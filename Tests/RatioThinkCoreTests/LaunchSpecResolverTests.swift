@@ -932,6 +932,174 @@ final class LaunchSpecResolverTests: XCTestCase {
     }
   }
 
+  // MARK: - split-GGUF refusal
+
+  // The catalog marks a split-GGUF row unlaunchable so the picker can't
+  // select one, but a stale or hand-authored profile could still name a
+  // shard. The launch path must refuse it FAST with a clear reason (no
+  // engine work, no hang on the missing-tensor fatal).
+  func test_resolveLauncherSpec_rejects_split_gguf_shard_as_invalid_input() throws {
+    let profiles = tempDir.appendingPathComponent("profiles", isDirectory: true)
+    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
+    try """
+    id = "chat"
+    name = "Chat"
+    model = "unsloth/Big-GGUF/Big-Q4_K_M-00001-of-00003.gguf"
+    inferlet = "chat-apc"
+    """.write(to: profiles.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
+    let store = ProfileStore(directory: profiles,
+                             activeProfileURL: tempDir.appendingPathComponent("active-profile"))
+    try store.start()
+    defer { store.stop() }
+
+    // Fake closures suffice — the guard returns before any of them run.
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { self.tempDir.appendingPathComponent("pie-fake") },
+      modelsRoot: { self.tempDir.appendingPathComponent("models") },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
+    )
+    guard case .failure(let err) = resolver.resolveLauncherSpec(profileID: "chat") else {
+      return XCTFail("a split-GGUF shard model must be refused before launch")
+    }
+    XCTAssertEqual(err.code, .invalidInput,
+                   "a split shard is invalid input the engine can't load — not missing/oversized")
+    XCTAssertTrue(err.message.contains("Split GGUF"),
+                  "the failure must explain why it was refused: \(err.message)")
+  }
+
+  // MARK: - catalog slug → launch round-trip
+
+  /// A slug produced by `HFCacheCatalog.scan` must resolve to the right
+  /// `hf_repo` SHAPE — the `.gguf` FILE for a GGUF repo, the snapshot
+  /// DIRECTORY for a safetensors repo — and the catalog's reported size
+  /// must agree with what the memory guardrail measures for that target.
+  /// This is the gap that let a dir-written-as-hf_repo-for-GGUF bug land.
+  // NB: deliberately NOT the seeded default repo. `defaultChatModelID`
+  // hits LaunchSpecResolver.hfIdentity's default special-case (file:nil →
+  // repo-level snapshot dir). A non-default GGUF repo exercises the
+  // GENERAL discovered-cache path this catalog feeds — and still catches
+  // the regression: a 2-segment catalog slug would resolve to the
+  // snapshot dir, failing the `.gguf`-suffix check below.
+  func test_catalog_gguf_slug_resolves_to_gguf_file_hf_repo() throws {
+    try assertCatalogRoundTrip(
+      repo: "TheBloke/Llama-2-7B-Chat-GGUF",
+      files: ["config.json": "{}", "tokenizer.json": "{}",
+              "llama-2-7b-chat.Q4_K_M.gguf": String(repeating: "g", count: 4096)],
+      expectedSlug: "TheBloke/Llama-2-7B-Chat-GGUF/llama-2-7b-chat.Q4_K_M.gguf",
+      hfRepoMustContain: "llama-2-7b-chat.Q4_K_M.gguf",
+      hfRepoMustBeGGUFFile: true)
+  }
+
+  func test_catalog_safetensors_slug_resolves_to_snapshot_dir_hf_repo() throws {
+    try assertCatalogRoundTrip(
+      repo: "Qwen/Qwen3-0.6B",
+      files: ["config.json": "{}", "tokenizer.json": "{}",
+              "model.safetensors": String(repeating: "s", count: 4096)],
+      expectedSlug: "Qwen/Qwen3-0.6B",
+      hfRepoMustContain: "snapshots",
+      hfRepoMustBeGGUFFile: false)
+  }
+
+  private func assertCatalogRoundTrip(repo: String,
+                                      files: [String: String],
+                                      expectedSlug: String,
+                                      hfRepoMustContain: String,
+                                      hfRepoMustBeGGUFFile: Bool,
+                                      line: UInt = #line) throws {
+    let suffix = repo.replacingOccurrences(of: "/", with: "-")
+    let hfHome = tempDir.appendingPathComponent("hf-rt-\(suffix)", isDirectory: true)
+    try writeHFCacheSnapshot(hfHome: hfHome, repo: repo, files: files)
+
+    let rows = HFCacheCatalog.scan(hfHome: hfHome)
+    guard let row = rows.first(where: { $0.filename == expectedSlug }) else {
+      return XCTFail("catalog must list \(expectedSlug); got \(rows.map(\.filename))", line: line)
+    }
+
+    // Size agreement: the guardrail measures exactly what the catalog
+    // reported for the same resolved target (boundary on row.sizeBytes).
+    let atLimit = ModelMemoryGuardrail.validate(
+      resolvedModelURL: row.url, modelID: row.filename,
+      policy: .init(maxResolvedModelBytes: row.sizeBytes))
+    if case .failure(let err) = atLimit {
+      XCTFail("catalog size must pass its own ceiling; \(err.message)", line: line)
+    }
+    let belowLimit = ModelMemoryGuardrail.validate(
+      resolvedModelURL: row.url, modelID: row.filename,
+      policy: .init(maxResolvedModelBytes: row.sizeBytes - 1))
+    if case .success = belowLimit {
+      XCTFail("guardrail must measure the same size the catalog reported", line: line)
+    }
+
+    // Round-trip through the production resolver → hf_repo shape.
+    let store = try makeStoreWithModel(row.filename)
+    defer { store.stop() }
+    let binary = tempDir.appendingPathComponent("pie-fake-rt-\(suffix)", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { self.tempDir.appendingPathComponent("models-rt-\(suffix)", isDirectory: true) },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-rt-\(suffix)") },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { hfHome })
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(profileID: "chat") else {
+      return XCTFail("catalog slug \(row.filename) must resolve to a launchable spec", line: line)
+    }
+    let body = PieControlLauncher.renderConfigBody(modelConfig: spec.modelConfig)
+    // Assert on the hf_repo VALUE alone, not the whole body: `name`
+    // carries the full slug (which for GGUF already contains the quant
+    // filename + ".gguf"), so a body-wide contains() would pass even if
+    // hf_repo regressed to the snapshot dir.
+    guard let hfRepo = Self.hfRepoValue(in: body) else {
+      return XCTFail("rendered config must have an hf_repo line; body:\n\(body)", line: line)
+    }
+    XCTAssertTrue(hfRepo.contains(hfRepoMustContain),
+                  "hf_repo must contain \(hfRepoMustContain.debugDescription); hf_repo=\(hfRepo)", line: line)
+    if hfRepoMustBeGGUFFile {
+      XCTAssertTrue(hfRepo.hasSuffix(".gguf"),
+                    "GGUF hf_repo must END with the .gguf file, not the snapshot dir; hf_repo=\(hfRepo)", line: line)
+    } else {
+      XCTAssertFalse(hfRepo.contains(".gguf"),
+                     "safetensors hf_repo must be the snapshot dir, never a .gguf; hf_repo=\(hfRepo)", line: line)
+    }
+  }
+
+  /// Extract the value of the `hf_repo = "<value>"` line from a rendered
+  /// pie config body (TOML basic string). Returns nil when absent.
+  static func hfRepoValue(in body: String) -> String? {
+    for rawLine in body.split(separator: "\n") {
+      let line = rawLine.trimmingCharacters(in: .whitespaces)
+      guard line.hasPrefix("hf_repo"), let eq = line.firstIndex(of: "=") else { continue }
+      let rhs = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+      return rhs.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+    }
+    return nil
+  }
+
+  /// Negative guard: prove the round-trip assertion actually catches a
+  /// dir-shaped hf_repo for a GGUF slug. The `name` line carries the full
+  /// `.gguf` slug, but `hfRepoValue` must read the hf_repo line (the
+  /// snapshot dir) — so the GGUF `.gguf`-suffix check would FAIL here,
+  /// exactly as it should when the dir-as-hf_repo bug regresses.
+  func test_round_trip_guard_catches_dir_shaped_gguf_hf_repo() {
+    let ggufSlug = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    let snapshotDir = "/cache/hub/models--Qwen--Qwen3-0.6B-GGUF/snapshots/abc123"
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: ggufSlug, modelRef: snapshotDir))
+    // The whole body DOES contain ".gguf" (via `name`), which is exactly
+    // why asserting on the body would be a false pass.
+    XCTAssertTrue(body.contains(".gguf"))
+    let hfRepo = Self.hfRepoValue(in: body)
+    XCTAssertEqual(hfRepo, snapshotDir, "parser must read hf_repo, not the name slug")
+    XCTAssertFalse(hfRepo?.hasSuffix(".gguf") ?? true,
+                   "a dir-shaped GGUF hf_repo must be detectable as NOT a .gguf file")
+  }
+
   // MARK: - helpers
 
   private func makeStoreWithChatProfile() throws -> ProfileStore {

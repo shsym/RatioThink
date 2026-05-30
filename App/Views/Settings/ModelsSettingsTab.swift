@@ -65,15 +65,17 @@ struct ModelsSettingsTab: View {
 
   @MainActor
   private func refresh() async {
-    do {
-      let dir = try PieDirs.models()
-      modelsDirectory = dir
-      installed = try InstalledModels.scan(dir)
-      scanError = nil
-    } catch {
-      installed = []
-      scanError = String(describing: error)
-    }
+    // Filesystem walks run off the main actor. Surface models already
+    // staged in the shared HF cache (safetensors / GGUF) alongside
+    // app-managed files, deduped by slug keeping the app-managed row (the
+    // resolver's app-staged-first precedence). HF rows are read-only in
+    // the table. On an app-dir scan failure the HF rows are KEPT and the
+    // error shows as a banner above the table rather than emptying it.
+    let scan = await CachedModelScan.run()
+    modelsDirectory = scan.modelsDirectory
+    let appSlugs = Set(scan.appManaged.map(\.filename))
+    installed = scan.appManaged + scan.huggingFaceCache.filter { !appSlugs.contains($0.filename) }
+    scanError = scan.appError
   }
 
   private func revealInFinder(_ row: InstalledModel) {
@@ -317,12 +319,16 @@ private struct InstalledModelsTable: View {
 
   var body: some View {
     VStack(spacing: 8) {
+      // The scan error is a banner ABOVE the table, not a replacement for
+      // it — an app-dir failure must not hide healthy HF-cache rows that
+      // were discovered independently.
       if let error {
         Text(error)
           .foregroundStyle(.red)
           .frame(maxWidth: .infinity, alignment: .leading)
-      } else if rows.isEmpty {
-        emptyState
+      }
+      if rows.isEmpty {
+        if error == nil { emptyState }
       } else {
         Table(rows) {
           TableColumn("Name") { row in
@@ -344,6 +350,19 @@ private struct InstalledModelsTable: View {
                   .accessibilityIdentifier("InstalledRow-Unverified-\(row.id)")
               }
               Text(row.displayName).lineLimit(1).truncationMode(.middle)
+              if row.source == .huggingFaceCache {
+                // Cached HF models are read-only here (the app does not
+                // own ~/.cache/huggingface). Tag them so the user
+                // understands why Delete is unavailable.
+                Text("HF cache")
+                  .font(.caption2)
+                  .foregroundStyle(.secondary)
+                  .padding(.horizontal, 5)
+                  .padding(.vertical, 1)
+                  .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                  .help("Discovered in the shared Hugging Face cache. Managed outside RatioThink — reveal in Finder to inspect.")
+                  .accessibilityIdentifier("InstalledRow-HFCache-\(row.id)")
+              }
             }
           }
           TableColumn("Size") { row in
@@ -376,7 +395,12 @@ private struct InstalledModelsTable: View {
                 Image(systemName: "trash")
               }
               .buttonStyle(.borderless)
-              .help("Move to Trash")
+              // HF-cache rows are read-only — the app does not manage the
+              // shared cache, so deletion is out of scope.
+              .disabled(row.source == .huggingFaceCache)
+              .help(row.source == .huggingFaceCache
+                    ? "Cached Hugging Face models are managed outside RatioThink"
+                    : "Move to Trash")
             }
           }
           .width(min: 50, ideal: 60)

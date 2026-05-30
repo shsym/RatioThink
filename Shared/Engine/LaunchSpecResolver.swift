@@ -162,6 +162,18 @@ public struct LaunchSpecResolver {
         message: "no profile with id=\(profileID) in \(profileStore.directory.path)"
       ))
     }
+    // Refuse a split-GGUF shard (`…-NNNNN-of-MMMMM.gguf`) before any
+    // engine work. The catalog marks such rows unlaunchable so the picker
+    // can't select them, but a stale or hand-authored profile could still
+    // name one — fail fast with a clear reason instead of handing the
+    // engine a shard it cannot load.
+    let modelLeaf = profile.model.split(separator: "/").last.map(String.init) ?? profile.model
+    if HFCacheCatalog.isSplitShardFilename(modelLeaf) {
+      return .failure(EngineError(
+        code: .invalidInput,
+        message: "\(HFCacheCatalog.shardedUnsupportedReason) (model=\(profile.model))"
+      ))
+    }
     let binary: URL
     let models: URL
     let resources: (wasm: URL, manifest: URL)
