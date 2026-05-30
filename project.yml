@@ -23,6 +23,24 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     ENABLE_HARDENED_RUNTIME: NO
     DEAD_CODE_STRIPPING: YES
+  configs:
+    # Notarization requires the hardened runtime on every executable in the
+    # bundle. Enable it for Release only so Debug builds (make build /
+    # install-app / GUI tests) keep their unhardened + get-task-allow
+    # debugging behavior. The pie engine is already signed `--options
+    # runtime` in Scripts/build-pie-engine.sh regardless of configuration;
+    # this hardens the app + helper that Xcode signs directly. The helper
+    # already carries cs.allow-jit / cs.allow-unsigned-executable-memory and
+    # the app needs no JIT, so no entitlement changes are required.
+    Release:
+      ENABLE_HARDENED_RUNTIME: YES
+      # Do not inject the base debug entitlements (get-task-allow) into the
+      # Release build. The notary service REJECTS any executable carrying
+      # com.apple.security.get-task-allow. A Developer ID signature normally
+      # omits it, but ad-hoc/local signing injects it by default — disabling
+      # injection guarantees the notarization candidate is clean regardless of
+      # the signing identity. Debug keeps injection on so lldb can attach.
+      CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
 
 packages:
   TOMLKit:
