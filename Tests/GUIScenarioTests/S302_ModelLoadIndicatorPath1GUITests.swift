@@ -1,7 +1,9 @@
 import XCTest
 
 /// toolbar model-load indicator via the REAL production
-/// path-1 (explicit load), plus mid-load cancel.
+/// path-1 (explicit load), plus the #359 confirmed mid-load cancel gate
+/// — opening the popover is info-only, the "Cancel" button only arms an
+/// explicit "Stop Loading" confirm, and only that confirm cancels.
 ///
 /// Where S297 drives the indicator through the chat-send meta-frame path
 /// (`applyChatMetaEvent`, which only fires on engine `model_loading`
@@ -74,10 +76,11 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
         + "label=\(indicator.label); app: \(app.debugDescription)")
   }
 
-  // MARK: - mid-load cancel: synchronous .loading → .cancelled clears the ring
+  // MARK: - mid-load cancel: opening info never cancels; only the
+  // explicit confirmed "Stop Loading" cancels (#359)
 
   @MainActor
-  func test_path1_midload_cancel_clears_indicator() throws {
+  func test_path1_midload_cancel_is_confirmed_and_only_confirm_cancels() throws {
     let app = try launchedApp()
     defer { app.terminate() }
 
@@ -96,22 +99,39 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
       "toolbar.modelLoadIndicator exists but never showed 'Loading model' before cancel — "
         + "state-machine regression? label=\(indicator.label); app: \(app.debugDescription)")
 
-    // Open the indicator popover and hit Cancel — center.cancel() makes
-    // a synchronous .loading → .cancelled transition
-    // (ModelLoadCenter.swift:207).
+    // (1) Opening the indicator popover is info-only — it must NOT cancel
+    // the load (#359 acceptance: "click-open does not cancel").
     XCTAssertTrue(openIndicatorPopover(indicator, in: app),
                   "indicator popover did not open; app: \(app.debugDescription)")
-    let cancelButton = app.popovers.buttons
-      .matching(NSPredicate(format: "label == %@", "Cancel")).firstMatch
-    XCTAssertTrue(cancelButton.waitForExistence(timeout: 5),
-                  "loading popover did not render a Cancel button; app: \(app.debugDescription)")
-    cancelButton.click()
+    XCTAssertTrue(indicator.label.hasPrefix("Loading model"),
+                  "opening the popover cancelled the load — click must be info-only; "
+                    + "label=\(indicator.label); app: \(app.debugDescription)")
 
-    // The synchronous cancel clears .loading and the indicator goes idle
-    // (opacity 0 / no label) — the "Loading model" label must clear …
+    // (2) The "Cancel" button ARMS the confirm step; it must not cancel
+    // on the first click. After clicking it the confirm prompt appears
+    // ("Stop Loading" / "Keep Loading") while the load is STILL running.
+    let cancelTrigger = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Cancel")).firstMatch
+    XCTAssertTrue(cancelTrigger.waitForExistence(timeout: 5),
+                  "loading popover did not render a Cancel trigger; app: \(app.debugDescription)")
+    cancelTrigger.click()
+
+    let confirmStop = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Stop Loading")).firstMatch
+    XCTAssertTrue(confirmStop.waitForExistence(timeout: 5),
+                  "clicking Cancel did not surface the 'Stop Loading' confirm — confirm gate missing; "
+                    + "app: \(app.debugDescription)")
+    XCTAssertTrue(indicator.label.hasPrefix("Loading model"),
+                  "arming the confirm cancelled the load — cancellation must be confirmed, not on first click; "
+                    + "label=\(indicator.label); app: \(app.debugDescription)")
+
+    // (3) Only the confirmed "Stop Loading" actually cancels. center.cancel()
+    // makes a synchronous .loading → .cancelled transition
+    // (ModelLoadCenter.swift), so the "Loading model" label clears …
+    confirmStop.click()
     XCTAssertTrue(
       waitUntilLabelClears(indicator, prefix: "Loading model", timeout: 10),
-      "toolbar.modelLoadIndicator stayed in 'Loading model' after Cancel; "
+      "toolbar.modelLoadIndicator stayed in 'Loading model' after confirmed Stop Loading; "
         + "label=\(indicator.label); app: \(app.debugDescription)")
     // … and the cancelled load must NOT complete to ready — for the
     // FULL hold + slack (review F3). The old 8 s window was decoupled
@@ -125,6 +145,49 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
       waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 5),
       "cancelled load still completed to 'Model loaded:' within hold+slack (hold=\(hold)s); "
         + "the cancel did not stop the load; app: \(app.debugDescription)")
+  }
+
+  // MARK: - "Keep Loading" backs out of the confirm without cancelling
+
+  @MainActor
+  func test_path1_keep_loading_backs_out_and_load_completes() throws {
+    let app = try launchedApp()
+    defer { app.terminate() }
+
+    try triggerExplicitLoad(in: app)
+
+    let indicator = app.buttons["toolbar.modelLoadIndicator"].firstMatch
+    XCTAssertTrue(
+      indicator.waitForExistence(timeout: 10),
+      "toolbar.modelLoadIndicator was never instantiated — ContentToolbar wiring regression? "
+        + "app: \(app.debugDescription)")
+    XCTAssertTrue(
+      waitForLabel(indicator, beginsWith: "Loading model", timeout: 15),
+      "toolbar.modelLoadIndicator never showed 'Loading model'; "
+        + "label=\(indicator.label); app: \(app.debugDescription)")
+
+    // Arm the cancel confirm, then back out with "Keep Loading".
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
+                  "indicator popover did not open; app: \(app.debugDescription)")
+    let cancelTrigger = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Cancel")).firstMatch
+    XCTAssertTrue(cancelTrigger.waitForExistence(timeout: 5),
+                  "loading popover did not render a Cancel trigger; app: \(app.debugDescription)")
+    cancelTrigger.click()
+
+    let keepLoading = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Keep Loading")).firstMatch
+    XCTAssertTrue(keepLoading.waitForExistence(timeout: 5),
+                  "confirm step missing a 'Keep Loading' escape; app: \(app.debugDescription)")
+    keepLoading.click()
+
+    // Backing out must NOT cancel — the load proceeds to ready once the
+    // harness releases its hold.
+    let hold = try Self.holdSeconds()
+    XCTAssertTrue(
+      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 15),
+      "'Keep Loading' aborted the load instead of letting it finish; "
+        + "label=\(indicator.label); app: \(app.debugDescription)")
   }
 
   // MARK: - steps
