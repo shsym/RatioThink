@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
 # Mount a packaged RatioThink DMG read-only and assert the drag-install
-# layout (ticket #354):
+# layout + window styling (ticket #354):
 #   * the mounted root contains RatioThink.app,
 #   * the root contains an `Applications` symlink to /Applications so the
-#     window offers the familiar drag-install target, and
+#     window offers the familiar drag-install target,
 #   * the app still passes a strict codesign seal check — i.e. packaging
-#     did not corrupt the signed bundle.
+#     did not corrupt the signed bundle,
+#   * the background asset is present, and
+#   * the `.DS_Store` pins the icons with RatioThink.app LEFT of Applications
+#     and sets the background picture.
+#
+# The styling checks read the `.DS_Store` directly (via the vendored ds_store
+# parser), so verification needs no GUI and runs in CI.
 #
 # Usage: Scripts/verify-dmg-layout.sh <dmg>
 #
-# package-dmg.sh calls this on every build so a silent layout/seal
+# package-dmg.sh calls this on every build so a silent layout/styling/seal
 # regression fails the package instead of shipping.
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DMG="${1:-}"
 if [[ -z "$DMG" ]]; then
@@ -59,4 +67,42 @@ if ! codesign --verify --strict --deep --verbose=2 "$APP" >/dev/null 2>&1; then
   fail "RatioThink.app inside the DMG fails codesign verification"
 fi
 
-echo "verify-dmg-layout.sh: ok — RatioThink.app + Applications target present, codesign valid ($DMG)"
+# Styling: the background art and the .DS_Store icon layout.
+[[ -f "$MNT/.background/background.png" ]] ||
+  fail "mounted DMG is missing the background asset (.background/background.png)"
+[[ -f "$MNT/.DS_Store" ]] ||
+  fail "mounted DMG has no .DS_Store — the window is unstyled"
+
+# Parse the .DS_Store with the vendored ds_store reader and assert the icons
+# are pinned app-left/Applications-right and the background picture is set.
+# Self-contained + GUI-free, so it runs the same in CI.
+if ! VENDOR_DIR="$SCRIPT_DIR/vendor" python3 - "$MNT/.DS_Store" <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["VENDOR_DIR"])
+from ds_store import DSStore
+
+ds_path = sys.argv[1]
+pos = {}
+background_set = False
+with DSStore.open(ds_path, "r") as d:
+    for e in d:
+        if e.code == b"Iloc" and e.filename in ("RatioThink.app", "Applications"):
+            pos[e.filename] = tuple(e.value[:2])
+        if e.filename == "." and e.code == b"icvp":
+            icvp = e.value
+            background_set = icvp.get("backgroundType") == 2 and bool(icvp.get("backgroundImageAlias"))
+
+app = pos.get("RatioThink.app")
+apps = pos.get("Applications")
+if app is None or apps is None:
+    sys.exit(f"icon positions missing in .DS_Store (RatioThink.app={app}, Applications={apps})")
+if app[0] >= apps[0]:
+    sys.exit(f"RatioThink.app ({app}) is not left of Applications ({apps})")
+if not background_set:
+    sys.exit("background picture is not set in the icon-view options (icvp)")
+PY
+then
+  fail "DMG window styling check failed (see above)"
+fi
+
+echo "verify-dmg-layout.sh: ok — RatioThink.app + Applications target, codesign valid, styled window ($DMG)"

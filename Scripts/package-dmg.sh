@@ -149,31 +149,71 @@ done
 DMG_PATH="$OUT_DIR/RatioThink-$ARCH.dmg"
 rm -f "$DMG_PATH"
 
-# Stage a DMG root holding the app plus an `Applications` symlink so the
-# mounted window offers the standard drag-install target (ticket #354).
-# `ditto` clones the *verified* bundle — preserving its signature and
-# xattrs — into staging, leaving $APP_PATH untouched; hdiutil's
-# `-srcfolder` then copies the staged tree (app + symlink) faithfully
-# into the HFS+ image, keeping the symlink a symlink.
-STAGE_DIR="$BUILD_DIR/dmg-stage"
-rm -rf "$STAGE_DIR"
-mkdir -p "$STAGE_DIR"
-ditto "$APP_PATH" "$STAGE_DIR/RatioThink.app"
-ln -s /Applications "$STAGE_DIR/Applications"
+# Build a styled drag-install DMG window (ticket #354): RatioThink.app on the
+# left, an `Applications` symlink target on the right, and a background showing
+# an arrow app -> Applications.
+#
+# We do NOT drive Finder via AppleScript. Finder Apple events time out under
+# automation (and there is no Finder at all in CI), so scripted styling is
+# unreliable and unverifiable. Instead we lay the icon view out deterministically
+# by writing the volume `.DS_Store` directly — the same approach `dmgbuild` uses
+# — which needs no GUI and runs identically on a dev Mac and in CI.
+VOLNAME="RatioThink"
+STAGE_MOUNT="/Volumes/$VOLNAME"
+RW_DMG="$BUILD_DIR/RatioThink-$ARCH-rw.dmg"
+BG_PNG="$BUILD_DIR/dmg-background.png"
 
-echo "package-dmg.sh: hdiutil create $DMG_PATH"
-# UDZO = compressed read-only.
-hdiutil create \
-  -volname "RatioThink" \
-  -srcfolder "$STAGE_DIR" \
-  -fs HFS+ \
-  -format UDZO \
-  "$DMG_PATH"
+# Background art is generated programmatically (Swift/AppKit) so the build stays
+# self-contained — no committed binary asset, no ImageMagick dependency.
+echo "package-dmg.sh: rendering DMG background art"
+xcrun swift "$SCRIPT_DIR/make-dmg-background.swift" "$BG_PNG"
 
-# Mount the finished image and assert the drag-install layout plus that
-# the staged app survived packaging with its seal intact. Self-verifying
-# packaging — a silent layout/seal regression fails the build here rather
-# than shipping a DMG users cannot install from (ticket #354 acceptance).
+# Size the writable image to the app plus slack for HFS metadata + .DS_Store.
+APP_MB=$(du -sm "$APP_PATH" | cut -f1)
+IMG_MB=$((APP_MB + 60))
+
+# Fresh read-write image. Detach any stale mount from an interrupted prior run
+# first so the volume name is free.
+hdiutil detach "$STAGE_MOUNT" >/dev/null 2>&1 || true
+rm -f "$RW_DMG"
+hdiutil create -size "${IMG_MB}m" -fs HFS+ -volname "$VOLNAME" "$RW_DMG" >/dev/null
+hdiutil attach "$RW_DMG" -nobrowse -noverify >/dev/null
+# A pre-existing user volume named RatioThink would push our image to
+# "/Volumes/RatioThink 1"; refuse rather than style the wrong volume.
+if [[ ! -d "$STAGE_MOUNT" || ! -w "$STAGE_MOUNT" ]]; then
+  echo "package-dmg.sh: RW image did not mount writable at $STAGE_MOUNT" >&2
+  hdiutil detach "$STAGE_MOUNT" >/dev/null 2>&1 || true
+  exit 75
+fi
+# Never leave the staging image mounted if a later step fails.
+trap 'hdiutil detach "$STAGE_MOUNT" >/dev/null 2>&1 || true' EXIT
+
+# Populate the volume: the verified app (ditto preserves its signature, leaving
+# $APP_PATH untouched), the Applications drag target, and the background asset.
+ditto "$APP_PATH" "$STAGE_MOUNT/RatioThink.app"
+ln -s /Applications "$STAGE_MOUNT/Applications"
+mkdir -p "$STAGE_MOUNT/.background"
+cp "$BG_PNG" "$STAGE_MOUNT/.background/background.png"
+
+# Write the styled .DS_Store (icon positions + background picture). The
+# generator self-validates and exits non-zero on a malformed store, so a
+# styling regression fails the build instead of silently shipping a plain
+# window.
+echo "package-dmg.sh: writing styled .DS_Store"
+python3 "$SCRIPT_DIR/make-dmg-dsstore.py" "$STAGE_MOUNT"
+
+sync
+hdiutil detach "$STAGE_MOUNT" >/dev/null
+trap - EXIT
+
+# Compress the styled writable image to the final read-only DMG.
+echo "package-dmg.sh: hdiutil convert -> UDZO $DMG_PATH"
+hdiutil convert "$RW_DMG" -format UDZO -o "$DMG_PATH" >/dev/null
+rm -f "$RW_DMG"
+
+# Mount the finished image and assert the drag-install layout, the styling
+# (background + app-left/Applications-right), and that the staged app survived
+# packaging with its seal intact (ticket #354 acceptance).
 "$SCRIPT_DIR/verify-dmg-layout.sh" "$DMG_PATH"
 
 echo "package-dmg.sh: ok ($DMG_PATH)"
