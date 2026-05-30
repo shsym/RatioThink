@@ -73,6 +73,43 @@ public enum HelperConfig {
     return value
   }
 
+  /// True iff this binary was compiled with the DEBUG flag. Captured
+  /// here so the policy in `isTestOverrideAllowed` stays a pure function
+  /// of its inputs: the `#if DEBUG` compile gate can't be exercised from
+  /// a DEBUG test build, so tests inject this seam instead.
+  public static var isDebugBuild: Bool {
+    #if DEBUG
+    return true
+    #else
+    return false
+    #endif
+  }
+
+  /// Single source of truth for "may a test-only override take effect in
+  /// THIS build?" — an explicit test harness (`PIE_TEST_MODE=1`) OR a
+  /// DEBUG build. A shipped Release binary returns false, so a stray test
+  /// env knob is inert in production.
+  ///
+  /// Shared by the two consumers of `PIE_TEST_ENGINE_BASE_URL` so they
+  /// agree: `RatioThinkApp.isEngineBaseURLOverrideAllowed` (the engine-client
+  /// redirect) and `HelperRegistrationReconciler.isTestLaunch` (the
+  /// launchd reconcile-skip marker). Without this gate the latter keyed on
+  /// the var's mere presence in every build, so a Release launch with it
+  /// set skipped the self-heal reconcile while the former correctly
+  /// ignored it — half-gated.
+  ///
+  /// Pure in its arguments: reads only the injected `environment` (never
+  /// process env or the task-local overrides that `isTestMode` consults)
+  /// and takes `isDebugBuild` as a seam, so every caller's Release branch
+  /// is unit-testable.
+  public static func isTestOverrideAllowed(
+    environment: [String: String],
+    isDebugBuild: Bool = HelperConfig.isDebugBuild
+  ) -> Bool {
+    if environment[testModeEnvVar] == "1" { return true }
+    return isDebugBuild
+  }
+
   /// Single greppable choke point for any helper code path that would
   /// touch system-wide state (login items, keychain, IOPM assertions,
   /// global mach service binding, etc). Call BEFORE performing the

@@ -118,10 +118,40 @@ struct RatioThinkApp: App {
     statusStore.start()
   }
 
+  /// Test-only engine base-URL override. `PIE_TEST_ENGINE_BASE_URL`
+  /// points the chat client straight at an externally-launched engine,
+  /// bypassing the entire production launch boundary (Helper XPC,
+  /// `EngineStatusStore`, `LaunchSpecResolver`, `PieControlLauncher`,
+  /// `pie serve`). It is honored ONLY in a test harness
+  /// (`PIE_TEST_MODE=1`) or a DEBUG build — a shipped Release
+  /// `RatioThink.app` MUST use the real Helper→engine path. Refusing it
+  /// in Release closes the parity gap two ways: a shipped app can't be
+  /// redirected at a foreign URL, and a "real binary" (Release/packaged)
+  /// scenario cannot silently pass on a fake base URL — if the override
+  /// is set it is ignored and the app exercises the real path (failing
+  /// loudly when no real engine is present). Mirrors
+  /// `HelperXPCListener.isAnonymousModeAllowed` for the
+  /// `PIE_ALLOW_UNSIGNED_CALLERS` bypass.
   private static func chatTestEngineBaseURL() -> URL? {
     guard let raw = ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_BASE_URL"],
           !raw.isEmpty else { return nil }
+    guard isEngineBaseURLOverrideAllowed() else {
+      NSLog("PIE_TEST_ENGINE_BASE_URL ignored: a release build uses the real Helper→engine path, not a base-URL bypass")
+      return nil
+    }
     return URL(string: raw)
+  }
+
+  /// Whether the `PIE_TEST_ENGINE_BASE_URL` engine-client override is
+  /// permitted. Test harness (`PIE_TEST_MODE=1`) or DEBUG only; never a
+  /// production Release build. Internal (not private) so the gate is
+  /// unit-testable via `@testable import RatioThink`. Delegates to the
+  /// shared `HelperConfig.isTestOverrideAllowed` so this consumer and
+  /// `HelperRegistrationReconciler.isTestLaunch` agree on one predicate.
+  static func isEngineBaseURLOverrideAllowed(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+  ) -> Bool {
+    HelperConfig.isTestOverrideAllowed(environment: environment)
   }
 
   private static func appPreferencesDefaults() -> UserDefaults {

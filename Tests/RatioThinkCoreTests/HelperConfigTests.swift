@@ -164,6 +164,51 @@ final class HelperConfigTests: XCTestCase {
   // Negative cases still trap (precondition on empty PIE_XPC_SERVICE).
   // Documented; covered by probe-based death-tests above where possible.
 
+  // MARK: - shared test-override gate (isTestOverrideAllowed)
+
+  /// The single predicate behind `RatioThinkApp.isEngineBaseURLOverrideAllowed`
+  /// and the `PIE_TEST_ENGINE_BASE_URL` marker in
+  /// `HelperRegistrationReconciler.isTestLaunch`. `isDebugBuild` is
+  /// injected so the Release branch — which the `#if DEBUG` capture hides
+  /// from a DEBUG test build — is exercised directly (the gap the gate
+  /// test could not close).
+  func test_isTestOverrideAllowed_releaseBuild_refusesUnlessTestMode() {
+    // Release (non-DEBUG): a stray env knob is inert.
+    XCTAssertFalse(
+      HelperConfig.isTestOverrideAllowed(
+        environment: ["PIE_TEST_ENGINE_BASE_URL": "http://127.0.0.1:9"],
+        isDebugBuild: false))
+    XCTAssertFalse(
+      HelperConfig.isTestOverrideAllowed(environment: [:], isDebugBuild: false))
+    // …unless the explicit harness flag is set.
+    XCTAssertTrue(
+      HelperConfig.isTestOverrideAllowed(
+        environment: ["PIE_TEST_MODE": "1"], isDebugBuild: false))
+    // PIE_TEST_MODE set to anything but "1" is not a harness.
+    XCTAssertFalse(
+      HelperConfig.isTestOverrideAllowed(
+        environment: ["PIE_TEST_MODE": "0"], isDebugBuild: false))
+  }
+
+  /// A DEBUG build permits the override regardless of env so dev/test
+  /// builds keep their seams.
+  func test_isTestOverrideAllowed_debugBuild_permits() {
+    XCTAssertTrue(
+      HelperConfig.isTestOverrideAllowed(environment: [:], isDebugBuild: true))
+    XCTAssertTrue(
+      HelperConfig.isTestOverrideAllowed(
+        environment: ["PIE_TEST_MODE": "0"], isDebugBuild: true))
+  }
+
+  /// The default `isDebugBuild` argument tracks this bundle's compile
+  /// config (DEBUG), so the override is permitted with no env — pins that
+  /// the production call sites pass through the same default seam.
+  func test_isTestOverrideAllowed_defaultBuildFlag_isDebugInTestBundle() {
+    XCTAssertTrue(HelperConfig.isDebugBuild,
+                  "the test bundle compiles DEBUG; if this fails the gate's default seam changed")
+    XCTAssertTrue(HelperConfig.isTestOverrideAllowed(environment: [:]))
+  }
+
   // MARK: - helpers
 
   fileprivate static func makeTempRoot() throws -> URL {
