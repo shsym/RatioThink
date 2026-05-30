@@ -34,6 +34,15 @@ struct ModelsSettingsTab: View {
                             onDrop: handleDrop)
     }
     .padding(20)
+    // Pin the pane to the top of the tab. Without this the VStack only
+    // expands to fill the 520-tall Settings pane in states that contain
+    // a greedy child (the populated `Table`); the empty, loading, and
+    // error states size to their content and TabView centers the whole
+    // block vertically — the "model content floats mid-pane" misalignment.
+    // `.topLeading` keeps every state top-anchored, matching ProfilesSettingsTab.
+    // Frame goes AFTER `.padding(20)` so the inset stays inside the greedy
+    // frame; before it, the filled frame + outer padding would overflow the pane.
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     .task { await refresh() }
     .onChange(of: downloads.completionTick) { _, _ in
       Task { await refresh() }
