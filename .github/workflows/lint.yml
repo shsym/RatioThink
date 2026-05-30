@@ -75,6 +75,9 @@ jobs:
       - name: Scenario tests
         run: make test-scenario
 
+      - name: Collect-diagnostics script self-test (#358)
+        run: make test-collect-diagnostics
+
   sanitizer-stability-canary:
     #  F8. Catches drift between SpawnEnvSanitizer's
     # declared prefix/exact-key policy and its actual filter behavior

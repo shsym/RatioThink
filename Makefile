@@ -25,7 +25,7 @@ $(LOGDIR):
 	@mkdir -p $(LOGDIR)
 
 .PHONY: help genproject build build-tests clean lint \
-        verify-app-icon-assets test-app-icon-assets \
+        verify-app-icon-assets test-app-icon-assets test-collect-diagnostics \
         test-xcode-chat-scaffold \
         test-unit test-scenario test-smoke test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
@@ -174,6 +174,14 @@ verify-app-icon-assets: ## Verify committed app-icon source, generated PNGs, and
 
 test-app-icon-assets: ## Regression-test the app-icon verifier failure modes
 	Scripts/test-verify-app-icon-assets.sh
+
+test-collect-diagnostics: $(LOGDIR) ## Real-script self-test for Scripts/collect-diagnostics.sh (CI-safe via override env)
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-collect-diag.log; \
+	  Scripts/test-collect-diagnostics.sh 2>&1 | tee $$LOG | tail -30; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  exit $$status
 
 test-gui: genproject $(LOGDIR) ## GUI scenarios (S4, S5) via XCUITest — needs seated session
 	@set +e +o pipefail; \
