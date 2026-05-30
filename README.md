@@ -103,6 +103,33 @@ make release-preflight ARTIFACT=build/dmg/RatioThink-arm64.dmg
 On a notarized release it exits **0** ("Gatekeeper-accepted"); on an unsigned
 or dev build it exits non-zero and prints exactly what is missing.
 
+## Troubleshooting / Collect diagnostics
+
+If RatioThink "does nothing" after launch — no window, no menu-bar icon, no chat —
+collect a diagnostics bundle and send it to the developer.
+
+**From the app** (if it opens): **Help → Collect Diagnostics…**. It writes a
+`.zip` to your Desktop and reveals it in Finder.
+
+**From Terminal** (works even when the app or helper won't launch):
+
+```bash
+/Applications/RatioThink.app/Contents/Resources/collect-diagnostics.sh
+```
+
+This prints a short verdict (e.g. *quarantine present*, *helper never
+launched*, *Gatekeeper rejected*, *engine failed*) and writes
+`~/Desktop/RatioThink-diagnostics-<timestamp>.zip`. Attach that `.zip` to your
+report.
+
+The bundle contains app/helper versions, codesign + Gatekeeper + quarantine
+status, the launchd helper state, the running-process list, recent macOS
+Unified Logging for `com.ratiothink*`, recent crash reports, and the app's own
+breadcrumb logs (`app.log` / `helper.log` / `engine.log`). It is **redacted**:
+your home path is collapsed to `~` and obvious tokens are stripped. Chat
+contents are **not** included unless you pass `--include-chats`. Other flags:
+`--window <dur>` (Unified Logging look-back, default `2h`) and `--out <path>`.
+
 ## Repo layout
 
 ```
