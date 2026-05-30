@@ -25,6 +25,7 @@ this script fails loud with that command if they are missing.
 Usage: make-dmg-dsstore.py <mounted-volume-path>
 """
 
+import json
 import os
 import sys
 
@@ -57,12 +58,20 @@ APP_NAME = "RatioThink.app"
 APPS_NAME = "Applications"
 BACKGROUND_REL = ".background/background.png"
 
-# Canvas + slot geometry — keep in sync with make-dmg-background.swift.
-CANVAS_W, CANVAS_H = 600, 400
+# Window + slot geometry come from the shared geometry file, the single source
+# of truth also read by make-dmg-background.swift (arrow art) and
+# verify-dmg-layout.sh (asserts these positions). Edit Scripts/dmg-window.json,
+# not these values.
+with open(os.path.join(_HERE, "dmg-window.json"), encoding="utf-8") as _gf:
+    _GEO = json.load(_gf)
+CANVAS_W = _GEO["window"]["width"]
+CANVAS_H = _GEO["window"]["height"]
+ICON_SIZE = _GEO["iconSize"]
+APP_POS = (_GEO["icons"][APP_NAME]["x"], _GEO["icons"][APP_NAME]["y"])
+APPS_POS = (_GEO["icons"][APPS_NAME]["x"], _GEO["icons"][APPS_NAME]["y"])
+# On-screen window origin is cosmetic (where the window opens), not part of the
+# geometry contract the art/verifier share.
 WINDOW_X, WINDOW_Y = 200, 120
-ICON_SIZE = 128
-APP_POS = (150, 200)   # left slot
-APPS_POS = (450, 200)  # right slot
 
 
 def build(volume: str) -> None:
@@ -126,17 +135,15 @@ def validate(ds_path: str) -> None:
     window, so treat any read-back mismatch as a hard failure.
     """
     found = {}
-    background_ok = False
+    background_alias = None
     with DSStore.open(ds_path, "r") as d:
         for entry in d:
             if entry.code == b"Iloc" and entry.filename in (APP_NAME, APPS_NAME):
                 found[entry.filename] = tuple(entry.value[:2])
             if entry.filename == "." and entry.code == b"icvp":
                 icvp = entry.value
-                background_ok = (
-                    icvp.get("backgroundType") == 2
-                    and bool(icvp.get("backgroundImageAlias"))
-                )
+                if icvp.get("backgroundType") == 2:
+                    background_alias = icvp.get("backgroundImageAlias")
 
     if found.get(APP_NAME) != APP_POS:
         sys.exit(f"make-dmg-dsstore.py: validation failed — {APP_NAME} Iloc={found.get(APP_NAME)} != {APP_POS}")
@@ -144,8 +151,24 @@ def validate(ds_path: str) -> None:
         sys.exit(f"make-dmg-dsstore.py: validation failed — {APPS_NAME} Iloc={found.get(APPS_NAME)} != {APPS_POS}")
     if found[APP_NAME][0] >= found[APPS_NAME][0]:
         sys.exit("make-dmg-dsstore.py: validation failed — app is not left of Applications")
-    if not background_ok:
+    if not background_alias:
         sys.exit("make-dmg-dsstore.py: validation failed — background picture not set in icvp")
+
+    # Don't just trust that the alias bytes are non-empty: decode them and
+    # confirm they actually resolve to .background/background.png, so a stale or
+    # wrong alias is caught rather than read as "styled".
+    target = Alias.from_bytes(background_alias).target
+    name = target.filename
+    if isinstance(name, bytes):
+        name = name.decode("utf-8", "replace")
+    carbon = target.carbon_path or b""
+    if isinstance(carbon, bytes):
+        carbon = carbon.decode("latin-1")
+    if name != "background.png" or ".background:" not in carbon:
+        sys.exit(
+            "make-dmg-dsstore.py: validation failed — background alias does not "
+            f"resolve to {BACKGROUND_REL} (filename={name!r}, path={carbon!r})"
+        )
 
 
 def main() -> None:

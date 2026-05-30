@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# Regression tests for Scripts/verify-dmg-layout.sh (ticket #354). Each case
-# builds a real DMG fixture (hdiutil) — some bare, some fully styled via the
-# production .DS_Store generator — and asserts the verifier's pass/fail verdict.
-# Exercises the REAL hdiutil + codesign + .DS_Store writer/reader, no xcodebuild
-# and no Finder/GUI, so it runs in CI under the lint job.
+# Regression tests for Scripts/verify-dmg-layout.sh + Scripts/make-styled-dmg.sh
+# (ticket #354). Each case builds a real DMG fixture (hdiutil) — some bare, some
+# fully styled via the production builder/generator — and asserts the verifier's
+# pass/fail verdict, plus the staging mount-safety guard. Exercises the REAL
+# hdiutil + codesign + .DS_Store writer/reader, no xcodebuild and no Finder/GUI,
+# so it runs in CI under the lint job.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERIFIER="$ROOT/Scripts/verify-dmg-layout.sh"
+STYLED_SH="$ROOT/Scripts/make-styled-dmg.sh"
 BG_SWIFT="$ROOT/Scripts/make-dmg-background.swift"
 DSSTORE_PY="$ROOT/Scripts/make-dmg-dsstore.py"
+GEOMETRY_JSON="$ROOT/Scripts/dmg-window.json"
 VENDOR_DIR="$ROOT/Scripts/vendor"
 WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pie-dmg-verifier-tests.XXXXXX")"
 VOLNAME="RatioThink"
@@ -48,9 +51,16 @@ make_dmg() {
   hdiutil create -volname "$VOLNAME" -srcfolder "$stage" -fs HFS+ -format UDZO "$dmg" >/dev/null
 }
 
-# Build a DMG the way production does: create a writable image, mount it, run a
-# populate callback against the mount, detach, convert to UDZO. The callback
-# receives the mount path and decides how complete/styled the layout is.
+# Build a DMG by mounting a writable image and running a populate callback —
+# for the styling-variant fixtures that need to mutate mid-build.
+#
+# IMPORTANT: this is called as a BARE statement and returns its result in the
+# global DMG_OUT — NOT via $(...). Under command substitution, stock-Mac
+# /bin/bash 3.2.57 does not let `set -e` abort this function body, so a failed
+# hdiutil/populate would return a path with rc=0 and green a styling guard
+# vacuously. As a bare statement, `set -e` aborts the whole suite on any failed
+# step here.
+DMG_OUT=""
 build_dmg() {
   local name="$1" populate="$2"
   local rw="$WORK_ROOT/$name-rw.dmg" out="$WORK_ROOT/$name.dmg"
@@ -61,31 +71,23 @@ build_dmg() {
   "$populate" "$STAGE_MOUNT"
   sync
   hdiutil detach "$STAGE_MOUNT" >/dev/null
-  hdiutil convert "$rw" -format UDZO -o "$out" >/dev/null 2>&1
+  hdiutil convert "$rw" -format UDZO -o "$out" >/dev/null  # keep stderr visible
   rm -f "$rw"
-  printf "%s" "$out"
+  DMG_OUT="$out"
 }
 
 # Populate callbacks (run against the mounted writable volume).
-pop_app_symlink() {
+pop_with_background() {
   local mnt="$1"
   make_dummy_app "$mnt/RatioThink.app"
   ln -s /Applications "$mnt/Applications"
-}
-pop_with_background() {
-  local mnt="$1"
-  pop_app_symlink "$mnt"
   mkdir -p "$mnt/.background"
   cp "$WORK_ROOT/bg.png" "$mnt/.background/background.png"
 }
-pop_styled() {
+pop_styled_reversed() {
   local mnt="$1"
   pop_with_background "$mnt"
   python3 "$DSSTORE_PY" "$mnt" >/dev/null
-}
-pop_styled_reversed() {
-  local mnt="$1"
-  pop_styled "$mnt"
   # Swap the pinned icon positions so RatioThink.app sits to the RIGHT of
   # Applications — the exact regression the verifier must catch.
   VENDOR_DIR="$VENDOR_DIR" python3 - "$mnt/.DS_Store" <<'PY'
@@ -117,11 +119,43 @@ expect_fail() {
   fi
 }
 
-# Shared background art for the styled fixtures.
-xcrun swift "$BG_SWIFT" "$WORK_ROOT/bg.png" >/dev/null
+# make-styled-dmg.sh must refuse when a volume named RatioThink is already
+# mounted, and must neither write into nor detach that pre-existing volume.
+test_collision_guard() {
+  local app="$WORK_ROOT/collide-app/RatioThink.app"
+  make_dummy_app "$app"
+  local dummy_rw="$WORK_ROOT/dummy-rw.dmg"
+  hdiutil detach "$STAGE_MOUNT" >/dev/null 2>&1 || true
+  hdiutil create -size 10m -fs HFS+ -volname "$VOLNAME" "$dummy_rw" >/dev/null
+  hdiutil attach "$dummy_rw" -nobrowse -noverify >/dev/null
+  echo "operator-data" >"$STAGE_MOUNT/SENTINEL.txt"
 
-# baseline: the fully styled layout package-dmg.sh produces.
-expect_pass "baseline" "$(build_dmg baseline pop_styled)"
+  if "$STYLED_SH" "$app" "$WORK_ROOT/collide.dmg" >"$WORK_ROOT/collide.log" 2>&1; then
+    cat "$WORK_ROOT/collide.log" >&2
+    echo "FAIL: make-styled-dmg should refuse when $STAGE_MOUNT is occupied" >&2
+    hdiutil detach "$STAGE_MOUNT" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  if [[ ! -d "$STAGE_MOUNT" ]]; then
+    echo "FAIL: make-styled-dmg detached the pre-existing $STAGE_MOUNT volume" >&2
+    exit 1
+  fi
+  if [[ ! -f "$STAGE_MOUNT/SENTINEL.txt" || -e "$STAGE_MOUNT/RatioThink.app" ]]; then
+    echo "FAIL: make-styled-dmg wrote into the pre-existing $STAGE_MOUNT volume" >&2
+    hdiutil detach "$STAGE_MOUNT" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  hdiutil detach "$STAGE_MOUNT" >/dev/null
+}
+
+# Shared background art for the styling-variant fixtures.
+xcrun swift "$BG_SWIFT" "$WORK_ROOT/bg.png" "$GEOMETRY_JSON" >/dev/null
+
+# baseline: the fully styled DMG the production builder produces.
+hdiutil detach "$STAGE_MOUNT" >/dev/null 2>&1 || true
+make_dummy_app "$WORK_ROOT/app/RatioThink.app"
+"$STYLED_SH" "$WORK_ROOT/app/RatioThink.app" "$WORK_ROOT/baseline.dmg" >/dev/null
+expect_pass "baseline" "$WORK_ROOT/baseline.dmg"
 
 # missing Applications symlink → no drag-install target (fails before styling).
 S="$WORK_ROOT/noapps-stage"; mkdir -p "$S"; make_dummy_app "$S/RatioThink.app"
@@ -155,9 +189,14 @@ make_dmg "$S" "$WORK_ROOT/unstyled.dmg"
 expect_fail "unstyled-no-background" "$WORK_ROOT/unstyled.dmg"
 
 # background present but no .DS_Store → window would open unstyled.
-expect_fail "no-dsstore" "$(build_dmg no-dsstore pop_with_background)"
+build_dmg no-dsstore pop_with_background
+expect_fail "no-dsstore" "$DMG_OUT"
 
 # fully styled but icons pinned in the wrong order (app right of Applications).
-expect_fail "reversed-icon-positions" "$(build_dmg reversed pop_styled_reversed)"
+build_dmg reversed pop_styled_reversed
+expect_fail "reversed-icon-positions" "$DMG_OUT"
+
+# staging mount-safety guard.
+test_collision_guard
 
 echo "DMG layout verifier regression tests passed"

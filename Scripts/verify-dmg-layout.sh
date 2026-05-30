@@ -74,10 +74,12 @@ fi
   fail "mounted DMG has no .DS_Store — the window is unstyled"
 
 # Parse the .DS_Store with the ds_store submodule reader and assert the icons
-# are pinned app-left/Applications-right and the background picture is set.
+# are pinned at the EXACT positions from the shared geometry file (the same file
+# the background art is drawn from) and that the background picture is set.
 # Self-contained + GUI-free, so it runs the same in CI.
-if ! VENDOR_DIR="$SCRIPT_DIR/vendor" python3 - "$MNT/.DS_Store" <<'PY'
-import os, sys
+if ! VENDOR_DIR="$SCRIPT_DIR/vendor" GEOMETRY_JSON="$SCRIPT_DIR/dmg-window.json" \
+     python3 - "$MNT/.DS_Store" <<'PY'
+import json, os, sys
 vendor = os.environ["VENDOR_DIR"]
 src = {name: os.path.join(vendor, name, "src") for name in ("ds_store", "mac_alias")}
 missing = [n for n, s in src.items() if not os.path.isfile(os.path.join(s, n, "__init__.py"))]
@@ -88,23 +90,29 @@ for s in src.values():
     sys.path.insert(0, s)
 from ds_store import DSStore
 
+with open(os.environ["GEOMETRY_JSON"], encoding="utf-8") as f:
+    geo = json.load(f)
+expected = {name: (i["x"], i["y"]) for name, i in geo["icons"].items()}
+
 ds_path = sys.argv[1]
 pos = {}
 background_set = False
 with DSStore.open(ds_path, "r") as d:
     for e in d:
-        if e.code == b"Iloc" and e.filename in ("RatioThink.app", "Applications"):
+        if e.code == b"Iloc" and e.filename in expected:
             pos[e.filename] = tuple(e.value[:2])
         if e.filename == "." and e.code == b"icvp":
             icvp = e.value
             background_set = icvp.get("backgroundType") == 2 and bool(icvp.get("backgroundImageAlias"))
 
-app = pos.get("RatioThink.app")
-apps = pos.get("Applications")
-if app is None or apps is None:
-    sys.exit(f"icon positions missing in .DS_Store (RatioThink.app={app}, Applications={apps})")
+# Assert the shipped positions match the shared geometry exactly (not just
+# ordering), so the icons stay aligned with the drawn arrow.
+if pos != expected:
+    sys.exit(f"icon positions {pos} do not match the geometry contract {expected}")
+app = expected["RatioThink.app"]
+apps = expected["Applications"]
 if app[0] >= apps[0]:
-    sys.exit(f"RatioThink.app ({app}) is not left of Applications ({apps})")
+    sys.exit(f"geometry contract is inconsistent — app ({app}) is not left of Applications ({apps})")
 if not background_set:
     sys.exit("background picture is not set in the icon-view options (icvp)")
 PY
