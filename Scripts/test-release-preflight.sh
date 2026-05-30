@@ -21,12 +21,16 @@ expect_nz() { if [ "$1" -ne 0 ];   then ok "$2 (rc=$1)"; else bad "$2 (got rc=0)
 have()  { if grep -q  "$1" <<<"$2"; then ok "$3"; else bad "$3"; fi; }
 haveE() { if grep -Eq "$1" <<<"$2"; then ok "$3"; else bad "$3"; fi; }
 
-make_dummy_app() {
+make_dummy_app() {  # $1=dir  [$2=entitlements plist] -> ad-hoc-signed bundle
   local app="$1/Dummy.app"
   mkdir -p "$app/Contents/MacOS"
   cp /bin/echo "$app/Contents/MacOS/Dummy"
   printf '%s' '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>Dummy</string><key>CFBundleIdentifier</key><string>com.example.dummy</string></dict></plist>' > "$app/Contents/Info.plist"
-  codesign -f -s - "$app" 2>/dev/null
+  if [ -n "${2:-}" ]; then
+    codesign -f -s - --entitlements "$2" "$app" 2>/dev/null
+  else
+    codesign -f -s - "$app" 2>/dev/null
+  fi
   printf '%s' "$app"
 }
 
@@ -61,15 +65,56 @@ expect_rc 65 "$RC" "unsupported extension exit 65"
 echo "test-release-preflight: .dmg path mounts + assesses the app inside"
 DMG="$TMP/Dummy.dmg"
 hdiutil create -volname Dummy -srcfolder "$APP" -fs HFS+ -format UDZO "$DMG" >/dev/null 2>&1
+MOUNT_BEFORE="$(mount)"
 set +e
 DMG_OUT="$("$PREFLIGHT" "$DMG" 2>&1)"; DMG_RC=$?
 set -e
+MOUNT_AFTER="$(mount)"
 expect_nz "$DMG_RC" "ad-hoc dmg: nonzero exit"
 have "Disk image:" "$DMG_OUT" "dmg section header present"
 have "mounting dmg to inspect" "$DMG_OUT" "dmg mounted for inspection"
-have "spctl --assess --type install" "$DMG_OUT" "dmg assessed as install"
-# Confirm no leftover mount from the preflight's EXIT trap.
-if mount | grep -q "$TMP"; then bad "dmg left mounted after preflight"; else ok "dmg detached cleanly"; fi
+# A .dmg is a disk image, so it must be assessed with `-t open --context
+# context:primary-signature` (Apple's documented form), NOT `-t install`
+# (which is for .pkg installers). Asserting the exact flags catches a
+# regression of the type even without a paid Developer ID cert.
+have "spctl --assess --type open --context context:primary-signature" "$DMG_OUT" "dmg assessed with -t open + primary-signature context"
+# Real mount-leak guard: the preflight mounts at its OWN mktemp dir, not the
+# test's $TMP, so the old `mount | grep "$TMP"` could never match and always
+# passed. Compare the full mount table before vs after — a leaked mount (e.g.
+# the cleanup trap's `|| true` swallowing a busy-detach failure) appears as a
+# new line and fails the test.
+if [ "$MOUNT_BEFORE" = "$MOUNT_AFTER" ]; then
+  ok "dmg detached cleanly (mount table unchanged)"
+else
+  bad "dmg left a mount behind: $(diff <(printf '%s\n' "$MOUNT_BEFORE") <(printf '%s\n' "$MOUNT_AFTER") | tr '\n' ' ')"
+fi
+
+echo "test-release-preflight: get-task-allow-entitled bundle must FAIL the verdict"
+# Exercises check_get_task_allow's FAIL branch — the exact invariant the
+# "Strip get-task-allow from the Release notarization candidate" commit
+# enforces. Ad-hoc signing WITH an entitlements plist yields a verify-valid
+# bundle that carries com.apple.security.get-task-allow, which the notary
+# service rejects.
+cat > "$TMP/gta.entitlements" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>com.apple.security.get-task-allow</key><true/></dict></plist>
+PLIST
+mkdir -p "$TMP/gta"
+GTA_APP="$(make_dummy_app "$TMP/gta" "$TMP/gta.entitlements")"
+set +e
+GTA_OUT="$("$PREFLIGHT" "$GTA_APP" 2>&1)"; GTA_RC=$?
+set -e
+# Guard the fixture itself: if codesign did not actually embed the entitlement,
+# the test would silently revert to the absent->PASS path and prove nothing.
+if codesign -d --entitlements :- "$GTA_APP" 2>/dev/null | grep -q 'get-task-allow'; then
+  ok "fixture carries get-task-allow"
+else
+  bad "fixture did NOT embed get-task-allow (codesign --entitlements failed) — F3 assertions are vacuous"
+fi
+expect_nz "$GTA_RC" "get-task-allow bundle: nonzero verdict"
+have "get-task-allow: PRESENT" "$GTA_OUT" "get-task-allow PRESENT line emitted (FAIL branch)"
+have "get-task-allow present" "$GTA_OUT" "get-task-allow listed as a blocking issue in the verdict"
 
 echo "------------------------------------------------------------"
 echo "test-release-preflight: $PASS passed, $FAILN failed"

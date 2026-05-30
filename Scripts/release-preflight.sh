@@ -119,17 +119,28 @@ check_get_task_allow() {
   fi
 }
 
+# $3 (optional) = an spctl --context value. A .dmg is a disk image, not an
+# installer package: `man spctl` defines --type `install` for .pkg and `open`
+# for opened documents/images, so a dmg must be assessed `-t open --context
+# context:primary-signature` (Apple's documented form) — using `install` would
+# spuriously reject a genuinely notarized dmg. The .app keeps `-t execute`.
 check_spctl() {
-  local path="$1" type="$2" out rc
+  local path="$1" type="$2" context="${3:-}" out rc
+  local args=(--assess --type "$type" --verbose=4)
+  local label="spctl --assess --type $type"
+  if [[ -n "$context" ]]; then
+    args=(--assess --type "$type" --context "$context" --verbose=4)
+    label="spctl --assess --type $type --context $context"
+  fi
   set +e
-  out="$(spctl --assess --type "$type" --verbose=4 "$path" 2>&1)"
+  out="$(spctl "${args[@]}" "$path" 2>&1)"
   rc=$?
   set -e
   if [[ $rc -eq 0 ]]; then
-    echo "$PASS spctl --assess --type $type: accepted"
+    echo "$PASS $label: accepted"
     indent "      " <<<"$out"
   else
-    echo "$FAIL spctl --assess --type $type: REJECTED (rc=$rc)"
+    echo "$FAIL $label: REJECTED (rc=$rc)"
     indent "      " <<<"$out"
     note_fail "spctl assessment rejected ($path)"
   fi
@@ -229,7 +240,7 @@ else
   section "Disk image: $ARTIFACT"
   check_quarantine "$ARTIFACT"
   check_codesign "$ARTIFACT"
-  check_spctl "$ARTIFACT" install
+  check_spctl "$ARTIFACT" open "context:primary-signature"
   check_staple "$ARTIFACT"
   # Mount read-only and assess the app inside (what the user actually runs).
   MNT="$(mktemp -d)"
