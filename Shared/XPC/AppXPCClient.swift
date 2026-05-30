@@ -31,6 +31,16 @@ public protocol AppXPCClient: Sendable {
   /// throws the helper-side `EngineError` when the stop is rejected, or
   /// an `AppXPCClientError` on transport failure.
   func stopEngine() async throws
+  /// Resident memory of the running engine, or nil when not running /
+  /// unavailable. Read on demand while the status popover is open; never
+  /// polled into a published field.
+  func engineMemory() async throws -> EngineMemorySample?
+}
+
+public extension AppXPCClient {
+  /// Default: memory unavailable. Test stubs that don't model the
+  /// engineMemory selector inherit nil and need no change.
+  func engineMemory() async throws -> EngineMemorySample? { nil }
 }
 
 public enum AppXPCClientError: Error, Sendable, CustomStringConvertible {
@@ -248,6 +258,60 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
       guard conn === connection else { return }
       conn?.invalidate()
       conn = nil
+    }
+  }
+
+  public func engineMemory() async throws -> EngineMemorySample? {
+    let connection = ensureConnection()
+    do {
+      return try await engineMemory(on: connection)
+    } catch let error as AppXPCClientError {
+      if case .replyTimeout = error {
+        invalidateIfCurrent(connection)
+      }
+      throw error
+    }
+  }
+
+  private func engineMemory(on connection: NSXPCConnection) async throws -> EngineMemorySample? {
+    let timeout = replyTimeout
+    return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<EngineMemorySample?, Error>) in
+      let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
+      func resumeOnce(_ result: Result<EngineMemorySample?, Error>) {
+        let shouldResume = resumed.withLock { fired -> Bool in
+          if fired { return false }
+          fired = true
+          return true
+        }
+        guard shouldResume else { return }
+        switch result {
+        case .success(let s): continuation.resume(returning: s)
+        case .failure(let e): continuation.resume(throwing: e)
+        }
+      }
+      if timeout > 0 {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+          resumeOnce(.failure(AppXPCClientError.replyTimeout(
+            selector: "engineMemory",
+            timeout: timeout
+          )))
+        }
+      }
+      let proxy = connection.remoteObjectProxyWithErrorHandler { err in
+        resumeOnce(.failure(AppXPCClientError.proxyError(err as NSError)))
+      }
+      guard let api = proxy as? PieHelperXPC else {
+        resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
+        return
+      }
+      api.engineMemory { data in
+        do {
+          let sample = try XPCPayload.decode(EngineMemorySample?.self, from: data)
+          resumeOnce(.success(sample))
+        } catch {
+          resumeOnce(.failure(AppXPCClientError.decode(error as NSError)))
+        }
+      }
     }
   }
 }

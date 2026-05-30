@@ -113,6 +113,12 @@ public final class PieEngineHost: @unchecked Sendable {
   public protocol EngineSession: Sendable {
     func shutdown() async
     func checkLiveness() async -> EngineLiveness
+    /// Resident memory of the live engine process in bytes, or nil when
+    /// unavailable. Default nil (see extension) so test fakes that only
+    /// model shutdown/liveness need no change; the production
+    /// `LaunchedSession` overrides with a `proc_pid_rusage` sample of the
+    /// pie pid.
+    func residentMemoryBytes() async -> UInt64?
   }
 
   // MARK: - Init
@@ -153,6 +159,21 @@ public final class PieEngineHost: @unchecked Sendable {
   /// Cheap snapshot. Lock-free path so XPC `engineStatus` never
   /// bounces through `stateQueue`.
   public var status: EngineStatus { statusLock.withLock { $0 } }
+
+  /// Live resident memory of the running engine process in bytes, or nil
+  /// when not running / unavailable. Hops onto `stateQueue` — the owner
+  /// of `_state`, which carries the live session — to extract the
+  /// session, then awaits its `proc_pid_rusage` sampler. Deliberately
+  /// off the hot `status` path: callers read this on demand (status
+  /// popover open), never per frame.
+  public func residentMemoryBytes() async -> UInt64? {
+    let session: (any EngineSession)? = stateQueue.sync {
+      if case let .running(_, _, session) = _state { return session }
+      return nil
+    }
+    guard let session else { return nil }
+    return await session.residentMemoryBytes()
+  }
 
   /// Diagnostic-only observer count. Mirrors `PieSupervisor
   /// .observerCountForTesting` so the HelperStatusItem integration
@@ -417,4 +438,8 @@ public extension PieEngineHost.EngineSession {
   /// (the production `LaunchedSession`) override this; test fakes that
   /// only model shutdown inherit it so they never trip the monitor.
   func checkLiveness() async -> EngineLiveness { .alive }
+
+  /// Default: memory unavailable. Only the production `LaunchedSession`
+  /// overrides this with a real `proc_pid_rusage` sample.
+  func residentMemoryBytes() async -> UInt64? { nil }
 }

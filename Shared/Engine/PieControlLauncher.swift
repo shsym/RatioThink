@@ -810,6 +810,65 @@ public actor LaunchedSession {
   public var pid: pid_t { process.processIdentifier }
   public var isRunning: Bool { process.isRunning }
 
+  /// Resident memory of the live pie process in bytes, or nil if the
+  /// engine is not running or the sample fails. Satisfies
+  /// `PieEngineHost.EngineSession`. Reads the actor-owned pid, then defers
+  /// to the nonisolated `proc_pid_rusage` helper. Measures the parent pie
+  /// process only; summing the process group is a deliberate follow-up.
+  ///
+  /// Liveness gate: never sample a dead/reaped engine. Foundation flips
+  /// `process.isRunning` false the instant the child exits — well before
+  /// `PieEngineHost`'s liveness monitor takes
+  /// ~`livenessFailureThreshold × livenessInterval` (~10 s) to demote
+  /// `_state` from `.running` — so this closes the window where the
+  /// popover would otherwise render a dead engine's STALE RSS (measured:
+  /// `proc_pid_rusage` returns rc==0 with ~1.2 MB of stale bytes for a
+  /// zombie pid). The static helper re-checks the raw pid as defence.
+  public func residentMemoryBytes() async -> UInt64? {
+    guard process.isRunning else { return nil }
+    return LaunchedSession.residentMemory(ofPID: process.processIdentifier)
+  }
+
+  /// `proc_pid_rusage(RUSAGE_INFO_V2)` → `ri_resident_size` for `pid`, or
+  /// nil when `pid` is not a live process or the sample is not a real
+  /// reading. `static` (nonisolated) so unit tests can sample a known pid
+  /// (e.g. `getpid()`) without standing up an actor.
+  ///
+  /// Two gates beyond rc:
+  ///  · LIVENESS — `proc_pid_rusage` returns rc==0 with STALE non-zero
+  ///    bytes for a zombie (exited-but-unreaped) pid, and the OS may reuse
+  ///    a dead pid for an unrelated process. `isPidLive` rejects both, so
+  ///    a dead engine never reports phantom (or someone else's) memory.
+  ///  · NON-ZERO — a live engine is never 0-resident; rc==0 with 0 bytes
+  ///    is an edge/failed reading, not a measurement, so it collapses into
+  ///    the same nil ("unavailable") channel rather than rendering "0 MB".
+  static func residentMemory(ofPID pid: pid_t) -> UInt64? {
+    guard isPidLive(pid) else { return nil }
+    var info = rusage_info_v2()
+    let rc = withUnsafeMutablePointer(to: &info) { ptr -> Int32 in
+      ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+        proc_pid_rusage(pid, RUSAGE_INFO_V2, $0)
+      }
+    }
+    guard rc == 0 else { return nil }
+    guard info.ri_resident_size > 0 else { return nil }
+    return info.ri_resident_size
+  }
+
+  /// True only when `pid` names a LIVE process — not a zombie
+  /// (exited-but-unreaped) nor a vanished/reused-dead pid. Measured:
+  /// `proc_pidinfo(PROC_PIDTBSDINFO)` returns the struct size for a live
+  /// process and 0 for a zombie or a gone pid, so a short read means
+  /// "not live"; the `SZOMB` check is defensive belt-and-suspenders. This
+  /// is the pid-validity guard `proc_pid_rusage` itself cannot provide.
+  static func isPidLive(_ pid: pid_t) -> Bool {
+    guard pid > 0 else { return false }
+    var info = proc_bsdinfo()
+    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+    let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size)
+    return n == size && info.pbi_status != UInt32(SZOMB)
+  }
+
   /// Record the control-plane WS address for later liveness probes.
   /// Called once by `launch()` after the handshake resolves it.
   func recordControlWSURL(_ url: URL) { controlWSURL = url }
