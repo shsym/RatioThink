@@ -80,7 +80,7 @@ let captionAttrs: [NSAttributedString.Key: Any] = [
 ]
 let captionSize = caption.size(withAttributes: captionAttrs)
 caption.draw(
-  at: NSPoint(x: (CGFloat(WIDTH) - captionSize.width) / 2, y: CENTER_Y + 46),
+  at: NSPoint(x: (CGFloat(WIDTH) - captionSize.width) / 2, y: CENTER_Y + 80),
   withAttributes: captionAttrs)
 
 NSGraphicsContext.restoreGraphicsState()
