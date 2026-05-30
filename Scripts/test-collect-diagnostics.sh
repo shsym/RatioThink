@@ -146,26 +146,51 @@ RATIOTHINK_DIAG_OUT_DIR="$E/out" bash "$SCRIPT" --window 1m >/dev/null
 bundleE="$(extract_bundle "$E/out" "$E/x")"
 refute_contains "$bundleE/report.txt" "ENGINE_FAILED" "E: benign 'error' does not trip ENGINE_FAILED"
 
-echo "case F: real pie Full-format ERROR line classifies ENGINE_FAILED (R1)"
+echo "case F: Rust panic in engine.log (stdout/stderr tee) classifies ENGINE_FAILED"
 F="$WORK_ROOT/F"; mkdir -p "$F/out" "$F/crash" "$F/home/logs"
 mini_app "$F/app/RatioThink.app"
 echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$F/home/logs/helper.log"
-# pie tracing default Full format: bare uppercase level token, not level=error.
-echo "2026-05-30T12:00:00.123Z  ERROR pie_server::serve: driver thread exited rc=1" > "$F/home/logs/engine.log"
+# Serve-path tracing goes to pie.log.<date>, NOT stdout — engine.log only sees
+# panic prose. Use the real signal that DOES reach it.
+echo "thread 'tokio-runtime-worker' panicked at runtime/src/server.rs:42:1: assertion failed" > "$F/home/logs/engine.log"
 RATIOTHINK_APP="$F/app/RatioThink.app" PIE_HOME="$F/home" RATIOTHINK_DIAG_CRASH_DIR="$F/crash" \
 RATIOTHINK_DIAG_OUT_DIR="$F/out" bash "$SCRIPT" --window 1m >/dev/null
 bundleF="$(extract_bundle "$F/out" "$F/x")"
-assert_contains "$bundleF/report.txt" "ENGINE_FAILED" "F: real pie ERROR in engine.log trips ENGINE_FAILED"
+assert_contains "$bundleF/report.txt" "ENGINE_FAILED" "F: 'panicked at' in engine.log trips ENGINE_FAILED"
 
-echo "case Fp: pie serve-path tracing (pie.log) ERROR also classifies ENGINE_FAILED (R1)"
+echo "case Fb: engine.fail breadcrumb in helper.log classifies ENGINE_FAILED"
+FB="$WORK_ROOT/Fb"; mkdir -p "$FB/out" "$FB/crash" "$FB/home/logs"
+mini_app "$FB/app/RatioThink.app"
+printf '2026-05-30T00:00:00Z helper helper.launch version=1.0\n2026-05-30T12:00:00Z helper engine.fail code=spawnFailed\n' > "$FB/home/logs/helper.log"
+RATIOTHINK_APP="$FB/app/RatioThink.app" PIE_HOME="$FB/home" RATIOTHINK_DIAG_CRASH_DIR="$FB/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$FB/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleFb="$(extract_bundle "$FB/out" "$FB/x")"
+assert_contains "$bundleFb/report.txt" "ENGINE_FAILED" "Fb: engine.fail breadcrumb trips ENGINE_FAILED"
+
+echo "case Fp: real serve-path teardown line in DATE-ROLLED pie.log.<date> -> ENGINE_FAILED (V1)"
 FP="$WORK_ROOT/Fp"; mkdir -p "$FP/out" "$FP/crash" "$FP/home/logs"
 mini_app "$FP/app/RatioThink.app"
 echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$FP/home/logs/helper.log"
-echo "2026-05-30T12:00:00Z FATAL pie_server::serve: caps channel disconnected" > "$FP/home/logs/pie.log"
+# pie writes tracing_appender rolling::daily -> pie.log.<date>, never literal
+# pie.log; the real engine-death line is lifecycle.rs's "driver ... exited
+# unexpectedly". Both the dated filename and the anchored line are required.
+echo "2026-05-30T12:00:00Z  ERROR pie_server: driver shmem-abc123 exited unexpectedly; tearing down" > "$FP/home/logs/pie.log.2026-05-30"
 RATIOTHINK_APP="$FP/app/RatioThink.app" PIE_HOME="$FP/home" RATIOTHINK_DIAG_CRASH_DIR="$FP/crash" \
 RATIOTHINK_DIAG_OUT_DIR="$FP/out" bash "$SCRIPT" --window 1m >/dev/null
 bundleFp="$(extract_bundle "$FP/out" "$FP/x")"
-assert_contains "$bundleFp/report.txt" "ENGINE_FAILED" "Fp: pie.log FATAL trips ENGINE_FAILED"
+assert_contains "$bundleFp/report.txt" "ENGINE_FAILED" "Fp: pie.log.<date> teardown line trips ENGINE_FAILED"
+
+echo "case Fn: recoverable per-request ERROR in pie.log.<date> must NOT classify ENGINE_FAILED (V2)"
+FN="$WORK_ROOT/Fn"; mkdir -p "$FN/out" "$FN/crash" "$FN/home/logs"
+mini_app "$FN/app/RatioThink.app"
+echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$FN/home/logs/helper.log"
+# pie logs tracing::error! for recoverable churn (user quits mid-stream) — the
+# engine keeps serving; this must not read as engine death.
+echo "2026-05-30T12:00:00Z  ERROR pie_server::server: Error writing to ws stream: Broken pipe" > "$FN/home/logs/pie.log.2026-05-30"
+RATIOTHINK_APP="$FN/app/RatioThink.app" PIE_HOME="$FN/home" RATIOTHINK_DIAG_CRASH_DIR="$FN/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$FN/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleFn="$(extract_bundle "$FN/out" "$FN/x")"
+refute_contains "$bundleFn/report.txt" "ENGINE_FAILED" "Fn: recoverable ws-write ERROR does not trip ENGINE_FAILED"
 
 echo "case G: all-clear with recent Unified Log activity -> verified OK headline (F2)"
 G="$WORK_ROOT/G"; mkdir -p "$G/out" "$G/crash" "$G/home/logs" "$G/bin"

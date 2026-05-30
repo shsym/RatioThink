@@ -180,7 +180,6 @@ classify() {
   local app_log="$LOGS_DIR/app.log"
   local helper_log="$LOGS_DIR/helper.log"
   local engine_log="$LOGS_DIR/engine.log"
-  local pie_log="$LOGS_DIR/pie.log"
 
   if [ ! -d "$APP" ]; then
     add_verdict "APP_MISSING: RatioThink.app not found at $APP — was it dragged into /Applications?"
@@ -211,20 +210,39 @@ classify() {
     add_verdict "HELPER_CRASHED_OR_DEGRADED: helper.log shows a degraded boot — see app-logs/helper.log"
   fi
 
-  # Engine failed: an engine.fail breadcrumb, a failure line in the engine's
-  # log, or a pie crash. The engine log is a verbatim tee of pie's stdout/
-  # stderr (engine.log) and serve-path tracing (pie.log). pie uses tracing's
-  # default Full format, which renders the level as a BARE UPPERCASE token
-  # ("… ERROR pie_server::…"), never "level=error"/"[ERROR]". Match that token
-  # CASE-SENSITIVELY so pie's lowercase benign body ("0 errors", "error_rate=0",
-  # model names) does not false-positive (R1 — a too-narrow v1 pattern missed
-  # real ERROR lines and re-opened a false-OK).
-  local engine_fail_re='(^|[[:space:]])(ERROR|FATAL)([[:space:]]|$)|panicked at|panic'
-  if { [ -f "$helper_log" ] && grep -q 'engine\.fail' "$helper_log" 2>/dev/null; } \
-     || { [ -f "$engine_log" ] && grep -qE "$engine_fail_re" "$engine_log" 2>/dev/null; } \
-     || { [ -f "$pie_log" ] && grep -qE "$engine_fail_re" "$pie_log" 2>/dev/null; } \
-     || find "$CRASH_DIR" -maxdepth 1 -type f -name 'pie-[0-9]*' -mtime -7 2>/dev/null | grep -q .; then
-    add_verdict "ENGINE_FAILED: an engine failure was recorded — see app-logs/{helper.log,engine.log,pie.log}, crash-reports/"
+  # Engine failed — GENUINE death signals only (never bare ERROR/FATAL): pie has
+  # no FATAL level, and tracing::error! marks RECOVERABLE per-request churn
+  # (ws-write / auth / msgpack on a still-serving engine — Vendor/pie
+  # runtime/src/server.rs), so matching the level token would false-fire when a
+  # user quits mid-stream. The real signals:
+  #  · engine.fail breadcrumb in helper.log — the supervisor observed a .failed
+  #    transition (incl. bootstrap-fatal via handshake timeout);
+  #  · a pie-* crash report;
+  #  · a Rust `panicked at` in engine.log (PieSupervisor's stdout/stderr tee —
+  #    pie's serve-path tracing goes to pie.log.<date>, NOT stdout, so only
+  #    panic prose lands in engine.log);
+  #  · pie's serve-path teardown line `driver <name> exited unexpectedly` in the
+  #    DATE-ROLLED pie.log.* files (Vendor/pie server/src/serve/lifecycle.rs;
+  #    tracing_appender rolling::daily writes pie.log.YYYY-MM-DD, never a literal
+  #    `pie.log`).
+  local engine_failed=0
+  if [ -f "$helper_log" ] && grep -q 'engine\.fail' "$helper_log" 2>/dev/null; then
+    engine_failed=1
+  fi
+  if [ -f "$engine_log" ] && grep -qF 'panicked at' "$engine_log" 2>/dev/null; then
+    engine_failed=1
+  fi
+  for pl in "$LOGS_DIR"/pie.log*; do
+    [ -f "$pl" ] || continue
+    if grep -qE 'driver .* exited unexpectedly' "$pl" 2>/dev/null; then
+      engine_failed=1; break
+    fi
+  done
+  if find "$CRASH_DIR" -maxdepth 1 -type f -name 'pie-[0-9]*' -mtime -7 2>/dev/null | grep -q .; then
+    engine_failed=1
+  fi
+  if [ "$engine_failed" -eq 1 ]; then
+    add_verdict "ENGINE_FAILED: an engine failure was recorded — see app-logs/{helper.log,engine.log,pie.log*}, crash-reports/"
   fi
 
   # Activity / empty-log handling — always actionable, never an empty dir.
