@@ -180,6 +180,7 @@ classify() {
   local app_log="$LOGS_DIR/app.log"
   local helper_log="$LOGS_DIR/helper.log"
   local engine_log="$LOGS_DIR/engine.log"
+  local pie_log="$LOGS_DIR/pie.log"
 
   if [ ! -d "$APP" ]; then
     add_verdict "APP_MISSING: RatioThink.app not found at $APP — was it dragged into /Applications?"
@@ -210,11 +211,20 @@ classify() {
     add_verdict "HELPER_CRASHED_OR_DEGRADED: helper.log shows a degraded boot — see app-logs/helper.log"
   fi
 
-  # Engine failed: an engine.fail breadcrumb, an engine.log failure, or a pie crash.
+  # Engine failed: an engine.fail breadcrumb, a failure line in the engine's
+  # log, or a pie crash. The engine log is a verbatim tee of pie's stdout/
+  # stderr (engine.log) and serve-path tracing (pie.log). pie uses tracing's
+  # default Full format, which renders the level as a BARE UPPERCASE token
+  # ("… ERROR pie_server::…"), never "level=error"/"[ERROR]". Match that token
+  # CASE-SENSITIVELY so pie's lowercase benign body ("0 errors", "error_rate=0",
+  # model names) does not false-positive (R1 — a too-narrow v1 pattern missed
+  # real ERROR lines and re-opened a false-OK).
+  local engine_fail_re='(^|[[:space:]])(ERROR|FATAL)([[:space:]]|$)|panicked at|panic'
   if { [ -f "$helper_log" ] && grep -q 'engine\.fail' "$helper_log" 2>/dev/null; } \
-     || { [ -f "$engine_log" ] && grep -qE 'panic|fatal|level=error|\[ERROR\]' "$engine_log" 2>/dev/null; } \
+     || { [ -f "$engine_log" ] && grep -qE "$engine_fail_re" "$engine_log" 2>/dev/null; } \
+     || { [ -f "$pie_log" ] && grep -qE "$engine_fail_re" "$pie_log" 2>/dev/null; } \
      || find "$CRASH_DIR" -maxdepth 1 -type f -name 'pie-[0-9]*' -mtime -7 2>/dev/null | grep -q .; then
-    add_verdict "ENGINE_FAILED: an engine failure was recorded — see app-logs/helper.log, app-logs/engine.log, crash-reports/"
+    add_verdict "ENGINE_FAILED: an engine failure was recorded — see app-logs/{helper.log,engine.log,pie.log}, crash-reports/"
   fi
 
   # Activity / empty-log handling — always actionable, never an empty dir.

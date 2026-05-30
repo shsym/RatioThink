@@ -24,6 +24,30 @@ refute_contains() { # <file> <needle> <label> — passes when the needle is ABSE
     bad "$3 (unexpectedly found: $2)"; echo "    --- $1 ---"; sed 's/^/    /' "$1" | head -40
   else ok "$3"; fi
 }
+# PATH shims so a hermetic run can reach the all-clear OK branch: real spctl/
+# launchctl would reject a fake bundle / report no helper, and real `log show`
+# is machine-dependent. Shims force spctl/launchctl success and make `log`
+# emit a controlled fixture so ACTIVITY_VERIFIED is deterministic.
+make_shims() { # <bin_dir> <unified_fixture_file>
+  local d="$1" fixture="$2"
+  mkdir -p "$d"
+  printf '#!/bin/bash\nexit 0\n' > "$d/spctl"
+  printf '#!/bin/bash\nexit 0\n' > "$d/launchctl"
+  cat > "$d/log" <<EOF
+#!/bin/bash
+cat "$fixture" 2>/dev/null
+exit 0
+EOF
+  chmod +x "$d/spctl" "$d/launchctl" "$d/log"
+}
+mini_app() { # <app_path> — minimal RatioThink.app with a version so it's "present"
+  mkdir -p "$1/Contents"
+  cat > "$1/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>1.0</string></dict></plist>
+PLIST
+}
 
 # Unzip the single produced bundle and echo its extracted root dir.
 extract_bundle() { # <out_dir> <dest>
@@ -121,6 +145,54 @@ RATIOTHINK_APP="$E/nonexistent" PIE_HOME="$E/home" RATIOTHINK_DIAG_CRASH_DIR="$E
 RATIOTHINK_DIAG_OUT_DIR="$E/out" bash "$SCRIPT" --window 1m >/dev/null
 bundleE="$(extract_bundle "$E/out" "$E/x")"
 refute_contains "$bundleE/report.txt" "ENGINE_FAILED" "E: benign 'error' does not trip ENGINE_FAILED"
+
+echo "case F: real pie Full-format ERROR line classifies ENGINE_FAILED (R1)"
+F="$WORK_ROOT/F"; mkdir -p "$F/out" "$F/crash" "$F/home/logs"
+mini_app "$F/app/RatioThink.app"
+echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$F/home/logs/helper.log"
+# pie tracing default Full format: bare uppercase level token, not level=error.
+echo "2026-05-30T12:00:00.123Z  ERROR pie_server::serve: driver thread exited rc=1" > "$F/home/logs/engine.log"
+RATIOTHINK_APP="$F/app/RatioThink.app" PIE_HOME="$F/home" RATIOTHINK_DIAG_CRASH_DIR="$F/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$F/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleF="$(extract_bundle "$F/out" "$F/x")"
+assert_contains "$bundleF/report.txt" "ENGINE_FAILED" "F: real pie ERROR in engine.log trips ENGINE_FAILED"
+
+echo "case Fp: pie serve-path tracing (pie.log) ERROR also classifies ENGINE_FAILED (R1)"
+FP="$WORK_ROOT/Fp"; mkdir -p "$FP/out" "$FP/crash" "$FP/home/logs"
+mini_app "$FP/app/RatioThink.app"
+echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$FP/home/logs/helper.log"
+echo "2026-05-30T12:00:00Z FATAL pie_server::serve: caps channel disconnected" > "$FP/home/logs/pie.log"
+RATIOTHINK_APP="$FP/app/RatioThink.app" PIE_HOME="$FP/home" RATIOTHINK_DIAG_CRASH_DIR="$FP/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$FP/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleFp="$(extract_bundle "$FP/out" "$FP/x")"
+assert_contains "$bundleFp/report.txt" "ENGINE_FAILED" "Fp: pie.log FATAL trips ENGINE_FAILED"
+
+echo "case G: all-clear with recent Unified Log activity -> verified OK headline (F2)"
+G="$WORK_ROOT/G"; mkdir -p "$G/out" "$G/crash" "$G/home/logs" "$G/bin"
+mini_app "$G/app/RatioThink.app"
+echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$G/home/logs/helper.log"
+printf '2026-05-30 12:00:00 com.ratiothink.app: ready\n' > "$G/unified.fixture"
+make_shims "$G/bin" "$G/unified.fixture"
+PATH="$G/bin:$PATH" RATIOTHINK_APP="$G/app/RatioThink.app" PIE_HOME="$G/home" \
+RATIOTHINK_DIAG_CRASH_DIR="$G/crash" RATIOTHINK_DIAG_OUT_DIR="$G/out" \
+  bash "$SCRIPT" --window 1m >/dev/null
+bundleG="$(extract_bundle "$G/out" "$G/x")"
+assert_contains "$bundleG/report.txt" "OK: no failure signature" "G: clean state -> OK verdict"
+assert_contains "$bundleG/report.txt" "recent activity found"    "G: claims recent activity when Unified Log has lines"
+
+echo "case H: all-clear with NO recent Unified Log activity -> unverified headline (F2)"
+H="$WORK_ROOT/H"; mkdir -p "$H/out" "$H/crash" "$H/home/logs" "$H/bin"
+mini_app "$H/app/RatioThink.app"
+echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$H/home/logs/helper.log"
+: > "$H/unified.empty"
+make_shims "$H/bin" "$H/unified.empty"
+PATH="$H/bin:$PATH" RATIOTHINK_APP="$H/app/RatioThink.app" PIE_HOME="$H/home" \
+  RATIOTHINK_DIAG_CRASH_DIR="$H/crash" RATIOTHINK_DIAG_OUT_DIR="$H/out" \
+  bash "$SCRIPT" --window 1m >/dev/null
+bundleH="$(extract_bundle "$H/out" "$H/x")"
+assert_contains "$bundleH/report.txt" "OK: no failure signature"              "H: clean state -> OK verdict"
+assert_contains "$bundleH/report.txt" "No recent Unified Log activity confirmed" "H: unverified-activity headline"
+refute_contains "$bundleH/report.txt" "recent activity found"                 "H: does not claim recent activity"
 
 echo
 echo "collect-diagnostics self-test: $pass passed, $fail failed"
