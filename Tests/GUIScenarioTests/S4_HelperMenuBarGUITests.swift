@@ -17,7 +17,51 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
   /// Sibling S5 tests apply the same annotation for the same reason.
   @MainActor
   func test_helper_status_bar_surfaces_design_items() async throws {
+    // Drive a DETERMINISTIC `Engine: stopped` boot. The helper auto-resumes
+    // the ACTIVE profile at boot (HelperMain.autoResumeEngineOnBoot), so a
+    // freshly-seeded PIE_HOME — whose seed also writes the active-profile
+    // marker — boots to `starting…`/`Pause Engine`, and a missing model to
+    // `failed (modelMissing)`; neither is the idle shell this test asserts.
+    // So pre-write profiles/chat.toml WITHOUT the `<PIE_HOME>/active-profile`
+    // marker: `seedDefaultsIfEmpty` skips (a .toml already exists) so no
+    // marker is written, `activeProfileID` is nil, and autoResume no-ops
+    // (`.noActiveProfile`) → the engine stays `.stopped`. The model is still
+    // staged (app-staged path — the GGUF-only default repo has no HF-cache
+    // snapshot fallback) so the profile resolves: a realistic "installed but
+    // idle" state that keeps the fixture + skip-guard meaningful. PIE_HOME
+    // lives under the runner-writable NSTemporaryDirectory container (the
+    // sandboxed runner cannot create dirs under /tmp).
+    let fm = FileManager.default
+    let modelSource = try SeededModelFixture.require()
+    let tempDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("pie-s4design-\(UUID().uuidString)", isDirectory: true)
+    let profilesDir = tempDir.appendingPathComponent("profiles", isDirectory: true)
+    let modelsDir = tempDir.appendingPathComponent("models", isDirectory: true)
+    try fm.createDirectory(at: profilesDir, withIntermediateDirectories: true)
+    try fm.createDirectory(at: modelsDir, withIntermediateDirectories: true)
+    addTeardownBlock { try? fm.removeItem(at: tempDir) }
+    try SeededModelFixture.stage(modelSource, intoModels: modelsDir)
+    // Mirrors ProfileStore.defaultChatTOML / defaultChatModelID. Present but
+    // NOT marked active, so the boot stays idle (`Engine: stopped`).
+    let chatTOML = """
+    id = "chat"
+    name = "Chat"
+    icon = "bubble.left.and.bubble.right"
+    model = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    inferlet = "chat-apc"
+    system_prompt = "You are a helpful assistant."
+
+    [sampling]
+    temperature = 0.7
+    top_p = 0.9
+    max_tokens = 2048
+
+    """
+    try chatTOML.write(to: profilesDir.appendingPathComponent("chat.toml"),
+                       atomically: true, encoding: .utf8)
+
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app.helper")
+    app.launchEnvironment["PIE_HOME"] = tempDir.path
     // Debug dev builds are ad-hoc-signed (no Team ID).
     // `HelperXPCListener.verifyStartupInvariants` preconditionFails
     // on `.teamIDAbsent` unless a bypass env is captured. Notarized

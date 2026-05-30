@@ -142,6 +142,7 @@ test-smoke: engine-build $(LOGDIR) ## Engine subprocess smoke (depends on built 
 	  exit $$status
 
 test-gui-script: ## Fast preflight regressions for GUI E2E wrappers
+	Scripts/test-run-stage-test-model.sh
 	Scripts/test-run-chat-gui-e2e.sh
 	Scripts/test-run-resume-gui-history-e2e.sh
 	Scripts/test-run-first-launch-package-e2e.sh
@@ -162,6 +163,11 @@ test-app-icon-assets: ## Regression-test the app-icon verifier failure modes
 	Scripts/test-verify-app-icon-assets.sh
 
 test-gui: genproject $(LOGDIR) ## GUI scenarios (S4, S5) via XCUITest — needs seated session
+	@# Provision the model fixture (symlink from HF cache) so the
+	@# model-dependent helper-menu test resolves its seeded profile.
+	@# Guide-and-continue: if the model is absent the tests XCTSkip with
+	@# the same instruction this prints, so the suite never hard-fails on it.
+	@Scripts/stage-test-model.sh || echo "warning: model fixture unavailable — model-dependent GUI tests will XCTSkip; see guidance above."
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-gui.log; \
 	  if ! pgrep -x Dock >/dev/null 2>&1; then \
