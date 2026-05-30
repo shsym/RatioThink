@@ -62,6 +62,11 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   func applicationDidFinishLaunching(_ note: Notification) {
     HelperConfig.assertStartupContract()
     Log.helper.info("RatioThinkHelper launched (xpc=\(HelperConfig.xpcServiceName, privacy: .public) testMode=\(HelperConfig.isTestMode, privacy: .public))")
+    let info = Bundle.main.infoDictionary
+    Diag.helper.event("helper.launch", [
+      ("version", info?["CFBundleShortVersionString"] as? String ?? "?"),
+      ("build", info?["CFBundleVersion"] as? String ?? "?"),
+    ])
     eagerProbePieDirs()
     setupStatusItemIfNeeded()
     registerLoginItemIfNeeded()
@@ -73,6 +78,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // remains as the ongoing reminder. Dispatched async so the runloop
     // is up before we beginSheetModalForWindow.
     if let reason = degradedReason {
+      Diag.helper.event("helper.degraded", [("reason", "\(reason)")])
       DispatchQueue.main.async { [weak self] in
         self?.presentPieDirsAlert(title: "RatioThink cannot start", error: reason)
       }
@@ -485,6 +491,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
                             keyEquivalent: "q"))
     item.menu = menu
     self.statusItem = item
+    Diag.helper.event("statusitem.create", [("kind", "normal")])
 
     // Review v1 F3: no synthetic `.stopped` initial render here.
     // `subscribeToSupervisor` registers an observer whose
@@ -569,6 +576,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       Log.helper.info("statusItem: initial observer paint arrived AFTER the \(Self.initialRenderDeadlineSeconds, privacy: .public)s watchdog deadline — supervisor wiring intact, just slow")
     }
     Log.helper.info("statusItem: dot=\(model.dot.rawValue, privacy: .public) label=\(model.engineLabel, privacy: .public) pr.title=\(model.pauseResume.title, privacy: .public) pr.enabled=\(model.pauseResume.enabled, privacy: .public)")
+    Diag.helper.event("statusitem.update", [("dot", model.dot.rawValue), ("label", model.engineLabel)])
     statusItemBinding().apply(model)
   }
 
@@ -620,6 +628,25 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     case .loading: return ("circle.fill", .systemYellow)
     case .running: return ("circle.fill", .systemGreen)
     case .error:   return ("exclamationmark.circle.fill", .systemRed)
+    }
+  }
+
+  /// Durable engine-lifecycle breadcrumb for each healthy-mode transition. The
+  /// `.failed` message is intentionally omitted — its code is the routable
+  /// signal and the full text already rides Unified Logging + engine.log;
+  /// `.stopping` is a transient and is skipped.
+  private static func recordEngineBreadcrumb(for status: EngineStatus) {
+    switch status {
+    case .starting:
+      Diag.helper.event("engine.start")
+    case let .running(port, profileID):
+      Diag.helper.event("engine.ready", [("port", String(port)), ("profile", profileID)])
+    case let .failed(code, _):
+      Diag.helper.event("engine.fail", [("code", code.rawValue)])
+    case .stopped:
+      Diag.helper.event("engine.stop")
+    case .stopping:
+      break
     }
   }
 
@@ -729,6 +756,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
         if case .failed = status {
           Log.helper.error("engine-host transition: \(String(describing: status), privacy: .public)")
         }
+        Self.recordEngineBreadcrumb(for: status)
         self.applyStatusItemModel(HelperStatusItemModel.make(from: status))
       }
     }
@@ -1014,6 +1042,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     menu.addItem(NSMenuItem(title: "Quit RatioThink", action: #selector(quitPie), keyEquivalent: "q"))
     item.menu = menu
     self.statusItem = item
+    Diag.helper.event("statusitem.create", [("kind", "degraded")])
   }
 
   @objc func showPie() {

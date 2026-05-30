@@ -90,6 +90,8 @@ public final class ModelDownloadController: ObservableObject {
       let msg = String(describing: err)
       lastError = "start(repo: \(repo), file: \(file)) failed: \(msg)"
       Self.log.error("ModelDownloadController enqueue failed: \(msg, privacy: .public)")
+      Diag.app.event("download.fail", [("phase", "start"), ("file", file),
+                                       ("reason", DiagnosticLog.redactHome(msg))])
       return nil
 
     case .success(let handle):
@@ -104,6 +106,7 @@ public final class ModelDownloadController: ObservableObject {
                                           file: handle.file,
                                           progress: initial,
                                           errorMessage: nil)
+      Diag.app.event("download.start", [("repo", repo), ("file", file)])
       let stream = downloader.progress(for: handle)
       Task { [weak self] in
         await self?.consume(stream: stream, handle: handle)
@@ -267,6 +270,19 @@ public final class ModelDownloadController: ObservableObject {
     if entry.isTerminal {
       if progress.phase == .completed {
         completionTick &+= 1
+      }
+      // Durable breadcrumb on the terminal transition only — guarded by the
+      // prior-phase change so the per-tick `apply` calls don't duplicate it.
+      if priorPhase != progress.phase {
+        switch progress.phase {
+        case .completed:
+          Diag.app.event("download.finish", [("file", handle.file)])
+        case .failed:
+          Diag.app.event("download.fail", [("file", handle.file),
+            ("reason", DiagnosticLog.redactHome(entry.errorMessage ?? "unknown"))])
+        case .starting, .downloading, .verifying, .cancelled:
+          break
+        }
       }
       scheduleEviction(of: handle.id)
     }

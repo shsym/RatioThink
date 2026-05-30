@@ -39,6 +39,7 @@ public final class ChatSendController: ObservableObject {
     let myGeneration = generation
     let request = Self.makeRequest(chat: chat, options: options)
     isInFlight = true
+    Diag.app.event("chat.send", [("model", options.modelID)])
 
     task = Task { @MainActor [weak self] in
       guard let self else { return }
@@ -105,6 +106,9 @@ public final class ChatSendController: ObservableObject {
             writer?.appendDelta(content)
           case let .finish(reason):
             writer?.finish(meta: Self.finishMeta(for: reason))
+            let reasonValue = Self.finishReasonValue(for: reason)
+            Diag.app.event(reasonValue == "length" ? "chat.truncated" : "chat.stream_end",
+                           [("reason", reasonValue)])
             self.activeWriter = nil
             self.activeAssistant = nil
             self.activeContext = nil
@@ -168,22 +172,23 @@ public final class ChatSendController: ObservableObject {
     )
   }
 
-  private static func finishMeta(for reason: ChatEvent.FinishReason) -> Data? {
-    let value: String
+  /// Canonical wire string for a finish reason. Shared by `finishMeta`
+  /// (persisted JSON) and the `chat.stream_end`/`chat.truncated` breadcrumb so
+  /// the two never drift.
+  static func finishReasonValue(for reason: ChatEvent.FinishReason) -> String {
     switch reason {
-    case .stop:
-      value = "stop"
-    case .length:
-      value = "length"
-    case .cancelled:
-      value = "cancelled"
-    case .other(let raw):
-      value = raw
+    case .stop:           return "stop"
+    case .length:         return "length"
+    case .cancelled:      return "cancelled"
+    case .other(let raw): return raw
     }
+  }
+
+  private static func finishMeta(for reason: ChatEvent.FinishReason) -> Data? {
     struct FinishMeta: Encodable { let finishReason: String }
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase
-    return try? encoder.encode(FinishMeta(finishReason: value))
+    return try? encoder.encode(FinishMeta(finishReason: finishReasonValue(for: reason)))
   }
 
   private static func markAssistant(
@@ -193,6 +198,8 @@ public final class ChatSendController: ObservableObject {
     persistenceStatus: PersistenceStatus
   ) {
     assistant.content = "⚠️ \(PersistenceStatus.formatError(error))"
+    // Breadcrumb the error TYPE only — never the prompt/response content.
+    Diag.app.event("chat.fail", [("error", String(describing: type(of: error)))])
     do {
       try context.save()
     } catch {
