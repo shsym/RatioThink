@@ -76,6 +76,7 @@ trap cleanup EXIT
 
 REPORT="$WORK/report.txt"
 VERDICTS=""   # accumulated, newline-separated
+ACTIVITY_VERIFIED=0   # set by classify() iff Unified Logging had recent lines
 
 add_verdict() { VERDICTS="${VERDICTS}$1"$'\n'; }
 
@@ -195,6 +196,13 @@ classify() {
     add_verdict "HELPER_LAUNCHCTL_MISSING: launchd has no '$HELPER_LABEL' agent — the helper was never registered (or registration was rejected)"
   fi
 
+  # Main app crashed: a RatioThink-* crash report (anchored to exclude the
+  # helper's RatioThinkHelper-* reports). This is the single most common
+  # "the app does nothing" cause and must not slip through to an OK verdict.
+  if find "$CRASH_DIR" -maxdepth 1 -type f -name 'RatioThink-*' ! -name 'RatioThinkHelper-*' -mtime -7 2>/dev/null | grep -q .; then
+    add_verdict "APP_CRASHED: a recent RatioThink crash report exists — the main app started then crashed; see crash-reports/"
+  fi
+
   # Helper crashed / degraded: a helper crash report, or a degraded breadcrumb.
   if find "$CRASH_DIR" -maxdepth 1 -type f -name 'RatioThinkHelper-*' -mtime -7 2>/dev/null | grep -q .; then
     add_verdict "HELPER_CRASHED_OR_DEGRADED: a recent RatioThinkHelper crash report exists — see crash-reports/"
@@ -204,7 +212,7 @@ classify() {
 
   # Engine failed: an engine.fail breadcrumb, an engine.log failure, or a pie crash.
   if { [ -f "$helper_log" ] && grep -q 'engine\.fail' "$helper_log" 2>/dev/null; } \
-     || { [ -f "$engine_log" ] && grep -qiE 'fatal|panic|error' "$engine_log" 2>/dev/null; } \
+     || { [ -f "$engine_log" ] && grep -qE 'panic|fatal|level=error|\[ERROR\]' "$engine_log" 2>/dev/null; } \
      || find "$CRASH_DIR" -maxdepth 1 -type f -name 'pie-[0-9]*' -mtime -7 2>/dev/null | grep -q .; then
     add_verdict "ENGINE_FAILED: an engine failure was recorded — see app-logs/helper.log, app-logs/engine.log, crash-reports/"
   fi
@@ -212,6 +220,11 @@ classify() {
   # Activity / empty-log handling — always actionable, never an empty dir.
   local unified_has_lines=0
   [ -s "$unified" ] && grep -q 'com.ratiothink' "$unified" 2>/dev/null && unified_has_lines=1
+  # Surfaced to the OK headline so it only claims "recent activity" when
+  # Unified Logging actually returned com.ratiothink lines in the window —
+  # breadcrumb files are size-rotated, not time-bounded, so their presence
+  # is NOT evidence of recent activity (F2).
+  ACTIVITY_VERIFIED="$unified_has_lines"
   if [ ! -f "$helper_log" ]; then
     add_verdict "NOTE: no helper.log breadcrumb — the helper never launched, or never reached its logs dir"
   fi
@@ -235,7 +248,7 @@ redact_all() {
     LC_ALL=C sed -i '' -E \
       -e "s#${home_esc}#~#g" \
       -e 's/hf_[A-Za-z0-9]+/hf_REDACTED/g' \
-      -e 's/[Bb]earer [A-Za-z0-9._-]+/Bearer REDACTED/g' \
+      -e 's/([Bb]earer )[^[:space:]]+/\1REDACTED/g' \
       -e 's/(token|access_token|api_key|apikey)=[^ &"'"'"']+/\1=REDACTED/g' \
       "$f" 2>/dev/null || true
   done
@@ -264,8 +277,10 @@ classify
 VERDICT_BLOCK="================ VERDICTS ================"$'\n'
 if [ -n "$VERDICTS" ]; then
   VERDICT_BLOCK="${VERDICT_BLOCK}${VERDICTS}"
-else
+elif [ "${ACTIVITY_VERIFIED:-0}" -eq 1 ]; then
   VERDICT_BLOCK="${VERDICT_BLOCK}OK: no failure signature detected — app present, helper registered, recent activity found."$'\n'
+else
+  VERDICT_BLOCK="${VERDICT_BLOCK}OK: no failure signature detected — app present, helper registered. No recent Unified Log activity confirmed in the last $WINDOW (see unified-log.txt); any breadcrumb logs may be from an earlier run."$'\n'
 fi
 
 {

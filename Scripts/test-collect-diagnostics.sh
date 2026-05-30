@@ -19,6 +19,11 @@ assert_contains() { # <file> <needle> <label>
     bad "$3 (missing: $2)"; echo "    --- $1 ---"; sed 's/^/    /' "$1" | head -40; fi
 }
 assert_exists() { [ -e "$1" ] && ok "$2" || bad "$2 (no $1)"; }
+refute_contains() { # <file> <needle> <label> — passes when the needle is ABSENT
+  if grep -qF -- "$2" "$1"; then
+    bad "$3 (unexpectedly found: $2)"; echo "    --- $1 ---"; sed 's/^/    /' "$1" | head -40
+  else ok "$3"; fi
+}
 
 # Unzip the single produced bundle and echo its extracted root dir.
 extract_bundle() { # <out_dir> <dest>
@@ -80,6 +85,42 @@ assert_contains "$bundleB/app-logs/app.log" "hf_REDACTED"    "B: redacts hf_ tok
 assert_contains "$bundleB/app-logs/app.log" "token=REDACTED" "B: redacts token="
 if grep -qF "$HOME/Library/x" "$bundleB/app-logs/app.log"; then
   bad "B: raw \$HOME leaked into bundle"; else ok "B: no raw \$HOME in bundle"; fi
+
+echo "case C: main-app crash report must classify APP_CRASHED, not OK (F1)"
+C="$WORK_ROOT/C"; mkdir -p "$C/out" "$C/crash" "$C/home/logs"
+CAPP="$C/app/RatioThink.app"; mkdir -p "$CAPP/Contents"
+cat > "$CAPP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>1.0</string></dict></plist>
+PLIST
+echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$C/home/logs/helper.log"
+echo "fake app crash" > "$C/crash/RatioThink-2026-05-30-120000.ips"
+RATIOTHINK_APP="$CAPP" PIE_HOME="$C/home" RATIOTHINK_DIAG_CRASH_DIR="$C/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$C/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleC="$(extract_bundle "$C/out" "$C/x")"
+assert_contains "$bundleC/report.txt" "APP_CRASHED" "C: main-app crash classified APP_CRASHED"
+refute_contains "$bundleC/report.txt" "OK: no failure signature" "C: does not print OK when app crashed"
+
+echo "case D: Bearer base64 token (+/=) fully redacted (F5)"
+D="$WORK_ROOT/D"; mkdir -p "$D/out" "$D/crash" "$D/home/logs"
+echo "2026-05-30T00:00:00Z app chat.send auth=Authorization: Bearer ab+cd/ef= done" > "$D/home/logs/app.log"
+RATIOTHINK_APP="$D/nonexistent" PIE_HOME="$D/home" RATIOTHINK_DIAG_CRASH_DIR="$D/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$D/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleD="$(extract_bundle "$D/out" "$D/x")"
+assert_contains "$bundleD/app-logs/app.log" "Bearer REDACTED" "D: Bearer token replaced"
+# The old regex [A-Za-z0-9._-]+ stopped at '+', leaking the tail '+cd/ef='.
+# Assert that leaked remainder is gone (the bytes the bug used to expose).
+refute_contains "$bundleD/app-logs/app.log" "cd/ef"          "D: no base64 token tail survives"
+
+echo "case E: benign engine.log 'error' must NOT classify ENGINE_FAILED (F3)"
+E="$WORK_ROOT/E"; mkdir -p "$E/out" "$E/crash" "$E/home/logs"
+echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$E/home/logs/helper.log"
+echo "engine up: 0 errors; error_rate=0; loaded model mixtral-no-error" > "$E/home/logs/engine.log"
+RATIOTHINK_APP="$E/nonexistent" PIE_HOME="$E/home" RATIOTHINK_DIAG_CRASH_DIR="$E/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$E/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleE="$(extract_bundle "$E/out" "$E/x")"
+refute_contains "$bundleE/report.txt" "ENGINE_FAILED" "E: benign 'error' does not trip ENGINE_FAILED"
 
 echo
 echo "collect-diagnostics self-test: $pass passed, $fail failed"
