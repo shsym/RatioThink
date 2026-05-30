@@ -63,6 +63,17 @@ if [[ ! -d "RatioThink.xcodeproj" ]]; then
   Scripts/genproject.sh
 fi
 
+# The styled .DS_Store is written by make-dmg-dsstore.py, which needs the
+# ds_store + mac_alias git submodules (Scripts/vendor/*/src). Fail loud now —
+# before the long build — rather than after xcodebuild at packaging time.
+for _mod in ds_store mac_alias; do
+  if [[ ! -f "$SCRIPT_DIR/vendor/$_mod/src/$_mod/__init__.py" ]]; then
+    echo "package-dmg.sh: required submodule '$_mod' is not initialized" >&2
+    echo "  Run: git submodule update --init --recursive" >&2
+    exit 76
+  fi
+done
+
 # Pass identity through to the build-pie-engine.sh phase via env var.
 # Xcode forwards $CODE_SIGN_IDENTITY into the script env automatically;
 # we override here only when the caller supplied --identity.

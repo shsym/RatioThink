@@ -24,6 +24,14 @@ cd RatioThink
 make build          # generates RatioThink.xcodeproj, then builds RatioThink.app + helper
 ```
 
+The repo uses git submodules (the Pie engine, plus `ds_store` + `mac_alias` under
+`Scripts/vendor/` which `make dmg-arm64` needs to write the styled DMG window). If
+you cloned without `--recurse-submodules`, initialize them:
+
+```bash
+git submodule update --init --recursive
+```
+
 To install a signed build into `/Applications` (verified end-to-end: helper + engine + a chat
 round-trip), use `make install-app`. It needs an Apple "Apple Development" signing identity in your
 keychain; override `DEVELOPMENT_TEAM` / `CODE_SIGN_IDENTITY` per machine. The background helper is

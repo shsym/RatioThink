@@ -90,7 +90,9 @@ pop_styled_reversed() {
   # Applications — the exact regression the verifier must catch.
   VENDOR_DIR="$VENDOR_DIR" python3 - "$mnt/.DS_Store" <<'PY'
 import os, sys
-sys.path.insert(0, os.environ["VENDOR_DIR"])
+vendor = os.environ["VENDOR_DIR"]
+for name in ("ds_store", "mac_alias"):
+    sys.path.insert(0, os.path.join(vendor, name, "src"))
 from ds_store import DSStore
 with DSStore.open(sys.argv[1], "r+") as d:
     d["RatioThink.app"]["Iloc"] = (450, 200)

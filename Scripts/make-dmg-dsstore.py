@@ -18,14 +18,37 @@ The geometry constants MUST match Scripts/make-dmg-background.swift (SLOT_APP_X
 After writing, the store is re-read and validated; a malformed store exits
 non-zero so the build fails loudly instead of silently shipping an unstyled DMG.
 
+Requires the ds_store + mac_alias git submodules under Scripts/vendor/ (pinned
+release commits). Initialize them with `git submodule update --init --recursive`;
+this script fails loud with that command if they are missing.
+
 Usage: make-dmg-dsstore.py <mounted-volume-path>
 """
 
 import os
 import sys
 
-# Vendored, pure-Python ds_store + mac_alias keep the build self-contained.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
+# ds_store + mac_alias are required runtime deps, pinned as git submodules
+# under Scripts/vendor/ (both use a src/ layout). Fail loud with the exact
+# init command if the submodules were not checked out, rather than letting it
+# surface as a cryptic ImportError.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SUBMODULE_SRC = {
+    "ds_store": os.path.join(_HERE, "vendor", "ds_store", "src"),
+    "mac_alias": os.path.join(_HERE, "vendor", "mac_alias", "src"),
+}
+_missing = [
+    name for name, src in _SUBMODULE_SRC.items()
+    if not os.path.isfile(os.path.join(src, name, "__init__.py"))
+]
+if _missing:
+    sys.exit(
+        "make-dmg-dsstore.py: required submodule(s) not initialized: "
+        + ", ".join(_missing)
+        + "\n  Run: git submodule update --init --recursive"
+    )
+for _src in _SUBMODULE_SRC.values():
+    sys.path.insert(0, _src)
 
 from ds_store import DSStore  # noqa: E402
 from mac_alias import Alias  # noqa: E402

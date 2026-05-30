@@ -73,12 +73,19 @@ fi
 [[ -f "$MNT/.DS_Store" ]] ||
   fail "mounted DMG has no .DS_Store — the window is unstyled"
 
-# Parse the .DS_Store with the vendored ds_store reader and assert the icons
+# Parse the .DS_Store with the ds_store submodule reader and assert the icons
 # are pinned app-left/Applications-right and the background picture is set.
 # Self-contained + GUI-free, so it runs the same in CI.
 if ! VENDOR_DIR="$SCRIPT_DIR/vendor" python3 - "$MNT/.DS_Store" <<'PY'
 import os, sys
-sys.path.insert(0, os.environ["VENDOR_DIR"])
+vendor = os.environ["VENDOR_DIR"]
+src = {name: os.path.join(vendor, name, "src") for name in ("ds_store", "mac_alias")}
+missing = [n for n, s in src.items() if not os.path.isfile(os.path.join(s, n, "__init__.py"))]
+if missing:
+    sys.exit("required submodule(s) not initialized: " + ", ".join(missing)
+             + "\n  Run: git submodule update --init --recursive")
+for s in src.values():
+    sys.path.insert(0, s)
 from ds_store import DSStore
 
 ds_path = sys.argv[1]
