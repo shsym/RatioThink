@@ -29,6 +29,7 @@ $(LOGDIR):
         test-xcode-chat-scaffold \
         test-unit test-scenario test-smoke test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
+        release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
         build-inferlets stamp-inferlets verify-inferlets verify-inferlets-inputs \
         test-stamp
 
@@ -101,6 +102,19 @@ dmg-arm64: ARCH := arm64
 dmg-x86_64: ARCH := x86_64
 dmg-arm64 dmg-x86_64: genproject ## Build arch-specific RatioThink-<arch>.dmg (release)
 	Scripts/package-dmg.sh --arch $(ARCH)
+
+release-dmg-arm64: ARCH := arm64
+release-dmg-x86_64: ARCH := x86_64
+release-dmg-arm64 release-dmg-x86_64: genproject ## Signed+notarized+stapled RatioThink-<arch>.dmg (needs Developer ID + notarytool creds; see Scripts/notarize.sh)
+	Scripts/package-dmg.sh --arch $(ARCH) --notarize
+
+release-preflight: ## Assess a built artifact for Gatekeeper readiness (ARTIFACT=path/to/.app|.dmg)
+	@test -n "$(ARTIFACT)" || { echo "usage: make release-preflight ARTIFACT=build/dmg/RatioThink-arm64.dmg" >&2; exit 64; }
+	Scripts/release-preflight.sh "$(ARTIFACT)"
+
+test-release: ## Real-tool contract tests for the notarize + preflight scripts (CI-safe)
+	Scripts/test-release-preflight.sh
+	Scripts/test-notarize.sh
 
 build-inferlets: ## Build chat-apc inferlet wasm (wasm32-wasip2) into Inferlets/chat-apc/prebuilt/
 	Scripts/stamp-chat-apc.sh build

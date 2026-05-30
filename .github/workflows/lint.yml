@@ -275,3 +275,20 @@ jobs:
             exit 1
           fi
           echo "gmake-canary: rc=$rc, log line + injection sentinel + Executed line present (sources: $search_sources), recipe guard works under gmake 4.x"
+
+  release-scripts:
+    # Real-tool contract tests for the notarization + preflight scripts
+    # (Scripts/test-{notarize,release-preflight}.sh). They drive codesign /
+    # spctl / hdiutil against throwaway ad-hoc bundles — no xcodegen, no
+    # rust, no Apple round-trip — so they are fast and deterministic, and
+    # they keep the loud-fail / Gatekeeper-rejection contracts (#357) from
+    # silently regressing.
+    name: release script contract tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Notarize + preflight contract tests
+        run: make test-release
