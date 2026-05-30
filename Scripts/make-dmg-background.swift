@@ -13,7 +13,7 @@
 // Finder/osascript involved; the window layout is written to the .DS_Store
 // directly by make-dmg-dsstore.py.
 //
-// TODO(#354): placeholder art — replace with a designed background asset later.
+// TODO: replace this placeholder art with a designed background asset.
 //
 // Usage: make-dmg-background.swift <out.png> <geometry.json>
 

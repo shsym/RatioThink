@@ -50,8 +50,16 @@ fi
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pie-styled-dmg.XXXXXX")"
 RW_DMG="$WORK/rw.dmg"
 BG_PNG="$WORK/background.png"
+# Detach ONLY the mount this script created, never a bare /Volumes/RatioThink:
+# if a racing process mounts there between the pre-check and our attach, our
+# image lands at "/Volumes/RatioThink 1" and the mismatch branch ejects that
+# (ours); the trap must not then force-eject the racing volume we did not create.
+# Set only after the post-attach match check passes.
+CREATED_MOUNT=""
 cleanup() {
-  hdiutil detach "$STAGE_MOUNT" >/dev/null 2>&1 || true
+  if [[ -n "$CREATED_MOUNT" ]]; then
+    hdiutil detach "$CREATED_MOUNT" >/dev/null 2>&1 || true
+  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -75,6 +83,8 @@ if [[ "$ACTUAL_MOUNT" != "$STAGE_MOUNT" ]]; then
   hdiutil detach "$ACTUAL_MOUNT" >/dev/null 2>&1 || true
   exit 75
 fi
+# We created this mount and confirmed it is ours — the trap may clean it up.
+CREATED_MOUNT="$ACTUAL_MOUNT"
 
 # Populate the volume: the verified app (ditto preserves its signature and
 # leaves $APP_PATH untouched), the Applications drag target, and the background.
@@ -88,7 +98,8 @@ cp "$BG_PNG" "$STAGE_MOUNT/.background/background.png"
 python3 "$SCRIPT_DIR/make-dmg-dsstore.py" "$STAGE_MOUNT"
 
 sync
-hdiutil detach "$STAGE_MOUNT" >/dev/null
+hdiutil detach "$CREATED_MOUNT" >/dev/null
+CREATED_MOUNT=""  # detached cleanly; nothing left for the trap to eject
 
 # Compress the styled writable image to the final read-only DMG.
 rm -f "$OUT_DMG"

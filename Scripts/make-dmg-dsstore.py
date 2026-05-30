@@ -12,8 +12,10 @@ volume that already contains `RatioThink.app`, an `Applications` symlink and
     background arrow points app -> Applications, and
   * sets the background picture to the staged `.background/background.png`.
 
-The geometry constants MUST match Scripts/make-dmg-background.swift (SLOT_APP_X
-/ SLOT_APPS_X / CENTER_Y and the canvas size), or the arrow will not line up.
+The window geometry (icon positions + canvas size) is read from the shared
+Scripts/dmg-window.json — the single source of truth make-dmg-background.swift
+draws the arrow from and verify-dmg-layout.sh asserts — so the icons and the
+arrow stay aligned without a second copy to keep in sync.
 
 After writing, the store is re-read and validated; a malformed store exits
 non-zero so the build fails loudly instead of silently shipping an unstyled DMG.
