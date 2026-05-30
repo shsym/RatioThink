@@ -287,6 +287,13 @@ struct RatioThinkApp: App {
         }
         .keyboardShortcut("l", modifiers: [.command, .option])
       }
+      // #358: user-reachable diagnostics. Runs the bundled
+      // collect-diagnostics.sh and reveals the redacted .zip in Finder.
+      CommandGroup(after: .help) {
+        Button("Collect Diagnostics…") {
+          Task { await DiagnosticsCollector.collectAndReveal() }
+        }
+      }
     }
 
     Settings {
