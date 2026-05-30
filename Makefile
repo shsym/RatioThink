@@ -25,7 +25,7 @@ $(LOGDIR):
 	@mkdir -p $(LOGDIR)
 
 .PHONY: help genproject build build-tests clean lint \
-        verify-app-icon-assets test-app-icon-assets \
+        verify-app-icon-assets test-app-icon-assets test-dmg-layout \
         test-xcode-chat-scaffold \
         test-unit test-scenario test-smoke test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
@@ -160,6 +160,9 @@ verify-app-icon-assets: ## Verify committed app-icon source, generated PNGs, and
 
 test-app-icon-assets: ## Regression-test the app-icon verifier failure modes
 	Scripts/test-verify-app-icon-assets.sh
+
+test-dmg-layout: ## Regression-test the DMG drag-install layout verifier (hdiutil + codesign, no xcodebuild)
+	Scripts/test-verify-dmg-layout.sh
 
 test-gui: genproject $(LOGDIR) ## GUI scenarios (S4, S5) via XCUITest — needs seated session
 	@set +e +o pipefail; \

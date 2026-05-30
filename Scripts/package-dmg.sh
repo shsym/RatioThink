@@ -149,16 +149,31 @@ done
 DMG_PATH="$OUT_DIR/RatioThink-$ARCH.dmg"
 rm -f "$DMG_PATH"
 
+# Stage a DMG root holding the app plus an `Applications` symlink so the
+# mounted window offers the standard drag-install target (ticket #354).
+# `ditto` clones the *verified* bundle — preserving its signature and
+# xattrs — into staging, leaving $APP_PATH untouched; hdiutil's
+# `-srcfolder` then copies the staged tree (app + symlink) faithfully
+# into the HFS+ image, keeping the symlink a symlink.
+STAGE_DIR="$BUILD_DIR/dmg-stage"
+rm -rf "$STAGE_DIR"
+mkdir -p "$STAGE_DIR"
+ditto "$APP_PATH" "$STAGE_DIR/RatioThink.app"
+ln -s /Applications "$STAGE_DIR/Applications"
+
 echo "package-dmg.sh: hdiutil create $DMG_PATH"
-# UDZO = compressed read-only. `-srcfolder` mode wraps the .app in a
-# DMG whose root contains just RatioThink.app — sufficient for v1 (no custom
-# background, no `/Applications` symlink). A nicer designed DMG can
-# follow when notarization lands.
+# UDZO = compressed read-only.
 hdiutil create \
   -volname "RatioThink" \
-  -srcfolder "$APP_PATH" \
+  -srcfolder "$STAGE_DIR" \
   -fs HFS+ \
   -format UDZO \
   "$DMG_PATH"
+
+# Mount the finished image and assert the drag-install layout plus that
+# the staged app survived packaging with its seal intact. Self-verifying
+# packaging — a silent layout/seal regression fails the build here rather
+# than shipping a DMG users cannot install from (ticket #354 acceptance).
+"$SCRIPT_DIR/verify-dmg-layout.sh" "$DMG_PATH"
 
 echo "package-dmg.sh: ok ($DMG_PATH)"

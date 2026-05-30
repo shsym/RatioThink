@@ -46,6 +46,9 @@ jobs:
       - name: Regression-test app icon verifier
         run: make test-app-icon-assets
 
+      - name: Regression-test DMG drag-install layout verifier
+        run: make test-dmg-layout
+
       - name: Build app + helper
         run: make build
 

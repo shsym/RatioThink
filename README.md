@@ -8,7 +8,7 @@ APC-enabled chat inferlet.
 ## Install (DMG)
 
 1. Download `RatioThink-arm64.dmg` (Apple Silicon) from Releases and open it.
-2. Drag **RatioThink.app** into **Applications**.
+2. In the window that opens, drag **RatioThink.app** onto the **Applications** shortcut.
 3. Clear the quarantine flag so the bundled helper/engine can launch:
    `xattr -dr com.apple.quarantine /Applications/RatioThink.app`
 4. Open **RatioThink** from Applications.
