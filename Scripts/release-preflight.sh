@@ -8,7 +8,7 @@
 #   - codesign verification (--deep --strict)
 #   - signing identity / team / hardened runtime / secure timestamp
 #   - absence of the get-task-allow debug entitlement
-#   - spctl assessment (execute for .app, install for .dmg)
+#   - spctl assessment (execute for .app, open+primary-signature for .dmg)
 #   - notarization / stapling status
 #   - helper registration readiness (LoginItems + sealed LaunchAgent + Team ID)
 #   - bundled pie engine readiness (present, executable, hardened)
