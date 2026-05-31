@@ -808,12 +808,45 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     self.profileStore = store
     let resolver = LaunchSpecResolver(
       profileStore: store,
-      pieBinary: { try LaunchSpecResolver.bundledPieBinary() }
+      pieBinary: { try LaunchSpecResolver.bundledPieBinary() },
+      // Engine RUNTIME home is decoupled from the user store. The spawned
+      // engine binds an aux Unix socket at
+      // <pieHome>/standalone/<pid>/g0/aux.sock, which must fit the
+      // `sun_path` 104-char limit. The store PIE_HOME can be arbitrarily
+      // deep (e.g. a sandboxed XCUITest runner's ~150-char container dir),
+      // which overflows it. The engine home is self-contained ephemeral
+      // runtime — config.toml is written fresh per launch, http.port is
+      // launcher-owned, and the model path is an absolute modelsRoot join —
+      // so a short /tmp anchor needs nothing from the store and leaves
+      // profiles/models/chats untouched. The Helper is app-sandbox=false,
+      // so it can create /tmp even when the test runner cannot.
+      pieHome: { try Self.engineRuntimeHome() }
     )
     let closure = resolver.asClosure
     self.launchSpecResolver = closure
     Log.helper.info("buildLaunchSpecResolver: ProfileStore-backed resolver wired (profiles=\(profilesDir.path, privacy: .public))")
     return closure
+  }
+
+  /// Short, `/tmp`-anchored RUNTIME home for the spawned engine — see the
+  /// `pieHome:` note in `buildLaunchSpecResolver`. Per-UID so distinct users
+  /// never collide; within a user a single Helper owns the engine and the
+  /// launcher rewrites `config.toml`/`http.port` per launch while pie scopes
+  /// its socket by pid, so the directory is safely reused. ~26 chars keeps
+  /// `<home>/standalone/<pid>/g0/aux.sock` well under the `sun_path` limit.
+  private static func engineRuntimeHome() throws -> URL {
+    let home = URL(fileURLWithPath: "/tmp/ratiothink-engine-\(getuid())", isDirectory: true)
+    let fm = FileManager.default
+    // Owner-private (0700): the engine's aux IPC socket lives here, and on
+    // multi-user macOS /tmp is world-traversable — restrict it the way the
+    // prior ~/Library/Application Support location was implicitly private.
+    try fm.createDirectory(at: home, withIntermediateDirectories: true,
+                           attributes: [.posixPermissions: 0o700])
+    // createDirectory does not reset perms on a dir that already existed
+    // from a prior launch, so enforce it (also fails loud if the path is
+    // owned by another account rather than silently reusing it).
+    try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: home.path)
+    return home
   }
 
   #if DEBUG
@@ -932,6 +965,18 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// so a degraded boot or unselected profile is a logged no-op.
   private func autoResumeEngineOnBoot() {
     if HelperConfig.isTestMode { return }
+    // Release-gated GUI-test seam: suppress ONLY the boot auto-resume so a
+    // seated XCUITest can assert the deterministic post-boot menu state
+    // (`Engine: stopped`) without racing the async engine start. Unlike
+    // `PIE_TEST_MODE`, the ProfileStore-backed resolver still wires, so the
+    // active profile resolves and `Resume Engine` is a live affordance.
+    // Compiled out of Release (mirrors the `#if DEBUG` policy elsewhere).
+    #if DEBUG
+    if ProcessInfo.processInfo.environment["PIE_TEST_NO_AUTO_RESUME"] == "1" {
+      Log.helper.info("autoResumeEngineOnBoot: suppressed by PIE_TEST_NO_AUTO_RESUME — engine stays stopped")
+      return
+    }
+    #endif
     let outcome = HelperResumeAction.run(
       engineHost: engineHost,
       profileStore: profileStore,

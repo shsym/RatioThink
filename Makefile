@@ -45,6 +45,8 @@ define gui_suite_run
   if ! pgrep -x Dock >/dev/null 2>&1; then \
     echo "warning: no seated GUI session — GUI tests will XCTSkip."; \
   fi; \
+  if [ -n "$$PIE_TEST_TCC_GRANTED" ]; then export TEST_RUNNER_PIE_TEST_TCC_GRANTED="$$PIE_TEST_TCC_GRANTED"; fi; \
+  if [ -n "$$PIE_TEST_MODEL" ]; then export TEST_RUNNER_PIE_TEST_MODEL="$$PIE_TEST_MODEL"; fi; \
   xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkGUITests \
     -destination 'platform=macOS,arch=arm64' \
     -parallel-testing-enabled NO \

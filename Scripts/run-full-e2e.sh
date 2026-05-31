@@ -153,19 +153,19 @@ echo "full e2e: engine=$BASE_URL (model loaded)"
 # the GUI. Test assertion + documented seed only — no new product API.
 echo "full e2e: LAYER 1 — HTTP API assertion (engine contract)"
 PIE_TEST_API_BASE_URL="$BASE_URL" \
-PIE_TEST_API_MODEL="default" \
+PIE_TEST_API_MODEL="$REPO/$FILE" \
 PIE_TEST_API_PROMPT="The capital of France is" \
 PIE_TEST_API_EXPECT="Paris" \
 xcrun swift run api-probe
 
 # ---- Phase B: GUI chat send/persist (reuse the  composer test) ---
-# The portable driver registers the model under name "default"; the app
-# must request that id for /v1/chat/completions to match the resident
-# model.
+# The portable driver serves the model under its slug (`<repo>/<file>`,
+# PieControlLauncher → `servedID: modelSlug`), so the app must request that
+# slug for /v1/chat/completions to match the resident model — NOT "default".
 cat >"$CHAT_CONFIG" <<EOF
 PIE_TEST_ENGINE_BASE_URL=$BASE_URL
 PIE_TEST_GUI_HOME=$GUI_HOME
-PIE_TEST_CHAT_MODEL=default
+PIE_TEST_CHAT_MODEL=$REPO/$FILE
 EOF
 
 echo "full e2e: PHASE B — chat send/persist against the acquired model"
