@@ -45,6 +45,11 @@ final class S360_ModelsTopAlignGUITests: XCTestCase {
     let home = "/tmp/pie-s360-" + UUID().uuidString
     tempHomes.append(home)
     app.launchEnvironment["PIE_HOME"] = home
+    // Isolate the HF cache too: `CachedModelScan` surfaces HF-cached models in
+    // the pane (`HFCacheCatalog.scan(LaunchSpecResolver.defaultHFHome())`), so
+    // a populated dev cache (`~/.cache/huggingface`) would hide the empty
+    // state. An empty `HF_HOME` makes the cache scan find nothing.
+    app.launchEnvironment["HF_HOME"] = home + "/hf-empty"
     return app
   }
 
