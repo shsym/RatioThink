@@ -46,6 +46,9 @@ jobs:
       - name: Regression-test app icon verifier
         run: make test-app-icon-assets
 
+      - name: Regression-test DMG drag-install layout verifier
+        run: make test-dmg-layout
+
       - name: Build app + helper
         run: make build
 
@@ -74,6 +77,9 @@ jobs:
 
       - name: Scenario tests
         run: make test-scenario
+
+      - name: Collect-diagnostics script self-test (#358)
+        run: make test-collect-diagnostics
 
   sanitizer-stability-canary:
     #  F8. Catches drift between SpawnEnvSanitizer's
@@ -275,3 +281,20 @@ jobs:
             exit 1
           fi
           echo "gmake-canary: rc=$rc, log line + injection sentinel + Executed line present (sources: $search_sources), recipe guard works under gmake 4.x"
+
+  release-scripts:
+    # Real-tool contract tests for the notarization + preflight scripts
+    # (Scripts/test-{notarize,release-preflight}.sh). They drive codesign /
+    # spctl / hdiutil against throwaway ad-hoc bundles — no xcodegen, no
+    # rust, no Apple round-trip — so they are fast and deterministic, and
+    # they keep the loud-fail / Gatekeeper-rejection contracts (#357) from
+    # silently regressing.
+    name: release script contract tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Notarize + preflight contract tests
+        run: make test-release

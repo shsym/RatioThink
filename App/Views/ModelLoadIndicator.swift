@@ -248,14 +248,43 @@ struct ModelLoadIndicator: View {
 }
 
 /// Popover surfaced from the toolbar indicator. Read-only details +
-/// the active control for the current state — `Cancel` while loading,
-/// `Dismiss` after a failure (review v1 F7) so the user can clear the
-/// red ring without restarting the load. Both end-states dismiss the
-/// popover so the user does not have to click outside.
+/// the active control for the current state. Opening the popover is
+/// pure info — it never stops a load or frees RAM (#359). The two
+/// destructive/interrupting actions (`Cancel` a live load, `Unload` a
+/// resident model) are gated behind an explicit in-popover confirm
+/// step rather than firing on the first click, so a user inspecting
+/// the load cannot accidentally interrupt it. `Dismiss` after a
+/// `.failed` / `.engineNotReady` terminal (review v1 F7) stays a single
+/// tap — clearing an already-finished error ring is not destructive.
+///
+/// The confirm step is rendered inline (not a system
+/// `.confirmationDialog`) so it stays inside the one popover surface
+/// #327 hardened for reliable presentation, and so it is driveable by
+/// the same `app.popovers.buttons` GUI-test path as every sibling
+/// control.
 struct ModelLoadPopover: View {
   @ObservedObject var center: ModelLoadCenter
   @Binding var isPresented: Bool
   var onUnload: () -> Void = {}
+
+  /// The destructive action the user armed — Cancel a live load or
+  /// Unload a resident model — CAPTURED at arm time (review v1 F2). The
+  /// confirm acts on this captured intent, NOT a re-read of
+  /// `center.state` at click time: if the load resolves
+  /// (`.loading → .ready`) in the frame between the user reading the
+  /// prompt and the click landing, a stale click can no longer perform
+  /// the WRONG destructive action — `performDestructive()` checks the
+  /// captured kind against the current state and no-ops on a mismatch.
+  /// Local `@State`, so it resets to nil every time the popover is
+  /// re-presented (fresh content view per presentation) — a stale armed
+  /// confirm can never survive a close/reopen. Also cleared whenever the
+  /// load resolves under it (see `.onChange(of: stateCategory)`).
+  @State private var armedAction: ArmedAction?
+
+  /// Which destructive action a trigger armed. Distinguishing the two at
+  /// arm time (rather than re-deriving from `center.state`) is what makes
+  /// the confirm honour the user's intent across a state flip.
+  private enum ArmedAction { case cancel, unload }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
@@ -271,14 +300,38 @@ struct ModelLoadPopover: View {
         etaRow
       }
       Divider()
+      actionArea
+    }
+    .padding(14)
+    .frame(width: 280)
+    .accessibilityIdentifier("modelLoad.popover")
+    // If the load resolves (completes, fails, or is cancelled by another
+    // path) while the confirm prompt is armed, collapse back to the info
+    // view for the NEW state instead of letting the user confirm against
+    // stale intent. Keyed on the coarse category, NOT `center.state`:
+    // a determinate load mutates the `.loading` byte/eta payload every
+    // frame, and resetting on each frame would make the confirm prompt
+    // un-openable mid-load.
+    .onChange(of: stateCategory) { _, _ in
+      armedAction = nil
+    }
+  }
+
+  /// Either the single destructive trigger button (the default,
+  /// info-only state of the popover) or — once that trigger is tapped —
+  /// the explicit confirm prompt. The indicator click only ever reaches
+  /// the former; performing a stop/unload requires the second deliberate
+  /// click inside `confirmBlock` (#359).
+  @ViewBuilder
+  private var actionArea: some View {
+    if armedAction != nil, let confirm = Self.destructiveConfirm(for: center.state) {
+      confirmBlock(confirm)
+    } else {
       HStack {
         Spacer()
         actionButton
       }
     }
-    .padding(14)
-    .frame(width: 280)
-    .accessibilityIdentifier("modelLoad.popover")
   }
 
   private var header: some View {
@@ -296,11 +349,11 @@ struct ModelLoadPopover: View {
   private var actionButton: some View {
     switch center.state {
     case .ready:
-      // : free the resident model's RAM. The next send re-enters
-      // the no-model confirm gate.
+      // : free the resident model's RAM. Destructive/interrupting, so
+      // it only ARMS the confirm step — the next send otherwise re-enters
+      // the no-model confirm gate with no model resident (#359).
       Button("Unload", role: .destructive) {
-        onUnload()
-        isPresented = false
+        armedAction = .unload
       }
       .accessibilityIdentifier("modelLoad.popover.unload")
     case .failed, .engineNotReady:
@@ -308,18 +361,133 @@ struct ModelLoadPopover: View {
         // Review v2 F3: use the documented public API instead of the
         // test-only `_testOverrideState` seam — the seam internally
         // calls `cancel()` which bumps the load generation and would
-        // kill any new load racing the user's tap.
+        // kill any new load racing the user's tap. Dismiss only clears
+        // an already-finished error ring — not destructive — so it stays
+        // a single tap (no confirm gate).
         center.dismissTerminalState()
         isPresented = false
       }
       .keyboardShortcut(.defaultAction)
       .accessibilityIdentifier("modelLoad.popover.dismiss")
     default:
+      // Interrupts an in-flight load — arm the confirm rather than
+      // cancelling on the first click (#359).
       Button("Cancel", role: .destructive) {
-        center.cancel()
-        isPresented = false
+        armedAction = .cancel
       }
       .accessibilityIdentifier("modelLoad.popover.cancel")
+    }
+  }
+
+  /// The explicit confirm prompt shown after a destructive trigger is
+  /// armed: a plain-language statement of what stops and whether it can
+  /// be resumed, plus a non-destructive "keep" escape (also bound to
+  /// Esc) and the destructive confirm. The confirm carries NO
+  /// `.defaultAction`, so a stray Return can never trigger the
+  /// stop/unload — it takes a deliberate click.
+  private func confirmBlock(_ confirm: DestructiveConfirm) -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Text(confirm.message)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+      HStack {
+        Spacer()
+        Button(confirm.keepTitle) {
+          armedAction = nil
+        }
+        .keyboardShortcut(.cancelAction)
+        .accessibilityIdentifier(confirm.keepIdentifier)
+        Button(confirm.confirmTitle, role: .destructive) {
+          performDestructive()
+        }
+        .accessibilityIdentifier(confirm.confirmIdentifier)
+      }
+    }
+    .accessibilityIdentifier("modelLoad.popover.confirm")
+  }
+
+  /// Run the CONFIRMED destructive action — the only path that reaches
+  /// `center.cancel()` / `onUnload()` from the status UI. Acts on the
+  /// kind the user ARMED, not a fresh read of `center.state` (review v1
+  /// F2), and additionally guards that the live state still matches: if
+  /// the load flipped `.loading → .ready` between arming and the click,
+  /// an armed "Stop Loading" must NOT fall through to unloading the
+  /// now-resident model — it no-ops and lets the user re-decide. Every
+  /// other interaction (indicator click, arming the trigger, keep/escape)
+  /// is non-destructive (#359).
+  private func performDestructive() {
+    switch armedAction {
+    case .cancel:
+      if case .loading = center.state { center.cancel() }
+    case .unload:
+      if case .ready = center.state { onUnload() }
+    case nil:
+      break
+    }
+    isPresented = false
+  }
+
+  // MARK: - confirm copy (pure)
+
+  /// Plain-language copy + accessibility ids for the explicit confirm
+  /// step. Pure function of `state` so the wording (and crucially WHICH
+  /// states are destructive) is unit-testable without standing up the
+  /// view. Returns nil for every non-destructive state — `.idle` /
+  /// `.cancelled` have no action, and `.failed` / `.engineNotReady` use
+  /// the one-tap Dismiss — guaranteeing the only `.some` results are the
+  /// two interrupting actions (#359). Each message names what stops AND
+  /// that it can be resumed, per the ticket's "clear copy" requirement.
+  struct DestructiveConfirm: Equatable {
+    let message: String
+    let confirmTitle: String
+    let keepTitle: String
+    let confirmIdentifier: String
+    let keepIdentifier: String
+  }
+
+  static func destructiveConfirm(for state: ModelLoadCenter.State) -> DestructiveConfirm? {
+    switch state {
+    case let .loading(modelID, _, _, _):
+      return DestructiveConfirm(
+        message: "Stop loading \(modelID)? The partial load is discarded. You can start it again anytime.",
+        confirmTitle: "Stop Loading",
+        keepTitle: "Keep Loading",
+        confirmIdentifier: "modelLoad.popover.confirmCancel",
+        keepIdentifier: "modelLoad.popover.keepLoading"
+      )
+    case let .ready(modelID):
+      return DestructiveConfirm(
+        message: "Unload \(modelID)? This frees its memory. The engine keeps running — you'll need to reload the model before your next message.",
+        confirmTitle: "Unload",
+        keepTitle: "Keep Loaded",
+        confirmIdentifier: "modelLoad.popover.confirmUnload",
+        keepIdentifier: "modelLoad.popover.keepLoaded"
+      )
+    case .idle, .cancelled, .failed, .engineNotReady:
+      return nil
+    }
+  }
+
+  // MARK: - state category
+
+  /// Coarse classification of `ModelLoadCenter.State` that ignores the
+  /// per-frame `.loading` byte/eta payload. Drives the confirm-reset
+  /// `.onChange` so an in-progress determinate load (whose state value
+  /// changes every frame) does not collapse the armed confirm prompt,
+  /// while a genuine resolution (loading→ready/failed/cancelled) does.
+  enum StateCategory: Equatable {
+    case idle, loading, ready, cancelled, failed, engineNotReady
+  }
+
+  private var stateCategory: StateCategory {
+    switch center.state {
+    case .idle:           return .idle
+    case .loading:        return .loading
+    case .ready:          return .ready
+    case .cancelled:      return .cancelled
+    case .failed:         return .failed
+    case .engineNotReady: return .engineNotReady
     }
   }
 

@@ -39,14 +39,27 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/healthz":
             self.send_json({"status": "ok"})
         elif self.path == "/v1/models":
+            # Two entries on purpose. ChatScaffoldView reconciles this list
+            # into the toolbar model menu AND sets residentModelID = ids[0].
+            # The model-menu confirm gate only publishes a Switch (→ load)
+            # when the picked id DIFFERS from the resident, so the resident
+            # stub MUST be first and MUST NOT be the seeded default the
+            # S302 test clicks. The second entry is the seeded default
+            # (ProfileStore.defaultChatModelID) whose leaf is the menu
+            # label the test selects ("Qwen3-0.6B-Q8_0.gguf").
             self.send_json({
                 "object": "list",
                 "data": [
                     {
-                        "id": "loadviz",
+                        "id": "loadviz-resident",
                         "object": "model",
                         "owned_by": "pie-test",
-                    }
+                    },
+                    {
+                        "id": "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf",
+                        "object": "model",
+                        "owned_by": "pie-test",
+                    },
                 ],
             })
         else:

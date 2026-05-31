@@ -47,6 +47,7 @@ struct RatioThinkApp: App {
   @MainActor
   init() {
     Self.writeArtifactPathProbeIfRequested()
+    Self.recordLaunchBreadcrumb()
 
     // Build the four dependencies value-side so the coordinator can
     // borrow them at construction. The `@StateObject` wrappers aren't
@@ -56,13 +57,42 @@ struct RatioThinkApp: App {
     let prefs = AppPreferences(defaults: Self.appPreferencesDefaults())
     let testBaseURL = Self.chatTestEngineBaseURL()
     let statusStore: EngineStatusStore
-    if let testBaseURL {
-      // Probe the wrapper-booted engine for status (not the absent Helper) so
-      // the chat model-menu reconcile, gated on `.running`, fetches /v1/models.
-      statusStore = EngineStatusStore(client: TestEngineStatusXPCClient(baseURL: testBaseURL))
+    #if DEBUG
+    // DEBUG-only GUI-harness seam (S302): a pure-HTTP mock engine answers
+    // `/v1/...` but has NO Helper to report status over XPC, so the
+    // model-menu `/v1/models` reconcile (gated on `.running`) would
+    // otherwise empty the menu. When `PIE_TEST_PIN_ENGINE_RUNNING` is set
+    // alongside the base-URL bypass, pin `EngineStatus.running(port:)` —
+    // the one fact the absent Helper would report, and one the harness
+    // genuinely satisfies (`.running`'s downstream contract is "an inferlet
+    // serves `/v1/...` on this port"). Scoped to its OWN flag, NOT every
+    // `PIE_TEST_ENGINE_BASE_URL` launch: the lifecycle-recovery suite
+    // (S279) drives real status transitions and must keep polling.
+    // `#if DEBUG` so the flag + pin compile out of Release entirely; the
+    // S302 GUI suite runs the Debug build.
+    let pinnedRunningPort: EnginePort? = {
+      guard ProcessInfo.processInfo.environment["PIE_TEST_PIN_ENGINE_RUNNING"] == "1",
+            let rawPort = testBaseURL?.port,
+            let port = EnginePort(exactly: rawPort) else { return nil }
+      return port
+    }()
+    if let pinnedRunningPort {
+      // Inject a stub XPC client (NOT HelperXPCClient): the helperless
+      // harness has no Helper, so a real stopEngine() during Unload would
+      // throw and ChatScaffoldView.unloadModel would never reach
+      // markUnloaded() — the model would stay resident. The stub reports
+      // the pinned running status and accepts stopEngine as a no-op so
+      // the Unload confirm path completes to .idle (#359 Path2).
+      statusStore = EngineStatusStore(
+        client: PinnedRunningXPCClient(port: pinnedRunningPort),
+        initialStatus: .running(port: pinnedRunningPort, profileID: "chat")
+      )
     } else {
       statusStore = EngineStatusStore(client: HelperXPCClient())
     }
+    #else
+    statusStore = EngineStatusStore(client: HelperXPCClient())
+    #endif
     //  wire-in completed by : `HTTPEngineClient.baseURLProvider`
     // resolves `EngineStatusStore.requireBaseURL()` on each request.
     // Returns `http://127.0.0.1:<port>` when the helper reports
@@ -123,45 +153,25 @@ struct RatioThinkApp: App {
     // Kick the XPC poll loop. Idempotent + cheap — first reply lands
     // within ~one runloop tick when the helper is registered, longer
     // when launchd has not yet published the mach service.
+    #if DEBUG
+    // Skipped when status is pinned for the S302 harness (no Helper to
+    // poll; a failed poll would reset the pinned `.running` → `.starting`).
+    if pinnedRunningPort == nil {
+      statusStore.start()
+    }
+    #else
     statusStore.start()
+    #endif
   }
 
   private static func chatTestEngineBaseURL() -> URL? {
     // Gated through HelperConfig so a Release build ignores the override
-    // entirely — both this read and the `TestEngineStatusXPCClient` status
-    // branch key off the result, so a non-debug app falls back to the real
+    // entirely — the engine-client redirection and the DEBUG status pin both
+    // key off this result, so a non-debug app falls back to the real
     // Helper-driven engine path (`HelperXPCClient()`) and never honors the
     // `PIE_TEST_ENGINE_BASE_URL` seam.
     guard let raw = HelperConfig.testEngineBaseURLOverride() else { return nil }
     return URL(string: raw)
-  }
-
-  /// `AppXPCClient` that derives engine status by probing a fixed base URL
-  /// (`PIE_TEST_ENGINE_BASE_URL`) instead of the Helper XPC. The e2e wrapper
-  /// boots the engine and exports its URL; no Helper runs on this path, so
-  /// polling the Helper would pin status at `.starting` and the chat
-  /// model-menu reconcile (gated on `.running`) would never fetch
-  /// `/v1/models`. A reachable engine maps to `.running(port:)` — which the
-  /// reconcile needs to surface the served model; a stale/unreachable URL
-  /// (S279) makes the probe throw → status is NOT `.running`, preserving the
-  /// recoverable-error path. Lifecycle is owned by the wrapper, so
-  /// `stopEngine()` is a no-op.
-  private struct TestEngineStatusXPCClient: AppXPCClient {
-    let baseURL: URL
-
-    func engineStatus() async throws -> EngineStatus {
-      var request = URLRequest(url: baseURL.appendingPathComponent("v1/models"))
-      request.timeoutInterval = 2
-      let (_, response) = try await URLSession.shared.data(for: request)
-      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-            let port = baseURL.port, let enginePort = EnginePort(exactly: port) else {
-        throw AppXPCClientError.replyTimeout(
-          selector: "engineStatus(probe \(baseURL.absoluteString))", timeout: 2)
-      }
-      return .running(port: enginePort, profileID: "chat")
-    }
-
-    func stopEngine() async throws {}
   }
 
   private static func appPreferencesDefaults() -> UserDefaults {
@@ -224,6 +234,7 @@ struct RatioThinkApp: App {
     )
     let outcome = await reconciler.reconcile()
     NSLog("RatioThinkHelper registration reconcile: \(outcome)")
+    Diag.app.event("helper.reconcile", [("outcome", "\(outcome)")])
     if case .needsApproval = outcome {
       // Hard macOS consent gate — route the user to the toggle.
       SMAppService.openSystemSettingsLoginItems()
@@ -244,6 +255,22 @@ struct RatioThinkApp: App {
       }
     }
     return false
+  }
+
+  /// Durable launch breadcrumb: proves the app process started, and records the
+  /// version/build, the (home-redacted) bundle path, and whether Gatekeeper's
+  /// quarantine xattr is still on the bundle — the first thing triage needs when
+  /// "the app does nothing". Best-effort; never blocks launch.
+  private static func recordLaunchBreadcrumb() {
+    let info = Bundle.main.infoDictionary
+    let bundlePath = Bundle.main.bundleURL.path
+    let quarantined = getxattr(bundlePath, "com.apple.quarantine", nil, 0, 0, 0) > 0
+    Diag.app.event("app.launch", [
+      ("version", info?["CFBundleShortVersionString"] as? String ?? "?"),
+      ("build", info?["CFBundleVersion"] as? String ?? "?"),
+      ("bundle", DiagnosticLog.redactHome(bundlePath)),
+      ("quarantine", quarantined ? "present" : "absent"),
+    ])
   }
 
   private static func writeArtifactPathProbeIfRequested() {
@@ -309,6 +336,13 @@ struct RatioThinkApp: App {
         }
         .keyboardShortcut("l", modifiers: [.command, .option])
       }
+      // #358: user-reachable diagnostics. Runs the bundled
+      // collect-diagnostics.sh and reveals the redacted .zip in Finder.
+      CommandGroup(after: .help) {
+        Button("Collect Diagnostics…") {
+          Task { await DiagnosticsCollector.collectAndReveal() }
+        }
+      }
     }
 
     Settings {
@@ -325,3 +359,18 @@ struct RatioThinkApp: App {
     }
   }
 }
+
+#if DEBUG
+/// Minimal `AppXPCClient` for the helperless S302 GUI harness
+/// (`PIE_TEST_PIN_ENGINE_RUNNING`). The harness has no Helper to answer
+/// XPC, so a real `stopEngine()` during Unload would throw and
+/// `ChatScaffoldView.unloadModel` would never run `markUnloaded()`. This
+/// reports the pinned `.running` status and treats `stopEngine()` as a
+/// no-op success, so the Unload confirm path completes to `.idle`. DEBUG
+/// only — compiled out of Release alongside the pin itself.
+private struct PinnedRunningXPCClient: AppXPCClient {
+  let port: EnginePort
+  func engineStatus() async throws -> EngineStatus { .running(port: port, profileID: "chat") }
+  func stopEngine() async throws {}
+}
+#endif

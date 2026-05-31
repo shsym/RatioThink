@@ -34,6 +34,11 @@ final class S260_ChatModelMenuGUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
+    // No Helper runs on the wrapper path, so engine status would never reach
+    // `.running` and the model-menu reconcile (gated on `.running`) would
+    // leave the menu empty. Pin status via the DEBUG-only S302 seam so the
+    // reconcile fetches `/v1/models` from the wrapper-booted engine.
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     app.launch()
     defer { app.terminate() }
@@ -53,9 +58,9 @@ final class S260_ChatModelMenuGUITests: XCTestCase {
     modelMenu.click()
 
     // The served id `Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` renders as its
-    // leaf. Allow time for the engine-status poll to reach `.running` and the
-    // reconcile to fetch `/v1/models` (the menu only resolves to the served id
-    // once `engineModels` is `.known([...])`).
+    // leaf. Status is pinned `.running`, so allow time for the reconcile to
+    // fetch `/v1/models` (the menu only resolves to the served id once
+    // `engineModels` is `.known([...])`).
     let seededModel = app.menuItems["Qwen3-0.6B-Q8_0.gguf"]
     XCTAssertTrue(seededModel.waitForExistence(timeout: 10),
                   "seeded Qwen3 GGUF missing from chat model menu; app tree: \(app.debugDescription)")
