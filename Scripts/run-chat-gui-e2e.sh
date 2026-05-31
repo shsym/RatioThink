@@ -6,11 +6,14 @@ cd "$ROOT"
 source "$ROOT/Scripts/e2e-prep.sh"
 
 TAG="chat gui e2e"
-MODEL="${PIE_TEST_CHAT_MODEL:-Qwen/Qwen3-0.6B}"
-HF_HOME_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
+# Serve the seeded GGUF the App's default "chat" profile resolves, under its
+# slug — so `/v1/models` reports the slug and the chat menu renders its leaf
+# (`Qwen3-0.6B-Q8_0.gguf`). S258 (send) and S260 (model menu) both consume it.
+SLUG="Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p258-$$}"
 ENGINE_HOME="$RUN_ROOT/e"
 GUI_HOME="$RUN_ROOT/g"
+MODELS_ROOT="$RUN_ROOT/models"
 URL_FILE="$RUN_ROOT/engine.url"
 HARNESS_LOG="$RUN_ROOT/engine-harness.log"
 CONFIG_FILE="/tmp/pie-chat-gui-e2e.env"
@@ -32,7 +35,20 @@ e2e_require_seated_gui "$TAG" || exit 2
 e2e_require_tcc "$TAG" || exit 2
 e2e_require_chat_apc "$ROOT" "$TAG" || exit 2
 PIE_BIN="$(e2e_ensure_pie "$ROOT" "$TAG")" || exit 2
-e2e_ensure_hf_model "$MODEL" "$HF_HOME_DIR" "$TAG" || exit 2
+
+# Stage the GGUF weight (symlink test-models/ from the HF cache, or print the
+# exact download command and exit non-zero — honest-skip only when the GGUF is
+# genuinely unavailable), then materialize the app-staged slug path the harness
+# serves in portable mode.
+if ! Scripts/stage-test-model.sh >&2; then
+  echo "$TAG: GGUF fixture unavailable (see guidance above); cannot run the GGUF chat E2E." >&2
+  exit 2
+fi
+GGUF_REAL="$(realpath "$ROOT/test-models/Qwen3-0.6B-Q8_0.gguf")"
+GGUF_DEST="$MODELS_ROOT/$SLUG"
+mkdir -p "$(dirname "$GGUF_DEST")"
+# Regular file (hard-link; copy across volumes) so pie loads the weight directly.
+ln "$GGUF_REAL" "$GGUF_DEST" 2>/dev/null || cp "$GGUF_REAL" "$GGUF_DEST"
 
 mkdir -p "$ENGINE_HOME" "$GUI_HOME"
 rm -f "$URL_FILE" "$CONFIG_FILE"
@@ -40,9 +56,10 @@ rm -f "$URL_FILE" "$CONFIG_FILE"
 echo "chat gui e2e: generating Xcode project"
 Scripts/genproject.sh
 
-echo "chat gui e2e: starting small-model engine harness"
+echo "chat gui e2e: starting portable GGUF engine harness"
 PIE_BIN="$PIE_BIN" \
-PIE_TEST_CHAT_MODEL="$MODEL" \
+PIE_TEST_HARNESS_MODEL_SLUG="$SLUG" \
+PIE_TEST_HARNESS_MODELS_ROOT="$MODELS_ROOT" \
 PIE_TEST_ENGINE_HOME="$ENGINE_HOME" \
 PIE_TEST_ENGINE_URL_FILE="$URL_FILE" \
 xcrun swift run chat-engine-harness >"$HARNESS_LOG" 2>&1 &
@@ -70,11 +87,11 @@ BASE_URL="$(cat "$URL_FILE")"
 cat >"$CONFIG_FILE" <<EOF
 PIE_TEST_ENGINE_BASE_URL=$BASE_URL
 PIE_TEST_GUI_HOME=$GUI_HOME
-PIE_TEST_CHAT_MODEL=$MODEL
+PIE_TEST_CHAT_MODEL=$SLUG
 EOF
 
 echo "chat gui e2e: engine=$BASE_URL"
-echo "chat gui e2e: model=$MODEL"
+echo "chat gui e2e: model=$SLUG"
 echo "chat gui e2e: gui PIE_HOME=$GUI_HOME"
 echo "chat gui e2e: config=$CONFIG_FILE"
 echo "chat gui e2e: retained run root: $RUN_ROOT"
@@ -86,6 +103,7 @@ xcodebuild -project RatioThink.xcodeproj \
   -parallel-testing-enabled NO \
   test \
   -only-testing:RatioThinkGUITests/S258_ComposerSendGUITests/test_composer_send_streams_real_assistant_and_persists_after_relaunch \
+  -only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests/test_chat_model_menu_contains_seeded_qwen3_default \
   ENABLE_CODE_COVERAGE=NO
 
 if ! sqlite3 "$GUI_HOME/chats.sqlite" \
