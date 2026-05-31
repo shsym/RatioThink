@@ -54,7 +54,15 @@ struct RatioThinkApp: App {
     // is the only place identity can be threaded.
     let center = ModelLoadCenter()
     let prefs = AppPreferences(defaults: Self.appPreferencesDefaults())
-    let statusStore = EngineStatusStore(client: HelperXPCClient())
+    let testBaseURL = Self.chatTestEngineBaseURL()
+    let statusStore: EngineStatusStore
+    if let testBaseURL {
+      // Probe the wrapper-booted engine for status (not the absent Helper) so
+      // the chat model-menu reconcile, gated on `.running`, fetches /v1/models.
+      statusStore = EngineStatusStore(client: TestEngineStatusXPCClient(baseURL: testBaseURL))
+    } else {
+      statusStore = EngineStatusStore(client: HelperXPCClient())
+    }
     //  wire-in completed by : `HTTPEngineClient.baseURLProvider`
     // resolves `EngineStatusStore.requireBaseURL()` on each request.
     // Returns `http://127.0.0.1:<port>` when the helper reports
@@ -66,7 +74,7 @@ struct RatioThinkApp: App {
     // mode an `engineNotReady` rather than a force-unwrap crash if a
     // future refactor lets the store deinit early.
     let engine: EngineClient
-    if let testBaseURL = Self.chatTestEngineBaseURL() {
+    if let testBaseURL {
       engine = HTTPEngineClient(baseURL: testBaseURL)
     } else {
       engine = HTTPEngineClient(
@@ -119,9 +127,41 @@ struct RatioThinkApp: App {
   }
 
   private static func chatTestEngineBaseURL() -> URL? {
-    guard let raw = ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_BASE_URL"],
-          !raw.isEmpty else { return nil }
+    // Gated through HelperConfig so a Release build ignores the override
+    // entirely — both this read and the `TestEngineStatusXPCClient` status
+    // branch key off the result, so a non-debug app falls back to the real
+    // Helper-driven engine path (`HelperXPCClient()`) and never honors the
+    // `PIE_TEST_ENGINE_BASE_URL` seam.
+    guard let raw = HelperConfig.testEngineBaseURLOverride() else { return nil }
     return URL(string: raw)
+  }
+
+  /// `AppXPCClient` that derives engine status by probing a fixed base URL
+  /// (`PIE_TEST_ENGINE_BASE_URL`) instead of the Helper XPC. The e2e wrapper
+  /// boots the engine and exports its URL; no Helper runs on this path, so
+  /// polling the Helper would pin status at `.starting` and the chat
+  /// model-menu reconcile (gated on `.running`) would never fetch
+  /// `/v1/models`. A reachable engine maps to `.running(port:)` — which the
+  /// reconcile needs to surface the served model; a stale/unreachable URL
+  /// (S279) makes the probe throw → status is NOT `.running`, preserving the
+  /// recoverable-error path. Lifecycle is owned by the wrapper, so
+  /// `stopEngine()` is a no-op.
+  private struct TestEngineStatusXPCClient: AppXPCClient {
+    let baseURL: URL
+
+    func engineStatus() async throws -> EngineStatus {
+      var request = URLRequest(url: baseURL.appendingPathComponent("v1/models"))
+      request.timeoutInterval = 2
+      let (_, response) = try await URLSession.shared.data(for: request)
+      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+            let port = baseURL.port, let enginePort = EnginePort(exactly: port) else {
+        throw AppXPCClientError.replyTimeout(
+          selector: "engineStatus(probe \(baseURL.absoluteString))", timeout: 2)
+      }
+      return .running(port: enginePort, profileID: "chat")
+    }
+
+    func stopEngine() async throws {}
   }
 
   private static func appPreferencesDefaults() -> UserDefaults {

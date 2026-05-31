@@ -97,6 +97,43 @@ public enum HelperConfig {
     validateContract()
   }
 
+  // MARK: - Test-override build gate
+
+  /// Compiled build configuration. A Release build MUST ignore every
+  /// test-only env override (the `PIE_TEST_*` seams) so a shipped, signed app
+  /// never honors a test backdoor; a DEBUG build — including the `xcodebuild
+  /// test` runner — honors them.
+  #if DEBUG
+  public static let defaultIsDebugBuild = true
+  #else
+  public static let defaultIsDebugBuild = false
+  #endif
+
+  /// Injectable seam so the Release branch is exercisable from a DEBUG test
+  /// process. `nil` ⇒ use the compiled `defaultIsDebugBuild`.
+  @TaskLocal public static var isDebugBuildOverride: Bool?
+
+  /// Effective build configuration (override-aware).
+  public static var isDebugBuild: Bool { isDebugBuildOverride ?? defaultIsDebugBuild }
+
+  /// Whether test-only env overrides may activate. `false` in Release.
+  public static var isTestOverrideAllowed: Bool { isDebugBuild }
+
+  /// Resolve the `PIE_TEST_ENGINE_BASE_URL` test seam — honored only when test
+  /// overrides are allowed. A Release build returns `nil` regardless of the
+  /// env var, so the App falls back to the real Helper-driven engine path
+  /// instead of an attacker-supplied loopback. Pure + parameterized so the
+  /// gate is unit-testable.
+  public static func testEngineBaseURLOverride(
+    env: [String: String] = ProcessInfo.processInfo.environment,
+    allowed: Bool = isTestOverrideAllowed
+  ) -> String? {
+    guard allowed, let raw = env["PIE_TEST_ENGINE_BASE_URL"], !raw.isEmpty else {
+      return nil
+    }
+    return raw
+  }
+
   // MARK: - internals
 
   private static let log = Logger(subsystem: "com.ratiothink.app.helper", category: "config")
