@@ -636,6 +636,14 @@ public enum HTTPEngineError: Error, Equatable, Sendable {
   /// as a distinct case so views can render "engine not ready" rather
   /// than a generic network failure.
   case engineNotReady(detail: String)
+  /// The engine died after a successful launch handshake (G1's
+  /// `.failed(.engineGone)`) — the boundary equivalent of an HTTP 503
+  /// Retry-After (D2). Distinct from `.engineNotReady` (engine never
+  /// came up) and `.http`/`.api` (engine answered) precisely so the
+  /// chat retry path can classify this fault as retryable without
+  /// inspecting human-readable detail strings. `detail` carries the
+  /// coarse `EngineStatusStore.statusDetail` summary.
+  case engineGone(detail: String)
 }
 
 extension HTTPEngineError: LocalizedError, CustomStringConvertible {
@@ -663,6 +671,15 @@ extension HTTPEngineError: LocalizedError, CustomStringConvertible {
       return "Engine stream error (\(code)): \(message)"
     case let .engineNotReady(detail):
       return detail.isEmpty ? "Engine not ready" : "Engine not ready: \(detail)"
+    case let .engineGone(detail):
+      // Do NOT promise "— retrying" here. This surfaces through
+      // `markAssistant(failedWith:)` precisely when retries are
+      // exhausted or the recovery wait timed out, so wording that
+      // implies in-progress recovery would lie to the user. Active
+      // recovery state is signalled elsewhere (toolbar / status dot).
+      return detail.isEmpty
+        ? "Engine stopped unexpectedly"
+        : "Engine stopped unexpectedly (\(detail))"
     }
   }
 }
