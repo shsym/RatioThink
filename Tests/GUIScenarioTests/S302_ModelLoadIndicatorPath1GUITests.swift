@@ -263,6 +263,69 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
         + "label=\(indicator.label); app: \(app.debugDescription)")
   }
 
+  // MARK: - path-2: arming Unload then dismissing (not confirming) leaves
+  // the confirm DISARMED on reopen (review v1 F4)
+
+  @MainActor
+  func test_path2_unload_confirm_disarms_on_dismiss_and_reopen() throws {
+    let app = try launchedApp()
+    defer { app.terminate() }
+
+    try triggerExplicitLoad(in: app)
+
+    let indicator = app.buttons["toolbar.modelLoadIndicator"].firstMatch
+    XCTAssertTrue(
+      indicator.waitForExistence(timeout: 10),
+      "toolbar.modelLoadIndicator was never instantiated; app: \(app.debugDescription)")
+
+    let hold = try Self.holdSeconds()
+    XCTAssertTrue(
+      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 15),
+      "load never reached the '.ready' ring; label=\(indicator.label); app: \(app.debugDescription)")
+
+    // Arm Unload (the .ready confirm prompt appears: "Keep Loaded" + "Unload").
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
+                  "indicator popover did not open; app: \(app.debugDescription)")
+    let unloadTrigger = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Unload")).firstMatch
+    XCTAssertTrue(unloadTrigger.waitForExistence(timeout: 5),
+                  "ready popover did not render an Unload trigger; app: \(app.debugDescription)")
+    unloadTrigger.click()
+    let keepLoaded = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Keep Loaded")).firstMatch
+    XCTAssertTrue(keepLoaded.waitForExistence(timeout: 5),
+                  "Unload did not arm the confirm ('Keep Loaded' missing); app: \(app.debugDescription)")
+
+    // Dismiss by clicking OUTSIDE the popover — NOT Keep, NOT Confirm.
+    // (Esc is bound to the "Keep Loaded" button, so it would disarm via
+    // Keep rather than exercise the close/reopen @State-freshness reset.)
+    // Anchor the coordinate on the WINDOW (the app element proxy has no
+    // finite frame → INFINITY point), low-centre and well away from the
+    // top-trailing popover.
+    app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.6)).tap()
+    XCTAssertTrue(waitForNoPopover(app, timeout: 5),
+                  "popover did not dismiss on an outside click; app: \(app.debugDescription)")
+    // Dismissing without confirming must NOT unload — model stays resident.
+    XCTAssertTrue(indicator.label.hasPrefix("Model loaded:"),
+                  "dismissing the armed confirm unloaded the model; "
+                    + "label=\(indicator.label); app: \(app.debugDescription)")
+
+    // Reopen — the documented "a stale armed confirm cannot survive a
+    // close/reopen" guarantee (popover @State recreated fresh) must hold:
+    // the info "Unload" ARM shows, NOT the armed confirm ("Keep Loaded").
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
+                  "indicator popover did not reopen; app: \(app.debugDescription)")
+    let reopenedUnload = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Unload")).firstMatch
+    XCTAssertTrue(reopenedUnload.waitForExistence(timeout: 5),
+                  "reopened popover did not show the info Unload arm; app: \(app.debugDescription)")
+    let staleConfirm = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Keep Loaded")).firstMatch
+    XCTAssertFalse(staleConfirm.waitForExistence(timeout: 2),
+                   "reopened popover showed a STALE armed confirm ('Keep Loaded') — the close/reopen "
+                     + "@State reset regressed; app: \(app.debugDescription)")
+  }
+
   // MARK: - steps
 
   /// Launch the app pointed at the harness engine.

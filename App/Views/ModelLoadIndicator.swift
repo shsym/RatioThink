@@ -267,13 +267,24 @@ struct ModelLoadPopover: View {
   @Binding var isPresented: Bool
   var onUnload: () -> Void = {}
 
-  /// Armed by the destructive trigger button (Cancel / Unload); swaps
-  /// the action row for the explicit confirm prompt. Local `@State`, so
-  /// it resets to `false` every time the popover is re-presented (fresh
-  /// content view per presentation) — a stale "confirming" can never
-  /// survive a close/reopen. Also reset whenever the load resolves under
-  /// it (see `.onChange(of: stateCategory)`).
-  @State private var confirmingDestructive = false
+  /// The destructive action the user armed — Cancel a live load or
+  /// Unload a resident model — CAPTURED at arm time (review v1 F2). The
+  /// confirm acts on this captured intent, NOT a re-read of
+  /// `center.state` at click time: if the load resolves
+  /// (`.loading → .ready`) in the frame between the user reading the
+  /// prompt and the click landing, a stale click can no longer perform
+  /// the WRONG destructive action — `performDestructive()` checks the
+  /// captured kind against the current state and no-ops on a mismatch.
+  /// Local `@State`, so it resets to nil every time the popover is
+  /// re-presented (fresh content view per presentation) — a stale armed
+  /// confirm can never survive a close/reopen. Also cleared whenever the
+  /// load resolves under it (see `.onChange(of: stateCategory)`).
+  @State private var armedAction: ArmedAction?
+
+  /// Which destructive action a trigger armed. Distinguishing the two at
+  /// arm time (rather than re-deriving from `center.state`) is what makes
+  /// the confirm honour the user's intent across a state flip.
+  private enum ArmedAction { case cancel, unload }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
@@ -302,7 +313,7 @@ struct ModelLoadPopover: View {
     // frame, and resetting on each frame would make the confirm prompt
     // un-openable mid-load.
     .onChange(of: stateCategory) { _, _ in
-      confirmingDestructive = false
+      armedAction = nil
     }
   }
 
@@ -313,7 +324,7 @@ struct ModelLoadPopover: View {
   /// click inside `confirmBlock` (#359).
   @ViewBuilder
   private var actionArea: some View {
-    if confirmingDestructive, let confirm = Self.destructiveConfirm(for: center.state) {
+    if armedAction != nil, let confirm = Self.destructiveConfirm(for: center.state) {
       confirmBlock(confirm)
     } else {
       HStack {
@@ -342,7 +353,7 @@ struct ModelLoadPopover: View {
       // it only ARMS the confirm step — the next send otherwise re-enters
       // the no-model confirm gate with no model resident (#359).
       Button("Unload", role: .destructive) {
-        confirmingDestructive = true
+        armedAction = .unload
       }
       .accessibilityIdentifier("modelLoad.popover.unload")
     case .failed, .engineNotReady:
@@ -362,7 +373,7 @@ struct ModelLoadPopover: View {
       // Interrupts an in-flight load — arm the confirm rather than
       // cancelling on the first click (#359).
       Button("Cancel", role: .destructive) {
-        confirmingDestructive = true
+        armedAction = .cancel
       }
       .accessibilityIdentifier("modelLoad.popover.cancel")
     }
@@ -383,7 +394,7 @@ struct ModelLoadPopover: View {
       HStack {
         Spacer()
         Button(confirm.keepTitle) {
-          confirmingDestructive = false
+          armedAction = nil
         }
         .keyboardShortcut(.cancelAction)
         .accessibilityIdentifier(confirm.keepIdentifier)
@@ -396,17 +407,22 @@ struct ModelLoadPopover: View {
     .accessibilityIdentifier("modelLoad.popover.confirm")
   }
 
-  /// Run the confirmed destructive action for the current state. The
-  /// ONLY path that reaches `center.cancel()` / `onUnload()` from the
-  /// status UI — every other interaction (indicator click, arming the
-  /// trigger, keep/escape) is non-destructive (#359).
+  /// Run the CONFIRMED destructive action — the only path that reaches
+  /// `center.cancel()` / `onUnload()` from the status UI. Acts on the
+  /// kind the user ARMED, not a fresh read of `center.state` (review v1
+  /// F2), and additionally guards that the live state still matches: if
+  /// the load flipped `.loading → .ready` between arming and the click,
+  /// an armed "Stop Loading" must NOT fall through to unloading the
+  /// now-resident model — it no-ops and lets the user re-decide. Every
+  /// other interaction (indicator click, arming the trigger, keep/escape)
+  /// is non-destructive (#359).
   private func performDestructive() {
-    switch center.state {
-    case .loading:
-      center.cancel()
-    case .ready:
-      onUnload()
-    default:
+    switch armedAction {
+    case .cancel:
+      if case .loading = center.state { center.cancel() }
+    case .unload:
+      if case .ready = center.state { onUnload() }
+    case nil:
       break
     }
     isPresented = false
