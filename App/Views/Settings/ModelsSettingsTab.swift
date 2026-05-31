@@ -32,6 +32,8 @@ struct ModelsSettingsTab: View {
                             onReveal: revealInFinder,
                             onDelete: deleteFile,
                             onDrop: handleDrop)
+
+      MemoryGuardrailSection()
     }
     .padding(20)
     .task { await refresh() }
@@ -417,5 +419,115 @@ private struct InstalledModelsTable: View {
         .foregroundStyle(.tertiary)
     }
     .frame(maxWidth: .infinity, minHeight: 140)
+  }
+}
+
+// MARK: - Memory guardrail dial
+
+/// Operator control for the RAM-aware model-size guardrail fraction.
+/// Persists via `GuardrailSettings` (a file in the support root) so the
+/// Helper's launch-time guardrail reads the same value across the
+/// sandbox boundary. Only `fraction` is exposed; the reserve term stays
+/// a `ModelMemoryGuardrail.Policy` constant for v1. The live preview
+/// recomputes this Mac's ceiling as the dial moves.
+///
+/// NOTE: this section is the model-size guardrail dial only. The
+/// HF-cache model *discovery* list (`HFCacheCatalog`) lands separately;
+/// when that merges it adds its own section here and does not touch this
+/// one — they share only the `Models` settings tab as a host.
+private struct MemoryGuardrailSection: View {
+  @State private var fraction: Double = GuardrailSettings.defaultFraction
+  @State private var saveError: String?
+
+  private enum FractionChoice: Hashable {
+    case preset(Double)
+    case custom
+  }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      SettingsSectionHeader(title: "Memory guardrail")
+      Text("Largest model RatioThink will load, as a fraction of this Mac's memory after reserving headroom for the system. Higher is riskier under memory pressure.")
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+
+      Picker("Preset", selection: choiceBinding) {
+        ForEach(GuardrailSettings.presets, id: \.value) { preset in
+          Text(preset.label).tag(FractionChoice.preset(preset.value))
+        }
+        Text("Custom").tag(FractionChoice.custom)
+      }
+      .pickerStyle(.segmented)
+      .labelsHidden()
+      .accessibilityIdentifier("GuardrailFractionPresetPicker")
+
+      Stepper(value: stepperBinding,
+              in: GuardrailSettings.minFraction...GuardrailSettings.maxFraction,
+              step: GuardrailSettings.step) {
+        Text("Fraction: \(String(format: "%.2f", fraction))").monospacedDigit()
+      }
+      .fixedSize()
+      .accessibilityIdentifier("GuardrailFractionStepper")
+
+      Text(limitPreview)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityIdentifier("GuardrailLimitPreview")
+
+      if let saveError {
+        Text(saveError).font(.callout).foregroundStyle(.red)
+      }
+    }
+    .onAppear(perform: load)
+  }
+
+  /// Highlights the matching preset, or "Custom" for an off-preset
+  /// value. Selecting a preset sets the fraction; selecting "Custom"
+  /// keeps the current stepper value (no-op).
+  private var choiceBinding: Binding<FractionChoice> {
+    Binding(
+      get: { GuardrailSettings.matchingPreset(fraction).map(FractionChoice.preset) ?? .custom },
+      set: { choice in
+        if case .preset(let value) = choice { setFraction(value) }
+      }
+    )
+  }
+
+  private var stepperBinding: Binding<Double> {
+    Binding(get: { fraction }, set: { setFraction($0) })
+  }
+
+  private var limitPreview: String {
+    guard let physical = SystemMemory.physicalBytes() else {
+      return "This Mac's memory couldn't be read — the guardrail uses a conservative default."
+    }
+    let policy = ModelMemoryGuardrail.Policy.recommended(
+      physicalMemoryBytes: physical, fraction: fraction)
+    var line = "Max model on this Mac: \(InstalledModels.formattedSize(policy.maxResolvedModelBytes))"
+    if let derivation = policy.derivationSummary {
+      line += "  (\(derivation))"
+    }
+    return line
+  }
+
+  private func load() {
+    guard let root = try? PieDirs.applicationSupport() else { return }
+    fraction = GuardrailSettings.loadFraction(root: root)
+  }
+
+  private func setFraction(_ value: Double) {
+    // Snap to the 0.05 grid so presets stay exact and the JSON stays clean.
+    let snapped = (value / GuardrailSettings.step).rounded() * GuardrailSettings.step
+    let clamped = GuardrailSettings.clamp(snapped)
+    fraction = clamped
+    do {
+      let root = try PieDirs.applicationSupport()
+      try GuardrailSettings.saveFraction(clamped, root: root)
+      saveError = nil
+    } catch {
+      saveError = "Could not save guardrail setting: \(error)"
+    }
   }
 }

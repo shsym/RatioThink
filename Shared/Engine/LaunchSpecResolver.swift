@@ -76,6 +76,12 @@ public struct LaunchSpecResolver {
   /// read-only fallback after RatioThink's app-managed models directory.
   public let hfHome: () -> URL
 
+  /// Resolved-model memory ceiling handed to `ModelMemoryGuardrail`.
+  /// Production reads physical RAM (`ModelMemoryGuardrail.defaultPolicy`);
+  /// tests inject a fixed `Policy` so their fixtures never depend on the
+  /// host's real memory.
+  public let memoryPolicy: () -> ModelMemoryGuardrail.Policy
+
   private static let log = Logger(subsystem: "com.ratiothink.app.helper",
                                   category: "launchspec.resolver")
 
@@ -88,7 +94,9 @@ public struct LaunchSpecResolver {
               pieHome: @escaping () throws -> URL = { try PieDirs.applicationSupport() },
               subprocessEnvironment: @escaping () -> [String: String]
                 = { SpawnEnvSanitizer.sanitize(ProcessInfo.processInfo.environment) },
-              hfHome: @escaping () -> URL = { LaunchSpecResolver.defaultHFHome() }) {
+              hfHome: @escaping () -> URL = { LaunchSpecResolver.defaultHFHome() },
+              memoryPolicy: @escaping () -> ModelMemoryGuardrail.Policy
+                = { ModelMemoryGuardrail.defaultPolicy }) {
     self.profileStore = profileStore
     self.pieBinary = pieBinary
     self.modelsRoot = modelsRoot
@@ -97,6 +105,7 @@ public struct LaunchSpecResolver {
     self.pieHome = pieHome
     self.subprocessEnvironment = subprocessEnvironment
     self.hfHome = hfHome
+    self.memoryPolicy = memoryPolicy
   }
 
   /// Core mapping. Pure on injected state — no Bundle / PieDirs reads
@@ -222,6 +231,7 @@ public struct LaunchSpecResolver {
       switch ModelMemoryGuardrail.validate(
         resolvedModelURL: URL(fileURLWithPath: localPath, isDirectory: false),
         modelID: profile.model,
+        policy: memoryPolicy(),
         fileManager: fileManager
       ) {
       case .success:
@@ -251,6 +261,7 @@ public struct LaunchSpecResolver {
         switch ModelMemoryGuardrail.validate(
           resolvedModelURL: cached,
           modelID: profile.model,
+          policy: memoryPolicy(),
           fileManager: fileManager
         ) {
         case .success:
