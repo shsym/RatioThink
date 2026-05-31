@@ -47,6 +47,7 @@ struct RatioThinkApp: App {
   @MainActor
   init() {
     Self.writeArtifactPathProbeIfRequested()
+    Self.recordLaunchBreadcrumb()
 
     // Build the four dependencies value-side so the coordinator can
     // borrow them at construction. The `@StateObject` wrappers aren't
@@ -184,6 +185,7 @@ struct RatioThinkApp: App {
     )
     let outcome = await reconciler.reconcile()
     NSLog("RatioThinkHelper registration reconcile: \(outcome)")
+    Diag.app.event("helper.reconcile", [("outcome", "\(outcome)")])
     if case .needsApproval = outcome {
       // Hard macOS consent gate — route the user to the toggle.
       SMAppService.openSystemSettingsLoginItems()
@@ -204,6 +206,22 @@ struct RatioThinkApp: App {
       }
     }
     return false
+  }
+
+  /// Durable launch breadcrumb: proves the app process started, and records the
+  /// version/build, the (home-redacted) bundle path, and whether Gatekeeper's
+  /// quarantine xattr is still on the bundle — the first thing triage needs when
+  /// "the app does nothing". Best-effort; never blocks launch.
+  private static func recordLaunchBreadcrumb() {
+    let info = Bundle.main.infoDictionary
+    let bundlePath = Bundle.main.bundleURL.path
+    let quarantined = getxattr(bundlePath, "com.apple.quarantine", nil, 0, 0, 0) > 0
+    Diag.app.event("app.launch", [
+      ("version", info?["CFBundleShortVersionString"] as? String ?? "?"),
+      ("build", info?["CFBundleVersion"] as? String ?? "?"),
+      ("bundle", DiagnosticLog.redactHome(bundlePath)),
+      ("quarantine", quarantined ? "present" : "absent"),
+    ])
   }
 
   private static func writeArtifactPathProbeIfRequested() {
@@ -268,6 +286,13 @@ struct RatioThinkApp: App {
           windowState.toggleItemList()
         }
         .keyboardShortcut("l", modifiers: [.command, .option])
+      }
+      // #358: user-reachable diagnostics. Runs the bundled
+      // collect-diagnostics.sh and reveals the redacted .zip in Finder.
+      CommandGroup(after: .help) {
+        Button("Collect Diagnostics…") {
+          Task { await DiagnosticsCollector.collectAndReveal() }
+        }
       }
     }
 

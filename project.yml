@@ -98,6 +98,24 @@ targets:
           - $(SRCROOT)/Helper/com.ratiothink.app.helper.plist
         outputFiles:
           - $(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/com.ratiothink.app.helper.plist
+    # Bundle Scripts/collect-diagnostics.sh into Contents/Resources/ so a
+    # downloaded build carries it (#358). Pre-CodeSign (postCompileScript) so
+    # it is sealed into CodeResources — else the outer codesign rejects a
+    # "resource added that did not exist at signing". The App's Help → Collect
+    # Diagnostics… menu runs this exact copy, and a user can run it standalone
+    # when the app won't launch:
+    #   /Applications/RatioThink.app/Contents/Resources/collect-diagnostics.sh
+      - name: Bundle collect-diagnostics script
+        script: |
+          set -euo pipefail
+          DEST="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+          mkdir -p "$DEST"
+          cp "${SRCROOT}/Scripts/collect-diagnostics.sh" "$DEST/"
+          chmod +x "$DEST/collect-diagnostics.sh"
+        inputFiles:
+          - $(SRCROOT)/Scripts/collect-diagnostics.sh
+        outputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/collect-diagnostics.sh
     # Build the pie engine binary (Vendor/pie `pie-server` crate, bin
     # `pie`) for the current Xcode arch, stage into
     # Contents/Resources/pie-engine/pie (the path
