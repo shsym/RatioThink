@@ -99,10 +99,14 @@ public enum HelperConfig {
 
   // MARK: - Test-override build gate
 
-  /// Compiled build configuration. A Release build MUST ignore every
-  /// test-only env override (the `PIE_TEST_*` seams) so a shipped, signed app
-  /// never honors a test backdoor; a DEBUG build — including the `xcodebuild
-  /// test` runner — honors them.
+  /// Compiled build configuration. Gates the engine-base-URL test seam (see
+  /// `testEngineBaseURLOverride`): a Release build ignores it so a shipped,
+  /// signed app never redirects its engine endpoint to an attacker-supplied
+  /// URL; a DEBUG build — including the `xcodebuild test` runner — honors it.
+  /// NOTE: this gate currently covers ONLY that seam. Other App-side
+  /// `PIE_TEST_*` reads (prefs suite, first-launch flag, fake/fixture
+  /// downloads, artifact-path probe) still read the env directly and stay
+  /// live in Release; routing them through this gate is a separate follow-up.
   #if DEBUG
   public static let defaultIsDebugBuild = true
   #else
@@ -116,7 +120,8 @@ public enum HelperConfig {
   /// Effective build configuration (override-aware).
   public static var isDebugBuild: Bool { isDebugBuildOverride ?? defaultIsDebugBuild }
 
-  /// Whether test-only env overrides may activate. `false` in Release.
+  /// Whether the engine-base-URL test seam may activate. `false` in Release.
+  /// (The only `PIE_TEST_*` seam currently gated — see `defaultIsDebugBuild`.)
   public static var isTestOverrideAllowed: Bool { isDebugBuild }
 
   /// Resolve the `PIE_TEST_ENGINE_BASE_URL` test seam — honored only when test
