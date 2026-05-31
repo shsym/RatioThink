@@ -28,6 +28,14 @@ if [ -z "$PIE_BIN" ]; then
     PIE_BIN="$ROOT/Vendor/pie/target/release/pie"
   elif [ -x "/Applications/RatioThink.app/Contents/Resources/pie-engine/pie" ]; then
     PIE_BIN="/Applications/RatioThink.app/Contents/Resources/pie-engine/pie"
+    # Loud fallback: no repo build exists, so this run exercises the
+    # INSTALLED app's engine binary, not the current worktree. Make the
+    # substitution visible so a stale /Applications build can't silently
+    # green an engine regression in the repo. Set PIE_BIN to override.
+    echo "e2e: WARNING no repo build (Vendor/pie/target/release/pie) — using INSTALLED app engine:" >&2
+    echo "e2e:          $PIE_BIN" >&2
+    echo "e2e:          this tests the installed /Applications build, not this worktree." >&2
+    echo "e2e:          run 'make engine-build' or set PIE_BIN to test the repo binary." >&2
   fi
 fi
 if [ -z "$PIE_BIN" ] || [ ! -x "$PIE_BIN" ]; then

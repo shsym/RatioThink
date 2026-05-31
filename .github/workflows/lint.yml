@@ -26,6 +26,14 @@ jobs:
       - name: Self-test the lint script
         run: ./Scripts/test-lint-helper-side-effects.sh
 
+      - name: Install-time launchd-safety regression guards
+        # Deterministic, fully-stubbed regressions for the launchd source-
+        # closed / agent-reenable / new-bundle-acceptance logic in
+        # Scripts/lib/proc-acceptance.sh that ships inside install-app.sh.
+        # Were green but unwired (surfaced by the GUI/E2E audit) — a regression in the install
+        # safety lib would otherwise pass CI unnoticed.
+        run: make test-install-guards
+
   build-tests:
     name: build every xcodebuild target
     runs-on: macos-15
