@@ -1134,6 +1134,12 @@ public actor LaunchedSession {
   }
 
   private nonisolated func diagnose(_ msg: String) {
+    // Route through the unified log so shutdown anomalies (SIGKILL did
+    // not reap the pid, `shm_unlink` FAILED — both host-global corruption
+    // vectors) are visible in the shipped, detached Helper, where stderr
+    // is not captured. Keep the stderr write too for CLI/test contexts
+    // that DO capture it.
+    Log.engine.error("[LaunchedSession] \(msg, privacy: .public)")
     FileHandle.standardError.write(Data("[LaunchedSession] \(msg)\n".utf8))
   }
 }

@@ -216,8 +216,26 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       // production helper boot path. Lazily constructed (not in
       // init) so degraded helpers never spawn the host they cannot
       // use.
-      let host = PieEngineHost()
+      // Wire the auto-relaunch ladder: on a mid-session engine death the
+      // host re-runs the SAME resume funnel (`HelperResumeAction.run`)
+      // that boot auto-start and the menu-bar Resume use, so all three
+      // build one LaunchSpec. The ladder fires off `PieEngineHost`'s
+      // queue; the closure captures NOTHING (the delegate is not
+      // `Sendable`) and re-acquires it on the main thread, where the
+      // stored host/store/resolver live and are read at fire time. Without
+      // a non-nil relauncher the ladder is inert and a crashed engine
+      // would die into terminal `.failed`, waiting for a manual Resume.
+      let host = PieEngineHost(
+        relaunchPolicy: PieEngineHost.RelaunchPolicy(),
+        relauncher: {
+          DispatchQueue.main.async {
+            (NSApp.delegate as? HelperAppDelegate)?.performAutoRelaunch()
+          }
+        }
+      )
       self.engineHost = host
+      assert(host.isAutoRelaunchEnabled,
+             "production PieEngineHost must wire a relauncher so the auto-relaunch ladder is live")
       // Phase 2.4: stand up the profile-backed LaunchSpec
       // resolver. ProfileStore.start failures fall back to the
       // DEBUG smoke seam (or nil) so the helper still publishes its
@@ -808,7 +826,20 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     self.profileStore = store
     let resolver = LaunchSpecResolver(
       profileStore: store,
-      pieBinary: { try LaunchSpecResolver.bundledPieBinary() }
+      pieBinary: { try LaunchSpecResolver.bundledPieBinary() },
+      // Honor the operator's RAM-guardrail fraction (persisted by the
+      // Settings → Models dial as guardrail.json) at the launch-time size
+      // guard, instead of the hardcoded default. Re-evaluated per resolve
+      // so a dial change takes effect on the next launch with no Helper
+      // restart; falls back to the default fraction when unset/unreadable.
+      memoryPolicy: {
+        let fraction = (try? PieDirs.applicationSupport())
+          .map { GuardrailSettings.loadFraction(root: $0) } ?? GuardrailSettings.defaultFraction
+        return ModelMemoryGuardrail.Policy.recommended(
+          physicalMemoryBytes: SystemMemory.physicalBytes(),
+          fraction: fraction
+        )
+      }
     )
     let closure = resolver.asClosure
     self.launchSpecResolver = closure
@@ -945,6 +976,20 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     default:
       Log.helper.notice("autoResumeEngineOnBoot: not started (\(outcome.description, privacy: .public))")
     }
+  }
+
+  /// Auto-relaunch entry point invoked by `PieEngineHost`'s relaunch
+  /// ladder after a mid-session engine death (the ladder hops to the main
+  /// thread, then calls this on the live delegate). Routes through the
+  /// same `HelperResumeAction.run` funnel as boot auto-start and the
+  /// menu-bar Resume so all three paths build one LaunchSpec.
+  func performAutoRelaunch() {
+    let outcome = HelperResumeAction.run(
+      engineHost: engineHost,
+      profileStore: profileStore,
+      resolver: launchSpecResolver
+    )
+    Log.helper.info("performAutoRelaunch: HelperResumeAction.run → \(outcome.description, privacy: .public)")
   }
 
   @objc func togglePauseResume(_ sender: NSMenuItem) {
