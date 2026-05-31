@@ -6,10 +6,26 @@ import SwiftUI
 struct RootView: View {
   @EnvironmentObject private var windowState: WindowState
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
+  /// Engine lifecycle + in-flight load, folded into the unified
+  /// indicator state that gates the engine-error banner. Both are
+  /// injected at app scope (`RatioThinkApp`).
+  @EnvironmentObject private var engineStatusStore: EngineStatusStore
+  @EnvironmentObject private var modelLoadCenter: ModelLoadCenter
 
   var body: some View {
     VStack(spacing: 0) {
       PersistenceBanner(status: persistenceStatus)
+      // Loud surface for engine/load failures only; quiet for everything
+      // else. Self-hides via the reducer + dedup signature.
+      EngineStatusBanner(
+        indicatorState: EngineIndicatorState.make(
+          engine: engineStatusStore.status,
+          engineDetail: engineStatusStore.statusDetail,
+          load: modelLoadCenter.state,
+          residentModelID: modelLoadCenter.residentModelID
+        ),
+        engineStatus: engineStatusStore
+      )
       NavigationSplitView(columnVisibility: $windowState.columnVisibility) {
         SidebarView(selection: $windowState.selectedSection)
       } content: {

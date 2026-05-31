@@ -106,6 +106,7 @@ struct ChatScaffoldView: View {
         availableModels: engineModels.resolved(fallback: availableModels),
         swapCoordinator: swapCoordinator,
         modelLoadCenter: modelLoadCenter,
+        engineStatus: engineStatusStore,
         onUnload: unloadModel
       )
       Divider().opacity(0.0001) // structural breather; no visible line per §5

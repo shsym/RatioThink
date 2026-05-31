@@ -37,7 +37,13 @@ struct ContentToolbar: View {
   /// argument in a `ChatScaffoldView` refactor would otherwise silently
   /// drop the indicator (review F2). `nil` ⇒ not shown.
   let modelLoadCenter: ModelLoadCenter?
-  /// Forwarded to the indicator's `.ready` popover Unload action.
+  /// : engine lifecycle source for the status pip. Optional only so
+  /// snapshot/preview call sites can render the toolbar without standing
+  /// up a store; like `modelLoadCenter` it is a *required* init param (no
+  /// default) so production wiring is compile-enforced. The pip shows only
+  /// when BOTH `modelLoadCenter` and `engineStatus` are present.
+  let engineStatus: EngineStatusStore?
+  /// Forwarded to the indicator's running/ready popover Unload action.
   let onUnload: () -> Void
 
   @State private var showParamsPopover = false
@@ -49,6 +55,7 @@ struct ContentToolbar: View {
     availableModels: [String] = ChatTranscriptViewModel.placeholderModels,
     swapCoordinator: ProfileSwapCoordinator,
     modelLoadCenter: ModelLoadCenter?,
+    engineStatus: EngineStatusStore?,
     onUnload: @escaping () -> Void
   ) {
     self.viewModel = viewModel
@@ -56,6 +63,7 @@ struct ContentToolbar: View {
     self.availableModels = availableModels
     self.swapCoordinator = swapCoordinator
     self.modelLoadCenter = modelLoadCenter
+    self.engineStatus = engineStatus
     self.onUnload = onUnload
   }
 
@@ -82,11 +90,17 @@ struct ContentToolbar: View {
       attachButton
       systemPromptButton
 
-      // : model-load indicator on the trailing edge. Content-hosted
-      // (not the window NSToolbar) so its popover presents reliably; its
-      // own `.opacity(0)` when idle keeps the slot from flashing empty.
-      if let modelLoadCenter {
-        ModelLoadIndicator(center: modelLoadCenter, onUnload: onUnload)
+      // : engine-status pip on the trailing edge. Content-hosted (not
+      // the window NSToolbar) so its popover presents reliably. Shown only
+      // when both the load center and the engine-status store are wired
+      // (production); snapshot/preview call sites pass nil and stay
+      // pip-less so their reference PNGs are unchanged.
+      if let modelLoadCenter, let engineStatus {
+        ModelLoadIndicator(
+          center: modelLoadCenter,
+          engineStatus: engineStatus,
+          onUnload: onUnload
+        )
       }
     }
     .padding(.horizontal, 16)
@@ -137,7 +151,7 @@ struct ContentToolbar: View {
       Divider()
       ForEach(availableModels, id: \.self) { id in
         // Stored id is the resolvable `<repo>/<file>` slug; show the
-        // friendly leaf ( review v2 F1).
+        // friendly leaf.
         Button(ModelDisplayName.leaf(id)) {
           // : route through the confirm gate. Picking a model that
           // differs from the resident model publishes a swap confirm

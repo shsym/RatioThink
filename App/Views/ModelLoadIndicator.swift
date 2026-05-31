@@ -1,90 +1,89 @@
 import SwiftUI
 
-/// Window-toolbar load indicator (design §R8, Phase 3.5).
+/// Window content-toolbar engine-status pip. A single, always-present
+/// affordance that folds the engine lifecycle (`EngineStatusStore`) and the
+/// in-flight model load (`ModelLoadCenter`) into one quiet indicator via the
+/// pure `EngineIndicatorState` reducer.
 ///
-///   ┌─ Circle (SF Symbol "circle", secondary) ────────────────────┐
-///   │     overlaid with                                            │
-///   │  Circle().trim(from: 0, to: p).rotation(-90°).stroke(...)    │
-///   │     determinate when engine reports total bytes,             │
-///   │     indeterminate (rotating short arc) otherwise.            │
-///   └──────────────────────────────────────────────────────────────┘
+/// Render per state (design locked with the user):
+///   · `.offline`  → small grey filled dot, no inline text.
+///   · `.starting` → small amber filled dot, no inline text (tooltip detail).
+///   · `.running`  → small green filled dot, no inline text.
+///   · `.loading`  → progress ring (determinate `Circle().trim` / indeterminate
+///     `TimelineView` arc, accent) + inline "Loading <leaf>… N%" (determinate)
+///     or "Loading <leaf>" + AnimatedEllipsis (indeterminate).
+///   · `.error`    → red filled dot + short red label (the error title).
 ///
-/// Click → popover with model name, loaded/total MB, ETA, Cancel.
-///
-/// Visibility:
-///   · `.loading` → indicator visible, accent stroke.
-///   · `.failed`  → indicator visible, red stroke (review v1 F7 —
-///     a hidden failure offers the user no signal; popover surfaces
-///     the message and a Dismiss action that clears the state).
-///   · everything else → `.opacity(0)` so the toolbar layout never
-///     reflows mid-load.
+/// Unlike the prior model-load-only widget, the pip is ALWAYS visible (it
+/// reflects the engine even at rest) — there is no opacity-hiding. The dot
+/// is a bare `.plain` button (no background box) so the toolbar chrome shows
+/// through. The popover lifecycle `onChange` still acks any terminal load
+/// state on dismissal so a stuck `.failed`/`.cancelled`/`.engineNotReady`
+/// clears when the popover closes from any path.
 struct ModelLoadIndicator: View {
   @ObservedObject var center: ModelLoadCenter
-  /// : invoked from the `.ready` popover's Unload button. Wired in
-  /// `RootView` to stop the engine (free RAM) then `markUnloaded()`.
+  /// : engine lifecycle source. Required so the pip reflects engine
+  /// state (offline/starting/running) even when no load is in flight, and
+  /// so the popover can read on-demand engine memory.
+  @ObservedObject var engineStatus: EngineStatusStore
+  /// : invoked from the running/ready popover's Unload button. Wired in
+  /// `ChatScaffoldView` to stop the engine (free RAM) then `markUnloaded()`.
   var onUnload: () -> Void = {}
 
   @State private var showPopover = false
 
+  /// The single semantic state the pip renders, folded from both sources.
+  private var indicatorState: EngineIndicatorState {
+    EngineIndicatorState.make(
+      engine: engineStatus.status,
+      engineDetail: engineStatus.statusDetail,
+      load: center.state,
+      residentModelID: center.residentModelID
+    )
+  }
+
   var body: some View {
-    // Single source of determinacy (review v1 F2): `center.progress` is
-    // the one place that decides determinate-vs-indeterminate (and
-    // latch-logs a `loaded > total` protocol bug). The label percent,
-    // the ring fill, and the ellipsis-animation flag all read from this
-    // one value so they can never drift — an overflow frame falls back
-    // to indeterminate copy AND a spinning ring AND animated dots.
-    let fraction = center.progress
+    let state = indicatorState
     return Button {
       showPopover.toggle()
     } label: {
-      // : pair the ring with self-explanatory text on its
-      // left so the indicator reads as a labeled control rather than
-      // an ambiguous floating wheel. No `.background` here — the bare
-      // `.plain` button lets the toolbar chrome show through, which is
-      // what removes the "odd boxed background" the icon-only widget
-      // appeared to have in review snapshots.
       HStack(spacing: 5) {
-        if let prefix = Self.labelPrefix(for: center.state, fraction: fraction) {
+        if let prefix = Self.pipLabel(for: state) {
           HStack(spacing: 0) {
-            // Review v1 F1: cap width + middle-truncate so a long
-            // HF-style repo ID can't render unbounded and crowd other
-            // toolbar items — mirrors the popover header treatment.
+            // Cap width + middle-truncate so a long HF-style leaf can't
+            // render unbounded and crowd other toolbar items.
             Text(prefix)
               .monospacedDigit()
               .lineLimit(1)
               .truncationMode(.middle)
-            if Self.labelAnimatesEllipsis(for: center.state, fraction: fraction) {
+            if Self.pipLabelAnimatesEllipsis(for: state) {
               AnimatedEllipsis()
             }
           }
           .font(.callout)
-          .foregroundStyle(labelTint)
+          .foregroundStyle(Self.labelTint(for: state))
           .frame(maxWidth: 200, alignment: .trailing)
         }
-        indicatorShape(fraction: fraction)
+        indicatorShape(for: state)
       }
     }
     .buttonStyle(.plain)
-    .opacity(isSurfaceVisible ? 1 : 0)
-    .allowsHitTesting(isSurfaceVisible)
-    .help(helpText)
+    .help(Self.helpText(for: state))
     .accessibilityIdentifier("toolbar.modelLoadIndicator")
-    .accessibilityLabel(accessibilityLabelText)
+    .accessibilityLabel(Self.accessibilityLabelText(for: state))
     .popover(isPresented: $showPopover, arrowEdge: .bottom) {
-      ModelLoadPopover(center: center, isPresented: $showPopover, onUnload: onUnload)
+      ModelLoadPopover(
+        center: center,
+        engineStatus: engineStatus,
+        isPresented: $showPopover,
+        onUnload: onUnload
+      )
     }
-    // Review v1 F11: a popover opened during load A must close when
-    // the surface goes invisible between load A and load B, otherwise
-    // a stale popover reappears anchored at the next load's indicator.
-    .onChange(of: isSurfaceVisible) { _, visible in
-      if !visible { showPopover = false }
-    }
-    // Review v2 F7: clicking outside the popover dismisses it but
-    // does NOT clear `.failed` / `.cancelled`, leaving the red ring
-    // (or invisible-but-terminal state) stuck. When the popover
-    // closes from any path while state is terminal, ack the terminal
-    // and return to .idle. Confirms via Dismiss button still work
-    // — they call dismissTerminalState directly, then close.
+    // Clicking outside the popover dismisses it but does NOT clear a
+    // terminal load (`.failed` / `.cancelled` / `.engineNotReady`),
+    // leaving it stuck. When the popover closes from any path while the
+    // load is terminal, ack the terminal and return to .idle. The
+    // Dismiss button also works — it calls dismissTerminalState directly.
     .onChange(of: showPopover) { wasShown, isShown in
       if wasShown, !isShown {
         switch center.state {
@@ -99,55 +98,47 @@ struct ModelLoadIndicator: View {
 
   // MARK: - shape
 
-  private func indicatorShape(fraction: Double?) -> some View {
+  /// The dot/ring at the trailing edge. A filled dot for the quiet states
+  /// (offline/starting/running/error); the progress ring for `.loading`.
+  @ViewBuilder
+  private func indicatorShape(for state: EngineIndicatorState) -> some View {
+    switch state {
+    case let .loading(_, fraction):
+      loadingRing(fraction: fraction)
+        .frame(width: 18, height: 18)
+    default:
+      Circle()
+        .fill(Self.dotColor(for: state))
+        .frame(width: 9, height: 9)
+        // Match the loading ring's slot so the trailing edge never
+        // shifts horizontally when the state flips dot↔ring.
+        .frame(width: 18, height: 18)
+    }
+  }
+
+  @ViewBuilder
+  private func loadingRing(fraction: Double?) -> some View {
     ZStack {
       Image(systemName: "circle")
         .imageScale(.medium)
         .foregroundStyle(.secondary)
-      progressOverlay(fraction: fraction)
-        .frame(width: 14, height: 14)
-    }
-    .frame(width: 18, height: 18)
-  }
-
-  @ViewBuilder
-  private func progressOverlay(fraction: Double?) -> some View {
-    switch center.state {
-    case .loading:
-      if let fraction {
-        Circle()
-          .trim(from: 0, to: fraction)
-          .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-          .rotationEffect(.degrees(-90))
-      } else {
-        indeterminateArc
+      Group {
+        if let fraction {
+          Circle()
+            .trim(from: 0, to: fraction)
+            .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+            .rotationEffect(.degrees(-90))
+        } else {
+          indeterminateArc
+        }
       }
-    case .failed:
-      // Static red ring so the failure is unmissable; the popover
-      // carries the actionable message (review v1 F7).
-      Circle()
-        .stroke(Color.red, style: StrokeStyle(lineWidth: 2))
-    case .engineNotReady:
-      // : yellow ring distinguishes "engine still booting"
-      // from "load failed" — same wait-and-retry shape the helper
-      // menu-bar dot uses for `.starting`/`.stopping`.
-      Circle()
-        .stroke(Color.yellow, style: StrokeStyle(lineWidth: 2))
-    case .ready:
-      // : a resident model gets a solid green ring so the user has
-      // a visible, clickable affordance to Unload (free RAM). Without
-      // this the indicator was invisible once loaded.
-      Circle()
-        .stroke(Color.green, style: StrokeStyle(lineWidth: 2))
-    default:
-      EmptyView()
+      .frame(width: 14, height: 14)
     }
   }
 
-  /// Spinner driven by `TimelineView(.animation)` (review v1 F10) so
-  /// the rotation is a deterministic function of `Date` rather than
-  /// an open-ended `withAnimation(.repeatForever)` whose lifetime
-  /// outlives view teardown.
+  /// Spinner driven by `TimelineView(.animation)` so the rotation is a
+  /// deterministic function of `Date` whose lifetime ends with the view,
+  /// rather than an open-ended `withAnimation(.repeatForever)`.
   private var indeterminateArc: some View {
     TimelineView(.animation) { context in
       let seconds = context.date.timeIntervalSinceReferenceDate
@@ -159,103 +150,139 @@ struct ModelLoadIndicator: View {
     }
   }
 
-  // MARK: - toolbar label
+  // MARK: - pure presentation helpers
 
-  /// Stable prefix for the toolbar label (no trailing ellipsis — the
-  /// animated dots are appended separately for the active states).
-  /// `fraction` is `ModelLoadCenter.progress` — the single source of
-  /// the determinate-vs-indeterminate decision (review v1 F2). Pure
-  /// function of `(state, fraction)` so it can be asserted in unit
-  /// tests. `.ready` deliberately returns nil so a resident model
-  /// leaves the toolbar quiet; every *waiting/error* state gets
-  /// self-explanatory copy so the ring is never an ambiguous wheel.
-  static func labelPrefix(for state: ModelLoadCenter.State, fraction: Double?) -> String? {
+  /// Inline pip label, or nil when the state should be a bare dot.
+  /// Pure function of `EngineIndicatorState` so it is unit-testable
+  /// without SwiftUI (`ModelLoadIndicatorLabelTests`):
+  ///   · `.offline` / `.running` / `.starting` → nil (quiet dot; the
+  ///     tooltip carries any detail).
+  ///   · `.loading(id, fraction)` → "Loading <leaf>… N%" (determinate)
+  ///     or "Loading <leaf>" (indeterminate — the ellipsis is appended
+  ///     separately as an animated view).
+  ///   · `.error(err)` → the error title.
+  static func pipLabel(for state: EngineIndicatorState) -> String? {
     switch state {
-    case let .loading(modelID, _, _, _):
+    case let .loading(modelID, fraction):
+      let leaf = ModelDisplayName.leaf(modelID)
       if let fraction {
-        return "Loading \(modelID)… \(Int(fraction * 100))%"
+        return "Loading \(leaf)… \(Int(fraction * 100))%"
       }
-      return "Loading \(modelID)"
-    case .failed:          return "Load failed"
-    case .engineNotReady:  return "Engine starting"
-    default:               return nil
+      return "Loading \(leaf)"
+    case let .error(error):
+      return error.title
+    case .offline, .starting, .running:
+      return nil
     }
   }
 
-  /// Whether the label animates a trailing ellipsis. Determinate loads
-  /// already show a percent that cycling dots would jitter, so only the
-  /// indeterminate waiting states (`Loading id`, `Engine starting`,
-  /// and an overflow `loaded > total` frame) get the dots. Keyed off
-  /// the same `fraction` as the percent and the ring (review v1 F2) so
-  /// the three can never disagree.
-  static func labelAnimatesEllipsis(for state: ModelLoadCenter.State, fraction: Double?) -> Bool {
+  /// Whether the label animates a trailing ellipsis. Only the
+  /// indeterminate load does — a determinate load already shows a
+  /// percent that cycling dots would jitter, and the error title is
+  /// static. Keyed off the same state as the label and the ring so the
+  /// three can never disagree.
+  static func pipLabelAnimatesEllipsis(for state: EngineIndicatorState) -> Bool {
+    if case let .loading(_, fraction) = state {
+      return fraction == nil
+    }
+    return false
+  }
+
+  /// Concrete dot colour for the bare-dot states. The reducer owns the
+  /// abstract `Dot` intent; the view maps it to a SwiftUI `Color`:
+  /// grey (offline) / amber (busy: starting) / neutral adaptive ink
+  /// (running) / red (error).
+  ///
+  /// The running dot is `Color.primary` — the system label ink — so a
+  /// healthy engine reads as a QUIET neutral (near-black in light mode,
+  /// near-white in dark) rather than a loud green, matching 's "quiet
+  /// when healthy, loud on problems" intent. `Color.primary` is
+  /// appearance-adaptive, so it stays clearly visible in BOTH light and
+  /// dark toolbars (a hardcoded white would vanish on a light toolbar),
+  /// and its full-strength ink stays distinct from `.offline`'s muted
+  /// `.secondary` grey. `.loading` also maps via `.busy` but renders the
+  /// accent ring instead of a dot, so its colour here is never shown.
+  static func dotColor(for state: EngineIndicatorState) -> Color {
+    switch state.dot {
+    case .offline: return .secondary
+    case .busy:    return .orange
+    case .running: return .primary
+    case .error:   return .red
+    }
+  }
+
+  /// Match the inline label colour to the state: red for an error, muted
+  /// for the (only other labelled) loading state.
+  static func labelTint(for state: EngineIndicatorState) -> Color {
     switch state {
-    case .loading:        return fraction == nil
-    case .engineNotReady: return true
-    default:              return false
+    case .error: return .red
+    default:     return .secondary
     }
   }
 
-  /// Match the label colour to the ring so the control reads as one
-  /// unit: muted for in-progress/engine-starting, red for failure.
-  private var labelTint: Color {
-    switch center.state {
-    case .failed: return .red
-    default:      return .secondary
-    }
-  }
-
-  // MARK: - state helpers
-
-  /// True when the indicator should render at full opacity. Loading
-  /// AND failed both qualify (failure is otherwise undetectable —
-  /// review v1 F7).
-  private var isSurfaceVisible: Bool {
-    switch center.state {
-    case .loading, .failed, .engineNotReady, .ready: return true
-    default: return false
-    }
-  }
-
-  private var helpText: String {
-    switch center.state {
-    case let .loading(modelID, _, _, _):    return "Loading \(modelID)…"
-    case let .failed(modelID, _):           return "Load failed: \(modelID)"
-    case let .engineNotReady(modelID, _):   return "Engine starting… (\(modelID) load deferred)"
-    case let .ready(modelID):               return "Model loaded: \(modelID) — click to unload"
-    default:                                return ""
-    }
-  }
-
-  private var accessibilityLabelText: String {
-    switch center.state {
-    case let .loading(modelID, _, _, _):
-      // Same single-source fraction as the visible label/ring (F2).
-      if let fraction = center.progress {
-        return "Loading model \(modelID), \(Int(fraction * 100)) percent complete"
+  /// Tooltip text per state. The quiet dots carry their detail here
+  /// (especially `.starting`, whose amber dot has no inline text).
+  static func helpText(for state: EngineIndicatorState) -> String {
+    switch state {
+    case .offline:
+      return "Engine stopped"
+    case let .starting(detail):
+      return detail
+    case let .loading(modelID, _):
+      return "Loading \(ModelDisplayName.leaf(modelID))…"
+    case let .running(modelID):
+      if let modelID {
+        return "Engine running — \(ModelDisplayName.leaf(modelID)) (click to unload)"
       }
-      return "Loading model \(modelID)"
-    case let .failed(modelID, _):
-      return "Model load failed: \(modelID)"
-    case let .engineNotReady(modelID, _):
-      return "Engine starting, model \(modelID) load deferred"
-    case let .ready(modelID):
-      return "Model loaded: \(modelID)"
-    default:
-      return ""
+      return "Engine running"
+    case let .error(error):
+      return "\(error.title): \(error.message)"
+    }
+  }
+
+  /// VoiceOver label per state.
+  static func accessibilityLabelText(for state: EngineIndicatorState) -> String {
+    switch state {
+    case .offline:
+      return "Engine stopped"
+    case .starting:
+      return "Engine starting"
+    case let .loading(modelID, fraction):
+      let leaf = ModelDisplayName.leaf(modelID)
+      if let fraction {
+        return "Loading model \(leaf), \(Int(fraction * 100)) percent complete"
+      }
+      return "Loading model \(leaf)"
+    case let .running(modelID):
+      if let modelID {
+        return "Engine running, model \(ModelDisplayName.leaf(modelID)) resident"
+      }
+      return "Engine running"
+    case let .error(error):
+      return "\(error.title). \(error.message)"
     }
   }
 }
 
-/// Popover surfaced from the toolbar indicator. Read-only details +
-/// the active control for the current state — `Cancel` while loading,
-/// `Dismiss` after a failure (review v1 F7) so the user can clear the
-/// red ring without restarting the load. Both end-states dismiss the
-/// popover so the user does not have to click outside.
+/// Popover surfaced from the toolbar pip. Read-only details + the active
+/// control for the current load state — `Unload` while running/ready,
+/// `Cancel` while loading, `Dismiss` after a failure / engine-not-ready.
+/// When the engine is running/ready it also shows an on-demand `Memory`
+/// row sampled from the helper while the popover is open. Both
+/// end-states dismiss the popover so the user does not have to click out.
 struct ModelLoadPopover: View {
   @ObservedObject var center: ModelLoadCenter
+  /// : source for the on-demand engine-memory readout. Polled only
+  /// while this popover is open (a `.task` cancelled on disappear), never
+  /// as a published field — a per-second RSS publish would re-render the
+  /// toolbar hosting this popover and dismiss it.
+  @ObservedObject var engineStatus: EngineStatusStore
   @Binding var isPresented: Bool
   var onUnload: () -> Void = {}
+
+  /// Latest engine RSS sample, refreshed every ~2s while the popover is
+  /// open and the engine is running/ready. Local-only; nil hides the row.
+  @State private var memory: EngineMemorySample?
 
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
@@ -269,6 +296,9 @@ struct ModelLoadPopover: View {
       default:
         bytesRow
         etaRow
+        if let memory, Self.showsMemoryRow(centerState: center.state, engineRunningOrReady: isEngineRunningOrReady) {
+          memoryRow(memory)
+        }
       }
       Divider()
       HStack {
@@ -279,6 +309,51 @@ struct ModelLoadPopover: View {
     .padding(14)
     .frame(width: 280)
     .accessibilityIdentifier("modelLoad.popover")
+    // On-demand memory poll: only while the popover is open and the
+    // engine is running/ready. Re-armed by `.task(id:)` when the engine
+    // state flips so an engine that comes up after the popover opened
+    // still starts sampling. Cancelled automatically on disappear.
+    .task(id: isEngineRunningOrReady) {
+      guard isEngineRunningOrReady else {
+        memory = nil
+        return
+      }
+      while !Task.isCancelled {
+        memory = await engineStatus.engineMemory()
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+      }
+    }
+  }
+
+  /// Engine is in a state where a memory readout is meaningful (a model
+  /// is resident / the engine is serving). Drives the `.task` gate and
+  /// the row's presence.
+  private var isEngineRunningOrReady: Bool {
+    if case .running = engineStatus.status {
+      return true
+    }
+    if case .ready = center.state {
+      return true
+    }
+    return false
+  }
+
+  /// Whether the on-demand `Memory` row should render. Pure so the gate
+  /// is unit-testable (`ModelLoadPopoverMemoryRowTests`): the row shows
+  /// only in the steady/loading branch (never over a `.failed` /
+  /// `.engineNotReady` block) AND while the engine is running/ready. The
+  /// caller still requires a non-nil sample — a nil sample (engine
+  /// answered "unavailable", or hasn't answered yet) hides the row.
+  static func showsMemoryRow(
+    centerState: ModelLoadCenter.State,
+    engineRunningOrReady: Bool
+  ) -> Bool {
+    switch centerState {
+    case .failed, .engineNotReady:
+      return false
+    default:
+      return engineRunningOrReady
+    }
   }
 
   private var header: some View {
@@ -305,10 +380,10 @@ struct ModelLoadPopover: View {
       .accessibilityIdentifier("modelLoad.popover.unload")
     case .failed, .engineNotReady:
       Button("Dismiss") {
-        // Review v2 F3: use the documented public API instead of the
-        // test-only `_testOverrideState` seam — the seam internally
-        // calls `cancel()` which bumps the load generation and would
-        // kill any new load racing the user's tap.
+        // Use the documented public API instead of the test-only
+        // `_testOverrideState` seam — the seam internally calls
+        // `cancel()` which bumps the load generation and would kill any
+        // new load racing the user's tap.
         center.dismissTerminalState()
         isPresented = false
       }
@@ -337,11 +412,10 @@ struct ModelLoadPopover: View {
     }
   }
 
-  /// : `.engineNotReady` placeholder block. Reads as
-  /// "Engine starting…" + the store's status detail (e.g. "Engine
-  /// stopped" or "Helper unreachable: <error>"). Distinct copy +
-  /// muted (not red) tint so the user reads "the engine is still
-  /// coming up, my click is queued in spirit" instead of "the load
+  /// `.engineNotReady` placeholder block. Reads as "Engine starting…" +
+  /// the store's status detail (e.g. "Engine stopped" or "Helper
+  /// unreachable: <error>"). Distinct copy + muted (not red) tint so the
+  /// user reads "the engine is still coming up" rather than "the load
   /// failed for some technical reason."
   private func engineNotReadyBlock(detail: String) -> some View {
     VStack(alignment: .leading, spacing: 6) {
@@ -376,6 +450,25 @@ struct ModelLoadPopover: View {
       Spacer()
       Text(etaText)
         .monospacedDigit()
+    }
+    .font(.callout)
+  }
+
+  /// On-demand engine resident-memory row. Rendered only when a
+  /// sample is present (engine running/ready and the helper answered).
+  private func memoryRow(_ sample: EngineMemorySample) -> some View {
+    HStack {
+      Text("Memory")
+        .foregroundStyle(.secondary)
+      Spacer()
+      //  e2e: the id sits on the VALUE Text (not the HStack container)
+      // so a GUI test can read the rendered RSS string off
+      // `popovers.staticTexts["modelLoad.popover.memory"].label` and
+      // assert a plausible non-zero readout — a container HStack exposes
+      // no readable label.
+      Text(sample.formattedResident)
+        .monospacedDigit()
+        .accessibilityIdentifier("modelLoad.popover.memory")
     }
     .font(.callout)
   }
@@ -431,13 +524,12 @@ struct ModelLoadPopover: View {
   }
 }
 
-/// Trailing `…` rendered as three dots that cycle `.` → `..` → `...`
-///. All three dots always occupy layout space — only
-/// their opacity animates — so the dots never reflow the text that
-/// follows (the percent) or shift the ring beside it. Driven by
-/// `TimelineView(.periodic)` rather than `withAnimation(.repeatForever)`
-/// so the cadence is a deterministic function of `Date` whose lifetime
-/// ends with the view (matching the indeterminate-arc rationale, F10).
+/// Trailing `…` rendered as three dots that cycle `.` → `..` → `...`.
+/// All three dots always occupy layout space — only their opacity
+/// animates — so the dots never reflow the text that follows. Driven by
+/// `TimelineView(.periodic)` so the cadence is a deterministic function
+/// of `Date` whose lifetime ends with the view (matching the
+/// indeterminate-arc rationale).
 private struct AnimatedEllipsis: View {
   /// Seconds per dot step; full `.`→`..`→`...` cycle is 3× this.
   private let step: TimeInterval = 0.4
