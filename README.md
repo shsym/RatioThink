@@ -11,7 +11,7 @@ Release DMGs are signed with a Developer ID and notarized by Apple, so they
 pass Gatekeeper with no extra steps:
 
 1. Download `RatioThink-arm64.dmg` (Apple Silicon) from Releases and open it.
-2. Drag **RatioThink.app** into **Applications**.
+2. In the window that opens, drag **RatioThink.app** onto the **Applications** shortcut.
 3. Open **RatioThink** from Applications.
 
 > **Unsigned / development builds.** A DMG or app you build yourself
@@ -31,6 +31,14 @@ pass Gatekeeper with no extra steps:
 git clone --recurse-submodules https://github.com/shsym/RatioThink.git
 cd RatioThink
 make build          # generates RatioThink.xcodeproj, then builds RatioThink.app + helper
+```
+
+The repo uses git submodules (the Pie engine, plus `ds_store` + `mac_alias` under
+`Scripts/vendor/` which `make dmg-arm64` needs to write the styled DMG window). If
+you cloned without `--recurse-submodules`, initialize them:
+
+```bash
+git submodule update --init --recursive
 ```
 
 To install a signed build into `/Applications` (verified end-to-end: helper + engine + a chat
@@ -102,6 +110,33 @@ make release-preflight ARTIFACT=build/dmg/RatioThink-arm64.dmg
 
 On a notarized release it exits **0** ("Gatekeeper-accepted"); on an unsigned
 or dev build it exits non-zero and prints exactly what is missing.
+
+## Troubleshooting / Collect diagnostics
+
+If RatioThink "does nothing" after launch — no window, no menu-bar icon, no chat —
+collect a diagnostics bundle and send it to the developer.
+
+**From the app** (if it opens): **Help → Collect Diagnostics…**. It writes a
+`.zip` to your Desktop and reveals it in Finder.
+
+**From Terminal** (works even when the app or helper won't launch):
+
+```bash
+/Applications/RatioThink.app/Contents/Resources/collect-diagnostics.sh
+```
+
+This prints a short verdict (e.g. *quarantine present*, *helper never
+launched*, *Gatekeeper rejected*, *engine failed*) and writes
+`~/Desktop/RatioThink-diagnostics-<timestamp>.zip`. Attach that `.zip` to your
+report.
+
+The bundle contains app/helper versions, codesign + Gatekeeper + quarantine
+status, the launchd helper state, the running-process list, recent macOS
+Unified Logging for `com.ratiothink*`, recent crash reports, and the app's own
+breadcrumb logs (`app.log` / `helper.log` / `engine.log`). It is **redacted**:
+your home path is collapsed to `~` and obvious tokens are stripped. Chat
+contents are **not** included unless you pass `--include-chats`. Other flags:
+`--window <dur>` (Unified Logging look-back, default `2h`) and `--out <path>`.
 
 ## Repo layout
 

@@ -15,16 +15,20 @@
 # driveable under XCUITest.)
 #
 #
-# The hold (default 12s) is the deterministic observable window: long
-# enough for XCUITest to catch "Loading model" AND to open the popover
-# and hit Cancel before model_ready, short enough that the load test
-# completes promptly. Override with PIE_TEST_LOAD_HOLD_SECONDS.
+# The hold is the deterministic observable window: long enough for
+# XCUITest to catch "Loading model" AND complete the slower interaction
+# dance (dismiss the Switch popover → open the indicator popover → click
+# Cancel to ARM the confirm) before model_ready lands and the popover's
+# action swaps Cancel→Unload. 30s gives comfortable margin over the
+# worst-case open path (~18s); the per-test "Model loaded:" waits are all
+# derived from this hold, not hardcoded. Override with
+# PIE_TEST_LOAD_HOLD_SECONDS.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-HOLD_SECONDS="${PIE_TEST_LOAD_HOLD_SECONDS:-12}"
+HOLD_SECONDS="${PIE_TEST_LOAD_HOLD_SECONDS:-30}"
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p302-loadviz-$$}"
 GUI_HOME="$RUN_ROOT/g"
 URL_FILE="$RUN_ROOT/harness.url"

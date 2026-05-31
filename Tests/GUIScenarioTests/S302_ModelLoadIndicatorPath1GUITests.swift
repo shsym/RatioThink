@@ -1,7 +1,9 @@
 import XCTest
 
 /// toolbar model-load indicator via the REAL production
-/// path-1 (explicit load), plus mid-load cancel.
+/// path-1 (explicit load), plus the #359 confirmed mid-load cancel gate
+/// — opening the popover is info-only, the "Cancel" button only arms an
+/// explicit "Stop Loading" confirm, and only that confirm cancels.
 ///
 /// Where S297 drives the indicator through the chat-send meta-frame path
 /// (`applyChatMetaEvent`, which only fires on engine `model_loading`
@@ -68,16 +70,21 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
 
     // After model_ready: the Loading label clears and the ready ring
     // takes over ("Model loaded: <id>", label prefix nil for .ready).
+    // Derive the wait from the harness hold (+ slack) rather than a fixed
+    // value — model_ready only lands after the hold, so a hardcoded window
+    // shorter than the hold would flake when the hold is raised.
+    let hold = try Self.holdSeconds()
     XCTAssertTrue(
-      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: 20),
-      "toolbar.modelLoadIndicator did not clear to the 'Model loaded:' ready ring; "
-        + "label=\(indicator.label); app: \(app.debugDescription)")
+      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 10),
+      "toolbar.modelLoadIndicator did not clear to the 'Model loaded:' ready ring within hold+10 "
+        + "(hold=\(hold)s); label=\(indicator.label); app: \(app.debugDescription)")
   }
 
-  // MARK: - mid-load cancel: synchronous .loading → .cancelled clears the ring
+  // MARK: - mid-load cancel: opening info never cancels; only the
+  // explicit confirmed "Stop Loading" cancels (#359)
 
   @MainActor
-  func test_path1_midload_cancel_clears_indicator() throws {
+  func test_path1_midload_cancel_is_confirmed_and_only_confirm_cancels() throws {
     let app = try launchedApp()
     defer { app.terminate() }
 
@@ -96,22 +103,39 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
       "toolbar.modelLoadIndicator exists but never showed 'Loading model' before cancel — "
         + "state-machine regression? label=\(indicator.label); app: \(app.debugDescription)")
 
-    // Open the indicator popover and hit Cancel — center.cancel() makes
-    // a synchronous .loading → .cancelled transition
-    // (ModelLoadCenter.swift:207).
+    // (1) Opening the indicator popover is info-only — it must NOT cancel
+    // the load (#359 acceptance: "click-open does not cancel").
     XCTAssertTrue(openIndicatorPopover(indicator, in: app),
                   "indicator popover did not open; app: \(app.debugDescription)")
-    let cancelButton = app.popovers.buttons
-      .matching(NSPredicate(format: "label == %@", "Cancel")).firstMatch
-    XCTAssertTrue(cancelButton.waitForExistence(timeout: 5),
-                  "loading popover did not render a Cancel button; app: \(app.debugDescription)")
-    cancelButton.click()
+    XCTAssertTrue(indicator.label.hasPrefix("Loading model"),
+                  "opening the popover cancelled the load — click must be info-only; "
+                    + "label=\(indicator.label); app: \(app.debugDescription)")
 
-    // The synchronous cancel clears .loading and the indicator goes idle
-    // (opacity 0 / no label) — the "Loading model" label must clear …
+    // (2) The "Cancel" button ARMS the confirm step; it must not cancel
+    // on the first click. After clicking it the confirm prompt appears
+    // ("Stop Loading" / "Keep Loading") while the load is STILL running.
+    let cancelTrigger = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Cancel")).firstMatch
+    XCTAssertTrue(cancelTrigger.waitForExistence(timeout: 5),
+                  "loading popover did not render a Cancel trigger; app: \(app.debugDescription)")
+    cancelTrigger.click()
+
+    let confirmStop = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Stop Loading")).firstMatch
+    XCTAssertTrue(confirmStop.waitForExistence(timeout: 5),
+                  "clicking Cancel did not surface the 'Stop Loading' confirm — confirm gate missing; "
+                    + "app: \(app.debugDescription)")
+    XCTAssertTrue(indicator.label.hasPrefix("Loading model"),
+                  "arming the confirm cancelled the load — cancellation must be confirmed, not on first click; "
+                    + "label=\(indicator.label); app: \(app.debugDescription)")
+
+    // (3) Only the confirmed "Stop Loading" actually cancels. center.cancel()
+    // makes a synchronous .loading → .cancelled transition
+    // (ModelLoadCenter.swift), so the "Loading model" label clears …
+    confirmStop.click()
     XCTAssertTrue(
       waitUntilLabelClears(indicator, prefix: "Loading model", timeout: 10),
-      "toolbar.modelLoadIndicator stayed in 'Loading model' after Cancel; "
+      "toolbar.modelLoadIndicator stayed in 'Loading model' after confirmed Stop Loading; "
         + "label=\(indicator.label); app: \(app.debugDescription)")
     // … and the cancelled load must NOT complete to ready — for the
     // FULL hold + slack (review F3). The old 8 s window was decoupled
@@ -125,6 +149,181 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
       waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 5),
       "cancelled load still completed to 'Model loaded:' within hold+slack (hold=\(hold)s); "
         + "the cancel did not stop the load; app: \(app.debugDescription)")
+  }
+
+  // MARK: - "Keep Loading" backs out of the confirm without cancelling
+
+  @MainActor
+  func test_path1_keep_loading_backs_out_and_load_completes() throws {
+    let app = try launchedApp()
+    defer { app.terminate() }
+
+    try triggerExplicitLoad(in: app)
+
+    let indicator = app.buttons["toolbar.modelLoadIndicator"].firstMatch
+    XCTAssertTrue(
+      indicator.waitForExistence(timeout: 10),
+      "toolbar.modelLoadIndicator was never instantiated — ContentToolbar wiring regression? "
+        + "app: \(app.debugDescription)")
+    XCTAssertTrue(
+      waitForLabel(indicator, beginsWith: "Loading model", timeout: 15),
+      "toolbar.modelLoadIndicator never showed 'Loading model'; "
+        + "label=\(indicator.label); app: \(app.debugDescription)")
+
+    // Arm the cancel confirm, then back out with "Keep Loading".
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
+                  "indicator popover did not open; app: \(app.debugDescription)")
+    let cancelTrigger = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Cancel")).firstMatch
+    XCTAssertTrue(cancelTrigger.waitForExistence(timeout: 5),
+                  "loading popover did not render a Cancel trigger; app: \(app.debugDescription)")
+    cancelTrigger.click()
+
+    let keepLoading = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Keep Loading")).firstMatch
+    XCTAssertTrue(keepLoading.waitForExistence(timeout: 5),
+                  "confirm step missing a 'Keep Loading' escape; app: \(app.debugDescription)")
+    keepLoading.click()
+
+    // Backing out must NOT cancel — the load proceeds to ready once the
+    // harness releases its hold.
+    let hold = try Self.holdSeconds()
+    XCTAssertTrue(
+      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 15),
+      "'Keep Loading' aborted the load instead of letting it finish; "
+        + "label=\(indicator.label); app: \(app.debugDescription)")
+  }
+
+  // MARK: - path-2: Unload after .ready — opening info never unloads;
+  // only the explicit confirmed "Unload" frees the resident model (#359)
+
+  @MainActor
+  func test_path2_unload_after_ready_is_confirmed_and_only_confirm_unloads() throws {
+    let app = try launchedApp()
+    defer { app.terminate() }
+
+    try triggerExplicitLoad(in: app)
+
+    let indicator = app.buttons["toolbar.modelLoadIndicator"].firstMatch
+    XCTAssertTrue(
+      indicator.waitForExistence(timeout: 10),
+      "toolbar.modelLoadIndicator was never instantiated — ContentToolbar wiring regression? "
+        + "app: \(app.debugDescription)")
+
+    // Drive the load all the way to .ready ("Model loaded:") — the state
+    // the Unload affordance lives in. Unlike the mid-load Cancel path,
+    // Unload is real-engine-meaningful today (pie supports unload).
+    let hold = try Self.holdSeconds()
+    XCTAssertTrue(
+      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 15),
+      "load never reached the '.ready' ring; label=\(indicator.label); app: \(app.debugDescription)")
+
+    // (1) Opening the indicator popover is info-only — it must NOT unload
+    // the resident model (#359 acceptance: click is read-only in running).
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
+                  "indicator popover did not open; app: \(app.debugDescription)")
+    XCTAssertTrue(indicator.label.hasPrefix("Model loaded:"),
+                  "opening the popover unloaded the model — click must be info-only; "
+                    + "label=\(indicator.label); app: \(app.debugDescription)")
+
+    // (2) The "Unload" button ARMS the confirm; it must not unload on the
+    // first click. The arm and the confirm both read "Unload" but the
+    // popover's action row is an if/else, so they are never on screen at
+    // once: arming swaps the arm out for the confirm ("Keep Loaded" +
+    // "Unload"). Wait for "Keep Loaded" to prove the confirm is armed,
+    // and assert the model is STILL resident.
+    let unloadTrigger = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Unload")).firstMatch
+    XCTAssertTrue(unloadTrigger.waitForExistence(timeout: 5),
+                  "ready popover did not render an Unload trigger; app: \(app.debugDescription)")
+    unloadTrigger.click()
+
+    let keepLoaded = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Keep Loaded")).firstMatch
+    XCTAssertTrue(keepLoaded.waitForExistence(timeout: 5),
+                  "clicking Unload did not surface the 'Keep Loaded' confirm — confirm gate missing; "
+                    + "app: \(app.debugDescription)")
+    XCTAssertTrue(indicator.label.hasPrefix("Model loaded:"),
+                  "arming the confirm unloaded the model — unload must be confirmed, not on first click; "
+                    + "label=\(indicator.label); app: \(app.debugDescription)")
+
+    // (3) Only the confirmed "Unload" actually unloads. With the arm
+    // swapped out, the sole "Unload" button is now the confirm. onUnload
+    // → stopEngine (harness stub) + markUnloaded → state .idle, so the
+    // indicator goes invisible and the "Model loaded:" label clears.
+    let confirmUnload = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Unload")).firstMatch
+    XCTAssertTrue(confirmUnload.waitForExistence(timeout: 5),
+                  "confirm 'Unload' button missing after arming; app: \(app.debugDescription)")
+    confirmUnload.click()
+
+    XCTAssertTrue(
+      waitUntilLabelClears(indicator, prefix: "Model loaded:", timeout: 10),
+      "model did not unload after confirmed Unload — 'Model loaded:' never cleared; "
+        + "label=\(indicator.label); app: \(app.debugDescription)")
+  }
+
+  // MARK: - path-2: arming Unload then dismissing (not confirming) leaves
+  // the confirm DISARMED on reopen (review v1 F4)
+
+  @MainActor
+  func test_path2_unload_confirm_disarms_on_dismiss_and_reopen() throws {
+    let app = try launchedApp()
+    defer { app.terminate() }
+
+    try triggerExplicitLoad(in: app)
+
+    let indicator = app.buttons["toolbar.modelLoadIndicator"].firstMatch
+    XCTAssertTrue(
+      indicator.waitForExistence(timeout: 10),
+      "toolbar.modelLoadIndicator was never instantiated; app: \(app.debugDescription)")
+
+    let hold = try Self.holdSeconds()
+    XCTAssertTrue(
+      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 15),
+      "load never reached the '.ready' ring; label=\(indicator.label); app: \(app.debugDescription)")
+
+    // Arm Unload (the .ready confirm prompt appears: "Keep Loaded" + "Unload").
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
+                  "indicator popover did not open; app: \(app.debugDescription)")
+    let unloadTrigger = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Unload")).firstMatch
+    XCTAssertTrue(unloadTrigger.waitForExistence(timeout: 5),
+                  "ready popover did not render an Unload trigger; app: \(app.debugDescription)")
+    unloadTrigger.click()
+    let keepLoaded = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Keep Loaded")).firstMatch
+    XCTAssertTrue(keepLoaded.waitForExistence(timeout: 5),
+                  "Unload did not arm the confirm ('Keep Loaded' missing); app: \(app.debugDescription)")
+
+    // Dismiss by clicking OUTSIDE the popover — NOT Keep, NOT Confirm.
+    // (Esc is bound to the "Keep Loaded" button, so it would disarm via
+    // Keep rather than exercise the close/reopen @State-freshness reset.)
+    // Anchor the coordinate on the WINDOW (the app element proxy has no
+    // finite frame → INFINITY point), low-centre and well away from the
+    // top-trailing popover.
+    app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.6)).tap()
+    XCTAssertTrue(waitForNoPopover(app, timeout: 5),
+                  "popover did not dismiss on an outside click; app: \(app.debugDescription)")
+    // Dismissing without confirming must NOT unload — model stays resident.
+    XCTAssertTrue(indicator.label.hasPrefix("Model loaded:"),
+                  "dismissing the armed confirm unloaded the model; "
+                    + "label=\(indicator.label); app: \(app.debugDescription)")
+
+    // Reopen — the documented "a stale armed confirm cannot survive a
+    // close/reopen" guarantee (popover @State recreated fresh) must hold:
+    // the info "Unload" ARM shows, NOT the armed confirm ("Keep Loaded").
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
+                  "indicator popover did not reopen; app: \(app.debugDescription)")
+    let reopenedUnload = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Unload")).firstMatch
+    XCTAssertTrue(reopenedUnload.waitForExistence(timeout: 5),
+                  "reopened popover did not show the info Unload arm; app: \(app.debugDescription)")
+    let staleConfirm = app.popovers.buttons
+      .matching(NSPredicate(format: "label == %@", "Keep Loaded")).firstMatch
+    XCTAssertFalse(staleConfirm.waitForExistence(timeout: 2),
+                   "reopened popover showed a STALE armed confirm ('Keep Loaded') — the close/reopen "
+                     + "@State reset regressed; app: \(app.debugDescription)")
   }
 
   // MARK: - steps
@@ -145,6 +344,12 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
+    // The loadviz harness is a pure-HTTP mock with no Helper to report
+    // engine status over XPC. Pin `EngineStatus.running(port:)` so the
+    // toolbar `/v1/models` reconcile (gated on `.running`) populates the
+    // model menu instead of emptying it — otherwise the model menu is
+    // empty and the explicit-load path never starts. See RatioThinkApp.
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     app.launch()
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),

@@ -75,6 +75,17 @@ if [[ ! -d "RatioThink.xcodeproj" ]]; then
   Scripts/genproject.sh
 fi
 
+# The styled .DS_Store is written by make-dmg-dsstore.py, which needs the
+# ds_store + mac_alias git submodules (Scripts/vendor/*/src). Fail loud now —
+# before the long build — rather than after xcodebuild at packaging time.
+for _mod in ds_store mac_alias; do
+  if [[ ! -f "$SCRIPT_DIR/vendor/$_mod/src/$_mod/__init__.py" ]]; then
+    echo "package-dmg.sh: required submodule '$_mod' is not initialized" >&2
+    echo "  Run: git submodule update --init --recursive" >&2
+    exit 76
+  fi
+done
+
 # When notarizing, the build MUST be signed with a Developer ID Application
 # identity — Gatekeeper rejects ad-hoc and Apple Development signatures. Honor
 # an explicit --identity, then DEVELOPER_ID_IDENTITY, then auto-detect the
@@ -196,17 +207,18 @@ fi
 DMG_PATH="$OUT_DIR/RatioThink-$ARCH.dmg"
 rm -f "$DMG_PATH"
 
-echo "package-dmg.sh: hdiutil create $DMG_PATH"
-# UDZO = compressed read-only. `-srcfolder` mode wraps the .app in a
-# DMG whose root contains just RatioThink.app — sufficient for v1 (no custom
-# background, no `/Applications` symlink). A nicer designed DMG can
-# follow when notarization lands.
-hdiutil create \
-  -volname "RatioThink" \
-  -srcfolder "$APP_PATH" \
-  -fs HFS+ \
-  -format UDZO \
-  "$DMG_PATH"
+# Build the styled drag-install DMG window (ticket #354): RatioThink.app on the
+# left, an `Applications` symlink target on the right, and a background showing
+# an arrow app -> Applications. make-styled-dmg.sh stages into a writable image,
+# writes the window layout to the volume `.DS_Store` directly (no Finder/
+# osascript — unreliable under automation, absent in CI), and converts to UDZO.
+echo "package-dmg.sh: building styled DMG"
+"$SCRIPT_DIR/make-styled-dmg.sh" "$APP_PATH" "$DMG_PATH"
+
+# Mount the finished image and assert the drag-install layout, the styling
+# (background + app-left/Applications-right), and that the staged app survived
+# packaging with its seal intact (ticket #354 acceptance).
+"$SCRIPT_DIR/verify-dmg-layout.sh" "$DMG_PATH"
 
 # Sign + notarize + staple the dmg itself, then run the release preflight as
 # the acceptance gate: a Developer ID-signed, notarized, stapled dmg passes
