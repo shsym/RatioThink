@@ -138,6 +138,7 @@ public final class ChatSendController: ObservableObject {
             writer?.cancel()
             return
           }
+
           let isEngineGoneFault = await Self.classifyEngineGone(
             error: error,
             gate: recoveryGate
@@ -166,12 +167,9 @@ public final class ChatSendController: ObservableObject {
           }
 
           // Reset the assistant bubble + writer for the retry pass. Any
-          // partial delta from the first attempt is discarded: chat-apc
-          // does not surface a resume cursor, so a clean re-issue is the
-          // only correct behavior. `reasoning` is reset alongside
-          // `content` — a fresh `MessageStreamWriter` APPENDS reasoning
-          // deltas to the durable field, so a flushed attempt-1 thinking
-          // block would otherwise fuse onto attempt-2's on recovery.
+          // partial delta or reasoning from the first attempt is
+          // discarded: chat-apc does not surface a resume cursor, so a
+          // clean re-issue is the only correct behavior.
           assistant.content = ""
           assistant.reasoning = ""
           assistant.meta = nil

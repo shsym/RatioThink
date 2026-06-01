@@ -1,5 +1,7 @@
 import XCTest
 import Foundation
+import Darwin
+import os
 @testable import RatioThinkCore
 
 /// REAL end-to-end Helper-hosted engine launch ( follow-up).
@@ -47,7 +49,17 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     // is ours to create.
     try super.setUpWithError()
     let uuid = UUID().uuidString.prefix(8).lowercased()
-    shortPieHome = URL(fileURLWithPath: "/tmp/pe2e-\(uuid)", isDirectory: true)
+    // When driven by Scripts/run-engine-e2e.sh, anchor under the wrapper's
+    // per-run id (`/tmp/pe2e-<runID>-<uuid>`) so its EXIT sweep can scope
+    // its `rm` to THIS run's pieHomes and never delete a concurrent run's
+    // (or a still-live bundle's) live engine home. Plain `swift test` (no
+    // PE2E_RUN_ID) keeps the flat `/tmp/pe2e-<uuid>` form. The run id is
+    // the wrapper's PID — digits only, so it stays sun_path-short and
+    // regex-safe for the wrapper's scoped pkill.
+    let runID = ProcessInfo.processInfo.environment["PE2E_RUN_ID"]
+      .flatMap { $0.isEmpty ? nil : $0 }
+    let leaf = runID.map { "pe2e-\($0)-\(uuid)" } ?? "pe2e-\(uuid)"
+    shortPieHome = URL(fileURLWithPath: "/tmp/\(leaf)", isDirectory: true)
     try FileManager.default.createDirectory(at: shortPieHome, withIntermediateDirectories: true)
   }
 
@@ -360,5 +372,115 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
       shmemName: shmemName,
       modelConfig: .dummy
     )
+  }
+
+  // MARK: - launch fires pidSink (engine-free production coverage)
+
+  /// The seam test above proves `reapEngineSubprocess` installs a pidSink,
+  /// but NOT that `PieControlLauncher.launch` actually FIRES it — the only
+  /// tests that drive `launch()` -> pidSink (S0_TestIsolationTests,
+  /// ScenarioBindings' S3) are `XCTSkipUnless`-gated on the pie binary, so
+  /// every engine-free lane has zero coverage of that production call. A
+  /// regression dropping the sink call would keep all default-lane tests
+  /// green while the real-engine test silently leaked.
+  ///
+  /// Drive a real `launch()` against a tiny stub `pie` that emits the two
+  /// handshake markers `awaitHandshake` waits on, with its advertised WS
+  /// address pointed at a just-closed loopback port so the post-handshake
+  /// control-plane install fails fast (ECONNREFUSED) — no real engine.
+  /// Assert (a) the sink received the spawned pid, and (b) `launch` failed
+  /// at the WS step (`.clientError`), which also pins the stub's marker
+  /// strings against the launcher's `awaitHandshake` regexes: a drift
+  /// would surface as `.handshakeTimeout` and fail (b).
+  func test_launch_fires_pidSink_with_spawned_pid_engineFree() async throws {
+    let deadPort = try Self.reserveClosedLoopbackPort()
+    let stub = try writeStubPie(advertisedWSPort: deadPort)
+    let captured = OSAllocatedUnfairLock<pid_t>(initialState: 0)
+
+    let spec = try PieControlLauncher.LaunchSpec(
+      pieBinary: stub,
+      wasmURL: tempPieHome.appendingPathComponent("chat-apc.wasm"),
+      manifestURL: tempPieHome.appendingPathComponent("Pie.toml"),
+      subprocessEnvironment: subprocessEnvironment,
+      pieHome: tempPieHome,
+      shmemName: shmemName,
+      handshakeTimeout: 5,
+      pidSink: { pid in captured.withLock { $0 = pid } },
+      modelConfig: .dummy
+    )
+
+    do {
+      // Unreachable in practice (the dead WS port refuses the post-handshake
+      // connect) — but if a future change ever let it succeed, shut the
+      // session down so the stub subprocess can't leak.
+      let (_, session) = try await PieControlLauncher.launch(spec: spec)
+      await session.shutdown()
+      XCTFail("engine-free stub cannot complete the WS install; launch must throw")
+    } catch let error as PieControlLauncher.LaunchError {
+      guard case .clientError = error else {
+        return XCTFail("expected .clientError (handshake passed, post-handshake WS install failed); got \(error) — stub markers may have drifted from PieControlLauncher.awaitHandshake")
+      }
+    }
+
+    let pid = captured.withLock { $0 }
+    XCTAssertGreaterThan(pid, 0,
+                         "PieControlLauncher.launch must fire pidSink with the spawned pie pid — the production fact the hand-rolled seam test does not cover")
+  }
+
+  /// Write an executable stub mimicking `pie serve` only as far as
+  /// `PieControlLauncher.awaitHandshake` reads: emit the serving-address
+  /// line and the internal-token line (the exact two markers the launcher
+  /// captures), then re-exec as `sleep` so the pid stays stable for the
+  /// launcher's shutdown SIGINT. It runs no WS server, so the launcher's
+  /// install step fails by design — after the pidSink has already fired.
+  private func writeStubPie(advertisedWSPort port: UInt16) throws -> URL {
+    let url = tempPieHome.appendingPathComponent("stub-pie")
+    let script = """
+    #!/bin/sh
+    echo "pie-server serving on 127.0.0.1:\(port)"
+    echo "internal token: stub-token-deadbeef"
+    exec sleep 30
+    """
+    try script.write(to: url, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                          ofItemAtPath: url.path)
+    return url
+  }
+
+  /// Bind 127.0.0.1:0, read the OS-assigned port, close the socket — so a
+  /// later connect to that port fails fast with ECONNREFUSED. Mirrors the
+  /// launcher's own `reserveFreePort`; gives the stub a dead WS port so
+  /// `launch()`'s post-handshake connect fails without a real engine.
+  /// (Same close->reuse race as the launcher; negligible on loopback for a
+  /// single-shot test.)
+  private static func reserveClosedLoopbackPort() throws -> UInt16 {
+    let fd = socket(AF_INET, SOCK_STREAM, 0)
+    guard fd >= 0 else { throw stubSocketError("socket", errno) }
+    defer { close(fd) }
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_port = 0
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    let bindRC = withUnsafePointer(to: &addr) { p in
+      p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+    guard bindRC == 0 else { throw stubSocketError("bind", errno) }
+    var out = sockaddr_in()
+    var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let nameRC = withUnsafeMutablePointer(to: &out) { p in
+      p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        getsockname(fd, $0, &len)
+      }
+    }
+    guard nameRC == 0 else { throw stubSocketError("getsockname", errno) }
+    return UInt16(bigEndian: out.sin_port)
+  }
+
+  private static func stubSocketError(_ call: String, _ err: Int32) -> NSError {
+    NSError(domain: "RealEngineLaunchE2ETests.stub", code: Int(err),
+            userInfo: [NSLocalizedDescriptionKey: "\(call) failed: \(String(cString: strerror(err)))"])
   }
 }

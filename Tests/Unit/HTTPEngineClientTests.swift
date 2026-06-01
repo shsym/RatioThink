@@ -94,9 +94,111 @@ final class HTTPEngineClientTests: XCTestCase {
     do {
       _ = try await makeClient().health()
       XCTFail("expected throw")
-    } catch let HTTPEngineError.http(status, body) {
+    } catch let HTTPEngineError.http(status, body, retryAfter) {
       XCTAssertEqual(status, 500)
       XCTAssertEqual(String(decoding: body, as: UTF8.self), "internal server error")
+      XCTAssertNil(retryAfter, "no Retry-After header was sent")
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
+  }
+
+  // MARK: - FaultClass (pie#375 status taxonomy)
+
+  // Pure classification: status + tag body → EngineFaultClass, derived
+  // off the error without any network plumbing.
+
+  func test_faultClass_500_isHostSetup_notRetryable() {
+    let err = HTTPEngineError.http(status: 500, body: Data("instantiate-failed".utf8), retryAfter: nil)
+    XCTAssertEqual(err.faultClass, .hostSetup(tag: "instantiate-failed"))
+    XCTAssertFalse(err.isRetryable)
+  }
+
+  func test_faultClass_502_isGuestFault_notRetryable() {
+    let err = HTTPEngineError.http(status: 502, body: Data("handler-trap".utf8), retryAfter: nil)
+    XCTAssertEqual(err.faultClass, .guestFault(tag: "handler-trap"))
+    XCTAssertFalse(err.isRetryable)
+  }
+
+  func test_faultClass_503_isInFlightCrash_carriesRetryAfter_andRetryable() {
+    let err = HTTPEngineError.http(status: 503, body: Data("handler-panic".utf8), retryAfter: 1)
+    XCTAssertEqual(err.faultClass, .inFlightCrash(tag: "handler-panic", retryAfter: 1))
+    XCTAssertTrue(err.isRetryable)
+  }
+
+  func test_faultClass_nonTaxonomyStatus_andOtherCases_areNil() {
+    // A non-FaultClass status (e.g. 404) is not part of the engine-fault
+    // axis, and neither are the inferlet-coded `.api`/`.stream` cases.
+    XCTAssertNil(HTTPEngineError.http(status: 404, body: Data("nope".utf8), retryAfter: nil).faultClass)
+    XCTAssertNil(HTTPEngineError.api(status: 400, code: "invalid_request", message: "bad").faultClass)
+    XCTAssertNil(HTTPEngineError.stream(code: "x", message: "y").faultClass)
+    XCTAssertFalse(HTTPEngineError.http(status: 404, body: Data(), retryAfter: nil).isRetryable)
+  }
+
+  // Rendering: documented tags get plain-language copy; unknown tags
+  // fall back to a status-class line that still preserves the raw tag.
+
+  func test_description_knownTags_arePlainLanguage() {
+    func desc(_ status: Int, _ tag: String) -> String {
+      HTTPEngineError.http(status: status, body: Data(tag.utf8), retryAfter: nil).description
+    }
+    XCTAssertEqual(desc(503, "handler-panic"), "The engine restarted while answering. Try again in a moment.")
+    XCTAssertEqual(desc(502, "handler-trap"), "The engine crashed while answering the request.")
+    XCTAssertEqual(desc(500, "instantiate-failed"), "The engine could not start the inferlet.")
+    XCTAssertEqual(desc(502, "outparam-never-set"), "The engine returned no response.")
+    // No longer the opaque pre-FaultClass shape.
+    XCTAssertFalse(desc(503, "handler-panic").contains("HTTP 503"))
+  }
+
+  func test_description_unknownTag_keepsStatusClassAndRawTag() {
+    let err = HTTPEngineError.http(status: 500, body: Data("some-novel-internal-fault".utf8), retryAfter: nil)
+    XCTAssertEqual(err.description, "The engine could not start (some-novel-internal-fault).")
+    // An unknown 503 still reads as retry-soon (handler-panic is the only
+    // 503 tag, so the class copy covers any future 503 tag too).
+    let unknown503 = HTTPEngineError.http(status: 503, body: Data("future-tag".utf8), retryAfter: 2)
+    XCTAssertEqual(unknown503.description, "The engine restarted while answering. Try again in a moment.")
+  }
+
+  func test_description_nonTaxonomyStatus_keepsLegacyShape() {
+    // Outside 500/502/503 the pre-FaultClass rendering is retained.
+    XCTAssertEqual(
+      HTTPEngineError.http(status: 418, body: Data("teapot".utf8), retryAfter: nil).description,
+      "Engine returned HTTP 418: teapot")
+    XCTAssertEqual(
+      HTTPEngineError.http(status: 418, body: Data(), retryAfter: nil).description,
+      "Engine returned HTTP 418")
+  }
+
+  // Boundary plumbing: the Retry-After header is parsed off the real
+  // HTTPURLResponse in assertOK and carried into the error — proven on
+  // BOTH the unary and the streaming guard.
+
+  func test_unary_503_parsesRetryAfter_intoFaultClass() async {
+    FakeSSEURLProtocol.handler = { _ in
+      .text(status: 503, body: "handler-panic", headers: ["Retry-After": "1"])
+    }
+    do {
+      _ = try await makeClient().health()
+      XCTFail("expected throw")
+    } catch let error as HTTPEngineError {
+      XCTAssertEqual(error.faultClass, .inFlightCrash(tag: "handler-panic", retryAfter: 1))
+      XCTAssertTrue(error.isRetryable)
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
+  }
+
+  func test_streaming_chat_503_parsesRetryAfter_intoFaultClass() async {
+    // The in-flight-crash 503 surfaces on the chat path's pre-stream
+    // guard (assertOK(_:bytes:)), the actual handler-panic site.
+    FakeSSEURLProtocol.handler = { _ in
+      .text(status: 503, body: "handler-panic", headers: ["Retry-After": "1"])
+    }
+    do {
+      for try await _ in makeClient().chatCompletion(.init(model: "m", messages: [], stream: true)) {}
+      XCTFail("expected throw")
+    } catch let error as HTTPEngineError {
+      XCTAssertEqual(error.faultClass, .inFlightCrash(tag: "handler-panic", retryAfter: 1))
     } catch {
       XCTFail("unexpected: \(error)")
     }
@@ -634,6 +736,10 @@ final class FakeSSEURLProtocol: URLProtocol {
   enum Stub {
     /// JSON response body (Content-Type: application/json).
     case json(status: Int, body: String)
+    /// Plain-text response body with caller-supplied headers — used to
+    /// drive pie's `FaultClass` tag bodies + the `503` `Retry-After`
+    /// header through the real `assertOK` boundary.
+    case text(status: Int, body: String, headers: [String: String])
     /// SSE stream. Chunks land via repeated `didLoad:` calls so
     /// `URLSession.bytes(for:)` surfaces them incrementally.
     case sse(chunks: [String], chunkDelayNanos: UInt64 = 0)
@@ -672,6 +778,19 @@ final class FakeSSEURLProtocol: URLProtocol {
         statusCode: status,
         httpVersion: "HTTP/1.1",
         headerFields: ["Content-Type": "application/json"]
+      )!
+      client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+      client?.urlProtocol(self, didLoad: Data(body.utf8))
+      client?.urlProtocolDidFinishLoading(self)
+
+    case .text(let status, let body, let headers):
+      var headerFields = ["Content-Type": "text/plain"]
+      headerFields.merge(headers) { _, new in new }
+      let response = HTTPURLResponse(
+        url: request.url!,
+        statusCode: status,
+        httpVersion: "HTTP/1.1",
+        headerFields: headerFields
       )!
       client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
       client?.urlProtocol(self, didLoad: Data(body.utf8))

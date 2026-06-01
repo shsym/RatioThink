@@ -178,4 +178,36 @@ public enum HelperResumeAction {
       }
     }
   }
+
+  /// Review v3 N3 — main-async veto for the engine-death auto-relaunch
+  /// closure. Extracted from `HelperMain.swift`'s relauncher body
+  /// (HelperMain is not SPM-reachable, so the inline guard was the
+  /// exact untestable boundary that hid the v1 F1 blocker). Pure
+  /// function over `EngineStatus`; the closure calls this at its
+  /// deferred `DispatchQueue.main.async` commit point to decide
+  /// whether `HelperResumeAction.run` should run.
+  ///
+  /// Semantics (see PieEngineHost review v2 R1):
+  ///  - `.failed`   → commit. The auto-relaunch scheduler ran
+  ///                  because the engine reported `.failed(.engineGone)`;
+  ///                  if state is still `.failed` at the deferred
+  ///                  main-queue commit, no user Pause has won the
+  ///                  race.
+  ///  - `.stopped`  → veto. `stopLocked`'s `.failed(.engineGone)` arm
+  ///                  transitions to `.stopped` on a user Pause; a
+  ///                  Pause landed between the host's schedule sync
+  ///                  and this main-queue turn. Abort.
+  ///  - `.running` / `.starting` / `.stopping` → veto. Some other
+  ///                  caller drove `start()` between the host's
+  ///                  schedule sync and the main-queue commit (e.g.
+  ///                  user Resume click). Do not pile a second
+  ///                  auto-relaunch on top of it.
+  public static func shouldCommitAutoRelaunch(status: EngineStatus) -> Bool {
+    switch status {
+    case .failed:
+      return true
+    case .stopped, .starting, .running, .stopping:
+      return false
+    }
+  }
 }

@@ -45,21 +45,12 @@ extension EngineStatusStore: ChatRecoveryGate {
   }
 
   public func refreshStatus() async {
-    // Best-effort poll: the chat retry path only needs a fresh-ish
-    // status, so a transport failure here is non-fatal — the cached
-    // `.failed(.engineGone)` (or whatever) stays visible to `isEngineGone`
+    // Swallow XPC errors here: the chat retry path only needs a
+    // best-effort poll; a transport failure leaves the cached
+    // `.failed(.engineGone)` (or whatever) visible to `isEngineGone`
     // and the retry surfaces normally if classification can't be
-    // resolved. But it MUST leave a trace: a swallowed poll error can
-    // turn a stale-cache misclassification into a masked retry, so log
-    // the cause (mirrors `EngineStatusStore.onMemoryPollError`) rather
-    // than dropping it silently.
-    do {
-      _ = try await refresh()
-    } catch {
-      Log.engine.error(
-        "ChatRecoveryGate.refreshStatus poll failed (cached status used for engine-gone classification): \(String(describing: error), privacy: .public)"
-      )
-    }
+    // resolved.
+    _ = try? await refresh()
   }
 
   public func waitUntilRunning(timeout: TimeInterval) async -> Bool {

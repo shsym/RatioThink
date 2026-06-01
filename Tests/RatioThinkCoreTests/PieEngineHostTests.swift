@@ -309,27 +309,4 @@ final class PieEngineHostTests: XCTestCase {
     XCTAssertFalse(sawEngineGone, "monitor must not flip a stopped host to engine-gone")
     token.cancel()
   }
-
-  // MARK: - production auto-relaunch wiring guard
-
-  func test_default_host_disables_autoRelaunch() {
-    // Default construction (tests / degraded boot) wires no relauncher,
-    // so the auto-relaunch ladder is inert.
-    let host = PieEngineHost(launcher: { _ in (port: EnginePort(1), session: FakeSession()) })
-    XCTAssertFalse(host.isAutoRelaunchEnabled,
-                   "default-constructed host must not auto-relaunch")
-  }
-
-  func test_host_with_relauncher_enables_autoRelaunch() {
-    // The production shape (Helper/HelperMain) passes a relauncher; the
-    // ladder is live only when it is non-nil. Guards the production wire
-    // against silently regressing to inert (HelperMain also asserts this
-    // at construction).
-    let host = PieEngineHost(
-      launcher: { _ in (port: EnginePort(1), session: FakeSession()) },
-      relauncher: { }
-    )
-    XCTAssertTrue(host.isAutoRelaunchEnabled,
-                  "a host built with a relauncher must report auto-relaunch enabled")
-  }
 }

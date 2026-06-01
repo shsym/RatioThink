@@ -17,16 +17,13 @@ import os
 /// it into the helper's selector + menu-bar wiring without
 /// rewriting PieSupervisor itself.
 ///
-/// Recovery: a bounded auto-relaunch ladder (`RelaunchPolicy` +
-/// `relauncher`) brings the engine back after a mid-session death
-/// (`.failed(.engineGone)`), capped against slow-flap and re-armed on
-/// sustained healthy uptime — so a crash becomes a retryable fault
-/// rather than a terminal state the user must manually Resume out of.
-/// The ladder is INERT unless the host is constructed with a non-nil
-/// `relauncher` (the default is nil); the production wiring lives at the
-/// `PieEngineHost(...)` construction site in `Helper/HelperMain.swift`.
-/// `.killRejected` boot recovery from the old `PieSupervisor` is still
-/// not ported (a separate concern).
+/// Scope ceiling ( "Out of scope"): the restart ladder,
+/// slow-flap cap, and `.killRejected` boot recovery from
+/// `PieSupervisor.swift:563,890,1132+` are NOT ported here. A
+/// single-shot lifecycle closes the MVP-S1 chat-demo path; if pie
+/// crashes mid-session the host transitions to `.failed` and waits
+/// for an explicit user Resume. Porting (or re-deciding) those
+/// behaviors is a follow-up.
 ///
 /// Concurrency model:
 ///  · `stateQueue` (serial) owns every `_state` transition. The
@@ -36,7 +33,7 @@ import os
 ///    lock-free `status` getter does not have to bounce through
 ///    `stateQueue` (the XPC `engineStatus` selector reads from any
 ///    peer queue and must never deadlock the host's own state path).
-/// Verdict from an `EngineSession` liveness probe. `gone`
+/// Verdict from an `EngineSession` liveness probe ( G1). `gone`
 /// carries a coarse human cause (process exit status, or "control
 /// plane unreachable: …"); the rich death reason from captured engine
 /// stderr is deferred to .
@@ -108,7 +105,7 @@ public final class PieEngineHost: @unchecked Sendable {
 
   /// The affordances `PieEngineHost` needs from the launcher's
   /// returned session: shut it down, and report whether the engine is
-  /// still alive (G1). `LaunchedSession` conforms with the
+  /// still alive ( G1). `LaunchedSession` conforms with the
   /// real process-exit + control-plane ping probe; test fakes
   /// implement the same contract on top of in-memory state. The
   /// `checkLiveness()` default returns `.alive` so existing fakes that
@@ -182,8 +179,8 @@ public final class PieEngineHost: @unchecked Sendable {
   ///   - livenessFailureThreshold: consecutive `.gone` probes required
   ///     before declaring `.failed(.engineGone)`. `> 1` tolerates a
   ///     transient control-plane blip without a spurious relaunch.
-  ///   - relaunchPolicy: bounded auto-relaunch ladder applied after
-  ///     engine-gone. Default `.init()` allows 2 retries / 60s.
+  ///   - relaunchPolicy: bounded ladder applied after engine-gone.
+  ///     Default `.init()` allows 2 retries / 60s.
   ///   - relauncher: closure that brings the engine back up after the
   ///     ladder's backoff elapses. `nil` (the default) disables
   ///     auto-relaunch even if `relaunchPolicy.maxAttempts > 0`, so
@@ -322,13 +319,13 @@ public final class PieEngineHost: @unchecked Sendable {
   private let statusLock = OSAllocatedUnfairLock<EngineStatus>(initialState: .stopped)
   private let observers = OSAllocatedUnfairLock<[UUID: (EngineStatus) -> Void]>(initialState: [:])
 
-  /// Post-launch liveness probe loop. Owned by `stateQueue`:
+  /// Post-launch liveness probe loop ( G1). Owned by `stateQueue`:
   /// started when entering `.running`, cancelled when leaving it.
   private var livenessMonitor: Task<Void, Never>?
 
-  /// Pending auto-relaunch task scheduled after `.failed(.engineGone)`
-  ///. Owned by `stateQueue`; cancelled on user
-  /// `start()`/`stop()` so a manual action wins over the ladder.
+  /// Pending auto-relaunch task scheduled after `.failed(.engineGone)`.
+  /// Owned by `stateQueue`; cancelled on user `start()`/`stop()` so a
+  /// manual action wins over the ladder.
   private var autoRelaunchTask: Task<Void, Never>?
 
   /// Engine-gone attempt timestamps, pruned to the sliding window on
@@ -518,7 +515,7 @@ public final class PieEngineHost: @unchecked Sendable {
     }
   }
 
-  /// Start the post-launch liveness probe loop. Runs off
+  /// Start the post-launch liveness probe loop ( G1). Runs off
   /// `stateQueue`; each tick asks the session whether the engine is
   /// alive. After `livenessFailureThreshold` CONSECUTIVE `.gone`
   /// verdicts it hops back onto `stateQueue` and, only if still
@@ -684,15 +681,6 @@ public final class PieEngineHost: @unchecked Sendable {
       return self.autoRelaunchAttempts.count
     }
   }
-
-  /// True when an auto-relaunch closure is wired. The default-constructed
-  /// host (tests / degraded boot) has `relauncher == nil` → the ladder is
-  /// inert. Lets the Helper assert at construction that it wired recovery,
-  /// and lets a unit test guard the production wiring so the ladder cannot
-  /// silently regress to inert (the existing recovery tests inject their
-  /// own relauncher and so cannot catch a missing production wire).
-  internal var isAutoRelaunchEnabled: Bool { relauncher != nil }
-
 }
 
 // MARK: - EngineSession liveness default
