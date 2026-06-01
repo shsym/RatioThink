@@ -173,6 +173,10 @@ test-unit: $(LOGDIR) ## Unit tests (XCTest) via xcrun swift test
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-unit.log; \
 	  Scripts/run-swift-test.sh --filter 'RatioThinkCoreTests' 2>&1 | tee $$LOG | tail -20; \
 	  status=$${PIPESTATUS[0]}; \
+	  if [ "$$status" -ne 0 ]; then \
+	    echo "=== failing tests (grepped from full log; the tail above truncates parallel output) ==="; \
+	    grep -nE "Test Case .+ failed|: error:|XCTAssert|recorded an issue|Fatal error|Restarting after|crashed|failed \(" $$LOG | grep -v "warning:" | tail -100; \
+	  fi; \
 	  echo "log: $$LOG"; \
 	  exit $$status
 
@@ -181,6 +185,10 @@ test-scenario: $(LOGDIR) ## Headless scenarios (S1, S2, S3) via CLIRunner
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-scenario.log; \
 	  Scripts/run-swift-test.sh --filter 'CLIScenarioTests' 2>&1 | tee $$LOG | tail -30; \
 	  status=$${PIPESTATUS[0]}; \
+	  if [ "$$status" -ne 0 ]; then \
+	    echo "=== failing tests (grepped from full log; the tail above truncates parallel output) ==="; \
+	    grep -nE "Test Case .+ failed|: error:|XCTAssert|recorded an issue|Fatal error|Restarting after|crashed|failed \(" $$LOG | grep -v "warning:" | tail -100; \
+	  fi; \
 	  echo "log: $$LOG"; \
 	  exit $$status
 

@@ -560,15 +560,23 @@ final class PieSupervisorTests: XCTestCase {
       }
     }
     // Loop in the background calling clearKillRejected periodically
-    // so the test progresses once the bash sleep expires.
+    // so the test progresses once the bash sleep expires. The deadline
+    // must outlast process-death detection on a slow, contended CI
+    // runner AND stay below the `wait(for:)` timeout below, so the loop
+    // is still retrying when the supervisor finally reaches .stopped.
+    // The previous 5s/6s pair was too tight under load: the retry loop
+    // gave up ~1s before the wait timed out, intermittently failing.
+    // These are upper bounds — the happy path completes in well under a
+    // second, so widening them does not slow the suite or weaken any
+    // assertion.
     DispatchQueue.global().async {
-      let deadline = Date().addingTimeInterval(5)
+      let deadline = Date().addingTimeInterval(20)
       while Date() < deadline {
         Thread.sleep(forTimeInterval: 0.1)
         if sup.clearKillRejected() { return }
       }
     }
-    wait(for: [exp], timeout: 6)
+    wait(for: [exp], timeout: 25)
     _ = token
   }
 

@@ -113,6 +113,11 @@ public enum RatioThinkModelContainer {
     public var id: UUID
     public var role: String
     public var content: String
+    /// Model thinking-block text, kept as a SEPARATE field from
+    /// `content` so an exported answer never silently carries the
+    /// reasoning. Optional + omitted-when-nil so older exports
+    /// (and turns with no reasoning) decode without it.
+    public var reasoning: String?
     public var tokens: Int
     public var ts: Date
     public var meta: Data?
@@ -121,6 +126,7 @@ public enum RatioThinkModelContainer {
       id: UUID,
       role: String,
       content: String,
+      reasoning: String? = nil,
       tokens: Int,
       ts: Date,
       meta: Data?
@@ -128,6 +134,7 @@ public enum RatioThinkModelContainer {
       self.id = id
       self.role = role
       self.content = content
+      self.reasoning = reasoning
       self.tokens = tokens
       self.ts = ts
       self.meta = meta
@@ -161,6 +168,7 @@ public enum RatioThinkModelContainer {
             id: $0.id,
             role: $0.role,
             content: $0.content,
+            reasoning: $0.reasoning.isEmpty ? nil : $0.reasoning,
             tokens: $0.tokens,
             ts: $0.ts,
             meta: $0.meta

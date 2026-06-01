@@ -46,6 +46,22 @@ final class EnvironmentFakeModelDownloader: ModelDownloading, @unchecked Sendabl
             failureReason: failure
           ))
           continuation.finish()
+          return
+        }
+        // #326: opt-in completion so a test can drive the
+        // download → onDownloaded → auto-start latch. Without this flag
+        // the stream stays open at `.downloading` (the prior behavior).
+        if environment["PIE_TEST_FAKE_DOWNLOAD_COMPLETE"] == "1" {
+          try? await Task.sleep(nanoseconds: 150_000_000)
+          continuation.yield(DownloadProgress(
+            handleID: handle.id,
+            phase: .completed,
+            bytesReceived: 100_000_000,
+            bytesExpected: 100_000_000,
+            etaSeconds: 0,
+            verification: .verified
+          ))
+          continuation.finish()
         }
       }
     }

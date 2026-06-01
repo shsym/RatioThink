@@ -2,13 +2,13 @@ import Foundation
 import os
 
 /// App-side, async wrapper around `NSXPCConnection` to the helper's
-/// `PieHelperXPC` interface. Today exposes only `engineStatus()` — the
-/// single selector the GUI needs to derive `HTTPEngineClient.baseURL`
-/// ( / follow-up to ). Other selectors (start/stopEngine,
-/// loadModel, downloadModel) are reached today via direct
-/// `NSXPCConnection` use in their respective subsystems; folding them
-/// behind this client is deliberately deferred until a second caller
-/// appears, so the surface stays narrow.
+/// `PieHelperXPC` interface. Exposes the selectors the GUI drives:
+/// `engineStatus()` (derives `HTTPEngineClient.baseURL`), `stopEngine()`
+/// (Unload), and `startEngine(profileID:)` (#326 fresh-install
+/// auto-start). The remaining `PieHelperXPC` selectors (loadModel,
+/// downloadModel, …) are still reached via direct `NSXPCConnection` use
+/// in their own subsystems; they get folded behind this client only when
+/// a GUI caller needs them, keeping the surface narrow.
 ///
 /// Two construction modes mirror `HelperXPCListener`:
 ///   · `.machService(name)` — production. Default name comes from
@@ -35,6 +35,12 @@ public protocol AppXPCClient: Sendable {
   /// unavailable. Read on demand while the status popover is open; never
   /// polled into a published field.
   func engineMemory() async throws -> EngineMemorySample?
+  /// Start (resolve + launch) the engine on `profileID`. Resolves on a
+  /// successful launch handshake; throws the helper-side `EngineError`
+  /// when the start is rejected (e.g. `.modelMissing`, `.profileMissing`),
+  /// or an `AppXPCClientError` on transport failure. Driven by #326's
+  /// fresh-install auto-start.
+  func startEngine(profileID: String) async throws
 }
 
 public extension AppXPCClient {
@@ -213,6 +219,71 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
           resumeOnce(.failure(engineError))
         } catch {
           resumeOnce(.failure(AppXPCClientError.decode(error as NSError)))
+        }
+      }
+    }
+  }
+
+  public func startEngine(profileID: String) async throws {
+    let connection = ensureConnection()
+    do {
+      try await startEngine(profileID: profileID, on: connection)
+    } catch let error as AppXPCClientError {
+      if case .replyTimeout = error {
+        invalidateIfCurrent(connection)
+      }
+      throw error
+    }
+  }
+
+  private func startEngine(profileID: String, on connection: NSXPCConnection) async throws {
+    let timeout = replyTimeout
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
+      func resumeOnce(_ result: Result<Void, Error>) {
+        let shouldResume = resumed.withLock { fired -> Bool in
+          if fired { return false }
+          fired = true
+          return true
+        }
+        guard shouldResume else { return }
+        switch result {
+        case .success: continuation.resume(returning: ())
+        case .failure(let e): continuation.resume(throwing: e)
+        }
+      }
+      if timeout > 0 {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+          resumeOnce(.failure(AppXPCClientError.replyTimeout(
+            selector: "startEngine",
+            timeout: timeout
+          )))
+        }
+      }
+      let proxy = connection.remoteObjectProxyWithErrorHandler { err in
+        resumeOnce(.failure(AppXPCClientError.proxyError(err as NSError)))
+      }
+      guard let api = proxy as? PieHelperXPC else {
+        resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
+        return
+      }
+      api.startEngine(profileID: profileID) { successData, errorData in
+        // Contract (PieHelperXPC): exactly one of (successData=EnginePort,
+        // errorData=EngineError) is non-nil. We discard the port — the
+        // caller relies on the engine-status poll for the live `.running`
+        // signal; the wrapper only needs to surface a refusal. A
+        // wire-contract violation decodes to EngineError(.wireContractViolation).
+        do {
+          switch try PieHelperXPCWire.decodeStartEngineReply(
+            successData: successData, errorData: errorData
+          ) {
+          case .success:
+            resumeOnce(.success(()))
+          case .failure(let engineError):
+            resumeOnce(.failure(engineError))
+          }
+        } catch {
+          resumeOnce(.failure(error))
         }
       }
     }

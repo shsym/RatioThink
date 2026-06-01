@@ -57,6 +57,22 @@ final class EngineStatusStoreTests: XCTestCase {
       }
       try result.get()
     }
+
+    // #326: capture startEngine calls + let tests inject a result.
+    private(set) var startCalls = 0
+    private(set) var lastStartProfileID: String?
+    private var startResult: Result<Void, Error> = .success(())
+    func setStartResult(_ result: Result<Void, Error>) {
+      lock.withLock { startResult = result }
+    }
+    func startEngine(profileID: String) async throws {
+      let result: Result<Void, Error> = lock.withLock {
+        startCalls += 1
+        lastStartProfileID = profileID
+        return startResult
+      }
+      try result.get()
+    }
   }
 
   // MARK: -  Unload
@@ -78,6 +94,60 @@ final class EngineStatusStoreTests: XCTestCase {
     } catch {
       // expected
     }
+  }
+
+  // MARK: - startEngine (#326 fresh-install recovery)
+
+  func test_startEngine_forwards_profileID_to_client() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client)
+    try await store.startEngine(profileID: "chat")
+    XCTAssertEqual(client.startCalls, 1,
+                   "startEngine must forward to the helper XPC client")
+    XCTAssertEqual(client.lastStartProfileID, "chat")
+  }
+
+  func test_startEngine_propagates_real_failure() async {
+    let client = StubXPCClient()
+    client.setStartResult(.failure(
+      EngineError(code: .modelMissing, message: "still missing")))
+    let store = EngineStatusStore(client: client)
+    do {
+      try await store.startEngine(profileID: "chat")
+      XCTFail("a real start failure must throw so the UI can surface the reason")
+    } catch let e as EngineError {
+      XCTAssertEqual(e.code, .modelMissing)
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
+  }
+
+  /// The helper only replies to `startEngine` after the launch
+  /// handshake (which includes the model load at engine boot); a slow
+  /// start trips the App-side reply timeout. That is NOT a failure —
+  /// the start is in flight and the status poll surfaces the real
+  /// outcome — so `startEngine` swallows `.replyTimeout` and returns.
+  func test_startEngine_swallows_reply_timeout_as_in_flight() async throws {
+    let client = StubXPCClient()
+    client.setStartResult(.failure(
+      AppXPCClientError.replyTimeout(selector: "startEngine", timeout: 2.0)))
+    let store = EngineStatusStore(client: client)
+    try await store.startEngine(profileID: "chat")  // must NOT throw
+    XCTAssertEqual(client.startCalls, 1)
+  }
+
+  /// A concurrent start finds the engine already starting/running and is
+  /// rejected `.alreadyRunning`. For a "kick the start" caller that is
+  /// the desired end state — #326's two recovery surfaces can both fire
+  /// `startEngine` on the same completed download, and the second must
+  /// NOT surface a user-facing error. Idempotent: swallow it.
+  func test_startEngine_swallows_alreadyRunning_as_idempotent() async throws {
+    let client = StubXPCClient()
+    client.setStartResult(.failure(
+      EngineError(code: .alreadyRunning, message: "engine already starting")))
+    let store = EngineStatusStore(client: client)
+    try await store.startEngine(profileID: "chat")  // must NOT throw
+    XCTAssertEqual(client.startCalls, 1)
   }
 
   // MARK: - initial state

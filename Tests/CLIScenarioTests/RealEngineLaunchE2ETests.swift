@@ -64,95 +64,37 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
   }
 
   func test_realEngine_startsServesAndStops() async throws {
-    let env = ProcessInfo.processInfo.environment
-    func require(_ key: String) throws -> String {
-      guard let v = env[key], !v.isEmpty else {
-        throw XCTSkip("\(key) not set — run Scripts/run-engine-e2e.sh (stages a GGUF + the bundled pie binary)")
-      }
-      return v
-    }
-    let pieBin = URL(fileURLWithPath: try require("PIE_TEST_REAL_PIE_BIN"))
-    let modelPath = URL(fileURLWithPath: try require("PIE_TEST_REAL_MODEL_PATH"))
-    let wasm = URL(fileURLWithPath: try require("PIE_TEST_REAL_CHATAPC_WASM"))
-    let manifest = URL(fileURLWithPath: try require("PIE_TEST_REAL_CHATAPC_MANIFEST"))
-    let fm = FileManager.default
-    XCTAssertTrue(fm.isExecutableFile(atPath: pieBin.path), "pie binary missing/!exec at \(pieBin.path)")
-    XCTAssertTrue(fm.fileExists(atPath: modelPath.path), "model missing at \(modelPath.path)")
-
-    // Stage a models root containing the GGUF (the slug is the leaf
-    // filename, matching the resolver's flat-slug join) + a profile
-    // pointing at it. Symlink so we don't copy ~500 MB per run.
-    let modelsRoot = tempPieHome.appendingPathComponent("models", isDirectory: true)
-    try fm.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
-    let slug = modelPath.lastPathComponent
-    let staged = modelsRoot.appendingPathComponent(slug, isDirectory: false)
-    try? fm.removeItem(at: staged)
-    // The resolver requires a regular file (rejects symlinks as an
-    // anti-symlink-attack guard), so hardlink when possible (same
-    // volume, no copy) and fall back to a full copy across volumes.
-    do {
-      try fm.linkItem(at: modelPath, to: staged)
-    } catch {
-      try fm.copyItem(at: modelPath, to: staged)
-    }
-
-    let profiles = tempPieHome.appendingPathComponent("profiles", isDirectory: true)
-    try fm.createDirectory(at: profiles, withIntermediateDirectories: true)
-    try """
-    id = "chat"
-    name = "Chat"
-    model = "\(slug)"
-    inferlet = "chat-apc"
-    """.write(to: profiles.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
-    let store = ProfileStore(
-      directory: profiles,
-      activeProfileURL: tempPieHome.appendingPathComponent("active-profile", isDirectory: false)
-    )
-    try store.start()
-    try store.setActiveProfileID("chat")
-    defer { store.stop() }
-
-    // Real resolver → real launcher (no PieEngineHost launcher override).
-    let resolver = LaunchSpecResolver(
-      profileStore: store,
-      pieBinary: { pieBin },
-      modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempPieHome.appendingPathComponent("inferlets") },
-      pieControlResources: { (wasm: wasm, manifest: manifest) },
-      // The engine binds an aux Unix-domain socket under
-      // <pieHome>/standalone/<pid>/g0/aux.sock, which must fit the
-      // sun_path 104-char limit. NSTemporaryDirectory() (/var/folders/…)
-      // is far too deep, so anchor pieHome at a short /tmp path. (:
-      // production's ~/Library/Application Support/RatioThink is short enough.)
-      pieHome: { self.shortPieHome },
-      subprocessEnvironment: { SpawnEnvSanitizer.sanitize(ProcessInfo.processInfo.environment) }
-    )
-    var spec: PieControlLauncher.LaunchSpec
-    switch resolver.asClosure("chat") {
-    case .success(let s): spec = s
-    case .failure(let e): return XCTFail("resolver rejected chat profile: \(e.code.rawValue): \(e.message)")
-    }
-    // Register the about-to-be-spawned `pie serve` pid with the
-    // IsolatedTestCase reap net so a hung engine is SIGKILL-reaped after
-    // the test even if the body throws or `host.stop()` (async) hasn't
-    // run. The resolver leaves `pidSink` nil; this is the sole sink.
-    reapEngineSubprocess(in: &spec)
-
+    let env = try realEngineEnvOrSkip()
     let host = PieEngineHost()
     defer { host.stop() }
-    if case .failure(let e) = host.start(spec) {
-      return XCTFail("engineHost.start rejected: \(e.code.rawValue): \(e.message)")
-    }
-
-    // Await .running (model load + Metal init can take ~10-30s cold).
-    let port = try await awaitRunning(host: host, timeout: 120)
-    XCTAssertGreaterThan(port, 0, "engine must publish a real port")
+    let (port, slug) = try await launchRealEngine(env, host: host)
 
     // Engine is genuinely serving: HTTP chat round-trip. The served id
     // must be the profile slug (id-unification,  follow-up) — assert
     // /v1/models advertises it, then chat against that exact id.
     try await assertServedModelID(port: port, expected: slug)
     try await assertChatCompletion(port: port, modelID: slug)
+  }
+
+  /// Real-model proof for the reasoning-channel split: a thinking model
+  /// (Qwen3) must keep raw `<think>`/`</think>` delimiters OFF the
+  /// visible-content channel and surface the scratchpad on
+  /// `reasoning_content` instead. Gated behind
+  /// `PIE_TEST_REAL_EXPECT_REASONING=1` so the model-agnostic suite
+  /// (Qwen2.5 etc.) doesn't run it — a non-thinking model has no
+  /// reasoning to assert on. Drive with:
+  ///   PIE_TEST_REAL_EXPECT_REASONING=1 \
+  ///   PIE_TEST_E2E_REPO=Qwen/Qwen3-0.6B-GGUF \
+  ///   PIE_TEST_E2E_FILE=Qwen3-0.6B-Q8_0.gguf  Scripts/run-engine-e2e.sh
+  func test_realEngine_keepsThinkDelimitersOffContentChannel() async throws {
+    let env = try realEngineEnvOrSkip()
+    guard ProcessInfo.processInfo.environment["PIE_TEST_REAL_EXPECT_REASONING"] == "1" else {
+      throw XCTSkip("set PIE_TEST_REAL_EXPECT_REASONING=1 with a thinking model (e.g. Qwen3) to run")
+    }
+    let host = PieEngineHost()
+    defer { host.stop() }
+    let (port, slug) = try await launchRealEngine(env, host: host)
+    try await assertReasoningSeparatedFromContent(port: port, modelID: slug)
   }
 
   /// Poll the host until it reports `.running`, failing fast on `.failed`.
@@ -214,6 +156,160 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     XCTAssertNotNil(content, "engine reply missing choices[0].message.content: \(String(data: data, encoding: .utf8) ?? "")")
     XCTAssertFalse((content ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                    "engine returned an empty assistant message")
+  }
+
+  /// Drive a real thinking-model completion and assert the
+  /// `<think>`/`</think>` delimiters never reach `message.content`, while
+  /// the scratchpad arrives on `message.reasoning_content`. Non-streaming
+  /// for a single deterministic JSON to inspect. A generous `max_tokens`
+  /// gives Qwen3 room to finish its reasoning chain; even if it caps
+  /// before the answer, the delimiter-free + reasoning-present invariant
+  /// still holds (reasoning streams first).
+  private func assertReasoningSeparatedFromContent(port: Int, modelID: String) async throws {
+    let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.timeoutInterval = 180
+    req.httpBody = try JSONSerialization.data(withJSONObject: [
+      "model": modelID,
+      "messages": [["role": "user", "content": "What is 2 + 2? Think briefly, then answer."]],
+      "max_tokens": 4096,
+      "stream": false,
+    ])
+    let (data, response) = try await URLSession.shared.data(for: req)
+    let http = try XCTUnwrap(response as? HTTPURLResponse)
+    let bodyText = String(data: data, encoding: .utf8) ?? ""
+    XCTAssertEqual(http.statusCode, 200, "chat HTTP \(http.statusCode): \(bodyText)")
+    let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    let message = (json?["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any]
+    let content = (message?["content"] as? String) ?? ""
+    let reasoning = (message?["reasoning_content"] as? String) ?? ""
+
+    // Core acceptance: no raw delimiter in the visible answer.
+    XCTAssertFalse(content.contains("</think>"), "raw </think> leaked into content: \(content.debugDescription)")
+    XCTAssertFalse(content.contains("<think>"), "raw <think> leaked into content: \(content.debugDescription)")
+    // Separation actually engaged: the thinking model routed its
+    // scratchpad to the reasoning channel, not into content.
+    XCTAssertFalse(reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   "expected non-empty reasoning_content for a thinking model; body=\(bodyText.prefix(400))")
+    XCTAssertFalse(reasoning.contains("</think>"),
+                   "reasoning_content must hold clean scratchpad text, not the delimiter")
+  }
+
+  // MARK: - launch helper
+
+  private struct RealEngineEnv {
+    let pieBin: URL
+    let modelPath: URL
+    let wasm: URL
+    let manifest: URL
+  }
+
+  private func realEngineEnvOrSkip() throws -> RealEngineEnv {
+    let env = ProcessInfo.processInfo.environment
+    func require(_ key: String) throws -> String {
+      guard let v = env[key], !v.isEmpty else {
+        throw XCTSkip("\(key) not set — run Scripts/run-engine-e2e.sh (stages a GGUF + the bundled pie binary)")
+      }
+      return v
+    }
+    let e = RealEngineEnv(
+      pieBin: URL(fileURLWithPath: try require("PIE_TEST_REAL_PIE_BIN")),
+      modelPath: URL(fileURLWithPath: try require("PIE_TEST_REAL_MODEL_PATH")),
+      wasm: URL(fileURLWithPath: try require("PIE_TEST_REAL_CHATAPC_WASM")),
+      manifest: URL(fileURLWithPath: try require("PIE_TEST_REAL_CHATAPC_MANIFEST"))
+    )
+    let fm = FileManager.default
+    XCTAssertTrue(fm.isExecutableFile(atPath: e.pieBin.path), "pie binary missing/!exec at \(e.pieBin.path)")
+    XCTAssertTrue(fm.fileExists(atPath: e.modelPath.path), "model missing at \(e.modelPath.path)")
+    return e
+  }
+
+  /// Drives the PRODUCTION launch path (real `LaunchSpecResolver` →
+  /// `PieEngineHost` → real `pie serve` subprocess) and returns once the
+  /// engine reports `.running`. The caller owns `host` (and its
+  /// `host.stop()` defer) so the engine outlives this call. The spawned
+  /// `pie serve` pid is routed into the `IsolatedTestCase` reap net via
+  /// `reapEngineSubprocess(in:)` so a hung engine is SIGKILL-reaped
+  /// post-test even if the body throws.
+  private func launchRealEngine(
+    _ e: RealEngineEnv,
+    host: PieEngineHost
+  ) async throws -> (port: Int, slug: String) {
+    let fm = FileManager.default
+    // Stage a models root containing the GGUF (the slug is the leaf
+    // filename, matching the resolver's flat-slug join) + a profile
+    // pointing at it. Hardlink so we don't copy ~500 MB per run.
+    let modelsRoot = tempPieHome.appendingPathComponent("models", isDirectory: true)
+    try fm.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+    let slug = e.modelPath.lastPathComponent
+    let staged = modelsRoot.appendingPathComponent(slug, isDirectory: false)
+    try? fm.removeItem(at: staged)
+    // The resolver requires a regular file (rejects symlinks as an
+    // anti-symlink-attack guard), so hardlink when possible (same
+    // volume, no copy) and fall back to a full copy across volumes.
+    do {
+      try fm.linkItem(at: e.modelPath, to: staged)
+    } catch {
+      try fm.copyItem(at: e.modelPath, to: staged)
+    }
+
+    let profiles = tempPieHome.appendingPathComponent("profiles", isDirectory: true)
+    try fm.createDirectory(at: profiles, withIntermediateDirectories: true)
+    try """
+    id = "chat"
+    name = "Chat"
+    model = "\(slug)"
+    inferlet = "chat-apc"
+    """.write(to: profiles.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
+    let store = ProfileStore(
+      directory: profiles,
+      activeProfileURL: tempPieHome.appendingPathComponent("active-profile", isDirectory: false)
+    )
+    try store.start()
+    try store.setActiveProfileID("chat")
+
+    // Real resolver → real launcher (no PieEngineHost launcher override).
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { e.pieBin },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempPieHome.appendingPathComponent("inferlets") },
+      pieControlResources: { (wasm: e.wasm, manifest: e.manifest) },
+      // The engine binds an aux Unix-domain socket under
+      // <pieHome>/standalone/<pid>/g0/aux.sock, which must fit the
+      // sun_path 104-char limit. NSTemporaryDirectory() (/var/folders/…)
+      // is far too deep, so anchor pieHome at a short /tmp path. (:
+      // production's ~/Library/Application Support/RatioThink is short enough.)
+      pieHome: { self.shortPieHome },
+      subprocessEnvironment: { SpawnEnvSanitizer.sanitize(ProcessInfo.processInfo.environment) }
+    )
+    var spec: PieControlLauncher.LaunchSpec
+    switch resolver.asClosure("chat") {
+    case .success(let s): spec = s
+    case .failure(let err):
+      store.stop()
+      XCTFail("resolver rejected chat profile: \(err.code.rawValue): \(err.message)")
+      throw XCTSkip("resolver failure")
+    }
+    // Register the about-to-be-spawned `pie serve` pid with the
+    // IsolatedTestCase reap net so a hung engine is SIGKILL-reaped after
+    // the test even if the body throws or `host.stop()` (async) hasn't
+    // run. The resolver leaves `pidSink` nil; this is the sole sink.
+    reapEngineSubprocess(in: &spec)
+    // ProfileStore must outlive the launch; the engine has its config by
+    // the time .running is reported, so stopping it after is safe.
+    defer { store.stop() }
+
+    if case .failure(let err) = host.start(spec) {
+      XCTFail("engineHost.start rejected: \(err.code.rawValue): \(err.message)")
+      throw XCTSkip("host start failure")
+    }
+    // Await .running (model load + Metal init can take ~10-30s cold).
+    let port = try await awaitRunning(host: host, timeout: 120)
+    XCTAssertGreaterThan(port, 0, "engine must publish a real port")
+    return (port, slug)
   }
 
   // MARK: - pid-reap wiring

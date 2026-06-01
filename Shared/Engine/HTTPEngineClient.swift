@@ -265,12 +265,19 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
             // OpenAI `chat.completion.chunk`.
             let chunk = try decoder.decode(ChatCompletionChunk.self, from: frame.dataBytes)
             guard let choice = chunk.choices.first else { continue }
-            if let delta = choice.delta,
-               (delta.content != nil || delta.role != nil) {
-              continuation.yield(.delta(
-                role: delta.role,
-                content: delta.content ?? ""
-              ))
+            if let delta = choice.delta {
+              // Reasoning frames carry `reasoning_content` and no
+              // `content`; route them to their own channel so thinking
+              // text never lands in the visible answer.
+              if let reasoning = delta.reasoning_content, !reasoning.isEmpty {
+                continuation.yield(.reasoningDelta(reasoning))
+              }
+              if delta.content != nil || delta.role != nil {
+                continuation.yield(.delta(
+                  role: delta.role,
+                  content: delta.content ?? ""
+                ))
+              }
             }
             if let reason = choice.finish_reason {
               continuation.yield(.finish(reason: Self.parseFinishReason(reason)))
@@ -604,6 +611,11 @@ private struct ChunkChoice: Decodable {
 private struct ChunkDelta: Decodable {
   let role: ChatMessage.Role?
   let content: String?
+  /// OpenAI `reasoning_content` delta — the model's thinking-block text
+  /// on chat-apc reasoning frames. Present only on reasoning chunks
+  /// (which carry no `content`); decoded so the GUI can surface it on a
+  /// separate channel instead of dropping it.
+  let reasoning_content: String?
 }
 
 // MARK: - Errors

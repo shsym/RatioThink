@@ -230,6 +230,43 @@ final class HTTPEngineClientTests: XCTestCase {
     ])
   }
 
+  func test_chatCompletion_routes_reasoning_content_to_its_own_channel() async throws {
+    // chat-apc wire order for a Qwen thinking turn: model_ready,
+    // role chunk, reasoning_content deltas, then visible content, finish.
+    // The closing </think> delimiter never appears on either channel —
+    // the inferlet keeps it off the wire entirely.
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        "data: {\"event\":\"model_ready\"}\n\n",
+        #"data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{"reasoning_content":"the user said"}}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{"reasoning_content":" hi"}}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{"content":"Hello!"}}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    let req = ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "hi")])
+    var events: [ChatEvent] = []
+    for try await ev in makeClient().chatCompletion(req) {
+      events.append(ev)
+    }
+    XCTAssertEqual(events, [
+      .modelReady,
+      .delta(role: .assistant, content: ""),
+      .reasoningDelta("the user said"),
+      .reasoningDelta(" hi"),
+      .delta(role: nil, content: "Hello!"),
+      .finish(reason: .stop),
+    ])
+    // No reasoning text bled into the visible-content channel.
+    let visible = events.compactMap { event -> String? in
+      if case let .delta(_, content) = event { return content }
+      return nil
+    }.joined()
+    XCTAssertEqual(visible, "Hello!")
+  }
+
   func test_chatCompletion_unknown_finish_reason_maps_to_other() async throws {
     FakeSSEURLProtocol.handler = { _ in
       .sse(chunks: [

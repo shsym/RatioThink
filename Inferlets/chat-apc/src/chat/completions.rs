@@ -495,6 +495,38 @@ impl Outcome {
 }
 
 // =============================================================================
+// Reasoning/content channel demux
+// =============================================================================
+
+/// Whether a generation step's chat-decoder text belongs on the
+/// **visible content** channel rather than the reasoning channel.
+///
+/// The reasoning decoder and chat decoder are fed the SAME token batch
+/// each step. The chat decoder is model-generic and surfaces *all*
+/// decoded text — including the `<think>` / `</think>` delimiter strings
+/// the reasoning decoder treats as structural. A batch is visible content
+/// only when it lands ENTIRELY OUTSIDE a reasoning block:
+///
+/// * `reason_idle` — the reasoning decoder reported no boundary or
+///   reasoning text for this batch (`Event::Idle`); a `Start`, `Delta`,
+///   or `End` means the batch is reasoning-channel material.
+/// * `was_in_reasoning` — the `in_reasoning` state *before* this batch
+///   was processed. Captured pre-`feed` because the reasoning decoder
+///   flips the flag as a side effect of consuming the boundary token.
+///
+/// The closing `</think>` batch makes the reasoning decoder
+/// report `End` and flips `in_reasoning` to false, but the chat decoder
+/// still emits `"</think>"` as a `Delta` on that same batch. Gating on
+/// the post-`feed` `in_reasoning` alone (the old `!in_reasoning` guard)
+/// re-opened the content channel exactly in time for the delimiter to
+/// leak. `End` is not `Idle`, so this returns false for that batch.
+/// The opening `<think>` batch was already handled correctly (`Start`
+/// is not `Idle`), which is why only the closing tag leaked.
+fn content_visible(reason_idle: bool, was_in_reasoning: bool) -> bool {
+    reason_idle && !was_in_reasoning
+}
+
+// =============================================================================
 // Launch-diagnostics registry (N1/N2 — OnceLock immutable snapshot)
 // =============================================================================
 
@@ -1808,6 +1840,12 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
         // `in_reasoning` guard so chat::Delta arms inside the block
         // are not double-emitted as visible content (mirrors the
         // text-completion canonical loop in pie/inferlets).
+        // capture the gate state BEFORE feeding the reasoning
+        // decoder — `feed` flips `in_reasoning` as a side effect of
+        // consuming a boundary token, and the chat decoder (fed below)
+        // must be gated on the batch's channel, not the post-flip state.
+        let was_in_reasoning = in_reasoning;
+        let mut reason_idle = false;
         match reason_dec.feed(&out.tokens) {
             Ok(inferlet::reasoning::Event::Start) => {
                 in_reasoning = true;
@@ -1833,7 +1871,9 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             Ok(inferlet::reasoning::Event::End(_)) => {
                 in_reasoning = false;
             }
-            Ok(inferlet::reasoning::Event::Idle) => {}
+            Ok(inferlet::reasoning::Event::Idle) => {
+                reason_idle = true;
+            }
             Err(e) => break (Outcome::Aborted, Some(("reasoning_decode_failed", e.to_string()))),
         }
 
@@ -1869,7 +1909,7 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
         }
 
         match decoder.feed(&out.tokens) {
-            Ok(chat::Event::Delta(s)) if !in_reasoning => {
+            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) => {
                 let chunk = ChatCompletionChunk {
                     id: &id,
                     object: "chat.completion.chunk",
@@ -1891,11 +1931,12 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
                 try_emit!(em, &chunk, "content_delta");
             }
             Ok(chat::Event::Delta(_)) => {
-                // Suppressed: chat::Delta fired while the reasoning
-                // decoder was inside a `<think>` block. Tokens are
-                // already accounted for via the reasoning_content
-                // emit above; surfacing them again as visible content
-                // would double-render the scratchpad.
+                // Suppressed: this batch is reasoning-channel material —
+                // either inside a `<think>` block, or the opening/closing
+                // delimiter itself. The chat decoder is model-generic and
+                // surfaces the delimiter text (`<think>` / `</think>`) as a
+                // Delta; `content_visible` keeps it off the visible channel
+                // so the scratchpad and its delimiters never leak.
             }
             Ok(chat::Event::Done(_)) => break (Outcome::Natural, None),
             Ok(chat::Event::Interrupt(id)) => {
@@ -2076,6 +2117,11 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
             Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
         };
 
+        // capture the gate state BEFORE feeding the reasoning
+        // decoder (see streaming branch + `content_visible`). Mirrors the
+        // streaming gate so stream + non-stream produce identical content.
+        let was_in_reasoning = in_reasoning;
+        let mut reason_idle = false;
         match reason_dec.feed(&out.tokens) {
             Ok(inferlet::reasoning::Event::Start) => in_reasoning = true,
             Ok(inferlet::reasoning::Event::Delta(s)) => {
@@ -2093,7 +2139,9 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
             Ok(inferlet::reasoning::Event::End(_)) => {
                 in_reasoning = false;
             }
-            Ok(inferlet::reasoning::Event::Idle) => {}
+            Ok(inferlet::reasoning::Event::Idle) => {
+                reason_idle = true;
+            }
             Err(e) => break (Outcome::Aborted, Some(("reasoning_decode_failed", e.to_string()))),
         }
 
@@ -2124,13 +2172,15 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         }
 
         match decoder.feed(&out.tokens) {
-            Ok(chat::Event::Delta(s)) if !in_reasoning => full_text.push_str(&s),
+            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) => {
+                full_text.push_str(&s)
+            }
             Ok(chat::Event::Delta(_)) => {}
-            // F1: trust the delta-stitched `full_text` that respects
-            // `in_reasoning`. The chat decoder runs alongside (not
-            // downstream of) the reasoning decoder, so `Done(s)`
-            // typically still contains the `<think>...</think>` span
-            // — overwriting `full_text` with it leaks reasoning into
+            // F1: trust the delta-stitched `full_text` that respects the
+            // reasoning channel (`content_visible`). The chat decoder runs
+            // alongside (not downstream of) the reasoning decoder, so
+            // `Done(s)` typically still contains the `<think>...</think>`
+            // span — overwriting `full_text` with it leaks reasoning into
             // visible content. Streaming gates content deltas the
             // same way; mirror that here so stream + non-stream
             // produce the same `content` for the same prompt.
@@ -2377,6 +2427,96 @@ fn next_tool_call_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Reasoning/content channel demux ──────────────────
+
+    /// Reasoning-decoder event kind for one generation step, paired with
+    /// the chat decoder's text for the same token batch. Models what the
+    /// host decoders return without the wasm host.
+    enum Step {
+        ThinkStart(&'static str),  // reasoning Start; chat surfaces the `<think>` text
+        Reason(&'static str),      // reasoning Delta; chat surfaces the same text
+        ThinkEnd(&'static str),    // reasoning End/Complete; chat surfaces the `</think>` text
+        Content(&'static str),     // reasoning Idle (outside); chat surfaces visible content
+    }
+
+    /// Replays the generation loop's reasoning/content demux exactly as
+    /// `handle_streaming` / `handle_non_streaming` do: capture
+    /// `was_in_reasoning`, feed reasoning (updating `in_reasoning` +
+    /// `reason_idle`), then gate the chat delta on `content_visible`.
+    /// Returns `(visible_content, reasoning)`.
+    fn demux(steps: &[Step]) -> (String, String) {
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut in_reasoning = false;
+        for step in steps {
+            let was_in_reasoning = in_reasoning;
+            let mut reason_idle = false;
+            let chat_text = match step {
+                Step::ThinkStart(t) => {
+                    in_reasoning = true;
+                    *t
+                }
+                Step::Reason(t) => {
+                    in_reasoning = true;
+                    reasoning.push_str(t);
+                    *t
+                }
+                Step::ThinkEnd(t) => {
+                    in_reasoning = false;
+                    *t
+                }
+                Step::Content(t) => {
+                    reason_idle = true;
+                    *t
+                }
+            };
+            if content_visible(reason_idle, was_in_reasoning) {
+                content.push_str(chat_text);
+            }
+        }
+        (content, reasoning)
+    }
+
+    #[test]
+    fn think_delimiters_never_leak_into_visible_content() {
+        // A canonical Qwen reasoning turn: <think> reasoning </think> answer.
+        let (content, reasoning) = demux(&[
+            Step::ThinkStart("<think>"),
+            Step::Reason("the user said hi"),
+            Step::ThinkEnd("</think>"),
+            Step::Content("Hello!"),
+        ]);
+        assert_eq!(content, "Hello!", "only the answer reaches visible content");
+        assert_eq!(reasoning, "the user said hi");
+        // The specific symptom: the CLOSING tag must not leak.
+        assert!(!content.contains("</think>"), "closing delimiter leaked: {content:?}");
+        assert!(!content.contains("<think>"), "opening delimiter leaked: {content:?}");
+    }
+
+    #[test]
+    fn content_visible_only_outside_reasoning() {
+        // Idle batch outside reasoning → visible.
+        assert!(content_visible(true, false));
+        // Closing-delimiter batch: reasoning End (not idle), was inside.
+        assert!(!content_visible(false, true));
+        // Opening-delimiter / reasoning-body batch: not idle.
+        assert!(!content_visible(false, false));
+        // Idle batch while still inside (no-visible-text reasoning token).
+        assert!(!content_visible(true, true));
+    }
+
+    #[test]
+    fn non_thinking_model_passes_all_content() {
+        // NoopReasoningDecoder always reports Idle and never flips the
+        // gate — every batch is visible content.
+        let (content, reasoning) = demux(&[
+            Step::Content("Plain "),
+            Step::Content("answer."),
+        ]);
+        assert_eq!(content, "Plain answer.");
+        assert!(reasoning.is_empty());
+    }
 
     #[test]
     fn truncate_message_passthrough() {
