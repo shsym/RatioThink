@@ -1292,8 +1292,8 @@ final class LaunchSpecResolverTests: XCTestCase {
   private func touchExecutable(at url: URL) throws {
     let script = """
     #!/bin/sh
-    if [ "$1" = "capabilities" ] && [ "$2" = "--json" ]; then
-      printf '%s\\n' '{"drivers":{"portable":true,"cuda_native":false,"dummy":true},"devices":{"metal":true}}'
+    if [ "$1" = "driver" ] && [ "$2" = "list" ]; then
+      printf 'Embedded drivers (compiled into this binary by feature):\\n  portable     (compiled in)\\n'
       exit 0
     fi
     exit 0

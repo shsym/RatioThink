@@ -66,6 +66,67 @@ jobs:
       - name: Run Xcode ChatScaffold regression guard (review v1 F1)
         run: make test-xcode-chat-scaffold
 
+  real-pie-driver-contract:
+    # Real-binary contract test for the driver-readiness probe: builds the
+    # bundled pie once and runs the SPM contract test against it with
+    # PIE_TEST_REAL_PIE_BIN set. The unit suite stubs the probe (so it stays
+    # green even if the real `pie driver list` surface is renamed/removed),
+    # which is exactly the stub-only blind spot that let the original
+    # probe-contract regression ship. This job gives the contract test a
+    # REAL binary and HARD-FAILS if it skips, so the drift guard cannot
+    # silently no-op in CI.
+    name: real pie driver-list contract
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Resolve pinned pie submodule SHA
+        id: piesha
+        run: echo "sha=$(git rev-parse HEAD:Vendor/pie)" >> "$GITHUB_OUTPUT"
+
+      # Cache the built engine keyed on the EXACT pinned pie SHA + the build
+      # script hash. No restore-keys: a fuzzy prefix match could restore a
+      # different pie's binary and the contract would silently test a stale
+      # engine (false green). Exact-match-or-rebuild only.
+      - name: Restore cached pie engine
+        id: piecache
+        uses: actions/cache@v4
+        with:
+          path: build/pie-engine/arm64
+          key: pie-engine-${{ runner.os }}-${{ runner.arch }}-${{ steps.piesha.outputs.sha }}-${{ hashFiles('Scripts/build-pie-engine.sh') }}
+
+      - name: Build pie engine
+        if: steps.piecache.outputs.cache-hit != 'true'
+        run: Scripts/build-pie-engine.sh --arch arm64
+
+      - name: Run real-binary driver-list contract test
+        env:
+          PIE_TEST_REAL_PIE_BIN: ${{ github.workspace }}/build/pie-engine/arm64/pie
+        run: |
+          set +e
+          xcrun swift test --filter test_realPie_driverList_subcommand_exists_and_reports_portable 2>&1 | tee contract.out
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "FAIL: real-binary contract test exited $rc"
+            exit "$rc"
+          fi
+          # A silent skip would green the job and re-open the blind spot
+          # the contract test exists to close — treat it as a hard failure.
+          if grep -q 'Test skipped' contract.out; then
+            echo "FAIL: contract test was SKIPPED in CI — PIE_TEST_REAL_PIE_BIN not honored or binary missing; the driver-list drift guard must not silently skip"
+            exit 1
+          fi
+          # `--filter` matching zero tests exits 0 (renamed/moved test) —
+          # require a real 'Executed N>=1 ... 0 failures' line.
+          if ! grep -Eq 'Executed [1-9][0-9]* tests?, with 0 failures' contract.out; then
+            echo "FAIL: expected 'Executed N tests, with 0 failures' (N>=1) — filter matched zero tests?"
+            exit 1
+          fi
+          echo "real-pie-contract: $(grep -E 'Executed [0-9]+ tests?' contract.out | tail -1)"
+
   unit-and-scenario-tests:
     # Runs the SPM test bundles. Exercises the production env-fallback
     # code paths via the `pie-resolve-probe` binary (review v6 F4) so

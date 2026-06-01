@@ -24,26 +24,41 @@ import Foundation
 ///   · PIE_TEST_REAL_MODEL_PATH       — a real .gguf on disk
 ///   · PIE_TEST_REAL_CHATAPC_WASM     — chat-apc.wasm
 ///   · PIE_TEST_REAL_CHATAPC_MANIFEST — chat-apc Pie.toml
-final class RealEngineLaunchE2ETests: XCTestCase {
-  private var tempDir: URL!
+///
+/// Isolation: subclasses `IsolatedTestCase` (not bare `XCTestCase`) so the
+/// real `pie serve` it spawns is registered via `trackSubprocess(_:)` and
+/// SIGKILL-reaped by the base's post-test reap loop even if the body throws
+/// or `host.stop()` (async, fire-and-forget) hasn't finished — the same
+/// safety net S0/S3 rely on. A hung engine no longer leaks into the next
+/// test or the developer's machine.
+final class RealEngineLaunchE2ETests: IsolatedTestCase {
   /// Short `/tmp`-anchored pieHome so the engine's aux Unix socket path
   /// stays under the 104-char `sun_path` limit (see resolver wiring).
+  /// Deliberately NOT the base `tempPieHome` (which lives under the deep
+  /// `NSTemporaryDirectory()` /var/folders root): only the engine's
+  /// PIE_HOME carries the length-bounded socket, so the models/profiles
+  /// scratch stays under `tempPieHome` while the engine gets this.
   private var shortPieHome: URL!
 
   override func setUpWithError() throws {
+    // super first: IsolatedTestCase.invokeTest already allocated
+    // `tempPieHome` and bound `PieDirs.homeOverride` to it; super's setUp
+    // precondition verifies that binding. Only the short engine pieHome
+    // is ours to create.
     try super.setUpWithError()
     let uuid = UUID().uuidString.prefix(8).lowercased()
-    tempDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-      .appendingPathComponent("pie-real-engine-\(uuid)", isDirectory: true)
-    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
     shortPieHome = URL(fileURLWithPath: "/tmp/pe2e-\(uuid)", isDirectory: true)
     try FileManager.default.createDirectory(at: shortPieHome, withIntermediateDirectories: true)
   }
 
   override func tearDownWithError() throws {
-    if let tempDir { try? FileManager.default.removeItem(at: tempDir) }
+    // Best-effort: races the async `host.stop()` shutdown, but POSIX
+    // unlink succeeds even while the engine still holds fds, and the
+    // wrapper's EXIT sweep (Scripts/run-engine-e2e.sh) is the
+    // deterministic outer net for an externally-killed bundle. The
+    // base's verified `cleanupTempPieHome()` (runs post-reap in
+    // invokeTest) owns `tempPieHome`.
     if let shortPieHome { try? FileManager.default.removeItem(at: shortPieHome) }
-    tempDir = nil
     shortPieHome = nil
     try super.tearDownWithError()
   }
@@ -67,7 +82,7 @@ final class RealEngineLaunchE2ETests: XCTestCase {
     // Stage a models root containing the GGUF (the slug is the leaf
     // filename, matching the resolver's flat-slug join) + a profile
     // pointing at it. Symlink so we don't copy ~500 MB per run.
-    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    let modelsRoot = tempPieHome.appendingPathComponent("models", isDirectory: true)
     try fm.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
     let slug = modelPath.lastPathComponent
     let staged = modelsRoot.appendingPathComponent(slug, isDirectory: false)
@@ -81,7 +96,7 @@ final class RealEngineLaunchE2ETests: XCTestCase {
       try fm.copyItem(at: modelPath, to: staged)
     }
 
-    let profiles = tempDir.appendingPathComponent("profiles", isDirectory: true)
+    let profiles = tempPieHome.appendingPathComponent("profiles", isDirectory: true)
     try fm.createDirectory(at: profiles, withIntermediateDirectories: true)
     try """
     id = "chat"
@@ -91,7 +106,7 @@ final class RealEngineLaunchE2ETests: XCTestCase {
     """.write(to: profiles.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
     let store = ProfileStore(
       directory: profiles,
-      activeProfileURL: tempDir.appendingPathComponent("active-profile", isDirectory: false)
+      activeProfileURL: tempPieHome.appendingPathComponent("active-profile", isDirectory: false)
     )
     try store.start()
     try store.setActiveProfileID("chat")
@@ -102,7 +117,7 @@ final class RealEngineLaunchE2ETests: XCTestCase {
       profileStore: store,
       pieBinary: { pieBin },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
+      inferletsDir: { self.tempPieHome.appendingPathComponent("inferlets") },
       pieControlResources: { (wasm: wasm, manifest: manifest) },
       // The engine binds an aux Unix-domain socket under
       // <pieHome>/standalone/<pid>/g0/aux.sock, which must fit the
@@ -112,11 +127,16 @@ final class RealEngineLaunchE2ETests: XCTestCase {
       pieHome: { self.shortPieHome },
       subprocessEnvironment: { SpawnEnvSanitizer.sanitize(ProcessInfo.processInfo.environment) }
     )
-    let spec: PieControlLauncher.LaunchSpec
+    var spec: PieControlLauncher.LaunchSpec
     switch resolver.asClosure("chat") {
     case .success(let s): spec = s
     case .failure(let e): return XCTFail("resolver rejected chat profile: \(e.code.rawValue): \(e.message)")
     }
+    // Register the about-to-be-spawned `pie serve` pid with the
+    // IsolatedTestCase reap net so a hung engine is SIGKILL-reaped after
+    // the test even if the body throws or `host.stop()` (async) hasn't
+    // run. The resolver leaves `pidSink` nil; this is the sole sink.
+    reapEngineSubprocess(in: &spec)
 
     let host = PieEngineHost()
     defer { host.stop() }
@@ -194,5 +214,55 @@ final class RealEngineLaunchE2ETests: XCTestCase {
     XCTAssertNotNil(content, "engine reply missing choices[0].message.content: \(String(data: data, encoding: .utf8) ?? "")")
     XCTAssertFalse((content ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                    "engine returned an empty assistant message")
+  }
+
+  // MARK: - pid-reap wiring
+
+  /// Route the about-to-be-spawned `pie serve` pid into the
+  /// `IsolatedTestCase` reap net. Factored out of the launch body so the
+  /// wiring is verifiable engine-free
+  /// (`test_reapEngineSubprocess_wires_pid_into_reap_net`); the gated
+  /// real-engine test only runs on a host with a staged model + binary.
+  private func reapEngineSubprocess(in spec: inout PieControlLauncher.LaunchSpec) {
+    spec.pidSink = { [weak self] pid in self?.trackSubprocess(pid) }
+  }
+
+  /// Engine-free regression guard for the pid-reap wiring. Subclassing
+  /// `IsolatedTestCase` only helps if the spawned pid actually reaches
+  /// `trackSubprocess(_:)`, so assert the seam forwards it. A real
+  /// `/bin/sleep` stands in for the engine: the base reap loop SIGKILLs +
+  /// waitpids it post-test, so there is no manual cleanup and no leak —
+  /// the same pattern as `IsolatedTestCaseTests`' reap check.
+  func test_reapEngineSubprocess_wires_pid_into_reap_net() throws {
+    let sleeper = Process()
+    sleeper.executableURL = URL(fileURLWithPath: "/bin/sleep")
+    sleeper.arguments = ["60"]
+    try sleeper.run()
+
+    var spec = try makeDummyLaunchSpec()
+    XCTAssertNil(spec.pidSink, "precondition: a fresh spec has no pidSink")
+    reapEngineSubprocess(in: &spec)
+    XCTAssertNotNil(spec.pidSink, "reapEngineSubprocess must install a pidSink")
+
+    let before = trackedSubprocessCountForTesting
+    spec.pidSink?(sleeper.processIdentifier)
+    XCTAssertEqual(trackedSubprocessCountForTesting, before + 1,
+                   "the spec's pidSink must forward the spawned pid into the IsolatedTestCase reap net")
+    // No teardown: the base reap loop SIGKILL + waitpids the sleeper.
+  }
+
+  /// Minimal `.dummy` LaunchSpec for the engine-free wiring test.
+  /// `.dummy` skips PieControlLauncher's driver-capability probe, so the
+  /// throwaway binary/resource paths need not exist on disk.
+  private func makeDummyLaunchSpec() throws -> PieControlLauncher.LaunchSpec {
+    try PieControlLauncher.LaunchSpec(
+      pieBinary: tempPieHome.appendingPathComponent("pie"),
+      wasmURL: tempPieHome.appendingPathComponent("chat-apc.wasm"),
+      manifestURL: tempPieHome.appendingPathComponent("Pie.toml"),
+      subprocessEnvironment: subprocessEnvironment,
+      pieHome: tempPieHome,
+      shmemName: shmemName,
+      modelConfig: .dummy
+    )
   }
 }

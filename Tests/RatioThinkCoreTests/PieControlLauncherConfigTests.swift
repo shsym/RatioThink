@@ -102,7 +102,7 @@ final class PieControlLauncherConfigTests: XCTestCase {
   }
 
   func test_launchSpecConstruction_rejects_portable_when_binary_lacks_portable_driver() throws {
-    let binary = try writeCapabilityProbe(portable: false, metal: false)
+    let binary = try writeDriverListProbe(portable: false)
     XCTAssertThrowsError(try makeSpec(binary: binary,
                                       modelConfig: .portable(modelSlug: "model.gguf",
                                                              modelsRoot: tempModelsRoot()))) { error in
@@ -115,8 +115,12 @@ final class PieControlLauncherConfigTests: XCTestCase {
     }
   }
 
-  func test_launchSpecConstruction_rejects_metal_when_binary_lacks_metal_backend() throws {
-    let binary = try writeCapabilityProbe(portable: true, metal: false)
+  // Current pie has no separate "metal" capability — Metal is the
+  // portable driver's device. So a `.metal` launch is rejected when the
+  // PORTABLE driver is not compiled in (the only thing the probe can know);
+  // the actual Metal backend is validated at serve boot.
+  func test_launchSpecConstruction_rejects_metal_when_portable_not_compiled() throws {
+    let binary = try writeDriverListProbe(portable: false)
     XCTAssertThrowsError(try makeSpec(binary: binary,
                                       modelConfig: .metal(modelID: "Qwen/Qwen3-0.6B"))) { error in
       guard case PieControlLauncher.LaunchError.driverUnsupported(
@@ -128,15 +132,15 @@ final class PieControlLauncherConfigTests: XCTestCase {
     }
   }
 
-  func test_launchSpecConstruction_accepts_metal_when_binary_reports_metal_backend() throws {
-    let binary = try writeCapabilityProbe(portable: true, metal: true)
+  func test_launchSpecConstruction_accepts_metal_when_portable_compiled_in() throws {
+    let binary = try writeDriverListProbe(portable: true)
     let spec = try makeSpec(binary: binary,
                             modelConfig: .metal(modelID: "Qwen/Qwen3-0.6B"))
     XCTAssertEqual(spec.pieBinary, binary)
   }
 
-  func test_launchSpecConstruction_uses_subprocessEnvironment_for_capabilityProbe() throws {
-    let binary = try writeEnvironmentSensitiveCapabilityProbe(
+  func test_launchSpecConstruction_uses_subprocessEnvironment_for_driverListProbe() throws {
+    let binary = try writeEnvironmentSensitiveDriverListProbe(
       key: "CAPABILITY_TEST_FLAG",
       expectedValue: "from-launch-spec"
     )
@@ -151,7 +155,7 @@ final class PieControlLauncherConfigTests: XCTestCase {
   func test_launchSpecConstruction_returnsBoundedFailureWhenProbeChildKeepsStdoutOpen() throws {
     let childPIDFile = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
       .appendingPathComponent("pie-capability-child-\(UUID().uuidString.prefix(8)).pid")
-    let binary = try writeStdoutLeakingCapabilityProbe(childPIDFile: childPIDFile)
+    let binary = try writeStdoutLeakingDriverListProbe(childPIDFile: childPIDFile)
     defer { killChildRecorded(in: childPIDFile) }
 
     let finished = expectation(description: "capability probe returns")
@@ -200,6 +204,105 @@ final class PieControlLauncherConfigTests: XCTestCase {
                   "expected timeout detail for inherited stdout pipe, got \(details)")
   }
 
+  // MARK: - driver-list parse + real-binary contract
+
+  private let pieURL = URL(fileURLWithPath: "/bin/pie")  // placeholder for parse tests
+
+  func test_parseDriverList_portable_compiled_in() throws {
+    let out = """
+    Embedded drivers (compiled into this binary by feature):
+      portable     (compiled in)
+      cuda_native  (not compiled)
+      dummy        (compiled in)
+    """
+    let portableCompiledIn = try PieControlLauncher.parseDriverList(out, pieBinary: pieURL, requested: "portable")
+    XCTAssertTrue(portableCompiledIn)
+  }
+
+  func test_parseDriverList_portable_not_compiled() throws {
+    let out = """
+    Embedded drivers (compiled into this binary by feature):
+      portable     (not compiled)
+      dummy        (compiled in)
+    """
+    let portableCompiledIn = try PieControlLauncher.parseDriverList(out, pieBinary: pieURL, requested: "portable")
+    XCTAssertFalse(portableCompiledIn)
+  }
+
+  func test_parseDriverList_failsClosed_whenPortableUnmentioned() {
+    // An unexpected/changed CLI format that never names `portable` must
+    // throw, not silently pass — this is the drift-guard.
+    let out = "some totally different output\n  foo (compiled in)\n"
+    XCTAssertThrowsError(
+      try PieControlLauncher.parseDriverList(out, pieBinary: pieURL, requested: "portable")
+    )
+  }
+
+  /// REAL-BINARY contract test: runs the ACTUAL pie binary's `driver
+  /// list` — not a stub — and asserts the subcommand exists and reports
+  /// the portable driver compiled in. Closes the gap a stubbed probe
+  /// leaves: the unit tests fake the probe, so they stay green even if
+  /// the real subcommand is removed/renamed upstream. Env-gated; falls
+  /// back to the installed app; skips if no real binary is available.
+  ///
+  /// Both pipes are drained on background queues and the wait is bounded,
+  /// so a chatty binary can't deadlock on a full pipe buffer and a hung
+  /// binary fails the test rather than hanging the suite.
+  func test_realPie_driverList_subcommand_exists_and_reports_portable() throws {
+    let candidates = [
+      ProcessInfo.processInfo.environment["PIE_TEST_REAL_PIE_BIN"],
+      "/Applications/RatioThink.app/Contents/Resources/pie-engine/pie",
+    ].compactMap { $0 }
+    guard let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+      throw XCTSkip("no real pie binary (set PIE_TEST_REAL_PIE_BIN or install RatioThink.app)")
+    }
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: path)
+    proc.arguments = ["driver", "list"]
+    let out = Pipe(); let err = Pipe()
+    proc.standardOutput = out; proc.standardError = err
+    // Launch the real binary before draining/awaiting. Without this the pipe
+    // reads never reach EOF (no child closes the write ends), the bounded
+    // wait below times out, and terminate() then throws `task not launched`
+    // on a process that was never started.
+    try proc.run()
+
+    // Drain both pipes concurrently (off this thread) so the child can
+    // never block writing to a full pipe while we wait, and bound the
+    // wait so a hung binary can't hang the suite.
+    let outBuf = NSMutableData(); let errBuf = NSMutableData()
+    let lock = NSLock()
+    let group = DispatchGroup()
+    let queue = DispatchQueue.global(qos: .userInitiated)
+    for (pipe, buf) in [(out, outBuf), (err, errBuf)] {
+      group.enter()
+      queue.async {
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        lock.lock(); buf.append(data); lock.unlock()
+        group.leave()
+      }
+    }
+    group.enter()
+    queue.async { proc.waitUntilExit(); group.leave() }
+
+    guard group.wait(timeout: .now() + 10) == .success else {
+      proc.terminate()
+      return XCTFail("`pie driver list` did not finish within 10s — possible hung binary")
+    }
+
+    let stdout = String(data: outBuf as Data, encoding: .utf8) ?? ""
+    let stderr = String(data: errBuf as Data, encoding: .utf8) ?? ""
+    XCTAssertEqual(proc.terminationStatus, 0,
+                   "`pie driver list` must exist + exit 0 (CLI-contract drift guard); stderr: \(stderr)")
+    XCTAssertFalse(stderr.contains("unrecognized subcommand"),
+                   "`pie driver list` subcommand is missing — pie CLI contract drifted: \(stderr)")
+    let portableCompiledIn = try PieControlLauncher.parseDriverList(
+      stdout, pieBinary: URL(fileURLWithPath: path), requested: "portable"
+    )
+    XCTAssertTrue(portableCompiledIn,
+                  "real pie must report the portable driver compiled in; got:\n\(stdout)")
+  }
+
   // MARK: - helpers
 
   private func makeSpec(binary: URL,
@@ -219,19 +322,34 @@ final class PieControlLauncherConfigTests: XCTestCase {
     )
   }
 
-  private func writeCapabilityProbe(portable: Bool, metal: Bool) throws -> URL {
+  /// Emit the `Embedded drivers` section of `pie driver list`, with the
+  /// `portable` driver marked compiled-in or not — the launcher now
+  /// probes `pie driver list`, not the removed `pie capabilities`.
+  private func driverListText(portable: Bool) -> String {
+    let mark = portable ? "(compiled in)" : "(not compiled)"
+    return """
+    Subprocess drivers (Python wheels):
+      dev       python -m pie_driver_dev
+
+    Embedded drivers (compiled into this binary by feature):
+      portable     \(mark)
+      cuda_native  (not compiled)
+      dummy        (compiled in)
+    """
+  }
+
+  private func writeDriverListProbe(portable: Bool) throws -> URL {
     let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-      .appendingPathComponent("pie-capabilities-\(UUID().uuidString.prefix(8))",
+      .appendingPathComponent("pie-driverlist-\(UUID().uuidString.prefix(8))",
                               isDirectory: true)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     let binary = dir.appendingPathComponent("pie", isDirectory: false)
-    let payload = """
-    {"drivers":{"portable":\(portable),"cuda_native":false,"dummy":true},"devices":{"metal":\(metal)}}
-    """
     let script = """
     #!/bin/sh
-    if [ "$1" = "capabilities" ] && [ "$2" = "--json" ]; then
-      printf '%s\\n' '\(payload)'
+    if [ "$1" = "driver" ] && [ "$2" = "list" ]; then
+      cat <<'EOF'
+    \(driverListText(portable: portable))
+    EOF
       exit 0
     fi
     exit 64
@@ -244,7 +362,7 @@ final class PieControlLauncherConfigTests: XCTestCase {
     return binary
   }
 
-  private func writeEnvironmentSensitiveCapabilityProbe(key: String,
+  private func writeEnvironmentSensitiveDriverListProbe(key: String,
                                                         expectedValue: String) throws -> URL {
     let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
       .appendingPathComponent("pie-capabilities-\(UUID().uuidString.prefix(8))",
@@ -253,11 +371,11 @@ final class PieControlLauncherConfigTests: XCTestCase {
     let binary = dir.appendingPathComponent("pie", isDirectory: false)
     let script = """
     #!/bin/sh
-    if [ "$1" = "capabilities" ] && [ "$2" = "--json" ]; then
+    if [ "$1" = "driver" ] && [ "$2" = "list" ]; then
       if [ "${\(key)}" = "\(expectedValue)" ]; then
-        printf '%s\\n' '{"drivers":{"portable":true,"cuda_native":false,"dummy":true},"devices":{"metal":false}}'
+        printf 'Embedded drivers (compiled into this binary by feature):\\n  portable     (compiled in)\\n'
       else
-        printf '%s\\n' '{"drivers":{"portable":false,"cuda_native":false,"dummy":true},"devices":{"metal":false}}'
+        printf 'Embedded drivers (compiled into this binary by feature):\\n  portable     (not compiled)\\n'
       fi
       exit 0
     fi
@@ -271,7 +389,7 @@ final class PieControlLauncherConfigTests: XCTestCase {
     return binary
   }
 
-  private func writeStdoutLeakingCapabilityProbe(childPIDFile: URL) throws -> URL {
+  private func writeStdoutLeakingDriverListProbe(childPIDFile: URL) throws -> URL {
     let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
       .appendingPathComponent("pie-capabilities-\(UUID().uuidString.prefix(8))",
                               isDirectory: true)
@@ -279,10 +397,10 @@ final class PieControlLauncherConfigTests: XCTestCase {
     let binary = dir.appendingPathComponent("pie", isDirectory: false)
     let script = """
     #!/bin/sh
-    if [ "$1" = "capabilities" ] && [ "$2" = "--json" ]; then
+    if [ "$1" = "driver" ] && [ "$2" = "list" ]; then
       ( sleep 30 ) &
       echo $! > '\(childPIDFile.path)'
-      printf '%s\\n' '{"drivers":{"portable":true,"cuda_native":false,"dummy":true},"devices":{"metal":false}}'
+      printf 'Embedded drivers (compiled into this binary by feature):\\n  portable     (compiled in)\\n'
       exit 0
     fi
     exit 64
