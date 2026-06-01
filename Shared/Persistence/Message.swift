@@ -29,6 +29,15 @@ public final class Message {
   /// any JSON export without a custom transformer.
   public var role: String
   public var content: String
+  /// Model thinking-block text (OpenAI `reasoning_content`; Qwen
+  /// `<think>…</think>`), kept OUT of `content` so it never renders in
+  /// the visible answer and is never replayed into request history.
+  /// Streams in alongside `content` via `MessageStreamWriter` and is
+  /// shown in a collapsible "Thinking" section. Empty for turns with no
+  /// reasoning and for non-thinking models. New optional-with-default
+  /// property → SwiftData lightweight migration (existing rows read
+  /// `""`).
+  public var reasoning: String
   /// Token count populated by the engine on finish; 0 while a
   /// streaming turn is in flight.
   public var tokens: Int
@@ -43,6 +52,7 @@ public final class Message {
     chat: Chat? = nil,
     role: String,
     content: String = "",
+    reasoning: String = "",
     tokens: Int = 0,
     ts: Date = Date(),
     meta: Data? = nil
@@ -51,6 +61,7 @@ public final class Message {
     self.chat = chat
     self.role = role
     self.content = content
+    self.reasoning = reasoning
     self.tokens = tokens
     self.ts = ts
     self.meta = meta

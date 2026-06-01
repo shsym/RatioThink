@@ -104,6 +104,8 @@ public final class ChatSendController: ObservableObject {
             writer?.flush()
           case let .delta(_, content):
             writer?.appendDelta(content)
+          case let .reasoningDelta(text):
+            writer?.appendReasoningDelta(text)
           case let .finish(reason):
             writer?.finish(meta: Self.finishMeta(for: reason))
             let reasonValue = Self.finishReasonValue(for: reason)
