@@ -16,6 +16,21 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Outer reap net — belt to the in-process IsolatedTestCase braces.
+# The in-process SIGKILL-reap only fires when the test bundle runs to
+# completion; if `swift test` is killed (XCTest timeout, CI cancel, ^C) a
+# hung `pie serve` and its /tmp pieHome survive. Sweep both on exit.
+# SIGKILL because a wedged engine ignores SIGTERM (a healthy one was
+# already reaped in-process). The pattern targets ONLY this suite's
+# ephemeral pieHomes (/tmp/pe2e-<uuid>, the short sun_path-safe roots
+# RealEngineLaunchE2ETests anchors the engine at) — never the staged
+# model cache (/tmp/pie-e2e-models).
+sweep_stray_engines() {
+  pkill -KILL -f '/tmp/pe2e-[0-9a-f]+/config\.toml' 2>/dev/null || true
+  rm -rf /tmp/pe2e-* 2>/dev/null || true
+}
+trap sweep_stray_engines EXIT
+
 REPO="${PIE_TEST_E2E_REPO:-Qwen/Qwen2.5-0.5B-Instruct-GGUF}"
 FILE="${PIE_TEST_E2E_FILE:-qwen2.5-0.5b-instruct-q4_k_m.gguf}"
 MODELS_DIR="${PIE_TEST_E2E_MODELS_DIR:-/tmp/pie-e2e-models}"
