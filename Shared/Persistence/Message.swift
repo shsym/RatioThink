@@ -34,10 +34,19 @@ public final class Message {
   /// the visible answer and is never replayed into request history.
   /// Streams in alongside `content` via `MessageStreamWriter` and is
   /// shown in a collapsible "Thinking" section. Empty for turns with no
-  /// reasoning and for non-thinking models. New optional-with-default
-  /// property → SwiftData lightweight migration (existing rows read
-  /// `""`).
-  public var reasoning: String
+  /// reasoning and for non-thinking models.
+  ///
+  /// Non-optional `String` carrying an **inline (declaration-site)
+  /// default**. The `= ""` here is what makes the column migratable:
+  /// it gives the stored property a schema-level default so SwiftData
+  /// lightweight migration can backfill existing rows when an older
+  /// on-disk `chats.sqlite` (written before this column existed) is
+  /// reopened with the current schema. An init-parameter default alone
+  /// is NOT enough — without this inline default, opening a pre-existing
+  /// store throws, and `RatioThinkModelContainer.openWithFallback` would
+  /// silently drop to an empty in-memory store, making the user's chat
+  /// history appear gone (the on-disk data is intact, just unopened).
+  public var reasoning: String = ""
   /// Token count populated by the engine on finish; 0 while a
   /// streaming turn is in flight.
   public var tokens: Int
