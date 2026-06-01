@@ -121,6 +121,30 @@ public final class EngineStatusStore: ObservableObject {
     try await client.stopEngine()
   }
 
+  /// #326: kick the helper to (re)start the engine on `profileID` —
+  /// used after a fresh-install model download lands so the engine boots
+  /// with the now-present model. The poll loop surfaces the live
+  /// `.starting` → `.running`/`.failed` transition; this call only needs
+  /// to trigger the start and report a fast refusal.
+  ///
+  /// The helper replies to `startEngine` only AFTER the launch handshake
+  /// (which includes the model load at engine boot), so a slow start
+  /// trips the App-side reply timeout. That is not a failure — the start
+  /// is in flight — so `.replyTimeout` is swallowed. A real helper
+  /// `EngineError` (resolver rejected, still `.modelMissing`, etc.)
+  /// propagates so the UI can surface the reason.
+  public func startEngine(profileID: String) async throws {
+    do {
+      try await client.startEngine(profileID: profileID)
+    } catch let error as AppXPCClientError {
+      if case .replyTimeout = error {
+        Self.log.notice("startEngine(profileID=\(profileID, privacy: .public)) reply timed out — start in flight; status poll will surface the outcome")
+        return
+      }
+      throw error
+    }
+  }
+
   /// Synchronous accessor for `HTTPEngineClient.baseURLProvider`.
   /// Throws `HTTPEngineError.engineNotReady` when the engine is not
   /// `.running` — the discriminator the HTTP client uses to surface

@@ -29,11 +29,12 @@ struct ChatScaffoldView: View {
   /// (no per-chat override, nothing resident). Blocks the send and
   /// offers to load the active profile's default model — never silent.
   @State private var showNoModelPrompt = false
-  /// The active profile's default model, captured at the instant the
-  /// send is blocked (when `selectedProfileID` is settled and the store
-  /// is loaded) rather than at sheet-build time. Drives the prompt's
-  /// Load affordance.
-  @State private var noModelProfileDefault: String?
+  /// The recovery action for the no-model prompt, captured at the
+  /// instant the send is blocked (when `selectedProfileID` is settled
+  /// and the store is loaded) rather than at sheet-build time. #326:
+  /// Load when the default model is on disk, Download when it isn't,
+  /// unavailable otherwise.
+  @State private var noModelAction: MissingModelRecovery.PromptAction = .unavailable
   /// What the toolbar model menu should offer. `.unknown` (→ injected
   /// `availableModels`) only until the first reconcile; afterwards it is
   /// the engine's real served list (`.known`, possibly empty), so a
@@ -91,6 +92,39 @@ struct ChatScaffoldView: View {
     }
   }
 
+  /// Decide and raise the no-model prompt for the chat's selected
+  /// profile. The Load-vs-Download choice turns on whether the profile's
+  /// default model is staged on disk (#326).
+  private func presentNoModelPrompt() {
+    let slug = profileStore.model(forProfileID: viewModel.selectedProfileID)
+    noModelAction = MissingModelRecovery.promptAction(
+      profileDefaultModel: slug,
+      isInstalled: slug.map(Self.isModelInstalled) ?? false)
+    showNoModelPrompt = true
+  }
+
+  /// True when the slug's app-staged model file exists — the engine's
+  /// primary model source. A miss means the prompt offers Download
+  /// instead of Load.
+  static func isModelInstalled(_ slug: String) -> Bool {
+    guard let modelsRoot = try? PieDirs.models() else { return false }
+    let path = LaunchSpecResolver.joinModelPath(modelsRoot: modelsRoot, slug: slug)
+    return FileManager.default.fileExists(atPath: path)
+  }
+
+  /// Kick the helper to (re)start the engine on this chat's profile —
+  /// fire-and-forget; the engine-status poll surfaces the outcome.
+  private func startEngineForSelectedProfile() {
+    let profileID = viewModel.selectedProfileID
+    Task { @MainActor in
+      do {
+        try await engineStatusStore.startEngine(profileID: profileID)
+      } catch {
+        persistenceStatus.report(error, context: "ChatScaffoldView.startEngineAfterDownload")
+      }
+    }
+  }
+
   private func scaffold(for chat: Chat) -> some View {
     VStack(spacing: 0) {
       ContentToolbar(
@@ -109,6 +143,18 @@ struct ChatScaffoldView: View {
         onUnload: unloadModel
       )
       Divider().opacity(0.0001) // structural breather; no visible line per §5
+      // #326 Path 2: surface a swallowed failed(modelMissing) engine
+      // state with an inline download + auto-start, instead of leaving
+      // the user to discover it by failing a send.
+      if let bannerTarget = MissingModelRecovery.bannerTarget(
+        engineStatus: engineStatusStore.status,
+        profileDefaultModel: profileStore.model(forProfileID: viewModel.selectedProfileID)
+      ) {
+        ModelMissingBanner(
+          target: bannerTarget,
+          onDownloaded: { startEngineForSelectedProfile() }
+        )
+      }
       TranscriptView(chat: chat)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
       ComposerView(
@@ -116,19 +162,24 @@ struct ChatScaffoldView: View {
         viewModel: viewModel,
         isSending: sendController.isInFlight,
         shouldAllowSend: { currentModelID() != nil },
-        onSendBlocked: {
-          noModelProfileDefault = profileStore.model(forProfileID: viewModel.selectedProfileID)
-          showNoModelPrompt = true
-        },
+        onSendBlocked: { presentNoModelPrompt() },
         onUserMessageSaved: { _ in sendAssistantTurn(for: chat) }
       )
     }
     .background(Color(nsColor: .windowBackgroundColor))
     .sheet(isPresented: $showNoModelPrompt) {
       NoModelLoadedPrompt(
-        profileDefaultModel: noModelProfileDefault,
+        action: noModelAction,
         onLoad: { model in
           swapCoordinator.loadDirect(modelID: model)
+          showNoModelPrompt = false
+        },
+        onDownloaded: {
+          // Model is now on disk — boot the engine on this chat's
+          // profile so it loads (#326 auto-start). The status poll +
+          // model-load indicator surface the rest; the composer
+          // unblocks once the engine serves the model.
+          startEngineForSelectedProfile()
           showNoModelPrompt = false
         },
         onChooseAnother: { showNoModelPrompt = false },
@@ -216,8 +267,7 @@ struct ChatScaffoldView: View {
     // passed, but never ask the engine to load a model the user did not
     // choose ( invariant).
     guard let modelID = currentModelID() else {
-      noModelProfileDefault = profileStore.model(forProfileID: viewModel.selectedProfileID)
-      showNoModelPrompt = true
+      presentNoModelPrompt()
       return
     }
     sendController.send(
