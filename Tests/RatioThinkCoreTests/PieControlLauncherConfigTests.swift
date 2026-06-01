@@ -261,6 +261,11 @@ final class PieControlLauncherConfigTests: XCTestCase {
     proc.arguments = ["driver", "list"]
     let out = Pipe(); let err = Pipe()
     proc.standardOutput = out; proc.standardError = err
+    // Launch the real binary before draining/awaiting. Without this the pipe
+    // reads never reach EOF (no child closes the write ends), the bounded
+    // wait below times out, and terminate() then throws `task not launched`
+    // on a process that was never started.
+    try proc.run()
 
     // Drain both pipes concurrently (off this thread) so the child can
     // never block writing to a full pipe while we wait, and bound the
