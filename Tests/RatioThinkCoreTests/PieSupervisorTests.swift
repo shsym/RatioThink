@@ -1021,6 +1021,12 @@ private final class FakeProcess: Process, @unchecked Sendable {
     set { _terminationHandler = newValue }
   }
   override var processIdentifier: Int32 { 0 }
-  override var isRunning: Bool { false }
+  // Models an engine that is alive but silent (never prints the
+  // handshake) and refuses SIGKILL — the `.killRejected` scenario these
+  // tests drive. The supervisor's handshake-timeout handler consults
+  // `isRunning` to distinguish a still-running silent engine from an
+  // early-exited one, so this must report `true`; a no-op `run()` means
+  // there is no real child to ever flip it false.
+  override var isRunning: Bool { true }
   override func run() throws {}
 }

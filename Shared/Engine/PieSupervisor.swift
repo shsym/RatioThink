@@ -648,6 +648,23 @@ public final class PieSupervisor: @unchecked Sendable {
     timer.setEventHandler { [weak self, weak inc] in
       guard let self, let inc, !inc.handshakeFound else { return }
       guard self.current?.id == inc.id else { return }
+      // A process that has already exited before the handshake is an
+      // early-exit / spawn failure (it carries an exit code), NOT a
+      // handshake timeout — which specifically means "process alive
+      // but silent". Its `terminationHandler` is guaranteed to fire
+      // and `handleTermination` classifies it via the exit code as
+      // `.spawnFailed`. Defer to that path rather than racing it to a
+      // less precise label: under load the timer event can run before
+      // the (starved) termination callback, and `finishSpawnFailure`
+      // would otherwise stamp `.handshakeTimeout`, which the
+      // `.failed` priorState guard in `handleTermination` then refuses
+      // to correct. Keying on `Process.isRunning` (Foundation `wait4`
+      // truth for THIS child, flips false on reap) makes the
+      // classification deterministic regardless of which event wins.
+      guard inc.process.isRunning else {
+        Log.engine.debug("PieSupervisor: handshake timer fired but process pid=\(inc.process.processIdentifier, privacy: .public) already exited; deferring to termination path for spawn-failure classification")
+        return
+      }
       Log.engine.error("PieSupervisor: handshake timeout after \(self.policy.handshakeTimeout, privacy: .public)s")
       let killed = self.killProcess(inc.process)
       // Review v2 F31: surface SIGKILL failure precisely. Without
