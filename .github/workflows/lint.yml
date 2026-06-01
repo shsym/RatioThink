@@ -71,7 +71,23 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Resolve pinned pie submodule SHA
+        id: piesha
+        run: echo "sha=$(git rev-parse HEAD:Vendor/pie)" >> "$GITHUB_OUTPUT"
+
+      # Cache the built engine keyed on the EXACT pinned pie SHA + the build
+      # script hash. No restore-keys: a fuzzy prefix match could restore a
+      # different pie's binary and the contract would silently test a stale
+      # engine (false green). Exact-match-or-rebuild only.
+      - name: Restore cached pie engine
+        id: piecache
+        uses: actions/cache@v4
+        with:
+          path: build/pie-engine/arm64
+          key: pie-engine-${{ runner.os }}-${{ runner.arch }}-${{ steps.piesha.outputs.sha }}-${{ hashFiles('Scripts/build-pie-engine.sh') }}
+
       - name: Build pie engine
+        if: steps.piecache.outputs.cache-hit != 'true'
         run: Scripts/build-pie-engine.sh --arch arm64
 
       - name: Run real-binary driver-list contract test
@@ -94,11 +110,11 @@ jobs:
           fi
           # `--filter` matching zero tests exits 0 (renamed/moved test) —
           # require a real 'Executed N>=1 ... 0 failures' line.
-          if ! grep -Eq 'Executed [1-9][0-9]* tests, with 0 failures' contract.out; then
+          if ! grep -Eq 'Executed [1-9][0-9]* tests?, with 0 failures' contract.out; then
             echo "FAIL: expected 'Executed N tests, with 0 failures' (N>=1) — filter matched zero tests?"
             exit 1
           fi
-          echo "real-pie-contract: $(grep -E 'Executed [0-9]+ tests' contract.out | tail -1)"
+          echo "real-pie-contract: $(grep -E 'Executed [0-9]+ tests?' contract.out | tail -1)"
 
   unit-and-scenario-tests:
     # Runs the SPM test bundles. Exercises the production env-fallback
