@@ -372,5 +372,9 @@ private struct PinnedRunningXPCClient: AppXPCClient {
   let port: EnginePort
   func engineStatus() async throws -> EngineStatus { .running(port: port, profileID: "chat") }
   func stopEngine() async throws {}
+  // The pinned harness has no Helper to launch an engine; the engine is
+  // already pinned `.running`, so a start is a no-op success (mirrors
+  // `stopEngine`).
+  func startEngine(profileID: String) async throws {}
 }
 #endif
