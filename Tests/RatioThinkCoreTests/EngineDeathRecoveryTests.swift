@@ -425,6 +425,57 @@ final class EngineDeathRecoveryTests: XCTestCase {
                    "the retried turn must produce real generated content, not a placeholder")
   }
 
+  // MARK: - 7. Engine-gone retry must reset the durable reasoning field
+
+  func test_engineGone_retry_resets_reasoning_no_fusion_across_attempts() async throws {
+    // Regression: the retry-reset block clears `content`/`meta` but the
+    // durable `reasoning` field must reset too. Attempt 1 streams a
+    // reasoning delta and FLUSHES it durably (a `model_ready` frame
+    // forces the writer's durability boundary) before the engine dies;
+    // attempt 2 streams its own reasoning. After auto-recovery,
+    // `assistant.reasoning` must hold ONLY attempt-2's text — never
+    // attempt-1 + attempt-2 fused (the same data-loss class as a stale
+    // reasoning carry-over).
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ReasoningRetryEngine(
+      firstAttemptEvents: [
+        .reasoningDelta("attempt-1 thinking"),
+        .modelReady, // forces flush → "attempt-1 thinking" committed durably
+      ],
+      firstError: HTTPEngineError.engineGone(detail: "synthetic engine death"),
+      successEvents: [
+        .reasoningDelta("attempt-2 thinking"),
+        .delta(role: .assistant, content: "ack"),
+        .finish(reason: .stop),
+      ]
+    )
+    let gate = ScriptedRecoveryGate(initialGone: true, willRecover: true)
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1"),
+      recoveryGate: gate
+    )
+
+    try await waitUntil("retry stream completes") { !controller.isInFlight }
+    let assistant = chat.messages.first { $0.role == "assistant" }
+    XCTAssertEqual(assistant?.content, "ack",
+                   "the retried turn must produce the retry's content")
+    XCTAssertEqual(assistant?.reasoning, "attempt-2 thinking",
+                   "retry-reset must discard attempt-1 reasoning; the recovered turn's reasoning must not fuse across attempts")
+  }
+
   // MARK: - helpers
 
   private func makeSpec(profileID: String = "chat") -> PieControlLauncher.LaunchSpec {
@@ -512,6 +563,50 @@ private final class ProbingChatEngine: EngineClient, @unchecked Sendable {
         continuation.finish(throwing: error)
       } else {
         if let probe { probe() }
+        for event in events { continuation.yield(event) }
+        continuation.finish()
+      }
+    }
+  }
+  func dispatchInferlet(_ req: InferletRequest) -> AsyncThrowingStream<Data, Error> {
+    AsyncThrowingStream { $0.finish() }
+  }
+}
+
+/// Engine fake for the reasoning-reset regression: attempt 1 streams
+/// `firstAttemptEvents` (so a reasoning delta can be flushed durably)
+/// then throws `firstError`; every later attempt streams
+/// `successEvents` cleanly. Distinct from `ProbingChatEngine`, which
+/// throws on attempt 1 with no prior frames.
+@available(macOS 14, *)
+private final class ReasoningRetryEngine: EngineClient, @unchecked Sendable {
+  let firstAttemptEvents: [ChatEvent]
+  let firstError: Error
+  let successEvents: [ChatEvent]
+  private(set) var callCount = 0
+
+  init(firstAttemptEvents: [ChatEvent], firstError: Error, successEvents: [ChatEvent]) {
+    self.firstAttemptEvents = firstAttemptEvents
+    self.firstError = firstError
+    self.successEvents = successEvents
+  }
+
+  func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
+  func models() async throws -> [ModelInfo] { [] }
+  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
+    AsyncThrowingStream { $0.finish() }
+  }
+  func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
+    callCount += 1
+    let isFirst = (callCount == 1)
+    let firstEvents = firstAttemptEvents
+    let error = firstError
+    let events = successEvents
+    return AsyncThrowingStream { continuation in
+      if isFirst {
+        for event in firstEvents { continuation.yield(event) }
+        continuation.finish(throwing: error)
+      } else {
         for event in events { continuation.yield(event) }
         continuation.finish()
       }
