@@ -83,58 +83,6 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
     XCTAssertFalse(HelperRegistrationReconciler.isTestLaunch(["PIE_TEST_FIRST_LAUNCH_COMPLETED": "0"]))
   }
 
-  // MARK: - PIE_TEST_ENGINE_BASE_URL marker is build-gated
-
-  /// The engine-bypass marker must NOT flag a test launch in a shipped
-  /// Release build (non-DEBUG, no PIE_TEST_MODE) — otherwise a stray
-  /// `PIE_TEST_ENGINE_BASE_URL` would skip the launchd self-heal
-  /// reconcile, the half-gating left behind. Mirrors
-  /// `RatioThinkApp.isEngineBaseURLOverrideAllowed` ignoring the var in Release.
-  func test_isTestLaunch_engineBaseURL_ignoredInReleaseBuild() {
-    XCTAssertFalse(
-      HelperRegistrationReconciler.isTestLaunch(
-        ["PIE_TEST_ENGINE_BASE_URL": "http://127.0.0.1:9"],
-        isDebugBuild: false),
-      "a Release launch with only PIE_TEST_ENGINE_BASE_URL must still reconcile")
-  }
-
-  /// An explicit harness (`PIE_TEST_MODE=1`) keeps the marker live even
-  /// in a Release build, so a packaged-binary base-URL scenario still
-  /// skips the real SMAppService mutation.
-  func test_isTestLaunch_engineBaseURL_honoredUnderTestModeEvenInRelease() {
-    XCTAssertTrue(
-      HelperRegistrationReconciler.isTestLaunch(
-        ["PIE_TEST_ENGINE_BASE_URL": "http://127.0.0.1:9",
-         "PIE_TEST_MODE": "1"],
-        isDebugBuild: false),
-      "PIE_TEST_MODE=1 is an explicit harness — the marker counts regardless of build")
-  }
-
-  /// A DEBUG build still treats the marker as a test launch (the GUI
-  /// base-URL suites compile DEBUG and rely on this).
-  func test_isTestLaunch_engineBaseURL_honoredInDebugBuild() {
-    XCTAssertTrue(
-      HelperRegistrationReconciler.isTestLaunch(
-        ["PIE_TEST_ENGINE_BASE_URL": "http://127.0.0.1:9"],
-        isDebugBuild: true),
-      "DEBUG builds must keep skipping the reconcile for the base-URL suites")
-  }
-
-  /// Gating is scoped to `PIE_TEST_ENGINE_BASE_URL` only: the other
-  /// test-only markers are unchanged and still flag a test launch
-  /// regardless of build (they have no production-gated sibling).
-  func test_isTestLaunch_otherMarkers_unaffectedByBuildGate() {
-    XCTAssertTrue(
-      HelperRegistrationReconciler.isTestLaunch(
-        ["PIE_APP_PREFERENCES_SUITE": "test.suite"], isDebugBuild: false))
-    XCTAssertTrue(
-      HelperRegistrationReconciler.isTestLaunch(
-        ["PIE_TEST_SKIP_HELPER_RECONCILE": "1"], isDebugBuild: false))
-    XCTAssertTrue(
-      HelperRegistrationReconciler.isTestLaunch(
-        ["PIE_TEST_LOGIN_ITEM_STATUS": "enabled"], isDebugBuild: false))
-  }
-
   func test_healthyHelper_isLeftUntouched() async {
     let h = Harness(probeResults: [true], state: .enabled)
     let outcome = await h.makeReconciler().reconcile()

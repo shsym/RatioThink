@@ -5,8 +5,23 @@ import XCTest
 /// raise the no-model confirm instead of silently loading a model. This
 /// is engine-free: the gate fires before any engine contact.
 final class S286_NoModelSendGateGUITests: XCTestCase {
+  private var tempHomes: [String] = []
+
   override func setUp() async throws {
     try guardSeatedGUI()
+  }
+
+  // Best-effort only: the XCUITest runner is app-sandboxed and cannot delete
+  // the real /tmp home (removeItem is silently denied), so the authoritative
+  // cleanup is the `GUI_TMP_HOMES` sweep in the GUI Make recipes, which runs
+  // non-sandboxed after xcodebuild exits. This block still helps any future
+  // non-sandboxed runner. Matches sibling S285.
+  override func tearDown() {
+    for home in tempHomes {
+      try? FileManager.default.removeItem(atPath: home)
+    }
+    tempHomes.removeAll()
+    super.tearDown()
   }
 
   @MainActor
@@ -15,8 +30,10 @@ final class S286_NoModelSendGateGUITests: XCTestCase {
     // sandboxed XCUITest runner the latter resolves to the runner's
     // container, which the (non-sandboxed) app cannot write to — its
     // ProfileStore would fail to seed and the profile default would not
-    // resolve.
+    // resolve. Tracked in tempHomes for best-effort tearDown; the real
+    // cleanup is the GUI_TMP_HOMES sweep in the Make recipe (see tearDown).
     let pieHome = "/tmp/pie-s286gate-" + UUID().uuidString
+    tempHomes.append(pieHome)
 
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
     app.launchArguments.append(contentsOf: [

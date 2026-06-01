@@ -179,25 +179,13 @@ struct RatioThinkApp: App {
   /// `HelperXPCListener.isAnonymousModeAllowed` for the
   /// `PIE_ALLOW_UNSIGNED_CALLERS` bypass.
   private static func chatTestEngineBaseURL() -> URL? {
-    guard let raw = ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_BASE_URL"],
-          !raw.isEmpty else { return nil }
-    guard isEngineBaseURLOverrideAllowed() else {
-      NSLog("PIE_TEST_ENGINE_BASE_URL ignored: a release build uses the real Helper→engine path, not a base-URL bypass")
-      return nil
-    }
+    // Gated through HelperConfig so a Release build ignores the override
+    // entirely — the engine-client redirection and the DEBUG status pin both
+    // key off this result, so a non-debug app falls back to the real
+    // Helper-driven engine path (`HelperXPCClient()`) and never honors the
+    // `PIE_TEST_ENGINE_BASE_URL` seam.
+    guard let raw = HelperConfig.testEngineBaseURLOverride() else { return nil }
     return URL(string: raw)
-  }
-
-  /// Whether the `PIE_TEST_ENGINE_BASE_URL` engine-client override is
-  /// permitted. Test harness (`PIE_TEST_MODE=1`) or DEBUG only; never a
-  /// production Release build. Internal (not private) so the gate is
-  /// unit-testable via `@testable import RatioThink`. Delegates to the
-  /// shared `HelperConfig.isTestOverrideAllowed` so this consumer and
-  /// `HelperRegistrationReconciler.isTestLaunch` agree on one predicate.
-  static func isEngineBaseURLOverrideAllowed(
-    environment: [String: String] = ProcessInfo.processInfo.environment
-  ) -> Bool {
-    HelperConfig.isTestOverrideAllowed(environment: environment)
   }
 
   private static func appPreferencesDefaults() -> UserDefaults {

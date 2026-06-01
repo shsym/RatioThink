@@ -73,43 +73,6 @@ public enum HelperConfig {
     return value
   }
 
-  /// True iff this binary was compiled with the DEBUG flag. Captured
-  /// here so the policy in `isTestOverrideAllowed` stays a pure function
-  /// of its inputs: the `#if DEBUG` compile gate can't be exercised from
-  /// a DEBUG test build, so tests inject this seam instead.
-  public static var isDebugBuild: Bool {
-    #if DEBUG
-    return true
-    #else
-    return false
-    #endif
-  }
-
-  /// Single source of truth for "may a test-only override take effect in
-  /// THIS build?" — an explicit test harness (`PIE_TEST_MODE=1`) OR a
-  /// DEBUG build. A shipped Release binary returns false, so a stray test
-  /// env knob is inert in production.
-  ///
-  /// Shared by the two consumers of `PIE_TEST_ENGINE_BASE_URL` so they
-  /// agree: `RatioThinkApp.isEngineBaseURLOverrideAllowed` (the engine-client
-  /// redirect) and `HelperRegistrationReconciler.isTestLaunch` (the
-  /// launchd reconcile-skip marker). Without this gate the latter keyed on
-  /// the var's mere presence in every build, so a Release launch with it
-  /// set skipped the self-heal reconcile while the former correctly
-  /// ignored it — half-gated.
-  ///
-  /// Pure in its arguments: reads only the injected `environment` (never
-  /// process env or the task-local overrides that `isTestMode` consults)
-  /// and takes `isDebugBuild` as a seam, so every caller's Release branch
-  /// is unit-testable.
-  public static func isTestOverrideAllowed(
-    environment: [String: String],
-    isDebugBuild: Bool = HelperConfig.isDebugBuild
-  ) -> Bool {
-    if environment[testModeEnvVar] == "1" { return true }
-    return isDebugBuild
-  }
-
   /// Single greppable choke point for any helper code path that would
   /// touch system-wide state (login items, keychain, IOPM assertions,
   /// global mach service binding, etc). Call BEFORE performing the
@@ -132,6 +95,48 @@ public enum HelperConfig {
   /// dict lookups + a switch.
   public static func assertStartupContract() {
     validateContract()
+  }
+
+  // MARK: - Test-override build gate
+
+  /// Compiled build configuration. Gates the engine-base-URL test seam (see
+  /// `testEngineBaseURLOverride`): a Release build ignores it so a shipped,
+  /// signed app never redirects its engine endpoint to an attacker-supplied
+  /// URL; a DEBUG build — including the `xcodebuild test` runner — honors it.
+  /// NOTE: this gate currently covers ONLY that seam. Other App-side
+  /// `PIE_TEST_*` reads (prefs suite, first-launch flag, fake/fixture
+  /// downloads, artifact-path probe) still read the env directly and stay
+  /// live in Release; routing them through this gate is a separate follow-up.
+  #if DEBUG
+  public static let defaultIsDebugBuild = true
+  #else
+  public static let defaultIsDebugBuild = false
+  #endif
+
+  /// Injectable seam so the Release branch is exercisable from a DEBUG test
+  /// process. `nil` ⇒ use the compiled `defaultIsDebugBuild`.
+  @TaskLocal public static var isDebugBuildOverride: Bool?
+
+  /// Effective build configuration (override-aware).
+  public static var isDebugBuild: Bool { isDebugBuildOverride ?? defaultIsDebugBuild }
+
+  /// Whether the engine-base-URL test seam may activate. `false` in Release.
+  /// (The only `PIE_TEST_*` seam currently gated — see `defaultIsDebugBuild`.)
+  public static var isTestOverrideAllowed: Bool { isDebugBuild }
+
+  /// Resolve the `PIE_TEST_ENGINE_BASE_URL` test seam — honored only when test
+  /// overrides are allowed. A Release build returns `nil` regardless of the
+  /// env var, so the App falls back to the real Helper-driven engine path
+  /// instead of an attacker-supplied loopback. Pure + parameterized so the
+  /// gate is unit-testable.
+  public static func testEngineBaseURLOverride(
+    env: [String: String] = ProcessInfo.processInfo.environment,
+    allowed: Bool = isTestOverrideAllowed
+  ) -> String? {
+    guard allowed, let raw = env["PIE_TEST_ENGINE_BASE_URL"], !raw.isEmpty else {
+      return nil
+    }
+    return raw
   }
 
   // MARK: - internals

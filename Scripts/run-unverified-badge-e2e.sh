@@ -27,7 +27,8 @@ if ! pgrep -x Dock >/dev/null 2>&1; then
   exit 2
 fi
 if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "unverified-badge: grant Automation/Accessibility, then rerun with PIE_TEST_TCC_GRANTED=1." >&2
+  echo "unverified-badge: grant Automation + Accessibility to the test runner in System Settings," >&2
+  echo "unverified-badge: then rerun →  PIE_TEST_TCC_GRANTED=1 Scripts/run-unverified-badge-e2e.sh" >&2
   exit 2
 fi
 

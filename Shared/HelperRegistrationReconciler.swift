@@ -83,31 +83,16 @@ public struct HelperRegistrationReconciler: Sendable {
   /// `SMAppService.unregister()/register()` there would mutate the
   /// developer/CI machine's actual background-item registration (F1).
   ///
-  /// Most markers are test-only env knobs a shipped app never carries,
-  /// so their mere presence means "test launch, no system side effects":
-  /// the registration stub (`PIE_TEST_LOGIN_ITEM_STATUS`), the
-  /// isolated-prefs suite (`PIE_APP_PREFERENCES_SUITE`, set by every GUI
-  /// test), fake downloads (`PIE_TEST_FAKE_DOWNLOADS`), the
-  /// completed-first-launch seam (`PIE_TEST_FIRST_LAUNCH_COMPLETED`) and
-  /// an explicit opt-out (`PIE_TEST_SKIP_HELPER_RECONCILE`).
-  ///
-  /// The in-harness engine bypass (`PIE_TEST_ENGINE_BASE_URL`) is the
-  /// exception: it counts only where it can actually take effect — gated
-  /// through `HelperConfig.isTestOverrideAllowed` exactly like
-  /// `RatioThinkApp.isEngineBaseURLOverrideAllowed`, the other consumer of
-  /// that var. So a shipped Release app launched with a stray
-  /// `PIE_TEST_ENGINE_BASE_URL` still runs the real launchd self-heal
-  /// reconcile rather than silently skipping it. `isDebugBuild` is
-  /// injected so the Release branch is unit-testable.
-  public static func isTestLaunch(
-    _ env: [String: String],
-    isDebugBuild: Bool = HelperConfig.isDebugBuild
-  ) -> Bool {
-    if (env["PIE_TEST_ENGINE_BASE_URL"] ?? "").isEmpty == false,
-       HelperConfig.isTestOverrideAllowed(environment: env, isDebugBuild: isDebugBuild) {
-      return true
-    }
+  /// Any of these env markers means "test launch, no system side
+  /// effects": the model/registration stubs (`PIE_TEST_LOGIN_ITEM_STATUS`),
+  /// the in-harness engine bypass (`PIE_TEST_ENGINE_BASE_URL`), fake
+  /// downloads, the GUI harness's completed-first-launch seam
+  /// (`PIE_TEST_FIRST_LAUNCH_COMPLETED`) and isolated-prefs suite
+  /// (`PIE_APP_PREFERENCES_SUITE`, set by every GUI test), plus an
+  /// explicit opt-out (`PIE_TEST_SKIP_HELPER_RECONCILE`).
+  public static func isTestLaunch(_ env: [String: String]) -> Bool {
     let present = ["PIE_TEST_LOGIN_ITEM_STATUS",
+                   "PIE_TEST_ENGINE_BASE_URL",
                    "PIE_APP_PREFERENCES_SUITE"]
     if present.contains(where: { (env[$0] ?? "").isEmpty == false }) { return true }
     let flags = ["PIE_TEST_FAKE_DOWNLOADS",

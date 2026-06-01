@@ -25,10 +25,14 @@ enum EngineHarness {
 
     //  full-chain mode: serve a portable app-staged GGUF (the path
     // the Settings downloader wrote into a shared PIE_HOME/models)
-    // instead of resolving an HF-cached model. Slug is `<repo>/<file>`;
-    // `.portable` registers it under the model name "default", so the
-    // load targets "default". Both env vars unset keeps the original
-    // `.metal` behavior used by  (this harness is shared).
+    // instead of resolving an HF-cached model. Slug is `<repo>/<file>`.
+    // `.portable` registers the model under the SLUG as its served id
+    // (`PieControlLauncher.renderPortableModel` writes `name = modelSlug`),
+    // matching production's `.portableResolved(servedModelID: profile.model)`
+    // — so both the `/v1/models` id and the load target are the slug, NOT
+    // "default" (loading "default" fails `model_not_found`). The App then
+    // renders the menu label as `ModelDisplayName.leaf(slug)`. Both env vars
+    // unset keeps the original `.metal` behavior (this harness is shared).
     let modelConfig: PieControlLauncher.ModelConfig
     let loadTarget: String
     if let slug = env["PIE_TEST_HARNESS_MODEL_SLUG"], !slug.isEmpty,
@@ -36,7 +40,7 @@ enum EngineHarness {
       modelConfig = .portable(
         modelSlug: slug,
         modelsRoot: URL(fileURLWithPath: rootPath, isDirectory: true))
-      loadTarget = "default"
+      loadTarget = slug
       print("chat-engine-harness: portable app-staged model slug=\(slug) modelsRoot=\(rootPath)")
     } else {
       modelConfig = .metal(modelID: model)
