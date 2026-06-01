@@ -95,6 +95,12 @@ public final class ChatSendController: ObservableObject {
       // writer so the user does not have to re-click Send. Surfaces the
       // error only after the retry also fails (or no gate was wired).
       var attemptsRemaining = max(1, recoveryPolicy.maxAttempts)
+      // Set once the stream delivers its terminal `.finish` chunk. A
+      // transport throw AFTER `.finish` but before the `[DONE]` sentinel
+      // (engine dies in that window) must NOT be treated as a retryable
+      // engine-gone fault — the answer is already persisted; retrying would
+      // discard a correct, finished turn.
+      var didFinish = false
       streamLoop: while attemptsRemaining > 0 {
         attemptsRemaining -= 1
         do {
@@ -119,6 +125,7 @@ public final class ChatSendController: ObservableObject {
               writer?.appendReasoningDelta(text)
             case let .finish(reason):
               writer?.finish(meta: Self.finishMeta(for: reason))
+              didFinish = true
               let reasonValue = Self.finishReasonValue(for: reason)
               Diag.app.event(reasonValue == "length" ? "chat.truncated" : "chat.stream_end",
                              [("reason", reasonValue)])
@@ -134,6 +141,13 @@ public final class ChatSendController: ObservableObject {
           writer?.cancel()
           return
         } catch {
+          // A throw AFTER the terminal `.finish` chunk (engine died between
+          // `.finish` and the `[DONE]` sentinel) is not a lost turn — the
+          // answer is already persisted and the active* fields nilled. Treat
+          // as terminal: do not retry/reset (would discard a correct answer)
+          // and do not markAssistant (would overwrite it with the engine-gone
+          // warning). The writer already finished, so no cleanup is needed.
+          if didFinish { return }
           guard self.generation == myGeneration, !Task.isCancelled else {
             writer?.cancel()
             return
@@ -147,6 +161,13 @@ public final class ChatSendController: ObservableObject {
                 isEngineGoneFault,
                 let gate = recoveryGate else {
             writer?.cancel()
+            // Re-check generation after the `await classifyEngineGone`
+            // suspension. A cancel()/supersede during it bumps `generation`
+            // and `recordCancelledAssistant` may have already DELETED this
+            // (empty) assistant row; markAssistant would then write + save
+            // onto a deleted Message and crash SwiftData. Mirror the
+            // recovered-path guard below.
+            guard self.generation == myGeneration, !Task.isCancelled else { return }
             Self.markAssistant(assistant, failedWith: error, context: context, persistenceStatus: persistenceStatus)
             return
           }
@@ -158,6 +179,13 @@ public final class ChatSendController: ObservableObject {
           let recovered = await gate.waitUntilRunning(timeout: recoveryPolicy.waitForReadyTimeout)
           guard recovered else {
             writer?.cancel()
+            // Re-check generation after the `await waitUntilRunning`
+            // suspension. `waitUntilRunning` returns false on cancellation,
+            // so a turn superseded during the recovery wait lands here; the
+            // same write-after-delete crash applies. Without this guard the
+            // stale task writes onto a row `recordCancelledAssistant` already
+            // deleted.
+            guard self.generation == myGeneration, !Task.isCancelled else { return }
             Self.markAssistant(assistant, failedWith: error, context: context, persistenceStatus: persistenceStatus)
             return
           }

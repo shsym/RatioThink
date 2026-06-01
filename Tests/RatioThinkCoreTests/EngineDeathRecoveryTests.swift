@@ -476,6 +476,152 @@ final class EngineDeathRecoveryTests: XCTestCase {
                    "retry-reset must discard attempt-1 reasoning; the recovered turn's reasoning must not fuse across attempts")
   }
 
+  // MARK: - 8. Recovery-failure branch surfaces the error (no hang)
+
+  func test_recoveryFails_surfacesEngineGoneMarker_doesNotHang() async throws {
+    // gate reports engine-gone but never recovers → the retry path falls
+    // through to markAssistant on the LIVE row (generation unchanged, no
+    // cancel), surfaces the engine-gone marker, and settles isInFlight.
+    // Exercises the `guard recovered else { … }` branch with the post-await
+    // generation guard PASSING.
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ProbingChatEngine(
+      firstError: HTTPEngineError.engineGone(detail: "synthetic engine death"),
+      successEvents: []   // recovery never happens, so this is never streamed
+    )
+    let gate = ScriptedRecoveryGate(initialGone: true, willRecover: false)
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1"),
+      recoveryGate: gate
+    )
+
+    try await waitUntil("controller settles after failed recovery") { !controller.isInFlight }
+    let assistant = chat.messages.first { $0.role == "assistant" }
+    XCTAssertNotNil(assistant, "the assistant row must remain (it was never cancelled/deleted)")
+    XCTAssertTrue(assistant?.content.hasPrefix("⚠️") ?? false,
+                  "failed recovery must surface the engine-gone marker, got: \(assistant?.content ?? "nil")")
+    XCTAssertTrue(assistant?.content.contains("Engine stopped unexpectedly") ?? false,
+                  "the surfaced error must be the engine-gone description")
+  }
+
+  // MARK: - 9. No recovery gate wired → engineGone surfaces, no hang
+
+  func test_noRecoveryGate_engineGoneFirst_surfaces_doesNotHang() async throws {
+    // With no gate the fault cannot be ridden through recovery; the
+    // first-pass throw must surface immediately on the live row and the
+    // controller must settle (not park on a recovery wait). Exercises the
+    // `guard attemptsRemaining > 0, isEngineGoneFault, let gate else { … }`
+    // branch with the post-await generation guard PASSING.
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ProbingChatEngine(
+      firstError: HTTPEngineError.engineGone(detail: "synthetic engine death"),
+      successEvents: []
+    )
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1"),
+      recoveryGate: nil
+    )
+
+    try await waitUntil("controller settles with no gate") { !controller.isInFlight }
+    let assistant = chat.messages.first { $0.role == "assistant" }
+    XCTAssertNotNil(assistant)
+    XCTAssertTrue(assistant?.content.hasPrefix("⚠️") ?? false,
+                  "no-gate engineGone must surface the error marker, got: \(assistant?.content ?? "nil")")
+    XCTAssertEqual(engine.callCount, 1, "with no gate there must be no retry attempt")
+  }
+
+  // MARK: - 10. Cancel during the recovery wait must not resurrect a deleted row
+
+  func test_cancelDuringRecoveryWait_doesNotResurrectDeletedRow() async throws {
+    // Reproduces the write-after-delete: attempt 1 throws engineGone, the
+    // task parks in waitUntilRunning, then cancel() bumps generation and
+    // recordCancelledAssistant DELETES the empty assistant row. When the
+    // wait returns false (cancellation), the post-await generation guard
+    // must abort BEFORE markAssistant — otherwise it writes + saves onto a
+    // deleted Message (SwiftData crash / resurrected warning row).
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let entered = OSAllocatedUnfairLock<Bool>(initialState: false)
+    let gate = ParkingRecoveryGate(onEntered: { entered.withLock { $0 = true } })
+    let engine = ProbingChatEngine(
+      firstError: HTTPEngineError.engineGone(detail: "synthetic engine death"),
+      successEvents: []
+    )
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1"),
+      recoveryGate: gate,
+      recoveryPolicy: ChatRecoveryPolicy(maxAttempts: 2, waitForReadyTimeout: 30)
+    )
+
+    // Park reached: attempt 1 threw, classified engine-gone, now waiting.
+    try await waitUntil("recovery wait entered") { entered.withLock { $0 } }
+    // Capture the row REFERENCE: markAssistant mutates this exact object, so
+    // asserting against it (not via chat.messages, which the delete already
+    // pruned) is what gives the regression teeth.
+    let parked = try XCTUnwrap(chat.messages.first { $0.role == "assistant" },
+                               "assistant row must exist while parked")
+    XCTAssertTrue(parked.content.isEmpty, "row is empty before cancel (no content streamed)")
+
+    // Cancel mid-wait → bumps generation, deletes the empty row.
+    controller.cancel()
+    XCTAssertFalse(controller.isInFlight, "cancel() settles isInFlight synchronously")
+
+    // Let the parked task observe cancellation, return false, and hit the
+    // post-await generation guard (which must abort without marking).
+    try await Task.sleep(nanoseconds: 200_000_000)
+
+    // F1 core assertion: the post-await generation guard must abort BEFORE
+    // markAssistant. markAssistant mutates THIS captured Message reference
+    // (sets content to the ⚠️ marker) and saves it — onto a row
+    // recordCancelledAssistant already deleted. Asserting the captured row
+    // never gained the marker proves the stale task did not write after the
+    // delete (on an on-disk store that errant write is the latent crash).
+    XCTAssertTrue(parked.content.isEmpty,
+                  "F1: the deleted row's content must stay empty (markAssistant must not run), got: \(parked.content)")
+    XCTAssertFalse(parked.content.contains("⚠️"),
+                   "F1: markAssistant wrote the engine-gone warning onto the deleted row")
+    XCTAssertFalse(chat.messages.contains { $0.content.contains("⚠️") },
+                   "F1: no engine-gone warning may surface in the live transcript")
+  }
+
   // MARK: - helpers
 
   private func makeSpec(profileID: String = "chat") -> PieControlLauncher.LaunchSpec {
@@ -632,6 +778,27 @@ private final class ScriptedRecoveryGate: ChatRecoveryGate {
     if willRecover {
       goneFlag = false
       return true
+    }
+    return false
+  }
+}
+
+/// Recovery gate whose `waitUntilRunning` PARKS until the surrounding task
+/// is cancelled, then returns false — mirroring the production gate's
+/// cancellation-aware return. Lets a test interleave a `cancel()` while the
+/// controller is suspended in the recovery wait: the exact window the F1
+/// write-after-delete guard protects.
+@available(macOS 14, *)
+@MainActor
+private final class ParkingRecoveryGate: ChatRecoveryGate {
+  private let onEntered: () -> Void
+  init(onEntered: @escaping () -> Void) { self.onEntered = onEntered }
+  var isEngineGone: Bool { true }
+  func refreshStatus() async {}
+  func waitUntilRunning(timeout: TimeInterval) async -> Bool {
+    onEntered()
+    while !Task.isCancelled {
+      try? await Task.sleep(nanoseconds: 5_000_000)
     }
     return false
   }
