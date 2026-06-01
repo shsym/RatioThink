@@ -180,11 +180,6 @@ public enum PieControlLauncher {
     }
   }
 
-  private struct BinaryCapabilities {
-    var portable: Bool
-    var metal: Bool
-  }
-
   private static func validateDriverSupport(pieBinary: URL,
                                             subprocessEnvironment: [String: String],
                                             pieHome: URL,
@@ -198,57 +193,53 @@ public enum PieControlLauncher {
     case .dummy:
       return
     case .portable, .portableResolved:
-      let capabilities = try probeBinaryCapabilities(
-        pieBinary: pieBinary,
-        environment: probeEnvironment,
-        requested: "portable"
-      )
-      guard capabilities.portable else {
+      guard try probeDriverList(pieBinary: pieBinary,
+                                environment: probeEnvironment,
+                                requested: "portable") else {
         throw LaunchError.driverUnsupported(
           requested: "portable",
           binary: pieBinary.path,
-          details: "capability probe reported portable=false"
+          details: "portable driver is not compiled into this pie binary"
         )
       }
     case .metal:
-      let capabilities = try probeBinaryCapabilities(
-        pieBinary: pieBinary,
-        environment: probeEnvironment,
-        requested: "metal"
-      )
-      guard capabilities.portable else {
-        throw LaunchError.driverUnsupported(
-          requested: "portable",
-          binary: pieBinary.path,
-          details: "capability probe reported portable=false"
-        )
-      }
-      guard capabilities.metal else {
+      // Current pie has no separate "metal" readiness signal — Metal is
+      // the embedded `portable` driver's device on macOS. Gate on
+      // `portable` being compiled in; the actual Metal backend is
+      // validated at `pie serve` boot (device = ["metal"] fails loud
+      // there if a host built without PIE_PORTABLE_METAL=1), surfaced via
+      // the launch handshake / liveness probe.
+      guard try probeDriverList(pieBinary: pieBinary,
+                                environment: probeEnvironment,
+                                requested: "metal") else {
         throw LaunchError.driverUnsupported(
           requested: "metal",
           binary: pieBinary.path,
-          details: "capability probe reported metal=false"
+          details: "portable driver (provides the Metal device) is not compiled into this pie binary"
         )
       }
     }
   }
 
-  private static func probeBinaryCapabilities(pieBinary: URL,
-                                              environment: [String: String],
-                                              requested: String) throws -> BinaryCapabilities {
+  /// Runs `pie driver list` and returns whether the embedded `portable`
+  /// driver is compiled into this binary. Fails closed (throws
+  /// `driverUnsupported`) on any spawn / non-zero-exit / parse failure.
+  private static func probeDriverList(pieBinary: URL,
+                                      environment: [String: String],
+                                      requested: String) throws -> Bool {
     guard FileManager.default.fileExists(atPath: pieBinary.path) else {
       throw LaunchError.pieBinaryMissing(path: pieBinary.path)
     }
     let result: ProbeResult
     do {
-      result = try runCapabilityProbe(pieBinary: pieBinary, environment: environment)
+      result = try runDriverListProbe(pieBinary: pieBinary, environment: environment)
     } catch let error as LaunchError {
       throw error
     } catch {
       throw LaunchError.driverUnsupported(
         requested: requested,
         binary: pieBinary.path,
-        details: "capability probe failed: \(error)"
+        details: "`pie driver list` probe failed: \(error)"
       )
     }
     guard result.exitCode == 0 else {
@@ -256,10 +247,10 @@ public enum PieControlLauncher {
       throw LaunchError.driverUnsupported(
         requested: requested,
         binary: pieBinary.path,
-        details: "capability probe exited \(result.exitCode): \(detail.trimmingCharacters(in: .whitespacesAndNewlines))"
+        details: "`pie driver list` probe exited \(result.exitCode): \(detail.trimmingCharacters(in: .whitespacesAndNewlines))"
       )
     }
-    return try decodeCapabilitiesJSON(
+    return try parseDriverList(
       result.stdout,
       pieBinary: pieBinary,
       requested: requested
@@ -272,11 +263,16 @@ public enum PieControlLauncher {
     var stderr: String
   }
 
-  private static func runCapabilityProbe(pieBinary: URL,
+  private static func runDriverListProbe(pieBinary: URL,
                                          environment: [String: String]) throws -> ProbeResult {
     let proc = Process()
     proc.executableURL = pieBinary
-    proc.arguments = ["capabilities", "--json"]
+    // `pie driver list` is the documented driver-readiness surface — it
+    // lists the embedded drivers compiled into the binary. (The older
+    // `pie capabilities --json` still exists but is an undocumented,
+    // feature-gated surface; standardize on `driver list` to avoid
+    // coupling the launcher to it.)
+    proc.arguments = ["driver", "list"]
     proc.environment = environment
     let stdout = Pipe()
     let stderr = Pipe()
@@ -299,9 +295,9 @@ public enum PieControlLauncher {
     if proc.isRunning {
       proc.terminate()
       throw LaunchError.driverUnsupported(
-        requested: "capabilities",
+        requested: "driver list",
         binary: pieBinary.path,
-        details: "capability probe timed out"
+        details: "`pie driver list` probe timed out"
       )
     }
 
@@ -310,9 +306,9 @@ public enum PieControlLauncher {
     let stderrClosed = stderrCollector.waitForEOF(until: outputDeadline)
     guard stdoutClosed && stderrClosed else {
       throw LaunchError.driverUnsupported(
-        requested: "capabilities",
+        requested: "driver list",
         binary: pieBinary.path,
-        details: "capability probe output timed out"
+        details: "`pie driver list` probe output timed out"
       )
     }
 
@@ -374,40 +370,39 @@ public enum PieControlLauncher {
     }
   }
 
-  private static func decodeCapabilitiesJSON(_ text: String,
-                                             pieBinary: URL,
-                                             requested: String) throws -> BinaryCapabilities {
-    let root: [String: Any]
-    do {
-      guard let data = text.data(using: .utf8),
-            let decoded = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        throw LaunchError.driverUnsupported(
-          requested: requested,
-          binary: pieBinary.path,
-          details: "capability probe returned malformed JSON: \(text.trimmingCharacters(in: .whitespacesAndNewlines))"
-        )
-      }
-      root = decoded
-    } catch let error as LaunchError {
-      throw error
-    } catch {
+  /// Parse `pie driver list` output for the embedded `portable` driver.
+  ///
+  /// `pie driver list` prints, under an "Embedded drivers (compiled into
+  /// this binary…)" section, one line per embedded driver:
+  ///
+  ///     portable     (compiled in)
+  ///     cuda_native  (not compiled)
+  ///     dummy        (compiled in)
+  ///
+  /// We need only `portable` — current pie has no separate "metal"
+  /// readiness signal (Metal is the portable driver's macOS device,
+  /// validated at serve boot), so the `.metal` gate also keys on
+  /// `portable` being compiled in. Fails CLOSED if the output never
+  /// mentions `portable` at all (an unexpected/changed CLI format), so a
+  /// future drift is caught loud rather than passed blind. Returns
+  /// whether the portable driver is compiled in.
+  static func parseDriverList(_ text: String,
+                              pieBinary: URL,
+                              requested: String) throws -> Bool {
+    let lines = text.split(separator: "\n").map {
+      $0.trimmingCharacters(in: .whitespaces)
+    }
+    let mentionsPortable = lines.contains { $0.hasPrefix("portable") }
+    guard mentionsPortable else {
       throw LaunchError.driverUnsupported(
         requested: requested,
         binary: pieBinary.path,
-        details: "capability probe returned malformed JSON: \(error)"
+        details: "`pie driver list` output did not list the portable driver: \(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))"
       )
     }
-    guard let drivers = root["drivers"] as? [String: Any],
-          let devices = root["devices"] as? [String: Any],
-          let portable = drivers["portable"] as? Bool,
-          let metal = devices["metal"] as? Bool else {
-      throw LaunchError.driverUnsupported(
-        requested: requested,
-        binary: pieBinary.path,
-        details: "capability probe returned malformed JSON: \(text.trimmingCharacters(in: .whitespacesAndNewlines))"
-      )
+    return lines.contains {
+      $0.hasPrefix("portable") && $0.contains("(compiled in)")
     }
-    return BinaryCapabilities(portable: portable, metal: metal)
   }
 
   // MARK: - launch
