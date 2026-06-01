@@ -169,10 +169,19 @@ struct ChatScaffoldView: View {
   /// banner; other `.failed` codes show the live status detail; a thrown
   /// action error shows when the status itself isn't `.failed`.
   private var engineFailureMessage: String? {
-    MissingModelRecovery.engineFailureBannerMessage(
+    // PR#15 v2 F1: only suppress modelMissing when the download banner
+    // will actually own it (a single-file-GGUF slug). A non-downloadable
+    // modelMissing has no download banner, so it must fall through to the
+    // engine-failure banner rather than be menu-bar-dot-only.
+    let slug = profileStore.model(forProfileID: viewModel.selectedProfileID)
+    let hasDownloadTarget = MissingModelRecovery.bannerTarget(
+      engineStatus: engineStatusStore.status,
+      profileDefaultModel: slug) != nil
+    return MissingModelRecovery.engineFailureBannerMessage(
       engineStatus: engineStatusStore.status,
       actionError: engineActionError,
-      statusDetail: engineStatusStore.statusDetail)
+      statusDetail: engineStatusStore.statusDetail,
+      hasDownloadTarget: hasDownloadTarget)
   }
 
   private func scaffold(for chat: Chat) -> some View {
@@ -208,8 +217,14 @@ struct ChatScaffoldView: View {
       } else if let message = engineFailureMessage {
         // PR#15 F2/F3: surface a non-modelMissing engine failure (or a
         // thrown start/stop error) in-chat — the user just acted; it must
-        // not be menu-bar-dot-only or hidden under "Couldn't save".
-        EngineFailureBanner(message: message, onDismiss: { engineActionError = nil })
+        // not be menu-bar-dot-only or hidden under "Couldn't save". v2 F2:
+        // only offer Dismiss for a dismissable (thrown action-error)
+        // message; a live `.failed` status self-clears on recovery, so its
+        // Dismiss would be a no-op and is hidden.
+        EngineFailureBanner(
+          message: message,
+          onDismiss: MissingModelRecovery.engineFailureDismissable(
+            engineStatus: engineStatusStore.status) ? { engineActionError = nil } : nil)
       }
       TranscriptView(chat: chat)
         .frame(maxWidth: .infinity, maxHeight: .infinity)

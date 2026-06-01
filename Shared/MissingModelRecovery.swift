@@ -79,19 +79,35 @@ public enum MissingModelRecovery {
   /// not only on the menu-bar dot and never under the persistence
   /// "Couldn't save" banner (wrong fault domain).
   ///
-  ///   · `.failed(.modelMissing)` → nil: the download banner owns that
-  ///     surface (offers the inline download), so this stays silent.
+  ///   · `.failed(.modelMissing)` → nil ONLY when `hasDownloadTarget`
+  ///     (the download banner owns that surface). For a NON-downloadable
+  ///     modelMissing slug (2-seg safetensors dir, bare leaf, non-`.gguf`,
+  ///     or a default whose snapshot was deleted) NO download banner
+  ///     exists, so it falls through to `statusDetail` here — otherwise it
+  ///     would be the menu-bar-dot-only state this channel exists to kill
+  ///     (PR#15 v2 F1).
   ///   · `.failed(otherCode)` → the live `statusDetail` (e.g. spawnFailed,
   ///     handshakeTimeout, engineGone).
   ///   · otherwise → a pending thrown `actionError` (a stop that left the
   ///     engine running, or a transport error the poll won't reflect).
   public static func engineFailureBannerMessage(engineStatus: EngineStatus,
                                                 actionError: String?,
-                                                statusDetail: String) -> String? {
+                                                statusDetail: String,
+                                                hasDownloadTarget: Bool) -> String? {
     if case .failed(let code, _) = engineStatus {
-      if code == .modelMissing { return nil }
+      if code == .modelMissing, hasDownloadTarget { return nil }
       return statusDetail
     }
     return actionError
+  }
+
+  /// Whether the engine-failure banner's message is dismissable (PR#15 v2
+  /// F2). A live `.failed` status re-derives the message every render, so
+  /// a Dismiss there clears nothing visible — hide the button. Only a
+  /// thrown `actionError` (surfaced when the status is NOT `.failed`) can
+  /// be dismissed by clearing it.
+  public static func engineFailureDismissable(engineStatus: EngineStatus) -> Bool {
+    if case .failed = engineStatus { return false }
+    return true
   }
 }

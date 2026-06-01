@@ -9,12 +9,13 @@ import SwiftUI
 /// the persistence "Couldn't save" banner (wrong fault domain).
 ///
 /// The message is decided by `MissingModelRecovery.engineFailureBannerMessage`;
-/// this view only renders it. `onDismiss` clears a transient thrown
-/// action error (a live `.failed` status re-derives the banner on the
-/// next poll, so dismissing it is a no-op until the status changes).
+/// this view only renders it. `onDismiss` is non-nil ONLY for a
+/// dismissable message (a thrown action error); a live `.failed` status
+/// re-derives the banner every render, so its Dismiss would be a no-op
+/// and the button is hidden (PR#15 v2 F2).
 struct EngineFailureBanner: View {
   let message: String
-  let onDismiss: () -> Void
+  let onDismiss: (() -> Void)?
 
   var body: some View {
     HStack(alignment: .center, spacing: 12) {
@@ -32,9 +33,11 @@ struct EngineFailureBanner: View {
           .fixedSize(horizontal: false, vertical: true)
       }
       Spacer(minLength: 12)
-      Button("Dismiss", action: onDismiss)
-        .buttonStyle(.borderless)
-        .accessibilityIdentifier("engineFailure.dismiss")
+      if let onDismiss {
+        Button("Dismiss", action: onDismiss)
+          .buttonStyle(.borderless)
+          .accessibilityIdentifier("engineFailure.dismiss")
+      }
     }
     .padding(12)
     .background(

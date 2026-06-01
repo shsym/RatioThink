@@ -136,18 +136,35 @@ final class MissingModelRecoveryTests: XCTestCase {
       MissingModelRecovery.engineFailureBannerMessage(
         engineStatus: .failed(code: .spawnFailed, message: "fork ENOENT"),
         actionError: nil,
-        statusDetail: "Engine failed (spawnFailed): fork ENOENT"),
+        statusDetail: "Engine failed (spawnFailed): fork ENOENT",
+        hasDownloadTarget: false),
       "Engine failed (spawnFailed): fork ENOENT")
   }
 
-  /// modelMissing is owned by the download banner, so the generic
-  /// engine-failure banner stays silent for it (even if an action error
-  /// is also pending).
-  func test_engineFailureBannerMessage_nil_for_modelMissing() {
+  /// modelMissing WITH a download target is owned by the download banner,
+  /// so the generic engine-failure banner stays silent for it (even if an
+  /// action error is also pending).
+  func test_engineFailureBannerMessage_nil_for_modelMissing_with_download_target() {
     XCTAssertNil(MissingModelRecovery.engineFailureBannerMessage(
       engineStatus: .failed(code: .modelMissing, message: "missing"),
       actionError: "boom",
-      statusDetail: "Engine failed (modelMissing): missing"))
+      statusDetail: "Engine failed (modelMissing): missing",
+      hasDownloadTarget: true))
+  }
+
+  /// PR#15 v2 F1: modelMissing for a NON-downloadable slug (2-seg
+  /// safetensors dir, bare leaf, nil default whose snapshot was deleted)
+  /// has no download banner to own it — so the engine-failure banner must
+  /// cover it, never leaving it menu-bar-dot-only. This is the boundary
+  /// the blanket modelMissing suppression slipped through.
+  func test_engineFailureBannerMessage_surfaces_non_downloadable_modelMissing() {
+    XCTAssertEqual(
+      MissingModelRecovery.engineFailureBannerMessage(
+        engineStatus: .failed(code: .modelMissing, message: "missing"),
+        actionError: nil,
+        statusDetail: "Engine failed (modelMissing): missing",
+        hasDownloadTarget: false),
+      "Engine failed (modelMissing): missing")
   }
 
   /// A thrown engine-action error (e.g. a stop that left the engine
@@ -158,7 +175,8 @@ final class MissingModelRecoveryTests: XCTestCase {
       MissingModelRecovery.engineFailureBannerMessage(
         engineStatus: .running(port: 8080, profileID: "chat"),
         actionError: "Couldn't stop the engine: kill rejected",
-        statusDetail: "Engine running"),
+        statusDetail: "Engine running",
+        hasDownloadTarget: false),
       "Couldn't stop the engine: kill rejected")
   }
 
@@ -167,6 +185,27 @@ final class MissingModelRecoveryTests: XCTestCase {
     XCTAssertNil(MissingModelRecovery.engineFailureBannerMessage(
       engineStatus: .running(port: 8080, profileID: "chat"),
       actionError: nil,
-      statusDetail: "Engine running"))
+      statusDetail: "Engine running",
+      hasDownloadTarget: false))
+  }
+
+  // MARK: - engineFailureDismissable (PR#15 v2 F2)
+
+  /// A live `.failed` status re-derives the banner every render, so its
+  /// message is NOT dismissable — the Dismiss button would be a no-op and
+  /// must be hidden.
+  func test_engineFailureDismissable_false_for_failed_status() {
+    XCTAssertFalse(MissingModelRecovery.engineFailureDismissable(
+      engineStatus: .failed(code: .spawnFailed, message: "fork")))
+    XCTAssertFalse(MissingModelRecovery.engineFailureDismissable(
+      engineStatus: .failed(code: .modelMissing, message: "missing")))
+  }
+
+  /// A thrown action-error banner (status not `.failed`) IS dismissable —
+  /// clearing `engineActionError` removes it.
+  func test_engineFailureDismissable_true_when_status_not_failed() {
+    XCTAssertTrue(MissingModelRecovery.engineFailureDismissable(
+      engineStatus: .running(port: 8080, profileID: "chat")))
+    XCTAssertTrue(MissingModelRecovery.engineFailureDismissable(engineStatus: .stopped))
   }
 }
