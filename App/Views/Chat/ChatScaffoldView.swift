@@ -106,6 +106,13 @@ struct ChatScaffoldView: View {
   /// True when the slug's app-staged model file exists — the engine's
   /// primary model source. A miss means the prompt offers Download
   /// instead of Load.
+  ///
+  /// Intentionally checks ONLY the app-staged path, not the HF cache
+  /// (the resolver's secondary fallback). A model present only in
+  /// `~/.cache/huggingface` is offered a Download here, which simply
+  /// stages a second copy into the app models dir before it resolves —
+  /// benign redundancy, not a wrong result. Mirroring the resolver's
+  /// two-stage check would couple this UI gate to resolver internals.
   static func isModelInstalled(_ slug: String) -> Bool {
     guard let modelsRoot = try? PieDirs.models() else { return false }
     let path = LaunchSpecResolver.joinModelPath(modelsRoot: modelsRoot, slug: slug)

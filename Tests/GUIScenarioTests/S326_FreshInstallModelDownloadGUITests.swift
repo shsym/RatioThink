@@ -68,4 +68,54 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
     XCTAssertTrue(app.buttons["missingModel.cancel"].waitForExistence(timeout: 5),
                   "tapping Download must show the in-flight progress row")
   }
+
+  /// A completed download must fire the CTA's one-shot `onDownloaded`
+  /// latch, which dismisses the no-model prompt and kicks the engine
+  /// start. Drives the fake downloader all the way to `.completed`.
+  @MainActor
+  func test_completed_download_fires_latch_and_dismisses_prompt() async throws {
+    let pieHome = "/tmp/pie-s326done-" + UUID().uuidString
+
+    let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
+    app.launchArguments.append(contentsOf: [
+      "-NSQuitAlwaysKeepsWindows", "NO",
+      "-ApplePersistenceIgnoreState", "YES",
+    ])
+    app.launchEnvironment["PIE_HOME"] = pieHome
+    app.launchEnvironment["PIE_TEST_FAKE_DOWNLOADS"] = "1"
+    // Drive the fake stream to a terminal `.completed` so the CTA's
+    // completion latch fires.
+    app.launchEnvironment["PIE_TEST_FAKE_DOWNLOAD_COMPLETE"] = "1"
+    configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
+    app.launch()
+    defer { app.terminate() }
+
+    XCTAssert(app.wait(for: .runningForeground, timeout: 10))
+    app.activate()
+
+    let newChat = app.buttons["chats.newButton"]
+    XCTAssertTrue(newChat.waitForExistence(timeout: 10), "New Chat button missing")
+    newChat.click()
+
+    let composer = app.descendants(matching: .any)
+      .matching(identifier: "composer.text")
+      .firstMatch
+    XCTAssertTrue(composer.waitForExistence(timeout: 10), "composer.text missing")
+    composer.click()
+    composer.typeText("Download then start")
+
+    let send = app.buttons["composer.send"]
+    XCTAssertTrue(send.waitForExistence(timeout: 5))
+    send.click()
+
+    XCTAssertTrue(app.staticTexts["No model loaded"].waitForExistence(timeout: 5))
+    let download = app.buttons["missingModel.download"]
+    XCTAssertTrue(download.waitForExistence(timeout: 5))
+    download.click()
+
+    // The fake stream completes → onDownloaded fires once → the prompt
+    // dismisses (and the engine start is kicked).
+    XCTAssertTrue(app.staticTexts["No model loaded"].waitForNonExistence(timeout: 10),
+                  "a completed download must fire onDownloaded and dismiss the no-model prompt")
+  }
 }
