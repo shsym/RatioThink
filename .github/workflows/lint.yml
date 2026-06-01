@@ -21,6 +21,12 @@ jobs:
   # (GitHub docs: "do not use path or branch filtering to skip workflow
   # runs if the workflow is required to pass before merging"). This keeps
   # the path-filtering safe even after `main` becomes a protected branch.
+  # The gated `if:`s are FAIL-OPEN (`!cancelled() && <out> != 'false'`):
+  # GitHub implicitly ANDs `success(needs)` into a bare `if:`, so if THIS
+  # detector errored the dependents would skip-as-Success and a real
+  # change could merge unverified. `!cancelled()` overrides that implicit
+  # success-gate and the empty output on failure makes `!= 'false'` true,
+  # so the dependents RUN instead.
   changes:
     name: detect changed paths
     runs-on: ubuntu-latest
@@ -213,10 +219,13 @@ jobs:
     runs-on: macos-15
     # Conditional (#389): only build/verify the inferlet when its sources,
     # the stamp script, the Vendor/pie pin, or the Makefile recipe change.
-    # Skipped via `if:` (not an `on.paths` filter) so it reports "Success"
-    # under branch protection.
+    # Skipped via `if:` (not an `on.paths` filter) so a no-op reports
+    # "Success" under branch protection. FAIL-OPEN on detector failure —
+    # see the `changes` job comment. Keep `!= 'false'`, not `== 'true'`
+    # (the latter skips-as-Success when `changes` errors = false-green).
+    # `${{ }}` is required: a bare leading `!` is a YAML tag indicator.
     needs: changes
-    if: needs.changes.outputs.inferlets == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.inferlets != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -267,10 +276,13 @@ jobs:
     runs-on: macos-15
     # Conditional (#389): the invariants this job guards live in the
     # Makefile recipe + the SanityFailInjection sentinel, so only run it
-    # when one of those changes. Skipped via `if:` (not `on.paths`) so it
-    # reports "Success" under branch protection.
+    # when one of those changes. Skipped via `if:` (not `on.paths`) so a
+    # no-op reports "Success" under branch protection. FAIL-OPEN on
+    # detector failure — see the `changes` job comment. Keep `!= 'false'`,
+    # not `== 'true'` (the latter skips-as-Success when `changes` errors).
+    # `${{ }}` is required: a bare leading `!` is a YAML tag indicator.
     needs: changes
-    if: needs.changes.outputs.makefile == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.makefile != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
