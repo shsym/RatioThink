@@ -41,6 +41,12 @@ struct ChatScaffoldView: View {
   /// verified empty/not-running/unreachable engine never re-surfaces
   /// placeholder models the engine would reject ( F2).
   @State private var engineModels: ToolbarModelList = .unknown
+  /// PR#15 F2/F3: a thrown engine start/stop error (transport failure, a
+  /// stop that left the engine running) that the status poll won't
+  /// reflect. Surfaced via the in-chat engine-failure banner — NOT the
+  /// persistence "Couldn't save" banner. Cleared when the engine status
+  /// changes to a non-failed state.
+  @State private var engineActionError: String?
 
   init(
     chatID: UUID,
@@ -84,10 +90,14 @@ struct ChatScaffoldView: View {
   private func unloadModel() {
     Task { @MainActor in
       do {
+        engineActionError = nil
         try await engineStatusStore.stopEngine()
         modelLoadCenter.markUnloaded()
       } catch {
-        persistenceStatus.report(error, context: "ChatScaffoldView.unloadModel")
+        // PR#15 F3: an engine STOP failure is an engine fault, not a
+        // persistence/durability failure — route it to the engine-failure
+        // banner, never the "Couldn't save" persistence banner.
+        engineActionError = Self.engineErrorMessage(error, verb: "stop")
       }
     }
   }
@@ -114,22 +124,55 @@ struct ChatScaffoldView: View {
   /// benign redundancy, not a wrong result. Mirroring the resolver's
   /// two-stage check would couple this UI gate to resolver internals.
   static func isModelInstalled(_ slug: String) -> Bool {
-    guard let modelsRoot = try? PieDirs.models() else { return false }
+    let modelsRoot: URL
+    do {
+      modelsRoot = try PieDirs.models()
+    } catch {
+      // PR#15 F4: don't silently swallow a transient FS/permissions
+      // failure — log it. The fall-through to Download is self-recovering
+      // (a visible affordance remains; re-download re-stages the file),
+      // but the cause must be greppable, not lost to `try?`.
+      NSLog("ChatScaffold.isModelInstalled: PieDirs.models() failed (\(error)); treating model as not-installed")
+      return false
+    }
     let path = LaunchSpecResolver.joinModelPath(modelsRoot: modelsRoot, slug: slug)
     return FileManager.default.fileExists(atPath: path)
   }
 
   /// Kick the helper to (re)start the engine on this chat's profile —
-  /// fire-and-forget; the engine-status poll surfaces the outcome.
+  /// fire-and-forget; the engine-status poll surfaces the outcome. A
+  /// resolver-level failure publishes `.failed` (surfaced by the in-chat
+  /// failure banner); a thrown transport error routes to
+  /// `engineActionError` (PR#15 F3) — never the persistence banner.
   private func startEngineForSelectedProfile() {
     let profileID = viewModel.selectedProfileID
     Task { @MainActor in
       do {
+        engineActionError = nil
         try await engineStatusStore.startEngine(profileID: profileID)
       } catch {
-        persistenceStatus.report(error, context: "ChatScaffoldView.startEngineAfterDownload")
+        engineActionError = Self.engineErrorMessage(error, verb: "start")
       }
     }
+  }
+
+  /// Human, fault-domain-correct message for an engine start/stop error.
+  static func engineErrorMessage(_ error: Error, verb: String) -> String {
+    if let e = error as? EngineError {
+      return "Couldn't \(verb) the engine: \(e.message)"
+    }
+    return "Couldn't \(verb) the engine: \(error)"
+  }
+
+  /// Message for the in-chat engine-failure banner (PR#15 F2/F3), or nil
+  /// when it should stay hidden. modelMissing is owned by the download
+  /// banner; other `.failed` codes show the live status detail; a thrown
+  /// action error shows when the status itself isn't `.failed`.
+  private var engineFailureMessage: String? {
+    MissingModelRecovery.engineFailureBannerMessage(
+      engineStatus: engineStatusStore.status,
+      actionError: engineActionError,
+      statusDetail: engineStatusStore.statusDetail)
   }
 
   private func scaffold(for chat: Chat) -> some View {
@@ -159,8 +202,14 @@ struct ChatScaffoldView: View {
       ) {
         ModelMissingBanner(
           target: bannerTarget,
-          onDownloaded: { startEngineForSelectedProfile() }
+          onDownloaded: { startEngineForSelectedProfile() },
+          engineStatus: engineStatusStore.status
         )
+      } else if let message = engineFailureMessage {
+        // PR#15 F2/F3: surface a non-modelMissing engine failure (or a
+        // thrown start/stop error) in-chat — the user just acted; it must
+        // not be menu-bar-dot-only or hidden under "Couldn't save".
+        EngineFailureBanner(message: message, onDismiss: { engineActionError = nil })
       }
       TranscriptView(chat: chat)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -190,8 +239,15 @@ struct ChatScaffoldView: View {
           showNoModelPrompt = false
         },
         onChooseAnother: { showNoModelPrompt = false },
-        onCancel: { showNoModelPrompt = false }
+        onCancel: { showNoModelPrompt = false },
+        engineStatus: engineStatusStore.status
       )
+    }
+    .onChange(of: engineStatusStore.status) { _, new in
+      // PR#15 F3: a thrown start/stop error is transient — once the poll
+      // observes the engine in any non-failed state, drop it so a stale
+      // action error can't outlive the condition it described.
+      if case .failed = new {} else { engineActionError = nil }
     }
     .onAppear {
       // Seed the toolbar from the persisted profile so the menu

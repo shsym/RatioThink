@@ -55,4 +55,43 @@ public enum MissingModelRecovery {
     guard let slug = profileDefaultModel else { return nil }
     return CuratedModelCatalog.downloadTarget(forModelSlug: slug)
   }
+
+  /// Whether the download CTA's completed ("starting engine…") latch
+  /// should drop back to a Retry/Download affordance.
+  ///
+  /// True only when a download has completed (`didComplete`) AND the
+  /// engine is back in `failed(.modelMissing)` — i.e. the post-download
+  /// `startEngine` did not take (corrupt/partial artifact, or a path the
+  /// resolver still rejects). Leaving the green latch up with no retry is
+  /// the exact silent dead-end #326 exists to kill. A `.running` (or any
+  /// other) state keeps the latch; a *different* failure code is the
+  /// generic engine-failure banner's job (the download itself succeeded).
+  public static func completedLatchShouldReset(didComplete: Bool,
+                                               engineStatus: EngineStatus) -> Bool {
+    guard didComplete else { return false }
+    if case .failed(.modelMissing, _) = engineStatus { return true }
+    return false
+  }
+
+  /// Message for the generic in-chat engine-failure banner, or nil when
+  /// it should stay hidden. The single engine-failure channel (PR#15
+  /// F2/F3): a user-initiated start/stop that fails must surface IN-CHAT,
+  /// not only on the menu-bar dot and never under the persistence
+  /// "Couldn't save" banner (wrong fault domain).
+  ///
+  ///   · `.failed(.modelMissing)` → nil: the download banner owns that
+  ///     surface (offers the inline download), so this stays silent.
+  ///   · `.failed(otherCode)` → the live `statusDetail` (e.g. spawnFailed,
+  ///     handshakeTimeout, engineGone).
+  ///   · otherwise → a pending thrown `actionError` (a stop that left the
+  ///     engine running, or a transport error the poll won't reflect).
+  public static func engineFailureBannerMessage(engineStatus: EngineStatus,
+                                                actionError: String?,
+                                                statusDetail: String) -> String? {
+    if case .failed(let code, _) = engineStatus {
+      if code == .modelMissing { return nil }
+      return statusDetail
+    }
+    return actionError
+  }
 }

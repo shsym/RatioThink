@@ -2,13 +2,13 @@ import Foundation
 import os
 
 /// App-side, async wrapper around `NSXPCConnection` to the helper's
-/// `PieHelperXPC` interface. Today exposes only `engineStatus()` — the
-/// single selector the GUI needs to derive `HTTPEngineClient.baseURL`
-/// ( / follow-up to ). Other selectors (start/stopEngine,
-/// loadModel, downloadModel) are reached today via direct
-/// `NSXPCConnection` use in their respective subsystems; folding them
-/// behind this client is deliberately deferred until a second caller
-/// appears, so the surface stays narrow.
+/// `PieHelperXPC` interface. Exposes the selectors the GUI drives:
+/// `engineStatus()` (derives `HTTPEngineClient.baseURL`), `stopEngine()`
+/// (Unload), and `startEngine(profileID:)` (#326 fresh-install
+/// auto-start). The remaining `PieHelperXPC` selectors (loadModel,
+/// downloadModel, …) are still reached via direct `NSXPCConnection` use
+/// in their own subsystems; they get folded behind this client only when
+/// a GUI caller needs them, keeping the surface narrow.
 ///
 /// Two construction modes mirror `HelperXPCListener`:
 ///   · `.machService(name)` — production. Default name comes from
@@ -34,10 +34,8 @@ public protocol AppXPCClient: Sendable {
   /// Start (resolve + launch) the engine on `profileID`. Resolves on a
   /// successful launch handshake; throws the helper-side `EngineError`
   /// when the start is rejected (e.g. `.modelMissing`, `.profileMissing`),
-  /// or an `AppXPCClientError` on transport failure. #326's fresh-install
-  /// recovery is the first App-side caller — the comment above this
-  /// protocol noted start/stopEngine were deferred "until a second
-  /// caller appears."
+  /// or an `AppXPCClientError` on transport failure. Driven by #326's
+  /// fresh-install auto-start.
   func startEngine(profileID: String) async throws
 }
 

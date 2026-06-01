@@ -98,4 +98,75 @@ final class MissingModelRecoveryTests: XCTestCase {
       engineStatus: .failed(code: .modelMissing, message: "missing"),
       profileDefaultModel: nil))
   }
+
+  // MARK: - completedLatchShouldReset (PR#15 F1: re-failure → Retry)
+
+  /// After a download completed (latched), the engine re-entering
+  /// failed(modelMissing) means the start did not take (corrupt/partial
+  /// artifact or a rejected path) — the CTA must drop its green latch and
+  /// return to a Retry/Download affordance, not stay green forever.
+  func test_completedLatchShouldReset_when_completed_and_modelMissing() {
+    XCTAssertTrue(MissingModelRecovery.completedLatchShouldReset(
+      didComplete: true,
+      engineStatus: .failed(code: .modelMissing, message: "still missing")))
+  }
+
+  /// A successful start (or any non-failed/other-code state) must NOT
+  /// reset the latch — the green "starting engine" is correct there.
+  func test_completedLatchShouldReset_false_when_not_modelMissing_or_not_completed() {
+    XCTAssertFalse(MissingModelRecovery.completedLatchShouldReset(
+      didComplete: true, engineStatus: .running(port: 8080, profileID: "chat")))
+    XCTAssertFalse(MissingModelRecovery.completedLatchShouldReset(
+      didComplete: true, engineStatus: .starting))
+    // A different failure code is the F2 engine-failure banner's job, not
+    // a download-retry — the download already succeeded.
+    XCTAssertFalse(MissingModelRecovery.completedLatchShouldReset(
+      didComplete: true, engineStatus: .failed(code: .spawnFailed, message: "fork")))
+    XCTAssertFalse(MissingModelRecovery.completedLatchShouldReset(
+      didComplete: false, engineStatus: .failed(code: .modelMissing, message: "x")))
+  }
+
+  // MARK: - engineFailureBannerMessage (PR#15 F2/F3: one engine-failure channel)
+
+  /// A non-modelMissing engine failure surfaces the live status detail —
+  /// the user just acted (download → start), so the failure can't be
+  /// menu-bar-dot-only (F2).
+  func test_engineFailureBannerMessage_uses_status_detail_for_non_modelMissing_failure() {
+    XCTAssertEqual(
+      MissingModelRecovery.engineFailureBannerMessage(
+        engineStatus: .failed(code: .spawnFailed, message: "fork ENOENT"),
+        actionError: nil,
+        statusDetail: "Engine failed (spawnFailed): fork ENOENT"),
+      "Engine failed (spawnFailed): fork ENOENT")
+  }
+
+  /// modelMissing is owned by the download banner, so the generic
+  /// engine-failure banner stays silent for it (even if an action error
+  /// is also pending).
+  func test_engineFailureBannerMessage_nil_for_modelMissing() {
+    XCTAssertNil(MissingModelRecovery.engineFailureBannerMessage(
+      engineStatus: .failed(code: .modelMissing, message: "missing"),
+      actionError: "boom",
+      statusDetail: "Engine failed (modelMissing): missing"))
+  }
+
+  /// A thrown engine-action error (e.g. a stop that left the engine
+  /// .running, or a transport error) surfaces via the engine channel —
+  /// NOT the persistence "Couldn't save" banner (F3).
+  func test_engineFailureBannerMessage_surfaces_action_error_when_status_not_failed() {
+    XCTAssertEqual(
+      MissingModelRecovery.engineFailureBannerMessage(
+        engineStatus: .running(port: 8080, profileID: "chat"),
+        actionError: "Couldn't stop the engine: kill rejected",
+        statusDetail: "Engine running"),
+      "Couldn't stop the engine: kill rejected")
+  }
+
+  /// Healthy engine, no action error → no banner.
+  func test_engineFailureBannerMessage_nil_when_healthy() {
+    XCTAssertNil(MissingModelRecovery.engineFailureBannerMessage(
+      engineStatus: .running(port: 8080, profileID: "chat"),
+      actionError: nil,
+      statusDetail: "Engine running"))
+  }
 }

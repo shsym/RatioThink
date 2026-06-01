@@ -21,6 +21,8 @@ struct NoModelLoadedPrompt: View {
   let onDownloaded: () -> Void
   let onChooseAnother: () -> Void
   let onCancel: () -> Void
+  /// Live engine status, threaded into the download CTA (PR#15 F1).
+  let engineStatus: EngineStatus
 
   var body: some View {
     VStack(alignment: .leading, spacing: 14) {
@@ -39,7 +41,7 @@ struct NoModelLoadedPrompt: View {
       case let .download(target):
         Text("This profile's model isn't downloaded yet. Download it to send your message.")
           .fixedSize(horizontal: false, vertical: true)
-        MissingModelDownloadCTA(target: target, onDownloaded: onDownloaded)
+        MissingModelDownloadCTA(target: target, onDownloaded: onDownloaded, engineStatus: engineStatus)
       case .unavailable:
         Text("This profile has no model ready. Choose one from the Model menu in the toolbar, or add one in Settings → Models.")
           .fixedSize(horizontal: false, vertical: true)

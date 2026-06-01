@@ -13,6 +13,15 @@ struct MissingModelDownloadCTA: View {
   let target: ModelDownloadTarget
   /// Fired exactly once when the tracked download reaches `.completed`.
   let onDownloaded: () -> Void
+  /// Live engine status, so the completed latch can drop back to Retry if
+  /// the post-download `startEngine` does not take (PR#15 F1).
+  let engineStatus: EngineStatus
+  /// Grace window after completion before the latch reverts to Retry when
+  /// the engine is still stuck. Injectable so a test need not wait the
+  /// production default. The fast path is `onChange(engineStatus)`; this
+  /// is the safety net for a re-failure that carries an identical status
+  /// value (no `onChange` to observe).
+  var reFailureGrace: Duration = .seconds(8)
 
   @EnvironmentObject private var downloads: ModelDownloadController
   /// Handle of the download this CTA started. Nil until the user taps
@@ -47,14 +56,48 @@ struct MissingModelDownloadCTA: View {
         onDownloaded()
       }
     }
-    .onAppear {
-      // Reflect a download for this target already in flight (started by
-      // the sibling surface or Settings → Models) instead of offering a
-      // redundant Download button — the controller is shared app-wide.
-      if handleID == nil, !didComplete, let existing = inFlightHandleForTarget() {
-        handleID = existing
+    .onChange(of: engineStatus) { _, _ in
+      // PR#15 F1: the engine re-entered failed(modelMissing) after we
+      // latched completion — the start did not take. Drop the green
+      // latch back to a Retry/Download affordance (a re-download also
+      // re-stages a corrupt/partial artifact).
+      if MissingModelRecovery.completedLatchShouldReset(
+        didComplete: didComplete, engineStatus: engineStatus) {
+        resetToRetry()
       }
     }
+    .task(id: didComplete) {
+      // Safety net for a re-failure carrying an identical status value
+      // (no `onChange` fires): a successful start unmounts this banner
+      // (engine leaves failed(modelMissing)) and cancels this task; if
+      // we are still mounted + latched after the grace window, the start
+      // did not take — revert to Retry.
+      guard didComplete else { return }
+      try? await Task.sleep(for: reFailureGrace)
+      guard !Task.isCancelled, didComplete else { return }
+      resetToRetry()
+    }
+    .onAppear {
+      guard handleID == nil, !didComplete else { return }
+      if let existing = inFlightHandleForTarget() {
+        // Reflect a download for this target already in flight (started by
+        // the sibling surface or Settings → Models) — the controller is
+        // shared app-wide — instead of offering a redundant Download.
+        handleID = existing
+      } else if isTargetInstalled() {
+        // PR#15 F5: a sibling surface already finished + evicted this
+        // download. Reflect "done" and (idempotently — startEngine
+        // swallows .alreadyRunning) ensure the engine is kicked, rather
+        // than re-offering a redundant Download.
+        didComplete = true
+        onDownloaded()
+      }
+    }
+  }
+
+  private func resetToRetry() {
+    didComplete = false
+    handleID = nil
   }
 
   @ViewBuilder
@@ -150,5 +193,13 @@ struct MissingModelDownloadCTA: View {
     downloads.active.values.first {
       $0.repo == target.repo && $0.file == target.file && !$0.isTerminal
     }?.id
+  }
+
+  /// Whether this target's file is already staged on disk. The download
+  /// writes `<modelsRoot>/<repo>/<file>`, which `joinModelPath` resolves
+  /// from the `<repo>/<file>` slug — the same check the no-model prompt
+  /// uses (PR#15 F5).
+  private func isTargetInstalled() -> Bool {
+    ChatScaffoldView.isModelInstalled("\(target.repo)/\(target.file)")
   }
 }

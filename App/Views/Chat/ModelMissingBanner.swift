@@ -15,6 +15,9 @@ struct ModelMissingBanner: View {
   /// Called once the inline download completes — the parent starts the
   /// engine on the active profile.
   let onDownloaded: () -> Void
+  /// Live engine status, threaded into the CTA so its completed latch can
+  /// revert to Retry if the post-download start does not take (PR#15 F1).
+  let engineStatus: EngineStatus
 
   var body: some View {
     HStack(alignment: .center, spacing: 12) {
@@ -29,7 +32,7 @@ struct ModelMissingBanner: View {
           .fixedSize(horizontal: false, vertical: true)
       }
       Spacer(minLength: 12)
-      MissingModelDownloadCTA(target: target, onDownloaded: onDownloaded)
+      MissingModelDownloadCTA(target: target, onDownloaded: onDownloaded, engineStatus: engineStatus)
       SettingsLink {
         Text("Settings…")
       }
