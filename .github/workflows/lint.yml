@@ -12,6 +12,43 @@ on:
     branches: ["**"]
 
 jobs:
+  # Path-change detector for the conditional jobs (#389). The workflow
+  # itself stays UNFILTERED (no top-level `on.paths`) so it always runs
+  # and every check reports a status. Conditional jobs gate on these
+  # outputs via a job-level `if:` — a job skipped by `if:` reports
+  # "Success" to branch protection, whereas a workflow skipped by an
+  # `on.paths` filter stays "Pending" and would block a protected PR
+  # (GitHub docs: "do not use path or branch filtering to skip workflow
+  # runs if the workflow is required to pass before merging"). This keeps
+  # the path-filtering safe even after `main` becomes a protected branch.
+  changes:
+    name: detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      inferlets: ${{ steps.filter.outputs.inferlets }}
+      makefile: ${{ steps.filter.outputs.makefile }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # `Vendor/pie` matches the submodule gitlink, so a pie SHA bump
+          # re-runs the inferlet job (the wasm links pie's wit/crates and
+          # the stamp can drift). `Makefile` is in both families because a
+          # recipe edit can change what either job builds.
+          filters: |
+            inferlets:
+              - 'Inferlets/**'
+              - 'Vendor/pie'
+              - 'Scripts/stamp-chat-apc.sh'
+              - 'Makefile'
+            makefile:
+              - 'Makefile'
+              - 'Tests/RatioThinkCoreTests/SanityFailInjectionTests.swift'
+
   lint-helper-side-effects:
     name: lint Helper side-effect APIs
     runs-on: macos-15
@@ -33,6 +70,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      # The long pole (#389): `make build` / `make build-tests` drive the
+      # `Build pie engine binary` Xcode phase, which runs
+      # Scripts/build-pie-engine.sh -> `cargo build --release -p pie-server`
+      # against Vendor/pie/target (~734 crates). Cache the cargo target so
+      # the dependency crates incremental-skip across runs. rust-cache keys
+      # on rustc version + Cargo.lock + job_id by default, so the key
+      # invalidates on a pie SHA / Cargo.lock / toolchain change, and the
+      # engine is always actually recompiled from the current source (cargo
+      # re-fingerprints) — the cache only accelerates, it never substitutes
+      # a stale binary (cache-on-failure stays false).
+      - name: Cache pie-server cargo target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "Vendor/pie"
 
       - name: Set up xcodegen
         run: brew install xcodegen
@@ -159,10 +211,24 @@ jobs:
     # clean checkout with the pinned toolchain target.
     name: chat-apc inferlet build + stamp verify
     runs-on: macos-15
+    # Conditional (#389): only build/verify the inferlet when its sources,
+    # the stamp script, the Vendor/pie pin, or the Makefile recipe change.
+    # Skipped via `if:` (not an `on.paths` filter) so it reports "Success"
+    # under branch protection.
+    needs: changes
+    if: needs.changes.outputs.inferlets == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      # chat-apc is a separate cargo workspace (its own target dir), so it
+      # gets its own keyed cache. Cold-compiles on every Vendor/pie bump
+      # otherwise (#389).
+      - name: Cache chat-apc cargo target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "Inferlets/chat-apc"
 
       - name: Install wasm32-wasip2 target
         run: rustup target add wasm32-wasip2
@@ -199,6 +265,12 @@ jobs:
     #      guard neutralized gmake 4.x's `set -e -o pipefail`).
     name: Makefile recipe under gmake 4.x
     runs-on: macos-15
+    # Conditional (#389): the invariants this job guards live in the
+    # Makefile recipe + the SanityFailInjection sentinel, so only run it
+    # when one of those changes. Skipped via `if:` (not `on.paths`) so it
+    # reports "Success" under branch protection.
+    needs: changes
+    if: needs.changes.outputs.makefile == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
