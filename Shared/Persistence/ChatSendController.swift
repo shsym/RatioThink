@@ -32,7 +32,9 @@ public final class ChatSendController: ObservableObject {
     engine: EngineClient,
     modelLoadCenter: ModelLoadCenter,
     persistenceStatus: PersistenceStatus,
-    options: ChatSendRequestOptions
+    options: ChatSendRequestOptions,
+    recoveryGate: ChatRecoveryGate? = nil,
+    recoveryPolicy: ChatRecoveryPolicy = .default
   ) {
     cancel()
     generation &+= 1
@@ -86,46 +88,106 @@ public final class ChatSendController: ObservableObject {
       self.activeContext = context
       self.activePersistenceStatus = persistenceStatus
 
-      do {
-        for try await event in engine.chatCompletion(request) {
+      // Bounded retry ladder. First pass runs the normal stream. On a
+      // fault that classifies as engine-gone via `recoveryGate`, wait
+      // for the helper's auto-relaunch to bring the engine back to
+      // `.running`, then re-issue the SAME `ChatRequest` against a fresh
+      // writer so the user does not have to re-click Send. Surfaces the
+      // error only after the retry also fails (or no gate was wired).
+      var attemptsRemaining = max(1, recoveryPolicy.maxAttempts)
+      streamLoop: while attemptsRemaining > 0 {
+        attemptsRemaining -= 1
+        do {
+          for try await event in engine.chatCompletion(request) {
+            guard self.generation == myGeneration, !Task.isCancelled else {
+              writer?.cancel()
+              return
+            }
+            switch event {
+            case let .modelLoading(loaded, total, eta):
+              modelLoadCenter.applyChatMetaEvent(
+                .loading(loadedBytes: loaded, totalBytes: total, etaSeconds: eta),
+                modelID: options.modelID
+              )
+              writer?.flush()
+            case .modelReady:
+              modelLoadCenter.applyChatMetaEvent(.ready, modelID: options.modelID)
+              writer?.flush()
+            case let .delta(_, content):
+              writer?.appendDelta(content)
+            case let .reasoningDelta(text):
+              writer?.appendReasoningDelta(text)
+            case let .finish(reason):
+              writer?.finish(meta: Self.finishMeta(for: reason))
+              let reasonValue = Self.finishReasonValue(for: reason)
+              Diag.app.event(reasonValue == "length" ? "chat.truncated" : "chat.stream_end",
+                             [("reason", reasonValue)])
+              self.activeWriter = nil
+              self.activeAssistant = nil
+              self.activeContext = nil
+              self.activePersistenceStatus = nil
+            }
+          }
+          // Stream completed cleanly — no retry.
+          break streamLoop
+        } catch is CancellationError {
+          writer?.cancel()
+          return
+        } catch {
           guard self.generation == myGeneration, !Task.isCancelled else {
             writer?.cancel()
             return
           }
-          switch event {
-          case let .modelLoading(loaded, total, eta):
-            modelLoadCenter.applyChatMetaEvent(
-              .loading(loadedBytes: loaded, totalBytes: total, etaSeconds: eta),
-              modelID: options.modelID
-            )
-            writer?.flush()
-          case .modelReady:
-            modelLoadCenter.applyChatMetaEvent(.ready, modelID: options.modelID)
-            writer?.flush()
-          case let .delta(_, content):
-            writer?.appendDelta(content)
-          case let .reasoningDelta(text):
-            writer?.appendReasoningDelta(text)
-          case let .finish(reason):
-            writer?.finish(meta: Self.finishMeta(for: reason))
-            let reasonValue = Self.finishReasonValue(for: reason)
-            Diag.app.event(reasonValue == "length" ? "chat.truncated" : "chat.stream_end",
-                           [("reason", reasonValue)])
-            self.activeWriter = nil
-            self.activeAssistant = nil
-            self.activeContext = nil
-            self.activePersistenceStatus = nil
+
+          let isEngineGoneFault = await Self.classifyEngineGone(
+            error: error,
+            gate: recoveryGate
+          )
+          guard attemptsRemaining > 0,
+                isEngineGoneFault,
+                let gate = recoveryGate else {
+            writer?.cancel()
+            Self.markAssistant(assistant, failedWith: error, context: context, persistenceStatus: persistenceStatus)
+            return
           }
+
+          // Wait for the helper's auto-relaunch ladder to bring the
+          // engine back. If it doesn't recover inside the policy window,
+          // surface the original engine-gone error rather than a generic
+          // timeout so the assistant bubble shows what actually happened.
+          let recovered = await gate.waitUntilRunning(timeout: recoveryPolicy.waitForReadyTimeout)
+          guard recovered else {
+            writer?.cancel()
+            Self.markAssistant(assistant, failedWith: error, context: context, persistenceStatus: persistenceStatus)
+            return
+          }
+          guard self.generation == myGeneration, !Task.isCancelled else {
+            writer?.cancel()
+            return
+          }
+
+          // Reset the assistant bubble + writer for the retry pass. Any
+          // partial delta or reasoning from the first attempt is
+          // discarded: chat-apc does not surface a resume cursor, so a
+          // clean re-issue is the only correct behavior.
+          assistant.content = ""
+          assistant.reasoning = ""
+          assistant.meta = nil
+          do {
+            try context.save()
+          } catch {
+            persistenceStatus.report(error, context: "ChatSendController.resetAssistantForRetry")
+          }
+          writer = MessageStreamWriter(
+            context: context,
+            message: assistant,
+            errorReporter: { error, context in
+              persistenceStatus.report(error, context: context)
+            }
+          )
+          self.activeWriter = writer
+          continue streamLoop
         }
-      } catch is CancellationError {
-        writer?.cancel()
-      } catch {
-        guard self.generation == myGeneration, !Task.isCancelled else {
-          writer?.cancel()
-          return
-        }
-        writer?.cancel()
-        Self.markAssistant(assistant, failedWith: error, context: context, persistenceStatus: persistenceStatus)
       }
     }
   }
@@ -149,6 +211,25 @@ public final class ChatSendController: ObservableObject {
     activeContext = nil
     activePersistenceStatus = nil
     isInFlight = false
+  }
+
+  /// True when `error` should be classified as engine-death by the
+  /// retry path. Two channels:
+  ///  · `HTTPEngineError.engineGone` thrown synchronously by
+  ///    `baseURLProvider` when the cached status is already
+  ///    `.failed(.engineGone)` — the post-poll case.
+  ///  · A streaming throw (URLError, `.http`, `.stream`, …) that races
+  ///    ahead of the poll: force a fresh helper poll and re-check the
+  ///    cached status. This catches the mid-stream death case where the
+  ///    chat fails before the 1Hz background poll has seen the new state.
+  private static func classifyEngineGone(
+    error: Error,
+    gate: ChatRecoveryGate?
+  ) async -> Bool {
+    if case HTTPEngineError.engineGone = error { return true }
+    guard let gate else { return false }
+    await gate.refreshStatus()
+    return gate.isEngineGone
   }
 
   private static func makeRequest(chat: Chat, options: ChatSendRequestOptions) -> ChatRequest {
@@ -259,4 +340,27 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
     self.sampling = sampling
     self.systemPromptOverride = systemPromptOverride
   }
+}
+
+/// Knobs for the engine-gone retry ladder in `ChatSendController.send`.
+/// Defaults match the helper's `PieEngineHost.RelaunchPolicy` so an
+/// in-flight chat turn outlasts one full auto-relaunch cycle (backoff +
+/// handshake).
+public struct ChatRecoveryPolicy: Equatable, Sendable {
+  /// Total stream attempts including the first. `1` disables retry
+  /// entirely (no second pass); `2` (the default) is "initial + one
+  /// retry".
+  public var maxAttempts: Int
+  /// How long to wait for `recoveryGate.waitUntilRunning(timeout:)` to
+  /// report `.running` again after classifying engine-gone. Picked so
+  /// the helper can ride through its full ladder (2 × 1–2s backoff +
+  /// handshake) without timing out from under us.
+  public var waitForReadyTimeout: TimeInterval
+
+  public init(maxAttempts: Int = 2, waitForReadyTimeout: TimeInterval = 15) {
+    self.maxAttempts = maxAttempts
+    self.waitForReadyTimeout = waitForReadyTimeout
+  }
+
+  public static let `default` = ChatRecoveryPolicy()
 }

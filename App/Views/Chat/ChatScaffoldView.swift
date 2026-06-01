@@ -358,7 +358,13 @@ struct ChatScaffoldView: View {
         modelID: modelID,
         sampling: viewModel.sampling,
         systemPromptOverride: viewModel.systemPromptOverride
-      )
+      ),
+      // `EngineStatusStore` conforms to `ChatRecoveryGate`; passing it
+      // here lets the send pipeline classify a mid-stream
+      // `HTTPEngineError.engineGone` (or a transport throw racing the
+      // helper's auto-relaunch) and ride the same chat turn through the
+      // recovery without the user re-clicking Send.
+      recoveryGate: engineStatusStore
     )
   }
 

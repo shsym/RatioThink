@@ -158,12 +158,21 @@ public final class EngineStatusStore: ObservableObject {
   /// `.running` — the discriminator the HTTP client uses to surface
   /// "Engine starting…" rather than a generic network error. Must
   /// run on the main actor because it reads the published `status`.
+  ///
+  /// When the helper has reported `.failed(.engineGone, _)` (the
+  /// post-launch death signal), the provider throws `.engineGone`
+  /// instead of `.engineNotReady` — a semantic 503-Retry-After at the
+  /// boundary. `ChatSendController` keys its recovery retry on that
+  /// discrete case rather than parsing the `engineNotReady` detail.
   public func requireBaseURL() throws -> URL {
     if case .running(let port, _) = status {
       // Force-unwrap is safe: `EnginePort` (UInt16) interpolates into
       // a valid IPv4 loopback URL by construction, and the `running`
       // decoder already rejects `port == 0`.
       return URL(string: "http://127.0.0.1:\(port)")!
+    }
+    if case .failed(.engineGone, _) = status {
+      throw HTTPEngineError.engineGone(detail: detailForStatus())
     }
     throw HTTPEngineError.engineNotReady(detail: detailForStatus())
   }

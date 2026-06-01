@@ -465,6 +465,61 @@ final class HelperResumeActionTests: XCTestCase {
     token.cancel()
   }
 
+  // MARK: - Review v3 N3: shouldCommitAutoRelaunch veto
+
+  /// The main-async block in `HelperMain.swift`'s relauncher closure
+  /// calls this helper to decide whether the deferred
+  /// `HelperResumeAction.run` should fire. Pinning the table here
+  /// closes the SPM-untestable boundary that hid the v1 F1 blocker:
+  /// deleting the production guard would now fail these tests.
+
+  func test_shouldCommitAutoRelaunch_commits_on_failed_engineGone() {
+    // The scheduler that triggers the closure ONLY fires on
+    // `.failed(.engineGone)`, so this is the production-realistic
+    // commit case: state is still `.failed` at the deferred main-
+    // queue commit, meaning no user Pause has won the race.
+    XCTAssertTrue(HelperResumeAction.shouldCommitAutoRelaunch(
+      status: .failed(code: .engineGone, message: "engine process exited (status 9)")
+    ))
+  }
+
+  func test_shouldCommitAutoRelaunch_commits_on_failed_any_code() {
+    // The veto keys on `.failed` as a category, not on `.engineGone`
+    // specifically — auto-relaunch into a fresh `.failed` of any
+    // code is still recovery intent. Pin so a future narrowing
+    // doesn't silently drop legitimate retries.
+    for code: EngineErrorCode in [.engineGone, .spawnFailed, .handshakeTimeout, .memoryRisk] {
+      XCTAssertTrue(HelperResumeAction.shouldCommitAutoRelaunch(
+        status: .failed(code: code, message: "synthetic")
+      ), "\(code) must still commit; veto only fires on non-.failed states")
+    }
+  }
+
+  func test_shouldCommitAutoRelaunch_vetoes_on_stopped() {
+    // Review v2 R1: `stopLocked`'s `.failed(.engineGone)` arm
+    // transitions state to `.stopped` on a user Pause. A `.stopped`
+    // read here means Pause won the deferred-hop race; abort.
+    XCTAssertFalse(HelperResumeAction.shouldCommitAutoRelaunch(status: .stopped))
+  }
+
+  func test_shouldCommitAutoRelaunch_vetoes_on_running() {
+    // Some other caller already drove the engine through `.running`
+    // between the host's schedule sync and this main-queue commit
+    // (e.g. the user clicked Resume manually). Do not pile a second
+    // auto-relaunch on top.
+    XCTAssertFalse(HelperResumeAction.shouldCommitAutoRelaunch(
+      status: .running(port: 50001, profileID: "chat")
+    ))
+  }
+
+  func test_shouldCommitAutoRelaunch_vetoes_on_starting_and_stopping() {
+    // Transient non-terminal states must also veto so a deferred
+    // commit cannot race a fresh launch / shutdown into a double-
+    // start or a relaunch under teardown.
+    XCTAssertFalse(HelperResumeAction.shouldCommitAutoRelaunch(status: .starting))
+    XCTAssertFalse(HelperResumeAction.shouldCommitAutoRelaunch(status: .stopping))
+  }
+
   /// Minimal `EngineSession` for the launcher seam. Records shutdown
   /// invocation count so happy-path tests can verify the host tore
   /// the session down on Pause.

@@ -1,6 +1,24 @@
 import AppKit
 import os
 
+/// Engine-death (D2) — the auto-relaunch closure handed to
+/// `PieEngineHost` needs the HelperAppDelegate's profileStore +
+/// resolver but must NOT keep the delegate alive past XPC
+/// teardown. The holder is a weak indirection: the closure
+/// captures it, dereferences `helper` (which is itself weak), and
+/// no-ops if the helper has been released.
+///
+/// `@unchecked Sendable`: the closure that captures this is
+/// `@Sendable` (invoked off `PieEngineHost.stateQueue`), but every
+/// access to `helper` is confined to the main queue — `helper` is
+/// assigned once on the main thread during `startXPCListener` boot
+/// and read only inside the relauncher's `DispatchQueue.main.async`
+/// block. The compiler cannot prove that confinement, so the promise
+/// is annotated rather than checked.
+private final class HelperResumeHolder: @unchecked Sendable {
+  weak var helper: HelperAppDelegate?
+}
+
 @main
 final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   var statusItem: NSStatusItem?
@@ -216,7 +234,58 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       // production helper boot path. Lazily constructed (not in
       // init) so degraded helpers never spawn the host they cannot
       // use.
-      let host = PieEngineHost()
+      //
+      // Engine-death recovery (D2): the host's bounded auto-relaunch
+      // ladder fires on `.failed(.engineGone)`, but the host itself
+      // is profile-agnostic — the closure below routes the relaunch
+      // back through the same `HelperResumeAction` policy a
+      // user-clicked Pause/Resume would take, so the auto path and
+      // the manual path always reach the engine via one funnel.
+      // `HelperResumeHolder` carries a `weak var helper` that the
+      // closure dereferences to reach the live HelperAppDelegate.
+      // The closure captures `holder` STRONGLY so the holder outlives
+      // this function — the local `let` at the line below is the only
+      // other strong owner and goes out of scope at function return.
+      // Cycle safety: HelperMain -> engineHost -> RelaunchPolicy
+      // closure -> holder -[weak]-> HelperMain. The weak edge inside
+      // the holder breaks the cycle; capturing the holder weakly
+      // here would deallocate it at function return and silently
+      // disable every later relaunch (review v1 F1).
+      let holder = HelperResumeHolder()
+      let host = PieEngineHost(
+        relauncher: { [holder] in
+          // Off-stateQueue. Hop onto the main queue so the read of
+          // `helper.profileStore` / `helper.launchSpecResolver` is
+          // serialized against the boot-time writers and the
+          // togglePauseResume click path. HelperResumeAction.run is
+          // synchronous and quick (no I/O); it queues a fresh
+          // PieEngineHost launch task and returns.
+          DispatchQueue.main.async {
+            guard let helper = holder.helper else { return }
+            guard let engineHost = helper.engineHost else { return }
+            // Review v3 N3: route the main-queue commit-veto through
+            // `HelperResumeAction.shouldCommitAutoRelaunch(status:)`
+            // (an SPM-reachable pure function) instead of an inline
+            // guard. Without the extraction, deleting the production
+            // guard would have failed no test — the exact untestable
+            // boundary that hid the v1 F1 blocker. Semantic is
+            // unchanged: `.failed` commits, anything else (Pause won,
+            // user Resume already ran, in-flight start) vetoes. See
+            // `Shared/HelperResumeAction.swift` for the full table.
+            guard HelperResumeAction.shouldCommitAutoRelaunch(status: engineHost.status) else {
+              Log.helper.notice("auto-relaunch skipped: engineHost.status=\(String(describing: engineHost.status), privacy: .public) at main-queue commit (user Pause or concurrent start landed during the deferred hop)")
+              return
+            }
+            let outcome = HelperResumeAction.run(
+              engineHost: engineHost,
+              profileStore: helper.profileStore,
+              resolver: helper.launchSpecResolver
+            )
+            Log.helper.notice("auto-relaunch outcome: \(String(describing: outcome), privacy: .public)")
+          }
+        }
+      )
+      holder.helper = self
       self.engineHost = host
       // Phase 2.4: stand up the profile-backed LaunchSpec
       // resolver. ProfileStore.start failures fall back to the
