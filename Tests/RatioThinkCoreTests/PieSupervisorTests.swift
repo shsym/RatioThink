@@ -441,44 +441,51 @@ final class PieSupervisorTests: XCTestCase {
   // MARK: - F50: clearKillRejected recovery path
 
   func test_clearKillRejected_refusesWhenZombieAlive() throws {
-    let fake = try writeScript("pie-killreject2.sh", body: """
-      #!/bin/bash
-      sleep 3
-      """)
+    // Drive the zombie alive→dead transition through the
+    // `livenessOverride` seam instead of waiting on a real `sleep`
+    // subprocess to exit AND be wait4-reaped (the arbitrarily-delayed
+    // step that made this flake up to the 25s suite timeout under CI
+    // load). Entry into `.killRejected` still exercises the real
+    // spawn → handshake-timeout → SIGKILL-rejected path, but against
+    // a `FakeProcess` that forks no child, so there is nothing to
+    // schedule, exit, or reap. The whole alive→dead recovery now runs
+    // synchronously and deterministically.
+    let alive = OSAllocatedUnfairLock<Bool>(initialState: true)
     let sup = PieSupervisor(
-      policy: .init(handshakeTimeout: 0.3,
+      policy: .init(handshakeTimeout: 0.05,
                     restartAttempts: 1,
                     restartWindow: 30,
                     stopGracePeriod: 1,
                     stopOverrun: 1,
                     stdoutCarryLimit: 64 * 1024),
       logFileURL: logURL,
-      killProcessOverride: { _ in false }
+      recoveryManifestURL: tempDir.appendingPathComponent("manifest.json"),
+      processFactory: { FakeProcess() },
+      killProcessOverride: { _ in false },         // reject SIGKILL → enter .killRejected
+      livenessOverride: { _ in alive.withLock { $0 } }
     )
-    _ = sup.start(makeSpec(binary: fake, profileID: "chat"))
-    _ = waitFor(sup, predicate: { status in
-      if case .failed = status { return true }
-      return false
-    }, timeout: 3)
-    // Zombie pid (the bash sleep 3) is still alive at this point.
-    // clearKillRejected should refuse.
+    _ = sup.start(makeSpec(binary: tempDir.appendingPathComponent("unused-fake-binary"),
+                           profileID: "chat"))
+    // Reliable entry: the handshake timer (~50ms) fires, SIGKILL is
+    // rejected, supervisor enters .killRejected. No real child means
+    // this cannot starve under load.
+    waitFor(sup, predicate: { if case .failed(.killRejected, _) = $0 { return true }; return false },
+            timeout: 5)
+
+    // Override reports the zombie alive → recovery must refuse and
+    // stay in .killRejected.
     XCTAssertFalse(sup.clearKillRejected(),
-                   "clearKillRejected must refuse while zombie is alive")
-    // Wait for the bash process to exit on its own (sleep 3 → ~3s
-    // total). Then the recovery should succeed.
-    let recovered = OSAllocatedUnfairLock<Bool>(initialState: false)
-    let deadline = Date().addingTimeInterval(5)
-    while Date() < deadline {
-      if sup.clearKillRejected() {
-        recovered.withLock { $0 = true }
-        break
-      }
-      Thread.sleep(forTimeInterval: 0.2)
+                   "clearKillRejected must refuse while liveness override reports the zombie alive")
+    guard case .failed(.killRejected, _) = sup.status else {
+      return XCTFail("expected to remain .killRejected after refusal, got \(sup.status)")
     }
-    XCTAssertTrue(recovered.withLock { $0 },
-                  "clearKillRejected should succeed once zombie exits")
-    if case .stopped = sup.status { /* expected */ } else {
-      XCTFail("expected .stopped after clearKillRejected, got \(sup.status)")
+
+    // Flip the override to dead → recovery succeeds synchronously.
+    alive.withLock { $0 = false }
+    XCTAssertTrue(sup.clearKillRejected(),
+                  "clearKillRejected must succeed once liveness override reports the zombie dead")
+    guard case .stopped = sup.status else {
+      return XCTFail("expected .stopped after successful clearKillRejected, got \(sup.status)")
     }
   }
 
@@ -523,61 +530,64 @@ final class PieSupervisorTests: XCTestCase {
   // MARK: - F61: clearKillRejected from observer handler does not deadlock
 
   func test_clearKillRejected_safeFromObserverHandler() throws {
-    // The supervisor enters .killRejected; an observer fires; the
-    // handler calls clearKillRejected on the supervisor. Without
-    // the F61 stateQueue-affinity check, this would
-    // dispatch_sync-deadlock the supervisor's own queue.
-    let fake = try writeScript("pie-killreject3.sh", body: """
-      #!/bin/bash
-      sleep 0.3
-      """)
+    // Review v5 F61: an observer handler runs on the
+    // supervisor's stateQueue. Calling clearKillRejected() from
+    // inside it must take the queue-affinity inline path and must
+    // NOT dispatch_sync-deadlock the queue. The property under test
+    // is PURE re-entrancy — it never needed real process timing.
+    // Previously it was proven by polling until a real `sleep 0.3`
+    // zombie exited and was reaped, which flaked up to the 25s suite
+    // timeout under load. Now the `livenessOverride` seam drives the
+    // zombie alive→dead synchronously while the clearKillRejected
+    // calls are still made re-entrantly from the handler, so the
+    // no-deadlock guarantee is exercised on BOTH the refuse path
+    // (alive) and the success path (dead).
+    let alive = OSAllocatedUnfairLock<Bool>(initialState: true)
+    let refusedInlineWhileAlive = OSAllocatedUnfairLock<Bool>(initialState: false)
     let sup = PieSupervisor(
-      policy: .init(handshakeTimeout: 0.3,
+      policy: .init(handshakeTimeout: 0.05,
                     restartAttempts: 1,
                     restartWindow: 30,
                     stopGracePeriod: 1,
                     stopOverrun: 1,
                     stdoutCarryLimit: 64 * 1024),
       logFileURL: logURL,
-      killProcessOverride: { _ in false }
+      recoveryManifestURL: tempDir.appendingPathComponent("manifest.json"),
+      processFactory: { FakeProcess() },
+      killProcessOverride: { _ in false },
+      livenessOverride: { _ in alive.withLock { $0 } }
     )
-    _ = sup.start(makeSpec(binary: fake, profileID: "chat"))
-    // Wait for .failed(.killRejected). Process will keep running
-    // until sleep 0.3 expires; clearKillRejected refuses until
-    // then. Once isRunning flips false, calling from the observer
-    // must NOT deadlock.
+    // Only the .stopped reached THROUGH the killRejected→clear path
+    // is terminal — the supervisor also publishes its initial
+    // .stopped to a freshly-registered observer, which must not be
+    // mistaken for recovery.
+    let sawKillRejected = OSAllocatedUnfairLock<Bool>(initialState: false)
     let exp = expectation(description: "supervisor reached .stopped via observer-driven clearKillRejected")
     let token = sup.observe { status, token in
       if case .failed(.killRejected, _) = status {
-        // Attempt clearKillRejected from inside the handler. The
-        // first calls will refuse (zombie alive); the F61 check
-        // ensures none deadlock.
+        sawKillRejected.withLock { $0 = true }
+        // Re-entrant call #1 (zombie alive): must run INLINE and
+        // refuse. If the F61 affinity check were missing this would
+        // dispatch_sync-deadlock and the test would hang to timeout.
+        if sup.clearKillRejected() == false {
+          refusedInlineWhileAlive.withLock { $0 = true }
+        }
+        // Flip to dead, then re-entrant call #2: must run inline and
+        // succeed, transitioning to .stopped.
+        alive.withLock { $0 = false }
         _ = sup.clearKillRejected()
       }
-      if case .stopped = status {
+      if case .stopped = status, sawKillRejected.withLock({ $0 }) {
         token.cancel()
         exp.fulfill()
       }
     }
-    // Loop in the background calling clearKillRejected periodically
-    // so the test progresses once the bash sleep expires. The deadline
-    // must outlast process-death detection on a slow, contended CI
-    // runner AND stay below the `wait(for:)` timeout below, so the loop
-    // is still retrying when the supervisor finally reaches .stopped.
-    // The previous 5s/6s pair was too tight under load: the retry loop
-    // gave up ~1s before the wait timed out, intermittently failing.
-    // These are upper bounds — the happy path completes in well under a
-    // second, so widening them does not slow the suite or weaken any
-    // assertion.
-    DispatchQueue.global().async {
-      let deadline = Date().addingTimeInterval(20)
-      while Date() < deadline {
-        Thread.sleep(forTimeInterval: 0.1)
-        if sup.clearKillRejected() { return }
-      }
-    }
-    wait(for: [exp], timeout: 25)
+    _ = sup.start(makeSpec(binary: tempDir.appendingPathComponent("unused-fake-binary"),
+                           profileID: "chat"))
+    wait(for: [exp], timeout: 5)
     _ = token
+    XCTAssertTrue(refusedInlineWhileAlive.withLock { $0 },
+                  "clearKillRejected from the observer handler must run inline and refuse while the zombie is alive")
   }
 
   // MARK: - F62: post-handshake-crash backoff does not publish stale .running
@@ -962,4 +972,55 @@ final class PieSupervisorTests: XCTestCase {
     if result != .completed { return nil }
     return captured
   }
+}
+
+/// Test double for a `pie` engine process that forks no real
+/// child. `Process`/`NSTask` is an abstract class cluster, so a
+/// concrete subclass must provide its OWN storage for every property
+/// it is asked to set — NSTask.h: "You cannot use this property in a
+/// concrete subclass of NSTask which hasn't been updated to include
+/// an implementation of the storage and use of it." `PieSupervisor`
+/// `spawn` configures (`executableURL`, `arguments`, `environment`,
+/// `standardOutput/Error`, `terminationHandler`) and `run()`s it like
+/// any process; because `run()` is a no-op, Foundation never invokes
+/// the `terminationHandler`, so the incarnation stays `.starting`
+/// until the handshake timer fires. With a rejecting
+/// `killProcessOverride` that yields a deterministic entry into
+/// `.failed(.killRejected)` — no real subprocess to schedule, exit,
+/// or wait4-reap, and therefore no wall-clock flake.
+private final class FakeProcess: Process, @unchecked Sendable {
+  private var _executableURL: URL?
+  private var _arguments: [String]?
+  private var _environment: [String: String]?
+  private var _standardOutput: Any?
+  private var _standardError: Any?
+  private var _terminationHandler: (@Sendable (Process) -> Void)?
+
+  override var executableURL: URL? {
+    get { _executableURL }
+    set { _executableURL = newValue }
+  }
+  override var arguments: [String]? {
+    get { _arguments }
+    set { _arguments = newValue }
+  }
+  override var environment: [String: String]? {
+    get { _environment }
+    set { _environment = newValue }
+  }
+  override var standardOutput: Any? {
+    get { _standardOutput }
+    set { _standardOutput = newValue }
+  }
+  override var standardError: Any? {
+    get { _standardError }
+    set { _standardError = newValue }
+  }
+  override var terminationHandler: (@Sendable (Process) -> Void)? {
+    get { _terminationHandler }
+    set { _terminationHandler = newValue }
+  }
+  override var processIdentifier: Int32 { 0 }
+  override var isRunning: Bool { false }
+  override func run() throws {}
 }
