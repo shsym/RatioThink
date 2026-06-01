@@ -306,6 +306,15 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app.helper")
     app.launchEnvironment["PIE_HOME"] = tempDir.path
     app.launchEnvironment["PIE_ALLOW_UNSIGNED_CALLERS"] = "1"
+    // Pin the guardrail's view of physical RAM (DEBUG-only seam in
+    // SystemMemory.physicalBytes) to 8 GiB, so the launch-time limit is
+    // max(0, 8 − 6 GiB reserve) × 0.65 ≈ 1.3 GiB. That makes the 8 GiB
+    // sparse default deterministically oversized on any runner, regardless
+    // of its real RAM (this 64 GiB host's real limit is ~37.7 GiB, which an
+    // 8 GiB model would not exceed). Faking RAM smaller only makes the
+    // guardrail stricter, and the rejection is pre-launch — pie never reads
+    // the (bogus, sparse) model, so there is no real load or memory cost.
+    app.launchEnvironment["PIE_TEST_PHYSICAL_MEMORY_BYTES"] = "8589934592"
     app.launch()
     defer { app.terminate() }
 
