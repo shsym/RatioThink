@@ -25,9 +25,11 @@ struct ChatScaffoldView: View {
   @EnvironmentObject private var modelLoadCenter: ModelLoadCenter
   @EnvironmentObject private var engineStatusStore: EngineStatusStore
   @EnvironmentObject private var profileStore: ProfileStore
-  /// : shown when the user tries to send with no model resolvable
-  /// (no per-chat override, nothing resident). Blocks the send and
-  /// offers to load the active profile's default model — never silent.
+  /// Shown when a send is blocked because no model resolves yet. #326
+  /// decides the model-availability action (Load / Download / unavailable
+  /// via `noModelAction`); #397 layers the engine/model lifecycle framing
+  /// on top (`chatStartState` → calm "starting / loading…" instead of the
+  /// error-toned "No model loaded" while the engine is still coming up).
   @State private var showNoModelPrompt = false
   /// The recovery action for the no-model prompt, captured at the
   /// instant the send is blocked (when `selectedProfileID` is settled
@@ -241,10 +243,17 @@ struct ChatScaffoldView: View {
     .background(Color(nsColor: .windowBackgroundColor))
     .sheet(isPresented: $showNoModelPrompt) {
       NoModelLoadedPrompt(
+        // #397: the lifecycle state gives the prompt its "starting /
+        // loading…" framing while the engine/model comes up.
+        gateState: chatStartState,
+        // #326: the model-availability action (Load / Download /
+        // unavailable) captured when the send was blocked.
         action: noModelAction,
         onLoad: { model in
-          swapCoordinator.loadDirect(modelID: model)
-          showNoModelPrompt = false
+          // #397: ensure the engine is running FIRST, then load — the
+          // pre-#397 `loadDirect` no-opped on a stopped engine. The sheet
+          // stays open, reflects busy→ready, and auto-dismisses below.
+          loadDefaultModel(model)
         },
         onDownloaded: {
           // Model is now on disk — boot the engine on this chat's
@@ -265,6 +274,11 @@ struct ChatScaffoldView: View {
       // action error can't outlive the condition it described.
       if case .failed = new {} else { engineActionError = nil }
     }
+    // #397: auto-dismiss the gate once a model resolves (engine came up
+    // and reconciled, or a load completed) so the user lands back at the
+    // composer with their draft intact — no stale "starting…" sheet.
+    .onChange(of: modelLoadCenter.residentModelID) { _, _ in dismissPromptIfResolved() }
+    .onChange(of: viewModel.modelOverride) { _, _ in dismissPromptIfResolved() }
     .onAppear {
       // Seed the toolbar from the persisted profile so the menu
       // label matches what the chat was created with.
@@ -375,6 +389,52 @@ struct ChatScaffoldView: View {
       residentModelID: modelLoadCenter.residentModelID,
       testModelID: ProcessInfo.processInfo.environment["PIE_TEST_CHAT_MODEL"]
     )
+  }
+
+  /// #397: the live engine/model lifecycle state driving the gate's
+  /// "starting / loading…" framing. Folds engine status + helper
+  /// reachability + model-load state + the active profile's default into
+  /// one explicit state. The model-availability action (Load / Download /
+  /// unavailable) stays #326's `MissingModelRecovery`; this only decides
+  /// the lifecycle framing (chiefly: is the engine/model still busy?).
+  private var chatStartState: ChatStartGate.State {
+    ChatStartGate.evaluate(
+      engineStatus: engineStatusStore.status,
+      helperError: engineStatusStore.lastError,
+      load: modelLoadCenter.state,
+      resolvedModelID: currentModelID(),
+      profileDefault: profileStore.model(forProfileID: viewModel.selectedProfileID),
+      profileError: profileStore.lastActiveProfileError?.description
+    )
+  }
+
+  /// "Load default" action. Honors the no-eager-load invariant — only
+  /// runs because the user tapped Load. #397: ensures the engine is
+  /// running FIRST (the App's only engine-start path), since a load
+  /// against a stopped engine would otherwise just defer on
+  /// `engineNotReady`. The sheet stays open and reflects busy→ready, then
+  /// auto-dismisses via `dismissPromptIfResolved`.
+  private func loadDefaultModel(_ model: String) {
+    switch engineStatusStore.status {
+    case .running:
+      // Engine up — load the model directly (`/v1/models/load`).
+      swapCoordinator.loadDirect(modelID: model)
+    case .stopped, .failed:
+      // Bring the engine up bound to this chat's profile; v1 pie loads
+      // the profile's model at boot, and `reconcileEngineResidentModel`
+      // picks it up once `.running`.
+      startEngineForSelectedProfile()
+    case .starting, .stopping:
+      break  // already in flight — the busy state already reflects this
+    }
+  }
+
+  /// #397: close the gate once a model resolves so the user lands back at
+  /// the composer with their draft intact.
+  private func dismissPromptIfResolved() {
+    if showNoModelPrompt, currentModelID() != nil {
+      showNoModelPrompt = false
+    }
   }
 
   /// Resolve the model a send should target. : no hidden fallback —
