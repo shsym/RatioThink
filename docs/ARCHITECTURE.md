@@ -131,8 +131,11 @@ its HTTP listener and routes each request to it (`Inferlets/chat-apc/src/lib.rs`
 
 "APC" is **A**daptive **P**ersonality/**C**apability: the chat loop runs decoder
 wrappers (`chat/apc.rs`) alongside the base decoder. The reasoning decoder emits
-`reasoning_content` deltas for `<think>` blocks; the tool-use decoder is wired but
-dormant in v1 (OpenAI client-side tool-call model). The control plane is a thin
+`reasoning_content` deltas for `<think>` blocks. The tool-use decoder is fully
+implemented — it emits OpenAI `tool_calls` (with `finish_reason: "tool_calls"`)
+whenever a request supplies a `tools` array — but the v1 RatioThink app never
+sends `tools`, so it stays dormant in the shipping product (OpenAI client-side
+tool-call model). The control plane is a thin
 registry view — because the model is already loaded at boot, `/v1/models/load`
 just confirms the model and emits `model_ready`.
 

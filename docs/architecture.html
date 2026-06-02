@@ -216,7 +216,7 @@
       tag:"chat-apc inferlet", title:"chat-apc (wasm)",
       user:"The only inferlet RatioThink ships. pie installs it at startup and routes HTTP requests to it. It presents the OpenAI-compatible endpoints — chat completions plus health and model listing — so any OpenAI client can talk to your local engine.",
       tech:[["Serves","/healthz · /v1/models · /v1/chat/completions · /v1/models/load · /v1/inferlet"],
-            ["APC","Adaptive Personality/Capability decoders — reasoning active, tool-use stubbed in v1"],
+            ["APC","Adaptive Personality/Capability decoders. Reasoning is active. The tool-use decoder is fully implemented — it emits OpenAI tool_calls (finish_reason: tool_calls) when a request supplies a tools array — but the v1 RatioThink app never sends tools, so it stays dormant in the shipping product."],
             ["Note","ONE inferlet for both planes; there is no separate pie-control inferlet"]]}
   };
 
