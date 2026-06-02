@@ -135,9 +135,17 @@ engine-clean: ## Remove pie engine build artifacts
 	cd Vendor/pie && cargo clean
 	rm -rf build/pie-engine
 
+# Optional local signing for the non-notarized DMG: set SIGN_IDENTITY (cert
+# name or SHA-1) and/or DEVELOPMENT_TEAM to team-sign with a local Apple
+# Development identity (needed for SMAppService to register the Helper). Unset,
+# the build auto-detects an Apple Development identity in the keychain, else
+# falls back to ad-hoc / unsigned. Export so both `VAR=… make dmg-arm64` and
+# `make dmg-arm64 VAR=…` reach package-dmg.sh.
+export SIGN_IDENTITY DEVELOPMENT_TEAM
+
 dmg-arm64: ARCH := arm64
 dmg-x86_64: ARCH := x86_64
-dmg-arm64 dmg-x86_64: genproject ## Build arch-specific RatioThink-<arch>.dmg (release)
+dmg-arm64 dmg-x86_64: genproject ## Build RatioThink-<arch>.dmg (release; SIGN_IDENTITY/DEVELOPMENT_TEAM team-signs, else auto-detect Apple Development, else ad-hoc)
 	Scripts/package-dmg.sh --arch $(ARCH)
 
 release-dmg-arm64: ARCH := arm64

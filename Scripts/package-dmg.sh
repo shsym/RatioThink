@@ -106,6 +106,33 @@ if [[ "$NOTARIZE" -eq 1 && -z "$IDENTITY" ]]; then
   echo "package-dmg.sh: Developer ID signing identity = $IDENTITY"
 fi
 
+# Non-notarize signing. Default to a real Apple Development identity so the
+# packaged app + embedded Helper carry one consistent Team ID: SMAppService
+# anchors the launchd Helper to that team, and an ad-hoc ("-") signature has no
+# team for it to bind (the Helper then fails to register). Resolution order
+# (an explicit --identity and the --notarize / Developer ID path above both
+# take precedence and are left untouched):
+#   1. SIGN_IDENTITY env override (name or SHA-1); DEVELOPMENT_TEAM is its
+#      companion team override, applied via SIGN_ARGS below.
+#   2. else auto-detect an "Apple Development" identity in the keychain, pinned
+#      by SHA-1 (mirrors the Developer ID auto-detect block above).
+#   3. else fall back to ad-hoc / unsigned (the project default) so CI and
+#      contributors without a signing certificate still build.
+if [[ "$NOTARIZE" -eq 0 && -z "$IDENTITY" ]]; then
+  if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+    IDENTITY="$SIGN_IDENTITY"
+    echo "package-dmg.sh: signing identity from SIGN_IDENTITY override"
+  else
+    IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+      | awk '/Apple Development/ {print $2; exit}')"
+    if [[ -n "$IDENTITY" ]]; then
+      echo "package-dmg.sh: auto-detected an Apple Development identity in the keychain (set SIGN_IDENTITY / DEVELOPMENT_TEAM to override)"
+    else
+      echo "package-dmg.sh: no Apple Development identity (no --identity, no SIGN_IDENTITY, none in keychain) — building ad-hoc / unsigned"
+    fi
+  fi
+fi
+
 # Pass identity through to the build-pie-engine.sh phase via env var.
 # Xcode forwards $CODE_SIGN_IDENTITY into the script env automatically;
 # we override here only when the caller supplied --identity.
@@ -113,9 +140,10 @@ SIGN_ARGS=()
 if [[ -n "$IDENTITY" ]]; then
   SIGN_ARGS+=("CODE_SIGN_IDENTITY=$IDENTITY")
 fi
-# Manual signing (project.yml default) resolves a Developer ID cert by
-# DEVELOPMENT_TEAM when set; pass it through so notarized builds bind to the
-# right team without editing project.yml.
+# Manual signing (project.yml default) binds the build to a team when
+# DEVELOPMENT_TEAM is set; pass it through so the signed app + Helper anchor to
+# the right team without editing project.yml (used by both the notarize and
+# Apple Development paths).
 if [[ -n "${DEVELOPMENT_TEAM:-}" ]]; then
   SIGN_ARGS+=("DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM")
 fi
