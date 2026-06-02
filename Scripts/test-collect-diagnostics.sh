@@ -219,6 +219,114 @@ assert_contains "$bundleH/report.txt" "OK: no failure signature"              "H
 assert_contains "$bundleH/report.txt" "No recent Unified Log activity confirmed" "H: unverified-activity headline"
 refute_contains "$bundleH/report.txt" "recent activity found"                 "H: does not claim recent activity"
 
+echo "case Fc: seeded pie crash report (pie-<date>.ips) -> ENGINE_FAILED + collected"
+FC="$WORK_ROOT/Fc"; mkdir -p "$FC/out" "$FC/crash" "$FC/home/logs"
+mini_app "$FC/app/RatioThink.app"
+echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$FC/home/logs/helper.log"
+# The engine reports as `pie` -> pie-<date>.ips; classify() greps -name
+# 'pie-[0-9]*' and section_crash_reports copies it into crash-reports/.
+echo '{"app_name":"pie","fake":"crash"}' > "$FC/crash/pie-2026-05-30-120000.ips"
+RATIOTHINK_APP="$FC/app/RatioThink.app" PIE_HOME="$FC/home" RATIOTHINK_DIAG_CRASH_DIR="$FC/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$FC/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleFc="$(extract_bundle "$FC/out" "$FC/x")"
+assert_contains "$bundleFc/report.txt" "ENGINE_FAILED" "Fc: seeded pie crash trips ENGINE_FAILED"
+assert_exists "$bundleFc/crash-reports/pie-2026-05-30-120000.ips" "Fc: pie crash report copied into bundle"
+
+# --- chat-collection removal (#399) -----------------------------------------
+# Privacy invariant: a diagnostics bundle must NEVER carry chat content, under
+# any flag, from any copy of the script. Exercised against the source script
+# and, when a built app is discoverable, the app-bundled Resources copy too.
+
+# Seed a PIE_HOME that DOES contain chats.sqlite, so "no chat artifact" is a
+# real exclusion assertion (the file exists to be left out, not merely absent).
+seed_chat_home() { # <home_dir>
+  mkdir -p "$1/logs"
+  echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$1/logs/helper.log"
+  # Recognizable payload — if any byte lands in the bundle, the test fails.
+  printf 'SQLite format 3\000CHATSECRET_user_said_hello\n' > "$1/chats.sqlite"
+}
+# Fail if any chat artifact (file name or payload bytes) is in <bundle_dir>.
+assert_no_chats() { # <bundle_dir> <label>
+  local d="$1" lbl="$2" hit
+  hit="$(find "$d" -type f \( -name '*.sqlite' -o -name 'chats*' \) 2>/dev/null)"
+  if [ -n "$hit" ]; then bad "$lbl (chat file in bundle: $hit)"; return; fi
+  if grep -rqlF "CHATSECRET" "$d" 2>/dev/null; then
+    bad "$lbl (chat payload bytes leaked into bundle)"; return; fi
+  ok "$lbl"
+}
+
+# Discover the app-bundled copy (project.yml cp's it verbatim into
+# Contents/Resources). Explicit override > RATIOTHINK_APP bundle > std install.
+# Absent => a LOUD note (never a silent skip); the static guard (case K) still
+# proves drift cannot ship the flag without any build.
+BUNDLED_SCRIPT=""
+if [ -n "${RATIOTHINK_BUNDLED_SCRIPT:-}" ] && [ -f "${RATIOTHINK_BUNDLED_SCRIPT}" ]; then
+  BUNDLED_SCRIPT="$RATIOTHINK_BUNDLED_SCRIPT"
+elif [ -n "${RATIOTHINK_APP:-}" ] && [ -f "${RATIOTHINK_APP}/Contents/Resources/collect-diagnostics.sh" ]; then
+  BUNDLED_SCRIPT="${RATIOTHINK_APP}/Contents/Resources/collect-diagnostics.sh"
+elif [ -f "/Applications/RatioThink.app/Contents/Resources/collect-diagnostics.sh" ]; then
+  BUNDLED_SCRIPT="/Applications/RatioThink.app/Contents/Resources/collect-diagnostics.sh"
+fi
+SCRIPTS_UNDER_TEST=("$SCRIPT")
+if [ -n "$BUNDLED_SCRIPT" ]; then
+  SCRIPTS_UNDER_TEST+=("$BUNDLED_SCRIPT")
+  echo "note: also exercising app-bundled copy: $BUNDLED_SCRIPT"
+else
+  echo "note: no app-bundled copy found — running source-only chat E2E."
+  echo "      to also exercise the shipped artifact, build/install the app and re-run:"
+  echo "        make install-app                       # build + sign into /Applications"
+  echo "        RATIOTHINK_APP=/Applications/RatioThink.app Scripts/test-collect-diagnostics.sh"
+  echo "      (case K below still proves no --include-chats can ship via packaging drift)"
+fi
+
+i=0
+for SUT in "${SCRIPTS_UNDER_TEST[@]}"; do
+  tag="src"; [ "$i" -gt 0 ] && tag="bundled"; i=$((i+1))
+
+  echo "case I[$tag]: chats.sqlite present + NORMAL run -> bundle excludes all chat content"
+  ID="$WORK_ROOT/I$tag"; mkdir -p "$ID/out" "$ID/crash"
+  seed_chat_home "$ID/home"; mini_app "$ID/app/RatioThink.app"
+  RATIOTHINK_APP="$ID/app/RatioThink.app" PIE_HOME="$ID/home" \
+  RATIOTHINK_DIAG_CRASH_DIR="$ID/crash" RATIOTHINK_DIAG_OUT_DIR="$ID/out" \
+    bash "$SUT" --window 1m >/dev/null
+  bundleI="$(extract_bundle "$ID/out" "$ID/x")"
+  assert_exists "$bundleI/report.txt"  "I[$tag]: bundle produced"
+  assert_no_chats "$bundleI"           "I[$tag]: no chat artifact in normal bundle"
+
+  echo "case J[$tag]: old --include-chats flag never yields chat content"
+  JD="$WORK_ROOT/J$tag"; mkdir -p "$JD/out" "$JD/crash"
+  seed_chat_home "$JD/home"; mini_app "$JD/app/RatioThink.app"
+  rc=0
+  RATIOTHINK_APP="$JD/app/RatioThink.app" PIE_HOME="$JD/home" \
+  RATIOTHINK_DIAG_CRASH_DIR="$JD/crash" RATIOTHINK_DIAG_OUT_DIR="$JD/out" \
+    bash "$SUT" --window 1m --include-chats >/dev/null 2>&1 || rc=$?
+  # Acceptable: fail clearly (exit!=0, no bundle) OR ignore safely (bundle with
+  # no chats). NEVER: succeed with chats. Both branches assert no chat leak.
+  zJ="$(find "$JD/out" -maxdepth 1 -name '*.zip' 2>/dev/null | head -1)"
+  if [ "$rc" -ne 0 ]; then
+    ok "J[$tag]: --include-chats rejected (exit $rc, fails clearly)"
+    [ -z "$zJ" ] && ok "J[$tag]: rejection produced no bundle" \
+                 || bad "J[$tag]: rejection still wrote a bundle ($zJ)"
+  else
+    bundleJ="$(extract_bundle "$JD/out" "$JD/x")"
+    assert_no_chats "$bundleJ" "J[$tag]: ignored-flag bundle carries no chats"
+  fi
+  if find "$JD/out" -type f -name '*.sqlite' 2>/dev/null | grep -q .; then
+    bad "J[$tag]: chats.sqlite leaked into out dir"
+  else ok "J[$tag]: no chats.sqlite under out dir"; fi
+done
+
+echo "case K: packaging-drift guard — no chat collection in source, shipped verbatim"
+refute_contains "$SCRIPT" "include-chats" "K: source script has no --include-chats"
+refute_contains "$SCRIPT" "chats.sqlite"  "K: source script never references chats.sqlite"
+# project.yml bundles via a verbatim cp of THIS exact source path, so the shipped
+# Resources copy is byte-identical — drift cannot reintroduce the flag.
+assert_contains "$ROOT/project.yml" 'cp "${SRCROOT}/Scripts/collect-diagnostics.sh"' \
+  "K: project.yml bundles the source script verbatim (cp)"
+if [ -n "$BUNDLED_SCRIPT" ]; then
+  refute_contains "$BUNDLED_SCRIPT" "include-chats" "K: app-bundled copy has no --include-chats"
+fi
+
 echo
 echo "collect-diagnostics self-test: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

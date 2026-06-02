@@ -33,11 +33,10 @@ set -u
 
 usage() {
   cat <<'USAGE'
-Usage: collect-diagnostics.sh [--window <dur>] [--out <path>] [--include-chats]
+Usage: collect-diagnostics.sh [--window <dur>] [--out <path>]
 
   --window <dur>     Unified Logging look-back window (default: 2h). e.g. 30m, 6h, 1d
   --out <path>       Write the .zip to this exact path (default: ~/Desktop/RatioThink-diagnostics-<stamp>.zip)
-  --include-chats    Also bundle chats.sqlite (OFF by default — may contain chat text)
   -h, --help         Show this help
 
 Produces a redacted .zip and prints a terminal summary classifying the failure
@@ -47,12 +46,10 @@ USAGE
 
 WINDOW="2h"
 OUT=""
-INCLUDE_CHATS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --window) WINDOW="${2:-}"; shift 2 ;;
     --out)    OUT="${2:-}"; shift 2 ;;
-    --include-chats) INCLUDE_CHATS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -167,9 +164,6 @@ section_app_logs() {
     find "$LOGS_DIR" -maxdepth 1 -type f -name '*.log*' \
       -exec cp {} "$dest/" \; 2>/dev/null || true
   fi
-  if [ "$INCLUDE_CHATS" -eq 1 ] && [ -f "$ROOT/chats.sqlite" ]; then
-    cp "$ROOT/chats.sqlite" "$dest/" 2>/dev/null || true
-  fi
   [ -n "$(ls -A "$dest" 2>/dev/null)" ] || echo "(app-owned logs dir empty or absent: $LOGS_DIR)" > "$dest/NONE.txt"
 }
 
@@ -269,10 +263,11 @@ classify() {
 
 redact_all() {
   # Collapse the real home prefix and scrub obvious secrets across every text
-  # artifact in the bundle (not the opt-in chats.sqlite binary).
+  # artifact in the bundle. Diagnostics never bundles chat content (#399), so
+  # every collected file is redactable text.
   local home_esc
   home_esc="$(printf '%s' "$HOME" | sed -e 's/[&#\\]/\\&/g')"
-  find "$WORK" -type f ! -name '*.sqlite' -print0 2>/dev/null | while IFS= read -r -d '' f; do
+  find "$WORK" -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
     LC_ALL=C sed -i '' -E \
       -e "s#${home_esc}#~#g" \
       -e 's/hf_[A-Za-z0-9]+/hf_REDACTED/g' \

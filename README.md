@@ -80,8 +80,9 @@ status, the launchd helper state, the running-process list, recent macOS
 Unified Logging for `com.ratiothink*`, recent crash reports, and the app's own
 breadcrumb logs (`app.log` / `helper.log` / `engine.log`). It is **redacted**:
 your home path is collapsed to `~` and obvious tokens are stripped. Chat
-contents are **not** included unless you pass `--include-chats`. Other flags:
-`--window <dur>` (Unified Logging look-back, default `2h`) and `--out <path>`.
+contents are **never** included — diagnostics carry logs, status, and config
+metadata only. Flags: `--window <dur>` (Unified Logging look-back, default
+`2h`) and `--out <path>`.
 
 ## Repo layout
 
