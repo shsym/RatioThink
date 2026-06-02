@@ -22,7 +22,8 @@ below in the same change.
 | `make test-collect-diagnostics` | `Scripts/collect-diagnostics.sh` self-test (redacted diagnostics bundle) | anywhere | — (in CI) |
 | `make test-dmg-layout` | DMG drag-install layout verifier regression (hdiutil + codesign) | anywhere | — (in CI) |
 | `make test-release` | real-tool contract tests for `notarize.sh` + `release-preflight.sh` | anywhere | — (in CI) |
-| `make test-stamp` | `Inferlets/pie-control/_stamp.py` unit tests | anywhere | — |
+| `make test-stamp` | `Inferlets/chat-apc/_stamp.py` unit tests | anywhere | — |
+| `make test-e2e-http` | chat-apc HTTP API stress + SSE/concurrency + OpenAI tool-call contract (`e2e_test.py` + `stress_e2e_test.py`) vs the **dummy driver** | anywhere (headless) | self-bootstraps `pie` + wasm; needs `uv` + Qwen3-0.6B `config.json`+`tokenizer.json` in HF cache (no weights/GPU) |
 | `make test-ssh` | `test-unit` + `test-scenario` + `test-smoke` + `test-install-guards` | anywhere (no GUI) | — |
 | `make test-gui` | GUI scenarios (S4, S5, and the rest of `Tests/GUIScenarioTests`) via XCUITest | **seated session** | `Dock` running; Automation/Accessibility TCC |
 | `make test-gui-history` | Deterministic  multi-turn history/resume E2E | **seated session** | `PIE_TEST_TCC_GRANTED=1` |
@@ -123,8 +124,13 @@ best-effort and a no-op under the sandboxed runner.
 `make test-scenario` → SpawnEnvSanitizer canary → inferlet build/stamp verify.
 
 **CI does NOT cover** (headless runners, no model/engine):
-- any **GUI** scenario (`guardSeatedGUI` skips them all), and
-- any **real-model** path (S258, packaged-model, S3-real).
+- any **GUI** scenario (`guardSeatedGUI` skips them all),
+- any **real-model** path (S258, packaged-model, S3-real), and
+- the **HTTP API E2E** (`make test-e2e-http`) — dummy-driver only (no GPU,
+  no model weights) so it is CI-*eligible*, but it needs the `pie` binary
+  built + the small Qwen3-0.6B `config.json`/`tokenizer.json` in the HF
+  cache; provisioning those into `lint.yml` is a tracked follow-up. Run it
+  locally/by operator for now.
 
 There is **no local git hook**. So GUI + real-model proof is manual and
 developer-owned. A PR touching those areas must carry its own evidence (log /
@@ -140,6 +146,7 @@ wrapper PASS line) in the PR body.
 | First-launch / wizard / model download | `S7_*` GUI suites + `make test-gui-first-launch-package` |
 | Engine launch / supervisor / XPC / helper | `make test-ssh` (incl. `test-smoke`) + `S4_HelperMenuBarGUITests`; real-engine S3 (Appendix A) if launch args changed |
 | Engine subprocess / inference contract | S3-real (Appendix A) + `make test-stamp` if inferlet stamps touched |
+| chat-apc HTTP routes / SSE / tool calling (`Inferlets/chat-apc/src`) | `make test-e2e-http` (rebuilds wasm + restamps via `stamp-inferlets` if you edited `src/`) |
 | Broad / release / "everything" | `make test-all` on a seated session (real-model wrappers run separately) |
 
 Rule of thumb: always run `make test-ssh` (cheap, runs anywhere); add the GUI

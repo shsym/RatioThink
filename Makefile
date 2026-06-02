@@ -61,7 +61,7 @@ endef
 .PHONY: help genproject build build-tests clean lint \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
         test-xcode-chat-scaffold \
-        test-unit test-scenario test-smoke test-install-guards \
+        test-unit test-scenario test-smoke test-install-guards test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
         test-e2e-engine test-e2e-models test-e2e-load test-e2e-chat test-e2e-full test-helper-respawn \
@@ -211,6 +211,14 @@ test-smoke: engine-build $(LOGDIR) ## Engine subprocess smoke (depends on built 
 test-install-guards: ## Install-time launchd-safety regression guards (stubbed, deterministic — runs anywhere)
 	Scripts/test-proc-acceptance.sh
 	Scripts/test-source-closed.sh
+
+test-e2e-http: $(LOGDIR) ## HTTP API stress + tool-call contract E2E (dummy driver; self-bootstraps pie+wasm; needs uv + Qwen3-0.6B config/tokenizer in HF cache)
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-http-e2e.log; \
+	  Scripts/run-http-e2e.sh 2>&1 | tee $$LOG | tail -50; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  exit $$status
 
 test-gui-script: ## Fast preflight regressions for GUI E2E wrappers
 	Scripts/test-run-stage-test-model.sh

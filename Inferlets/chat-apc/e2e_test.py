@@ -836,124 +836,124 @@ async def main() -> int:
                             "control flow + live-driver coverage in "
                         )
 
-                # APC plumbing-alive ( Phase 2): the chat handler
-                # now wires `inferlet::tools::equip_prefix` +
-                # `ToolUseDecoder` + `ReasoningDecoder` into the
-                # generation loop. The dummy driver can't drive a
-                # real forward pass and (depending on the
-                # model template) may have no tool surface, so we
-                # only assert that:
-                #   1. valid OpenAI tools[] payloads PARSE (not 400),
-                #   2. the response stays inside the canonical
-                #      envelope (200 with assistant message, or 500
-                #      with a known error code from the new wiring).
-                # Semantic correctness — tool_call detection,
-                # reasoning_content content — requires a live model
-                # and is gated behind .
-                tool_payload = {
-                    "model": model_id,
-                    "messages": [{"role": "user", "content": "What is 2+2?"}],
-                    "stream": False,
-                    "tools": [{
-                        "type": "function",
-                        "function": {
-                            "name": "calculator",
-                            "description": "Evaluate an arithmetic expression.",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {"expr": {"type": "string"}},
-                                "required": ["expr"],
-                            },
-                        },
-                    }],
-                    "tool_choice": "auto",
-                }
-                r = await http.post(
-                    f"{base}/v1/chat/completions", json=tool_payload
-                )
-                print(
-                    f"[harness] POST /v1/chat/completions(tools+tool_choice) "
-                    f"-> {r.status_code}"
-                )
-                if r.status_code == 400:
-                    failures.append(
-                        f"/v1/chat/completions tools-param parse: 400 "
-                        f"{r.text!r} (tools[] schema should deserialize)"
-                    )
-                elif r.status_code == 200:
-                    body = r.json()
-                    msg = body.get("choices", [{}])[0].get("message", {})
-                    if msg.get("role") != "assistant":
-                        failures.append(
-                            f"/v1/chat/completions tools 200 body shape: "
-                            f"missing assistant message: {body!r}"
-                        )
-                elif r.status_code == 500:
-                    code = r.json().get("error", {}).get("code")
-                    if code not in (
-                        "tool_equip_failed",
-                        "tool_decode_failed",
-                        "forward_pass_failed",
-                        "decode_failed",
-                        "reasoning_decode_failed",
-                        "model_load_failed",
-                        "context_create_failed",
-                    ):
-                        failures.append(
-                            f"/v1/chat/completions tools 500 code={code!r} "
-                            f"not in APC-wiring set"
-                        )
-                else:
-                    failures.append(
-                        f"/v1/chat/completions tools status {r.status_code} "
-                        f"unexpected"
-                    )
-
-                # Reasoning plumbing-alive: the ReasoningDecoder runs
-                # unconditionally on every request. Send a prompt
-                # that *would* trigger a thinking model and confirm
-                # the streaming envelope still parses end-to-end —
-                # no frame should be malformed even when no reasoning
-                # tokens are produced. reasoning_content is omitted
-                # via `skip_serializing_if = Option::is_none`, so a
-                # well-behaved stream has the same shape as before
-                # the wiring landed (regression guard).
-                r = await http.post(
-                    f"{base}/v1/chat/completions",
-                    json={
+                    # APC plumbing-alive ( Phase 2): the chat handler
+                    # now wires `inferlet::tools::equip_prefix` +
+                    # `ToolUseDecoder` + `ReasoningDecoder` into the
+                    # generation loop. The dummy driver can't drive a
+                    # real forward pass and (depending on the
+                    # model template) may have no tool surface, so we
+                    # only assert that:
+                    #   1. valid OpenAI tools[] payloads PARSE (not 400),
+                    #   2. the response stays inside the canonical
+                    #      envelope (200 with assistant message, or 500
+                    #      with a known error code from the new wiring).
+                    # Semantic correctness — tool_call detection,
+                    # reasoning_content content — requires a live model
+                    # and is gated behind .
+                    tool_payload = {
                         "model": model_id,
-                        "messages": [
-                            {"role": "system", "content": "Think step by step."},
-                            {"role": "user", "content": "Solve: 17*24+13"},
-                        ],
-                        "stream": True,
-                    },
-                )
-                print(
-                    f"[harness] POST /v1/chat/completions(reasoning-prompt) "
-                    f"-> {r.status_code}"
-                )
-                if r.status_code != 200:
-                    failures.append(
-                        f"/v1/chat/completions reasoning stream status {r.status_code}"
+                        "messages": [{"role": "user", "content": "What is 2+2?"}],
+                        "stream": False,
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "calculator",
+                                "description": "Evaluate an arithmetic expression.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"expr": {"type": "string"}},
+                                    "required": ["expr"],
+                                },
+                            },
+                        }],
+                        "tool_choice": "auto",
+                    }
+                    r = await http.post(
+                        f"{base}/v1/chat/completions", json=tool_payload
                     )
-                else:
-                    data_lines = [
-                        line[len("data: "):]
-                        for line in r.text.splitlines()
-                        if line.startswith("data: ")
-                    ]
-                    for d in data_lines:
-                        if d == "[DONE]":
-                            continue
-                        try:
-                            _json.loads(d)
-                        except _json.JSONDecodeError as e:
+                    print(
+                        f"[harness] POST /v1/chat/completions(tools+tool_choice) "
+                        f"-> {r.status_code}"
+                    )
+                    if r.status_code == 400:
+                        failures.append(
+                            f"/v1/chat/completions tools-param parse: 400 "
+                            f"{r.text!r} (tools[] schema should deserialize)"
+                        )
+                    elif r.status_code == 200:
+                        body = r.json()
+                        msg = body.get("choices", [{}])[0].get("message", {})
+                        if msg.get("role") != "assistant":
                             failures.append(
-                                f"/v1/chat/completions reasoning stream: "
-                                f"malformed frame {d!r}: {e}"
+                                f"/v1/chat/completions tools 200 body shape: "
+                                f"missing assistant message: {body!r}"
                             )
-                            break
+                    elif r.status_code == 500:
+                        code = r.json().get("error", {}).get("code")
+                        if code not in (
+                            "tool_equip_failed",
+                            "tool_decode_failed",
+                            "forward_pass_failed",
+                            "decode_failed",
+                            "reasoning_decode_failed",
+                            "model_load_failed",
+                            "context_create_failed",
+                        ):
+                            failures.append(
+                                f"/v1/chat/completions tools 500 code={code!r} "
+                                f"not in APC-wiring set"
+                            )
+                    else:
+                        failures.append(
+                            f"/v1/chat/completions tools status {r.status_code} "
+                            f"unexpected"
+                        )
+
+                    # Reasoning plumbing-alive: the ReasoningDecoder runs
+                    # unconditionally on every request. Send a prompt
+                    # that *would* trigger a thinking model and confirm
+                    # the streaming envelope still parses end-to-end —
+                    # no frame should be malformed even when no reasoning
+                    # tokens are produced. reasoning_content is omitted
+                    # via `skip_serializing_if = Option::is_none`, so a
+                    # well-behaved stream has the same shape as before
+                    # the wiring landed (regression guard).
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [
+                                {"role": "system", "content": "Think step by step."},
+                                {"role": "user", "content": "Solve: 17*24+13"},
+                            ],
+                            "stream": True,
+                        },
+                    )
+                    print(
+                        f"[harness] POST /v1/chat/completions(reasoning-prompt) "
+                        f"-> {r.status_code}"
+                    )
+                    if r.status_code != 200:
+                        failures.append(
+                            f"/v1/chat/completions reasoning stream status {r.status_code}"
+                        )
+                    else:
+                        data_lines = [
+                            line[len("data: "):]
+                            for line in r.text.splitlines()
+                            if line.startswith("data: ")
+                        ]
+                        for d in data_lines:
+                            if d == "[DONE]":
+                                continue
+                            try:
+                                _json.loads(d)
+                            except _json.JSONDecodeError as e:
+                                failures.append(
+                                    f"/v1/chat/completions reasoning stream: "
+                                    f"malformed frame {d!r}: {e}"
+                                )
+                                break
 
                 await client.close()
 

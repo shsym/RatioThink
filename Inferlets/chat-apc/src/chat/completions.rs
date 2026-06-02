@@ -45,6 +45,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use inferlet::chat;
 use inferlet::Context;
+use inferlet::GrammarConstraint;
 use inferlet::model::Model;
 use inferlet::runtime;
 use inferlet::sample::Sampler;
@@ -1729,6 +1730,24 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             .await;
     }
 
+    // `tool_choice: "required" | {function}` constrains generation to the
+    // model's native tool-call grammar (OpenAI tool_choice enforcement).
+    // Built BEFORE the Emitter so an unsatisfiable directive returns a
+    // clean 4xx JSON envelope instead of a half-open stream.
+    let tool_constraint = match build_forced_tool_constraint(
+        &model,
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+    ) {
+        Ok(c) => c,
+        Err((status, code, msg)) => {
+            return res
+                .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
+                .await;
+        }
+    };
+    let forced_tool = tool_constraint.is_some();
+
     // Headers committed; from here we must finish via the Emitter.
     let mut em = Emitter::start(res);
     let id = next_id();
@@ -1801,6 +1820,9 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
         .generate(sampler)
         .max_tokens(max_tokens)
         .stop(&stop_tokens);
+    if let Some(c) = tool_constraint {
+        stream = stream.constrain(c);
+    }
     let mut decoder = chat::Decoder::new(&model);
     // Reasoning decoder is always live — cheap on models without a
     // thinking template (returns `Idle` for every batch). Tool-use
@@ -1909,7 +1931,14 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
         }
 
         match decoder.feed(&out.tokens) {
-            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) => {
+            // When a forced `tool_choice` constrains output to the
+            // tool-call grammar, the ENTIRE generation IS the call
+            // (`root` has no free-text alternative), so suppress the
+            // visible content channel — the call rides only the terminal
+            // `tool_calls` delta (OpenAI emits content:null alongside
+            // tool_calls). Composes with the reasoning content gate; the
+            // suppressed deltas fall through to the no-op arm below.
+            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) && !forced_tool => {
                 let chunk = ChatCompletionChunk {
                     id: &id,
                     object: "chat.completion.chunk",
@@ -2079,6 +2108,23 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
             .await;
     }
 
+    // tool_choice enforcement (mirrors handle_streaming): constrain to the
+    // model's native tool-call grammar when a call is forced; an
+    // unsatisfiable directive returns a 4xx before generation begins.
+    let tool_constraint = match build_forced_tool_constraint(
+        &model,
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+    ) {
+        Ok(c) => c,
+        Err((status, code, msg)) => {
+            return res
+                .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
+                .await;
+        }
+    };
+    let forced_tool = tool_constraint.is_some();
+
     let sampler = Sampler::TopP {
         temperature,
         p: top_p,
@@ -2088,6 +2134,9 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         .generate(sampler)
         .max_tokens(max_tokens)
         .stop(&stop_tokens);
+    if let Some(c) = tool_constraint {
+        stream = stream.constrain(c);
+    }
     let mut decoder = chat::Decoder::new(&model);
     let mut reason_dec = ReasoningDecoder::new(&model);
     let mut tool_dec = ToolUseDecoder::new(&model);
@@ -2172,7 +2221,9 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         }
 
         match decoder.feed(&out.tokens) {
-            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) => {
+            // Forced tool_choice suppresses visible content (see
+            // handle_streaming) — the call surfaces only via tool_calls.
+            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) && !forced_tool => {
                 full_text.push_str(&s)
             }
             Ok(chat::Event::Delta(_)) => {}
@@ -2338,6 +2389,117 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
 // Internals
 // =============================================================================
 
+/// OpenAI `tool_choice` reduced to whether — and how — it FORCES a tool
+/// call. Only the force-a-call modes enable constrained generation;
+/// `"none"` / `"auto"` / absent leave generation unconstrained (the prior
+/// behavior — `tool_choice` was parsed-but-ignored).
+enum ForcedToolChoice {
+    /// `"none"`, `"auto"`, or absent → do not constrain.
+    No,
+    /// `"required"` → constrain to the grammar over ALL equipped tools.
+    Any,
+    /// `{"type":"function","function":{"name":N}}` → constrain to the one
+    /// named function so the call's `name` is pinned.
+    Named(String),
+}
+
+/// Classify `tool_choice`. Unknown / malformed shapes degrade to `No`
+/// (parsed-but-ignored) rather than erroring — matches the lenient
+/// `#[serde(default)]` posture on the field.
+fn forced_tool_choice(tc: Option<&serde_json::Value>) -> ForcedToolChoice {
+    let Some(v) = tc else { return ForcedToolChoice::No };
+    if let Some(s) = v.as_str() {
+        return if s == "required" {
+            ForcedToolChoice::Any
+        } else {
+            ForcedToolChoice::No
+        };
+    }
+    if v.get("type").and_then(|t| t.as_str()) == Some("function")
+        && let Some(name) = v
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+        && !name.is_empty()
+    {
+        return ForcedToolChoice::Named(name.to_string());
+    }
+    ForcedToolChoice::No
+}
+
+/// Build the `{name, description, parameters}` JSON envelopes the host's
+/// `equip_prefix` / `native_grammar` expect from the OpenAI `tools[]`.
+/// Non-function variants are dropped (the model template can't encode
+/// them). `only` (a named `tool_choice`) restricts to a single function so
+/// the constrain grammar pins that name.
+fn tool_envelopes(tools: &[ToolSchema], only: Option<&str>) -> Vec<String> {
+    tools
+        .iter()
+        .filter(|t| t.kind.is_empty() || t.kind == "function")
+        .filter(|t| only.is_none_or(|n| t.function.name == n))
+        .map(|t| {
+            serde_json::json!({
+                "name": t.function.name,
+                "description": t.function.description.as_deref().unwrap_or(""),
+                "parameters": t.function.parameters,
+            })
+            .to_string()
+        })
+        .collect()
+}
+
+/// When `tool_choice` forces a call, constrain generation to the model's
+/// native tool-call grammar. This is real OpenAI `tool_choice` enforcement
+/// (previously a no-op) AND the mechanism that makes a tool call
+/// deterministic on the dummy driver — the dummy honors the grammar's
+/// per-step logit mask, and the Qwen tool grammar's `root` forces a
+/// `<tool_call>{…}</tool_call>` with the name pinned to the equipped
+/// tool(s). Returns:
+///   * `Ok(None)`      — not forced; leave generation unconstrained.
+///   * `Ok(Some(c))`   — forced + model has a native tool grammar.
+///   * `Err((status,code,msg))` — forced but unsatisfiable (no matching
+///     tool in `tools[]`, or the model has no native tool-call grammar) →
+///     the caller returns this OpenAI-shape error instead of silently
+///     ignoring the directive.
+fn build_forced_tool_constraint(
+    model: &Model,
+    tools: Option<&[ToolSchema]>,
+    tool_choice: Option<&serde_json::Value>,
+) -> Result<Option<GrammarConstraint>, (u16, &'static str, String)> {
+    let only = match forced_tool_choice(tool_choice) {
+        ForcedToolChoice::No => return Ok(None),
+        ForcedToolChoice::Any => None,
+        ForcedToolChoice::Named(n) => Some(n),
+    };
+    let envelopes = tool_envelopes(tools.unwrap_or(&[]), only.as_deref());
+    if envelopes.is_empty() {
+        return Err((
+            400,
+            "invalid_request",
+            match &only {
+                Some(n) => format!(
+                    "tool_choice names function '{n}' but it is not present in tools[]"
+                ),
+                None => "tool_choice is \"required\" but tools[] is empty".to_string(),
+            },
+        ));
+    }
+    // `native_grammar` returns `None` gracefully when the model has no
+    // tool-call format (unlike `native_matcher`, which would trap). Gate
+    // on it, then wrap the grammar in a matcher-backed constraint.
+    match inferlet::tools::native_grammar(model, &envelopes) {
+        Some(grammar) => Ok(Some(GrammarConstraint::from_grammar(&grammar, model))),
+        None => Err((
+            400,
+            "tool_choice_unsupported",
+            "tool_choice forces a tool call but this model has no native \
+             tool-call grammar (constrained tool calling is unsupported for \
+             this architecture)"
+                .to_string(),
+        )),
+    }
+}
+
 /// Apply role-tagged messages to `ctx` via the SDK's chat templating
 /// and, when `tools` is non-empty, splice the model's native tool
 /// schema preamble via `inferlet::tools::equip_prefix`. Equip runs
@@ -2354,22 +2516,12 @@ fn fill_context(
     tools: Option<&[ToolSchema]>,
 ) -> Result<(), (&'static str, String)> {
     if let Some(tools) = tools {
-        let envelopes: Vec<String> = tools
-            .iter()
-            // The SDK's `equip_prefix` expects `{name, description,
-            // parameters}` per entry; the OpenAI `type:"function"`
-            // wrapper is stripped here. Non-function variants are
-            // ignored — the model template has no encoding for them.
-            .filter(|t| t.kind.is_empty() || t.kind == "function")
-            .map(|t| {
-                serde_json::json!({
-                    "name": t.function.name,
-                    "description": t.function.description.as_deref().unwrap_or(""),
-                    "parameters": t.function.parameters,
-                })
-                .to_string()
-            })
-            .collect();
+        // The SDK's `equip_prefix` expects `{name, description,
+        // parameters}` per entry; the OpenAI `type:"function"` wrapper is
+        // stripped here. Non-function variants are ignored — the model
+        // template has no encoding for them. All tools are equipped
+        // (visible to the model) regardless of `tool_choice`.
+        let envelopes = tool_envelopes(tools, None);
         if !envelopes.is_empty() {
             let prefix = inferlet::tools::equip_prefix(model, &envelopes)
                 .map_err(|e| ("tool_equip_failed", format!("equip_prefix: {e}")))?;
