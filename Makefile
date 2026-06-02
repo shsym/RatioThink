@@ -293,8 +293,11 @@ test-e2e-models: ## E2E area: model discovery/download/verify + unverified badge
 	Scripts/run-unverified-badge-e2e.sh
 	Scripts/run-real-model-acquisition.sh
 
-test-e2e-load: ## E2E area: model-load indicator path-1 loading→ready + cancel (S302, mock harness)
+test-e2e-load: ## E2E area: model-load indicator path-1 loading→ready + cancel + #396 honest popover (S302, mock harness)
 	Scripts/run-gui-load-indicator-e2e.sh
+
+test-e2e-396: ## E2E area: #396 failed-load Retry recovery + Dismiss-clears (S396, fail-first mock harness)
+	Scripts/run-gui-396-retry-e2e.sh
 
 test-e2e-chat: ## E2E area: real small-model chat send streams + persists (S258, real Qwen3-0.6B)
 	Scripts/run-chat-gui-e2e.sh

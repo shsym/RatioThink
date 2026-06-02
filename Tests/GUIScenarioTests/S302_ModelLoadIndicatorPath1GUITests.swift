@@ -75,9 +75,55 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     // shorter than the hold would flake when the hold is raised.
     let hold = try Self.holdSeconds()
     XCTAssertTrue(
-      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 10),
+      waitForLabel(indicator, beginsWith: "Engine running, model", timeout: hold + 10),
       "toolbar.modelLoadIndicator did not clear to the 'Model loaded:' ready ring within hold+10 "
         + "(hold=\(hold)s); label=\(indicator.label); app: \(app.debugDescription)")
+  }
+
+  // MARK: - #396: the loading popover shows an honest indeterminate
+  // status, never a bare "—" primary value
+
+  /// The loadviz harness emits no `model_loading` byte/eta frame (exactly
+  /// pie-control v1's shape), so a held load is genuinely indeterminate
+  /// (loaded=0/total=0/eta=nil). The popover must say "Preparing…" — an
+  /// honest "we're working on it" — and MUST NOT render the old bare "—"
+  /// for a live load. This is the EXECUTED counterpart to the pure
+  /// `ModelLoadPopover.loadingDetail` unit coverage (#396).
+  @MainActor
+  func test_path1_loading_popover_shows_honest_indeterminate_not_dash() throws {
+    let app = try launchedApp()
+    defer { app.terminate() }
+
+    try triggerExplicitLoad(in: app)
+
+    let indicator = app.buttons["toolbar.modelLoadIndicator"].firstMatch
+    XCTAssertTrue(
+      indicator.waitForExistence(timeout: 10),
+      "toolbar.modelLoadIndicator was never instantiated — ContentToolbar wiring regression? "
+        + "app: \(app.debugDescription)")
+    XCTAssertTrue(
+      waitForLabel(indicator, beginsWith: "Loading model", timeout: 15),
+      "indicator never entered the loading state; label=\(indicator.label); app: \(app.debugDescription)")
+
+    // Open the popover DURING the hold and read its detail rows.
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
+                  "indicator popover did not open; app: \(app.debugDescription)")
+
+    // Honest indeterminate primary: a byte-less held load reads
+    // "Preparing…" (U+2026), not "Loaded —" / "ETA —".
+    XCTAssertTrue(
+      app.popovers.staticTexts["Preparing…"].waitForExistence(timeout: 5),
+      "loading popover did not show the honest 'Preparing…' status; the live load is "
+        + "indeterminate so it must read 'Preparing…', not a bare dash; "
+        + "popover: \(app.popovers.firstMatch.debugDescription)")
+
+    // The #396 regression guard: no bare "—" primary anywhere in a live
+    // load's popover (the original ticket complaint was a "-- ETA").
+    XCTAssertFalse(
+      app.popovers.staticTexts["—"].exists,
+      "loading popover rendered a bare '—' primary — unknown ETA/bytes must read "
+        + "'Preparing…'/'Estimating…', never a meaningless dash (#396); "
+        + "popover: \(app.popovers.firstMatch.debugDescription)")
   }
 
   // MARK: - mid-load cancel: opening info never cancels; only the
@@ -145,10 +191,17 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     // and pass `XCTAssertFalse(false)` after the window had already
     // returned. Deriving from the hold catches that.
     let hold = try Self.holdSeconds()
+    // Model-specific: post-#327 the pip folds engine status, and the
+    // harness's 2-entry /v1/models reconcile pre-sets a `loadviz-resident`
+    // stub, so "Engine running, model …" can legitimately show that stub
+    // even after a cancel. The cancel guarantee is narrower: the model
+    // the user cancelled (`menuModelLeaf`) must never become the resident
+    // one — a completed load would read "Engine running, model <leaf>
+    // resident".
     XCTAssertFalse(
-      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 5),
-      "cancelled load still completed to 'Model loaded:' within hold+slack (hold=\(hold)s); "
-        + "the cancel did not stop the load; app: \(app.debugDescription)")
+      waitForLabel(indicator, beginsWith: "Engine running, model \(Self.menuModelLeaf)", timeout: hold + 5),
+      "cancelled load still completed to a resident \(Self.menuModelLeaf) within hold+slack "
+        + "(hold=\(hold)s); the cancel did not stop the load; app: \(app.debugDescription)")
   }
 
   // MARK: - "Keep Loading" backs out of the confirm without cancelling
@@ -189,7 +242,7 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     // harness releases its hold.
     let hold = try Self.holdSeconds()
     XCTAssertTrue(
-      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 15),
+      waitForLabel(indicator, beginsWith: "Engine running, model", timeout: hold + 15),
       "'Keep Loading' aborted the load instead of letting it finish; "
         + "label=\(indicator.label); app: \(app.debugDescription)")
   }
@@ -215,14 +268,14 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     // Unload is real-engine-meaningful today (pie supports unload).
     let hold = try Self.holdSeconds()
     XCTAssertTrue(
-      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 15),
+      waitForLabel(indicator, beginsWith: "Engine running, model", timeout: hold + 15),
       "load never reached the '.ready' ring; label=\(indicator.label); app: \(app.debugDescription)")
 
     // (1) Opening the indicator popover is info-only — it must NOT unload
     // the resident model (#359 acceptance: click is read-only in running).
     XCTAssertTrue(openIndicatorPopover(indicator, in: app),
                   "indicator popover did not open; app: \(app.debugDescription)")
-    XCTAssertTrue(indicator.label.hasPrefix("Model loaded:"),
+    XCTAssertTrue(indicator.label.hasPrefix("Engine running, model"),
                   "opening the popover unloaded the model — click must be info-only; "
                     + "label=\(indicator.label); app: \(app.debugDescription)")
 
@@ -243,7 +296,7 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     XCTAssertTrue(keepLoaded.waitForExistence(timeout: 5),
                   "clicking Unload did not surface the 'Keep Loaded' confirm — confirm gate missing; "
                     + "app: \(app.debugDescription)")
-    XCTAssertTrue(indicator.label.hasPrefix("Model loaded:"),
+    XCTAssertTrue(indicator.label.hasPrefix("Engine running, model"),
                   "arming the confirm unloaded the model — unload must be confirmed, not on first click; "
                     + "label=\(indicator.label); app: \(app.debugDescription)")
 
@@ -258,7 +311,7 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     confirmUnload.click()
 
     XCTAssertTrue(
-      waitUntilLabelClears(indicator, prefix: "Model loaded:", timeout: 10),
+      waitUntilLabelClears(indicator, prefix: "Engine running, model", timeout: 10),
       "model did not unload after confirmed Unload — 'Model loaded:' never cleared; "
         + "label=\(indicator.label); app: \(app.debugDescription)")
   }
@@ -280,7 +333,7 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
 
     let hold = try Self.holdSeconds()
     XCTAssertTrue(
-      waitForLabel(indicator, beginsWith: "Model loaded:", timeout: hold + 15),
+      waitForLabel(indicator, beginsWith: "Engine running, model", timeout: hold + 15),
       "load never reached the '.ready' ring; label=\(indicator.label); app: \(app.debugDescription)")
 
     // Arm Unload (the .ready confirm prompt appears: "Keep Loaded" + "Unload").
@@ -306,7 +359,7 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     XCTAssertTrue(waitForNoPopover(app, timeout: 5),
                   "popover did not dismiss on an outside click; app: \(app.debugDescription)")
     // Dismissing without confirming must NOT unload — model stays resident.
-    XCTAssertTrue(indicator.label.hasPrefix("Model loaded:"),
+    XCTAssertTrue(indicator.label.hasPrefix("Engine running, model"),
                   "dismissing the armed confirm unloaded the model; "
                     + "label=\(indicator.label); app: \(app.debugDescription)")
 

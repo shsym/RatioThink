@@ -28,8 +28,23 @@ from pathlib import Path
 
 
 class State:
-    def __init__(self, hold_seconds: float):
+    def __init__(self, hold_seconds: float, fail_load_attempts: int = 0):
         self.hold_seconds = hold_seconds
+        # #396 retry coverage: fail the FIRST `fail_load_attempts`
+        # `/v1/models/load` requests with HTTP 500 so ModelLoadCenter goes
+        # `.failed`, then succeed (hold -> model_ready) on the next attempt
+        # — the popover's Retry re-invokes the stored factory, which must
+        # recover. 0 = legacy behaviour (every load succeeds).
+        self.fail_load_attempts = fail_load_attempts
+        self._load_calls = 0
+        self._lock = threading.Lock()
+
+    def should_fail_load(self) -> bool:
+        """Atomically count this /v1/models/load and report whether it is
+        within the leading failure window."""
+        with self._lock:
+            self._load_calls += 1
+            return self._load_calls <= self.fail_load_attempts
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -69,6 +84,12 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         _ = self.rfile.read(length)
         if self.path == "/v1/models/load":
+            # #396 retry coverage: fail the leading N loads with HTTP 500
+            # so ModelLoadCenter goes `.failed`; the popover's Retry then
+            # re-invokes the stored factory and the next attempt recovers.
+            if self.server.state.should_fail_load():
+                self.send_error(500, "loadviz forced load failure (#396 retry coverage)")
+                return
             # Production path-1 load. Hold (model still loading) then
             # `model_ready`. NO `model_loading` frame — `.loading` is set
             # locally by ModelLoadCenter.load() at load-start, so the
@@ -136,6 +157,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port-file", required=True)
     parser.add_argument("--hold-seconds", type=float, default=8.0)
+    parser.add_argument("--fail-load-attempts", type=int, default=0,
+                        help="fail the first N /v1/models/load requests with "
+                             "HTTP 500 before succeeding (#396 retry coverage)")
     args = parser.parse_args()
 
     port_file = Path(args.port_file)
@@ -146,7 +170,7 @@ def main() -> int:
     # F5): handler threads exit with the server on `kill $HARNESS_PID`,
     # no lingering sleeping handlers.
     server.daemon_threads = True
-    server.state = State(args.hold_seconds)
+    server.state = State(args.hold_seconds, fail_load_attempts=args.fail_load_attempts)
     host, port = server.server_address
     port_file.write_text(f"http://{host}:{port}", encoding="utf-8")
     print(f"loadviz-harness: listening http://{host}:{port} hold={args.hold_seconds}s", flush=True)
