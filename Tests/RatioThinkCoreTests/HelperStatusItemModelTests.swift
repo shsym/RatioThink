@@ -110,4 +110,40 @@ final class HelperStatusItemModelTests: XCTestCase {
                    "killRejected must surface as red dot — supervisor refuses re-start")
     XCTAssertFalse(m.pauseResume.enabled)
   }
+
+  // MARK: - #396 working-state affordance (motion + not color-only)
+
+  /// The transitional `.loading` dot must be distinguishable from
+  /// `.running` by SHAPE, not color alone — a colorblind user otherwise
+  /// cannot tell "engine starting" (amber) from "engine running" (green)
+  /// since both were `circle.fill`.
+  func test_loading_symbol_is_distinct_from_running_notColorOnly() {
+    XCTAssertNotEqual(
+      HelperStatusItemModel.Dot.loading.symbolName,
+      HelperStatusItemModel.Dot.running.symbolName,
+      "loading and running must differ by symbol, not just tint color (#396)"
+    )
+  }
+
+  /// Every dot maps to a concrete SF Symbol name (the view no longer
+  /// owns the symbol decision — it reads it off the pure model so the
+  /// mapping is testable without AppKit).
+  func test_symbolNames_are_stable() {
+    XCTAssertEqual(HelperStatusItemModel.Dot.stopped.symbolName, "circle")
+    XCTAssertEqual(HelperStatusItemModel.Dot.loading.symbolName, "circle.dotted")
+    XCTAssertEqual(HelperStatusItemModel.Dot.running.symbolName, "circle.fill")
+    XCTAssertEqual(HelperStatusItemModel.Dot.error.symbolName, "exclamationmark.circle.fill")
+  }
+
+  /// A running async operation (engine starting/stopping) must carry an
+  /// active affordance — the view animates while `isAnimated`, so the
+  /// menu-bar dot is never a *static* colored dot for in-progress work
+  /// (#396 invariant 1). Steady states do not animate.
+  func test_only_loading_dot_animates() {
+    XCTAssertTrue(HelperStatusItemModel.Dot.loading.isAnimated,
+                  "transitional starting/stopping must show motion, not a static dot")
+    XCTAssertFalse(HelperStatusItemModel.Dot.stopped.isAnimated)
+    XCTAssertFalse(HelperStatusItemModel.Dot.running.isAnimated)
+    XCTAssertFalse(HelperStatusItemModel.Dot.error.isAnimated)
+  }
 }

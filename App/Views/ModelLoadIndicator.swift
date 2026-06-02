@@ -325,8 +325,7 @@ struct ModelLoadPopover: View {
       case let .engineNotReady(_, detail):
         engineNotReadyBlock(detail: detail)
       default:
-        bytesRow
-        etaRow
+        loadDetailRows
         if let memory, Self.showsMemoryRow(centerState: center.state, engineRunningOrReady: isEngineRunningOrReady) {
           memoryRow(memory)
         }
@@ -434,6 +433,17 @@ struct ModelLoadPopover: View {
       }
       .accessibilityIdentifier("modelLoad.popover.unload")
     case .failed, .engineNotReady:
+      // #396: a failed/deferred load is otherwise a dead end with only
+      // "Dismiss". Offer Retry as the recovery action — re-runs the same
+      // load via the center's retained factory (`retryLast`). Not
+      // destructive (it starts work, doesn't stop it), so no confirm
+      // gate; Dismiss stays the default key so the safe non-reloading
+      // choice is the accidental one.
+      Button("Retry") {
+        center.retryLast()
+        isPresented = false
+      }
+      .accessibilityIdentifier("modelLoad.popover.retry")
       Button("Dismiss") {
         // Use the documented public API instead of the test-only
         // `_testOverrideState` seam — the seam internally calls
@@ -602,23 +612,48 @@ struct ModelLoadPopover: View {
     .accessibilityIdentifier("modelLoad.popover.engineNotReady")
   }
 
-  private var bytesRow: some View {
-    HStack {
-      Text("Loaded")
-        .foregroundStyle(.secondary)
-      Spacer()
-      Text(bytesText)
-        .monospacedDigit()
+  /// In-progress / settled load detail. #396: a live load never shows
+  /// "—" as a primary value. Covers the body switch's `default:` branch
+  /// (`.loading` / `.ready` / `.idle` / `.cancelled` — the failed &
+  /// engine-not-ready states render their own blocks above). The memory
+  /// row is still appended separately by the body.
+  @ViewBuilder
+  private var loadDetailRows: some View {
+    switch center.state {
+    case .loading:
+      switch Self.loadingDetail(for: center.state, fraction: center.progress) {
+      case .preparing:
+        // No byte total and nothing transferred yet — the only honest
+        // thing to say is "working on it". The spinning ring carries the
+        // motion; this avoids a bogus "Loaded —" / "ETA —" pair.
+        detailRow("Status", "Preparing…")
+      case let .indeterminate(loaded):
+        detailRow("Loaded", loaded)
+        detailRow("ETA", "Estimating…")
+      case let .determinate(loaded, eta):
+        detailRow("Loaded", loaded)
+        detailRow("ETA", eta)
+      case .none:
+        EmptyView()
+      }
+    case .ready:
+      // Resident model — the load is done, so no bytes/ETA rows (the
+      // old code showed a stale "—/—" pair here). The memory row below
+      // carries the useful readout.
+      detailRow("Status", "Loaded — resident")
+    case .cancelled:
+      detailRow("Status", "Load cancelled")
+    case .idle, .failed, .engineNotReady:
+      EmptyView()
     }
-    .font(.callout)
   }
 
-  private var etaRow: some View {
+  private func detailRow(_ label: String, _ value: String) -> some View {
     HStack {
-      Text("ETA")
+      Text(label)
         .foregroundStyle(.secondary)
       Spacer()
-      Text(etaText)
+      Text(value)
         .monospacedDigit()
     }
     .font(.callout)
@@ -664,20 +699,40 @@ struct ModelLoadPopover: View {
     }
   }
 
-  private var bytesText: String {
-    guard case let .loading(_, loaded, total, _) = center.state else {
-      return "—"
-    }
-    if total == 0 {
-      return formatMB(loaded)
-    }
-    return "\(formatMB(loaded)) / \(formatMB(total))"
+  // MARK: - load detail (pure, #396)
+
+  /// Pure description of the in-progress load detail, so the
+  /// "never render — for a live load" rule (#396) is unit-testable
+  /// without standing up the SwiftUI view.
+  enum LoadingDetail: Equatable {
+    /// Indeterminate with no byte info yet → single "Preparing…" line.
+    case preparing
+    /// Bytes flowing but no transfer-rate sample yet → loaded amount +
+    /// an honest "Estimating…" ETA.
+    case indeterminate(loaded: String)
+    /// Byte progress (and possibly ETA) known. `eta` is already the
+    /// honest string — a real duration, or "Estimating…" when the rate
+    /// sample is still missing — never "—".
+    case determinate(loaded: String, eta: String)
   }
 
-  private var etaText: String {
-    guard case let .loading(_, _, _, eta) = center.state, let eta else {
-      return "—"
+  static func loadingDetail(for state: ModelLoadCenter.State, fraction: Double?) -> LoadingDetail? {
+    guard case let .loading(_, loaded, total, eta) = state else { return nil }
+    // `fraction != nil` is the single determinacy source shared with the
+    // ring + label (matches ModelLoadCenter.progress).
+    if fraction != nil {
+      return .determinate(loaded: bytesPair(loaded, total), eta: etaString(eta))
     }
+    if loaded > 0 {
+      return .indeterminate(loaded: formatMB(loaded))
+    }
+    return .preparing
+  }
+
+  /// Honest ETA copy. Unknown ETA is metadata-not-yet-known, not an
+  /// error, so it reads "Estimating…" — never a meaningless dash (#396).
+  static func etaString(_ eta: Double?) -> String {
+    guard let eta else { return "Estimating…" }
     if eta < 1 { return "< 1 s" }
     if eta < 60 { return "\(Int(eta.rounded())) s" }
     let mins = Int(eta) / 60
@@ -685,7 +740,11 @@ struct ModelLoadPopover: View {
     return "\(mins) min \(secs) s"
   }
 
-  private func formatMB(_ bytes: UInt64) -> String {
+  static func bytesPair(_ loaded: UInt64, _ total: UInt64) -> String {
+    "\(formatMB(loaded)) / \(formatMB(total))"
+  }
+
+  static func formatMB(_ bytes: UInt64) -> String {
     let mb = Double(bytes) / (1024.0 * 1024.0)
     if mb >= 1024 {
       return String(format: "%.2f GB", mb / 1024.0)

@@ -124,4 +124,56 @@ final class ModelLoadIndicatorLabelTests: XCTestCase {
     let err = EngineIndicatorError(kind: .engineFailed, title: "Engine failed", message: "x", invitesModelChoice: false)
     XCTAssertEqual(ModelLoadIndicator.dotColor(for: .error(err)), .red)
   }
+
+  // MARK: - #396 popover detail (honest indeterminate — never "—" for a live load)
+
+  private let mb: UInt64 = 1024 * 1024
+
+  /// A load that has reported no byte total and no bytes yet is honestly
+  /// indeterminate — the popover shows "Preparing…", never a "—" ETA.
+  func test_loadingDetail_indeterminate_noBytes_isPreparing() {
+    let state = ModelLoadCenter.State.loading(modelID: "m", loadedBytes: 0, totalBytes: 0, etaSeconds: nil)
+    XCTAssertEqual(ModelLoadPopover.loadingDetail(for: state, fraction: nil), .preparing)
+  }
+
+  /// Bytes are flowing but the engine has no transfer-rate sample yet:
+  /// show the loaded amount and an honest "Estimating…" ETA, not "—".
+  func test_loadingDetail_indeterminate_withBytes_showsLoaded_andEstimating() {
+    let state = ModelLoadCenter.State.loading(modelID: "m", loadedBytes: 128 * mb, totalBytes: 0, etaSeconds: nil)
+    XCTAssertEqual(
+      ModelLoadPopover.loadingDetail(for: state, fraction: nil),
+      .indeterminate(loaded: "128 MB")
+    )
+  }
+
+  /// Determinate load with a real ETA shows both concrete values.
+  func test_loadingDetail_determinate_withEta_showsBytesAndEta() {
+    let state = ModelLoadCenter.State.loading(modelID: "m", loadedBytes: 256 * mb, totalBytes: 1024 * mb, etaSeconds: 6.0)
+    XCTAssertEqual(
+      ModelLoadPopover.loadingDetail(for: state, fraction: 0.25),
+      .determinate(loaded: "256 MB / 1.00 GB", eta: "6 s")
+    )
+  }
+
+  /// Determinate progress but still no rate sample: the ETA is honestly
+  /// "Estimating…" — the bug this ticket fixes was rendering "—" here.
+  func test_loadingDetail_determinate_withoutEta_showsEstimating_notDash() {
+    let state = ModelLoadCenter.State.loading(modelID: "m", loadedBytes: 256 * mb, totalBytes: 1024 * mb, etaSeconds: nil)
+    let detail = ModelLoadPopover.loadingDetail(for: state, fraction: 0.25)
+    XCTAssertEqual(detail, .determinate(loaded: "256 MB / 1.00 GB", eta: "Estimating…"))
+    if case let .determinate(_, eta) = detail {
+      XCTAssertNotEqual(eta, "—", "unknown ETA must never render as a meaningless dash (#396)")
+    } else {
+      XCTFail("expected determinate detail")
+    }
+  }
+
+  /// Non-loading states have no load detail — the popover renders their
+  /// own block (resident / failed / cancelled), never the "—/—" rows.
+  func test_loadingDetail_isNil_for_nonLoading_states() {
+    XCTAssertNil(ModelLoadPopover.loadingDetail(for: .ready(modelID: "m"), fraction: nil))
+    XCTAssertNil(ModelLoadPopover.loadingDetail(for: .idle, fraction: nil))
+    XCTAssertNil(ModelLoadPopover.loadingDetail(for: .cancelled(modelID: "m"), fraction: nil))
+    XCTAssertNil(ModelLoadPopover.loadingDetail(for: .failed(modelID: "m", message: "x"), fraction: nil))
+  }
 }

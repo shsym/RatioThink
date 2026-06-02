@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 import os
 
 /// Engine-death (D2) — the auto-relaunch closure handed to
@@ -657,13 +658,17 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     HelperStatusItemBinding(
       setDot: { [weak self] dot in
         guard let self, let button = self.statusItem?.button else { return }
-        let (symbolName, color) = Self.symbolForDot(dot)
-        let config = NSImage.SymbolConfiguration(paletteColors: [color])
-        let img = NSImage(systemSymbolName: symbolName,
+        let config = NSImage.SymbolConfiguration(paletteColors: [Self.colorForDot(dot)])
+        let img = NSImage(systemSymbolName: dot.symbolName,
                           accessibilityDescription: "Pie engine \(dot.rawValue)")?
           .withSymbolConfiguration(config)
         img?.isTemplate = false
         button.image = img
+        // #396: a transitional dot (engine starting/stopping) is an
+        // in-flight async op, so it must show MOTION — never a static
+        // colored dot. Steady states remove the pulse so the menu bar
+        // is quiet when the engine is settled.
+        Self.applyDotPulse(animated: dot.isAnimated, to: button)
       },
       setEngineLabel: { [weak self] title in
         self?.engineLabelMenuItem?.title = title
@@ -687,16 +692,48 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     )
   }
 
-  /// SF Symbol + tint color for each dot state. Kept here (not in
-  /// `HelperStatusItemModel`) because `NSColor` lives in AppKit and
-  /// the model is RatioThinkCore (no AppKit). The pure model decides the
-  /// `Dot` enum; the view picks the rendering.
-  private static func symbolForDot(_ dot: HelperStatusItemModel.Dot) -> (String, NSColor) {
+  /// Tint color for each dot state. Kept here (not in
+  /// `HelperStatusItemModel`) because `NSColor` lives in AppKit and the
+  /// model is RatioThinkCore (no AppKit). The pure model decides the
+  /// `Dot` enum AND the SF Symbol name (`dot.symbolName`, #396 — so the
+  /// shape mapping is unit-testable); the view only picks the tint.
+  private static func colorForDot(_ dot: HelperStatusItemModel.Dot) -> NSColor {
     switch dot {
-    case .stopped: return ("circle", .secondaryLabelColor)
-    case .loading: return ("circle.fill", .systemYellow)
-    case .running: return ("circle.fill", .systemGreen)
-    case .error:   return ("exclamationmark.circle.fill", .systemRed)
+    case .stopped: return .secondaryLabelColor
+    case .loading: return .systemYellow
+    case .running: return .systemGreen
+    case .error:   return .systemRed
+    }
+  }
+
+  /// Layer-animation key for the transitional-dot pulse. A constant so
+  /// the add/remove pair can never drift.
+  private static let dotPulseAnimationKey = "com.ratiothink.helper.dotPulse"
+
+  /// Drive (or stop) a gentle opacity pulse on the menu-bar dot so an
+  /// in-progress engine transition reads as *active work*, not a stuck
+  /// static dot (#396 invariant 1). Layer-backed opacity animation
+  /// rather than a `Timer` so the cadence is owned by Core Animation and
+  /// stops cleanly on removal — no timer to invalidate on teardown. The
+  /// pulse survives the per-apply `button.image` reassignment because it
+  /// targets `layer.opacity`, not the image.
+  private static func applyDotPulse(animated: Bool, to button: NSStatusBarButton) {
+    button.wantsLayer = true
+    guard let layer = button.layer else { return }
+    if animated {
+      // Idempotent: re-applying the same state (e.g. starting → stopping,
+      // both `.loading`) must not restart the animation mid-cycle.
+      guard layer.animation(forKey: dotPulseAnimationKey) == nil else { return }
+      let pulse = CABasicAnimation(keyPath: "opacity")
+      pulse.fromValue = 1.0
+      pulse.toValue = 0.3
+      pulse.duration = 0.7
+      pulse.autoreverses = true
+      pulse.repeatCount = .infinity
+      pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+      layer.add(pulse, forKey: dotPulseAnimationKey)
+    } else {
+      layer.removeAnimation(forKey: dotPulseAnimationKey)
     }
   }
 
