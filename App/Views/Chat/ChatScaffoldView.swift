@@ -27,16 +27,14 @@ struct ChatScaffoldView: View {
   @EnvironmentObject private var profileStore: ProfileStore
   /// Shown when a send is blocked because no model resolves yet. #326
   /// decides the model-availability action (Load / Download / unavailable
-  /// via `noModelAction`); #397 layers the engine/model lifecycle framing
-  /// on top (`chatStartState` → calm "starting / loading…" instead of the
-  /// error-toned "No model loaded" while the engine is still coming up).
+  /// via the live `noModelAction`); #397 layers the engine/model lifecycle
+  /// framing on top (`chatStartState` → calm "starting / loading…" instead
+  /// of the error-toned "No model loaded" while the engine is still coming
+  /// up). Both axes are LIVE computed properties (no stored copy), so on
+  /// any given render they derive from current state together — neither
+  /// freezes a value the other has moved past (#400 intra-render parity;
+  /// this is not filesystem-freshness — see `noModelAction`).
   @State private var showNoModelPrompt = false
-  /// The recovery action for the no-model prompt, captured at the
-  /// instant the send is blocked (when `selectedProfileID` is settled
-  /// and the store is loaded) rather than at sheet-build time. #326:
-  /// Load when the default model is on disk, Download when it isn't,
-  /// unavailable otherwise.
-  @State private var noModelAction: MissingModelRecovery.PromptAction = .unavailable
   /// What the toolbar model menu should offer. `.unknown` (→ injected
   /// `availableModels`) only until the first reconcile; afterwards it is
   /// the engine's real served list (`.known`, possibly empty), so a
@@ -104,14 +102,11 @@ struct ChatScaffoldView: View {
     }
   }
 
-  /// Decide and raise the no-model prompt for the chat's selected
-  /// profile. The Load-vs-Download choice turns on whether the profile's
-  /// default model is staged on disk (#326).
+  /// Raise the no-model prompt. The model-availability action and the
+  /// lifecycle framing are both derived from current state on each render
+  /// (`noModelAction` / `chatStartState`), so this only flips the
+  /// presentation flag — there is no captured copy to freeze (#400).
   private func presentNoModelPrompt() {
-    let slug = profileStore.model(forProfileID: viewModel.selectedProfileID)
-    noModelAction = MissingModelRecovery.promptAction(
-      profileDefaultModel: slug,
-      isInstalled: slug.map(Self.isModelInstalled) ?? false)
     showNoModelPrompt = true
   }
 
@@ -126,18 +121,15 @@ struct ChatScaffoldView: View {
   /// benign redundancy, not a wrong result. Mirroring the resolver's
   /// two-stage check would couple this UI gate to resolver internals.
   static func isModelInstalled(_ slug: String) -> Bool {
-    let modelsRoot: URL
-    do {
-      modelsRoot = try PieDirs.models()
-    } catch {
-      // PR#15 F4: don't silently swallow a transient FS/permissions
-      // failure — log it. The fall-through to Download is self-recovering
-      // (a visible affordance remains; re-download re-stages the file),
-      // but the cause must be greppable, not lost to `try?`.
-      NSLog("ChatScaffold.isModelInstalled: PieDirs.models() failed (\(error)); treating model as not-installed")
-      return false
-    }
-    let path = LaunchSpecResolver.joinModelPath(modelsRoot: modelsRoot, slug: slug)
+    // Read-only existence check that runs on the render path (the live
+    // `noModelAction` / the download CTA): resolve the models dir path
+    // WITHOUT creating it or touching xattrs. The mutating `PieDirs
+    // .models()` does `createDirectory` + `setResourceValues
+    // (isExcludedFromBackup)` on every call, so calling it here would emit
+    // main-thread filesystem WRITES on every render while the no-model
+    // sheet is open. `modelsURL()` is pure path composition; the
+    // download/staging writers still call the mutating `models()`.
+    let path = LaunchSpecResolver.joinModelPath(modelsRoot: PieDirs.modelsURL(), slug: slug)
     return FileManager.default.fileExists(atPath: path)
   }
 
@@ -175,7 +167,7 @@ struct ChatScaffoldView: View {
     // will actually own it (a single-file-GGUF slug). A non-downloadable
     // modelMissing has no download banner, so it must fall through to the
     // engine-failure banner rather than be menu-bar-dot-only.
-    let slug = profileStore.model(forProfileID: viewModel.selectedProfileID)
+    let slug = selectedProfileDefault
     let hasDownloadTarget = MissingModelRecovery.bannerTarget(
       engineStatus: engineStatusStore.status,
       profileDefaultModel: slug) != nil
@@ -210,7 +202,7 @@ struct ChatScaffoldView: View {
       // the user to discover it by failing a send.
       if let bannerTarget = MissingModelRecovery.bannerTarget(
         engineStatus: engineStatusStore.status,
-        profileDefaultModel: profileStore.model(forProfileID: viewModel.selectedProfileID)
+        profileDefaultModel: selectedProfileDefault
       ) {
         ModelMissingBanner(
           target: bannerTarget,
@@ -398,6 +390,17 @@ struct ChatScaffoldView: View {
     )
   }
 
+  /// The active chat profile's default model slug — the ONE definition of
+  /// the profile→default lookup, reused by every reader below (the
+  /// lifecycle axis `chatStartState`, the availability axis
+  /// `noModelAction`, the engine-failure message, and the inline
+  /// missing-model banner). Centralizing it means the readers can't
+  /// disagree because one copied the `selectedProfileID` key wrong, and
+  /// the `profileStore` lookup is expressed once rather than four times.
+  private var selectedProfileDefault: String? {
+    profileStore.model(forProfileID: viewModel.selectedProfileID)
+  }
+
   /// #397: the live engine/model lifecycle state driving the gate's
   /// "starting / loading…" framing. Folds engine status + helper
   /// reachability + model-load state + the active profile's default into
@@ -410,9 +413,42 @@ struct ChatScaffoldView: View {
       helperError: engineStatusStore.lastError,
       load: modelLoadCenter.state,
       resolvedModelID: currentModelID(),
-      profileDefault: profileStore.model(forProfileID: viewModel.selectedProfileID),
+      profileDefault: selectedProfileDefault,
       profileError: profileStore.lastActiveProfileError?.description
     )
+  }
+
+  /// #326 model-AVAILABILITY axis — the sibling of `chatStartState`'s
+  /// lifecycle axis: Load when the profile's default model is staged on
+  /// disk, Download when it isn't but resolves to a curated GGUF,
+  /// unavailable otherwise. Computed (not stored): on each render it
+  /// derives from current state alongside `chatStartState`, so the two
+  /// axes are consistent within a render — neither freezes a value the
+  /// other has moved past, which is the drift #400 removes. (This is
+  /// intra-render parity, NOT filesystem-freshness: install-state is read
+  /// by `isModelInstalled`, which is not a SwiftUI-observable input, so a
+  /// model that lands on disk mid-sheet from another surface does not by
+  /// itself re-render this prompt. The #326 download path re-renders via
+  /// the shared `ModelDownloadController` and then dismisses on
+  /// completion.) The decision itself stays #326's pure
+  /// `MissingModelRecovery.promptAction`.
+  private var noModelAction: MissingModelRecovery.PromptAction {
+    Self.availabilityAction(profileDefault: selectedProfileDefault,
+                            isModelInstalled: Self.isModelInstalled)
+  }
+
+  /// Pure availability derivation that `noModelAction` delegates to —
+  /// extracted so it can be exercised across an install-state flip without
+  /// a view host (and so no stored/memoized copy can hide here): it
+  /// re-reads `isModelInstalled` on every call, which is what keeps the
+  /// availability axis live per render. `isModelInstalled` is injected so a
+  /// test can drive it; production passes `Self.isModelInstalled`.
+  static func availabilityAction(profileDefault slug: String?,
+                                 isModelInstalled: (String) -> Bool)
+    -> MissingModelRecovery.PromptAction {
+    MissingModelRecovery.promptAction(
+      profileDefaultModel: slug,
+      isInstalled: slug.map(isModelInstalled) ?? false)
   }
 
   /// "Load default" action. Honors the no-eager-load invariant — only

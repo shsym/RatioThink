@@ -154,4 +154,61 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     XCTAssertTrue(p.showsOpenSettings)
     XCTAssertEqual(p.primary, .none)
   }
+
+  // MARK: - #400: availability action is derived LIVE per render (drift fix)
+
+  /// The regression #400 closes: the availability action was captured ONCE
+  /// into `@State`, so it froze (e.g. a stale `.download`) while the prompt
+  /// stayed open. The fix routes the prompt's action through
+  /// `ChatScaffoldView.availabilityAction`, the SAME seam `noModelAction`
+  /// delegates to on every render, which re-reads install-state each call.
+  ///
+  /// This drives that seam across an install-state flip with a STATEFUL
+  /// probe: the action must follow the latest install-state
+  /// (`.download` → `.load`) AND the probe must be consulted on every call
+  /// (not once). A reintroduced capture / memoization would return the
+  /// stale `.download` on the second call (and leave `probeCalls == 1`),
+  /// failing this test — where the old `plan()`-only test, asserting an
+  /// already-pure function, would still pass. (View-host re-render is not
+  /// asserted — no ViewInspector dep — but the per-render derivation the
+  /// view runs is.)
+  func test_availabilityAction_is_reread_every_render_not_captured() {
+    let slug = ProfileStore.defaultChatModelID
+    var installed = false
+    var probeCalls = 0
+    let probe: (String) -> Bool = { _ in probeCalls += 1; return installed }
+
+    // Render 1 — model not on disk → Download.
+    let r1 = ChatScaffoldView.availabilityAction(profileDefault: slug, isModelInstalled: probe)
+    guard case .download = r1 else { return XCTFail("render 1 expected .download, got \(r1)") }
+
+    // The model lands on disk between renders.
+    installed = true
+
+    // Render 2 — SAME slug, install-state flipped → must re-probe and
+    // return .load. A captured/memoized derivation returns the stale
+    // .download here and fails.
+    let r2 = ChatScaffoldView.availabilityAction(profileDefault: slug, isModelInstalled: probe)
+    guard case .load = r2 else { return XCTFail("render 2 expected .load after install, got \(r2)") }
+
+    XCTAssertEqual(probeCalls, 2,
+                   "install-state must be re-read every render, not captured once")
+
+    // The rendered plan follows the live action for an unchanged lifecycle
+    // state (sheet open on a profile default): Download CTA → Load.
+    let sheetOpen: ChatStartGate.State = .needsDefaultLoad(modelID: slug)
+    XCTAssertTrue(plan(sheetOpen, r1).showsDownloadCTA)
+    XCTAssertEqual(plan(sheetOpen, r2).primary, .load)
+  }
+
+  /// `availabilityAction` with no profile default is `.unavailable`
+  /// regardless of the install probe — and must NOT consult the probe
+  /// (nothing to check). Guards the `slug.map(...) ?? false` short-circuit.
+  func test_availabilityAction_no_default_is_unavailable_without_probing() {
+    var probeCalls = 0
+    let action = ChatScaffoldView.availabilityAction(
+      profileDefault: nil, isModelInstalled: { _ in probeCalls += 1; return true })
+    XCTAssertEqual(action, .unavailable)
+    XCTAssertEqual(probeCalls, 0, "no slug → no install probe")
+  }
 }
