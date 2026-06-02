@@ -347,7 +347,10 @@ async def section_protocol_stress(base: str, http: httpx.AsyncClient, rep: Repor
         "model": MODEL, "messages": [{"role": "user", "content": "hi"}],
         "stream": False, "max_tokens": 4, "tools": [big_tool], "tool_choice": "auto",
     })
-    rep.ok(r.status_code != 400, f"{P}: large tools[] schema -> {r.status_code} (want != 400)")
+    # Parse-only intent, but a closed allow-set so a 5xx/crash on a valid
+    # large payload fails (not just a 400). "Suite fails on bare 500s."
+    rep.ok(r.status_code in (200, 404),
+           f"{P}: large tools[] schema -> {r.status_code} (want 200/404; 400=parse-fail, 5xx=crash)")
 
     # invalid tools[] schema (function entry missing required `name`) -> 400.
     r = await http.post(f"{base}/v1/chat/completions", json={
@@ -572,7 +575,10 @@ async def section_toolcall_parse(base: str, http: httpx.AsyncClient, rep: Report
         "model": MODEL, "messages": [{"role": "user", "content": "What is 2+2?"}],
         "stream": False, "max_tokens": 8, "tools": [CALC_TOOL], "tool_choice": "auto",
     })
-    rep.ok(r.status_code != 400, f"{P}: tools[]+auto -> {r.status_code} (want != 400; tools[] must deserialize)")
+    # Closed allow-set (not just `!= 400`) so a 5xx crash on a valid
+    # tools[] payload fails instead of reporting green.
+    rep.ok(r.status_code in (200, 404),
+           f"{P}: tools[]+auto -> {r.status_code} (want 200/404; tools[] must deserialize, no 5xx)")
 
     # role:"tool" follow-up shape is unsupported -> documented 400. Pin it so
     # the gap can't silently change shape.
@@ -601,6 +607,50 @@ async def section_toolcall_parse(base: str, http: httpx.AsyncClient, rep: Report
         "tool_choice": "required",
     })
     rep.ok(r.status_code == 400, f"{P}: required + empty tools -> {r.status_code} (want 400)")
+
+    # F1 (v2 review): a forced call that CANNOT close the tool-call grammar
+    # within max_tokens (here 1; the args object can't complete) must NOT be
+    # a silent empty 200. Content is suppressed on the forced path, so the
+    # contract requires either tool_calls OR an explicit error — never a
+    # deceptive empty completion that drops the directive.
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "messages": [{"role": "user", "content": "What is 2+2?"}],
+        "stream": False, "max_tokens": 1,
+        "tools": [CALC_TOOL], "tool_choice": "required",
+    })
+    if r.status_code == 200:
+        tcs = r.json().get("choices", [{}])[0].get("message", {}).get("tool_calls")
+        rep.ok(bool(tcs),
+               f"{P}: forced+max_tokens=1 returned a SILENT EMPTY 200 (no tool_calls, no error) "
+               f"— directive dropped: {r.text[:160]!r}")
+    else:
+        code = ""
+        try:
+            code = r.json().get("error", {}).get("code", "")
+        except Exception:
+            pass
+        rep.ok(r.status_code in (500, 502) and code == "tool_call_not_produced",
+               f"{P}: forced unfulfilled -> {r.status_code} code={code!r} "
+               f"(want 500/502 tool_call_not_produced)")
+
+    # Same, streaming: the terminal frame must carry finish_reason "error"
+    # (+ tool_call_not_produced meta) or tool_calls — never a clean
+    # "stop"/"length" with an empty content channel.
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "messages": [{"role": "user", "content": "What is 2+2?"}],
+        "stream": True, "max_tokens": 1,
+        "tools": [CALC_TOOL],
+        "tool_choice": {"type": "function", "function": {"name": "calculator"}},
+    })
+    if rep.ok(r.status_code == 200, f"{P}: forced stream unfulfilled status {r.status_code}"):
+        _, term = terminal_chunk(sse_payloads(r.text))
+        if rep.ok(term is not None, f"{P}: forced stream unfulfilled: no terminal chunk"):
+            ch = term["choices"][0]
+            fr = ch.get("finish_reason")
+            has_tc = bool(ch.get("delta", {}).get("tool_calls"))
+            rep.ok(fr == "error" or has_tc,
+                   f"{P}: forced stream unfulfilled terminal finish_reason={fr!r} "
+                   f"tool_calls={has_tc} (want \"error\" or tool_calls — not a silent stop/length)")
 
 
 async def section_toolcall_nonstream_roundtrip(rep: Report) -> None:

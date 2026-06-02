@@ -1979,6 +1979,30 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
         }
     };
 
+    // F1: a forced `tool_choice` whose constrained generation never closed
+    // a complete tool call (max_tokens too small for the args, a natural
+    // stop before `Event::Call`, or a mid-turn tool-decoder disable) leaves
+    // `pending_tool` None. Content was suppressed on the forced path, so the
+    // default terminal here would be a deceptive empty success
+    // (`finish_reason:"stop"`/`"length"`, no `tool_calls`, no error) —
+    // silently dropping the directive this path exists to enforce. The
+    // "preserve a viable plain-text reply" rationale does not apply when
+    // content is suppressed. Reclassify as an explicit error so the terminal
+    // chunk carries `finish_reason:"error"` + the diagnostic meta-frame.
+    let (outcome, error_diag) = if forced_tool && pending_tool.is_none() && error_diag.is_none() {
+        (
+            Outcome::Aborted,
+            Some((
+                "tool_call_not_produced",
+                "tool_choice forced a tool call but generation ended before a complete \
+                 tool call was produced; raise max_tokens or relax tool_choice"
+                    .to_string(),
+            )),
+        )
+    } else {
+        (outcome, error_diag)
+    };
+
     // Terminal chunk first so OpenAI clients see a `finish_reason`
     // in the canonical envelope (F8). When the loop exited via
     // ToolCalls, the buffered call lands here on the same frame —
@@ -2250,6 +2274,24 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
             Ok(chat::Event::Idle) => continue,
             Err(e) => break (Outcome::Aborted, Some(("decode_failed", e.to_string()))),
         }
+    };
+
+    // F1: forced `tool_choice` that never closed a complete tool call (see
+    // the streaming branch) leaves `pending_tool` None with content
+    // suppressed — reclassify as an explicit error so the no-tokens-produced
+    // branch below returns a 500 instead of a deceptive empty 200.
+    let (outcome, error_diag) = if forced_tool && pending_tool.is_none() && error_diag.is_none() {
+        (
+            Outcome::Aborted,
+            Some((
+                "tool_call_not_produced",
+                "tool_choice forced a tool call but generation ended before a complete \
+                 tool call was produced; raise max_tokens or relax tool_choice"
+                    .to_string(),
+            )),
+        )
+    } else {
+        (outcome, error_diag)
     };
 
     // F2: only the no-tokens-produced abort drops to a bare 500.
