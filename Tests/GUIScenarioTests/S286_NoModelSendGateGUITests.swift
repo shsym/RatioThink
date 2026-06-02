@@ -65,16 +65,20 @@ final class S286_NoModelSendGateGUITests: XCTestCase {
     XCTAssertTrue(send.waitForExistence(timeout: 5))
     send.click()
 
-    // The send is blocked behind the no-model confirm — never a silent
-    // load. The seeded chat profile's default model is offered via Load.
-    // Hard invariant: the send is BLOCKED behind the no-model
-    // confirm — RatioThink never loads a model the user did not choose. The
-    // Load-default affordance + its resolution are unit-proven
-    // (CuratedModelCatalog resolution invariant, LaunchSpecResolver
-    // nested-stage, InstalledModels recurse); the GUI Load button isn't
-    // asserted here (the seated-session automation wedge blocks a
-    // reliable run — verify on a fresh console session).
-    XCTAssertTrue(app.staticTexts["No model loaded"].waitForExistence(timeout: 5),
-                  "send with nothing resolvable must raise the no-model confirm, not load silently")
+    // The send is BLOCKED behind the no-model gate — never a silent load
+    // (RatioThink never loads a model the user did not choose).
+    //
+    // #397: the gate's HEADLINE is now state-dependent ("No model loaded"
+    // for download/unavailable, "Model not loaded yet" for an on-disk
+    // default, "Starting the engine…" while it boots, a failure reason
+    // when the engine/load failed). Which state the runner lands in turns
+    // on the Helper's reachability/engine state — not controlled by this
+    // engine-free case. So assert the state-INDEPENDENT invariant: the
+    // gate was raised (its Cancel affordance, present in every state),
+    // not a single pinned headline. The per-state copy + actions are
+    // exhaustively unit-proven in NoModelLoadedPromptPlanTests +
+    // ChatStartGateTests.
+    XCTAssertTrue(app.buttons["noModel.cancel"].waitForExistence(timeout: 5),
+                  "send with nothing resolvable must raise the no-model gate, not load silently")
   }
 }

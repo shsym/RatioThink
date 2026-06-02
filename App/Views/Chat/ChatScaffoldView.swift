@@ -263,6 +263,13 @@ struct ChatScaffoldView: View {
           startEngineForSelectedProfile()
           showNoModelPrompt = false
         },
+        // #397 F1: retryable engine failure → re-start the engine.
+        onRetryEngineStart: { startEngineForSelectedProfile() },
+        // #397 F1: failed model load → re-run it via the ensure-engine
+        // -then-load path (restarts the engine if it has since stopped).
+        onRetryLoad: { model in loadDefaultModel(model) },
+        // #397 F1: helper unreachable → force an immediate status re-poll.
+        onRefresh: { refreshEngineStatus() },
         onChooseAnother: { showNoModelPrompt = false },
         onCancel: { showNoModelPrompt = false },
         engineStatus: engineStatusStore.status
@@ -419,13 +426,27 @@ struct ChatScaffoldView: View {
     case .running:
       // Engine up — load the model directly (`/v1/models/load`).
       swapCoordinator.loadDirect(modelID: model)
-    case .stopped, .failed:
+    case .stopped:
       // Bring the engine up bound to this chat's profile; v1 pie loads
       // the profile's model at boot, and `reconcileEngineResidentModel`
       // picks it up once `.running`.
       startEngineForSelectedProfile()
+    case let .failed(code, _):
+      // #397 F3: only re-start for a retryable failure. memoryRisk /
+      // killRejected re-fire a guaranteed-to-fail or refused start, so
+      // do NOT — the prompt shows those as terminal (Open Settings /
+      // reason), never an active Load/Retry that loops.
+      if code.invitesResumeRetry { startEngineForSelectedProfile() }
     case .starting, .stopping:
       break  // already in flight — the busy state already reflects this
+    }
+  }
+
+  /// #397 F1: re-poll the helper after an unreachable-transport failure.
+  /// The 1 Hz loop would catch up anyway; this makes Retry immediate.
+  private func refreshEngineStatus() {
+    Task { @MainActor in
+      _ = try? await engineStatusStore.refresh()
     }
   }
 

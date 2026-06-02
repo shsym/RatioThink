@@ -49,9 +49,14 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
     XCTAssertTrue(send.waitForExistence(timeout: 5))
     send.click()
 
-    // Send is blocked behind the no-model confirm — never a silent load.
-    XCTAssertTrue(app.staticTexts["No model loaded"].waitForExistence(timeout: 5),
-                  "send with nothing resolvable must raise the no-model confirm")
+    // Send is blocked behind the no-model gate — never a silent load.
+    // #397: assert the gate via its state-independent Cancel affordance,
+    // not the pinned "No model loaded" headline (now state-dependent —
+    // e.g. "Starting the engine…" while the engine boots, where #397 F2
+    // keeps the download CTA below visible). The real #326 contract — the
+    // inline Download CTA — is asserted next and is what this case proves.
+    XCTAssertTrue(app.buttons["noModel.cancel"].waitForExistence(timeout: 5),
+                  "send with nothing resolvable must raise the no-model gate")
 
     // #326: the model is NOT on disk, so the gate offers Download — the
     // inline recovery — and NOT the plain Load (which would dead-end).
@@ -108,14 +113,15 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
     XCTAssertTrue(send.waitForExistence(timeout: 5))
     send.click()
 
-    XCTAssertTrue(app.staticTexts["No model loaded"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.buttons["noModel.cancel"].waitForExistence(timeout: 5))
     let download = app.buttons["missingModel.download"]
     XCTAssertTrue(download.waitForExistence(timeout: 5))
     download.click()
 
     // The fake stream completes → onDownloaded fires once → the prompt
-    // dismisses (and the engine start is kicked).
-    XCTAssertTrue(app.staticTexts["No model loaded"].waitForNonExistence(timeout: 10),
+    // dismisses (and the engine start is kicked). Assert the gate's
+    // state-independent Cancel disappears, not the pinned headline (#397).
+    XCTAssertTrue(app.buttons["noModel.cancel"].waitForNonExistence(timeout: 10),
                   "a completed download must fire onDownloaded and dismiss the no-model prompt")
   }
 }
