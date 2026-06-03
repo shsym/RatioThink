@@ -14,6 +14,11 @@ struct RootView: View {
   /// #412: background-helper health. Drives the loud escalation banner when
   /// the App's restart ladder can't bring the helper back.
   @EnvironmentObject private var helperHealth: HelperHealthController
+  /// #411: persisted ignore-set for update versions + the launch-time update
+  /// check state that drives the non-modal `UpdateAvailableBanner`.
+  @EnvironmentObject private var appPreferences: AppPreferences
+  @EnvironmentObject private var updateAvailability: UpdateAvailabilityModel
+  @Environment(\.openURL) private var openURL
 
   var body: some View {
     VStack(spacing: 0) {
@@ -34,6 +39,18 @@ struct RootView: View {
         ),
         engineStatus: engineStatusStore
       )
+      // #411: low-urgency, non-modal update prompt. Only present for a newer,
+      // non-ignored release found by the once-per-launch check.
+      if let pending = updateAvailability.pending {
+        UpdateAvailableBanner(
+          pending: pending,
+          onDownload: {
+            openURL(pending.release.htmlURL)
+            updateAvailability.dismissPending()
+          },
+          onIgnore: { updateAvailability.ignorePending(into: appPreferences) }
+        )
+      }
       NavigationSplitView(columnVisibility: $windowState.columnVisibility) {
         SidebarView(selection: $windowState.selectedSection)
       } content: {
@@ -56,6 +73,17 @@ struct RootView: View {
       }
       .navigationTitle("RatioThink")
     }
+    .task { await runLaunchUpdateCheck() }
+  }
+
+  /// #411: run the once-per-launch update check. Skipped on test/automation
+  /// launches so GUI/E2E suites never make the one real GitHub network call;
+  /// the model's own guard makes a re-`task` a no-op in production.
+  private func runLaunchUpdateCheck() async {
+    guard !HelperRegistrationReconciler.isTestLaunch(ProcessInfo.processInfo.environment) else {
+      return
+    }
+    await updateAvailability.checkOnLaunch(preferences: appPreferences)
   }
 }
 

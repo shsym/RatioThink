@@ -80,6 +80,40 @@ public enum UpdateCheck {
     }
     return .upToDate(current: currentVersion.displayString)
   }
+
+  /// Launch-time decision: whether to interrupt the user with the non-modal
+  /// "update available" banner. Layers the persisted ignore-set on top of
+  /// `status` so only a newer release the user has NOT dismissed surfaces on
+  /// launch. Pure (no AppKit, no network) — the show/suppress logic is
+  /// unit-testable on its own.
+  ///
+  /// `ignoredVersions` holds normalized version strings (the `displayString`
+  /// form, e.g. `"0.1.1"`). Membership is exact, so a dismissed version stays
+  /// silent until a strictly newer one ships (a newer tag is not in the set
+  /// and therefore prompts). The manual "Check for Updates…" menu command does
+  /// NOT call this — it always reports via `status`, bypassing the ignore-set.
+  public static func launchPrompt(current: String,
+                                  latest: Release,
+                                  ignoredVersions: Set<String>) -> LaunchPrompt {
+    switch status(current: current, latest: latest) {
+    case let .updateAvailable(currentDisplay, latestDisplay, release):
+      if ignoredVersions.contains(latestDisplay) {
+        return .silent
+      }
+      return .prompt(current: currentDisplay, latest: latestDisplay, release: release)
+    case .upToDate, .indeterminate:
+      return .silent
+    }
+  }
+
+  /// Outcome of the launch-time check after the ignore-set is applied.
+  public enum LaunchPrompt: Equatable, Sendable {
+    /// Surface the banner for a newer, non-ignored release.
+    case prompt(current: String, latest: String, release: Release)
+    /// Stay silent: up to date, the newer version is ignored, or the check
+    /// was indeterminate (incl. any network/parse failure upstream).
+    case silent
+  }
 }
 
 /// A lenient dotted-integer version (`major.minor.patch…`) parsed from a

@@ -24,12 +24,19 @@ pass Gatekeeper with no extra steps:
 
 ## Updating
 
-RatioThink does not auto-update yet. To check whether a newer build exists,
-choose **RatioThink → Check for Updates…**: it compares your running version
-against the latest [GitHub release](https://github.com/shsym/RatioThink/releases)
-and, if one is newer, offers to open the release page so you can download the new
-DMG. You can also watch the Releases page directly. (In-app auto-update via
-Sparkle is tracked as future work.)
+RatioThink does not auto-install updates yet, but it does **check** for them.
+
+- **On launch**, it makes one request to the public
+  [GitHub Releases](https://github.com/shsym/RatioThink/releases) API and, if a
+  newer release exists, shows a dismissable banner with **Download** (opens the
+  release page) and **Ignore this version** (that version stays hidden until a
+  newer one ships). It stays silent if you're up to date or offline.
+- **Anytime**, choose **RatioThink → Check for Updates…** to check on demand;
+  the menu command always checks and ignores any dismissed versions.
+
+Neither path downloads or installs anything automatically — they compare
+versions and link you to the release. (In-app auto-update via Sparkle is tracked
+as future work.)
 
 ## Build from source
 

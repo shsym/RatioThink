@@ -90,6 +90,48 @@ final class UpdateCheckTests: XCTestCase {
     }
   }
 
+  // MARK: - launchPrompt (ignore-set layered over status)
+
+  func test_launchPrompt_promptsForNewerNonIgnoredRelease() {
+    let prompt = UpdateCheck.launchPrompt(current: "0.1.0",
+                                          latest: release("v0.1.1"),
+                                          ignoredVersions: [])
+    XCTAssertEqual(prompt, .prompt(current: "0.1.0", latest: "0.1.1", release: release("v0.1.1")))
+  }
+
+  func test_launchPrompt_silentWhenLatestIsIgnored() {
+    // Ignore-set stores normalized displayStrings ("0.1.1"), not the raw tag.
+    XCTAssertEqual(
+      UpdateCheck.launchPrompt(current: "0.1.0", latest: release("v0.1.1"), ignoredVersions: ["0.1.1"]),
+      .silent
+    )
+  }
+
+  func test_launchPrompt_newerVersionResurfacesAfterAnIgnore() {
+    // 0.1.1 was dismissed; a strictly newer 0.1.2 is NOT in the set, so it
+    // prompts again — the "never re-surface until a newer one ships" contract.
+    let ignored: Set<String> = ["0.1.1"]
+    XCTAssertEqual(
+      UpdateCheck.launchPrompt(current: "0.1.0", latest: release("v0.1.1"), ignoredVersions: ignored),
+      .silent
+    )
+    XCTAssertEqual(
+      UpdateCheck.launchPrompt(current: "0.1.0", latest: release("v0.1.2"), ignoredVersions: ignored),
+      .prompt(current: "0.1.0", latest: "0.1.2", release: release("v0.1.2"))
+    )
+  }
+
+  func test_launchPrompt_silentWhenUpToDateOrIndeterminate() {
+    XCTAssertEqual(
+      UpdateCheck.launchPrompt(current: "0.1.1", latest: release("v0.1.1"), ignoredVersions: []),
+      .silent
+    )
+    XCTAssertEqual(
+      UpdateCheck.launchPrompt(current: "0.1.0", latest: release("nightly"), ignoredVersions: []),
+      .silent
+    )
+  }
+
   // MARK: - Slug / URL guards (drift tripwire)
 
   func test_feedURLs_pointAtPublicRepo() {

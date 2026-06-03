@@ -47,6 +47,10 @@ struct RatioThinkApp: App {
   /// closing + reopening the Settings sheet does not orphan an
   /// in-flight download.
   @StateObject private var downloadController: ModelDownloadController
+  /// #411: once-per-launch GitHub-Releases update check. App-scoped so the
+  /// check (and its single network call) fires once per process; RootView
+  /// observes `pending` to render the non-modal update banner.
+  @StateObject private var updateAvailability = UpdateAvailabilityModel()
 
   @MainActor
   init() {
@@ -340,18 +344,19 @@ struct RatioThinkApp: App {
         .environmentObject(engineStatusStore)
         .environmentObject(helperHealth)
         .environmentObject(downloadController)
+        .environmentObject(updateAvailability)
         .frame(minWidth: 900, minHeight: 600)
     }
     .modelContainer(chatContainer)
     .defaultSize(width: 1200, height: 800)
     .commands {
-      // #411: surface a truthful "Check for Updates…" entry in the
-      // standard macOS spot (App menu, directly under "About RatioThink"),
-      // so a future Sparkle swap (#178) is drop-in. RatioThink ships via
-      // GitHub Releases (notarized arm64 DMG) with no auto-update plumbing
-      // yet, so this is a manual check: it compares the running version to
-      // the latest published release and, at most, opens the release page —
-      // it never downloads or installs.
+      // #411: the MANUAL "Check for Updates…" entry, in the standard macOS
+      // spot (App menu, directly under "About RatioThink"). It always checks
+      // and bypasses the ignore-set, complementing the once-per-launch auto
+      // check that surfaces the non-modal UpdateAvailableBanner (RootView /
+      // UpdateAvailabilityModel). Both compare the running version to the
+      // latest GitHub release and, at most, open the release page — neither
+      // downloads or installs (in-app auto-INSTALL via Sparkle is future #178).
       CommandGroup(after: .appInfo) {
         Button("Check for Updates…") {
           Task { await UpdateChecker.checkForUpdates() }
