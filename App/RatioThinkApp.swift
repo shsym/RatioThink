@@ -345,10 +345,28 @@ struct RatioThinkApp: App {
     .modelContainer(chatContainer)
     .defaultSize(width: 1200, height: 800)
     .commands {
-      CommandGroup(replacing: .newItem) {
-        Button("New Chat") {}.keyboardShortcut("n")
-        Button("New Chat (Always)") {}.keyboardShortcut("t")
+      // #411: surface a truthful "Check for Updates…" entry in the
+      // standard macOS spot (App menu, directly under "About RatioThink"),
+      // so a future Sparkle swap (#178) is drop-in. RatioThink ships via
+      // GitHub Releases (notarized arm64 DMG) with no auto-update plumbing
+      // yet, so this is a manual check: it compares the running version to
+      // the latest published release and, at most, opens the release page —
+      // it never downloads or installs.
+      CommandGroup(after: .appInfo) {
+        Button("Check for Updates…") {
+          Task { await UpdateChecker.checkForUpdates() }
+        }
       }
+      // #411: remove the two orphaned no-op "New Chat" menu commands
+      // (⌘N / "New Chat (Always)" ⌘T) that had replaced the default
+      // File ▸ New. Both were empty closures — they did nothing, while the
+      // live new-chat affordances drive `ChatCreation.create` directly
+      // (chat-list "+" + col-3 zero-state CTA), never a global menu command.
+      // Replacing `.newItem` with an empty group drops both items and their
+      // ⌘N/⌘T shortcuts, and keeps the default "New Window" suppressed — the
+      // app shares one app-scoped `WindowState`, so a second window is a
+      // half-baked surface.
+      CommandGroup(replacing: .newItem) {}
       CommandGroup(after: .sidebar) {
         Button(windowState.columnVisibility == .all ? "Hide Sidebar" : "Show Sidebar") {
           windowState.toggleSidebar()
