@@ -17,7 +17,7 @@ use inferlet::sample::Sampler;
 use inferlet::Context;
 
 use super::schema::TotParams;
-use super::tree::{assemble, new_node_id, parse_score, select_beam, Node};
+use super::tree::{assemble, best_leaf, new_node_id, parse_score, select_beam, Candidate, Node};
 
 /// Built-in expansion instruction appended before forking at levels > 1.
 /// Level-1 children answer the conversation directly (sibling diversity
@@ -55,15 +55,19 @@ pub struct SearchOutcome {
 }
 
 /// Run the beam search. `root_ctx` must already be filled (system +
-/// messages) and cued.
+/// messages) **and flushed, but NOT cued** — the assistant turn is
+/// opened per branch in [`expand`]. A cue committed into the shared
+/// prefix would be duplicated across every fork and waste the zero-token
+/// forward pass that the level-1 spin fix removed.
 pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
     let mut flat: Vec<Node> = vec![Node::root()];
     let mut frontier: Vec<Frontier> = vec![Frontier {
         ctx: root_ctx,
         node_id: "root".to_string(),
     }];
-    // Scores at the deepest level reached — used to pick the best leaf.
-    let mut last_level_scored: Vec<(String, Option<u8>)> = Vec::new();
+    // Candidates at the deepest level reached — used to pick the best
+    // (ok-only) leaf.
+    let mut last_level: Vec<Candidate> = Vec::new();
 
     for level in 1..=params.depth {
         // Levels > 1 refine the parent before forking: append the refine
@@ -113,8 +117,8 @@ pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
         }
         let results = join_all(futs).await;
 
-        // Materialize nodes + collect survivors for pruning.
-        let mut scored: Vec<(String, Option<u8>)> = Vec::new();
+        // Materialize nodes + collect candidates/survivors for pruning.
+        let mut scored: Vec<Candidate> = Vec::new();
         let mut survivors: Vec<Frontier> = Vec::new();
         for ((parent_id, branch_index), ex) in metas.into_iter().zip(results) {
             let id = new_node_id();
@@ -135,25 +139,33 @@ pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
                 error,
                 children: Vec::new(),
             });
-            scored.push((id.clone(), ex.score));
+            scored.push(Candidate {
+                id: id.clone(),
+                score: ex.score,
+                ok: !is_error,
+            });
             survivors.push(Frontier {
                 ctx: ex.ctx,
                 node_id: id,
             });
         }
 
-        // Prune to the top `beam_width` for the next level.
-        let keep = select_beam(scored.clone(), params.beam_width);
+        // Prune to the top `beam_width` for the next level. `select_beam`
+        // excludes error nodes, so a failed branch never survives to be
+        // re-expanded (its partially-advanced context is dropped here).
+        let keep = select_beam(&scored, params.beam_width);
         frontier = survivors
             .into_iter()
             .filter(|f| keep.contains(&f.node_id))
             .collect();
-        last_level_scored = scored;
+        last_level = scored;
     }
 
-    // Best leaf at the deepest level (None scores rank lowest; all-None
-    // → first by stable order).
-    let best = select_beam(last_level_scored, 1).into_iter().next();
+    // Best ok leaf at the deepest level (error leaves excluded; None
+    // scores rank lowest; all-None-ok → first by stable order). When no
+    // ok leaf exists, `final_answer`/`selected_node_id` honestly null out
+    // — matching the all-fork-fail path.
+    let best = best_leaf(&last_level);
     let final_answer = best
         .as_ref()
         .and_then(|id| flat.iter().find(|n| &n.id == id).map(|n| n.content.clone()));

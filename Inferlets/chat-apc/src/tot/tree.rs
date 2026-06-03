@@ -95,14 +95,34 @@ pub fn parse_score(text: &str) -> Option<u8> {
     }
 }
 
-/// Stable-sort `(id, score)` by score descending (`None` ranks lowest),
-/// returning the ids of the top `m`. Stable so equal scores keep input
-/// order (deterministic beam + best-leaf selection).
-pub fn select_beam(mut scored: Vec<(String, Option<u8>)>, m: usize) -> Vec<String> {
+/// A scored candidate reduced to what beam selection needs. `ok` is
+/// `false` for a node whose generation failed (`status:"error"`); such
+/// nodes are excluded from both beam survival and final-answer
+/// selection, so `final_answer`/`selected_node_id` honestly become
+/// `null` when no ok leaf exists (matching the all-fork-fail path).
+#[derive(Clone, Debug)]
+pub struct Candidate {
+    pub id: String,
+    pub score: Option<u8>,
+    pub ok: bool,
+}
+
+/// Ids of the top `m` **ok** candidates, score-descending (`None` ranks
+/// lowest), stable on ties. Error candidates are excluded entirely, so
+/// an error node is never kept in the beam.
+pub fn select_beam(candidates: &[Candidate], m: usize) -> Vec<String> {
+    let mut ok: Vec<&Candidate> = candidates.iter().filter(|c| c.ok).collect();
     // `Option<u8>` orders `None < Some(_)`, so `b.cmp(a)` puts the
-    // highest scores first and `None` entries last.
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
-    scored.into_iter().take(m).map(|(id, _)| id).collect()
+    // highest scores first and `None` entries last. Stable → ties keep
+    // input order (deterministic beam + best-leaf selection).
+    ok.sort_by(|a, b| b.score.cmp(&a.score));
+    ok.into_iter().take(m).map(|c| c.id.clone()).collect()
+}
+
+/// Id of the single best **ok** candidate (highest score, `None` last,
+/// stable), or `None` when no ok candidate exists.
+pub fn best_leaf(candidates: &[Candidate]) -> Option<String> {
+    select_beam(candidates, 1).into_iter().next()
 }
 
 /// Assemble a nested tree from a flat node list via `parent_id` links.
@@ -154,22 +174,71 @@ mod tests {
         assert_eq!(parse_score("no number here"), None);
     }
 
+    fn cand(id: &str, score: Option<u8>, ok: bool) -> Candidate {
+        Candidate {
+            id: id.to_string(),
+            score,
+            ok,
+        }
+    }
+
     #[test]
     fn beam_keeps_top_m_none_last() {
-        let scored = vec![
-            ("a".to_string(), Some(3)),
-            ("b".to_string(), None),
-            ("c".to_string(), Some(9)),
-            ("d".to_string(), Some(5)),
+        let c = vec![
+            cand("a", Some(3), true),
+            cand("b", None, true),
+            cand("c", Some(9), true),
+            cand("d", Some(5), true),
         ];
-        assert_eq!(select_beam(scored, 2), vec!["c", "d"]);
+        assert_eq!(select_beam(&c, 2), vec!["c", "d"]);
     }
 
     #[test]
     fn beam_all_none_is_deterministic() {
-        let scored = vec![("a".to_string(), None), ("b".to_string(), None)];
+        let c = vec![cand("a", None, true), cand("b", None, true)];
         // Stable sort keeps the first input on ties.
-        assert_eq!(select_beam(scored, 1), vec!["a"]);
+        assert_eq!(select_beam(&c, 1), vec!["a"]);
+    }
+
+    #[test]
+    fn beam_excludes_error_nodes_even_when_higher_scored() {
+        // An error node carrying a (stale) high score must never be kept.
+        let c = vec![
+            cand("err", Some(10), false),
+            cand("ok1", Some(4), true),
+            cand("ok2", Some(2), true),
+        ];
+        assert_eq!(select_beam(&c, 3), vec!["ok1", "ok2"]);
+    }
+
+    #[test]
+    fn beam_all_error_keeps_nothing() {
+        let c = vec![cand("e1", None, false), cand("e2", Some(8), false)];
+        assert!(select_beam(&c, 5).is_empty());
+    }
+
+    #[test]
+    fn best_leaf_all_error_is_none() {
+        // All-error deepest level → no ok leaf → null final answer.
+        let c = vec![cand("e1", None, false), cand("e2", Some(7), false)];
+        assert_eq!(best_leaf(&c), None);
+    }
+
+    #[test]
+    fn best_leaf_skips_error_picks_best_ok() {
+        // Mixed ok/error: never selects an error node, picks the best ok.
+        let c = vec![
+            cand("err", Some(10), false),
+            cand("ok_lo", Some(3), true),
+            cand("ok_hi", Some(8), true),
+        ];
+        assert_eq!(best_leaf(&c), Some("ok_hi".to_string()));
+    }
+
+    #[test]
+    fn best_leaf_all_ok_none_score_is_first() {
+        let c = vec![cand("a", None, true), cand("b", None, true)];
+        assert_eq!(best_leaf(&c), Some("a".to_string()));
     }
 
     #[test]
