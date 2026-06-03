@@ -67,12 +67,14 @@
   /* dim / highlight states driven by walkthrough */
   .col.playing .node{opacity:.4}
   .col.playing .node.hot{opacity:1}
-  path.edge{fill:none;stroke:#7b8398;stroke-width:2.25;opacity:.9;transition:stroke .15s,opacity .15s,stroke-width .15s}
+  path.edge{fill:none;stroke:#8b93a8;stroke-width:2.5;opacity:.9;pointer-events:stroke;cursor:pointer;
+    transition:stroke .12s,opacity .12s,stroke-width .12s}
   path.edge.data{stroke-dasharray:1 0}
-  path.hit{fill:none;stroke:transparent;stroke-width:16;pointer-events:stroke;cursor:pointer}
-  #edges.playing path.edge{opacity:.18}
-  #edges.playing path.edge.hot{opacity:1;stroke:var(--hot);stroke-width:3}
-  path.edge.sel{stroke:var(--hot);opacity:1}
+  path.edge.hover{stroke:#c2c9d8;stroke-width:3.5;opacity:1}
+  path.edge.sel{stroke:var(--hot);stroke-width:3.75;opacity:1}
+  path.hit{fill:none;stroke:transparent;stroke-width:24;pointer-events:stroke;cursor:pointer}
+  #edges.playing path.edge{opacity:.16;cursor:default}
+  #edges.playing path.edge.hot{opacity:1;stroke:var(--hot);stroke-width:3.25}
   .elabel{position:absolute;z-index:3;transform:translate(-50%,-50%);
     font:600 11px/1.25 var(--mono);color:var(--ink-dim);background:#0f1117cc;
     padding:3px 7px;border:1px solid var(--line);border-radius:7px;white-space:nowrap;
@@ -88,7 +90,14 @@
   .panel p{margin:0 0 10px;font-size:14px;color:var(--ink)}
   .panel .tech{display:none;border-top:1px solid var(--line);margin-top:12px;padding-top:12px}
   body.mode-contrib .panel .tech{display:block}
-  .panel .tech h4{margin:0 0 6px;font-size:12px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.06em}
+  .panel .tech h4{margin:14px 0 6px;font-size:12px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.06em}
+  .panel .tech h4:first-child{margin-top:0}
+  .panel .chain{font:500 11.5px/1.65 var(--mono);color:var(--ink-dim);background:#0c0e14;
+    border:1px solid var(--line);border-left:2px solid var(--accent,#8a91a6);border-radius:7px;
+    padding:7px 9px;margin:0 0 6px;word-break:break-word}
+  .panel .chain:last-child{margin-bottom:0}
+  .panel .chain b{color:var(--ink);font-weight:600}
+  .panel .src{font:500 11.5px/1.55 var(--mono);color:var(--ink-faint);word-break:break-word}
   .panel .kv{font:500 12.5px/1.7 var(--mono);color:var(--ink-dim)}
   .panel .kv code{color:var(--ink);background:#0c0e14;border:1px solid var(--line);
     border-radius:5px;padding:1px 5px}
@@ -108,6 +117,12 @@
   .walk .cap{margin-top:12px;min-height:42px;font-size:14px;color:var(--ink)}
   .walk .cap b{color:var(--hot)}
   .walk .cap .n{font:600 12px var(--mono);color:var(--ink-dim)}
+  .walk .stepchain{display:none;margin-top:10px;font:500 11.5px/1.6 var(--mono);color:var(--ink-dim);
+    background:#0c0e14;border:1px solid var(--line);border-left:2px solid var(--hot);border-radius:8px;
+    padding:9px 11px;word-break:break-word}
+  body.mode-contrib .walk .stepchain{display:block}
+  .walk .stepchain b{color:var(--ink);font-weight:600}
+  .walk .stepchain .lead{color:var(--ink-faint);text-transform:uppercase;letter-spacing:.06em;font-size:10px;display:block;margin-bottom:3px}
   footer{margin-top:34px;color:var(--ink-faint);font-size:12.5px}
 </style>
 </head>
@@ -193,71 +208,105 @@
   "use strict";
 
   // ---- content model (kept parallel to ARCHITECTURE.md, not a superset) ----
+  var css=function(v){return getComputedStyle(document.documentElement).getPropertyValue(v);};
   var NODES = {
-    app:{accent:getComputedStyle(document.documentElement).getPropertyValue('--app'),
-      tag:"Front-end", title:"RatioThink.app",
-      user:"The SwiftUI front end. It owns every user action — typing a message, picking a model, switching profiles, changing settings — and shows engine and model status. It never runs the model itself; it asks the helper to manage the engine and talks to the engine directly for chat.",
-      tech:[["Owns","chat UI, persistence (SwiftData), direct HTTP to engine"],
-            ["Status","EngineStatusStore polls engineStatus() ~1 Hz"],
-            ["Send path","ComposerView → ChatSendController → HTTPEngineClient"]]},
-    helper:{accent:getComputedStyle(document.documentElement).getPropertyValue('--helper'),
-      tag:"Background helper", title:"RatioThinkHelper",
-      user:"A menu-bar background agent. Its job is to start, supervise, and stop the pie engine, and to manage the on-disk model profiles and downloads. It keeps running when the app is closed, so the engine can outlive a single app window.",
-      tech:[["Launched as","launchd agent via SMAppService (not a login item)"],
-            ["Mach service","com.ratiothink.helper"],
-            ["Owns","PieEngineHost (engine lifecycle), ProfileStore, ModelDownloader"]]},
-    engine:{accent:getComputedStyle(document.documentElement).getPropertyValue('--engine'),
-      tag:"pie engine", title:"pie engine (pie serve)",
-      user:"The inference engine, bundled inside the app. It loads the chosen model at startup, runs the actual token generation, and can host small WebAssembly programs (inferlets) right next to the model.",
-      tech:[["Spawned as","pie serve --config <toml> --no-auth --debug"],
-            ["Model","loads at boot from config [[model]].hf_repo"],
-            ["Control plane","WebSocket, MessagePack RPC (auth / install / launch)"]]},
-    inferlet:{accent:getComputedStyle(document.documentElement).getPropertyValue('--inferlet'),
-      tag:"chat-apc inferlet", title:"chat-apc (wasm)",
+    app:{accent:css('--app'),
+      tag:"Front-end · SwiftUI", title:"RatioThink.app",
+      user:"The SwiftUI front end. It owns every user action — typing a message, picking a model, switching profiles, changing settings — and shows engine and model status. It never runs the model itself: it talks to the engine directly for chat and only asks the helper to manage the engine's lifecycle.",
+      facts:[["Owns","chat UI, persistence (SwiftData), the direct HTTP link to the engine"],
+             ["Status","poll-only — EngineStatusStore polls engineStatus() ~1 Hz; the app never starts the engine"]],
+      calls:["<b>Send:</b> ComposerView.submit() → ChatScaffoldView.sendAssistantTurn(for:) → ChatSendController.send(…) → HTTPEngineClient.chatCompletion(_:)",
+             "<b>Status:</b> EngineStatusStore poll → HelperXPCClient.engineStatus() → on .running(port) → requireBaseURL()"],
+      files:["App/RatioThinkApp.swift","App/Views/Chat/","Shared/Persistence/ChatSendController.swift","Shared/Engine/EngineStatusStore.swift"]},
+    helper:{accent:css('--helper'),
+      tag:"Background · menu bar", title:"RatioThinkHelper",
+      user:"A menu-bar background agent. It starts, supervises, and stops the pie engine, and manages the on-disk model profiles and downloads. It keeps running when the app is closed — and on boot it auto-resumes the last active profile, so the engine comes up with no user action.",
+      facts:[["Launched as","launchd agent via SMAppService (not a login item)"],
+             ["Mach service","com.ratiothink.helper"],
+             ["Owns","PieEngineHost (engine lifecycle), ProfileStore, ModelDownloader"]],
+      calls:["<b>Boot auto-resume:</b> HelperMain.autoResumeEngineOnBoot() → HelperResumeAction.run(engineHost:profileStore:resolver:) → resolver(profileID) → PieEngineHost.start(spec)",
+             "<b>XPC impl:</b> HelperExportedAPI implements engineStatus / startEngine / stopEngine / downloadModel / listProfiles"],
+      files:["Helper/HelperMain.swift","Shared/XPC/HelperExportedAPI.swift","Shared/HelperResumeAction.swift"]},
+    engine:{accent:css('--engine'),
+      tag:"Engine · pie serve", title:"pie engine (pie serve)",
+      user:"The inference engine, bundled inside the app. It loads the chosen model at startup, runs the actual token generation, and hosts small WebAssembly programs (inferlets) right next to the model.",
+      facts:[["Spawned as","pie serve --config &lt;toml&gt; --no-auth --debug (PIE_HOME, PIE_SHMEM_NAME)"],
+             ["Model","loads at boot from config [[model]].hf_repo — no runtime load call"],
+             ["Control plane","WebSocket, MessagePack RPC (auth / install / launch)"]],
+      calls:["<b>Launch:</b> PieEngineHost.start(spec) → doStart(spec) → PieControlLauncher.launch(spec:) → spawn pie serve; parse stdout “serving on host:port” + “internal token”",
+             "<b>Teardown:</b> SIGINT → 10 s grace → SIGKILL → shm_unlink(PIE_SHMEM_NAME)"],
+      files:["Vendor/pie/","Shared/Engine/PieControlLauncher.swift","Shared/Engine/PieEngineHost.swift","Shared/Engine/LaunchSpecResolver.swift"]},
+    inferlet:{accent:css('--inferlet'),
+      tag:"Inferlet · wasm", title:"chat-apc (wasm)",
       user:"The only inferlet RatioThink ships. pie installs it at startup and routes HTTP requests to it. It presents the OpenAI-compatible endpoints — chat completions plus health and model listing — so any OpenAI client can talk to your local engine.",
-      tech:[["Serves","/healthz · /v1/models · /v1/chat/completions · /v1/models/load · /v1/inferlet"],
-            ["APC","Adaptive Personality/Capability decoders. Reasoning is active. The tool-use decoder is fully implemented — it emits OpenAI tool_calls (finish_reason: tool_calls) when a request supplies a tools array — but the v1 RatioThink app never sends tools, so it stays dormant in the shipping product."],
-            ["Note","ONE inferlet for both planes; there is no separate pie-control inferlet"]]}
+      facts:[["Serves","/healthz · /v1/models · /v1/chat/completions · /v1/models/load · /v1/inferlet"],
+             ["APC","Adaptive Personality/Capability decoders. Reasoning active; the tool-use decoder is fully implemented (emits OpenAI tool_calls when a request supplies a tools array) but the v1 app never sends tools, so it stays dormant in the shipping product."],
+             ["Note","ONE inferlet for both planes — there is no separate pie-control inferlet"]],
+      calls:["<b>Route:</b> lib.rs match (method, path) → chat::completions::handle / control::{health,models,load}",
+             "<b>Install:</b> wasm staged via Shared/InferletResources, uploaded by PieControlClient.installProgram + launchDaemon"],
+      files:["Inferlets/chat-apc/src/lib.rs","src/chat/completions.rs","src/chat/apc.rs","src/control/load.rs"]}
   };
 
   var EDGES = {
     xpc:{from:"app",to:"helper",side:"left",
       hi:"XPC · control", lo:"NSXPC · Codable→Data",
-      title:"App ↔ Helper — XPC", accent:NODES.helper.accent,
-      user:"The app asks the helper to do privileged, long-lived work: start or stop the engine, download a model, list profiles. It also asks “is the engine up, and on what port?” about once a second.",
-      tech:[["Transport","NSXPCConnection → mach service com.ratiothink.helper"],
-            ["Protocol","@objc(PieHelperXPC); payloads are Codable encoded to Data via XPCPayload (JSON: sortedKeys, ISO-8601, base64)"],
-            ["Calls","engineStatus (polled), startEngine, stopEngine, downloadModel, listProfiles, tailLog"],
-            ["Direction","pull, not push — the helper does not stream status changes"]]},
+      title:"App ↔ Helper — XPC control plane", accent:NODES.helper.accent,
+      user:"The app asks the helper to do privileged, long-lived work — stop the engine, download a model, list profiles — and polls “is the engine up, and on what port?” about once a second. The app is poll-only; the helper auto-resumes the engine itself.",
+      facts:[["Transport","NSXPCConnection → mach service com.ratiothink.helper"],
+             ["Protocol","@objc(PieHelperXPC); payloads Codable→Data via XPCPayload (JSON: sortedKeys, ISO-8601, base64)"],
+             ["Direction","pull, not push — the helper does not stream status changes"]],
+      calls:["<b>Selectors:</b> engineStatus (polled) · startEngine(profileID:) · stopEngine · downloadModel(repo:file:) · listProfiles · tailLog",
+             "<b>App side:</b> HelperXPCClient.engineStatus() / .stopEngine() (AppXPCClient)",
+             "<b>Helper side:</b> HelperExportedAPI.startEngine(profileID:reply:) → PieEngineHost.start(spec)"],
+      files:["Shared/XPC/PieHelperXPC.swift","Shared/XPC/AppXPCClient.swift","Shared/XPC/HelperXPCListener.swift","Shared/XPC/HelperExportedAPI.swift"]},
     launch:{from:"helper",to:"engine",side:"left",
       hi:"launch + WS control", lo:"spawn · install chat-apc",
-      title:"Helper ↔ pie — launch + control", accent:NODES.engine.accent,
-      user:"The helper starts the engine as a child process and then, over a WebSocket, hands it the chat-apc inferlet and tells it which port to listen on. On shutdown it stops the process cleanly.",
-      tech:[["Spawn","pie serve --config <config.toml> --no-auth --debug (PIE_HOME, PIE_SHMEM_NAME)"],
-            ["Handshake","reads stdout: “pie-server serving on host:port” + “internal token: …”"],
-            ["WS RPC","auth_by_token → install_program(wasm) → launch_daemon(“chat-apc@0.1.0”, port)"],
-            ["Teardown","SIGINT → 10 s grace → SIGKILL → shm_unlink"]]},
+      title:"Helper ↔ pie — launch + WebSocket control", accent:NODES.engine.accent,
+      user:"The helper starts the engine as a child process, waits for it to announce itself on stdout, then over a WebSocket hands it the chat-apc inferlet and tells it which port to listen on. On shutdown it stops the process cleanly.",
+      facts:[["Spawn","pie serve --config &lt;config.toml&gt; --no-auth --debug (PIE_HOME, PIE_SHMEM_NAME)"],
+             ["Handshake","reads stdout: “pie-server serving on host:port” + “internal token: …”"],
+             ["Wire","WebSocket, MessagePack request/response keyed by corr_id"]],
+      calls:["<b>Launch:</b> PieEngineHost.start(spec) → PieControlLauncher.launch(spec:)",
+             "<b>WS RPC:</b> PieControlClient.connect() → authByToken(token) → installProgram(wasmURL:) → launchDaemon(inferlet:port:)",
+             "<b>Resolve model:</b> LaunchSpecResolver builds the LaunchSpec (app-staged path or HF cache)"],
+      files:["Shared/Engine/PieEngineHost.swift","Shared/Engine/PieControlLauncher.swift","Shared/Engine/PieControlClient.swift","Shared/Engine/LaunchSpecResolver.swift"]},
     http:{from:"app",to:"inferlet",side:"right",
       hi:"HTTP + SSE · data", lo:"loopback · bypasses helper",
-      title:"App ↔ engine — HTTP + SSE", accent:NODES.app.accent,
-      user:"Chat does NOT go through the helper. The app connects straight to the engine on a local port and uses ordinary OpenAI-style HTTP. Replies stream back token by token.",
-      tech:[["Target","127.0.0.1:<port> — port comes from EngineStatus.running(port:)"],
-            ["Chat","POST /v1/chat/completions → SSE: {event:model_ready} → chat.completion.chunk deltas → data:[DONE]"],
-            ["Also","GET /healthz, GET /v1/models, POST /v1/models/load (instant — model already loaded at boot)"],
-            ["Consumed by","HTTPEngineClient via URLSession.bytes → MessageStreamWriter → SwiftData"]]}
+      title:"App ↔ engine — HTTP + SSE data plane", accent:NODES.app.accent,
+      user:"Chat does NOT go through the helper. The app connects straight to the engine on a local port and uses ordinary OpenAI-style HTTP; replies stream back token by token over Server-Sent Events.",
+      facts:[["Target","127.0.0.1:&lt;port&gt; — port from EngineStatus.running(port:)"],
+             ["Chat","POST /v1/chat/completions → SSE: {event:model_ready} → chat.completion.chunk → data:[DONE]"],
+             ["Also","GET /healthz · GET /v1/models · POST /v1/models/load (instant — model loaded at boot)"]],
+      calls:["<b>Request:</b> ChatSendController.send(…) → EngineClient.chatCompletion(req) → HTTPEngineClient.chatCompletion(_:) → baseURLProvider()",
+             "<b>Stream sink:</b> AsyncThrowingStream&lt;ChatEvent&gt; → MessageStreamWriter.appendDelta() → flush() → SwiftData"],
+      files:["Shared/Engine/HTTPEngineClient.swift","Shared/Engine/EngineClient.swift","Shared/Persistence/ChatSendController.swift","Shared/Persistence/MessageStreamWriter.swift"]}
   };
 
   var SCN = {
     cold:{name:"Cold start", steps:[
-      {edges:["xpc"],nodes:["app","helper"],cap:'App launches and asks the helper to bring the engine up: <span class="n">startEngine(profileID)</span> over XPC.'},
-      {edges:["launch"],nodes:["helper","engine"],cap:'The helper spawns <span class="n">pie serve</span>, waits for the stdout handshake, then opens the WebSocket control plane.'},
-      {edges:["launch"],nodes:["engine","inferlet"],cap:'Over that WebSocket it installs <span class="n">chat-apc</span> and calls <span class="n">launch_daemon</span> to bind its HTTP listener. The model is already loaded from the config at boot.'},
-      {edges:["xpc"],nodes:["app","helper"],cap:'Engine reports <span class="n">.running(port)</span>; the app’s status poll picks it up and resolves the loopback HTTP base URL. Ready to chat.'}
+      {nodes:["helper"],edges:[],focus:{node:"helper"},
+       cap:'The helper boots as a launchd agent and <b>auto-resumes</b> the last active profile. The app never starts the engine — it is poll-only.',
+       chain:'HelperMain.autoResumeEngineOnBoot() → HelperResumeAction.run(engineHost:profileStore:resolver:) → resolver(profileID) → <b>PieEngineHost.start(spec)</b>'},
+      {nodes:["helper","engine"],edges:["launch"],focus:{edge:"launch"},
+       cap:'The host launches <span class="n">pie serve</span> and waits for the stdout handshake (serving address + internal token).',
+       chain:'PieEngineHost.start → doStart(spec) → <b>PieControlLauncher.launch(spec:)</b> → spawn pie serve --config &lt;toml&gt; --no-auth --debug'},
+      {nodes:["engine","inferlet"],edges:["launch"],focus:{edge:"launch"},
+       cap:'Over the WebSocket it installs <span class="n">chat-apc</span> and binds its HTTP listener. The model is already loaded from the config at boot.',
+       chain:'PieControlClient.connect() → authByToken(token) → <b>installProgram(wasmURL:)</b> → launchDaemon(inferlet:port:) ⇒ host → .running(port)'},
+      {nodes:["app","helper"],edges:["xpc"],focus:{edge:"xpc"},
+       cap:'The app’s status poll picks up <span class="n">.running(port)</span> and resolves the loopback base URL. Ready to chat.',
+       chain:'EngineStatusStore poll → HelperXPCClient.engineStatus() → PieHelperXPC.engineStatus → .running(port) → <b>requireBaseURL()</b> ⇒ http://127.0.0.1:&lt;port&gt;'}
     ]},
     send:{name:"Send a message", steps:[
-      {edges:["http"],nodes:["app","inferlet"],cap:'You hit Return. The app POSTs <span class="n">/v1/chat/completions</span> straight to the engine’s loopback port — <b>not</b> through the helper.'},
-      {edges:["http"],nodes:["inferlet","app"],cap:'chat-apc streams Server-Sent Events back: a <span class="n">model_ready</span> frame, then OpenAI <span class="n">chat.completion.chunk</span> deltas.'},
-      {edges:["http"],nodes:["app"],cap:'Each delta is flushed into the assistant message; the transcript re-renders live until <span class="n">data:[DONE]</span>.'}
+      {nodes:["app","inferlet"],edges:["http"],focus:{edge:"http"},
+       cap:'You hit Return. The app POSTs <span class="n">/v1/chat/completions</span> straight to the engine’s loopback port — <b>not</b> through the helper.',
+       chain:'ComposerView.submit() → ChatScaffoldView.sendAssistantTurn(for:) → ChatSendController.send(…) → EngineClient.chatCompletion(req) → <b>HTTPEngineClient.chatCompletion(_:)</b> → POST /v1/chat/completions'},
+      {nodes:["inferlet","app"],edges:["http"],focus:{edge:"http"},
+       cap:'<span class="n">chat-apc</span> streams Server-Sent Events back: a <span class="n">model_ready</span> frame, then OpenAI <span class="n">chat.completion.chunk</span> deltas.',
+       chain:'pie routes request → chat-apc lib.rs → <b>chat::completions::handle</b> → SSE {event:model_ready} → chat.completion.chunk deltas → data:[DONE]'},
+      {nodes:["app"],edges:["http"],focus:{edge:"http"},
+       cap:'Each delta is flushed into the assistant message; the transcript re-renders live until <span class="n">data:[DONE]</span>.',
+       chain:'ChatSendController consumes AsyncThrowingStream&lt;ChatEvent&gt; → <b>MessageStreamWriter.appendDelta()</b> → flush() (250 ms) → SwiftData → TranscriptView re-render → finish()'}
     ]}
   };
 
@@ -272,19 +321,28 @@
   var scnId=null, stepIx=-1;        // walkthrough state
 
   // ---- build edge SVG paths + labels once ----
+  // Each edge has a visible path, a fat transparent hit path on top, and an
+  // HTML label — ALL three select the edge on click and brighten it on hover.
+  var SVGNS='http://www.w3.org/2000/svg';
   Object.keys(EDGES).forEach(function(id){
-    var hit=document.createElementNS('http://www.w3.org/2000/svg','path');
-    hit.setAttribute('class','hit'); hit.style.cursor='pointer';
-    hit.addEventListener('click',function(e){e.stopPropagation();selectEdge(id);});
-    var p=document.createElementNS('http://www.w3.org/2000/svg','path');
+    var p=document.createElementNS(SVGNS,'path');
     p.setAttribute('class','edge'+(id==='http'?' data':''));
+    var hit=document.createElementNS(SVGNS,'path');
+    hit.setAttribute('class','hit');
     svg.appendChild(p); svg.appendChild(hit);
     edgePaths[id]=p; edgeHits[id]=hit;
     var lab=document.createElement('div'); lab.className='elabel';
     lab.innerHTML='<span class="hi">'+EDGES[id].hi+'</span><span class="lo">'+EDGES[id].lo+'</span>';
-    lab.addEventListener('click',function(e){e.stopPropagation();selectEdge(id);});
     lab.style.pointerEvents='auto'; lab.style.cursor='pointer';
     diagram.appendChild(lab); edgeLabels[id]=lab;
+    function pick(e){e.stopPropagation();selectEdge(id);}
+    function over(){if(!scnId)p.classList.add('hover');}
+    function out(){p.classList.remove('hover');}
+    [p,hit,lab].forEach(function(el){
+      el.addEventListener('click',pick);
+      el.addEventListener('mouseenter',over);
+      el.addEventListener('mouseleave',out);
+    });
   });
 
   function center(el,host){var r=el.getBoundingClientRect(),h=host.getBoundingClientRect();
@@ -317,32 +375,38 @@
   }
 
   // ---- inspection panel ----
-  function rows(arr){return arr.map(function(kv){
+  function kvRows(arr){return arr.map(function(kv){
     return '<div class="kv"><b style="color:var(--ink)">'+kv[0]+':</b> '+kv[1]+'</div>';}).join('');}
+  function chainRows(arr){return arr.map(function(c){return '<div class="chain">'+c+'</div>';}).join('');}
+  function srcRow(arr){return '<div class="src">'+arr.join(' · ')+'</div>';}
+  function techBlock(factsLabel,facts,callsLabel,calls,files){
+    return '<div class="tech"><h4>'+factsLabel+'</h4>'+kvRows(facts)+
+      '<h4>'+callsLabel+'</h4>'+chainRows(calls)+
+      '<h4>Source</h4>'+srcRow(files)+'</div>';}
   function showNode(id){var n=NODES[id];
     panel.style.setProperty('--accent',n.accent);
     panel.innerHTML='<div class="ptag">'+n.tag+'</div><h2>'+n.title+'</h2><p>'+n.user+'</p>'+
-      '<div class="tech"><h4>Under the hood</h4>'+rows(n.tech)+'</div>';}
+      techBlock('Key facts',n.facts,'Call paths',n.calls,n.files);}
   function showEdge(id){var e=EDGES[id];
     panel.style.setProperty('--accent',e.accent);
     panel.innerHTML='<div class="ptag">connection</div><h2>'+e.title+'</h2><p>'+e.user+'</p>'+
-      '<div class="tech"><h4>Protocol</h4>'+rows(e.tech)+'</div>';}
+      techBlock('Mechanism',e.facts,'Key calls',e.calls,e.files);}
   function showIntro(){panel.style.setProperty('--accent','#8a91a6');
     panel.innerHTML='<div class="ptag">overview</div><h2>Three conversations</h2>'+
       '<p>The app talks to the <b style="color:var(--helper)">helper</b> over XPC to manage the engine, '+
       'the helper <b style="color:var(--engine)">launches pie</b> and installs the inferlet, and the app '+
       'talks <b style="color:var(--app)">straight to the engine</b> over HTTP for chat.</p>'+
-      '<p style="color:var(--ink-dim);font-size:13px">Switch to <b>Contributor view</b> for protocols, ports, and file pointers. Click any box or line.</p>';}
+      '<p style="color:var(--ink-dim);font-size:13px">Click any <b>box</b> or <b>connector line</b> to inspect it. Switch to <b>Contributor view</b> for the concrete call paths, protocols, and source files — including each walkthrough step.</p>';}
 
   function clearSel(){
     if(selKind==='node'&&nodeEls[selId])nodeEls[selId].classList.remove('sel');
-    if(selKind==='edge'&&edgePaths[selId])edgePaths[selId].classList.remove('sel');
+    if(selKind==='edge'&&edgePaths[selId]){edgePaths[selId].classList.remove('sel');edgePaths[selId].classList.remove('hover');}
     selKind=selId=null;
   }
   function selectNode(id){if(scnId)return; clearSel(); selKind='node';selId=id;
     nodeEls[id].classList.add('sel'); showNode(id);}
   function selectEdge(id){if(scnId)return; clearSel(); selKind='edge';selId=id;
-    edgePaths[id].classList.add('sel'); showEdge(id);}
+    edgePaths[id].classList.remove('hover'); edgePaths[id].classList.add('sel'); showEdge(id);}
 
   Object.keys(nodeEls).forEach(function(id){
     nodeEls[id].addEventListener('click',function(e){e.stopPropagation();selectNode(id);});});
@@ -362,21 +426,25 @@
     col.classList.toggle('playing',playing);
     svg.classList.toggle('playing',playing);
     Object.keys(nodeEls).forEach(function(id){nodeEls[id].classList.remove('hot');});
-    Object.keys(edgePaths).forEach(function(id){edgePaths[id].classList.remove('hot');});
+    Object.keys(edgePaths).forEach(function(id){edgePaths[id].classList.remove('hot');edgePaths[id].classList.remove('hover');});
     if(!playing){countEl.textContent='–';return;}
     var steps=SCN[scnId].steps, st=steps[stepIx];
     (st.nodes||[]).forEach(function(id){if(nodeEls[id])nodeEls[id].classList.add('hot');});
     (st.edges||[]).forEach(function(id){if(edgePaths[id])edgePaths[id].classList.add('hot');});
-    cap.innerHTML='<span class="n">'+SCN[scnId].name+' · '+(stepIx+1)+'/'+steps.length+'</span> &nbsp; '+st.cap;
+    cap.innerHTML='<span class="n">'+SCN[scnId].name+' · '+(stepIx+1)+'/'+steps.length+'</span> &nbsp; '+st.cap+
+      (st.chain?'<div class="stepchain"><span class="lead">call path</span>'+st.chain+'</div>':'');
     countEl.textContent=(stepIx+1)+' / '+steps.length;
     document.getElementById('prev').disabled=(stepIx===0);
     document.getElementById('next').disabled=(stepIx===steps.length-1);
   }
   function startScn(id){clearSel(); scnId=id; stepIx=0;
     Array.prototype.forEach.call(document.querySelectorAll('#scn button'),function(b){b.classList.toggle('on',b.dataset.scn===id);});
-    showEdgeOrIntroForScn(); applyStep();}
-  function showEdgeOrIntroForScn(){ // panel shows the scenario's primary connection
-    var first=SCN[scnId].steps[0]; if(first.edges&&first.edges[0])showEdge(first.edges[0]); else showIntro();}
+    applyStep(); panelForStep(SCN[id].steps[0]);}
+  function panelForStep(st){ // panel follows the step: its edge if it has one, else its node
+    if(st.focus&&st.focus.edge)showEdge(st.focus.edge);
+    else if(st.focus&&st.focus.node)showNode(st.focus.node);
+    else if(st.edges&&st.edges[0])showEdge(st.edges[0]);
+    else if(st.nodes&&st.nodes[0])showNode(st.nodes[0]);}
   function stopScn(){scnId=null;stepIx=-1;
     Array.prototype.forEach.call(document.querySelectorAll('#scn button'),function(b){b.classList.remove('on');});
     cap.innerHTML='Pick a walkthrough and step through it, or just click around the diagram.';
@@ -385,11 +453,9 @@
   document.getElementById('scn').addEventListener('click',function(e){
     var b=e.target.closest('button'); if(!b)return; startScn(b.dataset.scn);});
   document.getElementById('next').addEventListener('click',function(){
-    if(scnId&&stepIx<SCN[scnId].steps.length-1){stepIx++;applyStep();
-      var ed=SCN[scnId].steps[stepIx].edges;if(ed&&ed[0])showEdge(ed[0]);}});
+    if(scnId&&stepIx<SCN[scnId].steps.length-1){stepIx++;applyStep();panelForStep(SCN[scnId].steps[stepIx]);}});
   document.getElementById('prev').addEventListener('click',function(){
-    if(scnId&&stepIx>0){stepIx--;applyStep();
-      var ed=SCN[scnId].steps[stepIx].edges;if(ed&&ed[0])showEdge(ed[0]);}});
+    if(scnId&&stepIx>0){stepIx--;applyStep();panelForStep(SCN[scnId].steps[stepIx]);}});
   document.getElementById('reset').addEventListener('click',stopScn);
   document.addEventListener('keydown',function(e){
     if(!scnId)return;
