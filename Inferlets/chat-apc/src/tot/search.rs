@@ -66,12 +66,17 @@ pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
     let mut last_level_scored: Vec<(String, Option<u8>)> = Vec::new();
 
     for level in 1..=params.depth {
-        // Levels > 1 refine the parent before forking. Sequential
-        // (≤ beam_width parents; flush is light). A flush failure is
-        // best-effort — children simply re-cue from the un-refined prefix.
+        // Levels > 1 refine the parent before forking: append the refine
+        // user-turn, then `cue()` to open the assistant turn the children
+        // will generate into (mirrors the pie tree-of-thought example).
+        // Level 1 needs no prep — the root's cue is already committed via
+        // `fill_context` + the root flush, and is shared into every fork.
+        // Sequential (≤ beam_width parents; flush is light). A flush
+        // failure is best-effort.
         if level > 1 {
             for f in frontier.iter_mut() {
                 f.ctx.user(REFINE_INSTRUCTION);
+                f.ctx.cue();
                 let _ = f.ctx.flush().await;
             }
         }
