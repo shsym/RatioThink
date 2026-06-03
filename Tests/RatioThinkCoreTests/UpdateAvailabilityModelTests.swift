@@ -95,6 +95,23 @@ final class UpdateAvailabilityModelTests: XCTestCase {
     XCTAssertEqual(feed.callCount, 1, "the launch check is one-shot — no second network call")
   }
 
+  func test_checkOnLaunch_reArmsAfterCancellation() async {
+    // A cancelled launch `.task` must NOT burn the one-shot — otherwise the
+    // banner could never surface again this process despite no completed check.
+    let feed = StubReleaseFeed(.failure(CancellationError()))
+    let model = UpdateAvailabilityModel(feed: feed, currentVersion: "0.1.0")
+    let (prefs, _) = makePreferences()
+
+    await model.checkOnLaunch(preferences: prefs)
+    XCTAssertNil(model.pending)
+    XCTAssertEqual(feed.callCount, 1)
+
+    // Re-armed: a later launch (or re-`task`) retries.
+    await model.checkOnLaunch(preferences: prefs)
+    XCTAssertEqual(feed.callCount, 2,
+                   "a cancelled launch check must re-arm so it can retry")
+  }
+
   // MARK: - ignore + persistence
 
   func test_ignorePending_persistsVersionAndClearsBanner() async {

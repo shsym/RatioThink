@@ -46,6 +46,17 @@ final class UpdateCheckTests: XCTestCase {
     XCTAssertFalse(padded < short)   // i.e. equal ordering — 1.2 == 1.2.0
   }
 
+  func test_semanticVersion_equatableAndHashableMatchZeroPaddedOrdering() {
+    // `==` and `hash` must agree with the zero-padded `<` (Comparable's
+    // total-order law) — the synthesized versions would not.
+    XCTAssertEqual(SemanticVersion("1.2")!, SemanticVersion("1.2.0")!)
+    XCTAssertEqual(SemanticVersion("0.1")!, SemanticVersion("0.1.0")!)
+    XCTAssertNotEqual(SemanticVersion("1.2")!, SemanticVersion("1.2.1")!)
+    // Equal values collapse in a Set (hash consistent with ==).
+    XCTAssertEqual(Set([SemanticVersion("1.2")!, SemanticVersion("1.2.0")!]).count, 1)
+    XCTAssertEqual(Set([SemanticVersion("1.2")!, SemanticVersion("1.2.1")!]).count, 2)
+  }
+
   // MARK: - UpdateCheck.status decision
 
   private func release(_ tag: String) -> UpdateCheck.Release {

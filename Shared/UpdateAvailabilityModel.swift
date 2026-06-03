@@ -50,20 +50,37 @@ public final class UpdateAvailabilityModel: ObservableObject {
   /// `.task`) is a no-op, so the network is hit at most once per launch.
   public func checkOnLaunch(preferences: AppPreferences) async {
     guard !didRunLaunchCheck else { return }
-    didRunLaunchCheck = true
-    await refresh(ignoredVersions: preferences.ignoredUpdateVersions)
+    // Burn the one-shot only on a COMPLETED attempt. If SwiftUI cancels
+    // RootView's `.task` mid-fetch, refresh reports "not completed" and the
+    // guard stays armed so a later launch (or re-`task`) can retry; a real
+    // GitHub failure (404/HTTP/parse) is a completed attempt and burns it.
+    if await refresh(ignoredVersions: preferences.ignoredUpdateVersions) {
+      didRunLaunchCheck = true
+    }
   }
 
   /// Fetch the latest release and apply the launch decision against
-  /// `ignoredVersions`. Factored out of the once-guard so tests can drive the
-  /// decision directly with different ignore-sets. Stays silent on failure.
-  func refresh(ignoredVersions: Set<String>) async {
+  /// `ignoredVersions`. Returns `true` when a real attempt completed (success
+  /// or a genuine GitHub failure), and `false` only when the attempt was
+  /// cancelled — so the caller keeps its once-per-launch guard armed for a
+  /// retry. Stays silent (no banner) on any failure. Factored out of the
+  /// once-guard so tests can drive the decision directly with different
+  /// ignore-sets.
+  @discardableResult
+  func refresh(ignoredVersions: Set<String>) async -> Bool {
     let release: UpdateCheck.Release
     do {
       release = try await feed.latestRelease()
     } catch {
       pending = nil
-      return
+      // A cancelled launch `.task` surfaces here. URLSession maps task
+      // cancellation to `URLError.cancelled`, which `GitHubReleaseFeed`
+      // re-wraps as `UpdateCheckError.transport` — so detect cancellation by
+      // `Task.isCancelled` (production) OR the raw cancellation error types
+      // (direct propagation / tests), never the wrapped error alone.
+      if error is CancellationError || Task.isCancelled { return false }
+      if let urlError = error as? URLError, urlError.code == .cancelled { return false }
+      return true
     }
     switch UpdateCheck.launchPrompt(current: currentVersion,
                                     latest: release,
@@ -73,6 +90,7 @@ public final class UpdateAvailabilityModel: ObservableObject {
     case .silent:
       pending = nil
     }
+    return true
   }
 
   /// Persist the pending version into the ignore-set and clear the banner. A

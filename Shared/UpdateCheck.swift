@@ -122,7 +122,7 @@ public enum UpdateCheck {
 /// which is enough to order RatioThink's `vX.Y.Z` release tags. Returns
 /// `nil` on anything non-numeric so the caller falls back to honest
 /// "couldn't determine" rather than guessing.
-public struct SemanticVersion: Comparable, Equatable, Sendable {
+public struct SemanticVersion: Comparable, Hashable, Sendable {
   /// The numeric release components in order, e.g. `[0, 1, 1]`.
   public let components: [Int]
   /// Canonical `joined(".")` form for display, e.g. `0.1.1`.
@@ -159,6 +159,24 @@ public struct SemanticVersion: Comparable, Equatable, Sendable {
       if left != right { return left < right }
     }
     return false
+  }
+
+  /// Equatable consistent with the zero-padded ordering: `1.2 == 1.2.0`
+  /// (matches `<`'s missing-trailing-component-as-zero rule). The synthesized
+  /// `==` would compare `components`/`displayString` and call them unequal,
+  /// breaking the Comparable total-order law (exactly one of `<`, `==`, `>`
+  /// must hold) for an otherwise order-equal pair.
+  public static func == (lhs: SemanticVersion, rhs: SemanticVersion) -> Bool {
+    !(lhs < rhs) && !(rhs < lhs)
+  }
+
+  /// Hash the canonical (trailing-zero-stripped) form so equal versions hash
+  /// equal — `1.2` and `1.2.0` collapse in a `Set`/dictionary, keeping
+  /// `Hashable` consistent with the custom `==`.
+  public func hash(into hasher: inout Hasher) {
+    var canonical = components
+    while canonical.count > 1, canonical.last == 0 { canonical.removeLast() }
+    hasher.combine(canonical)
   }
 }
 
