@@ -324,6 +324,9 @@ test-e2e-full: ## E2E area: 3-layer real-model proof — GUI download → engine
 test-helper-respawn: ## Acceptance: live launchd Helper auto-respawn (needs signed/registered install)
 	Scripts/verify-helper-respawn.sh
 
+test-helper-recovery: ## Acceptance: App-side runtime helper recovery #412 (needs signed install + RatioThink.app running)
+	Scripts/verify-helper-recovery.sh
+
 test-ssh: test-unit test-scenario test-smoke test-install-guards ## Everything runnable under SSH (no GUI)
 
 test-all: test-ssh test-gui ## Everything (GUI tests skip if no seated session)
