@@ -188,7 +188,7 @@ large local GGUF unless the small-model path is proven or precisely blocked.
     System Settings, then export `PIE_TEST_TCC_GRANTED=1` for tests that require
     menu-bar interaction.
   - If using the existing S4 helper boot test, stage
-    `Qwen3-0.6B-Q4_K_M.gguf` at `test-models/` or set `PIE_TEST_MODEL` to the
+    `Qwen3-0.6B-Q8_0.gguf` at `test-models/` or set `PIE_TEST_MODEL` to the
     fixture path. That S4 path is a GGUF fixture path and is separate from the
     small HF cache path below.
 
@@ -326,10 +326,13 @@ Expected pass evidence:
 _Last verified 2026-05-25 — `S275_MultiTurnResumeGUITests`, 1 test, 0 failures;
 wrapper printed `resume gui history e2e: PASS`._
 
-Lower-level fallback — the smallest real GUI engine-boot path. Gates: a seated
-session, `PIE_TEST_TCC_GRANTED=1`, and a model at
-`test-models/Qwen3-0.6B-Q4_K_M.gguf` (or `PIE_TEST_MODEL`); missing any of them
-fails before the test body with `Timed out while enabling automation mode`.
+Lower-level fallback — the smallest real GUI engine-boot path. A missing seated
+session, an unset `PIE_TEST_TCC_GRANTED=1`, or a missing model at
+`test-models/Qwen3-0.6B-Q8_0.gguf` (or `PIE_TEST_MODEL`) each **`XCTSkip`** the
+test with its own recovery message. The `Timed out while enabling automation
+mode` failure is separate: it means the real OS Automation/Accessibility
+permission is ungranted (the `PIE_TEST_TCC_GRANTED` flag only opts in — it does
+not grant it), so grant it in System Settings first.
 
 ```bash
 xcodebuild -project RatioThink.xcodeproj \
