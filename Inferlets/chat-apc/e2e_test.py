@@ -550,6 +550,169 @@ async def main() -> int:
                             f"/v1/inferlet chat-apc bad model status {r.status_code}"
                         )
 
+                    # ── tree-of-thought (#407) ───────────────────────
+                    # The `tree-of-thought` dispatch name is accepted
+                    # (distinct from the unknown-name 404 above). These
+                    # validation paths are deterministic — they don't
+                    # need a working forward pass. The full-search shape
+                    # check below is best-effort against the dummy driver.
+
+                    # stream:true → 400 (no streaming in v1).
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": True,
+                            "input": {"messages": [{"role": "user", "content": "hi"}]},
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot stream=true) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(f"tot stream:true status {r.status_code} (want 400)")
+
+                    # Out-of-range breadth → 400 with `param` tag.
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": False,
+                            "input": {
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "breadth": 0,
+                            },
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot breadth=0) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(f"tot breadth=0 status {r.status_code} (want 400)")
+                    else:
+                        try:
+                            param = r.json().get("error", {}).get("param")
+                        except Exception:
+                            param = None
+                        if param != "breadth":
+                            failures.append(f"tot breadth=0 param {param!r} (want 'breadth')")
+
+                    # Node-budget explosion (5×4×5 = 80 > 64) → 400.
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": False,
+                            "input": {
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "breadth": 5,
+                                "depth": 4,
+                                "beam_width": 5,
+                            },
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot node-explosion) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(f"tot node-explosion status {r.status_code} (want 400)")
+
+                    # Unknown model in input → 404.
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": False,
+                            "input": {
+                                "model": "does-not-exist",
+                                "messages": [{"role": "user", "content": "hi"}],
+                            },
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot bad model) -> {r.status_code}")
+                    if r.status_code != 404:
+                        failures.append(f"tot bad model status {r.status_code} (want 404)")
+
+                    # Empty messages → 400.
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": False,
+                            "input": {"messages": []},
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot empty messages) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(f"tot empty messages status {r.status_code} (want 400)")
+
+                    # Full search path: a small tree. With the dummy
+                    # driver the per-node forward pass may error
+                    # (status:"error" nodes) or return random tokens
+                    # (status:"ok"); either way the REQUEST returns 200
+                    # with the full tree. If the dummy driver cannot flush
+                    # the prompt the request is 500 — recorded as SKIPPED
+                    # (tree shape asserted only under a real driver).
+                    bd, dp, bw = 2, 2, 1
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": False,
+                            "input": {
+                                "messages": [{"role": "user", "content": "What is 2+2?"}],
+                                "breadth": bd,
+                                "depth": dp,
+                                "beam_width": bw,
+                                "max_tokens_per_node": 16,
+                            },
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot search {bd}x{dp}/beam{bw}) -> {r.status_code}")
+                    if r.status_code == 200:
+                        body = r.json()
+                        if body.get("object") != "tree_of_thought":
+                            failures.append(f"tot object {body.get('object')!r}")
+                        root = body.get("root") or {}
+                        if root.get("id") != "root" or root.get("depth") != 0:
+                            failures.append(f"tot root shape {root!r}")
+                        if (body.get("breadth"), body.get("depth"), body.get("beam_width")) != (bd, dp, bw):
+                            failures.append(f"tot echoed params {body!r}")
+
+                        def _walk(n):
+                            out = [n]
+                            for c in n.get("children", []):
+                                out.extend(_walk(c))
+                            return out
+
+                        non_root = [n for n in _walk(root) if n.get("id") != "root"]
+                        want_nodes = bd + (dp - 1) * bw * bd  # 2 + 1*1*2 = 4
+                        if len(non_root) != want_nodes:
+                            failures.append(
+                                f"tot node count {len(non_root)} (want {want_nodes}): {body!r}"
+                            )
+                        ids = {n.get("id") for n in non_root}
+                        for n in non_root:
+                            missing = [
+                                k
+                                for k in ("id", "parent_id", "depth", "branch_index", "content", "score", "status")
+                                if k not in n
+                            ]
+                            if missing:
+                                failures.append(f"tot node missing {missing}: {n!r}")
+                            if n.get("status") not in ("ok", "error"):
+                                failures.append(f"tot node status {n.get('status')!r}")
+                            if not (isinstance(n.get("depth"), int) and 1 <= n["depth"] <= dp):
+                                failures.append(f"tot node depth {n.get('depth')!r}")
+                            sc = n.get("score")
+                            if sc is not None and not (isinstance(sc, int) and 1 <= sc <= 10):
+                                failures.append(f"tot node score {sc!r}")
+                        sel = body.get("selected_node_id")
+                        if sel is not None and sel not in ids:
+                            failures.append(f"tot selected_node_id {sel!r} not in tree")
+                    elif r.status_code == 500:
+                        skipped.append(
+                            "tree-of-thought full search: dummy driver could not "
+                            "flush/generate (500); tree shape is asserted only under a "
+                            "forward-pass-capable driver (live-engine coverage)"
+                        )
+                    else:
+                        failures.append(f"tot search status {r.status_code} (want 200 or 500)")
+
                     # Review v2 follow-ups (F6/F7/F16): param bounds,
                     # malformed JSON, oversized body, streaming frame
                     # order, /v1/inferlet messages-precedence.
