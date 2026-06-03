@@ -62,6 +62,22 @@ public struct HelperHealthPolicy: Equatable, Sendable {
   }
 }
 
+/// Worst-case duration of ONE reconcile reachability probe
+/// (`HelperRegistrationRepair.probeHelperReachable`). Single source of truth,
+/// in RatioThinkCore so BOTH the App-side probe (which can't be referenced
+/// from Core) AND the Core-side chat-recovery ceiling derive from the same
+/// numbers — there is no second place to drift (#412 re-F1). The probe lives
+/// in the App target; only its TIMING BUDGET is policy and lives here.
+public enum HelperReconcileProbeBudget {
+  /// Reachability poll attempts per probe.
+  public static let attempts = 8
+  /// Backoff between attempts.
+  public static let delaySeconds: TimeInterval = 0.6
+  /// Worst-case probe wall time (`attempts × delaySeconds`). The XPC call
+  /// itself fails fast when the helper is down, so the delays dominate.
+  public static var seconds: TimeInterval { Double(attempts) * delaySeconds }
+}
+
 /// Inputs to `HelperHealthReducer`.
 public enum HelperHealthEvent: Equatable, Sendable {
   /// A background `engineStatus()` poll returned a value (helper reachable).

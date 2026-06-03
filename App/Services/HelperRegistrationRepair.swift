@@ -65,8 +65,13 @@ struct HelperRegistrationRepair {
   /// Default bounded reachability probe: one `engineStatus()` poll retried
   /// over ~5s so a just-(re)launched on-demand Helper has time to publish its
   /// mach service. Mirrors the launch-time probe `RatioThinkApp` used inline.
-  static func probeHelperReachable(attempts: Int = 8,
-                                   delayMilliseconds: UInt64 = 600) async -> Bool {
+  /// Defaults come from `HelperReconcileProbeBudget` (RatioThinkCore) so the
+  /// probe's wall time and the chat-recovery ceiling that depends on it share
+  /// ONE definition and cannot drift (#412 re-F1).
+  static func probeHelperReachable(
+    attempts: Int = HelperReconcileProbeBudget.attempts,
+    delayMilliseconds: UInt64 = UInt64(HelperReconcileProbeBudget.delaySeconds * 1000)
+  ) async -> Bool {
     let client = HelperXPCClient()
     for attempt in 0..<attempts {
       if (try? await client.engineStatus()) != nil { return true }

@@ -758,6 +758,43 @@ final class EngineDeathRecoveryTests: XCTestCase {
                    "engine-death branch must keep the tight engine-relaunch budget")
   }
 
+  // MARK: - 13. Helper-wait ceiling is policy-derived, not a literal (#412 re-F1)
+
+  func test_helperUnreachableCeiling_covers_worstCase_and_tracks_policy() {
+    let probe = HelperReconcileProbeBudget.seconds
+
+    // (a) The default helper-wait timeout MUST be the derived ceiling — not a
+    // hand-picked literal — and that ceiling MUST cover the ladder's worst-case
+    // time-to-.unreachable, modeled here INDEPENDENTLY of the ceiling formula
+    // (1 Hz cadence; each repair attempt probes reachability ~twice). If the
+    // wait could expire before the ladder escalates, `helperRecoveryGaveUp`
+    // never fires and the raw error surfaces — F1 reborn.
+    let p = HelperHealthPolicy()
+    let worstCaseToUnreachable =
+      TimeInterval(p.transientThreshold)
+      + TimeInterval(p.maxRepairAttempts) * (TimeInterval(p.repairGap) + 2 * probe)
+    let ceiling = ChatRecoveryPolicy.helperUnreachableCeiling(for: p, probeBudget: probe)
+    XCTAssertGreaterThanOrEqual(ceiling, worstCaseToUnreachable,
+      "derived ceiling must cover the ladder's worst-case time-to-.unreachable")
+    XCTAssertEqual(ChatRecoveryPolicy().helperUnreachableWaitTimeout, ceiling,
+      "the shipping default must BE the derived ceiling, not a hand-picked literal")
+
+    // (b) The ceiling tracks the policy: bumping ANY ladder knob (or slowing
+    // the reconcile probe) raises it, so a future retune cannot silently push
+    // recovery past a stale ceiling and re-introduce F1.
+    func ceil(_ policy: HelperHealthPolicy, _ pb: TimeInterval = probe) -> TimeInterval {
+      ChatRecoveryPolicy.helperUnreachableCeiling(for: policy, probeBudget: pb)
+    }
+    XCTAssertGreaterThan(ceil(HelperHealthPolicy(transientThreshold: p.transientThreshold + 6)), ceiling,
+      "larger transientThreshold must raise the ceiling")
+    XCTAssertGreaterThan(ceil(HelperHealthPolicy(maxRepairAttempts: p.maxRepairAttempts + 1)), ceiling,
+      "more repair attempts must raise the ceiling")
+    XCTAssertGreaterThan(ceil(HelperHealthPolicy(repairGap: p.repairGap + 5)), ceiling,
+      "larger repairGap must raise the ceiling")
+    XCTAssertGreaterThan(ceil(p, probe + 5), ceiling,
+      "a slower reconcile probe must raise the ceiling")
+  }
+
   // MARK: - helpers
 
   private func makeSpec(profileID: String = "chat") -> PieControlLauncher.LaunchSpec {

@@ -399,21 +399,45 @@ public struct ChatRecoveryPolicy: Equatable, Sendable {
 
   /// How long to wait when the fault is a HELPER death (`isHelperUnreachable`).
   /// Larger than `waitForReadyTimeout` because the App-side helper-restart
-  /// ladder's FIRST repair only restores reachability after
-  /// ~`HelperHealthPolicy.transientThreshold` failed polls (~12s, it defers to
-  /// launchd's faster on-demand relaunch first) plus a reconcile probe
-  /// (~5s) — well past the engine budget (review F1). The wait ALSO early-exits
-  /// the instant the ladder gives up (`helperRecoveryGaveUp`), so this is an
-  /// upper backstop, not a delay the user always pays. Keep ≥ the helper
-  /// ladder's worst-case-to-recovery; revisit if `HelperHealthPolicy` changes.
+  /// ladder only restores reachability after several poll cycles plus reconcile
+  /// probes (well past the engine-relaunch budget — review F1). NOT a
+  /// hand-picked literal: the default is DERIVED from `HelperHealthPolicy` +
+  /// the reconcile probe budget via `helperUnreachableCeiling(for:probeBudget:)`,
+  /// so a ladder-policy retune cannot silently push recovery past a stale
+  /// ceiling and re-introduce F1 (re-F1, TD2 pt4). The wait ALSO early-exits the
+  /// instant the ladder gives up (`helperRecoveryGaveUp`), so this is an upper
+  /// backstop, not a delay the user always pays.
   public var helperUnreachableWaitTimeout: TimeInterval
 
   public init(maxAttempts: Int = 2,
               waitForReadyTimeout: TimeInterval = 15,
-              helperUnreachableWaitTimeout: TimeInterval = 45) {
+              helperUnreachableWaitTimeout: TimeInterval =
+                ChatRecoveryPolicy.helperUnreachableCeiling(
+                  for: HelperHealthPolicy(),
+                  probeBudget: HelperReconcileProbeBudget.seconds)) {
     self.maxAttempts = maxAttempts
     self.waitForReadyTimeout = waitForReadyTimeout
     self.helperUnreachableWaitTimeout = helperUnreachableWaitTimeout
+  }
+
+  /// Upper bound on how long to wait for the App-side helper-restart ladder to
+  /// either recover the engine or escalate to `.unreachable` — DERIVED from the
+  /// ladder policy so it tracks any retune instead of drifting (#412 re-F1,
+  /// TD2 pt4). At the 1 Hz poll cadence `transientThreshold`/`repairGap` are
+  /// seconds; each repair attempt runs the reconcile, which probes reachability
+  /// ~twice (pre-unregister + post-register), so an attempt costs
+  /// `repairGap + 2 × probeBudget`. `margin` covers scheduling slack.
+  /// Overestimates safely: a too-large backstop only delays a give-up the
+  /// `.unreachable` early-exit already short-circuits.
+  public static func helperUnreachableCeiling(
+    for policy: HelperHealthPolicy,
+    probeBudget: TimeInterval,
+    margin: TimeInterval = 8
+  ) -> TimeInterval {
+    let pollSecond: TimeInterval = 1   // the HelperHealthController ladder is poll-clocked at 1 Hz
+    let transient = TimeInterval(policy.transientThreshold) * pollSecond
+    let perAttempt = TimeInterval(policy.repairGap) * pollSecond + 2 * probeBudget
+    return transient + TimeInterval(policy.maxRepairAttempts) * perAttempt + margin
   }
 
   public static let `default` = ChatRecoveryPolicy()
