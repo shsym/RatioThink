@@ -68,7 +68,7 @@ endef
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
         build-inferlets stamp-inferlets verify-inferlets verify-inferlets-inputs \
-        test-stamp
+        test-stamp test-inferlets
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -175,6 +175,9 @@ verify-inferlets-inputs: ## Verify only the input-side stamp fields (post-build 
 
 test-stamp: ## Unit tests for Inferlets/chat-apc/_stamp.py (review v1 follow-ups)
 	python3 Inferlets/chat-apc/_stamp_test.py
+
+test-inferlets: ## Run chat-apc Rust unit tests (native cargo test --lib)
+	cd Inferlets/chat-apc && cargo test --lib
 
 test-unit: $(LOGDIR) ## Unit tests (XCTest) via xcrun swift test
 	@set +e +o pipefail; \

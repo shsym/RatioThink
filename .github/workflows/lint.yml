@@ -320,6 +320,13 @@ jobs:
       - name: Stamp helper unit tests
         run: make test-stamp
 
+      - name: Inferlet Rust unit tests (native)
+        # Pure-logic unit tests (tree-of-thought schema/tree/score/beam,
+        # launch-diag wire freezes, sse helpers) run on the host target —
+        # the wasm/WIT deps compile for host and the pure tests never call
+        # the imports. Gates `Inferlets/chat-apc/src/**` logic regressions.
+        run: make test-inferlets
+
       - name: Verify committed prebuilt matches stamp (full)
         run: make verify-inferlets
 
