@@ -99,6 +99,13 @@ RatioThink/
 └── Vendor/pie/     # Pie engine (vendored submodule)
 ```
 
+## Documentation
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the app, helper, pie engine, and
+  `chat-apc` inferlet fit together (plus an interactive [`architecture.html`](docs/architecture.html)).
+- [`TEST.md`](TEST.md) — test catalog and pre-PR gate: what to run for each change type.
+- [`PARITY.md`](PARITY.md) — how each test tier maps to the real packaged-binary path, and every bypass it takes.
+
 ## License
 
 [Apache-2.0](LICENSE)
