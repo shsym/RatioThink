@@ -162,4 +162,23 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
     XCTAssertEqual(outcome, .repaired)
     XCTAssertEqual(h.registerCalls, 1)
   }
+
+  // MARK: - Outcome → reachable mapping (#412, runtime repair ladder)
+
+  func test_outcome_helperReachable_mapping() {
+    // The signal HelperHealthController feeds back as repairFinished(reachable:).
+    XCTAssertTrue(HelperRegistrationReconciler.Outcome.healthy.helperReachable)
+    XCTAssertTrue(HelperRegistrationReconciler.Outcome.repaired.helperReachable)
+    XCTAssertTrue(HelperRegistrationReconciler.Outcome.registered.helperReachable)
+    XCTAssertFalse(HelperRegistrationReconciler.Outcome.needsApproval.helperReachable,
+                   "needsApproval is a user-consent gate, NOT a recovered helper — the ladder must escalate")
+    XCTAssertFalse(HelperRegistrationReconciler.Outcome.repairFailed("x").helperReachable)
+  }
+
+  func test_outcome_requiresUserApproval_only_for_needsApproval() {
+    XCTAssertTrue(HelperRegistrationReconciler.Outcome.needsApproval.requiresUserApproval)
+    for o: HelperRegistrationReconciler.Outcome in [.healthy, .repaired, .registered, .repairFailed("x")] {
+      XCTAssertFalse(o.requiresUserApproval, "\(o) must not route to System Settings")
+    }
+  }
 }

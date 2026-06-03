@@ -239,36 +239,17 @@ struct RatioThinkApp: App {
       return
     }
 
-    let registrar = SMAppServiceLoginItemRegistrar()
-    let reconciler = HelperRegistrationReconciler(
-      probeReachable: { await Self.helperReachable() },
-      currentState: { registrar.status.reconcilerState },
-      register: { try registrar.register().reconcilerState },
-      unregister: { try registrar.unregister() }
-    )
-    let outcome = await reconciler.reconcile()
+    // #412: the reconcile is now the shared `HelperRegistrationRepair`
+    // primitive so the launch-time self-heal, the runtime
+    // `HelperHealthController` restart ladder, and the user's "Restart
+    // helper" action all go through one wiring.
+    let outcome = await HelperRegistrationRepair().reconcile()
     NSLog("RatioThinkHelper registration reconcile: \(outcome)")
     Diag.app.event("helper.reconcile", [("outcome", "\(outcome)")])
-    if case .needsApproval = outcome {
+    if outcome.requiresUserApproval {
       // Hard macOS consent gate — route the user to the toggle.
       SMAppService.openSystemSettingsLoginItems()
     }
-  }
-
-  /// Returns true as soon as the Helper answers an `engineStatus()` XPC
-  /// call, retrying over a bounded window so a just-launched (or
-  /// just-reloaded) on-demand Helper has time to publish its mach
-  /// service. ~5s worst case.
-  private static func helperReachable(attempts: Int = 8,
-                                      delayMilliseconds: UInt64 = 600) async -> Bool {
-    let client = HelperXPCClient()
-    for attempt in 0..<attempts {
-      if (try? await client.engineStatus()) != nil { return true }
-      if attempt < attempts - 1 {
-        try? await Task.sleep(nanoseconds: delayMilliseconds * 1_000_000)
-      }
-    }
-    return false
   }
 
   /// Durable launch breadcrumb: proves the app process started, and records the
