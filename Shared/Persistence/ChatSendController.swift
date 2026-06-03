@@ -153,12 +153,12 @@ public final class ChatSendController: ObservableObject {
             return
           }
 
-          let isEngineGoneFault = await Self.classifyEngineGone(
+          let isRecoverableFault = await Self.classifyRecoverable(
             error: error,
             gate: recoveryGate
           )
           guard attemptsRemaining > 0,
-                isEngineGoneFault,
+                isRecoverableFault,
                 let gate = recoveryGate else {
             writer?.cancel()
             // Re-check generation after the `await classifyEngineGone`
@@ -241,23 +241,29 @@ public final class ChatSendController: ObservableObject {
     isInFlight = false
   }
 
-  /// True when `error` should be classified as engine-death by the
-  /// retry path. Two channels:
+  /// True when `error` should be ridden through recovery (wait for the engine
+  /// to come back, then retry the turn) rather than surfaced immediately.
+  /// Channels:
   ///  · `HTTPEngineError.engineGone` thrown synchronously by
   ///    `baseURLProvider` when the cached status is already
-  ///    `.failed(.engineGone)` — the post-poll case.
-  ///  · A streaming throw (URLError, `.http`, `.stream`, …) that races
-  ///    ahead of the poll: force a fresh helper poll and re-check the
-  ///    cached status. This catches the mid-stream death case where the
-  ///    chat fails before the 1Hz background poll has seen the new state.
-  private static func classifyEngineGone(
+  ///    `.failed(.engineGone)` — the post-poll engine-death case.
+  ///  · A streaming throw (URLError, `.http`, `.stream`, …) that races ahead
+  ///    of the 1Hz poll: force a fresh helper poll and re-check. The retried
+  ///    classification covers BOTH (a) the engine died with a live helper
+  ///    (`isEngineGone`), and (b) the HELPER itself died mid-stream
+  ///    (`isHelperUnreachable`) — the App's helper-restart ladder will bring
+  ///    it back, so the turn waits for `.running` and retries instead of
+  ///    surfacing a raw transport error (#393/#412). A non-death fault leaves
+  ///    a reachable helper reporting a non-gone state, so neither flag trips
+  ///    and the error surfaces normally.
+  private static func classifyRecoverable(
     error: Error,
     gate: ChatRecoveryGate?
   ) async -> Bool {
     if case HTTPEngineError.engineGone = error { return true }
     guard let gate else { return false }
     await gate.refreshStatus()
-    return gate.isEngineGone
+    return gate.isEngineGone || gate.isHelperUnreachable
   }
 
   private static func makeRequest(chat: Chat, options: ChatSendRequestOptions) -> ChatRequest {

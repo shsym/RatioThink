@@ -675,6 +675,49 @@ final class EngineDeathRecoveryTests: XCTestCase {
                    "F1: no engine-gone warning may surface in the live transcript")
   }
 
+  // MARK: - 11. Mid-stream HELPER death is recoverable (#393/#412)
+
+  func test_helperUnreachable_midStream_waitsAndRetries() async throws {
+    // A HELPER death mid-stream surfaces as a bare transport error (NOT
+    // `HTTPEngineError.engineGone` — the dead helper can't report engineGone).
+    // The classifier's forced poll finds the helper unreachable
+    // (`isHelperUnreachable`), so the turn must be ridden through recovery:
+    // wait for the App's restart ladder to bring the engine back, then retry —
+    // instead of surfacing a raw transport error. Without the #412 broadening
+    // (isEngineGone OR isHelperUnreachable) the assistant would show the ⚠️
+    // error marker instead of the retried answer.
+    struct TransportBoom: Error {}
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ProbingChatEngine(
+      firstError: TransportBoom(),
+      successEvents: [.delta(role: .assistant, content: "ack"), .finish(reason: .stop)]
+    )
+    let gate = ScriptedRecoveryGate(initialGone: false, willRecover: true, initialHelperUnreachable: true)
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1"),
+      recoveryGate: gate
+    )
+
+    try await waitUntil("retry stream completes after helper recovery") { !controller.isInFlight }
+    let assistant = chat.messages.first { $0.role == "assistant" }
+    XCTAssertEqual(assistant?.content, "ack",
+                   "a mid-stream helper death must be ridden through recovery + retried, not surfaced as a transport error")
+    XCTAssertEqual(engine.callCount, 2, "exactly one retry after the helper recovered")
+  }
+
   // MARK: - helpers
 
   private func makeSpec(profileID: String = "chat") -> PieControlLauncher.LaunchSpec {
@@ -820,16 +863,20 @@ private final class ReasoningRetryEngine: EngineClient, @unchecked Sendable {
 @MainActor
 private final class ScriptedRecoveryGate: ChatRecoveryGate {
   private var goneFlag: Bool
+  private var unreachableFlag: Bool
   let willRecover: Bool
-  init(initialGone: Bool, willRecover: Bool) {
+  init(initialGone: Bool, willRecover: Bool, initialHelperUnreachable: Bool = false) {
     self.goneFlag = initialGone
+    self.unreachableFlag = initialHelperUnreachable
     self.willRecover = willRecover
   }
   var isEngineGone: Bool { goneFlag }
+  var isHelperUnreachable: Bool { unreachableFlag }
   func refreshStatus() async {}
   func waitUntilRunning(timeout: TimeInterval) async -> Bool {
     if willRecover {
       goneFlag = false
+      unreachableFlag = false
       return true
     }
     return false
@@ -847,6 +894,7 @@ private final class ParkingRecoveryGate: ChatRecoveryGate {
   private let onEntered: () -> Void
   init(onEntered: @escaping () -> Void) { self.onEntered = onEntered }
   var isEngineGone: Bool { true }
+  var isHelperUnreachable: Bool { false }
   func refreshStatus() async {}
   func waitUntilRunning(timeout: TimeInterval) async -> Bool {
     onEntered()

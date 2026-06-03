@@ -20,6 +20,14 @@ public protocol ChatRecoveryGate: AnyObject {
   /// helper poll when classifying a fresh fault.
   var isEngineGone: Bool { get }
 
+  /// True iff the most recent helper poll's transport itself failed — the
+  /// background HELPER is unreachable (it died mid-stream, vs the engine
+  /// reporting `.failed(.engineGone)` over a live helper). The App-side
+  /// helper-restart ladder will bring it back, so this is ALSO a
+  /// wait-and-retry fault, not a surface-now one (#393/#412). `refreshStatus`
+  /// records the forced poll's outcome, so this is fresh right after it.
+  var isHelperUnreachable: Bool { get }
+
   /// Force one immediate helper poll so the cache reflects state
   /// changes that happened between the previous tick and now. The
   /// 1Hz background poll on `EngineStatusStore` is too coarse to
@@ -44,13 +52,20 @@ extension EngineStatusStore: ChatRecoveryGate {
     return false
   }
 
+  /// `lastError` is non-nil exactly when the most recent poll's XPC transport
+  /// failed — the discriminator for "the helper itself is unreachable" vs
+  /// "the helper is up and reported an engine state". `refreshStatus()`
+  /// records the forced poll's outcome into `lastError`, so this reflects the
+  /// fresh probe, not a stale 1Hz tick.
+  public var isHelperUnreachable: Bool { lastError != nil }
+
   public func refreshStatus() async {
-    // Swallow XPC errors here: the chat retry path only needs a
-    // best-effort poll; a transport failure leaves the cached
-    // `.failed(.engineGone)` (or whatever) visible to `isEngineGone`
-    // and the retry surfaces normally if classification can't be
-    // resolved.
-    _ = try? await refresh()
+    // Record BOTH outcomes of the forced poll (unlike `refresh()`, which
+    // rethrows without writing `lastError`). The chat classifier reads
+    // `isEngineGone` / `isHelperUnreachable` immediately after this, and the
+    // 1Hz background loop is too coarse to catch a sub-second mid-stream
+    // death (#393) — so the forced poll must update both signals itself.
+    await pollRecordingOutcome()
   }
 
   public func waitUntilRunning(timeout: TimeInterval) async -> Bool {

@@ -131,6 +131,21 @@ public final class EngineStatusStore: ObservableObject {
     return next
   }
 
+  /// Force one poll, recording BOTH outcomes into `status`/`lastError` (unlike
+  /// `refresh()`, which rethrows on failure WITHOUT recording — see its
+  /// asymmetry note). Used by `ChatRecoveryGate.refreshStatus()` so the chat
+  /// classifier's `isHelperUnreachable`/`isEngineGone` reflect the forced
+  /// probe, catching a sub-second mid-stream helper/engine death the 1Hz
+  /// background loop missed (#393). Also feeds the helper-health ladder via
+  /// `onPollOutcome` (a forced-poll failure is a real reachability signal).
+  func pollRecordingOutcome() async {
+    do {
+      apply(next: try await client.engineStatus(), error: nil)
+    } catch {
+      apply(next: nil, error: String(describing: error))
+    }
+  }
+
   ///  Unload: ask the helper to stop the running engine, freeing the
   /// resident model's RAM. Throws on rejection / transport failure so
   /// the caller keeps the resident-model state when the stop did not
