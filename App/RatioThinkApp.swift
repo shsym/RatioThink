@@ -36,6 +36,10 @@ struct RatioThinkApp: App {
   @StateObject private var profileStore: ProfileStore
   @StateObject private var swapCoordinator: ProfileSwapCoordinator
   @StateObject private var engineStatusStore: EngineStatusStore
+  /// #412: App-side background-helper health + restart ladder. Driven by the
+  /// same `engineStatus()` poll as `engineStatusStore` (via `onPollOutcome`)
+  /// and surfaced as the toolbar helper-ring + the escalation banner.
+  @StateObject private var helperHealth: HelperHealthController
   @StateObject private var engineClientStore: EngineClientStore
   /// Phase 3.8 (review v2 F1): the Add Model sheet's `.queueDownload`
   /// outcome runs through this controller so the existing
@@ -149,6 +153,24 @@ struct RatioThinkApp: App {
 
     _persistenceStatus = StateObject(wrappedValue: status)
     chatContainer = RatioThinkModelContainer.openWithFallback(status: status)
+
+    // #412: App-side helper-health restart ladder. The repair runs the
+    // runtime registration reconcile; a test/automation launch gets a no-op
+    // repair so a GUI run never mutates the real machine's SMAppService
+    // background-item registration (same guard the launch reconcile uses).
+    let helperRepair: () async -> Bool
+    if HelperRegistrationReconciler.isTestLaunch(ProcessInfo.processInfo.environment) {
+      helperRepair = { false }
+    } else {
+      helperRepair = { await HelperRegistrationRepair().repairAndReportReachable() }
+    }
+    let helperHealthController = HelperHealthController(repair: helperRepair)
+    // Drive the ladder from the SAME poll the status mirror runs — no second
+    // XPC surface. Set BEFORE statusStore.start() so the first ticks count.
+    statusStore.onPollOutcome = { [weak helperHealthController] succeeded in
+      helperHealthController?.ingestPollOutcome(succeeded: succeeded)
+    }
+    _helperHealth = StateObject(wrappedValue: helperHealthController)
 
     // Kick the XPC poll loop. Idempotent + cheap — first reply lands
     // within ~one runloop tick when the helper is registered, longer
@@ -310,6 +332,7 @@ struct RatioThinkApp: App {
         .environmentObject(engineClientStore)
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
+        .environmentObject(helperHealth)
         .environmentObject(downloadController)
         .frame(minWidth: 900, minHeight: 600)
     }
