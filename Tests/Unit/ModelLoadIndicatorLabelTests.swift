@@ -109,20 +109,31 @@ final class ModelLoadIndicatorLabelTests: XCTestCase {
     XCTAssertFalse(ModelLoadIndicator.pipLabelAnimatesEllipsis(for: .error(err)))
   }
 
-  // MARK: - dot colour intent per state
+  // MARK: - LED tint → colour mapping (#412)
 
-  // The bare-dot states map to concrete colours via the reducer's `Dot`
-  // intent: grey (offline) / amber (starting) / neutral adaptive ink
-  // `.primary` (running) / red (error). These pin the view's mapping so a
-  // colour regression is a unit failure, not just a pixel diff. Running is
-  // `.primary` (not `.green`): a healthy engine is a QUIET neutral dot
-  //, appearance-adaptive so it shows in both light and dark.
-  func test_dot_colours_per_state() {
-    XCTAssertEqual(ModelLoadIndicator.dotColor(for: .offline), .secondary)
-    XCTAssertEqual(ModelLoadIndicator.dotColor(for: .starting(detail: "x")), .orange)
-    XCTAssertEqual(ModelLoadIndicator.dotColor(for: .running(modelID: "m")), .primary)
+  // The pip dot/ring now render the pure `StatusLED.Tint` (ring = helper,
+  // dot = engine) via the view's `color(for:)`. These pin the view's
+  // tint→Color mapping so a colour regression is a unit failure, not just a
+  // pixel diff. `.white` is `.primary` (appearance-adaptive ink) so the
+  // "blink white" waiting LED is visible in BOTH light and dark toolbars;
+  // `.greenWhite` is the quiet healthy tint; amber/red are trouble/given-up.
+  func test_led_tint_colours() {
+    XCTAssertEqual(ModelLoadIndicator.color(for: .off), .secondary)
+    XCTAssertEqual(ModelLoadIndicator.color(for: .white), .primary)
+    XCTAssertEqual(ModelLoadIndicator.color(for: .greenWhite), .green)
+    XCTAssertEqual(ModelLoadIndicator.color(for: .amber), .orange)
+    XCTAssertEqual(ModelLoadIndicator.color(for: .red), .red)
+  }
+
+  // The engine state → dot LED mapping (the pure RatioThinkCore reducer is
+  // covered in HelperEngineIndicatorTests; this pins it survives through the
+  // App module too, since the view depends on it).
+  func test_engine_dot_led_per_state() {
+    XCTAssertEqual(StatusLED.engineDot(for: .offline), StatusLED(tint: .off, blink: false))
+    XCTAssertEqual(StatusLED.engineDot(for: .starting(detail: "x")), StatusLED(tint: .white, blink: true))
+    XCTAssertEqual(StatusLED.engineDot(for: .running(modelID: "m")), StatusLED(tint: .greenWhite, blink: false))
     let err = EngineIndicatorError(kind: .engineFailed, title: "Engine failed", message: "x", invitesModelChoice: false)
-    XCTAssertEqual(ModelLoadIndicator.dotColor(for: .error(err)), .red)
+    XCTAssertEqual(StatusLED.engineDot(for: .error(err)), StatusLED(tint: .amber, blink: true))
   }
 
   // MARK: - #396 popover detail (honest indeterminate — never "—" for a live load)

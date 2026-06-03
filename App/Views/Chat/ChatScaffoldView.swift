@@ -24,6 +24,8 @@ struct ChatScaffoldView: View {
   @EnvironmentObject private var engineStore: EngineClientStore
   @EnvironmentObject private var modelLoadCenter: ModelLoadCenter
   @EnvironmentObject private var engineStatusStore: EngineStatusStore
+  /// #412: background-helper health, forwarded to the toolbar pip's outer ring.
+  @EnvironmentObject private var helperHealth: HelperHealthController
   @EnvironmentObject private var profileStore: ProfileStore
   /// Shown when a send is blocked because no model resolves yet. #326
   /// decides the model-availability action (Load / Download / unavailable
@@ -194,6 +196,7 @@ struct ChatScaffoldView: View {
         swapCoordinator: swapCoordinator,
         modelLoadCenter: modelLoadCenter,
         engineStatus: engineStatusStore,
+        helperHealth: helperHealth,
         onUnload: unloadModel
       )
       Divider().opacity(0.0001) // structural breather; no visible line per §5

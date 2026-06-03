@@ -43,6 +43,11 @@ struct ContentToolbar: View {
   /// default) so production wiring is compile-enforced. The pip shows only
   /// when BOTH `modelLoadCenter` and `engineStatus` are present.
   let engineStatus: EngineStatusStore?
+  /// #412: background-helper health for the pip's outer ring. Optional like
+  /// `engineStatus` so snapshot/preview call sites stay pip-less; the pip
+  /// renders only when all three (center, engineStatus, helperHealth) are
+  /// wired (production).
+  let helperHealth: HelperHealthController?
   /// Forwarded to the indicator's running/ready popover Unload action.
   let onUnload: () -> Void
 
@@ -56,6 +61,7 @@ struct ContentToolbar: View {
     swapCoordinator: ProfileSwapCoordinator,
     modelLoadCenter: ModelLoadCenter?,
     engineStatus: EngineStatusStore?,
+    helperHealth: HelperHealthController?,
     onUnload: @escaping () -> Void
   ) {
     self.viewModel = viewModel
@@ -64,6 +70,7 @@ struct ContentToolbar: View {
     self.swapCoordinator = swapCoordinator
     self.modelLoadCenter = modelLoadCenter
     self.engineStatus = engineStatus
+    self.helperHealth = helperHealth
     self.onUnload = onUnload
   }
 
@@ -95,10 +102,11 @@ struct ContentToolbar: View {
       // when both the load center and the engine-status store are wired
       // (production); snapshot/preview call sites pass nil and stay
       // pip-less so their reference PNGs are unchanged.
-      if let modelLoadCenter, let engineStatus {
+      if let modelLoadCenter, let engineStatus, let helperHealth {
         ModelLoadIndicator(
           center: modelLoadCenter,
           engineStatus: engineStatus,
+          helperHealth: helperHealth,
           onUnload: onUnload
         )
       }

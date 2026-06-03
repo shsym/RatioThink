@@ -701,11 +701,17 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// `Dot` enum AND the SF Symbol name (`dot.symbolName`, #396 — so the
   /// shape mapping is unit-testable); the view only picks the tint.
   private static func colorForDot(_ dot: HelperStatusItemModel.Dot) -> NSColor {
+    // #412 LED language (shared with the App toolbar pip via StatusLED):
+    // waiting = white (pulses via applyDotPulse), success = green-ish white,
+    // recoverable trouble = amber. Red is reserved for the App-side
+    // helper-given-up ring, which the menu bar never shows (a dead Helper
+    // has no menu). The symbol shape (`dot.symbolName`) still distinguishes
+    // states without color (#396 accessibility), so the tint change is safe.
     switch dot {
-    case .stopped: return .secondaryLabelColor
-    case .loading: return .systemYellow
-    case .running: return .systemGreen
-    case .error:   return .systemRed
+    case .stopped: return .secondaryLabelColor   // off / dim
+    case .loading: return .labelColor            // waiting → white (animated)
+    case .running: return .systemGreen           // healthy → green-ish white
+    case .error:   return .systemOrange          // recoverable trouble → amber
     }
   }
 

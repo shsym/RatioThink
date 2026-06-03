@@ -26,13 +26,18 @@ struct ModelLoadIndicator: View {
   /// state (offline/starting/running) even when no load is in flight, and
   /// so the popover can read on-demand engine memory.
   @ObservedObject var engineStatus: EngineStatusStore
+  /// #412: background-helper health. Drives the OUTER ring of the pip
+  /// (ring = helper, dot = engine). When the helper is reachable the ring is
+  /// quiet; while it is reconnecting/repairing/unreachable the ring blinks
+  /// white/amber/red and the engine dot dims (its state is then unknown).
+  @ObservedObject var helperHealth: HelperHealthController
   /// : invoked from the running/ready popover's Unload button. Wired in
   /// `ChatScaffoldView` to stop the engine (free RAM) then `markUnloaded()`.
   var onUnload: () -> Void = {}
 
   @State private var showPopover = false
 
-  /// The single semantic state the pip renders, folded from both sources.
+  /// The single semantic ENGINE state, folded from the engine + load sources.
   private var indicatorState: EngineIndicatorState {
     EngineIndicatorState.make(
       engine: engineStatus.status,
@@ -40,6 +45,12 @@ struct ModelLoadIndicator: View {
       load: center.state,
       residentModelID: center.residentModelID
     )
+  }
+
+  /// The folded toolbar pip: outer ring (helper) + inner dot (engine), via
+  /// the pure `HelperEngineIndicator` reducer.
+  private var folded: (ring: StatusLED?, dot: IndicatorDot) {
+    HelperEngineIndicator.make(helper: helperHealth.health, engine: indicatorState)
   }
 
   var body: some View {
@@ -64,13 +75,13 @@ struct ModelLoadIndicator: View {
           .foregroundStyle(Self.labelTint(for: state))
           .frame(maxWidth: 200, alignment: .trailing)
         }
-        indicatorShape(for: state)
+        indicatorShape(folded)
       }
     }
     .buttonStyle(.plain)
-    .help(Self.helpText(for: state))
+    .help(Self.helpText(helper: helperHealth.health, engine: state))
     .accessibilityIdentifier("toolbar.modelLoadIndicator")
-    .accessibilityLabel(Self.accessibilityLabelText(for: state))
+    .accessibilityLabel(Self.accessibilityLabelText(helper: helperHealth.health, engine: state))
     .popover(isPresented: $showPopover, arrowEdge: .bottom) {
       ModelLoadPopover(
         center: center,
@@ -98,22 +109,34 @@ struct ModelLoadIndicator: View {
 
   // MARK: - shape
 
-  /// The dot/ring at the trailing edge. A filled dot for the quiet states
-  /// (offline/starting/running/error); the progress ring for `.loading`.
+  /// The trailing-edge indicator: an outer helper-health ring composed over
+  /// the inner engine element (#412). The ring is present only when the
+  /// helper is not healthy; the inner element is the model-load progress ring
+  /// during a load, otherwise the engine LED dot. Both blink slowly when the
+  /// reducer asks (`StatusLED.blink`).
   @ViewBuilder
-  private func indicatorShape(for state: EngineIndicatorState) -> some View {
-    switch state {
-    case let .loading(_, fraction):
-      loadingRing(fraction: fraction)
-        .frame(width: 18, height: 18)
-    default:
-      Circle()
-        .fill(Self.dotColor(for: state))
-        .frame(width: 9, height: 9)
-        // Match the loading ring's slot so the trailing edge never
-        // shifts horizontally when the state flips dot↔ring.
-        .frame(width: 18, height: 18)
+  private func indicatorShape(_ folded: (ring: StatusLED?, dot: IndicatorDot)) -> some View {
+    ZStack {
+      // Outer helper-health ring (quiet/absent when the helper is reachable).
+      if let ring = folded.ring {
+        Circle()
+          .stroke(Self.color(for: ring.tint), lineWidth: 1.5)
+          .frame(width: 17, height: 17)
+          .modifier(SlowBlink(active: ring.blink))
+      }
+      // Inner engine element.
+      switch folded.dot {
+      case let .progressRing(fraction):
+        loadingRing(fraction: fraction)
+      case let .led(led):
+        Circle()
+          .fill(Self.color(for: led.tint))
+          .frame(width: 9, height: 9)
+          .modifier(SlowBlink(active: led.blink))
+      }
     }
+    // Fixed slot so the trailing edge never shifts as the shape changes.
+    .frame(width: 18, height: 18)
   }
 
   @ViewBuilder
@@ -202,12 +225,20 @@ struct ModelLoadIndicator: View {
   /// and its full-strength ink stays distinct from `.offline`'s muted
   /// `.secondary` grey. `.loading` also maps via `.busy` but renders the
   /// accent ring instead of a dot, so its colour here is never shown.
-  static func dotColor(for state: EngineIndicatorState) -> Color {
-    switch state.dot {
-    case .offline: return .secondary
-    case .busy:    return .orange
-    case .running: return .primary
-    case .error:   return .red
+  /// Map a pure `StatusLED.Tint` to a concrete, appearance-adaptive SwiftUI
+  /// `Color` (#412). `.white` uses `Color.primary` — the system label ink —
+  /// so the "blink white" waiting LED stays clearly visible in BOTH a light
+  /// and a dark toolbar (a hardcoded white would vanish on a light one),
+  /// reading as a near-white pulse in dark mode like a Mac mini's sleep LED.
+  /// `.greenWhite` is the quiet healthy success tint; `.amber`/`.red` are the
+  /// trouble/given-up tints.
+  static func color(for tint: StatusLED.Tint) -> Color {
+    switch tint {
+    case .off:        return .secondary
+    case .white:      return .primary
+    case .greenWhite: return .green
+    case .amber:      return .orange
+    case .red:        return .red
     }
   }
 
@@ -240,6 +271,29 @@ struct ModelLoadIndicator: View {
     }
   }
 
+  /// Helper-aware tooltip (#412): when the background helper is not healthy
+  /// the ring is the story, so its message wins over the (stale/unknown)
+  /// engine detail. A healthy helper falls through to the engine tooltip.
+  static func helpText(helper: HelperHealth, engine: EngineIndicatorState) -> String {
+    if let helperText = helperStatusText(helper) { return helperText }
+    return helpText(for: engine)
+  }
+
+  /// Short message for a non-healthy background helper, or nil when healthy.
+  /// Shared by the tooltip + the VoiceOver label so they never drift.
+  static func helperStatusText(_ health: HelperHealth) -> String? {
+    switch health {
+    case .healthy:
+      return nil
+    case .reconnecting:
+      return "Reconnecting to the background helper…"
+    case .repairing, .repairCoolingDown:
+      return "Background helper isn’t responding — restarting it…"
+    case .unreachable:
+      return "Background helper isn’t responding"
+    }
+  }
+
   /// VoiceOver label per state.
   static func accessibilityLabelText(for state: EngineIndicatorState) -> String {
     switch state {
@@ -260,6 +314,35 @@ struct ModelLoadIndicator: View {
       return "Engine running"
     case let .error(error):
       return "\(error.title). \(error.message)"
+    }
+  }
+
+  /// Helper-aware VoiceOver label (#412): helper trouble wins over the engine
+  /// label, mirroring the tooltip.
+  static func accessibilityLabelText(helper: HelperHealth, engine: EngineIndicatorState) -> String {
+    if let helperText = helperStatusText(helper) { return helperText }
+    return accessibilityLabelText(for: engine)
+  }
+}
+
+/// Slow opacity pulse for the LED indicator elements (#412) — like a Mac
+/// mini's sleeping power LED. Driven by `TimelineView(.animation)` so the
+/// cadence is a deterministic function of `Date` whose lifetime ends with the
+/// view (no open-ended `repeatForever` animation to leak), matching the
+/// existing `indeterminateArc` / `AnimatedEllipsis` rationale. Inert when
+/// `active` is false so steady states (healthy running, stopped) hold still.
+private struct SlowBlink: ViewModifier {
+  let active: Bool
+  func body(content: Content) -> some View {
+    if active {
+      TimelineView(.animation) { context in
+        // ~1.4s period, opacity 0.35…1.0.
+        let t = context.date.timeIntervalSinceReferenceDate
+        let phase = (sin(t * .pi / 0.7) + 1) / 2
+        content.opacity(0.35 + 0.65 * phase)
+      }
+    } else {
+      content
     }
   }
 }
