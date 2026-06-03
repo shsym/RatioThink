@@ -1724,7 +1724,7 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
                 .await;
         }
     };
-    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref()) {
+    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true) {
         return res
             .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
             .await;
@@ -2126,7 +2126,7 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
                 .await;
         }
     };
-    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref()) {
+    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true) {
         return res
             .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
             .await;
@@ -2556,6 +2556,7 @@ pub(crate) fn fill_context(
     model: &Model,
     messages: &[ChatMessage],
     tools: Option<&[ToolSchema]>,
+    cue: bool,
 ) -> Result<(), (&'static str, String)> {
     if let Some(tools) = tools {
         // The SDK's `equip_prefix` expects `{name, description,
@@ -2586,7 +2587,14 @@ pub(crate) fn fill_context(
             }
         }
     }
-    ctx.cue();
+    // The trailing cue opens the assistant turn the generator fills.
+    // Single-shot chat callers commit it with the prompt; tree-of-thought
+    // defers it to each forked branch (so a freshly forked, fully-flushed
+    // context still has tokens to process — an empty forward pass spins
+    // the generator), so it is opt-out here.
+    if cue {
+        ctx.cue();
+    }
     Ok(())
 }
 

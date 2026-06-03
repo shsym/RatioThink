@@ -56,11 +56,25 @@
 //! wire seam: a future move to a dynamically-loaded or separate inferlet
 //! requires no client change.
 //!
+//! ## Scoring caveat (v1)
+//!
+//! The value evaluator asks the model for a single 1–10 integer and
+//! parses the first in-range integer it emits. **Reasoning models**
+//! (e.g. Qwen3, which wraps output in `<think>…</think>`) tend to
+//! restate the problem before answering, so the first integer is often
+//! out of range and the score parses to `null`. A `null` score ranks
+//! lowest, so the beam falls back to deterministic (input-order)
+//! selection — the search still runs and returns a well-formed tree,
+//! but pruning is not quality-driven. Real score-driven pruning needs a
+//! non-reasoning model, a `/no_think`-style directive, or reasoning-tag
+//! stripping + a larger score budget (future work).
+//!
 //! ## Future
 //!
 //! - **Profile mapping:** `breadth`/`depth`/`beam_width` presets → named
 //!   profiles (kept explicit on the wire for v1).
-//! - Vote-based evaluator + multi-sample value averaging; DFS+backtrack;
+//! - Reasoning-aware scoring (strip `<think>` / raise the score budget),
+//!   vote-based evaluator + multi-sample value averaging; DFS+backtrack;
 //!   `max_tokens` status granularity; per-node partial content on error;
 //!   streaming (#413).
 
@@ -212,7 +226,11 @@ pub async fn dispatch(
                 .await;
         }
     };
-    if let Err((code, msg)) = completions::fill_context(&mut root_ctx, &model, &messages, None) {
+    // cue:false — the assistant turn is opened per branch in `search`
+    // (each fork re-cues), so the shared prefix stays cue-free and KV
+    // pages are shared across branches.
+    if let Err((code, msg)) = completions::fill_context(&mut root_ctx, &model, &messages, None, false)
+    {
         return res.respond(sse::json_error(500, code, &msg)).await;
     }
     if let Err(e) = root_ctx.flush().await {

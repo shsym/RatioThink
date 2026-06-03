@@ -67,16 +67,14 @@ pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
 
     for level in 1..=params.depth {
         // Levels > 1 refine the parent before forking: append the refine
-        // user-turn, then `cue()` to open the assistant turn the children
-        // will generate into (mirrors the pie tree-of-thought example).
-        // Level 1 needs no prep — the root's cue is already committed via
-        // `fill_context` + the root flush, and is shared into every fork.
-        // Sequential (≤ beam_width parents; flush is light). A flush
-        // failure is best-effort.
+        // user-turn and flush it into the shared prefix. The assistant
+        // turn itself is opened per child in `expand` (every level cues
+        // its own fork), so the shared prefix stays cue-free and KV pages
+        // are shared across the branches. Sequential (≤ beam_width
+        // parents; flush is light). A flush failure is best-effort.
         if level > 1 {
             for f in frontier.iter_mut() {
                 f.ctx.user(REFINE_INSTRUCTION);
-                f.ctx.cue();
                 let _ = f.ctx.flush().await;
             }
         }
@@ -171,6 +169,10 @@ pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
 /// it. The context is moved back out so a surviving node can be expanded
 /// at the next level.
 async fn expand(mut ctx: Context, temperature: f32, top_p: f32, max_tokens: usize) -> Expanded {
+    // Open the assistant turn for this branch. The forked context shares a
+    // fully-flushed, cue-free prefix, so without this the first forward
+    // pass would carry zero new tokens and spin the generator.
+    ctx.cue();
     let stops = inferlet::chat::stop_tokens(ctx.model());
     let result = ctx
         .generate(Sampler::TopP { temperature, p: top_p })
