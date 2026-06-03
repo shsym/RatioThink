@@ -68,6 +68,11 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
       ["PIE_TEST_FAKE_DOWNLOADS": "1"],
       ["PIE_TEST_FIRST_LAUNCH_COMPLETED": "1"],          // GUI configureCompletedFirstLaunch
       ["PIE_TEST_SKIP_HELPER_RECONCILE": "1"],
+      // #412: the app code runs IN-PROCESS inside a unit-test host, where
+      // XCTest sets this — must suppress SMAppService side effects + the
+      // runtime helper-restart ladder so a plain `xcodebuild test` never
+      // mutates the machine's background-item registration.
+      ["XCTestConfigurationFilePath": "/tmp/Foo.xctestconfiguration"],
     ]
     for env in seams {
       XCTAssertTrue(HelperRegistrationReconciler.isTestLaunch(env),

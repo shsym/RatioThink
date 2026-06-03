@@ -11,10 +11,18 @@ struct RootView: View {
   /// injected at app scope (`RatioThinkApp`).
   @EnvironmentObject private var engineStatusStore: EngineStatusStore
   @EnvironmentObject private var modelLoadCenter: ModelLoadCenter
+  /// #412: background-helper health. Drives the loud escalation banner when
+  /// the App's restart ladder can't bring the helper back.
+  @EnvironmentObject private var helperHealth: HelperHealthController
 
   var body: some View {
     VStack(spacing: 0) {
       PersistenceBanner(status: persistenceStatus)
+      // #412: the most fundamental failure — a dead background helper the App
+      // couldn't auto-recover — surfaces ABOVE the engine banner. (When the
+      // helper is unreachable the engine status sticks at .starting, so
+      // EngineStatusBanner stays silent and this is the only loud surface.)
+      HelperUnreachableBanner(helperHealth: helperHealth)
       // Loud surface for engine/load failures only; quiet for everything
       // else. Self-hides via the reducer + dedup signature.
       EngineStatusBanner(

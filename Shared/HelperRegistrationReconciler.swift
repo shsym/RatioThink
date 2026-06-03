@@ -91,6 +91,14 @@ public struct HelperRegistrationReconciler: Sendable {
   /// (`PIE_APP_PREFERENCES_SUITE`, set by every GUI test), plus an
   /// explicit opt-out (`PIE_TEST_SKIP_HELPER_RECONCILE`).
   public static func isTestLaunch(_ env: [String: String]) -> Bool {
+    // Running INSIDE an XCTest host process (the unit-test bundles load the
+    // app code in-process, so `RatioThinkApp.init` runs here). SMAppService
+    // register/unregister + the runtime helper-restart ladder must NEVER fire
+    // in this process — they would mutate the dev/CI machine's background-item
+    // registration and even pop System Settings (#412). XCUITests run the app
+    // as a SEPARATE process WITHOUT this var, so they still rely on the
+    // explicit PIE_* markers below.
+    if (env["XCTestConfigurationFilePath"] ?? "").isEmpty == false { return true }
     let present = ["PIE_TEST_LOGIN_ITEM_STATUS",
                    "PIE_TEST_ENGINE_BASE_URL",
                    "PIE_APP_PREFERENCES_SUITE"]
