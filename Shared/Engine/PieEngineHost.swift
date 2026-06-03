@@ -474,6 +474,13 @@ public final class PieEngineHost: @unchecked Sendable {
       autoRelaunchTask = nil
       healthyUptimeTask?.cancel()
       healthyUptimeTask = nil
+      // #394: an explicit user Pause is "off intent" — reset the
+      // slow-flap death history so a later Resume starts the cap fresh.
+      // Without this, a Pause → Resume → quick-death would inherit the
+      // pre-Pause attempt count and could exhaust the ladder prematurely
+      // (the healthy-uptime re-arm needs sustained `.running` the paused
+      // user never reaches).
+      autoRelaunchAttempts.removeAll()
       setState(.stopped)
       return
     case .failed(let code, _):

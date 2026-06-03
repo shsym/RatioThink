@@ -263,6 +263,59 @@ final class EngineDeathRecoveryTests: XCTestCase {
     token.cancel()
   }
 
+  // MARK: - 4b. User Pause out of engineGone clears the attempt ladder (#394)
+
+  func test_userPause_outOfEngineGone_clearsAutoRelaunchAttempts() async throws {
+    // #394: a user Pause out of `.failed(.engineGone)` is an explicit
+    // "off". The recorded death-attempt history must reset so a later
+    // Resume starts the slow-flap ladder fresh — otherwise a
+    // Pause → Resume → quick-death prematurely exhausts the cap, since the
+    // healthy-uptime re-arm needs `healthyUptimeThreshold` of sustained
+    // `.running` the paused user never reaches. `stop()` already cancels
+    // the pending backoff Task (case 4); this pins that it ALSO clears the
+    // attempt timestamps.
+    let launcher: PieEngineHost.LauncherCall = { _ in
+      (port: EnginePort(60095), session: OneShotDeathSession())
+    }
+    let policy = PieEngineHost.RelaunchPolicy(
+      maxAttempts: 2,
+      window: 60,
+      backoffSchedule: [0.4] // long enough that the Pause lands mid-backoff
+    )
+    let box = WeakHostBox()
+    let spec = makeSpec()
+    let relauncher: PieEngineHost.Relauncher = { [box, spec] in _ = box.host?.start(spec) }
+    let host = PieEngineHost(
+      launcher: launcher,
+      livenessInterval: 0.02,
+      livenessFailureThreshold: 1,
+      relaunchPolicy: policy,
+      relauncher: relauncher
+    )
+    box.host = host
+
+    let gone = expectation(description: ".failed(.engineGone)")
+    var hit = false
+    let token = host.observe { status, _ in
+      if case .failed(.engineGone, _) = status, !hit { hit = true; gone.fulfill() }
+    }
+    _ = host.start(spec)
+    await fulfillment(of: [gone], timeout: 2)
+    // The death recorded one ladder attempt: scheduleAutoRelaunchIfAllowed
+    // appends `now` before it sleeps the backoff.
+    XCTAssertEqual(host.autoRelaunchAttemptsForTesting, 1,
+                   "engine death must record one auto-relaunch attempt before the backoff fires")
+
+    host.stop() // user Pause out of .failed(.engineGone), mid-backoff
+    try await waitUntil("host returns to .stopped after user pause") {
+      if case .stopped = host.status { return true }
+      return false
+    }
+    XCTAssertEqual(host.autoRelaunchAttemptsForTesting, 0,
+                   "#394: a user Pause out of engineGone must clear the recorded attempts so a later Resume starts the cap fresh")
+    token.cancel()
+  }
+
   // MARK: - 5. Auto + user-Resume share HelperResumeAction.run funnel
 
   func test_autoRelaunch_and_userResume_share_HelperResumeAction_funnel() async throws {

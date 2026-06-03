@@ -520,6 +520,48 @@ final class HelperResumeActionTests: XCTestCase {
     XCTAssertFalse(HelperResumeAction.shouldCommitAutoRelaunch(status: .stopping))
   }
 
+  // MARK: - #395: composeAutoRelaunch (SPM-reachable relauncher seam)
+
+  func test_composeAutoRelaunch_runs_on_failed_and_returns_outcome() {
+    // `.failed` is the scheduler-realistic commit case: the seam must
+    // invoke `run` exactly once and surface its Outcome. Pinning this
+    // here closes the SPM-untestable HelperMain boundary (#395) — the
+    // production relauncher now composes through this function.
+    let runCount = AtomicCounter()
+    let decision = HelperResumeAction.composeAutoRelaunch(
+      status: .failed(code: .engineGone, message: "engine process exited")
+    ) {
+      runCount.increment()
+      return .started(profileID: "chat")
+    }
+    XCTAssertEqual(runCount.value, 1, "a committed decision must invoke `run` exactly once")
+    XCTAssertEqual(decision, .ran(.started(profileID: "chat")),
+                   "the seam must carry the run Outcome back to the caller for logging")
+  }
+
+  func test_composeAutoRelaunch_vetoes_without_running_on_non_failed_states() {
+    // A user Pause (`.stopped`), a concurrent start (`.running`), or a
+    // transient (`.starting`/`.stopping`) that won the deferred-hop race
+    // must VETO — `run` is never invoked, and the observed status rides
+    // back in the `.vetoed` payload so HelperMain can log why it skipped.
+    let states: [EngineStatus] = [
+      .stopped,
+      .running(port: 50001, profileID: "chat"),
+      .starting,
+      .stopping,
+    ]
+    for status in states {
+      let runCount = AtomicCounter()
+      let decision = HelperResumeAction.composeAutoRelaunch(status: status) {
+        runCount.increment()
+        return .started(profileID: "should-not-run")
+      }
+      XCTAssertEqual(runCount.value, 0, "\(status) must veto: run must NOT fire")
+      XCTAssertEqual(decision, .vetoed(status),
+                     "\(status) must veto and carry the observed status back for the skip log")
+    }
+  }
+
   /// Minimal `EngineSession` for the launcher seam. Records shutdown
   /// invocation count so happy-path tests can verify the host tore
   /// the session down on Pause.

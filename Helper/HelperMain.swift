@@ -264,25 +264,28 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
           DispatchQueue.main.async {
             guard let helper = holder.helper else { return }
             guard let engineHost = helper.engineHost else { return }
-            // Review v3 N3: route the main-queue commit-veto through
-            // `HelperResumeAction.shouldCommitAutoRelaunch(status:)`
-            // (an SPM-reachable pure function) instead of an inline
-            // guard. Without the extraction, deleting the production
-            // guard would have failed no test — the exact untestable
-            // boundary that hid the v1 F1 blocker. Semantic is
-            // unchanged: `.failed` commits, anything else (Pause won,
-            // user Resume already ran, in-flight start) vetoes. See
-            // `Shared/HelperResumeAction.swift` for the full table.
-            guard HelperResumeAction.shouldCommitAutoRelaunch(status: engineHost.status) else {
-              Log.helper.notice("auto-relaunch skipped: engineHost.status=\(String(describing: engineHost.status), privacy: .public) at main-queue commit (user Pause or concurrent start landed during the deferred hop)")
-              return
+            // #395 + review v3 N3: the veto→run composition is now the
+            // SPM-reachable `HelperResumeAction.composeAutoRelaunch`, so
+            // deleting the veto fails a unit test (it was the exact
+            // untestable boundary that hid the #299 v1 F1 blocker). This
+            // closure keeps ONLY the AppKit-bound bits: the main-queue hop,
+            // the `HelperResumeHolder` deref, and the log lines. Veto
+            // semantics are unchanged — `.failed` commits, anything else
+            // (Pause won, user Resume already ran, in-flight start) vetoes.
+            // See `Shared/HelperResumeAction.swift` for the full table.
+            let decision = HelperResumeAction.composeAutoRelaunch(status: engineHost.status) {
+              HelperResumeAction.run(
+                engineHost: engineHost,
+                profileStore: helper.profileStore,
+                resolver: helper.launchSpecResolver
+              )
             }
-            let outcome = HelperResumeAction.run(
-              engineHost: engineHost,
-              profileStore: helper.profileStore,
-              resolver: helper.launchSpecResolver
-            )
-            Log.helper.notice("auto-relaunch outcome: \(String(describing: outcome), privacy: .public)")
+            switch decision {
+            case .vetoed(let status):
+              Log.helper.notice("auto-relaunch skipped: engineHost.status=\(String(describing: status), privacy: .public) at main-queue commit (user Pause or concurrent start landed during the deferred hop)")
+            case .ran(let outcome):
+              Log.helper.notice("auto-relaunch outcome: \(String(describing: outcome), privacy: .public)")
+            }
           }
         }
       )

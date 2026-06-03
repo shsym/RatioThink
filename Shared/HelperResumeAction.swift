@@ -210,4 +210,47 @@ public enum HelperResumeAction {
       return false
     }
   }
+
+  /// Result of the composite auto-relaunch decision (#395). Carries the
+  /// observed status on a veto so the caller can log WHY it skipped.
+  public enum AutoRelaunchDecision: Equatable, CustomStringConvertible {
+    /// `shouldCommitAutoRelaunch` vetoed — a user Pause, a concurrent
+    /// start, or teardown won the deferred main-queue-hop race. The engine
+    /// is no longer in the `.failed` state the scheduler fired for.
+    case vetoed(EngineStatus)
+    /// Committed — the `run` closure fired; carries its `Outcome`.
+    case ran(Outcome)
+
+    public var description: String {
+      switch self {
+      case .vetoed(let status): return "vetoed(status=\(status))"
+      case .ran(let outcome):   return "ran(\(outcome))"
+      }
+    }
+  }
+
+  /// SPM-reachable composite of the engine-death auto-relaunch closure
+  /// (#395). The production relauncher in `HelperMain.swift` lives in the
+  /// Helper Xcode target — NOT SPM-reachable — so its veto→run body was the
+  /// exact untestable boundary that hid the #299 v1 F1 "feature dead in
+  /// production" blocker. This extracts the *decision* (veto via
+  /// `shouldCommitAutoRelaunch`) plus the *action* (`run`) so the whole
+  /// composition is unit-testable here; HelperMain keeps only the
+  /// AppKit-bound `DispatchQueue.main.async` hop, the `HelperResumeHolder`
+  /// deref, and the log lines.
+  ///
+  /// `run` is supplied by the caller (rather than threading
+  /// host/store/resolver through this function) so HelperMain reads its
+  /// live `engineHost.status` AND the run inputs at the same deferred
+  /// commit point — the status passed here and the closure's captures stay
+  /// consistent. Pure over `status` + the closure's effect: a `.failed`
+  /// status runs the closure exactly once; any other status vetoes and the
+  /// closure is never invoked.
+  public static func composeAutoRelaunch(
+    status: EngineStatus,
+    run: () -> Outcome
+  ) -> AutoRelaunchDecision {
+    guard shouldCommitAutoRelaunch(status: status) else { return .vetoed(status) }
+    return .ran(run())
+  }
 }
