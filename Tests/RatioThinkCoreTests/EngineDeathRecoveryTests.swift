@@ -718,6 +718,46 @@ final class EngineDeathRecoveryTests: XCTestCase {
     XCTAssertEqual(engine.callCount, 2, "exactly one retry after the helper recovered")
   }
 
+  // MARK: - 12. Recovery wait budget is sized to the fault's recovery path (#412 F1)
+
+  func test_recoveryWait_budget_matches_fault_recovery_path() async throws {
+    // A HELPER death recovers via the App-side restart ladder (first repair
+    // ~17s+), so the wait must use the larger `helperUnreachableWaitTimeout`;
+    // an ENGINE death recovers via PieEngineHost's faster ladder, so it keeps
+    // the tight `waitForReadyTimeout`. The fixed 15s wait used for both was
+    // too short for the helper-ladder path (review F1).
+    let policy = ChatRecoveryPolicy()  // 15s engine / 45s helper
+
+    func runAndCaptureBudget(gone: Bool, helperUnreachable: Bool) async throws -> TimeInterval? {
+      let container = try RatioThinkModelContainer.makeInMemory()
+      let context = ModelContext(container)
+      let chat = Chat()
+      context.insert(chat)
+      chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+      try context.save()
+      struct TransportBoom: Error {}
+      let engine = ProbingChatEngine(
+        firstError: gone ? HTTPEngineError.engineGone(detail: "x") : TransportBoom(),
+        successEvents: [.delta(role: .assistant, content: "ack"), .finish(reason: .stop)]
+      )
+      let gate = ScriptedRecoveryGate(initialGone: gone, willRecover: true, initialHelperUnreachable: helperUnreachable)
+      let controller = ChatSendController()
+      controller.send(chat: chat, context: context, engine: engine,
+                      modelLoadCenter: ModelLoadCenter(), persistenceStatus: PersistenceStatus(),
+                      options: ChatSendRequestOptions(modelID: "m1"),
+                      recoveryGate: gate, recoveryPolicy: policy)
+      try await waitUntil("retry settles") { !controller.isInFlight }
+      return gate.lastWaitTimeout
+    }
+
+    let helperBudget = try await runAndCaptureBudget(gone: false, helperUnreachable: true)
+    XCTAssertEqual(helperBudget, policy.helperUnreachableWaitTimeout,
+                   "helper-death branch must use the larger ladder-sized budget")
+    let engineBudget = try await runAndCaptureBudget(gone: true, helperUnreachable: false)
+    XCTAssertEqual(engineBudget, policy.waitForReadyTimeout,
+                   "engine-death branch must keep the tight engine-relaunch budget")
+  }
+
   // MARK: - helpers
 
   private func makeSpec(profileID: String = "chat") -> PieControlLauncher.LaunchSpec {
@@ -872,8 +912,13 @@ private final class ScriptedRecoveryGate: ChatRecoveryGate {
   }
   var isEngineGone: Bool { goneFlag }
   var isHelperUnreachable: Bool { unreachableFlag }
+  var helperRecoveryGaveUp: Bool { false }
+  /// Captures the budget `ChatSendController` chose for the wait, so a test
+  /// can assert the helper-unreachable branch gets the larger ladder budget.
+  private(set) var lastWaitTimeout: TimeInterval?
   func refreshStatus() async {}
   func waitUntilRunning(timeout: TimeInterval) async -> Bool {
+    lastWaitTimeout = timeout
     if willRecover {
       goneFlag = false
       unreachableFlag = false
@@ -895,6 +940,7 @@ private final class ParkingRecoveryGate: ChatRecoveryGate {
   init(onEntered: @escaping () -> Void) { self.onEntered = onEntered }
   var isEngineGone: Bool { true }
   var isHelperUnreachable: Bool { false }
+  var helperRecoveryGaveUp: Bool { false }
   func refreshStatus() async {}
   func waitUntilRunning(timeout: TimeInterval) async -> Bool {
     onEntered()

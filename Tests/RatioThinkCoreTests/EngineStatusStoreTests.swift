@@ -305,6 +305,45 @@ final class EngineStatusStoreTests: XCTestCase {
                   "got \(store.statusDetail)")
   }
 
+  // MARK: - #412 review F1: recovery wait bounded by the ladder outcome
+
+  func test_waitUntilRunning_earlyExits_when_helper_ladder_gaveUp() async {
+    // When the App's helper-restart ladder reports `.unreachable` (gave up),
+    // the recovery wait must return false IMMEDIATELY rather than burn the
+    // full (helper-sized) budget — so the chat turn surfaces in lockstep with
+    // the escalation banner instead of spinning for tens of seconds.
+    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting)
+    store.helperHealthProvider = { .unreachable }
+    let start = Date()
+    let recovered = await store.waitUntilRunning(timeout: 10)
+    let elapsed = Date().timeIntervalSince(start)
+    XCTAssertFalse(recovered, "a ladder that gave up must not report recovery")
+    XCTAssertLessThan(elapsed, 1.0, "must early-exit on .unreachable, not wait the full 10s budget")
+  }
+
+  func test_waitUntilRunning_keepsWaiting_while_ladder_still_repairing() async {
+    // While the ladder is still working (not terminal), the wait honors its
+    // budget — it must NOT bail early on a non-terminal helper state.
+    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting)
+    store.helperHealthProvider = { .repairing(attempt: 1) }
+    let start = Date()
+    let recovered = await store.waitUntilRunning(timeout: 0.3)
+    let elapsed = Date().timeIntervalSince(start)
+    XCTAssertFalse(recovered)
+    XCTAssertGreaterThanOrEqual(elapsed, 0.25, "a still-repairing ladder must not trip the give-up early-exit")
+  }
+
+  func test_waitUntilRunning_noProvider_waits_full_budget() async {
+    // Backward compat: with no helper-health source (engine-gone path / tests)
+    // `helperRecoveryGaveUp` is false and the wait runs to its timeout.
+    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting)
+    let start = Date()
+    let recovered = await store.waitUntilRunning(timeout: 0.3)
+    let elapsed = Date().timeIntervalSince(start)
+    XCTAssertFalse(recovered)
+    XCTAssertGreaterThanOrEqual(elapsed, 0.25, "no give-up signal → honor the timeout")
+  }
+
   private func waitUntil(
     _ description: String,
     timeout: TimeInterval = 1.0,

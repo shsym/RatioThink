@@ -170,6 +170,12 @@ struct RatioThinkApp: App {
     statusStore.onPollOutcome = { [weak helperHealthController] succeeded in
       helperHealthController?.ingestPollOutcome(succeeded: succeeded)
     }
+    // #412 review F1: let the chat recovery wait bound itself by the ladder
+    // outcome (give up the moment the ladder hits .unreachable) instead of a
+    // fixed timeout chosen out of sync with the ladder cadence.
+    statusStore.helperHealthProvider = { [weak helperHealthController] in
+      helperHealthController?.health
+    }
     _helperHealth = StateObject(wrappedValue: helperHealthController)
 
     // Kick the XPC poll loop. Idempotent + cheap — first reply lands

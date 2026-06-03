@@ -174,6 +174,15 @@ public final class EngineStatusStore: ObservableObject {
   /// the `@MainActor` controller synchronously.
   @MainActor public var onPollOutcome: (Bool) -> Void = { _ in }
 
+  /// #412 review F1: source of the App's helper-restart ladder state, so the
+  /// chat recovery wait can be bounded by the LADDER OUTCOME (`.unreachable`
+  /// ⇒ give up now) rather than a fixed timeout chosen out of sync with the
+  /// ladder cadence. Wired by RatioThinkApp to read `HelperHealthController`;
+  /// the default `nil` keeps the engine-gone path + tests on prior behavior.
+  /// `@MainActor` so `helperRecoveryGaveUp` can read it synchronously from the
+  /// main-actor recovery wait.
+  @MainActor public var helperHealthProvider: () -> HelperHealth? = { nil }
+
   /// On-demand engine resident-memory readout for the status popover.
   /// Forwards to the XPC client; on a transport error it returns nil to
   /// the UI (a quiet, optional readout just hides the row — never

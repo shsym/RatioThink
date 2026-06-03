@@ -172,11 +172,18 @@ public final class ChatSendController: ObservableObject {
             return
           }
 
-          // Wait for the helper's auto-relaunch ladder to bring the
-          // engine back. If it doesn't recover inside the policy window,
-          // surface the original engine-gone error rather than a generic
-          // timeout so the assistant bubble shows what actually happened.
-          let recovered = await gate.waitUntilRunning(timeout: recoveryPolicy.waitForReadyTimeout)
+          // Wait for recovery to bring the engine back. The budget is sized
+          // to the fault's recovery path (review F1): a HELPER death recovers
+          // via the App-side restart ladder (first repair ~17s+), so it gets
+          // the larger `helperUnreachableWaitTimeout`; an ENGINE death recovers
+          // via PieEngineHost's faster relaunch ladder, so it keeps the tight
+          // `waitForReadyTimeout`. Either wait early-exits the moment the
+          // helper ladder gives up. If recovery doesn't land in budget, surface
+          // the original error so the bubble shows what actually happened.
+          let waitBudget = gate.isHelperUnreachable
+            ? recoveryPolicy.helperUnreachableWaitTimeout
+            : recoveryPolicy.waitForReadyTimeout
+          let recovered = await gate.waitUntilRunning(timeout: waitBudget)
           guard recovered else {
             writer?.cancel()
             // Re-check generation after the `await waitUntilRunning`
@@ -385,15 +392,28 @@ public struct ChatRecoveryPolicy: Equatable, Sendable {
   /// entirely (no second pass); `2` (the default) is "initial + one
   /// retry".
   public var maxAttempts: Int
-  /// How long to wait for `recoveryGate.waitUntilRunning(timeout:)` to
-  /// report `.running` again after classifying engine-gone. Picked so
-  /// the helper can ride through its full ladder (2 × 1–2s backoff +
-  /// handshake) without timing out from under us.
+  /// How long to wait for `.running` again after classifying ENGINE-gone
+  /// (helper alive). Sized for `PieEngineHost`'s engine-relaunch ladder
+  /// (2 × 1–2s backoff + handshake) — a few seconds.
   public var waitForReadyTimeout: TimeInterval
 
-  public init(maxAttempts: Int = 2, waitForReadyTimeout: TimeInterval = 15) {
+  /// How long to wait when the fault is a HELPER death (`isHelperUnreachable`).
+  /// Larger than `waitForReadyTimeout` because the App-side helper-restart
+  /// ladder's FIRST repair only restores reachability after
+  /// ~`HelperHealthPolicy.transientThreshold` failed polls (~12s, it defers to
+  /// launchd's faster on-demand relaunch first) plus a reconcile probe
+  /// (~5s) — well past the engine budget (review F1). The wait ALSO early-exits
+  /// the instant the ladder gives up (`helperRecoveryGaveUp`), so this is an
+  /// upper backstop, not a delay the user always pays. Keep ≥ the helper
+  /// ladder's worst-case-to-recovery; revisit if `HelperHealthPolicy` changes.
+  public var helperUnreachableWaitTimeout: TimeInterval
+
+  public init(maxAttempts: Int = 2,
+              waitForReadyTimeout: TimeInterval = 15,
+              helperUnreachableWaitTimeout: TimeInterval = 45) {
     self.maxAttempts = maxAttempts
     self.waitForReadyTimeout = waitForReadyTimeout
+    self.helperUnreachableWaitTimeout = helperUnreachableWaitTimeout
   }
 
   public static let `default` = ChatRecoveryPolicy()

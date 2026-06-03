@@ -28,6 +28,15 @@ public protocol ChatRecoveryGate: AnyObject {
   /// records the forced poll's outcome, so this is fresh right after it.
   var isHelperUnreachable: Bool { get }
 
+  /// True once the App's helper-restart ladder has DEFINITIVELY given up
+  /// (`HelperHealth == .unreachable`). Distinct from `isHelperUnreachable`
+  /// (one failed poll): this is the ladder's terminal verdict. The recovery
+  /// wait early-exits on it so a helper that can't be restarted surfaces the
+  /// turn in lockstep with the escalation banner instead of burning the rest
+  /// of its budget (#412 review F1). Default-false for gates with no
+  /// helper-health source (the engine-gone path + test fakes).
+  var helperRecoveryGaveUp: Bool { get }
+
   /// Force one immediate helper poll so the cache reflects state
   /// changes that happened between the previous tick and now. The
   /// 1Hz background poll on `EngineStatusStore` is too coarse to
@@ -59,6 +68,15 @@ extension EngineStatusStore: ChatRecoveryGate {
   /// fresh probe, not a stale 1Hz tick.
   public var isHelperUnreachable: Bool { lastError != nil }
 
+  /// Reads the App's helper-restart ladder state via `helperHealthProvider`
+  /// (wired by RatioThinkApp to `HelperHealthController`). Nil provider — the
+  /// engine-gone path and tests — reports `false`, preserving prior behavior.
+  public var helperRecoveryGaveUp: Bool {
+    guard let health = helperHealthProvider() else { return false }
+    if case .unreachable = health { return true }
+    return false
+  }
+
   public func refreshStatus() async {
     // Record BOTH outcomes of the forced poll (unlike `refresh()`, which
     // rethrows without writing `lastError`). The chat classifier reads
@@ -78,6 +96,12 @@ extension EngineStatusStore: ChatRecoveryGate {
     while Date() < deadline {
       if Task.isCancelled { return false }
       if case .running = status { return true }
+      // F1: the App's helper-restart ladder definitively gave up
+      // (`.unreachable`). Recovery isn't coming — surface the turn NOW
+      // rather than burn the rest of the (helper-sized) budget; the
+      // escalation banner already explains it. The engine-gone path has no
+      // helper-health source, so this never fires there.
+      if helperRecoveryGaveUp { return false }
       let remaining = deadline.timeIntervalSinceNow
       let step = max(0.05, min(0.2, remaining))
       try? await Task.sleep(nanoseconds: UInt64(step * 1_000_000_000))
