@@ -108,7 +108,14 @@ final class HelperStatusItemSupervisorIntegrationTests: XCTestCase {
       recorder.record(HelperStatusItemModel.make(from: status))
     }
     _ = sup.start(makeSpec(binary: fake, profileID: "chat"))
-    recorder.waitForDot(.error, timeout: 5, testCase: self)
+    // Wait for the TERMINAL spawn-failure classification, not merely the
+    // first `.error` dot. A crash-on-launch child that exits with a code
+    // settles on `.failed(.spawnFailed)`, but under load the handshake
+    // timer can briefly publish an intermediate `.error`/`.handshakeTimeout`
+    // first (the supervisor then reclassifies it once the real exit code
+    // arrives). Stopping at the first `.error` could capture that
+    // intermediate; wait for the real invariant instead.
+    recorder.waitForLabel(containing: "spawnFailed", timeout: 5, testCase: self)
     token.cancel()
 
     let last = recorder.snapshot.last
@@ -207,6 +214,29 @@ final class HelperStatusItemSupervisorIntegrationTests: XCTestCase {
           }
           if !already { exp.fulfill() }
         }
+      }
+      timer.resume()
+      defer { timer.cancel() }
+      testCase.wait(for: [exp], timeout: timeout)
+    }
+
+    /// Wait until any recorded model's `engineLabel` contains `needle`.
+    /// Used to wait for a terminal classification (e.g. "spawnFailed")
+    /// rather than a coarse dot that an intermediate state may also map to.
+    func waitForLabel(containing needle: String,
+                      timeout: TimeInterval,
+                      testCase: XCTestCase) {
+      let exp = testCase.expectation(description: "model label contains \(needle)")
+      let fired = OSAllocatedUnfairLock<Bool>(initialState: false)
+      let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
+      timer.schedule(deadline: .now() + 0.05, repeating: 0.05)
+      timer.setEventHandler {
+        guard self.snapshot.contains(where: { $0.engineLabel.contains(needle) }) else { return }
+        let already = fired.withLock { (f: inout Bool) -> Bool in
+          defer { f = true }
+          return f
+        }
+        if !already { exp.fulfill() }
       }
       timer.resume()
       defer { timer.cancel() }

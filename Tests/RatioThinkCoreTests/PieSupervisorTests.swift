@@ -925,6 +925,92 @@ final class PieSupervisorTests: XCTestCase {
     }
   }
 
+  // MARK: - handshake-timer vs reaper race → exit code wins classification
+
+  /// Under load the handshake timer can fire before Foundation reaps a
+  /// crash-on-launch child whose `isRunning` (wait4 bookkeeping) still
+  /// reads true, so the supervisor stamps a terminal
+  /// `.failed(.handshakeTimeout)` and nils `current` first. The child's
+  /// real `terminationReason == .exit` must then reclassify that to
+  /// `.failed(.spawnFailed)` — a process that exited with its own code
+  /// was never an alive-but-silent handshake timeout. Driven through the
+  /// `FakeProcess` seam so the timer-wins-then-reaper ordering is
+  /// deterministic instead of load-dependent. Fails (stuck on
+  /// `.handshakeTimeout`) without the `handleTermination` reclassification.
+  func test_handshakeTimerWinsRace_thenRealExitCode_reclassifiesToSpawnFailed() throws {
+    let fake = FakeProcess()
+    let sup = PieSupervisor(
+      policy: .init(handshakeTimeout: 0.05,
+                    restartAttempts: 1,
+                    restartWindow: 30,
+                    stopGracePeriod: 1,
+                    stopOverrun: 1,
+                    stdoutCarryLimit: 64 * 1024),
+      logFileURL: logURL,
+      recoveryManifestURL: tempDir.appendingPathComponent("manifest.json"),
+      processFactory: { fake },
+      killProcessOverride: { _ in true }   // SIGKILL "succeeds" on the zombie
+    )
+    _ = sup.start(makeSpec(binary: tempDir.appendingPathComponent("unused-fake-binary"),
+                           profileID: "chat"))
+
+    // 1. Timer wins: the ~50ms handshake timer fires while FakeProcess
+    //    still reports isRunning==true, so the supervisor stamps the
+    //    (wrong) terminal handshake timeout and nils `current`.
+    let timedOut = waitFor(sup, predicate: {
+      if case .failed(.handshakeTimeout, _) = $0 { return true }; return false
+    }, timeout: 5)
+    guard case .failed(.handshakeTimeout, _)? = timedOut else {
+      return XCTFail("precondition: supervisor must first stamp .handshakeTimeout, got \(String(describing: timedOut))")
+    }
+
+    // 2. Reaper arrives: the child actually exited on its own with
+    //    code 7. terminationReason==.exit must flip the classification.
+    fake.deliverTermination(status: 7, reason: .exit)
+    let corrected = waitFor(sup, predicate: {
+      if case .failed(.spawnFailed, _) = $0 { return true }; return false
+    }, timeout: 5)
+    guard case .failed(.spawnFailed, _)? = corrected else {
+      return XCTFail("a child that exited with code 7 must reclassify .handshakeTimeout → .spawnFailed; got \(String(describing: sup.status))")
+    }
+  }
+
+  /// Guard the discriminator: a genuinely alive-but-silent engine we
+  /// SIGKILL for missing the handshake reports `terminationReason ==
+  /// .uncaughtSignal`, and must STAY `.handshakeTimeout` — the
+  /// reclassification keys on `.exit`, so it must not fire here.
+  func test_handshakeTimeout_killedAliveEngine_staysHandshakeTimeout() throws {
+    let fake = FakeProcess()
+    let sup = PieSupervisor(
+      policy: .init(handshakeTimeout: 0.05,
+                    restartAttempts: 1,
+                    restartWindow: 30,
+                    stopGracePeriod: 1,
+                    stopOverrun: 1,
+                    stdoutCarryLimit: 64 * 1024),
+      logFileURL: logURL,
+      recoveryManifestURL: tempDir.appendingPathComponent("manifest.json"),
+      processFactory: { fake },
+      killProcessOverride: { _ in true }
+    )
+    _ = sup.start(makeSpec(binary: tempDir.appendingPathComponent("unused-fake-binary"),
+                           profileID: "chat"))
+    let timedOut = waitFor(sup, predicate: {
+      if case .failed(.handshakeTimeout, _) = $0 { return true }; return false
+    }, timeout: 5)
+    guard case .failed(.handshakeTimeout, _)? = timedOut else {
+      return XCTFail("precondition: supervisor must stamp .handshakeTimeout, got \(String(describing: timedOut))")
+    }
+    // Our SIGKILL of an alive-but-silent engine surfaces as a signal,
+    // not a self-exit — this is a real handshake timeout, keep it.
+    fake.deliverTermination(status: SIGKILL, reason: .uncaughtSignal)
+    // Give the termination work item time to run; the code must not flip.
+    Thread.sleep(forTimeInterval: 0.3)
+    guard case .failed(.handshakeTimeout, _) = sup.status else {
+      return XCTFail("a SIGKILLed alive engine must stay .handshakeTimeout, got \(sup.status)")
+    }
+  }
+
   // MARK: - helpers
 
   private func makeSupervisor(policy: PieSupervisor.Policy = .init(handshakeTimeout: 1.0,
@@ -1029,4 +1115,23 @@ private final class FakeProcess: Process, @unchecked Sendable {
   // there is no real child to ever flip it false.
   override var isRunning: Bool { true }
   override func run() throws {}
+
+  // Foundation publishes the reaped child's exit code/reason here. The
+  // base FakeProcess never terminates on its own (`run()` is a no-op);
+  // `deliverTermination` lets a test fire the supervisor's
+  // terminationHandler with a chosen exit code + reason to reproduce
+  // the reaper-races-the-handshake-timer classification path.
+  private var _terminationStatus: Int32 = 0
+  private var _terminationReason: Process.TerminationReason = .exit
+  override var terminationStatus: Int32 { _terminationStatus }
+  override var terminationReason: Process.TerminationReason { _terminationReason }
+
+  /// Synchronously invoke the stored `terminationHandler` as Foundation
+  /// would after `wait4` reaps the child, with `status` / `reason`
+  /// visible through `terminationStatus` / `terminationReason`.
+  func deliverTermination(status: Int32, reason: Process.TerminationReason) {
+    _terminationStatus = status
+    _terminationReason = reason
+    _terminationHandler?(self)
+  }
 }
