@@ -1664,7 +1664,7 @@ fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, 
 }
 
 /// Build an OpenAI-shape error JSON with a populated `param` field.
-fn json_error_param(
+pub(crate) fn json_error_param(
     status: u16,
     code: &str,
     message: &str,
@@ -2551,7 +2551,7 @@ fn build_forced_tool_constraint(
 /// Roles outside the OpenAI canonical set are demoted to `user` so
 /// future SDK extensions (e.g. `tool`) don't crash the handler — a
 /// pessimistic but loss-of-information-preserving choice.
-fn fill_context(
+pub(crate) fn fill_context(
     ctx: &mut Context,
     model: &Model,
     messages: &[ChatMessage],

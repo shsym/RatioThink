@@ -76,12 +76,15 @@ pub async fn handle(req: Request<IncomingBody>, res: Responder) -> Finished {
 
     match dispatch.inferlet.as_str() {
         "chat-apc" => dispatch_chat_apc(dispatch, res).await,
+        "tree-of-thought" => {
+            crate::tot::dispatch(dispatch.input, dispatch.messages, dispatch.stream, res).await
+        }
         other => res
             .respond(sse::json_error(
                 404,
                 "inferlet_not_found",
                 &format!(
-                    "Inferlet '{other}' not available. V1 supports only 'chat-apc'."
+                    "Inferlet '{other}' not available. V1 supports 'chat-apc' and 'tree-of-thought'."
                 ),
             ))
             .await,
