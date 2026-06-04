@@ -40,8 +40,9 @@ existing tooling (curl, the OpenAI SDKs, your own apps) can talk to it without c
   status at a glance.
 - **Engine status & loading** — A toolbar indicator shows when the engine is starting, a
   model is loading (with progress), ready, or failed — and lets you unload to free RAM.
-- **OpenAI-compatible API** — Expose a loaded model as a local `…/v1/chat/completions`
-  endpoint with an optional bearer token, and point any OpenAI client at it.
+- **OpenAI-compatible engine** — RatioThink's chat runs against a local OpenAI-style
+  `/v1/chat/completions` engine. A screen to expose it on a fixed port (with a bearer token
+  / CORS) for your own clients is in preview — see [Known issues](#known-issues).
 
 <div align="center">
 
@@ -53,7 +54,7 @@ existing tooling (curl, the OpenAI SDKs, your own apps) can talk to it without c
 
 <img src="docs/assets/endpoint.png" alt="API endpoint detail with the local OpenAI-compatible URL and a ready-to-copy curl example" width="820" />
 
-<sub><b>OpenAI-compatible API</b> — expose a loaded model on a local endpoint and copy the curl.</sub>
+<sub><b>OpenAI-compatible API (preview)</b> — configure a local endpoint and copy the curl; live serving is coming.</sub>
 
 </div>
 
@@ -153,6 +154,24 @@ your home path is collapsed to `~` and obvious tokens are stripped. Chat
 contents are **never** included — diagnostics carry logs, status, and config
 metadata only. Flags: `--window <dur>` (Unified Logging look-back, default
 `2h`) and `--out <path>`.
+
+## Known issues
+
+A few known issues in the v0.1.1 release, with workarounds:
+
+- **The "Qwen2.5 7B Instruct" model in the list won't load.** Hugging Face publishes that
+  quant as split files the bundled engine can't assemble yet, so downloading it leaves a
+  model that fails to load. Pick a different model for now —
+  [a fix is in progress](https://github.com/shsym/RatioThink/pull/41).
+- **The local API endpoint is a preview.** You can configure an endpoint in the API
+  Endpoints screen, but it doesn't serve live requests yet — exposing a loaded model on a
+  fixed port is still being built. Use in-app chat in the meantime.
+- **The "Starting the engine…" prompt can rarely get stuck.** In an uncommon sequence — a
+  model load waiting on the engine, then a model-list refresh failing — the prompt can stay
+  on "Starting the engine…". Click **Cancel** and try again.
+- **A reply can lose its last words if saving fails.** If storage errors out exactly as a
+  streamed answer finishes, the saved copy may drop its final chunk (you'll see an error).
+  Re-generate the reply.
 
 ## Repo layout
 
