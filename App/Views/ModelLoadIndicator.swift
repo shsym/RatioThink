@@ -34,9 +34,6 @@ struct ModelLoadIndicator: View {
   /// : invoked from the running/ready popover's Unload button. Wired in
   /// `ChatScaffoldView` to stop the engine (free RAM) then `markUnloaded()`.
   var onUnload: () -> Void = {}
-  /// #218 F3: invoked from the `.engineNotReady` popover's "Stop Engine"
-  /// button. Stop-only (no `markUnloaded`) — see `ModelLoadPopover.onStopEngine`.
-  var onStopEngine: () -> Void = {}
 
   @State private var showPopover = false
 
@@ -90,8 +87,7 @@ struct ModelLoadIndicator: View {
         center: center,
         engineStatus: engineStatus,
         isPresented: $showPopover,
-        onUnload: onUnload,
-        onStopEngine: onStopEngine
+        onUnload: onUnload
       )
     }
     // Clicking outside the popover dismisses it but does NOT clear a
@@ -379,15 +375,6 @@ struct ModelLoadPopover: View {
   @ObservedObject var engineStatus: EngineStatusStore
   @Binding var isPresented: Bool
   var onUnload: () -> Void = {}
-  /// #218 F3: stop-only action for the `.engineNotReady` "Stop Engine"
-  /// path. Calls ONLY `stopEngine()` — NOT the RAM-freeing `onUnload`
-  /// (= `markUnloaded()` → `cancel()`), whose async, epoch-unguarded
-  /// `cancel()` could land in the post-stop window and silently kill a
-  /// load the user just started. The app-side `.engineNotReady` → `.idle`
-  /// reset is handled epoch-safely by the popover-close
-  /// `dismissTerminalState()` (see `ModelLoadIndicator`), mirroring the
-  /// Dismiss path's race avoidance.
-  var onStopEngine: () -> Void = {}
 
   /// Latest engine RSS sample, refreshed every ~2s while the popover is
   /// open and the engine is running/ready. Local-only; nil hides the row.
@@ -528,37 +515,13 @@ struct ModelLoadPopover: View {
         armedAction = .unload
       }
       .accessibilityIdentifier("modelLoad.popover.unload")
-    case .engineNotReady:
-      // #396: Retry re-runs the same load via the retained factory — not
-      // destructive (starts work), so no confirm gate.
-      Button("Retry") {
-        center.retryLast()
-        isPresented = false
-      }
-      .accessibilityIdentifier("modelLoad.popover.retry")
-      // #218 (F3): "Stop Engine" terminates the slow-booting engine so the
-      // user can pick another model and Resume. STOP-ONLY (`onStopEngine`),
-      // NOT `onUnload` (= markUnloaded → cancel(), async + epoch-unguarded,
-      // which could kill a load started in the "stop → pick another model"
-      // window). Immediate (not armed): the `.engineNotReady` → `.idle`
-      // reset rides the popover-close `dismissTerminalState()` (epoch-safe).
-      Button("Stop Engine", role: .destructive) {
-        onStopEngine()
-        isPresented = false
-      }
-      .accessibilityIdentifier("modelLoad.popover.stopEngine")
-      Button("Dismiss") {
-        center.dismissTerminalState()
-        isPresented = false
-      }
-      .keyboardShortcut(.defaultAction)
-      .accessibilityIdentifier("modelLoad.popover.dismiss")
-    case .failed:
-      // #396: a failed load is otherwise a dead end with only "Dismiss".
-      // Offer Retry — re-runs the same load via the center's retained
-      // factory (`retryLast`). Not destructive (it starts work, doesn't
-      // stop it), so no confirm gate; Dismiss stays the default key so the
-      // safe non-reloading choice is the accidental one.
+    case .failed, .engineNotReady:
+      // #396: a failed/deferred load is otherwise a dead end with only
+      // "Dismiss". Offer Retry as the recovery action — re-runs the same
+      // load via the center's retained factory (`retryLast`). Not
+      // destructive (it starts work, doesn't stop it), so no confirm
+      // gate; Dismiss stays the default key so the safe non-reloading
+      // choice is the accidental one.
       Button("Retry") {
         center.retryLast()
         isPresented = false

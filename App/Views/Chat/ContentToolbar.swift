@@ -50,11 +50,6 @@ struct ContentToolbar: View {
   let helperHealth: HelperHealthController?
   /// Forwarded to the indicator's running/ready popover Unload action.
   let onUnload: () -> Void
-  /// Forwarded to the indicator's `.engineNotReady` popover "Stop Engine"
-  /// action — stop-only (no `markUnloaded`), see #218 F3. Required (no
-  /// default) so a missed wiring is a compile error, not a silent no-op
-  /// terminate (same rationale as `onUnload`).
-  let onStopEngine: () -> Void
 
   @State private var showParamsPopover = false
   @State private var showSystemPopover = false
@@ -67,8 +62,7 @@ struct ContentToolbar: View {
     modelLoadCenter: ModelLoadCenter?,
     engineStatus: EngineStatusStore?,
     helperHealth: HelperHealthController?,
-    onUnload: @escaping () -> Void,
-    onStopEngine: @escaping () -> Void
+    onUnload: @escaping () -> Void
   ) {
     self.viewModel = viewModel
     self.availableProfiles = availableProfiles
@@ -78,7 +72,6 @@ struct ContentToolbar: View {
     self.engineStatus = engineStatus
     self.helperHealth = helperHealth
     self.onUnload = onUnload
-    self.onStopEngine = onStopEngine
   }
 
   var body: some View {
@@ -106,16 +99,15 @@ struct ContentToolbar: View {
 
       // : engine-status pip on the trailing edge. Content-hosted (not
       // the window NSToolbar) so its popover presents reliably. Shown only
-      // when the load center + engine-status store + helper health are
-      // wired (production); snapshot/preview call sites pass nil and stay
+      // when both the load center and the engine-status store are wired
+      // (production); snapshot/preview call sites pass nil and stay
       // pip-less so their reference PNGs are unchanged.
       if let modelLoadCenter, let engineStatus, let helperHealth {
         ModelLoadIndicator(
           center: modelLoadCenter,
           engineStatus: engineStatus,
           helperHealth: helperHealth,
-          onUnload: onUnload,
-          onStopEngine: onStopEngine
+          onUnload: onUnload
         )
       }
     }
