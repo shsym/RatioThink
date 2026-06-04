@@ -37,10 +37,11 @@
 //! A structured tree. Each node carries a stable `id`, `parent_id`,
 //! `depth`, `branch_index`, `content`, `score` (1–10 or `null`),
 //! `status` (`"root" | "ok" | "error"`), an optional per-node `error`
-//! (partial-failure diagnostic), and nested `children`. The envelope adds
-//! `selected_node_id` + `final_answer` (the best-scoring leaf). A node
-//! that was generated but pruned still appears in the tree (childless);
-//! a node with children was kept in the beam.
+//! (generation-failure diagnostic), an optional per-node `score_error`
+//! (value-evaluator infra failure — see the scoring caveat), and nested
+//! `children`. The envelope adds `selected_node_id` + `final_answer` (the
+//! best-scoring leaf). A node that was generated but pruned still appears
+//! in the tree (childless); a node with children was kept in the beam.
 //!
 //! Validation / model-resolution / pre-generation failures use the same
 //! OpenAI-shape `{error:{...}}` envelope as `/v1/chat/completions`
@@ -68,6 +69,13 @@
 //! but pruning is not quality-driven. Real score-driven pruning needs a
 //! non-reasoning model, a `/no_think`-style directive, or reasoning-tag
 //! stripping + a larger score budget (future work).
+//!
+//! This benign `null` (the model emitted no in-range integer) is
+//! distinct from a scorer-*infrastructure* failure (the value-evaluator
+//! fork or generation itself failed): the latter surfaces as a per-node
+//! `score_error`, so an infra collapse that silently degrades the beam to
+//! input-order pruning is observable rather than indistinguishable from
+//! an ordinary `null`.
 //!
 //! ## Future
 //!
