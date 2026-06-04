@@ -611,6 +611,91 @@ async def main() -> int:
                             f"/v1/chat/completions oversized status {r.status_code}"
                         )
 
+                    # #418: speculative-decode WIRING smoke. The dummy
+                    # driver is non-deterministic (random tokens even at
+                    # temperature 0), so it CANNOT demonstrate draft
+                    # acceptance or greedy token-equivalence — those are
+                    # proven deterministically by the host unit tests
+                    # (`cargo test`: deterministic accounting +
+                    # `greedy_spec_matches_plain_token_stream`) and by a
+                    # real-model run. Here we assert only what the dummy
+                    # CAN show end-to-end: a `speculation` request returns
+                    # a self-consistent `spec_metrics` block, and a normal
+                    # request stays byte-identical (no `spec_metrics`).
+                    # Results are printed inline (flush) so the evidence
+                    # survives even if a later, unrelated harness step
+                    # aborts before the final summary.
+                    import json as _json418
+                    spec418: list[str] = []
+                    r_spec = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "alpha beta gamma"}],
+                            "temperature": 0,
+                            "max_tokens": 16,
+                            "speculation": {"enabled": True},
+                        },
+                    )
+                    print(f"[harness] POST chat(speculation) -> {r_spec.status_code}")
+                    if r_spec.status_code != 200:
+                        spec418.append(f"spec status {r_spec.status_code} (expected 200)")
+                    else:
+                        try:
+                            b_spec = _json418.loads(r_spec.text)
+                        except _json418.JSONDecodeError as e:
+                            spec418.append(f"spec body not json: {e}")
+                            b_spec = None
+                        if b_spec is not None:
+                            sm = b_spec.get("spec_metrics")
+                            if sm is None:
+                                spec418.append(f"spec_metrics missing: {b_spec!r}")
+                            else:
+                                print(f"[harness] spec_metrics={sm}", flush=True)
+                                prop = sm.get("proposed_draft_tokens")
+                                acc = sm.get("accepted_draft_tokens")
+                                rej = sm.get("rejected_draft_tokens")
+                                if None in (prop, acc, rej) or acc + rej != prop:
+                                    spec418.append(f"accounting inconsistent: {sm!r}")
+                                if not sm.get("enabled", False):
+                                    spec418.append(f"enabled=false despite greedy+request: {sm!r}")
+                                if sm.get("decode_steps", 0) <= 0:
+                                    spec418.append(f"no decode steps: {sm!r}")
+                    # Normal request (no speculation field) must NOT carry
+                    # spec_metrics — proves normal responses are unchanged.
+                    r_plain = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "alpha beta gamma"}],
+                            "temperature": 0,
+                            "max_tokens": 16,
+                        },
+                    )
+                    if r_plain.status_code == 200:
+                        try:
+                            if _json418.loads(r_plain.text).get("spec_metrics") is not None:
+                                spec418.append(
+                                    "plain response carried spec_metrics without a "
+                                    "speculation request (normal responses must stay "
+                                    "byte-identical)"
+                                )
+                        except _json418.JSONDecodeError:
+                            pass
+                    if spec418:
+                        for f in spec418:
+                            print(f"[harness] #418 FAIL: {f}", flush=True)
+                        failures.extend(f"#418 {f}" for f in spec418)
+                    else:
+                        print("[harness] #418 spec_metrics wiring OK", flush=True)
+                    # Acceptance + greedy token-equivalence need a
+                    # deterministic model; the dummy driver can't provide
+                    # one (covered by host cargo tests + a real-model run).
+                    skipped.append(
+                        "#418 spec acceptance + greedy equivalence (dummy driver is "
+                        "non-deterministic; host cargo tests + real-model smoke cover it)"
+                    )
+
                     # /v1/inferlet messages-precedence: input.messages
                     # wins over top-level messages. Setting input.messages
                     # to [] while top-level has content → 400 (empty
