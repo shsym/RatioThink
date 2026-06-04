@@ -80,6 +80,14 @@ pub struct CachebackDrafter {
     start_cursor: u32,
     /// Drafts proposed in the most recent `draft()`; read by `accept`.
     last_proposed: usize,
+    /// Set once the first `accept` lands. The first generation step
+    /// processes the prompt prefill (a large `n_pending` pass); drafting
+    /// there would fuse prefill with multi-position speculative samplers
+    /// — a shape the SDK warns can drift off the greedy trajectory on
+    /// some backends (`inferlets/cacheback-decoding` notes). Suppressing
+    /// the prefill-step draft keeps step 1 a plain prefill+1 pass; drafts
+    /// engage from the first pure decode step onward.
+    prefilled: bool,
     metrics: Arc<Mutex<SpecMetrics>>,
 }
 
@@ -93,6 +101,7 @@ impl CachebackDrafter {
             cursor: start_cursor,
             start_cursor,
             last_proposed: 0,
+            prefilled: false,
             metrics: Arc::new(Mutex::new(SpecMetrics::default())),
         }
     }
@@ -139,7 +148,7 @@ impl CachebackDrafter {
 
 impl inferlet::Speculator for CachebackDrafter {
     fn draft(&mut self) -> (Vec<u32>, Vec<u32>) {
-        if self.recent.len() < self.cfg.leader_len {
+        if !self.prefilled || self.recent.len() < self.cfg.leader_len {
             self.last_proposed = 0;
             return (Vec::new(), Vec::new());
         }
@@ -181,6 +190,9 @@ impl inferlet::Speculator for CachebackDrafter {
             self.ingest(t);
         }
         self.cursor += accepted.len() as u32;
+        // The prefill step's output has now been committed; drafts may
+        // engage from the next (pure decode) step.
+        self.prefilled = true;
     }
 
     fn rollback(&mut self, _n: u32) {
@@ -199,6 +211,7 @@ impl inferlet::Speculator for CachebackDrafter {
         self.recent.clear();
         self.cursor = self.start_cursor;
         self.last_proposed = 0;
+        self.prefilled = false;
         *self.metrics.lock().unwrap() = SpecMetrics::default();
     }
 }
@@ -257,10 +270,23 @@ mod tests {
         let mut d = CachebackDrafter::new(cfg(), 0);
         // a,b,c repeating so 3->1, 1->2, 2->3 chain after seeding.
         d.seed(&[1, 2, 3, 1, 2, 3]);
+        d.prefilled = true; // bypass the prefill-step gate for unit test
         let (drafts, positions) = d.draft();
         assert_eq!(drafts, vec![1, 2, 3]);
         // cursor seeded at 0, seed does not advance it.
         assert_eq!(positions, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn does_not_draft_on_prefill_step() {
+        let mut d = CachebackDrafter::new(cfg(), 0);
+        d.seed(&[1, 2, 3, 1, 2, 3]); // cache + recent warm
+        // Before any accept (the prefill step), drafting is suppressed.
+        assert_eq!(d.draft(), (Vec::new(), Vec::new()));
+        // First accept = prefill step output committed.
+        d.accept(&[3]);
+        let (drafts, _) = d.draft();
+        assert!(!drafts.is_empty());
     }
 
     #[test]
