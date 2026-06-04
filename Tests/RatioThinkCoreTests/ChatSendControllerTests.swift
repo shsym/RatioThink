@@ -290,6 +290,29 @@ final class ChatSendControllerTests: XCTestCase {
     XCTAssertEqual(req.sampling.temperature, 0.7)
   }
 
+  /// End-to-end golden tie: the seeded built-in "Fast Think" profile must
+  /// produce exactly the inferlet-facing body that engages the #418
+  /// drafter — `speculation.enabled == true` AND a greedy top-level
+  /// `temperature == 0`. Drives the real request builder with the seeded
+  /// TOML's speculation and a NON-greedy toolbar sampling (0.7) to prove
+  /// the chokepoint forces greedy regardless. (#426)
+  func test_seeded_fast_think_profile_yields_drafting_body() async throws {
+    let profile = try Profile.parse(toml: ProfileStore.defaultFastThinkTOML)
+    XCTAssertEqual(profile.speculation, Profile.Speculation(enabled: true),
+                   "seeded Fast Think profile must enable speculation")
+
+    let req = try await capturedRequest(
+      speculation: profile.speculation,
+      sampling: ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 100))
+
+    let body = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try JSONEncoder().encode(req)) as? [String: Any])
+    let spec = try XCTUnwrap(body["speculation"] as? [String: Any])
+    XCTAssertEqual(spec["enabled"] as? Bool, true)
+    XCTAssertEqual(body["temperature"] as? Double, 0,
+                   "Fast Think body must be greedy (temp 0) so the drafter engages")
+  }
+
   private func waitUntil(
     _ description: String,
     timeout: TimeInterval = 1,
