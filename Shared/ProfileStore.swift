@@ -219,6 +219,38 @@ public final class ProfileStore: ObservableObject {
   /// no-op on fresh installs.
   public static let defaultProfileID = "chat"
 
+  /// Built-in "Fast Think" profile id (#426). A second seeded profile that
+  /// turns on the chat-apc speculative drafter. Greedy by definition
+  /// (temperature 0) so drafting actually engages — see
+  /// `ChatSendController.makeRequest`.
+  public static let defaultFastThinkProfileID = "fast-think"
+
+  /// Filename for the seeded Fast Think profile.
+  public static let defaultFastThinkFilename = "fast-think.toml"
+
+  /// Seed body for the Fast Think profile. Same model + inferlet as the
+  /// default Chat profile (so selecting it is a silent same-model swap,
+  /// no reload), but greedy (`temperature = 0`) with `[speculation]`
+  /// enabled. `leader_len`/`draft_len` are omitted so the inferlet applies
+  /// its #418 defaults (1 / 3).
+  public static let defaultFastThinkTOML: String = """
+  id = "fast-think"
+  name = "Fast Think"
+  icon = "bolt"
+  model = "\(defaultChatModelID)"
+  inferlet = "chat-apc"
+  system_prompt = "You are a helpful assistant."
+
+  [sampling]
+  temperature = 0.0
+  top_p = 0.9
+  max_tokens = 2048
+
+  [speculation]
+  enabled = true
+
+  """
+
   private let queue: DispatchQueue
   /// Per-instance specific key so any method can detect whether the
   /// current thread is already running on THIS store's `queue`
@@ -405,9 +437,16 @@ public final class ProfileStore: ObservableObject {
     // directory but does NOT touch the marker.
     queue.sync {
       let seed = self.seedDefaultsIfEmpty()
+      // Ensure the built-in Fast Think profile exists even on installs
+      // that already seeded chat.toml (the empty-dir seed above is a no-op
+      // there). Runs before `reloadLocked()` below so the initial scan
+      // picks it up. (#426)
+      let fastThinkSeedError = self.ensureBuiltinFastThinkProfile()
       let readResult = self.readActiveProfileIDFromDisk()
       self.stateLock.withLock {
-        self._lastSeedError = seed.dirError
+        // Keep the chat-seed error's precedence; surface the Fast Think
+        // seed error only when the primary seed was clean.
+        self._lastSeedError = seed.dirError ?? fastThinkSeedError
         self.commitActiveReadResultLocked(readResult, source: .start)
         //  review v1 F2: a marker-seed failure must NOT
         // be silent. The override below fills `_activeProfileError`
@@ -956,6 +995,30 @@ public final class ProfileStore: ObservableObject {
     // sibling Pie process raced our seed) and must win.
     let markerError = seedActiveProfileMarker()
     return SeedResult(dirError: nil, markerError: markerError)
+  }
+
+  /// Ensure the built-in "Fast Think" profile exists (#426). Unlike
+  /// `seedDefaultsIfEmpty` (gated on an empty dir), this writes
+  /// `fast-think.toml` whenever it is ABSENT — so installs that already
+  /// have a `chat.toml` (i.e. every install past first launch) still gain
+  /// Fast Think on the next start. Existence-gated, so a user's edits to
+  /// the file survive; deleting it re-creates it next launch, which is the
+  /// accepted contract for a built-in default (edit it, don't delete it).
+  /// Never touches the active-profile marker — the default selection stays
+  /// `chat`. Returns `.seedFailed` on a write failure so `start()` can
+  /// surface it rather than swallow it; a nil return is success-or-exists.
+  private func ensureBuiltinFastThinkProfile() -> ProfileStoreError? {
+    let target = directory.appendingPathComponent(Self.defaultFastThinkFilename)
+    if FileManager.default.fileExists(atPath: target.path) { return nil }
+    do {
+      try Self.defaultFastThinkTOML.write(to: target, atomically: true, encoding: .utf8)
+      Log.store.info("seeded built-in Fast Think profile at \(target.path, privacy: .public)")
+      return nil
+    } catch {
+      let underlying = String(describing: error)
+      Log.store.error("seed Fast Think profile failed: \(underlying, privacy: .public)")
+      return .seedFailed(path: target.path, underlying: underlying)
+    }
   }
 
   /// Exclusive-create write of the active-profile marker (review v1 F3).
