@@ -35,7 +35,7 @@ public struct Profile {
   /// (temperature 0); the send path (`ChatSendController.makeRequest`)
   /// enforces that coupling, so an enabled-speculation profile is always
   /// a greedy "Fast Think" profile.
-  public struct Speculation: Equatable {
+  public struct Speculation: Equatable, Sendable {
     public var enabled: Bool
     public var leaderLen: Int?
     public var draftLen: Int?

@@ -288,11 +288,26 @@ public final class ChatSendController: ObservableObject {
         guard !Self.excludesFromRequestHistory(message, role: role) else { return nil }
         return ChatMessage(role: role, content: message.content)
       })
+    // Authoritative speculation coupling (#426). An enabled-speculation
+    // profile is a greedy "Fast Think" profile: the chat-apc drafter only
+    // engages when the request is greedy (temperature 0, #418), so force
+    // it here regardless of the toolbar's sampling. A profile with no
+    // `[speculation]` section, or one explicitly disabled, attaches no
+    // field and leaves sampling untouched — the request stays
+    // byte-identical to a normal chat (no `spec_metrics` overhead).
+    let spec = options.speculation
+    let wireSpec: ChatSpeculation? = (spec?.enabled == true)
+      ? ChatSpeculation(enabled: true, leaderLen: spec?.leaderLen, draftLen: spec?.draftLen)
+      : nil
+    let sampling = wireSpec == nil
+      ? options.sampling
+      : ChatSampling(temperature: 0, topP: options.sampling.topP, maxTokens: options.sampling.maxTokens)
     return ChatRequest(
       model: options.modelID,
       messages: turns,
-      sampling: options.sampling,
-      stream: true
+      sampling: sampling,
+      stream: true,
+      speculation: wireSpec
     )
   }
 
@@ -371,15 +386,21 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
   public let modelID: String
   public let sampling: ChatSampling
   public let systemPromptOverride: String?
+  /// Speculative-decoding settings of the chat's selected profile, or
+  /// `nil` when the profile has none. `makeRequest` injects this into the
+  /// request (and forces greedy temperature) when `enabled` — see #426.
+  public let speculation: Profile.Speculation?
 
   public init(
     modelID: String,
     sampling: ChatSampling = ChatSampling(),
-    systemPromptOverride: String? = nil
+    systemPromptOverride: String? = nil,
+    speculation: Profile.Speculation? = nil
   ) {
     self.modelID = modelID
     self.sampling = sampling
     self.systemPromptOverride = systemPromptOverride
+    self.speculation = speculation
   }
 }
 
