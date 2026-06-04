@@ -105,10 +105,14 @@ public enum ProfileStoreError: Error, CustomStringConvertible, Equatable {
 /// `directoryError` priority (newest signal wins):
 ///   1. `.scanFailed` — most recent reload could not enumerate the
 ///      directory (deleted under us, perms revoked, etc.).
-///   2. `.seedFailed` — first-launch seed write failed AND the
+///   2. `.seedFailed` — first-launch chat seed write failed AND the
 ///      directory is still empty. Cleared as soon as a scan finds at
 ///      least one `*.toml` (user / external process repaired it).
-///   3. `nil` — clean.
+///   3. `.seedFailed` — the existence-gated built-in (Fast Think) seed
+///      write failed (review v1 F1). Surfaces regardless of whether the
+///      directory has other profiles, since the built-in is seeded into
+///      populated installs; not cleared by a non-empty scan.
+///   4. `nil` — clean.
 public struct ProfileStoreSnapshot {
   public let entries: [ProfileLoadResult]
   public let directoryError: ProfileStoreError?
@@ -266,6 +270,14 @@ public final class ProfileStore: ObservableObject {
   private var _entries: [ProfileLoadResult] = []
   private var _lastSeedError: ProfileStoreError?
   private var _lastScanError: ProfileStoreError?
+  /// Write failure from the existence-gated built-in (Fast Think) seed
+  /// (review v1 F1). Distinct from `_lastSeedError` (the empty-dir chat
+  /// seed): the built-in is seeded into installs that ALREADY have
+  /// profiles, so its failure must surface even when `_entries` is
+  /// non-empty — and must NOT be cleared by a successful scan the way
+  /// the empty-dir seed error is. Self-clears on the next `start()` whose
+  /// seed succeeds (set fresh every start), and on `stop()`.
+  private var _builtinSeedError: ProfileStoreError?
   private var _activeProfileID: String?
   private var _activeProfileError: ProfileStoreError?
   /// Listener fan-out invariant (review v6 F7).
@@ -444,9 +456,12 @@ public final class ProfileStore: ObservableObject {
       let fastThinkSeedError = self.ensureBuiltinFastThinkProfile()
       let readResult = self.readActiveProfileIDFromDisk()
       self.stateLock.withLock {
-        // Keep the chat-seed error's precedence; surface the Fast Think
-        // seed error only when the primary seed was clean.
-        self._lastSeedError = seed.dirError ?? fastThinkSeedError
+        self._lastSeedError = seed.dirError
+        // The built-in (Fast Think) seed error rides its own channel: it
+        // is seeded into populated dirs, so it must surface even when
+        // `_entries` is non-empty (review v1 F1) — `_lastSeedError` is
+        // gated on an empty dir and cleared by the next non-empty scan.
+        self._builtinSeedError = fastThinkSeedError
         self.commitActiveReadResultLocked(readResult, source: .start)
         //  review v1 F2: a marker-seed failure must NOT
         // be silent. The override below fills `_activeProfileError`
@@ -540,6 +555,7 @@ public final class ProfileStore: ObservableObject {
     _entries = []
     _lastSeedError = nil
     _lastScanError = nil
+    _builtinSeedError = nil
     _activeProfileID = nil
     _activeProfileError = nil
     _pendingPostRecursionFanOut = false
@@ -1005,8 +1021,10 @@ public final class ProfileStore: ObservableObject {
   /// the file survive; deleting it re-creates it next launch, which is the
   /// accepted contract for a built-in default (edit it, don't delete it).
   /// Never touches the active-profile marker — the default selection stays
-  /// `chat`. Returns `.seedFailed` on a write failure so `start()` can
-  /// surface it rather than swallow it; a nil return is success-or-exists.
+  /// `chat`. Returns `.seedFailed` on a write failure; `start()` routes it
+  /// to the dedicated `_builtinSeedError` channel, which surfaces on the
+  /// snapshot's `directoryError` even when the directory already has
+  /// profiles (review v1 F1). A nil return is success-or-exists.
   private func ensureBuiltinFastThinkProfile() -> ProfileStoreError? {
     let target = directory.appendingPathComponent(Self.defaultFastThinkFilename)
     if FileManager.default.fileExists(atPath: target.path) { return nil }
@@ -1356,11 +1374,16 @@ public final class ProfileStore: ObservableObject {
   }
 
   /// Caller must hold `stateLock`. Scan errors take priority over
-  /// seed errors (scan reflects the most recent FS interaction);
-  /// seed error only surfaces while the directory is still empty.
+  /// seed errors (scan reflects the most recent FS interaction); the
+  /// empty-dir chat seed error only surfaces while the directory is
+  /// still empty. The built-in (Fast Think) seed error surfaces
+  /// regardless of `_entries.isEmpty` — its whole purpose is populated
+  /// installs (review v1 F1) — at lowest priority, since a scan failure
+  /// or a failed empty-dir chat seed is the more actionable signal.
   private func resolvedDirectoryErrorLocked() -> ProfileStoreError? {
     if let s = _lastScanError { return s }
     if let s = _lastSeedError, _entries.isEmpty { return s }
+    if let s = _builtinSeedError { return s }
     return nil
   }
 

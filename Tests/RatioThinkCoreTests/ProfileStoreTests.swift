@@ -1971,6 +1971,37 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  func test_fast_think_seed_failure_surfaces_via_snapshot_directoryError() throws {
+    try withTempProfilesDir { dir in
+      // A parseable chat.toml is present, so `_entries` is non-empty after
+      // start — the empty-dir chat-seed error channel (`_lastSeedError`,
+      // gated on an empty dir AND cleared by a non-empty scan) cannot carry
+      // a failure. This is exactly the case the built-in seed exists for
+      // (review v1 F1), and where the prior code swallowed the error.
+      try ProfileStore.defaultChatTOML.write(
+        to: dir.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
+      // Read-only dir: chat.toml still loads (r-x is readable), but the
+      // Fast Think write fails → its error must reach the snapshot.
+      try setPermissions(dir, mode: 0o500)
+      defer { try? setPermissions(dir, mode: 0o755) }
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertFalse(store.entries.isEmpty,
+                     "chat.toml must still load from a read-only (but readable) dir")
+      XCTAssertFalse(FileManager.default.fileExists(
+        atPath: dir.appendingPathComponent(ProfileStore.defaultFastThinkFilename).path),
+        "precondition: the Fast Think write must have failed under the read-only dir")
+      guard case .seedFailed(let path, _)? = store.snapshot.directoryError else {
+        return XCTFail("Fast Think seed failure must surface on snapshot.directoryError even with chat.toml present; got \(String(describing: store.snapshot.directoryError))")
+      }
+      XCTAssertTrue(path.hasSuffix(ProfileStore.defaultFastThinkFilename),
+                    "directoryError must point at fast-think.toml, got \(path)")
+    }
+  }
+
   // MARK: - speculation accessor (#426 Fast Think)
 
   func test_speculation_accessor_returns_profile_setting() throws {
