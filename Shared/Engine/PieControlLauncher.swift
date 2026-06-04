@@ -927,7 +927,9 @@ public actor LaunchedSession {
     }
 
     // Close pipe so any reader (awaitHandshake's task, if still
-    // running) sees EOF.
+    // running) sees EOF. Drop the post-handshake discard-drain handler
+    // first so no callback fires into a closing handle.
+    stdout.fileHandleForReading.readabilityHandler = nil
     try? stdout.fileHandleForReading.close()
 
     shmUnlinkQuiet(shmemName)
@@ -1028,10 +1030,22 @@ public actor LaunchedSession {
         }
       }
       cont.onTermination = { _ in
-        // Drop the handler so the kernel buffer drains naturally
-        // into close(); we don't want stale callbacks firing into
-        // a finished continuation.
-        fh.readabilityHandler = nil
+        // The handshake line-stream is done, but pie keeps writing to this
+        // merged stdout+stderr pipe under `--debug` for its WHOLE lifetime.
+        // Stopping the reader here (the old `= nil`) was a wedge: the pipe is
+        // NOT closed until `shutdown()`, so an undrained ~64 KiB kernel
+        // buffer fills on a long-running request — a multi-level
+        // tree-of-thought search emits a lot of tracing — and pie BLOCKS on
+        // write, stalling generation with no frames, no terminal, no error
+        // (the engine appears hung). Keep draining and DISCARD; the handler
+        // self-removes at EOF (shutdown() closes the pipe). This is exactly
+        // why launch() merges stderr into this pipe (see the comment there)
+        // — but the merge only helps if we keep reading.
+        fh.readabilityHandler = { handle in
+          if handle.availableData.isEmpty {
+            handle.readabilityHandler = nil
+          }
+        }
       }
     }
   }
