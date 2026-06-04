@@ -6,57 +6,21 @@
 
 **Private, local AI chat for macOS — powered by your own models.**
 
-RatioThink is a native macOS app that runs large language models entirely on your
-Mac through a bundled [Pie](https://github.com/pie-project/pie) inference engine. Chat
-offline, manage your models, and expose an OpenAI-compatible HTTP endpoint your own
-scripts can call — no account, no cloud, no data leaving the device.
-
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black)
 ![Version](https://img.shields.io/badge/version-v0.1.1-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 
-<br />
-
-<img src="docs/assets/chat.png" alt="RatioThink chat window streaming a reply from a locally-loaded model" width="840" />
-
 </div>
 
-> Screenshots show the actual app UI. Chat replies and the installed-model list are
-> illustrative — generated against a local test engine, not a real model.
+RatioThink is a native macOS app that runs open-weight language models entirely on your Mac
+through a bundled [Pie](https://github.com/pie-project/pie) inference engine — no account,
+no cloud, no data leaving the device.
 
-## What it is
-
-RatioThink wraps the Pie engine in a SwiftUI + AppKit app and a menu-bar helper that
-supervises the engine for you. You pick an open-weight model, load it, and chat — all
-on-device. The same engine is published locally on an OpenAI-compatible endpoint, so
-existing tooling (curl, the OpenAI SDKs, your own apps) can talk to it without changes.
-
-## Features
-
-- **Local chat** — Prompts and replies stream from a model running on your Mac. Nothing
-  is sent to a server you don't control.
-- **Model management** — Download curated GGUF models or import your own, and see size and
-  status at a glance.
-- **Engine status & loading** — A toolbar indicator shows when the engine is starting, a
-  model is loading (with progress), ready, or failed — and lets you unload to free RAM.
-- **OpenAI-compatible engine** — RatioThink's chat runs against a local OpenAI-style
-  `/v1/chat/completions` engine. A screen to expose it on a fixed port (with a bearer token
-  / CORS) for your own clients is in preview — see [Known issues](#known-issues).
-
-<div align="center">
-
-<img src="docs/assets/models.png" alt="Settings — Models tab listing installed GGUF models with size and status" width="720" />
-
-<sub><b>Model management</b> — download curated GGUF models or import your own.</sub>
-
-<br />
-
-<img src="docs/assets/endpoint.png" alt="API endpoint detail with the local OpenAI-compatible URL and a ready-to-copy curl example" width="820" />
-
-<sub><b>OpenAI-compatible API (preview)</b> — configure a local endpoint and copy the curl; live serving is coming.</sub>
-
-</div>
+**v0.1.1 is an early release**, focused on core functionality and bug fixes: local chat,
+basic model management (download or import GGUF models), and engine status while a model
+loads. See the [release notes](https://github.com/shsym/RatioThink/releases) for what's in
+this build.
 
 ## Install (DMG)
 
@@ -76,22 +40,6 @@ pass Gatekeeper with no extra steps:
 > ```bash
 > xattr -dr com.apple.quarantine /Applications/RatioThink.app
 > ```
-
-## Updating
-
-RatioThink does not auto-install updates yet, but it does **check** for them.
-
-- **On launch**, it makes one request to the public
-  [GitHub Releases](https://github.com/shsym/RatioThink/releases) API and, if a
-  newer release exists, shows a dismissable banner with **Download** (opens the
-  release page) and **Ignore this version** (that version stays hidden until a
-  newer one ships). It stays silent if you're up to date or offline.
-- **Anytime**, choose **RatioThink → Check for Updates…** to check on demand;
-  the menu command always checks and ignores any dismissed versions.
-
-Neither path downloads or installs anything automatically — they compare
-versions and link you to the release. (In-app auto-update via Sparkle is tracked
-as future work.)
 
 ## Build from source
 
@@ -167,12 +115,13 @@ A few known issues in the v0.1.1 release, with workarounds:
   progress can lag, and cancelling may not stop it as cleanly as expected — a partial
   download can be left behind. If one remains, remove it from the Models list;
   [a fix is in progress](https://github.com/shsym/RatioThink/pull/43).
-- **The local API endpoint is a preview.** You can configure an endpoint in the API
-  Endpoints screen, but it doesn't serve live requests yet — exposing a loaded model on a
-  fixed port is still being built. Use in-app chat in the meantime.
 - **The "Starting the engine…" prompt can rarely get stuck.** In an uncommon sequence — a
   model load waiting on the engine, then a model-list refresh failing — the prompt can stay
   on "Starting the engine…". Click **Cancel** and try again.
+- **A failed engine start can show a misleading reason.** If the engine crashes the instant
+  it launches, the failure can be reported as a timeout rather than a clear "couldn't start"
+  — the engine-error indicator still appears either way.
+  [Fixed in a later build](https://github.com/shsym/RatioThink/pull/36).
 - **A reply can lose its last words if saving fails.** If storage errors out exactly as a
   streamed answer finishes, the saved copy may drop its final chunk (you'll see an error).
   Re-generate the reply.
