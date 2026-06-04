@@ -1,18 +1,72 @@
+<div align="center">
+
+<img src="Resources/AppIcon/pie-icon-highres.png" alt="RatioThink" width="120" />
+
 # RatioThink
 
-A native macOS chat + local-server app for the [Pie](https://github.com/pie-project/pie)
-inference engine. Built with SwiftUI + AppKit. It ships a bundled Pie engine supervised by a
-menu-bar helper, and serves an OpenAI-compatible HTTP endpoint locally with a first-class
-APC-enabled chat inferlet.
+**Private, local AI chat for macOS — powered by your own models.**
+
+RatioThink is a native macOS app that runs large language models entirely on your
+Mac through a bundled [Pie](https://github.com/pie-project/pie) inference engine. Chat
+offline, manage your models, and expose an OpenAI-compatible HTTP endpoint your own
+scripts can call — no account, no cloud, no data leaving the device.
+
+![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
+![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black)
+![Version](https://img.shields.io/badge/version-v0.1.1-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-green)
+
+<br />
+
+<img src="docs/assets/chat.png" alt="RatioThink chat window streaming a reply from a locally-loaded model" width="840" />
+
+</div>
+
+> Screenshots show the actual app UI. Chat replies and the installed-model list are
+> illustrative — generated against a local test engine, not a real model.
+
+## What it is
+
+RatioThink wraps the Pie engine in a SwiftUI + AppKit app and a menu-bar helper that
+supervises the engine for you. You pick an open-weight model, load it, and chat — all
+on-device. The same engine is published locally on an OpenAI-compatible endpoint, so
+existing tooling (curl, the OpenAI SDKs, your own apps) can talk to it without changes.
+
+## Features
+
+- **Local chat** — Prompts and replies stream from a model running on your Mac. Nothing
+  is sent to a server you don't control.
+- **Model management** — Download curated GGUF models or import your own, and see size and
+  status at a glance.
+- **Engine status & loading** — A toolbar indicator shows when the engine is starting, a
+  model is loading (with progress), ready, or failed — and lets you unload to free RAM.
+- **OpenAI-compatible API** — Expose a loaded model as a local `…/v1/chat/completions`
+  endpoint with an optional bearer token, and point any OpenAI client at it.
+
+<div align="center">
+
+<img src="docs/assets/models.png" alt="Settings — Models tab listing installed GGUF models with size and status" width="720" />
+
+<sub><b>Model management</b> — download curated GGUF models or import your own.</sub>
+
+<br />
+
+<img src="docs/assets/endpoint.png" alt="API endpoint detail with the local OpenAI-compatible URL and a ready-to-copy curl example" width="820" />
+
+<sub><b>OpenAI-compatible API</b> — expose a loaded model on a local endpoint and copy the curl.</sub>
+
+</div>
 
 ## Install (DMG)
 
 Release DMGs are signed with a Developer ID and notarized by Apple, so they
 pass Gatekeeper with no extra steps:
 
-1. Download `RatioThink-arm64.dmg` (Apple Silicon) from Releases and open it.
+1. Download `RatioThink-arm64.dmg` (Apple Silicon) from
+   [Releases](https://github.com/shsym/RatioThink/releases) and open it.
 2. In the window that opens, drag **RatioThink.app** onto the **Applications** shortcut.
-3. Open **RatioThink** from Applications.
+3. Open **RatioThink** from Applications and follow the first-launch wizard to download a
+   starter model.
 
 > **Unsigned / development builds.** A DMG or app you build yourself
 > (`make dmg-arm64`) is *not* notarized, so Gatekeeper blocks it. For local
