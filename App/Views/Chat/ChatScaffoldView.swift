@@ -180,11 +180,24 @@ struct ChatScaffoldView: View {
       hasDownloadTarget: hasDownloadTarget)
   }
 
+  /// Profile ids offered by the toolbar switcher. Derived live from
+  /// `profileStore` (the source of truth — includes the seeded "Fast
+  /// Think" profile, #426) so every defined profile is selectable in
+  /// chat. `ProfileStore` publishes no `@Published` state, but it seeds +
+  /// scans synchronously in `start()` at app launch (before any chat
+  /// mounts), so `entries` is populated by first render; the body re-reads
+  /// it on each render. Falls back to the injected `availableProfiles`
+  /// only when the store has no parsed entries (previews / tests).
+  private var selectableProfileIDs: [String] {
+    let ids = profileStore.entries.compactMap { $0.profile?.id }
+    return ids.isEmpty ? availableProfiles : ids
+  }
+
   private func scaffold(for chat: Chat) -> some View {
     VStack(spacing: 0) {
       ContentToolbar(
         viewModel: viewModel,
-        availableProfiles: availableProfiles,
+        availableProfiles: selectableProfileIDs,
         // Reflect the models the engine ACTUALLY serves (from
         // `/v1/models`) rather than the static placeholder list — pie
         // serves only its single registered model and rejects a
@@ -374,7 +387,12 @@ struct ChatScaffoldView: View {
       options: ChatSendRequestOptions(
         modelID: modelID,
         sampling: viewModel.sampling,
-        systemPromptOverride: viewModel.systemPromptOverride
+        systemPromptOverride: viewModel.systemPromptOverride,
+        // Inject the selected profile's speculative-decoding settings
+        // (#426). For a "Fast Think" profile this makes `makeRequest`
+        // attach the `speculation` field and force greedy decoding; a
+        // normal profile has none, so the request is unchanged.
+        speculation: profileStore.speculation(forProfileID: viewModel.selectedProfileID)
       ),
       // `EngineStatusStore` conforms to `ChatRecoveryGate`; passing it
       // here lets the send pipeline classify a mid-stream
