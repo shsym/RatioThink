@@ -133,7 +133,12 @@ public struct ChatSampling: Codable, Equatable, Sendable {
   public let topP: Double
   public let maxTokens: Int
 
-  public init(temperature: Double = 0.7, topP: Double = 0.9, maxTokens: Int = 2048) {
+  // #434: default raised 2048 → 4096 so a reasoning model has room to
+  // think AND answer before hitting the cap. The honest truncation notice
+  // (`TurnNotice`) covers the residual; the composer's "Max tokens" slider
+  // (64…8192) lets a user push higher. Profile/serve-config defaults are a
+  // separate concern and stay at their own value.
+  public init(temperature: Double = 0.7, topP: Double = 0.9, maxTokens: Int = 4096) {
     self.temperature = temperature
     self.topP = topP
     self.maxTokens = maxTokens

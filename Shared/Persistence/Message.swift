@@ -76,3 +76,19 @@ public final class Message {
     self.meta = meta
   }
 }
+
+@available(macOS 14, *)
+public extension Message {
+  /// Engine `finish_reason` decoded from the opaque `meta` blob (the
+  /// `finish_reason` key written by `ChatSendController.finishMeta`), or
+  /// `nil` while a turn is still streaming and for plain non-streaming
+  /// inserts. Centralizes the decode so the renderer (`TurnNotice`) and the
+  /// send pipeline (`ChatSendController`) agree on one parse. (#434)
+  var finishReason: String? {
+    guard let meta,
+          let object = try? JSONSerialization.jsonObject(with: meta) as? [String: Any] else {
+      return nil
+    }
+    return object["finish_reason"] as? String
+  }
+}

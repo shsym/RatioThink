@@ -19,12 +19,24 @@ struct ChatMessageItem: Identifiable, Equatable {
   /// separate from `content`. Empty when the turn has no
   /// reasoning.
   var reasoning: String
+  /// Engine `finish_reason` for a completed turn (`"stop"`, `"length"`,
+  /// `"cancelled"`, …), or `nil` while the turn is still streaming. Lets
+  /// `MessageBubble` surface a truncated-before-answer turn instead of a
+  /// silent blank. (#434)
+  var finishReason: String?
 
-  init(id: UUID = UUID(), role: ChatMessage.Role, content: String, reasoning: String = "") {
+  init(id: UUID = UUID(), role: ChatMessage.Role, content: String, reasoning: String = "", finishReason: String? = nil) {
     self.id = id
     self.role = role
     self.content = content
     self.reasoning = reasoning
+    self.finishReason = finishReason
+  }
+
+  /// Honest terminal state for the turn — drives the truncation notice so
+  /// a reply that ran out of budget while thinking never renders blank.
+  var notice: TurnNotice {
+    TurnNotice.classify(content: content, reasoning: reasoning, finishReason: finishReason)
   }
 }
 
@@ -44,6 +56,6 @@ extension ChatMessageItem {
       chatMessageItemLog.warning("unknown role string, coercing to .system: \(message.role, privacy: .public)")
       role = .system
     }
-    self.init(id: message.id, role: role, content: message.content, reasoning: message.reasoning)
+    self.init(id: message.id, role: role, content: message.content, reasoning: message.reasoning, finishReason: message.finishReason)
   }
 }

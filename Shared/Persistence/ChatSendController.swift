@@ -388,15 +388,7 @@ public final class ChatSendController: ObservableObject {
   ) -> Bool {
     guard role == .assistant else { return false }
     if message.content.isEmpty { return true }
-    return finishReason(in: message.meta) == "cancelled"
-  }
-
-  private static func finishReason(in meta: Data?) -> String? {
-    guard let meta,
-          let object = try? JSONSerialization.jsonObject(with: meta) as? [String: Any] else {
-      return nil
-    }
-    return object["finish_reason"] as? String
+    return message.finishReason == "cancelled"
   }
 }
 

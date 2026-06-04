@@ -41,14 +41,22 @@ struct MessageBubble: View {
               answerStarted: !message.content.isEmpty
             )
           }
-          // Show the answer bubble once content arrives; when there's
-          // no reasoning at all, keep rendering it even while empty so
-          // the freshly-inserted streaming row still shows a placeholder
-          // bubble (preserves prior behavior).
-          if !message.content.isEmpty || message.reasoning.isEmpty {
+          // Always show whatever the turn produced. A partial answer
+          // (truncated mid-content) still renders its bubble; a freshly
+          // inserted streaming row with nothing yet keeps the immediate
+          // placeholder bubble. A FINISHED turn with no answer
+          // (`finishReason != nil`) skips the empty bubble and shows the
+          // notice below instead of a silent blank. (#434)
+          if !message.content.isEmpty
+            || (message.finishReason == nil && message.reasoning.isEmpty) {
             bubble(background: Color.secondary.opacity(0.15),
                    foreground: .primary,
                    alignment: .leading)
+          }
+          // Honest end-state: explain a missing/truncated answer rather
+          // than rendering nothing. (#434)
+          if let text = message.notice.message {
+            TurnNoticeRow(text: text, footnote: message.notice.isFootnote)
           }
         }
         Spacer(minLength: 60)
@@ -141,6 +149,31 @@ private struct ThinkingSection: View {
     }
     .frame(maxWidth: .infinity, alignment: .leading)
     .animation(.easeInOut(duration: 0.15), value: isExpanded)
+  }
+}
+
+// MARK: - truncation notice
+
+/// One-line honest end-state for an assistant turn that produced no answer
+/// (or a truncated one). Distinct from the answer bubble and the Thinking
+/// section: it explains WHY the reply is missing/short and points at the
+/// composer's "Max tokens" control. The footnote variant sits quietly under
+/// a partial answer; the stand-alone variant takes the place of a missing
+/// one. Copy lives in `TurnNotice.message`. (#434)
+private struct TurnNoticeRow: View {
+  let text: String
+  let footnote: Bool
+
+  var body: some View {
+    HStack(alignment: .firstTextBaseline, spacing: 5) {
+      Image(systemName: "exclamationmark.triangle")
+      Text(text)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+    .font(footnote ? .caption2 : .caption)
+    .foregroundStyle(.secondary)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .accessibilityElement(children: .combine)
   }
 }
 
