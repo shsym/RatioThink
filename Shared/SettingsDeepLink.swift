@@ -26,17 +26,14 @@ public enum SettingsDeepLink {
     URL(string: "\(scheme)://\(settingsHost)")!
   }
 
-  /// `true` when `url` is the open-Settings deep link.
-  ///
-  /// Scheme and host are matched case-insensitively (LaunchServices may
-  /// normalise either), and both the `ratiothink://settings` (host) and
-  /// the `ratiothink:settings` / `ratiothink:///settings` (path) spellings
-  /// route, so a producer typo or a LaunchServices reshaping still lands
-  /// on Settings rather than being dropped.
+  /// `true` when `url` is the canonical open-Settings deep link
+  /// `ratiothink://settings`. Scheme and host are matched case-insensitively
+  /// (both are case-insensitive per RFC 3986 and may be normalised by
+  /// LaunchServices). Only the authority (`scheme://host`) spelling is
+  /// accepted — that is the one and only form `settingsURL` produces, and
+  /// authority parsing is stable across Foundation versions, unlike the
+  /// no-authority `scheme:opaque` forms.
   public static func isSettings(_ url: URL) -> Bool {
-    guard url.scheme?.lowercased() == scheme else { return false }
-    if url.host?.lowercased() == settingsHost { return true }
-    let path = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-    return path.lowercased() == settingsHost
+    url.scheme?.lowercased() == scheme && url.host?.lowercased() == settingsHost
   }
 }

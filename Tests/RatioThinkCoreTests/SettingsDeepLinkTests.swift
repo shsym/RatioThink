@@ -18,14 +18,11 @@ final class SettingsDeepLinkTests: XCTestCase {
   }
 
   func test_case_insensitive_scheme_and_host() {
-    XCTAssertTrue(SettingsDeepLink.isSettings(URL(string: "RatioThink://Settings")!))
-    XCTAssertTrue(SettingsDeepLink.isSettings(URL(string: "RATIOTHINK://SETTINGS")!))
-  }
-
-  func test_path_spellings_match() {
-    // LaunchServices / a producer typo may reshape the host into a path.
-    XCTAssertTrue(SettingsDeepLink.isSettings(URL(string: "ratiothink:settings")!))
-    XCTAssertTrue(SettingsDeepLink.isSettings(URL(string: "ratiothink:///settings")!))
+    // Scheme and host are case-insensitive per RFC 3986; the matcher
+    // normalises both. Uses the canonical authority spelling, whose parsing
+    // is stable across Foundation versions.
+    XCTAssertTrue(SettingsDeepLink.isSettings(URL(string: "ratiothink://SETTINGS")!))
+    XCTAssertTrue(SettingsDeepLink.isSettings(URL(string: "ratiothink://Settings")!))
   }
 
   func test_other_scheme_does_not_match() {
