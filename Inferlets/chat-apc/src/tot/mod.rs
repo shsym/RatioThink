@@ -135,7 +135,7 @@ pub async fn dispatch(
 
     // `input.messages` wins over top-level chat-sugar (mirrors
     // dispatch_chat_apc).
-    let messages = match (input.messages.clone(), messages) {
+    let mut messages = match (input.messages.clone(), messages) {
         (Some(m), _) => m,
         (None, Some(m)) => m,
         (None, None) => {
@@ -171,6 +171,19 @@ pub async fn dispatch(
                 &format!("messages[{i}].content must be a non-empty, non-whitespace string"),
             ))
             .await;
+    }
+
+    // #413: suppress reasoning for the level-1 node generation. Qwen3-style
+    // reasoning models key thinking off the LAST user turn, so append the
+    // `/no_think` directive to it — otherwise each level-1 candidate drowns
+    // in `<think>` tokens, burning the whole `max_tokens_per_node` budget on
+    // reasoning and yielding no usable answer. The directive is an inert
+    // token on non-reasoning models. Deeper levels + scoring carry it via
+    // REFINE_INSTRUCTION/SCORE_PROMPT (best-effort there — see the caveat on
+    // REFINE_INSTRUCTION). This is a node-quality measure, not the stall fix:
+    // the operator's hang was an undrained engine pipe (see PieControlLauncher).
+    if let Some(last) = messages.iter_mut().rev().find(|m| m.role == "user") {
+        last.content.push_str(" /no_think");
     }
 
     let params = match schema::resolve(&input) {

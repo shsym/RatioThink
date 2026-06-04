@@ -33,13 +33,29 @@ use super::tree::{
 /// Built-in expansion instruction appended before forking at levels > 1.
 /// Level-1 children answer the conversation directly (sibling diversity
 /// comes from sampling temperature).
+///
+/// Trailing `/no_think`: reasoning models (Qwen3) key thinking off the LAST
+/// user turn, so each generated turn must carry the directive or the model
+/// drowns the candidate in `<think>` tokens — burning the whole
+/// `max_tokens_per_node` budget on reasoning, producing no usable answer
+/// (and often an unparseable score). A tree-of-thought node wants a CONCISE
+/// candidate, not a thinking trace; on non-reasoning models `/no_think` is
+/// an inert token. Best-effort only: small reasoning models (Qwen3-0.6B)
+/// honor it reliably at level 1 but stochastically ignore it at deeper
+/// levels, and the value scorer can then favor the longer think-trace
+/// candidate — making the selected answer a reasoning trace. A robust fix
+/// (reasoning-aware node scoring / display) is tracked as a follow-up; this
+/// is NOT what fixed the operator's hang (that was an undrained engine pipe
+/// — see PieControlLauncher). (See the scoring caveat in `super`.)
 const REFINE_INSTRUCTION: &str = "Critique your previous answer, then give a distinct, \
-     improved continuation toward correctly answering the original question. Be concise.";
+     improved continuation toward correctly answering the original question. Be concise. \
+     /no_think";
 
-/// Value-evaluator prompt (independent per-node scoring).
+/// Value-evaluator prompt (independent per-node scoring). `/no_think` so a
+/// reasoning model emits the bare integer instead of thinking past it.
 const SCORE_PROMPT: &str = "On a scale of 1 to 10, rate how promising the assistant's \
      latest answer is toward correctly and completely answering the original question. \
-     Respond with only a single integer from 1 to 10.";
+     Respond with only a single integer from 1 to 10. /no_think";
 
 /// Token budget for a scoring generation — just enough for an integer.
 const SCORE_MAX_TOKENS: usize = 16;
