@@ -236,6 +236,13 @@ private struct DownloadRow: View {
   let entry: ModelDownloadController.ActiveDownload
   let onCancel: () -> Void
 
+  /// #218: cancelling a download is a hard cancel (partial progress is
+  /// discarded, no resume), so the trailing "Cancel" arms an inline
+  /// confirm rather than firing immediately — matching the deliberate
+  /// inline-confirm pattern used by the model-load popover (#359), and
+  /// avoiding a system dialog (the app uses none).
+  @State private var confirmingCancel = false
+
   var body: some View {
     HStack(spacing: 10) {
       VStack(alignment: .leading, spacing: 2) {
@@ -249,11 +256,40 @@ private struct DownloadRow: View {
       Spacer()
       progressView
       if !entry.isTerminal {
-        Button("Cancel", action: onCancel)
-          .buttonStyle(.borderless)
+        cancelControl
       }
     }
     .padding(.vertical, 4)
+    // A download that reaches a terminal phase under the armed confirm
+    // (e.g. it completed first) shouldn't keep the prompt armed.
+    .onChange(of: entry.isTerminal) { _, terminal in
+      if terminal { confirmingCancel = false }
+    }
+  }
+
+  @ViewBuilder
+  private var cancelControl: some View {
+    if confirmingCancel {
+      HStack(spacing: 6) {
+        Text("Discard?")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        Button("Keep") { confirmingCancel = false }
+          .buttonStyle(.borderless)
+          .accessibilityIdentifier("DownloadRow-KeepDownloading")
+        Button("Discard", role: .destructive) {
+          confirmingCancel = false
+          onCancel()
+        }
+        .buttonStyle(.borderless)
+        .help("Stops the download and discards partial progress (no resume).")
+        .accessibilityIdentifier("DownloadRow-ConfirmCancel")
+      }
+    } else {
+      Button("Cancel") { confirmingCancel = true }
+        .buttonStyle(.borderless)
+        .accessibilityIdentifier("DownloadRow-Cancel")
+    }
   }
 
   @ViewBuilder
