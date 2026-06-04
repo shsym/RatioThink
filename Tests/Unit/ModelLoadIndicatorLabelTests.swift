@@ -87,4 +87,40 @@ final class ModelLoadIndicatorLabelTests: XCTestCase {
       "overflow frame is indeterminate, so the ellipsis must animate in step with the ring"
     )
   }
+
+  // MARK: - popover primary action (#218)
+
+  // The popover surfaces exactly one control per state. #218: the
+  // "Engine starting…" (`.engineNotReady`) state must offer "Stop Engine"
+  // (terminate the booting engine + clean slate via onUnload), NOT the
+  // old "Dismiss" that left the engine running. The rest of the mapping
+  // is pinned so a future state addition can't silently fall through.
+  func test_engineNotReady_primary_action_is_stopEngine() {
+    XCTAssertEqual(
+      ModelLoadPopover.primaryAction(for: .engineNotReady(modelID: "m", detail: "Engine stopped")),
+      .stopEngine)
+  }
+
+  func test_loading_primary_action_is_cancel() {
+    XCTAssertEqual(
+      ModelLoadPopover.primaryAction(for: .loading(modelID: "m", loadedBytes: 0, totalBytes: 0, etaSeconds: nil)),
+      .cancel)
+  }
+
+  func test_ready_primary_action_is_unload() {
+    XCTAssertEqual(ModelLoadPopover.primaryAction(for: .ready(modelID: "m")), .unload)
+  }
+
+  func test_failed_primary_action_is_dismiss() {
+    XCTAssertEqual(
+      ModelLoadPopover.primaryAction(for: .failed(modelID: "m", message: "boom")),
+      .dismiss)
+  }
+
+  func test_idle_and_cancelled_have_no_primary_action() {
+    XCTAssertEqual(ModelLoadPopover.primaryAction(for: .idle),
+                   ModelLoadPopover.PrimaryAction.none)
+    XCTAssertEqual(ModelLoadPopover.primaryAction(for: .cancelled(modelID: "m")),
+                   ModelLoadPopover.PrimaryAction.none)
+  }
 }

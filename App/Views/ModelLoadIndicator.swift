@@ -292,10 +292,41 @@ struct ModelLoadPopover: View {
     }
   }
 
+  /// The single control surfaced for a given load state. Pure mapping
+  /// (testable without the view) so the popover button can't drift from
+  /// intent — mirrors the `labelPrefix`/`labelAnimatesEllipsis` seams.
+  enum PrimaryAction: Equatable {
+    /// `.loading` — cancel the in-flight load (client-side stream only;
+    /// the engine keeps running).
+    case cancel
+    /// `.engineNotReady` (#218) — the slow "Engine starting…" the user
+    /// wants to abort IS the engine booting. Terminate it and reset to a
+    /// clean idle slate (`onUnload` = stopEngine + markUnloaded) so the
+    /// user can pick another model and Resume without stale state.
+    case stopEngine
+    /// `.ready` — free the resident model's RAM.
+    case unload
+    /// `.failed` — clear the error ring; the engine state is untouched.
+    case dismiss
+    /// `.idle`/`.cancelled` — no actionable control (indicator is hidden
+    /// in these states, so this is normally unreachable).
+    case none
+  }
+
+  static func primaryAction(for state: ModelLoadCenter.State) -> PrimaryAction {
+    switch state {
+    case .loading:          return .cancel
+    case .engineNotReady:   return .stopEngine
+    case .ready:            return .unload
+    case .failed:           return .dismiss
+    case .idle, .cancelled: return .none
+    }
+  }
+
   @ViewBuilder
   private var actionButton: some View {
-    switch center.state {
-    case .ready:
+    switch Self.primaryAction(for: center.state) {
+    case .unload:
       // : free the resident model's RAM. The next send re-enters
       // the no-model confirm gate.
       Button("Unload", role: .destructive) {
@@ -303,7 +334,18 @@ struct ModelLoadPopover: View {
         isPresented = false
       }
       .accessibilityIdentifier("modelLoad.popover.unload")
-    case .failed, .engineNotReady:
+    case .stopEngine:
+      // #218: terminate the booting engine. Reuses `onUnload`
+      // (stopEngine + markUnloaded) so the app-side state returns to a
+      // clean `.idle` — the user can then pick another model and Resume
+      // (Helper menu bar) with no stale "Engine starting…"/error ring.
+      // Click-outside still routes through the terminal-dismiss cleanup.
+      Button("Stop Engine", role: .destructive) {
+        onUnload()
+        isPresented = false
+      }
+      .accessibilityIdentifier("modelLoad.popover.stopEngine")
+    case .dismiss:
       Button("Dismiss") {
         // Review v2 F3: use the documented public API instead of the
         // test-only `_testOverrideState` seam — the seam internally
@@ -314,12 +356,14 @@ struct ModelLoadPopover: View {
       }
       .keyboardShortcut(.defaultAction)
       .accessibilityIdentifier("modelLoad.popover.dismiss")
-    default:
+    case .cancel:
       Button("Cancel", role: .destructive) {
         center.cancel()
         isPresented = false
       }
       .accessibilityIdentifier("modelLoad.popover.cancel")
+    case .none:
+      EmptyView()
     }
   }
 
