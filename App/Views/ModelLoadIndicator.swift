@@ -6,7 +6,7 @@ import SwiftUI
 /// pure `EngineIndicatorState` reducer.
 ///
 /// Render per state (design locked with the user):
-///   · `.offline`  → small grey filled dot, no inline text.
+///   · `.offline`  → small grey filled dot + quiet "Model not loaded" (#421).
 ///   · `.starting` → small amber filled dot, no inline text (tooltip detail).
 ///   · `.running`  → small green filled dot, no inline text.
 ///   · `.loading`  → progress ring (determinate `Circle().trim` / indeterminate
@@ -72,13 +72,13 @@ struct ModelLoadIndicator: View {
           // starting pip so a long start is visibly progressing, not
           // stuck. Driven by a view-local TimelineView off the store's
           // `startingSince`, so it never adds a per-second @Published
-          // churn source (the #327 popover-stability rule).
+          // churn source (the #327 popover-stability rule). #421: no
+          // width-cap frame here — the short label sizes to content so it
+          // sits snug against the dot, aligned with the neighbouring
+          // toolbar icons instead of right-pushed inside a reserved slot.
           StartingElapsedLabel(since: engineStatus.startingSince)
-            .frame(maxWidth: 200, alignment: .trailing)
         } else if let prefix = Self.pipLabel(for: state) {
           HStack(spacing: 0) {
-            // Cap width + middle-truncate so a long HF-style leaf can't
-            // render unbounded and crowd other toolbar items.
             Text(prefix)
               .monospacedDigit()
               .lineLimit(1)
@@ -89,7 +89,15 @@ struct ModelLoadIndicator: View {
           }
           .font(.callout)
           .foregroundStyle(Self.labelTint(for: state))
-          .frame(maxWidth: 200, alignment: .trailing)
+          // #421: cap + middle-truncate ONLY the loading label (a long
+          // HF-style leaf). The short bounded labels (`.offline` "Model
+          // not loaded", `.error` title) get no max-width frame so they
+          // size to content and hug the dot — the prior unconditional
+          // `maxWidth: 200, .trailing` reserved a fixed slot and
+          // right-pushed the text, which read as the detached "too much
+          // left margin" look.
+          .frame(maxWidth: Self.pipLabelNeedsWidthCap(for: state) ? CGFloat(200) : nil,
+                 alignment: .trailing)
         }
         indicatorShape(folded)
       }
@@ -196,8 +204,11 @@ struct ModelLoadIndicator: View {
   /// Inline pip label, or nil when the state should be a bare dot.
   /// Pure function of `EngineIndicatorState` so it is unit-testable
   /// without SwiftUI (`ModelLoadIndicatorLabelTests`):
-  ///   · `.offline` / `.running` / `.starting` → nil (quiet dot; the
-  ///     tooltip carries any detail).
+  ///   · `.offline` → "Model not loaded" (#421 — the one idle state that
+  ///     otherwise had no inline copy; a stopped engine = no resident model).
+  ///   · `.running` / `.starting` → nil (quiet dot; the running state stays
+  ///     silent, and `.starting` renders its own live "Starting… (Ns)"
+  ///     counter outside this helper. The tooltip carries any detail).
   ///   · `.loading(id, fraction)` → "Loading <leaf>… N%" (determinate)
   ///     or "Loading <leaf>" (indeterminate — the ellipsis is appended
   ///     separately as an animated view).
@@ -212,9 +223,22 @@ struct ModelLoadIndicator: View {
       return "Loading \(leaf)"
     case let .error(error):
       return error.title
-    case .offline, .starting, .running:
+    case .offline:
+      return "Model not loaded"
+    case .starting, .running:
       return nil
     }
+  }
+
+  /// Whether the inline label needs a width cap + middle truncation. Only
+  /// the LOADING label can be long (an HF-style `<repo>/<file>` leaf), so it
+  /// is bounded to keep it from crowding other toolbar items. The short
+  /// bounded labels (`.offline` "Model not loaded", `.error` title) return
+  /// false so they size to content and sit snug against the dot — the #421
+  /// spacing fix that removed the detached "too much left margin" look.
+  static func pipLabelNeedsWidthCap(for state: EngineIndicatorState) -> Bool {
+    if case .loading = state { return true }
+    return false
   }
 
   /// Whether the label animates a trailing ellipsis. Only the
