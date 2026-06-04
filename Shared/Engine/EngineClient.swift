@@ -146,6 +146,46 @@ public struct ChatSampling: Codable, Equatable, Sendable {
   }
 }
 
+/// Wire shape of the chat-apc `speculation` extension (#418). Unlike
+/// `ChatSampling` (flattened onto the top level), this rides as a nested
+/// `"speculation": {…}` object — matching the inferlet's `SpecRequest`
+/// schema. Snake-case keys; `nil` knobs are *omitted* so the inferlet
+/// applies its own defaults (leader 1 / draft 3). The request omits the
+/// whole object when there is no speculation (byte-identical normal
+/// decode); `ChatSendController.makeRequest` attaches it only for a
+/// profile whose speculation is enabled.
+public struct ChatSpeculation: Codable, Equatable, Sendable {
+  public let enabled: Bool
+  public let leaderLen: Int?
+  public let draftLen: Int?
+
+  public init(enabled: Bool, leaderLen: Int? = nil, draftLen: Int? = nil) {
+    self.enabled = enabled
+    self.leaderLen = leaderLen
+    self.draftLen = draftLen
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case enabled
+    case leaderLen = "leader_len"
+    case draftLen = "draft_len"
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var c = encoder.container(keyedBy: CodingKeys.self)
+    try c.encode(enabled, forKey: .enabled)
+    try c.encodeIfPresent(leaderLen, forKey: .leaderLen)
+    try c.encodeIfPresent(draftLen, forKey: .draftLen)
+  }
+
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    self.enabled = try c.decode(Bool.self, forKey: .enabled)
+    self.leaderLen = try c.decodeIfPresent(Int.self, forKey: .leaderLen)
+    self.draftLen = try c.decodeIfPresent(Int.self, forKey: .draftLen)
+  }
+}
+
 /// Body of POST /v1/chat/completions. `stream` is required on the wire
 /// (engine has different code paths for streaming vs non-streaming); we
 /// expose it but `EngineClient.chatCompletion` only models the streaming
@@ -165,20 +205,26 @@ public struct ChatRequest: Codable, Equatable, Sendable {
   public let messages: [ChatMessage]
   public let sampling: ChatSampling
   public let stream: Bool
+  /// Optional chat-apc speculation extension. `nil` → no `speculation`
+  /// key on the wire (normal decode). Nested-encoded (not flattened).
+  public let speculation: ChatSpeculation?
 
   public init(model: String,
               messages: [ChatMessage],
               sampling: ChatSampling = ChatSampling(),
-              stream: Bool = true) {
+              stream: Bool = true,
+              speculation: ChatSpeculation? = nil) {
     self.model = model
     self.messages = messages
     self.sampling = sampling
     self.stream = stream
+    self.speculation = speculation
   }
 
-  /// Flat wire keys. No `sampling` envelope — OpenAI's
+  /// Flat wire keys for sampling. No `sampling` envelope — OpenAI's
   /// /v1/chat/completions accepts `temperature` / `top_p` /
-  /// `max_tokens` at the top level. Any field added here must also
+  /// `max_tokens` at the top level. `speculation` is the one nested
+  /// object (chat-apc extension). Any field added here must also
   /// be touched in both `encode(to:)` and `init(from:)`.
   private enum CodingKeys: String, CodingKey {
     case model
@@ -187,6 +233,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     case temperature
     case topP = "top_p"
     case maxTokens = "max_tokens"
+    case speculation
   }
 
   public func encode(to encoder: Encoder) throws {
@@ -197,6 +244,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     try c.encode(sampling.temperature, forKey: .temperature)
     try c.encode(sampling.topP, forKey: .topP)
     try c.encode(sampling.maxTokens, forKey: .maxTokens)
+    try c.encodeIfPresent(speculation, forKey: .speculation)
   }
 
   public init(from decoder: Decoder) throws {
@@ -209,6 +257,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
       topP: try c.decode(Double.self, forKey: .topP),
       maxTokens: try c.decode(Int.self, forKey: .maxTokens)
     )
+    self.speculation = try c.decodeIfPresent(ChatSpeculation.self, forKey: .speculation)
   }
 }
 
