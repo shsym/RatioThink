@@ -35,12 +35,17 @@ import Foundation
 /// persisted `ToTTree` snapshot (`Message.tot`).
 public enum ToTNodeStatus: String, Codable, Equatable, Sendable {
   /// The synthetic conversation-prefix root (never appears on a
-  /// `node_complete` frame — generated nodes are `ok`/`error`).
+  /// `node_complete` frame — generated nodes are `ok`/`error`/`incomplete`).
   case root
-  /// A successfully generated, scored candidate.
+  /// A successfully generated, scored candidate (a non-empty answer).
   case ok
   /// Generation — or the fork/refine-flush preceding it — failed.
   case error
+  /// The node reasoned but produced no usable answer — it ran out of
+  /// reasoning budget mid-`<think>`, or closed the block with nothing after
+  /// it (#434). Its `reasoning` is preserved; like `error` it is kept out of
+  /// the beam and never selected.
+  case incomplete
 }
 
 /// One node as it arrives on a `node_complete` frame. Flat: no
@@ -54,6 +59,10 @@ public struct ToTNode: Decodable, Equatable, Sendable, Identifiable {
   public let depth: Int
   public let branchIndex: Int?
   public let content: String
+  /// The demuxed `<think>` reasoning trace (#413/#437). Omitted from the
+  /// wire when empty (non-reasoning model / `thinking:false`), so decode
+  /// defaults it to `""`.
+  public let reasoning: String
   public let score: Int?
   public let status: ToTNodeStatus
   public let error: String?
@@ -65,6 +74,7 @@ public struct ToTNode: Decodable, Equatable, Sendable, Identifiable {
     depth: Int,
     branchIndex: Int?,
     content: String,
+    reasoning: String = "",
     score: Int?,
     status: ToTNodeStatus,
     error: String? = nil,
@@ -75,6 +85,7 @@ public struct ToTNode: Decodable, Equatable, Sendable, Identifiable {
     self.depth = depth
     self.branchIndex = branchIndex
     self.content = content
+    self.reasoning = reasoning
     self.score = score
     self.status = status
     self.error = error
@@ -87,10 +98,27 @@ public struct ToTNode: Decodable, Equatable, Sendable, Identifiable {
     case depth
     case branchIndex = "branch_index"
     case content
+    case reasoning
     case score
     case status
     case error
     case scoreError = "score_error"
+  }
+
+  // `reasoning` is omitted from the wire when empty, so decode it tolerantly
+  // (default `""`); the rest mirror the synthesized decode.
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    self.id = try c.decode(String.self, forKey: .id)
+    self.parentID = try c.decodeIfPresent(String.self, forKey: .parentID)
+    self.depth = try c.decode(Int.self, forKey: .depth)
+    self.branchIndex = try c.decodeIfPresent(Int.self, forKey: .branchIndex)
+    self.content = try c.decode(String.self, forKey: .content)
+    self.reasoning = try c.decodeIfPresent(String.self, forKey: .reasoning) ?? ""
+    self.score = try c.decodeIfPresent(Int.self, forKey: .score)
+    self.status = try c.decode(ToTNodeStatus.self, forKey: .status)
+    self.error = try c.decodeIfPresent(String.self, forKey: .error)
+    self.scoreError = try c.decodeIfPresent(String.self, forKey: .scoreError)
   }
 }
 

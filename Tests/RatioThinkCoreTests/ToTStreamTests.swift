@@ -50,6 +50,40 @@ final class ToTStreamTests: XCTestCase {
     XCTAssertEqual(node2.scoreError, "score fork failed: boom")
   }
 
+  func test_decodes_node_complete_with_reasoning() throws {
+    // #413/#437: a thinking node carries its demuxed reasoning beside the
+    // (clean) answer.
+    let e = try decodeToTFrame(frame(
+      #"{"event":"node_complete","node":{"id":"tot-n3","parent_id":"root","depth":1,"branch_index":0,"content":"4","reasoning":"2+2 is 4 because…","score":8,"status":"ok"}}"#
+    ))
+    guard case let .nodeComplete(node) = e else { return XCTFail("want nodeComplete") }
+    XCTAssertEqual(node.reasoning, "2+2 is 4 because…")
+    XCTAssertEqual(node.content, "4")
+  }
+
+  func test_node_complete_without_reasoning_defaults_empty() throws {
+    // The wire omits `reasoning` when empty (non-reasoning model / thinking
+    // off); decode must default it rather than fail the frame.
+    let e = try decodeToTFrame(frame(
+      #"{"event":"node_complete","node":{"id":"tot-n3","parent_id":"root","depth":1,"branch_index":0,"content":"4","score":8,"status":"ok"}}"#
+    ))
+    guard case let .nodeComplete(node) = e else { return XCTFail("want nodeComplete") }
+    XCTAssertEqual(node.reasoning, "")
+  }
+
+  func test_decodes_incomplete_status_with_partial_reasoning() throws {
+    // #434: a reasoned-but-unanswered node streams as status "incomplete"
+    // with its partial reasoning and an empty answer.
+    let e = try decodeToTFrame(frame(
+      #"{"event":"node_complete","node":{"id":"tot-n7","parent_id":"tot-n1","depth":2,"branch_index":0,"content":"","reasoning":"I was still working through the cases","score":null,"status":"incomplete","error":"no answer"}}"#
+    ))
+    guard case let .nodeComplete(node) = e else { return XCTFail("want nodeComplete") }
+    XCTAssertEqual(node.status, .incomplete)
+    XCTAssertEqual(node.reasoning, "I was still working through the cases")
+    XCTAssertEqual(node.content, "")
+    XCTAssertEqual(node.error, "no answer")
+  }
+
   func test_decodes_level_pruned() throws {
     let e = try decodeToTFrame(frame(
       #"{"event":"level_pruned","level":1,"kept":["tot-n1","tot-n2"]}"#

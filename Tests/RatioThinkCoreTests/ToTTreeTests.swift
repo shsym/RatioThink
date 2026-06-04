@@ -8,10 +8,11 @@ final class ToTTreeTests: XCTestCase {
 
   private func node(
     _ id: String, parent: String, depth: Int, branch: Int,
-    content: String = "x", score: Int? = nil, status: ToTNodeStatus = .ok
+    content: String = "x", reasoning: String = "", score: Int? = nil,
+    status: ToTNodeStatus = .ok
   ) -> ToTNode {
     ToTNode(id: id, parentID: parent, depth: depth, branchIndex: branch,
-            content: content, score: score, status: status)
+            content: content, reasoning: reasoning, score: score, status: status)
   }
 
   func test_initial_state_is_idle() {
@@ -124,5 +125,47 @@ final class ToTTreeTests: XCTestCase {
     // Hierarchy: n1 → n5,n6 ; n2 childless (pruned).
     XCTAssertEqual(t.children(of: "tot-n1").map(\.id), ["tot-n5", "tot-n6"])
     XCTAssertTrue(t.children(of: "tot-n2").isEmpty)
+  }
+
+  func test_node_complete_carries_reasoning_into_tree() {
+    // #413/#437: the demuxed reasoning rides the node into the live tree.
+    var t = ToTTree()
+    t.apply(.nodeComplete(
+      node("tot-n1", parent: "root", depth: 1, branch: 0,
+           content: "the answer", reasoning: "first weigh A vs B")))
+    XCTAssertEqual(t.nodes.first?.reasoning, "first weigh A vs B")
+    XCTAssertEqual(t.nodes.first?.content, "the answer")
+  }
+
+  func test_incomplete_node_round_trips_through_persistence() throws {
+    var t = ToTTree()
+    t.apply(.treeStart(id: "tot-1", model: "qwen", breadth: 1, depth: 1, beamWidth: 1))
+    t.apply(.nodeComplete(
+      node("tot-n1", parent: "root", depth: 1, branch: 0,
+           content: "", reasoning: "still thinking…", status: .incomplete)))
+    let data = try JSONEncoder().encode(t)
+    let back = try JSONDecoder().decode(ToTTree.self, from: data)
+    XCTAssertEqual(back.nodes.first?.status, .incomplete)
+    XCTAssertEqual(back.nodes.first?.reasoning, "still thinking…")
+  }
+
+  func test_persisted_tree_missing_reasoning_key_decodes_with_empty() throws {
+    // A ToTTree persisted (Message.tot) before `reasoning` existed must still
+    // load — the renderer treats a decode failure as no tree, so a required
+    // new key would silently drop a reloaded search. Simulate the old shape
+    // by stripping the key from a real encoding.
+    var t = ToTTree()
+    t.apply(.nodeComplete(
+      node("tot-n1", parent: "root", depth: 1, branch: 0,
+           content: "4", reasoning: "legacy thought", score: 9)))
+    var json = String(decoding: try JSONEncoder().encode(t), as: UTF8.self)
+    // Drop `"reasoning":"legacy thought"` plus one adjacent comma, whichever
+    // side it sits on, so the remaining object is still valid JSON.
+    json = json.replacingOccurrences(of: #","reasoning":"legacy thought""#, with: "")
+    json = json.replacingOccurrences(of: #""reasoning":"legacy thought","#, with: "")
+    XCTAssertFalse(json.contains("reasoning"), "precondition: key removed")
+    let back = try JSONDecoder().decode(ToTTree.self, from: Data(json.utf8))
+    XCTAssertEqual(back.nodes.first?.reasoning, "")
+    XCTAssertEqual(back.nodes.first?.content, "4")
   }
 }

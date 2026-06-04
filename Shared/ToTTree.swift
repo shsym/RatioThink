@@ -50,6 +50,10 @@ public struct ToTTree: Equatable, Sendable, Codable {
     public let depth: Int
     public let branchIndex: Int?
     public var content: String
+    /// The node's demuxed `<think>` reasoning trace (#413/#437), separated
+    /// from `content` (the answer) by the engine. Empty for a non-reasoning
+    /// model or a `thinking:false` search.
+    public var reasoning: String
     public var score: Int?
     public var status: ToTNodeStatus
     public var error: String?
@@ -62,11 +66,36 @@ public struct ToTTree: Equatable, Sendable, Codable {
       self.depth = n.depth
       self.branchIndex = n.branchIndex
       self.content = n.content
+      self.reasoning = n.reasoning
       self.score = n.score
       self.status = n.status
       self.error = n.error
       self.scoreError = n.scoreError
       self.beam = beam
+    }
+
+    enum CodingKeys: String, CodingKey {
+      case id, parentID, depth, branchIndex, content, reasoning
+      case score, status, error, scoreError, beam
+    }
+
+    // Custom decode so a ToTTree persisted before `reasoning` existed still
+    // loads (the field defaults to empty) instead of failing the whole tree
+    // — the renderer treats a decode failure as no tree, so a required new
+    // key would silently drop a reloaded search. Encode stays synthesized.
+    public init(from decoder: Decoder) throws {
+      let c = try decoder.container(keyedBy: CodingKeys.self)
+      self.id = try c.decode(String.self, forKey: .id)
+      self.parentID = try c.decodeIfPresent(String.self, forKey: .parentID)
+      self.depth = try c.decode(Int.self, forKey: .depth)
+      self.branchIndex = try c.decodeIfPresent(Int.self, forKey: .branchIndex)
+      self.content = try c.decode(String.self, forKey: .content)
+      self.reasoning = try c.decodeIfPresent(String.self, forKey: .reasoning) ?? ""
+      self.score = try c.decodeIfPresent(Int.self, forKey: .score)
+      self.status = try c.decode(ToTNodeStatus.self, forKey: .status)
+      self.error = try c.decodeIfPresent(String.self, forKey: .error)
+      self.scoreError = try c.decodeIfPresent(String.self, forKey: .scoreError)
+      self.beam = try c.decode(BeamState.self, forKey: .beam)
     }
   }
 
