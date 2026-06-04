@@ -23,7 +23,10 @@ struct SettingsURLHandler: ViewModifier {
       Diag.app.event("deeplink.open", [("route", "settings")])
       // Bring the app forward first: a deep link that launches the app
       // from the background otherwise opens Settings behind other windows.
-      NSApp.activate(ignoringOtherApps: true)
+      // No-arg `activate()` is the non-deprecated macOS-14 API (and matches
+      // the Helper's convention); LaunchServices already foregrounds the app
+      // when it delivers the deep link, so dropping the argument is a no-op.
+      NSApp.activate()
       openSettings()
     }
   }
