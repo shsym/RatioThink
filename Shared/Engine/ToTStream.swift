@@ -15,8 +15,13 @@ import Foundation
 /// A `tree-of-thought` stream is exactly:
 ///
 ///   `treeStart` → (`nodeComplete`* then `levelPruned`) per level →
-///   one terminal `treeComplete` (success) | thrown `ToTStreamError`
-///   (the `error` frame) → end.
+///   one terminal `treeComplete` (an ok leaf was selected) | thrown
+///   `ToTStreamError` (the `error` frame — a total failure, no ok leaf;
+///   F1) → end.
+///
+/// A `treeComplete` whose `selectedNodeID` is nil is ALSO a total failure
+/// (the server emits the `error` frame for it now, but the consumer treats
+/// a null selection as failure defensively — `ChatSendController`).
 ///
 /// `nodeComplete` carries the **flat** node — the client assembles the
 /// hierarchy from `parentID`, exactly as the non-streaming server does.
@@ -103,7 +108,10 @@ public enum ToTEvent: Equatable, Sendable {
   /// A level's beam selection: the ids kept as the next frontier. Empty
   /// `kept` ⇒ the level produced no survivor and the search stopped.
   case levelPruned(level: Int, kept: [String])
-  /// Terminal success: the best leaf, or nil/nil when no ok leaf survived.
+  /// Terminal: the selected best leaf. A non-nil `selectedNodeID` is a
+  /// real answer; a nil `selectedNodeID` (and `finalAnswer`) is a TOTAL
+  /// failure, not an empty success — the server emits the `error` frame
+  /// for it now, and the consumer treats a null selection as failure (F1).
   case treeComplete(selectedNodeID: String?, finalAnswer: String?)
 }
 
@@ -116,6 +124,20 @@ public enum ToTStreamError: Error, Equatable, Sendable {
   /// A frame's JSON could not be decoded into a known shape. `payload`
   /// is the raw frame for diagnostics.
   case malformedFrame(payload: String)
+}
+
+extension ToTStreamError: LocalizedError {
+  /// Surface the engine's own message for a terminal `error` frame so the
+  /// failed-turn bubble reads as the engine's diagnostic, not the enum's
+  /// debug form (`ChatSendController` renders this via `formatError`).
+  public var errorDescription: String? {
+    switch self {
+    case let .stream(code, message):
+      return message.isEmpty ? "Engine stream error (\(code))" : message
+    case let .malformedFrame(payload):
+      return "Malformed tree-of-thought frame: \(payload)"
+    }
+  }
 }
 
 // MARK: - Decoding

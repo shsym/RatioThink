@@ -53,8 +53,12 @@
 //!
 //! `stream:true` returns an SSE stream that surfaces the search live —
 //! `tree_start`, then per level a `node_complete` for every generated node
-//! followed by a `level_pruned` beam selection, then a terminal
-//! `tree_complete` and `[DONE]`. The wire format + frame schema live in
+//! followed by a `level_pruned` beam selection, then ONE terminal:
+//! `tree_complete` when an ok leaf was selected, or `error` when none was
+//! (F1 — a null selection means every branch failed; see
+//! [`stream::is_total_failure`]). Non-streaming is symmetric: an ok-leaf
+//! search returns the 200 `TreeResponse`, a total failure returns the same
+//! JSON `error` envelope. The wire format + frame schema live in
 //! [`stream`]; the same [`search::run`] orchestration drives both the
 //! streamed and non-streamed responses (it just takes an optional
 //! [`Emitter`]), so the two can never diverge. Pre-stream failures
@@ -261,6 +265,17 @@ pub async fn dispatch(
 
     let outcome = search::run(root_ctx, &params, None).await;
 
+    // F1: a search that selected no ok leaf totally failed (every branch
+    // failed to generate — the beam keeps the best ok leaf whenever one
+    // exists). Surface it as an error envelope, symmetric with the
+    // streaming path's terminal `error` frame, rather than a 200
+    // success-shaped tree with null answer.
+    if stream::is_total_failure(&outcome.selected_node_id) {
+        return res
+            .respond(sse::json_error(500, stream::NO_ANSWER_CODE, stream::NO_ANSWER_MESSAGE))
+            .await;
+    }
+
     let response_body = tree::TreeResponse {
         id: tree_id,
         object: "tree_of_thought",
@@ -299,10 +314,14 @@ pub async fn dispatch(
 /// reached, exactly like `chat-apc`'s `handle_streaming`.
 ///
 /// Frame order: `tree_start` → (`node_complete`* `level_pruned`)\* per
-/// level (emitted inside [`search::run`]) → `tree_complete` → `[DONE]`.
-/// A client that disconnects before the first frame ends the stream
-/// immediately; mid-stream disconnects are swallowed by `run` and the
-/// terminal emits below (the search still completes, just unobserved).
+/// level (emitted inside [`search::run`]) → one terminal `tree_complete`
+/// (an ok leaf was selected) OR `error` (F1: no ok leaf — total failure)
+/// → `[DONE]`. The streamed `node_complete` frames carry the (error) tree
+/// regardless, so an `error` terminal still leaves the client a renderable
+/// tree plus a surfaced failure. A client that disconnects before the
+/// first frame ends the stream immediately; mid-stream disconnects are
+/// swallowed by `run` and the terminal emits below (the search still
+/// completes, just unobserved).
 async fn dispatch_streaming(
     root_ctx: inferlet::Context,
     params: &schema::TotParams,
@@ -318,12 +337,21 @@ async fn dispatch_streaming(
         return em.finish();
     }
     let outcome = search::run(root_ctx, params, Some(&mut em)).await;
-    let _ = stream::emit_tree_complete(
-        &mut em,
-        outcome.selected_node_id.as_deref(),
-        outcome.final_answer.as_deref(),
-    )
-    .await;
-    sse::emit_done_logged(&mut em, "tot_tree_complete").await;
+    if stream::is_total_failure(&outcome.selected_node_id) {
+        // F1: total failure — emit the documented terminal `error` frame
+        // (the client's catch marks the turn failed) instead of a
+        // success-shaped `tree_complete{null,null}`.
+        let _ = em
+            .emit_json(&sse::SseError::new(stream::NO_ANSWER_CODE, stream::NO_ANSWER_MESSAGE))
+            .await;
+    } else {
+        let _ = stream::emit_tree_complete(
+            &mut em,
+            outcome.selected_node_id.as_deref(),
+            outcome.final_answer.as_deref(),
+        )
+        .await;
+    }
+    sse::emit_done_logged(&mut em, "tot_terminal").await;
     em.finish()
 }

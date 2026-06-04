@@ -32,7 +32,14 @@
 //!
 //! Invariant (carried over from #407): every event identifies the node(s)
 //! it concerns by stable id, and the stream ends with exactly one terminal
-//! `tree_complete` (success) or `error` (failure) before `[DONE]`.
+//! `tree_complete` (success) or `error` (failure) before `[DONE]`. The
+//! terminal is the `error` frame precisely when the search selected no ok
+//! leaf — `select_beam`/`best_leaf` pick the best ok leaf whenever ANY ok
+//! node exists, so a null selection means every branch failed to generate
+//! (total failure). Surfacing that as `tree_complete{null,null}` would be
+//! a success-shaped frame for a total failure (a blank "successful" turn
+//! on the client); [`is_total_failure`] gates the terminal so the
+//! documented `error` frame fires instead (F1).
 //!
 //! `node_complete` carries the **flat** node (no nested `children`): the
 //! client assembles the tree from `parent_id` links exactly as the
@@ -190,6 +197,24 @@ pub async fn emit_tree_complete(
     .await
 }
 
+/// Whether a finished search totally failed: it selected no ok leaf. The
+/// beam (`select_beam`/`best_leaf`) keeps the best ok leaf whenever ANY ok
+/// node exists, so a `None` selection means every fork/refine/generation
+/// failed across every level — a total failure, never a legitimate empty
+/// answer. Both dispatch paths gate the terminal on this (F1): `true` ⇒
+/// emit the `error` frame (stream) / a JSON `error` envelope (non-stream)
+/// instead of the success-shaped `tree_complete`/`TreeResponse`.
+pub fn is_total_failure(selected_node_id: &Option<String>) -> bool {
+    selected_node_id.is_none()
+}
+
+/// Wire `code`/`message` for the no-ok-leaf terminal failure, shared by
+/// both dispatch paths so the streamed `error` frame and the non-stream
+/// error envelope carry identical text.
+pub const NO_ANSWER_CODE: &str = "no_answer";
+pub const NO_ANSWER_MESSAGE: &str =
+    "tree-of-thought search produced no answer: every branch failed to generate";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +345,15 @@ mod tests {
             v,
             json!({"event":"tree_complete","selected_node_id":"tot-n3","final_answer":"4"})
         );
+    }
+
+    #[test]
+    fn total_failure_iff_no_selected_leaf() {
+        // F1: a None selection is a total failure (the terminal must be the
+        // `error` frame, not a success-shaped tree_complete{null,null}); a
+        // Some selection is a real answer (tree_complete).
+        assert!(is_total_failure(&None));
+        assert!(!is_total_failure(&Some("tot-n3".to_string())));
     }
 
     #[test]

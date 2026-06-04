@@ -300,8 +300,23 @@ public final class ChatSendController: ObservableObject {
           // boundaries + the terminal frame, like MessageStreamWriter.
           assistant.tot = try? encoder.encode(tree)
           switch event {
-          case let .treeComplete(_, finalAnswer):
-            assistant.content = finalAnswer ?? ""
+          case let .treeComplete(selectedNodeID, finalAnswer):
+            if selectedNodeID == nil {
+              // F1: a null selection is a TOTAL failure — the beam selects
+              // the best ok leaf whenever one exists, so no selection means
+              // every branch failed to generate. The server now emits the
+              // terminal `error` frame for this (handled by the `catch`),
+              // but treat a null `treeComplete` as failure defensively so a
+              // total failure never persists as a blank SUCCESSFUL turn.
+              tree.fail(Self.totNoAnswerMessage)
+              assistant.tot = try? encoder.encode(tree)
+              if assistant.content.isEmpty {
+                assistant.content = "⚠️ \(Self.totNoAnswerMessage)"
+              }
+              Diag.app.event("chat.fail.tot", [("reason", "no_answer")])
+            } else {
+              assistant.content = finalAnswer ?? ""
+            }
             Self.persistTree(context, status: persistenceStatus)
             // Terminal: nil the active row so a later cancel() can't delete
             // an already-finished turn (mirrors `send`).
@@ -333,6 +348,11 @@ public final class ChatSendController: ObservableObject {
       }
     }
   }
+
+  /// User-facing copy for a no-ok-leaf tree-of-thought total failure (F1).
+  /// Kept close to the engine's `no_answer` message without coupling to its
+  /// exact wording.
+  static let totNoAnswerMessage = "Tree-of-thought search produced no answer (every branch failed)."
 
   private static func persistTree(_ context: ModelContext, status: PersistenceStatus) {
     do {
