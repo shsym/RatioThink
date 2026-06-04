@@ -208,15 +208,21 @@ public enum CuratedModelCatalog {
       huggingFaceFile: "Phi-3.5-mini-instruct-Q4_K_M.gguf",
       summary: "Reasoning-leaning Phi family build."
     ),
+    // Qwen2.5 7B Q4_K_M comes from bartowski's repo, NOT the official
+    // `Qwen/Qwen2.5-7B-Instruct-GGUF` — Qwen publishes this quant ONLY as
+    // split shards (`…-q4_k_m-00001-of-00002.gguf` + `-00002-…`), which
+    // pie cannot assemble (it loads a single .gguf via `gguf_init_from_file`).
+    // bartowski ships a verified monolithic `Q4_K_M` file. Do not "fix" this
+    // back to the official repo — `CuratedModelCatalogTests` fails if you do.
     CuratedModel(
       id: "qwen2.5-7b-instruct-q4_k_m",
       displayName: "Qwen2.5 7B Instruct",
       publisher: "Alibaba",
       parameterCountBillions: 7.0,
       quantization: "Q4_K_M",
-      approximateSizeBytes: 4_680_000_000,
-      huggingFaceRepo: "Qwen/Qwen2.5-7B-Instruct-GGUF",
-      huggingFaceFile: "qwen2.5-7b-instruct-q4_k_m.gguf",
+      approximateSizeBytes: 4_683_074_240,
+      huggingFaceRepo: "bartowski/Qwen2.5-7B-Instruct-GGUF",
+      huggingFaceFile: "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
       summary: "Bigger Qwen with broader general capability."
     ),
     CuratedModel(
