@@ -131,12 +131,54 @@ enum EngineHarness {
       }
     }
     let total = Date().timeIntervalSince(t0)
-    print(String(format: "chat-engine-harness: ToT stream ended after %.1fs; status=\(tree.status); nodes=\(tree.nodes.count); terminal=\(sawTerminal)", total))
-    if case .complete = tree.status, sawTerminal, tree.selectedNode != nil {
-      print("chat-engine-harness: ToT PASS — reached tree_complete with a selected answer")
+
+    // Per-node reasoning-aware accounting (#413/#434/#437).
+    func answered(_ n: ToTTree.Node) -> Bool {
+      !n.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+    let okNodes = tree.nodes.filter { $0.status == .ok }
+    let incompleteNodes = tree.nodes.filter { $0.status == .incomplete }
+    let withReasoning = tree.nodes.filter { !$0.reasoning.isEmpty }
+    let bothReasoningAndAnswer = okNodes.filter { !$0.reasoning.isEmpty && answered($0) }
+    // The demux contract: a node's ANSWER (content) must never carry the raw
+    // <think> delimiters — those belong to the reasoning channel (#437).
+    let tagSoup = tree.nodes.filter {
+      $0.content.contains("<think>") || $0.content.contains("</think>")
+    }
+    let expectReasoning = (env["PIE_TEST_TOT_EXPECT_REASONING"] ?? "1") == "1"
+
+    print(String(format: "chat-engine-harness: ToT stream ended after %.1fs; status=\(tree.status); nodes=\(tree.nodes.count) (ok=\(okNodes.count) incomplete=\(incompleteNodes.count)); withReasoning=\(withReasoning.count); terminal=\(sawTerminal)", total))
+    if let sel = tree.selectedNode {
+      print("chat-engine-harness: selected=\(sel.id) score=\(sel.score.map(String.init) ?? "nil") reasoningChars=\(sel.reasoning.count) answerChars=\(sel.content.count)")
+    }
+
+    // Failure modes must be handled honestly, not as a hang or tag-soup.
+    var failures: [String] = []
+    if !(tree.status == .complete && sawTerminal && tree.selectedNode != nil) {
+      failures.append("no tree_complete / no selected answer (status=\(tree.status))")
+    }
+    if !tagSoup.isEmpty {
+      failures.append("\(tagSoup.count) node(s) leak <think> tags into the ANSWER channel (demux broken)")
+    }
+    if let sel = tree.selectedNode, !answered(sel) {
+      failures.append("selected node has no usable answer")
+    }
+    if expectReasoning {
+      // Thinking is on: the demux must yield nodes that carry BOTH a
+      // reasoning trace AND a clean answer — that is the whole point.
+      if bothReasoningAndAnswer.isEmpty {
+        failures.append("no ok node carried BOTH reasoning AND an answer (reasoning demux not working)")
+      }
+      if let sel = tree.selectedNode, sel.reasoning.isEmpty {
+        failures.append("selected node carries no reasoning (expected thinking on)")
+      }
+    }
+
+    if failures.isEmpty {
+      print("chat-engine-harness: ToT PASS — tree_complete; each node demuxed into reasoning + a clean answer; \(incompleteNodes.count) incomplete node(s) surfaced honestly")
       return true
     }
-    print("chat-engine-harness: ToT FAIL — no tree_complete / no selected answer (status=\(tree.status))")
+    for f in failures { print("chat-engine-harness: ToT FAIL — \(f)") }
     return false
   }
 
