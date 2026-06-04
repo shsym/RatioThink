@@ -91,6 +91,23 @@ struct ChatScaffoldView: View {
     }
   }
 
+  /// #218 F3: "Stop Engine" on the `.engineNotReady` boot indicator.
+  /// Terminates the booting engine but — unlike `unloadModel` —
+  /// deliberately does NOT call `markUnloaded()` (= `ModelLoadCenter.cancel()`).
+  /// `cancel()` is async + epoch-unguarded and would silently kill a load
+  /// the user starts in the "stop → pick another model" window. The
+  /// app-side `.engineNotReady` → `.idle` reset is handled epoch-safely by
+  /// the popover-close `dismissTerminalState()` (see ModelLoadIndicator).
+  private func terminateEngine() {
+    Task { @MainActor in
+      do {
+        try await engineStatusStore.stopEngine()
+      } catch {
+        persistenceStatus.report(error, context: "ChatScaffoldView.terminateEngine")
+      }
+    }
+  }
+
   private func scaffold(for chat: Chat) -> some View {
     VStack(spacing: 0) {
       ContentToolbar(
@@ -106,7 +123,8 @@ struct ChatScaffoldView: View {
         availableModels: engineModels.resolved(fallback: availableModels),
         swapCoordinator: swapCoordinator,
         modelLoadCenter: modelLoadCenter,
-        onUnload: unloadModel
+        onUnload: unloadModel,
+        onStopEngine: terminateEngine
       )
       Divider().opacity(0.0001) // structural breather; no visible line per §5
       TranscriptView(chat: chat)

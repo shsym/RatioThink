@@ -23,6 +23,9 @@ struct ModelLoadIndicator: View {
   /// : invoked from the `.ready` popover's Unload button. Wired in
   /// `RootView` to stop the engine (free RAM) then `markUnloaded()`.
   var onUnload: () -> Void = {}
+  /// #218 F3: invoked from the `.engineNotReady` popover's "Stop Engine"
+  /// button. Stop-only (no `markUnloaded`) — see `ModelLoadPopover.onStopEngine`.
+  var onStopEngine: () -> Void = {}
 
   @State private var showPopover = false
 
@@ -71,7 +74,7 @@ struct ModelLoadIndicator: View {
     .accessibilityIdentifier("toolbar.modelLoadIndicator")
     .accessibilityLabel(accessibilityLabelText)
     .popover(isPresented: $showPopover, arrowEdge: .bottom) {
-      ModelLoadPopover(center: center, isPresented: $showPopover, onUnload: onUnload)
+      ModelLoadPopover(center: center, isPresented: $showPopover, onUnload: onUnload, onStopEngine: onStopEngine)
     }
     // Review v1 F11: a popover opened during load A must close when
     // the surface goes invisible between load A and load B, otherwise
@@ -256,6 +259,15 @@ struct ModelLoadPopover: View {
   @ObservedObject var center: ModelLoadCenter
   @Binding var isPresented: Bool
   var onUnload: () -> Void = {}
+  /// #218 F3: stop-only action for the `.engineNotReady` "Stop Engine"
+  /// path. Calls ONLY `stopEngine()` — NOT the RAM-freeing `onUnload`
+  /// (= `markUnloaded()` → `cancel()`), whose async, epoch-unguarded
+  /// `cancel()` could land in the post-stop window and silently kill a
+  /// load the user just started. The app-side `.engineNotReady` → `.idle`
+  /// reset is handled epoch-safely by the popover-close
+  /// `dismissTerminalState()` (see `ModelLoadIndicator`), mirroring the
+  /// Dismiss path's race avoidance.
+  var onStopEngine: () -> Void = {}
 
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
@@ -300,9 +312,10 @@ struct ModelLoadPopover: View {
     /// the engine keeps running).
     case cancel
     /// `.engineNotReady` (#218) — the slow "Engine starting…" the user
-    /// wants to abort IS the engine booting. Terminate it and reset to a
-    /// clean idle slate (`onUnload` = stopEngine + markUnloaded) so the
-    /// user can pick another model and Resume without stale state.
+    /// wants to abort IS the engine booting. Terminate it (stop-only,
+    /// via `onStopEngine`) and let the popover-close `dismissTerminalState()`
+    /// reset to a clean idle slate so the user can pick another model and
+    /// Resume without stale state.
     case stopEngine
     /// `.ready` — free the resident model's RAM.
     case unload
@@ -335,13 +348,16 @@ struct ModelLoadPopover: View {
       }
       .accessibilityIdentifier("modelLoad.popover.unload")
     case .stopEngine:
-      // #218: terminate the booting engine. Reuses `onUnload`
-      // (stopEngine + markUnloaded) so the app-side state returns to a
-      // clean `.idle` — the user can then pick another model and Resume
-      // (Helper menu bar) with no stale "Engine starting…"/error ring.
-      // Click-outside still routes through the terminal-dismiss cleanup.
+      // #218 (F3): terminate the booting engine via the STOP-ONLY action
+      // — not `onUnload`. `onUnload` = `markUnloaded()` → `cancel()`,
+      // which runs asynchronously after the stopEngine XPC round-trip and
+      // is epoch-unguarded, so it could cancel a load the user started in
+      // the "stop → pick another model" window. Setting `isPresented =
+      // false` routes the app-side `.engineNotReady` → `.idle` reset
+      // through the popover-close `dismissTerminalState()` (epoch-safe;
+      // does not touch the load task), mirroring the Dismiss path.
       Button("Stop Engine", role: .destructive) {
-        onUnload()
+        onStopEngine()
         isPresented = false
       }
       .accessibilityIdentifier("modelLoad.popover.stopEngine")

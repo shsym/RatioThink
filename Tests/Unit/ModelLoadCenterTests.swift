@@ -35,6 +35,54 @@ final class ModelLoadCenterTests: XCTestCase {
     XCTAssertFalse(center.isLoading)
   }
 
+  // MARK: - #218 F3: Stop Engine must not kill a racing new load
+
+  /// #218 F3 (the fix). "Stop Engine" on `.engineNotReady` runs a
+  /// STOP-ONLY action (`terminateEngine` → engine XPC, no center
+  /// mutation); the app-side `.engineNotReady` → `.idle` reset is routed
+  /// through the popover-close `dismissTerminalState()`, NOT
+  /// `markUnloaded()`. `dismissTerminalState()` is epoch-safe — a no-op
+  /// on a non-terminal `.loading` — so a load the user starts in the
+  /// "stop → pick another model" window survives.
+  func test_stopEngine_reset_via_dismissTerminalState_preserves_a_racing_new_load() {
+    let center = ModelLoadCenter()
+    center._testOverrideState(.engineNotReady(modelID: "old", detail: "Engine stopped"))
+    // User taps Stop Engine, then immediately starts a new load before
+    // the popover-close reset lands.
+    center.load(modelID: "new") {
+      AsyncThrowingStream { _ in /* holds .loading(new) */ }
+    }
+    guard case .loading(let id, _, _, _) = center.state, id == "new" else {
+      return XCTFail("precondition: new load should be .loading(new); got \(center.state)")
+    }
+    center.dismissTerminalState()  // the Stop Engine reset path
+    XCTAssertEqual(
+      center.state,
+      .loading(modelID: "new", loadedBytes: 0, totalBytes: 0, etaSeconds: nil),
+      "Stop Engine's dismissTerminalState reset must not kill a racing new load")
+    XCTAssertTrue(center.isLoading)
+  }
+
+  /// #218 F3 (the hazard the fix avoids). `markUnloaded()` — the original
+  /// Stop Engine wiring — calls `cancel()`, which is epoch-unguarded and
+  /// WOULD demote a load started in the post-stop window to `.idle`. Pins
+  /// WHY the `.engineNotReady` path must use the stop-only action, not
+  /// `onUnload`; a future re-route back to `markUnloaded` fails here.
+  func test_markUnloaded_kills_a_racing_new_load_documenting_why_stopEngine_avoids_it() {
+    let center = ModelLoadCenter()
+    center._testOverrideState(.engineNotReady(modelID: "old", detail: "Engine stopped"))
+    center.load(modelID: "new") {
+      AsyncThrowingStream { _ in }
+    }
+    guard case .loading(let id, _, _, _) = center.state, id == "new" else {
+      return XCTFail("precondition: .loading(new); got \(center.state)")
+    }
+    center.markUnloaded()
+    XCTAssertEqual(center.state, .idle,
+                   "markUnloaded cancels the racing load (the F3 hazard) — Stop Engine must not call it")
+    XCTAssertFalse(center.isLoading)
+  }
+
   // MARK: - helpers
 
   private func streamFactory(events: [LoadEvent]) -> @Sendable () -> AsyncThrowingStream<LoadEvent, Error> {

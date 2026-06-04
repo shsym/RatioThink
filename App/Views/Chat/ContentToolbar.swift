@@ -39,6 +39,11 @@ struct ContentToolbar: View {
   let modelLoadCenter: ModelLoadCenter?
   /// Forwarded to the indicator's `.ready` popover Unload action.
   let onUnload: () -> Void
+  /// Forwarded to the indicator's `.engineNotReady` popover "Stop Engine"
+  /// action — stop-only (no `markUnloaded`), see #218 F3. Required (no
+  /// default) so a missed wiring is a compile error, not a silent no-op
+  /// terminate (same rationale as `onUnload`).
+  let onStopEngine: () -> Void
 
   @State private var showParamsPopover = false
   @State private var showSystemPopover = false
@@ -49,7 +54,8 @@ struct ContentToolbar: View {
     availableModels: [String] = ChatTranscriptViewModel.placeholderModels,
     swapCoordinator: ProfileSwapCoordinator,
     modelLoadCenter: ModelLoadCenter?,
-    onUnload: @escaping () -> Void
+    onUnload: @escaping () -> Void,
+    onStopEngine: @escaping () -> Void
   ) {
     self.viewModel = viewModel
     self.availableProfiles = availableProfiles
@@ -57,6 +63,7 @@ struct ContentToolbar: View {
     self.swapCoordinator = swapCoordinator
     self.modelLoadCenter = modelLoadCenter
     self.onUnload = onUnload
+    self.onStopEngine = onStopEngine
   }
 
   var body: some View {
@@ -86,7 +93,7 @@ struct ContentToolbar: View {
       // (not the window NSToolbar) so its popover presents reliably; its
       // own `.opacity(0)` when idle keeps the slot from flashing empty.
       if let modelLoadCenter {
-        ModelLoadIndicator(center: modelLoadCenter, onUnload: onUnload)
+        ModelLoadIndicator(center: modelLoadCenter, onUnload: onUnload, onStopEngine: onStopEngine)
       }
     }
     .padding(.horizontal, 16)

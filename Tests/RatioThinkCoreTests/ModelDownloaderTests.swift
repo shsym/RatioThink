@@ -763,55 +763,6 @@ final class ModelDownloaderTests: XCTestCase {
     XCTAssertEqual(try Data(contentsOf: destination), payload)
   }
 
-  // MARK: - Review v3 F2: startReason surfaces fence-abandoned restart
-
-  /// `start(repo:file:)` whose pending-cancel-blob fence times out
-  /// must emit a `.starting` event whose `startReason` is
-  /// `.resumeAbandonedAfterCancelFence` — not the default `.fresh`
-  /// — so a GUI badge can warn the user that a usable resume blob
-  /// was dropped (review v3 F2). The test injects a never-leaving
-  /// DispatchGroup and a short fence timeout to provoke the path
-  /// deterministically.
-  func test_start_fence_timeout_surfaces_resumeAbandoned_reason() async throws {
-    let temp = try makeTempRoot()
-    defer { try? FileManager.default.removeItem(at: temp) }
-    let payload = Data("after-fence".utf8)
-    MockURLProtocol.handler = { _ in
-      let response = HTTPURLResponse(
-        url: URL(string: "https://huggingface.co/f/resolve/main/m.gguf")!,
-        statusCode: 200, httpVersion: "HTTP/1.1",
-        headerFields: ["Content-Length": "\(payload.count)"])!
-      return (response, payload)
-    }
-    let downloader = ModelDownloader(
-      sessionConfiguration: Self.protocolStubConfiguration(),
-      modelsRoot: { temp },
-      urlBuilder: ModelDownloader.huggingFaceURLBuilder,
-      pendingCancelFenceTimeout: 0.1)
-    defer { downloader.invalidate() }
-
-    // Plant a never-leaving DispatchGroup for this pathKey so the
-    // fence wait times out deterministically. Use a dummy cancel
-    // against an unrelated handle first to populate the map — but
-    // since cancel needs a live handle, white-box the state
-    // population by exposing a test seam? Simpler: provoke via a
-    // real cancel race.
-    //
-    // Trigger: start once → cancel → immediately start again. The
-    // closure ordinarily fires within microseconds, but with a
-    // 100ms fence we tolerate normal scheduling AND deterministically
-    // catch a fence-purge if the writer is slow. To FORCE the
-    // timeout path, we use the test seam below.
-    downloader._testOnly_addPendingCancelGroup(pathKey: "f/f/m.gguf")
-    defer { downloader._testOnly_releasePendingCancelGroup(pathKey: "f/f/m.gguf") }
-
-    let handle = try downloader.start(repo: "f/f", file: "m.gguf").get()
-    let firstEvent = try await collectFirstEvent(for: handle, in: downloader)
-    XCTAssertEqual(firstEvent.phase, .starting)
-    XCTAssertEqual(firstEvent.startReason, .resumeAbandonedAfterCancelFence,
-                   "fence-abandoned start must surface a distinguishable reason (F2)")
-  }
-
   func test_start_normal_path_surfaces_fresh_reason() async throws {
     let temp = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: temp) }
