@@ -66,6 +66,19 @@ enum EngineHarness {
 
     do {
       try await loadModel(loadTarget, baseURL: baseURL)
+      // ToT app-path E2E mode (#413 stall repro / regression): when
+      // PIE_TEST_TOT_QUESTION is set, drive a real tree-of-thought search
+      // through the SAME Swift path the app uses — HTTPEngineClient
+      // .dispatchInferlet -> toTEventStream -> ToTTree — and assert it
+      // reaches a `tree_complete` terminal. This is the coverage the wire
+      // probe (Python, bypasses Swift) and the TCC-blocked GUI tests both
+      // missed. Exits non-zero if the stream stalls / ends without a
+      // terminal.
+      if let question = env["PIE_TEST_TOT_QUESTION"], !question.isEmpty {
+        let ok = try await runTreeOfThought(question: question, baseURL: baseURL, env: env)
+        await session.shutdown()
+        exit(ok ? 0 : 1)
+      }
       try baseURL.absoluteString.write(to: urlFile, atomically: true, encoding: .utf8)
       print("chat-engine-harness: wrote \(urlFile.path)")
       await waitForSIGTERM()
@@ -75,6 +88,56 @@ enum EngineHarness {
       await session.shutdown()
       throw error
     }
+  }
+
+  /// Drive a real ToT search through the App's Swift path and report
+  /// per-event timing + the terminal. Returns true iff a `tree_complete`
+  /// arrived (the live tree would reach a final answer in the UI).
+  private static func runTreeOfThought(
+    question: String, baseURL: URL, env: [String: String]
+  ) async throws -> Bool {
+    func intEnv(_ key: String, _ fallback: Int) -> Int { env[key].flatMap { Int($0) } ?? fallback }
+    let breadth = intEnv("PIE_TEST_TOT_BREADTH", 3)
+    let depth = intEnv("PIE_TEST_TOT_DEPTH", 2)
+    let beam = intEnv("PIE_TEST_TOT_BEAM", 2)
+    let maxTok = intEnv("PIE_TEST_TOT_MAXTOK", 256)
+    let input: [String: Any] = [
+      "messages": [["role": "user", "content": question]],
+      "breadth": breadth, "depth": depth, "beam_width": beam,
+      "max_tokens_per_node": maxTok, "temperature": 0.7, "top_p": 0.9,
+    ]
+    let inputData = try JSONSerialization.data(withJSONObject: input)
+    let req = InferletRequest(inferlet: "tree-of-thought", input: inputData, messages: nil, stream: true)
+    let client = HTTPEngineClient(baseURL: baseURL)
+
+    print("chat-engine-harness: ToT drive b\(breadth)/d\(depth)/beam\(beam)/max\(maxTok) q=\(question.debugDescription)")
+    var tree = ToTTree()
+    let t0 = Date()
+    var sawTerminal = false
+    for try await event in toTEventStream(from: client.dispatchInferlet(req)) {
+      tree.apply(event)
+      let dt = Date().timeIntervalSince(t0)
+      switch event {
+      case let .treeStart(id, model, b, d, w):
+        print(String(format: "  +%6.1fs tree_start id=\(id) model=\(model) b\(b)/d\(d)/beam\(w)", dt))
+      case let .nodeComplete(node):
+        let head = node.content.prefix(40).replacingOccurrences(of: "\n", with: "\\n")
+        print(String(format: "  +%6.1fs node_complete depth=\(node.depth) status=\(node.status) score=\(node.score.map(String.init) ?? "nil") len=\(node.content.count) head=\(head.debugDescription)", dt))
+      case let .levelPruned(level, kept):
+        print(String(format: "  +%6.1fs level_pruned level=\(level) kept=\(kept)", dt))
+      case let .treeComplete(sel, ans):
+        sawTerminal = true
+        print(String(format: "  +%6.1fs tree_complete selected=\(sel ?? "nil") answer_len=\(ans?.count ?? 0)", dt))
+      }
+    }
+    let total = Date().timeIntervalSince(t0)
+    print(String(format: "chat-engine-harness: ToT stream ended after %.1fs; status=\(tree.status); nodes=\(tree.nodes.count); terminal=\(sawTerminal)", total))
+    if case .complete = tree.status, sawTerminal, tree.selectedNode != nil {
+      print("chat-engine-harness: ToT PASS — reached tree_complete with a selected answer")
+      return true
+    }
+    print("chat-engine-harness: ToT FAIL — no tree_complete / no selected answer (status=\(tree.status))")
+    return false
   }
 
   private static func loadModel(_ model: String, baseURL: URL) async throws {

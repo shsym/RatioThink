@@ -64,7 +64,7 @@ endef
         test-unit test-scenario test-smoke test-install-guards test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
-        test-e2e-engine test-e2e-models test-e2e-load test-e2e-chat test-e2e-full test-helper-respawn \
+        test-e2e-engine test-e2e-models test-e2e-load test-e2e-chat test-e2e-tot test-e2e-full test-helper-respawn \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
         build-inferlets stamp-inferlets verify-inferlets verify-inferlets-inputs \
@@ -325,6 +325,9 @@ test-e2e-396: ## E2E area: #396 failed-load Retry recovery + Dismiss-clears (S39
 
 test-e2e-chat: ## E2E area: real small-model chat send streams + persists (S258, real Qwen3-0.6B)
 	Scripts/run-chat-gui-e2e.sh
+
+test-e2e-tot: ## E2E area: real-engine tree-of-thought APP path completes (#413 stall guard; depth>1, real Qwen3-0.6B-GGUF)
+	Scripts/run-tot-e2e.sh
 
 test-e2e-full: ## E2E area: 3-layer real-model proof — GUI download → engine boot → chat persist (S204)
 	Scripts/run-full-e2e.sh
