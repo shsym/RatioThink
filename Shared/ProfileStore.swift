@@ -598,6 +598,16 @@ public final class ProfileStore: ObservableObject {
     }
   }
 
+  /// The full parsed `Profile` for `id`, or nil when the id is absent or
+  /// its file failed to parse. The chat send path reads this to detect a
+  /// tree-of-thought profile (`Profile.treeOfThought`) and route the turn
+  /// to the ToT dispatch (#413); ordinary callers want `model(forProfileID:)`.
+  public func profile(forProfileID id: String) -> Profile? {
+    stateLock.withLock {
+      _entries.first { $0.profile?.id == id }?.profile
+    }
+  }
+
   /// Persist a new default `model` onto the profile with `id`, leaving
   /// every other field untouched. Writes back to the profile's own
   /// on-disk file (not an assumed `<id>.toml`) and force-reloads so the

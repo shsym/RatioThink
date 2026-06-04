@@ -26,7 +26,9 @@ import Foundation
 /// Lifecycle of a streamed tree node — byte-identical to the server's
 /// `NodeStatus` wire strings. Closed set: a drift would be a wire-format
 /// change and should surface as a decode failure, not silently coerce.
-public enum ToTNodeStatus: String, Decodable, Equatable, Sendable {
+/// `Codable` (not just `Decodable`) so it round-trips through the
+/// persisted `ToTTree` snapshot (`Message.tot`).
+public enum ToTNodeStatus: String, Codable, Equatable, Sendable {
   /// The synthetic conversation-prefix root (never appears on a
   /// `node_complete` frame — generated nodes are `ok`/`error`).
   case root

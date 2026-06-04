@@ -13,10 +13,16 @@ import Foundation
 /// non-streaming server does from `parent_id`. The synthetic `"root"`
 /// prefix is never streamed, so the visible roots are the depth-1 nodes
 /// ([`rootChildren`]).
-public struct ToTTree: Equatable, Sendable {
+///
+/// `Codable` so a completed search persists into `Message.tot` and a
+/// reloaded transcript re-renders the tree (beam highlighting included).
+/// The on-disk shape is an app-internal store format, not a wire contract;
+/// the renderer tolerates a decode failure (treats it as no tree).
+public struct ToTTree: Equatable, Sendable, Codable {
 
-  /// Where a node sits relative to its level's beam selection.
-  public enum BeamState: Equatable, Sendable {
+  /// Where a node sits relative to its level's beam selection. `String`
+  /// raw value so it round-trips stably through the persisted snapshot.
+  public enum BeamState: String, Equatable, Sendable, Codable {
     /// Its level has not been pruned yet (still streaming / scoring).
     case pending
     /// Kept by the beam — survived as the next frontier.
@@ -26,7 +32,7 @@ public struct ToTTree: Equatable, Sendable {
   }
 
   /// Overall search lifecycle, mirroring the stream's terminal contract.
-  public enum Status: Equatable, Sendable {
+  public enum Status: Equatable, Sendable, Codable {
     /// No `tree_start` yet.
     case idle
     /// `tree_start` seen; nodes/levels streaming.
@@ -38,7 +44,7 @@ public struct ToTTree: Equatable, Sendable {
   }
 
   /// One node in the live tree: the wire node plus its beam state.
-  public struct Node: Equatable, Sendable, Identifiable {
+  public struct Node: Equatable, Sendable, Identifiable, Codable {
     public let id: String
     public let parentID: String?
     public let depth: Int

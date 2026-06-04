@@ -227,6 +227,121 @@ public final class ChatSendController: ObservableObject {
     }
   }
 
+  /// Send the current turn as a **tree-of-thought** search (#413). Shares
+  /// the controller's generation/cancel/`isInFlight` scaffolding with
+  /// `send` but consumes the `/v1/inferlet` SSE tree stream instead of a
+  /// chat completion: each event folds into a `ToTTree`, snapshotted onto
+  /// the assistant row's `tot` for the live tree-search view, and the
+  /// `tree_complete` final answer becomes the row's `content`.
+  ///
+  /// Deliberately NOT wired to the engine-gone retry ladder `send` uses:
+  /// a ToT search is long and non-idempotent (a re-issue re-runs the whole
+  /// tree), so v1 surfaces a fault rather than silently re-spending it.
+  public func sendTreeOfThought(
+    chat: Chat,
+    context: ModelContext,
+    engine: EngineClient,
+    config: ToTProfileConfig,
+    persistenceStatus: PersistenceStatus,
+    options: ChatSendRequestOptions
+  ) {
+    cancel()
+    generation &+= 1
+    let myGeneration = generation
+    guard let request = Self.makeToTRequest(chat: chat, config: config, options: options) else {
+      persistenceStatus.report(
+        ToTSendError.requestEncodingFailed,
+        context: "ChatSendController.makeToTRequest"
+      )
+      return
+    }
+    isInFlight = true
+    Diag.app.event("chat.send.tot", [("model", options.modelID)])
+
+    task = Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer {
+        if self.generation == myGeneration {
+          self.activeWriter = nil
+          self.activeAssistant = nil
+          self.activeContext = nil
+          self.activePersistenceStatus = nil
+          self.task = nil
+          self.isInFlight = false
+        }
+      }
+
+      guard self.generation == myGeneration, !Task.isCancelled else { return }
+
+      let assistant = Message(role: ChatMessage.Role.assistant.rawValue, content: "", ts: Date())
+      context.insert(assistant)
+      chat.messages.append(assistant)
+      chat.updatedAt = assistant.ts
+      do {
+        try context.save()
+      } catch {
+        chat.messages.removeAll { $0.id == assistant.id }
+        context.delete(assistant)
+        persistenceStatus.report(error, context: "ChatSendController.insertAssistant(tot)")
+        return
+      }
+      self.activeAssistant = assistant
+      self.activeContext = context
+      self.activePersistenceStatus = persistenceStatus
+
+      var tree = ToTTree()
+      let encoder = JSONEncoder()
+      do {
+        for try await event in toTEventStream(from: engine.dispatchInferlet(request)) {
+          guard self.generation == myGeneration, !Task.isCancelled else { return }
+          tree.apply(event)
+          // In-memory mutation drives the live tree-search view (SwiftData
+          // @Model is observed); persistence is throttled to level
+          // boundaries + the terminal frame, like MessageStreamWriter.
+          assistant.tot = try? encoder.encode(tree)
+          switch event {
+          case let .treeComplete(_, finalAnswer):
+            assistant.content = finalAnswer ?? ""
+            Self.persistTree(context, status: persistenceStatus)
+            // Terminal: nil the active row so a later cancel() can't delete
+            // an already-finished turn (mirrors `send`).
+            self.activeAssistant = nil
+            self.activeContext = nil
+            self.activePersistenceStatus = nil
+          case .levelPruned:
+            Self.persistTree(context, status: persistenceStatus)
+          case .treeStart, .nodeComplete:
+            break
+          }
+        }
+        // Clean end without a tree_complete (engine closed early): persist
+        // whatever streamed so the partial tree isn't lost.
+        if self.generation == myGeneration, !Task.isCancelled {
+          Self.persistTree(context, status: persistenceStatus)
+        }
+      } catch is CancellationError {
+        return  // cancel() owns the row (recordCancelledAssistant)
+      } catch {
+        guard self.generation == myGeneration, !Task.isCancelled else { return }
+        tree.fail(PersistenceStatus.formatError(error))
+        assistant.tot = try? encoder.encode(tree)
+        if assistant.content.isEmpty {
+          assistant.content = "⚠️ \(PersistenceStatus.formatError(error))"
+        }
+        Diag.app.event("chat.fail.tot", [("error", String(describing: type(of: error)))])
+        Self.persistTree(context, status: persistenceStatus)
+      }
+    }
+  }
+
+  private static func persistTree(_ context: ModelContext, status: PersistenceStatus) {
+    do {
+      try context.save()
+    } catch {
+      status.report(error, context: "ChatSendController.persistTree")
+    }
+  }
+
   public func cancel() {
     generation &+= 1
     task?.cancel()
@@ -274,6 +389,20 @@ public final class ChatSendController: ObservableObject {
   }
 
   private static func makeRequest(chat: Chat, options: ChatSendRequestOptions) -> ChatRequest {
+    return ChatRequest(
+      model: options.modelID,
+      messages: transcriptTurns(chat: chat, options: options),
+      sampling: options.sampling,
+      stream: true
+    )
+  }
+
+  /// The request-history turns: an optional system-prompt override
+  /// followed by the persisted transcript in `(ts, id)` order, dropping
+  /// turns that don't belong in history (empty / cancelled assistants).
+  /// Shared by the chat (`makeRequest`) and tree-of-thought
+  /// (`makeToTRequest`) request builders so the two can't drift.
+  private static func transcriptTurns(chat: Chat, options: ChatSendRequestOptions) -> [ChatMessage] {
     var turns: [ChatMessage] = []
     if let prompt = options.systemPromptOverride, !prompt.isEmpty {
       turns.append(ChatMessage(role: .system, content: prompt))
@@ -288,12 +417,31 @@ public final class ChatSendController: ObservableObject {
         guard !Self.excludesFromRequestHistory(message, role: role) else { return nil }
         return ChatMessage(role: role, content: message.content)
       })
-    return ChatRequest(
+    return turns
+  }
+
+  /// Build the `/v1/inferlet` dispatch body for a tree-of-thought turn.
+  /// The ToT `input` carries the transcript + the bounded search params
+  /// (server re-validates them); `temperature`/`top_p` come from the same
+  /// sampling the chat path uses. Returns nil only if the body can't be
+  /// JSON-encoded (a programmer error — the input is plain owned data).
+  private static func makeToTRequest(
+    chat: Chat,
+    config: ToTProfileConfig,
+    options: ChatSendRequestOptions
+  ) -> InferletRequest? {
+    let input = ToTRequestInput(
       model: options.modelID,
-      messages: turns,
-      sampling: options.sampling,
-      stream: true
+      messages: transcriptTurns(chat: chat, options: options),
+      breadth: config.breadth,
+      depth: config.depth,
+      beamWidth: config.beamWidth,
+      maxTokensPerNode: config.maxTokensPerNode,
+      temperature: options.sampling.temperature,
+      topP: options.sampling.topP
     )
+    guard let data = try? JSONEncoder().encode(input) else { return nil }
+    return InferletRequest(inferlet: "tree-of-thought", input: data, messages: nil, stream: true)
   }
 
   /// Canonical wire string for a finish reason. Shared by `finishMeta`
@@ -365,6 +513,33 @@ public final class ChatSendController: ObservableObject {
     }
     return object["finish_reason"] as? String
   }
+}
+
+/// JSON body for the tree-of-thought `/v1/inferlet` dispatch `input`.
+/// snake_case keys mirror the engine's `TotInput` schema; `temperature` /
+/// `top_p` come from the shared sampling, the rest from the ToT profile.
+private struct ToTRequestInput: Encodable {
+  let model: String
+  let messages: [ChatMessage]
+  let breadth: Int
+  let depth: Int
+  let beamWidth: Int
+  let maxTokensPerNode: Int
+  let temperature: Double
+  let topP: Double
+
+  private enum CodingKeys: String, CodingKey {
+    case model, messages, breadth, depth, temperature
+    case beamWidth = "beam_width"
+    case maxTokensPerNode = "max_tokens_per_node"
+    case topP = "top_p"
+  }
+}
+
+/// Failure constructing a tree-of-thought send.
+public enum ToTSendError: Error, Equatable, Sendable {
+  /// The `/v1/inferlet` dispatch body could not be JSON-encoded.
+  case requestEncodingFailed
 }
 
 public struct ChatSendRequestOptions: Equatable, Sendable {

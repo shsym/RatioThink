@@ -1,0 +1,148 @@
+import XCTest
+import SwiftData
+@testable import RatioThinkCore
+
+/// Integration tests for the tree-of-thought send path (#413):
+/// `ChatSendController.sendTreeOfThought` consumes the `/v1/inferlet` SSE
+/// tree stream, folds it into a persisted `ToTTree` snapshot on the
+/// assistant row, and sets the final answer as the row's content.
+@available(macOS 14, *)
+@MainActor
+final class ToTChatSendTests: XCTestCase {
+
+  func test_streams_tree_persists_snapshot_and_sets_final_answer() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "What is 2+2?",
+                                 ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ToTFrameEngine(frames: [
+      #"{"event":"tree_start","id":"tot-1","model":"qwen","breadth":2,"depth":1,"beam_width":1}"#,
+      #"{"event":"node_complete","node":{"id":"tot-n1","parent_id":"root","depth":1,"branch_index":0,"content":"4","score":9,"status":"ok"}}"#,
+      #"{"event":"node_complete","node":{"id":"tot-n2","parent_id":"root","depth":1,"branch_index":1,"content":"5","score":3,"status":"ok"}}"#,
+      #"{"event":"level_pruned","level":1,"kept":["tot-n1"]}"#,
+      #"{"event":"tree_complete","selected_node_id":"tot-n1","final_answer":"4"}"#,
+    ])
+    let controller = ChatSendController()
+    controller.sendTreeOfThought(
+      chat: chat,
+      context: context,
+      engine: engine,
+      config: ToTProfileConfig(breadth: 2, depth: 1, beamWidth: 1),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "qwen")
+    )
+    try await waitUntil("tot stream finishes") { !controller.isInFlight }
+
+    let assistants = chat.messages.filter { $0.role == "assistant" }
+    XCTAssertEqual(assistants.count, 1)
+    let assistant = try XCTUnwrap(assistants.first)
+    XCTAssertEqual(assistant.content, "4")
+
+    let totData = try XCTUnwrap(assistant.tot, "expected a persisted ToTTree snapshot")
+    let tree = try JSONDecoder().decode(ToTTree.self, from: totData)
+    XCTAssertEqual(tree.status, .complete)
+    XCTAssertEqual(tree.selectedNodeID, "tot-n1")
+    XCTAssertEqual(tree.finalAnswer, "4")
+    XCTAssertEqual(tree.nodes.count, 2)
+    XCTAssertEqual(tree.nodes.first { $0.id == "tot-n1" }?.beam, .kept)
+    XCTAssertEqual(tree.nodes.first { $0.id == "tot-n2" }?.beam, .pruned)
+
+    // The dispatch routed to tree-of-thought with the bounded params.
+    let req = try XCTUnwrap(engine.lastRequest)
+    XCTAssertEqual(req.inferlet, "tree-of-thought")
+    XCTAssertTrue(req.stream)
+    let input = try JSONSerialization.jsonObject(with: req.input) as? [String: Any]
+    XCTAssertEqual(input?["breadth"] as? Int, 2)
+    XCTAssertEqual(input?["depth"] as? Int, 1)
+    XCTAssertEqual(input?["beam_width"] as? Int, 1)
+    // Transcript rides inside `input` (the dispatch envelope's top-level
+    // messages stays nil; input.messages wins server-side).
+    let msgs = input?["messages"] as? [[String: Any]]
+    XCTAssertEqual(msgs?.first?["content"] as? String, "What is 2+2?")
+  }
+
+  func test_error_frame_marks_assistant_failed_and_persists_failed_tree() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ToTFrameEngine(frames: [
+      #"{"event":"tree_start","id":"tot-1","model":"qwen","breadth":1,"depth":1,"beam_width":1}"#,
+      #"{"event":"error","code":"serialize_bug","message":"boom"}"#,
+    ])
+    let controller = ChatSendController()
+    controller.sendTreeOfThought(
+      chat: chat,
+      context: context,
+      engine: engine,
+      config: ToTProfileConfig(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "qwen")
+    )
+    try await waitUntil("tot stream fails") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(chat.messages.first { $0.role == "assistant" })
+    XCTAssertTrue(assistant.content.hasPrefix("⚠️"), "failed turn should surface the error: \(assistant.content)")
+    let tree = try JSONDecoder().decode(ToTTree.self, from: try XCTUnwrap(assistant.tot))
+    guard case .failed = tree.status else {
+      return XCTFail("expected failed status, got \(tree.status)")
+    }
+  }
+
+  func test_non_tot_profile_does_not_route_to_dispatch() {
+    // A profile with no mode key is not a ToT profile, so the routing
+    // guard in the view never calls sendTreeOfThought. This documents the
+    // gate at the convention layer (full routing is covered by GUI tests).
+    let p = Profile(id: "chat", name: "Chat", model: "qwen", inferlet: "chat-apc")
+    XCTAssertNil(p.treeOfThought)
+  }
+
+  // MARK: - helpers
+
+  private func waitUntil(
+    _ description: String,
+    timeout: TimeInterval = 2,
+    condition: @MainActor @escaping () -> Bool
+  ) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if condition() { return }
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTFail("Timed out waiting for \(description)")
+  }
+}
+
+/// Mock engine whose `dispatchInferlet` replays a fixed list of SSE
+/// `data:` payloads (decoded by `toTEventStream`). Records the last
+/// request so the test can assert the dispatch routed correctly.
+private final class ToTFrameEngine: EngineClient, @unchecked Sendable {
+  private let frames: [String]
+  private(set) var lastRequest: InferletRequest?
+
+  init(frames: [String]) { self.frames = frames }
+
+  func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
+  func models() async throws -> [ModelInfo] { [] }
+  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
+    AsyncThrowingStream { $0.finish() }
+  }
+  func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
+    AsyncThrowingStream { $0.finish() }
+  }
+  func dispatchInferlet(_ req: InferletRequest) -> AsyncThrowingStream<Data, Error> {
+    lastRequest = req
+    let frames = self.frames
+    return AsyncThrowingStream { continuation in
+      for f in frames { continuation.yield(Data(f.utf8)) }
+      continuation.finish()
+    }
+  }
+}
