@@ -167,6 +167,15 @@ jobs:
       - name: Install wasm32-wasip2 target
         run: rustup target add wasm32-wasip2
 
+      - name: Run chat-apc host unit tests
+        # Host-target unit tests for the inferlet's pure logic — chat-apc
+        # builds against the vendored inferlet SDK, which compiles for the
+        # host, so `cargo test` runs the LRU cache, CachebackDrafter
+        # (#418) deterministic accounting + greedy-equivalence regression,
+        # and the launch-diag / sse helpers without a wasm runner. These
+        # were previously not run in CI at all.
+        run: cd Inferlets/chat-apc && cargo test --lib
+
       - name: Stamp helper unit tests
         run: make test-stamp
 
