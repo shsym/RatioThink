@@ -234,4 +234,69 @@ final class ProfileTests: XCTestCase {
     XCTAssertTrue(dumped.contains("remote"))
     XCTAssertTrue(dumped.contains("agent"))
   }
+
+  // MARK: - [speculation] (#426 Fast Think)
+
+  func test_parses_speculation_section_enabled_only() throws {
+    let toml = """
+    id = "x"
+    name = "X"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [speculation]
+    enabled = true
+    """
+    let p = try Profile.parse(toml: toml)
+    XCTAssertEqual(p.speculation, Profile.Speculation(enabled: true))
+  }
+
+  func test_parses_speculation_section_with_knobs() throws {
+    let toml = """
+    id = "x"
+    name = "X"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [speculation]
+    enabled = true
+    leader_len = 2
+    draft_len = 5
+    """
+    let p = try Profile.parse(toml: toml)
+    XCTAssertEqual(p.speculation, Profile.Speculation(enabled: true, leaderLen: 2, draftLen: 5))
+  }
+
+  func test_absent_speculation_section_is_nil() throws {
+    let toml = """
+    id = "x"
+    name = "X"
+    model = "m"
+    inferlet = "chat-apc"
+    """
+    XCTAssertNil(try Profile.parse(toml: toml).speculation)
+  }
+
+  func test_dump_round_trips_speculation_with_knobs() throws {
+    let p = Profile(id: "x", name: "X", model: "m", inferlet: "chat-apc",
+                    speculation: Profile.Speculation(enabled: true, leaderLen: 2, draftLen: 5))
+    let reparsed = try Profile.parse(toml: try p.dump())
+    XCTAssertEqual(reparsed.speculation, Profile.Speculation(enabled: true, leaderLen: 2, draftLen: 5))
+  }
+
+  func test_dump_drops_speculation_when_cleared_to_nil() throws {
+    // A profile parsed WITH speculation, then mutated to nil, must not
+    // re-emit the section (mirrors the icon/system_prompt purge).
+    var p = try Profile.parse(toml: """
+    id = "x"
+    name = "X"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [speculation]
+    enabled = true
+    """)
+    p.speculation = nil
+    XCTAssertNil(try Profile.parse(toml: try p.dump()).speculation)
+  }
 }
