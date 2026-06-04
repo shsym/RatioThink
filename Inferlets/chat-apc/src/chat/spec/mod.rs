@@ -25,11 +25,11 @@ use std::sync::{Arc, Mutex};
 
 use cache::NgramCache;
 
-/// Paper-grounded defaults (arXiv:2511.21699): Leader Length 1,
-/// Follower Length 3.
+/// Drafting parameters (the "how", not the "whether" — that is the
+/// caller's [`super::generate::DecodeStrategy`] choice). Paper-grounded
+/// defaults (arXiv:2511.21699): Leader Length 1, Follower Length 3.
 #[derive(Clone, Debug)]
 pub struct SpecConfig {
-    pub enabled: bool,
     pub leader_len: usize,
     pub draft_len: usize,
     pub leader_cap: usize,
@@ -39,7 +39,6 @@ pub struct SpecConfig {
 impl Default for SpecConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             leader_len: 1,
             draft_len: 3,
             // 65536 leaders: the paper's LC=2^20 scaled down for a
@@ -112,15 +111,19 @@ impl CachebackDrafter {
         Arc::clone(&self.metrics)
     }
 
-    /// Snapshot of current metrics.
+    /// Snapshot of current metrics. Test-only; production reads through
+    /// the shared [`Self::metrics_handle`] after generation completes.
+    #[cfg(test)]
     pub fn metrics(&self) -> SpecMetrics {
         *self.metrics.lock().unwrap()
     }
 
+    #[cfg(test)]
     pub fn cursor(&self) -> u32 {
         self.cursor
     }
 
+    #[cfg(test)]
     pub fn cache_len(&self) -> usize {
         self.cache.len()
     }
@@ -223,7 +226,6 @@ mod tests {
 
     fn cfg() -> SpecConfig {
         SpecConfig {
-            enabled: true,
             leader_len: 1,
             draft_len: 3,
             ..SpecConfig::default()
