@@ -1,0 +1,205 @@
+import XCTest
+
+/// Captures README landing-page screenshots of the REAL app driven into a
+/// populated, offline state.
+///
+/// The app is pointed at `Scripts/readme-screenshot-harness.py` (a mock pie
+/// engine, no real engine / no model download) via `PIE_TEST_ENGINE_BASE_URL`,
+/// and `PIE_TEST_CHAT_MODEL` satisfies the composer send-gate
+/// (`ChatScaffoldView.currentModelID()`), so a sent prompt streams a canned
+/// assistant reply. Models tab is populated by dummy `.gguf` files the wrapper
+/// drops in `$PIE_HOME/models`. Each test attaches one window screenshot
+/// (`.keepAlways`); `Scripts/capture-readme-screenshots.sh` exports them from
+/// the `.xcresult` into `docs/assets/`.
+///
+/// Real screenshots of the real SwiftUI views — only the engine and the
+/// installed-model files are mocked. Driven by the wrapper, which writes the
+/// config file below; the suite XCTSkips (not fails) when run without it so a
+/// plain `make test` never reds on the absence of a seated GUI / harness.
+final class ReadmeScreenshotsGUITests: XCTestCase {
+  override func setUp() async throws { try guardSeatedGUI() }
+
+  // MARK: - Tests (one screenshot each)
+
+  @MainActor
+  func test_capture_chat() async throws {
+    let cfg = try Self.loadConfig()
+    let app = Self.makeApp(cfg)
+    app.launch()
+    defer { app.terminate() }
+    Self.activate(app)
+
+    try createChatAndSend("What makes RatioThink different from a cloud chatbot?", in: app)
+    XCTAssertTrue(
+      waitForStaticTextContaining("OpenAI-compatible", in: app, timeout: 30),
+      "canned assistant reply did not render; app: \(app.debugDescription)"
+    )
+    Self.settle()
+    attach(Self.mainWindow(app).screenshot(), name: "chat")
+  }
+
+  @MainActor
+  func test_capture_endpoint() async throws {
+    let cfg = try Self.loadConfig()
+    let app = Self.makeApp(cfg)
+    app.launch()
+    defer { app.terminate() }
+    Self.activate(app)
+
+    let curl = app.descendants(matching: .any)
+      .matching(identifier: "EndpointCurl").firstMatch
+
+    // The col-3 zero-state "Add Endpoint" CTA (visible at launch, large
+    // control) creates an endpoint, selects it, AND routes to the API
+    // Endpoints section in one action — so the detail pane mounts. Prefer
+    // it over the col-2 list empty-state button, whose freshly-laid-out
+    // small control intermittently ignores a synthesized click under
+    // XCUITest. Coordinate-click is a second strategy for the same quirk.
+    let addEndpoint = app.buttons["Add Endpoint"]
+    if addEndpoint.waitForExistence(timeout: 15) {
+      addEndpoint.click()
+      if !curl.waitForExistence(timeout: 8) {
+        addEndpoint.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
+      }
+    }
+
+    // Fallback: switch to the section and use the list empty-state CTA.
+    if !curl.exists {
+      app.buttons["API Endpoints"].click()
+      Self.settle()
+      let create = app.buttons["CreateEndpoint"]
+      if create.waitForExistence(timeout: 10) {
+        create.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
+      }
+    }
+
+    XCTAssertTrue(curl.waitForExistence(timeout: 10),
+                  "endpoint detail (curl) did not render; app: \(app.debugDescription)")
+    Self.settle()
+    attach(Self.mainWindow(app).screenshot(), name: "endpoint")
+  }
+
+  @MainActor
+  func test_capture_models() async throws {
+    let cfg = try Self.loadConfig()
+    let app = Self.makeApp(cfg)
+    app.launch()
+    defer { app.terminate() }
+    Self.activate(app)
+
+    app.typeKey(",", modifierFlags: .command)
+    let settings = app.windows
+      .matching(identifier: "com_apple_SwiftUI_Settings_window").firstMatch
+    XCTAssertTrue(settings.waitForExistence(timeout: 10),
+                  "Settings window did not appear after ⌘,; app: \(app.debugDescription)")
+    let modelsTab = settings.toolbars.buttons["Models"]
+    XCTAssertTrue(modelsTab.waitForExistence(timeout: 10),
+                  "Models settings tab missing; window: \(settings.debugDescription)")
+    modelsTab.click()
+
+    // Wait for a seeded installed-model row (the wrapper drops dummy
+    // `.gguf` files) so the screenshot shows a populated table.
+    XCTAssertTrue(settings.buttons["AddModelButton"].waitForExistence(timeout: 10),
+                  "Models tab did not render; window: \(settings.debugDescription)")
+    Self.settle()
+    attach(settings.screenshot(), name: "models")
+  }
+
+  // MARK: - Steps
+
+  private func createChatAndSend(_ prompt: String, in app: XCUIApplication) throws {
+    let newChat = app.buttons["chats.newButton"]
+    XCTAssertTrue(newChat.waitForExistence(timeout: 10),
+                  "New Chat button missing; app: \(app.debugDescription)")
+    newChat.click()
+
+    let composer = app.descendants(matching: .any)
+      .matching(identifier: "composer.text").firstMatch
+    XCTAssertTrue(composer.waitForExistence(timeout: 10),
+                  "composer.text missing; app: \(app.debugDescription)")
+    composer.click()
+    composer.typeText(prompt)
+
+    let send = app.buttons["composer.send"]
+    XCTAssertTrue(send.waitForExistence(timeout: 5), "composer.send missing")
+    XCTAssertTrue(send.isEnabled, "composer.send disabled (PIE_TEST_CHAT_MODEL not honored?)")
+    send.click()
+  }
+
+  // MARK: - Helpers
+
+  private func attach(_ screenshot: XCUIScreenshot, name: String) {
+    let att = XCTAttachment(screenshot: screenshot)
+    att.name = name
+    att.lifetime = .keepAlways
+    add(att)
+  }
+
+  private static func makeApp(_ cfg: [String: String]) -> XCUIApplication {
+    let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
+    app.launchArguments.append(contentsOf: [
+      "-NSQuitAlwaysKeepsWindows", "NO",
+      "-ApplePersistenceIgnoreState", "YES",
+    ])
+    if let pieHome = cfg["PIE_TEST_GUI_HOME"] { app.launchEnvironment["PIE_HOME"] = pieHome }
+    if let baseURL = cfg["PIE_TEST_ENGINE_BASE_URL"] {
+      app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
+    }
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = cfg["PIE_TEST_CHAT_MODEL"] ?? "Qwen3-8B-Instruct"
+    configureCompletedFirstLaunch(
+      app, suiteName: stablePreferenceSuiteName(cfg["PIE_TEST_GUI_HOME"] ?? "readme"))
+    return app
+  }
+
+  private static func activate(_ app: XCUIApplication) {
+    XCTAssert(app.wait(for: .runningForeground, timeout: 15),
+              "RatioThink.app did not reach runningForeground")
+    app.activate()
+  }
+
+  /// The main app window (the only non-Settings window). Settings is a
+  /// separate scene; chat/endpoint shots run before it opens.
+  private static func mainWindow(_ app: XCUIApplication) -> XCUIElement {
+    let main = app.windows
+      .matching(NSPredicate(format: "identifier != %@", "com_apple_SwiftUI_Settings_window"))
+      .firstMatch
+    return main.exists ? main : app.windows.firstMatch
+  }
+
+  /// Let the final frame (streaming reply / list rows) paint before capture.
+  private static func settle() {
+    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.8))
+  }
+
+  private func waitForStaticTextContaining(_ needle: String,
+                                           in app: XCUIApplication,
+                                           timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+                                needle, needle)
+    while Date() < deadline {
+      if app.descendants(matching: .staticText).matching(predicate).count >= 1 {
+        return true
+      }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
+    }
+    return false
+  }
+
+  private static let configPath = "/tmp/pie-readme-screenshots.env"
+
+  private static func loadConfig() throws -> [String: String] {
+    let url = URL(fileURLWithPath: configPath)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+      throw XCTSkip("README screenshot config missing at \(configPath); " +
+                    "run Scripts/capture-readme-screenshots.sh")
+    }
+    let text = try String(contentsOf: url, encoding: .utf8)
+    return text.split(separator: "\n").reduce(into: [:]) { result, line in
+      let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+      guard parts.count == 2 else { return }
+      let key = String(parts[0])
+      if !key.isEmpty { result[key] = String(parts[1]) }
+    }
+  }
+}
