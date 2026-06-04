@@ -68,8 +68,16 @@ final class CuratedModelCatalogLiveHFTests: XCTestCase {
         print("LIVE-HF: \(m.id) OK — \(m.huggingFaceRepo)/\(m.huggingFaceFile) "
               + "declared=\(m.approximateSizeBytes) real=\(real)")
       } else {
-        print("LIVE-HF: \(m.id) OK (size unavailable) — "
-              + "\(m.huggingFaceRepo)/\(m.huggingFaceFile)")
+        // Exists, but HF published no/zero size for the blob. A curated
+        // `.gguf` HF reports with no positive size is itself suspicious
+        // (odd/truncated repo metadata), and the declared size then goes
+        // unverified — so the gated live audit must FAIL here rather than
+        // print-and-continue and green on a missing size (#428 / PR #41 F2).
+        let published = match?.sizeBytes.map(String.init) ?? "nil"
+        XCTFail(
+          "\(m.id): \(m.huggingFaceRepo)/\(m.huggingFaceFile) exists but HF "
+          + "reports no positive size (size=\(published)) — suspicious repo "
+          + "metadata; declared \(m.approximateSizeBytes) B unverifiable")
       }
     }
   }
