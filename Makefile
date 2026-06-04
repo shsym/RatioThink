@@ -296,6 +296,11 @@ test-gui-first-launch: genproject $(LOGDIR) ## GUI area: first-launch wizard, fa
 test-gui-helper: genproject $(LOGDIR) ## GUI area: menu-bar helper + engine startup (S4)
 	$(call gui_suite_run,helper,-only-testing:RatioThinkGUITests/S4_HelperMenuBarGUITests)
 
+render-menubar-icon: ## Render the #424 branded menu-bar icon (4 states x light/dark) to a PNG for eyeballing
+	@swiftc -parse-as-library Helper/MenuBarBrandIcon.swift Scripts/render-menubar-icon.swift -o /tmp/render-menubar-icon
+	@/tmp/render-menubar-icon
+	@open /tmp/menubar-icon-preview.png 2>/dev/null || true
+
 test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate (S260/S279/S285/S286)
 	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests)
 

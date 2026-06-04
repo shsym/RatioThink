@@ -661,11 +661,14 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     HelperStatusItemBinding(
       setDot: { [weak self] dot in
         guard let self, let button = self.statusItem?.button else { return }
-        let config = NSImage.SymbolConfiguration(paletteColors: [Self.colorForDot(dot)])
-        let img = NSImage(systemSymbolName: dot.symbolName,
-                          accessibilityDescription: "Pie engine \(dot.rawValue)")?
-          .withSymbolConfiguration(config)
-        img?.isTemplate = false
+        // #424: render the RatioThink brand mark (a rounded down-pointing
+        // triangle) instead of a generic SF-Symbol circle. Fill + the
+        // error badge carry status WITHOUT color (#396); the #412 LED tint
+        // is applied here because `NSColor` is AppKit.
+        let img = MenuBarBrandIcon.image(filled: dot.isFilled,
+                                         errorBadge: dot.showsErrorBadge,
+                                         color: Self.colorForDot(dot))
+        img.accessibilityDescription = "RatioThink engine \(dot.accessibilityWord)"
         button.image = img
         // #396: a transitional dot (engine starting/stopping) is an
         // in-flight async op, so it must show MOTION — never a static
@@ -698,15 +701,17 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// Tint color for each dot state. Kept here (not in
   /// `HelperStatusItemModel`) because `NSColor` lives in AppKit and the
   /// model is RatioThinkCore (no AppKit). The pure model decides the
-  /// `Dot` enum AND the SF Symbol name (`dot.symbolName`, #396 — so the
-  /// shape mapping is unit-testable); the view only picks the tint.
+  /// `Dot` enum AND the brand-mark shape (`dot.isFilled` /
+  /// `dot.showsErrorBadge`, #424 — so the shape mapping is unit-testable);
+  /// the view only picks the tint.
   private static func colorForDot(_ dot: HelperStatusItemModel.Dot) -> NSColor {
     // #412 LED language (shared with the App toolbar pip via StatusLED):
     // waiting = white (pulses via applyDotPulse), success = green-ish white,
     // recoverable trouble = amber. Red is reserved for the App-side
     // helper-given-up ring, which the menu bar never shows (a dead Helper
-    // has no menu). The symbol shape (`dot.symbolName`) still distinguishes
-    // states without color (#396 accessibility), so the tint change is safe.
+    // has no menu). The brand-mark shape (`dot.isFilled` /
+    // `dot.showsErrorBadge`) still distinguishes states without color
+    // (#396 accessibility), so the tint change is safe.
     switch dot {
     case .stopped: return .secondaryLabelColor   // off / dim
     case .loading: return .labelColor            // waiting → white (animated)

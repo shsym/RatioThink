@@ -111,33 +111,56 @@ final class HelperStatusItemModelTests: XCTestCase {
     XCTAssertFalse(m.pauseResume.enabled)
   }
 
-  // MARK: - #396 working-state affordance (motion + not color-only)
+  // MARK: - #396/#424 working-state affordance (motion + not color-only)
 
-  /// The transitional `.loading` dot must be distinguishable from
+  /// The transitional `.loading` mark must be distinguishable from
   /// `.running` by SHAPE, not color alone — a colorblind user otherwise
-  /// cannot tell "engine starting" (amber) from "engine running" (green)
-  /// since both were `circle.fill`.
-  func test_loading_symbol_is_distinct_from_running_notColorOnly() {
+  /// cannot tell "engine starting" (white) from "engine running" (green).
+  /// The brand triangle is an OUTLINE while loading and SOLID while
+  /// running, so the FILL — not the tint — carries the distinction (#396).
+  func test_loading_shape_is_distinct_from_running_notColorOnly() {
+    XCTAssertFalse(HelperStatusItemModel.Dot.loading.isFilled,
+                   "loading is an outline triangle")
+    XCTAssertTrue(HelperStatusItemModel.Dot.running.isFilled,
+                  "running is a solid triangle")
     XCTAssertNotEqual(
-      HelperStatusItemModel.Dot.loading.symbolName,
-      HelperStatusItemModel.Dot.running.symbolName,
-      "loading and running must differ by symbol, not just tint color (#396)"
+      HelperStatusItemModel.Dot.loading.isFilled,
+      HelperStatusItemModel.Dot.running.isFilled,
+      "loading and running must differ by fill, not just tint color (#396)"
     )
   }
 
-  /// Every dot maps to a concrete SF Symbol name (the view no longer
-  /// owns the symbol decision — it reads it off the pure model so the
-  /// mapping is testable without AppKit).
-  func test_symbolNames_are_stable() {
-    XCTAssertEqual(HelperStatusItemModel.Dot.stopped.symbolName, "circle")
-    XCTAssertEqual(HelperStatusItemModel.Dot.loading.symbolName, "circle.dotted")
-    XCTAssertEqual(HelperStatusItemModel.Dot.running.symbolName, "circle.fill")
-    XCTAssertEqual(HelperStatusItemModel.Dot.error.symbolName, "exclamationmark.circle.fill")
+  /// `.error` must be distinguishable from `.running` by SHAPE, not the
+  /// amber-vs-green tint alone — both are SOLID triangles, so the
+  /// exclamation knockout badge is the non-color cue (#396).
+  func test_error_badge_is_distinct_from_running_notColorOnly() {
+    XCTAssertTrue(HelperStatusItemModel.Dot.error.isFilled)
+    XCTAssertTrue(HelperStatusItemModel.Dot.running.isFilled)
+    XCTAssertTrue(HelperStatusItemModel.Dot.error.showsErrorBadge,
+                  "error carries the '!' knockout")
+    XCTAssertFalse(HelperStatusItemModel.Dot.running.showsErrorBadge,
+                   "running must not — so error/running differ by shape, not just tint (#396)")
+  }
+
+  /// The view no longer owns the brand-mark shape decision — it reads
+  /// `isFilled` / `showsErrorBadge` off the pure model so the mapping is
+  /// testable without AppKit (#424). Outline = idle/working; solid =
+  /// engine present; badge = error only.
+  func test_brand_mark_shape_mapping_is_stable() {
+    XCTAssertEqual(HelperStatusItemModel.Dot.stopped.isFilled, false)
+    XCTAssertEqual(HelperStatusItemModel.Dot.loading.isFilled, false)
+    XCTAssertEqual(HelperStatusItemModel.Dot.running.isFilled, true)
+    XCTAssertEqual(HelperStatusItemModel.Dot.error.isFilled, true)
+
+    XCTAssertEqual(HelperStatusItemModel.Dot.stopped.showsErrorBadge, false)
+    XCTAssertEqual(HelperStatusItemModel.Dot.loading.showsErrorBadge, false)
+    XCTAssertEqual(HelperStatusItemModel.Dot.running.showsErrorBadge, false)
+    XCTAssertEqual(HelperStatusItemModel.Dot.error.showsErrorBadge, true)
   }
 
   /// A running async operation (engine starting/stopping) must carry an
   /// active affordance — the view animates while `isAnimated`, so the
-  /// menu-bar dot is never a *static* colored dot for in-progress work
+  /// menu-bar mark is never a *static* colored dot for in-progress work
   /// (#396 invariant 1). Steady states do not animate.
   func test_only_loading_dot_animates() {
     XCTAssertTrue(HelperStatusItemModel.Dot.loading.isAnimated,
@@ -145,5 +168,15 @@ final class HelperStatusItemModelTests: XCTestCase {
     XCTAssertFalse(HelperStatusItemModel.Dot.stopped.isAnimated)
     XCTAssertFalse(HelperStatusItemModel.Dot.running.isAnimated)
     XCTAssertFalse(HelperStatusItemModel.Dot.error.isAnimated)
+  }
+
+  /// The menu-bar button's accessibility label must describe the app AND
+  /// the current engine status (#424 acceptance). The model supplies the
+  /// state word; the view composes "RatioThink engine <word>".
+  func test_accessibilityWord_describes_each_engine_state() {
+    XCTAssertEqual(HelperStatusItemModel.Dot.stopped.accessibilityWord, "stopped")
+    XCTAssertEqual(HelperStatusItemModel.Dot.loading.accessibilityWord, "starting")
+    XCTAssertEqual(HelperStatusItemModel.Dot.running.accessibilityWord, "running")
+    XCTAssertEqual(HelperStatusItemModel.Dot.error.accessibilityWord, "failed")
   }
 }
