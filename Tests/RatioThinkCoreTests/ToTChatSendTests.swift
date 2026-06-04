@@ -65,6 +65,47 @@ final class ToTChatSendTests: XCTestCase {
     XCTAssertEqual(msgs?.first?["content"] as? String, "What is 2+2?")
   }
 
+  func test_stream_ends_without_terminal_marks_assistant_failed_not_silent_hang() async throws {
+    // The real-stall repro: the engine streamed level 1 + its beam, then
+    // closed the connection mid-level-2 (per-request timeout on a slow
+    // search) — NO tree_complete, NO error frame. The turn must surface a
+    // failure (the partial tree preserved), not sit as a silent half-tree
+    // that looks like a permanent hang.
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ToTFrameEngine(frames: [
+      #"{"event":"tree_start","id":"tot-1","model":"qwen","breadth":3,"depth":2,"beam_width":2}"#,
+      #"{"event":"node_complete","node":{"id":"tot-n1","parent_id":"root","depth":1,"branch_index":0,"content":"a","score":null,"status":"ok"}}"#,
+      #"{"event":"node_complete","node":{"id":"tot-n2","parent_id":"root","depth":1,"branch_index":1,"content":"b","score":null,"status":"ok"}}"#,
+      #"{"event":"node_complete","node":{"id":"tot-n3","parent_id":"root","depth":1,"branch_index":2,"content":"c","score":null,"status":"ok"}}"#,
+      #"{"event":"level_pruned","level":1,"kept":["tot-n1","tot-n2"]}"#,
+      // …connection closes here — no level-2 nodes, no terminal frame.
+    ])
+    let controller = ChatSendController()
+    controller.sendTreeOfThought(
+      chat: chat, context: context, engine: engine,
+      config: ToTProfileConfig(breadth: 3, depth: 2, beamWidth: 2),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "qwen")
+    )
+    try await waitUntil("tot no-terminal stream ends") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(chat.messages.first { $0.role == "assistant" })
+    XCTAssertTrue(assistant.content.hasPrefix("⚠️"),
+                  "a no-terminal stream close must surface a failure, not a silent hang: \(assistant.content.debugDescription)")
+    let tree = try JSONDecoder().decode(ToTTree.self, from: try XCTUnwrap(assistant.tot))
+    guard case .failed = tree.status else { return XCTFail("expected .failed, got \(tree.status)") }
+    // The partial tree (level 1) is preserved for inspection.
+    XCTAssertEqual(tree.nodes.count, 3)
+    XCTAssertEqual(tree.nodes.first { $0.id == "tot-n1" }?.beam, .kept)
+    XCTAssertEqual(tree.nodes.first { $0.id == "tot-n3" }?.beam, .pruned)
+  }
+
   func test_error_frame_marks_assistant_failed_and_persists_failed_tree() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)

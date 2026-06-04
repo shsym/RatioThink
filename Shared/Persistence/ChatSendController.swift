@@ -290,6 +290,12 @@ public final class ChatSendController: ObservableObject {
       self.activePersistenceStatus = persistenceStatus
 
       var tree = ToTTree()
+      // Whether a terminal frame (tree_complete) arrived. A ToT stream that
+      // ends WITHOUT one — the engine closed the connection mid-search, e.g.
+      // a slow search hit the engine's per-request timeout — must surface as
+      // a failure, not a silent partial tree the UI shows forever (the
+      // "hangs after the beam selection, no completion, no error" report).
+      var reachedTerminal = false
       let encoder = JSONEncoder()
       do {
         for try await event in toTEventStream(from: engine.dispatchInferlet(request)) {
@@ -301,6 +307,7 @@ public final class ChatSendController: ObservableObject {
           assistant.tot = try? encoder.encode(tree)
           switch event {
           case let .treeComplete(selectedNodeID, finalAnswer):
+            reachedTerminal = true
             if selectedNodeID == nil {
               // F1: a null selection is a TOTAL failure — the beam selects
               // the best ok leaf whenever one exists, so no selection means
@@ -329,9 +336,21 @@ public final class ChatSendController: ObservableObject {
             break
           }
         }
-        // Clean end without a tree_complete (engine closed early): persist
-        // whatever streamed so the partial tree isn't lost.
+        // Stream ended cleanly. If no terminal frame arrived, the engine
+        // closed the connection mid-search (a slow search hit the engine's
+        // per-request timeout, or the daemon dropped it) — surface it as a
+        // failure with the partial tree preserved, instead of leaving a
+        // half-built tree that looks like a permanent hang (no completion,
+        // no error). A real terminal already set `.complete`/`.failed`.
         if self.generation == myGeneration, !Task.isCancelled {
+          if !reachedTerminal {
+            tree.fail(Self.totIncompleteMessage)
+            assistant.tot = try? encoder.encode(tree)
+            if assistant.content.isEmpty {
+              assistant.content = "⚠️ \(Self.totIncompleteMessage)"
+            }
+            Diag.app.event("chat.fail.tot", [("reason", "no_terminal")])
+          }
           Self.persistTree(context, status: persistenceStatus)
         }
       } catch is CancellationError {
@@ -353,6 +372,11 @@ public final class ChatSendController: ObservableObject {
   /// Kept close to the engine's `no_answer` message without coupling to its
   /// exact wording.
   static let totNoAnswerMessage = "Tree-of-thought search produced no answer (every branch failed)."
+
+  /// User-facing copy when the ToT stream ends without a terminal frame —
+  /// the engine closed the connection mid-search (commonly its per-request
+  /// timeout on a slow search). The partial tree is preserved (F-stall).
+  static let totIncompleteMessage = "Tree-of-thought search did not finish — the engine closed the connection (it may have timed out). Try a lighter profile (smaller breadth/depth) or a simpler question."
 
   private static func persistTree(_ context: ModelContext, status: PersistenceStatus) {
     do {
