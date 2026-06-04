@@ -15,11 +15,16 @@ struct ChatMessageItem: Identifiable, Equatable {
   let id: UUID
   var role: ChatMessage.Role
   var content: String
+  /// Model thinking-block text, rendered in a collapsible section
+  /// separate from `content`. Empty when the turn has no
+  /// reasoning.
+  var reasoning: String
 
-  init(id: UUID = UUID(), role: ChatMessage.Role, content: String) {
+  init(id: UUID = UUID(), role: ChatMessage.Role, content: String, reasoning: String = "") {
     self.id = id
     self.role = role
     self.content = content
+    self.reasoning = reasoning
   }
 }
 
@@ -39,6 +44,6 @@ extension ChatMessageItem {
       chatMessageItemLog.warning("unknown role string, coercing to .system: \(message.role, privacy: .public)")
       role = .system
     }
-    self.init(id: message.id, role: role, content: message.content)
+    self.init(id: message.id, role: role, content: message.content, reasoning: message.reasoning)
   }
 }

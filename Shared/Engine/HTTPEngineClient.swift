@@ -26,12 +26,21 @@ import Foundation
 /// Error model ( — one code space across channels): an HTTP
 /// non-2xx whose body is an OpenAI-shape `{"error":{code,message}}`
 /// envelope surfaces as `HTTPEngineError.api(status, code, message)`;
-/// bodies that don't parse (empty, or pie's daemon bare anyhow 500
-/// text) fall back to `HTTPEngineError.http(status, body)`. In-stream
+/// bodies that don't parse (empty, or pie's daemon plain-text
+/// `FaultClass` tag — see below) fall back to
+/// `HTTPEngineError.http(status, body, retryAfter)`. In-stream
 /// `{"event":"error","code","message"}` meta-frames surface as
 /// `HTTPEngineError.stream(code, message)` thrown into the async
 /// stream. All three carry the same canonical `code`. Network/JSON
 /// failures propagate as-is.
+///
+/// Engine `FaultClass` (pie#375): the daemon emits a stable, uncoded
+/// plain-text tag body keyed by status — `500` host-setup
+/// (`instantiate-failed`, …), `502` guest fault (`handler-trap`,
+/// `outparam-never-set`, …), `503` + `Retry-After` in-flight crash
+/// (`handler-panic`). These land on `.http`; `HTTPEngineError.faultClass`
+/// reads the status + tag back into `EngineFaultClass` so a consumer can
+/// branch on the fault domain without re-parsing the wire.
 public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
 
   // MARK: - Config
@@ -265,12 +274,19 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
             // OpenAI `chat.completion.chunk`.
             let chunk = try decoder.decode(ChatCompletionChunk.self, from: frame.dataBytes)
             guard let choice = chunk.choices.first else { continue }
-            if let delta = choice.delta,
-               (delta.content != nil || delta.role != nil) {
-              continuation.yield(.delta(
-                role: delta.role,
-                content: delta.content ?? ""
-              ))
+            if let delta = choice.delta {
+              // Reasoning frames carry `reasoning_content` and no
+              // `content`; route them to their own channel so thinking
+              // text never lands in the visible answer.
+              if let reasoning = delta.reasoning_content, !reasoning.isEmpty {
+                continuation.yield(.reasoningDelta(reasoning))
+              }
+              if delta.content != nil || delta.role != nil {
+                continuation.yield(.delta(
+                  role: delta.role,
+                  content: delta.content ?? ""
+                ))
+              }
             }
             if let reason = choice.finish_reason {
               continuation.yield(.finish(reason: Self.parseFinishReason(reason)))
@@ -362,9 +378,12 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
   /// `.api` so the canonical code is preserved — parity
   /// with the SSE `.stream` channel, so a fault is traceable end-to-end
   /// by the same code space. Anything else (empty bodies, pie's daemon
-  /// bare anyhow 500 text) falls back to `.http`; the absence of a code
-  /// is itself the "engine-internal, not inferlet-coded" signal.
-  private static func httpError(status: Int, body: Data) -> HTTPEngineError {
+  /// plain-text `FaultClass` tag) falls back to `.http`; the absence of a
+  /// code is itself the "engine-internal, not inferlet-coded" signal.
+  /// `retryAfter` is the parsed `Retry-After` header (carried only by
+  /// pie's `503` in-flight crash) — `FaultClass` bodies are never
+  /// enveloped, so the `.api` branch never drops it.
+  private static func httpError(status: Int, body: Data, retryAfter: TimeInterval?) -> HTTPEngineError {
     if let env = try? JSONDecoder().decode(APIErrorEnvelope.self, from: body),
        env.error.code != nil || env.error.message != nil {
       return .api(
@@ -372,7 +391,17 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
         code: env.error.code ?? "",
         message: env.error.message ?? "")
     }
-    return .http(status: status, body: body)
+    return .http(status: status, body: body, retryAfter: retryAfter)
+  }
+
+  /// Parse an HTTP `Retry-After` header as delta-seconds. pie's `503`
+  /// `FaultClass` sends the integer-seconds form (`Retry-After: 1`); the
+  /// RFC's alternate HTTP-date form is not emitted by pie and is treated
+  /// as absent (nil) rather than guessed at.
+  private static func retryAfterSeconds(_ response: HTTPURLResponse) -> TimeInterval? {
+    guard let raw = response.value(forHTTPHeaderField: "Retry-After")?
+      .trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
+    return TimeInterval(raw)
   }
 
   /// Unary guard: `data` is the fully-buffered response body.
@@ -381,7 +410,8 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
       throw HTTPEngineError.nonHTTPResponse
     }
     guard (200..<300).contains(http.statusCode) else {
-      throw httpError(status: http.statusCode, body: data ?? Data())
+      throw httpError(status: http.statusCode, body: data ?? Data(),
+                      retryAfter: retryAfterSeconds(http))
     }
   }
 
@@ -399,7 +429,8 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
     guard (200..<300).contains(http.statusCode) else {
       var body = Data()
       for try await byte in bytes { body.append(byte) }
-      throw httpError(status: http.statusCode, body: body)
+      throw httpError(status: http.statusCode, body: body,
+                      retryAfter: retryAfterSeconds(http))
     }
   }
 
@@ -604,6 +635,11 @@ private struct ChunkChoice: Decodable {
 private struct ChunkDelta: Decodable {
   let role: ChatMessage.Role?
   let content: String?
+  /// OpenAI `reasoning_content` delta — the model's thinking-block text
+  /// on chat-apc reasoning frames. Present only on reasoning chunks
+  /// (which carry no `content`); decoded so the GUI can surface it on a
+  /// separate channel instead of dropping it.
+  let reasoning_content: String?
 }
 
 // MARK: - Errors
@@ -619,10 +655,14 @@ public enum HTTPEngineError: Error, Equatable, Sendable {
   /// uses. `code` is `""` when the envelope omitted it.
   case api(status: Int, code: String, message: String)
   /// Engine returned a non-2xx status whose body did NOT parse as an
-  /// error envelope — an empty body or pie's daemon bare anyhow 500
-  /// text. The absence of a code is the "engine-internal, not
-  /// inferlet-coded" signal; `body` is the raw bytes for diagnostics.
-  case http(status: Int, body: Data)
+  /// error envelope — an empty body or pie's daemon plain-text
+  /// `FaultClass` tag (`handler-panic`, `instantiate-failed`, …). The
+  /// absence of a code is the "engine-internal, not inferlet-coded"
+  /// signal; `body` is the raw tag for diagnostics, `status` is the
+  /// `FaultClass` discriminator (500/502/503), and `retryAfter` carries
+  /// the `503` in-flight-crash `Retry-After` (nil otherwise). Read the
+  /// fault domain back via `faultClass`.
+  case http(status: Int, body: Data, retryAfter: TimeInterval?)
   /// `URLResponse` was not an `HTTPURLResponse` — typically a
   /// configuration bug rather than a network failure.
   case nonHTTPResponse
@@ -636,6 +676,14 @@ public enum HTTPEngineError: Error, Equatable, Sendable {
   /// as a distinct case so views can render "engine not ready" rather
   /// than a generic network failure.
   case engineNotReady(detail: String)
+  /// The engine died after a successful launch handshake (G1's
+  /// `.failed(.engineGone)`) — the boundary equivalent of an HTTP 503
+  /// Retry-After (D2). Distinct from `.engineNotReady` (engine never
+  /// came up) and `.http`/`.api` (engine answered) precisely so the
+  /// chat retry path can classify this fault as retryable without
+  /// inspecting human-readable detail strings. `detail` carries the
+  /// coarse `EngineStatusStore.statusDetail` summary.
+  case engineGone(detail: String)
 }
 
 extension HTTPEngineError: LocalizedError, CustomStringConvertible {
@@ -648,12 +696,8 @@ extension HTTPEngineError: LocalizedError, CustomStringConvertible {
         return "Engine error (HTTP \(status)): \(message)"
       }
       return "Engine error (\(code)): \(message)"
-    case let .http(status, body):
-      let bodyText = String(decoding: body, as: UTF8.self)
-      if bodyText.isEmpty {
-        return "Engine returned HTTP \(status)"
-      }
-      return "Engine returned HTTP \(status): \(bodyText)"
+    case let .http(status, body, _):
+      return HTTPEngineError.faultDescription(status: status, body: body)
     case .nonHTTPResponse:
       return "Engine returned a non-HTTP response"
     case let .stream(code, message):
@@ -663,6 +707,118 @@ extension HTTPEngineError: LocalizedError, CustomStringConvertible {
       return "Engine stream error (\(code)): \(message)"
     case let .engineNotReady(detail):
       return detail.isEmpty ? "Engine not ready" : "Engine not ready: \(detail)"
+    case let .engineGone(detail):
+      // Do NOT promise "— retrying" here. This surfaces through
+      // `markAssistant(failedWith:)` precisely when retries are
+      // exhausted or the recovery wait timed out, so wording that
+      // implies in-progress recovery would lie to the user. Active
+      // recovery state is signalled elsewhere (toolbar / status dot).
+      return detail.isEmpty
+        ? "Engine stopped unexpectedly"
+        : "Engine stopped unexpectedly (\(detail))"
     }
   }
+}
+
+// MARK: - Engine FaultClass
+
+/// The engine-side fault taxonomy pie's daemon emits on the HTTP
+/// boundary (pie#375 `FaultClass`). Read off `HTTPEngineError.faultClass`
+/// at the point a `.http` error is handled so a consumer can branch on
+/// the fault DOMAIN — host setup vs guest fault vs in-flight crash —
+/// rather than re-parsing the status + tag wire shape.
+///
+/// This is the engine-fault axis, deliberately separate from
+/// `EngineStatus.EngineErrorCode` (the engine LIFECYCLE axis:
+/// spawn/handshake/download/memory). The tag stays a `String`, not a
+/// closed enum, so it tracks pie's evolving tag set without a wire-bound
+/// recompile — same map-at-boundary contract as `HTTPEngineError.api`'s
+/// `code`.
+///
+/// NOTE: this type only CLASSIFIES the fault. The recovery ACTION for a
+/// retryable `503` (funnel to `engineGone` + bounded relaunch/retry) is
+/// deferred to its own ticket and is intentionally not wired here.
+public enum EngineFaultClass: Equatable, Sendable {
+  /// HTTP `500` — host-side setup failed before the guest ran
+  /// (`body-buffer-failed`, `instantiate-failed`, `missing-export`,
+  /// `new-incoming-request-failed`, `new-outparam-failed`). The engine
+  /// could not stand the inferlet up; a blind retry re-fails.
+  case hostSetup(tag: String)
+  /// HTTP `502` — the guest inferlet faulted handling the request
+  /// (`outparam-error`, `handler-trap`, `outparam-never-set`). The engine
+  /// process is alive; the request itself failed.
+  case guestFault(tag: String)
+  /// HTTP `503` + `Retry-After` — the engine panicked mid-request
+  /// (`handler-panic`) and is coming back. Safe to retry after
+  /// `retryAfter` seconds (nil when the header was absent/unparseable).
+  case inFlightCrash(tag: String, retryAfter: TimeInterval?)
+}
+
+public extension HTTPEngineError {
+  /// The engine `FaultClass` for a `.http` error carrying pie's daemon
+  /// status taxonomy, else `nil`. `.api`/`.stream` are inferlet-coded and
+  /// belong to the request-error code space, not this engine-fault axis;
+  /// non-fault statuses (e.g. `404`/`400`) return `nil` too.
+  var faultClass: EngineFaultClass? {
+    guard case let .http(status, body, retryAfter) = self else { return nil }
+    let tag = String(decoding: body, as: UTF8.self)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    switch status {
+    case 500: return .hostSetup(tag: tag)
+    case 502: return .guestFault(tag: tag)
+    case 503: return .inFlightCrash(tag: tag, retryAfter: retryAfter)
+    default:  return nil
+    }
+  }
+
+  /// Whether the wire contract says this fault is safe to retry as-is.
+  /// Only a `503` in-flight crash (engine restarting) is — `500`/`502`
+  /// would re-fault on a blind retry. CLASSIFICATION only; the retry
+  /// action lives in the recovery path, not here.
+  var isRetryable: Bool {
+    if case .inFlightCrash = faultClass { return true }
+    return false
+  }
+}
+
+extension HTTPEngineError {
+  /// User-facing copy for a `.http` fault. Documented pie#375 tags get
+  /// bespoke, plain-language copy; any other tag falls back to a
+  /// status-class line that still preserves the raw tag, so an
+  /// unrecognized fault is never reduced to a bare status number. The
+  /// pre-FaultClass "Engine returned HTTP <N>" shape is retained only for
+  /// statuses outside the 500/502/503 taxonomy.
+  static func faultDescription(status: Int, body: Data) -> String {
+    let tag = String(decoding: body, as: UTF8.self)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    if let friendly = faultTagCopy[tag] { return friendly }
+    switch status {
+    case 503:
+      // `handler-panic` is the only 503 tag; class copy == tag copy.
+      return "The engine restarted while answering. Try again in a moment."
+    case 500:
+      return tag.isEmpty
+        ? "The engine could not start."
+        : "The engine could not start (\(tag))."
+    case 502:
+      return tag.isEmpty
+        ? "The engine failed to answer the request."
+        : "The engine failed to answer the request (\(tag))."
+    default:
+      return tag.isEmpty
+        ? "Engine returned HTTP \(status)"
+        : "Engine returned HTTP \(status): \(tag)"
+    }
+  }
+
+  /// Plain-language copy for the documented pie#375 `FaultClass` tags
+  /// (project_pie_303_closed_fault_taxonomy_dormant). Kept to the tags
+  /// with a stable, user-meaningful cause; everything else renders via
+  /// the status-class fallback in `faultDescription`.
+  private static let faultTagCopy: [String: String] = [
+    "handler-panic": "The engine restarted while answering. Try again in a moment.",
+    "handler-trap": "The engine crashed while answering the request.",
+    "instantiate-failed": "The engine could not start the inferlet.",
+    "outparam-never-set": "The engine returned no response.",
+  ]
 }

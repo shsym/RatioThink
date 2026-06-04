@@ -103,12 +103,33 @@ async def main() -> int:
 
                 msg = [{"role": "user", "content": "List the first six prime numbers, comma separated."}]
                 body = {"model": MODEL, "messages": msg, "temperature": 0, "max_tokens": 64}
+                forced_body = {
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": "What is 2+2?"}],
+                    "temperature": 0,
+                    "max_tokens": 32,
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "calculator",
+                            "description": "Evaluate an arithmetic expression.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"expr": {"type": "string"}},
+                                "required": ["expr"],
+                            },
+                        },
+                    }],
+                    "tool_choice": "required",
+                    "speculation": {"enabled": True},
+                }
                 async with httpx.AsyncClient(timeout=180) as http_c:
                     r_plain = await http_c.post(f"{base}/v1/chat/completions", json=body)
                     r_spec = await http_c.post(
                         f"{base}/v1/chat/completions",
                         json={**body, "speculation": {"enabled": True}},
                     )
+                    forced = await http_c.post(f"{base}/v1/chat/completions", json=forced_body)
                 print(f"[smoke] plain -> {r_plain.status_code}; spec -> {r_spec.status_code}")
                 if r_plain.status_code != 200 or r_spec.status_code != 200:
                     failures.append(f"non-200: plain={r_plain.status_code} spec={r_spec.status_code} "
@@ -147,6 +168,37 @@ async def main() -> int:
                         else:
                             print(f"[smoke] ACCEPTED {sm['accepted_draft_tokens']}/{sm['proposed_draft_tokens']} "
                                   f"draft tokens, avg {sm['avg_tokens_per_step']:.2f} tok/step")
+
+                # #418 x tool_choice: speculation gates OFF when a tool call
+                # is FORCED (sampler constrained to the tool-call grammar).
+                # The real model has a native tool grammar, so a forced
+                # request 200s and returns a tool call; spec_metrics must
+                # report enabled=false + fallback_reason=tool_choice_forced.
+                # (The request was issued inside the client block above.)
+                print(f"[smoke] forced tool + speculation -> {forced.status_code}")
+                if forced.status_code != 200:
+                    failures.append(
+                        f"forced-tool request status {forced.status_code} "
+                        f"(want 200): {forced.text[:200]!r}"
+                    )
+                else:
+                    fb = json.loads(forced.text)
+                    fsm = fb.get("spec_metrics")
+                    tcs = fb["choices"][0].get("finish_reason")
+                    tool_calls = fb["choices"][0]["message"].get("tool_calls")
+                    print(f"[smoke] forced-tool finish_reason={tcs} tool_calls={bool(tool_calls)} spec_metrics={fsm}")
+                    if fsm is None:
+                        failures.append("forced-tool: spec_metrics missing")
+                    elif fsm.get("enabled") is not False:
+                        failures.append(f"forced-tool: speculation NOT gated off: {fsm}")
+                    elif fsm.get("fallback_reason") != "tool_choice_forced":
+                        failures.append(
+                            f"forced-tool: fallback_reason={fsm.get('fallback_reason')!r} "
+                            f"(want tool_choice_forced)"
+                        )
+                    else:
+                        print("[smoke] forced-tool gate OK "
+                              "(speculation off, fallback_reason=tool_choice_forced)")
             finally:
                 drain.cancel()
         finally:

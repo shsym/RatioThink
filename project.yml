@@ -23,6 +23,24 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     ENABLE_HARDENED_RUNTIME: NO
     DEAD_CODE_STRIPPING: YES
+  configs:
+    # Notarization requires the hardened runtime on every executable in the
+    # bundle. Enable it for Release only so Debug builds (make build /
+    # install-app / GUI tests) keep their unhardened + get-task-allow
+    # debugging behavior. The pie engine is already signed `--options
+    # runtime` in Scripts/build-pie-engine.sh regardless of configuration;
+    # this hardens the app + helper that Xcode signs directly. The helper
+    # already carries cs.allow-jit / cs.allow-unsigned-executable-memory and
+    # the app needs no JIT, so no entitlement changes are required.
+    Release:
+      ENABLE_HARDENED_RUNTIME: YES
+      # Do not inject the base debug entitlements (get-task-allow) into the
+      # Release build. The notary service REJECTS any executable carrying
+      # com.apple.security.get-task-allow. A Developer ID signature normally
+      # omits it, but ad-hoc/local signing injects it by default — disabling
+      # injection guarantees the notarization candidate is clean regardless of
+      # the signing identity. Debug keeps injection on so lldb can attach.
+      CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
 
 packages:
   TOMLKit:
@@ -80,6 +98,24 @@ targets:
           - $(SRCROOT)/Helper/com.ratiothink.app.helper.plist
         outputFiles:
           - $(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/com.ratiothink.app.helper.plist
+    # Bundle Scripts/collect-diagnostics.sh into Contents/Resources/ so a
+    # downloaded build carries it (#358). Pre-CodeSign (postCompileScript) so
+    # it is sealed into CodeResources — else the outer codesign rejects a
+    # "resource added that did not exist at signing". The App's Help → Collect
+    # Diagnostics… menu runs this exact copy, and a user can run it standalone
+    # when the app won't launch:
+    #   /Applications/RatioThink.app/Contents/Resources/collect-diagnostics.sh
+      - name: Bundle collect-diagnostics script
+        script: |
+          set -euo pipefail
+          DEST="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+          mkdir -p "$DEST"
+          cp "${SRCROOT}/Scripts/collect-diagnostics.sh" "$DEST/"
+          chmod +x "$DEST/collect-diagnostics.sh"
+        inputFiles:
+          - $(SRCROOT)/Scripts/collect-diagnostics.sh
+        outputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/collect-diagnostics.sh
     # Build the pie engine binary (Vendor/pie `pie-server` crate, bin
     # `pie`) for the current Xcode arch, stage into
     # Contents/Resources/pie-engine/pie (the path

@@ -164,6 +164,44 @@ final class HelperConfigTests: XCTestCase {
   // Negative cases still trap (precondition on empty PIE_XPC_SERVICE).
   // Documented; covered by probe-based death-tests above where possible.
 
+  // MARK: - test-override build gate (Release ignores PIE_TEST_* seams)
+
+  /// A non-debug (Release) build MUST ignore `PIE_TEST_ENGINE_BASE_URL` so a
+  /// shipped, signed app falls back to the real Helper-driven engine path and
+  /// never honors an attacker-supplied loopback. Exercised via the injected
+  /// `isDebugBuildOverride` seam (the compiled default is `true` in this DEBUG
+  /// test process).
+  func test_release_build_ignores_engine_base_url_override() {
+    let env = ["PIE_TEST_ENGINE_BASE_URL": "http://127.0.0.1:9999"]
+    HelperConfig.$isDebugBuildOverride.withValue(false) {
+      XCTAssertFalse(HelperConfig.isTestOverrideAllowed,
+                     "a non-debug build must not allow test overrides")
+      XCTAssertNil(HelperConfig.testEngineBaseURLOverride(env: env),
+                   "Release build must ignore PIE_TEST_ENGINE_BASE_URL")
+    }
+  }
+
+  /// A DEBUG build — including the `xcodebuild test` runner that drives the
+  /// chat-gui E2E — honors the seam so S258/S260 can point the App at the
+  /// wrapper-booted engine.
+  func test_debug_build_honors_engine_base_url_override() {
+    let env = ["PIE_TEST_ENGINE_BASE_URL": "http://127.0.0.1:9999"]
+    HelperConfig.$isDebugBuildOverride.withValue(true) {
+      XCTAssertTrue(HelperConfig.isTestOverrideAllowed)
+      XCTAssertEqual(HelperConfig.testEngineBaseURLOverride(env: env),
+                     "http://127.0.0.1:9999",
+                     "a debug build must honor the engine base-url seam")
+    }
+  }
+
+  /// Empty/absent env yields `nil` even when overrides are allowed.
+  func test_empty_or_absent_engine_base_url_is_nil_even_in_debug() {
+    HelperConfig.$isDebugBuildOverride.withValue(true) {
+      XCTAssertNil(HelperConfig.testEngineBaseURLOverride(env: ["PIE_TEST_ENGINE_BASE_URL": ""]))
+      XCTAssertNil(HelperConfig.testEngineBaseURLOverride(env: [:]))
+    }
+  }
+
   // MARK: - helpers
 
   fileprivate static func makeTempRoot() throws -> URL {

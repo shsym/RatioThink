@@ -17,11 +17,13 @@ import Foundation
 /// never publishes a green dot through the supervisor pipeline.
 public struct HelperStatusItemModel: Equatable, Sendable {
 
-  /// Semantic dot state. View layer maps to SF Symbol + tint.
+  /// Semantic dot state. View layer maps to tint color (AppKit); the
+  /// SF Symbol name + the "show motion" decision live here so they are
+  /// testable without an `NSStatusBar` (#396).
   public enum Dot: String, Equatable, Sendable {
     /// Gray outline circle. Supervisor is `.stopped`.
     case stopped
-    /// Amber filled circle. Supervisor is `.starting` or `.stopping`
+    /// Amber dotted circle. Supervisor is `.starting` or `.stopping`
     /// — transitional, not yet steady-state.
     case loading
     /// Green filled circle. Supervisor is `.running`.
@@ -29,6 +31,29 @@ public struct HelperStatusItemModel: Equatable, Sendable {
     /// Red filled circle (or triangle, view's choice). Supervisor is
     /// `.failed`.
     case error
+
+    /// SF Symbol the menu-bar button renders for this dot. `.loading`
+    /// is deliberately a DIFFERENT symbol from `.running` (`circle.dotted`
+    /// vs `circle.fill`), not just a different tint, so the two are
+    /// distinguishable without color — the amber-vs-green pair was the
+    /// "ambiguous yellow dot" accessibility gap (#396 invariant: status
+    /// must not rely only on color).
+    public var symbolName: String {
+      switch self {
+      case .stopped: return "circle"
+      case .loading: return "circle.dotted"
+      case .running: return "circle.fill"
+      case .error:   return "exclamationmark.circle.fill"
+      }
+    }
+
+    /// Whether the view should drive a repeating animation on the dot.
+    /// Only the transitional `.loading` state (engine starting/stopping)
+    /// is an in-flight async operation, so only it animates — a running
+    /// async op is never represented solely by a *static* colored dot
+    /// (#396 invariant 1). Steady states (stopped/running/error) hold
+    /// still.
+    public var isAnimated: Bool { self == .loading }
   }
 
   /// Pause/Resume toggle. The supervisor has one canonical

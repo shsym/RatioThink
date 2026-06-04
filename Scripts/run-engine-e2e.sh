@@ -16,6 +16,30 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Per-run id, exported so RealEngineLaunchE2ETests anchors each engine
+# pieHome at /tmp/pe2e-${PE2E_RUN_ID}-<uuid>. The wrapper PID is unique
+# among any concurrently-live run-engine-e2e.sh processes — exactly what
+# lets the sweep below scope itself to THIS run.
+PE2E_RUN_ID="$$"
+export PE2E_RUN_ID
+
+# Outer reap net — belt to the in-process IsolatedTestCase braces. The
+# in-process SIGKILL-reap only fires when the bundle runs to completion;
+# if `swift test` is killed (XCTest timeout, CI cancel, ^C) a hung
+# `pie serve` and its /tmp pieHome survive. On exit, SIGKILL a stray
+# engine of THIS run by its --config path, then remove THIS run's pieHome
+# dirs. Both halves are scoped to /tmp/pe2e-${PE2E_RUN_ID}-* so a
+# concurrent run-engine-e2e.sh (or a still-live bundle on the flat
+# /tmp/pe2e-<uuid> fallback) is never deleted out from under its live
+# engine — and neither is the staged model cache (/tmp/pie-e2e-models).
+# SIGKILL because a wedged engine ignores SIGTERM (a healthy one was
+# already reaped in-process).
+sweep_stray_engines() {
+  pkill -KILL -f "/tmp/pe2e-${PE2E_RUN_ID}-[0-9a-f]+/config\.toml" 2>/dev/null || true
+  rm -rf "/tmp/pe2e-${PE2E_RUN_ID}-"* 2>/dev/null || true
+}
+trap sweep_stray_engines EXIT
+
 REPO="${PIE_TEST_E2E_REPO:-Qwen/Qwen2.5-0.5B-Instruct-GGUF}"
 FILE="${PIE_TEST_E2E_FILE:-qwen2.5-0.5b-instruct-q4_k_m.gguf}"
 MODELS_DIR="${PIE_TEST_E2E_MODELS_DIR:-/tmp/pie-e2e-models}"
@@ -28,6 +52,14 @@ if [ -z "$PIE_BIN" ]; then
     PIE_BIN="$ROOT/Vendor/pie/target/release/pie"
   elif [ -x "/Applications/RatioThink.app/Contents/Resources/pie-engine/pie" ]; then
     PIE_BIN="/Applications/RatioThink.app/Contents/Resources/pie-engine/pie"
+    # Loud fallback: no repo build exists, so this run exercises the
+    # INSTALLED app's engine binary, not the current worktree. Make the
+    # substitution visible so a stale /Applications build can't silently
+    # green an engine regression in the repo. Set PIE_BIN to override.
+    echo "e2e: WARNING no repo build (Vendor/pie/target/release/pie) — using INSTALLED app engine:" >&2
+    echo "e2e:          $PIE_BIN" >&2
+    echo "e2e:          this tests the installed /Applications build, not this worktree." >&2
+    echo "e2e:          run 'make engine-build' or set PIE_BIN to test the repo binary." >&2
   fi
 fi
 if [ -z "$PIE_BIN" ] || [ ! -x "$PIE_BIN" ]; then

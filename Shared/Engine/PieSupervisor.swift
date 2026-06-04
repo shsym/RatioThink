@@ -199,6 +199,7 @@ public final class PieSupervisor: @unchecked Sendable {
     self.clock = clock
     #if DEBUG
     self.killProcessOverride = nil
+    self.livenessOverride = nil
     #endif
     self.stateQueue.setSpecific(key: self.stateQueueKey, value: ())
     // Sweep any persisted .killRejected manifest from a prior
@@ -223,13 +224,15 @@ public final class PieSupervisor: @unchecked Sendable {
                 recoveryManifestURL: URL? = nil,
                 processFactory: @escaping () -> Process = { Process() },
                 clock: @escaping () -> Date = Date.init,
-                killProcessOverride: @escaping (Process) -> Bool) {
+                killProcessOverride: @escaping (Process) -> Bool,
+                livenessOverride: ((Process) -> Bool)? = nil) {
     self.policy = policy
     self.providedLogURL = logFileURL
     self.providedRecoveryManifestURL = recoveryManifestURL
     self.processFactory = processFactory
     self.clock = clock
     self.killProcessOverride = killProcessOverride
+    self.livenessOverride = livenessOverride
     self.stateQueue.setSpecific(key: self.stateQueueKey, value: ())
     processBootRecovery()
   }
@@ -376,7 +379,7 @@ public final class PieSupervisor: @unchecked Sendable {
       Log.engine.error("PieSupervisor: clearKillRejected with no retained zombie reference; refusing")
       return false
     }
-    if process.isRunning {
+    if isProcessRunning(process) {
       Log.engine.fault("PieSupervisor: clearKillRejected denied — Process pid=\(pid, privacy: .public) still running")
       return false
     }
@@ -422,6 +425,17 @@ public final class PieSupervisor: @unchecked Sendable {
   private let clock: () -> Date
   #if DEBUG
   private let killProcessOverride: ((Process) -> Bool)?
+  /// Test-only seam parallel to `killProcessOverride`:
+  /// replaces the real `Process.isRunning` liveness probe consulted
+  /// by `clearKillRejectedLocked`. Lets a test drive the zombie
+  /// alive→dead transition synchronously instead of depending on a
+  /// real subprocess actually exiting AND being `wait4`-reaped —
+  /// timing that is arbitrarily delayed on a contended CI runner and
+  /// made `test_clearKillRejected_*` flake up to the 25s suite
+  /// timeout. Release builds strip both this storage AND the only
+  /// init that sets it, so production liveness always uses the real
+  /// `Process.isRunning` (review v5 F59 pid-reuse safety intact).
+  private let livenessOverride: ((Process) -> Bool)?
   #endif
 
   private let stateQueue = DispatchQueue(label: "com.ratiothink.supervisor.state", qos: .userInitiated)
@@ -634,6 +648,23 @@ public final class PieSupervisor: @unchecked Sendable {
     timer.setEventHandler { [weak self, weak inc] in
       guard let self, let inc, !inc.handshakeFound else { return }
       guard self.current?.id == inc.id else { return }
+      // A process that has already exited before the handshake is an
+      // early-exit / spawn failure (it carries an exit code), NOT a
+      // handshake timeout — which specifically means "process alive
+      // but silent". Its `terminationHandler` is guaranteed to fire
+      // and `handleTermination` classifies it via the exit code as
+      // `.spawnFailed`. Defer to that path rather than racing it to a
+      // less precise label: under load the timer event can run before
+      // the (starved) termination callback, and `finishSpawnFailure`
+      // would otherwise stamp `.handshakeTimeout`, which the
+      // `.failed` priorState guard in `handleTermination` then refuses
+      // to correct. Keying on `Process.isRunning` (Foundation `wait4`
+      // truth for THIS child, flips false on reap) makes the
+      // classification deterministic regardless of which event wins.
+      guard inc.process.isRunning else {
+        Log.engine.debug("PieSupervisor: handshake timer fired but process pid=\(inc.process.processIdentifier, privacy: .public) already exited; deferring to termination path for spawn-failure classification")
+        return
+      }
       Log.engine.error("PieSupervisor: handshake timeout after \(self.policy.handshakeTimeout, privacy: .public)s")
       let killed = self.killProcess(inc.process)
       // Review v2 F31: surface SIGKILL failure precisely. Without
@@ -1091,6 +1122,19 @@ public final class PieSupervisor: @unchecked Sendable {
       message: message
     )
     setState(.failed(.killRejected, message))
+  }
+
+  /// Liveness probe for the retained `.killRejected` zombie. Defers
+  /// to the real `Process.isRunning` (Foundation `wait4` bookkeeping
+  /// for the SPECIFIC child, pid-reuse-safe per review v5 F59) in
+  /// production; the `livenessOverride` test seam replaces it
+  /// so `clearKillRejected` recovery can be exercised synchronously
+  /// without waiting on a real subprocess to exit and be reaped.
+  private func isProcessRunning(_ process: Process) -> Bool {
+    #if DEBUG
+    if let livenessOverride { return livenessOverride(process) }
+    #endif
+    return process.isRunning
   }
 
   /// SIGKILL with errno capture (review v1 F6). Returns true if the

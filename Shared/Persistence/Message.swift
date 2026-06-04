@@ -29,6 +29,24 @@ public final class Message {
   /// any JSON export without a custom transformer.
   public var role: String
   public var content: String
+  /// Model thinking-block text (OpenAI `reasoning_content`; Qwen
+  /// `<think>…</think>`), kept OUT of `content` so it never renders in
+  /// the visible answer and is never replayed into request history.
+  /// Streams in alongside `content` via `MessageStreamWriter` and is
+  /// shown in a collapsible "Thinking" section. Empty for turns with no
+  /// reasoning and for non-thinking models.
+  ///
+  /// Non-optional `String` carrying an **inline (declaration-site)
+  /// default**. The `= ""` here is what makes the column migratable:
+  /// it gives the stored property a schema-level default so SwiftData
+  /// lightweight migration can backfill existing rows when an older
+  /// on-disk `chats.sqlite` (written before this column existed) is
+  /// reopened with the current schema. An init-parameter default alone
+  /// is NOT enough — without this inline default, opening a pre-existing
+  /// store throws, and `RatioThinkModelContainer.openWithFallback` would
+  /// silently drop to an empty in-memory store, making the user's chat
+  /// history appear gone (the on-disk data is intact, just unopened).
+  public var reasoning: String = ""
   /// Token count populated by the engine on finish; 0 while a
   /// streaming turn is in flight.
   public var tokens: Int
@@ -43,6 +61,7 @@ public final class Message {
     chat: Chat? = nil,
     role: String,
     content: String = "",
+    reasoning: String = "",
     tokens: Int = 0,
     ts: Date = Date(),
     meta: Data? = nil
@@ -51,6 +70,7 @@ public final class Message {
     self.chat = chat
     self.role = role
     self.content = content
+    self.reasoning = reasoning
     self.tokens = tokens
     self.ts = ts
     self.meta = meta

@@ -91,6 +91,14 @@ public struct HelperRegistrationReconciler: Sendable {
   /// (`PIE_APP_PREFERENCES_SUITE`, set by every GUI test), plus an
   /// explicit opt-out (`PIE_TEST_SKIP_HELPER_RECONCILE`).
   public static func isTestLaunch(_ env: [String: String]) -> Bool {
+    // Running INSIDE an XCTest host process (the unit-test bundles load the
+    // app code in-process, so `RatioThinkApp.init` runs here). SMAppService
+    // register/unregister + the runtime helper-restart ladder must NEVER fire
+    // in this process — they would mutate the dev/CI machine's background-item
+    // registration and even pop System Settings (#412). XCUITests run the app
+    // as a SEPARATE process WITHOUT this var, so they still rely on the
+    // explicit PIE_* markers below.
+    if (env["XCTestConfigurationFilePath"] ?? "").isEmpty == false { return true }
     let present = ["PIE_TEST_LOGIN_ITEM_STATUS",
                    "PIE_TEST_ENGINE_BASE_URL",
                    "PIE_APP_PREFERENCES_SUITE"]
@@ -154,5 +162,31 @@ public struct HelperRegistrationReconciler: Sendable {
       msg += "; unregister() had failed: \(unregisterError)"
     }
     return .repairFailed(msg)
+  }
+}
+
+extension HelperRegistrationReconciler.Outcome {
+  /// Whether the Helper is reachable after this reconcile outcome — the
+  /// signal the App-side `HelperHealthController` feeds back into the
+  /// restart ladder as `HelperHealthEvent.repairFinished(reachable:)` (#412).
+  /// `.needsApproval` counts as NOT reachable: only the user can clear the
+  /// macOS consent gate, so the ladder must escalate (and route to System
+  /// Settings) rather than treat the helper as recovered.
+  public var helperReachable: Bool {
+    switch self {
+    case .healthy, .repaired, .registered:
+      return true
+    case .needsApproval, .repairFailed:
+      return false
+    }
+  }
+
+  /// Whether this outcome requires routing the user to System Settings →
+  /// Login Items (the unbypassable macOS consent gate). The repair primitive
+  /// opens that pane so an escalated user has a one-click path to re-enable
+  /// the background item.
+  public var requiresUserApproval: Bool {
+    if case .needsApproval = self { return true }
+    return false
   }
 }

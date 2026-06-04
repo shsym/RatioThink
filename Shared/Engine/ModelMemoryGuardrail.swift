@@ -1,27 +1,114 @@
 import Foundation
 
-/// Deterministic v1 guardrail for obviously unsafe model loads.
+/// Guardrail for obviously unsafe model loads.
 ///
-/// The guardrail intentionally uses resolved artifact size, not live
-/// machine telemetry. That keeps the behavior deterministic in tests
-/// and avoids promising that RatioThink.app can perfectly predict every host's
-/// memory pressure. Unknown-size cases fail closed for v1 because
-/// launching an unmeasurable local artifact is no safer than launching
-/// an oversized one.
+/// The guardrail compares the *resolved artifact size* against a
+/// ceiling. The ceiling is now derived from the host's physical RAM
+/// rather than a fixed tripwire, so a roomy machine can run the
+/// 8B-30B models the old hardcoded 8 GiB limit wrongly blocked. Tests
+/// inject a fixed `Policy` to stay deterministic — the production
+/// default reads RAM, but no test is allowed to depend on the real
+/// host's memory. Unknown *model*-size cases still fail closed because
+/// launching an unmeasurable artifact is no safer than an oversized
+/// one; unknown *host RAM* falls back to the old fixed ceiling so the
+/// app stays usable rather than blocking every load.
 public enum ModelMemoryGuardrail {
   public struct Policy: Equatable, Sendable {
-    /// V1 ceiling for a resolved model artifact. The default seeded
-    /// model and the curated small models remain comfortably below
-    /// this, while a deterministic sparse-file fixture above it is
-    /// rejected before `pie serve` is spawned.
+    /// Ceiling for a resolved model artifact. Production derives this
+    /// from physical RAM via `recommended(physicalMemoryBytes:)`;
+    /// tests inject a fixed value so a deterministic sparse-file
+    /// fixture above it is rejected before `pie serve` is spawned.
     public var maxResolvedModelBytes: Int64
 
-    public init(maxResolvedModelBytes: Int64 = 8 * 1024 * 1024 * 1024) {
+    /// Physical RAM the ceiling was derived from, or `nil` when a
+    /// fixed ceiling was injected directly / RAM was unreadable.
+    /// Carried only so the rejection message can show the
+    /// "(N% of <RAM> RAM)" context an operator needs to understand
+    /// why a model the machine *almost* fits was blocked.
+    public var physicalMemoryBytes: Int64?
+
+    /// Fraction of *usable* RAM the ceiling represents, or `nil` when
+    /// a fixed ceiling was injected directly. Message context only.
+    public var ramFraction: Double?
+
+    /// Fixed OS/app headroom subtracted from physical RAM *before* the
+    /// fraction is applied. Carried so the rejection
+    /// message + picker badge can show the full derivation; `nil` for
+    /// an injected fixed ceiling.
+    public var reserveBytes: Int64?
+
+    public init(maxResolvedModelBytes: Int64 = Policy.unknownRAMFallbackBytes,
+                physicalMemoryBytes: Int64? = nil,
+                ramFraction: Double? = nil,
+                reserveBytes: Int64? = nil) {
       self.maxResolvedModelBytes = maxResolvedModelBytes
+      self.physicalMemoryBytes = physicalMemoryBytes
+      self.ramFraction = ramFraction
+      self.reserveBytes = reserveBytes
+    }
+
+    /// Default fraction of *usable* RAM (physical − reserve) a resolved
+    /// model may occupy. 0.65 lets a 64 GB host run the 8B-30B
+    /// models the old fixed 8 GiB tripwire wrongly blocked, after the
+    /// reserve carves out OS/app headroom.
+    public static let defaultRAMFraction: Double = 0.65
+
+    /// Fixed OS/app headroom reserved before the fraction is applied
+    ///. Without it a flat `fraction × physical` allows,
+    /// on an 8 GB Mac, 0.65 × 8 = 5.2 GiB — enough to greenlight a
+    /// ~4.7 GiB model with zero headroom. Subtracting 6 GiB first makes
+    /// that host's ceiling (8−6) × 0.65 = 1.3 GiB, correctly blocking
+    /// it. Not user-exposed in v1 (only `fraction` is on the dial).
+    public static let defaultReserveBytes: Int64 = 6 * 1024 * 1024 * 1024
+
+    /// Conservative ceiling when physical RAM is unreadable: the
+    /// pre- fixed tripwire. Falling back here (instead of failing
+    /// closed on every load) keeps small models usable on a host whose
+    /// RAM we somehow cannot read.
+    public static let unknownRAMFallbackBytes: Int64 = 8 * 1024 * 1024 * 1024
+
+    /// RAM-aware ceiling: `max(0, physicalMemoryBytes − reserveBytes) ×
+    /// fraction`, rounded. The reserve is subtracted first so a small
+    /// host keeps real OS/app headroom (a 4 GB host yields a 0 ceiling
+    /// → blocks every model, which is correct). Falls back to
+    /// `unknownRAMFallbackBytes` when RAM is unknown or non-positive.
+    /// The returned policy carries RAM + fraction + reserve so callers
+    /// (the rejection message, the picker's over-limit badge) can show
+    /// the same comparison the guardrail enforced.
+    public static func recommended(physicalMemoryBytes: Int64?,
+                                   fraction: Double = defaultRAMFraction,
+                                   reserveBytes: Int64 = defaultReserveBytes) -> Policy {
+      guard let physical = physicalMemoryBytes, physical > 0 else {
+        return Policy(maxResolvedModelBytes: unknownRAMFallbackBytes)
+      }
+      let usable = max(0, physical - reserveBytes)
+      let ceiling = Int64((Double(usable) * fraction).rounded())
+      return Policy(maxResolvedModelBytes: ceiling,
+                    physicalMemoryBytes: physical,
+                    ramFraction: fraction,
+                    reserveBytes: reserveBytes)
+    }
+
+    /// Human summary of how the ceiling was derived, e.g.
+    /// `"0.65 × (64.0 GB RAM − 6.0 GB reserve)"`. `nil` when this policy
+    /// was injected with a fixed ceiling (no RAM context) so the
+    /// message + picker simply omit the formula.
+    public var derivationSummary: String? {
+      guard let physical = physicalMemoryBytes,
+            let fraction = ramFraction,
+            let reserve = reserveBytes else { return nil }
+      return String(format: "%.2f", fraction)
+        + " × (\(InstalledModels.formattedSize(physical)) RAM"
+        + " − \(InstalledModels.formattedSize(reserve)) reserve)"
     }
   }
 
-  public static let defaultPolicy = Policy()
+  /// Production default — RAM-aware. Resolved once from the host's
+  /// physical memory. Tests that exercise the size limit inject a fixed
+  /// `Policy` instead of reading this (see `LaunchSpecResolver`'s
+  /// `memoryPolicy` seam) so their fixtures never depend on real RAM.
+  public static let defaultPolicy = Policy.recommended(
+    physicalMemoryBytes: SystemMemory.physicalBytes())
 
   private struct SizeSummary {
     var totalBytes: Int64
@@ -52,9 +139,26 @@ public enum ModelMemoryGuardrail {
     }
 
     guard summary.totalBytes <= policy.maxResolvedModelBytes else {
-      let detail = "resolved size \(InstalledModels.formattedSize(summary.totalBytes))"
-        + " exceeds v1 safety limit \(InstalledModels.formattedSize(policy.maxResolvedModelBytes));"
-        + " largest artifact \(summary.largestPath) is \(InstalledModels.formattedSize(summary.largestBytes))"
+      let detail: String
+      if policy.maxResolvedModelBytes == 0,
+         let physical = policy.physicalMemoryBytes,
+         let reserve = policy.reserveBytes {
+        // 0-ceiling: physical RAM ≤ reserve, so no model fits. Render it
+        // as a too-small-host condition, NOT "model exceeds limit 0 B"
+        // (which reads like a corrupt model) —  review F4.
+        // Unreachable on supported Apple Silicon (8 GiB floor →
+        // (8−6)×0.65 = 1.3 GiB), rendered correctly regardless.
+        detail = "this Mac's memory \(InstalledModels.formattedSize(physical)) is below the minimum"
+          + " to run any model after reserving \(InstalledModels.formattedSize(reserve)) for the system"
+      } else {
+        var over = "resolved size \(InstalledModels.formattedSize(summary.totalBytes))"
+          + " exceeds limit \(InstalledModels.formattedSize(policy.maxResolvedModelBytes))"
+        if let derivation = policy.derivationSummary {
+          over += " (\(derivation))"
+        }
+        over += "; largest artifact \(summary.largestPath) is \(InstalledModels.formattedSize(summary.largestBytes))"
+        detail = over
+      }
       return .failure(memoryRiskError(
         modelID: modelID,
         path: resolvedModelURL.path,

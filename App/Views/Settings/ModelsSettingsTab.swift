@@ -32,8 +32,19 @@ struct ModelsSettingsTab: View {
                             onReveal: revealInFinder,
                             onDelete: deleteFile,
                             onDrop: handleDrop)
+
+      MemoryGuardrailSection()
     }
     .padding(20)
+    // Pin the pane to the top of the tab. Without this the VStack only
+    // expands to fill the 520-tall Settings pane in states that contain
+    // a greedy child (the populated `Table`); the empty, loading, and
+    // error states size to their content and TabView centers the whole
+    // block vertically — the "model content floats mid-pane" misalignment.
+    // `.topLeading` keeps every state top-anchored, matching ProfilesSettingsTab.
+    // Frame goes AFTER `.padding(20)` so the inset stays inside the greedy
+    // frame; before it, the filled frame + outer padding would overflow the pane.
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     .task { await refresh() }
     .onChange(of: downloads.completionTick) { _, _ in
       Task { await refresh() }
@@ -65,15 +76,17 @@ struct ModelsSettingsTab: View {
 
   @MainActor
   private func refresh() async {
-    do {
-      let dir = try PieDirs.models()
-      modelsDirectory = dir
-      installed = try InstalledModels.scan(dir)
-      scanError = nil
-    } catch {
-      installed = []
-      scanError = String(describing: error)
-    }
+    // Filesystem walks run off the main actor. Surface models already
+    // staged in the shared HF cache (safetensors / GGUF) alongside
+    // app-managed files, deduped by slug keeping the app-managed row (the
+    // resolver's app-staged-first precedence). HF rows are read-only in
+    // the table. On an app-dir scan failure the HF rows are KEPT and the
+    // error shows as a banner above the table rather than emptying it.
+    let scan = await CachedModelScan.run()
+    modelsDirectory = scan.modelsDirectory
+    let appSlugs = Set(scan.appManaged.map(\.filename))
+    installed = scan.appManaged + scan.huggingFaceCache.filter { !appSlugs.contains($0.filename) }
+    scanError = scan.appError
   }
 
   private func revealInFinder(_ row: InstalledModel) {
@@ -317,12 +330,16 @@ private struct InstalledModelsTable: View {
 
   var body: some View {
     VStack(spacing: 8) {
+      // The scan error is a banner ABOVE the table, not a replacement for
+      // it — an app-dir failure must not hide healthy HF-cache rows that
+      // were discovered independently.
       if let error {
         Text(error)
           .foregroundStyle(.red)
           .frame(maxWidth: .infinity, alignment: .leading)
-      } else if rows.isEmpty {
-        emptyState
+      }
+      if rows.isEmpty {
+        if error == nil { emptyState }
       } else {
         Table(rows) {
           TableColumn("Name") { row in
@@ -344,6 +361,19 @@ private struct InstalledModelsTable: View {
                   .accessibilityIdentifier("InstalledRow-Unverified-\(row.id)")
               }
               Text(row.displayName).lineLimit(1).truncationMode(.middle)
+              if row.source == .huggingFaceCache {
+                // Cached HF models are read-only here (the app does not
+                // own ~/.cache/huggingface). Tag them so the user
+                // understands why Delete is unavailable.
+                Text("HF cache")
+                  .font(.caption2)
+                  .foregroundStyle(.secondary)
+                  .padding(.horizontal, 5)
+                  .padding(.vertical, 1)
+                  .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                  .help("Discovered in the shared Hugging Face cache. Managed outside RatioThink — reveal in Finder to inspect.")
+                  .accessibilityIdentifier("InstalledRow-HFCache-\(row.id)")
+              }
             }
           }
           TableColumn("Size") { row in
@@ -376,7 +406,12 @@ private struct InstalledModelsTable: View {
                 Image(systemName: "trash")
               }
               .buttonStyle(.borderless)
-              .help("Move to Trash")
+              // HF-cache rows are read-only — the app does not manage the
+              // shared cache, so deletion is out of scope.
+              .disabled(row.source == .huggingFaceCache)
+              .help(row.source == .huggingFaceCache
+                    ? "Cached Hugging Face models are managed outside RatioThink"
+                    : "Move to Trash")
             }
           }
           .width(min: 50, ideal: 60)
@@ -417,5 +452,115 @@ private struct InstalledModelsTable: View {
         .foregroundStyle(.tertiary)
     }
     .frame(maxWidth: .infinity, minHeight: 140)
+  }
+}
+
+// MARK: - Memory guardrail dial
+
+/// Operator control for the RAM-aware model-size guardrail fraction.
+/// Persists via `GuardrailSettings` (a file in the support root) so the
+/// Helper's launch-time guardrail reads the same value across the
+/// sandbox boundary. Only `fraction` is exposed; the reserve term stays
+/// a `ModelMemoryGuardrail.Policy` constant for v1. The live preview
+/// recomputes this Mac's ceiling as the dial moves.
+///
+/// NOTE: this section is the model-size guardrail dial only. The
+/// HF-cache model *discovery* list (`HFCacheCatalog`) lands separately;
+/// when that merges it adds its own section here and does not touch this
+/// one — they share only the `Models` settings tab as a host.
+private struct MemoryGuardrailSection: View {
+  @State private var fraction: Double = GuardrailSettings.defaultFraction
+  @State private var saveError: String?
+
+  private enum FractionChoice: Hashable {
+    case preset(Double)
+    case custom
+  }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      SettingsSectionHeader(title: "Memory guardrail")
+      Text("Largest model RatioThink will load, as a fraction of this Mac's memory after reserving headroom for the system. Higher is riskier under memory pressure.")
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+
+      Picker("Preset", selection: choiceBinding) {
+        ForEach(GuardrailSettings.presets, id: \.value) { preset in
+          Text(preset.label).tag(FractionChoice.preset(preset.value))
+        }
+        Text("Custom").tag(FractionChoice.custom)
+      }
+      .pickerStyle(.segmented)
+      .labelsHidden()
+      .accessibilityIdentifier("GuardrailFractionPresetPicker")
+
+      Stepper(value: stepperBinding,
+              in: GuardrailSettings.minFraction...GuardrailSettings.maxFraction,
+              step: GuardrailSettings.step) {
+        Text("Fraction: \(String(format: "%.2f", fraction))").monospacedDigit()
+      }
+      .fixedSize()
+      .accessibilityIdentifier("GuardrailFractionStepper")
+
+      Text(limitPreview)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityIdentifier("GuardrailLimitPreview")
+
+      if let saveError {
+        Text(saveError).font(.callout).foregroundStyle(.red)
+      }
+    }
+    .onAppear(perform: load)
+  }
+
+  /// Highlights the matching preset, or "Custom" for an off-preset
+  /// value. Selecting a preset sets the fraction; selecting "Custom"
+  /// keeps the current stepper value (no-op).
+  private var choiceBinding: Binding<FractionChoice> {
+    Binding(
+      get: { GuardrailSettings.matchingPreset(fraction).map(FractionChoice.preset) ?? .custom },
+      set: { choice in
+        if case .preset(let value) = choice { setFraction(value) }
+      }
+    )
+  }
+
+  private var stepperBinding: Binding<Double> {
+    Binding(get: { fraction }, set: { setFraction($0) })
+  }
+
+  private var limitPreview: String {
+    guard let physical = SystemMemory.physicalBytes() else {
+      return "This Mac's memory couldn't be read — the guardrail uses a conservative default."
+    }
+    let policy = ModelMemoryGuardrail.Policy.recommended(
+      physicalMemoryBytes: physical, fraction: fraction)
+    var line = "Max model on this Mac: \(InstalledModels.formattedSize(policy.maxResolvedModelBytes))"
+    if let derivation = policy.derivationSummary {
+      line += "  (\(derivation))"
+    }
+    return line
+  }
+
+  private func load() {
+    guard let root = try? PieDirs.applicationSupport() else { return }
+    fraction = GuardrailSettings.loadFraction(root: root)
+  }
+
+  private func setFraction(_ value: Double) {
+    // Snap to the 0.05 grid so presets stay exact and the JSON stays clean.
+    let snapped = (value / GuardrailSettings.step).rounded() * GuardrailSettings.step
+    let clamped = GuardrailSettings.clamp(snapped)
+    fraction = clamped
+    do {
+      let root = try PieDirs.applicationSupport()
+      try GuardrailSettings.saveFraction(clamped, root: root)
+      saveError = nil
+    } catch {
+      saveError = "Could not save guardrail setting: \(error)"
+    }
   }
 }

@@ -1,5 +1,24 @@
 import AppKit
+import QuartzCore
 import os
+
+/// Engine-death (D2) — the auto-relaunch closure handed to
+/// `PieEngineHost` needs the HelperAppDelegate's profileStore +
+/// resolver but must NOT keep the delegate alive past XPC
+/// teardown. The holder is a weak indirection: the closure
+/// captures it, dereferences `helper` (which is itself weak), and
+/// no-ops if the helper has been released.
+///
+/// `@unchecked Sendable`: the closure that captures this is
+/// `@Sendable` (invoked off `PieEngineHost.stateQueue`), but every
+/// access to `helper` is confined to the main queue — `helper` is
+/// assigned once on the main thread during `startXPCListener` boot
+/// and read only inside the relauncher's `DispatchQueue.main.async`
+/// block. The compiler cannot prove that confinement, so the promise
+/// is annotated rather than checked.
+private final class HelperResumeHolder: @unchecked Sendable {
+  weak var helper: HelperAppDelegate?
+}
 
 @main
 final class HelperAppDelegate: NSObject, NSApplicationDelegate {
@@ -62,6 +81,11 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   func applicationDidFinishLaunching(_ note: Notification) {
     HelperConfig.assertStartupContract()
     Log.helper.info("RatioThinkHelper launched (xpc=\(HelperConfig.xpcServiceName, privacy: .public) testMode=\(HelperConfig.isTestMode, privacy: .public))")
+    let info = Bundle.main.infoDictionary
+    Diag.helper.event("helper.launch", [
+      ("version", info?["CFBundleShortVersionString"] as? String ?? "?"),
+      ("build", info?["CFBundleVersion"] as? String ?? "?"),
+    ])
     eagerProbePieDirs()
     setupStatusItemIfNeeded()
     registerLoginItemIfNeeded()
@@ -73,6 +97,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // remains as the ongoing reminder. Dispatched async so the runloop
     // is up before we beginSheetModalForWindow.
     if let reason = degradedReason {
+      Diag.helper.event("helper.degraded", [("reason", "\(reason)")])
       DispatchQueue.main.async { [weak self] in
         self?.presentPieDirsAlert(title: "RatioThink cannot start", error: reason)
       }
@@ -210,7 +235,61 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       // production helper boot path. Lazily constructed (not in
       // init) so degraded helpers never spawn the host they cannot
       // use.
-      let host = PieEngineHost()
+      //
+      // Engine-death recovery (D2): the host's bounded auto-relaunch
+      // ladder fires on `.failed(.engineGone)`, but the host itself
+      // is profile-agnostic — the closure below routes the relaunch
+      // back through the same `HelperResumeAction` policy a
+      // user-clicked Pause/Resume would take, so the auto path and
+      // the manual path always reach the engine via one funnel.
+      // `HelperResumeHolder` carries a `weak var helper` that the
+      // closure dereferences to reach the live HelperAppDelegate.
+      // The closure captures `holder` STRONGLY so the holder outlives
+      // this function — the local `let` at the line below is the only
+      // other strong owner and goes out of scope at function return.
+      // Cycle safety: HelperMain -> engineHost -> RelaunchPolicy
+      // closure -> holder -[weak]-> HelperMain. The weak edge inside
+      // the holder breaks the cycle; capturing the holder weakly
+      // here would deallocate it at function return and silently
+      // disable every later relaunch (review v1 F1).
+      let holder = HelperResumeHolder()
+      let host = PieEngineHost(
+        relauncher: { [holder] in
+          // Off-stateQueue. Hop onto the main queue so the read of
+          // `helper.profileStore` / `helper.launchSpecResolver` is
+          // serialized against the boot-time writers and the
+          // togglePauseResume click path. HelperResumeAction.run is
+          // synchronous and quick (no I/O); it queues a fresh
+          // PieEngineHost launch task and returns.
+          DispatchQueue.main.async {
+            guard let helper = holder.helper else { return }
+            guard let engineHost = helper.engineHost else { return }
+            // #395 + review v3 N3: the veto→run composition is now the
+            // SPM-reachable `HelperResumeAction.composeAutoRelaunch`, so
+            // deleting the veto fails a unit test (it was the exact
+            // untestable boundary that hid the #299 v1 F1 blocker). This
+            // closure keeps ONLY the AppKit-bound bits: the main-queue hop,
+            // the `HelperResumeHolder` deref, and the log lines. Veto
+            // semantics are unchanged — `.failed` commits, anything else
+            // (Pause won, user Resume already ran, in-flight start) vetoes.
+            // See `Shared/HelperResumeAction.swift` for the full table.
+            let decision = HelperResumeAction.composeAutoRelaunch(status: engineHost.status) {
+              HelperResumeAction.run(
+                engineHost: engineHost,
+                profileStore: helper.profileStore,
+                resolver: helper.launchSpecResolver
+              )
+            }
+            switch decision {
+            case .vetoed(let status):
+              Log.helper.notice("auto-relaunch skipped: engineHost.status=\(String(describing: status), privacy: .public) at main-queue commit (user Pause or concurrent start landed during the deferred hop)")
+            case .ran(let outcome):
+              Log.helper.notice("auto-relaunch outcome: \(String(describing: outcome), privacy: .public)")
+            }
+          }
+        }
+      )
+      holder.helper = self
       self.engineHost = host
       // Phase 2.4: stand up the profile-backed LaunchSpec
       // resolver. ProfileStore.start failures fall back to the
@@ -485,6 +564,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
                             keyEquivalent: "q"))
     item.menu = menu
     self.statusItem = item
+    Diag.helper.event("statusitem.create", [("kind", "normal")])
 
     // Review v1 F3: no synthetic `.stopped` initial render here.
     // `subscribeToSupervisor` registers an observer whose
@@ -569,6 +649,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       Log.helper.info("statusItem: initial observer paint arrived AFTER the \(Self.initialRenderDeadlineSeconds, privacy: .public)s watchdog deadline — supervisor wiring intact, just slow")
     }
     Log.helper.info("statusItem: dot=\(model.dot.rawValue, privacy: .public) label=\(model.engineLabel, privacy: .public) pr.title=\(model.pauseResume.title, privacy: .public) pr.enabled=\(model.pauseResume.enabled, privacy: .public)")
+    Diag.helper.event("statusitem.update", [("dot", model.dot.rawValue), ("label", model.engineLabel)])
     statusItemBinding().apply(model)
   }
 
@@ -580,13 +661,17 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     HelperStatusItemBinding(
       setDot: { [weak self] dot in
         guard let self, let button = self.statusItem?.button else { return }
-        let (symbolName, color) = Self.symbolForDot(dot)
-        let config = NSImage.SymbolConfiguration(paletteColors: [color])
-        let img = NSImage(systemSymbolName: symbolName,
+        let config = NSImage.SymbolConfiguration(paletteColors: [Self.colorForDot(dot)])
+        let img = NSImage(systemSymbolName: dot.symbolName,
                           accessibilityDescription: "Pie engine \(dot.rawValue)")?
           .withSymbolConfiguration(config)
         img?.isTemplate = false
         button.image = img
+        // #396: a transitional dot (engine starting/stopping) is an
+        // in-flight async op, so it must show MOTION — never a static
+        // colored dot. Steady states remove the pulse so the menu bar
+        // is quiet when the engine is settled.
+        Self.applyDotPulse(animated: dot.isAnimated, to: button)
       },
       setEngineLabel: { [weak self] title in
         self?.engineLabelMenuItem?.title = title
@@ -610,16 +695,73 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     )
   }
 
-  /// SF Symbol + tint color for each dot state. Kept here (not in
-  /// `HelperStatusItemModel`) because `NSColor` lives in AppKit and
-  /// the model is RatioThinkCore (no AppKit). The pure model decides the
-  /// `Dot` enum; the view picks the rendering.
-  private static func symbolForDot(_ dot: HelperStatusItemModel.Dot) -> (String, NSColor) {
+  /// Tint color for each dot state. Kept here (not in
+  /// `HelperStatusItemModel`) because `NSColor` lives in AppKit and the
+  /// model is RatioThinkCore (no AppKit). The pure model decides the
+  /// `Dot` enum AND the SF Symbol name (`dot.symbolName`, #396 — so the
+  /// shape mapping is unit-testable); the view only picks the tint.
+  private static func colorForDot(_ dot: HelperStatusItemModel.Dot) -> NSColor {
+    // #412 LED language (shared with the App toolbar pip via StatusLED):
+    // waiting = white (pulses via applyDotPulse), success = green-ish white,
+    // recoverable trouble = amber. Red is reserved for the App-side
+    // helper-given-up ring, which the menu bar never shows (a dead Helper
+    // has no menu). The symbol shape (`dot.symbolName`) still distinguishes
+    // states without color (#396 accessibility), so the tint change is safe.
     switch dot {
-    case .stopped: return ("circle", .secondaryLabelColor)
-    case .loading: return ("circle.fill", .systemYellow)
-    case .running: return ("circle.fill", .systemGreen)
-    case .error:   return ("exclamationmark.circle.fill", .systemRed)
+    case .stopped: return .secondaryLabelColor   // off / dim
+    case .loading: return .labelColor            // waiting → white (animated)
+    case .running: return .systemGreen           // healthy → green-ish white
+    case .error:   return .systemOrange          // recoverable trouble → amber
+    }
+  }
+
+  /// Layer-animation key for the transitional-dot pulse. A constant so
+  /// the add/remove pair can never drift.
+  private static let dotPulseAnimationKey = "com.ratiothink.helper.dotPulse"
+
+  /// Drive (or stop) a gentle opacity pulse on the menu-bar dot so an
+  /// in-progress engine transition reads as *active work*, not a stuck
+  /// static dot (#396 invariant 1). Layer-backed opacity animation
+  /// rather than a `Timer` so the cadence is owned by Core Animation and
+  /// stops cleanly on removal — no timer to invalidate on teardown. The
+  /// pulse survives the per-apply `button.image` reassignment because it
+  /// targets `layer.opacity`, not the image.
+  private static func applyDotPulse(animated: Bool, to button: NSStatusBarButton) {
+    button.wantsLayer = true
+    guard let layer = button.layer else { return }
+    if animated {
+      // Idempotent: re-applying the same state (e.g. starting → stopping,
+      // both `.loading`) must not restart the animation mid-cycle.
+      guard layer.animation(forKey: dotPulseAnimationKey) == nil else { return }
+      let pulse = CABasicAnimation(keyPath: "opacity")
+      pulse.fromValue = 1.0
+      pulse.toValue = 0.3
+      pulse.duration = 0.7
+      pulse.autoreverses = true
+      pulse.repeatCount = .infinity
+      pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+      layer.add(pulse, forKey: dotPulseAnimationKey)
+    } else {
+      layer.removeAnimation(forKey: dotPulseAnimationKey)
+    }
+  }
+
+  /// Durable engine-lifecycle breadcrumb for each healthy-mode transition. The
+  /// `.failed` message is intentionally omitted — its code is the routable
+  /// signal and the full text already rides Unified Logging + engine.log;
+  /// `.stopping` is a transient and is skipped.
+  private static func recordEngineBreadcrumb(for status: EngineStatus) {
+    switch status {
+    case .starting:
+      Diag.helper.event("engine.start")
+    case let .running(port, profileID):
+      Diag.helper.event("engine.ready", [("port", String(port)), ("profile", profileID)])
+    case let .failed(code, _):
+      Diag.helper.event("engine.fail", [("code", code.rawValue)])
+    case .stopped:
+      Diag.helper.event("engine.stop")
+    case .stopping:
+      break
     }
   }
 
@@ -729,6 +871,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
         if case .failed = status {
           Log.helper.error("engine-host transition: \(String(describing: status), privacy: .public)")
         }
+        Self.recordEngineBreadcrumb(for: status)
         self.applyStatusItemModel(HelperStatusItemModel.make(from: status))
       }
     }
@@ -780,12 +923,58 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     self.profileStore = store
     let resolver = LaunchSpecResolver(
       profileStore: store,
-      pieBinary: { try LaunchSpecResolver.bundledPieBinary() }
+      pieBinary: { try LaunchSpecResolver.bundledPieBinary() },
+      // Engine RUNTIME home is decoupled from the user store. The spawned
+      // engine binds an aux Unix socket at
+      // <pieHome>/standalone/<pid>/g0/aux.sock, which must fit the
+      // `sun_path` 104-char limit. The store PIE_HOME can be arbitrarily
+      // deep (e.g. a sandboxed XCUITest runner's ~150-char container dir),
+      // which overflows it. The engine home is self-contained ephemeral
+      // runtime — config.toml is written fresh per launch, http.port is
+      // launcher-owned, and the model path is an absolute modelsRoot join —
+      // so a short /tmp anchor needs nothing from the store and leaves
+      // profiles/models/chats untouched. The Helper is app-sandbox=false,
+      // so it can create /tmp even when the test runner cannot.
+      pieHome: { try Self.engineRuntimeHome() },
+      // Honor the operator's RAM-guardrail fraction (persisted by the
+      // Settings → Models dial as guardrail.json) at the launch-time size
+      // guard, instead of the hardcoded default. Re-evaluated per resolve
+      // so a dial change takes effect on the next launch with no Helper
+      // restart; falls back to the default fraction when unset/unreadable.
+      memoryPolicy: {
+        let fraction = (try? PieDirs.applicationSupport())
+          .map { GuardrailSettings.loadFraction(root: $0) } ?? GuardrailSettings.defaultFraction
+        return ModelMemoryGuardrail.Policy.recommended(
+          physicalMemoryBytes: SystemMemory.physicalBytes(),
+          fraction: fraction
+        )
+      }
     )
     let closure = resolver.asClosure
     self.launchSpecResolver = closure
     Log.helper.info("buildLaunchSpecResolver: ProfileStore-backed resolver wired (profiles=\(profilesDir.path, privacy: .public))")
     return closure
+  }
+
+  /// Short, `/tmp`-anchored RUNTIME home for the spawned engine — see the
+  /// `pieHome:` note in `buildLaunchSpecResolver`. Per-UID so distinct users
+  /// never collide; within a user a single Helper owns the engine and the
+  /// launcher rewrites `config.toml`/`http.port` per launch while pie scopes
+  /// its socket by pid, so the directory is safely reused. ~26 chars keeps
+  /// `<home>/standalone/<pid>/g0/aux.sock` well under the `sun_path` limit.
+  private static func engineRuntimeHome() throws -> URL {
+    let home = URL(fileURLWithPath: "/tmp/ratiothink-engine-\(getuid())", isDirectory: true)
+    let fm = FileManager.default
+    // Owner-private (0700): the engine's aux IPC socket lives here, and on
+    // multi-user macOS /tmp is world-traversable — restrict it the way the
+    // prior ~/Library/Application Support location was implicitly private.
+    try fm.createDirectory(at: home, withIntermediateDirectories: true,
+                           attributes: [.posixPermissions: 0o700])
+    // createDirectory does not reset perms on a dir that already existed
+    // from a prior launch, so enforce it (also fails loud if the path is
+    // owned by another account rather than silently reusing it).
+    try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: home.path)
+    return home
   }
 
   #if DEBUG
@@ -904,6 +1093,18 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// so a degraded boot or unselected profile is a logged no-op.
   private func autoResumeEngineOnBoot() {
     if HelperConfig.isTestMode { return }
+    // Release-gated GUI-test seam: suppress ONLY the boot auto-resume so a
+    // seated XCUITest can assert the deterministic post-boot menu state
+    // (`Engine: stopped`) without racing the async engine start. Unlike
+    // `PIE_TEST_MODE`, the ProfileStore-backed resolver still wires, so the
+    // active profile resolves and `Resume Engine` is a live affordance.
+    // Compiled out of Release (mirrors the `#if DEBUG` policy elsewhere).
+    #if DEBUG
+    if ProcessInfo.processInfo.environment["PIE_TEST_NO_AUTO_RESUME"] == "1" {
+      Log.helper.info("autoResumeEngineOnBoot: suppressed by PIE_TEST_NO_AUTO_RESUME — engine stays stopped")
+      return
+    }
+    #endif
     let outcome = HelperResumeAction.run(
       engineHost: engineHost,
       profileStore: profileStore,
@@ -1014,6 +1215,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     menu.addItem(NSMenuItem(title: "Quit RatioThink", action: #selector(quitPie), keyEquivalent: "q"))
     item.menu = menu
     self.statusItem = item
+    Diag.helper.event("statusitem.create", [("kind", "degraded")])
   }
 
   @objc func showPie() {

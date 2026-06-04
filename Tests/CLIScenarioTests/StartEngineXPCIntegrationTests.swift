@@ -393,13 +393,14 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
 
   private func writeCapabilityProbe(portable: Bool, metal: Bool) throws -> URL {
     let binary = tempDir.appendingPathComponent("ignored-pie", isDirectory: false)
-    let payload = """
-    {"drivers":{"portable":\(portable),"cuda_native":false,"dummy":true},"devices":{"metal":\(metal)}}
-    """
+    // The launcher now probes `pie driver list` (not the removed
+    // `pie capabilities`). `metal` is vestigial — Metal is the portable
+    // driver's device, so the probe only reports portable.
+    let mark = portable ? "(compiled in)" : "(not compiled)"
     let script = """
     #!/bin/sh
-    if [ "$1" = "capabilities" ] && [ "$2" = "--json" ]; then
-      printf '%s\\n' '\(payload)'
+    if [ "$1" = "driver" ] && [ "$2" = "list" ]; then
+      printf 'Embedded drivers (compiled into this binary by feature):\\n  portable     \(mark)\\n  dummy        (compiled in)\\n'
       exit 0
     fi
     exit 0

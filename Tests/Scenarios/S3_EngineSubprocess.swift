@@ -170,6 +170,7 @@ public enum S3_EngineSubprocess {
     // with a real, untruncated inference.
     let result = try await withTimeout(seconds: timeoutSeconds, label: label) {
       var tokens = ""
+      var reasoning = ""
       var deltaCount = 0
       var finishReason: ChatEvent.FinishReason?
       for try await event in events {
@@ -179,13 +180,17 @@ public enum S3_EngineSubprocess {
             deltaCount += 1
             tokens += content
           }
+        case .reasoningDelta(let text):
+          // Thinking text rides its own channel; it must never be
+          // counted as visible content.
+          reasoning += text
         case let .finish(reason):
           finishReason = reason
         case .modelLoading, .modelReady:
           continue
         }
       }
-      return (tokens: tokens, deltaCount: deltaCount, finishReason: finishReason)
+      return (tokens: tokens, reasoning: reasoning, deltaCount: deltaCount, finishReason: finishReason)
     }
     // Review v1 F6: ≥1 non-empty `.delta` AND a semantic anchor.
     // The dummy driver historically emitted 0–few junk chars with
@@ -194,6 +199,13 @@ public enum S3_EngineSubprocess {
     // so `deltaCount` reflects real token frames only.
     try r.require(result.deltaCount >= 1,
                   "no token-content .delta frames received (only meta/finish) — dummy driver or stream regression")
+    // raw thinking delimiters must never reach the visible
+    // content channel. Holds for thinking and non-thinking models alike
+    // (a non-thinking model simply never emits them). For a thinking
+    // model (Qwen3) the reasoning text rides `reasoning_content` and is
+    // captured in `result.reasoning` instead.
+    try r.require(!result.tokens.contains("</think>") && !result.tokens.contains("<think>"),
+                  "raw <think>/</think> delimiter leaked into visible content: tokens=\(result.tokens.debugDescription)")
     let looksLikeParis = result.tokens.lowercased().contains("paris")
     let looksLong = result.tokens.count >= 10
     switch result.finishReason {
