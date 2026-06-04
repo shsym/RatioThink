@@ -184,7 +184,7 @@ struct ChatScaffoldView: View {
     VStack(spacing: 0) {
       ContentToolbar(
         viewModel: viewModel,
-        availableProfiles: availableProfiles,
+        availableProfiles: pickerProfileIDs,
         // Reflect the models the engine ACTUALLY serves (from
         // `/v1/models`) rather than the static placeholder list — pie
         // serves only its single registered model and rejects a
@@ -420,6 +420,26 @@ struct ChatScaffoldView: View {
   /// the `profileStore` lookup is expressed once rather than four times.
   private var selectedProfileDefault: String? {
     profileStore.model(forProfileID: viewModel.selectedProfileID)
+  }
+
+  /// Profile ids the toolbar picker offers — the SAME set the Settings
+  /// editor lists (every valid `*.toml`), derived live from the store so a
+  /// user can actually switch to a non-`chat` profile (e.g. the seeded
+  /// `tree-of-thought` or a `fast-think`). The previous default `["chat"]`
+  /// was never wired to `ProfileStore`, so the picker only ever showed
+  /// `chat`. Re-read each render: `ProfileStore` publishes nothing, but
+  /// this view re-renders on the ~1 Hz engine-status publishes, so a newly
+  /// seeded/edited profile appears without an app restart. Falls back to
+  /// the injected `availableProfiles` (previews/tests) when the store has
+  /// no valid entries yet. The selected id is kept present so the picker
+  /// always offers the active profile even mid-scan.
+  private var pickerProfileIDs: [String] {
+    var ids = profileStore.entries.compactMap { $0.profile?.id }
+    if ids.isEmpty { ids = availableProfiles }
+    if !ids.contains(viewModel.selectedProfileID) {
+      ids.append(viewModel.selectedProfileID)
+    }
+    return ids.sorted()
   }
 
   /// #397: the live engine/model lifecycle state driving the gate's
