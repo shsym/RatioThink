@@ -19,12 +19,24 @@ struct ChatMessageItem: Identifiable, Equatable {
   /// separate from `content`. Empty when the turn has no
   /// reasoning.
   var reasoning: String
+  /// Decoded tree-of-thought search for a ToT turn (#413), rendered in a
+  /// collapsible live tree-search section — the structured analogue of
+  /// the "Thinking" section. Nil for ordinary chat turns (and when a
+  /// persisted snapshot fails to decode, treated as no tree).
+  var tot: ToTTree?
 
-  init(id: UUID = UUID(), role: ChatMessage.Role, content: String, reasoning: String = "") {
+  init(
+    id: UUID = UUID(),
+    role: ChatMessage.Role,
+    content: String,
+    reasoning: String = "",
+    tot: ToTTree? = nil
+  ) {
     self.id = id
     self.role = role
     self.content = content
     self.reasoning = reasoning
+    self.tot = tot
   }
 }
 
@@ -44,6 +56,9 @@ extension ChatMessageItem {
       chatMessageItemLog.warning("unknown role string, coercing to .system: \(message.role, privacy: .public)")
       role = .system
     }
-    self.init(id: message.id, role: role, content: message.content, reasoning: message.reasoning)
+    // Tolerant decode: a snapshot written by a newer/older schema that no
+    // longer decodes is treated as "no tree" rather than failing the row.
+    let tot = message.tot.flatMap { try? JSONDecoder().decode(ToTTree.self, from: $0) }
+    self.init(id: message.id, role: role, content: message.content, reasoning: message.reasoning, tot: tot)
   }
 }

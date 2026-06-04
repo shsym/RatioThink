@@ -365,17 +365,35 @@ struct ChatScaffoldView: View {
       presentNoModelPrompt()
       return
     }
+    let options = ChatSendRequestOptions(
+      modelID: modelID,
+      sampling: viewModel.sampling,
+      systemPromptOverride: viewModel.systemPromptOverride
+    )
+
+    // #413: when the active profile declares `mode = "tree-of-thought"`,
+    // route the turn to the ToT dispatch (streamed tree search rendered
+    // inline) instead of a chat completion. The launched inferlet is
+    // still chat-apc — ToT is a per-request dispatch mode.
+    if let totConfig = profileStore.profile(forProfileID: viewModel.selectedProfileID)?.treeOfThought {
+      sendController.sendTreeOfThought(
+        chat: chat,
+        context: modelContext,
+        engine: engineStore.client,
+        config: totConfig,
+        persistenceStatus: persistenceStatus,
+        options: options
+      )
+      return
+    }
+
     sendController.send(
       chat: chat,
       context: modelContext,
       engine: engineStore.client,
       modelLoadCenter: modelLoadCenter,
       persistenceStatus: persistenceStatus,
-      options: ChatSendRequestOptions(
-        modelID: modelID,
-        sampling: viewModel.sampling,
-        systemPromptOverride: viewModel.systemPromptOverride
-      ),
+      options: options,
       // `EngineStatusStore` conforms to `ChatRecoveryGate`; passing it
       // here lets the send pipeline classify a mid-stream
       // `HTTPEngineError.engineGone` (or a transport throw racing the

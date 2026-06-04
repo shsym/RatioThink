@@ -38,6 +38,30 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  /// #413: first launch also seeds an example tree-of-thought profile so
+  /// the live tree-search feature is reachable by switching to it. chat
+  /// stays the active default; the ToT profile is a valid ToT profile.
+  func test_seeds_tree_of_thought_profile_on_first_launch() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      let seeded = dir.appendingPathComponent(ProfileStore.treeOfThoughtFilename)
+      XCTAssertTrue(FileManager.default.fileExists(atPath: seeded.path),
+                    "first launch should seed tree-of-thought.toml")
+
+      let entry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "tree-of-thought.toml" })
+      let profile = try XCTUnwrap(entry.profile)
+      XCTAssertEqual(profile.id, "tree-of-thought")
+      XCTAssertEqual(profile.inferlet, "chat-apc", "ToT is a dispatch mode; the launched inferlet stays chat-apc")
+      XCTAssertEqual(profile.treeOfThought, ToTProfileConfig(breadth: 3, depth: 2, beamWidth: 2, maxTokensPerNode: 256))
+      // chat remains the active default; ToT is opt-in via profile switch.
+      XCTAssertEqual(store.activeProfileID, "chat")
+    }
+  }
+
   /// : seeding the default `chat.toml` on a fresh install
   /// must also write the active-profile marker. Without this, the
   /// menu-bar Resume click returns `.noActiveProfile` on first launch

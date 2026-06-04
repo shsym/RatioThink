@@ -213,6 +213,38 @@ public final class ProfileStore: ObservableObject {
   /// Filename written by `seedDefaultsIfEmpty()` on first launch.
   public static let defaultChatFilename = "chat.toml"
 
+  /// Example tree-of-thought profile (#413) seeded alongside `chat.toml`
+  /// on first launch so the live tree-search feature is reachable: the
+  /// user just switches to it. Reuses the same default model + the
+  /// `chat-apc` inferlet (ToT is a per-request dispatch mode, not a
+  /// separate wasm); `inferlet_args.mode = "tree-of-thought"` is what
+  /// `Profile.treeOfThought` keys on, and the breadth/depth/beam_width
+  /// are the bounded search shape (server-validated). The profiles editor
+  /// only displays `inferlet_args`, so seeding the file is how a user gets
+  /// a ToT profile without hand-editing TOML.
+  public static let treeOfThoughtFilename = "tree-of-thought.toml"
+  public static let treeOfThoughtTOML: String = """
+  id = "tree-of-thought"
+  name = "Tree of Thought"
+  icon = "point.3.connected.trianglepath.dotted"
+  model = "\(defaultChatModelID)"
+  inferlet = "chat-apc"
+  system_prompt = "You are a helpful assistant."
+
+  [sampling]
+  temperature = 0.7
+  top_p = 0.9
+  max_tokens = 2048
+
+  [inferlet_args]
+  mode = "tree-of-thought"
+  breadth = 3
+  depth = 2
+  beam_width = 2
+  max_tokens_per_node = 256
+
+  """
+
   /// Profile id encoded in `defaultChatTOML`. Also the value written
   /// to the `activeProfileURL` marker on first launch:
   /// without seeding the marker the menu-bar Resume click is a silent
@@ -943,6 +975,22 @@ public final class ProfileStore: ObservableObject {
       return SeedResult(
         dirError: .seedFailed(path: target.path, underlying: underlying),
         markerError: nil
+      )
+    }
+
+    // #413: seed the example tree-of-thought profile alongside chat.toml so
+    // the live tree-search feature is reachable out of the box. Best-effort
+    // — a failure here must NOT fail the seed (chat.toml + its marker are
+    // the critical path); the user can still chat, just without a
+    // pre-seeded ToT profile. Gated on the same empty-dir guard as
+    // chat.toml, so a deleted ToT profile stays deleted.
+    let totTarget = directory.appendingPathComponent(Self.treeOfThoughtFilename)
+    do {
+      try Self.treeOfThoughtTOML.write(to: totTarget, atomically: true, encoding: .utf8)
+      Log.store.info("seeded tree-of-thought profile at \(totTarget.path, privacy: .public)")
+    } catch {
+      Log.store.error(
+        "seed tree-of-thought profile failed (non-fatal): \(String(describing: error), privacy: .public)"
       )
     }
 

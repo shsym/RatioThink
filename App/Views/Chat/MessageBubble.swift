@@ -35,6 +35,11 @@ struct MessageBubble: View {
     case .assistant:
       HStack {
         VStack(alignment: .leading, spacing: 6) {
+          // #413: a tree-of-thought turn renders its live search above the
+          // answer, the structured sibling of the reasoning section.
+          if let tot = message.tot {
+            TreeSearchSection(tree: tot, answerStarted: !message.content.isEmpty)
+          }
           if !message.reasoning.isEmpty {
             ThinkingSection(
               reasoning: message.reasoning,
@@ -42,10 +47,12 @@ struct MessageBubble: View {
             )
           }
           // Show the answer bubble once content arrives; when there's
-          // no reasoning at all, keep rendering it even while empty so
-          // the freshly-inserted streaming row still shows a placeholder
-          // bubble (preserves prior behavior).
-          if !message.content.isEmpty || message.reasoning.isEmpty {
+          // neither reasoning nor a tree, keep rendering it even while
+          // empty so the freshly-inserted streaming row still shows a
+          // placeholder bubble (preserves prior behavior). A ToT turn
+          // mid-search has empty content + a tree, so it shows only the
+          // tree until the final answer lands.
+          if !message.content.isEmpty || (message.reasoning.isEmpty && message.tot == nil) {
             bubble(background: Color.secondary.opacity(0.15),
                    foreground: .primary,
                    alignment: .leading)
