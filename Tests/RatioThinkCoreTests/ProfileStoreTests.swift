@@ -62,6 +62,65 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  /// #413 (operator ITEM 2A): an EXISTING install — profiles dir already
+  /// holds `chat.toml` from before #413, so the empty-dir seed is a no-op —
+  /// must STILL get the tree-of-thought profile, via the write-if-absent
+  /// backfill on `start()`. (Reproduces the operator's "ToT profile appears
+  /// nowhere" on an upgraded install.)
+  func test_backfills_tree_of_thought_profile_into_existing_install() throws {
+    try withTempProfilesDir { dir in
+      try ProfileStore.defaultChatTOML.write(
+        to: dir.appendingPathComponent(ProfileStore.defaultChatFilename),
+        atomically: true, encoding: .utf8)
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      try "chat".write(to: active, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      let totURL = dir.appendingPathComponent(ProfileStore.treeOfThoughtFilename)
+      XCTAssertTrue(FileManager.default.fileExists(atPath: totURL.path),
+                    "existing install (non-empty dir) must still get tree-of-thought.toml backfilled")
+      let entry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "tree-of-thought.toml" })
+      XCTAssertEqual(entry.profile?.id, "tree-of-thought")
+      XCTAssertNotNil(entry.profile?.treeOfThought)
+      XCTAssertEqual(store.activeProfileID, "chat", "backfill must not change the active profile")
+    }
+  }
+
+  /// #413: the backfill is write-IF-ABSENT — it must never clobber a
+  /// user-edited tree-of-thought.toml.
+  func test_backfill_does_not_clobber_user_edited_tree_of_thought_profile() throws {
+    try withTempProfilesDir { dir in
+      try ProfileStore.defaultChatTOML.write(
+        to: dir.appendingPathComponent(ProfileStore.defaultChatFilename),
+        atomically: true, encoding: .utf8)
+      let edited = """
+      id = "tree-of-thought"
+      name = "My ToT"
+      model = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+      inferlet = "chat-apc"
+
+      [inferlet_args]
+      mode = "tree-of-thought"
+      breadth = 5
+      """
+      let totURL = dir.appendingPathComponent(ProfileStore.treeOfThoughtFilename)
+      try edited.write(to: totURL, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(try String(contentsOf: totURL, encoding: .utf8), edited,
+                     "backfill must not clobber a user-edited tree-of-thought.toml")
+      XCTAssertEqual(
+        store.entries.first { $0.url.lastPathComponent == "tree-of-thought.toml" }?.profile?.treeOfThought?.breadth,
+        5)
+    }
+  }
+
   /// : seeding the default `chat.toml` on a fresh install
   /// must also write the active-profile marker. Without this, the
   /// menu-bar Resume click returns `.noActiveProfile` on first launch
@@ -256,7 +315,9 @@ final class ProfileStoreTests: XCTestCase {
       try writeProfile(into: dir, name: "zeta.toml", id: "zeta", displayName: "Zeta")
       try writeProfile(into: dir, name: "alpha.toml", id: "alpha", displayName: "Alpha")
 
-      let store = ProfileStore(directory: dir)
+      // Opt out of the #413 example-profile backfill so this scan-ordering
+      // fixture stays hermetic (alpha + zeta only).
+      let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
       try store.start()
       defer { store.stop() }
 
@@ -1350,7 +1411,9 @@ final class ProfileStoreTests: XCTestCase {
     try withTempProfilesDir { dir in
       try writeProfile(into: dir, name: "a.toml", id: "a", displayName: "A")
       try writeProfile(into: dir, name: "b.toml", id: "b", displayName: "B")
-      let store = ProfileStore(directory: dir)
+      // Opt out of the #413 example-profile backfill so the entry count is
+      // exactly the two fixtures.
+      let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
       try store.start()
       XCTAssertEqual(store.entries.count, 2, "sanity: populated post-start")
 
@@ -1479,7 +1542,9 @@ final class ProfileStoreTests: XCTestCase {
     // pins it.
     try withTempProfilesDir { dir in
       try writeProfile(into: dir, name: "a.toml", id: "a", displayName: "A")
-      let store = ProfileStore(directory: dir)
+      // Opt out of the #413 example-profile backfill so the count is exactly
+      // the one fixture (the test then drops a 2nd to schedule a reload).
+      let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
       try store.start()
       XCTAssertEqual(store.entries.count, 1, "sanity: 1 entry post-start")
 
