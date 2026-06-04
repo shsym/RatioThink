@@ -1011,6 +1011,52 @@ final class PieSupervisorTests: XCTestCase {
     }
   }
 
+  /// Same reaper race as the exit-code case, but the crash-on-launch
+  /// child died on a signal it raised itself — a Rust panic aborts with
+  /// SIGABRT, a bad load segfaults with SIGSEGV. Foundation reports
+  /// `terminationReason == .uncaughtSignal` with the crash signal as the
+  /// status. That is a spawn failure, not an alive-but-silent handshake
+  /// timeout, and must reclassify `.handshakeTimeout → .spawnFailed`. The
+  /// discriminator is the signal: the supervisor's own kill of a live
+  /// engine is SIGKILL (the only signal this path sends), so any OTHER
+  /// signal is the child crashing on its own.
+  func test_handshakeTimerWinsRace_thenSignalCrash_reclassifiesToSpawnFailed() throws {
+    let fake = FakeProcess()
+    let sup = PieSupervisor(
+      policy: .init(handshakeTimeout: 0.05,
+                    restartAttempts: 1,
+                    restartWindow: 30,
+                    stopGracePeriod: 1,
+                    stopOverrun: 1,
+                    stdoutCarryLimit: 64 * 1024),
+      logFileURL: logURL,
+      recoveryManifestURL: tempDir.appendingPathComponent("manifest.json"),
+      processFactory: { fake },
+      killProcessOverride: { _ in true }   // SIGKILL "succeeds" on the zombie
+    )
+    _ = sup.start(makeSpec(binary: tempDir.appendingPathComponent("unused-fake-binary"),
+                           profileID: "chat"))
+
+    // 1. Timer wins: stamps the (wrong) terminal handshake timeout.
+    let timedOut = waitFor(sup, predicate: {
+      if case .failed(.handshakeTimeout, _) = $0 { return true }; return false
+    }, timeout: 5)
+    guard case .failed(.handshakeTimeout, _)? = timedOut else {
+      return XCTFail("precondition: supervisor must first stamp .handshakeTimeout, got \(String(describing: timedOut))")
+    }
+
+    // 2. Reaper arrives: the child actually aborted on its own (SIGABRT).
+    //    terminationReason==.uncaughtSignal with a non-SIGKILL status must
+    //    flip the classification to .spawnFailed.
+    fake.deliverTermination(status: SIGABRT, reason: .uncaughtSignal)
+    let corrected = waitFor(sup, predicate: {
+      if case .failed(.spawnFailed, _) = $0 { return true }; return false
+    }, timeout: 5)
+    guard case .failed(.spawnFailed, _)? = corrected else {
+      return XCTFail("a child that crashed on SIGABRT must reclassify .handshakeTimeout → .spawnFailed; got \(String(describing: sup.status))")
+    }
+  }
+
   // MARK: - helpers
 
   private func makeSupervisor(policy: PieSupervisor.Policy = .init(handshakeTimeout: 1.0,
