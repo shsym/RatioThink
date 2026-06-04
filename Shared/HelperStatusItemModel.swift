@@ -66,10 +66,18 @@ public struct HelperStatusItemModel: Equatable, Sendable {
     /// Human-readable engine state for the menu-bar button's
     /// accessibility label (#424 acceptance: AX describes the app AND
     /// current status). The view composes "RatioThink engine <word>".
+    ///
+    /// `.loading` is deliberately SUB-STATE-NEUTRAL ("changing state"):
+    /// it collapses BOTH `.starting` and `.stopping` into one visual state
+    /// (white outline + pulse), and this word is the only channel that
+    /// could distinguish them on the status button — so it must not claim
+    /// a direction (announcing "starting" during a stop would be wrong).
+    /// The precise sub-state still rides the menu's `engineLabel`
+    /// ("Engine: stopping…").
     public var accessibilityWord: String {
       switch self {
       case .stopped: return "stopped"
-      case .loading: return "starting"
+      case .loading: return "changing state"
       case .running: return "running"
       case .error:   return "failed"
       }

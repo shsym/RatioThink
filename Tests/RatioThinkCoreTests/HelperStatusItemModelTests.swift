@@ -175,8 +175,26 @@ final class HelperStatusItemModelTests: XCTestCase {
   /// state word; the view composes "RatioThink engine <word>".
   func test_accessibilityWord_describes_each_engine_state() {
     XCTAssertEqual(HelperStatusItemModel.Dot.stopped.accessibilityWord, "stopped")
-    XCTAssertEqual(HelperStatusItemModel.Dot.loading.accessibilityWord, "starting")
     XCTAssertEqual(HelperStatusItemModel.Dot.running.accessibilityWord, "running")
     XCTAssertEqual(HelperStatusItemModel.Dot.error.accessibilityWord, "failed")
+
+    // `.loading` collapses .starting AND .stopping into one visual state,
+    // so its AX word must be SUB-STATE-NEUTRAL — never claim a direction
+    // (announcing "starting" during a stop would be wrong; F1).
+    XCTAssertEqual(HelperStatusItemModel.Dot.loading.accessibilityWord, "changing state")
+    XCTAssertNotEqual(HelperStatusItemModel.Dot.loading.accessibilityWord, "starting")
+  }
+
+  /// A STOPPING engine maps to `.loading`, so the status-button AX word
+  /// must not announce "starting" — the precise sub-state rides the menu
+  /// label (`engineLabel`) instead (F1: the AX word is the button's sole
+  /// disambiguator, so it stays neutral rather than wrong).
+  func test_stopping_accessibilityWord_does_not_say_starting() {
+    let stopping = HelperStatusItemModel.make(from: .stopping)
+    XCTAssertEqual(stopping.dot, .loading)
+    XCTAssertFalse(stopping.dot.accessibilityWord.contains("starting"),
+                   "stopping must not announce 'starting' on the status button")
+    // The precise sub-state still rides the menu label.
+    XCTAssertEqual(stopping.engineLabel, "Engine: stopping…")
   }
 }
