@@ -7,14 +7,36 @@
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Lifecycle status of a tree node. Serializes to the snake_case wire
+/// strings `"root" | "ok" | "error"` — byte-identical to the prior
+/// `&'static str` representation — so this is a pure internal tightening,
+/// not a wire change. Modeling it as an enum makes illegal status values
+/// unrepresentable and lets the orchestration branch on a variant instead
+/// of string-comparing.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeStatus {
+    /// The synthetic conversation-prefix root (never generated or scored).
+    Root,
+    /// A successfully generated candidate continuation.
+    Ok,
+    /// Generation — or the fork that precedes it — failed for this node.
+    Error,
+}
+
 /// One node in the generated thought tree.
 ///
-/// * `status` is `"root"`, `"ok"`, or `"error"`.
-/// * `score` is the value-evaluator rating (1–10), or `null` when scoring
-///   failed or could not be parsed.
-/// * `error` carries a per-node diagnostic on partial failure (omitted
-///   from the wire otherwise) — this is how the response represents
-///   per-node failures while the rest of the tree still returns.
+/// * `status` is a [`NodeStatus`] (`"root" | "ok" | "error"` on the wire).
+/// * `score` is the value-evaluator rating (1–10), or `null` when the
+///   scorer returned no usable integer or failed outright.
+/// * `error` carries a per-node *generation* diagnostic on partial failure
+///   (omitted from the wire otherwise) — this is how the response
+///   represents per-node failures while the rest of the tree still returns.
+/// * `score_error` carries a per-node *scoring-infrastructure* diagnostic
+///   (a fork/generate failure inside the value evaluator), omitted when
+///   absent. It distinguishes an infra scorer collapse — which silently
+///   degrades the beam to input-order pruning — from a benign `null` score
+///   the model simply didn't emit a parseable integer for.
 #[derive(Serialize, Clone, Debug)]
 pub struct Node {
     pub id: String,
@@ -23,9 +45,11 @@ pub struct Node {
     pub branch_index: Option<usize>,
     pub content: String,
     pub score: Option<u8>,
-    pub status: &'static str,
+    pub status: NodeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_error: Option<String>,
     pub children: Vec<Node>,
 }
 
@@ -40,8 +64,9 @@ impl Node {
             branch_index: None,
             content: String::new(),
             score: None,
-            status: "root",
+            status: NodeStatus::Root,
             error: None,
+            score_error: None,
             children: Vec::new(),
         }
     }
@@ -89,8 +114,9 @@ pub fn error_leaf(parent_id: &str, depth: usize, branch_index: usize, error: Str
         branch_index: Some(branch_index),
         content: String::new(),
         score: None,
-        status: "error",
+        status: NodeStatus::Error,
         error: Some(error),
+        score_error: None,
         children: Vec::new(),
     }
 }
@@ -266,7 +292,7 @@ mod tests {
         assert_eq!(n.parent_id.as_deref(), Some("p1"));
         assert_eq!(n.depth, 2);
         assert_eq!(n.branch_index, Some(1));
-        assert_eq!(n.status, "error");
+        assert_eq!(n.status, NodeStatus::Error);
         // Empty content + no score keep it out of the beam.
         assert!(n.content.is_empty());
         assert_eq!(n.score, None);
@@ -290,8 +316,9 @@ mod tests {
                 branch_index: Some(0),
                 content: "c".to_string(),
                 score: Some(5),
-                status: "ok",
+                status: NodeStatus::Ok,
                 error: None,
+                score_error: None,
                 children: Vec::new(),
             },
         ];
@@ -311,8 +338,9 @@ mod tests {
                 branch_index: Some(b),
                 content: String::new(),
                 score: None,
-                status: "ok",
+                status: NodeStatus::Ok,
                 error: None,
+                score_error: None,
                 children: Vec::new(),
             });
         }
@@ -365,7 +393,40 @@ mod tests {
         ] {
             assert!(root.get(k).is_some(), "node missing key {k}");
         }
-        // `error` is omitted when None.
+        // `error` / `score_error` are omitted when None.
         assert!(root.get("error").is_none(), "error should be omitted when None");
+        assert!(
+            root.get("score_error").is_none(),
+            "score_error should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn node_status_serializes_to_stable_wire_strings() {
+        // Guards the wire format a forthcoming freeze will pin: the enum
+        // must stay byte-identical to the prior `&'static str`.
+        assert_eq!(serde_json::to_value(NodeStatus::Root).unwrap(), "root");
+        assert_eq!(serde_json::to_value(NodeStatus::Ok).unwrap(), "ok");
+        assert_eq!(serde_json::to_value(NodeStatus::Error).unwrap(), "error");
+    }
+
+    #[test]
+    fn node_score_error_serializes_when_present() {
+        let n = Node {
+            id: "x".to_string(),
+            parent_id: Some("root".to_string()),
+            depth: 1,
+            branch_index: Some(0),
+            content: "ans".to_string(),
+            score: None,
+            status: NodeStatus::Ok,
+            error: None,
+            score_error: Some("score fork failed: boom".to_string()),
+            children: Vec::new(),
+        };
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(v.get("score_error").unwrap(), "score fork failed: boom");
+        // An ok node with a scoring failure still has a null score.
+        assert!(v.get("score").unwrap().is_null());
     }
 }
