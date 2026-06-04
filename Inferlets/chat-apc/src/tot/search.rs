@@ -21,7 +21,10 @@ use futures::future::join_all;
 use inferlet::sample::Sampler;
 use inferlet::Context;
 
+use crate::sse::Emitter;
+
 use super::schema::TotParams;
+use super::stream;
 use super::tree::{
     assemble, best_leaf, error_leaf, new_node_id, parse_score, select_beam, Candidate, Node,
     NodeStatus,
@@ -112,7 +115,21 @@ pub struct SearchOutcome {
 /// opened per branch in [`expand`]. A cue committed into the shared
 /// prefix would be duplicated across every fork and waste the zero-token
 /// forward pass that the level-1 spin fix removed.
-pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
+///
+/// When `emitter` is `Some`, the search streams (#413): as each level
+/// finishes (generated + scored + pruned), every node on it is emitted as
+/// a `node_complete` frame followed by the level's `level_pruned` beam
+/// selection — the single source of search orchestration drives both the
+/// non-streaming response and the streamed one, so they can never diverge.
+/// Emit errors are deliberately swallowed: a peer disconnect (the common
+/// case) just means no one is listening, and the bounded search
+/// (≤ `MAX_NODES`) finishes either way; the returned [`SearchOutcome`] is
+/// identical regardless of whether anyone received the frames.
+pub async fn run(
+    root_ctx: Context,
+    params: &TotParams,
+    mut emitter: Option<&mut Emitter>,
+) -> SearchOutcome {
     let mut flat: Vec<Node> = vec![Node::root()];
     let mut frontier: Vec<Frontier> = vec![Frontier {
         ctx: root_ctx,
@@ -125,6 +142,12 @@ pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
     let mut last_level: Vec<Candidate> = Vec::new();
 
     for level in 1..=params.depth {
+        // Index into `flat` of this level's first node. Every node appended
+        // below — refine-flush error leaves, fork error leaves, and the
+        // materialized candidates — lands in `flat[level_start..]`, the
+        // exact slice the streaming sink replays as `node_complete` frames.
+        let level_start = flat.len();
+
         // Levels > 1 refine the parent before forking: append the refine
         // user-turn and flush it into the shared prefix. The assistant
         // turn itself is opened per child in `expand` (every level cues
@@ -232,6 +255,14 @@ pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
         // null an answer earlier levels produced.
         let (pool, stop) = fold_level(last_level, candidates, &keep);
         last_level = pool;
+
+        // #413: stream this level (all of its nodes, then the beam) once
+        // it is fully resolved. Emitted before the `stop` break so a
+        // search-ending final level still streams its nodes + empty beam.
+        if let Some(em) = emitter.as_deref_mut() {
+            let _ = stream::emit_level(em, level, &flat[level_start..], &keep).await;
+        }
+
         if stop {
             break;
         }

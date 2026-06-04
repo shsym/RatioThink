@@ -49,13 +49,21 @@
 //! represented on the node (`status:"error"` + `error`) while the rest
 //! of the tree still returns.
 //!
-//! ## Scope (v1)
+//! ## Streaming (`stream:true`, #413)
 //!
-//! Non-streaming only — `stream:true` is rejected with 400. The live
-//! tree-search UI + a ToT streaming wire format are tracked separately
-//! (ticket #413). The `tree-of-thought` dispatch *name* is the stable
-//! wire seam: a future move to a dynamically-loaded or separate inferlet
-//! requires no client change.
+//! `stream:true` returns an SSE stream that surfaces the search live —
+//! `tree_start`, then per level a `node_complete` for every generated node
+//! followed by a `level_pruned` beam selection, then a terminal
+//! `tree_complete` and `[DONE]`. The wire format + frame schema live in
+//! [`stream`]; the same [`search::run`] orchestration drives both the
+//! streamed and non-streamed responses (it just takes an optional
+//! [`Emitter`]), so the two can never diverge. Pre-stream failures
+//! (validation, model resolution, context build) still return the JSON
+//! 4xx/5xx envelope — the SSE response is opened only once the root
+//! context is built and flushed, so a doomed request never emits a
+//! misleading `tree_start`. The `tree-of-thought` dispatch *name* is the
+//! stable wire seam: a future move to a dynamically-loaded or separate
+//! inferlet requires no client change.
 //!
 //! ## Scoring caveat (v1)
 //!
@@ -88,10 +96,11 @@
 
 mod schema;
 mod search;
+mod stream;
 mod tree;
 
 use crate::chat::completions::{self, ChatMessage};
-use crate::sse;
+use crate::sse::{self, Emitter};
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Response};
 
@@ -104,18 +113,6 @@ pub async fn dispatch(
     stream: bool,
     res: Responder,
 ) -> Finished {
-    // v1 has no streaming. Reject explicitly rather than silently
-    // ignoring the flag (Swift's dispatchInferlet defaults stream:true).
-    if stream {
-        return res
-            .respond(sse::json_error(
-                400,
-                "invalid_request",
-                "tree-of-thought has no streaming in v1; set stream:false",
-            ))
-            .await;
-    }
-
     let input: schema::TotInput = match input {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
@@ -251,10 +248,21 @@ pub async fn dispatch(
             .await;
     }
 
-    let outcome = search::run(root_ctx, &params).await;
+    // Generated once so the streaming `tree_start` id and the non-streaming
+    // envelope id come from the same source.
+    let tree_id = tree::new_tree_id();
+
+    // #413: the root context is now built + flushed, so a `stream:true`
+    // request can safely commit SSE headers — every failure that warranted
+    // a JSON 4xx/5xx envelope has already returned above.
+    if stream {
+        return dispatch_streaming(root_ctx, &params, &tree_id, &model_id, res).await;
+    }
+
+    let outcome = search::run(root_ctx, &params, None).await;
 
     let response_body = tree::TreeResponse {
-        id: tree::new_tree_id(),
+        id: tree_id,
         object: "tree_of_thought",
         model: model_id,
         breadth: params.breadth,
@@ -282,4 +290,40 @@ pub async fn dispatch(
         .body(body.into_body())
         .unwrap();
     res.respond(response).await
+}
+
+/// SSE streaming variant (#413). `Emitter::start` commits the response
+/// headers, so from here every exit path finishes through the emitter —
+/// all pre-stream failures (validation, model resolution, context build)
+/// were already returned as JSON envelopes by [`dispatch`] before this is
+/// reached, exactly like `chat-apc`'s `handle_streaming`.
+///
+/// Frame order: `tree_start` → (`node_complete`* `level_pruned`)\* per
+/// level (emitted inside [`search::run`]) → `tree_complete` → `[DONE]`.
+/// A client that disconnects before the first frame ends the stream
+/// immediately; mid-stream disconnects are swallowed by `run` and the
+/// terminal emits below (the search still completes, just unobserved).
+async fn dispatch_streaming(
+    root_ctx: inferlet::Context,
+    params: &schema::TotParams,
+    tree_id: &str,
+    model_id: &str,
+    res: Responder,
+) -> Finished {
+    let mut em = Emitter::start(res);
+    if stream::emit_tree_start(&mut em, tree_id, model_id, params)
+        .await
+        .is_err()
+    {
+        return em.finish();
+    }
+    let outcome = search::run(root_ctx, params, Some(&mut em)).await;
+    let _ = stream::emit_tree_complete(
+        &mut em,
+        outcome.selected_node_id.as_deref(),
+        outcome.final_answer.as_deref(),
+    )
+    .await;
+    sse::emit_done_logged(&mut em, "tot_tree_complete").await;
+    em.finish()
 }

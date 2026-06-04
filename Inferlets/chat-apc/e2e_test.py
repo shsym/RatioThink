@@ -557,18 +557,28 @@ async def main() -> int:
                     # need a working forward pass. The full-search shape
                     # check below is best-effort against the dummy driver.
 
-                    # stream:true → 400 (no streaming in v1).
+                    # stream:true + invalid params → still a JSON 400
+                    # envelope, NOT a half-open SSE stream. #413: pre-stream
+                    # validation runs BEFORE Emitter::start, so a doomed
+                    # request never opens a stream it can only error inside.
                     r = await http.post(
                         f"{base}/v1/inferlet",
                         json={
                             "inferlet": "tree-of-thought",
                             "stream": True,
-                            "input": {"messages": [{"role": "user", "content": "hi"}]},
+                            "input": {
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "breadth": 0,
+                            },
                         },
                     )
-                    print(f"[harness] POST /v1/inferlet(tot stream=true) -> {r.status_code}")
+                    print(f"[harness] POST /v1/inferlet(tot stream + breadth=0) -> {r.status_code}")
                     if r.status_code != 400:
-                        failures.append(f"tot stream:true status {r.status_code} (want 400)")
+                        failures.append(f"tot stream breadth=0 status {r.status_code} (want 400)")
+                    if r.headers.get("content-type", "").split(";", 1)[0] == "text/event-stream":
+                        failures.append(
+                            "tot stream breadth=0 opened an SSE stream (want a JSON 400 envelope)"
+                        )
 
                     # Out-of-range breadth → 400 with `param` tag.
                     r = await http.post(
@@ -712,6 +722,124 @@ async def main() -> int:
                         )
                     else:
                         failures.append(f"tot search status {r.status_code} (want 200 or 500)")
+
+                    # ── tree-of-thought STREAMING (#413) ─────────────
+                    # stream:true streams the same search as SSE: a
+                    # `tree_start`, then per level a `node_complete` per
+                    # node followed by a `level_pruned` beam, then exactly
+                    # one terminal `tree_complete` and `[DONE]`. As with
+                    # the non-stream search the dummy driver may fail the
+                    # pre-stream flush (→ JSON 500, recorded SKIPPED); the
+                    # frame-ORDER invariant is asserted only when the
+                    # stream actually opens (200 text/event-stream).
+                    sbd, sdp, sbw = 2, 2, 1
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": True,
+                            "input": {
+                                "messages": [{"role": "user", "content": "What is 2+2?"}],
+                                "breadth": sbd,
+                                "depth": sdp,
+                                "beam_width": sbw,
+                                "max_tokens_per_node": 16,
+                            },
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot STREAM {sbd}x{sdp}/beam{sbw}) -> {r.status_code}")
+                    if r.status_code == 200:
+                        ctype = r.headers.get("content-type", "").split(";", 1)[0]
+                        if ctype != "text/event-stream":
+                            failures.append(f"tot stream content-type {ctype!r} (want text/event-stream)")
+
+                        # Parse `data: <payload>` SSE frames into ordered
+                        # (event, json) pairs; `[DONE]` is the sentinel.
+                        import json as _json
+                        events, saw_done = [], False
+                        for line in r.text.splitlines():
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[len("data:"):].strip()
+                            if payload == "[DONE]":
+                                saw_done = True
+                                continue
+                            if saw_done:
+                                failures.append("tot stream emitted a frame AFTER [DONE]")
+                            try:
+                                events.append(_json.loads(payload))
+                            except Exception as exc:
+                                failures.append(f"tot stream frame not JSON: {payload!r} ({exc})")
+
+                        if not saw_done:
+                            failures.append(f"tot stream missing [DONE] sentinel: {r.text!r}")
+
+                        kinds = [e.get("event") for e in events]
+                        # Opens with exactly one tree_start carrying the bounds.
+                        if not kinds or kinds[0] != "tree_start":
+                            failures.append(f"tot stream first frame {kinds[:1]} (want ['tree_start'])")
+                        else:
+                            ts = events[0]
+                            if (ts.get("breadth"), ts.get("depth"), ts.get("beam_width")) != (sbd, sdp, sbw):
+                                failures.append(f"tot stream tree_start bounds {ts!r}")
+                            if not isinstance(ts.get("id"), str) or not ts.get("id"):
+                                failures.append(f"tot stream tree_start id {ts.get('id')!r}")
+
+                        # #407 invariant pt.1: every node_complete identifies
+                        # its node by a stable id, and the node is flat
+                        # (assembled client-side from parent_id — no children).
+                        node_ids = set()
+                        for e in events:
+                            if e.get("event") != "node_complete":
+                                continue
+                            node = e.get("node") or {}
+                            nid = node.get("id")
+                            if not isinstance(nid, str) or not nid:
+                                failures.append(f"tot stream node_complete missing node.id: {e!r}")
+                            else:
+                                node_ids.add(nid)
+                            if "children" in node:
+                                failures.append(f"tot stream node_complete carries children: {e!r}")
+                            missing = [k for k in ("id", "parent_id", "depth", "branch_index", "content", "score", "status") if k not in node]
+                            if missing:
+                                failures.append(f"tot stream node_complete missing {missing}: {e!r}")
+
+                        # level_pruned keeps only ids we actually streamed.
+                        for e in events:
+                            if e.get("event") != "level_pruned":
+                                continue
+                            kept = e.get("kept")
+                            if not isinstance(kept, list):
+                                failures.append(f"tot stream level_pruned kept {kept!r}")
+                                continue
+                            for kid in kept:
+                                if kid not in node_ids:
+                                    failures.append(f"tot stream level_pruned kept id {kid!r} never streamed")
+
+                        # #407 invariant pt.2: exactly one terminal frame
+                        # (tree_complete on success | error), and it is the
+                        # LAST data frame (nothing streams after it).
+                        terminals = [i for i, k in enumerate(kinds) if k in ("tree_complete", "error")]
+                        if len(terminals) != 1:
+                            failures.append(f"tot stream terminal frames {[kinds[i] for i in terminals]} (want exactly one)")
+                        elif terminals[0] != len(kinds) - 1:
+                            failures.append(f"tot stream frame(s) after terminal: {kinds[terminals[0]:]!r}")
+                        else:
+                            term = events[terminals[0]]
+                            if term.get("event") == "tree_complete":
+                                sel = term.get("selected_node_id")
+                                if sel is not None and sel not in node_ids:
+                                    failures.append(f"tot stream selected_node_id {sel!r} not streamed")
+                                if "final_answer" not in term:
+                                    failures.append(f"tot stream tree_complete missing final_answer: {term!r}")
+                    elif r.status_code == 500:
+                        skipped.append(
+                            "tree-of-thought STREAM: dummy driver could not flush/generate "
+                            "(pre-stream 500); SSE frame order asserted only under a "
+                            "forward-pass-capable driver (live-engine coverage)"
+                        )
+                    else:
+                        failures.append(f"tot stream status {r.status_code} (want 200 or 500)")
 
                     # Review v2 follow-ups (F6/F7/F16): param bounds,
                     # malformed JSON, oversized body, streaming frame
