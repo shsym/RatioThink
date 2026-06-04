@@ -163,6 +163,10 @@ A few known issues in the v0.1.1 release, with workarounds:
   quant as split files the bundled engine can't assemble yet, so downloading it leaves a
   model that fails to load. Pick a different model for now —
   [a fix is in progress](https://github.com/shsym/RatioThink/pull/41).
+- **Cancelling a model download can be unstable.** While a model is downloading the
+  progress can lag, and cancelling may not stop it as cleanly as expected — a partial
+  download can be left behind. If one remains, remove it from the Models list;
+  [a fix is in progress](https://github.com/shsym/RatioThink/pull/43).
 - **The local API endpoint is a preview.** You can configure an endpoint in the API
   Endpoints screen, but it doesn't serve live requests yet — exposing a loaded model on a
   fixed port is still being built. Use in-app chat in the meantime.
