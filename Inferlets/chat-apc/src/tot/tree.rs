@@ -76,6 +76,25 @@ pub fn new_tree_id() -> String {
     format!("tot-{n}")
 }
 
+/// An error leaf: a node whose branch failed before producing a scored
+/// answer (a failed `fork()`, or a failed refine `flush()`). Empty
+/// `content` and `score: None` keep it out of the beam, while `error`
+/// carries the diagnostic so the failure is visible on the wire rather
+/// than silently downgraded. `branch_index` orders it under its parent.
+pub fn error_leaf(parent_id: &str, depth: usize, branch_index: usize, error: String) -> Node {
+    Node {
+        id: new_node_id(),
+        parent_id: Some(parent_id.to_string()),
+        depth,
+        branch_index: Some(branch_index),
+        content: String::new(),
+        score: None,
+        status: "error",
+        error: Some(error),
+        children: Vec::new(),
+    }
+}
+
 /// Parse the first integer in `[1, 10]` out of value-evaluator output.
 /// Returns `None` for no-digit text or an out-of-range value.
 pub fn parse_score(text: &str) -> Option<u8> {
@@ -239,6 +258,25 @@ mod tests {
     fn best_leaf_all_ok_none_score_is_first() {
         let c = vec![cand("a", None, true), cand("b", None, true)];
         assert_eq!(best_leaf(&c), Some("a".to_string()));
+    }
+
+    #[test]
+    fn error_leaf_is_wire_visible_and_beam_excludable() {
+        let n = error_leaf("p1", 2, 1, "refine flush failed: boom".to_string());
+        assert_eq!(n.parent_id.as_deref(), Some("p1"));
+        assert_eq!(n.depth, 2);
+        assert_eq!(n.branch_index, Some(1));
+        assert_eq!(n.status, "error");
+        // Empty content + no score keep it out of the beam.
+        assert!(n.content.is_empty());
+        assert_eq!(n.score, None);
+        // The diagnostic is serialized (not omitted) so a failed refine is
+        // visible in the response instead of a silent re-roll downgrade.
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(
+            v.get("error").and_then(|e| e.as_str()),
+            Some("refine flush failed: boom"),
+        );
     }
 
     #[test]

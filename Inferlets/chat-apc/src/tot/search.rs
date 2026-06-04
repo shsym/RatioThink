@@ -17,7 +17,9 @@ use inferlet::sample::Sampler;
 use inferlet::Context;
 
 use super::schema::TotParams;
-use super::tree::{assemble, best_leaf, new_node_id, parse_score, select_beam, Candidate, Node};
+use super::tree::{
+    Candidate, Node, assemble, best_leaf, error_leaf, new_node_id, parse_score, select_beam,
+};
 
 /// Built-in expansion instruction appended before forking at levels > 1.
 /// Level-1 children answer the conversation directly (sibling diversity
@@ -75,12 +77,37 @@ pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
         // turn itself is opened per child in `expand` (every level cues
         // its own fork), so the shared prefix stays cue-free and KV pages
         // are shared across the branches. Sequential (≤ beam_width
-        // parents; flush is light). A flush failure is best-effort.
+        // parents; flush is light).
+        //
+        // A flush failure here is NOT best-effort: `Context::flush` takes
+        // the token buffer before its fallible forward pass, so on error
+        // the REFINE_INSTRUCTION tokens are discarded while `seq_len` is
+        // left unchanged — and `fork()` clones that now-empty buffer.
+        // Forking such a parent would silently generate a re-roll of its
+        // PRE-refine answer and record it as `status:"ok"`: an invisible
+        // downgrade, since this flush is the only thing that makes a
+        // level a refinement rather than a re-roll. So drop the parent and
+        // record error leaves for its children, mirroring the fork-failure
+        // path below.
         if level > 1 {
-            for f in frontier.iter_mut() {
+            let mut refined: Vec<Frontier> = Vec::with_capacity(frontier.len());
+            for mut f in frontier {
                 f.ctx.user(REFINE_INSTRUCTION);
-                let _ = f.ctx.flush().await;
+                match f.ctx.flush().await {
+                    Ok(()) => refined.push(f),
+                    Err(e) => {
+                        for b in 0..params.breadth {
+                            flat.push(error_leaf(
+                                &f.node_id,
+                                level,
+                                b,
+                                format!("refine flush failed: {e}"),
+                            ));
+                        }
+                    }
+                }
             }
+            frontier = refined;
         }
 
         // Fork every child; generate + score successful forks concurrently.
@@ -100,17 +127,12 @@ pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
                     }
                     Err(e) => {
                         // No context to carry → record an error leaf inline.
-                        flat.push(Node {
-                            id: new_node_id(),
-                            parent_id: Some(f.node_id.clone()),
-                            depth: level,
-                            branch_index: Some(b),
-                            content: String::new(),
-                            score: None,
-                            status: "error",
-                            error: Some(format!("fork failed: {e}")),
-                            children: Vec::new(),
-                        });
+                        flat.push(error_leaf(
+                            &f.node_id,
+                            level,
+                            b,
+                            format!("fork failed: {e}"),
+                        ));
                     }
                 }
             }
