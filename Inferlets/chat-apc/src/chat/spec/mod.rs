@@ -129,7 +129,9 @@ impl CachebackDrafter {
     }
 
     /// Seed the dynamic table from prompt tokens. Does NOT advance the
-    /// cursor — the prompt KV is already committed by the caller's flush.
+    /// cursor — the prompt tokens are still buffered (un-flushed) and are
+    /// accounted for by initializing the cursor to `seq_len + buffer.len()`
+    /// in `start()`.
     pub fn seed(&mut self, tokens: &[u32]) {
         for &t in tokens {
             self.ingest(t);
@@ -385,5 +387,68 @@ mod tests {
         spec_out.truncate(8);
 
         assert_eq!(spec_out, plain_out);
+    }
+
+    #[test]
+    fn step_partial_reject_reanchors_cursor() {
+        // F2: integrated reject path. The cache drafts a chain; the model
+        // follows the free pick then DIVERGES from the cached follower
+        // mid-chain, so the verify breaks partway. Exercises
+        // draft() -> partial accept -> cursor advance -> re-anchor
+        // end-to-end (previously only the all-accept path had coverage).
+        let mut d = CachebackDrafter::new(cfg(), 0);
+        // Corpus warms 7->1, 1->2, 2->3 and leaves recent=[7], so a draft
+        // from [7] chains to [1, 2, 3].
+        d.seed(&[7, 1, 2, 3, 7]);
+        d.prefilled = true; // skip the prefill-step gate for this unit test
+
+        let (drafts, positions) = d.draft();
+        assert_eq!(drafts, vec![1, 2, 3]);
+        assert_eq!(positions, vec![0, 1, 2]);
+
+        // Ground-truth model: after 7 emit 1 (== draft[0] -> the
+        // free-pick position matches, so draft[0]'s successor is kept);
+        // after 1 emit 7 (!= cached draft[1]=2 -> reject from here on).
+        let model = |c: &[u32]| -> u32 {
+            match c.last() {
+                Some(7) => 1,
+                Some(1) => 7,
+                _ => 0,
+            }
+        };
+        let mut ctx = vec![7u32, 1, 2, 3, 7];
+        let accepted = step(&mut d, &model, &mut ctx);
+        assert_eq!(accepted, vec![1, 7]); // free pick + 1 accepted draft
+
+        let m = d.metrics();
+        assert!(m.rejected > 0, "{m:?}");
+        assert_eq!(m.proposed, m.accepted + m.rejected); // invariant
+        assert_eq!((m.proposed, m.accepted, m.rejected), (3, 1, 2));
+
+        // (b) cursor advanced by accepted.len()=2, NOT proposed(3).
+        assert_eq!(d.cursor(), 2);
+
+        // (c) the immediately-following draft re-anchors at the
+        // post-accept cursor.
+        let (next_drafts, next_positions) = d.draft();
+        assert!(!next_drafts.is_empty());
+        assert_eq!(next_positions[0], d.cursor());
+        assert_eq!(next_positions[0], 2);
+    }
+
+    #[test]
+    fn accept_overshoot_does_not_underflow() {
+        // F2: all-accept extra-pick clamp. When the accepted slice is
+        // longer than last_proposed + 1 (the post-draft free pick can
+        // ride along), `hits` is clamped to last_proposed so
+        // `rejected = last_proposed - hits` never underflows.
+        let mut d = CachebackDrafter::new(cfg(), 0);
+        d.last_proposed = 3;
+        d.accept(&[10, 11, 12, 13, 14]); // len 5 = last_proposed + 2
+        let m = d.metrics();
+        assert_eq!(m.proposed, 3);
+        assert_eq!(m.accepted, 3); // clamped: min(len - 1 = 4, 3)
+        assert_eq!(m.rejected, 0); // 3 - 3, no underflow panic
+        assert_eq!(m.proposed, m.accepted + m.rejected);
     }
 }

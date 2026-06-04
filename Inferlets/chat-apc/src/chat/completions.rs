@@ -135,6 +135,15 @@ const MAX_TOP_P: f32 = 1.0;
 /// reply length.
 const MAX_MAX_TOKENS: usize = 8192;
 
+/// Inclusive bounds on the #418 speculation knobs. Out-of-range values
+/// are rejected at the 400 boundary (see `validate_sampling`), mirroring
+/// the `max_tokens` contract; `SpecRequest::to_config`'s `.clamp` then
+/// stays only as a redundant safety net.
+const MIN_LEADER_LEN: usize = 1;
+const MAX_LEADER_LEN: usize = 8;
+const MIN_DRAFT_LEN: usize = 1;
+const MAX_DRAFT_LEN: usize = 16;
+
 // =============================================================================
 // Request schema
 // =============================================================================
@@ -182,8 +191,16 @@ impl SpecRequest {
     fn to_config(&self) -> SpecConfig {
         let d = SpecConfig::default();
         SpecConfig {
-            leader_len: self.leader_len.unwrap_or(d.leader_len).clamp(1, 8),
-            draft_len: self.draft_len.unwrap_or(d.draft_len).clamp(1, 16),
+            // Redundant safety net: `validate_sampling` already rejects
+            // out-of-range values at the 400 boundary before this runs.
+            leader_len: self
+                .leader_len
+                .unwrap_or(d.leader_len)
+                .clamp(MIN_LEADER_LEN, MAX_LEADER_LEN),
+            draft_len: self
+                .draft_len
+                .unwrap_or(d.draft_len)
+                .clamp(MIN_DRAFT_LEN, MAX_DRAFT_LEN),
             ..d
         }
     }
@@ -1790,6 +1807,29 @@ fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, 
             ));
         }
     }
+    // #418: range-check the speculation knobs at the 400 boundary so an
+    // out-of-range value is rejected with a `param`, mirroring
+    // `max_tokens` — rather than silently coerced by `to_config`'s
+    // `.clamp`. `enabled` is a bool (nothing to range-check); cache caps
+    // are internal (not request-settable).
+    if let Some(spec) = &req.speculation {
+        if let Some(n) = spec.leader_len {
+            if !(MIN_LEADER_LEN..=MAX_LEADER_LEN).contains(&n) {
+                return Err((
+                    "speculation.leader_len",
+                    format!("speculation.leader_len must be in [{MIN_LEADER_LEN}, {MAX_LEADER_LEN}]"),
+                ));
+            }
+        }
+        if let Some(n) = spec.draft_len {
+            if !(MIN_DRAFT_LEN..=MAX_DRAFT_LEN).contains(&n) {
+                return Err((
+                    "speculation.draft_len",
+                    format!("speculation.draft_len must be in [{MIN_DRAFT_LEN}, {MAX_DRAFT_LEN}]"),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2642,15 +2682,41 @@ mod tests {
     }
 
     #[test]
-    fn spec_dims_are_clamped_to_safe_bounds() {
-        let s = SpecRequest {
-            enabled: true,
-            leader_len: Some(0),
-            draft_len: Some(9999),
-        };
-        let cfg = s.to_config();
-        assert_eq!(cfg.leader_len, 1); // clamped up from 0
-        assert_eq!(cfg.draft_len, 16); // clamped down from 9999
+    fn spec_dims_out_of_range_rejected() {
+        // F1: out-of-range speculation knobs are rejected at the 400
+        // boundary with a `param`, mirroring max_tokens — NOT silently
+        // clamped. leader_len below range:
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "temperature":0,"speculation":{"enabled":true,"leader_len":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_sampling(&req).unwrap_err().0,
+            "speculation.leader_len"
+        );
+
+        // draft_len above range:
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "temperature":0,"speculation":{"enabled":true,"draft_len":99999}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_sampling(&req).unwrap_err().0,
+            "speculation.draft_len"
+        );
+
+        // in-range values pass; the clamp in to_config is then a
+        // redundant safety net.
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "temperature":0,"speculation":{"enabled":true,"leader_len":2,"draft_len":4}}"#,
+        )
+        .unwrap();
+        assert!(validate_sampling(&req).is_ok());
+        let cfg = req.speculation.unwrap().to_config();
+        assert_eq!((cfg.leader_len, cfg.draft_len), (2, 4));
     }
 
     #[test]

@@ -22,9 +22,9 @@ use inferlet::sample::Sampler;
 use super::spec::{CachebackDrafter, SpecConfig, SpecMetrics};
 
 /// Map request sampling params to an SDK sampler. `temperature == 0`
-/// resolves to greedy [`Sampler::Argmax`] — both the correct semantics
-/// for temperature 0 and the safe choice (a degenerate `TopP{0.0}` would
-/// divide logits by zero). Speculation requires this greedy path.
+/// resolves to the explicit greedy [`Sampler::Argmax`]; the host encodes
+/// `temperature == 0` as argmax anyway, and speculation requires this
+/// greedy path.
 pub fn resolve_sampler(temperature: f32, top_p: f32) -> Sampler {
     if temperature <= 0.0 {
         Sampler::Argmax

@@ -586,6 +586,41 @@ async def main() -> int:
                                     f"/v1/chat/completions {field}={value!r} param tag {err!r}"
                                 )
 
+                    # #418 (review F1): out-of-range speculation knobs are
+                    # rejected at the 400 boundary with a nested `param`,
+                    # parallel to the max_tokens over-range case above —
+                    # NOT silently clamped.
+                    for sub, value in [("leader_len", 0), ("draft_len", 99999)]:
+                        r = await http.post(
+                            f"{base}/v1/chat/completions",
+                            json={
+                                "model": model_id,
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "stream": False,
+                                "temperature": 0,
+                                "speculation": {"enabled": True, sub: value},
+                            },
+                        )
+                        print(
+                            f"[harness] POST /v1/chat/completions(speculation.{sub}={value}) "
+                            f"-> {r.status_code}"
+                        )
+                        if r.status_code != 400:
+                            failures.append(
+                                f"/v1/chat/completions speculation.{sub}={value} "
+                                f"status {r.status_code} (expected 400)"
+                            )
+                        else:
+                            try:
+                                err = r.json().get("error", {})
+                            except Exception:
+                                err = {}
+                            if err.get("param") != f"speculation.{sub}":
+                                failures.append(
+                                    f"/v1/chat/completions speculation.{sub}={value} "
+                                    f"param tag {err!r} (expected speculation.{sub})"
+                                )
+
                     # Malformed JSON body → 400.
                     r = await http.post(
                         f"{base}/v1/chat/completions",
