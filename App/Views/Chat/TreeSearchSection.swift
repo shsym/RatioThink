@@ -76,31 +76,106 @@ struct TreeSearchSection: View {
 }
 
 /// One node in the tree-search disclosure, recursing into its children
-/// (indented). Shows the beam state (kept / pruned / pending), the value
-/// score, and a content preview; the selected final leaf is starred.
+/// (indented) for a foldable tree nested by depth (#413). The header shows
+/// the beam state (kept / pruned / pending / starred selection) and the
+/// value score; tapping it folds the node's detail + subtree. When expanded
+/// the node shows its FULL output: the demuxed `<think>` reasoning behind a
+/// per-node `ReasoningDisclosure` (#329 style) plus the answer — and, for a
+/// node that reasoned but never answered, an honest "incomplete" note over
+/// whatever partial reasoning exists rather than broken tag-soup (#434/#437).
 private struct ToTNodeRow: View {
   let tree: ToTTree
   let node: ToTTree.Node
+  @State private var userExpanded: Bool?
 
   private var isSelected: Bool { tree.selectedNodeID == node.id }
   private var isPruned: Bool { node.beam == .pruned }
+  private var children: [ToTTree.Node] { tree.children(of: node.id) }
+  private var answer: String {
+    node.content.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+  private var hasAnswer: Bool { !answer.isEmpty }
+  // Expanded by default so the full tree is visible as it streams; a manual
+  // fold sticks. Folded reload is handled one level up by the "Tree search"
+  // section itself, which starts collapsed for a finished turn.
+  private var isExpanded: Bool { userExpanded ?? true }
+  private var hasDetail: Bool {
+    !node.reasoning.isEmpty || hasAnswer || node.status == .error
+      || node.status == .incomplete || !children.isEmpty
+  }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 3) {
-      HStack(alignment: .firstTextBaseline, spacing: 6) {
-        beamGlyph
-        scoreBadge
-        Text(preview)
+    VStack(alignment: .leading, spacing: 4) {
+      Button {
+        userExpanded = !isExpanded
+      } label: {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+          beamGlyph
+          scoreBadge
+          Text(headline)
+            .font(.caption.monospaced())
+            .foregroundStyle(isPruned ? .tertiary : .secondary)
+            .lineLimit(1)
+            .strikethrough(isPruned, color: .secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+          if hasDetail {
+            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+              .font(.caption2)
+              .foregroundStyle(.tertiary)
+          }
+        }
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .help(isExpanded ? "Collapse this branch" : "Expand this branch")
+
+      if isExpanded {
+        // The node's reasoning — shown, never stripped, folded behind the
+        // same disclosure the chat answer uses (#329). Auto-expands for an
+        // unanswered (incomplete) node so its partial thought is visible.
+        if !node.reasoning.isEmpty {
+          ReasoningDisclosure(
+            reasoning: node.reasoning,
+            answerStarted: hasAnswer,
+            labelFont: .caption2,
+            bodyFont: .caption2.monospaced()
+          )
+          .padding(.leading, 4)
+        }
+        detail
+          .padding(.leading, 4)
+        ForEach(children) { child in
+          ToTNodeRow(tree: tree, node: child)
+            .padding(.leading, 14)
+        }
+      }
+    }
+  }
+
+  /// The node's answer, or an honest note for a non-`ok` node — never
+  /// rendered tag-soup.
+  @ViewBuilder private var detail: some View {
+    switch node.status {
+    case .error:
+      Text(node.error ?? "generation failed")
+        .font(.caption2)
+        .foregroundStyle(.red)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .textSelection(.enabled)
+    case .incomplete:
+      Text(node.error ?? "Incomplete — the node reasoned but produced no answer.")
+        .font(.caption2)
+        .italic()
+        .foregroundStyle(.tertiary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    default:
+      if hasAnswer {
+        Text(answer)
           .font(.caption.monospaced())
-          .foregroundStyle(isPruned ? .tertiary : .secondary)
-          .lineLimit(3)
+          .foregroundStyle(isPruned ? .tertiary : .primary)
           .strikethrough(isPruned, color: .secondary)
           .frame(maxWidth: .infinity, alignment: .leading)
           .textSelection(.enabled)
-      }
-      ForEach(tree.children(of: node.id)) { child in
-        ToTNodeRow(tree: tree, node: child)
-          .padding(.leading, 14)
       }
     }
   }
@@ -128,13 +203,18 @@ private struct ToTNodeRow: View {
     }
   }
 
-  /// Score capsule: the 1–10 value, "err" for a failed node, "—" when the
-  /// scorer returned nothing parseable.
+  /// Score capsule: the 1–10 value, "err" for a failed node, "…" for an
+  /// incomplete (reasoned-but-unanswered) node, "—" when the scorer returned
+  /// nothing parseable.
   @ViewBuilder private var scoreBadge: some View {
     let (text, tint): (String, Color) = {
-      if node.status == .error { return ("err", .red) }
-      if let s = node.score { return ("\(s)", .accentColor) }
-      return ("—", .secondary)
+      switch node.status {
+      case .error: return ("err", .red)
+      case .incomplete: return ("…", .orange)
+      default:
+        if let s = node.score { return ("\(s)", .accentColor) }
+        return ("—", .secondary)
+      }
     }()
     Text(text)
       .font(.caption2.monospacedDigit())
@@ -145,13 +225,17 @@ private struct ToTNodeRow: View {
       .background(tint.opacity(0.12), in: Capsule())
   }
 
-  /// One-line content preview. An error node shows its diagnostic; an
-  /// empty (pending) node shows a placeholder.
-  private var preview: String {
-    if node.status == .error {
+  /// One-line header preview: the answer's first line, a status word for an
+  /// error/incomplete node, or a "thinking…" placeholder.
+  private var headline: String {
+    switch node.status {
+    case .error:
       return node.error ?? "generation failed"
+    case .incomplete:
+      return "reasoned, no answer"
+    default:
+      if hasAnswer { return answer }
+      return node.reasoning.isEmpty ? "…" : "thinking…"
     }
-    let trimmed = node.content.trimmingCharacters(in: .whitespacesAndNewlines)
-    return trimmed.isEmpty ? "…" : trimmed
   }
 }
