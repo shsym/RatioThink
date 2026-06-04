@@ -1216,11 +1216,15 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   @objc func openSettings() {
-    // TODO(phase-3): once RatioThink.app has a Settings scene + a URL scheme
-    // or AppleEvent for "open settings", deep-link here. Today we
-    // just bring RatioThink.app to the foreground; the user picks Settings
-    // from its menu (Cmd+,).
-    openPieApp()
+    // RatioThink.app now ships a Settings scene and the `ratiothink://` URL
+    // scheme, so deliver `ratiothink://settings` to route straight to
+    // Settings instead of just foregrounding the app and leaving the user
+    // to press ⌘,. Delivering the URL *to the resolved parent bundle*
+    // (rather than a bare `NSWorkspace.open(url)`, which LaunchServices
+    // could route to any registered RatioThink.app) preserves the existing
+    // "launch MY install" guarantee and reuses the same launch-failure
+    // alert path.
+    openPieApp(delivering: [SettingsDeepLink.settingsURL])
   }
 
   /// Resolve the parent `RatioThink.app` bundle that ships this helper.
@@ -1292,12 +1296,18 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     return fallback
   }
 
-  private func openPieApp() {
+  /// Launch / foreground the resolved parent RatioThink.app. When `urls` is
+  /// non-empty they are delivered to that specific bundle (e.g.
+  /// `ratiothink://settings`), so the app routes the deep link AND the
+  /// launch still targets MY install rather than whichever RatioThink.app
+  /// LaunchServices would pick for a bare scheme open. Both paths share the
+  /// same launch-failure alert (review v2 F16 / v3 F25).
+  private func openPieApp(delivering urls: [URL] = []) {
     let url = resolvedPieAppURL()
-    Log.helper.info("openPieApp: \(url.path, privacy: .public)")
+    Log.helper.info("openPieApp: \(url.path, privacy: .public) urls=\(urls.map(\.absoluteString).joined(separator: ","), privacy: .public)")
     let cfg = NSWorkspace.OpenConfiguration()
     cfg.activates = true
-    NSWorkspace.shared.openApplication(at: url, configuration: cfg) { [weak self] app, err in
+    let completion: (NSRunningApplication?, Error?) -> Void = { [weak self] app, err in
       if let err {
         Log.helper.error("openPieApp failed: \(String(describing: err), privacy: .public)")
         // Review v2 F16: a logged-only failure left the menu click
@@ -1322,6 +1332,11 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       } else if let app {
         Log.helper.info("openPieApp launched pid=\(app.processIdentifier, privacy: .public)")
       }
+    }
+    if urls.isEmpty {
+      NSWorkspace.shared.openApplication(at: url, configuration: cfg, completionHandler: completion)
+    } else {
+      NSWorkspace.shared.open(urls, withApplicationAt: url, configuration: cfg, completionHandler: completion)
     }
   }
 

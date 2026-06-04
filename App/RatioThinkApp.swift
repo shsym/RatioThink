@@ -394,6 +394,9 @@ struct RatioThinkApp: App {
         .environmentObject(helperHealth)
         .environmentObject(downloadController)
         .environmentObject(updateAvailability)
+        // #420: route the menu-bar Helper's `ratiothink://settings` deep
+        // link straight to the Settings scene (not just app-foreground).
+        .handlesSettingsDeepLink()
         .frame(minWidth: 900, minHeight: 600)
     }
     .modelContainer(chatContainer)

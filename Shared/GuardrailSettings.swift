@@ -32,6 +32,16 @@ public enum GuardrailSettings {
     return min(maxFraction, max(minFraction, fraction))
   }
 
+  /// Human-readable percent rendering of a fraction for the Settings dial
+  /// readout (e.g. `0.65` → `"65%"`). The dial snaps to a 0.05 (5%) grid,
+  /// so a whole-percent label is exact and reads far clearer than the raw
+  /// `"0.65"`. A non-finite value falls back to the default's label rather
+  /// than rendering `"naN%"`.
+  public static func percentLabel(_ fraction: Double) -> String {
+    let value = fraction.isFinite ? fraction : defaultFraction
+    return "\(Int((value * 100).rounded()))%"
+  }
+
   /// `true` when `fraction` matches a preset (within half a step), so
   /// the dial can highlight that preset vs. show "Custom".
   public static func matchingPreset(_ fraction: Double) -> Double? {
