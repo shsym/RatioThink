@@ -30,7 +30,7 @@ use wstd::http::body::IncomingBody;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::Request;
 
-use super::completions::{self, ChatCompletionsRequest, ChatMessage, ToolSchema};
+use super::completions::{self, ChatCompletionsRequest, ChatMessage, SpecRequest, ToolSchema};
 use crate::sse;
 
 #[derive(Deserialize)]
@@ -53,6 +53,7 @@ struct ChatApcInput {
     max_tokens: Option<usize>,
     tools: Option<Vec<ToolSchema>>,
     tool_choice: Option<serde_json::Value>,
+    speculation: Option<SpecRequest>,
 }
 
 pub async fn handle(req: Request<IncomingBody>, res: Responder) -> Finished {
@@ -162,6 +163,7 @@ async fn dispatch_chat_apc(dispatch: InferletDispatch, res: Responder) -> Finish
         max_tokens: input.max_tokens,
         tools: input.tools,
         tool_choice: input.tool_choice,
+        speculation: input.speculation,
     };
     completions::handle_parsed(request, res).await
 }
