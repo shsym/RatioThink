@@ -97,6 +97,48 @@ public enum HelperConfig {
     validateContract()
   }
 
+  // MARK: - Test-override build gate
+
+  /// Compiled build configuration. Gates the engine-base-URL test seam (see
+  /// `testEngineBaseURLOverride`): a Release build ignores it so a shipped,
+  /// signed app never redirects its engine endpoint to an attacker-supplied
+  /// URL; a DEBUG build — including the `xcodebuild test` runner — honors it.
+  /// NOTE: this gate currently covers ONLY that seam. Other App-side
+  /// `PIE_TEST_*` reads (prefs suite, first-launch flag, fake/fixture
+  /// downloads, artifact-path probe) still read the env directly and stay
+  /// live in Release; routing them through this gate is a separate follow-up.
+  #if DEBUG
+  public static let defaultIsDebugBuild = true
+  #else
+  public static let defaultIsDebugBuild = false
+  #endif
+
+  /// Injectable seam so the Release branch is exercisable from a DEBUG test
+  /// process. `nil` ⇒ use the compiled `defaultIsDebugBuild`.
+  @TaskLocal public static var isDebugBuildOverride: Bool?
+
+  /// Effective build configuration (override-aware).
+  public static var isDebugBuild: Bool { isDebugBuildOverride ?? defaultIsDebugBuild }
+
+  /// Whether the engine-base-URL test seam may activate. `false` in Release.
+  /// (The only `PIE_TEST_*` seam currently gated — see `defaultIsDebugBuild`.)
+  public static var isTestOverrideAllowed: Bool { isDebugBuild }
+
+  /// Resolve the `PIE_TEST_ENGINE_BASE_URL` test seam — honored only when test
+  /// overrides are allowed. A Release build returns `nil` regardless of the
+  /// env var, so the App falls back to the real Helper-driven engine path
+  /// instead of an attacker-supplied loopback. Pure + parameterized so the
+  /// gate is unit-testable.
+  public static func testEngineBaseURLOverride(
+    env: [String: String] = ProcessInfo.processInfo.environment,
+    allowed: Bool = isTestOverrideAllowed
+  ) -> String? {
+    guard allowed, let raw = env["PIE_TEST_ENGINE_BASE_URL"], !raw.isEmpty else {
+      return nil
+    }
+    return raw
+  }
+
   // MARK: - internals
 
   private static let log = Logger(subsystem: "com.ratiothink.app.helper", category: "config")

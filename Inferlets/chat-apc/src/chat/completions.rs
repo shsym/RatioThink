@@ -42,18 +42,21 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use inferlet::chat;
 use inferlet::Context;
+use inferlet::GrammarConstraint;
 use inferlet::model::Model;
 use inferlet::runtime;
-use inferlet::sample::Sampler;
 use serde::{Deserialize, Serialize};
 use wstd::http::body::IncomingBody;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Request, Response};
 
 use super::apc::{ReasoningDecoder, ToolUseDecoder};
+use super::generate::{self, DecodeStrategy};
+use super::spec::{SpecConfig, SpecMetrics};
 use crate::sse::{self, EmitError, Emitter, SseError};
 
 // =============================================================================
@@ -133,6 +136,15 @@ const MAX_TOP_P: f32 = 1.0;
 /// reply length.
 const MAX_MAX_TOKENS: usize = 8192;
 
+/// Inclusive bounds on the #418 speculation knobs. Out-of-range values
+/// are rejected at the 400 boundary (see `validate_sampling`), mirroring
+/// the `max_tokens` contract; `SpecRequest::to_config`'s `.clamp` then
+/// stays only as a redundant safety net.
+const MIN_LEADER_LEN: usize = 1;
+const MAX_LEADER_LEN: usize = 8;
+const MIN_DRAFT_LEN: usize = 1;
+const MAX_DRAFT_LEN: usize = 16;
+
 // =============================================================================
 // Request schema
 // =============================================================================
@@ -157,6 +169,42 @@ pub struct ChatCompletionsRequest {
     #[serde(default)]
     #[allow(dead_code)]
     pub tool_choice: Option<serde_json::Value>,
+    /// chat-apc extension: opt-in linear Cacheback speculative decoding.
+    /// Absent → normal decode, byte-identical to pre-speculation
+    /// behavior. Present → the `spec_metrics` block is returned and,
+    /// when `enabled` + greedy (`temperature == 0`), drafting engages.
+    #[serde(default)]
+    pub speculation: Option<SpecRequest>,
+}
+
+/// Request-side speculation knobs (chat-apc extension). Dimensions
+/// default to the paper-optimal LL=1 / FL=3 and are clamped to safe
+/// bounds. See [`super::spec`].
+#[derive(Deserialize, Clone)]
+pub struct SpecRequest {
+    #[serde(default)]
+    pub enabled: bool,
+    pub leader_len: Option<usize>,
+    pub draft_len: Option<usize>,
+}
+
+impl SpecRequest {
+    fn to_config(&self) -> SpecConfig {
+        let d = SpecConfig::default();
+        SpecConfig {
+            // Redundant safety net: `validate_sampling` already rejects
+            // out-of-range values at the 400 boundary before this runs.
+            leader_len: self
+                .leader_len
+                .unwrap_or(d.leader_len)
+                .clamp(MIN_LEADER_LEN, MAX_LEADER_LEN),
+            draft_len: self
+                .draft_len
+                .unwrap_or(d.draft_len)
+                .clamp(MIN_DRAFT_LEN, MAX_DRAFT_LEN),
+            ..d
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -261,6 +309,150 @@ struct ChatCompletion<'a> {
     /// doc + ). Skipped from serialization when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     warnings: Option<Vec<NonStreamWarning<'a>>>,
+    /// chat-apc extension: speculative-decode metrics. Present only when
+    /// the request included a `speculation` block, so normal responses
+    /// stay byte-identical. Carries draft accounting + throughput, plus
+    /// `fallback_reason` when speculation was requested but inactive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spec_metrics: Option<SpecMetricsReport>,
+}
+
+// =============================================================================
+// Speculative-decode metrics (ticket #418)
+// =============================================================================
+
+/// Structured speculation metrics, emitted on the non-stream response as
+/// `spec_metrics` and on the SSE stream as a terminal `spec_metrics`
+/// frame. `generated_tokens` / `decode_steps` / throughput are measured
+/// by the transport loop; the draft accounting comes from the drafter's
+/// shared [`SpecMetrics`].
+#[derive(Serialize)]
+struct SpecMetricsReport {
+    /// Whether drafting actually engaged this turn.
+    enabled: bool,
+    /// Why speculation did not engage despite being requested
+    /// (`disabled`, `non_greedy_sampling`); `None` when it engaged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_reason: Option<&'static str>,
+    generated_tokens: usize,
+    decode_steps: usize,
+    proposed_draft_tokens: usize,
+    accepted_draft_tokens: usize,
+    rejected_draft_tokens: usize,
+    avg_tokens_per_step: f64,
+    decode_tokens_per_sec: f64,
+    leader_len: usize,
+    draft_len: usize,
+}
+
+impl SpecMetricsReport {
+    fn build(
+        enabled: bool,
+        fallback_reason: Option<&'static str>,
+        dims: (usize, usize),
+        spec: SpecMetrics,
+        generated_tokens: usize,
+        decode_steps: usize,
+        elapsed: Duration,
+    ) -> Self {
+        let secs = elapsed.as_secs_f64();
+        Self {
+            enabled,
+            fallback_reason,
+            generated_tokens,
+            decode_steps,
+            proposed_draft_tokens: spec.proposed,
+            accepted_draft_tokens: spec.accepted,
+            rejected_draft_tokens: spec.rejected,
+            avg_tokens_per_step: if decode_steps > 0 {
+                generated_tokens as f64 / decode_steps as f64
+            } else {
+                0.0
+            },
+            decode_tokens_per_sec: if secs > 0.0 {
+                generated_tokens as f64 / secs
+            } else {
+                0.0
+            },
+            leader_len: dims.0,
+            draft_len: dims.1,
+        }
+    }
+
+    /// One parseable line for the smoke harness (mirrors
+    /// `text-completion-spec`'s `SPEC_STATS`). wasm stderr is dropped on
+    /// the daemon path, so this is dev/smoke-tier only — the wire surface
+    /// is the SSE frame / JSON field.
+    fn log_spec_stats(&self) {
+        eprintln!(
+            "SPEC_STATS enabled={} fallback={} generated_tokens={} decode_steps={} \
+             proposed={} accepted={} rejected={} avg_tokens_per_step={:.3} \
+             decode_tokens_per_sec={:.2}",
+            self.enabled,
+            self.fallback_reason.unwrap_or("none"),
+            self.generated_tokens,
+            self.decode_steps,
+            self.proposed_draft_tokens,
+            self.accepted_draft_tokens,
+            self.rejected_draft_tokens,
+            self.avg_tokens_per_step,
+            self.decode_tokens_per_sec,
+        );
+    }
+}
+
+/// SSE wrapper: tags the report with `event:"spec_metrics"` so the GUI's
+/// frame router can branch on it like the other meta-frames.
+#[derive(Serialize)]
+struct SpecMetricsSse<'a> {
+    event: &'static str,
+    #[serde(flatten)]
+    report: &'a SpecMetricsReport,
+}
+
+/// Decide the decode strategy from the request, greedy gate, and whether
+/// a tool call is forced. Returns `(strategy, fallback_reason,
+/// want_metrics, (leader_len, draft_len))`. `want_metrics` is true
+/// whenever the caller sent a `speculation` block, so a requested-but-
+/// inactive run still reports why (no silent no-op).
+///
+/// `forced_tool` gates speculation OFF: when `tool_choice` forces a call
+/// the sampler is constrained to the tool-call grammar, and the drafter's
+/// verify must not run against a grammar-constrained sampler. Forced-tool
+/// is checked before the greedy gate so a forced+greedy request reports
+/// `tool_choice_forced`, not speculative.
+fn plan_strategy(
+    spec: Option<&SpecRequest>,
+    greedy: bool,
+    forced_tool: bool,
+) -> (DecodeStrategy, Option<&'static str>, bool, (usize, usize)) {
+    match spec {
+        None => (DecodeStrategy::Plain, None, false, (0, 0)),
+        Some(s) if s.enabled && forced_tool => {
+            (DecodeStrategy::Plain, Some("tool_choice_forced"), true, (0, 0))
+        }
+        Some(s) if s.enabled && greedy => {
+            let cfg = s.to_config();
+            let dims = (cfg.leader_len, cfg.draft_len);
+            (DecodeStrategy::Speculative(cfg), None, true, dims)
+        }
+        Some(s) if s.enabled => {
+            (DecodeStrategy::Plain, Some("non_greedy_sampling"), true, (0, 0))
+        }
+        Some(_) => (DecodeStrategy::Plain, Some("disabled"), true, (0, 0)),
+    }
+}
+
+/// Stand-alone tokenization of the prompt to seed the drafter's dynamic
+/// table. Exact chat-template alignment isn't required — accepted tokens
+/// grow the cache as generation proceeds (see `super::spec`).
+fn seed_tokens_from(model: &Model, messages: &[ChatMessage]) -> Vec<u32> {
+    let joined = messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    model.tokenizer().encode(&joined)
 }
 
 #[derive(Serialize)]
@@ -492,6 +684,38 @@ impl Outcome {
             Outcome::Aborted => "error",
         }
     }
+}
+
+// =============================================================================
+// Reasoning/content channel demux
+// =============================================================================
+
+/// Whether a generation step's chat-decoder text belongs on the
+/// **visible content** channel rather than the reasoning channel.
+///
+/// The reasoning decoder and chat decoder are fed the SAME token batch
+/// each step. The chat decoder is model-generic and surfaces *all*
+/// decoded text — including the `<think>` / `</think>` delimiter strings
+/// the reasoning decoder treats as structural. A batch is visible content
+/// only when it lands ENTIRELY OUTSIDE a reasoning block:
+///
+/// * `reason_idle` — the reasoning decoder reported no boundary or
+///   reasoning text for this batch (`Event::Idle`); a `Start`, `Delta`,
+///   or `End` means the batch is reasoning-channel material.
+/// * `was_in_reasoning` — the `in_reasoning` state *before* this batch
+///   was processed. Captured pre-`feed` because the reasoning decoder
+///   flips the flag as a side effect of consuming the boundary token.
+///
+/// The closing `</think>` batch makes the reasoning decoder
+/// report `End` and flips `in_reasoning` to false, but the chat decoder
+/// still emits `"</think>"` as a `Delta` on that same batch. Gating on
+/// the post-`feed` `in_reasoning` alone (the old `!in_reasoning` guard)
+/// re-opened the content channel exactly in time for the delimiter to
+/// leak. `End` is not `Idle`, so this returns false for that batch.
+/// The opening `<think>` batch was already handled correctly (`Start`
+/// is not `Idle`), which is why only the closing tag leaked.
+fn content_visible(reason_idle: bool, was_in_reasoning: bool) -> bool {
+    reason_idle && !was_in_reasoning
 }
 
 // =============================================================================
@@ -1627,11 +1851,34 @@ fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, 
             ));
         }
     }
+    // #418: range-check the speculation knobs at the 400 boundary so an
+    // out-of-range value is rejected with a `param`, mirroring
+    // `max_tokens` — rather than silently coerced by `to_config`'s
+    // `.clamp`. `enabled` is a bool (nothing to range-check); cache caps
+    // are internal (not request-settable).
+    if let Some(spec) = &req.speculation {
+        if let Some(n) = spec.leader_len {
+            if !(MIN_LEADER_LEN..=MAX_LEADER_LEN).contains(&n) {
+                return Err((
+                    "speculation.leader_len",
+                    format!("speculation.leader_len must be in [{MIN_LEADER_LEN}, {MAX_LEADER_LEN}]"),
+                ));
+            }
+        }
+        if let Some(n) = spec.draft_len {
+            if !(MIN_DRAFT_LEN..=MAX_DRAFT_LEN).contains(&n) {
+                return Err((
+                    "speculation.draft_len",
+                    format!("speculation.draft_len must be in [{MIN_DRAFT_LEN}, {MAX_DRAFT_LEN}]"),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
 /// Build an OpenAI-shape error JSON with a populated `param` field.
-fn json_error_param(
+pub(crate) fn json_error_param(
     status: u16,
     code: &str,
     message: &str,
@@ -1691,11 +1938,29 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
                 .await;
         }
     };
-    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref()) {
+    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true) {
         return res
             .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
             .await;
     }
+
+    // `tool_choice: "required" | {function}` constrains generation to the
+    // model's native tool-call grammar (OpenAI tool_choice enforcement).
+    // Built BEFORE the Emitter so an unsatisfiable directive returns a
+    // clean 4xx JSON envelope instead of a half-open stream.
+    let tool_constraint = match build_forced_tool_constraint(
+        &model,
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+    ) {
+        Ok(c) => c,
+        Err((status, code, msg)) => {
+            return res
+                .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
+                .await;
+        }
+    };
+    let forced_tool = tool_constraint.is_some();
 
     // Headers committed; from here we must finish via the Emitter.
     let mut em = Emitter::start(res);
@@ -1760,15 +2025,37 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
     };
     try_emit!(em, &role_chunk, "role_chunk");
 
-    let sampler = Sampler::TopP {
-        temperature,
-        p: top_p,
-    };
     let stop_tokens = chat::stop_tokens(&model);
-    let mut stream = ctx
-        .generate(sampler)
-        .max_tokens(max_tokens)
-        .stop(&stop_tokens);
+    // #418: pick plain vs speculative decode. Speculation engages only
+    // when requested, greedy (temperature 0), AND no tool call is forced
+    // — a forced tool call constrains the sampler to the tool-call
+    // grammar, and the drafter's verify must not run against a
+    // grammar-constrained sampler. Otherwise plain decode, with
+    // `fallback_reason` reporting why (no silent no-op).
+    let greedy = temperature <= 0.0;
+    let (strategy, fallback_reason, want_metrics, dims) =
+        plan_strategy(req.speculation.as_ref(), greedy, forced_tool);
+    let spec_enabled = matches!(strategy, DecodeStrategy::Speculative(_));
+    let sampler = generate::resolve_sampler(temperature, top_p);
+    let seed_tokens = if spec_enabled {
+        seed_tokens_from(&model, &req.messages)
+    } else {
+        Vec::new()
+    };
+    let generate::GenSession {
+        generator: mut stream,
+        metrics: spec_metrics_handle,
+    } = generate::start(&mut ctx, sampler, max_tokens, &stop_tokens, strategy, &seed_tokens);
+    // tool_choice enforcement (from main): constrain to the tool-call
+    // grammar when a call is forced. Speculation is gated off in that
+    // case (`forced_tool` above), so this only ever applies to the plain
+    // generator.
+    if let Some(c) = tool_constraint {
+        stream = stream.constrain(c);
+    }
+    let mut spec_generated = 0usize;
+    let mut spec_steps = 0usize;
+    let spec_start = Instant::now();
     let mut decoder = chat::Decoder::new(&model);
     // Reasoning decoder is always live — cheap on models without a
     // thinking template (returns `Idle` for every batch). Tool-use
@@ -1802,12 +2089,22 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             Ok(o) => o,
             Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
         };
+        // #418: per-step decode accounting (one forward pass; `out.tokens`
+        // is a burst of 1 free pick + accepted drafts under speculation).
+        spec_steps += 1;
+        spec_generated += out.tokens.len();
 
         // Reasoning side: thinking-blocks become `reasoning_content`
         // deltas. `Idle` is the no-op signal; `Start` flips the
         // `in_reasoning` guard so chat::Delta arms inside the block
         // are not double-emitted as visible content (mirrors the
         // text-completion canonical loop in pie/inferlets).
+        // capture the gate state BEFORE feeding the reasoning
+        // decoder — `feed` flips `in_reasoning` as a side effect of
+        // consuming a boundary token, and the chat decoder (fed below)
+        // must be gated on the batch's channel, not the post-flip state.
+        let was_in_reasoning = in_reasoning;
+        let mut reason_idle = false;
         match reason_dec.feed(&out.tokens) {
             Ok(inferlet::reasoning::Event::Start) => {
                 in_reasoning = true;
@@ -1833,7 +2130,9 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             Ok(inferlet::reasoning::Event::End(_)) => {
                 in_reasoning = false;
             }
-            Ok(inferlet::reasoning::Event::Idle) => {}
+            Ok(inferlet::reasoning::Event::Idle) => {
+                reason_idle = true;
+            }
             Err(e) => break (Outcome::Aborted, Some(("reasoning_decode_failed", e.to_string()))),
         }
 
@@ -1869,7 +2168,14 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
         }
 
         match decoder.feed(&out.tokens) {
-            Ok(chat::Event::Delta(s)) if !in_reasoning => {
+            // When a forced `tool_choice` constrains output to the
+            // tool-call grammar, the ENTIRE generation IS the call
+            // (`root` has no free-text alternative), so suppress the
+            // visible content channel — the call rides only the terminal
+            // `tool_calls` delta (OpenAI emits content:null alongside
+            // tool_calls). Composes with the reasoning content gate; the
+            // suppressed deltas fall through to the no-op arm below.
+            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) && !forced_tool => {
                 let chunk = ChatCompletionChunk {
                     id: &id,
                     object: "chat.completion.chunk",
@@ -1891,11 +2197,12 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
                 try_emit!(em, &chunk, "content_delta");
             }
             Ok(chat::Event::Delta(_)) => {
-                // Suppressed: chat::Delta fired while the reasoning
-                // decoder was inside a `<think>` block. Tokens are
-                // already accounted for via the reasoning_content
-                // emit above; surfacing them again as visible content
-                // would double-render the scratchpad.
+                // Suppressed: this batch is reasoning-channel material —
+                // either inside a `<think>` block, or the opening/closing
+                // delimiter itself. The chat decoder is model-generic and
+                // surfaces the delimiter text (`<think>` / `</think>`) as a
+                // Delta; `content_visible` keeps it off the visible channel
+                // so the scratchpad and its delimiters never leak.
             }
             Ok(chat::Event::Done(_)) => break (Outcome::Natural, None),
             Ok(chat::Event::Interrupt(id)) => {
@@ -1907,6 +2214,30 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             Ok(chat::Event::Idle) => continue,
             Err(e) => break (Outcome::Aborted, Some(("decode_failed", e.to_string()))),
         }
+    };
+
+    // F1: a forced `tool_choice` whose constrained generation never closed
+    // a complete tool call (max_tokens too small for the args, a natural
+    // stop before `Event::Call`, or a mid-turn tool-decoder disable) leaves
+    // `pending_tool` None. Content was suppressed on the forced path, so the
+    // default terminal here would be a deceptive empty success
+    // (`finish_reason:"stop"`/`"length"`, no `tool_calls`, no error) —
+    // silently dropping the directive this path exists to enforce. The
+    // "preserve a viable plain-text reply" rationale does not apply when
+    // content is suppressed. Reclassify as an explicit error so the terminal
+    // chunk carries `finish_reason:"error"` + the diagnostic meta-frame.
+    let (outcome, error_diag) = if forced_tool && pending_tool.is_none() && error_diag.is_none() {
+        (
+            Outcome::Aborted,
+            Some((
+                "tool_call_not_produced",
+                "tool_choice forced a tool call but generation ended before a complete \
+                 tool call was produced; raise max_tokens or relax tool_choice"
+                    .to_string(),
+            )),
+        )
+    } else {
+        (outcome, error_diag)
     };
 
     // Terminal chunk first so OpenAI clients see a `finish_reason`
@@ -1992,6 +2323,30 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             eprintln!("[chat-apc] error-meta serialize bug: {e}");
         }
     }
+    // #418: terminal spec_metrics frame (only when the caller opted into
+    // the speculation surface, so normal streams are byte-identical).
+    if want_metrics {
+        let spec = spec_metrics_handle
+            .map(|h| *h.lock().unwrap())
+            .unwrap_or_default();
+        let report = SpecMetricsReport::build(
+            spec_enabled,
+            fallback_reason,
+            dims,
+            spec,
+            spec_generated,
+            spec_steps,
+            spec_start.elapsed(),
+        );
+        report.log_spec_stats();
+        let frame = SpecMetricsSse {
+            event: "spec_metrics",
+            report: &report,
+        };
+        if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
+            eprintln!("[chat-apc] spec_metrics serialize bug: {e}");
+        }
+    }
     sse::emit_done_logged(&mut em, "stream_exit").await;
     em.finish()
 }
@@ -2032,21 +2387,53 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
                 .await;
         }
     };
-    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref()) {
+    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true) {
         return res
             .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
             .await;
     }
 
-    let sampler = Sampler::TopP {
-        temperature,
-        p: top_p,
+    // tool_choice enforcement (mirrors handle_streaming): constrain to the
+    // model's native tool-call grammar when a call is forced; an
+    // unsatisfiable directive returns a 4xx before generation begins.
+    let tool_constraint = match build_forced_tool_constraint(
+        &model,
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+    ) {
+        Ok(c) => c,
+        Err((status, code, msg)) => {
+            return res
+                .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
+                .await;
+        }
     };
+    let forced_tool = tool_constraint.is_some();
     let stop_tokens = chat::stop_tokens(&model);
-    let mut stream = ctx
-        .generate(sampler)
-        .max_tokens(max_tokens)
-        .stop(&stop_tokens);
+    // #418: plain vs speculative decode (see handle_streaming for the
+    // greedy + forced-tool gate rationale).
+    let greedy = temperature <= 0.0;
+    let (strategy, fallback_reason, want_metrics, dims) =
+        plan_strategy(req.speculation.as_ref(), greedy, forced_tool);
+    let spec_enabled = matches!(strategy, DecodeStrategy::Speculative(_));
+    let sampler = generate::resolve_sampler(temperature, top_p);
+    let seed_tokens = if spec_enabled {
+        seed_tokens_from(&model, &req.messages)
+    } else {
+        Vec::new()
+    };
+    let generate::GenSession {
+        generator: mut stream,
+        metrics: spec_metrics_handle,
+    } = generate::start(&mut ctx, sampler, max_tokens, &stop_tokens, strategy, &seed_tokens);
+    // tool_choice enforcement (from main); spec is gated off when forced,
+    // so this only applies to the plain generator.
+    if let Some(c) = tool_constraint {
+        stream = stream.constrain(c);
+    }
+    let mut spec_generated = 0usize;
+    let mut spec_steps = 0usize;
+    let spec_start = Instant::now();
     let mut decoder = chat::Decoder::new(&model);
     let mut reason_dec = ReasoningDecoder::new(&model);
     let mut tool_dec = ToolUseDecoder::new(&model);
@@ -2075,7 +2462,16 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
             Ok(o) => o,
             Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
         };
+        // #418: per-step decode accounting (one forward pass; `out.tokens`
+        // is a burst of 1 free pick + accepted drafts under speculation).
+        spec_steps += 1;
+        spec_generated += out.tokens.len();
 
+        // capture the gate state BEFORE feeding the reasoning
+        // decoder (see streaming branch + `content_visible`). Mirrors the
+        // streaming gate so stream + non-stream produce identical content.
+        let was_in_reasoning = in_reasoning;
+        let mut reason_idle = false;
         match reason_dec.feed(&out.tokens) {
             Ok(inferlet::reasoning::Event::Start) => in_reasoning = true,
             Ok(inferlet::reasoning::Event::Delta(s)) => {
@@ -2093,7 +2489,9 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
             Ok(inferlet::reasoning::Event::End(_)) => {
                 in_reasoning = false;
             }
-            Ok(inferlet::reasoning::Event::Idle) => {}
+            Ok(inferlet::reasoning::Event::Idle) => {
+                reason_idle = true;
+            }
             Err(e) => break (Outcome::Aborted, Some(("reasoning_decode_failed", e.to_string()))),
         }
 
@@ -2124,13 +2522,17 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         }
 
         match decoder.feed(&out.tokens) {
-            Ok(chat::Event::Delta(s)) if !in_reasoning => full_text.push_str(&s),
+            // Forced tool_choice suppresses visible content (see
+            // handle_streaming) — the call surfaces only via tool_calls.
+            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) && !forced_tool => {
+                full_text.push_str(&s)
+            }
             Ok(chat::Event::Delta(_)) => {}
-            // F1: trust the delta-stitched `full_text` that respects
-            // `in_reasoning`. The chat decoder runs alongside (not
-            // downstream of) the reasoning decoder, so `Done(s)`
-            // typically still contains the `<think>...</think>` span
-            // — overwriting `full_text` with it leaks reasoning into
+            // F1: trust the delta-stitched `full_text` that respects the
+            // reasoning channel (`content_visible`). The chat decoder runs
+            // alongside (not downstream of) the reasoning decoder, so
+            // `Done(s)` typically still contains the `<think>...</think>`
+            // span — overwriting `full_text` with it leaks reasoning into
             // visible content. Streaming gates content deltas the
             // same way; mirror that here so stream + non-stream
             // produce the same `content` for the same prompt.
@@ -2149,6 +2551,24 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
             Ok(chat::Event::Idle) => continue,
             Err(e) => break (Outcome::Aborted, Some(("decode_failed", e.to_string()))),
         }
+    };
+
+    // F1: forced `tool_choice` that never closed a complete tool call (see
+    // the streaming branch) leaves `pending_tool` None with content
+    // suppressed — reclassify as an explicit error so the no-tokens-produced
+    // branch below returns a 500 instead of a deceptive empty 200.
+    let (outcome, error_diag) = if forced_tool && pending_tool.is_none() && error_diag.is_none() {
+        (
+            Outcome::Aborted,
+            Some((
+                "tool_call_not_produced",
+                "tool_choice forced a tool call but generation ended before a complete \
+                 tool call was produced; raise max_tokens or relax tool_choice"
+                    .to_string(),
+            )),
+        )
+    } else {
+        (outcome, error_diag)
     };
 
     // F2: only the no-tokens-produced abort drops to a bare 500.
@@ -2234,6 +2654,26 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
                 .collect(),
         )
     };
+    // #418: speculation metrics, only when the caller opted into the
+    // surface (so normal responses are byte-identical).
+    let spec_metrics = if want_metrics {
+        let spec = spec_metrics_handle
+            .map(|h| *h.lock().unwrap())
+            .unwrap_or_default();
+        let report = SpecMetricsReport::build(
+            spec_enabled,
+            fallback_reason,
+            dims,
+            spec,
+            spec_generated,
+            spec_steps,
+            spec_start.elapsed(),
+        );
+        report.log_spec_stats();
+        Some(report)
+    } else {
+        None
+    };
     let body = ChatCompletion {
         id: &id,
         object: "chat.completion",
@@ -2251,6 +2691,7 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         }],
         error: error_block,
         warnings: warnings_vec,
+        spec_metrics,
     };
     // `ChatCompletion` is a closed schema of plain scalars + an
     // assistant message string. None of the fields can fail to
@@ -2288,6 +2729,117 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
 // Internals
 // =============================================================================
 
+/// OpenAI `tool_choice` reduced to whether — and how — it FORCES a tool
+/// call. Only the force-a-call modes enable constrained generation;
+/// `"none"` / `"auto"` / absent leave generation unconstrained (the prior
+/// behavior — `tool_choice` was parsed-but-ignored).
+enum ForcedToolChoice {
+    /// `"none"`, `"auto"`, or absent → do not constrain.
+    No,
+    /// `"required"` → constrain to the grammar over ALL equipped tools.
+    Any,
+    /// `{"type":"function","function":{"name":N}}` → constrain to the one
+    /// named function so the call's `name` is pinned.
+    Named(String),
+}
+
+/// Classify `tool_choice`. Unknown / malformed shapes degrade to `No`
+/// (parsed-but-ignored) rather than erroring — matches the lenient
+/// `#[serde(default)]` posture on the field.
+fn forced_tool_choice(tc: Option<&serde_json::Value>) -> ForcedToolChoice {
+    let Some(v) = tc else { return ForcedToolChoice::No };
+    if let Some(s) = v.as_str() {
+        return if s == "required" {
+            ForcedToolChoice::Any
+        } else {
+            ForcedToolChoice::No
+        };
+    }
+    if v.get("type").and_then(|t| t.as_str()) == Some("function")
+        && let Some(name) = v
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+        && !name.is_empty()
+    {
+        return ForcedToolChoice::Named(name.to_string());
+    }
+    ForcedToolChoice::No
+}
+
+/// Build the `{name, description, parameters}` JSON envelopes the host's
+/// `equip_prefix` / `native_grammar` expect from the OpenAI `tools[]`.
+/// Non-function variants are dropped (the model template can't encode
+/// them). `only` (a named `tool_choice`) restricts to a single function so
+/// the constrain grammar pins that name.
+fn tool_envelopes(tools: &[ToolSchema], only: Option<&str>) -> Vec<String> {
+    tools
+        .iter()
+        .filter(|t| t.kind.is_empty() || t.kind == "function")
+        .filter(|t| only.is_none_or(|n| t.function.name == n))
+        .map(|t| {
+            serde_json::json!({
+                "name": t.function.name,
+                "description": t.function.description.as_deref().unwrap_or(""),
+                "parameters": t.function.parameters,
+            })
+            .to_string()
+        })
+        .collect()
+}
+
+/// When `tool_choice` forces a call, constrain generation to the model's
+/// native tool-call grammar. This is real OpenAI `tool_choice` enforcement
+/// (previously a no-op) AND the mechanism that makes a tool call
+/// deterministic on the dummy driver — the dummy honors the grammar's
+/// per-step logit mask, and the Qwen tool grammar's `root` forces a
+/// `<tool_call>{…}</tool_call>` with the name pinned to the equipped
+/// tool(s). Returns:
+///   * `Ok(None)`      — not forced; leave generation unconstrained.
+///   * `Ok(Some(c))`   — forced + model has a native tool grammar.
+///   * `Err((status,code,msg))` — forced but unsatisfiable (no matching
+///     tool in `tools[]`, or the model has no native tool-call grammar) →
+///     the caller returns this OpenAI-shape error instead of silently
+///     ignoring the directive.
+fn build_forced_tool_constraint(
+    model: &Model,
+    tools: Option<&[ToolSchema]>,
+    tool_choice: Option<&serde_json::Value>,
+) -> Result<Option<GrammarConstraint>, (u16, &'static str, String)> {
+    let only = match forced_tool_choice(tool_choice) {
+        ForcedToolChoice::No => return Ok(None),
+        ForcedToolChoice::Any => None,
+        ForcedToolChoice::Named(n) => Some(n),
+    };
+    let envelopes = tool_envelopes(tools.unwrap_or(&[]), only.as_deref());
+    if envelopes.is_empty() {
+        return Err((
+            400,
+            "invalid_request",
+            match &only {
+                Some(n) => format!(
+                    "tool_choice names function '{n}' but it is not present in tools[]"
+                ),
+                None => "tool_choice is \"required\" but tools[] is empty".to_string(),
+            },
+        ));
+    }
+    // `native_grammar` returns `None` gracefully when the model has no
+    // tool-call format (unlike `native_matcher`, which would trap). Gate
+    // on it, then wrap the grammar in a matcher-backed constraint.
+    match inferlet::tools::native_grammar(model, &envelopes) {
+        Some(grammar) => Ok(Some(GrammarConstraint::from_grammar(&grammar, model))),
+        None => Err((
+            400,
+            "tool_choice_unsupported",
+            "tool_choice forces a tool call but this model has no native \
+             tool-call grammar (constrained tool calling is unsupported for \
+             this architecture)"
+                .to_string(),
+        )),
+    }
+}
+
 /// Apply role-tagged messages to `ctx` via the SDK's chat templating
 /// and, when `tools` is non-empty, splice the model's native tool
 /// schema preamble via `inferlet::tools::equip_prefix`. Equip runs
@@ -2297,29 +2849,20 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
 /// Roles outside the OpenAI canonical set are demoted to `user` so
 /// future SDK extensions (e.g. `tool`) don't crash the handler — a
 /// pessimistic but loss-of-information-preserving choice.
-fn fill_context(
+pub(crate) fn fill_context(
     ctx: &mut Context,
     model: &Model,
     messages: &[ChatMessage],
     tools: Option<&[ToolSchema]>,
+    cue: bool,
 ) -> Result<(), (&'static str, String)> {
     if let Some(tools) = tools {
-        let envelopes: Vec<String> = tools
-            .iter()
-            // The SDK's `equip_prefix` expects `{name, description,
-            // parameters}` per entry; the OpenAI `type:"function"`
-            // wrapper is stripped here. Non-function variants are
-            // ignored — the model template has no encoding for them.
-            .filter(|t| t.kind.is_empty() || t.kind == "function")
-            .map(|t| {
-                serde_json::json!({
-                    "name": t.function.name,
-                    "description": t.function.description.as_deref().unwrap_or(""),
-                    "parameters": t.function.parameters,
-                })
-                .to_string()
-            })
-            .collect();
+        // The SDK's `equip_prefix` expects `{name, description,
+        // parameters}` per entry; the OpenAI `type:"function"` wrapper is
+        // stripped here. Non-function variants are ignored — the model
+        // template has no encoding for them. All tools are equipped
+        // (visible to the model) regardless of `tool_choice`.
+        let envelopes = tool_envelopes(tools, None);
         if !envelopes.is_empty() {
             let prefix = inferlet::tools::equip_prefix(model, &envelopes)
                 .map_err(|e| ("tool_equip_failed", format!("equip_prefix: {e}")))?;
@@ -2342,7 +2885,14 @@ fn fill_context(
             }
         }
     }
-    ctx.cue();
+    // The trailing cue opens the assistant turn the generator fills.
+    // Single-shot chat callers commit it with the prompt; tree-of-thought
+    // defers it to each forked branch (so a freshly forked, fully-flushed
+    // context still has tokens to process — an empty forward pass spins
+    // the generator), so it is opt-out here.
+    if cue {
+        ctx.cue();
+    }
     Ok(())
 }
 
@@ -2377,6 +2927,187 @@ fn next_tool_call_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Reasoning/content channel demux ──────────────────
+
+    /// Reasoning-decoder event kind for one generation step, paired with
+    /// the chat decoder's text for the same token batch. Models what the
+    /// host decoders return without the wasm host.
+    enum Step {
+        ThinkStart(&'static str),  // reasoning Start; chat surfaces the `<think>` text
+        Reason(&'static str),      // reasoning Delta; chat surfaces the same text
+        ThinkEnd(&'static str),    // reasoning End/Complete; chat surfaces the `</think>` text
+        Content(&'static str),     // reasoning Idle (outside); chat surfaces visible content
+    }
+
+    /// Replays the generation loop's reasoning/content demux exactly as
+    /// `handle_streaming` / `handle_non_streaming` do: capture
+    /// `was_in_reasoning`, feed reasoning (updating `in_reasoning` +
+    /// `reason_idle`), then gate the chat delta on `content_visible`.
+    /// Returns `(visible_content, reasoning)`.
+    fn demux(steps: &[Step]) -> (String, String) {
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut in_reasoning = false;
+        for step in steps {
+            let was_in_reasoning = in_reasoning;
+            let mut reason_idle = false;
+            let chat_text = match step {
+                Step::ThinkStart(t) => {
+                    in_reasoning = true;
+                    *t
+                }
+                Step::Reason(t) => {
+                    in_reasoning = true;
+                    reasoning.push_str(t);
+                    *t
+                }
+                Step::ThinkEnd(t) => {
+                    in_reasoning = false;
+                    *t
+                }
+                Step::Content(t) => {
+                    reason_idle = true;
+                    *t
+                }
+            };
+            if content_visible(reason_idle, was_in_reasoning) {
+                content.push_str(chat_text);
+            }
+        }
+        (content, reasoning)
+    }
+
+    #[test]
+    fn think_delimiters_never_leak_into_visible_content() {
+        // A canonical Qwen reasoning turn: <think> reasoning </think> answer.
+        let (content, reasoning) = demux(&[
+            Step::ThinkStart("<think>"),
+            Step::Reason("the user said hi"),
+            Step::ThinkEnd("</think>"),
+            Step::Content("Hello!"),
+        ]);
+        assert_eq!(content, "Hello!", "only the answer reaches visible content");
+        assert_eq!(reasoning, "the user said hi");
+        // The specific symptom: the CLOSING tag must not leak.
+        assert!(!content.contains("</think>"), "closing delimiter leaked: {content:?}");
+        assert!(!content.contains("<think>"), "opening delimiter leaked: {content:?}");
+    }
+
+    #[test]
+    fn content_visible_only_outside_reasoning() {
+        // Idle batch outside reasoning → visible.
+        assert!(content_visible(true, false));
+        // Closing-delimiter batch: reasoning End (not idle), was inside.
+        assert!(!content_visible(false, true));
+        // Opening-delimiter / reasoning-body batch: not idle.
+        assert!(!content_visible(false, false));
+        // Idle batch while still inside (no-visible-text reasoning token).
+        assert!(!content_visible(true, true));
+    }
+
+    #[test]
+    fn non_thinking_model_passes_all_content() {
+        // NoopReasoningDecoder always reports Idle and never flips the
+        // gate — every batch is visible content.
+        let (content, reasoning) = demux(&[
+            Step::Content("Plain "),
+            Step::Content("answer."),
+        ]);
+        assert_eq!(content, "Plain answer.");
+        assert!(reasoning.is_empty());
+    }
+
+    #[test]
+    fn speculation_parses_and_maps_paper_defaults() {
+        let r: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "temperature":0,"speculation":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let s = r.speculation.expect("speculation present");
+        assert!(s.enabled);
+        let cfg = s.to_config();
+        assert_eq!(cfg.leader_len, 1);
+        assert_eq!(cfg.draft_len, 3);
+    }
+
+    #[test]
+    fn absent_speculation_is_none() {
+        let r: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        assert!(r.speculation.is_none());
+    }
+
+    #[test]
+    fn spec_dims_out_of_range_rejected() {
+        // F1: out-of-range speculation knobs are rejected at the 400
+        // boundary with a `param`, mirroring max_tokens — NOT silently
+        // clamped. leader_len below range:
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "temperature":0,"speculation":{"enabled":true,"leader_len":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_sampling(&req).unwrap_err().0,
+            "speculation.leader_len"
+        );
+
+        // draft_len above range:
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "temperature":0,"speculation":{"enabled":true,"draft_len":99999}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_sampling(&req).unwrap_err().0,
+            "speculation.draft_len"
+        );
+
+        // in-range values pass; the clamp in to_config is then a
+        // redundant safety net.
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "temperature":0,"speculation":{"enabled":true,"leader_len":2,"draft_len":4}}"#,
+        )
+        .unwrap();
+        assert!(validate_sampling(&req).is_ok());
+        let cfg = req.speculation.unwrap().to_config();
+        assert_eq!((cfg.leader_len, cfg.draft_len), (2, 4));
+    }
+
+    #[test]
+    fn plan_strategy_gates_on_greedy_and_enabled() {
+        // requested + greedy + no forced tool -> speculative, no fallback
+        let s = SpecRequest { enabled: true, leader_len: None, draft_len: None };
+        let (st, fb, want, _) = plan_strategy(Some(&s), true, false);
+        assert!(matches!(st, DecodeStrategy::Speculative(_)));
+        assert!(fb.is_none());
+        assert!(want);
+        // requested + non-greedy -> plain, fallback reason
+        let (st, fb, want, _) = plan_strategy(Some(&s), false, false);
+        assert!(matches!(st, DecodeStrategy::Plain));
+        assert_eq!(fb, Some("non_greedy_sampling"));
+        assert!(want);
+        // requested + greedy BUT a tool call is forced -> plain, gated off
+        // with a distinct reason (checked before the greedy gate).
+        let (st, fb, want, _) = plan_strategy(Some(&s), true, true);
+        assert!(matches!(st, DecodeStrategy::Plain));
+        assert_eq!(fb, Some("tool_choice_forced"));
+        assert!(want);
+        // enabled:false -> plain, disabled
+        let off = SpecRequest { enabled: false, leader_len: None, draft_len: None };
+        let (_, fb, want, _) = plan_strategy(Some(&off), true, false);
+        assert_eq!(fb, Some("disabled"));
+        assert!(want);
+        // absent -> plain, no metrics surface
+        let (_, fb, want, _) = plan_strategy(None, true, false);
+        assert!(fb.is_none());
+        assert!(!want);
+    }
 
     #[test]
     fn truncate_message_passthrough() {

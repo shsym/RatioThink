@@ -1,5 +1,18 @@
 import Foundation
 
+/// Where a discovered model lives, which decides what the app may do
+/// with it.
+public enum CachedModelSource: String, Equatable, Sendable {
+  /// Staged in RatioThink's app-managed models directory
+  /// (`PieDirs.models()`) — imported or downloaded through the app, and
+  /// deletable from it.
+  case appManaged
+  /// Discovered in the shared Hugging Face cache (`HF_HOME/hub`). The
+  /// app does not own that directory, so these rows are read-only:
+  /// reveal in Finder, never delete.
+  case huggingFaceCache
+}
+
 /// One row in *Settings → Models → Installed library*. Built by
 /// scanning `PieDirs.models()` for `*.gguf` files plus their `*.gguf.partial`
 /// siblings (active downloads). Pure value type — no observation,
@@ -48,13 +61,30 @@ public struct InstalledModel: Equatable, Identifiable, Sendable {
   /// expected to suppress the size + date columns on `true`.
   public let metadataUnreadable: Bool
 
+  /// Origin of the row. `.appManaged` for files under the app models
+  /// directory (the only rows `InstalledModels.scan` produces);
+  /// `.huggingFaceCache` for repos surfaced by `HFCacheCatalog`. The UI
+  /// keys read-only behavior off this.
+  public let source: CachedModelSource
+
+  /// Non-nil when the row is discovered-but-NOT-LAUNCHABLE: a
+  /// human-readable reason the engine cannot load this model as-is, so
+  /// the UI surfaces it (the user can see the cached model) but disables
+  /// selecting it as a launch target. A split GGUF
+  /// (`…-NNNNN-of-MMMMM.gguf`) collapses to one row carrying this reason,
+  /// because pie's portable driver loads a single `.gguf` file and has no
+  /// split-file support. `nil` = launchable.
+  public let unsupportedReason: String?
+
   public init(filename: String,
               url: URL,
               sizeBytes: Int64,
               modifiedAt: Date,
               isPartial: Bool,
               isUnverified: Bool = false,
-              metadataUnreadable: Bool = false) {
+              metadataUnreadable: Bool = false,
+              source: CachedModelSource = .appManaged,
+              unsupportedReason: String? = nil) {
     self.filename = filename
     self.url = url
     self.sizeBytes = sizeBytes
@@ -62,6 +92,8 @@ public struct InstalledModel: Equatable, Identifiable, Sendable {
     self.isPartial = isPartial
     self.isUnverified = isUnverified
     self.metadataUnreadable = metadataUnreadable
+    self.source = source
+    self.unsupportedReason = unsupportedReason
   }
 }
 

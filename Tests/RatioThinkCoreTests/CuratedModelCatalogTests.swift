@@ -91,4 +91,66 @@ final class CuratedModelCatalogTests: XCTestCase {
     XCTAssertTrue(seededResolved.contains("/\(recommended.huggingFaceRepo)/"),
                   "resolved path must be nested under the repo, not a flat top-level leaf name")
   }
+
+  // MARK: - single-file-GGUF shape guards (#425)
+
+  /// Every curated entry must be shaped as a SINGLE-FILE GGUF download:
+  /// a 2-segment `<org>/<name>` repo and a single `.gguf` leaf with no
+  /// path separators. pie loads one `.gguf` via `gguf_init_from_file`
+  /// (and `ModelDownloader.start(repo:file:)` fetches one blob), so a
+  /// directory slug or a nested path could never download-and-launch.
+  /// This is the offline tripwire for the #425 class of bug.
+  func test_every_curated_entry_is_shaped_as_a_single_file_gguf_download() {
+    for m in CuratedModelCatalog.all {
+      let repoSegments = m.huggingFaceRepo
+        .split(separator: "/", omittingEmptySubsequences: true)
+      XCTAssertEqual(repoSegments.count, 2,
+                     "repo must be a 2-segment <org>/<name> for \(m.id): \(m.huggingFaceRepo)")
+      XCTAssertFalse(m.huggingFaceFile.contains("/"),
+                     "curated file must be a single leaf, not a nested path for \(m.id): \(m.huggingFaceFile)")
+      XCTAssertTrue(m.huggingFaceFile.lowercased().hasSuffix(".gguf"),
+                    "curated file must be a .gguf for \(m.id): \(m.huggingFaceFile)")
+
+      // The slug the UI hands to the download path must resolve back to
+      // exactly this single-file target — proves the entry is consumable
+      // by `ModelDownloadController.enqueue(repo:file:)`, not a dir slug
+      // that `downloadTarget` rejects (returns nil).
+      let slug = "\(m.huggingFaceRepo)/\(m.huggingFaceFile)"
+      let target = CuratedModelCatalog.downloadTarget(forModelSlug: slug)
+      XCTAssertEqual(target?.repo, m.huggingFaceRepo,
+                     "curated slug must resolve to its own repo for \(m.id)")
+      XCTAssertEqual(target?.file, m.huggingFaceFile,
+                     "curated slug must resolve to its own file for \(m.id)")
+    }
+  }
+
+  /// No curated entry may point at a split GGUF shard
+  /// (`…-NNNNN-of-MMMMM.gguf`). Reuses the SAME detector the launch path
+  /// (`LaunchSpecResolver`) and cache discovery (`HFCacheCatalog`) use to
+  /// refuse split models, so the curated catalog can't silently surface
+  /// what the engine would reject downstream. Catches a maintainer
+  /// pasting a shard filename from a split-only repo.
+  func test_no_curated_entry_points_at_a_split_shard_file() {
+    for m in CuratedModelCatalog.all {
+      XCTAssertFalse(HFCacheCatalog.isSplitShardFilename(m.huggingFaceFile),
+                     "curated entry \(m.id) points at a split GGUF shard the engine cannot assemble: \(m.huggingFaceFile)")
+    }
+  }
+
+  /// #425 regression pin: Qwen2.5 7B Q4_K_M must come from bartowski's
+  /// single-file repo, NOT the official `Qwen/Qwen2.5-7B-Instruct-GGUF`,
+  /// which publishes that quant ONLY as `…-q4_k_m-00001-of-00002.gguf`
+  /// shards (verified against the live HF repo). This fails the instant
+  /// someone "corrects" the catalog back to the official repo and
+  /// re-introduces a non-existent monolithic file.
+  func test_qwen7b_entry_uses_single_file_repo_not_split_shard_repo() {
+    let entry = CuratedModelCatalog.model(withID: "qwen2.5-7b-instruct-q4_k_m")
+    XCTAssertNotNil(entry, "the 7B curated entry must exist")
+    XCTAssertEqual(entry?.huggingFaceRepo, "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                   "7B must use the bartowski single-file repo, not the Qwen split-shard repo")
+    XCTAssertEqual(entry?.huggingFaceFile, "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+                   "7B must point at the monolithic Q4_K_M file")
+    XCTAssertNotEqual(entry?.huggingFaceRepo, "Qwen/Qwen2.5-7B-Instruct-GGUF",
+                      "the Qwen official repo ships this quant only as split shards — do not revert")
+  }
 }

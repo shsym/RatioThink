@@ -2,3 +2,9 @@
 	path = Vendor/pie
 	url = https://github.com/pie-project/pie.git
 	branch = pie.app/v1-base-shmem
+[submodule "Scripts/vendor/ds_store"]
+	path = Scripts/vendor/ds_store
+	url = https://github.com/dmgbuild/ds_store.git
+[submodule "Scripts/vendor/mac_alias"]
+	path = Scripts/vendor/mac_alias
+	url = https://github.com/dmgbuild/mac_alias.git

@@ -36,6 +36,10 @@ struct RatioThinkApp: App {
   @StateObject private var profileStore: ProfileStore
   @StateObject private var swapCoordinator: ProfileSwapCoordinator
   @StateObject private var engineStatusStore: EngineStatusStore
+  /// #412: App-side background-helper health + restart ladder. Driven by the
+  /// same `engineStatus()` poll as `engineStatusStore` (via `onPollOutcome`)
+  /// and surfaced as the toolbar helper-ring + the escalation banner.
+  @StateObject private var helperHealth: HelperHealthController
   @StateObject private var engineClientStore: EngineClientStore
   /// Phase 3.8 (review v2 F1): the Add Model sheet's `.queueDownload`
   /// outcome runs through this controller so the existing
@@ -43,10 +47,15 @@ struct RatioThinkApp: App {
   /// closing + reopening the Settings sheet does not orphan an
   /// in-flight download.
   @StateObject private var downloadController: ModelDownloadController
+  /// #411: once-per-launch GitHub-Releases update check. App-scoped so the
+  /// check (and its single network call) fires once per process; RootView
+  /// observes `pending` to render the non-modal update banner.
+  @StateObject private var updateAvailability = UpdateAvailabilityModel()
 
   @MainActor
   init() {
     Self.writeArtifactPathProbeIfRequested()
+    Self.recordLaunchBreadcrumb()
 
     // Build the four dependencies value-side so the coordinator can
     // borrow them at construction. The `@StateObject` wrappers aren't
@@ -54,7 +63,44 @@ struct RatioThinkApp: App {
     // is the only place identity can be threaded.
     let center = ModelLoadCenter()
     let prefs = AppPreferences(defaults: Self.appPreferencesDefaults())
-    let statusStore = EngineStatusStore(client: HelperXPCClient())
+    let testBaseURL = Self.chatTestEngineBaseURL()
+    let statusStore: EngineStatusStore
+    #if DEBUG
+    // DEBUG-only GUI-harness seam (S302): a pure-HTTP mock engine answers
+    // `/v1/...` but has NO Helper to report status over XPC, so the
+    // model-menu `/v1/models` reconcile (gated on `.running`) would
+    // otherwise empty the menu. When `PIE_TEST_PIN_ENGINE_RUNNING` is set
+    // alongside the base-URL bypass, pin `EngineStatus.running(port:)` —
+    // the one fact the absent Helper would report, and one the harness
+    // genuinely satisfies (`.running`'s downstream contract is "an inferlet
+    // serves `/v1/...` on this port"). Scoped to its OWN flag, NOT every
+    // `PIE_TEST_ENGINE_BASE_URL` launch: the lifecycle-recovery suite
+    // (S279) drives real status transitions and must keep polling.
+    // `#if DEBUG` so the flag + pin compile out of Release entirely; the
+    // S302 GUI suite runs the Debug build.
+    let pinnedRunningPort: EnginePort? = {
+      guard ProcessInfo.processInfo.environment["PIE_TEST_PIN_ENGINE_RUNNING"] == "1",
+            let rawPort = testBaseURL?.port,
+            let port = EnginePort(exactly: rawPort) else { return nil }
+      return port
+    }()
+    if let pinnedRunningPort {
+      // Inject a stub XPC client (NOT HelperXPCClient): the helperless
+      // harness has no Helper, so a real stopEngine() during Unload would
+      // throw and ChatScaffoldView.unloadModel would never reach
+      // markUnloaded() — the model would stay resident. The stub reports
+      // the pinned running status and accepts stopEngine as a no-op so
+      // the Unload confirm path completes to .idle (#359 Path2).
+      statusStore = EngineStatusStore(
+        client: PinnedRunningXPCClient(port: pinnedRunningPort),
+        initialStatus: .running(port: pinnedRunningPort, profileID: "chat")
+      )
+    } else {
+      statusStore = EngineStatusStore(client: HelperXPCClient())
+    }
+    #else
+    statusStore = EngineStatusStore(client: HelperXPCClient())
+    #endif
     //  wire-in completed by : `HTTPEngineClient.baseURLProvider`
     // resolves `EngineStatusStore.requireBaseURL()` on each request.
     // Returns `http://127.0.0.1:<port>` when the helper reports
@@ -66,7 +112,7 @@ struct RatioThinkApp: App {
     // mode an `engineNotReady` rather than a force-unwrap crash if a
     // future refactor lets the store deinit early.
     let engine: EngineClient
-    if let testBaseURL = Self.chatTestEngineBaseURL() {
+    if let testBaseURL {
       engine = HTTPEngineClient(baseURL: testBaseURL)
     } else {
       engine = HTTPEngineClient(
@@ -112,15 +158,65 @@ struct RatioThinkApp: App {
     _persistenceStatus = StateObject(wrappedValue: status)
     chatContainer = RatioThinkModelContainer.openWithFallback(status: status)
 
+    // #412: App-side helper-health restart ladder. The repair runs the
+    // runtime registration reconcile; a test/automation launch gets a no-op
+    // repair so a GUI run never mutates the real machine's SMAppService
+    // background-item registration (same guard the launch reconcile uses).
+    let helperRepair: () async -> Bool
+    if HelperRegistrationReconciler.isTestLaunch(ProcessInfo.processInfo.environment) {
+      helperRepair = { false }
+    } else {
+      helperRepair = { await HelperRegistrationRepair().repairAndReportReachable() }
+    }
+    let helperHealthController = HelperHealthController(repair: helperRepair)
+    // Drive the ladder from the SAME poll the status mirror runs — no second
+    // XPC surface. Set BEFORE statusStore.start() so the first ticks count.
+    statusStore.onPollOutcome = { [weak helperHealthController] succeeded in
+      helperHealthController?.ingestPollOutcome(succeeded: succeeded)
+    }
+    // #412 review F1: let the chat recovery wait bound itself by the ladder
+    // outcome (give up the moment the ladder hits .unreachable) instead of a
+    // fixed timeout chosen out of sync with the ladder cadence.
+    statusStore.helperHealthProvider = { [weak helperHealthController] in
+      helperHealthController?.health
+    }
+    _helperHealth = StateObject(wrappedValue: helperHealthController)
+
     // Kick the XPC poll loop. Idempotent + cheap — first reply lands
     // within ~one runloop tick when the helper is registered, longer
     // when launchd has not yet published the mach service.
+    #if DEBUG
+    // Skipped when status is pinned for the S302 harness (no Helper to
+    // poll; a failed poll would reset the pinned `.running` → `.starting`).
+    if pinnedRunningPort == nil {
+      statusStore.start()
+    }
+    #else
     statusStore.start()
+    #endif
   }
 
+  /// Test-only engine base-URL override. `PIE_TEST_ENGINE_BASE_URL`
+  /// points the chat client straight at an externally-launched engine,
+  /// bypassing the entire production launch boundary (Helper XPC,
+  /// `EngineStatusStore`, `LaunchSpecResolver`, `PieControlLauncher`,
+  /// `pie serve`). It is honored ONLY in a test harness
+  /// (`PIE_TEST_MODE=1`) or a DEBUG build — a shipped Release
+  /// `RatioThink.app` MUST use the real Helper→engine path. Refusing it
+  /// in Release closes the parity gap two ways: a shipped app can't be
+  /// redirected at a foreign URL, and a "real binary" (Release/packaged)
+  /// scenario cannot silently pass on a fake base URL — if the override
+  /// is set it is ignored and the app exercises the real path (failing
+  /// loudly when no real engine is present). Mirrors
+  /// `HelperXPCListener.isAnonymousModeAllowed` for the
+  /// `PIE_ALLOW_UNSIGNED_CALLERS` bypass.
   private static func chatTestEngineBaseURL() -> URL? {
-    guard let raw = ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_BASE_URL"],
-          !raw.isEmpty else { return nil }
+    // Gated through HelperConfig so a Release build ignores the override
+    // entirely — the engine-client redirection and the DEBUG status pin both
+    // key off this result, so a non-debug app falls back to the real
+    // Helper-driven engine path (`HelperXPCClient()`) and never honors the
+    // `PIE_TEST_ENGINE_BASE_URL` seam.
+    guard let raw = HelperConfig.testEngineBaseURLOverride() else { return nil }
     return URL(string: raw)
   }
 
@@ -175,35 +271,33 @@ struct RatioThinkApp: App {
       return
     }
 
-    let registrar = SMAppServiceLoginItemRegistrar()
-    let reconciler = HelperRegistrationReconciler(
-      probeReachable: { await Self.helperReachable() },
-      currentState: { registrar.status.reconcilerState },
-      register: { try registrar.register().reconcilerState },
-      unregister: { try registrar.unregister() }
-    )
-    let outcome = await reconciler.reconcile()
+    // #412: the reconcile is now the shared `HelperRegistrationRepair`
+    // primitive so the launch-time self-heal, the runtime
+    // `HelperHealthController` restart ladder, and the user's "Restart
+    // helper" action all go through one wiring.
+    let outcome = await HelperRegistrationRepair().reconcile()
     NSLog("RatioThinkHelper registration reconcile: \(outcome)")
-    if case .needsApproval = outcome {
+    Diag.app.event("helper.reconcile", [("outcome", "\(outcome)")])
+    if outcome.requiresUserApproval {
       // Hard macOS consent gate — route the user to the toggle.
       SMAppService.openSystemSettingsLoginItems()
     }
   }
 
-  /// Returns true as soon as the Helper answers an `engineStatus()` XPC
-  /// call, retrying over a bounded window so a just-launched (or
-  /// just-reloaded) on-demand Helper has time to publish its mach
-  /// service. ~5s worst case.
-  private static func helperReachable(attempts: Int = 8,
-                                      delayMilliseconds: UInt64 = 600) async -> Bool {
-    let client = HelperXPCClient()
-    for attempt in 0..<attempts {
-      if (try? await client.engineStatus()) != nil { return true }
-      if attempt < attempts - 1 {
-        try? await Task.sleep(nanoseconds: delayMilliseconds * 1_000_000)
-      }
-    }
-    return false
+  /// Durable launch breadcrumb: proves the app process started, and records the
+  /// version/build, the (home-redacted) bundle path, and whether Gatekeeper's
+  /// quarantine xattr is still on the bundle — the first thing triage needs when
+  /// "the app does nothing". Best-effort; never blocks launch.
+  private static func recordLaunchBreadcrumb() {
+    let info = Bundle.main.infoDictionary
+    let bundlePath = Bundle.main.bundleURL.path
+    let quarantined = getxattr(bundlePath, "com.apple.quarantine", nil, 0, 0, 0) > 0
+    Diag.app.event("app.launch", [
+      ("version", info?["CFBundleShortVersionString"] as? String ?? "?"),
+      ("build", info?["CFBundleVersion"] as? String ?? "?"),
+      ("bundle", DiagnosticLog.redactHome(bundlePath)),
+      ("quarantine", quarantined ? "present" : "absent"),
+    ])
   }
 
   private static func writeArtifactPathProbeIfRequested() {
@@ -248,16 +342,36 @@ struct RatioThinkApp: App {
         .environmentObject(engineClientStore)
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
+        .environmentObject(helperHealth)
         .environmentObject(downloadController)
+        .environmentObject(updateAvailability)
         .frame(minWidth: 900, minHeight: 600)
     }
     .modelContainer(chatContainer)
     .defaultSize(width: 1200, height: 800)
     .commands {
-      CommandGroup(replacing: .newItem) {
-        Button("New Chat") {}.keyboardShortcut("n")
-        Button("New Chat (Always)") {}.keyboardShortcut("t")
+      // #411: the MANUAL "Check for Updates…" entry, in the standard macOS
+      // spot (App menu, directly under "About RatioThink"). It always checks
+      // and bypasses the ignore-set, complementing the once-per-launch auto
+      // check that surfaces the non-modal UpdateAvailableBanner (RootView /
+      // UpdateAvailabilityModel). Both compare the running version to the
+      // latest GitHub release and, at most, open the release page — neither
+      // downloads or installs (in-app auto-INSTALL via Sparkle is future #178).
+      CommandGroup(after: .appInfo) {
+        Button("Check for Updates…") {
+          Task { await UpdateChecker.checkForUpdates() }
+        }
       }
+      // #411: remove the two orphaned no-op "New Chat" menu commands
+      // (⌘N / "New Chat (Always)" ⌘T) that had replaced the default
+      // File ▸ New. Both were empty closures — they did nothing, while the
+      // live new-chat affordances drive `ChatCreation.create` directly
+      // (chat-list "+" + col-3 zero-state CTA), never a global menu command.
+      // Replacing `.newItem` with an empty group drops both items and their
+      // ⌘N/⌘T shortcuts, and keeps the default "New Window" suppressed — the
+      // app shares one app-scoped `WindowState`, so a second window is a
+      // half-baked surface.
+      CommandGroup(replacing: .newItem) {}
       CommandGroup(after: .sidebar) {
         Button(windowState.columnVisibility == .all ? "Hide Sidebar" : "Show Sidebar") {
           windowState.toggleSidebar()
@@ -268,6 +382,13 @@ struct RatioThinkApp: App {
           windowState.toggleItemList()
         }
         .keyboardShortcut("l", modifiers: [.command, .option])
+      }
+      // #358: user-reachable diagnostics. Runs the bundled
+      // collect-diagnostics.sh and reveals the redacted .zip in Finder.
+      CommandGroup(after: .help) {
+        Button("Collect Diagnostics…") {
+          Task { await DiagnosticsCollector.collectAndReveal() }
+        }
       }
     }
 
@@ -285,3 +406,22 @@ struct RatioThinkApp: App {
     }
   }
 }
+
+#if DEBUG
+/// Minimal `AppXPCClient` for the helperless S302 GUI harness
+/// (`PIE_TEST_PIN_ENGINE_RUNNING`). The harness has no Helper to answer
+/// XPC, so a real `stopEngine()` during Unload would throw and
+/// `ChatScaffoldView.unloadModel` would never run `markUnloaded()`. This
+/// reports the pinned `.running` status and treats `stopEngine()` as a
+/// no-op success, so the Unload confirm path completes to `.idle`. DEBUG
+/// only — compiled out of Release alongside the pin itself.
+private struct PinnedRunningXPCClient: AppXPCClient {
+  let port: EnginePort
+  func engineStatus() async throws -> EngineStatus { .running(port: port, profileID: "chat") }
+  func stopEngine() async throws {}
+  // The pinned harness has no Helper to launch an engine; the engine is
+  // already pinned `.running`, so a start is a no-op success (mirrors
+  // `stopEngine`).
+  func startEngine(profileID: String) async throws {}
+}
+#endif

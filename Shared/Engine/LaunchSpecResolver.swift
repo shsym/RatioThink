@@ -76,6 +76,12 @@ public struct LaunchSpecResolver {
   /// read-only fallback after RatioThink's app-managed models directory.
   public let hfHome: () -> URL
 
+  /// Resolved-model memory ceiling handed to `ModelMemoryGuardrail`.
+  /// Production reads physical RAM (`ModelMemoryGuardrail.defaultPolicy`);
+  /// tests inject a fixed `Policy` so their fixtures never depend on the
+  /// host's real memory.
+  public let memoryPolicy: () -> ModelMemoryGuardrail.Policy
+
   private static let log = Logger(subsystem: "com.ratiothink.app.helper",
                                   category: "launchspec.resolver")
 
@@ -88,7 +94,9 @@ public struct LaunchSpecResolver {
               pieHome: @escaping () throws -> URL = { try PieDirs.applicationSupport() },
               subprocessEnvironment: @escaping () -> [String: String]
                 = { SpawnEnvSanitizer.sanitize(ProcessInfo.processInfo.environment) },
-              hfHome: @escaping () -> URL = { LaunchSpecResolver.defaultHFHome() }) {
+              hfHome: @escaping () -> URL = { LaunchSpecResolver.defaultHFHome() },
+              memoryPolicy: @escaping () -> ModelMemoryGuardrail.Policy
+                = { ModelMemoryGuardrail.defaultPolicy }) {
     self.profileStore = profileStore
     self.pieBinary = pieBinary
     self.modelsRoot = modelsRoot
@@ -97,6 +105,7 @@ public struct LaunchSpecResolver {
     self.pieHome = pieHome
     self.subprocessEnvironment = subprocessEnvironment
     self.hfHome = hfHome
+    self.memoryPolicy = memoryPolicy
   }
 
   /// Core mapping. Pure on injected state — no Bundle / PieDirs reads
@@ -162,6 +171,18 @@ public struct LaunchSpecResolver {
         message: "no profile with id=\(profileID) in \(profileStore.directory.path)"
       ))
     }
+    // Refuse a split-GGUF shard (`…-NNNNN-of-MMMMM.gguf`) before any
+    // engine work. The catalog marks such rows unlaunchable so the picker
+    // can't select them, but a stale or hand-authored profile could still
+    // name one — fail fast with a clear reason instead of handing the
+    // engine a shard it cannot load.
+    let modelLeaf = profile.model.split(separator: "/").last.map(String.init) ?? profile.model
+    if HFCacheCatalog.isSplitShardFilename(modelLeaf) {
+      return .failure(EngineError(
+        code: .invalidInput,
+        message: "\(HFCacheCatalog.shardedUnsupportedReason) (model=\(profile.model))"
+      ))
+    }
     let binary: URL
     let models: URL
     let resources: (wasm: URL, manifest: URL)
@@ -222,6 +243,7 @@ public struct LaunchSpecResolver {
       switch ModelMemoryGuardrail.validate(
         resolvedModelURL: URL(fileURLWithPath: localPath, isDirectory: false),
         modelID: profile.model,
+        policy: memoryPolicy(),
         fileManager: fileManager
       ) {
       case .success:
@@ -251,6 +273,7 @@ public struct LaunchSpecResolver {
         switch ModelMemoryGuardrail.validate(
           resolvedModelURL: cached,
           modelID: profile.model,
+          policy: memoryPolicy(),
           fileManager: fileManager
         ) {
         case .success:

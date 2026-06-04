@@ -9,3 +9,5 @@
 pub mod apc;
 pub mod completions;
 pub mod dispatch;
+pub mod generate;
+pub mod spec;

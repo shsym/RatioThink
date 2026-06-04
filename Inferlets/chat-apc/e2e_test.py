@@ -550,6 +550,169 @@ async def main() -> int:
                             f"/v1/inferlet chat-apc bad model status {r.status_code}"
                         )
 
+                    # ── tree-of-thought (#407) ───────────────────────
+                    # The `tree-of-thought` dispatch name is accepted
+                    # (distinct from the unknown-name 404 above). These
+                    # validation paths are deterministic — they don't
+                    # need a working forward pass. The full-search shape
+                    # check below is best-effort against the dummy driver.
+
+                    # stream:true → 400 (no streaming in v1).
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": True,
+                            "input": {"messages": [{"role": "user", "content": "hi"}]},
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot stream=true) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(f"tot stream:true status {r.status_code} (want 400)")
+
+                    # Out-of-range breadth → 400 with `param` tag.
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": False,
+                            "input": {
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "breadth": 0,
+                            },
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot breadth=0) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(f"tot breadth=0 status {r.status_code} (want 400)")
+                    else:
+                        try:
+                            param = r.json().get("error", {}).get("param")
+                        except Exception:
+                            param = None
+                        if param != "breadth":
+                            failures.append(f"tot breadth=0 param {param!r} (want 'breadth')")
+
+                    # Node-budget explosion (5×4×5 = 80 > 64) → 400.
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": False,
+                            "input": {
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "breadth": 5,
+                                "depth": 4,
+                                "beam_width": 5,
+                            },
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot node-explosion) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(f"tot node-explosion status {r.status_code} (want 400)")
+
+                    # Unknown model in input → 404.
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": False,
+                            "input": {
+                                "model": "does-not-exist",
+                                "messages": [{"role": "user", "content": "hi"}],
+                            },
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot bad model) -> {r.status_code}")
+                    if r.status_code != 404:
+                        failures.append(f"tot bad model status {r.status_code} (want 404)")
+
+                    # Empty messages → 400.
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": False,
+                            "input": {"messages": []},
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot empty messages) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(f"tot empty messages status {r.status_code} (want 400)")
+
+                    # Full search path: a small tree. With the dummy
+                    # driver the per-node forward pass may error
+                    # (status:"error" nodes) or return random tokens
+                    # (status:"ok"); either way the REQUEST returns 200
+                    # with the full tree. If the dummy driver cannot flush
+                    # the prompt the request is 500 — recorded as SKIPPED
+                    # (tree shape asserted only under a real driver).
+                    bd, dp, bw = 2, 2, 1
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": False,
+                            "input": {
+                                "messages": [{"role": "user", "content": "What is 2+2?"}],
+                                "breadth": bd,
+                                "depth": dp,
+                                "beam_width": bw,
+                                "max_tokens_per_node": 16,
+                            },
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot search {bd}x{dp}/beam{bw}) -> {r.status_code}")
+                    if r.status_code == 200:
+                        body = r.json()
+                        if body.get("object") != "tree_of_thought":
+                            failures.append(f"tot object {body.get('object')!r}")
+                        root = body.get("root") or {}
+                        if root.get("id") != "root" or root.get("depth") != 0:
+                            failures.append(f"tot root shape {root!r}")
+                        if (body.get("breadth"), body.get("depth"), body.get("beam_width")) != (bd, dp, bw):
+                            failures.append(f"tot echoed params {body!r}")
+
+                        def _walk(n):
+                            out = [n]
+                            for c in n.get("children", []):
+                                out.extend(_walk(c))
+                            return out
+
+                        non_root = [n for n in _walk(root) if n.get("id") != "root"]
+                        want_nodes = bd + (dp - 1) * bw * bd  # 2 + 1*1*2 = 4
+                        if len(non_root) != want_nodes:
+                            failures.append(
+                                f"tot node count {len(non_root)} (want {want_nodes}): {body!r}"
+                            )
+                        ids = {n.get("id") for n in non_root}
+                        for n in non_root:
+                            missing = [
+                                k
+                                for k in ("id", "parent_id", "depth", "branch_index", "content", "score", "status")
+                                if k not in n
+                            ]
+                            if missing:
+                                failures.append(f"tot node missing {missing}: {n!r}")
+                            if n.get("status") not in ("ok", "error"):
+                                failures.append(f"tot node status {n.get('status')!r}")
+                            if not (isinstance(n.get("depth"), int) and 1 <= n["depth"] <= dp):
+                                failures.append(f"tot node depth {n.get('depth')!r}")
+                            sc = n.get("score")
+                            if sc is not None and not (isinstance(sc, int) and 1 <= sc <= 10):
+                                failures.append(f"tot node score {sc!r}")
+                        sel = body.get("selected_node_id")
+                        if sel is not None and sel not in ids:
+                            failures.append(f"tot selected_node_id {sel!r} not in tree")
+                    elif r.status_code == 500:
+                        skipped.append(
+                            "tree-of-thought full search: dummy driver could not "
+                            "flush/generate (500); tree shape is asserted only under a "
+                            "forward-pass-capable driver (live-engine coverage)"
+                        )
+                    else:
+                        failures.append(f"tot search status {r.status_code} (want 200 or 500)")
+
                     # Review v2 follow-ups (F6/F7/F16): param bounds,
                     # malformed JSON, oversized body, streaming frame
                     # order, /v1/inferlet messages-precedence.
@@ -586,6 +749,41 @@ async def main() -> int:
                                     f"/v1/chat/completions {field}={value!r} param tag {err!r}"
                                 )
 
+                    # #418 (review F1): out-of-range speculation knobs are
+                    # rejected at the 400 boundary with a nested `param`,
+                    # parallel to the max_tokens over-range case above —
+                    # NOT silently clamped.
+                    for sub, value in [("leader_len", 0), ("draft_len", 99999)]:
+                        r = await http.post(
+                            f"{base}/v1/chat/completions",
+                            json={
+                                "model": model_id,
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "stream": False,
+                                "temperature": 0,
+                                "speculation": {"enabled": True, sub: value},
+                            },
+                        )
+                        print(
+                            f"[harness] POST /v1/chat/completions(speculation.{sub}={value}) "
+                            f"-> {r.status_code}"
+                        )
+                        if r.status_code != 400:
+                            failures.append(
+                                f"/v1/chat/completions speculation.{sub}={value} "
+                                f"status {r.status_code} (expected 400)"
+                            )
+                        else:
+                            try:
+                                err = r.json().get("error", {})
+                            except Exception:
+                                err = {}
+                            if err.get("param") != f"speculation.{sub}":
+                                failures.append(
+                                    f"/v1/chat/completions speculation.{sub}={value} "
+                                    f"param tag {err!r} (expected speculation.{sub})"
+                                )
+
                     # Malformed JSON body → 400.
                     r = await http.post(
                         f"{base}/v1/chat/completions",
@@ -609,6 +807,151 @@ async def main() -> int:
                     if r.status_code != 413:
                         failures.append(
                             f"/v1/chat/completions oversized status {r.status_code}"
+                        )
+
+                    # #418: speculative-decode WIRING smoke. The dummy
+                    # driver is non-deterministic (random tokens even at
+                    # temperature 0), so it CANNOT demonstrate draft
+                    # acceptance or greedy token-equivalence — those are
+                    # proven deterministically by the host unit tests
+                    # (`cargo test`: deterministic accounting +
+                    # `greedy_spec_matches_plain_token_stream`) and by a
+                    # real-model run. Here we assert only what the dummy
+                    # CAN show end-to-end: a `speculation` request returns
+                    # a self-consistent `spec_metrics` block, and a normal
+                    # request stays byte-identical (no `spec_metrics`).
+                    # Results are printed inline (flush) so the evidence
+                    # survives even if a later, unrelated harness step
+                    # aborts before the final summary.
+                    import json as _json418
+                    spec418: list[str] = []
+                    r_spec = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "alpha beta gamma"}],
+                            "temperature": 0,
+                            "max_tokens": 16,
+                            "speculation": {"enabled": True},
+                        },
+                    )
+                    print(f"[harness] POST chat(speculation) -> {r_spec.status_code}")
+                    if r_spec.status_code != 200:
+                        spec418.append(f"spec status {r_spec.status_code} (expected 200)")
+                    else:
+                        try:
+                            b_spec = _json418.loads(r_spec.text)
+                        except _json418.JSONDecodeError as e:
+                            spec418.append(f"spec body not json: {e}")
+                            b_spec = None
+                        if b_spec is not None:
+                            sm = b_spec.get("spec_metrics")
+                            if sm is None:
+                                spec418.append(f"spec_metrics missing: {b_spec!r}")
+                            else:
+                                print(f"[harness] spec_metrics={sm}", flush=True)
+                                prop = sm.get("proposed_draft_tokens")
+                                acc = sm.get("accepted_draft_tokens")
+                                rej = sm.get("rejected_draft_tokens")
+                                if None in (prop, acc, rej) or acc + rej != prop:
+                                    spec418.append(f"accounting inconsistent: {sm!r}")
+                                if not sm.get("enabled", False):
+                                    spec418.append(f"enabled=false despite greedy+request: {sm!r}")
+                                if sm.get("decode_steps", 0) <= 0:
+                                    spec418.append(f"no decode steps: {sm!r}")
+                    # Normal request (no speculation field) must NOT carry
+                    # spec_metrics — proves normal responses are unchanged.
+                    r_plain = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "alpha beta gamma"}],
+                            "temperature": 0,
+                            "max_tokens": 16,
+                        },
+                    )
+                    if r_plain.status_code == 200:
+                        try:
+                            if _json418.loads(r_plain.text).get("spec_metrics") is not None:
+                                spec418.append(
+                                    "plain response carried spec_metrics without a "
+                                    "speculation request (normal responses must stay "
+                                    "byte-identical)"
+                                )
+                        except _json418.JSONDecodeError:
+                            pass
+                    if spec418:
+                        for f in spec418:
+                            print(f"[harness] #418 FAIL: {f}", flush=True)
+                        failures.extend(f"#418 {f}" for f in spec418)
+                    else:
+                        print("[harness] #418 spec_metrics wiring OK", flush=True)
+                    # Acceptance + greedy token-equivalence need a
+                    # deterministic model; the dummy driver can't provide
+                    # one (covered by host cargo tests + a real-model run).
+                    skipped.append(
+                        "#418 spec acceptance + greedy equivalence (dummy driver is "
+                        "non-deterministic; host cargo tests + real-model smoke cover it)"
+                    )
+
+                    # #418 x tool_choice: speculation gates OFF when a tool
+                    # call is FORCED (the sampler is constrained to the
+                    # tool-call grammar; the drafter must not verify against
+                    # it). A forced request that also enables speculation
+                    # must report spec_metrics.enabled=false with
+                    # fallback_reason="tool_choice_forced".
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "What is 2+2?"}],
+                            "stream": False,
+                            "temperature": 0,
+                            "tools": [{
+                                "type": "function",
+                                "function": {
+                                    "name": "calculator",
+                                    "description": "Evaluate an arithmetic expression.",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {"expr": {"type": "string"}},
+                                        "required": ["expr"],
+                                    },
+                                },
+                            }],
+                            "tool_choice": "required",
+                            "speculation": {"enabled": True},
+                        },
+                    )
+                    print(
+                        f"[harness] POST chat(forced tool + speculation) -> {r.status_code}"
+                    )
+                    if r.status_code == 200:
+                        try:
+                            sm = _json418.loads(r.text).get("spec_metrics")
+                        except _json418.JSONDecodeError:
+                            sm = None
+                        if sm is None:
+                            failures.append(
+                                f"#418 forced-tool: spec_metrics missing: {r.text[:200]!r}"
+                            )
+                        else:
+                            print(f"[harness] forced-tool spec_metrics={sm}", flush=True)
+                            if sm.get("enabled") is not False:
+                                failures.append(
+                                    f"#418 forced-tool: speculation NOT gated off: {sm!r}"
+                                )
+                            if sm.get("fallback_reason") != "tool_choice_forced":
+                                failures.append(
+                                    f"#418 forced-tool: fallback_reason={sm.get('fallback_reason')!r} "
+                                    f"(expected 'tool_choice_forced')"
+                                )
+                    else:
+                        # A non-200 (e.g. model lacks a native tool grammar)
+                        # doesn't exercise the gate; record explicitly.
+                        skipped.append(
+                            f"#418 forced-tool gate (engine returned {r.status_code}, "
+                            f"not a 200 tool-call body)"
                         )
 
                     # /v1/inferlet messages-precedence: input.messages
@@ -836,124 +1179,124 @@ async def main() -> int:
                             "control flow + live-driver coverage in "
                         )
 
-                # APC plumbing-alive ( Phase 2): the chat handler
-                # now wires `inferlet::tools::equip_prefix` +
-                # `ToolUseDecoder` + `ReasoningDecoder` into the
-                # generation loop. The dummy driver can't drive a
-                # real forward pass and (depending on the
-                # model template) may have no tool surface, so we
-                # only assert that:
-                #   1. valid OpenAI tools[] payloads PARSE (not 400),
-                #   2. the response stays inside the canonical
-                #      envelope (200 with assistant message, or 500
-                #      with a known error code from the new wiring).
-                # Semantic correctness — tool_call detection,
-                # reasoning_content content — requires a live model
-                # and is gated behind .
-                tool_payload = {
-                    "model": model_id,
-                    "messages": [{"role": "user", "content": "What is 2+2?"}],
-                    "stream": False,
-                    "tools": [{
-                        "type": "function",
-                        "function": {
-                            "name": "calculator",
-                            "description": "Evaluate an arithmetic expression.",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {"expr": {"type": "string"}},
-                                "required": ["expr"],
-                            },
-                        },
-                    }],
-                    "tool_choice": "auto",
-                }
-                r = await http.post(
-                    f"{base}/v1/chat/completions", json=tool_payload
-                )
-                print(
-                    f"[harness] POST /v1/chat/completions(tools+tool_choice) "
-                    f"-> {r.status_code}"
-                )
-                if r.status_code == 400:
-                    failures.append(
-                        f"/v1/chat/completions tools-param parse: 400 "
-                        f"{r.text!r} (tools[] schema should deserialize)"
-                    )
-                elif r.status_code == 200:
-                    body = r.json()
-                    msg = body.get("choices", [{}])[0].get("message", {})
-                    if msg.get("role") != "assistant":
-                        failures.append(
-                            f"/v1/chat/completions tools 200 body shape: "
-                            f"missing assistant message: {body!r}"
-                        )
-                elif r.status_code == 500:
-                    code = r.json().get("error", {}).get("code")
-                    if code not in (
-                        "tool_equip_failed",
-                        "tool_decode_failed",
-                        "forward_pass_failed",
-                        "decode_failed",
-                        "reasoning_decode_failed",
-                        "model_load_failed",
-                        "context_create_failed",
-                    ):
-                        failures.append(
-                            f"/v1/chat/completions tools 500 code={code!r} "
-                            f"not in APC-wiring set"
-                        )
-                else:
-                    failures.append(
-                        f"/v1/chat/completions tools status {r.status_code} "
-                        f"unexpected"
-                    )
-
-                # Reasoning plumbing-alive: the ReasoningDecoder runs
-                # unconditionally on every request. Send a prompt
-                # that *would* trigger a thinking model and confirm
-                # the streaming envelope still parses end-to-end —
-                # no frame should be malformed even when no reasoning
-                # tokens are produced. reasoning_content is omitted
-                # via `skip_serializing_if = Option::is_none`, so a
-                # well-behaved stream has the same shape as before
-                # the wiring landed (regression guard).
-                r = await http.post(
-                    f"{base}/v1/chat/completions",
-                    json={
+                    # APC plumbing-alive ( Phase 2): the chat handler
+                    # now wires `inferlet::tools::equip_prefix` +
+                    # `ToolUseDecoder` + `ReasoningDecoder` into the
+                    # generation loop. The dummy driver can't drive a
+                    # real forward pass and (depending on the
+                    # model template) may have no tool surface, so we
+                    # only assert that:
+                    #   1. valid OpenAI tools[] payloads PARSE (not 400),
+                    #   2. the response stays inside the canonical
+                    #      envelope (200 with assistant message, or 500
+                    #      with a known error code from the new wiring).
+                    # Semantic correctness — tool_call detection,
+                    # reasoning_content content — requires a live model
+                    # and is gated behind .
+                    tool_payload = {
                         "model": model_id,
-                        "messages": [
-                            {"role": "system", "content": "Think step by step."},
-                            {"role": "user", "content": "Solve: 17*24+13"},
-                        ],
-                        "stream": True,
-                    },
-                )
-                print(
-                    f"[harness] POST /v1/chat/completions(reasoning-prompt) "
-                    f"-> {r.status_code}"
-                )
-                if r.status_code != 200:
-                    failures.append(
-                        f"/v1/chat/completions reasoning stream status {r.status_code}"
+                        "messages": [{"role": "user", "content": "What is 2+2?"}],
+                        "stream": False,
+                        "tools": [{
+                            "type": "function",
+                            "function": {
+                                "name": "calculator",
+                                "description": "Evaluate an arithmetic expression.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"expr": {"type": "string"}},
+                                    "required": ["expr"],
+                                },
+                            },
+                        }],
+                        "tool_choice": "auto",
+                    }
+                    r = await http.post(
+                        f"{base}/v1/chat/completions", json=tool_payload
                     )
-                else:
-                    data_lines = [
-                        line[len("data: "):]
-                        for line in r.text.splitlines()
-                        if line.startswith("data: ")
-                    ]
-                    for d in data_lines:
-                        if d == "[DONE]":
-                            continue
-                        try:
-                            _json.loads(d)
-                        except _json.JSONDecodeError as e:
+                    print(
+                        f"[harness] POST /v1/chat/completions(tools+tool_choice) "
+                        f"-> {r.status_code}"
+                    )
+                    if r.status_code == 400:
+                        failures.append(
+                            f"/v1/chat/completions tools-param parse: 400 "
+                            f"{r.text!r} (tools[] schema should deserialize)"
+                        )
+                    elif r.status_code == 200:
+                        body = r.json()
+                        msg = body.get("choices", [{}])[0].get("message", {})
+                        if msg.get("role") != "assistant":
                             failures.append(
-                                f"/v1/chat/completions reasoning stream: "
-                                f"malformed frame {d!r}: {e}"
+                                f"/v1/chat/completions tools 200 body shape: "
+                                f"missing assistant message: {body!r}"
                             )
-                            break
+                    elif r.status_code == 500:
+                        code = r.json().get("error", {}).get("code")
+                        if code not in (
+                            "tool_equip_failed",
+                            "tool_decode_failed",
+                            "forward_pass_failed",
+                            "decode_failed",
+                            "reasoning_decode_failed",
+                            "model_load_failed",
+                            "context_create_failed",
+                        ):
+                            failures.append(
+                                f"/v1/chat/completions tools 500 code={code!r} "
+                                f"not in APC-wiring set"
+                            )
+                    else:
+                        failures.append(
+                            f"/v1/chat/completions tools status {r.status_code} "
+                            f"unexpected"
+                        )
+
+                    # Reasoning plumbing-alive: the ReasoningDecoder runs
+                    # unconditionally on every request. Send a prompt
+                    # that *would* trigger a thinking model and confirm
+                    # the streaming envelope still parses end-to-end —
+                    # no frame should be malformed even when no reasoning
+                    # tokens are produced. reasoning_content is omitted
+                    # via `skip_serializing_if = Option::is_none`, so a
+                    # well-behaved stream has the same shape as before
+                    # the wiring landed (regression guard).
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [
+                                {"role": "system", "content": "Think step by step."},
+                                {"role": "user", "content": "Solve: 17*24+13"},
+                            ],
+                            "stream": True,
+                        },
+                    )
+                    print(
+                        f"[harness] POST /v1/chat/completions(reasoning-prompt) "
+                        f"-> {r.status_code}"
+                    )
+                    if r.status_code != 200:
+                        failures.append(
+                            f"/v1/chat/completions reasoning stream status {r.status_code}"
+                        )
+                    else:
+                        data_lines = [
+                            line[len("data: "):]
+                            for line in r.text.splitlines()
+                            if line.startswith("data: ")
+                        ]
+                        for d in data_lines:
+                            if d == "[DONE]":
+                                continue
+                            try:
+                                _json.loads(d)
+                            except _json.JSONDecodeError as e:
+                                failures.append(
+                                    f"/v1/chat/completions reasoning stream: "
+                                    f"malformed frame {d!r}: {e}"
+                                )
+                                break
 
                 await client.close()
 

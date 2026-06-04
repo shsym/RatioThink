@@ -11,18 +11,23 @@ below in the same change.
 
 | Target | What it runs | Runs where | Gating |
 |---|---|---|---|
-| `make lint` |  helper side-effect invariants (static) | anywhere | — |
+| `make lint` | helper side-effect invariants (static) | anywhere | — |
 | `make build` | Debug build of RatioThink app + helper | anywhere | — |
 | `make build-tests` | Compile every xcodebuild target + SPM probe | anywhere | — |
 | `make test-xcode-chat-scaffold` | `ChatScaffoldModelSelectionTests` (xcodebuild RatioThinkTests) regression guard | anywhere | — |
 | `make test-unit` | `RatioThinkCoreTests` (SPM, pure logic) | anywhere | — |
 | `make test-scenario` | `CLIScenarioTests` (S0 isolation, S1/S2/S3 XPC + engine integration), headless | anywhere | — |
 | `make test-smoke` | S3 engine subprocess smoke | anywhere | needs built `pie` (`make engine-build`) |
-| `make test-stamp` | `Inferlets/pie-control/_stamp.py` unit tests | anywhere | — |
-| `make test-ssh` | `test-unit` + `test-scenario` + `test-smoke` | anywhere (no GUI) | — |
+| `make test-install-guards` | launchd source-closed / agent-reenable / new-bundle acceptance regressions (stubbed) | anywhere | — (in CI) |
+| `make test-collect-diagnostics` | `Scripts/collect-diagnostics.sh` self-test (redacted diagnostics bundle) | anywhere | — (in CI) |
+| `make test-dmg-layout` | DMG drag-install layout verifier regression (hdiutil + codesign) | anywhere | — (in CI) |
+| `make test-release` | real-tool contract tests for `notarize.sh` + `release-preflight.sh` | anywhere | — (in CI) |
+| `make test-stamp` | `Inferlets/chat-apc/_stamp.py` unit tests | anywhere | — |
+| `make test-e2e-http` | chat-apc HTTP API stress + SSE/concurrency + OpenAI tool-call contract (`e2e_test.py` + `stress_e2e_test.py`) vs the **dummy driver** | anywhere (headless) | self-bootstraps `pie` + wasm; needs `uv` + Qwen3-0.6B `config.json`+`tokenizer.json` in HF cache (no weights/GPU) |
+| `make test-ssh` | `test-unit` + `test-scenario` + `test-smoke` + `test-install-guards` | anywhere (no GUI) | — |
 | `make test-gui` | GUI scenarios (S4, S5, and the rest of `Tests/GUIScenarioTests`) via XCUITest | **seated session** | `Dock` running; Automation/Accessibility TCC |
-| `make test-gui-history` | Deterministic  multi-turn history/resume E2E | **seated session** | `PIE_TEST_TCC_GRANTED=1` |
-| `make test-gui-first-launch-package` | Package-backed  first-launch E2E (Release `.app`) | **seated session** | built artifact + TCC |
+| `make test-gui-history` | Deterministic multi-turn history/resume E2E | **seated session** | `PIE_TEST_TCC_GRANTED=1` |
+| `make test-gui-first-launch-package` | Package-backed first-launch E2E (Release `.app`) | **seated session** | built artifact + TCC |
 | `make test-gui-script` | Fast preflight regressions for the GUI E2E wrapper scripts | anywhere | — |
 | `make test-all` | `test-ssh` + `test-gui` (GUI skips if no seated session) | seated for full | — |
 
@@ -39,20 +44,84 @@ suite with
 
 ## GUI / scenario suite catalog (`Tests/GUIScenarioTests`)
 
-All require a seated session (`guardSeatedGUI` → `XCTSkip` otherwise).
+All require a seated session (`guardSeatedGUI` → `XCTSkip` otherwise). Grouped
+by product area; the **Run via** column is the focused modular target (see
+"Modular suites by area" below). Suites whose **Boundary** is a wrapper
+harness (`app+real-engine`, `app+fake-engine`, `packaged`) `XCTSkip` unless the
+matching `Scripts/run-*.sh` wrote its `/tmp/*.env` first — run them through
+that wrapper, not bare `xcodebuild`.
 
-| Suite | Proves | Real model? |
+| Suite | Area | Proves | Boundary / real model? | Run via |
+|---|---|---|---|---|
+| `S5_AppWindowShellGUITests` | settings/shell | 3-column shell vocabulary, ⌘, → Settings (5 tabs) | mock | `test-gui-shell` |
+| `S7_FirstLaunchWizardGUITests` | first-launch | wizard flow (register / approval-blocked) | mock (faked login-item) | `test-gui-first-launch` |
+| `S7_FirstLaunchWizardPackagedArtifactGUITests` | package/install | Release `.app` first-launch persists across relaunch; launched-artifact path | packaged-signed-app | `test-gui-first-launch-package` |
+| `S4_HelperMenuBarGUITests` | helper/engine | menu-bar shell; fresh seed enables Resume; oversized-model rejected; Resume boots pie → Pause | app+real-engine (GGUF fixture) | `test-gui-helper` |
+| `S204_ModelAcquisitionGUITests` | model discovery | Settings curated download → **verified** badge (sha256 == HF X-Linked-Etag) | real HF download (no inference) | `test-e2e-models` |
+| `S204_UnverifiedBadgeGUITests` | model discovery | `.unverified` sidecar row badges after rescan; clean row does not | no engine/network (staged files) | `test-e2e-models` |
+| `S260_ChatModelMenuGUITests` | model discovery | chat model menu contains seeded default profile model | mock (static placeholder menu) | `test-gui-chat` |
+| `S302_ModelLoadIndicatorPath1GUITests` | model load/status | explicit load → "Loading…" → ready ring; mid-load Cancel clears + no late ready | app+fake-engine (`loadviz-harness.py`) | `test-e2e-load` |
+| `S286_NoModelSendGateGUITests` | model load/status | send with nothing resolvable BLOCKS behind the "No model loaded" confirm (no silent load) | mock (gate fires pre-engine) | `test-gui-chat` |
+| `S258_ComposerSendGUITests` | chat send/persist | send → **real pie stream** → bubble → SwiftData persist across relaunch | **app+real-engine (real Qwen3-0.6B)** | `test-e2e-chat` |
+| `S204_ChatSendGUITests` | chat send/persist | INSTRUCT model answers "Paris" → persists across relaunch | **app+real-engine (real GGUF)** | `test-e2e-full` |
+| `S275_MultiTurnResumeGUITests` | chat send/persist | ordered multi-turn history sent to engine + persisted across relaunch | app+fake-engine (deterministic HTTP) | `test-gui-history` |
+| `S279_LifecycleRecoveryGUITests` | lifecycle/recovery | unreachable engine → visible recoverable error + composer re-enabled | app+real-engine seam (dead loopback) | `test-gui-chat` |
+| `S285_ZeroStateGUITests` | zero-state | empty-state top-alignment; Start Chat / Add Endpoint CTAs open a chat/endpoint | mock (stops at composer; no send) | `test-gui-chat` |
+| `S326_FreshInstallModelDownloadGUITests` | first-launch | fresh install (seeded profile, model absent) → no-model gate offers inline **download**, not a dead-end Load | mock (fake downloader, pre-engine) | `test-gui` |
+| `S327_EngineStatusIndicatorGUITests` | model load/status | always-visible engine-status pip; popover **stays open** across 1 Hz poll ticks (`pollCount` demoted from `@Published`) | mock (no engine) | `test-gui` |
+| `S360_ModelsTopAlignGUITests` | settings/shell | Settings → Models empty state stays **top-aligned**, not vertically centered (mirrors S285) | mock (isolated empty `PIE_HOME`) | `test-gui` |
+| `S365_CachedModelDiscoveryGUITests` | model discovery | HF-cache-staged model surfaces as a Settings **"HF-cache" row** + in the profile picker; pure filesystem scan | staged HF cache (no engine/network) | `run-cache-discovery-gui-e2e.sh` |
+| `S396_RetryRecoveryGUITests` | model load/status | forced HTTP 500 load → red "Load failed" pip; popover **Retry** recovers (`retryLast`), **Dismiss** clears (default key) | app+fake-engine (`loadviz-harness.py` fail-first) | `test-e2e-396` |
+
+> Reconciled against `Tests/GUIScenarioTests/` on 2026-06-02 — every suite on
+> disk is listed above. A `S7_FirstLaunchWizardPackagedModelDownloadGUITests`
+> suite named in older catalogs does **not** exist on disk: a first-launch
+> **packaged model download** GUI suite is a tracked coverage gap, not an
+> existing test.
+
+## Modular suites by area
+
+Run the area you touched for fast, attributable signal instead of the whole
+matrix. GUI targets need a seated session + TCC; E2E targets additionally need
+the real engine / model (or a deterministic harness) and fail loud with an
+exact fix command when a human gate is unmet.
+
+| Area | Focused target(s) | Aggregate |
 |---|---|---|
-| `S4_HelperMenuBarGUITests` | menu-bar helper shell; resume boots engine + flips state | engine lifecycle (GGUF fixture) |
-| `S5_AppWindowShellGUITests` | 3-column shell, nav vocabulary, ⌘, → Settings (5 tabs) | no |
-| `S7_FirstLaunchWizardGUITests` | first-launch wizard flow (register / skip / download-fail retry) | fake downloads |
-| `S7_FirstLaunchWizardPackagedArtifactGUITests` | Release `.app` first-launch persists across relaunch | no |
-| `S7_FirstLaunchWizardPackagedModelDownloadGUITests` | first-launch curated GGUF download → chat uses persisted default | **yes (fixture/real GGUF)** |
-| `S258_ComposerSendGUITests` | send → **real pie engine stream** → tokens → SwiftData persist | **YES — real model** |
-| `S260_ChatModelMenuGUITests` | chat model menu contains seeded default profile model | no |
-| `S275_MultiTurnResumeGUITests` | ordered multi-turn history sent to engine across relaunch | deterministic HTTP harness (fake) |
-| `S279_LifecycleRecoveryGUITests` | stale engine URL → visible recoverable error + retry | no |
-| `S285_ZeroStateGUITests` | empty-state top-alignment; Start Chat / Add Endpoint CTAs open a chat/endpoint | no (stops at composer; no send) |
+| settings / app shell | `make test-gui-shell` (S5) | `test-gui` |
+| first launch (wizard) | `make test-gui-first-launch` (S7 fast) | `test-gui` |
+| package / install | `make test-gui-first-launch-package` (S7 packaged `.app`) | — |
+| helper / engine startup | `make test-gui-helper` (S4); `make test-smoke` (S3 subprocess); `make test-e2e-engine` (real launch) | `test-gui` / `test-ssh` |
+| engine-free chat surfaces | `make test-gui-chat` (S260/S279/S285/S286) | `test-gui` |
+| model discovery / download | `make test-e2e-models` (S204 acquisition + unverified badge + live HF acquire); `Scripts/run-cache-discovery-gui-e2e.sh` (S365 HF-cache → Settings row) | — |
+| model load / status | `make test-e2e-load` (S302 indicator); `make test-e2e-396` (S396 failed-load Retry/Dismiss) | — |
+| chat send / persist (real) | `make test-e2e-chat` (S258); `make test-e2e-full` (S204 3-layer) | — |
+| chat history / resume | `make test-gui-history` (S275 deterministic) | — |
+| install-time launchd safety | `make test-install-guards` (stubbed, runs anywhere — in CI) | `test-ssh` |
+| live helper respawn | `make test-helper-respawn` (signed/registered install) | — |
+| diagnostics | `make test-collect-diagnostics` (bundle self-test, in CI) + `DiagnosticLogTests` via `test-unit` | `test-ssh` |
+| notarization / release preflight | `make test-release` (notarize + preflight contract tests) + `make test-dmg-layout` (DMG layout verifier), both in CI; `release-preflight ARTIFACT=…` for a built artifact | — |
+
+`make test-gui` still runs the **entire** `RatioThinkGUITests` matrix; the
+focused targets are `-only-testing` slices of it. A few suites have **no**
+focused target and run only in the full matrix: `S326` (fresh-install
+download), `S327` (engine-status pip), `S360` (Models top-align).
+
+### GUI temp-home cleanup
+
+A GUI suite that needs the non-sandboxed `RatioThink.app` to write a real
+on-disk store stages its `PIE_HOME` under a real `/tmp` path (S285, S286) —
+never `NSTemporaryDirectory()`, which resolves to the sandboxed runner's
+container the app cannot write. Consequence: the suite **cannot delete that
+home itself**. The `RatioThinkGUITests-Runner` is app-sandboxed
+(`com.apple.security.app-sandbox`), so its `tearDown` `removeItem` on
+`/private/tmp` is silently denied and each run leaks a `<prefix>-<uuid>` dir
+(observed: dozens of stale `/tmp/pie-s285-*`). Authoritative cleanup is the
+`GUI_TMP_HOMES` sweep in the GUI Make recipes (`gui_suite_run` + `test-gui`),
+which runs in a non-sandboxed shell after `xcodebuild` exits (every test app
+already dead). **A new GUI suite that stages a real `/tmp` home must add its
+glob to `GUI_TMP_HOMES` in the Makefile** — the in-suite `tearDown` is
+best-effort and a no-op under the sandboxed runner.
 
 ## Pre-PR gate
 
@@ -62,8 +131,13 @@ All require a seated session (`guardSeatedGUI` → `XCTSkip` otherwise).
 `make test-scenario` → SpawnEnvSanitizer canary → inferlet build/stamp verify.
 
 **CI does NOT cover** (headless runners, no model/engine):
-- any **GUI** scenario (`guardSeatedGUI` skips them all), and
-- any **real-model** path (S258, packaged-model, S3-real).
+- any **GUI** scenario (`guardSeatedGUI` skips them all),
+- any **real-model** path (S258, packaged-model, S3-real), and
+- the **HTTP API E2E** (`make test-e2e-http`) — dummy-driver only (no GPU,
+  no model weights) so it is CI-*eligible*, but it needs the `pie` binary
+  built + the small Qwen3-0.6B `config.json`/`tokenizer.json` in the HF
+  cache; provisioning those into `lint.yml` is a tracked follow-up. Run it
+  locally/by operator for now.
 
 There is **no local git hook**. So GUI + real-model proof is manual and
 developer-owned. A PR touching those areas must carry its own evidence (log /
@@ -79,6 +153,7 @@ wrapper PASS line) in the PR body.
 | First-launch / wizard / model download | `S7_*` GUI suites + `make test-gui-first-launch-package` |
 | Engine launch / supervisor / XPC / helper | `make test-ssh` (incl. `test-smoke`) + `S4_HelperMenuBarGUITests`; real-engine S3 (Appendix A) if launch args changed |
 | Engine subprocess / inference contract | S3-real (Appendix A) + `make test-stamp` if inferlet stamps touched |
+| chat-apc HTTP routes / SSE / tool calling (`Inferlets/chat-apc/src`) | `make test-e2e-http` (rebuilds wasm + restamps via `stamp-inferlets` if you edited `src/`) |
 | Broad / release / "everything" | `make test-all` on a seated session (real-model wrappers run separately) |
 
 Rule of thumb: always run `make test-ssh` (cheap, runs anywhere); add the GUI
@@ -91,7 +166,7 @@ evidence for the real-model / deterministic E2E wrappers.
 
 ---
 
-# Appendix A —  E2E verification notes
+# Appendix A — E2E verification notes
 
 Scope: verification for the `ComposerView → HTTPEngineClient → MessageStreamWriter`
 chat send path. Keep the small cached HF model path first; do not start with a
@@ -113,7 +188,7 @@ large local GGUF unless the small-model path is proven or precisely blocked.
     System Settings, then export `PIE_TEST_TCC_GRANTED=1` for tests that require
     menu-bar interaction.
   - If using the existing S4 helper boot test, stage
-    `Qwen3-0.6B-Q4_K_M.gguf` at `test-models/` or set `PIE_TEST_MODEL` to the
+    `Qwen3-0.6B-Q8_0.gguf` at `test-models/` or set `PIE_TEST_MODEL` to the
     fixture path. That S4 path is a GGUF fixture path and is separate from the
     small HF cache path below.
 
@@ -136,43 +211,18 @@ Expected pass evidence:
 - `POST /v1/chat/completions → looks like real inference`
 - XCTest exits 0.
 
-Observed on 2026-05-22 / audited on 2026-05-24:
+**Gotcha:** a sandboxed run can be blocked by SwiftPM writing to
+`~/.cache/clang/ModuleCache` — rerun outside the sandbox.
 
-- First sandboxed run was blocked by SwiftPM writing to
-  `~/.cache/clang/ModuleCache`; rerun outside the sandbox.
-- The rerun launched real `pie`, loaded `Qwen/Qwen3-0.6B`, and received real
-  streamed chat text containing:
-  `The capital of France is **Paris**.`
-- The real stream ended with `finish_reason == .length` after returning visible
-  semantic content containing `Paris`.
+**Finish-reason acceptance:** the S3 drain accepts `.stop` or Qwen3's observed
+`.length` only after at least one non-empty assistant delta and the
+semantic-content check pass. Missing, cancelled, or other finish reasons fail.
 
-Feature A v1 finish condition:
-
-- The S3 drain now accepts `.stop` or Qwen3's observed `.length` only after at
-  least one non-empty assistant delta and the existing semantic-content check
-  pass. Missing, cancelled, or other finish reasons still fail.
-
-Observed pass on 2026-05-25:
-
-```bash
-PIE_TEST_S3_REAL=1 \
-PIE_BIN="$PWD/Vendor/pie/target/release/pie" \
-Scripts/run-swift-test.sh --filter 'S3_EngineSubprocessCLITests'
-```
-
-Evidence:
-
-- `pie serve started + chat-apc installed`
-- `GET /healthz → ok`
-- `GET /v1/models → non-empty`
-- `load Qwen/Qwen3-0.6B (≤90s)`
-- `POST /v1/chat/completions → looks like real inference`
-- `session shutdown clean`
-- XCTest executed 2 S3 tests with 0 failures.
+_Last verified 2026-05-25 — 2 S3 tests, 0 failures._
 
 ## Existing GUI command and blockers
 
- direct small-model GUI E2E wrapper:
+The direct small-model GUI E2E wrapper:
 
 ```bash
 Scripts/run-chat-gui-e2e.sh
@@ -225,28 +275,11 @@ Expected pass evidence:
 - wrapper prints `chat gui e2e: persisted assistant row contains Paris`,
 - wrapper prints `chat gui e2e: PASS`.
 
-Observed pass on 2026-05-22:
+_Last verified 2026-05-22 — `S258_ComposerSendGUITests`, 1 test, 0 failures;
+wrapper printed `chat gui e2e: PASS` and the persisted assistant row contained
+`Paris`._
 
-```bash
-Scripts/run-chat-gui-e2e.sh
-```
-
-Evidence:
-
-- engine URL: `http://127.0.0.1:57832`
-- model: `Qwen/Qwen3-0.6B`
-- GUI `PIE_HOME`: `/tmp/p258-26910/g`
-- XCUITest:
-  `RatioThinkGUITests/S258_ComposerSendGUITests/test_composer_send_streams_real_assistant_and_persists_after_relaunch`
-  executed 1 test with 0 failures.
-- SQLite persistence check:
-  `chat gui e2e: persisted assistant row contains Paris`
-- Final wrapper status:
-  `chat gui e2e: PASS`
-- Stored assistant row:
-  `</think>\n\nThe capital of France is **Paris**.`
-
-# Appendix B —  deterministic GUI history/resume command
+# Appendix B — deterministic GUI history/resume command
 
 Use this scenario for conversation-history correctness. It deliberately does
 not rely on real LLM output: the wrapper starts a local deterministic HTTP
@@ -290,26 +323,16 @@ Expected pass evidence:
   `resume gui history e2e: sqlite contains all 6 expected message rows in order`,
 - wrapper prints `resume gui history e2e: PASS`.
 
-Observed pass on 2026-05-25:
+_Last verified 2026-05-25 — `S275_MultiTurnResumeGUITests`, 1 test, 0 failures;
+wrapper printed `resume gui history e2e: PASS`._
 
-```bash
-PIE_TEST_TCC_GRANTED=1 make test-gui-history
-```
-
-Evidence:
-
-- harness URL: `http://127.0.0.1:64809`
-- model: `resume-deterministic`
-- GUI `PIE_HOME`: `/tmp/p275-history-8721/g`
-- request log: `/tmp/p275-history-8721/chat-requests.jsonl`
-- XCUITest:
-  `RatioThinkGUITests/S275_MultiTurnResumeGUITests/test_multi_turn_history_survives_relaunch_and_is_sent_to_engine`
-  executed 1 test with 0 failures.
-- Wrapper request-log and SQLite assertions printed the expected pass lines.
-- Final wrapper status:
-  `resume gui history e2e: PASS`
-
-Older smallest existing real GUI engine boot path:
+Lower-level fallback — the smallest real GUI engine-boot path. A missing seated
+session, an unset `PIE_TEST_TCC_GRANTED=1`, or a missing model at
+`test-models/Qwen3-0.6B-Q8_0.gguf` (or `PIE_TEST_MODEL`) each **`XCTSkip`** the
+test with its own recovery message. The `Timed out while enabling automation
+mode` failure is separate: it means the real OS Automation/Accessibility
+permission is ungranted (the `PIE_TEST_TCC_GRANTED` flag only opts in — it does
+not grant it), so grant it in System Settings first.
 
 ```bash
 xcodebuild -project RatioThink.xcodeproj \
@@ -322,14 +345,7 @@ xcodebuild -project RatioThink.xcodeproj \
   ENABLE_CODE_COVERAGE=NO
 ```
 
-Observed blocker on 2026-05-22:
-
-- `RatioThinkGUITests-Runner` failed before test body with:
-  `Timed out while enabling automation mode.`
-- `PIE_TEST_TCC_GRANTED` was unset.
-- `PIE_TEST_MODEL` was unset and `test-models/Qwen3-0.6B-Q4_K_M.gguf` was
-  missing.
-
-Before , no existing GUI/XCUITest exercised the full
-`RatioThink.app → create/select chat → ComposerView send → HTTPEngineClient → real
-engine stream → MessageStreamWriter → persisted assistant message` path.
+`S258_ComposerSendGUITests` is the first GUI suite to exercise the full
+`RatioThink.app → create/select chat → ComposerView send → HTTPEngineClient →
+real engine stream → MessageStreamWriter → persisted assistant message` path
+end to end.

@@ -360,6 +360,11 @@ public enum LoadEvent: Equatable, Sendable {
 ///   so the loading indicator's source-of-truth doesn't bifurcate.
 /// - `.delta` is OpenAI's `choices[0].delta`. `role` only appears on
 ///   the first delta of a turn; subsequent deltas carry content alone.
+/// - `.reasoningDelta` is OpenAI's `choices[0].delta.reasoning_content`
+///   — the model's thinking-block text (Qwen `<think>…</think>`),
+///   surfaced on its own channel so it never mixes into the visible
+///   answer. The chat-apc inferlet keeps the delimiter tokens off both
+///   channels; the GUI renders this in a separate, collapsible section.
 /// - `.finish` is a synthetic terminal frame the decoder emits when it
 ///   sees `finish_reason != nil`. Streams end with exactly one
 ///   `.finish` followed by completion.
@@ -371,6 +376,7 @@ public enum ChatEvent: Equatable, Sendable {
   case modelLoading(loadedBytes: UInt64, totalBytes: UInt64, etaSeconds: Double?)
   case modelReady
   case delta(role: ChatMessage.Role?, content: String)
+  case reasoningDelta(String)
   case finish(reason: FinishReason)
 
   public enum FinishReason: Equatable, Sendable {

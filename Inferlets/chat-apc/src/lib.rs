@@ -9,7 +9,8 @@
 //!   * `GET    /healthz`             -> `control::health`
 //!   * `GET    /v1/models`           -> `control::models`
 //!   * `POST   /v1/chat/completions` -> `chat::completions`
-//!   * `POST   /v1/inferlet`         -> `chat::dispatch` (v1: only `chat-apc`)
+//!   * `POST   /v1/inferlet`         -> `chat::dispatch`
+//!         (`inferlet:"chat-apc"` | `inferlet:"tree-of-thought"`)
 //!   * `POST   /v1/models/load`      -> `control::load` (SSE: model_ready)
 //!   * `DELETE /v1/models/load`      -> `control::load` (204 no-op)
 //!
@@ -30,6 +31,7 @@
 mod chat;
 mod control;
 mod sse;
+mod tot;
 
 use wstd::http::body::IncomingBody;
 use wstd::http::server::{Finished, Responder};

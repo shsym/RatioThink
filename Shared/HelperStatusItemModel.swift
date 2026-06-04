@@ -6,7 +6,7 @@ import Foundation
 /// matches the `HelperDegradedSurface` testability pattern.
 ///
 /// The view (HelperMain) renders the model into AppKit:
-///   · `dot` → SF Symbol name + tint color
+///   · `dot` → brand triangle glyph (fill + error badge) + tint color
 ///   · `engineLabel` → disabled menu item title (the
 ///     "current model/profile/port" slot from Phase 2.3)
 ///   · `pauseResume.{title,enabled,action}` → toggle menu item
@@ -17,18 +17,71 @@ import Foundation
 /// never publishes a green dot through the supervisor pipeline.
 public struct HelperStatusItemModel: Equatable, Sendable {
 
-  /// Semantic dot state. View layer maps to SF Symbol + tint.
+  /// Semantic dot state. The view (HelperMain) renders the brand mark —
+  /// a rounded down-pointing triangle (the app-icon glyph, #424) — and
+  /// maps `Dot` to its tint color (AppKit). The SHAPE decisions (filled
+  /// vs outline, error badge, motion) live here so they are testable
+  /// without an `NSStatusBar` (#396/#424).
   public enum Dot: String, Equatable, Sendable {
-    /// Gray outline circle. Supervisor is `.stopped`.
+    /// Outline triangle, dim grey. Supervisor is `.stopped`.
     case stopped
-    /// Amber filled circle. Supervisor is `.starting` or `.stopping`
-    /// — transitional, not yet steady-state.
+    /// Outline triangle, white, pulsing. Supervisor is `.starting` or
+    /// `.stopping` — transitional, not yet steady-state.
     case loading
-    /// Green filled circle. Supervisor is `.running`.
+    /// Filled triangle, green. Supervisor is `.running`.
     case running
-    /// Red filled circle (or triangle, view's choice). Supervisor is
-    /// `.failed`.
+    /// Filled triangle with an exclamation knockout, amber. Supervisor
+    /// is `.failed`.
     case error
+
+    /// Whether the brand triangle is rendered SOLID (`true`) or as a
+    /// thick rounded OUTLINE (`false`). Outline = idle/working
+    /// (stopped, loading); solid = steady engine presence (running,
+    /// error). This fill difference — not tint — is what distinguishes
+    /// `.loading` from `.running` without color, the #396 invariant
+    /// (the old amber-vs-green pair was an "ambiguous dot"
+    /// accessibility gap).
+    public var isFilled: Bool {
+      switch self {
+      case .stopped, .loading: return false
+      case .running, .error:   return true
+      }
+    }
+
+    /// Whether an exclamation mark is knocked out of the solid triangle.
+    /// Only `.error` carries it — this badge (a shape cue, not just the
+    /// amber tint) is what distinguishes `.error` from `.running`
+    /// without color (#396 invariant); the filled amber triangle plus
+    /// the "!" reads as the universal warning sign.
+    public var showsErrorBadge: Bool { self == .error }
+
+    /// Whether the view should drive a repeating animation on the dot.
+    /// Only the transitional `.loading` state (engine starting/stopping)
+    /// is an in-flight async operation, so only it animates — a running
+    /// async op is never represented solely by a *static* colored dot
+    /// (#396 invariant 1). Steady states (stopped/running/error) hold
+    /// still.
+    public var isAnimated: Bool { self == .loading }
+
+    /// Human-readable engine state for the menu-bar button's
+    /// accessibility label (#424 acceptance: AX describes the app AND
+    /// current status). The view composes "RatioThink engine <word>".
+    ///
+    /// `.loading` is deliberately SUB-STATE-NEUTRAL ("changing state"):
+    /// it collapses BOTH `.starting` and `.stopping` into one visual state
+    /// (white outline + pulse), and this word is the only channel that
+    /// could distinguish them on the status button — so it must not claim
+    /// a direction (announcing "starting" during a stop would be wrong).
+    /// The precise sub-state still rides the menu's `engineLabel`
+    /// ("Engine: stopping…").
+    public var accessibilityWord: String {
+      switch self {
+      case .stopped: return "stopped"
+      case .loading: return "changing state"
+      case .running: return "running"
+      case .error:   return "failed"
+      }
+    }
   }
 
   /// Pause/Resume toggle. The supervisor has one canonical

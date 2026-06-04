@@ -53,7 +53,9 @@ enum APIProbe {
             text += content
           case .finish:
             return text
-          case .modelLoading, .modelReady:
+          // Reasoning rides its own channel and is not part of the
+          // visible reply this probe asserts on.
+          case .reasoningDelta, .modelLoading, .modelReady:
             continue
           }
         }

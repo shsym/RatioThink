@@ -465,6 +465,103 @@ final class HelperResumeActionTests: XCTestCase {
     token.cancel()
   }
 
+  // MARK: - Review v3 N3: shouldCommitAutoRelaunch veto
+
+  /// The main-async block in `HelperMain.swift`'s relauncher closure
+  /// calls this helper to decide whether the deferred
+  /// `HelperResumeAction.run` should fire. Pinning the table here
+  /// closes the SPM-untestable boundary that hid the v1 F1 blocker:
+  /// deleting the production guard would now fail these tests.
+
+  func test_shouldCommitAutoRelaunch_commits_on_failed_engineGone() {
+    // The scheduler that triggers the closure ONLY fires on
+    // `.failed(.engineGone)`, so this is the production-realistic
+    // commit case: state is still `.failed` at the deferred main-
+    // queue commit, meaning no user Pause has won the race.
+    XCTAssertTrue(HelperResumeAction.shouldCommitAutoRelaunch(
+      status: .failed(code: .engineGone, message: "engine process exited (status 9)")
+    ))
+  }
+
+  func test_shouldCommitAutoRelaunch_commits_on_failed_any_code() {
+    // The veto keys on `.failed` as a category, not on `.engineGone`
+    // specifically — auto-relaunch into a fresh `.failed` of any
+    // code is still recovery intent. Pin so a future narrowing
+    // doesn't silently drop legitimate retries.
+    for code: EngineErrorCode in [.engineGone, .spawnFailed, .handshakeTimeout, .memoryRisk] {
+      XCTAssertTrue(HelperResumeAction.shouldCommitAutoRelaunch(
+        status: .failed(code: code, message: "synthetic")
+      ), "\(code) must still commit; veto only fires on non-.failed states")
+    }
+  }
+
+  func test_shouldCommitAutoRelaunch_vetoes_on_stopped() {
+    // Review v2 R1: `stopLocked`'s `.failed(.engineGone)` arm
+    // transitions state to `.stopped` on a user Pause. A `.stopped`
+    // read here means Pause won the deferred-hop race; abort.
+    XCTAssertFalse(HelperResumeAction.shouldCommitAutoRelaunch(status: .stopped))
+  }
+
+  func test_shouldCommitAutoRelaunch_vetoes_on_running() {
+    // Some other caller already drove the engine through `.running`
+    // between the host's schedule sync and this main-queue commit
+    // (e.g. the user clicked Resume manually). Do not pile a second
+    // auto-relaunch on top.
+    XCTAssertFalse(HelperResumeAction.shouldCommitAutoRelaunch(
+      status: .running(port: 50001, profileID: "chat")
+    ))
+  }
+
+  func test_shouldCommitAutoRelaunch_vetoes_on_starting_and_stopping() {
+    // Transient non-terminal states must also veto so a deferred
+    // commit cannot race a fresh launch / shutdown into a double-
+    // start or a relaunch under teardown.
+    XCTAssertFalse(HelperResumeAction.shouldCommitAutoRelaunch(status: .starting))
+    XCTAssertFalse(HelperResumeAction.shouldCommitAutoRelaunch(status: .stopping))
+  }
+
+  // MARK: - #395: composeAutoRelaunch (SPM-reachable relauncher seam)
+
+  func test_composeAutoRelaunch_runs_on_failed_and_returns_outcome() {
+    // `.failed` is the scheduler-realistic commit case: the seam must
+    // invoke `run` exactly once and surface its Outcome. Pinning this
+    // here closes the SPM-untestable HelperMain boundary (#395) — the
+    // production relauncher now composes through this function.
+    let runCount = AtomicCounter()
+    let decision = HelperResumeAction.composeAutoRelaunch(
+      status: .failed(code: .engineGone, message: "engine process exited")
+    ) {
+      runCount.increment()
+      return .started(profileID: "chat")
+    }
+    XCTAssertEqual(runCount.value, 1, "a committed decision must invoke `run` exactly once")
+    XCTAssertEqual(decision, .ran(.started(profileID: "chat")),
+                   "the seam must carry the run Outcome back to the caller for logging")
+  }
+
+  func test_composeAutoRelaunch_vetoes_without_running_on_non_failed_states() {
+    // A user Pause (`.stopped`), a concurrent start (`.running`), or a
+    // transient (`.starting`/`.stopping`) that won the deferred-hop race
+    // must VETO — `run` is never invoked, and the observed status rides
+    // back in the `.vetoed` payload so HelperMain can log why it skipped.
+    let states: [EngineStatus] = [
+      .stopped,
+      .running(port: 50001, profileID: "chat"),
+      .starting,
+      .stopping,
+    ]
+    for status in states {
+      let runCount = AtomicCounter()
+      let decision = HelperResumeAction.composeAutoRelaunch(status: status) {
+        runCount.increment()
+        return .started(profileID: "should-not-run")
+      }
+      XCTAssertEqual(runCount.value, 0, "\(status) must veto: run must NOT fire")
+      XCTAssertEqual(decision, .vetoed(status),
+                     "\(status) must veto and carry the observed status back for the skip log")
+    }
+  }
+
   /// Minimal `EngineSession` for the launcher seam. Records shutdown
   /// invocation count so happy-path tests can verify the host tore
   /// the session down on Pause.

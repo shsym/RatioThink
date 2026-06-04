@@ -49,6 +49,11 @@ public enum PieControlLauncher {
     case portFileWriteFailed(path: String, underlying: String)
     case clientError(underlying: String)
     case driverUnsupported(requested: String, binary: String, details: String)
+    /// `PIE_HOME` is so deep that the engine's aux Unix-domain control
+    /// socket path would overrun the OS `sun_path` limit. Thrown by the
+    /// pre-launch budget check so the failure is loud and actionable
+    /// instead of a silent model-load hang.
+    case pieHomePathTooLong(pieHome: String, length: Int, limit: Int)
 
     public var description: String {
       switch self {
@@ -65,6 +70,8 @@ public enum PieControlLauncher {
       case let .clientError(u): return "PieControlLauncher: WS client error: \(u)"
       case let .driverUnsupported(requested, binary, details):
         return "PieControlLauncher: driver unsupported: \(requested) by \(binary): \(details)"
+      case let .pieHomePathTooLong(pieHome, length, limit):
+        return "PieControlLauncher: PIE_HOME path too long (\(length) bytes > \(limit) max): the engine binds a Unix aux socket at \(pieHome)/standalone/<pid>/g0/aux.sock, which would exceed the macOS sun_path limit (\(auxSocketSunPathBytes) bytes) and hang at model load — use a shorter PIE_HOME (production uses ~/Library/Application Support/RatioThink; tests should anchor pieHome at a short /tmp path)"
       }
     }
   }
@@ -180,11 +187,6 @@ public enum PieControlLauncher {
     }
   }
 
-  private struct BinaryCapabilities {
-    var portable: Bool
-    var metal: Bool
-  }
-
   private static func validateDriverSupport(pieBinary: URL,
                                             subprocessEnvironment: [String: String],
                                             pieHome: URL,
@@ -198,57 +200,53 @@ public enum PieControlLauncher {
     case .dummy:
       return
     case .portable, .portableResolved:
-      let capabilities = try probeBinaryCapabilities(
-        pieBinary: pieBinary,
-        environment: probeEnvironment,
-        requested: "portable"
-      )
-      guard capabilities.portable else {
+      guard try probeDriverList(pieBinary: pieBinary,
+                                environment: probeEnvironment,
+                                requested: "portable") else {
         throw LaunchError.driverUnsupported(
           requested: "portable",
           binary: pieBinary.path,
-          details: "capability probe reported portable=false"
+          details: "portable driver is not compiled into this pie binary"
         )
       }
     case .metal:
-      let capabilities = try probeBinaryCapabilities(
-        pieBinary: pieBinary,
-        environment: probeEnvironment,
-        requested: "metal"
-      )
-      guard capabilities.portable else {
-        throw LaunchError.driverUnsupported(
-          requested: "portable",
-          binary: pieBinary.path,
-          details: "capability probe reported portable=false"
-        )
-      }
-      guard capabilities.metal else {
+      // Current pie has no separate "metal" readiness signal — Metal is
+      // the embedded `portable` driver's device on macOS. Gate on
+      // `portable` being compiled in; the actual Metal backend is
+      // validated at `pie serve` boot (device = ["metal"] fails loud
+      // there if a host built without PIE_PORTABLE_METAL=1), surfaced via
+      // the launch handshake / liveness probe.
+      guard try probeDriverList(pieBinary: pieBinary,
+                                environment: probeEnvironment,
+                                requested: "metal") else {
         throw LaunchError.driverUnsupported(
           requested: "metal",
           binary: pieBinary.path,
-          details: "capability probe reported metal=false"
+          details: "portable driver (provides the Metal device) is not compiled into this pie binary"
         )
       }
     }
   }
 
-  private static func probeBinaryCapabilities(pieBinary: URL,
-                                              environment: [String: String],
-                                              requested: String) throws -> BinaryCapabilities {
+  /// Runs `pie driver list` and returns whether the embedded `portable`
+  /// driver is compiled into this binary. Fails closed (throws
+  /// `driverUnsupported`) on any spawn / non-zero-exit / parse failure.
+  private static func probeDriverList(pieBinary: URL,
+                                      environment: [String: String],
+                                      requested: String) throws -> Bool {
     guard FileManager.default.fileExists(atPath: pieBinary.path) else {
       throw LaunchError.pieBinaryMissing(path: pieBinary.path)
     }
     let result: ProbeResult
     do {
-      result = try runCapabilityProbe(pieBinary: pieBinary, environment: environment)
+      result = try runDriverListProbe(pieBinary: pieBinary, environment: environment)
     } catch let error as LaunchError {
       throw error
     } catch {
       throw LaunchError.driverUnsupported(
         requested: requested,
         binary: pieBinary.path,
-        details: "capability probe failed: \(error)"
+        details: "`pie driver list` probe failed: \(error)"
       )
     }
     guard result.exitCode == 0 else {
@@ -256,10 +254,10 @@ public enum PieControlLauncher {
       throw LaunchError.driverUnsupported(
         requested: requested,
         binary: pieBinary.path,
-        details: "capability probe exited \(result.exitCode): \(detail.trimmingCharacters(in: .whitespacesAndNewlines))"
+        details: "`pie driver list` probe exited \(result.exitCode): \(detail.trimmingCharacters(in: .whitespacesAndNewlines))"
       )
     }
-    return try decodeCapabilitiesJSON(
+    return try parseDriverList(
       result.stdout,
       pieBinary: pieBinary,
       requested: requested
@@ -272,11 +270,16 @@ public enum PieControlLauncher {
     var stderr: String
   }
 
-  private static func runCapabilityProbe(pieBinary: URL,
+  private static func runDriverListProbe(pieBinary: URL,
                                          environment: [String: String]) throws -> ProbeResult {
     let proc = Process()
     proc.executableURL = pieBinary
-    proc.arguments = ["capabilities", "--json"]
+    // `pie driver list` is the documented driver-readiness surface — it
+    // lists the embedded drivers compiled into the binary. (The older
+    // `pie capabilities --json` still exists but is an undocumented,
+    // feature-gated surface; standardize on `driver list` to avoid
+    // coupling the launcher to it.)
+    proc.arguments = ["driver", "list"]
     proc.environment = environment
     let stdout = Pipe()
     let stderr = Pipe()
@@ -299,9 +302,9 @@ public enum PieControlLauncher {
     if proc.isRunning {
       proc.terminate()
       throw LaunchError.driverUnsupported(
-        requested: "capabilities",
+        requested: "driver list",
         binary: pieBinary.path,
-        details: "capability probe timed out"
+        details: "`pie driver list` probe timed out"
       )
     }
 
@@ -310,9 +313,9 @@ public enum PieControlLauncher {
     let stderrClosed = stderrCollector.waitForEOF(until: outputDeadline)
     guard stdoutClosed && stderrClosed else {
       throw LaunchError.driverUnsupported(
-        requested: "capabilities",
+        requested: "driver list",
         binary: pieBinary.path,
-        details: "capability probe output timed out"
+        details: "`pie driver list` probe output timed out"
       )
     }
 
@@ -374,40 +377,89 @@ public enum PieControlLauncher {
     }
   }
 
-  private static func decodeCapabilitiesJSON(_ text: String,
-                                             pieBinary: URL,
-                                             requested: String) throws -> BinaryCapabilities {
-    let root: [String: Any]
-    do {
-      guard let data = text.data(using: .utf8),
-            let decoded = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        throw LaunchError.driverUnsupported(
-          requested: requested,
-          binary: pieBinary.path,
-          details: "capability probe returned malformed JSON: \(text.trimmingCharacters(in: .whitespacesAndNewlines))"
-        )
-      }
-      root = decoded
-    } catch let error as LaunchError {
-      throw error
-    } catch {
+  /// Parse `pie driver list` output for the embedded `portable` driver.
+  ///
+  /// `pie driver list` prints, under an "Embedded drivers (compiled into
+  /// this binary…)" section, one line per embedded driver:
+  ///
+  ///     portable     (compiled in)
+  ///     cuda_native  (not compiled)
+  ///     dummy        (compiled in)
+  ///
+  /// We need only `portable` — current pie has no separate "metal"
+  /// readiness signal (Metal is the portable driver's macOS device,
+  /// validated at serve boot), so the `.metal` gate also keys on
+  /// `portable` being compiled in. Fails CLOSED if the output never
+  /// mentions `portable` at all (an unexpected/changed CLI format), so a
+  /// future drift is caught loud rather than passed blind. Returns
+  /// whether the portable driver is compiled in.
+  static func parseDriverList(_ text: String,
+                              pieBinary: URL,
+                              requested: String) throws -> Bool {
+    let lines = text.split(separator: "\n").map {
+      $0.trimmingCharacters(in: .whitespaces)
+    }
+    let mentionsPortable = lines.contains { $0.hasPrefix("portable") }
+    guard mentionsPortable else {
       throw LaunchError.driverUnsupported(
         requested: requested,
         binary: pieBinary.path,
-        details: "capability probe returned malformed JSON: \(error)"
+        details: "`pie driver list` output did not list the portable driver: \(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))"
       )
     }
-    guard let drivers = root["drivers"] as? [String: Any],
-          let devices = root["devices"] as? [String: Any],
-          let portable = drivers["portable"] as? Bool,
-          let metal = devices["metal"] as? Bool else {
-      throw LaunchError.driverUnsupported(
-        requested: requested,
-        binary: pieBinary.path,
-        details: "capability probe returned malformed JSON: \(text.trimmingCharacters(in: .whitespacesAndNewlines))"
-      )
+    return lines.contains {
+      $0.hasPrefix("portable") && $0.contains("(compiled in)")
     }
-    return BinaryCapabilities(portable: portable, metal: metal)
+  }
+
+  // MARK: - aux socket path budget
+
+  /// Darwin caps `sockaddr_un.sun_path` at 104 bytes (incl. NUL). The
+  /// `pie serve` engine binds a per-launch aux control socket at
+  /// `$PIE_HOME/standalone/<pid>/g<group>[r<rank>]/aux.sock` (pie
+  /// `server/src/embedded_driver.rs`). A `PIE_HOME` deep enough to push
+  /// that path past the limit makes the engine's `bind()` fail and it
+  /// hangs at model load — the exact failure a too-deep
+  /// `NSTemporaryDirectory()` pieHome produced. The pre-launch check
+  /// below converts that hang into a loud, actionable error.
+  static let auxSocketSunPathBytes = 104
+
+  /// Modeled worst-case engine-appended suffix under PIE_HOME:
+  /// `/standalone/<pid>/g0/aux.sock` — `/standalone/` (12) + a 7-digit
+  /// pid allowance (well beyond macOS pid_max defaults) + `/g0/aux.sock`
+  /// (12) = 31. Single-device Metal is always group 0; any multi-rank
+  /// `r<n>` suffix stays within the pid slack.
+  static let auxSocketSuffixReserve = 31
+
+  /// Longest PIE_HOME (UTF-8 bytes) that still leaves room for the
+  /// engine's aux socket path + NUL terminator: `104 - 1 - 31 = 72`.
+  static var maxSafePieHomePathLength: Int {
+    auxSocketSunPathBytes - 1 - auxSocketSuffixReserve
+  }
+
+  /// `nil` when `pieHome` leaves room for the engine's aux socket;
+  /// otherwise the loud pre-launch error to throw. Pure + deterministic
+  /// (no pid read) so it is directly unit-testable.
+  static func auxSocketBudgetError(pieHome: URL) -> LaunchError? {
+    let length = pieHome.path.utf8.count
+    guard length > maxSafePieHomePathLength else { return nil }
+    return .pieHomePathTooLong(
+      pieHome: pieHome.path,
+      length: length,
+      limit: maxSafePieHomePathLength
+    )
+  }
+
+  /// Whether `modelConfig` spawns a real driver that binds the aux Unix
+  /// socket (and is therefore subject to the `sun_path` budget). The
+  /// `.dummy` driver has no aux socket (pie `rpc_loop.rs`), so its
+  /// launches are exempt — that keeps the long `NSTemporaryDirectory()`
+  /// pieHomes used by the dummy-driver CLI scenarios valid.
+  static func modelConfigBindsAuxSocket(_ modelConfig: ModelConfig) -> Bool {
+    switch modelConfig {
+    case .dummy: return false
+    case .portable, .portableResolved, .metal: return true
+    }
   }
 
   // MARK: - launch
@@ -417,6 +469,13 @@ public enum PieControlLauncher {
   public static func launch(spec: LaunchSpec) async throws -> (httpPort: UInt16, session: LaunchedSession) {
     guard FileManager.default.fileExists(atPath: spec.pieBinary.path) else {
       throw LaunchError.pieBinaryMissing(path: spec.pieBinary.path)
+    }
+    // Fail loud before spawning if PIE_HOME is so deep the engine's aux
+    // Unix socket path would overrun sun_path and hang. Only real drivers
+    // (portable/metal) bind that socket.
+    if modelConfigBindsAuxSocket(spec.modelConfig),
+       let budgetError = auxSocketBudgetError(pieHome: spec.pieHome) {
+      throw budgetError
     }
     let httpPort = try reserveFreePort()
     let configURL = try writeConfig(modelConfig: spec.modelConfig, in: spec.pieHome)
@@ -746,6 +805,65 @@ public actor LaunchedSession {
   public var pid: pid_t { process.processIdentifier }
   public var isRunning: Bool { process.isRunning }
 
+  /// Resident memory of the live pie process in bytes, or nil if the
+  /// engine is not running or the sample fails. Satisfies
+  /// `PieEngineHost.EngineSession`. Reads the actor-owned pid, then defers
+  /// to the nonisolated `proc_pid_rusage` helper. Measures the parent pie
+  /// process only; summing the process group is a deliberate follow-up.
+  ///
+  /// Liveness gate: never sample a dead/reaped engine. Foundation flips
+  /// `process.isRunning` false the instant the child exits — well before
+  /// `PieEngineHost`'s liveness monitor takes
+  /// ~`livenessFailureThreshold × livenessInterval` (~10 s) to demote
+  /// `_state` from `.running` — so this closes the window where the
+  /// popover would otherwise render a dead engine's STALE RSS (measured:
+  /// `proc_pid_rusage` returns rc==0 with ~1.2 MB of stale bytes for a
+  /// zombie pid). The static helper re-checks the raw pid as defence.
+  public func residentMemoryBytes() async -> UInt64? {
+    guard process.isRunning else { return nil }
+    return LaunchedSession.residentMemory(ofPID: process.processIdentifier)
+  }
+
+  /// `proc_pid_rusage(RUSAGE_INFO_V2)` → `ri_resident_size` for `pid`, or
+  /// nil when `pid` is not a live process or the sample is not a real
+  /// reading. `static` (nonisolated) so unit tests can sample a known pid
+  /// (e.g. `getpid()`) without standing up an actor.
+  ///
+  /// Two gates beyond rc:
+  ///  · LIVENESS — `proc_pid_rusage` returns rc==0 with STALE non-zero
+  ///    bytes for a zombie (exited-but-unreaped) pid, and the OS may reuse
+  ///    a dead pid for an unrelated process. `isPidLive` rejects both, so
+  ///    a dead engine never reports phantom (or someone else's) memory.
+  ///  · NON-ZERO — a live engine is never 0-resident; rc==0 with 0 bytes
+  ///    is an edge/failed reading, not a measurement, so it collapses into
+  ///    the same nil ("unavailable") channel rather than rendering "0 MB".
+  static func residentMemory(ofPID pid: pid_t) -> UInt64? {
+    guard isPidLive(pid) else { return nil }
+    var info = rusage_info_v2()
+    let rc = withUnsafeMutablePointer(to: &info) { ptr -> Int32 in
+      ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+        proc_pid_rusage(pid, RUSAGE_INFO_V2, $0)
+      }
+    }
+    guard rc == 0 else { return nil }
+    guard info.ri_resident_size > 0 else { return nil }
+    return info.ri_resident_size
+  }
+
+  /// True only when `pid` names a LIVE process — not a zombie
+  /// (exited-but-unreaped) nor a vanished/reused-dead pid. Measured:
+  /// `proc_pidinfo(PROC_PIDTBSDINFO)` returns the struct size for a live
+  /// process and 0 for a zombie or a gone pid, so a short read means
+  /// "not live"; the `SZOMB` check is defensive belt-and-suspenders. This
+  /// is the pid-validity guard `proc_pid_rusage` itself cannot provide.
+  static func isPidLive(_ pid: pid_t) -> Bool {
+    guard pid > 0 else { return false }
+    var info = proc_bsdinfo()
+    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+    let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size)
+    return n == size && info.pbi_status != UInt32(SZOMB)
+  }
+
   /// Record the control-plane WS address for later liveness probes.
   /// Called once by `launch()` after the handshake resolves it.
   func recordControlWSURL(_ url: URL) { controlWSURL = url }
@@ -1011,6 +1129,12 @@ public actor LaunchedSession {
   }
 
   private nonisolated func diagnose(_ msg: String) {
+    // Route through the unified log so shutdown anomalies (SIGKILL did
+    // not reap the pid, `shm_unlink` FAILED — both host-global corruption
+    // vectors) are visible in the shipped, detached Helper, where stderr
+    // is not captured. Keep the stderr write too for CLI/test contexts
+    // that DO capture it.
+    Log.engine.error("[LaunchedSession] \(msg, privacy: .public)")
     FileHandle.standardError.write(Data("[LaunchedSession] \(msg)\n".utf8))
   }
 }

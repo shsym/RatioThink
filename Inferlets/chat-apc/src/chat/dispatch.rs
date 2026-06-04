@@ -30,7 +30,7 @@ use wstd::http::body::IncomingBody;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::Request;
 
-use super::completions::{self, ChatCompletionsRequest, ChatMessage, ToolSchema};
+use super::completions::{self, ChatCompletionsRequest, ChatMessage, SpecRequest, ToolSchema};
 use crate::sse;
 
 #[derive(Deserialize)]
@@ -53,6 +53,7 @@ struct ChatApcInput {
     max_tokens: Option<usize>,
     tools: Option<Vec<ToolSchema>>,
     tool_choice: Option<serde_json::Value>,
+    speculation: Option<SpecRequest>,
 }
 
 pub async fn handle(req: Request<IncomingBody>, res: Responder) -> Finished {
@@ -76,12 +77,15 @@ pub async fn handle(req: Request<IncomingBody>, res: Responder) -> Finished {
 
     match dispatch.inferlet.as_str() {
         "chat-apc" => dispatch_chat_apc(dispatch, res).await,
+        "tree-of-thought" => {
+            crate::tot::dispatch(dispatch.input, dispatch.messages, dispatch.stream, res).await
+        }
         other => res
             .respond(sse::json_error(
                 404,
                 "inferlet_not_found",
                 &format!(
-                    "Inferlet '{other}' not available. V1 supports only 'chat-apc'."
+                    "Inferlet '{other}' not available. V1 supports 'chat-apc' and 'tree-of-thought'."
                 ),
             ))
             .await,
@@ -162,6 +166,7 @@ async fn dispatch_chat_apc(dispatch: InferletDispatch, res: Responder) -> Finish
         max_tokens: input.max_tokens,
         tools: input.tools,
         tool_choice: input.tool_choice,
+        speculation: input.speculation,
     };
     completions::handle_parsed(request, res).await
 }

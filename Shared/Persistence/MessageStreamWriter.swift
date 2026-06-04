@@ -54,6 +54,11 @@ public final class MessageStreamWriter {
   private let flushInterval: TimeInterval
   private let errorReporter: ErrorReporter?
   private var pending: String = ""
+  /// Buffered reasoning (`reasoning_content`) deltas, flushed into
+  /// `message.reasoning` on the same durability boundary as `content`
+  /// so the thinking section and the answer stay consistent on disk
+  ///.
+  private var pendingReasoning: String = ""
   private var timer: Timer?
   private var didFinish = false
 
@@ -91,33 +96,48 @@ public final class MessageStreamWriter {
     armTimer()
   }
 
+  /// Appends a streaming reasoning (`reasoning_content`) delta. Buffered
+  /// separately from `content` and committed to `message.reasoning` on
+  /// the same flush boundary.
+  public func appendReasoningDelta(_ text: String) {
+    guard !didFinish else { return }
+    pendingReasoning.append(text)
+    armTimer()
+  }
+
   /// Forces a durability boundary. Safe to call when the buffer is
   /// empty. Bumps `chat.updatedAt` so the sidebar's recency sort
   /// promotes a chat whose assistant turn is still streaming —
   /// otherwise pin / profile toggles would float ahead of the most
   /// recent activity ( F2).
   public func flush() {
-    guard !pending.isEmpty else { return }
+    guard !pending.isEmpty || !pendingReasoning.isEmpty else { return }
     let previousContent = message.content
+    let previousReasoning = message.reasoning
     let owningChat = message.chat
     let previousUpdatedAt = owningChat?.updatedAt
     message.content.append(pending)
+    message.reasoning.append(pendingReasoning)
     let flushed = pending
+    let flushedReasoning = pendingReasoning
     pending.removeAll(keepingCapacity: true)
+    pendingReasoning.removeAll(keepingCapacity: true)
     owningChat?.updatedAt = Date()
     do {
       try context.save()
     } catch {
       // Mirror the rollback shape used elsewhere on the durability
       // boundary ( F21): un-bump `chat.updatedAt` and re-buffer
-      // the flushed slice so the in-memory view doesn't overstate
+      // both flushed slices so the in-memory view doesn't overstate
       // persistence relative to disk. A subsequent successful
       // flush will re-attempt the same write.
       message.content = previousContent
+      message.reasoning = previousReasoning
       if let owningChat, let previousUpdatedAt {
         owningChat.updatedAt = previousUpdatedAt
       }
       pending.insert(contentsOf: flushed, at: pending.startIndex)
+      pendingReasoning.insert(contentsOf: flushedReasoning, at: pendingReasoning.startIndex)
       errorReporter?(error, "MessageStreamWriter.flush")
     }
   }
@@ -152,6 +172,7 @@ public final class MessageStreamWriter {
   public func cancel() {
     guard !didFinish else { return }
     pending.removeAll(keepingCapacity: false)
+    pendingReasoning.removeAll(keepingCapacity: false)
     stopTimer()
     didFinish = true
     do {

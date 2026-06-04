@@ -17,7 +17,38 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
   /// Sibling S5 tests apply the same annotation for the same reason.
   @MainActor
   func test_helper_status_bar_surfaces_design_items() async throws {
+    // Drive a DETERMINISTIC `Engine: stopped` boot WITHOUT a staged model.
+    // `HelperStatusItemModel` renders the status shell from the `.stopped`
+    // status alone and never consults the model, so this menu-shell smoke
+    // needs no weight and must run on a model-less checkout (gated only by
+    // guardSeatedGUI). The helper auto-resumes the ACTIVE profile at boot
+    // (HelperMain.autoResumeEngineOnBoot), so a freshly-seeded PIE_HOME —
+    // whose seed also writes the active-profile marker — would boot to
+    // `starting…`/`Pause Engine`. Pre-write a profile so `seedDefaultsIfEmpty`
+    // skips (a .toml already exists) and NO `<PIE_HOME>/active-profile` marker
+    // is written → `activeProfileID` is nil → autoResume no-ops
+    // (`.noActiveProfile`) → the engine stays `.stopped`. Only the file's
+    // existence matters (the helper never resolves it — no active profile), so
+    // it is a minimal placeholder, NOT a copy of the seed format. PIE_HOME lives
+    // under the runner-writable NSTemporaryDirectory container (the sandboxed
+    // runner cannot create dirs under /tmp).
+    let fm = FileManager.default
+    let tempDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("pie-s4design-\(UUID().uuidString)", isDirectory: true)
+    let profilesDir = tempDir.appendingPathComponent("profiles", isDirectory: true)
+    try fm.createDirectory(at: profilesDir, withIntermediateDirectories: true)
+    addTeardownBlock { try? fm.removeItem(at: tempDir) }
+    let placeholderProfile = """
+    id = "chat"
+    name = "Chat"
+    model = "placeholder"
+    inferlet = "chat-apc"
+    """
+    try placeholderProfile.write(to: profilesDir.appendingPathComponent("chat.toml"),
+                                 atomically: true, encoding: .utf8)
+
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app.helper")
+    app.launchEnvironment["PIE_HOME"] = tempDir.path
     // Debug dev builds are ad-hoc-signed (no Team ID).
     // `HelperXPCListener.verifyStartupInvariants` preconditionFails
     // on `.teamIDAbsent` unless a bypass env is captured. Notarized
@@ -53,6 +84,13 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
                      "Settings…", "Open Logs…", "Quit RatioThink"] {
       XCTAssertTrue(titles.contains(expected),
                     "menu missing '\(expected)'; got: \(titles)")
+    }
+    // Idle-shell determinism: no active profile ⇒ autoResume no-ops, so the
+    // running/starting affordances must be ABSENT — proving the `.stopped`
+    // shell renders without any staged model.
+    for absent in ["Pause Engine", "Engine: starting…"] {
+      XCTAssertFalse(titles.contains(absent),
+                     "idle shell must not show a running/starting affordance; got: \(titles)")
     }
 
     app.typeKey(.escape, modifierFlags: [])
@@ -268,6 +306,15 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app.helper")
     app.launchEnvironment["PIE_HOME"] = tempDir.path
     app.launchEnvironment["PIE_ALLOW_UNSIGNED_CALLERS"] = "1"
+    // Pin the guardrail's view of physical RAM (DEBUG-only seam in
+    // SystemMemory.physicalBytes) to 8 GiB, so the launch-time limit is
+    // max(0, 8 − 6 GiB reserve) × 0.65 ≈ 1.3 GiB. That makes the 8 GiB
+    // sparse default deterministically oversized on any runner, regardless
+    // of its real RAM (this 64 GiB host's real limit is ~37.7 GiB, which an
+    // 8 GiB model would not exceed). Faking RAM smaller only makes the
+    // guardrail stricter, and the rejection is pre-launch — pie never reads
+    // the (bogus, sparse) model, so there is no real load or memory cost.
+    app.launchEnvironment["PIE_TEST_PHYSICAL_MEMORY_BYTES"] = "8589934592"
     app.launch()
     defer { app.terminate() }
 
@@ -361,10 +408,9 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
       fm.fileExists(atPath: modelSource.path),
       "model fixture missing at \(modelSource.path) — stage a Qwen3-0.6B-Q8_0.gguf or set PIE_TEST_MODEL"
     )
-    try fm.createSymbolicLink(
-      at: try Self.seededModelDestination(in: modelsDir),
-      withDestinationURL: modelSource
-    )
+    // Regular file, not a symlink: a real boot resolves the model through
+    // validateAppStagedModel, which rejects non-regular files.
+    try Self.stageSeededModelRegularFile(from: modelSource, in: modelsDir)
 
     // 3. Locate RatioThink.app via the test bundle's sibling, then verify
     //    the staged pie binary exists. If it's missing, the
@@ -394,6 +440,10 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     // 4. Launch helper bound to the isolated PIE_HOME.
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app.helper")
     app.launchEnvironment["PIE_HOME"] = tempDir.path
+    // Suppress boot auto-resume so the engine starts ONLY via the explicit
+    // Resume click this test exercises — otherwise the async auto-start
+    // pre-empts it (menu already shows "Pause Engine", no Resume to click).
+    app.launchEnvironment["PIE_TEST_NO_AUTO_RESUME"] = "1"
     app.launchEnvironment["PIE_ALLOW_UNSIGNED_CALLERS"] = "1"
     app.launch()
     defer { app.terminate() }
@@ -435,6 +485,11 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
         lastTitles = menu.menuItems.allElementsBoundByIndex.map(\.title)
         if menu.menuItems["Pause Engine"].exists {
           sawPause = true
+          // Dismiss the open menu before leaving the loop — step 7 re-opens
+          // it to click Pause, and clicking the status item while its menu
+          // is already open toggles it shut, which strands the subsequent
+          // menu-item click waiting for a menu-open that never fires.
+          app.typeKey(.escape, modifierFlags: [])
           break
         }
         // Surface `Engine: failed` early — no point waiting 60 s if
@@ -524,5 +579,26 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(),
                                             withIntermediateDirectories: true)
     return dest
+  }
+
+  /// Stage the seeded model as a REGULAR FILE at the app-staged path
+  /// (`<PIE_HOME>/models/<slug>`). `LaunchSpecResolver.validateAppStagedModel`
+  /// accepts only `.typeRegular`, so a symlink is rejected and the engine
+  /// status eval reports `failed(modelMissing)` even though the bytes are
+  /// reachable. Hardlink first (cheap, same-volume); copy across volumes.
+  private static func stageSeededModelRegularFile(from source: URL, in modelsDir: URL) throws {
+    let dest = try seededModelDestination(in: modelsDir)
+    let fm = FileManager.default
+    // Dereference first: the canonical fixture (Scripts/stage-test-model.sh)
+    // stages test-models/ as a SYMLINK to the HF-cache blob, and hardlinking
+    // or copying a symlink yields a symlink at the app-staged path —
+    // validateAppStagedModel accepts only `.typeRegular`. Resolve to the real
+    // blob so the staged file is regular.
+    let resolved = source.resolvingSymlinksInPath()
+    do {
+      try fm.linkItem(at: resolved, to: dest)
+    } catch {
+      try fm.copyItem(at: resolved, to: dest)
+    }
   }
 }

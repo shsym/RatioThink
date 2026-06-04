@@ -153,6 +153,10 @@ private final class FixedStatusExportedObject: NSObject, PieHelperXPC, @unchecke
     }
   }
 
+  func engineMemory(reply: @escaping (Data) -> Void) {
+    reply((try? XPCPayload.encode(Optional<EngineMemorySample>.none)) ?? Data("null".utf8))
+  }
+
   func startEngine(profileID: String,
                    reply: @escaping (Data?, Data?) -> Void) {
     PieHelperXPCWire.replyStartEngine(
@@ -209,6 +213,10 @@ private final class NeverReplyStatusExportedObject: NSObject, PieHelperXPC, @unc
   func engineStatus(reply: @escaping (Data) -> Void) {
     // Intentionally do not call reply. This simulates a helper that accepted
     // the XPC message but wedged before producing a response.
+  }
+
+  func engineMemory(reply: @escaping (Data) -> Void) {
+    // Wedged: intentionally never replies, like engineStatus above.
   }
 
   func startEngine(profileID: String,

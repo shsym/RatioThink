@@ -7,11 +7,36 @@ APC-enabled chat inferlet.
 
 ## Install (DMG)
 
+Release DMGs are signed with a Developer ID and notarized by Apple, so they
+pass Gatekeeper with no extra steps:
+
 1. Download `RatioThink-arm64.dmg` (Apple Silicon) from Releases and open it.
-2. Drag **RatioThink.app** into **Applications**.
-3. Clear the quarantine flag so the bundled helper/engine can launch:
-   `xattr -dr com.apple.quarantine /Applications/RatioThink.app`
-4. Open **RatioThink** from Applications.
+2. In the window that opens, drag **RatioThink.app** onto the **Applications** shortcut.
+3. Open **RatioThink** from Applications.
+
+> **Unsigned / development builds.** A DMG or app you build yourself
+> (`make dmg-arm64`) is *not* notarized, so Gatekeeper blocks it. For local
+> use only, clear the quarantine flag — notarized release downloads never need
+> this:
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/RatioThink.app
+> ```
+
+## Updating
+
+RatioThink does not auto-install updates yet, but it does **check** for them.
+
+- **On launch**, it makes one request to the public
+  [GitHub Releases](https://github.com/shsym/RatioThink/releases) API and, if a
+  newer release exists, shows a dismissable banner with **Download** (opens the
+  release page) and **Ignore this version** (that version stays hidden until a
+  newer one ships). It stays silent if you're up to date or offline.
+- **Anytime**, choose **RatioThink → Check for Updates…** to check on demand;
+  the menu command always checks and ignores any dismissed versions.
+
+Neither path downloads or installs anything automatically — they compare
+versions and link you to the release. (In-app auto-update via Sparkle is tracked
+as future work.)
 
 ## Build from source
 
@@ -24,6 +49,14 @@ cd RatioThink
 make build          # generates RatioThink.xcodeproj, then builds RatioThink.app + helper
 ```
 
+The repo uses git submodules (the Pie engine, plus `ds_store` + `mac_alias` under
+`Scripts/vendor/` which `make dmg-arm64` needs to write the styled DMG window). If
+you cloned without `--recurse-submodules`, initialize them:
+
+```bash
+git submodule update --init --recursive
+```
+
 To install a signed build into `/Applications` (verified end-to-end: helper + engine + a chat
 round-trip), use `make install-app`. It needs an Apple "Apple Development" signing identity in your
 keychain; override `DEVELOPMENT_TEAM` / `CODE_SIGN_IDENTITY` per machine. The background helper is
@@ -33,6 +66,39 @@ working install.
 ```bash
 make install-app    # build, sign, install into /Applications, launch, verify
 ```
+
+`make install-app` uses a local **Apple Development** identity. That is enough
+to run and debug locally, but it is *not* a distribution identity — Gatekeeper
+rejects it on download. Producing a DMG that passes `spctl` on other Macs
+requires the notarized release flow below.
+
+## Troubleshooting / Collect diagnostics
+
+If RatioThink "does nothing" after launch — no window, no menu-bar icon, no chat —
+collect a diagnostics bundle and send it to the developer.
+
+**From the app** (if it opens): **Help → Collect Diagnostics…**. It writes a
+`.zip` to your Desktop and reveals it in Finder.
+
+**From Terminal** (works even when the app or helper won't launch):
+
+```bash
+/Applications/RatioThink.app/Contents/Resources/collect-diagnostics.sh
+```
+
+This prints a short verdict (e.g. *quarantine present*, *helper never
+launched*, *Gatekeeper rejected*, *engine failed*) and writes
+`~/Desktop/RatioThink-diagnostics-<timestamp>.zip`. Attach that `.zip` to your
+report.
+
+The bundle contains app/helper versions, codesign + Gatekeeper + quarantine
+status, the launchd helper state, the running-process list, recent macOS
+Unified Logging for `com.ratiothink*`, recent crash reports, and the app's own
+breadcrumb logs (`app.log` / `helper.log` / `engine.log`). It is **redacted**:
+your home path is collapsed to `~` and obvious tokens are stripped. Chat
+contents are **never** included — diagnostics carry logs, status, and config
+metadata only. Flags: `--window <dur>` (Unified Logging look-back, default
+`2h`) and `--out <path>`.
 
 ## Repo layout
 
@@ -49,6 +115,13 @@ RatioThink/
 └── Vendor/pie/     # Pie engine (vendored submodule)
 ```
 
+## Documentation
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the app, helper, pie engine, and
+  `chat-apc` inferlet fit together (plus an interactive [`architecture.html`](docs/architecture.html)).
+- [`TEST.md`](TEST.md) — test catalog and pre-PR gate: what to run for each change type.
+- [`PARITY.md`](PARITY.md) — how each test tier maps to the real packaged-binary path, and every bypass it takes.
+
 ## License
 
-[Apache-2.0](LICENSE) — matching the Pie engine.
+[Apache-2.0](LICENSE)

@@ -114,6 +114,16 @@ public enum PieDirs {
     resolveRoot().appendingPathComponent("profiles", isDirectory: true)
   }
 
+  /// Canonical models directory URL **without** creating it or mutating
+  /// attributes — for read-only callers (a model-present existence check
+  /// on a SwiftUI render path). Pure path composition, no side effects.
+  /// Use the throwing `models()` when you intend to WRITE into the dir: it
+  /// ensures the dir exists and excludes it from backup, which are
+  /// filesystem mutations that must not run on every render.
+  public static func modelsURL() -> URL {
+    resolveRoot().appendingPathComponent("models", isDirectory: true)
+  }
+
   // MARK: - internals
 
   private static func resolveRoot() -> URL {

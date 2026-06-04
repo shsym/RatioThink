@@ -22,13 +22,36 @@ public final class AppPreferences: ObservableObject {
   /// Storage key flipped after the first-launch wizard completes.
   public static let firstLaunchWizardCompletedKey = "firstLaunchWizardCompleted"
 
+  /// Storage key for the set of update versions the user chose to ignore via
+  /// the launch-time "update available" banner (#411). Persisted as a string
+  /// array of normalized version strings (e.g. `["0.1.1"]`).
+  public static let ignoredUpdateVersionsKey = "ignoredUpdateVersions"
+
   private let defaults: UserDefaults
 
   @Published public private(set) var firstLaunchWizardCompleted: Bool
 
+  /// Versions dismissed from the launch update banner. A dismissed version
+  /// never re-surfaces; a strictly newer release is not in this set, so it
+  /// prompts again. The manual "Check for Updates…" command ignores this set.
+  @Published public private(set) var ignoredUpdateVersions: Set<String>
+
   public init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
     self.firstLaunchWizardCompleted = defaults.bool(forKey: Self.firstLaunchWizardCompletedKey)
+    self.ignoredUpdateVersions = Set(defaults.stringArray(forKey: Self.ignoredUpdateVersionsKey) ?? [])
+  }
+
+  /// Persist a version as ignored. Flushed to disk now (like the first-launch
+  /// flag) so a quit right after dismissing the banner doesn't lose it and the
+  /// version wrongly re-surfaces next launch. Empty input is a no-op.
+  public func ignoreUpdateVersion(_ version: String) {
+    let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, !ignoredUpdateVersions.contains(trimmed) else { return }
+    ignoredUpdateVersions.insert(trimmed)
+    // Store sorted for a stable, debuggable `defaults read`.
+    defaults.set(ignoredUpdateVersions.sorted(), forKey: Self.ignoredUpdateVersionsKey)
+    defaults.synchronize()
   }
 
   /// Mark the first-launch wizard complete.  reduced the

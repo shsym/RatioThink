@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RatioThink Architecture</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a23; --panel-2:#1d2130; --line:#2a2f40;
+    --ink:#e7e9ef; --ink-dim:#9aa1b4; --ink-faint:#6b7186;
+    --app:#5cc8ff; --helper:#c79cff; --engine:#ffcf6b; --inferlet:#6be59a;
+    --edge:#5b6479; --hot:#ff7a59;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    -webkit-font-smoothing:antialiased;line-height:1.5}
+  a{color:var(--app)}
+  .wrap{max-width:1180px;margin:0 auto;padding:28px 22px 60px}
+  header h1{font-size:24px;margin:0 0 4px;letter-spacing:-.01em}
+  header p.sub{margin:0;color:var(--ink-dim);font-size:14px;max-width:64ch}
+
+  /* segmented view toggle */
+  .toolbar{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:20px 0 4px}
+  .seg{display:inline-flex;background:var(--panel);border:1px solid var(--line);
+    border-radius:10px;padding:3px}
+  .seg button{appearance:none;border:0;background:transparent;color:var(--ink-dim);
+    font:600 13px/1 var(--sans);padding:8px 14px;border-radius:7px;cursor:pointer}
+  .seg button.on{background:var(--panel-2);color:var(--ink);box-shadow:0 1px 0 #0006}
+  .hint{color:var(--ink-faint);font-size:12.5px}
+
+  .grid{display:grid;grid-template-columns:1.55fr 1fr;gap:22px;margin-top:18px}
+  @media(max-width:860px){.grid{grid-template-columns:1fr}}
+
+  /* diagram */
+  .diagram{position:relative;background:
+      radial-gradient(120% 90% at 50% -10%,#1a1e2b 0%,var(--panel) 60%);
+    border:1px solid var(--line);border-radius:16px;padding:26px 30px}
+  #edges{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
+  .col{position:relative;display:flex;flex-direction:column;gap:46px;z-index:2;margin:0 74px}
+  @media(max-width:560px){.col{margin:0 40px}}
+
+  .node{position:relative;border:1px solid var(--line);border-radius:13px;
+    background:var(--panel-2);padding:14px 16px;cursor:pointer;
+    transition:transform .15s,border-color .15s,box-shadow .15s,opacity .15s}
+  .node:hover{transform:translateY(-1px);border-color:var(--accent)}
+  .node.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 10px 30px #0007}
+  .node .tag{font:600 11px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+    color:var(--accent)}
+  .node h3{margin:6px 0 3px;font-size:16px}
+  .node p{margin:0;color:var(--ink-dim);font-size:13px}
+  .node .files{margin-top:8px;font:500 11.5px/1.5 var(--mono);color:var(--ink-faint);
+    display:none}
+  body.mode-contrib .node .files{display:block}
+  .node[data-node=app]{--accent:var(--app)}
+  .node[data-node=helper]{--accent:var(--helper)}
+  .node[data-node=engine]{--accent:var(--engine)}
+  .node[data-node=inferlet]{--accent:var(--inferlet)}
+
+  /* engine wraps the inferlet to show hosting */
+  .engine-wrap{border:1px dashed #394056;border-radius:15px;padding:12px;background:#14171f}
+  .engine-wrap > .lead{font:600 11px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+    color:var(--engine);display:flex;justify-content:space-between;align-items:center;margin:2px 4px 12px}
+  .engine-wrap > .lead .note{color:var(--ink-faint);text-transform:none;letter-spacing:0;font-weight:500}
+
+  /* dim / highlight states driven by walkthrough */
+  .col.playing .node{opacity:.4}
+  .col.playing .node.hot{opacity:1}
+  path.edge{fill:none;stroke:#8b93a8;stroke-width:2.5;opacity:.9;pointer-events:stroke;cursor:pointer;
+    transition:stroke .12s,opacity .12s,stroke-width .12s}
+  path.edge.data{stroke-dasharray:1 0}
+  path.edge.hover{stroke:#c2c9d8;stroke-width:3.5;opacity:1}
+  path.edge.sel{stroke:var(--hot);stroke-width:3.75;opacity:1}
+  path.hit{fill:none;stroke:transparent;stroke-width:24;pointer-events:stroke;cursor:pointer}
+  #edges.playing path.edge{opacity:.16;cursor:default}
+  #edges.playing path.edge.hot{opacity:1;stroke:var(--hot);stroke-width:3.25}
+  .elabel{position:absolute;z-index:3;transform:translate(-50%,-50%);
+    font:600 11px/1.25 var(--mono);color:var(--ink-dim);background:#0f1117cc;
+    padding:3px 7px;border:1px solid var(--line);border-radius:7px;white-space:nowrap;
+    pointer-events:none;text-align:center}
+  .elabel .lo{display:none;color:var(--ink-faint);font-weight:500}
+  body.mode-contrib .elabel .lo{display:block}
+
+  /* info panel */
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;
+    padding:18px 20px;position:sticky;top:18px;align-self:start}
+  .panel .ptag{font:600 11px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--accent,#8a91a6)}
+  .panel h2{margin:8px 0 8px;font-size:18px}
+  .panel p{margin:0 0 10px;font-size:14px;color:var(--ink)}
+  .panel .tech{display:none;border-top:1px solid var(--line);margin-top:12px;padding-top:12px}
+  body.mode-contrib .panel .tech{display:block}
+  .panel .tech h4{margin:14px 0 6px;font-size:12px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.06em}
+  .panel .tech h4:first-child{margin-top:0}
+  .panel .chain{font:500 11.5px/1.65 var(--mono);color:var(--ink-dim);background:#0c0e14;
+    border:1px solid var(--line);border-left:2px solid var(--accent,#8a91a6);border-radius:7px;
+    padding:7px 9px;margin:0 0 6px;word-break:break-word}
+  .panel .chain:last-child{margin-bottom:0}
+  .panel .chain b{color:var(--ink);font-weight:600}
+  .panel .src{font:500 11.5px/1.55 var(--mono);color:var(--ink-faint);word-break:break-word}
+  .panel .kv{font:500 12.5px/1.7 var(--mono);color:var(--ink-dim)}
+  .panel .kv code{color:var(--ink);background:#0c0e14;border:1px solid var(--line);
+    border-radius:5px;padding:1px 5px}
+
+  /* walkthrough */
+  .walk{margin-top:22px;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px 18px}
+  .walk .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  .walk .scn{display:inline-flex;gap:6px;background:var(--panel-2);border:1px solid var(--line);border-radius:9px;padding:3px}
+  .walk .scn button{appearance:none;border:0;background:transparent;color:var(--ink-dim);
+    font:600 12.5px/1 var(--sans);padding:7px 12px;border-radius:6px;cursor:pointer}
+  .walk .scn button.on{background:#0c0e14;color:var(--ink)}
+  .walk .steps{margin-left:auto;display:flex;gap:8px;align-items:center}
+  .walk .steps button{appearance:none;cursor:pointer;background:var(--panel-2);
+    border:1px solid var(--line);color:var(--ink);width:34px;height:32px;border-radius:8px;font-size:15px}
+  .walk .steps button:disabled{opacity:.35;cursor:default}
+  .walk .count{font:600 12px/1 var(--mono);color:var(--ink-faint);min-width:46px;text-align:center}
+  .walk .cap{margin-top:12px;min-height:42px;font-size:14px;color:var(--ink)}
+  .walk .cap b{color:var(--hot)}
+  .walk .cap .n{font:600 12px var(--mono);color:var(--ink-dim)}
+  .walk .stepchain{display:none;margin-top:10px;font:500 11.5px/1.6 var(--mono);color:var(--ink-dim);
+    background:#0c0e14;border:1px solid var(--line);border-left:2px solid var(--hot);border-radius:8px;
+    padding:9px 11px;word-break:break-word}
+  body.mode-contrib .walk .stepchain{display:block}
+  .walk .stepchain b{color:var(--ink);font-weight:600}
+  .walk .stepchain .lead{color:var(--ink-faint);text-transform:uppercase;letter-spacing:.06em;font-size:10px;display:block;margin-bottom:3px}
+  footer{margin-top:34px;color:var(--ink-faint);font-size:12.5px}
+</style>
+</head>
+<body class="mode-user">
+<div class="wrap">
+  <header>
+    <h1>RatioThink — Architecture at a glance</h1>
+    <p class="sub">A native macOS app that runs the Pie inference engine locally and speaks it over an
+      OpenAI-compatible HTTP API. Four layers, three conversations between them. This is the visual
+      companion to <a href="ARCHITECTURE.md">ARCHITECTURE.md</a>.</p>
+  </header>
+
+  <div class="toolbar">
+    <div class="seg" id="viewToggle">
+      <button data-view="user" class="on">User view</button>
+      <button data-view="contrib">Contributor view</button>
+    </div>
+    <span class="hint">Click a box or a line to inspect it · run a walkthrough below</span>
+  </div>
+
+  <div class="grid">
+    <div class="diagram">
+      <svg id="edges"></svg>
+      <div class="col" id="col">
+        <div class="node" data-node="app">
+          <div class="tag">Front-end · SwiftUI</div>
+          <h3>RatioThink.app</h3>
+          <p>Everything you see: chat, model picker, profiles, settings, and the engine/model status surfaces.</p>
+          <div class="files">App/ · Shared/Persistence · Shared/Engine/EngineStatusStore</div>
+        </div>
+
+        <div class="node" data-node="helper">
+          <div class="tag">Background · menu bar</div>
+          <h3>RatioThinkHelper</h3>
+          <p>A small agent that lives in the menu bar and keeps the engine running — even across app restarts. Owns profiles and downloads.</p>
+          <div class="files">Helper/HelperMain.swift · App/Services/LoginItemRegistrar</div>
+        </div>
+
+        <div class="engine-wrap" id="engineWrap">
+          <div class="lead"><span>pie runtime</span><span class="note">hosts the inferlet next to the model</span></div>
+          <div class="node" data-node="engine">
+            <div class="tag">Engine · pie serve</div>
+            <h3>pie engine</h3>
+            <p>Loads the model at startup, runs the forward pass, and exposes a control plane. Bundled and supervised by RatioThink.</p>
+            <div class="files">Vendor/pie · Shared/Engine/PieControlLauncher · PieEngineHost</div>
+          </div>
+          <div class="node" data-node="inferlet" style="margin-top:14px">
+            <div class="tag">Inferlet · wasm</div>
+            <h3>chat-apc</h3>
+            <p>The one inferlet RatioThink ships. Turns pie into an OpenAI-style HTTP API — serving both chat and the model/health endpoints.</p>
+            <div class="files">Inferlets/chat-apc/src/lib.rs · src/chat · src/control</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <aside class="panel" id="panel">
+      <!-- filled by JS -->
+    </aside>
+  </div>
+
+  <div class="walk">
+    <div class="row">
+      <div class="scn" id="scn">
+        <button data-scn="cold" class="on">▶ Cold start</button>
+        <button data-scn="send">▶ Send a message</button>
+      </div>
+      <div class="steps">
+        <button id="prev" title="Previous">‹</button>
+        <span class="count" id="count">–</span>
+        <button id="next" title="Next">›</button>
+        <button id="reset" title="Exit walkthrough" style="width:auto;padding:0 12px;font-size:12.5px;font-weight:600">Explore</button>
+      </div>
+    </div>
+    <div class="cap" id="cap">Pick a walkthrough and step through it, or just click around the diagram.</div>
+  </div>
+
+  <footer>Self-contained — no server, no network. Source of truth: <code>ARCHITECTURE.md</code> and the files it points to.</footer>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ---- content model (kept parallel to ARCHITECTURE.md, not a superset) ----
+  var css=function(v){return getComputedStyle(document.documentElement).getPropertyValue(v);};
+  var NODES = {
+    app:{accent:css('--app'),
+      tag:"Front-end · SwiftUI", title:"RatioThink.app",
+      user:"The SwiftUI front end. It owns every user action — typing a message, picking a model, switching profiles, changing settings — and shows engine and model status. It never runs the model itself: it talks to the engine directly for chat and only asks the helper to manage the engine's lifecycle.",
+      facts:[["Owns","chat UI, persistence (SwiftData), the direct HTTP link to the engine"],
+             ["Status","poll-only — EngineStatusStore polls engineStatus() ~1 Hz; the app never starts the engine"]],
+      calls:["<b>Send:</b> ComposerView.submit() → ChatScaffoldView.sendAssistantTurn(for:) → ChatSendController.send(…) → HTTPEngineClient.chatCompletion(_:)",
+             "<b>Status:</b> EngineStatusStore poll → HelperXPCClient.engineStatus() → on .running(port) → requireBaseURL()"],
+      files:["App/RatioThinkApp.swift","App/Views/Chat/","Shared/Persistence/ChatSendController.swift","Shared/Engine/EngineStatusStore.swift"]},
+    helper:{accent:css('--helper'),
+      tag:"Background · menu bar", title:"RatioThinkHelper",
+      user:"A menu-bar background agent. It starts, supervises, and stops the pie engine, and manages the on-disk model profiles and downloads. It keeps running when the app is closed — and on boot it auto-resumes the last active profile, so the engine comes up with no user action.",
+      facts:[["Launched as","launchd agent via SMAppService (not a login item)"],
+             ["Mach service","com.ratiothink.helper"],
+             ["Owns","PieEngineHost (engine lifecycle), ProfileStore, ModelDownloader"]],
+      calls:["<b>Boot auto-resume:</b> HelperMain.autoResumeEngineOnBoot() → HelperResumeAction.run(engineHost:profileStore:resolver:) → resolver(profileID) → PieEngineHost.start(spec)",
+             "<b>XPC impl:</b> HelperExportedAPI implements engineStatus / startEngine / stopEngine / downloadModel / listProfiles"],
+      files:["Helper/HelperMain.swift","Shared/XPC/HelperExportedAPI.swift","Shared/HelperResumeAction.swift"]},
+    engine:{accent:css('--engine'),
+      tag:"Engine · pie serve", title:"pie engine (pie serve)",
+      user:"The inference engine, bundled inside the app. It loads the chosen model at startup, runs the actual token generation, and hosts small WebAssembly programs (inferlets) right next to the model.",
+      facts:[["Spawned as","pie serve --config &lt;toml&gt; --no-auth --debug (PIE_HOME, PIE_SHMEM_NAME)"],
+             ["Model","loads at boot from config [[model]].hf_repo — no runtime load call"],
+             ["Control plane","WebSocket, MessagePack RPC (auth / install / launch)"]],
+      calls:["<b>Launch:</b> PieEngineHost.start(spec) → doStart(spec) → PieControlLauncher.launch(spec:) → spawn pie serve; parse stdout “serving on host:port” + “internal token”",
+             "<b>Teardown:</b> SIGINT → 10 s grace → SIGKILL → shm_unlink(PIE_SHMEM_NAME)"],
+      files:["Vendor/pie/","Shared/Engine/PieControlLauncher.swift","Shared/Engine/PieEngineHost.swift","Shared/Engine/LaunchSpecResolver.swift"]},
+    inferlet:{accent:css('--inferlet'),
+      tag:"Inferlet · wasm", title:"chat-apc (wasm)",
+      user:"The only inferlet RatioThink ships. pie installs it at startup and routes HTTP requests to it. It presents the OpenAI-compatible endpoints — chat completions plus health and model listing — so any OpenAI client can talk to your local engine.",
+      facts:[["Serves","/healthz · /v1/models · /v1/chat/completions · /v1/models/load · /v1/inferlet"],
+             ["APC","Adaptive Personality/Capability decoders. Reasoning active; the tool-use decoder is fully implemented (emits OpenAI tool_calls when a request supplies a tools array) but the v1 app never sends tools, so it stays dormant in the shipping product."],
+             ["Note","ONE inferlet for both planes — there is no separate pie-control inferlet"]],
+      calls:["<b>Route:</b> lib.rs match (method, path) → chat::completions::handle / control::{health,models,load}",
+             "<b>Install:</b> wasm staged via Shared/InferletResources, uploaded by PieControlClient.installProgram + launchDaemon"],
+      files:["Inferlets/chat-apc/src/lib.rs","src/chat/completions.rs","src/chat/apc.rs","src/control/load.rs"]}
+  };
+
+  var EDGES = {
+    xpc:{from:"app",to:"helper",side:"left",
+      hi:"XPC · control", lo:"NSXPC · Codable→Data",
+      title:"App ↔ Helper — XPC control plane", accent:NODES.helper.accent,
+      user:"The app asks the helper to do privileged, long-lived work — stop the engine, download a model, list profiles — and polls “is the engine up, and on what port?” about once a second. The app is poll-only; the helper auto-resumes the engine itself.",
+      facts:[["Transport","NSXPCConnection → mach service com.ratiothink.helper"],
+             ["Protocol","@objc(PieHelperXPC); payloads Codable→Data via XPCPayload (JSON: sortedKeys, ISO-8601, base64)"],
+             ["Direction","pull, not push — the helper does not stream status changes"]],
+      calls:["<b>Selectors:</b> engineStatus (polled) · startEngine(profileID:) · stopEngine · downloadModel(repo:file:) · listProfiles · tailLog",
+             "<b>App side:</b> HelperXPCClient.engineStatus() / .stopEngine() (AppXPCClient)",
+             "<b>Helper side:</b> HelperExportedAPI.startEngine(profileID:reply:) → PieEngineHost.start(spec)"],
+      files:["Shared/XPC/PieHelperXPC.swift","Shared/XPC/AppXPCClient.swift","Shared/XPC/HelperXPCListener.swift","Shared/XPC/HelperExportedAPI.swift"]},
+    launch:{from:"helper",to:"engine",side:"left",
+      hi:"launch + WS control", lo:"spawn · install chat-apc",
+      title:"Helper ↔ pie — launch + WebSocket control", accent:NODES.engine.accent,
+      user:"The helper starts the engine as a child process, waits for it to announce itself on stdout, then over a WebSocket hands it the chat-apc inferlet and tells it which port to listen on. On shutdown it stops the process cleanly.",
+      facts:[["Spawn","pie serve --config &lt;config.toml&gt; --no-auth --debug (PIE_HOME, PIE_SHMEM_NAME)"],
+             ["Handshake","reads stdout: “pie-server serving on host:port” + “internal token: …”"],
+             ["Wire","WebSocket, MessagePack request/response keyed by corr_id"]],
+      calls:["<b>Launch:</b> PieEngineHost.start(spec) → PieControlLauncher.launch(spec:)",
+             "<b>WS RPC:</b> PieControlClient.connect() → authByToken(token) → installProgram(wasmURL:) → launchDaemon(inferlet:port:)",
+             "<b>Resolve model:</b> LaunchSpecResolver builds the LaunchSpec (app-staged path or HF cache)"],
+      files:["Shared/Engine/PieEngineHost.swift","Shared/Engine/PieControlLauncher.swift","Shared/Engine/PieControlClient.swift","Shared/Engine/LaunchSpecResolver.swift"]},
+    http:{from:"app",to:"inferlet",side:"right",
+      hi:"HTTP + SSE · data", lo:"loopback · bypasses helper",
+      title:"App ↔ engine — HTTP + SSE data plane", accent:NODES.app.accent,
+      user:"Chat does NOT go through the helper. The app connects straight to the engine on a local port and uses ordinary OpenAI-style HTTP; replies stream back token by token over Server-Sent Events.",
+      facts:[["Target","127.0.0.1:&lt;port&gt; — port from EngineStatus.running(port:)"],
+             ["Chat","POST /v1/chat/completions → SSE: {event:model_ready} → chat.completion.chunk → data:[DONE]"],
+             ["Also","GET /healthz · GET /v1/models · POST /v1/models/load (instant — model loaded at boot)"]],
+      calls:["<b>Request:</b> ChatSendController.send(…) → EngineClient.chatCompletion(req) → HTTPEngineClient.chatCompletion(_:) → baseURLProvider()",
+             "<b>Stream sink:</b> AsyncThrowingStream&lt;ChatEvent&gt; → MessageStreamWriter.appendDelta() → flush() → SwiftData"],
+      files:["Shared/Engine/HTTPEngineClient.swift","Shared/Engine/EngineClient.swift","Shared/Persistence/ChatSendController.swift","Shared/Persistence/MessageStreamWriter.swift"]}
+  };
+
+  var SCN = {
+    cold:{name:"Cold start", steps:[
+      {nodes:["helper"],edges:[],focus:{node:"helper"},
+       cap:'The helper boots as a launchd agent and <b>auto-resumes</b> the last active profile. The app never starts the engine — it is poll-only.',
+       chain:'HelperMain.autoResumeEngineOnBoot() → HelperResumeAction.run(engineHost:profileStore:resolver:) → resolver(profileID) → <b>PieEngineHost.start(spec)</b>'},
+      {nodes:["helper","engine"],edges:["launch"],focus:{edge:"launch"},
+       cap:'The host launches <span class="n">pie serve</span> and waits for the stdout handshake (serving address + internal token).',
+       chain:'PieEngineHost.start → doStart(spec) → <b>PieControlLauncher.launch(spec:)</b> → spawn pie serve --config &lt;toml&gt; --no-auth --debug'},
+      {nodes:["engine","inferlet"],edges:["launch"],focus:{edge:"launch"},
+       cap:'Over the WebSocket it installs <span class="n">chat-apc</span> and binds its HTTP listener. The model is already loaded from the config at boot.',
+       chain:'PieControlClient.connect() → authByToken(token) → <b>installProgram(wasmURL:)</b> → launchDaemon(inferlet:port:) ⇒ host → .running(port)'},
+      {nodes:["app","helper"],edges:["xpc"],focus:{edge:"xpc"},
+       cap:'The app’s status poll picks up <span class="n">.running(port)</span> and resolves the loopback base URL. Ready to chat.',
+       chain:'EngineStatusStore poll → HelperXPCClient.engineStatus() → PieHelperXPC.engineStatus → .running(port) → <b>requireBaseURL()</b> ⇒ http://127.0.0.1:&lt;port&gt;'}
+    ]},
+    send:{name:"Send a message", steps:[
+      {nodes:["app","inferlet"],edges:["http"],focus:{edge:"http"},
+       cap:'You hit Return. The app POSTs <span class="n">/v1/chat/completions</span> straight to the engine’s loopback port — <b>not</b> through the helper.',
+       chain:'ComposerView.submit() → ChatScaffoldView.sendAssistantTurn(for:) → ChatSendController.send(…) → EngineClient.chatCompletion(req) → <b>HTTPEngineClient.chatCompletion(_:)</b> → POST /v1/chat/completions'},
+      {nodes:["inferlet","app"],edges:["http"],focus:{edge:"http"},
+       cap:'<span class="n">chat-apc</span> streams Server-Sent Events back: a <span class="n">model_ready</span> frame, then OpenAI <span class="n">chat.completion.chunk</span> deltas.',
+       chain:'pie routes request → chat-apc lib.rs → <b>chat::completions::handle</b> → SSE {event:model_ready} → chat.completion.chunk deltas → data:[DONE]'},
+      {nodes:["app"],edges:["http"],focus:{edge:"http"},
+       cap:'Each delta is flushed into the assistant message; the transcript re-renders live until <span class="n">data:[DONE]</span>.',
+       chain:'ChatSendController consumes AsyncThrowingStream&lt;ChatEvent&gt; → <b>MessageStreamWriter.appendDelta()</b> → flush() (250 ms) → SwiftData → TranscriptView re-render → finish()'}
+    ]}
+  };
+
+  // ---- DOM refs ----
+  var body=document.body, svg=document.getElementById('edges'),
+      col=document.getElementById('col'), diagram=document.querySelector('.diagram'),
+      panel=document.getElementById('panel'), cap=document.getElementById('cap'),
+      countEl=document.getElementById('count');
+  var nodeEls={}; Array.prototype.forEach.call(document.querySelectorAll('.node'),function(n){nodeEls[n.dataset.node]=n;});
+  var edgePaths={}, edgeHits={}, edgeLabels={};
+  var selKind=null, selId=null;     // current inspected node/edge
+  var scnId=null, stepIx=-1;        // walkthrough state
+
+  // ---- build edge SVG paths + labels once ----
+  // Each edge has a visible path, a fat transparent hit path on top, and an
+  // HTML label — ALL three select the edge on click and brighten it on hover.
+  var SVGNS='http://www.w3.org/2000/svg';
+  Object.keys(EDGES).forEach(function(id){
+    var p=document.createElementNS(SVGNS,'path');
+    p.setAttribute('class','edge'+(id==='http'?' data':''));
+    var hit=document.createElementNS(SVGNS,'path');
+    hit.setAttribute('class','hit');
+    svg.appendChild(p); svg.appendChild(hit);
+    edgePaths[id]=p; edgeHits[id]=hit;
+    var lab=document.createElement('div'); lab.className='elabel';
+    lab.innerHTML='<span class="hi">'+EDGES[id].hi+'</span><span class="lo">'+EDGES[id].lo+'</span>';
+    lab.style.pointerEvents='auto'; lab.style.cursor='pointer';
+    diagram.appendChild(lab); edgeLabels[id]=lab;
+    function pick(e){e.stopPropagation();selectEdge(id);}
+    function over(){if(!scnId)p.classList.add('hover');}
+    function out(){p.classList.remove('hover');}
+    [p,hit,lab].forEach(function(el){
+      el.addEventListener('click',pick);
+      el.addEventListener('mouseenter',over);
+      el.addEventListener('mouseleave',out);
+    });
+  });
+
+  function center(el,host){var r=el.getBoundingClientRect(),h=host.getBoundingClientRect();
+    return {l:r.left-h.left,t:r.top-h.top,w:r.width,h:r.height};}
+
+  function layout(){
+    var host=diagram.getBoundingClientRect();
+    svg.setAttribute('viewBox','0 0 '+host.width+' '+host.height);
+    Object.keys(EDGES).forEach(function(id){
+      var e=EDGES[id], A=center(nodeEls[e.from],diagram), B=center(nodeEls[e.to],diagram);
+      var ax,ay,bx,by,cx1,cx2,mx,my;
+      if(e.side==='left'){
+        ax=A.l; ay=A.t+A.h/2; bx=B.l; by=B.t+B.h/2;
+        var bow=Math.min(46, 24+Math.abs(by-ay)*0.12);
+        cx1=ax-bow; cx2=bx-bow; mx=Math.min(ax,bx)-bow*0.92;
+        edgePaths[id].setAttribute('d','M'+ax+','+ay+' C'+cx1+','+ay+' '+cx2+','+by+' '+bx+','+by);
+      }else{ // right side data edge: down the right margin
+        ax=A.l+A.w; ay=A.t+A.h/2; bx=B.l+B.w; by=B.t+B.h/2;
+        var bow2=Math.min(70, 34+Math.abs(by-ay)*0.10);
+        cx1=ax+bow2; cx2=bx+bow2; mx=Math.max(ax,bx)+bow2*0.92;
+        edgePaths[id].setAttribute('d','M'+ax+','+ay+' C'+cx1+','+ay+' '+cx2+','+by+' '+bx+','+by);
+      }
+      edgeHits[id].setAttribute('d',edgePaths[id].getAttribute('d'));
+      my=(ay+by)/2;
+      // keep the (translateX(-50%)) label fully inside the diagram box
+      var lw=edgeLabels[id].offsetWidth||100, half=lw/2+8;
+      mx=Math.max(half,Math.min(host.width-half,mx));
+      edgeLabels[id].style.left=mx+'px'; edgeLabels[id].style.top=my+'px';
+    });
+  }
+
+  // ---- inspection panel ----
+  function kvRows(arr){return arr.map(function(kv){
+    return '<div class="kv"><b style="color:var(--ink)">'+kv[0]+':</b> '+kv[1]+'</div>';}).join('');}
+  function chainRows(arr){return arr.map(function(c){return '<div class="chain">'+c+'</div>';}).join('');}
+  function srcRow(arr){return '<div class="src">'+arr.join(' · ')+'</div>';}
+  function techBlock(factsLabel,facts,callsLabel,calls,files){
+    return '<div class="tech"><h4>'+factsLabel+'</h4>'+kvRows(facts)+
+      '<h4>'+callsLabel+'</h4>'+chainRows(calls)+
+      '<h4>Source</h4>'+srcRow(files)+'</div>';}
+  function showNode(id){var n=NODES[id];
+    panel.style.setProperty('--accent',n.accent);
+    panel.innerHTML='<div class="ptag">'+n.tag+'</div><h2>'+n.title+'</h2><p>'+n.user+'</p>'+
+      techBlock('Key facts',n.facts,'Call paths',n.calls,n.files);}
+  function showEdge(id){var e=EDGES[id];
+    panel.style.setProperty('--accent',e.accent);
+    panel.innerHTML='<div class="ptag">connection</div><h2>'+e.title+'</h2><p>'+e.user+'</p>'+
+      techBlock('Mechanism',e.facts,'Key calls',e.calls,e.files);}
+  function showIntro(){panel.style.setProperty('--accent','#8a91a6');
+    panel.innerHTML='<div class="ptag">overview</div><h2>Three conversations</h2>'+
+      '<p>The app talks to the <b style="color:var(--helper)">helper</b> over XPC to manage the engine, '+
+      'the helper <b style="color:var(--engine)">launches pie</b> and installs the inferlet, and the app '+
+      'talks <b style="color:var(--app)">straight to the engine</b> over HTTP for chat.</p>'+
+      '<p style="color:var(--ink-dim);font-size:13px">Click any <b>box</b> or <b>connector line</b> to inspect it. Switch to <b>Contributor view</b> for the concrete call paths, protocols, and source files — including each walkthrough step.</p>';}
+
+  function clearSel(){
+    if(selKind==='node'&&nodeEls[selId])nodeEls[selId].classList.remove('sel');
+    if(selKind==='edge'&&edgePaths[selId]){edgePaths[selId].classList.remove('sel');edgePaths[selId].classList.remove('hover');}
+    selKind=selId=null;
+  }
+  function selectNode(id){if(scnId)return; clearSel(); selKind='node';selId=id;
+    nodeEls[id].classList.add('sel'); showNode(id);}
+  function selectEdge(id){if(scnId)return; clearSel(); selKind='edge';selId=id;
+    edgePaths[id].classList.remove('hover'); edgePaths[id].classList.add('sel'); showEdge(id);}
+
+  Object.keys(nodeEls).forEach(function(id){
+    nodeEls[id].addEventListener('click',function(e){e.stopPropagation();selectNode(id);});});
+  diagram.addEventListener('click',function(){if(!scnId){clearSel();showIntro();}});
+
+  // ---- view toggle ----
+  document.getElementById('viewToggle').addEventListener('click',function(e){
+    var b=e.target.closest('button'); if(!b)return;
+    body.className='mode-'+(b.dataset.view==='contrib'?'contrib':'user');
+    Array.prototype.forEach.call(this.querySelectorAll('button'),function(x){x.classList.toggle('on',x===b);});
+    layout();
+  });
+
+  // ---- walkthrough ----
+  function applyStep(){
+    var playing=!!scnId;
+    col.classList.toggle('playing',playing);
+    svg.classList.toggle('playing',playing);
+    Object.keys(nodeEls).forEach(function(id){nodeEls[id].classList.remove('hot');});
+    Object.keys(edgePaths).forEach(function(id){edgePaths[id].classList.remove('hot');edgePaths[id].classList.remove('hover');});
+    if(!playing){countEl.textContent='–';return;}
+    var steps=SCN[scnId].steps, st=steps[stepIx];
+    (st.nodes||[]).forEach(function(id){if(nodeEls[id])nodeEls[id].classList.add('hot');});
+    (st.edges||[]).forEach(function(id){if(edgePaths[id])edgePaths[id].classList.add('hot');});
+    cap.innerHTML='<span class="n">'+SCN[scnId].name+' · '+(stepIx+1)+'/'+steps.length+'</span> &nbsp; '+st.cap+
+      (st.chain?'<div class="stepchain"><span class="lead">call path</span>'+st.chain+'</div>':'');
+    countEl.textContent=(stepIx+1)+' / '+steps.length;
+    document.getElementById('prev').disabled=(stepIx===0);
+    document.getElementById('next').disabled=(stepIx===steps.length-1);
+  }
+  function startScn(id){clearSel(); scnId=id; stepIx=0;
+    Array.prototype.forEach.call(document.querySelectorAll('#scn button'),function(b){b.classList.toggle('on',b.dataset.scn===id);});
+    applyStep(); panelForStep(SCN[id].steps[0]);}
+  function panelForStep(st){ // panel follows the step: its edge if it has one, else its node
+    if(st.focus&&st.focus.edge)showEdge(st.focus.edge);
+    else if(st.focus&&st.focus.node)showNode(st.focus.node);
+    else if(st.edges&&st.edges[0])showEdge(st.edges[0]);
+    else if(st.nodes&&st.nodes[0])showNode(st.nodes[0]);}
+  function stopScn(){scnId=null;stepIx=-1;
+    Array.prototype.forEach.call(document.querySelectorAll('#scn button'),function(b){b.classList.remove('on');});
+    cap.innerHTML='Pick a walkthrough and step through it, or just click around the diagram.';
+    applyStep(); showIntro();}
+
+  document.getElementById('scn').addEventListener('click',function(e){
+    var b=e.target.closest('button'); if(!b)return; startScn(b.dataset.scn);});
+  document.getElementById('next').addEventListener('click',function(){
+    if(scnId&&stepIx<SCN[scnId].steps.length-1){stepIx++;applyStep();panelForStep(SCN[scnId].steps[stepIx]);}});
+  document.getElementById('prev').addEventListener('click',function(){
+    if(scnId&&stepIx>0){stepIx--;applyStep();panelForStep(SCN[scnId].steps[stepIx]);}});
+  document.getElementById('reset').addEventListener('click',stopScn);
+  document.addEventListener('keydown',function(e){
+    if(!scnId)return;
+    if(e.key==='ArrowRight')document.getElementById('next').click();
+    if(e.key==='ArrowLeft')document.getElementById('prev').click();
+    if(e.key==='Escape')stopScn();});
+
+  // ---- init ----
+  showIntro();
+  function relayout(){layout();}
+  window.addEventListener('resize',relayout);
+  // fonts/layout may settle a tick after load
+  if(document.readyState==='complete')requestAnimationFrame(layout);
+  else window.addEventListener('load',function(){requestAnimationFrame(layout);});
+  requestAnimationFrame(layout);
+})();
+</script>
+</body>
+</html>

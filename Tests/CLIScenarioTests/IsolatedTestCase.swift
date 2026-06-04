@@ -139,6 +139,13 @@ open class IsolatedTestCase: XCTestCase {
     trackedPIDs.append(pid)
   }
 
+  /// Count of pids currently queued for the post-test reap. Test-only
+  /// observability (mirrors `PieEngineHost.observerCountForTesting`) so a
+  /// subclass can assert it actually routed its spawned engine pid into
+  /// the reap net via `trackSubprocess(_:)` — engine-free, no real spawn
+  /// required (the pid-reap wiring guard).
+  internal var trackedSubprocessCountForTesting: Int { trackedPIDs.count }
+
   /// Build env for spawning the pie binary. Callers MUST pass this to
   /// `Process.environment` (never inherit). The base is the parent
   /// process env passed through `SpawnEnvSanitizer.sanitize` — single

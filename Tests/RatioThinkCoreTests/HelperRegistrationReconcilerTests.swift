@@ -68,6 +68,11 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
       ["PIE_TEST_FAKE_DOWNLOADS": "1"],
       ["PIE_TEST_FIRST_LAUNCH_COMPLETED": "1"],          // GUI configureCompletedFirstLaunch
       ["PIE_TEST_SKIP_HELPER_RECONCILE": "1"],
+      // #412: the app code runs IN-PROCESS inside a unit-test host, where
+      // XCTest sets this — must suppress SMAppService side effects + the
+      // runtime helper-restart ladder so a plain `xcodebuild test` never
+      // mutates the machine's background-item registration.
+      ["XCTestConfigurationFilePath": "/tmp/Foo.xctestconfiguration"],
     ]
     for env in seams {
       XCTAssertTrue(HelperRegistrationReconciler.isTestLaunch(env),
@@ -161,5 +166,24 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
     let outcome = await h.makeReconciler().reconcile()
     XCTAssertEqual(outcome, .repaired)
     XCTAssertEqual(h.registerCalls, 1)
+  }
+
+  // MARK: - Outcome → reachable mapping (#412, runtime repair ladder)
+
+  func test_outcome_helperReachable_mapping() {
+    // The signal HelperHealthController feeds back as repairFinished(reachable:).
+    XCTAssertTrue(HelperRegistrationReconciler.Outcome.healthy.helperReachable)
+    XCTAssertTrue(HelperRegistrationReconciler.Outcome.repaired.helperReachable)
+    XCTAssertTrue(HelperRegistrationReconciler.Outcome.registered.helperReachable)
+    XCTAssertFalse(HelperRegistrationReconciler.Outcome.needsApproval.helperReachable,
+                   "needsApproval is a user-consent gate, NOT a recovered helper — the ladder must escalate")
+    XCTAssertFalse(HelperRegistrationReconciler.Outcome.repairFailed("x").helperReachable)
+  }
+
+  func test_outcome_requiresUserApproval_only_for_needsApproval() {
+    XCTAssertTrue(HelperRegistrationReconciler.Outcome.needsApproval.requiresUserApproval)
+    for o: HelperRegistrationReconciler.Outcome in [.healthy, .repaired, .registered, .repairFailed("x")] {
+      XCTAssertFalse(o.requiresUserApproval, "\(o) must not route to System Settings")
+    }
   }
 }

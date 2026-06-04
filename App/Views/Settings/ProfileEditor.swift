@@ -13,12 +13,17 @@ struct ProfileEditor: View {
   var onModelChanged: () -> Void = {}
   @EnvironmentObject private var profileStore: ProfileStore
   @State private var showAdvanced: Bool = false
-  @State private var installedModels: [String] = []
+  /// Discovered model options (app-managed + HF cache), each carrying
+  /// size + over-limit / unsupported state for the model-size guardrail.
+  @State private var modelOptions: [ProfileModelOptions.Option] = []
+  /// Guardrail policy (ceiling), shown in the "exceeds …" reason on
+  /// over-limit options. `nil` until the first scan.
+  @State private var memoryPolicy: ModelMemoryGuardrail.Policy?
   @State private var modelWriteError: String?
-  /// Set when `InstalledModels.scan` throws ( F2). Without this the
-  /// picker silently rendered empty on a scan failure, so a permission
-  /// glitch on the models dir looked like "no models installed".
-  /// Mirrors `ModelsSettingsTab`'s `scanError` surfacing.
+  /// Set when the model scan throws. Without this the picker silently
+  /// rendered empty on a scan failure, so a permission glitch on the
+  /// models dir looked like "no models installed". Mirrors
+  /// `ModelsSettingsTab`'s `scanError` surfacing.
   @State private var modelScanError: String?
 
   var body: some View {
@@ -44,7 +49,7 @@ struct ProfileEditor: View {
       .padding(20)
     }
     .accessibilityIdentifier("ProfileEditor")
-    .task { await refreshInstalledModels() }
+    .task { await refreshModelOptions(current: entry.profile?.model ?? "") }
   }
 
   // MARK: - Sections
@@ -88,25 +93,28 @@ struct ProfileEditor: View {
     }
   }
 
-  /// Pull-down of installed GGUF models (+ the profile's current model
-  /// even if uninstalled). Selecting a model persists it as the
-  /// profile's default via `ProfileStore.setModel`. This is a default
-  /// for the swap-confirm PRE-FILL only — it never triggers a load.
+  /// Pull-down of discovered models — app-managed GGUF + Hugging Face
+  /// cache (safetensors/GGUF) — plus the profile's current model even
+  /// if uninstalled. Each row shows its resolved size; a model that
+  /// exceeds the guardrail ceiling, or that the engine can't load (a
+  /// split GGUF), is disabled with a reason since selecting it could
+  /// never launch. Selecting a model persists it as the profile's
+  /// default via `ProfileStore.setModel`. This is a default for the
+  /// swap-confirm PRE-FILL only — it never triggers a load.
   private func modelPicker(profile: Profile) -> some View {
     Menu {
-      ForEach(ProfileModelOptions.merge(installed: installedModels,
-                                        current: profile.model), id: \.self) { model in
+      ForEach(modelOptions) { option in
         Button {
-          persistModel(model, profileID: profile.id)
+          persistModel(option.slug, profileID: profile.id)
         } label: {
           // Value is the resolvable slug; label is the friendly leaf
-          // ( review v2 F1).
-          if model == profile.model {
-            Label(ModelDisplayName.leaf(model), systemImage: "checkmark")
-          } else {
-            Text(ModelDisplayName.leaf(model))
-          }
+          // plus size + over-limit / unsupported reason.
+          modelOptionLabel(option)
         }
+        // Block selecting an unloadable model — over-limit (too large for
+        // this host) or unsupported (a split GGUF the engine can't load)
+        // — but never the current value, which stays a no-op.
+        .disabled((option.isOverLimit || option.unsupportedReason != nil) && !option.isCurrent)
       }
     } label: {
       HStack(spacing: 4) {
@@ -117,6 +125,35 @@ struct ProfileEditor: View {
     .menuStyle(.borderlessButton)
     .fixedSize()
     .accessibilityIdentifier("ProfileEditorModelPicker")
+  }
+
+  @ViewBuilder
+  private func modelOptionLabel(_ option: ProfileModelOptions.Option) -> some View {
+    let text = modelOptionText(option)
+    if option.isCurrent {
+      Label(text, systemImage: "checkmark")
+    } else if option.isOverLimit || option.unsupportedReason != nil {
+      Label(text, systemImage: "exclamationmark.triangle")
+    } else {
+      Text(text)
+    }
+  }
+
+  /// "<leaf>  <size>" plus "— exceeds <limit> limit" when the model is
+  /// too large for this host, or "— <reason>" when the engine can't load
+  /// it at all. Size is omitted when unknown (the synthesized
+  /// current-model entry).
+  private func modelOptionText(_ option: ProfileModelOptions.Option) -> String {
+    var text = option.displayName
+    if let size = option.sizeBytes {
+      text += "  \(InstalledModels.formattedSize(size))"
+    }
+    if option.isOverLimit, let policy = memoryPolicy {
+      text += " — exceeds \(InstalledModels.formattedSize(policy.maxResolvedModelBytes)) limit"
+    } else if let reason = option.unsupportedReason {
+      text += " — \(reason)"
+    }
+    return text
   }
 
   private func systemPromptSection(_ prompt: String) -> some View {
@@ -220,19 +257,19 @@ struct ProfileEditor: View {
   }
 
   @MainActor
-  private func refreshInstalledModels() async {
-    do {
-      let dir = try PieDirs.models()
-      installedModels = try InstalledModels.scan(dir).map(\.filename)
-      modelScanError = nil
-    } catch {
-      //  F2: surface the failure instead of `try?`-swallowing to an
-      // empty picker. The current profile model still shows (merged in by
-      // `ProfileModelOptions.merge`); this just explains why the rest is
-      // missing.
-      installedModels = []
-      modelScanError = "Could not read installed models: \(error)"
-    }
+  private func refreshModelOptions(current: String) async {
+    let policy = ModelMemoryGuardrail.defaultPolicy
+    memoryPolicy = policy
+    // Filesystem walks (app dir + HF cache) run off the main actor. HF
+    // rows survive a models-dir prepare/scan failure; that failure still
+    // surfaces with its detail. The current model is merged in by
+    // `ProfileModelOptions.build`, so the picker is never silently empty.
+    let scan = await CachedModelScan.run()
+    modelOptions = ProfileModelOptions.build(
+      models: scan.appManaged + scan.huggingFaceCache,
+      current: current,
+      limitBytes: policy.maxResolvedModelBytes)
+    modelScanError = scan.appError
   }
 
   // MARK: - helpers

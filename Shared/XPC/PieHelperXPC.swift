@@ -35,6 +35,12 @@ public protocol PieHelperXPC {
   /// Reply data is `XPCPayload.encode(EngineStatus)`.
   func engineStatus(reply: @escaping (Data) -> Void)
 
+  /// Reply data is `XPCPayload.encode(EngineMemorySample?)` — a nil
+  /// sample decodes to "engine not running / RSS unavailable". A plain
+  /// `Data` reply (like `engineStatus`) so the interface needs no extra
+  /// allowed-class list.
+  func engineMemory(reply: @escaping (Data) -> Void)
+
   /// On success `successData` decodes to `EnginePort`; on failure
   /// `errorData` decodes to `EngineError`. Exactly one is non-nil.
   func startEngine(profileID: String,

@@ -129,6 +129,73 @@ final class ChatPersistenceTests: XCTestCase {
     XCTAssertEqual(message.content, "committed ", "cancel must drop the in-flight buffer")
   }
 
+  // MARK: - reasoning channel
+
+  func test_streamWriter_reasoning_persists_separately_from_content() throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    let message = Message(chat: chat, role: "assistant", content: "")
+    chat.messages.append(message)
+
+    let writer = MessageStreamWriter(context: context, message: message, flushInterval: 60)
+    // Mirror the wire order: reasoning streams first, then the answer.
+    writer.appendReasoningDelta("the user wants ")
+    writer.appendReasoningDelta("a greeting")
+    writer.appendDelta("Hello!")
+    writer.flush()
+
+    XCTAssertEqual(message.content, "Hello!", "answer channel holds only visible content")
+    XCTAssertEqual(message.reasoning, "the user wants a greeting",
+                   "reasoning channel holds thinking text, never mixed into content")
+    XCTAssertFalse(message.content.contains("the user wants"),
+                   "reasoning must not bleed into content")
+  }
+
+  func test_streamWriter_finish_flushes_reasoning_tail() throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    let message = Message(chat: chat, role: "assistant", content: "")
+    chat.messages.append(message)
+
+    let writer = MessageStreamWriter(context: context, message: message, flushInterval: 60)
+    writer.appendReasoningDelta("pondering")
+    writer.appendDelta("Done.")
+    writer.finish(tokens: 7)
+
+    XCTAssertEqual(message.content, "Done.")
+    XCTAssertEqual(message.reasoning, "pondering", "finish must flush the buffered reasoning tail")
+
+    // Post-finish reasoning deltas are ignored, same as content.
+    writer.appendReasoningDelta(" more")
+    XCTAssertEqual(message.reasoning, "pondering")
+  }
+
+  func test_exportJSON_carries_reasoning_as_separate_field_and_omits_when_empty() throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    let withReasoning = Message(role: "assistant", content: "Hi", reasoning: "thought", ts: Date(timeIntervalSince1970: 1))
+    let plain = Message(role: "assistant", content: "Yo", reasoning: "", ts: Date(timeIntervalSince1970: 2))
+    chat.messages.append(withReasoning)
+    chat.messages.append(plain)
+    try context.save()
+
+    let data = try RatioThinkModelContainer.exportJSON(from: context)
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let decoded = try decoder.decode([RatioThinkModelContainer.ExportedChat].self, from: data)
+    let messages = try XCTUnwrap(decoded.first).messages.sorted { $0.ts < $1.ts }
+
+    XCTAssertEqual(messages[0].reasoning, "thought", "reasoning exported as its own field, not folded into content")
+    XCTAssertEqual(messages[0].content, "Hi")
+    XCTAssertNil(messages[1].reasoning, "empty reasoning is omitted from the export")
+  }
+
   func test_streamWriter_timer_flushes_on_runloop_tick() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)

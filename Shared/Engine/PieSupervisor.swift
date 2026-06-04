@@ -199,6 +199,7 @@ public final class PieSupervisor: @unchecked Sendable {
     self.clock = clock
     #if DEBUG
     self.killProcessOverride = nil
+    self.livenessOverride = nil
     #endif
     self.stateQueue.setSpecific(key: self.stateQueueKey, value: ())
     // Sweep any persisted .killRejected manifest from a prior
@@ -223,13 +224,15 @@ public final class PieSupervisor: @unchecked Sendable {
                 recoveryManifestURL: URL? = nil,
                 processFactory: @escaping () -> Process = { Process() },
                 clock: @escaping () -> Date = Date.init,
-                killProcessOverride: @escaping (Process) -> Bool) {
+                killProcessOverride: @escaping (Process) -> Bool,
+                livenessOverride: ((Process) -> Bool)? = nil) {
     self.policy = policy
     self.providedLogURL = logFileURL
     self.providedRecoveryManifestURL = recoveryManifestURL
     self.processFactory = processFactory
     self.clock = clock
     self.killProcessOverride = killProcessOverride
+    self.livenessOverride = livenessOverride
     self.stateQueue.setSpecific(key: self.stateQueueKey, value: ())
     processBootRecovery()
   }
@@ -376,7 +379,7 @@ public final class PieSupervisor: @unchecked Sendable {
       Log.engine.error("PieSupervisor: clearKillRejected with no retained zombie reference; refusing")
       return false
     }
-    if process.isRunning {
+    if isProcessRunning(process) {
       Log.engine.fault("PieSupervisor: clearKillRejected denied — Process pid=\(pid, privacy: .public) still running")
       return false
     }
@@ -422,6 +425,17 @@ public final class PieSupervisor: @unchecked Sendable {
   private let clock: () -> Date
   #if DEBUG
   private let killProcessOverride: ((Process) -> Bool)?
+  /// Test-only seam parallel to `killProcessOverride`:
+  /// replaces the real `Process.isRunning` liveness probe consulted
+  /// by `clearKillRejectedLocked`. Lets a test drive the zombie
+  /// alive→dead transition synchronously instead of depending on a
+  /// real subprocess actually exiting AND being `wait4`-reaped —
+  /// timing that is arbitrarily delayed on a contended CI runner and
+  /// made `test_clearKillRejected_*` flake up to the 25s suite
+  /// timeout. Release builds strip both this storage AND the only
+  /// init that sets it, so production liveness always uses the real
+  /// `Process.isRunning` (review v5 F59 pid-reuse safety intact).
+  private let livenessOverride: ((Process) -> Bool)?
   #endif
 
   private let stateQueue = DispatchQueue(label: "com.ratiothink.supervisor.state", qos: .userInitiated)
@@ -504,6 +518,16 @@ public final class PieSupervisor: @unchecked Sendable {
   /// Pending stop-deadline timer (review v1 F5). Cancelled when
   /// terminationHandler fires within the deadline.
   private var stopDeadlineTimer: DispatchSourceTimer?
+  /// Incarnation whose SILENT handshake timer terminally stamped
+  /// `.failed(.handshakeTimeout)` (set only on that path, not the
+  /// malformed / carry-overflow kills — those SIGKILL a live child and
+  /// surface as `.uncaughtSignal`). If that same child's
+  /// terminationHandler later reports a real exit code
+  /// (`terminationReason == .exit`), the handshake timer won a race
+  /// against the reaper for a process that had already exited on its
+  /// own, and `handleTermination` reclassifies the failure as
+  /// `.spawnFailed`.
+  private var handshakeTimedOutIncID: UUID?
 
   private final class Incarnation {
     let id = UUID()
@@ -634,6 +658,28 @@ public final class PieSupervisor: @unchecked Sendable {
     timer.setEventHandler { [weak self, weak inc] in
       guard let self, let inc, !inc.handshakeFound else { return }
       guard self.current?.id == inc.id else { return }
+      // A process that has already exited before the handshake is an
+      // early-exit / spawn failure (it carries an exit code), NOT a
+      // handshake timeout — which specifically means "process alive
+      // but silent". Its `terminationHandler` is guaranteed to fire
+      // and `handleTermination` classifies it via the exit code as
+      // `.spawnFailed`. Defer to that path rather than racing it to a
+      // less precise label: under load the timer event can run before
+      // the (starved) termination callback, and `finishSpawnFailure`
+      // would otherwise stamp `.handshakeTimeout`, which the
+      // `.failed` priorState guard in `handleTermination` then refuses
+      // to correct. Keying on `Process.isRunning` (Foundation `wait4`
+      // truth for THIS child, flips false on reap) catches the
+      // already-reaped case here, but it is NOT fully deterministic: in
+      // the window after the child exits and before Foundation reaps it,
+      // `isRunning` still reads true and the timer proceeds to stamp
+      // `.handshakeTimeout`. `handleTermination` closes that residual
+      // window by reclassifying to `.spawnFailed` once the real exit
+      // code / crash signal arrives.
+      guard inc.process.isRunning else {
+        Log.engine.debug("PieSupervisor: handshake timer fired but process pid=\(inc.process.processIdentifier, privacy: .public) already exited; deferring to termination path for spawn-failure classification")
+        return
+      }
       Log.engine.error("PieSupervisor: handshake timeout after \(self.policy.handshakeTimeout, privacy: .public)s")
       let killed = self.killProcess(inc.process)
       // Review v2 F31: surface SIGKILL failure precisely. Without
@@ -653,8 +699,13 @@ public final class PieSupervisor: @unchecked Sendable {
         )
         return
       }
+      // Remember this incarnation: if its real exit code or crash
+      // signal arrives later, `handleTermination` reclassifies this
+      // handshake timeout as the spawn failure it actually was — the
+      // timer raced the reaper for a child that had already died.
+      self.handshakeTimedOutIncID = inc.id
       self.finishSpawnFailure(code: .handshakeTimeout,
-                              message: "pie did not print HTTP_LISTEN within \(Int(self.policy.handshakeTimeout))s")
+                              message: "pie did not print HTTP_LISTEN within \(Self.formatSeconds(self.policy.handshakeTimeout))s")
     }
     inc.handshakeTimer = timer
     timer.resume()
@@ -792,10 +843,62 @@ public final class PieSupervisor: @unchecked Sendable {
 
   // MARK: termination + restart
 
+  /// If `process` terminated on its own before the handshake — a normal
+  /// exit code, or a crash signal it raised itself (e.g. SIGABRT from a
+  /// Rust panic, SIGSEGV from a bad load) — return a short description
+  /// for the diagnostic. Returns nil when the termination is this path's
+  /// own SIGKILL of an alive-but-silent engine, which is a genuine
+  /// handshake timeout that must NOT be reclassified as a spawn failure.
+  private static func diedOnLaunch(_ process: Process) -> String? {
+    switch process.terminationReason {
+    case .exit:
+      return "exited code=\(process.terminationStatus)"
+    case .uncaughtSignal where process.terminationStatus != SIGKILL:
+      return "crashed on signal=\(process.terminationStatus)"
+    default:
+      return nil
+    }
+  }
+
+  /// Render a timeout in seconds without the misleading integer
+  /// truncation `Int(0.5)` → `0` produced for sub-second policies (whole
+  /// seconds stay clean: `10.0` → `"10"`, fractions keep their value:
+  /// `0.05` → `"0.05"`).
+  private static func formatSeconds(_ s: TimeInterval) -> String {
+    s == s.rounded() ? String(Int(s)) : String(s)
+  }
+
   private func handleTermination(of inc: Incarnation, process: Process) {
     // Drop stale callbacks from a prior incarnation that we've
     // already moved past (the new spawn took over `current`).
-    guard current?.id == inc.id else { return }
+    guard current?.id == inc.id else {
+      // The handshake-timer path may have already TERMINALLY failed
+      // this incarnation as `.handshakeTimeout` (it nils `current`, so
+      // we land here, not in the `.failed` branch below). Under load
+      // that timer can win the race against the reaper even though the
+      // child had already died on its own: `Process.isRunning`
+      // (Foundation wait4 bookkeeping) lags the real exit, so the
+      // timer's guard saw the zombie "alive". A child that terminated
+      // on its own — exited with a code (`.exit`), or crashed on a
+      // signal it raised itself such as SIGABRT from a Rust panic or
+      // SIGSEGV from a bad load (`.uncaughtSignal`) — was never an
+      // alive-but-silent handshake timeout; it is a spawn failure.
+      // Reclassify it using the authoritative reason/status that only
+      // the terminationHandler carries. The only signal THIS path ever
+      // sends is SIGKILL (of a genuinely alive-but-silent engine), so a
+      // `.uncaughtSignal` whose status IS SIGKILL is our own kill — a
+      // real handshake timeout that must never be reclassified.
+      if inc.id == handshakeTimedOutIncID,
+         case .failed(.handshakeTimeout, _) = _state,
+         let diedDesc = Self.diedOnLaunch(process) {
+        handshakeTimedOutIncID = nil
+        let exitDesc = "engine \(diedDesc) on launch before the handshake (handshake timer raced the reaper)"
+        Log.engine.error("PieSupervisor: reclassifying .handshakeTimeout → .spawnFailed — \(exitDesc, privacy: .public)")
+        let joined = attemptHistory.joined(separator: "; ")
+        setState(.failed(.spawnFailed, joined.isEmpty ? exitDesc : "\(joined); \(exitDesc)"))
+      }
+      return
+    }
     inc.handshakeTimer?.cancel()
     inc.stdoutPipe.fileHandleForReading.readabilityHandler = nil
     inc.stderrPipe.fileHandleForReading.readabilityHandler = nil
@@ -1091,6 +1194,19 @@ public final class PieSupervisor: @unchecked Sendable {
       message: message
     )
     setState(.failed(.killRejected, message))
+  }
+
+  /// Liveness probe for the retained `.killRejected` zombie. Defers
+  /// to the real `Process.isRunning` (Foundation `wait4` bookkeeping
+  /// for the SPECIFIC child, pid-reuse-safe per review v5 F59) in
+  /// production; the `livenessOverride` test seam replaces it
+  /// so `clearKillRejected` recovery can be exercised synchronously
+  /// without waiting on a real subprocess to exit and be reaped.
+  private func isProcessRunning(_ process: Process) -> Bool {
+    #if DEBUG
+    if let livenessOverride { return livenessOverride(process) }
+    #endif
+    return process.isRunning
   }
 
   /// SIGKILL with errno capture (review v1 F6). Returns true if the

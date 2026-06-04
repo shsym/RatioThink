@@ -441,44 +441,51 @@ final class PieSupervisorTests: XCTestCase {
   // MARK: - F50: clearKillRejected recovery path
 
   func test_clearKillRejected_refusesWhenZombieAlive() throws {
-    let fake = try writeScript("pie-killreject2.sh", body: """
-      #!/bin/bash
-      sleep 3
-      """)
+    // Drive the zombie alive→dead transition through the
+    // `livenessOverride` seam instead of waiting on a real `sleep`
+    // subprocess to exit AND be wait4-reaped (the arbitrarily-delayed
+    // step that made this flake up to the 25s suite timeout under CI
+    // load). Entry into `.killRejected` still exercises the real
+    // spawn → handshake-timeout → SIGKILL-rejected path, but against
+    // a `FakeProcess` that forks no child, so there is nothing to
+    // schedule, exit, or reap. The whole alive→dead recovery now runs
+    // synchronously and deterministically.
+    let alive = OSAllocatedUnfairLock<Bool>(initialState: true)
     let sup = PieSupervisor(
-      policy: .init(handshakeTimeout: 0.3,
+      policy: .init(handshakeTimeout: 0.05,
                     restartAttempts: 1,
                     restartWindow: 30,
                     stopGracePeriod: 1,
                     stopOverrun: 1,
                     stdoutCarryLimit: 64 * 1024),
       logFileURL: logURL,
-      killProcessOverride: { _ in false }
+      recoveryManifestURL: tempDir.appendingPathComponent("manifest.json"),
+      processFactory: { FakeProcess() },
+      killProcessOverride: { _ in false },         // reject SIGKILL → enter .killRejected
+      livenessOverride: { _ in alive.withLock { $0 } }
     )
-    _ = sup.start(makeSpec(binary: fake, profileID: "chat"))
-    _ = waitFor(sup, predicate: { status in
-      if case .failed = status { return true }
-      return false
-    }, timeout: 3)
-    // Zombie pid (the bash sleep 3) is still alive at this point.
-    // clearKillRejected should refuse.
+    _ = sup.start(makeSpec(binary: tempDir.appendingPathComponent("unused-fake-binary"),
+                           profileID: "chat"))
+    // Reliable entry: the handshake timer (~50ms) fires, SIGKILL is
+    // rejected, supervisor enters .killRejected. No real child means
+    // this cannot starve under load.
+    waitFor(sup, predicate: { if case .failed(.killRejected, _) = $0 { return true }; return false },
+            timeout: 5)
+
+    // Override reports the zombie alive → recovery must refuse and
+    // stay in .killRejected.
     XCTAssertFalse(sup.clearKillRejected(),
-                   "clearKillRejected must refuse while zombie is alive")
-    // Wait for the bash process to exit on its own (sleep 3 → ~3s
-    // total). Then the recovery should succeed.
-    let recovered = OSAllocatedUnfairLock<Bool>(initialState: false)
-    let deadline = Date().addingTimeInterval(5)
-    while Date() < deadline {
-      if sup.clearKillRejected() {
-        recovered.withLock { $0 = true }
-        break
-      }
-      Thread.sleep(forTimeInterval: 0.2)
+                   "clearKillRejected must refuse while liveness override reports the zombie alive")
+    guard case .failed(.killRejected, _) = sup.status else {
+      return XCTFail("expected to remain .killRejected after refusal, got \(sup.status)")
     }
-    XCTAssertTrue(recovered.withLock { $0 },
-                  "clearKillRejected should succeed once zombie exits")
-    if case .stopped = sup.status { /* expected */ } else {
-      XCTFail("expected .stopped after clearKillRejected, got \(sup.status)")
+
+    // Flip the override to dead → recovery succeeds synchronously.
+    alive.withLock { $0 = false }
+    XCTAssertTrue(sup.clearKillRejected(),
+                  "clearKillRejected must succeed once liveness override reports the zombie dead")
+    guard case .stopped = sup.status else {
+      return XCTFail("expected .stopped after successful clearKillRejected, got \(sup.status)")
     }
   }
 
@@ -523,53 +530,64 @@ final class PieSupervisorTests: XCTestCase {
   // MARK: - F61: clearKillRejected from observer handler does not deadlock
 
   func test_clearKillRejected_safeFromObserverHandler() throws {
-    // The supervisor enters .killRejected; an observer fires; the
-    // handler calls clearKillRejected on the supervisor. Without
-    // the F61 stateQueue-affinity check, this would
-    // dispatch_sync-deadlock the supervisor's own queue.
-    let fake = try writeScript("pie-killreject3.sh", body: """
-      #!/bin/bash
-      sleep 0.3
-      """)
+    // Review v5 F61: an observer handler runs on the
+    // supervisor's stateQueue. Calling clearKillRejected() from
+    // inside it must take the queue-affinity inline path and must
+    // NOT dispatch_sync-deadlock the queue. The property under test
+    // is PURE re-entrancy — it never needed real process timing.
+    // Previously it was proven by polling until a real `sleep 0.3`
+    // zombie exited and was reaped, which flaked up to the 25s suite
+    // timeout under load. Now the `livenessOverride` seam drives the
+    // zombie alive→dead synchronously while the clearKillRejected
+    // calls are still made re-entrantly from the handler, so the
+    // no-deadlock guarantee is exercised on BOTH the refuse path
+    // (alive) and the success path (dead).
+    let alive = OSAllocatedUnfairLock<Bool>(initialState: true)
+    let refusedInlineWhileAlive = OSAllocatedUnfairLock<Bool>(initialState: false)
     let sup = PieSupervisor(
-      policy: .init(handshakeTimeout: 0.3,
+      policy: .init(handshakeTimeout: 0.05,
                     restartAttempts: 1,
                     restartWindow: 30,
                     stopGracePeriod: 1,
                     stopOverrun: 1,
                     stdoutCarryLimit: 64 * 1024),
       logFileURL: logURL,
-      killProcessOverride: { _ in false }
+      recoveryManifestURL: tempDir.appendingPathComponent("manifest.json"),
+      processFactory: { FakeProcess() },
+      killProcessOverride: { _ in false },
+      livenessOverride: { _ in alive.withLock { $0 } }
     )
-    _ = sup.start(makeSpec(binary: fake, profileID: "chat"))
-    // Wait for .failed(.killRejected). Process will keep running
-    // until sleep 0.3 expires; clearKillRejected refuses until
-    // then. Once isRunning flips false, calling from the observer
-    // must NOT deadlock.
+    // Only the .stopped reached THROUGH the killRejected→clear path
+    // is terminal — the supervisor also publishes its initial
+    // .stopped to a freshly-registered observer, which must not be
+    // mistaken for recovery.
+    let sawKillRejected = OSAllocatedUnfairLock<Bool>(initialState: false)
     let exp = expectation(description: "supervisor reached .stopped via observer-driven clearKillRejected")
     let token = sup.observe { status, token in
       if case .failed(.killRejected, _) = status {
-        // Attempt clearKillRejected from inside the handler. The
-        // first calls will refuse (zombie alive); the F61 check
-        // ensures none deadlock.
+        sawKillRejected.withLock { $0 = true }
+        // Re-entrant call #1 (zombie alive): must run INLINE and
+        // refuse. If the F61 affinity check were missing this would
+        // dispatch_sync-deadlock and the test would hang to timeout.
+        if sup.clearKillRejected() == false {
+          refusedInlineWhileAlive.withLock { $0 = true }
+        }
+        // Flip to dead, then re-entrant call #2: must run inline and
+        // succeed, transitioning to .stopped.
+        alive.withLock { $0 = false }
         _ = sup.clearKillRejected()
       }
-      if case .stopped = status {
+      if case .stopped = status, sawKillRejected.withLock({ $0 }) {
         token.cancel()
         exp.fulfill()
       }
     }
-    // Loop in the background calling clearKillRejected periodically
-    // so the test progresses once the bash sleep expires.
-    DispatchQueue.global().async {
-      let deadline = Date().addingTimeInterval(5)
-      while Date() < deadline {
-        Thread.sleep(forTimeInterval: 0.1)
-        if sup.clearKillRejected() { return }
-      }
-    }
-    wait(for: [exp], timeout: 6)
+    _ = sup.start(makeSpec(binary: tempDir.appendingPathComponent("unused-fake-binary"),
+                           profileID: "chat"))
+    wait(for: [exp], timeout: 5)
     _ = token
+    XCTAssertTrue(refusedInlineWhileAlive.withLock { $0 },
+                  "clearKillRejected from the observer handler must run inline and refuse while the zombie is alive")
   }
 
   // MARK: - F62: post-handshake-crash backoff does not publish stale .running
@@ -907,6 +925,138 @@ final class PieSupervisorTests: XCTestCase {
     }
   }
 
+  // MARK: - handshake-timer vs reaper race → exit code wins classification
+
+  /// Under load the handshake timer can fire before Foundation reaps a
+  /// crash-on-launch child whose `isRunning` (wait4 bookkeeping) still
+  /// reads true, so the supervisor stamps a terminal
+  /// `.failed(.handshakeTimeout)` and nils `current` first. The child's
+  /// real `terminationReason == .exit` must then reclassify that to
+  /// `.failed(.spawnFailed)` — a process that exited with its own code
+  /// was never an alive-but-silent handshake timeout. Driven through the
+  /// `FakeProcess` seam so the timer-wins-then-reaper ordering is
+  /// deterministic instead of load-dependent. Fails (stuck on
+  /// `.handshakeTimeout`) without the `handleTermination` reclassification.
+  func test_handshakeTimerWinsRace_thenRealExitCode_reclassifiesToSpawnFailed() throws {
+    let fake = FakeProcess()
+    let sup = PieSupervisor(
+      policy: .init(handshakeTimeout: 0.05,
+                    restartAttempts: 1,
+                    restartWindow: 30,
+                    stopGracePeriod: 1,
+                    stopOverrun: 1,
+                    stdoutCarryLimit: 64 * 1024),
+      logFileURL: logURL,
+      recoveryManifestURL: tempDir.appendingPathComponent("manifest.json"),
+      processFactory: { fake },
+      killProcessOverride: { _ in true }   // SIGKILL "succeeds" on the zombie
+    )
+    _ = sup.start(makeSpec(binary: tempDir.appendingPathComponent("unused-fake-binary"),
+                           profileID: "chat"))
+
+    // 1. Timer wins: the ~50ms handshake timer fires while FakeProcess
+    //    still reports isRunning==true, so the supervisor stamps the
+    //    (wrong) terminal handshake timeout and nils `current`.
+    let timedOut = waitFor(sup, predicate: {
+      if case .failed(.handshakeTimeout, _) = $0 { return true }; return false
+    }, timeout: 5)
+    guard case .failed(.handshakeTimeout, _)? = timedOut else {
+      return XCTFail("precondition: supervisor must first stamp .handshakeTimeout, got \(String(describing: timedOut))")
+    }
+
+    // 2. Reaper arrives: the child actually exited on its own with
+    //    code 7. terminationReason==.exit must flip the classification.
+    fake.deliverTermination(status: 7, reason: .exit)
+    let corrected = waitFor(sup, predicate: {
+      if case .failed(.spawnFailed, _) = $0 { return true }; return false
+    }, timeout: 5)
+    guard case .failed(.spawnFailed, _)? = corrected else {
+      return XCTFail("a child that exited with code 7 must reclassify .handshakeTimeout → .spawnFailed; got \(String(describing: sup.status))")
+    }
+  }
+
+  /// Guard the discriminator: a genuinely alive-but-silent engine we
+  /// SIGKILL for missing the handshake reports `terminationReason ==
+  /// .uncaughtSignal`, and must STAY `.handshakeTimeout` — the
+  /// reclassification keys on `.exit`, so it must not fire here.
+  func test_handshakeTimeout_killedAliveEngine_staysHandshakeTimeout() throws {
+    let fake = FakeProcess()
+    let sup = PieSupervisor(
+      policy: .init(handshakeTimeout: 0.05,
+                    restartAttempts: 1,
+                    restartWindow: 30,
+                    stopGracePeriod: 1,
+                    stopOverrun: 1,
+                    stdoutCarryLimit: 64 * 1024),
+      logFileURL: logURL,
+      recoveryManifestURL: tempDir.appendingPathComponent("manifest.json"),
+      processFactory: { fake },
+      killProcessOverride: { _ in true }
+    )
+    _ = sup.start(makeSpec(binary: tempDir.appendingPathComponent("unused-fake-binary"),
+                           profileID: "chat"))
+    let timedOut = waitFor(sup, predicate: {
+      if case .failed(.handshakeTimeout, _) = $0 { return true }; return false
+    }, timeout: 5)
+    guard case .failed(.handshakeTimeout, _)? = timedOut else {
+      return XCTFail("precondition: supervisor must stamp .handshakeTimeout, got \(String(describing: timedOut))")
+    }
+    // Our SIGKILL of an alive-but-silent engine surfaces as a signal,
+    // not a self-exit — this is a real handshake timeout, keep it.
+    fake.deliverTermination(status: SIGKILL, reason: .uncaughtSignal)
+    // Give the termination work item time to run; the code must not flip.
+    Thread.sleep(forTimeInterval: 0.3)
+    guard case .failed(.handshakeTimeout, _) = sup.status else {
+      return XCTFail("a SIGKILLed alive engine must stay .handshakeTimeout, got \(sup.status)")
+    }
+  }
+
+  /// Same reaper race as the exit-code case, but the crash-on-launch
+  /// child died on a signal it raised itself — a Rust panic aborts with
+  /// SIGABRT, a bad load segfaults with SIGSEGV. Foundation reports
+  /// `terminationReason == .uncaughtSignal` with the crash signal as the
+  /// status. That is a spawn failure, not an alive-but-silent handshake
+  /// timeout, and must reclassify `.handshakeTimeout → .spawnFailed`. The
+  /// discriminator is the signal: the supervisor's own kill of a live
+  /// engine is SIGKILL (the only signal this path sends), so any OTHER
+  /// signal is the child crashing on its own.
+  func test_handshakeTimerWinsRace_thenSignalCrash_reclassifiesToSpawnFailed() throws {
+    let fake = FakeProcess()
+    let sup = PieSupervisor(
+      policy: .init(handshakeTimeout: 0.05,
+                    restartAttempts: 1,
+                    restartWindow: 30,
+                    stopGracePeriod: 1,
+                    stopOverrun: 1,
+                    stdoutCarryLimit: 64 * 1024),
+      logFileURL: logURL,
+      recoveryManifestURL: tempDir.appendingPathComponent("manifest.json"),
+      processFactory: { fake },
+      killProcessOverride: { _ in true }   // SIGKILL "succeeds" on the zombie
+    )
+    _ = sup.start(makeSpec(binary: tempDir.appendingPathComponent("unused-fake-binary"),
+                           profileID: "chat"))
+
+    // 1. Timer wins: stamps the (wrong) terminal handshake timeout.
+    let timedOut = waitFor(sup, predicate: {
+      if case .failed(.handshakeTimeout, _) = $0 { return true }; return false
+    }, timeout: 5)
+    guard case .failed(.handshakeTimeout, _)? = timedOut else {
+      return XCTFail("precondition: supervisor must first stamp .handshakeTimeout, got \(String(describing: timedOut))")
+    }
+
+    // 2. Reaper arrives: the child actually aborted on its own (SIGABRT).
+    //    terminationReason==.uncaughtSignal with a non-SIGKILL status must
+    //    flip the classification to .spawnFailed.
+    fake.deliverTermination(status: SIGABRT, reason: .uncaughtSignal)
+    let corrected = waitFor(sup, predicate: {
+      if case .failed(.spawnFailed, _) = $0 { return true }; return false
+    }, timeout: 5)
+    guard case .failed(.spawnFailed, _)? = corrected else {
+      return XCTFail("a child that crashed on SIGABRT must reclassify .handshakeTimeout → .spawnFailed; got \(String(describing: sup.status))")
+    }
+  }
+
   // MARK: - helpers
 
   private func makeSupervisor(policy: PieSupervisor.Policy = .init(handshakeTimeout: 1.0,
@@ -953,5 +1103,81 @@ final class PieSupervisorTests: XCTestCase {
     token.cancel()
     if result != .completed { return nil }
     return captured
+  }
+}
+
+/// Test double for a `pie` engine process that forks no real
+/// child. `Process`/`NSTask` is an abstract class cluster, so a
+/// concrete subclass must provide its OWN storage for every property
+/// it is asked to set — NSTask.h: "You cannot use this property in a
+/// concrete subclass of NSTask which hasn't been updated to include
+/// an implementation of the storage and use of it." `PieSupervisor`
+/// `spawn` configures (`executableURL`, `arguments`, `environment`,
+/// `standardOutput/Error`, `terminationHandler`) and `run()`s it like
+/// any process; because `run()` is a no-op, Foundation never invokes
+/// the `terminationHandler`, so the incarnation stays `.starting`
+/// until the handshake timer fires. With a rejecting
+/// `killProcessOverride` that yields a deterministic entry into
+/// `.failed(.killRejected)` — no real subprocess to schedule, exit,
+/// or wait4-reap, and therefore no wall-clock flake.
+private final class FakeProcess: Process, @unchecked Sendable {
+  private var _executableURL: URL?
+  private var _arguments: [String]?
+  private var _environment: [String: String]?
+  private var _standardOutput: Any?
+  private var _standardError: Any?
+  private var _terminationHandler: (@Sendable (Process) -> Void)?
+
+  override var executableURL: URL? {
+    get { _executableURL }
+    set { _executableURL = newValue }
+  }
+  override var arguments: [String]? {
+    get { _arguments }
+    set { _arguments = newValue }
+  }
+  override var environment: [String: String]? {
+    get { _environment }
+    set { _environment = newValue }
+  }
+  override var standardOutput: Any? {
+    get { _standardOutput }
+    set { _standardOutput = newValue }
+  }
+  override var standardError: Any? {
+    get { _standardError }
+    set { _standardError = newValue }
+  }
+  override var terminationHandler: (@Sendable (Process) -> Void)? {
+    get { _terminationHandler }
+    set { _terminationHandler = newValue }
+  }
+  override var processIdentifier: Int32 { 0 }
+  // Models an engine that is alive but silent (never prints the
+  // handshake) and refuses SIGKILL — the `.killRejected` scenario these
+  // tests drive. The supervisor's handshake-timeout handler consults
+  // `isRunning` to distinguish a still-running silent engine from an
+  // early-exited one, so this must report `true`; a no-op `run()` means
+  // there is no real child to ever flip it false.
+  override var isRunning: Bool { true }
+  override func run() throws {}
+
+  // Foundation publishes the reaped child's exit code/reason here. The
+  // base FakeProcess never terminates on its own (`run()` is a no-op);
+  // `deliverTermination` lets a test fire the supervisor's
+  // terminationHandler with a chosen exit code + reason to reproduce
+  // the reaper-races-the-handshake-timer classification path.
+  private var _terminationStatus: Int32 = 0
+  private var _terminationReason: Process.TerminationReason = .exit
+  override var terminationStatus: Int32 { _terminationStatus }
+  override var terminationReason: Process.TerminationReason { _terminationReason }
+
+  /// Synchronously invoke the stored `terminationHandler` as Foundation
+  /// would after `wait4` reaps the child, with `status` / `reason`
+  /// visible through `terminationStatus` / `terminationReason`.
+  func deliverTermination(status: Int32, reason: Process.TerminationReason) {
+    _terminationStatus = status
+    _terminationReason = reason
+    _terminationHandler?(self)
   }
 }

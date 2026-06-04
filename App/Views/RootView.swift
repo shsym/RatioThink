@@ -6,10 +6,51 @@ import SwiftUI
 struct RootView: View {
   @EnvironmentObject private var windowState: WindowState
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
+  /// Engine lifecycle + in-flight load, folded into the unified
+  /// indicator state that gates the engine-error banner. Both are
+  /// injected at app scope (`RatioThinkApp`).
+  @EnvironmentObject private var engineStatusStore: EngineStatusStore
+  @EnvironmentObject private var modelLoadCenter: ModelLoadCenter
+  /// #412: background-helper health. Drives the loud escalation banner when
+  /// the App's restart ladder can't bring the helper back.
+  @EnvironmentObject private var helperHealth: HelperHealthController
+  /// #411: persisted ignore-set for update versions + the launch-time update
+  /// check state that drives the non-modal `UpdateAvailableBanner`.
+  @EnvironmentObject private var appPreferences: AppPreferences
+  @EnvironmentObject private var updateAvailability: UpdateAvailabilityModel
+  @Environment(\.openURL) private var openURL
 
   var body: some View {
     VStack(spacing: 0) {
       PersistenceBanner(status: persistenceStatus)
+      // #412: the most fundamental failure — a dead background helper the App
+      // couldn't auto-recover — surfaces ABOVE the engine banner. (When the
+      // helper is unreachable the engine status sticks at .starting, so
+      // EngineStatusBanner stays silent and this is the only loud surface.)
+      HelperUnreachableBanner(helperHealth: helperHealth)
+      // Loud surface for engine/load failures only; quiet for everything
+      // else. Self-hides via the reducer + dedup signature.
+      EngineStatusBanner(
+        indicatorState: EngineIndicatorState.make(
+          engine: engineStatusStore.status,
+          engineDetail: engineStatusStore.statusDetail,
+          load: modelLoadCenter.state,
+          residentModelID: modelLoadCenter.residentModelID
+        ),
+        engineStatus: engineStatusStore
+      )
+      // #411: low-urgency, non-modal update prompt. Only present for a newer,
+      // non-ignored release found by the once-per-launch check.
+      if let pending = updateAvailability.pending {
+        UpdateAvailableBanner(
+          pending: pending,
+          onDownload: {
+            openURL(pending.release.htmlURL)
+            updateAvailability.dismissPending()
+          },
+          onIgnore: { updateAvailability.ignorePending(into: appPreferences) }
+        )
+      }
       NavigationSplitView(columnVisibility: $windowState.columnVisibility) {
         SidebarView(selection: $windowState.selectedSection)
       } content: {
@@ -32,6 +73,17 @@ struct RootView: View {
       }
       .navigationTitle("RatioThink")
     }
+    .task { await runLaunchUpdateCheck() }
+  }
+
+  /// #411: run the once-per-launch update check. Skipped on test/automation
+  /// launches so GUI/E2E suites never make the one real GitHub network call;
+  /// the model's own guard makes a re-`task` a no-op in production.
+  private func runLaunchUpdateCheck() async {
+    guard !HelperRegistrationReconciler.isTestLaunch(ProcessInfo.processInfo.environment) else {
+      return
+    }
+    await updateAvailability.checkOnLaunch(preferences: appPreferences)
   }
 }
 

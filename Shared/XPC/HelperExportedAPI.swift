@@ -215,6 +215,48 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     }
   }
 
+  // MARK: - engineMemory
+
+  /// Pre-encoded `Optional<EngineMemorySample>.none` reply — the "no
+  /// host / not running / encode failure" payload. Encoded at type init
+  /// so the catch path is provably dead, matching the other pre-encoded
+  /// blobs above.
+  private static let emptyMemoryData: Data = {
+    do {
+      return try XPCPayload.encode(Optional<EngineMemorySample>.none)
+    } catch {
+      preconditionFailure("HelperExportedAPI: failed to pre-encode nil EngineMemorySample: \(error)")
+    }
+  }()
+
+  /// Samples the running engine's resident memory (parent pie process)
+  /// and replies `XPCPayload.encode(EngineMemorySample?)`. No host
+  /// wired, engine not running, or a sample failure ⇒ nil. Async
+  /// because `PieEngineHost.residentMemoryBytes()` hops onto the host's
+  /// state queue; the reply fires from the spawned task. The App-side
+  /// `HelperXPCClient` bounds this with its own reply-timeout, so no
+  /// timeout fallback is needed here (proc_pid_rusage is a cheap
+  /// syscall regardless).
+  public func engineMemory(reply: @escaping (Data) -> Void) {
+    guard let engineHost else {
+      reply(Self.emptyMemoryData)
+      return
+    }
+    Task {
+      // `.flatMap` (not `.map`): a 0-byte reading is not a valid sample
+      // — `EngineMemorySample.from` collapses it to nil so it rides the
+      // same "unavailable" channel as a missing engine.
+      let sample = await engineHost.residentMemoryBytes()
+        .flatMap { EngineMemorySample.from(residentBytes: $0) }
+      do {
+        reply(try XPCPayload.encode(sample))
+      } catch {
+        Self.log.fault("engineMemory encode failed: \(String(describing: error), privacy: .public)")
+        reply(Self.emptyMemoryData)
+      }
+    }
+  }
+
   // MARK: - startEngine / stopEngine
 
   /// Slack added on top of the engine host's timeout budget before
@@ -618,6 +660,13 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   public func engineStatus(reply: @escaping (Data) -> Void) {
     Self.log.info("engineStatus -> .degraded")
     reply(degradedStatusData)
+  }
+
+  public func engineMemory(reply: @escaping (Data) -> Void) {
+    // No engine runs in degraded mode → RSS unavailable. `nil` cannot
+    // realistically fail to encode; the literal "null" fallback decodes
+    // to the same nil EngineMemorySample?.
+    reply((try? XPCPayload.encode(Optional<EngineMemorySample>.none)) ?? Data("null".utf8))
   }
 
   public func startEngine(profileID: String,

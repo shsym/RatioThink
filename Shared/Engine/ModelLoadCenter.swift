@@ -67,6 +67,16 @@ public final class ModelLoadCenter: ObservableObject {
   private var eventEpoch: UInt64 = 0
   private var loadEpoch: UInt64 = 0
 
+  /// The most recent `(modelID, streamFactory)` handed to `load()`,
+  /// retained so `retryLast()` can re-run it (#396 recovery action).
+  /// Cleared by `markUnloaded()` — an explicit Unload is the user
+  /// saying "stop", so a later Retry must not resurrect that model.
+  /// `.failed` is only ever produced by `load()`'s error path (the chat
+  /// pipeline uses `applyChatMetaEvent`, which carries only
+  /// `.loading`/`.ready`), so this is a complete retry target for every
+  /// failure the popover can surface.
+  private var lastLoad: (modelID: String, factory: @Sendable () -> AsyncThrowingStream<LoadEvent, Error>)?
+
   /// Per-load latch tripped at most once by `progress` to keep the
   /// upstream-protocol-bug warning out of the per-frame logging
   /// budget (review v1 F14). Reset on every `load()` entry.
@@ -116,6 +126,7 @@ public final class ModelLoadCenter: ObservableObject {
     streamFactory: @escaping @Sendable () -> AsyncThrowingStream<LoadEvent, Error>
   ) {
     cancel()
+    lastLoad = (modelID, streamFactory)
     loadEpoch &+= 1
     eventEpoch &+= 1
     let myLoadEpoch = loadEpoch
@@ -187,6 +198,22 @@ public final class ModelLoadCenter: ObservableObject {
         }
       }
     }
+  }
+
+  /// Re-run the most recent load (#396 recovery action). Drives the
+  /// popover's "Retry" button on a `.failed` / `.engineNotReady`
+  /// terminal: re-invokes the stored stream factory through the normal
+  /// `load()` path (which cancels any in-flight load and resets the
+  /// epoch counters), so a retry is indistinguishable from the user
+  /// re-triggering the same load. No-op when nothing has been loaded
+  /// yet or after an explicit Unload cleared the target.
+  public func retryLast() {
+    guard let lastLoad else {
+      Self.log.info("retryLast: no prior load to retry — ignored")
+      return
+    }
+    Self.log.info("retryLast: re-running load id=\(lastLoad.modelID, privacy: .public)")
+    load(modelID: lastLoad.modelID, streamFactory: lastLoad.factory)
   }
 
   /// Cancel the current load. No-op when idle.
@@ -437,6 +464,7 @@ public final class ModelLoadCenter: ObservableObject {
   /// the no-model confirm gate.
   public func markUnloaded() {
     cancel()
+    lastLoad = nil
     residentModelID = nil
     state = .idle
     Self.log.info("model unloaded — resident cleared, state idle")
