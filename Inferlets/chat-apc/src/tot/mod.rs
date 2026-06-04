@@ -173,19 +173,6 @@ pub async fn dispatch(
             .await;
     }
 
-    // #413: suppress reasoning for the level-1 node generation. Qwen3-style
-    // reasoning models key thinking off the LAST user turn, so append the
-    // `/no_think` directive to it — otherwise each level-1 candidate drowns
-    // in `<think>` tokens, burning the whole `max_tokens_per_node` budget on
-    // reasoning and yielding no usable answer. The directive is an inert
-    // token on non-reasoning models. Deeper levels + scoring carry it via
-    // REFINE_INSTRUCTION/SCORE_PROMPT (best-effort there — see the caveat on
-    // REFINE_INSTRUCTION). This is a node-quality measure, not the stall fix:
-    // the operator's hang was an undrained engine pipe (see PieControlLauncher).
-    if let Some(last) = messages.iter_mut().rev().find(|m| m.role == "user") {
-        last.content.push_str(" /no_think");
-    }
-
     let params = match schema::resolve(&input) {
         Ok(p) => p,
         Err((field, msg)) => {
@@ -194,6 +181,19 @@ pub async fn dispatch(
                 .await;
         }
     };
+
+    // #413/#437: tree-of-thought THINKS by default — the `<think>` reasoning
+    // is the point of the search, demuxed apart from the answer per node (see
+    // `search::generate_demuxed`). Only when the caller disables it
+    // (`thinking:false`) do we append the `/no_think` directive to the last
+    // user turn (Qwen3 keys thinking off it); deeper levels + the scorer carry
+    // it via `with_thinking(REFINE_INSTRUCTION/SCORE_PROMPT)`. The directive is
+    // an inert token on a non-reasoning model.
+    if !params.thinking {
+        if let Some(last) = messages.iter_mut().rev().find(|m| m.role == "user") {
+            last.content.push_str(" /no_think");
+        }
+    }
 
     // Resolve the model (default to the engine's single registered model).
     let model_id = match input.model {
@@ -273,10 +273,10 @@ pub async fn dispatch(
     // request can safely commit SSE headers — every failure that warranted
     // a JSON 4xx/5xx envelope has already returned above.
     if stream {
-        return dispatch_streaming(root_ctx, &params, &tree_id, &model_id, res).await;
+        return dispatch_streaming(root_ctx, &params, &model, &tree_id, &model_id, res).await;
     }
 
-    let outcome = search::run(root_ctx, &params, None).await;
+    let outcome = search::run(root_ctx, &params, &model, None).await;
 
     // F1: a search that selected no ok leaf totally failed (every branch
     // failed to generate — the beam keeps the best ok leaf whenever one
@@ -338,6 +338,7 @@ pub async fn dispatch(
 async fn dispatch_streaming(
     root_ctx: inferlet::Context,
     params: &schema::TotParams,
+    model: &inferlet::model::Model,
     tree_id: &str,
     model_id: &str,
     res: Responder,
@@ -349,7 +350,7 @@ async fn dispatch_streaming(
     {
         return em.finish();
     }
-    let outcome = search::run(root_ctx, params, Some(&mut em)).await;
+    let outcome = search::run(root_ctx, params, model, Some(&mut em)).await;
     if stream::is_total_failure(&outcome.selected_node_id) {
         // F1: total failure — emit the documented terminal `error` frame
         // (the client's catch marks the turn failed) instead of a

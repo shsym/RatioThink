@@ -75,6 +75,8 @@ struct NodeView<'a> {
     depth: usize,
     branch_index: Option<usize>,
     content: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    reasoning: &'a str,
     score: Option<u8>,
     status: NodeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,6 +93,7 @@ impl<'a> NodeView<'a> {
             depth: n.depth,
             branch_index: n.branch_index,
             content: &n.content,
+            reasoning: &n.reasoning,
             score: n.score,
             status: n.status,
             error: n.error.as_deref(),
@@ -227,6 +230,7 @@ mod tests {
             depth: 1,
             branch_index: Some(0),
             content: "ans".to_string(),
+            reasoning: String::new(),
             score: Some(7),
             status,
             error: None,
@@ -254,6 +258,43 @@ mod tests {
         // Clean optionals are omitted, matching the non-streaming node wire.
         assert!(v["node"].get("error").is_none());
         assert!(v["node"].get("score_error").is_none());
+        // Empty reasoning is omitted too (non-reasoning model / thinking off).
+        assert!(v["node"].get("reasoning").is_none());
+    }
+
+    #[test]
+    fn node_complete_frame_carries_reasoning_when_present() {
+        // #413/#437: a thinking node ships its demuxed reasoning alongside the
+        // answer so the client can render the per-node "Thinking" section.
+        let mut n = node("tot-n6", "root", NodeStatus::Ok);
+        n.reasoning = "first I weigh A vs B…".to_string();
+        let v = serde_json::to_value(NodeCompleteFrame {
+            event: "node_complete",
+            node: NodeView::new(&n),
+        })
+        .unwrap();
+        assert_eq!(v["node"]["reasoning"], "first I weigh A vs B…");
+        assert_eq!(v["node"]["content"], "ans");
+    }
+
+    #[test]
+    fn node_complete_frame_surfaces_incomplete_status() {
+        // A reasoned-but-unanswered node streams as status "incomplete" with
+        // its partial reasoning and an empty answer (#434).
+        let mut n = node("tot-n7", "tot-n1", NodeStatus::Incomplete);
+        n.content = String::new();
+        n.score = None;
+        n.reasoning = "I was still working through…".to_string();
+        n.error = Some("no answer".to_string());
+        let v = serde_json::to_value(NodeCompleteFrame {
+            event: "node_complete",
+            node: NodeView::new(&n),
+        })
+        .unwrap();
+        assert_eq!(v["node"]["status"], "incomplete");
+        assert_eq!(v["node"]["reasoning"], "I was still working through…");
+        assert_eq!(v["node"]["content"], "");
+        assert_eq!(v["node"]["error"], "no answer");
     }
 
     #[test]
@@ -291,8 +332,10 @@ mod tests {
             depth: 2,
             beam_width: 2,
             max_tokens_per_node: 16,
+            max_reasoning_tokens: 256,
             temperature: 0.7,
             top_p: 0.95,
+            thinking: true,
         };
         let v = serde_json::to_value(TreeStartFrame {
             event: "tree_start",
