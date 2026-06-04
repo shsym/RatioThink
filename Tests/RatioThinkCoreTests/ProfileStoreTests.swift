@@ -1893,6 +1893,52 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  // MARK: - speculation accessor (#426 Fast Think)
+
+  func test_speculation_accessor_returns_profile_setting() throws {
+    try withTempProfilesDir { dir in
+      let toml = """
+      id = "fast"
+      name = "Fast"
+      model = "m"
+      inferlet = "chat-apc"
+
+      [speculation]
+      enabled = true
+      leader_len = 2
+      draft_len = 5
+      """
+      try toml.write(to: dir.appendingPathComponent("fast.toml"), atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(store.speculation(forProfileID: "fast"),
+                     Profile.Speculation(enabled: true, leaderLen: 2, draftLen: 5))
+    }
+  }
+
+  func test_speculation_accessor_nil_for_unknown_profile() throws {
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertNil(store.speculation(forProfileID: "does-not-exist"))
+    }
+  }
+
+  func test_speculation_accessor_nil_when_section_absent() throws {
+    try withTempProfilesDir { dir in
+      // The seeded chat.toml carries no [speculation] section.
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertNil(store.speculation(forProfileID: "chat"))
+    }
+  }
+
   // MARK: - helpers
 
   private func withTempProfilesDir(_ body: (URL) throws -> Void) throws {

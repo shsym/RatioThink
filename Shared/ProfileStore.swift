@@ -598,6 +598,18 @@ public final class ProfileStore: ObservableObject {
     }
   }
 
+  /// The speculative-decoding ("Fast Think") settings a profile carries,
+  /// or `nil` when the profile has no `[speculation]` section / does not
+  /// exist / failed to parse. `ChatScaffoldView.sendAssistantTurn` reads
+  /// this for the chat's selected profile and threads it into the request
+  /// options so `ChatSendController` can inject it (#426). Mirrors
+  /// `model(forProfileID:)`.
+  public func speculation(forProfileID id: String) -> Profile.Speculation? {
+    stateLock.withLock {
+      _entries.first { $0.profile?.id == id }?.profile?.speculation
+    }
+  }
+
   /// Persist a new default `model` onto the profile with `id`, leaving
   /// every other field untouched. Writes back to the profile's own
   /// on-disk file (not an assumed `<id>.toml`) and force-reloads so the
