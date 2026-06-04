@@ -317,12 +317,31 @@ public struct LaunchSpecResolver {
       return .failure(AppStagedModelProblem(reason: "is a directory, expected a model file"))
     }
     do {
+      // `attributesOfItem` has lstat semantics (no symlink follow), so a
+      // staged symlink reports `.typeSymbolicLink`. The outer
+      // `fileExists(isDirectory:)` above DID follow the link and already
+      // confirmed the target exists and is not a directory — so a symlink
+      // reaching here points at a regular model file.
       let attrs = try fileManager.attributesOfItem(atPath: path)
-      if let type = attrs[.type] as? FileAttributeType,
-         type != .typeRegular {
-        return .failure(AppStagedModelProblem(
-          reason: "is \(type.rawValue), expected a regular model file"
-        ))
+      if let type = attrs[.type] as? FileAttributeType {
+        switch type {
+        case .typeRegular:
+          break  // a plainly-staged GGUF
+        case .typeSymbolicLink:
+          // Accept a staged symlink-to-regular (e.g. `stage-test-model.sh`
+          // links the HF cache, or a user `ln -s`'d a GGUF). Return the
+          // SYMLINK path (the caller's `localPath`) unchanged: pie follows
+          // it and the `.gguf` suffix is preserved, whereas the resolved
+          // blob would be an extension-less path pie rejects. Previously
+          // this hard-failed → `modelMissing`, which ALSO skipped the
+          // HF-cache fallback even when the cache held the model (the
+          // operator's real blocker). Pre-existing, not #413.
+          break
+        default:
+          return .failure(AppStagedModelProblem(
+            reason: "is \(type.rawValue), expected a regular model file"
+          ))
+        }
       }
     } catch {
       return .failure(AppStagedModelProblem(
