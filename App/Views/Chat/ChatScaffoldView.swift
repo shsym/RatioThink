@@ -316,6 +316,16 @@ struct ChatScaffoldView: View {
     // composer with their draft intact — no stale "starting…" sheet.
     .onChange(of: modelLoadCenter.residentModelID) { _, _ in dismissPromptIfResolved() }
     .onChange(of: viewModel.modelOverride) { _, _ in dismissPromptIfResolved() }
+    // #413: open/close the helper-health generation gate around every stream.
+    // While a chat / ToT generation is in flight a saturated engineStatus poll
+    // path can time out for many consecutive polls; without this gate the
+    // restart ladder reads those busy-timeouts as an unreachable helper and
+    // bounces it — killing the engine mid-search and closing the SSE. The gate
+    // holds those failed polls; genuine death still surfaces (the stream drops,
+    // ending the generation and releasing the gate).
+    .onChange(of: sendController.isInFlight) { _, inFlight in
+      helperHealth.setGenerating(inFlight)
+    }
     .onAppear {
       // Seed the toolbar from the persisted profile so the menu
       // label matches what the chat was created with.

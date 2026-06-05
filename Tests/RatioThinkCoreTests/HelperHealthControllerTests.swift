@@ -117,6 +117,49 @@ final class HelperHealthControllerTests: XCTestCase {
     XCTAssertEqual(c.health, .healthy)
   }
 
+  // MARK: - generation gate (#413)
+
+  func test_generationGate_holdsFailedPolls_noRepair() async {
+    let fake = ScriptedRepair([])
+    let c = HelperHealthController(policy: tiny, repair: { await fake.run() })
+    c.setGenerating(true)
+    // Far past transientThreshold (2): a long ToT search saturates the poll
+    // path so many polls time out. Without the gate this bounces the engine
+    // mid-stream (#413).
+    for _ in 0..<10 { c.ingestPollOutcome(succeeded: false) }
+    XCTAssertEqual(c.health, .healthy, "a streaming generation holds busy-timeout polls — no false reconnecting/repair")
+    XCTAssertEqual(fake.calls, 0, "the restart ladder must not reconcile (bounce the helper) mid-stream")
+  }
+
+  func test_generationGate_successPollStillRecovers() async {
+    let fake = ScriptedRepair([])
+    let c = HelperHealthController(policy: tiny, repair: { await fake.run() })
+    c.ingestPollOutcome(succeeded: false)  // reconnecting(1), before the stream
+    XCTAssertEqual(c.health, .reconnecting(consecutiveFailures: 1))
+    c.setGenerating(true)
+    c.ingestPollOutcome(succeeded: true)   // success is never gated
+    XCTAssertEqual(c.health, .healthy, "a live successful poll recovers even mid-generation")
+    XCTAssertEqual(fake.calls, 0)
+  }
+
+  func test_generationGate_release_reArmsLadder() async {
+    let fake = ScriptedRepair([true])
+    let c = HelperHealthController(policy: tiny, repair: { await fake.run() })
+    c.setGenerating(true)
+    for _ in 0..<5 { c.ingestPollOutcome(succeeded: false) }  // all held
+    XCTAssertEqual(c.health, .healthy)
+    c.setGenerating(false)                                    // stream ended
+    // A helper that is genuinely unreachable AFTER the stream still repairs —
+    // the gate only suppresses busy-timeouts DURING a generation.
+    c.ingestPollOutcome(succeeded: false)                     // reconnecting(1)
+    XCTAssertEqual(c.health, .reconnecting(consecutiveFailures: 1))
+    c.ingestPollOutcome(succeeded: false)                     // repairing(1)
+    XCTAssertEqual(c.health, .repairing(attempt: 1), "after the stream ends a real unreachable helper still repairs")
+    await c.awaitRepairForTesting()
+    XCTAssertEqual(c.health, .healthy)
+    XCTAssertEqual(fake.calls, 1)
+  }
+
   // MARK: - fakes
 
   /// Returns scripted reachability results (defaults to `false` once drained).
