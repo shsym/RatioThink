@@ -340,20 +340,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     }
     let token = engineHost.observe { status, _ in
       let shouldFire: (Result<EnginePort, EngineError>)?
-      switch status {
-      case .running(let port, let pid) where pid == spec.profileID:
-        shouldFire = .success(port)
-      case .running:
-        shouldFire = .failure(EngineError(code: .alreadyRunning,
-                                          message: "engine host running a different profile"))
-      case .failed(let code, let message):
-        shouldFire = .failure(EngineError(code: code, message: message))
-      case .stopped:
-        shouldFire = .failure(EngineError(code: .spawnFailed,
-                                          message: "engine returned to stopped before handshake"))
-      case .starting, .stopping:
-        shouldFire = nil
-      }
+      shouldFire = Self.startEngineTerminalResult(for: status, requestedProfileID: spec.profileID)
       guard let result = shouldFire else { return }
       fireOnce(result)
     }
@@ -366,17 +353,58 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     let deadline: TimeInterval = Self.startReplyDeadline
     #endif
     DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + deadline) { [weak engineHost] in
-      // Review v1 F1: cancel the in-flight launch BEFORE firing the
-      // failure reply. Without this the host stays in `.starting`; a
-      // slow `pie serve` boot then publishes `.running` after the
-      // client already received `.handshakeTimeout`, and a subsequent
-      // `startEngine` is rejected with `.alreadyRunning` against an
-      // orphan engine the client never saw acknowledged.
-      engineHost?.stop(reason: "xpc.startEngine.replyTimeoutFallback")
-      fireOnce(.failure(EngineError(
-        code: .handshakeTimeout,
-        message: "startEngine reply-timeout fallback fired after \(deadline)s (host never transitioned out of .starting)"
-      )))
+      // Review v1 F1: when the host is still `.starting`, cancel the in-flight
+      // launch BEFORE firing the failure reply. Without this the host stays in
+      // `.starting`; a slow `pie serve` boot then publishes `.running` after
+      // the client already received `.handshakeTimeout`, and a subsequent
+      // `startEngine` is rejected with `.alreadyRunning` against an orphan
+      // engine the client never saw acknowledged. Critically, this fallback is
+      // NOT a general `stop()` path: if the observer already acknowledged
+      // `.running`, the timer must not kill that healthy engine.
+      guard let engineHost else {
+        fireOnce(.failure(EngineError(
+          code: .handshakeTimeout,
+          message: "startEngine reply-timeout fallback fired after \(deadline)s (host unavailable)"
+        )))
+        return
+      }
+      if engineHost.stopIfStarting(reason: "xpc.startEngine.replyTimeoutFallback") {
+        fireOnce(.failure(EngineError(
+          code: .handshakeTimeout,
+          message: "startEngine reply-timeout fallback fired after \(deadline)s (host never transitioned out of .starting)"
+        )))
+        return
+      }
+      // The fallback deadline can race an already-successful observer callback.
+      // If the host is no longer `.starting`, do NOT call `stop(reason:)`:
+      // stopping `.running` here kills a healthy engine after the XPC request
+      // already received (or is about to receive) its success reply. Instead,
+      // synthesize the same terminal reply the observer would emit; `fireOnce`
+      // is still the single reply gate, so an already-acknowledged request is a
+      // no-op and an unacknowledged terminal state is completed safely.
+      if let result = Self.startEngineTerminalResult(for: engineHost.status, requestedProfileID: spec.profileID) {
+        fireOnce(result)
+      }
+    }
+  }
+
+  private static func startEngineTerminalResult(
+    for status: EngineStatus,
+    requestedProfileID: String
+  ) -> Result<EnginePort, EngineError>? {
+    switch status {
+    case .running(let port, let pid) where pid == requestedProfileID:
+      return .success(port)
+    case .running:
+      return .failure(EngineError(code: .alreadyRunning,
+                                  message: "engine host running a different profile"))
+    case .failed(let code, let message):
+      return .failure(EngineError(code: code, message: message))
+    case .stopped:
+      return .failure(EngineError(code: .spawnFailed,
+                                  message: "engine returned to stopped before handshake"))
+    case .starting, .stopping:
+      return nil
     }
   }
 

@@ -314,6 +314,27 @@ public final class PieEngineHost: @unchecked Sendable {
     }
   }
 
+  /// Cancel an in-flight launch only if the host is still genuinely in
+  /// `.starting`. This is intentionally narrower than `stop(reason:)`: XPC
+  /// reply-timeout fallback code uses it after its own deadline, and that
+  /// fallback must not tear down a healthy `.running` engine whose success reply
+  /// already won (or is about to win) the race.
+  @discardableResult
+  public func stopIfStarting(reason: String) -> Bool {
+    stateQueue.sync {
+      guard case .starting = _state else {
+        DiagnosticLog.helper.event("engine.shutdown.request", [
+          ("reason", reason),
+          ("state", String(describing: _state)),
+          ("action", "skip_not_starting"),
+        ])
+        return false
+      }
+      stopLocked(reason: reason)
+      return true
+    }
+  }
+
   /// Publish a resolver-level failure that happened before `start(_:)`
   /// could create a launch task. This keeps pre-start safety
   /// rejections (notably `.memoryRisk`) visible through the same

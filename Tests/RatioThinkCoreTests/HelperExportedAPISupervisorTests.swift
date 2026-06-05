@@ -155,6 +155,45 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     host.stop()
   }
 
+  func test_startEngine_replyTimeoutFallback_doesNotStopAlreadyAcknowledgedRunningEngine() throws {
+    var session: FakeSession?
+    let host = PieEngineHost(launcher: Self.makeLauncher(port: 31416, sessionSink: { session = $0 }))
+    let spec = makeSpec(profileID: "tree-of-thought")
+    let api = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: { _ in .success(spec) },
+      replyTimeoutOverride: (start: 0.2, stop: 0.3)
+    )
+
+    let exp = expectation(description: "startEngine success reply before fallback")
+    var captured: Result<EnginePort, EngineError>?
+    api.startEngine(profileID: "tree-of-thought") { successData, errorData in
+      captured = try? PieHelperXPCWire.decodeStartEngineReply(
+        successData: successData, errorData: errorData
+      )
+      exp.fulfill()
+    }
+    wait(for: [exp], timeout: 2)
+    guard case .success(let port)? = captured else {
+      host.stop()
+      return XCTFail("expected .success before fallback; got \(String(describing: captured))")
+    }
+    XCTAssertEqual(port, 31416)
+
+    let fallbackExpired = expectation(description: "fallback deadline passed")
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { fallbackExpired.fulfill() }
+    wait(for: [fallbackExpired], timeout: 2)
+
+    guard case .running(let livePort, let liveProfile) = host.status else {
+      return XCTFail("reply-timeout fallback stopped an already-acknowledged engine; status=\(host.status)")
+    }
+    XCTAssertEqual(livePort, 31416)
+    XCTAssertEqual(liveProfile, "tree-of-thought")
+    XCTAssertEqual(session?.shutdownCount, 0,
+                   "fallback must not shutdown a running engine after startEngine already replied success")
+    host.stop()
+  }
+
   func test_startEngine_propagatesHostFailure() throws {
     let host = PieEngineHost(launcher: Self.makeFailingLauncher(message: "fake spawn boom"))
     let spec = makeSpec(profileID: "chat")
