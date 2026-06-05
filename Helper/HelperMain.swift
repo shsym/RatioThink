@@ -71,6 +71,19 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// "continue with a beep" failure mode (review v4 F4).
   private var degradedReason: PieDirsError?
 
+  /// Test seam over the `NSWorkspace` app-launch `openPieApp` performs.
+  /// Production leaves it `nil` and the real `NSWorkspace.shared`
+  /// launches/foregrounds the resolved parent bundle (delivering any
+  /// deep-link URLs). A unit test sets it to capture `(urls, appURL)` and
+  /// assert that the menu-bar "Settings…" item delivers exactly
+  /// `[SettingsDeepLink.settingsURL]` to `resolvedPieAppURL()` — the wiring
+  /// that otherwise silently degrades to a plain app-foreground on a refactor
+  /// (#440). A settable property rather than a constructor-injected closure
+  /// (the idiom for `PieSupervisor.killProcessOverride`) because
+  /// `HelperAppDelegate` is `@main`-constructed with no init seam; `nil` in
+  /// production keeps the real launch path untouched.
+  var workspaceOpenOverride: ((_ urls: [URL], _ appURL: URL) -> Void)?
+
   static func main() {
     let app = NSApplication.shared
     let delegate = HelperAppDelegate()
@@ -79,6 +92,19 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationDidFinishLaunching(_ note: Notification) {
+    // When this helper hosts the #440 RatioThinkHelperTests unit bundle its
+    // code is loaded in-process, and the real boot would otherwise run: status
+    // item, login-item registration, and the XPC-listener bind whose
+    // `verifyStartupInvariants` hard-traps under the ad-hoc-signed test host
+    // (no Team Identifier). XCTest's own `XCTestConfigurationFilePath` marker is
+    // injected only AFTER launch, too late for this boot path, so the test
+    // scheme sets this env var instead — scheme env is present from launch. It
+    // is never set in production or by the App-spawned helper subprocess, so
+    // this skips boot ONLY under the unit-test scheme.
+    if ProcessInfo.processInfo.environment["PIE_TEST_HELPER_NO_BOOT"] == "1" {
+      Log.helper.info("PIE_TEST_HELPER_NO_BOOT=1; skipping helper boot (unit-test host)")
+      return
+    }
     HelperConfig.assertStartupContract()
     Log.helper.info("RatioThinkHelper launched (xpc=\(HelperConfig.xpcServiceName, privacy: .public) testMode=\(HelperConfig.isTestMode, privacy: .public))")
     let info = Bundle.main.infoDictionary
@@ -1244,7 +1270,10 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// launch.
   private static let pieAppAncestorMaxDepth = 6
 
-  private func resolvedPieAppURL() -> URL {
+  // `internal` (not `private`) so the #440 delivery unit test can assert the
+  // deep link is delivered to exactly this resolved bundle. Still file-scoped
+  // to the helper module; exposed only under `@testable import`.
+  func resolvedPieAppURL() -> URL {
     let helperBundle = Bundle.main.bundleURL
     // Review v4 F33: walk ancestors up to a bounded depth looking
     // for ANY `*.app`. The v3 fixed 4-up walk landed in the wrong
@@ -1305,6 +1334,12 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   private func openPieApp(delivering urls: [URL] = []) {
     let url = resolvedPieAppURL()
     Log.helper.info("openPieApp: \(url.path, privacy: .public) urls=\(urls.map(\.absoluteString).joined(separator: ","), privacy: .public)")
+    // Test seam: capture the delivered URLs + resolved bundle instead of
+    // actually launching an app (#440). Nil in production.
+    if let workspaceOpenOverride {
+      workspaceOpenOverride(urls, url)
+      return
+    }
     let cfg = NSWorkspace.OpenConfiguration()
     cfg.activates = true
     let completion: (NSRunningApplication?, Error?) -> Void = { [weak self] app, err in
