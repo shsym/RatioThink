@@ -60,7 +60,7 @@ endef
 
 .PHONY: help genproject build build-tests clean lint \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
-        test-xcode-chat-scaffold \
+        test-xcode-chat-scaffold test-app-unit \
         test-unit test-scenario test-smoke test-curated-hf test-install-guards test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
@@ -116,6 +116,30 @@ test-xcode-chat-scaffold: genproject $(LOGDIR) ## Run Xcode-only ChatScaffold un
 	  fi; \
 	  if ! grep -Eq 'Executed [1-9][0-9]* tests, with 0 failures' $$LOG; then \
 	    echo "FAIL: expected XCTest executed-test summary for ChatScaffoldModelSelectionTests"; \
+	    exit 1; \
+	  fi
+
+test-app-unit: genproject $(LOGDIR) ## App-tier unit bundle (xcodebuild RatioThinkTests): #420 deep-link/login-item guards, ChatScaffold, ZeroState, snapshots — deterministic, headless (local tier; CI only compiles it via build-tests)
+	@# RatioThinkTests is the app-hosted xcodebuild unit bundle. CI does NOT
+	@# run it (CI-scope policy: app-tier suites are a local responsibility);
+	@# build-tests only COMPILES it there. This target runs the whole bundle
+	@# so the #420 CFBundleURLTypes scheme-drop guard (SettingsDeepLinkBundleTests)
+	@# and the menuBarPersistenceSummary copy guard (LoginItemPersistenceSummaryTests)
+	@# actually assert. Headless (unit, not GUI) — no seated session needed.
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-app-unit.log; \
+	  xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
+	    -destination 'platform=macOS,arch=arm64' \
+	    -configuration Debug \
+	    -parallel-testing-enabled NO \
+	    -only-testing:RatioThinkTests \
+	    ENABLE_CODE_COVERAGE=NO \
+	    test 2>&1 | tee $$LOG | tail -40; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  if [ "$$status" -ne 0 ]; then exit "$$status"; fi; \
+	  if ! grep -Eq 'Executed [1-9][0-9]* tests, with 0 failures' $$LOG; then \
+	    echo "FAIL: RatioThinkTests bundle did not report an executed-test summary (zero-test guard — filter matched nothing or the bundle did not run)"; \
 	    exit 1; \
 	  fi
 
@@ -359,9 +383,9 @@ test-helper-respawn: ## Acceptance: live launchd Helper auto-respawn (needs sign
 test-helper-recovery: ## Acceptance: App-side runtime helper recovery #412 (needs signed install + RatioThink.app running)
 	Scripts/verify-helper-recovery.sh
 
-test-ssh: test-unit test-scenario test-smoke test-install-guards ## Everything runnable under SSH (no GUI)
+test-ssh: test-unit test-scenario test-smoke test-install-guards ## Everything runnable under SSH (no GUI; SPM-only, no xcodebuild app build)
 
-test-all: test-ssh test-gui ## Everything (GUI tests skip if no seated session)
+test-all: test-ssh test-app-unit test-gui ## Everything (app-unit bundle + GUI; GUI tests skip if no seated session)
 
 clean: ## Remove build outputs
 	rm -rf .build RatioThink.xcodeproj DerivedData $(LOGDIR)
