@@ -213,6 +213,13 @@ public struct LaunchSpecResolver {
     let shmem = Self.uniqueShmemName()
     let env = subprocessEnvironment()
     do {
+      // Memory-aware KV pool (#438 Phase 2): size `max_num_kv_pages` from
+      // the same RAM policy the size guardrail uses, so the per-request
+      // output ceiling chat-apc reads back (`runtime::max-output-tokens`)
+      // scales with host RAM. `nil` on a non-roomy / unknown-RAM host →
+      // the engine keeps its default; the driver backoff clamps any
+      // over-request to what actually fits.
+      let maxKVPages = KVCacheBudget.recommendedMaxPages(for: memoryPolicy())
       let spec = try PieControlLauncher.LaunchSpec(
         pieBinary: binary,
         wasmURL: resources.wasm,
@@ -222,7 +229,8 @@ public struct LaunchSpecResolver {
         shmemName: shmem,
         inferletNameAtVersion: inferletNameAtVersion,
         profileID: profile.id,
-        modelConfig: .portableResolved(servedModelID: profile.model, modelRef: modelRef)
+        modelConfig: .portableResolved(servedModelID: profile.model, modelRef: modelRef),
+        maxKVPages: maxKVPages
       )
       return .success(spec)
     } catch {

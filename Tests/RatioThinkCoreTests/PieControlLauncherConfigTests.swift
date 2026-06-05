@@ -41,6 +41,47 @@ final class PieControlLauncherConfigTests: XCTestCase {
                    "portable config must not emit the dummy-driver block")
   }
 
+  func test_portable_body_omits_kv_override_when_nil() {
+    // #438 Phase 2: with no memory-aware override, the body must NOT emit
+    // a driver-options block — the engine keeps its own KV-pool default,
+    // preserving the pre-#438 behavior on small / unknown-RAM hosts.
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      maxKVPages: nil
+    )
+    XCTAssertFalse(body.contains("[model.driver.options]"),
+                   "nil maxKVPages must omit the driver-options block; got:\n\(body)")
+    XCTAssertFalse(body.contains("max_num_kv_pages"),
+                   "nil maxKVPages must not write a max_num_kv_pages override")
+  }
+
+  func test_portable_body_emits_kv_override_when_set() {
+    // #438 Phase 2: a memory-aware override writes max_num_kv_pages (plus
+    // kv_page_size so token capacity = pages * page_size is
+    // self-consistent) into [model.driver.options].
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      maxKVPages: 2048
+    )
+    XCTAssertTrue(body.contains("[model.driver.options]"),
+                  "an override must emit the driver-options block; got:\n\(body)")
+    // Assert the exact key = value lines, not a loose substring, so a
+    // regression in the emitted number or key name is caught.
+    XCTAssertTrue(body.contains("max_num_kv_pages = 2048"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("kv_page_size = 32"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("type = \"portable\""),
+                  "the override rides the portable driver block")
+  }
+
+  func test_metal_body_emits_kv_override_when_set() {
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .metal(modelID: "Qwen/Qwen3-0.6B"),
+      maxKVPages: 4096
+    )
+    XCTAssertTrue(body.contains("max_num_kv_pages = 4096"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
+  }
+
   func test_portableResolved_serves_under_profile_slug_with_distinct_hf_repo_path() {
     // The crux of the id-unification fix ( follow-up): the engine's
     // served `name` is the profile slug the App carries everywhere, while
