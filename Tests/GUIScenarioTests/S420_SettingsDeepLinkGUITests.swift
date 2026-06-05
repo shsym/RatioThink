@@ -54,11 +54,10 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
               "RatioThink.app did not reach runningForeground")
     app.activate()
 
-    // Precondition: no Settings window yet — so the post-delivery window is
-    // unambiguously the deep link's doing, not launch-time restoration.
+    // Precondition: no Settings window yet — so a post-delivery Settings window
+    // is unambiguously the deep link's doing, not launch-time restoration.
     let settings = app.windows.matching(identifier: Self.settingsWindowID).firstMatch
     XCTAssertFalse(settings.exists, "a Settings window was already open before the deep link")
-    let before = app.windows.count
 
     // Deliver the deep link exactly as the menu-bar Helper does: to the
     // running app-under-test's own bundle, so LaunchServices can't route it to
@@ -73,18 +72,27 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
     }
     await fulfillment(of: [delivered], timeout: 10)
 
-    // The deep link must open the Settings scene (not just foreground the app).
+    // The deep link must open the Settings scene. If the routing glue is
+    // dropped, the URL degrades to a plain app-foreground and NO Settings
+    // window ever appears — this is the regression the test guards.
     XCTAssertTrue(
       settings.waitForExistence(timeout: 5),
       "ratiothink://settings did not open the Settings window — the deep link "
-        + "degraded to a plain app-foreground (had \(before) window(s) before; "
-        + "expected SwiftUI identifier '\(Self.settingsWindowID)')")
-    XCTAssertEqual(
-      app.windows.count, before + 1,
-      "expected exactly one new window from the deep link; got delta=\(app.windows.count - before)")
-    // `NSApp.activate()` in the handler brings the app forward; the Settings
-    // window is hittable only when it is actually frontmost and interactive.
-    XCTAssertTrue(settings.isHittable, "Settings window opened but is not frontmost")
+        + "degraded to a plain app-foreground (expected SwiftUI identifier "
+        + "'\(Self.settingsWindowID)')")
+    // Prove it is the REAL, rendered Settings scene the user can act on, not a
+    // blank or degenerate window: its tab toolbar must be present (mirrors
+    // S5_AppWindowShellGUITests). AX elements are queryable regardless of
+    // z-order, so this holds even though delivering the URL via LaunchServices
+    // also re-raises a main window over the freshly-opened Settings.
+    let generalTab = settings.toolbars.buttons.matching(identifier: "General").firstMatch
+    XCTAssertTrue(
+      generalTab.waitForExistence(timeout: 3),
+      "Settings window opened but its tabs did not render — deep link did not "
+        + "reach the real Settings scene")
+    // …and the deep link must bring RatioThink forward (NSApp.activate() in the
+    // handler), the foreground half of "open straight to Settings".
+    XCTAssertEqual(app.state, .runningForeground, "deep link did not foreground the app")
   }
 
   /// The bundle URL of the running app under test. The deep link is delivered
