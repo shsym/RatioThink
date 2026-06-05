@@ -19,8 +19,8 @@ settings:
     # GENERATE_INFOPLIST_FILE=YES synthesizes CFBundleShortVersionString /
     # CFBundleVersion from these build settings; without them the version
     # keys in each target's info.properties are dropped from the built bundle.
-    MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.1.1"
+    CURRENT_PROJECT_VERSION: "2"
     ENABLE_HARDENED_RUNTIME: NO
     DEAD_CODE_STRIPPING: YES
   configs:
@@ -41,6 +41,15 @@ settings:
       # injection guarantees the notarization candidate is clean regardless of
       # the signing identity. Debug keeps injection on so lldb can attach.
       CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+      # Force a secure timestamp on the Release codesign. `xcodebuild build`
+      # signs with `--timestamp=none` by default (only `archive`/export reach a
+      # secure TSA), but the notary service REJECTS any executable without one
+      # ("The signature does not include a secure timestamp"). Setting it on the
+      # Release config means both the app and the embedded helper that Xcode
+      # signs get a secure timestamp; the pie engine already signs --timestamp
+      # in build-pie-engine.sh. The RatioThink target adds --preserve-metadata
+      # via $(inherited), so both flags survive on the app target.
+      OTHER_CODE_SIGN_FLAGS: $(inherited) --timestamp
 
 packages:
   TOMLKit:
@@ -164,11 +173,19 @@ targets:
         CFBundleIconFile: AppIcon
         CFBundleName: RatioThink
         CFBundleDisplayName: RatioThink
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.1.1"
+        CFBundleVersion: "2"
         NSHumanReadableCopyright: "© 2026 RatioThink"
         NSSupportsAutomaticTermination: false
         NSSupportsSuddenTermination: false
+        # `ratiothink://` deep-link scheme. The menu-bar Helper opens
+        # `ratiothink://settings` so the app routes straight to Settings
+        # (App/SettingsURLHandler.swift) instead of merely foregrounding the
+        # window. Scheme string is owned by Shared/SettingsDeepLink.swift.
+        CFBundleURLTypes:
+          - CFBundleURLName: com.ratiothink.app.deeplink
+            CFBundleURLSchemes:
+              - ratiothink
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ratiothink.app
@@ -203,8 +220,8 @@ targets:
         CFBundleIdentifier: com.ratiothink.app.helper
         CFBundleName: RatioThinkHelper
         CFBundleDisplayName: RatioThinkHelper
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.1.1"
+        CFBundleVersion: "2"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ratiothink.app.helper

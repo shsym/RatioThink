@@ -235,10 +235,123 @@ final class ChatSendControllerTests: XCTestCase {
     )
   }
 
+  // MARK: - #2 model-not-found copy
+
+  /// A `model_not_found` rejection (engine running, requested model not
+  /// served) collapses into ONE plain, actionable line naming the model
+  /// — not the raw "Engine error (model_not_found): …" diagnostic.
+  func test_failureCopy_model_not_found_api_is_plain_actionable_line() {
+    let modelID = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    let error = HTTPEngineError.api(status: 404, code: "model_not_found",
+                                    message: "model not found in registry; available: [other]")
+    let copy = ChatSendController.failureCopy(for: error, requestedModelID: modelID)
+    XCTAssertEqual(
+      copy,
+      "Model \(ModelDisplayName.leaf(modelID)) isn’t installed — download it in Settings → Models, or pick another model.")
+    XCTAssertFalse(copy.contains("model_not_found"), "the raw engine code must not leak into the user copy")
+  }
+
+  /// Same plain copy for a mid-stream `model_not_found` meta-frame.
+  func test_failureCopy_model_not_found_stream_frame_without_modelID() {
+    let error = HTTPEngineError.stream(code: "model_not_found", message: "noisy detail")
+    let copy = ChatSendController.failureCopy(for: error, requestedModelID: nil)
+    XCTAssertEqual(
+      copy,
+      "The selected model isn’t installed — download it in Settings → Models, or pick another model.")
+  }
+
+  /// Every other engine error passes through the existing formatter — the
+  /// plain copy is scoped strictly to model-not-found.
+  func test_failureCopy_other_errors_pass_through_unchanged() {
+    let error = HTTPEngineError.engineGone(detail: "exit 1")
+    let copy = ChatSendController.failureCopy(for: error, requestedModelID: "x")
+    XCTAssertFalse(copy.contains("isn’t installed"),
+                   "a non-model-not-found error must not be rewritten; got \(copy)")
+  }
+
+  func test_isModelNotFound_only_matches_that_code() {
+    XCTAssertTrue(HTTPEngineError.api(status: 404, code: "model_not_found", message: "").isModelNotFound)
+    XCTAssertTrue(HTTPEngineError.stream(code: "model_not_found", message: "").isModelNotFound)
+    XCTAssertFalse(HTTPEngineError.api(status: 500, code: "internal", message: "").isModelNotFound)
+    XCTAssertFalse(HTTPEngineError.engineGone(detail: "").isModelNotFound)
+  }
+
   private func assistantMessages(in chat: Chat) -> [Message] {
     chat.messages
       .filter { $0.role == ChatMessage.Role.assistant.rawValue }
       .sorted { $0.ts < $1.ts }
+  }
+
+  // MARK: - speculation injection (#426 Fast Think)
+
+  /// Drive `send` and return the single `ChatRequest` the engine saw.
+  private func capturedRequest(
+    speculation: Profile.Speculation?,
+    sampling: ChatSampling = ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 100)
+  ) async throws -> ChatRequest {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [.delta(role: .assistant, content: "ok"), .finish(reason: .stop)])
+    let controller = ChatSendController()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m", sampling: sampling, speculation: speculation)
+    )
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+    return try XCTUnwrap(engine.requests.first)
+  }
+
+  func test_send_enabledSpeculation_attaches_field_and_forces_greedy_temp() async throws {
+    let req = try await capturedRequest(
+      speculation: Profile.Speculation(enabled: true, leaderLen: 2, draftLen: 5))
+    XCTAssertEqual(req.speculation, ChatSpeculation(enabled: true, leaderLen: 2, draftLen: 5))
+    XCTAssertEqual(req.sampling.temperature, 0, "enabled speculation must force greedy decode")
+    XCTAssertEqual(req.sampling.topP, 0.9, "other sampling knobs preserved")
+    XCTAssertEqual(req.sampling.maxTokens, 100)
+  }
+
+  func test_send_nilSpeculation_no_field_and_temp_unchanged() async throws {
+    let req = try await capturedRequest(speculation: nil)
+    XCTAssertNil(req.speculation, "no profile speculation → byte-identical normal chat")
+    XCTAssertEqual(req.sampling.temperature, 0.7, "temperature untouched without speculation")
+  }
+
+  func test_send_disabledSpeculation_no_field_and_temp_unchanged() async throws {
+    let req = try await capturedRequest(speculation: Profile.Speculation(enabled: false))
+    XCTAssertNil(req.speculation, "disabled speculation must not attach the field")
+    XCTAssertEqual(req.sampling.temperature, 0.7)
+  }
+
+  /// End-to-end golden tie: the seeded built-in "Fast Think" profile must
+  /// produce exactly the inferlet-facing body that engages the #418
+  /// drafter — `speculation.enabled == true` AND a greedy top-level
+  /// `temperature == 0`. Drives the real request builder with the seeded
+  /// TOML's speculation and a NON-greedy toolbar sampling (0.7) to prove
+  /// the chokepoint forces greedy regardless. (#426)
+  func test_seeded_fast_think_profile_yields_drafting_body() async throws {
+    let profile = try Profile.parse(toml: ProfileStore.defaultFastThinkTOML)
+    XCTAssertEqual(profile.speculation, Profile.Speculation(enabled: true),
+                   "seeded Fast Think profile must enable speculation")
+
+    let req = try await capturedRequest(
+      speculation: profile.speculation,
+      sampling: ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 100))
+
+    let body = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try JSONEncoder().encode(req)) as? [String: Any])
+    let spec = try XCTUnwrap(body["speculation"] as? [String: Any])
+    XCTAssertEqual(spec["enabled"] as? Bool, true)
+    XCTAssertEqual(body["temperature"] as? Double, 0,
+                   "Fast Think body must be greedy (temp 0) so the drafter engages")
   }
 
   private func waitUntil(

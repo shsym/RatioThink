@@ -83,8 +83,16 @@ if [ "$needs_build" = "1" ]; then
   # Review v1 F5: --locked forbids transitive crate version drift
   # between the developer who regenerated the stamp and any later
   # rebuild (CI or otherwise). Cargo.lock IS the input declaration.
+  # Strip absolute build-machine paths from the wasm. Without remapping, rustc
+  # bakes the build user's home dir + username (cargo registry, rustup std, and
+  # this repo path) into the prebuilt artifact's panic/debug strings, which then
+  # ship both in git and inside the app bundle. --remap-path-prefix
+  # rewrites them to machine-independent roots; this also aids reproducibility.
+  REMAP_FLAGS="--remap-path-prefix=$HOME=/home --remap-path-prefix=$ROOT=/src"
   echo "[stamp] cargo build --release --locked --target wasm32-wasip2 ($INFERLET_DIR)"
-  (cd "$INFERLET_DIR" && cargo build --release --locked --target wasm32-wasip2)
+  (cd "$INFERLET_DIR" && \
+    RUSTFLAGS="${RUSTFLAGS:-} $REMAP_FLAGS" \
+    cargo build --release --locked --target wasm32-wasip2)
 
   if [ ! -f "$BUILT_WASM" ]; then
     echo "error: cargo reported success but $BUILT_WASM is missing" >&2

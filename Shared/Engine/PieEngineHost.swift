@@ -191,13 +191,15 @@ public final class PieEngineHost: @unchecked Sendable {
     livenessInterval: TimeInterval = 5,
     livenessFailureThreshold: Int = 2,
     relaunchPolicy: RelaunchPolicy = RelaunchPolicy(),
-    relauncher: Relauncher? = nil
+    relauncher: Relauncher? = nil,
+    clock: @Sendable @escaping () -> Date = { Date() }
   ) {
     self.launcher = launcher ?? PieEngineHost.productionLauncher
     self.livenessInterval = livenessInterval
     self.livenessFailureThreshold = max(1, livenessFailureThreshold)
     self.relaunchPolicy = relaunchPolicy
     self.relauncher = relauncher
+    self.clock = clock
   }
 
   private let launcher: LauncherCall
@@ -205,6 +207,13 @@ public final class PieEngineHost: @unchecked Sendable {
   private let livenessFailureThreshold: Int
   private let relaunchPolicy: RelaunchPolicy
   private let relauncher: Relauncher?
+
+  /// Wall-clock source for the slow-flap window math, injectable so a
+  /// test can advance time deterministically instead of sleeping —
+  /// the window prune is otherwise racy against the real liveness and
+  /// backoff timers. Defaults to `Date()` (production + existing
+  /// callers unaffected).
+  private let clock: @Sendable () -> Date
 
   /// Production launcher: bridge `PieControlLauncher.launch` into the
   /// `(EnginePort, any EngineSession)` shape `PieEngineHost`
@@ -627,7 +636,7 @@ public final class PieEngineHost: @unchecked Sendable {
     guard let relauncher else { return }
     guard relaunchPolicy.maxAttempts > 0 else { return }
 
-    let now = Date()
+    let now = clock()
     autoRelaunchAttempts.removeAll { now.timeIntervalSince($0) > relaunchPolicy.window }
     guard autoRelaunchAttempts.count < relaunchPolicy.maxAttempts else {
       Log.engine.error("PieEngineHost: auto-relaunch ladder exhausted (\(self.autoRelaunchAttempts.count, privacy: .public)/\(self.relaunchPolicy.maxAttempts, privacy: .public) inside \(self.relaunchPolicy.window, privacy: .public)s); leaving .failed(.engineGone) until a sustained healthy .running re-arms the cap (review v1 F2)")
@@ -683,7 +692,7 @@ public final class PieEngineHost: @unchecked Sendable {
   /// on access). Owned by `stateQueue`.
   internal var autoRelaunchAttemptsForTesting: Int {
     stateQueue.sync {
-      let now = Date()
+      let now = self.clock()
       self.autoRelaunchAttempts.removeAll { now.timeIntervalSince($0) > self.relaunchPolicy.window }
       return self.autoRelaunchAttempts.count
     }

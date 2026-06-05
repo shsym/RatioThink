@@ -720,6 +720,23 @@ extension HTTPEngineError: LocalizedError, CustomStringConvertible {
   }
 }
 
+extension HTTPEngineError {
+  /// #2: the engine answered but rejected the request because it does not
+  /// serve the requested model — pie's `/v1/chat/completions` (or
+  /// `/v1/models/load`) returns `model_not_found`, on the pre-stream
+  /// `.api` envelope or the mid-stream `.stream` meta-frame. The single
+  /// signal the plain "Model X isn’t installed — …" copy keys on, so a
+  /// chatting user sees one actionable line instead of the raw
+  /// `Engine error (model_not_found): …` diagnostic.
+  public var isModelNotFound: Bool {
+    switch self {
+    case let .api(_, code, _):   return code == "model_not_found"
+    case let .stream(code, _):   return code == "model_not_found"
+    default:                     return false
+    }
+  }
+}
+
 // MARK: - Engine FaultClass
 
 /// The engine-side fault taxonomy pie's daemon emits on the HTTP

@@ -2,6 +2,9 @@ import Foundation
 
 final class EnvironmentFakeModelDownloader: ModelDownloading, @unchecked Sendable {
   private let environment: [String: String]
+  private let lock = NSLock()
+  private var continuations: [UUID: AsyncStream<DownloadProgress>.Continuation] = [:]
+  private var cancelledHandles: Set<UUID> = []
 
   init(environment: [String: String] = ProcessInfo.processInfo.environment) {
     self.environment = environment
@@ -11,13 +14,54 @@ final class EnvironmentFakeModelDownloader: ModelDownloading, @unchecked Sendabl
     .success(DownloadHandle(repo: repo, file: file))
   }
 
+  /// #218: honor cancel so the GUI cancel → "Discard?" confirm →
+  /// `.cancelled` flow is observable. The production `ModelDownloader`
+  /// emits `.cancelled` synchronously on a hard cancel; this double
+  /// mirrors that by yielding a terminal `.cancelled` to the live
+  /// progress stream (the fake otherwise holds at `.downloading`).
   func cancel(handle: DownloadHandle) -> DownloadError? {
-    nil
+    lock.lock()
+    cancelledHandles.insert(handle.id)
+    let continuation = continuations[handle.id]
+    lock.unlock()
+    continuation?.yield(DownloadProgress(
+      handleID: handle.id,
+      phase: .cancelled,
+      bytesReceived: 25_000_000,
+      bytesExpected: 100_000_000,
+      etaSeconds: nil,
+      verification: .notApplicable
+    ))
+    continuation?.finish()
+    return nil
   }
 
   func progress(for handle: DownloadHandle) -> AsyncStream<DownloadProgress> {
     AsyncStream { continuation in
-      Task {
+      lock.lock()
+      continuations[handle.id] = continuation
+      let alreadyCancelled = cancelledHandles.contains(handle.id)
+      lock.unlock()
+      if alreadyCancelled {
+        continuation.yield(DownloadProgress(
+          handleID: handle.id,
+          phase: .cancelled,
+          bytesReceived: 25_000_000,
+          bytesExpected: 100_000_000,
+          etaSeconds: nil,
+          verification: .notApplicable
+        ))
+        continuation.finish()
+        return
+      }
+      continuation.onTermination = { [weak self] _ in
+        guard let self else { return }
+        self.lock.lock()
+        self.continuations[handle.id] = nil
+        self.lock.unlock()
+      }
+      Task { [weak self] in
+        guard let self else { return }
         continuation.yield(DownloadProgress(
           handleID: handle.id,
           phase: .starting,
@@ -26,6 +70,7 @@ final class EnvironmentFakeModelDownloader: ModelDownloading, @unchecked Sendabl
           etaSeconds: 60
         ))
         try? await Task.sleep(nanoseconds: 150_000_000)
+        if self.isCancelled(handle.id) { return }
         continuation.yield(DownloadProgress(
           handleID: handle.id,
           phase: .downloading,
@@ -33,9 +78,10 @@ final class EnvironmentFakeModelDownloader: ModelDownloading, @unchecked Sendabl
           bytesExpected: 100_000_000,
           etaSeconds: 60
         ))
-        if let failure = environment["PIE_TEST_FAKE_DOWNLOAD_FAILURE"],
+        if let failure = self.environment["PIE_TEST_FAKE_DOWNLOAD_FAILURE"],
            !failure.isEmpty {
           try? await Task.sleep(nanoseconds: 150_000_000)
+          if self.isCancelled(handle.id) { return }
           continuation.yield(DownloadProgress(
             handleID: handle.id,
             phase: .failed,
@@ -63,7 +109,15 @@ final class EnvironmentFakeModelDownloader: ModelDownloading, @unchecked Sendabl
           ))
           continuation.finish()
         }
+        // Otherwise hold at `.downloading` (no terminal) so the row stays
+        // cancelable until `cancel(handle:)` yields `.cancelled`.
       }
     }
+  }
+
+  private func isCancelled(_ id: UUID) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return cancelledHandles.contains(id)
   }
 }

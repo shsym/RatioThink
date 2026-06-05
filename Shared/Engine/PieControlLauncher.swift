@@ -965,20 +965,31 @@ public actor LaunchedSession {
           if let a = address, let t = token {
             return PieControlLauncher.Handshake(address: a, token: t)
           }
-          if await self?.isProcessRunning() == false {
+          // #2 root: confirm a REAL exit before classifying engineExitedEarly.
+          // `process.isRunning` is wait4-backed and can momentarily misread a
+          // still-loading engine under heavy model-load pressure; a brief
+          // settle + re-check separates a true exit from a transient blip, so a
+          // live engine is never mislabeled `.spawnFailed`.
+          if await self?.confirmedExit() == true {
             throw PieControlLauncher.LaunchError.engineExitedEarly(
               code: Int32((await self?.terminationStatusIfExited()) ?? -1),
               stderrTail: (await self?.recentLinesJoined()) ?? ""
             )
           }
         }
-        // Stream finished — either EOF (pie exited) or handler
-        // dropped by the parent task's cancellation. Treat both
-        // as a hard error and let `handshakeTimeout` win the race
-        // if we got cancelled.
-        throw PieControlLauncher.LaunchError.engineExitedEarly(
-          code: Int32((await self?.terminationStatusIfExited()) ?? -1),
-          stderrTail: (await self?.recentLinesJoined()) ?? ""
+        // Stream finished (stdout EOF or parent cancellation). Only a
+        // CONFIRMED process exit is `engineExitedEarly`; a benign EOF while the
+        // engine is still alive (stdout closed before READY) falls back to the
+        // handshake timeout rather than a spurious early-exit (#2 root).
+        if await self?.confirmedExit() == true {
+          throw PieControlLauncher.LaunchError.engineExitedEarly(
+            code: Int32((await self?.terminationStatusIfExited()) ?? -1),
+            stderrTail: (await self?.recentLinesJoined()) ?? ""
+          )
+        }
+        throw PieControlLauncher.LaunchError.handshakeTimeout(
+          elapsed: Date().timeIntervalSince(started),
+          lastLines: (await self?.recentLines()) ?? []
         )
       }
       // Timeout child — wins if the reader doesn't find both
@@ -1006,6 +1017,19 @@ public actor LaunchedSession {
   private func isProcessRunning() -> Bool { process.isRunning }
   private func terminationStatusIfExited() -> Int32 {
     process.isRunning ? -1 : process.terminationStatus
+  }
+
+  /// Confirm a REAL subprocess exit before classifying `engineExitedEarly`.
+  /// Foundation's `process.isRunning` is wait4-backed and can momentarily
+  /// misread under load (the same class of race as the supervisor handshake
+  /// timeout); one brief settle + re-check separates a true exit from a
+  /// transient blip or a benign stdout EOF while the engine is still loading
+  /// (#2 root). Returns true only when the process is confirmed not-running
+  /// after the settle.
+  private func confirmedExit() async -> Bool {
+    guard !process.isRunning else { return false }
+    try? await Task.sleep(nanoseconds: 250_000_000)
+    return !process.isRunning
   }
 
   /// Streams `\n`-terminated lines from `stdout` until either:

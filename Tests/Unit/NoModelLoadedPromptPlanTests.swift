@@ -38,7 +38,6 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     XCTAssertEqual(p.reason, "fork ENOENT")        // reason AT the gate, not only the banner
     XCTAssertEqual(p.primary, .retryEngine)
     XCTAssertFalse(p.showsOpenSettings)
-    XCTAssertTrue(p.showsChooseAnother)
   }
 
   func test_engineGone_is_retryable() {
@@ -65,7 +64,6 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     XCTAssertEqual(p.reason, "zombie pid 42")
     XCTAssertEqual(p.primary, .none)
     XCTAssertFalse(p.showsOpenSettings)
-    XCTAssertTrue(p.showsChooseAnother)
   }
 
   func test_modelMissing_downloadable_offers_inline_download() {

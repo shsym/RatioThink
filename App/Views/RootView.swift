@@ -10,10 +10,11 @@ struct RootView: View {
   /// indicator state that gates the engine-error banner. Both are
   /// injected at app scope (`RatioThinkApp`).
   @EnvironmentObject private var engineStatusStore: EngineStatusStore
-  @EnvironmentObject private var modelLoadCenter: ModelLoadCenter
-  /// #412: background-helper health. Drives the loud escalation banner when
-  /// the App's restart ladder can't bring the helper back.
+  /// #412: background-helper health. Drives the helper axis of the unified
+  /// status banner (calm "reconnecting" → loud "can't reach helper").
   @EnvironmentObject private var helperHealth: HelperHealthController
+  /// Active-profile lookup, for the engine-axis Force Restart target.
+  @EnvironmentObject private var profileStore: ProfileStore
   /// #411: persisted ignore-set for update versions + the launch-time update
   /// check state that drives the non-modal `UpdateAvailableBanner`.
   @EnvironmentObject private var appPreferences: AppPreferences
@@ -23,21 +24,21 @@ struct RootView: View {
   var body: some View {
     VStack(spacing: 0) {
       PersistenceBanner(status: persistenceStatus)
-      // #412: the most fundamental failure — a dead background helper the App
-      // couldn't auto-recover — surfaces ABOVE the engine banner. (When the
-      // helper is unreachable the engine status sticks at .starting, so
-      // EngineStatusBanner stays silent and this is the only loud surface.)
-      HelperUnreachableBanner(helperHealth: helperHealth)
-      // Loud surface for engine/load failures only; quiet for everything
-      // else. Self-hides via the reducer + dedup signature.
-      EngineStatusBanner(
-        indicatorState: EngineIndicatorState.make(
+      // Unified, source-labeled engine/helper status banner (one poll-count
+      // policy, both axes). Tier 0 renders nothing (the toolbar pip shows
+      // "Starting… (Ns)"); Tier 1 a calm "reconnecting" bar; Tier 2 a loud
+      // error bar with a source-aware Force Restart. Supersedes the separate
+      // HelperUnreachableBanner + EngineStatusBanner.
+      UnifiedStatusBannerView(
+        banner: StatusBannerReducer.make(
           engine: engineStatusStore.status,
-          engineDetail: engineStatusStore.statusDetail,
-          load: modelLoadCenter.state,
-          residentModelID: modelLoadCenter.residentModelID
+          wasEverRunning: engineStatusStore.wasEverRunning,
+          helper: helperHealth.health,
+          engineGonePolls: engineStatusStore.engineGonePolls,
+          policy: engineStatusStore.tierPolicy
         ),
-        engineStatus: engineStatusStore
+        onRestartHelper: { helperHealth.restartHelperManually() },
+        onRestartEngine: { restartEngineFromBanner() }
       )
       // #411: low-urgency, non-modal update prompt. Only present for a newer,
       // non-ignored release found by the once-per-launch check.
@@ -84,6 +85,19 @@ struct RootView: View {
       return
     }
     await updateAvailability.checkOnLaunch(preferences: appPreferences)
+  }
+
+  /// Engine-axis Force Restart (Tier 2, helper alive): re-start the engine on
+  /// the active profile. The helper is reachable here, so no registration
+  /// reconcile is needed — just a fresh start; the status poll surfaces the
+  /// outcome. A slow-start `replyTimeout` is swallowed by
+  /// `EngineStatusStore.startEngine`.
+  private func restartEngineFromBanner() {
+    let profileID = profileStore.activeProfileID
+    Task { @MainActor in
+      guard let profileID, !profileID.isEmpty else { return }
+      try? await engineStatusStore.startEngine(profileID: profileID)
+    }
   }
 }
 

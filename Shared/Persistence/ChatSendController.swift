@@ -168,7 +168,7 @@ public final class ChatSendController: ObservableObject {
             // onto a deleted Message and crash SwiftData. Mirror the
             // recovered-path guard below.
             guard self.generation == myGeneration, !Task.isCancelled else { return }
-            Self.markAssistant(assistant, failedWith: error, context: context, persistenceStatus: persistenceStatus)
+            Self.markAssistant(assistant, failedWith: error, requestedModelID: options.modelID, context: context, persistenceStatus: persistenceStatus)
             return
           }
 
@@ -193,7 +193,7 @@ public final class ChatSendController: ObservableObject {
             // stale task writes onto a row `recordCancelledAssistant` already
             // deleted.
             guard self.generation == myGeneration, !Task.isCancelled else { return }
-            Self.markAssistant(assistant, failedWith: error, context: context, persistenceStatus: persistenceStatus)
+            Self.markAssistant(assistant, failedWith: error, requestedModelID: options.modelID, context: context, persistenceStatus: persistenceStatus)
             return
           }
           guard self.generation == myGeneration, !Task.isCancelled else {
@@ -436,11 +436,26 @@ public final class ChatSendController: ObservableObject {
   }
 
   private static func makeRequest(chat: Chat, options: ChatSendRequestOptions) -> ChatRequest {
+    // Authoritative speculation coupling (#426). An enabled-speculation
+    // profile is a greedy "Fast Think" profile: the chat-apc drafter only
+    // engages when the request is greedy (temperature 0, #418), so force it
+    // here regardless of the toolbar's sampling. A profile with no
+    // `[speculation]` section, or one explicitly disabled, attaches no field
+    // and leaves sampling untouched — the request stays byte-identical to a
+    // normal chat (no `spec_metrics` overhead).
+    let spec = options.speculation
+    let wireSpec: ChatSpeculation? = (spec?.enabled == true)
+      ? ChatSpeculation(enabled: true, leaderLen: spec?.leaderLen, draftLen: spec?.draftLen)
+      : nil
+    let sampling = wireSpec == nil
+      ? options.sampling
+      : ChatSampling(temperature: 0, topP: options.sampling.topP, maxTokens: options.sampling.maxTokens)
     return ChatRequest(
       model: options.modelID,
       messages: transcriptTurns(chat: chat, options: options),
-      sampling: options.sampling,
-      stream: true
+      sampling: sampling,
+      stream: true,
+      speculation: wireSpec
     )
   }
 
@@ -513,10 +528,11 @@ public final class ChatSendController: ObservableObject {
   private static func markAssistant(
     _ assistant: Message,
     failedWith error: Error,
+    requestedModelID: String?,
     context: ModelContext,
     persistenceStatus: PersistenceStatus
   ) {
-    assistant.content = "⚠️ \(PersistenceStatus.formatError(error))"
+    assistant.content = "⚠️ \(failureCopy(for: error, requestedModelID: requestedModelID))"
     // Breadcrumb the error TYPE only — never the prompt/response content.
     Diag.app.event("chat.fail", [("error", String(describing: type(of: error)))])
     do {
@@ -524,6 +540,23 @@ public final class ChatSendController: ObservableObject {
     } catch {
       persistenceStatus.report(error, context: "ChatSendController.markAssistantFailed")
     }
+  }
+
+  /// #2: collapse the engine's noisy `model_not_found` rejection into one
+  /// plain, actionable line that names the model; pass everything else
+  /// through the existing formatter unchanged. Pure + static so the copy
+  /// is unit-tested without a live engine or a SwiftData context.
+  static func failureCopy(for error: Error, requestedModelID: String?) -> String {
+    if let engineError = error as? HTTPEngineError, engineError.isModelNotFound {
+      let leaf = requestedModelID.flatMap {
+        $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : ModelDisplayName.leaf($0)
+      }
+      if let leaf {
+        return "Model \(leaf) isn’t installed — download it in Settings → Models, or pick another model."
+      }
+      return "The selected model isn’t installed — download it in Settings → Models, or pick another model."
+    }
+    return PersistenceStatus.formatError(error)
   }
 
   private static func recordCancelledAssistant(
@@ -550,15 +583,7 @@ public final class ChatSendController: ObservableObject {
   ) -> Bool {
     guard role == .assistant else { return false }
     if message.content.isEmpty { return true }
-    return finishReason(in: message.meta) == "cancelled"
-  }
-
-  private static func finishReason(in meta: Data?) -> String? {
-    guard let meta,
-          let object = try? JSONSerialization.jsonObject(with: meta) as? [String: Any] else {
-      return nil
-    }
-    return object["finish_reason"] as? String
+    return message.finishReason == "cancelled"
   }
 }
 
@@ -593,15 +618,21 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
   public let modelID: String
   public let sampling: ChatSampling
   public let systemPromptOverride: String?
+  /// Speculative-decoding settings of the chat's selected profile, or
+  /// `nil` when the profile has none. `makeRequest` injects this into the
+  /// request (and forces greedy temperature) when `enabled` — see #426.
+  public let speculation: Profile.Speculation?
 
   public init(
     modelID: String,
     sampling: ChatSampling = ChatSampling(),
-    systemPromptOverride: String? = nil
+    systemPromptOverride: String? = nil,
+    speculation: Profile.Speculation? = nil
   ) {
     self.modelID = modelID
     self.sampling = sampling
     self.systemPromptOverride = systemPromptOverride
+    self.speculation = speculation
   }
 }
 

@@ -27,6 +27,10 @@ struct ChatScaffoldView: View {
   /// #412: background-helper health, forwarded to the toolbar pip's outer ring.
   @EnvironmentObject private var helperHealth: HelperHealthController
   @EnvironmentObject private var profileStore: ProfileStore
+  /// The reconciled engine-lifecycle fold, forwarded to the toolbar pip +
+  /// popover so they derive the resident/offline distinction from the single
+  /// published `indicator`.
+  @EnvironmentObject private var engineLifecycle: EngineLifecycle
   /// Shown when a send is blocked because no model resolves yet. #326
   /// decides the model-availability action (Load / Download / unavailable
   /// via the live `noModelAction`); #397 layers the engine/model lifecycle
@@ -112,6 +116,30 @@ struct ChatScaffoldView: View {
     showNoModelPrompt = true
   }
 
+  /// #4: closes after the engine status FIRST settles this launch, so the
+  /// launch prompt is evaluated exactly once and a later mid-session stop
+  /// never re-pops it. Process-scoped (static) — resets every launch, so
+  /// the app ALWAYS asks once per launch.
+  @MainActor private static var didEvaluateLaunchStartPrompt = false
+
+  /// #4: the engine no longer auto-starts on boot (see
+  /// `HelperMain.autoResumeEngineOnBoot`). Once the status settles, if the
+  /// engine is idle with a default model, proactively raise the existing
+  /// no-model prompt — whose Load action starts the engine — so the user
+  /// explicitly confirms the start instead of it happening silently. The
+  /// initial `.starting` placeholder is skipped so we evaluate the real
+  /// post-launch state, not the "reachability unknown" default.
+  private func maybePromptEngineStartOnLaunch() {
+    guard !Self.didEvaluateLaunchStartPrompt else { return }
+    if case .starting = engineStatusStore.status { return }
+    Self.didEvaluateLaunchStartPrompt = true
+    if LaunchEngineStartPrompt.shouldAsk(
+        status: engineStatusStore.status,
+        profileDefault: selectedProfileDefault) {
+      showNoModelPrompt = true
+    }
+  }
+
   /// True when the slug's app-staged model file exists — the engine's
   /// primary model source. A miss means the prompt offers Download
   /// instead of Load.
@@ -180,6 +208,9 @@ struct ChatScaffoldView: View {
       hasDownloadTarget: hasDownloadTarget)
   }
 
+  /// Profile ids offered by the toolbar switcher. Derived live from
+  /// `profileStore` (the source of truth — includes the seeded "Fast
+  /// Think" profile, #426) so every defined profile is selectable in
   private func scaffold(for chat: Chat) -> some View {
     VStack(spacing: 0) {
       ContentToolbar(
@@ -197,7 +228,9 @@ struct ChatScaffoldView: View {
         modelLoadCenter: modelLoadCenter,
         engineStatus: engineStatusStore,
         helperHealth: helperHealth,
-        onUnload: unloadModel
+        engineLifecycle: engineLifecycle,
+        onUnload: unloadModel,
+        onStartEngine: startEngineForSelectedProfile
       )
       Divider().opacity(0.0001) // structural breather; no visible line per §5
       // #326 Path 2: surface a swallowed failed(modelMissing) engine
@@ -265,7 +298,6 @@ struct ChatScaffoldView: View {
         onRetryLoad: { model in loadDefaultModel(model) },
         // #397 F1: helper unreachable → force an immediate status re-poll.
         onRefresh: { refreshEngineStatus() },
-        onChooseAnother: { showNoModelPrompt = false },
         onCancel: { showNoModelPrompt = false },
         engineStatus: engineStatusStore.status
       )
@@ -275,6 +307,9 @@ struct ChatScaffoldView: View {
       // observes the engine in any non-failed state, drop it so a stale
       // action error can't outlive the condition it described.
       if case .failed = new {} else { engineActionError = nil }
+      // #4: the engine no longer auto-starts on boot — once status settles
+      // (.starting → .stopped), proactively ask to start the model.
+      maybePromptEngineStartOnLaunch()
     }
     // #397: auto-dismiss the gate once a model resolves (engine came up
     // and reconciled, or a load completed) so the user lands back at the
@@ -285,6 +320,10 @@ struct ChatScaffoldView: View {
       // Seed the toolbar from the persisted profile so the menu
       // label matches what the chat was created with.
       viewModel.selectedProfileID = chat.profileID
+      // #4: covers the case where the engine status already settled before
+      // this view appeared (no .onChange fires) — evaluate the launch ask
+      // here too; the once-flag keeps it from double-prompting.
+      maybePromptEngineStartOnLaunch()
     }
     .onChange(of: viewModel.selectedProfileID) { _, new in
       // Mirror toolbar swaps back into the persistent chat — the
@@ -300,6 +339,17 @@ struct ChatScaffoldView: View {
       chat.profileID = new
       do {
         try modelContext.save()
+        // #3: a profile swap chooses which profile is active. The menu-bar
+        // (menu-icon) engine start reads the GLOBAL active-profile marker
+        // (HelperResumeAction → ProfileStore.activeProfileID), NOT this
+        // per-chat selection — so persist the swap to the marker too.
+        // Otherwise a swap while the engine is stopped leaves the marker on
+        // the old profile and a later menu-icon start launches the OLD
+        // model. Stage-only: this updates the start TARGET, it does not
+        // auto-start the engine. `setActiveProfileID` logs internally on a
+        // write failure (the marker simply stays on the prior profile), so
+        // the `try?` does not silently drop the signal.
+        try? profileStore.setActiveProfileID(new)
       } catch {
         chat.profileID = previous
         // Also revert the toolbar selection so the menu label
@@ -352,7 +402,15 @@ struct ChatScaffoldView: View {
     case .failedAfterRetries(let attempts):
       // Don't silently drop: engine running but unreachable for models.
       NSLog("ChatScaffold: /v1/models reconcile failed after \(attempts) attempts while engine .running")
-    case .empty, .notRunning:
+    case .empty:
+      // Engine running but serving NO model — clear any stale residency so
+      // the send gate doesn't pass a model the engine no longer has (the
+      // sibling gap to the leave-`.running` invalidation). No-op while a load
+      // is in flight.
+      modelLoadCenter.engineServesNoModel()
+    case .notRunning:
+      // Engine isn't running — `EngineLifecycle` already invalidated residency
+      // on the leave-`.running` edge; nothing to do here.
       break
     }
   }
@@ -368,7 +426,12 @@ struct ChatScaffoldView: View {
     let options = ChatSendRequestOptions(
       modelID: modelID,
       sampling: viewModel.sampling,
-      systemPromptOverride: viewModel.systemPromptOverride
+      systemPromptOverride: viewModel.systemPromptOverride,
+      // #426: thread the selected profile's Fast Think (speculative-decoding)
+      // settings into the request — a Fast Think profile attaches speculation
+      // + forces greedy; a normal or tree-of-thought profile carries none.
+      // Built once here so both the ToT dispatch and the normal send get it.
+      speculation: profileStore.speculation(forProfileID: viewModel.selectedProfileID)
     )
 
     // #413: when the active profile declares `mode = "tree-of-thought"`,
@@ -393,6 +456,8 @@ struct ChatScaffoldView: View {
       engine: engineStore.client,
       modelLoadCenter: modelLoadCenter,
       persistenceStatus: persistenceStatus,
+      // Reuses the `options` built above (now carrying #426 speculation), so
+      // the normal send and the ToT dispatch share one options value.
       options: options,
       // `EngineStatusStore` conforms to `ChatRecoveryGate`; passing it
       // here lets the send pipeline classify a mid-stream
@@ -404,9 +469,18 @@ struct ChatScaffoldView: View {
   }
 
   private func currentModelID() -> String? {
-    Self.requestModelID(
+    // A resident model only counts when the engine is actually `.running`.
+    // `EngineLifecycle` clears `residentModelID` on the leave-`.running` edge,
+    // but this guard also covers the brief window before that lands — so a
+    // stopped engine yields `needsDefaultLoad`/`noDefault` (an honest "Load
+    // X?" prompt) instead of a send that passes the gate then fails at HTTP.
+    let engineRunning: Bool = {
+      if case .running = engineStatusStore.status { return true }
+      return false
+    }()
+    return Self.requestModelID(
       modelOverride: viewModel.modelOverride,
-      residentModelID: modelLoadCenter.residentModelID,
+      residentModelID: engineRunning ? modelLoadCenter.residentModelID : nil,
       testModelID: ProcessInfo.processInfo.environment["PIE_TEST_CHAT_MODEL"]
     )
   }

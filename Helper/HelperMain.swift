@@ -1097,32 +1097,20 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// `HelperResumeAction.run` is internally nil/`.noActiveProfile`-safe,
   /// so a degraded boot or unselected profile is a logged no-op.
   private func autoResumeEngineOnBoot() {
-    if HelperConfig.isTestMode { return }
-    // Release-gated GUI-test seam: suppress ONLY the boot auto-resume so a
-    // seated XCUITest can assert the deterministic post-boot menu state
-    // (`Engine: stopped`) without racing the async engine start. Unlike
-    // `PIE_TEST_MODE`, the ProfileStore-backed resolver still wires, so the
-    // active profile resolves and `Resume Engine` is a live affordance.
-    // Compiled out of Release (mirrors the `#if DEBUG` policy elsewhere).
-    #if DEBUG
-    if ProcessInfo.processInfo.environment["PIE_TEST_NO_AUTO_RESUME"] == "1" {
-      Log.helper.info("autoResumeEngineOnBoot: suppressed by PIE_TEST_NO_AUTO_RESUME — engine stays stopped")
-      return
-    }
-    #endif
-    let outcome = HelperResumeAction.run(
-      engineHost: engineHost,
-      profileStore: profileStore,
-      resolver: launchSpecResolver
-    )
-    switch outcome {
-    case .started(let id):
-      Log.helper.info("autoResumeEngineOnBoot: engine start queued for active profile \(id, privacy: .public)")
-    case .noActiveProfile:
-      Log.helper.info("autoResumeEngineOnBoot: no active profile — engine stays stopped until one is chosen")
-    default:
-      Log.helper.notice("autoResumeEngineOnBoot: not started (\(outcome.description, privacy: .public))")
-    }
+    // #4: the engine is NO LONGER auto-started on boot. Pre-#4 this
+    // resumed the active profile automatically, which (a) loaded a
+    // multi-GB model the user may not want this session and (b) made a
+    // model-load failure on launch read as an unprompted error. The App
+    // now ALWAYS asks ("Start <model>?") on launch and starts the engine
+    // only on explicit user confirm via the `startEngine` XPC selector.
+    //
+    // Scope: this disables the BOOT model-load only. The engine-CRASH
+    // auto-relaunch ladder is a separate mechanism (the `relauncher`
+    // closure wired into `PieEngineHost` in `startXPCListener`, fired by
+    // the liveness monitor on `.failed(.engineGone)` per
+    // `RelaunchPolicy`) and is deliberately UNCHANGED — a crashed engine
+    // still recovers automatically without a prompt.
+    Log.helper.info("autoResumeEngineOnBoot: boot auto-start disabled (#4) — engine stays stopped; the App prompts the user to start the active profile’s model on launch")
   }
 
   @objc func togglePauseResume(_ sender: NSMenuItem) {
@@ -1228,11 +1216,15 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   @objc func openSettings() {
-    // TODO(phase-3): once RatioThink.app has a Settings scene + a URL scheme
-    // or AppleEvent for "open settings", deep-link here. Today we
-    // just bring RatioThink.app to the foreground; the user picks Settings
-    // from its menu (Cmd+,).
-    openPieApp()
+    // RatioThink.app now ships a Settings scene and the `ratiothink://` URL
+    // scheme, so deliver `ratiothink://settings` to route straight to
+    // Settings instead of just foregrounding the app and leaving the user
+    // to press ⌘,. Delivering the URL *to the resolved parent bundle*
+    // (rather than a bare `NSWorkspace.open(url)`, which LaunchServices
+    // could route to any registered RatioThink.app) preserves the existing
+    // "launch MY install" guarantee and reuses the same launch-failure
+    // alert path.
+    openPieApp(delivering: [SettingsDeepLink.settingsURL])
   }
 
   /// Resolve the parent `RatioThink.app` bundle that ships this helper.
@@ -1304,12 +1296,18 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     return fallback
   }
 
-  private func openPieApp() {
+  /// Launch / foreground the resolved parent RatioThink.app. When `urls` is
+  /// non-empty they are delivered to that specific bundle (e.g.
+  /// `ratiothink://settings`), so the app routes the deep link AND the
+  /// launch still targets MY install rather than whichever RatioThink.app
+  /// LaunchServices would pick for a bare scheme open. Both paths share the
+  /// same launch-failure alert (review v2 F16 / v3 F25).
+  private func openPieApp(delivering urls: [URL] = []) {
     let url = resolvedPieAppURL()
-    Log.helper.info("openPieApp: \(url.path, privacy: .public)")
+    Log.helper.info("openPieApp: \(url.path, privacy: .public) urls=\(urls.map(\.absoluteString).joined(separator: ","), privacy: .public)")
     let cfg = NSWorkspace.OpenConfiguration()
     cfg.activates = true
-    NSWorkspace.shared.openApplication(at: url, configuration: cfg) { [weak self] app, err in
+    let completion: (NSRunningApplication?, Error?) -> Void = { [weak self] app, err in
       if let err {
         Log.helper.error("openPieApp failed: \(String(describing: err), privacy: .public)")
         // Review v2 F16: a logged-only failure left the menu click
@@ -1334,6 +1332,11 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       } else if let app {
         Log.helper.info("openPieApp launched pid=\(app.processIdentifier, privacy: .public)")
       }
+    }
+    if urls.isEmpty {
+      NSWorkspace.shared.openApplication(at: url, configuration: cfg, completionHandler: completion)
+    } else {
+      NSWorkspace.shared.open(urls, withApplicationAt: url, configuration: cfg, completionHandler: completion)
     }
   }
 

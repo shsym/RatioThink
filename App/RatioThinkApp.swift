@@ -36,6 +36,11 @@ struct RatioThinkApp: App {
   @StateObject private var profileStore: ProfileStore
   @StateObject private var swapCoordinator: ProfileSwapCoordinator
   @StateObject private var engineStatusStore: EngineStatusStore
+  /// The reconciled engine-lifecycle source of truth: folds engine status +
+  /// model load into one published `EngineIndicatorState` every surface
+  /// derives from, and invalidates app-side residency when the engine leaves
+  /// `.running` so no surface can claim a resident model on a dead engine.
+  @StateObject private var engineLifecycle: EngineLifecycle
   /// #412: App-side background-helper health + restart ladder. Driven by the
   /// same `engineStatus()` poll as `engineStatusStore` (via `onPollOutcome`)
   /// and surfaced as the toolbar helper-ring + the escalation banner.
@@ -147,6 +152,13 @@ struct RatioThinkApp: App {
     _appPreferences = StateObject(wrappedValue: prefs)
     _profileStore = StateObject(wrappedValue: store)
     _engineStatusStore = StateObject(wrappedValue: statusStore)
+    // The reconciled engine-lifecycle fold + residency invalidation. Borrows
+    // the value-side `statusStore`/`center` built above; observes both and
+    // republishes the single `EngineIndicatorState`.
+    _engineLifecycle = StateObject(wrappedValue: EngineLifecycle(
+      engineStatus: statusStore,
+      modelLoad: center
+    ))
     _engineClientStore = StateObject(wrappedValue: EngineClientStore(client: engine))
     _swapCoordinator = StateObject(wrappedValue: ProfileSwapCoordinator(
       center: center,
@@ -261,7 +273,18 @@ struct RatioThinkApp: App {
   private static func reconcileHelperRegistrationIfNeeded() async {
     guard !didReconcileHelperRegistration else { return }
     didReconcileHelperRegistration = true
+    await performHelperRegistrationReconcile()
+  }
 
+  /// The reconcile body, callable on demand. The launch path guards it
+  /// with `didReconcileHelperRegistration` (run once); the runtime
+  /// "Restart Engine" command (#5b) calls it UNGUARDED to repair a Helper
+  /// that went down / unreachable mid-session. Probes the Helper and,
+  /// only if it is unreachable, forces a launchd reload (`unregister()`
+  /// then `register()`) — which resets a wedged or throttled on-demand
+  /// job, the step that previously required a full app restart.
+  @MainActor
+  private static func performHelperRegistrationReconcile() async {
     // A test/automation launch must NOT construct the real registrar or
     // run SMAppService.unregister()/register() — that mutates the real
     // machine's background-item registration. GUI helpers set only
@@ -281,6 +304,31 @@ struct RatioThinkApp: App {
     if outcome.requiresUserApproval {
       // Hard macOS consent gate — route the user to the toggle.
       SMAppService.openSystemSettingsLoginItems()
+    }
+  }
+
+  /// User-triggered runtime recovery behind the "Restart Engine" menu
+  /// command: reload a wedged or throttled Helper registration via the
+  /// shared `performHelperRegistrationReconcile` (the same
+  /// `HelperRegistrationRepair` primitive the launch-time self-heal and
+  /// the autonomous restart ladder use), then re-start the engine on the
+  /// active profile — without quitting the app. A slow-start
+  /// `replyTimeout` is swallowed by `EngineStatusStore.startEngine`; the
+  /// status poll surfaces the real outcome.
+  @MainActor
+  private func restartEngine() {
+    Task {
+      await Self.performHelperRegistrationReconcile()
+      guard let profileID = profileStore.activeProfileID,
+            !profileID.isEmpty else {
+        NSLog("Restart Engine: no active profile to start")
+        return
+      }
+      do {
+        try await engineStatusStore.startEngine(profileID: profileID)
+      } catch {
+        NSLog("Restart Engine: startEngine(\(profileID)) failed: \(error)")
+      }
     }
   }
 
@@ -342,9 +390,13 @@ struct RatioThinkApp: App {
         .environmentObject(engineClientStore)
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
+        .environmentObject(engineLifecycle)
         .environmentObject(helperHealth)
         .environmentObject(downloadController)
         .environmentObject(updateAvailability)
+        // #420: route the menu-bar Helper's `ratiothink://settings` deep
+        // link straight to the Settings scene (not just app-foreground).
+        .handlesSettingsDeepLink()
         .frame(minWidth: 900, minHeight: 600)
     }
     .modelContainer(chatContainer)
@@ -383,9 +435,14 @@ struct RatioThinkApp: App {
         }
         .keyboardShortcut("l", modifiers: [.command, .option])
       }
-      // #358: user-reachable diagnostics. Runs the bundled
-      // collect-diagnostics.sh and reveals the redacted .zip in Finder.
+      // #5b: runtime recovery for a Helper/engine that went down or
+      // unreachable mid-session — reloads the launchd registration and
+      // re-starts the engine without a full app restart. Always reachable
+      // from the menu even when the in-window UI is wedged.
       CommandGroup(after: .help) {
+        Button("Restart Engine") { restartEngine() }
+        // #358: user-reachable diagnostics. Runs the bundled
+        // collect-diagnostics.sh and reveals the redacted .zip in Finder.
         Button("Collect Diagnostics…") {
           Task { await DiagnosticsCollector.collectAndReveal() }
         }

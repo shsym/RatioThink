@@ -7,7 +7,11 @@ struct SidebarView: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 4) {
       sidebarRow(.chats)
-      sidebarRow(.apiEndpoints)
+      // v0.1.1: the API Endpoints (HTTP-serving) feature is not shipping yet —
+      // hide its nav entry. The `SidebarSection.apiEndpoints` case and the
+      // Endpoint views are left intact, so re-enabling is just restoring this
+      // one row. (The EmptyStateView "Add Endpoint" CTA — the only other nav
+      // path here — is hidden for the same reason.)
       Spacer()
     }
     .padding(.top, 8)

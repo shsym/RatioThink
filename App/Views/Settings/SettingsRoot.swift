@@ -2,11 +2,14 @@ import SwiftUI
 
 /// `Settings { SettingsRoot() }` host for the RatioThink app's Cmd-, window.
 ///
-/// Five tabs (§5 design): General, Models, Profiles, API, Advanced.
+/// Four tabs (§5 design): General, Models, Profiles, Advanced. The API tab
+/// is hidden for v0.1.1 (the HTTP-endpoint feature isn't shipping yet) —
+/// `APISettingsTab` and `EndpointStore` are left intact, so re-enabling is
+/// just restoring the one `tab("API", …)` registration below.
 /// The toolbar-button AX identity propagates from each tab's root
 /// view, so every tab body MUST carry `.accessibilityIdentifier(title)`.
 /// The S5_AppWindowShellGUITests case
-/// `test_cmd_comma_opens_settings_with_five_tabs` pins that string via
+/// `test_cmd_comma_opens_settings_with_four_tabs` pins that string via
 /// `toolbarButtons.matching(identifier:)` queries — see the comment
 /// block on `tab(_:systemImage:content:)` below for why pinning only
 /// `.tabItem { Label }` is insufficient on macOS 14, and why the
@@ -14,7 +17,6 @@ import SwiftUI
 /// container rather than carry an `.accessibilityLabel`.
 struct SettingsRoot: View {
   @EnvironmentObject private var appPreferences: AppPreferences
-  @EnvironmentObject private var endpointStore: EndpointStore
 
   var body: some View {
     TabView {
@@ -27,9 +29,10 @@ struct SettingsRoot: View {
       tab("Profiles", systemImage: "person.crop.rectangle") {
         ProfilesSettingsTab()
       }
-      tab("API", systemImage: "network") {
-        APISettingsTab()
-      }
+      // v0.1.1: the API tab is hidden — the HTTP-endpoint feature isn't
+      // shipping yet (mirrors the hidden sidebar row). Restore this one
+      // `tab("API", systemImage: "network") { APISettingsTab() }` block to
+      // re-enable; APISettingsTab + EndpointStore are left intact.
       tab("Advanced", systemImage: "wrench.and.screwdriver") {
         AdvancedSettingsTab()
       }
@@ -44,7 +47,7 @@ struct SettingsRoot: View {
   /// view (this outer `accessibilityIdentifier` modifier on the body
   /// root), NOT the `Label` inside `.tabItem`. Label-only pinning is
   /// ignored by SwiftUI's toolbar adapter and drops the queryable
-  /// toolbar count from 5 to 2.
+  /// toolbar count from 4 to 2.
   ///
   /// `.accessibilityElement(children: .contain)` is load-bearing
   ///: an earlier version paired `.accessibilityIdentifier`

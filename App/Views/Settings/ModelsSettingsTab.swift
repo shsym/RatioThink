@@ -249,6 +249,13 @@ private struct DownloadRow: View {
   let entry: ModelDownloadController.ActiveDownload
   let onCancel: () -> Void
 
+  /// #218: cancelling a download is a hard cancel (partial progress is
+  /// discarded, no resume), so the trailing "Cancel" arms an inline
+  /// confirm rather than firing immediately — matching the deliberate
+  /// inline-confirm pattern used by the model-load popover (#359), and
+  /// avoiding a system dialog (the app uses none).
+  @State private var confirmingCancel = false
+
   var body: some View {
     HStack(spacing: 10) {
       VStack(alignment: .leading, spacing: 2) {
@@ -262,11 +269,40 @@ private struct DownloadRow: View {
       Spacer()
       progressView
       if !entry.isTerminal {
-        Button("Cancel", action: onCancel)
-          .buttonStyle(.borderless)
+        cancelControl
       }
     }
     .padding(.vertical, 4)
+    // A download that reaches a terminal phase under the armed confirm
+    // (e.g. it completed first) shouldn't keep the prompt armed.
+    .onChange(of: entry.isTerminal) { _, terminal in
+      if terminal { confirmingCancel = false }
+    }
+  }
+
+  @ViewBuilder
+  private var cancelControl: some View {
+    if confirmingCancel {
+      HStack(spacing: 6) {
+        Text("Discard?")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        Button("Keep") { confirmingCancel = false }
+          .buttonStyle(.borderless)
+          .accessibilityIdentifier("DownloadRow-KeepDownloading")
+        Button("Discard", role: .destructive) {
+          confirmingCancel = false
+          onCancel()
+        }
+        .buttonStyle(.borderless)
+        .help("Stops the download and discards partial progress (no resume).")
+        .accessibilityIdentifier("DownloadRow-ConfirmCancel")
+      }
+    } else {
+      Button("Cancel") { confirmingCancel = true }
+        .buttonStyle(.borderless)
+        .accessibilityIdentifier("DownloadRow-Cancel")
+    }
   }
 
   @ViewBuilder
@@ -495,13 +531,28 @@ private struct MemoryGuardrailSection: View {
       .labelsHidden()
       .accessibilityIdentifier("GuardrailFractionPresetPicker")
 
-      Stepper(value: stepperBinding,
-              in: GuardrailSettings.minFraction...GuardrailSettings.maxFraction,
-              step: GuardrailSettings.step) {
-        Text("Fraction: \(String(format: "%.2f", fraction))").monospacedDigit()
+      // A plain linear Slider over the supported fraction range (snapped to
+      // the 0.05 grid by `step`), flanked by the range ends and a live
+      // percent readout. Percent (e.g. "65%") reads far clearer than the
+      // raw "0.65" and matches how the limit preview frames the value.
+      HStack(spacing: 12) {
+        Text(GuardrailSettings.percentLabel(GuardrailSettings.minFraction))
+          .font(.caption).foregroundStyle(.tertiary).monospacedDigit()
+        Slider(value: sliderBinding,
+               in: GuardrailSettings.minFraction...GuardrailSettings.maxFraction,
+               step: GuardrailSettings.step)
+          .accessibilityIdentifier("GuardrailFractionSlider")
+          .accessibilityLabel("Memory guardrail fraction")
+          .accessibilityValue(GuardrailSettings.percentLabel(fraction))
+        Text(GuardrailSettings.percentLabel(GuardrailSettings.maxFraction))
+          .font(.caption).foregroundStyle(.tertiary).monospacedDigit()
+        Text(GuardrailSettings.percentLabel(fraction))
+          .monospacedDigit()
+          .frame(width: 48, alignment: .trailing)
+          // The slider already announces its value to VoiceOver; hide the
+          // duplicate visual readout so it isn't read twice.
+          .accessibilityHidden(true)
       }
-      .fixedSize()
-      .accessibilityIdentifier("GuardrailFractionStepper")
 
       Text(limitPreview)
         .font(.callout)
@@ -528,7 +579,7 @@ private struct MemoryGuardrailSection: View {
     )
   }
 
-  private var stepperBinding: Binding<Double> {
+  private var sliderBinding: Binding<Double> {
     Binding(get: { fraction }, set: { setFraction($0) })
   }
 

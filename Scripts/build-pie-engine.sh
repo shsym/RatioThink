@@ -194,10 +194,30 @@ if [[ -z "$RT_ARCHS" ]] || ! grep -qw "$ARCH" <<<"$RT_ARCHS"; then
   exit 75
 fi
 
+# Strip absolute build-machine paths from the engine binary. The compiler bakes
+# the source path of every translation unit into panic messages / GGML_ASSERT
+# strings / debug info; without remapping, the shipped engine leaks the build
+# user's home dir + username (e.g. /Users/<name>/.cargo/...). The release DMG
+# must not publish personal paths. Two compilers are involved, so
+# two equivalent flags are needed:
+#   - rustc: --remap-path-prefix (cargo registry, rustup std, this repo).
+#   - clang: -ffile-prefix-map for the ggml/llama C/C++/ObjC sources, which are
+#     compiled via the cmake crate (rustc's flag does NOT reach them). CMake
+#     seeds CMAKE_<LANG>_FLAGS from CFLAGS/CXXFLAGS/OBJCFLAGS at configure time.
+# Both rewrite $HOME -> /home and the repo root -> /src (machine-independent,
+# also improves reproducibility). $HOME first, repo root last so a checkout
+# under $HOME still resolves to /src.
+REMAP_FLAGS="--remap-path-prefix=$HOME=/home --remap-path-prefix=$SRCROOT=/src"
+CPREFIX_MAP="-ffile-prefix-map=$HOME=/home -ffile-prefix-map=$SRCROOT=/src"
+
 echo "build-pie-engine.sh: cargo build pie-server ($TRIPLE)"
 (
   cd "$PIE_DIR"
-  RUSTFLAGS="${RUSTFLAGS:-} -C linker=$CC_BIN -C link-arg=-L$RT_DIR -C link-arg=-lclang_rt.osx" \
+  RUSTFLAGS="${RUSTFLAGS:-} -C linker=$CC_BIN -C link-arg=-L$RT_DIR -C link-arg=-lclang_rt.osx $REMAP_FLAGS" \
+  CFLAGS="${CFLAGS:-} $CPREFIX_MAP" \
+  CXXFLAGS="${CXXFLAGS:-} $CPREFIX_MAP" \
+  OBJCFLAGS="${OBJCFLAGS:-} $CPREFIX_MAP" \
+  OBJCXXFLAGS="${OBJCXXFLAGS:-} $CPREFIX_MAP" \
     PIE_PORTABLE_METAL=1 "$CARGO" build --release -p pie-server --target "$TRIPLE"
 )
 

@@ -48,5 +48,5 @@
 
 vendor_pie_sha = "2e080d80920210deb7f264afe73bfaa9d5ba385b"
 src_sha256     = "6e3abb7ce1ae23fd6f014927432114a28404d5ebfc818c4f08c81fd181ec3e1a"
-wasm_sha256    = "3602d4756eb04692a669fa49fee6f56129c376a3c9689a4de6903bf46c7ae543"
-wasm_size      = 721648
+wasm_sha256    = "d08fdd459d7057de553147ee5d46c01d970af0d8cde3826d6671a037b9286c74"
+wasm_size      = 720688

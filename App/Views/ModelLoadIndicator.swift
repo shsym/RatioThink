@@ -31,20 +31,26 @@ struct ModelLoadIndicator: View {
   /// quiet; while it is reconnecting/repairing/unreachable the ring blinks
   /// white/amber/red and the engine dot dims (its state is then unknown).
   @ObservedObject var helperHealth: HelperHealthController
+  /// The single reconciled engine-lifecycle fold. The dot AND the popover
+  /// read `lifecycle.indicator` (one published `EngineIndicatorState`) so they
+  /// can never disagree — e.g. the popover can't show a resident model while
+  /// the dot is offline.
+  @ObservedObject var lifecycle: EngineLifecycle
   /// : invoked from the running/ready popover's Unload button. Wired in
   /// `ChatScaffoldView` to stop the engine (free RAM) then `markUnloaded()`.
   var onUnload: () -> Void = {}
+  /// Invoked from the popover's `.offline` (engine-stopped) block "Start
+  /// engine" action. Wired in `ChatScaffoldView` to start the engine on the
+  /// active profile.
+  var onStartEngine: () -> Void = {}
 
   @State private var showPopover = false
 
-  /// The single semantic ENGINE state, folded from the engine + load sources.
+  /// The single semantic ENGINE state — the published fold from
+  /// `EngineLifecycle` (engine lifecycle + model load), shared with the
+  /// popover so the two surfaces derive from one value.
   private var indicatorState: EngineIndicatorState {
-    EngineIndicatorState.make(
-      engine: engineStatus.status,
-      engineDetail: engineStatus.statusDetail,
-      load: center.state,
-      residentModelID: center.residentModelID
-    )
+    lifecycle.indicator
   }
 
   /// The folded toolbar pip: outer ring (helper) + inner dot (engine), via
@@ -59,7 +65,17 @@ struct ModelLoadIndicator: View {
       showPopover.toggle()
     } label: {
       HStack(spacing: 5) {
-        if let prefix = Self.pipLabel(for: state) {
+        if case .starting = state {
+          // #1: a starting engine reads honestly as "Starting… (Ns)" with
+          // a live elapsed counter — never a fault, even on a slow boot.
+          // The amber dot stays; this replaces the previously-bare
+          // starting pip so a long start is visibly progressing, not
+          // stuck. Driven by a view-local TimelineView off the store's
+          // `startingSince`, so it never adds a per-second @Published
+          // churn source (the #327 popover-stability rule).
+          StartingElapsedLabel(since: engineStatus.startingSince)
+            .frame(maxWidth: 200, alignment: .trailing)
+        } else if let prefix = Self.pipLabel(for: state) {
           HStack(spacing: 0) {
             // Cap width + middle-truncate so a long HF-style leaf can't
             // render unbounded and crowd other toolbar items.
@@ -86,8 +102,10 @@ struct ModelLoadIndicator: View {
       ModelLoadPopover(
         center: center,
         engineStatus: engineStatus,
+        lifecycle: lifecycle,
         isPresented: $showPopover,
-        onUnload: onUnload
+        onUnload: onUnload,
+        onStartEngine: onStartEngine
       )
     }
     // Clicking outside the popover dismisses it but does NOT clear a
@@ -373,8 +391,16 @@ struct ModelLoadPopover: View {
   /// as a published field — a per-second RSS publish would re-render the
   /// toolbar hosting this popover and dismiss it.
   @ObservedObject var engineStatus: EngineStatusStore
+  /// The reconciled engine-lifecycle fold. The popover branches its top-level
+  /// content + action on `lifecycle.indicator` (not raw `center.state`) so the
+  /// resident/offline distinction can never drift from the dot: `Loaded —
+  /// resident` + Unload + the memory poll render ONLY for `.running`; a
+  /// stopped engine shows the offline block + Start engine.
+  @ObservedObject var lifecycle: EngineLifecycle
   @Binding var isPresented: Bool
   var onUnload: () -> Void = {}
+  /// Start the engine on the active profile — the `.offline` block's action.
+  var onStartEngine: () -> Void = {}
 
   /// Latest engine RSS sample, refreshed every ~2s while the popover is
   /// open and the engine is running/ready. Local-only; nil hides the row.
@@ -402,17 +428,7 @@ struct ModelLoadPopover: View {
     VStack(alignment: .leading, spacing: 10) {
       header
       Divider()
-      switch center.state {
-      case let .failed(_, message):
-        failureBlock(message: message)
-      case let .engineNotReady(_, detail):
-        engineNotReadyBlock(detail: detail)
-      default:
-        loadDetailRows
-        if let memory, Self.showsMemoryRow(centerState: center.state, engineRunningOrReady: isEngineRunningOrReady) {
-          memoryRow(memory)
-        }
-      }
+      contentBlock
       Divider()
       actionArea
     }
@@ -429,12 +445,14 @@ struct ModelLoadPopover: View {
     .onChange(of: stateCategory) { _, _ in
       armedAction = nil
     }
-    // On-demand memory poll: only while the popover is open and the
-    // engine is running/ready. Re-armed by `.task(id:)` when the engine
-    // state flips so an engine that comes up after the popover opened
-    // still starts sampling. Cancelled automatically on disappear.
-    .task(id: isEngineRunningOrReady) {
-      guard isEngineRunningOrReady else {
+    // On-demand memory poll: only while the popover is open and the engine
+    // is actually `.running`. Re-armed by `.task(id:)` when the engine state
+    // flips so an engine that comes up after the popover opened still starts
+    // sampling. Cancelled automatically on disappear. Gated on the engine
+    // alone (not `center.state == .ready`) — a stale resident must never keep
+    // the popover polling a stopped engine.
+    .task(id: isEngineRunning) {
+      guard isEngineRunning else {
         memory = nil
         return
       }
@@ -462,17 +480,54 @@ struct ModelLoadPopover: View {
     }
   }
 
-  /// Engine is in a state where a memory readout is meaningful (a model
-  /// is resident / the engine is serving). Drives the `.task` gate and
-  /// the row's presence.
-  private var isEngineRunningOrReady: Bool {
-    if case .running = engineStatus.status {
-      return true
-    }
-    if case .ready = center.state {
-      return true
-    }
+  /// Engine is actually `.running` — the only state where a memory readout
+  /// (and a resident model) is meaningful. Drives the `.task` gate and the
+  /// row's presence. Read from the engine ALONE: a stale `center.state ==
+  /// .ready` must never make a stopped engine look running.
+  private var isEngineRunning: Bool {
+    if case .running = engineStatus.status { return true }
     return false
+  }
+
+  /// Top-level popover content, branched on the single `lifecycle.indicator`
+  /// fold (NOT raw `center.state`) so the resident/offline distinction can't
+  /// drift from the dot: `Loaded — resident` + the memory row render ONLY for
+  /// `.running`/`.loading` (engine up); a stopped engine shows the offline
+  /// block; an engine/load failure shows the error; a starting engine shows
+  /// the "Engine starting…" placeholder. The per-load byte/ETA detail still
+  /// comes from `center.state`, but only inside the engine-up fold.
+  @ViewBuilder
+  private var contentBlock: some View {
+    switch lifecycle.indicator {
+    case .offline:
+      engineStoppedBlock
+    case let .starting(detail):
+      engineNotReadyBlock(detail: detail)
+    case let .error(error):
+      indicatorErrorBlock(error)
+    case .loading, .running:
+      loadDetailRows
+      if let memory,
+         Self.showsMemoryRow(centerState: center.state, engineRunningOrReady: isEngineRunning) {
+        memoryRow(memory)
+      }
+    }
+  }
+
+  /// `.offline` (engine stopped) block: an honest "engine isn't running"
+  /// statement — never a stale "Loaded — resident". The action area pairs it
+  /// with a "Start engine" button (not Unload).
+  private var engineStoppedBlock: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      Text("Engine stopped")
+        .font(.callout.weight(.medium))
+        .foregroundStyle(.secondary)
+      Text("No model is loaded. Start the engine to load this profile's model.")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+    .accessibilityIdentifier("modelLoad.popover.engineStopped")
   }
 
   /// Whether the on-demand `Memory` row should render. Pure so the gate
@@ -506,15 +561,50 @@ struct ModelLoadPopover: View {
 
   @ViewBuilder
   private var actionButton: some View {
-    switch center.state {
-    case .ready:
-      // : free the resident model's RAM. Destructive/interrupting, so
-      // it only ARMS the confirm step — the next send otherwise re-enters
-      // the no-model confirm gate with no model resident (#359).
-      Button("Unload", role: .destructive) {
-        armedAction = .unload
+    switch lifecycle.indicator {
+    case .offline:
+      // Engine stopped — the one constructive action is to start it (NOT
+      // Unload, which would be nonsensical on a dead engine). Wired to the
+      // active-profile engine start in `ChatScaffoldView`.
+      Button("Start engine") {
+        onStartEngine()
+        isPresented = false
       }
-      .accessibilityIdentifier("modelLoad.popover.unload")
+      .accessibilityIdentifier("modelLoad.popover.startEngine")
+    case .running:
+      // Engine up. A resident model can be unloaded; otherwise (running but
+      // idle / a settled cancel) there is no destructive action to offer.
+      if case .ready = center.state {
+        // : free the resident model's RAM. Destructive/interrupting, so
+        // it only ARMS the confirm step — the next send otherwise re-enters
+        // the no-model confirm gate with no model resident (#359).
+        Button("Unload", role: .destructive) {
+          armedAction = .unload
+        }
+        .accessibilityIdentifier("modelLoad.popover.unload")
+      }
+    case .loading:
+      // Interrupts an in-flight load — arm the confirm rather than
+      // cancelling on the first click (#359).
+      Button("Cancel", role: .destructive) {
+        armedAction = .cancel
+      }
+      .accessibilityIdentifier("modelLoad.popover.cancel")
+    case .starting, .error:
+      // A deferred (`.engineNotReady`) or failed LOAD offers Retry + Dismiss;
+      // an engine-level start/failure has no load terminal to retry from here
+      // (the status banner owns engine restart), so it shows nothing.
+      loadTerminalActions
+    }
+  }
+
+  /// Retry + Dismiss for a LOAD terminal (`.failed` / `.engineNotReady`),
+  /// reached from the `.starting`/`.error` indicator branches. Keyed off
+  /// `center.state` so the retry target is a real prior load; an engine-level
+  /// starting/failure (no load terminal) renders nothing.
+  @ViewBuilder
+  private var loadTerminalActions: some View {
+    switch center.state {
     case .failed, .engineNotReady:
       // #396: a failed/deferred load is otherwise a dead end with only
       // "Dismiss". Offer Retry as the recovery action — re-runs the same
@@ -540,12 +630,7 @@ struct ModelLoadPopover: View {
       .keyboardShortcut(.defaultAction)
       .accessibilityIdentifier("modelLoad.popover.dismiss")
     default:
-      // Interrupts an in-flight load — arm the confirm rather than
-      // cancelling on the first click (#359).
-      Button("Cancel", role: .destructive) {
-        armedAction = .cancel
-      }
-      .accessibilityIdentifier("modelLoad.popover.cancel")
+      EmptyView()
     }
   }
 
@@ -661,12 +746,16 @@ struct ModelLoadPopover: View {
     }
   }
 
-  private func failureBlock(message: String) -> some View {
+  /// `.error` block, driven by the folded `EngineIndicatorError` so it covers
+  /// BOTH a load failure (`Load failed`) and an engine-level failure (e.g.
+  /// `Engine stopped unexpectedly`) with the reducer's routed title + message
+  /// — replacing the prior load-only `failureBlock`.
+  private func indicatorErrorBlock(_ error: EngineIndicatorError) -> some View {
     VStack(alignment: .leading, spacing: 6) {
-      Text("Load failed")
+      Text(error.title)
         .font(.callout.weight(.medium))
         .foregroundStyle(Color.red)
-      Text(message)
+      Text(error.message)
         .font(.caption)
         .foregroundStyle(.secondary)
         .lineLimit(4)
@@ -833,6 +922,41 @@ struct ModelLoadPopover: View {
       return String(format: "%.2f GB", mb / 1024.0)
     }
     return String(format: "%.0f MB", mb)
+  }
+}
+
+/// #1: honest "Starting… (Ns)" pip label. The engine-start path used to
+/// render a bare amber dot whose tooltip flipped to "Helper unreachable: …"
+/// the instant a single status poll hit the 2 s reply timeout, so a normal
+/// slow boot read as a fault. This shows a calm, live elapsed counter
+/// instead — `EngineStatusStore` now escalates to a real `.failed(.engineGone)`
+/// only on SUSTAINED transport loss, so reaching this view always means a
+/// genuine in-progress start. Driven by `TimelineView(.periodic)` so the
+/// tick is a deterministic function of `Date` whose lifetime ends with the
+/// view (matching the indeterminate-arc / ellipsis rationale) — never a
+/// per-second `@Published` source.
+private struct StartingElapsedLabel: View {
+  let since: Date?
+
+  var body: some View {
+    TimelineView(.periodic(from: .now, by: 1)) { context in
+      Text(Self.text(since: since, now: context.date))
+        .monospacedDigit()
+        .lineLimit(1)
+        .truncationMode(.middle)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+    }
+    .accessibilityIdentifier("toolbar.modelLoadIndicator.starting")
+  }
+
+  /// Pure formatter so the copy is unit-testable without a view host.
+  /// `nil`/future `since` (clock skew) collapses to the bare "Starting…".
+  static func text(since: Date?, now: Date) -> String {
+    guard let since else { return "Starting…" }
+    let elapsed = Int(now.timeIntervalSince(since))
+    guard elapsed >= 1 else { return "Starting…" }
+    return "Starting… (\(elapsed)s)"
   }
 }
 

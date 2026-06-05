@@ -322,7 +322,9 @@ final class ProfileStoreTests: XCTestCase {
       defer { store.stop() }
 
       let names = store.entries.map { $0.url.lastPathComponent }
-      XCTAssertEqual(names, ["alpha.toml", "zeta.toml"],
+      // fast-think.toml is auto-seeded into every install (#426 ensure-exists),
+      // so it appears in the scan alongside the authored profiles, sorted.
+      XCTAssertEqual(names, ["alpha.toml", "fast-think.toml", "zeta.toml"],
                      "entries must be sorted by filename for stable UI ordering")
     }
   }
@@ -1415,7 +1417,9 @@ final class ProfileStoreTests: XCTestCase {
       // exactly the two fixtures.
       let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
       try store.start()
-      XCTAssertEqual(store.entries.count, 2, "sanity: populated post-start")
+      // Seed-count-agnostic: the built-in Fast Think profile is auto-seeded
+      // (#426) on top of the authored set, so assert "populated", not a count.
+      XCTAssertFalse(store.entries.isEmpty, "sanity: populated post-start")
 
       store.stop()
 
@@ -1546,7 +1550,9 @@ final class ProfileStoreTests: XCTestCase {
       // the one fixture (the test then drops a 2nd to schedule a reload).
       let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
       try store.start()
-      XCTAssertEqual(store.entries.count, 1, "sanity: 1 entry post-start")
+      // Seed-count-agnostic (#426 auto-seeds Fast Think on top of the
+      // authored set); this test only needs the store populated post-start.
+      XCTAssertFalse(store.entries.isEmpty, "sanity: populated post-start")
 
       // Drop a new profile to schedule a debounced reload (queue
       // tick due after debounceInterval).
@@ -1979,6 +1985,155 @@ final class ProfileStoreTests: XCTestCase {
 
       XCTAssertThrowsError(try store.setModel("x.gguf", forProfileID: "ghost"),
                            "setting a model on a non-existent profile must throw, not silently no-op")
+    }
+  }
+
+  // MARK: - built-in Fast Think seed (#426)
+
+  func test_seeds_fast_think_profile_on_fresh_install() throws {
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let seeded = dir.appendingPathComponent(ProfileStore.defaultFastThinkFilename)
+      XCTAssertTrue(FileManager.default.fileExists(atPath: seeded.path),
+                    "fresh install should seed fast-think.toml")
+      let entry = try XCTUnwrap(store.entries.first {
+        $0.profile?.id == ProfileStore.defaultFastThinkProfileID
+      })
+      XCTAssertNil(entry.error)
+      XCTAssertEqual(entry.profile?.speculation, Profile.Speculation(enabled: true))
+      XCTAssertEqual(entry.profile?.sampling.temperature, 0,
+                     "Fast Think is greedy — temperature must be 0")
+    }
+  }
+
+  func test_seeds_fast_think_into_existing_install_with_only_chat() throws {
+    try withTempProfilesDir { dir in
+      // Pre-existing chat.toml (existing install): the empty-dir seed is a
+      // no-op, so Fast Think must arrive via the ensure-exists path.
+      try ProfileStore.defaultChatTOML.write(
+        to: dir.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertTrue(FileManager.default.fileExists(
+        atPath: dir.appendingPathComponent(ProfileStore.defaultFastThinkFilename).path),
+        "existing install must gain Fast Think via ensure-exists")
+    }
+  }
+
+  func test_fast_think_seed_does_not_overwrite_existing_edited_copy() throws {
+    try withTempProfilesDir { dir in
+      let edited = """
+      id = "fast-think"
+      name = "My Fast Think"
+      model = "m"
+      inferlet = "chat-apc"
+
+      [speculation]
+      enabled = true
+      """
+      let url = dir.appendingPathComponent(ProfileStore.defaultFastThinkFilename)
+      try edited.write(to: url, atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), edited,
+                     "an existing fast-think.toml must not be clobbered by the seed")
+    }
+  }
+
+  func test_fast_think_seed_does_not_change_active_profile_on_fresh_install() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(store.activeProfileID, ProfileStore.defaultProfileID,
+                     "seeding Fast Think must not steal the default active profile from chat")
+    }
+  }
+
+  func test_fast_think_seed_failure_surfaces_via_snapshot_directoryError() throws {
+    try withTempProfilesDir { dir in
+      // A parseable chat.toml is present, so `_entries` is non-empty after
+      // start — the empty-dir chat-seed error channel (`_lastSeedError`,
+      // gated on an empty dir AND cleared by a non-empty scan) cannot carry
+      // a failure. This is exactly the case the built-in seed exists for
+      // (review v1 F1), and where the prior code swallowed the error.
+      try ProfileStore.defaultChatTOML.write(
+        to: dir.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
+      // Read-only dir: chat.toml still loads (r-x is readable), but the
+      // Fast Think write fails → its error must reach the snapshot.
+      try setPermissions(dir, mode: 0o500)
+      defer { try? setPermissions(dir, mode: 0o755) }
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertFalse(store.entries.isEmpty,
+                     "chat.toml must still load from a read-only (but readable) dir")
+      XCTAssertFalse(FileManager.default.fileExists(
+        atPath: dir.appendingPathComponent(ProfileStore.defaultFastThinkFilename).path),
+        "precondition: the Fast Think write must have failed under the read-only dir")
+      guard case .seedFailed(let path, _)? = store.snapshot.directoryError else {
+        return XCTFail("Fast Think seed failure must surface on snapshot.directoryError even with chat.toml present; got \(String(describing: store.snapshot.directoryError))")
+      }
+      XCTAssertTrue(path.hasSuffix(ProfileStore.defaultFastThinkFilename),
+                    "directoryError must point at fast-think.toml, got \(path)")
+    }
+  }
+
+  // MARK: - speculation accessor (#426 Fast Think)
+
+  func test_speculation_accessor_returns_profile_setting() throws {
+    try withTempProfilesDir { dir in
+      let toml = """
+      id = "fast"
+      name = "Fast"
+      model = "m"
+      inferlet = "chat-apc"
+
+      [speculation]
+      enabled = true
+      leader_len = 2
+      draft_len = 5
+      """
+      try toml.write(to: dir.appendingPathComponent("fast.toml"), atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(store.speculation(forProfileID: "fast"),
+                     Profile.Speculation(enabled: true, leaderLen: 2, draftLen: 5))
+    }
+  }
+
+  func test_speculation_accessor_nil_for_unknown_profile() throws {
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertNil(store.speculation(forProfileID: "does-not-exist"))
+    }
+  }
+
+  func test_speculation_accessor_nil_when_section_absent() throws {
+    try withTempProfilesDir { dir in
+      // The seeded chat.toml carries no [speculation] section.
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertNil(store.speculation(forProfileID: "chat"))
     }
   }
 

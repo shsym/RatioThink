@@ -48,8 +48,15 @@ struct ContentToolbar: View {
   /// renders only when all three (center, engineStatus, helperHealth) are
   /// wired (production).
   let helperHealth: HelperHealthController?
+  /// The reconciled engine-lifecycle fold for the pip + its popover. Optional
+  /// like the others so snapshot/preview sites stay pip-less; the pip renders
+  /// only when it (with center/engineStatus/helperHealth) is wired.
+  let engineLifecycle: EngineLifecycle?
   /// Forwarded to the indicator's running/ready popover Unload action.
   let onUnload: () -> Void
+  /// Forwarded to the indicator's offline (engine-stopped) popover "Start
+  /// engine" action.
+  let onStartEngine: () -> Void
 
   @State private var showParamsPopover = false
   @State private var showSystemPopover = false
@@ -62,7 +69,9 @@ struct ContentToolbar: View {
     modelLoadCenter: ModelLoadCenter?,
     engineStatus: EngineStatusStore?,
     helperHealth: HelperHealthController?,
-    onUnload: @escaping () -> Void
+    engineLifecycle: EngineLifecycle?,
+    onUnload: @escaping () -> Void,
+    onStartEngine: @escaping () -> Void = {}
   ) {
     self.viewModel = viewModel
     self.availableProfiles = availableProfiles
@@ -71,7 +80,9 @@ struct ContentToolbar: View {
     self.modelLoadCenter = modelLoadCenter
     self.engineStatus = engineStatus
     self.helperHealth = helperHealth
+    self.engineLifecycle = engineLifecycle
     self.onUnload = onUnload
+    self.onStartEngine = onStartEngine
   }
 
   var body: some View {
@@ -102,12 +113,14 @@ struct ContentToolbar: View {
       // when both the load center and the engine-status store are wired
       // (production); snapshot/preview call sites pass nil and stay
       // pip-less so their reference PNGs are unchanged.
-      if let modelLoadCenter, let engineStatus, let helperHealth {
+      if let modelLoadCenter, let engineStatus, let helperHealth, let engineLifecycle {
         ModelLoadIndicator(
           center: modelLoadCenter,
           engineStatus: engineStatus,
           helperHealth: helperHealth,
-          onUnload: onUnload
+          lifecycle: engineLifecycle,
+          onUnload: onUnload,
+          onStartEngine: onStartEngine
         )
       }
     }

@@ -396,6 +396,40 @@ final class HelperResumeActionTests: XCTestCase {
 
   // MARK: - helpers
 
+  // MARK: - #3: active-profile marker is authoritative for the menu-icon start
+
+  /// : the menu-bar (menu-icon) Resume start resolves from the GLOBAL
+  /// active-profile marker (`store.activeProfileID`). A profile swap persists
+  /// the selection via `ProfileStore.setActiveProfileID`, so updating the
+  /// marker MUST redirect which profile the helper starts — otherwise a
+  /// swap-while-stopped leaves the marker on the old profile and the menu-icon
+  /// start launches the OLD model. Pins that the marker write a swap makes is
+  /// honored end-to-end.
+  func test_active_profile_marker_redirects_menu_icon_start_after_swap() throws {
+    let store = try makeStoreWithChatProfile(active: "chat")
+    defer { store.stop() }
+
+    // The resolver echoes whatever profile id the marker hands it, so the
+    // `.started(profileID:)` outcome reflects the resolved selection.
+    let before = HelperResumeAction.run(
+      engineHost: makeEngineHost(), profileStore: store,
+      resolver: { id in .success(self.makeSpec(profileID: id)) }
+    )
+    XCTAssertEqual(before, .started(profileID: "chat"),
+                   "Resume must start the active-profile marker (chat)")
+
+    // Simulate a profile swap persisting the new selection — the #3 fix's
+    // `ChatScaffoldView.onChange → setActiveProfileID(new)` write.
+    try store.setActiveProfileID("beta")
+
+    let after = HelperResumeAction.run(
+      engineHost: makeEngineHost(), profileStore: store,
+      resolver: { id in .success(self.makeSpec(profileID: id)) }
+    )
+    XCTAssertEqual(after, .started(profileID: "beta"),
+                   "after a swap updates the active-profile marker, the menu-icon start must launch the NEW profile, not the old one")
+  }
+
   private func makeStoreWithChatProfile(active: String?) throws -> ProfileStore {
     let profiles = tempDir.appendingPathComponent("profiles", isDirectory: true)
     try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)

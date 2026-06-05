@@ -1,42 +1,35 @@
+<div align="center">
+
+<img src="Resources/AppIcon/pie-icon-highres.png" alt="RatioThink" width="120" />
+
 # RatioThink
 
-A native macOS chat + local-server app for the [Pie](https://github.com/pie-project/pie)
-inference engine. Built with SwiftUI + AppKit. It ships a bundled Pie engine supervised by a
-menu-bar helper, and serves an OpenAI-compatible HTTP endpoint locally with a first-class
-APC-enabled chat inferlet.
+**Private, local AI chat for macOS — powered by various thinking modes.**
 
-## Install (DMG)
+![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
+![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black)
+![Version](https://img.shields.io/badge/version-v0.1.1-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-green)
 
-Release DMGs are signed with a Developer ID and notarized by Apple, so they
-pass Gatekeeper with no extra steps:
+</div>
 
-1. Download `RatioThink-arm64.dmg` (Apple Silicon) from Releases and open it.
+RatioThink is a native macOS app that runs open-weight language models entirely on your Mac.
+Powered by a bundled [Pie](https://github.com/pie-project/pie) inference engine, it supercharges
+local models using specialized _thinking profiles_.
+
+## Early release
+
+v0.1.1 is an early release, focusing on core functionality and bug fixes.
+Since many components are still a work in progress, your feedback is incredibly valuable.
+Feel free to report any issues you find!
+
+## Install
+
+1. Download `RatioThink-arm64.dmg` (Apple Silicon) from
+   [Releases](https://github.com/shsym/RatioThink/releases) and open it.
 2. In the window that opens, drag **RatioThink.app** onto the **Applications** shortcut.
-3. Open **RatioThink** from Applications.
-
-> **Unsigned / development builds.** A DMG or app you build yourself
-> (`make dmg-arm64`) is *not* notarized, so Gatekeeper blocks it. For local
-> use only, clear the quarantine flag — notarized release downloads never need
-> this:
-> ```bash
-> xattr -dr com.apple.quarantine /Applications/RatioThink.app
-> ```
-
-## Updating
-
-RatioThink does not auto-install updates yet, but it does **check** for them.
-
-- **On launch**, it makes one request to the public
-  [GitHub Releases](https://github.com/shsym/RatioThink/releases) API and, if a
-  newer release exists, shows a dismissable banner with **Download** (opens the
-  release page) and **Ignore this version** (that version stays hidden until a
-  newer one ships). It stays silent if you're up to date or offline.
-- **Anytime**, choose **RatioThink → Check for Updates…** to check on demand;
-  the menu command always checks and ignores any dismissed versions.
-
-Neither path downloads or installs anything automatically — they compare
-versions and link you to the release. (In-app auto-update via Sparkle is tracked
-as future work.)
+3. Open **RatioThink** from Applications and follow the first-launch wizard to download a
+   starter model.
 
 ## Build from source
 
@@ -72,13 +65,20 @@ to run and debug locally, but it is *not* a distribution identity — Gatekeeper
 rejects it on download. Producing a DMG that passes `spctl` on other Macs
 requires the notarized release flow below.
 
+> **Unsigned / development builds.** A DMG or app you build yourself
+> (`make dmg-arm64`) is *not* notarized, so Gatekeeper blocks it. For local
+> use only, clear the quarantine flag — notarized release downloads never need
+> this:
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/RatioThink.app
+> ```
+
 ## Troubleshooting / Collect diagnostics
 
-If RatioThink "does nothing" after launch — no window, no menu-bar icon, no chat —
-collect a diagnostics bundle and send it to the developer.
+If the app misbehaves, you can collect a diagnostics bundle to send to the developer.
 
 **From the app** (if it opens): **Help → Collect Diagnostics…**. It writes a
-`.zip` to your Desktop and reveals it in Finder.
+`.zip` to your Desktop.
 
 **From Terminal** (works even when the app or helper won't launch):
 
@@ -99,6 +99,26 @@ your home path is collapsed to `~` and obvious tokens are stripped. Chat
 contents are **never** included — diagnostics carry logs, status, and config
 metadata only. Flags: `--window <dur>` (Unified Logging look-back, default
 `2h`) and `--out <path>`.
+
+## Known issues
+
+A few known issues in the v0.1.1 release, with workarounds:
+
+- **The "Qwen2.5 7B Instruct" model in the list won't load.** Hugging Face publishes that
+  quant as split files the bundled engine can't assemble yet, so downloading it leaves a
+  model that fails to load. Pick a different model for now —
+  [a fix is in progress](https://github.com/shsym/RatioThink/pull/41).
+- **Cancelling a model download can be unstable.** While a model is downloading the
+  progress can lag, and cancelling may not stop it as cleanly as expected — a partial
+  download can be left behind. If one remains, remove it from the Models list;
+  [a fix is in progress](https://github.com/shsym/RatioThink/pull/43).
+- **The "Starting the engine…" prompt can rarely get stuck.** In an uncommon sequence — a
+  model load waiting on the engine, then a model-list refresh failing — the prompt can stay
+  on "Starting the engine…". Click **Cancel** and try again.
+- **A failed engine start can show a misleading reason.** If the engine crashes the instant
+  it launches, the failure can be reported as a timeout rather than a clear "couldn't start"
+  — the engine-error indicator still appears either way.
+  [Fixed in a later build](https://github.com/shsym/RatioThink/pull/36).
 
 ## Repo layout
 

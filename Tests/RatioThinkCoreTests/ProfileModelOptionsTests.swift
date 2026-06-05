@@ -114,4 +114,22 @@ final class ProfileModelOptionsTests: XCTestCase {
     XCTAssertNil(options.first { $0.slug == "ok.gguf" }?.unsupportedReason,
                  "a launchable model carries no unsupported reason")
   }
+
+  // #3: a profile default that isn't installed on this Mac is the
+  // synthesized current entry (no discovered model behind it). It must
+  // carry a "Not downloaded" reason so the picker shows WHY it can't run
+  // (and a non-current not-present slug renders disabled), instead of
+  // offering a clean choice that resolves to the engine's noisy
+  // model_not_found at load (#2).
+  func test_not_installed_model_is_marked_not_downloaded() {
+    let options = ProfileModelOptions.build(models: [appModel("installed.gguf")],
+                                            current: "missing.gguf",
+                                            limitBytes: nil)
+    let missing = options.first { $0.slug == "missing.gguf" }
+    XCTAssertEqual(missing?.unsupportedReason, "Not downloaded",
+                   "a not-installed model must carry a not-present reason for the picker")
+    XCTAssertEqual(missing?.isCurrent, true)
+    XCTAssertNil(options.first { $0.slug == "installed.gguf" }?.unsupportedReason,
+                 "an installed model carries no not-downloaded reason")
+  }
 }

@@ -46,16 +46,21 @@ struct MessageBubble: View {
               answerStarted: !message.content.isEmpty
             )
           }
-          // Show the answer bubble once content arrives; when there's
-          // neither reasoning nor a tree, keep rendering it even while
-          // empty so the freshly-inserted streaming row still shows a
-          // placeholder bubble (preserves prior behavior). A ToT turn
-          // mid-search has empty content + a tree, so it shows only the
-          // tree until the final answer lands.
-          if !message.content.isEmpty || (message.reasoning.isEmpty && message.tot == nil) {
+          // Show the answer bubble once content arrives. When it is still
+          // empty, render a placeholder bubble ONLY for a fresh streaming row
+          // — not when a reasoning section (#329) or a live tree (#413) is
+          // already showing, and not when the turn FINISHED with no answer
+          // (#434: the notice below explains that instead of a silent blank).
+          if !message.content.isEmpty
+            || (message.reasoning.isEmpty && message.tot == nil && message.finishReason == nil) {
             bubble(background: Color.secondary.opacity(0.15),
                    foreground: .primary,
                    alignment: .leading)
+          }
+          // Honest end-state: explain a missing/truncated answer rather
+          // than rendering nothing. (#434)
+          if let text = message.notice.message {
+            TurnNoticeRow(text: text, footnote: message.notice.isFootnote)
           }
         }
         Spacer(minLength: 60)
@@ -93,6 +98,31 @@ struct MessageBubble: View {
 // The assistant turn's reasoning disclosure (#329) is now the shared
 // `ReasoningDisclosure` (see ReasoningDisclosure.swift) — the same component
 // each tree-of-thought node uses for its per-node thinking (#413).
+
+// MARK: - truncation notice
+
+/// One-line honest end-state for an assistant turn that produced no answer
+/// (or a truncated one). Distinct from the answer bubble and the Thinking
+/// section: it explains WHY the reply is missing/short and points at the
+/// composer's "Max tokens" control. The footnote variant sits quietly under
+/// a partial answer; the stand-alone variant takes the place of a missing
+/// one. Copy lives in `TurnNotice.message`. (#434)
+private struct TurnNoticeRow: View {
+  let text: String
+  let footnote: Bool
+
+  var body: some View {
+    HStack(alignment: .firstTextBaseline, spacing: 5) {
+      Image(systemName: "exclamationmark.triangle")
+      Text(text)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+    .font(footnote ? .caption2 : .caption)
+    .foregroundStyle(.secondary)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .accessibilityElement(children: .combine)
+  }
+}
 
 // MARK: - link policy
 

@@ -73,6 +73,14 @@ public enum ProfileModelOptions {
     return order
       .map { slug -> Option in
         let model = bySlug[slug]
+        // #3: a slug that is NOT among the discovered set is the
+        // synthesized current-model entry for a default that isn't
+        // installed on this Mac. Mark it "Not downloaded" so the picker
+        // shows WHY it can't run (and a non-current one is disabled),
+        // instead of offering a clean-looking choice that resolves to the
+        // engine's noisy `model_not_found` at load time (#2). A discovered
+        // model keeps its own reason (e.g. a split GGUF).
+        let reason = model?.unsupportedReason ?? (model == nil ? "Not downloaded" : nil)
         return Option(
           slug: slug,
           displayName: ModelDisplayName.leaf(slug),
@@ -80,7 +88,7 @@ public enum ProfileModelOptions {
           source: model?.source,
           isOverLimit: isOverLimit(sizeBytes: model?.sizeBytes, limitBytes: limitBytes),
           isCurrent: slug == current,
-          unsupportedReason: model?.unsupportedReason
+          unsupportedReason: reason
         )
       }
       .sorted { $0.slug < $1.slug }

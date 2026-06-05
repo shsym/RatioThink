@@ -24,19 +24,32 @@ struct ChatMessageItem: Identifiable, Equatable {
   /// the "Thinking" section. Nil for ordinary chat turns (and when a
   /// persisted snapshot fails to decode, treated as no tree).
   var tot: ToTTree?
+  /// Engine `finish_reason` for a completed turn (`"stop"`, `"length"`,
+  /// `"cancelled"`, …), or `nil` while the turn is still streaming. Lets
+  /// `MessageBubble` surface a truncated-before-answer turn instead of a
+  /// silent blank. (#434)
+  var finishReason: String?
 
   init(
     id: UUID = UUID(),
     role: ChatMessage.Role,
     content: String,
     reasoning: String = "",
-    tot: ToTTree? = nil
+    tot: ToTTree? = nil,
+    finishReason: String? = nil
   ) {
     self.id = id
     self.role = role
     self.content = content
     self.reasoning = reasoning
     self.tot = tot
+    self.finishReason = finishReason
+  }
+
+  /// Honest terminal state for the turn — drives the truncation notice so
+  /// a reply that ran out of budget while thinking never renders blank.
+  var notice: TurnNotice {
+    TurnNotice.classify(content: content, reasoning: reasoning, finishReason: finishReason)
   }
 }
 
@@ -59,6 +72,8 @@ extension ChatMessageItem {
     // Tolerant decode: a snapshot written by a newer/older schema that no
     // longer decodes is treated as "no tree" rather than failing the row.
     let tot = message.tot.flatMap { try? JSONDecoder().decode(ToTTree.self, from: $0) }
-    self.init(id: message.id, role: role, content: message.content, reasoning: message.reasoning, tot: tot)
+    self.init(
+      id: message.id, role: role, content: message.content,
+      reasoning: message.reasoning, tot: tot, finishReason: message.finishReason)
   }
 }

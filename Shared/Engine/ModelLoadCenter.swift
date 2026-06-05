@@ -487,6 +487,48 @@ public final class ModelLoadCenter: ObservableObject {
     Self.log.info("engine-resident reconcile: residentModelID=\(id, privacy: .public)")
   }
 
+  /// The engine left `.running` (stopped, failed, or stopping). Its resident
+  /// model's RAM is freed by the stop, so app-side residency must not outlive
+  /// it: clear `residentModelID`, demote a settled `.ready` to `.idle`, and
+  /// abandon any in-flight `.loading` (it is streaming against a gone engine
+  /// and would otherwise leave a stale progress bar). An explicit `.failed` /
+  /// `.cancelled` terminal is left intact as history — it no longer counts as
+  /// residency because `residentModelID` is now nil. Idempotent (a no-op once
+  /// cleared), so it is safe to call on every leave-`.running` edge. Invoked
+  /// by `EngineLifecycle` on the `EngineStatus` transition out of `.running`.
+  public func engineLeftRunning() {
+    if residentModelID != nil { residentModelID = nil }
+    switch state {
+    case .ready:
+      state = .idle
+    case .loading:
+      // Abandon the in-flight load pump (it will throw on the dead engine);
+      // bump eventEpoch so any buffered frame is dropped by the for-await
+      // body, and settle to `.idle` rather than a user-facing
+      // `.cancelled`/`.failed` — the engine went away, the user did not
+      // cancel and the load did not fail on its own merits.
+      task?.cancel()
+      task = nil
+      eventEpoch &+= 1
+      state = .idle
+    case .idle, .cancelled, .failed, .engineNotReady:
+      break  // terminals stay as history; resident already cleared above
+    }
+    Self.log.info("engine left running — resident cleared, load state settled")
+  }
+
+  /// The engine is `.running` but `GET /v1/models` returned no model — a live
+  /// engine serving nothing. Clear any stale residency so the chat gate does
+  /// not pass a send to a model the engine no longer has. No-op while a load
+  /// is in flight (must not clobber a legitimate `.loading`). Sibling to
+  /// `engineLeftRunning()` for the engine-running-but-empty case
+  /// (`reconcileEngineResidentModel`'s `.empty` branch).
+  public func engineServesNoModel() {
+    guard !isLoading else { return }
+    if residentModelID != nil { residentModelID = nil }
+    if case .ready = state { state = .idle }
+  }
+
   /// User-facing clear for terminal `.failed` / `.cancelled` /
   /// `.ready` states (review v2 F3, F7, v3 F3). The popover's
   /// Dismiss button calls this; click-outside dismissal of the

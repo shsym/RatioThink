@@ -153,10 +153,19 @@ final class EngineDeathRecoveryTests: XCTestCase {
     // are pruned, so a fresh death gets a fresh attempt. Mirrors
     // PieSupervisor's healthy-uptime reset pattern.
     let launchCount = OSAllocatedUnfairLock<Int>(initialState: 0)
+    // Fulfilled by the launcher when the launch count reaches a target the
+    // re-arm phase arms — i.e. when an actual auto-relaunch fires. Gating on
+    // a real launch (not a .failed event, which host.observe replays to a
+    // freshly-registered observer) keeps the re-arm assertion unambiguous.
+    let rearmSignal = OSAllocatedUnfairLock<(target: Int, exp: XCTestExpectation)?>(initialState: nil)
     let launcher: PieEngineHost.LauncherCall = { _ in
       let n = launchCount.withLock { c -> Int in c += 1; return c }
+      rearmSignal.withLock { armed in
+        if let a = armed, n >= a.target { a.exp.fulfill(); armed = nil }
+      }
       return (port: EnginePort(60030 + UInt16(n)), session: OneShotDeathSession())
     }
+    let clock = MutableClock(Date(timeIntervalSince1970: 1_000_000_000))
     let policy = PieEngineHost.RelaunchPolicy(
       maxAttempts: 2,
       window: 0.25,
@@ -172,7 +181,8 @@ final class EngineDeathRecoveryTests: XCTestCase {
       livenessInterval: 0.02,
       livenessFailureThreshold: 1,
       relaunchPolicy: policy,
-      relauncher: relauncher
+      relauncher: relauncher,
+      clock: { clock.now() }
     )
     box.host = host
 
@@ -190,32 +200,35 @@ final class EngineDeathRecoveryTests: XCTestCase {
     XCTAssertEqual(launchesInsideWindow, 3,
                    "1 initial + 2 auto-relaunches inside window before exhaustion")
 
-    // Sleep past the window so attempt timestamps are pruned.
-    try await Task.sleep(nanoseconds: 400_000_000)
+    // Assert the prune actually transitions: inside the window the two
+    // exhausted attempts still count against the cap, and advancing the
+    // injected clock past the window clears them. Driving the window with
+    // the clock instead of a real sleep is what makes this deterministic —
+    // the prune is clock-based and otherwise raced the live liveness /
+    // backoff timers under load (the historical flake). Checking 2 -> 0
+    // (not just a static 0) proves the window prune, not an empty set.
+    XCTAssertEqual(host.autoRelaunchAttemptsForTesting, 2,
+                   "inside the window the two exhausted attempts still count against the cap")
+    clock.advance(by: policy.window + 0.1)
     XCTAssertEqual(host.autoRelaunchAttemptsForTesting, 0,
-                   "post-window prune must clear the attempt set")
+                   "after the window elapses the prune clears the attempt set")
 
-    // Drive a fresh start; engine dies again → ladder should re-arm
-    // and fire one more auto-relaunch since the window is empty.
-    let rearmed = expectation(description: "post-window auto-relaunch fires again")
-    var sawFreshFailed = false
+    // Drive a fresh start outside the (now-pruned) window. The engine dies
+    // again and, because the attempt set is empty, the ladder re-arms and
+    // fires a fresh auto-relaunch. The user start is one launch; an
+    // auto-relaunch is a second, so the launch count reaching preLaunch+2
+    // can ONLY happen if the re-armed ladder actually relaunched. Awaiting
+    // that launch (armed via rearmSignal) is deterministic AND proves the
+    // re-arm — no fixed sleep, no dependence on observer-replay semantics.
     let preLaunchCount = launchCount.withLock { $0 }
-    let token2 = host.observe { status, _ in
-      if case .failed(.engineGone, _) = status {
-        if !sawFreshFailed { sawFreshFailed = true }
-      }
-    }
-    _ = host.start(spec) // user-driven restart
-    // After this start: engine dies → .failed → ladder re-arms → fresh launch.
-    try await Task.sleep(nanoseconds: 250_000_000)
-    let postLaunchCount = launchCount.withLock { $0 }
-    XCTAssertGreaterThanOrEqual(postLaunchCount - preLaunchCount, 2,
-                                "post-window: a fresh user start + at least one auto-relaunch")
-    rearmed.fulfill()
-    await fulfillment(of: [rearmed], timeout: 0.1)
+    let rearmed = expectation(description: "post-window fresh start re-arms ladder and fires an auto-relaunch")
+    rearmSignal.withLock { $0 = (target: preLaunchCount + 2, exp: rearmed) }
+    _ = host.start(spec) // user-driven restart, outside the window
+    await fulfillment(of: [rearmed], timeout: 3)
+    XCTAssertGreaterThanOrEqual(launchCount.withLock { $0 } - preLaunchCount, 2,
+                                "post-window: a fresh user start plus at least one auto-relaunch")
 
     token.cancel()
-    token2.cancel()
     host.stop()
   }
 
@@ -838,6 +851,20 @@ private final class OneShotDeathSession: PieEngineHost.EngineSession, @unchecked
     lock.lock(); defer { lock.unlock() }
     if !fired { fired = true; return .gone(reason: "synthetic crash") }
     return .alive
+  }
+}
+
+/// Test clock the slow-flap test advances by hand so the sliding-window
+/// prune is exercised deterministically instead of via a real sleep
+/// that races the liveness/backoff timers.
+private final class MutableClock: @unchecked Sendable {
+  private let lock = NSLock()
+  private var current: Date
+  init(_ start: Date) { current = start }
+  func now() -> Date { lock.lock(); defer { lock.unlock() }; return current }
+  func advance(by seconds: TimeInterval) {
+    lock.lock(); defer { lock.unlock() }
+    current = current.addingTimeInterval(seconds)
   }
 }
 

@@ -67,4 +67,26 @@ final class ProfileSwapWiringTests: XCTestCase {
       XCTAssertNil(coord.pending)
     }
   }
+
+  /// : the engine-stopped re-select case. With the engine NOT running,
+  /// nothing is resident (`residentModelID == nil` — the lifecycle clears it
+  /// on the leave-`.running` edge), so the same-model check (`to == nil`) can
+  /// never catch it and the swap used to prompt a meaningless "swap from — to
+  /// X". A profile selection with no resident model to REPLACE must commit
+  /// silently and fire no load.
+  func test_profileStore_backed_coordinator_stays_silent_when_no_model_is_resident() throws {
+    try withTwoProfileStore { store in
+      let coord = ProfileSwapCoordinator(
+        center: ModelLoadCenter(),   // engine stopped → residentModelID == nil
+        engine: MockEngineClient(),
+        profileStore: store
+      )
+      var committed: String?
+      coord.requestSwap(toProfileID: "beta") { committed = $0 }
+      XCTAssertEqual(committed, "beta",
+                     "with nothing resident, selecting a profile must commit silently — there is no resident model to replace")
+      XCTAssertNil(coord.pending,
+                   "no swap-confirm popover when the engine is stopped and no model is loaded")
+    }
+  }
 }

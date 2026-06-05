@@ -39,7 +39,6 @@ struct NoModelLoadedPrompt: View {
   let onRetryLoad: (String) -> Void
   /// Re-poll the helper after an unreachable-transport failure.
   let onRefresh: () -> Void
-  let onChooseAnother: () -> Void
   let onCancel: () -> Void
   /// Live engine status, threaded into the download CTA (PR#15 F1).
   let engineStatus: EngineStatus
@@ -69,7 +68,6 @@ struct NoModelLoadedPrompt: View {
     var showsUnavailableCopy: Bool
     var primary: Primary
     var showsOpenSettings: Bool
-    var showsChooseAnother: Bool
   }
 
   /// Fold the lifecycle state + availability action into a render plan.
@@ -81,7 +79,7 @@ struct NoModelLoadedPrompt: View {
       return Plan(headline: "", reason: nil, showsWaitSpinner: false,
                   showsModelChip: false, showsDownloadCTA: false,
                   showsUnavailableCopy: false, primary: .none,
-                  showsOpenSettings: false, showsChooseAnother: false)
+                  showsOpenSettings: false)
 
     case let .busy(phase):
       // F2: while the engine is starting on a fresh install whose model
@@ -94,7 +92,7 @@ struct NoModelLoadedPrompt: View {
       return Plan(headline: busyTitle(phase), reason: nil, showsWaitSpinner: true,
                   showsModelChip: false, showsDownloadCTA: keepDownload,
                   showsUnavailableCopy: false, primary: .none,
-                  showsOpenSettings: false, showsChooseAnother: false)
+                  showsOpenSettings: false)
 
     case .needsDefaultLoad:
       // #326 availability action is authoritative for load-vs-download.
@@ -103,12 +101,12 @@ struct NoModelLoadedPrompt: View {
         return Plan(headline: "Model not loaded yet", reason: nil, showsWaitSpinner: false,
                     showsModelChip: true, showsDownloadCTA: false,
                     showsUnavailableCopy: false, primary: .load,
-                    showsOpenSettings: false, showsChooseAnother: true)
+                    showsOpenSettings: false)
       case .download:
         return Plan(headline: "No model loaded", reason: nil, showsWaitSpinner: false,
                     showsModelChip: false, showsDownloadCTA: true,
                     showsUnavailableCopy: false, primary: .none,
-                    showsOpenSettings: false, showsChooseAnother: true)
+                    showsOpenSettings: false)
       case .unavailable:
         return unavailablePlan()
       }
@@ -122,7 +120,7 @@ struct NoModelLoadedPrompt: View {
         return Plan(headline: "Default model isn't downloaded", reason: reason,
                     showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: true,
                     showsUnavailableCopy: false, primary: .none,
-                    showsOpenSettings: false, showsChooseAnother: true)
+                    showsOpenSettings: false)
       }
       // Model-choice faults (missing-not-downloadable / too-large /
       // profile) route to Models settings, never a re-fire (F3).
@@ -130,7 +128,7 @@ struct NoModelLoadedPrompt: View {
         return Plan(headline: engineFailedTitle(code), reason: reason,
                     showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
                     showsUnavailableCopy: false, primary: .none,
-                    showsOpenSettings: true, showsChooseAnother: true)
+                    showsOpenSettings: true)
       }
       // Retryable engine fault (spawnFailed / engineGone / …) → Retry.
       // Non-retryable, non-model-choice (killRejected) → terminal: reason
@@ -139,25 +137,25 @@ struct NoModelLoadedPrompt: View {
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
                   showsUnavailableCopy: false,
                   primary: retryable ? .retryEngine : .none,
-                  showsOpenSettings: false, showsChooseAnother: true)
+                  showsOpenSettings: false)
 
     case let .loadFailed(_, reason):
       return Plan(headline: "Couldn't load the model", reason: reason,
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
                   showsUnavailableCopy: false, primary: .retryLoad,
-                  showsOpenSettings: false, showsChooseAnother: true)
+                  showsOpenSettings: false)
 
     case let .helperUnreachable(reason):
       return Plan(headline: "Can't reach the engine", reason: reason,
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
                   showsUnavailableCopy: false, primary: .refresh,
-                  showsOpenSettings: false, showsChooseAnother: true)
+                  showsOpenSettings: false)
 
     case let .configBroken(reason):
       return Plan(headline: "Can't read your profile selection", reason: reason,
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
                   showsUnavailableCopy: false, primary: .none,
-                  showsOpenSettings: true, showsChooseAnother: true)
+                  showsOpenSettings: true)
     }
   }
 
@@ -165,7 +163,7 @@ struct NoModelLoadedPrompt: View {
     Plan(headline: "No model loaded", reason: nil, showsWaitSpinner: false,
          showsModelChip: false, showsDownloadCTA: false,
          showsUnavailableCopy: true, primary: .none,
-         showsOpenSettings: true, showsChooseAnother: true)
+         showsOpenSettings: true)
   }
 
   static func isModelChoiceFault(_ code: EngineErrorCode) -> Bool {
@@ -261,10 +259,6 @@ struct NoModelLoadedPrompt: View {
       if plan.showsOpenSettings {
         SettingsLink { Text("Open Settings…") }
           .accessibilityIdentifier("noModel.openSettings")
-      }
-      if plan.showsChooseAnother {
-        Button("Choose another") { onChooseAnother() }
-          .accessibilityIdentifier("noModel.chooseAnother")
       }
       primaryButton(plan.primary)
     }

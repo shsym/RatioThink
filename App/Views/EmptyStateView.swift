@@ -5,7 +5,6 @@ import SwiftData
 /// large `Start Chat` + `Add Endpoint` CTAs as the zero-state for col 3.
 struct EmptyStateView: View {
   @EnvironmentObject private var windowState: WindowState
-  @EnvironmentObject private var endpointStore: EndpointStore
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
   @Environment(\.modelContext) private var modelContext
 
@@ -21,7 +20,9 @@ struct EmptyStateView: View {
         .foregroundStyle(.secondary)
       HStack(spacing: 12) {
         ctaButton(title: "Start Chat", systemImage: "bubble.left.and.bubble.right", action: startChat)
-        ctaButton(title: "Add Endpoint", systemImage: "network", action: addEndpoint)
+        // v0.1.1: "Add Endpoint" hidden — the API Endpoints feature is not
+        // shipping yet (mirrors the hidden sidebar row). Re-add this CTA (and
+        // `addEndpoint()` + the `endpointStore` injection) to re-enable.
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -56,11 +57,5 @@ struct EmptyStateView: View {
     ) else { return }
     windowState.selectedSection = .chats
     windowState.selectedItemID = id
-  }
-
-  private func addEndpoint() {
-    let endpoint = endpointStore.createEndpoint()
-    windowState.selectedSection = .apiEndpoints
-    windowState.selectedItemID = endpoint.id
   }
 }

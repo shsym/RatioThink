@@ -35,19 +35,13 @@ public struct DownloadProgress: Codable, Equatable, Sendable {
 
   /// Why a `.starting` event was emitted. Nil on every non-starting
   /// phase. Surfaces the difference between a clean cold start, a
-  /// resumed task, and a fresh task that abandoned a usable `.resume`
-  /// sidecar because the cancel-blob writer was still in flight when
-  /// `start()` raced past the fence (review v3 F2). The GUI uses
-  /// this to badge the abandoned-resume case so a user cancelling a
-  /// 90%-complete download isn't silently re-fetching from byte 0
-  /// without a diagnostic.
+  /// resumed task, and a fresh task that abandoned an unusable `.resume`
+  /// sidecar (corrupt/unreadable/missing-keys, or an orphan-resume
+  /// restart). The GUI uses this to badge the abandoned-resume case so a
+  /// user isn't silently re-fetching from byte 0 without a diagnostic.
   public enum StartReason: String, Codable, Sendable {
     case fresh
     case resumed
-    /// `start(repo:file:)` waited up to the pending-cancel-blob
-    /// fence timeout and gave up on the sidecar, restarting from
-    /// byte 0. Distinct from `.fresh` so the GUI surface can warn.
-    case resumeAbandonedAfterCancelFence
     /// `didCompleteWithError(NSURLErrorCannotOpenFile)` fired — the
     /// resume blob referenced a vanished temp file. The downloader
     /// swapped in a fresh task from byte 0 within the same handle.
@@ -215,17 +209,6 @@ public enum DownloadError: Error, Equatable, Sendable {
   case httpStatus(code: Int)
 }
 
-/// Sendable weak reference wrapper. `weak var` cannot be captured by
-/// a `@Sendable` closure because the read of a weak reference is not
-/// itself thread-safe in the Swift memory model. Wrapping it in a
-/// class with a `weak` ivar gives us a stable Sendable handle whose
-/// `value` read is safe to do from any thread (the runtime
-/// synchronizes per-object weak slots).
-private final class WeakBox<T: AnyObject>: @unchecked Sendable {
-  weak var value: T?
-  init(_ value: T) { self.value = value }
-}
-
 /// Manages background HF GGUF downloads on behalf of the Helper.
 ///
 /// One instance per helper process; serializes its mutable state with
@@ -240,10 +223,13 @@ private final class WeakBox<T: AnyObject>: @unchecked Sendable {
 ///   `<modelsRoot>/<repo>/<file>.partial`    — verified payload pre-rename
 ///   `<modelsRoot>/<repo>/<file>.resume`     — URLSession resume blob
 ///
-/// On cancel we ask URLSession for resume data and persist it next to
-/// the destination so a subsequent `start(repo:file:)` for the same
-/// path resumes from the byte we stopped on. Resume blobs are stable
-/// across helper restarts (URLSession serializes them as plist).
+/// A user **cancel is a hard cancel** (#218): the in-flight task is
+/// dropped with no resume blob and any existing `.resume` sidecar is
+/// purged, so the next `start(repo:file:)` re-downloads from byte 0.
+/// Resume blobs are still written on a *transport failure* (a network
+/// drop mid-download, not a user cancel) so an automatic retry can
+/// continue from where it stopped; those are stable across helper
+/// restarts (URLSession serializes them as plist).
 ///
 /// SHA-256 verification uses the `X-Linked-Etag` header HF's CDN
 /// returns for LFS-backed assets — quoted lowercase hex digest, with
@@ -341,6 +327,14 @@ public final class ModelDownloader: NSObject, @unchecked Sendable {
     /// orphan resume blob (review v3 F6). Prevents an infinite loop
     /// if the fresh restart fails the same way.
     var resumeOpenFailureRestartAttempted: Bool = false
+    /// Wall-clock of the last `.downloading` frame actually PUBLISHED to
+    /// subscribers (#218). `didWriteData` fires per network chunk
+    /// (hundreds/sec on a fast link); publishing each one floods the
+    /// consumer's `@MainActor` and makes the UI janky + delays the
+    /// cancel response. `nil` until the first frame publishes. Throttle
+    /// only gates the PUBLISH — `lastProgress`/`receivedBytes` are
+    /// updated every chunk so a late subscriber still sees current bytes.
+    var lastDownloadingPublishAt: Date? = nil
   }
 
   private struct State {
@@ -356,15 +350,6 @@ public final class ModelDownloader: NSObject, @unchecked Sendable {
     /// Insertion-ordered; trimmed at the head when it exceeds
     /// `terminalCacheCap` (review v1 F2).
     var terminalCache: [(UUID, DownloadProgress)] = []
-    /// `<repo>/<file>` → DispatchGroup that is `enter`'d when
-    /// `cancel(handle:)` registers a pending resume-blob write and
-    /// `leave`'d when the write completes (success OR failure).
-    /// Subsequent `start(repo:file:)` calls for the same path
-    /// `group.wait(timeout:)` before loading the sidecar so they
-    /// can't race the writer and end up with either a fresh task
-    /// alongside an orphan blob, or a half-written blob (review v2
-    /// F4). The entry is removed once the group reaches zero.
-    var pendingCancelBlobWrites: [String: DispatchGroup] = [:]
   }
 
   /// Cap on the terminal-snapshot cache. 64 is enough headroom for a
@@ -372,6 +357,33 @@ public final class ModelDownloader: NSObject, @unchecked Sendable {
   /// cap exists so a helper running for days doesn't accumulate
   /// unbounded snapshots.
   private static let terminalCacheCap = 64
+
+  /// Minimum wall-clock gap between published `.downloading` frames
+  /// (#218). 0.1s = 10 Hz — smooth for a progress bar while collapsing
+  /// the hundreds-of-chunks-per-second `didWriteData` flood that
+  /// otherwise re-renders the consumer's download list per chunk and
+  /// stalls the cancel response. The terminal phases
+  /// (`.verifying`/`.completed`/`.cancelled`/`.failed`) bypass the
+  /// throttle, so the final byte count always reaches subscribers.
+  static let downloadingPublishMinInterval: TimeInterval = 0.1
+
+  /// Producer-side throttle decision for `.downloading` frames. Publish
+  /// when this is the first frame, when the download just reached
+  /// 100%-by-bytes (so the bar visibly fills before `.verifying`), or
+  /// when at least `minInterval` has elapsed since the last published
+  /// frame. Pure function so the policy is unit-testable without driving
+  /// `URLSession` at chunk granularity.
+  static func shouldPublishDownloadingFrame(
+    now: Date,
+    lastPublishedAt: Date?,
+    minInterval: TimeInterval,
+    bytesReceived: Int64,
+    totalBytes: Int64?
+  ) -> Bool {
+    guard let last = lastPublishedAt else { return true }
+    if let total = totalBytes, total > 0, bytesReceived >= total { return true }
+    return now.timeIntervalSince(last) >= minInterval
+  }
 
   private let log = Logger(subsystem: "com.ratiothink.app.helper", category: "downloader")
   private let modelsRootProvider: () throws -> URL
@@ -389,14 +401,6 @@ public final class ModelDownloader: NSObject, @unchecked Sendable {
     = ModelDownloader.posixRenameSyscall
   private let lock = OSAllocatedUnfairLock(initialState: State())
   private var session: URLSession!
-  /// Maximum time `start(repo:file:)` will wait for a previously-issued
-  /// cancel's resume-blob writer to finish before purging the sidecar
-  /// and starting a fresh task (review v2 F4 fence). Production
-  /// default is 2s — long enough for ordinary CFNetwork tear-down,
-  /// short enough that a hung writer doesn't block the caller.
-  /// Injectable so tests can force the timeout path deterministically
-  /// (review v3 F2).
-  let pendingCancelFenceTimeout: TimeInterval
 
   /// Background queue for hashing + final placement. Verify is hopped
   /// off the URLSession delegate queue (review v1 F5) because hashing a
@@ -420,12 +424,10 @@ public final class ModelDownloader: NSObject, @unchecked Sendable {
   public init(sessionConfiguration: URLSessionConfiguration = .default,
               modelsRoot: @escaping () throws -> URL = { try PieDirs.models() },
               urlBuilder: @escaping URLBuilder = ModelDownloader.huggingFaceURLBuilder,
-              fileManager: FileManager = .default,
-              pendingCancelFenceTimeout: TimeInterval = 2.0) {
+              fileManager: FileManager = .default) {
     self.modelsRootProvider = modelsRoot
     self.urlBuilder = urlBuilder
     self.fileManager = fileManager
-    self.pendingCancelFenceTimeout = pendingCancelFenceTimeout
     super.init()
     let queue = OperationQueue()
     queue.name = "com.ratiothink.app.helper.downloader.delegate"
@@ -442,46 +444,6 @@ public final class ModelDownloader: NSObject, @unchecked Sendable {
   public func invalidate() {
     session.invalidateAndCancel()
   }
-
-  // MARK: - Test seams
-  //
-  // Gated to DEBUG builds (review v4 F6). The RatioThinkHelper Release
-  // binary that ships in `RatioThink.app/Contents/Library/LoginItems/` is
-  // compiled with `-DNDEBUG` and without `DEBUG`, so these methods
-  // are stripped from the production binary entirely. RatioThinkCoreTests
-  // builds DEBUG by default; the test bundle keeps full access via
-  // `@testable import`.
-  //
-  // These exist only to drive the cancel-blob fence path
-  // deterministically from `ModelDownloaderTests` (review v3 F2).
-  // They are NOT part of the public surface — call sites in App /
-  // Helper code must not touch `pendingCancelBlobWrites` directly.
-
-  #if DEBUG
-  /// Insert a never-leaving DispatchGroup entry under `pathKey` so
-  /// the next `start(repo:file:)` for the matching path times out
-  /// the fence and emits `.resumeAbandonedAfterCancelFence`.
-  func _testOnly_addPendingCancelGroup(pathKey: String) {
-    lock.withLock { state in
-      let group = state.pendingCancelBlobWrites[pathKey] ?? DispatchGroup()
-      group.enter()
-      state.pendingCancelBlobWrites[pathKey] = group
-    }
-  }
-
-  /// Drain the test seam's pending group so the test bundle doesn't
-  /// leak a stuck DispatchGroup across test methods.
-  func _testOnly_releasePendingCancelGroup(pathKey: String) {
-    lock.withLock { state in
-      if let group = state.pendingCancelBlobWrites[pathKey] {
-        group.leave()
-        if group.wait(timeout: .now()) == .success {
-          state.pendingCancelBlobWrites.removeValue(forKey: pathKey)
-        }
-      }
-    }
-  }
-  #endif
 
   // MARK: - Public API
 
@@ -565,38 +527,6 @@ public final class ModelDownloader: NSObject, @unchecked Sendable {
       return .success(handle)
     }
     guard case .success = dedupeResult else { return dedupeResult }
-
-    // Wait for any in-flight cancel-blob writer for this path to
-    // finish (review v2 F4). `cancel(handle:)` adds a DispatchGroup
-    // entry before asking URLSession for resume data; the closure
-    // leaves the group once the blob is written. If we skipped this
-    // fence, a fast cancel→start sequence could:
-    //   · load the sidecar BEFORE the writer wrote it (fresh task +
-    //     orphan blob landing on disk), OR
-    //   · see a partial/zero-length blob mid-write.
-    // Pull the group out under lock, wait OUTSIDE lock with bounded
-    // timeout so a hung writer can't deadlock start(). Timeout
-    // surfaces as `.resumeAbandonedAfterCancelFence` on the first
-    // progress event (review v3 F2) — distinguishable from a clean
-    // cold start so the GUI can warn the user that an in-flight
-    // resume blob was dropped.
-    var fenceAbandoned = false
-    let pendingGroup: DispatchGroup? = lock.withLock { state in
-      state.pendingCancelBlobWrites[pathKey]
-    }
-    if let pendingGroup {
-      let waitResult = pendingGroup.wait(timeout: .now() + pendingCancelFenceTimeout)
-      if waitResult == .timedOut {
-        log.error("start \(pathKey, privacy: .public): pending cancel-blob writer did not finish within \(self.pendingCancelFenceTimeout, privacy: .public)s — purging any sidecar to avoid race")
-        // Pessimistically purge: the writer may still land a stale
-        // blob, but our load below ignores it because we deleted it
-        // first. The writer's next attempt will fail-and-log when it
-        // hits the now-absent .resume parent — acceptable trade for
-        // never handing CFNetwork a half-written blob.
-        purgeResumeSidecar(resumeFile, pathKey: pathKey)
-        fenceAbandoned = true
-      }
-    }
 
     // Defensive: if the canonical destination already exists, any
     // `.resume` next to it is by definition stale — either a previous
@@ -683,18 +613,11 @@ public final class ModelDownloader: NSObject, @unchecked Sendable {
         return .failure(.invalidArguments(message: msg))
       }
       task = session.downloadTask(with: url)
-      // Precedence: corrupt-resume signal beats fence-abandoned —
-      // the corrupt path is more specific (we actually tried to
-      // load and failed) than the fence path (we waited and gave
-      // up). Both yield a fresh task from byte 0; the GUI surface
-      // differs.
-      if untrusted {
-        startReason = .restartedAfterCorruptResume
-      } else if fenceAbandoned {
-        startReason = .resumeAbandonedAfterCancelFence
-      } else {
-        startReason = .fresh
-      }
+      // A sidecar that was present but unusable (corrupt/unreadable,
+      // missing keys, or unsafe-sentinel) surfaces as a distinct
+      // restart reason so the GUI can render the byte-0 abandonment
+      // rather than a silent re-fetch; otherwise it's a clean cold start.
+      startReason = untrusted ? .restartedAfterCorruptResume : .fresh
     }
 
     let startProgress = DownloadProgress(handleID: handle.id,
@@ -725,167 +648,52 @@ public final class ModelDownloader: NSObject, @unchecked Sendable {
     return .success(handle)
   }
 
-  /// Cancel an in-flight download. Asks URLSession to surrender resume
-  /// data, persists it next to the destination so a subsequent `start`
-  /// for the same path picks up where we left off. Returns
-  /// `.unknownHandle` when the id doesn't match a live download.
+  /// Cancel an in-flight download — **hard cancel, no resume** (#218).
+  /// Issues a plain `task.cancel()` so URLSession tears the connection
+  /// down and discards its temp file WITHOUT producing a resume blob,
+  /// then synchronously emits `.cancelled` and tears the handle down via
+  /// `finishCancelled`. The UI therefore flips the instant the user
+  /// confirms, instead of waiting on CFNetwork to serialize resume data
+  /// (the old `cancel(byProducingResumeData:)` deferred `.cancelled`
+  /// until `didCompleteWithError`, which queued behind the per-chunk
+  /// progress flood — the user-perceived "slow cancel"). Any pre-existing
+  /// `.resume` sidecar for this path is purged so the next `start()`
+  /// re-downloads from byte 0. Returns `.unknownHandle` when the id
+  /// doesn't match a live download.
   ///
-  /// Review v1 F4 + F9: the resume-data closure captures `resumeFile`
-  /// + `log` + `fileManager` directly (no `[weak self]`, no
-  /// `state.active` lookup) so the persist is safe even if (a)
-  /// `finishAll` runs first and purges `state.active`, or (b) the
-  /// downloader is `invalidate()`'d before the closure fires.
-  ///
-  /// Review v2 F4: we register a per-pathKey `DispatchGroup` in
-  /// `state.pendingCancelBlobWrites` BEFORE asking URLSession to
-  /// produce the blob, and `leave` it from inside the closure once
-  /// the write completes (success or failure). A subsequent
-  /// `start(repo:file:)` for the same path `wait`s on this group
-  /// (with timeout) before loading the sidecar — without this serial
-  /// fence the cancel-blob writer can land an orphan blob on disk
-  /// after the next download already started without it.
+  /// Placement-wins (review v3 F5) is preserved: `finishCancelled`
+  /// re-checks `placementInProgress` under the lock, so a cancel that
+  /// races a winning placement is dropped and the subscriber correctly
+  /// sees `.completed`. The synchronous `finishCancelled` here and the
+  /// one in `didCompleteWithError(NSURLErrorCancelled)` are mutually
+  /// idempotent — `mutateAndPublish` no-ops once `finishAll` has removed
+  /// the handle, so exactly one `.cancelled` is emitted regardless of
+  /// which runs first.
   public func cancel(handle: DownloadHandle) -> DownloadError? {
-    let captured: (URLSessionDownloadTask, URL, URL, String)? = lock.withLock { state in
+    let captured: (URLSessionDownloadTask, URL)? = lock.withLock { state in
       guard let active = state.active[handle.id] else { return nil }
-      let pathKey = "\(active.handle.repo)/\(active.handle.file)"
-      // Track this pending write so start() serializes against it.
-      let group = state.pendingCancelBlobWrites[pathKey] ?? DispatchGroup()
-      group.enter()
-      state.pendingCancelBlobWrites[pathKey] = group
-      return (active.task, active.resumeFile, active.destination, pathKey)
+      return (active.task, active.resumeFile)
     }
-    guard let (task, resumeFile, destination, pathKey) = captured else { return .unknownHandle }
-    let fileManager = self.fileManager
-    let log = self.log
-    let handleID = handle.id
-    // Capture `self` weakly for the group-leave bookkeeping; the
-    // file ops themselves don't need self.
-    let weakSelf = WeakBox(self)
-    task.cancel(byProducingResumeData: { data in
-      defer {
-        // Always leave the group + drop the entry once empty so
-        // start() never blocks on a phantom write. Group bookkeeping
-        // is the only thing that touches downloader state from this
-        // closure (review v2 F4). Review v3 F3: if the downloader
-        // was `invalidate()`'d / deallocated between `cancel()` and
-        // this callback, `weakSelf.value` is nil and the group
-        // bookkeeping is skipped entirely — log a fault so the drop
-        // is greppable in `log stream` rather than failing silently.
-        // The leak dies with the instance so the production
-        // consequence is bounded, but the log line guards against a
-        // future refactor that makes any closure-body work
-        // (file-write etc.) depend on `self`.
-        if let strongSelf = weakSelf.value {
-          strongSelf.lock.withLock { state in
-            if let group = state.pendingCancelBlobWrites[pathKey] {
-              group.leave()
-              // We can't ask DispatchGroup for its count; instead use a
-              // wait(timeout: .now()) to test — `.success` means zero
-              // outstanding entries. Drop the map entry then so the
-              // next start path sees no pending write.
-              if group.wait(timeout: .now()) == .success {
-                state.pendingCancelBlobWrites.removeValue(forKey: pathKey)
-              }
-            }
-          }
-        } else {
-          log.fault("cancel handle=\(handleID.uuidString, privacy: .public): downloader vanished before resume-data callback ran — group entry leaked with instance")
-        }
-      }
-      guard let data else {
-        log.info("cancel handle=\(handleID.uuidString, privacy: .public): URLSession produced no resume blob")
-        return
-      }
-      // Review v4 F4: cancel can race a winning placement. If
-      // `completeDownload` already placed the destination by the
-      // time we got here, writing a `.resume` blob next to the now-
-      // canonical file produces an orphan sidecar that the next
-      // `start()` would have to purge defensively. Skip the write
-      // entirely instead — the user sees `.completed` and the on-
-      // disk state stays clean.
-      //
-      // TRADE-OFF (review v5 F1): this `fileExists` check runs on
-      // URLSession's resume-data callback queue with NO lock;
-      // `completeDownload`'s `placeAtomic` runs on `verifyQueue`.
-      // Cross-queue read-then-write means a placement that completes
-      // BETWEEN `fileExists` returning false and the `data.write`
-      // line below still leaves an orphan sidecar on disk. The
-      // start-side defensive purge at `loadResumeBlobOrPurge`'s
-      // "destination already exists" check (see `start(repo:file:)`)
-      // covers this — the orphan window survives only until the
-      // next `start()` for the same path. Holding the downloader
-      // lock across `data.write` + `fsyncFile` would close the
-      // window at the cost of blocking every other downloader
-      // operation behind disk I/O. The trade is accepted; the log
-      // below makes the orphan-write case greppable so an operator
-      // can correlate a stale sidecar with the cancel-vs-placement
-      // race instead of investigating phantom state corruption.
-      if fileManager.fileExists(atPath: destination.path) {
-        log.info("cancel handle=\(handleID.uuidString, privacy: .public): destination already placed (placement won race) — skipping resume-blob write")
-        return
-      }
-      do {
-        try data.write(to: resumeFile, options: .atomic)
-        // Fsync the sidecar so power loss between cancel and the
-        // next start can't surface a zero-length blob (review v2 F5).
-        try Self.fsyncFile(at: resumeFile, fileManager: fileManager)
-        // Review v15 F4: also fsync the parent dir entry — file fsync
-        // alone does NOT flush the rename(2) that `.atomic` write
-        // performs via temp+rename. Crash between this point and a
-        // periodic dir-flush would drop the sidecar on next boot even
-        // though `.cancelled` was already emitted.
-        //
-        // Review v16 F4: on dir-fsync failure, write a
-        // `<resumeFile>-unsafe` sentinel so the next `start()`
-        // knows the sidecar's dir entry may not have survived a
-        // crash and must NOT be trusted blindly. `.cancelled` was
-        // already emitted to the caller; the sentinel converts the
-        // ambiguity into a deterministic restart-from-byte-0 on
-        // next boot rather than a silent half-truth.
-        do {
-          try Self.fsyncDirectory(at: resumeFile.deletingLastPathComponent())
-        } catch {
-          let sentinel = Self.unsafeSentinelURL(forResumeFile: resumeFile)
-          log.error("fsyncDirectory(cancel resume) \(resumeFile.deletingLastPathComponent().path, privacy: .public) failed — writing unsafe sentinel \(sentinel.path, privacy: .public): \(String(describing: error), privacy: .public)")
-          // Review v17 F3: in the cascading-failure case where the
-          // sentinel write ALSO fails (parent inode's journal is
-          // bad but a different fd-class still succeeds), we'd
-          // emit `.cancelled` while leaving the sidecar on disk
-          // with no marker — exactly the silent-trust case F4 was
-          // designed to prevent. Recover by removing the sidecar
-          // itself so the next start sees `.resume`-absent (the
-          // same fresh-restart path as sentinel-present). Failing
-          // to remove the sidecar logs but otherwise tolerates the
-          // worst case; the sidecar contents are at most a single
-          // URLSession resume blob from a `.cancelled` flow whose
-          // caller already accepted "may retry from byte 0."
-          do {
-            try Data().write(to: sentinel, options: .atomic)
-          } catch let sentinelErr {
-            log.error("cancel-resume sentinel write failed at \(sentinel.path, privacy: .public): \(String(describing: sentinelErr), privacy: .public) — removing sidecar so next start matches absence-of-marker")
-            do {
-              try Self.removeIgnoringNoSuchFile(resumeFile, fileManager: fileManager)
-            } catch {
-              log.error("cancel-resume sidecar removal also failed at \(resumeFile.path, privacy: .public): \(String(describing: error), privacy: .public) — operator must clear sidecar manually before next retry")
-            }
-          }
-        }
-        // Review v7 F2: restore `.info` (was `.debug` in v6) so the
-        // per-cancel sidecar write is preserved in production OSLog
-        // — `.debug` is filtered by default at helper-process log
-        // level, and we need a durable trail tying cancel events to
-        // sidecar paths even when no subsequent `start()` runs.
-        // Distinguishability from the rare orphan case is carried
-        // by the leading `cancel-blob:write` token (this routine
-        // line) vs `cancel-blob:orphan-detected` at the start-side
-        // defensive purge — grep on either token to isolate the
-        // condition you care about (review v6 F3 + v7 F2).
-        log.info("cancel-blob:write handle=\(handleID.uuidString, privacy: .public) path=\(resumeFile.path, privacy: .public) bytes=\(data.count, privacy: .public)")
-      } catch {
-        log.error("persistResumeData: \(resumeFile.path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
-      }
-    })
-    log.info("cancel handle=\(handle.id.uuidString, privacy: .public)")
+    guard let (task, resumeFile) = captured else { return .unknownHandle }
+    // Plain cancel: no `byProducingResumeData`. The user confirmed a hard
+    // cancel, so resumable state is deliberately dropped — URLSession
+    // discards its temp file and emits `didCompleteWithError(.cancelled)`
+    // promptly (no resume-blob serialization to wait on).
+    task.cancel()
+    // Purge any pre-existing `.resume` sidecar (e.g. from a prior
+    // transport-failure retry) so the next `start()` for this path is a
+    // clean byte-0 download rather than a silent resume.
+    do {
+      try Self.removeIgnoringNoSuchFile(resumeFile, fileManager: fileManager)
+    } catch {
+      log.error("cancel handle=\(handle.id.uuidString, privacy: .public): .resume purge failed at \(resumeFile.path, privacy: .public): \(String(describing: error), privacy: .public)")
+    }
+    // Emit `.cancelled` synchronously (placement-wins re-checked inside).
+    // `.partial` cleanup is intentionally left to `completeDownload`'s
+    // vanished-handle gate so we never race `placeAtomic`'s rename of
+    // `.partial` into the destination.
+    finishCancelled(handle.id)
+    log.info("cancel handle=\(handle.id.uuidString, privacy: .public) (hard-cancel, no resume)")
     return nil
   }
 
@@ -1445,7 +1253,14 @@ extension ModelDownloader: URLSessionDownloadDelegate {
     guard let handleID else { return }
     let advertisedSHA = ModelDownloader.extractAdvertisedSHA256(from: downloadTask.response)
     let now = Date()
-    mutateAndPublish(handleID) { active in
+    // Producer-side throttle (#218): update the `lastProgress` snapshot +
+    // byte counters on EVERY chunk (so a `progress(for:)` subscribe-after
+    // still sees current bytes), but only YIELD to existing subscribers on
+    // throttle boundaries — collapsing the per-chunk flood that re-renders
+    // the consumer's download list and stalls the cancel response.
+    let toYield: (DownloadProgress, [AsyncStream<DownloadProgress>.Continuation])? =
+      lock.withLock { state in
+      guard var active = state.active[handleID] else { return nil }
       if active.expectedSHA256 == nil, let advertisedSHA {
         active.expectedSHA256 = advertisedSHA
       }
@@ -1462,12 +1277,27 @@ extension ModelDownloader: URLSessionDownloadDelegate {
         guard rate > 0 else { return nil }
         return Double(expected - totalBytesWritten) / rate
       }()
-      active.lastProgress = DownloadProgress(handleID: handleID,
-                                             phase: .downloading,
-                                             bytesReceived: totalBytesWritten,
-                                             bytesExpected: expected,
-                                             etaSeconds: eta,
-                                             verification: nil)
+      let progress = DownloadProgress(handleID: handleID,
+                                      phase: .downloading,
+                                      bytesReceived: totalBytesWritten,
+                                      bytesExpected: expected,
+                                      etaSeconds: eta,
+                                      verification: nil)
+      active.lastProgress = progress
+      let shouldPublish = Self.shouldPublishDownloadingFrame(
+        now: now,
+        lastPublishedAt: active.lastDownloadingPublishAt,
+        minInterval: Self.downloadingPublishMinInterval,
+        bytesReceived: totalBytesWritten,
+        totalBytes: expected)
+      if shouldPublish {
+        active.lastDownloadingPublishAt = now
+      }
+      state.active[handleID] = active
+      return shouldPublish ? (progress, Array(active.continuations.values)) : nil
+    }
+    if let (progress, conts) = toYield {
+      for c in conts { c.yield(progress) }
     }
   }
 
@@ -1559,10 +1389,12 @@ extension ModelDownloader: URLSessionDownloadDelegate {
     }
     let nsErr = error! as NSError
     if nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled {
-      // `cancel(byProducingResumeData:)` persists the blob on a
-      // separate closure — by the time this callback fires, the blob
-      // may or may not be written yet. Either way, tear the active
-      // entry down and emit `.cancelled`.
+      // Delegate-side cancel completion. Hard-cancel (#218) emits
+      // `.cancelled` synchronously from `cancel()`; this call is the
+      // mutually-idempotent backstop — once `finishCancelled` →
+      // `finishAll` removed the handle, `mutateAndPublish` no-ops, so
+      // exactly one `.cancelled` is emitted regardless of order (see
+      // the `cancel()` doc).
       finishCancelled(handleID)
       return
     }

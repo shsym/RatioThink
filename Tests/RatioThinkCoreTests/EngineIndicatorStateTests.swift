@@ -130,4 +130,43 @@ final class EngineIndicatorStateTests: XCTestCase {
     XCTAssertEqual(state.dot, .busy)
     XCTAssertNil(state.bannerError)
   }
+
+  // MARK: - SoT-drift matrix: a non-running engine never folds to a resident
+
+  /// The operator's exact case: the engine stopped while a model was still
+  /// app-side `.ready`. The fold MUST be `.offline` (engine wins), so no
+  /// surface deriving from it can show `Loaded — resident` on a dead engine.
+  func test_stopped_engine_with_stale_ready_load_is_offline_not_resident() {
+    let state = make(engine: .stopped, load: .ready(modelID: "org/m"), resident: "org/m")
+    XCTAssertEqual(state, .offline)
+    XCTAssertEqual(state.dot, .offline)
+    if case .running = state { XCTFail("a stopped engine must never fold to .running/resident") }
+  }
+
+  /// Table-driven drift matrix: for every non-running engine, a stale
+  /// `.ready` load must NOT yield `.running` (the popover's resident row +
+  /// the gate's resident both key off `.running`). The one cell that DOES
+  /// surface a resident is a genuinely `.running` engine.
+  func test_resident_surfaces_only_when_engine_is_running() {
+    let resident = "org/m"
+    let nonRunning: [EngineStatus] = [
+      .stopped,
+      .starting,
+      .stopping,
+      .failed(code: .engineGone, message: "x"),
+      .failed(code: .spawnFailed, message: "x"),
+    ]
+    for engine in nonRunning {
+      let state = make(engine: engine, load: .ready(modelID: resident), resident: resident)
+      if case .running = state {
+        XCTFail("engine \(engine) with stale .ready folded to .running — resident leaked")
+      }
+    }
+    // The single legitimate resident cell.
+    XCTAssertEqual(
+      make(engine: .running(port: 1, profileID: "chat"),
+           load: .ready(modelID: resident), resident: resident),
+      .running(modelID: resident)
+    )
+  }
 }

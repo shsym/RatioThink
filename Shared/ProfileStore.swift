@@ -105,10 +105,14 @@ public enum ProfileStoreError: Error, CustomStringConvertible, Equatable {
 /// `directoryError` priority (newest signal wins):
 ///   1. `.scanFailed` — most recent reload could not enumerate the
 ///      directory (deleted under us, perms revoked, etc.).
-///   2. `.seedFailed` — first-launch seed write failed AND the
+///   2. `.seedFailed` — first-launch chat seed write failed AND the
 ///      directory is still empty. Cleared as soon as a scan finds at
 ///      least one `*.toml` (user / external process repaired it).
-///   3. `nil` — clean.
+///   3. `.seedFailed` — the existence-gated built-in (Fast Think) seed
+///      write failed (review v1 F1). Surfaces regardless of whether the
+///      directory has other profiles, since the built-in is seeded into
+///      populated installs; not cleared by a non-empty scan.
+///   4. `nil` — clean.
 public struct ProfileStoreSnapshot {
   public let entries: [ProfileLoadResult]
   public let directoryError: ProfileStoreError?
@@ -251,6 +255,38 @@ public final class ProfileStore: ObservableObject {
   /// no-op on fresh installs.
   public static let defaultProfileID = "chat"
 
+  /// Built-in "Fast Think" profile id (#426). A second seeded profile that
+  /// turns on the chat-apc speculative drafter. Greedy by definition
+  /// (temperature 0) so drafting actually engages — see
+  /// `ChatSendController.makeRequest`.
+  public static let defaultFastThinkProfileID = "fast-think"
+
+  /// Filename for the seeded Fast Think profile.
+  public static let defaultFastThinkFilename = "fast-think.toml"
+
+  /// Seed body for the Fast Think profile. Same model + inferlet as the
+  /// default Chat profile (so selecting it is a silent same-model swap,
+  /// no reload), but greedy (`temperature = 0`) with `[speculation]`
+  /// enabled. `leader_len`/`draft_len` are omitted so the inferlet applies
+  /// its #418 defaults (1 / 3).
+  public static let defaultFastThinkTOML: String = """
+  id = "fast-think"
+  name = "Fast Think"
+  icon = "bolt"
+  model = "\(defaultChatModelID)"
+  inferlet = "chat-apc"
+  system_prompt = "You are a helpful assistant."
+
+  [sampling]
+  temperature = 0.0
+  top_p = 0.9
+  max_tokens = 2048
+
+  [speculation]
+  enabled = true
+
+  """
+
   private let queue: DispatchQueue
   /// Per-instance specific key so any method can detect whether the
   /// current thread is already running on THIS store's `queue`
@@ -266,6 +302,14 @@ public final class ProfileStore: ObservableObject {
   private var _entries: [ProfileLoadResult] = []
   private var _lastSeedError: ProfileStoreError?
   private var _lastScanError: ProfileStoreError?
+  /// Write failure from the existence-gated built-in (Fast Think) seed
+  /// (review v1 F1). Distinct from `_lastSeedError` (the empty-dir chat
+  /// seed): the built-in is seeded into installs that ALREADY have
+  /// profiles, so its failure must surface even when `_entries` is
+  /// non-empty — and must NOT be cleared by a successful scan the way
+  /// the empty-dir seed error is. Self-clears on the next `start()` whose
+  /// seed succeeds (set fresh every start), and on `stop()`.
+  private var _builtinSeedError: ProfileStoreError?
   private var _activeProfileID: String?
   private var _activeProfileError: ProfileStoreError?
   /// Listener fan-out invariant (review v6 F7).
@@ -450,9 +494,19 @@ public final class ProfileStore: ObservableObject {
       // already lists it. Independent of the dir-empty seed, so existing
       // installs get it too.
       self.backfillTreeOfThoughtProfile()
+      // Ensure the built-in Fast Think profile exists even on installs
+      // that already seeded chat.toml (the empty-dir seed above is a no-op
+      // there). Runs before `reloadLocked()` below so the initial scan
+      // picks it up. (#426)
+      let fastThinkSeedError = self.ensureBuiltinFastThinkProfile()
       let readResult = self.readActiveProfileIDFromDisk()
       self.stateLock.withLock {
         self._lastSeedError = seed.dirError
+        // The built-in (Fast Think) seed error rides its own channel: it
+        // is seeded into populated dirs, so it must surface even when
+        // `_entries` is non-empty (review v1 F1) — `_lastSeedError` is
+        // gated on an empty dir and cleared by the next non-empty scan.
+        self._builtinSeedError = fastThinkSeedError
         self.commitActiveReadResultLocked(readResult, source: .start)
         //  review v1 F2: a marker-seed failure must NOT
         // be silent. The override below fills `_activeProfileError`
@@ -546,6 +600,7 @@ public final class ProfileStore: ObservableObject {
     _entries = []
     _lastSeedError = nil
     _lastScanError = nil
+    _builtinSeedError = nil
     _activeProfileID = nil
     _activeProfileError = nil
     _pendingPostRecursionFanOut = false
@@ -652,6 +707,19 @@ public final class ProfileStore: ObservableObject {
       _entries.first { $0.profile?.id == id }?.profile
     }
   }
+
+  /// The speculative-decoding ("Fast Think") settings a profile carries,
+  /// or `nil` when the profile has no `[speculation]` section / does not
+  /// exist / failed to parse. `ChatScaffoldView.sendAssistantTurn` reads
+  /// this for the chat's selected profile and threads it into the request
+  /// options so `ChatSendController` can inject it (#426). Mirrors
+  /// `model(forProfileID:)`.
+  public func speculation(forProfileID id: String) -> Profile.Speculation? {
+    stateLock.withLock {
+      _entries.first { $0.profile?.id == id }?.profile?.speculation
+    }
+  }
+
 
   /// Persist a new default `model` onto the profile with `id`, leaving
   /// every other field untouched. Writes back to the profile's own
@@ -1036,6 +1104,32 @@ public final class ProfileStore: ObservableObject {
     return SeedResult(dirError: nil, markerError: markerError)
   }
 
+  /// Ensure the built-in "Fast Think" profile exists (#426). Unlike
+  /// `seedDefaultsIfEmpty` (gated on an empty dir), this writes
+  /// `fast-think.toml` whenever it is ABSENT — so installs that already
+  /// have a `chat.toml` (i.e. every install past first launch) still gain
+  /// Fast Think on the next start. Existence-gated, so a user's edits to
+  /// the file survive; deleting it re-creates it next launch, which is the
+  /// accepted contract for a built-in default (edit it, don't delete it).
+  /// Never touches the active-profile marker — the default selection stays
+  /// `chat`. Returns `.seedFailed` on a write failure; `start()` routes it
+  /// to the dedicated `_builtinSeedError` channel, which surfaces on the
+  /// snapshot's `directoryError` even when the directory already has
+  /// profiles (review v1 F1). A nil return is success-or-exists.
+  private func ensureBuiltinFastThinkProfile() -> ProfileStoreError? {
+    let target = directory.appendingPathComponent(Self.defaultFastThinkFilename)
+    if FileManager.default.fileExists(atPath: target.path) { return nil }
+    do {
+      try Self.defaultFastThinkTOML.write(to: target, atomically: true, encoding: .utf8)
+      Log.store.info("seeded built-in Fast Think profile at \(target.path, privacy: .public)")
+      return nil
+    } catch {
+      let underlying = String(describing: error)
+      Log.store.error("seed Fast Think profile failed: \(underlying, privacy: .public)")
+      return .seedFailed(path: target.path, underlying: underlying)
+    }
+  }
+
   /// Exclusive-create write of the active-profile marker (review v1 F3).
   ///
   /// Implemented via `open(2)` with `O_CREAT | O_EXCL | O_WRONLY`
@@ -1371,11 +1465,16 @@ public final class ProfileStore: ObservableObject {
   }
 
   /// Caller must hold `stateLock`. Scan errors take priority over
-  /// seed errors (scan reflects the most recent FS interaction);
-  /// seed error only surfaces while the directory is still empty.
+  /// seed errors (scan reflects the most recent FS interaction); the
+  /// empty-dir chat seed error only surfaces while the directory is
+  /// still empty. The built-in (Fast Think) seed error surfaces
+  /// regardless of `_entries.isEmpty` — its whole purpose is populated
+  /// installs (review v1 F1) — at lowest priority, since a scan failure
+  /// or a failed empty-dir chat seed is the more actionable signal.
   private func resolvedDirectoryErrorLocked() -> ProfileStoreError? {
     if let s = _lastScanError { return s }
     if let s = _lastSeedError, _entries.isEmpty { return s }
+    if let s = _builtinSeedError { return s }
     return nil
   }
 

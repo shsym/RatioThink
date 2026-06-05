@@ -12,6 +12,10 @@ import os
 ///   1. New profile's model unknown → swap silently, fire NO load. A
 ///      later send with nothing resident routes through the no-model
 ///      confirm gate; there is no deferred silent load here.
+///   1.5. NO model is currently resident (engine stopped / nothing loaded)
+///      → swap silently, fire NO load. There is no resident model to
+///      REPLACE, so a swap-confirm would be a meaningless "swap from — to
+///      X". The model loads later through the normal start gate.
 ///   2. New profile's model == currently-resident model → swap silently.
 ///   3. Otherwise → publish a `PendingSwap` so the toolbar can present
 ///      `ProfileSwapPopover`. The popover calls `confirm(token:setAsDefault:)`
@@ -191,6 +195,20 @@ public final class ProfileSwapCoordinator: ObservableObject {
       commit(toProfileID)
       return
     }
+    guard let fromModelID else {
+      // Policy 1.5: NOTHING is resident (engine stopped / no model loaded),
+      // so there is no model to REPLACE — a swap-confirm ("swap from — to X")
+      // is meaningless. This is the engine-stopped re-select case: with the
+      // engine down `residentModelID` is nil (the lifecycle clears it on the
+      // leave-`.running` edge), so the same-model check below would never
+      // catch it and the swap would prompt for a no-op. Commit the profile
+      // selection silently and fire NO load; the model loads later through
+      // the normal start gate, never an implicit load here.
+      Self.log.debug("swap silent (no resident model to replace) profile=\(toProfileID, privacy: .public) to=\(to, privacy: .public)")
+      pendingState = nil
+      commit(toProfileID)
+      return
+    }
     if to == fromModelID {
       Self.log.debug("swap silent (same model) profile=\(toProfileID, privacy: .public) model=\(to, privacy: .public)")
       pendingState = nil
@@ -198,7 +216,7 @@ public final class ProfileSwapCoordinator: ObservableObject {
       return
     }
     let token = UUID()
-    Self.log.info("swap pending confirm token=\(token, privacy: .public) profile=\(toProfileID, privacy: .public) from=\(fromModelID ?? "—", privacy: .public) to=\(to, privacy: .public)")
+    Self.log.info("swap pending confirm token=\(token, privacy: .public) profile=\(toProfileID, privacy: .public) from=\(fromModelID, privacy: .public) to=\(to, privacy: .public)")
     // Single assignment — review v3 F2. Replaces the prior pending
     // (if any) atomically; the bound popover binding never sees an
     // intermediate `pending == nil` view. A profile swap loads the

@@ -28,6 +28,25 @@ public struct Sampling: Equatable {
 }
 
 public struct Profile {
+  /// Per-profile speculative-decoding ("Fast Think") settings — the
+  /// domain mirror of the wire `ChatSpeculation` (#426). `nil` knobs fall
+  /// back to the chat-apc inferlet's #418 defaults (leader 1 / draft 3).
+  /// Drafting only engages when `enabled` AND the request is greedy
+  /// (temperature 0); the send path (`ChatSendController.makeRequest`)
+  /// enforces that coupling, so an enabled-speculation profile is always
+  /// a greedy "Fast Think" profile.
+  public struct Speculation: Equatable, Sendable {
+    public var enabled: Bool
+    public var leaderLen: Int?
+    public var draftLen: Int?
+
+    public init(enabled: Bool = false, leaderLen: Int? = nil, draftLen: Int? = nil) {
+      self.enabled = enabled
+      self.leaderLen = leaderLen
+      self.draftLen = draftLen
+    }
+  }
+
   public var id: String
   public var name: String
   public var icon: String?
@@ -36,6 +55,9 @@ public struct Profile {
   public var systemPrompt: String?
   public var sampling: Sampling
   public var inferletArgs: [String: TOMLValueConvertible]
+  /// Speculative-decoding settings from the `[speculation]` section;
+  /// `nil` when the profile has no such section.
+  public var speculation: Speculation?
 
   // Preserve unknown v2 sections (mcp_servers, routine, remote, agent) verbatim.
   private var rawTable: TOMLTable
@@ -49,6 +71,7 @@ public struct Profile {
     systemPrompt: String? = nil,
     sampling: Sampling = Sampling(),
     inferletArgs: [String: TOMLValueConvertible] = [:],
+    speculation: Speculation? = nil,
     rawTable: TOMLTable = TOMLTable()
   ) {
     self.id = id
@@ -59,6 +82,7 @@ public struct Profile {
     self.systemPrompt = systemPrompt
     self.sampling = sampling
     self.inferletArgs = inferletArgs
+    self.speculation = speculation
     self.rawTable = rawTable
   }
 
@@ -99,12 +123,22 @@ public struct Profile {
       }
     }
 
+    var speculation: Speculation? = nil
+    if let s = table["speculation"]?.table {
+      speculation = Speculation(
+        enabled: s["enabled"]?.bool ?? false,
+        leaderLen: s["leader_len"]?.int,
+        draftLen: s["draft_len"]?.int
+      )
+    }
+
     return Profile(
       id: id, name: name, icon: icon,
       model: model, inferlet: inferlet,
       systemPrompt: systemPrompt,
       sampling: sampling,
       inferletArgs: args,
+      speculation: speculation,
       rawTable: table
     )
   }
@@ -152,6 +186,7 @@ public struct Profile {
     table.remove(at: "icon")
     table.remove(at: "system_prompt")
     table.remove(at: "inferlet_args")
+    table.remove(at: "speculation")
     table["id"]       = TOMLValue(stringLiteral: id)
     table["name"]     = TOMLValue(stringLiteral: name)
     table["model"]    = TOMLValue(stringLiteral: model)
@@ -168,6 +203,12 @@ public struct Profile {
       let args = TOMLTable()
       for (k, v) in inferletArgs { args[k] = v.tomlValue }
       table["inferlet_args"] = TOMLValue(args)
+    }
+    if let speculation {
+      let specTable = TOMLTable(["enabled": TOMLValue(booleanLiteral: speculation.enabled)])
+      if let l = speculation.leaderLen { specTable["leader_len"] = TOMLValue(integerLiteral: l) }
+      if let d = speculation.draftLen  { specTable["draft_len"]  = TOMLValue(integerLiteral: d) }
+      table["speculation"] = TOMLValue(specTable)
     }
     return table.convert()
   }
