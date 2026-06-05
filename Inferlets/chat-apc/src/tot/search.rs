@@ -17,7 +17,6 @@
 //! pure helpers [`materialize_level`], [`fold_level`], and [`finalize`],
 //! which are unit-tested natively via `cargo test --lib`.
 
-use futures::future::join_all;
 use inferlet::model::Model;
 use inferlet::sample::Sampler;
 use inferlet::{chat, reasoning};
@@ -122,6 +121,8 @@ async fn generate_demuxed(
     reasoning_budget: usize,
     answer_budget: usize,
     stops: &[u32],
+    mut emitter: Option<&mut Emitter>,
+    node_id: &str,
 ) -> Demux {
     let mut reason_dec = reasoning::Decoder::new(model);
     let mut chat_dec = chat::Decoder::new(model);
@@ -159,6 +160,10 @@ async fn generate_demuxed(
             Ok(reasoning::Event::Delta(s)) => {
                 in_reasoning = true;
                 reasoning.push_str(&s);
+                // #413 token stream: live-fill this node's reasoning channel.
+                if let Some(em) = emitter.as_deref_mut() {
+                    let _ = stream::emit_node_delta(em, node_id, stream::DELTA_REASONING, &s).await;
+                }
             }
             Ok(reasoning::Event::End(_)) => {
                 in_reasoning = false;
@@ -169,7 +174,11 @@ async fn generate_demuxed(
         }
         match chat_dec.feed(&out.tokens) {
             Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) => {
-                answer.push_str(&s)
+                answer.push_str(&s);
+                // #413 token stream: live-fill this node's answer channel.
+                if let Some(em) = emitter.as_deref_mut() {
+                    let _ = stream::emit_node_delta(em, node_id, stream::DELTA_ANSWER, &s).await;
+                }
             }
             Ok(chat::Event::Delta(_)) | Ok(chat::Event::Idle) => {}
             Ok(chat::Event::Done(_)) => break DemuxKind::Answered,
@@ -289,15 +298,18 @@ pub struct SearchOutcome {
 /// prefix would be duplicated across every fork and waste the zero-token
 /// forward pass that the level-1 spin fix removed.
 ///
-/// When `emitter` is `Some`, the search streams (#413): as each level
-/// finishes (generated + scored + pruned), every node on it is emitted as
-/// a `node_complete` frame followed by the level's `level_pruned` beam
-/// selection — the single source of search orchestration drives both the
-/// non-streaming response and the streamed one, so they can never diverge.
-/// Emit errors are deliberately swallowed: a peer disconnect (the common
-/// case) just means no one is listening, and the bounded search
-/// (≤ `MAX_NODES`) finishes either way; the returned [`SearchOutcome`] is
-/// identical regardless of whether anyone received the frames.
+/// When `emitter` is `Some`, the search streams (#413): each node emits a
+/// `node_start`, then its reasoning + answer stream live as `node_delta`
+/// chunks while it generates ([`generate_demuxed`]), then the level's nodes
+/// are emitted as `node_complete` frames (full node + score) followed by the
+/// `level_pruned` beam selection — the single source of search orchestration
+/// drives both the non-streaming response and the streamed one, so they can
+/// never diverge (the non-stream path simply passes `None` and emits no
+/// deltas, ending at a byte-identical tree). Emit errors are deliberately
+/// swallowed: a peer disconnect (the common case) just means no one is
+/// listening, and the bounded search (≤ `MAX_NODES`) finishes either way; the
+/// returned [`SearchOutcome`] is identical regardless of whether anyone
+/// received the frames.
 pub async fn run(
     root_ctx: Context,
     params: &TotParams,
@@ -381,17 +393,32 @@ pub async fn run(
             }
         }
 
-        let results = join_all(ctxs.into_iter().map(|c| {
-            expand(
-                c,
-                model,
-                params.temperature,
-                params.top_p,
-                params.max_reasoning_tokens,
-                params.max_tokens_per_node,
-            )
-        }))
-        .await;
+        // Sequential generation (#413 phase B): each node streams its own
+        // node_start + token deltas to the single SSE emitter with exclusive
+        // access, so the live tree fills a node at a time. Concurrency was
+        // ~23% faster here but the engine batches forks only weakly, and a
+        // sequential per-node stream reads as more responsive than a level
+        // appearing all at once; the id on every frame keeps routing robust.
+        let mut results: Vec<(Context, NodeOutcome)> = Vec::with_capacity(ctxs.len());
+        for (meta, c) in metas.iter().zip(ctxs.into_iter()) {
+            let (id, parent_id, branch_index) = (meta.0.as_str(), meta.1.as_str(), meta.2);
+            if let Some(em) = emitter.as_deref_mut() {
+                let _ = stream::emit_node_start(em, id, parent_id, level, branch_index).await;
+            }
+            results.push(
+                expand(
+                    c,
+                    model,
+                    params.temperature,
+                    params.top_p,
+                    params.max_reasoning_tokens,
+                    params.max_tokens_per_node,
+                    emitter.as_deref_mut(),
+                    id,
+                )
+                .await,
+            );
+        }
 
         // Pair each expansion with its meta: keep the moved-back context as
         // a potential survivor, and hand the Context-free outcome to the
@@ -547,12 +574,16 @@ async fn expand(
     top_p: f32,
     reasoning_budget: usize,
     answer_budget: usize,
+    emitter: Option<&mut Emitter>,
+    node_id: &str,
 ) -> (Context, NodeOutcome) {
     // Open the assistant turn for this branch. The forked context shares a
     // fully-flushed, cue-free prefix, so without this the first forward
     // pass would carry zero new tokens and spin the generator.
     ctx.cue();
     let stops = chat::stop_tokens(model);
+    // Streams this node's reasoning + answer chunks as node_delta frames when
+    // an emitter is present (#413 token stream); None on the non-stream path.
     let demux = generate_demuxed(
         &mut ctx,
         model,
@@ -560,6 +591,8 @@ async fn expand(
         reasoning_budget,
         answer_budget,
         &stops,
+        emitter,
+        node_id,
     )
     .await;
     let outcome = match demux.kind {

@@ -23,12 +23,29 @@
 //!
 //! ```text
 //! tree_start     {event,id,model,breadth,depth,beam_width}   // once, opens
-//! node_complete  {event,node:{…}}                            // per generated/errored node
+//! node_start     {event,id,parent_id,depth,branch_index}     // per node, before its deltas (#413 token stream)
+//! node_delta     {event,id,kind:"reasoning"|"answer",text}   // streamed token chunks for that node
+//! node_complete  {event,node:{…}}                            // per-node terminal: full node + score + status
 //! level_pruned   {event,level,kept:[id,…]}                   // per level, the beam
 //! tree_complete  {event,selected_node_id,final_answer}       // once, terminal success
 //! error          {event:"error",code,message}                // terminal failure (crate::sse::SseError)
 //! [DONE]                                                     // sentinel
 //! ```
+//!
+//! ## Token-level streaming (#413 phase B)
+//!
+//! A node is announced by `node_start` (its tree position), then its
+//! reasoning and answer stream INCREMENTALLY as `node_delta` chunks tagged
+//! by the same id (`kind:"reasoning"` while inside `<think>`, then
+//! `kind:"answer"` for the visible answer — the demux in
+//! [`super::search::generate_demuxed`] decides the channel). `node_complete`
+//! remains the per-node terminal: it carries the FULL node (content +
+//! reasoning + score + status) and is authoritative — a client live-fills
+//! from the deltas, then reconciles to `node_complete` (which also lets the
+//! non-streaming path, that emits no deltas, produce a byte-identical final
+//! tree). Generation is sequential per level, so a node's `node_start` +
+//! deltas + `node_complete` never interleave with another node's; the id on
+//! every frame keeps routing robust regardless.
 //!
 //! Invariant (carried over from #407): every event identifies the node(s)
 //! it concerns by stable id, and the stream ends with exactly one terminal
@@ -122,6 +139,33 @@ struct NodeCompleteFrame<'a> {
     node: NodeView<'a>,
 }
 
+/// `node_start` — announces a node + its tree position before its text
+/// streams, so a client can create + place the node and route subsequent
+/// `node_delta`s to it. Carries only the metadata known pre-generation;
+/// content/reasoning/score arrive via deltas + the terminal `node_complete`.
+#[derive(Serialize)]
+struct NodeStartFrame<'a> {
+    event: &'static str,
+    id: &'a str,
+    parent_id: &'a str,
+    depth: usize,
+    branch_index: usize,
+}
+
+/// `node_delta` — one streamed text chunk for a node, tagged by id and by
+/// channel (`reasoning` while inside `<think>`, `answer` afterward).
+#[derive(Serialize)]
+struct NodeDeltaFrame<'a> {
+    event: &'static str,
+    id: &'a str,
+    kind: &'static str,
+    text: &'a str,
+}
+
+/// `node_delta` channel tags (#413). The demux routes a chunk to exactly one.
+pub const DELTA_REASONING: &str = "reasoning";
+pub const DELTA_ANSWER: &str = "answer";
+
 /// `level_pruned` — the beam selection for a just-completed level: the ids
 /// kept as the next frontier. An empty `kept` means the level produced no
 /// surviving candidate (every branch failed) and the search stops here.
@@ -155,6 +199,43 @@ pub async fn emit_tree_start(
         breadth: params.breadth,
         depth: params.depth,
         beam_width: params.beam_width,
+    })
+    .await
+}
+
+/// Emit `node_start` for a node about to generate (#413 token stream). The
+/// caller follows it with `node_delta`s (via the search's demux) and a
+/// terminal `node_complete`.
+pub async fn emit_node_start(
+    em: &mut Emitter,
+    id: &str,
+    parent_id: &str,
+    depth: usize,
+    branch_index: usize,
+) -> Result<(), EmitError> {
+    em.emit_json(&NodeStartFrame {
+        event: "node_start",
+        id,
+        parent_id,
+        depth,
+        branch_index,
+    })
+    .await
+}
+
+/// Emit one streamed `node_delta` chunk for `id` on `kind`'s channel
+/// ([`DELTA_REASONING`] / [`DELTA_ANSWER`]).
+pub async fn emit_node_delta(
+    em: &mut Emitter,
+    id: &str,
+    kind: &'static str,
+    text: &str,
+) -> Result<(), EmitError> {
+    em.emit_json(&NodeDeltaFrame {
+        event: "node_delta",
+        id,
+        kind,
+        text,
     })
     .await
 }
@@ -323,6 +404,46 @@ mod tests {
         .unwrap();
         assert_eq!(v["node"]["score_error"], "score fork failed: boom");
         assert!(v["node"]["score"].is_null());
+    }
+
+    #[test]
+    fn node_start_frame_carries_position() {
+        let v = serde_json::to_value(NodeStartFrame {
+            event: "node_start",
+            id: "tot-n3",
+            parent_id: "root",
+            depth: 1,
+            branch_index: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            json!({"event":"node_start","id":"tot-n3","parent_id":"root","depth":1,"branch_index":0})
+        );
+    }
+
+    #[test]
+    fn node_delta_frame_tags_id_and_channel() {
+        let r = serde_json::to_value(NodeDeltaFrame {
+            event: "node_delta",
+            id: "tot-n3",
+            kind: DELTA_REASONING,
+            text: "weigh A vs B",
+        })
+        .unwrap();
+        assert_eq!(
+            r,
+            json!({"event":"node_delta","id":"tot-n3","kind":"reasoning","text":"weigh A vs B"})
+        );
+        let a = serde_json::to_value(NodeDeltaFrame {
+            event: "node_delta",
+            id: "tot-n3",
+            kind: DELTA_ANSWER,
+            text: "4",
+        })
+        .unwrap();
+        assert_eq!(a["kind"], "answer");
+        assert_eq!(a["text"], "4");
     }
 
     #[test]
