@@ -15,8 +15,18 @@ struct TreeSearchSection: View {
   let tree: ToTTree
   let answerStarted: Bool
   @State private var userExpanded: Bool?
+  /// Drives the slow breathing of the "searching…" label while the search
+  /// runs. Toggled true on enter-search so the repeat-forever animation
+  /// kicks; settles back when the search leaves `.searching`.
+  @State private var breathe = false
 
   private var isExpanded: Bool { userExpanded ?? !answerStarted }
+
+  /// True only while the search is actively streaming levels.
+  private var isSearching: Bool {
+    if case .searching = tree.status { return true }
+    return false
+  }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
@@ -27,8 +37,21 @@ struct TreeSearchSection: View {
           Image(systemName: "point.3.connected.trianglepath.dotted")
           Text("Tree search")
             .fontWeight(.medium)
-          Text(summary)
+          Text(boundsPrefix)
             .foregroundStyle(.tertiary)
+          // The status word breathes (1.0 ↔ 0.4) while searching, then
+          // settles opaque the moment the answer lands or the search fails.
+          Text(statusWord)
+            .foregroundStyle(.tertiary)
+            .opacity(isSearching && breathe ? 0.4 : 1.0)
+            .animation(
+              isSearching
+                ? .easeInOut(duration: 1.2).repeatForever(autoreverses: true)
+                : .easeInOut(duration: 0.25),
+              value: breathe
+            )
+            .onAppear { breathe = isSearching }
+            .onChange(of: isSearching) { _, searching in breathe = searching }
           Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
         }
         .font(.caption)
@@ -57,21 +80,24 @@ struct TreeSearchSection: View {
     .animation(.easeInOut(duration: 0.15), value: isExpanded)
   }
 
-  /// "3×2, beam 2 · searching…" / "· 9 nodes" / "· no answer" / "failed".
-  private var summary: String {
-    var parts: [String] = []
-    if let b = tree.breadth, let d = tree.depth, let w = tree.beamWidth {
-      parts.append("\(b)×\(d), beam \(w)")
-    }
+  /// The static bounds prefix shown before the (separately-pulsed) status
+  /// word: "· 3×2, beam 2 ·", or just "·" before `tree_start` echoes bounds.
+  private var boundsPrefix: String {
+    guard let b = tree.breadth, let d = tree.depth, let w = tree.beamWidth else { return "·" }
+    return "· \(b)×\(d), beam \(w) ·"
+  }
+
+  /// The status word, rendered as its own Text so only it breathes while
+  /// searching: "searching…" / "9 nodes" / "no answer" / "failed".
+  private var statusWord: String {
     switch tree.status {
     case .idle, .searching:
-      parts.append("searching…")
+      return "searching…"
     case .complete:
-      parts.append(tree.selectedNode != nil ? "\(tree.nodes.count) nodes" : "no answer")
+      return tree.selectedNode != nil ? "\(tree.nodes.count) nodes" : "no answer"
     case .failed:
-      parts.append("failed")
+      return "failed"
     }
-    return parts.isEmpty ? "" : "· " + parts.joined(separator: " · ")
   }
 }
 
