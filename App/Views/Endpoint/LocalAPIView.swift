@@ -28,6 +28,14 @@ struct LocalAPIView: View {
   @State private var servedModel: String?
   @State private var health: EngineHealth.Status?
   @State private var confirmStop = false
+  /// Last engine start/stop failure, surfaced near the status card. The
+  /// engine's poll channel does NOT cover resolver-stage start rejections
+  /// (`.profileMissing`/`.invalidInput`/`.spawnFailed`/`.modelMissing`):
+  /// the helper replies the error but leaves status `.stopped`, so without
+  /// this the toggle would snap back silently. A stop rejection likewise
+  /// leaves status `.running` (toggle stuck on). Mirrors
+  /// `ChatScaffoldView`'s `engineActionError` channel.
+  @State private var engineActionError: String?
 
   private var state: LocalAPIState {
     LocalAPIState.make(
@@ -41,6 +49,9 @@ struct LocalAPIView: View {
       VStack(alignment: .leading, spacing: 20) {
         header
         statusCard
+        if let engineActionError {
+          actionErrorRow(engineActionError)
+        }
         if state.isServing {
           servingDetails
         }
@@ -52,6 +63,11 @@ struct LocalAPIView: View {
     .background(Color(nsColor: .windowBackgroundColor))
     .accessibilityIdentifier("LocalAPIView")
     .task(id: state.port) { await runLiveStats() }
+    // Clear a stale start/stop error once the engine actually reaches
+    // `.running` (the action succeeded, possibly via another surface).
+    .onChange(of: state.isServing) { _, serving in
+      if serving { engineActionError = nil }
+    }
     .confirmationDialog(
       "Turn off the local API?",
       isPresented: $confirmStop,
@@ -125,6 +141,25 @@ struct LocalAPIView: View {
     .frame(maxWidth: .infinity, alignment: .leading)
     .padding(12)
     .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
+  }
+
+  /// Engine start/stop failure surface. Required because resolver-stage
+  /// rejections don't move the polled status, so the reducer can't show them.
+  private func actionErrorRow(_ message: String) -> some View {
+    HStack(alignment: .firstTextBaseline, spacing: 8) {
+      Image(systemName: "exclamationmark.triangle.fill")
+        .foregroundStyle(.red)
+        .accessibilityHidden(true)
+      Text(message)
+        .font(.callout)
+        .foregroundStyle(.red)
+        .fixedSize(horizontal: false, vertical: true)
+      Spacer(minLength: 0)
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .padding(12)
+    .background(RoundedRectangle(cornerRadius: 8).fill(Color.red.opacity(0.08)))
+    .accessibilityIdentifier("LocalAPIActionError")
   }
 
   private var statusColor: Color {
@@ -285,13 +320,35 @@ struct LocalAPIView: View {
 
   // MARK: - actions
 
+  /// Start the engine on the active profile. A resolver-stage rejection
+  /// (`.profileMissing`/`.modelMissing`/…) is re-thrown by
+  /// `EngineStatusStore.startEngine` and leaves the polled status `.stopped`,
+  /// so it MUST surface here — the reducer never sees it. (`.replyTimeout` /
+  /// `.alreadyRunning` are swallowed by the store as non-failures.)
   private func start() {
     guard let profileID = profileStore.activeProfileID, !profileID.isEmpty else { return }
-    Task { try? await engineStatusStore.startEngine(profileID: profileID) }
+    Task { @MainActor in
+      engineActionError = nil
+      do {
+        try await engineStatusStore.startEngine(profileID: profileID)
+      } catch {
+        engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "start")
+      }
+    }
   }
 
+  /// Stop the engine. A rejected stop (e.g. `.killRejected`) leaves status
+  /// `.running`, so the toggle would otherwise stay on with no explanation —
+  /// surface the reason after this user-confirmed destructive action.
   private func stop() {
-    Task { try? await engineStatusStore.stopEngine() }
+    Task { @MainActor in
+      engineActionError = nil
+      do {
+        try await engineStatusStore.stopEngine()
+      } catch {
+        engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "stop")
+      }
+    }
   }
 
   private func copy(_ string: String) {
