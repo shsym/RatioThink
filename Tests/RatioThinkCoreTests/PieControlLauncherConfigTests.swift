@@ -11,6 +11,27 @@ import XCTest
 /// (which depends on the same emission shape).
 final class PieControlLauncherConfigTests: XCTestCase {
 
+  func test_configTimeout_matchesPieTemplateDefaultForSlowToTRequests() {
+    let body = PieControlLauncher.renderConfigBody(modelConfig: .dummy)
+    XCTAssertTrue(body.contains("request_timeout_secs = 120"),
+                  "app launcher config must not lower pie's template/default 120s request timeout; slow ToT node/scorer passes can otherwise close SSE without a terminal frame")
+    XCTAssertFalse(body.contains("request_timeout_secs = 60"),
+                   "60s was too low for packaged-app ToT runs on slower hardware/profiles")
+  }
+
+  func test_subprocessEnvironment_liftsShmemTimeoutToMatchSchedulerTimeout() {
+    let env = PieControlLauncher.renderSubprocessEnvironment(
+      base: ["PIE_SHMEM_TIMEOUT_S": "1", "KEEP": "yes"],
+      pieHome: URL(fileURLWithPath: "/tmp/pie-home", isDirectory: true),
+      shmemName: "/pie-test"
+    )
+    XCTAssertEqual(env["PIE_HOME"], "/tmp/pie-home")
+    XCTAssertEqual(env["PIE_SHMEM_NAME"], "/pie-test")
+    XCTAssertEqual(env["PIE_SHMEM_TIMEOUT_S"], "120",
+                   "the real fire_batch/shmem path reads PIE_SHMEM_TIMEOUT_S, not scheduler.request_timeout_secs directly")
+    XCTAssertEqual(env["KEEP"], "yes")
+  }
+
   func test_dummy_body_emits_dummy_driver_with_qwen3_fixture() {
     let body = PieControlLauncher.renderConfigBody(modelConfig: .dummy)
     XCTAssertTrue(body.contains("type = \"dummy\""),

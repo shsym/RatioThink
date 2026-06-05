@@ -35,6 +35,13 @@ import Darwin
 /// avoids the Python harness's `_drain_stdout` background task +
 /// `_send_signal_safe` dance.
 public enum PieControlLauncher {
+  /// Keep the app launcher aligned with pie's template/default scheduler
+  /// timeout. Tree-of-thought can run long, and on slower hardware a single
+  /// node/scorer forward-pass may exceed the old app-local 60s cap, closing
+  /// the SSE before a terminal tree frame. The shmem fire_batch path also
+  /// reads `PIE_SHMEM_TIMEOUT_S`, so launch() mirrors this value into the
+  /// child environment instead of relying on TOML alone.
+  static let requestTimeoutSeconds = 120
 
   // MARK: - errors
 
@@ -480,9 +487,11 @@ public enum PieControlLauncher {
     let httpPort = try reserveFreePort()
     let configURL = try writeConfig(modelConfig: spec.modelConfig, in: spec.pieHome)
 
-    var env = spec.subprocessEnvironment
-    env["PIE_HOME"] = spec.pieHome.path
-    env["PIE_SHMEM_NAME"] = spec.shmemName
+    let env = renderSubprocessEnvironment(
+      base: spec.subprocessEnvironment,
+      pieHome: spec.pieHome,
+      shmemName: spec.shmemName
+    )
 
     let proc = Process()
     proc.executableURL = spec.pieBinary
@@ -643,7 +652,7 @@ public enum PieControlLauncher {
 
     [model.scheduler]
     batch_policy = "adaptive"
-    request_timeout_secs = 60
+    request_timeout_secs = \(requestTimeoutSeconds)
     default_endowment_pages = 4
     admission_oversubscription_factor = 8.0
     restore_pause_at_utilization = 0.85
@@ -706,6 +715,23 @@ public enum PieControlLauncher {
       """
       return preamble + model + scheduler + driver
     }
+  }
+
+  /// Child environment projection for `pie serve`. `SpawnEnvSanitizer` removes
+  /// parent `PIE_*` variables before `LaunchSpec` construction; this method
+  /// re-adds the exact app-owned values the child must see. Keep the shmem
+  /// hard timeout in lock-step with the TOML scheduler timeout because
+  /// `fire_batch` enforces `PIE_SHMEM_TIMEOUT_S` independently.
+  static func renderSubprocessEnvironment(
+    base: [String: String],
+    pieHome: URL,
+    shmemName: String
+  ) -> [String: String] {
+    var env = base
+    env["PIE_HOME"] = pieHome.path
+    env["PIE_SHMEM_NAME"] = shmemName
+    env["PIE_SHMEM_TIMEOUT_S"] = String(requestTimeoutSeconds)
+    return env
   }
 
   private static func renderPortableModel(servedID: String,
