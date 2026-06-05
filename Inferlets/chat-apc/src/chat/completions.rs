@@ -1871,12 +1871,11 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
 /// where `field` names the offending JSON key (passed to the
 /// OpenAI-shape error envelope's `param`).
 /// Per-request `max_tokens` ceiling, read live from the engine. This is
-/// `runtime::max-output-tokens()` — the engine's launch-time KV-cache
-/// capacity (`kv_page_size * max_num_kv_pages`, after the driver's
-/// memory-pressure backoff), so the ceiling tracks the configured engine
-/// and host RAM rather than a hardcoded constant. Falls back to
+/// `runtime::max-output-tokens()` — the runtime-reported output-token
+/// ceiling: configured scheduler `default_token_limit` capped by raw KV
+/// capacity when set, otherwise raw KV capacity. Falls back to
 /// `MAX_OUTPUT_TOKENS_FALLBACK` when the engine reports 0 (no model
-/// registered / capacity unknown).
+/// registered / ceiling unknown).
 fn max_output_ceiling() -> usize {
     match runtime::max_output_tokens() as usize {
         0 => MAX_OUTPUT_TOKENS_FALLBACK,
@@ -1885,11 +1884,12 @@ fn max_output_ceiling() -> usize {
 }
 
 /// `max_output_ceiling` is the inclusive upper bound on `max_tokens`,
-/// supplied by the caller from `runtime::max-output-tokens` (the engine's
-/// launch-time KV-cache capacity) so the ceiling follows the configured
-/// engine instead of a hardcoded constant. Kept as a parameter — rather
-/// than reading the host import in here — so this stays a pure function
-/// the unit tests can drive without an engine host.
+/// supplied by the caller from `runtime::max-output-tokens` so validation
+/// follows the runtime-reported ceiling (configured `default_token_limit`
+/// capped by KV capacity, or raw KV capacity when unset) instead of a
+/// hardcoded constant. Kept as a parameter — rather than reading the host
+/// import in here — so this stays a pure function the unit tests can drive
+/// without an engine host.
 fn validate_sampling(
     req: &ChatCompletionsRequest,
     max_output_ceiling: usize,

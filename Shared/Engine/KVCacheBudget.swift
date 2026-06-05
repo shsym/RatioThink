@@ -33,21 +33,22 @@ public enum KVCacheBudget {
   public static let overheadFloorBytes: Int64 = 1 * 1024 * 1024 * 1024  // 1 GiB
   public static let overheadFraction: Double = 0.15
 
-  /// Smallest ceiling we will write. Below this the model nearly fills
+  /// Usability floor after RAM fitting. Below this the model nearly fills
   /// RAM and KV is squeezed, but `default_token_limit` must be > 0 and a
-  /// tiny positive cap keeps chat minimally usable; the driver's pool
-  /// backoff handles the physical fit.
+  /// tiny positive cap keeps chat minimally usable. The model's context
+  /// window remains the hard cap, even when it is below this floor.
   public static let minCeilingTokens: Int = 512
 
   /// Returns the value to write as `[model.scheduler].default_token_limit`,
   /// or `nil` to omit it (engine keeps its default pool cap — no clamp).
   ///
   /// `ceiling = min( floor((threshold − weights − overhead) / kv_per_token),
-  ///                 defaultPoolCapacityTokens, contextLength )`, floored
-  /// at `minCeilingTokens`. `nil` when the RAM-fit ceiling is at or above
-  /// the pool capacity AND the context window is too (i.e. nothing to
-  /// clamp). `threshold` is the size guardrail's RAM-derived ceiling, so
-  /// the operator's RAM-fraction dial scales this too.
+  ///                 defaultPoolCapacityTokens, contextLength )`, raised
+  /// to `minCeilingTokens` only when doing so does not exceed
+  /// `contextLength`. `nil` when the RAM-fit ceiling is at or above the
+  /// pool capacity AND the context window is too (i.e. nothing to clamp).
+  /// `threshold` is the size guardrail's RAM-derived ceiling, so the
+  /// operator's RAM-fraction dial scales this too.
   public static func outputTokenCeiling(
     policy: ModelMemoryGuardrail.Policy,
     weightBytes: Int64,
