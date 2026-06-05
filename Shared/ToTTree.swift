@@ -128,10 +128,33 @@ public struct ToTTree: Equatable, Sendable, Codable {
       self.beamWidth = beamWidth
       self.status = .searching
 
+    case let .nodeStart(id, parentID, depth, branchIndex):
+      // #413 token stream: create a provisional node so its deltas have a
+      // home and it renders (filling live) before `nodeComplete` finalizes
+      // it. Provisional status is `.ok` with empty text + no score; the
+      // terminal `nodeComplete` replaces it with the authoritative node.
+      if !nodes.contains(where: { $0.id == id }) {
+        let provisional = ToTNode(
+          id: id, parentID: parentID, depth: depth, branchIndex: branchIndex,
+          content: "", reasoning: "", score: nil, status: .ok)
+        nodes.append(Node(provisional))
+      }
+
+    case let .nodeDelta(id, channel, text):
+      // Append the streamed chunk to the live node's reasoning or answer.
+      // Out-of-order (no node yet) is dropped — sequential generation always
+      // sends nodeStart first, and nodeComplete backfills regardless.
+      guard let idx = nodes.firstIndex(where: { $0.id == id }) else { return }
+      switch channel {
+      case .reasoning: nodes[idx].reasoning += text
+      case .answer: nodes[idx].content += text
+      }
+
     case let .nodeComplete(wire):
       let node = Node(wire)
       // A node id is unique per response; replace on the off chance the
-      // same id streams twice rather than duplicate it in the tree.
+      // same id streams twice (and to reconcile a provisional node + its
+      // streamed deltas to the authoritative final) rather than duplicate.
       if let idx = nodes.firstIndex(where: { $0.id == node.id }) {
         nodes[idx] = node
       } else {

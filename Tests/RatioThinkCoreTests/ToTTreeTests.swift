@@ -168,4 +168,41 @@ final class ToTTreeTests: XCTestCase {
     XCTAssertEqual(back.nodes.first?.reasoning, "")
     XCTAssertEqual(back.nodes.first?.content, "4")
   }
+
+  // ── #413 phase B: token-level streaming ──
+
+  func test_node_start_then_deltas_live_fill_then_complete_reconciles() {
+    var t = ToTTree()
+    t.apply(.treeStart(id: "tot-1", model: "qwen", breadth: 1, depth: 1, beamWidth: 1))
+    // node_start creates a provisional, empty node.
+    t.apply(.nodeStart(id: "tot-n1", parentID: "root", depth: 1, branchIndex: 0))
+    XCTAssertEqual(t.nodes.count, 1)
+    XCTAssertEqual(t.nodes.first?.content, "")
+    XCTAssertEqual(t.nodes.first?.reasoning, "")
+    XCTAssertEqual(t.rootChildren.map(\.id), ["tot-n1"])  // placed in the tree
+
+    // reasoning streams first, then the answer (the demux order).
+    t.apply(.nodeDelta(id: "tot-n1", channel: .reasoning, text: "first "))
+    t.apply(.nodeDelta(id: "tot-n1", channel: .reasoning, text: "weigh A vs B"))
+    XCTAssertEqual(t.nodes.first?.reasoning, "first weigh A vs B")
+    XCTAssertEqual(t.nodes.first?.content, "")
+    t.apply(.nodeDelta(id: "tot-n1", channel: .answer, text: "Pick "))
+    t.apply(.nodeDelta(id: "tot-n1", channel: .answer, text: "A."))
+    XCTAssertEqual(t.nodes.first?.content, "Pick A.")
+    XCTAssertEqual(t.nodes.count, 1, "deltas fill the existing node, never duplicate")
+
+    // node_complete reconciles to the authoritative node (adds the score).
+    t.apply(.nodeComplete(
+      node("tot-n1", parent: "root", depth: 1, branch: 0,
+           content: "Pick A.", reasoning: "first weigh A vs B", score: 8)))
+    XCTAssertEqual(t.nodes.count, 1)
+    XCTAssertEqual(t.nodes.first?.score, 8)
+    XCTAssertEqual(t.nodes.first?.content, "Pick A.")
+  }
+
+  func test_node_delta_before_its_start_is_dropped() {
+    var t = ToTTree()
+    t.apply(.nodeDelta(id: "ghost", channel: .answer, text: "x"))
+    XCTAssertTrue(t.nodes.isEmpty)
+  }
 }

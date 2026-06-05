@@ -114,12 +114,24 @@ enum EngineHarness {
     var tree = ToTTree()
     let t0 = Date()
     var sawTerminal = false
+    var nodeStarts = 0
+    var reasoningDeltas = 0
+    var answerDeltas = 0
     for try await event in toTEventStream(from: client.dispatchInferlet(req)) {
       tree.apply(event)
       let dt = Date().timeIntervalSince(t0)
       switch event {
       case let .treeStart(id, model, b, d, w):
         print(String(format: "  +%6.1fs tree_start id=\(id) model=\(model) b\(b)/d\(d)/beam\(w)", dt))
+      case let .nodeStart(id, _, depth, _):
+        nodeStarts += 1
+        print(String(format: "  +%6.1fs node_start \(id) depth=\(depth)", dt))
+      case let .nodeDelta(_, channel, _):
+        // Token-level chunks (#413 phase B) — count, don't spam per-chunk.
+        switch channel {
+        case .reasoning: reasoningDeltas += 1
+        case .answer: answerDeltas += 1
+        }
       case let .nodeComplete(node):
         let head = node.content.prefix(40).replacingOccurrences(of: "\n", with: "\\n")
         print(String(format: "  +%6.1fs node_complete depth=\(node.depth) status=\(node.status) score=\(node.score.map(String.init) ?? "nil") len=\(node.content.count) head=\(head.debugDescription)", dt))
@@ -131,6 +143,7 @@ enum EngineHarness {
       }
     }
     let total = Date().timeIntervalSince(t0)
+    print("chat-engine-harness: token stream — node_starts=\(nodeStarts) reasoningDeltas=\(reasoningDeltas) answerDeltas=\(answerDeltas)")
 
     // Per-node reasoning-aware accounting (#413/#434/#437).
     func answered(_ n: ToTTree.Node) -> Bool {
@@ -163,7 +176,17 @@ enum EngineHarness {
     if let sel = tree.selectedNode, !answered(sel) {
       failures.append("selected node has no usable answer")
     }
+    // #413 phase B: text must stream INCREMENTALLY, not only at node_complete.
+    if nodeStarts == 0 {
+      failures.append("no node_start frames — token streaming not emitting")
+    }
+    if answerDeltas == 0 {
+      failures.append("no answer node_delta chunks — answers not streaming incrementally")
+    }
     if expectReasoning {
+      if reasoningDeltas == 0 {
+        failures.append("no reasoning node_delta chunks — reasoning not streaming incrementally")
+      }
       // Thinking is on: the demux must yield nodes that carry BOTH a
       // reasoning trace AND a clean answer — that is the whole point.
       if bothReasoningAndAnswer.isEmpty {

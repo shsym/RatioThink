@@ -332,7 +332,10 @@ public final class ChatSendController: ObservableObject {
             self.activePersistenceStatus = nil
           case .levelPruned:
             Self.persistTree(context, status: persistenceStatus)
-          case .treeStart, .nodeComplete:
+          case .treeStart, .nodeStart, .nodeDelta, .nodeComplete:
+            // In-memory tot re-encode above already drives the live tree
+            // (incl. per-token node_delta fill, #413 phase B); disk persistence
+            // stays throttled to level boundaries + the terminal.
             break
           }
         }

@@ -84,6 +84,43 @@ final class ToTStreamTests: XCTestCase {
     XCTAssertEqual(node.error, "no answer")
   }
 
+  func test_decodes_node_start() throws {
+    let e = try decodeToTFrame(frame(
+      #"{"event":"node_start","id":"tot-n4","parent_id":"tot-n1","depth":2,"branch_index":1}"#
+    ))
+    guard case let .nodeStart(id, parentID, depth, branchIndex) = e else {
+      return XCTFail("want nodeStart, got \(String(describing: e))")
+    }
+    XCTAssertEqual(id, "tot-n4")
+    XCTAssertEqual(parentID, "tot-n1")
+    XCTAssertEqual(depth, 2)
+    XCTAssertEqual(branchIndex, 1)
+  }
+
+  func test_decodes_node_delta_reasoning_then_answer() throws {
+    let r = try decodeToTFrame(frame(
+      #"{"event":"node_delta","id":"tot-n4","kind":"reasoning","text":"weigh A"}"#
+    ))
+    guard case let .nodeDelta(id, channel, text) = r else { return XCTFail("want nodeDelta") }
+    XCTAssertEqual(id, "tot-n4")
+    XCTAssertEqual(channel, .reasoning)
+    XCTAssertEqual(text, "weigh A")
+
+    let a = try decodeToTFrame(frame(
+      #"{"event":"node_delta","id":"tot-n4","kind":"answer","text":"The answer"}"#
+    ))
+    guard case let .nodeDelta(_, channel2, text2) = a else { return XCTFail("want nodeDelta") }
+    XCTAssertEqual(channel2, .answer)
+    XCTAssertEqual(text2, "The answer")
+  }
+
+  func test_unknown_delta_channel_is_dropped() throws {
+    // Forward-compat: a newer engine channel must not kill the stream.
+    XCTAssertNil(try decodeToTFrame(frame(
+      #"{"event":"node_delta","id":"tot-n4","kind":"future_channel","text":"x"}"#
+    )))
+  }
+
   func test_decodes_level_pruned() throws {
     let e = try decodeToTFrame(frame(
       #"{"event":"level_pruned","level":1,"kept":["tot-n1","tot-n2"]}"#

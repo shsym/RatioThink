@@ -131,7 +131,15 @@ public enum ToTEvent: Equatable, Sendable {
   /// Opens the stream; echoes the search bounds so the UI can render the
   /// expected shape before nodes arrive.
   case treeStart(id: String, model: String, breadth: Int, depth: Int, beamWidth: Int)
-  /// One fully-resolved node (generated + scored, or errored).
+  /// A node is about to generate (#413 token stream): its tree position, so
+  /// the client can create + place a provisional node and route the node's
+  /// `nodeDelta`s to it before `nodeComplete` finalizes it.
+  case nodeStart(id: String, parentID: String?, depth: Int, branchIndex: Int?)
+  /// A streamed text chunk for a node, tagged by id + channel (reasoning
+  /// while inside `<think>`, then the answer). Appended live to the node.
+  case nodeDelta(id: String, channel: ToTDeltaChannel, text: String)
+  /// One fully-resolved node (generated + scored, or errored) — the per-node
+  /// terminal + authoritative final (the non-stream path emits only these).
   case nodeComplete(ToTNode)
   /// A level's beam selection: the ids kept as the next frontier. Empty
   /// `kept` ⇒ the level produced no survivor and the search stopped.
@@ -141,6 +149,12 @@ public enum ToTEvent: Equatable, Sendable {
   /// failure, not an empty success — the server emits the `error` frame
   /// for it now, and the consumer treats a null selection as failure (F1).
   case treeComplete(selectedNodeID: String?, finalAnswer: String?)
+}
+
+/// Which channel a streamed `nodeDelta` chunk fills (#413).
+public enum ToTDeltaChannel: String, Equatable, Sendable {
+  case reasoning
+  case answer
 }
 
 /// Failures specific to the tree-of-thought stream.
@@ -194,6 +208,19 @@ public func decodeToTFrame(_ data: Data) throws -> ToTEvent? {
       throw ToTStreamError.malformedFrame(payload: String(decoding: data, as: UTF8.self))
     }
     return .treeStart(id: id, model: model, breadth: breadth, depth: depth, beamWidth: beamWidth)
+  case "node_start":
+    guard let id = raw.id, let depth = raw.depth else {
+      throw ToTStreamError.malformedFrame(payload: String(decoding: data, as: UTF8.self))
+    }
+    return .nodeStart(id: id, parentID: raw.parentID, depth: depth, branchIndex: raw.branchIndex)
+  case "node_delta":
+    guard let id = raw.id, let kind = raw.kind, let text = raw.text else {
+      throw ToTStreamError.malformedFrame(payload: String(decoding: data, as: UTF8.self))
+    }
+    // An unknown channel from a newer engine is dropped (forward-compat),
+    // not fatal — mirrors the unknown-event default below.
+    guard let channel = ToTDeltaChannel(rawValue: kind) else { return nil }
+    return .nodeDelta(id: id, channel: channel, text: text)
   case "node_complete":
     guard let node = raw.node else {
       throw ToTStreamError.malformedFrame(payload: String(decoding: data, as: UTF8.self))
@@ -256,6 +283,11 @@ struct RawToTFrame: Decodable {
   let finalAnswer: String?
   let code: String?
   let message: String?
+  // node_start position + node_delta payload (#413 token stream).
+  let parentID: String?
+  let branchIndex: Int?
+  let kind: String?
+  let text: String?
 
   private enum CodingKeys: String, CodingKey {
     case event
@@ -271,5 +303,9 @@ struct RawToTFrame: Decodable {
     case finalAnswer = "final_answer"
     case code
     case message
+    case parentID = "parent_id"
+    case branchIndex = "branch_index"
+    case kind
+    case text
   }
 }
