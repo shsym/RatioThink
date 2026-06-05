@@ -61,7 +61,7 @@ endef
 .PHONY: help genproject build build-tests clean lint \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
         test-xcode-chat-scaffold \
-        test-unit test-scenario test-smoke test-install-guards test-e2e-http \
+        test-unit test-scenario test-smoke test-curated-hf test-install-guards test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
         test-e2e-engine test-e2e-models test-e2e-load test-e2e-chat test-e2e-full test-helper-respawn \
@@ -210,6 +210,30 @@ test-smoke: engine-build $(LOGDIR) ## Engine subprocess smoke (depends on built 
 	  status=$${PIPESTATUS[0]}; \
 	  echo "log: $$LOG"; \
 	  exit $$status
+
+test-curated-hf: $(LOGDIR) ## Live-HF existence audit of the curated catalog (PIE_TEST_REAL_HF=1; network). Hard-fails on a phantom/nonexistent curated file or a silent skip (#427). Used by the scheduled curated-catalog-audit CI job + as a release/local gate.
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-curated-hf.log; \
+	  PIE_TEST_REAL_HF=1 Scripts/run-swift-test.sh --filter 'CuratedModelCatalogLiveHFTests' 2>&1 | tee $$LOG | tail -40; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  if [ "$$status" -ne 0 ]; then \
+	    echo "FAIL: curated-catalog live-HF audit failed — a curated (repo,file) does not exist on HF, is published only as split shards, or has no positive published size; see $$LOG"; \
+	    exit "$$status"; \
+	  fi; \
+	  if grep -Eq 'Test Case .* skipped' $$LOG; then \
+	    echo "FAIL: live-HF audit was SKIPPED — PIE_TEST_REAL_HF was not honored; the existence guard must not silently no-op"; \
+	    exit 1; \
+	  fi; \
+	  if ! grep -Eq 'Executed [1-9][0-9]* tests?, with 0 failures' $$LOG; then \
+	    echo "FAIL: expected 'Executed N tests, with 0 failures' (N>=1) — filter matched zero tests (renamed class? stale bundle?)"; \
+	    exit 1; \
+	  fi; \
+	  if ! grep -q 'LIVE-HF: ' $$LOG; then \
+	    echo "FAIL: no 'LIVE-HF:' success line — the audit ran but validated zero curated entries against HF"; \
+	    exit 1; \
+	  fi; \
+	  echo "curated-hf-audit: $$(grep -c 'LIVE-HF: ' $$LOG) curated entries verified to exist on HF"
 
 test-install-guards: ## Install-time launchd-safety regression guards (stubbed, deterministic — runs anywhere)
 	Scripts/test-proc-acceptance.sh

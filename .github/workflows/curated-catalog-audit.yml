@@ -1,0 +1,79 @@
+name: curated-catalog-audit
+
+# Always-on existence coverage for the curated GGUF catalog (#427).
+#
+# The offline `CuratedModelCatalogTests` only prove SHAPE (a 2-segment
+# `<org>/<name>` repo + a single `.gguf` leaf that is not a split-shard
+# name). A phantom monolithic filename — the #425 bug
+# (`Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_k_m.gguf`, which
+# HF never published) — is correctly shaped and passes every offline guard.
+# Only the live HF tree-API audit (`CuratedModelCatalogLiveHFTests`,
+# `PIE_TEST_REAL_HF=1`) proves each curated `(repo, file)` actually EXISTS,
+# and it is OFF by default so PR CI stays network-free.
+#
+# This workflow runs that audit automatically so the existence regression
+# class is covered without an opt-in run:
+#   · nightly — catches HF-side drift (a curated repo/file pulled or
+#     renamed AFTER it was added), which no code change would re-trigger.
+#   · on a PR that edits the catalog or its tests — reds the #425
+#     introduction moment BEFORE merge, when a maintainer pastes a
+#     nonexistent / split-shard-only filename.
+# Unrelated PRs never hit the network (the audit job is skipped).
+
+on:
+  schedule:
+    # Nightly at 09:37 UTC — off the top-of-hour Actions congestion.
+    - cron: "37 9 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  # Path-change detector for the conditional audit job. The workflow stays
+  # UNFILTERED (no top-level `on.paths`) and the audit gates on this output
+  # via a job-level `if:` — an `if:`-skip reports "Success" to branch
+  # protection, whereas an `on.paths`-skip stays "Pending" and would block a
+  # protected PR (#389 / GitHub required-check skip semantics). This keeps
+  # the path-filtering safe even if `main` later becomes protected.
+  changes:
+    name: detect curated-catalog changes
+    runs-on: ubuntu-latest
+    outputs:
+      catalog: ${{ steps.filter.outputs.catalog }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            catalog:
+              - 'Shared/CuratedModelCatalog.swift'
+              - 'Tests/RatioThinkCoreTests/CuratedModelCatalogLiveHFTests.swift'
+              - 'Tests/RatioThinkCoreTests/CuratedModelCatalogTests.swift'
+
+  hf-existence-audit:
+    name: curated catalog live-HF existence audit
+    runs-on: macos-15
+    # Always run on schedule / manual dispatch; on a PR run only when the
+    # catalog or its tests changed. FAIL-OPEN (`!cancelled()` overrides the
+    # implicit `success(needs)` gate, and an empty output on detector
+    # failure makes `!= 'false'` true): if the detector errored, AUDIT
+    # anyway rather than skip-as-Success and let a phantom merge unaudited
+    # (#389 rationale). Keep `!= 'false'`, not `== 'true'`.
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.catalog != 'false') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      # `make test-curated-hf` runs the gated live test with
+      # PIE_TEST_REAL_HF=1 and HARD-FAILS on a phantom file, on a silent
+      # skip (env not honored), on a zero-match filter, or on zero verified
+      # entries — so this audit cannot false-green. The guard travels with
+      # the make target, so a local / release run gets the same contract.
+      - name: Live-HF curated catalog existence audit
+        run: make test-curated-hf
