@@ -559,11 +559,22 @@ public final class PieEngineHost: @unchecked Sendable {
           consecutiveGone = 0
         case .gone(let reason):
           consecutiveGone += 1
+          // #413 diag: a `.gone` verdict from the control-plane ping while the
+          // engine is BUSY (not dead) would falsely restart it mid-search and
+          // close the in-flight ToT SSE. Persist every miss + its reason so the
+          // operator's run shows whether (and why) the monitor fired.
+          DiagnosticLog.helper.event("engine.liveness", [
+            ("verdict", "gone"),
+            ("consecutive", String(consecutiveGone)),
+            ("threshold", String(threshold)),
+            ("reason", reason),
+          ])
           guard consecutiveGone >= threshold else { continue }
           self?.stateQueue.async { [weak self] in
             guard let self else { return }
             guard case .running = self._state else { return }
             Log.engine.error("PieEngineHost: liveness monitor declared engine gone: \(reason, privacy: .public)")
+            DiagnosticLog.helper.event("engine.gone", [("reason", reason), ("consecutive", String(consecutiveGone))])
             self.livenessMonitor = nil
             self.healthyUptimeTask?.cancel()
             self.healthyUptimeTask = nil
@@ -648,6 +659,14 @@ public final class PieEngineHost: @unchecked Sendable {
     let backoff = schedule[min(attemptIndex, schedule.count - 1)]
 
     Log.engine.notice("PieEngineHost: scheduling auto-relaunch attempt \(attemptIndex + 1, privacy: .public)/\(self.relaunchPolicy.maxAttempts, privacy: .public) in \(backoff, privacy: .public)s (reason=\(reason, privacy: .public))")
+    // #413 diag: a relaunch kills + respawns the engine — if this fires during
+    // a ToT search the in-flight SSE closes with no terminal. Persist it so the
+    // operator's run lines this up against the chat.fail.tot timestamp.
+    DiagnosticLog.helper.event("engine.relaunch", [
+      ("attempt", String(attemptIndex + 1)),
+      ("backoff", String(format: "%.1f", backoff)),
+      ("reason", reason),
+    ])
 
     autoRelaunchTask?.cancel()
     autoRelaunchTask = Task { [weak self, relauncher, backoff] in

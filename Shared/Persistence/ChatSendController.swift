@@ -307,6 +307,11 @@ public final class ChatSendController: ObservableObject {
       // pruning, the terminal) always flush so the view never lags a whole
       // node behind and the persisted snapshot is never stale.
       var lastLiveEncode = Date.distantPast
+      // #413 diag: time + progress at the SSE close, so the operator's run can
+      // line a `no_terminal` close up against an `engine.relaunch` (helper.log)
+      // or `engine.poll fail` (app.log) at the same instant — pinning whether a
+      // mid-search engine/helper restart closed the stream.
+      let totStart = Date()
       do {
         for try await event in toTEventStream(from: engine.dispatchInferlet(request)) {
           guard self.generation == myGeneration, !Task.isCancelled else { return }
@@ -364,7 +369,11 @@ public final class ChatSendController: ObservableObject {
             if assistant.content.isEmpty {
               assistant.content = "⚠️ \(Self.totIncompleteMessage)"
             }
-            Diag.app.event("chat.fail.tot", [("reason", "no_terminal")])
+            Diag.app.event("chat.fail.tot", [
+              ("reason", "no_terminal"),
+              ("elapsed", String(format: "%.1f", Date().timeIntervalSince(totStart))),
+              ("nodes", String(tree.nodes.count)),
+            ])
           }
           Self.persistTree(context, status: persistenceStatus)
         }

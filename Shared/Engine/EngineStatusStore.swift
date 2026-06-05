@@ -362,14 +362,31 @@ public final class EngineStatusStore: ObservableObject {
   }
 
   private nonisolated func refreshOnce(client: any AppXPCClient) async {
+    let started = Date()
     do {
       let next = try await client.engineStatus()
+      let took = Date().timeIntervalSince(started)
+      // #413 diag: a slow-but-succeeding poll is the early warning that the
+      // helper is getting saturated (toward the 2 s reply timeout) — the next
+      // poll may time out and feed HelperHealthController's restart ladder.
+      if took > 0.5 {
+        DiagnosticLog.app.event("engine.poll", [("result", "slow"), ("took", String(format: "%.2f", took))])
+      }
       await MainActor.run { [weak self] in
         self?.apply(next: next, error: nil)
       }
     } catch {
       let message = String(describing: error)
+      let took = Date().timeIntervalSince(started)
       Self.log.error("engineStatus poll failed: \(message, privacy: .public)")
+      // #413 diag: a FAILED engineStatus XPC poll is exactly what drives the
+      // helper-restart ladder. A `replyTimeout` here = the helper was too slow
+      // to answer (e.g. saturated draining pie's --debug output during a busy
+      // search), NOT engine death. Persist it + the XPC latency so the
+      // operator's run shows whether the helper-restart path fired.
+      DiagnosticLog.app.event("engine.poll", [
+        ("result", "fail"), ("took", String(format: "%.2f", took)), ("reason", message),
+      ])
       await MainActor.run { [weak self] in
         self?.apply(next: nil, error: message)
       }
