@@ -287,7 +287,7 @@ test-gui: genproject $(LOGDIR) ## GUI scenarios — full RatioThinkGUITests matr
 # --- Focused GUI suites by product area (xcodebuild -only-testing) ----------
 # Engine-free / mock GUI suites; need a seated session + TCC. Run the area you
 # touched for fast, attributable signal instead of the whole `test-gui` matrix.
-test-gui-shell: genproject $(LOGDIR) ## GUI area: app window shell + Settings 5 tabs (S5)
+test-gui-shell: genproject $(LOGDIR) ## GUI area: app window shell + Settings 4 tabs (S5)
 	$(call gui_suite_run,shell,-only-testing:RatioThinkGUITests/S5_AppWindowShellGUITests)
 
 test-gui-first-launch: genproject $(LOGDIR) ## GUI area: first-launch wizard, fast/mock (S7)

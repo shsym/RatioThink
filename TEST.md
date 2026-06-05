@@ -53,7 +53,7 @@ that wrapper, not bare `xcodebuild`.
 
 | Suite | Area | Proves | Boundary / real model? | Run via |
 |---|---|---|---|---|
-| `S5_AppWindowShellGUITests` | settings/shell | 3-column shell vocabulary, ⌘, → Settings (5 tabs) | mock | `test-gui-shell` |
+| `S5_AppWindowShellGUITests` | settings/shell | 3-column shell vocabulary (Chats + API Endpoints nav, #422), ⌘, → Settings (4 tabs, no API tab) | mock | `test-gui-shell` |
 | `S7_FirstLaunchWizardGUITests` | first-launch | wizard flow (register / approval-blocked) | mock (faked login-item) | `test-gui-first-launch` |
 | `S7_FirstLaunchWizardPackagedArtifactGUITests` | package/install | Release `.app` first-launch persists across relaunch; launched-artifact path | packaged-signed-app | `test-gui-first-launch-package` |
 | `S4_HelperMenuBarGUITests` | helper/engine | menu-bar shell; fresh seed enables Resume; oversized-model rejected; Resume boots pie → Pause | app+real-engine (GGUF fixture) | `test-gui-helper` |
@@ -66,7 +66,7 @@ that wrapper, not bare `xcodebuild`.
 | `S204_ChatSendGUITests` | chat send/persist | INSTRUCT model answers "Paris" → persists across relaunch | **app+real-engine (real GGUF)** | `test-e2e-full` |
 | `S275_MultiTurnResumeGUITests` | chat send/persist | ordered multi-turn history sent to engine + persisted across relaunch | app+fake-engine (deterministic HTTP) | `test-gui-history` |
 | `S279_LifecycleRecoveryGUITests` | lifecycle/recovery | unreachable engine → visible recoverable error + composer re-enabled | app+real-engine seam (dead loopback) | `test-gui-chat` |
-| `S285_ZeroStateGUITests` | zero-state | empty-state top-alignment; Start Chat / Add Endpoint CTAs open a chat/endpoint | mock (stops at composer; no send) | `test-gui-chat` |
+| `S285_ZeroStateGUITests` | zero-state | empty-state top-alignment; Start Chat CTA opens a chat; API Endpoints section opens the single live `LocalAPIView` (#422) | mock (stops at composer; no send) | `test-gui-chat` |
 | `S326_FreshInstallModelDownloadGUITests` | first-launch | fresh install (seeded profile, model absent) → no-model gate offers inline **download**, not a dead-end Load | mock (fake downloader, pre-engine) | `test-gui` |
 | `S327_EngineStatusIndicatorGUITests` | model load/status | always-visible engine-status pip; popover **stays open** across 1 Hz poll ticks (`pollCount` demoted from `@Published`) | mock (no engine) | `test-gui` |
 | `S360_ModelsTopAlignGUITests` | settings/shell | Settings → Models empty state stays **top-aligned**, not vertically centered (mirrors S285) | mock (isolated empty `PIE_HOME`) | `test-gui` |
