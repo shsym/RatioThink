@@ -38,6 +38,16 @@ public struct ModelArchMetadata: Equatable, Sendable {
     Int64(4) * Int64(numLayers) * Int64(numKVHeads) * Int64(headDim)
   }
 
+  /// Architectures whose KV geometry is not uniform across all layers.
+  /// The generic `ModelArchMetadata` shape cannot represent them safely,
+  /// so callers must omit the memory-derived ceiling until per-layer
+  /// accounting is implemented.
+  static func requiresPerLayerKVAccounting(_ architecture: String) -> Bool {
+    let normalized = architecture.lowercased()
+    return normalized == "gemma3" || normalized == "gemma3_text"
+      || normalized == "gemma4" || normalized == "gemma4_text"
+  }
+
   /// Read from a resolved model path: a `.gguf` FILE → GGUF header; a
   /// directory (HF snapshot) → `config.json`. `nil` when unreadable or
   /// unsupported (caller then omits the ceiling).
@@ -73,6 +83,10 @@ enum HFConfigMetadata {
     func int(_ key: String) -> Int? {
       if let n = obj[key] as? Int { return n }
       if let n = obj[key] as? NSNumber { return n.intValue }
+      return nil
+    }
+    if let modelType = obj["model_type"] as? String,
+       ModelArchMetadata.requiresPerLayerKVAccounting(modelType) {
       return nil
     }
     let numLayers = int("num_hidden_layers") ?? 0
@@ -152,7 +166,8 @@ enum GGUFMetadata {
       }
     }
 
-    guard let arch = strings["general.architecture"], !arch.isEmpty else { return nil }
+    guard let arch = strings["general.architecture"], !arch.isEmpty,
+          !ModelArchMetadata.requiresPerLayerKVAccounting(arch) else { return nil }
     func num(_ suffix: String) -> Int? { ints["\(arch).\(suffix)"].map(Int.init) }
 
     let numLayers = num("block_count") ?? 0

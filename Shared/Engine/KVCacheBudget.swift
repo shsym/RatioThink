@@ -65,6 +65,6 @@ public enum KVCacheBudget {
     // Only emit when it actually lowers the ceiling below the engine
     // default; otherwise the default pool cap already binds.
     guard ceiling < defaultPoolCapacityTokens else { return nil }
-    return max(minCeilingTokens, ceiling)
+    return min(metadata.contextLength, max(minCeilingTokens, ceiling))
   }
 }

@@ -71,6 +71,23 @@ final class ModelMetadataTests: XCTestCase {
     XCTAssertNil(ModelArchMetadata.read(resolvedModelURL: url))
   }
 
+  func test_gguf_gemma3_text_returns_nil_until_per_layer_kv_is_supported() throws {
+    let url = try writeGGUF(kvs: [
+      kvStr("general.architecture", "gemma3_text"),
+      kvU32("gemma3_text.block_count", 26),
+      kvU32("gemma3_text.attention.head_count", 8),
+      kvU32("gemma3_text.attention.head_count_kv", 4),
+      kvU32("gemma3_text.attention.key_length", 256),
+      kvU32("gemma3_text.context_length", 131072),
+    ])
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    XCTAssertNil(
+      ModelArchMetadata.read(resolvedModelURL: url),
+      "Gemma-3/4 style architectures need per-layer KV accounting; generic uniform metadata must fail closed."
+    )
+  }
+
   func test_gguf_bad_magic_returns_nil() throws {
     let url = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
       .appendingPathComponent("bad-\(UUID().uuidString.prefix(8)).gguf")
@@ -108,6 +125,24 @@ final class ModelMetadataTests: XCTestCase {
     try Data(json.utf8).write(to: dir.appendingPathComponent("config.json"))
     let m = ModelArchMetadata.read(resolvedModelURL: dir)
     XCTAssertEqual(m, ModelArchMetadata(numLayers: 32, numKVHeads: 32, headDim: 128, contextLength: 8192))
+  }
+
+  func test_hf_config_gemma3_text_returns_nil_until_per_layer_kv_is_supported() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("snap-\(UUID().uuidString.prefix(8))", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let json = """
+    {"model_type": "gemma3_text", "num_hidden_layers": 26, "num_attention_heads": 8,
+     "num_key_value_heads": 4, "head_dim": 256, "hidden_size": 2048,
+     "max_position_embeddings": 131072}
+    """
+    try Data(json.utf8).write(to: dir.appendingPathComponent("config.json"))
+
+    XCTAssertNil(
+      ModelArchMetadata.read(resolvedModelURL: dir),
+      "Gemma-3/4 style configs need per-layer KV accounting; generic uniform metadata must fail closed."
+    )
   }
 
   // MARK: optional real cached GGUF

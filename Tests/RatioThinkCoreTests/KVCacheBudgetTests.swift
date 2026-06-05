@@ -35,6 +35,14 @@ final class KVCacheBudgetTests: XCTestCase {
     XCTAssertEqual(c, 4096)
   }
 
+  func test_context_window_clamp_remains_authoritative_below_minimum_floor() {
+    // The minimum usability floor must not raise an override above the
+    // model's hard context-window limit.
+    let c = KVCacheBudget.outputTokenCeiling(
+      policy: policy(thresholdGiB: 32), weightBytes: gib(1), metadata: meta(ctx: 256))
+    XCTAssertEqual(c, 256)
+  }
+
   func test_omits_when_host_sustains_default_pool() {
     // Roomy RAM + context window ≥ default pool → nothing to clamp → nil.
     let c = KVCacheBudget.outputTokenCeiling(
