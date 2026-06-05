@@ -47,6 +47,7 @@ use std::time::{Duration, Instant};
 use inferlet::chat;
 use inferlet::Context;
 use inferlet::GrammarConstraint;
+use inferlet::inference::SlotOutput;
 use inferlet::model::Model;
 use inferlet::runtime;
 use serde::{Deserialize, Serialize};
@@ -685,6 +686,43 @@ impl Outcome {
         }
     }
 }
+
+// =============================================================================
+// Forward-pass starvation guard (#439)
+// =============================================================================
+
+/// True when a generation step came back with **no sampled token**, i.e.
+/// the host returned zero `Token` slots for a decode that had the auto-
+/// sampler attached.
+///
+/// Why this is a terminal condition, not "zero progress this step":
+/// pie's scheduler swallows a forward-pass failure / per-batch timeout /
+/// mid-stream KV eviction into an empty `ForwardPassOutput::default()`
+/// (`Ok`, **not** `Err`) — `runtime/src/inference/scheduler.rs`. The SDK
+/// `Generator` then folds that empty output in as "0 tokens accepted",
+/// which never advances `tokens_generated` and never errors, so the
+/// completion loop neither hits `MaxTokens` nor `Aborted` — it spins, and
+/// the next step issues an empty-input forward pass that hangs the Metal
+/// driver. The SSE body then closes with no terminal `finish_reason` chunk
+/// and the app falls back to the opaque `missing_finish_reason` (#439).
+///
+/// This is distinct from a natural stop: on a stop-token step the host
+/// still samples and returns `Token(stop)`, so `slots` carries a `Token`
+/// and this returns `false`. (The SDK truncates that stop token out of
+/// `Output::tokens` afterwards — which is why the loop must inspect the raw
+/// host slots here, not `out.tokens`.)
+fn forward_pass_starved(slots: &[SlotOutput]) -> bool {
+    !slots.iter().any(|s| matches!(s, SlotOutput::Token(_)))
+}
+
+/// Diagnostic carried on the terminal `error` chunk + SSE meta-frame when
+/// [`forward_pass_starved`] fires. Stable code so clients/log scrapers can
+/// branch on the starvation case distinctly from a generic
+/// `forward_pass_failed`.
+const STARVED_CODE: &str = "forward_pass_starved";
+const STARVED_MESSAGE: &str =
+    "engine produced no tokens for a decode step (device failure, per-batch \
+     timeout, or KV eviction); generation cannot continue";
 
 // =============================================================================
 // Reasoning/content channel demux
@@ -2081,7 +2119,22 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
     // diagnostic; no code path falls through to a fake "stop".
     let (outcome, error_diag): (Outcome, Option<(&str, String)>) = loop {
         let step = match stream.next() {
-            Ok(None) => break (Outcome::MaxTokens, None),
+            Ok(None) => {
+                // `next()` returns None once the generator is done.
+                // Distinguish a max_tokens cap ("length") from a stop-token
+                // natural end ("stop"): the SDK truncates the stop token out
+                // of `out.tokens` (it's in `chat::stop_tokens`) before the
+                // chat decoder ever sees it, so a stop-token end never reaches
+                // the `Event::Done` arm below and would otherwise be
+                // mislabeled "length". The ticket's contract is explicit:
+                // length on the cap, stop on natural end (#439).
+                let reason = if stream.tokens_generated() >= max_tokens {
+                    Outcome::MaxTokens
+                } else {
+                    Outcome::Natural
+                };
+                break (reason, None);
+            }
             Ok(Some(s)) => s,
             Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
         };
@@ -2089,6 +2142,17 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             Ok(o) => o,
             Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
         };
+        // #439: a decode step that returns no sampled token means the
+        // forward-pass layer starved — pie swallows a device failure / batch
+        // timeout / mid-stream KV eviction into an empty output rather than an
+        // error, and the SDK folds that in as zero progress. Break with an
+        // explicit reason so the stream still carries a terminal
+        // `finish_reason` (instead of truncating into the app's
+        // `missing_finish_reason` fallback), and so the loop never issues the
+        // empty-input forward pass that hangs the Metal driver.
+        if forward_pass_starved(&out.raw().slots) {
+            break (Outcome::Aborted, Some((STARVED_CODE, STARVED_MESSAGE.to_string())));
+        }
         // #418: per-step decode accounting (one forward pass; `out.tokens`
         // is a burst of 1 free pick + accepted drafts under speculation).
         spec_steps += 1;
@@ -2454,7 +2518,22 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
     // wire.
     let (outcome, error_diag): (Outcome, Option<(&str, String)>) = loop {
         let step = match stream.next() {
-            Ok(None) => break (Outcome::MaxTokens, None),
+            Ok(None) => {
+                // `next()` returns None once the generator is done.
+                // Distinguish a max_tokens cap ("length") from a stop-token
+                // natural end ("stop"): the SDK truncates the stop token out
+                // of `out.tokens` (it's in `chat::stop_tokens`) before the
+                // chat decoder ever sees it, so a stop-token end never reaches
+                // the `Event::Done` arm below and would otherwise be
+                // mislabeled "length". The ticket's contract is explicit:
+                // length on the cap, stop on natural end (#439).
+                let reason = if stream.tokens_generated() >= max_tokens {
+                    Outcome::MaxTokens
+                } else {
+                    Outcome::Natural
+                };
+                break (reason, None);
+            }
             Ok(Some(s)) => s,
             Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
         };
@@ -2462,6 +2541,17 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
             Ok(o) => o,
             Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
         };
+        // #439: a decode step that returns no sampled token means the
+        // forward-pass layer starved — pie swallows a device failure / batch
+        // timeout / mid-stream KV eviction into an empty output rather than an
+        // error, and the SDK folds that in as zero progress. Break with an
+        // explicit reason so the stream still carries a terminal
+        // `finish_reason` (instead of truncating into the app's
+        // `missing_finish_reason` fallback), and so the loop never issues the
+        // empty-input forward pass that hangs the Metal driver.
+        if forward_pass_starved(&out.raw().slots) {
+            break (Outcome::Aborted, Some((STARVED_CODE, STARVED_MESSAGE.to_string())));
+        }
         // #418: per-step decode accounting (one forward pass; `out.tokens`
         // is a burst of 1 free pick + accepted drafts under speculation).
         spec_steps += 1;
@@ -2927,6 +3017,37 @@ fn next_tool_call_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Forward-pass starvation guard (#439) ─────────────
+
+    #[test]
+    fn starved_when_no_slots() {
+        // The real starvation shape: pie's scheduler hands back
+        // `ForwardPassOutput::default()` (no slots) on a swallowed
+        // device failure / batch timeout / KV eviction.
+        assert!(forward_pass_starved(&[]));
+    }
+
+    #[test]
+    fn not_starved_when_a_token_was_sampled() {
+        assert!(!forward_pass_starved(&[SlotOutput::Token(5)]));
+        assert!(!forward_pass_starved(&[SlotOutput::Token(5), SlotOutput::Token(6)]));
+    }
+
+    #[test]
+    fn not_starved_when_token_leads_non_token_slots() {
+        // A decode step with the auto-sampler at slot 0 plus probe slots:
+        // the leading Token means the engine produced a pick.
+        assert!(!forward_pass_starved(&[SlotOutput::Token(5), SlotOutput::Entropy(0.5)]));
+    }
+
+    #[test]
+    fn starved_when_slots_carry_no_token() {
+        // Probe-only output with no sampled token still counts as
+        // starvation for a decode step (the loop always attaches the
+        // auto-sampler, so a missing Token slot is the host producing none).
+        assert!(forward_pass_starved(&[SlotOutput::Entropy(0.5)]));
+    }
 
     // ─── Reasoning/content channel demux ──────────────────
 
