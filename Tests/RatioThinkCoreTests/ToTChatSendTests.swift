@@ -106,6 +106,47 @@ final class ToTChatSendTests: XCTestCase {
     XCTAssertEqual(tree.nodes.first { $0.id == "tot-n3" }?.beam, .pruned)
   }
 
+  func test_token_deltas_accumulate_into_preserved_tree_despite_throttled_encode() async throws {
+    // #413 phase B: token deltas live-fill a node; the live-encode is
+    // coalesced (~15 Hz) so a delta flood doesn't rebuild the view thousands
+    // of times. Correctness contract: the FINAL persisted tot must reflect
+    // every delta even though intermediate encodes are throttled. Drive
+    // node_start + reasoning/answer deltas, then close with NO terminal — the
+    // preserved partial tree must carry the fully-accumulated text.
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ToTFrameEngine(frames: [
+      #"{"event":"tree_start","id":"tot-1","model":"qwen","breadth":1,"depth":1,"beam_width":1}"#,
+      #"{"event":"node_start","id":"tot-n1","parent_id":"root","depth":1,"branch_index":0}"#,
+      #"{"event":"node_delta","id":"tot-n1","kind":"reasoning","text":"weigh "}"#,
+      #"{"event":"node_delta","id":"tot-n1","kind":"reasoning","text":"A vs B"}"#,
+      #"{"event":"node_delta","id":"tot-n1","kind":"answer","text":"Pick "}"#,
+      #"{"event":"node_delta","id":"tot-n1","kind":"answer","text":"A."}"#,
+      // …connection closes here — no node_complete, no terminal.
+    ])
+    let controller = ChatSendController()
+    controller.sendTreeOfThought(
+      chat: chat, context: context, engine: engine,
+      config: ToTProfileConfig(breadth: 1, depth: 1, beamWidth: 1),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "qwen")
+    )
+    try await waitUntil("tot delta stream ends") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(chat.messages.first { $0.role == "assistant" })
+    XCTAssertTrue(assistant.content.hasPrefix("⚠️"), "no-terminal close surfaces a failure")
+    let tree = try JSONDecoder().decode(ToTTree.self, from: try XCTUnwrap(assistant.tot))
+    let node = try XCTUnwrap(tree.nodes.first { $0.id == "tot-n1" })
+    // Every delta survived into the final (throttled) encode.
+    XCTAssertEqual(node.reasoning, "weigh A vs B")
+    XCTAssertEqual(node.content, "Pick A.")
+  }
+
   func test_error_frame_marks_assistant_failed_and_persists_failed_tree() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)

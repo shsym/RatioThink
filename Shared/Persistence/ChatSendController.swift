@@ -297,14 +297,26 @@ public final class ChatSendController: ObservableObject {
       // "hangs after the beam selection, no completion, no error" report).
       var reachedTerminal = false
       let encoder = JSONEncoder()
+      // Coalesce the live-view encode (#413 phase B). Each `assistant.tot`
+      // set republishes the @Model and rebuilds the whole recursive tree
+      // view; the token-delta flood (thousands per search) would do that
+      // thousands of times and saturate the MainActor — which starved the
+      // helper-health monitor into restarting the engine mid-search, closing
+      // the SSE with no terminal. So re-encode at most ~15 Hz for delta
+      // frames; structural frames (a node starting/finishing, a level
+      // pruning, the terminal) always flush so the view never lags a whole
+      // node behind and the persisted snapshot is never stale.
+      var lastLiveEncode = Date.distantPast
       do {
         for try await event in toTEventStream(from: engine.dispatchInferlet(request)) {
           guard self.generation == myGeneration, !Task.isCancelled else { return }
           tree.apply(event)
-          // In-memory mutation drives the live tree-search view (SwiftData
-          // @Model is observed); persistence is throttled to level
-          // boundaries + the terminal frame, like MessageStreamWriter.
-          assistant.tot = try? encoder.encode(tree)
+          let isDelta: Bool = { if case .nodeDelta = event { return true } else { return false } }()
+          let now = Date()
+          if !isDelta || now.timeIntervalSince(lastLiveEncode) >= Self.totLiveEncodeInterval {
+            lastLiveEncode = now
+            assistant.tot = try? encoder.encode(tree)
+          }
           switch event {
           case let .treeComplete(selectedNodeID, finalAnswer):
             reachedTerminal = true
@@ -370,6 +382,12 @@ public final class ChatSendController: ObservableObject {
       }
     }
   }
+
+  /// Min interval between live-tree re-encodes for token-delta frames
+  /// (#413 phase B) — ~15 Hz. Smooth enough for live token-fill, sparse
+  /// enough that a search's thousands of deltas no longer rebuild the tree
+  /// view thousands of times on the MainActor. Structural frames bypass it.
+  static let totLiveEncodeInterval: TimeInterval = 1.0 / 15.0
 
   /// User-facing copy for a no-ok-leaf tree-of-thought total failure (F1).
   /// Kept close to the engine's `no_answer` message without coupling to its
