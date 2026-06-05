@@ -92,7 +92,18 @@ device = ["cpu"]
 [model.driver.options]
 vocab_size = 32000
 arch_name = "test"
+# Pin the KV geometry so the per-request max_tokens ceiling chat-apc reads
+# back from the engine (runtime::max-output-tokens — #438) is a known,
+# non-default value: kv_page_size * max_num_kv_pages = 32 * 512 = 16384.
+# The over-limit assertion in main() verifies the ceiling FOLLOWS this
+# engine config instead of the old hardcoded 8192.
+kv_page_size = 32
+max_num_kv_pages = 512
 """
+
+# Engine KV capacity implied by CONFIG_TOML above (kv_page_size *
+# max_num_kv_pages). chat-apc's max_tokens ceiling must equal this.
+EXPECTED_MAX_OUTPUT_TOKENS = 32 * 512  # 16384
 
 # Files contributing to the inferlet "source hash" re-exported for
 # legacy callers; authoritative copy lives in `_stamp.SRC_HASH_PATHS`.
@@ -748,6 +759,39 @@ async def main() -> int:
                                 failures.append(
                                     f"/v1/chat/completions {field}={value!r} param tag {err!r}"
                                 )
+
+                    # #438: the max_tokens ceiling must FOLLOW the engine's
+                    # KV capacity (runtime::max-output-tokens), not the old
+                    # hardcoded 8192. With the pinned dummy geometry the
+                    # ceiling is EXPECTED_MAX_OUTPUT_TOKENS (16384), so an
+                    # over-ceiling request's 400 message must name that
+                    # number — proving the value flowed engine -> inferlet
+                    # end to end.
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                            "max_tokens": 1_000_000,
+                        },
+                    )
+                    ceiling_msg = ""
+                    try:
+                        ceiling_msg = r.json().get("error", {}).get("message", "")
+                    except Exception:
+                        ceiling_msg = r.text
+                    print(f"[harness] max_tokens ceiling 400 message -> {ceiling_msg!r}")
+                    if str(EXPECTED_MAX_OUTPUT_TOKENS) not in ceiling_msg:
+                        failures.append(
+                            "max_tokens ceiling must follow engine capacity "
+                            f"{EXPECTED_MAX_OUTPUT_TOKENS}; 400 message was {ceiling_msg!r}"
+                        )
+                    if "8192" in ceiling_msg:
+                        failures.append(
+                            "max_tokens ceiling regressed to the hardcoded 8192; "
+                            f"message was {ceiling_msg!r}"
+                        )
 
                     # #418 (review F1): out-of-range speculation knobs are
                     # rejected at the 400 boundary with a nested `param`,
