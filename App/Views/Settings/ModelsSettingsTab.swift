@@ -545,6 +545,12 @@ private struct MemoryGuardrailSection: View {
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityIdentifier("GuardrailLimitPreview")
 
+      Text(contextCeilingPreview)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityIdentifier("KVContextCeilingPreview")
+
       if let saveError {
         Text(saveError).font(.callout).foregroundStyle(.red)
       }
@@ -579,6 +585,26 @@ private struct MemoryGuardrailSection: View {
       line += "  (\(derivation))"
     }
     return line
+  }
+
+  /// Read-only preview of the per-request output-token ceiling the engine
+  /// is configured with on this Mac (#438). Memory-aware: the same dial
+  /// that scales the model-size limit also scales the KV pool, so a
+  /// roomier Mac allows longer replies. The engine clamps this down at
+  /// launch if a model's weights leave less room, so it is the requested
+  /// target, not a guarantee.
+  private var contextCeilingPreview: String {
+    guard let physical = SystemMemory.physicalBytes() else {
+      return "Reply length ceiling: engine default (this Mac's memory couldn't be read)."
+    }
+    let policy = ModelMemoryGuardrail.Policy.recommended(
+      physicalMemoryBytes: physical, fraction: fraction)
+    let override = KVCacheBudget.recommendedMaxPages(for: policy)
+    let pages = override ?? KVCacheBudget.defaultPages
+    let tokens = Int(pages) * Int(KVCacheBudget.pageSize)
+    let qualifier = override == nil ? "engine default" : "memory-aware"
+    return "Reply length ceiling on this Mac: ~\(tokens.formatted()) tokens (\(qualifier))."
+      + " Lowered automatically if a model needs the memory."
   }
 
   private func load() {
