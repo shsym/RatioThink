@@ -99,6 +99,41 @@ final class MissingModelRecoveryTests: XCTestCase {
       profileDefaultModel: nil))
   }
 
+  // MARK: - bannerTarget gated by the send-gate sheet (#446: single download surface)
+
+  /// While the send-gate sheet is presented it renders the SAME inline
+  /// download, so the banner must stay hidden — otherwise the user sees two
+  /// Download prompts for one model. The sheet (modal, user-initiated) owns
+  /// the recovery while it is up.
+  func test_bannerTarget_suppressed_while_send_gate_presented() {
+    XCTAssertNil(MissingModelRecovery.bannerTarget(
+      engineStatus: .failed(code: .modelMissing, message: "model missing"),
+      profileDefaultModel: ProfileStore.defaultChatModelID,
+      sendGatePresented: true),
+      "banner must defer to the send-gate sheet's download CTA")
+  }
+
+  /// When the sheet is NOT presented the banner re-takes the surface (e.g.
+  /// a post-download start that did not take is still recoverable) — the
+  /// gated overload matches the ungated decision.
+  func test_bannerTarget_present_when_send_gate_not_presented() {
+    let target = MissingModelRecovery.bannerTarget(
+      engineStatus: .failed(code: .modelMissing, message: "model missing"),
+      profileDefaultModel: ProfileStore.defaultChatModelID,
+      sendGatePresented: false)
+    XCTAssertEqual(target?.repo, "Qwen/Qwen3-0.6B-GGUF")
+    XCTAssertEqual(target?.file, "Qwen3-0.6B-Q8_0.gguf")
+  }
+
+  /// The sheet gate is the ONLY thing the overload adds: a non-modelMissing
+  /// failure has no banner with or without the sheet (no false positive).
+  func test_bannerTarget_gated_still_absent_for_non_modelMissing() {
+    XCTAssertNil(MissingModelRecovery.bannerTarget(
+      engineStatus: .failed(code: .spawnFailed, message: "fork"),
+      profileDefaultModel: ProfileStore.defaultChatModelID,
+      sendGatePresented: false))
+  }
+
   // MARK: - completedLatchShouldReset (PR#15 F1: re-failure → Retry)
 
   /// After a download completed (latched), the engine re-entering

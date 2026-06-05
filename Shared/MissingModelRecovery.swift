@@ -56,6 +56,26 @@ public enum MissingModelRecovery {
     return CuratedModelCatalog.downloadTarget(forModelSlug: slug)
   }
 
+  /// The download target the in-chat `ModelMissingBanner` should show, or
+  /// nil when the banner must stay hidden — the single decision for "is the
+  /// banner the active download surface right now?".
+  ///
+  /// #446: the banner and the send-gate sheet (`NoModelLoadedPrompt`) BOTH
+  /// recover a missing-but-downloadable default model with an inline
+  /// Download. On `failed(.modelMissing)` the banner is mounted in the chat
+  /// scaffold while the sheet (raised on Send) ALSO renders a Download for
+  /// the same target — two download prompts for one recovery. The sheet is
+  /// the modal, user-initiated surface, so while it is presented it OWNS the
+  /// recovery; suppress the banner so at most one Download affordance is
+  /// ever visible. When the sheet closes, the banner re-takes the surface
+  /// (e.g. a post-download start that did not take stays recoverable).
+  public static func bannerTarget(engineStatus: EngineStatus,
+                                  profileDefaultModel: String?,
+                                  sendGatePresented: Bool) -> ModelDownloadTarget? {
+    guard !sendGatePresented else { return nil }
+    return bannerTarget(engineStatus: engineStatus, profileDefaultModel: profileDefaultModel)
+  }
+
   /// Whether the download CTA's completed ("starting engine…") latch
   /// should drop back to a Retry/Download affordance.
   ///

@@ -246,9 +246,13 @@ struct ChatScaffoldView: View {
       // #326 Path 2: surface a swallowed failed(modelMissing) engine
       // state with an inline download + auto-start, instead of leaving
       // the user to discover it by failing a send.
+      // #446: while the send-gate sheet is presented it already renders the
+      // same inline download; suppress the banner so the user never sees two
+      // download prompts for one model (`sendGatePresented:`).
       if let bannerTarget = MissingModelRecovery.bannerTarget(
         engineStatus: engineStatusStore.status,
-        profileDefaultModel: selectedProfileDefault
+        profileDefaultModel: selectedProfileDefault,
+        sendGatePresented: showNoModelPrompt
       ) {
         ModelMissingBanner(
           target: bannerTarget,
