@@ -130,11 +130,13 @@ public enum S3_EngineSubprocess {
         // Qwen3-0.6B ignores `/no_think` in the user prompt, so the
         // only knob is generated-token headroom.
         //
-        // 8192 is chat-apc's `MAX_MAX_TOKENS` ceiling — the largest
-        // value the inferlet will accept without 400ing the
-        // request. With Qwen3-0.6B Metal this leaves enough room
-        // for the thinking chain on trivial prompts (~3–6k tokens
-        // observed) plus a short visible answer (~10 tokens)
+        // 8192 is a generous generated-token budget, comfortably under
+        // chat-apc's per-request ceiling. That ceiling is no longer a
+        // hardcoded 8192 — since #438 it follows the engine's launch-time
+        // KV-cache capacity via `runtime::max-output-tokens` (≥ 32768 by
+        // default), so 8192 is always accepted. With Qwen3-0.6B Metal this
+        // leaves enough room for the thinking chain on trivial prompts
+        // (~3–6k tokens observed) plus a short visible answer (~10 tokens)
         // before the model emits `<|im_end|>` for a clean `.stop`.
         //
         // If a future Qwen3 build runs longer reasoning chains and
