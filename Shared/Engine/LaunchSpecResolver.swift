@@ -213,13 +213,21 @@ public struct LaunchSpecResolver {
     let shmem = Self.uniqueShmemName()
     let env = subprocessEnvironment()
     do {
-      // Memory-aware KV pool (#438 Phase 2): size `max_num_kv_pages` from
-      // the same RAM policy the size guardrail uses, so the per-request
-      // output ceiling chat-apc reads back (`runtime::max-output-tokens`)
-      // scales with host RAM. `nil` on a non-roomy / unknown-RAM host →
-      // the engine keeps its default; the driver backoff clamps any
-      // over-request to what actually fits.
-      let maxKVPages = KVCacheBudget.recommendedMaxPages(for: memoryPolicy())
+      // Memory-aware per-request output ceiling (#438): from the resolved
+      // model's arch dims + weight size, compute how many F16 KV tokens
+      // fit in the RAM budget after weights + a conservative overhead,
+      // clamped to the context window and the engine default pool. Written
+      // as `default_token_limit`, which chat-apc reads back via
+      // `runtime::max-output-tokens`. Down-only: `nil` (omit) when the
+      // metadata can't be read or the host sustains the full default.
+      let modelURL = URL(fileURLWithPath: modelRef, isDirectory: false)
+      let defaultTokenLimit: Int? = ModelArchMetadata.read(resolvedModelURL: modelURL)
+        .flatMap { metadata in
+          ModelMemoryGuardrail.resolvedBytes(resolvedModelURL: modelURL).flatMap { weightBytes in
+            KVCacheBudget.outputTokenCeiling(
+              policy: memoryPolicy(), weightBytes: weightBytes, metadata: metadata)
+          }
+        }
       let spec = try PieControlLauncher.LaunchSpec(
         pieBinary: binary,
         wasmURL: resources.wasm,
@@ -230,7 +238,7 @@ public struct LaunchSpecResolver {
         inferletNameAtVersion: inferletNameAtVersion,
         profileID: profile.id,
         modelConfig: .portableResolved(servedModelID: profile.model, modelRef: modelRef),
-        maxKVPages: maxKVPages
+        defaultTokenLimit: defaultTokenLimit
       )
       return .success(spec)
     } catch {

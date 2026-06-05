@@ -1,83 +1,70 @@
 import Foundation
 
-/// Memory-aware sizing for the engine's KV-cache pool (`max_num_kv_pages`).
+/// Memory-aware, conservative per-request output-token ceiling for the
+/// engine launch config (#438).
 ///
-/// The portable driver allocates `max_num_kv_pages * kv_page_size` tokens
-/// of KV cache up front at launch, and that pool is the real per-request
-/// output ceiling the engine can serve — chat-apc reads it back via
-/// `runtime::max-output-tokens` (#438 Phase 1). The driver's fixed default
-/// (1024 pages = 32768 tokens) ignores how much RAM the host has, so a
-/// roomy Mac is capped no higher than a small one.
+/// chat-apc's per-request `max_tokens` ceiling follows the engine via
+/// `runtime::max-output-tokens`, which returns the scheduler's
+/// `default_token_limit` when set. We compute that limit pre-launch from
+/// what the host can actually hold: how many tokens of F16 KV cache fit
+/// in the RAM budget after the model weights and a conservative overhead,
+/// clamped to the model's context window and the engine's default KV-pool
+/// capacity.
 ///
-/// This sizes the *request* from host RAM. It deliberately does NOT try to
-/// compute the exact KV byte cost (which needs per-model n_layers /
-/// n_kv_heads / head_dim / dtype the App cannot cheaply read for GGUF).
-/// Instead it scales the page COUNT by available RAM and leans on the
-/// portable driver's launch-time backoff as the safety net: on an
-/// allocation OOM the driver halves `max_num_kv_pages` (down to 64) and
-/// reports the actual count it settled on (`driver/portable/src/entry.cpp`).
-/// So an over-request is clamped to what physically fits — including room
-/// already taken by the loaded weights, since KV is allocated after the
-/// model loads — and chat-apc then follows the *actual* post-backoff
-/// capacity. The request is only emitted when it *raises* the pool above
-/// the engine default (a small host keeps today's behavior, never
-/// regressing), and is capped so a large host does not reserve KV slots
-/// far beyond any model's usable context window.
-///
-/// Precise per-model sizing (a driver-side budget→pages computation where
-/// the exact dims live) is the planned refinement; this is the lean, safe
-/// first cut that the driver backoff keeps honest.
+/// This is **down-only**: it never raises the ceiling above the engine's
+/// default pool capacity (we do not resize the pool). It only *lowers*
+/// the ceiling — and surfaces an honest clean-400 — when a large model on
+/// limited RAM, or a short context window, can't sustain the default.
+/// `default_token_limit` caps TOTAL forwarded tokens (prompt + output),
+/// which matches a KV-capacity number since KV holds the whole context;
+/// bounding the output `max_tokens` by it is conservative (output ≤ total
+/// is always safe).
 public enum KVCacheBudget {
-  /// KV page size the request assumes and writes — matches the portable
-  /// driver default, so capacity-in-tokens = pages * this.
-  public static let pageSize: UInt32 = 32
+  /// Engine default KV-pool capacity in tokens = `kv_page_size (32) *
+  /// default max_num_kv_pages (1024)`. The pool is not resized, so this
+  /// is the hard upper bound; an override is only written when it would
+  /// LOWER the ceiling below this.
+  public static let defaultPoolCapacityTokens: Int = 32 * 1024  // 32768
 
-  /// Engine default `max_num_kv_pages` (portable driver). Sizing at or
-  /// below this returns `nil` so the launcher omits the override and the
-  /// engine keeps its own default — a low-RAM host never regresses, and
-  /// the driver backoff still handles the rare case where even the
-  /// default does not fit.
-  public static let defaultPages: UInt32 = 1024
+  /// Conservative overhead reserved on top of the weights before KV:
+  /// `max(floor, fraction * weights)` (activations, compute/graph
+  /// buffers, framework + fragmentation). Biased high → ceiling biased
+  /// low → never OOM.
+  public static let overheadFloorBytes: Int64 = 1 * 1024 * 1024 * 1024  // 1 GiB
+  public static let overheadFraction: Double = 0.15
 
-  /// Upper bound on the requested pool. 4096 pages * 32 = 131072 tokens —
-  /// generous headroom over the 32768 default, comfortably covering
-  /// common local-model context windows (32k–128k) without reserving KV
-  /// slots no model could address.
-  public static let maxPages: UInt32 = 4096
+  /// Smallest ceiling we will write. Below this the model nearly fills
+  /// RAM and KV is squeezed, but `default_token_limit` must be > 0 and a
+  /// tiny positive cap keeps chat minimally usable; the driver's pool
+  /// backoff handles the physical fit.
+  public static let minCeilingTokens: Int = 512
 
-  /// Usable RAM (physical − reserve) at which the default pool is kept
-  /// (scale factor 1.0). Picked so a ~16 GB Mac (≈10 GiB usable after the
-  /// 6 GiB reserve) maps to the default and larger hosts scale up
-  /// proportionally.
-  public static let referenceUsableBytes: Int64 = 10 * 1024 * 1024 * 1024
+  /// Returns the value to write as `[model.scheduler].default_token_limit`,
+  /// or `nil` to omit it (engine keeps its default pool cap — no clamp).
+  ///
+  /// `ceiling = min( floor((threshold − weights − overhead) / kv_per_token),
+  ///                 defaultPoolCapacityTokens, contextLength )`, floored
+  /// at `minCeilingTokens`. `nil` when the RAM-fit ceiling is at or above
+  /// the pool capacity AND the context window is too (i.e. nothing to
+  /// clamp). `threshold` is the size guardrail's RAM-derived ceiling, so
+  /// the operator's RAM-fraction dial scales this too.
+  public static func outputTokenCeiling(
+    policy: ModelMemoryGuardrail.Policy,
+    weightBytes: Int64,
+    metadata: ModelArchMetadata
+  ) -> Int? {
+    let kvPerToken = metadata.kvBytesPerToken
+    guard kvPerToken > 0, weightBytes >= 0 else { return nil }
 
-  /// Recommended `max_num_kv_pages` for the host, or `nil` when RAM is
-  /// unknown or the host is not roomy enough to exceed the engine default
-  /// (caller omits the override → engine keeps its own default). Derived
-  /// from the same `ModelMemoryGuardrail.Policy` the size guardrail uses,
-  /// so the operator's RAM-fraction dial scales both.
-  public static func recommendedMaxPages(
-    for policy: ModelMemoryGuardrail.Policy
-  ) -> UInt32? {
-    guard let physical = policy.physicalMemoryBytes, physical > 0 else {
-      return nil
-    }
-    let reserve = policy.reserveBytes ?? ModelMemoryGuardrail.Policy.defaultReserveBytes
-    let fraction = policy.ramFraction ?? ModelMemoryGuardrail.Policy.defaultRAMFraction
-    let usable = max(0, physical - reserve)
+    let threshold = policy.maxResolvedModelBytes
+    let overhead = max(overheadFloorBytes, Int64(Double(weightBytes) * overheadFraction))
+    let kvBudget = threshold - weightBytes - overhead
+    let ramFit = kvBudget > 0 ? Int(kvBudget / kvPerToken) : 0
 
-    // Scale the page count by how much usable RAM the host has relative
-    // to the reference, then by the operator's aggressiveness dial
-    // (fraction / default). Over-requests are safe — the driver clamps.
-    let ramScale = Double(usable) / Double(referenceUsableBytes)
-    let fractionScale = fraction / ModelMemoryGuardrail.Policy.defaultRAMFraction
-    let scaled = Double(defaultPages) * ramScale * fractionScale
-    guard scaled.isFinite, scaled > 0 else { return nil }
-
-    let rounded = Int64(scaled.rounded())
-    // Only emit the override when it actually raises the pool above the
-    // engine default; clamp to the cap.
-    guard rounded > Int64(defaultPages) else { return nil }
-    return UInt32(min(Int64(maxPages), rounded))
+    let ceiling = min(ramFit, defaultPoolCapacityTokens, metadata.contextLength)
+    // Only emit when it actually lowers the ceiling below the engine
+    // default; otherwise the default pool cap already binds.
+    guard ceiling < defaultPoolCapacityTokens else { return nil }
+    return max(minCeilingTokens, ceiling)
   }
 }

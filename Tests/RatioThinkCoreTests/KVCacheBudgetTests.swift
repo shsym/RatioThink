@@ -1,63 +1,71 @@
 import XCTest
 @testable import RatioThinkCore
 
-/// #438 Phase 2 — memory-aware sizing of the engine KV pool. These pin
-/// the RAM → `max_num_kv_pages` heuristic so a regression (or a default
-/// constant drift) is caught at the unit layer rather than as a
-/// surprising launch-time KV allocation. The driver's launch-time backoff
-/// is the real safety net; this just verifies the *request* shape.
+/// #438 — conservative, down-only memory-aware output-token ceiling.
+/// Injects a fixed-threshold `Policy` + explicit weights + metadata so
+/// every case is deterministic (no host-RAM dependency).
 final class KVCacheBudgetTests: XCTestCase {
 
-  private func policy(
-    ramGiB: Double,
-    fraction: Double = ModelMemoryGuardrail.Policy.defaultRAMFraction
-  ) -> ModelMemoryGuardrail.Policy {
-    ModelMemoryGuardrail.Policy.recommended(
-      physicalMemoryBytes: Int64(ramGiB * 1024 * 1024 * 1024),
-      fraction: fraction
-    )
+  private func gib(_ n: Double) -> Int64 { Int64(n * 1024 * 1024 * 1024) }
+  private func policy(thresholdGiB: Double) -> ModelMemoryGuardrail.Policy {
+    ModelMemoryGuardrail.Policy(maxResolvedModelBytes: gib(thresholdGiB))
+  }
+  // Qwen3-0.6B-shaped: 28 layers, 8 KV heads, 128 head_dim → 112 KiB/token.
+  private func meta(ctx: Int = 40960) -> ModelArchMetadata {
+    ModelArchMetadata(numLayers: 28, numKVHeads: 8, headDim: 128, contextLength: ctx)
   }
 
-  func test_unknown_ram_returns_nil() {
-    // An injected fixed policy carries no RAM context → omit the override
-    // so the engine keeps its own default (and the size-guardrail test
-    // fixtures don't accidentally drive KV sizing).
-    let fixed = ModelMemoryGuardrail.Policy(maxResolvedModelBytes: 8 << 30)
-    XCTAssertNil(KVCacheBudget.recommendedMaxPages(for: fixed))
+  func test_kvBytesPerToken_matches_pie_formula() {
+    // 4 * 28 * 8 * 128 = 114688 (= 2(K+V) * L * kvH * dim * 2(F16)).
+    XCTAssertEqual(meta().kvBytesPerToken, 114_688)
   }
 
-  func test_small_host_returns_nil_keeping_engine_default() {
-    // A ~16 GB Mac maps to the engine default (no headroom to raise) and
-    // anything smaller stays there too — never regressing below today's
-    // behavior; the driver backoff handles a host where even the default
-    // does not fit.
-    XCTAssertNil(KVCacheBudget.recommendedMaxPages(for: policy(ramGiB: 16)))
-    XCTAssertNil(KVCacheBudget.recommendedMaxPages(for: policy(ramGiB: 8)))
+  func test_ram_constrained_lowers_ceiling_below_default() {
+    // threshold 8 GiB, weights 4 GiB, overhead = max(1 GiB, 0.6 GiB) = 1 GiB.
+    // kvBudget = 3 GiB; ramFit = floor(3 GiB / 114688) = 28086.
+    let c = KVCacheBudget.outputTokenCeiling(
+      policy: policy(thresholdGiB: 8), weightBytes: gib(4), metadata: meta())
+    XCTAssertEqual(c, 28_086)
   }
 
-  func test_roomy_host_raises_pool_above_default() {
-    let pages = KVCacheBudget.recommendedMaxPages(for: policy(ramGiB: 32))
-    XCTAssertNotNil(pages)
-    XCTAssertGreaterThan(pages!, KVCacheBudget.defaultPages)
-    XCTAssertLessThanOrEqual(pages!, KVCacheBudget.maxPages)
+  func test_context_window_clamps_even_with_roomy_ram() {
+    // Roomy RAM but a 4096-context model → ceiling clamps to the window.
+    let c = KVCacheBudget.outputTokenCeiling(
+      policy: policy(thresholdGiB: 32), weightBytes: gib(1), metadata: meta(ctx: 4096))
+    XCTAssertEqual(c, 4096)
   }
 
-  func test_large_host_clamps_to_cap() {
-    XCTAssertEqual(KVCacheBudget.recommendedMaxPages(for: policy(ramGiB: 128)),
-                   KVCacheBudget.maxPages)
-    XCTAssertEqual(KVCacheBudget.recommendedMaxPages(for: policy(ramGiB: 256)),
-                   KVCacheBudget.maxPages)
+  func test_omits_when_host_sustains_default_pool() {
+    // Roomy RAM + context window ≥ default pool → nothing to clamp → nil.
+    let c = KVCacheBudget.outputTokenCeiling(
+      policy: policy(thresholdGiB: 64), weightBytes: gib(1), metadata: meta(ctx: 40960))
+    XCTAssertNil(c)
   }
 
-  func test_operator_fraction_scales_request() {
-    // At a RAM tier below the cap, a more aggressive fraction must request
-    // strictly more pages than a conservative one (the operator dial
-    // scales KV sizing the same way it scales the size guardrail).
-    let conservative = KVCacheBudget.recommendedMaxPages(for: policy(ramGiB: 32, fraction: 0.55))
-    let aggressive = KVCacheBudget.recommendedMaxPages(for: policy(ramGiB: 32, fraction: 0.95))
-    XCTAssertNotNil(conservative)
-    XCTAssertNotNil(aggressive)
-    XCTAssertGreaterThan(aggressive!, conservative!)
-    XCTAssertLessThanOrEqual(aggressive!, KVCacheBudget.maxPages)
+  func test_never_exceeds_default_pool_capacity() {
+    // Even with a 128k context window and huge RAM, the ceiling is never
+    // written above the 32768 default (down-only; pool is not resized).
+    let c = KVCacheBudget.outputTokenCeiling(
+      policy: policy(thresholdGiB: 256), weightBytes: gib(1), metadata: meta(ctx: 131072))
+    XCTAssertNil(c, "ceiling at/above the pool default must be omitted, not written")
+  }
+
+  func test_tight_fit_floors_to_minimum() {
+    // weights nearly fill the threshold → negative KV budget → floored to
+    // the minimum positive cap (default_token_limit must be > 0).
+    let c = KVCacheBudget.outputTokenCeiling(
+      policy: policy(thresholdGiB: 5), weightBytes: gib(4.8), metadata: meta())
+    XCTAssertEqual(c, KVCacheBudget.minCeilingTokens)
+  }
+
+  func test_overhead_fraction_dominates_for_large_weights() {
+    // 40 GiB weights → overhead = max(1 GiB, 0.15*40 = 6 GiB) = 6 GiB.
+    // threshold 64 GiB → kvBudget = 64-40-6 = 18 GiB; ramFit = floor(18 GiB/114688).
+    let expected = Int(gib(18) / 114_688)  // 168550
+    let c = KVCacheBudget.outputTokenCeiling(
+      policy: policy(thresholdGiB: 64), weightBytes: gib(40), metadata: meta(ctx: 200000))
+    // ramFit (168550) > pool default → clamped to default → omitted.
+    XCTAssertNil(c)
+    XCTAssertGreaterThan(expected, KVCacheBudget.defaultPoolCapacityTokens)
   }
 }

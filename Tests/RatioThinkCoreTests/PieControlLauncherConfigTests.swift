@@ -41,44 +41,40 @@ final class PieControlLauncherConfigTests: XCTestCase {
                    "portable config must not emit the dummy-driver block")
   }
 
-  func test_portable_body_omits_kv_override_when_nil() {
-    // #438 Phase 2: with no memory-aware override, the body must NOT emit
-    // a driver-options block — the engine keeps its own KV-pool default,
-    // preserving the pre-#438 behavior on small / unknown-RAM hosts.
+  func test_portable_body_omits_default_token_limit_when_nil() {
+    // #438: with no memory-aware ceiling, the scheduler block must NOT
+    // carry default_token_limit — the engine keeps its default (no clamp),
+    // preserving pre-#438 behavior on hosts that sustain the full pool.
     let body = PieControlLauncher.renderConfigBody(
       modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
-      maxKVPages: nil
+      defaultTokenLimit: nil
     )
+    XCTAssertFalse(body.contains("default_token_limit"),
+                   "nil defaultTokenLimit must not write the override; got:\n\(body)")
     XCTAssertFalse(body.contains("[model.driver.options]"),
-                   "nil maxKVPages must omit the driver-options block; got:\n\(body)")
-    XCTAssertFalse(body.contains("max_num_kv_pages"),
-                   "nil maxKVPages must not write a max_num_kv_pages override")
+                   "the pool-resize path is gone — no driver-options block; got:\n\(body)")
   }
 
-  func test_portable_body_emits_kv_override_when_set() {
-    // #438 Phase 2: a memory-aware override writes max_num_kv_pages (plus
-    // kv_page_size so token capacity = pages * page_size is
-    // self-consistent) into [model.driver.options].
+  func test_portable_body_emits_default_token_limit_when_set() {
+    // #438: the memory-aware ceiling rides [model.scheduler].default_token_limit.
     let body = PieControlLauncher.renderConfigBody(
       modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
-      maxKVPages: 2048
+      defaultTokenLimit: 5000
     )
-    XCTAssertTrue(body.contains("[model.driver.options]"),
-                  "an override must emit the driver-options block; got:\n\(body)")
-    // Assert the exact key = value lines, not a loose substring, so a
-    // regression in the emitted number or key name is caught.
-    XCTAssertTrue(body.contains("max_num_kv_pages = 2048"), "got:\n\(body)")
-    XCTAssertTrue(body.contains("kv_page_size = 32"), "got:\n\(body)")
-    XCTAssertTrue(body.contains("type = \"portable\""),
-                  "the override rides the portable driver block")
+    // Exact key = value line, under the scheduler section, not driver options.
+    XCTAssertTrue(body.contains("default_token_limit = 5000"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("[model.scheduler]"), "got:\n\(body)")
+    XCTAssertFalse(body.contains("max_num_kv_pages"),
+                   "the old pool-resize knob must not be emitted; got:\n\(body)")
+    XCTAssertTrue(body.contains("type = \"portable\""))
   }
 
-  func test_metal_body_emits_kv_override_when_set() {
+  func test_metal_body_emits_default_token_limit_when_set() {
     let body = PieControlLauncher.renderConfigBody(
       modelConfig: .metal(modelID: "Qwen/Qwen3-0.6B"),
-      maxKVPages: 4096
+      defaultTokenLimit: 4096
     )
-    XCTAssertTrue(body.contains("max_num_kv_pages = 4096"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("default_token_limit = 4096"), "got:\n\(body)")
     XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
   }
 

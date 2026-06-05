@@ -155,12 +155,13 @@ public enum PieControlLauncher {
     /// `.metal(...)`.
     public var modelConfig: ModelConfig
 
-    /// Memory-aware `max_num_kv_pages` override written into the real
-    /// driver's `[model.driver.options]` (#438 Phase 2). `nil` omits the
-    /// override so the engine keeps its own default — used for `.dummy`
-    /// launches, hosts whose RAM is unknown, and hosts not roomy enough
-    /// to exceed the default. See `KVCacheBudget`.
-    public var maxKVPages: UInt32?
+    /// Memory-aware per-request output-token ceiling written as
+    /// `[model.scheduler].default_token_limit` (#438). `nil` omits it so
+    /// the engine keeps its default — used for `.dummy` launches, hosts
+    /// whose model metadata can't be read, and the common case where the
+    /// host can sustain the full default pool. Down-only: only set when it
+    /// lowers the ceiling below the engine default. See `KVCacheBudget`.
+    public var defaultTokenLimit: Int?
 
     public init(pieBinary: URL,
                 wasmURL: URL,
@@ -173,7 +174,7 @@ public enum PieControlLauncher {
                 pidSink: (@Sendable (pid_t) -> Void)? = nil,
                 profileID: String = "isolated",
                 modelConfig: ModelConfig,
-                maxKVPages: UInt32? = nil) throws {
+                defaultTokenLimit: Int? = nil) throws {
       try PieControlLauncher.validateDriverSupport(
         pieBinary: pieBinary,
         subprocessEnvironment: subprocessEnvironment,
@@ -192,7 +193,7 @@ public enum PieControlLauncher {
       self.pidSink = pidSink
       self.profileID = profileID
       self.modelConfig = modelConfig
-      self.maxKVPages = maxKVPages
+      self.defaultTokenLimit = defaultTokenLimit
     }
   }
 
@@ -488,7 +489,7 @@ public enum PieControlLauncher {
     }
     let httpPort = try reserveFreePort()
     let configURL = try writeConfig(
-      modelConfig: spec.modelConfig, maxKVPages: spec.maxKVPages, in: spec.pieHome
+      modelConfig: spec.modelConfig, defaultTokenLimit: spec.defaultTokenLimit, in: spec.pieHome
     )
 
     var env = spec.subprocessEnvironment
@@ -620,10 +621,10 @@ public enum PieControlLauncher {
   /// model, so the daemon binds to the single registered model
   /// regardless of its name.
   static func writeConfig(modelConfig: ModelConfig,
-                          maxKVPages: UInt32? = nil,
+                          defaultTokenLimit: Int? = nil,
                           in pieHome: URL) throws -> URL {
     let configURL = pieHome.appendingPathComponent("config.toml")
-    let body = renderConfigBody(modelConfig: modelConfig, maxKVPages: maxKVPages)
+    let body = renderConfigBody(modelConfig: modelConfig, defaultTokenLimit: defaultTokenLimit)
     do {
       try FileManager.default.createDirectory(at: pieHome, withIntermediateDirectories: true)
       try body.write(to: configURL, atomically: true, encoding: .utf8)
@@ -636,7 +637,7 @@ public enum PieControlLauncher {
   /// Pure TOML projection of `ModelConfig`. Internal so the unit
   /// tests can pin the emitted body without writing to disk.
   static func renderConfigBody(modelConfig: ModelConfig,
-                               maxKVPages: UInt32? = nil) -> String {
+                               defaultTokenLimit: Int? = nil) -> String {
     let preamble = """
     [server]
     host = "127.0.0.1"
@@ -653,6 +654,11 @@ public enum PieControlLauncher {
     allow_network = true
 
     """
+    // #438: the memory-aware per-request output ceiling rides
+    // `default_token_limit` (the scheduler's total-token compute cap).
+    // chat-apc follows it via `runtime::max-output-tokens`. Omitted when
+    // nil → engine keeps its default (no clamp).
+    let limitLine = defaultTokenLimit.map { "\ndefault_token_limit = \($0)" } ?? ""
     let scheduler = """
 
     [model.scheduler]
@@ -660,7 +666,7 @@ public enum PieControlLauncher {
     request_timeout_secs = 60
     default_endowment_pages = 4
     admission_oversubscription_factor = 8.0
-    restore_pause_at_utilization = 0.85
+    restore_pause_at_utilization = 0.85\(limitLine)
 
     """
     switch modelConfig {
@@ -692,12 +698,12 @@ public enum PieControlLauncher {
       )
       return renderPortableModel(
         servedID: modelSlug, modelRef: modelPath, preamble: preamble,
-        scheduler: scheduler, maxKVPages: maxKVPages
+        scheduler: scheduler
       )
     case let .portableResolved(servedModelID, modelRef):
       return renderPortableModel(
         servedID: servedModelID, modelRef: modelRef, preamble: preamble,
-        scheduler: scheduler, maxKVPages: maxKVPages
+        scheduler: scheduler
       )
     case let .metal(modelID):
       // `pie-driver-portable` with ggml-metal selected at C++ build
@@ -721,15 +727,13 @@ public enum PieControlLauncher {
       device = ["metal"]
       """
       return preamble + model + scheduler + driver
-        + portableDriverOptions(maxKVPages: maxKVPages)
     }
   }
 
   private static func renderPortableModel(servedID: String,
                                           modelRef: String,
                                           preamble: String,
-                                          scheduler: String,
-                                          maxKVPages: UInt32?) -> String {
+                                          scheduler: String) -> String {
     let model = """
     [[model]]
     name = \(tomlString(servedID))
@@ -742,25 +746,6 @@ public enum PieControlLauncher {
     device = ["metal"]
     """
     return preamble + model + scheduler + driver
-      + portableDriverOptions(maxKVPages: maxKVPages)
-  }
-
-  /// `[model.driver.options]` block carrying the memory-aware KV pool
-  /// override (#438 Phase 2), or "" when no override applies (engine keeps
-  /// its own default). `kv_page_size` is written alongside so the token
-  /// capacity (`max_num_kv_pages * kv_page_size`) is self-consistent with
-  /// what `KVCacheBudget` assumed. `PortableDriverOptions` is
-  /// `#[serde(default)]`, so a partial table is valid — the other knobs
-  /// keep their engine defaults.
-  private static func portableDriverOptions(maxKVPages: UInt32?) -> String {
-    guard let pages = maxKVPages else { return "" }
-    return """
-
-
-    [model.driver.options]
-    kv_page_size = \(KVCacheBudget.pageSize)
-    max_num_kv_pages = \(pages)
-    """
   }
 
   /// Minimal TOML basic-string escape: wrap in `"..."` and backslash-
