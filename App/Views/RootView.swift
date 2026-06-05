@@ -55,8 +55,10 @@ struct RootView: View {
       NavigationSplitView(columnVisibility: $windowState.columnVisibility) {
         SidebarView(selection: $windowState.selectedSection)
       } content: {
-        if windowState.isItemListHidden {
-          // Collapse col 2 to zero width when toggled off via View > Hide List.
+        if windowState.isItemListHidden || windowState.selectedSection == .apiEndpoints {
+          // Collapse col 2 to zero width when toggled off via View > Hide
+          // List, or for the API Endpoints section, which has no item list —
+          // its single `LocalAPIView` fills the detail column (#422).
           Color.clear
             .navigationSplitViewColumnWidth(min: 0, ideal: 0, max: 0)
         } else {

@@ -31,6 +31,29 @@ enum LoginItemRegistrationStatus: Equatable {
       return false
     }
   }
+
+  /// One-line description, for *Settings → General → Startup*, of whether
+  /// RatioThink keeps its menu-bar icon / background helper after the main
+  /// app quits. The menu-bar presence is owned by the launchd-managed
+  /// RatioThinkHelper agent (registered via `SMAppService`), so this
+  /// registration state — not the app process — decides whether the icon
+  /// and the engine survive a quit. Phrased honestly: the app cannot tear
+  /// down a running helper, so we surface the persistence the user has
+  /// (or hasn't) opted into rather than offer a switch that can't deliver.
+  var menuBarPersistenceSummary: String {
+    switch self {
+    case .enabled:
+      return "RatioThink stays in your menu bar after you quit, so the engine resumes instantly."
+    case .notRegistered:
+      return "RatioThink won't stay in your menu bar after you quit until RatioThinkHelper is registered."
+    case .requiresApproval:
+      return "Approve RatioThinkHelper in System Settings to keep RatioThink in your menu bar after you quit."
+    case .notFound:
+      return "RatioThinkHelper is missing from the app bundle, so RatioThink can't stay in your menu bar after you quit."
+    case .unavailable(let reason):
+      return "Menu-bar persistence is unavailable: \(reason)."
+    }
+  }
 }
 
 protocol LoginItemRegistering: AnyObject {

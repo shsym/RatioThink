@@ -178,6 +178,14 @@ targets:
         NSHumanReadableCopyright: "© 2026 RatioThink"
         NSSupportsAutomaticTermination: false
         NSSupportsSuddenTermination: false
+        # `ratiothink://` deep-link scheme. The menu-bar Helper opens
+        # `ratiothink://settings` so the app routes straight to Settings
+        # (App/SettingsURLHandler.swift) instead of merely foregrounding the
+        # window. Scheme string is owned by Shared/SettingsDeepLink.swift.
+        CFBundleURLTypes:
+          - CFBundleURLName: com.ratiothink.app.deeplink
+            CFBundleURLSchemes:
+              - ratiothink
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ratiothink.app

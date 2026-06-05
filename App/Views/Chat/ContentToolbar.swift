@@ -264,11 +264,13 @@ struct ContentToolbar: View {
 
 // MARK: - popover contents
 
-private struct ParamsPopover: View {
+/// `internal` (not `private`) so the #421 slider polish — coarse labelled
+/// ticks and the removed Max-tokens row — can be rendered to a PNG via
+/// `ImageRenderer` in a snapshot test (`SamplingAndIndicatorSnapshotTests`).
+struct ParamsPopover: View {
   @Binding var sampling: ChatSampling
   @State private var temperature: Double
   @State private var topP: Double
-  @State private var maxTokens: Double
   /// Latches once `commit()` runs so the dismissal flush on
   /// `.onDisappear` does not re-fire after an explicit Apply click.
   /// Today `commit()` is pure value-assignment, but Phase 6 wiring
@@ -286,15 +288,17 @@ private struct ParamsPopover: View {
     self._sampling = sampling
     _temperature = State(initialValue: sampling.wrappedValue.temperature)
     _topP = State(initialValue: sampling.wrappedValue.topP)
-    _maxTokens = State(initialValue: Double(sampling.wrappedValue.maxTokens))
   }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
       Text("Sampling").font(.headline)
-      slider("Temperature", value: $temperature, range: 0...2, format: "%.2f")
-      slider("Top-p",       value: $topP,        range: 0...1, format: "%.2f")
-      slider("Max tokens",  value: $maxTokens,   range: 64...8192, format: "%.0f", step: 64)
+      slider("Temperature", value: $temperature, range: 0...2, format: "%.2f",
+             ticks: SliderTickScale.evenTicks(0...2, step: 0.25),
+             labels: SliderTickScale.labels([0, 0.5, 1, 1.5, 2], format: "%g"))
+      slider("Top-p", value: $topP, range: 0...1, format: "%.2f",
+             ticks: SliderTickScale.evenTicks(0...1, step: 0.25),
+             labels: SliderTickScale.labels([0, 0.25, 0.5, 0.75, 1], format: "%g"))
       Divider()
       HStack {
         Text("Changes apply on close")
@@ -314,7 +318,6 @@ private struct ParamsPopover: View {
     // not retriggered by `commit()` itself — no feedback loop.
     .onChange(of: temperature) { _, _ in didCommit = false }
     .onChange(of: topP)        { _, _ in didCommit = false }
-    .onChange(of: maxTokens)   { _, _ in didCommit = false }
     // macOS popover dismissal (click-outside, Esc) is treated as
     // accept — flush the local buffer so silent edit loss is not a
     // thing. Review v1 F4. Latch prevents double-commit when Apply
@@ -329,7 +332,8 @@ private struct ParamsPopover: View {
     value: Binding<Double>,
     range: ClosedRange<Double>,
     format: String,
-    step: Double = 0.01
+    ticks: [Double],
+    labels: [SliderTickScale.Label]
   ) -> some View {
     VStack(alignment: .leading, spacing: 4) {
       HStack {
@@ -339,15 +343,24 @@ private struct ParamsPopover: View {
           .foregroundStyle(.secondary)
           .monospacedDigit()
       }
-      Slider(value: value, in: range, step: step)
+      // #421: a CONTINUOUS slider (no `step:`). The stepped initialiser
+      // makes macOS draw one NSSlider tick per step — 200 for 0–2 @0.01 —
+      // a cluttered swarm. We render a few coarse labelled ticks below
+      // instead; the value stays fine-grained (no snap yet, see #438).
+      Slider(value: value, in: range)
+      SliderTickScale(range: range, ticks: ticks, labels: labels)
     }
   }
 
   private func commit() {
+    // #421: the Max tokens slider was removed — its real ceiling is an
+    // engine-launch concern (#438), not a per-chat knob. Preserve the
+    // existing max_tokens (profile default) so dropping the control never
+    // silently resets it.
     sampling = ChatSampling(
       temperature: temperature,
       topP: topP,
-      maxTokens: Int(maxTokens.rounded())
+      maxTokens: sampling.maxTokens
     )
     didCommit = true
   }
@@ -371,5 +384,90 @@ private struct SystemPromptPopover: View {
         .foregroundStyle(.secondary)
     }
     .padding(16)
+  }
+}
+
+/// Coarse, labelled tick scale rendered under a continuous sampling
+/// `Slider` (#421). `Slider(value:in:step:)` makes macOS draw one NSSlider
+/// tick PER step (200 for 0–2 @0.01) — a cluttered swarm that read as
+/// "ugly". Dropping `step` removes them; this renders a few evenly-spaced
+/// notches + sparse numeric labels instead, positioned by value-fraction
+/// so the scale aligns with the track and reflows with the popover width.
+/// `internal` (not `private`) so the pure geometry is unit-testable
+/// (`SliderTickScaleTests`); the view itself is decoration, hidden from
+/// accessibility (the slider already exposes its value).
+struct SliderTickScale: View {
+  /// One labelled stop on the scale. `id` = the value so a label list
+  /// carries no duplicate positions.
+  struct Label: Identifiable {
+    let value: Double
+    let text: String
+    var id: Double { value }
+  }
+
+  let range: ClosedRange<Double>
+  let ticks: [Double]
+  let labels: [Label]
+
+  /// Horizontal inset (~slider thumb radius) so fraction 0/1 line up with
+  /// the track ends rather than the raw view bounds.
+  private let inset: CGFloat = 7
+
+  var body: some View {
+    VStack(spacing: 2) {
+      GeometryReader { geo in
+        let usable = max(0, geo.size.width - inset * 2)
+        ForEach(ticks, id: \.self) { v in
+          Capsule()
+            .fill(Color.secondary.opacity(0.4))
+            .frame(width: 1.5, height: 5)
+            .position(x: inset + CGFloat(Self.fraction(v, in: range)) * usable, y: 2.5)
+        }
+      }
+      .frame(height: 5)
+      GeometryReader { geo in
+        let usable = max(0, geo.size.width - inset * 2)
+        ForEach(labels) { lab in
+          Text(lab.text)
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .monospacedDigit()
+            .fixedSize()
+            .position(x: inset + CGFloat(Self.fraction(lab.value, in: range)) * usable, y: 7)
+        }
+      }
+      .frame(height: 14)
+    }
+    .accessibilityHidden(true)
+  }
+
+  // MARK: - pure geometry (unit-tested)
+
+  /// 0…1 position of `v` within `r`, clamped to the ends. A degenerate
+  /// (zero-width) range maps everything to 0.
+  static func fraction(_ v: Double, in r: ClosedRange<Double>) -> Double {
+    guard r.upperBound > r.lowerBound else { return 0 }
+    return min(1, max(0, (v - r.lowerBound) / (r.upperBound - r.lowerBound)))
+  }
+
+  /// Evenly-spaced tick values from `lowerBound` to `upperBound` inclusive
+  /// by `step`. The float epsilon admits the exact endpoint (e.g. 2.0
+  /// reached by 0.25 steps); the final value is clamped so it can never
+  /// overrun the range.
+  static func evenTicks(_ r: ClosedRange<Double>, step: Double) -> [Double] {
+    guard step > 0, r.upperBound > r.lowerBound else { return [r.lowerBound] }
+    var out: [Double] = []
+    var v = r.lowerBound
+    while v <= r.upperBound + 1e-9 {
+      out.append(min(v, r.upperBound))
+      v += step
+    }
+    return out
+  }
+
+  /// Build `Label`s from raw values with a printf format (e.g. "%g" drops
+  /// trailing zeros: 0.5 → "0.5", 1 → "1").
+  static func labels(_ values: [Double], format: String) -> [Label] {
+    values.map { Label(value: $0, text: String(format: format, $0)) }
   }
 }

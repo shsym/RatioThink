@@ -72,6 +72,20 @@ final class GuardrailSettingsTests: XCTestCase {
     XCTAssertEqual(GuardrailSettings.presets.map(\.value), [0.55, 0.65, 0.80])
   }
 
+  func test_percent_label_renders_whole_percent() {
+    XCTAssertEqual(GuardrailSettings.percentLabel(0.65), "65%")
+    XCTAssertEqual(GuardrailSettings.percentLabel(0.50), "50%")
+    XCTAssertEqual(GuardrailSettings.percentLabel(0.95), "95%")
+    XCTAssertEqual(GuardrailSettings.percentLabel(0.80), "80%")
+  }
+
+  func test_percent_label_non_finite_falls_back_to_default() {
+    XCTAssertEqual(GuardrailSettings.percentLabel(.nan),
+                   GuardrailSettings.percentLabel(GuardrailSettings.defaultFraction))
+    XCTAssertEqual(GuardrailSettings.percentLabel(.infinity),
+                   GuardrailSettings.percentLabel(GuardrailSettings.defaultFraction))
+  }
+
   /// Integration guard for the production wiring (Helper/HelperMain
   /// `buildLaunchSpecResolver`): the `memoryPolicy` built from a persisted
   /// `guardrail.json` must reflect the operator's fraction, NOT the

@@ -8,7 +8,6 @@ struct RatioThinkApp: App {
   /// runs once even if a second window opens.
   @MainActor private static var didReconcileHelperRegistration = false
   @StateObject private var windowState = WindowState()
-  @StateObject private var endpointStore = EndpointStore()
   /// Phase 4: observable durability state for the chat
   /// store. Surfaces on-disk vs in-memory fallback and per-mutation
   /// save failures to a banner inside `RootView` so the user is
@@ -382,7 +381,6 @@ struct RatioThinkApp: App {
         }
       }
         .environmentObject(windowState)
-        .environmentObject(endpointStore)
         .environmentObject(modelLoadCenter)
         .environmentObject(appPreferences)
         .environmentObject(profileStore)
@@ -394,6 +392,9 @@ struct RatioThinkApp: App {
         .environmentObject(helperHealth)
         .environmentObject(downloadController)
         .environmentObject(updateAvailability)
+        // #420: route the menu-bar Helper's `ratiothink://settings` deep
+        // link straight to the Settings scene (not just app-foreground).
+        .handlesSettingsDeepLink()
         .frame(minWidth: 900, minHeight: 600)
     }
     .modelContainer(chatContainer)
@@ -448,7 +449,6 @@ struct RatioThinkApp: App {
 
     Settings {
       SettingsRoot()
-        .environmentObject(endpointStore)
         .environmentObject(modelLoadCenter)
         .environmentObject(appPreferences)
         .environmentObject(profileStore)

@@ -531,13 +531,28 @@ private struct MemoryGuardrailSection: View {
       .labelsHidden()
       .accessibilityIdentifier("GuardrailFractionPresetPicker")
 
-      Stepper(value: stepperBinding,
-              in: GuardrailSettings.minFraction...GuardrailSettings.maxFraction,
-              step: GuardrailSettings.step) {
-        Text("Fraction: \(String(format: "%.2f", fraction))").monospacedDigit()
+      // A plain linear Slider over the supported fraction range (snapped to
+      // the 0.05 grid by `step`), flanked by the range ends and a live
+      // percent readout. Percent (e.g. "65%") reads far clearer than the
+      // raw "0.65" and matches how the limit preview frames the value.
+      HStack(spacing: 12) {
+        Text(GuardrailSettings.percentLabel(GuardrailSettings.minFraction))
+          .font(.caption).foregroundStyle(.tertiary).monospacedDigit()
+        Slider(value: sliderBinding,
+               in: GuardrailSettings.minFraction...GuardrailSettings.maxFraction,
+               step: GuardrailSettings.step)
+          .accessibilityIdentifier("GuardrailFractionSlider")
+          .accessibilityLabel("Memory guardrail fraction")
+          .accessibilityValue(GuardrailSettings.percentLabel(fraction))
+        Text(GuardrailSettings.percentLabel(GuardrailSettings.maxFraction))
+          .font(.caption).foregroundStyle(.tertiary).monospacedDigit()
+        Text(GuardrailSettings.percentLabel(fraction))
+          .monospacedDigit()
+          .frame(width: 48, alignment: .trailing)
+          // The slider already announces its value to VoiceOver; hide the
+          // duplicate visual readout so it isn't read twice.
+          .accessibilityHidden(true)
       }
-      .fixedSize()
-      .accessibilityIdentifier("GuardrailFractionStepper")
 
       Text(limitPreview)
         .font(.callout)
@@ -564,7 +579,7 @@ private struct MemoryGuardrailSection: View {
     )
   }
 
-  private var stepperBinding: Binding<Double> {
+  private var sliderBinding: Binding<Double> {
     Binding(get: { fraction }, set: { setFraction($0) })
   }
 

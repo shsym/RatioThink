@@ -92,25 +92,29 @@ final class S285_ZeroStateGUITests: XCTestCase {
                   "zero-state CTAs must dismiss once a chat is selected")
   }
 
-  /// The col-3 zero-state "Add Endpoint" CTA must create an endpoint and
-  /// open its detail (previously wired to an empty closure).
+  /// #422: selecting the "API Endpoints" sidebar section opens the single
+  /// live `LocalAPIView` (there is no per-endpoint creation — the local API
+  /// is the engine's one endpoint). Replaces the old "Add Endpoint" CTA test.
   @MainActor
-  func test_add_endpoint_cta_opens_endpoint_detail() async throws {
+  func test_api_endpoints_section_opens_local_api_view() async throws {
     let app = makeApp()
     app.launch()
     defer { app.terminate() }
     XCTAssert(app.wait(for: .runningForeground, timeout: 5))
     app.activate()
 
-    let addEndpoint = app.buttons["Add Endpoint"]
-    XCTAssertTrue(addEndpoint.waitForExistence(timeout: 5),
-                  "col-3 zero-state Add Endpoint CTA missing")
-    addEndpoint.click()
+    let navRow = app.descendants(matching: .any).matching(identifier: "API Endpoints").firstMatch
+    XCTAssertTrue(navRow.waitForExistence(timeout: 5),
+                  "sidebar 'API Endpoints' nav row missing")
+    navRow.click()
 
-    // The endpoint detail's name field only exists once an endpoint is open.
-    XCTAssertTrue(app.textFields["EndpointName"].waitForExistence(timeout: 5),
-                  "Add Endpoint must create + open an endpoint detail")
-    XCTAssertTrue(addEndpoint.waitForNonExistence(timeout: 5),
-                  "zero-state CTAs must dismiss once an endpoint is selected")
+    // The single live view mounts in the detail column; its security section
+    // (read-only posture) is always present whether or not the engine runs.
+    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "LocalAPIView")
+                    .firstMatch.waitForExistence(timeout: 5),
+                  "selecting API Endpoints must open the LocalAPIView")
+    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "LocalAPISecurity")
+                    .firstMatch.waitForExistence(timeout: 5),
+                  "LocalAPIView must always show the read-only security posture")
   }
 }
