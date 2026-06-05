@@ -1,5 +1,21 @@
 name: lint
 
+# CI-scope policy: CI runs only the DETERMINISTIC tier — `make lint` +
+# the SPM unit/scenario tests + the contract/canary/inferlet/release jobs
+# + a compile-only smoke of the xcodebuild targets. Every test that
+# depends on a real timer, wall-clock, real subprocess/network timing, a
+# seated GUI session, or a real engine/model is a LOCAL responsibility,
+# not CI:
+#   · app-tier unit bundle (RatioThinkTests) → `make test-app-unit`
+#     (the #420 deep-link/login-item guards, ChatScaffold, ZeroState, …);
+#   · GUI suites (RatioThinkGUITests)        → `make test-gui*`;
+#   · integration / real-engine / e2e        → `make test-e2e*`.
+# Rationale: a CI test that races a timer or a seated session is a flake,
+# and a flaky required check erodes trust in the gate. Anything that must
+# stay in CI is made deterministic with an injected seam (e.g. the
+# `PieEngineHost` clock/sleep seams behind EngineDeathRecoveryTests)
+# rather than a sleep. See TEST.md "Pre-PR gate" for the full split.
+#
 # Wires `make lint` + the lint-self-test + the unit/scenario test
 # bundles into CI per  review findings F8 (lint in CI) and
 # F4 (the ResolveProbe CI hard-fail path was dead until CI actually
@@ -118,11 +134,18 @@ jobs:
       - name: Build app + helper
         run: make build
 
+      # Compile-only smoke for every xcodebuild target (app, helper, and the
+      # RatioThinkTests/RatioThinkGUITests bundles). This job BUILDS the
+      # app-tier test bundles but does NOT run them: under the CI-scope
+      # policy (see the header), the RatioThinkTests app-unit bundle
+      # (the #420 deep-link/login-item guards, ChatScaffold, ZeroState, …)
+      # and every GUI/e2e suite are a local responsibility (`make
+      # test-app-unit`, `make test-gui*`, `make test-e2e*`). Keeping the
+      # compile here still catches app-tier test-code rot — a bundle that
+      # won't compile silently voids the entire local tier — without
+      # asserting non-deterministic, seated, or real-engine behaviour in CI.
       - name: Compile every test target (review v4 F1)
         run: make build-tests
-
-      - name: Run Xcode ChatScaffold regression guard (review v1 F1)
-        run: make test-xcode-chat-scaffold
 
   real-pie-driver-contract:
     # Real-binary contract test for the driver-readiness probe: builds the

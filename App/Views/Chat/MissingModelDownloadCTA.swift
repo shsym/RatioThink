@@ -151,7 +151,10 @@ struct MissingModelDownloadCTA: View {
       .buttonStyle(.borderless)
       .accessibilityIdentifier("missingModel.cancel")
     }
-    .accessibilityIdentifier("missingModel.downloading")
+    // NOTE: no `.accessibilityIdentifier` on this row container — like the
+    // `NoModelLoadedPrompt` container, it would propagate down and override
+    // the embedded "missingModel.cancel" button's identifier (making the
+    // in-flight Cancel unqueryable). The row's controls carry their own ids.
   }
 
   private func failedRow(_ entry: ModelDownloadController.ActiveDownload) -> some View {

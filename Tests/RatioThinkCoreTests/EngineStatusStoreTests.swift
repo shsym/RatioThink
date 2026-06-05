@@ -150,6 +150,53 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(client.startCalls, 1)
   }
 
+  /// #422 F1: a resolver-stage start rejection re-throws AND does NOT move
+  /// the status — the helper leaves it `.stopped` (only `.memoryRisk`
+  /// publishes `.failed`). So the polled-status reducer can't surface it;
+  /// the Local API on/off toggle MUST surface the throw itself, or the user
+  /// gets a silent snap-back. Pins the contract `LocalAPIView.start()` relies
+  /// on. (`.modelMissing` re-throw is covered by
+  /// `test_startEngine_propagates_real_failure` above; this adds the
+  /// status-unchanged half for `.profileMissing`.)
+  func test_startEngine_profileMissing_rethrows_and_leaves_status_stopped() async {
+    let client = StubXPCClient()
+    client.setStartResult(.failure(
+      EngineError(code: .profileMissing, message: "no such profile")))
+    let store = EngineStatusStore(client: client, initialStatus: .stopped)
+    do {
+      try await store.startEngine(profileID: "ghost")
+      XCTFail("a resolver-stage start rejection must re-throw so the toggle can surface it")
+    } catch let e as EngineError {
+      XCTAssertEqual(e.code, .profileMissing)
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
+    XCTAssertEqual(store.status, .stopped,
+                   "start rejection must NOT change status — proves the poll channel can't surface it")
+  }
+
+  /// #422 F1: a rejected stop (e.g. `.killRejected`) re-throws AND leaves the
+  /// engine `.running`, so the Local API toggle stays ON with no explanation
+  /// unless `stop()` surfaces the thrown reason after the user-confirmed
+  /// destructive action.
+  func test_stopEngine_killRejected_rethrows_and_leaves_status_running() async {
+    let client = StubXPCClient()
+    client.setStopResult(.failure(
+      EngineError(code: .killRejected, message: "pid still alive")))
+    let store = EngineStatusStore(
+      client: client, initialStatus: .running(port: 8123, profileID: "chat"))
+    do {
+      try await store.stopEngine()
+      XCTFail("a rejected stop must re-throw so the toggle can surface it")
+    } catch let e as EngineError {
+      XCTAssertEqual(e.code, .killRejected)
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
+    XCTAssertEqual(store.status, .running(port: 8123, profileID: "chat"),
+                   "a rejected stop must NOT change status — toggle stays on, so the view must explain why")
+  }
+
   // MARK: - initial state
 
   func test_initial_status_is_starting_until_first_poll() {

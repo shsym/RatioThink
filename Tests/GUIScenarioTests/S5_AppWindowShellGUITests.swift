@@ -3,10 +3,11 @@ import XCTest
 /// S5 — RatioThink.app window shell matches Notes-style 3-column design (§5).
 ///
 /// GUI-only. Asserts against FINAL design strings — sidebar shows the nav
-/// label `Chats` (the `API Endpoints` HTTP-serving feature is hidden in
-/// v0.1.1; its nav row + the empty-state `Add Endpoint` CTA are both gone),
-/// detail empty-state shows the `Start Chat` CTA, Settings opens via Cmd+,
-/// with 4 tabs (the API tab is hidden in v0.1.1 with the rest of the feature).
+/// labels `Chats` and `API Endpoints` (the latter now mirrors the live engine
+/// endpoint via `LocalAPIView`, #422). The detail empty-state shows the
+/// `Start Chat` CTA (there is no per-endpoint `Add Endpoint` CTA — the local
+/// API is the engine's single endpoint). Settings opens via Cmd+, with 4 tabs
+/// (no API settings tab — the local API's single surface is the main window).
 final class S5_AppWindowShellGUITests: XCTestCase {
   override func setUp() async throws {
     try guardSeatedGUI()
@@ -77,17 +78,18 @@ final class S5_AppWindowShellGUITests: XCTestCase {
 
     XCTAssertTrue(allStrings.contains("Chats"),
                   "sidebar missing 'Chats'; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
-    // v0.1.1: the API Endpoints feature is hidden — its sidebar nav row must
-    // be absent (the enum case + Endpoint views remain, but unreachable).
-    XCTAssertFalse(allStrings.contains("API Endpoints"),
-                   "sidebar should NOT show 'API Endpoints' in v0.1.1; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
+    // #422: the API Endpoints section is live — its sidebar nav row is present
+    // and routes to the single LocalAPIView.
+    XCTAssertTrue(allStrings.contains("API Endpoints"),
+                  "sidebar missing 'API Endpoints'; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
 
-    // Detail empty-state — design §5 CTA. Only `Start Chat` ships in v0.1.1;
-    // the `Add Endpoint` CTA is hidden with the rest of the feature.
+    // Detail empty-state — design §5 CTA. Only `Start Chat` is a zero-state
+    // CTA; there is no `Add Endpoint` (the local API is the engine's single
+    // endpoint, reached via the sidebar section, not created here).
     XCTAssertTrue(allStrings.contains("Start Chat"),
                   "detail missing 'Start Chat' CTA; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
     XCTAssertFalse(allStrings.contains("Add Endpoint"),
-                   "empty-state should NOT show 'Add Endpoint' CTA in v0.1.1; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
+                   "empty-state must not show an 'Add Endpoint' CTA; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
 
     // Pin the spoken VoiceOver label exactly — guards against SwiftUI
     // synthesizing the SF Symbol name into the Button's a11y label
@@ -148,7 +150,7 @@ final class S5_AppWindowShellGUITests: XCTestCase {
     let toolbarButtons = settings.toolbars.buttons
     XCTAssertEqual(
       toolbarButtons.count, 4,
-      "Expected 4 TabView toolbar buttons (API tab hidden in v0.1.1); window: \(settings.debugDescription)"
+      "Expected 4 TabView toolbar buttons (no API settings tab — the local API's surface is the main window); window: \(settings.debugDescription)"
     )
 
     // Query by identifier only (not the label-or-id subscript). Identifier
@@ -163,10 +165,11 @@ final class S5_AppWindowShellGUITests: XCTestCase {
         "Settings tab '\(expected)' missing; window: \(settings.debugDescription)"
       )
     }
-    // v0.1.1: the API tab is hidden — its toolbar button must be absent.
+    // No API settings tab — the local API lives in the main window's API
+    // Endpoints section (LocalAPIView, #422), not in Settings.
     XCTAssertEqual(
       toolbarButtons.matching(identifier: "API").count, 0,
-      "Settings should NOT show an 'API' tab in v0.1.1; window: \(settings.debugDescription)"
+      "Settings should NOT show an 'API' tab (single surface is the main window); window: \(settings.debugDescription)"
     )
   }
 }
