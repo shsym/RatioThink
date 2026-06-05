@@ -46,35 +46,20 @@ final class ReadmeScreenshotsGUITests: XCTestCase {
     defer { app.terminate() }
     Self.activate(app)
 
-    let curl = app.descendants(matching: .any)
-      .matching(identifier: "EndpointCurl").firstMatch
+    // #422: the API Endpoints section is a single live `LocalAPIView` (no
+    // per-endpoint creation). Select the sidebar row and screenshot it. Its
+    // read-only security section always renders; the base-URL/curl rows show
+    // when the harness reports the engine running.
+    let navRow = app.descendants(matching: .any)
+      .matching(identifier: "API Endpoints").firstMatch
+    XCTAssertTrue(navRow.waitForExistence(timeout: 15),
+                  "API Endpoints nav row missing; app: \(app.debugDescription)")
+    navRow.click()
 
-    // The col-3 zero-state "Add Endpoint" CTA (visible at launch, large
-    // control) creates an endpoint, selects it, AND routes to the API
-    // Endpoints section in one action — so the detail pane mounts. Prefer
-    // it over the col-2 list empty-state button, whose freshly-laid-out
-    // small control intermittently ignores a synthesized click under
-    // XCUITest. Coordinate-click is a second strategy for the same quirk.
-    let addEndpoint = app.buttons["Add Endpoint"]
-    if addEndpoint.waitForExistence(timeout: 15) {
-      addEndpoint.click()
-      if !curl.waitForExistence(timeout: 8) {
-        addEndpoint.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
-      }
-    }
-
-    // Fallback: switch to the section and use the list empty-state CTA.
-    if !curl.exists {
-      app.buttons["API Endpoints"].click()
-      Self.settle()
-      let create = app.buttons["CreateEndpoint"]
-      if create.waitForExistence(timeout: 10) {
-        create.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
-      }
-    }
-
-    XCTAssertTrue(curl.waitForExistence(timeout: 10),
-                  "endpoint detail (curl) did not render; app: \(app.debugDescription)")
+    let view = app.descendants(matching: .any)
+      .matching(identifier: "LocalAPIView").firstMatch
+    XCTAssertTrue(view.waitForExistence(timeout: 10),
+                  "LocalAPIView did not render; app: \(app.debugDescription)")
     Self.settle()
     attach(Self.mainWindow(app).screenshot(), name: "endpoint")
   }
