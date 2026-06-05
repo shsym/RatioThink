@@ -343,7 +343,9 @@ struct RatioThinkApp: App {
     Diag.app.event("app.launch", [
       ("version", info?["CFBundleShortVersionString"] as? String ?? "?"),
       ("build", info?["CFBundleVersion"] as? String ?? "?"),
+      ("pid", String(ProcessInfo.processInfo.processIdentifier)),
       ("bundle", DiagnosticLog.redactHome(bundlePath)),
+      ("executable", DiagnosticLog.redactHome(Bundle.main.executableURL?.path ?? "?")),
       ("quarantine", quarantined ? "present" : "absent"),
     ])
   }

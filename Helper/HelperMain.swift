@@ -85,6 +85,9 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     Diag.helper.event("helper.launch", [
       ("version", info?["CFBundleShortVersionString"] as? String ?? "?"),
       ("build", info?["CFBundleVersion"] as? String ?? "?"),
+      ("pid", String(ProcessInfo.processInfo.processIdentifier)),
+      ("bundle", DiagnosticLog.redactHome(Bundle.main.bundleURL.path)),
+      ("executable", DiagnosticLog.redactHome(Bundle.main.executableURL?.path ?? "?")),
     ])
     eagerProbePieDirs()
     setupStatusItemIfNeeded()
@@ -122,6 +125,10 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   ///    which therefore calls `xpcListener.invalidate()` inline
   ///    instead of relying on this hook.
   func applicationWillTerminate(_ note: Notification) {
+    Diag.helper.event("helper.quit", [
+      ("reason", "applicationWillTerminate"),
+      ("pid", String(ProcessInfo.processInfo.processIdentifier)),
+    ])
     // Order matters here (review v1 F1):
     //   1. Cancel the supervisor observer FIRST and nil out the
     //      status item so the `guard` in `applyStatusItemModel`
@@ -151,7 +158,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // paths reach this hook still apply — SIGKILL/SIGABRT/exit(_:)
     // skip the helper teardown entirely, in which case launchd
     // reaps the child via process-group cleanup.
-    engineHost?.stop()
+    engineHost?.stop(reason: "helper.applicationWillTerminate")
     profileStore?.stop()
     profileStore = nil
     if let xpcListener {
@@ -446,6 +453,10 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   private func transitionToDegradedOrTerminate(reason: String) {
     guard transitionToDegraded(reason: reason) else {
       Log.helper.fault("transitionToDegraded had no listener to mutate (reason=\(reason, privacy: .public)) — terminating: a live listener serving .degraded is the only acceptable post-resume failure mode")
+      Diag.helper.event("helper.quit", [
+        ("reason", "degraded_transition_failed"),
+        ("pid", String(ProcessInfo.processInfo.processIdentifier)),
+      ])
       xpcListener?.invalidate()
       xpcListener = nil
       exit(EXIT_FAILURE)
@@ -1133,7 +1144,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
         return
       }
       Log.helper.info("togglePauseResume: pause requested")
-      engineHost.stop()
+      engineHost.stop(reason: "menu.pause")
     case .resume:
       // In-process Resume ( follow-up): no XPC round-trip — the
       // menu-bar action runs inside the helper, so we hand the

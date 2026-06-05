@@ -372,7 +372,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       // client already received `.handshakeTimeout`, and a subsequent
       // `startEngine` is rejected with `.alreadyRunning` against an
       // orphan engine the client never saw acknowledged.
-      engineHost?.stop()
+      engineHost?.stop(reason: "xpc.startEngine.replyTimeoutFallback")
       fireOnce(.failure(EngineError(
         code: .handshakeTimeout,
         message: "startEngine reply-timeout fallback fired after \(deadline)s (host never transitioned out of .starting)"
@@ -419,7 +419,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     }
     tokenBox.withLock { $0 = token }
     if replied.withLock({ $0 }) { cancelObserver() }
-    engineHost.stop()
+    engineHost.stop(reason: "xpc.stopEngine")
     #if DEBUG
     let deadline: TimeInterval = replyTimeoutOverride?.stop
       ?? Self.stopReplyDeadline

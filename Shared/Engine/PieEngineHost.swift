@@ -112,7 +112,9 @@ public final class PieEngineHost: @unchecked Sendable {
   /// only care about shutdown need no change.
   public protocol EngineSession: Sendable {
     func shutdown() async
+    func shutdown(reason: String) async
     func checkLiveness() async -> EngineLiveness
+    func diagnosticProcessID() async -> pid_t?
     /// Resident memory of the live engine process in bytes, or nil when
     /// unavailable. Default nil (see extension) so test fakes that
     /// only model shutdown/liveness need no change; the production
@@ -299,8 +301,16 @@ public final class PieEngineHost: @unchecked Sendable {
   /// in-flight launch task. Idempotent — repeated calls while
   /// `.stopped` / `.failed` / `.stopping` are no-ops.
   public func stop() {
+    stop(reason: "unspecified")
+  }
+
+  /// Stop the engine with a durable non-content diagnostic reason. Callers that
+  /// represent explicit user/system intent should use this overload so
+  /// helper.log can separate user Pause, XPC Unload, app/helper termination,
+  /// and timeout fallback from organic engine death.
+  public func stop(reason: String) {
     stateQueue.sync {
-      stopLocked()
+      stopLocked(reason: reason)
     }
   }
 
@@ -405,7 +415,7 @@ public final class PieEngineHost: @unchecked Sendable {
           // keeps the host alive long past any caller's release.
           Log.engine.info("PieEngineHost: launch completed during .stopping — shutting freshly-spawned session down")
           Task { [weak self, session] in
-            await session.shutdown()
+            await session.shutdown(reason: "host.launch_completed_during_stopping")
             self?.stateQueue.async {
               guard let self else { return }
               if case .stopping = self._state {
@@ -416,7 +426,7 @@ public final class PieEngineHost: @unchecked Sendable {
         default:
           // Unexpected state (.stopped / .failed / .running) — discard.
           Log.engine.error("PieEngineHost: launch completed in unexpected state \(String(describing: self._state), privacy: .public); shutting session down")
-          Task { [session] in await session.shutdown() }
+          Task { [session] in await session.shutdown(reason: "host.launch_completed_unexpected_state") }
         }
       }
     } catch is CancellationError {
@@ -458,9 +468,14 @@ public final class PieEngineHost: @unchecked Sendable {
     }
   }
 
-  private func stopLocked() {
+  private func stopLocked(reason: String) {
     switch _state {
     case .stopped, .stopping:
+      DiagnosticLog.helper.event("engine.shutdown.request", [
+        ("reason", reason),
+        ("state", String(describing: _state)),
+        ("action", "noop"),
+      ])
       return
     case .failed(.engineGone, _):
       // Review v2 R1: a user Pause on `.failed(.engineGone)` is an
@@ -479,6 +494,11 @@ public final class PieEngineHost: @unchecked Sendable {
       // and HelperMain's deferred main-async block re-checks
       // `engineHost.status` to close the post-sync race window.
       Log.engine.info("PieEngineHost: stop() on .failed(.engineGone) — transitioning to .stopped (user Pause)")
+      DiagnosticLog.helper.event("engine.shutdown.request", [
+        ("reason", reason),
+        ("state", String(describing: _state)),
+        ("action", "clear_failed_engineGone"),
+      ])
       autoRelaunchTask?.cancel()
       autoRelaunchTask = nil
       healthyUptimeTask?.cancel()
@@ -499,6 +519,12 @@ public final class PieEngineHost: @unchecked Sendable {
       // `start()` accepts `.failed` as restartable, so the next
       // user Resume drives `doStart` directly.
       Log.engine.info("PieEngineHost: stop() no-op: already .failed(\(code.rawValue, privacy: .public))")
+      DiagnosticLog.helper.event("engine.shutdown.request", [
+        ("reason", reason),
+        ("state", String(describing: _state)),
+        ("action", "noop_failed"),
+        ("code", code.rawValue),
+      ])
       return
     case .starting(_, let launchTask):
       // Cancel the launch task. PieControlLauncher.launch propagates
@@ -506,12 +532,31 @@ public final class PieEngineHost: @unchecked Sendable {
       // shut the (possibly-spawned) session down. The launch task's
       // own state hop will publish `.stopped`.
       Log.engine.info("PieEngineHost: stop() cancelling in-flight launch")
+      DiagnosticLog.helper.event("engine.shutdown.request", [
+        ("reason", reason),
+        ("state", String(describing: _state)),
+        ("action", "cancel_starting"),
+      ])
       launchTask.cancel()
       healthyUptimeTask?.cancel()
       healthyUptimeTask = nil
       setState(.stopping(session: nil))
     case .running(_, _, let session):
       Log.engine.info("PieEngineHost: stop() shutting running session down (pid path)")
+      DiagnosticLog.helper.event("engine.shutdown.request", [
+        ("reason", reason),
+        ("state", "running"),
+        ("action", "shutdown_session"),
+      ])
+      Task { [session, reason] in
+        let pid = await session.diagnosticProcessID()
+        DiagnosticLog.helper.event("engine.shutdown.request", [
+          ("reason", reason),
+          ("state", "running"),
+          ("action", "shutdown_session"),
+          ("pid", pid.map(String.init) ?? "?"),
+        ])
+      }
       livenessMonitor?.cancel()
       livenessMonitor = nil
       autoRelaunchTask?.cancel()
@@ -519,8 +564,8 @@ public final class PieEngineHost: @unchecked Sendable {
       healthyUptimeTask?.cancel()
       healthyUptimeTask = nil
       setState(.stopping(session: session))
-      Task { [weak self, session] in
-        await session.shutdown()
+      Task { [weak self, session, reason] in
+        await session.shutdown(reason: reason)
         self?.stateQueue.async {
           guard let self else { return }
           if case .stopping = self._state {
@@ -552,19 +597,24 @@ public final class PieEngineHost: @unchecked Sendable {
         try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
         if Task.isCancelled { return }
         guard self != nil else { return }
+        let started = Date()
         let liveness = await session.checkLiveness()
+        let elapsed = Date().timeIntervalSince(started)
         if Task.isCancelled { return }
         switch liveness {
         case .alive:
           consecutiveGone = 0
         case .gone(let reason):
           consecutiveGone += 1
+          let pid = await session.diagnosticProcessID()
           // #413 diag: a `.gone` verdict from the control-plane ping while the
           // engine is BUSY (not dead) would falsely restart it mid-search and
           // close the in-flight ToT SSE. Persist every miss + its reason so the
           // operator's run shows whether (and why) the monitor fired.
           DiagnosticLog.helper.event("engine.liveness", [
             ("verdict", "gone"),
+            ("pid", pid.map(String.init) ?? "?"),
+            ("elapsed", String(format: "%.2f", elapsed)),
             ("consecutive", String(consecutiveGone)),
             ("threshold", String(threshold)),
             ("reason", reason),
@@ -574,7 +624,11 @@ public final class PieEngineHost: @unchecked Sendable {
             guard let self else { return }
             guard case .running = self._state else { return }
             Log.engine.error("PieEngineHost: liveness monitor declared engine gone: \(reason, privacy: .public)")
-            DiagnosticLog.helper.event("engine.gone", [("reason", reason), ("consecutive", String(consecutiveGone))])
+            DiagnosticLog.helper.event("engine.gone", [
+              ("pid", pid.map(String.init) ?? "?"),
+              ("reason", reason),
+              ("consecutive", String(consecutiveGone)),
+            ])
             self.livenessMonitor = nil
             self.healthyUptimeTask?.cancel()
             self.healthyUptimeTask = nil
@@ -721,10 +775,15 @@ public final class PieEngineHost: @unchecked Sendable {
 // MARK: - EngineSession liveness default
 
 public extension PieEngineHost.EngineSession {
+  /// Default: reason-aware shutdown collapses to the legacy shutdown for fakes.
+  func shutdown(reason: String) async { await shutdown() }
   /// Default: assume alive. Sessions that can observe engine death
   /// (the production `LaunchedSession`) override this; test fakes that
   /// only model shutdown inherit it so they never trip the monitor.
   func checkLiveness() async -> EngineLiveness { .alive }
+  /// Default: no process identity. Production sessions override this so
+  /// lifecycle diagnostics can correlate liveness misses, exits, and relaunches.
+  func diagnosticProcessID() async -> pid_t? { nil }
   /// Default: memory unavailable. Only the production `LaunchedSession`
   /// samples real RSS; test fakes inherit nil.
   func residentMemoryBytes() async -> UInt64? { nil }

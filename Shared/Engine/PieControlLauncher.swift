@@ -514,6 +514,16 @@ public enum PieControlLauncher {
       throw LaunchError.spawnFailed(underlying: "\(error)")
     }
     spec.pidSink?(proc.processIdentifier)
+    DiagnosticLog.helper.event("engine.launch", [
+      ("pid", String(proc.processIdentifier)),
+      ("profile", spec.profileID),
+      ("binary", DiagnosticLog.redactHome(spec.pieBinary.path)),
+      ("config", DiagnosticLog.redactHome(configURL.path)),
+      ("pieHome", DiagnosticLog.redactHome(spec.pieHome.path)),
+      ("request_timeout_secs", String(requestTimeoutSeconds)),
+      ("PIE_SHMEM_TIMEOUT_S", env["PIE_SHMEM_TIMEOUT_S"] ?? "?"),
+      ("shmem", spec.shmemName),
+    ])
 
     let session = LaunchedSession(process: proc,
                                   stdout: stdout,
@@ -524,7 +534,7 @@ public enum PieControlLauncher {
     do {
       handshake = try await session.awaitHandshake(timeout: spec.handshakeTimeout)
     } catch {
-      await session.shutdown()
+      await session.shutdown(reason: "launch.handshake_failed")
       throw error
     }
 
@@ -545,14 +555,14 @@ public enum PieControlLauncher {
       await client.close()
     } catch {
       await client.close()
-      await session.shutdown()
+      await session.shutdown(reason: "launch.client_error")
       throw LaunchError.clientError(underlying: "\(error)")
     }
 
     do {
       try writePortFile(port: httpPort, in: spec.pieHome)
     } catch {
-      await session.shutdown()
+      await session.shutdown(reason: "launch.port_file_failed")
       throw error
     }
 
@@ -830,6 +840,7 @@ public actor LaunchedSession {
 
   public var pid: pid_t { process.processIdentifier }
   public var isRunning: Bool { process.isRunning }
+  public func diagnosticProcessID() async -> pid_t? { process.processIdentifier }
 
   /// Resident memory of the live pie process in bytes, or nil if the
   /// engine is not running or the sample fails. Satisfies
@@ -907,7 +918,7 @@ public actor LaunchedSession {
   ///     death from an inferlet rejection.
   public func checkLiveness() async -> EngineLiveness {
     if !process.isRunning {
-      return .gone(reason: "engine process exited (status \(process.terminationStatus))")
+      return .gone(reason: "engine process exited (\(terminationDescription()))")
     }
     guard let controlWSURL else {
       // Pre-handshake (address not yet recorded): the process is up;
@@ -936,20 +947,57 @@ public actor LaunchedSession {
   /// caller already failed; making cleanup throwable would just
   /// mask the original error.
   public func shutdown() async {
+    await shutdown(reason: "unspecified")
+  }
+
+  public func shutdown(reason: String) async {
     guard !shutdownDone else { return }
     shutdownDone = true
 
+    let pid = process.processIdentifier
+    let wasRunning = process.isRunning
+    DiagnosticLog.helper.event("engine.shutdown", [
+      ("reason", reason),
+      ("pid", String(pid)),
+      ("wasRunning", wasRunning ? "true" : "false"),
+    ])
+
     if process.isRunning {
+      DiagnosticLog.helper.event("engine.signal", [
+        ("reason", reason),
+        ("pid", String(pid)),
+        ("signal", "SIGINT"),
+      ])
       sendSignalQuiet(SIGINT, label: "SIGINT")
       let exited = await waitForExit(timeout: 10)
       if !exited {
         diagnose("SIGINT timed out after 10s; escalating to SIGKILL")
+        DiagnosticLog.helper.event("engine.signal", [
+          ("reason", reason),
+          ("pid", String(pid)),
+          ("signal", "SIGKILL"),
+        ])
         sendSignalQuiet(SIGKILL, label: "SIGKILL")
         let killed = await waitForExit(timeout: 5)
         if !killed {
           diagnose("SIGKILL + 5s waitpid window did not reap pid \(process.processIdentifier); leaking to process exit")
         }
       }
+    }
+    if process.isRunning {
+      DiagnosticLog.helper.event("engine.exit", [
+        ("reason", reason),
+        ("pid", String(pid)),
+        ("status", "?"),
+        ("termination", "still_running"),
+      ])
+    } else {
+      DiagnosticLog.helper.event("engine.exit", [
+        ("reason", reason),
+        ("pid", String(pid)),
+        ("status", String(process.terminationStatus)),
+        ("termination", terminationDescription()),
+      ])
     }
 
     // Close pipe so any reader (awaitHandshake's task, if still
@@ -1043,6 +1091,18 @@ public actor LaunchedSession {
   private func isProcessRunning() -> Bool { process.isRunning }
   private func terminationStatusIfExited() -> Int32 {
     process.isRunning ? -1 : process.terminationStatus
+  }
+
+  private func terminationDescription() -> String {
+    guard !process.isRunning else { return "running" }
+    switch process.terminationReason {
+    case .exit:
+      return "exit status=\(process.terminationStatus)"
+    case .uncaughtSignal:
+      return "signal status=\(process.terminationStatus)"
+    @unknown default:
+      return "unknown status=\(process.terminationStatus)"
+    }
   }
 
   /// Confirm a REAL subprocess exit before classifying `engineExitedEarly`.

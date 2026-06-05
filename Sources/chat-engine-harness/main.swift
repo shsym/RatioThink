@@ -22,6 +22,12 @@ enum EngineHarness {
 
     try FileManager.default.createDirectory(at: pieHome, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: urlFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+    // Keep the harness' non-content DiagnosticLog breadcrumbs isolated with the
+    // engine home under test. Without this, helper-style lifecycle events from
+    // the CLI harness land in the user's real RatioThink helper.log, making
+    // bounded reproductions harder to correlate and potentially polluting
+    // operator diagnostics.
+    setenv(PieDirs.homeEnvVar, pieHome.path, 1)
 
     //  full-chain mode: serve a portable app-staged GGUF (the path
     // the Settings downloader wrote into a shared PIE_HOME/models)
@@ -59,6 +65,11 @@ enum EngineHarness {
       modelConfig: modelConfig
     )
 
+    if let lifecycleMode = env["PIE_TEST_LIFECYCLE_SOAK"], !lifecycleMode.isEmpty {
+      let ok = try await runLifecycleSoak(mode: lifecycleMode, spec: spec, loadTarget: loadTarget, env: env)
+      exit(ok ? 0 : 1)
+    }
+
     print("chat-engine-harness: launching \(pieBinary.path) with model \(loadTarget)")
     let (port, session) = try await PieControlLauncher.launch(spec: spec)
     let baseURL = URL(string: "http://127.0.0.1:\(port)")!
@@ -76,17 +87,86 @@ enum EngineHarness {
       // terminal.
       if let question = env["PIE_TEST_TOT_QUESTION"], !question.isEmpty {
         let ok = try await runTreeOfThought(question: question, baseURL: baseURL, env: env)
-        await session.shutdown()
+        await session.shutdown(reason: "harness.tot_complete")
         exit(ok ? 0 : 1)
       }
       try baseURL.absoluteString.write(to: urlFile, atomically: true, encoding: .utf8)
       print("chat-engine-harness: wrote \(urlFile.path)")
       await waitForSIGTERM()
       print("chat-engine-harness: shutting down")
-      await session.shutdown()
+      await session.shutdown(reason: "harness.sigterm")
     } catch {
-      await session.shutdown()
+      await session.shutdown(reason: "harness.error")
       throw error
+    }
+  }
+
+  /// Production-lifecycle soak harness: drives the real `PieEngineHost`
+  /// liveness monitor + optional auto-relaunch instead of launching
+  /// `PieControlLauncher` directly. Emits only non-content lifecycle data.
+  private static func runLifecycleSoak(
+    mode: String,
+    spec originalSpec: PieControlLauncher.LaunchSpec,
+    loadTarget: String,
+    env: [String: String]
+  ) async throws -> Bool {
+    let duration = doubleEnv("PIE_TEST_LIFECYCLE_DURATION", 150, env: env)
+    let interval = doubleEnv("PIE_TEST_LIFECYCLE_LIVENESS_INTERVAL", 5, env: env)
+    let threshold = intEnv("PIE_TEST_LIFECYCLE_LIVENESS_THRESHOLD", 2, env: env)
+    let pids = Locked<[pid_t]>([])
+    var spec = originalSpec
+    spec.pidSink = { pid in pids.withLock { $0.append(pid) } }
+
+    final class HostBox: @unchecked Sendable { weak var host: PieEngineHost? }
+    let box = HostBox()
+    let relauncher: PieEngineHost.Relauncher = { [box, spec] in
+      print("chat-engine-harness: lifecycle relauncher invoked")
+      _ = box.host?.start(spec)
+    }
+    let host = PieEngineHost(
+      livenessInterval: interval,
+      livenessFailureThreshold: threshold,
+      relaunchPolicy: PieEngineHost.RelaunchPolicy(maxAttempts: 2, window: 60, backoffSchedule: [1.0, 2.0]),
+      relauncher: relauncher
+    )
+    box.host = host
+
+    let transitions = Locked<[String]>([])
+    let token = host.observe { status, _ in
+      let rendered = String(describing: status)
+      transitions.withLock { $0.append(rendered) }
+      print("chat-engine-harness: lifecycle status=\(rendered)")
+    }
+    defer { token.cancel() }
+
+    print("chat-engine-harness: lifecycle mode=\(mode) duration=\(duration)s interval=\(interval)s threshold=\(threshold)")
+    try host.start(spec).get()
+    let port = try await waitForRunningPort(host: host, timeout: 120)
+    let baseURL = URL(string: "http://127.0.0.1:\(port)")!
+    print("chat-engine-harness: lifecycle engine running port=\(port) pids=\(pids.withLock { $0.map(String.init).joined(separator: ",") })")
+    try await loadModel(loadTarget, baseURL: baseURL)
+
+    switch mode {
+    case "idle":
+      print("chat-engine-harness: lifecycle idle soak begin (no chat/ToT content)")
+      try await sleepSeconds(duration)
+      let final = host.status
+      print("chat-engine-harness: lifecycle idle soak end status=\(final) pids=\(pids.withLock { $0.map(String.init).joined(separator: ",") }) transitions=\(transitions.withLock { $0.count })")
+      await stopLifecycleHost(host)
+      if case .running = final { return true }
+      return false
+    case "tot":
+      let question = env["PIE_TEST_TOT_QUESTION"].flatMap { $0.isEmpty ? nil : $0 } ?? "Diagnose a software lifecycle issue."
+      print("chat-engine-harness: lifecycle active ToT soak begin (question_chars=\(question.count))")
+      let ok = try await runTreeOfThought(question: question, baseURL: baseURL, env: env)
+      let final = host.status
+      print("chat-engine-harness: lifecycle active ToT soak end status=\(final) terminal=\(ok) pids=\(pids.withLock { $0.map(String.init).joined(separator: ",") }) transitions=\(transitions.withLock { $0.count })")
+      await stopLifecycleHost(host)
+      return ok
+    default:
+      print("chat-engine-harness: unknown PIE_TEST_LIFECYCLE_SOAK=\(mode); expected idle|tot")
+      await stopLifecycleHost(host)
+      return false
     }
   }
 
@@ -96,11 +176,10 @@ enum EngineHarness {
   private static func runTreeOfThought(
     question: String, baseURL: URL, env: [String: String]
   ) async throws -> Bool {
-    func intEnv(_ key: String, _ fallback: Int) -> Int { env[key].flatMap { Int($0) } ?? fallback }
-    let breadth = intEnv("PIE_TEST_TOT_BREADTH", 3)
-    let depth = intEnv("PIE_TEST_TOT_DEPTH", 2)
-    let beam = intEnv("PIE_TEST_TOT_BEAM", 2)
-    let maxTok = intEnv("PIE_TEST_TOT_MAXTOK", 256)
+    let breadth = intEnv("PIE_TEST_TOT_BREADTH", 3, env: env)
+    let depth = intEnv("PIE_TEST_TOT_DEPTH", 2, env: env)
+    let beam = intEnv("PIE_TEST_TOT_BEAM", 2, env: env)
+    let maxTok = intEnv("PIE_TEST_TOT_MAXTOK", 256, env: env)
     let input: [String: Any] = [
       "messages": [["role": "user", "content": question]],
       "breadth": breadth, "depth": depth, "beam_width": beam,
@@ -110,7 +189,7 @@ enum EngineHarness {
     let req = InferletRequest(inferlet: "tree-of-thought", input: inputData, messages: nil, stream: true)
     let client = HTTPEngineClient(baseURL: baseURL)
 
-    print("chat-engine-harness: ToT drive b\(breadth)/d\(depth)/beam\(beam)/max\(maxTok) q=\(question.debugDescription)")
+    print("chat-engine-harness: ToT drive b\(breadth)/d\(depth)/beam\(beam)/max\(maxTok) question_chars=\(question.count)")
     var tree = ToTTree()
     let t0 = Date()
     var sawTerminal = false
@@ -133,8 +212,7 @@ enum EngineHarness {
         case .answer: answerDeltas += 1
         }
       case let .nodeComplete(node):
-        let head = node.content.prefix(40).replacingOccurrences(of: "\n", with: "\\n")
-        print(String(format: "  +%6.1fs node_complete depth=\(node.depth) status=\(node.status) score=\(node.score.map(String.init) ?? "nil") len=\(node.content.count) head=\(head.debugDescription)", dt))
+        print(String(format: "  +%6.1fs node_complete depth=\(node.depth) status=\(node.status) score=\(node.score.map(String.init) ?? "nil") answer_len=\(node.content.count) reasoning_len=\(node.reasoning.count)", dt))
       case let .levelPruned(level, kept):
         print(String(format: "  +%6.1fs level_pruned level=\(level) kept=\(kept)", dt))
       case let .treeComplete(sel, ans):
@@ -251,11 +329,59 @@ enum EngineHarness {
       _ = try await group.next()
     }
   }
+
+  private static func waitForRunningPort(host: PieEngineHost, timeout: TimeInterval) async throws -> UInt16 {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      switch host.status {
+      case .running(let port, _):
+        return UInt16(port)
+      case .failed(let code, let message):
+        throw HarnessError.engineFailed("\(code.rawValue): \(message)")
+      default:
+        try await Task.sleep(nanoseconds: 250_000_000)
+      }
+    }
+    throw HarnessError.timeout("waitForRunningPort(\(timeout)s), last=\(host.status)")
+  }
+
+  private static func sleepSeconds(_ seconds: TimeInterval) async throws {
+    try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+  }
+
+  private static func stopLifecycleHost(_ host: PieEngineHost) async {
+    host.stop(reason: "harness.lifecycle.complete")
+    let deadline = Date().addingTimeInterval(3)
+    while Date() < deadline {
+      if case .stopped = host.status { break }
+      try? await Task.sleep(nanoseconds: 100_000_000)
+    }
+  }
+
+  private static func intEnv(_ key: String, _ fallback: Int, env: [String: String]) -> Int {
+    env[key].flatMap { Int($0) } ?? fallback
+  }
+
+  private static func doubleEnv(_ key: String, _ fallback: TimeInterval, env: [String: String]) -> TimeInterval {
+    env[key].flatMap { TimeInterval($0) } ?? fallback
+  }
+}
+
+private final class Locked<Value>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: Value
+  init(_ value: Value) { self.value = value }
+  func withLock<T>(_ body: (inout Value) -> T) -> T {
+    lock.lock()
+    defer { lock.unlock() }
+    return body(&value)
+  }
 }
 
 private enum HarnessError: Error, CustomStringConvertible {
   case timeout(String)
   case modelLoadEndedWithoutReady(String)
+  case engineFailed(String)
 
   var description: String {
     switch self {
@@ -263,6 +389,8 @@ private enum HarnessError: Error, CustomStringConvertible {
       return "\(label) timed out"
     case .modelLoadEndedWithoutReady(let model):
       return "loadModel(\(model)) ended without .ready"
+    case .engineFailed(let message):
+      return "engine failed: \(message)"
     }
   }
 }
