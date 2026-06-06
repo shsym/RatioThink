@@ -323,8 +323,12 @@ struct LocalAPIView: View {
   /// Start the engine on the active profile. A resolver-stage rejection
   /// (`.profileMissing`/`.modelMissing`/…) is re-thrown by
   /// `EngineStatusStore.startEngine` and leaves the polled status `.stopped`,
-  /// so it MUST surface here — the reducer never sees it. (`.replyTimeout` /
-  /// `.alreadyRunning` are swallowed by the store as non-failures.)
+  /// so it MUST surface here — the reducer never sees it. Only
+  /// App-side `.replyTimeout` is swallowed by the store because the
+  /// helper start remains in flight; same-profile idempotency is handled
+  /// inside `HelperExportedAPI` / `PieEngineHost.startOrAttach`, so any
+  /// `.alreadyRunning` that reaches the app is an incompatible-start
+  /// conflict and surfaces to the caller.
   private func start() {
     guard let profileID = profileStore.activeProfileID, !profileID.isEmpty else { return }
     Task { @MainActor in

@@ -66,7 +66,7 @@ fire-and-forget):
 | Call | Purpose |
 |------|---------|
 | `engineStatus()` | Returns the current `EngineStatus`. The app **polls** this (~1 Hz); there is no push channel. |
-| `startEngine(profileID:)` / `stopEngine()` | Bring the engine up for a profile / shut it down. (The helper auto-resumes the active profile on boot, so the shipping app never calls `startEngine`.) |
+| `startEngine(profileID:)` / `stopEngine()` | Bring the engine up for a profile / shut it down. The helper auto-resumes the active profile on boot; the app also invokes `startEngine` for explicit restart and post-download recovery paths. |
 | `loadModel` / `cancelLoad` | Model-load handles (forward-compat stubs in v1 — see invariants). |
 | `downloadModel(repo:file:)` / `cancelDownload` | Fetch a model into the local cache. |
 | `listProfiles()` / `reloadProfiles()` | Read/refresh the on-disk TOML profiles. |
@@ -146,11 +146,15 @@ just confirms the model and emits `model_ready`.
 **Cold start.** The helper boots (launchd agent) and **auto-resumes** the last active
 profile in-process — `HelperMain.autoResumeEngineOnBoot()` → `HelperResumeAction.run(…)`
 → `PieEngineHost.start(spec)` → `PieControlLauncher` boots `pie serve`, completes the WS
-handshake, and installs `chat-apc` → engine reports `.running(port:)`. The app is
-**poll-only**: it launches, reconciles the helper registration (re-registers via
+handshake, and installs `chat-apc` → engine reports `.running(port:)`. The app normally
+discovers this via polling: it launches, reconciles the helper registration (re-registers via
 `SMAppService` if the mach service is unreachable), and its `EngineStatusStore` (polling
-at ~1 Hz) sees `.running(port:)` and resolves the HTTP base URL. The `startEngine(profileID:)`
-selector exists for explicit/external callers, but the shipping app never invokes it.
+at ~1 Hz) sees `.running(port:)` and resolves the HTTP base URL. The app also invokes
+`startEngine(profileID:)` for explicit restart and post-download recovery. Same-profile
+idempotency is handled in `HelperExportedAPI` / `PieEngineHost.startOrAttach`;
+`EngineStatusStore` swallows only App-side reply timeouts because the start remains in
+flight, while any helper `.alreadyRunning` that reaches the app is an incompatible-start
+conflict surfaced to the caller.
 
 **Send a message.** You type and hit Return (`ComposerView`) → the user turn is
 saved to SwiftData and `ChatSendController.send()` builds the request →

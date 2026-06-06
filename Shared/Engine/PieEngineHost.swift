@@ -77,15 +77,15 @@ public final class PieEngineHost: @unchecked Sendable {
   private enum State {
     case stopped
     case starting(profileID: String, launchID: UInt64, launchTask: Task<Void, Never>)
-    case running(port: EnginePort, profileID: String, session: any EngineSession)
-    case stopping(session: (any EngineSession)?)
+    case running(port: EnginePort, profileID: String, launchID: UInt64, session: any EngineSession)
+    case stopping(session: (any EngineSession)?, launchID: UInt64?)
     case failed(EngineErrorCode, String)
 
     var publicStatus: EngineStatus {
       switch self {
       case .stopped:                                return .stopped
       case .starting:                               return .starting
-      case .running(let port, let profileID, _):    return .running(port: port, profileID: profileID)
+      case .running(let port, let profileID, _, _): return .running(port: port, profileID: profileID)
       case .stopping:                               return .stopping
       case .failed(let code, let message):          return .failed(code: code, message: message)
       }
@@ -267,7 +267,7 @@ public final class PieEngineHost: @unchecked Sendable {
   /// open), never per frame.
   public func residentMemoryBytes() async -> UInt64? {
     let session: (any EngineSession)? = stateQueue.sync {
-      if case let .running(_, _, session) = _state { return session }
+      if case let .running(_, _, _, session) = _state { return session }
       return nil
     }
     guard let session else { return nil }
@@ -339,7 +339,7 @@ public final class PieEngineHost: @unchecked Sendable {
           ("action", "attach_existing"),
         ])
         return .success(())
-      case .running(_, let profileID, _) where profileID == spec.profileID:
+      case .running(_, let profileID, _, _) where profileID == spec.profileID:
         DiagnosticLog.helper.event("engine.start.request", [
           ("profile", spec.profileID),
           ("state", "running"),
@@ -522,10 +522,10 @@ public final class PieEngineHost: @unchecked Sendable {
           where currentProfileID == spec.profileID && currentLaunchID == launchID:
           self.launchTimeoutTask?.cancel()
           self.launchTimeoutTask = nil
-          self.setState(.running(port: port, profileID: spec.profileID, session: session))
+          self.setState(.running(port: port, profileID: spec.profileID, launchID: launchID, session: session))
           self.startLivenessMonitor(session: session)
           self.armHealthyUptimeTimer()
-        case .stopping:
+        case .stopping(_, let stoppingLaunchID) where stoppingLaunchID == launchID:
           // stop() arrived after launch finished but before we hopped
           // back. Honour the cancellation by shutting the
           // freshly-launched session down.
@@ -538,7 +538,8 @@ public final class PieEngineHost: @unchecked Sendable {
             await session.shutdown(reason: "host.launch_completed_during_stopping")
             self?.stateQueue.async {
               guard let self else { return }
-              if case .stopping = self._state {
+              if case .stopping(_, let currentLaunchID) = self._state,
+                 currentLaunchID == launchID {
                 self.setState(.stopped)
               }
             }
@@ -564,7 +565,7 @@ public final class PieEngineHost: @unchecked Sendable {
           self.launchTimeoutTask?.cancel()
           self.launchTimeoutTask = nil
           self.setState(.stopped)
-        case .stopping:
+        case .stopping(_, let stoppingLaunchID) where stoppingLaunchID == launchID:
           self.launchTimeoutTask?.cancel()
           self.launchTimeoutTask = nil
           self.setState(.stopped)
@@ -590,7 +591,7 @@ public final class PieEngineHost: @unchecked Sendable {
           self.launchTimeoutTask?.cancel()
           self.launchTimeoutTask = nil
           self.setState(.failed(.spawnFailed, msg))
-        case .stopping:
+        case .stopping(_, let stoppingLaunchID) where stoppingLaunchID == launchID:
           self.launchTimeoutTask?.cancel()
           self.launchTimeoutTask = nil
           self.setState(.stopped)
@@ -661,7 +662,7 @@ public final class PieEngineHost: @unchecked Sendable {
         ("code", code.rawValue),
       ])
       return
-    case .starting(_, _, let launchTask):
+    case .starting(_, let launchID, let launchTask):
       // Cancel the launch task. PieControlLauncher.launch propagates
       // `CancellationError` on the next await point; its catch paths
       // shut the (possibly-spawned) session down. The launch task's
@@ -677,8 +678,8 @@ public final class PieEngineHost: @unchecked Sendable {
       launchTimeoutTask = nil
       healthyUptimeTask?.cancel()
       healthyUptimeTask = nil
-      setState(.stopping(session: nil))
-    case .running(_, _, let session):
+      setState(.stopping(session: nil, launchID: launchID))
+    case .running(_, _, let launchID, let session):
       Log.engine.info("PieEngineHost: stop() shutting running session down (pid path)")
       DiagnosticLog.helper.event("engine.shutdown.request", [
         ("reason", reason),
@@ -700,12 +701,13 @@ public final class PieEngineHost: @unchecked Sendable {
       autoRelaunchTask = nil
       healthyUptimeTask?.cancel()
       healthyUptimeTask = nil
-      setState(.stopping(session: session))
+      setState(.stopping(session: session, launchID: launchID))
       Task { [weak self, session, reason] in
         await session.shutdown(reason: reason)
         self?.stateQueue.async {
           guard let self else { return }
-          if case .stopping = self._state {
+          if case .stopping(_, let currentLaunchID) = self._state,
+             currentLaunchID == launchID {
             self.setState(.stopped)
           }
         }

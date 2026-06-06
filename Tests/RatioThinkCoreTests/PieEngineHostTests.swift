@@ -19,6 +19,42 @@ final class PieEngineHostTests: XCTestCase {
     func shutdown() async { lock.lock(); _count += 1; lock.unlock() }
   }
 
+  final class BlockingShutdownSession: PieEngineHost.EngineSession, @unchecked Sendable {
+    private let lock = NSLock()
+    private var shutdownContinuation: CheckedContinuation<Void, Never>?
+    private var _shutdownCount = 0
+    let shutdownStarted: XCTestExpectation
+
+    init(shutdownStarted: XCTestExpectation) {
+      self.shutdownStarted = shutdownStarted
+    }
+
+    var shutdownCount: Int {
+      lock.lock(); defer { lock.unlock() }
+      return _shutdownCount
+    }
+
+    func shutdown() async {
+      lock.lock()
+      _shutdownCount += 1
+      lock.unlock()
+      shutdownStarted.fulfill()
+      await withCheckedContinuation { continuation in
+        lock.lock()
+        shutdownContinuation = continuation
+        lock.unlock()
+      }
+    }
+
+    func finishShutdown() {
+      lock.lock()
+      let continuation = shutdownContinuation
+      shutdownContinuation = nil
+      lock.unlock()
+      continuation?.resume()
+    }
+  }
+
   final class LaunchGate: @unchecked Sendable {
     typealias LaunchResult = (port: EnginePort, session: any PieEngineHost.EngineSession)
 
@@ -437,6 +473,114 @@ final class PieEngineHostTests: XCTestCase {
     XCTAssertEqual(host.status, .running(port: 2002, profileID: "tree-of-thought"))
     XCTAssertEqual(secondSession.shutdownCount, 0)
     host.stop()
+  }
+
+  func test_stale_launch_success_does_not_complete_unrelated_slow_stop() {
+    let firstSession = FakeSession()
+    assertStaleLaunchCompletionDoesNotCompleteUnrelatedSlowStop { launches in
+      launches.succeed(0, port: EnginePort(1001), session: firstSession)
+    }
+    XCTAssertEqual(firstSession.shutdownCount, 1,
+                   "stale successful launch must shut down only its own returned session")
+  }
+
+  func test_stale_launch_cancellation_does_not_complete_unrelated_slow_stop() {
+    assertStaleLaunchCompletionDoesNotCompleteUnrelatedSlowStop { launches in
+      launches.fail(0, CancellationError())
+    }
+  }
+
+  func test_stale_launch_error_does_not_complete_unrelated_slow_stop() {
+    struct Boom: Error, CustomStringConvertible { var description: String { "late launch #1 boom" } }
+    assertStaleLaunchCompletionDoesNotCompleteUnrelatedSlowStop { launches in
+      launches.fail(0, Boom())
+    }
+  }
+
+  private func assertStaleLaunchCompletionDoesNotCompleteUnrelatedSlowStop(
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    completeStaleLaunch: (LaunchGate) -> Void
+  ) {
+    let firstStarted = expectation(description: "launch #1 started")
+    let secondStarted = expectation(description: "launch #2 started")
+    let firstTimeoutArmed = expectation(description: "launch #1 timeout armed")
+    let secondTimeoutArmed = expectation(description: "launch #2 timeout armed")
+    let secondShutdownStarted = expectation(description: "launch #2 shutdown started")
+    let stopped = expectation(description: "launch #2 stop completes")
+    let launches = LaunchGate(started: [firstStarted, secondStarted])
+    let sleeps = SleepGate(armed: [firstTimeoutArmed, secondTimeoutArmed])
+    let secondSession = BlockingShutdownSession(shutdownStarted: secondShutdownStarted)
+    let host = PieEngineHost(
+      launcher: { spec in try await launches.launch(spec) },
+      launchTimeoutSlack: 0,
+      sleepFor: { seconds in await sleeps.sleep(seconds) }
+    )
+
+    XCTAssertNoThrow(try host.start(makeSpec(profileID: "chat", handshakeTimeout: 0.2)).get(),
+                     file: file, line: line)
+    wait(for: [firstStarted, firstTimeoutArmed], timeout: 2)
+
+    let timedOut = expectation(description: "launch #1 times out")
+    var sawTimeout = false
+    let timeoutToken = host.observe { status, token in
+      if case .failed(.handshakeTimeout, _) = status, !sawTimeout {
+        sawTimeout = true
+        timedOut.fulfill()
+        token.cancel()
+      }
+    }
+    sleeps.wake(0)
+    wait(for: [timedOut], timeout: 2)
+    timeoutToken.cancel()
+
+    XCTAssertNoThrow(try host.start(makeSpec(profileID: "tree-of-thought", handshakeTimeout: 0.2)).get(),
+                     file: file, line: line)
+    wait(for: [secondStarted, secondTimeoutArmed], timeout: 2)
+
+    let running = expectation(description: "launch #2 reaches running")
+    let runningToken = host.observe { status, token in
+      if case .running(let port, let profileID) = status,
+         port == 2002, profileID == "tree-of-thought" {
+        running.fulfill()
+        token.cancel()
+      }
+    }
+    launches.succeed(1, port: EnginePort(2002), session: secondSession)
+    wait(for: [running], timeout: 2)
+    runningToken.cancel()
+
+    let stoppedToken = host.observe { status, token in
+      if case .stopped = status {
+        stopped.fulfill()
+        token.cancel()
+      }
+    }
+    host.stop()
+    wait(for: [secondShutdownStarted], timeout: 2)
+    XCTAssertEqual(host.status, .stopping, file: file, line: line)
+
+    completeStaleLaunch(launches)
+    let staleCompletionSettled = expectation(description: "stale launch completion processed")
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+      staleCompletionSettled.fulfill()
+    }
+    wait(for: [staleCompletionSettled], timeout: 1)
+
+    XCTAssertEqual(host.status, .stopping,
+                   "stale launch #1 completion must not complete launch #2's stop",
+                   file: file, line: line)
+    let overlappingStart = host.start(makeSpec(profileID: "chat", handshakeTimeout: 0.2))
+    guard case .failure(let err) = overlappingStart else {
+      return XCTFail("host must reject new starts while launch #2 shutdown is still in progress",
+                     file: file, line: line)
+    }
+    XCTAssertEqual(err.code, .alreadyRunning, file: file, line: line)
+    XCTAssertEqual(secondSession.shutdownCount, 1, file: file, line: line)
+
+    secondSession.finishShutdown()
+    wait(for: [stopped], timeout: 2)
+    stoppedToken.cancel()
   }
 
   // MARK: - stop while running
