@@ -76,7 +76,7 @@ public final class PieEngineHost: @unchecked Sendable {
 
   private enum State {
     case stopped
-    case starting(profileID: String, launchTask: Task<Void, Never>)
+    case starting(profileID: String, launchID: UInt64, launchTask: Task<Void, Never>)
     case running(port: EnginePort, profileID: String, session: any EngineSession)
     case stopping(session: (any EngineSession)?)
     case failed(EngineErrorCode, String)
@@ -188,12 +188,19 @@ public final class PieEngineHost: @unchecked Sendable {
   ///     auto-relaunch even if `relaunchPolicy.maxAttempts > 0`, so
   ///     existing call sites (tests, degraded boot) keep the prior
   ///     "stay .failed until user-Resume" behavior.
+  ///   - launchTimeoutSlack: host-owned safety margin added to
+  ///     `LaunchSpec.handshakeTimeout` before cancelling a launch that is
+  ///     still `.starting`. This is scoped to the launch incarnation; once
+  ///     the host reaches `.running`, the timer is cancelled / inert. The
+  ///     XPC reply timeout is deliberately separate and never owns process
+  ///     lifetime.
   public init(
     launcher: LauncherCall? = nil,
     livenessInterval: TimeInterval = 5,
     livenessFailureThreshold: Int = 2,
     relaunchPolicy: RelaunchPolicy = RelaunchPolicy(),
     relauncher: Relauncher? = nil,
+    launchTimeoutSlack: TimeInterval = 2,
     clock: @Sendable @escaping () -> Date = { Date() }
   ) {
     self.launcher = launcher ?? PieEngineHost.productionLauncher
@@ -201,6 +208,7 @@ public final class PieEngineHost: @unchecked Sendable {
     self.livenessFailureThreshold = max(1, livenessFailureThreshold)
     self.relaunchPolicy = relaunchPolicy
     self.relauncher = relauncher
+    self.launchTimeoutSlack = max(0, launchTimeoutSlack)
     self.clock = clock
   }
 
@@ -209,6 +217,7 @@ public final class PieEngineHost: @unchecked Sendable {
   private let livenessFailureThreshold: Int
   private let relaunchPolicy: RelaunchPolicy
   private let relauncher: Relauncher?
+  private let launchTimeoutSlack: TimeInterval
 
   /// Wall-clock source for the slow-flap window math, injectable so a
   /// test can advance time deterministically instead of sleeping —
@@ -273,9 +282,11 @@ public final class PieEngineHost: @unchecked Sendable {
     return token
   }
 
-  /// Spawn `pie serve` for the LaunchSpec. Returns `.alreadyRunning`
-  /// when an engine is already starting / running / stopping (the
-  /// host does NOT silently restart on top of itself).
+  /// Spawn `pie serve` for the LaunchSpec. Repeated starts for the same
+  /// profile while `.starting` / `.running` are idempotent and attach to the
+  /// existing launch/session. Different-profile starts and starts while
+  /// `.stopping` still return `.alreadyRunning` (the host does NOT silently
+  /// restart on top of itself).
   ///
   /// Cancellation: subsequent `stop()` calls cancel the launch task.
   /// `PieControlLauncher.launch`'s catch paths tear down the
@@ -287,6 +298,20 @@ public final class PieEngineHost: @unchecked Sendable {
       switch _state {
       case .stopped, .failed:
         return doStart(spec)
+      case .starting(let profileID, _, _) where profileID == spec.profileID:
+        DiagnosticLog.helper.event("engine.start.request", [
+          ("profile", spec.profileID),
+          ("state", "starting"),
+          ("action", "attach_existing"),
+        ])
+        return .success(())
+      case .running(_, let profileID, _) where profileID == spec.profileID:
+        DiagnosticLog.helper.event("engine.start.request", [
+          ("profile", spec.profileID),
+          ("state", "running"),
+          ("action", "already_running_same_profile"),
+        ])
+        return .success(())
       case .starting, .running, .stopping:
         return .failure(EngineError(
           code: .alreadyRunning,
@@ -311,27 +336,6 @@ public final class PieEngineHost: @unchecked Sendable {
   public func stop(reason: String) {
     stateQueue.sync {
       stopLocked(reason: reason)
-    }
-  }
-
-  /// Cancel an in-flight launch only if the host is still genuinely in
-  /// `.starting`. This is intentionally narrower than `stop(reason:)`: XPC
-  /// reply-timeout fallback code uses it after its own deadline, and that
-  /// fallback must not tear down a healthy `.running` engine whose success reply
-  /// already won (or is about to win) the race.
-  @discardableResult
-  public func stopIfStarting(reason: String) -> Bool {
-    stateQueue.sync {
-      guard case .starting = _state else {
-        DiagnosticLog.helper.event("engine.shutdown.request", [
-          ("reason", reason),
-          ("state", String(describing: _state)),
-          ("action", "skip_not_starting"),
-        ])
-        return false
-      }
-      stopLocked(reason: reason)
-      return true
     }
   }
 
@@ -388,6 +392,13 @@ public final class PieEngineHost: @unchecked Sendable {
   /// fix in the relaunch task (R1). Owned by `stateQueue`.
   private var healthyUptimeIncarnation: Int = 0
 
+  /// Host-owned launch timeout. This is the process-lifetime lease for a
+  /// not-yet-running engine; XPC reply fallbacks must never call `stop()`.
+  /// Owned by `stateQueue` and guarded by `launchIncarnation` so a stale timer
+  /// can only cancel the same still-starting launch it was armed for.
+  private var launchTimeoutTask: Task<Void, Never>?
+  private var launchIncarnation: UInt64 = 0
+
   private func setState(_ next: State) { _state = next }
 
   private func publish(_ status: EngineStatus) {
@@ -406,12 +417,63 @@ public final class PieEngineHost: @unchecked Sendable {
     autoRelaunchTask?.cancel()
     autoRelaunchTask = nil
     let profileID = spec.profileID
+    launchIncarnation &+= 1
+    let launchID = launchIncarnation
     let task = Task { [weak self] in
       guard let self else { return }
       await self.runLaunch(spec: spec)
     }
-    setState(.starting(profileID: profileID, launchTask: task))
+    setState(.starting(profileID: profileID, launchID: launchID, launchTask: task))
+    armLaunchTimeout(profileID: profileID, launchID: launchID, timeout: spec.handshakeTimeout + launchTimeoutSlack)
     return .success(())
+  }
+
+  private func armLaunchTimeout(profileID: String,
+                                launchID: UInt64,
+                                timeout: TimeInterval) {
+    launchTimeoutTask?.cancel()
+    launchTimeoutTask = Task { [weak self, timeout, launchID, profileID] in
+      let nanos = UInt64(max(0, timeout) * 1_000_000_000)
+      try? await Task.sleep(nanoseconds: nanos)
+      if Task.isCancelled { return }
+      guard let self else { return }
+      self.stateQueue.async { [weak self] in
+        guard let self else { return }
+        guard case .starting(let currentProfileID, let currentLaunchID, let currentTask) = self._state else {
+          DiagnosticLog.helper.event("engine.launch_timeout", [
+            ("profile", profileID),
+            ("launch_id", String(launchID)),
+            ("state", String(describing: self._state)),
+            ("action", "stale_noop_not_starting"),
+          ])
+          return
+        }
+        guard currentLaunchID == launchID else {
+          DiagnosticLog.helper.event("engine.launch_timeout", [
+            ("profile", profileID),
+            ("launch_id", String(launchID)),
+            ("current_launch_id", String(currentLaunchID)),
+            ("state", String(describing: self._state)),
+            ("action", "stale_noop_new_launch"),
+          ])
+          return
+        }
+        DiagnosticLog.helper.event("engine.shutdown.request", [
+          ("reason", "engine.launchTimeout"),
+          ("profile", currentProfileID),
+          ("launch_id", String(currentLaunchID)),
+          ("state", "starting"),
+          ("action", "cancel_starting"),
+          ("timeout", String(format: "%.1f", timeout)),
+        ])
+        self.launchTimeoutTask = nil
+        currentTask.cancel()
+        self.setState(.failed(
+          .handshakeTimeout,
+          "engine launch timed out after \(String(format: "%.1f", timeout))s while starting profile \(currentProfileID)"
+        ))
+      }
+    }
   }
 
   /// Body of the launch task. Lives outside `doStart` so it can hop
@@ -423,6 +485,8 @@ public final class PieEngineHost: @unchecked Sendable {
         guard let self else { return }
         switch self._state {
         case .starting:
+          self.launchTimeoutTask?.cancel()
+          self.launchTimeoutTask = nil
           self.setState(.running(port: port, profileID: spec.profileID, session: session))
           self.startLivenessMonitor(session: session)
           self.armHealthyUptimeTimer()
@@ -458,6 +522,8 @@ public final class PieEngineHost: @unchecked Sendable {
         guard let self else { return }
         switch self._state {
         case .starting, .stopping:
+          self.launchTimeoutTask?.cancel()
+          self.launchTimeoutTask = nil
           self.setState(.stopped)
         default:
           // Review v1 F3: the success arm logs + shuts the session
@@ -477,8 +543,12 @@ public final class PieEngineHost: @unchecked Sendable {
         // the cancellation winner already published .stopped.
         switch self._state {
         case .starting:
+          self.launchTimeoutTask?.cancel()
+          self.launchTimeoutTask = nil
           self.setState(.failed(.spawnFailed, msg))
         case .stopping:
+          self.launchTimeoutTask?.cancel()
+          self.launchTimeoutTask = nil
           self.setState(.stopped)
         default:
           // Review v1 F3: mirror the success-default's diagnostic.
@@ -547,7 +617,7 @@ public final class PieEngineHost: @unchecked Sendable {
         ("code", code.rawValue),
       ])
       return
-    case .starting(_, let launchTask):
+    case .starting(_, _, let launchTask):
       // Cancel the launch task. PieControlLauncher.launch propagates
       // `CancellationError` on the next await point; its catch paths
       // shut the (possibly-spawned) session down. The launch task's
@@ -559,6 +629,8 @@ public final class PieEngineHost: @unchecked Sendable {
         ("action", "cancel_starting"),
       ])
       launchTask.cancel()
+      launchTimeoutTask?.cancel()
+      launchTimeoutTask = nil
       healthyUptimeTask?.cancel()
       healthyUptimeTask = nil
       setState(.stopping(session: nil))

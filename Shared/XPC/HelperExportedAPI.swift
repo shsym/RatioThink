@@ -353,14 +353,11 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     let deadline: TimeInterval = Self.startReplyDeadline
     #endif
     DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + deadline) { [weak engineHost] in
-      // Review v1 F1: when the host is still `.starting`, cancel the in-flight
-      // launch BEFORE firing the failure reply. Without this the host stays in
-      // `.starting`; a slow `pie serve` boot then publishes `.running` after
-      // the client already received `.handshakeTimeout`, and a subsequent
-      // `startEngine` is rejected with `.alreadyRunning` against an orphan
-      // engine the client never saw acknowledged. Critically, this fallback is
-      // NOT a general `stop()` path: if the observer already acknowledged
-      // `.running`, the timer must not kill that healthy engine.
+      // The XPC reply timeout is NOT an engine lifetime lease. It exists only
+      // to complete this selector's reply block if the observer path wedges or
+      // loses a race. Process cleanup for a stuck launch belongs to
+      // PieEngineHost's attempt-scoped launch timeout; calling `stop()` here
+      // can kill a healthy `.running` engine after an earlier success reply.
       guard let engineHost else {
         fireOnce(.failure(EngineError(
           code: .handshakeTimeout,
@@ -368,22 +365,19 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
         )))
         return
       }
-      if engineHost.stopIfStarting(reason: "xpc.startEngine.replyTimeoutFallback") {
-        fireOnce(.failure(EngineError(
-          code: .handshakeTimeout,
-          message: "startEngine reply-timeout fallback fired after \(deadline)s (host never transitioned out of .starting)"
-        )))
-        return
-      }
-      // The fallback deadline can race an already-successful observer callback.
-      // If the host is no longer `.starting`, do NOT call `stop(reason:)`:
-      // stopping `.running` here kills a healthy engine after the XPC request
-      // already received (or is about to receive) its success reply. Instead,
-      // synthesize the same terminal reply the observer would emit; `fireOnce`
-      // is still the single reply gate, so an already-acknowledged request is a
-      // no-op and an unacknowledged terminal state is completed safely.
       if let result = Self.startEngineTerminalResult(for: engineHost.status, requestedProfileID: spec.profileID) {
         fireOnce(result)
+      } else {
+        DiagnosticLog.helper.event("xpc.startEngine.reply_timeout", [
+          ("profile", spec.profileID),
+          ("state", String(describing: engineHost.status)),
+          ("action", "reply_only_no_lifetime_stop"),
+          ("deadline", String(format: "%.1f", deadline)),
+        ])
+        fireOnce(.failure(EngineError(
+          code: .handshakeTimeout,
+          message: "startEngine reply-timeout fallback fired after \(deadline)s (host still starting; launch cleanup is host-owned)"
+        )))
       }
     }
   }

@@ -19,7 +19,8 @@ final class PieEngineHostTests: XCTestCase {
     func shutdown() async { lock.lock(); _count += 1; lock.unlock() }
   }
 
-  private func makeSpec(profileID: String = "chat") -> PieControlLauncher.LaunchSpec {
+  private func makeSpec(profileID: String = "chat",
+                        handshakeTimeout: TimeInterval = 30) -> PieControlLauncher.LaunchSpec {
     let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
     return try! PieControlLauncher.LaunchSpec(
       pieBinary: tmp.appendingPathComponent("ignored-pie"),
@@ -28,6 +29,7 @@ final class PieEngineHostTests: XCTestCase {
       subprocessEnvironment: [:],
       pieHome: tmp.appendingPathComponent("home"),
       shmemName: "/pie_test_\(UUID().uuidString.prefix(8))",
+      handshakeTimeout: handshakeTimeout,
       profileID: profileID,
       modelConfig: .dummy
     )
@@ -75,9 +77,9 @@ final class PieEngineHostTests: XCTestCase {
     token.cancel()
   }
 
-  // MARK: - double-start rejected
+  // MARK: - repeated start semantics
 
-  func test_double_start_returns_alreadyRunning() {
+  func test_double_start_different_profile_returns_alreadyRunning() {
     let host = PieEngineHost(launcher: { _ in
       // Hold past the second start so the host stays in .starting.
       try await Task.sleep(nanoseconds: 200_000_000)
@@ -91,6 +93,111 @@ final class PieEngineHostTests: XCTestCase {
       return XCTFail("second start must be rejected while first is .starting")
     }
     XCTAssertEqual(err.code, .alreadyRunning)
+    host.stop()
+  }
+
+  func test_start_same_profile_while_starting_is_idempotent_and_does_not_launch_again() {
+    let launchCount = OSAllocatedUnfairLock<Int>(initialState: 0)
+    let host = PieEngineHost(launcher: { _ in
+      launchCount.withLock { $0 += 1 }
+      try await Task.sleep(nanoseconds: 200_000_000)
+      return (port: EnginePort(1234), session: FakeSession())
+    })
+    let spec = makeSpec(profileID: "chat")
+    XCTAssertNoThrow(try host.start(spec).get())
+    XCTAssertNoThrow(try host.start(spec).get())
+
+    let exp = expectation(description: "host reaches running from the single launch")
+    let token = host.observe { status, _ in
+      if case .running(let port, let profileID) = status {
+        XCTAssertEqual(port, 1234)
+        XCTAssertEqual(profileID, "chat")
+        exp.fulfill()
+      }
+    }
+    wait(for: [exp], timeout: 2)
+    token.cancel()
+    XCTAssertEqual(launchCount.withLock { $0 }, 1,
+                   "idempotent start(same profile) must attach to the in-flight launch, not spawn another engine")
+    host.stop()
+  }
+
+  func test_start_same_profile_while_running_is_idempotent_and_does_not_restart() {
+    let launchCount = OSAllocatedUnfairLock<Int>(initialState: 0)
+    let session = FakeSession()
+    let host = PieEngineHost(launcher: { _ in
+      launchCount.withLock { $0 += 1 }
+      return (port: EnginePort(5678), session: session)
+    })
+    let spec = makeSpec(profileID: "tree-of-thought")
+    XCTAssertNoThrow(try host.start(spec).get())
+    let exp = expectation(description: "host reaches running")
+    let token = host.observe { status, _ in
+      if case .running = status { exp.fulfill() }
+    }
+    wait(for: [exp], timeout: 2)
+    token.cancel()
+
+    XCTAssertNoThrow(try host.start(spec).get())
+    XCTAssertEqual(launchCount.withLock { $0 }, 1,
+                   "idempotent start(same profile) while running must not restart the engine")
+    XCTAssertEqual(session.shutdownCount, 0,
+                   "idempotent start(same profile) while running must not shut down the active engine")
+    host.stop()
+  }
+
+  func test_launch_timeout_is_owned_by_host_and_cancels_only_still_starting_attempt() {
+    let host = PieEngineHost(
+      launcher: { _ in
+        while !Task.isCancelled {
+          try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        throw CancellationError()
+      },
+      launchTimeoutSlack: 0
+    )
+    let exp = expectation(description: "host launch timeout fails with handshakeTimeout")
+    let token = host.observe { status, _ in
+      if case .failed(.handshakeTimeout, let message) = status {
+        XCTAssertTrue(message.contains("launch timed out"), "got \(message)")
+        exp.fulfill()
+      }
+    }
+    XCTAssertNoThrow(try host.start(makeSpec(handshakeTimeout: 0.2)).get())
+    wait(for: [exp], timeout: 2)
+    token.cancel()
+    guard case .failed(.handshakeTimeout, _) = host.status else {
+      return XCTFail("expected host-owned launch timeout failure; got \(host.status)")
+    }
+  }
+
+  func test_stale_launch_timeout_after_running_is_inert() {
+    let session = FakeSession()
+    let host = PieEngineHost(
+      launcher: { _ in (port: EnginePort(9012), session: session) },
+      launchTimeoutSlack: 0
+    )
+    XCTAssertNoThrow(try host.start(makeSpec(profileID: "tree-of-thought", handshakeTimeout: 0.2)).get())
+    let running = expectation(description: "host reaches running")
+    let token = host.observe { status, _ in
+      if case .running = status { running.fulfill() }
+    }
+    wait(for: [running], timeout: 2)
+
+    let timeoutWouldHaveExpired = expectation(description: "launch timeout deadline passed")
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.35) {
+      timeoutWouldHaveExpired.fulfill()
+    }
+    wait(for: [timeoutWouldHaveExpired], timeout: 2)
+    token.cancel()
+
+    guard case .running(let port, let profileID) = host.status else {
+      return XCTFail("stale launch timeout must not change a running host; status=\(host.status)")
+    }
+    XCTAssertEqual(port, 9012)
+    XCTAssertEqual(profileID, "tree-of-thought")
+    XCTAssertEqual(session.shutdownCount, 0,
+                   "stale launch timeout must not shut down a running engine")
     host.stop()
   }
 
