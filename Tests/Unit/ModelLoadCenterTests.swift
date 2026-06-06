@@ -550,7 +550,7 @@ final class ModelLoadCenterTests: XCTestCase {
     center.reconcileEngineResident("default")
 
     XCTAssertEqual(center.residentModelID, "default",
-                   "a model the engine already has resident (e.g. Helper auto-resume) must surface so sends aren't blocked")
+                   "a model the engine already has resident after explicit start or crash recovery must surface so sends aren't blocked")
   }
 
   func test_reconcileEngineResident_is_noop_during_inflight_load() {

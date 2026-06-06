@@ -26,7 +26,7 @@ public enum ChatStartGate {
   /// affordance (no conflicting Load/Choose buttons that would
   /// double-trigger) rather than an actionable error.
   public enum BusyPhase: Equatable, Sendable {
-    /// Engine is `.starting` — boot auto-resume or an explicit Resume is
+    /// Engine is `.starting` — an explicit start request or crash auto-relaunch is
     /// bringing the engine (and, for v1's load-at-boot pie, its model) up.
     case startingEngine
     /// Engine is `.stopping` — transient; resolves to `.stopped` shortly.
@@ -112,9 +112,10 @@ public enum ChatStartGate {
     case .stopping:
       return .busy(.stoppingEngine)
     case .starting:
-      // Engine coming up (boot auto-resume / Resume). v1 pie loads the
-      // model at `pie serve` boot, so "starting" already implies the
-      // default is on its way — wait, don't offer a redundant Load.
+      // Engine coming up via launch prompt/user-confirm, explicit Restart,
+      // Local API, post-download startEngine, or crash auto-relaunch. v1 pie
+      // loads the model at `pie serve` boot, so "starting" already implies
+      // the default is on its way — wait, don't offer a redundant Load.
       return .busy(.startingEngine)
     case .running:
       return runningState(load: load, profileDefault: profileDefault, profileError: profileError)

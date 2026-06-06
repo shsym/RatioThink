@@ -375,10 +375,11 @@ struct ChatScaffoldView: View {
     .onDisappear {
       sendController.cancel()
     }
-    // Reflect a model the engine already has resident (e.g. the Helper
-    // auto-resumed the active profile at boot) so the composer doesn't
-    // block every send behind the no-model prompt despite a ready engine
-    // ( follow-up). Re-runs whenever the engine status flips.
+    // Reflect a model the engine already has resident (e.g. after the launch
+    // prompt/user-confirm path, explicit Restart, Local API start,
+    // post-download startEngine, or crash auto-relaunch) so the composer
+    // doesn't block every send behind the no-model prompt despite a ready
+    // engine ( follow-up). Re-runs whenever the engine status flips.
     .task(id: engineStatusStore.status) {
       await reconcileEngineResidentModel()
     }
