@@ -19,6 +19,67 @@ final class PieEngineHostTests: XCTestCase {
     func shutdown() async { lock.lock(); _count += 1; lock.unlock() }
   }
 
+  final class LaunchGate: @unchecked Sendable {
+    typealias LaunchResult = (port: EnginePort, session: any PieEngineHost.EngineSession)
+
+    private let lock = NSLock()
+    private var continuations: [CheckedContinuation<LaunchResult, Error>] = []
+    let started: [XCTestExpectation]
+
+    init(started: [XCTestExpectation]) {
+      self.started = started
+    }
+
+    func launch(_ spec: PieControlLauncher.LaunchSpec) async throws -> LaunchResult {
+      try await withCheckedThrowingContinuation { continuation in
+        let index = lock.withLock { () -> Int in
+          continuations.append(continuation)
+          return continuations.count - 1
+        }
+        if index < started.count {
+          started[index].fulfill()
+        }
+      }
+    }
+
+    func succeed(_ index: Int, port: EnginePort, session: any PieEngineHost.EngineSession) {
+      let continuation = lock.withLock { continuations[index] }
+      continuation.resume(returning: (port: port, session: session))
+    }
+
+    func fail(_ index: Int, _ error: Error) {
+      let continuation = lock.withLock { continuations[index] }
+      continuation.resume(throwing: error)
+    }
+  }
+
+  final class SleepGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    let armed: [XCTestExpectation]
+
+    init(armed: [XCTestExpectation]) {
+      self.armed = armed
+    }
+
+    func sleep(_ seconds: TimeInterval) async {
+      await withCheckedContinuation { continuation in
+        let index = lock.withLock { () -> Int in
+          continuations.append(continuation)
+          return continuations.count - 1
+        }
+        if index < armed.count {
+          armed[index].fulfill()
+        }
+      }
+    }
+
+    func wake(_ index: Int) {
+      let continuation = lock.withLock { continuations[index] }
+      continuation.resume()
+    }
+  }
+
   private func makeSpec(profileID: String = "chat",
                         handshakeTimeout: TimeInterval = 30) -> PieControlLauncher.LaunchSpec {
     let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -198,6 +259,183 @@ final class PieEngineHostTests: XCTestCase {
     XCTAssertEqual(profileID, "tree-of-thought")
     XCTAssertEqual(session.shutdownCount, 0,
                    "stale launch timeout must not shut down a running engine")
+    host.stop()
+  }
+
+  func test_stale_launch_success_after_timeout_does_not_overwrite_retry() {
+    let firstStarted = expectation(description: "launch #1 started")
+    let secondStarted = expectation(description: "launch #2 started")
+    let firstTimeoutArmed = expectation(description: "launch #1 timeout armed")
+    let secondTimeoutArmed = expectation(description: "launch #2 timeout armed")
+    let launches = LaunchGate(started: [firstStarted, secondStarted])
+    let sleeps = SleepGate(armed: [firstTimeoutArmed, secondTimeoutArmed])
+    let firstSession = FakeSession()
+    let secondSession = FakeSession()
+    let host = PieEngineHost(
+      launcher: { spec in try await launches.launch(spec) },
+      launchTimeoutSlack: 0,
+      sleepFor: { seconds in await sleeps.sleep(seconds) }
+    )
+
+    XCTAssertNoThrow(try host.start(makeSpec(profileID: "chat", handshakeTimeout: 0.2)).get())
+    wait(for: [firstStarted, firstTimeoutArmed], timeout: 2)
+
+    let timedOut = expectation(description: "launch #1 times out")
+    var sawTimeout = false
+    let timeoutToken = host.observe { status, token in
+      if case .failed(.handshakeTimeout, _) = status, !sawTimeout {
+        sawTimeout = true
+        timedOut.fulfill()
+        token.cancel()
+      }
+    }
+    sleeps.wake(0)
+    wait(for: [timedOut], timeout: 2)
+    timeoutToken.cancel()
+
+    XCTAssertNoThrow(try host.start(makeSpec(profileID: "tree-of-thought", handshakeTimeout: 0.2)).get())
+    wait(for: [secondStarted, secondTimeoutArmed], timeout: 2)
+
+    let running = expectation(description: "launch #2 owns running state")
+    let runningToken = host.observe { status, token in
+      if case .running(let port, let profileID) = status,
+         port == 2002, profileID == "tree-of-thought" {
+        running.fulfill()
+        token.cancel()
+      }
+    }
+    launches.succeed(0, port: EnginePort(1001), session: firstSession)
+    launches.succeed(1, port: EnginePort(2002), session: secondSession)
+    wait(for: [running], timeout: 2)
+    runningToken.cancel()
+
+    guard case .running(let port, let profileID) = host.status else {
+      return XCTFail("retry launch must remain running; status=\(host.status)")
+    }
+    XCTAssertEqual(port, 2002)
+    XCTAssertEqual(profileID, "tree-of-thought")
+    XCTAssertEqual(firstSession.shutdownCount, 1,
+                   "stale successful launch must shut down only its own returned session")
+    XCTAssertEqual(secondSession.shutdownCount, 0,
+                   "current retry session must remain owned by the host")
+    host.stop()
+  }
+
+  func test_stale_launch_cancellation_after_timeout_does_not_stop_retry() {
+    let firstStarted = expectation(description: "launch #1 started")
+    let secondStarted = expectation(description: "launch #2 started")
+    let firstTimeoutArmed = expectation(description: "launch #1 timeout armed")
+    let secondTimeoutArmed = expectation(description: "launch #2 timeout armed")
+    let launches = LaunchGate(started: [firstStarted, secondStarted])
+    let sleeps = SleepGate(armed: [firstTimeoutArmed, secondTimeoutArmed])
+    let secondSession = FakeSession()
+    let host = PieEngineHost(
+      launcher: { spec in try await launches.launch(spec) },
+      launchTimeoutSlack: 0,
+      sleepFor: { seconds in await sleeps.sleep(seconds) }
+    )
+
+    XCTAssertNoThrow(try host.start(makeSpec(profileID: "chat", handshakeTimeout: 0.2)).get())
+    wait(for: [firstStarted, firstTimeoutArmed], timeout: 2)
+    let timedOut = expectation(description: "launch #1 times out")
+    var sawTimeout = false
+    let timeoutToken = host.observe { status, token in
+      if case .failed(.handshakeTimeout, _) = status, !sawTimeout {
+        sawTimeout = true
+        timedOut.fulfill()
+        token.cancel()
+      }
+    }
+    sleeps.wake(0)
+    wait(for: [timedOut], timeout: 2)
+    timeoutToken.cancel()
+
+    XCTAssertNoThrow(try host.start(makeSpec(profileID: "tree-of-thought", handshakeTimeout: 0.2)).get())
+    wait(for: [secondStarted, secondTimeoutArmed], timeout: 2)
+
+    launches.fail(0, CancellationError())
+    let staleCancellationSettled = expectation(description: "stale cancellation processed")
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+      staleCancellationSettled.fulfill()
+    }
+    wait(for: [staleCancellationSettled], timeout: 1)
+    guard case .starting = host.status else {
+      return XCTFail("stale launch #1 cancellation must leave launch #2 starting; status=\(host.status)")
+    }
+    let running = expectation(description: "launch #2 owns running state")
+    let runningToken = host.observe { status, token in
+      if case .running(let port, let profileID) = status,
+         port == 2002, profileID == "tree-of-thought" {
+        running.fulfill()
+        token.cancel()
+      }
+    }
+    launches.succeed(1, port: EnginePort(2002), session: secondSession)
+    wait(for: [running], timeout: 2)
+    runningToken.cancel()
+
+    XCTAssertEqual(host.status, .running(port: 2002, profileID: "tree-of-thought"))
+    XCTAssertEqual(secondSession.shutdownCount, 0)
+    host.stop()
+  }
+
+  func test_stale_launch_error_after_timeout_does_not_fail_retry() {
+    struct Boom: Error, CustomStringConvertible { var description: String { "late launch #1 boom" } }
+
+    let firstStarted = expectation(description: "launch #1 started")
+    let secondStarted = expectation(description: "launch #2 started")
+    let firstTimeoutArmed = expectation(description: "launch #1 timeout armed")
+    let secondTimeoutArmed = expectation(description: "launch #2 timeout armed")
+    let launches = LaunchGate(started: [firstStarted, secondStarted])
+    let sleeps = SleepGate(armed: [firstTimeoutArmed, secondTimeoutArmed])
+    let secondSession = FakeSession()
+    let host = PieEngineHost(
+      launcher: { spec in try await launches.launch(spec) },
+      launchTimeoutSlack: 0,
+      sleepFor: { seconds in await sleeps.sleep(seconds) }
+    )
+
+    XCTAssertNoThrow(try host.start(makeSpec(profileID: "chat", handshakeTimeout: 0.2)).get())
+    wait(for: [firstStarted, firstTimeoutArmed], timeout: 2)
+    let timedOut = expectation(description: "launch #1 times out")
+    var sawTimeout = false
+    let timeoutToken = host.observe { status, token in
+      if case .failed(.handshakeTimeout, _) = status, !sawTimeout {
+        sawTimeout = true
+        timedOut.fulfill()
+        token.cancel()
+      }
+    }
+    sleeps.wake(0)
+    wait(for: [timedOut], timeout: 2)
+    timeoutToken.cancel()
+
+    XCTAssertNoThrow(try host.start(makeSpec(profileID: "tree-of-thought", handshakeTimeout: 0.2)).get())
+    wait(for: [secondStarted, secondTimeoutArmed], timeout: 2)
+
+    launches.fail(0, Boom())
+    let staleErrorSettled = expectation(description: "stale error processed")
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+      staleErrorSettled.fulfill()
+    }
+    wait(for: [staleErrorSettled], timeout: 1)
+    guard case .starting = host.status else {
+      return XCTFail("stale launch #1 error must leave launch #2 starting; status=\(host.status)")
+    }
+    let running = expectation(description: "launch #2 owns running state")
+    let runningToken = host.observe { status, token in
+      if case .running(let port, let profileID) = status,
+         port == 2002, profileID == "tree-of-thought" {
+        running.fulfill()
+        token.cancel()
+      }
+    }
+    launches.succeed(1, port: EnginePort(2002), session: secondSession)
+    wait(for: [running], timeout: 2)
+    runningToken.cancel()
+
+    XCTAssertEqual(host.status, .running(port: 2002, profileID: "tree-of-thought"))
+    XCTAssertEqual(secondSession.shutdownCount, 0)
     host.stop()
   }
 

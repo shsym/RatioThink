@@ -279,7 +279,11 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
 
   /// Spawns the engine for `profileID` via `PieEngineHost`. Returns
   /// `.profileMissing` when the resolver is unwired and
-  /// `.alreadyRunning` when a host is already starting / running.
+  /// `.alreadyRunning` for incompatible starts (for example, a different
+  /// profile is already starting / running, or the host is stopping).
+  /// Same-profile requests while the host is already `.starting` /
+  /// `.running` attach to the existing launch/session instead; once the
+  /// host reaches `.running`, this selector returns that session's port.
   ///
   /// Success path waits for the host to transition out of
   /// `.starting`: on `.running(port, _)` the port is encoded and

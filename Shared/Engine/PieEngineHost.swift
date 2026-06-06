@@ -455,7 +455,7 @@ public final class PieEngineHost: @unchecked Sendable {
     let launchID = launchIncarnation
     let task = Task { [weak self] in
       guard let self else { return }
-      await self.runLaunch(spec: spec)
+      await self.runLaunch(spec: spec, launchID: launchID)
     }
     setState(.starting(profileID: profileID, launchID: launchID, launchTask: task))
     armLaunchTimeout(profileID: profileID, launchID: launchID, timeout: spec.handshakeTimeout + launchTimeoutSlack)
@@ -512,13 +512,14 @@ public final class PieEngineHost: @unchecked Sendable {
 
   /// Body of the launch task. Lives outside `doStart` so it can hop
   /// back onto `stateQueue` for every transition.
-  private func runLaunch(spec: LaunchSpec) async {
+  private func runLaunch(spec: LaunchSpec, launchID: UInt64) async {
     do {
       let (port, session) = try await launcher(spec)
       stateQueue.async { [weak self] in
         guard let self else { return }
         switch self._state {
-        case .starting:
+        case .starting(let currentProfileID, let currentLaunchID, _)
+          where currentProfileID == spec.profileID && currentLaunchID == launchID:
           self.launchTimeoutTask?.cancel()
           self.launchTimeoutTask = nil
           self.setState(.running(port: port, profileID: spec.profileID, session: session))
@@ -543,9 +544,12 @@ public final class PieEngineHost: @unchecked Sendable {
             }
           }
         default:
-          // Unexpected state (.stopped / .failed / .running) — discard.
-          Log.engine.error("PieEngineHost: launch completed in unexpected state \(String(describing: self._state), privacy: .public); shutting session down")
-          Task { [session] in await session.shutdown(reason: "host.launch_completed_unexpected_state") }
+          // Stale completion from an older launch incarnation (or an
+          // otherwise unexpected state) must not publish `.running` over a
+          // newer `.starting` retry. Discard only the session this launch
+          // returned.
+          Log.engine.error("PieEngineHost: launch completed in unexpected/stale state \(String(describing: self._state), privacy: .public) launchID=\(launchID, privacy: .public); shutting session down")
+          Task { [session] in await session.shutdown(reason: "host.launch_completed_stale_or_unexpected_state") }
         }
       }
     } catch is CancellationError {
@@ -555,7 +559,12 @@ public final class PieEngineHost: @unchecked Sendable {
       stateQueue.async { [weak self] in
         guard let self else { return }
         switch self._state {
-        case .starting, .stopping:
+        case .starting(let currentProfileID, let currentLaunchID, _)
+          where currentProfileID == spec.profileID && currentLaunchID == launchID:
+          self.launchTimeoutTask?.cancel()
+          self.launchTimeoutTask = nil
+          self.setState(.stopped)
+        case .stopping:
           self.launchTimeoutTask?.cancel()
           self.launchTimeoutTask = nil
           self.setState(.stopped)
@@ -564,7 +573,7 @@ public final class PieEngineHost: @unchecked Sendable {
           // down in this terminal-state branch; mirror the diagnostic
           // here so a future refactor that lets `.starting` be left
           // by some other path doesn't silently swallow the cancel.
-          Log.engine.fault("PieEngineHost: launch cancelled in unexpected state \(String(describing: self._state), privacy: .public); dropping")
+          Log.engine.fault("PieEngineHost: launch cancelled in unexpected/stale state \(String(describing: self._state), privacy: .public) launchID=\(launchID, privacy: .public); dropping")
           return
         }
       }
@@ -576,7 +585,8 @@ public final class PieEngineHost: @unchecked Sendable {
         // Don't clobber a user-initiated stop with a launch error —
         // the cancellation winner already published .stopped.
         switch self._state {
-        case .starting:
+        case .starting(let currentProfileID, let currentLaunchID, _)
+          where currentProfileID == spec.profileID && currentLaunchID == launchID:
           self.launchTimeoutTask?.cancel()
           self.launchTimeoutTask = nil
           self.setState(.failed(.spawnFailed, msg))
@@ -586,7 +596,7 @@ public final class PieEngineHost: @unchecked Sendable {
           self.setState(.stopped)
         default:
           // Review v1 F3: mirror the success-default's diagnostic.
-          Log.engine.fault("PieEngineHost: launch error in unexpected state \(String(describing: self._state), privacy: .public): \(msg, privacy: .public); dropping")
+          Log.engine.fault("PieEngineHost: launch error in unexpected/stale state \(String(describing: self._state), privacy: .public) launchID=\(launchID, privacy: .public): \(msg, privacy: .public); dropping")
           return
         }
       }

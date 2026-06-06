@@ -298,14 +298,6 @@ public final class EngineStatusStore: ObservableObject {
         return
       }
       throw error
-    } catch let error as EngineError where error.code == .alreadyRunning {
-      // A concurrent start found the engine already starting/running.
-      // For a "kick the start" caller that IS the desired end state —
-      // #326's no-model prompt and failed(modelMissing) banner can both
-      // fire startEngine on the same completed download, and the loser
-      // must not surface a user-facing error. Idempotent no-op.
-      Self.log.notice("startEngine(profileID=\(profileID, privacy: .public)) → alreadyRunning; engine already coming up (idempotent)")
-      return
     }
   }
 

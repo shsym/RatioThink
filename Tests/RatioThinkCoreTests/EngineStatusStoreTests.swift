@@ -136,18 +136,45 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(client.startCalls, 1)
   }
 
-  /// A concurrent start finds the engine already starting/running and is
-  /// rejected `.alreadyRunning`. For a "kick the start" caller that is
-  /// the desired end state — #326's two recovery surfaces can both fire
-  /// `startEngine` on the same completed download, and the second must
-  /// NOT surface a user-facing error. Idempotent: swallow it.
-  func test_startEngine_swallows_alreadyRunning_as_idempotent() async throws {
+  /// Same-profile idempotent attach is owned by the helper's
+  /// `startOrAttach` boundary. If `.alreadyRunning` reaches the app, it is
+  /// an incompatible start (different profile, stopping, etc.) and must
+  /// surface to the caller instead of pretending the requested profile
+  /// started.
+  func test_startEngine_propagates_alreadyRunning_conflict() async {
     let client = StubXPCClient()
     client.setStartResult(.failure(
       EngineError(code: .alreadyRunning, message: "engine already starting")))
     let store = EngineStatusStore(client: client)
-    try await store.startEngine(profileID: "chat")  // must NOT throw
+    do {
+      try await store.startEngine(profileID: "chat")
+      XCTFail("alreadyRunning from helper startEngine must surface as an incompatible start")
+    } catch let e as EngineError {
+      XCTAssertEqual(e.code, .alreadyRunning)
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
     XCTAssertEqual(client.startCalls, 1)
+  }
+
+  func test_startEngine_propagates_alreadyRunning_when_current_status_is_different_profile() async {
+    let client = StubXPCClient()
+    client.setStartResult(.failure(
+      EngineError(code: .alreadyRunning, message: "tree-of-thought already running")))
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(port: 8123, profileID: "tree-of-thought")
+    )
+    do {
+      try await store.startEngine(profileID: "chat")
+      XCTFail("a different-profile alreadyRunning conflict must throw")
+    } catch let e as EngineError {
+      XCTAssertEqual(e.code, .alreadyRunning)
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(store.status, .running(port: 8123, profileID: "tree-of-thought"))
   }
 
   /// #422 F1: a resolver-stage start rejection re-throws AND does NOT move
