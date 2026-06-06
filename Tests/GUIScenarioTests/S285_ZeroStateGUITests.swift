@@ -1,7 +1,7 @@
 import XCTest
 
 /// S285 — UI soundness audit: empty/zero states stay top-aligned and the
-/// col-3 zero-state CTAs are live affordances (not dead buttons).
+/// shipping col-3 zero-state CTAs are live affordances (not dead buttons).
 ///
 /// Each test runs against an isolated `PIE_HOME` temp root so the on-disk
 /// `chats.sqlite` starts empty and creating a chat/endpoint here never
@@ -92,25 +92,25 @@ final class S285_ZeroStateGUITests: XCTestCase {
                   "zero-state CTAs must dismiss once a chat is selected")
   }
 
-  /// The col-3 zero-state "Add Endpoint" CTA must create an endpoint and
-  /// open its detail (previously wired to an empty closure).
+  /// v0.1.1 hides the API Endpoints feature; the col-3 zero-state must
+  /// therefore expose only the shipping Start Chat CTA. Keep this aligned
+  /// with S5_AppWindowShellGUITests and the product code comments in
+  /// EmptyStateView/SidebarView so a stale endpoint expectation does not
+  /// block the chat-focused GUI gate.
   @MainActor
-  func test_add_endpoint_cta_opens_endpoint_detail() async throws {
+  func test_add_endpoint_cta_hidden_while_endpoint_feature_unshipped() async throws {
     let app = makeApp()
     app.launch()
     defer { app.terminate() }
     XCTAssert(app.wait(for: .runningForeground, timeout: 5))
     app.activate()
 
-    let addEndpoint = app.buttons["Add Endpoint"]
-    XCTAssertTrue(addEndpoint.waitForExistence(timeout: 5),
-                  "col-3 zero-state Add Endpoint CTA missing")
-    addEndpoint.click()
-
-    // The endpoint detail's name field only exists once an endpoint is open.
-    XCTAssertTrue(app.textFields["EndpointName"].waitForExistence(timeout: 5),
-                  "Add Endpoint must create + open an endpoint detail")
-    XCTAssertTrue(addEndpoint.waitForNonExistence(timeout: 5),
-                  "zero-state CTAs must dismiss once an endpoint is selected")
+    let startChat = app.buttons["Start Chat"]
+    XCTAssertTrue(startChat.waitForExistence(timeout: 5),
+                  "col-3 zero-state Start Chat CTA missing")
+    XCTAssertFalse(app.buttons["Add Endpoint"].waitForExistence(timeout: 2),
+                   "Add Endpoint CTA must stay hidden while API Endpoints are unshipped")
+    XCTAssertFalse(app.textFields["EndpointName"].exists,
+                   "endpoint detail must not be reachable from the hidden zero-state CTA")
   }
 }
