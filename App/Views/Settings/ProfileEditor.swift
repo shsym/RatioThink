@@ -12,6 +12,8 @@ struct ProfileEditor: View {
   /// hands back a refreshed `entry`. .
   var onModelChanged: () -> Void = {}
   @EnvironmentObject private var profileStore: ProfileStore
+  @EnvironmentObject private var downloads: ModelDownloadController
+  @EnvironmentObject private var engineStatusStore: EngineStatusStore
   @State private var showAdvanced: Bool = false
   /// Discovered model options (app-managed + HF cache), each carrying
   /// size + over-limit / unsupported state for the model-size guardrail.
@@ -50,6 +52,9 @@ struct ProfileEditor: View {
     }
     .accessibilityIdentifier("ProfileEditor")
     .task { await refreshModelOptions(current: entry.profile?.model ?? "") }
+    .onChange(of: downloads.completionTick) { _, _ in
+      Task { await refreshModelOptions(current: entry.profile?.model ?? "") }
+    }
   }
 
   // MARK: - Sections
@@ -251,8 +256,26 @@ struct ProfileEditor: View {
       try profileStore.setModel(model, forProfileID: profileID)
       modelWriteError = nil
       onModelChanged()
+      Task { await refreshModelOptions(current: model) }
+      restartActiveEngineIfNeeded(profileID: profileID)
     } catch {
       modelWriteError = "Could not set default model: \(error)"
+    }
+  }
+
+  /// If the edited profile is the active engine target, rebuild the
+  /// helper engine after the default-model write so pie's boot-time
+  /// model registry contains the newly selected model. Without this,
+  /// `/v1/models/load` keeps rejecting the fresh slug as
+  /// `model_not_found` until the user restarts the whole product.
+  private func restartActiveEngineIfNeeded(profileID: String) {
+    guard profileStore.activeProfileID == profileID else { return }
+    Task { @MainActor in
+      do {
+        try await engineStatusStore.restartEngine(profileID: profileID)
+      } catch {
+        modelWriteError = "Default saved, but couldn’t reload the engine: \(error)"
+      }
     }
   }
 

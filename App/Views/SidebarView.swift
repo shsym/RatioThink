@@ -7,11 +7,10 @@ struct SidebarView: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 4) {
       sidebarRow(.chats)
-      // v0.1.1: the API Endpoints (HTTP-serving) feature is not shipping yet —
-      // hide its nav entry. The `SidebarSection.apiEndpoints` case and the
-      // Endpoint views are left intact, so re-enabling is just restoring this
-      // one row. (The EmptyStateView "Add Endpoint" CTA — the only other nav
-      // path here — is hidden for the same reason.)
+      // #422: the API Endpoints section now mirrors the live engine HTTP
+      // endpoint (LocalAPIView). Selecting it collapses the item-list column
+      // and shows the single status view in the detail column.
+      sidebarRow(.apiEndpoints)
       Spacer()
     }
     .padding(.top, 8)

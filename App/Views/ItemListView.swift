@@ -1,8 +1,8 @@
 import SwiftUI
 
-/// Col 2 — items inside the selected sidebar section. v1 has no item model
-/// wired yet (lands in 3.3 chats / 4.x endpoints); placeholder rows here keep
-/// the column shape testable and let `View > Hide List` exercise the binding.
+/// Col 2 — items inside the selected sidebar section. Chats render a list;
+/// the API Endpoints section has no list (one engine endpoint — #422), so
+/// its column is collapsed in `RootView` and this returns nothing for it.
 struct ItemListView: View {
   let section: SidebarSection?
   @Binding var selectedItemID: UUID?
@@ -13,7 +13,8 @@ struct ItemListView: View {
       case .chats:
         ChatListView(selectedItemID: $selectedItemID)
       case .apiEndpoints:
-        EndpointListView(selectedItemID: $selectedItemID)
+        // No item list — the single `LocalAPIView` fills the detail column.
+        EmptyView()
       case .none:
         Text("Select a section")
           .foregroundStyle(.secondary)

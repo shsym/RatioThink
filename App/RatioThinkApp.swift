@@ -4,11 +4,15 @@ import ServiceManagement
 
 @main
 struct RatioThinkApp: App {
+  /// #448: window-close = background, ⌘Q / "Quit" / `ratiothink://quit` =
+  /// coordinated full quit. The delegate owns `applicationShouldTerminate`
+  /// (which SwiftUI's `App` does not expose) and
+  /// `applicationShouldTerminateAfterLastWindowClosed`.
+  @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
   /// One-shot guard so the launch-time Helper registration reconcile
   /// runs once even if a second window opens.
   @MainActor private static var didReconcileHelperRegistration = false
   @StateObject private var windowState = WindowState()
-  @StateObject private var endpointStore = EndpointStore()
   /// Phase 4: observable durability state for the chat
   /// store. Surfaces on-disk vs in-memory fallback and per-mutation
   /// save failures to a banner inside `RootView` so the user is
@@ -193,6 +197,10 @@ struct RatioThinkApp: App {
       helperHealthController?.health
     }
     _helperHealth = StateObject(wrappedValue: helperHealthController)
+
+    // #448: give the full-product quit coordinator the poll loop it must stop
+    // before tearing down, so no late on-demand poll respawns the Helper.
+    AppQuitCoordinator.shared.engineStatusStore = statusStore
 
     // Kick the XPC poll loop. Idempotent + cheap — first reply lands
     // within ~one runloop tick when the helper is registered, longer
@@ -382,7 +390,6 @@ struct RatioThinkApp: App {
         }
       }
         .environmentObject(windowState)
-        .environmentObject(endpointStore)
         .environmentObject(modelLoadCenter)
         .environmentObject(appPreferences)
         .environmentObject(profileStore)
@@ -451,7 +458,6 @@ struct RatioThinkApp: App {
 
     Settings {
       SettingsRoot()
-        .environmentObject(endpointStore)
         .environmentObject(modelLoadCenter)
         .environmentObject(appPreferences)
         .environmentObject(profileStore)
@@ -474,11 +480,13 @@ struct RatioThinkApp: App {
 /// only — compiled out of Release alongside the pin itself.
 private struct PinnedRunningXPCClient: AppXPCClient {
   let port: EnginePort
+  func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
   func engineStatus() async throws -> EngineStatus { .running(port: port, profileID: "chat") }
   func stopEngine() async throws {}
   // The pinned harness has no Helper to launch an engine; the engine is
   // already pinned `.running`, so a start is a no-op success (mirrors
   // `stopEngine`).
   func startEngine(profileID: String) async throws {}
+  func restartEngine(profileID: String) async throws {}
 }
 #endif

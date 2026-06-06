@@ -211,10 +211,12 @@ struct NoModelLoadedPrompt: View {
     }
     .padding(20)
     .frame(width: 360)
-    // Do not assign an accessibilityIdentifier to this container: on macOS
-    // SwiftUI propagates the container identifier down to descendant
-    // controls, masking their explicit ids (for example noModel.cancel).
-    // The action controls are the stable automation surface for this sheet.
+    // NOTE: do NOT put an `.accessibilityIdentifier` on this container — on
+    // current SwiftUI it propagates down and OVERRIDES the child controls'
+    // own identifiers (the Cancel/Load/Retry buttons and the embedded
+    // `MissingModelDownloadCTA`), so `noModel.cancel` / `missingModel.download`
+    // become unqueryable (they all reported `noModel.prompt`). The gate's
+    // controls carry their own identifiers; the container needs none.
   }
 
   private func header(_ plan: Plan) -> some View {

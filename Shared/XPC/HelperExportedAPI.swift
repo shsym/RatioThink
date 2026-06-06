@@ -123,6 +123,13 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// URLProtocol stub.
   let downloader: ModelDownloader
 
+  /// #448: invoked after `quitHelper` has stopped + reaped the engine, to
+  /// terminate the Helper process itself. Injected by `HelperMain` as
+  /// `{ NSApp.terminate(nil) }` so this RatioThinkCore type stays AppKit-free
+  /// and unit-testable; `nil` (the default for the stub/test inits) makes
+  /// `quitHelper` reply and then no-op the termination.
+  private let onQuitRequested: (@Sendable () -> Void)?
+
   #if DEBUG
   /// Test seam (review v2 F30, v3 F41, v5 F63). Replaces the
   /// default reply-timeout deadline computation
@@ -145,6 +152,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     self.engineHost = nil
     self.launchSpecResolver = nil
     self.downloader = ModelDownloader()
+    self.onQuitRequested = nil
     #if DEBUG
     self.replyTimeoutOverride = nil
     #endif
@@ -152,10 +160,12 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   }
 
   public init(engineHost: PieEngineHost? = nil,
-              launchSpecResolver: LaunchSpecResolver? = nil) {
+              launchSpecResolver: LaunchSpecResolver? = nil,
+              onQuitRequested: (@Sendable () -> Void)? = nil) {
     self.engineHost = engineHost
     self.launchSpecResolver = launchSpecResolver
     self.downloader = ModelDownloader()
+    self.onQuitRequested = onQuitRequested
     #if DEBUG
     self.replyTimeoutOverride = nil
     #endif
@@ -170,6 +180,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     self.engineHost = nil
     self.launchSpecResolver = nil
     self.downloader = downloader
+    self.onQuitRequested = nil
     #if DEBUG
     self.replyTimeoutOverride = nil
     #endif
@@ -184,16 +195,27 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// within the same Swift module.
   internal init(engineHost: PieEngineHost?,
                 launchSpecResolver: LaunchSpecResolver?,
-                replyTimeoutOverride: (start: TimeInterval, stop: TimeInterval)?) {
+                replyTimeoutOverride: (start: TimeInterval, stop: TimeInterval)?,
+                onQuitRequested: (@Sendable () -> Void)? = nil) {
     self.engineHost = engineHost
     self.launchSpecResolver = launchSpecResolver
     self.downloader = ModelDownloader()
+    self.onQuitRequested = onQuitRequested
     self.replyTimeoutOverride = replyTimeoutOverride
     super.init()
   }
   #endif
 
   // MARK: - engineStatus
+
+  public func helperProtocolVersion(reply: @escaping (Data) -> Void) {
+    do {
+      reply(try XPCPayload.encode(HelperProtocolCompatibility.currentVersion))
+    } catch {
+      Self.log.fault("helperProtocolVersion encode failed: \(String(describing: error), privacy: .public)")
+      reply(PieHelperXPCWire.fallbackReplyEncodeFailureData)
+    }
+  }
 
   /// Returns the live supervisor status when one is wired. Falls back
   /// to the pre-encoded `.stopped` blob when no supervisor exists,
@@ -263,7 +285,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// the XPC reply-timeout fallback (review v1 F4) fires. Covers
   /// the gap between deadline arrival on the host's state queue
   /// and the observer hopping over to reply.
-  private static let replyTimeoutSlack: TimeInterval = 2
+  static let replyTimeoutSlack: TimeInterval = 2
 
   /// PieControlLauncher's `handshakeTimeout` + WS install upper bound.
   /// `LaunchSpec.handshakeTimeout` defaults to 30s; the WS
@@ -275,7 +297,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
 
   /// `LaunchedSession.shutdown` budget: SIGINT(10s) → SIGKILL(5s) =
   /// 15s in the worst case. Add slack.
-  private static let stopReplyDeadline: TimeInterval = 17
+  static let stopReplyDeadline: TimeInterval = 17
 
   /// Spawns the engine for `profileID` via `PieEngineHost`. Returns
   /// `.profileMissing` when the resolver is unwired and
@@ -296,29 +318,151 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       reply(nil, Self.notImplementedErrorData)
       return
     }
+    guard let spec = resolveLaunchSpec(profileID: profileID,
+                                       engineHost: engineHost,
+                                       operation: "startEngine",
+                                       reply: reply) else {
+      return
+    }
+    let replied = OSAllocatedUnfairLock<Bool>(initialState: false)
+    func fireOnce(_ result: Result<EnginePort, EngineError>) {
+      let already = replied.withLock { (fired: inout Bool) -> Bool in
+        defer { fired = true }
+        return fired
+      }
+      if already { return }
+      PieHelperXPCWire.replyStartEngine(result, via: reply)
+    }
+    beginStart(engineHost: engineHost, spec: spec, fireOnce: fireOnce)
+  }
+
+  /// Strict stop→start rebuild used after the active profile's default
+  /// model changes. This selector is intentionally helper-side: the
+  /// helper has the only authoritative engine state, can wait for
+  /// terminal stop with the same deadline as `stopEngine`, and can then
+  /// start without reusing the App's generic idempotent start semantics.
+  public func restartEngine(profileID: String,
+                            reply: @escaping (Data?, Data?) -> Void) {
+    guard let engineHost else {
+      Self.log.error("restartEngine: no engineHost wired (early boot or unit test)")
+      reply(nil, Self.notImplementedErrorData)
+      return
+    }
+    guard let spec = resolveLaunchSpec(profileID: profileID,
+                                       engineHost: engineHost,
+                                       operation: "restartEngine",
+                                       reply: reply) else {
+      return
+    }
+    let replied = OSAllocatedUnfairLock<Bool>(initialState: false)
+    func fireOnce(_ result: Result<EnginePort, EngineError>) {
+      let already = replied.withLock { (fired: inout Bool) -> Bool in
+        defer { fired = true }
+        return fired
+      }
+      if already { return }
+      PieHelperXPCWire.replyStartEngine(result, via: reply)
+    }
+    let advancedToStart = OSAllocatedUnfairLock<Bool>(initialState: false)
+    let stopTokenBox = OSAllocatedUnfairLock<PieEngineHost.ObservationToken?>(initialState: nil)
+    func cancelStopObserver() {
+      stopTokenBox.withLock { (box: inout PieEngineHost.ObservationToken?) in
+        box?.cancel()
+        box = nil
+      }
+    }
+    func startAfterTerminalStopOnce() {
+      let already = advancedToStart.withLock { (advanced: inout Bool) -> Bool in
+        defer { advanced = true }
+        return advanced
+      }
+      cancelStopObserver()
+      guard !already else { return }
+      DispatchQueue.global(qos: .userInitiated).async { [weak self, weak engineHost] in
+        guard let self, let engineHost else { return }
+        self.beginStart(engineHost: engineHost, spec: spec, fireOnce: fireOnce)
+      }
+    }
+    func failBeforeStartOnce(_ error: EngineError) {
+      let already = advancedToStart.withLock { (advanced: inout Bool) -> Bool in
+        defer { advanced = true }
+        return advanced
+      }
+      cancelStopObserver()
+      guard !already else { return }
+      fireOnce(.failure(error))
+    }
+
+    switch engineHost.status {
+    case .stopped, .failed:
+      startAfterTerminalStopOnce()
+      return
+    case .starting, .running, .stopping:
+      break
+    }
+
+    let token = engineHost.observe { status, _ in
+      switch status {
+      case .stopped:
+        startAfterTerminalStopOnce()
+      case .failed(let code, let message):
+        failBeforeStartOnce(EngineError(code: code, message: message))
+      case .starting, .running, .stopping:
+        return
+      }
+    }
+    stopTokenBox.withLock { $0 = token }
+    if advancedToStart.withLock({ $0 }) { cancelStopObserver() }
+    engineHost.stop()
+    #if DEBUG
+    let deadline: TimeInterval = replyTimeoutOverride?.stop
+      ?? Self.stopReplyDeadline
+    #else
+    let deadline: TimeInterval = Self.stopReplyDeadline
+    #endif
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + deadline) {
+      failBeforeStartOnce(EngineError(
+        code: .handshakeTimeout,
+        message: "restartEngine stop phase fallback fired after \(deadline)s (host never reached terminal)"
+      ))
+    }
+  }
+
+  private func resolveLaunchSpec(
+    profileID: String,
+    engineHost: PieEngineHost,
+    operation: String,
+    reply: @escaping (Data?, Data?) -> Void
+  ) -> PieControlLauncher.LaunchSpec? {
     guard let launchSpecResolver else {
-      Self.log.error("startEngine: no launch-spec resolver wired")
+      Self.log.error("\(operation, privacy: .public): no launch-spec resolver wired")
       PieHelperXPCWire.replyStartEngine(
         .failure(EngineError(code: .profileMissing,
                              message: "ProfileStore-backed resolver not wired")),
         via: reply
       )
-      return
+      return nil
     }
-    let resolved = launchSpecResolver(profileID)
-    let spec: PieControlLauncher.LaunchSpec
-    switch resolved {
-    case .success(let s): spec = s
+    switch launchSpecResolver(profileID) {
+    case .success(let spec):
+      return spec
     case .failure(let err):
-      Self.log.error("startEngine: resolver rejected profileID=\(profileID, privacy: .public) (\(err.code.rawValue, privacy: .public))")
+      Self.log.error("\(operation, privacy: .public): resolver rejected profileID=\(profileID, privacy: .public) (\(err.code.rawValue, privacy: .public))")
       if err.code == .memoryRisk {
         engineHost.recordPreStartFailure(err)
       }
       PieHelperXPCWire.replyStartEngine(.failure(err), via: reply)
-      return
+      return nil
     }
+  }
+
+  private func beginStart(
+    engineHost: PieEngineHost,
+    spec: PieControlLauncher.LaunchSpec,
+    fireOnce complete: @escaping (Result<EnginePort, EngineError>) -> Void
+  ) {
     if case .failure(let err) = engineHost.start(spec) {
-      PieHelperXPCWire.replyStartEngine(.failure(err), via: reply)
+      complete(.failure(err))
       return
     }
     let replied = OSAllocatedUnfairLock<Bool>(initialState: false)
@@ -329,14 +473,25 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
         box = nil
       }
     }
-    func fireOnce(_ result: Result<EnginePort, EngineError>) {
+    /// Resolve the single startEngine reply. Returns `true` when THIS call
+    /// won the race (it delivered the reply), `false` when a prior caller
+    /// already replied. The win flag gates the reply-timeout fallback's
+    /// `engineHost.stop()` so only a genuinely-wedged start is cancelled
+    /// (#448). `beforeComplete` lets a winning timeout cancel the in-flight
+    /// launch before the app receives `.handshakeTimeout`, preserving the
+    /// strict restart fix for PR #63 review v1 F1.
+    @discardableResult
+    func finish(_ result: Result<EnginePort, EngineError>,
+                beforeComplete: (() -> Void)? = nil) -> Bool {
       let already = replied.withLock { (fired: inout Bool) -> Bool in
         defer { fired = true }
         return fired
       }
       cancelObserver()
-      if already { return }
-      PieHelperXPCWire.replyStartEngine(result, via: reply)
+      if already { return false }
+      beforeComplete?()
+      complete(result)
+      return true
     }
     let token = engineHost.observe { status, _ in
       let shouldFire: (Result<EnginePort, EngineError>)?
@@ -355,7 +510,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
         shouldFire = nil
       }
       guard let result = shouldFire else { return }
-      fireOnce(result)
+      finish(result)
     }
     tokenBox.withLock { $0 = token }
     if replied.withLock({ $0 }) { cancelObserver() }
@@ -366,17 +521,22 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     let deadline: TimeInterval = Self.startReplyDeadline
     #endif
     DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + deadline) { [weak engineHost] in
-      // Review v1 F1: cancel the in-flight launch BEFORE firing the
-      // failure reply. Without this the host stays in `.starting`; a
-      // slow `pie serve` boot then publishes `.running` after the
-      // client already received `.handshakeTimeout`, and a subsequent
-      // `startEngine` is rejected with `.alreadyRunning` against an
-      // orphan engine the client never saw acknowledged.
-      engineHost?.stop()
-      fireOnce(.failure(EngineError(
+      // #448: the fallback must stop the engine ONLY when this timeout WON
+      // the reply race — i.e. the start never resolved and the host is still
+      // wedged in `.starting`. Pre-fix, `engineHost.stop()` ran
+      // unconditionally here, so a HEALTHY `.running` engine (whose success
+      // reply was already delivered by the observer) was force-stopped
+      // exactly `deadline`s after every App-driven start — the ~60s "engine
+      // dies after going idle" bug. Gating on the `finish` win flag
+      // preserves the original intent (review v1 F1): a genuinely wedged
+      // launch is cancelled before it can surprise-publish `.running` after
+      // the client gave up, while a started engine is left running.
+      _ = finish(.failure(EngineError(
         code: .handshakeTimeout,
         message: "startEngine reply-timeout fallback fired after \(deadline)s (host never transitioned out of .starting)"
-      )))
+      )), beforeComplete: {
+        engineHost?.stop()
+      })
     }
   }
 
@@ -608,6 +768,53 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       reply(PieHelperXPCWire.fallbackReplyEncodeFailureData)
     }
   }
+
+  // MARK: - quitHelper (#448)
+
+  /// Full-product quit. Stops the engine and WAITS for it to reach a
+  /// terminal state — `PieEngineHost.stop()` only publishes `.stopped`
+  /// after `LaunchedSession.shutdown` (SIGINT → grace → SIGKILL) has reaped
+  /// `pie`, so awaiting `.stopped`/`.failed` guarantees no orphan engine
+  /// before the Helper exits. Then replies and fires `onQuitRequested`
+  /// (wired by `HelperMain` to `NSApp.terminate`) for a clean exit so
+  /// launchd's `KeepAlive { SuccessfulExit: false }` does not relaunch it.
+  ///
+  /// A bounded fallback fires the termination even if the engine never
+  /// reaches terminal, so a wedged engine cannot block quit; a stuck pid is
+  /// then reaped by launchd when the Helper exits, the same as any unclean
+  /// death. Idempotent via the single-shot `finished` flag.
+  public func quitHelper(reply: @escaping (Data?) -> Void) {
+    Self.log.info("quitHelper: tearing down engine then terminating helper")
+    guard let engineHost else {
+      // No engine to reap (early boot / stub) — just acknowledge + exit.
+      PieHelperXPCWire.replyStopEngine(nil, via: reply)
+      onQuitRequested?()
+      return
+    }
+    #if DEBUG
+    let deadline = replyTimeoutOverride?.stop ?? Self.stopReplyDeadline
+    #else
+    let deadline = Self.stopReplyDeadline
+    #endif
+    HelperQuitTeardown.stopThenTerminate(
+      engineHost: engineHost,
+      initialTimeout: deadline,
+      timeoutTerminationGrace: HelperQuitTeardown.timeoutTerminationGrace,
+      onTerminalBeforeTimeout: { _ in
+        PieHelperXPCWire.replyStopEngine(nil, via: reply)
+      },
+      onTimeout: { result in
+        PieHelperXPCWire.replyStopEngine(EngineError(
+          code: .handshakeTimeout,
+          message: "quitHelper stop/reap timeout after \(deadline)s (last status: \(result.lastStatus)); helper will terminate after bounded \(HelperQuitTeardown.timeoutTerminationGrace)s fallback if reap remains wedged"
+        ), via: reply)
+      },
+      onFinalTimeout: { result in
+        Self.log.error("quitHelper: bounded fallback expired with status \(String(describing: result.lastStatus), privacy: .public); terminating helper anyway")
+      },
+      terminate: { [onQuitRequested] in onQuitRequested?() }
+    )
+  }
 }
 
 /// Degraded-mode `PieHelperXPC` implementation. Used when the helper
@@ -630,13 +837,19 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   /// `[String]` slot, which the GUI decoded as wire corruption.
   private let emptyProfilesData: Data
 
+  /// #448: self-terminate hook, same contract as `HelperExportedAPI`. A
+  /// degraded Helper owns no engine, so `quitHelper` just acknowledges and
+  /// fires this to exit cleanly.
+  private let onQuitRequested: (@Sendable () -> Void)?
+
   private static let log = Logger(subsystem: "com.ratiothink.app.helper", category: "xpc.exported.degraded")
 
   /// `reasonMessage` is folded into both `EngineError.message` and
   /// `EngineStatus.failed.message` so a single source of truth flows
   /// from PieDirsError → wire → GUI alert.
-  public init(reasonMessage: String) {
+  public init(reasonMessage: String, onQuitRequested: (@Sendable () -> Void)? = nil) {
     self.reasonMessage = reasonMessage
+    self.onQuitRequested = onQuitRequested
     let err = EngineError(code: .degraded, message: reasonMessage)
     do {
       self.degradedErrorData = try XPCPayload.encode(err)
@@ -662,6 +875,11 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
     reply(degradedStatusData)
   }
 
+  public func helperProtocolVersion(reply: @escaping (Data) -> Void) {
+    reply((try? XPCPayload.encode(HelperProtocolCompatibility.currentVersion))
+          ?? PieHelperXPCWire.fallbackReplyEncodeFailureData)
+  }
+
   public func engineMemory(reply: @escaping (Data) -> Void) {
     // No engine runs in degraded mode → RSS unavailable. `nil` cannot
     // realistically fail to encode; the literal "null" fallback decodes
@@ -672,6 +890,12 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   public func startEngine(profileID: String,
                           reply: @escaping (Data?, Data?) -> Void) {
     Self.log.error("startEngine refused in degraded mode (profileID=\(profileID, privacy: .public))")
+    reply(nil, degradedErrorData)
+  }
+
+  public func restartEngine(profileID: String,
+                            reply: @escaping (Data?, Data?) -> Void) {
+    Self.log.error("restartEngine refused in degraded mode (profileID=\(profileID, privacy: .public))")
     reply(nil, degradedErrorData)
   }
 
@@ -721,5 +945,15 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   /// instead of optimistically retrying.
   public func clearKillRejected(reply: @escaping (Data?) -> Void) {
     reply(degradedErrorData)
+  }
+
+  /// #448: a degraded Helper owns no engine, so there is nothing to reap —
+  /// acknowledge the quit and terminate. Honoring quit (rather than
+  /// returning the degraded error) lets the user fully dismiss a broken
+  /// Helper from the menu bar.
+  public func quitHelper(reply: @escaping (Data?) -> Void) {
+    Self.log.info("quitHelper: degraded helper terminating (no engine to reap)")
+    reply(nil)
+    onQuitRequested?()
   }
 }

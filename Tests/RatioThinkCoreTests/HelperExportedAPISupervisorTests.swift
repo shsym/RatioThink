@@ -21,8 +21,17 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
   /// can verify the host tore the engine down on Pause / cancel.
   final class FakeSession: PieEngineHost.EngineSession, @unchecked Sendable {
     private let count = OSAllocatedUnfairLock<Int>(initialState: 0)
+    private let delay: TimeInterval
+    init(shutdownDelay: TimeInterval = 0) {
+      self.delay = shutdownDelay
+    }
     var shutdownCount: Int { count.withLock { $0 } }
-    func shutdown() async { count.withLock { $0 += 1 } }
+    func shutdown() async {
+      count.withLock { $0 += 1 }
+      if delay > 0 {
+        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+      }
+    }
   }
 
   /// Build a launcher that returns `(port, FakeSession)` after an
@@ -249,6 +258,55 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     XCTAssertNil(errPayload, "stopEngine should reply nil on clean stop")
     // Session.shutdown must have been called.
     XCTAssertEqual(captured?.shutdownCount, 1, "host did not invoke session.shutdown on stop")
+  }
+
+  // MARK: - restartEngine
+
+  func test_restartEngine_waitsForSlowStopTerminalBeforeStartingReplacement() throws {
+    let launchCount = OSAllocatedUnfairLock<Int>(initialState: 0)
+    let firstSession = FakeSession(shutdownDelay: 0.3)
+    let secondSession = FakeSession()
+    let host = PieEngineHost(launcher: { _ in
+      let count = launchCount.withLock { count -> Int in
+        count += 1
+        return count
+      }
+      return count == 1
+        ? (port: EnginePort(11111), session: firstSession)
+        : (port: EnginePort(22222), session: secondSession)
+    })
+    let spec = makeSpec(profileID: "chat")
+    let api = HelperExportedAPI(engineHost: host, launchSpecResolver: { _ in .success(spec) })
+
+    let startExp = expectation(description: "initial start reply")
+    api.startEngine(profileID: "chat") { _, _ in startExp.fulfill() }
+    wait(for: [startExp], timeout: 2)
+    waitForRunning(host, timeout: 2)
+
+    let restartExp = expectation(description: "restart reply after replacement start")
+    var captured: Result<EnginePort, EngineError>?
+    api.restartEngine(profileID: "chat") { successData, errorData in
+      captured = try? PieHelperXPCWire.decodeStartEngineReply(
+        successData: successData, errorData: errorData
+      )
+      restartExp.fulfill()
+    }
+
+    let preTerminalExp = expectation(description: "before slow shutdown finishes")
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) { preTerminalExp.fulfill() }
+    wait(for: [preTerminalExp], timeout: 1)
+    XCTAssertEqual(firstSession.shutdownCount, 1)
+    XCTAssertEqual(launchCount.withLock { $0 }, 1,
+                   "restart must not launch replacement until the helper host has published terminal stop")
+
+    wait(for: [restartExp], timeout: 3)
+    guard case .success(let port)? = captured else {
+      host.stop()
+      return XCTFail("expected restart success, got \(String(describing: captured))")
+    }
+    XCTAssertEqual(port, 22222)
+    XCTAssertEqual(launchCount.withLock { $0 }, 2)
+    host.stop()
   }
 
   // MARK: - wireViolationStatusBlob shape (F7 carry-over)

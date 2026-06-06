@@ -42,6 +42,23 @@ public enum EngineLiveness: Equatable, Sendable {
   case gone(reason: String)
 }
 
+public struct StopAndWaitResult: Equatable, Sendable {
+  public enum Completion: Equatable, Sendable {
+    case terminal
+    case timedOut
+  }
+
+  public let completion: Completion
+  public let lastStatus: EngineStatus
+
+  public var reachedTerminal: Bool { completion == .terminal }
+
+  public init(completion: Completion, lastStatus: EngineStatus) {
+    self.completion = completion
+    self.lastStatus = lastStatus
+  }
+}
+
 public final class PieEngineHost: @unchecked Sendable {
 
   // MARK: - LaunchSpec
@@ -192,7 +209,13 @@ public final class PieEngineHost: @unchecked Sendable {
     livenessFailureThreshold: Int = 2,
     relaunchPolicy: RelaunchPolicy = RelaunchPolicy(),
     relauncher: Relauncher? = nil,
-    clock: @Sendable @escaping () -> Date = { Date() }
+    clock: @Sendable @escaping () -> Date = { Date() },
+    // Default: a real cooperative sleep that swallows cancellation, exactly
+    // matching the inline `try? await Task.sleep` the three timers used
+    // before the seam existed — so production behaviour is unchanged.
+    sleepFor: @Sendable @escaping (TimeInterval) async -> Void = { seconds in
+      try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+    }
   ) {
     self.launcher = launcher ?? PieEngineHost.productionLauncher
     self.livenessInterval = livenessInterval
@@ -200,6 +223,7 @@ public final class PieEngineHost: @unchecked Sendable {
     self.relaunchPolicy = relaunchPolicy
     self.relauncher = relauncher
     self.clock = clock
+    self.sleepFor = sleepFor
   }
 
   private let launcher: LauncherCall
@@ -214,6 +238,15 @@ public final class PieEngineHost: @unchecked Sendable {
   /// backoff timers. Defaults to `Date()` (production + existing
   /// callers unaffected).
   private let clock: @Sendable () -> Date
+
+  /// Suspension seam shared by the liveness-poll cadence, the
+  /// auto-relaunch backoff, and the healthy-uptime re-arm timer.
+  /// Production sleeps for real (the default argument in `init`); a
+  /// deterministic test injects an immediate (or virtual-clock) sleep so
+  /// the death/relaunch cycle carries zero wall-clock dependence and
+  /// cannot race the injected `clock`'s window math. The default is
+  /// behaviour-identical to the prior inline `try? await Task.sleep`.
+  private let sleepFor: @Sendable (TimeInterval) async -> Void
 
   /// Production launcher: bridge `PieControlLauncher.launch` into the
   /// `(EnginePort, any EngineSession)` shape `PieEngineHost`
@@ -301,6 +334,56 @@ public final class PieEngineHost: @unchecked Sendable {
   public func stop() {
     stateQueue.sync {
       stopLocked()
+    }
+  }
+
+  /// #448 quit primitive: `stop()` the engine and invoke `completion`
+  /// exactly once with a result that distinguishes a real terminal state
+  /// (`.stopped`/`.failed`) from the timeout fallback. Terminal states are
+  /// published only AFTER `LaunchedSession.shutdown` (SIGINT → grace →
+  /// SIGKILL) has reaped the `pie` process, so callers that promise a
+  /// no-orphan structured quit must require `result.reachedTerminal == true`
+  /// before reporting success. The bounded fallback keeps callers observable
+  /// when the engine wedges instead of silently conflating timeout with reap.
+  /// `completion` fires on `stateQueue` (terminal path) or a global queue
+  /// (timeout).
+  public func stopAndWait(timeout: TimeInterval, completion: @escaping @Sendable (StopAndWaitResult) -> Void) {
+    let done = OSAllocatedUnfairLock<Bool>(initialState: false)
+    let tokenBox = OSAllocatedUnfairLock<ObservationToken?>(initialState: nil)
+    func cancelObserver() {
+      tokenBox.withLock { (box: inout ObservationToken?) in
+        box?.cancel()
+        box = nil
+      }
+    }
+    func finish(_ result: StopAndWaitResult) {
+      let already = done.withLock { (d: inout Bool) -> Bool in
+        defer { d = true }
+        return d
+      }
+      cancelObserver()
+      if already { return }
+      completion(result)
+    }
+    // observe() dispatches the CURRENT status synchronously on stateQueue, so
+    // an already-terminal host fires `finish()` immediately.
+    let token = observe { status, _ in
+      switch status {
+      case .stopped, .failed:
+        finish(StopAndWaitResult(completion: .terminal, lastStatus: status))
+      case .starting, .running, .stopping: return
+      }
+    }
+    tokenBox.withLock { $0 = token }
+    if done.withLock({ $0 }) { cancelObserver() }
+    stop()
+    if timeout > 0 {
+      DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout) { [weak self] in
+        finish(StopAndWaitResult(completion: .timedOut, lastStatus: self?.status ?? .failed(
+          code: .unknown,
+          message: "PieEngineHost deallocated before stopAndWait timeout sampled status"
+        )))
+      }
     }
   }
 
@@ -544,12 +627,13 @@ public final class PieEngineHost: @unchecked Sendable {
   private func startLivenessMonitor(session: any EngineSession) {
     let interval = livenessInterval
     let threshold = livenessFailureThreshold
+    let sleepFor = self.sleepFor
     guard interval > 0 else { return }
     livenessMonitor?.cancel()
-    livenessMonitor = Task { [weak self] in
+    livenessMonitor = Task { [weak self, sleepFor] in
       var consecutiveGone = 0
       while !Task.isCancelled {
-        try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+        await sleepFor(interval)
         if Task.isCancelled { return }
         guard self != nil else { return }
         let liveness = await session.checkLiveness()
@@ -590,10 +674,10 @@ public final class PieEngineHost: @unchecked Sendable {
     guard relaunchPolicy.maxAttempts > 0 else { return }
     healthyUptimeIncarnation += 1
     let myIncarnation = healthyUptimeIncarnation
+    let sleepFor = self.sleepFor
     healthyUptimeTask?.cancel()
-    healthyUptimeTask = Task { [weak self, threshold, myIncarnation] in
-      let nanos = UInt64(max(0, threshold) * 1_000_000_000)
-      try? await Task.sleep(nanoseconds: nanos)
+    healthyUptimeTask = Task { [weak self, threshold, myIncarnation, sleepFor] in
+      await sleepFor(threshold)
       if Task.isCancelled { return }
       guard let self else { return }
       self.stateQueue.async { [weak self] in
@@ -649,10 +733,10 @@ public final class PieEngineHost: @unchecked Sendable {
 
     Log.engine.notice("PieEngineHost: scheduling auto-relaunch attempt \(attemptIndex + 1, privacy: .public)/\(self.relaunchPolicy.maxAttempts, privacy: .public) in \(backoff, privacy: .public)s (reason=\(reason, privacy: .public))")
 
+    let sleepFor = self.sleepFor
     autoRelaunchTask?.cancel()
-    autoRelaunchTask = Task { [weak self, relauncher, backoff] in
-      let nanos = UInt64(max(0, backoff) * 1_000_000_000)
-      try? await Task.sleep(nanoseconds: nanos)
+    autoRelaunchTask = Task { [weak self, relauncher, backoff, sleepFor] in
+      await sleepFor(backoff)
       if Task.isCancelled { return }
       guard let self else { return }
 

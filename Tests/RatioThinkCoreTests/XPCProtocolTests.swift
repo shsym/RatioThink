@@ -19,8 +19,10 @@ final class XPCProtocolTests: XCTestCase {
     // a single anonymous trailing label — verifying by string keeps
     // the wire contract greppable when ObjC consumers are added.
     let expected = [
+      "helperProtocolVersionWithReply:",
       "engineStatusWithReply:",
       "startEngineWithProfileID:reply:",
+      "restartEngineWithProfileID:reply:",
       "stopEngineWithReply:",
       "loadModelWithModelID:reply:",
       "cancelLoadWithHandle:reply:",
@@ -170,6 +172,14 @@ final class XPCProtocolTests: XCTestCase {
   func test_logStream_roundtrip() throws {
     assertRoundTrip(LogStream.helper)
     assertRoundTrip(LogStream.engine)
+  }
+
+  func test_quitHelper_appReplyTimeoutCoversHelperStopReapBudget() {
+    XCTAssertGreaterThanOrEqual(
+      HelperXPCClient.quitReplyTimeout,
+      HelperExportedAPI.stopReplyDeadline + HelperExportedAPI.replyTimeoutSlack,
+      "App-side quit timeout must cover the helper's valid stop/reap window plus slack"
+    )
   }
 
   // MARK: - startEngine wire convention

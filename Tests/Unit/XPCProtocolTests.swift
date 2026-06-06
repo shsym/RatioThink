@@ -19,8 +19,10 @@ final class XPCProtocolTests: XCTestCase {
     // a single anonymous trailing label — verifying by string keeps
     // the wire contract greppable when ObjC consumers are added.
     let expected = [
+      "helperProtocolVersionWithReply:",
       "engineStatusWithReply:",
       "startEngineWithProfileID:reply:",
+      "restartEngineWithProfileID:reply:",
       "stopEngineWithReply:",
       "loadModelWithModelID:reply:",
       "cancelLoadWithHandle:reply:",

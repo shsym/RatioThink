@@ -1,8 +1,9 @@
 import SwiftUI
 import SwiftData
 
-/// Detail empty-state shown when no item is selected. Design §5 specifies
-/// large `Start Chat` + `Add Endpoint` CTAs as the zero-state for col 3.
+/// Detail empty-state shown when no item is selected: a large `Start Chat`
+/// CTA for col 3. (The former `Add Endpoint` CTA is gone — the local API is
+/// the engine's single endpoint, surfaced via the API Endpoints section.)
 struct EmptyStateView: View {
   @EnvironmentObject private var windowState: WindowState
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
@@ -20,9 +21,9 @@ struct EmptyStateView: View {
         .foregroundStyle(.secondary)
       HStack(spacing: 12) {
         ctaButton(title: "Start Chat", systemImage: "bubble.left.and.bubble.right", action: startChat)
-        // v0.1.1: "Add Endpoint" hidden — the API Endpoints feature is not
-        // shipping yet (mirrors the hidden sidebar row). Re-add this CTA (and
-        // `addEndpoint()` + the `endpointStore` injection) to re-enable.
+        // No "Add Endpoint" CTA: the local API is the engine's single
+        // endpoint, viewed via the sidebar's API Endpoints section
+        // (LocalAPIView, #422) — there is nothing to create here.
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)

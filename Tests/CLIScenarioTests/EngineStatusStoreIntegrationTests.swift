@@ -153,12 +153,26 @@ private final class FixedStatusExportedObject: NSObject, PieHelperXPC, @unchecke
     }
   }
 
+  func helperProtocolVersion(reply: @escaping (Data) -> Void) {
+    reply((try? XPCPayload.encode(HelperProtocolCompatibility.currentVersion))
+          ?? PieHelperXPCWire.fallbackReplyEncodeFailureData)
+  }
+
   func engineMemory(reply: @escaping (Data) -> Void) {
     reply((try? XPCPayload.encode(Optional<EngineMemorySample>.none)) ?? Data("null".utf8))
   }
 
   func startEngine(profileID: String,
                    reply: @escaping (Data?, Data?) -> Void) {
+    PieHelperXPCWire.replyStartEngine(
+      .failure(EngineError(code: .wireContractViolation,
+                           message: "FixedStatusExportedObject is read-only")),
+      via: reply
+    )
+  }
+
+  func restartEngine(profileID: String,
+                     reply: @escaping (Data?, Data?) -> Void) {
     PieHelperXPCWire.replyStartEngine(
       .failure(EngineError(code: .wireContractViolation,
                            message: "FixedStatusExportedObject is read-only")),
@@ -207,9 +221,15 @@ private final class FixedStatusExportedObject: NSObject, PieHelperXPC, @unchecke
   }
 
   func clearKillRejected(reply: @escaping (Data?) -> Void) { reply(nil) }
+
+  func quitHelper(reply: @escaping (Data?) -> Void) { reply(nil) }
 }
 
 private final class NeverReplyStatusExportedObject: NSObject, PieHelperXPC, @unchecked Sendable {
+  func helperProtocolVersion(reply: @escaping (Data) -> Void) {
+    // Wedged: intentionally never replies, like engineStatus below.
+  }
+
   func engineStatus(reply: @escaping (Data) -> Void) {
     // Intentionally do not call reply. This simulates a helper that accepted
     // the XPC message but wedged before producing a response.
@@ -221,6 +241,9 @@ private final class NeverReplyStatusExportedObject: NSObject, PieHelperXPC, @unc
 
   func startEngine(profileID: String,
                    reply: @escaping (Data?, Data?) -> Void) {}
+
+  func restartEngine(profileID: String,
+                     reply: @escaping (Data?, Data?) -> Void) {}
 
   func stopEngine(reply: @escaping (Data?) -> Void) {}
 
@@ -242,4 +265,7 @@ private final class NeverReplyStatusExportedObject: NSObject, PieHelperXPC, @unc
                reply: @escaping (FileHandle?, Data?) -> Void) {}
 
   func clearKillRejected(reply: @escaping (Data?) -> Void) {}
+
+  // Wedged: intentionally never replies, like the selectors above.
+  func quitHelper(reply: @escaping (Data?) -> Void) {}
 }
