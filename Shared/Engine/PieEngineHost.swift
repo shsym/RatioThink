@@ -298,11 +298,9 @@ public final class PieEngineHost: @unchecked Sendable {
     return token
   }
 
-  /// Spawn `pie serve` for the LaunchSpec. Repeated starts for the same
-  /// profile while `.starting` / `.running` are idempotent and attach to the
-  /// existing launch/session. Different-profile starts and starts while
-  /// `.stopping` still return `.alreadyRunning` (the host does NOT silently
-  /// restart on top of itself).
+  /// Spawn `pie serve` for the LaunchSpec. Returns `.alreadyRunning`
+  /// when an engine is already starting / running / stopping (the
+  /// host does NOT silently restart on top of itself).
   ///
   /// Cancellation: subsequent `stop()` calls cancel the launch task.
   /// `PieControlLauncher.launch`'s catch paths tear down the
@@ -310,6 +308,26 @@ public final class PieEngineHost: @unchecked Sendable {
   /// click-Resume-then-Pause does not leak a child engine.
   @discardableResult
   public func start(_ spec: LaunchSpec) -> Result<Void, EngineError> {
+    stateQueue.sync {
+      switch _state {
+      case .stopped, .failed:
+        return doStart(spec)
+      case .starting, .running, .stopping:
+        return .failure(EngineError(
+          code: .alreadyRunning,
+          message: "PieEngineHost already \(_state)"
+        ))
+      }
+    }
+  }
+
+  /// Start the engine, or attach to the existing same-profile
+  /// `.starting`/`.running` incarnation. This is deliberately narrower than
+  /// `start(_:)`: XPC `startEngine` is idempotent for repeated same-profile
+  /// requests, but explicit caller intents such as menu Resume still use
+  /// `start(_:)` so duplicate user/system starts surface `.alreadyRunning`.
+  @discardableResult
+  public func startOrAttach(_ spec: LaunchSpec) -> Result<Void, EngineError> {
     stateQueue.sync {
       switch _state {
       case .stopped, .failed:

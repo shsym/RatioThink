@@ -317,7 +317,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       PieHelperXPCWire.replyStartEngine(.failure(err), via: reply)
       return
     }
-    if case .failure(let err) = engineHost.start(spec) {
+    if case .failure(let err) = engineHost.startOrAttach(spec) {
       PieHelperXPCWire.replyStartEngine(.failure(err), via: reply)
       return
     }

@@ -96,7 +96,7 @@ final class PieEngineHostTests: XCTestCase {
     host.stop()
   }
 
-  func test_start_same_profile_while_starting_is_idempotent_and_does_not_launch_again() {
+  func test_startOrAttach_same_profile_while_starting_is_idempotent_and_does_not_launch_again() {
     let launchCount = OSAllocatedUnfairLock<Int>(initialState: 0)
     let host = PieEngineHost(launcher: { _ in
       launchCount.withLock { $0 += 1 }
@@ -105,7 +105,7 @@ final class PieEngineHostTests: XCTestCase {
     })
     let spec = makeSpec(profileID: "chat")
     XCTAssertNoThrow(try host.start(spec).get())
-    XCTAssertNoThrow(try host.start(spec).get())
+    XCTAssertNoThrow(try host.startOrAttach(spec).get())
 
     let exp = expectation(description: "host reaches running from the single launch")
     let token = host.observe { status, _ in
@@ -122,7 +122,7 @@ final class PieEngineHostTests: XCTestCase {
     host.stop()
   }
 
-  func test_start_same_profile_while_running_is_idempotent_and_does_not_restart() {
+  func test_startOrAttach_same_profile_while_running_is_idempotent_and_does_not_restart() {
     let launchCount = OSAllocatedUnfairLock<Int>(initialState: 0)
     let session = FakeSession()
     let host = PieEngineHost(launcher: { _ in
@@ -138,7 +138,7 @@ final class PieEngineHostTests: XCTestCase {
     wait(for: [exp], timeout: 2)
     token.cancel()
 
-    XCTAssertNoThrow(try host.start(spec).get())
+    XCTAssertNoThrow(try host.startOrAttach(spec).get())
     XCTAssertEqual(launchCount.withLock { $0 }, 1,
                    "idempotent start(same profile) while running must not restart the engine")
     XCTAssertEqual(session.shutdownCount, 0,
