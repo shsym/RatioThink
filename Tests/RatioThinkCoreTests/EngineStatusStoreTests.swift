@@ -197,6 +197,55 @@ final class EngineStatusStoreTests: XCTestCase {
                    "a rejected stop must NOT change status — toggle stays on, so the view must explain why")
   }
 
+  // MARK: - restartEngine (active profile default changed)
+
+  func test_restartEngine_whenRunning_stopsBeforeStartingSameProfile() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(port: 51234, profileID: "chat")
+    )
+
+    try await store.restartEngine(profileID: "chat")
+
+    XCTAssertEqual(client.stopCalls, 1,
+                   "running engine must be intentionally stopped so pie rebuilds its model registry")
+    XCTAssertEqual(client.startCalls, 1,
+                   "restart must start the helper again after stop acceptance")
+    XCTAssertEqual(client.lastStartProfileID, "chat")
+  }
+
+  func test_restartEngine_whenStopped_startsWithoutStop() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client, initialStatus: .stopped)
+
+    try await store.restartEngine(profileID: "chat")
+
+    XCTAssertEqual(client.stopCalls, 0,
+                   "a stopped engine has no stale registry to tear down")
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(client.lastStartProfileID, "chat")
+  }
+
+  func test_restartEngine_doesNotStartWhenStopIsRejected() async {
+    let client = StubXPCClient()
+    client.setStopResult(.failure(EngineError(code: .killRejected,
+                                              message: "engine still alive")))
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(port: 51234, profileID: "chat")
+    )
+
+    do {
+      try await store.restartEngine(profileID: "chat")
+      XCTFail("restart must surface stop rejection rather than starting over a live engine")
+    } catch {
+      XCTAssertEqual(client.stopCalls, 1)
+      XCTAssertEqual(client.startCalls, 0,
+                     "do not start a second engine if the old one refused to stop")
+    }
+  }
+
   // MARK: - initial state
 
   func test_initial_status_is_starting_until_first_poll() {
