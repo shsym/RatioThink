@@ -46,6 +46,14 @@ public protocol PieHelperXPC {
   func startEngine(profileID: String,
                    reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
 
+  /// Strict active-profile rebuild. Same reply tuple as `startEngine`,
+  /// but the helper owns real engine state: it waits for any live
+  /// engine to reach helper-confirmed terminal stop before starting
+  /// `profileID`, and it does not treat `.alreadyRunning` as an
+  /// idempotent success.
+  func restartEngine(profileID: String,
+                     reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
+
   /// Reply is `XPCPayload.encode(EngineError)` when the stop request
   /// could not be honored (helper degraded, engine missing, transport
   /// race) or nil on acceptance. The prior `() -> Void` shape had no

@@ -41,6 +41,10 @@ public protocol AppXPCClient: Sendable {
   /// or an `AppXPCClientError` on transport failure. Driven by #326's
   /// fresh-install auto-start.
   func startEngine(profileID: String) async throws
+  /// Strict restart for active-profile default-model changes. Unlike
+  /// `startEngine(profileID:)`, `.alreadyRunning` is a failure signal:
+  /// the helper did not complete a stop→start registry rebuild.
+  func restartEngine(profileID: String) async throws
 }
 
 public extension AppXPCClient {
@@ -90,15 +94,19 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
   private let endpoint: Endpoint
   private let interface: NSXPCInterface
   private let replyTimeout: TimeInterval
+  private let restartReplyTimeout: TimeInterval
   /// Persistent connection. `nil` means "not yet opened" or "torn
   /// down by invalidation/interruption — recreate on next call."
   private let connectionLock = OSAllocatedUnfairLock<NSXPCConnection?>(initialState: nil)
   private static let log = Logger(subsystem: "com.ratiothink.app", category: "xpc.client")
 
-  public init(endpoint: Endpoint, replyTimeout: TimeInterval = 2.0) {
+  public init(endpoint: Endpoint,
+              replyTimeout: TimeInterval = 2.0,
+              restartReplyTimeout: TimeInterval = 85.0) {
     self.endpoint = endpoint
     self.interface = PieHelperXPCInterface.make()
     self.replyTimeout = replyTimeout
+    self.restartReplyTimeout = restartReplyTimeout
   }
 
   /// Default-construct against the helper's resolved mach service.
@@ -273,6 +281,66 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
         // caller relies on the engine-status poll for the live `.running`
         // signal; the wrapper only needs to surface a refusal. A
         // wire-contract violation decodes to EngineError(.wireContractViolation).
+        do {
+          switch try PieHelperXPCWire.decodeStartEngineReply(
+            successData: successData, errorData: errorData
+          ) {
+          case .success:
+            resumeOnce(.success(()))
+          case .failure(let engineError):
+            resumeOnce(.failure(engineError))
+          }
+        } catch {
+          resumeOnce(.failure(error))
+        }
+      }
+    }
+  }
+
+  public func restartEngine(profileID: String) async throws {
+    let connection = ensureConnection()
+    do {
+      try await restartEngine(profileID: profileID, on: connection)
+    } catch let error as AppXPCClientError {
+      if case .replyTimeout = error {
+        invalidateIfCurrent(connection)
+      }
+      throw error
+    }
+  }
+
+  private func restartEngine(profileID: String, on connection: NSXPCConnection) async throws {
+    let timeout = restartReplyTimeout
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
+      func resumeOnce(_ result: Result<Void, Error>) {
+        let shouldResume = resumed.withLock { fired -> Bool in
+          if fired { return false }
+          fired = true
+          return true
+        }
+        guard shouldResume else { return }
+        switch result {
+        case .success: continuation.resume(returning: ())
+        case .failure(let e): continuation.resume(throwing: e)
+        }
+      }
+      if timeout > 0 {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+          resumeOnce(.failure(AppXPCClientError.replyTimeout(
+            selector: "restartEngine",
+            timeout: timeout
+          )))
+        }
+      }
+      let proxy = connection.remoteObjectProxyWithErrorHandler { err in
+        resumeOnce(.failure(AppXPCClientError.proxyError(err as NSError)))
+      }
+      guard let api = proxy as? PieHelperXPC else {
+        resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
+        return
+      }
+      api.restartEngine(profileID: profileID) { successData, errorData in
         do {
           switch try PieHelperXPCWire.decodeStartEngineReply(
             successData: successData, errorData: errorData

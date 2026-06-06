@@ -477,5 +477,6 @@ private struct PinnedRunningXPCClient: AppXPCClient {
   // already pinned `.running`, so a start is a no-op success (mirrors
   // `stopEngine`).
   func startEngine(profileID: String) async throws {}
+  func restartEngine(profileID: String) async throws {}
 }
 #endif

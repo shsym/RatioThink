@@ -222,18 +222,16 @@ public final class EngineStatusStore: ObservableObject {
   /// helper performs that product-internal reload without requiring the
   /// user to quit RatioThink.
   ///
-  /// Stop rejections propagate and prevent the subsequent start so we
-  /// never launch a second engine over one that refused to die. Start
-  /// keeps the same reply-timeout/already-running semantics as
-  /// `startEngine(profileID:)`.
+  /// Restart deliberately routes through a helper-side selector instead
+  /// of composing `stopEngine()` + `startEngine(profileID:)` here:
+  /// the app's `status` is only a 1 Hz mirror, generic start swallows
+  /// `.alreadyRunning` as idempotent, and `stopEngine()` has a short
+  /// app-side reply timeout. The helper owns the authoritative state
+  /// machine and waits for terminal stop before starting the new
+  /// profile; any `.alreadyRunning` that escapes that contract is a
+  /// failed rebuild and must surface to the caller.
   public func restartEngine(profileID: String) async throws {
-    switch status {
-    case .running, .starting, .stopping:
-      try await stopEngine()
-    case .stopped, .failed:
-      break
-    }
-    try await startEngine(profileID: profileID)
+    try await client.restartEngine(profileID: profileID)
   }
 
   /// Test seam: invoked with the human-readable cause whenever a
