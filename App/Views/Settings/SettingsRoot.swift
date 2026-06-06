@@ -2,10 +2,9 @@ import SwiftUI
 
 /// `Settings { SettingsRoot() }` host for the RatioThink app's Cmd-, window.
 ///
-/// Four tabs (§5 design): General, Models, Profiles, Advanced. The API tab
-/// is hidden for v0.1.1 (the HTTP-endpoint feature isn't shipping yet) —
-/// `APISettingsTab` and `EndpointStore` are left intact, so re-enabling is
-/// just restoring the one `tab("API", …)` registration below.
+/// Four tabs (§5 design): General, Models, Profiles, Advanced. There is no
+/// API tab: the local API is a single live view in the main window's API
+/// Endpoints section (`LocalAPIView`, #422), not a settings pane.
 /// The toolbar-button AX identity propagates from each tab's root
 /// view, so every tab body MUST carry `.accessibilityIdentifier(title)`.
 /// The S5_AppWindowShellGUITests case
@@ -29,10 +28,8 @@ struct SettingsRoot: View {
       tab("Profiles", systemImage: "person.crop.rectangle") {
         ProfilesSettingsTab()
       }
-      // v0.1.1: the API tab is hidden — the HTTP-endpoint feature isn't
-      // shipping yet (mirrors the hidden sidebar row). Restore this one
-      // `tab("API", systemImage: "network") { APISettingsTab() }` block to
-      // re-enable; APISettingsTab + EndpointStore are left intact.
+      // No API tab: the local API lives in the main window's API Endpoints
+      // section (LocalAPIView, #422), the single surface for it.
       tab("Advanced", systemImage: "wrench.and.screwdriver") {
         AdvancedSettingsTab()
       }

@@ -10,18 +10,24 @@ import XCTest
 /// `EngineIndicatorState`, so the label is keyed off that enum directly.
 ///
 /// Contract (design locked with the user):
-///   · `.offline` / `.running` / `.starting` → NO inline text (bare dot;
-///     the tooltip carries any detail). `pipLabel` returns nil.
+///   · `.offline` → "Model not loaded" (#421 — a stopped engine has no
+///     resident model, so the idle dot gains a quiet inline label).
+///   · `.running` / `.starting` → NO inline text from `pipLabel` (bare dot;
+///     `.starting` renders its own live "Starting… (Ns)" counter; the
+///     tooltip carries any detail). `pipLabel` returns nil.
 ///   · `.loading(id, fraction)` → "Loading <leaf>… N%" (determinate) or
 ///     "Loading <leaf>" + animated ellipsis (indeterminate). Uses the
 ///     model-id LEAF, not the full `<repo>/<file>` slug.
 ///   · `.error(err)` → the error `title`, static (no ellipsis).
 final class ModelLoadIndicatorLabelTests: XCTestCase {
 
-  // MARK: - bare-dot states have no inline label
+  // MARK: - idle / bare-dot states
 
-  func test_offline_has_no_label() {
-    XCTAssertNil(ModelLoadIndicator.pipLabel(for: .offline))
+  // #421: a stopped engine (no resident model) reads as a quiet
+  // "Model not loaded" next to the grey dot — the one idle state that
+  // previously had no inline copy.
+  func test_offline_shows_model_not_loaded_label() {
+    XCTAssertEqual(ModelLoadIndicator.pipLabel(for: .offline), "Model not loaded")
   }
 
   func test_running_has_no_label() {
@@ -107,6 +113,21 @@ final class ModelLoadIndicatorLabelTests: XCTestCase {
     XCTAssertFalse(ModelLoadIndicator.pipLabelAnimatesEllipsis(for: .running(modelID: "m")))
     let err = EngineIndicatorError(kind: .engineFailed, title: "Engine failed", message: "x", invitesModelChoice: false)
     XCTAssertFalse(ModelLoadIndicator.pipLabelAnimatesEllipsis(for: .error(err)))
+  }
+
+  // MARK: - width-cap gating (#421 spacing fix)
+
+  // Only the LOADING label (a long HF leaf) is width-capped + truncated.
+  // The short bounded labels size to content so they hug the dot instead
+  // of being right-pushed inside a reserved 200pt slot.
+  func test_only_loading_label_is_width_capped() {
+    XCTAssertTrue(ModelLoadIndicator.pipLabelNeedsWidthCap(for: .loading(modelID: "m", fraction: nil)))
+    XCTAssertTrue(ModelLoadIndicator.pipLabelNeedsWidthCap(for: .loading(modelID: "m", fraction: 0.5)))
+    XCTAssertFalse(ModelLoadIndicator.pipLabelNeedsWidthCap(for: .offline))
+    XCTAssertFalse(ModelLoadIndicator.pipLabelNeedsWidthCap(for: .starting(detail: "x")))
+    XCTAssertFalse(ModelLoadIndicator.pipLabelNeedsWidthCap(for: .running(modelID: "m")))
+    let err = EngineIndicatorError(kind: .loadFailed, title: "Load failed", message: "x", invitesModelChoice: false)
+    XCTAssertFalse(ModelLoadIndicator.pipLabelNeedsWidthCap(for: .error(err)))
   }
 
   // MARK: - LED tint → colour mapping (#412)

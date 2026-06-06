@@ -99,7 +99,15 @@ final class CuratedModelCatalogTests: XCTestCase {
   /// path separators. pie loads one `.gguf` via `gguf_init_from_file`
   /// (and `ModelDownloader.start(repo:file:)` fetches one blob), so a
   /// directory slug or a nested path could never download-and-launch.
-  /// This is the offline tripwire for the #425 class of bug.
+  ///
+  /// SHAPE ONLY — this does NOT prove the file exists. A phantom
+  /// monolithic name (the actual #425 bug,
+  /// `Qwen/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_k_m.gguf`,
+  /// which HF never published) is correctly shaped and passes every
+  /// assertion here. Existence is proven only by the live HF audit
+  /// (`CuratedModelCatalogLiveHFTests`), run always-on by the
+  /// `curated-catalog-audit` CI workflow / `make test-curated-hf` (#427).
+  /// Do not trust this test to catch a nonexistent curated file.
   func test_every_curated_entry_is_shaped_as_a_single_file_gguf_download() {
     for m in CuratedModelCatalog.all {
       let repoSegments = m.huggingFaceRepo

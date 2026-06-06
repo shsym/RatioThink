@@ -384,12 +384,18 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertEqual(coord.pending?.toModelID, "m_target")
   }
 
-  func test_no_resident_yet_publishes_popover_with_nil_from() {
-    let (coord, _, _) = makeCoordinator(map: ["next": "m2"])
-    coord.requestSwap(toProfileID: "next") { _ in }
-    XCTAssertNotNil(coord.pending)
-    XCTAssertNil(coord.pending?.fromModelID, "no resident → from is nil; popover renders the 'no model' label")
-    XCTAssertEqual(coord.pending?.toModelID, "m2")
+  func test_no_resident_yet_commits_silently_no_popover() {
+    // Policy 1.5 (`ProfileSwapCoordinator.requestSwap`): with nothing
+    // resident there is no model to REPLACE, so a swap-confirm popover is
+    // meaningless. The selection commits silently and fires NO load — the
+    // model loads later through the normal start gate. Mirrors the sibling
+    // silent-swap tests above.
+    let (coord, center, _) = makeCoordinator(map: ["next": "m2"])  // no resident
+    var committed: String?
+    coord.requestSwap(toProfileID: "next") { committed = $0 }
+    XCTAssertEqual(committed, "next")
+    XCTAssertNil(coord.pending, "no resident → silent swap, no confirm popover")
+    XCTAssertEqual(center.state, .idle, "no resident: no load fires")
   }
 
   // MARK: - review v1 F5: loadDirect short-circuit (used by the no-model prompt's Load)

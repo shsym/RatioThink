@@ -201,7 +201,13 @@ public final class PieEngineHost: @unchecked Sendable {
     relaunchPolicy: RelaunchPolicy = RelaunchPolicy(),
     relauncher: Relauncher? = nil,
     launchTimeoutSlack: TimeInterval = 2,
-    clock: @Sendable @escaping () -> Date = { Date() }
+    clock: @Sendable @escaping () -> Date = { Date() },
+    // Default: a real cooperative sleep that swallows cancellation, exactly
+    // matching the inline `try? await Task.sleep` the three timers used
+    // before the seam existed — so production behaviour is unchanged.
+    sleepFor: @Sendable @escaping (TimeInterval) async -> Void = { seconds in
+      try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+    }
   ) {
     self.launcher = launcher ?? PieEngineHost.productionLauncher
     self.livenessInterval = livenessInterval
@@ -210,6 +216,7 @@ public final class PieEngineHost: @unchecked Sendable {
     self.relauncher = relauncher
     self.launchTimeoutSlack = max(0, launchTimeoutSlack)
     self.clock = clock
+    self.sleepFor = sleepFor
   }
 
   private let launcher: LauncherCall
@@ -225,6 +232,15 @@ public final class PieEngineHost: @unchecked Sendable {
   /// backoff timers. Defaults to `Date()` (production + existing
   /// callers unaffected).
   private let clock: @Sendable () -> Date
+
+  /// Suspension seam shared by the liveness-poll cadence, the
+  /// auto-relaunch backoff, and the healthy-uptime re-arm timer.
+  /// Production sleeps for real (the default argument in `init`); a
+  /// deterministic test injects an immediate (or virtual-clock) sleep so
+  /// the death/relaunch cycle carries zero wall-clock dependence and
+  /// cannot race the injected `clock`'s window math. The default is
+  /// behaviour-identical to the prior inline `try? await Task.sleep`.
+  private let sleepFor: @Sendable (TimeInterval) async -> Void
 
   /// Production launcher: bridge `PieControlLauncher.launch` into the
   /// `(EnginePort, any EngineSession)` shape `PieEngineHost`
@@ -431,10 +447,10 @@ public final class PieEngineHost: @unchecked Sendable {
   private func armLaunchTimeout(profileID: String,
                                 launchID: UInt64,
                                 timeout: TimeInterval) {
+    let sleepFor = self.sleepFor
     launchTimeoutTask?.cancel()
-    launchTimeoutTask = Task { [weak self, timeout, launchID, profileID] in
-      let nanos = UInt64(max(0, timeout) * 1_000_000_000)
-      try? await Task.sleep(nanoseconds: nanos)
+    launchTimeoutTask = Task { [weak self, timeout, launchID, profileID, sleepFor] in
+      await sleepFor(timeout)
       if Task.isCancelled { return }
       guard let self else { return }
       self.stateQueue.async { [weak self] in
@@ -682,12 +698,13 @@ public final class PieEngineHost: @unchecked Sendable {
   private func startLivenessMonitor(session: any EngineSession) {
     let interval = livenessInterval
     let threshold = livenessFailureThreshold
+    let sleepFor = self.sleepFor
     guard interval > 0 else { return }
     livenessMonitor?.cancel()
-    livenessMonitor = Task { [weak self] in
+    livenessMonitor = Task { [weak self, sleepFor] in
       var consecutiveGone = 0
       while !Task.isCancelled {
-        try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+        await sleepFor(interval)
         if Task.isCancelled { return }
         guard self != nil else { return }
         let started = Date()
@@ -748,10 +765,10 @@ public final class PieEngineHost: @unchecked Sendable {
     guard relaunchPolicy.maxAttempts > 0 else { return }
     healthyUptimeIncarnation += 1
     let myIncarnation = healthyUptimeIncarnation
+    let sleepFor = self.sleepFor
     healthyUptimeTask?.cancel()
-    healthyUptimeTask = Task { [weak self, threshold, myIncarnation] in
-      let nanos = UInt64(max(0, threshold) * 1_000_000_000)
-      try? await Task.sleep(nanoseconds: nanos)
+    healthyUptimeTask = Task { [weak self, threshold, myIncarnation, sleepFor] in
+      await sleepFor(threshold)
       if Task.isCancelled { return }
       guard let self else { return }
       self.stateQueue.async { [weak self] in
@@ -815,10 +832,10 @@ public final class PieEngineHost: @unchecked Sendable {
       ("reason", reason),
     ])
 
+    let sleepFor = self.sleepFor
     autoRelaunchTask?.cancel()
-    autoRelaunchTask = Task { [weak self, relauncher, backoff] in
-      let nanos = UInt64(max(0, backoff) * 1_000_000_000)
-      try? await Task.sleep(nanoseconds: nanos)
+    autoRelaunchTask = Task { [weak self, relauncher, backoff, sleepFor] in
+      await sleepFor(backoff)
       if Task.isCancelled { return }
       guard let self else { return }
 

@@ -250,3 +250,36 @@ targets:
     settings:
       base:
         TEST_TARGET_NAME: RatioThink
+
+  # #440: Helper-executable unit tests. The App-hosted RatioThinkTests cannot
+  # cover HelperAppDelegate — a unit bundle can't ALSO link RatioThinkHelper
+  # without duplicating every Shared symbol — so the Helper gets its own
+  # host-app unit-test bundle, mirroring how RatioThinkTests hosts RatioThink.
+  # The RatioThinkHelper host's applicationDidFinishLaunching early-returns when
+  # PIE_TEST_HELPER_NO_BOOT=1 (set on the scheme below), so the test host runs
+  # none of the real boot (status item / login-item registration / XPC bind)
+  # and mutates no machine state.
+  RatioThinkHelperTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/HelperUnit
+    dependencies:
+      - target: RatioThinkHelper
+      - package: TOMLKit
+
+schemes:
+  # Explicit scheme so the test action sets PIE_TEST_HELPER_NO_BOOT=1 in the
+  # RatioThinkHelper host process from launch (XCTest's own configuration env is
+  # injected too late for the helper's applicationDidFinishLaunching). Without
+  # it the host's real boot binds the com.ratiothink.helper mach service and
+  # hard-traps in verifyStartupInvariants under the ad-hoc-signed test host.
+  RatioThinkHelperTests:
+    build:
+      targets:
+        RatioThinkHelperTests: [test]
+    test:
+      environmentVariables:
+        PIE_TEST_HELPER_NO_BOOT: "1"
+      targets:
+        - RatioThinkHelperTests

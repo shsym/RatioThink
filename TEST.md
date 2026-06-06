@@ -13,9 +13,10 @@ below in the same change.
 |---|---|---|---|
 | `make lint` | helper side-effect invariants (static) | anywhere | — |
 | `make build` | Debug build of RatioThink app + helper | anywhere | — |
-| `make build-tests` | Compile every xcodebuild target + SPM probe | anywhere | — |
-| `make test-xcode-chat-scaffold` | `ChatScaffoldModelSelectionTests` (xcodebuild RatioThinkTests) regression guard | anywhere | — |
-| `make test-unit` | `RatioThinkCoreTests` (SPM, pure logic) | anywhere | — |
+| `make build-tests` | **Compile-only** smoke of every xcodebuild target + SPM probe (does NOT run the bundles) | anywhere | — (in CI) |
+| `make test-app-unit` | **RatioThinkTests** app-unit bundle (xcodebuild): #420 deep-link/login-item guards, ChatScaffold, ZeroState, snapshots | anywhere (headless, needs Xcode) | local tier — CI only **compiles** it (via `build-tests`) |
+| `make test-xcode-chat-scaffold` | `ChatScaffoldModelSelectionTests` focused slice of the above (one suite) | anywhere | local tier — subset of `test-app-unit` |
+| `make test-unit` | `RatioThinkCoreTests` (SPM, pure logic) | anywhere | — (in CI) |
 | `make test-scenario` | `CLIScenarioTests` (S0 isolation, S1/S2/S3 XPC + engine integration), headless | anywhere | — |
 | `make test-smoke` | S3 engine subprocess smoke | anywhere | needs built `pie` (`make engine-build`) |
 | `make test-install-guards` | launchd source-closed / agent-reenable / new-bundle acceptance regressions (stubbed) | anywhere | — (in CI) |
@@ -31,11 +32,14 @@ below in the same change.
 | `make test-gui-script` | Fast preflight regressions for the GUI E2E wrapper scripts | anywhere | — |
 | `make test-all` | `test-ssh` + `test-gui` (GUI skips if no seated session) | seated for full | — |
 
-The **`RatioThinkTests`** xcodebuild unit target (`Tests/Unit/*`, e.g.
-`ZeroStateActionsTests`, snapshot tests) is not a standalone Make target; run a
-slice with
+The **`RatioThinkTests`** xcodebuild app-unit target (`Tests/Unit/*`, e.g.
+`ZeroStateActionsTests`, `SettingsDeepLinkBundleTests`,
+`LoginItemPersistenceSummaryTests`, snapshot tests) runs as a whole via
+`make test-app-unit`; run a single slice with
 `xcodebuild -scheme RatioThink -only-testing:RatioThinkTests/<Class> test` (see commands in
-the appendices).
+the appendices). It is a **local-tier** bundle: CI only **compiles** it (via
+`make build-tests`), so its app-tier guards assert locally, not in CI — by the
+CI-scope policy below.
 
 The **`RatioThinkGUITests`** xcodebuild UI-test target (the `S*` suites in
 `Tests/GUIScenarioTests`, catalog below) backs `make test-gui`; run a single
@@ -53,7 +57,7 @@ that wrapper, not bare `xcodebuild`.
 
 | Suite | Area | Proves | Boundary / real model? | Run via |
 |---|---|---|---|---|
-| `S5_AppWindowShellGUITests` | settings/shell | 3-column shell vocabulary, ⌘, → Settings (5 tabs) | mock | `test-gui-shell` |
+| `S5_AppWindowShellGUITests` | settings/shell | 3-column shell vocabulary (Chats + API Endpoints nav, #422), ⌘, → Settings (4 tabs, no API tab) | mock | `test-gui-shell` |
 | `S7_FirstLaunchWizardGUITests` | first-launch | wizard flow (register / approval-blocked) | mock (faked login-item) | `test-gui-first-launch` |
 | `S7_FirstLaunchWizardPackagedArtifactGUITests` | package/install | Release `.app` first-launch persists across relaunch; launched-artifact path | packaged-signed-app | `test-gui-first-launch-package` |
 | `S4_HelperMenuBarGUITests` | helper/engine | menu-bar shell; fresh seed enables Resume; oversized-model rejected; Resume boots pie → Pause | app+real-engine (GGUF fixture) | `test-gui-helper` |
@@ -66,7 +70,7 @@ that wrapper, not bare `xcodebuild`.
 | `S204_ChatSendGUITests` | chat send/persist | INSTRUCT model answers "Paris" → persists across relaunch | **app+real-engine (real GGUF)** | `test-e2e-full` |
 | `S275_MultiTurnResumeGUITests` | chat send/persist | ordered multi-turn history sent to engine + persisted across relaunch | app+fake-engine (deterministic HTTP) | `test-gui-history` |
 | `S279_LifecycleRecoveryGUITests` | lifecycle/recovery | unreachable engine → visible recoverable error + composer re-enabled | app+real-engine seam (dead loopback) | `test-gui-chat` |
-| `S285_ZeroStateGUITests` | zero-state | empty-state top-alignment; Start Chat / Add Endpoint CTAs open a chat/endpoint | mock (stops at composer; no send) | `test-gui-chat` |
+| `S285_ZeroStateGUITests` | zero-state | empty-state top-alignment; Start Chat CTA opens a chat; API Endpoints section opens the single live `LocalAPIView` (#422) | mock (stops at composer; no send) | `test-gui-chat` |
 | `S326_FreshInstallModelDownloadGUITests` | first-launch | fresh install (seeded profile, model absent) → no-model gate offers inline **download**, not a dead-end Load | mock (fake downloader, pre-engine) | `test-gui` |
 | `S327_EngineStatusIndicatorGUITests` | model load/status | always-visible engine-status pip; popover **stays open** across 1 Hz poll ticks (`pollCount` demoted from `@Published`) | mock (no engine) | `test-gui` |
 | `S360_ModelsTopAlignGUITests` | settings/shell | Settings → Models empty state stays **top-aligned**, not vertically centered (mirrors S285) | mock (isolated empty `PIE_HOME`) | `test-gui` |
@@ -125,30 +129,45 @@ best-effort and a no-op under the sandboxed runner.
 
 ## Pre-PR gate
 
+**CI-scope policy: CI runs only the DETERMINISTIC tier.** A CI test that
+depends on a real timer, wall-clock, real subprocess/network timing, a seated
+GUI session, or a real engine/model is a flake risk, and a flaky *required*
+check erodes the gate. Such a test either moves to the local tier, or — if it
+must stay in CI — is made deterministic with an injected seam (e.g. the
+`PieEngineHost` clock/`sleepFor` seams behind `EngineDeathRecoveryTests`)
+rather than a sleep.
+
 **Automated (CI — `.github/workflows/lint.yml`, on push + pull_request,
 `macos-15` runners):** `make lint` + lint self-test → build app + helper →
-`make build-tests` → `make test-xcode-chat-scaffold` → `make test-unit` +
-`make test-scenario` → SpawnEnvSanitizer canary → inferlet build/stamp verify.
+`make build-tests` (**compile-only** smoke of the app + test bundles) →
+`make test-unit` + `make test-scenario` (SPM, headless, deterministic) →
+real-pie-driver contract → SpawnEnvSanitizer canary → gmake recipe canary →
+inferlet build/stamp verify → release-script contracts.
 
-**CI does NOT cover** (headless runners, no model/engine):
-- any **GUI** scenario (`guardSeatedGUI` skips them all),
-- any **real-model** path (S258, packaged-model, S3-real), and
+**CI does NOT run** (local responsibility — by the policy above):
+- the **`RatioThinkTests` app-unit bundle** → `make test-app-unit` (the #420
+  deep-link/login-item guards, ChatScaffold, ZeroState, snapshots). CI only
+  **compiles** it (via `build-tests`), so app-tier guards assert locally;
+- any **GUI** scenario (`guardSeatedGUI` skips them all) → `make test-gui*`;
+- any **real-model / real-engine** path (S258, packaged-model, S3-real,
+  `RealEngineLaunchE2ETests`) → `make test-e2e*`;
 - the **HTTP API E2E** (`make test-e2e-http`) — dummy-driver only (no GPU,
   no model weights) so it is CI-*eligible*, but it needs the `pie` binary
   built + the small Qwen3-0.6B `config.json`/`tokenizer.json` in the HF
   cache; provisioning those into `lint.yml` is a tracked follow-up. Run it
   locally/by operator for now.
 
-There is **no local git hook**. So GUI + real-model proof is manual and
-developer-owned. A PR touching those areas must carry its own evidence (log /
-wrapper PASS line) in the PR body.
+There is **no local git hook**. So app-unit + GUI + real-model proof is manual
+and developer-owned. A PR touching those areas must carry its own evidence (log
+/ wrapper PASS line) in the PR body.
 
 ### Confirm-before-PR by change type
 
 | You changed… | Run before PR |
 |---|---|
-| Pure logic / models / services (no UI) | `make test-ssh` (and the matching `RatioThinkCoreTests`/`RatioThinkTests` slice) |
-| SwiftUI views / layout / copy / a11y ids | `make test-ssh` + the affected GUI suite(s) (e.g. `-only-testing:RatioThinkGUITests/S285_…`, `…/S5_…`, `…/S7_…`) |
+| Pure logic / models / services (no UI) | `make test-ssh` (SPM) + `make test-app-unit` if you touched anything in the app-tier `RatioThinkTests` bundle |
+| Deep link / URL scheme / login-item / menu-bar persistence copy (#420/#440) | `make test-app-unit` (`SettingsDeepLinkBundleTests` CFBundleURLTypes guard, `LoginItemPersistenceSummaryTests` copy guard) — these assert locally only; `make test-unit` still covers the `SettingsDeepLink` SPM matcher |
+| SwiftUI views / layout / copy / a11y ids | `make test-ssh` + `make test-app-unit` + the affected GUI suite(s) (e.g. `-only-testing:RatioThinkGUITests/S285_…`, `…/S5_…`, `…/S7_…`) |
 | Chat ↔ engine send / streaming / persistence | the affected GUI suite **+ a real-model proof**: `Scripts/run-chat-gui-e2e.sh` (Appendix B) or `make test-gui-history` |
 | First-launch / wizard / model download | `S7_*` GUI suites + `make test-gui-first-launch-package` |
 | Engine launch / supervisor / XPC / helper | `make test-ssh` (incl. `test-smoke`) + `S4_HelperMenuBarGUITests`; real-engine S3 (Appendix A) if launch args changed |
