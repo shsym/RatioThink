@@ -182,11 +182,14 @@ Things that are easy to get wrong, and where to look:
   a runtime load call. So `/v1/models/load` is an instant registry confirm, and a slow
   first load shows up as `EngineStatus.starting`, not as in-flight load progress
   (`Shared/Engine/ModelLoadCenter.swift`, `Inferlets/chat-apc/src/control/load.rs`).
-- **XPC status is pull, not push; the app never starts the engine.** The app polls
-  `engineStatus()`; the helper does not stream changes. The engine comes up because the
-  helper **auto-resumes** the active profile on boot (`HelperMain.autoResumeEngineOnBoot()`
-  → `HelperResumeAction.run`), not because the app asks it to. Every XPC reply carries an
-  error channel so a dropped click is never silently swallowed (`Shared/XPC/PieHelperXPC.swift`).
+- **XPC status is pull, not push; starts are explicit requests.** The app polls
+  `engineStatus()`; the helper does not stream changes. On cold start, the engine comes
+  up because the helper **auto-resumes** the active profile on boot
+  (`HelperMain.autoResumeEngineOnBoot()` → `HelperResumeAction.run`). The app can also
+  request `startEngine(profileID:)` for explicit restart and post-download recovery
+  paths; same-profile idempotency stays inside `HelperExportedAPI` /
+  `PieEngineHost.startOrAttach`. Every XPC reply carries an error channel so a dropped
+  click is never silently swallowed (`Shared/XPC/PieHelperXPC.swift`).
 - **Two ports per launch.** pie announces its own control-plane port on stdout (used for
   the WebSocket handshake); the inferlet's OpenAI HTTP listener binds a *separate*
   reserved port (`PieControlLauncher.swift`). The app's HTTP traffic targets the latter.

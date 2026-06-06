@@ -214,7 +214,7 @@
       tag:"Front-end · SwiftUI", title:"RatioThink.app",
       user:"The SwiftUI front end. It owns every user action — typing a message, picking a model, switching profiles, changing settings — and shows engine and model status. It never runs the model itself: it talks to the engine directly for chat and only asks the helper to manage the engine's lifecycle.",
       facts:[["Owns","chat UI, persistence (SwiftData), the direct HTTP link to the engine"],
-             ["Status","poll-only — EngineStatusStore polls engineStatus() ~1 Hz; the app never starts the engine"]],
+             ["Status","poll-only — EngineStatusStore polls engineStatus() ~1 Hz; app-initiated startEngine is explicit restart / post-download recovery"]],
       calls:["<b>Send:</b> ComposerView.submit() → ChatScaffoldView.sendAssistantTurn(for:) → ChatSendController.send(…) → HTTPEngineClient.chatCompletion(_:)",
              "<b>Status:</b> EngineStatusStore poll → HelperXPCClient.engineStatus() → on .running(port) → requireBaseURL()"],
       files:["App/RatioThinkApp.swift","App/Views/Chat/","Shared/Persistence/ChatSendController.swift","Shared/Engine/EngineStatusStore.swift"]},
@@ -285,7 +285,7 @@
   var SCN = {
     cold:{name:"Cold start", steps:[
       {nodes:["helper"],edges:[],focus:{node:"helper"},
-       cap:'The helper boots as a launchd agent and <b>auto-resumes</b> the last active profile. The app never starts the engine — it is poll-only.',
+       cap:'The helper boots as a launchd agent and <b>auto-resumes</b> the last active profile by default. Status remains poll-only; explicit restart and post-download recovery paths can request startEngine.',
        chain:'HelperMain.autoResumeEngineOnBoot() → HelperResumeAction.run(engineHost:profileStore:resolver:) → resolver(profileID) → <b>PieEngineHost.start(spec)</b>'},
       {nodes:["helper","engine"],edges:["launch"],focus:{edge:"launch"},
        cap:'The host launches <span class="n">pie serve</span> and waits for the stdout handshake (serving address + internal token).',
