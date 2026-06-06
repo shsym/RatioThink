@@ -21,6 +21,10 @@ final class EngineStatusStoreTests: XCTestCase {
     private var queue: [Result<EngineStatus, Error>] = []
     private(set) var calls = 0
 
+    func helperProtocolVersion() async throws -> Int {
+      HelperProtocolCompatibility.currentVersion
+    }
+
     func setNext(_ result: Result<EngineStatus, Error>) {
       lock.withLock { queue.append(result) }
     }

@@ -471,6 +471,7 @@ struct RatioThinkApp: App {
 /// only — compiled out of Release alongside the pin itself.
 private struct PinnedRunningXPCClient: AppXPCClient {
   let port: EnginePort
+  func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
   func engineStatus() async throws -> EngineStatus { .running(port: port, profileID: "chat") }
   func stopEngine() async throws {}
   // The pinned harness has no Helper to launch an engine; the engine is

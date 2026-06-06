@@ -111,6 +111,7 @@ final class SamplingAndIndicatorSnapshotTests: XCTestCase {
 /// `initialStatus`.
 private struct SnapshotStubXPC: AppXPCClient {
   let status: EngineStatus
+  func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
   func engineStatus() async throws -> EngineStatus { status }
   func stopEngine() async throws {}
   func startEngine(profileID: String) async throws {}

@@ -195,6 +195,15 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
 
   // MARK: - engineStatus
 
+  public func helperProtocolVersion(reply: @escaping (Data) -> Void) {
+    do {
+      reply(try XPCPayload.encode(HelperProtocolCompatibility.currentVersion))
+    } catch {
+      Self.log.fault("helperProtocolVersion encode failed: \(String(describing: error), privacy: .public)")
+      reply(PieHelperXPCWire.fallbackReplyEncodeFailureData)
+    }
+  }
+
   /// Returns the live supervisor status when one is wired. Falls back
   /// to the pre-encoded `.stopped` blob when no supervisor exists,
   /// matching the Phase 2.1 contract. Encode failures fall back to
@@ -785,6 +794,11 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   public func engineStatus(reply: @escaping (Data) -> Void) {
     Self.log.info("engineStatus -> .degraded")
     reply(degradedStatusData)
+  }
+
+  public func helperProtocolVersion(reply: @escaping (Data) -> Void) {
+    reply((try? XPCPayload.encode(HelperProtocolCompatibility.currentVersion))
+          ?? PieHelperXPCWire.fallbackReplyEncodeFailureData)
   }
 
   public func engineMemory(reply: @escaping (Data) -> Void) {

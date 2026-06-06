@@ -32,6 +32,14 @@ import os
 /// introspection in tests and for future bridges.
 @objc(PieHelperXPC)
 public protocol PieHelperXPC {
+  /// Reply data is `XPCPayload.encode(Int)`. Bump the returned
+  /// `HelperProtocolCompatibility.currentVersion` whenever the App
+  /// starts requiring a newly-added helper selector. App-side launchd
+  /// reconciliation probes this first so an old-but-reachable helper
+  /// from a previous app build is repaired before product paths call
+  /// selectors it does not export.
+  func helperProtocolVersion(reply: @escaping (Data) -> Void)
+
   /// Reply data is `XPCPayload.encode(EngineStatus)`.
   func engineStatus(reply: @escaping (Data) -> Void)
 
