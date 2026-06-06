@@ -410,6 +410,9 @@ test-helper-respawn: ## Acceptance: live launchd Helper auto-respawn (needs sign
 test-helper-recovery: ## Acceptance: App-side runtime helper recovery #412 (needs signed install + RatioThink.app running)
 	Scripts/verify-helper-recovery.sh
 
+test-quit-structured: ## Acceptance: #448 structured quit — idle engine persists + ratiothink://quit leaves nothing (needs signed install + engine running)
+	Scripts/verify-structured-quit.sh
+
 test-ssh: test-unit test-scenario test-smoke test-install-guards ## Everything runnable under SSH (no GUI; SPM-only, no xcodebuild app build)
 
 test-all: test-ssh test-app-unit test-gui ## Everything (app-unit bundle + GUI; GUI tests skip if no seated session)

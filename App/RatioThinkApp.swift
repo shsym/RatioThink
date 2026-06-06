@@ -4,6 +4,11 @@ import ServiceManagement
 
 @main
 struct RatioThinkApp: App {
+  /// #448: window-close = background, ⌘Q / "Quit" / `ratiothink://quit` =
+  /// coordinated full quit. The delegate owns `applicationShouldTerminate`
+  /// (which SwiftUI's `App` does not expose) and
+  /// `applicationShouldTerminateAfterLastWindowClosed`.
+  @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
   /// One-shot guard so the launch-time Helper registration reconcile
   /// runs once even if a second window opens.
   @MainActor private static var didReconcileHelperRegistration = false
@@ -192,6 +197,10 @@ struct RatioThinkApp: App {
       helperHealthController?.health
     }
     _helperHealth = StateObject(wrappedValue: helperHealthController)
+
+    // #448: give the full-product quit coordinator the poll loop it must stop
+    // before tearing down, so no late on-demand poll respawns the Helper.
+    AppQuitCoordinator.shared.engineStatusStore = statusStore
 
     // Kick the XPC poll loop. Idempotent + cheap — first reply lands
     // within ~one runloop tick when the helper is registered, longer

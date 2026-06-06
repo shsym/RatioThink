@@ -262,7 +262,8 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     let exported: PieHelperXPC
     if let reason = degradedReason {
       Log.helper.error("publishing degraded XPC listener (reason=\(String(describing: reason), privacy: .public))")
-      exported = DegradedHelperAPI(reasonMessage: String(describing: reason))
+      exported = DegradedHelperAPI(reasonMessage: String(describing: reason),
+                                   onQuitRequested: Self.terminateSelf)
     } else {
       // : PieEngineHost replaces PieSupervisor on the
       // production helper boot path. Lazily constructed (not in
@@ -332,7 +333,8 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       // refusing every selector.
       let resolver = buildLaunchSpecResolver()
       exported = HelperExportedAPI(engineHost: host,
-                                   launchSpecResolver: resolver)
+                                   launchSpecResolver: resolver,
+                                   onQuitRequested: Self.terminateSelf)
       // Phase 2.3: wire engine-host state into the menu-bar dot
       // once a healthy host exists. Degraded boots skip this — the
       // degraded status item is already published and must not be
@@ -455,7 +457,8 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   @discardableResult
   private func transitionToDegraded(reason: String) -> Bool {
     guard let xpcListener else { return false }
-    let degraded = DegradedHelperAPI(reasonMessage: reason)
+    let degraded = DegradedHelperAPI(reasonMessage: reason,
+                                     onQuitRequested: Self.terminateSelf)
     xpcListener.setExportedObject(degraded)
     return true
   }
@@ -1407,8 +1410,64 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
                         error: reason)
   }
 
+  /// #448: self-terminate hook handed to the exported XPC object. The
+  /// `quitHelper` selector fires this AFTER the engine is reaped, so the
+  /// Helper exits cleanly (exit 0) and launchd's
+  /// `KeepAlive { SuccessfulExit: false }` does NOT relaunch it. Hops to main
+  /// because `NSApp.terminate` is main-thread-only; the selector runs on an
+  /// arbitrary XPC / engine-host queue.
+  private static let terminateSelf: @Sendable () -> Void = {
+    DispatchQueue.main.async { NSApp.terminate(nil) }
+  }
+
+  /// True when an instance of the main RatioThink.app is running. The
+  /// menu-bar "Quit RatioThink" then delegates the coordinated full-product
+  /// teardown to the App (the single quit coordinator) so the Helper isn't
+  /// quit-then-respawned on-demand.
+  private static var isAppRunning: Bool {
+    !NSRunningApplication.runningApplications(withBundleIdentifier: "com.ratiothink.app").isEmpty
+  }
+
+  /// "Quit RatioThink" (#448): tears down the WHOLE product, not just the
+  /// Helper. The old `NSApp.terminate(nil)` quit only the Helper — the
+  /// still-running App then respawned it on-demand within ~1s and the engine
+  /// could orphan. Now: if the App is running it owns the quit, so hand it
+  /// `ratiothink://quit` and let `AppQuitCoordinator` drive the teardown
+  /// (stop polling → `quitHelper` → terminate App + Helper). If the App is
+  /// absent there is nothing to coordinate, so the Helper reaps its own
+  /// engine and exits.
   @objc func quitPie() {
-    NSApp.terminate(nil)
+    if Self.isAppRunning {
+      Log.helper.info("quitPie: App running — delivering ratiothink://quit for coordinated full quit")
+      openPieApp(delivering: [SettingsDeepLink.quitURL])
+    } else {
+      Log.helper.info("quitPie: App not running — local teardown (reap engine, then terminate helper)")
+      quitHelperLocally()
+    }
+  }
+
+  /// App-absent fallback for "Quit RatioThink": reap the engine before
+  /// exiting so the Helper never orphans `pie`. `stopAndWait` fires only
+  /// after the terminal status that `LaunchedSession.shutdown` publishes once
+  /// `pie` is gone, and is bounded so a wedged engine still lets the user
+  /// quit.
+  private func quitHelperLocally() {
+    guard let engineHost else {
+      NSApp.terminate(nil)
+      return
+    }
+    HelperQuitTeardown.stopThenTerminate(
+      engineHost: engineHost,
+      initialTimeout: HelperExportedAPI.stopReplyDeadline,
+      timeoutTerminationGrace: HelperQuitTeardown.timeoutTerminationGrace,
+      onTimeout: { result in
+        Log.helper.error("quitHelperLocally: stop/reap timed out with status \(String(describing: result.lastStatus), privacy: .public); terminating after bounded fallback if reap remains wedged")
+      },
+      onFinalTimeout: { result in
+        Log.helper.error("quitHelperLocally: bounded fallback expired with status \(String(describing: result.lastStatus), privacy: .public); terminating helper anyway")
+      },
+      terminate: { DispatchQueue.main.async { NSApp.terminate(nil) } }
+    )
   }
 
   // MARK: - alert

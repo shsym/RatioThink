@@ -172,6 +172,14 @@ final class XPCProtocolTests: XCTestCase {
     assertRoundTrip(LogStream.engine)
   }
 
+  func test_quitHelper_appReplyTimeoutCoversHelperStopReapBudget() {
+    XCTAssertGreaterThanOrEqual(
+      HelperXPCClient.quitReplyTimeout,
+      HelperExportedAPI.stopReplyDeadline + HelperExportedAPI.replyTimeoutSlack,
+      "App-side quit timeout must cover the helper's valid stop/reap window plus slack"
+    )
+  }
+
   // MARK: - startEngine wire convention
 
   func test_startEngine_reply_success_encodes_port_only() throws {

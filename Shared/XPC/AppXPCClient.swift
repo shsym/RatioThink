@@ -41,12 +41,25 @@ public protocol AppXPCClient: Sendable {
   /// or an `AppXPCClientError` on transport failure. Driven by #326's
   /// fresh-install auto-start.
   func startEngine(profileID: String) async throws
+  /// #448: ask the helper to stop the engine and terminate itself as the
+  /// final step of a coordinated full-product quit. Resolves on acceptance;
+  /// throws the helper-side `EngineError` on refusal or an
+  /// `AppXPCClientError` on transport failure. The helper may exit before
+  /// the reply flushes, so a post-call connection invalidation is normal —
+  /// the App-side coordinator treats any outcome as "helper is quitting" and
+  /// proceeds to terminate.
+  func quitHelper() async throws
 }
 
 public extension AppXPCClient {
   /// Default: memory unavailable. Test stubs that don't model the
   /// engineMemory selector inherit nil and need no change.
   func engineMemory() async throws -> EngineMemorySample? { nil }
+
+  /// Default: no helper to quit. Test stubs and the helperless DEBUG
+  /// harness inherit this no-op; only the production `HelperXPCClient`
+  /// drives the real `quitHelper` selector.
+  func quitHelper() async throws {}
 }
 
 public enum AppXPCClientError: Error, Sendable, CustomStringConvertible {
@@ -210,6 +223,76 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
         // the helper-side EngineError describing why the stop was
         // refused. Surface that error verbatim so the caller can decide
         // whether to keep the resident-model state.
+        guard let errorData else {
+          resumeOnce(.success(()))
+          return
+        }
+        do {
+          let engineError = try XPCPayload.decode(EngineError.self, from: errorData)
+          resumeOnce(.failure(engineError))
+        } catch {
+          resumeOnce(.failure(AppXPCClientError.decode(error as NSError)))
+        }
+      }
+    }
+  }
+
+  /// #448: drive the `quitHelper` selector. Uses a dedicated, longer
+  /// deadline than the shared 2s `replyTimeout` because the helper stops +
+  /// reaps the engine (worst case the `LaunchedSession` SIGINT→SIGKILL
+  /// grace) before replying. A healthy engine stops in well under a second;
+  /// the bound exists only so a wedged engine can't hang the App's quit.
+  static let quitReplyTimeout: TimeInterval =
+    HelperExportedAPI.stopReplyDeadline + HelperExportedAPI.replyTimeoutSlack
+
+  public func quitHelper() async throws {
+    let connection = ensureConnection()
+    do {
+      try await quitHelper(on: connection)
+    } catch let error as AppXPCClientError {
+      if case .replyTimeout = error {
+        invalidateIfCurrent(connection)
+      }
+      throw error
+    }
+  }
+
+  private func quitHelper(on connection: NSXPCConnection) async throws {
+    let timeout = Self.quitReplyTimeout
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
+      func resumeOnce(_ result: Result<Void, Error>) {
+        let shouldResume = resumed.withLock { fired -> Bool in
+          if fired { return false }
+          fired = true
+          return true
+        }
+        guard shouldResume else { return }
+        switch result {
+        case .success: continuation.resume(returning: ())
+        case .failure(let e): continuation.resume(throwing: e)
+        }
+      }
+      if timeout > 0 {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+          resumeOnce(.failure(AppXPCClientError.replyTimeout(
+            selector: "quitHelper",
+            timeout: timeout
+          )))
+        }
+      }
+      let proxy = connection.remoteObjectProxyWithErrorHandler { err in
+        // The helper terminating mid-reply surfaces here as
+        // NSXPCConnectionInvalid — for quitHelper that IS the success path
+        // (helper exited), but the App-side coordinator ignores the outcome
+        // and terminates regardless, so reporting it as proxyError is fine.
+        resumeOnce(.failure(AppXPCClientError.proxyError(err as NSError)))
+      }
+      guard let api = proxy as? PieHelperXPC else {
+        resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
+        return
+      }
+      api.quitHelper { errorData in
         guard let errorData else {
           resumeOnce(.success(()))
           return

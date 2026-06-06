@@ -105,6 +105,18 @@ public protocol PieHelperXPC {
   /// clear was refused (engine still alive, no zombie tracked, not
   /// in killRejected state, helper degraded).
   func clearKillRejected(reply: @escaping (_ errorData: Data?) -> Void)
+
+  /// Full-product quit (#448): stop the running engine, WAIT for it to
+  /// reach a terminal state so `pie` is reaped (no orphan process), then
+  /// terminate the Helper itself with a clean exit (so launchd's
+  /// `KeepAlive { SuccessfulExit: false }` does not relaunch it). The App
+  /// calls this as the final step of a coordinated quit after it has
+  /// stopped polling, so nothing respawns the cleanly-exited Helper via the
+  /// on-demand mach service. Reply is nil on acceptance; a non-nil
+  /// `EngineError` reports why the quit could not be honored. The reply may
+  /// also never arrive if the Helper terminates before it flushes — callers
+  /// MUST treat a post-call connection invalidation as success.
+  func quitHelper(reply: @escaping (_ errorData: Data?) -> Void)
 }
 
 /// Convenience encoders/decoders that hide the multi-slot reply tuples
