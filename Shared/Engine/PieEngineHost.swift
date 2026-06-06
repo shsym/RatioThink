@@ -42,6 +42,23 @@ public enum EngineLiveness: Equatable, Sendable {
   case gone(reason: String)
 }
 
+public struct StopAndWaitResult: Equatable, Sendable {
+  public enum Completion: Equatable, Sendable {
+    case terminal
+    case timedOut
+  }
+
+  public let completion: Completion
+  public let lastStatus: EngineStatus
+
+  public var reachedTerminal: Bool { completion == .terminal }
+
+  public init(completion: Completion, lastStatus: EngineStatus) {
+    self.completion = completion
+    self.lastStatus = lastStatus
+  }
+}
+
 public final class PieEngineHost: @unchecked Sendable {
 
   // MARK: - LaunchSpec
@@ -317,6 +334,56 @@ public final class PieEngineHost: @unchecked Sendable {
   public func stop() {
     stateQueue.sync {
       stopLocked()
+    }
+  }
+
+  /// #448 quit primitive: `stop()` the engine and invoke `completion`
+  /// exactly once with a result that distinguishes a real terminal state
+  /// (`.stopped`/`.failed`) from the timeout fallback. Terminal states are
+  /// published only AFTER `LaunchedSession.shutdown` (SIGINT → grace →
+  /// SIGKILL) has reaped the `pie` process, so callers that promise a
+  /// no-orphan structured quit must require `result.reachedTerminal == true`
+  /// before reporting success. The bounded fallback keeps callers observable
+  /// when the engine wedges instead of silently conflating timeout with reap.
+  /// `completion` fires on `stateQueue` (terminal path) or a global queue
+  /// (timeout).
+  public func stopAndWait(timeout: TimeInterval, completion: @escaping @Sendable (StopAndWaitResult) -> Void) {
+    let done = OSAllocatedUnfairLock<Bool>(initialState: false)
+    let tokenBox = OSAllocatedUnfairLock<ObservationToken?>(initialState: nil)
+    func cancelObserver() {
+      tokenBox.withLock { (box: inout ObservationToken?) in
+        box?.cancel()
+        box = nil
+      }
+    }
+    func finish(_ result: StopAndWaitResult) {
+      let already = done.withLock { (d: inout Bool) -> Bool in
+        defer { d = true }
+        return d
+      }
+      cancelObserver()
+      if already { return }
+      completion(result)
+    }
+    // observe() dispatches the CURRENT status synchronously on stateQueue, so
+    // an already-terminal host fires `finish()` immediately.
+    let token = observe { status, _ in
+      switch status {
+      case .stopped, .failed:
+        finish(StopAndWaitResult(completion: .terminal, lastStatus: status))
+      case .starting, .running, .stopping: return
+      }
+    }
+    tokenBox.withLock { $0 = token }
+    if done.withLock({ $0 }) { cancelObserver() }
+    stop()
+    if timeout > 0 {
+      DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout) { [weak self] in
+        finish(StopAndWaitResult(completion: .timedOut, lastStatus: self?.status ?? .failed(
+          code: .unknown,
+          message: "PieEngineHost deallocated before stopAndWait timeout sampled status"
+        )))
+      }
     }
   }
 

@@ -60,7 +60,7 @@ endef
 
 .PHONY: help genproject build build-tests clean lint \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
-        test-xcode-chat-scaffold test-app-unit \
+        test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-curated-hf test-install-guards test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
@@ -89,6 +89,9 @@ build-tests: genproject ## Compile every xcodebuild target + the SPM probe (revi
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build-for-testing
 	xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkGUITests \
+	  -destination 'platform=macOS,arch=arm64' \
+	  -configuration Debug ENABLE_CODE_COVERAGE=NO build-for-testing
+	xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkHelperTests \
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build-for-testing
 	@# pie-resolve-probe is an SPM executable target — xcodebuild
@@ -140,6 +143,27 @@ test-app-unit: genproject $(LOGDIR) ## App-tier unit bundle (xcodebuild RatioThi
 	  if [ "$$status" -ne 0 ]; then exit "$$status"; fi; \
 	  if ! grep -Eq 'Executed [1-9][0-9]* tests, with 0 failures' $$LOG; then \
 	    echo "FAIL: RatioThinkTests bundle did not report an executed-test summary (zero-test guard — filter matched nothing or the bundle did not run)"; \
+	    exit 1; \
+	  fi
+
+test-xcode-helper: genproject $(LOGDIR) ## Run Helper-executable unit tests (#440 deep-link delivery) with zero-test guard
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-xcode-helper.log; \
+	  xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkHelperTests \
+	    -destination 'platform=macOS,arch=arm64' \
+	    -configuration Debug \
+	    -parallel-testing-enabled NO \
+	    ENABLE_CODE_COVERAGE=NO \
+	    test 2>&1 | tee $$LOG | tail -40; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  if [ "$$status" -ne 0 ]; then exit "$$status"; fi; \
+	  if ! grep -Eq "Test Suite 'RatioThinkHelperTests.xctest' passed" $$LOG; then \
+	    echo "FAIL: RatioThinkHelperTests did not execute (host may have booted instead of skipping)"; \
+	    exit 1; \
+	  fi; \
+	  if ! grep -Eq 'Executed [1-9][0-9]* tests, with 0 failures' $$LOG; then \
+	    echo "FAIL: expected XCTest executed-test summary for RatioThinkHelperTests"; \
 	    exit 1; \
 	  fi
 
@@ -382,6 +406,9 @@ test-helper-respawn: ## Acceptance: live launchd Helper auto-respawn (needs sign
 
 test-helper-recovery: ## Acceptance: App-side runtime helper recovery #412 (needs signed install + RatioThink.app running)
 	Scripts/verify-helper-recovery.sh
+
+test-quit-structured: ## Acceptance: #448 structured quit — idle engine persists + ratiothink://quit leaves nothing (needs signed install + engine running)
+	Scripts/verify-structured-quit.sh
 
 test-ssh: test-unit test-scenario test-smoke test-install-guards ## Everything runnable under SSH (no GUI; SPM-only, no xcodebuild app build)
 

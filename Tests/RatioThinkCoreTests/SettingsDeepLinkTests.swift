@@ -34,4 +34,26 @@ final class SettingsDeepLinkTests: XCTestCase {
     XCTAssertFalse(SettingsDeepLink.isSettings(URL(string: "ratiothink://models")!))
     XCTAssertFalse(SettingsDeepLink.isSettings(URL(string: "ratiothink://")!))
   }
+
+  // MARK: - quit (#448)
+
+  func test_quit_url_is_canonical_scheme_and_host() {
+    XCTAssertEqual(SettingsDeepLink.quitURL.absoluteString, "ratiothink://quit")
+    XCTAssertEqual(SettingsDeepLink.quitHost, "quit")
+  }
+
+  func test_quit_matcher_pins_canonical_and_case_insensitive() {
+    XCTAssertTrue(SettingsDeepLink.isQuit(SettingsDeepLink.quitURL))
+    XCTAssertTrue(SettingsDeepLink.isQuit(URL(string: "ratiothink://quit")!))
+    XCTAssertTrue(SettingsDeepLink.isQuit(URL(string: "ratiothink://QUIT")!))
+  }
+
+  func test_quit_and_settings_routes_are_disjoint() {
+    // A drift that aliased the two hosts would make ⌘-clicking Settings quit
+    // the app (or vice-versa) — pin them mutually exclusive.
+    XCTAssertFalse(SettingsDeepLink.isQuit(SettingsDeepLink.settingsURL))
+    XCTAssertFalse(SettingsDeepLink.isSettings(SettingsDeepLink.quitURL))
+    XCTAssertFalse(SettingsDeepLink.isQuit(URL(string: "https://quit")!))
+    XCTAssertFalse(SettingsDeepLink.isQuit(URL(string: "ratiothink://")!))
+  }
 }

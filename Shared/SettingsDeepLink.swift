@@ -21,9 +21,21 @@ public enum SettingsDeepLink {
   /// Host that selects the Settings surface.
   public static let settingsHost = "settings"
 
+  /// Host that requests a full-product quit (#448). The menu-bar Helper
+  /// delivers `ratiothink://quit` to the running App so a single
+  /// coordinator (the App) tears the whole product down — App + Helper +
+  /// engine — instead of the Helper quitting itself while the App keeps
+  /// polling and respawns it on-demand.
+  public static let quitHost = "quit"
+
   /// `ratiothink://settings` — open straight to the Settings window.
   public static var settingsURL: URL {
     URL(string: "\(scheme)://\(settingsHost)")!
+  }
+
+  /// `ratiothink://quit` — ask the running App to perform a full-product quit.
+  public static var quitURL: URL {
+    URL(string: "\(scheme)://\(quitHost)")!
   }
 
   /// `true` when `url` is the canonical open-Settings deep link
@@ -35,5 +47,11 @@ public enum SettingsDeepLink {
   /// no-authority `scheme:opaque` forms.
   public static func isSettings(_ url: URL) -> Bool {
     url.scheme?.lowercased() == scheme && url.host?.lowercased() == settingsHost
+  }
+
+  /// `true` when `url` is the canonical full-quit deep link
+  /// `ratiothink://quit`. Same matching discipline as `isSettings`.
+  public static func isQuit(_ url: URL) -> Bool {
+    url.scheme?.lowercased() == scheme && url.host?.lowercased() == quitHost
   }
 }
