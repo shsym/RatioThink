@@ -66,7 +66,7 @@ fire-and-forget):
 | Call | Purpose |
 |------|---------|
 | `engineStatus()` | Returns the current `EngineStatus`. The app **polls** this (~1 Hz); there is no push channel. |
-| `startEngine(profileID:)` / `stopEngine()` | Bring the engine up for a profile / shut it down. The helper auto-resumes the active profile on boot; the app also invokes `startEngine` for explicit restart and post-download recovery paths. |
+| `startEngine(profileID:)` / `stopEngine()` | Bring the engine up for a profile / shut it down. Helper boot leaves the engine stopped; the app/user launch prompt, explicit restart, and post-download recovery paths invoke `startEngine(profileID:)`. |
 | `loadModel` / `cancelLoad` | Model-load handles (forward-compat stubs in v1 — see invariants). |
 | `downloadModel(repo:file:)` / `cancelDownload` | Fetch a model into the local cache. |
 | `listProfiles()` / `reloadProfiles()` | Read/refresh the on-disk TOML profiles. |
@@ -143,18 +143,17 @@ just confirms the model and emits `model_ready`.
 
 ## Two end-to-end flows
 
-**Cold start.** The helper boots (launchd agent) and **auto-resumes** the last active
-profile in-process — `HelperMain.autoResumeEngineOnBoot()` → `HelperResumeAction.run(…)`
-→ `PieEngineHost.start(spec)` → `PieControlLauncher` boots `pie serve`, completes the WS
-handshake, and installs `chat-apc` → engine reports `.running(port:)`. The app normally
-discovers this via polling: it launches, reconciles the helper registration (re-registers via
-`SMAppService` if the mach service is unreachable), and its `EngineStatusStore` (polling
-at ~1 Hz) sees `.running(port:)` and resolves the HTTP base URL. The app also invokes
-`startEngine(profileID:)` for explicit restart and post-download recovery. Same-profile
-idempotency is handled in `HelperExportedAPI` / `PieEngineHost.startOrAttach`;
-`EngineStatusStore` swallows only App-side reply timeouts because the start remains in
-flight, while any helper `.alreadyRunning` that reaches the app is an incompatible-start
-conflict surfaced to the caller.
+**Cold start.** The helper boots as a launchd agent, publishes its XPC/menu-bar
+state, and leaves the engine `.stopped`; boot model-load is disabled. The app discovers
+that state by polling `engineStatus()` at ~1 Hz after reconciling helper registration
+(re-registering via `SMAppService` if the mach service is unreachable). The launch
+prompt/user-confirm path, explicit Restart, Local API start, and post-download recovery
+paths can then invoke `startEngine(profileID:)`. `HelperExportedAPI` resolves the profile
+and `PieEngineHost.startOrAttach` starts the engine or attaches same-profile requests;
+once `.running(port:)` appears, the app resolves the HTTP base URL. `EngineStatusStore`
+swallows only App-side reply timeouts because the start remains in flight, while any
+helper `.alreadyRunning` that reaches the app is an incompatible-start conflict surfaced
+to the caller.
 
 **Send a message.** You type and hit Return (`ComposerView`) → the user turn is
 saved to SwiftData and `ChatSendController.send()` builds the request →
@@ -183,11 +182,10 @@ Things that are easy to get wrong, and where to look:
   first load shows up as `EngineStatus.starting`, not as in-flight load progress
   (`Shared/Engine/ModelLoadCenter.swift`, `Inferlets/chat-apc/src/control/load.rs`).
 - **XPC status is pull, not push; starts are explicit requests.** The app polls
-  `engineStatus()`; the helper does not stream changes. On cold start, the engine comes
-  up because the helper **auto-resumes** the active profile on boot
-  (`HelperMain.autoResumeEngineOnBoot()` → `HelperResumeAction.run`). The app can also
-  request `startEngine(profileID:)` for explicit restart and post-download recovery
-  paths; same-profile idempotency stays inside `HelperExportedAPI` /
+  `engineStatus()`; the helper does not stream status changes, and helper boot leaves
+  the engine stopped. The launch prompt/user-confirm path plus explicit Restart, Local
+  API start, and post-download recovery can request `startEngine(profileID:)`;
+  same-profile idempotency stays inside `HelperExportedAPI` /
   `PieEngineHost.startOrAttach`. Every XPC reply carries an error channel so a dropped
   click is never silently swallowed (`Shared/XPC/PieHelperXPC.swift`).
 - **Two ports per launch.** pie announces its own control-plane port on stdout (used for
