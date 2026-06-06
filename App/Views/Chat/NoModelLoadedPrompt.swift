@@ -211,7 +211,10 @@ struct NoModelLoadedPrompt: View {
     }
     .padding(20)
     .frame(width: 360)
-    .accessibilityIdentifier("noModel.prompt")
+    // Do not assign an accessibilityIdentifier to this container: on macOS
+    // SwiftUI propagates the container identifier down to descendant
+    // controls, masking their explicit ids (for example noModel.cancel).
+    // The action controls are the stable automation surface for this sheet.
   }
 
   private func header(_ plan: Plan) -> some View {
