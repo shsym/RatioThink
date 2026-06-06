@@ -1799,16 +1799,20 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
         return res.respond(with_launch_diags_header(response)).await;
     }
 
-    if let Err((field, msg)) = validate_sampling(&request, max_output_ceiling()) {
-        return res
-            .respond(with_launch_diags_header(json_error_param(
-                400,
-                "invalid_request",
-                &msg,
-                field,
-            )))
-            .await;
-    }
+    let max_output_ceiling = max_output_ceiling();
+    let effective_max_tokens = match validate_sampling(&request, max_output_ceiling) {
+        Ok(max_tokens) => max_tokens,
+        Err((field, msg)) => {
+            return res
+                .respond(with_launch_diags_header(json_error_param(
+                    400,
+                    "invalid_request",
+                    &msg,
+                    field,
+                )))
+                .await;
+        }
+    };
 
     // F4: reject `role:"tool"` until the chat template grows a real
     // tool slot. Silent demotion to `user` (the prior `_` arm in
@@ -1857,9 +1861,9 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
     // and non-stream `warnings` field and `X-ChatAPC-Launch-Diags`
     // header all source from the same place.
     if request.stream {
-        handle_streaming(request, res).await
+        handle_streaming(request, res, effective_max_tokens).await
     } else {
-        handle_non_streaming(request, res).await
+        handle_non_streaming(request, res, effective_max_tokens).await
     }
 }
 
@@ -1867,9 +1871,6 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
 // Validation (F7)
 // =============================================================================
 
-/// Validate sampling parameters. Returns `Err((field, message))`
-/// where `field` names the offending JSON key (passed to the
-/// OpenAI-shape error envelope's `param`).
 /// Per-request `max_tokens` ceiling, read live from the engine. This is
 /// `runtime::max-output-tokens()` — the runtime-reported output-token
 /// ceiling: configured scheduler `default_token_limit` capped by raw KV
@@ -1890,10 +1891,15 @@ fn max_output_ceiling() -> usize {
 /// hardcoded constant. Kept as a parameter — rather than reading the host
 /// import in here — so this stays a pure function the unit tests can drive
 /// without an engine host.
+/// Returns the effective generation `max_tokens` budget. For omitted
+/// `max_tokens`, the default is clamped down to the runtime ceiling so the
+/// common default request path cannot exceed a memory-aware engine limit.
+/// Returns `Err((field, message))` where `field` names the offending JSON key
+/// (passed to the OpenAI-shape error envelope's `param`).
 fn validate_sampling(
     req: &ChatCompletionsRequest,
     max_output_ceiling: usize,
-) -> Result<(), (&'static str, String)> {
+) -> Result<usize, (&'static str, String)> {
     if let Some(t) = req.temperature {
         if !(t.is_finite() && (0.0..=MAX_TEMPERATURE).contains(&t)) {
             return Err((
@@ -1907,14 +1913,16 @@ fn validate_sampling(
             return Err(("top_p", format!("top_p must be in (0.0, {MAX_TOP_P}]")));
         }
     }
-    if let Some(n) = req.max_tokens {
-        if n == 0 || n > max_output_ceiling {
+    let effective_max_tokens = match req.max_tokens {
+        Some(n) if n == 0 || n > max_output_ceiling => {
             return Err((
                 "max_tokens",
                 format!("max_tokens must be in [1, {max_output_ceiling}]"),
             ));
         }
-    }
+        Some(n) => n,
+        None => DEFAULT_MAX_TOKENS.min(max_output_ceiling),
+    };
     // #418: range-check the speculation knobs at the 400 boundary so an
     // out-of-range value is rejected with a `param`, mirroring
     // `max_tokens` — rather than silently coerced by `to_config`'s
@@ -1938,7 +1946,7 @@ fn validate_sampling(
             }
         }
     }
-    Ok(())
+    Ok(effective_max_tokens)
 }
 
 /// Build an OpenAI-shape error JSON with a populated `param` field.
@@ -1967,10 +1975,13 @@ pub(crate) fn json_error_param(
 // Streaming branch
 // =============================================================================
 
-async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finished {
+async fn handle_streaming(
+    req: ChatCompletionsRequest,
+    res: Responder,
+    max_tokens: usize,
+) -> Finished {
     let temperature = req.temperature.unwrap_or(DEFAULT_TEMPERATURE);
     let top_p = req.top_p.unwrap_or(DEFAULT_TOP_P);
-    let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
     // F9: load the model BEFORE opening the SSE response so a load
     // failure returns a clean 5xx JSON envelope rather than a
@@ -2445,10 +2456,13 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
 // Non-streaming branch (F4 — finish_reason driven by actual termination)
 // =============================================================================
 
-async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Finished {
+async fn handle_non_streaming(
+    req: ChatCompletionsRequest,
+    res: Responder,
+    max_tokens: usize,
+) -> Finished {
     let temperature = req.temperature.unwrap_or(DEFAULT_TEMPERATURE);
     let top_p = req.top_p.unwrap_or(DEFAULT_TOP_P);
-    let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
     // N1: pre-loop 500 paths attach the immutable launch-diags
     // snapshot via the response header. No drain/restore needed —
@@ -3255,6 +3269,20 @@ mod tests {
         // The 400 message reflects the dynamic ceiling, not a constant.
         let (_, msg) = validate_sampling(&mk(99999), 8192).unwrap_err();
         assert!(msg.contains("[1, 8192]"), "got: {msg}");
+    }
+
+    #[test]
+    fn omitted_max_tokens_uses_dynamic_ceiling_when_below_default() {
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(validate_sampling(&req, 512).unwrap(), 512);
+        assert_eq!(
+            validate_sampling(&req, DEFAULT_MAX_TOKENS + 1).unwrap(),
+            DEFAULT_MAX_TOKENS
+        );
     }
 
     #[test]
