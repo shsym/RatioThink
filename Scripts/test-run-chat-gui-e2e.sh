@@ -88,15 +88,15 @@ FAKE_PGREP
   fi
 }
 
-test_partial_hf_cache_is_not_accepted() {
+test_missing_gguf_fixture_is_not_accepted() {
   local tmp
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
 
-  # Fake a seated session and a runnable pie so the flow reaches the HF model
-  # gate, then stage only a *bare* hub dir — the partial/aborted-download shape
-  # the old `[ -d "$dir" ]` check wrongly accepted ( F3). With
-  # autoprep off the gate must report "not cached" and exit, not proceed.
+  # Fake a seated session and a runnable pie so the flow reaches the model
+  # fixture gate. The chat GUI wrapper now serves the seeded GGUF profile slug
+  # through the portable harness, so the wrapper must fail loudly before
+  # starting Xcode/engine work when the GGUF fixture is unavailable.
   mkdir -p "$tmp/bin" "$tmp/hf/hub/models--Qwen--Qwen3-0.6B"
   cat >"$tmp/bin/pgrep" <<'FAKE_PGREP'
 #!/bin/bash
@@ -121,14 +121,15 @@ FAKE_PGREP
   set -e
 
   if [[ "$status" -ne 2 ]]; then
-    echo "FAIL: a bare/partial HF cache must fail the model gate (exit 2), got $status" >&2
+    echo "FAIL: missing GGUF fixture must fail the model gate (exit 2), got $status" >&2
     echo "--- output ---" >&2
-    printf '%s\n' "$output" >&2
+    printf '%s
+' "$output" >&2
     exit 1
   fi
-  require_contains "$output" "not cached and autoprep disabled"
-  if [[ "$output" == *"starting small-model engine harness"* ]]; then
-    echo "FAIL: bare HF cache wrongly accepted as cached — engine harness started" >&2
+  require_contains "$output" "GGUF fixture unavailable"
+  if [[ "$output" == *"starting portable GGUF engine harness"* ]]; then
+    echo "FAIL: missing GGUF fixture wrongly accepted — engine harness started" >&2
     exit 1
   fi
 }
@@ -185,6 +186,6 @@ test_hf_model_cached_helper_contract() {
 
 test_requires_tcc_before_starting_engine
 test_removes_stale_config_on_exit
-test_partial_hf_cache_is_not_accepted
+test_missing_gguf_fixture_is_not_accepted
 test_hf_model_cached_helper_contract
 echo "test-run-chat-gui-e2e: PASS"

@@ -58,13 +58,14 @@ define gui_suite_run
   exit $$status
 endef
 
-.PHONY: help genproject build build-tests clean lint \
+.PHONY: help genproject build build-static build-tests clean lint ci-pr local-pre-merge local-gui-gate local-e2e-gate release-gate \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
-        test-xcode-chat-scaffold test-app-unit \
+        test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit \
         test-unit test-scenario test-smoke test-curated-hf test-install-guards test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
-        test-e2e-engine test-e2e-models test-e2e-load test-e2e-chat test-e2e-full test-helper-respawn \
+        test-e2e-engine test-e2e-models test-e2e-load test-e2e-396 test-e2e-chat test-e2e-full test-helper-respawn test-helper-recovery \
+        test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
         build-inferlets stamp-inferlets verify-inferlets verify-inferlets-inputs \
@@ -80,6 +81,21 @@ build: genproject ## xcodebuild Debug build of RatioThink app + helper
 	xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build
+
+build-static: genproject ## Compile/type-check RatioThink app + helper without building the Rust pie engine (CI v2 PR gate)
+	PIE_SKIP_ENGINE_BUILD=1 xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
+	  -destination 'platform=macOS,arch=arm64' \
+	  -configuration Debug ENABLE_CODE_COVERAGE=NO build
+
+ci-pr: lint test-ci-v2-static-gate verify-app-icon-assets test-app-icon-assets build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary ## Required lightweight PR gate: static/lint/provenance + compile/type + deterministic unit/contracts only
+
+local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary ## Mandatory local pre-merge parity for runtime/heavy checks removed from required PR CI
+
+local-gui-gate: test-gui-script test-gui ## Mandatory local GUI parity gate for UI changes; requires seated session + Automation/Accessibility TCC
+
+local-e2e-gate: test-e2e-engine test-e2e-models test-e2e-load test-e2e-396 test-e2e-chat test-e2e-full test-gui-history test-gui-first-launch-package test-helper-respawn test-helper-recovery ## Operator-gated integration/E2E parity; requires documented models, engine, signing, TCC, or live services
+
+release-gate: local-pre-merge test-curated-hf test-dmg-layout test-release ## Release readiness gate; additionally run release-preflight with ARTIFACT=<built .app|.dmg> after packaging/notarization
 
 install-app: ## Signed install into /Applications, verified end-to-end (Helper+engine+chat). Override DEVELOPMENT_TEAM / CODE_SIGN_IDENTITY per machine.
 	Scripts/install-app.sh
@@ -262,6 +278,79 @@ test-curated-hf: $(LOGDIR) ## Live-HF existence audit of the curated catalog (PI
 test-install-guards: ## Install-time launchd-safety regression guards (stubbed, deterministic — runs anywhere)
 	Scripts/test-proc-acceptance.sh
 	Scripts/test-source-closed.sh
+
+test-ci-v2-static-gate: ## Regression-test the CI v2 required/static gate taxonomy (#456)
+	Scripts/test-ci-v2-static-gate.sh
+
+test-sanitizer-canary: ## Env-sanitizer canary with zero-test guard (deterministic contract; CI v2 lightweight)
+	@set +e +o pipefail; \
+	  LOG=$$(mktemp); \
+	  SPAWN_SANITIZER_CANARY=1 \
+	  PIE_SANITIZER_CANARY=canary \
+	  RUST_SANITIZER_CANARY=canary \
+	  MTL_SANITIZER_CANARY=canary \
+	  XCTestSanitizerCanary=canary \
+	  XCTEST_SANITIZER_CANARY=canary \
+	  __XCODE_SANITIZER_CANARY=canary \
+	  OS_ACTIVITY_SANITIZER_CANARY=canary \
+	  OBJC_SANITIZER_CANARY=canary \
+	  NSZombieEnabled=canary \
+	  PIESURVIVES_CANARY=canary \
+	  MallocCanarySurvives=canary \
+	  xcrun swift test --filter SpawnEnvSanitizerCanaryTests 2>&1 | tee $$LOG; \
+	  status=$${PIPESTATUS[0]}; \
+	  if [ "$$status" -ne 0 ]; then rm -f $$LOG; exit "$$status"; fi; \
+	  if ! grep -Eq 'Executed [3-9][0-9]* tests, with 0 failures' $$LOG; then \
+	    echo "FAIL: expected SpawnEnvSanitizerCanaryTests to execute N>=3 tests; filter may have matched zero tests"; \
+	    rm -f $$LOG; exit 1; \
+	  fi; \
+	  rm -f $$LOG
+
+test-real-pie-driver-contract: engine-bundle $(LOGDIR) ## Local heavy real-binary driver-list contract removed from required PR CI
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-real-pie-driver-contract.log; \
+	  PIE_TEST_REAL_PIE_BIN="$(PWD)/build/pie-engine/$(ARCH)/pie" Scripts/run-swift-test.sh --filter 'test_realPie_driverList_subcommand_exists_and_reports_portable' 2>&1 | tee $$LOG | tail -40; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  if [ "$$status" -ne 0 ]; then exit "$$status"; fi; \
+	  if grep -q 'Test skipped' $$LOG; then \
+	    echo "FAIL: real pie driver-list contract was skipped; PIE_TEST_REAL_PIE_BIN must point at the worktree-built pie binary"; \
+	    exit 1; \
+	  fi; \
+	  if ! grep -Eq 'Executed [1-9][0-9]* tests?, with 0 failures' $$LOG; then \
+	    echo "FAIL: expected real pie driver-list contract to execute N>=1 tests"; \
+	    exit 1; \
+	  fi
+
+test-gmake-recipe-canary: $(LOGDIR) ## Local gmake 4.x recipe guard removed from required PR CI (requires Homebrew gmake)
+	@set -e; \
+	  gmake_bin="$$(command -v gmake || true)"; \
+	  if [ -z "$$gmake_bin" ] && [ -x "$$(brew --prefix 2>/dev/null)/opt/make/libexec/gnubin/make" ]; then \
+	    gmake_bin="$$(brew --prefix)/opt/make/libexec/gnubin/make"; \
+	  fi; \
+	  if [ -z "$$gmake_bin" ]; then \
+	    echo "FAIL: gmake not found; install with 'brew install make' before running make test-gmake-recipe-canary"; \
+	    exit 69; \
+	  fi; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-gmake-canary.log; \
+	  set +e; \
+	  PIE_SANITY_FAIL_INJECTION=1 "$$gmake_bin" test-unit > $$LOG 2>&1; \
+	  status=$$?; \
+	  set -e; \
+	  tail -60 $$LOG; \
+	  echo "log: $$LOG"; \
+	  if [ "$$status" -eq 0 ]; then \
+	    echo "FAIL: expected sanity-fail injection to make gmake test-unit exit nonzero"; \
+	    exit 1; \
+	  fi; \
+	  if ! grep -Fq 'PIE_SANITY_FAIL_INJECTION_FIRED_v1' $$LOG; then \
+	    echo "FAIL: sanity-fail sentinel not found; recipe failed for an unrelated reason"; \
+	    exit 1; \
+	  fi; \
+	  if ! grep -Eq '^log: ' $$LOG || ! grep -Eq 'Executed [0-9]+ tests' $$LOG; then \
+	    echo "FAIL: gmake recipe did not preserve log line and executed-test evidence"; \
+	    exit 1; \
+	  fi
 
 test-e2e-http: $(LOGDIR) ## HTTP API stress + tool-call contract E2E (dummy driver; self-bootstraps pie+wasm; needs uv + Qwen3-0.6B config/tokenizer in HF cache)
 	@set +e +o pipefail; \

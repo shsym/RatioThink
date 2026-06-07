@@ -11,35 +11,50 @@ below in the same change.
 
 | Target | What it runs | Runs where | Gating |
 |---|---|---|---|
-| `make lint` | helper side-effect invariants (static) | anywhere | — |
-| `make build` | Debug build of RatioThink app + helper | anywhere | — |
-| `make build-tests` | **Compile-only** smoke of every xcodebuild target + SPM probe (does NOT run the bundles) | anywhere | — (in CI) |
-| `make test-app-unit` | **RatioThinkTests** app-unit bundle (xcodebuild): #420 deep-link/login-item guards, ChatScaffold, ZeroState, snapshots | anywhere (headless, needs Xcode) | local tier — CI only **compiles** it (via `build-tests`) |
-| `make test-xcode-chat-scaffold` | `ChatScaffoldModelSelectionTests` focused slice of the above (one suite) | anywhere | local tier — subset of `test-app-unit` |
-| `make test-unit` | `RatioThinkCoreTests` (SPM, pure logic) | anywhere | — (in CI) |
-| `make test-scenario` | `CLIScenarioTests` (S0 isolation, S1/S2/S3 XPC + engine integration), headless | anywhere | — |
-| `make test-smoke` | S3 engine subprocess smoke | anywhere | needs built `pie` (`make engine-build`) |
-| `make test-install-guards` | launchd source-closed / agent-reenable / new-bundle acceptance regressions (stubbed) | anywhere | — (in CI) |
-| `make test-collect-diagnostics` | `Scripts/collect-diagnostics.sh` self-test (redacted diagnostics bundle) | anywhere | — (in CI) |
-| `make test-dmg-layout` | DMG drag-install layout verifier regression (hdiutil + codesign) | anywhere | — (in CI) |
-| `make test-release` | real-tool contract tests for `notarize.sh` + `release-preflight.sh` | anywhere | — (in CI) |
-| `make test-stamp` | `Inferlets/chat-apc/_stamp.py` unit tests | anywhere | — |
-| `make test-e2e-http` | chat-apc HTTP API stress + SSE/concurrency + OpenAI tool-call contract (`e2e_test.py` + `stress_e2e_test.py`) vs the **dummy driver** | anywhere (headless) | self-bootstraps `pie` + wasm; needs `uv` + Qwen3-0.6B `config.json`+`tokenizer.json` in HF cache (no weights/GPU) |
-| `make test-ssh` | `test-unit` + `test-scenario` + `test-smoke` + `test-install-guards` | anywhere (no GUI) | — |
-| `make test-gui` | GUI scenarios (S4, S5, and the rest of `Tests/GUIScenarioTests`) via XCUITest | **seated session** | `Dock` running; Automation/Accessibility TCC |
-| `make test-gui-history` | Deterministic multi-turn history/resume E2E | **seated session** | `PIE_TEST_TCC_GRANTED=1` |
-| `make test-gui-first-launch-package` | Package-backed first-launch E2E (Release `.app`) | **seated session** | built artifact + TCC |
-| `make test-gui-script` | Fast preflight regressions for the GUI E2E wrapper scripts | anywhere | — |
-| `make test-all` | `test-ssh` + `test-gui` (GUI skips if no seated session) | seated for full | — |
+| `make ci-pr` | Required GitHub PR aggregate: `lint`, CI-v2 taxonomy guard, app-icon provenance, compile/type check via `build-static`, SPM unit tests, install-guard contracts, diagnostics self-test, sanitizer canary | GitHub required PR workflow + local | **Required PR CI** |
+| `make build-static` | Xcode Debug compile/type check of RatioThink app + helper with `PIE_SKIP_ENGINE_BUILD=1` so the Rust engine long pole is not built | GitHub + local | **Required PR CI** compile/type check |
+| `make local-pre-merge` | `ci-pr` plus `build-tests`, app-unit, scenario/smoke, HTTP E2E, real-pie driver contract, gmake recipe canary | local operator machine | **Mandatory before merge** for non-doc changes; carries runtime coverage removed from required CI |
+| `make local-gui-gate` | GUI wrapper script regressions + full `RatioThinkGUITests` matrix | seated local session | **Mandatory before merge** for GUI/UI changes |
+| `make local-e2e-gate` | Real-engine/model/signing/helper E2E wrappers (`test-e2e-*`, GUI history/package, helper respawn/recovery) | local/operator only | **Mandatory before merge/release** for affected engine/model/install paths |
+| `make release-gate` | `local-pre-merge` + live-HF curated audit + DMG layout + notarization/preflight contract tests | local/operator + release machine | **Mandatory before release**; also run `make release-preflight ARTIFACT=…` on the built artifact |
+| `make lint` | helper side-effect invariants (static) | anywhere | Required PR CI via `ci-pr` |
+| `make build` | Debug build of RatioThink app + helper, including real Rust engine bundle build | local | Local packaging/runtime verification |
+| `make build-tests` | **Compile-only** smoke of every xcodebuild target + SPM probe (does NOT run the bundles) | local | Local pre-merge via `local-pre-merge` |
+| `make test-app-unit` | **RatioThinkTests** app-unit bundle (xcodebuild): #420 deep-link/login-item guards, ChatScaffold, ZeroState, snapshots | local (headless, needs Xcode) | Local pre-merge via `local-pre-merge`; CI only type-checks app/helper via `build-static` |
+| `make test-xcode-chat-scaffold` | `ChatScaffoldModelSelectionTests` focused slice of the above (one suite) | local | Focused local app-unit slice |
+| `make test-unit` | `RatioThinkCoreTests` (SPM, pure/deterministic logic) | GitHub + local | Required PR CI via `ci-pr` |
+| `make test-scenario` | `CLIScenarioTests` (S0 isolation, S1/S2/S3 XPC + engine integration), headless | local | Local pre-merge via `local-pre-merge` |
+| `make test-smoke` | S3 engine subprocess smoke | local | Local pre-merge via `local-pre-merge`; needs built `pie` (`make engine-build`) |
+| `make test-install-guards` | launchd source-closed / agent-reenable / new-bundle acceptance regressions (stubbed) | GitHub + local | Required PR CI via `ci-pr` |
+| `make test-collect-diagnostics` | `Scripts/collect-diagnostics.sh` self-test (redacted diagnostics bundle) | GitHub + local | Required PR CI via `ci-pr` |
+| `make test-sanitizer-canary` | SpawnEnvSanitizer canary through the live Swift test environment with a zero-test guard | GitHub + local | Required PR CI via `ci-pr` |
+| `make test-ci-v2-static-gate` | Shell guard that asserts the workflow/Makefile keep the CI-v2 lightweight/static taxonomy | GitHub + local | Required PR CI via `ci-pr` |
+| `make test-real-pie-driver-contract` | Builds the worktree pie engine and runs the real `pie driver list` drift guard without silent skips | local | Local pre-merge parity for removed `real-pie-driver-contract` CI job |
+| `make test-gmake-recipe-canary` | gmake 4.x recipe failure/log canary (requires Homebrew `gmake`) | local | Local pre-merge parity when Makefile recipes change |
+| `make test-dmg-layout` | DMG drag-install layout verifier regression (hdiutil + codesign) | local/release | Release gate via `release-gate` |
+| `make test-release` | real-tool contract tests for `notarize.sh` + `release-preflight.sh` | local/release | Release gate via `release-gate` |
+| `make test-stamp` | `Inferlets/chat-apc/_stamp.py` unit tests | GitHub when inferlet-relevant paths change + local | Conditional PR provenance gate |
+| `make test-inferlets` | chat-apc Rust unit tests (native cargo test --lib) | GitHub when inferlet-relevant paths change + local | Conditional PR provenance gate |
+| `make verify-inferlets` | Verify committed chat-apc prebuilt + stamp against the tree | GitHub when inferlet-relevant paths change + local | Conditional PR provenance gate |
+| `make build-inferlets` / `make stamp-inferlets` / `make verify-inferlets-inputs` | Rebuild/restamp wasm and check rebuilt-tree inputs | local | Local pre-merge/release when inferlet source, WIT/vendor pin, or prebuilt wasm changes |
+| `make test-curated-hf` | Live-HF existence audit of the curated catalog (`PIE_TEST_REAL_HF=1`; network) | scheduled/targeted PR workflow + local | `curated-catalog-audit` for catalog edits/nightly; release gate via `release-gate` |
+| `make test-e2e-http` | chat-apc HTTP API stress + SSE/concurrency + OpenAI tool-call contract (`e2e_test.py` + `stress_e2e_test.py`) vs the **dummy driver** | local (headless) | Local pre-merge via `local-pre-merge`; needs `uv` + Qwen3-0.6B config/tokenizer HF cache |
+| `make test-ssh` | `test-unit` + `test-scenario` + `test-smoke` + `test-install-guards` | local (no GUI) | Convenience local subset; not required CI |
+| `make test-gui` | GUI scenarios (S4, S5, and the rest of `Tests/GUIScenarioTests`) via XCUITest | **seated session** | Local GUI gate via `local-gui-gate` |
+| `make test-gui-history` | Deterministic multi-turn history/resume E2E | **seated session** | Local E2E gate |
+| `make test-gui-first-launch-package` | Package-backed first-launch E2E (Release `.app`) | **seated session** | Local E2E gate |
+| `make test-gui-script` | Fast preflight regressions for the GUI E2E wrapper scripts | anywhere | Local GUI gate via `local-gui-gate` |
+| `make test-all` | `test-ssh` + `test-app-unit` + `test-gui` (GUI skips if no seated session) | seated for full | Legacy broad local convenience target |
 
 The **`RatioThinkTests`** xcodebuild app-unit target (`Tests/Unit/*`, e.g.
 `ZeroStateActionsTests`, `SettingsDeepLinkBundleTests`,
 `LoginItemPersistenceSummaryTests`, snapshot tests) runs as a whole via
 `make test-app-unit`; run a single slice with
 `xcodebuild -scheme RatioThink -only-testing:RatioThinkTests/<Class> test` (see commands in
-the appendices). It is a **local-tier** bundle: CI only **compiles** it (via
-`make build-tests`), so its app-tier guards assert locally, not in CI — by the
-CI-scope policy below.
+the appendices). It is a **local-tier** bundle: required CI only type-checks the
+app/helper targets via `make build-static`; `make build-tests` compiles the
+app-unit and GUI bundles locally through `make local-pre-merge`, so app-tier
+guards assert before merge rather than in the lightweight GitHub path.
 
 The **`RatioThinkGUITests`** xcodebuild UI-test target (the `S*` suites in
 `Tests/GUIScenarioTests`, catalog below) backs `make test-gui`; run a single
@@ -101,10 +116,10 @@ exact fix command when a human gate is unmet.
 | model load / status | `make test-e2e-load` (S302 indicator); `make test-e2e-396` (S396 failed-load Retry/Dismiss) | — |
 | chat send / persist (real) | `make test-e2e-chat` (S258); `make test-e2e-full` (S204 3-layer) | — |
 | chat history / resume | `make test-gui-history` (S275 deterministic) | — |
-| install-time launchd safety | `make test-install-guards` (stubbed, runs anywhere — in CI) | `test-ssh` |
+| install-time launchd safety | `make test-install-guards` (stubbed, runs anywhere — required CI via `ci-pr`) | `test-ssh` / `ci-pr` |
 | live helper respawn | `make test-helper-respawn` (signed/registered install) | — |
-| diagnostics | `make test-collect-diagnostics` (bundle self-test, in CI) + `DiagnosticLogTests` via `test-unit` | `test-ssh` |
-| notarization / release preflight | `make test-release` (notarize + preflight contract tests) + `make test-dmg-layout` (DMG layout verifier), both in CI; `release-preflight ARTIFACT=…` for a built artifact | — |
+| diagnostics | `make test-collect-diagnostics` (bundle self-test, required CI via `ci-pr`) + `DiagnosticLogTests` via `test-unit` | `test-ssh` / `ci-pr` |
+| notarization / release preflight | `make test-release` (notarize + preflight contract tests) + `make test-dmg-layout` (DMG layout verifier), via `make release-gate`; `release-preflight ARTIFACT=…` for a built artifact | `release-gate` |
 
 `make test-gui` still runs the **entire** `RatioThinkGUITests` matrix; the
 focused targets are `-only-testing` slices of it. A few suites have **no**
@@ -127,58 +142,77 @@ already dead). **A new GUI suite that stages a real `/tmp` home must add its
 glob to `GUI_TMP_HOMES` in the Makefile** — the in-suite `tearDown` is
 best-effort and a no-op under the sandboxed runner.
 
-## Pre-PR gate
+## Pre-PR, pre-merge, and release gates
 
-**CI-scope policy: CI runs only the DETERMINISTIC tier.** A CI test that
-depends on a real timer, wall-clock, real subprocess/network timing, a seated
-GUI session, or a real engine/model is a flake risk, and a flaky *required*
-check erodes the gate. Such a test either moves to the local tier, or — if it
-must stay in CI — is made deterministic with an injected seam (e.g. the
-`PieEngineHost` clock/`sleepFor` seams behind `EngineDeathRecoveryTests`)
-rather than a sleep.
+**CI v2 policy (#456): required GitHub PR CI is the lightweight deterministic
+static gate.** Required CI may run formatting/lint/static checks, compile/type
+checks, cheap provenance checks, and deterministic unit/contract tests. It must
+not depend on a seated GUI session, real model weights, real engine launch,
+network/live-HF access, release signing/notarization credentials, Homebrew gmake
+installation, or broad integration/runtime timing. Coverage removed from the
+required path is mandatory locally through the exact targets below.
 
-**Automated (CI — `.github/workflows/lint.yml`, on push + pull_request,
-`macos-15` runners):** `make lint` + lint self-test → build app + helper →
-`make build-tests` (**compile-only** smoke of the app + test bundles) →
-`make test-unit` + `make test-scenario` (SPM, headless, deterministic) →
-real-pie-driver contract → SpawnEnvSanitizer canary → gmake recipe canary →
-inferlet build/stamp verify → release-script contracts.
+### Required GitHub PR gate
 
-**CI does NOT run** (local responsibility — by the policy above):
-- the **`RatioThinkTests` app-unit bundle** → `make test-app-unit` (the #420
-  deep-link/login-item guards, ChatScaffold, ZeroState, snapshots). CI only
-  **compiles** it (via `build-tests`), so app-tier guards assert locally;
-- any **GUI** scenario (`guardSeatedGUI` skips them all) → `make test-gui*`;
-- any **real-model / real-engine** path (S258, packaged-model, S3-real,
-  `RealEngineLaunchE2ETests`) → `make test-e2e*`;
-- the **HTTP API E2E** (`make test-e2e-http`) — dummy-driver only (no GPU,
-  no model weights) so it is CI-*eligible*, but it needs the `pie` binary
-  built + the small Qwen3-0.6B `config.json`/`tokenizer.json` in the HF
-  cache; provisioning those into `lint.yml` is a tracked follow-up. Run it
-  locally/by operator for now.
+`.github/workflows/lint.yml` is intentionally **not** top-level path-filtered:
+it runs on every `push` and `pull_request`, so a protected required check cannot
+remain Pending because GitHub skipped the workflow. The required workflow now has
+only two check families:
 
-There is **no local git hook**. So app-unit + GUI + real-model proof is manual
-and developer-owned. A PR touching those areas must carry its own evidence (log
-/ wrapper PASS line) in the PR body.
+| Job | Classification | Runs | Notes |
+|---|---|---|---|
+| `PR static gate` | required-static + required-lightweight-runtime | `make ci-pr` | Lint, CI taxonomy guard, app-icon provenance, `build-static`, SPM unit tests, install/diagnostics contracts, sanitizer canary. |
+| `chat-apc inferlet provenance` | required cheap provenance, path-conditional | `make test-stamp`; `make test-inferlets`; `make verify-inferlets` | Uses a job-level `if:` with `needs.changes.outputs.inferlets != 'false'` and `!cancelled()` so unrelated PRs skip-as-Success, while detector failures fail open by running the checks. |
+| `curated-catalog-audit` workflow | optional/scheduled + targeted PR | `make test-curated-hf` | Separate workflow. Runs nightly/manual and on PRs touching the curated catalog/tests; unrelated PRs do not hit live HF. |
+
+`make build-static` is the PR compile/type check. It uses
+`PIE_SKIP_ENGINE_BUILD=1` so the Xcode app/helper targets still compile while
+skipping the Rust pie-engine build phase that caused the old long pole. Do not
+use `PIE_SKIP_ENGINE_BUILD=1` for packaging, release, or runtime verification.
+
+### Removed required-CI coverage and local parity commands
+
+Every suite/job removed from required PR CI maps to an explicit local command:
+
+| Removed/kept-out CI job or suite | Classification | Replacement command | When it is mandatory |
+|---|---|---|---|
+| Old `build every xcodebuild target` job (`make build` + `make build-tests`) | local-required-before-merge | `make local-pre-merge` (contains `make build-tests`); use `make build` for real bundle/runtime packaging checks | Before merge for non-doc code changes; always before release |
+| `RatioThinkTests` app-unit bundle | local-required-before-merge | `make test-app-unit` or aggregate `make local-pre-merge` | App/UI/deep-link/login-item/snapshot changes |
+| `CLIScenarioTests` / old CI scenario step | local-required-before-merge | `make test-scenario` or aggregate `make local-pre-merge` | Engine/helper/XPC/scenario-affecting changes |
+| S3 engine subprocess smoke | local-required-before-merge | `make test-smoke` or aggregate `make local-pre-merge` | Engine subprocess/inference launch changes |
+| Old `real-pie-driver-contract` CI job | local-required-before-merge | `make test-real-pie-driver-contract` or aggregate `make local-pre-merge` | Pie driver/probe/engine launch contract changes; before release |
+| Old `gmake-sanity-fail-injection` CI job | local-required-before-merge for Makefile work | `make test-gmake-recipe-canary` (install Homebrew `gmake` first if needed) | Makefile recipe/logging changes; before release if recipes changed |
+| Old `release-scripts` CI job | local-required-before-release | `make test-release`; aggregate `make release-gate` | Before release or when notarize/preflight scripts change |
+| DMG layout verifier | local-required-before-release | `make test-dmg-layout`; aggregate `make release-gate` | Before release or when packaging layout changes |
+| Live-HF curated catalog existence | optional/manual + local release | `make test-curated-hf`; also scheduled/targeted `curated-catalog-audit` workflow | Before release; on curated catalog/test changes; nightly drift check |
+| Inferlet wasm rebuild/restamp (`make build-inferlets`) | local-required-before-merge for inferlet changes | `make stamp-inferlets` then `make verify-inferlets-inputs`; cheap `make test-stamp test-inferlets verify-inferlets` remains conditional PR CI | When `Inferlets/**`, `Vendor/pie`, WIT/vendor pin, or prebuilt wasm changes |
+| HTTP API E2E | local-required-before-merge | `make test-e2e-http` or aggregate `make local-pre-merge` | chat-apc HTTP/SSE/tool-call changes |
+| GUI/XCUITest suites | local-required-before-merge for UI | `make local-gui-gate` or focused `make test-gui-*` targets | SwiftUI/layout/copy/a11y/menu/wizard/model UI changes; requires seated session + TCC |
+| Real-engine/model/signing/helper E2E wrappers | local-required-before-merge/release for affected paths | `make local-e2e-gate` or focused `make test-e2e-*`, `make test-gui-history`, `make test-gui-first-launch-package`, `make test-helper-respawn`, `make test-helper-recovery` | Engine/model/download/chat persistence/install/helper lifecycle changes; before release for affected areas |
+| Packaging/notarization artifact assessment | local-required-before-release | `make release-preflight ARTIFACT=path/to/RatioThink.app` or `make release-preflight ARTIFACT=path/to/RatioThink-<arch>.dmg` after packaging/notarization | Every release candidate artifact |
 
 ### Confirm-before-PR by change type
 
-| You changed… | Run before PR |
+| You changed… | Run before PR / before merge |
 |---|---|
-| Pure logic / models / services (no UI) | `make test-ssh` (SPM) + `make test-app-unit` if you touched anything in the app-tier `RatioThinkTests` bundle |
-| Deep link / URL scheme / login-item / menu-bar persistence copy (#420/#440) | `make test-app-unit` (`SettingsDeepLinkBundleTests` CFBundleURLTypes guard, `LoginItemPersistenceSummaryTests` copy guard) — these assert locally only; `make test-unit` still covers the `SettingsDeepLink` SPM matcher |
-| SwiftUI views / layout / copy / a11y ids | `make test-ssh` + `make test-app-unit` + the affected GUI suite(s) (e.g. `-only-testing:RatioThinkGUITests/S285_…`, `…/S5_…`, `…/S7_…`) |
-| Chat ↔ engine send / streaming / persistence | the affected GUI suite **+ a real-model proof**: `Scripts/run-chat-gui-e2e.sh` (Appendix B) or `make test-gui-history` |
-| First-launch / wizard / model download | `S7_*` GUI suites + `make test-gui-first-launch-package` |
-| Engine launch / supervisor / XPC / helper | `make test-ssh` (incl. `test-smoke`) + `S4_HelperMenuBarGUITests`; real-engine S3 (Appendix A) if launch args changed |
-| Engine subprocess / inference contract | S3-real (Appendix A) + `make test-stamp` if inferlet stamps touched |
-| chat-apc HTTP routes / SSE / tool calling (`Inferlets/chat-apc/src`) | `make test-e2e-http` (rebuilds wasm + restamps via `stamp-inferlets` if you edited `src/`) |
-| Broad / release / "everything" | `make test-all` on a seated session (real-model wrappers run separately) |
+| Docs-only / comments-only | `make test-ci-v2-static-gate` if CI taxonomy docs/workflow/Makefile changed; otherwise no broad local gate required |
+| Required CI workflow / Makefile taxonomy | `make test-ci-v2-static-gate`; `make ci-pr`; `make test-gmake-recipe-canary` if recipe failure/logging behavior changed |
+| Pure logic / models / services (no UI) | `make ci-pr` locally, then `make local-pre-merge` before merge |
+| Deep link / URL scheme / login-item / menu-bar persistence copy (#420/#440) | `make local-pre-merge` (includes `make test-app-unit`; `SettingsDeepLinkBundleTests` and `LoginItemPersistenceSummaryTests` assert locally) |
+| SwiftUI views / layout / copy / a11y ids | `make local-pre-merge` + `make local-gui-gate` or the affected focused GUI suite(s) |
+| Chat ↔ engine send / streaming / persistence | `make local-pre-merge` + affected GUI suite + real-model proof: `make test-e2e-chat`, `Scripts/run-chat-gui-e2e.sh`, or `make test-gui-history` |
+| First-launch / wizard / model download | `make local-gui-gate` focused to S7 where possible + `make test-gui-first-launch-package`; add `make test-e2e-models` for real model acquisition/download paths |
+| Engine launch / supervisor / XPC / helper | `make local-pre-merge` + `make test-e2e-engine`; add `make test-gui-helper` / `make test-helper-respawn` / `make test-helper-recovery` for helper lifecycle or signed-install changes |
+| Engine subprocess / inference contract | `make test-smoke` + `make test-real-pie-driver-contract`; add S3-real from Appendix A when launch args or inference semantics changed |
+| chat-apc HTTP routes / SSE / tool calling (`Inferlets/chat-apc/src`) | `make test-e2e-http`; `make stamp-inferlets`; `make verify-inferlets-inputs`; conditional PR CI also runs `make test-stamp`, `make test-inferlets`, `make verify-inferlets` |
+| Curated catalog coordinates | `make test-curated-hf`; targeted `curated-catalog-audit` PR workflow will also run live HF |
+| Packaging / notarization / release scripts | `make release-gate`; after building the candidate artifact, run `make release-preflight ARTIFACT=…` |
+| Broad / release / "everything" | `make release-gate` + `make local-gui-gate` + `make local-e2e-gate` on an operator machine with the documented models, TCC, signing, and live-service prerequisites |
 
-Rule of thumb: always run `make test-ssh` (cheap, runs anywhere); add the GUI
-suite(s) whose code you touched; add a real-model wrapper only when you touched
-the chat↔engine path. Don't run the full GUI matrix for an isolated change —
-run the affected suites for fast, attributable signal.
+There is **no local git hook**. Local verification is developer-owned and
+mandatory for coverage moved out of the required GitHub path. A PR touching one
+of the local-only areas should carry the relevant command/log evidence in the
+PR body.
 
 The appendices below are the maintained run commands + last-observed PASS
 evidence for the real-model / deterministic E2E wrappers.
