@@ -184,7 +184,10 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // paths reach this hook still apply — SIGKILL/SIGABRT/exit(_:)
     // skip the helper teardown entirely, in which case launchd
     // reaps the child via process-group cleanup.
-    engineHost?.stop(reason: "helper.applicationWillTerminate")
+    // A graceful helper teardown takes the engine with it; preserve both the
+    // durable shutdown reason and the initiator so diagnostics distinguish this
+    // from an operator Pause.
+    engineHost?.stop(reason: "helper.applicationWillTerminate", initiator: .helper)
     profileStore?.stop()
     profileStore = nil
     if let xpcListener {
@@ -321,7 +324,14 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
               Log.helper.notice("auto-relaunch outcome: \(String(describing: outcome), privacy: .public)")
             }
           }
-        }
+        },
+        // #447: durable, chat-free engine death diagnostics. The sinks write
+        // the `engine.terminated` breadcrumb (helper.log) + the bounded
+        // redacted stderr tail (engine.log); the guardrail feeds the
+        // likely-OOM heuristic (SIGKILL-not-by-us + last-RSS >= ceiling).
+        terminationSink: PieEngineHost.productionTerminationSink,
+        tailWriter: PieEngineHost.productionTailWriter,
+        guardrailBytes: ModelMemoryGuardrail.defaultPolicy.maxResolvedModelBytes
       )
       holder.helper = self
       self.engineHost = host

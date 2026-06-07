@@ -49,13 +49,7 @@ final class S279_LifecycleRecoveryGUITests: XCTestCase {
       return
     }
 
-    let composer = app.descendants(matching: .any)
-      .matching(identifier: "composer.text")
-      .firstMatch
-    XCTAssertTrue(composer.waitForExistence(timeout: 5),
-                  "composer.text missing after stale engine error; app tree: \(app.debugDescription)")
-    composer.click()
-    composer.typeText("Retry after lifecycle recovery")
+    typeComposerText("Retry after lifecycle recovery", in: app)
 
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5),
@@ -77,19 +71,11 @@ final class S279_LifecycleRecoveryGUITests: XCTestCase {
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
   }
 
+  @MainActor
   private func createChatAndSend(_ prompt: String, in app: XCUIApplication) throws {
-    let newChat = app.buttons["chats.newButton"]
-    XCTAssertTrue(newChat.waitForExistence(timeout: 10),
-                  "New Chat button missing; app tree: \(app.debugDescription)")
-    newChat.click()
+    openFreshChat(in: app)
 
-    let composer = app.descendants(matching: .any)
-      .matching(identifier: "composer.text")
-      .firstMatch
-    XCTAssertTrue(composer.waitForExistence(timeout: 10),
-                  "composer.text missing after creating chat; app tree: \(app.debugDescription)")
-    composer.click()
-    composer.typeText(prompt)
+    typeComposerText(prompt, in: app)
 
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5),

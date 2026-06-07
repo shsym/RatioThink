@@ -381,6 +381,222 @@ final class PieEngineHostTests: XCTestCase {
     }
   }
 
+  func test_launch_timeout_waits_for_launcher_cleanup_before_terminal_failure_and_restart() {
+    let firstStarted = expectation(description: "launch started")
+    let timeoutArmed = expectation(description: "launch timeout armed")
+    let launches = LaunchGate(started: [firstStarted])
+    let sleeps = SleepGate(armed: [timeoutArmed])
+    let capturedTermination = OSAllocatedUnfairLock<EngineTermination?>(initialState: nil)
+    let terminationCaptured = expectation(description: "handshake timeout termination captured")
+    let host = PieEngineHost(
+      launcher: { spec in try await launches.launch(spec) },
+      terminationSink: { termination in
+        capturedTermination.withLock { $0 = termination }
+        terminationCaptured.fulfill()
+      },
+      launchTimeoutSlack: 0,
+      sleepFor: { seconds in await sleeps.sleep(seconds) }
+    )
+
+    XCTAssertNoThrow(try host.start(makeSpec(profileID: "chat", handshakeTimeout: 0.2)).get())
+    wait(for: [firstStarted, timeoutArmed], timeout: 2)
+
+    sleeps.wake(0)
+    let stoppingObserved = expectation(description: "timed out launch moves to stopping while cleanup runs")
+    let stoppingToken = host.observe { status, token in
+      if case .stopping = status {
+        stoppingObserved.fulfill()
+        token.cancel()
+      }
+    }
+    wait(for: [stoppingObserved], timeout: 2)
+    stoppingToken.cancel()
+    XCTAssertEqual(host.status, EngineStatus.stopping)
+
+    let overlappingStart = host.start(makeSpec(profileID: "retry", handshakeTimeout: 0.2))
+    guard case .failure(let startError) = overlappingStart else {
+      return XCTFail("timed-out launch must remain non-restartable until launcher cleanup completes")
+    }
+    XCTAssertEqual(startError.code, EngineErrorCode.alreadyRunning)
+
+    let stopAndWaitDone = expectation(description: "stopAndWait reports timeout, not terminal reap")
+    host.stopAndWait(timeout: 0.05) { result in
+      XCTAssertFalse(result.reachedTerminal,
+                     "cleanup is still running, so stopAndWait must not report a proven reap")
+      XCTAssertEqual(result.completion, StopAndWaitResult.Completion.timedOut)
+      XCTAssertEqual(result.lastStatus, .stopping)
+      stopAndWaitDone.fulfill()
+    }
+    wait(for: [stopAndWaitDone], timeout: 2)
+
+    let failedObserved = expectation(description: "handshake timeout publishes after cleanup")
+    let failedToken = host.observe { status, token in
+      if case .failed(.handshakeTimeout, let message) = status {
+        XCTAssertTrue(message.contains("launch timed out"), "got \(message)")
+        failedObserved.fulfill()
+        token.cancel()
+      }
+    }
+    launches.fail(0, CancellationError())
+    wait(for: [failedObserved, terminationCaptured], timeout: 2)
+    failedToken.cancel()
+
+    let termination = capturedTermination.withLock { $0 }
+    XCTAssertEqual(termination?.cause, .handshakeTimeout)
+    XCTAssertEqual(termination?.initiator, .launch)
+  }
+
+  func test_launch_timeout_stoppingFallback_usesLauncherTimeoutTail() {
+    let firstStarted = expectation(description: "launch started")
+    let timeoutArmed = expectation(description: "launch timeout armed")
+    let launches = LaunchGate(started: [firstStarted])
+    let sleeps = SleepGate(armed: [timeoutArmed])
+    let unique = "launcher-timeout-tail-\(UUID().uuidString)"
+    let capturedTail = OSAllocatedUnfairLock<[String]>(initialState: [])
+    let tailCaptured = expectation(description: "tail writer captured launcher timeout tail")
+    let host = PieEngineHost(
+      launcher: { spec in try await launches.launch(spec) },
+      terminationSink: { _ in },
+      tailWriter: { lines in
+        capturedTail.withLock { $0 = lines }
+        tailCaptured.fulfill()
+      },
+      launchTimeoutSlack: 0,
+      sleepFor: { seconds in await sleeps.sleep(seconds) }
+    )
+
+    XCTAssertNoThrow(try host.start(makeSpec(profileID: "chat", handshakeTimeout: 0.2)).get())
+    wait(for: [firstStarted, timeoutArmed], timeout: 2)
+
+    sleeps.wake(0)
+    let stoppingObserved = expectation(description: "timed out launch moves to stopping")
+    let stoppingToken = host.observe { status, token in
+      if case .stopping = status {
+        stoppingObserved.fulfill()
+        token.cancel()
+      }
+    }
+    wait(for: [stoppingObserved], timeout: 2)
+    stoppingToken.cancel()
+
+    launches.fail(0, PieControlLauncher.LaunchError.handshakeTimeout(
+      elapsed: 0.2,
+      lastLines: [unique]))
+    wait(for: [tailCaptured], timeout: 2)
+
+    XCTAssertEqual(capturedTail.withLock { $0 }, [unique])
+  }
+
+  func test_launch_timeout_realLauncher_emitsCapturedTailAfterCleanup() throws {
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("pie-host-timeout-tail-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    let marker = tmp.appendingPathComponent("line-written")
+    let script = tmp.appendingPathComponent("stub-pie")
+    let unique = "host-timeout-pre-handshake-tail-\(UUID().uuidString)"
+    try """
+    #!/bin/sh
+    trap 'kill "$child" 2>/dev/null; exit 0' INT TERM
+    i=0
+    while [ "$i" -lt 8 ]; do
+      /bin/echo "\(unique)" >&2
+      i=$((i + 1))
+    done
+    sleep 30 &
+    child=$!
+    touch "\(marker.path)"
+    wait "$child"
+    """.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                          ofItemAtPath: script.path)
+
+    let timeoutArmed = expectation(description: "host timeout armed")
+    let sleeps = SleepGate(armed: [timeoutArmed])
+    let capturedTermination = OSAllocatedUnfairLock<EngineTermination?>(initialState: nil)
+    let capturedTail = OSAllocatedUnfairLock<[String]>(initialState: [])
+    let terminationCaptured = expectation(description: "handshake timeout termination captured")
+    let tailCaptured = expectation(description: "tail writer captured timeout output")
+    let host = PieEngineHost(
+      launcher: { spec in
+        let launched = try await PieControlLauncher.launch(spec: spec)
+        return (port: EnginePort(launched.httpPort), session: launched.session)
+      },
+      livenessInterval: 0,
+      relaunchPolicy: PieEngineHost.RelaunchPolicy(maxAttempts: 0),
+      terminationSink: { termination in
+        capturedTermination.withLock { $0 = termination }
+        terminationCaptured.fulfill()
+      },
+      tailWriter: { lines in
+        capturedTail.withLock { $0 = lines }
+        tailCaptured.fulfill()
+      },
+      launchTimeoutSlack: 0,
+      sleepFor: { seconds in await sleeps.sleep(seconds) }
+    )
+    let spec = try PieControlLauncher.LaunchSpec(
+      pieBinary: script,
+      wasmURL: tmp.appendingPathComponent("unused.wasm"),
+      manifestURL: tmp.appendingPathComponent("unused.toml"),
+      subprocessEnvironment: [:],
+      pieHome: tmp.appendingPathComponent("home"),
+      shmemName: "/pie_test_\(UUID().uuidString.prefix(8))",
+      handshakeTimeout: 30,
+      profileID: "chat",
+      modelConfig: .dummy)
+
+    XCTAssertNoThrow(try host.start(spec).get())
+    wait(for: [timeoutArmed], timeout: 2)
+    waitForFile(marker, timeout: 2)
+    sleeps.wake(0)
+    wait(for: [terminationCaptured, tailCaptured], timeout: 5)
+
+    XCTAssertEqual(capturedTermination.withLock { $0 }?.cause, .handshakeTimeout)
+    XCTAssertTrue(capturedTail.withLock { $0 }.contains(unique),
+                  "host-owned timeout must pass the launcher's redacted diagnostic tail to tailWriter; got \(capturedTail.withLock { $0 })")
+  }
+
+  func test_launch_timeout_cleanup_failure_publishesKillRejectedInsteadOfHandshakeTimeout() {
+    let firstStarted = expectation(description: "launch started")
+    let timeoutArmed = expectation(description: "launch timeout armed")
+    let launches = LaunchGate(started: [firstStarted])
+    let sleeps = SleepGate(armed: [timeoutArmed])
+    let host = PieEngineHost(
+      launcher: { spec in try await launches.launch(spec) },
+      launchTimeoutSlack: 0,
+      sleepFor: { seconds in await sleeps.sleep(seconds) }
+    )
+
+    XCTAssertNoThrow(try host.start(makeSpec(profileID: "chat", handshakeTimeout: 0.2)).get())
+    wait(for: [firstStarted, timeoutArmed], timeout: 2)
+
+    let stoppingObserved = expectation(description: "timed out launch waits in stopping")
+    let stoppingToken = host.observe { status, token in
+      if case .stopping = status {
+        stoppingObserved.fulfill()
+        token.cancel()
+      }
+    }
+    sleeps.wake(0)
+    wait(for: [stoppingObserved], timeout: 2)
+    stoppingToken.cancel()
+
+    let failedObserved = expectation(description: "cleanup failure publishes killRejected")
+    let failedToken = host.observe { status, token in
+      if case .failed(.killRejected, let message) = status {
+        XCTAssertEqual(message, "SIGKILL + 5s waitpid window did not reap pid 4242")
+        failedObserved.fulfill()
+        token.cancel()
+      }
+    }
+    launches.fail(0, PieControlLauncher.LaunchError.shutdownFailed(
+      underlying: "CancellationError()",
+      shutdownFailure: "SIGKILL + 5s waitpid window did not reap pid 4242"
+    ))
+    wait(for: [failedObserved], timeout: 2)
+    failedToken.cancel()
+  }
+
   func test_stale_launch_timeout_after_running_is_inert() {
     let session = FakeSession()
     let host = PieEngineHost(
@@ -411,219 +627,45 @@ final class PieEngineHostTests: XCTestCase {
     host.stop()
   }
 
-  func test_stale_launch_success_after_timeout_does_not_overwrite_retry() {
-    let firstStarted = expectation(description: "launch #1 started")
-    let secondStarted = expectation(description: "launch #2 started")
-    let firstTimeoutArmed = expectation(description: "launch #1 timeout armed")
-    let secondTimeoutArmed = expectation(description: "launch #2 timeout armed")
-    let launches = LaunchGate(started: [firstStarted, secondStarted])
-    let sleeps = SleepGate(armed: [firstTimeoutArmed, secondTimeoutArmed])
+  func test_timed_out_launch_success_cleans_session_before_retry_can_start() {
     let firstSession = FakeSession()
-    let secondSession = FakeSession()
-    let host = PieEngineHost(
-      launcher: { spec in try await launches.launch(spec) },
-      launchTimeoutSlack: 0,
-      sleepFor: { seconds in await sleeps.sleep(seconds) }
+    assertRetryStartsOnlyAfterTimedOutLaunchCleanup(
+      completeFirstLaunch: { launches in
+        launches.succeed(0, port: EnginePort(1001), session: firstSession)
+      },
+      assertAfterFirstCleanup: {
+        XCTAssertEqual(firstSession.shutdownCount, 1,
+                       "timed-out successful launch must shut down its returned session before retry")
+      }
     )
-
-    XCTAssertNoThrow(try host.start(makeSpec(profileID: "chat", handshakeTimeout: 0.2)).get())
-    wait(for: [firstStarted, firstTimeoutArmed], timeout: 2)
-
-    let timedOut = expectation(description: "launch #1 times out")
-    var sawTimeout = false
-    let timeoutToken = host.observe { status, token in
-      if case .failed(.handshakeTimeout, _) = status, !sawTimeout {
-        sawTimeout = true
-        timedOut.fulfill()
-        token.cancel()
-      }
-    }
-    sleeps.wake(0)
-    wait(for: [timedOut], timeout: 2)
-    timeoutToken.cancel()
-
-    XCTAssertNoThrow(try host.start(makeSpec(profileID: "tree-of-thought", handshakeTimeout: 0.2)).get())
-    wait(for: [secondStarted, secondTimeoutArmed], timeout: 2)
-
-    let running = expectation(description: "launch #2 owns running state")
-    let runningToken = host.observe { status, token in
-      if case .running(let port, let profileID) = status,
-         port == 2002, profileID == "tree-of-thought" {
-        running.fulfill()
-        token.cancel()
-      }
-    }
-    launches.succeed(0, port: EnginePort(1001), session: firstSession)
-    launches.succeed(1, port: EnginePort(2002), session: secondSession)
-    wait(for: [running], timeout: 2)
-    runningToken.cancel()
-
-    guard case .running(let port, let profileID) = host.status else {
-      return XCTFail("retry launch must remain running; status=\(host.status)")
-    }
-    XCTAssertEqual(port, 2002)
-    XCTAssertEqual(profileID, "tree-of-thought")
-    XCTAssertEqual(firstSession.shutdownCount, 1,
-                   "stale successful launch must shut down only its own returned session")
-    XCTAssertEqual(secondSession.shutdownCount, 0,
-                   "current retry session must remain owned by the host")
-    host.stop()
   }
 
-  func test_stale_launch_cancellation_after_timeout_does_not_stop_retry() {
-    let firstStarted = expectation(description: "launch #1 started")
-    let secondStarted = expectation(description: "launch #2 started")
-    let firstTimeoutArmed = expectation(description: "launch #1 timeout armed")
-    let secondTimeoutArmed = expectation(description: "launch #2 timeout armed")
-    let launches = LaunchGate(started: [firstStarted, secondStarted])
-    let sleeps = SleepGate(armed: [firstTimeoutArmed, secondTimeoutArmed])
-    let secondSession = FakeSession()
-    let host = PieEngineHost(
-      launcher: { spec in try await launches.launch(spec) },
-      launchTimeoutSlack: 0,
-      sleepFor: { seconds in await sleeps.sleep(seconds) }
-    )
-
-    XCTAssertNoThrow(try host.start(makeSpec(profileID: "chat", handshakeTimeout: 0.2)).get())
-    wait(for: [firstStarted, firstTimeoutArmed], timeout: 2)
-    let timedOut = expectation(description: "launch #1 times out")
-    var sawTimeout = false
-    let timeoutToken = host.observe { status, token in
-      if case .failed(.handshakeTimeout, _) = status, !sawTimeout {
-        sawTimeout = true
-        timedOut.fulfill()
-        token.cancel()
-      }
-    }
-    sleeps.wake(0)
-    wait(for: [timedOut], timeout: 2)
-    timeoutToken.cancel()
-
-    XCTAssertNoThrow(try host.start(makeSpec(profileID: "tree-of-thought", handshakeTimeout: 0.2)).get())
-    wait(for: [secondStarted, secondTimeoutArmed], timeout: 2)
-
-    launches.fail(0, CancellationError())
-    let staleCancellationSettled = expectation(description: "stale cancellation processed")
-    DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
-      staleCancellationSettled.fulfill()
-    }
-    wait(for: [staleCancellationSettled], timeout: 1)
-    guard case .starting = host.status else {
-      return XCTFail("stale launch #1 cancellation must leave launch #2 starting; status=\(host.status)")
-    }
-    let running = expectation(description: "launch #2 owns running state")
-    let runningToken = host.observe { status, token in
-      if case .running(let port, let profileID) = status,
-         port == 2002, profileID == "tree-of-thought" {
-        running.fulfill()
-        token.cancel()
-      }
-    }
-    launches.succeed(1, port: EnginePort(2002), session: secondSession)
-    wait(for: [running], timeout: 2)
-    runningToken.cancel()
-
-    XCTAssertEqual(host.status, .running(port: 2002, profileID: "tree-of-thought"))
-    XCTAssertEqual(secondSession.shutdownCount, 0)
-    host.stop()
-  }
-
-  func test_stale_launch_error_after_timeout_does_not_fail_retry() {
-    struct Boom: Error, CustomStringConvertible { var description: String { "late launch #1 boom" } }
-
-    let firstStarted = expectation(description: "launch #1 started")
-    let secondStarted = expectation(description: "launch #2 started")
-    let firstTimeoutArmed = expectation(description: "launch #1 timeout armed")
-    let secondTimeoutArmed = expectation(description: "launch #2 timeout armed")
-    let launches = LaunchGate(started: [firstStarted, secondStarted])
-    let sleeps = SleepGate(armed: [firstTimeoutArmed, secondTimeoutArmed])
-    let secondSession = FakeSession()
-    let host = PieEngineHost(
-      launcher: { spec in try await launches.launch(spec) },
-      launchTimeoutSlack: 0,
-      sleepFor: { seconds in await sleeps.sleep(seconds) }
-    )
-
-    XCTAssertNoThrow(try host.start(makeSpec(profileID: "chat", handshakeTimeout: 0.2)).get())
-    wait(for: [firstStarted, firstTimeoutArmed], timeout: 2)
-    let timedOut = expectation(description: "launch #1 times out")
-    var sawTimeout = false
-    let timeoutToken = host.observe { status, token in
-      if case .failed(.handshakeTimeout, _) = status, !sawTimeout {
-        sawTimeout = true
-        timedOut.fulfill()
-        token.cancel()
-      }
-    }
-    sleeps.wake(0)
-    wait(for: [timedOut], timeout: 2)
-    timeoutToken.cancel()
-
-    XCTAssertNoThrow(try host.start(makeSpec(profileID: "tree-of-thought", handshakeTimeout: 0.2)).get())
-    wait(for: [secondStarted, secondTimeoutArmed], timeout: 2)
-
-    launches.fail(0, Boom())
-    let staleErrorSettled = expectation(description: "stale error processed")
-    DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
-      staleErrorSettled.fulfill()
-    }
-    wait(for: [staleErrorSettled], timeout: 1)
-    guard case .starting = host.status else {
-      return XCTFail("stale launch #1 error must leave launch #2 starting; status=\(host.status)")
-    }
-    let running = expectation(description: "launch #2 owns running state")
-    let runningToken = host.observe { status, token in
-      if case .running(let port, let profileID) = status,
-         port == 2002, profileID == "tree-of-thought" {
-        running.fulfill()
-        token.cancel()
-      }
-    }
-    launches.succeed(1, port: EnginePort(2002), session: secondSession)
-    wait(for: [running], timeout: 2)
-    runningToken.cancel()
-
-    XCTAssertEqual(host.status, .running(port: 2002, profileID: "tree-of-thought"))
-    XCTAssertEqual(secondSession.shutdownCount, 0)
-    host.stop()
-  }
-
-  func test_stale_launch_success_does_not_complete_unrelated_slow_stop() {
-    let firstSession = FakeSession()
-    assertStaleLaunchCompletionDoesNotCompleteUnrelatedSlowStop { launches in
-      launches.succeed(0, port: EnginePort(1001), session: firstSession)
-    }
-    XCTAssertEqual(firstSession.shutdownCount, 1,
-                   "stale successful launch must shut down only its own returned session")
-  }
-
-  func test_stale_launch_cancellation_does_not_complete_unrelated_slow_stop() {
-    assertStaleLaunchCompletionDoesNotCompleteUnrelatedSlowStop { launches in
+  func test_timed_out_launch_cancellation_finishes_before_retry_can_start() {
+    assertRetryStartsOnlyAfterTimedOutLaunchCleanup { launches in
       launches.fail(0, CancellationError())
     }
   }
 
-  func test_stale_launch_error_does_not_complete_unrelated_slow_stop() {
+  func test_timed_out_launch_error_finishes_before_retry_can_start() {
     struct Boom: Error, CustomStringConvertible { var description: String { "late launch #1 boom" } }
-    assertStaleLaunchCompletionDoesNotCompleteUnrelatedSlowStop { launches in
+    assertRetryStartsOnlyAfterTimedOutLaunchCleanup { launches in
       launches.fail(0, Boom())
     }
   }
 
-  private func assertStaleLaunchCompletionDoesNotCompleteUnrelatedSlowStop(
+  private func assertRetryStartsOnlyAfterTimedOutLaunchCleanup(
     file: StaticString = #filePath,
     line: UInt = #line,
-    completeStaleLaunch: (LaunchGate) -> Void
+    completeFirstLaunch: (LaunchGate) -> Void,
+    assertAfterFirstCleanup: () -> Void = {}
   ) {
     let firstStarted = expectation(description: "launch #1 started")
     let secondStarted = expectation(description: "launch #2 started")
     let firstTimeoutArmed = expectation(description: "launch #1 timeout armed")
     let secondTimeoutArmed = expectation(description: "launch #2 timeout armed")
-    let secondShutdownStarted = expectation(description: "launch #2 shutdown started")
-    let stopped = expectation(description: "launch #2 stop completes")
     let launches = LaunchGate(started: [firstStarted, secondStarted])
     let sleeps = SleepGate(armed: [firstTimeoutArmed, secondTimeoutArmed])
-    let secondSession = BlockingShutdownSession(shutdownStarted: secondShutdownStarted)
+    let secondSession = FakeSession()
     let host = PieEngineHost(
       launcher: { spec in try await launches.launch(spec) },
       launchTimeoutSlack: 0,
@@ -634,24 +676,42 @@ final class PieEngineHostTests: XCTestCase {
                      file: file, line: line)
     wait(for: [firstStarted, firstTimeoutArmed], timeout: 2)
 
-    let timedOut = expectation(description: "launch #1 times out")
-    var sawTimeout = false
-    let timeoutToken = host.observe { status, token in
-      if case .failed(.handshakeTimeout, _) = status, !sawTimeout {
-        sawTimeout = true
-        timedOut.fulfill()
+    let stopping = expectation(description: "launch #1 waits in stopping for cleanup")
+    let stoppingToken = host.observe { status, token in
+      if case .stopping = status {
+        stopping.fulfill()
         token.cancel()
       }
     }
     sleeps.wake(0)
-    wait(for: [timedOut], timeout: 2)
-    timeoutToken.cancel()
+    wait(for: [stopping], timeout: 2)
+    stoppingToken.cancel()
+    XCTAssertEqual(host.status, EngineStatus.stopping, file: file, line: line)
+
+    let retryBeforeCleanup = host.start(makeSpec(profileID: "tree-of-thought", handshakeTimeout: 0.2))
+    guard case .failure(let retryError) = retryBeforeCleanup else {
+      return XCTFail("retry must be rejected until timed-out launch cleanup completes",
+                     file: file, line: line)
+    }
+    XCTAssertEqual(retryError.code, EngineErrorCode.alreadyRunning, file: file, line: line)
+
+    let firstFailed = expectation(description: "launch #1 publishes timeout after cleanup")
+    let firstFailedToken = host.observe { status, token in
+      if case .failed(.handshakeTimeout, _) = status {
+        firstFailed.fulfill()
+        token.cancel()
+      }
+    }
+    completeFirstLaunch(launches)
+    wait(for: [firstFailed], timeout: 2)
+    firstFailedToken.cancel()
+    assertAfterFirstCleanup()
 
     XCTAssertNoThrow(try host.start(makeSpec(profileID: "tree-of-thought", handshakeTimeout: 0.2)).get(),
                      file: file, line: line)
     wait(for: [secondStarted, secondTimeoutArmed], timeout: 2)
 
-    let running = expectation(description: "launch #2 reaches running")
+    let running = expectation(description: "launch #2 owns running state")
     let runningToken = host.observe { status, token in
       if case .running(let port, let profileID) = status,
          port == 2002, profileID == "tree-of-thought" {
@@ -663,37 +723,20 @@ final class PieEngineHostTests: XCTestCase {
     wait(for: [running], timeout: 2)
     runningToken.cancel()
 
-    let stoppedToken = host.observe { status, token in
-      if case .stopped = status {
-        stopped.fulfill()
-        token.cancel()
-      }
-    }
-    host.stop()
-    wait(for: [secondShutdownStarted], timeout: 2)
-    XCTAssertEqual(host.status, .stopping, file: file, line: line)
-
-    completeStaleLaunch(launches)
-    let staleCompletionSettled = expectation(description: "stale launch completion processed")
-    DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
-      staleCompletionSettled.fulfill()
-    }
-    wait(for: [staleCompletionSettled], timeout: 1)
-
-    XCTAssertEqual(host.status, .stopping,
-                   "stale launch #1 completion must not complete launch #2's stop",
+    XCTAssertEqual(host.status, .running(port: 2002, profileID: "tree-of-thought"),
                    file: file, line: line)
-    let overlappingStart = host.start(makeSpec(profileID: "chat", handshakeTimeout: 0.2))
-    guard case .failure(let err) = overlappingStart else {
-      return XCTFail("host must reject new starts while launch #2 shutdown is still in progress",
-                     file: file, line: line)
-    }
-    XCTAssertEqual(err.code, .alreadyRunning, file: file, line: line)
-    XCTAssertEqual(secondSession.shutdownCount, 1, file: file, line: line)
+    XCTAssertEqual(secondSession.shutdownCount, 0, file: file, line: line)
+    host.stop()
+  }
 
-    secondSession.finishShutdown()
-    wait(for: [stopped], timeout: 2)
-    stoppedToken.cancel()
+  private func waitForFile(_ url: URL, timeout: TimeInterval,
+                           file: StaticString = #filePath, line: UInt = #line) {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if FileManager.default.fileExists(atPath: url.path) { return }
+      Thread.sleep(forTimeInterval: 0.01)
+    }
+    XCTFail("file did not appear before deadline: \(url.path)", file: file, line: line)
   }
 
   // MARK: - stop while running
