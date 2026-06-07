@@ -21,8 +21,18 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
   /// can verify the host tore the engine down on Pause / cancel.
   final class FakeSession: PieEngineHost.EngineSession, @unchecked Sendable {
     private let count = OSAllocatedUnfairLock<Int>(initialState: 0)
+    private let delay: TimeInterval
+    init(shutdownDelay: TimeInterval = 0) {
+      self.delay = shutdownDelay
+    }
     var shutdownCount: Int { count.withLock { $0 } }
-    func shutdown() async { count.withLock { $0 += 1 } }
+    func shutdown() async -> EngineShutdownResult {
+      count.withLock { $0 += 1 }
+      if delay > 0 {
+        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+      }
+      return .reaped
+    }
   }
 
   /// Build a launcher that returns `(port, FakeSession)` after an
@@ -61,7 +71,8 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     }
   }
 
-  private func makeSpec(profileID: String = "chat") -> PieControlLauncher.LaunchSpec {
+  private func makeSpec(profileID: String = "chat",
+                        handshakeTimeout: TimeInterval = 30) -> PieControlLauncher.LaunchSpec {
     let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
     return try! PieControlLauncher.LaunchSpec(
       pieBinary: tmp.appendingPathComponent("ignored-pie"),
@@ -70,6 +81,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
       subprocessEnvironment: [:],
       pieHome: tmp.appendingPathComponent("home"),
       shmemName: "/pie_test_\(UUID().uuidString.prefix(8))",
+      handshakeTimeout: handshakeTimeout,
       profileID: profileID,
       modelConfig: .dummy
     )
@@ -153,6 +165,128 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     }
     XCTAssertEqual(port, 31415)
     host.stop()
+  }
+
+  func test_startEngine_replyTimeoutFallback_doesNotStopAlreadyAcknowledgedRunningEngine() throws {
+    var session: FakeSession?
+    let host = PieEngineHost(launcher: Self.makeLauncher(port: 31416, sessionSink: { session = $0 }))
+    let spec = makeSpec(profileID: "tree-of-thought")
+    let api = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: { _ in .success(spec) },
+      replyTimeoutOverride: (start: 0.2, stop: 0.3)
+    )
+
+    let exp = expectation(description: "startEngine success reply before fallback")
+    var captured: Result<EnginePort, EngineError>?
+    api.startEngine(profileID: "tree-of-thought") { successData, errorData in
+      captured = try? PieHelperXPCWire.decodeStartEngineReply(
+        successData: successData, errorData: errorData
+      )
+      exp.fulfill()
+    }
+    wait(for: [exp], timeout: 2)
+    guard case .success(let port)? = captured else {
+      host.stop()
+      return XCTFail("expected .success before fallback; got \(String(describing: captured))")
+    }
+    XCTAssertEqual(port, 31416)
+
+    let fallbackExpired = expectation(description: "fallback deadline passed")
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { fallbackExpired.fulfill() }
+    wait(for: [fallbackExpired], timeout: 2)
+
+    guard case .running(let livePort, let liveProfile) = host.status else {
+      return XCTFail("reply-timeout fallback stopped an already-acknowledged engine; status=\(host.status)")
+    }
+    XCTAssertEqual(livePort, 31416)
+    XCTAssertEqual(liveProfile, "tree-of-thought")
+    XCTAssertEqual(session?.shutdownCount, 0,
+                   "fallback must not shutdown a running engine after startEngine already replied success")
+    host.stop()
+  }
+
+  func test_startEngine_repeatedSameProfileWhileStarting_attachesToSameLaunch() throws {
+    let launchCount = OSAllocatedUnfairLock<Int>(initialState: 0)
+    let host = PieEngineHost(launcher: { _ in
+      launchCount.withLock { $0 += 1 }
+      try await Task.sleep(nanoseconds: 200_000_000)
+      return (port: EnginePort(41414), session: FakeSession())
+    })
+    let spec = makeSpec(profileID: "tree-of-thought")
+    let api = HelperExportedAPI(engineHost: host, launchSpecResolver: { _ in .success(spec) })
+
+    let first = expectation(description: "first startEngine reply")
+    let second = expectation(description: "second startEngine reply")
+    var firstResult: Result<EnginePort, EngineError>?
+    var secondResult: Result<EnginePort, EngineError>?
+    api.startEngine(profileID: "tree-of-thought") { successData, errorData in
+      firstResult = try? PieHelperXPCWire.decodeStartEngineReply(
+        successData: successData, errorData: errorData
+      )
+      first.fulfill()
+    }
+    api.startEngine(profileID: "tree-of-thought") { successData, errorData in
+      secondResult = try? PieHelperXPCWire.decodeStartEngineReply(
+        successData: successData, errorData: errorData
+      )
+      second.fulfill()
+    }
+    wait(for: [first, second], timeout: 3)
+
+    guard case .success(let firstPort)? = firstResult else {
+      host.stop()
+      return XCTFail("first startEngine should attach to launch and succeed; got \(String(describing: firstResult))")
+    }
+    guard case .success(let secondPort)? = secondResult else {
+      host.stop()
+      return XCTFail("second startEngine should attach to same launch and succeed; got \(String(describing: secondResult))")
+    }
+    XCTAssertEqual(firstPort, 41414)
+    XCTAssertEqual(secondPort, 41414)
+    XCTAssertEqual(launchCount.withLock { $0 }, 1,
+                   "repeated startEngine(same profile) while starting must not spawn a second engine")
+    host.stop()
+  }
+
+  func test_startEngine_replyTimeoutFallback_onlyCompletesXPCReply_notEngineLifetime() throws {
+    let host = PieEngineHost(
+      launcher: Self.makeWedgedLauncher(),
+      launchTimeoutSlack: 0
+    )
+    let spec = makeSpec(profileID: "chat", handshakeTimeout: 1.0)
+    let api = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: { _ in .success(spec) },
+      replyTimeoutOverride: (start: 0.2, stop: 0.3)
+    )
+
+    let exp = expectation(description: "startEngine XPC fallback reply")
+    var captured: Result<EnginePort, EngineError>?
+    api.startEngine(profileID: "chat") { successData, errorData in
+      captured = try? PieHelperXPCWire.decodeStartEngineReply(
+        successData: successData, errorData: errorData
+      )
+      exp.fulfill()
+    }
+    wait(for: [exp], timeout: 2)
+    guard case .failure(let err)? = captured else {
+      host.stop()
+      return XCTFail("expected fallback .failure; got \(String(describing: captured))")
+    }
+    XCTAssertEqual(err.code, .handshakeTimeout)
+    XCTAssertTrue(err.message.contains("reply-timeout fallback"))
+    guard case .starting = host.status else {
+      host.stop()
+      return XCTFail("XPC reply fallback must not be an engine lifetime lease or cleanup path; status=\(host.status)")
+    }
+
+    let hostTimeout = expectation(description: "host-owned launch timeout")
+    let token = host.observe { status, _ in
+      if case .failed(.handshakeTimeout, _) = status { hostTimeout.fulfill() }
+    }
+    wait(for: [hostTimeout], timeout: 3)
+    token.cancel()
   }
 
   func test_startEngine_propagatesHostFailure() throws {
@@ -251,6 +385,55 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     XCTAssertEqual(captured?.shutdownCount, 1, "host did not invoke session.shutdown on stop")
   }
 
+  // MARK: - restartEngine
+
+  func test_restartEngine_waitsForSlowStopTerminalBeforeStartingReplacement() throws {
+    let launchCount = OSAllocatedUnfairLock<Int>(initialState: 0)
+    let firstSession = FakeSession(shutdownDelay: 0.3)
+    let secondSession = FakeSession()
+    let host = PieEngineHost(launcher: { _ in
+      let count = launchCount.withLock { count -> Int in
+        count += 1
+        return count
+      }
+      return count == 1
+        ? (port: EnginePort(11111), session: firstSession)
+        : (port: EnginePort(22222), session: secondSession)
+    })
+    let spec = makeSpec(profileID: "chat")
+    let api = HelperExportedAPI(engineHost: host, launchSpecResolver: { _ in .success(spec) })
+
+    let startExp = expectation(description: "initial start reply")
+    api.startEngine(profileID: "chat") { _, _ in startExp.fulfill() }
+    wait(for: [startExp], timeout: 2)
+    waitForRunning(host, timeout: 2)
+
+    let restartExp = expectation(description: "restart reply after replacement start")
+    var captured: Result<EnginePort, EngineError>?
+    api.restartEngine(profileID: "chat") { successData, errorData in
+      captured = try? PieHelperXPCWire.decodeStartEngineReply(
+        successData: successData, errorData: errorData
+      )
+      restartExp.fulfill()
+    }
+
+    let preTerminalExp = expectation(description: "before slow shutdown finishes")
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) { preTerminalExp.fulfill() }
+    wait(for: [preTerminalExp], timeout: 1)
+    XCTAssertEqual(firstSession.shutdownCount, 1)
+    XCTAssertEqual(launchCount.withLock { $0 }, 1,
+                   "restart must not launch replacement until the helper host has published terminal stop")
+
+    wait(for: [restartExp], timeout: 3)
+    guard case .success(let port)? = captured else {
+      host.stop()
+      return XCTFail("expected restart success, got \(String(describing: captured))")
+    }
+    XCTAssertEqual(port, 22222)
+    XCTAssertEqual(launchCount.withLock { $0 }, 2)
+    host.stop()
+  }
+
   // MARK: - wireViolationStatusBlob shape (F7 carry-over)
 
   func test_wireViolationStatusBlob_decodesAsFailedWireContract() throws {
@@ -317,21 +500,20 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
                              "fallback path leaked observer (review v2 F28)")
   }
 
-  /// Review v1 F1 regression guard. The reply-timeout fallback must
-  /// not just cancel the local observer — it must also `stop()` the
-  /// engine host, otherwise a slow `pie serve` boot transitions to
-  /// `.running` *after* the client received `.handshakeTimeout`, and
-  /// the next `startEngine` is rejected as `.alreadyRunning` against
-  /// an orphan engine the client never saw acknowledged.
-  func test_startEngine_replyTimeoutFallback_cancelsHostNotJustObserver() throws {
-    let host = PieEngineHost(launcher: Self.makeLauncher(port: 42424, delay: 2.0))
-    let spec = makeSpec(profileID: "chat")
+  /// Host-owned launch timeout regression guard. The XPC reply fallback is not
+  /// allowed to own process lifetime; a genuinely stuck `.starting` attempt is
+  /// cleaned up by `PieEngineHost` using the launch incarnation it armed when
+  /// the launch began, and `startEngine` reports that terminal
+  /// `.handshakeTimeout` via the observer path.
+  func test_startEngine_hostLaunchTimeout_cancelsStuckStartingAndRepliesHandshakeTimeout() throws {
+    let host = PieEngineHost(launcher: Self.makeWedgedLauncher(), launchTimeoutSlack: 0)
+    let spec = makeSpec(profileID: "chat", handshakeTimeout: 0.2)
     let api = HelperExportedAPI(
       engineHost: host,
       launchSpecResolver: { _ in .success(spec) },
-      replyTimeoutOverride: (start: 0.3, stop: 0.3)
+      replyTimeoutOverride: (start: 5, stop: 0.3)
     )
-    let replyExp = expectation(description: "startEngine reply (fallback)")
+    let replyExp = expectation(description: "startEngine reply (host launch timeout)")
     var captured: Result<EnginePort, EngineError>?
     api.startEngine(profileID: "chat") { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
@@ -345,19 +527,12 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
       return XCTFail("expected .failure; got \(String(describing: captured))")
     }
     XCTAssertEqual(err.code, .handshakeTimeout)
+    XCTAssertTrue(err.message.contains("launch timed out"),
+                  "expected host-owned launch timeout message; got \(err.message)")
 
-    // Wait past the launcher's own delay (2.0s) so the launch Task
-    // has had every chance to publish `.running` if F1 was NOT fixed.
-    // With the fix in place, the fallback `engineHost.stop()` cancels
-    // the launch Task — PieControlLauncher.launch's catch paths
-    // propagate the CancellationError, and the host settles at
-    // `.stopped`. Without the fix the host would publish `.running`
-    // here and the test would fail.
-    let settleExp = expectation(description: "host settled past launcher delay")
-    DispatchQueue.global().asyncAfter(deadline: .now() + 2.2) { settleExp.fulfill() }
-    wait(for: [settleExp], timeout: 4)
-    XCTAssertEqual(host.status, .stopped,
-                   "fallback path left host non-.stopped — slow boot orphan engine on next startEngine (review v1 F1)")
+    guard case .failed(.handshakeTimeout, _) = host.status else {
+      return XCTFail("host launch timeout must leave a retryable terminal failure, not an orphan .starting launch; status=\(host.status)")
+    }
   }
 
   func test_stopEngine_replyTimeoutFallback_cancelsObserver() throws {
@@ -365,10 +540,11 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     // stopEngine's observer never sees `.stopped`. The fallback
     // deadline (0.3s) wins and the observer-detach path runs.
     final class HangSession: PieEngineHost.EngineSession, @unchecked Sendable {
-      func shutdown() async {
+      func shutdown() async -> EngineShutdownResult {
         while !Task.isCancelled {
           try? await Task.sleep(nanoseconds: 100_000_000)
         }
+        return .unreaped("test hang")
       }
     }
     let host = PieEngineHost(launcher: { _ in

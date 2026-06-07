@@ -54,6 +54,38 @@ final class LaunchSpecResolverTests: XCTestCase {
                    "modelPath must join `modelsRoot` with `profile.model` for the downloader's on-disk layout")
   }
 
+  func test_resolve_noDefaultProfile_returns_modelMissing_without_fallback() throws {
+    let profiles = tempDir.appendingPathComponent("profiles-no-default", isDirectory: true)
+    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
+    let toml = """
+    id = "chat"
+    name = "Chat"
+    inferlet = "chat-apc"
+    """
+    try toml.write(to: profiles.appendingPathComponent("chat.toml"),
+                   atomically: true, encoding: .utf8)
+    let active = tempDir.appendingPathComponent("active-profile-no-default", isDirectory: false)
+    let store = ProfileStore(directory: profiles, activeProfileURL: active)
+    try store.start()
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { self.tempDir.appendingPathComponent("models") },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
+    )
+
+    guard case .failure(let error) = resolver.resolve(profileID: "chat") else {
+      return XCTFail("no-default profile must not resolve by choosing a hidden fallback")
+    }
+    XCTAssertEqual(error.code, .modelMissing)
+    XCTAssertTrue(error.message.contains("has no default model"),
+                  "error should route the UI to choose/download actions; got: \(error.message)")
+  }
+
   /// Review v2 F7 + v3 F1 regression guard. The resolver mapped
   /// `profile.model` but silently dropped `profile.inferlet` — making
   /// every profile indistinguishable to the engine as soon as a second
@@ -395,6 +427,104 @@ final class LaunchSpecResolverTests: XCTestCase {
                   "pie requires the .gguf snapshot path, not the extensionless blob target; got:\n\(body)")
     XCTAssertFalse(body.contains("/blobs/abcdef"),
                    "HF fallback must not resolve symlinks into extensionless blobs; got:\n\(body)")
+  }
+
+  func test_resolveLauncherSpec_app_staged_symlink_to_regular_gguf_resolves() throws {
+    // ITEM 1 / pre-#413: a staged model that is a SYMLINK to a regular GGUF
+    // (e.g. `stage-test-model.sh` links the HF cache, or a user `ln -s`'d a
+    // weight) must RESOLVE to the symlink path — not hard-fail with
+    // `modelMissing`, which ALSO skipped the HF-cache fallback even when the
+    // cache held the model (the operator's real blocker). pie follows the
+    // symlink and the `.gguf` suffix is preserved.
+    let slug = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    let store = try makeStoreWithModel(slug)
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+
+    // A real regular GGUF outside modelsRoot, linked into the staged path.
+    let target = tempDir.appendingPathComponent("real-weights.gguf", isDirectory: false)
+    try Data("gguf".utf8).write(to: target)
+    let staged = slug.split(separator: "/").map(String.init)
+      .reduce(modelsRoot) { $0.appendingPathComponent($1, isDirectory: false) }
+    try FileManager.default.createDirectory(
+      at: staged.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(atPath: staged.path, withDestinationPath: target.path)
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      // Empty HF home: proves the staged symlink resolves on its own, not
+      // via the cache fallback.
+      hfHome: { self.tempDir.appendingPathComponent("hf-home-empty") }
+    )
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(profileID: "chat") else {
+      return XCTFail("a staged symlink-to-regular GGUF must resolve, not fail modelMissing")
+    }
+    let body = PieControlLauncher.renderConfigBody(modelConfig: spec.modelConfig)
+    XCTAssertTrue(body.contains("hf_repo = \"\(staged.path)\""),
+                  "must pass the staged SYMLINK path (pie follows it; .gguf suffix preserved), not the resolved target; got:\n\(body)")
+    XCTAssertFalse(body.contains(target.path),
+                   "must not pass the resolved target path; got:\n\(body)")
+  }
+
+  func test_resolveLauncherSpec_dangling_app_staged_symlink_falls_through_to_hf_cache() throws {
+    // A DANGLING staged symlink (target gone) is treated as "not staged" and
+    // falls through to the HF-cache GGUF (3-seg slug → first-class file hit),
+    // rather than hard-failing.
+    let slug = "Qwen/Qwen3-0.6B-GGUF/model.gguf"
+    let store = try makeStoreWithModel(slug)
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    let hfHome = tempDir.appendingPathComponent("hf-home", isDirectory: true)
+
+    // HF cache holds the GGUF (snapshot entry → blob).
+    let snapshot = try writeHFCacheSnapshot(hfHome: hfHome, repo: "Qwen/Qwen3-0.6B-GGUF", files: [:])
+    let repoDir = snapshot.deletingLastPathComponent().deletingLastPathComponent()
+    let blobs = repoDir.appendingPathComponent("blobs", isDirectory: true)
+    try FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
+    let blob = blobs.appendingPathComponent("abcdef", isDirectory: false)
+    try Data("gguf".utf8).write(to: blob)
+    let snapshotEntry = snapshot.appendingPathComponent("model.gguf", isDirectory: false)
+    try FileManager.default.createSymbolicLink(atPath: snapshotEntry.path, withDestinationPath: "../../blobs/abcdef")
+
+    // Staged path is a DANGLING symlink (target never created).
+    let staged = slug.split(separator: "/").map(String.init)
+      .reduce(modelsRoot) { $0.appendingPathComponent($1, isDirectory: false) }
+    try FileManager.default.createDirectory(
+      at: staged.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(atPath: staged.path, withDestinationPath: "/nonexistent/gone.gguf")
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { hfHome }
+    )
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(profileID: "chat") else {
+      return XCTFail("a dangling staged symlink must fall through to the HF-cache GGUF, not fail")
+    }
+    let body = PieControlLauncher.renderConfigBody(modelConfig: spec.modelConfig)
+    XCTAssertTrue(body.contains("hf_repo = \"\(snapshotEntry.path)\""),
+                  "dangling staged symlink must fall through to the HF-cache .gguf snapshot path; got:\n\(body)")
   }
 
   func test_resolveLauncherSpec_rejects_incomplete_default_hf_cache() throws {

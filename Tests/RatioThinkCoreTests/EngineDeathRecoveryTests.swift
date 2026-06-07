@@ -848,7 +848,7 @@ final class EngineDeathRecoveryTests: XCTestCase {
 
 @available(macOS 14, *)
 private final class HealthySession: PieEngineHost.EngineSession, @unchecked Sendable {
-  func shutdown() async {}
+  func shutdown() async -> EngineShutdownResult { .reaped }
   func checkLiveness() async -> EngineLiveness { .alive }
 }
 
@@ -856,7 +856,7 @@ private final class HealthySession: PieEngineHost.EngineSession, @unchecked Send
 private final class OneShotDeathSession: PieEngineHost.EngineSession, @unchecked Sendable {
   private let lock = NSLock()
   private var fired = false
-  func shutdown() async {}
+  func shutdown() async -> EngineShutdownResult { .reaped }
   func checkLiveness() async -> EngineLiveness {
     lock.lock(); defer { lock.unlock() }
     if !fired { fired = true; return .gone(reason: "synthetic crash") }

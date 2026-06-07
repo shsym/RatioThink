@@ -17,11 +17,15 @@
 //! pure helpers [`materialize_level`], [`fold_level`], and [`finalize`],
 //! which are unit-tested natively via `cargo test --lib`.
 
-use futures::future::join_all;
+use inferlet::model::Model;
 use inferlet::sample::Sampler;
+use inferlet::{chat, reasoning};
 use inferlet::Context;
 
+use crate::sse::Emitter;
+
 use super::schema::TotParams;
+use super::stream;
 use super::tree::{
     assemble, best_leaf, error_leaf, new_node_id, parse_score, select_beam, Candidate, Node,
     NodeStatus,
@@ -30,16 +34,191 @@ use super::tree::{
 /// Built-in expansion instruction appended before forking at levels > 1.
 /// Level-1 children answer the conversation directly (sibling diversity
 /// comes from sampling temperature).
+///
+/// Reasoning-aware (#413/#437): a node generates a `<think>` block then an
+/// answer, which [`generate_demuxed`] splits apart — reasoning IS the point
+/// of a tree-of-thought search, so the candidate keeps its thought trace
+/// while the beam and the scorer see only the clean answer. The instruction
+/// carries no `/no_think`; [`with_thinking`] appends one only when the
+/// search runs with `thinking:false`.
 const REFINE_INSTRUCTION: &str = "Critique your previous answer, then give a distinct, \
      improved continuation toward correctly answering the original question. Be concise.";
 
-/// Value-evaluator prompt (independent per-node scoring).
+/// Value-evaluator prompt (independent per-node scoring). The node already
+/// did its reasoning; the scorer is a value HEAD that rates the resulting
+/// ANSWER (#437), so it always runs with `/no_think` appended (see
+/// [`score_node`]) to emit a bare integer cheaply — a thinking scorer burns
+/// its budget restating the problem and lands no parseable integer at deeper
+/// levels (observed: depth-2 scores all null → input-order pruning, and ~2×
+/// slower). This is orthogonal to the node-generation `thinking` knob, which
+/// stays on. The directive is inert on a non-reasoning model, and the score
+/// output is demuxed regardless so a stray empty think block can't swallow
+/// the integer.
 const SCORE_PROMPT: &str = "On a scale of 1 to 10, rate how promising the assistant's \
      latest answer is toward correctly and completely answering the original question. \
      Respond with only a single integer from 1 to 10.";
 
-/// Token budget for a scoring generation — just enough for an integer.
-const SCORE_MAX_TOKENS: usize = 16;
+/// Token budget for a scoring generation — enough for a suppressed empty
+/// `<think></think>` plus the integer. The scorer is NOT demuxed (see
+/// [`score_node`]), so this is the whole budget.
+const SCORE_MAX_TOKENS: usize = 32;
+
+/// Append the `/no_think` directive when reasoning is disabled for this
+/// search (`thinking:false`). On a Qwen3-style model this suppresses the
+/// `<think>` block; on a non-reasoning model it is an inert token.
+fn with_thinking(base: &str, thinking: bool) -> String {
+    if thinking {
+        base.to_string()
+    } else {
+        format!("{base} /no_think")
+    }
+}
+
+/// A generated batch is visible answer content only when it lands entirely
+/// outside a reasoning block (mirrors `chat::completions::content_visible`):
+/// the reasoning decoder reported `Idle` for it AND we were not already
+/// inside a `<think>` block before this batch — so the closing `</think>`
+/// delimiter (which the chat decoder still surfaces as a Delta on the End
+/// batch) stays off the answer channel.
+fn content_visible(reason_idle: bool, was_in_reasoning: bool) -> bool {
+    reason_idle && !was_in_reasoning
+}
+
+/// How [`generate_demuxed`] resolved one assistant-turn generation.
+enum DemuxKind {
+    /// A non-empty answer was produced (after any reasoning).
+    Answered,
+    /// Reasoning ran but no usable answer followed — truncated mid-thought
+    /// (the reasoning budget elapsed before `</think>`) or an empty/closed
+    /// think block with nothing after it (#434).
+    Incomplete,
+    /// The generator or a decoder failed mid-generation.
+    Aborted(String),
+}
+
+/// One generation, demuxed into its reasoning trace and its answer.
+struct Demux {
+    reasoning: String,
+    answer: String,
+    kind: DemuxKind,
+}
+
+/// Generate one assistant turn with two-phase budgeting and `<think>` demux.
+///
+/// Phase 1 (reasoning) runs until the model closes its think block or
+/// `reasoning_budget` tokens elapse; phase 2 (answer) then runs until the
+/// chat template completes or `answer_budget` tokens elapse — so an
+/// over-long thought can never starve the answer (#434), because the answer
+/// always gets its own budget once reasoning has closed. Reasoning text is
+/// collected from the reasoning decoder; the answer is the chat-decoder
+/// content that falls outside any think block (#437 — the beam and scorer
+/// see only this clean answer, never the thought trace). The caller owns
+/// `cue`/forking/scoring; this only drives `generate`.
+async fn generate_demuxed(
+    ctx: &mut Context,
+    model: &Model,
+    sampler: Sampler,
+    reasoning_budget: usize,
+    answer_budget: usize,
+    stops: &[u32],
+    mut emitter: Option<&mut Emitter>,
+    node_id: &str,
+) -> Demux {
+    let mut reason_dec = reasoning::Decoder::new(model);
+    let mut chat_dec = chat::Decoder::new(model);
+    let mut generator = ctx
+        .generate(sampler)
+        .max_tokens(reasoning_budget + answer_budget)
+        .stop(stops);
+
+    let mut reasoning = String::new();
+    let mut answer = String::new();
+    let mut in_reasoning = false;
+    let mut reasoning_done = false;
+    let mut reasoning_tokens = 0usize;
+    let mut answer_tokens = 0usize;
+
+    let kind = loop {
+        let step = match generator.next() {
+            Ok(None) => break DemuxKind::Answered, // max-tokens; reclassified by answer below
+            Ok(Some(s)) => s,
+            Err(e) => break DemuxKind::Aborted(format!("forward pass failed: {e}")),
+        };
+        let out = match step.execute().await {
+            Ok(o) => o,
+            Err(e) => break DemuxKind::Aborted(format!("forward pass failed: {e}")),
+        };
+
+        // Capture the gate state BEFORE feeding the reasoning decoder: `feed`
+        // flips `in_reasoning` as it consumes a boundary token, but the chat
+        // decoder must be gated on this batch's channel, not the post-flip
+        // state (the canonical chat-completions demux).
+        let was_in_reasoning = in_reasoning;
+        let mut reason_idle = false;
+        match reason_dec.feed(&out.tokens) {
+            Ok(reasoning::Event::Start) => in_reasoning = true,
+            Ok(reasoning::Event::Delta(s)) => {
+                in_reasoning = true;
+                reasoning.push_str(&s);
+                // #413 token stream: live-fill this node's reasoning channel.
+                if let Some(em) = emitter.as_deref_mut() {
+                    let _ = stream::emit_node_delta(em, node_id, stream::DELTA_REASONING, &s).await;
+                }
+            }
+            Ok(reasoning::Event::End(_)) => {
+                in_reasoning = false;
+                reasoning_done = true;
+            }
+            Ok(reasoning::Event::Idle) => reason_idle = true,
+            Err(e) => break DemuxKind::Aborted(format!("reasoning decode failed: {e}")),
+        }
+        match chat_dec.feed(&out.tokens) {
+            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) => {
+                answer.push_str(&s);
+                // #413 token stream: live-fill this node's answer channel.
+                if let Some(em) = emitter.as_deref_mut() {
+                    let _ = stream::emit_node_delta(em, node_id, stream::DELTA_ANSWER, &s).await;
+                }
+            }
+            Ok(chat::Event::Delta(_)) | Ok(chat::Event::Idle) => {}
+            Ok(chat::Event::Done(_)) => break DemuxKind::Answered,
+            Ok(chat::Event::Interrupt(_)) => {
+                break DemuxKind::Aborted("chat template interrupt".to_string())
+            }
+            Err(e) => break DemuxKind::Aborted(format!("chat decode failed: {e}")),
+        }
+
+        // Phase accounting: a batch is answer-phase once reasoning has closed
+        // (or the model never opened a think block and is already emitting
+        // visible content). Reasoning that overruns its budget before closing
+        // ends the node Incomplete — there is no answer phase to enter.
+        let answering =
+            reasoning_done || (!in_reasoning && !was_in_reasoning && !answer.is_empty());
+        if answering {
+            answer_tokens += out.tokens.len();
+            if answer_tokens >= answer_budget {
+                break DemuxKind::Answered;
+            }
+        } else {
+            reasoning_tokens += out.tokens.len();
+            if reasoning_tokens >= reasoning_budget && !reasoning_done {
+                break DemuxKind::Incomplete;
+            }
+        }
+    };
+
+    // A clean stop (chat Done / max-tokens) that produced no answer text is
+    // still Incomplete: an empty or closed-but-unanswered think block (#434).
+    let kind = match kind {
+        DemuxKind::Answered if answer.trim().is_empty() => DemuxKind::Incomplete,
+        other => other,
+    };
+    Demux {
+        reasoning,
+        answer,
+        kind,
+    }
+}
 
 /// Outcome of the value evaluator for one node. Distinguishes the three
 /// classes the old bare `Option<u8>` collapsed together: a parsed score,
@@ -73,9 +252,15 @@ impl ScoreOutcome {
 #[derive(Clone, Debug)]
 struct NodeOutcome {
     status: NodeStatus,
+    /// The clean answer (empty for `Error`/`Incomplete`).
     content: String,
+    /// The demuxed `<think>` trace (present for a thinking `Ok` node and for
+    /// an `Incomplete` node that thought but never answered).
+    reasoning: String,
     score: Option<u8>,
     score_error: Option<String>,
+    /// Per-node diagnostic for a non-`Ok` node (`None` for `Ok`).
+    error: Option<String>,
 }
 
 /// One forked branch ready to materialize: its caller-assigned id + tree
@@ -112,7 +297,25 @@ pub struct SearchOutcome {
 /// opened per branch in [`expand`]. A cue committed into the shared
 /// prefix would be duplicated across every fork and waste the zero-token
 /// forward pass that the level-1 spin fix removed.
-pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
+///
+/// When `emitter` is `Some`, the search streams (#413): each node emits a
+/// `node_start`, then its reasoning + answer stream live as `node_delta`
+/// chunks while it generates ([`generate_demuxed`]), then the level's nodes
+/// are emitted as `node_complete` frames (full node + score) followed by the
+/// `level_pruned` beam selection — the single source of search orchestration
+/// drives both the non-streaming response and the streamed one, so they can
+/// never diverge (the non-stream path simply passes `None` and emits no
+/// deltas, ending at a byte-identical tree). Emit errors are deliberately
+/// swallowed: a peer disconnect (the common case) just means no one is
+/// listening, and the bounded search (≤ `MAX_NODES`) finishes either way; the
+/// returned [`SearchOutcome`] is identical regardless of whether anyone
+/// received the frames.
+pub async fn run(
+    root_ctx: Context,
+    params: &TotParams,
+    model: &Model,
+    mut emitter: Option<&mut Emitter>,
+) -> SearchOutcome {
     let mut flat: Vec<Node> = vec![Node::root()];
     let mut frontier: Vec<Frontier> = vec![Frontier {
         ctx: root_ctx,
@@ -125,6 +328,12 @@ pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
     let mut last_level: Vec<Candidate> = Vec::new();
 
     for level in 1..=params.depth {
+        // Index into `flat` of this level's first node. Every node appended
+        // below — refine-flush error leaves, fork error leaves, and the
+        // materialized candidates — lands in `flat[level_start..]`, the
+        // exact slice the streaming sink replays as `node_complete` frames.
+        let level_start = flat.len();
+
         // Levels > 1 refine the parent before forking: append the refine
         // user-turn and flush it into the shared prefix. The assistant
         // turn itself is opened per child in `expand` (every level cues
@@ -144,8 +353,9 @@ pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
         // path below.
         if level > 1 {
             let mut refined: Vec<Frontier> = Vec::with_capacity(frontier.len());
+            let refine = with_thinking(REFINE_INSTRUCTION, params.thinking);
             for mut f in frontier {
-                f.ctx.user(REFINE_INSTRUCTION);
+                f.ctx.user(&refine);
                 match f.ctx.flush().await {
                     Ok(()) => refined.push(f),
                     Err(e) => {
@@ -183,15 +393,32 @@ pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
             }
         }
 
-        let results = join_all(ctxs.into_iter().map(|c| {
-            expand(
-                c,
-                params.temperature,
-                params.top_p,
-                params.max_tokens_per_node,
-            )
-        }))
-        .await;
+        // Sequential generation (#413 phase B): each node streams its own
+        // node_start + token deltas to the single SSE emitter with exclusive
+        // access, so the live tree fills a node at a time. Concurrency was
+        // ~23% faster here but the engine batches forks only weakly, and a
+        // sequential per-node stream reads as more responsive than a level
+        // appearing all at once; the id on every frame keeps routing robust.
+        let mut results: Vec<(Context, NodeOutcome)> = Vec::with_capacity(ctxs.len());
+        for (meta, c) in metas.iter().zip(ctxs.into_iter()) {
+            let (id, parent_id, branch_index) = (meta.0.as_str(), meta.1.as_str(), meta.2);
+            if let Some(em) = emitter.as_deref_mut() {
+                let _ = stream::emit_node_start(em, id, parent_id, level, branch_index).await;
+            }
+            results.push(
+                expand(
+                    c,
+                    model,
+                    params.temperature,
+                    params.top_p,
+                    params.max_reasoning_tokens,
+                    params.max_tokens_per_node,
+                    emitter.as_deref_mut(),
+                    id,
+                )
+                .await,
+            );
+        }
 
         // Pair each expansion with its meta: keep the moved-back context as
         // a potential survivor, and hand the Context-free outcome to the
@@ -232,6 +459,14 @@ pub async fn run(root_ctx: Context, params: &TotParams) -> SearchOutcome {
         // null an answer earlier levels produced.
         let (pool, stop) = fold_level(last_level, candidates, &keep);
         last_level = pool;
+
+        // #413: stream this level (all of its nodes, then the beam) once
+        // it is fully resolved. Emitted before the `stop` break so a
+        // search-ending final level still streams its nodes + empty beam.
+        if let Some(em) = emitter.as_deref_mut() {
+            let _ = stream::emit_level(em, level, &flat[level_start..], &keep).await;
+        }
+
         if stop {
             break;
         }
@@ -254,32 +489,27 @@ fn materialize_level(level: usize, branches: Vec<Branch>, beam_width: usize) -> 
     let mut nodes: Vec<Node> = Vec::with_capacity(branches.len());
     let mut candidates: Vec<Candidate> = Vec::with_capacity(branches.len());
     for b in branches {
-        let is_error = b.outcome.status == NodeStatus::Error;
-        // A generation error carries its message in `content`; move it to
-        // the node's `error` field and blank `content` (wire contract).
-        let error = if is_error && !b.outcome.content.is_empty() {
-            Some(b.outcome.content.clone())
-        } else {
-            None
-        };
+        // Only an `Ok` node (a non-empty answer) is beam-eligible; both
+        // `Error` (generation failed) and `Incomplete` (reasoned but never
+        // answered) are excluded from survival and final-answer selection,
+        // so the beam never keeps a node that has no answer — and a
+        // think-only candidate can no longer win the search (#437).
+        let is_ok = b.outcome.status == NodeStatus::Ok;
         candidates.push(Candidate {
             id: b.id.clone(),
             score: b.outcome.score,
-            ok: !is_error,
+            ok: is_ok,
         });
         nodes.push(Node {
             id: b.id,
             parent_id: Some(b.parent_id),
             depth: level,
             branch_index: Some(b.branch_index),
-            content: if is_error {
-                String::new()
-            } else {
-                b.outcome.content
-            },
+            content: b.outcome.content,
+            reasoning: b.outcome.reasoning,
             score: b.outcome.score,
             status: b.outcome.status,
-            error,
+            error: b.outcome.error,
             score_error: b.outcome.score_error,
             children: Vec::new(),
         });
@@ -330,62 +560,100 @@ fn finalize(flat: Vec<Node>, last_level: &[Candidate]) -> SearchOutcome {
     }
 }
 
-/// Expand one forked context: generate a continuation, then value-score
-/// it. The context is moved back out (paired with a Context-free
-/// [`NodeOutcome`]) so a surviving node can be expanded at the next level.
+/// Expand one forked context: generate a reasoning+answer continuation
+/// ([`generate_demuxed`]), then value-score an answered node. The context is
+/// moved back out (paired with a Context-free [`NodeOutcome`]) so a
+/// surviving node can be expanded at the next level. Classification:
+/// `Answered` → `Ok` (scored); `Incomplete` → kept out of the beam with its
+/// partial reasoning preserved (#434); `Aborted` → `Error`. Only an `Ok`
+/// node is scored — a node with no answer has nothing to rate.
 async fn expand(
     mut ctx: Context,
+    model: &Model,
     temperature: f32,
     top_p: f32,
-    max_tokens: usize,
+    reasoning_budget: usize,
+    answer_budget: usize,
+    emitter: Option<&mut Emitter>,
+    node_id: &str,
 ) -> (Context, NodeOutcome) {
     // Open the assistant turn for this branch. The forked context shares a
     // fully-flushed, cue-free prefix, so without this the first forward
     // pass would carry zero new tokens and spin the generator.
     ctx.cue();
-    let stops = inferlet::chat::stop_tokens(ctx.model());
-    let result = ctx
-        .generate(Sampler::TopP { temperature, p: top_p })
-        .max_tokens(max_tokens)
-        .stop(&stops)
-        .collect_text()
-        .await;
-    let outcome = match result {
-        Ok(text) => {
-            let (score, score_error) = score_node(&ctx).await.into_parts();
+    let stops = chat::stop_tokens(model);
+    // Streams this node's reasoning + answer chunks as node_delta frames when
+    // an emitter is present (#413 token stream); None on the non-stream path.
+    let demux = generate_demuxed(
+        &mut ctx,
+        model,
+        Sampler::TopP { temperature, p: top_p },
+        reasoning_budget,
+        answer_budget,
+        &stops,
+        emitter,
+        node_id,
+    )
+    .await;
+    let outcome = match demux.kind {
+        DemuxKind::Answered => {
+            let (score, score_error) = score_node(&ctx, model).await.into_parts();
             NodeOutcome {
                 status: NodeStatus::Ok,
-                content: text,
+                content: demux.answer,
+                reasoning: demux.reasoning,
                 score,
                 score_error,
+                error: None,
             }
         }
-        // Carry the error message in `content`; `materialize_level` moves
-        // it to the node's `error` field and blanks `content`.
-        Err(e) => NodeOutcome {
-            status: NodeStatus::Error,
-            content: e,
+        DemuxKind::Incomplete => NodeOutcome {
+            status: NodeStatus::Incomplete,
+            content: String::new(),
+            reasoning: demux.reasoning,
             score: None,
             score_error: None,
+            error: Some(
+                "no answer: the node ran out of reasoning budget before producing one".to_string(),
+            ),
+        },
+        DemuxKind::Aborted(e) => NodeOutcome {
+            status: NodeStatus::Error,
+            content: String::new(),
+            reasoning: demux.reasoning,
+            score: None,
+            score_error: None,
+            error: Some(e),
         },
     };
     (ctx, outcome)
 }
 
-/// Value evaluator: fork the answered context, ask for a 1–10 rating,
-/// greedy-decode a few tokens, and parse the integer. The three outcomes
-/// are kept distinct so an infra failure (fork/generate) is not mistaken
-/// for a benign unparseable score — see [`ScoreOutcome`].
-async fn score_node(ctx: &Context) -> ScoreOutcome {
+/// Value evaluator: fork the answered context, ask for a 1–10 rating, and
+/// parse the first in-range integer. The node already did its reasoning, so
+/// the scorer is a cheap value HEAD — it always runs `/no_think` (NOT the
+/// node `thinking` knob) to emit a bare integer rather than re-reasoning the
+/// problem; a thinking scorer burns its budget restating the question and
+/// lands no parseable integer at deeper levels (→ unscored, input-order
+/// pruning, ~2× slower). Unlike node generation this does NOT demux: it reads
+/// the raw text and lets [`parse_score`] find the integer anywhere in it
+/// (skipping the empty `<think></think>` `/no_think` leaves), which is
+/// robust to the integer landing in the same token batch as `</think>` — a
+/// case the content-channel gate would drop. The three outcomes stay distinct
+/// so an infra failure (fork/generate) is not mistaken for a benign
+/// unparseable score — see [`ScoreOutcome`].
+async fn score_node(ctx: &Context, model: &Model) -> ScoreOutcome {
     let mut sctx = match ctx.fork() {
         Ok(c) => c,
         Err(e) => return ScoreOutcome::Failed(format!("score fork failed: {e}")),
     };
-    sctx.user(SCORE_PROMPT);
+    sctx.user(&with_thinking(SCORE_PROMPT, false));
     sctx.cue();
+    let stops = chat::stop_tokens(model);
     let text = match sctx
         .generate(Sampler::TopP { temperature: 0.0, p: 1.0 }) // greedy
         .max_tokens(SCORE_MAX_TOKENS)
+        .stop(&stops)
         .collect_text()
         .await
     {
@@ -406,8 +674,10 @@ mod tests {
         NodeOutcome {
             status: NodeStatus::Ok,
             content: content.to_string(),
+            reasoning: String::new(),
             score,
             score_error: None,
+            error: None,
         }
     }
 
@@ -415,17 +685,32 @@ mod tests {
         NodeOutcome {
             status: NodeStatus::Ok,
             content: content.to_string(),
+            reasoning: String::new(),
             score: None,
             score_error: Some(err.to_string()),
+            error: None,
         }
     }
 
     fn err_outcome(msg: &str) -> NodeOutcome {
         NodeOutcome {
             status: NodeStatus::Error,
-            content: msg.to_string(),
+            content: String::new(),
+            reasoning: String::new(),
             score: None,
             score_error: None,
+            error: Some(msg.to_string()),
+        }
+    }
+
+    fn incomplete_outcome(reasoning: &str) -> NodeOutcome {
+        NodeOutcome {
+            status: NodeStatus::Incomplete,
+            content: String::new(),
+            reasoning: reasoning.to_string(),
+            score: None,
+            score_error: None,
+            error: Some("no answer".to_string()),
         }
     }
 
@@ -514,6 +799,66 @@ mod tests {
     }
 
     #[test]
+    fn materialize_incomplete_preserves_reasoning_blanks_answer_excludes_from_beam() {
+        // #434/#437: a node that reasoned but never answered is kept in the
+        // tree (so the UI can show the partial thought) but excluded from the
+        // beam — it has no answer to select.
+        let m = materialize_level(
+            2,
+            vec![branch(
+                "n0",
+                "p",
+                0,
+                incomplete_outcome("step 1: consider the base case…"),
+            )],
+            2,
+        );
+        let n = &m.nodes[0];
+        assert_eq!(n.status, NodeStatus::Incomplete);
+        assert_eq!(n.content, "");
+        assert_eq!(n.reasoning, "step 1: consider the base case…");
+        assert_eq!(n.error.as_deref(), Some("no answer"));
+        assert!(!m.candidates[0].ok);
+        assert!(m.keep.is_empty());
+    }
+
+    #[test]
+    fn materialize_ok_node_carries_reasoning_and_stays_beam_eligible() {
+        let m = materialize_level(
+            1,
+            vec![{
+                let mut o = ok_outcome("the answer", Some(8));
+                o.reasoning = "because X then Y".to_string();
+                branch("n0", "root", 0, o)
+            }],
+            2,
+        );
+        let n = &m.nodes[0];
+        assert_eq!(n.status, NodeStatus::Ok);
+        assert_eq!(n.content, "the answer");
+        assert_eq!(n.reasoning, "because X then Y");
+        assert!(m.candidates[0].ok);
+        assert_eq!(m.keep, vec!["n0"]);
+    }
+
+    #[test]
+    fn with_thinking_appends_no_think_only_when_disabled() {
+        assert_eq!(with_thinking("rate it", true), "rate it");
+        assert_eq!(with_thinking("rate it", false), "rate it /no_think");
+    }
+
+    #[test]
+    fn content_visible_only_outside_a_reasoning_block() {
+        // Idle batch outside reasoning → visible answer content.
+        assert!(content_visible(true, false));
+        // The closing `</think>` batch: reasoning decoder is NOT Idle and we
+        // WERE in reasoning → suppressed.
+        assert!(!content_visible(false, true));
+        // Inside reasoning (Idle never set there) → suppressed.
+        assert!(!content_visible(false, false));
+    }
+
+    #[test]
     fn materialize_all_none_scores_keep_input_order() {
         // all-None path: ok nodes with no parseable score fall back to
         // deterministic input-order selection.
@@ -580,6 +925,7 @@ mod tests {
             depth: 1,
             branch_index: Some(0),
             content: content.to_string(),
+            reasoning: String::new(),
             score,
             status: NodeStatus::Ok,
             error: None,

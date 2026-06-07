@@ -17,6 +17,15 @@ struct SettingsURLHandler: ViewModifier {
 
   func body(content: Content) -> some View {
     content.onOpenURL { url in
+      // #448: the menu-bar Helper delivers `ratiothink://quit` to ask the
+      // App (the single quit coordinator) to tear the whole product down.
+      // Route it to NSApp.terminate so it flows through the standard
+      // `applicationShouldTerminate` coordinator just like ⌘Q.
+      if SettingsDeepLink.isQuit(url) {
+        Diag.app.event("deeplink.open", [("route", "quit")])
+        NSApp.terminate(nil)
+        return
+      }
       guard SettingsDeepLink.isSettings(url) else { return }
       // Triage breadcrumb: proves the menu-bar "Settings…" deep link
       // reached the app (vs. a LaunchServices/scheme-registration failure).

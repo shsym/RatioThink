@@ -161,4 +161,51 @@ final class CuratedModelCatalogTests: XCTestCase {
     XCTAssertNotEqual(entry?.huggingFaceRepo, "Qwen/Qwen2.5-7B-Instruct-GGUF",
                       "the Qwen official repo ships this quant only as split shards — do not revert")
   }
+
+  /// The PR-time live-HF audit is intentionally path-gated so unrelated
+  /// PRs do not hit the network. Keep that gate broad enough for future
+  /// catalog splits: if `CuratedModelCatalog.all` starts aggregating
+  /// another source file under the `Shared/Curated*Catalog*.swift`
+  /// convention, a PR that edits only that new source must still run the
+  /// live audit before merge. This test parses the workflow as text so
+  /// the CI contract drifts loudly when the path filter is narrowed.
+  func test_curated_catalog_audit_path_filter_covers_future_catalog_sources() throws {
+    let workflow = try readRepoFile(".github/workflows/curated-catalog-audit.yml")
+
+    XCTAssertTrue(
+      workflow.contains("- 'Shared/Curated*Catalog*.swift'"),
+      "curated-catalog-audit.yml must use a Shared/Curated*Catalog*.swift glob, "
+      + "not only the current exact source file, so future catalog source splits "
+      + "still trigger the PR-time live-HF audit")
+    XCTAssertTrue(
+      workflow.contains("- 'Tests/RatioThinkCoreTests/CuratedModelCatalog*.swift'"),
+      "curated-catalog-audit.yml must keep curated catalog test changes on the same "
+      + "PR-time live-HF audit path")
+  }
+}
+
+private func readRepoFile(_ relativePath: String,
+                          file: StaticString = #filePath,
+                          line: UInt = #line) throws -> String {
+  let root = try repoRoot(file: file, line: line)
+  let url = root.appendingPathComponent(relativePath)
+  return try String(contentsOf: url, encoding: .utf8)
+}
+
+private func repoRoot(file: StaticString = #filePath,
+                      line: UInt = #line) throws -> URL {
+  var url = URL(fileURLWithPath: "\(file)", isDirectory: false)
+    .deletingLastPathComponent()
+  let fileManager = FileManager.default
+
+  while url.path != "/" {
+    if fileManager.fileExists(atPath: url.appendingPathComponent("Package.swift").path),
+       fileManager.fileExists(atPath: url.appendingPathComponent(".github/workflows/curated-catalog-audit.yml").path) {
+      return url
+    }
+    url.deleteLastPathComponent()
+  }
+
+  XCTFail("could not locate repository root from \(file)", file: file, line: line)
+  throw CocoaError(.fileNoSuchFile)
 }

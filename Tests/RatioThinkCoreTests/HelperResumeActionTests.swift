@@ -603,7 +603,10 @@ final class HelperResumeActionTests: XCTestCase {
     private let count = NSLock()
     private var _value = 0
     var shutdownCount: Int { count.lock(); defer { count.unlock() }; return _value }
-    func shutdown() async { count.lock(); _value += 1; count.unlock() }
+    func shutdown() async -> EngineShutdownResult {
+      count.lock(); _value += 1; count.unlock()
+      return .reaped
+    }
   }
 }
 

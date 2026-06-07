@@ -35,20 +35,24 @@ struct MessageBubble: View {
     case .assistant:
       HStack {
         VStack(alignment: .leading, spacing: 6) {
+          // #413: a tree-of-thought turn renders its live search above the
+          // answer, the structured sibling of the reasoning section.
+          if let tot = message.tot {
+            TreeSearchSection(tree: tot, answerStarted: !message.content.isEmpty)
+          }
           if !message.reasoning.isEmpty {
-            ThinkingSection(
+            ReasoningDisclosure(
               reasoning: message.reasoning,
               answerStarted: !message.content.isEmpty
             )
           }
-          // Always show whatever the turn produced. A partial answer
-          // (truncated mid-content) still renders its bubble; a freshly
-          // inserted streaming row with nothing yet keeps the immediate
-          // placeholder bubble. A FINISHED turn with no answer
-          // (`finishReason != nil`) skips the empty bubble and shows the
-          // notice below instead of a silent blank. (#434)
+          // Show the answer bubble once content arrives. When it is still
+          // empty, render a placeholder bubble ONLY for a fresh streaming row
+          // — not when a reasoning section (#329) or a live tree (#413) is
+          // already showing, and not when the turn FINISHED with no answer
+          // (#434: the notice below explains that instead of a silent blank).
           if !message.content.isEmpty
-            || (message.finishReason == nil && message.reasoning.isEmpty) {
+            || (message.reasoning.isEmpty && message.tot == nil && message.finishReason == nil) {
             bubble(background: Color.secondary.opacity(0.15),
                    foreground: .primary,
                    alignment: .leading)
@@ -91,66 +95,9 @@ struct MessageBubble: View {
 
 // MARK: - thinking section
 
-/// Collapsible "Thinking" disclosure for an assistant turn's reasoning
-/// (`reasoning_content`). Distinct from the answer bubble so the model's
-/// scratchpad never mixes into — or gets copied with — the visible
-/// answer.
-///
-/// Expansion policy: auto-expanded while the answer hasn't started
-/// (reasoning streaming live), auto-folds the moment visible content
-/// arrives. A manual toggle wins and sticks for the turn's lifetime, so
-/// a user who opens the section to watch the model think keeps it open
-/// past the answer's first token. Folded by default once a completed
-/// turn is reloaded from disk.
-///
-/// Reasoning is rendered as plain (monospaced, secondary) text rather
-/// than Markdown — it's an internal scratchpad, not authored prose, and
-/// keeping it un-rendered avoids re-interpreting half-formed markup mid
-/// stream. It is selectable only while expanded; collapsed, it is absent
-/// from the view tree so a copy of the answer can't pull it in.
-private struct ThinkingSection: View {
-  let reasoning: String
-  let answerStarted: Bool
-  @State private var userExpanded: Bool?
-
-  private var isExpanded: Bool { userExpanded ?? !answerStarted }
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 4) {
-      Button {
-        userExpanded = !isExpanded
-      } label: {
-        HStack(spacing: 4) {
-          Image(systemName: "brain")
-          Text("Thinking")
-            .fontWeight(.medium)
-          Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .contentShape(Rectangle())
-      }
-      .buttonStyle(.plain)
-      .help(isExpanded ? "Hide the model's reasoning" : "Show the model's reasoning")
-
-      if isExpanded {
-        Text(reasoning)
-          .font(.caption.monospaced())
-          .foregroundStyle(.secondary)
-          .textSelection(.enabled)
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .padding(.horizontal, 10)
-          .padding(.vertical, 8)
-          .background(
-            Color.secondary.opacity(0.08),
-            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-          )
-      }
-    }
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .animation(.easeInOut(duration: 0.15), value: isExpanded)
-  }
-}
+// The assistant turn's reasoning disclosure (#329) is now the shared
+// `ReasoningDisclosure` (see ReasoningDisclosure.swift) — the same component
+// each tree-of-thought node uses for its per-node thinking (#413).
 
 // MARK: - truncation notice
 

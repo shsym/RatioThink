@@ -30,18 +30,74 @@ struct ComposerView: View {
   @Environment(\.modelContext) private var modelContext
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
   @State private var draft: String = ""
+  /// The editor's live laid-out width, captured from SwiftUI via a
+  /// background `GeometryReader`. The box height is derived from `draft` +
+  /// this width (see `editorHeight`), so it is computed where both inputs
+  /// are known — no `NSTextView` round-trip whose width isn't valid yet at
+  /// `updateNSView` time (the timing trap the first cut of #446 hit).
+  @State private var editorWidth: CGFloat = 0
   @FocusState private var isFocused: Bool
 
-  /// Single line height target. SwiftUI's `TextEditor` measures itself
-  /// from intrinsic content height; we sample once via `lineHeight`
-  /// helper and clamp `1...maxLines` lines for the visual box.
-  private static let minLines = 1
+  /// Auto-grow envelope. The box height tracks the editor's REAL laid-out
+  /// content height (`draft` measured at the live `editorWidth`), clamped to
+  /// `[lineHeight, lineHeight * maxLines]`. #446: the previous height counted
+  /// only hard `\n`s, so a long line that SOFT-WRAPS stayed one line tall and
+  /// the wrapped text (descenders included) clipped. Real layout accounts for
+  /// wraps, hard newlines, and the font's actual metrics.
   private static let maxLines = 8
-  /// Empirically measured at 13pt system body; matches the `NSTextView`
-  /// default line height closely enough to avoid one-pixel jitter on
-  /// the first line.
+  /// Single-line floor for the box. 13pt system body lays out at ~16pt; the
+  /// 18pt floor adds ~2pt of breathing room so a single line's descenders
+  /// never touch the bottom edge, and serves as the per-line unit for the
+  /// `maxLines` ceiling.
   private static let lineHeight: CGFloat = 18
   private static let verticalPadding: CGFloat = 8
+  /// The 8-line ceiling; past it the editor scrolls internally.
+  private static var maxBoxHeight: CGFloat { lineHeight * CGFloat(maxLines) }
+
+  /// Clamp the editor's real content height into the visible box envelope.
+  /// Pure + static so the auto-grow contract is unit-tested without a view
+  /// host (the regression: a soft-wrapped line must yield a taller box than
+  /// a single short line — newline-counting could not tell them apart).
+  static func editorBoxHeight(forContentHeight h: CGFloat) -> CGFloat {
+    min(max(h, lineHeight), maxBoxHeight)
+  }
+
+  /// The text's real laid-out height at a given container width — the
+  /// measurement that drives auto-grow. Pure (throwaway TextKit stack, no
+  /// view host) and the single source the live editor also calls, so the
+  /// wrap contract is unit-testable: a soft-wrapped line is TALLER than a
+  /// short one — the distinction the old hard-`\n` count could not make.
+  static func contentHeight(forText text: String,
+                            containerWidth: CGFloat,
+                            inset: CGFloat = 0,
+                            lineFragmentPadding: CGFloat = 5,
+                            font: NSFont = .systemFont(ofSize: NSFont.systemFontSize)) -> CGFloat {
+    guard containerWidth > 1 else { return lineHeight }
+    let storage = NSTextStorage(string: text, attributes: [.font: font])
+    let layout = NSLayoutManager()
+    storage.addLayoutManager(layout)
+    let container = NSTextContainer(size: CGSize(width: containerWidth, height: .greatestFiniteMagnitude))
+    container.lineFragmentPadding = lineFragmentPadding
+    layout.addTextContainer(container)
+    layout.ensureLayout(for: container)
+    return layout.usedRect(for: container).height + inset * 2
+  }
+
+  /// The box height for the current draft at the live editor width.
+  private var editorHeight: CGFloat {
+    Self.editorHeight(forDraft: draft, editorWidth: editorWidth)
+  }
+
+  /// Compose the measure + clamp: the draft's real wrapped height at the live
+  /// editor width, clamped into the 1..maxLines envelope. The `NSTextView`'s
+  /// container tracks the view width, so measuring at `editorWidth` reproduces
+  /// the editor's own `usedRect` (verified). Static so the auto-grow contract
+  /// — a soft-wrapped draft yields a TALLER box than a short one at the same
+  /// width — is unit-tested without a view host (the wiring gap the first cut
+  /// of #446 missed).
+  static func editorHeight(forDraft draft: String, editorWidth: CGFloat) -> CGFloat {
+    editorBoxHeight(forContentHeight: contentHeight(forText: draft, containerWidth: editorWidth))
+  }
 
   init(
     chat: Chat,
@@ -65,7 +121,16 @@ struct ComposerView: View {
         text: $draft,
         onSubmit: submit
       )
-      .frame(minHeight: minHeight, maxHeight: maxHeight)
+      .frame(height: editorHeight)
+      // Capture the editor's live width so `editorHeight` can wrap-measure
+      // the draft at the real width (#446). Width is set by the HStack and is
+      // independent of height, so this never feeds back into a layout loop.
+      .background(
+        GeometryReader { geo in
+          Color.clear.preference(key: ComposerEditorWidthKey.self, value: geo.size.width)
+        }
+      )
+      .onPreferenceChange(ComposerEditorWidthKey.self) { editorWidth = $0 }
       .padding(.horizontal, 10)
       .padding(.vertical, Self.verticalPadding)
       .background(
@@ -96,16 +161,6 @@ struct ComposerView: View {
   private var trimmedDraft: String {
     draft.trimmingCharacters(in: .whitespacesAndNewlines)
   }
-
-  private var lineCount: Int {
-    // +1 because N newlines means N+1 lines; clamp to [min, max] for
-    // the visual envelope — overflow scrolls inside the editor.
-    let newlines = draft.reduce(0) { $0 + ($1 == "\n" ? 1 : 0) }
-    return max(Self.minLines, min(Self.maxLines, newlines + 1))
-  }
-
-  private var minHeight: CGFloat { Self.lineHeight }
-  private var maxHeight: CGFloat { Self.lineHeight * CGFloat(lineCount) }
 
   private func submit() {
     let payload = trimmedDraft
@@ -151,12 +206,23 @@ struct ComposerView: View {
 
 private let composerLog = Logger(subsystem: "com.ratiothink.app", category: "composer")
 
+/// Carries the composer editor's measured width up so `ComposerView` can
+/// wrap-measure the draft at the real width (#446 auto-grow).
+private struct ComposerEditorWidthKey: PreferenceKey {
+  static let defaultValue: CGFloat = 0
+  static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+    value = max(value, nextValue())
+  }
+}
+
 /// NSTextView-backed editor that:
 ///   · forwards plain Return to `onSubmit`
 ///   · lets any modifier+Return fall through to `super` (Shift / Opt
 ///     insert a newline; Cmd / Ctrl reach menu shortcuts) — review v1 F1.
-///   · auto-resizes by reporting its intrinsic content size through the
-///     SwiftUI layout system
+///
+/// Sizing is owned by SwiftUI (`ComposerView.editorHeight` from the draft +
+/// the live editor width), not by this view — so there is no intrinsic-size
+/// or height-binding plumbing here.
 private struct ComposerTextEditor: NSViewRepresentable {
   @Binding var text: String
   let onSubmit: () -> Void

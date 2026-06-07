@@ -212,6 +212,28 @@ public final class EngineStatusStore: ObservableObject {
     try await client.stopEngine()
   }
 
+  /// Intentionally rebuild the helper engine for `profileID`.
+  ///
+  /// pie's `/v1/models/load` endpoint is a registry lookup: the set of
+  /// loadable ids is fixed by the config written before `pie serve`
+  /// starts. When the active profile's default model changes (for
+  /// example after a just-finished download), a live engine still
+  /// advertises the old id until it is stopped and started again. This
+  /// helper performs that product-internal reload without requiring the
+  /// user to quit RatioThink.
+  ///
+  /// Restart deliberately routes through a helper-side selector instead
+  /// of composing `stopEngine()` + `startEngine(profileID:)` here:
+  /// the app's `status` is only a 1 Hz mirror, generic start swallows
+  /// `.alreadyRunning` as idempotent, and `stopEngine()` has a short
+  /// app-side reply timeout. The helper owns the authoritative state
+  /// machine and waits for terminal stop before starting the new
+  /// profile; any `.alreadyRunning` that escapes that contract is a
+  /// failed rebuild and must surface to the caller.
+  public func restartEngine(profileID: String) async throws {
+    try await client.restartEngine(profileID: profileID)
+  }
+
   /// Test seam: invoked with the human-readable cause whenever a
   /// memory-poll transport error is swallowed to nil. Default routes to
   /// the os.Logger, mirroring `refreshOnce`; tests inject a spy to prove
@@ -298,14 +320,6 @@ public final class EngineStatusStore: ObservableObject {
         return
       }
       throw error
-    } catch let error as EngineError where error.code == .alreadyRunning {
-      // A concurrent start found the engine already starting/running.
-      // For a "kick the start" caller that IS the desired end state —
-      // #326's no-model prompt and failed(modelMissing) banner can both
-      // fire startEngine on the same completed download, and the loser
-      // must not surface a user-facing error. Idempotent no-op.
-      Self.log.notice("startEngine(profileID=\(profileID, privacy: .public)) → alreadyRunning; engine already coming up (idempotent)")
-      return
     }
   }
 
@@ -362,14 +376,31 @@ public final class EngineStatusStore: ObservableObject {
   }
 
   private nonisolated func refreshOnce(client: any AppXPCClient) async {
+    let started = Date()
     do {
       let next = try await client.engineStatus()
+      let took = Date().timeIntervalSince(started)
+      // #413 diag: a slow-but-succeeding poll is the early warning that the
+      // helper is getting saturated (toward the 2 s reply timeout) — the next
+      // poll may time out and feed HelperHealthController's restart ladder.
+      if took > 0.5 {
+        DiagnosticLog.app.event("engine.poll", [("result", "slow"), ("took", String(format: "%.2f", took))])
+      }
       await MainActor.run { [weak self] in
         self?.apply(next: next, error: nil)
       }
     } catch {
       let message = String(describing: error)
+      let took = Date().timeIntervalSince(started)
       Self.log.error("engineStatus poll failed: \(message, privacy: .public)")
+      // #413 diag: a FAILED engineStatus XPC poll is exactly what drives the
+      // helper-restart ladder. A `replyTimeout` here = the helper was too slow
+      // to answer (e.g. saturated draining pie's --debug output during a busy
+      // search), NOT engine death. Persist it + the XPC latency so the
+      // operator's run shows whether the helper-restart path fired.
+      DiagnosticLog.app.event("engine.poll", [
+        ("result", "fail"), ("took", String(format: "%.2f", took)), ("reason", message),
+      ])
       await MainActor.run { [weak self] in
         self?.apply(next: nil, error: message)
       }

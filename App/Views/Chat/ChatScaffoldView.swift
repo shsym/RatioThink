@@ -211,21 +211,11 @@ struct ChatScaffoldView: View {
   /// Profile ids offered by the toolbar switcher. Derived live from
   /// `profileStore` (the source of truth — includes the seeded "Fast
   /// Think" profile, #426) so every defined profile is selectable in
-  /// chat. `ProfileStore` publishes no `@Published` state, but it seeds +
-  /// scans synchronously in `start()` at app launch (before any chat
-  /// mounts), so `entries` is populated by first render; the body re-reads
-  /// it on each render. Falls back to the injected `availableProfiles`
-  /// only when the store has no parsed entries (previews / tests).
-  private var selectableProfileIDs: [String] {
-    let ids = profileStore.entries.compactMap { $0.profile?.id }
-    return ids.isEmpty ? availableProfiles : ids
-  }
-
   private func scaffold(for chat: Chat) -> some View {
     VStack(spacing: 0) {
       ContentToolbar(
         viewModel: viewModel,
-        availableProfiles: selectableProfileIDs,
+        availableProfiles: pickerProfileIDs,
         // Reflect the models the engine ACTUALLY serves (from
         // `/v1/models`) rather than the static placeholder list — pie
         // serves only its single registered model and rejects a
@@ -246,9 +236,17 @@ struct ChatScaffoldView: View {
       // #326 Path 2: surface a swallowed failed(modelMissing) engine
       // state with an inline download + auto-start, instead of leaving
       // the user to discover it by failing a send.
+      // #446: suppress the banner ONLY when the send-gate sheet is presented
+      // AND is itself showing the same inline download (action `.download`),
+      // so the user never sees two download prompts for one model. Review F1:
+      // gate on the sheet's REAL download condition, not bare presentation —
+      // in the present-but-invalid staged-model edge the sheet shows Open
+      // Settings (action `.load`), which does NOT duplicate the banner, so the
+      // banner (the only one-click download there) must stay visible.
       if let bannerTarget = MissingModelRecovery.bannerTarget(
         engineStatus: engineStatusStore.status,
-        profileDefaultModel: selectedProfileDefault
+        profileDefaultModel: selectedProfileDefault,
+        sendGatePresented: showNoModelPrompt && noModelAction.isDownload
       ) {
         ModelMissingBanner(
           target: bannerTarget,
@@ -326,6 +324,16 @@ struct ChatScaffoldView: View {
     // composer with their draft intact — no stale "starting…" sheet.
     .onChange(of: modelLoadCenter.residentModelID) { _, _ in dismissPromptIfResolved() }
     .onChange(of: viewModel.modelOverride) { _, _ in dismissPromptIfResolved() }
+    // #413: open/close the helper-health generation gate around every stream.
+    // While a chat / ToT generation is in flight a saturated engineStatus poll
+    // path can time out for many consecutive polls; without this gate the
+    // restart ladder reads those busy-timeouts as an unreachable helper and
+    // bounces it — killing the engine mid-search and closing the SSE. The gate
+    // holds those failed polls; genuine death still surfaces (the stream drops,
+    // ending the generation and releasing the gate).
+    .onChange(of: sendController.isInFlight) { _, inFlight in
+      helperHealth.setGenerating(inFlight)
+    }
     .onAppear {
       // Seed the toolbar from the persisted profile so the menu
       // label matches what the chat was created with.
@@ -375,10 +383,11 @@ struct ChatScaffoldView: View {
     .onDisappear {
       sendController.cancel()
     }
-    // Reflect a model the engine already has resident (e.g. the Helper
-    // auto-resumed the active profile at boot) so the composer doesn't
-    // block every send behind the no-model prompt despite a ready engine
-    // ( follow-up). Re-runs whenever the engine status flips.
+    // Reflect a model the engine already has resident (e.g. after the launch
+    // prompt/user-confirm path, explicit Restart, Local API start,
+    // post-download startEngine, or crash auto-relaunch) so the composer
+    // doesn't block every send behind the no-model prompt despite a ready
+    // engine ( follow-up). Re-runs whenever the engine status flips.
     .task(id: engineStatusStore.status) {
       await reconcileEngineResidentModel()
     }
@@ -433,22 +442,42 @@ struct ChatScaffoldView: View {
       presentNoModelPrompt()
       return
     }
+    let options = ChatSendRequestOptions(
+      modelID: modelID,
+      sampling: viewModel.sampling,
+      systemPromptOverride: viewModel.systemPromptOverride,
+      // #426: thread the selected profile's Fast Think (speculative-decoding)
+      // settings into the request — a Fast Think profile attaches speculation
+      // + forces greedy; a normal or tree-of-thought profile carries none.
+      // Built once here so both the ToT dispatch and the normal send get it.
+      speculation: profileStore.speculation(forProfileID: viewModel.selectedProfileID)
+    )
+
+    // #413: when the active profile declares `mode = "tree-of-thought"`,
+    // route the turn to the ToT dispatch (streamed tree search rendered
+    // inline) instead of a chat completion. The launched inferlet is
+    // still chat-apc — ToT is a per-request dispatch mode.
+    if let totConfig = profileStore.profile(forProfileID: viewModel.selectedProfileID)?.treeOfThought {
+      sendController.sendTreeOfThought(
+        chat: chat,
+        context: modelContext,
+        engine: engineStore.client,
+        config: totConfig,
+        persistenceStatus: persistenceStatus,
+        options: options
+      )
+      return
+    }
+
     sendController.send(
       chat: chat,
       context: modelContext,
       engine: engineStore.client,
       modelLoadCenter: modelLoadCenter,
       persistenceStatus: persistenceStatus,
-      options: ChatSendRequestOptions(
-        modelID: modelID,
-        sampling: viewModel.sampling,
-        systemPromptOverride: viewModel.systemPromptOverride,
-        // Inject the selected profile's speculative-decoding settings
-        // (#426). For a "Fast Think" profile this makes `makeRequest`
-        // attach the `speculation` field and force greedy decoding; a
-        // normal profile has none, so the request is unchanged.
-        speculation: profileStore.speculation(forProfileID: viewModel.selectedProfileID)
-      ),
+      // Reuses the `options` built above (now carrying #426 speculation), so
+      // the normal send and the ToT dispatch share one options value.
+      options: options,
       // `EngineStatusStore` conforms to `ChatRecoveryGate`; passing it
       // here lets the send pipeline classify a mid-stream
       // `HTTPEngineError.engineGone` (or a transport throw racing the
@@ -484,6 +513,26 @@ struct ChatScaffoldView: View {
   /// the `profileStore` lookup is expressed once rather than four times.
   private var selectedProfileDefault: String? {
     profileStore.model(forProfileID: viewModel.selectedProfileID)
+  }
+
+  /// Profile ids the toolbar picker offers — the SAME set the Settings
+  /// editor lists (every valid `*.toml`), derived live from the store so a
+  /// user can actually switch to a non-`chat` profile (e.g. the seeded
+  /// `tree-of-thought` or a `fast-think`). The previous default `["chat"]`
+  /// was never wired to `ProfileStore`, so the picker only ever showed
+  /// `chat`. Re-read each render: `ProfileStore` publishes nothing, but
+  /// this view re-renders on the ~1 Hz engine-status publishes, so a newly
+  /// seeded/edited profile appears without an app restart. Falls back to
+  /// the injected `availableProfiles` (previews/tests) when the store has
+  /// no valid entries yet. The selected id is kept present so the picker
+  /// always offers the active profile even mid-scan.
+  private var pickerProfileIDs: [String] {
+    var ids = profileStore.entries.compactMap { $0.profile?.id }
+    if ids.isEmpty { ids = availableProfiles }
+    if !ids.contains(viewModel.selectedProfileID) {
+      ids.append(viewModel.selectedProfileID)
+    }
+    return ids.sorted()
   }
 
   /// #397: the live engine/model lifecycle state driving the gate's

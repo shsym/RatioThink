@@ -1,9 +1,9 @@
 import Foundation
 
 /// #4: the App ALWAYS asks before starting the engine/model on launch —
-/// it never silently auto-starts. (The Helper's boot auto-resume is
-/// disabled; see `HelperMain.autoResumeEngineOnBoot`.) This is the pure
-/// decision for whether, once the engine status has SETTLED after launch,
+/// it never silently auto-starts. Helper boot leaves the engine stopped;
+/// see `HelperMain.autoResumeEngineOnBoot`. This is the pure decision for
+/// whether, once the engine status has SETTLED after launch,
 /// the App should proactively raise the "Start <model>?" prompt.
 ///
 /// The caller closes the launch window after the first settled status

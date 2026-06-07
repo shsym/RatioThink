@@ -21,8 +21,10 @@ struct HelperRegistrationRepair {
   /// cheap and stateless. Injected so tests supply `EnvironmentLoginItemRegistrar`
   /// instead of mutating the real machine's background-item registration.
   private let makeRegistrar: @Sendable () -> LoginItemRegistering
-  /// One bounded reachability probe (a helper `engineStatus()` poll with
+  /// One bounded compatibility probe (a helper protocol-version poll with
   /// retry/backoff). Injected so tests don't open a real XPC connection.
+  /// A merely reachable old helper is not enough after app upgrades that add
+  /// required selectors such as `restartEngine(profileID:)`.
   private let probeReachable: @Sendable () async -> Bool
 
   init(
@@ -34,8 +36,9 @@ struct HelperRegistrationRepair {
   }
 
   /// Run one reconcile pass. Probes first; repairs (unregister+register) only
-  /// when the Helper is unreachable, leaving a healthy background service
-  /// untouched. The decision table lives in the pure `HelperRegistrationReconciler`.
+  /// when the Helper is unreachable or protocol-incompatible, leaving a
+  /// healthy/current background service untouched. The decision table lives in
+  /// the pure `HelperRegistrationReconciler`.
   func reconcile() async -> HelperRegistrationReconciler.Outcome {
     let registrar = makeRegistrar()
     let reconciler = HelperRegistrationReconciler(
@@ -62,9 +65,12 @@ struct HelperRegistrationRepair {
     return outcome.helperReachable
   }
 
-  /// Default bounded reachability probe: one `engineStatus()` poll retried
-  /// over ~5s so a just-(re)launched on-demand Helper has time to publish its
-  /// mach service. Mirrors the launch-time probe `RatioThinkApp` used inline.
+  /// Default bounded compatibility probe: a `helperProtocolVersion()` poll
+  /// retried over ~5s so a just-(re)launched on-demand Helper has time to
+  /// publish its mach service. This intentionally checks a capability/version
+  /// selector instead of only `engineStatus()`: after an app update, a previous
+  /// build's helper can still answer `engineStatus` while lacking newly-required
+  /// selectors such as strict `restartEngine(profileID:)`.
   /// Defaults come from `HelperReconcileProbeBudget` (RatioThinkCore) so the
   /// probe's wall time and the chat-recovery ceiling that depends on it share
   /// ONE definition and cannot drift (#412 re-F1).
@@ -74,7 +80,7 @@ struct HelperRegistrationRepair {
   ) async -> Bool {
     let client = HelperXPCClient()
     for attempt in 0..<attempts {
-      if (try? await client.engineStatus()) != nil { return true }
+      if await HelperProtocolCompatibility.isCompatible(client: client) { return true }
       if attempt < attempts - 1 {
         try? await Task.sleep(nanoseconds: delayMilliseconds * 1_000_000)
       }

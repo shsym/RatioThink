@@ -414,7 +414,7 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
       // connect) — but if a future change ever let it succeed, shut the
       // session down so the stub subprocess can't leak.
       let (_, session) = try await PieControlLauncher.launch(spec: spec)
-      await session.shutdown()
+      _ = await session.shutdown()
       XCTFail("engine-free stub cannot complete the WS install; launch must throw")
     } catch let error as PieControlLauncher.LaunchError {
       guard case .clientError = error else {

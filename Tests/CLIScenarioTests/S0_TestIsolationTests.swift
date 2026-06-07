@@ -46,7 +46,7 @@ final class S0_TestIsolationTests: IsolatedTestCase {
 
     // Shutdown is idempotent — running it again from tearDown's
     // reap loop is safe.
-    defer { Task { await session.shutdown() } }
+    defer { Task { _ = await session.shutdown() } }
 
     let pollPort = try await boundHTTPPort(timeout: 5)
     XCTAssertEqual(Int(bound), pollPort,

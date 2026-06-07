@@ -132,8 +132,12 @@ public struct LaunchSpecResolver {
         message: "launch path resolution failed: \(String(describing: error))"
       ))
     }
+    guard let model = profile.model,
+          !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return .failure(Self.noDefaultModelError(profile: profile))
+    }
     let modelPath = Self.joinModelPath(modelsRoot: models,
-                                       slug: profile.model)
+                                       slug: model)
     return .success(PieSupervisor.LaunchSpec(
       binaryURL: binary,
       modelPath: modelPath,
@@ -176,11 +180,15 @@ public struct LaunchSpecResolver {
     // can't select them, but a stale or hand-authored profile could still
     // name one — fail fast with a clear reason instead of handing the
     // engine a shard it cannot load.
-    let modelLeaf = profile.model.split(separator: "/").last.map(String.init) ?? profile.model
+    guard let model = profile.model,
+          !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return .failure(Self.noDefaultModelError(profile: profile))
+    }
+    let modelLeaf = model.split(separator: "/").last.map(String.init) ?? model
     if HFCacheCatalog.isSplitShardFilename(modelLeaf) {
       return .failure(EngineError(
         code: .invalidInput,
-        message: "\(HFCacheCatalog.shardedUnsupportedReason) (model=\(profile.model))"
+        message: "\(HFCacheCatalog.shardedUnsupportedReason) (model=\(model))"
       ))
     }
     let binary: URL
@@ -213,6 +221,21 @@ public struct LaunchSpecResolver {
     let shmem = Self.uniqueShmemName()
     let env = subprocessEnvironment()
     do {
+      // Memory-aware per-request output ceiling (#438): from the resolved
+      // model's arch dims + weight size, compute how many F16 KV tokens
+      // fit in the RAM budget after weights + a conservative overhead,
+      // clamped to the context window and the engine default pool. Written
+      // as `default_token_limit`, which chat-apc reads back via
+      // `runtime::max-output-tokens`. Down-only: `nil` (omit) when the
+      // metadata can't be read or the host sustains the full default.
+      let modelURL = URL(fileURLWithPath: modelRef, isDirectory: false)
+      let defaultTokenLimit: Int? = ModelArchMetadata.read(resolvedModelURL: modelURL)
+        .flatMap { metadata in
+          ModelMemoryGuardrail.resolvedBytes(resolvedModelURL: modelURL).flatMap { weightBytes in
+            KVCacheBudget.outputTokenCeiling(
+              policy: memoryPolicy(), weightBytes: weightBytes, metadata: metadata)
+          }
+        }
       let spec = try PieControlLauncher.LaunchSpec(
         pieBinary: binary,
         wasmURL: resources.wasm,
@@ -222,7 +245,8 @@ public struct LaunchSpecResolver {
         shmemName: shmem,
         inferletNameAtVersion: inferletNameAtVersion,
         profileID: profile.id,
-        modelConfig: .portableResolved(servedModelID: profile.model, modelRef: modelRef)
+        modelConfig: .portableResolved(servedModelID: model, modelRef: modelRef),
+        defaultTokenLimit: defaultTokenLimit
       )
       return .success(spec)
     } catch {
@@ -237,12 +261,16 @@ public struct LaunchSpecResolver {
   private func resolveModelRef(profile: Profile,
                                modelsRoot: URL,
                                fileManager: FileManager = .default) -> Result<String, EngineError> {
-    let localPath = Self.joinModelPath(modelsRoot: modelsRoot, slug: profile.model)
+    guard let model = profile.model,
+          !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return .failure(Self.noDefaultModelError(profile: profile))
+    }
+    let localPath = Self.joinModelPath(modelsRoot: modelsRoot, slug: model)
     switch Self.validateAppStagedModel(at: localPath, fileManager: fileManager) {
     case .success(true):
       switch ModelMemoryGuardrail.validate(
         resolvedModelURL: URL(fileURLWithPath: localPath, isDirectory: false),
-        modelID: profile.model,
+        modelID: model,
         policy: memoryPolicy(),
         fileManager: fileManager
       ) {
@@ -259,12 +287,12 @@ public struct LaunchSpecResolver {
         profile: profile,
         appPath: localPath,
         appPathProblem: problem.reason,
-        hfIdentity: Self.hfIdentity(forModelSlug: profile.model),
+        hfIdentity: Self.hfIdentity(forModelSlug: model),
         hfHome: hfHome()
       ))
     }
 
-    let hfIdentity = Self.hfIdentity(forModelSlug: profile.model)
+    let hfIdentity = Self.hfIdentity(forModelSlug: model)
     let hfCacheRoot = hfHome()
     if let hfIdentity {
       switch HFCacheResolver(hfHome: hfCacheRoot, fileManager: fileManager)
@@ -272,7 +300,7 @@ public struct LaunchSpecResolver {
       case .hit(let cached):
         switch ModelMemoryGuardrail.validate(
           resolvedModelURL: cached,
-          modelID: profile.model,
+          modelID: model,
           policy: memoryPolicy(),
           fileManager: fileManager
         ) {
@@ -317,12 +345,31 @@ public struct LaunchSpecResolver {
       return .failure(AppStagedModelProblem(reason: "is a directory, expected a model file"))
     }
     do {
+      // `attributesOfItem` has lstat semantics (no symlink follow), so a
+      // staged symlink reports `.typeSymbolicLink`. The outer
+      // `fileExists(isDirectory:)` above DID follow the link and already
+      // confirmed the target exists and is not a directory — so a symlink
+      // reaching here points at a regular model file.
       let attrs = try fileManager.attributesOfItem(atPath: path)
-      if let type = attrs[.type] as? FileAttributeType,
-         type != .typeRegular {
-        return .failure(AppStagedModelProblem(
-          reason: "is \(type.rawValue), expected a regular model file"
-        ))
+      if let type = attrs[.type] as? FileAttributeType {
+        switch type {
+        case .typeRegular:
+          break  // a plainly-staged GGUF
+        case .typeSymbolicLink:
+          // Accept a staged symlink-to-regular (e.g. `stage-test-model.sh`
+          // links the HF cache, or a user `ln -s`'d a GGUF). Return the
+          // SYMLINK path (the caller's `localPath`) unchanged: pie follows
+          // it and the `.gguf` suffix is preserved, whereas the resolved
+          // blob would be an extension-less path pie rejects. Previously
+          // this hard-failed → `modelMissing`, which ALSO skipped the
+          // HF-cache fallback even when the cache held the model (the
+          // operator's real blocker). Pre-existing, not #413.
+          break
+        default:
+          return .failure(AppStagedModelProblem(
+            reason: "is \(type.rawValue), expected a regular model file"
+          ))
+        }
       }
     } catch {
       return .failure(AppStagedModelProblem(
@@ -348,7 +395,7 @@ public struct LaunchSpecResolver {
                                         hfHome: URL,
                                         hfProblem: HFCacheResolver.CacheProblem? = nil) -> EngineError {
     var parts = [
-      "model missing for profile \(profile.id.debugDescription): \(profile.model.debugDescription)",
+      "model missing for profile \(profile.id.debugDescription): \((profile.model ?? "<none>").debugDescription)",
       "checked app-staged path \(appPath)",
     ]
     if let appPathProblem {
@@ -365,6 +412,13 @@ public struct LaunchSpecResolver {
       parts.append("recovery: import/stage a GGUF at \(appPath)")
     }
     return EngineError(code: .modelMissing, message: parts.joined(separator: "; "))
+  }
+
+  private static func noDefaultModelError(profile: Profile) -> EngineError {
+    EngineError(
+      code: .modelMissing,
+      message: "profile \(profile.id.debugDescription) has no default model; choose or download a model before starting"
+    )
   }
 
   private static func downloadCommand(for identity: (repo: String, file: String?)) -> String {

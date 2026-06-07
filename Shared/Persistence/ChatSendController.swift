@@ -227,6 +227,195 @@ public final class ChatSendController: ObservableObject {
     }
   }
 
+  /// Send the current turn as a **tree-of-thought** search (#413). Shares
+  /// the controller's generation/cancel/`isInFlight` scaffolding with
+  /// `send` but consumes the `/v1/inferlet` SSE tree stream instead of a
+  /// chat completion: each event folds into a `ToTTree`, snapshotted onto
+  /// the assistant row's `tot` for the live tree-search view, and the
+  /// `tree_complete` final answer becomes the row's `content`.
+  ///
+  /// Deliberately NOT wired to the engine-gone retry ladder `send` uses:
+  /// a ToT search is long and non-idempotent (a re-issue re-runs the whole
+  /// tree), so v1 surfaces a fault rather than silently re-spending it.
+  public func sendTreeOfThought(
+    chat: Chat,
+    context: ModelContext,
+    engine: EngineClient,
+    config: ToTProfileConfig,
+    persistenceStatus: PersistenceStatus,
+    options: ChatSendRequestOptions
+  ) {
+    cancel()
+    generation &+= 1
+    let myGeneration = generation
+    guard let request = Self.makeToTRequest(chat: chat, config: config, options: options) else {
+      persistenceStatus.report(
+        ToTSendError.requestEncodingFailed,
+        context: "ChatSendController.makeToTRequest"
+      )
+      return
+    }
+    isInFlight = true
+    Diag.app.event("chat.send.tot", [("model", options.modelID)])
+
+    task = Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer {
+        if self.generation == myGeneration {
+          self.activeWriter = nil
+          self.activeAssistant = nil
+          self.activeContext = nil
+          self.activePersistenceStatus = nil
+          self.task = nil
+          self.isInFlight = false
+        }
+      }
+
+      guard self.generation == myGeneration, !Task.isCancelled else { return }
+
+      let assistant = Message(role: ChatMessage.Role.assistant.rawValue, content: "", ts: Date())
+      context.insert(assistant)
+      chat.messages.append(assistant)
+      chat.updatedAt = assistant.ts
+      do {
+        try context.save()
+      } catch {
+        chat.messages.removeAll { $0.id == assistant.id }
+        context.delete(assistant)
+        persistenceStatus.report(error, context: "ChatSendController.insertAssistant(tot)")
+        return
+      }
+      self.activeAssistant = assistant
+      self.activeContext = context
+      self.activePersistenceStatus = persistenceStatus
+
+      var tree = ToTTree()
+      // Whether a terminal frame (tree_complete) arrived. A ToT stream that
+      // ends WITHOUT one — the engine closed the connection mid-search, e.g.
+      // a slow search hit the engine's per-request timeout — must surface as
+      // a failure, not a silent partial tree the UI shows forever (the
+      // "hangs after the beam selection, no completion, no error" report).
+      var reachedTerminal = false
+      let encoder = JSONEncoder()
+      // Coalesce the live-view encode (#413 phase B). Each `assistant.tot`
+      // set republishes the @Model and rebuilds the whole recursive tree
+      // view; the token-delta flood (thousands per search) would do that
+      // thousands of times and saturate the MainActor — which starved the
+      // helper-health monitor into restarting the engine mid-search, closing
+      // the SSE with no terminal. So re-encode at most ~15 Hz for delta
+      // frames; structural frames (a node starting/finishing, a level
+      // pruning, the terminal) always flush so the view never lags a whole
+      // node behind and the persisted snapshot is never stale.
+      var lastLiveEncode = Date.distantPast
+      // #413 diag: time + progress at the SSE close, so the operator's run can
+      // line a `no_terminal` close up against an `engine.relaunch` (helper.log)
+      // or `engine.poll fail` (app.log) at the same instant — pinning whether a
+      // mid-search engine/helper restart closed the stream.
+      let totStart = Date()
+      do {
+        for try await event in toTEventStream(from: engine.dispatchInferlet(request)) {
+          guard self.generation == myGeneration, !Task.isCancelled else { return }
+          tree.apply(event)
+          let isDelta: Bool = { if case .nodeDelta = event { return true } else { return false } }()
+          let now = Date()
+          if !isDelta || now.timeIntervalSince(lastLiveEncode) >= Self.totLiveEncodeInterval {
+            lastLiveEncode = now
+            assistant.tot = try? encoder.encode(tree)
+          }
+          switch event {
+          case let .treeComplete(selectedNodeID, finalAnswer):
+            reachedTerminal = true
+            if selectedNodeID == nil {
+              // F1: a null selection is a TOTAL failure — the beam selects
+              // the best ok leaf whenever one exists, so no selection means
+              // every branch failed to generate. The server now emits the
+              // terminal `error` frame for this (handled by the `catch`),
+              // but treat a null `treeComplete` as failure defensively so a
+              // total failure never persists as a blank SUCCESSFUL turn.
+              tree.fail(Self.totNoAnswerMessage)
+              assistant.tot = try? encoder.encode(tree)
+              if assistant.content.isEmpty {
+                assistant.content = "⚠️ \(Self.totNoAnswerMessage)"
+              }
+              Diag.app.event("chat.fail.tot", [("reason", "no_answer")])
+            } else {
+              assistant.content = finalAnswer ?? ""
+            }
+            Self.persistTree(context, status: persistenceStatus)
+            // Terminal: nil the active row so a later cancel() can't delete
+            // an already-finished turn (mirrors `send`).
+            self.activeAssistant = nil
+            self.activeContext = nil
+            self.activePersistenceStatus = nil
+          case .levelPruned:
+            Self.persistTree(context, status: persistenceStatus)
+          case .treeStart, .nodeStart, .nodeDelta, .nodeComplete:
+            // In-memory tot re-encode above already drives the live tree
+            // (incl. per-token node_delta fill, #413 phase B); disk persistence
+            // stays throttled to level boundaries + the terminal.
+            break
+          }
+        }
+        // Stream ended cleanly. If no terminal frame arrived, the engine
+        // closed the connection mid-search (a slow search hit the engine's
+        // per-request timeout, or the daemon dropped it) — surface it as a
+        // failure with the partial tree preserved, instead of leaving a
+        // half-built tree that looks like a permanent hang (no completion,
+        // no error). A real terminal already set `.complete`/`.failed`.
+        if self.generation == myGeneration, !Task.isCancelled {
+          if !reachedTerminal {
+            tree.fail(Self.totIncompleteMessage)
+            assistant.tot = try? encoder.encode(tree)
+            if assistant.content.isEmpty {
+              assistant.content = "⚠️ \(Self.totIncompleteMessage)"
+            }
+            Diag.app.event("chat.fail.tot", [
+              ("reason", "no_terminal"),
+              ("elapsed", String(format: "%.1f", Date().timeIntervalSince(totStart))),
+              ("nodes", String(tree.nodes.count)),
+            ])
+          }
+          Self.persistTree(context, status: persistenceStatus)
+        }
+      } catch is CancellationError {
+        return  // cancel() owns the row (recordCancelledAssistant)
+      } catch {
+        guard self.generation == myGeneration, !Task.isCancelled else { return }
+        tree.fail(PersistenceStatus.formatError(error))
+        assistant.tot = try? encoder.encode(tree)
+        if assistant.content.isEmpty {
+          assistant.content = "⚠️ \(PersistenceStatus.formatError(error))"
+        }
+        Diag.app.event("chat.fail.tot", [("error", String(describing: type(of: error)))])
+        Self.persistTree(context, status: persistenceStatus)
+      }
+    }
+  }
+
+  /// Min interval between live-tree re-encodes for token-delta frames
+  /// (#413 phase B) — ~15 Hz. Smooth enough for live token-fill, sparse
+  /// enough that a search's thousands of deltas no longer rebuild the tree
+  /// view thousands of times on the MainActor. Structural frames bypass it.
+  static let totLiveEncodeInterval: TimeInterval = 1.0 / 15.0
+
+  /// User-facing copy for a no-ok-leaf tree-of-thought total failure (F1).
+  /// Kept close to the engine's `no_answer` message without coupling to its
+  /// exact wording.
+  static let totNoAnswerMessage = "Tree-of-thought search produced no answer (every branch failed)."
+
+  /// User-facing copy when the ToT stream ends without a terminal frame —
+  /// the engine closed the connection mid-search (commonly its per-request
+  /// timeout on a slow search). The partial tree is preserved (F-stall).
+  static let totIncompleteMessage = "Tree-of-thought search did not finish — the engine closed the connection (it may have timed out). Try a lighter profile (smaller breadth/depth) or a simpler question."
+
+  private static func persistTree(_ context: ModelContext, status: PersistenceStatus) {
+    do {
+      try context.save()
+    } catch {
+      status.report(error, context: "ChatSendController.persistTree")
+    }
+  }
+
   public func cancel() {
     generation &+= 1
     task?.cancel()
@@ -274,6 +463,35 @@ public final class ChatSendController: ObservableObject {
   }
 
   private static func makeRequest(chat: Chat, options: ChatSendRequestOptions) -> ChatRequest {
+    // Authoritative speculation coupling (#426). An enabled-speculation
+    // profile is a greedy "Fast Think" profile: the chat-apc drafter only
+    // engages when the request is greedy (temperature 0, #418), so force it
+    // here regardless of the toolbar's sampling. A profile with no
+    // `[speculation]` section, or one explicitly disabled, attaches no field
+    // and leaves sampling untouched — the request stays byte-identical to a
+    // normal chat (no `spec_metrics` overhead).
+    let spec = options.speculation
+    let wireSpec: ChatSpeculation? = (spec?.enabled == true)
+      ? ChatSpeculation(enabled: true, leaderLen: spec?.leaderLen, draftLen: spec?.draftLen)
+      : nil
+    let sampling = wireSpec == nil
+      ? options.sampling
+      : ChatSampling(temperature: 0, topP: options.sampling.topP, maxTokens: options.sampling.maxTokens)
+    return ChatRequest(
+      model: options.modelID,
+      messages: transcriptTurns(chat: chat, options: options),
+      sampling: sampling,
+      stream: true,
+      speculation: wireSpec
+    )
+  }
+
+  /// The request-history turns: an optional system-prompt override
+  /// followed by the persisted transcript in `(ts, id)` order, dropping
+  /// turns that don't belong in history (empty / cancelled assistants).
+  /// Shared by the chat (`makeRequest`) and tree-of-thought
+  /// (`makeToTRequest`) request builders so the two can't drift.
+  private static func transcriptTurns(chat: Chat, options: ChatSendRequestOptions) -> [ChatMessage] {
     var turns: [ChatMessage] = []
     if let prompt = options.systemPromptOverride, !prompt.isEmpty {
       turns.append(ChatMessage(role: .system, content: prompt))
@@ -288,27 +506,31 @@ public final class ChatSendController: ObservableObject {
         guard !Self.excludesFromRequestHistory(message, role: role) else { return nil }
         return ChatMessage(role: role, content: message.content)
       })
-    // Authoritative speculation coupling (#426). An enabled-speculation
-    // profile is a greedy "Fast Think" profile: the chat-apc drafter only
-    // engages when the request is greedy (temperature 0, #418), so force
-    // it here regardless of the toolbar's sampling. A profile with no
-    // `[speculation]` section, or one explicitly disabled, attaches no
-    // field and leaves sampling untouched — the request stays
-    // byte-identical to a normal chat (no `spec_metrics` overhead).
-    let spec = options.speculation
-    let wireSpec: ChatSpeculation? = (spec?.enabled == true)
-      ? ChatSpeculation(enabled: true, leaderLen: spec?.leaderLen, draftLen: spec?.draftLen)
-      : nil
-    let sampling = wireSpec == nil
-      ? options.sampling
-      : ChatSampling(temperature: 0, topP: options.sampling.topP, maxTokens: options.sampling.maxTokens)
-    return ChatRequest(
+    return turns
+  }
+
+  /// Build the `/v1/inferlet` dispatch body for a tree-of-thought turn.
+  /// The ToT `input` carries the transcript + the bounded search params
+  /// (server re-validates them); `temperature`/`top_p` come from the same
+  /// sampling the chat path uses. Returns nil only if the body can't be
+  /// JSON-encoded (a programmer error — the input is plain owned data).
+  private static func makeToTRequest(
+    chat: Chat,
+    config: ToTProfileConfig,
+    options: ChatSendRequestOptions
+  ) -> InferletRequest? {
+    let input = ToTRequestInput(
       model: options.modelID,
-      messages: turns,
-      sampling: sampling,
-      stream: true,
-      speculation: wireSpec
+      messages: transcriptTurns(chat: chat, options: options),
+      breadth: config.breadth,
+      depth: config.depth,
+      beamWidth: config.beamWidth,
+      maxTokensPerNode: config.maxTokensPerNode,
+      temperature: options.sampling.temperature,
+      topP: options.sampling.topP
     )
+    guard let data = try? JSONEncoder().encode(input) else { return nil }
+    return InferletRequest(inferlet: "tree-of-thought", input: data, messages: nil, stream: true)
   }
 
   /// Canonical wire string for a finish reason. Shared by `finishMeta`
@@ -390,6 +612,33 @@ public final class ChatSendController: ObservableObject {
     if message.content.isEmpty { return true }
     return message.finishReason == "cancelled"
   }
+}
+
+/// JSON body for the tree-of-thought `/v1/inferlet` dispatch `input`.
+/// snake_case keys mirror the engine's `TotInput` schema; `temperature` /
+/// `top_p` come from the shared sampling, the rest from the ToT profile.
+private struct ToTRequestInput: Encodable {
+  let model: String
+  let messages: [ChatMessage]
+  let breadth: Int
+  let depth: Int
+  let beamWidth: Int
+  let maxTokensPerNode: Int
+  let temperature: Double
+  let topP: Double
+
+  private enum CodingKeys: String, CodingKey {
+    case model, messages, breadth, depth, temperature
+    case beamWidth = "beam_width"
+    case maxTokensPerNode = "max_tokens_per_node"
+    case topP = "top_p"
+  }
+}
+
+/// Failure constructing a tree-of-thought send.
+public enum ToTSendError: Error, Equatable, Sendable {
+  /// The `/v1/inferlet` dispatch body could not be JSON-encoded.
+  case requestEncodingFailed
 }
 
 public struct ChatSendRequestOptions: Equatable, Sendable {

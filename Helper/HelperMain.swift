@@ -71,6 +71,19 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// "continue with a beep" failure mode (review v4 F4).
   private var degradedReason: PieDirsError?
 
+  /// Test seam over the `NSWorkspace` app-launch `openPieApp` performs.
+  /// Production leaves it `nil` and the real `NSWorkspace.shared`
+  /// launches/foregrounds the resolved parent bundle (delivering any
+  /// deep-link URLs). A unit test sets it to capture `(urls, appURL)` and
+  /// assert that the menu-bar "Settings…" item delivers exactly
+  /// `[SettingsDeepLink.settingsURL]` to `resolvedPieAppURL()` — the wiring
+  /// that otherwise silently degrades to a plain app-foreground on a refactor
+  /// (#440). A settable property rather than a constructor-injected closure
+  /// (the idiom for `PieSupervisor.killProcessOverride`) because
+  /// `HelperAppDelegate` is `@main`-constructed with no init seam; `nil` in
+  /// production keeps the real launch path untouched.
+  var workspaceOpenOverride: ((_ urls: [URL], _ appURL: URL) -> Void)?
+
   static func main() {
     let app = NSApplication.shared
     let delegate = HelperAppDelegate()
@@ -79,12 +92,28 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationDidFinishLaunching(_ note: Notification) {
+    // When this helper hosts the #440 RatioThinkHelperTests unit bundle its
+    // code is loaded in-process, and the real boot would otherwise run: status
+    // item, login-item registration, and the XPC-listener bind whose
+    // `verifyStartupInvariants` hard-traps under the ad-hoc-signed test host
+    // (no Team Identifier). XCTest's own `XCTestConfigurationFilePath` marker is
+    // injected only AFTER launch, too late for this boot path, so the test
+    // scheme sets this env var instead — scheme env is present from launch. It
+    // is never set in production or by the App-spawned helper subprocess, so
+    // this skips boot ONLY under the unit-test scheme.
+    if ProcessInfo.processInfo.environment["PIE_TEST_HELPER_NO_BOOT"] == "1" {
+      Log.helper.info("PIE_TEST_HELPER_NO_BOOT=1; skipping helper boot (unit-test host)")
+      return
+    }
     HelperConfig.assertStartupContract()
     Log.helper.info("RatioThinkHelper launched (xpc=\(HelperConfig.xpcServiceName, privacy: .public) testMode=\(HelperConfig.isTestMode, privacy: .public))")
     let info = Bundle.main.infoDictionary
     Diag.helper.event("helper.launch", [
       ("version", info?["CFBundleShortVersionString"] as? String ?? "?"),
       ("build", info?["CFBundleVersion"] as? String ?? "?"),
+      ("pid", String(ProcessInfo.processInfo.processIdentifier)),
+      ("bundle", DiagnosticLog.redactHome(Bundle.main.bundleURL.path)),
+      ("executable", DiagnosticLog.redactHome(Bundle.main.executableURL?.path ?? "?")),
     ])
     eagerProbePieDirs()
     setupStatusItemIfNeeded()
@@ -122,6 +151,10 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   ///    which therefore calls `xpcListener.invalidate()` inline
   ///    instead of relying on this hook.
   func applicationWillTerminate(_ note: Notification) {
+    Diag.helper.event("helper.quit", [
+      ("reason", "applicationWillTerminate"),
+      ("pid", String(ProcessInfo.processInfo.processIdentifier)),
+    ])
     // Order matters here (review v1 F1):
     //   1. Cancel the supervisor observer FIRST and nil out the
     //      status item so the `guard` in `applyStatusItemModel`
@@ -151,7 +184,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // paths reach this hook still apply — SIGKILL/SIGABRT/exit(_:)
     // skip the helper teardown entirely, in which case launchd
     // reaps the child via process-group cleanup.
-    engineHost?.stop()
+    engineHost?.stop(reason: "helper.applicationWillTerminate")
     profileStore?.stop()
     profileStore = nil
     if let xpcListener {
@@ -229,7 +262,8 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     let exported: PieHelperXPC
     if let reason = degradedReason {
       Log.helper.error("publishing degraded XPC listener (reason=\(String(describing: reason), privacy: .public))")
-      exported = DegradedHelperAPI(reasonMessage: String(describing: reason))
+      exported = DegradedHelperAPI(reasonMessage: String(describing: reason),
+                                   onQuitRequested: Self.terminateSelf)
     } else {
       // : PieEngineHost replaces PieSupervisor on the
       // production helper boot path. Lazily constructed (not in
@@ -299,19 +333,20 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       // refusing every selector.
       let resolver = buildLaunchSpecResolver()
       exported = HelperExportedAPI(engineHost: host,
-                                   launchSpecResolver: resolver)
+                                   launchSpecResolver: resolver,
+                                   onQuitRequested: Self.terminateSelf)
       // Phase 2.3: wire engine-host state into the menu-bar dot
       // once a healthy host exists. Degraded boots skip this — the
       // degraded status item is already published and must not be
       // overwritten by a misleading "Engine: stopped" render.
       subscribeToEngineHost(host)
-      // Auto-start the engine for the active profile at boot (
-      // follow-up). The App is poll-only and never issues `startEngine`;
-      // before this the engine only started via a manual menu-bar Resume,
-      // so a freshly-booted Helper left the engine `.stopped` and every
-      // model load deferred forever on `engineNotReady`. Firing the same
-      // in-process resume path here yields a ready engine without user
-      // interaction. No active profile selected ⇒ benign no-op.
+      // Boot model-load is intentionally disabled: helper startup publishes
+      // XPC/menu state and leaves the engine `.stopped`. Status delivery is
+      // still poll-based via `engineStatus`, but the app can issue explicit
+      // lifecycle requests through `EngineStatusStore.startEngine` for the
+      // launch prompt/user confirmation, Restart, Local API, and post-download
+      // recovery paths. Engine-crash auto-relaunch remains separate and is
+      // wired through `HelperResumeAction` via `PieEngineHost`'s relauncher.
       autoResumeEngineOnBoot()
       #if DEBUG
       scheduleSmokeAutoDriveIfRequested(engineHost: host)
@@ -422,7 +457,8 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   @discardableResult
   private func transitionToDegraded(reason: String) -> Bool {
     guard let xpcListener else { return false }
-    let degraded = DegradedHelperAPI(reasonMessage: reason)
+    let degraded = DegradedHelperAPI(reasonMessage: reason,
+                                     onQuitRequested: Self.terminateSelf)
     xpcListener.setExportedObject(degraded)
     return true
   }
@@ -446,6 +482,10 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   private func transitionToDegradedOrTerminate(reason: String) {
     guard transitionToDegraded(reason: reason) else {
       Log.helper.fault("transitionToDegraded had no listener to mutate (reason=\(reason, privacy: .public)) — terminating: a live listener serving .degraded is the only acceptable post-resume failure mode")
+      Diag.helper.event("helper.quit", [
+        ("reason", "degraded_transition_failed"),
+        ("pid", String(ProcessInfo.processInfo.processIdentifier)),
+      ])
       xpcListener?.invalidate()
       xpcListener = nil
       exit(EXIT_FAILURE)
@@ -1089,20 +1129,20 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
   #endif
 
-  /// Boot-time engine auto-start ( follow-up). Mirrors the menu-bar
-  /// Resume path but fires once at launch so a configured profile yields
-  /// a running engine without user interaction — the App's poll-only
-  /// model-load flow then finds a ready engine instead of deferring on
-  /// `engineNotReady`. Skipped in test mode (tests own engine lifecycle).
-  /// `HelperResumeAction.run` is internally nil/`.noActiveProfile`-safe,
-  /// so a degraded boot or unselected profile is a logged no-op.
+  /// Boot-time model-load hook. This is now a disabled/no-op hook: helper
+  /// boot publishes XPC/menu state and leaves the engine stopped while the app
+  /// polls status separately. Starts happen through explicit lifecycle requests
+  /// (`startEngine(profileID:)`) from the launch prompt/user confirmation,
+  /// Restart, Local API, or post-download recovery paths. Skipped in test mode
+  /// because tests own engine lifecycle.
   private func autoResumeEngineOnBoot() {
     // #4: the engine is NO LONGER auto-started on boot. Pre-#4 this
     // resumed the active profile automatically, which (a) loaded a
     // multi-GB model the user may not want this session and (b) made a
     // model-load failure on launch read as an unprompted error. The App
-    // now ALWAYS asks ("Start <model>?") on launch and starts the engine
-    // only on explicit user confirm via the `startEngine` XPC selector.
+    // now starts via explicit lifecycle requests: the launch prompt/user
+    // confirmation, Restart, Local API, or post-download recovery paths call
+    // the `startEngine` XPC selector.
     //
     // Scope: this disables the BOOT model-load only. The engine-CRASH
     // auto-relaunch ladder is a separate mechanism (the `relauncher`
@@ -1110,7 +1150,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // the liveness monitor on `.failed(.engineGone)` per
     // `RelaunchPolicy`) and is deliberately UNCHANGED — a crashed engine
     // still recovers automatically without a prompt.
-    Log.helper.info("autoResumeEngineOnBoot: boot auto-start disabled (#4) — engine stays stopped; the App prompts the user to start the active profile’s model on launch")
+    Log.helper.info("autoResumeEngineOnBoot: boot auto-start disabled (#4) — engine stays stopped until an explicit app/user start request")
   }
 
   @objc func togglePauseResume(_ sender: NSMenuItem) {
@@ -1133,7 +1173,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
         return
       }
       Log.helper.info("togglePauseResume: pause requested")
-      engineHost.stop()
+      engineHost.stop(reason: "menu.pause")
     case .resume:
       // In-process Resume ( follow-up): no XPC round-trip — the
       // menu-bar action runs inside the helper, so we hand the
@@ -1244,7 +1284,10 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// launch.
   private static let pieAppAncestorMaxDepth = 6
 
-  private func resolvedPieAppURL() -> URL {
+  // `internal` (not `private`) so the #440 delivery unit test can assert the
+  // deep link is delivered to exactly this resolved bundle. Still file-scoped
+  // to the helper module; exposed only under `@testable import`.
+  func resolvedPieAppURL() -> URL {
     let helperBundle = Bundle.main.bundleURL
     // Review v4 F33: walk ancestors up to a bounded depth looking
     // for ANY `*.app`. The v3 fixed 4-up walk landed in the wrong
@@ -1305,6 +1348,12 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   private func openPieApp(delivering urls: [URL] = []) {
     let url = resolvedPieAppURL()
     Log.helper.info("openPieApp: \(url.path, privacy: .public) urls=\(urls.map(\.absoluteString).joined(separator: ","), privacy: .public)")
+    // Test seam: capture the delivered URLs + resolved bundle instead of
+    // actually launching an app (#440). Nil in production.
+    if let workspaceOpenOverride {
+      workspaceOpenOverride(urls, url)
+      return
+    }
     let cfg = NSWorkspace.OpenConfiguration()
     cfg.activates = true
     let completion: (NSRunningApplication?, Error?) -> Void = { [weak self] app, err in
@@ -1361,8 +1410,63 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
                         error: reason)
   }
 
+  /// #448: self-terminate hook handed to the exported XPC object. The
+  /// `quitHelper` selector fires this AFTER the engine is reaped, so the
+  /// Helper exits cleanly (exit 0) and launchd's
+  /// `KeepAlive { SuccessfulExit: false }` does NOT relaunch it. Hops to main
+  /// because `NSApp.terminate` is main-thread-only; the selector runs on an
+  /// arbitrary XPC / engine-host queue.
+  private static let terminateSelf: @Sendable () -> Void = {
+    DispatchQueue.main.async { NSApp.terminate(nil) }
+  }
+
+  /// True when an instance of the main RatioThink.app is running. The
+  /// menu-bar "Quit RatioThink" then delegates the coordinated full-product
+  /// teardown to the App (the single quit coordinator) so the Helper isn't
+  /// quit-then-respawned on-demand.
+  private static var isAppRunning: Bool {
+    !NSRunningApplication.runningApplications(withBundleIdentifier: "com.ratiothink.app").isEmpty
+  }
+
+  /// "Quit RatioThink" (#448): tears down the WHOLE product, not just the
+  /// Helper. The old `NSApp.terminate(nil)` quit only the Helper — the
+  /// still-running App then respawned it on-demand within ~1s and the engine
+  /// could orphan. Now: if the App is running it owns the quit, so hand it
+  /// `ratiothink://quit` and let `AppQuitCoordinator` drive the teardown
+  /// (stop polling → `quitHelper` → terminate App + Helper). If the App is
+  /// absent there is nothing to coordinate, so the Helper reaps its own
+  /// engine and exits.
   @objc func quitPie() {
-    NSApp.terminate(nil)
+    if Self.isAppRunning {
+      Log.helper.info("quitPie: App running — delivering ratiothink://quit for coordinated full quit")
+      openPieApp(delivering: [SettingsDeepLink.quitURL])
+    } else {
+      Log.helper.info("quitPie: App not running — local teardown (reap engine, then terminate helper)")
+      quitHelperLocally()
+    }
+  }
+
+  /// App-absent fallback for "Quit RatioThink": reap the engine before
+  /// exiting so the Helper never orphans `pie`. `stopAndWait` fires only
+  /// after the terminal status that `LaunchedSession.shutdown` publishes once
+  /// `pie` is gone. If that deadline expires, the Helper stays alive so it can
+  /// continue owning the session for retry or an explicit force-quit path.
+  private func quitHelperLocally() {
+    guard let engineHost else {
+      NSApp.terminate(nil)
+      return
+    }
+    HelperQuitTeardown.stopThenTerminate(
+      engineHost: engineHost,
+      initialTimeout: HelperExportedAPI.stopReplyDeadline,
+      onTerminalFailure: { result in
+        Log.helper.error("quitHelperLocally: stop/reap failed with status \(String(describing: result.lastStatus), privacy: .public); keeping helper alive for retry or explicit force quit")
+      },
+      onTimeout: { result in
+        Log.helper.error("quitHelperLocally: stop/reap timed out with status \(String(describing: result.lastStatus), privacy: .public); keeping helper alive for retry or explicit force quit")
+      },
+      terminate: { DispatchQueue.main.async { NSApp.terminate(nil) } }
+    )
   }
 
   // MARK: - alert

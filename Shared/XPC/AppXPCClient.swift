@@ -26,6 +26,7 @@ import os
 /// errorHandler AFTER a successful reply when the peer tears down
 /// (the same pattern `HelperMain.verifyMachServicePublished` uses).
 public protocol AppXPCClient: Sendable {
+  func helperProtocolVersion() async throws -> Int
   func engineStatus() async throws -> EngineStatus
   /// Stop the running engine ( Unload). Resolves on acceptance;
   /// throws the helper-side `EngineError` when the stop is rejected, or
@@ -41,12 +42,44 @@ public protocol AppXPCClient: Sendable {
   /// or an `AppXPCClientError` on transport failure. Driven by #326's
   /// fresh-install auto-start.
   func startEngine(profileID: String) async throws
+  /// Strict restart for active-profile default-model changes. Unlike
+  /// `startEngine(profileID:)`, `.alreadyRunning` is a failure signal:
+  /// the helper did not complete a stop→start registry rebuild.
+  func restartEngine(profileID: String) async throws
+  /// #448: ask the helper to stop the engine and terminate itself as the
+  /// final step of a coordinated full-product quit. Resolves on acceptance;
+  /// throws the helper-side `EngineError` on refusal or an
+  /// `AppXPCClientError` on transport failure. The helper may exit before
+  /// the reply flushes, so a post-call connection invalidation is normal —
+  /// the App-side coordinator treats any outcome as "helper is quitting" and
+  /// proceeds to terminate.
+  func quitHelper() async throws
 }
 
 public extension AppXPCClient {
   /// Default: memory unavailable. Test stubs that don't model the
   /// engineMemory selector inherit nil and need no change.
   func engineMemory() async throws -> EngineMemorySample? { nil }
+
+  /// Default: no helper to quit. Test stubs and the helperless DEBUG
+  /// harness inherit this no-op; only the production `HelperXPCClient`
+  /// drives the real `quitHelper` selector.
+  func quitHelper() async throws {}
+}
+
+public enum HelperProtocolCompatibility {
+  /// Version 1: pre-capability helpers. Version 2: helper exports the
+  /// strict `restartEngine(profileID:)` selector required by active
+  /// default-model changes.
+  public static let currentVersion = 2
+
+  public static func isCompatible(client: any AppXPCClient) async -> Bool {
+    do {
+      return try await client.helperProtocolVersion() >= currentVersion
+    } catch {
+      return false
+    }
+  }
 }
 
 public enum AppXPCClientError: Error, Sendable, CustomStringConvertible {
@@ -90,15 +123,19 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
   private let endpoint: Endpoint
   private let interface: NSXPCInterface
   private let replyTimeout: TimeInterval
+  private let restartReplyTimeout: TimeInterval
   /// Persistent connection. `nil` means "not yet opened" or "torn
   /// down by invalidation/interruption — recreate on next call."
   private let connectionLock = OSAllocatedUnfairLock<NSXPCConnection?>(initialState: nil)
   private static let log = Logger(subsystem: "com.ratiothink.app", category: "xpc.client")
 
-  public init(endpoint: Endpoint, replyTimeout: TimeInterval = 2.0) {
+  public init(endpoint: Endpoint,
+              replyTimeout: TimeInterval = 2.0,
+              restartReplyTimeout: TimeInterval = 85.0) {
     self.endpoint = endpoint
     self.interface = PieHelperXPCInterface.make()
     self.replyTimeout = replyTimeout
+    self.restartReplyTimeout = restartReplyTimeout
   }
 
   /// Default-construct against the helper's resolved mach service.
@@ -117,6 +154,60 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
         invalidateIfCurrent(connection)
       }
       throw error
+    }
+  }
+
+  public func helperProtocolVersion() async throws -> Int {
+    let connection = ensureConnection()
+    do {
+      return try await helperProtocolVersion(on: connection)
+    } catch let error as AppXPCClientError {
+      if case .replyTimeout = error {
+        invalidateIfCurrent(connection)
+      }
+      throw error
+    }
+  }
+
+  private func helperProtocolVersion(on connection: NSXPCConnection) async throws -> Int {
+    let timeout = replyTimeout
+    return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int, Error>) in
+      let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
+      func resumeOnce(_ result: Result<Int, Error>) {
+        let shouldResume = resumed.withLock { fired -> Bool in
+          if fired { return false }
+          fired = true
+          return true
+        }
+        guard shouldResume else { return }
+        switch result {
+        case .success(let version): continuation.resume(returning: version)
+        case .failure(let error): continuation.resume(throwing: error)
+        }
+      }
+      if timeout > 0 {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+          resumeOnce(.failure(AppXPCClientError.replyTimeout(
+            selector: "helperProtocolVersion",
+            timeout: timeout
+          )))
+        }
+      }
+      let proxy = connection.remoteObjectProxyWithErrorHandler { err in
+        resumeOnce(.failure(AppXPCClientError.proxyError(err as NSError)))
+      }
+      guard let api = proxy as? PieHelperXPC else {
+        resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
+        return
+      }
+      api.helperProtocolVersion { data in
+        do {
+          let version = try XPCPayload.decode(Int.self, from: data)
+          resumeOnce(.success(version))
+        } catch {
+          resumeOnce(.failure(AppXPCClientError.decode(error as NSError)))
+        }
+      }
     }
   }
 
@@ -224,6 +315,76 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
     }
   }
 
+  /// #448: drive the `quitHelper` selector. Uses a dedicated, longer
+  /// deadline than the shared 2s `replyTimeout` because the helper stops +
+  /// reaps the engine (worst case the `LaunchedSession` SIGINT→SIGKILL
+  /// grace) before replying. A healthy engine stops in well under a second;
+  /// the bound exists only so a wedged engine can't hang the App's quit.
+  static let quitReplyTimeout: TimeInterval =
+    HelperExportedAPI.stopReplyDeadline + HelperExportedAPI.replyTimeoutSlack
+
+  public func quitHelper() async throws {
+    let connection = ensureConnection()
+    do {
+      try await quitHelper(on: connection)
+    } catch let error as AppXPCClientError {
+      if case .replyTimeout = error {
+        invalidateIfCurrent(connection)
+      }
+      throw error
+    }
+  }
+
+  private func quitHelper(on connection: NSXPCConnection) async throws {
+    let timeout = Self.quitReplyTimeout
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
+      func resumeOnce(_ result: Result<Void, Error>) {
+        let shouldResume = resumed.withLock { fired -> Bool in
+          if fired { return false }
+          fired = true
+          return true
+        }
+        guard shouldResume else { return }
+        switch result {
+        case .success: continuation.resume(returning: ())
+        case .failure(let e): continuation.resume(throwing: e)
+        }
+      }
+      if timeout > 0 {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+          resumeOnce(.failure(AppXPCClientError.replyTimeout(
+            selector: "quitHelper",
+            timeout: timeout
+          )))
+        }
+      }
+      let proxy = connection.remoteObjectProxyWithErrorHandler { err in
+        // The helper terminating mid-reply surfaces here as
+        // NSXPCConnectionInvalid — for quitHelper that IS the success path
+        // (helper exited), but the App-side coordinator ignores the outcome
+        // and terminates regardless, so reporting it as proxyError is fine.
+        resumeOnce(.failure(AppXPCClientError.proxyError(err as NSError)))
+      }
+      guard let api = proxy as? PieHelperXPC else {
+        resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
+        return
+      }
+      api.quitHelper { errorData in
+        guard let errorData else {
+          resumeOnce(.success(()))
+          return
+        }
+        do {
+          let engineError = try XPCPayload.decode(EngineError.self, from: errorData)
+          resumeOnce(.failure(engineError))
+        } catch {
+          resumeOnce(.failure(AppXPCClientError.decode(error as NSError)))
+        }
+      }
+    }
+  }
+
   public func startEngine(profileID: String) async throws {
     let connection = ensureConnection()
     do {
@@ -273,6 +434,66 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
         // caller relies on the engine-status poll for the live `.running`
         // signal; the wrapper only needs to surface a refusal. A
         // wire-contract violation decodes to EngineError(.wireContractViolation).
+        do {
+          switch try PieHelperXPCWire.decodeStartEngineReply(
+            successData: successData, errorData: errorData
+          ) {
+          case .success:
+            resumeOnce(.success(()))
+          case .failure(let engineError):
+            resumeOnce(.failure(engineError))
+          }
+        } catch {
+          resumeOnce(.failure(error))
+        }
+      }
+    }
+  }
+
+  public func restartEngine(profileID: String) async throws {
+    let connection = ensureConnection()
+    do {
+      try await restartEngine(profileID: profileID, on: connection)
+    } catch let error as AppXPCClientError {
+      if case .replyTimeout = error {
+        invalidateIfCurrent(connection)
+      }
+      throw error
+    }
+  }
+
+  private func restartEngine(profileID: String, on connection: NSXPCConnection) async throws {
+    let timeout = restartReplyTimeout
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
+      func resumeOnce(_ result: Result<Void, Error>) {
+        let shouldResume = resumed.withLock { fired -> Bool in
+          if fired { return false }
+          fired = true
+          return true
+        }
+        guard shouldResume else { return }
+        switch result {
+        case .success: continuation.resume(returning: ())
+        case .failure(let e): continuation.resume(throwing: e)
+        }
+      }
+      if timeout > 0 {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+          resumeOnce(.failure(AppXPCClientError.replyTimeout(
+            selector: "restartEngine",
+            timeout: timeout
+          )))
+        }
+      }
+      let proxy = connection.remoteObjectProxyWithErrorHandler { err in
+        resumeOnce(.failure(AppXPCClientError.proxyError(err as NSError)))
+      }
+      guard let api = proxy as? PieHelperXPC else {
+        resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
+        return
+      }
+      api.restartEngine(profileID: profileID) { successData, errorData in
         do {
           switch try PieHelperXPCWire.decodeStartEngineReply(
             successData: successData, errorData: errorData

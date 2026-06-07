@@ -121,6 +121,10 @@ public enum RatioThinkModelContainer {
     public var tokens: Int
     public var ts: Date
     public var meta: Data?
+    /// Serialized `ToTTree` snapshot for a tree-of-thought turn (#413).
+    /// Optional + omitted-when-nil so older exports and ordinary chat
+    /// turns decode without it.
+    public var tot: Data?
 
     public init(
       id: UUID,
@@ -129,7 +133,8 @@ public enum RatioThinkModelContainer {
       reasoning: String? = nil,
       tokens: Int,
       ts: Date,
-      meta: Data?
+      meta: Data?,
+      tot: Data? = nil
     ) {
       self.id = id
       self.role = role
@@ -138,6 +143,7 @@ public enum RatioThinkModelContainer {
       self.tokens = tokens
       self.ts = ts
       self.meta = meta
+      self.tot = tot
     }
   }
 
@@ -171,7 +177,8 @@ public enum RatioThinkModelContainer {
             reasoning: $0.reasoning.isEmpty ? nil : $0.reasoning,
             tokens: $0.tokens,
             ts: $0.ts,
-            meta: $0.meta
+            meta: $0.meta,
+            tot: $0.tot
           ) }
       )
     }
