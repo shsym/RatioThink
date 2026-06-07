@@ -309,10 +309,10 @@ final class PieControlLauncherConfigTests: XCTestCase {
   func test_realPie_driverList_subcommand_exists_and_reports_portable() throws {
     let candidates = [
       ProcessInfo.processInfo.environment["PIE_TEST_REAL_PIE_BIN"],
-      "/Applications/RatioThink.app/Contents/Resources/pie-engine/pie",
+      "/Applications/Rational.app/Contents/Resources/pie-engine/pie",
     ].compactMap { $0 }
     guard let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-      throw XCTSkip("no real pie binary (set PIE_TEST_REAL_PIE_BIN or install RatioThink.app)")
+      throw XCTSkip("no real pie binary (set PIE_TEST_REAL_PIE_BIN or install Rational.app)")
     }
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: path)

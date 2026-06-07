@@ -2,7 +2,7 @@ import Foundation
 import os
 
 /// #448 full-product quit coordinator (App side). A single funnel for every
-/// quit trigger — ⌘Q, the App "Quit RatioThink" menu item, and the menu-bar
+/// quit trigger — ⌘Q, the App "Quit Rational" menu item, and the menu-bar
 /// Helper's `ratiothink://quit` deep link — so the whole product tears down
 /// with no orphaned App / Helper / `pie` process and no relaunch loop.
 ///

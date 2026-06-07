@@ -4,7 +4,7 @@ import XCTest
 ///
 /// Phase B of the full real-model E2E (Phase A = S204_ModelAcquisition
 /// downloads the GGUF via Settings). The engine harness loads THAT
-/// downloaded GGUF via the portable driver; this test connects RatioThink.app
+/// downloaded GGUF via the portable driver; this test connects Rational.app
 /// to it, sends a prompt, and verifies the real assistant answer is
 /// visible and persists across relaunch.
 ///
@@ -33,7 +33,7 @@ final class S204_ChatSendGUITests: XCTestCase {
     app.launch()
     defer { app.terminate() }
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     try createChatAndSend(prompt, in: app)
@@ -48,7 +48,7 @@ final class S204_ChatSendGUITests: XCTestCase {
     relaunched.launch()
     defer { relaunched.terminate() }
     XCTAssert(relaunched.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not relaunch")
+              "Rational.app did not relaunch")
     relaunched.activate()
 
     try selectPersistedChat(in: relaunched)

@@ -1,7 +1,7 @@
 #!/bin/bash
 # production path-1 model-load indicator GUI E2E.
 #
-# Drives RatioThink.app's REAL load path: model menu -> confirm gate ("Switch")
+# Drives Rational.app's REAL load path: model menu -> confirm gate ("Switch")
 # -> ProfileSwapCoordinator -> ModelLoadCenter.load -> HTTPEngineClient
 # .loadModel -> POST /v1/models/load against a mock harness that HOLDS
 # the load SSE (no model_loading frame — exactly pie-control v1's shape)
@@ -50,8 +50,8 @@ if ! pgrep -x Dock >/dev/null 2>&1; then
   exit 2
 fi
 if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "gui load-indicator e2e: RatioThink.app Automation/Accessibility permissions required." >&2
-  echo "gui load-indicator e2e: grant Xcode/XCTest runner and RatioThink.app Automation + Accessibility in System Settings, then rerun:" >&2
+  echo "gui load-indicator e2e: Rational.app Automation/Accessibility permissions required." >&2
+  echo "gui load-indicator e2e: grant Xcode/XCTest runner and Rational.app Automation + Accessibility in System Settings, then rerun:" >&2
   echo "gui load-indicator e2e: PIE_TEST_TCC_GRANTED=1 Scripts/run-gui-load-indicator-e2e.sh" >&2
   exit 2
 fi

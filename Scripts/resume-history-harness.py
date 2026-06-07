@@ -7,6 +7,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+class LocalThreadingHTTPServer(ThreadingHTTPServer):
+    """Bind loopback test servers without reverse-DNS/FQDN lookup."""
+
+    def server_bind(self):
+        self.socket.bind(self.server_address)
+        self.server_address = self.socket.getsockname()
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
+
+
 RESPONSES = [
     "I will remember cerulean-275.",
     "The code word is cerulean-275.",
@@ -129,7 +140,7 @@ def main() -> int:
     request_log.parent.mkdir(parents=True, exist_ok=True)
     request_log.write_text("", encoding="utf-8")
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = LocalThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.state = State(request_log)
     host, port = server.server_address
     port_file.write_text(f"http://{host}:{port}", encoding="utf-8")

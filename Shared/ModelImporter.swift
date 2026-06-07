@@ -1,7 +1,7 @@
 import Foundation
 
 /// Imports a user-supplied GGUF file (drag-drop or *Open…* picker) into
-/// the RatioThink models directory. Lives in `Shared/` so the same logic can
+/// the Rational models directory. Lives in `Shared/` so the same logic can
 /// run from the App, from a unit test, or eventually from a CLI tool.
 public enum ModelImporter {
 

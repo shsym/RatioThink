@@ -1,6 +1,49 @@
 import Foundation
 import os
 
+/// Identity payload used by launch reconciliation to distinguish "the mach
+/// service answered" from "the expected RationalHelper answered". The service
+/// name and bundle identifier are intentionally preserved across the product
+/// rename, so the executable name is the stable migration discriminator.
+public struct HelperIdentity: Codable, Equatable, Sendable {
+  public static let expectedExecutableName = "RationalHelper"
+  public static let expectedBundleIdentifier = "com.ratiothink.app.helper"
+
+  public let executableName: String
+  public let bundleIdentifier: String?
+  public let bundleVersion: String?
+  public let bundlePath: String?
+
+  public init(executableName: String,
+              bundleIdentifier: String?,
+              bundleVersion: String?,
+              bundlePath: String?) {
+    self.executableName = executableName
+    self.bundleIdentifier = bundleIdentifier
+    self.bundleVersion = bundleVersion
+    self.bundlePath = bundlePath
+  }
+
+  public static func current(bundle: Bundle = .main) -> HelperIdentity {
+    HelperIdentity(
+      executableName: bundle.executableURL?.lastPathComponent
+        ?? ProcessInfo.processInfo.processName,
+      bundleIdentifier: bundle.bundleIdentifier,
+      bundleVersion: bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+      bundlePath: bundle.bundleURL.path
+    )
+  }
+
+  public var isExpectedRationalHelper: Bool {
+    executableName == Self.expectedExecutableName
+      && bundleIdentifier == Self.expectedBundleIdentifier
+  }
+
+  public var mismatchSummary: String {
+    "executable=\(executableName), bundleID=\(bundleIdentifier ?? "nil"), version=\(bundleVersion ?? "nil"), path=\(bundlePath ?? "nil")"
+  }
+}
+
 /// XPC wire protocol the GUI calls and the Helper publishes.
 ///
 /// The selectors are `@objc` because `NSXPCConnection` builds proxies via
@@ -32,12 +75,17 @@ import os
 /// introspection in tests and for future bridges.
 @objc(PieHelperXPC)
 public protocol PieHelperXPC {
+  /// Reply data is `XPCPayload.encode(HelperIdentity)`. Optional for
+  /// migration safety: pre-rename helpers do not implement it, and the app
+  /// treats a reachable helper that cannot answer identity as mismatched.
+  @objc optional func helperIdentity(reply: @escaping (Data) -> Void)
+
   /// Reply data is `XPCPayload.encode(Int)`. Bump the returned
   /// `HelperProtocolCompatibility.currentVersion` whenever the App
   /// starts requiring a newly-added helper selector. App-side launchd
-  /// reconciliation probes this first so an old-but-reachable helper
-  /// from a previous app build is repaired before product paths call
-  /// selectors it does not export.
+  /// reconciliation probes this so an old-but-reachable helper from a previous
+  /// app build is repaired before product paths call selectors it does not
+  /// export.
   func helperProtocolVersion(reply: @escaping (Data) -> Void)
 
   /// Reply data is `XPCPayload.encode(EngineStatus)`.

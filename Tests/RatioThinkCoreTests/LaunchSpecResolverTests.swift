@@ -247,7 +247,7 @@ final class LaunchSpecResolverTests: XCTestCase {
     // : asClosure now returns PieControlLauncher.LaunchSpec
     // and requires wasm/manifest + pieHome injection. Stub them with
     // tempDir-anchored paths so the test does not depend on a
-    // bundled RatioThink.app sibling.
+    // bundled Rational.app sibling.
     let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
     let modelsRoot = tempDir.appendingPathComponent("models-closure", isDirectory: true)
     try stageModel(named: "llama-3.1-8b-instruct", in: modelsRoot)

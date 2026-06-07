@@ -145,7 +145,7 @@ final class S396_RetryRecoveryGUITests: XCTestCase {
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     app.launch()
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
     return app
   }

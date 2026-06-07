@@ -1,7 +1,7 @@
 import Foundation
 
 /// The `ratiothink://` URL-scheme contract that lets the menu-bar Helper
-/// (a separate process) ask the running — or launching — RatioThink.app to
+/// (a separate process) ask the running — or launching — Rational.app to
 /// open a specific surface.
 ///
 /// Today the only route is Settings: the menu-bar "Settings…" item opens

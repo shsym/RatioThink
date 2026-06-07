@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the pie engine binary (Vendor/pie -> `pie-server` crate, bin `pie`)
 # for one macOS architecture, codesign it with the same identity used by
-# the host RatioThink.app target, and copy the result into the app bundle's
+# the host Rational.app target, and copy the result into the app bundle's
 # Resources/pie-engine/ directory.
 #
 # Two invocation modes:

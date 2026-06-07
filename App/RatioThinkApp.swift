@@ -222,7 +222,7 @@ struct RatioThinkApp: App {
   /// `EngineStatusStore`, `LaunchSpecResolver`, `PieControlLauncher`,
   /// `pie serve`). It is honored ONLY in a test harness
   /// (`PIE_TEST_MODE=1`) or a DEBUG build — a shipped Release
-  /// `RatioThink.app` MUST use the real Helper→engine path. Refusing it
+  /// `Rational.app` MUST use the real Helper→engine path. Refusing it
   /// in Release closes the parity gap two ways: a shipped app can't be
   /// redirected at a foreign URL, and a "real binary" (Release/packaged)
   /// scenario cannot silently pass on a fake base URL — if the override
@@ -380,7 +380,7 @@ struct RatioThinkApp: App {
   }
 
   var body: some Scene {
-    WindowGroup("RatioThink") {
+    WindowGroup("Rational") {
       Group {
         if appPreferences.firstLaunchWizardCompleted {
           RootView()
@@ -412,7 +412,7 @@ struct RatioThinkApp: App {
     .defaultSize(width: 1200, height: 800)
     .commands {
       // #411: the MANUAL "Check for Updates…" entry, in the standard macOS
-      // spot (App menu, directly under "About RatioThink"). It always checks
+      // spot (App menu, directly under "About Rational"). It always checks
       // and bypasses the ignore-set, complementing the once-per-launch auto
       // check that surfaces the non-modal UpdateAvailableBanner (RootView /
       // UpdateAvailabilityModel). Both compare the running version to the

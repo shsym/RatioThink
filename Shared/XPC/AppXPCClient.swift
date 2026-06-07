@@ -107,7 +107,7 @@ public enum AppXPCClientError: Error, Sendable, CustomStringConvertible {
     case .proxyError(let err):
       return "NSXPCConnection error: \(err)"
     case .decode(let err):
-      return "EngineStatus decode failed: \(err)"
+      return "XPC reply decode failed: \(err)"
     case .replyTimeout(let selector, let timeout):
       return "\(selector) timed out after \(timeout)s"
     }
@@ -154,6 +154,64 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
         invalidateIfCurrent(connection)
       }
       throw error
+    }
+  }
+
+  public func helperIdentity() async throws -> HelperIdentity {
+    let connection = ensureConnection()
+    do {
+      return try await helperIdentity(on: connection)
+    } catch let error as AppXPCClientError {
+      if case .replyTimeout = error {
+        invalidateIfCurrent(connection)
+      }
+      throw error
+    }
+  }
+
+  private func helperIdentity(on connection: NSXPCConnection) async throws -> HelperIdentity {
+    let timeout = replyTimeout
+    return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<HelperIdentity, Error>) in
+      let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
+      func resumeOnce(_ result: Result<HelperIdentity, Error>) {
+        let shouldResume = resumed.withLock { fired -> Bool in
+          if fired { return false }
+          fired = true
+          return true
+        }
+        guard shouldResume else { return }
+        switch result {
+        case .success(let identity): continuation.resume(returning: identity)
+        case .failure(let error): continuation.resume(throwing: error)
+        }
+      }
+      if timeout > 0 {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+          resumeOnce(.failure(AppXPCClientError.replyTimeout(
+            selector: "helperIdentity",
+            timeout: timeout
+          )))
+        }
+      }
+      let proxy = connection.remoteObjectProxyWithErrorHandler { err in
+        resumeOnce(.failure(AppXPCClientError.proxyError(err as NSError)))
+      }
+      guard let api = proxy as? PieHelperXPC else {
+        resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
+        return
+      }
+      guard let helperIdentity = api.helperIdentity else {
+        resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
+        return
+      }
+      helperIdentity { data in
+        do {
+          let identity = try XPCPayload.decode(HelperIdentity.self, from: data)
+          resumeOnce(.success(identity))
+        } catch {
+          resumeOnce(.failure(AppXPCClientError.decode(error as NSError)))
+        }
+      }
     }
   }
 

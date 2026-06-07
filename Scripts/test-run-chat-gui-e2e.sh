@@ -93,11 +93,11 @@ test_missing_gguf_fixture_is_not_accepted() {
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
 
-  # Fake a seated session and a runnable pie so the flow reaches the model
-  # fixture gate. The chat GUI wrapper now serves the seeded GGUF profile slug
-  # through the portable harness, so the wrapper must fail loudly before
-  # starting Xcode/engine work when the GGUF fixture is unavailable.
-  mkdir -p "$tmp/bin" "$tmp/hf/hub/models--Qwen--Qwen3-0.6B"
+  # Fake a seated session and a runnable pie so the flow reaches the GGUF
+  # fixture gate. Stage only a *bare* GGUF hub dir — the partial/aborted-
+  # download shape that must not be accepted as a resolved fixture — and
+  # assert the wrapper fails loudly before starting Xcode/engine work.
+  mkdir -p "$tmp/bin" "$tmp/hf/hub/models--Qwen--Qwen3-0.6B-GGUF"
   cat >"$tmp/bin/pgrep" <<'FAKE_PGREP'
 #!/bin/bash
 exit 0
@@ -115,6 +115,7 @@ FAKE_PGREP
     PIE_TEST_TCC_GRANTED=1 \
     PIE_E2E_AUTOPREP=0 \
     PIE_TEST_RUN_ROOT="$tmp/run" \
+    STAGE_TEST_MODEL_DEST="$tmp/staged/Qwen3-0.6B-Q8_0.gguf" \
     "$SCRIPT" 2>&1
   )"
   local status=$?
@@ -123,13 +124,13 @@ FAKE_PGREP
   if [[ "$status" -ne 2 ]]; then
     echo "FAIL: missing GGUF fixture must fail the model gate (exit 2), got $status" >&2
     echo "--- output ---" >&2
-    printf '%s
-' "$output" >&2
+    printf '%s\n' "$output" >&2
     exit 1
   fi
+  require_contains "$output" "model fixture NOT staged"
   require_contains "$output" "GGUF fixture unavailable"
   if [[ "$output" == *"starting portable GGUF engine harness"* ]]; then
-    echo "FAIL: missing GGUF fixture wrongly accepted — engine harness started" >&2
+    echo "FAIL: bare GGUF cache wrongly accepted as a staged fixture — engine harness started" >&2
     exit 1
   fi
 }

@@ -37,14 +37,14 @@ final class SettingsDeepLinkDeliveryTests: XCTestCase {
       got.urls, [SettingsDeepLink.settingsURL],
       "menu-bar Settings… must deliver exactly [ratiothink://settings]; got \(got.urls)")
     // …and it must target the resolved parent bundle (the "launch MY install"
-    // guarantee), not whichever RatioThink.app LaunchServices would pick for a
+    // guarantee), not whichever Rational.app LaunchServices would pick for a
     // bare scheme open.
     XCTAssertEqual(
       got.appURL, delegate.resolvedPieAppURL(),
-      "deep link must be delivered to the resolved parent RatioThink.app bundle")
+      "deep link must be delivered to the resolved parent Rational.app bundle")
   }
 
-  /// The non-deep-link entry point (`showPie()` / "Show RatioThink") must keep
+  /// The non-deep-link entry point (`showPie()` / "Show Rational") must keep
   /// delivering NO urls, so a future change that always attaches the Settings
   /// URL can't silently turn every menu click into a Settings open.
   func test_showPie_delivers_no_urls() throws {
@@ -57,6 +57,6 @@ final class SettingsDeepLinkDeliveryTests: XCTestCase {
     delegate.showPie()
 
     let got = try XCTUnwrap(captured, "showPie() did not route through the workspace-open seam")
-    XCTAssertEqual(got.urls, [], "Show RatioThink must foreground the app with no deep link; got \(got.urls)")
+    XCTAssertEqual(got.urls, [], "Show Rational must foreground the app with no deep link; got \(got.urls)")
   }
 }

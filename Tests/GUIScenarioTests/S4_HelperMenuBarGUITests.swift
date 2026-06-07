@@ -3,8 +3,8 @@ import XCTest
 
 /// S4 — RatioThinkHelper menu bar shell.
 ///
-/// GUI-only. Asserts against FINAL design strings (`Show RatioThink`, `Engine:
-/// stopped`, `Settings…`, `Open Logs…`, `Quit RatioThink`) so the test stays
+/// GUI-only. Asserts against FINAL design strings (`Show Rational`, `Engine:
+/// stopped`, `Settings…`, `Open Logs…`, `Quit Rational`) so the test stays
 /// honest about whether real impl has landed. Skips if no seated session.
 final class S4_HelperMenuBarGUITests: XCTestCase {
   override func setUp() async throws {
@@ -77,8 +77,8 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     // helper boot, which `HelperStatusItemModel` maps to the
     // disabled "Resume Engine" item. Phase 2.4 wires
     // ProfileStore so the item actually enables.
-    for expected in ["Show RatioThink", "Engine: stopped", "Resume Engine",
-                     "Settings…", "Open Logs…", "Quit RatioThink"] {
+    for expected in ["Show Rational", "Engine: stopped", "Resume Engine",
+                     "Settings…", "Open Logs…", "Quit Rational"] {
       XCTAssertTrue(titles.contains(expected),
                     "menu missing '\(expected)'; got: \(titles)")
     }
@@ -108,7 +108,7 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
   /// Its real pre-requisites are:
   ///   · TCC permissions granted (covered by the existing skip),
   ///   · the bundled pie binary at
-  ///     `<RatioThink.app>/Contents/Resources/pie-engine/pie` (Scripts/
+  ///     `<Rational.app>/Contents/Resources/pie-engine/pie` (Scripts/
   ///     build-pie-engine.sh stages this during xcodebuild; the
   ///     portable Metal driver is compiled in — verify with
   ///     `pie doctor` → "portable compiled in"),
@@ -125,8 +125,8 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
   ///     fixture (`test-models/`) or `PIE_TEST_MODEL` env override.
   ///     `LaunchSpecResolver` joins `<PIE_HOME>/models` with
   ///     `profile.model` to build the model path.
-  ///   - `inferlets` — symlinked at `<RatioThink.app>/Contents/Resources/Inferlets`
-  ///     resolved via the test bundle's sibling RatioThink.app (test target
+  ///   - `inferlets` — symlinked at `<Rational.app>/Contents/Resources/Inferlets`
+  ///     resolved via the test bundle's sibling Rational.app (test target
   ///     depends on `RatioThink`, so xcodebuild stages it next to the runner),
   ///     so the engine's inferlet-dir walk finds the bundled
   ///     `chat-apc` artifacts.
@@ -185,22 +185,22 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
       withDestinationURL: modelSource
     )
 
-    // 3. Locate RatioThink.app via the test bundle's sibling, not LaunchServices.
+    // 3. Locate Rational.app via the test bundle's sibling, not LaunchServices.
     //    `project.yml` declares `RatioThinkGUITests.dependencies = [target: RatioThink,
-    //    target: RatioThinkHelper]` so xcodebuild stages RatioThink.app at
-    //    `<BUILT_PRODUCTS_DIR>/RatioThink.app` next to the runner. Walking up
+    //    target: RatioThinkHelper]` so xcodebuild stages Rational.app at
+    //    `<BUILT_PRODUCTS_DIR>/Rational.app` next to the runner. Walking up
     //    from `Bundle(for:)` finds it deterministically — LaunchServices
     //    lookup can fail for many reasons (stale LSDB entry, sandboxed
     //    runner) that produce a misleading skip (review v1 F1).
     let pieAppURL = try XCTUnwrap(
-      Self.locateSiblingApp(named: "RatioThink.app", from: type(of: self)),
-      "RatioThink.app not found next to test bundle — verify project.yml `RatioThinkGUITests.dependencies` includes `target: RatioThink`"
+      Self.locateSiblingApp(named: "Rational.app", from: type(of: self)),
+      "Rational.app not found next to test bundle — verify project.yml `RatioThinkGUITests.dependencies` includes `target: RatioThink`"
     )
     let inferletSource = pieAppURL
       .appendingPathComponent("Contents/Resources/Inferlets", isDirectory: true)
     XCTAssertTrue(
       fm.fileExists(atPath: inferletSource.path),
-      "bundled inferlets dir missing at \(inferletSource.path) — re-run `make build-inferlets` and re-build RatioThink.app"
+      "bundled inferlets dir missing at \(inferletSource.path) — re-run `make build-inferlets` and re-build Rational.app"
     )
     try fm.createSymbolicLink(
       at: tempDir.appendingPathComponent("inferlets"),
@@ -280,20 +280,20 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     )
 
     let pieAppURL = try XCTUnwrap(
-      Self.locateSiblingApp(named: "RatioThink.app", from: type(of: self)),
-      "RatioThink.app not found next to test bundle — verify project.yml `RatioThinkGUITests.dependencies` includes `target: RatioThink`"
+      Self.locateSiblingApp(named: "Rational.app", from: type(of: self)),
+      "Rational.app not found next to test bundle — verify project.yml `RatioThinkGUITests.dependencies` includes `target: RatioThink`"
     )
     let stagedPieBinary = pieAppURL
       .appendingPathComponent("Contents/Resources/pie-engine/pie", isDirectory: false)
     try XCTSkipUnless(
       fm.isExecutableFile(atPath: stagedPieBinary.path),
-      "bundled pie engine missing at \(stagedPieBinary.path) — rebuild RatioThink.app (Scripts/build-pie-engine.sh)"
+      "bundled pie engine missing at \(stagedPieBinary.path) — rebuild Rational.app (Scripts/build-pie-engine.sh)"
     )
     let inferletSource = pieAppURL
       .appendingPathComponent("Contents/Resources/Inferlets", isDirectory: true)
     XCTAssertTrue(
       fm.fileExists(atPath: inferletSource.path),
-      "bundled inferlets dir missing at \(inferletSource.path) — re-run `make build-inferlets` and re-build RatioThink.app"
+      "bundled inferlets dir missing at \(inferletSource.path) — re-run `make build-inferlets` and re-build Rational.app"
     )
     try fm.createSymbolicLink(
       at: tempDir.appendingPathComponent("inferlets"),
@@ -361,7 +361,7 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
   /// Pre-reqs (all skip-with-clear-reason if missing):
   ///   · `PIE_TEST_TCC_GRANTED=1` (Accessibility / Automation),
   ///   · pie binary bundled at
-  ///     `<RatioThink.app>/Contents/Resources/pie-engine/pie` (built by
+  ///     `<Rational.app>/Contents/Resources/pie-engine/pie` (built by
   ///     the `Build pie engine binary` post-compile phase — see
   ///     project.yml; portable Metal driver is compiled in),
   ///   · `Qwen3-0.6B-Q8_0.gguf` at `PIE_TEST_MODEL` or repo-root
@@ -409,25 +409,25 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     // validateAppStagedModel, which rejects non-regular files.
     try Self.stageSeededModelRegularFile(from: modelSource, in: modelsDir)
 
-    // 3. Locate RatioThink.app via the test bundle's sibling, then verify
+    // 3. Locate Rational.app via the test bundle's sibling, then verify
     //    the staged pie binary exists. If it's missing, the
     //    post-compile build phase didn't run — skip with a clear
     //    pointer so the operator knows to rebuild.
     let pieAppURL = try XCTUnwrap(
-      Self.locateSiblingApp(named: "RatioThink.app", from: type(of: self)),
-      "RatioThink.app not found next to test bundle — verify project.yml `RatioThinkGUITests.dependencies` includes `target: RatioThink`"
+      Self.locateSiblingApp(named: "Rational.app", from: type(of: self)),
+      "Rational.app not found next to test bundle — verify project.yml `RatioThinkGUITests.dependencies` includes `target: RatioThink`"
     )
     let stagedPieBinary = pieAppURL
       .appendingPathComponent("Contents/Resources/pie-engine/pie", isDirectory: false)
     try XCTSkipUnless(
       fm.isExecutableFile(atPath: stagedPieBinary.path),
-      "bundled pie engine missing at \(stagedPieBinary.path) — rebuild RatioThink.app (Scripts/build-pie-engine.sh)"
+      "bundled pie engine missing at \(stagedPieBinary.path) — rebuild Rational.app (Scripts/build-pie-engine.sh)"
     )
     let inferletSource = pieAppURL
       .appendingPathComponent("Contents/Resources/Inferlets", isDirectory: true)
     XCTAssertTrue(
       fm.fileExists(atPath: inferletSource.path),
-      "bundled inferlets dir missing at \(inferletSource.path) — re-run `make build-inferlets` and re-build RatioThink.app"
+      "bundled inferlets dir missing at \(inferletSource.path) — re-run `make build-inferlets` and re-build Rational.app"
     )
     try fm.createSymbolicLink(
       at: tempDir.appendingPathComponent("inferlets"),

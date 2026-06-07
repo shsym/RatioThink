@@ -29,7 +29,7 @@ final class ReadmeScreenshotsGUITests: XCTestCase {
     defer { app.terminate() }
     Self.activate(app)
 
-    try createChatAndSend("What makes RatioThink different from a cloud chatbot?", in: app)
+    try createChatAndSend("What makes Rational different from a cloud chatbot?", in: app)
     XCTAssertTrue(
       waitForStaticTextContaining("OpenAI-compatible", in: app, timeout: 30),
       "canned assistant reply did not render; app: \(app.debugDescription)"
@@ -138,7 +138,7 @@ final class ReadmeScreenshotsGUITests: XCTestCase {
 
   private static func activate(_ app: XCUIApplication) {
     XCTAssert(app.wait(for: .runningForeground, timeout: 15),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
   }
 

@@ -6,9 +6,9 @@ import AppKit
 ///
 /// - Window close (red button / ⌘W) does NOT quit. The product keeps running
 ///   in the menu bar with the engine still serving; reopen via the menu-bar
-///   "Show RatioThink" (#448 Q2). The idle-death fix (#448) is what makes this
+///   "Show Rational" (#448 Q2). The idle-death fix (#448) is what makes this
 ///   honest — a backgrounded engine actually stays alive.
-/// - ⌘Q, the "Quit RatioThink" menu items, and the Helper's
+/// - ⌘Q, the "Quit Rational" menu items, and the Helper's
 ///   `ratiothink://quit` deep link all route through `NSApp.terminate`, which
 ///   lands here and performs a coordinated FULL quit via `AppQuitCoordinator`:
 ///   stop polling, ask the Helper to stop + reap the engine and exit cleanly,

@@ -265,7 +265,7 @@ public final class ProfileStore: ObservableObject {
   /// HF repo the seeded default lives in — the SAME repo the recommended
   /// curated entry downloads from. Used by the resolver's HF-cache
   /// fallback (`LaunchSpecResolver.hfIdentity`) when the model is not
-  /// staged in RatioThink's app models directory.
+  /// staged in Rational's app models directory.
   public static let defaultChatHFRepoID = "Qwen/Qwen3-0.6B-GGUF"
 
   public static let defaultChatTOML: String = """

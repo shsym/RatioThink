@@ -168,7 +168,7 @@ public enum CuratedModelCatalog {
       approximateSizeBytes: 639_446_688,
       huggingFaceRepo: "Qwen/Qwen3-0.6B-GGUF",
       huggingFaceFile: "Qwen3-0.6B-Q8_0.gguf",
-      summary: "Recommended starter — same model RatioThink seeds as the default chat profile."
+      summary: "Recommended starter — same model Rational seeds as the default chat profile."
     ),
     CuratedModel(
       id: "llama-3.2-1b-instruct-q4_k_m",

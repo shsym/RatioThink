@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="Resources/AppIcon/pie-icon-highres.png" alt="RatioThink" width="120" />
+<img src="Resources/AppIcon/pie-icon-highres.png" alt="Rational" width="120" />
 
-# RatioThink
+# Rational
 
 **Private, local AI chat for macOS — powered by various thinking modes.**
 
@@ -13,7 +13,7 @@
 
 </div>
 
-RatioThink is a native macOS app that runs open-weight language models entirely on your Mac.
+Rational is a native macOS app that runs open-weight language models entirely on your Mac.
 Powered by a bundled [Pie](https://github.com/pie-project/pie) inference engine, it supercharges
 local models using specialized _thinking profiles_.
 
@@ -25,10 +25,10 @@ Feel free to report any issues you find!
 
 ## Install
 
-1. Download `RatioThink-arm64.dmg` (Apple Silicon) from
+1. Download `Rational-arm64.dmg` (Apple Silicon) from
    [Releases](https://github.com/shsym/RatioThink/releases) and open it.
-2. In the window that opens, drag **RatioThink.app** onto the **Applications** shortcut.
-3. Open **RatioThink** from Applications and follow the first-launch wizard to download a
+2. In the window that opens, drag **Rational.app** onto the **Applications** shortcut.
+3. Open **Rational** from Applications and follow the first-launch wizard to download a
    starter model.
 
 ## Build from source
@@ -39,7 +39,7 @@ Feel free to report any issues you find!
 ```bash
 git clone --recurse-submodules https://github.com/shsym/RatioThink.git
 cd RatioThink
-make build          # generates RatioThink.xcodeproj, then builds RatioThink.app + helper
+make build          # generates RatioThink.xcodeproj, then builds Rational.app + helper
 ```
 
 The repo uses git submodules (the Pie engine, plus `ds_store` + `mac_alias` under
@@ -70,7 +70,7 @@ requires the notarized release flow below.
 > use only, clear the quarantine flag — notarized release downloads never need
 > this:
 > ```bash
-> xattr -dr com.apple.quarantine /Applications/RatioThink.app
+> xattr -dr com.apple.quarantine /Applications/Rational.app
 > ```
 
 ## Troubleshooting / Collect diagnostics
@@ -83,12 +83,12 @@ If the app misbehaves, you can collect a diagnostics bundle to send to the devel
 **From Terminal** (works even when the app or helper won't launch):
 
 ```bash
-/Applications/RatioThink.app/Contents/Resources/collect-diagnostics.sh
+/Applications/Rational.app/Contents/Resources/collect-diagnostics.sh
 ```
 
 This prints a short verdict (e.g. *quarantine present*, *helper never
 launched*, *Gatekeeper rejected*, *engine failed*) and writes
-`~/Desktop/RatioThink-diagnostics-<timestamp>.zip`. Attach that `.zip` to your
+`~/Desktop/Rational-diagnostics-<timestamp>.zip`. Attach that `.zip` to your
 report.
 
 The bundle contains app/helper versions, codesign + Gatekeeper + quarantine
@@ -124,8 +124,8 @@ A few known issues in the v0.1.1 release, with workarounds:
 
 ```
 RatioThink/
-├── App/            # Main SwiftUI app target (RatioThink.app)
-├── Helper/         # SMAppService menu-bar helper (RatioThinkHelper.app)
+├── App/            # Main SwiftUI app target (Rational.app)
+├── Helper/         # SMAppService menu-bar helper (RationalHelper.app)
 ├── Shared/         # Cross-target Swift library (RatioThinkCore: engine client, XPC, models, persistence)
 ├── Inferlets/      # chat-apc inferlet (Rust → wasm) + prebuilt artifact
 ├── Resources/      # App icon + asset catalog

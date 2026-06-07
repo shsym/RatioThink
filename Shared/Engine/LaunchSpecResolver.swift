@@ -38,7 +38,7 @@ public struct LaunchSpecResolver {
   /// Returns the bundled `pie` engine executable. Throws when the
   /// binary is missing — surfaced over XPC as `.spawnFailed` rather
   /// than `.profileMissing` so the GUI distinguishes "user picked an
-  /// invalid profile" from "RatioThink.app is broken".
+  /// invalid profile" from "Rational.app is broken".
   public let pieBinary: () throws -> URL
 
   /// Returns the models root (default `PieDirs.models()`).
@@ -55,7 +55,7 @@ public struct LaunchSpecResolver {
   /// Returns the bundled `chat-apc` wasm + manifest used by
   /// `PieControlLauncher`'s `install_program` WS call. Default
   /// delegates to `InferletResources.pieControl(in: .main)` so the
-  /// helper resolves them from `RatioThink.app/Contents/Resources/Inferlets`
+  /// helper resolves them from `Rational.app/Contents/Resources/Inferlets`
   /// without having to know the bundle layout. Tests inject a stub
   /// returning temp-dir paths.
   public let pieControlResources: () throws -> (wasm: URL, manifest: URL)
@@ -73,7 +73,7 @@ public struct LaunchSpecResolver {
   public let subprocessEnvironment: () -> [String: String]
 
   /// HuggingFace cache root (`HF_HOME`, not `HF_HOME/hub`) used as a
-  /// read-only fallback after RatioThink's app-managed models directory.
+  /// read-only fallback after Rational's app-managed models directory.
   public let hfHome: () -> URL
 
   /// Resolved-model memory ceiling handed to `ModelMemoryGuardrail`.
@@ -614,9 +614,9 @@ public struct LaunchSpecResolver {
 }
 
 extension LaunchSpecResolver {
-  /// Production binary lookup: `<RatioThink.app>/Contents/Resources/pie-engine/pie`.
-  /// Walks parent `.app` bundles so the embedded `RatioThinkHelper.app` finds
-  /// the engine shipped with its containing `RatioThink.app`. Mirrors
+  /// Production binary lookup: `<Rational.app>/Contents/Resources/pie-engine/pie`.
+  /// Walks parent `.app` bundles so the embedded `RationalHelper.app` finds
+  /// the engine shipped with its containing `Rational.app`. Mirrors
   /// `InferletResources.candidateBundles` (Phase 5.5 ).
   ///
   /// Throws `LaunchSpecResolver.BinaryMissing` when no candidate
@@ -647,18 +647,18 @@ extension LaunchSpecResolver {
 
   /// Maximum ancestor levels the bundle walk inspects looking for a
   /// parent `.app`. Canonical embed layout is
-  /// `RatioThink.app/Contents/Library/LoginItems/RatioThinkHelper.app` — four
+  /// `Rational.app/Contents/Library/LoginItems/RationalHelper.app` — four
   /// `deletingLastPathComponent()` hops from the helper bundle to
-  /// reach `RatioThink.app`. The prior `0..<3` bound stopped at
-  /// `RatioThink.app/Contents` and silently fell through to the
+  /// reach `Rational.app`. The prior `0..<3` bound stopped at
+  /// `Rational.app/Contents` and silently fell through to the
   /// helper-bundle-only candidate, so the engine binary lookup never
-  /// considered the containing `RatioThink.app` (review v150 F6).
+  /// considered the containing `Rational.app` (review v150 F6).
   ///
   /// Matches `HelperAppDelegate.pieAppAncestorMaxDepth = 6` (two
   /// extra levels of headroom for a future versioned LoginItems
   /// subdir).
   static let bundleWalkMaxDepth = 6
-  private static let xcodeSiblingAppName = "RatioThink.app"
+  private static let xcodeSiblingAppName = "Rational.app"
 
   /// Same walk as `InferletResources.candidateBundles` — kept private
   /// here so the binary lookup does not depend on the inferlet bundling
@@ -680,8 +680,8 @@ extension LaunchSpecResolver {
     var url = bundle.bundleURL
     for _ in 0..<bundleWalkMaxDepth {
       // Xcode UI tests launch the RatioThinkHelper target as a standalone
-      // sibling of RatioThink.app, while production launches the helper from
-      // RatioThink.app/Contents/Library/LoginItems. Check the sibling app as
+      // sibling of Rational.app, while production launches the helper from
+      // Rational.app/Contents/Library/LoginItems. Check the sibling app as
       // well as ancestor apps so both layouts resolve the single
       // app-bundled pie engine.
       appendBundle(at: url.deletingLastPathComponent()

@@ -3,7 +3,7 @@ import XCTest
 /// Feature B lifecycle recovery, GUI-facing scenario.
 ///
 /// The existing GUI scenario runner has a stable stale-engine seam:
-/// `PIE_TEST_ENGINE_BASE_URL` lets XCUITest launch RatioThink.app with the
+/// `PIE_TEST_ENGINE_BASE_URL` lets XCUITest launch Rational.app with the
 /// chat HTTP client pointed at an explicit loopback URL. Full real-stack
 /// helper/RatioThink crash injection is not available in the current GUI
 /// framework without broad runner refactors, so this scenario covers the
@@ -35,7 +35,7 @@ final class S279_LifecycleRecoveryGUITests: XCTestCase {
     defer { app.terminate() }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     try createChatAndSend("Trigger stale engine recovery", in: app)

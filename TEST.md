@@ -1,4 +1,4 @@
-# RatioThink — Test catalog & pre-PR gate
+# Rational — Test catalog & pre-PR gate
 
 The single source of truth for *what tests exist, where they run, and what to
 confirm before opening a PR*. `make help` lists the runnable targets; this doc
@@ -12,16 +12,17 @@ below in the same change.
 | Target | What it runs | Runs where | Gating |
 |---|---|---|---|
 | `make ci-pr` | Required GitHub PR aggregate: `lint`, CI-v2 taxonomy guard, app-icon provenance, compile/type check via `build-static`, SPM unit tests, install-guard contracts, diagnostics self-test, sanitizer canary, release-script contracts | GitHub required PR workflow + local | **Required PR CI** |
-| `make build-static` | Xcode Debug compile/type check of RatioThink app + helper with `PIE_SKIP_ENGINE_BUILD=1` so the Rust engine long pole is not built | GitHub + local | **Required PR CI** compile/type check |
+| `make build-static` | Xcode Debug compile/type check of the Rational app + helper with `PIE_SKIP_ENGINE_BUILD=1` so the Rust engine long pole is not built | GitHub + local | **Required PR CI** compile/type check |
 | `make local-pre-merge` | `ci-pr` plus `build-tests`, app-unit, scenario/smoke, HTTP E2E, real-pie driver contract, gmake recipe canary | local operator machine | **Mandatory before merge** for non-doc changes; carries runtime coverage removed from required CI |
 | `make local-gui-gate` | GUI wrapper script regressions + full `RatioThinkGUITests` matrix | seated local session | **Mandatory before merge** for GUI/UI changes |
-| `make local-e2e-gate` | Real-engine/model/signing/helper E2E wrappers (`test-e2e-*`, GUI history/package, helper respawn/recovery) | local/operator only | **Mandatory before merge/release** for affected engine/model/install paths |
+| `make local-e2e-gate` | Real-engine/model/signing/helper E2E wrappers (`test-e2e-*`, GUI history/package, helper respawn/recovery, structured quit) | local/operator only | **Mandatory before merge/release** for affected engine/model/install paths |
 | `make release-gate` | `local-pre-merge` + live-HF curated audit + DMG layout + artifact preflight | local/operator + release machine | **Mandatory before release**; also run `make release-preflight ARTIFACT=…` on the built artifact |
 | `make lint` | helper side-effect invariants (static) | anywhere | Required PR CI via `ci-pr` |
-| `make build` | Debug build of RatioThink app + helper, including real Rust engine bundle build | local | Local packaging/runtime verification |
+| `make build` | Debug build of the Rational app + helper, including real Rust engine bundle build | local | Local packaging/runtime verification |
 | `make build-tests` | **Compile-only** smoke of every xcodebuild target + SPM probe (does NOT run the bundles) | local | Local pre-merge via `local-pre-merge` |
 | `make test-app-unit` | **RatioThinkTests** app-unit bundle (xcodebuild): #420 deep-link/login-item guards, ChatScaffold, ZeroState, snapshots | local (headless, needs Xcode) | Local pre-merge via `local-pre-merge`; CI only type-checks app/helper via `build-static` |
-| `make test-xcode-chat-scaffold` | `ChatScaffoldModelSelectionTests` focused slice of the above (one suite) | local | Focused local app-unit slice |
+| `make test-xcode-chat-scaffold` | `ChatScaffoldModelSelectionTests` focused slice of the app-unit bundle | local | Focused local app-unit slice |
+| `make test-xcode-helper` | `RatioThinkHelperTests` helper-executable unit bundle with zero-test guard | local | Focused local helper slice; compiled by `build-tests` |
 | `make test-unit` | `RatioThinkCoreTests` (SPM, pure/deterministic logic) | GitHub + local | Required PR CI via `ci-pr` |
 | `make test-scenario` | `CLIScenarioTests` (S0 isolation, S1/S2/S3 XPC + engine integration), headless | local | Local pre-merge via `local-pre-merge` |
 | `make test-smoke` | S3 engine subprocess smoke | local | Local pre-merge via `local-pre-merge`; needs built `pie` (`make engine-build`) |
@@ -31,6 +32,7 @@ below in the same change.
 | `make test-ci-v2-static-gate` | Shell guard that asserts the workflow/Makefile keep the CI-v2 lightweight/static taxonomy | GitHub + local | Required PR CI via `ci-pr` |
 | `make test-real-pie-driver-contract` | Builds the worktree pie engine and runs the real `pie driver list` drift guard without silent skips | local | Local pre-merge parity for removed `real-pie-driver-contract` CI job |
 | `make test-gmake-recipe-canary` | gmake 4.x recipe failure/log canary (requires Homebrew `gmake`) | local | Local pre-merge parity when Makefile recipes change |
+| `make test-readme-harness` | README screenshot canned-copy branding guard | local | Focused local docs/product-name guard |
 | `make test-dmg-layout` | DMG drag-install layout verifier regression (hdiutil + codesign) | local/release | Release gate via `release-gate` |
 | `make test-release` | real-tool contract tests for `notarize.sh` + `release-preflight.sh` | GitHub + local/release | Required PR CI via `ci-pr`; also included in `release-gate` through `local-pre-merge` |
 | `make test-stamp` | `Inferlets/chat-apc/_stamp.py` unit tests | GitHub when inferlet-relevant paths change + local | Conditional PR provenance gate |
@@ -44,6 +46,8 @@ below in the same change.
 | `make test-gui-history` | Deterministic multi-turn history/resume E2E | **seated session** | Local E2E gate |
 | `make test-gui-first-launch-package` | Package-backed first-launch E2E (Release `.app`) | **seated session** | Local E2E gate |
 | `make test-gui-script` | Fast preflight regressions for the GUI E2E wrapper scripts | anywhere | Local GUI gate via `local-gui-gate` |
+| `make test-e2e-tot` | Real-engine tree-of-thought app path completes without the #413 stall | local/operator only | Local E2E gate |
+| `make test-quit-structured` | Live structured-quit acceptance: idle engine persists; `ratiothink://quit` leaves no App/Helper/pie | signed install + running engine | Local E2E/manual live gate |
 | `make test-all` | `test-ssh` + `test-app-unit` + `test-gui` (GUI skips if no seated session) | seated for full | Legacy broad local convenience target |
 
 The **`RatioThinkTests`** xcodebuild app-unit target (`Tests/Unit/*`, e.g.
@@ -128,7 +132,7 @@ download), `S327` (engine-status pip), `S360` (Models top-align).
 
 ### GUI temp-home cleanup
 
-A GUI suite that needs the non-sandboxed `RatioThink.app` to write a real
+A GUI suite that needs the non-sandboxed `Rational.app` to write a real
 on-disk store stages its `PIE_HOME` under a real `/tmp` path (S285, S286) —
 never `NSTemporaryDirectory()`, which resolves to the sandboxed runner's
 container the app cannot write. Consequence: the suite **cannot delete that
@@ -366,7 +370,7 @@ Expected pass evidence:
   `What code word did I give you?`,
 - request log entry 2 contains the ordered in-session history:
   user turn 1, assistant turn 1, user turn 2,
-- XCUITest terminates/relaunches RatioThink.app with the same `PIE_HOME`, selects the
+- XCUITest terminates/relaunches Rational.app with the same `PIE_HOME`, selects the
   persisted chat, and sends turn 3:
   `Repeat the code word again.`,
 - request log entry 3 contains the ordered persisted history:
@@ -402,6 +406,6 @@ xcodebuild -project RatioThink.xcodeproj \
 ```
 
 `S258_ComposerSendGUITests` is the first GUI suite to exercise the full
-`RatioThink.app → create/select chat → ComposerView send → HTTPEngineClient →
+`Rational.app → create/select chat → ComposerView send → HTTPEngineClient →
 real engine stream → MessageStreamWriter → persisted assistant message` path
 end to end.

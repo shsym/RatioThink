@@ -76,7 +76,7 @@ struct LocalAPIView: View {
       Button("Turn Off", role: .destructive) { stop() }
       Button("Cancel", role: .cancel) {}
     } message: {
-      Text("This stops the RatioThink engine. In-app chat will also stop until you turn it back on.")
+      Text("This stops the Rational engine. In-app chat will also stop until you turn it back on.")
     }
   }
 
@@ -87,7 +87,7 @@ struct LocalAPIView: View {
       VStack(alignment: .leading, spacing: 4) {
         Text("Local API")
           .font(.title2.weight(.semibold))
-        Text("An OpenAI-compatible HTTP endpoint served by the RatioThink engine on this Mac. It’s the same engine that powers in-app chat.")
+        Text("An OpenAI-compatible HTTP endpoint served by the Rational engine on this Mac. It’s the same engine that powers in-app chat.")
           .font(.callout)
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)

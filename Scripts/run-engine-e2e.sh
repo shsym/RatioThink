@@ -50,8 +50,8 @@ PIE_BIN="${PIE_BIN:-}"
 if [ -z "$PIE_BIN" ]; then
   if [ -x "$ROOT/Vendor/pie/target/release/pie" ]; then
     PIE_BIN="$ROOT/Vendor/pie/target/release/pie"
-  elif [ -x "/Applications/RatioThink.app/Contents/Resources/pie-engine/pie" ]; then
-    PIE_BIN="/Applications/RatioThink.app/Contents/Resources/pie-engine/pie"
+  elif [ -x "/Applications/Rational.app/Contents/Resources/pie-engine/pie" ]; then
+    PIE_BIN="/Applications/Rational.app/Contents/Resources/pie-engine/pie"
     # Loud fallback: no repo build exists, so this run exercises the
     # INSTALLED app's engine binary, not the current worktree. Make the
     # substitution visible so a stale /Applications build can't silently

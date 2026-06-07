@@ -51,7 +51,7 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
     }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 5),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     // Precondition: no Settings window yet — so a post-delivery Settings window
@@ -61,7 +61,7 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
 
     // Deliver the deep link exactly as the menu-bar Helper does: to the
     // running app-under-test's own bundle, so LaunchServices can't route it to
-    // some other registered RatioThink.app.
+    // some other registered Rational.app.
     let appURL = try resolvedRunningAppURL()
     let cfg = NSWorkspace.OpenConfiguration()
     cfg.activates = true
@@ -90,7 +90,7 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
       generalTab.waitForExistence(timeout: 3),
       "Settings window opened but its tabs did not render — deep link did not "
         + "reach the real Settings scene")
-    // …and the deep link must bring RatioThink forward (NSApp.activate() in the
+    // …and the deep link must bring Rational forward (NSApp.activate() in the
     // handler), the foreground half of "open straight to Settings".
     XCTAssertEqual(app.state, .runningForeground, "deep link did not foreground the app")
   }
@@ -101,6 +101,6 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
     let url = NSWorkspace.shared.runningApplications
       .first { $0.bundleIdentifier == "com.ratiothink.app" }?
       .bundleURL
-    return try XCTUnwrap(url, "RatioThink.app is not in runningApplications; launch() may have failed")
+    return try XCTUnwrap(url, "Rational.app is not in runningApplications; launch() may have failed")
   }
 }

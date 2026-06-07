@@ -102,6 +102,13 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   }()
 
   private static let log = Logger(subsystem: "com.ratiothink.app.helper", category: "xpc.exported")
+  private static let identityData: Data = {
+    do {
+      return try XPCPayload.encode(HelperIdentity.current())
+    } catch {
+      preconditionFailure("HelperExportedAPI: failed to pre-encode HelperIdentity: \(error)")
+    }
+  }()
 
   /// Production engine manager. Optional so the same
   /// class still vends a usable `.stopped` reply during early
@@ -207,6 +214,10 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   #endif
 
   // MARK: - engineStatus
+
+  public func helperIdentity(reply: @escaping (Data) -> Void) {
+    reply(Self.identityData)
+  }
 
   public func helperProtocolVersion(reply: @escaping (Data) -> Void) {
     do {
@@ -745,7 +756,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       // Review v16 F2 / v17 F5: a path-traversal attempt or
       // builder-rejected input is a caller-input failure — surface
       // as `.invalidInput` so the GUI renders "please correct
-      // repo/file" rather than "RatioThink internal bug." Reserves
+      // repo/file" rather than "Rational internal bug." Reserves
       // `.wireContractViolation` for actual XPC plumbing bugs per
       // its doc-comment.
       return EngineError(code: .invalidInput,
@@ -874,6 +885,7 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   /// prior catch path replied with `EngineError`-shaped bytes into a
   /// `[String]` slot, which the GUI decoded as wire corruption.
   private let emptyProfilesData: Data
+  private let identityData: Data
 
   /// #448: self-terminate hook, same contract as `HelperExportedAPI`. A
   /// degraded Helper owns no engine, so `quitHelper` just acknowledges and
@@ -905,7 +917,16 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
     } catch {
       preconditionFailure("DegradedHelperAPI: failed to encode empty profiles list: \(error)")
     }
+    do {
+      self.identityData = try XPCPayload.encode(HelperIdentity.current())
+    } catch {
+      preconditionFailure("DegradedHelperAPI: failed to encode HelperIdentity: \(error)")
+    }
     super.init()
+  }
+
+  public func helperIdentity(reply: @escaping (Data) -> Void) {
+    reply(identityData)
   }
 
   public func engineStatus(reply: @escaping (Data) -> Void) {

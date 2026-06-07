@@ -159,10 +159,10 @@ check_staple() {
 
 check_helper() {
   local app="$1" helper plist hteam
-  helper="$app/Contents/Library/LoginItems/RatioThinkHelper.app"
+  helper="$app/Contents/Library/LoginItems/RationalHelper.app"
   plist="$app/Contents/Library/LaunchAgents/com.ratiothink.app.helper.plist"
   if [[ -d "$helper" ]]; then
-    echo "$PASS helper bundle: present (LoginItems/RatioThinkHelper.app)"
+    echo "$PASS helper bundle: present (LoginItems/RationalHelper.app)"
     hteam="$(codesign -dvv "$helper" 2>&1 | grep -m1 '^TeamIdentifier=' | sed 's/^TeamIdentifier=//' || true)"
     if [[ -n "$hteam" && "$hteam" != "not set" ]]; then
       echo "$PASS helper team identifier: $hteam"
@@ -210,7 +210,7 @@ log_hints() {
   section "Recent Gatekeeper / amfid log hints (last 2m, best-effort)"
   local out
   out="$(log show --last 2m --style compact \
-    --predicate '(subsystem == "com.apple.syspolicy") OR (process == "amfid") OR (eventMessage CONTAINS[c] "RatioThink")' \
+    --predicate '(subsystem == "com.apple.syspolicy") OR (process == "amfid") OR (eventMessage CONTAINS[c] "Rational")' \
     2>/dev/null | tail -20 || true)"
   if [[ -n "$out" ]]; then
     indent "  " <<<"$out"

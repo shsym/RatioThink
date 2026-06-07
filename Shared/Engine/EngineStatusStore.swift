@@ -220,7 +220,7 @@ public final class EngineStatusStore: ObservableObject {
   /// example after a just-finished download), a live engine still
   /// advertises the old id until it is stopped and started again. This
   /// helper performs that product-internal reload without requiring the
-  /// user to quit RatioThink.
+  /// user to quit Rational.
   ///
   /// Restart deliberately routes through a helper-side selector instead
   /// of composing `stopEngine()` + `startEngine(profileID:)` here:

@@ -22,14 +22,16 @@ struct HelperRegistrationRepair {
   /// instead of mutating the real machine's background-item registration.
   private let makeRegistrar: @Sendable () -> LoginItemRegistering
   /// One bounded compatibility probe (a helper protocol-version poll with
-  /// retry/backoff). Injected so tests don't open a real XPC connection.
-  /// A merely reachable old helper is not enough after app upgrades that add
-  /// required selectors such as `restartEngine(profileID:)`.
-  private let probeReachable: @Sendable () async -> Bool
+  /// retry/backoff plus identity validation). Injected so tests don't open a
+  /// real XPC connection. A merely reachable old helper is not enough after
+  /// app upgrades or the RatioThink → Rational rename: it can answer the
+  /// preserved mach service while lacking required selectors or still running
+  /// the legacy executable.
+  private let probeReachable: @Sendable () async -> HelperRegistrationProbeResult
 
   init(
     makeRegistrar: @escaping @Sendable () -> LoginItemRegistering = { LoginItemRegistrarFactory.make() },
-    probeReachable: @escaping @Sendable () async -> Bool = { await HelperRegistrationRepair.probeHelperReachable() }
+    probeReachable: @escaping @Sendable () async -> HelperRegistrationProbeResult = { await HelperRegistrationRepair.probeHelperReachable() }
   ) {
     self.makeRegistrar = makeRegistrar
     self.probeReachable = probeReachable
@@ -65,26 +67,47 @@ struct HelperRegistrationRepair {
     return outcome.helperReachable
   }
 
-  /// Default bounded compatibility probe: a `helperProtocolVersion()` poll
-  /// retried over ~5s so a just-(re)launched on-demand Helper has time to
-  /// publish its mach service. This intentionally checks a capability/version
-  /// selector instead of only `engineStatus()`: after an app update, a previous
-  /// build's helper can still answer `engineStatus` while lacking newly-required
-  /// selectors such as strict `restartEngine(profileID:)`.
+  /// Default bounded compatibility probe: one `engineStatus()` poll retried
+  /// over ~5s so a just-(re)launched on-demand Helper has time to publish its
+  /// mach service, followed by identity and protocol-version checks. The
+  /// identity check is required during the RatioThink → Rational rename: a
+  /// legacy RatioThinkHelper can be reachable on the preserved mach service but
+  /// still be the wrong helper. The protocol-version check preserves the
+  /// broader upgrade guard: an old-but-reachable helper can answer
+  /// `engineStatus()` while lacking newly-required selectors such as strict
+  /// `restartEngine(profileID:)`.
   /// Defaults come from `HelperReconcileProbeBudget` (RatioThinkCore) so the
   /// probe's wall time and the chat-recovery ceiling that depends on it share
   /// ONE definition and cannot drift (#412 re-F1).
   static func probeHelperReachable(
     attempts: Int = HelperReconcileProbeBudget.attempts,
     delayMilliseconds: UInt64 = UInt64(HelperReconcileProbeBudget.delaySeconds * 1000)
-  ) async -> Bool {
+  ) async -> HelperRegistrationProbeResult {
     let client = HelperXPCClient()
     for attempt in 0..<attempts {
-      if await HelperProtocolCompatibility.isCompatible(client: client) { return true }
-      if attempt < attempts - 1 {
-        try? await Task.sleep(nanoseconds: delayMilliseconds * 1_000_000)
+      do {
+        _ = try await client.engineStatus()
+      } catch {
+        if attempt < attempts - 1 {
+          try? await Task.sleep(nanoseconds: delayMilliseconds * 1_000_000)
+        }
+        continue
       }
+
+      do {
+        let identity = try await client.helperIdentity()
+        if !identity.isExpectedRationalHelper {
+          return .identityMismatch(identity.mismatchSummary)
+        }
+      } catch {
+        return .identityMismatch("identity probe failed after engineStatus: \(error)")
+      }
+
+      if await HelperProtocolCompatibility.isCompatible(client: client) {
+        return .healthy
+      }
+      return .identityMismatch("helper protocol version is older than \(HelperProtocolCompatibility.currentVersion)")
     }
-    return false
+    return .unreachable
   }
 }

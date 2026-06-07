@@ -1,12 +1,12 @@
 #!/bin/bash
-# Collect a redacted RatioThink diagnostics bundle for triage / a developer.
+# Collect a redacted Rational diagnostics bundle for triage / a developer.
 #
 # This is the keystone of issue #358: when "the app does nothing", a user runs
 # ONE command and gets a .zip (plus a terminal summary) that classifies WHY —
 # app not copied, Gatekeeper quarantine, notarization reject, helper never
 # registered, helper crashed/degraded, engine failed, or simply no activity.
 #
-# It works even when no RatioThink process can launch and
+# It works even when no Rational process can launch and
 # ~/Library/Application Support/RatioThink/logs is empty: it leans on macOS
 # Unified Logging (`log show`), Gatekeeper/codesign state, launchd state, the
 # process list, and crash reports — not just app-owned files. The durable
@@ -15,7 +15,7 @@
 # empty dir.
 #
 # Runs three ways, all the same code:
-#   1. bundled:    /Applications/RatioThink.app/Contents/Resources/collect-diagnostics.sh
+#   1. bundled:    /Applications/Rational.app/Contents/Resources/collect-diagnostics.sh
 #   2. App menu:   Help -> Collect Diagnostics... (shells out to the bundled copy)
 #   3. from source ./Scripts/collect-diagnostics.sh
 #
@@ -25,7 +25,7 @@
 #
 # Override env (used by Scripts/test-collect-diagnostics.sh for hermetic,
 # CI-safe runs — real machine roots are never touched):
-#   RATIOTHINK_APP             app bundle path (default /Applications/RatioThink.app)
+#   RATIOTHINK_APP             app bundle path (default /Applications/Rational.app)
 #   PIE_HOME                   RatioThink support root (default ~/Library/Application Support/RatioThink)
 #   RATIOTHINK_DIAG_CRASH_DIR  crash-report dir (default ~/Library/Logs/DiagnosticReports)
 #   RATIOTHINK_DIAG_OUT_DIR    where the .zip lands (default ~/Desktop)
@@ -36,7 +36,7 @@ usage() {
 Usage: collect-diagnostics.sh [--window <dur>] [--out <path>]
 
   --window <dur>     Unified Logging look-back window (default: 2h). e.g. 30m, 6h, 1d
-  --out <path>       Write the .zip to this exact path (default: ~/Desktop/RatioThink-diagnostics-<stamp>.zip)
+  --out <path>       Write the .zip to this exact path (default: ~/Desktop/Rational-diagnostics-<stamp>.zip)
   -h, --help         Show this help
 
 Produces a redacted .zip and prints a terminal summary classifying the failure
@@ -55,18 +55,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-APP="${RATIOTHINK_APP:-/Applications/RatioThink.app}"
+APP="${RATIOTHINK_APP:-/Applications/Rational.app}"
 ROOT="${PIE_HOME:-$HOME/Library/Application Support/RatioThink}"
 LOGS_DIR="$ROOT/logs"
 CRASH_DIR="${RATIOTHINK_DIAG_CRASH_DIR:-$HOME/Library/Logs/DiagnosticReports}"
 OUT_DIR="${RATIOTHINK_DIAG_OUT_DIR:-$HOME/Desktop}"
-HELPER_APP="$APP/Contents/Library/LoginItems/RatioThinkHelper.app"
+HELPER_APP="$APP/Contents/Library/LoginItems/RationalHelper.app"
 HELPER_LABEL="com.ratiothink.app.helper"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 PLISTBUDDY="/usr/libexec/PlistBuddy"
 
 WORKPARENT="$(mktemp -d "${TMPDIR:-/tmp}/ratiothink-diag.XXXXXX")"
-WORK="$WORKPARENT/RatioThink-diagnostics-$STAMP"
+WORK="$WORKPARENT/Rational-diagnostics-$STAMP"
 mkdir -p "$WORK"
 cleanup() { rm -rf "$WORKPARENT"; }
 trap cleanup EXIT
@@ -129,8 +129,8 @@ section_launchctl() {
 section_processes() {
   local f="$WORK/processes.txt"
   {
-    echo "=== pgrep -fl RatioThink ==="
-    pgrep -fl RatioThink || echo "(no RatioThink processes)"
+    echo "=== pgrep -fl Rational ==="
+    pgrep -fl Rational || echo "(no Rational processes)"
     echo
     echo "=== running pie engine / helper ==="
     ps -Ao pid,comm,args 2>/dev/null | grep -iE 'ratiothink|pie-engine/pie' | grep -v grep || echo "(none)"
@@ -148,13 +148,16 @@ section_crash_reports() {
   mkdir -p "$dest"
   if [ -d "$CRASH_DIR" ]; then
     # Case-sensitive, anchored process names only — the engine reports as
-    # `pie` (`pie-<date>.ips`). Deliberately excludes test-harness binaries
-    # (`pie-resolve-probe-*`, `pietest-sleep-*`) and the pre-rename `Pie*`.
+    # `pie` (`pie-<date>.ips`). During the RatioThink → Rational compatibility
+    # window, collect both current and legacy app/helper crash names so upgrade
+    # failures caused by a still-running legacy helper are visible.
     find "$CRASH_DIR" -maxdepth 1 -type f \
-      \( -name 'RatioThink-*' -o -name 'RatioThinkHelper-*' -o -name 'pie-[0-9]*' \) \
+      \( -name 'Rational-*' -o -name 'RationalHelper-*' \
+         -o -name 'RatioThink-*' -o -name 'RatioThinkHelper-*' \
+         -o -name 'pie-[0-9]*' \) \
       -mtime -7 -exec cp {} "$dest/" \; 2>/dev/null || true
   fi
-  [ -n "$(ls -A "$dest" 2>/dev/null)" ] || echo "(no recent RatioThink/pie crash reports)" > "$dest/NONE.txt"
+  [ -n "$(ls -A "$dest" 2>/dev/null)" ] || echo "(no recent Rational/RatioThink/pie crash reports)" > "$dest/NONE.txt"
 }
 
 section_app_logs() {
@@ -176,7 +179,7 @@ classify() {
   local engine_log="$LOGS_DIR/engine.log"
 
   if [ ! -d "$APP" ]; then
-    add_verdict "APP_MISSING: RatioThink.app not found at $APP — was it dragged into /Applications?"
+    add_verdict "APP_MISSING: Rational.app not found at $APP — was it dragged into /Applications?"
   else
     if xattr -p com.apple.quarantine "$APP" >/dev/null 2>&1; then
       add_verdict "QUARANTINE_PRESENT: Gatekeeper quarantine xattr is set — clear it: xattr -dr com.apple.quarantine \"$APP\""
@@ -190,17 +193,29 @@ classify() {
     add_verdict "HELPER_LAUNCHCTL_MISSING: launchd has no '$HELPER_LABEL' agent — the helper was never registered (or registration was rejected)"
   fi
 
-  # Main app crashed: a RatioThink-* crash report (anchored to exclude the
-  # helper's RatioThinkHelper-* reports). This is the single most common
+  # Main app crashed: a Rational-* crash report (anchored to exclude the
+  # helper's RationalHelper-* reports). This is the single most common
   # "the app does nothing" cause and must not slip through to an OK verdict.
+  if find "$CRASH_DIR" -maxdepth 1 -type f -name 'Rational-*' ! -name 'RationalHelper-*' -mtime -7 2>/dev/null | grep -q .; then
+    add_verdict "APP_CRASHED: a recent Rational crash report exists — the main app started then crashed; see crash-reports/"
+  fi
   if find "$CRASH_DIR" -maxdepth 1 -type f -name 'RatioThink-*' ! -name 'RatioThinkHelper-*' -mtime -7 2>/dev/null | grep -q .; then
-    add_verdict "APP_CRASHED: a recent RatioThink crash report exists — the main app started then crashed; see crash-reports/"
+    add_verdict "APP_CRASHED_LEGACY: a recent legacy RatioThink crash report exists during the rename migration — see crash-reports/"
   fi
 
-  # Helper crashed / degraded: a helper crash report, or a degraded breadcrumb.
+  # Helper crashed / degraded: helper crash reports (current and legacy are
+  # independent during rename migration), or a degraded breadcrumb only when no
+  # helper crash report exists.
+  helper_crash_found=0
+  if find "$CRASH_DIR" -maxdepth 1 -type f -name 'RationalHelper-*' -mtime -7 2>/dev/null | grep -q .; then
+    add_verdict "HELPER_CRASHED_OR_DEGRADED: a recent Rational Helper crash report exists — see crash-reports/"
+    helper_crash_found=1
+  fi
   if find "$CRASH_DIR" -maxdepth 1 -type f -name 'RatioThinkHelper-*' -mtime -7 2>/dev/null | grep -q .; then
-    add_verdict "HELPER_CRASHED_OR_DEGRADED: a recent RatioThinkHelper crash report exists — see crash-reports/"
-  elif [ -f "$helper_log" ] && grep -qiE 'helper\.degraded|cannot start' "$helper_log" 2>/dev/null; then
+    add_verdict "HELPER_CRASHED_OR_DEGRADED_LEGACY: a recent legacy RatioThinkHelper crash report exists during the rename migration — see crash-reports/"
+    helper_crash_found=1
+  fi
+  if [ "$helper_crash_found" -eq 0 ] && [ -f "$helper_log" ] && grep -qiE 'helper\.degraded|cannot start' "$helper_log" 2>/dev/null; then
     add_verdict "HELPER_CRASHED_OR_DEGRADED: helper.log shows a degraded boot — see app-logs/helper.log"
   fi
 
@@ -254,7 +269,7 @@ classify() {
     if [ "$unified_has_lines" -eq 1 ]; then
       add_verdict "NOTE: only Unified Logging is available (no durable breadcrumb files yet) — see unified-log.txt"
     else
-      add_verdict "NO_RECENT_ACTIVITY: no RatioThink Unified Log entries in the last $WINDOW and no breadcrumb logs — the app may not have run"
+      add_verdict "NO_RECENT_ACTIVITY: no Rational Unified Log entries in the last $WINDOW and no breadcrumb logs — the app may not have run"
     fi
   fi
 }
@@ -280,7 +295,7 @@ redact_all() {
 # --- run --------------------------------------------------------------------
 
 {
-  echo "RatioThink diagnostics — $STAMP"
+  echo "Rational diagnostics — $STAMP"
   echo "generated by collect-diagnostics.sh (#358)"
   echo "app:    $APP"
   echo "root:   $ROOT"
@@ -320,13 +335,13 @@ if [ -n "$OUT" ]; then
   ZIP="$OUT"
 else
   mkdir -p "$OUT_DIR"
-  ZIP="$OUT_DIR/RatioThink-diagnostics-$STAMP.zip"
+  ZIP="$OUT_DIR/Rational-diagnostics-$STAMP.zip"
 fi
 mkdir -p "$(dirname "$ZIP")"
 ditto -c -k --keepParent "$WORK" "$ZIP" 2>/dev/null || true
 
 # Terminal summary.
-echo "RatioThink diagnostics collected."
+echo "Rational diagnostics collected."
 echo
 printf '%s' "$VERDICT_BLOCK"
 echo

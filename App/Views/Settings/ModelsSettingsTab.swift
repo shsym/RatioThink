@@ -440,7 +440,7 @@ private struct InstalledModelsTable: View {
                   .padding(.horizontal, 5)
                   .padding(.vertical, 1)
                   .background(Capsule().fill(Color.secondary.opacity(0.15)))
-                  .help("Discovered in the shared Hugging Face cache. Managed outside RatioThink — reveal in Finder to inspect.")
+                  .help("Discovered in the shared Hugging Face cache. Managed outside Rational — reveal in Finder to inspect.")
                   .accessibilityIdentifier("InstalledRow-HFCache-\(row.id)")
               }
             }
@@ -479,7 +479,7 @@ private struct InstalledModelsTable: View {
               // shared cache, so deletion is out of scope.
               .disabled(row.source == .huggingFaceCache)
               .help(row.source == .huggingFaceCache
-                    ? "Cached Hugging Face models are managed outside RatioThink"
+                    ? "Cached Hugging Face models are managed outside Rational"
                     : "Move to Trash")
             }
           }
@@ -549,7 +549,7 @@ private struct MemoryGuardrailSection: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
       SettingsSectionHeader(title: "Memory guardrail")
-      Text("Largest model RatioThink will load, as a fraction of this Mac's memory after reserving headroom for the system. Higher is riskier under memory pressure.")
+      Text("Largest model Rational will load, as a fraction of this Mac's memory after reserving headroom for the system. Higher is riskier under memory pressure.")
         .font(.callout)
         .foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)

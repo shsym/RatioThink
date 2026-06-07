@@ -5,7 +5,7 @@ import os
 /// of RatioThinkHelper.
 ///
 /// Responsibilities (per design doc §3 + Phase 2.2 work):
-///  · Spawn `RatioThink.app/Contents/Resources/pie-engine/pie` with arguments
+///  · Spawn `Rational.app/Contents/Resources/pie-engine/pie` with arguments
 ///    derived from the active `Profile`.
 ///  · Capture the `HTTP_LISTEN=host:port\n` handshake line written to
 ///    stdout. Transition to `.running(port, profileID)` once captured.

@@ -10,7 +10,7 @@
 #      that window with no user interaction.
 #
 #   2. Full-product quit — `ratiothink://quit` (the same coordinated path
-#      ⌘Q and the menu-bar "Quit RatioThink" take) leaves NO App, Helper, or
+#      ⌘Q and the menu-bar "Quit Rational" take) leaves NO App, Helper, or
 #      pie process behind, and the cleanly-exited Helper is NOT respawned.
 #
 # Crash recovery (unclean Helper death -> launchd relaunch) is covered by
@@ -24,8 +24,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-APP_GLOB="RatioThink.app/Contents/MacOS/RatioThink"
-HELPER_GLOB="LoginItems/RatioThinkHelper.app/Contents/MacOS/RatioThinkHelper"
+APP_GLOB="Rational.app/Contents/MacOS/Rational"
+HELPER_GLOB="LoginItems/RationalHelper.app/Contents/MacOS/RationalHelper"
 # pie is spawned as `pie serve --config <toml> ...` by the Helper.
 PIE_GLOB="pie serve"
 
@@ -39,8 +39,8 @@ engine_pid() { pgrep -f "$PIE_GLOB" | head -1 || true; }
 
 guide_if_missing() {
   local missing=0
-  [ -z "$(app_pid)" ]    && { echo "  · RatioThink.app is not running" >&2; missing=1; }
-  [ -z "$(helper_pid)" ] && { echo "  · RatioThinkHelper is not running" >&2; missing=1; }
+  [ -z "$(app_pid)" ]    && { echo "  · Rational.app is not running" >&2; missing=1; }
+  [ -z "$(helper_pid)" ] && { echo "  · RationalHelper is not running" >&2; missing=1; }
   [ -z "$(engine_pid)" ] && { echo "  · no 'pie serve' engine is running (load a model in the App)" >&2; missing=1; }
   if [ "$missing" -eq 1 ]; then
     cat >&2 <<EOF
@@ -48,7 +48,7 @@ guide_if_missing() {
 Prerequisites missing. This live check needs the signed, registered build
 with the engine running:
   1. Build + install signed (see Scripts/verify-helper-respawn.sh header).
-  2. Launch /Applications/RatioThink.app, finish first-launch, and START the
+  2. Launch /Applications/Rational.app, finish first-launch, and START the
      engine (load the default model) so 'pie serve' is running.
   3. Re-run this script.
 EOF

@@ -79,7 +79,7 @@ final class S0_TestIsolationTests: IsolatedTestCase {
 
   private func discoverBundledInferletResources() throws -> (wasm: URL, manifest: URL) {
     // The CLIScenarioTests bundle is an SPM test target; it has no
-    // RatioThink.app resources of its own. Fall through to the source-tree
+    // Rational.app resources of its own. Fall through to the source-tree
     // prebuilt + manifest the e2e harness uses. The launcher
     // production caller (RatioThinkHelper) resolves these via
     // `InferletResources.pieControl(in:)` — covered by the unit

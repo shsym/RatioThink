@@ -1,5 +1,5 @@
 #!/bin/bash
-# Capture README landing-page screenshots of the REAL RatioThink.app driven
+# Capture README landing-page screenshots of the REAL Rational.app driven
 # into a populated, OFFLINE state, and export them into docs/assets/.
 #
 # Mechanism (see Tests/GUIScenarioTests/ReadmeScreenshotsGUITests.swift):
@@ -13,7 +13,7 @@
 #   4. Export the attachments from the .xcresult into docs/assets/.
 #
 # Requires a seated GUI session (console / Screen Sharing) and a one-time TCC
-# grant for the XCTest runner + RatioThink.app (Automation + Accessibility),
+# grant for the XCTest runner + Rational.app (Automation + Accessibility),
 # same as the other GUI E2E scripts. Re-run with PIE_TEST_TCC_GRANTED=1.
 set -euo pipefail
 
@@ -45,7 +45,7 @@ if ! pgrep -x Dock >/dev/null 2>&1; then
   exit 2
 fi
 if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "readme shots: RatioThink.app + XCTest runner need Automation + Accessibility." >&2
+  echo "readme shots: Rational.app + XCTest runner need Automation + Accessibility." >&2
   echo "readme shots: grant them once in System Settings → Privacy & Security, then rerun:" >&2
   echo "readme shots:   PIE_TEST_TCC_GRANTED=1 Scripts/capture-readme-screenshots.sh" >&2
   exit 2

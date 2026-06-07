@@ -128,7 +128,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     if let reason = degradedReason {
       Diag.helper.event("helper.degraded", [("reason", "\(reason)")])
       DispatchQueue.main.async { [weak self] in
-        self?.presentPieDirsAlert(title: "RatioThink cannot start", error: reason)
+        self?.presentPieDirsAlert(title: "Rational cannot start", error: reason)
       }
     }
   }
@@ -193,7 +193,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     xpcListener = nil
   }
 
-  /// Force-creates the RatioThink root + logs subdir. On failure, records the
+  /// Force-creates the Rational root + logs subdir. On failure, records the
   /// error in `degradedReason` so downstream setup branches degrade
   /// gracefully instead of registering a broken helper for relaunch
   /// or publishing a no-op status item (review v4 F4).
@@ -238,7 +238,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// returns `EngineError(.degraded, message: <PieDirsError>)` on
   /// every selector. A GUI that connects sees a *structured cause*
   /// instead of a mach-service-not-found, so the UI can render the
-  /// real reason even if the parallel "RatioThink cannot start" alert path
+  /// real reason even if the parallel "Rational cannot start" alert path
   /// fails.
   ///
   /// Pre-bind: `HelperXPCListener.verifyStartupInvariants()` opens a
@@ -556,7 +556,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     HelperConfig.assertSystemSideEffectAllowed("NSStatusBar.statusItem")
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
-    menu.addItem(NSMenuItem(title: "Show RatioThink",
+    menu.addItem(NSMenuItem(title: "Show Rational",
                             action: #selector(showPie),
                             keyEquivalent: "0"))
     menu.addItem(.separator())
@@ -599,7 +599,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
                             action: #selector(openLogs),
                             keyEquivalent: ""))
     menu.addItem(.separator())
-    menu.addItem(NSMenuItem(title: "Quit RatioThink",
+    menu.addItem(NSMenuItem(title: "Quit Rational",
                             action: #selector(quitPie),
                             keyEquivalent: "q"))
     item.menu = menu
@@ -701,14 +701,14 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     HelperStatusItemBinding(
       setDot: { [weak self] dot in
         guard let self, let button = self.statusItem?.button else { return }
-        // #424: render the RatioThink brand mark (a rounded down-pointing
+        // #424: render the Rational brand mark (a rounded down-pointing
         // triangle) instead of a generic SF-Symbol circle. Fill + the
         // error badge carry status WITHOUT color (#396); the #412 LED tint
         // is applied here because `NSColor` is AppKit.
         let img = MenuBarBrandIcon.image(filled: dot.isFilled,
                                          errorBadge: dot.showsErrorBadge,
                                          color: Self.colorForDot(dot))
-        img.accessibilityDescription = "RatioThink engine \(dot.accessibilityWord)"
+        img.accessibilityDescription = "Rational engine \(dot.accessibilityWord)"
         button.image = img
         // #396: a transitional dot (engine starting/stopping) is an
         // in-flight async op, so it must show MOTION — never a static
@@ -1236,16 +1236,16 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     if let button = item.button {
       let img = NSImage(systemSymbolName: "exclamationmark.triangle.fill",
-                        accessibilityDescription: "RatioThink startup error")
+                        accessibilityDescription: "Rational startup error")
       img?.isTemplate = false
       button.image = img
     }
     let menu = NSMenu()
-    menu.addItem(NSMenuItem(title: "RatioThink cannot start — click for details",
+    menu.addItem(NSMenuItem(title: "Rational cannot start — click for details",
                             action: #selector(showStartupError),
                             keyEquivalent: ""))
     menu.addItem(.separator())
-    menu.addItem(NSMenuItem(title: "Quit RatioThink", action: #selector(quitPie), keyEquivalent: "q"))
+    menu.addItem(NSMenuItem(title: "Quit Rational", action: #selector(quitPie), keyEquivalent: "q"))
     item.menu = menu
     self.statusItem = item
     Diag.helper.event("statusitem.create", [("kind", "degraded")])
@@ -1256,28 +1256,28 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   @objc func openSettings() {
-    // RatioThink.app now ships a Settings scene and the `ratiothink://` URL
+    // Rational.app now ships a Settings scene and the `ratiothink://` URL
     // scheme, so deliver `ratiothink://settings` to route straight to
     // Settings instead of just foregrounding the app and leaving the user
     // to press ⌘,. Delivering the URL *to the resolved parent bundle*
     // (rather than a bare `NSWorkspace.open(url)`, which LaunchServices
-    // could route to any registered RatioThink.app) preserves the existing
+    // could route to any registered Rational.app) preserves the existing
     // "launch MY install" guarantee and reuses the same launch-failure
     // alert path.
     openPieApp(delivering: [SettingsDeepLink.settingsURL])
   }
 
-  /// Resolve the parent `RatioThink.app` bundle that ships this helper.
+  /// Resolve the parent `Rational.app` bundle that ships this helper.
   /// The helper bundle lives at
-  ///   `<RatioThink.app>/Contents/Library/LoginItems/RatioThinkHelper.app`
+  ///   `<Rational.app>/Contents/Library/LoginItems/RationalHelper.app`
   /// so the parent is four `deletingLastPathComponent()`s up from
-  /// the helper bundle URL. Falls back to `/Applications/RatioThink.app`
+  /// the helper bundle URL. Falls back to `/Applications/Rational.app`
   /// when the structure does not match (e.g. helper launched
   /// standalone from a build artifact path that has been moved).
   /// Maximum ancestor levels `resolvedPieAppURL` walks looking for
   /// a `.app` parent before declaring the helper standalone
   /// (review v4 F33). Today's canonical structure is four
-  /// (`<RatioThink>.app/Contents/Library/LoginItems/RatioThinkHelper.app`); the
+  /// (`<Rational>.app/Contents/Library/LoginItems/RationalHelper.app`); the
   /// bound covers two extra levels for a future embed layout
   /// change (e.g. versioned LoginItems subdir) so a structural
   /// drift surfaces as a moved-app `.error`, not a silent cross-
@@ -1292,7 +1292,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // Review v4 F33: walk ancestors up to a bounded depth looking
     // for ANY `*.app`. The v3 fixed 4-up walk landed in the wrong
     // directory under any future embed-layout change and silently
-    // cross-launched /Applications/RatioThink.app. The walk now finds the
+    // cross-launched /Applications/Rational.app. The walk now finds the
     // first `.app` ancestor regardless of depth, and only declares
     // "true standalone" when none of the first
     // `pieAppAncestorMaxDepth` ancestors is a `.app`.
@@ -1307,7 +1307,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       if candidate.path == "/" { break }
     }
 
-    let fallback = URL(fileURLWithPath: "/Applications/RatioThink.app")
+    let fallback = URL(fileURLWithPath: "/Applications/Rational.app")
     let fallbackExists = FileManager.default.fileExists(atPath: fallback.path)
 
     if let ancestor = firstAppAncestor {
@@ -1320,9 +1320,9 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       // `.error` — the fallback is a different installation,
       // IPC-version-mismatch likely.
       if !fallbackExists {
-        Log.helper.fault("resolvedPieAppURL: parent .app gone AND /Applications/RatioThink.app absent — click will fail (ancestor=\(ancestor.path, privacy: .public))")
+        Log.helper.fault("resolvedPieAppURL: parent .app gone AND /Applications/Rational.app absent — click will fail (ancestor=\(ancestor.path, privacy: .public))")
       } else {
-        Log.helper.error("resolvedPieAppURL: parent .app moved or deleted (ancestor=\(ancestor.path, privacy: .public)); falling back to /Applications/RatioThink.app (possible IPC schema mismatch)")
+        Log.helper.error("resolvedPieAppURL: parent .app moved or deleted (ancestor=\(ancestor.path, privacy: .public)); falling back to /Applications/Rational.app (possible IPC schema mismatch)")
       }
       return fallback
     }
@@ -1332,17 +1332,17 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // outside a .app, test bench, etc.). The fallback is the only
     // sane guess.
     if !fallbackExists {
-      Log.helper.fault("resolvedPieAppURL: helper not inside an .app ancestor (within \(Self.pieAppAncestorMaxDepth, privacy: .public) levels) AND /Applications/RatioThink.app absent — click will fail (helperBundle=\(helperBundle.path, privacy: .public))")
+      Log.helper.fault("resolvedPieAppURL: helper not inside an .app ancestor (within \(Self.pieAppAncestorMaxDepth, privacy: .public) levels) AND /Applications/Rational.app absent — click will fail (helperBundle=\(helperBundle.path, privacy: .public))")
     } else {
-      Log.helper.info("resolvedPieAppURL: helper not inside an .app ancestor (within \(Self.pieAppAncestorMaxDepth, privacy: .public) levels); falling back to /Applications/RatioThink.app (helperBundle=\(helperBundle.path, privacy: .public))")
+      Log.helper.info("resolvedPieAppURL: helper not inside an .app ancestor (within \(Self.pieAppAncestorMaxDepth, privacy: .public) levels); falling back to /Applications/Rational.app (helperBundle=\(helperBundle.path, privacy: .public))")
     }
     return fallback
   }
 
-  /// Launch / foreground the resolved parent RatioThink.app. When `urls` is
+  /// Launch / foreground the resolved parent Rational.app. When `urls` is
   /// non-empty they are delivered to that specific bundle (e.g.
   /// `ratiothink://settings`), so the app routes the deep link AND the
-  /// launch still targets MY install rather than whichever RatioThink.app
+  /// launch still targets MY install rather than whichever Rational.app
   /// LaunchServices would pick for a bare scheme open. Both paths share the
   /// same launch-failure alert (review v2 F16 / v3 F25).
   private func openPieApp(delivering urls: [URL] = []) {
@@ -1360,9 +1360,9 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       if let err {
         Log.helper.error("openPieApp failed: \(String(describing: err), privacy: .public)")
         // Review v2 F16: a logged-only failure left the menu click
-        // visually silent — clicking "Show RatioThink" / "Settings…" did
+        // visually silent — clicking "Show Rational" / "Settings…" did
         // nothing, no beep, no banner, no dock activity. The helper
-        // is the user's only surface when RatioThink.app cannot launch, so
+        // is the user's only surface when Rational.app cannot launch, so
         // surface the failure via NSAlert + NSSound.beep so the
         // click registers as something the user can act on.
         DispatchQueue.main.async {
@@ -1373,8 +1373,8 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
           // contract — the launch-failure alert is deferred until
           // that sheet completes instead of dropped.
           self?.presentHighPriorityAlert(
-            title: "Couldn't launch RatioThink.app",
-            informativeText: "Tried to launch RatioThink at \(url.path)\n\(err.localizedDescription)\n\nReinstall RatioThink from the DMG or check that RatioThink.app is in /Applications.",
+            title: "Couldn't launch Rational.app",
+            informativeText: "Tried to launch Rational at \(url.path)\n\(err.localizedDescription)\n\nReinstall Rational from the DMG or check that Rational.app is in /Applications.",
             revealRoot: FileManager.default.fileExists(atPath: url.path) ? url : nil
           )
         }
@@ -1394,11 +1394,11 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       NSWorkspace.shared.open(try PieDirs.logs())
     } catch let error as PieDirsError {
       Log.helper.error("openLogs: \(String(describing: error), privacy: .public)")
-      presentPieDirsAlert(title: "Cannot open RatioThink logs",
+      presentPieDirsAlert(title: "Cannot open Rational logs",
                           error: error)
     } catch {
       Log.helper.error("openLogs: \(String(describing: error), privacy: .public)")
-      presentAlert(title: "Cannot open RatioThink logs",
+      presentAlert(title: "Cannot open Rational logs",
                    informativeText: String(describing: error),
                    revealRoot: nil)
     }
@@ -1406,7 +1406,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
 
   @objc func showStartupError() {
     guard let reason = degradedReason else { return }
-    presentPieDirsAlert(title: "RatioThink cannot start",
+    presentPieDirsAlert(title: "Rational cannot start",
                         error: reason)
   }
 
@@ -1421,14 +1421,14 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   /// True when an instance of the main RatioThink.app is running. The
-  /// menu-bar "Quit RatioThink" then delegates the coordinated full-product
+  /// menu-bar "Quit Rational" then delegates the coordinated full-product
   /// teardown to the App (the single quit coordinator) so the Helper isn't
   /// quit-then-respawned on-demand.
   private static var isAppRunning: Bool {
     !NSRunningApplication.runningApplications(withBundleIdentifier: "com.ratiothink.app").isEmpty
   }
 
-  /// "Quit RatioThink" (#448): tears down the WHOLE product, not just the
+  /// "Quit Rational" (#448): tears down the WHOLE product, not just the
   /// Helper. The old `NSApp.terminate(nil)` quit only the Helper — the
   /// still-running App then respawned it on-demand within ~1s and the engine
   /// could orphan. Now: if the App is running it owns the quit, so hand it
@@ -1446,7 +1446,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     }
   }
 
-  /// App-absent fallback for "Quit RatioThink": reap the engine before
+  /// App-absent fallback for "Quit Rational": reap the engine before
   /// exiting so the Helper never orphans `pie`. `stopAndWait` fires only
   /// after the terminal status that `LaunchedSession.shutdown` publishes once
   /// `pie` is gone. If that deadline expires, the Helper stays alive so it can
@@ -1639,7 +1639,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// contract cannot tolerate a silent drop (review v3 F25). If a
   /// sheet is already in flight, the alert is queued (latest-wins)
   /// and presented from the in-flight sheet's completion handler.
-  /// Used by the "Couldn't launch RatioThink.app" path so the user is
+  /// Used by the "Couldn't launch Rational.app" path so the user is
   /// guaranteed to see *some* sheet for their click, not just an
   /// ambiguous beep.
   ///

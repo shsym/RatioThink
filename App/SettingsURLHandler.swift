@@ -5,7 +5,7 @@ import AppKit
 ///
 /// The menu-bar Helper (a separate process) opens `ratiothink://settings`
 /// when the user picks its "Settings…" item; LaunchServices launches or
-/// foregrounds RatioThink.app and delivers the URL here. Without this the
+/// foregrounds Rational.app and delivers the URL here. Without this the
 /// Helper could only foreground the main window, leaving the user to find
 /// ⌘, themselves — the gap #420 closes.
 ///

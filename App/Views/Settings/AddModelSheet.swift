@@ -622,7 +622,7 @@ struct LocalFilePane: View {
         .foregroundStyle(.tertiary)
       Text("Drop a .gguf file here")
         .font(.headline)
-      Text("Or click *Choose File…* to import from disk. The file is copied into your RatioThink models directory; the original is left untouched.")
+      Text("Or click *Choose File…* to import from disk. The file is copied into your Rational models directory; the original is left untouched.")
         .multilineTextAlignment(.center)
         .foregroundStyle(.secondary)
         .padding(.horizontal, 40)
