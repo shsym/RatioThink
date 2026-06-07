@@ -132,10 +132,13 @@ const DEFAULT_MAX_TOKENS: usize = 1024;
 const MAX_TEMPERATURE: f32 = 2.0;
 /// Inclusive upper bound on `top_p` (the canonical nucleus cap).
 const MAX_TOP_P: f32 = 1.0;
-/// Inclusive upper bound on `max_tokens`. Picked to cap worst-case
-/// per-request scheduler residency; well above any sensible chat
-/// reply length.
-const MAX_MAX_TOKENS: usize = 8192;
+/// Fallback ceiling on `max_tokens`, used only when the engine reports
+/// no capacity (`runtime::max-output-tokens()` == 0 — e.g. no model
+/// registered yet). In normal operation the live engine value — its
+/// launch-time KV-cache capacity, which is memory-aware — is used
+/// instead (see `max_output_ceiling`). 8192 is a conservative cap well
+/// above any sensible chat reply length.
+const MAX_OUTPUT_TOKENS_FALLBACK: usize = 8192;
 
 /// Inclusive bounds on the #418 speculation knobs. Out-of-range values
 /// are rejected at the 400 boundary (see `validate_sampling`), mirroring
@@ -1796,16 +1799,20 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
         return res.respond(with_launch_diags_header(response)).await;
     }
 
-    if let Err((field, msg)) = validate_sampling(&request) {
-        return res
-            .respond(with_launch_diags_header(json_error_param(
-                400,
-                "invalid_request",
-                &msg,
-                field,
-            )))
-            .await;
-    }
+    let max_output_ceiling = max_output_ceiling();
+    let effective_max_tokens = match validate_sampling(&request, max_output_ceiling) {
+        Ok(max_tokens) => max_tokens,
+        Err((field, msg)) => {
+            return res
+                .respond(with_launch_diags_header(json_error_param(
+                    400,
+                    "invalid_request",
+                    &msg,
+                    field,
+                )))
+                .await;
+        }
+    };
 
     // F4: reject `role:"tool"` until the chat template grows a real
     // tool slot. Silent demotion to `user` (the prior `_` arm in
@@ -1854,9 +1861,9 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
     // and non-stream `warnings` field and `X-ChatAPC-Launch-Diags`
     // header all source from the same place.
     if request.stream {
-        handle_streaming(request, res).await
+        handle_streaming(request, res, effective_max_tokens).await
     } else {
-        handle_non_streaming(request, res).await
+        handle_non_streaming(request, res, effective_max_tokens).await
     }
 }
 
@@ -1864,10 +1871,35 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
 // Validation (F7)
 // =============================================================================
 
-/// Validate sampling parameters. Returns `Err((field, message))`
-/// where `field` names the offending JSON key (passed to the
-/// OpenAI-shape error envelope's `param`).
-fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, String)> {
+/// Per-request `max_tokens` ceiling, read live from the engine. This is
+/// `runtime::max-output-tokens()` — the runtime-reported output-token
+/// ceiling: configured scheduler `default_token_limit` capped by raw KV
+/// capacity when set, otherwise raw KV capacity. Falls back to
+/// `MAX_OUTPUT_TOKENS_FALLBACK` when the engine reports 0 (no model
+/// registered / ceiling unknown).
+fn max_output_ceiling() -> usize {
+    match runtime::max_output_tokens() as usize {
+        0 => MAX_OUTPUT_TOKENS_FALLBACK,
+        n => n,
+    }
+}
+
+/// `max_output_ceiling` is the inclusive upper bound on `max_tokens`,
+/// supplied by the caller from `runtime::max-output-tokens` so validation
+/// follows the runtime-reported ceiling (configured `default_token_limit`
+/// capped by KV capacity, or raw KV capacity when unset) instead of a
+/// hardcoded constant. Kept as a parameter — rather than reading the host
+/// import in here — so this stays a pure function the unit tests can drive
+/// without an engine host.
+/// Returns the effective generation `max_tokens` budget. For omitted
+/// `max_tokens`, the default is clamped down to the runtime ceiling so the
+/// common default request path cannot exceed a memory-aware engine limit.
+/// Returns `Err((field, message))` where `field` names the offending JSON key
+/// (passed to the OpenAI-shape error envelope's `param`).
+fn validate_sampling(
+    req: &ChatCompletionsRequest,
+    max_output_ceiling: usize,
+) -> Result<usize, (&'static str, String)> {
     if let Some(t) = req.temperature {
         if !(t.is_finite() && (0.0..=MAX_TEMPERATURE).contains(&t)) {
             return Err((
@@ -1881,14 +1913,16 @@ fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, 
             return Err(("top_p", format!("top_p must be in (0.0, {MAX_TOP_P}]")));
         }
     }
-    if let Some(n) = req.max_tokens {
-        if n == 0 || n > MAX_MAX_TOKENS {
+    let effective_max_tokens = match req.max_tokens {
+        Some(n) if n == 0 || n > max_output_ceiling => {
             return Err((
                 "max_tokens",
-                format!("max_tokens must be in [1, {MAX_MAX_TOKENS}]"),
+                format!("max_tokens must be in [1, {max_output_ceiling}]"),
             ));
         }
-    }
+        Some(n) => n,
+        None => DEFAULT_MAX_TOKENS.min(max_output_ceiling),
+    };
     // #418: range-check the speculation knobs at the 400 boundary so an
     // out-of-range value is rejected with a `param`, mirroring
     // `max_tokens` — rather than silently coerced by `to_config`'s
@@ -1912,7 +1946,7 @@ fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, 
             }
         }
     }
-    Ok(())
+    Ok(effective_max_tokens)
 }
 
 /// Build an OpenAI-shape error JSON with a populated `param` field.
@@ -1941,10 +1975,13 @@ pub(crate) fn json_error_param(
 // Streaming branch
 // =============================================================================
 
-async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finished {
+async fn handle_streaming(
+    req: ChatCompletionsRequest,
+    res: Responder,
+    max_tokens: usize,
+) -> Finished {
     let temperature = req.temperature.unwrap_or(DEFAULT_TEMPERATURE);
     let top_p = req.top_p.unwrap_or(DEFAULT_TOP_P);
-    let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
     // F9: load the model BEFORE opening the SSE response so a load
     // failure returns a clean 5xx JSON envelope rather than a
@@ -2419,10 +2456,13 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
 // Non-streaming branch (F4 — finish_reason driven by actual termination)
 // =============================================================================
 
-async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Finished {
+async fn handle_non_streaming(
+    req: ChatCompletionsRequest,
+    res: Responder,
+    max_tokens: usize,
+) -> Finished {
     let temperature = req.temperature.unwrap_or(DEFAULT_TEMPERATURE);
     let top_p = req.top_p.unwrap_or(DEFAULT_TOP_P);
-    let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
     // N1: pre-loop 500 paths attach the immutable launch-diags
     // snapshot via the response header. No drain/restore needed —
@@ -3173,7 +3213,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            validate_sampling(&req).unwrap_err().0,
+            validate_sampling(&req, MAX_OUTPUT_TOKENS_FALLBACK).unwrap_err().0,
             "speculation.leader_len"
         );
 
@@ -3184,7 +3224,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            validate_sampling(&req).unwrap_err().0,
+            validate_sampling(&req, MAX_OUTPUT_TOKENS_FALLBACK).unwrap_err().0,
             "speculation.draft_len"
         );
 
@@ -3195,9 +3235,54 @@ mod tests {
                 "temperature":0,"speculation":{"enabled":true,"leader_len":2,"draft_len":4}}"#,
         )
         .unwrap();
-        assert!(validate_sampling(&req).is_ok());
+        assert!(validate_sampling(&req, MAX_OUTPUT_TOKENS_FALLBACK).is_ok());
         let cfg = req.speculation.unwrap().to_config();
         assert_eq!((cfg.leader_len, cfg.draft_len), (2, 4));
+    }
+
+    #[test]
+    fn max_tokens_ceiling_is_dynamic() {
+        // The `max_tokens` ceiling is the engine value passed in, not a
+        // hardcoded constant: a request at the ceiling passes, one above
+        // is rejected, 0 is always rejected, and a larger engine capacity
+        // lifts the ceiling. Drives the pure `validate_sampling` directly
+        // with an explicit ceiling (no engine host needed).
+        let mk = |mt: usize| -> ChatCompletionsRequest {
+            serde_json::from_str(&format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"max_tokens":{mt}}}"#
+            ))
+            .unwrap()
+        };
+        assert!(validate_sampling(&mk(4096), 4096).is_ok());
+        assert_eq!(
+            validate_sampling(&mk(4097), 4096).unwrap_err().0,
+            "max_tokens"
+        );
+        // A larger engine KV capacity lifts the ceiling: 40000 now passes
+        // where the old hardcoded 8192 would have rejected it.
+        assert!(validate_sampling(&mk(40000), 65536).is_ok());
+        // Zero is invalid regardless of ceiling.
+        assert_eq!(
+            validate_sampling(&mk(0), 65536).unwrap_err().0,
+            "max_tokens"
+        );
+        // The 400 message reflects the dynamic ceiling, not a constant.
+        let (_, msg) = validate_sampling(&mk(99999), 8192).unwrap_err();
+        assert!(msg.contains("[1, 8192]"), "got: {msg}");
+    }
+
+    #[test]
+    fn omitted_max_tokens_uses_dynamic_ceiling_when_below_default() {
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(validate_sampling(&req, 512).unwrap(), 512);
+        assert_eq!(
+            validate_sampling(&req, DEFAULT_MAX_TOKENS + 1).unwrap(),
+            DEFAULT_MAX_TOKENS
+        );
     }
 
     #[test]

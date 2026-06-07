@@ -14,9 +14,11 @@ final class AppQuitCoordinatorTests: XCTestCase {
     var quitError: Error?
     var suspendQuit = false
     var quitContinuation: CheckedContinuation<Void, Error>?
+    func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
     func engineStatus() async throws -> EngineStatus { .stopped }
     func stopEngine() async throws {}
     func startEngine(profileID: String) async throws {}
+    func restartEngine(profileID: String) async throws {}
     func quitHelper() async throws {
       quitCount += 1
       if let quitError { throw quitError }

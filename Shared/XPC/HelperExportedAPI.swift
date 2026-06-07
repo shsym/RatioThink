@@ -208,6 +208,15 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
 
   // MARK: - engineStatus
 
+  public func helperProtocolVersion(reply: @escaping (Data) -> Void) {
+    do {
+      reply(try XPCPayload.encode(HelperProtocolCompatibility.currentVersion))
+    } catch {
+      Self.log.fault("helperProtocolVersion encode failed: \(String(describing: error), privacy: .public)")
+      reply(PieHelperXPCWire.fallbackReplyEncodeFailureData)
+    }
+  }
+
   /// Returns the live supervisor status when one is wired. Falls back
   /// to the pre-encoded `.stopped` blob when no supervisor exists,
   /// matching the Phase 2.1 contract. Encode failures fall back to
@@ -313,29 +322,164 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       reply(nil, Self.notImplementedErrorData)
       return
     }
+    guard let spec = resolveLaunchSpec(profileID: profileID,
+                                       engineHost: engineHost,
+                                       operation: "startEngine",
+                                       reply: reply) else {
+      return
+    }
+    let replied = OSAllocatedUnfairLock<Bool>(initialState: false)
+    func fireOnce(_ result: Result<EnginePort, EngineError>) {
+      let already = replied.withLock { (fired: inout Bool) -> Bool in
+        defer { fired = true }
+        return fired
+      }
+      if already { return }
+      PieHelperXPCWire.replyStartEngine(result, via: reply)
+    }
+    beginStart(engineHost: engineHost, spec: spec, fireOnce: fireOnce)
+  }
+
+  /// Strict stop→start rebuild used after the active profile's default
+  /// model changes. This selector is intentionally helper-side: the
+  /// helper has the only authoritative engine state, can wait for
+  /// terminal stop with the same deadline as `stopEngine`, and can then
+  /// start without reusing the App's generic idempotent start semantics.
+  public func restartEngine(profileID: String,
+                            reply: @escaping (Data?, Data?) -> Void) {
+    guard let engineHost else {
+      Self.log.error("restartEngine: no engineHost wired (early boot or unit test)")
+      reply(nil, Self.notImplementedErrorData)
+      return
+    }
+    guard let spec = resolveLaunchSpec(profileID: profileID,
+                                       engineHost: engineHost,
+                                       operation: "restartEngine",
+                                       reply: reply) else {
+      return
+    }
+    let replied = OSAllocatedUnfairLock<Bool>(initialState: false)
+    func fireOnce(_ result: Result<EnginePort, EngineError>) {
+      let already = replied.withLock { (fired: inout Bool) -> Bool in
+        defer { fired = true }
+        return fired
+      }
+      if already { return }
+      PieHelperXPCWire.replyStartEngine(result, via: reply)
+    }
+    let advancedToStart = OSAllocatedUnfairLock<Bool>(initialState: false)
+    let stopTokenBox = OSAllocatedUnfairLock<PieEngineHost.ObservationToken?>(initialState: nil)
+    func cancelStopObserver() {
+      stopTokenBox.withLock { (box: inout PieEngineHost.ObservationToken?) in
+        box?.cancel()
+        box = nil
+      }
+    }
+    func startAfterTerminalStopOnce() {
+      let already = advancedToStart.withLock { (advanced: inout Bool) -> Bool in
+        defer { advanced = true }
+        return advanced
+      }
+      cancelStopObserver()
+      guard !already else { return }
+      DispatchQueue.global(qos: .userInitiated).async { [weak self, weak engineHost] in
+        guard let self, let engineHost else { return }
+        self.beginStart(engineHost: engineHost, spec: spec, mode: .strict, fireOnce: fireOnce)
+      }
+    }
+    func failBeforeStartOnce(_ error: EngineError) {
+      let already = advancedToStart.withLock { (advanced: inout Bool) -> Bool in
+        defer { advanced = true }
+        return advanced
+      }
+      cancelStopObserver()
+      guard !already else { return }
+      fireOnce(.failure(error))
+    }
+
+    switch engineHost.status {
+    case .stopped, .failed:
+      startAfterTerminalStopOnce()
+      return
+    case .starting, .running, .stopping:
+      break
+    }
+
+    let token = engineHost.observe { status, _ in
+      switch status {
+      case .stopped:
+        startAfterTerminalStopOnce()
+      case .failed(let code, let message):
+        failBeforeStartOnce(EngineError(code: code, message: message))
+      case .starting, .running, .stopping:
+        return
+      }
+    }
+    stopTokenBox.withLock { $0 = token }
+    if advancedToStart.withLock({ $0 }) { cancelStopObserver() }
+    engineHost.stop()
+    #if DEBUG
+    let deadline: TimeInterval = replyTimeoutOverride?.stop
+      ?? Self.stopReplyDeadline
+    #else
+    let deadline: TimeInterval = Self.stopReplyDeadline
+    #endif
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + deadline) {
+      failBeforeStartOnce(EngineError(
+        code: .handshakeTimeout,
+        message: "restartEngine stop phase fallback fired after \(deadline)s (host never reached terminal)"
+      ))
+    }
+  }
+
+  private func resolveLaunchSpec(
+    profileID: String,
+    engineHost: PieEngineHost,
+    operation: String,
+    reply: @escaping (Data?, Data?) -> Void
+  ) -> PieControlLauncher.LaunchSpec? {
     guard let launchSpecResolver else {
-      Self.log.error("startEngine: no launch-spec resolver wired")
+      Self.log.error("\(operation, privacy: .public): no launch-spec resolver wired")
       PieHelperXPCWire.replyStartEngine(
         .failure(EngineError(code: .profileMissing,
                              message: "ProfileStore-backed resolver not wired")),
         via: reply
       )
-      return
+      return nil
     }
-    let resolved = launchSpecResolver(profileID)
-    let spec: PieControlLauncher.LaunchSpec
-    switch resolved {
-    case .success(let s): spec = s
+    switch launchSpecResolver(profileID) {
+    case .success(let spec):
+      return spec
     case .failure(let err):
-      Self.log.error("startEngine: resolver rejected profileID=\(profileID, privacy: .public) (\(err.code.rawValue, privacy: .public))")
+      Self.log.error("\(operation, privacy: .public): resolver rejected profileID=\(profileID, privacy: .public) (\(err.code.rawValue, privacy: .public))")
       if err.code == .memoryRisk {
         engineHost.recordPreStartFailure(err)
       }
       PieHelperXPCWire.replyStartEngine(.failure(err), via: reply)
-      return
+      return nil
     }
-    if case .failure(let err) = engineHost.startOrAttach(spec) {
-      PieHelperXPCWire.replyStartEngine(.failure(err), via: reply)
+  }
+
+  private enum StartMode {
+    case attachIfSameProfile
+    case strict
+  }
+
+  private func beginStart(
+    engineHost: PieEngineHost,
+    spec: PieControlLauncher.LaunchSpec,
+    mode: StartMode = .attachIfSameProfile,
+    fireOnce complete: @escaping (Result<EnginePort, EngineError>) -> Void
+  ) {
+    let startResult: Result<Void, EngineError>
+    switch mode {
+    case .attachIfSameProfile:
+      startResult = engineHost.startOrAttach(spec)
+    case .strict:
+      startResult = engineHost.start(spec)
+    }
+    if case .failure(let err) = startResult {
+      complete(.failure(err))
       return
     }
     let replied = OSAllocatedUnfairLock<Bool>(initialState: false)
@@ -346,26 +490,26 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
         box = nil
       }
     }
-    /// Resolve the single startEngine reply. Returns `true` when THIS call
-    /// won the race (it delivered the reply), `false` when a prior caller
-    /// already replied. The reply timeout uses this only to avoid duplicate
-    /// XPC replies; engine launch cleanup remains owned by `PieEngineHost`.
+    /// Resolve the single startEngine/restartEngine reply. Returns `true`
+    /// when THIS call won the race (it delivered the reply), `false` when a
+    /// prior path already replied. The XPC reply timeout uses this only to
+    /// avoid duplicate XPC replies; engine launch cleanup remains owned by
+    /// `PieEngineHost`'s attempt-scoped launch timeout.
     @discardableResult
-    func fireOnce(_ result: Result<EnginePort, EngineError>) -> Bool {
+    func finish(_ result: Result<EnginePort, EngineError>) -> Bool {
       let already = replied.withLock { (fired: inout Bool) -> Bool in
         defer { fired = true }
         return fired
       }
       cancelObserver()
       if already { return false }
-      PieHelperXPCWire.replyStartEngine(result, via: reply)
+      complete(result)
       return true
     }
     let token = engineHost.observe { status, _ in
-      let shouldFire: (Result<EnginePort, EngineError>)?
-      shouldFire = Self.startEngineTerminalResult(for: status, requestedProfileID: spec.profileID)
-      guard let result = shouldFire else { return }
-      fireOnce(result)
+      guard let result = Self.startEngineTerminalResult(for: status,
+                                                        requestedProfileID: spec.profileID) else { return }
+      finish(result)
     }
     tokenBox.withLock { $0 = token }
     if replied.withLock({ $0 }) { cancelObserver() }
@@ -382,14 +526,15 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       // PieEngineHost's attempt-scoped launch timeout; calling `stop()` here
       // can kill a healthy `.running` engine after an earlier success reply.
       guard let engineHost else {
-        fireOnce(.failure(EngineError(
+        finish(.failure(EngineError(
           code: .handshakeTimeout,
           message: "startEngine reply-timeout fallback fired after \(deadline)s (host unavailable)"
         )))
         return
       }
-      if let result = Self.startEngineTerminalResult(for: engineHost.status, requestedProfileID: spec.profileID) {
-        fireOnce(result)
+      if let result = Self.startEngineTerminalResult(for: engineHost.status,
+                                                     requestedProfileID: spec.profileID) {
+        finish(result)
       } else {
         DiagnosticLog.helper.event("xpc.startEngine.reply_timeout", [
           ("profile", spec.profileID),
@@ -397,7 +542,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
           ("action", "reply_only_no_lifetime_stop"),
           ("deadline", String(format: "%.1f", deadline)),
         ])
-        fireOnce(.failure(EngineError(
+        finish(.failure(EngineError(
           code: .handshakeTimeout,
           message: "startEngine reply-timeout fallback fired after \(deadline)s (host still starting; launch cleanup is host-owned)"
         )))
@@ -422,7 +567,6 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
                                   message: "engine returned to stopped before handshake"))
     case .starting, .stopping:
       return nil
-
     }
   }
 
@@ -761,6 +905,11 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
     reply(degradedStatusData)
   }
 
+  public func helperProtocolVersion(reply: @escaping (Data) -> Void) {
+    reply((try? XPCPayload.encode(HelperProtocolCompatibility.currentVersion))
+          ?? PieHelperXPCWire.fallbackReplyEncodeFailureData)
+  }
+
   public func engineMemory(reply: @escaping (Data) -> Void) {
     // No engine runs in degraded mode → RSS unavailable. `nil` cannot
     // realistically fail to encode; the literal "null" fallback decodes
@@ -771,6 +920,12 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   public func startEngine(profileID: String,
                           reply: @escaping (Data?, Data?) -> Void) {
     Self.log.error("startEngine refused in degraded mode (profileID=\(profileID, privacy: .public))")
+    reply(nil, degradedErrorData)
+  }
+
+  public func restartEngine(profileID: String,
+                            reply: @escaping (Data?, Data?) -> Void) {
+    Self.log.error("restartEngine refused in degraded mode (profileID=\(profileID, privacy: .public))")
     reply(nil, degradedErrorData)
   }
 

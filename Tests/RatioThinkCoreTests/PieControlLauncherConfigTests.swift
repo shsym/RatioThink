@@ -62,6 +62,43 @@ final class PieControlLauncherConfigTests: XCTestCase {
                    "portable config must not emit the dummy-driver block")
   }
 
+  func test_portable_body_omits_default_token_limit_when_nil() {
+    // #438: with no memory-aware ceiling, the scheduler block must NOT
+    // carry default_token_limit — the engine keeps its default (no clamp),
+    // preserving pre-#438 behavior on hosts that sustain the full pool.
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      defaultTokenLimit: nil
+    )
+    XCTAssertFalse(body.contains("default_token_limit"),
+                   "nil defaultTokenLimit must not write the override; got:\n\(body)")
+    XCTAssertFalse(body.contains("[model.driver.options]"),
+                   "the pool-resize path is gone — no driver-options block; got:\n\(body)")
+  }
+
+  func test_portable_body_emits_default_token_limit_when_set() {
+    // #438: the memory-aware ceiling rides [model.scheduler].default_token_limit.
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      defaultTokenLimit: 5000
+    )
+    // Exact key = value line, under the scheduler section, not driver options.
+    XCTAssertTrue(body.contains("default_token_limit = 5000"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("[model.scheduler]"), "got:\n\(body)")
+    XCTAssertFalse(body.contains("max_num_kv_pages"),
+                   "the old pool-resize knob must not be emitted; got:\n\(body)")
+    XCTAssertTrue(body.contains("type = \"portable\""))
+  }
+
+  func test_metal_body_emits_default_token_limit_when_set() {
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .metal(modelID: "Qwen/Qwen3-0.6B"),
+      defaultTokenLimit: 4096
+    )
+    XCTAssertTrue(body.contains("default_token_limit = 4096"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
+  }
+
   func test_portableResolved_serves_under_profile_slug_with_distinct_hf_repo_path() {
     // The crux of the id-unification fix ( follow-up): the engine's
     // served `name` is the profile slug the App carries everywhere, while

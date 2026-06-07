@@ -162,6 +162,14 @@ public enum PieControlLauncher {
     /// `.metal(...)`.
     public var modelConfig: ModelConfig
 
+    /// Memory-aware per-request output-token ceiling written as
+    /// `[model.scheduler].default_token_limit` (#438). `nil` omits it so
+    /// the engine keeps its default — used for `.dummy` launches, hosts
+    /// whose model metadata can't be read, and the common case where the
+    /// host can sustain the full default pool. Down-only: only set when it
+    /// lowers the ceiling below the engine default. See `KVCacheBudget`.
+    public var defaultTokenLimit: Int?
+
     public init(pieBinary: URL,
                 wasmURL: URL,
                 manifestURL: URL,
@@ -172,7 +180,8 @@ public enum PieControlLauncher {
                 handshakeTimeout: TimeInterval = 30,
                 pidSink: (@Sendable (pid_t) -> Void)? = nil,
                 profileID: String = "isolated",
-                modelConfig: ModelConfig) throws {
+                modelConfig: ModelConfig,
+                defaultTokenLimit: Int? = nil) throws {
       try PieControlLauncher.validateDriverSupport(
         pieBinary: pieBinary,
         subprocessEnvironment: subprocessEnvironment,
@@ -191,6 +200,7 @@ public enum PieControlLauncher {
       self.pidSink = pidSink
       self.profileID = profileID
       self.modelConfig = modelConfig
+      self.defaultTokenLimit = defaultTokenLimit
     }
   }
 
@@ -485,7 +495,9 @@ public enum PieControlLauncher {
       throw budgetError
     }
     let httpPort = try reserveFreePort()
-    let configURL = try writeConfig(modelConfig: spec.modelConfig, in: spec.pieHome)
+    let configURL = try writeConfig(
+      modelConfig: spec.modelConfig, defaultTokenLimit: spec.defaultTokenLimit, in: spec.pieHome
+    )
 
     let env = renderSubprocessEnvironment(
       base: spec.subprocessEnvironment,
@@ -627,9 +639,11 @@ public enum PieControlLauncher {
   /// model id exists). The `launch_daemon` control call passes no
   /// model, so the daemon binds to the single registered model
   /// regardless of its name.
-  static func writeConfig(modelConfig: ModelConfig, in pieHome: URL) throws -> URL {
+  static func writeConfig(modelConfig: ModelConfig,
+                          defaultTokenLimit: Int? = nil,
+                          in pieHome: URL) throws -> URL {
     let configURL = pieHome.appendingPathComponent("config.toml")
-    let body = renderConfigBody(modelConfig: modelConfig)
+    let body = renderConfigBody(modelConfig: modelConfig, defaultTokenLimit: defaultTokenLimit)
     do {
       try FileManager.default.createDirectory(at: pieHome, withIntermediateDirectories: true)
       try body.write(to: configURL, atomically: true, encoding: .utf8)
@@ -641,7 +655,8 @@ public enum PieControlLauncher {
 
   /// Pure TOML projection of `ModelConfig`. Internal so the unit
   /// tests can pin the emitted body without writing to disk.
-  static func renderConfigBody(modelConfig: ModelConfig) -> String {
+  static func renderConfigBody(modelConfig: ModelConfig,
+                               defaultTokenLimit: Int? = nil) -> String {
     let preamble = """
     [server]
     host = "127.0.0.1"
@@ -658,6 +673,11 @@ public enum PieControlLauncher {
     allow_network = true
 
     """
+    // #438: the memory-aware per-request output ceiling rides
+    // `default_token_limit` (the scheduler's total-token compute cap).
+    // chat-apc follows it via `runtime::max-output-tokens`. Omitted when
+    // nil → engine keeps its default (no clamp).
+    let limitLine = defaultTokenLimit.map { "\ndefault_token_limit = \($0)" } ?? ""
     let scheduler = """
 
     [model.scheduler]
@@ -665,7 +685,7 @@ public enum PieControlLauncher {
     request_timeout_secs = \(requestTimeoutSeconds)
     default_endowment_pages = 4
     admission_oversubscription_factor = 8.0
-    restore_pause_at_utilization = 0.85
+    restore_pause_at_utilization = 0.85\(limitLine)
 
     """
     switch modelConfig {
@@ -696,11 +716,13 @@ public enum PieControlLauncher {
         modelsRoot: modelsRoot, slug: modelSlug
       )
       return renderPortableModel(
-        servedID: modelSlug, modelRef: modelPath, preamble: preamble, scheduler: scheduler
+        servedID: modelSlug, modelRef: modelPath, preamble: preamble,
+        scheduler: scheduler
       )
     case let .portableResolved(servedModelID, modelRef):
       return renderPortableModel(
-        servedID: servedModelID, modelRef: modelRef, preamble: preamble, scheduler: scheduler
+        servedID: servedModelID, modelRef: modelRef, preamble: preamble,
+        scheduler: scheduler
       )
     case let .metal(modelID):
       // `pie-driver-portable` with ggml-metal selected at C++ build

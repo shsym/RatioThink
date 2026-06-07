@@ -84,6 +84,13 @@ request_timeout_secs = 60
 default_endowment_pages = 4
 admission_oversubscription_factor = 8.0
 restore_pause_at_utilization = 0.85
+# The per-request max_tokens ceiling chat-apc reads back
+# (runtime::max-output-tokens — #438) follows default_token_limit when
+# set, ELSE the raw KV capacity. Set it to a value that is neither the KV
+# capacity (32 * 512 = 16384) nor the old hardcoded 8192, so the
+# over-limit assertion in main() proves default_token_limit takes
+# precedence end to end.
+default_token_limit = 5000
 
 [model.driver]
 type = "dummy"
@@ -92,7 +99,13 @@ device = ["cpu"]
 [model.driver.options]
 vocab_size = 32000
 arch_name = "test"
+kv_page_size = 32
+max_num_kv_pages = 512
 """
+
+# The ceiling chat-apc must report = the configured default_token_limit
+# above (NOT the 16384 KV capacity, NOT the old 8192 constant).
+EXPECTED_MAX_OUTPUT_TOKENS = 5000
 
 # Files contributing to the inferlet "source hash" re-exported for
 # legacy callers; authoritative copy lives in `_stamp.SRC_HASH_PATHS`.
@@ -876,6 +889,44 @@ async def main() -> int:
                                 failures.append(
                                     f"/v1/chat/completions {field}={value!r} param tag {err!r}"
                                 )
+
+                    # #438: the max_tokens ceiling must FOLLOW the engine's
+                    # configured default_token_limit (runtime::max-output-tokens),
+                    # taking precedence over the raw KV capacity and never the
+                    # old hardcoded 8192. The 400 message must name
+                    # EXPECTED_MAX_OUTPUT_TOKENS (5000), NOT the 16384 capacity
+                    # and NOT 8192 — proving the value flowed engine -> inferlet
+                    # end to end via default_token_limit.
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                            "max_tokens": 1_000_000,
+                        },
+                    )
+                    ceiling_msg = ""
+                    try:
+                        ceiling_msg = r.json().get("error", {}).get("message", "")
+                    except Exception:
+                        ceiling_msg = r.text
+                    print(f"[harness] max_tokens ceiling 400 message -> {ceiling_msg!r}")
+                    if str(EXPECTED_MAX_OUTPUT_TOKENS) not in ceiling_msg:
+                        failures.append(
+                            "max_tokens ceiling must follow default_token_limit "
+                            f"{EXPECTED_MAX_OUTPUT_TOKENS}; 400 message was {ceiling_msg!r}"
+                        )
+                    if "16384" in ceiling_msg:
+                        failures.append(
+                            "default_token_limit must take precedence over KV "
+                            f"capacity 16384; 400 message was {ceiling_msg!r}"
+                        )
+                    if "8192" in ceiling_msg:
+                        failures.append(
+                            "max_tokens ceiling regressed to the hardcoded 8192; "
+                            f"message was {ceiling_msg!r}"
+                        )
 
                     # #418 (review F1): out-of-range speculation knobs are
                     # rejected at the 400 boundary with a nested `param`,

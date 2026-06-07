@@ -21,6 +21,10 @@ final class EngineStatusStoreTests: XCTestCase {
     private var queue: [Result<EngineStatus, Error>] = []
     private(set) var calls = 0
 
+    func helperProtocolVersion() async throws -> Int {
+      HelperProtocolCompatibility.currentVersion
+    }
+
     func setNext(_ result: Result<EngineStatus, Error>) {
       lock.withLock { queue.append(result) }
     }
@@ -70,6 +74,25 @@ final class EngineStatusStoreTests: XCTestCase {
         startCalls += 1
         lastStartProfileID = profileID
         return startResult
+      }
+      try result.get()
+    }
+
+    // Active-profile default-model changes need restart semantics that
+    // differ from the generic "kick start" path above. Model reload must
+    // not be decided from EngineStatusStore's cached mirror or swallow
+    // `.alreadyRunning`.
+    private(set) var restartCalls = 0
+    private(set) var lastRestartProfileID: String?
+    private var restartResult: Result<Void, Error> = .success(())
+    func setRestartResult(_ result: Result<Void, Error>) {
+      lock.withLock { restartResult = result }
+    }
+    func restartEngine(profileID: String) async throws {
+      let result: Result<Void, Error> = lock.withLock {
+        restartCalls += 1
+        lastRestartProfileID = profileID
+        return restartResult
       }
       try result.get()
     }
@@ -222,6 +245,69 @@ final class EngineStatusStoreTests: XCTestCase {
     }
     XCTAssertEqual(store.status, .running(port: 8123, profileID: "chat"),
                    "a rejected stop must NOT change status — toggle stays on, so the view must explain why")
+  }
+
+  // MARK: - restartEngine (active profile default changed)
+
+  func test_restartEngine_forwardsToAuthoritativeClientRestart() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(port: 51234, profileID: "chat")
+    )
+
+    try await store.restartEngine(profileID: "chat")
+
+    XCTAssertEqual(client.restartCalls, 1,
+                   "active-profile model changes need the helper's authoritative restart contract")
+    XCTAssertEqual(client.lastRestartProfileID, "chat")
+    XCTAssertEqual(client.stopCalls, 0,
+                   "app must not locally compose stop+start from a cached 1Hz status mirror")
+    XCTAssertEqual(client.startCalls, 0,
+                   "generic start swallows alreadyRunning; restart must not reuse that idempotent path")
+  }
+
+  func test_restartEngine_slowButSuccessfulStopDoesNotTripAppSideStopTimeout() async throws {
+    let client = StubXPCClient()
+    client.setStopResult(.failure(
+      AppXPCClientError.replyTimeout(selector: "stopEngine", timeout: 2.0)
+    ))
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(port: 51234, profileID: "chat")
+    )
+
+    try await store.restartEngine(profileID: "chat")
+
+    XCTAssertEqual(client.stopCalls, 0,
+                   "a normal slow helper stop must be owned by the restart selector's longer deadline, not app-side stopEngine's short timeout")
+    XCTAssertEqual(client.startCalls, 0)
+    XCTAssertEqual(client.restartCalls, 1)
+  }
+
+  func test_restartEngine_staleStoppedCacheAlreadyRunningDoesNotSilentlySucceed() async {
+    let client = StubXPCClient()
+    let staleRunning = EngineError(code: .alreadyRunning,
+                                   message: "helper is already running despite stale app cache")
+    client.setStartResult(.failure(staleRunning))
+    client.setRestartResult(.failure(staleRunning))
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .stopped
+    )
+
+    do {
+      try await store.restartEngine(profileID: "chat")
+      XCTFail("restart must not report success when stale cached .stopped hides a live helper engine")
+    } catch let e as EngineError {
+      XCTAssertEqual(e.code, .alreadyRunning)
+      XCTAssertEqual(client.restartCalls, 1,
+                     "the helper-side restart selector owns real helper state")
+      XCTAssertEqual(client.startCalls, 0,
+                     "generic start would swallow .alreadyRunning and silently skip the rebuild")
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
   }
 
   // MARK: - initial state

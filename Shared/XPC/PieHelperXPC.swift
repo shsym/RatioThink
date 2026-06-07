@@ -32,6 +32,14 @@ import os
 /// introspection in tests and for future bridges.
 @objc(PieHelperXPC)
 public protocol PieHelperXPC {
+  /// Reply data is `XPCPayload.encode(Int)`. Bump the returned
+  /// `HelperProtocolCompatibility.currentVersion` whenever the App
+  /// starts requiring a newly-added helper selector. App-side launchd
+  /// reconciliation probes this first so an old-but-reachable helper
+  /// from a previous app build is repaired before product paths call
+  /// selectors it does not export.
+  func helperProtocolVersion(reply: @escaping (Data) -> Void)
+
   /// Reply data is `XPCPayload.encode(EngineStatus)`.
   func engineStatus(reply: @escaping (Data) -> Void)
 
@@ -45,6 +53,14 @@ public protocol PieHelperXPC {
   /// `errorData` decodes to `EngineError`. Exactly one is non-nil.
   func startEngine(profileID: String,
                    reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
+
+  /// Strict active-profile rebuild. Same reply tuple as `startEngine`,
+  /// but the helper owns real engine state: it waits for any live
+  /// engine to reach helper-confirmed terminal stop before starting
+  /// `profileID`, and it does not treat `.alreadyRunning` as an
+  /// idempotent success.
+  func restartEngine(profileID: String,
+                     reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
 
   /// Reply is `XPCPayload.encode(EngineError)` when the stop request
   /// could not be honored (helper degraded, engine missing, transport

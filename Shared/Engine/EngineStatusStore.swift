@@ -212,6 +212,28 @@ public final class EngineStatusStore: ObservableObject {
     try await client.stopEngine()
   }
 
+  /// Intentionally rebuild the helper engine for `profileID`.
+  ///
+  /// pie's `/v1/models/load` endpoint is a registry lookup: the set of
+  /// loadable ids is fixed by the config written before `pie serve`
+  /// starts. When the active profile's default model changes (for
+  /// example after a just-finished download), a live engine still
+  /// advertises the old id until it is stopped and started again. This
+  /// helper performs that product-internal reload without requiring the
+  /// user to quit RatioThink.
+  ///
+  /// Restart deliberately routes through a helper-side selector instead
+  /// of composing `stopEngine()` + `startEngine(profileID:)` here:
+  /// the app's `status` is only a 1 Hz mirror, generic start swallows
+  /// `.alreadyRunning` as idempotent, and `stopEngine()` has a short
+  /// app-side reply timeout. The helper owns the authoritative state
+  /// machine and waits for terminal stop before starting the new
+  /// profile; any `.alreadyRunning` that escapes that contract is a
+  /// failed rebuild and must surface to the caller.
+  public func restartEngine(profileID: String) async throws {
+    try await client.restartEngine(profileID: profileID)
+  }
+
   /// Test seam: invoked with the human-readable cause whenever a
   /// memory-poll transport error is swallowed to nil. Default routes to
   /// the os.Logger, mirroring `refreshOnce`; tests inject a spy to prove
