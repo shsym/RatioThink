@@ -41,6 +41,11 @@ final class S286_NoModelSendGateGUITests: XCTestCase {
       "-ApplePersistenceIgnoreState", "YES",
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
+    // Engine-free invariant: do not let a developer-machine Helper that
+    // happens to be running with a resident model make `currentModelID()`
+    // resolve and bypass the no-model gate. Point model reconciliation at
+    // the discard port; the send should block before any engine request.
+    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
     // Deliberately NO PIE_TEST_CHAT_MODEL: nothing resolves the model,
     // so the send must be gated.
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
@@ -50,19 +55,13 @@ final class S286_NoModelSendGateGUITests: XCTestCase {
     XCTAssert(app.wait(for: .runningForeground, timeout: 10))
     app.activate()
 
-    let newChat = app.buttons["chats.newButton"]
-    XCTAssertTrue(newChat.waitForExistence(timeout: 10), "New Chat button missing")
-    newChat.click()
+    openFreshChat(in: app)
 
-    let composer = app.descendants(matching: .any)
-      .matching(identifier: "composer.text")
-      .firstMatch
-    XCTAssertTrue(composer.waitForExistence(timeout: 10), "composer.text missing")
-    composer.click()
-    composer.typeText("Hello with no model loaded")
+    typeComposerText("Hello with no model loaded", in: app)
 
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5))
+    XCTAssertTrue(send.isEnabled, "composer.send disabled after typing prompt; app tree: \(app.debugDescription)")
     send.click()
 
     // The send is BLOCKED behind the no-model gate — never a silent load
@@ -74,11 +73,14 @@ final class S286_NoModelSendGateGUITests: XCTestCase {
     // when the engine/load failed). Which state the runner lands in turns
     // on the Helper's reachability/engine state — not controlled by this
     // engine-free case. So assert the state-INDEPENDENT invariant: the
-    // gate was raised (its Cancel affordance, present in every state),
-    // not a single pinned headline. The per-state copy + actions are
+    // gate was raised (the prompt container, present in every state),
+    // not a single pinned headline. On macOS, the prompt's parent
+    // accessibility identifier can subsume child button identifiers while
+    // the engine is in a busy state, so the container is the stable signal.
+    // The per-state copy + actions are
     // exhaustively unit-proven in NoModelLoadedPromptPlanTests +
     // ChatStartGateTests.
-    XCTAssertTrue(app.buttons["noModel.cancel"].waitForExistence(timeout: 5),
-                  "send with nothing resolvable must raise the no-model gate, not load silently")
+    XCTAssertTrue(noModelPrompt(in: app).waitForExistence(timeout: 5),
+                  "send with nothing resolvable must raise the no-model gate, not load silently; app tree: \(app.debugDescription)")
   }
 }

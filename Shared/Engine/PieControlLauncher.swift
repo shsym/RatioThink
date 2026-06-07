@@ -1,6 +1,38 @@
 import Foundation
 import Darwin
 
+private final class LaunchCancellationSignal: @unchecked Sendable {
+  private let lock = NSLock()
+  private var continuation: CheckedContinuation<Void, Never>?
+  private var cancelled = false
+
+  func wait() async {
+    await withTaskCancellationHandler(operation: {
+      await withCheckedContinuation { continuation in
+        lock.lock()
+        if cancelled {
+          lock.unlock()
+          continuation.resume()
+        } else {
+          self.continuation = continuation
+          lock.unlock()
+        }
+      }
+    }, onCancel: {
+      self.cancel()
+    })
+  }
+
+  func cancel() {
+    lock.lock()
+    cancelled = true
+    let continuation = continuation
+    self.continuation = nil
+    lock.unlock()
+    continuation?.resume()
+  }
+}
+
 /// Brings a `pie serve` engine up with the bundled `chat-apc`
 /// inferlet installed and listening on an OS-picked HTTP port.
 ///
@@ -50,8 +82,9 @@ public enum PieControlLauncher {
     case freePortGetSockNameFailed(errno: Int32)
     case pieBinaryMissing(path: String)
     case spawnFailed(underlying: String)
-    case engineExitedEarly(code: Int32?, stderrTail: String)
+    case engineExitedEarly(code: Int32?, reason: Process.TerminationReason, stderrTail: String, rssBytes: UInt64? = nil)
     case handshakeTimeout(elapsed: TimeInterval, lastLines: [String])
+    case launchCancelledAfterCleanup(shutdownResult: EngineShutdownResult, lastLines: [String])
     case configWriteFailed(path: String, underlying: String)
     case portFileWriteFailed(path: String, underlying: String)
     case clientError(underlying: String)
@@ -69,10 +102,22 @@ public enum PieControlLauncher {
       case let .freePortGetSockNameFailed(e): return "PieControlLauncher: getsockname failed errno=\(e)"
       case let .pieBinaryMissing(path): return "PieControlLauncher: pie binary missing at \(path)"
       case let .spawnFailed(u): return "PieControlLauncher: spawn failed: \(u)"
-      case let .engineExitedEarly(code, tail):
-        return "PieControlLauncher: pie exited early code=\(code.map(String.init) ?? "?") stderr-tail:\n\(tail)"
+      case let .engineExitedEarly(code, reason, tail, _):
+        // `code` is `process.terminationStatus`: a signal number under
+        // `.uncaughtSignal`, an exit code under `.exit`. Render which so a
+        // segfault (signal=11) is never read as exit code 11 (#447).
+        let how: String
+        if reason == .uncaughtSignal, let s = code {
+          how = "signal=\(s) (\(EngineTermination.signalName(s)))"
+        } else {
+          how = "code=\(code.map(String.init) ?? "?")"
+        }
+        return "PieControlLauncher: pie exited early \(how) stderr-tail:\n\(tail)"
       case let .handshakeTimeout(elapsed, lastLines):
         return "PieControlLauncher: pie handshake not seen within \(elapsed)s — last stdout lines:\n  - \(lastLines.joined(separator: "\n  - "))"
+      case let .launchCancelledAfterCleanup(shutdownResult, lastLines):
+        let cleanup = shutdownResult.reaped ? "reaped" : "unreaped: \(shutdownResult.message)"
+        return "PieControlLauncher: launch cancelled after cleanup (\(cleanup)) — last stdout lines:\n  - \(lastLines.joined(separator: "\n  - "))"
       case let .configWriteFailed(path, u): return "PieControlLauncher: cannot write config at \(path): \(u)"
       case let .portFileWriteFailed(path, u): return "PieControlLauncher: cannot write http.port at \(path): \(u)"
       case let .clientError(u): return "PieControlLauncher: WS client error: \(u)"
@@ -544,17 +589,35 @@ public enum PieControlLauncher {
                                   stdout: stdout,
                                   shmemName: spec.shmemName,
                                   pieHome: spec.pieHome)
+    _ = await session.residentMemoryBytes()
 
     let handshake: Handshake
     do {
       handshake = try await session.awaitHandshake(timeout: spec.handshakeTimeout)
+    } catch is CancellationError {
+      let (shutdownResult, tail) = await cleanupCancelledLaunch(session)
+      throw LaunchError.launchCancelledAfterCleanup(
+        shutdownResult: shutdownResult,
+        lastLines: tail)
     } catch {
+      let timeoutElapsed: TimeInterval?
+      if case let LaunchError.handshakeTimeout(elapsed, _) = error {
+        timeoutElapsed = elapsed
+      } else {
+        timeoutElapsed = nil
+      }
       let shutdownResult = await session.shutdown(reason: "launch.handshake_failed")
       if !shutdownResult.reaped {
         throw LaunchError.shutdownFailed(
           underlying: "\(error)",
           shutdownFailure: shutdownResult.message
         )
+      }
+      if let timeoutElapsed {
+        let refreshedTail = await session.diagnosticTail()
+        throw LaunchError.handshakeTimeout(
+          elapsed: timeoutElapsed,
+          lastLines: refreshedTail)
       }
       throw error
     }
@@ -574,9 +637,27 @@ public enum PieControlLauncher {
                                       forceOverwrite: true)
       try await client.launchDaemon(inferlet: spec.inferletNameAtVersion, port: UInt32(httpPort))
       await client.close()
+    } catch is CancellationError {
+      _ = await session.residentMemoryBytes()
+      await client.close()
+      let (shutdownResult, tail) = await cleanupCancelledLaunch(session)
+      throw LaunchError.launchCancelledAfterCleanup(
+        shutdownResult: shutdownResult,
+        lastLines: tail)
     } catch {
+      _ = await session.residentMemoryBytes()
+      let snapshot = await session.confirmedTerminationSnapshot()
+      let tail = await session.diagnosticTail().joined(separator: "\n")
+      let rss = await session.observedResidentMemoryBytes()
       await client.close()
       let shutdownResult = await session.shutdown(reason: "launch.client_error")
+      if let snapshot {
+        throw LaunchError.engineExitedEarly(
+          code: snapshot.status,
+          reason: snapshot.reason,
+          stderrTail: tail,
+          rssBytes: rss)
+      }
       if !shutdownResult.reaped {
         throw LaunchError.shutdownFailed(
           underlying: "\(error)",
@@ -600,6 +681,21 @@ public enum PieControlLauncher {
     }
 
     return (httpPort, session)
+  }
+
+  private static func cleanupCancelledLaunch(
+    _ session: LaunchedSession
+  ) async -> (shutdownResult: EngineShutdownResult, tail: [String]) {
+    // Host-owned launch timeouts cancel the launch task. Run cleanup and tail
+    // snapshotting outside that cancelled task context so shutdown's waits and
+    // the pipe-drain barrier are not short-circuited by cooperative
+    // cancellation before the host receives durable failure evidence.
+    await Task.detached {
+      await session.drainDiagnosticOutput()
+      let shutdownResult = await session.shutdown(reason: "launch.cancelled")
+      let tail = await session.diagnosticTail()
+      return (shutdownResult, tail)
+    }.value
   }
 
   // MARK: - free port
@@ -839,7 +935,7 @@ public enum PieControlLauncher {
     }
   }
 
-  fileprivate struct Handshake {
+  struct Handshake {
     let address: String
     let token: String
   }
@@ -857,9 +953,18 @@ public actor LaunchedSession {
   private let stdout: Pipe  // stderr is merged into this (see launch())
   private let shmemName: String
   private let pieHome: URL
-  private var collectedLines: [String] = []
   /// Last 32 lines are enough for a timeout diagnostic.
   private static let recentLineLimit = 32
+  private static let residentMemorySampleInterval: TimeInterval = 0.05
+  private static let residentMemorySamplerOverride = ResidentMemorySamplerOverride()
+
+  private let outputTail = OutputTailBuffer(limit: recentLineLimit)
+  private let outputCarry = LineCarry()
+  private let outputReadQueue = DispatchQueue(label: "com.ratiothink.pie-control-launcher.output-tailer")
+  private let residentMemorySampler: @Sendable (pid_t) -> UInt64?
+  private var outputSource: DispatchSourceRead?
+  private var outputTailerStarted = false
+  private var maxResidentMemoryBytes: UInt64?
   private var shutdownDone = false
   /// Control-plane WS address, retained post-handshake so liveness
   /// probes can reconnect ( G1). `nil` until `launch()` records it.
@@ -871,12 +976,23 @@ public actor LaunchedSession {
   /// the socket but never answers can't hang the monitor.
   private static let livenessProbeTimeout: TimeInterval = 5
 
-  fileprivate init(process: Process, stdout: Pipe,
-                   shmemName: String, pieHome: URL) {
+  init(process: Process, stdout: Pipe,
+       shmemName: String, pieHome: URL) {
     self.process = process
     self.stdout = stdout
     self.shmemName = shmemName
     self.pieHome = pieHome
+    self.residentMemorySampler =
+      Self.residentMemorySamplerOverride.get() ?? { pid in LaunchedSession.residentMemory(ofPID: pid) }
+    self.outputTailerStarted = true
+    self.outputSource = Self.installOutputTailer(
+      fileDescriptor: stdout.fileHandleForReading.fileDescriptor,
+      readQueue: outputReadQueue,
+      carryBox: outputCarry,
+      outputTail: outputTail)
+    Task { [weak self] in
+      await self?.runResidentMemorySampler()
+    }
   }
 
   // MARK: - public surface
@@ -900,8 +1016,48 @@ public actor LaunchedSession {
   /// `proc_pid_rusage` returns rc==0 with ~1.2 MB of stale bytes for a
   /// zombie pid). The static helper re-checks the raw pid as defence.
   public func residentMemoryBytes() async -> UInt64? {
+    sampleResidentMemory()
+  }
+
+  /// Highest successful RSS sample observed during this child lifetime.
+  /// Unlike `residentMemoryBytes()`, this remains available after the
+  /// process exits so early SIGKILL/OOM windows can still be classified.
+  public func observedResidentMemoryBytes() async -> UInt64? {
+    maxResidentMemoryBytes
+  }
+
+  static func withResidentMemorySamplerForTesting<T>(
+    _ sampler: @escaping @Sendable (pid_t) -> UInt64?,
+    operation: () async throws -> T
+  ) async rethrows -> T {
+    let previous = residentMemorySamplerOverride.get()
+    residentMemorySamplerOverride.set(sampler)
+    defer { residentMemorySamplerOverride.set(previous) }
+    return try await operation()
+  }
+
+  @discardableResult
+  private func sampleResidentMemory() -> UInt64? {
     guard process.isRunning else { return nil }
-    return LaunchedSession.residentMemory(ofPID: process.processIdentifier)
+    guard let rss = residentMemorySampler(process.processIdentifier) else {
+      return nil
+    }
+    if let current = maxResidentMemoryBytes {
+      maxResidentMemoryBytes = max(current, rss)
+    } else {
+      maxResidentMemoryBytes = rss
+    }
+    return rss
+  }
+
+  private func runResidentMemorySampler() async {
+    while !Task.isCancelled {
+      if shutdownDone { return }
+      if !process.isRunning { return }
+      sampleResidentMemory()
+      try? await Task.sleep(
+        nanoseconds: UInt64(Self.residentMemorySampleInterval * 1_000_000_000))
+    }
   }
 
   /// `proc_pid_rusage(RUSAGE_INFO_V2)` → `ri_resident_size` for `pid`, or
@@ -1056,10 +1212,9 @@ public actor LaunchedSession {
       ])
     }
 
-    // Close pipe so any reader (awaitHandshake's task, if still
-    // running) sees EOF. Drop the post-handshake discard-drain handler
-    // first so no callback fires into a closing handle.
-    stdout.fileHandleForReading.readabilityHandler = nil
+    // Shutdown is the only non-EOF path that stops the lifetime drain and
+    // finishes late handshake subscribers before the pipe is closed.
+    finishOutputTailerBeforeClose()
     try? stdout.fileHandleForReading.close()
 
     shmUnlinkQuiet(shmemName)
@@ -1072,29 +1227,30 @@ public actor LaunchedSession {
 
   /// Reads stdout until both handshake markers appear or the
   /// timeout/exit window elapses. Stdout lines are also buffered
-  /// in `collectedLines` for diagnostics on failure paths.
+  /// in the session lifetime output tail for diagnostics on failure paths.
   ///
-  /// Implementation: `FileHandle.readabilityHandler` is the only
-  /// stable non-blocking pipe-reader macOS offers from Swift —
-  /// `read(upToCount:)` blocks until at least one byte arrives,
-  /// which deadlocks if pie's stdout buffers a partial line and
-  /// then waits for WS install before flushing more. A handler-driven
-  /// AsyncStream covers both the "burst then quiet" and "early-exit"
-  /// cases without us spinning a poll loop on a DispatchSource.
-  fileprivate func awaitHandshake(timeout: TimeInterval) async throws -> PieControlLauncher.Handshake {
+  /// Implementation: a session-lifetime `DispatchSourceRead` owns the pipe
+  /// drain and publishes lines into `outputTail`; handshake observes that same
+  /// line bus. Synchronous drain barriers use the same serial queue, so timeout
+  /// and death diagnostics can snapshot bytes already written by the child
+  /// without racing a `FileHandle.readabilityHandler` callback.
+  func awaitHandshake(timeout: TimeInterval) async throws -> PieControlLauncher.Handshake {
     let urlRegex = try! NSRegularExpression(pattern: #"pie-server serving on (\S+:\d+)"#)
     let tokRegex = try! NSRegularExpression(pattern: #"internal token: (\S+)"#)
     let started = Date()
-    let lines = startLineStream()
+    let lines = outputTail.subscribe(replayRecent: true)
+    startOutputTailer()
+    sampleResidentMemory()
 
-    return try await withThrowingTaskGroup(of: PieControlLauncher.Handshake.self) { group in
+    let cancellationSignal = LaunchCancellationSignal()
+    return try await withTaskCancellationHandler(operation: {
+      try await withThrowingTaskGroup(of: PieControlLauncher.Handshake.self) { group in
       // Reader child — yields the Handshake when both markers
       // appear or throws engineExitedEarly when pie dies.
       group.addTask { [weak self] in
         var address: String?
         var token: String?
         for await line in lines {
-          await self?.append(line: line)
           if address == nil, let m = await self?.match(urlRegex, in: line) { address = m }
           if token == nil, let m = await self?.match(tokRegex, in: line) { token = m }
           if let a = address, let t = token {
@@ -1108,7 +1264,9 @@ public actor LaunchedSession {
           if await self?.confirmedExit() == true {
             throw PieControlLauncher.LaunchError.engineExitedEarly(
               code: Int32((await self?.terminationStatusIfExited()) ?? -1),
-              stderrTail: (await self?.recentLinesJoined()) ?? ""
+              reason: (await self?.terminationReasonIfExited()) ?? .exit,
+              stderrTail: (await self?.recentLinesJoined()) ?? "",
+              rssBytes: await self?.observedResidentMemoryBytes()
             )
           }
         }
@@ -1119,7 +1277,9 @@ public actor LaunchedSession {
         if await self?.confirmedExit() == true {
           throw PieControlLauncher.LaunchError.engineExitedEarly(
             code: Int32((await self?.terminationStatusIfExited()) ?? -1),
-            stderrTail: (await self?.recentLinesJoined()) ?? ""
+            reason: (await self?.terminationReasonIfExited()) ?? .exit,
+            stderrTail: (await self?.recentLinesJoined()) ?? "",
+            rssBytes: await self?.observedResidentMemoryBytes()
           )
         }
         throw PieControlLauncher.LaunchError.handshakeTimeout(
@@ -1136,6 +1296,14 @@ public actor LaunchedSession {
           lastLines: (await self?.recentLines()) ?? []
         )
       }
+      // Parent cancellation (the host-owned launch timeout) must interrupt the
+      // handshake wait immediately so launch() can run cleanup and return the
+      // captured diagnostic tail instead of waiting for the launcher's own
+      // wall-clock timeout.
+      group.addTask {
+        await cancellationSignal.wait()
+        throw CancellationError()
+      }
       // Whoever wins, cancel the other and surface the result.
       defer { group.cancelAll() }
       guard let first = try await group.next() else {
@@ -1144,14 +1312,56 @@ public actor LaunchedSession {
         )
       }
       return first
-    }
+      }
+    }, onCancel: {
+      cancellationSignal.cancel()
+    })
   }
 
-  private func recentLines() -> [String] { Array(collectedLines.suffix(Self.recentLineLimit)) }
-  private func recentLinesJoined() -> String { recentLines().joined(separator: "\n") }
+  private func recentLines() -> [String] { outputTail.recentLines() }
+  private func recentLinesJoined() -> String { outputTail.recentLinesJoined() }
   private func isProcessRunning() -> Bool { process.isRunning }
   private func terminationStatusIfExited() -> Int32 {
     process.isRunning ? -1 : process.terminationStatus
+  }
+  private func terminationReasonIfExited() -> Process.TerminationReason? {
+    process.isRunning ? nil : process.terminationReason
+  }
+
+  /// Process-exit snapshot for `PieEngineHost`'s termination classifier
+  /// (#447). `nil` while the engine is still running — e.g. a control-plane
+  /// hang where the process is alive but unresponsive, which the liveness
+  /// monitor then classifies as `.livenessFailure`. When the process HAS
+  /// exited, returns the authoritative `(reason, status)` the classifier
+  /// needs to tell a segfault from a clean exit.
+  public func terminationSnapshot() -> (reason: Process.TerminationReason, status: Int32)? {
+    guard !process.isRunning else { return nil }
+    return (process.terminationReason, process.terminationStatus)
+  }
+
+  /// Settled exit snapshot for post-handshake launch-client failures. A
+  /// refused/failed WS operation can mean either "client/setup problem while
+  /// the engine is still alive" or "the engine died between READY and
+  /// install"; only the latter should be emitted as an engine death.
+  func confirmedTerminationSnapshot() async -> (reason: Process.TerminationReason, status: Int32)? {
+    if process.isRunning {
+      try? await Task.sleep(nanoseconds: 250_000_000)
+    }
+    guard !process.isRunning else { return nil }
+    return (process.terminationReason, process.terminationStatus)
+  }
+
+  /// Bounded, token-redacted tail of the engine's merged stdout/stderr for
+  /// durable failure capture (#447). Lines are already redacted at append
+  /// time (`redactToken`); this is `pie serve --debug` tracing, never chat
+  /// content (which rides HTTP/WS, not the engine's stdio — see #358).
+  public func diagnosticTail() async -> [String] {
+    drainOutputIfProcessExited()
+    return recentLines()
+  }
+
+  func drainDiagnosticOutput() {
+    drainAvailableOutputWithoutFinishing()
   }
 
   private func terminationDescription() -> String {
@@ -1179,46 +1389,174 @@ public actor LaunchedSession {
     return !process.isRunning
   }
 
-  /// Streams `\n`-terminated lines from `stdout` until either:
-  ///   - the deadline (the parent `awaitHandshake` task cancels), OR
-  ///   - the pipe sees EOF (subprocess exited and reader returned 0 bytes).
-  private func startLineStream() -> AsyncStream<String> {
-    let fh = stdout.fileHandleForReading
-    let carryBox = LineCarry()
-    return AsyncStream { cont in
-      // Hook readabilityHandler — fires on every byte the kernel
-      // ships up the pipe. Each call gets *some* data (never
-      // partial below 1 byte) or empty Data on EOF.
-      fh.readabilityHandler = { handle in
-        let chunk = handle.availableData
-        if chunk.isEmpty {
-          handle.readabilityHandler = nil
-          cont.finish()
-          return
-        }
-        for line in carryBox.feed(chunk) {
-          cont.yield(line)
-        }
-      }
-      cont.onTermination = { _ in
-        // The handshake line-stream is done, but pie keeps writing to this
-        // merged stdout+stderr pipe under `--debug` for its WHOLE lifetime.
-        // Stopping the reader here (the old `= nil`) was a wedge: the pipe is
-        // NOT closed until `shutdown()`, so an undrained ~64 KiB kernel
-        // buffer fills on a long-running request — a multi-level
-        // tree-of-thought search emits a lot of tracing — and pie BLOCKS on
-        // write, stalling generation with no frames, no terminal, no error
-        // (the engine appears hung). Keep draining and DISCARD; the handler
-        // self-removes at EOF (shutdown() closes the pipe). This is exactly
-        // why launch() merges stderr into this pipe (see the comment there)
-        // — but the merge only helps if we keep reading.
-        fh.readabilityHandler = { handle in
-          if handle.availableData.isEmpty {
-            handle.readabilityHandler = nil
-          }
-        }
+  /// Start the lifetime stdout/stderr drain. Handshake consumers subscribe to
+  /// the same line bus, but cancelling the handshake no longer cancels the
+  /// pipe drain; the dispatch source stays installed until shutdown closes the
+  /// pipe or the subprocess exits and the pipe reaches EOF.
+  private func startOutputTailer() {
+    guard !outputTailerStarted else { return }
+    outputTailerStarted = true
+    outputSource = Self.installOutputTailer(
+      fileDescriptor: stdout.fileHandleForReading.fileDescriptor,
+      readQueue: outputReadQueue,
+      carryBox: outputCarry,
+      outputTail: outputTail)
+  }
+
+  private static func installOutputTailer(
+    fileDescriptor fd: Int32,
+    readQueue: DispatchQueue,
+    carryBox: LineCarry,
+    outputTail: OutputTailBuffer
+  ) -> DispatchSourceRead {
+    let flags = fcntl(fd, F_GETFL)
+    if flags >= 0 {
+      _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    }
+    let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: readQueue)
+    source.setEventHandler { [weak source] in
+      let reachedEOF = drainAvailableOutput(
+        fileDescriptor: fd,
+        carryBox: carryBox,
+        outputTail: outputTail,
+        maxReadIterations: 16)
+      if reachedEOF {
+        source?.setEventHandler(handler: nil)
+        source?.cancel()
       }
     }
+    source.resume()
+    return source
+  }
+
+  @discardableResult
+  private static func drainAvailableOutput(
+    fileDescriptor fd: Int32,
+    carryBox: LineCarry,
+    outputTail: OutputTailBuffer,
+    maxReadIterations: Int? = nil
+  ) -> Bool {
+    var buffer = [UInt8](repeating: 0, count: 16 * 1024)
+    var readIterations = 0
+    while true {
+      if let maxReadIterations, readIterations >= maxReadIterations {
+        return false
+      }
+      let n = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
+        guard let base = rawBuffer.baseAddress else { return 0 }
+        return Darwin.read(fd, base, rawBuffer.count)
+      }
+      if n > 0 {
+        readIterations += 1
+        outputTail.append(carryBox.feed(Data(buffer.prefix(n))))
+        continue
+      }
+      if n == 0 {
+        outputTail.append(carryBox.finish())
+        outputTail.finish()
+        return true
+      }
+      if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR {
+        return false
+      }
+      outputTail.append(carryBox.finish())
+      outputTail.finish()
+      return true
+    }
+  }
+
+  private static func drainAvailableOutputUntilQuiescent(
+    fileDescriptor fd: Int32,
+    carryBox: LineCarry,
+    outputTail: OutputTailBuffer,
+    readinessTimeoutMilliseconds: Int32
+  ) {
+    while true {
+      if drainAvailableOutput(
+        fileDescriptor: fd,
+        carryBox: carryBox,
+        outputTail: outputTail) {
+        return
+      }
+      var pfd = pollfd(fd: fd, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0)
+      let ready = poll(&pfd, 1, readinessTimeoutMilliseconds)
+      guard ready > 0, pfd.revents != 0 else { return }
+    }
+  }
+
+  /// Deterministic drain barrier for death paths. The dispatch-source handler
+  /// and this method both read on `outputReadQueue`, so when this returns every
+  /// source read that started earlier has appended synchronously. If the
+  /// process has already exited, we then cancel future source callbacks and
+  /// drain any bytes still sitting in the pipe before snapshotting
+  /// `diagnosticTail()`.
+  private func drainOutputIfProcessExited() {
+    guard !outputTail.isFinished() else { return }
+    guard !process.isRunning else { return }
+    let fd = stdout.fileHandleForReading.fileDescriptor
+    let source = outputSource
+    outputSource = nil
+    outputReadQueue.sync {
+      guard !outputTail.isFinished() else { return }
+      source?.setEventHandler(handler: nil)
+      source?.cancel()
+      Self.drainAvailableOutputUntilQuiescent(
+        fileDescriptor: fd,
+        carryBox: outputCarry,
+        outputTail: outputTail,
+        readinessTimeoutMilliseconds: 100)
+    }
+  }
+
+  private func drainAvailableOutputWithoutFinishing() {
+    guard !outputTail.isFinished() else { return }
+    let fd = stdout.fileHandleForReading.fileDescriptor
+    outputReadQueue.sync {
+      guard !outputTail.isFinished() else { return }
+      _ = Self.drainAvailableOutput(
+        fileDescriptor: fd,
+        carryBox: outputCarry,
+        outputTail: outputTail,
+        maxReadIterations: 16)
+    }
+  }
+
+  private func finishOutputTailerBeforeClose() {
+    let fd = stdout.fileHandleForReading.fileDescriptor
+    let source = outputSource
+    outputSource = nil
+    outputReadQueue.sync {
+      guard !outputTail.isFinished() else { return }
+      source?.setEventHandler(handler: nil)
+      source?.cancel()
+      if process.isRunning {
+        // Cleanup already exhausted the signal/reap window. Do not wait for a
+        // still-live noisy child to become quiet; drain at most bytes ready now
+        // and return the unreaped result promptly.
+        _ = Self.drainAvailableOutput(
+          fileDescriptor: fd,
+          carryBox: outputCarry,
+          outputTail: outputTail,
+          maxReadIterations: 4)
+      } else {
+        Self.drainAvailableOutputUntilQuiescent(
+          fileDescriptor: fd,
+          carryBox: outputCarry,
+          outputTail: outputTail,
+          readinessTimeoutMilliseconds: 100)
+      }
+      outputTail.append(outputCarry.finish())
+      outputTail.finish()
+    }
+  }
+
+  func outputTailFinishedForTesting() -> Bool {
+    outputTail.isFinishedForTesting()
+  }
+
+  func finishOutputTailerBeforeCloseForTesting() -> [String] {
+    finishOutputTailerBeforeClose()
+    return recentLines()
   }
 
   // MARK: - private
@@ -1229,15 +1567,8 @@ public actor LaunchedSession {
   /// and may end up in crash reports or log aggregators (review 
   /// F1). Even though the token is loopback-scoped, never store live
   /// credentials in error descriptions. Redaction happens at the
-  /// entry point so every consumer of `collectedLines`
+  /// entry point so every consumer of the lifetime output tail
   /// (`recentLines`, `recentLinesJoined`) is safe by construction.
-  private func append(line: String) {
-    collectedLines.append(Self.redactToken(in: line))
-    if collectedLines.count > Self.recentLineLimit * 4 {
-      collectedLines.removeFirst(collectedLines.count - Self.recentLineLimit * 2)
-    }
-  }
-
   /// Replaces `internal token: <opaque>` with `internal token: <REDACTED>`.
   /// `nonisolated` + `static` so the matching regex (the same one
   /// `awaitHandshake` uses to capture) is the single source of truth
@@ -1329,12 +1660,11 @@ public actor LaunchedSession {
 
 // MARK: - LineCarry
 
-/// Mutable carry buffer for the readabilityHandler-driven line stream.
-/// Lives outside the actor so the handler closure (which runs on
-/// arbitrary queues) does not need to hop onto the actor for every
-/// byte. The carry is appended-to from one queue (the FileHandle's
-/// readability dispatch queue) and `feed()` is the only mutator;
-/// `@unchecked Sendable` documents the invariant.
+/// Mutable carry buffer shared by the dispatch-source stream and the
+/// deterministic drain barrier. Lives outside the actor so the source
+/// closure does not need to hop onto the actor for every byte. All
+/// `feed()`/`finish()` calls are serialized by `outputReadQueue`;
+/// `@unchecked Sendable` documents that invariant.
 // MARK: - PieEngineHost.EngineSession conformance
 
 /// Bridge so `PieEngineHost` can hold `LaunchedSession` behind its
@@ -1361,5 +1691,126 @@ fileprivate final class LineCarry: @unchecked Sendable {
       out.append(s)
     }
     return out
+  }
+
+  func finish() -> [String] {
+    guard !carry.isEmpty else { return [] }
+    defer { carry.removeAll() }
+    return [Self.string(from: carry)]
+  }
+
+  private static func string(from data: Data) -> String {
+    var s = String(data: data, encoding: .utf8) ?? ""
+    if s.hasSuffix("\r") { s.removeLast() }
+    return s
+  }
+}
+
+private final class OutputTailBuffer: @unchecked Sendable {
+  private let limit: Int
+  private let lock = NSLock()
+  private var rawLines: [String] = []
+  private var redactedLines: [String] = []
+  private var subscribers: [UUID: AsyncStream<String>.Continuation] = [:]
+  private var finished = false
+
+  init(limit: Int) {
+    self.limit = limit
+  }
+
+  func append(_ rawLines: [String]) {
+    guard !rawLines.isEmpty else { return }
+    let redactedLines = rawLines.map(LaunchedSession.redactToken(in:))
+    let continuations: [AsyncStream<String>.Continuation] = lock.withLock {
+      self.rawLines.append(contentsOf: rawLines)
+      self.redactedLines.append(contentsOf: redactedLines)
+      if self.rawLines.count > limit * 4 {
+        let trimCount = self.rawLines.count - limit * 2
+        self.rawLines.removeFirst(trimCount)
+        self.redactedLines.removeFirst(trimCount)
+      }
+      return Array(subscribers.values)
+    }
+    for line in rawLines {
+      for continuation in continuations {
+        continuation.yield(line)
+      }
+    }
+  }
+
+  func subscribe(replayRecent: Bool) -> AsyncStream<String> {
+    let id = UUID()
+    var continuation: AsyncStream<String>.Continuation!
+    let stream = AsyncStream<String> { cont in
+      continuation = cont
+    }
+    let snapshot: (replay: [String], alreadyFinished: Bool) = lock.withLock {
+      if !finished {
+        subscribers[id] = continuation
+      }
+      return (
+        replayRecent ? Array(rawLines.suffix(limit)) : [],
+        finished
+      )
+    }
+    for line in snapshot.replay {
+      continuation.yield(line)
+    }
+    if snapshot.alreadyFinished {
+      continuation.finish()
+      return stream
+    }
+    continuation.onTermination = { [weak self] _ in
+      self?.lock.withLock {
+        self?.subscribers[id] = nil
+      }
+    }
+    return stream
+  }
+
+  func finish() {
+    let continuations: [AsyncStream<String>.Continuation] = lock.withLock {
+      guard !finished else { return [] }
+      finished = true
+      let snapshot = Array(subscribers.values)
+      subscribers.removeAll()
+      return snapshot
+    }
+    for continuation in continuations {
+      continuation.finish()
+    }
+  }
+
+  func recentLines() -> [String] {
+    lock.withLock { Array(redactedLines.suffix(limit)) }
+  }
+
+  func recentLinesJoined() -> String {
+    recentLines().joined(separator: "\n")
+  }
+
+  func isFinishedForTesting() -> Bool {
+    isFinished()
+  }
+
+  func isFinished() -> Bool {
+    lock.withLock { finished }
+  }
+}
+
+private final class ResidentMemorySamplerOverride: @unchecked Sendable {
+  private let lock = NSLock()
+  private var sampler: (@Sendable (pid_t) -> UInt64?)?
+
+  func get() -> (@Sendable (pid_t) -> UInt64?)? {
+    lock.lock()
+    defer { lock.unlock() }
+    return sampler
+  }
+
+  func set(_ value: (@Sendable (pid_t) -> UInt64?)?) {
+    lock.lock()
+    sampler = value
+    lock.unlock()
   }
 }

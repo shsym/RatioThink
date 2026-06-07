@@ -250,8 +250,22 @@ classify() {
   if find "$CRASH_DIR" -maxdepth 1 -type f -name 'pie-[0-9]*' -mtime -7 2>/dev/null | grep -q .; then
     engine_failed=1
   fi
+  # #447: the structured `engine.terminated` breadcrumb names the death class.
+  # ONLY fault causes are an engine failure — userStop / helperShutdown /
+  # cleanExit are normal stops and must NOT trip the failure verdict. Extract
+  # the last FAULT cause (not the last cause overall, so a fault followed by a
+  # user pause still reports the fault) to annotate the verdict.
+  local term_cause=""
+  if [ -f "$helper_log" ]; then
+    term_cause="$(grep 'engine\.terminated' "$helper_log" 2>/dev/null \
+      | grep -oE 'cause=(crash|segfault|oom|killed|nonzeroExit|livenessFailure|handshakeTimeout|unknown)' \
+      | sed 's/cause=//' | tail -1)"
+  fi
+  [ -n "$term_cause" ] && engine_failed=1
   if [ "$engine_failed" -eq 1 ]; then
-    add_verdict "ENGINE_FAILED: an engine failure was recorded — see app-logs/{helper.log,engine.log,pie.log*}, crash-reports/"
+    local cause_note=""
+    [ -n "$term_cause" ] && cause_note=" (cause=$term_cause)"
+    add_verdict "ENGINE_FAILED${cause_note}: an engine failure was recorded — see app-logs/{helper.log,engine.log,pie.log*}, crash-reports/"
   fi
 
   # Activity / empty-log handling — always actionable, never an empty dir.

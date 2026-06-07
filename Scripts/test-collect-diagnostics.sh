@@ -258,6 +258,37 @@ bundleFc="$(extract_bundle "$FC/out" "$FC/x")"
 assert_contains "$bundleFc/report.txt" "ENGINE_FAILED" "Fc: seeded pie crash trips ENGINE_FAILED"
 assert_exists "$bundleFc/crash-reports/pie-2026-05-30-120000.ips" "Fc: pie crash report copied into bundle"
 
+echo "case Ft: #447 engine.terminated FAULT cause -> ENGINE_FAILED + surfaced cause"
+FT="$WORK_ROOT/Ft"; mkdir -p "$FT/out" "$FT/crash" "$FT/home/logs"
+mini_app "$FT/app/RatioThink.app"
+# A structured fault breadcrumb AND adjacent chat-like prose: the verdict must
+# name the cause (segfault) but the cause extraction is scalar-only and must
+# NOT echo the seeded chat text into report.txt.
+{
+  echo "2026-05-30T00:00:00Z helper helper.launch version=1.0"
+  echo "2026-05-30T12:00:00Z helper engine.terminated cause=segfault initiator=engine signal=11 name=SIGSEGV"
+  echo "2026-05-30T12:00:01Z helper chat.note assistant=TERMINATED_CHATSECRET_should_never_surface"
+} > "$FT/home/logs/helper.log"
+RATIOTHINK_APP="$FT/app/RatioThink.app" PIE_HOME="$FT/home" RATIOTHINK_DIAG_CRASH_DIR="$FT/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$FT/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleFt="$(extract_bundle "$FT/out" "$FT/x")"
+assert_contains "$bundleFt/report.txt" "ENGINE_FAILED" "Ft: engine.terminated fault trips ENGINE_FAILED"
+assert_contains "$bundleFt/report.txt" "cause=segfault" "Ft: verdict surfaces the death cause"
+refute_contains "$bundleFt/report.txt" "CHATSECRET" "Ft: verdict never echoes adjacent log prose (scalar cause only)"
+
+echo "case Fu: #447 engine.terminated NORMAL stop must NOT trip ENGINE_FAILED"
+FU="$WORK_ROOT/Fu"; mkdir -p "$FU/out" "$FU/crash" "$FU/home/logs"
+mini_app "$FU/app/RatioThink.app"
+{
+  echo "2026-05-30T00:00:00Z helper helper.launch version=1.0"
+  echo "2026-05-30T12:00:00Z helper engine.terminated cause=userStop initiator=user"
+  echo "2026-05-30T12:05:00Z helper engine.terminated cause=helperShutdown initiator=helper"
+} > "$FU/home/logs/helper.log"
+RATIOTHINK_APP="$FU/app/RatioThink.app" PIE_HOME="$FU/home" RATIOTHINK_DIAG_CRASH_DIR="$FU/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$FU/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleFu="$(extract_bundle "$FU/out" "$FU/x")"
+refute_contains "$bundleFu/report.txt" "ENGINE_FAILED" "Fu: user/helper stop is not an engine failure"
+
 # --- chat-collection removal (#399) -----------------------------------------
 # Privacy invariant: a diagnostics bundle must NEVER carry chat content, under
 # any flag, from any copy of the script. Exercised against the source script
