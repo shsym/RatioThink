@@ -11,12 +11,12 @@ below in the same change.
 
 | Target | What it runs | Runs where | Gating |
 |---|---|---|---|
-| `make ci-pr` | Required GitHub PR aggregate: `lint`, CI-v2 taxonomy guard, app-icon provenance, compile/type check via `build-static`, SPM unit tests, install-guard contracts, diagnostics self-test, sanitizer canary | GitHub required PR workflow + local | **Required PR CI** |
+| `make ci-pr` | Required GitHub PR aggregate: `lint`, CI-v2 taxonomy guard, app-icon provenance, compile/type check via `build-static`, SPM unit tests, install-guard contracts, diagnostics self-test, sanitizer canary, release-script contracts | GitHub required PR workflow + local | **Required PR CI** |
 | `make build-static` | Xcode Debug compile/type check of RatioThink app + helper with `PIE_SKIP_ENGINE_BUILD=1` so the Rust engine long pole is not built | GitHub + local | **Required PR CI** compile/type check |
 | `make local-pre-merge` | `ci-pr` plus `build-tests`, app-unit, scenario/smoke, HTTP E2E, real-pie driver contract, gmake recipe canary | local operator machine | **Mandatory before merge** for non-doc changes; carries runtime coverage removed from required CI |
 | `make local-gui-gate` | GUI wrapper script regressions + full `RatioThinkGUITests` matrix | seated local session | **Mandatory before merge** for GUI/UI changes |
 | `make local-e2e-gate` | Real-engine/model/signing/helper E2E wrappers (`test-e2e-*`, GUI history/package, helper respawn/recovery) | local/operator only | **Mandatory before merge/release** for affected engine/model/install paths |
-| `make release-gate` | `local-pre-merge` + live-HF curated audit + DMG layout + notarization/preflight contract tests | local/operator + release machine | **Mandatory before release**; also run `make release-preflight ARTIFACT=…` on the built artifact |
+| `make release-gate` | `local-pre-merge` + live-HF curated audit + DMG layout + artifact preflight | local/operator + release machine | **Mandatory before release**; also run `make release-preflight ARTIFACT=…` on the built artifact |
 | `make lint` | helper side-effect invariants (static) | anywhere | Required PR CI via `ci-pr` |
 | `make build` | Debug build of RatioThink app + helper, including real Rust engine bundle build | local | Local packaging/runtime verification |
 | `make build-tests` | **Compile-only** smoke of every xcodebuild target + SPM probe (does NOT run the bundles) | local | Local pre-merge via `local-pre-merge` |
@@ -32,7 +32,7 @@ below in the same change.
 | `make test-real-pie-driver-contract` | Builds the worktree pie engine and runs the real `pie driver list` drift guard without silent skips | local | Local pre-merge parity for removed `real-pie-driver-contract` CI job |
 | `make test-gmake-recipe-canary` | gmake 4.x recipe failure/log canary (requires Homebrew `gmake`) | local | Local pre-merge parity when Makefile recipes change |
 | `make test-dmg-layout` | DMG drag-install layout verifier regression (hdiutil + codesign) | local/release | Release gate via `release-gate` |
-| `make test-release` | real-tool contract tests for `notarize.sh` + `release-preflight.sh` | local/release | Release gate via `release-gate` |
+| `make test-release` | real-tool contract tests for `notarize.sh` + `release-preflight.sh` | GitHub + local/release | Required PR CI via `ci-pr`; also included in `release-gate` through `local-pre-merge` |
 | `make test-stamp` | `Inferlets/chat-apc/_stamp.py` unit tests | GitHub when inferlet-relevant paths change + local | Conditional PR provenance gate |
 | `make test-inferlets` | chat-apc Rust unit tests (native cargo test --lib) | GitHub when inferlet-relevant paths change + local | Conditional PR provenance gate |
 | `make verify-inferlets` | Verify committed chat-apc prebuilt + stamp against the tree | GitHub when inferlet-relevant paths change + local | Conditional PR provenance gate |
@@ -119,7 +119,7 @@ exact fix command when a human gate is unmet.
 | install-time launchd safety | `make test-install-guards` (stubbed, runs anywhere — required CI via `ci-pr`) | `test-ssh` / `ci-pr` |
 | live helper respawn | `make test-helper-respawn` (signed/registered install) | — |
 | diagnostics | `make test-collect-diagnostics` (bundle self-test, required CI via `ci-pr`) + `DiagnosticLogTests` via `test-unit` | `test-ssh` / `ci-pr` |
-| notarization / release preflight | `make test-release` (notarize + preflight contract tests) + `make test-dmg-layout` (DMG layout verifier), via `make release-gate`; `release-preflight ARTIFACT=…` for a built artifact | `release-gate` |
+| notarization / release preflight | `make test-release` (notarize + preflight contract tests, required CI via `ci-pr`) + `make test-dmg-layout` (DMG layout verifier), via `make release-gate`; `release-preflight ARTIFACT=…` for a built artifact | `ci-pr` / `release-gate` |
 
 `make test-gui` still runs the **entire** `RatioThinkGUITests` matrix; the
 focused targets are `-only-testing` slices of it. A few suites have **no**
@@ -149,7 +149,10 @@ static gate.** Required CI may run formatting/lint/static checks, compile/type
 checks, cheap provenance checks, and deterministic unit/contract tests. It must
 not depend on a seated GUI session, real model weights, real engine launch,
 network/live-HF access, release signing/notarization credentials, Homebrew gmake
-installation, or broad integration/runtime timing. Coverage removed from the
+installation, or broad integration/runtime timing. The release-script contract
+tests are the exception: they use local throwaway ad-hoc artifacts and real
+macOS tools, but no signing secrets, notarization service call, GUI session,
+engine, or network, so they stay in required PR CI. Coverage removed from the
 required path is mandatory locally through the exact targets below.
 
 ### Required GitHub PR gate
@@ -161,7 +164,7 @@ only two check families:
 
 | Job | Classification | Runs | Notes |
 |---|---|---|---|
-| `PR static gate` | required-static + required-lightweight-runtime | `make ci-pr` | Lint, CI taxonomy guard, app-icon provenance, `build-static`, SPM unit tests, install/diagnostics contracts, sanitizer canary. |
+| `PR static gate` | required-static + required-lightweight-runtime | `make ci-pr` | Lint, CI taxonomy guard, app-icon provenance, `build-static`, SPM unit tests, install/diagnostics contracts, sanitizer canary, release-script contracts. |
 | `chat-apc inferlet provenance` | required cheap provenance, path-conditional | `make test-stamp`; `make test-inferlets`; `make verify-inferlets` | Uses a job-level `if:` with `needs.changes.outputs.inferlets != 'false'` and `!cancelled()` so unrelated PRs skip-as-Success, while detector failures fail open by running the checks. |
 | `curated-catalog-audit` workflow | optional/scheduled + targeted PR | `make test-curated-hf` | Separate workflow. Runs nightly/manual and on PRs touching the curated catalog/tests; unrelated PRs do not hit live HF. |
 
@@ -182,7 +185,7 @@ Every suite/job removed from required PR CI maps to an explicit local command:
 | S3 engine subprocess smoke | local-required-before-merge | `make test-smoke` or aggregate `make local-pre-merge` | Engine subprocess/inference launch changes |
 | Old `real-pie-driver-contract` CI job | local-required-before-merge | `make test-real-pie-driver-contract` or aggregate `make local-pre-merge` | Pie driver/probe/engine launch contract changes; before release |
 | Old `gmake-sanity-fail-injection` CI job | local-required-before-merge for Makefile work | `make test-gmake-recipe-canary` (install Homebrew `gmake` first if needed) | Makefile recipe/logging changes; before release if recipes changed |
-| Old `release-scripts` CI job | local-required-before-release | `make test-release`; aggregate `make release-gate` | Before release or when notarize/preflight scripts change |
+| Release-script contract tests | required-lightweight-runtime | `make test-release` through `make ci-pr` | Required on every PR; also part of `make release-gate` through `local-pre-merge` |
 | DMG layout verifier | local-required-before-release | `make test-dmg-layout`; aggregate `make release-gate` | Before release or when packaging layout changes |
 | Live-HF curated catalog existence | optional/manual + local release | `make test-curated-hf`; also scheduled/targeted `curated-catalog-audit` workflow | Before release; on curated catalog/test changes; nightly drift check |
 | Inferlet wasm rebuild/restamp (`make build-inferlets`) | local-required-before-merge for inferlet changes | `make stamp-inferlets` then `make verify-inferlets-inputs`; cheap `make test-stamp test-inferlets verify-inferlets` remains conditional PR CI | When `Inferlets/**`, `Vendor/pie`, WIT/vendor pin, or prebuilt wasm changes |
@@ -206,7 +209,7 @@ Every suite/job removed from required PR CI maps to an explicit local command:
 | Engine subprocess / inference contract | `make test-smoke` + `make test-real-pie-driver-contract`; add S3-real from Appendix A when launch args or inference semantics changed |
 | chat-apc HTTP routes / SSE / tool calling (`Inferlets/chat-apc/src`) | `make test-e2e-http`; `make stamp-inferlets`; `make verify-inferlets-inputs`; conditional PR CI also runs `make test-stamp`, `make test-inferlets`, `make verify-inferlets` |
 | Curated catalog coordinates | `make test-curated-hf`; targeted `curated-catalog-audit` PR workflow will also run live HF |
-| Packaging / notarization / release scripts | `make release-gate`; after building the candidate artifact, run `make release-preflight ARTIFACT=…` |
+| Packaging / notarization / release scripts | `make ci-pr` for release-script contract tests; `make release-gate`; after building the candidate artifact, run `make release-preflight ARTIFACT=…` |
 | Broad / release / "everything" | `make release-gate` + `make local-gui-gate` + `make local-e2e-gate` on an operator machine with the documented models, TCC, signing, and live-service prerequisites |
 
 There is **no local git hook**. Local verification is developer-owned and

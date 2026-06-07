@@ -87,7 +87,7 @@ build-static: genproject ## Compile/type-check RatioThink app + helper without b
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build
 
-ci-pr: lint test-ci-v2-static-gate verify-app-icon-assets test-app-icon-assets build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary ## Required lightweight PR gate: static/lint/provenance + compile/type + deterministic unit/contracts only
+ci-pr: lint test-ci-v2-static-gate verify-app-icon-assets test-app-icon-assets build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Required lightweight PR gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
 
 local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary ## Mandatory local pre-merge parity for runtime/heavy checks removed from required PR CI
 
@@ -95,7 +95,7 @@ local-gui-gate: test-gui-script test-gui ## Mandatory local GUI parity gate for 
 
 local-e2e-gate: test-e2e-engine test-e2e-models test-e2e-load test-e2e-396 test-e2e-chat test-e2e-full test-gui-history test-gui-first-launch-package test-helper-respawn test-helper-recovery ## Operator-gated integration/E2E parity; requires documented models, engine, signing, TCC, or live services
 
-release-gate: local-pre-merge test-curated-hf test-dmg-layout test-release ## Release readiness gate; additionally run release-preflight with ARTIFACT=<built .app|.dmg> after packaging/notarization
+release-gate: local-pre-merge test-curated-hf test-dmg-layout ## Release readiness gate; additionally run release-preflight with ARTIFACT=<built .app|.dmg> after packaging/notarization
 
 install-app: ## Signed install into /Applications, verified end-to-end (Helper+engine+chat). Override DEVELOPMENT_TEAM / CODE_SIGN_IDENTITY per machine.
 	Scripts/install-app.sh

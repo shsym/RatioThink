@@ -9,9 +9,9 @@ name: lint
 #                                gmake canary)
 #   - make local-gui-gate       (seated GUI/XCUITest)
 #   - make local-e2e-gate       (real-engine/model/signing/live-service paths)
-#   - make release-gate         (release-script/live-HF/readiness checks)
+#   - make release-gate         (live-HF/packaging/readiness checks)
 # Required PR jobs below keep only static/lint/provenance, compile/type checks,
-# and cheap deterministic unit/contract tests.
+# cheap deterministic unit/contract tests, and release-script contracts.
 
 on:
   push:
