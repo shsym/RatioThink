@@ -1,23 +1,23 @@
 name: lint
 
-# CI v2 (#456): required PR CI is intentionally lightweight and deterministic.
-# The workflow is NOT top-level path-filtered, so protected checks never stay
-# pending. Heavy/runtime coverage removed from this required path is preserved
-# through the documented local make tiers in TEST.md:
+# CI v2 (#456): the lightweight GitHub gate is manual/on-demand only.
+# Normal merge evidence is local: run `make ci-pr` plus the documented local
+# parity gates in TEST.md for affected runtime/UI/release paths. This workflow
+# remains available as an explicit operator-triggered verification run when a
+# GitHub-hosted copy of the lightweight/static evidence is useful.
+#
+# Heavy/runtime coverage is preserved through the local make tiers:
 #   - make local-pre-merge      (xcodebuild test-bundle compile, app-unit,
 #                                scenario/smoke, HTTP E2E, real-pie contract,
 #                                gmake canary)
 #   - make local-gui-gate       (seated GUI/XCUITest)
 #   - make local-e2e-gate       (real-engine/model/signing/live-service paths)
 #   - make release-gate         (live-HF/packaging/readiness checks)
-# Required PR jobs below keep only static/lint/provenance, compile/type checks,
+# The manual jobs below keep only static/lint/provenance, compile/type checks,
 # cheap deterministic unit/contract tests, and release-script contracts.
 
 on:
-  push:
-    branches: ["**"]
-  pull_request:
-    branches: ["**"]
+  workflow_dispatch:
 
 jobs:
   changes:

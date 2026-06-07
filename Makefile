@@ -82,14 +82,14 @@ build: genproject ## xcodebuild Debug build of Rational app + helper
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build
 
-build-static: genproject ## Compile/type-check Rational app + helper without building the Rust pie engine (CI v2 PR gate)
+build-static: genproject ## Compile/type-check Rational app + helper without building the Rust pie engine (CI v2 local/manual gate)
 	PIE_SKIP_ENGINE_BUILD=1 xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build
 
-ci-pr: lint test-ci-v2-static-gate verify-app-icon-assets test-app-icon-assets build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Required lightweight PR gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
+ci-pr: lint test-ci-v2-static-gate verify-app-icon-assets test-app-icon-assets build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
 
-local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary ## Mandatory local pre-merge parity for runtime/heavy checks removed from required PR CI
+local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary ## Mandatory local pre-merge parity for runtime/heavy checks kept out of the lightweight manual workflow
 
 local-gui-gate: test-gui-script test-gui ## Mandatory local GUI parity gate for UI changes; requires seated session + Automation/Accessibility TCC
 
@@ -303,7 +303,7 @@ test-install-guards: ## Install-time launchd-safety regression guards (stubbed, 
 	Scripts/test-proc-acceptance.sh
 	Scripts/test-source-closed.sh
 
-test-ci-v2-static-gate: ## Regression-test the CI v2 required/static gate taxonomy (#456)
+test-ci-v2-static-gate: ## Regression-test the CI v2 manual/static gate taxonomy (#456)
 	Scripts/test-ci-v2-static-gate.sh
 
 test-sanitizer-canary: ## Env-sanitizer canary with zero-test guard (deterministic contract; CI v2 lightweight)
@@ -330,7 +330,7 @@ test-sanitizer-canary: ## Env-sanitizer canary with zero-test guard (determinist
 	  fi; \
 	  rm -f $$LOG
 
-test-real-pie-driver-contract: engine-bundle $(LOGDIR) ## Local heavy real-binary driver-list contract removed from required PR CI
+test-real-pie-driver-contract: engine-bundle $(LOGDIR) ## Local heavy real-binary driver-list contract kept out of lightweight manual CI
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-real-pie-driver-contract.log; \
 	  PIE_TEST_REAL_PIE_BIN="$(PWD)/build/pie-engine/$(ARCH)/pie" Scripts/run-swift-test.sh --filter 'test_realPie_driverList_subcommand_exists_and_reports_portable' 2>&1 | tee $$LOG | tail -40; \
@@ -346,7 +346,7 @@ test-real-pie-driver-contract: engine-bundle $(LOGDIR) ## Local heavy real-binar
 	    exit 1; \
 	  fi
 
-test-gmake-recipe-canary: $(LOGDIR) ## Local gmake 4.x recipe guard removed from required PR CI (requires Homebrew gmake)
+test-gmake-recipe-canary: $(LOGDIR) ## Local gmake 4.x recipe guard kept out of lightweight manual CI (requires Homebrew gmake)
 	@set -e; \
 	  gmake_bin="$$(command -v gmake || true)"; \
 	  if [ -z "$$gmake_bin" ] && [ -x "$$(brew --prefix 2>/dev/null)/opt/make/libexec/gnubin/make" ]; then \

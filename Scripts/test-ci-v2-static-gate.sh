@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Regression guard for ticket #456: required PR CI stays lightweight/static,
-# and every removed heavyweight/runtime suite remains reachable through named
-# local make tiers.
+# Regression guard for ticket #456: the CI-v2 GitHub workflow stays
+# manual/on-demand and lightweight/static, while every removed heavyweight/
+# runtime suite remains reachable through named local make tiers.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,8 +38,9 @@ assert_no_grep() {
   fi
 }
 
-# Make tiers: CI gets a small deterministic aggregate; local/release gates keep
-# parity for dynamic coverage removed from required PR CI.
+# Make tiers: local `make ci-pr` is the normal deterministic merge-evidence
+# aggregate; local/release gates keep parity for dynamic coverage kept out of
+# the manual GitHub workflow.
 assert_grep '^ci-pr: ' Makefile "Makefile exposes ci-pr aggregate"
 assert_grep '^local-pre-merge: ' Makefile "Makefile exposes local-pre-merge aggregate"
 assert_grep '^release-gate: ' Makefile "Makefile exposes release-gate aggregate"
@@ -47,18 +48,19 @@ assert_grep '^local-gui-gate: ' Makefile "Makefile exposes local-gui-gate aggreg
 assert_grep '^local-e2e-gate: ' Makefile "Makefile exposes local-e2e-gate aggregate"
 assert_grep '^build-static: ' Makefile "Makefile exposes compile-only build-static target"
 
-# Required PR workflow remains unfiltered but delegates to ci-pr and avoids the
-# known heavyweight/runtime jobs that made the old gate slow or flaky.
-assert_grep 'push:' .github/workflows/lint.yml "lint workflow still runs on push"
-assert_grep 'pull_request:' .github/workflows/lint.yml "lint workflow still runs on pull_request"
-assert_grep 'run: make ci-pr' .github/workflows/lint.yml "required workflow uses ci-pr aggregate"
-assert_grep '^ci-pr: .*test-release' Makefile "release script contract tests stay in required PR aggregate"
-assert_no_grep '^  real-pie-driver-contract:' .github/workflows/lint.yml "real pie binary contract removed from required PR workflow"
-assert_no_grep '^  gmake-sanity-fail-injection:' .github/workflows/lint.yml "gmake 4.x canary removed from required PR workflow"
-assert_no_grep '^  release-scripts:' .github/workflows/lint.yml "release script contracts are folded into PR static gate, not a separate heavy job"
-assert_no_grep 'run: make build-tests' .github/workflows/lint.yml "required PR workflow does not build every xcodebuild test bundle"
-assert_no_grep 'run: make build-inferlets' .github/workflows/lint.yml "required PR workflow does not rebuild wasm inferlets"
-assert_grep 'run: make verify-inferlets' .github/workflows/lint.yml "cheap inferlet stamp provenance remains in PR workflow"
+# Manual GitHub workflow delegates to ci-pr and avoids the known heavyweight/
+# runtime jobs that made the old automatic gate slow or flaky.
+assert_grep 'workflow_dispatch:' .github/workflows/lint.yml "lint workflow is manually dispatchable"
+assert_no_grep '^[[:space:]]*push:' .github/workflows/lint.yml "lint workflow does not run automatically on push"
+assert_no_grep '^[[:space:]]*pull_request:' .github/workflows/lint.yml "lint workflow does not run automatically on pull_request"
+assert_grep 'run: make ci-pr' .github/workflows/lint.yml "manual workflow uses ci-pr aggregate"
+assert_grep '^ci-pr: .*test-release' Makefile "release script contract tests stay in ci-pr aggregate"
+assert_no_grep '^  real-pie-driver-contract:' .github/workflows/lint.yml "real pie binary contract kept out of manual lightweight workflow"
+assert_no_grep '^  gmake-sanity-fail-injection:' .github/workflows/lint.yml "gmake 4.x canary kept out of manual lightweight workflow"
+assert_no_grep '^  release-scripts:' .github/workflows/lint.yml "release script contracts are folded into ci-pr, not a separate heavy job"
+assert_no_grep 'run: make build-tests' .github/workflows/lint.yml "manual lightweight workflow does not build every xcodebuild test bundle"
+assert_no_grep 'run: make build-inferlets' .github/workflows/lint.yml "manual lightweight workflow does not rebuild wasm inferlets"
+assert_grep 'run: make verify-inferlets' .github/workflows/lint.yml "cheap inferlet stamp provenance remains available in manual workflow"
 
 # The Xcode compile target must be able to type-check/package the app without
 # building the Rust engine long pole. Exercise the build-phase entrypoint in

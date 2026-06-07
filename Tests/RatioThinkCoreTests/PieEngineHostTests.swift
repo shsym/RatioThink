@@ -15,9 +15,14 @@ final class PieEngineHostTests: XCTestCase {
   final class FakeSession: PieEngineHost.EngineSession, @unchecked Sendable {
     private let lock = NSLock()
     private var _count = 0
+    private let shutdownCalled: XCTestExpectation?
+    init(shutdownCalled: XCTestExpectation? = nil) {
+      self.shutdownCalled = shutdownCalled
+    }
     var shutdownCount: Int { lock.lock(); defer { lock.unlock() }; return _count }
     func shutdown() async -> EngineShutdownResult {
       lock.lock(); _count += 1; lock.unlock()
+      shutdownCalled?.fulfill()
       return .reaped
     }
   }
@@ -418,7 +423,8 @@ final class PieEngineHostTests: XCTestCase {
     let secondTimeoutArmed = expectation(description: "launch #2 timeout armed")
     let launches = LaunchGate(started: [firstStarted, secondStarted])
     let sleeps = SleepGate(armed: [firstTimeoutArmed, secondTimeoutArmed])
-    let firstSession = FakeSession()
+    let firstSessionShutdown = expectation(description: "stale launch #1 shutdown")
+    let firstSession = FakeSession(shutdownCalled: firstSessionShutdown)
     let secondSession = FakeSession()
     let host = PieEngineHost(
       launcher: { spec in try await launches.launch(spec) },
@@ -463,6 +469,7 @@ final class PieEngineHostTests: XCTestCase {
     }
     XCTAssertEqual(port, 2002)
     XCTAssertEqual(profileID, "tree-of-thought")
+    wait(for: [firstSessionShutdown], timeout: 1)
     XCTAssertEqual(firstSession.shutdownCount, 1,
                    "stale successful launch must shut down only its own returned session")
     XCTAssertEqual(secondSession.shutdownCount, 0,
