@@ -334,12 +334,13 @@ struct ProfileModelPickerLabel: View {
 
   var body: some View {
     HStack(spacing: 4) {
+      // #462: shared truncation primitive — middle-truncate one line and
+      // fill the slot whose width the outer `.frame` fixes below. The full
+      // id stays inspectable via the `.help`/a11y on the outer frame.
       Text(displayName)
         .monospaced()
         .foregroundStyle(modelID == nil ? .secondary : .primary)
-        .lineLimit(1)
-        .truncationMode(.middle)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .boundedModelName(maxWidth: .infinity)
 
       Image(systemName: "chevron.up.chevron.down")
         .font(.caption)

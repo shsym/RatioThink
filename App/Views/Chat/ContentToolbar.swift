@@ -203,11 +203,16 @@ struct ContentToolbar: View {
     } label: {
       HStack(spacing: 4) {
         Image(systemName: "shippingbox")
+        // #462: bound the title so a long model name truncates rather than
+        // pushing the toolbar past the window edge. No `.fixedSize()` — it
+        // would pin the label non-compressible and re-break layout. The full
+        // id stays inspectable via the menu-level `.help(modelMenuHelp)` +
+        // accessibility value below.
         Text("Model: \(modelMenuTitle)")
+          .boundedModelName()
       }
     }
     .menuStyle(.borderlessButton)
-    .fixedSize()
     .help(modelMenuHelp)
     .accessibilityIdentifier("toolbar.model")
     .accessibilityLabel("Model")

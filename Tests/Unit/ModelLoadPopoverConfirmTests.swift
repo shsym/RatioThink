@@ -54,6 +54,30 @@ final class ModelLoadPopoverConfirmTests: XCTestCase {
     XCTAssertEqual(c.keepIdentifier, "modelLoad.popover.keepLoaded")
   }
 
+  // #462: the confirm copy must name the model by its friendly LEAF, never
+  // the raw `<repo>/<file>` slug — an unbreakable slug token clips the
+  // fixed-width confirm popover. The full id stays in the popover header.
+  func test_loading_confirm_uses_leaf_not_raw_slug() {
+    let slug = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+    let c = try! XCTUnwrap(ModelLoadPopover.destructiveConfirm(for: .loading(
+      modelID: slug, loadedBytes: 0, totalBytes: 0, etaSeconds: nil)))
+    XCTAssertTrue(c.message.contains("Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"),
+                  "confirm must name the model by its leaf; got: \(c.message)")
+    XCTAssertFalse(c.message.contains("bartowski/"),
+                   "confirm must NOT inline the raw repo slug; got: \(c.message)")
+    XCTAssertFalse(c.message.contains(slug),
+                   "confirm must NOT inline the full slug; got: \(c.message)")
+  }
+
+  func test_ready_confirm_uses_leaf_not_raw_slug() {
+    let slug = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+    let c = try! XCTUnwrap(ModelLoadPopover.destructiveConfirm(for: .ready(modelID: slug)))
+    XCTAssertTrue(c.message.contains("Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"),
+                  "confirm must name the model by its leaf; got: \(c.message)")
+    XCTAssertFalse(c.message.contains("bartowski/"),
+                   "confirm must NOT inline the raw repo slug; got: \(c.message)")
+  }
+
   /// The two interrupting actions are distinct affordances, not one
   /// overloaded button.
   func test_loading_and_ready_confirms_are_distinct() {

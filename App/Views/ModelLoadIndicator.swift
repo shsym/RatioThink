@@ -576,10 +576,16 @@ struct ModelLoadPopover: View {
     HStack(spacing: 6) {
       Image(systemName: glyphForState)
         .foregroundStyle(.secondary)
+      // The popover is the designated place to inspect the FULL id: the
+      // headline middle-truncates a long slug so it can't widen the
+      // 280pt popover (#462), and the tooltip + text selection recover
+      // the complete identifier the truncation hides.
       Text(modelID)
         .font(.headline)
         .lineLimit(1)
         .truncationMode(.middle)
+        .help(modelID)
+        .textSelection(.enabled)
     }
   }
 
@@ -728,16 +734,22 @@ struct ModelLoadPopover: View {
   static func destructiveConfirm(for state: ModelLoadCenter.State) -> DestructiveConfirm? {
     switch state {
     case let .loading(modelID, _, _, _):
+      // #462: name the model by its friendly leaf, never the raw
+      // `<repo>/<file>` slug — an unbreakable slug token forces the
+      // fixed-width confirm popover to clip. The full id stays visible
+      // (middle-truncated, copyable) in the popover header.
+      let name = ModelDisplayName.leaf(modelID)
       return DestructiveConfirm(
-        message: "Stop loading \(modelID)? The partial load is discarded. You can start it again anytime.",
+        message: "Stop loading \(name)? The partial load is discarded. You can start it again anytime.",
         confirmTitle: "Stop Loading",
         keepTitle: "Keep Loading",
         confirmIdentifier: "modelLoad.popover.confirmCancel",
         keepIdentifier: "modelLoad.popover.keepLoading"
       )
     case let .ready(modelID):
+      let name = ModelDisplayName.leaf(modelID)
       return DestructiveConfirm(
-        message: "Unload \(modelID)? This frees its memory. The engine keeps running — you'll need to reload the model before your next message.",
+        message: "Unload \(name)? This frees its memory. The engine keeps running — you'll need to reload the model before your next message.",
         confirmTitle: "Unload",
         keepTitle: "Keep Loaded",
         confirmIdentifier: "modelLoad.popover.confirmUnload",
