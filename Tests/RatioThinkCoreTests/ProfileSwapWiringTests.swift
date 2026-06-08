@@ -37,13 +37,15 @@ final class ProfileSwapWiringTests: XCTestCase {
   func test_profileStore_backed_coordinator_fires_popover_on_model_changing_swap() throws {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
-        center: ModelLoadCenter(initialResident: "model-A.gguf"),
+        center: ModelLoadCenter(),
         engine: MockEngineClient(),
         profileStore: store
       )
 
       var committed: String?
-      coord.requestSwap(toProfileID: "beta") { committed = $0 }
+      // #460: the "current model" is the chat's selection passed in, NOT
+      // engine residency — here the chat is on model-A.
+      coord.requestSwap(toProfileID: "beta", fromModel: "model-A.gguf") { profileID, _ in committed = profileID }
 
       XCTAssertNil(committed, "a model-changing swap must wait for confirm, not commit silently")
       let pending = try XCTUnwrap(coord.pending,
@@ -57,36 +59,40 @@ final class ProfileSwapWiringTests: XCTestCase {
   func test_profileStore_backed_coordinator_stays_silent_for_same_model() throws {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
-        center: ModelLoadCenter(initialResident: "model-B.gguf"),
+        center: ModelLoadCenter(),
         engine: MockEngineClient(),
         profileStore: store
       )
       var committed: String?
-      coord.requestSwap(toProfileID: "beta") { committed = $0 }
-      XCTAssertEqual(committed, "beta", "swapping into the already-resident model must stay silent")
+      var preservedModel = true
+      // The chat is already on model-B (beta's default) → silent swap.
+      coord.requestSwap(toProfileID: "beta", fromModel: "model-B.gguf") { profileID, pinModel in
+        committed = profileID
+        preservedModel = (pinModel == nil)
+      }
+      XCTAssertEqual(committed, "beta", "swapping into the already-selected model must stay silent")
+      XCTAssertTrue(preservedModel, "a same-model swap must not pin a new model")
       XCTAssertNil(coord.pending)
     }
   }
 
-  /// : the engine-stopped re-select case. With the engine NOT running,
-  /// nothing is resident (`residentModelID == nil` — the lifecycle clears it
-  /// on the leave-`.running` edge), so the same-model check (`to == nil`) can
-  /// never catch it and the swap used to prompt a meaningless "swap from — to
-  /// X". A profile selection with no resident model to REPLACE must commit
-  /// silently and fire no load.
-  func test_profileStore_backed_coordinator_stays_silent_when_no_model_is_resident() throws {
+  /// #460: the engine-stopped / unpinned re-select case. With no current
+  /// model (`fromModel == nil`) there is nothing to REPLACE, so a swap-confirm
+  /// "swap from — to X" is meaningless. The profile selection commits silently
+  /// and fires no load.
+  func test_profileStore_backed_coordinator_stays_silent_when_no_model_is_selected() throws {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
-        center: ModelLoadCenter(),   // engine stopped → residentModelID == nil
+        center: ModelLoadCenter(),
         engine: MockEngineClient(),
         profileStore: store
       )
       var committed: String?
-      coord.requestSwap(toProfileID: "beta") { committed = $0 }
+      coord.requestSwap(toProfileID: "beta", fromModel: nil) { profileID, _ in committed = profileID }
       XCTAssertEqual(committed, "beta",
-                     "with nothing resident, selecting a profile must commit silently — there is no resident model to replace")
+                     "with no current model, selecting a profile must commit silently — there is nothing to replace")
       XCTAssertNil(coord.pending,
-                   "no swap-confirm popover when the engine is stopped and no model is loaded")
+                   "no swap-confirm popover when there is no current model")
     }
   }
 }

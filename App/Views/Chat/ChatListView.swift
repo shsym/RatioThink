@@ -118,10 +118,17 @@ struct ChatListView: View {
   // MARK: - mutations
 
   private func createChat() {
+    // #460: inherit the active profile + concrete model from the chat the
+    // user was already in, so "New Chat" preserves the same profile/model
+    // context. With no current selection (e.g. first chat) fall back to the
+    // creation defaults.
+    let source = selectedItemID.flatMap { id in chats.first { $0.id == id } }
     if let id = ChatCreation.create(
       in: modelContext,
       persistenceStatus: persistenceStatus,
-      contextLabel: "ChatListView.createChat"
+      contextLabel: "ChatListView.createChat",
+      profileID: source?.profileID ?? "chat",
+      modelID: source?.modelID
     ) {
       selectedItemID = id
     }

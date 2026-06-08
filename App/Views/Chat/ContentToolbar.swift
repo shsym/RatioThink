@@ -23,6 +23,23 @@ struct ContentToolbar: View {
   @ObservedObject var viewModel: ChatTranscriptViewModel
   let availableProfiles: [String]
   let availableModels: [String]
+  /// #460: the chat's persisted selected model (`Chat.modelID`) — the
+  /// single selection authority, read straight through for the label and
+  /// the swap-policy "from model". `nil` ⇒ the chat follows the active
+  /// profile's default (shown via `profileDefaultModel`).
+  let selectedModelID: String?
+  /// #460: the active profile's default model, used to render the label
+  /// when the chat is unpinned and to resolve the effective "from model"
+  /// the swap policy compares against.
+  let profileDefaultModel: String?
+  /// #460: persists a confirmed profile swap (profile + optional pinned
+  /// model) — wired by `ChatScaffoldView`, which owns the SwiftData write.
+  let commitSwap: ProfileSwapCoordinator.SwapCommit
+  /// #460: persists a per-chat model selection — wired by `ChatScaffoldView`.
+  let commitModel: (String) -> Void
+  /// #460: clears the per-chat model pin so the chat follows the profile
+  /// default again ("Use profile default") — wired by `ChatScaffoldView`.
+  let onUseProfileDefault: () -> Void
   /// Swap coordinator. Required — review v1 F9: defaulting this to a
   /// preview-only `previewDefault()` let a forgotten injection at any
   /// call site silently fall through to an orphan coordinator the
@@ -65,6 +82,11 @@ struct ContentToolbar: View {
     viewModel: ChatTranscriptViewModel,
     availableProfiles: [String] = ["chat"],
     availableModels: [String] = ChatTranscriptViewModel.placeholderModels,
+    selectedModelID: String? = nil,
+    profileDefaultModel: String? = nil,
+    commitSwap: @escaping ProfileSwapCoordinator.SwapCommit = { _, _ in },
+    commitModel: @escaping (String) -> Void = { _ in },
+    onUseProfileDefault: @escaping () -> Void = {},
     swapCoordinator: ProfileSwapCoordinator,
     modelLoadCenter: ModelLoadCenter?,
     engineStatus: EngineStatusStore?,
@@ -76,6 +98,11 @@ struct ContentToolbar: View {
     self.viewModel = viewModel
     self.availableProfiles = availableProfiles
     self.availableModels = availableModels
+    self.selectedModelID = selectedModelID
+    self.profileDefaultModel = profileDefaultModel
+    self.commitSwap = commitSwap
+    self.commitModel = commitModel
+    self.onUseProfileDefault = onUseProfileDefault
     self.swapCoordinator = swapCoordinator
     self.modelLoadCenter = modelLoadCenter
     self.engineStatus = engineStatus
@@ -166,28 +193,44 @@ struct ContentToolbar: View {
     }
   }
 
+  /// #460: the chat's effective current model — the explicit pin
+  /// (`selectedModelID`) or, when unpinned, the active profile's default.
+  /// This is the single value the swap policy treats as "the current
+  /// model", so it stays correct whether the model is loaded or loading.
+  private var effectiveModelID: String? {
+    selectedModelID ?? profileDefaultModel
+  }
+
   private var modelMenu: some View {
     Menu {
-      Button("Use profile default") { viewModel.modelOverride = nil }
+      Button("Use profile default") { onUseProfileDefault() }
       Divider()
       ForEach(availableModels, id: \.self) { id in
         // Stored id is the resolvable `<repo>/<file>` slug; show the
         // friendly leaf.
         Button(ModelDisplayName.leaf(id)) {
-          // : route through the confirm gate. Picking a model that
-          // differs from the resident model publishes a swap confirm
-          // (with "Set as default for this profile"); picking the
-          // already-resident model just sets the override, no load.
+          // #460: route through the confirm gate against the chat's EXPLICIT
+          // selection (`selectedModelID` = `Chat.modelID`), NOT the profile
+          // default. Picking a model that differs from the current pin
+          // publishes a swap confirm (with "Set as default for this
+          // profile"); picking the already-selected/resident model just pins
+          // it, no load. The profile default is the PROFILE's model, not the
+          // user's pick, so it must not silence an explicit menu choice —
+          // `reconcileEngineResidentModel` seeds `selectedModelID` to the
+          // served model, so in steady state this equals what is loaded.
+          // `commitModel` persists onto `Chat.modelID`.
           swapCoordinator.requestModelOverride(
             modelID: id,
-            activeProfileID: viewModel.selectedProfileID
-          ) { viewModel.modelOverride = $0 }
+            activeProfileID: viewModel.selectedProfileID,
+            fromModel: selectedModelID,
+            commit: commitModel
+          )
         }
       }
     } label: {
       HStack(spacing: 4) {
         Image(systemName: "shippingbox")
-        Text("Model: \(viewModel.modelOverride.map(ModelDisplayName.leaf) ?? "Profile default")")
+        Text("Model: \(modelMenuLabel)")
       }
     }
     .menuStyle(.borderlessButton)
@@ -195,12 +238,35 @@ struct ContentToolbar: View {
     .accessibilityIdentifier("toolbar.model")
   }
 
+  /// Toolbar model label: the pinned model's leaf, else the profile
+  /// default's leaf, else "Profile default" when the active profile has
+  /// none. #460: reads the persisted authority so it stays stable across a
+  /// profile switch / new chat instead of resetting.
+  private var modelMenuLabel: String {
+    Self.modelLabel(selectedModelID: selectedModelID, profileDefaultModel: profileDefaultModel)
+  }
+
+  /// Pure label derivation (#460) — `internal` (not `private`) so the
+  /// label-stability contract is unit-tested without a view host: the same
+  /// inputs always yield the same friendly leaf, so a preserved selection
+  /// renders an unchanged label across a profile switch / new chat.
+  static func modelLabel(selectedModelID: String?, profileDefaultModel: String?) -> String {
+    if let selectedModelID, !selectedModelID.isEmpty { return ModelDisplayName.leaf(selectedModelID) }
+    if let profileDefaultModel, !profileDefaultModel.isEmpty { return ModelDisplayName.leaf(profileDefaultModel) }
+    return "Profile default"
+  }
+
   // MARK: - swap helpers
 
   private func selectProfile(_ id: String) {
+    // #460: compare against the chat's CURRENT model (`effectiveModelID`),
+    // not engine residency. `commitSwap` persists the profile and — only on
+    // a confirm-and-switch — the new pinned model; a silent swap preserves
+    // the current model (`pinModel == nil`).
     swapCoordinator.requestSwap(
       toProfileID: id,
-      commit: { committed in viewModel.selectedProfileID = committed }
+      fromModel: effectiveModelID,
+      commit: commitSwap
     )
   }
 

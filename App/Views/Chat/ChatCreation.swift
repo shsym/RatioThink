@@ -11,13 +11,22 @@ enum ChatCreation {
   /// Insert and persist a new chat, returning its id. On a save failure
   /// the insert is rolled back, the error is reported, and `nil` is
   /// returned so the caller leaves selection untouched.
+  ///
+  /// #460: a new chat INHERITS the active profile + concrete model from the
+  /// chat the user was already in, so "New Chat" keeps the same
+  /// profile/model context instead of resetting to the bare `"chat"`
+  /// default. Callers pass the source chat's `profileID` / `modelID`; the
+  /// defaults (used by the zero-state CTA, which has no source chat) match
+  /// the old `Chat()` behavior.
   @MainActor
   static func create(
     in context: ModelContext,
     persistenceStatus: PersistenceStatus,
-    contextLabel: String
+    contextLabel: String,
+    profileID: String = "chat",
+    modelID: String? = nil
   ) -> UUID? {
-    let chat = Chat()
+    let chat = Chat(profileID: profileID, modelID: modelID)
     context.insert(chat)
     do {
       try context.save()

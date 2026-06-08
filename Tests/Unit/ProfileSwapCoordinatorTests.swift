@@ -2,11 +2,14 @@ import XCTest
 import Combine
 @testable import RatioThink
 
-/// : same-model = silent, cross-model = popover (always confirmed —
-/// the per-model skip-set is gone). Model overrides go through
-/// `requestModelOverride` and offer "Set as default for this profile".
-/// Preserves the review v1/v2/v3 invariants: F3 (re-entrancy), F4
-/// (source-of-truth + atomic state + token-checked confirm/cancel), F5
+/// #460: the swap policy keys on the chat's CURRENT model SELECTION (passed
+/// in as `fromModel` — the single source of truth `Chat.modelID` resolved
+/// through the profile default), NOT engine residency. Same-model = silent;
+/// no-target-default = silent + PRESERVE the current model; cross-model =
+/// popover (confirm switches + pins the new model, cancel keeps the current
+/// one). Model overrides go through `requestModelOverride` and offer "Set as
+/// default for this profile". Preserves the review v1/v2/v3 invariants: F3
+/// (re-entrancy), F4 (atomic state + token-checked confirm/cancel), F5
 /// (loadDirect short-circuit), F8 (no-pending no-op).
 @MainActor
 final class ProfileSwapCoordinatorTests: XCTestCase {
@@ -19,6 +22,19 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
   private final class DefaultWriteSpy {
     var writes: [(profileID: String, model: String)] = []
     var errorToThrow: Error?
+  }
+
+  /// Captures what a swap/override commit wrote, so the preserve-vs-pin
+  /// decision is observable (#460).
+  private final class CommitSpy {
+    /// Profile committed by a `requestSwap` commit.
+    var swappedProfile: String?
+    /// Model pinned by a `requestSwap` commit. `nil` ⇒ "preserve current
+    /// model" (the no-default / silent path); non-nil ⇒ switch-and-pin.
+    var pinnedModel: String?
+    var swapCommitCount = 0
+    /// Model set by a `requestModelOverride` commit.
+    var overrodeModel: String?
   }
 
   private struct StubWriteError: Error {}
@@ -59,6 +75,15 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     return (coord, center, spy)
   }
 
+  /// A `requestSwap` commit bound to a `CommitSpy`.
+  private func swapCommit(_ spy: CommitSpy) -> ProfileSwapCoordinator.SwapCommit {
+    { profileID, pinModel in
+      spy.swapCommitCount += 1
+      spy.swappedProfile = profileID
+      spy.pinnedModel = pinModel
+    }
+  }
+
   private func confirmCurrent(_ coord: ProfileSwapCoordinator, setAsDefault: Bool = false) {
     guard let token = coord.pending?.id else {
       return XCTFail("confirmCurrent called without a pending swap")
@@ -71,46 +96,75 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     coord.cancel(token: token)
   }
 
-  // MARK: - silent paths (no load without confirm)
+  // MARK: - AC1: no-target-default swap PRESERVES the current model
 
-  func test_unknown_target_model_commits_silently_and_fires_no_load() {
+  func test_no_target_default_commits_profile_silently_and_preserves_model() {
+    // Profile "next" has no default; the chat is currently on "m1". The swap
+    // must commit the profile, fire NO load, and leave the model untouched
+    // (`pinModel == nil`) so the user keeps the concrete model they had.
     let (coord, center, _) = makeCoordinator(map: ["next": nil], resident: "m1")
-    var committed: String?
-
-    coord.requestSwap(toProfileID: "next") { committed = $0 }
-    XCTAssertEqual(committed, "next")
+    let spy = CommitSpy()
+    coord.requestSwap(toProfileID: "next", fromModel: "m1", commit: swapCommit(spy))
+    XCTAssertEqual(spy.swappedProfile, "next")
+    XCTAssertNil(spy.pinnedModel, "no-default swap must PRESERVE the current model (no pin)")
     XCTAssertNil(coord.pending)
     XCTAssertEqual(center.state, .ready(modelID: "m1"),
-                   "unknown target model: no load fires, resident stays put (no deferred silent load)")
+                   "no-default swap: no load fires, current model stays put")
   }
 
-  func test_same_model_as_resident_commits_silently_and_skips_popover() {
+  func test_no_target_default_preserves_a_currently_loading_model() {
+    // AC1 "whether already loaded or currently loading": the chat is loading
+    // "m1" (fromModel = the loading target, residency still nil). A no-default
+    // swap must still preserve it silently and not disturb the load.
+    let (coord, _, _) = makeCoordinator(map: ["next": nil])
+    let spy = CommitSpy()
+    coord.requestSwap(toProfileID: "next", fromModel: "m1-loading", commit: swapCommit(spy))
+    XCTAssertEqual(spy.swappedProfile, "next")
+    XCTAssertNil(spy.pinnedModel, "a loading model is the current model and must be preserved")
+    XCTAssertNil(coord.pending)
+  }
+
+  // MARK: - silent paths
+
+  func test_same_model_as_selection_commits_silently_and_skips_popover() {
     let (coord, center, _) = makeCoordinator(map: ["next": "m1"], resident: "m1")
-    var committed: String?
-    coord.requestSwap(toProfileID: "next") { committed = $0 }
-    XCTAssertEqual(committed, "next")
+    let spy = CommitSpy()
+    coord.requestSwap(toProfileID: "next", fromModel: "m1", commit: swapCommit(spy))
+    XCTAssertEqual(spy.swappedProfile, "next")
+    XCTAssertNil(spy.pinnedModel)
     XCTAssertNil(coord.pending)
     XCTAssertEqual(center.state, .ready(modelID: "m1"), "same model: load must not fire")
   }
 
-  ///  inferlet-only invariant: a profile whose model equals the
-  /// resident model (only inferlet/sampling/system-prompt differ) must
-  /// NOT confirm or load. The coordinator keys on model identity, so a
-  /// same-model swap is silent regardless of other profile fields.
+  ///  inferlet-only invariant: a profile whose default equals the current
+  /// model (only inferlet/sampling/system-prompt differ) must NOT confirm or
+  /// load. The coordinator keys on model identity.
   func test_same_model_different_inferlet_does_not_confirm_or_load() {
     let (coord, center, _) = makeCoordinator(map: ["docs": "m1"], resident: "m1")
-    coord.requestSwap(toProfileID: "docs") { _ in }
+    coord.requestSwap(toProfileID: "docs", fromModel: "m1") { _, _ in }
     XCTAssertNil(coord.pending, "an inferlet-only change (same model) must not raise the confirm")
     XCTAssertEqual(center.state, .ready(modelID: "m1"), "an inferlet-only change must not load")
   }
 
-  // MARK: - cross-model profile swap
+  func test_no_current_model_commits_silently_no_popover() {
+    // Policy 1.5: with no current model (`fromModel == nil`) there is nothing
+    // to REPLACE, so the selection commits silently and fires NO load.
+    let (coord, center, _) = makeCoordinator(map: ["next": "m2"])  // engine stopped, nothing selected
+    let spy = CommitSpy()
+    coord.requestSwap(toProfileID: "next", fromModel: nil, commit: swapCommit(spy))
+    XCTAssertEqual(spy.swappedProfile, "next")
+    XCTAssertNil(spy.pinnedModel)
+    XCTAssertNil(coord.pending, "no current model → silent swap, no confirm popover")
+    XCTAssertEqual(center.state, .idle, "no current model: no load fires")
+  }
+
+  // MARK: - AC2: different-target-default swap PROMPTS
 
   func test_cross_model_publishes_pending_without_set_as_default() {
     let (coord, _, _) = makeCoordinator(map: ["next": "m2"], resident: "m1")
-    var committed: String?
-    coord.requestSwap(toProfileID: "next") { committed = $0 }
-    XCTAssertNil(committed, "swap must wait for confirm()")
+    let spy = CommitSpy()
+    coord.requestSwap(toProfileID: "next", fromModel: "m1", commit: swapCommit(spy))
+    XCTAssertEqual(spy.swapCommitCount, 0, "swap must wait for confirm()")
     guard let pending = coord.pending else { return XCTFail("expected pending swap") }
     XCTAssertEqual(pending.toProfileID, "next")
     XCTAssertEqual(pending.fromModelID, "m1")
@@ -119,13 +173,28 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
                    "a profile swap loads the profile's stored default — 'set as default' would be a no-op")
   }
 
-  func test_confirm_commits_swap_and_kicks_off_load() async throws {
+  /// AC2 loading-aware (scenario 4): switching to a profile whose default
+  /// differs from the model the chat is CURRENTLY LOADING must still prompt.
+  /// Pre-#460 this read engine residency (nil during a load) and silently
+  /// skipped the popover.
+  func test_cross_model_prompts_even_while_a_model_is_loading() {
+    let (coord, _, _) = makeCoordinator(map: ["next": "m2"])  // nothing resident yet
+    coord.requestSwap(toProfileID: "next", fromModel: "m1-loading") { _, _ in }
+    guard let pending = coord.pending else {
+      return XCTFail("a differing default must prompt even when the current model is still loading")
+    }
+    XCTAssertEqual(pending.fromModelID, "m1-loading")
+    XCTAssertEqual(pending.toModelID, "m2")
+  }
+
+  func test_confirm_commits_swap_pins_new_model_and_kicks_off_load() async throws {
     let (coord, center, _) = makeCoordinator(map: ["next": "m2"], resident: "m1")
-    var committed: String?
-    coord.requestSwap(toProfileID: "next") { committed = $0 }
+    let spy = CommitSpy()
+    coord.requestSwap(toProfileID: "next", fromModel: "m1", commit: swapCommit(spy))
 
     confirmCurrent(coord)
-    XCTAssertEqual(committed, "next")
+    XCTAssertEqual(spy.swappedProfile, "next")
+    XCTAssertEqual(spy.pinnedModel, "m2", "confirm-and-switch must PIN the new model on the chat")
     XCTAssertNil(coord.pending)
 
     await waitUntil(timeout: 2.0) {
@@ -136,22 +205,24 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertEqual(center.residentModelID, "m2")
   }
 
-  func test_cancel_clears_pending_and_does_not_commit() {
+  func test_cancel_keeps_current_model_and_does_not_commit() {
+    // AC2 decline: cancelling the "Switch model?" popover keeps the current
+    // model — no commit (profile + model both unchanged), no load.
     let (coord, center, _) = makeCoordinator(map: ["next": "m2"], resident: "m1")
-    var committed: String?
-    coord.requestSwap(toProfileID: "next") { committed = $0 }
+    let spy = CommitSpy()
+    coord.requestSwap(toProfileID: "next", fromModel: "m1", commit: swapCommit(spy))
     cancelCurrent(coord)
     XCTAssertNil(coord.pending)
-    XCTAssertNil(committed)
-    XCTAssertEqual(center.state, .ready(modelID: "m1"))
+    XCTAssertEqual(spy.swapCommitCount, 0, "decline must not commit the swap")
+    XCTAssertEqual(center.state, .ready(modelID: "m1"), "decline keeps the current model — no load")
   }
 
-  // MARK: - model override + set-as-default ( step 5)
+  // MARK: - model override + set-as-default
 
   func test_model_override_different_model_publishes_pending_with_set_as_default() {
     let (coord, _, _) = makeCoordinator(map: [:], resident: "m1")
     var committed: String?
-    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat") { committed = $0 }
+    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat", fromModel: "m1") { committed = $0 }
     XCTAssertNil(committed, "override must wait for confirm()")
     guard let pending = coord.pending else { return XCTFail("expected pending override") }
     XCTAssertEqual(pending.toModelID, "m2")
@@ -159,22 +230,22 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertTrue(pending.canSetAsDefault, "a model override must offer 'set as default for this profile'")
   }
 
-  func test_model_override_same_as_resident_is_silent_with_no_load() {
+  func test_model_override_same_as_selection_is_silent_with_no_load() {
     let (coord, center, _) = makeCoordinator(map: [:], resident: "m1")
     var committed: String?
-    coord.requestModelOverride(modelID: "m1", activeProfileID: "chat") { committed = $0 }
-    XCTAssertEqual(committed, "m1", "picking the already-resident model just sets the override")
+    coord.requestModelOverride(modelID: "m1", activeProfileID: "chat", fromModel: "m1") { committed = $0 }
+    XCTAssertEqual(committed, "m1", "picking the already-selected model just pins it")
     XCTAssertNil(coord.pending)
-    XCTAssertEqual(center.state, .ready(modelID: "m1"), "no reload for the already-resident model")
+    XCTAssertEqual(center.state, .ready(modelID: "m1"), "no reload for the already-selected model")
   }
 
   func test_confirm_override_with_set_as_default_persists_model_onto_profile() async throws {
     let (coord, center, spy) = makeCoordinator(map: [:], resident: "m1")
     var committed: String?
-    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat") { committed = $0 }
+    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat", fromModel: "m1") { committed = $0 }
     confirmCurrent(coord, setAsDefault: true)
 
-    XCTAssertEqual(committed, "m2", "commit sets the per-chat override to the picked model")
+    XCTAssertEqual(committed, "m2", "commit pins the per-chat model to the picked model")
     XCTAssertEqual(spy.writes.count, 1)
     XCTAssertEqual(spy.writes.first?.profileID, "chat")
     XCTAssertEqual(spy.writes.first?.model, "m2")
@@ -187,7 +258,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
 
   func test_confirm_override_without_set_as_default_does_not_persist() async throws {
     let (coord, center, spy) = makeCoordinator(map: [:], resident: "m1")
-    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat") { _ in }
+    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat", fromModel: "m1") { _ in }
     confirmCurrent(coord, setAsDefault: false)
 
     XCTAssertTrue(spy.writes.isEmpty, "unchecked 'set as default' must not persist a profile default")
@@ -201,7 +272,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
   func test_confirm_setAsDefault_write_failure_is_surfaced_and_load_still_proceeds() async {
     let (coord, center, _) = makeCoordinator(map: [:], resident: "m1",
                                              setDefaultModelError: StubWriteError())
-    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat") { _ in }
+    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat", fromModel: "m1") { _ in }
     confirmCurrent(coord, setAsDefault: true)
 
     XCTAssertNotNil(coord.defaultModelWriteError,
@@ -217,7 +288,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
   func test_set_as_default_error_clears_when_user_moves_on() {
     let (coord, _, _) = makeCoordinator(map: [:], resident: "m1",
                                         setDefaultModelError: StubWriteError())
-    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat") { _ in }
+    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat", fromModel: "m1") { _ in }
     confirmCurrent(coord, setAsDefault: true)
     XCTAssertNotNil(coord.defaultModelWriteError)
 
@@ -231,7 +302,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
   func test_acknowledge_clears_set_as_default_error() {
     let (coord, _, _) = makeCoordinator(map: [:], resident: "m1",
                                         setDefaultModelError: StubWriteError())
-    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat") { _ in }
+    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat", fromModel: "m1") { _ in }
     confirmCurrent(coord, setAsDefault: true)
     XCTAssertNotNil(coord.defaultModelWriteError)
 
@@ -240,7 +311,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
   }
 
   //  review v3 F2: regression guards for the remaining clear sites
-  // (requestSwap, requestModelOverride already-resident, cancel,
+  // (requestSwap, requestModelOverride already-selected, cancel,
   // dismissCurrentPending) so a future edit can't reintroduce a stale
   // toolbar error.
 
@@ -252,7 +323,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
   ) -> (ProfileSwapCoordinator, ModelLoadCenter) {
     let (coord, center, _) = makeCoordinator(map: map, resident: resident,
                                              setDefaultModelError: StubWriteError())
-    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat") { _ in }
+    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat", fromModel: "m1") { _ in }
     confirmCurrent(coord, setAsDefault: true)
     return (coord, center)
   }
@@ -260,25 +331,25 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
   func test_requestSwap_clears_stale_set_as_default_error() {
     let (coord, _) = coordinatorWithSurfacedWriteError(map: ["next": "zzz"])
     XCTAssertNotNil(coord.defaultModelWriteError)
-    coord.requestSwap(toProfileID: "next") { _ in }
+    coord.requestSwap(toProfileID: "next", fromModel: "m2") { _, _ in }
     XCTAssertNil(coord.defaultModelWriteError, "a fresh profile swap must clear the stale error")
   }
 
-  func test_requestModelOverride_already_resident_clears_stale_error() async {
+  func test_requestModelOverride_already_selected_clears_stale_error() async {
     let (coord, center) = coordinatorWithSurfacedWriteError()
     XCTAssertNotNil(coord.defaultModelWriteError)
     await waitUntil(timeout: 2.0) { center.residentModelID == "m2" }
-    // Re-selecting the now-resident model hits the already-resident
-    // early return, which must still clear the stale error.
-    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat") { _ in }
-    XCTAssertNil(coord.pending, "selecting the resident model is a silent no-op")
+    // Re-selecting the now-current model hits the already-selected early
+    // return, which must still clear the stale error.
+    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat", fromModel: "m2") { _ in }
+    XCTAssertNil(coord.pending, "selecting the current model is a silent no-op")
     XCTAssertNil(coord.defaultModelWriteError)
   }
 
   func test_cancel_leaves_no_stale_set_as_default_error() {
     let (coord, _) = coordinatorWithSurfacedWriteError(map: ["next": "zzz"])
     XCTAssertNotNil(coord.defaultModelWriteError)
-    coord.requestSwap(toProfileID: "next") { _ in }
+    coord.requestSwap(toProfileID: "next", fromModel: "m2") { _, _ in }
     cancelCurrent(coord)
     XCTAssertNil(coord.defaultModelWriteError, "no stale error must survive a cancel flow")
   }
@@ -286,14 +357,14 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
   func test_dismissCurrentPending_leaves_no_stale_set_as_default_error() {
     let (coord, _) = coordinatorWithSurfacedWriteError(map: ["next": "zzz"])
     XCTAssertNotNil(coord.defaultModelWriteError)
-    coord.requestSwap(toProfileID: "next") { _ in }
+    coord.requestSwap(toProfileID: "next", fromModel: "m2") { _, _ in }
     coord.dismissCurrentPending()
     XCTAssertNil(coord.defaultModelWriteError, "no stale error must survive a dismiss flow")
   }
 
   func test_confirm_setAsDefault_success_clears_write_error() {
     let (coord, _, spy) = makeCoordinator(map: [:], resident: "m1")
-    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat") { _ in }
+    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat", fromModel: "m1") { _ in }
     confirmCurrent(coord, setAsDefault: true)
     XCTAssertNil(coord.defaultModelWriteError)
     XCTAssertEqual(spy.writes.count, 1)
@@ -303,7 +374,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     // A profile swap pending has no set-as-default target; even if a
     // caller passes setAsDefault: true, nothing is persisted.
     let (coord, _, spy) = makeCoordinator(map: ["next": "m2"], resident: "m1")
-    coord.requestSwap(toProfileID: "next") { _ in }
+    coord.requestSwap(toProfileID: "next", fromModel: "m1") { _, _ in }
     confirmCurrent(coord, setAsDefault: true)
     XCTAssertTrue(spy.writes.isEmpty, "profile swap must never persist a default — the model already is the profile's default")
   }
@@ -312,41 +383,42 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
 
   func test_reentrant_requestSwap_cancels_prior_and_publishes_new_pending() {
     let (coord, _, _) = makeCoordinator(map: ["b": "m_b", "c": "m_c"], resident: "m_a")
-    var firstCommitted: String?
-    var secondCommitted: String?
-    coord.requestSwap(toProfileID: "b") { firstCommitted = $0 }
-    coord.requestSwap(toProfileID: "c") { secondCommitted = $0 }
+    let first = CommitSpy()
+    let second = CommitSpy()
+    coord.requestSwap(toProfileID: "b", fromModel: "m_a", commit: swapCommit(first))
+    coord.requestSwap(toProfileID: "c", fromModel: "m_a", commit: swapCommit(second))
 
-    XCTAssertNil(firstCommitted, "first commit must NOT fire — superseded")
-    XCTAssertNil(secondCommitted, "second commit waits for confirm()")
+    XCTAssertEqual(first.swapCommitCount, 0, "first commit must NOT fire — superseded")
+    XCTAssertEqual(second.swapCommitCount, 0, "second commit waits for confirm()")
     XCTAssertEqual(coord.pending?.toProfileID, "c")
     XCTAssertEqual(coord.pending?.toModelID, "m_c")
 
     confirmCurrent(coord)
-    XCTAssertNil(firstCommitted, "even after confirm, the older commit must stay dropped")
-    XCTAssertEqual(secondCommitted, "c")
+    XCTAssertEqual(first.swapCommitCount, 0, "even after confirm, the older commit must stay dropped")
+    XCTAssertEqual(second.swappedProfile, "c")
+    XCTAssertEqual(second.pinnedModel, "m_c")
   }
 
   // MARK: - review v2 F4: token-checked confirm/cancel
 
   func test_stale_confirm_token_from_superseded_swap_is_dropped() {
     let (coord, _, _) = makeCoordinator(map: ["b": "m_b", "c": "m_c"], resident: "m_a")
-    var firstCommitted: String?
-    var secondCommitted: String?
-    coord.requestSwap(toProfileID: "b") { firstCommitted = $0 }
+    let first = CommitSpy()
+    let second = CommitSpy()
+    coord.requestSwap(toProfileID: "b", fromModel: "m_a", commit: swapCommit(first))
     let staleToken = coord.pending!.id
-    coord.requestSwap(toProfileID: "c") { secondCommitted = $0 }
+    coord.requestSwap(toProfileID: "c", fromModel: "m_a", commit: swapCommit(second))
     coord.confirm(token: staleToken, setAsDefault: false)
-    XCTAssertNil(firstCommitted, "stale token must NOT commit superseded swap")
-    XCTAssertNil(secondCommitted, "stale token must NOT commit current swap either")
+    XCTAssertEqual(first.swapCommitCount, 0, "stale token must NOT commit superseded swap")
+    XCTAssertEqual(second.swapCommitCount, 0, "stale token must NOT commit current swap either")
     XCTAssertEqual(coord.pending?.toProfileID, "c", "current pending stays put")
   }
 
   func test_stale_cancel_token_does_not_clobber_current_pending() {
     let (coord, _, _) = makeCoordinator(map: ["b": "m_b", "c": "m_c"], resident: "m_a")
-    coord.requestSwap(toProfileID: "b") { _ in }
+    coord.requestSwap(toProfileID: "b", fromModel: "m_a") { _, _ in }
     let staleToken = coord.pending!.id
-    coord.requestSwap(toProfileID: "c") { _ in }
+    coord.requestSwap(toProfileID: "c", fromModel: "m_a") { _, _ in }
     coord.cancel(token: staleToken)
     XCTAssertEqual(coord.pending?.toProfileID, "c", "stale cancel must NOT clear the new pending")
   }
@@ -355,7 +427,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
 
   func test_reentry_does_not_publish_transient_nil_pending() {
     let (coord, _, _) = makeCoordinator(map: ["b": "m_b", "c": "m_c"], resident: "m_a")
-    coord.requestSwap(toProfileID: "b") { _ in }
+    coord.requestSwap(toProfileID: "b", fromModel: "m_a") { _, _ in }
     let priorID = coord.pending?.id
     XCTAssertNotNil(priorID)
 
@@ -363,7 +435,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     let cancellable = coord.$pending.sink { observed.append($0?.id) }
     defer { cancellable.cancel() }
 
-    coord.requestSwap(toProfileID: "c") { _ in }
+    coord.requestSwap(toProfileID: "c", fromModel: "m_a") { _, _ in }
 
     let transitions = Array(observed.dropFirst())
     XCTAssertFalse(transitions.contains(nil),
@@ -372,30 +444,19 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertNotEqual(coord.pending?.id, priorID, "token must rotate on re-entry")
   }
 
-  // MARK: - review v1 F4: from-source-of-truth
+  // MARK: - #460 single source of truth: from-model is the PASSED selection
 
-  func test_from_model_comes_from_resident_only_not_profile_map() {
+  func test_from_model_is_the_passed_selection_not_engine_residency() {
+    // The coordinator must compare against the SELECTION the caller passes,
+    // independent of what the engine has resident.
     let (coord, _, _) = makeCoordinator(
-      map: ["current": "m_claimed", "next": "m_target"],
-      resident: "m_real"
+      map: ["next": "m_target"],
+      resident: "m_resident_differs"
     )
-    coord.requestSwap(toProfileID: "next") { _ in }
-    XCTAssertEqual(coord.pending?.fromModelID, "m_real")
+    coord.requestSwap(toProfileID: "next", fromModel: "m_selected") { _, _ in }
+    XCTAssertEqual(coord.pending?.fromModelID, "m_selected",
+                   "policy keys on the passed selection, not engine residency")
     XCTAssertEqual(coord.pending?.toModelID, "m_target")
-  }
-
-  func test_no_resident_yet_commits_silently_no_popover() {
-    // Policy 1.5 (`ProfileSwapCoordinator.requestSwap`): with nothing
-    // resident there is no model to REPLACE, so a swap-confirm popover is
-    // meaningless. The selection commits silently and fires NO load — the
-    // model loads later through the normal start gate. Mirrors the sibling
-    // silent-swap tests above.
-    let (coord, center, _) = makeCoordinator(map: ["next": "m2"])  // no resident
-    var committed: String?
-    coord.requestSwap(toProfileID: "next") { committed = $0 }
-    XCTAssertEqual(committed, "next")
-    XCTAssertNil(coord.pending, "no resident → silent swap, no confirm popover")
-    XCTAssertEqual(center.state, .idle, "no resident: no load fires")
   }
 
   // MARK: - review v1 F5: loadDirect short-circuit (used by the no-model prompt's Load)
@@ -428,7 +489,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
 
   func test_dismissal_after_confirm_is_idempotent() async throws {
     let (coord, center, _) = makeCoordinator(map: ["next": "m2"], resident: "m1")
-    coord.requestSwap(toProfileID: "next") { _ in }
+    coord.requestSwap(toProfileID: "next", fromModel: "m1") { _, _ in }
     confirmCurrent(coord)
     coord.dismissCurrentPending()
     XCTAssertNil(coord.pending)

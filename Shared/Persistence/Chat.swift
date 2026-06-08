@@ -23,6 +23,16 @@ public final class Chat {
   /// profile store, and the profile catalog rebuilds on the fly
   /// anyway, so a stale id just falls back to defaults at chat-open.
   public var profileID: String
+  /// #460: the chat's SELECTED model — the single authority for "what
+  /// model is this chat using". `nil` means "follow the active profile's
+  /// default" (late-bound); a non-nil value is an explicit, preserved
+  /// pin. Persisted per-chat so a profile switch / new chat keeps the
+  /// concrete model instead of resetting to a profile default, and so
+  /// the toolbar's selection survives navigation + relaunch (mirrors how
+  /// `profileID` already travels with the chat). Optional + nil-default
+  /// so this is an additive, reversible SwiftData lightweight migration —
+  /// older stores decode with `modelID == nil`.
+  public var modelID: String?
   public var createdAt: Date
   public var updatedAt: Date
   public var pinned: Bool
@@ -38,6 +48,7 @@ public final class Chat {
     id: UUID = UUID(),
     title: String = "New Chat",
     profileID: String = "chat",
+    modelID: String? = nil,
     createdAt: Date = Date(),
     updatedAt: Date? = nil,
     pinned: Bool = false
@@ -45,6 +56,7 @@ public final class Chat {
     self.id = id
     self.title = title
     self.profileID = profileID
+    self.modelID = modelID
     self.createdAt = createdAt
     self.updatedAt = updatedAt ?? createdAt
     self.pinned = pinned
