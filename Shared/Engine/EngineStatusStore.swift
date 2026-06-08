@@ -231,7 +231,22 @@ public final class EngineStatusStore: ObservableObject {
   /// profile; any `.alreadyRunning` that escapes that contract is a
   /// failed rebuild and must surface to the caller.
   public func restartEngine(profileID: String) async throws {
-    try await client.restartEngine(profileID: profileID)
+    do {
+      try await client.restartEngine(profileID: profileID)
+    } catch let error as AppXPCClientError {
+      // The helper only replies after the rebuild's cold-boot handshake.
+      // A boot slower than the App reply window is NOT a reload failure —
+      // the restart is in flight and the status poll surfaces the real
+      // `.running`/`.failed` outcome (#459 repro 2). Mirror `startEngine`'s
+      // in-flight swallow so a slow large-model reload is never reported to
+      // the caller as a failed reload. A real helper `EngineError`
+      // (resolver rejected, modelMissing, …) still propagates.
+      if case .replyTimeout = error {
+        Self.log.notice("restartEngine(profileID=\(profileID, privacy: .public)) reply timed out — rebuild in flight; status poll will surface the outcome")
+        return
+      }
+      throw error
+    }
   }
 
   /// Test seam: invoked with the human-readable cause whenever a

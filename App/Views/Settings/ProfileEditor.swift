@@ -22,12 +22,27 @@ struct ProfileEditor: View {
   /// Guardrail policy (ceiling), shown in the "exceeds …" reason on
   /// over-limit options. `nil` until the first scan.
   @State private var memoryPolicy: ModelMemoryGuardrail.Policy?
+  /// Failure of the DEFAULT-MODEL SAVE itself (`ProfileStore.setModel`).
+  /// Kept strictly separate from an engine reload failure (#459 repro 2):
+  /// a saved default must never be reported as "couldn't save" just because
+  /// the engine rebuild that follows it failed. Short, single-line copy.
   @State private var modelWriteError: String?
   /// Set when the model scan throws. Without this the picker silently
   /// rendered empty on a scan failure, so a permission glitch on the
   /// models dir looked like "no models installed". Mirrors
   /// `ModelsSettingsTab`'s `scanError` surfacing.
   @State private var modelScanError: String?
+  /// Lifecycle of the post-save engine rebuild (#459 repro 2/3). The save
+  /// already succeeded; this tracks the SEPARATE reload so the route shows a
+  /// loading indicator while the engine restarts and surfaces any failure in
+  /// a bounded banner — never as layout-breaking inline error text.
+  @State private var engineReload: EngineReloadState = .idle
+
+  enum EngineReloadState: Equatable {
+    case idle
+    case reloading
+    case failed(String)
+  }
 
   var body: some View {
     ScrollView {
@@ -82,7 +97,9 @@ struct ProfileEditor: View {
           .font(.callout)
           .foregroundStyle(.red)
           .frame(maxWidth: .infinity, alignment: .leading)
+          .accessibilityIdentifier("ProfileEditorModelWriteError")
       }
+      engineReloadStatus
       if let modelScanError {
         Text(modelScanError)
           .font(.callout)
@@ -262,6 +279,9 @@ struct ProfileEditor: View {
 
   private func persistModel(_ model: String, profileID: String) {
     guard model != entry.profile?.model else { return }
+    // Fresh interaction — clear any prior reload banner so a new save's
+    // outcome can't read against a stale one.
+    engineReload = .idle
     do {
       try profileStore.setModel(model, forProfileID: profileID)
       modelWriteError = nil
@@ -278,14 +298,56 @@ struct ProfileEditor: View {
   /// model registry contains the newly selected model. Without this,
   /// `/v1/models/load` keeps rejecting the fresh slug as
   /// `model_not_found` until the user restarts the whole product.
+  ///
+  /// The default-model SAVE has already succeeded by the time this runs
+  /// (#459 repro 2): a reload failure is reported on its own
+  /// `engineReload` channel — never folded back into `modelWriteError`,
+  /// which would mislabel a saved default as a failed save. The route shows
+  /// a loading indicator while the rebuild is in flight (#459 repro 3) and a
+  /// bounded banner if it fails (#459 acceptance: stable surface, no
+  /// layout-breaking inline text).
   private func restartActiveEngineIfNeeded(profileID: String) {
     guard profileStore.activeProfileID == profileID else { return }
+    engineReload = .reloading
     Task { @MainActor in
       do {
         try await engineStatusStore.restartEngine(profileID: profileID)
+        engineReload = .idle
       } catch {
-        modelWriteError = "Default saved, but couldn’t reload the engine: \(error)"
+        engineReload = .failed(Self.engineReloadMessage(error))
       }
+    }
+  }
+
+  /// Human, fault-domain-correct copy for a failed post-save engine reload.
+  /// Frames the save as done and the reload as the failed step.
+  static func engineReloadMessage(_ error: Error) -> String {
+    if let e = error as? EngineError {
+      return "The new default was saved, but the engine couldn’t reload: \(e.message)"
+    }
+    return "The new default was saved, but the engine couldn’t reload: \(error)"
+  }
+
+  /// Loading indicator (rebuild in flight) / bounded failure banner for the
+  /// post-save engine reload. Idle renders nothing.
+  @ViewBuilder
+  private var engineReloadStatus: some View {
+    switch engineReload {
+    case .idle:
+      EmptyView()
+    case .reloading:
+      HStack(spacing: 8) {
+        ProgressView().controlSize(.small)
+        Text("Reloading the engine with the new default model…")
+          .font(.callout)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .accessibilityIdentifier("ProfileEditorEngineReloading")
+    case .failed(let message):
+      EngineFailureBanner(message: message, onDismiss: { engineReload = .idle })
+        .accessibilityIdentifier("ProfileEditorEngineReloadFailed")
     }
   }
 

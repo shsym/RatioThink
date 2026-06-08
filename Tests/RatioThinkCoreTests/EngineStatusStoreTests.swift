@@ -328,6 +328,43 @@ final class EngineStatusStoreTests: XCTestCase {
     }
   }
 
+  /// #459 repro 2: a rebuild whose cold boot outlasts the App reply window
+  /// is in flight, not a failed reload. `restartEngine` must swallow
+  /// `.replyTimeout` so a slow large-model reload is never reported to the
+  /// caller (ProfileEditor) as a reload failure; the status poll surfaces the
+  /// real outcome.
+  func test_restartEngine_swallows_reply_timeout_as_in_flight() async throws {
+    let client = StubXPCClient()
+    client.setRestartResult(.failure(
+      AppXPCClientError.replyTimeout(selector: "restartEngine", timeout: 85.0)))
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(port: 51234, profileID: "chat")
+    )
+    try await store.restartEngine(profileID: "chat")  // must NOT throw
+    XCTAssertEqual(client.restartCalls, 1)
+  }
+
+  /// A real helper `EngineError` (resolver rejected, modelMissing, …) still
+  /// propagates so ProfileEditor can surface the reason in its banner.
+  func test_restartEngine_propagates_real_failure() async {
+    let client = StubXPCClient()
+    client.setRestartResult(.failure(
+      EngineError(code: .modelMissing, message: "still missing")))
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(port: 51234, profileID: "chat")
+    )
+    do {
+      try await store.restartEngine(profileID: "chat")
+      XCTFail("a real restart failure must throw so the UI can surface the reason")
+    } catch let e as EngineError {
+      XCTAssertEqual(e.code, .modelMissing)
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
+  }
+
   // MARK: - initial state
 
   func test_initial_status_is_starting_until_first_poll() {
