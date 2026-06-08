@@ -22,9 +22,11 @@ final class ComposerTextViewGeometryTests: XCTestCase {
   /// Mirrors the geometry-relevant part of
   /// `ComposerTextEditor.installSubmitTextView`: a `SubmitNSTextView` built
   /// from the container `scrollableTextView()` vends, installed as the scroll
-  /// view's documentView. A realistic width is set so a short word lays out as
-  /// a single line (the seed frame is 0-width). Returns the seed frame height
-  /// the bare view is clamped to, and the font's line height.
+  /// view's documentView. The view stays 0-width (the seed frame is 0-width and
+  /// documentView assignment keeps it so), and a 0-width `widthTracksTextView`
+  /// container does not wrap, so a short word lays out on a single line.
+  /// Returns the seed frame height the bare view is clamped to, and the font's
+  /// line height.
   private func makeInstalledSubmitTextView() throws -> (NSTextView, CGFloat, CGFloat) {
     let scroll = NSTextView.scrollableTextView()
     let seed = try XCTUnwrap(scroll.documentView as? NSTextView)
@@ -33,7 +35,6 @@ final class ComposerTextViewGeometryTests: XCTestCase {
 
     let custom = SubmitNSTextView(frame: seed.frame, textContainer: container)
     custom.font = .systemFont(ofSize: NSFont.systemFontSize)
-    custom.frame = NSRect(x: 0, y: 0, width: 300, height: seedHeight)
     scroll.documentView = custom
 
     let lm = try XCTUnwrap(custom.layoutManager)
@@ -47,10 +48,10 @@ final class ComposerTextViewGeometryTests: XCTestCase {
   ///   · `>= lineHeight` rules out a collapsed/degenerate layout (and, since
   ///     lineHeight ~16pt > seedHeight ~14pt, transitively anchors
   ///     `usedHeight > seedHeight`, the premise behind the negative control).
-  ///   · `< 2 * lineHeight` rules out the 0-width-wrap case. (The container's
-  ///     `size.width` stays 0 under `widthTracksTextView`; the effective layout
-  ///     width comes from the text view's 300pt frame, so non-degeneracy is
-  ///     asserted via the line count, not `container.size.width`.)
+  ///   · `< 2 * lineHeight` rules out a wrapped/degenerate layout. The line is
+  ///     single because the 0-width `widthTracksTextView` container does not
+  ///     wrap (`container.size.width` stays 0), so non-degeneracy is asserted
+  ///     via the line count, not `container.size.width`.
   private func layOutDescenderLine(_ tv: NSTextView, lineHeight: CGFloat) throws -> CGFloat {
     tv.string = "pqgyj"
     let full = NSRange(location: 0, length: (tv.string as NSString).length)
