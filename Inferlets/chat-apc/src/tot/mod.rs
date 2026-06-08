@@ -35,19 +35,24 @@
 //! ## Response (200)
 //!
 //! A structured tree. Each node carries a stable `id`, `parent_id`,
-//! `depth`, `branch_index`, `content`, `score` (1–10 or `null`),
-//! `status` (`"root" | "ok" | "error"`), an optional per-node `error`
-//! (generation-failure diagnostic), an optional per-node `score_error`
-//! (value-evaluator infra failure — see the scoring caveat), and nested
-//! `children`. The envelope adds `selected_node_id` + `final_answer` (the
-//! best-scoring leaf). A node that was generated but pruned still appears
-//! in the tree (childless); a node with children was kept in the beam.
+//! `depth`, `branch_index`, `content` (the clean answer), an optional
+//! `reasoning` (the demuxed `<think>` trace — omitted when empty),
+//! `score` (1–10 or `null`),
+//! `status` (`"root" | "ok" | "incomplete" | "error"`), an optional
+//! per-node `error` (generation/no-answer diagnostic), an optional
+//! per-node `score_error` (value-evaluator infra failure — see the scoring
+//! caveat), and nested `children`. The envelope adds `selected_node_id` +
+//! `final_answer` (the best-scoring leaf). A node that was generated but
+//! pruned still appears in the tree (childless); a node with children was
+//! kept in the beam.
 //!
 //! Validation / model-resolution / pre-generation failures use the same
 //! OpenAI-shape `{error:{...}}` envelope as `/v1/chat/completions`
 //! (`crate::sse::json_error`). Per-node generation failures are
 //! represented on the node (`status:"error"` + `error`) while the rest
-//! of the tree still returns.
+//! of the tree still returns; a node that reasoned but never produced an
+//! answer is `status:"incomplete"` (its partial `reasoning` preserved) and,
+//! like an error, is kept out of the beam and never selected.
 //!
 //! ## Scope (v1)
 //!
@@ -57,18 +62,26 @@
 //! wire seam: a future move to a dynamically-loaded or separate inferlet
 //! requires no client change.
 //!
-//! ## Scoring caveat (v1)
+//! ## Reasoning-aware scoring (#437)
 //!
-//! The value evaluator asks the model for a single 1–10 integer and
-//! parses the first in-range integer it emits. **Reasoning models**
-//! (e.g. Qwen3, which wraps output in `<think>…</think>`) tend to
-//! restate the problem before answering, so the first integer is often
-//! out of range and the score parses to `null`. A `null` score ranks
-//! lowest, so the beam falls back to deterministic (input-order)
-//! selection — the search still runs and returns a well-formed tree,
-//! but pruning is not quality-driven. Real score-driven pruning needs a
-//! non-reasoning model, a `/no_think`-style directive, or reasoning-tag
-//! stripping + a larger score budget (future work).
+//! Tree-of-thought THINKS by default (`thinking:true`). Each node is
+//! generated in two phases — a `<think>` reasoning block (budget
+//! `max_reasoning_tokens`) then the answer (budget `max_tokens_per_node`) —
+//! and `search::generate_demuxed` splits the two apart, so the answer is
+//! never starved by an over-long thought (#434) and the beam + value scorer
+//! see only the clean `content`, never the `<think>` trace. The reasoning
+//! rides alongside as the node's `reasoning` field. A node that reasoned but
+//! never answered is `status:"incomplete"` and is excluded from the beam, so
+//! a think-only candidate can no longer win the search and become the
+//! `final_answer`.
+//!
+//! The value evaluator is a cheap value HEAD: the node already reasoned, so
+//! the scorer runs `/no_think` and asks for a single 1–10 integer, parsing
+//! the first in-range integer it emits. A `null` score (the model emitted no
+//! in-range integer) ranks lowest, so the beam falls back to deterministic
+//! (input-order) selection among the answered candidates. Set
+//! `thinking:false` to suppress node reasoning entirely (`/no_think` on the
+//! node turns) and run nodes as concise non-reasoning candidates.
 //!
 //! This benign `null` (the model emitted no in-range integer) is
 //! distinct from a scorer-*infrastructure* failure (the value-evaluator
@@ -81,8 +94,7 @@
 //!
 //! - **Profile mapping:** `breadth`/`depth`/`beam_width` presets → named
 //!   profiles (kept explicit on the wire for v1).
-//! - Reasoning-aware scoring (strip `<think>` / raise the score budget),
-//!   vote-based evaluator + multi-sample value averaging; DFS+backtrack;
+//! - Vote-based evaluator + multi-sample value averaging; DFS+backtrack;
 //!   `max_tokens` status granularity; per-node partial content on error;
 //!   streaming (#413).
 
@@ -134,7 +146,7 @@ pub async fn dispatch(
 
     // `input.messages` wins over top-level chat-sugar (mirrors
     // dispatch_chat_apc).
-    let messages = match (input.messages.clone(), messages) {
+    let mut messages = match (input.messages.clone(), messages) {
         (Some(m), _) => m,
         (None, Some(m)) => m,
         (None, None) => {
@@ -180,6 +192,20 @@ pub async fn dispatch(
                 .await;
         }
     };
+
+    // #413/#437: tree-of-thought THINKS by default — the `<think>` reasoning
+    // is the point of the search, demuxed apart from the answer per node (see
+    // `search::generate_demuxed`), so the beam and value scorer rate the clean
+    // answer and a think-only candidate can no longer win. Only when the
+    // caller disables it (`thinking:false`) do we append the `/no_think`
+    // directive to the last user turn (Qwen3 keys thinking off it); deeper
+    // levels + the scorer carry it via `with_thinking(REFINE_INSTRUCTION)`. The
+    // directive is an inert token on a non-reasoning model.
+    if !params.thinking {
+        if let Some(last) = messages.iter_mut().rev().find(|m| m.role == "user") {
+            last.content.push_str(" /no_think");
+        }
+    }
 
     // Resolve the model (default to the engine's single registered model).
     let model_id = match input.model {
@@ -251,7 +277,7 @@ pub async fn dispatch(
             .await;
     }
 
-    let outcome = search::run(root_ctx, &params).await;
+    let outcome = search::run(root_ctx, &params, &model).await;
 
     let response_body = tree::TreeResponse {
         id: tree::new_tree_id(),
