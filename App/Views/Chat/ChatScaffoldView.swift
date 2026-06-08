@@ -455,12 +455,22 @@ struct ChatScaffoldView: View {
     // Bounded retry while the engine stays running — a single transient
     // /v1/models failure must not strand residentModelID unset until a
     // status flip that may never come on equal .running polls (F2).
+    // #474: capture the engine's effective max_tokens ceiling alongside the
+    // resident-model fetch. The reconciler is generic over ids; the ceiling
+    // rides the same `GET /v1/models` response (`ModelInfo.maxOutputTokens`,
+    // engine-global so the first entry's value is authoritative), stashed
+    // here on the successful fetch and applied below with residency.
+    var fetchedCeiling: Int?
     let result = await EngineModelReconciler.reconcile(
       isRunning: {
         if case .running = engineStatusStore.status { return true }
         return false
       },
-      fetchModelIDs: { try await engineStore.client.models().map(\.id) }
+      fetchModelIDs: {
+        let infos = try await engineStore.client.models()
+        fetchedCeiling = infos.first?.maxOutputTokens
+        return infos.map(\.id)
+      }
     )
     // Fold into the toolbar state. `.empty`/`.notRunning` become
     // `.known([])` (no placeholders for a verified empty/dead engine);
@@ -472,6 +482,10 @@ struct ChatScaffoldView: View {
       // reconcileEngineResident is internally guarded against clobbering
       // an in-flight load.
       modelLoadCenter.reconcileEngineResident(ids[0])
+      // #474: apply the launched ceiling unconditionally (a guardrail change
+      // or reload can hand the same model a different ceiling). The setter
+      // no-ops on an unchanged value and while a load is in flight.
+      modelLoadCenter.setResidentMaxOutputTokens(fetchedCeiling)
     case .failedAfterRetries(let attempts):
       // Don't silently drop: engine running but unreachable for models.
       NSLog("ChatScaffold: /v1/models reconcile failed after \(attempts) attempts while engine .running")
@@ -504,7 +518,12 @@ struct ChatScaffoldView: View {
       // settings into the request — a Fast Think profile attaches speculation
       // + forces greedy; a normal or tree-of-thought profile carries none.
       // Built once here so both the ToT dispatch and the normal send get it.
-      speculation: profileStore.speculation(forProfileID: viewModel.selectedProfileID)
+      speculation: profileStore.speculation(forProfileID: viewModel.selectedProfileID),
+      // #474: the launched engine's effective max_tokens ceiling, learned
+      // from GET /v1/models during resident-model reconcile. `makeRequest`
+      // clamps the profile's max_tokens down to this so a memory-squeezed
+      // launch never trips the engine's clean 400.
+      maxOutputTokensCeiling: modelLoadCenter.residentMaxOutputTokens
     )
 
     // #413: when the active profile declares `mode = "tree-of-thought"`,

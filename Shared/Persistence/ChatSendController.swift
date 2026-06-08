@@ -462,6 +462,19 @@ public final class ChatSendController: ObservableObject {
     return gate.isEngineGone || gate.isHelperUnreachable
   }
 
+  /// Clamp a profile `max_tokens` DOWN to the launched engine's effective
+  /// ceiling (#474). Pure so the full matrix is unit-tested without an
+  /// engine. `nil` or a non-positive ceiling means "unknown / no clamp" —
+  /// the engine reports 0 when no model is registered, and clamping a
+  /// request to 0 would be a worse failure than the value we are guarding
+  /// against — so the profile value passes through untouched. Down-only:
+  /// a profile value at or below the ceiling is returned verbatim, so a
+  /// user's intentionally-lower cap is never raised.
+  nonisolated static func clampMaxTokens(_ requested: Int, toCeiling ceiling: Int?) -> Int {
+    guard let ceiling, ceiling > 0 else { return requested }
+    return min(requested, ceiling)
+  }
+
   private static func makeRequest(chat: Chat, options: ChatSendRequestOptions) -> ChatRequest {
     // Authoritative speculation coupling (#426). An enabled-speculation
     // profile is a greedy "Fast Think" profile: the chat-apc drafter only
@@ -474,9 +487,22 @@ public final class ChatSendController: ObservableObject {
     let wireSpec: ChatSpeculation? = (spec?.enabled == true)
       ? ChatSpeculation(enabled: true, leaderLen: spec?.leaderLen, draftLen: spec?.draftLen)
       : nil
+    // #474: clamp the profile's max_tokens DOWN to the launched engine's
+    // effective ceiling before send. On a memory-squeezed launch the engine
+    // accepts far fewer output tokens than the profile default; sending the
+    // blind value trips chat-apc's clean 400 ("max_tokens must be in
+    // [1, N]") and the whole turn fails. Clamping makes the turn succeed
+    // (shorter reply) instead. Down-only, so an intentionally-lower profile
+    // value is preserved.
+    let effectiveMaxTokens = clampMaxTokens(
+      options.sampling.maxTokens, toCeiling: options.maxOutputTokensCeiling
+    )
     let sampling = wireSpec == nil
-      ? options.sampling
-      : ChatSampling(temperature: 0, topP: options.sampling.topP, maxTokens: options.sampling.maxTokens)
+      ? ChatSampling(
+          temperature: options.sampling.temperature,
+          topP: options.sampling.topP,
+          maxTokens: effectiveMaxTokens)
+      : ChatSampling(temperature: 0, topP: options.sampling.topP, maxTokens: effectiveMaxTokens)
     return ChatRequest(
       model: options.modelID,
       messages: transcriptTurns(chat: chat, options: options),
@@ -649,17 +675,28 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
   /// `nil` when the profile has none. `makeRequest` injects this into the
   /// request (and forces greedy temperature) when `enabled` — see #426.
   public let speculation: Profile.Speculation?
+  /// The launched engine's effective `max_tokens` ceiling for the resident
+  /// model (#474), from `ModelLoadCenter.residentMaxOutputTokens` (which
+  /// mirrors `GET /v1/models`' `max_output_tokens`). `makeRequest` clamps
+  /// the profile's `max_tokens` DOWN to this so a memory-squeezed launch
+  /// never trips the engine's clean 400. `nil` = ceiling unknown
+  /// (pre-#474 engine / not yet reconciled) → no clamp, send the profile
+  /// value verbatim. The profile default stays distinct from this
+  /// per-launch effective limit.
+  public let maxOutputTokensCeiling: Int?
 
   public init(
     modelID: String,
     sampling: ChatSampling = ChatSampling(),
     systemPromptOverride: String? = nil,
-    speculation: Profile.Speculation? = nil
+    speculation: Profile.Speculation? = nil,
+    maxOutputTokensCeiling: Int? = nil
   ) {
     self.modelID = modelID
     self.sampling = sampling
     self.systemPromptOverride = systemPromptOverride
     self.speculation = speculation
+    self.maxOutputTokensCeiling = maxOutputTokensCeiling
   }
 }
 
