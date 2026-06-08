@@ -27,6 +27,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+class LocalThreadingHTTPServer(ThreadingHTTPServer):
+    """Bind loopback test servers without reverse-DNS/FQDN lookup.
+
+    Python's HTTPServer.server_bind() calls socket.getfqdn(host). On some local
+    macOS/Homebrew Python setups that lookup can block before the harness writes
+    its port file, causing the GUI wrapper to time out even though binding
+    127.0.0.1 would otherwise be instantaneous.
+    """
+
+    def server_bind(self):
+        self.socket.bind(self.server_address)
+        self.server_address = self.socket.getsockname()
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
+
+
 class State:
     def __init__(self, hold_seconds: float, fail_load_attempts: int = 0):
         self.hold_seconds = hold_seconds
@@ -165,7 +182,7 @@ def main() -> int:
     port_file = Path(args.port_file)
     port_file.parent.mkdir(parents=True, exist_ok=True)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = LocalThreadingHTTPServer(("127.0.0.1", 0), Handler)
     # Explicit (stdlib default is True, but make it intentional — review
     # F5): handler threads exit with the server on `kill $HARNESS_PID`,
     # no lingering sleeping handlers.

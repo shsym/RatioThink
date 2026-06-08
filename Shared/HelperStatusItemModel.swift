@@ -65,7 +65,7 @@ public struct HelperStatusItemModel: Equatable, Sendable {
 
     /// Human-readable engine state for the menu-bar button's
     /// accessibility label (#424 acceptance: AX describes the app AND
-    /// current status). The view composes "RatioThink engine <word>".
+    /// current status). The view composes "Rational engine <word>".
     ///
     /// `.loading` is deliberately SUB-STATE-NEUTRAL ("changing state"):
     /// it collapses BOTH `.starting` and `.stopping` into one visual state

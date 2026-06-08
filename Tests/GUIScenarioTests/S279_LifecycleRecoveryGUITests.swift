@@ -3,7 +3,7 @@ import XCTest
 /// Feature B lifecycle recovery, GUI-facing scenario.
 ///
 /// The existing GUI scenario runner has a stable stale-engine seam:
-/// `PIE_TEST_ENGINE_BASE_URL` lets XCUITest launch RatioThink.app with the
+/// `PIE_TEST_ENGINE_BASE_URL` lets XCUITest launch Rational.app with the
 /// chat HTTP client pointed at an explicit loopback URL. Full real-stack
 /// helper/RatioThink crash injection is not available in the current GUI
 /// framework without broad runner refactors, so this scenario covers the
@@ -35,7 +35,7 @@ final class S279_LifecycleRecoveryGUITests: XCTestCase {
     defer { app.terminate() }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     try createChatAndSend("Trigger stale engine recovery", in: app)
@@ -49,13 +49,7 @@ final class S279_LifecycleRecoveryGUITests: XCTestCase {
       return
     }
 
-    let composer = app.descendants(matching: .any)
-      .matching(identifier: "composer.text")
-      .firstMatch
-    XCTAssertTrue(composer.waitForExistence(timeout: 5),
-                  "composer.text missing after stale engine error; app tree: \(app.debugDescription)")
-    composer.click()
-    composer.typeText("Retry after lifecycle recovery")
+    typeComposerText("Retry after lifecycle recovery", in: app)
 
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5),
@@ -77,19 +71,11 @@ final class S279_LifecycleRecoveryGUITests: XCTestCase {
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
   }
 
+  @MainActor
   private func createChatAndSend(_ prompt: String, in app: XCUIApplication) throws {
-    let newChat = app.buttons["chats.newButton"]
-    XCTAssertTrue(newChat.waitForExistence(timeout: 10),
-                  "New Chat button missing; app tree: \(app.debugDescription)")
-    newChat.click()
+    openFreshChat(in: app)
 
-    let composer = app.descendants(matching: .any)
-      .matching(identifier: "composer.text")
-      .firstMatch
-    XCTAssertTrue(composer.waitForExistence(timeout: 10),
-                  "composer.text missing after creating chat; app tree: \(app.debugDescription)")
-    composer.click()
-    composer.typeText(prompt)
+    typeComposerText(prompt, in: app)
 
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5),

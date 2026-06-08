@@ -7,6 +7,18 @@ description = "Chat-API + control-plane inferlet (HTTP): /healthz, /v1/models, /
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# #458 — gate the non-default tree-of-thought execution strategies
+# (concurrent generation / phased scoring) behind a build flag. They are a
+# benchmark/debug apparatus measured as no-win, so production builds (default,
+# feature OFF) accept only the default `coupled_sequential` on the public
+# `/v1/inferlet` input and REJECT any non-default `exec`. The benchmark and
+# real-engine strategy e2e build with `--features exec-strategies` to drive
+# every variant. The feature changes ONLY the input-acceptance gate in
+# `tot::schema::resolve`; the execution code paths are identical, so a feature
+# build's `coupled_sequential` is byte-identical to production.
+exec-strategies = []
+
 [dependencies]
 wstd = "0.5.6"
 # Path dep on the pie sdk vendored as a git submodule under Vendor/pie.

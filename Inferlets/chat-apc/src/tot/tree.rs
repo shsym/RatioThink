@@ -18,10 +18,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub enum NodeStatus {
     /// The synthetic conversation-prefix root (never generated or scored).
     Root,
-    /// A successfully generated candidate continuation.
+    /// A successfully generated candidate continuation (a non-empty answer).
     Ok,
     /// Generation — or the fork that precedes it — failed for this node.
     Error,
+    /// The node generated reasoning but no usable answer — the model ran out
+    /// of budget mid-`<think>` (truncated thought) or closed the block and
+    /// emitted nothing after it (#434). Its `reasoning` is preserved so the
+    /// UI can show the partial thought; like `Error` it is kept out of the
+    /// beam and never selected as the final answer.
+    Incomplete,
 }
 
 /// One node in the generated thought tree.
@@ -44,6 +50,11 @@ pub struct Node {
     pub depth: usize,
     pub branch_index: Option<usize>,
     pub content: String,
+    /// The demuxed `<think>` reasoning trace for this node, separated from
+    /// `content` (the answer) at generation time (#413/#437). Omitted from
+    /// the wire when empty (non-reasoning model, or `thinking:false`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
     pub score: Option<u8>,
     pub status: NodeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,6 +74,7 @@ impl Node {
             depth: 0,
             branch_index: None,
             content: String::new(),
+            reasoning: String::new(),
             score: None,
             status: NodeStatus::Root,
             error: None,
@@ -113,6 +125,7 @@ pub fn error_leaf(parent_id: &str, depth: usize, branch_index: usize, error: Str
         depth,
         branch_index: Some(branch_index),
         content: String::new(),
+        reasoning: String::new(),
         score: None,
         status: NodeStatus::Error,
         error: Some(error),
@@ -315,6 +328,7 @@ mod tests {
                 depth: 1,
                 branch_index: Some(0),
                 content: "c".to_string(),
+                reasoning: String::new(),
                 score: Some(5),
                 status: NodeStatus::Ok,
                 error: None,
@@ -337,6 +351,7 @@ mod tests {
                 depth: 1,
                 branch_index: Some(b),
                 content: String::new(),
+                reasoning: String::new(),
                 score: None,
                 status: NodeStatus::Ok,
                 error: None,
@@ -408,6 +423,22 @@ mod tests {
         assert_eq!(serde_json::to_value(NodeStatus::Root).unwrap(), "root");
         assert_eq!(serde_json::to_value(NodeStatus::Ok).unwrap(), "ok");
         assert_eq!(serde_json::to_value(NodeStatus::Error).unwrap(), "error");
+        assert_eq!(
+            serde_json::to_value(NodeStatus::Incomplete).unwrap(),
+            "incomplete"
+        );
+    }
+
+    #[test]
+    fn node_reasoning_serializes_when_present_omitted_when_empty() {
+        let mut n = error_leaf("root", 1, 0, "x".to_string());
+        // Empty reasoning is omitted from the wire (clean default).
+        let v = serde_json::to_value(&n).unwrap();
+        assert!(v.get("reasoning").is_none(), "empty reasoning should be omitted");
+        // A present reasoning trace serializes under "reasoning".
+        n.reasoning = "first, consider…".to_string();
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(v.get("reasoning").and_then(|r| r.as_str()), Some("first, consider…"));
     }
 
     #[test]
@@ -418,6 +449,7 @@ mod tests {
             depth: 1,
             branch_index: Some(0),
             content: "ans".to_string(),
+            reasoning: String::new(),
             score: None,
             status: NodeStatus::Ok,
             error: None,

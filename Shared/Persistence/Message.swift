@@ -55,6 +55,17 @@ public final class Message {
   /// model id, future tool-call frames). Nil for plain
   /// non-streaming inserts.
   public var meta: Data?
+  /// Serialized `ToTTree` snapshot for a tree-of-thought turn (#413),
+  /// written as the search streams (one snapshot per level + terminal)
+  /// and rendered as a collapsible live tree-search section — the
+  /// structured analogue of `reasoning`'s "Thinking" section. Nil for
+  /// ordinary chat turns.
+  ///
+  /// Optional (nullable column) so SwiftData lightweight migration adds
+  /// it to a pre-existing `chats.sqlite` without a migration plan, and an
+  /// older export decodes without it. The `= nil` declaration-site
+  /// default mirrors `reasoning`'s migratability fix.
+  public var tot: Data? = nil
 
   public init(
     id: UUID = UUID(),
@@ -64,7 +75,8 @@ public final class Message {
     reasoning: String = "",
     tokens: Int = 0,
     ts: Date = Date(),
-    meta: Data? = nil
+    meta: Data? = nil,
+    tot: Data? = nil
   ) {
     self.id = id
     self.chat = chat
@@ -74,6 +86,7 @@ public final class Message {
     self.tokens = tokens
     self.ts = ts
     self.meta = meta
+    self.tot = tot
   }
 }
 

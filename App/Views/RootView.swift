@@ -74,7 +74,7 @@ struct RootView: View {
         )
         .navigationSplitViewColumnWidth(min: 480, ideal: 720)
       }
-      .navigationTitle("RatioThink")
+      .navigationTitle("Rational")
     }
     .task { await runLaunchUpdateCheck() }
   }

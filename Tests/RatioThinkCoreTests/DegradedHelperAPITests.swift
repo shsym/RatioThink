@@ -61,7 +61,7 @@ final class DegradedHelperAPITests: XCTestCase {
   func test_degraded_startEngine_returns_degraded_error() {
     let api = makeAPI()
     let expectation = XCTestExpectation(description: "startEngine reply")
-    api.startEngine(profileID: "p") { successData, errorData in
+    api.startEngine(profileID: "p", modelOverride: nil) { successData, errorData in
       XCTAssertNil(successData)
       let result = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData

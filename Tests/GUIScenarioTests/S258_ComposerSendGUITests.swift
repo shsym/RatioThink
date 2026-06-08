@@ -1,7 +1,7 @@
 import XCTest
 
 /// full GUI send path:
-/// RatioThink.app → ChatListView → ComposerView → HTTPEngineClient →
+/// Rational.app → ChatListView → ComposerView → HTTPEngineClient →
 /// real pie engine stream → MessageStreamWriter → SwiftData persistence.
 final class S258_ComposerSendGUITests: XCTestCase {
   override func setUp() async throws {
@@ -30,7 +30,7 @@ final class S258_ComposerSendGUITests: XCTestCase {
     defer { app.terminate() }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     try createChatAndSend(prompt, in: app)
@@ -46,7 +46,7 @@ final class S258_ComposerSendGUITests: XCTestCase {
     relaunched.launch()
     defer { relaunched.terminate() }
     XCTAssert(relaunched.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not relaunch")
+              "Rational.app did not relaunch")
     relaunched.activate()
 
     try selectPersistedChat(in: relaunched)

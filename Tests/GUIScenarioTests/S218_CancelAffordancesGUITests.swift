@@ -31,7 +31,7 @@ final class S218_CancelAffordancesGUITests: XCTestCase {
     app.launch()
     defer { app.terminate() }
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     // Settings → Models → Add Model… → a curated Add enqueues a download.

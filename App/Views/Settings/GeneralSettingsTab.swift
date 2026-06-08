@@ -4,14 +4,14 @@ import ServiceManagement
 /// *Settings → General* — app-wide info and toggles that don't fit any
 /// other tab. The About section shows the build version, a one-line
 /// description, the GitHub URL, the bundle id, and the resolved PIE_HOME.
-/// The Startup section surfaces whether RatioThink will keep its menu-bar
+/// The Startup section surfaces whether Rational will keep its menu-bar
 /// icon / background helper after the main app quits — a state owned by the
 /// launchd-managed RatioThinkHelper's `SMAppService` registration, not the
 /// app process — and routes to System Settings → Login Items to change it.
 struct GeneralSettingsTab: View {
   @State private var resolvedPieHome: String = "—"
   @State private var menuBarPersistenceText =
-    "Checking whether RatioThink stays in your menu bar after you quit…"
+    "Checking whether Rational stays in your menu bar after you quit…"
 
   /// One-line description of the app. Kept honest and feature-neutral — no
   /// release/update claims (those live in the #411 update-check surface).

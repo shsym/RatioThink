@@ -76,7 +76,7 @@ struct LocalAPIView: View {
       Button("Turn Off", role: .destructive) { stop() }
       Button("Cancel", role: .cancel) {}
     } message: {
-      Text("This stops the RatioThink engine. In-app chat will also stop until you turn it back on.")
+      Text("This stops the Rational engine. In-app chat will also stop until you turn it back on.")
     }
   }
 
@@ -87,7 +87,7 @@ struct LocalAPIView: View {
       VStack(alignment: .leading, spacing: 4) {
         Text("Local API")
           .font(.title2.weight(.semibold))
-        Text("An OpenAI-compatible HTTP endpoint served by the RatioThink engine on this Mac. It’s the same engine that powers in-app chat.")
+        Text("An OpenAI-compatible HTTP endpoint served by the Rational engine on this Mac. It’s the same engine that powers in-app chat.")
           .font(.callout)
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
@@ -323,8 +323,12 @@ struct LocalAPIView: View {
   /// Start the engine on the active profile. A resolver-stage rejection
   /// (`.profileMissing`/`.modelMissing`/…) is re-thrown by
   /// `EngineStatusStore.startEngine` and leaves the polled status `.stopped`,
-  /// so it MUST surface here — the reducer never sees it. (`.replyTimeout` /
-  /// `.alreadyRunning` are swallowed by the store as non-failures.)
+  /// so it MUST surface here — the reducer never sees it. Only
+  /// App-side `.replyTimeout` is swallowed by the store because the
+  /// helper start remains in flight; same-profile idempotency is handled
+  /// inside `HelperExportedAPI` / `PieEngineHost.startOrAttach`, so any
+  /// `.alreadyRunning` that reaches the app is an incompatible-start
+  /// conflict and surfaces to the caller.
   private func start() {
     guard let profileID = profileStore.activeProfileID, !profileID.isEmpty else { return }
     Task { @MainActor in

@@ -19,8 +19,10 @@ final class XPCProtocolTests: XCTestCase {
     // a single anonymous trailing label — verifying by string keeps
     // the wire contract greppable when ObjC consumers are added.
     let expected = [
+      "helperProtocolVersionWithReply:",
       "engineStatusWithReply:",
-      "startEngineWithProfileID:reply:",
+      "startEngineWithProfileID:modelOverride:reply:",
+      "restartEngineWithProfileID:reply:",
       "stopEngineWithReply:",
       "loadModelWithModelID:reply:",
       "cancelLoadWithHandle:reply:",
@@ -186,7 +188,7 @@ final class XPCProtocolTests: XCTestCase {
   func test_startEngine_reply_double_nil_throws_wire_contract_violation() {
     // Wire-contract bugs MUST carry `.wireContractViolation`, never
     // `.unknown` (review F8) — a `try?` at the call site would
-    // otherwise collapse "RatioThink bug" and "engine failed: unknown"
+    // otherwise collapse "Rational bug" and "engine failed: unknown"
     // into the same nil.
     XCTAssertThrowsError(
       try PieHelperXPCWire.decodeStartEngineReply(successData: nil, errorData: nil)

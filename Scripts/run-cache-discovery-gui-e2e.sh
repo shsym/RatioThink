@@ -3,7 +3,7 @@
 #
 # Proves a model already staged in the shared HF cache surfaces in the
 # real app with no download and no engine launch:
-#   RatioThink.app → Settings (⌘,) → Models tab → an "HF cache" row, and
+#   Rational.app → Settings (⌘,) → Models tab → an "HF cache" row, and
 #   → Profiles → ProfileEditor picker → a split-GGUF model offered with
 #     its unsupported reason.
 # Both are populated by CachedModelScan → HFCacheCatalog.scan(hfHome:)
@@ -12,7 +12,7 @@
 # The XCUITest runner is sandboxed and CANNOT write the fixture to /tmp
 # (EPERM). So this script — running as the normal, unsandboxed user —
 # stages the fixture cache + a fresh PIE_HOME on /tmp and hands their
-# paths to the test via a config env file. The launched RatioThink.app is
+# paths to the test via a config env file. The launched Rational.app is
 # NOT sandboxed, so it reads HF_HOME and writes PIE_HOME on /tmp without
 # issue. Mirrors Scripts/run-gui-e2e.sh.
 set -euo pipefail
@@ -44,7 +44,7 @@ if ! pgrep -x Dock >/dev/null 2>&1; then
   exit 2
 fi
 if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "cache-discovery gui e2e: RatioThink.app + XCTest-runner Automation/Accessibility permissions required." >&2
+  echo "cache-discovery gui e2e: Rational.app + XCTest-runner Automation/Accessibility permissions required." >&2
   echo "cache-discovery gui e2e: grant them in System Settings → Privacy & Security, then rerun:" >&2
   echo "cache-discovery gui e2e:   PIE_TEST_TCC_GRANTED=1 Scripts/run-cache-discovery-gui-e2e.sh" >&2
   exit 2

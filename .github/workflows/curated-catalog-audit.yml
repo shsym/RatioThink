@@ -17,7 +17,9 @@ name: curated-catalog-audit
 #     renamed AFTER it was added), which no code change would re-trigger.
 #   · on a PR that edits the catalog or its tests — reds the #425
 #     introduction moment BEFORE merge, when a maintainer pastes a
-#     nonexistent / split-shard-only filename.
+#     nonexistent / split-shard-only filename. Catalog sources follow the
+#     `Shared/Curated*Catalog*.swift` naming convention so a future split
+#     source still trips this PR-time detector.
 # Unrelated PRs never hit the network (the audit job is skipped).
 
 on:
@@ -50,9 +52,8 @@ jobs:
         with:
           filters: |
             catalog:
-              - 'Shared/CuratedModelCatalog.swift'
-              - 'Tests/RatioThinkCoreTests/CuratedModelCatalogLiveHFTests.swift'
-              - 'Tests/RatioThinkCoreTests/CuratedModelCatalogTests.swift'
+              - 'Shared/Curated*Catalog*.swift'
+              - 'Tests/RatioThinkCoreTests/CuratedModelCatalog*.swift'
 
   hf-existence-audit:
     name: curated catalog live-HF existence audit

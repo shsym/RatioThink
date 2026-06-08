@@ -27,8 +27,8 @@ if ! pgrep -x Dock >/dev/null 2>&1; then
   exit 2
 fi
 if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "resume gui history e2e: RatioThink.app Automation/Accessibility permissions required." >&2
-  echo "resume gui history e2e: grant Xcode/XCTest runner and RatioThink.app Automation + Accessibility in System Settings, then rerun:" >&2
+  echo "resume gui history e2e: Rational.app Automation/Accessibility permissions required." >&2
+  echo "resume gui history e2e: grant Xcode/XCTest runner and Rational.app Automation + Accessibility in System Settings, then rerun:" >&2
   echo "resume gui history e2e: PIE_TEST_TCC_GRANTED=1 Scripts/run-resume-gui-history-e2e.sh" >&2
   exit 2
 fi

@@ -151,7 +151,7 @@ public struct LoadHandle: Codable, Equatable, Hashable, Sendable {
 ///
 /// `wireContractViolation` exists so XPC plumbing bugs (double-set
 /// reply tuple, missing payload, type-skewed Data) route to a distinct
-/// "this is a RatioThink bug, not an engine failure" path in the GUI rather
+/// "this is a Rational bug, not an engine failure" path in the GUI rather
 /// than being lumped with `.unknown` (review F8).
 public enum EngineErrorCode: String, Codable, Sendable {
   case spawnFailed
@@ -188,8 +188,8 @@ public enum EngineErrorCode: String, Codable, Sendable {
   /// Caller-supplied input failed validation BEFORE any engine work:
   /// `repo`/`file` path-traversal, malformed URL, NUL byte, etc.
   /// Distinct from `.wireContractViolation` (which is reserved for
-  /// RatioThink-internal plumbing bugs — see comment above) so the GUI can
-  /// surface "please correct repo/file" instead of "RatioThink internal bug
+  /// Rational-internal plumbing bugs — see comment above) so the GUI can
+  /// surface "please correct repo/file" instead of "Rational internal bug
   /// — please file a bug report" (review v17 F5). Added Phase 2.5.
   case invalidInput
   /// Engine subprocess could not be reaped (SIGKILL rejected:
@@ -217,7 +217,7 @@ public enum EngineErrorCode: String, Codable, Sendable {
   ///  · `kill -9 <pid>` manually (pid is in the fault log).
   case killRejected
   /// The requested model was rejected before launch because its
-  /// resolved local artifact size is above RatioThink.app's v1 memory safety
+  /// resolved local artifact size is above Rational.app's v1 memory safety
   /// limit, or because the app could not determine the artifact size
   /// safely. This is a user-recoverable model choice problem, not a
   /// Pie binary/process failure.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Offline mock pie engine for README screenshot capture.
 #
-# Serves the four loopback endpoints RatioThink.app's HTTPEngineClient
+# Serves the four loopback endpoints Rational.app's HTTPEngineClient
 # speaks (see Shared/Engine/HTTPEngineClient.swift "Wire shapes"), with
 # canned content, so the REAL app UI can be driven into a populated state
 # for screenshots WITHOUT a real pie engine or a multi-GB model download:
@@ -24,8 +24,20 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+
+class LocalThreadingHTTPServer(ThreadingHTTPServer):
+    """Bind loopback test servers without reverse-DNS/FQDN lookup."""
+
+    def server_bind(self):
+        self.socket.bind(self.server_address)
+        self.server_address = self.socket.getsockname()
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
+
+
 DEFAULT_ANSWER = (
-    "Everything runs on your Mac. RatioThink launches a bundled Pie engine "
+    "Everything runs on your Mac. Rational launches a bundled Pie engine "
     "locally, so your prompts and replies never leave the device — and the "
     "same engine is exposed as an OpenAI-compatible endpoint your own scripts "
     "can call."
@@ -160,7 +172,7 @@ def main() -> int:
     port_file = Path(args.port_file)
     port_file.parent.mkdir(parents=True, exist_ok=True)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = LocalThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
     server.state = State(
         model=args.model,

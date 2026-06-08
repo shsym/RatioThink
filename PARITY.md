@@ -1,4 +1,4 @@
-# RatioThink — E2E ↔ production parity matrix
+# Rational — E2E ↔ production parity matrix
 
 How each test/script tier maps to the **real packaged-binary chat path**, and
 every intentional bypass it takes. Companion to [`TEST.md`](TEST.md) (which is
@@ -12,7 +12,7 @@ is only as honest as the boundary it actually crosses.
 
 ## The production boundary (what "real" means)
 
-A normally-launched, signed `/Applications/RatioThink.app` does **all** of:
+A normally-launched, signed `/Applications/Rational.app` does **all** of:
 
 1. **Launch topology** — App registers an `SMAppService.agent` so **launchd**
    owns the `com.ratiothink.helper` MachService; App↔Helper talk over that
@@ -26,7 +26,7 @@ A normally-launched, signed `/Applications/RatioThink.app` does **all** of:
    the app-staged models root then the HF/pie cache; rejects symlinks /
    directories / oversized / incomplete snapshots; served model id == profile
    slug.
-5. **Filesystem** — `/Applications/RatioThink.app` bundle resources (embedded
+5. **Filesystem** — `/Applications/Rational.app` bundle resources (embedded
    Helper, `pie-engine/pie`, `chat-apc` wasm + manifest, staged LaunchAgent
    plist), `PIE_HOME = ~/Library/Application Support/RatioThink`.
 6. **UI observability** — missing model / resolver failure / engine-start
