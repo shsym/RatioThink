@@ -174,7 +174,8 @@ struct ContentToolbar: View {
           estimatedTotalBytes: nil,
           estimatedEtaSeconds: nil,
           onConfirm: { setAsDefault in swapCoordinator.confirm(token: capturedToken, setAsDefault: setAsDefault) },
-          onCancel:  { swapCoordinator.cancel(token: capturedToken) }
+          onCancel:  { swapCoordinator.cancel(token: capturedToken) },
+          onKeepCurrent: { swapCoordinator.keepCurrentModel(token: capturedToken) }
         )
       }
     }
@@ -261,7 +262,11 @@ struct ContentToolbar: View {
   private func selectProfile(_ id: String) {
     swapCoordinator.requestSwap(
       toProfileID: id,
-      commit: { committed in viewModel.selectedProfileID = committed }
+      commit: { committed in viewModel.selectedProfileID = committed },
+      // #459 "Keep Current Model": pin the resident model A as the per-chat
+      // override on the switched profile (no reload). Pure UI assignment,
+      // per the commit caller contract.
+      setOverride: { override in viewModel.modelOverride = override }
     )
   }
 

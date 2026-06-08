@@ -32,7 +32,7 @@ $(LOGDIR):
 # recipes below, which run in a non-sandboxed shell after xcodebuild exits
 # (every test app already dead). Add a suite's prefix here if it stages a real
 # /tmp home. See TEST.md "GUI temp-home cleanup".
-GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-* /tmp/pie-s326dl-* /tmp/pie-s326done-*
+GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-* /tmp/pie-s326dl-* /tmp/pie-s326done-* /tmp/pie-s459swap-*
 
 # Canned recipe: run a focused set of RatioThinkGUITests suites via xcodebuild
 # with the seated-session warning + the standard log-capture/PIPESTATUS guard
@@ -466,8 +466,8 @@ render-menubar-icon: ## Render the #424 branded menu-bar icon (4 states x light/
 	@/tmp/render-menubar-icon
 	@open /tmp/menubar-icon-preview.png 2>/dev/null || true
 
-test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate, composer auto-grow (S260/S279/S285/S286/S446)
-	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests)
+test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate, composer auto-grow, profile-swap keep-current (S260/S279/S285/S286/S446/S459)
+	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests -only-testing:RatioThinkGUITests/S459_ProfileSwapKeepCurrentGUITests)
 
 # --- E2E wrappers by product area ------------------------------------------
 # Operator-gated (seated session + TCC; real engine/model or deterministic
