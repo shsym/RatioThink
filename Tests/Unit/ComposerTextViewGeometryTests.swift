@@ -7,71 +7,84 @@ import AppKit
 /// built with `init(frame:textContainer:)` does NOT inherit the
 /// vertically-resizable geometry that `scrollableTextView()` configures — it
 /// is `isVerticallyResizable == false` with `min/maxSize` clamped to the seed
-/// frame height (14pt). Frozen below the ~16pt line height, the bottom of each
-/// line is clipped: descenders (q/g/p/y/j) lose their tails (a "p" reads as a
-/// "D") and underline/marked-text decorations are cut off.
+/// frame height (measured ~14pt). Frozen below the ~16pt line height, the
+/// bottom of each line is clipped: descenders (q/g/p/y/j) lose their tails (a
+/// "p" reads as a "D") and underline/marked-text decorations are cut off.
 ///
-/// `applyResizableTextViewGeometry(to:)` restores the contract. These tests
-/// fail if the fix is removed — the bare text view is provably clamped below
-/// the line height, and the corrected one is provably able to grow past it.
+/// These tests install a real `SubmitNSTextView` as the scroll view's
+/// documentView — the same seam production uses — and assert the laid-out
+/// line via `sizeToFit()` against the view's actual frame, so the positive
+/// check is falsifiable: remove `applyResizableTextViewGeometry(to:)` and the
+/// corrected view can no longer grow to contain a full descender line.
 @MainActor
 final class ComposerTextViewGeometryTests: XCTestCase {
 
-  /// Builds a text view exactly the way `ComposerTextEditor` does: reuse the
-  /// container vended by `scrollableTextView()`, seeded into a fresh
-  /// `init(frame:textContainer:)` text view.
-  private func makeSeededTextView() throws -> (NSTextView, NSLayoutManager, CGFloat) {
+  /// Mirrors the geometry-relevant part of
+  /// `ComposerTextEditor.installSubmitTextView`: a `SubmitNSTextView` built
+  /// from the container `scrollableTextView()` vends, installed as the scroll
+  /// view's documentView. A realistic width is set so a short word lays out as
+  /// a single line (the seed frame is 0-width). Returns the seed frame height
+  /// the bare view is clamped to, and the font's line height.
+  private func makeInstalledSubmitTextView() throws -> (NSTextView, CGFloat, CGFloat) {
     let scroll = NSTextView.scrollableTextView()
     let seed = try XCTUnwrap(scroll.documentView as? NSTextView)
     let container = try XCTUnwrap(seed.textContainer)
-    let tv = NSTextView(frame: seed.frame, textContainer: container)
-    tv.font = .systemFont(ofSize: NSFont.systemFontSize)
-    let lm = try XCTUnwrap(tv.layoutManager)
-    let lineHeight = lm.defaultLineHeight(for: try XCTUnwrap(tv.font))
-    return (tv, lm, lineHeight)
+    let seedHeight = seed.frame.height
+
+    let custom = SubmitNSTextView(frame: seed.frame, textContainer: container)
+    custom.font = .systemFont(ofSize: NSFont.systemFontSize)
+    custom.frame = NSRect(x: 0, y: 0, width: 300, height: seedHeight)
+    scroll.documentView = custom
+
+    let lm = try XCTUnwrap(custom.layoutManager)
+    let lineHeight = lm.defaultLineHeight(for: try XCTUnwrap(custom.font))
+    return (custom, seedHeight, lineHeight)
   }
 
-  func test_bareTextView_isClampedBelowLineHeight_provingTheClip() throws {
-    let (tv, _, lineHeight) = try makeSeededTextView()
-    // The regression itself: without the fix the view cannot grow to a full
-    // line, so the descender/underline band falls outside its bounds.
-    XCTAssertFalse(tv.isVerticallyResizable,
-                   "bare init(frame:textContainer:) must start non-resizable")
-    XCTAssertLessThan(tv.maxSize.height, lineHeight,
-                      "bare text view is frozen below the line height — this is the clip (#463)")
-  }
-
-  func test_applyResizableGeometry_letsTheViewGrowPastTheLineHeight() throws {
-    let (tv, _, lineHeight) = try makeSeededTextView()
-
-    applyResizableTextViewGeometry(to: tv)
-
-    XCTAssertTrue(tv.isVerticallyResizable)
-    XCTAssertFalse(tv.isHorizontallyResizable)
-    XCTAssertGreaterThanOrEqual(tv.maxSize.height, lineHeight,
-                                "corrected view must be able to contain a full line")
-    XCTAssertEqual(tv.minSize.height, 0, accuracy: 0.001)
-  }
-
-  /// After the fix, laying out a real underlined descender line must fit
-  /// inside the view's allowed height — i.e. the used line-fragment height
-  /// (which spans ascender → descender and the underline band) is never
-  /// clamped away.
-  func test_descenderUnderlineLine_fitsWithinAllowedHeight() throws {
-    let (tv, lm, lineHeight) = try makeSeededTextView()
-    applyResizableTextViewGeometry(to: tv)
-    let container = try XCTUnwrap(tv.textContainer)
-
+  /// Lays out an underlined descender line and returns its used height.
+  private func layOutDescenderLine(_ tv: NSTextView) throws -> CGFloat {
     tv.string = "pqgyj"
     let full = NSRange(location: 0, length: (tv.string as NSString).length)
     tv.textStorage?.addAttribute(.underlineStyle,
                                  value: NSUnderlineStyle.single.rawValue, range: full)
+    let lm = try XCTUnwrap(tv.layoutManager)
+    let container = try XCTUnwrap(tv.textContainer)
     lm.ensureLayout(for: container)
-    let usedHeight = lm.usedRect(for: container).height
+    return lm.usedRect(for: container).height
+  }
 
-    XCTAssertGreaterThanOrEqual(usedHeight, lineHeight,
-                                "a descender line should occupy at least one full line height")
-    XCTAssertGreaterThanOrEqual(tv.maxSize.height, usedHeight,
-                                "the corrected view must contain the full laid-out line, descenders and underline included")
+  /// Negative control: without the geometry fix the installed view is frozen
+  /// at its seed height and cannot grow to contain a full line — the clip.
+  func test_installedTextView_withoutGeometryFix_isFrozenAndClipsTheLine() throws {
+    let (tv, seedHeight, _) = try makeInstalledSubmitTextView()
+
+    // Robust invariant: the swapped view starts non-resizable, with its max
+    // height pinned to the seed frame (not the content) — independent of the
+    // exact seed value AppKit happens to vend.
+    XCTAssertFalse(tv.isVerticallyResizable)
+    XCTAssertEqual(tv.maxSize.height, seedHeight, accuracy: 0.001,
+                   "bare view's max height is clamped to the seed frame, not the content")
+
+    let usedHeight = try layOutDescenderLine(tv)
+    tv.sizeToFit()
+    XCTAssertLessThan(tv.frame.height, usedHeight,
+                      "frozen view cannot grow to contain a full descender+underline line — the clip (#463)")
+  }
+
+  /// Positive, falsifiable guard: after the fix the installed view grows to
+  /// contain the full laid-out descender+underline line. Fails if
+  /// `applyResizableTextViewGeometry(to:)` is removed (the view stays frozen
+  /// at the seed height, below the line height).
+  func test_installedTextView_withGeometryFix_growsToContainDescenderLine() throws {
+    let (tv, _, _) = try makeInstalledSubmitTextView()
+
+    applyResizableTextViewGeometry(to: tv)
+    XCTAssertTrue(tv.isVerticallyResizable)
+    XCTAssertFalse(tv.isHorizontallyResizable)
+
+    let usedHeight = try layOutDescenderLine(tv)
+    tv.sizeToFit()
+    XCTAssertGreaterThanOrEqual(tv.frame.height, usedHeight,
+                                "corrected view must grow to contain the full descender+underline line")
   }
 }
