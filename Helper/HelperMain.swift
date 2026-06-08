@@ -1048,7 +1048,9 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       return nil
     }
     Log.helper.info("smoke seam: PIE_SMOKE_FAKE_ENGINE_BIN=\(fakeBin, privacy: .public)")
-    return { profileID in
+    // Smoke resolver ignores the explicit model override — it only swaps
+    // the engine binary for the fake smoke engine.
+    return { profileID, _ in
       // Use the same path-resolution closures as the production
       // resolver for the wasm/manifest/pieHome bits; the smoke
       // contract only swaps the engine binary.
