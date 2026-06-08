@@ -142,9 +142,17 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
   private let connectionLock = OSAllocatedUnfairLock<NSXPCConnection?>(initialState: nil)
   private static let log = Logger(subsystem: "com.ratiothink.app", category: "xpc.client")
 
+  // Restart = stop phase + a full cold-boot start phase. Wait past the
+  // helper's start reply deadline (`coldStartHandshakeTimeout` + headroom)
+  // so the App receives the engine's REAL terminal outcome instead of a
+  // premature `.replyTimeout` for a large model that is still loading (#459).
+  // `EngineStatusStore.restartEngine` also treats `.replyTimeout` as
+  // "in flight" so an even slower boot degrades to the status poll rather
+  // than a false reload failure.
   public init(endpoint: Endpoint,
               replyTimeout: TimeInterval = 2.0,
-              restartReplyTimeout: TimeInterval = 85.0) {
+              restartReplyTimeout: TimeInterval
+                = PieControlLauncher.coldStartHandshakeTimeout + 30) {
     self.endpoint = endpoint
     self.interface = PieHelperXPCInterface.make()
     self.replyTimeout = replyTimeout

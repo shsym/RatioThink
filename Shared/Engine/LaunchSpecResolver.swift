@@ -257,6 +257,11 @@ public struct LaunchSpecResolver {
         pieHome: home,
         shmemName: shmem,
         inferletNameAtVersion: inferletNameAtVersion,
+        // Real `pie serve` cold boot loads the model weights before the READY
+        // handshake; align the boot budget with the 120s request/shmem
+        // timeouts so a slow large-model start is not killed by the 30s
+        // default handshake ceiling (#459 evidence).
+        handshakeTimeout: PieControlLauncher.coldStartHandshakeTimeout,
         profileID: profile.id,
         modelConfig: .portableResolved(servedModelID: model, modelRef: modelRef),
         defaultTokenLimit: defaultTokenLimit

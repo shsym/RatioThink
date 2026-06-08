@@ -133,6 +133,45 @@ final class LaunchSpecResolverTests: XCTestCase {
                    "profile inferlet must still drive the launch even when the model is an explicit override")
   }
 
+  /// #459 timeout coherence: the production resolver must hand the engine a
+  /// cold-start boot budget aligned with the 120s request/shmem timeouts, not
+  /// the 30s test default — otherwise a slow large-model boot is killed by an
+  /// out-of-band handshake ceiling.
+  func test_resolveLauncherSpec_uses_coldStart_handshake_budget() throws {
+    let store = try makeSeededDefaultStore()
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake-handshake", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models-handshake", isDirectory: true)
+    let staged = URL(fileURLWithPath: LaunchSpecResolver.joinModelPath(
+      modelsRoot: modelsRoot, slug: ProfileStore.defaultChatModelID))
+    try FileManager.default.createDirectory(at: staged.deletingLastPathComponent(),
+                                            withIntermediateDirectories: true)
+    try Data("gguf".utf8).write(to: staged)
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-handshake") },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { self.tempDir.appendingPathComponent("hf-home-handshake", isDirectory: true) }
+    )
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(
+      profileID: ProfileStore.defaultProfileID) else {
+      return XCTFail("seeded default must resolve")
+    }
+    XCTAssertEqual(spec.handshakeTimeout, PieControlLauncher.coldStartHandshakeTimeout,
+                   "resolver must align the boot handshake with the 120s cold-start budget, not the 30s default")
+    XCTAssertGreaterThanOrEqual(spec.handshakeTimeout, 120,
+                                "cold-start budget must cover a slow large-model boot")
+  }
+
   /// A blank/whitespace `explicitModel` is treated as "no override" so a
   /// genuinely no-default profile still surfaces the choose/download path
   /// rather than booting an empty slug.

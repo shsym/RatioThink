@@ -304,13 +304,18 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// and the observer hopping over to reply.
   static let replyTimeoutSlack: TimeInterval = 2
 
-  /// PieControlLauncher's `handshakeTimeout` + WS install upper bound.
-  /// `LaunchSpec.handshakeTimeout` defaults to 30s; the WS
-  /// `installProgram` + `launchDaemon` rounds add at most a few
-  /// seconds on cold boot. 60s + slack is the safety net for the
-  /// XPC reply — the host itself will surface a real failure long
-  /// before this fires.
-  private static let startReplyDeadline: TimeInterval = 60
+  /// XPC reply safety net for start / restart. Must sit ABOVE the engine's
+  /// own process-lifetime lease (`LaunchSpec.handshakeTimeout` +
+  /// `PieEngineHost.launchTimeoutSlack`) so this fallback never reports a
+  /// premature `handshakeTimeout` for an engine that is still legitimately
+  /// cold-booting a large model (#459). The production resolver sets the boot
+  /// handshake to `PieControlLauncher.coldStartHandshakeTimeout` (120s); 15s
+  /// of headroom covers the host slack + WS `installProgram`/`launchDaemon`
+  /// rounds. The host surfaces a real `.failed` (or `.running`) via the
+  /// observer long before this fires; tests inject a short
+  /// `replyTimeoutOverride`.
+  private static let startReplyDeadline: TimeInterval =
+    PieControlLauncher.coldStartHandshakeTimeout + 15
 
   /// `LaunchedSession.shutdown` budget: SIGINT(10s) → SIGKILL(5s) =
   /// 15s in the worst case. Add slack.

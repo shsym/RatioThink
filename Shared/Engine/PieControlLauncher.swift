@@ -75,6 +75,21 @@ public enum PieControlLauncher {
   /// child environment instead of relying on TOML alone.
   static let requestTimeoutSeconds = 120
 
+  /// Cold-start handshake budget the production resolver hands to
+  /// `LaunchSpec.handshakeTimeout` (#459). The default `handshakeTimeout`
+  /// (30s) is sized for the `.dummy` test launcher; a real `pie serve` cold
+  /// boot also loads the model weights into the device before printing its
+  /// READY handshake, which on slower hardware / larger models can exceed
+  /// 30s — the user saw `tree-of-thought` killed at exactly 30s while the
+  /// request/shmem timeouts were already 120s. Align the boot handshake with
+  /// the same 120s budget so a legitimately-slow cold start is not killed by
+  /// an out-of-band 30s ceiling. `PieEngineHost` adds its small
+  /// `launchTimeoutSlack` on top to form the process-lifetime lease, and the
+  /// XPC reply deadlines (`HelperExportedAPI.startReplyDeadline`,
+  /// `AppXPCClient.restartReplyTimeout`) sit strictly above that lease so no
+  /// outer layer reports a premature failure for a still-booting engine.
+  public static let coldStartHandshakeTimeout: TimeInterval = TimeInterval(requestTimeoutSeconds)
+
   // MARK: - errors
 
   public enum LaunchError: Error, CustomStringConvertible {
