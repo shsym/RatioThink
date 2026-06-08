@@ -595,7 +595,9 @@ async def main() -> int:
                      f"(build: Scripts/stamp-chat-apc.sh write)")
     try:
         E.verify_stamp()
-    except Exception as e:
+    except SystemExit as e:
+        # _stamp.verify raises SystemExit (NOT Exception) on every failure, so
+        # this MUST catch SystemExit or the branches below are dead code.
         # A MISSING stamp file is a legit gate (prebuilt not generated yet) ->
         # clean SKIP. A PRESENT-but-mismatched/incomplete stamp means the wasm
         # is stale relative to the tree: that is a real regression and must
@@ -671,9 +673,6 @@ async def self_test() -> int:
     bodies = [{"model": MODEL, "messages": [{"role": "user", "content": "hi"}],
                "stream": True, "max_tokens": 8}]
 
-    def _gen_keys(rep: Report) -> list[str]:
-        return [k for k in rep.failure_keys if k == "generation_guard"]
-
     # Case A — heavy disabled (no corpus): only the smoke guard can fire.
     # Exactly one failure, and it must be the generation guard (all-400 is an
     # allowed per-request outcome, so without the guard there'd be 0 failures).
@@ -698,7 +697,52 @@ async def self_test() -> int:
     return 0 if passed else 1
 
 
+async def stamp_gate_self_test() -> int:
+    """Engine-free guard for the F5 stamp gate (review v1 F1). `verify_stamp`
+    (`_stamp.verify`) raises SystemExit — a BaseException, NOT Exception — so
+    main()'s `except` MUST name SystemExit or both stamp branches are dead.
+    Drive the REAL main() with `verify_stamp` monkeypatched to raise and assert:
+    a MISSING stamp file -> clean SKIP (rc 0); a PRESENT-but-stale stamp ->
+    FATAL (rc 1). Catches a regression to `except Exception` here."""
+
+    class _Path:  # stand-in whose .exists() we control; only attr main() needs
+        def __init__(self, present: bool) -> None:
+            self._present = present
+
+        def exists(self) -> bool:
+            return self._present
+
+    saved = (E.PIE_BIN, E.WASM_PATH, E.STAMP_PATH, E.verify_stamp)
+    # PIE_BIN / WASM_PATH must pass so main() reaches the stamp gate.
+    E.PIE_BIN = _Path(True)
+    E.WASM_PATH = _Path(True)
+
+    def _raise() -> None:
+        raise SystemExit("simulated stamp failure")
+
+    E.verify_stamp = _raise
+    try:
+        E.STAMP_PATH = _Path(False)  # missing stamp file -> clean SKIP
+        missing_rc = await main()
+        E.STAMP_PATH = _Path(True)   # present-but-stale -> FATAL
+        stale_rc = await main()
+    finally:
+        E.PIE_BIN, E.WASM_PATH, E.STAMP_PATH, E.verify_stamp = saved
+
+    passed = (missing_rc == 0 and stale_rc == 1)
+    print(f"[harsh-load] STAMP-GATE SELF-TEST {'PASS' if passed else 'FAIL'}: "
+          f"missing-stamp rc={missing_rc} (want 0 clean SKIP), "
+          f"present-but-stale rc={stale_rc} (want 1 FATAL)")
+    return 0 if passed else 1
+
+
+async def _all_self_tests() -> int:
+    rc_gen = await self_test()
+    rc_stamp = await stamp_gate_self_test()
+    return rc_gen or rc_stamp
+
+
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
-        sys.exit(asyncio.run(self_test()))
+        sys.exit(asyncio.run(_all_self_tests()))
     sys.exit(asyncio.run(main()))
