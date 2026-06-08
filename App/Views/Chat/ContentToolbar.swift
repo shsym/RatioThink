@@ -22,15 +22,23 @@ import SwiftUI
 struct ContentToolbar: View {
   @ObservedObject var viewModel: ChatTranscriptViewModel
   let availableProfiles: [String]
-  let availableModels: [String]
-  /// #460: the chat's persisted selected model (`Chat.modelID`) — the
-  /// single selection authority, read straight through for the label and
-  /// the swap-policy "from model". `nil` ⇒ the chat follows the active
-  /// profile's default (shown via `profileDefaultModel`).
+  /// #459's option list for the model menu (checkmark on current,
+  /// profile-default annotation, unavailable reasons, "Manage Models…").
+  /// Built by `ChatScaffoldView` from `Chat.modelID` (the #460 authority) +
+  /// the served/discovered models.
+  let modelOptions: [ToolbarModelOptions.Option]
+  /// #459's collapsed model-menu summary (concrete leaf + optional
+  /// annotation). `ChatScaffoldView` derives it from `Chat.modelID`.
+  let currentModelSummary: ToolbarModelOptions.CurrentSummary?
+  /// #460: the chat's persisted selected model (`Chat.modelID`) — the single
+  /// selection authority. Resolves the swap-policy "from model" and the
+  /// model-menu clear-vs-load decision; `nil` ⇒ the chat follows the active
+  /// profile's default. NOT engine residency (residency is not a selection
+  /// source under the single authority).
   let selectedModelID: String?
-  /// #460: the active profile's default model, used to render the label
-  /// when the chat is unpinned and to resolve the effective "from model"
-  /// the swap policy compares against.
+  /// #460: the active profile's default model — resolves the effective
+  /// "from model" (`selectedModelID ?? profileDefaultModel`) the swap policy
+  /// compares against.
   let profileDefaultModel: String?
   /// #460: persists a confirmed profile swap (profile + optional pinned
   /// model) — wired by `ChatScaffoldView`, which owns the SwiftData write.
@@ -41,7 +49,7 @@ struct ContentToolbar: View {
   /// Returns `false` on a save failure so the coordinator skips the load.
   let commitModel: (String) -> Bool
   /// #460: clears the per-chat model pin so the chat follows the profile
-  /// default again ("Use profile default") — wired by `ChatScaffoldView`.
+  /// default again — wired by `ChatScaffoldView`.
   let onUseProfileDefault: () -> Void
   /// Swap coordinator. Required — review v1 F9: defaulting this to a
   /// preview-only `previewDefault()` let a forgotten injection at any
@@ -78,13 +86,17 @@ struct ContentToolbar: View {
   /// engine" action.
   let onStartEngine: () -> Void
 
+  @Environment(\.openSettings) private var openSettings
+  @EnvironmentObject private var settingsNavigation: SettingsNavigation
+
   @State private var showParamsPopover = false
   @State private var showSystemPopover = false
 
   init(
     viewModel: ChatTranscriptViewModel,
     availableProfiles: [String] = ["chat"],
-    availableModels: [String] = ChatTranscriptViewModel.placeholderModels,
+    modelOptions: [ToolbarModelOptions.Option] = [],
+    currentModelSummary: ToolbarModelOptions.CurrentSummary? = nil,
     selectedModelID: String? = nil,
     profileDefaultModel: String? = nil,
     commitSwap: @escaping ProfileSwapCoordinator.SwapCommit = { _, _ in true },
@@ -100,7 +112,8 @@ struct ContentToolbar: View {
   ) {
     self.viewModel = viewModel
     self.availableProfiles = availableProfiles
-    self.availableModels = availableModels
+    self.modelOptions = modelOptions
+    self.currentModelSummary = currentModelSummary
     self.selectedModelID = selectedModelID
     self.profileDefaultModel = profileDefaultModel
     self.commitSwap = commitSwap
@@ -190,7 +203,8 @@ struct ContentToolbar: View {
           estimatedTotalBytes: nil,
           estimatedEtaSeconds: nil,
           onConfirm: { setAsDefault in swapCoordinator.confirm(token: capturedToken, setAsDefault: setAsDefault) },
-          onCancel:  { swapCoordinator.cancel(token: capturedToken) }
+          onCancel:  { swapCoordinator.cancel(token: capturedToken) },
+          onKeepCurrent: { swapCoordinator.keepCurrentModel(token: capturedToken) }
         )
       }
     }
@@ -206,53 +220,97 @@ struct ContentToolbar: View {
 
   private var modelMenu: some View {
     Menu {
-      Button("Use profile default") { onUseProfileDefault() }
-      Divider()
-      ForEach(availableModels, id: \.self) { id in
-        // Stored id is the resolvable `<repo>/<file>` slug; show the
-        // friendly leaf.
-        Button(ModelDisplayName.leaf(id)) {
-          // #460: route through the confirm gate against the chat's EXPLICIT
-          // selection (`selectedModelID` = `Chat.modelID`), NOT the profile
-          // default. Picking a model that differs from the current pin
-          // publishes a swap confirm (with "Set as default for this
-          // profile"); picking the already-selected/resident model just pins
-          // it, no load. The profile default is the PROFILE's model, not the
-          // user's pick, so it must not silence an explicit menu choice —
-          // `reconcileEngineResidentModel` seeds `selectedModelID` to the
-          // served model, so in steady state this equals what is loaded.
-          // `commitModel` persists onto `Chat.modelID`.
-          swapCoordinator.requestModelOverride(
-            modelID: id,
-            activeProfileID: viewModel.selectedProfileID,
-            fromModel: selectedModelID,
-            commit: commitModel
-          )
+      // #459's richer option list (checkmark on current, profile-default
+      // annotation, unavailable reasons, "Manage Models…") kept; the write
+      // is routed to `Chat.modelID` (the #460 authority) in `selectModel`.
+      ForEach(modelOptions) { option in
+        Button {
+          selectModel(option)
+        } label: {
+          modelOptionLabel(option)
         }
+        .help(option.unavailableReason.map { "\(option.slug) — \($0)" } ?? option.slug)
+        .accessibilityValue(option.unavailableReason.map { "\(option.slug), \($0)" } ?? option.slug)
+        .disabled(!option.isSelectable)
       }
+      if !modelOptions.isEmpty { Divider() }
+      Button {
+        openModelsSettings()
+      } label: {
+        Label("Manage Models…", systemImage: "gearshape")
+      }
+      .help("Open Settings → Models")
+      .accessibilityIdentifier("toolbar.model.manageModels")
     } label: {
       HStack(spacing: 4) {
         Image(systemName: "shippingbox")
-        Text("Model: \(modelMenuLabel)")
+        // #462: bound the title so a long model name truncates rather than
+        // pushing the toolbar past the window edge. No `.fixedSize()` — it
+        // would pin the label non-compressible and re-break layout. The full
+        // id stays inspectable via the menu-level `.help(modelMenuHelp)` +
+        // accessibility value below. #460: `modelMenuTitle` reads
+        // `currentModelSummary`, which `ChatScaffoldView` builds from
+        // `Chat.modelID` (the authority).
+        Text("Model: \(modelMenuTitle)")
+          .boundedModelName()
       }
     }
     .menuStyle(.borderlessButton)
-    .fixedSize()
+    .help(modelMenuHelp)
     .accessibilityIdentifier("toolbar.model")
+    .accessibilityLabel("Model")
+    .accessibilityValue(modelMenuAccessibilityValue)
   }
 
-  /// Toolbar model label: the pinned model's leaf, else the profile
-  /// default's leaf, else "Profile default" when the active profile has
-  /// none. #460: reads the persisted authority so it stays stable across a
-  /// profile switch / new chat instead of resetting.
-  private var modelMenuLabel: String {
-    Self.modelLabel(selectedModelID: selectedModelID, profileDefaultModel: profileDefaultModel)
+  @ViewBuilder
+  private func modelOptionLabel(_ option: ToolbarModelOptions.Option) -> some View {
+    let text = modelOptionText(option)
+    if option.isCurrent {
+      Label(text, systemImage: "checkmark")
+    } else if option.unavailableReason != nil {
+      Label(text, systemImage: "exclamationmark.triangle")
+    } else {
+      Text(text)
+    }
+  }
+
+  private func modelOptionText(_ option: ToolbarModelOptions.Option) -> String {
+    var text = option.displayName + (option.isProfileDefault ? " (profile default)" : "")
+    if let reason = option.unavailableReason { text += " — \(reason)" }
+    return text
+  }
+
+  private var modelMenuTitle: String {
+    guard let currentModelSummary else { return "Choose model" }
+    if currentModelSummary.annotation != nil {
+      return "\(currentModelSummary.displayName) (Default)"
+    }
+    return currentModelSummary.displayName
+  }
+
+  private var modelMenuHelp: String {
+    guard let currentModelSummary else { return "Choose a model" }
+    if let annotation = currentModelSummary.annotation {
+      return "\(annotation): \(currentModelSummary.slug)"
+    }
+    return currentModelSummary.slug
+  }
+
+  private var modelMenuAccessibilityValue: String {
+    guard let currentModelSummary else { return "No model selected" }
+    if let annotation = currentModelSummary.annotation {
+      return "\(currentModelSummary.slug), \(annotation)"
+    }
+    return currentModelSummary.slug
   }
 
   /// Pure label derivation (#460) — `internal` (not `private`) so the
   /// label-stability contract is unit-tested without a view host: the same
   /// inputs always yield the same friendly leaf, so a preserved selection
-  /// renders an unchanged label across a profile switch / new chat.
+  /// renders an unchanged label across a profile switch / new chat. The
+  /// collapsed toolbar label itself now renders the richer #459
+  /// `modelMenuTitle` (built from `currentModelSummary`); this pure helper
+  /// pins the leaf-derivation contract that the summary relies on.
   static func modelLabel(selectedModelID: String?, profileDefaultModel: String?) -> String {
     if let selectedModelID, !selectedModelID.isEmpty { return ModelDisplayName.leaf(selectedModelID) }
     if let profileDefaultModel, !profileDefaultModel.isEmpty { return ModelDisplayName.leaf(profileDefaultModel) }
@@ -266,11 +324,53 @@ struct ContentToolbar: View {
     // not engine residency. `commitSwap` persists the profile and — only on
     // a confirm-and-switch — the new pinned model; a silent swap preserves
     // the current model (`pinModel == nil`).
+    // #459 "Keep Current Model" needs no `setOverride` under the single
+    // authority: the coordinator builds the keep-current action from this
+    // same `commitSwap`, pinning the CURRENT model (`fromModel`) instead of
+    // the new default — both write `Chat.modelID`.
     swapCoordinator.requestSwap(
       toProfileID: id,
       fromModel: effectiveModelID,
       commit: commitSwap
     )
+  }
+
+  private func selectModel(_ option: ToolbarModelOptions.Option) {
+    // #460: the clear-vs-load decision keys on the chat's SELECTION
+    // (`selectedModelID` = `Chat.modelID`), NOT engine residency — residency
+    // must not be a selection source. `selectionAction`'s `residentModelID`
+    // parameter is the "current concrete model" it compares the picked row
+    // against; under the single authority that is the chat's pin.
+    switch ToolbarModelOptions.selectionAction(for: option,
+                                               residentModelID: selectedModelID) {
+    case .unavailable:
+      return
+    case .clearOverride:
+      // Picking the profile-default row while it is already the chat's
+      // selection clears the pin so the chat follows the profile default.
+      onUseProfileDefault()
+    case let .requestModel(modelID, overrideAfterConfirmation):
+      // Confirm gate against the chat's current pin; on confirm, persist the
+      // result onto `Chat.modelID`. A `nil` `overrideAfterConfirmation`
+      // (concrete profile-default row) clears the pin so the chat keeps
+      // profile-default semantics rather than persisting a redundant pin.
+      swapCoordinator.requestModelOverride(
+        modelID: modelID,
+        activeProfileID: viewModel.selectedProfileID,
+        fromModel: selectedModelID
+      ) { _ in
+        if let overrideAfterConfirmation {
+          return commitModel(overrideAfterConfirmation)
+        }
+        onUseProfileDefault()
+        return true
+      }
+    }
+  }
+
+  private func openModelsSettings() {
+    settingsNavigation.open(.models)
+    openSettings()
   }
 
   /// `Binding<Bool>` derived from the coordinator's optional pending

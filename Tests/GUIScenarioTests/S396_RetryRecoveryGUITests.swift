@@ -49,8 +49,9 @@ final class S396_RetryRecoveryGUITests: XCTestCase {
         + "label=\(indicator.label); app: \(app.debugDescription)")
 
     // The failed popover offers a recovery action AND a dismiss.
-    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
-                  "indicator popover did not open over the failed load; app: \(app.debugDescription)")
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app, expecting: .retry),
+                  "indicator popover did not open with a Retry action; app: \(app.debugDescription); "
+                    + "popover: \(app.popovers.firstMatch.debugDescription)")
     let retry = app.popovers.buttons.matching(NSPredicate(format: "label == %@", "Retry")).firstMatch
     XCTAssertTrue(retry.waitForExistence(timeout: 5),
                   "failed popover did not offer a Retry recovery action (#396); "
@@ -100,8 +101,9 @@ final class S396_RetryRecoveryGUITests: XCTestCase {
       waitForLabel(indicator, beginsWith: "Load failed", timeout: 20),
       "load did not surface as 'Load failed'; label=\(indicator.label); app: \(app.debugDescription)")
 
-    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
-                  "indicator popover did not open; app: \(app.debugDescription)")
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app, expecting: .dismiss),
+                  "indicator popover did not open with a Dismiss action; app: \(app.debugDescription); "
+                    + "popover: \(app.popovers.firstMatch.debugDescription)")
     let dismiss = app.popovers.buttons.matching(NSPredicate(format: "label == %@", "Dismiss")).firstMatch
     XCTAssertTrue(dismiss.waitForExistence(timeout: 5),
                   "failed popover missing Dismiss; popover: \(app.popovers.firstMatch.debugDescription)")
@@ -143,7 +145,7 @@ final class S396_RetryRecoveryGUITests: XCTestCase {
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     app.launch()
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
     return app
   }
@@ -155,15 +157,7 @@ final class S396_RetryRecoveryGUITests: XCTestCase {
                   "New Chat button missing; app: \(app.debugDescription)")
     newChat.click()
 
-    let modelMenu = app.menuButtons["toolbar.model"]
-    XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
-                  "model menu missing after creating chat; app: \(app.debugDescription)")
-    modelMenu.click()
-
-    let modelItem = app.menuItems[Self.menuModelLeaf]
-    XCTAssertTrue(modelItem.waitForExistence(timeout: 5),
-                  "seeded model '\(Self.menuModelLeaf)' missing from menu; app: \(app.debugDescription)")
-    modelItem.click()
+    try selectSeededModelFromToolbar(in: app)
 
     let switchButton = app.buttons.matching(NSPredicate(format: "label == %@", "Switch")).firstMatch
     XCTAssertTrue(switchButton.waitForExistence(timeout: 5),
@@ -171,20 +165,93 @@ final class S396_RetryRecoveryGUITests: XCTestCase {
     switchButton.click()
   }
 
+  /// Select the seeded model from the native toolbar `Menu` with the same
+  /// reconcile-aware retry/reopen loop as S302. The retry GUI suite drives the
+  /// same production model-menu path, so keep the hardened native-menu handling
+  /// in sync with S302's helper.
   @MainActor
-  private func openIndicatorPopover(_ indicator: XCUIElement, in app: XCUIApplication) -> Bool {
+  private func selectSeededModelFromToolbar(in app: XCUIApplication) throws {
+    let modelMenu = app.menuButtons["toolbar.model"]
+    XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
+                  "model menu missing after creating chat; app: \(app.debugDescription)")
+
+    let deadline = Date().addingTimeInterval(15)
+    var lastMenuDescription = ""
+    var attempt = 0
+    while Date() < deadline {
+      attempt += 1
+      modelMenu.click()
+      let modelItem = seededModelMenuItem(in: app)
+      if modelItem.waitForExistence(timeout: 2) {
+        // Let the native menu finish opening before traversing/tapping; this
+        // avoids the observed `open menu during menu traversal` boundary.
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.35))
+        if modelItem.exists {
+          modelItem.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+          return
+        }
+      }
+      lastMenuDescription = app.debugDescription
+      app.typeKey(.escape, modifierFlags: [])
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.3))
+    }
+
+    XCTFail("seeded model '\(Self.menuModelLeaf)' missing from toolbar model menu after reconcile-aware retries; "
+      + "attempts=\(attempt); app: \(lastMenuDescription)")
+    throw NSError(domain: "S396.RetryRecoveryGUITests", code: 1)
+  }
+
+  private func seededModelMenuItem(in app: XCUIApplication) -> XCUIElement {
+    app.menuItems[Self.menuModelLeaf]
+  }
+
+  @MainActor
+  private func openIndicatorPopover(
+    _ indicator: XCUIElement,
+    in app: XCUIApplication,
+    expecting expectation: IndicatorPopoverExpectation
+  ) -> Bool {
     _ = waitForNoPopover(app, timeout: 5)
     var attempts = 0
-    while app.popovers.count == 0 && attempts < 5 {
+    while attempts < 5 {
       attempts += 1
+      if app.popovers.count > 0 {
+        app.typeKey(.escape, modifierFlags: [])
+        _ = waitForNoPopover(app, timeout: 2)
+      }
       indicator.click()
-      let deadline = Date().addingTimeInterval(2.0)
-      while Date() < deadline {
-        if app.popovers.count > 0 { return true }
-        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+      if waitForPopoverContent(expectation, in: app, timeout: 3) { return true }
+    }
+    return waitForPopoverContent(expectation, in: app, timeout: 1)
+  }
+
+  private enum IndicatorPopoverExpectation {
+    case retry
+    case dismiss
+
+    var label: String {
+      switch self {
+      case .retry:   return "Retry"
+      case .dismiss: return "Dismiss"
       }
     }
-    return app.popovers.count > 0
+
+    func element(in app: XCUIApplication) -> XCUIElement {
+      app.popovers.buttons.matching(NSPredicate(format: "label == %@", label)).firstMatch
+    }
+  }
+
+  private func waitForPopoverContent(
+    _ expectation: IndicatorPopoverExpectation,
+    in app: XCUIApplication,
+    timeout: TimeInterval
+  ) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if expectation.element(in: app).exists { return true }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+    }
+    return expectation.element(in: app).exists
   }
 
   private func waitForLabel(_ element: XCUIElement,

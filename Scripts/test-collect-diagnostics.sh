@@ -40,7 +40,7 @@ exit 0
 EOF
   chmod +x "$d/spctl" "$d/launchctl" "$d/log"
 }
-mini_app() { # <app_path> — minimal RatioThink.app with a version so it's "present"
+mini_app() { # <app_path> — minimal Rational.app with a version so it's "present"
   mkdir -p "$1/Contents"
   cat > "$1/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -56,12 +56,12 @@ extract_bundle() { # <out_dir> <dest>
   [ -n "$zip" ] || { echo "NO_ZIP"; return 1; }
   mkdir -p "$dest"
   ditto -x -k "$zip" "$dest" 2>/dev/null || unzip -q "$zip" -d "$dest"
-  find "$dest" -type d -name 'RatioThink-diagnostics-*' | head -1
+  find "$dest" -type d -name 'Rational-diagnostics-*' | head -1
 }
 
 echo "case A: empty-log / helper-missing"
 A="$WORK_ROOT/A"; mkdir -p "$A/out"
-RATIOTHINK_APP="$A/nonexistent/RatioThink.app" \
+RATIOTHINK_APP="$A/nonexistent/Rational.app" \
 PIE_HOME="$A/home" \
 RATIOTHINK_DIAG_CRASH_DIR="$A/crash" \
 RATIOTHINK_DIAG_OUT_DIR="$A/out" \
@@ -74,7 +74,7 @@ assert_exists "$bundleA/unified-log.txt" "A: unified-log section present"
 
 echo "case B: happy-path bundle shape + redaction"
 B="$WORK_ROOT/B"; mkdir -p "$B/out" "$B/crash" "$B/home/logs"
-APP="$B/app/RatioThink.app"; mkdir -p "$APP/Contents"
+APP="$B/app/Rational.app"; mkdir -p "$APP/Contents"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -87,7 +87,7 @@ PLIST
 printf '2026-05-30T00:00:00Z app app.launch version=9.9.9 path=%s/Library/x token=abcd1234 hf_SECRETTOKEN\n' "$HOME" > "$B/home/logs/app.log"
 echo "2026-05-30T00:00:01Z helper helper.launch version=9.9.9" > "$B/home/logs/helper.log"
 echo "engine starting" > "$B/home/logs/engine.log"
-echo "fake crash" > "$B/crash/RatioThink-2026-05-30.ips"
+echo "fake crash" > "$B/crash/Rational-2026-05-30.ips"
 
 RATIOTHINK_APP="$APP" \
 PIE_HOME="$B/home" \
@@ -112,19 +112,45 @@ if grep -qF "$HOME/Library/x" "$bundleB/app-logs/app.log"; then
 
 echo "case C: main-app crash report must classify APP_CRASHED, not OK (F1)"
 C="$WORK_ROOT/C"; mkdir -p "$C/out" "$C/crash" "$C/home/logs"
-CAPP="$C/app/RatioThink.app"; mkdir -p "$CAPP/Contents"
+CAPP="$C/app/Rational.app"; mkdir -p "$CAPP/Contents"
 cat > "$CAPP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>1.0</string></dict></plist>
 PLIST
 echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$C/home/logs/helper.log"
-echo "fake app crash" > "$C/crash/RatioThink-2026-05-30-120000.ips"
+echo "fake app crash" > "$C/crash/Rational-2026-05-30-120000.ips"
 RATIOTHINK_APP="$CAPP" PIE_HOME="$C/home" RATIOTHINK_DIAG_CRASH_DIR="$C/crash" \
 RATIOTHINK_DIAG_OUT_DIR="$C/out" bash "$SCRIPT" --window 1m >/dev/null
 bundleC="$(extract_bundle "$C/out" "$C/x")"
 assert_contains "$bundleC/report.txt" "APP_CRASHED" "C: main-app crash classified APP_CRASHED"
 refute_contains "$bundleC/report.txt" "OK: no failure signature" "C: does not print OK when app crashed"
+
+echo "case Clegacy: legacy RatioThink app/helper crash reports collected + classified during rename migration"
+CL="$WORK_ROOT/Clegacy"; mkdir -p "$CL/out" "$CL/crash" "$CL/home/logs"
+mini_app "$CL/app/Rational.app"
+echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$CL/home/logs/helper.log"
+echo "fake legacy app crash" > "$CL/crash/RatioThink-2026-05-30-120000.ips"
+echo "fake legacy helper crash" > "$CL/crash/RatioThinkHelper-2026-05-30-120001.ips"
+RATIOTHINK_APP="$CL/app/Rational.app" PIE_HOME="$CL/home" RATIOTHINK_DIAG_CRASH_DIR="$CL/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$CL/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleCL="$(extract_bundle "$CL/out" "$CL/x")"
+assert_exists "$bundleCL/crash-reports/RatioThink-2026-05-30-120000.ips" "Clegacy: legacy app crash report copied"
+assert_exists "$bundleCL/crash-reports/RatioThinkHelper-2026-05-30-120001.ips" "Clegacy: legacy helper crash report copied"
+assert_contains "$bundleCL/report.txt" "APP_CRASHED_LEGACY" "Clegacy: legacy app crash classified explicitly"
+assert_contains "$bundleCL/report.txt" "HELPER_CRASHED_OR_DEGRADED_LEGACY" "Clegacy: legacy helper crash classified explicitly"
+
+echo "case Cmixedhelper: current + legacy helper crash reports both classify during rename migration"
+CMH="$WORK_ROOT/Cmixedhelper"; mkdir -p "$CMH/out" "$CMH/crash" "$CMH/home/logs"
+mini_app "$CMH/app/Rational.app"
+echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$CMH/home/logs/helper.log"
+echo "fake current helper crash" > "$CMH/crash/RationalHelper-2026-05-30-120000.ips"
+echo "fake legacy helper crash" > "$CMH/crash/RatioThinkHelper-2026-05-30-120001.ips"
+RATIOTHINK_APP="$CMH/app/Rational.app" PIE_HOME="$CMH/home" RATIOTHINK_DIAG_CRASH_DIR="$CMH/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$CMH/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleCMH="$(extract_bundle "$CMH/out" "$CMH/x")"
+assert_contains "$bundleCMH/report.txt" "HELPER_CRASHED_OR_DEGRADED: a recent Rational Helper crash report exists" "Cmixedhelper: current helper crash classified"
+assert_contains "$bundleCMH/report.txt" "HELPER_CRASHED_OR_DEGRADED_LEGACY" "Cmixedhelper: legacy helper crash classified alongside current helper"
 
 echo "case D: Bearer base64 token (+/=) fully redacted (F5)"
 D="$WORK_ROOT/D"; mkdir -p "$D/out" "$D/crash" "$D/home/logs"
@@ -148,57 +174,57 @@ refute_contains "$bundleE/report.txt" "ENGINE_FAILED" "E: benign 'error' does no
 
 echo "case F: Rust panic in engine.log (stdout/stderr tee) classifies ENGINE_FAILED"
 F="$WORK_ROOT/F"; mkdir -p "$F/out" "$F/crash" "$F/home/logs"
-mini_app "$F/app/RatioThink.app"
+mini_app "$F/app/Rational.app"
 echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$F/home/logs/helper.log"
 # Serve-path tracing goes to pie.log.<date>, NOT stdout — engine.log only sees
 # panic prose. Use the real signal that DOES reach it.
 echo "thread 'tokio-runtime-worker' panicked at runtime/src/server.rs:42:1: assertion failed" > "$F/home/logs/engine.log"
-RATIOTHINK_APP="$F/app/RatioThink.app" PIE_HOME="$F/home" RATIOTHINK_DIAG_CRASH_DIR="$F/crash" \
+RATIOTHINK_APP="$F/app/Rational.app" PIE_HOME="$F/home" RATIOTHINK_DIAG_CRASH_DIR="$F/crash" \
 RATIOTHINK_DIAG_OUT_DIR="$F/out" bash "$SCRIPT" --window 1m >/dev/null
 bundleF="$(extract_bundle "$F/out" "$F/x")"
 assert_contains "$bundleF/report.txt" "ENGINE_FAILED" "F: 'panicked at' in engine.log trips ENGINE_FAILED"
 
 echo "case Fb: engine.fail breadcrumb in helper.log classifies ENGINE_FAILED"
 FB="$WORK_ROOT/Fb"; mkdir -p "$FB/out" "$FB/crash" "$FB/home/logs"
-mini_app "$FB/app/RatioThink.app"
+mini_app "$FB/app/Rational.app"
 printf '2026-05-30T00:00:00Z helper helper.launch version=1.0\n2026-05-30T12:00:00Z helper engine.fail code=spawnFailed\n' > "$FB/home/logs/helper.log"
-RATIOTHINK_APP="$FB/app/RatioThink.app" PIE_HOME="$FB/home" RATIOTHINK_DIAG_CRASH_DIR="$FB/crash" \
+RATIOTHINK_APP="$FB/app/Rational.app" PIE_HOME="$FB/home" RATIOTHINK_DIAG_CRASH_DIR="$FB/crash" \
 RATIOTHINK_DIAG_OUT_DIR="$FB/out" bash "$SCRIPT" --window 1m >/dev/null
 bundleFb="$(extract_bundle "$FB/out" "$FB/x")"
 assert_contains "$bundleFb/report.txt" "ENGINE_FAILED" "Fb: engine.fail breadcrumb trips ENGINE_FAILED"
 
 echo "case Fp: real serve-path teardown line in DATE-ROLLED pie.log.<date> -> ENGINE_FAILED (V1)"
 FP="$WORK_ROOT/Fp"; mkdir -p "$FP/out" "$FP/crash" "$FP/home/logs"
-mini_app "$FP/app/RatioThink.app"
+mini_app "$FP/app/Rational.app"
 echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$FP/home/logs/helper.log"
 # pie writes tracing_appender rolling::daily -> pie.log.<date>, never literal
 # pie.log; the real engine-death line is lifecycle.rs's "driver ... exited
 # unexpectedly". Both the dated filename and the anchored line are required.
 echo "2026-05-30T12:00:00Z  ERROR pie_server: driver shmem-abc123 exited unexpectedly; tearing down" > "$FP/home/logs/pie.log.2026-05-30"
-RATIOTHINK_APP="$FP/app/RatioThink.app" PIE_HOME="$FP/home" RATIOTHINK_DIAG_CRASH_DIR="$FP/crash" \
+RATIOTHINK_APP="$FP/app/Rational.app" PIE_HOME="$FP/home" RATIOTHINK_DIAG_CRASH_DIR="$FP/crash" \
 RATIOTHINK_DIAG_OUT_DIR="$FP/out" bash "$SCRIPT" --window 1m >/dev/null
 bundleFp="$(extract_bundle "$FP/out" "$FP/x")"
 assert_contains "$bundleFp/report.txt" "ENGINE_FAILED" "Fp: pie.log.<date> teardown line trips ENGINE_FAILED"
 
 echo "case Fn: recoverable per-request ERROR in pie.log.<date> must NOT classify ENGINE_FAILED (V2)"
 FN="$WORK_ROOT/Fn"; mkdir -p "$FN/out" "$FN/crash" "$FN/home/logs"
-mini_app "$FN/app/RatioThink.app"
+mini_app "$FN/app/Rational.app"
 echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$FN/home/logs/helper.log"
 # pie logs tracing::error! for recoverable churn (user quits mid-stream) — the
 # engine keeps serving; this must not read as engine death.
 echo "2026-05-30T12:00:00Z  ERROR pie_server::server: Error writing to ws stream: Broken pipe" > "$FN/home/logs/pie.log.2026-05-30"
-RATIOTHINK_APP="$FN/app/RatioThink.app" PIE_HOME="$FN/home" RATIOTHINK_DIAG_CRASH_DIR="$FN/crash" \
+RATIOTHINK_APP="$FN/app/Rational.app" PIE_HOME="$FN/home" RATIOTHINK_DIAG_CRASH_DIR="$FN/crash" \
 RATIOTHINK_DIAG_OUT_DIR="$FN/out" bash "$SCRIPT" --window 1m >/dev/null
 bundleFn="$(extract_bundle "$FN/out" "$FN/x")"
 refute_contains "$bundleFn/report.txt" "ENGINE_FAILED" "Fn: recoverable ws-write ERROR does not trip ENGINE_FAILED"
 
 echo "case G: all-clear with recent Unified Log activity -> verified OK headline (F2)"
 G="$WORK_ROOT/G"; mkdir -p "$G/out" "$G/crash" "$G/home/logs" "$G/bin"
-mini_app "$G/app/RatioThink.app"
+mini_app "$G/app/Rational.app"
 echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$G/home/logs/helper.log"
 printf '2026-05-30 12:00:00 com.ratiothink.app: ready\n' > "$G/unified.fixture"
 make_shims "$G/bin" "$G/unified.fixture"
-PATH="$G/bin:$PATH" RATIOTHINK_APP="$G/app/RatioThink.app" PIE_HOME="$G/home" \
+PATH="$G/bin:$PATH" RATIOTHINK_APP="$G/app/Rational.app" PIE_HOME="$G/home" \
 RATIOTHINK_DIAG_CRASH_DIR="$G/crash" RATIOTHINK_DIAG_OUT_DIR="$G/out" \
   bash "$SCRIPT" --window 1m >/dev/null
 bundleG="$(extract_bundle "$G/out" "$G/x")"
@@ -207,11 +233,11 @@ assert_contains "$bundleG/report.txt" "recent activity found"    "G: claims rece
 
 echo "case H: all-clear with NO recent Unified Log activity -> unverified headline (F2)"
 H="$WORK_ROOT/H"; mkdir -p "$H/out" "$H/crash" "$H/home/logs" "$H/bin"
-mini_app "$H/app/RatioThink.app"
+mini_app "$H/app/Rational.app"
 echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$H/home/logs/helper.log"
 : > "$H/unified.empty"
 make_shims "$H/bin" "$H/unified.empty"
-PATH="$H/bin:$PATH" RATIOTHINK_APP="$H/app/RatioThink.app" PIE_HOME="$H/home" \
+PATH="$H/bin:$PATH" RATIOTHINK_APP="$H/app/Rational.app" PIE_HOME="$H/home" \
   RATIOTHINK_DIAG_CRASH_DIR="$H/crash" RATIOTHINK_DIAG_OUT_DIR="$H/out" \
   bash "$SCRIPT" --window 1m >/dev/null
 bundleH="$(extract_bundle "$H/out" "$H/x")"
@@ -221,16 +247,47 @@ refute_contains "$bundleH/report.txt" "recent activity found"                 "H
 
 echo "case Fc: seeded pie crash report (pie-<date>.ips) -> ENGINE_FAILED + collected"
 FC="$WORK_ROOT/Fc"; mkdir -p "$FC/out" "$FC/crash" "$FC/home/logs"
-mini_app "$FC/app/RatioThink.app"
+mini_app "$FC/app/Rational.app"
 echo "2026-05-30T00:00:00Z helper helper.launch version=1.0" > "$FC/home/logs/helper.log"
 # The engine reports as `pie` -> pie-<date>.ips; classify() greps -name
 # 'pie-[0-9]*' and section_crash_reports copies it into crash-reports/.
 echo '{"app_name":"pie","fake":"crash"}' > "$FC/crash/pie-2026-05-30-120000.ips"
-RATIOTHINK_APP="$FC/app/RatioThink.app" PIE_HOME="$FC/home" RATIOTHINK_DIAG_CRASH_DIR="$FC/crash" \
+RATIOTHINK_APP="$FC/app/Rational.app" PIE_HOME="$FC/home" RATIOTHINK_DIAG_CRASH_DIR="$FC/crash" \
 RATIOTHINK_DIAG_OUT_DIR="$FC/out" bash "$SCRIPT" --window 1m >/dev/null
 bundleFc="$(extract_bundle "$FC/out" "$FC/x")"
 assert_contains "$bundleFc/report.txt" "ENGINE_FAILED" "Fc: seeded pie crash trips ENGINE_FAILED"
 assert_exists "$bundleFc/crash-reports/pie-2026-05-30-120000.ips" "Fc: pie crash report copied into bundle"
+
+echo "case Ft: #447 engine.terminated FAULT cause -> ENGINE_FAILED + surfaced cause"
+FT="$WORK_ROOT/Ft"; mkdir -p "$FT/out" "$FT/crash" "$FT/home/logs"
+mini_app "$FT/app/RatioThink.app"
+# A structured fault breadcrumb AND adjacent chat-like prose: the verdict must
+# name the cause (segfault) but the cause extraction is scalar-only and must
+# NOT echo the seeded chat text into report.txt.
+{
+  echo "2026-05-30T00:00:00Z helper helper.launch version=1.0"
+  echo "2026-05-30T12:00:00Z helper engine.terminated cause=segfault initiator=engine signal=11 name=SIGSEGV"
+  echo "2026-05-30T12:00:01Z helper chat.note assistant=TERMINATED_CHATSECRET_should_never_surface"
+} > "$FT/home/logs/helper.log"
+RATIOTHINK_APP="$FT/app/RatioThink.app" PIE_HOME="$FT/home" RATIOTHINK_DIAG_CRASH_DIR="$FT/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$FT/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleFt="$(extract_bundle "$FT/out" "$FT/x")"
+assert_contains "$bundleFt/report.txt" "ENGINE_FAILED" "Ft: engine.terminated fault trips ENGINE_FAILED"
+assert_contains "$bundleFt/report.txt" "cause=segfault" "Ft: verdict surfaces the death cause"
+refute_contains "$bundleFt/report.txt" "CHATSECRET" "Ft: verdict never echoes adjacent log prose (scalar cause only)"
+
+echo "case Fu: #447 engine.terminated NORMAL stop must NOT trip ENGINE_FAILED"
+FU="$WORK_ROOT/Fu"; mkdir -p "$FU/out" "$FU/crash" "$FU/home/logs"
+mini_app "$FU/app/RatioThink.app"
+{
+  echo "2026-05-30T00:00:00Z helper helper.launch version=1.0"
+  echo "2026-05-30T12:00:00Z helper engine.terminated cause=userStop initiator=user"
+  echo "2026-05-30T12:05:00Z helper engine.terminated cause=helperShutdown initiator=helper"
+} > "$FU/home/logs/helper.log"
+RATIOTHINK_APP="$FU/app/RatioThink.app" PIE_HOME="$FU/home" RATIOTHINK_DIAG_CRASH_DIR="$FU/crash" \
+RATIOTHINK_DIAG_OUT_DIR="$FU/out" bash "$SCRIPT" --window 1m >/dev/null
+bundleFu="$(extract_bundle "$FU/out" "$FU/x")"
+refute_contains "$bundleFu/report.txt" "ENGINE_FAILED" "Fu: user/helper stop is not an engine failure"
 
 # --- chat-collection removal (#399) -----------------------------------------
 # Privacy invariant: a diagnostics bundle must NEVER carry chat content, under
@@ -264,8 +321,8 @@ if [ -n "${RATIOTHINK_BUNDLED_SCRIPT:-}" ] && [ -f "${RATIOTHINK_BUNDLED_SCRIPT}
   BUNDLED_SCRIPT="$RATIOTHINK_BUNDLED_SCRIPT"
 elif [ -n "${RATIOTHINK_APP:-}" ] && [ -f "${RATIOTHINK_APP}/Contents/Resources/collect-diagnostics.sh" ]; then
   BUNDLED_SCRIPT="${RATIOTHINK_APP}/Contents/Resources/collect-diagnostics.sh"
-elif [ -f "/Applications/RatioThink.app/Contents/Resources/collect-diagnostics.sh" ]; then
-  BUNDLED_SCRIPT="/Applications/RatioThink.app/Contents/Resources/collect-diagnostics.sh"
+elif [ -f "/Applications/Rational.app/Contents/Resources/collect-diagnostics.sh" ]; then
+  BUNDLED_SCRIPT="/Applications/Rational.app/Contents/Resources/collect-diagnostics.sh"
 fi
 SCRIPTS_UNDER_TEST=("$SCRIPT")
 if [ -n "$BUNDLED_SCRIPT" ]; then
@@ -275,7 +332,7 @@ else
   echo "note: no app-bundled copy found — running source-only chat E2E."
   echo "      to also exercise the shipped artifact, build/install the app and re-run:"
   echo "        make install-app                       # build + sign into /Applications"
-  echo "        RATIOTHINK_APP=/Applications/RatioThink.app Scripts/test-collect-diagnostics.sh"
+  echo "        RATIOTHINK_APP=/Applications/Rational.app Scripts/test-collect-diagnostics.sh"
   echo "      (case K below still proves no --include-chats can ship via packaging drift)"
 fi
 
@@ -285,8 +342,8 @@ for SUT in "${SCRIPTS_UNDER_TEST[@]}"; do
 
   echo "case I[$tag]: chats.sqlite present + NORMAL run -> bundle excludes all chat content"
   ID="$WORK_ROOT/I$tag"; mkdir -p "$ID/out" "$ID/crash"
-  seed_chat_home "$ID/home"; mini_app "$ID/app/RatioThink.app"
-  RATIOTHINK_APP="$ID/app/RatioThink.app" PIE_HOME="$ID/home" \
+  seed_chat_home "$ID/home"; mini_app "$ID/app/Rational.app"
+  RATIOTHINK_APP="$ID/app/Rational.app" PIE_HOME="$ID/home" \
   RATIOTHINK_DIAG_CRASH_DIR="$ID/crash" RATIOTHINK_DIAG_OUT_DIR="$ID/out" \
     bash "$SUT" --window 1m >/dev/null
   bundleI="$(extract_bundle "$ID/out" "$ID/x")"
@@ -295,9 +352,9 @@ for SUT in "${SCRIPTS_UNDER_TEST[@]}"; do
 
   echo "case J[$tag]: old --include-chats flag never yields chat content"
   JD="$WORK_ROOT/J$tag"; mkdir -p "$JD/out" "$JD/crash"
-  seed_chat_home "$JD/home"; mini_app "$JD/app/RatioThink.app"
+  seed_chat_home "$JD/home"; mini_app "$JD/app/Rational.app"
   rc=0
-  RATIOTHINK_APP="$JD/app/RatioThink.app" PIE_HOME="$JD/home" \
+  RATIOTHINK_APP="$JD/app/Rational.app" PIE_HOME="$JD/home" \
   RATIOTHINK_DIAG_CRASH_DIR="$JD/crash" RATIOTHINK_DIAG_OUT_DIR="$JD/out" \
     bash "$SUT" --window 1m --include-chats >/dev/null 2>&1 || rc=$?
   # Acceptable: fail clearly (exit!=0, no bundle) OR ignore safely (bundle with

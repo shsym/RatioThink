@@ -19,17 +19,30 @@ struct ChatMessageItem: Identifiable, Equatable {
   /// separate from `content`. Empty when the turn has no
   /// reasoning.
   var reasoning: String
+  /// Decoded tree-of-thought search for a ToT turn (#413), rendered in a
+  /// collapsible live tree-search section — the structured analogue of
+  /// the "Thinking" section. Nil for ordinary chat turns (and when a
+  /// persisted snapshot fails to decode, treated as no tree).
+  var tot: ToTTree?
   /// Engine `finish_reason` for a completed turn (`"stop"`, `"length"`,
   /// `"cancelled"`, …), or `nil` while the turn is still streaming. Lets
   /// `MessageBubble` surface a truncated-before-answer turn instead of a
   /// silent blank. (#434)
   var finishReason: String?
 
-  init(id: UUID = UUID(), role: ChatMessage.Role, content: String, reasoning: String = "", finishReason: String? = nil) {
+  init(
+    id: UUID = UUID(),
+    role: ChatMessage.Role,
+    content: String,
+    reasoning: String = "",
+    tot: ToTTree? = nil,
+    finishReason: String? = nil
+  ) {
     self.id = id
     self.role = role
     self.content = content
     self.reasoning = reasoning
+    self.tot = tot
     self.finishReason = finishReason
   }
 
@@ -56,6 +69,11 @@ extension ChatMessageItem {
       chatMessageItemLog.warning("unknown role string, coercing to .system: \(message.role, privacy: .public)")
       role = .system
     }
-    self.init(id: message.id, role: role, content: message.content, reasoning: message.reasoning, finishReason: message.finishReason)
+    // Tolerant decode: a snapshot written by a newer/older schema that no
+    // longer decodes is treated as "no tree" rather than failing the row.
+    let tot = message.tot.flatMap { try? JSONDecoder().decode(ToTTree.self, from: $0) }
+    self.init(
+      id: message.id, role: role, content: message.content,
+      reasoning: message.reasoning, tot: tot, finishReason: message.finishReason)
   }
 }

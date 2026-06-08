@@ -1,6 +1,49 @@
 import Foundation
 import os
 
+/// Identity payload used by launch reconciliation to distinguish "the mach
+/// service answered" from "the expected RationalHelper answered". The service
+/// name and bundle identifier are intentionally preserved across the product
+/// rename, so the executable name is the stable migration discriminator.
+public struct HelperIdentity: Codable, Equatable, Sendable {
+  public static let expectedExecutableName = "RationalHelper"
+  public static let expectedBundleIdentifier = "com.ratiothink.app.helper"
+
+  public let executableName: String
+  public let bundleIdentifier: String?
+  public let bundleVersion: String?
+  public let bundlePath: String?
+
+  public init(executableName: String,
+              bundleIdentifier: String?,
+              bundleVersion: String?,
+              bundlePath: String?) {
+    self.executableName = executableName
+    self.bundleIdentifier = bundleIdentifier
+    self.bundleVersion = bundleVersion
+    self.bundlePath = bundlePath
+  }
+
+  public static func current(bundle: Bundle = .main) -> HelperIdentity {
+    HelperIdentity(
+      executableName: bundle.executableURL?.lastPathComponent
+        ?? ProcessInfo.processInfo.processName,
+      bundleIdentifier: bundle.bundleIdentifier,
+      bundleVersion: bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+      bundlePath: bundle.bundleURL.path
+    )
+  }
+
+  public var isExpectedRationalHelper: Bool {
+    executableName == Self.expectedExecutableName
+      && bundleIdentifier == Self.expectedBundleIdentifier
+  }
+
+  public var mismatchSummary: String {
+    "executable=\(executableName), bundleID=\(bundleIdentifier ?? "nil"), version=\(bundleVersion ?? "nil"), path=\(bundlePath ?? "nil")"
+  }
+}
+
 /// XPC wire protocol the GUI calls and the Helper publishes.
 ///
 /// The selectors are `@objc` because `NSXPCConnection` builds proxies via
@@ -32,6 +75,19 @@ import os
 /// introspection in tests and for future bridges.
 @objc(PieHelperXPC)
 public protocol PieHelperXPC {
+  /// Reply data is `XPCPayload.encode(HelperIdentity)`. Optional for
+  /// migration safety: pre-rename helpers do not implement it, and the app
+  /// treats a reachable helper that cannot answer identity as mismatched.
+  @objc optional func helperIdentity(reply: @escaping (Data) -> Void)
+
+  /// Reply data is `XPCPayload.encode(Int)`. Bump the returned
+  /// `HelperProtocolCompatibility.currentVersion` whenever the App
+  /// starts requiring a newly-added helper selector. App-side launchd
+  /// reconciliation probes this so an old-but-reachable helper from a previous
+  /// app build is repaired before product paths call selectors it does not
+  /// export.
+  func helperProtocolVersion(reply: @escaping (Data) -> Void)
+
   /// Reply data is `XPCPayload.encode(EngineStatus)`.
   func engineStatus(reply: @escaping (Data) -> Void)
 
@@ -43,8 +99,25 @@ public protocol PieHelperXPC {
 
   /// On success `successData` decodes to `EnginePort`; on failure
   /// `errorData` decodes to `EngineError`. Exactly one is non-nil.
+  ///
+  /// `modelOverride` is the caller's explicit per-start model selection
+  /// (the chat toolbar / model-list pick). When non-nil it is the boot
+  /// model, overriding the profile's persisted default so a no-default
+  /// profile can be started by an explicit pick (#459 repro 1). `nil`
+  /// boots the profile default. Threaded in the same call as `profileID`
+  /// so it stays race-free against the helper's own FS-watched
+  /// `ProfileStore` (which may not yet have observed an App-side write).
   func startEngine(profileID: String,
+                   modelOverride: String?,
                    reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
+
+  /// Strict active-profile rebuild. Same reply tuple as `startEngine`,
+  /// but the helper owns real engine state: it waits for any live
+  /// engine to reach helper-confirmed terminal stop before starting
+  /// `profileID`, and it does not treat `.alreadyRunning` as an
+  /// idempotent success.
+  func restartEngine(profileID: String,
+                     reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
 
   /// Reply is `XPCPayload.encode(EngineError)` when the stop request
   /// could not be honored (helper degraded, engine missing, transport
@@ -105,6 +178,18 @@ public protocol PieHelperXPC {
   /// clear was refused (engine still alive, no zombie tracked, not
   /// in killRejected state, helper degraded).
   func clearKillRejected(reply: @escaping (_ errorData: Data?) -> Void)
+
+  /// Full-product quit (#448): stop the running engine, WAIT for it to
+  /// reach a terminal state so `pie` is reaped (no orphan process), then
+  /// terminate the Helper itself with a clean exit (so launchd's
+  /// `KeepAlive { SuccessfulExit: false }` does not relaunch it). The App
+  /// calls this as the final step of a coordinated quit after it has
+  /// stopped polling, so nothing respawns the cleanly-exited Helper via the
+  /// on-demand mach service. Reply is nil on acceptance; a non-nil
+  /// `EngineError` reports why the quit could not be honored. The reply may
+  /// also never arrive if the Helper terminates before it flushes — callers
+  /// MUST treat a post-call connection invalidation as success.
+  func quitHelper(reply: @escaping (_ errorData: Data?) -> Void)
 }
 
 /// Convenience encoders/decoders that hide the multi-slot reply tuples

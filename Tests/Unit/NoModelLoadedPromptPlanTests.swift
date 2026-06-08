@@ -138,9 +138,13 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     XCTAssertEqual(p.primary, .load)
   }
 
-  func test_needsDefaultLoad_not_on_disk_offers_download_keeps_pinned_headline() {
+  func test_needsDefaultLoad_not_on_disk_offers_download_with_truthful_headline() {
     let p = plan(.needsDefaultLoad(modelID: ProfileStore.defaultChatModelID), downloadAction)
-    XCTAssertEqual(p.headline, "No model loaded")       // S326/S286 pin this for .download
+    // #446: headline agrees with the body ("isn't downloaded yet") and with
+    // the .engineFailed(.modelMissing) + .download sibling — not the
+    // contradictory "No model loaded" (a default IS configured). GUI S286/S326
+    // assert via noModel.cancel, not the headline, so nothing else pins it.
+    XCTAssertEqual(p.headline, "Default model isn't downloaded")
     XCTAssertTrue(p.showsDownloadCTA)
     XCTAssertEqual(p.primary, .none)                    // no noModel.load for .download
   }

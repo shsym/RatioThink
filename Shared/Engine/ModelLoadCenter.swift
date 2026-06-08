@@ -472,8 +472,9 @@ public final class ModelLoadCenter: ObservableObject {
 
   /// Reflect a model the ENGINE already has resident that this center
   /// did not load itself ( follow-up). The engine can come up with a
-  /// model already loaded — e.g. the Helper auto-resumes the active
-  /// profile at boot — in which case nothing went through `startLoad`, so
+  /// model already loaded after an explicit start path (launch prompt/user
+  /// confirmation, Restart, Local API, post-download startEngine) or after
+  /// crash auto-relaunch, in which case nothing went through `startLoad`, so
   /// `residentModelID` would stay nil and the chat composer would block
   /// every send behind the no-model prompt despite a ready engine. The
   /// caller passes the id from `GET /v1/models` (the only id the engine's

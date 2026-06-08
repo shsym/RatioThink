@@ -45,8 +45,8 @@ final class ChatStartGateTests: XCTestCase {
   // MARK: - S1: engine starting (the reported bug)
 
   func test_S1_engine_starting_is_busy_not_no_model() {
-    // App launched, engine auto-resuming, open chat, send → must read as
-    // "starting", never "No model loaded / choose another".
+    // App requested an explicit start and the engine is still coming up;
+    // send must read as "starting", never "No model loaded / choose another".
     XCTAssertEqual(eval(engine: .starting, profileDefault: model),
                    .busy(.startingEngine))
   }

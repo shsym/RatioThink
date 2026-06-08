@@ -64,6 +64,14 @@ public final class ProfileSwapCoordinator: ObservableObject {
     /// plain profile swap (the model already IS the profile's default,
     /// so the checkbox would be a no-op).
     public let canSetAsDefault: Bool
+    /// True when the popover should offer the third "Keep Current Model"
+    /// outcome (#459): switch to the new profile but keep the
+    /// already-resident model A loaded, with NO reload. Only the
+    /// profile-swap path qualifies (`canSetAsDefault == false`) and only
+    /// when a resident model A actually exists (`fromModelID != nil`).
+    /// Meaningless for the toolbar model-override path, where the user
+    /// explicitly picked a model to load.
+    public let canKeepCurrentModel: Bool
   }
 
   /// Atomic record of an in-flight pending swap. Holds the user's
@@ -83,6 +91,16 @@ public final class ProfileSwapCoordinator: ObservableObject {
     /// `confirm` skips `startLoad` — a failed commit must not load a model
     /// the chat did not actually adopt.
     let commit: () -> Bool
+    /// #459 "Keep Current Model", ported onto #460's single authority: the
+    /// third profile-swap outcome — switch to the new profile but KEEP the
+    /// chat's CURRENT concrete model (`fromModelID`) as its selection, with
+    /// NO reload. Built from the same `SwapCommit` by pinning `fromModel`
+    /// instead of the new default, so it pins `Chat.modelID` (the authority)
+    /// rather than the removed `viewModel.modelOverride`. Non-nil only on the
+    /// profile-swap path with a current model; nil for the model-override
+    /// path. Returns `false` if the durable write failed (review F2 — a
+    /// failed pin leaves the profile unswitched).
+    let keepCurrentCommit: (() -> Bool)?
     /// Profile id to persist `toModelID` onto when the user checks
     /// "Set as default". Nil disables the checkbox.
     let setAsDefaultProfileID: String?
@@ -93,7 +111,11 @@ public final class ProfileSwapCoordinator: ObservableObject {
         toProfileID: toProfileID,
         fromModelID: fromModelID,
         toModelID: toModelID,
-        canSetAsDefault: setAsDefaultProfileID != nil
+        canSetAsDefault: setAsDefaultProfileID != nil,
+        // Keep-current is offered exactly when a keep-current action exists
+        // (the profile-swap path with a current model to keep) — the single
+        // source for the popover's third button.
+        canKeepCurrentModel: keepCurrentCommit != nil
       )
     }
   }
@@ -201,6 +223,12 @@ public final class ProfileSwapCoordinator: ObservableObject {
   /// the caller's side: it always sets the profile, and pins a model only
   /// on the confirm-and-switch path (`pinModel != nil`); a silent swap
   /// passes `pinModel == nil` so the chat's current model is PRESERVED.
+  ///
+  /// #459 "Keep Current Model" is the popover's third outcome — switch the
+  /// profile but keep the current model loaded with NO reload. Under the
+  /// single authority it needs no separate `setOverride`: the coordinator
+  /// builds it from the same `commit`, pinning `fromModel` (the current
+  /// model) instead of the new default, which writes `Chat.modelID`.
   public func requestSwap(
     toProfileID: String,
     fromModel: String?,
@@ -255,7 +283,12 @@ public final class ProfileSwapCoordinator: ObservableObject {
       toProfileID: toProfileID,
       fromModelID: fromModel,
       toModelID: to,
+      // Confirm = switch + pin the new profile's default.
       commit: { commit(toProfileID, to) },
+      // #459 Keep Current = switch + pin the CURRENT model (`fromModel`,
+      // non-nil here), no reload — pins `Chat.modelID`, not the deleted
+      // `modelOverride`.
+      keepCurrentCommit: { commit(toProfileID, fromModel) },
       setAsDefaultProfileID: nil
     )
   }
@@ -294,6 +327,9 @@ public final class ProfileSwapCoordinator: ObservableObject {
       fromModelID: fromModel,
       toModelID: modelID,
       commit: { commit(modelID) },
+      // The model-override path has no keep-current outcome (the user
+      // explicitly picked a model to LOAD).
+      keepCurrentCommit: nil,
       setAsDefaultProfileID: activeProfileID
     )
   }
@@ -353,6 +389,44 @@ public final class ProfileSwapCoordinator: ObservableObject {
     pendingState = nil
     // User moved on — clear any stale set-as-default error (review F2).
     defaultModelWriteError = nil
+  }
+
+  /// Third profile-swap outcome (#459, ported onto #460's single authority):
+  /// switch to the new profile but KEEP the chat's current concrete model
+  /// loaded — pin `Chat.modelID` to the current model (`fromModelID`) AND
+  /// switch the profile, with NO reload (no `startLoad`/`loadModel`). The new
+  /// profile's stored default is left untouched. Under the authority this is
+  /// just the swap `commit` with the CURRENT model as the pin (instead of the
+  /// new default), so it writes `Chat.modelID`, not the removed
+  /// `viewModel.modelOverride`. Mirrors `confirm`/`cancel`'s token-checked
+  /// stale-drop + single `pendingState = nil` discipline; the pin+profile
+  /// write is F2-atomic (a failed pin leaves the profile unswitched).
+  ///
+  /// Only valid on the profile-swap path with a current model
+  /// (`canKeepCurrentModel` ⇔ `keepCurrentCommit != nil`). A call against a
+  /// model-override pending is dropped — the popover does not offer the
+  /// button there, so this is defensive.
+  public func keepCurrentModel(token: UUID) {
+    guard let p = pendingState else {
+      Self.log.notice("keepCurrentModel token=\(token, privacy: .public) ignored: no pending")
+      return
+    }
+    guard p.token == token else {
+      Self.log.notice("keepCurrentModel token=\(token, privacy: .public) mismatch (current=\(p.token, privacy: .public)) — stale callback dropped")
+      return
+    }
+    guard let keepCurrent = p.keepCurrentCommit else {
+      Self.log.notice("keepCurrentModel token=\(token, privacy: .public) ignored: not a profile-swap pending with a current model")
+      return
+    }
+    Self.log.info("swap keep-current token=\(token, privacy: .public) profile=\(p.toProfileID, privacy: .public) keepModel=\(p.fromModelID ?? "—", privacy: .public) (no reload)")
+    pendingState = nil
+    // User moved on — clear any stale set-as-default error (review F2).
+    defaultModelWriteError = nil
+    // Switch the profile AND pin the current model as the chat's selection,
+    // with NO startLoad — the resident/loading model stays and the new
+    // profile's default is never loaded.
+    _ = keepCurrent()
   }
 
   /// Dismissal-binding entry. SwiftUI's `.popover(isPresented:)`

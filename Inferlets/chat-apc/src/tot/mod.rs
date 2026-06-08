@@ -49,13 +49,25 @@
 //! represented on the node (`status:"error"` + `error`) while the rest
 //! of the tree still returns.
 //!
-//! ## Scope (v1)
+//! ## Streaming (`stream:true`, #413)
 //!
-//! Non-streaming only — `stream:true` is rejected with 400. The live
-//! tree-search UI + a ToT streaming wire format are tracked separately
-//! (ticket #413). The `tree-of-thought` dispatch *name* is the stable
-//! wire seam: a future move to a dynamically-loaded or separate inferlet
-//! requires no client change.
+//! `stream:true` returns an SSE stream that surfaces the search live —
+//! `tree_start`, then per level a `node_complete` for every generated node
+//! followed by a `level_pruned` beam selection, then ONE terminal:
+//! `tree_complete` when an ok leaf was selected, or `error` when none was
+//! (F1 — a null selection means every branch failed; see
+//! [`stream::is_total_failure`]). Non-streaming is symmetric: an ok-leaf
+//! search returns the 200 `TreeResponse`, a total failure returns the same
+//! JSON `error` envelope. The wire format + frame schema live in
+//! [`stream`]; the same [`search::run`] orchestration drives both the
+//! streamed and non-streamed responses (it just takes an optional
+//! [`Emitter`]), so the two can never diverge. Pre-stream failures
+//! (validation, model resolution, context build) still return the JSON
+//! 4xx/5xx envelope — the SSE response is opened only once the root
+//! context is built and flushed, so a doomed request never emits a
+//! misleading `tree_start`. The `tree-of-thought` dispatch *name* is the
+//! stable wire seam: a future move to a dynamically-loaded or separate
+//! inferlet requires no client change.
 //!
 //! ## Scoring caveat (v1)
 //!
@@ -88,10 +100,11 @@
 
 mod schema;
 mod search;
+mod stream;
 mod tree;
 
 use crate::chat::completions::{self, ChatMessage};
-use crate::sse;
+use crate::sse::{self, Emitter};
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Response};
 
@@ -104,18 +117,6 @@ pub async fn dispatch(
     stream: bool,
     res: Responder,
 ) -> Finished {
-    // v1 has no streaming. Reject explicitly rather than silently
-    // ignoring the flag (Swift's dispatchInferlet defaults stream:true).
-    if stream {
-        return res
-            .respond(sse::json_error(
-                400,
-                "invalid_request",
-                "tree-of-thought has no streaming in v1; set stream:false",
-            ))
-            .await;
-    }
-
     let input: schema::TotInput = match input {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
@@ -134,7 +135,7 @@ pub async fn dispatch(
 
     // `input.messages` wins over top-level chat-sugar (mirrors
     // dispatch_chat_apc).
-    let messages = match (input.messages.clone(), messages) {
+    let mut messages = match (input.messages.clone(), messages) {
         (Some(m), _) => m,
         (None, Some(m)) => m,
         (None, None) => {
@@ -180,6 +181,19 @@ pub async fn dispatch(
                 .await;
         }
     };
+
+    // #413/#437: tree-of-thought THINKS by default — the `<think>` reasoning
+    // is the point of the search, demuxed apart from the answer per node (see
+    // `search::generate_demuxed`). Only when the caller disables it
+    // (`thinking:false`) do we append the `/no_think` directive to the last
+    // user turn (Qwen3 keys thinking off it); deeper levels + the scorer carry
+    // it via `with_thinking(REFINE_INSTRUCTION/SCORE_PROMPT)`. The directive is
+    // an inert token on a non-reasoning model.
+    if !params.thinking {
+        if let Some(last) = messages.iter_mut().rev().find(|m| m.role == "user") {
+            last.content.push_str(" /no_think");
+        }
+    }
 
     // Resolve the model (default to the engine's single registered model).
     let model_id = match input.model {
@@ -251,10 +265,32 @@ pub async fn dispatch(
             .await;
     }
 
-    let outcome = search::run(root_ctx, &params).await;
+    // Generated once so the streaming `tree_start` id and the non-streaming
+    // envelope id come from the same source.
+    let tree_id = tree::new_tree_id();
+
+    // #413: the root context is now built + flushed, so a `stream:true`
+    // request can safely commit SSE headers — every failure that warranted
+    // a JSON 4xx/5xx envelope has already returned above.
+    if stream {
+        return dispatch_streaming(root_ctx, &params, &model, &tree_id, &model_id, res).await;
+    }
+
+    let outcome = search::run(root_ctx, &params, &model, None).await;
+
+    // F1: a search that selected no ok leaf totally failed (every branch
+    // failed to generate — the beam keeps the best ok leaf whenever one
+    // exists). Surface it as an error envelope, symmetric with the
+    // streaming path's terminal `error` frame, rather than a 200
+    // success-shaped tree with null answer.
+    if stream::is_total_failure(&outcome.selected_node_id) {
+        return res
+            .respond(sse::json_error(500, stream::NO_ANSWER_CODE, stream::NO_ANSWER_MESSAGE))
+            .await;
+    }
 
     let response_body = tree::TreeResponse {
-        id: tree::new_tree_id(),
+        id: tree_id,
         object: "tree_of_thought",
         model: model_id,
         breadth: params.breadth,
@@ -282,4 +318,54 @@ pub async fn dispatch(
         .body(body.into_body())
         .unwrap();
     res.respond(response).await
+}
+
+/// SSE streaming variant (#413). `Emitter::start` commits the response
+/// headers, so from here every exit path finishes through the emitter —
+/// all pre-stream failures (validation, model resolution, context build)
+/// were already returned as JSON envelopes by [`dispatch`] before this is
+/// reached, exactly like `chat-apc`'s `handle_streaming`.
+///
+/// Frame order: `tree_start` → (`node_complete`* `level_pruned`)\* per
+/// level (emitted inside [`search::run`]) → one terminal `tree_complete`
+/// (an ok leaf was selected) OR `error` (F1: no ok leaf — total failure)
+/// → `[DONE]`. The streamed `node_complete` frames carry the (error) tree
+/// regardless, so an `error` terminal still leaves the client a renderable
+/// tree plus a surfaced failure. A client that disconnects before the
+/// first frame ends the stream immediately; mid-stream disconnects are
+/// swallowed by `run` and the terminal emits below (the search still
+/// completes, just unobserved).
+async fn dispatch_streaming(
+    root_ctx: inferlet::Context,
+    params: &schema::TotParams,
+    model: &inferlet::model::Model,
+    tree_id: &str,
+    model_id: &str,
+    res: Responder,
+) -> Finished {
+    let mut em = Emitter::start(res);
+    if stream::emit_tree_start(&mut em, tree_id, model_id, params)
+        .await
+        .is_err()
+    {
+        return em.finish();
+    }
+    let outcome = search::run(root_ctx, params, model, Some(&mut em)).await;
+    if stream::is_total_failure(&outcome.selected_node_id) {
+        // F1: total failure — emit the documented terminal `error` frame
+        // (the client's catch marks the turn failed) instead of a
+        // success-shaped `tree_complete{null,null}`.
+        let _ = em
+            .emit_json(&sse::SseError::new(stream::NO_ANSWER_CODE, stream::NO_ANSWER_MESSAGE))
+            .await;
+    } else {
+        let _ = stream::emit_tree_complete(
+            &mut em,
+            outcome.selected_node_id.as_deref(),
+            outcome.final_answer.as_deref(),
+        )
+        .await;
+    }
+    sse::emit_done_logged(&mut em, "tot_terminal").await;
+    em.finish()
 }

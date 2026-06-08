@@ -52,7 +52,7 @@ FAKE_PGREP
     printf '%s\n' "$output" >&2
     exit 1
   fi
-  require_contains "$output" "RatioThink.app Automation/Accessibility permissions required"
+  require_contains "$output" "Rational.app Automation/Accessibility permissions required"
   require_contains "$output" "PIE_TEST_TCC_GRANTED=1"
   if [[ "$output" == *"starting deterministic HTTP harness"* ]]; then
     echo "FAIL: TCC preflight must happen before starting the deterministic harness" >&2

@@ -4,6 +4,11 @@ import ServiceManagement
 
 @main
 struct RatioThinkApp: App {
+  /// #448: window-close = background, ⌘Q / "Quit" / `ratiothink://quit` =
+  /// coordinated full quit. The delegate owns `applicationShouldTerminate`
+  /// (which SwiftUI's `App` does not expose) and
+  /// `applicationShouldTerminateAfterLastWindowClosed`.
+  @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
   /// One-shot guard so the launch-time Helper registration reconcile
   /// runs once even if a second window opens.
   @MainActor private static var didReconcileHelperRegistration = false
@@ -55,6 +60,7 @@ struct RatioThinkApp: App {
   /// check (and its single network call) fires once per process; RootView
   /// observes `pending` to render the non-modal update banner.
   @StateObject private var updateAvailability = UpdateAvailabilityModel()
+  @StateObject private var settingsNavigation = SettingsNavigation()
 
   @MainActor
   init() {
@@ -65,7 +71,7 @@ struct RatioThinkApp: App {
     // borrow them at construction. The `@StateObject` wrappers aren't
     // installed on `self` at `init` time, so a re-instantiation here
     // is the only place identity can be threaded.
-    let center = ModelLoadCenter()
+    let center = Self.makeModelLoadCenter()
     let prefs = AppPreferences(defaults: Self.appPreferencesDefaults())
     let testBaseURL = Self.chatTestEngineBaseURL()
     let statusStore: EngineStatusStore
@@ -193,6 +199,10 @@ struct RatioThinkApp: App {
     }
     _helperHealth = StateObject(wrappedValue: helperHealthController)
 
+    // #448: give the full-product quit coordinator the poll loop it must stop
+    // before tearing down, so no late on-demand poll respawns the Helper.
+    AppQuitCoordinator.shared.engineStatusStore = statusStore
+
     // Kick the XPC poll loop. Idempotent + cheap — first reply lands
     // within ~one runloop tick when the helper is registered, longer
     // when launchd has not yet published the mach service.
@@ -213,7 +223,7 @@ struct RatioThinkApp: App {
   /// `EngineStatusStore`, `LaunchSpecResolver`, `PieControlLauncher`,
   /// `pie serve`). It is honored ONLY in a test harness
   /// (`PIE_TEST_MODE=1`) or a DEBUG build — a shipped Release
-  /// `RatioThink.app` MUST use the real Helper→engine path. Refusing it
+  /// `Rational.app` MUST use the real Helper→engine path. Refusing it
   /// in Release closes the parity gap two ways: a shipped app can't be
   /// redirected at a foreign URL, and a "real binary" (Release/packaged)
   /// scenario cannot silently pass on a fake base URL — if the override
@@ -229,6 +239,24 @@ struct RatioThinkApp: App {
     // `PIE_TEST_ENGINE_BASE_URL` seam.
     guard let raw = HelperConfig.testEngineBaseURLOverride() else { return nil }
     return URL(string: raw)
+  }
+
+  /// Build the app's `ModelLoadCenter`. DEBUG-only seam (#459): when
+  /// `PIE_TEST_RESIDENT_MODEL` is set, seed `residentModelID` so a GUI test
+  /// can deterministically reach the cross-model profile-swap popover (which
+  /// fires only when a model A is resident) WITHOUT standing up a real engine
+  /// — mirrors the `PIE_TEST_PIN_ENGINE_RUNNING` status seam. The seed
+  /// survives an engine-free launch because `EngineLifecycle` clears residency
+  /// only on a leave-`.running` EDGE, which never occurs when the engine never
+  /// runs. Compiled out of Release entirely.
+  private static func makeModelLoadCenter() -> ModelLoadCenter {
+    #if DEBUG
+    let resident = ProcessInfo.processInfo.environment["PIE_TEST_RESIDENT_MODEL"]
+    if let resident, !resident.isEmpty {
+      return ModelLoadCenter(initialResident: resident)
+    }
+    #endif
+    return ModelLoadCenter()
   }
 
   private static func appPreferencesDefaults() -> UserDefaults {
@@ -342,7 +370,9 @@ struct RatioThinkApp: App {
     Diag.app.event("app.launch", [
       ("version", info?["CFBundleShortVersionString"] as? String ?? "?"),
       ("build", info?["CFBundleVersion"] as? String ?? "?"),
+      ("pid", String(ProcessInfo.processInfo.processIdentifier)),
       ("bundle", DiagnosticLog.redactHome(bundlePath)),
+      ("executable", DiagnosticLog.redactHome(Bundle.main.executableURL?.path ?? "?")),
       ("quarantine", quarantined ? "present" : "absent"),
     ])
   }
@@ -369,7 +399,7 @@ struct RatioThinkApp: App {
   }
 
   var body: some Scene {
-    WindowGroup("RatioThink") {
+    WindowGroup("Rational") {
       Group {
         if appPreferences.firstLaunchWizardCompleted {
           RootView()
@@ -392,6 +422,7 @@ struct RatioThinkApp: App {
         .environmentObject(helperHealth)
         .environmentObject(downloadController)
         .environmentObject(updateAvailability)
+        .environmentObject(settingsNavigation)
         // #420: route the menu-bar Helper's `ratiothink://settings` deep
         // link straight to the Settings scene (not just app-foreground).
         .handlesSettingsDeepLink()
@@ -401,7 +432,7 @@ struct RatioThinkApp: App {
     .defaultSize(width: 1200, height: 800)
     .commands {
       // #411: the MANUAL "Check for Updates…" entry, in the standard macOS
-      // spot (App menu, directly under "About RatioThink"). It always checks
+      // spot (App menu, directly under "About Rational"). It always checks
       // and bypasses the ignore-set, complementing the once-per-launch auto
       // check that surfaces the non-modal UpdateAvailableBanner (RootView /
       // UpdateAvailabilityModel). Both compare the running version to the
@@ -449,6 +480,7 @@ struct RatioThinkApp: App {
 
     Settings {
       SettingsRoot()
+        .environmentObject(settingsNavigation)
         .environmentObject(modelLoadCenter)
         .environmentObject(appPreferences)
         .environmentObject(profileStore)
@@ -471,11 +503,13 @@ struct RatioThinkApp: App {
 /// only — compiled out of Release alongside the pin itself.
 private struct PinnedRunningXPCClient: AppXPCClient {
   let port: EnginePort
+  func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
   func engineStatus() async throws -> EngineStatus { .running(port: port, profileID: "chat") }
   func stopEngine() async throws {}
   // The pinned harness has no Helper to launch an engine; the engine is
   // already pinned `.running`, so a start is a no-op success (mirrors
   // `stopEngine`).
-  func startEngine(profileID: String) async throws {}
+  func startEngine(profileID: String, modelOverride: String?) async throws {}
+  func restartEngine(profileID: String) async throws {}
 }
 #endif

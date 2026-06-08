@@ -11,6 +11,27 @@ import XCTest
 /// (which depends on the same emission shape).
 final class PieControlLauncherConfigTests: XCTestCase {
 
+  func test_configTimeout_matchesPieTemplateDefaultForSlowToTRequests() {
+    let body = PieControlLauncher.renderConfigBody(modelConfig: .dummy)
+    XCTAssertTrue(body.contains("request_timeout_secs = 120"),
+                  "app launcher config must not lower pie's template/default 120s request timeout; slow ToT node/scorer passes can otherwise close SSE without a terminal frame")
+    XCTAssertFalse(body.contains("request_timeout_secs = 60"),
+                   "60s was too low for packaged-app ToT runs on slower hardware/profiles")
+  }
+
+  func test_subprocessEnvironment_liftsShmemTimeoutToMatchSchedulerTimeout() {
+    let env = PieControlLauncher.renderSubprocessEnvironment(
+      base: ["PIE_SHMEM_TIMEOUT_S": "1", "KEEP": "yes"],
+      pieHome: URL(fileURLWithPath: "/tmp/pie-home", isDirectory: true),
+      shmemName: "/pie-test"
+    )
+    XCTAssertEqual(env["PIE_HOME"], "/tmp/pie-home")
+    XCTAssertEqual(env["PIE_SHMEM_NAME"], "/pie-test")
+    XCTAssertEqual(env["PIE_SHMEM_TIMEOUT_S"], "120",
+                   "the real fire_batch/shmem path reads PIE_SHMEM_TIMEOUT_S, not scheduler.request_timeout_secs directly")
+    XCTAssertEqual(env["KEEP"], "yes")
+  }
+
   func test_dummy_body_emits_dummy_driver_with_qwen3_fixture() {
     let body = PieControlLauncher.renderConfigBody(modelConfig: .dummy)
     XCTAssertTrue(body.contains("type = \"dummy\""),
@@ -39,6 +60,43 @@ final class PieControlLauncherConfigTests: XCTestCase {
                    "pie serve config no longer accepts top-level hf_path; it resolves model.hf_repo")
     XCTAssertFalse(body.contains("type = \"dummy\""),
                    "portable config must not emit the dummy-driver block")
+  }
+
+  func test_portable_body_omits_default_token_limit_when_nil() {
+    // #438: with no memory-aware ceiling, the scheduler block must NOT
+    // carry default_token_limit — the engine keeps its default (no clamp),
+    // preserving pre-#438 behavior on hosts that sustain the full pool.
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      defaultTokenLimit: nil
+    )
+    XCTAssertFalse(body.contains("default_token_limit"),
+                   "nil defaultTokenLimit must not write the override; got:\n\(body)")
+    XCTAssertFalse(body.contains("[model.driver.options]"),
+                   "the pool-resize path is gone — no driver-options block; got:\n\(body)")
+  }
+
+  func test_portable_body_emits_default_token_limit_when_set() {
+    // #438: the memory-aware ceiling rides [model.scheduler].default_token_limit.
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      defaultTokenLimit: 5000
+    )
+    // Exact key = value line, under the scheduler section, not driver options.
+    XCTAssertTrue(body.contains("default_token_limit = 5000"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("[model.scheduler]"), "got:\n\(body)")
+    XCTAssertFalse(body.contains("max_num_kv_pages"),
+                   "the old pool-resize knob must not be emitted; got:\n\(body)")
+    XCTAssertTrue(body.contains("type = \"portable\""))
+  }
+
+  func test_metal_body_emits_default_token_limit_when_set() {
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .metal(modelID: "Qwen/Qwen3-0.6B"),
+      defaultTokenLimit: 4096
+    )
+    XCTAssertTrue(body.contains("default_token_limit = 4096"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
   }
 
   func test_portableResolved_serves_under_profile_slug_with_distinct_hf_repo_path() {
@@ -251,10 +309,10 @@ final class PieControlLauncherConfigTests: XCTestCase {
   func test_realPie_driverList_subcommand_exists_and_reports_portable() throws {
     let candidates = [
       ProcessInfo.processInfo.environment["PIE_TEST_REAL_PIE_BIN"],
-      "/Applications/RatioThink.app/Contents/Resources/pie-engine/pie",
+      "/Applications/Rational.app/Contents/Resources/pie-engine/pie",
     ].compactMap { $0 }
     guard let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-      throw XCTSkip("no real pie binary (set PIE_TEST_REAL_PIE_BIN or install RatioThink.app)")
+      throw XCTSkip("no real pie binary (set PIE_TEST_REAL_PIE_BIN or install Rational.app)")
     }
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: path)
