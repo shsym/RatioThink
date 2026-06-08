@@ -244,7 +244,7 @@ struct ChatScaffoldView: View {
           commitSwap(profileID: profileID, pinModel: pinModel, chat: chat)
         },
         commitModel: { modelID in persistChatModel(modelID, on: chat) },
-        onUseProfileDefault: { persistChatModel(nil, on: chat) },
+        onUseProfileDefault: { _ = persistChatModel(nil, on: chat) },
         swapCoordinator: swapCoordinator,
         modelLoadCenter: modelLoadCenter,
         engineStatus: engineStatusStore,
@@ -420,15 +420,24 @@ struct ChatScaffoldView: View {
       // reconcileEngineResident is internally guarded against clobbering
       // an in-flight load.
       modelLoadCenter.reconcileEngineResident(ids[0])
-      // #460: seed the chat's SELECTION authority (`Chat.modelID`) from the
-      // model the engine actually serves WHEN the chat is unpinned. This
-      // turns the implicit "follow profile default" into a concrete pin, so
-      // a later no-default profile switch or a new chat preserves the model
-      // the user was actually using instead of resetting. Seed-only: never
-      // overwrites an explicit pick. No-op while a load is in flight (the
-      // load's target is the user's choice, not yet served).
-      if chat.modelID == nil, !modelLoadCenter.isLoading {
-        persistChatModel(ids[0], on: chat)
+      // #460 (review F1): seed the chat's SELECTION authority (`Chat.modelID`)
+      // from the served model ONLY when it matches THIS chat's profile
+      // default — never the engine's single GLOBAL resident model when it
+      // differs. The engine serves one global model; `ids[0]` is that, not
+      // necessarily this chat's selection, and navigating between chats does
+      // NOT reload the engine to the new chat's profile (the active-profile
+      // write is stage-only). Adopting `ids[0]` unconditionally would durably
+      // pin an unpinned chat to the wrong model. When the served model is not
+      // this chat's default, leave `modelID` nil (follow the profile default).
+      // `seededModelID` is the pure decision; seed-only (never overwrites a
+      // pick) and no-op while a load is in flight.
+      if let toPin = Self.seededModelID(
+        currentPin: chat.modelID,
+        servedID: ids[0],
+        profileDefault: selectedProfileDefault,
+        isLoading: modelLoadCenter.isLoading
+      ) {
+        _ = persistChatModel(toPin, on: chat)
       }
     case .failedAfterRetries(let attempts):
       // Don't silently drop: engine running but unreachable for models.
@@ -506,32 +515,64 @@ struct ChatScaffoldView: View {
   /// selection authority. `nil` clears the pin so the chat follows the
   /// active profile's default again. Does NOT bump `updatedAt` (a config
   /// edit, like a profile swap — it must not float the chat ahead of
-  /// more-recently-talked chats in the recency-sorted sidebar). Rolls back
-  /// + reports on a save failure so the toolbar never shows a selection
-  /// that isn't on disk.
-  private func persistChatModel(_ modelID: String?, on chat: Chat) {
-    guard chat.modelID != modelID else { return }
-    let previous = chat.modelID
+  /// more-recently-talked chats in the recency-sorted sidebar). Returns
+  /// `true` when the value is durably set (including the no-op case);
+  /// `false` when the save failed. Review F2: on failure use
+  /// `modelContext.rollback()` (like `ChatListView.delete`) so ALL pending
+  /// edits are discarded rather than only field-restoring `modelID` and
+  /// leaving a second pending write to flush later.
+  @discardableResult
+  private func persistChatModel(_ modelID: String?, on chat: Chat) -> Bool {
+    guard chat.modelID != modelID else { return true }
     chat.modelID = modelID
     do {
       try modelContext.save()
+      return true
     } catch {
-      chat.modelID = previous
+      modelContext.rollback()
       persistenceStatus.report(error, context: "ChatScaffoldView.modelSelect")
+      return false
     }
   }
 
-  /// #460: persist a profile swap on this chat. Always sets the profile;
-  /// pins a model only when the swap adopted one (`pinModel != nil`) — a
-  /// silent / no-default swap passes `nil` so the chat's current model is
-  /// PRESERVED. The profile change routes through `viewModel
-  /// .selectedProfileID`, whose `.onChange` owns the durable profile write
-  /// (+ active-profile marker + rollback); the model pin is written here.
-  /// The preserve-vs-switch policy was already decided in
+  /// #460: persist a profile swap on this chat. The model pin is written
+  /// FIRST and the profile is switched ONLY if it succeeded (review F2 —
+  /// a failed pin must not leave the chat with a switched profile + a
+  /// loaded new model while `modelID` reverts). Returns `false` on a pin
+  /// failure so `ProfileSwapCoordinator.confirm` skips the load; the swap is
+  /// then fully aborted (profile unchanged, no load). A silent / no-default
+  /// swap passes `pinModel == nil` so the chat's current model is PRESERVED.
+  /// The profile change routes through `viewModel.selectedProfileID`, whose
+  /// `.onChange` owns the durable profile write (+ active-profile marker +
+  /// rollback). The preserve-vs-switch policy was already decided in
   /// `ProfileSwapCoordinator`; this only performs the persistence.
-  private func commitSwap(profileID: String, pinModel: String?, chat: Chat) {
-    if let pinModel { persistChatModel(pinModel, on: chat) }
+  private func commitSwap(profileID: String, pinModel: String?, chat: Chat) -> Bool {
+    if let pinModel, !persistChatModel(pinModel, on: chat) {
+      return false  // pin save failed → do NOT switch the profile or load
+    }
     viewModel.selectedProfileID = profileID
+    return true
+  }
+
+  /// #460 (review F1): pure decision for the residency seed. Adopt the
+  /// served model as this chat's pin ONLY when the chat is unpinned, not
+  /// loading, and the served model is exactly this chat's profile default —
+  /// so the seed never durably pins an unpinned chat to the engine's GLOBAL
+  /// resident model when that differs from the chat's own default. Returns
+  /// the id to pin, or `nil` to leave `modelID` untouched (follow the
+  /// profile default). Static + pure so the matrix is unit-testable without
+  /// a view host.
+  static func seededModelID(
+    currentPin: String?,
+    servedID: String?,
+    profileDefault: String?,
+    isLoading: Bool
+  ) -> String? {
+    guard !isLoading else { return nil }          // load in flight → no-op
+    guard currentPin == nil else { return nil }   // already pinned → never overwrite
+    guard let servedID, !servedID.isEmpty else { return nil }
+    guard servedID == profileDefault else { return nil }  // served != this chat's default → don't seed
+    return servedID
   }
 
   /// The active chat profile's default model slug — the ONE definition of

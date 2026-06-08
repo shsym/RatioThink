@@ -101,4 +101,54 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
                                           profileDefaultModel: nil)
     XCTAssertEqual(before, after, "the model label must not reset on a no-default profile switch")
   }
+
+  // MARK: - review F1: residency seed adopts the served model ONLY when it is
+  // this chat's profile default — never the engine's global resident model.
+
+  func test_seed_adopts_served_model_when_it_is_the_profile_default() {
+    XCTAssertEqual(
+      ChatScaffoldView.seededModelID(
+        currentPin: nil, servedID: "org/A/Default.gguf",
+        profileDefault: "org/A/Default.gguf", isLoading: false),
+      "org/A/Default.gguf",
+      "unpinned + served == profile default → seed it"
+    )
+  }
+
+  func test_seed_does_not_adopt_a_served_model_that_differs_from_profile_default() {
+    // The engine serves a global model that is NOT this chat's default
+    // (e.g. another chat loaded it). Seeding it would durably pin the wrong
+    // model and freeze it there — the exact defect F1 flags.
+    XCTAssertNil(
+      ChatScaffoldView.seededModelID(
+        currentPin: nil, servedID: "org/Other/Resident.gguf",
+        profileDefault: "org/A/Default.gguf", isLoading: false),
+      "unpinned + served != profile default → do NOT seed (follow the profile default)"
+    )
+  }
+
+  func test_seed_never_overwrites_an_explicit_pin() {
+    XCTAssertNil(
+      ChatScaffoldView.seededModelID(
+        currentPin: "org/Pinned/Pick.gguf", servedID: "org/Pinned/Pick.gguf",
+        profileDefault: "org/Pinned/Pick.gguf", isLoading: false),
+      "already pinned → never overwrite, even when everything agrees"
+    )
+  }
+
+  func test_seed_is_a_noop_while_a_load_is_in_flight() {
+    XCTAssertNil(
+      ChatScaffoldView.seededModelID(
+        currentPin: nil, servedID: "org/A/Default.gguf",
+        profileDefault: "org/A/Default.gguf", isLoading: true),
+      "loading → no-op (the load's target is the user's choice, not yet served)"
+    )
+  }
+
+  func test_seed_is_a_noop_when_nothing_is_served() {
+    XCTAssertNil(
+      ChatScaffoldView.seededModelID(
+        currentPin: nil, servedID: nil,
+        profileDefault: "org/A/Default.gguf", isLoading: false))
+  }
 }

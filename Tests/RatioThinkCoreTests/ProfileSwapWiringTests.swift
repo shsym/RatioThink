@@ -45,7 +45,7 @@ final class ProfileSwapWiringTests: XCTestCase {
       var committed: String?
       // #460: the "current model" is the chat's selection passed in, NOT
       // engine residency — here the chat is on model-A.
-      coord.requestSwap(toProfileID: "beta", fromModel: "model-A.gguf") { profileID, _ in committed = profileID }
+      coord.requestSwap(toProfileID: "beta", fromModel: "model-A.gguf") { profileID, _ in committed = profileID; return true }
 
       XCTAssertNil(committed, "a model-changing swap must wait for confirm, not commit silently")
       let pending = try XCTUnwrap(coord.pending,
@@ -69,6 +69,7 @@ final class ProfileSwapWiringTests: XCTestCase {
       coord.requestSwap(toProfileID: "beta", fromModel: "model-B.gguf") { profileID, pinModel in
         committed = profileID
         preservedModel = (pinModel == nil)
+        return true
       }
       XCTAssertEqual(committed, "beta", "swapping into the already-selected model must stay silent")
       XCTAssertTrue(preservedModel, "a same-model swap must not pin a new model")
@@ -88,7 +89,7 @@ final class ProfileSwapWiringTests: XCTestCase {
         profileStore: store
       )
       var committed: String?
-      coord.requestSwap(toProfileID: "beta", fromModel: nil) { profileID, _ in committed = profileID }
+      coord.requestSwap(toProfileID: "beta", fromModel: nil) { profileID, _ in committed = profileID; return true }
       XCTAssertEqual(committed, "beta",
                      "with no current model, selecting a profile must commit silently — there is nothing to replace")
       XCTAssertNil(coord.pending,

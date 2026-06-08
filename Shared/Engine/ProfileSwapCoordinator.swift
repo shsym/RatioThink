@@ -76,10 +76,13 @@ public final class ProfileSwapCoordinator: ObservableObject {
     let toModelID: String
     /// Fully-bound effect run on confirm. A profile swap sets the chat's
     /// profile AND pins `toModelID` as its model; a model override sets the
-    /// per-chat model. Storing a `() -> Void` thunk (rather than a value +
+    /// per-chat model. Storing a `() -> Bool` thunk (rather than a value +
     /// applier) lets the two shapes share the same pending machinery
-    /// without the coordinator knowing which fields each writes.
-    let commit: () -> Void
+    /// without the coordinator knowing which fields each writes. Returns
+    /// `false` when the caller's durable write failed (review F2) so
+    /// `confirm` skips `startLoad` — a failed commit must not load a model
+    /// the chat did not actually adopt.
+    let commit: () -> Bool
     /// Profile id to persist `toModelID` onto when the user checks
     /// "Set as default". Nil disables the checkbox.
     let setAsDefaultProfileID: String?
@@ -98,8 +101,11 @@ public final class ProfileSwapCoordinator: ObservableObject {
   /// What a confirmed/silent swap should persist on the caller's side.
   /// `profileID` is always set; `pinModel` is set only when the swap
   /// adopts a new model — `nil` means "leave the chat's model untouched"
-  /// (the preserve path, #460-AC1), distinct from clearing it.
-  public typealias SwapCommit = (_ profileID: String, _ pinModel: String?) -> Void
+  /// (the preserve path, #460-AC1), distinct from clearing it. Returns
+  /// `false` when persisting the pin failed (review F2): on a confirmed
+  /// swap the caller must NOT switch the profile, and `confirm` skips the
+  /// load. Silent paths ignore the result (they fire no load).
+  public typealias SwapCommit = (_ profileID: String, _ pinModel: String?) -> Bool
 
   @Published public private(set) var pending: PendingSwap?
   private var pendingState: PendingState? {
@@ -216,7 +222,7 @@ public final class ProfileSwapCoordinator: ObservableObject {
       // no-model confirm gate (ChatScaffoldView), never an implicit load here.
       Self.log.debug("swap silent (no target default — preserve current model) profile=\(toProfileID, privacy: .public)")
       pendingState = nil
-      commit(toProfileID, nil)
+      _ = commit(toProfileID, nil)  // silent path fires no load — result irrelevant
       return
     }
     guard let fromModel else {
@@ -227,13 +233,13 @@ public final class ProfileSwapCoordinator: ObservableObject {
       // start gate, never an implicit load here. Nothing to pin/preserve.
       Self.log.debug("swap silent (no current model to replace) profile=\(toProfileID, privacy: .public) to=\(to, privacy: .public)")
       pendingState = nil
-      commit(toProfileID, nil)
+      _ = commit(toProfileID, nil)  // silent path fires no load — result irrelevant
       return
     }
     if to == fromModel {
       Self.log.debug("swap silent (same model) profile=\(toProfileID, privacy: .public) model=\(to, privacy: .public)")
       pendingState = nil
-      commit(toProfileID, nil)
+      _ = commit(toProfileID, nil)  // silent path fires no load — result irrelevant
       return
     }
     let token = UUID()
@@ -269,7 +275,7 @@ public final class ProfileSwapCoordinator: ObservableObject {
     modelID: String,
     activeProfileID: String,
     fromModel: String?,
-    commit: @escaping (String) -> Void
+    commit: @escaping (String) -> Bool
   ) {
     // Fresh interaction — clear any stale set-as-default error (review
     // v2 F2). Covers the already-selected early return below too.
@@ -277,7 +283,7 @@ public final class ProfileSwapCoordinator: ObservableObject {
     if modelID == fromModel {
       Self.log.debug("model override silent (already selected) model=\(modelID, privacy: .public)")
       pendingState = nil
-      commit(modelID)
+      _ = commit(modelID)  // silent path fires no load — result irrelevant
       return
     }
     let token = UUID()
@@ -326,7 +332,11 @@ public final class ProfileSwapCoordinator: ObservableObject {
     let toModel = p.toModelID
     let commit = p.commit
     pendingState = nil
-    commit()
+    // Review F2: only load once the caller durably applied the swap. A
+    // failed model-pin save returns false → skip the load so the engine is
+    // not driven to a model the chat did not actually adopt (which would
+    // leave the toolbar label and the served model disagreeing).
+    guard commit() else { return }
     startLoad(modelID: toModel)
   }
 

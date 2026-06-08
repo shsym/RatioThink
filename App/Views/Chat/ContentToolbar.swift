@@ -34,9 +34,12 @@ struct ContentToolbar: View {
   let profileDefaultModel: String?
   /// #460: persists a confirmed profile swap (profile + optional pinned
   /// model) — wired by `ChatScaffoldView`, which owns the SwiftData write.
+  /// Returns `false` when the model-pin save failed (review F2) so the
+  /// coordinator skips the load and the profile is left unswitched.
   let commitSwap: ProfileSwapCoordinator.SwapCommit
   /// #460: persists a per-chat model selection — wired by `ChatScaffoldView`.
-  let commitModel: (String) -> Void
+  /// Returns `false` on a save failure so the coordinator skips the load.
+  let commitModel: (String) -> Bool
   /// #460: clears the per-chat model pin so the chat follows the profile
   /// default again ("Use profile default") — wired by `ChatScaffoldView`.
   let onUseProfileDefault: () -> Void
@@ -84,8 +87,8 @@ struct ContentToolbar: View {
     availableModels: [String] = ChatTranscriptViewModel.placeholderModels,
     selectedModelID: String? = nil,
     profileDefaultModel: String? = nil,
-    commitSwap: @escaping ProfileSwapCoordinator.SwapCommit = { _, _ in },
-    commitModel: @escaping (String) -> Void = { _ in },
+    commitSwap: @escaping ProfileSwapCoordinator.SwapCommit = { _, _ in true },
+    commitModel: @escaping (String) -> Bool = { _ in true },
     onUseProfileDefault: @escaping () -> Void = {},
     swapCoordinator: ProfileSwapCoordinator,
     modelLoadCenter: ModelLoadCenter?,
