@@ -261,7 +261,7 @@ public final class PieEngineHost: @unchecked Sendable {
     terminationSink: (@Sendable (EngineTermination) -> Void)? = nil,
     tailWriter: (@Sendable ([String]) -> Void)? = nil,
     guardrailBytes: Int64? = nil,
-    launchTimeoutSlack: TimeInterval = 2,
+    launchTimeoutSlack: TimeInterval = PieEngineHost.defaultLaunchTimeoutSlack,
     clock: @Sendable @escaping () -> Date = { Date() },
     // Default: a real cooperative sleep that swallows cancellation, exactly
     // matching the inline `try? await Task.sleep` the three timers used
@@ -310,6 +310,11 @@ public final class PieEngineHost: @unchecked Sendable {
     tailWriteQueue.async { EngineLogTail.append(lines) }
   }
   private static let tailWriteQueue = DispatchQueue(label: "com.ratiothink.engine.logtail")
+  /// Default host-owned safety margin added to `LaunchSpec.handshakeTimeout`
+  /// to form the launch lease. Public + named so the cross-layer timeout
+  /// ladder (engine lease < helper reply deadline < App restart wait) can be
+  /// asserted from one source (#459 review F2).
+  public static let defaultLaunchTimeoutSlack: TimeInterval = 2
   private let launchTimeoutSlack: TimeInterval
 
   /// Wall-clock source for the slow-flap window math, injectable so a

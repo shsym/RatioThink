@@ -528,6 +528,61 @@ final class XPCProtocolTests: XCTestCase {
     XCTAssertNil(captured?.1)
   }
 
+  // MARK: - #459 F1: protocol-version gate for the modelOverride selector
+
+  /// A stale helper from a previous build reports its own compiled-in
+  /// version and only exports the OLD `startEngineWithProfileID:reply:`
+  /// selector. The repair gate keys on
+  /// `helperProtocolVersion() >= currentVersion`, so adding the now-required
+  /// `startEngine(profileID:modelOverride:)` selector REQUIRES a version bump
+  /// — otherwise a stale v2 helper passes as healthy and the new App's start
+  /// call dies into a swallowed `.replyTimeout` and the engine never boots.
+  private final class FixedVersionClient: AppXPCClient, @unchecked Sendable {
+    let version: Int
+    init(version: Int) { self.version = version }
+    func helperProtocolVersion() async throws -> Int { version }
+    func engineStatus() async throws -> EngineStatus { .stopped }
+    func stopEngine() async throws {}
+    func startEngine(profileID: String, modelOverride: String?) async throws {}
+    func restartEngine(profileID: String) async throws {}
+  }
+
+  func test_currentVersion_bumped_for_modelOverride_selector() {
+    // The protocol exports `startEngineWithProfileID:modelOverride:reply:`
+    // (asserted in the selector list above) and the App requires it for every
+    // start. Pin the version so a future required-selector addition fails
+    // here until `currentVersion` is bumped.
+    XCTAssertEqual(HelperProtocolCompatibility.currentVersion, 3,
+                   "bump currentVersion whenever a new REQUIRED PieHelperXPC selector is added")
+  }
+
+  func test_isCompatible_routes_stale_lower_version_helper_to_repair() async {
+    let current = HelperProtocolCompatibility.currentVersion
+    let staleOK = await HelperProtocolCompatibility.isCompatible(
+      client: FixedVersionClient(version: current - 1))
+    let freshOK = await HelperProtocolCompatibility.isCompatible(
+      client: FixedVersionClient(version: current))
+    XCTAssertFalse(staleOK,
+                   "a helper below currentVersion must fail the gate so repair unregisters+reregisters it before any start path runs")
+    XCTAssertTrue(freshOK)
+  }
+
+  // MARK: - #459 F2: cross-layer engine-start timeout ladder
+
+  /// Each outer layer must sit strictly above the inner one so no layer
+  /// reports a premature failure for a still-booting engine, and the App
+  /// restart wait must dominate the helper's SERIAL stop+start budget.
+  func test_engine_start_timeout_ladder_is_strictly_ordered() {
+    let engineLease = PieControlLauncher.coldStartHandshakeTimeout
+      + PieEngineHost.defaultLaunchTimeoutSlack
+    XCTAssertLessThan(engineLease, HelperExportedAPI.startReplyDeadline,
+                      "helper start reply deadline must exceed the engine launch lease so its reply reflects the real outcome")
+    let helperSerialWorstCase = HelperExportedAPI.startReplyDeadline
+      + HelperExportedAPI.stopReplyDeadline
+    XCTAssertLessThan(helperSerialWorstCase, HelperXPCClient.defaultRestartReplyTimeout,
+                      "App restart wait must dominate the helper's serial stop+start budget (review F2: was 2s short)")
+  }
+
   // MARK: - helpers
 
   private func assertRoundTrip<T: Codable & Equatable>(

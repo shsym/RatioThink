@@ -302,7 +302,12 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// the XPC reply-timeout fallback (review v1 F4) fires. Covers
   /// the gap between deadline arrival on the host's state queue
   /// and the observer hopping over to reply.
-  static let replyTimeoutSlack: TimeInterval = 2
+  ///
+  /// Public so `AppXPCClient.restartReplyTimeout` derives its budget from
+  /// these helper deadlines rather than a hand-picked margin (#459 review
+  /// F2) — the App restart wait must always dominate the helper's serial
+  /// stop+start budget.
+  public static let replyTimeoutSlack: TimeInterval = 2
 
   /// XPC reply safety net for start / restart. Must sit ABOVE the engine's
   /// own process-lifetime lease (`LaunchSpec.handshakeTimeout` +
@@ -313,13 +318,15 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// of headroom covers the host slack + WS `installProgram`/`launchDaemon`
   /// rounds. The host surfaces a real `.failed` (or `.running`) via the
   /// observer long before this fires; tests inject a short
-  /// `replyTimeoutOverride`.
-  private static let startReplyDeadline: TimeInterval =
+  /// `replyTimeoutOverride`. Public so the App-side restart wait derives
+  /// from it (#459 review F2).
+  public static let startReplyDeadline: TimeInterval =
     PieControlLauncher.coldStartHandshakeTimeout + 15
 
   /// `LaunchedSession.shutdown` budget: SIGINT(10s) → SIGKILL(5s) =
-  /// 15s in the worst case. Add slack.
-  static let stopReplyDeadline: TimeInterval = 17
+  /// 15s in the worst case. Add slack. Public so the App-side restart wait
+  /// derives from it (#459 review F2).
+  public static let stopReplyDeadline: TimeInterval = 17
 
   /// Spawns the engine for `profileID` via `PieEngineHost`. Returns
   /// `.profileMissing` when the resolver is unwired and

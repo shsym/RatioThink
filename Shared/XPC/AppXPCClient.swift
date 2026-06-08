@@ -83,8 +83,19 @@ public extension AppXPCClient {
 public enum HelperProtocolCompatibility {
   /// Version 1: pre-capability helpers. Version 2: helper exports the
   /// strict `restartEngine(profileID:)` selector required by active
-  /// default-model changes.
-  public static let currentVersion = 2
+  /// default-model changes. Version 3: helper exports
+  /// `startEngine(profileID:modelOverride:)` (#459) — the App now invokes
+  /// the new `startEngineWithProfileID:modelOverride:reply:` selector for
+  /// every engine start, so a stale v2 helper (which only exports the old
+  /// `startEngineWithProfileID:reply:`) must be unregistered+reregistered by
+  /// the `>= currentVersion` repair gate before any start path runs;
+  /// otherwise the call dies into `.replyTimeout` (swallowed as
+  /// "start in flight") and the engine silently never boots.
+  ///
+  /// BUMP THIS whenever a new REQUIRED selector is added to `PieHelperXPC`,
+  /// or an in-place upgrade leaves a running old helper that passes the
+  /// reachability gate yet cannot service the new call.
+  public static let currentVersion = 3
 
   public static func isCompatible(client: any AppXPCClient) async -> Bool {
     do {
@@ -142,17 +153,28 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
   private let connectionLock = OSAllocatedUnfairLock<NSXPCConnection?>(initialState: nil)
   private static let log = Logger(subsystem: "com.ratiothink.app", category: "xpc.client")
 
-  // Restart = stop phase + a full cold-boot start phase. Wait past the
-  // helper's start reply deadline (`coldStartHandshakeTimeout` + headroom)
-  // so the App receives the engine's REAL terminal outcome instead of a
-  // premature `.replyTimeout` for a large model that is still loading (#459).
-  // `EngineStatusStore.restartEngine` also treats `.replyTimeout` as
-  // "in flight" so an even slower boot degrades to the status poll rather
+  // Restart = the helper's SERIAL stop phase + a full cold-boot start phase
+  // (HelperExportedAPI.restartEngine). Derive the App wait from those helper
+  // deadlines so it always dominates the serial budget and cannot drift when
+  // either deadline changes (#459 review F2): a hand-picked margin
+  // (coldStart + 30 = 150s) was 2s SHORT of the worst case
+  // (stopReplyDeadline 17 + startReplyDeadline 135 = 152s), violating the
+  // PR's own "App reply deadline sits strictly above the engine lease"
+  // invariant. `EngineStatusStore.restartEngine` also treats `.replyTimeout`
+  // as "in flight" so an even slower boot degrades to the status poll rather
   // than a false reload failure.
+  /// App-side restart wait, derived from the helper's serial stop+start
+  /// deadlines plus slack so it always dominates the helper's worst-case
+  /// reply (#459 review F2). Named so the timeout-ladder test asserts the
+  /// real value the init uses.
+  public static let defaultRestartReplyTimeout: TimeInterval =
+    HelperExportedAPI.startReplyDeadline
+    + HelperExportedAPI.stopReplyDeadline
+    + HelperExportedAPI.replyTimeoutSlack
+
   public init(endpoint: Endpoint,
               replyTimeout: TimeInterval = 2.0,
-              restartReplyTimeout: TimeInterval
-                = PieControlLauncher.coldStartHandshakeTimeout + 30) {
+              restartReplyTimeout: TimeInterval = HelperXPCClient.defaultRestartReplyTimeout) {
     self.endpoint = endpoint
     self.interface = PieHelperXPCInterface.make()
     self.replyTimeout = replyTimeout
