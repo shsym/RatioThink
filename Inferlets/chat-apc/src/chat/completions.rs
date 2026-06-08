@@ -1862,38 +1862,57 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
 /// role outside this set is an OpenAI-compatibility error (#468).
 const SUPPORTED_ROLES: [&str; 3] = ["system", "user", "assistant"];
 
+/// Single source of truth for the role policy. `None` = fillable;
+/// `Some(code)` = rejected with that 400 envelope `code`. `tool` keeps
+/// its dedicated `tool_role_unsupported` code (no tool slot in v1); any
+/// other unknown role — typo, `developer`, `function`, … — is
+/// `unsupported_role`. Used by both `validate_roles` (the early request
+/// gate) and `fill_context` (the callee guard), so the two can't drift.
+fn role_error_code(role: &str) -> Option<&'static str> {
+    if SUPPORTED_ROLES.contains(&role) {
+        None
+    } else if role == "tool" {
+        Some("tool_role_unsupported")
+    } else {
+        Some("unsupported_role")
+    }
+}
+
+/// Build the 400-envelope message for a rejected role at index `i`.
+fn role_error_message(i: usize, role: &str, code: &str) -> String {
+    if code == "tool_role_unsupported" {
+        format!(
+            "messages[{i}].role=\"tool\" is not yet supported (chat template has no tool slot); \
+             post the tool result as a user turn or wait for the SDK tool-answer surface to land"
+        )
+    } else {
+        format!(
+            "messages[{i}].role={role:?} is not a supported role (expected one of: system, user, assistant)"
+        )
+    }
+}
+
+/// Error `code`s emitted by the role policy (vs. internal failures like
+/// `tool_equip_failed`). A `fill_context` `Err` carrying one of these is
+/// a client error (400); anything else is an internal 500. Callers that
+/// surface `fill_context` failures (e.g. `tot::dispatch`) use this to
+/// pick the status.
+pub(crate) fn is_role_error_code(code: &str) -> bool {
+    matches!(code, "unsupported_role" | "tool_role_unsupported")
+}
+
 /// Validate message roles against the supported set. Returns the
 /// offending message index plus the 400 envelope `code`/`message`.
 ///
-/// `tool` keeps its dedicated `tool_role_unsupported` code (the chat
-/// template has no tool slot in v1); any other unknown role — a typo,
-/// `developer`, `function`, … — is `unsupported_role`. Both replace the
-/// prior silent demotion to `user` in [`fill_context`], which let a
-/// mis-spelled role generate a (wrongly-templated) completion instead of
-/// failing the request the way OpenAI-compatible SDKs expect.
+/// This is the early request gate ([`handle_parsed`]); [`fill_context`]
+/// guards the same policy at the callee so any non-completions caller
+/// (e.g. the tree-of-thought dispatch path) also rejects rather than
+/// silently demoting an unknown role to `user`.
 fn validate_roles(messages: &[ChatMessage]) -> Result<(), (usize, &'static str, String)> {
     for (i, m) in messages.iter().enumerate() {
-        if SUPPORTED_ROLES.contains(&m.role.as_str()) {
-            continue;
+        if let Some(code) = role_error_code(&m.role) {
+            return Err((i, code, role_error_message(i, &m.role, code)));
         }
-        if m.role == "tool" {
-            return Err((
-                i,
-                "tool_role_unsupported",
-                format!(
-                    "messages[{i}].role=\"tool\" is not yet supported (chat template has no tool slot); \
-                     post the tool result as a user turn or wait for the SDK tool-answer surface to land"
-                ),
-            ));
-        }
-        return Err((
-            i,
-            "unsupported_role",
-            format!(
-                "messages[{i}].role={:?} is not a supported role (expected one of: system, user, assistant)",
-                m.role
-            ),
-        ));
     }
     Ok(())
 }
@@ -2970,10 +2989,12 @@ fn build_forced_tool_constraint(
 /// before any chat turn so the schemas land in the system slot the
 /// chat template expects.
 ///
-/// Roles are validated upstream by `validate_roles` (#468), so only the
-/// supported set (`system`/`user`/`assistant`) reaches here on the
-/// request path; the `_` arm is defense-in-depth for any non-request
-/// caller.
+/// Enforces the role policy at the callee (#468): an unknown role returns
+/// `Err((code, message))` rather than being silently demoted to `user`.
+/// Both user-reachable callers — `handle_parsed` (which also gates early
+/// via `validate_roles`) and the tree-of-thought `tot::dispatch` — go
+/// through here, so no caller can forget the check. The `code` is a role
+/// policy code ([`is_role_error_code`]); callers map it to a 400.
 pub(crate) fn fill_context(
     ctx: &mut Context,
     model: &Model,
@@ -2994,7 +3015,7 @@ pub(crate) fn fill_context(
             ctx.append(&prefix);
         }
     }
-    for msg in messages {
+    for (i, msg) in messages.iter().enumerate() {
         match msg.role.as_str() {
             "system" => {
                 ctx.system(&msg.content);
@@ -3002,12 +3023,16 @@ pub(crate) fn fill_context(
             "assistant" => {
                 ctx.assistant(&msg.content);
             }
-            // `user` and a defensive catch-all. Unknown/unsupported roles
-            // are already rejected upstream by `validate_roles` (#468), so
-            // this arm only handles `user` on the request path; the
-            // catch-all is defense-in-depth for any non-request caller.
-            _ => {
+            "user" => {
                 ctx.user(&msg.content);
+            }
+            // #468: reject any other role here rather than demoting it to
+            // `user`. This is the root-cause guard — every caller goes
+            // through `fill_context`, so the tree-of-thought path can't
+            // bypass the policy the way it did before.
+            other => {
+                let code = role_error_code(other).unwrap_or("unsupported_role");
+                return Err((code, role_error_message(i, other, code)));
             }
         }
     }
@@ -3270,6 +3295,16 @@ mod tests {
             assert_eq!(code, "unsupported_role", "role={role:?}");
             assert!(msg.contains("messages[0].role"), "role={role:?}: {msg}");
         }
+    }
+
+    #[test]
+    fn is_role_error_code_splits_client_from_internal() {
+        // Role-policy codes are client errors (400); internal failures
+        // (e.g. tool_equip_failed) are not — the tot::dispatch status
+        // split (400 vs 500) keys on this.
+        assert!(is_role_error_code("unsupported_role"));
+        assert!(is_role_error_code("tool_role_unsupported"));
+        assert!(!is_role_error_code("tool_equip_failed"));
     }
 
     #[test]
