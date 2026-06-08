@@ -64,13 +64,18 @@ pub const DEFAULT_THINKING: bool = true;
 /// portable Metal (`make bench-tot`, Qwen3-0.6B) showed it does not pay off
 /// from inside a single inferlet, on either axis:
 ///
-/// - **Concurrency buys ~0%.** A WASM inferlet runs single-threaded and its
-///   forward-pass host call does not yield until it completes, so `join_all`
-///   never has two sibling decode steps in flight at once — the engine's
-///   batch scheduler never sees a coalescible pair. Measured: concurrent ≈
-///   sequential to within noise at every shape/regime (e.g. b4·d1 greedy:
-///   3.36s seq vs 3.40s conc). This is the empirical form of #413's "the
-///   engine batches forks only weakly".
+/// - **Concurrency buys ~0%.** The SDK async surface exists, but the engine
+///   host resolves `forward-pass.execute()` eagerly (awaits the pass to
+///   completion before returning the future-output), and a wasm guest is a
+///   single execution stack — so an async host call suspends the whole guest
+///   and `join_all` can't put two sibling decode steps in flight. Forward
+///   passes from one inferlet reach the batch scheduler strictly serially
+///   (probe-measured: batch size 1 across 1503 passes at 25 concurrent forks;
+///   driver `contexts=1` always). Measured: concurrent ≈ sequential to within
+///   noise at every shape/regime (e.g. b4·d1 greedy: 3.36s seq vs 3.40s conc).
+///   The empirical form of #413's "engine batches forks only weakly"; NOT
+///   small-breadth economics. See the `search` module docs for the host
+///   `execute()` file:line + the upstream fix.
 /// - **Phasing buys ~0% and risks a 2–3× regression.** Holding every sibling
 ///   context *and* its score-fork resident across a barrier spikes KV-page
 ///   utilization past the engine's eviction threshold, so each forward pass

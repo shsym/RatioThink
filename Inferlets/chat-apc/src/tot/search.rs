@@ -19,13 +19,29 @@
 //! loops (the pattern Pie's own `parallel-generation` / `tree-of-thought`
 //! examples use).
 //!
-//! **It does not pay off from inside a single inferlet.** Measured on real
-//! portable Metal (`make bench-tot`):
-//! - Concurrency buys ~0%: a WASM inferlet is single-threaded and its
-//!   forward-pass host call does not yield until it completes, so `join_all`
-//!   never has two sibling decode steps in flight — the scheduler never sees
-//!   a coalescible pair. (Empirical form of #413's "engine batches forks
-//!   only weakly".)
+//! **It does not pay off from inside a single inferlet** — verified by code
+//! + instrumentation, not wall-clock alone (#458):
+//!
+//! - Concurrency buys ~0%. The SDK *does* have an async surface — `execute()`
+//!   returns a `future-output` and `ForwardPassExt::execute_async` awaits its
+//!   pollable — and the wstd reactor + `join_all` would submit every sibling
+//!   before blocking. But the engine host resolves `execute()` **eagerly**:
+//!   its host impl (`Vendor/pie/runtime/src/api/inference.rs:324`) is an
+//!   `async fn` that `inference::submit(...).await`s the forward pass to
+//!   completion and returns an already-done `FutureOutput { done: true }`
+//!   (ibid. ~447, 506) — the deferred `rx`/`done:false` path on `FutureOutput`
+//!   (ibid. 45–75) is left unused. A wasm guest is a single execution stack,
+//!   so an async host call suspends the *whole* guest: `join_all` cannot
+//!   advance a sibling past its `execute()` until the current pass finishes.
+//!   Forward passes from one inferlet therefore reach the per-device batch
+//!   scheduler **strictly serially** — measured with a scheduler probe over
+//!   1503 passes at 25 concurrent forks (breadth 5, depth 2, beam 5): every
+//!   cycle was `recv → batch_len=1 → fire size=1`, with the non-blocking drain
+//!   never once finding a second request, and the portable driver logging
+//!   `contexts=1` for every pass. Batch size is structurally 1 regardless of
+//!   breadth — this is the precise form of #413's "engine batches forks only
+//!   weakly", and it is NOT small-breadth economics (25 ≫ a level's nodes
+//!   still never co-batched).
 //! - A phased generate-then-score barrier buys ~0% and **regresses 2–3×**
 //!   under high KV residency: holding every sibling context plus its
 //!   score-fork resident spikes KV-page use past the eviction threshold, so
@@ -35,18 +51,22 @@
 //! `CoupledSequential` — generate-then-score one node at a time, the
 //! memory-frugal pre-#458 / #413 shape, fastest-or-tied at every shape. The
 //! knob still exposes two axes —
-//! - **generation** concurrent (engine-*would*-batch) vs sequential;
+//! - **generation** concurrent (engine-*would*-batch, if the host deferred
+//!   `execute()`) vs sequential;
 //! - **scoring** phased (barrier, all `Answered` nodes scored in one
 //!   concurrent batch) vs coupled (each branch generates then scores) —
 //! so the non-default variants remain as the reproducible measurement
 //! apparatus, never the production path. They never change the returned tree.
 //!
-//! **Upstream blocker:** true batched sibling decode needs the SDK/runtime to
-//! either multiplex several forward-pass host calls from one guest (so
-//! `join_all`'d siblings actually co-batch) or expose a multi-context batched
-//! forward pass, plus enough KV headroom to keep a level's contexts resident.
-//! Until then the inferlet can't express a beneficial batch; the apparatus
-//! lets a future session re-measure `make bench-tot` once that lands.
+//! **Upstream blocker (real capability gap):** batched sibling decode needs
+//! the engine host to make `forward-pass.execute()` genuinely deferred —
+//! enqueue the pass to the scheduler and return a pending `FutureOutput`
+//! (`rx: Some`, `done: false`) immediately, resolving it via the pollable —
+//! so a single guest can hold several passes in flight and the scheduler can
+//! coalesce them. (The `FutureOutput` deferral path already exists; only
+//! `execute()` short-circuits it.) Phased scoring additionally needs enough
+//! KV headroom to keep a level's contexts resident. The apparatus lets a
+//! future session re-run `make bench-tot` once that host change lands.
 //!
 //! ### Streaming constraint (#413)
 //!
