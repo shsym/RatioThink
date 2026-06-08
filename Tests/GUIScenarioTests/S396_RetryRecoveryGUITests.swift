@@ -175,6 +175,17 @@ final class S396_RetryRecoveryGUITests: XCTestCase {
     XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
                   "model menu missing after creating chat; app: \(app.debugDescription)")
 
+    // #460 single source of truth: an unpinned fresh chat follows the active
+    // profile default, so the seeded model is the chat's CURRENT selection —
+    // the collapsed control surfaces it ("Model: <leaf> (Default)"). Assert it
+    // so the test still verifies the seeded model is present AND selected,
+    // independent of whether the menu row renders bare or annotated.
+    XCTAssertTrue(
+      waitForTitleOrValueContains(modelMenu, Self.menuModelLeaf, timeout: 10),
+      "toolbar.model must show the seeded model '\(Self.menuModelLeaf)' as the current "
+        + "selection (#460 single source of truth); title=\(modelMenu.title); "
+        + "value=\(String(describing: modelMenu.value)); app: \(app.debugDescription)")
+
     let deadline = Date().addingTimeInterval(15)
     var lastMenuDescription = ""
     var attempt = 0
@@ -201,8 +212,17 @@ final class S396_RetryRecoveryGUITests: XCTestCase {
     throw NSError(domain: "S396.RetryRecoveryGUITests", code: 1)
   }
 
+  /// Locate the seeded model's menu row by MODEL IDENTITY, tolerant of the
+  /// trailing `(profile default)` annotation the row carries when the seeded
+  /// model is the chat's CURRENT selection (#460: an unpinned fresh chat
+  /// follows the active profile default → the seeded model renders as the
+  /// checkmarked `<leaf> (profile default)` row). `BEGINSWITH <leaf>` finds the
+  /// row in BOTH the bare and annotated renderings; the exact `menuItems[leaf]`
+  /// only matched the bare form. Kept in sync with S302's helper.
   private func seededModelMenuItem(in app: XCUIApplication) -> XCUIElement {
-    app.menuItems[Self.menuModelLeaf]
+    app.menuItems
+      .matching(NSPredicate(format: "title BEGINSWITH %@", Self.menuModelLeaf))
+      .firstMatch
   }
 
   @MainActor
@@ -269,6 +289,25 @@ final class S396_RetryRecoveryGUITests: XCTestCase {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
       if app.popovers.count == 0 { return true }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+    }
+    return false
+  }
+
+  /// Poll an element's title/value for a substring. The collapsed
+  /// `toolbar.model` control exposes the current model in its title
+  /// (`Model: <leaf> (Default)`) and the full slug in its value, so the
+  /// seeded leaf appears in one or the other regardless of the menu row's
+  /// bare-vs-annotated rendering. Kept in sync with S302's helper.
+  private func waitForTitleOrValueContains(_ element: XCUIElement,
+                                           _ needle: String,
+                                           timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if element.exists {
+        if element.title.contains(needle) { return true }
+        if let value = element.value as? String, value.contains(needle) { return true }
+      }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
     }
     return false

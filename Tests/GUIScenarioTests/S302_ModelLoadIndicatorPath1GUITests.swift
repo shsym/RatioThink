@@ -450,6 +450,19 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
                   "model menu missing after creating chat; app: \(app.debugDescription)")
 
+    // #460 single source of truth: an unpinned fresh chat follows the active
+    // profile default, so the seeded model is the chat's CURRENT selection —
+    // the collapsed control surfaces it ("Model: <leaf> (Default)"). Assert it
+    // here so the test still verifies the seeded model is present AND selected,
+    // independent of whether the menu row renders bare or annotated. (The
+    // resident `loadviz-resident` is the engine fact we load the seeded model
+    // OVER below; it is NOT the selection.)
+    XCTAssertTrue(
+      waitForTitleOrValueContains(modelMenu, Self.menuModelLeaf, timeout: 10),
+      "toolbar.model must show the seeded model '\(Self.menuModelLeaf)' as the current "
+        + "selection (#460 single source of truth); title=\(modelMenu.title); "
+        + "value=\(String(describing: modelMenu.value)); app: \(app.debugDescription)")
+
     let deadline = Date().addingTimeInterval(15)
     var lastMenuDescription = ""
     var attempt = 0
@@ -476,8 +489,20 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     throw NSError(domain: "S302.ModelLoadIndicatorPath1GUITests", code: 1)
   }
 
+  /// Locate the seeded model's menu row by MODEL IDENTITY, tolerant of the
+  /// trailing `(profile default)` annotation the row carries when the seeded
+  /// model is the chat's CURRENT selection. Under #460's single source of
+  /// truth an unpinned fresh chat follows the active profile default, so the
+  /// seeded model renders as the checkmarked `<leaf> (profile default)` row
+  /// (menu-item identifier `checkmark`); when it is not the current selection
+  /// it renders as a bare `<leaf>` row. An exact `menuItems[leaf]` only matched
+  /// the bare form and missed the annotated/checkmarked one — `BEGINSWITH <leaf>`
+  /// finds the row in BOTH renderings without weakening identity (no other model
+  /// shares this leaf, and the leaf is the row's title prefix in either form).
   private func seededModelMenuItem(in app: XCUIApplication) -> XCUIElement {
-    app.menuItems[Self.menuModelLeaf]
+    app.menuItems
+      .matching(NSPredicate(format: "title BEGINSWITH %@", Self.menuModelLeaf))
+      .firstMatch
   }
 
   /// Open the indicator's popover and wait for the specific model-load
@@ -572,6 +597,25 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
       if !element.exists || !element.label.hasPrefix(prefix) { return true }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+    }
+    return false
+  }
+
+  /// Poll an element's title/value for a substring. The collapsed
+  /// `toolbar.model` control exposes the current model in its title
+  /// (`Model: <leaf> (Default)`) and the full slug in its value, so the
+  /// seeded leaf appears in one or the other regardless of the menu row's
+  /// bare-vs-annotated rendering. Returns true as soon as it matches.
+  private func waitForTitleOrValueContains(_ element: XCUIElement,
+                                           _ needle: String,
+                                           timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if element.exists {
+        if element.title.contains(needle) { return true }
+        if let value = element.value as? String, value.contains(needle) { return true }
+      }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
     }
     return false
