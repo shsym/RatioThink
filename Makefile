@@ -58,7 +58,7 @@ define gui_suite_run
   exit $$status
 endef
 
-.PHONY: help genproject build build-static build-tests clean lint ci-pr local-pre-merge local-gui-gate local-e2e-gate release-gate \
+.PHONY: help genproject build build-static build-tests clean lint ci-pr check-vendor-pin local-pre-merge local-gui-gate local-e2e-gate release-gate \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
@@ -87,7 +87,10 @@ build-static: genproject ## Compile/type-check Rational app + helper without bui
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build
 
-ci-pr: lint test-ci-v2-static-gate verify-app-icon-assets test-app-icon-assets build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
+check-vendor-pin: ## Fail-closed guard: Vendor/pie gitlink must be reachable from its .gitmodules tracking branch (catches pin/branch drift)
+	Scripts/check-vendor-pie-pin.sh
+
+ci-pr: lint check-vendor-pin test-ci-v2-static-gate verify-app-icon-assets test-app-icon-assets build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
 
 local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary test-harsh-load-selftest test-matrix-aggregator ## Mandatory local pre-merge parity for runtime/heavy checks kept out of the lightweight manual workflow
 
