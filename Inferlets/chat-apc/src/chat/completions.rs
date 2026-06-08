@@ -739,7 +739,14 @@ const STARVED_MESSAGE: &str =
 /// handler matches it to surface backpressure as `server_busy` + HTTP 503
 /// instead of a generic `forward_pass_failed` 500 — so an over-capacity
 /// client gets an explicit, retryable signal rather than a hung connection.
-const SERVER_BUSY_SENTINEL: &str = "server_busy";
+///
+/// The trailing colon is load-bearing: `GenStep::execute` errors are an
+/// opaque free-text channel that also carries verbatim device/driver text,
+/// so a bare `server_busy` substring could appear in an unrelated fatal
+/// error and get mislabeled retryable. The host's contract is the
+/// colon-suffixed prefix (`"server_busy: …"`); bind to exactly that. (The
+/// real fix is a structured WIT error code — tracked as a follow-up.)
+const SERVER_BUSY_SENTINEL: &str = "server_busy:";
 
 /// Distinct terminal/error code for the over-capacity case.
 const SERVER_BUSY_CODE: &str = "server_busy";
@@ -3157,6 +3164,18 @@ mod tests {
             "forward_pass_failed"
         );
         assert_eq!(classify_forward_error(""), "forward_pass_failed");
+    }
+
+    #[test]
+    fn bare_server_busy_token_in_device_error_is_not_backpressure() {
+        // The host's contract is the colon-suffixed `server_busy:` prefix.
+        // A verbatim device/driver error that merely contains the bare token
+        // `server_busy` (no colon) must stay a fatal `forward_pass_failed`,
+        // not get mislabeled as retryable backpressure (a 503 a client would
+        // retry forever against a genuinely dead engine).
+        let device_err =
+            "GenStep::execute forward: driver reported server_busy flag set on dead queue";
+        assert_eq!(classify_forward_error(device_err), "forward_pass_failed");
     }
 
     // ─── Reasoning/content channel demux ──────────────────
