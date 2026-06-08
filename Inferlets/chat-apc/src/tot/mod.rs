@@ -253,7 +253,11 @@ pub async fn dispatch(
     // pages are shared across branches.
     if let Err((code, msg)) = completions::fill_context(&mut root_ctx, &model, &messages, None, false)
     {
-        return res.respond(sse::json_error(500, code, &msg)).await;
+        // #468: an unknown role is a client error (400, same envelope as
+        // the completions path); other fill_context failures (e.g.
+        // tool_equip_failed) stay 500.
+        let status = if completions::is_role_error_code(code) { 400 } else { 500 };
+        return res.respond(sse::json_error(status, code, &msg)).await;
     }
     if let Err(e) = root_ctx.flush().await {
         return res

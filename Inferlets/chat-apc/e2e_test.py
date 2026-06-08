@@ -459,6 +459,12 @@ async def main() -> int:
                             failures.append(f"/v1/models[0].owned_by {first!r}")
                         if not isinstance(first.get("id"), str) or not first.get("id"):
                             failures.append(f"/v1/models[0].id {first!r}")
+                        # #474: every entry carries the effective per-request
+                        # max_tokens ceiling (engine-global min) so the App
+                        # can clamp its profile value to the launched engine.
+                        mot = first.get("max_output_tokens")
+                        if not isinstance(mot, int) or isinstance(mot, bool) or mot <= 0:
+                            failures.append(f"/v1/models[0].max_output_tokens {first!r}")
 
                     # 404
                     r = await http.get(f"{base}/nonexistent")

@@ -42,6 +42,17 @@ public final class ModelLoadCenter: ObservableObject {
   /// succeeds, so the conservative reading is "still resident."
   @Published public private(set) var residentModelID: String?
 
+  /// The launched engine's effective per-request `max_tokens` ceiling for
+  /// the resident model (#474), learned from `GET /v1/models`
+  /// (`ModelInfo.maxOutputTokens`). `nil` = unknown (pre-#474 engine, no
+  /// model, or never reconciled) → the send path does not clamp. Updated
+  /// on every successful reconcile, even when `residentModelID` is
+  /// unchanged: a memory-guardrail change or model reload can re-launch
+  /// the engine with a different ceiling under the same model id. Cleared
+  /// wherever residency clears so a stale ceiling never outlives its
+  /// engine.
+  @Published public private(set) var residentMaxOutputTokens: Int?
+
   // MARK: - epoch counters
   //
   // Two-counter model (review v3 F1). Each load() captures both at
@@ -466,6 +477,7 @@ public final class ModelLoadCenter: ObservableObject {
     cancel()
     lastLoad = nil
     residentModelID = nil
+    residentMaxOutputTokens = nil
     state = .idle
     Self.log.info("model unloaded — resident cleared, state idle")
   }
@@ -488,6 +500,19 @@ public final class ModelLoadCenter: ObservableObject {
     Self.log.info("engine-resident reconcile: residentModelID=\(id, privacy: .public)")
   }
 
+  /// Record the launched engine's effective `max_tokens` ceiling reported
+  /// by `GET /v1/models` (#474). Set unconditionally on every successful
+  /// reconcile — unlike `reconcileEngineResident`, this does NOT
+  /// short-circuit on an unchanged model id, because a guardrail change or
+  /// reload can hand the same model a different ceiling. No-op while a
+  /// load is in flight so it never races an explicit user load's terminal.
+  public func setResidentMaxOutputTokens(_ ceiling: Int?) {
+    guard !isLoading else { return }
+    guard residentMaxOutputTokens != ceiling else { return }
+    residentMaxOutputTokens = ceiling
+    Self.log.info("engine-resident ceiling: maxOutputTokens=\(ceiling ?? -1, privacy: .public)")
+  }
+
   /// The engine left `.running` (stopped, failed, or stopping). Its resident
   /// model's RAM is freed by the stop, so app-side residency must not outlive
   /// it: clear `residentModelID`, demote a settled `.ready` to `.idle`, and
@@ -499,6 +524,7 @@ public final class ModelLoadCenter: ObservableObject {
   /// by `EngineLifecycle` on the `EngineStatus` transition out of `.running`.
   public func engineLeftRunning() {
     if residentModelID != nil { residentModelID = nil }
+    if residentMaxOutputTokens != nil { residentMaxOutputTokens = nil }
     switch state {
     case .ready:
       state = .idle
@@ -527,6 +553,7 @@ public final class ModelLoadCenter: ObservableObject {
   public func engineServesNoModel() {
     guard !isLoading else { return }
     if residentModelID != nil { residentModelID = nil }
+    if residentMaxOutputTokens != nil { residentMaxOutputTokens = nil }
     if case .ready = state { state = .idle }
   }
 

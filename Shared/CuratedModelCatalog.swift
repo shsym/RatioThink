@@ -246,17 +246,12 @@ public enum CuratedModelCatalog {
       huggingFaceFile: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
       summary: "Solid daily-driver chat at low VRAM."
     ),
-    CuratedModel(
-      id: "phi-3.5-mini-instruct-q4_k_m",
-      displayName: "Phi-3.5 Mini Instruct",
-      publisher: "Microsoft",
-      parameterCountBillions: 3.8,
-      quantization: "Q4_K_M",
-      approximateSizeBytes: 2_390_000_000,
-      huggingFaceRepo: "bartowski/Phi-3.5-mini-instruct-GGUF",
-      huggingFaceFile: "Phi-3.5-mini-instruct-Q4_K_M.gguf",
-      summary: "Reasoning-leaning Phi family build."
-    ),
+    // NB: no Phi here. Phi-3/Phi-3.5 GGUFs fuse Q/K/V into one `qkv_proj`
+    // tensor and Phi-2 declares arch `phi2`; the pie portable Metal loader
+    // supports neither (it expects separate q/k/v in a Llama/Qwen layout), so
+    // every Phi variant aborts at model load. Removed from the curated set
+    // rather than shipped as a launch-failing entry. Engine-side fused-QKV
+    // support is tracked upstream in pie-project/pie #402.
     // Qwen2.5 7B Q4_K_M comes from bartowski's repo, NOT the official
     // `Qwen/Qwen2.5-7B-Instruct-GGUF` — Qwen publishes this quant ONLY as
     // split shards (`…-q4_k_m-00001-of-00002.gguf` + `-00002-…`), which

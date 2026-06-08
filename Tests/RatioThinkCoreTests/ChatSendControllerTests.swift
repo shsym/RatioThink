@@ -58,6 +58,48 @@ final class ChatSendControllerTests: XCTestCase {
     XCTAssertNil(status.lastError)
   }
 
+  /// #474: the outgoing request's `max_tokens` is clamped DOWN to the
+  /// launched engine ceiling carried on `ChatSendRequestOptions`. End-to-end
+  /// through `send` so the options → `makeRequest` → wire path is exercised,
+  /// not just the pure helper. A memory-squeezed launch (ceiling 512) must
+  /// turn a profile value of 2048 into a 512 request — the difference between
+  /// a working (shorter) reply and chat-apc's clean 400.
+  func test_send_clamps_max_tokens_to_engine_ceiling() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [
+      .modelReady,
+      .delta(role: .assistant, content: "ok"),
+      .finish(reason: .stop),
+    ])
+    let controller = ChatSendController()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(
+        modelID: "m1",
+        sampling: ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 2048),
+        maxOutputTokensCeiling: 512
+      )
+    )
+
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+
+    XCTAssertEqual(engine.requests.count, 1)
+    XCTAssertEqual(engine.requests.first?.sampling.maxTokens, 512)
+    // The other sampling knobs ride through untouched.
+    XCTAssertEqual(engine.requests.first?.sampling.temperature, 0.7)
+    XCTAssertEqual(engine.requests.first?.sampling.topP, 0.9)
+  }
+
   func test_new_send_cancels_stale_stream_so_late_events_do_not_clobber_new_turn() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)

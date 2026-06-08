@@ -123,15 +123,20 @@ echo "e2e: model staged at $MODEL_PATH ($(du -h "$MODEL_PATH" | awk '{print $1}'
 echo "e2e: pie engine = $PIE_BIN"
 
 # --- run the gated real-engine test -----------------------------------
+# `--filter` defaults to the whole class. The matrix driver
+# (Scripts/run-matrix-e2e.sh) overrides it to a single method so one boot
+# per model runs exactly the profile-matrix cell, not the happy-path +
+# reasoning tests too.
+FILTER="${PIE_TEST_E2E_FILTER:-RealEngineLaunchE2ETests}"
 mkdir -p "$ROOT/logs"
 LOG="$ROOT/logs/test-$(date +%Y%m%d-%H%M%S)-engine-e2e.log"
-echo "e2e: running RealEngineLaunchE2ETests (log: $LOG)"
+echo "e2e: running $FILTER (log: $LOG)"
 set +e
 PIE_TEST_REAL_PIE_BIN="$PIE_BIN" \
 PIE_TEST_REAL_MODEL_PATH="$MODEL_PATH" \
 PIE_TEST_REAL_CHATAPC_WASM="$WASM" \
 PIE_TEST_REAL_CHATAPC_MANIFEST="$MANIFEST" \
-  swift test --filter RealEngineLaunchE2ETests 2>&1 | tee "$LOG"
+  swift test --filter "$FILTER" 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
 echo "e2e: swift test rc=$rc"

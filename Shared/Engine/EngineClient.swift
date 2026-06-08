@@ -86,17 +86,27 @@ public struct ModelInfo: Codable, Equatable, Sendable, Identifiable {
   /// authoritatively quote. The chat UI sorts by `id` for now;
   /// `created` returns when pie surfaces a registration timestamp.
   public let created: Date?
+  /// The effective per-request `max_tokens` ceiling the launched engine
+  /// will accept for this model (#474): chat-apc reports the runtime's
+  /// `max-output-tokens` — the memory-aware scheduler `default_token_limit`
+  /// (#438) capped by raw KV capacity. The App clamps its profile
+  /// `max_tokens` down to this before sending so a memory-squeezed launch
+  /// never trips the engine's clean 400. Optional so a pre-#474 engine
+  /// (no field) decodes to `nil` = "ceiling unknown, do not clamp".
+  public let maxOutputTokens: Int?
 
-  public init(id: String, ownedBy: String, created: Date? = nil) {
+  public init(id: String, ownedBy: String, created: Date? = nil, maxOutputTokens: Int? = nil) {
     self.id = id
     self.ownedBy = ownedBy
     self.created = created
+    self.maxOutputTokens = maxOutputTokens
   }
 
   private enum CodingKeys: String, CodingKey {
     case id
     case ownedBy = "owned_by"
     case created
+    case maxOutputTokens = "max_output_tokens"
   }
 }
 
