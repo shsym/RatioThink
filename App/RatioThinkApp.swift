@@ -71,7 +71,7 @@ struct RatioThinkApp: App {
     // borrow them at construction. The `@StateObject` wrappers aren't
     // installed on `self` at `init` time, so a re-instantiation here
     // is the only place identity can be threaded.
-    let center = Self.makeModelLoadCenter()
+    let center = ModelLoadCenter()
     let prefs = AppPreferences(defaults: Self.appPreferencesDefaults())
     let testBaseURL = Self.chatTestEngineBaseURL()
     let statusStore: EngineStatusStore
@@ -239,24 +239,6 @@ struct RatioThinkApp: App {
     // `PIE_TEST_ENGINE_BASE_URL` seam.
     guard let raw = HelperConfig.testEngineBaseURLOverride() else { return nil }
     return URL(string: raw)
-  }
-
-  /// Build the app's `ModelLoadCenter`. DEBUG-only seam (#459): when
-  /// `PIE_TEST_RESIDENT_MODEL` is set, seed `residentModelID` so a GUI test
-  /// can deterministically reach the cross-model profile-swap popover (which
-  /// fires only when a model A is resident) WITHOUT standing up a real engine
-  /// — mirrors the `PIE_TEST_PIN_ENGINE_RUNNING` status seam. The seed
-  /// survives an engine-free launch because `EngineLifecycle` clears residency
-  /// only on a leave-`.running` EDGE, which never occurs when the engine never
-  /// runs. Compiled out of Release entirely.
-  private static func makeModelLoadCenter() -> ModelLoadCenter {
-    #if DEBUG
-    let resident = ProcessInfo.processInfo.environment["PIE_TEST_RESIDENT_MODEL"]
-    if let resident, !resident.isEmpty {
-      return ModelLoadCenter(initialResident: resident)
-    }
-    #endif
-    return ModelLoadCenter()
   }
 
   private static func appPreferencesDefaults() -> UserDefaults {

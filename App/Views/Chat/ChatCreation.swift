@@ -26,7 +26,8 @@ enum ChatCreation {
     profileID: String = "chat",
     modelID: String? = nil
   ) -> UUID? {
-    let chat = Chat(profileID: profileID, modelID: modelID)
+    let resolvedModelID = modelID ?? debugPinnedChatModel()
+    let chat = Chat(profileID: profileID, modelID: resolvedModelID)
     context.insert(chat)
     do {
       try context.save()
@@ -36,5 +37,24 @@ enum ChatCreation {
       return nil
     }
     return chat.id
+  }
+
+  /// DEBUG-only GUI-test seam (#460): pin a fresh chat's `Chat.modelID` (the
+  /// single selection authority) from `PIE_TEST_CHAT_MODEL_PIN` when the
+  /// caller did not already inherit a model. This is the single-source analog
+  /// of the removed `PIE_TEST_RESIDENT_MODEL` residency seam: under the single
+  /// authority a profile swap keys on the chat's SELECTION, not engine
+  /// residency, so a test reaches the cross-model swap popover by pinning a
+  /// model that differs from the target profile's default — an EXPLICIT pin,
+  /// never residency. Compiled out of Release; never consulted in production
+  /// (the env var is unset).
+  @MainActor
+  private static func debugPinnedChatModel() -> String? {
+    #if DEBUG
+    let pin = ProcessInfo.processInfo.environment["PIE_TEST_CHAT_MODEL_PIN"]
+    return (pin?.isEmpty == false) ? pin : nil
+    #else
+    return nil
+    #endif
   }
 }

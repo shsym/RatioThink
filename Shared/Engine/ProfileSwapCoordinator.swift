@@ -10,10 +10,13 @@ import os
 /// Policy (#460 — every real model load is always confirmed; the old
 /// per-model skip-set is gone):
 ///   1. New profile has no default model → swap silently, fire NO load,
-///      and PRESERVE the chat's current model selection (the caller's
-///      commit leaves `modelID` untouched). There is no resident model to
-///      replace and nothing to switch TO, so the user keeps the concrete
-///      model they were already using (acceptance #460-AC1).
+///      and KEEP the chat's current concrete model by PINNING it as the
+///      chat's selection (`commit(profile, fromModel)`). The new profile
+///      has no default to follow, so an unpinned chat would otherwise lose
+///      its concrete model (`modelID` nil + no profile default = nothing);
+///      pinning `fromModel` makes the model the user was already using
+///      survive the switch (acceptance #460-AC1). No popup — there is no
+///      competing target model to confirm against.
 ///   1.5. The chat has NO current model at all (`fromModel == nil`:
 ///      engine stopped, nothing selected) → swap silently, fire NO load.
 ///      There is no model to REPLACE, so a swap-confirm "swap from — to X"
@@ -121,9 +124,11 @@ public final class ProfileSwapCoordinator: ObservableObject {
   }
 
   /// What a confirmed/silent swap should persist on the caller's side.
-  /// `profileID` is always set; `pinModel` is set only when the swap
-  /// adopts a new model — `nil` means "leave the chat's model untouched"
-  /// (the preserve path, #460-AC1), distinct from clearing it. Returns
+  /// `profileID` is always set; `pinModel` carries the model to pin — the
+  /// new default on a confirm-and-switch, or the CURRENT model on the
+  /// keep-current / no-default paths (#460-AC1). `nil` means "leave the
+  /// chat's model untouched" — used by the same-model and no-current-model
+  /// silent paths — distinct from clearing it. Returns
   /// `false` when persisting the pin failed (review F2): on a confirmed
   /// swap the caller must NOT switch the profile, and `confirm` skips the
   /// load. Silent paths ignore the result (they fire no load).
@@ -244,13 +249,17 @@ public final class ProfileSwapCoordinator: ObservableObject {
 
     guard let to = toModelID else {
       // Policy 1 (#460-AC1): the target profile has no default model — commit
-      // the profile selection, fire NO load, and PRESERVE the chat's current
-      // model (`pinModel: nil`). The user keeps the concrete model they were
-      // already using; a later send with nothing resolvable routes through the
-      // no-model confirm gate (ChatScaffoldView), never an implicit load here.
-      Self.log.debug("swap silent (no target default — preserve current model) profile=\(toProfileID, privacy: .public)")
+      // the profile selection, fire NO load, and KEEP the chat's current
+      // concrete model by PINNING it (`pinModel: fromModel`). The new profile
+      // has no default to follow, so leaving an unpinned chat's `modelID` nil
+      // would drop the model the user was using; pinning `fromModel` makes it
+      // survive the switch. `fromModel == nil` (no current model) pins nothing
+      // — there is nothing to keep. A later send with nothing resolvable routes
+      // through the no-model confirm gate (ChatScaffoldView), never an implicit
+      // load here.
+      Self.log.debug("swap silent (no target default — pin current model) profile=\(toProfileID, privacy: .public) keep=\(fromModel ?? "—", privacy: .public)")
       pendingState = nil
-      _ = commit(toProfileID, nil)  // silent path fires no load — result irrelevant
+      _ = commit(toProfileID, fromModel)  // pin current model; silent path fires no load
       return
     }
     guard let fromModel else {

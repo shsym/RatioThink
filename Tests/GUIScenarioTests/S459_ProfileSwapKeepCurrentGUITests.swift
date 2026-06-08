@@ -1,29 +1,38 @@
 import XCTest
 
-/// #459 — the cross-model profile-swap popover offers THREE outcomes.
+/// #459/#460 — the cross-model profile-swap popover offers THREE outcomes.
 ///
 /// The popover fires only on `ProfileSwapCoordinator.requestSwap` Policy 3:
-/// switching to a profile whose default model differs from the resident
-/// model. Engine-free + deterministic, with NO runner filesystem writes (the
+/// switching to a profile whose default model differs from the chat's CURRENT
+/// SELECTION. Under #460's single source of truth that "current model" is the
+/// chat's `Chat.modelID` (the selection authority) resolved through the active
+/// profile default — NOT engine residency, which is no longer a selection
+/// source. So the cross-model state is established by an EXPLICIT pin, not by
+/// seeding a resident model.
+///
+/// Engine-free + deterministic, with NO runner filesystem writes (the
 /// sandboxed XCUITest runner cannot write `/tmp`): the non-sandboxed app
 /// auto-seeds the `chat` + `fast-think` profiles (both default to the same
-/// seeded model Y), and `PIE_TEST_RESIDENT_MODEL` (DEBUG seam) pins a
-/// DIFFERENT model X resident. Switching `chat → fast-think` is therefore a
-/// cross-model swap (profile default Y ≠ resident X) that raises the popover
-/// — no real engine, no network, no Helper.
+/// seeded model Y), and `PIE_TEST_CHAT_MODEL_PIN` (DEBUG seam) pins a
+/// DIFFERENT model X as the fresh chat's `Chat.modelID`. Switching
+/// `chat → fast-think` is therefore a cross-model swap (chat selection X ≠
+/// fast-think default Y) that raises the popover — no real engine, no
+/// network, no Helper.
 ///
 /// Outcomes asserted at the GUI level (the per-outcome coordinator logic —
-/// override = A, no reload, stale-token drop — is exhaustively unit-proven in
-/// ProfileSwapWiringTests):
+/// keep-current pins X, no reload, stale-token drop — is exhaustively
+/// unit-proven in ProfileSwapWiringTests / ProfileSwapCoordinatorTests):
 ///   1. all three buttons render (Cancel / Keep Current Model / Switch);
 ///   2. CANCEL       → abandon: profile stays `chat`;
-///   3. KEEP CURRENT → profile becomes `fast-think` but the resident model X
-///                     is kept (toolbar.model still reflects X — no reload);
+///   3. KEEP CURRENT → profile becomes `fast-think` but the chat's pinned
+///                     model X is kept (toolbar.model still reflects X — no
+///                     reload, no adoption of fast-think's default);
 ///   4. SWITCH       → profile becomes `fast-think`.
 final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   /// A slug deliberately DIFFERENT from the seeded profile default so the
-  /// chat→fast-think swap is cross-model and raises the popover.
-  private let residentSlug = "ghost-resident.gguf"
+  /// chat→fast-think swap is cross-model and raises the popover. Pinned as
+  /// the fresh chat's `Chat.modelID` (the #460 selection authority).
+  private let pinnedSlug = "ghost-pinned.gguf"
 
   override func setUp() async throws {
     try guardSeatedGUI()
@@ -31,7 +40,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
 
   @MainActor
   func test_all_three_buttons_present_on_cross_model_swap() throws {
-    let app = launchResidentX()
+    let app = launchPinnedX()
     defer { app.terminate() }
     _ = openSwapPopoverSwitchingToFastThink(in: app)
 
@@ -48,7 +57,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
 
   @MainActor
   func test_cancel_abandons_and_stays_on_the_old_profile() throws {
-    let app = launchResidentX()
+    let app = launchPinnedX()
     defer { app.terminate() }
     let profileMenu = openSwapPopoverSwitchingToFastThink(in: app)
 
@@ -63,8 +72,8 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   }
 
   @MainActor
-  func test_keep_current_switches_profile_but_keeps_resident_model() throws {
-    let app = launchResidentX()
+  func test_keep_current_switches_profile_but_keeps_pinned_model() throws {
+    let app = launchPinnedX()
     defer { app.terminate() }
     let profileMenu = openSwapPopoverSwitchingToFastThink(in: app)
 
@@ -77,16 +86,16 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
 
     XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "fast-think", timeout: 10),
                   "Keep Current must still commit the profile switch to fast-think; title=\(profileMenu.title)")
-    // The resident model X is kept as the per-chat override — toolbar.model
-    // must still reflect X, never the fast-think profile's default.
+    // The chat's pinned model X is kept as `Chat.modelID` — toolbar.model must
+    // still reflect X, never the fast-think profile's default.
     let modelMenu = app.menuButtons["toolbar.model"]
-    XCTAssertTrue(waitForElementValueContaining(modelMenu, "ghost-resident", timeout: 10),
-                  "Keep Current must keep the resident model X via the per-chat override; toolbar.model value=\(String(describing: modelMenu.value))")
+    XCTAssertTrue(waitForElementValueContaining(modelMenu, "ghost-pinned", timeout: 10),
+                  "Keep Current must keep the chat's pinned model X (Chat.modelID); toolbar.model value=\(String(describing: modelMenu.value))")
   }
 
   @MainActor
   func test_switch_commits_the_profile_switch() throws {
-    let app = launchResidentX()
+    let app = launchPinnedX()
     defer { app.terminate() }
     let profileMenu = openSwapPopoverSwitchingToFastThink(in: app)
 
@@ -103,11 +112,12 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   // MARK: - setup
 
   /// Launch engine-free with a /tmp PIE_HOME the NON-sandboxed app seeds
-  /// itself (the runner writes nothing), and pin model X resident via the
-  /// DEBUG `PIE_TEST_RESIDENT_MODEL` seam. The seeded `chat`/`fast-think`
-  /// profiles both default to model Y ≠ X, so swapping is cross-model.
+  /// itself (the runner writes nothing), and pin model X as the fresh chat's
+  /// `Chat.modelID` via the DEBUG `PIE_TEST_CHAT_MODEL_PIN` seam. The seeded
+  /// `chat`/`fast-think` profiles both default to model Y ≠ X, so swapping is
+  /// cross-model on the chat's SELECTION (single-source #460), not residency.
   @MainActor
-  private func launchResidentX() -> XCUIApplication {
+  private func launchPinnedX() -> XCUIApplication {
     let pieHome = "/tmp/pie-s459swap-" + UUID().uuidString
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
     app.launchArguments.append(contentsOf: [
@@ -115,11 +125,12 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
       "-ApplePersistenceIgnoreState", "YES",
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
-    // DEBUG seam: pin model X resident with NO engine so swapping to a
-    // profile whose default is Y is cross-model and raises the popover.
-    app.launchEnvironment["PIE_TEST_RESIDENT_MODEL"] = residentSlug
-    // Engine-free: a stray developer Helper must not let reconcile discover a
-    // different resident and skew the swap.
+    // DEBUG seam: pin model X as the fresh chat's selection authority
+    // (`Chat.modelID`) so swapping to a profile whose default is Y is
+    // cross-model under #460's single source of truth and raises the popover.
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = pinnedSlug
+    // Engine-free: a stray developer Helper must not let reconcile run; the
+    // swap keys on the chat's pin regardless, but keep the harness hermetic.
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     app.launch()

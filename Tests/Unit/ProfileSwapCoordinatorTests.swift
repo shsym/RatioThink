@@ -5,8 +5,9 @@ import Combine
 /// #460: the swap policy keys on the chat's CURRENT model SELECTION (passed
 /// in as `fromModel` — the single source of truth `Chat.modelID` resolved
 /// through the profile default), NOT engine residency. Same-model = silent;
-/// no-target-default = silent + PRESERVE the current model; cross-model =
-/// popover (confirm switches + pins the new model, cancel keeps the current
+/// no-target-default = silent + PIN the current model (so an unpinned chat
+/// keeps its concrete model when the new profile has no default); cross-model
+/// = popover (confirm switches + pins the new model, cancel keeps the current
 /// one). Model overrides go through `requestModelOverride` and offer "Set as
 /// default for this profile". Preserves the review v1/v2/v3 invariants: F3
 /// (re-entrancy), F4 (atomic state + token-checked confirm/cancel), F5
@@ -29,8 +30,10 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
   private final class CommitSpy {
     /// Profile committed by a `requestSwap` commit.
     var swappedProfile: String?
-    /// Model pinned by a `requestSwap` commit. `nil` ⇒ "preserve current
-    /// model" (the no-default / silent path); non-nil ⇒ switch-and-pin.
+    /// Model pinned by a `requestSwap` commit. `nil` ⇒ "leave the model
+    /// untouched" (the same-model / no-current-model silent paths); non-nil ⇒
+    /// pin it (switch-and-pin the new default, or keep-current on a no-default
+    /// swap).
     var pinnedModel: String?
     var swapCommitCount = 0
     /// Model set by a `requestModelOverride` commit.
@@ -101,31 +104,34 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     coord.cancel(token: token)
   }
 
-  // MARK: - AC1: no-target-default swap PRESERVES the current model
+  // MARK: - AC1: no-target-default swap PINS (keeps) the current model
 
-  func test_no_target_default_commits_profile_silently_and_preserves_model() {
+  func test_no_target_default_commits_profile_silently_and_pins_current_model() {
     // Profile "next" has no default; the chat is currently on "m1". The swap
-    // must commit the profile, fire NO load, and leave the model untouched
-    // (`pinModel == nil`) so the user keeps the concrete model they had.
+    // must commit the profile, fire NO load, and PIN the current model
+    // (`pinModel == "m1"`) so an unpinned chat does not lose its concrete
+    // model when the new profile has no default to follow (#460-AC1).
     let (coord, center, _) = makeCoordinator(map: ["next": nil], resident: "m1")
     let spy = CommitSpy()
     coord.requestSwap(toProfileID: "next", fromModel: "m1", commit: swapCommit(spy))
     XCTAssertEqual(spy.swappedProfile, "next")
-    XCTAssertNil(spy.pinnedModel, "no-default swap must PRESERVE the current model (no pin)")
+    XCTAssertEqual(spy.pinnedModel, "m1",
+                   "no-default swap must PIN the current model so it survives the switch")
     XCTAssertNil(coord.pending)
     XCTAssertEqual(center.state, .ready(modelID: "m1"),
-                   "no-default swap: no load fires, current model stays put")
+                   "no-default swap: pin only, no load fires — current model stays put")
   }
 
-  func test_no_target_default_preserves_a_currently_loading_model() {
+  func test_no_target_default_pins_a_currently_loading_model() {
     // AC1 "whether already loaded or currently loading": the chat is loading
     // "m1" (fromModel = the loading target, residency still nil). A no-default
-    // swap must still preserve it silently and not disturb the load.
+    // swap must pin it silently and not disturb the load.
     let (coord, _, _) = makeCoordinator(map: ["next": nil])
     let spy = CommitSpy()
     coord.requestSwap(toProfileID: "next", fromModel: "m1-loading", commit: swapCommit(spy))
     XCTAssertEqual(spy.swappedProfile, "next")
-    XCTAssertNil(spy.pinnedModel, "a loading model is the current model and must be preserved")
+    XCTAssertEqual(spy.pinnedModel, "m1-loading",
+                   "a loading model is the current model and must be pinned to survive the switch")
     XCTAssertNil(coord.pending)
   }
 
