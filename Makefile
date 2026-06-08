@@ -64,7 +64,7 @@ endef
         test-unit test-scenario test-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
-        test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-load test-e2e-396 test-e2e-chat test-e2e-tot test-e2e-full test-helper-respawn test-helper-recovery test-quit-structured \
+        test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-load test-e2e-396 test-e2e-chat test-e2e-tot test-e2e-tot-batched bench-tot test-e2e-full test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
@@ -496,6 +496,12 @@ test-e2e-chat: ## E2E area: real small-model chat send streams + persists (S258,
 
 test-e2e-tot: ## E2E area: real-engine tree-of-thought APP path completes (#413 stall guard; depth>1, real Qwen3-0.6B-GGUF)
 	Scripts/run-tot-e2e.sh
+
+test-e2e-tot-batched: ## E2E area: real-engine BATCHED ToT (exec=phased_concurrent) tree shape/status (#458; real Qwen3-0.6B-GGUF)
+	Scripts/run-tot-batched-e2e.sh
+
+bench-tot: ## Benchmark: ToT batched-vs-sequential strategies on real portable Metal — wall-clock + tok/s (#458)
+	Scripts/run-tot-bench.sh
 
 test-e2e-full: ## E2E area: 3-layer real-model proof — GUI download → engine boot → chat persist (S204)
 	Scripts/run-full-e2e.sh

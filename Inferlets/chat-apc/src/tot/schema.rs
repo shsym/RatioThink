@@ -36,6 +36,87 @@ pub const DEFAULT_TOP_P: f32 = 0.95;
 /// as concise non-reasoning candidates.
 pub const DEFAULT_THINKING: bool = true;
 
+/// Sibling execution strategy (#458). Controls *how* a level's branches are
+/// generated and scored, on two independent axes:
+///
+/// - **generation**: concurrent (all siblings in flight at once, so their
+///   per-step forward passes coalesce into one batched GPU pass via the
+///   engine's per-device scheduler — there is no multi-context forward-pass
+///   primitive, `join_all` IS the batched-decode API) vs sequential (one
+///   node at a time).
+/// - **scoring**: phased (a barrier — every branch finishes generating, then
+///   all `Answered` nodes are scored in one concurrent batch) vs coupled
+///   (each branch generates then immediately scores, so scoring overlaps the
+///   next branch's generation under concurrency — the pre-#458 shape).
+///
+/// The chosen strategy NEVER changes the returned tree (same nodes, scores,
+/// statuses, order) — only how it is computed. So this is an additive,
+/// optional execution hint, not a wire contract. The variants exist to
+/// benchmark the two axes on one warm engine (`tot_bench.py`).
+///
+/// On the **streaming** path generation is always sequential regardless of
+/// this knob (a single SSE emitter cannot be shared across concurrent branch
+/// futures, so node deltas would have no exclusive writer).
+///
+/// ## Why the default is `CoupledSequential` (#458, MEASURED)
+///
+/// The point of #458 was to batch sibling decode steps. Measurement on real
+/// portable Metal (`make bench-tot`, Qwen3-0.6B) showed it does not pay off
+/// from inside a single inferlet, on either axis:
+///
+/// - **Concurrency buys ~0%.** A WASM inferlet runs single-threaded and its
+///   forward-pass host call does not yield until it completes, so `join_all`
+///   never has two sibling decode steps in flight at once — the engine's
+///   batch scheduler never sees a coalescible pair. Measured: concurrent ≈
+///   sequential to within noise at every shape/regime (e.g. b4·d1 greedy:
+///   3.36s seq vs 3.40s conc). This is the empirical form of #413's "the
+///   engine batches forks only weakly".
+/// - **Phasing buys ~0% and risks a 2–3× regression.** Holding every sibling
+///   context *and* its score-fork resident across a barrier spikes KV-page
+///   utilization past the engine's eviction threshold, so each forward pass
+///   then pays suspend/restore. Measured b3·d2 greedy: 7.8s coupled vs 16.9s
+///   (phased_concurrent) / 25.2s (phased_sequential) — a 2.2–3.2× regression;
+///   tied (no win) in the lower-residency sampled regime.
+///
+/// So `CoupledSequential` — the pre-#458 / #413 shape, memory-frugal and
+/// fastest/tied everywhere — is the default. The other variants stay as the
+/// reproducible measurement apparatus: re-run `make bench-tot` to re-check
+/// when the SDK gains a guest async runtime that multiplexes forward passes
+/// (so siblings actually co-batch) or the KV budget grows. See the search.rs
+/// module docs for the upstream-pie blocker.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecStrategy {
+    /// Default (measured optimal): sequential generation, scoring coupled per
+    /// node — the pre-#458 / #413 production shape.
+    #[default]
+    CoupledSequential,
+    /// Concurrent generation, scoring coupled per branch (#407-style overlap)
+    /// — isolates the concurrency axis. Measured: no gain.
+    CoupledConcurrent,
+    /// Sequential generation, phased concurrent scoring — isolates the phase
+    /// barrier (and batched scoring). Measured: no gain; regresses under high
+    /// KV residency.
+    PhasedSequential,
+    /// Concurrent generation + phased concurrent scoring — the "fully batched"
+    /// target. Measured: no gain; regresses under high KV residency.
+    PhasedConcurrent,
+}
+
+impl ExecStrategy {
+    /// Whether sibling generation runs concurrently (engine-batched). The
+    /// streaming path forces this false regardless (see [`ExecStrategy`]).
+    pub fn concurrent_gen(self) -> bool {
+        matches!(self, Self::PhasedConcurrent | Self::CoupledConcurrent)
+    }
+
+    /// Whether scoring is a phase after all generation (`true`) or coupled
+    /// to each branch's generation (`false`).
+    pub fn phased_score(self) -> bool {
+        matches!(self, Self::PhasedConcurrent | Self::PhasedSequential)
+    }
+}
+
 /// Raw `input` payload for `inferlet:"tree-of-thought"`. Every field is
 /// optional; missing fields take the defaults above. `messages` may also
 /// be supplied at the top level of the dispatch envelope (handled by the
@@ -52,6 +133,9 @@ pub struct TotInput {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub thinking: Option<bool>,
+    /// Sibling execution strategy (#458). Optional execution hint; defaults
+    /// to the production [`ExecStrategy`]. Does not change the returned tree.
+    pub exec: Option<ExecStrategy>,
 }
 
 /// Validated, defaulted search parameters.
@@ -69,6 +153,9 @@ pub struct TotParams {
     /// When true, nodes generate a `<think>` reasoning block before the
     /// answer (demuxed apart); when false, `/no_think` suppresses it.
     pub thinking: bool,
+    /// Sibling execution strategy (#458) — how branches are generated/scored.
+    /// Production default; never changes the returned tree.
+    pub exec: ExecStrategy,
 }
 
 /// Total candidate nodes generated across all levels:
@@ -95,6 +182,7 @@ pub fn resolve(input: &TotInput) -> Result<TotParams, (&'static str, String)> {
     let temperature = input.temperature.unwrap_or(DEFAULT_TEMPERATURE);
     let top_p = input.top_p.unwrap_or(DEFAULT_TOP_P);
     let thinking = input.thinking.unwrap_or(DEFAULT_THINKING);
+    let exec = input.exec.unwrap_or_default();
 
     if !(1..=MAX_BREADTH).contains(&breadth) {
         return Err(("breadth", format!("breadth must be in [1, {MAX_BREADTH}]")));
@@ -147,6 +235,7 @@ pub fn resolve(input: &TotInput) -> Result<TotParams, (&'static str, String)> {
         temperature,
         top_p,
         thinking,
+        exec,
     })
 }
 
@@ -181,6 +270,44 @@ mod tests {
         let mut i = input();
         i.thinking = Some(false);
         assert!(!resolve(&i).unwrap().thinking);
+    }
+
+    #[test]
+    fn exec_defaults_to_coupled_sequential() {
+        // #458 (MEASURED): neither concurrency nor phasing pays off from a
+        // single inferlet, and phasing can regress 2–3× under KV pressure, so
+        // the coupled-sequential (#413) shape is the default. An unset `exec`
+        // resolves to it — production behavior is unchanged.
+        assert_eq!(resolve(&input()).unwrap().exec, ExecStrategy::CoupledSequential);
+        assert_eq!(ExecStrategy::default(), ExecStrategy::CoupledSequential);
+    }
+
+    #[test]
+    fn exec_knob_round_trips() {
+        // A non-default value must survive resolve (not be coerced to default).
+        let mut i = input();
+        i.exec = Some(ExecStrategy::PhasedConcurrent);
+        assert_eq!(resolve(&i).unwrap().exec, ExecStrategy::PhasedConcurrent);
+    }
+
+    #[test]
+    fn exec_axes_map_to_bools() {
+        // Two independent axes: generation concurrency × scoring phase.
+        assert!(ExecStrategy::PhasedConcurrent.concurrent_gen());
+        assert!(ExecStrategy::PhasedConcurrent.phased_score());
+        assert!(!ExecStrategy::CoupledSequential.concurrent_gen());
+        assert!(!ExecStrategy::CoupledSequential.phased_score());
+        assert!(ExecStrategy::CoupledConcurrent.concurrent_gen());
+        assert!(!ExecStrategy::CoupledConcurrent.phased_score());
+        assert!(!ExecStrategy::PhasedSequential.concurrent_gen());
+        assert!(ExecStrategy::PhasedSequential.phased_score());
+    }
+
+    #[test]
+    fn exec_deserializes_snake_case() {
+        let i: TotInput =
+            serde_json::from_str(r#"{"exec":"coupled_concurrent"}"#).unwrap();
+        assert_eq!(resolve(&i).unwrap().exec, ExecStrategy::CoupledConcurrent);
     }
 
     #[test]

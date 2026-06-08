@@ -457,6 +457,7 @@ mod tests {
             temperature: 0.7,
             top_p: 0.95,
             thinking: true,
+            exec: crate::tot::schema::ExecStrategy::default(),
         };
         let v = serde_json::to_value(TreeStartFrame {
             event: "tree_start",

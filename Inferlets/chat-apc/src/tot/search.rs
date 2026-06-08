@@ -8,15 +8,66 @@
 //! surviving (beam-kept) candidate is the final answer — earlier levels
 //! are preserved when a later level fully fails (see `fold_level` / F7).
 //!
-//! Branches at a level are generated concurrently via
-//! `futures::future::join_all`. The WIT-backed engine calls
-//! (`Context`/`generate`/`fork`) live in [`run`], [`expand`], and
+//! ## Batched sibling decoding + parallel scoring (#458 — investigated, NOT a win)
+//!
+//! A level's branches are sibling forks of one shared, flushed, cue-free
+//! prefix. There is **no multi-context forward-pass primitive** — the WIT
+//! `forward-pass` binds a single `context`, so the only way to put N siblings
+//! on one GPU forward pass is to have N decode steps *in flight at the same
+//! time* and let the engine's per-device batch scheduler coalesce them. The
+//! idiomatic attempt is `futures::future::join_all` over the sibling decode
+//! loops (the pattern Pie's own `parallel-generation` / `tree-of-thought`
+//! examples use).
+//!
+//! **It does not pay off from inside a single inferlet.** Measured on real
+//! portable Metal (`make bench-tot`):
+//! - Concurrency buys ~0%: a WASM inferlet is single-threaded and its
+//!   forward-pass host call does not yield until it completes, so `join_all`
+//!   never has two sibling decode steps in flight — the scheduler never sees
+//!   a coalescible pair. (Empirical form of #413's "engine batches forks
+//!   only weakly".)
+//! - A phased generate-then-score barrier buys ~0% and **regresses 2–3×**
+//!   under high KV residency: holding every sibling context plus its
+//!   score-fork resident spikes KV-page use past the eviction threshold, so
+//!   each pass then pays suspend/restore.
+//!
+//! So the default [`ExecStrategy`](super::schema::ExecStrategy) is
+//! `CoupledSequential` — generate-then-score one node at a time, the
+//! memory-frugal pre-#458 / #413 shape, fastest-or-tied at every shape. The
+//! knob still exposes two axes —
+//! - **generation** concurrent (engine-*would*-batch) vs sequential;
+//! - **scoring** phased (barrier, all `Answered` nodes scored in one
+//!   concurrent batch) vs coupled (each branch generates then scores) —
+//! so the non-default variants remain as the reproducible measurement
+//! apparatus, never the production path. They never change the returned tree.
+//!
+//! **Upstream blocker:** true batched sibling decode needs the SDK/runtime to
+//! either multiplex several forward-pass host calls from one guest (so
+//! `join_all`'d siblings actually co-batch) or expose a multi-context batched
+//! forward pass, plus enough KV headroom to keep a level's contexts resident.
+//! Until then the inferlet can't express a beneficial batch; the apparatus
+//! lets a future session re-measure `make bench-tot` once that lands.
+//!
+//! ### Streaming constraint (#413)
+//!
+//! On the streaming path generation is forced **sequential** regardless of
+//! `exec`: a single SSE [`Emitter`] cannot be shared across concurrent
+//! branch futures, so per-node `node_delta` chunks would have no exclusive
+//! writer. Scoring never streams, so it still phases + batches there — a
+//! streamed search keeps #413's one-node-at-a-time live fill while its
+//! per-level scoring runs as a coalesced batch. Both paths emit a
+//! byte-identical final tree.
+//!
+//! The WIT-backed engine calls (`Context`/`generate`/`fork`) live in
+//! [`run`], [`resolve_level`], [`generate_branch`], [`expand`], and
 //! [`score_node`] and are exercised by the real-engine e2e. The
-//! Context-free bookkeeping — node materialization, pruning, the
-//! empty-frontier break, and final-answer selection — is split into the
-//! pure helpers [`materialize_level`], [`fold_level`], and [`finalize`],
-//! which are unit-tested natively via `cargo test --lib`.
+//! Context-free bookkeeping — node classification, materialization,
+//! pruning, the empty-frontier break, and final-answer selection — is split
+//! into the pure helpers [`classify`], [`materialize_level`],
+//! [`fold_level`], and [`finalize`], which are unit-tested natively via
+//! `cargo test --lib`.
 
+use futures::future::join_all;
 use inferlet::model::Model;
 use inferlet::sample::Sampler;
 use inferlet::{chat, reasoning};
@@ -338,8 +389,12 @@ pub async fn run(
         // user-turn and flush it into the shared prefix. The assistant
         // turn itself is opened per child in `expand` (every level cues
         // its own fork), so the shared prefix stays cue-free and KV pages
-        // are shared across the branches. Sequential (≤ beam_width
-        // parents; flush is light).
+        // are shared across the branches. Concurrent (#458 / part B): the
+        // ≤ beam_width parent flushes are independent forward passes, so
+        // `join_all` lets the engine batch them into one prefill pass
+        // instead of running them serially. `join_all` preserves input
+        // order, so error leaves are still appended in deterministic
+        // frontier order (the streaming `emit_level` slice depends on it).
         //
         // A flush failure here is NOT best-effort: `Context::flush` takes
         // the token buffer before its fallible forward pass, so on error
@@ -352,16 +407,24 @@ pub async fn run(
         // record error leaves for its children, mirroring the fork-failure
         // path below.
         if level > 1 {
-            let mut refined: Vec<Frontier> = Vec::with_capacity(frontier.len());
             let refine = with_thinking(REFINE_INSTRUCTION, params.thinking);
-            for mut f in frontier {
-                f.ctx.user(&refine);
+            let refine_ref = refine.as_str();
+            let flushed = join_all(frontier.into_iter().map(|mut f| async move {
+                f.ctx.user(refine_ref);
                 match f.ctx.flush().await {
-                    Ok(()) => refined.push(f),
-                    Err(e) => {
+                    Ok(()) => Ok(f),
+                    Err(e) => Err((f.node_id, e)),
+                }
+            }))
+            .await;
+            let mut refined: Vec<Frontier> = Vec::with_capacity(flushed.len());
+            for r in flushed {
+                match r {
+                    Ok(f) => refined.push(f),
+                    Err((node_id, e)) => {
                         for b in 0..params.breadth {
                             flat.push(error_leaf(
-                                &f.node_id,
+                                &node_id,
                                 level,
                                 b,
                                 format!("refine flush failed: {e}"),
@@ -393,32 +456,15 @@ pub async fn run(
             }
         }
 
-        // Sequential generation (#413 phase B): each node streams its own
-        // node_start + token deltas to the single SSE emitter with exclusive
-        // access, so the live tree fills a node at a time. Concurrency was
-        // ~23% faster here but the engine batches forks only weakly, and a
-        // sequential per-node stream reads as more responsive than a level
-        // appearing all at once; the id on every frame keeps routing robust.
-        let mut results: Vec<(Context, NodeOutcome)> = Vec::with_capacity(ctxs.len());
-        for (meta, c) in metas.iter().zip(ctxs.into_iter()) {
-            let (id, parent_id, branch_index) = (meta.0.as_str(), meta.1.as_str(), meta.2);
-            if let Some(em) = emitter.as_deref_mut() {
-                let _ = stream::emit_node_start(em, id, parent_id, level, branch_index).await;
-            }
-            results.push(
-                expand(
-                    c,
-                    model,
-                    params.temperature,
-                    params.top_p,
-                    params.max_reasoning_tokens,
-                    params.max_tokens_per_node,
-                    emitter.as_deref_mut(),
-                    id,
-                )
-                .await,
-            );
-        }
+        // Generate + score this level's branches per the execution strategy
+        // (#458). Default is coupled-sequential (one node at a time); the
+        // concurrent / phased variants are the measurement apparatus (no
+        // measured win — see the module docs). Generation is always
+        // sequential when an emitter is present (#413 streaming). `results` is
+        // in `metas` order regardless (join_all and the sequential loop both
+        // preserve it), so the tree shape is identical across strategies.
+        let results: Vec<(Context, NodeOutcome)> =
+            resolve_level(&metas, ctxs, params, model, emitter.as_deref_mut(), level).await;
 
         // Pair each expansion with its meta: keep the moved-back context as
         // a potential survivor, and hand the Context-free outcome to the
@@ -560,44 +606,148 @@ fn finalize(flat: Vec<Node>, last_level: &[Candidate]) -> SearchOutcome {
     }
 }
 
-/// Expand one forked context: generate a reasoning+answer continuation
-/// ([`generate_demuxed`]), then value-score an answered node. The context is
-/// moved back out (paired with a Context-free [`NodeOutcome`]) so a
-/// surviving node can be expanded at the next level. Classification:
-/// `Answered` → `Ok` (scored); `Incomplete` → kept out of the beam with its
-/// partial reasoning preserved (#434); `Aborted` → `Error`. Only an `Ok`
-/// node is scored — a node with no answer has nothing to rate.
-async fn expand(
+/// Generate + score one level's branches per the [`ExecStrategy`](super::schema::ExecStrategy),
+/// returning `(Context, NodeOutcome)` in `metas` order so the moved-back
+/// contexts pair straight back to surviving [`Frontier`] entries and the
+/// tree shape is identical across strategies.
+///
+/// Two axes (see the module docs): generation concurrent (batched by the
+/// engine scheduler via `join_all`) vs sequential, and scoring phased (a
+/// barrier, then all `Answered` nodes scored in one concurrent batch) vs
+/// coupled (each branch generates then scores in one future). Generation is
+/// forced sequential whenever an [`Emitter`] is present — the single SSE
+/// writer can't be shared across concurrent branch futures (#413). Scoring
+/// never touches the emitter, so it is always concurrent (batched), even on
+/// the streaming path.
+async fn resolve_level(
+    metas: &[(String, String, usize)],
+    ctxs: Vec<Context>,
+    params: &TotParams,
+    model: &Model,
+    mut emitter: Option<&mut Emitter>,
+    level: usize,
+) -> Vec<(Context, NodeOutcome)> {
+    // Streaming forces sequential generation regardless of `exec`.
+    let concurrent_gen = params.exec.concurrent_gen() && emitter.is_none();
+
+    if params.exec.phased_score() {
+        // Phase 1 — generate every branch (no scoring yet).
+        let gens: Vec<(Context, Demux)> = if concurrent_gen {
+            // Non-stream only (emitter is None here): all siblings decode in
+            // flight at once, so the scheduler batches their forward passes.
+            join_all(
+                ctxs.into_iter()
+                    .zip(metas.iter())
+                    .map(|(c, m)| generate_branch(c, model, params, None, &m.0)),
+            )
+            .await
+        } else {
+            let mut out = Vec::with_capacity(ctxs.len());
+            for (c, m) in ctxs.into_iter().zip(metas.iter()) {
+                if let Some(em) = emitter.as_deref_mut() {
+                    let _ = stream::emit_node_start(em, &m.0, &m.1, level, m.2).await;
+                }
+                out.push(generate_branch(c, model, params, emitter.as_deref_mut(), &m.0).await);
+            }
+            out
+        };
+
+        // Phase 2 — score every `Answered` branch in one concurrent batch
+        // (#458): the short greedy scoring generations decode in flight at
+        // once so the engine coalesces them, instead of one score forward
+        // pass at a time. `Incomplete`/`Error` nodes have no answer to rate.
+        let scores: Vec<Option<ScoreOutcome>> = join_all(gens.iter().map(|(ctx, demux)| async move {
+            if matches!(demux.kind, DemuxKind::Answered) {
+                Some(score_node(ctx, model).await)
+            } else {
+                None
+            }
+        }))
+        .await;
+
+        gens.into_iter()
+            .zip(scores)
+            .map(|((ctx, demux), score)| (ctx, classify(demux, score)))
+            .collect()
+    } else {
+        // Coupled — each branch generates then scores in one future, so a
+        // branch's score overlaps the next branch's generation under
+        // concurrency (the pre-#458 shape; benchmark baseline / overlap
+        // variant).
+        if concurrent_gen {
+            join_all(
+                ctxs.into_iter()
+                    .zip(metas.iter())
+                    .map(|(c, m)| expand(c, model, params, None, &m.0)),
+            )
+            .await
+        } else {
+            let mut out = Vec::with_capacity(ctxs.len());
+            for (c, m) in ctxs.into_iter().zip(metas.iter()) {
+                if let Some(em) = emitter.as_deref_mut() {
+                    let _ = stream::emit_node_start(em, &m.0, &m.1, level, m.2).await;
+                }
+                out.push(expand(c, model, params, emitter.as_deref_mut(), &m.0).await);
+            }
+            out
+        }
+    }
+}
+
+/// Generate one forked branch's assistant turn — cue, then a demuxed
+/// reasoning+answer generation ([`generate_demuxed`]). No scoring. The
+/// context is moved back out paired with its [`Demux`] so a phased scorer
+/// (or [`expand`]) can use it and a survivor can expand at the next level.
+/// Streams this node's reasoning/answer chunks as `node_delta` frames when
+/// an emitter is present (#413 token stream); `None` on the non-stream /
+/// concurrent path.
+async fn generate_branch(
     mut ctx: Context,
     model: &Model,
-    temperature: f32,
-    top_p: f32,
-    reasoning_budget: usize,
-    answer_budget: usize,
+    params: &TotParams,
     emitter: Option<&mut Emitter>,
     node_id: &str,
-) -> (Context, NodeOutcome) {
+) -> (Context, Demux) {
     // Open the assistant turn for this branch. The forked context shares a
     // fully-flushed, cue-free prefix, so without this the first forward
     // pass would carry zero new tokens and spin the generator.
     ctx.cue();
     let stops = chat::stop_tokens(model);
-    // Streams this node's reasoning + answer chunks as node_delta frames when
-    // an emitter is present (#413 token stream); None on the non-stream path.
     let demux = generate_demuxed(
         &mut ctx,
         model,
-        Sampler::TopP { temperature, p: top_p },
-        reasoning_budget,
-        answer_budget,
+        Sampler::TopP {
+            temperature: params.temperature,
+            p: params.top_p,
+        },
+        params.max_reasoning_tokens,
+        params.max_tokens_per_node,
         &stops,
         emitter,
         node_id,
     )
     .await;
-    let outcome = match demux.kind {
+    (ctx, demux)
+}
+
+/// Turn a branch's [`Demux`] (+ its scorer outcome, when it answered) into a
+/// [`NodeOutcome`]. Classification: `Answered` → `Ok` (carries the scorer's
+/// `score`/`score_error`); `Incomplete` → kept out of the beam with its
+/// partial reasoning preserved (#434); `Aborted` → `Error`. Only an
+/// `Answered` node is scored — a node with no answer has nothing to rate, so
+/// its `score` is `None`. Pure → unit-tested.
+fn classify(demux: Demux, score: Option<ScoreOutcome>) -> NodeOutcome {
+    match demux.kind {
         DemuxKind::Answered => {
-            let (score, score_error) = score_node(&ctx, model).await.into_parts();
+            // An `Answered` node is always scored (phased: scored in phase 2;
+            // coupled: scored in `expand`). A `None` here would be a caller
+            // bug, not a benign unscored node — default it to an infra
+            // failure rather than silently dropping the score.
+            let (score, score_error) = score
+                .unwrap_or(ScoreOutcome::Failed(
+                    "internal: answered node was not scored".to_string(),
+                ))
+                .into_parts();
             NodeOutcome {
                 status: NodeStatus::Ok,
                 content: demux.answer,
@@ -625,8 +775,26 @@ async fn expand(
             score_error: None,
             error: Some(e),
         },
+    }
+}
+
+/// Generate then value-score one forked context in a single future (coupled
+/// scoring). The context is moved back out paired with a Context-free
+/// [`NodeOutcome`]. Only an `Answered` node is scored.
+async fn expand(
+    ctx: Context,
+    model: &Model,
+    params: &TotParams,
+    emitter: Option<&mut Emitter>,
+    node_id: &str,
+) -> (Context, NodeOutcome) {
+    let (ctx, demux) = generate_branch(ctx, model, params, emitter, node_id).await;
+    let score = if matches!(demux.kind, DemuxKind::Answered) {
+        Some(score_node(&ctx, model).await)
+    } else {
+        None
     };
-    (ctx, outcome)
+    (ctx, classify(demux, score))
 }
 
 /// Value evaluator: fork the answered context, ask for a 1–10 rating, and
@@ -741,6 +909,80 @@ mod tests {
             ScoreOutcome::Failed("score fork failed: x".to_string()).into_parts(),
             (None, Some("score fork failed: x".to_string()))
         );
+    }
+
+    // ── classify (#458): Demux + scorer outcome → NodeOutcome ──
+    //
+    // Same mapping the coupled `expand` and the phased scorer feed, so both
+    // execution strategies produce identical nodes.
+
+    fn demux(reasoning: &str, answer: &str, kind: DemuxKind) -> Demux {
+        Demux {
+            reasoning: reasoning.to_string(),
+            answer: answer.to_string(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn classify_answered_scored_is_ok_with_score() {
+        let o = classify(demux("r", "a", DemuxKind::Answered), Some(ScoreOutcome::Scored(7)));
+        assert_eq!(o.status, NodeStatus::Ok);
+        assert_eq!(o.content, "a");
+        assert_eq!(o.reasoning, "r");
+        assert_eq!(o.score, Some(7));
+        assert_eq!(o.score_error, None);
+        assert_eq!(o.error, None);
+    }
+
+    #[test]
+    fn classify_answered_unparseable_is_ok_null_score_no_error() {
+        // Benign unparseable score (reasoning model emits no in-range int):
+        // ok + null score, NO score_error — distinct from an infra failure.
+        let o = classify(demux("", "a", DemuxKind::Answered), Some(ScoreOutcome::Unparseable));
+        assert_eq!(o.status, NodeStatus::Ok);
+        assert_eq!(o.score, None);
+        assert_eq!(o.score_error, None);
+    }
+
+    #[test]
+    fn classify_answered_score_infra_failure_surfaces_score_error() {
+        let o = classify(
+            demux("", "a", DemuxKind::Answered),
+            Some(ScoreOutcome::Failed("score fork failed: x".to_string())),
+        );
+        assert_eq!(o.status, NodeStatus::Ok);
+        assert_eq!(o.score, None);
+        assert_eq!(o.score_error.as_deref(), Some("score fork failed: x"));
+    }
+
+    #[test]
+    fn classify_answered_missing_score_defaults_to_infra_failure() {
+        // Defensive: an Answered node must be scored. A None score is a
+        // caller bug — surfaced as a score_error, never a silent null.
+        let o = classify(demux("", "a", DemuxKind::Answered), None);
+        assert_eq!(o.status, NodeStatus::Ok);
+        assert_eq!(o.score, None);
+        assert!(o.score_error.as_deref().unwrap().contains("not scored"));
+    }
+
+    #[test]
+    fn classify_incomplete_preserves_reasoning_blanks_answer() {
+        let o = classify(demux("partial", "", DemuxKind::Incomplete), None);
+        assert_eq!(o.status, NodeStatus::Incomplete);
+        assert_eq!(o.content, "");
+        assert_eq!(o.reasoning, "partial");
+        assert!(o.error.as_deref().unwrap().contains("no answer"));
+        assert_eq!(o.score, None);
+    }
+
+    #[test]
+    fn classify_aborted_is_error_with_message() {
+        let o = classify(demux("r", "", DemuxKind::Aborted("boom".to_string())), None);
+        assert_eq!(o.status, NodeStatus::Error);
+        assert_eq!(o.content, "");
+        assert_eq!(o.reasoning, "r");
+        assert_eq!(o.error.as_deref(), Some("boom"));
     }
 
     // ── materialize_level (F4 + F6) ──
