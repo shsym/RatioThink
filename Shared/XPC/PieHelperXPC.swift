@@ -116,7 +116,14 @@ public protocol PieHelperXPC {
   /// engine to reach helper-confirmed terminal stop before starting
   /// `profileID`, and it does not treat `.alreadyRunning` as an
   /// idempotent success.
+  ///
+  /// `modelOverride` mirrors `startEngine`'s (#469): a model-switch on a
+  /// running engine rebuilds it bound to the explicit pick (v1 pie binds the
+  /// served model at boot, so `/v1/models/load` cannot swap it). `nil` boots
+  /// the freshly-saved profile default — the existing default-model-change
+  /// restart path (set-as-default, post-download).
   func restartEngine(profileID: String,
+                     modelOverride: String?,
                      reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
 
   /// Reply is `XPCPayload.encode(EngineError)` when the stop request

@@ -22,7 +22,7 @@ final class XPCProtocolTests: XCTestCase {
       "helperProtocolVersionWithReply:",
       "engineStatusWithReply:",
       "startEngineWithProfileID:modelOverride:reply:",
-      "restartEngineWithProfileID:reply:",
+      "restartEngineWithProfileID:modelOverride:reply:",
       "stopEngineWithReply:",
       "loadModelWithModelID:reply:",
       "cancelLoadWithHandle:reply:",

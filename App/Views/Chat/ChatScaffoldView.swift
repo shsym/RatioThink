@@ -648,8 +648,10 @@ struct ChatScaffoldView: View {
   private func loadDefaultModel(_ model: String) {
     switch engineStatusStore.status {
     case .running:
-      // Engine up — load the model directly (`/v1/models/load`).
-      swapCoordinator.loadDirect(modelID: model)
+      // Engine up — make it serve this model. #469: a model that differs from
+      // the resident one rebuilds the engine onto it (a live `/v1/models/load`
+      // can't swap the boot model); the already-resident case short-circuits.
+      swapCoordinator.loadDirect(modelID: model, profileID: viewModel.selectedProfileID)
     case .stopped:
       // Bring the engine up bound to this chat's profile; v1 pie loads
       // the profile's model at boot, and `reconcileEngineResidentModel`

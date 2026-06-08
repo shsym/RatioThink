@@ -230,9 +230,15 @@ public final class EngineStatusStore: ObservableObject {
   /// machine and waits for terminal stop before starting the new
   /// profile; any `.alreadyRunning` that escapes that contract is a
   /// failed rebuild and must surface to the caller.
-  public func restartEngine(profileID: String) async throws {
+  ///
+  /// `modelOverride` (#469) rebuilds the engine bound to an explicit pick —
+  /// the running-engine model switch, where `/v1/models/load` cannot swap the
+  /// served model. `nil` (the default) preserves the existing
+  /// default-model-change restart that boots the freshly-saved profile
+  /// default (set-as-default, post-download).
+  public func restartEngine(profileID: String, modelOverride: String? = nil) async throws {
     do {
-      try await client.restartEngine(profileID: profileID)
+      try await client.restartEngine(profileID: profileID, modelOverride: modelOverride)
     } catch let error as AppXPCClientError {
       // The helper only replies after the rebuild's cold-boot handshake.
       // A boot slower than the App reply window is NOT a reload failure —

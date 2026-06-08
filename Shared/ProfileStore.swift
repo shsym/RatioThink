@@ -243,6 +243,24 @@ public final class ProfileStore: ObservableObject {
   /// `directory.deletingLastPathComponent()/active-profile`.
   public let activeProfileURL: URL
 
+  /// On-disk location of the durable active-MODEL marker (#469) — one line
+  /// of UTF-8 holding the slug of the model the engine was last (re)launched
+  /// with. Distinct from each profile's `.toml` default: a plain model pick
+  /// records the active model here WITHOUT clobbering the profile's saved
+  /// default, and the Helper's menu-bar Resume / crash auto-relaunch boot
+  /// THIS marker (precedence: explicit XPC override > this marker > profile
+  /// default) so a stopped-engine Resume honors the user's last pick instead
+  /// of silently reverting to the profile default.
+  ///
+  /// Sibling of `activeProfileURL` (outside `directory`, so the FS watcher's
+  /// `*.toml` scan is unaffected). Written by the Helper's
+  /// `LaunchSpecResolver` on every successful launch resolve and read by
+  /// `HelperResumeAction`; the App never touches it (it routes picks through
+  /// the `startEngine`/`restartEngine` XPC override). Tests inject a custom
+  /// URL; production defaults to
+  /// `directory.deletingLastPathComponent()/active-model`.
+  public let activeModelURL: URL
+
   /// Debounce window for FS-event coalescing. The system fires
   /// multiple `.write` events for a single `mv tmp final.toml`
   /// rename; coalescing avoids a thundering-herd of rescans.
@@ -473,6 +491,7 @@ public final class ProfileStore: ObservableObject {
   public init(
     directory: URL,
     activeProfileURL: URL? = nil,
+    activeModelURL: URL? = nil,
     queue: DispatchQueue = DispatchQueue(label: "com.ratiothink.profile-store"),
     seedsExampleProfiles: Bool = true
   ) {
@@ -480,6 +499,9 @@ public final class ProfileStore: ObservableObject {
     self.activeProfileURL = activeProfileURL
       ?? directory.deletingLastPathComponent()
         .appendingPathComponent("active-profile", isDirectory: false)
+    self.activeModelURL = activeModelURL
+      ?? directory.deletingLastPathComponent()
+        .appendingPathComponent("active-model", isDirectory: false)
     self.queue = queue
     self.seedsExampleProfiles = seedsExampleProfiles
     queue.setSpecific(key: queueKey, value: ())
@@ -751,6 +773,60 @@ public final class ProfileStore: ObservableObject {
       guard _activeProfileError == nil else { return nil }
       guard let id = _activeProfileID else { return nil }
       return _entries.first { $0.profile?.id == id }?.profile
+    }
+  }
+
+  // MARK: - active model marker (#469)
+
+  /// The model slug the engine was last (re)launched with, read from the
+  /// durable `activeModelURL` marker. `nil` when the marker is absent, empty,
+  /// or unreadable — the caller (`HelperResumeAction`) then falls back to the
+  /// profile's `.toml` default.
+  ///
+  /// Read on demand (only at menu-bar Resume / crash auto-relaunch — both
+  /// rare), so no in-memory mirror or FS-watch is kept: the resolver's
+  /// `setActiveModelID` atomic write is the single on-disk source of truth,
+  /// and the Helper writes + reads it in one process. The atomic write
+  /// (temp + rename) means a concurrent read sees the old or new file whole,
+  /// never a torn line — no lock needed.
+  public var activeModelID: String? {
+    guard let data = try? Data(contentsOf: activeModelURL),
+          let raw = String(data: data, encoding: .utf8) else {
+      return nil
+    }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  /// Persist `id` as the active model. Atomic write (temp + rename) so a
+  /// crashed write never leaves a half-line a later Resume misreads. Called
+  /// by `LaunchSpecResolver.resolveLauncherSpec` on every successful launch
+  /// resolve, so the marker always reflects the model the engine was last
+  /// asked to serve. Throws on an I/O failure (the caller uses `try?` —
+  /// recording the active model is best-effort and must never fail a launch).
+  public func setActiveModelID(_ id: String) throws {
+    let parent = activeModelURL.deletingLastPathComponent()
+    try FileManager.default.createDirectory(at: parent,
+                                            withIntermediateDirectories: true)
+    do {
+      try id.write(to: activeModelURL, atomically: true, encoding: .utf8)
+    } catch {
+      Log.store.error("setActiveModelID: write to \(self.activeModelURL.path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+      throw error
+    }
+  }
+
+  /// Forget the active-model selection. Removes the on-disk marker; safe to
+  /// call when the file is already absent. A subsequent Resume then boots the
+  /// profile default.
+  public func clearActiveModelID() throws {
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: activeModelURL.path) else { return }
+    do {
+      try fm.removeItem(at: activeModelURL)
+    } catch {
+      Log.store.error("clearActiveModelID: remove of \(self.activeModelURL.path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+      throw error
     }
   }
 

@@ -87,14 +87,16 @@ final class EngineStatusStoreTests: XCTestCase {
     // `.alreadyRunning`.
     private(set) var restartCalls = 0
     private(set) var lastRestartProfileID: String?
+    private(set) var lastRestartModelOverride: String?
     private var restartResult: Result<Void, Error> = .success(())
     func setRestartResult(_ result: Result<Void, Error>) {
       lock.withLock { restartResult = result }
     }
-    func restartEngine(profileID: String) async throws {
+    func restartEngine(profileID: String, modelOverride: String?) async throws {
       let result: Result<Void, Error> = lock.withLock {
         restartCalls += 1
         lastRestartProfileID = profileID
+        lastRestartModelOverride = modelOverride
         return restartResult
       }
       try result.get()
@@ -283,6 +285,37 @@ final class EngineStatusStoreTests: XCTestCase {
                    "app must not locally compose stop+start from a cached 1Hz status mirror")
     XCTAssertEqual(client.startCalls, 0,
                    "generic start swallows alreadyRunning; restart must not reuse that idempotent path")
+  }
+
+  func test_restartEngine_forwardsExplicitModelOverride() async throws {
+    // #469: a running-engine model switch threads the explicit pick through
+    // the restart so the rebuilt engine boots the chosen model.
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(port: 51234, profileID: "chat")
+    )
+
+    try await store.restartEngine(profileID: "chat", modelOverride: "Org/New-GGUF/new.gguf")
+
+    XCTAssertEqual(client.restartCalls, 1)
+    XCTAssertEqual(client.lastRestartModelOverride, "Org/New-GGUF/new.gguf",
+                   "restartEngine must forward the explicit model override to the helper")
+  }
+
+  func test_restartEngine_defaultsToNilOverride() async throws {
+    // The convenience restart (set-as-default / post-download) boots the
+    // profile default — no override.
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(port: 51234, profileID: "chat")
+    )
+
+    try await store.restartEngine(profileID: "chat")
+
+    XCTAssertNil(client.lastRestartModelOverride,
+                 "the no-override restart convenience boots the profile default")
   }
 
   func test_restartEngine_slowButSuccessfulStopDoesNotTripAppSideStopTimeout() async throws {

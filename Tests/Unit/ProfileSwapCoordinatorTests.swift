@@ -223,7 +223,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
 
     // loadDirect (user picks a model) must clear the stale error even on
     // the already-resident short-circuit (review F2 — no lingering red).
-    coord.loadDirect(modelID: "m1")
+    coord.loadDirect(modelID: "m1", profileID: "chat")
     XCTAssertNil(coord.defaultModelWriteError,
                  "a stale set-as-default error must not persist after the user moves on")
   }
@@ -403,13 +403,13 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
   func test_loadDirect_short_circuits_when_model_already_resident() {
     let (coord, center, _) = makeCoordinator(map: [:], resident: "m1")
     let stateBefore = center.state
-    coord.loadDirect(modelID: "m1")
+    coord.loadDirect(modelID: "m1", profileID: "chat")
     XCTAssertEqual(center.state, stateBefore, "loadDirect on resident model must be a no-op — no flash")
   }
 
   func test_loadDirect_fires_load_when_model_differs() async throws {
     let (coord, center, _) = makeCoordinator(map: [:], resident: "m1")
-    coord.loadDirect(modelID: "m2")
+    coord.loadDirect(modelID: "m2", profileID: "chat")
     await waitUntil(timeout: 2.0) {
       if case .ready = center.state { return true }
       return false
@@ -437,6 +437,72 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
       return false
     }
     XCTAssertEqual(center.state, .ready(modelID: "m2"))
+  }
+
+  // MARK: - #469: a confirmed pick routes through the engine (re)launch executor
+
+  /// Records `serveModel(modelID, profileID)` calls so the #469 routing is
+  /// observable without an `EngineStatusStore`. `errorToThrow` simulates a
+  /// resolver-reject the status poll won't reflect (→ `serveModelError`).
+  private final class ServeSpy: @unchecked Sendable {
+    var calls: [(modelID: String, profileID: String)] = []
+    var errorToThrow: Error?
+  }
+
+  private func makeServeRoutingCoordinator(
+    map: [String: String?],
+    resident: String? = nil
+  ) -> (ProfileSwapCoordinator, ServeSpy) {
+    let center = ModelLoadCenter(initialResident: resident)
+    let spy = ServeSpy()
+    let coord = ProfileSwapCoordinator(
+      center: center,
+      engine: makeFastEngine(),
+      modelForProfile: { map[$0] ?? nil },
+      serveModel: { modelID, profileID in
+        spy.calls.append((modelID: modelID, profileID: profileID))
+        if let error = spy.errorToThrow { throw error }
+      }
+    )
+    return (coord, spy)
+  }
+
+  func test_confirmedPick_routesThroughServeModel_withProfile() async {
+    // A toolbar pick of a different model, once confirmed, must (re)launch the
+    // engine on the active profile via the executor — NOT a `/v1/models/load`.
+    let (coord, spy) = makeServeRoutingCoordinator(map: [:], resident: "m1")
+    coord.requestModelOverride(modelID: "m2", activeProfileID: "fast-think") { _ in }
+    confirmCurrent(coord)
+    await waitUntil(timeout: 2.0) { !spy.calls.isEmpty }
+    XCTAssertEqual(spy.calls.count, 1)
+    XCTAssertEqual(spy.calls.first?.modelID, "m2")
+    XCTAssertEqual(spy.calls.first?.profileID, "fast-think",
+                   "the pick must (re)launch on the pending's active profile")
+  }
+
+  func test_loadDirect_routesThroughServeModel_whenModelDiffers() async {
+    let (coord, spy) = makeServeRoutingCoordinator(map: [:], resident: "m1")
+    coord.loadDirect(modelID: "m2", profileID: "chat")
+    await waitUntil(timeout: 2.0) { !spy.calls.isEmpty }
+    XCTAssertEqual(spy.calls.map(\.modelID), ["m2"])
+    XCTAssertEqual(spy.calls.first?.profileID, "chat")
+  }
+
+  func test_loadDirect_shortCircuit_doesNotInvokeServeModel() async {
+    let (coord, spy) = makeServeRoutingCoordinator(map: [:], resident: "m1")
+    coord.loadDirect(modelID: "m1", profileID: "chat")   // already resident
+    // Give any erroneous async serve a chance to fire before asserting absence.
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    XCTAssertTrue(spy.calls.isEmpty, "an already-resident pick must not (re)launch the engine")
+  }
+
+  func test_serveModelFailure_surfacesServeModelError() async {
+    let (coord, spy) = makeServeRoutingCoordinator(map: [:], resident: "m1")
+    spy.errorToThrow = StubWriteError()
+    coord.loadDirect(modelID: "m2", profileID: "chat")
+    await waitUntil(timeout: 2.0) { coord.serveModelError != nil }
+    XCTAssertNotNil(coord.serveModelError,
+                    "a resolver-reject the status poll won't reflect must be surfaced")
   }
 
   // MARK: - helpers

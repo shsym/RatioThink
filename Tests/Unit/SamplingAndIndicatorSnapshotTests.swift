@@ -115,5 +115,5 @@ private struct SnapshotStubXPC: AppXPCClient {
   func engineStatus() async throws -> EngineStatus { status }
   func stopEngine() async throws {}
   func startEngine(profileID: String, modelOverride: String?) async throws {}
-  func restartEngine(profileID: String) async throws {}
+  func restartEngine(profileID: String, modelOverride: String?) async throws {}
 }

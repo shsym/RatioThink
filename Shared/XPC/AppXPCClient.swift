@@ -51,7 +51,12 @@ public protocol AppXPCClient: Sendable {
   /// Strict restart for active-profile default-model changes. Unlike
   /// `startEngine(profileID:)`, `.alreadyRunning` is a failure signal:
   /// the helper did not complete a stop→start registry rebuild.
-  func restartEngine(profileID: String) async throws
+  ///
+  /// `modelOverride` mirrors `startEngine`'s (#469): a model-switch on a
+  /// running engine rebuilds it bound to the explicit pick; `nil` boots the
+  /// profile default (the existing default-model-change restart). Callers
+  /// with no override use the `restartEngine(profileID:)` convenience below.
+  func restartEngine(profileID: String, modelOverride: String?) async throws
   /// #448: ask the helper to stop the engine and terminate itself as the
   /// final step of a coordinated full-product quit. Resolves on acceptance;
   /// throws the helper-side `EngineError` on refusal or an
@@ -68,6 +73,13 @@ public extension AppXPCClient {
   /// gained the `modelOverride` parameter (#459).
   func startEngine(profileID: String) async throws {
     try await startEngine(profileID: profileID, modelOverride: nil)
+  }
+
+  /// Convenience for the common no-override restart (boot the freshly-saved
+  /// profile default). Keeps existing call sites unchanged after
+  /// `restartEngine` gained the `modelOverride` parameter (#469).
+  func restartEngine(profileID: String) async throws {
+    try await restartEngine(profileID: profileID, modelOverride: nil)
   }
 
   /// Default: memory unavailable. Test stubs that don't model the
@@ -92,10 +104,18 @@ public enum HelperProtocolCompatibility {
   /// otherwise the call dies into `.replyTimeout` (swallowed as
   /// "start in flight") and the engine silently never boots.
   ///
+  /// Version 4: helper exports `restartEngine(profileID:modelOverride:)`
+  /// (#469) — the App now invokes the new
+  /// `restartEngineWithProfileID:modelOverride:reply:` selector for every
+  /// engine restart (a running-engine model switch threads the pick), so a
+  /// stale v3 helper (which only exports `restartEngineWithProfileID:reply:`)
+  /// must be repaired by the `>= currentVersion` gate before the model-switch
+  /// path runs; otherwise the call dies into `.replyTimeout`.
+  ///
   /// BUMP THIS whenever a new REQUIRED selector is added to `PieHelperXPC`,
   /// or an in-place upgrade leaves a running old helper that passes the
   /// reachability gate yet cannot service the new call.
-  public static let currentVersion = 3
+  public static let currentVersion = 4
 
   public static func isCompatible(client: any AppXPCClient) async -> Bool {
     do {
@@ -582,10 +602,10 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
     }
   }
 
-  public func restartEngine(profileID: String) async throws {
+  public func restartEngine(profileID: String, modelOverride: String?) async throws {
     let connection = ensureConnection()
     do {
-      try await restartEngine(profileID: profileID, on: connection)
+      try await restartEngine(profileID: profileID, modelOverride: modelOverride, on: connection)
     } catch let error as AppXPCClientError {
       if case .replyTimeout = error {
         invalidateIfCurrent(connection)
@@ -594,7 +614,9 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
     }
   }
 
-  private func restartEngine(profileID: String, on connection: NSXPCConnection) async throws {
+  private func restartEngine(profileID: String,
+                             modelOverride: String?,
+                             on connection: NSXPCConnection) async throws {
     let timeout = restartReplyTimeout
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
@@ -625,7 +647,7 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
         resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
         return
       }
-      api.restartEngine(profileID: profileID) { successData, errorData in
+      api.restartEngine(profileID: profileID, modelOverride: modelOverride) { successData, errorData in
         do {
           switch try PieHelperXPCWire.decodeStartEngineReply(
             successData: successData, errorData: errorData

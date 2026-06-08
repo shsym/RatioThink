@@ -377,13 +377,18 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// terminal stop with the same deadline as `stopEngine`, and can then
   /// start without reusing the App's generic idempotent start semantics.
   public func restartEngine(profileID: String,
+                            modelOverride: String?,
                             reply: @escaping (Data?, Data?) -> Void) {
     guard let engineHost else {
       Self.log.error("restartEngine: no engineHost wired (early boot or unit test)")
       reply(nil, Self.notImplementedErrorData)
       return
     }
+    // #469: thread the explicit pick through the rebuild so a model-switch on
+    // a running engine boots the chosen model. `nil` keeps the existing
+    // default-model-change behavior (resolver picks the profile default).
     guard let spec = resolveLaunchSpec(profileID: profileID,
+                                       explicitModel: modelOverride,
                                        engineHost: engineHost,
                                        operation: "restartEngine",
                                        reply: reply) else {
@@ -975,6 +980,7 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   }
 
   public func restartEngine(profileID: String,
+                            modelOverride: String?,
                             reply: @escaping (Data?, Data?) -> Void) {
     Self.log.error("restartEngine refused in degraded mode (profileID=\(profileID, privacy: .public))")
     reply(nil, degradedErrorData)

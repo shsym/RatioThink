@@ -133,6 +133,47 @@ final class LaunchSpecResolverTests: XCTestCase {
                    "profile inferlet must still drive the launch even when the model is an explicit override")
   }
 
+  func test_resolveLauncherSpec_records_resolvedModel_in_activeModelMarker() throws {
+    // #469: every successful launch resolve writes the resolved boot model to
+    // the durable active-model marker so a later menu-bar Resume honors it.
+    // A FAILED resolve must NOT touch the marker.
+    let store = try makeNoDefaultStore(inferlet: "chat-apc")
+    defer { store.stop() }
+    XCTAssertNil(store.activeModelID, "sanity: no marker before any launch")
+
+    let binary = tempDir.appendingPathComponent("pie-fake-marker", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models-marker", isDirectory: true)
+    let pickedSlug = "Org/Marker-GGUF/marker.gguf"
+    try stageModel(named: pickedSlug, in: modelsRoot)
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-marker") },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { self.tempDir.appendingPathComponent("hf-home-marker", isDirectory: true) }
+    )
+
+    // A failed resolve (no-default, no override) must not write the marker.
+    guard case .failure = resolver.resolveLauncherSpec(profileID: "chat") else {
+      return XCTFail("no-default profile must refuse a bare start")
+    }
+    XCTAssertNil(store.activeModelID, "a failed resolve must not write the active-model marker")
+
+    // A successful resolve records the resolved boot model.
+    guard case .success = resolver.resolveLauncherSpec(
+      profileID: "chat", explicitModel: pickedSlug) else {
+      return XCTFail("explicit pick must resolve")
+    }
+    XCTAssertEqual(store.activeModelID, pickedSlug,
+                   "a successful launch resolve must record the resolved model in the active-model marker")
+  }
+
   /// #459 timeout coherence: the production resolver must hand the engine a
   /// cold-start boot budget aligned with the 120s request/shmem timeouts, not
   /// the 30s test default — otherwise a slow large-model boot is killed by an

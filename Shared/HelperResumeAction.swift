@@ -131,7 +131,8 @@ public enum HelperResumeAction {
       // Retry healed the error — fall through to the standard
       // resolve-and-start path using the refreshed snapshot.
       if let id = retrySnap.activeProfileID {
-        return resolveAndStart(id: id, engineHost: engineHost, resolver: resolver)
+        return resolveAndStart(id: id, activeModel: store.activeModelID,
+                               engineHost: engineHost, resolver: resolver)
       }
       // Review v6 F3: retry healed the error but produced no active
       // id — operator's repair was to remove the marker, not write a
@@ -147,7 +148,8 @@ public enum HelperResumeAction {
       }
       return .noActiveProfile(afterRetry: false)
     }
-    return resolveAndStart(id: id, engineHost: engineHost, resolver: resolver)
+    return resolveAndStart(id: id, activeModel: store.activeModelID,
+                           engineHost: engineHost, resolver: resolver)
   }
 
   /// Shared resolve→host.start tail (review v6 F6). Both the
@@ -156,12 +158,19 @@ public enum HelperResumeAction {
   /// structured `.resolverFailed` log decoration) lives in one place.
   private static func resolveAndStart(
     id: String,
+    activeModel: String?,
     engineHost: PieEngineHost,
     resolver: HelperExportedAPI.LaunchSpecResolver
   ) -> Outcome {
-    // Resume always boots the profile's persisted default (no per-start
-    // override on the menu-bar / boot auto-resume path), so pass `nil`.
-    switch resolver(id, nil) {
+    // #469: the menu-bar Resume / crash auto-relaunch path has no XPC
+    // override, so the durable active-model marker is the explicit boot model
+    // here. Precedence in the resolver is `explicit override > marker >
+    // profile default`: a non-nil marker boots the user's last-launched model
+    // (so a stopped-engine Resume honors their last pick instead of reverting
+    // to the profile default); a nil marker (never launched) falls back to
+    // the profile default. The resolver re-writes the marker to the resolved
+    // model, so this is idempotent when the marker already holds it.
+    switch resolver(id, activeModel) {
     case .failure(let err):
       // Publish EVERY resolver failure (not just `.memoryRisk`) through
       // the engine's `.failed` status so the App surfaces the reason —

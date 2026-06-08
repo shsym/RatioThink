@@ -410,7 +410,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
 
     let restartExp = expectation(description: "restart reply after replacement start")
     var captured: Result<EnginePort, EngineError>?
-    api.restartEngine(profileID: "chat") { successData, errorData in
+    api.restartEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
       )

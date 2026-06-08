@@ -62,6 +62,62 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  // MARK: - #469 active-model marker
+
+  func test_activeModel_marker_roundTrips_and_clears() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertNil(store.activeModelID, "no marker before any launch")
+
+      try store.setActiveModelID("Org/Repo/picked.gguf")
+      XCTAssertEqual(store.activeModelID, "Org/Repo/picked.gguf")
+      // Default marker location is a sibling of active-profile.
+      XCTAssertTrue(FileManager.default.fileExists(atPath: store.activeModelURL.path),
+                    "setActiveModelID must persist the marker on disk")
+
+      // Overwrite is last-write-wins.
+      try store.setActiveModelID("Org/Repo/other.gguf")
+      XCTAssertEqual(store.activeModelID, "Org/Repo/other.gguf")
+
+      try store.clearActiveModelID()
+      XCTAssertNil(store.activeModelID, "clear removes the marker")
+      try store.clearActiveModelID()  // idempotent when already absent
+    }
+  }
+
+  func test_activeModel_marker_is_durable_across_store_instances() throws {
+    // The marker is the durable source of truth the Helper boots from after a
+    // relaunch (#469): a fresh ProfileStore over the same directory reads it.
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      let writer = ProfileStore(directory: dir, activeProfileURL: active)
+      try writer.start()
+      try writer.setActiveModelID("Org/Repo/durable.gguf")
+      writer.stop()
+
+      let reader = ProfileStore(directory: dir, activeProfileURL: active)
+      try reader.start()
+      defer { reader.stop() }
+      XCTAssertEqual(reader.activeModelID, "Org/Repo/durable.gguf",
+                     "a relaunched Helper must read the last-launched model from disk")
+    }
+  }
+
+  func test_activeModel_marker_blankFile_readsAsNil() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+      try "   \n".write(to: store.activeModelURL, atomically: true, encoding: .utf8)
+      XCTAssertNil(store.activeModelID, "a blank/whitespace marker reads as no selection")
+    }
+  }
+
   /// #413 (operator ITEM 2A): an EXISTING install — profiles dir already
   /// holds `chat.toml` from before #413, so the empty-dir seed is a no-op —
   /// must STILL get the tree-of-thought profile, via the write-if-absent

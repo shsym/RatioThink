@@ -19,7 +19,7 @@ final class AppQuitCoordinatorTests: XCTestCase {
     func engineStatus() async throws -> EngineStatus { .stopped }
     func stopEngine() async throws {}
     func startEngine(profileID: String, modelOverride: String?) async throws {}
-    func restartEngine(profileID: String) async throws {}
+    func restartEngine(profileID: String, modelOverride: String?) async throws {}
     func quitHelper() async throws {
       quitCount += 1
       if let quitError { throw quitError }

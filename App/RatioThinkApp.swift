@@ -165,10 +165,37 @@ struct RatioThinkApp: App {
       modelLoad: center
     ))
     _engineClientStore = StateObject(wrappedValue: EngineClientStore(client: engine))
+    // #469: the production status-aware executor a model PICK routes through.
+    // v1 pie binds the served model at `pie serve` boot, so changing the
+    // served model is an engine lifecycle event — start a stopped engine
+    // bound to the pick, rebuild a running one onto a different pick, or
+    // no-op when it is already resident — NOT a `/v1/models/load` (which a
+    // stopped engine ignores and a running one only acks for its boot model).
+    // The override is threaded through the start/restart XPC so the Helper
+    // boots the chosen model; the resolver records it in the durable
+    // active-model marker so a later menu-bar Resume honors the pick.
+    let serveModel: (@MainActor (String, String) async throws -> Void) = { [weak statusStore, weak center] modelID, profileID in
+      guard let statusStore, let center else { return }
+      switch ActiveModelLaunchPolicy.decide(
+        modelID: modelID,
+        status: statusStore.status,
+        residentModelID: center.residentModelID
+      ) {
+      case .startEngine(let model):
+        try await statusStore.startEngine(profileID: profileID, modelOverride: model)
+      case .restartEngine(let model):
+        try await statusStore.restartEngine(profileID: profileID, modelOverride: model)
+      case .alreadyResident, .deferBusy, .blockedTerminal:
+        // Already serving the pick, mid-transition, or terminally failed —
+        // no (re)launch. The indicator/banner already reflect the live state.
+        break
+      }
+    }
     _swapCoordinator = StateObject(wrappedValue: ProfileSwapCoordinator(
       center: center,
       engine: engine,
-      profileStore: store
+      profileStore: store,
+      serveModel: serveModel
     ))
     _downloadController = StateObject(wrappedValue: Self.makeDownloadController())
 
@@ -510,6 +537,6 @@ private struct PinnedRunningXPCClient: AppXPCClient {
   // already pinned `.running`, so a start is a no-op success (mirrors
   // `stopEngine`).
   func startEngine(profileID: String, modelOverride: String?) async throws {}
-  func restartEngine(profileID: String) async throws {}
+  func restartEngine(profileID: String, modelOverride: String?) async throws {}
 }
 #endif

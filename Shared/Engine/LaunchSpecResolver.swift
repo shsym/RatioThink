@@ -266,6 +266,15 @@ public struct LaunchSpecResolver {
         modelConfig: .portableResolved(servedModelID: model, modelRef: modelRef),
         defaultTokenLimit: defaultTokenLimit
       )
+      // #469: record the resolved boot model in the durable active-model
+      // marker. This is the single launch-resolution choke point every path
+      // funnels through (App `startEngine`/`restartEngine` XPC + menu-bar
+      // Resume + crash auto-relaunch), so the marker always reflects the
+      // model the engine was last asked to serve — letting a later Resume on
+      // a stopped engine honor the user's last pick instead of reverting to
+      // the profile default. Best-effort (`try?`): a marker write failure
+      // logs inside `setActiveModelID` but must never fail the launch.
+      try? profileStore.setActiveModelID(model)
       return .success(spec)
     } catch {
       Self.log.error("launcher spec construction failed for profile=\(profile.id, privacy: .public): \(String(describing: error), privacy: .public)")

@@ -116,6 +116,18 @@ struct ContentToolbar: View {
           .accessibilityLabel(writeError)
       }
 
+      if let serveError = swapCoordinator.serveModelError {
+        // #469: surface a model pick that failed to (re)launch the engine
+        // (a resolver reject the status poll won't reflect) so a silently
+        // dropped pick is never invisible. Mirrors `defaultModelWriteError`.
+        Label(serveError, systemImage: "exclamationmark.triangle.fill")
+          .labelStyle(.iconOnly)
+          .foregroundStyle(.red)
+          .help(serveError)
+          .accessibilityIdentifier("toolbar.serveModelError")
+          .accessibilityLabel(serveError)
+      }
+
       Spacer(minLength: 12)
 
       paramsButton
