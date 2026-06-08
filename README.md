@@ -8,7 +8,7 @@
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black)
-![Version](https://img.shields.io/badge/version-v0.1.2-blue)
+![Version](https://img.shields.io/badge/version-v0.1.3-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 
 </div>
@@ -19,7 +19,7 @@ local models using specialized _thinking profiles_.
 
 ## Early release
 
-v0.1.2 is an early release, focusing on core functionality and bug fixes.
+v0.1.3 is an early release, focusing on core functionality and bug fixes.
 Since many components are still a work in progress, your feedback is incredibly valuable.
 Feel free to report any issues you find!
 
@@ -123,7 +123,7 @@ metadata only. Flags: `--window <dur>` (Unified Logging look-back, default
 
 ## Known issues
 
-A few known issues in the v0.1.2 release, with workarounds:
+A few known issues in the v0.1.3 release, with workarounds:
 
 - **Very large GGUF models can still respond poorly or truncate misleadingly.** Prefer the
   starter model or smaller curated models until the large-model rendering fixes land

@@ -252,7 +252,7 @@ struct LocalAPIView: View {
   private var securitySection: some View {
     VStack(alignment: .leading, spacing: 8) {
       sectionHeader("Security")
-      Text("This endpoint is unauthenticated and local-only for 0.1.2. Don’t treat it as a secured service.")
+      Text("This endpoint is unauthenticated and local-only for 0.1.3. Don’t treat it as a secured service.")
         .font(.callout)
         .foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)
