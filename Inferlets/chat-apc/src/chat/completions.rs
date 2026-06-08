@@ -725,6 +725,35 @@ const STARVED_MESSAGE: &str =
      timeout, or KV eviction); generation cannot continue";
 
 // =============================================================================
+// Over-capacity / backpressure classification (#470)
+// =============================================================================
+
+/// Stable sentinel the pie runtime prefixes onto a KV-page **acquisition
+/// timeout** (`runtime::context::reserve_working_pages`). When concurrent
+/// requests exceed the engine's KV slot count, a reservation defers on the
+/// scheduler's alloc/restore queues with no timer of its own; the host now
+/// bounds that wait and fails the call with this prefix. The chat-apc
+/// handler matches it to surface backpressure as `server_busy` + HTTP 503
+/// instead of a generic `forward_pass_failed` 500 — so an over-capacity
+/// client gets an explicit, retryable signal rather than a hung connection.
+const SERVER_BUSY_SENTINEL: &str = "server_busy";
+
+/// Distinct terminal/error code for the over-capacity case.
+const SERVER_BUSY_CODE: &str = "server_busy";
+
+/// Classify a `Generator::next` / `GenStep::execute` error string into a
+/// stable terminal code. An over-capacity acquisition timeout (carrying the
+/// [`SERVER_BUSY_SENTINEL`]) maps to [`SERVER_BUSY_CODE`]; everything else
+/// is a generic `forward_pass_failed`.
+fn classify_forward_error(msg: &str) -> &'static str {
+    if msg.contains(SERVER_BUSY_SENTINEL) {
+        SERVER_BUSY_CODE
+    } else {
+        "forward_pass_failed"
+    }
+}
+
+// =============================================================================
 // Reasoning/content channel demux
 // =============================================================================
 
@@ -2136,11 +2165,17 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
                 break (reason, None);
             }
             Ok(Some(s)) => s,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         let out = match step.execute().await {
             Ok(o) => o,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         // #439: a decode step that returns no sampled token means the
         // forward-pass layer starved — pie swallows a device failure / batch
@@ -2535,11 +2570,17 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
                 break (reason, None);
             }
             Ok(Some(s)) => s,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         let out = match step.execute().await {
             Ok(o) => o,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         // #439: a decode step that returns no sampled token means the
         // forward-pass layer starved — pie swallows a device failure / batch
@@ -2670,11 +2711,17 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
     let has_partial = !full_text.is_empty() || pending_tool.is_some() || !reasoning_text.is_empty();
     if error_diag.is_some() && !has_partial {
         let (code, msg) = error_diag.unwrap();
-        // N1: pure-failure 500 attaches launch diags via header —
+        // #470: over-capacity backpressure is a retryable 503, not a 500.
+        // The reservation timed out before any token was produced (the
+        // common over-subscription case lands here, with no partial body),
+        // so the client should back off and retry rather than treat it as a
+        // hard server fault. Every other abort stays a 500.
+        let status = if code == SERVER_BUSY_CODE { 503 } else { 500 };
+        // N1: pure-failure 5xx attaches launch diags via header —
         // the snapshot is immutable, so the next request gets the
         // same diags regardless.
         return res
-            .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+            .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
             .await;
     }
 
@@ -3047,6 +3094,29 @@ mod tests {
         // starvation for a decode step (the loop always attaches the
         // auto-sampler, so a missing Token slot is the host producing none).
         assert!(forward_pass_starved(&[SlotOutput::Entropy(0.5)]));
+    }
+
+    // ─── Over-capacity backpressure classification (#470) ──
+
+    #[test]
+    fn server_busy_sentinel_classifies_as_server_busy() {
+        // The host wraps the acquisition-timeout message; the SDK then
+        // prefixes its own context ("GenStep::execute reserve: ..."). The
+        // sentinel survives both wraps as a substring.
+        let host = "server_busy: KV page acquisition timed out after 120s; \
+                    engine is over capacity";
+        let sdk_wrapped = format!("GenStep::execute reserve: {host}");
+        assert_eq!(classify_forward_error(host), SERVER_BUSY_CODE);
+        assert_eq!(classify_forward_error(&sdk_wrapped), SERVER_BUSY_CODE);
+    }
+
+    #[test]
+    fn generic_forward_error_classifies_as_forward_pass_failed() {
+        assert_eq!(
+            classify_forward_error("device RPC returned an error"),
+            "forward_pass_failed"
+        );
+        assert_eq!(classify_forward_error(""), "forward_pass_failed");
     }
 
     // ─── Reasoning/content channel demux ──────────────────
