@@ -67,18 +67,16 @@ final class S286_NoModelSendGateGUITests: XCTestCase {
     // The send is BLOCKED behind the no-model gate — never a silent load
     // (RatioThink never loads a model the user did not choose).
     //
-    // #397: the gate's HEADLINE is now state-dependent ("No model loaded"
-    // for download/unavailable, "Model not loaded yet" for an on-disk
-    // default, "Starting the engine…" while it boots, a failure reason
-    // when the engine/load failed). Which state the runner lands in turns
-    // on the Helper's reachability/engine state — not controlled by this
-    // engine-free case. So assert the state-INDEPENDENT invariant: the
-    // gate was raised (the prompt container, present in every state),
-    // not a single pinned headline. On macOS, the prompt's parent
-    // accessibility identifier can subsume child button identifiers while
-    // the engine is in a busy state, so the container is the stable signal.
-    // The per-state copy + actions are
-    // exhaustively unit-proven in NoModelLoadedPromptPlanTests +
+    // #397: the gate's HEADLINE is state-dependent ("No model loaded" for
+    // download/unavailable, "Model not loaded yet" for an on-disk default,
+    // "Starting the engine…" while it boots, a failure reason when the
+    // engine/load failed). Which state the runner lands in turns on the
+    // Helper's reachability/engine state — not controlled by this engine-free
+    // case. So assert the state-INDEPENDENT invariant via the gate's
+    // always-present Cancel control (`noModelPrompt` → `noModel.cancel`),
+    // which `NoModelLoadedPrompt.actions(_:)` renders unconditionally in every
+    // state, rather than a single pinned headline. The per-state copy +
+    // actions are exhaustively unit-proven in NoModelLoadedPromptPlanTests +
     // ChatStartGateTests.
     XCTAssertTrue(noModelPrompt(in: app).waitForExistence(timeout: 5),
                   "send with nothing resolvable must raise the no-model gate, not load silently; app tree: \(app.debugDescription)")

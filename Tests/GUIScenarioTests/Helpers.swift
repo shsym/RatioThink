@@ -31,9 +31,21 @@ func stablePreferenceSuiteName(_ seed: String) -> String {
   return "com.ratiothink.app.gui." + String(safe).prefix(180)
 }
 
+/// Stable signal that the no-model send gate (`NoModelLoadedPrompt`) is
+/// raised. Asserts the gate's always-present Cancel control
+/// (`noModel.cancel`), which `NoModelLoadedPrompt.actions(_:)` renders
+/// unconditionally in EVERY gate state (busy / needsDefaultLoad / noDefault /
+/// download / engineFailed / …) — so it is the state-independent "gate is up"
+/// marker the engine-free gate tests want.
+///
+/// The prior `noModel.prompt` container identifier never matched: the prompt
+/// deliberately carries NO container id (it propagated down and overrode the
+/// child control ids — see the comment in `NoModelLoadedPrompt.body`), so the
+/// children carry their own ids and the container has none. Asserting Cancel
+/// matches the product's accessibility design instead of a removed id.
 func noModelPrompt(in app: XCUIApplication) -> XCUIElement {
   app.descendants(matching: .any)
-    .matching(identifier: "noModel.prompt")
+    .matching(identifier: "noModel.cancel")
     .firstMatch
 }
 
