@@ -180,8 +180,14 @@ def _free_port() -> int:
 
 
 async def _parse_handshake(proc: subprocess.Popen, timeout: float) -> tuple[str, str]:
-    """Read pie stdout until we have `pie-server serving on <host>:<port>` + `internal token: <tok>`."""
-    url_re = re.compile(r"pie-server serving on ([^\s]+:[0-9]+)")
+    """Read pie stdout until we have the serving `<host>:<port>` + `internal token: <tok>`.
+
+    `pie serve` advertises its address differently across versions: the legacy
+    line was `pie-server serving on <host>:<port>`; the current startup banner
+    prints `✓ Server ready at ws://<host>:<port>`. Match either so the harness
+    parses the address before the engine goes idle (otherwise the readline below
+    blocks waiting for a line that never comes)."""
+    url_re = re.compile(r"(?:pie-server serving on |Server ready at ws://)([^\s]+:[0-9]+)")
     tok_re = re.compile(r"internal token: ([^\s]+)")
     url: str | None = None
     token: str | None = None
