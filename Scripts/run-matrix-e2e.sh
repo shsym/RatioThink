@@ -28,17 +28,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
-
-# --- single explicit operator gate ------------------------------------
-if [ "${PIE_TEST_E2E_MATRIX:-}" != "1" ]; then
-  echo "matrix: refusing to run without explicit opt-in." >&2
-  echo "matrix: the full matrix downloads ~36 GB and runs the real Metal engine for 30 cells." >&2
-  echo "matrix: opt in with the env gate:" >&2
-  echo "matrix:     PIE_TEST_E2E_MATRIX=1 Scripts/run-matrix-e2e.sh" >&2
-  echo "matrix: or via make:  RUN_MATRIX=1 make test-e2e-matrix" >&2
-  exit 2
-fi
 
 # --- the matrix model coordinates -------------------------------------
 # KEEP IN SYNC WITH Shared/CuratedModelCatalog.swift (CuratedModelCatalog.all).
@@ -61,8 +50,6 @@ MATRIX_MODELS=(
 )
 
 ALL_PROFILES="chat,tree-of-thought,fast-think"
-PROFILES="${PIE_TEST_E2E_PROFILES:-$ALL_PROFILES}"
-MODEL_FILTER="${PIE_TEST_E2E_MATRIX_MODELS:-}"
 
 # --- pie engine binary: enforce the worktree build --------------------
 # Like run-large-model-e2e.sh: a stale /Applications engine must not green
@@ -77,103 +64,159 @@ find_worktree_pie() {
   done
   return 1
 }
-PIE_BIN="${PIE_BIN:-$(find_worktree_pie || true)}"
-if [ -z "$PIE_BIN" ] || [ ! -x "$PIE_BIN" ]; then
-  echo "matrix: worktree pie binary not found — build it:  make engine-build" >&2
-  echo "matrix: expected under Vendor/pie/target/.../release/pie" >&2
-  exit 2
-fi
-export PIE_BIN
 
-echo "matrix: pie engine = $PIE_BIN"
-echo "matrix: profiles   = $PROFILES"
-[ -n "$MODEL_FILTER" ] && echo "matrix: model filter = $MODEL_FILTER"
-
-# --- run the matrix ---------------------------------------------------
-mkdir -p "$ROOT/logs"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-SUMMARY="$ROOT/logs/test-$STAMP-matrix-e2e.summary.log"
-: > "$SUMMARY"
-
-PASS_COUNT=0
-FAIL_COUNT=0
-overall_rc=0
-
-for entry in "${MATRIX_MODELS[@]}"; do
-  IFS='|' read -r repo file minbytes thinking <<< "$entry"
-  slug="$repo/$file"
-
-  if [ -n "$MODEL_FILTER" ]; then
-    keep=0
-    IFS=',' read -ra filters <<< "$MODEL_FILTER"
-    for f in "${filters[@]}"; do
-      f="$(printf '%s' "$f" | tr -d '[:space:]')"
-      [ -n "$f" ] && printf '%s' "$slug" | grep -qiF "$f" && { keep=1; break; }
-    done
-    [ "$keep" = "1" ] || { echo "matrix: skip (filtered) $slug"; continue; }
-  fi
-
-  echo ""
-  echo "==== MATRIX MODEL: $slug  (thinking=$thinking)  profiles=[$PROFILES] ===="
-  CELL_LOG="$ROOT/logs/test-$STAMP-matrix-$(printf '%s' "$file" | tr -c 'A-Za-z0-9._-' '_').log"
-
-  # Partial-download tripwire floor. The catalog's approximateSizeBytes is
-  # the EXACT blob size for the Qwen entries but a ROUNDED value for some
-  # bartowski entries (e.g. Llama-3.2-3B's 2_020_000_000 rounds ABOVE the
-  # real 2_019_377_696). The min-bytes guard exists to catch a truncated
-  # download, not to assert the byte-exact size, so floor it at 90% of the
-  # catalog figure — comfortably below any real complete file yet far above
-  # a partial one (insight #122). MATRIX_MODELS still carries the exact
-  # catalog value so the drift guard stays a 1:1 catalog check.
-  minfloor=$(( minbytes * 9 / 10 ))
-
-  # Per-cell environment for run-engine-e2e.sh. The FILTER targets only the
-  # profile-matrix method so the single boot does not also run the
-  # happy-path + reasoning tests.
-  env_args=(
-    "PIE_TEST_E2E_REPO=$repo"
-    "PIE_TEST_E2E_FILE=$file"
-    "PIE_TEST_E2E_MIN_BYTES=$minfloor"
-    "PIE_TEST_E2E_PROFILES=$PROFILES"
-    "PIE_TEST_E2E_FILTER=RealEngineLaunchE2ETests/test_realEngine_profileMatrixCell"
-  )
-  if [ "$thinking" = "1" ]; then
-    env_args+=("PIE_TEST_REAL_EXPECT_REASONING=1")
-  fi
-
-  set +e
-  env "${env_args[@]}" "$ROOT/Scripts/run-engine-e2e.sh" 2>&1 | tee "$CELL_LOG"
-  cell_rc=${PIPESTATUS[0]}
-  set -e
-
-  # Aggregate the per-profile verdicts the test printed. A profile with no
-  # MATRIX-CELL line never ran — the engine failed to boot/load — so every
-  # requested profile for this model is recorded FAIL(no-cell).
-  IFS=',' read -ra want_profiles <<< "$PROFILES"
-  for p in "${want_profiles[@]}"; do
+# aggregate_cell <slug> <file> <profiles_csv> <cell_log> <cell_rc>
+#
+# Fold the per-profile MATRIX-CELL verdicts the test printed into <cell_log>
+# into the globals SUMMARY / PASS_COUNT / FAIL_COUNT / overall_rc. Extracted
+# (and source-able) so Scripts/test-matrix-aggregator.sh can unit-test the
+# verdict logic engine-free.
+aggregate_cell() {
+  local slug="$1" file="$2" profiles_csv="$3" cell_log="$4" cell_rc="$5"
+  local printed=0 failed=0
+  local -a want
+  IFS=',' read -ra want <<< "$profiles_csv"
+  local p line reason
+  for p in "${want[@]}"; do
     p="$(printf '%s' "$p" | tr -d '[:space:]')"
     [ -n "$p" ] || continue
-    line="$(grep -E "^MATRIX-CELL	$file	$p	" "$CELL_LOG" | tail -1 || true)"
+    line="$(grep -E "^MATRIX-CELL	$file	$p	" "$cell_log" | tail -1 || true)"
     if [ -z "$line" ]; then
+      # No cell line ⇒ the engine never booted/loaded for this model, so the
+      # profile never ran. Record FAIL(no-cell); the run's non-zero exit is
+      # captured here in the message.
       printf 'FAIL\t%s\t%s\t(no cell — engine boot/load failed; cell_rc=%s)\n' "$slug" "$p" "$cell_rc" >> "$SUMMARY"
       FAIL_COUNT=$((FAIL_COUNT + 1)); overall_rc=1
     elif printf '%s' "$line" | grep -q "	PASS"; then
       printf 'PASS\t%s\t%s\n' "$slug" "$p" >> "$SUMMARY"
-      PASS_COUNT=$((PASS_COUNT + 1))
+      PASS_COUNT=$((PASS_COUNT + 1)); printed=$((printed + 1))
     else
       reason="$(printf '%s' "$line" | cut -f5-)"
       printf 'FAIL\t%s\t%s\t%s\n' "$slug" "$p" "$reason" >> "$SUMMARY"
       FAIL_COUNT=$((FAIL_COUNT + 1)); overall_rc=1
+      printed=$((printed + 1)); failed=$((failed + 1))
     fi
   done
-done
 
-echo ""
-echo "================= REAL-ENGINE MATRIX SUMMARY ================="
-echo "RESULT  MODEL / PROFILE"
-echo "-------------------------------------------------------------"
-cat "$SUMMARY"
-echo "-------------------------------------------------------------"
-echo "PASS=$PASS_COUNT  FAIL=$FAIL_COUNT  (summary: $SUMMARY)"
-echo "============================================================="
-exit "$overall_rc"
+  # Fail-closed on the swift-test exit code (review v1 F1). The per-profile
+  # verdict above is grep-driven, so a run where the engine booted and every
+  # requested profile printed PASS but the process THEN exited non-zero
+  # (Metal/teardown crash, host.stop() fault, IsolatedTestCase SIGKILL-reap,
+  # or any sibling/build non-zero exit) would launder a red run into a green
+  # table. Treat a non-zero cell_rc as a row-level failure — but only when at
+  # least one cell printed AND none were already recorded FAIL, so this
+  # neither double-counts the no-cell branch (printed==0, which already FAILed
+  # every profile) nor a legitimately-detected per-cell FAIL (failed>0, which
+  # itself drives cell_rc != 0 via the test's terminal XCTFail).
+  if [ "$cell_rc" -ne 0 ] && [ "$printed" -gt 0 ] && [ "$failed" -eq 0 ]; then
+    printf 'FAIL\t%s\t(cell_rc=%s despite PASS cells — run exited non-zero)\n' "$slug" "$cell_rc" >> "$SUMMARY"
+    FAIL_COUNT=$((FAIL_COUNT + 1)); overall_rc=1
+  fi
+}
+
+main() {
+  cd "$ROOT"
+
+  # --- single explicit operator gate ----------------------------------
+  if [ "${PIE_TEST_E2E_MATRIX:-}" != "1" ]; then
+    echo "matrix: refusing to run without explicit opt-in." >&2
+    echo "matrix: the full matrix downloads ~36 GB and runs the real Metal engine for 30 cells." >&2
+    echo "matrix: opt in with the env gate:" >&2
+    echo "matrix:     PIE_TEST_E2E_MATRIX=1 Scripts/run-matrix-e2e.sh" >&2
+    echo "matrix: or via make:  RUN_MATRIX=1 make test-e2e-matrix" >&2
+    exit 2
+  fi
+
+  local PROFILES="${PIE_TEST_E2E_PROFILES:-$ALL_PROFILES}"
+  local MODEL_FILTER="${PIE_TEST_E2E_MATRIX_MODELS:-}"
+
+  PIE_BIN="${PIE_BIN:-$(find_worktree_pie || true)}"
+  if [ -z "$PIE_BIN" ] || [ ! -x "$PIE_BIN" ]; then
+    echo "matrix: worktree pie binary not found — build it:  make engine-build" >&2
+    echo "matrix: expected under Vendor/pie/target/.../release/pie" >&2
+    exit 2
+  fi
+  export PIE_BIN
+
+  echo "matrix: pie engine = $PIE_BIN"
+  echo "matrix: profiles   = $PROFILES"
+  [ -n "$MODEL_FILTER" ] && echo "matrix: model filter = $MODEL_FILTER"
+
+  mkdir -p "$ROOT/logs"
+  local STAMP; STAMP="$(date +%Y%m%d-%H%M%S)"
+  SUMMARY="$ROOT/logs/test-$STAMP-matrix-e2e.summary.log"
+  : > "$SUMMARY"
+
+  PASS_COUNT=0
+  FAIL_COUNT=0
+  overall_rc=0
+
+  local entry repo file minbytes thinking slug keep f minfloor cell_rc CELL_LOG
+  local -a filters env_args
+  for entry in "${MATRIX_MODELS[@]}"; do
+    IFS='|' read -r repo file minbytes thinking <<< "$entry"
+    slug="$repo/$file"
+
+    if [ -n "$MODEL_FILTER" ]; then
+      keep=0
+      IFS=',' read -ra filters <<< "$MODEL_FILTER"
+      for f in "${filters[@]}"; do
+        f="$(printf '%s' "$f" | tr -d '[:space:]')"
+        [ -n "$f" ] && printf '%s' "$slug" | grep -qiF "$f" && { keep=1; break; }
+      done
+      [ "$keep" = "1" ] || { echo "matrix: skip (filtered) $slug"; continue; }
+    fi
+
+    echo ""
+    echo "==== MATRIX MODEL: $slug  (thinking=$thinking)  profiles=[$PROFILES] ===="
+    CELL_LOG="$ROOT/logs/test-$STAMP-matrix-$(printf '%s' "$file" | tr -c 'A-Za-z0-9._-' '_').log"
+
+    # Partial-download tripwire floor. The catalog's approximateSizeBytes is
+    # the EXACT blob size for the Qwen entries but a ROUNDED value for some
+    # bartowski entries (e.g. Llama-3.2-3B's 2_020_000_000 rounds ABOVE the
+    # real 2_019_377_696). The min-bytes guard exists to catch a truncated
+    # download, not to assert the byte-exact size, so floor it at 90% of the
+    # catalog figure — comfortably below any real complete file yet far above
+    # a partial one (insight #122). MATRIX_MODELS still carries the exact
+    # catalog value so the drift guard stays a 1:1 catalog check.
+    minfloor=$(( minbytes * 9 / 10 ))
+
+    # Per-cell environment for run-engine-e2e.sh. The FILTER targets only the
+    # profile-matrix method so the single boot does not also run the
+    # happy-path + reasoning tests.
+    env_args=(
+      "PIE_TEST_E2E_REPO=$repo"
+      "PIE_TEST_E2E_FILE=$file"
+      "PIE_TEST_E2E_MIN_BYTES=$minfloor"
+      "PIE_TEST_E2E_PROFILES=$PROFILES"
+      "PIE_TEST_E2E_FILTER=RealEngineLaunchE2ETests/test_realEngine_profileMatrixCell"
+    )
+    if [ "$thinking" = "1" ]; then
+      env_args+=("PIE_TEST_REAL_EXPECT_REASONING=1")
+    fi
+
+    set +e
+    env "${env_args[@]}" "$ROOT/Scripts/run-engine-e2e.sh" 2>&1 | tee "$CELL_LOG"
+    cell_rc=${PIPESTATUS[0]}
+    set -e
+
+    aggregate_cell "$slug" "$file" "$PROFILES" "$CELL_LOG" "$cell_rc"
+  done
+
+  echo ""
+  echo "================= REAL-ENGINE MATRIX SUMMARY ================="
+  echo "RESULT  MODEL / PROFILE"
+  echo "-------------------------------------------------------------"
+  cat "$SUMMARY"
+  echo "-------------------------------------------------------------"
+  echo "PASS=$PASS_COUNT  FAIL=$FAIL_COUNT  (summary: $SUMMARY)"
+  echo "============================================================="
+  exit "$overall_rc"
+}
+
+# Run main only when executed directly. When sourced (by
+# Scripts/test-matrix-aggregator.sh to unit-test aggregate_cell), only the
+# function + constant definitions load.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

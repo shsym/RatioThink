@@ -89,7 +89,7 @@ build-static: genproject ## Compile/type-check Rational app + helper without bui
 
 ci-pr: lint test-ci-v2-static-gate verify-app-icon-assets test-app-icon-assets build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
 
-local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary test-harsh-load-selftest ## Mandatory local pre-merge parity for runtime/heavy checks kept out of the lightweight manual workflow
+local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary test-harsh-load-selftest test-matrix-aggregator ## Mandatory local pre-merge parity for runtime/heavy checks kept out of the lightweight manual workflow
 
 local-gui-gate: test-gui-script test-gui ## Mandatory local GUI parity gate for UI changes; requires seated session + Automation/Accessibility TCC
 
@@ -393,6 +393,9 @@ test-e2e-http: $(LOGDIR) ## HTTP API stress + tool-call contract E2E (dummy driv
 test-harsh-load-selftest: ## Engine-free guard for the harsh-load generation assertion (#467 F1): an all-400-normalizing corpus must report FAIL, not a hollow PASS. Deterministic, CI-safe.
 	uv run --project Vendor/pie/client/python --with httpx \
 	  python Inferlets/chat-apc/harsh_load_real.py --self-test
+
+test-matrix-aggregator: ## Engine-free guard for the #473 matrix verdict aggregator (review F1 fail-closed): an all-PASS cell log + non-zero swift-test exit must record FAIL, not a hollow PASS. Deterministic, CI-safe.
+	Scripts/test-matrix-aggregator.sh
 
 test-e2e-harsh-load: $(LOGDIR) ## REAL-engine harsh LOAD eval (#467): concurrent agent-replay vs portable-Metal Qwen3-0.6B. Real-weights/GPU tier, NOT CI — SKIPs cleanly without weights. SMOKE uses the committed openclaw fixture; set PIE_TEST_REPLAY_CORPUS=/path/to/capture.jsonl for the HEAVY concurrent hermes replay.
 	@set +e +o pipefail; \

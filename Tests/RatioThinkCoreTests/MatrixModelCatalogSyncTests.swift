@@ -58,13 +58,29 @@ final class MatrixModelCatalogSyncTests: XCTestCase {
                    "matrix must cover every curated model exactly once")
   }
 
+  /// Negative guard: when the `MATRIX_MODELS=(` anchor is absent (renamed,
+  /// reformatted, or removed), the parser must record a test FAILURE, never
+  /// skip — otherwise drift ships green. `XCTExpectFailure` asserts a failure
+  /// is recorded inside the closure and itself fails if none is.
+  func test_driftGuard_failsNotSkips_whenAnchorMissing() {
+    XCTExpectFailure("a missing MATRIX_MODELS anchor must be a hard failure, not a skip") {
+      // Anchor deliberately renamed — `firstIndex(contains:)` won't match.
+      _ = try? parseMatrixModels("#!/usr/bin/env bash\nMODELS=(\n  \"a/b.gguf|b.gguf|1|0\"\n)\n")
+    }
+  }
+
   /// Parse the `MATRIX_MODELS=( "repo|file|minBytes|thinking" ... )` array
   /// literal out of the wrapper. Tolerant of leading whitespace and the
   /// surrounding quotes; stops at the closing paren.
   private func parseMatrixModels(_ script: String) throws -> [Row] {
     let lines = script.components(separatedBy: .newlines)
     guard let start = lines.firstIndex(where: { $0.contains("MATRIX_MODELS=(") }) else {
-      throw XCTSkip("MATRIX_MODELS=( … ) block not found in run-matrix-e2e.sh")
+      // This guard IS the anti-drift deliverable: if it cannot find its
+      // anchor (array renamed, reformatted, or moved) it must FAIL, not skip
+      // — a skip would let the wrapper and catalog diverge while make
+      // test-unit stays green (the #427 silent-skip failure mode).
+      XCTFail("MATRIX_MODELS=( … ) block not found in run-matrix-e2e.sh — drift guard cannot run")
+      return []
     }
     var rows: [Row] = []
     for raw in lines[(start + 1)...] {
