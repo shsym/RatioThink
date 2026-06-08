@@ -63,7 +63,7 @@ fi
 # the hint here too so an operator knows why a run no-opped.
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
 HF_CACHE="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
-REPO="models--$(printf '%s' "$MODEL" | tr '/' '-' | sed 's/-/--/')"
+REPO="models--$(printf '%s' "$MODEL" | sed 's#/#--#g')"
 if ! find -L "$HF_CACHE/$REPO/snapshots" -type f \
         \( -name '*.safetensors' -o -name '*.gguf' -o -name '*.bin' \) 2>/dev/null | grep -q .; then
   echo "[harsh-load] NOTE: no real weights for $MODEL under $HF_CACHE — the harness will SKIP." >&2

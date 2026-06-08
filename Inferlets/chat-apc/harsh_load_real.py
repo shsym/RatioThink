@@ -348,7 +348,13 @@ async def _fire(http: httpx.AsyncClient, base: str, body: dict, bearer: str,
 
 async def run_load(http: httpx.AsyncClient, base: str, bodies: list[dict], *,
                    concurrency: int, n_users: int, rounds: int, pattern: str,
-                   label: str, rep: Report) -> None:
+                   label: str, rep: Report) -> int:
+    """Fire the schedule and classify every result. Returns the count of
+    well-formed 200/SSE responses (`ok200`) so the caller can assert that the
+    tier actually GENERATED — a run where every request returns a structured
+    non-200 (a normalization regression, context overflow, tool-equip failure)
+    would otherwise pass the structured-error branch with ok200=0 while the
+    harness's whole premise — real decode under load — went unexercised."""
     n_turns = len(bodies)
     schedule = _schedule(n_users, n_turns, rounds, pattern)
     sem = asyncio.Semaphore(concurrency)
@@ -403,6 +409,7 @@ async def run_load(http: httpx.AsyncClient, base: str, bodies: list[dict], *,
     print(f"[harsh-load] {label}/{pattern}: {len(schedule)} reqs in {wall:.1f}s "
           f"(conc={concurrency}, users={n_users}, turns={n_turns}, rounds={rounds}) "
           f"-> ok200={ok200} structured_err={err_structured} hangs={hangs}{note}", flush=True)
+    return ok200
 
 
 # ---------------------------------------------------------------------------
@@ -522,19 +529,34 @@ async def main() -> int:
             # SMOKE tier — committed openclaw sample, low concurrency.
             print(f"[harsh-load] SMOKE: {len(smoke_bodies)} turns from committed fixture",
                   flush=True)
-            await run_load(http, base, smoke_bodies, concurrency=SMOKE_CONCURRENCY,
-                           n_users=2, rounds=1, pattern="sequential", label="smoke", rep=rep)
-            await run_load(http, base, smoke_bodies, concurrency=SMOKE_CONCURRENCY,
-                           n_users=2, rounds=1, pattern="interleaved", label="smoke", rep=rep)
+            smoke_ok = 0
+            smoke_ok += await run_load(http, base, smoke_bodies, concurrency=SMOKE_CONCURRENCY,
+                                       n_users=2, rounds=1, pattern="sequential",
+                                       label="smoke", rep=rep)
+            smoke_ok += await run_load(http, base, smoke_bodies, concurrency=SMOKE_CONCURRENCY,
+                                       n_users=2, rounds=1, pattern="interleaved",
+                                       label="smoke", rep=rep)
+            # A tier meant to GENERATE that produced zero 200/SSE responses is a
+            # silent no-op (all-structured-error bodies) — the harness premise
+            # went unexercised. Fail loud rather than report a hollow PASS.
+            rep.ok(smoke_ok > 0,
+                   "smoke: no replayed request produced a 200/SSE — the corpus never "
+                   "decoded under load (normalization regression / context overflow / "
+                   "tool-equip failure?)")
 
             # HEAVY tier — env-sourced hermes capture, high concurrency.
             if heavy_bodies:
                 print(f"[harsh-load] HEAVY: {len(heavy_bodies)} turns from {heavy_path}",
                       flush=True)
+                heavy_ok = 0
                 for pattern in ("interleaved", "sequential"):
-                    await run_load(http, base, heavy_bodies, concurrency=HEAVY_CONCURRENCY,
-                                   n_users=N_USERS, rounds=ROUNDS, pattern=pattern,
-                                   label="heavy", rep=rep)
+                    heavy_ok += await run_load(http, base, heavy_bodies,
+                                               concurrency=HEAVY_CONCURRENCY,
+                                               n_users=N_USERS, rounds=ROUNDS, pattern=pattern,
+                                               label="heavy", rep=rep)
+                rep.ok(heavy_ok > 0,
+                       "heavy: no replayed request produced a 200/SSE — the corpus never "
+                       "decoded under load")
             else:
                 print("[harsh-load] HEAVY tier skipped (set PIE_TEST_REPLAY_CORPUS to a "
                       "hermes capture.jsonl to enable the concurrent replay).", flush=True)
@@ -560,5 +582,41 @@ async def main() -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Engine-free negative self-test (guards the F1 generation assertion)
+# ---------------------------------------------------------------------------
+
+async def self_test() -> int:
+    """Deterministic, engine-free guard for the `ok200 > 0` assertion: drive
+    `run_load` against a stub that returns ALL structured 400s (the regression
+    F1 describes — every replayed body fails to decode). The per-request
+    classification stays green (a structured non-200 is allowed), so without
+    the generation guard the run would report a hollow PASS. Assert that the
+    guard turns ok200=0 into a FAIL."""
+
+    class _Stub400:
+        async def post(self, url, json=None, headers=None):
+            class _R:
+                status_code = 400
+                text = '{"error":{"code":"invalid_request","message":"stub"}}'
+            return _R()
+
+    rep = Report()
+    bodies = [{"model": MODEL, "messages": [{"role": "user", "content": "hi"}],
+               "stream": True, "max_tokens": 8}]
+    ok = await run_load(_Stub400(), "http://stub", bodies, concurrency=2,
+                        n_users=2, rounds=1, pattern="sequential", label="selftest", rep=rep)
+    failures_before_guard = len(rep.failures)
+    rep.ok(ok > 0, "smoke: no replayed request produced a 200/SSE")  # the F1 guard
+    guard_fired = len(rep.failures) == failures_before_guard + 1
+    passed = (ok == 0) and (failures_before_guard == 0) and guard_fired
+    print(f"[harsh-load] SELF-TEST {'PASS' if passed else 'FAIL'}: all-400 corpus -> "
+          f"ok200={ok}, per-request failures={failures_before_guard}, guard_fired={guard_fired} "
+          f"(expect ok200=0, 0 per-request failures, guard FAIL)")
+    return 0 if passed else 1
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(asyncio.run(self_test()))
     sys.exit(asyncio.run(main()))
