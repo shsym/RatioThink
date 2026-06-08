@@ -515,6 +515,18 @@ test-e2e-tot: ## E2E area: real-engine tree-of-thought APP path completes (#413 
 test-e2e-tot-batched: ## E2E area: real-engine BATCHED ToT (exec=phased_concurrent) tree shape/status (#458; real Qwen3-0.6B-GGUF)
 	Scripts/run-tot-batched-e2e.sh
 
+test-e2e-matrix: ## E2E area: FULL real-engine matrix — 10 curated models × {chat,tree-of-thought,fast-think} (#473; ~36GB, hours, operator-gated, NOT CI). Opt in with RUN_MATRIX=1.
+	@if [ "$(RUN_MATRIX)" != "1" ]; then \
+	  echo "test-e2e-matrix runs the FULL real-engine matrix: 10 curated models × 3 profiles,"; \
+	  echo "downloading ~36GB (incl. two ~9GB 14B models) and booting the real Metal engine per model."; \
+	  echo "It is operator-gated and never runs in CI. Opt in explicitly:"; \
+	  echo "    RUN_MATRIX=1 make test-e2e-matrix"; \
+	  echo "Subset for iteration, e.g.:"; \
+	  echo "    RUN_MATRIX=1 PIE_TEST_E2E_PROFILES=chat PIE_TEST_E2E_MATRIX_MODELS=Qwen3-0.6B make test-e2e-matrix"; \
+	  exit 2; \
+	fi
+	PIE_TEST_E2E_MATRIX=1 Scripts/run-matrix-e2e.sh
+
 bench-tot: ## Benchmark: ToT batched-vs-sequential strategies on real portable Metal — wall-clock + tok/s (#458)
 	Scripts/run-tot-bench.sh
 

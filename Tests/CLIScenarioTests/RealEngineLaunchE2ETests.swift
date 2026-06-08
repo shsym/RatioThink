@@ -109,6 +109,97 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     try await assertReasoningSeparatedFromContent(port: port, modelID: slug)
   }
 
+  /// One cell of the (model × profile) real-engine compatibility matrix
+  /// (#473). Routing is per-REQUEST, not per-launch-profile (chat →
+  /// /v1/chat/completions, tree-of-thought → /v1/inferlet, fast-think →
+  /// chat-completions + a `speculation` field), so a single booted model
+  /// proves every profile shape against it: this boots ONCE and fires each
+  /// profile in `PIE_TEST_E2E_PROFILES` as a sub-assertion. That keeps the
+  /// matrix at 10 boots / 30 cells instead of 30 cold boots — decisive for
+  /// the slow ~9 GB 14B loads.
+  ///
+  /// Gated on `PIE_TEST_E2E_PROFILES` (a csv of `chat,tree-of-thought,
+  /// fast-think`) so the default `Scripts/run-engine-e2e.sh` path — which
+  /// sets only `PIE_TEST_REAL_*` — skips it; `Scripts/run-matrix-e2e.sh`
+  /// sets the profile list + the per-cell model coordinate and is the sole
+  /// driver. `PIE_TEST_REAL_EXPECT_REASONING=1` (set by the wrapper for the
+  /// Qwen3 thinking models) adds the reasoning-channel sub-checks.
+  func test_realEngine_profileMatrixCell() async throws {
+    let env = try realEngineEnvOrSkip()
+    let raw = ProcessInfo.processInfo.environment["PIE_TEST_E2E_PROFILES"]?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !raw.isEmpty else {
+      throw XCTSkip("set PIE_TEST_E2E_PROFILES (csv of chat,tree-of-thought,fast-think) — driven by Scripts/run-matrix-e2e.sh")
+    }
+    let profiles = raw.split(separator: ",")
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+    let expectReasoning = ProcessInfo.processInfo.environment["PIE_TEST_REAL_EXPECT_REASONING"] == "1"
+
+    let host = PieEngineHost()
+    defer { host.stop() }
+    let (port, slug) = try await launchRealEngine(env, host: host)
+    // The engine must serve exactly the profile slug as its model id
+    // (id-unification) before any request can match it.
+    try await assertServedModelID(port: port, expected: slug)
+
+    // Run each profile independently: a throwing failure in one cell must
+    // not abort the others (we want the whole row's verdict, not "stop at
+    // the first red"). Each cell emits a machine-parseable
+    // `MATRIX-CELL <model> <profile> PASS|FAIL` line that
+    // Scripts/run-matrix-e2e.sh aggregates into the matrix table; if the
+    // engine never booted, the method threw above and NO lines print for
+    // this model — the wrapper reads that absence as a load failure.
+    let model = env.modelPath.lastPathComponent
+    var failures: [String] = []
+    for profile in profiles {
+      do {
+        switch profile {
+        case "chat":
+          try await assertChatCell(port: port, modelID: slug, expectReasoning: expectReasoning)
+        case "tree-of-thought":
+          try await assertTreeOfThoughtCell(port: port, modelID: slug)
+        case "fast-think":
+          try await assertFastThinkCell(port: port, modelID: slug, expectReasoning: expectReasoning)
+        default:
+          throw MatrixCellFailure("unknown profile (expected chat|tree-of-thought|fast-think)")
+        }
+        print("MATRIX-CELL\t\(model)\t\(profile)\tPASS")
+      } catch {
+        failures.append("\(profile): \(error)")
+        // Single-line, tab-delimited so the wrapper can grep it; the
+        // reason rides the 4th column with internal tabs stripped.
+        let reason = "\(error)".replacingOccurrences(of: "\t", with: " ")
+        print("MATRIX-CELL\t\(model)\t\(profile)\tFAIL\t\(reason)")
+      }
+    }
+    if !failures.isEmpty {
+      XCTFail("\(model): \(failures.count) profile cell(s) failed — \(failures.joined(separator: " | "))")
+    }
+  }
+
+  /// A real-engine matrix cell assertion failed. Thrown (not `XCTFail`) so
+  /// the per-profile loop in `test_realEngine_profileMatrixCell` can catch
+  /// it, record the verdict, and continue to the next profile rather than
+  /// aborting the whole row at the first red cell.
+  private struct MatrixCellFailure: Error, CustomStringConvertible {
+    let reason: String
+    init(_ reason: String) { self.reason = reason }
+    var description: String { reason }
+  }
+
+  /// Throwing analogue of `XCTAssert` for matrix cells — see
+  /// `MatrixCellFailure`.
+  private func cellRequire(_ condition: Bool, _ message: @autoclosure () -> String) throws {
+    if !condition { throw MatrixCellFailure(message()) }
+  }
+
+  /// Throwing analogue of `XCTUnwrap` for matrix cells.
+  private func cellUnwrap<T>(_ value: T?, _ message: @autoclosure () -> String) throws -> T {
+    guard let value else { throw MatrixCellFailure(message()) }
+    return value
+  }
+
   /// Poll the host until it reports `.running`, failing fast on `.failed`.
   private func awaitRunning(host: PieEngineHost, timeout: TimeInterval) async throws -> Int {
     let deadline = Date().addingTimeInterval(timeout)
@@ -207,6 +298,132 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
                    "expected non-empty reasoning_content for a thinking model; body=\(bodyText.prefix(400))")
     XCTAssertFalse(reasoning.contains("</think>"),
                    "reasoning_content must hold clean scratchpad text, not the delimiter")
+  }
+
+  // MARK: - profile matrix cells (#473)
+
+  /// POST a non-streaming chat body and return the decoded JSON object,
+  /// asserting HTTP 200 first. Shared by the chat and fast-think cells —
+  /// both inspect the single non-streaming JSON (so `finish_reason` /
+  /// `spec_metrics` are read directly rather than reassembled from SSE).
+  private func postChatJSON(port: Int, body: [String: Any]) async throws -> [String: Any] {
+    let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.timeoutInterval = 180
+    req.httpBody = try JSONSerialization.data(withJSONObject: body)
+    let (data, response) = try await URLSession.shared.data(for: req)
+    let http = try cellUnwrap(response as? HTTPURLResponse, "no HTTP response")
+    let text = String(data: data, encoding: .utf8) ?? ""
+    try cellRequire(http.statusCode == 200, "chat HTTP \(http.statusCode): \(text.prefix(400))")
+    return try cellUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          "chat response not a JSON object: \(text.prefix(400))")
+  }
+
+  /// chat cell: a plain completion returns 200 with a non-empty answer and
+  /// a terminal `finish_reason` of `stop` or `length` (#434/#439 — the
+  /// engine must always settle a turn, never starve). On a thinking model
+  /// the visible answer stays free of raw `<think>` delimiters and the
+  /// scratchpad rides `reasoning_content` (#329); a thinking model that
+  /// caps mid-reasoning legitimately yields empty `content`, so "produced
+  /// output" is satisfied by either channel.
+  private func assertChatCell(port: Int, modelID: String, expectReasoning: Bool) async throws {
+    let json = try await postChatJSON(port: port, body: [
+      "model": modelID,
+      "messages": [["role": "user", "content": "Reply with the single word: pong"]],
+      "max_tokens": expectReasoning ? 1024 : 64,
+      "stream": false,
+    ])
+    let choice = try cellUnwrap((json["choices"] as? [[String: Any]])?.first, "chat: no choices")
+    let message = try cellUnwrap(choice["message"] as? [String: Any], "chat: no message")
+    let content = ((message["content"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let reasoning = ((message["reasoning_content"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let finish = choice["finish_reason"] as? String
+    try cellRequire(["stop", "length"].contains(finish ?? ""),
+                    "chat: finish_reason must be stop|length, got \(finish ?? "nil")")
+    try cellRequire(!(content.isEmpty && reasoning.isEmpty),
+                    "chat: engine produced neither content nor reasoning")
+    if expectReasoning {
+      try cellRequire(!(content.contains("<think>") || content.contains("</think>")),
+                      "chat: raw think delimiter leaked into content: \(content.debugDescription)")
+      try cellRequire(!reasoning.isEmpty,
+                      "chat: thinking model must surface reasoning_content")
+    }
+  }
+
+  /// tree-of-thought cell: dispatch the real `/v1/inferlet` ToT search
+  /// through the typed client + `toTEventStream` (the exact App path) and
+  /// require the stream to reach a `tree_complete` terminal with a chosen
+  /// answer, having materialized at least one node at depth ≥ 2 — the
+  /// depth>1 search is what spans the inter-level idle gap (#413). Default
+  /// `coupled_sequential` exec, so the production prebuilt wasm serves it
+  /// (the #458 phased_concurrent strategies are a separate feature build).
+  private func assertTreeOfThoughtCell(port: Int, modelID: String) async throws {
+    let client = HTTPEngineClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!)
+    let input: [String: Any] = [
+      "model": modelID,
+      "messages": [["role": "user", "content": "What is the best way to learn a new programming language?"]],
+      "breadth": 3,
+      "depth": 2,
+      "beam_width": 2,
+      "max_tokens_per_node": 256,
+      "temperature": 0.7,
+      "top_p": 0.9,
+    ]
+    let req = InferletRequest(
+      inferlet: "tree-of-thought",
+      input: try JSONSerialization.data(withJSONObject: input),
+      messages: nil,
+      stream: true)
+
+    var sawTreeComplete = false
+    var maxDepth = 0
+    var selected: String?
+    var finalAnswer: String?
+    for try await event in toTEventStream(from: client.dispatchInferlet(req)) {
+      switch event {
+      case .nodeComplete(let node):
+        maxDepth = max(maxDepth, node.depth)
+      case .treeComplete(let sel, let ans):
+        sawTreeComplete = true
+        selected = sel
+        finalAnswer = ans
+      default:
+        break
+      }
+    }
+    try cellRequire(sawTreeComplete, "tot: stream never reached tree_complete")
+    try cellRequire(maxDepth >= 2, "tot: search did not reach depth>1 (max node depth \(maxDepth))")
+    try cellRequire(selected != nil || !((finalAnswer ?? "").isEmpty),
+                    "tot: tree_complete carried neither a selected node nor a final answer")
+  }
+
+  /// fast-think cell: a greedy (temperature 0) completion carrying the
+  /// chat-apc `speculation` extension must actually engage speculative
+  /// decoding — the response's `spec_metrics` object is omitted entirely
+  /// when speculation does not run (#418), so its presence with
+  /// `enabled == true` is the wire proof. Also a real answer on some
+  /// channel (thinking models may cap mid-reasoning, as in the chat cell).
+  private func assertFastThinkCell(port: Int, modelID: String, expectReasoning: Bool) async throws {
+    let json = try await postChatJSON(port: port, body: [
+      "model": modelID,
+      "messages": [["role": "user", "content": "Reply with the single word: pong"]],
+      "max_tokens": expectReasoning ? 1024 : 64,
+      "temperature": 0.0,
+      "stream": false,
+      "speculation": ["enabled": true],
+    ])
+    let choice = try cellUnwrap((json["choices"] as? [[String: Any]])?.first, "fast-think: no choices")
+    let message = try cellUnwrap(choice["message"] as? [String: Any], "fast-think: no message")
+    let content = ((message["content"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let reasoning = ((message["reasoning_content"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    try cellRequire(!(content.isEmpty && reasoning.isEmpty),
+                    "fast-think: engine produced neither content nor reasoning")
+    let spec = try cellUnwrap(json["spec_metrics"] as? [String: Any],
+                              "fast-think: spec_metrics absent — speculation did not engage")
+    try cellRequire(spec["enabled"] as? Bool == true,
+                    "fast-think: spec_metrics.enabled != true (fallback_reason=\(spec["fallback_reason"] ?? "nil"))")
   }
 
   // MARK: - launch helper
