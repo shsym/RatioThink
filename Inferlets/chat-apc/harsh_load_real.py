@@ -469,6 +469,63 @@ async def real_engine_session():
 # Gating + main
 # ---------------------------------------------------------------------------
 
+def assert_generated(ok200: int, label: str, rep: Report) -> bool:
+    """The F1 generation guard: a tier meant to DECODE that produced zero
+    200/SSE responses is a silent no-op (every body failed to decode — a
+    normalization regression, context overflow, or tool-equip failure), so a
+    hollow PASS would hide that the harness premise went unexercised. Shared
+    by main()'s smoke + heavy tiers AND the regression self-test, so the test
+    drives this exact production guard and fails if a caller removes it."""
+    return rep.ok(ok200 > 0,
+                  f"{label}: no replayed request produced a 200/SSE — the corpus never "
+                  f"decoded under load (normalization regression / context overflow / "
+                  f"tool-equip failure?)")
+
+
+async def run_all_tiers(http, base: str, smoke_bodies: list[dict],
+                        heavy_bodies: list[dict], heavy_path, rep: Report, *,
+                        survival: bool = True) -> None:
+    """The full load schedule + guards, shared by main() and the self-test so
+    the test drives the SAME guard wiring (F7): if a future change drops an
+    `assert_generated` call here, BOTH paths lose it and the self-test's
+    all-400 stub run stops reporting a generation failure -> self-test FAILs.
+    `survival` is False under the engine-free self-test (no live engine to
+    health-check)."""
+    # SMOKE tier — committed openclaw sample, low concurrency.
+    print(f"[harsh-load] SMOKE: {len(smoke_bodies)} turns from committed fixture", flush=True)
+    smoke_ok = 0
+    smoke_ok += await run_load(http, base, smoke_bodies, concurrency=SMOKE_CONCURRENCY,
+                               n_users=2, rounds=1, pattern="sequential", label="smoke", rep=rep)
+    smoke_ok += await run_load(http, base, smoke_bodies, concurrency=SMOKE_CONCURRENCY,
+                               n_users=2, rounds=1, pattern="interleaved", label="smoke", rep=rep)
+    assert_generated(smoke_ok, "smoke", rep)
+
+    # HEAVY tier — env-sourced hermes capture, high concurrency.
+    if heavy_bodies:
+        print(f"[harsh-load] HEAVY: {len(heavy_bodies)} turns from {heavy_path}", flush=True)
+        heavy_ok = 0
+        for pattern in ("interleaved", "sequential"):
+            heavy_ok += await run_load(http, base, heavy_bodies, concurrency=HEAVY_CONCURRENCY,
+                                       n_users=N_USERS, rounds=ROUNDS, pattern=pattern,
+                                       label="heavy", rep=rep)
+        assert_generated(heavy_ok, "heavy", rep)
+    else:
+        print("[harsh-load] HEAVY tier skipped (set PIE_TEST_REPLAY_CORPUS to a "
+              "hermes capture.jsonl to enable the concurrent replay).", flush=True)
+
+    # Survival: engine healthy + serves a normal request after the barrage.
+    if survival:
+        r = await http.get(f"{base}/healthz")
+        rep.ok(r.status_code == 200 and r.json() == {"status": "ok"},
+               f"survival: /healthz after load -> {r.status_code}")
+        r = await http.post(f"{base}/v1/chat/completions", json={
+            "model": MODEL, "stream": False, "max_tokens": 8,
+            "messages": [{"role": "user", "content": "Say hi."}],
+        })
+        rep.ok(r.status_code == 200, f"survival: normal chat after load -> {r.status_code} "
+               f"{r.text[:160]!r} (engine not wedged)")
+
+
 def _weights_cached(model: str) -> bool:
     """True if a resolved WEIGHT artifact for `model` exists in the HF cache
     (not just config/tokenizer — the dummy tier needs only those)."""
@@ -526,51 +583,7 @@ async def main() -> int:
     print(f"[harsh-load] booting REAL engine (portable Metal, {MODEL})…", flush=True)
     async with real_engine_session() as base:
         async with httpx.AsyncClient(timeout=REQ_TIMEOUT) as http:
-            # SMOKE tier — committed openclaw sample, low concurrency.
-            print(f"[harsh-load] SMOKE: {len(smoke_bodies)} turns from committed fixture",
-                  flush=True)
-            smoke_ok = 0
-            smoke_ok += await run_load(http, base, smoke_bodies, concurrency=SMOKE_CONCURRENCY,
-                                       n_users=2, rounds=1, pattern="sequential",
-                                       label="smoke", rep=rep)
-            smoke_ok += await run_load(http, base, smoke_bodies, concurrency=SMOKE_CONCURRENCY,
-                                       n_users=2, rounds=1, pattern="interleaved",
-                                       label="smoke", rep=rep)
-            # A tier meant to GENERATE that produced zero 200/SSE responses is a
-            # silent no-op (all-structured-error bodies) — the harness premise
-            # went unexercised. Fail loud rather than report a hollow PASS.
-            rep.ok(smoke_ok > 0,
-                   "smoke: no replayed request produced a 200/SSE — the corpus never "
-                   "decoded under load (normalization regression / context overflow / "
-                   "tool-equip failure?)")
-
-            # HEAVY tier — env-sourced hermes capture, high concurrency.
-            if heavy_bodies:
-                print(f"[harsh-load] HEAVY: {len(heavy_bodies)} turns from {heavy_path}",
-                      flush=True)
-                heavy_ok = 0
-                for pattern in ("interleaved", "sequential"):
-                    heavy_ok += await run_load(http, base, heavy_bodies,
-                                               concurrency=HEAVY_CONCURRENCY,
-                                               n_users=N_USERS, rounds=ROUNDS, pattern=pattern,
-                                               label="heavy", rep=rep)
-                rep.ok(heavy_ok > 0,
-                       "heavy: no replayed request produced a 200/SSE — the corpus never "
-                       "decoded under load")
-            else:
-                print("[harsh-load] HEAVY tier skipped (set PIE_TEST_REPLAY_CORPUS to a "
-                      "hermes capture.jsonl to enable the concurrent replay).", flush=True)
-
-            # Survival: engine healthy + serves a normal request after the barrage.
-            r = await http.get(f"{base}/healthz")
-            rep.ok(r.status_code == 200 and r.json() == {"status": "ok"},
-                   f"survival: /healthz after load -> {r.status_code}")
-            r = await http.post(f"{base}/v1/chat/completions", json={
-                "model": MODEL, "stream": False, "max_tokens": 8,
-                "messages": [{"role": "user", "content": "Say hi."}],
-            })
-            rep.ok(r.status_code == 200, f"survival: normal chat after load -> {r.status_code} "
-                   f"{r.text[:160]!r} (engine not wedged)")
+            await run_all_tiers(http, base, smoke_bodies, heavy_bodies, heavy_path, rep)
 
     if rep.failures:
         print(f"\n[harsh-load] FAILURES ({len(rep.failures)}):")
@@ -587,12 +600,14 @@ async def main() -> int:
 # ---------------------------------------------------------------------------
 
 async def self_test() -> int:
-    """Deterministic, engine-free guard for the `ok200 > 0` assertion: drive
-    `run_load` against a stub that returns ALL structured 400s (the regression
-    F1 describes — every replayed body fails to decode). The per-request
-    classification stays green (a structured non-200 is allowed), so without
-    the generation guard the run would report a hollow PASS. Assert that the
-    guard turns ok200=0 into a FAIL."""
+    """Deterministic, engine-free regression guard for the F1 fix. Drives the
+    REAL production path — `run_all_tiers` — against a stub that returns ALL
+    structured 400s (every replayed body fails to decode). Each per-request
+    classification stays green (a structured non-200 is allowed), so the ONLY
+    thing that can fail the run is the `assert_generated` guard. The test
+    passes iff that guard fired. Because `run_all_tiers` is the same code main()
+    runs, deleting OR weakening the guard there is caught here — not just a
+    copy of the assertion (review v2 F7)."""
 
     class _Stub400:
         async def post(self, url, json=None, headers=None):
@@ -604,15 +619,15 @@ async def self_test() -> int:
     rep = Report()
     bodies = [{"model": MODEL, "messages": [{"role": "user", "content": "hi"}],
                "stream": True, "max_tokens": 8}]
-    ok = await run_load(_Stub400(), "http://stub", bodies, concurrency=2,
-                        n_users=2, rounds=1, pattern="sequential", label="selftest", rep=rep)
-    failures_before_guard = len(rep.failures)
-    rep.ok(ok > 0, "smoke: no replayed request produced a 200/SSE")  # the F1 guard
-    guard_fired = len(rep.failures) == failures_before_guard + 1
-    passed = (ok == 0) and (failures_before_guard == 0) and guard_fired
-    print(f"[harsh-load] SELF-TEST {'PASS' if passed else 'FAIL'}: all-400 corpus -> "
-          f"ok200={ok}, per-request failures={failures_before_guard}, guard_fired={guard_fired} "
-          f"(expect ok200=0, 0 per-request failures, guard FAIL)")
+    # survival=False: no live engine to health-check. heavy disabled (no corpus).
+    await run_all_tiers(_Stub400(), "http://stub", bodies, [], None, rep, survival=False)
+    gen_failures = [f for f in rep.failures if "produced a 200/SSE" in f]
+    # Exactly the generation guard must have failed — nothing else (all-400 is
+    # an allowed per-request outcome, so without the guard there'd be 0 failures).
+    passed = len(rep.failures) == 1 and len(gen_failures) == 1
+    print(f"[harsh-load] SELF-TEST {'PASS' if passed else 'FAIL'}: all-400 corpus via "
+          f"run_all_tiers -> {len(rep.failures)} failure(s), generation-guard fired="
+          f"{len(gen_failures) == 1} (expect exactly 1: the generation guard)")
     return 0 if passed else 1
 
 
