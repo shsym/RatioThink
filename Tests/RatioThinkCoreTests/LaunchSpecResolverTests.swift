@@ -86,6 +86,113 @@ final class LaunchSpecResolverTests: XCTestCase {
                   "error should route the UI to choose/download actions; got: \(error.message)")
   }
 
+  /// #459 repro 1: a no-default profile (its `model` key cleared by a model
+  /// delete) must still start when the user explicitly picks a downloaded
+  /// model from the toolbar / model list. The pick is threaded as
+  /// `explicitModel` and becomes the boot model — without it the resolve
+  /// fails with `has no default model` even though a valid model is on disk.
+  func test_resolveLauncherSpec_explicitModel_satisfies_noDefault_profile() throws {
+    let store = try makeNoDefaultStore(inferlet: "chat-apc")
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake-explicit", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models-explicit", isDirectory: true)
+    let pickedSlug = "Org/New-Model-GGUF/new.gguf"
+    try stageModel(named: pickedSlug, in: modelsRoot)
+    let stagedPath = LaunchSpecResolver.joinModelPath(modelsRoot: modelsRoot, slug: pickedSlug)
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-explicit") },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { self.tempDir.appendingPathComponent("hf-home-explicit", isDirectory: true) }
+    )
+
+    // No-default control: bare resolve (no override) still refuses, so the
+    // #452 explicit-no-default contract is intact.
+    guard case .failure(let bare) = resolver.resolveLauncherSpec(profileID: "chat") else {
+      return XCTFail("no-default profile must still refuse a bare start")
+    }
+    XCTAssertEqual(bare.code, .modelMissing)
+
+    // With the explicit pick threaded, the start resolves to that model.
+    guard case .success(let spec) = resolver.resolveLauncherSpec(
+      profileID: "chat", explicitModel: pickedSlug) else {
+      return XCTFail("explicit model pick must satisfy a no-default profile's engine start")
+    }
+    let body = PieControlLauncher.renderConfigBody(modelConfig: spec.modelConfig)
+    XCTAssertTrue(body.contains("hf_repo = \"\(stagedPath)\""),
+                  "the explicit pick must be the boot model passed to pie; got:\n\(body)")
+    XCTAssertEqual(spec.inferletNameAtVersion, "chat-apc@0.1.0",
+                   "profile inferlet must still drive the launch even when the model is an explicit override")
+  }
+
+  /// A blank/whitespace `explicitModel` is treated as "no override" so a
+  /// genuinely no-default profile still surfaces the choose/download path
+  /// rather than booting an empty slug.
+  func test_resolveLauncherSpec_blank_explicitModel_falls_through_to_noDefault() throws {
+    let store = try makeNoDefaultStore(inferlet: "chat-apc")
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake-blank", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { self.tempDir.appendingPathComponent("models-blank") },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-blank") }
+    )
+
+    guard case .failure(let err) = resolver.resolveLauncherSpec(
+      profileID: "chat", explicitModel: "   ") else {
+      return XCTFail("blank explicit model must not be treated as a real boot model")
+    }
+    XCTAssertEqual(err.code, .modelMissing)
+    XCTAssertTrue(err.message.contains("has no default model"), "got: \(err.message)")
+  }
+
+  /// When the profile DOES carry a default, an explicit pick overrides it
+  /// for this boot (single-model v1 engine: the model you start is the one
+  /// the engine serves). The profile default is unchanged on disk.
+  func test_resolveLauncherSpec_explicitModel_overrides_profile_default() throws {
+    let store = try makeStoreWithModel("Org/Default-GGUF/default.gguf")
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake-override", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models-override", isDirectory: true)
+    try stageModel(named: "Org/Default-GGUF/default.gguf", in: modelsRoot)
+    let pickedSlug = "Org/Picked-GGUF/picked.gguf"
+    try stageModel(named: pickedSlug, in: modelsRoot)
+    let pickedPath = LaunchSpecResolver.joinModelPath(modelsRoot: modelsRoot, slug: pickedSlug)
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-override") },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { self.tempDir.appendingPathComponent("hf-home-override", isDirectory: true) }
+    )
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(
+      profileID: "chat", explicitModel: pickedSlug) else {
+      return XCTFail("explicit pick must override the profile default for this boot")
+    }
+    let body = PieControlLauncher.renderConfigBody(modelConfig: spec.modelConfig)
+    XCTAssertTrue(body.contains("hf_repo = \"\(pickedPath)\""),
+                  "explicit pick must win over the profile default; got:\n\(body)")
+  }
+
   /// Review v2 F7 + v3 F1 regression guard. The resolver mapped
   /// `profile.model` but silently dropped `profile.inferlet` — making
   /// every profile indistinguishable to the engine as soon as a second
@@ -262,7 +369,7 @@ final class LaunchSpecResolverTests: XCTestCase {
     )
 
     let closure: HelperExportedAPI.LaunchSpecResolver = resolver.asClosure
-    if case .success(let spec) = closure("chat") {
+    if case .success(let spec) = closure("chat", nil) {
       XCTAssertEqual(spec.profileID, "chat")
     } else {
       XCTFail("closure adapter must round-trip the same result as resolve()")
@@ -301,7 +408,7 @@ final class LaunchSpecResolverTests: XCTestCase {
     )
 
     let closure: HelperExportedAPI.LaunchSpecResolver = resolver.asClosure
-    guard case .success(let spec) = closure(ProfileStore.defaultProfileID) else {
+    guard case .success(let spec) = closure(ProfileStore.defaultProfileID, nil) else {
       return XCTFail("seeded default profile must resolve successfully through asClosure")
     }
     XCTAssertEqual(spec.inferletNameAtVersion, "chat-apc@0.1.0")
@@ -1248,6 +1355,25 @@ final class LaunchSpecResolverTests: XCTestCase {
     try toml.write(to: profiles.appendingPathComponent("chat.toml"),
                    atomically: true, encoding: .utf8)
     let active = tempDir.appendingPathComponent("active-profile", isDirectory: false)
+    let store = ProfileStore(directory: profiles, activeProfileURL: active)
+    try store.start()
+    return store
+  }
+
+  /// A profile whose `model` key is omitted — the explicit no-default state
+  /// (#452) a model delete leaves behind. Mirrors `makeStoreWithModel` but
+  /// without the `model =` line.
+  private func makeNoDefaultStore(inferlet: String) throws -> ProfileStore {
+    let profiles = tempDir.appendingPathComponent("profiles-no-default-store", isDirectory: true)
+    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
+    let toml = """
+    id = "chat"
+    name = "Chat"
+    inferlet = "\(inferlet)"
+    """
+    try toml.write(to: profiles.appendingPathComponent("chat.toml"),
+                   atomically: true, encoding: .utf8)
+    let active = tempDir.appendingPathComponent("active-profile-no-default-store", isDirectory: false)
     let store = ProfileStore(directory: profiles, activeProfileURL: active)
     try store.start()
     return store

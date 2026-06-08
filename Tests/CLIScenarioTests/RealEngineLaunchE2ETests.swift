@@ -298,7 +298,7 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
       subprocessEnvironment: { SpawnEnvSanitizer.sanitize(ProcessInfo.processInfo.environment) }
     )
     var spec: PieControlLauncher.LaunchSpec
-    switch resolver.asClosure("chat") {
+    switch resolver.asClosure("chat", nil) {
     case .success(let s): spec = s
     case .failure(let err):
       store.stop()

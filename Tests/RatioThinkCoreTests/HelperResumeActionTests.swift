@@ -44,7 +44,7 @@ final class HelperResumeActionTests: XCTestCase {
     let outcome = HelperResumeAction.run(
       engineHost: makeEngineHost(),
       profileStore: nil,
-      resolver: { _ in .success(self.makeSpec(profileID: "chat")) }
+      resolver: { _, _ in .success(self.makeSpec(profileID: "chat")) }
     )
     XCTAssertEqual(outcome, .profileStoreMissing)
   }
@@ -73,7 +73,7 @@ final class HelperResumeActionTests: XCTestCase {
     let outcome = HelperResumeAction.run(
       engineHost: engineHost,
       profileStore: store,
-      resolver: { _ in
+      resolver: { _, _ in
         resolverCalls.increment()
         return .success(self.makeSpec(profileID: "chat"))
       }
@@ -97,7 +97,7 @@ final class HelperResumeActionTests: XCTestCase {
     let store = try makeStoreWithChatProfile(active: "ghost")
     defer { store.stop() }
     let resolverCalls = AtomicCounter()
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { id in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, _ in
       resolverCalls.increment()
       return .failure(EngineError(code: .profileMissing,
                                   message: "no profile with id=\(id)"))
@@ -159,7 +159,7 @@ final class HelperResumeActionTests: XCTestCase {
     let outcome = HelperResumeAction.run(
       engineHost: makeEngineHost(),
       profileStore: store,
-      resolver: { _ in .success(self.makeSpec(profileID: "chat")) }
+      resolver: { _, _ in .success(self.makeSpec(profileID: "chat")) }
     )
     if case .activeProfileUnreadableAfterRetry(let err) = outcome {
       if case .activeProfileReadFailed = err {
@@ -210,7 +210,7 @@ final class HelperResumeActionTests: XCTestCase {
     let fakeBin = try writeFakePie(port: 52525)
     let engineHost = makeEngineHost()
     defer { engineHost.stop() }
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { id in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, _ in
       .success(self.makeSpec(profileID: id))
     }
     let outcome = HelperResumeAction.run(
@@ -258,7 +258,7 @@ final class HelperResumeActionTests: XCTestCase {
 
     let engineHost = makeEngineHost()
     defer { engineHost.stop() }
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { _ in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { _, _ in
       XCTFail("resolver must not be invoked when retry heals to absent")
       return .failure(EngineError(code: .profileMissing, message: "unreachable"))
     }
@@ -282,7 +282,7 @@ final class HelperResumeActionTests: XCTestCase {
     defer { engineHost.stop() }
 
     let resolverCalls = AtomicCounter()
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { id in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, _ in
       resolverCalls.increment()
       return .success(self.makeSpec(profileID: id))
     }
@@ -316,7 +316,7 @@ final class HelperResumeActionTests: XCTestCase {
     let outcome = HelperResumeAction.run(
       engineHost: engineHost,
       profileStore: store,
-      resolver: { _ in .failure(err) }
+      resolver: { _, _ in .failure(err) }
     )
     XCTAssertEqual(outcome, .resolverFailed(err))
     XCTAssertEqual(engineHost.status, .failed(code: .spawnFailed, message: err.message),
@@ -337,7 +337,7 @@ final class HelperResumeActionTests: XCTestCase {
     let outcome = HelperResumeAction.run(
       engineHost: engineHost,
       profileStore: store,
-      resolver: { _ in .failure(err) }
+      resolver: { _, _ in .failure(err) }
     )
 
     XCTAssertEqual(outcome, .resolverFailed(err))
@@ -355,7 +355,7 @@ final class HelperResumeActionTests: XCTestCase {
     let outcome = HelperResumeAction.run(
       engineHost: engineHost,
       profileStore: store,
-      resolver: { _ in .failure(err) }
+      resolver: { _, _ in .failure(err) }
     )
 
     XCTAssertEqual(outcome, .resolverFailed(err))
@@ -372,7 +372,7 @@ final class HelperResumeActionTests: XCTestCase {
     let engineHost = makeEngineHost()
     defer { engineHost.stop() }
 
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { id in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, _ in
       .success(self.makeSpec(profileID: id))
     }
     // First resume drives supervisor to .running.
@@ -413,7 +413,7 @@ final class HelperResumeActionTests: XCTestCase {
     // `.started(profileID:)` outcome reflects the resolved selection.
     let before = HelperResumeAction.run(
       engineHost: makeEngineHost(), profileStore: store,
-      resolver: { id in .success(self.makeSpec(profileID: id)) }
+      resolver: { id, _ in .success(self.makeSpec(profileID: id)) }
     )
     XCTAssertEqual(before, .started(profileID: "chat"),
                    "Resume must start the active-profile marker (chat)")
@@ -424,7 +424,7 @@ final class HelperResumeActionTests: XCTestCase {
 
     let after = HelperResumeAction.run(
       engineHost: makeEngineHost(), profileStore: store,
-      resolver: { id in .success(self.makeSpec(profileID: id)) }
+      resolver: { id, _ in .success(self.makeSpec(profileID: id)) }
     )
     XCTAssertEqual(after, .started(profileID: "beta"),
                    "after a swap updates the active-profile marker, the menu-icon start must launch the NEW profile, not the old one")

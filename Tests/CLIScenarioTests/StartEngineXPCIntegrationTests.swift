@@ -738,7 +738,7 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       }
       timer.resume()
 
-      api.startEngine(profileID: profileID) { successData, errorData in
+      api.startEngine(profileID: profileID, modelOverride: nil) { successData, errorData in
         timer.cancel()
         guard resumed.markIfPending() else { return }
         do {

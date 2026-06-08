@@ -65,14 +65,17 @@ final class EngineStatusStoreTests: XCTestCase {
     // #326: capture startEngine calls + let tests inject a result.
     private(set) var startCalls = 0
     private(set) var lastStartProfileID: String?
+    // #459: capture the explicit per-start model override threaded through.
+    private(set) var lastStartModelOverride: String?
     private var startResult: Result<Void, Error> = .success(())
     func setStartResult(_ result: Result<Void, Error>) {
       lock.withLock { startResult = result }
     }
-    func startEngine(profileID: String) async throws {
+    func startEngine(profileID: String, modelOverride: String?) async throws {
       let result: Result<Void, Error> = lock.withLock {
         startCalls += 1
         lastStartProfileID = profileID
+        lastStartModelOverride = modelOverride
         return startResult
       }
       try result.get()
@@ -128,6 +131,21 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(client.startCalls, 1,
                    "startEngine must forward to the helper XPC client")
     XCTAssertEqual(client.lastStartProfileID, "chat")
+    XCTAssertNil(client.lastStartModelOverride,
+                 "no override given → nil so the helper boots the profile default")
+  }
+
+  /// #459 repro 1: the explicit toolbar / model-list pick must reach the
+  /// helper as `modelOverride` so a no-default profile boots the chosen
+  /// model instead of failing with `has no default model`.
+  func test_startEngine_forwards_explicit_modelOverride() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client)
+    try await store.startEngine(profileID: "tree-of-thought",
+                                modelOverride: "Org/New-GGUF/new.gguf")
+    XCTAssertEqual(client.lastStartProfileID, "tree-of-thought")
+    XCTAssertEqual(client.lastStartModelOverride, "Org/New-GGUF/new.gguf",
+                   "the explicit pick must be threaded through to the helper start call")
   }
 
   func test_startEngine_propagates_real_failure() async {

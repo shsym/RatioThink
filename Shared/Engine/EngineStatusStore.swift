@@ -311,9 +311,14 @@ public final class EngineStatusStore: ObservableObject {
   /// is in flight — so `.replyTimeout` is swallowed. A real helper
   /// `EngineError` (resolver rejected, still `.modelMissing`, etc.)
   /// propagates so the UI can surface the reason.
-  public func startEngine(profileID: String) async throws {
+  ///
+  /// `modelOverride` is the explicit per-start model selection (chat
+  /// toolbar / model-list pick). Non-nil boots that model regardless of the
+  /// profile's persisted default, so a no-default profile starts cleanly
+  /// from an explicit pick (#459 repro 1).
+  public func startEngine(profileID: String, modelOverride: String? = nil) async throws {
     do {
-      try await client.startEngine(profileID: profileID)
+      try await client.startEngine(profileID: profileID, modelOverride: modelOverride)
     } catch let error as AppXPCClientError {
       if case .replyTimeout = error {
         Self.log.notice("startEngine(profileID=\(profileID, privacy: .public)) reply timed out — start in flight; status poll will surface the outcome")

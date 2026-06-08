@@ -491,7 +491,7 @@ private struct PinnedRunningXPCClient: AppXPCClient {
   // The pinned harness has no Helper to launch an engine; the engine is
   // already pinned `.running`, so a start is a no-op success (mirrors
   // `stopEngine`).
-  func startEngine(profileID: String) async throws {}
+  func startEngine(profileID: String, modelOverride: String?) async throws {}
   func restartEngine(profileID: String) async throws {}
 }
 #endif

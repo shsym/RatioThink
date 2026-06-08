@@ -99,7 +99,16 @@ public protocol PieHelperXPC {
 
   /// On success `successData` decodes to `EnginePort`; on failure
   /// `errorData` decodes to `EngineError`. Exactly one is non-nil.
+  ///
+  /// `modelOverride` is the caller's explicit per-start model selection
+  /// (the chat toolbar / model-list pick). When non-nil it is the boot
+  /// model, overriding the profile's persisted default so a no-default
+  /// profile can be started by an explicit pick (#459 repro 1). `nil`
+  /// boots the profile default. Threaded in the same call as `profileID`
+  /// so it stays race-free against the helper's own FS-watched
+  /// `ProfileStore` (which may not yet have observed an App-side write).
   func startEngine(profileID: String,
+                   modelOverride: String?,
                    reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
 
   /// Strict active-profile rebuild. Same reply tuple as `startEngine`,

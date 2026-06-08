@@ -33,7 +33,13 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// `PieSupervisor.LaunchSpec` (whose argv + handshake parser no
   /// longer match the `pie` binary). `LaunchSpecResolver
   /// .asClosure` is the canonical adapter.
-  public typealias LaunchSpecResolver = (String) -> Result<PieControlLauncher.LaunchSpec, EngineError>
+  ///
+  /// Second argument is the optional per-start `explicitModel` (#459 repro
+  /// 1) — the chat toolbar / model-list selection that overrides the
+  /// profile's persisted default for this boot. `nil` uses the profile
+  /// default. `startEngine` threads it; `restartEngine` passes `nil` (its
+  /// route always boots the freshly-saved profile default).
+  public typealias LaunchSpecResolver = (String, String?) -> Result<PieControlLauncher.LaunchSpec, EngineError>
 
   /// Pre-encoded `EngineStatus.stopped` reply. Encoded at type
   /// initialization so `engineStatus`'s success path is provably
@@ -327,6 +333,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// is self-cancelling via the token argument from
   /// `PieEngineHost.observe` (review v1 F3) — no tokenBox race.
   public func startEngine(profileID: String,
+                          modelOverride: String?,
                           reply: @escaping (Data?, Data?) -> Void) {
     guard let engineHost else {
       Self.log.error("startEngine: no engineHost wired (early boot or unit test)")
@@ -334,6 +341,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       return
     }
     guard let spec = resolveLaunchSpec(profileID: profileID,
+                                       explicitModel: modelOverride,
                                        engineHost: engineHost,
                                        operation: "startEngine",
                                        reply: reply) else {
@@ -445,6 +453,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
 
   private func resolveLaunchSpec(
     profileID: String,
+    explicitModel: String? = nil,
     engineHost: PieEngineHost,
     operation: String,
     reply: @escaping (Data?, Data?) -> Void
@@ -458,7 +467,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       )
       return nil
     }
-    switch launchSpecResolver(profileID) {
+    switch launchSpecResolver(profileID, explicitModel) {
     case .success(let spec):
       return spec
     case .failure(let err):
@@ -947,6 +956,7 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   }
 
   public func startEngine(profileID: String,
+                          modelOverride: String?,
                           reply: @escaping (Data?, Data?) -> Void) {
     Self.log.error("startEngine refused in degraded mode (profileID=\(profileID, privacy: .public))")
     reply(nil, degradedErrorData)

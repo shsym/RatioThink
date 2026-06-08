@@ -18,7 +18,7 @@ final class AppQuitCoordinatorTests: XCTestCase {
     func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
     func engineStatus() async throws -> EngineStatus { .stopped }
     func stopEngine() async throws {}
-    func startEngine(profileID: String) async throws {}
+    func startEngine(profileID: String, modelOverride: String?) async throws {}
     func restartEngine(profileID: String) async throws {}
     func quitHelper() async throws {
       quitCount += 1

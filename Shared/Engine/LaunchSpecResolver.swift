@@ -151,7 +151,7 @@ public struct LaunchSpecResolver {
   /// Captures `self` so the helper can hold the closure for the
   /// lifetime of the XPC listener.
   public var asClosure: HelperExportedAPI.LaunchSpecResolver {
-    { id in self.resolveLauncherSpec(profileID: id) }
+    { id, explicitModel in self.resolveLauncherSpec(profileID: id, explicitModel: explicitModel) }
   }
 
   /// Legacy adapter that still returns the stale `PieSupervisor
@@ -168,7 +168,20 @@ public struct LaunchSpecResolver {
   /// shmem name. The launcher's `writeConfig` then emits a
   /// production TOML with `[model.driver] type = "portable"` and
   /// `hf_path` pointed at the on-disk model the operator selected.
-  public func resolveLauncherSpec(profileID: String) -> Result<PieControlLauncher.LaunchSpec, EngineError> {
+  ///
+  /// `explicitModel` is the user's per-start model selection (the chat
+  /// toolbar / model-list pick, `viewModel.modelOverride`). When present it
+  /// is the boot model, overriding `profile.model` — #459 repro 1: a
+  /// no-default profile is started by an explicit pick the helper must honor
+  /// even though the profile carries no default. v1 pie loads the model at
+  /// `pie serve` boot from this spec, so the engine has to be told which
+  /// model to serve here; an override that only lived in App state would
+  /// never reach the boot config. Threading it in the same XPC call as the
+  /// profile id keeps it race-free against the helper's own FS-watched
+  /// `ProfileStore` (which may not yet have observed an App-side default
+  /// write). `nil`/blank falls back to the profile's persisted default.
+  public func resolveLauncherSpec(profileID: String,
+                                  explicitModel: String? = nil) -> Result<PieControlLauncher.LaunchSpec, EngineError> {
     guard let profile = lookup(profileID: profileID) else {
       return .failure(EngineError(
         code: .profileMissing,
@@ -180,8 +193,8 @@ public struct LaunchSpecResolver {
     // can't select them, but a stale or hand-authored profile could still
     // name one — fail fast with a clear reason instead of handing the
     // engine a shard it cannot load.
-    guard let model = profile.model,
-          !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+    guard let model = Self.effectiveModel(explicitModel: explicitModel,
+                                          profileModel: profile.model) else {
       return .failure(Self.noDefaultModelError(profile: profile))
     }
     let modelLeaf = model.split(separator: "/").last.map(String.init) ?? model
@@ -214,7 +227,7 @@ public struct LaunchSpecResolver {
     case .failure(let err):  return .failure(err)
     }
     let modelRef: String
-    switch resolveModelRef(profile: profile, modelsRoot: models) {
+    switch resolveModelRef(model: model, profile: profile, modelsRoot: models) {
     case .success(let resolved): modelRef = resolved
     case .failure(let err):      return .failure(err)
     }
@@ -258,13 +271,13 @@ public struct LaunchSpecResolver {
     }
   }
 
-  private func resolveModelRef(profile: Profile,
+  /// `model` is the already-resolved boot slug (`explicitModel ?? profile
+  /// .model`) — see `resolveLauncherSpec`. `profile` is kept only for the
+  /// error/diagnostic context.
+  private func resolveModelRef(model: String,
+                               profile: Profile,
                                modelsRoot: URL,
                                fileManager: FileManager = .default) -> Result<String, EngineError> {
-    guard let model = profile.model,
-          !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-      return .failure(Self.noDefaultModelError(profile: profile))
-    }
     let localPath = Self.joinModelPath(modelsRoot: modelsRoot, slug: model)
     switch Self.validateAppStagedModel(at: localPath, fileManager: fileManager) {
     case .success(true):
@@ -285,6 +298,7 @@ public struct LaunchSpecResolver {
     case .failure(let problem):
       return .failure(Self.modelMissingError(
         profile: profile,
+        model: model,
         appPath: localPath,
         appPathProblem: problem.reason,
         hfIdentity: Self.hfIdentity(forModelSlug: model),
@@ -315,6 +329,7 @@ public struct LaunchSpecResolver {
       case .invalid(let problem):
         return .failure(Self.modelMissingError(
           profile: profile,
+          model: model,
           appPath: localPath,
           hfIdentity: hfIdentity,
           hfHome: hfCacheRoot,
@@ -325,6 +340,7 @@ public struct LaunchSpecResolver {
 
     return .failure(Self.modelMissingError(
       profile: profile,
+      model: model,
       appPath: localPath,
       hfIdentity: hfIdentity,
       hfHome: hfCacheRoot
@@ -388,14 +404,32 @@ public struct LaunchSpecResolver {
     return .success(true)
   }
 
+  /// Effective boot model: the user's explicit per-start selection when
+  /// present (blank/whitespace ignored), otherwise the profile's persisted
+  /// default. `nil` means neither is set → `noDefaultModelError`. Returns the
+  /// chosen value verbatim (not trimmed) so the on-disk slug path is
+  /// preserved exactly as the picker/profile recorded it.
+  static func effectiveModel(explicitModel: String?, profileModel: String?) -> String? {
+    if let e = explicitModel,
+       !e.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      return e
+    }
+    if let p = profileModel,
+       !p.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      return p
+    }
+    return nil
+  }
+
   private static func modelMissingError(profile: Profile,
+                                        model: String,
                                         appPath: String,
                                         appPathProblem: String? = nil,
                                         hfIdentity: (repo: String, file: String?)?,
                                         hfHome: URL,
                                         hfProblem: HFCacheResolver.CacheProblem? = nil) -> EngineError {
     var parts = [
-      "model missing for profile \(profile.id.debugDescription): \((profile.model ?? "<none>").debugDescription)",
+      "model missing for profile \(profile.id.debugDescription): \(model.debugDescription)",
       "checked app-staged path \(appPath)",
     ]
     if let appPathProblem {

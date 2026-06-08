@@ -132,7 +132,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
 
     let exp = expectation(description: "startEngine reply")
     var captured: Result<EnginePort, EngineError>?
-    api.startEngine(profileID: "chat") { successData, errorData in
+    api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
       )
@@ -148,11 +148,11 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
   func test_startEngine_withResolver_returnsPortOnHandshake() throws {
     let host = PieEngineHost(launcher: Self.makeLauncher(port: 31415))
     let spec = makeSpec(profileID: "chat")
-    let api = HelperExportedAPI(engineHost: host, launchSpecResolver: { _ in .success(spec) })
+    let api = HelperExportedAPI(engineHost: host, launchSpecResolver: { _, _ in .success(spec) })
 
     let exp = expectation(description: "startEngine reply")
     var captured: Result<EnginePort, EngineError>?
-    api.startEngine(profileID: "chat") { successData, errorData in
+    api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
       )
@@ -173,13 +173,13 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     let spec = makeSpec(profileID: "tree-of-thought")
     let api = HelperExportedAPI(
       engineHost: host,
-      launchSpecResolver: { _ in .success(spec) },
+      launchSpecResolver: { _, _ in .success(spec) },
       replyTimeoutOverride: (start: 0.2, stop: 0.3)
     )
 
     let exp = expectation(description: "startEngine success reply before fallback")
     var captured: Result<EnginePort, EngineError>?
-    api.startEngine(profileID: "tree-of-thought") { successData, errorData in
+    api.startEngine(profileID: "tree-of-thought", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
       )
@@ -214,19 +214,19 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
       return (port: EnginePort(41414), session: FakeSession())
     })
     let spec = makeSpec(profileID: "tree-of-thought")
-    let api = HelperExportedAPI(engineHost: host, launchSpecResolver: { _ in .success(spec) })
+    let api = HelperExportedAPI(engineHost: host, launchSpecResolver: { _, _ in .success(spec) })
 
     let first = expectation(description: "first startEngine reply")
     let second = expectation(description: "second startEngine reply")
     var firstResult: Result<EnginePort, EngineError>?
     var secondResult: Result<EnginePort, EngineError>?
-    api.startEngine(profileID: "tree-of-thought") { successData, errorData in
+    api.startEngine(profileID: "tree-of-thought", modelOverride: nil) { successData, errorData in
       firstResult = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
       )
       first.fulfill()
     }
-    api.startEngine(profileID: "tree-of-thought") { successData, errorData in
+    api.startEngine(profileID: "tree-of-thought", modelOverride: nil) { successData, errorData in
       secondResult = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
       )
@@ -257,13 +257,13 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     let spec = makeSpec(profileID: "chat", handshakeTimeout: 1.0)
     let api = HelperExportedAPI(
       engineHost: host,
-      launchSpecResolver: { _ in .success(spec) },
+      launchSpecResolver: { _, _ in .success(spec) },
       replyTimeoutOverride: (start: 0.2, stop: 0.3)
     )
 
     let exp = expectation(description: "startEngine XPC fallback reply")
     var captured: Result<EnginePort, EngineError>?
-    api.startEngine(profileID: "chat") { successData, errorData in
+    api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
       )
@@ -292,11 +292,11 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
   func test_startEngine_propagatesHostFailure() throws {
     let host = PieEngineHost(launcher: Self.makeFailingLauncher(message: "fake spawn boom"))
     let spec = makeSpec(profileID: "chat")
-    let api = HelperExportedAPI(engineHost: host, launchSpecResolver: { _ in .success(spec) })
+    let api = HelperExportedAPI(engineHost: host, launchSpecResolver: { _, _ in .success(spec) })
 
     let exp = expectation(description: "startEngine reply")
     var captured: Result<EnginePort, EngineError>?
-    api.startEngine(profileID: "chat") { successData, errorData in
+    api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
       )
@@ -318,7 +318,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     })
     let api = HelperExportedAPI(
       engineHost: host,
-      launchSpecResolver: { _ in
+      launchSpecResolver: { _, _ in
         .failure(EngineError(
           code: .memoryRisk,
           message: "memory risk: oversized model; choose a smaller model"
@@ -328,7 +328,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
 
     let exp = expectation(description: "startEngine memory-risk reply")
     var captured: Result<EnginePort, EngineError>?
-    api.startEngine(profileID: "chat") { successData, errorData in
+    api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
       )
@@ -401,10 +401,10 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
         : (port: EnginePort(22222), session: secondSession)
     })
     let spec = makeSpec(profileID: "chat")
-    let api = HelperExportedAPI(engineHost: host, launchSpecResolver: { _ in .success(spec) })
+    let api = HelperExportedAPI(engineHost: host, launchSpecResolver: { _, _ in .success(spec) })
 
     let startExp = expectation(description: "initial start reply")
-    api.startEngine(profileID: "chat") { _, _ in startExp.fulfill() }
+    api.startEngine(profileID: "chat", modelOverride: nil) { _, _ in startExp.fulfill() }
     wait(for: [startExp], timeout: 2)
     waitForRunning(host, timeout: 2)
 
@@ -471,13 +471,13 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     let spec = makeSpec(profileID: "chat")
     let api = HelperExportedAPI(
       engineHost: host,
-      launchSpecResolver: { _ in .success(spec) },
+      launchSpecResolver: { _, _ in .success(spec) },
       replyTimeoutOverride: (start: 0.3, stop: 0.3)
     )
     let baseline = host.observerCountForTesting
     let exp = expectation(description: "startEngine reply (deterministic fallback)")
     var captured: Result<EnginePort, EngineError>?
-    api.startEngine(profileID: "chat") { successData, errorData in
+    api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
       )
@@ -510,12 +510,12 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     let spec = makeSpec(profileID: "chat", handshakeTimeout: 0.2)
     let api = HelperExportedAPI(
       engineHost: host,
-      launchSpecResolver: { _ in .success(spec) },
+      launchSpecResolver: { _, _ in .success(spec) },
       replyTimeoutOverride: (start: 5, stop: 0.3)
     )
     let replyExp = expectation(description: "startEngine reply (host launch timeout)")
     var captured: Result<EnginePort, EngineError>?
-    api.startEngine(profileID: "chat") { successData, errorData in
+    api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
       )
@@ -553,11 +553,11 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     let spec = makeSpec(profileID: "chat")
     let api = HelperExportedAPI(
       engineHost: host,
-      launchSpecResolver: { _ in .success(spec) },
+      launchSpecResolver: { _, _ in .success(spec) },
       replyTimeoutOverride: (start: 5, stop: 0.3)
     )
     let startExp = expectation(description: "engine running")
-    api.startEngine(profileID: "chat") { _, _ in startExp.fulfill() }
+    api.startEngine(profileID: "chat", modelOverride: nil) { _, _ in startExp.fulfill() }
     wait(for: [startExp], timeout: 8)
 
     let baseline = host.observerCountForTesting

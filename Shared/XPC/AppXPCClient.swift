@@ -41,7 +41,13 @@ public protocol AppXPCClient: Sendable {
   /// when the start is rejected (e.g. `.modelMissing`, `.profileMissing`),
   /// or an `AppXPCClientError` on transport failure. Driven by #326's
   /// fresh-install auto-start.
-  func startEngine(profileID: String) async throws
+  ///
+  /// `modelOverride` is the explicit per-start model selection (the chat
+  /// toolbar / model-list pick). Non-nil boots that model, overriding the
+  /// profile default so a no-default profile starts cleanly from an explicit
+  /// pick (#459 repro 1); `nil` boots the profile default. Callers with no
+  /// override use the `startEngine(profileID:)` convenience below.
+  func startEngine(profileID: String, modelOverride: String?) async throws
   /// Strict restart for active-profile default-model changes. Unlike
   /// `startEngine(profileID:)`, `.alreadyRunning` is a failure signal:
   /// the helper did not complete a stop→start registry rebuild.
@@ -57,6 +63,13 @@ public protocol AppXPCClient: Sendable {
 }
 
 public extension AppXPCClient {
+  /// Convenience for the common no-override start (boot the profile
+  /// default). Keeps existing call sites unchanged after `startEngine`
+  /// gained the `modelOverride` parameter (#459).
+  func startEngine(profileID: String) async throws {
+    try await startEngine(profileID: profileID, modelOverride: nil)
+  }
+
   /// Default: memory unavailable. Test stubs that don't model the
   /// engineMemory selector inherit nil and need no change.
   func engineMemory() async throws -> EngineMemorySample? { nil }
@@ -443,10 +456,10 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
     }
   }
 
-  public func startEngine(profileID: String) async throws {
+  public func startEngine(profileID: String, modelOverride: String?) async throws {
     let connection = ensureConnection()
     do {
-      try await startEngine(profileID: profileID, on: connection)
+      try await startEngine(profileID: profileID, modelOverride: modelOverride, on: connection)
     } catch let error as AppXPCClientError {
       if case .replyTimeout = error {
         invalidateIfCurrent(connection)
@@ -455,7 +468,9 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
     }
   }
 
-  private func startEngine(profileID: String, on connection: NSXPCConnection) async throws {
+  private func startEngine(profileID: String,
+                           modelOverride: String?,
+                           on connection: NSXPCConnection) async throws {
     let timeout = replyTimeout
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
@@ -486,7 +501,7 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
         resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
         return
       }
-      api.startEngine(profileID: profileID) { successData, errorData in
+      api.startEngine(profileID: profileID, modelOverride: modelOverride) { successData, errorData in
         // Contract (PieHelperXPC): exactly one of (successData=EnginePort,
         // errorData=EngineError) is non-nil. We discard the port — the
         // caller relies on the engine-status poll for the live `.running`

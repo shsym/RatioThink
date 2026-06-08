@@ -373,7 +373,7 @@ final class EngineDeathRecoveryTests: XCTestCase {
     // across the auto + user-Resume paths.
     let canonicalSpec = makeSpec(profileID: "chat")
     let resolverInvocations = OSAllocatedUnfairLock<[String]>(initialState: [])
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { id in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, _ in
       resolverInvocations.withLock { $0.append(id) }
       return .success(canonicalSpec)
     }

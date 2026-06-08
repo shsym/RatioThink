@@ -173,10 +173,19 @@ struct ChatScaffoldView: View {
   /// `engineActionError` (PR#15 F3) — never the persistence banner.
   private func startEngineForSelectedProfile() {
     let profileID = viewModel.selectedProfileID
+    // Honor an explicit toolbar / model-list pick as the boot model (#459
+    // repro 1). v1 pie loads the model at `pie serve` boot from the profile,
+    // so a per-chat override that only lives in App state would never reach
+    // the engine — a no-default profile would fail with `has no default
+    // model` despite the user having chosen one. Thread the override in the
+    // start call so the helper boots it without depending on the profile
+    // default (race-free against the helper's own profile store). A blank
+    // override falls back to the profile default.
+    let modelOverride = viewModel.modelOverride
     Task { @MainActor in
       do {
         engineActionError = nil
-        try await engineStatusStore.startEngine(profileID: profileID)
+        try await engineStatusStore.startEngine(profileID: profileID, modelOverride: modelOverride)
       } catch {
         engineActionError = Self.engineErrorMessage(error, verb: "start")
       }
