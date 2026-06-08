@@ -242,9 +242,9 @@
       facts:[["Serves","/healthz · /v1/models · /v1/chat/completions · /v1/inferlet"],
              ["APC","Adaptive Personality/Capability decoders. Reasoning active; the tool-use decoder is fully implemented (emits OpenAI tool_calls when a request supplies a tools array) but the v1 app never sends tools, so it stays dormant in the shipping product."],
              ["Note","ONE inferlet for both planes — there is no separate pie-control inferlet"]],
-      calls:["<b>Route:</b> lib.rs match (method, path) → chat::completions::handle / control::{health,models,load}",
+      calls:["<b>Route:</b> lib.rs match (method, path) → chat::completions::handle / control::{health,models}",
              "<b>Install:</b> wasm staged via Shared/InferletResources, uploaded by PieControlClient.installProgram + launchDaemon"],
-      files:["Inferlets/chat-apc/src/lib.rs","src/chat/completions.rs","src/chat/apc.rs","src/control/load.rs"]}
+      files:["Inferlets/chat-apc/src/lib.rs","src/chat/completions.rs","src/chat/apc.rs"]}
   };
 
   var EDGES = {

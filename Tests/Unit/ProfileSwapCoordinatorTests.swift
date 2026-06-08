@@ -486,6 +486,24 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
                     "a resolver-reject the status poll won't reflect must be surfaced")
   }
 
+  func test_secondPick_clearsPriorServeModelError_synchronously() async {
+    // review v2 F2: the error dismissal must run SYNCHRONOUSLY at the pick,
+    // not inside the async serve `Task` — otherwise two rapid picks race over
+    // the surfaced error. Surface an error from pick 1, then issue pick 2 and
+    // assert the prior error is gone the instant `loadDirect` returns. Pick 2
+    // keeps failing, so the ONLY way the error can be nil at this point is the
+    // synchronous clear (the async catch would re-set it, never clear it).
+    let (coord, spy) = makeServeRoutingCoordinator(map: [:], resident: "m1")
+    spy.errorToThrow = StubWriteError()
+    coord.loadDirect(modelID: "m2", profileID: "chat")
+    await waitUntil(timeout: 2.0) { coord.serveModelError != nil }
+    XCTAssertNotNil(coord.serveModelError, "precondition: pick 1 surfaced an error")
+
+    coord.loadDirect(modelID: "m3", profileID: "chat")
+    XCTAssertNil(coord.serveModelError,
+                 "pick 2 must clear the prior error synchronously, before its Task runs")
+  }
+
   // MARK: - helpers
 
   private func waitUntil(

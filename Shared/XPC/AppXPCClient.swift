@@ -5,8 +5,8 @@ import os
 /// `PieHelperXPC` interface. Exposes the selectors the GUI drives:
 /// `engineStatus()` (derives `HTTPEngineClient.baseURL`), `stopEngine()`
 /// (Unload), and `startEngine(profileID:)` (#326 fresh-install
-/// auto-start). The remaining `PieHelperXPC` selectors (loadModel,
-/// downloadModel, …) are still reached via direct `NSXPCConnection` use
+/// auto-start). The remaining `PieHelperXPC` selectors (downloadModel,
+/// restartEngine, …) are still reached via direct `NSXPCConnection` use
 /// in their own subsystems; they get folded behind this client only when
 /// a GUI caller needs them, keeping the surface narrow.
 ///

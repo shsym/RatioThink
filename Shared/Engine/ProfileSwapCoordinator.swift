@@ -460,9 +460,15 @@ public final class ProfileSwapCoordinator: ObservableObject {
   /// (the endpoint is gone). A thrown executor failure the status poll won't
   /// reflect (a resolver reject) surfaces via `serveModelError`.
   private func startLoad(modelID: String, profileID: String) {
+    // Clear synchronously BEFORE spawning the Task (review v2 F2): if the clear
+    // rode inside the async Task, two rapid picks could interleave — pick 2's
+    // clear wiping pick 1's surfaced error, or pick 1's late failure
+    // resurrecting after pick 2 already succeeded. A synchronous clear at the
+    // call point makes the dismissal deterministic; only the failure assignment
+    // stays inside the Task.
+    serveModelError = nil
     Task { @MainActor in
       do {
-        serveModelError = nil
         try await serveModel(modelID, profileID)
       } catch {
         serveModelError = "Couldn’t load \(modelID): \(error)"

@@ -245,7 +245,7 @@ final class XPCProtocolTests: XCTestCase {
     }
   }
 
-  // MARK: - Optional-error reply convention (cancelLoad/cancelDownload/reloadProfiles)
+  // MARK: - Optional-error reply convention (cancelDownload/reloadProfiles)
 
   func test_decodeOptionalError_nil_returns_nil() throws {
     XCTAssertNil(try PieHelperXPCWire.decodeOptionalError(nil))

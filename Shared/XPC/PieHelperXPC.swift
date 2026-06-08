@@ -48,7 +48,7 @@ public struct HelperIdentity: Codable, Equatable, Sendable {
 ///
 /// The selectors are `@objc` because `NSXPCConnection` builds proxies via
 /// the Objective-C runtime. Every Codable payload (`EngineStatus`,
-/// `LoadHandle`, `DownloadHandle`, `EngineError`, `[Profile]`-as-TOML…)
+/// `DownloadHandle`, `EngineError`, `[Profile]`-as-TOML…)
 /// crosses the boundary as a `Data` blob produced by `XPCPayload`. The
 /// blob-only wire keeps the protocol free of NSSecureCoding subclass
 /// gymnastics: only `Data`, `String`, and `FileHandle` traverse the
@@ -133,7 +133,6 @@ public protocol PieHelperXPC {
   /// real stop (review v1 F7).
   func stopEngine(reply: @escaping (_ errorData: Data?) -> Void)
 
-  /// On success `successData` decodes to `LoadHandle`; on rejection
   /// On success `successData` decodes to `DownloadHandle`; on rejection
   /// `errorData` decodes to `EngineError`. Reshape rationale: the prior
   /// `(Data) -> Void` shape forced stubs to synthesize a handle that
@@ -141,8 +140,8 @@ public protocol PieHelperXPC {
   func downloadModel(repo: String, file: String,
                      reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
 
-  /// `handle` is `XPCPayload.encode(DownloadHandle)`. Reply mirrors
-  /// `cancelLoad` — review F4.
+  /// `handle` is `XPCPayload.encode(DownloadHandle)`. Reply is the
+  /// optional-error convention (nil = accepted, else `EngineError`).
   func cancelDownload(handle: Data, reply: @escaping (_ errorData: Data?) -> Void)
 
   /// Reply data is `XPCPayload.encode([String])` where each element is
@@ -424,7 +423,7 @@ public enum PieHelperXPCWire {
     )
   }
 
-  /// Decode an optional-error reply (`cancelLoad`, `cancelDownload`,
+  /// Decode an optional-error reply (`cancelDownload`,
   /// `reloadProfiles`). Returns nil when the helper accepted the
   /// request, the decoded `EngineError` otherwise. Malformed non-nil
   /// bytes throw `.wireContractViolation` rather than leaking a raw
@@ -441,8 +440,8 @@ public enum PieHelperXPCWire {
 
   /// Generic helper for any `(Data?, Data?)` reply that encodes a
   /// Codable success type or an `EngineError`. Used by
-  /// `replyLoadModel` and `replyDownloadModel` so the F4 + F8 control
-  /// flow lives in one place.
+  /// `replyDownloadModel` so the F8 reply-reshape control flow lives in
+  /// one place.
   @usableFromInline
   internal static func _replyHandleOrError<T: Encodable>(
     _ result: Result<T, EngineError>,
