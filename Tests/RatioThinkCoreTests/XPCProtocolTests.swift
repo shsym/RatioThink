@@ -581,6 +581,15 @@ final class XPCProtocolTests: XCTestCase {
       + HelperExportedAPI.stopReplyDeadline
     XCTAssertLessThan(helperSerialWorstCase, HelperXPCClient.defaultRestartReplyTimeout,
                       "App restart wait must dominate the helper's serial stop+start budget (review F2: was 2s short)")
+    // #461: the plain-start App wait must likewise dominate the helper's start
+    // reply deadline. Pre-#461 `startEngine` used the 2s generic `replyTimeout`
+    // — far below the engine lease — so every cold large-model app start timed
+    // out and churned the shared connection while the helper was still booting.
+    XCTAssertLessThan(HelperExportedAPI.startReplyDeadline,
+                      HelperXPCClient.defaultStartReplyTimeout,
+                      "App plain-start wait must dominate the helper's start reply deadline (#461: was 2s, below the engine lease)")
+    XCTAssertGreaterThan(HelperXPCClient.defaultStartReplyTimeout, engineLease,
+                         "App plain-start wait must also sit above the engine launch lease so it never reports a premature failure for a still-booting engine (#461)")
   }
 
   // MARK: - helpers

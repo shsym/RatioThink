@@ -147,6 +147,7 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
   private let endpoint: Endpoint
   private let interface: NSXPCInterface
   private let replyTimeout: TimeInterval
+  private let startReplyTimeout: TimeInterval
   private let restartReplyTimeout: TimeInterval
   /// Persistent connection. `nil` means "not yet opened" or "torn
   /// down by invalidation/interruption — recreate on next call."
@@ -172,12 +173,35 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
     + HelperExportedAPI.stopReplyDeadline
     + HelperExportedAPI.replyTimeoutSlack
 
+  // Plain start (no preceding stop phase): the App wait must dominate the
+  // helper's start reply deadline (`HelperExportedAPI.startReplyDeadline`,
+  // which already sits above the engine's cold-boot launch lease) so the App
+  // never gives up — and churns the shared connection via `invalidateIfCurrent`
+  // — before the helper's own `startEngine` reply budget. The generic 2 s
+  // `replyTimeout` is the right deadline for cheap property-read selectors
+  // (engineStatus/identity/memory) but is far below a cold large-model start;
+  // `restartEngine` was derived from the helper deadlines in #459 review F2 yet
+  // its pure-start sibling was left on the 2 s default (#461). The menu/helper
+  // "Resume Engine" route has no XPC reply budget at all (it calls the
+  // in-process `PieEngineHost.start` and returns immediately, letting the
+  // host own the launch lease), so a start budget that dominates the host's
+  // lease is the App route's equivalent of "as reliable as Resume Engine".
+  /// App-side plain-start wait, derived from the helper's start reply deadline
+  /// plus slack so it always dominates the helper's `startEngine` budget
+  /// (#461). Named so the cross-layer timeout-ladder test asserts the real
+  /// value the init uses.
+  public static let defaultStartReplyTimeout: TimeInterval =
+    HelperExportedAPI.startReplyDeadline
+    + HelperExportedAPI.replyTimeoutSlack
+
   public init(endpoint: Endpoint,
               replyTimeout: TimeInterval = 2.0,
+              startReplyTimeout: TimeInterval = HelperXPCClient.defaultStartReplyTimeout,
               restartReplyTimeout: TimeInterval = HelperXPCClient.defaultRestartReplyTimeout) {
     self.endpoint = endpoint
     self.interface = PieHelperXPCInterface.make()
     self.replyTimeout = replyTimeout
+    self.startReplyTimeout = startReplyTimeout
     self.restartReplyTimeout = restartReplyTimeout
   }
 
@@ -501,7 +525,12 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
   private func startEngine(profileID: String,
                            modelOverride: String?,
                            on connection: NSXPCConnection) async throws {
-    let timeout = replyTimeout
+    // #461: a cold large-model start replies only after the launch handshake,
+    // so use the start-sized budget (dominates the helper's start reply
+    // deadline) — NOT the 2 s generic `replyTimeout` that `restartEngine`'s
+    // pure-start sibling was mistakenly left on. Below the helper's budget the
+    // App would always time out + invalidate the shared connection mid-start.
+    let timeout = startReplyTimeout
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
       func resumeOnce(_ result: Result<Void, Error>) {

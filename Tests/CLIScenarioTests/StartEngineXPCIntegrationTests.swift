@@ -215,6 +215,121 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     }
   }
 
+  // MARK: - #461: App-initiated start as reliable as helper/menu Resume
+
+  /// #461 core: the App route (`HelperXPCClient.startEngine` over a real
+  /// `NSXPCConnection`) must wait out a slow cold start and return the real
+  /// `.running` outcome, exactly as the in-process menu Resume does. The
+  /// derived `defaultStartReplyTimeout` dominates the helper's start reply
+  /// deadline; here both are scaled down deterministically (helper start
+  /// budget 4s via `replyTimeoutOverride`, App budget 3s) and the launcher
+  /// takes 0.5s — comfortably above the 2s the pure-start path used pre-#461.
+  func test_appRoute_startEngine_waitsOutSlowColdStart() async throws {
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+    let host = makeSlowEngineHost(port: 24700, delay: 0.5)
+    defer { host.stop() }
+
+    let exported = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: try makeChatResolver(store: store).asClosure,
+      replyTimeoutOverride: (start: 4, stop: 17)
+    )
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+
+    let client = HelperXPCClient(
+      endpoint: .listenerEndpoint(listenerOwner.endpoint),
+      startReplyTimeout: 3.0
+    )
+
+    // Must NOT throw: the App start budget (3s) sits above the launcher's 0.5s
+    // cold start, so the selector delivers the real terminal result. Pre-#461
+    // the 2s generic `replyTimeout` would not even be exercised here, but the
+    // production default (135s+slack) is what guarantees a real large-model
+    // boot is awaited rather than timed out at 2s.
+    try await client.startEngine(profileID: "chat", modelOverride: nil)
+    XCTAssertEqual(host.status, .running(port: 24700, profileID: "chat"),
+                   "App route must converge on the same .running state the host reached")
+  }
+
+  /// #461 acceptance 2: an App reply timeout (the App giving up early) must
+  /// NOT stop a still-starting engine — launch lifetime is host-owned. Models
+  /// the pre-#461 too-short budget by shrinking the App wait BELOW the
+  /// launcher delay; the App `startEngine` throws `.replyTimeout`, but the
+  /// engine must still reach `.running` on the host's own lease.
+  func test_appRoute_startReplyTimeout_doesNotStopStillStartingEngine() async throws {
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+    let host = makeSlowEngineHost(port: 24701, delay: 0.6)
+    defer { host.stop() }
+
+    let exported = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: try makeChatResolver(store: store).asClosure,
+      replyTimeoutOverride: (start: 4, stop: 17)
+    )
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+
+    // App budget 0.2s < 0.6s launcher delay → the App gives up before the
+    // engine finishes booting.
+    let client = HelperXPCClient(
+      endpoint: .listenerEndpoint(listenerOwner.endpoint),
+      startReplyTimeout: 0.2
+    )
+
+    do {
+      try await client.startEngine(profileID: "chat", modelOverride: nil)
+      XCTFail("App start budget below the launch delay must surface .replyTimeout")
+    } catch let error as AppXPCClientError {
+      guard case .replyTimeout = error else {
+        return XCTFail("expected .replyTimeout, got \(error)")
+      }
+    }
+
+    // The App gave up, but the host-owned launch must still complete: the
+    // reply timeout is NOT a lifetime lease and must never stop the engine.
+    try await pollHostUntilRunning(host, port: 24701, deadline: 3)
+  }
+
+  /// #461 acceptance 3: the App route and the menu/helper "Resume Engine"
+  /// route converge on the same final engine state for the same profile/model.
+  /// Same `ProfileStore` (activeProfile "chat") + same resolver feed both an
+  /// App-route start (over NSXPC) and a menu-route start
+  /// (`HelperResumeAction.run`, the in-process selector the status-bar Resume
+  /// click takes); both reach `.running(port, "chat")`.
+  func test_appRoute_and_menuResume_convergeOnSameRunningState() async throws {
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+    let resolver = try makeChatResolver(store: store)
+
+    // App route over the real NSXPC wire.
+    let appHost = makeSlowEngineHost(port: 24702, delay: 0.3)
+    defer { appHost.stop() }
+    let exported = HelperExportedAPI(engineHost: appHost,
+                                     launchSpecResolver: resolver.asClosure,
+                                     replyTimeoutOverride: (start: 4, stop: 17))
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+    let client = HelperXPCClient(endpoint: .listenerEndpoint(listenerOwner.endpoint),
+                                 startReplyTimeout: 3.0)
+    try await client.startEngine(profileID: "chat", modelOverride: nil)
+
+    // Menu/helper Resume route, in-process, same inputs.
+    let menuHost = makeSlowEngineHost(port: 24702, delay: 0.3)
+    defer { menuHost.stop() }
+    let outcome = HelperResumeAction.run(engineHost: menuHost,
+                                         profileStore: store,
+                                         resolver: resolver.asClosure)
+    XCTAssertEqual(outcome, .started(profileID: "chat"),
+                   "menu Resume must resolve the active profile and start it")
+    try await pollHostUntilRunning(menuHost, port: 24702, deadline: 3)
+
+    XCTAssertEqual(appHost.status, menuHost.status,
+                   "App-initiated start and menu Resume must converge on the same final engine state for the same profile/model")
+  }
+
   /// #448 quitHelper over the real NSXPC wire: a running engine is stopped
   /// (reaped) and the helper-self-terminate hook fires, with a nil (accepted)
   /// reply. Proves the full-product quit reaches `pie` through the Helper —
@@ -712,6 +827,53 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     PieEngineHost(launcher: { _ in
       return (port: port, session: FakeSession())
     })
+  }
+
+  /// `PieEngineHost` whose launcher sleeps `delay` before returning the
+  /// session — a deterministic stand-in for a slow cold large-model boot
+  /// (#461). The host stays `.starting` for `delay`, then reaches `.running`.
+  private func makeSlowEngineHost(port: EnginePort, delay: TimeInterval) -> PieEngineHost {
+    PieEngineHost(launcher: { _ in
+      try? await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
+      return (port: port, session: FakeSession())
+    })
+  }
+
+  /// Resolver over the freshly-created "chat" profile with a staged
+  /// fake-pie model + inferlet resources. Shared by the App route and the
+  /// menu Resume route so #461's convergence test feeds both identical inputs.
+  private func makeChatResolver(store: ProfileStore) throws -> LaunchSpecResolver {
+    let ignored = try writeCapabilityProbe(portable: true, metal: true)
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+    try Data("ignored".utf8).write(
+      to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false)
+    )
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    return LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { ignored },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] }
+    )
+  }
+
+  /// Poll `host.status` until `.running(port, "chat")` or `deadline` elapses.
+  /// Bounded so a regression can't hang the suite.
+  private func pollHostUntilRunning(_ host: PieEngineHost,
+                                    port: EnginePort,
+                                    deadline seconds: TimeInterval) async throws {
+    let expected = EngineStatus.running(port: port, profileID: "chat")
+    let deadline = Date().addingTimeInterval(seconds)
+    while Date() < deadline {
+      if host.status == expected { return }
+      try await Task.sleep(nanoseconds: 30_000_000)
+    }
+    XCTAssertEqual(host.status, expected,
+                   "engine never reached \(expected) within \(seconds)s (got \(host.status))")
   }
 
   /// Trivial `EngineSession` that records nothing; the XPC tests
