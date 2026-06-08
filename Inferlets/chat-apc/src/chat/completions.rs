@@ -1807,28 +1807,21 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
             .await;
     }
 
-    // F4: reject `role:"tool"` until the chat template grows a real
-    // tool slot. Silent demotion to `user` (the prior `_` arm in
-    // `fill_context`) makes multi-turn tool-call round-trips quietly
-    // wrong — better to fail loud than ship half-wired tool support.
-    if let Some((i, m)) = request
-        .messages
-        .iter()
-        .enumerate()
-        .find(|(_, m)| m.role == "tool")
-    {
+    // F4 + #468: reject any role outside the supported set at the 400
+    // boundary rather than silently demoting it to `user` in
+    // `fill_context`. `tool` keeps its dedicated `tool_role_unsupported`
+    // code (no tool slot yet); a typo'd or unsupported role (`developer`,
+    // `banana`, …) is `unsupported_role` — fail loud, the way an
+    // OpenAI-compatible SDK expects, instead of mis-templating it.
+    if let Err((i, code, message)) = validate_roles(&request.messages) {
         let body = serde_json::json!({
             "error": {
                 "type": "invalid_request_error",
-                "code": "tool_role_unsupported",
-                "message": format!(
-                    "messages[{i}].role=\"tool\" is not yet supported (chat template has no tool slot); \
-                     post the tool result as a user turn or wait for the SDK tool-answer surface to land"
-                ),
+                "code": code,
+                "message": message,
                 "param": format!("messages[{i}].role"),
             }
         });
-        let _ = m;
         let response = Response::builder()
             .status(400)
             .header("Content-Type", "application/json")
@@ -1863,6 +1856,47 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
 // =============================================================================
 // Validation (F7)
 // =============================================================================
+
+/// Roles the chat template has a real slot for. `tool` is parsed but
+/// rejected with a dedicated code (F4 — no tool slot yet); every other
+/// role outside this set is an OpenAI-compatibility error (#468).
+const SUPPORTED_ROLES: [&str; 3] = ["system", "user", "assistant"];
+
+/// Validate message roles against the supported set. Returns the
+/// offending message index plus the 400 envelope `code`/`message`.
+///
+/// `tool` keeps its dedicated `tool_role_unsupported` code (the chat
+/// template has no tool slot in v1); any other unknown role — a typo,
+/// `developer`, `function`, … — is `unsupported_role`. Both replace the
+/// prior silent demotion to `user` in [`fill_context`], which let a
+/// mis-spelled role generate a (wrongly-templated) completion instead of
+/// failing the request the way OpenAI-compatible SDKs expect.
+fn validate_roles(messages: &[ChatMessage]) -> Result<(), (usize, &'static str, String)> {
+    for (i, m) in messages.iter().enumerate() {
+        if SUPPORTED_ROLES.contains(&m.role.as_str()) {
+            continue;
+        }
+        if m.role == "tool" {
+            return Err((
+                i,
+                "tool_role_unsupported",
+                format!(
+                    "messages[{i}].role=\"tool\" is not yet supported (chat template has no tool slot); \
+                     post the tool result as a user turn or wait for the SDK tool-answer surface to land"
+                ),
+            ));
+        }
+        return Err((
+            i,
+            "unsupported_role",
+            format!(
+                "messages[{i}].role={:?} is not a supported role (expected one of: system, user, assistant)",
+                m.role
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// Validate sampling parameters. Returns `Err((field, message))`
 /// where `field` names the offending JSON key (passed to the
@@ -2936,9 +2970,10 @@ fn build_forced_tool_constraint(
 /// before any chat turn so the schemas land in the system slot the
 /// chat template expects.
 ///
-/// Roles outside the OpenAI canonical set are demoted to `user` so
-/// future SDK extensions (e.g. `tool`) don't crash the handler — a
-/// pessimistic but loss-of-information-preserving choice.
+/// Roles are validated upstream by `validate_roles` (#468), so only the
+/// supported set (`system`/`user`/`assistant`) reaches here on the
+/// request path; the `_` arm is defense-in-depth for any non-request
+/// caller.
 pub(crate) fn fill_context(
     ctx: &mut Context,
     model: &Model,
@@ -2967,9 +3002,10 @@ pub(crate) fn fill_context(
             "assistant" => {
                 ctx.assistant(&msg.content);
             }
-            // `user`, `tool`, anything else → user. The chat template
-            // doesn't have a `tool` slot in v1; surfacing the content
-            // as a user message is closer-to-correct than dropping it.
+            // `user` and a defensive catch-all. Unknown/unsupported roles
+            // are already rejected upstream by `validate_roles` (#468), so
+            // this arm only handles `user` on the request path; the
+            // catch-all is defense-in-depth for any non-request caller.
             _ => {
                 ctx.user(&msg.content);
             }
@@ -3198,6 +3234,53 @@ mod tests {
         assert!(validate_sampling(&req).is_ok());
         let cfg = req.speculation.unwrap().to_config();
         assert_eq!((cfg.leader_len, cfg.draft_len), (2, 4));
+    }
+
+    #[test]
+    fn validate_roles_accepts_supported_set() {
+        let msgs = vec![
+            ChatMessage { role: "system".into(), content: "s".into() },
+            ChatMessage { role: "user".into(), content: "u".into() },
+            ChatMessage { role: "assistant".into(), content: "a".into() },
+            ChatMessage { role: "user".into(), content: "u2".into() },
+        ];
+        assert!(validate_roles(&msgs).is_ok());
+    }
+
+    #[test]
+    fn validate_roles_rejects_tool_with_dedicated_code() {
+        // F4: `tool` keeps its own code so SDKs can branch on it.
+        let msgs = vec![
+            ChatMessage { role: "user".into(), content: "u".into() },
+            ChatMessage { role: "tool".into(), content: "t".into() },
+        ];
+        let (i, code, _msg) = validate_roles(&msgs).unwrap_err();
+        assert_eq!(i, 1);
+        assert_eq!(code, "tool_role_unsupported");
+    }
+
+    #[test]
+    fn validate_roles_rejects_unknown_role() {
+        // #468: a typo'd / unsupported role is a 400, not a silent
+        // demotion to `user` that generates a mis-templated completion.
+        for role in ["banana", "developer", "function", "User", ""] {
+            let msgs = vec![ChatMessage { role: role.into(), content: "c".into() }];
+            let (i, code, msg) = validate_roles(&msgs).unwrap_err();
+            assert_eq!(i, 0, "role={role:?}");
+            assert_eq!(code, "unsupported_role", "role={role:?}");
+            assert!(msg.contains("messages[0].role"), "role={role:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_roles_reports_first_offending_index() {
+        let msgs = vec![
+            ChatMessage { role: "user".into(), content: "u".into() },
+            ChatMessage { role: "assistant".into(), content: "a".into() },
+            ChatMessage { role: "banana".into(), content: "b".into() },
+        ];
+        let (i, _code, _msg) = validate_roles(&msgs).unwrap_err();
+        assert_eq!(i, 2);
     }
 
     #[test]

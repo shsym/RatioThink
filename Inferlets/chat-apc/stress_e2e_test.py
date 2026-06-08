@@ -311,6 +311,16 @@ async def section_protocol_stress(base: str, http: httpx.AsyncClient, rep: Repor
     ok = r.status_code == 400 and r.json().get("error", {}).get("code") == "tool_role_unsupported"
     rep.ok(ok, f"{P}: role=tool -> {r.status_code} {r.text[:120]!r} (want 400 tool_role_unsupported)")
 
+    # unknown role (#468) -> 400 unsupported_role, NOT a silently mis-templated
+    # 200. `developer` is included: OpenAI accepts it but the chat template has
+    # no slot, so chat-apc rejects rather than demote it to `user`.
+    for bad_role in ("banana", "developer"):
+        r = await http.post(f"{base}/v1/chat/completions", json={
+            "model": MODEL, "messages": [{"role": bad_role, "content": "hi"}], "stream": False,
+        })
+        ok = r.status_code == 400 and r.json().get("error", {}).get("code") == "unsupported_role"
+        rep.ok(ok, f"{P}: role={bad_role} -> {r.status_code} {r.text[:120]!r} (want 400 unsupported_role)")
+
     # whitespace-only content -> 400 param messages[i].content.
     r = await http.post(f"{base}/v1/chat/completions", json={
         "model": MODEL, "messages": [{"role": "user", "content": "   "}], "stream": False,
