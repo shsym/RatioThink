@@ -593,6 +593,34 @@ async def main() -> int:
                             "tot stream breadth=0 opened an SSE stream (want a JSON 400 envelope)"
                         )
 
+                    # #458: a non-default `exec` is REJECTED on a production
+                    # (default-feature) build with a `param`-tagged 400 — the
+                    # no-win strategy variants are gated behind
+                    # `--features exec-strategies` (benchmark/e2e only), and a
+                    # production client may not select a slower path. Never a
+                    # silent coerce to the default.
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": False,
+                            "input": {
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "exec": "phased_concurrent",
+                            },
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot exec=phased_concurrent) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(f"tot non-default exec status {r.status_code} (want 400)")
+                    else:
+                        try:
+                            param = r.json().get("error", {}).get("param")
+                        except Exception:
+                            param = None
+                        if param != "exec":
+                            failures.append(f"tot non-default exec param {param!r} (want 'exec')")
+
                     # Out-of-range breadth → 400 with `param` tag.
                     r = await http.post(
                         f"{base}/v1/inferlet",

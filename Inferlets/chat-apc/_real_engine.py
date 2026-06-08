@@ -76,9 +76,15 @@ async def real_engine(slug: str, model_path: str, handshake_timeout: float = 120
     """Boot a real portable-Metal `pie serve` for `model_path`, install the
     chat-apc inferlet, launch its HTTP daemon, and yield the base URL. Tears
     the engine down (and unlinks its shmem region) on exit. Model load can
-    take a while on a cold cache — hence the generous handshake timeout."""
+    take a while on a cold cache — hence the generous handshake timeout.
+
+    Installs `$PIE_TOT_WASM` when set, else the committed prebuilt wasm. The
+    #458 strategy harnesses build a `--features exec-strategies` wasm (so they
+    can drive the gated non-default strategies) and point this at it; the
+    production prebuilt rejects a non-default `exec`."""
+    wasm = Path(os.environ.get("PIE_TOT_WASM", WASM_PATH))
     assert PIE_BIN.exists(), f"missing pie binary at {PIE_BIN} (build PIE_PORTABLE_METAL=1)"
-    assert WASM_PATH.exists(), f"missing wasm at {WASM_PATH}"
+    assert wasm.exists(), f"missing wasm at {wasm}"
     assert Path(model_path).exists(), f"missing GGUF at {model_path}"
 
     shmem_base = f"/pie_tot_real_{os.getpid()}"
@@ -105,7 +111,7 @@ async def real_engine(slug: str, model_path: str, handshake_timeout: float = 120
                 client = PieClient(f"ws://{ws_addr}")
                 await client.connect()
                 await client.auth_by_token(token)
-                await client.install_program(WASM_PATH, MANIFEST_PATH, force_overwrite=True)
+                await client.install_program(wasm, MANIFEST_PATH, force_overwrite=True)
                 http_port = _free_port()
                 base = f"http://127.0.0.1:{http_port}"
                 await client.launch_daemon("chat-apc@0.1.0", http_port)

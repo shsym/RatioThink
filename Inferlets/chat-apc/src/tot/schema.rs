@@ -183,6 +183,21 @@ pub fn resolve(input: &TotInput) -> Result<TotParams, (&'static str, String)> {
     let top_p = input.top_p.unwrap_or(DEFAULT_TOP_P);
     let thinking = input.thinking.unwrap_or(DEFAULT_THINKING);
     let exec = input.exec.unwrap_or_default();
+    // #458 gate: the non-default execution strategies are a benchmark/debug
+    // apparatus measured as no-win (see [`ExecStrategy`]). Production builds
+    // (feature off) accept only the default and REJECT a non-default `exec` —
+    // never silently coerce it, which would hide that the client asked for an
+    // unsupported (slower) path. The benchmark / strategy e2e build with
+    // `--features exec-strategies` to drive every variant.
+    #[cfg(not(feature = "exec-strategies"))]
+    if exec != ExecStrategy::CoupledSequential {
+        return Err((
+            "exec",
+            "exec strategy selection is not available on this build; omit \
+             `exec` (the default is the only supported strategy)"
+                .to_string(),
+        ));
+    }
 
     if !(1..=MAX_BREADTH).contains(&breadth) {
         return Err(("breadth", format!("breadth must be in [1, {MAX_BREADTH}]")));
@@ -282,12 +297,46 @@ mod tests {
         assert_eq!(ExecStrategy::default(), ExecStrategy::CoupledSequential);
     }
 
+    // The default is always accepted (both builds); production behavior is
+    // unchanged whether or not the strategy feature is compiled in.
     #[test]
-    fn exec_knob_round_trips() {
-        // A non-default value must survive resolve (not be coerced to default).
+    fn exec_default_always_accepted() {
         let mut i = input();
-        i.exec = Some(ExecStrategy::PhasedConcurrent);
-        assert_eq!(resolve(&i).unwrap().exec, ExecStrategy::PhasedConcurrent);
+        i.exec = Some(ExecStrategy::CoupledSequential);
+        assert_eq!(resolve(&i).unwrap().exec, ExecStrategy::CoupledSequential);
+    }
+
+    // Production build (feature off): a non-default `exec` is REJECTED with a
+    // param-tagged error, never silently coerced to the default.
+    #[cfg(not(feature = "exec-strategies"))]
+    #[test]
+    fn exec_nondefault_rejected_without_feature() {
+        for s in [
+            ExecStrategy::CoupledConcurrent,
+            ExecStrategy::PhasedSequential,
+            ExecStrategy::PhasedConcurrent,
+        ] {
+            let mut i = input();
+            i.exec = Some(s);
+            assert_eq!(resolve(&i).unwrap_err().0, "exec", "{s:?} must be rejected");
+        }
+    }
+
+    // Gated build (feature on): every variant resolves to itself (the
+    // benchmark / strategy-e2e path).
+    #[cfg(feature = "exec-strategies")]
+    #[test]
+    fn exec_all_variants_resolve_with_feature() {
+        for s in [
+            ExecStrategy::CoupledSequential,
+            ExecStrategy::CoupledConcurrent,
+            ExecStrategy::PhasedSequential,
+            ExecStrategy::PhasedConcurrent,
+        ] {
+            let mut i = input();
+            i.exec = Some(s);
+            assert_eq!(resolve(&i).unwrap().exec, s);
+        }
     }
 
     #[test]
@@ -303,6 +352,9 @@ mod tests {
         assert!(ExecStrategy::PhasedSequential.phased_score());
     }
 
+    // snake_case wire parse of a non-default variant — only reachable on a
+    // gated build (production rejects it; see exec_nondefault_rejected...).
+    #[cfg(feature = "exec-strategies")]
     #[test]
     fn exec_deserializes_snake_case() {
         let i: TotInput =

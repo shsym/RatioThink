@@ -41,6 +41,15 @@ if [ ! -f "$WASM" ]; then
   Scripts/stamp-chat-apc.sh build
 fi
 
+# Build the exec-strategies wasm: the production prebuilt rejects a
+# non-default `exec`, and this test drives `exec=phased_concurrent` (#458).
+# Built into the run dir + pointed at via PIE_TOT_WASM (prod prebuilt untouched).
+echo "[tot-batched] building exec-strategies wasm…"
+( cd Inferlets/chat-apc && cargo build --release --locked --target wasm32-wasip2 --features exec-strategies >/dev/null )
+mkdir -p "$RUN_DIR"
+FEATURE_WASM="$RUN_DIR/chat-apc-exec.wasm"
+cp "$ROOT/Inferlets/chat-apc/target/wasm32-wasip2/release/chat_apc.wasm" "$FEATURE_WASM"
+
 REPO="${PIE_BENCH_REPO:-Qwen/Qwen3-0.6B-GGUF}"
 FILE="${PIE_BENCH_FILE:-Qwen3-0.6B-Q8_0.gguf}"
 SLUG="$REPO/$FILE"
@@ -63,6 +72,7 @@ echo "[tot-batched] running (log: $LOG)"
 set +e
 PIE_BENCH_SLUG="$SLUG" \
 PIE_BENCH_MODEL_PATH="$MODEL_PATH" \
+PIE_TOT_WASM="$FEATURE_WASM" \
   uv run --project "$PYDIR" --with httpx \
     python Inferlets/chat-apc/tot_real_e2e.py 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}

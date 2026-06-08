@@ -42,11 +42,15 @@ if [ ! -x "$PIE_BIN" ]; then
   echo "[tot-bench] pie engine missing — building (PIE_PORTABLE_METAL=1)…"
   (cd Vendor/pie && PIE_PORTABLE_METAL=1 cargo build -p pie-server --release)
 fi
-# Self-bootstrap: chat-apc wasm.
-if [ ! -f "$WASM" ]; then
-  echo "[tot-bench] chat-apc wasm missing — building…"
-  Scripts/stamp-chat-apc.sh build
-fi
+# Build the exec-strategies wasm: the production prebuilt rejects a
+# non-default `exec`, so the benchmark needs a `--features exec-strategies`
+# build to drive all four strategies (#458). Built into the run dir and
+# pointed at via PIE_TOT_WASM (the prod prebuilt is left untouched).
+echo "[tot-bench] building exec-strategies wasm…"
+( cd Inferlets/chat-apc && cargo build --release --locked --target wasm32-wasip2 --features exec-strategies >/dev/null )
+mkdir -p "$BENCH_RUN_DIR"
+FEATURE_WASM="$BENCH_RUN_DIR/chat-apc-exec.wasm"
+cp "$ROOT/Inferlets/chat-apc/target/wasm32-wasip2/release/chat_apc.wasm" "$FEATURE_WASM"
 
 # Stage the GGUF (symlink from HF cache if present, else download).
 REPO="${PIE_BENCH_REPO:-Qwen/Qwen3-0.6B-GGUF}"
@@ -71,6 +75,7 @@ echo "[tot-bench] running benchmark (log: $LOG)"
 set +e
 PIE_BENCH_SLUG="$SLUG" \
 PIE_BENCH_MODEL_PATH="$MODEL_PATH" \
+PIE_TOT_WASM="$FEATURE_WASM" \
 PIE_BENCH_TRIALS="${PIE_BENCH_TRIALS:-3}" \
 PIE_BENCH_MAX_TOKENS="${PIE_BENCH_MAX_TOKENS:-128}" \
   uv run --project "$PYDIR" --with httpx --with huggingface_hub --with tokenizers \
