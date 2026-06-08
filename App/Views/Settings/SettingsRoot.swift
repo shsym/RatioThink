@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// `Settings { SettingsRoot() }` host for the RatioThink app's Cmd-, window.
+/// `Settings { SettingsRoot() }` host for the Rational app's Cmd-, window.
 ///
 /// Four tabs (§5 design): General, Models, Profiles, Advanced. There is no
 /// API tab: the local API is a single live view in the main window's API
@@ -16,21 +16,22 @@ import SwiftUI
 /// container rather than carry an `.accessibilityLabel`.
 struct SettingsRoot: View {
   @EnvironmentObject private var appPreferences: AppPreferences
+  @EnvironmentObject private var settingsNavigation: SettingsNavigation
 
   var body: some View {
-    TabView {
-      tab("General", systemImage: "gear") {
+    TabView(selection: $settingsNavigation.selectedTab) {
+      tab("General", systemImage: "gear", value: .general) {
         GeneralSettingsTab()
       }
-      tab("Models", systemImage: "shippingbox") {
+      tab("Models", systemImage: "shippingbox", value: .models) {
         ModelsSettingsTab()
       }
-      tab("Profiles", systemImage: "person.crop.rectangle") {
+      tab("Profiles", systemImage: "person.crop.rectangle", value: .profiles) {
         ProfilesSettingsTab()
       }
       // No API tab: the local API lives in the main window's API Endpoints
       // section (LocalAPIView, #422), the single surface for it.
-      tab("Advanced", systemImage: "wrench.and.screwdriver") {
+      tab("Advanced", systemImage: "wrench.and.screwdriver", value: .advanced) {
         AdvancedSettingsTab()
       }
     }
@@ -61,11 +62,13 @@ struct SettingsRoot: View {
   @ViewBuilder
   private func tab<Content: View>(_ title: String,
                                    systemImage: String,
+                                   value: SettingsDeepLink.Tab,
                                    @ViewBuilder content: () -> Content) -> some View {
     content()
       .accessibilityElement(children: .contain)
       .accessibilityIdentifier(title)
       .tabItem { Label(title, systemImage: systemImage) }
+      .tag(value)
   }
 }
 

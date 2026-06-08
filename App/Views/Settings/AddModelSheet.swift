@@ -199,22 +199,35 @@ private struct CuratedRow: View {
       VStack(alignment: .leading, spacing: 2) {
         HStack(spacing: 6) {
           Text(model.displayName).font(.headline)
-          if model.id == CuratedModelCatalog.recommendedModelID {
-            Text("Recommended")
+          if let badge = model.installIntent.badgeText {
+            Text(badge)
               .font(.caption.bold())
               .padding(.horizontal, 6)
               .padding(.vertical, 2)
               .background(Capsule().fill(Color.accentColor.opacity(0.15)))
-              .accessibilityIdentifier("CuratedRecommended-\(model.id)")
+              .accessibilityIdentifier(model.installIntent == .defaultRecommended
+                                       ? "CuratedRecommended-\(model.id)"
+                                       : "CuratedIntent-\(model.id)")
           }
         }
         Text("\(model.publisher) · \(formattedParams) · \(model.quantization)")
           .font(.callout)
           .foregroundStyle(.secondary)
+        if let memory = model.recommendedSystemMemoryBytes {
+          Text("Recommended memory: \(InstalledModels.formattedSize(memory))")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+        }
         Text(model.summary)
           .font(.callout)
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
+        if !model.pieSupportNotes.isEmpty {
+          Text(model.pieSupportNotes)
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
       }
       Spacer()
       VStack(alignment: .trailing, spacing: 6) {
@@ -622,7 +635,7 @@ struct LocalFilePane: View {
         .foregroundStyle(.tertiary)
       Text("Drop a .gguf file here")
         .font(.headline)
-      Text("Or click *Choose File…* to import from disk. The file is copied into your RatioThink models directory; the original is left untouched.")
+      Text("Or click *Choose File…* to import from disk. The file is copied into your Rational models directory; the original is left untouched.")
         .multilineTextAlignment(.center)
         .foregroundStyle(.secondary)
         .padding(.horizontal, 40)

@@ -106,13 +106,14 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
       "indicator never entered the loading state; label=\(indicator.label); app: \(app.debugDescription)")
 
     // Open the popover DURING the hold and read its detail rows.
-    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
-                  "indicator popover did not open; app: \(app.debugDescription)")
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app, expecting: .preparing),
+                  "indicator popover did not open with Preparing… content; app: \(app.debugDescription); "
+                    + "popover: \(app.popovers.firstMatch.debugDescription)")
 
     // Honest indeterminate primary: a byte-less held load reads
     // "Preparing…" (U+2026), not "Loaded —" / "ETA —".
     XCTAssertTrue(
-      app.popovers.staticTexts["Preparing…"].waitForExistence(timeout: 5),
+      Self.staticText("Preparing…", in: app).waitForExistence(timeout: 5),
       "loading popover did not show the honest 'Preparing…' status; the live load is "
         + "indeterminate so it must read 'Preparing…', not a bare dash; "
         + "popover: \(app.popovers.firstMatch.debugDescription)")
@@ -120,7 +121,7 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     // The #396 regression guard: no bare "—" primary anywhere in a live
     // load's popover (the original ticket complaint was a "-- ETA").
     XCTAssertFalse(
-      app.popovers.staticTexts["—"].exists,
+      Self.staticText("—", in: app).exists,
       "loading popover rendered a bare '—' primary — unknown ETA/bytes must read "
         + "'Preparing…'/'Estimating…', never a meaningless dash (#396); "
         + "popover: \(app.popovers.firstMatch.debugDescription)")
@@ -151,8 +152,9 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
 
     // (1) Opening the indicator popover is info-only — it must NOT cancel
     // the load (#359 acceptance: "click-open does not cancel").
-    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
-                  "indicator popover did not open; app: \(app.debugDescription)")
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app, expecting: .cancel),
+                  "indicator popover did not open with a Cancel action; app: \(app.debugDescription); "
+                    + "popover: \(app.popovers.firstMatch.debugDescription)")
     XCTAssertTrue(indicator.label.hasPrefix("Loading model"),
                   "opening the popover cancelled the load — click must be info-only; "
                     + "label=\(indicator.label); app: \(app.debugDescription)")
@@ -224,8 +226,9 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
         + "label=\(indicator.label); app: \(app.debugDescription)")
 
     // Arm the cancel confirm, then back out with "Keep Loading".
-    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
-                  "indicator popover did not open; app: \(app.debugDescription)")
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app, expecting: .cancel),
+                  "indicator popover did not open with a Cancel action; app: \(app.debugDescription); "
+                    + "popover: \(app.popovers.firstMatch.debugDescription)")
     let cancelTrigger = app.popovers.buttons
       .matching(NSPredicate(format: "label == %@", "Cancel")).firstMatch
     XCTAssertTrue(cancelTrigger.waitForExistence(timeout: 5),
@@ -273,8 +276,9 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
 
     // (1) Opening the indicator popover is info-only — it must NOT unload
     // the resident model (#359 acceptance: click is read-only in running).
-    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
-                  "indicator popover did not open; app: \(app.debugDescription)")
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app, expecting: .unload),
+                  "indicator popover did not open with an Unload action; app: \(app.debugDescription); "
+                    + "popover: \(app.popovers.firstMatch.debugDescription)")
     XCTAssertTrue(indicator.label.hasPrefix("Engine running, model"),
                   "opening the popover unloaded the model — click must be info-only; "
                     + "label=\(indicator.label); app: \(app.debugDescription)")
@@ -337,8 +341,9 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
       "load never reached the '.ready' ring; label=\(indicator.label); app: \(app.debugDescription)")
 
     // Arm Unload (the .ready confirm prompt appears: "Keep Loaded" + "Unload").
-    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
-                  "indicator popover did not open; app: \(app.debugDescription)")
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app, expecting: .unload),
+                  "indicator popover did not open with an Unload action; app: \(app.debugDescription); "
+                    + "popover: \(app.popovers.firstMatch.debugDescription)")
     let unloadTrigger = app.popovers.buttons
       .matching(NSPredicate(format: "label == %@", "Unload")).firstMatch
     XCTAssertTrue(unloadTrigger.waitForExistence(timeout: 5),
@@ -366,8 +371,9 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     // Reopen — the documented "a stale armed confirm cannot survive a
     // close/reopen" guarantee (popover @State recreated fresh) must hold:
     // the info "Unload" ARM shows, NOT the armed confirm ("Keep Loaded").
-    XCTAssertTrue(openIndicatorPopover(indicator, in: app),
-                  "indicator popover did not reopen; app: \(app.debugDescription)")
+    XCTAssertTrue(openIndicatorPopover(indicator, in: app, expecting: .unload),
+                  "indicator popover did not reopen with an Unload action; app: \(app.debugDescription); "
+                    + "popover: \(app.popovers.firstMatch.debugDescription)")
     let reopenedUnload = app.popovers.buttons
       .matching(NSPredicate(format: "label == %@", "Unload")).firstMatch
     XCTAssertTrue(reopenedUnload.waitForExistence(timeout: 5),
@@ -406,7 +412,7 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     app.launch()
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
     return app
   }
@@ -420,15 +426,7 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
                   "New Chat button missing; app: \(app.debugDescription)")
     newChat.click()
 
-    let modelMenu = app.menuButtons["toolbar.model"]
-    XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
-                  "model menu missing after creating chat; app: \(app.debugDescription)")
-    modelMenu.click()
-
-    let modelItem = app.menuItems[Self.menuModelLeaf]
-    XCTAssertTrue(modelItem.waitForExistence(timeout: 5),
-                  "seeded model '\(Self.menuModelLeaf)' missing from menu; app: \(app.debugDescription)")
-    modelItem.click()
+    try selectSeededModelFromToolbar(in: app)
 
     // Picking a model that differs from the (nil) resident raises the
     // confirm gate; "Switch" commits the load (ContentToolbar.swift:106
@@ -441,24 +439,112 @@ final class S302_ModelLoadIndicatorPath1GUITests: XCTestCase {
     switchButton.click()
   }
 
-  /// Open the indicator's popover. First wait out the confirm-gate
-  /// popover's dismissal so it cannot eat the click; then click the
-  /// indicator only while no popover is open (never toggling an open one
-  /// shut), polling for it to appear. Returns true once a popover is open.
+  /// Select the seeded model from the native toolbar `Menu` with a
+  /// reconcile-aware retry/reopen loop. `/v1/models` reconciliation is async,
+  /// and AppKit menu traversal can briefly expose stale `MenuItem` proxies;
+  /// matching S260/S426's longer window and reopening the menu gives the real
+  /// served model list time to settle before clicking the live item.
   @MainActor
-  private func openIndicatorPopover(_ indicator: XCUIElement, in app: XCUIApplication) -> Bool {
+  private func selectSeededModelFromToolbar(in app: XCUIApplication) throws {
+    let modelMenu = app.menuButtons["toolbar.model"]
+    XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
+                  "model menu missing after creating chat; app: \(app.debugDescription)")
+
+    let deadline = Date().addingTimeInterval(15)
+    var lastMenuDescription = ""
+    var attempt = 0
+    while Date() < deadline {
+      attempt += 1
+      modelMenu.click()
+      let modelItem = seededModelMenuItem(in: app)
+      if modelItem.waitForExistence(timeout: 2) {
+        // Let the native menu finish opening before traversing/tapping; this
+        // avoids the observed `open menu during menu traversal` boundary.
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.35))
+        if modelItem.exists {
+          modelItem.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+          return
+        }
+      }
+      lastMenuDescription = app.debugDescription
+      app.typeKey(.escape, modifierFlags: [])
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.3))
+    }
+
+    XCTFail("seeded model '\(Self.menuModelLeaf)' missing from toolbar model menu after reconcile-aware retries; "
+      + "attempts=\(attempt); app: \(lastMenuDescription)")
+    throw NSError(domain: "S302.ModelLoadIndicatorPath1GUITests", code: 1)
+  }
+
+  private func seededModelMenuItem(in app: XCUIApplication) -> XCUIElement {
+    app.menuItems[Self.menuModelLeaf]
+  }
+
+  /// Open the indicator's popover and wait for the specific model-load
+  /// content/action this test is about to drive. A bare `app.popovers.count > 0`
+  /// is not a sufficient proof: native SwiftUI/AppKit popovers can be transient
+  /// or stale under XCUITest, and the S302 load path regressed into false
+  /// positives where no `Cancel`/`Preparing…`/`Unload` content was present.
+  @MainActor
+  private func openIndicatorPopover(
+    _ indicator: XCUIElement,
+    in app: XCUIApplication,
+    expecting expectation: IndicatorPopoverExpectation
+  ) -> Bool {
     _ = waitForNoPopover(app, timeout: 5)
     var attempts = 0
-    while app.popovers.count == 0 && attempts < 5 {
+    while attempts < 5 {
       attempts += 1
+      if app.popovers.count > 0 {
+        app.typeKey(.escape, modifierFlags: [])
+        _ = waitForNoPopover(app, timeout: 2)
+      }
       indicator.click()
-      let deadline = Date().addingTimeInterval(2.0)
-      while Date() < deadline {
-        if app.popovers.count > 0 { return true }
-        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+      if waitForPopoverContent(expectation, in: app, timeout: 3) { return true }
+    }
+    return waitForPopoverContent(expectation, in: app, timeout: 1)
+  }
+
+  private enum IndicatorPopoverExpectation {
+    case cancel
+    case preparing
+    case unload
+
+    var label: String {
+      switch self {
+      case .cancel:    return "Cancel"
+      case .preparing: return "Preparing…"
+      case .unload:    return "Unload"
       }
     }
-    return app.popovers.count > 0
+
+    func element(in app: XCUIApplication) -> XCUIElement {
+      switch self {
+      case .cancel, .unload:
+        return app.popovers.buttons.matching(NSPredicate(format: "label == %@", label)).firstMatch
+      case .preparing:
+        return S302_ModelLoadIndicatorPath1GUITests.staticText(label, in: app)
+      }
+    }
+  }
+
+  private static func staticText(_ text: String, in app: XCUIApplication) -> XCUIElement {
+    app.popovers.staticTexts
+      .matching(NSPredicate(format: "label == %@ OR value == %@", text, text))
+      .firstMatch
+  }
+
+  private func waitForPopoverContent(
+    _ expectation: IndicatorPopoverExpectation,
+    in app: XCUIApplication,
+    timeout: TimeInterval
+  ) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if expectation.element(in: app).exists { return true }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+    }
+    return expectation.element(in: app).exists
   }
 
   // MARK: - polling helpers (narrow queries only)

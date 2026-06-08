@@ -20,7 +20,7 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     let seededProfile = try Profile.parse(toml: ProfileStore.defaultChatTOML)
 
     XCTAssertTrue(
-      ChatTranscriptViewModel.placeholderModels.contains(seededProfile.model),
+      ChatTranscriptViewModel.placeholderModels.contains(try XCTUnwrap(seededProfile.model)),
       "placeholderModels must include the seeded default profile model so the first-launch model picker matches chat.toml"
     )
   }

@@ -89,4 +89,113 @@ final class ProfileSwapWiringTests: XCTestCase {
                    "no swap-confirm popover when the engine is stopped and no model is loaded")
     }
   }
+
+  // MARK: - #459 third outcome: Keep Current Model
+
+  /// KEEP CURRENT MODEL: commit the profile switch AND pin the resident model
+  /// A as the per-chat override, with NO reload. The profile's stored default
+  /// B is left untouched.
+  func test_keepCurrentModel_commits_profile_sets_override_A_and_fires_no_load() throws {
+    try withTwoProfileStore { store in
+      let center = ModelLoadCenter(initialResident: "model-A.gguf")
+      let coord = ProfileSwapCoordinator(
+        center: center, engine: MockEngineClient(), profileStore: store)
+
+      var committed: String?
+      var capturedOverride: String?
+      var overrideCalls = 0
+      coord.requestSwap(
+        toProfileID: "beta",
+        commit: { committed = $0 },
+        setOverride: { capturedOverride = $0; overrideCalls += 1 })
+
+      let pending = try XCTUnwrap(coord.pending, "model-changing swap must publish a pending")
+      XCTAssertTrue(pending.canKeepCurrentModel,
+                    "a profile swap with a resident model must offer Keep Current")
+      XCTAssertFalse(pending.canSetAsDefault,
+                     "the profile-swap path does not offer Set-as-default")
+
+      coord.keepCurrentModel(token: pending.id)
+
+      XCTAssertEqual(committed, "beta", "keep-current must commit the profile switch")
+      XCTAssertEqual(overrideCalls, 1, "keep-current must set the per-chat override exactly once")
+      XCTAssertEqual(capturedOverride, "model-A.gguf",
+                     "keep-current must pin the resident model A as the override")
+      XCTAssertNil(coord.pending, "pending must clear after keep-current")
+      XCTAssertEqual(center.residentModelID, "model-A.gguf",
+                     "keep-current must NOT reload — A stays resident")
+      XCTAssertFalse(center.isLoading, "keep-current must NOT start a model load")
+    }
+  }
+
+  /// A stale token (superseded pending) must be dropped: no profile switch,
+  /// no override, pending untouched — mirrors confirm/cancel.
+  func test_keepCurrentModel_drops_stale_token() throws {
+    try withTwoProfileStore { store in
+      let coord = ProfileSwapCoordinator(
+        center: ModelLoadCenter(initialResident: "model-A.gguf"),
+        engine: MockEngineClient(), profileStore: store)
+
+      var committed: String?
+      var overrideCalls = 0
+      coord.requestSwap(
+        toProfileID: "beta",
+        commit: { committed = $0 },
+        setOverride: { _ in overrideCalls += 1 })
+      XCTAssertNotNil(coord.pending)
+
+      coord.keepCurrentModel(token: UUID())   // wrong token
+
+      XCTAssertNotNil(coord.pending, "stale-token keep-current must not clear the pending")
+      XCTAssertNil(committed, "stale-token keep-current must not switch the profile")
+      XCTAssertEqual(overrideCalls, 0, "stale-token keep-current must not set the override")
+    }
+  }
+
+  /// Keep-current is meaningless on the toolbar model-override path (the user
+  /// explicitly picked a model to LOAD): the pending must not advertise it and
+  /// a defensive call must be dropped.
+  func test_keepCurrentModel_is_dropped_on_model_override_path() throws {
+    try withTwoProfileStore { store in
+      let coord = ProfileSwapCoordinator(
+        center: ModelLoadCenter(initialResident: "model-A.gguf"),
+        engine: MockEngineClient(), profileStore: store)
+
+      var committed: String?
+      coord.requestModelOverride(modelID: "model-B.gguf", activeProfileID: "alpha") { committed = $0 }
+      let pending = try XCTUnwrap(coord.pending)
+      XCTAssertTrue(pending.canSetAsDefault)
+      XCTAssertFalse(pending.canKeepCurrentModel,
+                     "keep-current must not be offered on the model-override path")
+
+      coord.keepCurrentModel(token: pending.id)
+
+      XCTAssertNotNil(coord.pending, "keep-current must be a no-op on the model-override path")
+      XCTAssertNil(committed)
+    }
+  }
+
+  /// Esc / click-outside (`dismissCurrentPending`) must be a TRUE abandon —
+  /// never silently keep-current: no profile switch, no override.
+  func test_dismiss_is_true_abandon_never_keeps_current() throws {
+    try withTwoProfileStore { store in
+      let coord = ProfileSwapCoordinator(
+        center: ModelLoadCenter(initialResident: "model-A.gguf"),
+        engine: MockEngineClient(), profileStore: store)
+
+      var committed: String?
+      var overrideCalls = 0
+      coord.requestSwap(
+        toProfileID: "beta",
+        commit: { committed = $0 },
+        setOverride: { _ in overrideCalls += 1 })
+      XCTAssertNotNil(coord.pending)
+
+      coord.dismissCurrentPending()   // Esc / click-outside
+
+      XCTAssertNil(coord.pending)
+      XCTAssertNil(committed, "an accidental dismiss must NOT switch the profile")
+      XCTAssertEqual(overrideCalls, 0, "an accidental dismiss must NOT set the keep-current override")
+    }
+  }
 }

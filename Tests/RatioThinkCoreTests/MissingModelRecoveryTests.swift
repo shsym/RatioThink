@@ -99,6 +99,88 @@ final class MissingModelRecoveryTests: XCTestCase {
       profileDefaultModel: nil))
   }
 
+  // MARK: - bannerTarget gated by the send-gate sheet (#446: single download surface)
+
+  /// While the send-gate sheet is presented it renders the SAME inline
+  /// download, so the banner must stay hidden — otherwise the user sees two
+  /// Download prompts for one model. The sheet (modal, user-initiated) owns
+  /// the recovery while it is up.
+  func test_bannerTarget_suppressed_while_send_gate_presented() {
+    XCTAssertNil(MissingModelRecovery.bannerTarget(
+      engineStatus: .failed(code: .modelMissing, message: "model missing"),
+      profileDefaultModel: ProfileStore.defaultChatModelID,
+      sendGatePresented: true),
+      "banner must defer to the send-gate sheet's download CTA")
+  }
+
+  /// When the sheet is NOT presented the banner re-takes the surface (e.g.
+  /// a post-download start that did not take is still recoverable). The
+  /// `sendGatePresented:` default (false) reproduces the ungated decision, so
+  /// the ungated `hasDownloadTarget` call site keeps the pre-#446 behavior.
+  func test_bannerTarget_present_when_send_gate_not_presented() {
+    let target = MissingModelRecovery.bannerTarget(
+      engineStatus: .failed(code: .modelMissing, message: "model missing"),
+      profileDefaultModel: ProfileStore.defaultChatModelID,
+      sendGatePresented: false)
+    XCTAssertEqual(target?.repo, "Qwen/Qwen3-0.6B-GGUF")
+    XCTAssertEqual(target?.file, "Qwen3-0.6B-Q8_0.gguf")
+    // F3: the default-arg form (no sendGatePresented:) is the same single
+    // entry point — ungated — not a separate arity overload.
+    XCTAssertEqual(MissingModelRecovery.bannerTarget(
+      engineStatus: .failed(code: .modelMissing, message: "model missing"),
+      profileDefaultModel: ProfileStore.defaultChatModelID), target)
+  }
+
+  /// The sheet gate is the ONLY thing the argument adds: a non-modelMissing
+  /// failure has no banner with or without the sheet (no false positive).
+  func test_bannerTarget_gated_still_absent_for_non_modelMissing() {
+    XCTAssertNil(MissingModelRecovery.bannerTarget(
+      engineStatus: .failed(code: .spawnFailed, message: "fork"),
+      profileDefaultModel: ProfileStore.defaultChatModelID,
+      sendGatePresented: false))
+  }
+
+  // MARK: - F1: gate honors the sheet's REAL download condition, not bare presentation
+
+  /// `PromptAction.isDownload` — the predicate the call site ANDs with sheet
+  /// presentation so the banner defers only when the sheet duplicates it.
+  func test_promptAction_isDownload() {
+    let slug = ProfileStore.defaultChatModelID
+    XCTAssertTrue(MissingModelRecovery.promptAction(profileDefaultModel: slug, isInstalled: false).isDownload)
+    XCTAssertFalse(MissingModelRecovery.promptAction(profileDefaultModel: slug, isInstalled: true).isDownload)   // .load
+    XCTAssertFalse(MissingModelRecovery.promptAction(profileDefaultModel: nil, isInstalled: false).isDownload)   // .unavailable
+  }
+
+  /// F1 edge: a present-but-INVALID staged model (a dir/symlink at the staged
+  /// path → `isModelInstalled` bare `fileExists` is true → action `.load`)
+  /// fails the engine with `.modelMissing`, but the sheet shows Open Settings,
+  /// NOT a download. The banner is the only one-click download there, so it
+  /// must NOT be suppressed even with the sheet open. Mirrors the call site's
+  /// `showNoModelPrompt && noModelAction.isDownload` gate.
+  func test_bannerTarget_not_suppressed_when_sheet_shows_settings_not_download() {
+    let status = EngineStatus.failed(code: .modelMissing, message: "staged path is a directory")
+    let slug = ProfileStore.defaultChatModelID
+    let action = MissingModelRecovery.promptAction(profileDefaultModel: slug, isInstalled: true)
+    XCTAssertEqual(action, .load(slug), "invalid-staged edge: bare fileExists true → .load")
+    let sheetGate = true && action.isDownload   // the call site's expression
+    XCTAssertNotNil(MissingModelRecovery.bannerTarget(
+      engineStatus: status, profileDefaultModel: slug, sendGatePresented: sheetGate),
+      "banner (one-click download) must stay when the sheet only offers Open Settings")
+  }
+
+  /// The common fresh-install edge (file genuinely absent → action
+  /// `.download`): the sheet DOES duplicate the download, so an open sheet
+  /// suppresses the banner — the single-download-surface intent holds.
+  func test_bannerTarget_suppressed_when_sheet_shows_duplicate_download() {
+    let status = EngineStatus.failed(code: .modelMissing, message: "absent")
+    let slug = ProfileStore.defaultChatModelID
+    let action = MissingModelRecovery.promptAction(profileDefaultModel: slug, isInstalled: false)
+    XCTAssertTrue(action.isDownload)
+    let sheetGate = true && action.isDownload
+    XCTAssertNil(MissingModelRecovery.bannerTarget(
+      engineStatus: status, profileDefaultModel: slug, sendGatePresented: sheetGate))
+  }
+
   // MARK: - completedLatchShouldReset (PR#15 F1: re-failure → Retry)
 
   /// After a download completed (latched), the engine re-entering

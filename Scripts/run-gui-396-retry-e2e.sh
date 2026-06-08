@@ -1,7 +1,7 @@
 #!/bin/bash
 # #396 EXECUTED failure-recovery GUI E2E.
 #
-# Drives RatioThink.app's REAL load path against a loadviz harness started
+# Drives Rational.app's REAL load path against a loadviz harness started
 # with `--fail-load-attempts 1`: the first POST /v1/models/load returns
 # HTTP 500, so ModelLoadCenter goes `.failed` and the indicator shows the
 # red "Load failed" pip. Then:
@@ -38,8 +38,8 @@ if ! pgrep -x Dock >/dev/null 2>&1; then
   exit 2
 fi
 if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "gui 396 retry e2e: RatioThink.app Automation/Accessibility permissions required." >&2
-  echo "gui 396 retry e2e: grant the XCTest runner + RatioThink.app Automation + Accessibility, then rerun:" >&2
+  echo "gui 396 retry e2e: Rational.app Automation/Accessibility permissions required." >&2
+  echo "gui 396 retry e2e: grant the XCTest runner + Rational.app Automation + Accessibility, then rerun:" >&2
   echo "gui 396 retry e2e: PIE_TEST_TCC_GRANTED=1 Scripts/run-gui-396-retry-e2e.sh" >&2
   exit 2
 fi

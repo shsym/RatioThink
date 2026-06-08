@@ -172,7 +172,7 @@ final class HelperStatusItemModelTests: XCTestCase {
 
   /// The menu-bar button's accessibility label must describe the app AND
   /// the current engine status (#424 acceptance). The model supplies the
-  /// state word; the view composes "RatioThink engine <word>".
+  /// state word; the view composes "Rational engine <word>".
   func test_accessibilityWord_describes_each_engine_state() {
     XCTAssertEqual(HelperStatusItemModel.Dot.stopped.accessibilityWord, "stopped")
     XCTAssertEqual(HelperStatusItemModel.Dot.running.accessibilityWord, "running")

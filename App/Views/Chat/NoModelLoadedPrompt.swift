@@ -103,7 +103,12 @@ struct NoModelLoadedPrompt: View {
                     showsUnavailableCopy: false, primary: .load,
                     showsOpenSettings: false)
       case .download:
-        return Plan(headline: "No model loaded", reason: nil, showsWaitSpinner: false,
+        // #446: the body says "isn't downloaded yet" — the headline must
+        // agree. A default IS configured (this is `.needsDefaultLoad`); it
+        // simply isn't on disk. "No model loaded" read as "nothing is set
+        // up". Match the `.engineFailed(.modelMissing)` + `.download`
+        // sibling below so both download entry points say the same thing.
+        return Plan(headline: "Default model isn't downloaded", reason: nil, showsWaitSpinner: false,
                     showsModelChip: false, showsDownloadCTA: true,
                     showsUnavailableCopy: false, primary: .none,
                     showsOpenSettings: false)

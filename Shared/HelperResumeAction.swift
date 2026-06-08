@@ -159,7 +159,9 @@ public enum HelperResumeAction {
     engineHost: PieEngineHost,
     resolver: HelperExportedAPI.LaunchSpecResolver
   ) -> Outcome {
-    switch resolver(id) {
+    // Resume always boots the profile's persisted default (no per-start
+    // override on the menu-bar / boot auto-resume path), so pass `nil`.
+    switch resolver(id, nil) {
     case .failure(let err):
       // Publish EVERY resolver failure (not just `.memoryRisk`) through
       // the engine's `.failed` status so the App surfaces the reason —

@@ -54,7 +54,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     defer { app.terminate() }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     let newChat = app.buttons["chats.newButton"]
@@ -63,14 +63,28 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     newChat.click()
 
     // Resolve `residentModelID` to the served slug before swapping profiles:
-    // the model menu only renders the seeded leaf once the reconcile has run,
-    // so its appearance is our barrier that the swap below will be silent.
+    // `waitForResidentModelValue` below is the reconciliation barrier because
+    // it waits for the unannotated toolbar accessibility value to equal the
+    // served model id. A seeded-leaf menu row can exist earlier from the
+    // profile-default option, so row appearance alone is not the barrier.
     let modelMenu = app.menuButtons["toolbar.model"]
     XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
                   "model menu missing after creating chat; app tree: \(app.debugDescription)")
-    modelMenu.click()
-    let seededModel = app.menuItems["Qwen3-0.6B-Q8_0.gguf"]
-    XCTAssertTrue(seededModel.waitForExistence(timeout: 15),
+
+    // This is the silent same-resident swap barrier. A menu row containing the
+    // Qwen leaf can be present from the profile-default option before
+    // `/v1/models` reconciliation. The toolbar accessibility value only becomes
+    // the unannotated concrete served slug once resident reconciliation has
+    // landed, which is what makes the Fast Think profile swap silent.
+    XCTAssertTrue(waitForResidentModelValue(modelMenu, model, timeout: 15),
+                  "toolbar.model never reflected reconciled resident model \(model); title=\(modelMenu.title), value=\(String(describing: modelMenu.value)); app tree: \(app.debugDescription)")
+
+    // With resident reconciliation proven, separately verify the selectable
+    // model row is still present in the menu.
+    XCTAssertTrue(waitForModelMenuItem(containingModelLeaf: "Qwen3-0.6B-Q8_0.gguf",
+                                       in: app,
+                                       openedBy: modelMenu,
+                                       timeout: 15),
                   "seeded Qwen3 GGUF missing from chat model menu (reconcile did not land); app tree: \(app.debugDescription)")
     app.typeKey(.escape, modifierFlags: [])
 
@@ -167,6 +181,45 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
     }
     return false
+  }
+
+  private func waitForResidentModelValue(_ element: XCUIElement,
+                                         _ expectedModelID: String,
+                                         timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      let value = element.value as? String ?? ""
+      let title = element.title
+      if value == expectedModelID,
+         !value.localizedCaseInsensitiveContains("profile default"),
+         !title.localizedCaseInsensitiveContains("(Default)") {
+        return true
+      }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.3))
+    }
+    return false
+  }
+
+  private func waitForModelMenuItem(containingModelLeaf leaf: String,
+                                    in app: XCUIApplication,
+                                    openedBy modelMenu: XCUIElement,
+                                    timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      modelMenu.click()
+      if menuItem(containingModelLeaf: leaf, in: app).waitForExistence(timeout: 2) {
+        return true
+      }
+      app.typeKey(.escape, modifierFlags: [])
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.3))
+    }
+    return false
+  }
+
+  private func menuItem(containingModelLeaf leaf: String, in app: XCUIApplication) -> XCUIElement {
+    let predicate = NSPredicate(format: "title CONTAINS[c] %@ OR label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+                                leaf, leaf, leaf)
+    return app.menuItems.matching(predicate).firstMatch
   }
 
   /// Shared with S258/S260: `Scripts/run-chat-gui-e2e.sh` writes this fixed

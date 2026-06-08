@@ -1,7 +1,7 @@
 #!/bin/bash
 # real-model acquisition GUI E2E.
 #
-# Drives RatioThink.app's Settings → Models → Add Model… → Curated download
+# Drives Rational.app's Settings → Models → Add Model… → Curated download
 # through the GUI (the real in-process ModelDownloader against live
 # Hugging Face), waits for the "Done" badge, then independently
 # re-verifies the placed GGUF's sha256 against HF's X-Linked-Etag.
@@ -32,7 +32,7 @@ if ! pgrep -x Dock >/dev/null 2>&1; then
   exit 2
 fi
 if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "gui e2e: RatioThink.app + XCTest-runner Automation/Accessibility permissions required." >&2
+  echo "gui e2e: Rational.app + XCTest-runner Automation/Accessibility permissions required." >&2
   echo "gui e2e: grant them in System Settings → Privacy & Security, then rerun:" >&2
   echo "gui e2e:   PIE_TEST_TCC_GRANTED=1 Scripts/run-gui-e2e.sh" >&2
   exit 2

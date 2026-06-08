@@ -19,8 +19,8 @@ final class BundledResourceLookupTests: XCTestCase {
   }
 
   func test_bundledPieBinary_resolves_sibling_pieApp_when_helper_runs_standalone_under_xcode() throws {
-    let helper = try makeAppBundle(named: "RatioThinkHelper", bundleID: "com.ratiothink.app.helper")
-    let pie = try makeAppBundle(named: "RatioThink", bundleID: "com.ratiothink.app")
+    let helper = try makeAppBundle(named: "RationalHelper", bundleID: "com.ratiothink.app.helper")
+    let pie = try makeAppBundle(named: "Rational", bundleID: "com.ratiothink.app")
     let binary = pie
       .appendingPathComponent("Contents/Resources/pie-engine/pie", isDirectory: false)
     try FileManager.default.createDirectory(
@@ -38,8 +38,8 @@ final class BundledResourceLookupTests: XCTestCase {
   }
 
   func test_inferletResources_resolve_sibling_pieApp_when_helper_runs_standalone_under_xcode() throws {
-    let helper = try makeAppBundle(named: "RatioThinkHelper", bundleID: "com.ratiothink.app.helper")
-    let pie = try makeAppBundle(named: "RatioThink", bundleID: "com.ratiothink.app")
+    let helper = try makeAppBundle(named: "RationalHelper", bundleID: "com.ratiothink.app.helper")
+    let pie = try makeAppBundle(named: "Rational", bundleID: "com.ratiothink.app")
     let inferletDir = pie
       .appendingPathComponent("Contents/Resources/Inferlets/chat-apc", isDirectory: true)
     try FileManager.default.createDirectory(at: inferletDir, withIntermediateDirectories: true)

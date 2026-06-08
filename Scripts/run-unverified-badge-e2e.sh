@@ -2,7 +2,7 @@
 # F10 — durable Unverified marker on the Installed-models row.
 #
 # Stages two GGUFs under a shared PIE_HOME/models (one with a
-# `<file>.unverified` sidecar, one clean), then drives RatioThink.app's
+# `<file>.unverified` sidecar, one clean), then drives Rational.app's
 # Settings → Models tab and asserts the unverified row carries the
 # Unverified badge after a fresh rescan while the clean row does not.
 # No network or engine — proves the marker survives rescan/restart, not

@@ -1,7 +1,7 @@
 import XCTest
 
 ///  deterministic history/resume proof:
-/// RatioThink.app → ComposerView → HTTPEngineClient → deterministic HTTP harness,
+/// Rational.app → ComposerView → HTTPEngineClient → deterministic HTTP harness,
 /// with every chat request body recorded so the test can assert the
 /// exact ordered message history sent on turns 2 and 3.
 final class S275_MultiTurnResumeGUITests: XCTestCase {
@@ -38,7 +38,7 @@ final class S275_MultiTurnResumeGUITests: XCTestCase {
     defer { app.terminate() }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     try createChatAndSend(user1, in: app)
@@ -64,7 +64,7 @@ final class S275_MultiTurnResumeGUITests: XCTestCase {
     defer { relaunched.terminate() }
 
     XCTAssert(relaunched.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not relaunch")
+              "Rational.app did not relaunch")
     relaunched.activate()
     try selectPersistedChat(in: relaunched)
 

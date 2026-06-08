@@ -1,5 +1,5 @@
 #!/usr/bin/env swift
-// Generate the RatioThink DMG drag-install background art programmatically so
+// Generate the Rational DMG drag-install background art programmatically so
 // the package build is self-contained (no committed binary art, no ImageMagick
 // dependency). Draws a left->right arrow between the app icon slot (left) and
 // the Applications slot (right).
@@ -38,7 +38,7 @@ guard let geomData = FileManager.default.contents(atPath: geomPath),
   let width = (window["width"] as? NSNumber)?.intValue,
   let height = (window["height"] as? NSNumber)?.intValue,
   let icons = geom["icons"] as? [String: Any],
-  let appIcon = icons["RatioThink.app"] as? [String: Any],
+  let appIcon = icons["Rational.app"] as? [String: Any],
   let appsIcon = icons["Applications"] as? [String: Any],
   let appX = (appIcon["x"] as? NSNumber)?.doubleValue,
   let appY = (appIcon["y"] as? NSNumber)?.doubleValue,
@@ -98,7 +98,7 @@ head.close()
 head.fill()
 
 // Caption above the arrow.
-let caption = "Drag RatioThink to Applications" as NSString
+let caption = "Drag Rational to Applications" as NSString
 let captionAttrs: [NSAttributedString.Key: Any] = [
   .font: NSFont.systemFont(ofSize: 15, weight: .medium),
   .foregroundColor: NSColor(calibratedWhite: 0.45, alpha: 1.0),

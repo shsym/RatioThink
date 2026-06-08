@@ -4,7 +4,7 @@ import XCTest
 ///
 /// A model already staged in the shared HF cache (`$HF_HOME/hub`) must
 /// surface in the real app without any download or engine launch:
-///   RatioThink.app → Settings (⌘,) → Models tab → an "HF cache" row.
+///   Rational.app → Settings (⌘,) → Models tab → an "HF cache" row.
 /// That row is produced by `CachedModelScan` → `HFCacheCatalog.scan(hfHome:)`
 /// where `hfHome == $HF_HOME` (`LaunchSpecResolver.defaultHFHome`), so a
 /// fixture cache pointed at by `HF_HOME` exercises the exact production
@@ -29,7 +29,7 @@ import XCTest
 /// `Scripts/run-cache-discovery-gui-e2e.sh` (running as the normal,
 /// unsandboxed user) BEFORE xcodebuild; these tests read their paths from
 /// a config env file and skip when it is absent — the
-/// `S204_ModelAcquisitionGUITests` pattern. The launched RatioThink.app
+/// `S204_ModelAcquisitionGUITests` pattern. The launched Rational.app
 /// is NOT sandboxed, so it reads the staged `HF_HOME` and writes
 /// `PIE_HOME` on `/tmp` without issue.
 ///
@@ -118,7 +118,7 @@ final class S365_CachedModelDiscoveryGUITests: XCTestCase {
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     app.launch()
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
     return app
   }
