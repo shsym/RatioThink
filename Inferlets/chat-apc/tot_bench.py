@@ -47,10 +47,10 @@ if str(_HERE) not in sys.path:
 from _real_engine import real_engine  # noqa: E402
 
 STRATEGIES = [
-    "coupled_sequential",   # pre-#458 baseline
+    "coupled_sequential",   # production default (measured fastest-or-tied)
     "coupled_concurrent",   # isolate generation concurrency
     "phased_sequential",    # isolate the phase barrier + batched scoring
-    "phased_concurrent",    # #458 production default
+    "phased_concurrent",    # #458 fully-batched target (measured no win)
 ]
 
 # Representative search shapes. b*d1 is a single wide level (max sibling
