@@ -353,6 +353,67 @@ final class HelperResumeActionTests: XCTestCase {
                   "with no active-model marker the resolver must receive nil → profile default")
   }
 
+  // MARK: - #469 F1: stale active-model marker falls back to the profile default
+
+  func test_resume_stale_marker_modelMissing_retries_profile_default() throws {
+    // The marker names a model deleted/evicted out from under it. The
+    // marker-driven resolve fails modelMissing; Resume must retry the profile
+    // default (which is still valid) rather than dead-end on the missing pick.
+    let store = try makeStoreWithChatProfile(active: "chat")
+    defer { store.stop() }
+    try store.setActiveModelID("Org/Deleted/gone.gguf")
+
+    let captured = CapturedModel()
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, model in
+      captured.value = model      // last call's override
+      captured.wasNil = (model == nil)
+      if model == "Org/Deleted/gone.gguf" {
+        return .failure(EngineError(code: .modelMissing, message: "model gone"))
+      }
+      return .success(self.makeSpec(profileID: id))   // nil (profile default) resolves
+    }
+    let engineHost = makeEngineHost()
+    defer { engineHost.stop() }
+    let outcome = HelperResumeAction.run(
+      engineHost: engineHost, profileStore: store, resolver: resolver)
+
+    XCTAssertEqual(outcome, .started(profileID: "chat"),
+                   "a stale marker (modelMissing) must retry the profile default, not dead-end; got \(outcome)")
+    XCTAssertTrue(captured.wasNil, "the retry must resolve with the profile default (nil override)")
+  }
+
+  func test_resume_marker_and_default_both_missing_surfaces_modelMissing() throws {
+    // Marker missing AND the profile default also missing → the single retry
+    // also fails → surface the original modelMissing (no dead-loop, real error).
+    let store = try makeStoreWithChatProfile(active: "chat")
+    defer { store.stop() }
+    try store.setActiveModelID("Org/Deleted/gone.gguf")
+    let err = EngineError(code: .modelMissing, message: "nothing resolves")
+    let engineHost = makeEngineHost()
+    let outcome = HelperResumeAction.run(
+      engineHost: engineHost, profileStore: store,
+      resolver: { _, _ in .failure(err) })   // both marker and default fail
+    XCTAssertEqual(outcome, .resolverFailed(err),
+                   "when both the marker and the profile default are missing, the real error must surface")
+  }
+
+  func test_resume_marker_non_modelMissing_failure_does_not_retry() throws {
+    // A non-modelMissing marker failure (e.g. memoryRisk) must NOT retry the
+    // default — the model is present but unsafe; retrying would not help and
+    // the reason must surface as-is.
+    let store = try makeStoreWithChatProfile(active: "chat")
+    defer { store.stop() }
+    try store.setActiveModelID("Org/Big/huge.gguf")
+    let calls = AtomicCounter()
+    let err = EngineError(code: .memoryRisk, message: "too large")
+    let engineHost = makeEngineHost()
+    let outcome = HelperResumeAction.run(
+      engineHost: engineHost, profileStore: store,
+      resolver: { _, _ in calls.increment(); return .failure(err) })
+    XCTAssertEqual(outcome, .resolverFailed(err))
+    XCTAssertEqual(calls.value, 1, "a non-modelMissing marker failure must not trigger the default retry")
+  }
+
   // MARK: - resolver failure
 
   func test_resolver_failure_surfaces_as_resolverFailed() throws {

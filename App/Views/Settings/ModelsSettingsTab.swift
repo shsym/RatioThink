@@ -135,6 +135,18 @@ struct ModelsSettingsTab: View {
     try profileStore.withClearedModelDefaults(referencing: row.filename) {
       try trashModel(row.url)
     }
+    // #469: complete the active-model marker's lifecycle at the delete choke
+    // point. The marker has precedence over the profile default in
+    // `HelperResumeAction`, so if the deleted model was the marker, a later
+    // menu-bar Resume / crash auto-relaunch would resolve the now-missing model
+    // ahead of the still-valid profile default and dead-end on `modelMissing`.
+    // Clearing it here lets Resume fall through to the profile default.
+    // Best-effort (`try?`): `clearActiveModelID` logs on failure, and
+    // `HelperResumeAction`'s marker-miss retry is the backstop for any marker
+    // that goes stale outside this path (external deletion / HF-cache eviction).
+    if profileStore.activeModelID == row.filename {
+      try? profileStore.clearActiveModelID()
+    }
     //  F10/F12: move the durable `.unverified` sidecar to the Trash
     // ALONGSIDE the GGUF — same recoverable semantics. The GGUF is
     // trashed (recoverable), so the marker must be too: a hard-remove

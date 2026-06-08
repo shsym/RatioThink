@@ -139,6 +139,80 @@ final class AddModelSheetOutcomeTests: XCTestCase {
                   "failed Trash move should leave the installed model in place")
   }
 
+  // #469 F1: deleting the model that the durable active-model marker names must
+  // clear the marker, so a later menu-bar Resume / crash auto-relaunch resolves
+  // the still-valid profile default instead of dead-ending on the now-missing
+  // marker model.
+  func test_delete_installed_model_clears_active_model_marker_for_the_deleted_file() throws {
+    let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("delete-marker-\(UUID().uuidString)", isDirectory: true)
+    let profiles = temp.appendingPathComponent("profiles", isDirectory: true)
+    let models = temp.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: models, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: temp) }
+
+    let deleted = "deleted-model.gguf"
+    try """
+    id = "chat"
+    name = "Chat"
+    model = "\(deleted)"
+    inferlet = "chat-apc"
+    """.write(to: profiles.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
+    let modelURL = models.appendingPathComponent(deleted)
+    try Data("model".utf8).write(to: modelURL)
+    let store = ProfileStore(directory: profiles)
+    try store.start()
+    defer { store.stop() }
+    try store.setActiveModelID(deleted)   // marker == the model being deleted
+    XCTAssertEqual(store.activeModelID, deleted, "precondition: marker set")
+
+    let row = InstalledModel(filename: deleted, url: modelURL, sizeBytes: 5,
+                             modifiedAt: Date(timeIntervalSince1970: 0), isPartial: false)
+    try ModelsSettingsTab.deleteInstalledModel(
+      row: row, profileStore: store,
+      trashModel: { try FileManager.default.removeItem(at: $0) },
+      trashSidecar: { _ in })
+
+    XCTAssertNil(store.activeModelID,
+                 "deleting the active model must clear the marker so Resume falls through to the profile default")
+  }
+
+  func test_delete_installed_model_preserves_marker_for_a_different_model() throws {
+    let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("delete-marker-other-\(UUID().uuidString)", isDirectory: true)
+    let profiles = temp.appendingPathComponent("profiles", isDirectory: true)
+    let models = temp.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: models, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: temp) }
+
+    let deleted = "deleted-model.gguf"
+    let other = "still-resident.gguf"
+    try """
+    id = "chat"
+    name = "Chat"
+    model = "\(other)"
+    inferlet = "chat-apc"
+    """.write(to: profiles.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
+    let modelURL = models.appendingPathComponent(deleted)
+    try Data("model".utf8).write(to: modelURL)
+    let store = ProfileStore(directory: profiles)
+    try store.start()
+    defer { store.stop() }
+    try store.setActiveModelID(other)   // marker names a DIFFERENT model
+
+    let row = InstalledModel(filename: deleted, url: modelURL, sizeBytes: 5,
+                             modifiedAt: Date(timeIntervalSince1970: 0), isPartial: false)
+    try ModelsSettingsTab.deleteInstalledModel(
+      row: row, profileStore: store,
+      trashModel: { try FileManager.default.removeItem(at: $0) },
+      trashSidecar: { _ in })
+
+    XCTAssertEqual(store.activeModelID, other,
+                   "deleting a different model must not clear an unrelated active-model marker")
+  }
+
   // MARK: - F38: emit-gate helper (review v5)
 
   // The drop closure's gate condition lives in
