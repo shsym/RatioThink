@@ -77,5 +77,8 @@ jobs:
       - name: Inferlet Rust unit tests (native)
         run: make test-inferlets
 
+      - name: Inferlet Rust unit tests (exec-strategies feature)
+        run: make test-inferlets-gated
+
       - name: Verify committed prebuilt matches stamp
         run: make verify-inferlets
