@@ -117,13 +117,23 @@ for entry in "${MATRIX_MODELS[@]}"; do
   echo "==== MATRIX MODEL: $slug  (thinking=$thinking)  profiles=[$PROFILES] ===="
   CELL_LOG="$ROOT/logs/test-$STAMP-matrix-$(printf '%s' "$file" | tr -c 'A-Za-z0-9._-' '_').log"
 
+  # Partial-download tripwire floor. The catalog's approximateSizeBytes is
+  # the EXACT blob size for the Qwen entries but a ROUNDED value for some
+  # bartowski entries (e.g. Llama-3.2-3B's 2_020_000_000 rounds ABOVE the
+  # real 2_019_377_696). The min-bytes guard exists to catch a truncated
+  # download, not to assert the byte-exact size, so floor it at 90% of the
+  # catalog figure — comfortably below any real complete file yet far above
+  # a partial one (insight #122). MATRIX_MODELS still carries the exact
+  # catalog value so the drift guard stays a 1:1 catalog check.
+  minfloor=$(( minbytes * 9 / 10 ))
+
   # Per-cell environment for run-engine-e2e.sh. The FILTER targets only the
   # profile-matrix method so the single boot does not also run the
   # happy-path + reasoning tests.
   env_args=(
     "PIE_TEST_E2E_REPO=$repo"
     "PIE_TEST_E2E_FILE=$file"
-    "PIE_TEST_E2E_MIN_BYTES=$minbytes"
+    "PIE_TEST_E2E_MIN_BYTES=$minfloor"
     "PIE_TEST_E2E_PROFILES=$PROFILES"
     "PIE_TEST_E2E_FILTER=RealEngineLaunchE2ETests/test_realEngine_profileMatrixCell"
   )
