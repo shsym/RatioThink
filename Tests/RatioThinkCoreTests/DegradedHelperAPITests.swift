@@ -88,24 +88,6 @@ final class DegradedHelperAPITests: XCTestCase {
     wait(for: [expectation], timeout: 1.0)
   }
 
-  func test_degraded_loadModel_returns_degraded_error() {
-    let api = makeAPI()
-    let expectation = XCTestExpectation(description: "loadModel reply")
-    api.loadModel(modelID: "m") { successData, errorData in
-      XCTAssertNil(successData)
-      let result = try? PieHelperXPCWire.decodeLoadModelReply(
-        successData: successData, errorData: errorData
-      )
-      if case .failure(let err)? = result {
-        XCTAssertEqual(err.code, .degraded)
-      } else {
-        XCTFail("expected .failure(.degraded), got \(String(describing: result))")
-      }
-      expectation.fulfill()
-    }
-    wait(for: [expectation], timeout: 1.0)
-  }
-
   func test_degraded_downloadModel_returns_degraded_error() {
     let api = makeAPI()
     let expectation = XCTestExpectation(description: "downloadModel reply")
@@ -124,17 +106,6 @@ final class DegradedHelperAPITests: XCTestCase {
     wait(for: [expectation], timeout: 1.0)
   }
 
-  func test_degraded_cancelLoad_returns_degraded_error() {
-    let api = makeAPI()
-    let expectation = XCTestExpectation(description: "cancelLoad reply")
-    let handleData = (try? XPCPayload.encode(LoadHandle(modelID: "m"))) ?? Data()
-    api.cancelLoad(handle: handleData) { errorData in
-      let err = try? PieHelperXPCWire.decodeOptionalError(errorData)
-      XCTAssertEqual(err?.code, .degraded)
-      expectation.fulfill()
-    }
-    wait(for: [expectation], timeout: 1.0)
-  }
 
   func test_degraded_cancelDownload_returns_degraded_error() {
     let api = makeAPI()

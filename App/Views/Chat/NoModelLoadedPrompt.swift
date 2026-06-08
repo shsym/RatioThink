@@ -10,12 +10,11 @@ import SwiftUI
 /// #397 — engine/model LIFECYCLE (`ChatStartGate.State`): the prompt
 /// renders the real reason AND the correct action for every gate state,
 /// instead of always falling through to the availability action:
-///   · busy(starting/stopping/loading) → calm wait (with the download
+///   · busy(starting/stopping) → calm wait (with the download
 ///     CTA still visible if a fresh-install model needs downloading);
 ///   · engineFailed → the reason + Retry (retryable) / Open Models
 ///     settings (model-choice faults: missing/too-large/profile) /
 ///     inline download (missing + downloadable);
-///   · loadFailed → the reason + Retry the load;
 ///   · helperUnreachable → the reason + Retry (re-poll);
 ///   · configBroken → the reason + Open Settings;
 ///   · needsDefaultLoad / noDefault → the #326 availability action.
@@ -35,8 +34,6 @@ struct NoModelLoadedPrompt: View {
   let onDownloaded: () -> Void
   /// Retry starting the engine after a retryable engine failure.
   let onRetryEngineStart: () -> Void
-  /// Retry a failed model load.
-  let onRetryLoad: (String) -> Void
   /// Re-poll the helper after an unreachable-transport failure.
   let onRefresh: () -> Void
   let onCancel: () -> Void
@@ -50,7 +47,6 @@ struct NoModelLoadedPrompt: View {
     case none
     case load          // load the on-disk default (ensures engine running first)
     case retryEngine   // re-start the engine after a retryable failure
-    case retryLoad     // re-run a failed model load
     case refresh       // re-poll an unreachable helper
   }
 
@@ -144,12 +140,6 @@ struct NoModelLoadedPrompt: View {
                   primary: retryable ? .retryEngine : .none,
                   showsOpenSettings: false)
 
-    case let .loadFailed(_, reason):
-      return Plan(headline: "Couldn't load the model", reason: reason,
-                  showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
-                  showsUnavailableCopy: false, primary: .retryLoad,
-                  showsOpenSettings: false)
-
     case let .helperUnreachable(reason):
       return Plan(headline: "Can't reach the engine", reason: reason,
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
@@ -190,9 +180,8 @@ struct NoModelLoadedPrompt: View {
 
   static func busyTitle(_ phase: ChatStartGate.BusyPhase) -> String {
     switch phase {
-    case .startingEngine:          return "Starting the engine…"
-    case .stoppingEngine:          return "Stopping the engine…"
-    case let .loadingModel(model): return "Loading \(ModelDisplayName.leaf(model))…"
+    case .startingEngine: return "Starting the engine…"
+    case .stoppingEngine: return "Stopping the engine…"
     }
   }
 
@@ -291,13 +280,6 @@ struct NoModelLoadedPrompt: View {
         .buttonStyle(.borderedProminent)
         .keyboardShortcut(.defaultAction)
         .accessibilityIdentifier("noModel.retry")
-    case .retryLoad:
-      Button("Retry") {
-        if case let .loadFailed(model, _) = gateState { onRetryLoad(model) }
-      }
-      .buttonStyle(.borderedProminent)
-      .keyboardShortcut(.defaultAction)
-      .accessibilityIdentifier("noModel.retry")
     case .refresh:
       Button("Retry") { onRefresh() }
         .buttonStyle(.borderedProminent)
@@ -310,17 +292,17 @@ struct NoModelLoadedPrompt: View {
 
   private var glyph: String {
     switch gateState {
-    case .busy:                                                    return "hourglass"
-    case .engineFailed, .loadFailed, .helperUnreachable, .configBroken:
+    case .busy:                                              return "hourglass"
+    case .engineFailed, .helperUnreachable, .configBroken:
       return "exclamationmark.triangle"
-    default:                                                       return "cpu"
+    default:                                                 return "cpu"
     }
   }
 
   private var tint: Color {
     switch gateState {
-    case .engineFailed, .loadFailed, .helperUnreachable, .configBroken: return .orange
-    default:                                                            return .secondary
+    case .engineFailed, .helperUnreachable, .configBroken: return .orange
+    default:                                                return .secondary
     }
   }
 
@@ -333,7 +315,6 @@ struct NoModelLoadedPrompt: View {
         }
         return "Your model is loading — your message will send once it's ready."
       case .stoppingEngine: return "One moment…"
-      case .loadingModel:   return "Hang tight — the model is loading."
       }
     }
     return ""

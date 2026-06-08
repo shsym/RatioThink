@@ -38,7 +38,6 @@ public final class EngineLifecycle: ObservableObject {
     self.indicator = EngineIndicatorState.make(
       engine: engineStatus.status,
       engineDetail: engineStatus.statusDetail,
-      load: modelLoad.state,
       residentModelID: modelLoad.residentModelID
     )
     wire()
@@ -47,21 +46,20 @@ public final class EngineLifecycle: ObservableObject {
   private func wire() {
     // Refold the single semantic state whenever any input changes.
     // `$status`/`$lastError` feed the engine axis (+ the `.starting` detail);
-    // `$state`/`$residentModelID` feed the load axis. `@Published` emits the
-    // current value on subscription, so `indicator` is correct immediately and
-    // stays change-guarded (`Equatable`) against churn.
-    Publishers.CombineLatest4(
+    // `$residentModelID` feeds the resident-model display (#469: the separate
+    // load axis is gone). `@Published` emits the current value on
+    // subscription, so `indicator` is correct immediately and stays
+    // change-guarded (`Equatable`) against churn.
+    Publishers.CombineLatest3(
       engineStatus.$status,
       engineStatus.$lastError,
-      modelLoad.$state,
       modelLoad.$residentModelID
     )
-    .sink { [weak self] status, _, load, resident in
+    .sink { [weak self] status, _, resident in
       guard let self else { return }
       let next = EngineIndicatorState.make(
         engine: status,
         engineDetail: self.engineStatus.statusDetail,
-        load: load,
         residentModelID: resident
       )
       if next != self.indicator { self.indicator = next }

@@ -36,13 +36,6 @@ public enum S6_XPCRoundtrip {
                     "round-trip mutated handle: \(original) → \(out)")
     }
 
-    try await r.step("LoadHandle survives round-trip with stable UUID") {
-      let original = LoadHandle(modelID: "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M.gguf")
-      let out = try await r.xpcRoundTripLoadHandle(original)
-      try r.require(out == original,
-                    "round-trip mutated handle: \(original) → \(out)")
-    }
-
     try await r.step("EngineError round-trips for every code") {
       for code in [EngineErrorCode.spawnFailed,
                    .handshakeTimeout, .modelMissing, .profileMissing,

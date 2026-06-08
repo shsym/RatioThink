@@ -148,9 +148,10 @@ public struct LocalAPIRoute: Equatable, Identifiable {
   }
 
   /// The routes `chat-apc` serves that are useful to an OpenAI-compatible
-  /// client. `/v1/inferlet` (raw dispatch) and `DELETE /v1/models/load`
-  /// (no-op) are intentionally omitted — they aren't part of the standard
-  /// client surface a user would call.
+  /// client. `/v1/inferlet` (raw dispatch) is intentionally omitted — it
+  /// isn't part of the standard client surface a user would call. (#469:
+  /// there is no `/v1/models/load` — the served model is fixed at engine boot
+  /// and read from `GET /v1/models`.)
   public static let clientFacing: [LocalAPIRoute] = [
     LocalAPIRoute(method: "POST", path: "/v1/chat/completions", summary: "Chat completions (SSE streaming)"),
     LocalAPIRoute(method: "GET", path: "/v1/models", summary: "List served models"),

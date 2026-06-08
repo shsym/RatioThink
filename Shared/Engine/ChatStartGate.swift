@@ -26,13 +26,12 @@ public enum ChatStartGate {
   /// affordance (no conflicting Load/Choose buttons that would
   /// double-trigger) rather than an actionable error.
   public enum BusyPhase: Equatable, Sendable {
-    /// Engine is `.starting` — an explicit start request or crash auto-relaunch is
-    /// bringing the engine (and, for v1's load-at-boot pie, its model) up.
+    /// Engine is `.starting` — an explicit start request, a model-switch
+    /// restart, or crash auto-relaunch is bringing the engine (and, for v1's
+    /// load-at-boot pie, its model) up.
     case startingEngine
     /// Engine is `.stopping` — transient; resolves to `.stopped` shortly.
     case stoppingEngine
-    /// A model load is in flight (engine running, `/v1/models/load`).
-    case loadingModel(modelID: String)
   }
 
   /// What the blocked send resolves to. `ready` means the gate is NOT
@@ -57,9 +56,6 @@ public enum ChatStartGate {
     /// `EngineErrorCode.invitesResumeRetry`) and route model-choice
     /// faults (missing / too-large / profile) to Models settings.
     case engineFailed(code: EngineErrorCode, reason: String, retryable: Bool)
-    /// A model load against a running engine failed. Offer Retry (re-run
-    /// the load) plus the reason.
-    case loadFailed(modelID: String, reason: String)
     /// The engine helper is unreachable over XPC (transport down) —
     /// distinct from a clean `.stopped` engine. Offer Retry + reason.
     case helperUnreachable(reason: String)
@@ -77,7 +73,6 @@ public enum ChatStartGate {
   ///     `engineStatus()` XPC poll itself failed (helper transport down).
   ///     Takes priority over `engineStatus` because a failed poll leaves
   ///     a stale/placeholder status that must not be read as truth.
-  ///   - load: the app-side `ModelLoadCenter.State`.
   ///   - resolvedModelID: the send target the app already computes
   ///     (`override ?? resident ?? PIE_TEST_CHAT_MODEL`). Non-nil ⇒ a
   ///     send can proceed and the gate is not shown.
@@ -88,7 +83,6 @@ public enum ChatStartGate {
   public static func evaluate(
     engineStatus: EngineStatus,
     helperError: String?,
-    load: ModelLoadCenter.State,
     resolvedModelID: String?,
     profileDefault: String?,
     profileError: String? = nil
@@ -118,56 +112,13 @@ public enum ChatStartGate {
       // the default is on its way — wait, don't offer a redundant Load.
       return .busy(.startingEngine)
     case .running:
-      return runningState(load: load, profileDefault: profileDefault, profileError: profileError)
+      return defaultOrNo(profileDefault: profileDefault, profileError: profileError)
     case .stopped:
-      return stoppedState(load: load, profileDefault: profileDefault, profileError: profileError)
+      return defaultOrNo(profileDefault: profileDefault, profileError: profileError)
     }
   }
 
   // MARK: - per-engine-state resolution
-
-  /// Engine `.running` but nothing resolved yet. A model load may be in
-  /// flight or terminal; otherwise the default can be loaded now
-  /// (`/v1/models/load` against the live engine).
-  private static func runningState(
-    load: ModelLoadCenter.State,
-    profileDefault: String?,
-    profileError: String?
-  ) -> State {
-    switch load {
-    case let .loading(id, _, _, _):
-      return .busy(.loadingModel(modelID: id))
-    case let .failed(id, message):
-      return .loadFailed(modelID: id, reason: message)
-    case .engineNotReady:
-      // The load deferred on a not-yet-running engine; status has since
-      // flipped to `.running`. Treat as still-coming-up; a reconcile or
-      // retry resolves it. Calmer than a failure.
-      return .busy(.startingEngine)
-    case .idle, .ready, .cancelled:
-      // `.ready` with no resolved id shouldn't occur (resident would be
-      // set → resolvedModelID non-nil), but fall through safely.
-      return defaultOrNo(profileDefault: profileDefault, profileError: profileError)
-    }
-  }
-
-  /// Engine `.stopped`. A terminal load state still routes to its
-  /// reason; otherwise offer the default (Load will START the engine
-  /// first), or report no-default / broken-config.
-  private static func stoppedState(
-    load: ModelLoadCenter.State,
-    profileDefault: String?,
-    profileError: String?
-  ) -> State {
-    switch load {
-    case let .loading(id, _, _, _):
-      return .busy(.loadingModel(modelID: id))
-    case let .failed(id, message):
-      return .loadFailed(modelID: id, reason: message)
-    case .idle, .ready, .cancelled, .engineNotReady:
-      return defaultOrNo(profileDefault: profileDefault, profileError: profileError)
-    }
-  }
 
   /// Shared tail: broken profile config beats a present default beats
   /// the genuine no-default state.

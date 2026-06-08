@@ -193,7 +193,6 @@ struct RatioThinkApp: App {
     }
     _swapCoordinator = StateObject(wrappedValue: ProfileSwapCoordinator(
       center: center,
-      engine: engine,
       profileStore: store,
       serveModel: serveModel
     ))

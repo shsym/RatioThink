@@ -17,7 +17,7 @@
 use serde::Serialize;
 use wstd::http::body::{BodyForthcoming, IncomingBody, OutgoingBody};
 use wstd::http::server::{Finished, Responder};
-use wstd::http::{IntoBody, Response, StatusCode};
+use wstd::http::{IntoBody, Response};
 use wstd::io::AsyncWrite;
 
 /// Cap on request-body bytes the chat handler will buffer. 1 MiB is
@@ -31,11 +31,6 @@ pub const CHAT_MAX_BODY: usize = 1 << 20; // 1 MiB
 /// the `input` payload is inferlet-defined and may carry larger
 /// state-replay blobs.
 pub const DISPATCH_MAX_BODY: usize = 1 << 18; // 256 KiB
-
-/// Cap on `/v1/models/load` bodies. The endpoint takes a single
-/// `{"model": "..."}` envelope; 4 KiB tolerates absurdly long model
-/// ids without inviting abuse.
-pub const LOAD_MAX_BODY: usize = 1 << 12; // 4 KiB
 
 // =============================================================================
 // EmitError (F10)
@@ -145,14 +140,6 @@ impl ModelReady {
             event: "model_ready",
         }
     }
-}
-
-/// Convenience: emit a single `model_ready` and flush. Used by both
-/// the chat-completion meta-frame prefix and the `/v1/models/load`
-/// endpoint, which currently share the same degenerate semantics
-/// (model already registered at engine boot → ready immediately).
-pub async fn emit_model_ready(em: &mut Emitter) -> Result<(), EmitError> {
-    em.emit_json(&ModelReady::new()).await
 }
 
 /// JSON-shape warning frame used inside SSE streams for non-fatal
@@ -430,21 +417,6 @@ pub fn body_error_response(err: BodyError) -> Response<wstd::http::body::Bounded
 /// consumers to branch on.
 fn transport_error_message(kind: std::io::ErrorKind) -> String {
     format!("Failed to read request body (transport error: {kind:?})")
-}
-
-// =============================================================================
-// 204 No Content helper
-// =============================================================================
-
-/// Build a 204 response with no body. Used by `DELETE /v1/models/load`
-/// (idempotent no-op until a real cancel hook lands).
-pub async fn respond_no_content(res: Responder) -> Finished {
-    let response = Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .body(BodyForthcoming)
-        .unwrap();
-    let body = res.start_response(response);
-    Finished::finish(body, Ok(()), None)
 }
 
 #[cfg(test)]

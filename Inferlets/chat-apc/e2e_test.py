@@ -476,41 +476,22 @@ async def main() -> int:
                     # harness.
                     model_id = first.get("id") if data else "default"
 
-                    # POST /v1/models/load — pre-warm OK path.
+                    # #469: /v1/models/load is REMOVED. pie binds the served
+                    # model at boot; the served model is `GET /v1/models` and
+                    # switching it is an engine relaunch, not a runtime load.
+                    # Guard the removal: the route must now be an unknown path.
+                    _ = model_id  # kept for the chat-completion checks below
                     r = await http.post(
                         f"{base}/v1/models/load",
-                        json={"model": model_id},
+                        json={"model": "anything"},
                     )
-                    print(f"[harness] POST /v1/models/load(model={model_id!r}) -> {r.status_code}")
-                    if r.status_code != 200:
-                        failures.append(f"/v1/models/load status {r.status_code}")
-                    if r.headers.get("content-type", "").split(";", 1)[0] != "text/event-stream":
-                        failures.append(
-                            f"/v1/models/load content-type {r.headers.get('content-type')!r}"
-                        )
-                    # Body should contain one model_ready meta-frame +
-                    # the [DONE] sentinel. We assert exact ordering so
-                    # GUI consumers can rely on it.
-                    text = r.text
-                    if 'data: {"event":"model_ready"}' not in text:
-                        failures.append(f"/v1/models/load missing model_ready frame: {text!r}")
-                    if "data: [DONE]" not in text:
-                        failures.append(f"/v1/models/load missing [DONE] sentinel: {text!r}")
-
-                    # POST /v1/models/load — unknown model → 404.
-                    r = await http.post(
-                        f"{base}/v1/models/load",
-                        json={"model": "does-not-exist"},
-                    )
-                    print(f"[harness] POST /v1/models/load(model='does-not-exist') -> {r.status_code}")
+                    print(f"[harness] POST /v1/models/load (removed) -> {r.status_code}")
                     if r.status_code != 404:
-                        failures.append(f"/v1/models/load unknown status {r.status_code}")
-
-                    # DELETE /v1/models/load — 204 no-op.
+                        failures.append(f"/v1/models/load should be removed (404), got {r.status_code}")
                     r = await http.delete(f"{base}/v1/models/load")
-                    print(f"[harness] DELETE /v1/models/load -> {r.status_code}")
-                    if r.status_code != 204:
-                        failures.append(f"/v1/models/load DELETE status {r.status_code}")
+                    print(f"[harness] DELETE /v1/models/load (removed) -> {r.status_code}")
+                    if r.status_code != 404:
+                        failures.append(f"DELETE /v1/models/load should be removed (404), got {r.status_code}")
 
                     # POST /v1/chat/completions — unknown model → 404
                     # (validation path, no forward pass triggered).

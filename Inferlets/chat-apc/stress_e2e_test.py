@@ -10,7 +10,7 @@ Extends the baseline `e2e_test.py` engine-side coverage with:
      that never corrupt OpenAI chunk parsing, repeated streams that don't
      cross-contaminate, client-disconnect behavior recorded against #200).
   3. Frequency/concurrency (sequential `/healthz` + `/v1/models` storms,
-     repeated `/v1/models/load`, frequent short chats, bounded concurrent
+     frequent short chats, bounded concurrent
      chats, a request storm with cancellation that must not hang or leak).
   4. Agent-client tool-call CONTRACT — the OpenAI client-side execution
      loop proven deterministically against the dummy driver:
@@ -25,7 +25,7 @@ Extends the baseline `e2e_test.py` engine-side coverage with:
      normal SDK never sends, on the no-auth loopback surface: HTTP method
      abuse, the closed-CORS security posture (no `Access-Control-*`),
      JSON type confusion, structural abuse + nested-value recursion DoS,
-     hostile content (NUL/emoji/control/RTL), and `/v1/models/load` abuse.
+     hostile content (NUL/emoji/control/RTL), and removed-endpoint (`/v1/models/load`) 404 abuse.
      Every case must fail as a 4xx JSON envelope (never a bare 5xx, hang,
      or crash) and the engine must still serve afterward.
 
@@ -514,14 +514,14 @@ async def section_concurrency(base: str, http: httpx.AsyncClient, rep: Report) -
             bad += 1
     rep.ok(bad == 0, f"{P}: 50 sequential /v1/models had {bad} failures")
 
-    # repeated /v1/models/load on the same model — instant registry lookup.
+    # #469: /v1/models/load is REMOVED (pie binds the model at boot). Hammer
+    # the removed route to prove it stays a clean 404, not a 500/hang.
     bad = 0
     for _ in range(10):
         r = await http.post(f"{base}/v1/models/load", json={"model": MODEL})
-        if r.status_code != 200 or 'data: {"event":"model_ready"}' not in r.text \
-                or "data: [DONE]" not in r.text:
+        if r.status_code != 404:
             bad += 1
-    rep.ok(bad == 0, f"{P}: 10 repeated /v1/models/load had {bad} failures")
+    rep.ok(bad == 0, f"{P}: 10 repeated /v1/models/load (removed) had {bad} non-404")
 
     # frequent short sequential chats.
     bad = 0
@@ -929,26 +929,24 @@ async def section_harsh_surface(base: str, http: httpx.AsyncClient, rep: Report)
     rep.skip(f"{P}/role: unknown roles (other than the blocked \"tool\") are accepted, "
              f"not 400'd — OpenAI-compat gap, no crash/security impact; follow-up ticket")
 
-    # ── G8: /v1/models/load control-plane abuse. Missing/null model and
-    # non-JSON -> 400; oversized body (> LOAD_MAX_BODY 4 KiB) -> 413.
-    r = await http.post(f"{base}/v1/models/load", json={})
-    rep.ok(r.status_code == 400, f"{P}/load: missing model -> {r.status_code} (want 400)")
-    r = await http.post(f"{base}/v1/models/load", content=b'{"model":null}',
-                        headers={"Content-Type": "application/json"})
-    rep.ok(r.status_code == 400, f"{P}/load: model=null -> {r.status_code} (want 400)")
-    r = await http.post(f"{base}/v1/models/load", content=b"xxx",
-                        headers={"Content-Type": "application/json"})
-    rep.ok(r.status_code == 400, f"{P}/load: non-json -> {r.status_code} (want 400)")
-    r = await http.post(f"{base}/v1/models/load",
-                        content=b'{"model":"' + b"a" * 5000 + b'"}',
-                        headers={"Content-Type": "application/json"})
-    rep.ok(r.status_code == 413, f"{P}/load: oversized -> {r.status_code} (want 413)")
-    # MEASURED: a blank/unregistered model id on load is a registry miss
-    # (404 model_not_found), NOT the 400-param rejection chat-completions
-    # gives blank model — load is a pure registration lookup with no trim.
-    r = await http.post(f"{base}/v1/models/load", json={"model": "  "})
-    rep.ok(r.status_code == 404 and _err_code(r) == "model_not_found",
-           f"{P}/load: blank model -> {r.status_code} (want 404 model_not_found — registry miss)")
+    # ── G8: /v1/models/load is REMOVED (#469 — pie binds the served model at
+    # boot; `GET /v1/models` is the served-model source of truth). Every abuse
+    # input that used to probe its validation must now hit the unknown-route
+    # fallthrough: a clean 404 `endpoint_not_found` JSON envelope, never a
+    # 400/413/500/hang.
+    removed_load_bodies = [
+        ('{}', "missing model"),
+        ('{"model":null}', "model=null"),
+        ('xxx', "non-json"),
+        ('{"model":"' + "a" * 5000 + '"}', "oversized"),
+        ('{"model":"  "}', "blank model"),
+    ]
+    for body, label in removed_load_bodies:
+        r = await http.post(f"{base}/v1/models/load", content=body.encode(),
+                            headers={"Content-Type": "application/json"})
+        rep.ok(r.status_code == 404 and _err_code(r) == "endpoint_not_found",
+               f"{P}/load: {label} -> {r.status_code} code={_err_code(r)!r} "
+               f"(want 404 endpoint_not_found — endpoint removed)")
 
     # ── Survival: after the full malformed-input barrage the engine must
     # still be healthy and serve a normal request (no wedge / leaked task).

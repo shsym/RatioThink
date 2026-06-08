@@ -905,9 +905,6 @@ private final class ProbingChatEngine: EngineClient, @unchecked Sendable {
 
   func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
   func models() async throws -> [ModelInfo] { [] }
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    AsyncThrowingStream { $0.finish() }
-  }
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     callCount += 1
     let isFirst = (callCount == 1)
@@ -949,9 +946,6 @@ private final class ReasoningRetryEngine: EngineClient, @unchecked Sendable {
 
   func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
   func models() async throws -> [ModelInfo] { [] }
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    AsyncThrowingStream { $0.finish() }
-  }
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     callCount += 1
     let isFirst = (callCount == 1)

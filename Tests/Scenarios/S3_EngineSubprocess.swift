@@ -14,12 +14,10 @@ import RatioThinkCore
 ///                                    after a successful launch is a
 ///                                    chat-apc / driver registration
 ///                                    regression, not a skip).
-///   3. `POST /v1/models/load`      — cold-load weights via the
-///                                    portable driver under a 90s
-///                                    timeout (review v1 F14 — a hung
-///                                    stream used to wedge the whole
-///                                    test under XCTest's 300s
-///                                    allowance).
+///   3. `GET  /v1/models`           — confirms the engine advertises the
+///                                    boot model under a 90s timeout
+///                                    (#469: pie binds the served model at
+///                                    boot; there is no `/v1/models/load`).
 ///   4. `POST /v1/chat/completions` — drain the SSE stream and assert
 ///                                    at least one `.delta` arrived
 ///                                    AND the accumulated tokens look
@@ -95,19 +93,14 @@ public enum S3_EngineSubprocess {
     // for traceability via an inline log line.
     let chatModel = try await Self.resolveChatModel(r: r, client: client)
 
-    try await r.step("load \(chatModel) (≤90s)") {
-      try await S3_EngineSubprocess.withTimeout(seconds: 90, label: "loadModel(\(chatModel))") {
-        var sawReady = false
-        for try await event in client.loadModel(chatModel) {
-          switch event {
-          case .loading:
-            continue
-          case .ready:
-            sawReady = true
-          }
-        }
-        try r.require(sawReady,
-                      "loadModel(\(chatModel)) stream ended without a .ready event")
+    try await r.step("engine serves \(chatModel) (boot model; ≤90s)") {
+      // #469: v1 pie binds the served model at `pie serve` boot, so there is
+      // no `/v1/models/load` to drive — confirm the engine advertises the
+      // boot model on `GET /v1/models` (the only id its chat endpoint accepts).
+      try await S3_EngineSubprocess.withTimeout(seconds: 90, label: "models(\(chatModel))") {
+        let served = try await client.models().map(\.id)
+        try r.require(served.contains(chatModel),
+                      "engine did not advertise the boot model \(chatModel); served=\(served)")
       }
     }
 

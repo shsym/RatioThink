@@ -132,19 +132,6 @@ public struct DownloadHandle: Codable, Equatable, Hashable, Sendable {
   }
 }
 
-/// Opaque ticket for an in-flight `loadModel` pre-warm. Same shape as
-/// `DownloadHandle` but distinct type so GUI code can't accidentally
-/// cancel the wrong subsystem.
-public struct LoadHandle: Codable, Equatable, Hashable, Sendable {
-  public let id: UUID
-  public let modelID: String
-
-  public init(id: UUID = UUID(), modelID: String) {
-    self.id = id
-    self.modelID = modelID
-  }
-}
-
 /// Discriminated engine failure category. Kept narrow on purpose; new
 /// cases require a deliberate decision about how the GUI should render
 /// them. Bag any extra detail in `message`.

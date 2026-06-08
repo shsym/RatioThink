@@ -23,38 +23,26 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
 
   private struct StubWriteError: Error {}
 
-  /// `MockEngineClient` whose `sleep` seam is a no-op (see prior note):
-  /// removes the cooperative hops that would race the consumer's
-  /// @MainActor for-await against the producer in tests.
-  private func makeFastEngine() -> MockEngineClient {
-    MockEngineClient(
-      config: .init(
-        loadStepInterval: .milliseconds(0),
-        chatStepInterval: .milliseconds(0),
-        loadSteps: 1,
-        totalBytes: 100
-      ),
-      sleep: { _ in }
-    )
-  }
-
   private func makeCoordinator(
     map: [String: String?],
     resident: String? = nil,
     setDefaultModelError: Error? = nil
   ) -> (ProfileSwapCoordinator, ModelLoadCenter, DefaultWriteSpy) {
     let center = ModelLoadCenter(initialResident: resident)
-    let engine = makeFastEngine()
     let spy = DefaultWriteSpy()
     spy.errorToThrow = setDefaultModelError
     let coord = ProfileSwapCoordinator(
       center: center,
-      engine: engine,
       modelForProfile: { map[$0] ?? nil },
       setDefaultModel: { profileID, model in
         spy.writes.append((profileID: profileID, model: model))
         if let error = spy.errorToThrow { throw error }
-      }
+      },
+      // #469: a confirmed pick routes through the engine (re)launch executor.
+      // Simulate the engine coming up serving the picked model by reconciling
+      // residency, so `center.residentModelID` reflects the load the way the
+      // production status-aware executor does.
+      serveModel: { modelID, _ in center.reconcileEngineResident(modelID) }
     )
     return (coord, center, spy)
   }
@@ -80,7 +68,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     coord.requestSwap(toProfileID: "next") { committed = $0 }
     XCTAssertEqual(committed, "next")
     XCTAssertNil(coord.pending)
-    XCTAssertEqual(center.state, .ready(modelID: "m1"),
+    XCTAssertEqual(center.residentModelID, "m1",
                    "unknown target model: no load fires, resident stays put (no deferred silent load)")
   }
 
@@ -90,7 +78,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     coord.requestSwap(toProfileID: "next") { committed = $0 }
     XCTAssertEqual(committed, "next")
     XCTAssertNil(coord.pending)
-    XCTAssertEqual(center.state, .ready(modelID: "m1"), "same model: load must not fire")
+    XCTAssertEqual(center.residentModelID, "m1", "same model: load must not fire")
   }
 
   ///  inferlet-only invariant: a profile whose model equals the
@@ -101,7 +89,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     let (coord, center, _) = makeCoordinator(map: ["docs": "m1"], resident: "m1")
     coord.requestSwap(toProfileID: "docs") { _ in }
     XCTAssertNil(coord.pending, "an inferlet-only change (same model) must not raise the confirm")
-    XCTAssertEqual(center.state, .ready(modelID: "m1"), "an inferlet-only change must not load")
+    XCTAssertEqual(center.residentModelID, "m1", "an inferlet-only change must not load")
   }
 
   // MARK: - cross-model profile swap
@@ -129,10 +117,9 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertNil(coord.pending)
 
     await waitUntil(timeout: 2.0) {
-      if case .ready = center.state { return true }
-      return false
+      return center.residentModelID == "m2"
     }
-    XCTAssertEqual(center.state, .ready(modelID: "m2"))
+    XCTAssertEqual(center.residentModelID, "m2")
     XCTAssertEqual(center.residentModelID, "m2")
   }
 
@@ -143,7 +130,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     cancelCurrent(coord)
     XCTAssertNil(coord.pending)
     XCTAssertNil(committed)
-    XCTAssertEqual(center.state, .ready(modelID: "m1"))
+    XCTAssertEqual(center.residentModelID, "m1")
   }
 
   // MARK: - model override + set-as-default ( step 5)
@@ -165,7 +152,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     coord.requestModelOverride(modelID: "m1", activeProfileID: "chat") { committed = $0 }
     XCTAssertEqual(committed, "m1", "picking the already-resident model just sets the override")
     XCTAssertNil(coord.pending)
-    XCTAssertEqual(center.state, .ready(modelID: "m1"), "no reload for the already-resident model")
+    XCTAssertEqual(center.residentModelID, "m1", "no reload for the already-resident model")
   }
 
   func test_confirm_override_with_set_as_default_persists_model_onto_profile() async throws {
@@ -179,8 +166,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertEqual(spy.writes.first?.profileID, "chat")
     XCTAssertEqual(spy.writes.first?.model, "m2")
     await waitUntil(timeout: 2.0) {
-      if case .ready = center.state { return true }
-      return false
+      return center.residentModelID == "m2"
     }
     XCTAssertEqual(center.residentModelID, "m2", "confirm always loads the chosen model")
   }
@@ -192,8 +178,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
 
     XCTAssertTrue(spy.writes.isEmpty, "unchecked 'set as default' must not persist a profile default")
     await waitUntil(timeout: 2.0) {
-      if case .ready = center.state { return true }
-      return false
+      return center.residentModelID == "m2"
     }
     XCTAssertEqual(center.residentModelID, "m2", "the load still happens even without set-as-default")
   }
@@ -207,8 +192,7 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertNotNil(coord.defaultModelWriteError,
                     "a failed set-as-default write must be surfaced, not swallowed (review F2)")
     await waitUntil(timeout: 2.0) {
-      if case .ready = center.state { return true }
-      return false
+      return center.residentModelID == "m2"
     }
     XCTAssertEqual(center.residentModelID, "m2",
                    "the chosen model still loads even when the default-persist failed")
@@ -395,26 +379,25 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     coord.requestSwap(toProfileID: "next") { committed = $0 }
     XCTAssertEqual(committed, "next")
     XCTAssertNil(coord.pending, "no resident → silent swap, no confirm popover")
-    XCTAssertEqual(center.state, .idle, "no resident: no load fires")
+    XCTAssertNil(center.residentModelID, "no resident: no load fires")
   }
 
   // MARK: - review v1 F5: loadDirect short-circuit (used by the no-model prompt's Load)
 
   func test_loadDirect_short_circuits_when_model_already_resident() {
     let (coord, center, _) = makeCoordinator(map: [:], resident: "m1")
-    let stateBefore = center.state
     coord.loadDirect(modelID: "m1", profileID: "chat")
-    XCTAssertEqual(center.state, stateBefore, "loadDirect on resident model must be a no-op — no flash")
+    XCTAssertEqual(center.residentModelID, "m1",
+                   "loadDirect on the resident model must be a no-op — resident unchanged")
   }
 
   func test_loadDirect_fires_load_when_model_differs() async throws {
     let (coord, center, _) = makeCoordinator(map: [:], resident: "m1")
     coord.loadDirect(modelID: "m2", profileID: "chat")
     await waitUntil(timeout: 2.0) {
-      if case .ready = center.state { return true }
-      return false
+      return center.residentModelID == "m2"
     }
-    XCTAssertEqual(center.state, .ready(modelID: "m2"))
+    XCTAssertEqual(center.residentModelID, "m2")
   }
 
   // MARK: - review v1 F8: confirm/cancel without pending no-ops
@@ -433,10 +416,9 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     coord.dismissCurrentPending()
     XCTAssertNil(coord.pending)
     await waitUntil(timeout: 2.0) {
-      if case .ready = center.state { return true }
-      return false
+      return center.residentModelID == "m2"
     }
-    XCTAssertEqual(center.state, .ready(modelID: "m2"))
+    XCTAssertEqual(center.residentModelID, "m2")
   }
 
   // MARK: - #469: a confirmed pick routes through the engine (re)launch executor
@@ -457,7 +439,6 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     let spy = ServeSpy()
     let coord = ProfileSwapCoordinator(
       center: center,
-      engine: makeFastEngine(),
       modelForProfile: { map[$0] ?? nil },
       serveModel: { modelID, profileID in
         spy.calls.append((modelID: modelID, profileID: profileID))

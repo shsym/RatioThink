@@ -16,29 +16,10 @@ final class EngineLifecycleTests: XCTestCase {
 
   // MARK: - ModelLoadCenter.engineLeftRunning (stop edge)
 
-  func test_engineLeftRunning_clears_ready_resident_to_idle() {
+  func test_engineLeftRunning_clears_resident() {
     let center = ModelLoadCenter(initialResident: "org/model")
-    XCTAssertEqual(center.state, .ready(modelID: "org/model"))
     center.engineLeftRunning()
     XCTAssertNil(center.residentModelID)
-    XCTAssertEqual(center.state, .idle)
-  }
-
-  func test_engineLeftRunning_abandons_inflight_loading_to_idle() {
-    let center = ModelLoadCenter()
-    center._testOverrideState(.loading(modelID: "m", loadedBytes: 1, totalBytes: 10, etaSeconds: nil))
-    center.engineLeftRunning()
-    XCTAssertNil(center.residentModelID)
-    XCTAssertEqual(center.state, .idle)
-  }
-
-  func test_engineLeftRunning_keeps_failed_terminal_but_drops_residency() {
-    let center = ModelLoadCenter(initialResident: "org/model")
-    center._testOverrideState(.failed(modelID: "m", message: "boom"))
-    XCTAssertEqual(center.residentModelID, "org/model")  // _testOverrideState only sets resident on .ready
-    center.engineLeftRunning()
-    XCTAssertNil(center.residentModelID)                 // residency gone …
-    XCTAssertEqual(center.state, .failed(modelID: "m", message: "boom"))  // … but the failure stays as history
   }
 
   func test_engineLeftRunning_is_idempotent_noop_when_idle() {
@@ -46,7 +27,6 @@ final class EngineLifecycleTests: XCTestCase {
     center.engineLeftRunning()
     center.engineLeftRunning()
     XCTAssertNil(center.residentModelID)
-    XCTAssertEqual(center.state, .idle)
   }
 
   // MARK: - ModelLoadCenter.engineServesNoModel (running-but-empty)
@@ -55,15 +35,6 @@ final class EngineLifecycleTests: XCTestCase {
     let center = ModelLoadCenter(initialResident: "org/model")
     center.engineServesNoModel()
     XCTAssertNil(center.residentModelID)
-    XCTAssertEqual(center.state, .idle)
-  }
-
-  func test_engineServesNoModel_noops_while_loading() {
-    let center = ModelLoadCenter()
-    let loading = ModelLoadCenter.State.loading(modelID: "m", loadedBytes: 0, totalBytes: 0, etaSeconds: nil)
-    center._testOverrideState(loading)
-    center.engineServesNoModel()
-    XCTAssertEqual(center.state, loading)  // a legitimate in-flight load is never clobbered
   }
 
   // MARK: - EngineLifecycle coordinator
@@ -89,7 +60,6 @@ final class EngineLifecycleTests: XCTestCase {
     store._applyPollForTesting(next: .stopped, error: nil)
 
     XCTAssertNil(center.residentModelID, "residency must be cleared on the stop edge")
-    XCTAssertEqual(center.state, .idle, "a settled .ready must demote to .idle")
     XCTAssertEqual(lifecycle.indicator, .offline, "the fold must be offline, never resident")
   }
 

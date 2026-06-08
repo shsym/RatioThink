@@ -134,21 +134,10 @@ public protocol PieHelperXPC {
   func stopEngine(reply: @escaping (_ errorData: Data?) -> Void)
 
   /// On success `successData` decodes to `LoadHandle`; on rejection
-  /// `errorData` decodes to `EngineError`. Exactly one is non-nil.
-  /// Reshaped from `(Data) -> Void` because the prior shape forced
-  /// stubs to synthesize a handle that referenced nothing, leaving the
-  /// GUI polling a non-existent load forever (review v1 F8).
-  func loadModel(modelID: String,
-                 reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
-
-  /// `handle` is `XPCPayload.encode(LoadHandle)`. Reply is
-  /// `XPCPayload.encode(EngineError)` on rejection (decode failure,
-  /// unknown handle, helper busy) or nil on acceptance — review F4.
-  func cancelLoad(handle: Data, reply: @escaping (_ errorData: Data?) -> Void)
-
   /// On success `successData` decodes to `DownloadHandle`; on rejection
-  /// `errorData` decodes to `EngineError`. Reshape rationale matches
-  /// `loadModel` — review v1 F8.
+  /// `errorData` decodes to `EngineError`. Reshape rationale: the prior
+  /// `(Data) -> Void` shape forced stubs to synthesize a handle that
+  /// referenced nothing (review v1 F8).
   func downloadModel(repo: String, file: String,
                      reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
 
@@ -370,35 +359,6 @@ public enum PieHelperXPCWire {
         message: "tailLog reply violated wire contract: handle=\(handle != nil) errorData=\(errorData != nil)"
       )
     }
-  }
-
-  // MARK: - loadModel (handle-or-error)
-
-  /// Reply-block helper for `loadModel`. Mirrors `replyStartEngine`
-  /// shape and failure handling — review v1 F8.
-  public static func replyLoadModel(
-    _ result: Result<LoadHandle, EngineError>,
-    via reply: (Data?, Data?) -> Void
-  ) {
-    _replyHandleOrError(
-      result, via: reply,
-      encode: defaultEncode,
-      onEncodeFailure: { PieHelperXPCLog.encodeFailure($0, site: "replyLoadModel") }
-    )
-  }
-
-  /// Decode a `loadModel` reply tuple. Wire-contract discipline matches
-  /// `decodeStartEngineReply`.
-  public static func decodeLoadModelReply(
-    successData: Data?,
-    errorData: Data?
-  ) throws -> Result<LoadHandle, EngineError> {
-    try decodeHandleOrErrorReply(
-      LoadHandle.self,
-      successData: successData,
-      errorData: errorData,
-      slot: "loadModel"
-    )
   }
 
   // MARK: - downloadModel (handle-or-error)

@@ -42,7 +42,6 @@ public protocol ScenarioRunner {
   // before Phase 2 brings up the helper listener.
   func xpcRoundTripEngineStatus(_ status: EngineStatus) async throws -> EngineStatus
   func xpcRoundTripDownloadHandle(_ handle: DownloadHandle) async throws -> DownloadHandle
-  func xpcRoundTripLoadHandle(_ handle: LoadHandle) async throws -> LoadHandle
   func xpcRoundTripEngineError(_ error: EngineError) async throws -> EngineError
   func xpcStartEngineReplyRoundTrip(
     _ result: Result<RatioThinkCore.EnginePort, EngineError>

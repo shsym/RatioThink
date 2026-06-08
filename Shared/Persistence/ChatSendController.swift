@@ -110,14 +110,17 @@ public final class ChatSendController: ObservableObject {
               return
             }
             switch event {
-            case let .modelLoading(loaded, total, eta):
-              modelLoadCenter.applyChatMetaEvent(
-                .loading(loadedBytes: loaded, totalBytes: total, etaSeconds: eta),
-                modelID: options.modelID
-              )
-              writer?.flush()
+            case .modelLoading:
+              // #469: pie binds the served model at `pie serve` boot, so a
+              // chat-stream `model_loading` meta-frame carries no actionable
+              // load progress (the dead `/v1/models/load` UI is gone). Ignore.
+              break
             case .modelReady:
-              modelLoadCenter.applyChatMetaEvent(.ready, modelID: options.modelID)
+              // The engine confirmed it is serving this model for the turn —
+              // record residency so the composer's send gate unblocks. (This
+              // is the residency half of the former ModelLoadCenter; the
+              // load-progress half was removed with `/v1/models/load`.)
+              modelLoadCenter.reconcileEngineResident(options.modelID)
               writer?.flush()
             case let .delta(_, content):
               writer?.appendDelta(content)

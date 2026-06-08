@@ -108,7 +108,6 @@ OpenAI-compatible HTTP surface (`HTTPEngineClient`):
 | `GET /healthz` | `{"status":"ok"}` liveness. |
 | `GET /v1/models` | `{"object":"list","data":[{id,object,owned_by}]}`. |
 | `POST /v1/chat/completions` | **SSE** stream: a `{"event":"model_ready"}` meta-frame, then OpenAI `chat.completion.chunk` deltas, ending in `data: [DONE]`. |
-| `POST /v1/models/load` | SSE: `model_ready` + `[DONE]` (instant — see invariants). |
 | `POST /v1/inferlet` | Raw inferlet dispatch (v1 routes only `chat-apc`). |
 
 Streaming is consumed with `URLSession.bytes(for:)`, so cancelling the consumer
@@ -127,7 +126,6 @@ its HTTP listener and routes each request to it (`Inferlets/chat-apc/src/lib.rs`
 | `GET /v1/models` | `control::models` | List the model registered at boot. |
 | `POST /v1/chat/completions` | `chat::completions` | Generate; stream OpenAI SSE chunks. |
 | `POST /v1/inferlet` | `chat::dispatch` | Raw dispatch (v1: chat-apc only). |
-| `POST` / `DELETE /v1/models/load` | `control::load` | Confirm load / no-op cancel. |
 
 "APC" is **A**daptive **P**ersonality/**C**apability: the chat loop runs decoder
 wrappers (`chat/apc.rs`) alongside the base decoder. The reasoning decoder emits
@@ -136,8 +134,9 @@ implemented — it emits OpenAI `tool_calls` (with `finish_reason: "tool_calls"`
 whenever a request supplies a `tools` array — but the v1 RatioThink app never
 sends `tools`, so it stays dormant in the shipping product (OpenAI client-side
 tool-call model). The control plane is a thin
-registry view — because the model is already loaded at boot, `/v1/models/load`
-just confirms the model and emits `model_ready`.
+registry view — the model is already loaded at boot, so the served model is
+fixed by the boot config and read from `GET /v1/models` (#469: there is no
+runtime `/v1/models/load` — switching the served model is an engine relaunch).
 
 ---
 
@@ -178,9 +177,10 @@ Things that are easy to get wrong, and where to look:
   (`[[model]].name`) *is* the id in chat/model responses — no translation layer
   (`PieControlLauncher.renderConfigBody`).
 - **The model loads at engine boot.** It comes from `config.toml`'s `hf_repo`, not from
-  a runtime load call. So `/v1/models/load` is an instant registry confirm, and a slow
-  first load shows up as `EngineStatus.starting`, not as in-flight load progress
-  (`Shared/Engine/ModelLoadCenter.swift`, `Inferlets/chat-apc/src/control/load.rs`).
+  a runtime load call (#469: there is no `/v1/models/load`). The served model is read
+  from `GET /v1/models`; switching it is an engine relaunch, and a slow first load shows
+  up as `EngineStatus.starting`, not as in-flight load progress
+  (`Shared/Engine/ModelLoadCenter.swift` now tracks only residency).
 - **XPC status is pull, not push; starts are explicit requests.** The app polls
   `engineStatus()`; the helper does not stream status changes, and helper boot leaves
   the engine stopped. The launch prompt/user-confirm path plus explicit Restart, Local

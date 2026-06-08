@@ -284,22 +284,17 @@ enum EngineHarness {
   }
 
   private static func loadModel(_ model: String, baseURL: URL) async throws {
+    // #469: v1 pie binds the served model at `pie serve` boot, so there is no
+    // `/v1/models/load` to drive — confirm the engine advertises the boot
+    // model on `GET /v1/models` (the only id its chat endpoint accepts).
     let client = HTTPEngineClient(baseURL: baseURL, unaryTimeout: 15)
-    try await withTimeout(seconds: 120, label: "loadModel(\(model))") {
-      var ready = false
-      for try await event in client.loadModel(model) {
-        switch event {
-        case .ready:
-          ready = true
-        case .loading:
-          continue
-        }
-      }
-      if !ready {
+    try await withTimeout(seconds: 120, label: "models(\(model))") {
+      let served = try await client.models().map(\.id)
+      if !served.contains(model) {
         throw HarnessError.modelLoadEndedWithoutReady(model)
       }
     }
-    print("chat-engine-harness: loaded \(model)")
+    print("chat-engine-harness: serving \(model)")
   }
 
   private static func waitForSIGTERM() async {

@@ -65,11 +65,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
-        if self.path == "/v1/models/load":
-            self.send_sse([
-                {"event": "model_ready"},
-            ])
-        elif self.path == "/v1/chat/completions":
+        # #469: no /v1/models/load — pie binds the model at boot.
+        if self.path == "/v1/chat/completions":
             response = self.server.state.record_chat(body)
             self.send_sse([
                 {

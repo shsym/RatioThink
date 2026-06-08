@@ -24,8 +24,6 @@ final class XPCProtocolTests: XCTestCase {
       "startEngineWithProfileID:modelOverride:reply:",
       "restartEngineWithProfileID:modelOverride:reply:",
       "stopEngineWithReply:",
-      "loadModelWithModelID:reply:",
-      "cancelLoadWithHandle:reply:",
       "downloadModelWithRepo:file:reply:",
       "cancelDownloadWithHandle:reply:",
       "listProfilesWithReply:",
@@ -132,11 +130,6 @@ final class XPCProtocolTests: XCTestCase {
   func test_downloadHandle_roundtrip() throws {
     let h = DownloadHandle(repo: "bartowski/Llama-3.2-3B-Instruct-GGUF",
                            file: "Q4_K_M.gguf")
-    assertRoundTrip(h)
-  }
-
-  func test_loadHandle_roundtrip() throws {
-    let h = LoadHandle(modelID: "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M.gguf")
     assertRoundTrip(h)
   }
 

@@ -15,7 +15,7 @@ below in the same change.
 | `make build-static` | Xcode Debug compile/type check of the Rational app + helper with `PIE_SKIP_ENGINE_BUILD=1` so the Rust engine long pole is not built | local + optional manual GitHub workflow | Lightweight compile/type check in `ci-pr` |
 | `make local-pre-merge` | `ci-pr` plus `build-tests`, app-unit, scenario/smoke, HTTP E2E, real-pie driver contract, gmake recipe canary | local operator machine | **Mandatory before merge** for non-doc changes; carries runtime coverage kept local |
 | `make local-gui-gate` | GUI wrapper script regressions + full `RatioThinkGUITests` matrix | seated local session | **Mandatory before merge** for GUI/UI changes |
-| `make local-e2e-gate` | Standard real-engine/model/signing/helper E2E wrappers (`test-e2e-engine`, `test-e2e-models`, `test-e2e-load`, `test-e2e-396`, `test-e2e-chat`, `test-e2e-tot`, `test-e2e-full`, GUI history/package, helper respawn/recovery, structured quit); excludes the separate ~9 GB `test-e2e-large-model` proof | local/operator only | **Mandatory before merge/release** for affected engine/model/install paths |
+| `make local-e2e-gate` | Standard real-engine/model/signing/helper E2E wrappers (`test-e2e-engine`, `test-e2e-models`, `test-e2e-chat`, `test-e2e-tot`, `test-e2e-full`, GUI history/package, helper respawn/recovery, structured quit); excludes the separate ~9 GB `test-e2e-large-model` proof | local/operator only | **Mandatory before merge/release** for affected engine/model/install paths |
 | `make release-gate` | `local-pre-merge` + live-HF curated audit + DMG layout + artifact preflight | local/operator + release machine | **Mandatory before release**; also run `make release-preflight ARTIFACT=…` on the built artifact |
 | `make lint` | helper side-effect invariants (static) | anywhere | Local/manual via `ci-pr` |
 | `make build` | Debug build of the Rational app + helper, including real Rust engine bundle build | local | Local packaging/runtime verification |
@@ -85,7 +85,6 @@ that wrapper, not bare `xcodebuild`.
 | `S204_ModelAcquisitionGUITests` | model discovery | Settings curated download → **verified** badge (sha256 == HF X-Linked-Etag) | real HF download (no inference) | `test-e2e-models` |
 | `S204_UnverifiedBadgeGUITests` | model discovery | `.unverified` sidecar row badges after rescan; clean row does not | no engine/network (staged files) | `test-e2e-models` |
 | `S260_ChatModelMenuGUITests` | model discovery | chat model menu contains seeded default profile model | mock (static placeholder menu) | `test-gui-chat` |
-| `S302_ModelLoadIndicatorPath1GUITests` | model load/status | explicit load → "Loading…" → ready ring; mid-load Cancel clears + no late ready | app+fake-engine (`loadviz-harness.py`) | `test-e2e-load` |
 | `S286_NoModelSendGateGUITests` | model load/status | send with nothing resolvable BLOCKS behind the "No model loaded" confirm (no silent load) | mock (gate fires pre-engine) | `test-gui-chat` |
 | `S258_ComposerSendGUITests` | chat send/persist | send → **real pie stream** → bubble → SwiftData persist across relaunch | **app+real-engine (real Qwen3-0.6B)** | `test-e2e-chat` |
 | `S204_ChatSendGUITests` | chat send/persist | INSTRUCT model answers "Paris" → persists across relaunch | **app+real-engine (real GGUF)** | `test-e2e-full` |
@@ -96,7 +95,6 @@ that wrapper, not bare `xcodebuild`.
 | `S327_EngineStatusIndicatorGUITests` | model load/status | always-visible engine-status pip; popover **stays open** across 1 Hz poll ticks (`pollCount` demoted from `@Published`) | mock (no engine) | `test-gui` |
 | `S360_ModelsTopAlignGUITests` | settings/shell | Settings → Models empty state stays **top-aligned**, not vertically centered (mirrors S285) | mock (isolated empty `PIE_HOME`) | `test-gui` |
 | `S365_CachedModelDiscoveryGUITests` | model discovery | HF-cache-staged model surfaces as a Settings **"HF-cache" row** + in the profile picker; pure filesystem scan | staged HF cache (no engine/network) | `run-cache-discovery-gui-e2e.sh` |
-| `S396_RetryRecoveryGUITests` | model load/status | forced HTTP 500 load → red "Load failed" pip; popover **Retry** recovers (`retryLast`), **Dismiss** clears (default key) | app+fake-engine (`loadviz-harness.py` fail-first) | `test-e2e-396` |
 
 > Reconciled against `Tests/GUIScenarioTests/` on 2026-06-02 — every suite on
 > disk is listed above. A `S7_FirstLaunchWizardPackagedModelDownloadGUITests`
@@ -120,7 +118,7 @@ exact fix command when a human gate is unmet.
 | large curated model real-engine proof | `make test-e2e-large-model` (manual/local; representative Qwen3 14B single-file GGUF, override with `PIE_TEST_E2E_REPO`/`PIE_TEST_E2E_FILE`) | — |
 | engine-free chat surfaces | `make test-gui-chat` (S260/S279/S285/S286) | `test-gui` |
 | model discovery / download | `make test-e2e-models` (S204 acquisition + unverified badge + live HF acquire); `Scripts/run-cache-discovery-gui-e2e.sh` (S365 HF-cache → Settings row) | — |
-| model load / status | `make test-e2e-load` (S302 indicator); `make test-e2e-396` (S396 failed-load Retry/Dismiss) | — |
+| model load / status | engine-restart surface (#469: the `/v1/models/load` load-indicator UI was removed — a model switch is an engine restart). Unit: `EngineIndicatorStateTests` / `ChatStartGateTests` / `ModelLoadIndicatorLabelTests` / `ModelLoadPopoverConfirmTests`; restart-serves-X proven by `RealEngineLaunchE2ETests.test_realEngine_servesExplicitPick_andResumeHonorsMarker` (`test-e2e-engine`) | — |
 | chat send / persist (real) | `make test-e2e-chat` (S258); `make test-e2e-full` (S204 3-layer) | — |
 | chat history / resume | `make test-gui-history` (S275 deterministic) | — |
 | install-time launchd safety | `make test-install-guards` (stubbed, runs anywhere — local/manual via `ci-pr`) | `test-ssh` / `ci-pr` |
@@ -201,7 +199,7 @@ Every suite/job kept out of `make ci-pr` or the manual lightweight workflow maps
 | Inferlet wasm rebuild/restamp (`make build-inferlets`) | local-required-before-merge for inferlet changes | `make stamp-inferlets` then `make verify-inferlets-inputs`; cheap `make test-stamp test-inferlets verify-inferlets` remains available in the conditional manual workflow | When `Inferlets/**`, `Vendor/pie`, WIT/vendor pin, or prebuilt wasm changes |
 | HTTP API E2E | local-required-before-merge | `make test-e2e-http` or aggregate `make local-pre-merge` | chat-apc HTTP/SSE/tool-call changes |
 | GUI/XCUITest suites | local-required-before-merge for UI | `make local-gui-gate` or focused `make test-gui-*` targets | SwiftUI/layout/copy/a11y/menu/wizard/model UI changes; requires seated session + TCC |
-| Real-engine/model/signing/helper E2E wrappers | local-required-before-merge/release for affected paths | `make local-e2e-gate` or focused standard targets: `make test-e2e-engine`, `make test-e2e-models`, `make test-e2e-load`, `make test-e2e-396`, `make test-e2e-chat`, `make test-e2e-tot`, `make test-e2e-full`, `make test-gui-history`, `make test-gui-first-launch-package`, `make test-helper-respawn`, `make test-helper-recovery` | Engine/model/download/chat persistence/install/helper lifecycle changes; before release for affected areas. The ~9 GB `make test-e2e-large-model` proof is a separate manual/operator target invoked directly, not part of `local-e2e-gate`, `release-gate`, or PR CI. |
+| Real-engine/model/signing/helper E2E wrappers | local-required-before-merge/release for affected paths | `make local-e2e-gate` or focused standard targets: `make test-e2e-engine`, `make test-e2e-models`, `make test-e2e-chat`, `make test-e2e-tot`, `make test-e2e-full`, `make test-gui-history`, `make test-gui-first-launch-package`, `make test-helper-respawn`, `make test-helper-recovery` | Engine/model/download/chat persistence/install/helper lifecycle changes; before release for affected areas. The ~9 GB `make test-e2e-large-model` proof is a separate manual/operator target invoked directly, not part of `local-e2e-gate`, `release-gate`, or PR CI. |
 | Packaging/notarization artifact assessment | local-required-before-release | `make release-preflight ARTIFACT=path/to/RatioThink.app` or `make release-preflight ARTIFACT=path/to/RatioThink-<arch>.dmg` after packaging/notarization | Every release candidate artifact |
 
 ### Confirm-before-PR by change type
@@ -349,7 +347,7 @@ wrapper printed `chat gui e2e: PASS` and the persisted assistant row contained
 
 Use this scenario for conversation-history correctness. It deliberately does
 not rely on real LLM output: the wrapper starts a local deterministic HTTP
-harness that implements `/healthz`, `/v1/models`, `/v1/models/load`, and
+harness that implements `/healthz`, `/v1/models`, and
 `/v1/chat/completions`, records every chat request body as JSONL, and streams
 fixed assistant responses.
 

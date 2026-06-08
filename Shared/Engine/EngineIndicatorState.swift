@@ -1,10 +1,15 @@
 import Foundation
 
-/// The single semantic state the toolbar engine-status pip renders,
-/// folding the two independent sources of truth — `EngineStatus`
-/// (engine lifecycle) and `ModelLoadCenter.State` (model load) — into
-/// one value. Pure and `Equatable` so the whole state→meaning mapping is
-/// unit-tested without SwiftUI, mirroring `HelperStatusItemModel.make`.
+/// The single semantic state the toolbar engine-status pip renders, derived
+/// from `EngineStatus` (engine lifecycle) plus the resident model id. Pure and
+/// `Equatable` so the whole state→meaning mapping is unit-tested without
+/// SwiftUI, mirroring `HelperStatusItemModel.make`.
+///
+/// #469: there is no longer a separate model-load axis. v1 pie binds the
+/// served model at `pie serve` boot, so a model switch is an engine
+/// restart (`.starting` → `.running`), and the dead `/v1/models/load`
+/// load-progress surface was removed. "Loading model X" is now the engine's
+/// own `.starting` state.
 ///
 /// The view owns *presentation* (pip text with the model leaf + percent,
 /// SF Symbols, popover rows); this enum owns *meaning* (which state, what
@@ -12,14 +17,11 @@ import Foundation
 public enum EngineIndicatorState: Equatable, Sendable {
   /// Engine stopped. Grey dot, no pip text — a calm idle affordance.
   case offline
-  /// Engine starting / stopping, a deferred load, or helper briefly
-  /// unreachable. Amber dot. `detail` carries the store's status detail
-  /// (e.g. "Engine starting…" or "Helper unreachable: …").
+  /// Engine starting / stopping (incl. a restart bringing up a switched
+  /// model) or helper briefly unreachable. Amber dot. `detail` carries the
+  /// store's status detail (e.g. "Engine starting…" or "Helper unreachable: …").
   case starting(detail: String)
-  /// A model load is in flight (foreground — outranks a running engine).
-  /// `fraction` is nil for an indeterminate load.
-  case loading(modelID: String, fraction: Double?)
-  /// Engine running, no active/failed load. Green dot, quiet. `modelID`
+  /// Engine running, no failure. Green dot, quiet. `modelID`
   /// is the resident model when known (popover shows it + memory).
   case running(modelID: String?)
   /// A failure that must be loud: red dot + an in-window banner.
@@ -37,10 +39,10 @@ public enum EngineIndicatorState: Equatable, Sendable {
 
   public var dot: Dot {
     switch self {
-    case .offline:            return .offline
-    case .starting, .loading: return .busy
-    case .running:            return .running
-    case .error:              return .error
+    case .offline:  return .offline
+    case .starting: return .busy
+    case .running:  return .running
+    case .error:    return .error
     }
   }
 
@@ -52,13 +54,8 @@ public enum EngineIndicatorState: Equatable, Sendable {
     return nil
   }
 
-  /// Build the semantic state from both sources. Pure.
-  ///
-  /// Precedence:
-  ///  1. An active model load is foreground (`.loading` outranks a
-  ///     running engine; a load `.failed` outranks everything).
-  ///  2. A deferred load (`.engineNotReady`) reads as "starting".
-  ///  3. Otherwise reflect the engine lifecycle.
+  /// Build the semantic state from the engine lifecycle + resident model.
+  /// Pure.
   ///
   /// Anti-flap: a transient poll failure never reaches here as a
   /// failure — `EngineStatusStore` keeps `.starting` (and folds the
@@ -67,24 +64,8 @@ public enum EngineIndicatorState: Equatable, Sendable {
   public static func make(
     engine: EngineStatus,
     engineDetail: String,
-    load: ModelLoadCenter.State,
     residentModelID: String?
   ) -> EngineIndicatorState {
-    switch load {
-    case let .loading(modelID, loaded, total, _):
-      let fraction = (total > 0 && loaded <= total) ? Double(loaded) / Double(total) : nil
-      return .loading(modelID: modelID, fraction: fraction)
-    case let .failed(modelID, message):
-      let text = message.isEmpty ? "Couldn’t load \(modelID)." : message
-      return .error(EngineIndicatorError(
-        kind: .loadFailed, title: "Load failed", message: text, invitesModelChoice: false
-      ))
-    case let .engineNotReady(_, detail):
-      return .starting(detail: detail)
-    case .idle, .ready, .cancelled:
-      break  // fall through to the engine lifecycle
-    }
-
     switch engine {
     case .stopped:
       return .offline
@@ -107,7 +88,6 @@ public struct EngineIndicatorError: Equatable, Sendable {
   public enum Kind: Equatable, Sendable {
     case engineFailed   // generic engine failure (spawn, handshake, …)
     case engineGone     // engine died after a good launch
-    case loadFailed     // HTTP /v1/models/load failure
     case memoryRisk     // model too large for this Mac's safe limit
     case modelMissing   // engine has no such model
   }

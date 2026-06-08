@@ -24,8 +24,6 @@ final class EngineStatusBannerTests: XCTestCase {
     XCTAssertNil(EngineStatusBanner.model(from: .offline, acknowledgedSignature: nil))
     XCTAssertNil(EngineStatusBanner.model(from: .starting(detail: "Engine starting…"), acknowledgedSignature: nil))
     XCTAssertNil(EngineStatusBanner.model(from: .running(modelID: "m"), acknowledgedSignature: nil))
-    XCTAssertNil(EngineStatusBanner.model(from: .loading(modelID: "m", fraction: 0.5), acknowledgedSignature: nil))
-    XCTAssertNil(EngineStatusBanner.model(from: .loading(modelID: "m", fraction: nil), acknowledgedSignature: nil))
   }
 
   func test_error_state_banners_with_title_and_message() {

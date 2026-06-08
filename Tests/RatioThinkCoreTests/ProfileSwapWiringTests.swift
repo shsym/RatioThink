@@ -38,8 +38,8 @@ final class ProfileSwapWiringTests: XCTestCase {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
         center: ModelLoadCenter(initialResident: "model-A.gguf"),
-        engine: MockEngineClient(),
-        profileStore: store
+        profileStore: store,
+        serveModel: { _, _ in }
       )
 
       var committed: String?
@@ -58,8 +58,8 @@ final class ProfileSwapWiringTests: XCTestCase {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
         center: ModelLoadCenter(initialResident: "model-B.gguf"),
-        engine: MockEngineClient(),
-        profileStore: store
+        profileStore: store,
+        serveModel: { _, _ in }
       )
       var committed: String?
       coord.requestSwap(toProfileID: "beta") { committed = $0 }
@@ -78,8 +78,8 @@ final class ProfileSwapWiringTests: XCTestCase {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
         center: ModelLoadCenter(),   // engine stopped → residentModelID == nil
-        engine: MockEngineClient(),
-        profileStore: store
+        profileStore: store,
+        serveModel: { _, _ in }
       )
       var committed: String?
       coord.requestSwap(toProfileID: "beta") { committed = $0 }
@@ -99,7 +99,7 @@ final class ProfileSwapWiringTests: XCTestCase {
     try withTwoProfileStore { store in
       let center = ModelLoadCenter(initialResident: "model-A.gguf")
       let coord = ProfileSwapCoordinator(
-        center: center, engine: MockEngineClient(), profileStore: store)
+        center: center, profileStore: store, serveModel: { _, _ in })
 
       var committed: String?
       var capturedOverride: String?
@@ -124,7 +124,6 @@ final class ProfileSwapWiringTests: XCTestCase {
       XCTAssertNil(coord.pending, "pending must clear after keep-current")
       XCTAssertEqual(center.residentModelID, "model-A.gguf",
                      "keep-current must NOT reload — A stays resident")
-      XCTAssertFalse(center.isLoading, "keep-current must NOT start a model load")
     }
   }
 
@@ -134,7 +133,7 @@ final class ProfileSwapWiringTests: XCTestCase {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
         center: ModelLoadCenter(initialResident: "model-A.gguf"),
-        engine: MockEngineClient(), profileStore: store)
+        profileStore: store, serveModel: { _, _ in })
 
       var committed: String?
       var overrideCalls = 0
@@ -159,7 +158,7 @@ final class ProfileSwapWiringTests: XCTestCase {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
         center: ModelLoadCenter(initialResident: "model-A.gguf"),
-        engine: MockEngineClient(), profileStore: store)
+        profileStore: store, serveModel: { _, _ in })
 
       var committed: String?
       coord.requestModelOverride(modelID: "model-B.gguf", activeProfileID: "alpha") { committed = $0 }
@@ -181,7 +180,7 @@ final class ProfileSwapWiringTests: XCTestCase {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
         center: ModelLoadCenter(initialResident: "model-A.gguf"),
-        engine: MockEngineClient(), profileStore: store)
+        profileStore: store, serveModel: { _, _ in })
 
       var committed: String?
       var overrideCalls = 0

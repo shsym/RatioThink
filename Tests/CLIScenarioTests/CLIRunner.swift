@@ -71,10 +71,6 @@ public final class CLIRunner: ScenarioRunner {
     try XPCPayload.decode(DownloadHandle.self, from: XPCPayload.encode(h))
   }
 
-  public func xpcRoundTripLoadHandle(_ h: LoadHandle) async throws -> LoadHandle {
-    try XPCPayload.decode(LoadHandle.self, from: XPCPayload.encode(h))
-  }
-
   public func xpcRoundTripEngineError(_ e: EngineError) async throws -> EngineError {
     try XPCPayload.decode(EngineError.self, from: XPCPayload.encode(e))
   }

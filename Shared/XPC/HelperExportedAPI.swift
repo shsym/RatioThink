@@ -661,20 +661,6 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     }
   }
 
-  /// Reshaped to `(Data?, Data?) -> Void`. Phase 2.1 returns the
-  /// notImplemented error on the error slot — no fake handle (review
-  /// v1 F8).
-  public func loadModel(modelID: String,
-                        reply: @escaping (Data?, Data?) -> Void) {
-    Self.log.error("loadModel called on Phase 2.1 stub (modelID=\(modelID, privacy: .public))")
-    reply(nil, Self.notImplementedErrorData)
-  }
-
-  public func cancelLoad(handle: Data, reply: @escaping (Data?) -> Void) {
-    Self.log.error("cancelLoad called on Phase 2.1 stub")
-    reply(Self.notImplementedErrorData)
-  }
-
   /// Phase 2.5: hand off to `ModelDownloader`. Re-stamps
   /// `DownloadError` into `EngineError` at the wire boundary so the
   /// GUI sees structured `EngineErrorCode` values rather than
@@ -987,16 +973,6 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   }
 
   public func stopEngine(reply: @escaping (Data?) -> Void) {
-    reply(degradedErrorData)
-  }
-
-  public func loadModel(modelID: String,
-                        reply: @escaping (Data?, Data?) -> Void) {
-    Self.log.error("loadModel refused in degraded mode (modelID=\(modelID, privacy: .public))")
-    reply(nil, degradedErrorData)
-  }
-
-  public func cancelLoad(handle: Data, reply: @escaping (Data?) -> Void) {
     reply(degradedErrorData)
   }
 

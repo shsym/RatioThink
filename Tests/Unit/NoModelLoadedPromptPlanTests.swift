@@ -83,14 +83,7 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     XCTAssertEqual(p.reason, "no HF fallback")
   }
 
-  // MARK: - loadFailed / helperUnreachable / configBroken (F1)
-
-  func test_loadFailed_shows_reason_and_retry_load() {
-    let p = plan(.loadFailed(modelID: "M", reason: "model_not_found"), loadAction)
-    XCTAssertEqual(p.headline, "Couldn't load the model")
-    XCTAssertEqual(p.reason, "model_not_found")
-    XCTAssertEqual(p.primary, .retryLoad)
-  }
+  // MARK: - helperUnreachable / configBroken (F1)
 
   func test_helperUnreachable_shows_reason_and_refresh() {
     let p = plan(.helperUnreachable(reason: "connection invalid"), unavailableAction)
@@ -122,8 +115,8 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     XCTAssertFalse(p.showsDownloadCTA)
   }
 
-  func test_busy_loading_is_wait_only() {
-    let p = plan(.busy(.loadingModel(modelID: "M")), loadAction)
+  func test_busy_stopping_is_wait_only() {
+    let p = plan(.busy(.stoppingEngine), loadAction)
     XCTAssertTrue(p.showsWaitSpinner)
     XCTAssertFalse(p.showsDownloadCTA)
     XCTAssertEqual(p.primary, .none)

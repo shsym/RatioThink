@@ -18,7 +18,6 @@ import Foundation
 ///   then OpenAI `chat.completion.chunk` frames, terminating with
 ///   `data: [DONE]`. `model_loading` meta-frames are tolerated but
 ///   absent in v1 (pie loads at boot).
-/// * `POST /v1/models/load` → SSE: `{"event":"model_ready"}` + `[DONE]`.
 /// * `POST /v1/inferlet` → routes through chat-completions for the
 ///   only registered name (`chat-apc`); dispatch surfaces the raw
 ///   SSE `data:` bytes per frame to the consumer.
@@ -144,19 +143,6 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
 
   // MARK: - EngineClient: streaming
 
-  public func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    let body: Data
-    do {
-      body = try encoder.encode(LoadRequestBody(model: id))
-    } catch {
-      return AsyncThrowingStream { $0.finish(throwing: error) }
-    }
-    return loadStream(buildRequest: {
-      try await self.makeRequest("/v1/models/load", method: "POST", body: body,
-                                 timeout: Self.streamingIdleTimeout)
-    })
-  }
-
   public func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     let body: Data
     do {
@@ -184,49 +170,6 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
   }
 
   // MARK: - Stream implementations
-
-  private func loadStream(
-    buildRequest: @escaping @Sendable () async throws -> URLRequest
-  ) -> AsyncThrowingStream<LoadEvent, Error> {
-    let session = self.session
-    let decoder = self.decoder
-    return AsyncThrowingStream { continuation in
-      let task = Task {
-        do {
-          let request = try await buildRequest()
-          let (bytes, response) = try await session.bytes(for: request)
-          try await Self.assertOK(response, bytes: bytes)
-          for try await frame in HTTPEngineClient.sseFrames(from: bytes) {
-            if frame.isDone { break }
-            try Task.checkCancellation()
-            let meta = try decoder.decode(MetaFrame.self, from: frame.dataBytes)
-            switch meta.event {
-            case "model_ready":
-              continuation.yield(.ready)
-            case "model_loading":
-              continuation.yield(.loading(
-                loadedBytes: meta.loaded_bytes ?? 0,
-                totalBytes: meta.total_bytes ?? 0,
-                etaSeconds: meta.eta_s
-              ))
-            case "error":
-              throw HTTPEngineError.stream(
-                code: meta.code ?? "unknown_error",
-                message: meta.message ?? "")
-            default:
-              // Tolerate unknown meta-events: a future engine extension
-              // shouldn't kill the load stream.
-              continue
-            }
-          }
-          continuation.finish()
-        } catch {
-          continuation.finish(throwing: error)
-        }
-      }
-      continuation.onTermination = { _ in task.cancel() }
-    }
-  }
 
   private func chatStream(
     buildRequest: @escaping @Sendable () async throws -> URLRequest
@@ -586,13 +529,6 @@ private struct ModelListResponse: Decodable {
   let data: [ModelInfo]
 }
 
-/// Body of `POST /v1/models/load`. Single-field carrier so the
-/// `encoder.encode(LoadRequestBody)` call produces `{"model":"…"}`
-/// without a positional-arg `[String: String]` literal.
-private struct LoadRequestBody: Encodable {
-  let model: String
-}
-
 /// OpenAI-shape error envelope: `{"error":{"type","code","message","param"}}`.
 /// The chat-apc inferlet emits this on every 4xx/5xx HTTP body
 /// (`Inferlets/chat-apc/src/sse.rs::json_error`). Only `code`/`message`
@@ -722,8 +658,8 @@ extension HTTPEngineError: LocalizedError, CustomStringConvertible {
 
 extension HTTPEngineError {
   /// #2: the engine answered but rejected the request because it does not
-  /// serve the requested model — pie's `/v1/chat/completions` (or
-  /// `/v1/models/load`) returns `model_not_found`, on the pre-stream
+  /// serve the requested model — pie's `/v1/chat/completions` returns
+  /// `model_not_found`, on the pre-stream
   /// `.api` envelope or the mid-stream `.stream` meta-frame. The single
   /// signal the plain "Model X isn’t installed — …" copy keys on, so a
   /// chatting user sees one actionable line instead of the raw

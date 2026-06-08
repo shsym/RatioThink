@@ -8,14 +8,13 @@
 #
 #   GET  /healthz            -> {"status":"ok"}
 #   GET  /v1/models          -> {"object":"list","data":[{id,object,owned_by}]}
-#   POST /v1/models/load     -> SSE: (optional hold) {"event":"model_ready"} + [DONE]
 #   POST /v1/chat/completions-> SSE: {"event":"model_ready"} meta, then OpenAI
 #                               chat.completion.chunk frames replaying --answer
 #                               (first delta carries role:"assistant"), a final
 #                               finish_reason:"stop" chunk, then [DONE].
 #
-# Pure test infrastructure — no production code. Mirrors loadviz-harness.py's
-# disconnect-aware SSE hold so a cancelled load never synthesizes model_ready.
+# Pure test infrastructure — no production code. (#469: there is no
+# /v1/models/load — pie binds the served model at boot.)
 import argparse
 import json
 import select
@@ -73,28 +72,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
         _ = self.rfile.read(length)
-        if self.path == "/v1/models/load":
-            self.handle_load()
-        elif self.path == "/v1/chat/completions":
+        # #469: no /v1/models/load — pie binds the model at boot.
+        if self.path == "/v1/chat/completions":
             self.handle_chat()
         else:
             self.send_error(404, "not found")
-
-    def handle_load(self):
-        # Optional disconnect-aware hold so a screenshot of the "Loading
-        # <id>" indicator window has time to be captured; a client close
-        # mid-hold (a cancel) short-circuits without a late model_ready.
-        try:
-            self.start_sse()
-            hold = self.server.state.load_hold_seconds
-            if hold > 0:
-                ready, _, _ = select.select([self.connection], [], [], hold)
-                if ready:
-                    return
-            self.write_frame({"event": "model_ready"})
-            self.finish_sse()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
 
     def handle_chat(self):
         try:

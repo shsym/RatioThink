@@ -11,7 +11,6 @@ final class ChatStartGateTests: XCTestCase {
   private func eval(
     engine: EngineStatus = .stopped,
     helperError: String? = nil,
-    load: ModelLoadCenter.State = .idle,
     resolved: String? = nil,
     profileDefault: String? = nil,
     profileError: String? = nil
@@ -19,7 +18,6 @@ final class ChatStartGateTests: XCTestCase {
     ChatStartGate.evaluate(
       engineStatus: engine,
       helperError: helperError,
-      load: load,
       resolvedModelID: resolved,
       profileDefault: profileDefault,
       profileError: profileError
@@ -63,15 +61,6 @@ final class ChatStartGateTests: XCTestCase {
                    .needsDefaultLoad(modelID: model))
   }
 
-  func test_S2_stopped_after_failed_load_attempt_reoffers_default() {
-    // A prior Load while stopped left `.engineNotReady`; re-offer Load.
-    XCTAssertEqual(
-      eval(engine: .stopped, load: .engineNotReady(modelID: model, detail: "Engine stopped"),
-           profileDefault: model),
-      .needsDefaultLoad(modelID: model)
-    )
-  }
-
   // MARK: - S3 / S5: no default configured
 
   func test_S5_stopped_without_default_is_noDefault() {
@@ -91,39 +80,8 @@ final class ChatStartGateTests: XCTestCase {
 
   func test_running_idle_with_default_needs_default_load() {
     XCTAssertEqual(
-      eval(engine: .running(port: 8080, profileID: "chat"), load: .idle, profileDefault: model),
+      eval(engine: .running(port: 8080, profileID: "chat"), profileDefault: model),
       .needsDefaultLoad(modelID: model)
-    )
-  }
-
-  // MARK: - S10: model load in flight
-
-  func test_running_loading_is_busy_loadingModel() {
-    XCTAssertEqual(
-      eval(engine: .running(port: 8080, profileID: "chat"),
-           load: .loading(modelID: model, loadedBytes: 1, totalBytes: 2, etaSeconds: nil),
-           profileDefault: model),
-      .busy(.loadingModel(modelID: model))
-    )
-  }
-
-  func test_loading_while_stopped_is_busy_loadingModel() {
-    // The load axis is authoritative for "loading" even if the engine
-    // status poll has not caught up.
-    XCTAssertEqual(
-      eval(engine: .stopped,
-           load: .loading(modelID: model, loadedBytes: 0, totalBytes: 0, etaSeconds: nil)),
-      .busy(.loadingModel(modelID: model))
-    )
-  }
-
-  // MARK: - S11: model load failed
-
-  func test_running_loadFailed_surfaces_reason() {
-    XCTAssertEqual(
-      eval(engine: .running(port: 8080, profileID: "chat"),
-           load: .failed(modelID: model, message: "model_not_found")),
-      .loadFailed(modelID: model, reason: "model_not_found")
     )
   }
 

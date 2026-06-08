@@ -1,7 +1,7 @@
 [package]
 name = "chat-apc"
 version = "0.1.0"
-description = "Chat-API + control-plane inferlet (HTTP): /healthz, /v1/models, /v1/chat/completions, /v1/inferlet, /v1/models/load"
+description = "Chat-API + control-plane inferlet (HTTP): /healthz, /v1/models, /v1/chat/completions, /v1/inferlet"
 authors = ["Pie Team"]
 
 [runtime]

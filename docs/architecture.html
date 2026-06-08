@@ -239,7 +239,7 @@
     inferlet:{accent:css('--inferlet'),
       tag:"Inferlet · wasm", title:"chat-apc (wasm)",
       user:"The only inferlet RatioThink ships. pie installs it at startup and routes HTTP requests to it. It presents the OpenAI-compatible endpoints — chat completions plus health and model listing — so any OpenAI client can talk to your local engine.",
-      facts:[["Serves","/healthz · /v1/models · /v1/chat/completions · /v1/models/load · /v1/inferlet"],
+      facts:[["Serves","/healthz · /v1/models · /v1/chat/completions · /v1/inferlet"],
              ["APC","Adaptive Personality/Capability decoders. Reasoning active; the tool-use decoder is fully implemented (emits OpenAI tool_calls when a request supplies a tools array) but the v1 app never sends tools, so it stays dormant in the shipping product."],
              ["Note","ONE inferlet for both planes — there is no separate pie-control inferlet"]],
       calls:["<b>Route:</b> lib.rs match (method, path) → chat::completions::handle / control::{health,models,load}",
@@ -276,7 +276,7 @@
       user:"Chat does NOT go through the helper. The app connects straight to the engine on a local port and uses ordinary OpenAI-style HTTP; replies stream back token by token over Server-Sent Events.",
       facts:[["Target","127.0.0.1:&lt;port&gt; — port from EngineStatus.running(port:)"],
              ["Chat","POST /v1/chat/completions → SSE: {event:model_ready} → chat.completion.chunk → data:[DONE]"],
-             ["Also","GET /healthz · GET /v1/models · POST /v1/models/load (instant — model loaded at boot)"]],
+             ["Also","GET /healthz · GET /v1/models"]],
       calls:["<b>Request:</b> ChatSendController.send(…) → EngineClient.chatCompletion(req) → HTTPEngineClient.chatCompletion(_:) → baseURLProvider()",
              "<b>Stream sink:</b> AsyncThrowingStream&lt;ChatEvent&gt; → MessageStreamWriter.appendDelta() → flush() → SwiftData"],
       files:["Shared/Engine/HTTPEngineClient.swift","Shared/Engine/EngineClient.swift","Shared/Persistence/ChatSendController.swift","Shared/Persistence/MessageStreamWriter.swift"]}

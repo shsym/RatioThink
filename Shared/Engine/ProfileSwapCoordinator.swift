@@ -126,16 +126,14 @@ public final class ProfileSwapCoordinator: ObservableObject {
   @Published public private(set) var serveModelError: String?
 
   private let center: ModelLoadCenter
-  private let engine: EngineClient
   /// #469: status-aware executor that makes the engine actually SERVE a
   /// picked model — start it (stopped), restart it (running a different
   /// model), or no-op (already resident) per `ActiveModelLaunchPolicy`. v1
   /// pie binds the served model at boot, so a served-model change is an
-  /// engine lifecycle event, not a `/v1/models/load`. `nil` (previews / unit
-  /// tests that don't inject it) falls back to the legacy direct load so
-  /// existing call sites are unchanged; production wires the real executor
-  /// through the convenience init.
-  private let serveModel: (@MainActor (_ modelID: String, _ profileID: String) async throws -> Void)?
+  /// engine LIFECYCLE event (start/restart), not a `/v1/models/load` — which
+  /// is why there is no longer a direct-load fallback. Required: production
+  /// wires the real executor; tests/previews inject a no-op or spy.
+  private let serveModel: @MainActor (_ modelID: String, _ profileID: String) async throws -> Void
   private let modelForProfile: (String) -> String?
   /// Persists a confirmed "Set as default" model onto a profile.
   /// Wired to `ProfileStore.setModel` in production; a no-op default
@@ -148,13 +146,11 @@ public final class ProfileSwapCoordinator: ObservableObject {
 
   public init(
     center: ModelLoadCenter,
-    engine: EngineClient,
     modelForProfile: @escaping (String) -> String? = { _ in nil },
     setDefaultModel: @escaping (_ profileID: String, _ model: String) throws -> Void = { _, _ in },
-    serveModel: (@MainActor (_ modelID: String, _ profileID: String) async throws -> Void)? = nil
+    serveModel: @escaping @MainActor (_ modelID: String, _ profileID: String) async throws -> Void
   ) {
     self.center = center
-    self.engine = engine
     self.modelForProfile = modelForProfile
     self.setDefaultModel = setDefaultModel
     self.serveModel = serveModel
@@ -170,13 +166,11 @@ public final class ProfileSwapCoordinator: ObservableObject {
   /// crash.
   public convenience init(
     center: ModelLoadCenter,
-    engine: EngineClient,
     profileStore: ProfileStore,
-    serveModel: (@MainActor (_ modelID: String, _ profileID: String) async throws -> Void)? = nil
+    serveModel: @escaping @MainActor (_ modelID: String, _ profileID: String) async throws -> Void
   ) {
     self.init(
       center: center,
-      engine: engine,
       modelForProfile: { [weak profileStore] in profileStore?.model(forProfileID: $0) },
       setDefaultModel: { [weak profileStore] profileID, model in
         // Propagate the throw so `confirm` surfaces it via
@@ -452,29 +446,20 @@ public final class ProfileSwapCoordinator: ObservableObject {
     // User moved on to an explicit load — clear any stale set-as-default
     // error (review F2).
     defaultModelWriteError = nil
-    if !center.isLoading, center.residentModelID == modelID {
+    if center.residentModelID == modelID {
       Self.log.debug("loadDirect short-circuit: model already resident id=\(modelID, privacy: .public)")
       return
     }
     startLoad(modelID: modelID, profileID: profileID)
   }
 
-  /// Make the engine serve `modelID`. #469: when a status-aware `serveModel`
-  /// executor is wired (production), route through the engine (re)launch —
-  /// start a stopped engine, restart a running one onto a different model, or
-  /// no-op when already resident — because v1 pie binds the served model at
-  /// boot and `/v1/models/load` cannot swap it. A thrown executor failure the
-  /// status poll won't reflect (a resolver reject) surfaces via
-  /// `serveModelError`. Without an executor (previews / unit tests that don't
-  /// inject one) it falls back to the legacy direct `/v1/models/load`.
+  /// Make the engine serve `modelID` (#469): route through the status-aware
+  /// engine (re)launch executor — start a stopped engine, restart a running
+  /// one onto a different model, or no-op when already resident — because v1
+  /// pie binds the served model at boot and `/v1/models/load` cannot swap it
+  /// (the endpoint is gone). A thrown executor failure the status poll won't
+  /// reflect (a resolver reject) surfaces via `serveModelError`.
   private func startLoad(modelID: String, profileID: String) {
-    guard let serveModel else {
-      let engine = self.engine
-      center.load(modelID: modelID) {
-        engine.loadModel(modelID)
-      }
-      return
-    }
     Task { @MainActor in
       do {
         serveModelError = nil
@@ -503,7 +488,7 @@ public final class ProfileSwapCoordinator: ObservableObject {
   public static func previewDefault() -> ProfileSwapCoordinator {
     ProfileSwapCoordinator(
       center: ModelLoadCenter(),
-      engine: MockEngineClient()
+      serveModel: { _, _ in }
     )
   }
   #endif

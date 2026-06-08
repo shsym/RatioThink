@@ -342,9 +342,6 @@ struct ChatScaffoldView: View {
         },
         // #397 F1: retryable engine failure → re-start the engine.
         onRetryEngineStart: { startEngineForSelectedProfile() },
-        // #397 F1: failed model load → re-run it via the ensure-engine
-        // -then-load path (restarts the engine if it has since stopped).
-        onRetryLoad: { model in loadDefaultModel(model) },
         // #397 F1: helper unreachable → force an immediate status re-poll.
         onRefresh: { refreshEngineStatus() },
         onCancel: { showNoModelPrompt = false },
@@ -599,7 +596,6 @@ struct ChatScaffoldView: View {
     ChatStartGate.evaluate(
       engineStatus: engineStatusStore.status,
       helperError: engineStatusStore.lastError,
-      load: modelLoadCenter.state,
       resolvedModelID: currentModelID(),
       profileDefault: selectedProfileDefault,
       profileError: profileStore.lastActiveProfileError?.description
