@@ -88,6 +88,66 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     try await assertChatCompletion(port: port, modelID: slug)
   }
 
+  /// #469 — App↔Helper active-model sync, end-to-end against a REAL engine.
+  /// Proves BOTH ticket symptoms are fixed on a profile that has NO default
+  /// model (so the only boot model can come from the pick / the durable
+  /// marker, never a profile default):
+  ///   (a) "App selects model X → the helper-started engine actually SERVES
+  ///       X": an explicit pick (the `startEngine(modelOverride:)` /
+  ///       switch-from-idle path) boots the engine on X, and the resolver
+  ///       records X in the durable active-model marker.
+  ///   (b) "engine start drops pending pick (wrong model)" is FIXED: a real
+  ///       `HelperResumeAction` run (menu-bar Resume / crash auto-relaunch),
+  ///       with only the marker to go on, boots the engine cleanly on X.
+  func test_realEngine_servesExplicitPick_andResumeHonorsMarker() async throws {
+    let e = try realEngineEnvOrSkip()
+    let (store, resolver, slug) = try stageNoDefaultProfile(e)
+    defer { store.stop() }
+
+    // (a) Switch-from-idle: resolve with the explicit override (the profile
+    // has no default) and launch — the engine must serve the picked model.
+    let host1 = PieEngineHost()
+    var spec1: PieControlLauncher.LaunchSpec
+    switch resolver.asClosure("chat", slug) {
+    case .success(let s): spec1 = s
+    case .failure(let err):
+      XCTFail("explicit pick must resolve a no-default profile: \(err.code.rawValue): \(err.message)")
+      throw XCTSkip("resolver failure")
+    }
+    reapEngineSubprocess(in: &spec1)
+    if case .failure(let err) = host1.start(spec1) {
+      XCTFail("engineHost.start rejected: \(err.code.rawValue): \(err.message)")
+      throw XCTSkip("host start failure")
+    }
+    let port1 = try await awaitRunning(host: host1, timeout: 120)
+    try await assertServedModelID(port: port1, expected: slug)
+    try await assertChatCompletion(port: port1, modelID: slug)
+    XCTAssertEqual(store.activeModelID, slug,
+                   "the launch must record the picked model in the durable active-model marker")
+    host1.stop()
+    await awaitStopped(host: host1, timeout: 30)
+
+    // (b) Menu-bar Resume: the profile STILL has no default, so the only way
+    // the engine can boot the pick is by honoring the marker. Drive the real
+    // HelperResumeAction with a reaping resolver wrapper so the relaunched
+    // engine's pid is tracked by the IsolatedTestCase reap net.
+    let host2 = PieEngineHost()
+    defer { host2.stop() }
+    let reapingResolver: HelperExportedAPI.LaunchSpecResolver = { id, model in
+      switch resolver.asClosure(id, model) {
+      case .success(var spec): self.reapEngineSubprocess(in: &spec); return .success(spec)
+      case .failure(let err):  return .failure(err)
+      }
+    }
+    let outcome = HelperResumeAction.run(
+      engineHost: host2, profileStore: store, resolver: reapingResolver)
+    XCTAssertEqual(outcome, .started(profileID: "chat"),
+                   "Resume must boot the marker model even with no profile default; got \(outcome)")
+    let port2 = try await awaitRunning(host: host2, timeout: 120)
+    try await assertServedModelID(port: port2, expected: slug)
+    try await assertChatCompletion(port: port2, modelID: slug)
+  }
+
   /// Real-model proof for the reasoning-channel split: a thinking model
   /// (Qwen3) must keep raw `<think>`/`</think>` delimiters OFF the
   /// visible-content channel and surface the scratchpad on
@@ -322,6 +382,61 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     let port = try await awaitRunning(host: host, timeout: 120)
     XCTAssertGreaterThan(port, 0, "engine must publish a real port")
     return (port, slug)
+  }
+
+  /// Stage a real GGUF + a profile with NO `model =` default, and build the
+  /// production resolver against them (#469). The absent default is the whole
+  /// point: it forces the engine's boot model to come from the explicit pick
+  /// or the active-model marker — the App↔Helper sync surfaces — never a
+  /// profile default. Does NOT launch; the caller drives the two launches.
+  private func stageNoDefaultProfile(
+    _ e: RealEngineEnv
+  ) throws -> (store: ProfileStore, resolver: LaunchSpecResolver, slug: String) {
+    let fm = FileManager.default
+    let modelsRoot = tempPieHome.appendingPathComponent("models", isDirectory: true)
+    try fm.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+    let slug = e.modelPath.lastPathComponent
+    let staged = modelsRoot.appendingPathComponent(slug, isDirectory: false)
+    try? fm.removeItem(at: staged)
+    do { try fm.linkItem(at: e.modelPath, to: staged) }
+    catch { try fm.copyItem(at: e.modelPath, to: staged) }
+
+    let profiles = tempPieHome.appendingPathComponent("profiles", isDirectory: true)
+    try fm.createDirectory(at: profiles, withIntermediateDirectories: true)
+    try """
+    id = "chat"
+    name = "Chat"
+    inferlet = "chat-apc"
+    """.write(to: profiles.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
+    let store = ProfileStore(
+      directory: profiles,
+      activeProfileURL: tempPieHome.appendingPathComponent("active-profile", isDirectory: false)
+    )
+    try store.start()
+    try store.setActiveProfileID("chat")
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { e.pieBin },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempPieHome.appendingPathComponent("inferlets") },
+      pieControlResources: { (wasm: e.wasm, manifest: e.manifest) },
+      pieHome: { self.shortPieHome },
+      subprocessEnvironment: { SpawnEnvSanitizer.sanitize(ProcessInfo.processInfo.environment) }
+    )
+    return (store, resolver, slug)
+  }
+
+  /// Poll the host until `.stopped` so the next launch starts from a clean
+  /// idle. Non-fatal on timeout — the IsolatedTestCase reap net SIGKILLs a
+  /// lingering engine, and a brief overlap of two small engines is harmless.
+  private func awaitStopped(host: PieEngineHost, timeout: TimeInterval) async {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if case .stopped = host.status { return }
+      try? await Task.sleep(nanoseconds: 250_000_000)
+    }
+    NSLog("awaitStopped: host still \(host.status) after \(timeout)s (reap net is the outer guard)")
   }
 
   // MARK: - pid-reap wiring
