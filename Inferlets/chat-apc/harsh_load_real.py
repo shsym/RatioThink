@@ -16,8 +16,11 @@ bounded-concurrent firing schedule on top of the same capture-replay idea.
 Two tiers:
   * SMOKE  — a committed, self-contained openclaw capture sample
              (`fixtures/openclaw_replay_sample.jsonl`: real 28-tool, ~28k-char
-             system prompt + multi-turn history). Low concurrency. A light
-             real-engine smoke that runs wherever the weights exist.
+             system prompt + multi-turn history). Low but REAL concurrency:
+             the fixture is one body, so the schedule fans it across
+             SMOKE_USERS (> SMOKE_CONCURRENCY by default) so the semaphore
+             actually binds. A light real-engine smoke that runs wherever the
+             weights exist.
   * HEAVY  — a richer hermes capture.jsonl env-sourced at runtime via
              `PIE_TEST_REPLAY_CORPUS` (NOT committed). High concurrency, more
              users/rounds, interleaved + sequential. Only runs when the env
@@ -89,6 +92,12 @@ FIXTURE = _HERE / "fixtures" / "openclaw_replay_sample.jsonl"
 # Bounded-but-high load knobs (all env-tunable). Defaults keep the run
 # bounded (a few minutes) while still oversubscribing the engine's slots.
 SMOKE_CONCURRENCY = int(os.environ.get("HARSH_SMOKE_CONCURRENCY", "4"))
+# The committed fixture is a single multi-turn capture (one body), so the smoke
+# schedule's request count is driven by users, not turns. Fire MORE users than
+# slots in the semaphore so SMOKE_CONCURRENCY actually binds — otherwise the
+# semaphore stays slack and the smoke tier never exercises concurrent decode
+# (F2). Default keeps it a light real-engine smoke (a handful of requests).
+SMOKE_USERS = int(os.environ.get("HARSH_SMOKE_USERS", str(SMOKE_CONCURRENCY + 1)))
 # Sustainable default: the portable engine serves a fixed number of KV slots
 # (8 in the shipped config). Firing MORE than that oversubscribes — queued
 # requests block on slot acquisition, and because the server's
@@ -147,17 +156,23 @@ device = ["metal"]
 class Report:
     def __init__(self) -> None:
         self.failures: list[str] = []
+        # Parallel to `failures`: a stable machine key per failure (or "" for
+        # an untagged one) so callers can classify a failure structurally
+        # instead of substring-matching its human message (F10).
+        self.failure_keys: list[str] = []
         self.passed = 0
 
-    def ok(self, cond: bool, msg: str) -> bool:
+    def ok(self, cond: bool, msg: str, *, key: str = "") -> bool:
         if cond:
             self.passed += 1
         else:
             self.failures.append(msg)
+            self.failure_keys.append(key)
         return cond
 
-    def fail(self, msg: str) -> None:
+    def fail(self, msg: str, *, key: str = "") -> None:
         self.failures.append(msg)
+        self.failure_keys.append(key)
 
 
 # ---------------------------------------------------------------------------
@@ -236,21 +251,34 @@ def load_corpus(path: Path) -> list[dict]:
     into an ordered list of chat-apc bodies. Order matters: turn N+1's
     messages embed turn N's output."""
     bodies: list[dict] = []
+    seen = dropped = 0  # non-blank rows seen / rows that yielded no body
     with path.open() as fh:
         for line in fh:
             line = line.strip()
             if not line:
-                continue
+                continue  # blank lines are formatting, not a dropped row
+            seen += 1
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
+                dropped += 1
                 continue
             raw = row.get("kwargs") if isinstance(row.get("kwargs"), dict) else row
             if not isinstance(raw, dict) or not raw.get("messages"):
+                dropped += 1
                 continue
-            body = _to_body(raw)
+            body = _to_body(raw)  # None when every message normalized to blank
             if body is not None:
                 bodies.append(body)
+            else:
+                dropped += 1
+    # Silent drops mask a corpus/normalization regression. Surface the ratio so
+    # a run that quietly discarded most of its workload is visible (F6).
+    if dropped:
+        ratio = dropped / seen if seen else 0.0
+        sev = "WARN" if ratio < 0.5 else "WARN(HIGH)"
+        print(f"[harsh-load] {sev}: dropped {dropped}/{seen} rows from {path.name} "
+              f"({ratio:.0%} unparseable / no usable messages)", flush=True)
     return bodies
 
 
@@ -375,7 +403,7 @@ async def run_load(http: httpx.AsyncClient, base: str, bodies: list[dict], *,
     #     sustainable concurrency (<= engine slots) this is 0; above it,
     #     queued requests can starve because the server's request_timeout
     #     doesn't abort a slot-blocked request — see the filed follow-up.
-    ok200 = err_structured = hangs = 0
+    ok200 = err_structured = hangs = err_5xx = 0
     for i, res in enumerate(results):
         ctx = f"{label}/{pattern}[req{i}]"
         if isinstance(res, BaseException):
@@ -395,20 +423,29 @@ async def run_load(http: httpx.AsyncClient, base: str, bodies: list[dict], *,
                 ok200 += 1
         else:
             # A non-200 under load is allowed IFF it is a structured JSON
-            # error envelope (never a bare/empty 500).
+            # error envelope (never a bare/empty 500). DESIGN DECISION (F3):
+            # unlike the dummy PROTOCOL tier (which contracts non-5xx), the
+            # REAL engine MAY shed load with a *coded* 5xx under resource
+            # pressure (slot/KV exhaustion). That is a tolerated
+            # resource-pressure rejection here, not a wire-contract bug — as
+            # long as the envelope is structured. The 5xx count is surfaced in
+            # the summary so an operator sees how much load was shed that way.
             code = _err_code(res["text"])
             rep.ok(400 <= st < 600 and bool(code),
                    f"{ctx}: CORRECTNESS status {st} without structured error "
                    f"envelope: {res['text'][:160]!r}")
             if code:
                 err_structured += 1
+                if st >= 500:
+                    err_5xx += 1
     note = ""
     if hangs:
         note = (f"  [!] {hangs} LIVENESS hang(s): concurrency {concurrency} likely exceeds "
                 f"engine slots — queued requests starved past the client deadline")
     print(f"[harsh-load] {label}/{pattern}: {len(schedule)} reqs in {wall:.1f}s "
           f"(conc={concurrency}, users={n_users}, turns={n_turns}, rounds={rounds}) "
-          f"-> ok200={ok200} structured_err={err_structured} hangs={hangs}{note}", flush=True)
+          f"-> ok200={ok200} structured_err={err_structured} (coded5xx={err_5xx}) "
+          f"hangs={hangs}{note}", flush=True)
     return ok200
 
 
@@ -479,7 +516,8 @@ def assert_generated(ok200: int, label: str, rep: Report) -> bool:
     return rep.ok(ok200 > 0,
                   f"{label}: no replayed request produced a 200/SSE — the corpus never "
                   f"decoded under load (normalization regression / context overflow / "
-                  f"tool-equip failure?)")
+                  f"tool-equip failure?)",
+                  key="generation_guard")
 
 
 async def run_all_tiers(http, base: str, smoke_bodies: list[dict],
@@ -495,9 +533,11 @@ async def run_all_tiers(http, base: str, smoke_bodies: list[dict],
     print(f"[harsh-load] SMOKE: {len(smoke_bodies)} turns from committed fixture", flush=True)
     smoke_ok = 0
     smoke_ok += await run_load(http, base, smoke_bodies, concurrency=SMOKE_CONCURRENCY,
-                               n_users=2, rounds=1, pattern="sequential", label="smoke", rep=rep)
+                               n_users=SMOKE_USERS, rounds=1, pattern="sequential",
+                               label="smoke", rep=rep)
     smoke_ok += await run_load(http, base, smoke_bodies, concurrency=SMOKE_CONCURRENCY,
-                               n_users=2, rounds=1, pattern="interleaved", label="smoke", rep=rep)
+                               n_users=SMOKE_USERS, rounds=1, pattern="interleaved",
+                               label="smoke", rep=rep)
     assert_generated(smoke_ok, "smoke", rep)
 
     # HEAVY tier — env-sourced hermes capture, high concurrency.
@@ -555,8 +595,19 @@ async def main() -> int:
                      f"(build: Scripts/stamp-chat-apc.sh write)")
     try:
         E.verify_stamp()
-    except Exception as e:
-        return _skip(f"wasm stamp mismatch: {e}")
+    except SystemExit as e:
+        # _stamp.verify raises SystemExit (NOT Exception) on every failure, so
+        # this MUST catch SystemExit or the branches below are dead code.
+        # A MISSING stamp file is a legit gate (prebuilt not generated yet) ->
+        # clean SKIP. A PRESENT-but-mismatched/incomplete stamp means the wasm
+        # is stale relative to the tree: that is a real regression and must
+        # FAIL, not be swallowed as a skip (F5).
+        if not E.STAMP_PATH.exists():
+            return _skip(f"wasm stamp file missing at {E.STAMP_PATH} "
+                         f"(build: Scripts/stamp-chat-apc.sh write)")
+        print(f"[harsh-load] FATAL: wasm stamp present but stale/invalid "
+              f"(rebuild the prebuilt): {e}")
+        return 1
     if not _weights_cached(MODEL):
         return _skip(f"real weights for {MODEL} not in HF cache (this is the real-engine tier)")
     if not FIXTURE.exists():
@@ -604,10 +655,13 @@ async def self_test() -> int:
     REAL production path — `run_all_tiers` — against a stub that returns ALL
     structured 400s (every replayed body fails to decode). Each per-request
     classification stays green (a structured non-200 is allowed), so the ONLY
-    thing that can fail the run is the `assert_generated` guard. The test
-    passes iff that guard fired. Because `run_all_tiers` is the same code main()
-    runs, deleting OR weakening the guard there is caught here — not just a
-    copy of the assertion (review v2 F7)."""
+    thing that can fail the run is the `assert_generated` guard. Because
+    `run_all_tiers` is the same code main() runs, deleting OR weakening the
+    guard there is caught here — not just a copy of the assertion (review v2
+    F7). Failures are classified by their stable `generation_guard` key, not by
+    a substring of the human message (F10), and both the smoke-only and
+    smoke+heavy branches are exercised so the heavy-branch guard is mutation-
+    covered too (F9)."""
 
     class _Stub400:
         async def post(self, url, json=None, headers=None):
@@ -616,22 +670,79 @@ async def self_test() -> int:
                 text = '{"error":{"code":"invalid_request","message":"stub"}}'
             return _R()
 
-    rep = Report()
     bodies = [{"model": MODEL, "messages": [{"role": "user", "content": "hi"}],
                "stream": True, "max_tokens": 8}]
-    # survival=False: no live engine to health-check. heavy disabled (no corpus).
-    await run_all_tiers(_Stub400(), "http://stub", bodies, [], None, rep, survival=False)
-    gen_failures = [f for f in rep.failures if "produced a 200/SSE" in f]
-    # Exactly the generation guard must have failed — nothing else (all-400 is
-    # an allowed per-request outcome, so without the guard there'd be 0 failures).
-    passed = len(rep.failures) == 1 and len(gen_failures) == 1
+
+    # Case A — heavy disabled (no corpus): only the smoke guard can fire.
+    # Exactly one failure, and it must be the generation guard (all-400 is an
+    # allowed per-request outcome, so without the guard there'd be 0 failures).
+    rep_smoke = Report()
+    await run_all_tiers(_Stub400(), "http://stub", bodies, [], None, rep_smoke,
+                        survival=False)
+    smoke_ok = (rep_smoke.failure_keys == ["generation_guard"])
+
+    # Case B (F9) — a one-row all-400 HEAVY corpus: the heavy branch's
+    # `assert_generated` must also fire, so exactly TWO generation guards
+    # (smoke + heavy) and nothing else.
+    rep_heavy = Report()
+    await run_all_tiers(_Stub400(), "http://stub", bodies, list(bodies),
+                        Path("stub-heavy.jsonl"), rep_heavy, survival=False)
+    heavy_ok = (rep_heavy.failure_keys == ["generation_guard", "generation_guard"])
+
+    passed = smoke_ok and heavy_ok
     print(f"[harsh-load] SELF-TEST {'PASS' if passed else 'FAIL'}: all-400 corpus via "
-          f"run_all_tiers -> {len(rep.failures)} failure(s), generation-guard fired="
-          f"{len(gen_failures) == 1} (expect exactly 1: the generation guard)")
+          f"run_all_tiers -> smoke-only failures={rep_smoke.failure_keys} "
+          f"(want ['generation_guard']), smoke+heavy failures={rep_heavy.failure_keys} "
+          f"(want two generation_guard)")
     return 0 if passed else 1
+
+
+async def stamp_gate_self_test() -> int:
+    """Engine-free guard for the F5 stamp gate (review v1 F1). `verify_stamp`
+    (`_stamp.verify`) raises SystemExit — a BaseException, NOT Exception — so
+    main()'s `except` MUST name SystemExit or both stamp branches are dead.
+    Drive the REAL main() with `verify_stamp` monkeypatched to raise and assert:
+    a MISSING stamp file -> clean SKIP (rc 0); a PRESENT-but-stale stamp ->
+    FATAL (rc 1). Catches a regression to `except Exception` here."""
+
+    class _Path:  # stand-in whose .exists() we control; only attr main() needs
+        def __init__(self, present: bool) -> None:
+            self._present = present
+
+        def exists(self) -> bool:
+            return self._present
+
+    saved = (E.PIE_BIN, E.WASM_PATH, E.STAMP_PATH, E.verify_stamp)
+    # PIE_BIN / WASM_PATH must pass so main() reaches the stamp gate.
+    E.PIE_BIN = _Path(True)
+    E.WASM_PATH = _Path(True)
+
+    def _raise() -> None:
+        raise SystemExit("simulated stamp failure")
+
+    E.verify_stamp = _raise
+    try:
+        E.STAMP_PATH = _Path(False)  # missing stamp file -> clean SKIP
+        missing_rc = await main()
+        E.STAMP_PATH = _Path(True)   # present-but-stale -> FATAL
+        stale_rc = await main()
+    finally:
+        E.PIE_BIN, E.WASM_PATH, E.STAMP_PATH, E.verify_stamp = saved
+
+    passed = (missing_rc == 0 and stale_rc == 1)
+    print(f"[harsh-load] STAMP-GATE SELF-TEST {'PASS' if passed else 'FAIL'}: "
+          f"missing-stamp rc={missing_rc} (want 0 clean SKIP), "
+          f"present-but-stale rc={stale_rc} (want 1 FATAL)")
+    return 0 if passed else 1
+
+
+async def _all_self_tests() -> int:
+    rc_gen = await self_test()
+    rc_stamp = await stamp_gate_self_test()
+    return rc_gen or rc_stamp
 
 
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
-        sys.exit(asyncio.run(self_test()))
+        sys.exit(asyncio.run(_all_self_tests()))
     sys.exit(asyncio.run(main()))

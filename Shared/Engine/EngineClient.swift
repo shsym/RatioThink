@@ -17,7 +17,7 @@ import Foundation
 ///   on `ChatRequest` that flattens `ChatSampling` onto the top
 ///   level, and on `InferletRequest` that embeds `input` as an
 ///   inline JSON sub-tree rather than a base64 blob.
-/// - **Streaming events** (`LoadEvent`, `ChatEvent`) are
+/// - **Streaming events** (`ChatEvent`) are
 ///   decoder-output types, NOT direct Codable mirrors of the wire.
 ///   Their on-the-wire counterparts are OpenAI-style SSE frames
 ///   (`data: {...}\n\n`) parsed by a separate frame decoder in
@@ -40,8 +40,8 @@ import Foundation
 /// Response shape of GET /healthz (design doc §HTTP API):
 /// `{"status":"ok","model":"<id>","uptime_s":…}`. `loadedModel` is
 /// optional because the engine starts up with no model resident — the
-/// healthz handler reports `"model": null` until the first
-/// `loadModel`/inferlet activation. Modeling that as `String?` keeps
+/// healthz handler reports `"model": null` until the engine boots with a
+/// model registered. Modeling that as `String?` keeps
 /// the GUI from string-matching `"none"`/`""` sentinels.
 public struct EngineHealth: Codable, Equatable, Sendable {
   public enum Status: String, Codable, Sendable {
@@ -86,17 +86,27 @@ public struct ModelInfo: Codable, Equatable, Sendable, Identifiable {
   /// authoritatively quote. The chat UI sorts by `id` for now;
   /// `created` returns when pie surfaces a registration timestamp.
   public let created: Date?
+  /// The effective per-request `max_tokens` ceiling the launched engine
+  /// will accept for this model (#474): chat-apc reports the runtime's
+  /// `max-output-tokens` — the memory-aware scheduler `default_token_limit`
+  /// (#438) capped by raw KV capacity. The App clamps its profile
+  /// `max_tokens` down to this before sending so a memory-squeezed launch
+  /// never trips the engine's clean 400. Optional so a pre-#474 engine
+  /// (no field) decodes to `nil` = "ceiling unknown, do not clamp".
+  public let maxOutputTokens: Int?
 
-  public init(id: String, ownedBy: String, created: Date? = nil) {
+  public init(id: String, ownedBy: String, created: Date? = nil, maxOutputTokens: Int? = nil) {
     self.id = id
     self.ownedBy = ownedBy
     self.created = created
+    self.maxOutputTokens = maxOutputTokens
   }
 
   private enum CodingKeys: String, CodingKey {
     case id
     case ownedBy = "owned_by"
     case created
+    case maxOutputTokens = "max_output_tokens"
   }
 }
 

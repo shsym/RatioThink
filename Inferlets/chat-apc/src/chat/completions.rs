@@ -728,6 +728,42 @@ const STARVED_MESSAGE: &str =
      timeout, or KV eviction); generation cannot continue";
 
 // =============================================================================
+// Over-capacity / backpressure classification (#470)
+// =============================================================================
+
+/// Stable sentinel the pie runtime prefixes onto a KV-page **acquisition
+/// timeout** (`runtime::context::reserve_working_pages`). When concurrent
+/// requests exceed the engine's KV slot count, a reservation defers on the
+/// scheduler's alloc/restore queues with no timer of its own; the host now
+/// bounds that wait and fails the call with this prefix. The chat-apc
+/// handler matches it to surface backpressure as `server_busy` + HTTP 503
+/// instead of a generic `forward_pass_failed` 500 — so an over-capacity
+/// client gets an explicit, retryable signal rather than a hung connection.
+///
+/// The trailing colon is load-bearing: `GenStep::execute` errors are an
+/// opaque free-text channel that also carries verbatim device/driver text,
+/// so a bare `server_busy` substring could appear in an unrelated fatal
+/// error and get mislabeled retryable. The host's contract is the
+/// colon-suffixed prefix (`"server_busy: …"`); bind to exactly that. (The
+/// real fix is a structured WIT error code — tracked as a follow-up.)
+const SERVER_BUSY_SENTINEL: &str = "server_busy:";
+
+/// Distinct terminal/error code for the over-capacity case.
+const SERVER_BUSY_CODE: &str = "server_busy";
+
+/// Classify a `Generator::next` / `GenStep::execute` error string into a
+/// stable terminal code. An over-capacity acquisition timeout (carrying the
+/// [`SERVER_BUSY_SENTINEL`]) maps to [`SERVER_BUSY_CODE`]; everything else
+/// is a generic `forward_pass_failed`.
+fn classify_forward_error(msg: &str) -> &'static str {
+    if msg.contains(SERVER_BUSY_SENTINEL) {
+        SERVER_BUSY_CODE
+    } else {
+        "forward_pass_failed"
+    }
+}
+
+// =============================================================================
 // Reasoning/content channel demux
 // =============================================================================
 
@@ -1814,28 +1850,21 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
         }
     };
 
-    // F4: reject `role:"tool"` until the chat template grows a real
-    // tool slot. Silent demotion to `user` (the prior `_` arm in
-    // `fill_context`) makes multi-turn tool-call round-trips quietly
-    // wrong — better to fail loud than ship half-wired tool support.
-    if let Some((i, m)) = request
-        .messages
-        .iter()
-        .enumerate()
-        .find(|(_, m)| m.role == "tool")
-    {
+    // F4 + #468: reject any role outside the supported set at the 400
+    // boundary rather than silently demoting it to `user` in
+    // `fill_context`. `tool` keeps its dedicated `tool_role_unsupported`
+    // code (no tool slot yet); a typo'd or unsupported role (`developer`,
+    // `banana`, …) is `unsupported_role` — fail loud, the way an
+    // OpenAI-compatible SDK expects, instead of mis-templating it.
+    if let Err((i, code, message)) = validate_roles(&request.messages) {
         let body = serde_json::json!({
             "error": {
                 "type": "invalid_request_error",
-                "code": "tool_role_unsupported",
-                "message": format!(
-                    "messages[{i}].role=\"tool\" is not yet supported (chat template has no tool slot); \
-                     post the tool result as a user turn or wait for the SDK tool-answer surface to land"
-                ),
+                "code": code,
+                "message": message,
                 "param": format!("messages[{i}].role"),
             }
         });
-        let _ = m;
         let response = Response::builder()
             .status(400)
             .header("Content-Type", "application/json")
@@ -1870,6 +1899,66 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
 // =============================================================================
 // Validation (F7)
 // =============================================================================
+
+/// Roles the chat template has a real slot for. `tool` is parsed but
+/// rejected with a dedicated code (F4 — no tool slot yet); every other
+/// role outside this set is an OpenAI-compatibility error (#468).
+const SUPPORTED_ROLES: [&str; 3] = ["system", "user", "assistant"];
+
+/// Single source of truth for the role policy. `None` = fillable;
+/// `Some(code)` = rejected with that 400 envelope `code`. `tool` keeps
+/// its dedicated `tool_role_unsupported` code (no tool slot in v1); any
+/// other unknown role — typo, `developer`, `function`, … — is
+/// `unsupported_role`. Used by both `validate_roles` (the early request
+/// gate) and `fill_context` (the callee guard), so the two can't drift.
+fn role_error_code(role: &str) -> Option<&'static str> {
+    if SUPPORTED_ROLES.contains(&role) {
+        None
+    } else if role == "tool" {
+        Some("tool_role_unsupported")
+    } else {
+        Some("unsupported_role")
+    }
+}
+
+/// Build the 400-envelope message for a rejected role at index `i`.
+fn role_error_message(i: usize, role: &str, code: &str) -> String {
+    if code == "tool_role_unsupported" {
+        format!(
+            "messages[{i}].role=\"tool\" is not yet supported (chat template has no tool slot); \
+             post the tool result as a user turn or wait for the SDK tool-answer surface to land"
+        )
+    } else {
+        format!(
+            "messages[{i}].role={role:?} is not a supported role (expected one of: system, user, assistant)"
+        )
+    }
+}
+
+/// Error `code`s emitted by the role policy (vs. internal failures like
+/// `tool_equip_failed`). A `fill_context` `Err` carrying one of these is
+/// a client error (400); anything else is an internal 500. Callers that
+/// surface `fill_context` failures (e.g. `tot::dispatch`) use this to
+/// pick the status.
+pub(crate) fn is_role_error_code(code: &str) -> bool {
+    matches!(code, "unsupported_role" | "tool_role_unsupported")
+}
+
+/// Validate message roles against the supported set. Returns the
+/// offending message index plus the 400 envelope `code`/`message`.
+///
+/// This is the early request gate ([`handle_parsed`]); [`fill_context`]
+/// guards the same policy at the callee so any non-completions caller
+/// (e.g. the tree-of-thought dispatch path) also rejects rather than
+/// silently demoting an unknown role to `user`.
+fn validate_roles(messages: &[ChatMessage]) -> Result<(), (usize, &'static str, String)> {
+    for (i, m) in messages.iter().enumerate() {
+        if let Some(code) = role_error_code(&m.role) {
+            return Err((i, code, role_error_message(i, &m.role, code)));
+        }
+    }
+    Ok(())
+}
 
 /// Per-request `max_tokens` ceiling, read live from the engine. This is
 /// `runtime::max-output-tokens()` — the runtime-reported output-token
@@ -2173,11 +2262,17 @@ async fn handle_streaming(
                 break (reason, None);
             }
             Ok(Some(s)) => s,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         let out = match step.execute().await {
             Ok(o) => o,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         // #439: a decode step that returns no sampled token means the
         // forward-pass layer starved — pie swallows a device failure / batch
@@ -2575,11 +2670,17 @@ async fn handle_non_streaming(
                 break (reason, None);
             }
             Ok(Some(s)) => s,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         let out = match step.execute().await {
             Ok(o) => o,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         // #439: a decode step that returns no sampled token means the
         // forward-pass layer starved — pie swallows a device failure / batch
@@ -2710,11 +2811,17 @@ async fn handle_non_streaming(
     let has_partial = !full_text.is_empty() || pending_tool.is_some() || !reasoning_text.is_empty();
     if error_diag.is_some() && !has_partial {
         let (code, msg) = error_diag.unwrap();
-        // N1: pure-failure 500 attaches launch diags via header —
+        // #470: over-capacity backpressure is a retryable 503, not a 500.
+        // The reservation timed out before any token was produced (the
+        // common over-subscription case lands here, with no partial body),
+        // so the client should back off and retry rather than treat it as a
+        // hard server fault. Every other abort stays a 500.
+        let status = if code == SERVER_BUSY_CODE { 503 } else { 500 };
+        // N1: pure-failure 5xx attaches launch diags via header —
         // the snapshot is immutable, so the next request gets the
         // same diags regardless.
         return res
-            .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+            .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
             .await;
     }
 
@@ -2976,9 +3083,12 @@ fn build_forced_tool_constraint(
 /// before any chat turn so the schemas land in the system slot the
 /// chat template expects.
 ///
-/// Roles outside the OpenAI canonical set are demoted to `user` so
-/// future SDK extensions (e.g. `tool`) don't crash the handler — a
-/// pessimistic but loss-of-information-preserving choice.
+/// Enforces the role policy at the callee (#468): an unknown role returns
+/// `Err((code, message))` rather than being silently demoted to `user`.
+/// Both user-reachable callers — `handle_parsed` (which also gates early
+/// via `validate_roles`) and the tree-of-thought `tot::dispatch` — go
+/// through here, so no caller can forget the check. The `code` is a role
+/// policy code ([`is_role_error_code`]); callers map it to a 400.
 pub(crate) fn fill_context(
     ctx: &mut Context,
     model: &Model,
@@ -2999,7 +3109,7 @@ pub(crate) fn fill_context(
             ctx.append(&prefix);
         }
     }
-    for msg in messages {
+    for (i, msg) in messages.iter().enumerate() {
         match msg.role.as_str() {
             "system" => {
                 ctx.system(&msg.content);
@@ -3007,11 +3117,16 @@ pub(crate) fn fill_context(
             "assistant" => {
                 ctx.assistant(&msg.content);
             }
-            // `user`, `tool`, anything else → user. The chat template
-            // doesn't have a `tool` slot in v1; surfacing the content
-            // as a user message is closer-to-correct than dropping it.
-            _ => {
+            "user" => {
                 ctx.user(&msg.content);
+            }
+            // #468: reject any other role here rather than demoting it to
+            // `user`. This is the root-cause guard — every caller goes
+            // through `fill_context`, so the tree-of-thought path can't
+            // bypass the policy the way it did before.
+            other => {
+                let code = role_error_code(other).unwrap_or("unsupported_role");
+                return Err((code, role_error_message(i, other, code)));
             }
         }
     }
@@ -3087,6 +3202,41 @@ mod tests {
         // starvation for a decode step (the loop always attaches the
         // auto-sampler, so a missing Token slot is the host producing none).
         assert!(forward_pass_starved(&[SlotOutput::Entropy(0.5)]));
+    }
+
+    // ─── Over-capacity backpressure classification (#470) ──
+
+    #[test]
+    fn server_busy_sentinel_classifies_as_server_busy() {
+        // The host wraps the acquisition-timeout message; the SDK then
+        // prefixes its own context ("GenStep::execute reserve: ..."). The
+        // sentinel survives both wraps as a substring.
+        let host = "server_busy: KV page acquisition timed out after 120s; \
+                    engine is over capacity";
+        let sdk_wrapped = format!("GenStep::execute reserve: {host}");
+        assert_eq!(classify_forward_error(host), SERVER_BUSY_CODE);
+        assert_eq!(classify_forward_error(&sdk_wrapped), SERVER_BUSY_CODE);
+    }
+
+    #[test]
+    fn generic_forward_error_classifies_as_forward_pass_failed() {
+        assert_eq!(
+            classify_forward_error("device RPC returned an error"),
+            "forward_pass_failed"
+        );
+        assert_eq!(classify_forward_error(""), "forward_pass_failed");
+    }
+
+    #[test]
+    fn bare_server_busy_token_in_device_error_is_not_backpressure() {
+        // The host's contract is the colon-suffixed `server_busy:` prefix.
+        // A verbatim device/driver error that merely contains the bare token
+        // `server_busy` (no colon) must stay a fatal `forward_pass_failed`,
+        // not get mislabeled as retryable backpressure (a 503 a client would
+        // retry forever against a genuinely dead engine).
+        let device_err =
+            "GenStep::execute forward: driver reported server_busy flag set on dead queue";
+        assert_eq!(classify_forward_error(device_err), "forward_pass_failed");
     }
 
     // ─── Reasoning/content channel demux ──────────────────
@@ -3238,6 +3388,63 @@ mod tests {
         assert!(validate_sampling(&req, MAX_OUTPUT_TOKENS_FALLBACK).is_ok());
         let cfg = req.speculation.unwrap().to_config();
         assert_eq!((cfg.leader_len, cfg.draft_len), (2, 4));
+    }
+
+    #[test]
+    fn validate_roles_accepts_supported_set() {
+        let msgs = vec![
+            ChatMessage { role: "system".into(), content: "s".into() },
+            ChatMessage { role: "user".into(), content: "u".into() },
+            ChatMessage { role: "assistant".into(), content: "a".into() },
+            ChatMessage { role: "user".into(), content: "u2".into() },
+        ];
+        assert!(validate_roles(&msgs).is_ok());
+    }
+
+    #[test]
+    fn validate_roles_rejects_tool_with_dedicated_code() {
+        // F4: `tool` keeps its own code so SDKs can branch on it.
+        let msgs = vec![
+            ChatMessage { role: "user".into(), content: "u".into() },
+            ChatMessage { role: "tool".into(), content: "t".into() },
+        ];
+        let (i, code, _msg) = validate_roles(&msgs).unwrap_err();
+        assert_eq!(i, 1);
+        assert_eq!(code, "tool_role_unsupported");
+    }
+
+    #[test]
+    fn validate_roles_rejects_unknown_role() {
+        // #468: a typo'd / unsupported role is a 400, not a silent
+        // demotion to `user` that generates a mis-templated completion.
+        for role in ["banana", "developer", "function", "User", ""] {
+            let msgs = vec![ChatMessage { role: role.into(), content: "c".into() }];
+            let (i, code, msg) = validate_roles(&msgs).unwrap_err();
+            assert_eq!(i, 0, "role={role:?}");
+            assert_eq!(code, "unsupported_role", "role={role:?}");
+            assert!(msg.contains("messages[0].role"), "role={role:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn is_role_error_code_splits_client_from_internal() {
+        // Role-policy codes are client errors (400); internal failures
+        // (e.g. tool_equip_failed) are not — the tot::dispatch status
+        // split (400 vs 500) keys on this.
+        assert!(is_role_error_code("unsupported_role"));
+        assert!(is_role_error_code("tool_role_unsupported"));
+        assert!(!is_role_error_code("tool_equip_failed"));
+    }
+
+    #[test]
+    fn validate_roles_reports_first_offending_index() {
+        let msgs = vec![
+            ChatMessage { role: "user".into(), content: "u".into() },
+            ChatMessage { role: "assistant".into(), content: "a".into() },
+            ChatMessage { role: "banana".into(), content: "b".into() },
+        ];
+        let (i, _code, _msg) = validate_roles(&msgs).unwrap_err();
+        assert_eq!(i, 2);
     }
 
     #[test]
