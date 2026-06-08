@@ -41,8 +41,17 @@ final class ComposerTextViewGeometryTests: XCTestCase {
     return (custom, seedHeight, lineHeight)
   }
 
-  /// Lays out an underlined descender line and returns its used height.
-  private func layOutDescenderLine(_ tv: NSTextView) throws -> CGFloat {
+  /// Lays out an underlined descender line and returns its used height. Asserts
+  /// the premises the frame differential rests on, so the guard can never pass
+  /// for the wrong reason — the used height is exactly one full line:
+  ///   · `>= lineHeight` rules out a collapsed/degenerate layout (and, since
+  ///     lineHeight ~16pt > seedHeight ~14pt, transitively anchors
+  ///     `usedHeight > seedHeight`, the premise behind the negative control).
+  ///   · `< 2 * lineHeight` rules out the 0-width-wrap case. (The container's
+  ///     `size.width` stays 0 under `widthTracksTextView`; the effective layout
+  ///     width comes from the text view's 300pt frame, so non-degeneracy is
+  ///     asserted via the line count, not `container.size.width`.)
+  private func layOutDescenderLine(_ tv: NSTextView, lineHeight: CGFloat) throws -> CGFloat {
     tv.string = "pqgyj"
     let full = NSRange(location: 0, length: (tv.string as NSString).length)
     tv.textStorage?.addAttribute(.underlineStyle,
@@ -50,13 +59,19 @@ final class ComposerTextViewGeometryTests: XCTestCase {
     let lm = try XCTUnwrap(tv.layoutManager)
     let container = try XCTUnwrap(tv.textContainer)
     lm.ensureLayout(for: container)
-    return lm.usedRect(for: container).height
+
+    let usedHeight = lm.usedRect(for: container).height
+    XCTAssertGreaterThanOrEqual(usedHeight, lineHeight,
+                                "premise: the laid-out line must span a full line height")
+    XCTAssertLessThan(usedHeight, 2 * lineHeight,
+                      "premise: the descender word lays out as a single line, not a degenerate 0-width wrap")
+    return usedHeight
   }
 
   /// Negative control: without the geometry fix the installed view is frozen
   /// at its seed height and cannot grow to contain a full line — the clip.
   func test_installedTextView_withoutGeometryFix_isFrozenAndClipsTheLine() throws {
-    let (tv, seedHeight, _) = try makeInstalledSubmitTextView()
+    let (tv, seedHeight, lineHeight) = try makeInstalledSubmitTextView()
 
     // Robust invariant: the swapped view starts non-resizable, with its max
     // height pinned to the seed frame (not the content) — independent of the
@@ -65,7 +80,7 @@ final class ComposerTextViewGeometryTests: XCTestCase {
     XCTAssertEqual(tv.maxSize.height, seedHeight, accuracy: 0.001,
                    "bare view's max height is clamped to the seed frame, not the content")
 
-    let usedHeight = try layOutDescenderLine(tv)
+    let usedHeight = try layOutDescenderLine(tv, lineHeight: lineHeight)
     tv.sizeToFit()
     XCTAssertLessThan(tv.frame.height, usedHeight,
                       "frozen view cannot grow to contain a full descender+underline line — the clip (#463)")
@@ -76,13 +91,13 @@ final class ComposerTextViewGeometryTests: XCTestCase {
   /// `applyResizableTextViewGeometry(to:)` is removed (the view stays frozen
   /// at the seed height, below the line height).
   func test_installedTextView_withGeometryFix_growsToContainDescenderLine() throws {
-    let (tv, _, _) = try makeInstalledSubmitTextView()
+    let (tv, _, lineHeight) = try makeInstalledSubmitTextView()
 
     applyResizableTextViewGeometry(to: tv)
     XCTAssertTrue(tv.isVerticallyResizable)
     XCTAssertFalse(tv.isHorizontallyResizable)
 
-    let usedHeight = try layOutDescenderLine(tv)
+    let usedHeight = try layOutDescenderLine(tv, lineHeight: lineHeight)
     tv.sizeToFit()
     XCTAssertGreaterThanOrEqual(tv.frame.height, usedHeight,
                                 "corrected view must grow to contain the full descender+underline line")
