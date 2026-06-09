@@ -75,6 +75,17 @@ public enum PieControlLauncher {
   /// child environment instead of relying on TOML alone.
   static let requestTimeoutSeconds = 120
 
+  /// Regex that extracts the control-plane `host:port` from the engine's READY
+  /// banner. Current pie (`server/src/serve.rs`) prints
+  /// `✓ Server ready at ws://<host>:<port>`; older builds printed
+  /// `pie-server serving on <host>:<port>`. Both forms are matched and the
+  /// bare `host:port` captured (the `ws://` scheme is re-added when the
+  /// WebSocket URL is built). Hoisted to a named constant so the engine-free
+  /// `PieControlLauncherHandshakeRegexTests` can pin BOTH banner forms in CI —
+  /// the operator-gated real-engine tier is the only other place this branch
+  /// runs, so without that test a banner-drift typo would ship green.
+  static let readyBannerAddressPattern = #"(?:pie-server serving on |Server ready at ws://)([^\s]+:\d+)"#
+
   /// Cold-start handshake budget the production resolver hands to
   /// `LaunchSpec.handshakeTimeout` (#459). The default `handshakeTimeout`
   /// (30s) is sized for the `.dummy` test launcher; a real `pie serve` cold
@@ -1250,15 +1261,11 @@ public actor LaunchedSession {
   /// and death diagnostics can snapshot bytes already written by the child
   /// without racing a `FileHandle.readabilityHandler` callback.
   func awaitHandshake(timeout: TimeInterval) async throws -> PieControlLauncher.Handshake {
-    // The engine's READY banner publishes the control-plane address. Current
-    // pie (server/src/serve.rs) prints `✓ Server ready at ws://<host>:<port>`;
-    // older builds printed `pie-server serving on <host>:<port>`. Accept both
-    // and capture the bare `host:port` (the `ws://` scheme is re-added when the
-    // WebSocket URL is built below). A pie pin bump that changes this banner is
-    // invisible to CI — the real-engine tier is operator-gated — so matching
-    // both forms keeps the handshake from silently hanging on a format drift.
-    let urlRegex = try! NSRegularExpression(
-      pattern: #"(?:pie-server serving on |Server ready at ws://)([^\s]+:\d+)"#)
+    // The engine's READY banner publishes the control-plane address. Both the
+    // current and legacy banner forms are matched by the shared, test-pinned
+    // `readyBannerAddressPattern` (the `ws://` scheme is re-added when the
+    // WebSocket URL is built below).
+    let urlRegex = try! NSRegularExpression(pattern: PieControlLauncher.readyBannerAddressPattern)
     let tokRegex = try! NSRegularExpression(pattern: #"internal token: (\S+)"#)
     let started = Date()
     let lines = outputTail.subscribe(replayRecent: true)
