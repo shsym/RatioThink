@@ -1250,7 +1250,15 @@ public actor LaunchedSession {
   /// and death diagnostics can snapshot bytes already written by the child
   /// without racing a `FileHandle.readabilityHandler` callback.
   func awaitHandshake(timeout: TimeInterval) async throws -> PieControlLauncher.Handshake {
-    let urlRegex = try! NSRegularExpression(pattern: #"pie-server serving on (\S+:\d+)"#)
+    // The engine's READY banner publishes the control-plane address. Current
+    // pie (server/src/serve.rs) prints `✓ Server ready at ws://<host>:<port>`;
+    // older builds printed `pie-server serving on <host>:<port>`. Accept both
+    // and capture the bare `host:port` (the `ws://` scheme is re-added when the
+    // WebSocket URL is built below). A pie pin bump that changes this banner is
+    // invisible to CI — the real-engine tier is operator-gated — so matching
+    // both forms keeps the handshake from silently hanging on a format drift.
+    let urlRegex = try! NSRegularExpression(
+      pattern: #"(?:pie-server serving on |Server ready at ws://)([^\s]+:\d+)"#)
     let tokRegex = try! NSRegularExpression(pattern: #"internal token: (\S+)"#)
     let started = Date()
     let lines = outputTail.subscribe(replayRecent: true)
