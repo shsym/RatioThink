@@ -117,6 +117,32 @@ aggregate_cell() {
   fi
 }
 
+# recognized_profile_count <profiles_csv>
+#
+# Echo how many recognized profiles (chat|tree-of-thought|fast-think) remain in
+# the csv after trimming whitespace and dropping empty fields. Extracted (like
+# aggregate_cell) so Scripts/test-matrix-aggregator.sh can unit-test the #483
+# hollow-green guard engine-free. An explicitly-set but empty / whitespace-only
+# / all-commas PIE_TEST_E2E_PROFILES resolves to zero recognized profiles: the
+# per-cell loop would then record no MATRIX-CELL rows and exit 0 with
+# PASS=0 FAIL=0 — a hollow green. The caller fails closed on a zero count.
+recognized_profile_count() {
+  local csv="$1" p n=0
+  local -a parts
+  IFS=',' read -ra parts <<< "$csv"
+  # ${parts[@]+...} is the nounset-safe expansion: an empty csv yields a
+  # zero-element array, and a bare "${parts[@]}" under `set -u` (bash 3.2 on
+  # macOS) is an "unbound variable" error — the very empty-input case this
+  # guard must handle.
+  for p in ${parts[@]+"${parts[@]}"}; do
+    p="$(printf '%s' "$p" | tr -d '[:space:]')"
+    case "$p" in
+      chat|tree-of-thought|fast-think) n=$((n + 1)) ;;
+    esac
+  done
+  printf '%s\n' "$n"
+}
+
 main() {
   cd "$ROOT"
 
@@ -132,6 +158,16 @@ main() {
 
   local PROFILES="${PIE_TEST_E2E_PROFILES:-$ALL_PROFILES}"
   local MODEL_FILTER="${PIE_TEST_E2E_MATRIX_MODELS:-}"
+
+  # Fail closed on a profile set that resolves to zero recognized profiles
+  # (#483). `${VAR:-default}` already covers an empty value, but a non-empty yet
+  # profile-free override (whitespace-only, all-commas, or only-typos) slips
+  # through and would silently iterate zero cells into a hollow green.
+  if [ "$(recognized_profile_count "$PROFILES")" -eq 0 ]; then
+    echo "matrix: PIE_TEST_E2E_PROFILES resolved to no recognized profile (got: '$PROFILES')." >&2
+    echo "matrix: expected a csv subset of: $ALL_PROFILES" >&2
+    exit 2
+  fi
 
   PIE_BIN="${PIE_BIN:-$(find_worktree_pie || true)}"
   if [ -z "$PIE_BIN" ] || [ ! -x "$PIE_BIN" ]; then
@@ -217,6 +253,16 @@ main() {
   echo "-------------------------------------------------------------"
   echo "PASS=$PASS_COUNT  FAIL=$FAIL_COUNT  (summary: $SUMMARY)"
   echo "============================================================="
+
+  # Zero-row backstop (#483). A matrix run that recorded no MATRIX-CELL rows
+  # never proved anything — e.g. PIE_TEST_E2E_MATRIX_MODELS matched no model and
+  # every entry was skipped — yet PASS=0 FAIL=0 would otherwise exit 0 as a
+  # hollow green. The recognized-profile guard above covers the empty-profile
+  # path; this is the catch-all invariant: no cells ⇒ not a pass.
+  if [ $((PASS_COUNT + FAIL_COUNT)) -eq 0 ]; then
+    echo "matrix: ERROR — recorded zero MATRIX-CELL rows; a zero-row run is never a pass." >&2
+    exit 2
+  fi
   exit "$overall_rc"
 }
 

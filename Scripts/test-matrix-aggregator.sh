@@ -72,6 +72,23 @@ nocell=0; [ "$overall_rc" -eq 1 ] && [ "$FAIL_COUNT" -eq 3 ] && [ "$PASS_COUNT" 
   && ! grep -q "despite PASS cells" "$SUMMARY" && nocell=1
 check "no cells + cell_rc=2 → 3 FAIL(no-cell), no spurious 'despite' row" "$nocell"
 
+# --- #483 hollow-green guard: recognized_profile_count --------------------
+# The wrapper fails closed (exit 2) when the resolved profile set has zero
+# recognized profiles. Drive the extracted counter with the values that slip
+# past `${VAR:-default}`: non-empty but profile-free overrides.
+prof_eq() {  # <desc> <csv> <expected-count>
+  local got; got="$(recognized_profile_count "$2")"
+  check "$1 → count=$3" "$([ "$got" = "$3" ] && echo 1 || echo 0)"
+}
+prof_eq "full default set"                "chat,tree-of-thought,fast-think" 3
+prof_eq "single profile"                  "chat"                            1
+prof_eq "whitespace-padded subset"        " chat , fast-think "             2
+prof_eq "empty string (hollow green)"     ""                                0
+prof_eq "whitespace-only (hollow green)"  "   "                             0
+prof_eq "all-commas (hollow green)"       ",,,"                             0
+prof_eq "only an unrecognized profile"    "bogus"                           0
+prof_eq "one recognized among typos"      "chat,bogus"                      1
+
 echo ""
 [ "$rc" -eq 0 ] && echo "matrix-aggregator self-test: PASS" || echo "matrix-aggregator self-test: FAIL"
 exit "$rc"
