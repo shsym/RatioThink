@@ -33,7 +33,6 @@ final class ToolbarModelMenuLayoutTests: XCTestCase {
       availableProfiles: ["chat"],
       modelOptions: [],
       currentModelSummary: summary,
-      residentModelIDForSelection: nil,
       swapCoordinator: .previewDefault(),
       modelLoadCenter: nil,
       engineStatus: nil,

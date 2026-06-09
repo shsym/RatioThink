@@ -173,15 +173,16 @@ struct ChatScaffoldView: View {
   /// `engineActionError` (PR#15 F3) — never the persistence banner.
   private func startEngineForSelectedProfile() {
     let profileID = viewModel.selectedProfileID
-    // Honor an explicit toolbar / model-list pick as the boot model (#459
-    // repro 1). v1 pie loads the model at `pie serve` boot from the profile,
-    // so a per-chat override that only lives in App state would never reach
-    // the engine — a no-default profile would fail with `has no default
-    // model` despite the user having chosen one. Thread the override in the
-    // start call so the helper boots it without depending on the profile
-    // default (race-free against the helper's own profile store). A blank
-    // override falls back to the profile default.
-    let modelOverride = viewModel.modelOverride
+    // Honor an explicit per-chat model pick as the boot model (#459 repro 1).
+    // v1 pie loads the model at `pie serve` boot from the profile, so a
+    // selection that only lives in App state would never reach the engine — a
+    // no-default profile would fail with `has no default model` despite the
+    // user having chosen one. Thread the selection in the start call so the
+    // helper boots it without depending on the profile default (race-free
+    // against the helper's own profile store). A nil/blank selection falls
+    // back to the profile default. #460: the selection is `Chat.modelID` (the
+    // single authority), read from this view's single chat.
+    let modelOverride = chats.first?.modelID
     Task { @MainActor in
       do {
         engineActionError = nil
@@ -234,17 +235,16 @@ struct ChatScaffoldView: View {
     }
   }
 
-  private var toolbarResidentModelIDForDisplay: String? {
-    if case .running = engineStatusStore.status {
-      return modelLoadCenter.residentModelID
-    }
-    return nil
-  }
-
+  /// #460: the chat's current model SELECTION drives the menu's "current"
+  /// row + collapsed summary — `Chat.modelID` (the authority), NOT engine
+  /// residency. Residency is not a selection source under the single
+  /// authority, so it is NOT fed into `currentSummary`/`build`'s
+  /// `residentModelID` (the served model still appears as a pickable row via
+  /// `toolbarServedModelIDs`). `chats.first` is this view's single chat.
   private var toolbarCurrentModelSummary: ToolbarModelOptions.CurrentSummary? {
     ToolbarModelOptions.currentSummary(
-      modelOverride: viewModel.modelOverride,
-      residentModelID: toolbarResidentModelIDForDisplay,
+      modelOverride: chats.first?.modelID,
+      residentModelID: nil,
       profileDefaultModelID: selectedProfileDefault)
   }
 
@@ -253,8 +253,8 @@ struct ChatScaffoldView: View {
       discoveredModels: toolbarDiscoveredModels,
       servedModelIDs: toolbarServedModelIDs,
       profileDefaultModelID: selectedProfileDefault,
-      modelOverride: viewModel.modelOverride,
-      residentModelID: toolbarResidentModelIDForDisplay)
+      modelOverride: chats.first?.modelID,
+      residentModelID: nil)
   }
 
   private func scaffold(for chat: Chat) -> some View {
@@ -262,9 +262,21 @@ struct ChatScaffoldView: View {
       ContentToolbar(
         viewModel: viewModel,
         availableProfiles: pickerProfileIDs,
+        // #459's richer model menu (option list + collapsed summary), built
+        // from `Chat.modelID` (the #460 authority).
         modelOptions: toolbarModelOptions,
         currentModelSummary: toolbarCurrentModelSummary,
-        residentModelIDForSelection: toolbarResidentModelIDForDisplay,
+        // #460: the chat's persisted selection authority + the active
+        // profile's default. The commits write the SwiftData authority
+        // (`Chat.modelID` / `Chat.profileID`); policy lives in the
+        // coordinator, persistence here.
+        selectedModelID: chat.modelID,
+        profileDefaultModel: selectedProfileDefault,
+        commitSwap: { profileID, pinModel in
+          commitSwap(profileID: profileID, pinModel: pinModel, chat: chat)
+        },
+        commitModel: { modelID in persistChatModel(modelID, on: chat) },
+        onUseProfileDefault: { _ = persistChatModel(nil, on: chat) },
         swapCoordinator: swapCoordinator,
         modelLoadCenter: modelLoadCenter,
         engineStatus: engineStatusStore,
@@ -312,7 +324,7 @@ struct ChatScaffoldView: View {
         chat: chat,
         viewModel: viewModel,
         isSending: sendController.isInFlight,
-        shouldAllowSend: { currentModelID() != nil },
+        shouldAllowSend: { currentModelID(for: chat) != nil },
         onSendBlocked: { presentNoModelPrompt() },
         onUserMessageSaved: { _ in sendAssistantTurn(for: chat) }
       )
@@ -322,7 +334,7 @@ struct ChatScaffoldView: View {
       NoModelLoadedPrompt(
         // #397: the lifecycle state gives the prompt its "starting /
         // loading…" framing while the engine/model comes up.
-        gateState: chatStartState,
+        gateState: chatStartState(for: chat),
         // #326: the model-availability action (Load / Download /
         // unavailable) captured when the send was blocked.
         action: noModelAction,
@@ -360,8 +372,8 @@ struct ChatScaffoldView: View {
     // #397: auto-dismiss the gate once a model resolves (engine came up
     // and reconciled, or a load completed) so the user lands back at the
     // composer with their draft intact — no stale "starting…" sheet.
-    .onChange(of: modelLoadCenter.residentModelID) { _, _ in dismissPromptIfResolved() }
-    .onChange(of: viewModel.modelOverride) { _, _ in dismissPromptIfResolved() }
+    .onChange(of: modelLoadCenter.residentModelID) { _, _ in dismissPromptIfResolved(for: chat) }
+    .onChange(of: chat.modelID) { _, _ in dismissPromptIfResolved(for: chat) }
     // #413: open/close the helper-health generation gate around every stream.
     // While a chat / ToT generation is in flight a saturated engineStatus poll
     // path can time out for many consecutive polls; without this gate the
@@ -430,7 +442,7 @@ struct ChatScaffoldView: View {
     // doesn't block every send behind the no-model prompt despite a ready
     // engine ( follow-up). Re-runs whenever the engine status flips.
     .task(id: engineStatusStore.status) {
-      await reconcileEngineResidentModel()
+      await reconcileEngineResidentModel(for: chat)
     }
   }
 
@@ -448,7 +460,7 @@ struct ChatScaffoldView: View {
   /// engine actually serves (`GET /v1/models`) — the only id its chat
   /// endpoint accepts. No-op when the engine isn't running or a load is
   /// already in flight.
-  private func reconcileEngineResidentModel() async {
+  private func reconcileEngineResidentModel(for chat: Chat) async {
     // Bounded retry while the engine stays running — a single transient
     // /v1/models failure must not strand residentModelID unset until a
     // status flip that may never come on equal .running polls (F2).
@@ -479,9 +491,33 @@ struct ChatScaffoldView: View {
       // reconcileEngineResident is internally guarded against clobbering
       // an in-flight load.
       modelLoadCenter.reconcileEngineResident(ids[0])
+      // #460 (review F1): seed the chat's SELECTION authority (`Chat.modelID`)
+      // from the served model ONLY when it matches THIS chat's profile
+      // default — never the engine's single GLOBAL resident model when it
+      // differs. The engine serves one global model; `ids[0]` is that, not
+      // necessarily this chat's selection, and navigating between chats does
+      // NOT reload the engine to the new chat's profile (the active-profile
+      // write is stage-only). Adopting `ids[0]` unconditionally would durably
+      // pin an unpinned chat to the wrong model. When the served model is not
+      // this chat's default, leave `modelID` nil (follow the profile default).
+      // `seededModelID` is the pure decision; seed-only (never overwrites a
+      // pick) and no-op while a load is in flight.
+      if let toPin = Self.seededModelID(
+        currentPin: chat.modelID,
+        servedID: ids[0],
+        profileDefault: selectedProfileDefault,
+        // #469: the residency-only ModelLoadCenter has no in-flight-load state
+        // (`/v1/models/load` is gone; the served model is bound at engine boot).
+        // This block runs on a successful `/v1/models` reconcile — the engine is
+        // serving, never mid-load — so the seed guard is never "in flight" here.
+        isLoading: false
+      ) {
+        _ = persistChatModel(toPin, on: chat)
+      }
       // #474: apply the launched ceiling unconditionally (a guardrail change
       // or reload can hand the same model a different ceiling). The setter
-      // no-ops on an unchanged value and while a load is in flight.
+      // no-ops on an unchanged value and while a load is in flight. Orthogonal
+      // to the #460 selection seed above — model identity vs token ceiling.
       modelLoadCenter.setResidentMaxOutputTokens(fetchedCeiling)
     case .failedAfterRetries(let attempts):
       // Don't silently drop: engine running but unreachable for models.
@@ -503,7 +539,7 @@ struct ChatScaffoldView: View {
     // Defensive: ComposerView only invokes this after `shouldAllowSend`
     // passed, but never ask the engine to load a model the user did not
     // choose ( invariant).
-    guard let modelID = currentModelID() else {
+    guard let modelID = currentModelID(for: chat) else {
       presentNoModelPrompt()
       return
     }
@@ -557,21 +593,91 @@ struct ChatScaffoldView: View {
     )
   }
 
-  private func currentModelID() -> String? {
-    // A resident model only counts when the engine is actually `.running`.
-    // `EngineLifecycle` clears `residentModelID` on the leave-`.running` edge,
-    // but this guard also covers the brief window before that lands — so a
-    // stopped engine yields `needsDefaultLoad`/`noDefault` (an honest "Load
-    // X?" prompt) instead of a send that passes the gate then fails at HTTP.
+  /// #460: resolve the model a send should target from the SINGLE selection
+  /// authority — the chat's pinned `modelID`, or the active profile's
+  /// default when unpinned. The engine must actually be `.running` for the
+  /// selection to count (a stopped engine yields a "Load X?" prompt rather
+  /// than a send that passes the gate then fails at HTTP); `EngineLifecycle`
+  /// clears residency on the leave-`.running` edge and `reconcileEngine
+  /// ResidentModel` re-seeds `chat.modelID` to the served id once running,
+  /// so by send time the authority matches what the engine serves. The
+  /// test override (`PIE_TEST_CHAT_MODEL`) bypasses the running gate for the
+  /// GUI harness. No `residentModelID` read here — residency is an engine
+  /// fact reconciled INTO the authority, not a parallel selection source.
+  private func currentModelID(for chat: Chat) -> String? {
     let engineRunning: Bool = {
       if case .running = engineStatusStore.status { return true }
       return false
     }()
     return Self.requestModelID(
-      modelOverride: viewModel.modelOverride,
-      residentModelID: engineRunning ? modelLoadCenter.residentModelID : nil,
+      selectedModelID: engineRunning ? chat.modelID : nil,
+      profileDefaultModel: engineRunning ? selectedProfileDefault : nil,
       testModelID: ProcessInfo.processInfo.environment["PIE_TEST_CHAT_MODEL"]
     )
+  }
+
+  /// #460: durably set (or clear) the chat's selected model — the single
+  /// selection authority. `nil` clears the pin so the chat follows the
+  /// active profile's default again. Does NOT bump `updatedAt` (a config
+  /// edit, like a profile swap — it must not float the chat ahead of
+  /// more-recently-talked chats in the recency-sorted sidebar). Returns
+  /// `true` when the value is durably set (including the no-op case);
+  /// `false` when the save failed. Review F2: on failure use
+  /// `modelContext.rollback()` (like `ChatListView.delete`) so ALL pending
+  /// edits are discarded rather than only field-restoring `modelID` and
+  /// leaving a second pending write to flush later.
+  @discardableResult
+  private func persistChatModel(_ modelID: String?, on chat: Chat) -> Bool {
+    guard chat.modelID != modelID else { return true }
+    chat.modelID = modelID
+    do {
+      try modelContext.save()
+      return true
+    } catch {
+      modelContext.rollback()
+      persistenceStatus.report(error, context: "ChatScaffoldView.modelSelect")
+      return false
+    }
+  }
+
+  /// #460: persist a profile swap on this chat. The model pin is written
+  /// FIRST and the profile is switched ONLY if it succeeded (review F2 —
+  /// a failed pin must not leave the chat with a switched profile + a
+  /// loaded new model while `modelID` reverts). Returns `false` on a pin
+  /// failure so `ProfileSwapCoordinator.confirm` skips the load; the swap is
+  /// then fully aborted (profile unchanged, no load). A silent / no-default
+  /// swap passes `pinModel == nil` so the chat's current model is PRESERVED.
+  /// The profile change routes through `viewModel.selectedProfileID`, whose
+  /// `.onChange` owns the durable profile write (+ active-profile marker +
+  /// rollback). The preserve-vs-switch policy was already decided in
+  /// `ProfileSwapCoordinator`; this only performs the persistence.
+  private func commitSwap(profileID: String, pinModel: String?, chat: Chat) -> Bool {
+    if let pinModel, !persistChatModel(pinModel, on: chat) {
+      return false  // pin save failed → do NOT switch the profile or load
+    }
+    viewModel.selectedProfileID = profileID
+    return true
+  }
+
+  /// #460 (review F1): pure decision for the residency seed. Adopt the
+  /// served model as this chat's pin ONLY when the chat is unpinned, not
+  /// loading, and the served model is exactly this chat's profile default —
+  /// so the seed never durably pins an unpinned chat to the engine's GLOBAL
+  /// resident model when that differs from the chat's own default. Returns
+  /// the id to pin, or `nil` to leave `modelID` untouched (follow the
+  /// profile default). Static + pure so the matrix is unit-testable without
+  /// a view host.
+  static func seededModelID(
+    currentPin: String?,
+    servedID: String?,
+    profileDefault: String?,
+    isLoading: Bool
+  ) -> String? {
+    guard !isLoading else { return nil }          // load in flight → no-op
+    guard currentPin == nil else { return nil }   // already pinned → never overwrite
+    guard let servedID, !servedID.isEmpty else { return nil }
+    guard servedID == profileDefault else { return nil }  // served != this chat's default → don't seed
+    return servedID
   }
 
   /// The active chat profile's default model slug — the ONE definition of
@@ -611,11 +717,14 @@ struct ChatScaffoldView: View {
   /// one explicit state. The model-availability action (Load / Download /
   /// unavailable) stays #326's `MissingModelRecovery`; this only decides
   /// the lifecycle framing (chiefly: is the engine/model still busy?).
-  private var chatStartState: ChatStartGate.State {
+  private func chatStartState(for chat: Chat) -> ChatStartGate.State {
     ChatStartGate.evaluate(
       engineStatus: engineStatusStore.status,
       helperError: engineStatusStore.lastError,
-      resolvedModelID: currentModelID(),
+      // #460: the chat's model is per-chat now (`currentModelID(for:)`); #469:
+      // `ChatStartGate.evaluate` no longer takes a `load:` state — the load
+      // state machine is gone (ModelLoadCenter is residency-only).
+      resolvedModelID: currentModelID(for: chat),
       profileDefault: selectedProfileDefault,
       profileError: profileStore.lastActiveProfileError?.description
     )
@@ -693,30 +802,32 @@ struct ChatScaffoldView: View {
 
   /// #397: close the gate once a model resolves so the user lands back at
   /// the composer with their draft intact.
-  private func dismissPromptIfResolved() {
-    if showNoModelPrompt, currentModelID() != nil {
+  private func dismissPromptIfResolved(for chat: Chat) {
+    if showNoModelPrompt, currentModelID(for: chat) != nil {
       showNoModelPrompt = false
     }
   }
 
-  /// Resolve the model a send should target. : no hidden fallback —
-  /// when the user has set no per-chat override and nothing is resident,
-  /// this returns nil and the caller blocks the send behind the
-  /// no-model confirm rather than asking the engine to load something
-  /// the user never chose.
+  /// Resolve the model a send should target from the chat's SELECTION
+  /// authority (#460): the explicit pin (`selectedModelID` = `Chat.modelID`),
+  /// else the active profile's default, else nil. : no hidden fallback —
+  /// when nothing resolves the caller blocks the send behind the no-model
+  /// confirm rather than asking the engine to load something the user never
+  /// chose. The test override wins for the GUI harness. Pure + static so the
+  /// precedence is unit-tested without a view.
   static func requestModelID(
-    modelOverride: String?,
-    residentModelID: String?,
+    selectedModelID: String?,
+    profileDefaultModel: String?,
     testModelID: String? = nil
   ) -> String? {
     if let testModel = testModelID, !testModel.isEmpty {
       return testModel
     }
-    if let modelOverride, !modelOverride.isEmpty {
-      return modelOverride
+    if let selectedModelID, !selectedModelID.isEmpty {
+      return selectedModelID
     }
-    if let residentModelID, !residentModelID.isEmpty {
-      return residentModelID
+    if let profileDefaultModel, !profileDefaultModel.isEmpty {
+      return profileDefaultModel
     }
     return nil
   }

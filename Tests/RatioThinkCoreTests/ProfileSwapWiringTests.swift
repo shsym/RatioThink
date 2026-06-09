@@ -37,13 +37,17 @@ final class ProfileSwapWiringTests: XCTestCase {
   func test_profileStore_backed_coordinator_fires_popover_on_model_changing_swap() throws {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
-        center: ModelLoadCenter(initialResident: "model-A.gguf"),
+        // #460 keys the swap on the passed `fromModel`, not residency (no
+        // seeded resident needed); #469 drops `engine:` for `serveModel:`.
+        center: ModelLoadCenter(),
         profileStore: store,
         serveModel: { _, _ in }
       )
 
       var committed: String?
-      coord.requestSwap(toProfileID: "beta") { committed = $0 }
+      // #460: the "current model" is the chat's selection passed in, NOT
+      // engine residency — here the chat is on model-A.
+      coord.requestSwap(toProfileID: "beta", fromModel: "model-A.gguf") { profileID, _ in committed = profileID; return true }
 
       XCTAssertNil(committed, "a model-changing swap must wait for confirm, not commit silently")
       let pending = try XCTUnwrap(coord.pending,
@@ -57,24 +61,29 @@ final class ProfileSwapWiringTests: XCTestCase {
   func test_profileStore_backed_coordinator_stays_silent_for_same_model() throws {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
-        center: ModelLoadCenter(initialResident: "model-B.gguf"),
+        center: ModelLoadCenter(),
         profileStore: store,
         serveModel: { _, _ in }
       )
       var committed: String?
-      coord.requestSwap(toProfileID: "beta") { committed = $0 }
-      XCTAssertEqual(committed, "beta", "swapping into the already-resident model must stay silent")
+      var preservedModel = true
+      // The chat is already on model-B (beta's default) → silent swap.
+      coord.requestSwap(toProfileID: "beta", fromModel: "model-B.gguf") { profileID, pinModel in
+        committed = profileID
+        preservedModel = (pinModel == nil)
+        return true
+      }
+      XCTAssertEqual(committed, "beta", "swapping into the already-selected model must stay silent")
+      XCTAssertTrue(preservedModel, "a same-model swap must not pin a new model")
       XCTAssertNil(coord.pending)
     }
   }
 
-  /// : the engine-stopped re-select case. With the engine NOT running,
-  /// nothing is resident (`residentModelID == nil` — the lifecycle clears it
-  /// on the leave-`.running` edge), so the same-model check (`to == nil`) can
-  /// never catch it and the swap used to prompt a meaningless "swap from — to
-  /// X". A profile selection with no resident model to REPLACE must commit
-  /// silently and fire no load.
-  func test_profileStore_backed_coordinator_stays_silent_when_no_model_is_resident() throws {
+  /// #460: the engine-stopped / unpinned re-select case. With no current
+  /// model (`fromModel == nil`) there is nothing to REPLACE, so a swap-confirm
+  /// "swap from — to X" is meaningless. The profile selection commits silently
+  /// and fires no load.
+  func test_profileStore_backed_coordinator_stays_silent_when_no_model_is_selected() throws {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
         center: ModelLoadCenter(),   // engine stopped → residentModelID == nil
@@ -82,45 +91,50 @@ final class ProfileSwapWiringTests: XCTestCase {
         serveModel: { _, _ in }
       )
       var committed: String?
-      coord.requestSwap(toProfileID: "beta") { committed = $0 }
+      coord.requestSwap(toProfileID: "beta", fromModel: nil) { profileID, _ in committed = profileID; return true }
       XCTAssertEqual(committed, "beta",
-                     "with nothing resident, selecting a profile must commit silently — there is no resident model to replace")
+                     "with no current model, selecting a profile must commit silently — there is nothing to replace")
       XCTAssertNil(coord.pending,
-                   "no swap-confirm popover when the engine is stopped and no model is loaded")
+                   "no swap-confirm popover when there is no current model")
     }
   }
 
-  // MARK: - #459 third outcome: Keep Current Model
+  // MARK: - #459 third outcome: Keep Current Model (ported onto #460's authority)
 
-  /// KEEP CURRENT MODEL: commit the profile switch AND pin the resident model
-  /// A as the per-chat override, with NO reload. The profile's stored default
-  /// B is left untouched.
-  func test_keepCurrentModel_commits_profile_sets_override_A_and_fires_no_load() throws {
+  /// KEEP CURRENT MODEL: commit the profile switch AND pin the chat's CURRENT
+  /// model A as its selection (`Chat.modelID`), with NO reload. Under the
+  /// single authority this is the swap `commit` invoked with the CURRENT model
+  /// (`fromModel`) as the pin instead of the new default — no `setOverride`.
+  func test_keepCurrentModel_commits_profile_pins_current_model_and_fires_no_load() throws {
     try withTwoProfileStore { store in
       let center = ModelLoadCenter(initialResident: "model-A.gguf")
       let coord = ProfileSwapCoordinator(
         center: center, profileStore: store, serveModel: { _, _ in })
 
-      var committed: String?
-      var capturedOverride: String?
-      var overrideCalls = 0
-      coord.requestSwap(
-        toProfileID: "beta",
-        commit: { committed = $0 },
-        setOverride: { capturedOverride = $0; overrideCalls += 1 })
+      var committedProfile: String?
+      var pinnedModel: String?
+      var commitCalls = 0
+      // The chat is currently on model-A; beta's default is model-B → a
+      // model-changing swap publishes a pending.
+      coord.requestSwap(toProfileID: "beta", fromModel: "model-A.gguf") { profileID, pinModel in
+        commitCalls += 1
+        committedProfile = profileID
+        pinnedModel = pinModel
+        return true
+      }
 
       let pending = try XCTUnwrap(coord.pending, "model-changing swap must publish a pending")
       XCTAssertTrue(pending.canKeepCurrentModel,
-                    "a profile swap with a resident model must offer Keep Current")
+                    "a profile swap with a current model must offer Keep Current")
       XCTAssertFalse(pending.canSetAsDefault,
                      "the profile-swap path does not offer Set-as-default")
 
       coord.keepCurrentModel(token: pending.id)
 
-      XCTAssertEqual(committed, "beta", "keep-current must commit the profile switch")
-      XCTAssertEqual(overrideCalls, 1, "keep-current must set the per-chat override exactly once")
-      XCTAssertEqual(capturedOverride, "model-A.gguf",
-                     "keep-current must pin the resident model A as the override")
+      XCTAssertEqual(commitCalls, 1, "keep-current commits exactly once")
+      XCTAssertEqual(committedProfile, "beta", "keep-current must commit the profile switch")
+      XCTAssertEqual(pinnedModel, "model-A.gguf",
+                     "keep-current must pin the CURRENT model A as the chat's selection")
       XCTAssertNil(coord.pending, "pending must clear after keep-current")
       XCTAssertEqual(center.residentModelID, "model-A.gguf",
                      "keep-current must NOT reload — A stays resident")
@@ -128,26 +142,23 @@ final class ProfileSwapWiringTests: XCTestCase {
   }
 
   /// A stale token (superseded pending) must be dropped: no profile switch,
-  /// no override, pending untouched — mirrors confirm/cancel.
+  /// no pin, pending untouched — mirrors confirm/cancel.
   func test_keepCurrentModel_drops_stale_token() throws {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
         center: ModelLoadCenter(initialResident: "model-A.gguf"),
         profileStore: store, serveModel: { _, _ in })
 
-      var committed: String?
-      var overrideCalls = 0
-      coord.requestSwap(
-        toProfileID: "beta",
-        commit: { committed = $0 },
-        setOverride: { _ in overrideCalls += 1 })
+      var commitCalls = 0
+      coord.requestSwap(toProfileID: "beta", fromModel: "model-A.gguf") { _, _ in
+        commitCalls += 1; return true
+      }
       XCTAssertNotNil(coord.pending)
 
       coord.keepCurrentModel(token: UUID())   // wrong token
 
       XCTAssertNotNil(coord.pending, "stale-token keep-current must not clear the pending")
-      XCTAssertNil(committed, "stale-token keep-current must not switch the profile")
-      XCTAssertEqual(overrideCalls, 0, "stale-token keep-current must not set the override")
+      XCTAssertEqual(commitCalls, 0, "stale-token keep-current must not commit (no switch, no pin)")
     }
   }
 
@@ -160,8 +171,9 @@ final class ProfileSwapWiringTests: XCTestCase {
         center: ModelLoadCenter(initialResident: "model-A.gguf"),
         profileStore: store, serveModel: { _, _ in })
 
-      var committed: String?
-      coord.requestModelOverride(modelID: "model-B.gguf", activeProfileID: "alpha") { committed = $0 }
+      var commitCalls = 0
+      coord.requestModelOverride(modelID: "model-B.gguf", activeProfileID: "alpha",
+                                 fromModel: "model-A.gguf") { _ in commitCalls += 1; return true }
       let pending = try XCTUnwrap(coord.pending)
       XCTAssertTrue(pending.canSetAsDefault)
       XCTAssertFalse(pending.canKeepCurrentModel,
@@ -170,31 +182,28 @@ final class ProfileSwapWiringTests: XCTestCase {
       coord.keepCurrentModel(token: pending.id)
 
       XCTAssertNotNil(coord.pending, "keep-current must be a no-op on the model-override path")
-      XCTAssertNil(committed)
+      XCTAssertEqual(commitCalls, 0)
     }
   }
 
   /// Esc / click-outside (`dismissCurrentPending`) must be a TRUE abandon —
-  /// never silently keep-current: no profile switch, no override.
+  /// never silently keep-current: no profile switch, no pin.
   func test_dismiss_is_true_abandon_never_keeps_current() throws {
     try withTwoProfileStore { store in
       let coord = ProfileSwapCoordinator(
         center: ModelLoadCenter(initialResident: "model-A.gguf"),
         profileStore: store, serveModel: { _, _ in })
 
-      var committed: String?
-      var overrideCalls = 0
-      coord.requestSwap(
-        toProfileID: "beta",
-        commit: { committed = $0 },
-        setOverride: { _ in overrideCalls += 1 })
+      var commitCalls = 0
+      coord.requestSwap(toProfileID: "beta", fromModel: "model-A.gguf") { _, _ in
+        commitCalls += 1; return true
+      }
       XCTAssertNotNil(coord.pending)
 
       coord.dismissCurrentPending()   // Esc / click-outside
 
       XCTAssertNil(coord.pending)
-      XCTAssertNil(committed, "an accidental dismiss must NOT switch the profile")
-      XCTAssertEqual(overrideCalls, 0, "an accidental dismiss must NOT set the keep-current override")
+      XCTAssertEqual(commitCalls, 0, "an accidental dismiss must NOT switch the profile or pin a model")
     }
   }
 }

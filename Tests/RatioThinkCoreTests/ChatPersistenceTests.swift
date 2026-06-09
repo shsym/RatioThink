@@ -419,6 +419,7 @@ final class ChatPersistenceTests: XCTestCase {
       id: chatID,
       title: "Exported",
       profileID: "chat",
+      modelID: "org/Repo/Exported-Q8.gguf",
       createdAt: createdAt,
       updatedAt: updatedAt,
       pinned: true
@@ -446,6 +447,8 @@ final class ChatPersistenceTests: XCTestCase {
     XCTAssertEqual(exported.id, chatID)
     XCTAssertEqual(exported.title, "Exported")
     XCTAssertEqual(exported.profileID, "chat")
+    XCTAssertEqual(exported.modelID, "org/Repo/Exported-Q8.gguf",
+                   "#460: the JSON export must carry the chat's pinned model")
     XCTAssertEqual(exported.pinned, true)
     XCTAssertEqual(exported.messages.count, 1)
     let exportedMsg = try XCTUnwrap(exported.messages.first)
@@ -454,5 +457,48 @@ final class ChatPersistenceTests: XCTestCase {
     XCTAssertEqual(exportedMsg.content, "body")
     XCTAssertEqual(exportedMsg.tokens, 7)
     XCTAssertEqual(exportedMsg.meta, meta)
+  }
+
+  /// #460: the new `Chat.modelID` is an ADDITIVE, reversible change. A
+  /// pre-#460 export (JSON with no `modelID` key) must still decode — the
+  /// field defaults to nil — so reading an old store/export never breaks.
+  func test_exportedChat_decodes_legacy_json_without_modelID_as_nil() throws {
+    let legacy = """
+    [{
+      "id": "00000000-0000-0000-0000-000000000001",
+      "title": "Legacy",
+      "profileID": "chat",
+      "createdAt": "2024-01-01T00:00:00Z",
+      "updatedAt": "2024-01-01T00:00:00Z",
+      "pinned": false,
+      "messages": []
+    }]
+    """
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let decoded = try decoder.decode([RatioThinkModelContainer.ExportedChat].self,
+                                     from: Data(legacy.utf8))
+    XCTAssertEqual(decoded.count, 1)
+    XCTAssertNil(decoded.first?.modelID,
+                 "a legacy export with no modelID key must decode with modelID == nil (additive)")
+  }
+
+  /// #460: a chat created on the pre-#460 default initializer (no modelID)
+  /// is unpinned, and a model can be pinned + read back — the migration adds
+  /// the column without disturbing existing rows.
+  func test_chat_modelID_defaults_nil_and_round_trips() throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+
+    let unpinned = Chat(title: "Unpinned", profileID: "chat")
+    context.insert(unpinned)
+    try context.save()
+    XCTAssertNil(unpinned.modelID, "default chat is unpinned (follows profile default)")
+
+    unpinned.modelID = "org/Repo/Pinned-Q8.gguf"
+    try context.save()
+    let reloaded = try XCTUnwrap(
+      context.fetch(FetchDescriptor<Chat>()).first { $0.id == unpinned.id })
+    XCTAssertEqual(reloaded.modelID, "org/Repo/Pinned-Q8.gguf")
   }
 }

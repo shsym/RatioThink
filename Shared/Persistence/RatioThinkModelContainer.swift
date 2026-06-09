@@ -85,6 +85,10 @@ public enum RatioThinkModelContainer {
     public var id: UUID
     public var title: String
     public var profileID: String
+    /// #460: the chat's pinned selected model (`Chat.modelID`). Optional +
+    /// omitted-when-nil so older exports (and chats that follow the profile
+    /// default) decode without it.
+    public var modelID: String?
     public var createdAt: Date
     public var updatedAt: Date
     public var pinned: Bool
@@ -94,6 +98,7 @@ public enum RatioThinkModelContainer {
       id: UUID,
       title: String,
       profileID: String,
+      modelID: String? = nil,
       createdAt: Date,
       updatedAt: Date,
       pinned: Bool,
@@ -102,6 +107,7 @@ public enum RatioThinkModelContainer {
       self.id = id
       self.title = title
       self.profileID = profileID
+      self.modelID = modelID
       self.createdAt = createdAt
       self.updatedAt = updatedAt
       self.pinned = pinned
@@ -165,6 +171,7 @@ public enum RatioThinkModelContainer {
         id: chat.id,
         title: chat.title,
         profileID: chat.profileID,
+        modelID: chat.modelID,
         createdAt: chat.createdAt,
         updatedAt: chat.updatedAt,
         pinned: chat.pinned,

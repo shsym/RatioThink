@@ -58,7 +58,7 @@ define gui_suite_run
   exit $$status
 endef
 
-.PHONY: help genproject build build-static build-tests clean lint ci-pr local-pre-merge local-gui-gate local-e2e-gate release-gate \
+.PHONY: help genproject build build-static build-tests clean lint ci-pr check-vendor-pin local-pre-merge local-gui-gate local-e2e-gate release-gate \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
@@ -87,9 +87,12 @@ build-static: genproject ## Compile/type-check Rational app + helper without bui
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build
 
-ci-pr: lint test-ci-v2-static-gate verify-app-icon-assets test-app-icon-assets build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
+check-vendor-pin: ## Fail-closed guard: Vendor/pie gitlink must be reachable from its .gitmodules tracking branch (catches pin/branch drift)
+	Scripts/check-vendor-pie-pin.sh
 
-local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary test-harsh-load-selftest ## Mandatory local pre-merge parity for runtime/heavy checks kept out of the lightweight manual workflow
+ci-pr: lint check-vendor-pin test-ci-v2-static-gate verify-app-icon-assets test-app-icon-assets build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
+
+local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary test-harsh-load-selftest test-matrix-aggregator ## Mandatory local pre-merge parity for runtime/heavy checks kept out of the lightweight manual workflow
 
 local-gui-gate: test-gui-script test-gui ## Mandatory local GUI parity gate for UI changes; requires seated session + Automation/Accessibility TCC
 
@@ -394,6 +397,9 @@ test-harsh-load-selftest: ## Engine-free guard for the harsh-load generation ass
 	uv run --project Vendor/pie/client/python --with httpx \
 	  python Inferlets/chat-apc/harsh_load_real.py --self-test
 
+test-matrix-aggregator: ## Engine-free guard for the #473 matrix verdict aggregator (review F1 fail-closed): an all-PASS cell log + non-zero swift-test exit must record FAIL, not a hollow PASS. Deterministic, CI-safe.
+	Scripts/test-matrix-aggregator.sh
+
 test-e2e-harsh-load: $(LOGDIR) ## REAL-engine harsh LOAD eval (#467): concurrent agent-replay vs portable-Metal Qwen3-0.6B. Real-weights/GPU tier, NOT CI — SKIPs cleanly without weights. SMOKE uses the committed openclaw fixture; set PIE_TEST_REPLAY_CORPUS=/path/to/capture.jsonl for the HEAVY concurrent hermes replay.
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-harsh-load.log; \
@@ -508,6 +514,18 @@ test-e2e-tot: ## E2E area: real-engine tree-of-thought APP path completes (#413 
 
 test-e2e-tot-batched: ## E2E area: real-engine BATCHED ToT (exec=phased_concurrent) tree shape/status (#458; real Qwen3-0.6B-GGUF)
 	Scripts/run-tot-batched-e2e.sh
+
+test-e2e-matrix: ## E2E area: FULL real-engine matrix — 10 curated models × {chat,tree-of-thought,fast-think} (#473; ~36GB, hours, operator-gated, NOT CI). Opt in with RUN_MATRIX=1.
+	@if [ "$(RUN_MATRIX)" != "1" ]; then \
+	  echo "test-e2e-matrix runs the FULL real-engine matrix: 10 curated models × 3 profiles,"; \
+	  echo "downloading ~36GB (incl. two ~9GB 14B models) and booting the real Metal engine per model."; \
+	  echo "It is operator-gated and never runs in CI. Opt in explicitly:"; \
+	  echo "    RUN_MATRIX=1 make test-e2e-matrix"; \
+	  echo "Subset for iteration, e.g.:"; \
+	  echo "    RUN_MATRIX=1 PIE_TEST_E2E_PROFILES=chat PIE_TEST_E2E_MATRIX_MODELS=Qwen3-0.6B make test-e2e-matrix"; \
+	  exit 2; \
+	fi
+	PIE_TEST_E2E_MATRIX=1 Scripts/run-matrix-e2e.sh
 
 bench-tot: ## Benchmark: ToT batched-vs-sequential strategies on real portable Metal — wall-clock + tok/s (#458)
 	Scripts/run-tot-bench.sh
