@@ -348,6 +348,15 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     let content = ((message["content"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     let reasoning = ((message["reasoning_content"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     let finish = choice["finish_reason"] as? String
+
+    // Diagnostic evidence (#484): surface the actual reply so the matrix log
+    // shows the semantic floor is satisfied by real text, not vacuously. One
+    // tab-delimited line per cell; truncated so a runaway reply can't flood
+    // the log. Printed before the asserts so it is captured even on a FAIL.
+    let reasonEvidence = reasoning.isEmpty ? "" : "\treasoning=\(reasoning.prefix(200).debugDescription)"
+    print("CHAT-REPLY\t\(modelID)\tfinish=\(finish ?? "nil")\tsemantic_gated=\(expectSemantic)"
+          + "\tcontent=\(content.prefix(200).debugDescription)\(reasonEvidence)")
+
     try cellRequire(["stop", "length"].contains(finish ?? ""),
                     "chat: finish_reason must be stop|length, got \(finish ?? "nil")")
     try cellRequire(!(content.isEmpty && reasoning.isEmpty),
