@@ -80,8 +80,9 @@ prof_eq() {  # <desc> <csv> <expected-count>
   local got; got="$(recognized_profile_count "$2")"
   check "$1 → count=$3" "$([ "$got" = "$3" ] && echo 1 || echo 0)"
 }
-prof_eq "full default set"                "chat,tree-of-thought,fast-think" 3
+prof_eq "full default set"                "chat,tree-of-thought,fast-think,ceiling" 4
 prof_eq "single profile"                  "chat"                            1
+prof_eq "ceiling profile (#475)"          "ceiling"                         1
 prof_eq "whitespace-padded subset"        " chat , fast-think "             2
 prof_eq "empty string (hollow green)"     ""                                0
 prof_eq "whitespace-only (hollow green)"  "   "                             0

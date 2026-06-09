@@ -139,8 +139,8 @@ aggregate_cell() {
 
 # recognized_profile_count <profiles_csv>
 #
-# Echo how many recognized profiles (chat|tree-of-thought|fast-think) remain in
-# the csv after trimming whitespace and dropping empty fields. Extracted (like
+# Echo how many recognized profiles (chat|tree-of-thought|fast-think|ceiling)
+# remain in the csv after trimming whitespace and dropping empty fields. Extracted (like
 # aggregate_cell) so Scripts/test-matrix-aggregator.sh can unit-test the #483
 # hollow-green guard engine-free. An explicitly-set but empty / whitespace-only
 # / all-commas PIE_TEST_E2E_PROFILES resolves to zero recognized profiles: the
@@ -157,7 +157,7 @@ recognized_profile_count() {
   for p in ${parts[@]+"${parts[@]}"}; do
     p="$(printf '%s' "$p" | tr -d '[:space:]')"
     case "$p" in
-      chat|tree-of-thought|fast-think) n=$((n + 1)) ;;
+      chat|tree-of-thought|fast-think|ceiling) n=$((n + 1)) ;;
     esac
   done
   printf '%s\n' "$n"
