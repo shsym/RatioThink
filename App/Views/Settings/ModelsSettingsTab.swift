@@ -440,6 +440,18 @@ private struct InstalledModelsTable: View {
                   .foregroundStyle(.orange)
                   .help("Installed without a verified sha256 (no X-Linked-Etag advertised — e.g. a resumed download). Integrity was not checked.")
                   .accessibilityIdentifier("InstalledRow-Unverified-\(row.id)")
+              } else if let reason = row.unsupportedReason {
+                // #349: a discovered-but-unlaunchable row (a collapsed
+                // split-GGUF shard set) carries `unsupportedReason`. The
+                // profile picker + LaunchSpecResolver already refuse it;
+                // surface it here too so the inventory view doesn't show it
+                // as a normal, loadable model. `nosign` (distinct from the
+                // partial/unverified warnings) reads as "the engine can't
+                // load this", with the reason in the tooltip.
+                Image(systemName: "nosign")
+                  .foregroundStyle(.orange)
+                  .help(reason)
+                  .accessibilityIdentifier("InstalledRow-Unsupported-\(row.id)")
               }
               Text(row.displayName).lineLimit(1).truncationMode(.middle)
               if row.source == .huggingFaceCache {

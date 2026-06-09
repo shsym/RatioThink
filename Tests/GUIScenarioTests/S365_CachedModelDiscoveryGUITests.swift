@@ -16,9 +16,13 @@ import XCTest
 /// launch but never appeared in Settings or the picker. A passing run
 /// proves enumeration → Settings row, the leg unit tests cannot cover.
 ///
-/// Two legs:
+/// Three legs:
 ///  - Models tab: a cached safetensors repo shows an "HF-cache" row
 ///    (`InstalledRow-HFCache-<slug>`), read-only (no Delete).
+///  - Models tab: a cached split-GGUF shard set — which the engine cannot
+///    load — collapses to one inventory row carrying the "unsupported"
+///    badge (`InstalledRow-Unsupported-<slug>`, #349), so the inventory
+///    view does not present it as a normal, loadable model.
 ///  - Profiles picker: a cached split-GGUF model — which the engine
 ///    cannot load — is offered but carries its unsupported reason, so the
 ///    user sees the cached model yet learns why it can't be the default.
@@ -42,6 +46,11 @@ final class S365_CachedModelDiscoveryGUITests: XCTestCase {
   private static let safetensorsSlug = "acme/discovery-model"
   /// Leaf of the staged split-GGUF first shard (matches the wrapper).
   private static let splitGGUFLeaf = "split-Q4_K_M-00001-of-00002.gguf"
+  /// Resolvable slug of the collapsed split-GGUF row = `InstalledModel.id`.
+  /// `HFCacheCatalog` emits the shard set as ONE row at its first shard,
+  /// `filename = "<repo>/<first-shard>"`; the wrapper stages the set under
+  /// `models--acme--split-gguf`, so the slug is `acme/split-gguf/<leaf>`.
+  private static let splitGGUFSlug = "acme/split-gguf/\(splitGGUFLeaf)"
 
   // MARK: - Models tab discovery
 
@@ -61,6 +70,25 @@ final class S365_CachedModelDiscoveryGUITests: XCTestCase {
     XCTAssertTrue(elementExists(rowID, in: settings, timeout: 15),
                   "cached safetensors model did not surface as an HF-cache row "
                   + "in Settings → Models; window: \(settings.debugDescription)")
+  }
+
+  @MainActor
+  func test_split_gguf_cache_model_shows_unsupported_badge_in_models_tab() async throws {
+    let app = try launchApp()
+    defer { app.terminate() }
+    let settings = try openSettingsTab("Models", in: app)
+
+    // #349: the collapsed split-GGUF row carries `unsupportedReason`, so
+    // ModelsSettingsTab renders the "unsupported" badge keyed on the row
+    // id. Its presence proves the inventory view marks the row unlaunchable
+    // (consistent with the picker + resolver) rather than showing it as a
+    // normal loadable model. The badge is an `Image` whose identifier may
+    // surface as images / otherElements / staticTexts depending on Table
+    // cell collapse — query all three (the S204 badge pattern).
+    let badgeID = "InstalledRow-Unsupported-\(Self.splitGGUFSlug)"
+    XCTAssertTrue(badgeExists(badgeID, in: settings, timeout: 15),
+                  "split-GGUF cache model did not show the unsupported badge in "
+                  + "Settings → Models; window: \(settings.debugDescription)")
   }
 
   // MARK: - Profiles picker unsupported reason
@@ -147,6 +175,25 @@ final class S365_CachedModelDiscoveryGUITests: XCTestCase {
                              timeout: TimeInterval) -> Bool {
     if settings.staticTexts[identifier].waitForExistence(timeout: timeout) { return true }
     return settings.otherElements[identifier].exists
+  }
+
+  /// Variant for an `Image`-hosted badge (the unsupported indicator): its
+  /// identifier may surface as `images`, `otherElements`, or `staticTexts`
+  /// depending on Table cell collapse — poll all three, narrow types only.
+  @MainActor
+  private func badgeExists(_ identifier: String,
+                           in settings: XCUIElement,
+                           timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+      if settings.images[identifier].exists
+          || settings.otherElements[identifier].exists
+          || settings.staticTexts[identifier].exists {
+        return true
+      }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
+    } while Date() < deadline
+    return false
   }
 
   // MARK: - Config
