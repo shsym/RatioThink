@@ -57,6 +57,17 @@ final class S486_ModelMenuNoResidentConfirmGUITests: XCTestCase {
     XCTAssertTrue(pickModelMenuRow(containingLeaf: defaultModelLeaf, modelMenu: modelMenu, in: app),
                   "could not pick the profile-default model row; app tree: \(app.debugDescription)")
 
+    // CLICK-LANDED proof (review v2 F1): on an unpinned chat the toolbar
+    // already shows the profile default and the silent commit is a no-op, so
+    // every other assertion below is ALSO true before the click — a
+    // non-delivered click (Helpers.swift:70-72 flake) would false-green the
+    // guard. The menu row exists ONLY while the menu is open; it disappears
+    // only when the click is delivered to the menu and it collapses. Assert
+    // the row vanished so a no-op/dropped click cannot pass.
+    let pickedRow = modelMenuRow(containingLeaf: defaultModelLeaf, in: app)
+    XCTAssertTrue(pickedRow.waitForNonExistence(timeout: 5),
+                  "the model-menu pick must collapse the menu (proves the click was delivered); app tree: \(app.debugDescription)")
+
     // The fix: with no current model there is nothing to REPLACE, so NO
     // switch-model confirm may appear. Assert the popover never presents.
     let popover = app.descendants(matching: .any)
@@ -140,13 +151,11 @@ final class S486_ModelMenuNoResidentConfirmGUITests: XCTestCase {
   private func pickModelMenuRow(containingLeaf leaf: String,
                                 modelMenu: XCUIElement,
                                 in app: XCUIApplication) -> Bool {
-    let predicate = NSPredicate(format: "value CONTAINS[c] %@ OR label CONTAINS[c] %@ OR title CONTAINS[c] %@",
-                                leaf, leaf, leaf)
     let deadline = Date().addingTimeInterval(45)
     while Date() < deadline {
       app.activate()
       modelMenu.click()
-      let row = app.menuItems.matching(predicate).firstMatch
+      let row = modelMenuRow(containingLeaf: leaf, in: app)
       if row.waitForExistence(timeout: 3), row.isHittable {
         row.click()
         return true
@@ -156,6 +165,18 @@ final class S486_ModelMenuNoResidentConfirmGUITests: XCTestCase {
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
     }
     return false
+  }
+
+  /// A model-menu ROW (a `menuItem`, present only while the menu is open)
+  /// matched by stable identity (value/label/title CONTAINS the slug leaf),
+  /// never exact title (#460 flake convention). Scoped to `menuItems` so it
+  /// never aliases the collapsed `toolbar.model` menu button, whose own
+  /// accessibility value also carries the slug.
+  private func modelMenuRow(containingLeaf leaf: String,
+                            in app: XCUIApplication) -> XCUIElement {
+    let predicate = NSPredicate(format: "value CONTAINS[c] %@ OR label CONTAINS[c] %@ OR title CONTAINS[c] %@",
+                                leaf, leaf, leaf)
+    return app.menuItems.matching(predicate).firstMatch
   }
 
   // MARK: - polling helpers (shared idiom with S459/S426)
