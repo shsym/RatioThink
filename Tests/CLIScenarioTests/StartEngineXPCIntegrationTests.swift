@@ -944,19 +944,25 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     )
   }
 
-  /// Poll `host.status` until `.running(port, "chat")` or `deadline` elapses.
+  /// Poll `host.status` until it is `.running` on `port` for profile "chat",
+  /// or `deadline` elapses. Matches on the snapshot's identity (port +
+  /// profileID), not full snapshot equality — the host-produced snapshot also
+  /// carries a live generation + served-model id the caller doesn't pin.
   /// Bounded so a regression can't hang the suite.
   private func pollHostUntilRunning(_ host: PieEngineHost,
                                     port: EnginePort,
                                     deadline seconds: TimeInterval) async throws {
-    let expected = EngineStatus.running(EngineSessionSnapshot(port: port, profileID: "chat"))
+    func runningOnPort(_ status: EngineStatus) -> Bool {
+      if case .running(let snap) = status { return snap.port == port && snap.profileID == "chat" }
+      return false
+    }
     let deadline = Date().addingTimeInterval(seconds)
     while Date() < deadline {
-      if host.status == expected { return }
+      if runningOnPort(host.status) { return }
       try await Task.sleep(nanoseconds: 30_000_000)
     }
-    XCTAssertEqual(host.status, expected,
-                   "engine never reached \(expected) within \(seconds)s (got \(host.status))")
+    XCTAssertTrue(runningOnPort(host.status),
+                  "engine never reached .running(port: \(port), profileID: chat) within \(seconds)s (got \(host.status))")
   }
 
   /// Trivial `EngineSession` that records nothing; the XPC tests
