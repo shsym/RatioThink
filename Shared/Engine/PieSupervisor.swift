@@ -537,6 +537,12 @@ public final class PieSupervisor: @unchecked Sendable {
     let process: Process
     let stdoutPipe = Pipe()
     let stderrPipe = Pipe()
+    /// Reads the child's stdout on the supervisor's `stateQueue` so
+    /// the handshake parser, the carry buffer, and the termination
+    /// flush never race a private FileHandle queue (review v9 F92,
+    /// CI flake #492). Cancelled on EOF, on `Process.run()` failure,
+    /// and in `handleTermination`.
+    var stdoutSource: DispatchSourceRead?
     var stdoutCarry = Data()
     var handshakeFound = false
     /// Port carried by the most-recently-parsed valid handshake line.
@@ -600,26 +606,33 @@ public final class PieSupervisor: @unchecked Sendable {
     Log.engine.info("PieSupervisor: spawning attempt=\(self.attemptCount, privacy: .public) profile=\(spec.profileID, privacy: .public) binary=\(spec.binaryURL.path, privacy: .public)")
 
     // Hook readers BEFORE run so we never miss the handshake line.
-    let stdoutHandle = inc.stdoutPipe.fileHandleForReading
-    let stderrHandle = inc.stderrPipe.fileHandleForReading
-    stdoutHandle.readabilityHandler = { [weak self, weak inc] fh in
-      guard let self, let inc else { return }
-      let data = fh.availableData
-      if data.isEmpty {
-        // Empty data = EOF OR a read error (EBADF/EIO). FileHandle
-        // does not expose the difference; the terminationHandler is
-        // the authoritative signal that the child is done. Detach
-        // the handler so it doesn't busy-loop, but defer the final
-        // carry-buffer flush to `handleTermination` — that path
-        // already runs on stateQueue and can race-free re-parse the
-        // tail (review v1 F9).
-        Log.engine.debug("PieSupervisor: stdout readabilityHandler observed EOF/error")
-        fh.readabilityHandler = nil
-        return
-      }
-      self.stateQueue.async { self.consumeStdout(inc: inc, chunk: data) }
-      self.appendLog(data)
+    //
+    // stdout is read by a DispatchSource targeting `stateQueue`
+    // (review v9 F92, CI flake #492) rather than a FileHandle
+    // `readabilityHandler`. The handshake parser, the carry buffer,
+    // and `handleTermination`'s final flush all run on `stateQueue`; a
+    // readabilityHandler fires on a private queue and hands its bytes
+    // over via a `stateQueue.async` hop, which loses the race to the
+    // independently-dispatched `terminationHandler` when the engine
+    // prints HTTP_LISTEN (no trailing newline) then exits instantly —
+    // the chunk lands on the queue AFTER termination already
+    // classified the exit, so it is dropped at the stale-incarnation
+    // guard and the printed-handshake diagnostic is lost. Reading on
+    // `stateQueue` makes stdout consumption and termination strictly
+    // serial: a pending read can never interleave with the
+    // termination flush, so the parked handshake is always recovered.
+    let stdoutFD = inc.stdoutPipe.fileHandleForReading.fileDescriptor
+    let stdoutFlags = fcntl(stdoutFD, F_GETFL)
+    if stdoutFlags != -1 { _ = fcntl(stdoutFD, F_SETFL, stdoutFlags | O_NONBLOCK) }
+    let stdoutSource = DispatchSource.makeReadSource(fileDescriptor: stdoutFD, queue: stateQueue)
+    stdoutSource.setEventHandler { [weak self, weak inc] in
+      guard let self, let inc, self.current?.id == inc.id else { return }
+      self.readStdout(inc: inc, fd: stdoutFD)
     }
+    inc.stdoutSource = stdoutSource
+    stdoutSource.resume()
+
+    let stderrHandle = inc.stderrPipe.fileHandleForReading
     stderrHandle.readabilityHandler = { [weak self] fh in
       let data = fh.availableData
       if data.isEmpty {
@@ -638,7 +651,8 @@ public final class PieSupervisor: @unchecked Sendable {
       // burning the full attempt ladder (review v1 F2).
       let msg = "Process.run() failed for \(spec.binaryURL.path): \(error)"
       Log.engine.fault("\(msg, privacy: .public)")
-      stdoutHandle.readabilityHandler = nil
+      inc.stdoutSource?.cancel()
+      inc.stdoutSource = nil
       stderrHandle.readabilityHandler = nil
       current = nil
       currentSpec = nil
@@ -714,6 +728,34 @@ public final class PieSupervisor: @unchecked Sendable {
     timer.resume()
   }
 
+  /// Event handler for the stdout DispatchSource (runs on
+  /// `stateQueue`). Drains every byte currently readable on the
+  /// non-blocking fd and feeds it through the handshake parser. A
+  /// 0-length read is EOF and cancels the source; -1/EAGAIN means
+  /// nothing more is buffered right now and the source will re-fire
+  /// when the child writes again.
+  private func readStdout(inc: Incarnation, fd: Int32) {
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+      let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+      if n > 0 {
+        let data = Data(buffer[0..<n])
+        appendLog(data)
+        consumeStdout(inc: inc, chunk: data)
+        // consumeStdout may have driven a terminal state (handshake,
+        // carry overflow, malformed line); stop reading a child we no
+        // longer own.
+        if current?.id != inc.id { return }
+      } else if n == 0 {
+        inc.stdoutSource?.cancel()
+        inc.stdoutSource = nil
+        return
+      } else {
+        return
+      }
+    }
+  }
+
   private func consumeStdout(inc: Incarnation, chunk: Data) {
     guard current?.id == inc.id else { return }
     inc.stdoutCarry.append(chunk)
@@ -749,6 +791,39 @@ public final class PieSupervisor: @unchecked Sendable {
       // processLine may have driven us to a terminal state; bail if
       // current was cleared.
       if current?.id != inc.id { return }
+    }
+  }
+
+  /// Synchronously drain whatever stdout the child left buffered in
+  /// the pipe straight into `inc.stdoutCarry`.
+  ///
+  /// Called from `handleTermination` when no handshake has been
+  /// observed yet (review v9 F92, CI flake #492). stdout is normally
+  /// consumed by the `stdoutSource` DispatchSource (also on
+  /// `stateQueue`), but the `terminationHandler` can be processed
+  /// before a pending source read event runs — and since both are
+  /// serialized on `stateQueue`, that pending event cannot run while
+  /// this termination flush is executing. The bytes the child printed
+  /// without a trailing newline — e.g. an `HTTP_LISTEN=` line before
+  /// an immediate exit — are therefore still sitting unread in the
+  /// pipe (the child has been reaped, so its write end is closed).
+  /// Reading them here, after cancelling the source, makes the
+  /// printed-handshake diagnostic deterministic.
+  ///
+  /// Uses a non-blocking read so a defensively-still-open write end
+  /// can never wedge the supervisor's serial queue: `read` returns the
+  /// buffered bytes, then 0 (EOF) or -1/EAGAIN, and the loop stops.
+  private func drainBufferedStdout(_ inc: Incarnation) {
+    let fd = inc.stdoutPipe.fileHandleForReading.fileDescriptor
+    let flags = fcntl(fd, F_GETFL)
+    if flags != -1 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+      let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+      guard n > 0 else { break }
+      let data = Data(buffer[0..<n])
+      inc.stdoutCarry.append(data)
+      appendLog(data)
     }
   }
 
@@ -903,18 +978,31 @@ public final class PieSupervisor: @unchecked Sendable {
       return
     }
     inc.handshakeTimer?.cancel()
-    inc.stdoutPipe.fileHandleForReading.readabilityHandler = nil
+    inc.stdoutSource?.cancel()
+    inc.stdoutSource = nil
     inc.stderrPipe.fileHandleForReading.readabilityHandler = nil
 
-    // Final flush: an engine that exited without a trailing newline
-    // may have parked the handshake line in stdoutCarry. Re-parse
-    // the tail BUT do not let processLine call setState / kill /
-    // finishSpawnFailure (review v2 F29 — the prior side-effecting
-    // flush published a transient `.running` for an already-exited
-    // engine). The flush only updates `inc.handshakeFound` /
-    // `inc.malformedHandshakeRaw`; the unified failure path below
-    // produces a precise diagnostic without ever crossing through
-    // `.running`.
+    // An engine that printed the handshake WITHOUT a trailing newline
+    // then exited immediately may have parked that line in the pipe.
+    // stdout is consumed by the `stdoutSource` DispatchSource (also on
+    // `stateQueue`), but for an instant-exit child this termination
+    // callback can be dequeued before a pending source read event —
+    // and the two are serialized on `stateQueue`, so that event cannot
+    // run while we hold the queue here. The parked bytes are therefore
+    // still unread in the pipe. Drain them straight into the carry
+    // (the source was just cancelled, so there is no competing reader)
+    // before re-parsing (review v9 F92, CI flake #492).
+    if !inc.handshakeFound {
+      drainBufferedStdout(inc)
+    }
+
+    // Final flush: re-parse the tail BUT do not let processLine call
+    // setState / kill / finishSpawnFailure (review v2 F29 — the prior
+    // side-effecting flush published a transient `.running` for an
+    // already-exited engine). The flush only updates
+    // `inc.handshakeFound` / `inc.malformedHandshakeRaw`; the unified
+    // failure path below produces a precise diagnostic without ever
+    // crossing through `.running`.
     if !inc.handshakeFound, !inc.stdoutCarry.isEmpty {
       let tail = inc.stdoutCarry
       inc.stdoutCarry = Data()
