@@ -179,7 +179,7 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
   /// `ceiling` profile is the memory-size half of the matrix — the engine's
   /// effective `max_output_tokens` (and its clean over-ceiling 400) is
   /// memory-aware, so it is proven once per loaded model. That keeps the
-  /// matrix at 10 boots / 30 cells instead of 30 cold boots — decisive for
+  /// matrix at 9 boots / 36 cells instead of 36 cold boots — decisive for
   /// the slow ~9 GB 14B loads.
   ///
   /// Gated on `PIE_TEST_E2E_PROFILES` (a csv of `chat,tree-of-thought,
