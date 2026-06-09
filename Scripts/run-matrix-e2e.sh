@@ -3,12 +3,18 @@
 #
 # Drives the production launch path (real LaunchSpecResolver → real
 # PieControlLauncher → real `pie serve` → HTTP) once per curated model and
-# fires all three profile request shapes against that single booted engine:
+# fires every profile request shape against that single booted engine:
 #   · chat            → POST /v1/chat/completions
 #   · tree-of-thought → POST /v1/inferlet {inferlet:"tree-of-thought"}
 #   · fast-think      → POST /v1/chat/completions + a `speculation` field
+#   · ceiling         → the #475 token-ceiling contract: read the engine's
+#                       memory-aware `max_output_tokens` N off /v1/models,
+#                       then assert N+1 → a clean 400 `max_tokens must be in
+#                       [1, N]` (not the raw generate-time engine error) and
+#                       N → 200. Proven once per loaded model, so the matrix
+#                       is also the memory-size sweep of the ceiling.
 # Routing is per-REQUEST, not per-launch-profile, so one loaded model proves
-# every profile against it — 10 boots / 30 cells instead of 30 cold boots
+# every profile against it — 9 boots / 36 cells instead of 36 cold boots
 # (decisive for the slow ~9 GB 14B loads).
 #
 # The FULL run downloads ~36 GB (incl. two ~9 GB 14B models) and runs the
@@ -21,7 +27,7 @@
 # a model that booted-but-emitted-no-cells = a load failure).
 #
 # Tunables (all optional):
-#   PIE_TEST_E2E_PROFILES        csv subset of chat,tree-of-thought,fast-think  (default: all)
+#   PIE_TEST_E2E_PROFILES        csv subset of chat,tree-of-thought,fast-think,ceiling  (default: all)
 #   PIE_TEST_E2E_MATRIX_MODELS   csv of case-insensitive substrings; keep only matching models
 #   PIE_BIN                      pie engine binary (default: the worktree release build)
 #   PIE_TEST_E2E_MODELS_DIR      staging dir for downloaded GGUFs (default: /tmp/pie-e2e-models)
@@ -52,7 +58,7 @@ MATRIX_MODELS=(
   "Qwen/Qwen3-14B-GGUF|Qwen3-14B-Q4_K_M.gguf|9001752960|1|1"
 )
 
-ALL_PROFILES="chat,tree-of-thought,fast-think"
+ALL_PROFILES="chat,tree-of-thought,fast-think,ceiling"
 
 # --- pie engine binary: enforce the worktree build --------------------
 # Like run-large-model-e2e.sh: a stale /Applications engine must not green

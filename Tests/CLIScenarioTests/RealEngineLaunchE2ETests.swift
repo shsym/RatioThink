@@ -172,9 +172,13 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
   /// One cell of the (model × profile) real-engine compatibility matrix
   /// (#473). Routing is per-REQUEST, not per-launch-profile (chat →
   /// /v1/chat/completions, tree-of-thought → /v1/inferlet, fast-think →
-  /// chat-completions + a `speculation` field), so a single booted model
-  /// proves every profile shape against it: this boots ONCE and fires each
-  /// profile in `PIE_TEST_E2E_PROFILES` as a sub-assertion. That keeps the
+  /// chat-completions + a `speculation` field, ceiling → the #475
+  /// token-ceiling contract over /v1/models + a boundary pair), so a single
+  /// booted model proves every profile shape against it: this boots ONCE and
+  /// fires each profile in `PIE_TEST_E2E_PROFILES` as a sub-assertion. The
+  /// `ceiling` profile is the memory-size half of the matrix — the engine's
+  /// effective `max_output_tokens` (and its clean over-ceiling 400) is
+  /// memory-aware, so it is proven once per loaded model. That keeps the
   /// matrix at 10 boots / 30 cells instead of 30 cold boots — decisive for
   /// the slow ~9 GB 14B loads.
   ///
@@ -228,8 +232,10 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
           try await assertTreeOfThoughtCell(port: port, modelID: slug)
         case "fast-think":
           try await assertFastThinkCell(port: port, modelID: slug, expectReasoning: expectReasoning)
+        case "ceiling":
+          try await assertTokenCeilingCell(port: port, modelID: slug)
         default:
-          throw MatrixCellFailure("unknown profile (expected chat|tree-of-thought|fast-think)")
+          throw MatrixCellFailure("unknown profile (expected chat|tree-of-thought|fast-think|ceiling)")
         }
         print("MATRIX-CELL\t\(model)\t\(profile)\tPASS")
       } catch {
@@ -570,6 +576,100 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
                               "fast-think: spec_metrics absent — speculation did not engage")
     try cellRequire(spec["enabled"] as? Bool == true,
                     "fast-think: spec_metrics.enabled != true (fallback_reason=\(spec["fallback_reason"] ?? "nil"))")
+  }
+
+  /// ceiling cell (#475): the real-engine token-ceiling contract, proven per
+  /// loaded model so the (memory-size) matrix shows the engine's effective
+  /// `max_output_tokens` — and its clean over-ceiling rejection — vary with
+  /// the model that squeezed KV capacity.
+  ///
+  /// The original failure (#475 → #474 fix): a profile `max_tokens` above the
+  /// launched engine's memory-aware ceiling tripped a raw, opaque engine
+  /// error ("max ... must be in [0,512]") at generate time. #474 moved the
+  /// check to the chat-apc 400 boundary; this is the REAL-engine proof of
+  /// that boundary across every memory size:
+  ///   1. `GET /v1/models` advertises a positive, floor-respecting ceiling N
+  ///      (`max_output_tokens`, memory-aware; floor 512 = KVCacheBudget).
+  ///   2. An over-ceiling request (N+1) returns a CLEAN 400
+  ///      `max_tokens must be in [1, N]` blaming `param=max_tokens` — the
+  ///      boundary rejection, NOT the raw generate-time engine error.
+  ///   3. An at-ceiling request (N) is accepted (200) — the bound is
+  ///      inclusive, guarding an off-by-one in the ceiling check / clamp.
+  ///
+  /// The actual N and the over-ceiling 400 body are printed (CEILING* lines)
+  /// so the matrix log makes the contract auditable per memory size, not a
+  /// vacuous PASS.
+  private func assertTokenCeilingCell(port: Int, modelID: String) async throws {
+    // 1. Read the engine's advertised ceiling for the loaded model.
+    let modelsURL = URL(string: "http://127.0.0.1:\(port)/v1/models")!
+    let (mData, mResp) = try await URLSession.shared.data(from: modelsURL)
+    let mHTTP = try cellUnwrap(mResp as? HTTPURLResponse, "ceiling: no /v1/models HTTP response")
+    let mText = String(data: mData, encoding: .utf8) ?? ""
+    try cellRequire(mHTTP.statusCode == 200,
+                    "ceiling: /v1/models HTTP \(mHTTP.statusCode): \(mText.prefix(300))")
+    let mJSON = try cellUnwrap(try JSONSerialization.jsonObject(with: mData) as? [String: Any],
+                               "ceiling: /v1/models not a JSON object: \(mText.prefix(300))")
+    let entry = try cellUnwrap(
+      (mJSON["data"] as? [[String: Any]])?.first(where: { $0["id"] as? String == modelID }),
+      "ceiling: /v1/models has no entry for \(modelID): \(mText.prefix(300))")
+    let ceiling = try cellUnwrap((entry["max_output_tokens"] as? NSNumber)?.intValue,
+                                 "ceiling: entry missing numeric max_output_tokens: \(entry)")
+
+    // Evidence first — captured even if an assert below trips.
+    print("CEILING\t\(modelID)\tmax_output_tokens=\(ceiling)")
+    try cellRequire(ceiling >= 512,
+                    "ceiling: max_output_tokens \(ceiling) below the KVCacheBudget floor of 512")
+
+    // 2. Over-ceiling (N+1) must be rejected at the clean 400 boundary — the
+    //    exact failure #475 captures: NOT the raw generate-time engine error.
+    let (overData, overResp) = try await postChatRaw(port: port, body: [
+      "model": modelID,
+      "messages": [["role": "user", "content": "Reply with the single word: pong"]],
+      "max_tokens": ceiling + 1,
+      "stream": false,
+    ])
+    let overHTTP = try cellUnwrap(overResp as? HTTPURLResponse, "ceiling: over-ceiling no HTTP response")
+    let overText = String(data: overData, encoding: .utf8) ?? ""
+    print("CEILING-OVER\t\(modelID)\tstatus=\(overHTTP.statusCode)\tbody=\(overText.prefix(200).debugDescription)")
+    try cellRequire(overHTTP.statusCode == 400,
+                    "ceiling: over-ceiling (max_tokens=\(ceiling + 1)) must be a clean 400, got "
+                    + "\(overHTTP.statusCode): \(overText.prefix(300))")
+    let overErr = (try? JSONSerialization.jsonObject(with: overData) as? [String: Any])?["error"] as? [String: Any]
+    let overMsg = (overErr?["message"] as? String) ?? ""
+    let overParam = (overErr?["param"] as? String) ?? ""
+    try cellRequire(overMsg == "max_tokens must be in [1, \(ceiling)]",
+                    "ceiling: over-ceiling 400 message drifted — want "
+                    + "'max_tokens must be in [1, \(ceiling)]', got \(overMsg.debugDescription)")
+    try cellRequire(overParam == "max_tokens",
+                    "ceiling: over-ceiling 400 must blame param=max_tokens, got \(overParam.debugDescription)")
+
+    // 3. At-ceiling (N) must be accepted — inclusive bound (off-by-one guard).
+    //    The trivial prompt stops the model early, so a large N stays cheap.
+    let (atData, atResp) = try await postChatRaw(port: port, body: [
+      "model": modelID,
+      "messages": [["role": "user", "content": "Reply with the single word: pong"]],
+      "max_tokens": ceiling,
+      "stream": false,
+    ])
+    let atHTTP = try cellUnwrap(atResp as? HTTPURLResponse, "ceiling: at-ceiling no HTTP response")
+    let atText = String(data: atData, encoding: .utf8) ?? ""
+    try cellRequire(atHTTP.statusCode == 200,
+                    "ceiling: at-ceiling (max_tokens=\(ceiling)) must be accepted (200), got "
+                    + "\(atHTTP.statusCode): \(atText.prefix(300))")
+  }
+
+  /// POST a non-streaming chat body and return the raw `(data, response)`
+  /// WITHOUT asserting a status — unlike `postChatJSON`, which requires 200.
+  /// The ceiling cell inspects both a 400 (over-ceiling) and a 200
+  /// (at-ceiling), so it owns the status check on each call.
+  private func postChatRaw(port: Int, body: [String: Any]) async throws -> (Data, URLResponse) {
+    let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.timeoutInterval = 180
+    req.httpBody = try JSONSerialization.data(withJSONObject: body)
+    return try await URLSession.shared.data(for: req)
   }
 
   // MARK: - launch helper
