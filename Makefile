@@ -64,7 +64,7 @@ endef
         test-unit test-scenario test-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
-        test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched bench-tot test-e2e-full test-helper-respawn test-helper-recovery test-quit-structured \
+        test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-e2e-harsh-load \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
@@ -96,7 +96,7 @@ local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e
 
 local-gui-gate: test-gui-script test-gui ## Mandatory local GUI parity gate for UI changes; requires seated session + Automation/Accessibility TCC
 
-local-e2e-gate: test-e2e-engine test-e2e-models test-e2e-chat test-e2e-tot test-e2e-full test-gui-history test-gui-first-launch-package test-helper-respawn test-helper-recovery test-quit-structured ## Operator-gated integration/E2E parity; requires documented models, engine, signing, TCC, or live services
+local-e2e-gate: test-e2e-engine test-e2e-models test-e2e-chat test-e2e-tot test-e2e-budget-sweep test-e2e-full test-gui-history test-gui-first-launch-package test-helper-respawn test-helper-recovery test-quit-structured ## Operator-gated integration/E2E parity; requires documented models, engine, signing, TCC, or live services
 
 release-gate: local-pre-merge test-curated-hf test-dmg-layout ## Release readiness gate; additionally run release-preflight with ARTIFACT=<built .app|.dmg> after packaging/notarization
 
@@ -514,6 +514,13 @@ test-e2e-tot: ## E2E area: real-engine tree-of-thought APP path completes (#413 
 
 test-e2e-tot-batched: ## E2E area: real-engine BATCHED ToT (exec=phased_concurrent) tree shape/status (#458; real Qwen3-0.6B-GGUF)
 	Scripts/run-tot-batched-e2e.sh
+
+test-e2e-budget-sweep: ## E2E area: real-engine memory-budget sweep — N tracks the configured budget across the App-guardrail + pie-KV-pages knobs; harsh-low trips a captured structured load failure (#475; small model, ~5 boots, operator-gated, NOT CI)
+	PIE_TEST_E2E_BUDGET_SWEEP=1 \
+	PIE_TEST_E2E_FILTER="RealEngineLaunchE2ETests/test_realEngine_memoryBudgetSweep" \
+	PIE_TEST_E2E_REPO="Qwen/Qwen2.5-0.5B-Instruct-GGUF" \
+	PIE_TEST_E2E_FILE="qwen2.5-0.5b-instruct-q4_k_m.gguf" \
+	  Scripts/run-engine-e2e.sh
 
 test-e2e-matrix: ## E2E area: FULL real-engine matrix — 9 curated models × {chat,tree-of-thought,fast-think,ceiling} (#473/#475; ~36GB, hours, operator-gated, NOT CI). Opt in with RUN_MATRIX=1.
 	@if [ "$(RUN_MATRIX)" != "1" ]; then \

@@ -17,6 +17,20 @@
 # every profile against it — 9 boots / 36 cells instead of 36 cold boots
 # (decisive for the slow ~9 GB 14B loads).
 #
+# The `ceiling` profile here probes ONE budget (the default launch). The
+# memory-SIZE dimension — varying the CONFIGURED budget so the effective N
+# actually changes — is a separate, multi-boot test driven by
+# `make test-e2e-budget-sweep` (RealEngineLaunchE2ETests.test_realEngine_
+# memoryBudgetSweep), kept off this per-request loop because it boots the
+# engine once per budget. Measured (#475, Qwen2.5-0.5B) which knob moves N:
+#   · App guardrail (#328/#438 → scheduler `default_token_limit`): lowers the
+#     ADVERTISED ceiling on a live boot — 32768 → 21845 → 512 — but never
+#     trips a load failure (it floors at 512; the physical KV pool is NOT
+#     resized — see the LaunchSpec.maxNumKvPages note + follow-up #489).
+#   · pie KV pool (`max_num_kv_pages`): lowers N = pages × 32 on a live boot
+#     (256 → 8192); too small for the model → a captured structured
+#     engine-start failure (`spawnFailed`, exit code + stderr), not a hang.
+#
 # The FULL run downloads ~36 GB (incl. two ~9 GB 14B models) and runs the
 # real Metal engine for every cell — minutes to hours. It must NEVER run by
 # default or in CI, so it is behind a single explicit env gate

@@ -244,6 +244,20 @@ public enum PieControlLauncher {
     /// lowers the ceiling below the engine default. See `KVCacheBudget`.
     public var defaultTokenLimit: Int?
 
+    /// Override for the portable driver's `[model.driver.options]
+    /// .max_num_kv_pages` — the size of the KV page pool the engine
+    /// allocates. `nil` omits it so the engine keeps its built-in default
+    /// (1024 pages × 32 = 32768 KV tokens). Lowering it shrinks the raw KV
+    /// capacity, which lowers the effective `runtime::max-output-tokens`
+    /// ceiling below the scheduler cap and — when set far too small for the
+    /// model's minimum context — makes `pie serve` fail to load with a
+    /// structured engine-start error. Currently set only by the real-engine
+    /// memory-budget matrix (#475) to drive the engine ceiling directly;
+    /// the production launch path leaves it `nil` (the #438 guardrail caps
+    /// the *advertised* ceiling via `defaultTokenLimit`, not the physical
+    /// pool — see #489 on wiring the guardrail to this knob).
+    public var maxNumKvPages: Int?
+
     public init(pieBinary: URL,
                 wasmURL: URL,
                 manifestURL: URL,
@@ -255,7 +269,8 @@ public enum PieControlLauncher {
                 pidSink: (@Sendable (pid_t) -> Void)? = nil,
                 profileID: String = "isolated",
                 modelConfig: ModelConfig,
-                defaultTokenLimit: Int? = nil) throws {
+                defaultTokenLimit: Int? = nil,
+                maxNumKvPages: Int? = nil) throws {
       try PieControlLauncher.validateDriverSupport(
         pieBinary: pieBinary,
         subprocessEnvironment: subprocessEnvironment,
@@ -275,6 +290,7 @@ public enum PieControlLauncher {
       self.profileID = profileID
       self.modelConfig = modelConfig
       self.defaultTokenLimit = defaultTokenLimit
+      self.maxNumKvPages = maxNumKvPages
     }
   }
 
@@ -570,7 +586,8 @@ public enum PieControlLauncher {
     }
     let httpPort = try reserveFreePort()
     let configURL = try writeConfig(
-      modelConfig: spec.modelConfig, defaultTokenLimit: spec.defaultTokenLimit, in: spec.pieHome
+      modelConfig: spec.modelConfig, defaultTokenLimit: spec.defaultTokenLimit,
+      maxNumKvPages: spec.maxNumKvPages, in: spec.pieHome
     )
 
     let env = renderSubprocessEnvironment(
@@ -784,9 +801,11 @@ public enum PieControlLauncher {
   /// regardless of its name.
   static func writeConfig(modelConfig: ModelConfig,
                           defaultTokenLimit: Int? = nil,
+                          maxNumKvPages: Int? = nil,
                           in pieHome: URL) throws -> URL {
     let configURL = pieHome.appendingPathComponent("config.toml")
-    let body = renderConfigBody(modelConfig: modelConfig, defaultTokenLimit: defaultTokenLimit)
+    let body = renderConfigBody(modelConfig: modelConfig, defaultTokenLimit: defaultTokenLimit,
+                                maxNumKvPages: maxNumKvPages)
     do {
       try FileManager.default.createDirectory(at: pieHome, withIntermediateDirectories: true)
       try body.write(to: configURL, atomically: true, encoding: .utf8)
@@ -799,7 +818,8 @@ public enum PieControlLauncher {
   /// Pure TOML projection of `ModelConfig`. Internal so the unit
   /// tests can pin the emitted body without writing to disk.
   static func renderConfigBody(modelConfig: ModelConfig,
-                               defaultTokenLimit: Int? = nil) -> String {
+                               defaultTokenLimit: Int? = nil,
+                               maxNumKvPages: Int? = nil) -> String {
     let preamble = """
     [server]
     host = "127.0.0.1"
@@ -860,12 +880,12 @@ public enum PieControlLauncher {
       )
       return renderPortableModel(
         servedID: modelSlug, modelRef: modelPath, preamble: preamble,
-        scheduler: scheduler
+        scheduler: scheduler, maxNumKvPages: maxNumKvPages
       )
     case let .portableResolved(servedModelID, modelRef):
       return renderPortableModel(
         servedID: servedModelID, modelRef: modelRef, preamble: preamble,
-        scheduler: scheduler
+        scheduler: scheduler, maxNumKvPages: maxNumKvPages
       )
     case let .metal(modelID):
       // `pie-driver-portable` with ggml-metal selected at C++ build
@@ -888,8 +908,22 @@ public enum PieControlLauncher {
       type = "portable"
       device = ["metal"]
       """
-      return preamble + model + scheduler + driver
+      return preamble + model + scheduler + driver + driverOptionsTOML(maxNumKvPages: maxNumKvPages)
     }
+  }
+
+  /// `[model.driver.options]` projection for the portable/metal driver.
+  /// Empty unless a knob override is set — the engine otherwise keeps its
+  /// built-in driver defaults. Only `max_num_kv_pages` is overridable today
+  /// (the #475 memory-budget matrix drives it); appended after the driver
+  /// block so it lands under the active `[model.driver]` table.
+  static func driverOptionsTOML(maxNumKvPages: Int?) -> String {
+    guard let pages = maxNumKvPages else { return "" }
+    return """
+
+    [model.driver.options]
+    max_num_kv_pages = \(pages)
+    """
   }
 
   /// Child environment projection for `pie serve`. `SpawnEnvSanitizer` removes
@@ -912,7 +946,8 @@ public enum PieControlLauncher {
   private static func renderPortableModel(servedID: String,
                                           modelRef: String,
                                           preamble: String,
-                                          scheduler: String) -> String {
+                                          scheduler: String,
+                                          maxNumKvPages: Int? = nil) -> String {
     let model = """
     [[model]]
     name = \(tomlString(servedID))
@@ -924,7 +959,7 @@ public enum PieControlLauncher {
     type = "portable"
     device = ["metal"]
     """
-    return preamble + model + scheduler + driver
+    return preamble + model + scheduler + driver + driverOptionsTOML(maxNumKvPages: maxNumKvPages)
   }
 
   /// Minimal TOML basic-string escape: wrap in `"..."` and backslash-

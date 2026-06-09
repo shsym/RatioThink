@@ -99,6 +99,37 @@ final class PieControlLauncherConfigTests: XCTestCase {
     XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
   }
 
+  func test_portable_body_emits_max_num_kv_pages_when_set() {
+    // #475: the engine KV-pool override rides [model.driver.options].
+    // max_num_kv_pages — the knob the memory-budget sweep turns to lower the
+    // raw KV capacity (and so the effective ceiling) directly. Omitted when
+    // nil (guarded by `..._omits_default_token_limit_when_nil`).
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      defaultTokenLimit: nil,
+      maxNumKvPages: 256
+    )
+    XCTAssertTrue(body.contains("[model.driver.options]"),
+                  "a set maxNumKvPages must emit the driver-options block; got:\n\(body)")
+    XCTAssertTrue(body.contains("max_num_kv_pages = 256"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("type = \"portable\""), "got:\n\(body)")
+    // The override is independent of the scheduler ceiling.
+    XCTAssertFalse(body.contains("default_token_limit"), "got:\n\(body)")
+  }
+
+  func test_metal_body_emits_max_num_kv_pages_when_set() {
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .metal(modelID: "Qwen/Qwen3-0.6B"),
+      defaultTokenLimit: 4096,
+      maxNumKvPages: 512
+    )
+    XCTAssertTrue(body.contains("[model.driver.options]"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("max_num_kv_pages = 512"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("default_token_limit = 4096"),
+                  "both knobs coexist — scheduler cap + driver pool; got:\n\(body)")
+    XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
+  }
+
   func test_portableResolved_serves_under_profile_slug_with_distinct_hf_repo_path() {
     // The crux of the id-unification fix ( follow-up): the engine's
     // served `name` is the profile slug the App carries everywhere, while
