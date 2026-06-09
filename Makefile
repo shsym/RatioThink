@@ -62,7 +62,7 @@ endef
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
-        test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
+        test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-load-default test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-e2e-harsh-load \
@@ -96,7 +96,7 @@ local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e
 
 local-gui-gate: test-gui-script test-gui ## Mandatory local GUI parity gate for UI changes; requires seated session + Automation/Accessibility TCC
 
-local-e2e-gate: test-e2e-engine test-e2e-models test-e2e-chat test-e2e-tot test-e2e-budget-sweep test-e2e-full test-gui-history test-gui-first-launch-package test-helper-respawn test-helper-recovery test-quit-structured ## Operator-gated integration/E2E parity; requires documented models, engine, signing, TCC, or live services
+local-e2e-gate: test-e2e-engine test-e2e-models test-e2e-chat test-e2e-tot test-e2e-budget-sweep test-e2e-full test-gui-history test-gui-stream-cancel test-gui-load-default test-gui-first-launch-package test-helper-respawn test-helper-recovery test-quit-structured ## Operator-gated integration/E2E parity; requires documented models, engine, signing, TCC, or live services
 
 release-gate: local-pre-merge test-curated-hf test-dmg-layout ## Release readiness gate; additionally run release-preflight with ARTIFACT=<built .app|.dmg> after packaging/notarization
 
@@ -413,10 +413,18 @@ test-gui-script: ## Fast preflight regressions for GUI E2E wrappers
 	Scripts/test-run-chat-gui-e2e.sh
 	Scripts/test-run-large-model-e2e.sh
 	Scripts/test-run-resume-gui-history-e2e.sh
+	Scripts/test-run-stream-cancel-gui-e2e.sh
+	Scripts/test-run-load-default-gui-e2e.sh
 	Scripts/test-run-first-launch-package-e2e.sh
 
 test-gui-history: genproject ## Deterministic  GUI history/resume E2E — needs seated session
 	Scripts/run-resume-gui-history-e2e.sh
+
+test-gui-stream-cancel: genproject ## #381 deterministic GUI cancel-mid-stream E2E (partial bubble + composer recovery) — needs seated session
+	Scripts/run-stream-cancel-gui-e2e.sh
+
+test-gui-load-default: genproject ## #381 deterministic GUI no-model → Load-default follow-through E2E — needs seated session
+	Scripts/run-load-default-gui-e2e.sh
 
 test-gui-first-launch-package: ## Package-backed  first-launch E2E — needs seated session
 	Scripts/run-first-launch-package-e2e.sh

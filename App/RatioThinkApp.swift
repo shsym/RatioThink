@@ -94,6 +94,21 @@ struct RatioThinkApp: App {
             let port = EnginePort(exactly: rawPort) else { return nil }
       return port
     }()
+    // #381: a SECOND helperless GUI seam, distinct from the pinned-running pin
+    // above. The no-model → Load-default follow-through needs the engine to
+    // start STOPPED so the send gate raises its Load affordance, then become
+    // `.running` the instant the user taps Load — without a real Helper or
+    // `pie serve` (the heavy, seated-session-flaky start that wedged the path).
+    // The stub reports `.stopped` until `startEngine` is called, then
+    // `.running(port)` — the one fact the absent Helper would report once the
+    // engine is up — pointed at the same mock base URL. Its own DEBUG flag so a
+    // pinned-running launch (S302/S486) is unaffected.
+    let startToRunningPort: EnginePort? = {
+      guard ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_START_TO_RUNNING"] == "1",
+            let rawPort = testBaseURL?.port,
+            let port = EnginePort(exactly: rawPort) else { return nil }
+      return port
+    }()
     if let pinnedRunningPort {
       // Inject a stub XPC client (NOT HelperXPCClient): the helperless
       // harness has no Helper, so a real stopEngine() during Unload would
@@ -104,6 +119,11 @@ struct RatioThinkApp: App {
       statusStore = EngineStatusStore(
         client: PinnedRunningXPCClient(port: pinnedRunningPort),
         initialStatus: .running(port: pinnedRunningPort, profileID: "chat")
+      )
+    } else if let startToRunningPort {
+      statusStore = EngineStatusStore(
+        client: StartableStubXPCClient(port: startToRunningPort),
+        initialStatus: .stopped
       )
     } else {
       statusStore = EngineStatusStore(client: HelperXPCClient())
@@ -519,5 +539,40 @@ private struct PinnedRunningXPCClient: AppXPCClient {
   // `stopEngine`).
   func startEngine(profileID: String, modelOverride: String?) async throws {}
   func restartEngine(profileID: String, modelOverride: String?) async throws {}
+}
+
+/// #381: helperless `AppXPCClient` whose engine starts `.stopped` and flips to
+/// `.running(port)` the first time the App calls `startEngine` — the GUI seam
+/// for the no-model → Load-default follow-through. It models the single fact
+/// the absent Helper would report across a `pie serve` start (stopped →
+/// running) so the send gate's Load button drives a deterministic engine start
+/// with NO real Helper or engine. `stopEngine` flips it back so the path is
+/// repeatable within a launch. DEBUG only — compiled out of Release alongside
+/// its `PIE_TEST_ENGINE_START_TO_RUNNING` flag.
+private final class StartableStubXPCClient: AppXPCClient, @unchecked Sendable {
+  private let port: EnginePort
+  private let lock = NSLock()
+  private var started = false
+
+  init(port: EnginePort) { self.port = port }
+
+  func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
+
+  func engineStatus() async throws -> EngineStatus {
+    lock.lock(); defer { lock.unlock() }
+    return started ? .running(port: port, profileID: "chat") : .stopped
+  }
+
+  func startEngine(profileID: String, modelOverride: String?) async throws {
+    lock.lock(); started = true; lock.unlock()
+  }
+
+  func restartEngine(profileID: String, modelOverride: String?) async throws {
+    lock.lock(); started = true; lock.unlock()
+  }
+
+  func stopEngine() async throws {
+    lock.lock(); started = false; lock.unlock()
+  }
 }
 #endif

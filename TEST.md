@@ -46,6 +46,8 @@ below in the same change.
 | `make test-ssh` | `test-unit` + `test-scenario` + `test-smoke` + `test-install-guards` | local (no GUI) | Convenience local subset; not part of `ci-pr` |
 | `make test-gui` | GUI scenarios (S4, S5, and the rest of `Tests/GUIScenarioTests`) via XCUITest | **seated session** | Local GUI gate via `local-gui-gate` |
 | `make test-gui-history` | Deterministic multi-turn history/resume E2E | **seated session** | Local E2E gate |
+| `make test-gui-stream-cancel` | #381 deterministic cancel-mid-stream E2E (partial bubble + composer recovery) | **seated session** | Local E2E gate |
+| `make test-gui-load-default` | #381 deterministic no-model → Load-default follow-through E2E | **seated session** | Local E2E gate |
 | `make test-gui-first-launch-package` | Package-backed first-launch E2E (Release `.app`) | **seated session** | Local E2E gate |
 | `make test-gui-script` | Fast preflight regressions for the GUI E2E wrapper scripts | anywhere | Local GUI gate via `local-gui-gate` |
 | `make test-e2e-tot` | Real-engine tree-of-thought app path completes without the #413 stall | local/operator only | Local E2E gate |
@@ -89,6 +91,8 @@ that wrapper, not bare `xcodebuild`.
 | `S258_ComposerSendGUITests` | chat send/persist | send → **real pie stream** → bubble → SwiftData persist across relaunch | **app+real-engine (real Qwen3-0.6B)** | `test-e2e-chat` |
 | `S204_ChatSendGUITests` | chat send/persist | INSTRUCT model answers "Paris" → persists across relaunch | **app+real-engine (real GGUF)** | `test-e2e-full` |
 | `S275_MultiTurnResumeGUITests` | chat send/persist | ordered multi-turn history sent to engine + persisted across relaunch | app+fake-engine (deterministic HTTP) | `test-gui-history` |
+| `S381_StreamCancelGUITests` | chat send/persist | cancel an IN-FLIGHT stream mid-generation → partial bubble survives + composer recovers (fresh send streams to completion) | app+fake-engine (holding SSE) | `test-gui-stream-cancel` |
+| `S381_NoModelLoadDefaultGUITests` | model load/status | no-model gate's **Load default** → engine starts + serves → gate dismisses → send streams a reply | app+fake-engine (start→running stub + mock) | `test-gui-load-default` |
 | `S279_LifecycleRecoveryGUITests` | lifecycle/recovery | unreachable engine → visible recoverable error + composer re-enabled | app+real-engine seam (dead loopback) | `test-gui-chat` |
 | `S285_ZeroStateGUITests` | zero-state | empty-state top-alignment; Start Chat CTA opens a chat; API Endpoints section opens the single live `LocalAPIView` (#422) | mock (stops at composer; no send) | `test-gui-chat` |
 | `S326_FreshInstallModelDownloadGUITests` | first-launch | fresh install (seeded profile, model absent) → no-model gate offers inline **download**, not a dead-end Load | mock (fake downloader, pre-engine) | `test-gui` |
