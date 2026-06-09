@@ -397,11 +397,21 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
           hardFailures.append("\(cell.name): booted but the ceiling contract failed — \(error)")
         }
       case .failed(let code, let message):
-        // A captured, classified engine-start error — the PASS outcome for a
-        // deliberately-too-small budget. NOT opaque, NOT a hang.
         print("BUDGET-CELL\t\(model)\t\(cell.name)\tstructured-fail\tcode=\(code)\tmsg=\(message.prefix(160).debugDescription)")
-        structuredFailures.append(cell.name)
-        try cellRequireStructured(code: code, message: message, label: cell.name, into: &hardFailures)
+        if cell.expectStructuredLoadFailure {
+          // The PASS outcome for a deliberately-too-small budget: a captured,
+          // classified ENGINE-start error. cellRequireStructured rejects an
+          // empty/opaque classification AND the `harness_error` sentinel (a
+          // setup failure, NOT the engine classifying the over-small pool).
+          structuredFailures.append(cell.name)
+          try cellRequireStructured(code: code, message: message, label: cell.name, into: &hardFailures)
+        } else {
+          // A cell that was supposed to BOOT regressed into a load failure —
+          // the silent regression #475 must never let green. Mirror the
+          // `.running`-branch guard (a supposed-to-fail cell that boots is a
+          // hard failure): this is its symmetric twin, not a captured cell.
+          hardFailures.append("\(cell.name): expected to boot but the engine failed to load — code=\(code) msg=\(message.prefix(160))")
+        }
       case .timedOut:
         // A hang is exactly the failure mode the ticket forbids: not a
         // captured cell. Fail hard and name it.
@@ -456,6 +466,15 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
   private func cellRequireStructured(code: String, message: String, label: String,
                                      into hardFailures: inout [String]) throws {
     let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+    // A harness setup failure (model staging, dir/profile creation) is mapped
+    // to `.failed(code: "harness_error", …)` by `launchForBudget`; it is NOT
+    // the engine classifying an over-small KV pool — the one thing the
+    // expect-fail cell must prove. Reject it so an infrastructure bug cannot
+    // satisfy the captured-structured-failure requirement.
+    if code == "harness_error" {
+      hardFailures.append("\(label): structured failure was a harness error, not an engine classification — \(message.prefix(200))")
+      return
+    }
     if code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || trimmed.isEmpty {
       hardFailures.append("\(label): engine failed without a structured code/message (opaque) — code=\(code.debugDescription) msg=\(message.debugDescription)")
     }
