@@ -206,4 +206,26 @@ final class ProfileSwapWiringTests: XCTestCase {
       XCTAssertEqual(commitCalls, 0, "an accidental dismiss must NOT switch the profile or pin a model")
     }
   }
+
+  /// #486: the model-menu analog of the no-current-model re-select. Picking a
+  /// model from the toolbar model menu with NO current model (`fromModel ==
+  /// nil`: engine stopped / unpinned) must NOT raise a switch-model confirm —
+  /// there is nothing to REPLACE, so the popover would be the same meaningless
+  /// "switch from — to X". `requestModelOverride` must commit the override
+  /// silently and fire no load, exactly like `requestSwap`'s policy 1.5.
+  func test_model_override_stays_silent_when_no_current_model() throws {
+    try withTwoProfileStore { store in
+      let coord = ProfileSwapCoordinator(
+        center: ModelLoadCenter(),   // engine stopped → nothing resident
+        profileStore: store, serveModel: { _, _ in })
+
+      var committed: String?
+      coord.requestModelOverride(modelID: "model-B.gguf", activeProfileID: "beta",
+                                 fromModel: nil) { committed = $0; return true }
+      XCTAssertEqual(committed, "model-B.gguf",
+                     "with no current model, a model-menu pick must commit the override silently")
+      XCTAssertNil(coord.pending,
+                   "no switch-model confirm popover when there is no current model")
+    }
+  }
 }

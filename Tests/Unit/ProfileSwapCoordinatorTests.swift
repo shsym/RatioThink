@@ -281,6 +281,22 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertEqual(center.residentModelID, "m1", "no reload for the already-selected model")
   }
 
+  func test_model_override_no_current_model_is_silent_with_no_load() {
+    // Policy 1.5 parity with `requestSwap` (#486): with NO current model
+    // (`fromModel == nil`: engine stopped / unpinned) there is nothing to
+    // REPLACE, so the switch-model confirm popover is meaningless. Picking a
+    // model from the model menu must commit the override silently and fire NO
+    // load — the model loads later through the normal start gate, exactly like
+    // a profile swap.
+    let (coord, center, _) = makeCoordinator(map: [:])  // engine stopped, nothing selected
+    var committed: String?
+    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat", fromModel: nil) { committed = $0; return true }
+    XCTAssertEqual(committed, "m2", "picking a model with no current model just pins it")
+    XCTAssertNil(coord.pending, "no current model → silent override, no confirm popover")
+    // #469: merged ModelLoadCenter is residency-only (no `.state`).
+    XCTAssertNil(center.residentModelID, "no current model: no load fires")
+  }
+
   func test_confirm_override_with_set_as_default_persists_model_onto_profile() async throws {
     let (coord, center, spy) = makeCoordinator(map: [:], resident: "m1")
     var committed: String?

@@ -323,7 +323,10 @@ public final class ProfileSwapCoordinator: ObservableObject {
   /// Entry point from the toolbar model menu. The user picked a
   /// specific model that overrides the active profile's default for
   /// this chat. Same model-identity policy as `requestSwap`: picking
-  /// the already-selected model is silent (set the pin, no load); any
+  /// the already-selected model is silent (set the pin, no load); with
+  /// NO current model (`fromModel == nil`: engine stopped / unpinned) the
+  /// pick is likewise silent with no load (policy 1.5 — nothing to
+  /// replace, so a switch-model confirm would be meaningless; #486); any
   /// other model publishes a confirm that offers "Set as default for
   /// this profile" before loading.
   ///
@@ -340,6 +343,20 @@ public final class ProfileSwapCoordinator: ObservableObject {
     // Fresh interaction — clear any stale set-as-default error (review
     // v2 F2). Covers the already-selected early return below too.
     defaultModelWriteError = nil
+    guard let fromModel else {
+      // Policy 1.5 (parity with `requestSwap` — #486): the chat has NO
+      // current model (engine stopped / unpinned), so there is nothing to
+      // REPLACE and a switch-model confirm ("switch from — to X") would be
+      // meaningless. Commit the override silently and fire NO load; the model
+      // loads later through the normal start gate, never an implicit load
+      // here. Without this branch the same-model check below (`modelID == nil`)
+      // never catches the no-current case and the model menu raised a spurious
+      // confirm whenever there was no current model.
+      Self.log.debug("model override silent (no current model to replace) model=\(modelID, privacy: .public)")
+      pendingState = nil
+      _ = commit(modelID)  // silent path fires no load — result irrelevant
+      return
+    }
     if modelID == fromModel {
       Self.log.debug("model override silent (already selected) model=\(modelID, privacy: .public)")
       pendingState = nil
@@ -347,7 +364,7 @@ public final class ProfileSwapCoordinator: ObservableObject {
       return
     }
     let token = UUID()
-    Self.log.info("model override pending confirm token=\(token, privacy: .public) profile=\(activeProfileID, privacy: .public) from=\(fromModel ?? "—", privacy: .public) to=\(modelID, privacy: .public)")
+    Self.log.info("model override pending confirm token=\(token, privacy: .public) profile=\(activeProfileID, privacy: .public) from=\(fromModel, privacy: .public) to=\(modelID, privacy: .public)")
     pendingState = PendingState(
       token: token,
       toProfileID: activeProfileID,
