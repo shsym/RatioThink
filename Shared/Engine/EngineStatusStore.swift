@@ -69,9 +69,19 @@ public final class EngineStatusStore: ObservableObject {
   /// `nil`. Computed live off `status` so the SwiftUI dependency
   /// graph re-evaluates dependent views when status flips.
   public var baseURL: URL? {
-    if case .running(let port, _) = status {
-      return URL(string: "http://127.0.0.1:\(port)")
+    if case .running(let snapshot) = status {
+      return URL(string: "http://127.0.0.1:\(snapshot.port)")
     }
+    return nil
+  }
+
+  /// The active engine session's `EngineSessionSnapshot` while `.running`,
+  /// else `nil` (#476). The single authoritative view of the launched
+  /// session — served model id, effective `max_tokens` ceiling, launch
+  /// generation — that `EngineLifecycle` feeds into `ModelLoadCenter` on the
+  /// `.running` edge and that callers use for stale-generation detection.
+  public var currentSnapshot: EngineSessionSnapshot? {
+    if case .running(let snapshot) = status { return snapshot }
     return nil
   }
 
@@ -361,11 +371,11 @@ public final class EngineStatusStore: ObservableObject {
   /// boundary. `ChatSendController` keys its recovery retry on that
   /// discrete case rather than parsing the `engineNotReady` detail.
   public func requireBaseURL() throws -> URL {
-    if case .running(let port, _) = status {
+    if case .running(let snapshot) = status {
       // Force-unwrap is safe: `EnginePort` (UInt16) interpolates into
       // a valid IPv4 loopback URL by construction, and the `running`
       // decoder already rejects `port == 0`.
-      return URL(string: "http://127.0.0.1:\(port)")!
+      return URL(string: "http://127.0.0.1:\(snapshot.port)")!
     }
     if case .failed(.engineGone, _) = status {
       throw HTTPEngineError.engineGone(detail: detailForStatus())

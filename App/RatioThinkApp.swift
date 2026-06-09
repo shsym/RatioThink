@@ -103,7 +103,7 @@ struct RatioThinkApp: App {
       // the Unload confirm path completes to .idle (#359 Path2).
       statusStore = EngineStatusStore(
         client: PinnedRunningXPCClient(port: pinnedRunningPort),
-        initialStatus: .running(port: pinnedRunningPort, profileID: "chat")
+        initialStatus: .running(EngineSessionSnapshot(port: pinnedRunningPort, profileID: "chat"))
       )
     } else {
       statusStore = EngineStatusStore(client: HelperXPCClient())
@@ -512,7 +512,7 @@ struct RatioThinkApp: App {
 private struct PinnedRunningXPCClient: AppXPCClient {
   let port: EnginePort
   func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
-  func engineStatus() async throws -> EngineStatus { .running(port: port, profileID: "chat") }
+  func engineStatus() async throws -> EngineStatus { .running(EngineSessionSnapshot(port: port, profileID: "chat")) }
   func stopEngine() async throws {}
   // The pinned harness has no Helper to launch an engine; the engine is
   // already pinned `.running`, so a start is a no-op success (mirrors

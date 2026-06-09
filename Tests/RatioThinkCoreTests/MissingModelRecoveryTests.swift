@@ -80,7 +80,7 @@ final class MissingModelRecoveryTests: XCTestCase {
   /// A healthy / non-failed engine never shows the missing-model banner.
   func test_bannerTarget_absent_when_engine_not_failed() {
     for status: EngineStatus in [.starting, .stopped, .stopping,
-                                 .running(port: 8080, profileID: "chat")] {
+                                 .running(EngineSessionSnapshot(port: 8080, profileID: "chat"))] {
       XCTAssertNil(MissingModelRecovery.bannerTarget(
         engineStatus: status,
         profileDefaultModel: ProfileStore.defaultChatModelID),
@@ -197,7 +197,7 @@ final class MissingModelRecoveryTests: XCTestCase {
   /// reset the latch — the green "starting engine" is correct there.
   func test_completedLatchShouldReset_false_when_not_modelMissing_or_not_completed() {
     XCTAssertFalse(MissingModelRecovery.completedLatchShouldReset(
-      didComplete: true, engineStatus: .running(port: 8080, profileID: "chat")))
+      didComplete: true, engineStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat"))))
     XCTAssertFalse(MissingModelRecovery.completedLatchShouldReset(
       didComplete: true, engineStatus: .starting))
     // A different failure code is the F2 engine-failure banner's job, not
@@ -255,7 +255,7 @@ final class MissingModelRecoveryTests: XCTestCase {
   func test_engineFailureBannerMessage_surfaces_action_error_when_status_not_failed() {
     XCTAssertEqual(
       MissingModelRecovery.engineFailureBannerMessage(
-        engineStatus: .running(port: 8080, profileID: "chat"),
+        engineStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
         actionError: "Couldn't stop the engine: kill rejected",
         statusDetail: "Engine running",
         hasDownloadTarget: false),
@@ -265,7 +265,7 @@ final class MissingModelRecoveryTests: XCTestCase {
   /// Healthy engine, no action error → no banner.
   func test_engineFailureBannerMessage_nil_when_healthy() {
     XCTAssertNil(MissingModelRecovery.engineFailureBannerMessage(
-      engineStatus: .running(port: 8080, profileID: "chat"),
+      engineStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
       actionError: nil,
       statusDetail: "Engine running",
       hasDownloadTarget: false))
@@ -287,7 +287,7 @@ final class MissingModelRecoveryTests: XCTestCase {
   /// clearing `engineActionError` removes it.
   func test_engineFailureDismissable_true_when_status_not_failed() {
     XCTAssertTrue(MissingModelRecovery.engineFailureDismissable(
-      engineStatus: .running(port: 8080, profileID: "chat")))
+      engineStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat"))))
     XCTAssertTrue(MissingModelRecovery.engineFailureDismissable(engineStatus: .stopped))
   }
 }

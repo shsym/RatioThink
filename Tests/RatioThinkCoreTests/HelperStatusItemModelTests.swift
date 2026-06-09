@@ -27,7 +27,7 @@ final class HelperStatusItemModelTests: XCTestCase {
   }
 
   func test_running_carriesProfileAndPort_andEnablesPause() {
-    let m = HelperStatusItemModel.make(from: .running(port: 54321, profileID: "chat"))
+    let m = HelperStatusItemModel.make(from: .running(EngineSessionSnapshot(port: 54321, profileID: "chat")))
     XCTAssertEqual(m.dot, .running)
     XCTAssertEqual(m.engineLabel, "Engine: running — chat @ port 54321")
     XCTAssertEqual(m.pauseResume.title, "Pause Engine")

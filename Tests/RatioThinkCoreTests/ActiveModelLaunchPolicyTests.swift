@@ -18,7 +18,7 @@ final class ActiveModelLaunchPolicyTests: XCTestCase {
     XCTAssertEqual(
       ActiveModelLaunchPolicy.decide(
         modelID: pick,
-        status: .running(port: 8080, profileID: "chat"),
+        status: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
         residentModelID: "org/repo/model-a.gguf"),
       .restartEngine(modelOverride: pick))
   }
@@ -27,7 +27,7 @@ final class ActiveModelLaunchPolicyTests: XCTestCase {
     XCTAssertEqual(
       ActiveModelLaunchPolicy.decide(
         modelID: pick,
-        status: .running(port: 8080, profileID: "chat"),
+        status: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
         residentModelID: pick),
       .alreadyResident)
   }
@@ -38,7 +38,7 @@ final class ActiveModelLaunchPolicyTests: XCTestCase {
     XCTAssertEqual(
       ActiveModelLaunchPolicy.decide(
         modelID: pick,
-        status: .running(port: 8080, profileID: "chat"),
+        status: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
         residentModelID: nil),
       .restartEngine(modelOverride: pick))
   }

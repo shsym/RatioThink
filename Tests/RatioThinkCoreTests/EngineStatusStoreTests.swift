@@ -206,7 +206,7 @@ final class EngineStatusStoreTests: XCTestCase {
       EngineError(code: .alreadyRunning, message: "tree-of-thought already running")))
     let store = EngineStatusStore(
       client: client,
-      initialStatus: .running(port: 8123, profileID: "tree-of-thought")
+      initialStatus: .running(EngineSessionSnapshot(port: 8123, profileID: "tree-of-thought"))
     )
     do {
       try await store.startEngine(profileID: "chat")
@@ -217,7 +217,7 @@ final class EngineStatusStoreTests: XCTestCase {
       XCTFail("unexpected: \(error)")
     }
     XCTAssertEqual(client.startCalls, 1)
-    XCTAssertEqual(store.status, .running(port: 8123, profileID: "tree-of-thought"))
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 8123, profileID: "tree-of-thought")))
   }
 
   /// #422 F1: a resolver-stage start rejection re-throws AND does NOT move
@@ -254,7 +254,7 @@ final class EngineStatusStoreTests: XCTestCase {
     client.setStopResult(.failure(
       EngineError(code: .killRejected, message: "pid still alive")))
     let store = EngineStatusStore(
-      client: client, initialStatus: .running(port: 8123, profileID: "chat"))
+      client: client, initialStatus: .running(EngineSessionSnapshot(port: 8123, profileID: "chat")))
     do {
       try await store.stopEngine()
       XCTFail("a rejected stop must re-throw so the toggle can surface it")
@@ -263,7 +263,7 @@ final class EngineStatusStoreTests: XCTestCase {
     } catch {
       XCTFail("unexpected: \(error)")
     }
-    XCTAssertEqual(store.status, .running(port: 8123, profileID: "chat"),
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 8123, profileID: "chat")),
                    "a rejected stop must NOT change status — toggle stays on, so the view must explain why")
   }
 
@@ -273,7 +273,7 @@ final class EngineStatusStoreTests: XCTestCase {
     let client = StubXPCClient()
     let store = EngineStatusStore(
       client: client,
-      initialStatus: .running(port: 51234, profileID: "chat")
+      initialStatus: .running(EngineSessionSnapshot(port: 51234, profileID: "chat"))
     )
 
     try await store.restartEngine(profileID: "chat")
@@ -293,7 +293,7 @@ final class EngineStatusStoreTests: XCTestCase {
     let client = StubXPCClient()
     let store = EngineStatusStore(
       client: client,
-      initialStatus: .running(port: 51234, profileID: "chat")
+      initialStatus: .running(EngineSessionSnapshot(port: 51234, profileID: "chat"))
     )
 
     try await store.restartEngine(profileID: "chat", modelOverride: "Org/New-GGUF/new.gguf")
@@ -309,7 +309,7 @@ final class EngineStatusStoreTests: XCTestCase {
     let client = StubXPCClient()
     let store = EngineStatusStore(
       client: client,
-      initialStatus: .running(port: 51234, profileID: "chat")
+      initialStatus: .running(EngineSessionSnapshot(port: 51234, profileID: "chat"))
     )
 
     try await store.restartEngine(profileID: "chat")
@@ -325,7 +325,7 @@ final class EngineStatusStoreTests: XCTestCase {
     ))
     let store = EngineStatusStore(
       client: client,
-      initialStatus: .running(port: 51234, profileID: "chat")
+      initialStatus: .running(EngineSessionSnapshot(port: 51234, profileID: "chat"))
     )
 
     try await store.restartEngine(profileID: "chat")
@@ -372,7 +372,7 @@ final class EngineStatusStoreTests: XCTestCase {
       AppXPCClientError.replyTimeout(selector: "restartEngine", timeout: 85.0)))
     let store = EngineStatusStore(
       client: client,
-      initialStatus: .running(port: 51234, profileID: "chat")
+      initialStatus: .running(EngineSessionSnapshot(port: 51234, profileID: "chat"))
     )
     try await store.restartEngine(profileID: "chat")  // must NOT throw
     XCTAssertEqual(client.restartCalls, 1)
@@ -386,7 +386,7 @@ final class EngineStatusStoreTests: XCTestCase {
       EngineError(code: .modelMissing, message: "still missing")))
     let store = EngineStatusStore(
       client: client,
-      initialStatus: .running(port: 51234, profileID: "chat")
+      initialStatus: .running(EngineSessionSnapshot(port: 51234, profileID: "chat"))
     )
     do {
       try await store.restartEngine(profileID: "chat")
@@ -417,12 +417,12 @@ final class EngineStatusStoreTests: XCTestCase {
 
   func test_refresh_publishes_running_and_exposes_baseURL() async throws {
     let client = StubXPCClient()
-    client.setNext(.running(port: 51234, profileID: "chat"))
+    client.setNext(.running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
     let store = EngineStatusStore(client: client)
 
     let status = try await store.refresh()
-    XCTAssertEqual(status, .running(port: 51234, profileID: "chat"))
-    XCTAssertEqual(store.status, .running(port: 51234, profileID: "chat"))
+    XCTAssertEqual(status, .running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
     XCTAssertEqual(store.baseURL, URL(string: "http://127.0.0.1:51234"))
     XCTAssertNil(store.lastError)
     XCTAssertEqual(store.pollCount, 1)
@@ -442,7 +442,7 @@ final class EngineStatusStoreTests: XCTestCase {
 
   func test_requireBaseURL_returns_url_when_running() async throws {
     let client = StubXPCClient()
-    client.setNext(.running(port: 8080, profileID: "chat"))
+    client.setNext(.running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
     let store = EngineStatusStore(client: client)
     _ = try await store.refresh()
     let url = try store.requireBaseURL()
@@ -461,9 +461,9 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertNil(store.baseURL)
     XCTAssertEqual(store.statusDetail, "Engine starting…")
 
-    client.setNext(.running(port: 49152, profileID: "chat"))
+    client.setNext(.running(EngineSessionSnapshot(port: 49152, profileID: "chat")))
     let s2 = try await store.refresh()
-    XCTAssertEqual(s2, .running(port: 49152, profileID: "chat"))
+    XCTAssertEqual(s2, .running(EngineSessionSnapshot(port: 49152, profileID: "chat")))
     XCTAssertEqual(store.baseURL, URL(string: "http://127.0.0.1:49152"))
 
     client.setNext(.stopped)
@@ -503,7 +503,7 @@ final class EngineStatusStoreTests: XCTestCase {
   /// failures, with no `lastError` churn.
   func test_transient_transport_loss_holds_last_running_status() async throws {
     let client = StubXPCClient()
-    client.setNext(.running(port: 51234, profileID: "chat"))
+    client.setNext(.running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
     let store = EngineStatusStore(client: client, tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3))
 
     _ = try await store.refresh()
@@ -513,7 +513,7 @@ final class EngineStatusStoreTests: XCTestCase {
     store._applyPollForTesting(next: nil, error: "NSXPCConnectionInterrupted")
     store._applyPollForTesting(next: nil, error: "NSXPCConnectionInterrupted")
 
-    XCTAssertEqual(store.status, .running(port: 51234, profileID: "chat"),
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 51234, profileID: "chat")),
                    "a sub-threshold transport blip must hold the last status, not flap")
     XCTAssertEqual(store.baseURL, URL(string: "http://127.0.0.1:51234"))
     XCTAssertNil(store.lastError,
@@ -526,7 +526,7 @@ final class EngineStatusStoreTests: XCTestCase {
   /// error with a Retry/Restart affordance. baseURL is cleared.
   func test_sustained_transport_loss_escalates_to_engineGone() async throws {
     let client = StubXPCClient()
-    client.setNext(.running(port: 51234, profileID: "chat"))
+    client.setNext(.running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
     let store = EngineStatusStore(client: client, tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3))
     _ = try await store.refresh()
 
@@ -554,16 +554,16 @@ final class EngineStatusStoreTests: XCTestCase {
     let client = StubXPCClient()
     let store = EngineStatusStore(client: client, tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3))
 
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
     store._applyPollForTesting(next: nil, error: "blip")
     store._applyPollForTesting(next: nil, error: "blip")
     // Recovery resets the counter…
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
     // …so two more blips still do NOT escalate.
     store._applyPollForTesting(next: nil, error: "blip")
     store._applyPollForTesting(next: nil, error: "blip")
 
-    XCTAssertEqual(store.status, .running(port: 8080, profileID: "chat"),
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
                    "a successful poll must reset the failure counter so an intermittent helper never escalates")
   }
 
@@ -578,7 +578,7 @@ final class EngineStatusStoreTests: XCTestCase {
     // Initial status is `.starting` → stamped at init.
     XCTAssertEqual(store.startingSince, fixed)
 
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
     XCTAssertNil(store.startingSince, "running clears startingSince")
 
     store._applyPollForTesting(next: .starting, error: nil)
@@ -596,7 +596,7 @@ final class EngineStatusStoreTests: XCTestCase {
     // initialStatus `.running` ⇒ wasEverRunning, so a post-run `.spawnFailed`
     // surfaces at once. (The #2 first-load hold defers a transient failure
     // ONLY during the very first load — covered by its own tests.)
-    let store = EngineStatusStore(client: client, initialStatus: .running(port: 8080, profileID: "chat"))
+    let store = EngineStatusStore(client: client, initialStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
     _ = try await store.refresh()
     XCTAssertEqual(store.status, .failed(code: .spawnFailed, message: "fork ENOENT"))
     XCTAssertTrue(store.statusDetail.contains("spawnFailed"),
@@ -674,8 +674,8 @@ final class EngineStatusStoreTests: XCTestCase {
     store._applyPollForTesting(next: .failed(code: .spawnFailed, message: "engine exited early"), error: nil)
     store._applyPollForTesting(next: .failed(code: .spawnFailed, message: "engine exited early"), error: nil)
     XCTAssertEqual(store.status, .starting, "a transient first-load .spawnFailed must read as Starting…, not error")
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
-    XCTAssertEqual(store.status, .running(port: 8080, profileID: "chat"))
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
     XCTAssertTrue(store.wasEverRunning)
   }
 
@@ -696,7 +696,7 @@ final class EngineStatusStoreTests: XCTestCase {
   func test_hold_does_not_apply_once_engine_has_run() {
     let store = EngineStatusStore(client: StubXPCClient(),
       tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 5, firstLoadFailureGracePolls: 3))
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
     XCTAssertTrue(store.wasEverRunning)
     store._applyPollForTesting(next: .failed(code: .spawnFailed, message: "died"), error: nil)
     guard case .failed(.spawnFailed, _) = store.status else {
@@ -708,12 +708,12 @@ final class EngineStatusStoreTests: XCTestCase {
   /// consecutive `.failed(.engineGone)`, resets on any other status.
   func test_engineGonePolls_counts_consecutive_engineGone_and_resets() {
     let store = EngineStatusStore(client: StubXPCClient())
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
     XCTAssertEqual(store.engineGonePolls, 0)
     store._applyPollForTesting(next: .failed(code: .engineGone, message: "exit 1"), error: nil)
     store._applyPollForTesting(next: .failed(code: .engineGone, message: "exit 1"), error: nil)
     XCTAssertEqual(store.engineGonePolls, 2)
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
     XCTAssertEqual(store.engineGonePolls, 0)
   }
 

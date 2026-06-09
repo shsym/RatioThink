@@ -411,7 +411,10 @@ public final class PieSupervisor: @unchecked Sendable {
       switch self {
       case .stopped:                          return .stopped
       case .starting:                         return .starting
-      case .running(let port, let spec):      return .running(port: port, profileID: spec.profileID)
+      // Legacy supervisor (test-bundle only): no LaunchSpec KV knobs, so
+      // project a minimal snapshot (#476). Production runs through PieEngineHost.
+      case .running(let port, let spec):
+        return .running(EngineSessionSnapshot(port: port, profileID: spec.profileID))
       case .stopping:                         return .stopping
       case .failed(let code, let message):    return .failed(code: code, message: message)
       }

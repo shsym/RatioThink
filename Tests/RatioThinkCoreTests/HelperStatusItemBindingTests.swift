@@ -32,7 +32,7 @@ final class HelperStatusItemBindingTests: XCTestCase {
   func test_apply_callsEverySetter_inDocumentedOrder() {
     let rec = Recorder()
     let binding = makeBinding(rec)
-    let model = HelperStatusItemModel.make(from: .running(port: 54321, profileID: "chat"))
+    let model = HelperStatusItemModel.make(from: .running(EngineSessionSnapshot(port: 54321, profileID: "chat")))
     binding.apply(model)
     XCTAssertEqual(rec.events, [
       "dot=running",
@@ -94,7 +94,7 @@ final class HelperStatusItemBindingTests: XCTestCase {
 
     // Walk: stopped (.resume, enabled=true) → running (.pause, enabled=true)
     raceCheckingBinding.apply(HelperStatusItemModel.make(from: .stopped))
-    raceCheckingBinding.apply(HelperStatusItemModel.make(from: .running(port: 1, profileID: "p")))
+    raceCheckingBinding.apply(HelperStatusItemModel.make(from: .running(EngineSessionSnapshot(port: 1, profileID: "p"))))
 
     XCTAssertEqual(observedRaces, [],
                    "setPauseResumeAction MUST land before setPauseResumeEnabled flips true")
@@ -123,7 +123,7 @@ final class HelperStatusItemBindingTests: XCTestCase {
     let statuses: [EngineStatus] = [
       .stopped,
       .starting,
-      .running(port: 54321, profileID: "chat"),
+      .running(EngineSessionSnapshot(port: 54321, profileID: "chat")),
       .stopping,
       .stopped,
     ]

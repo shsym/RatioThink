@@ -51,14 +51,16 @@ final class XPCProtocolTests: XCTestCase {
   func test_engineStatus_roundtrip_starting() { assertRoundTrip(EngineStatus.starting) }
   func test_engineStatus_roundtrip_stopping() { assertRoundTrip(EngineStatus.stopping) }
 
-  func test_engineStatus_roundtrip_running_carries_port_and_profile() throws {
-    let original = EngineStatus.running(port: 51234, profileID: "chat")
+  func test_engineStatus_roundtrip_running_carries_full_snapshot() throws {
+    let snapshot = EngineSessionSnapshot(
+      generation: 3, port: 51234, profileID: "chat",
+      servedModelID: "Qwen/Qwen3-0.6B", maxOutputTokens: 8000)
+    let original = EngineStatus.running(snapshot)
     let data = try XPCPayload.encode(original)
     let decoded = try XPCPayload.decode(EngineStatus.self, from: data)
     XCTAssertEqual(decoded, original)
-    if case .running(let port, let id) = decoded {
-      XCTAssertEqual(port, 51234)
-      XCTAssertEqual(id, "chat")
+    if case .running(let snap) = decoded {
+      XCTAssertEqual(snap, snapshot)
     } else {
       XCTFail("expected .running, got \(decoded)")
     }
@@ -68,14 +70,14 @@ final class XPCProtocolTests: XCTestCase {
     // Hand-craft the wire bytes so the decoder is what's under test.
     // `EnginePort = UInt16` makes negative/oversized values
     // unrepresentable at the type level, but 0 ("any-bind") still
-    // round-trips through UInt16 — the decoder is the last line of
-    // defense (review F2).
-    let data = Data(#"{"kind":"running","port":0,"profileID":"chat"}"#.utf8)
+    // round-trips through UInt16 — the EngineStatus decoder is the last
+    // line of defense on the embedded snapshot's port (review F2).
+    let data = Data(#"{"kind":"running","snapshot":{"generation":0,"maxOutputTokens":32768,"port":0,"profileID":"chat","servedModelID":""}}"#.utf8)
     XCTAssertThrowsError(try XPCPayload.decode(EngineStatus.self, from: data))
   }
 
   func test_engineStatus_running_port_at_uint16_max_is_accepted() throws {
-    let original = EngineStatus.running(port: UInt16.max, profileID: "chat")
+    let original = EngineStatus.running(EngineSessionSnapshot(port: UInt16.max, profileID: "chat"))
     let data = try XPCPayload.encode(original)
     let decoded = try XPCPayload.decode(EngineStatus.self, from: data)
     XCTAssertEqual(decoded, original)
@@ -83,8 +85,8 @@ final class XPCProtocolTests: XCTestCase {
 
   func test_engineStatus_running_oversized_port_is_rejected_by_uint16() throws {
     // 70000 is outside UInt16 — the Decodable conformance on UInt16
-    // throws, independent of our explicit guard. Belt + suspenders.
-    let data = Data(#"{"kind":"running","port":70000,"profileID":"chat"}"#.utf8)
+    // throws on the embedded snapshot, independent of our explicit guard.
+    let data = Data(#"{"kind":"running","snapshot":{"generation":0,"maxOutputTokens":32768,"port":70000,"profileID":"chat","servedModelID":""}}"#.utf8)
     XCTAssertThrowsError(try XPCPayload.decode(EngineStatus.self, from: data))
   }
 
@@ -151,16 +153,17 @@ final class XPCProtocolTests: XCTestCase {
 
   // MARK: - startEngine wire convention
 
-  func test_startEngine_reply_success_encodes_port_only() throws {
+  func test_startEngine_reply_success_encodes_snapshot_only() throws {
     var captured: (Data?, Data?) = (nil, nil)
-    PieHelperXPCWire.replyStartEngine(.success(7777)) { captured = ($0, $1) }
+    let snapshot = EngineSessionSnapshot(port: 7777, profileID: "chat")
+    PieHelperXPCWire.replyStartEngine(.success(snapshot)) { captured = ($0, $1) }
     XCTAssertNotNil(captured.0)
     XCTAssertNil(captured.1)
     let result = try PieHelperXPCWire.decodeStartEngineReply(
       successData: captured.0, errorData: captured.1
     )
-    if case .success(let port) = result {
-      XCTAssertEqual(port, 7777)
+    if case .success(let decoded) = result {
+      XCTAssertEqual(decoded, snapshot)
     } else { XCTFail("expected .success, got \(result)") }
   }
 
@@ -363,7 +366,7 @@ final class XPCProtocolTests: XCTestCase {
     // Compile-time check: assigning to a non-throwing function type
     // proves the helper doesn't `throws`. If F4 regresses this fails
     // to compile, not at runtime.
-    let _: (Result<EnginePort, EngineError>, (Data?, Data?) -> Void) -> Void =
+    let _: (Result<EngineSessionSnapshot, EngineError>, (Data?, Data?) -> Void) -> Void =
       PieHelperXPCWire.replyStartEngine(_:via:)
   }
 
@@ -388,7 +391,7 @@ final class XPCProtocolTests: XCTestCase {
 
   func test_engineStatus_running_port_zero_encode_throws() {
     XCTAssertThrowsError(
-      try XPCPayload.encode(EngineStatus.running(port: 0, profileID: "x"))
+      try XPCPayload.encode(EngineStatus.running(EngineSessionSnapshot(port: 0, profileID: "x")))
     ) { err in
       // Foundation wraps the inner EncodingError; assert by class
       // name + the diagnostic carries `port` so the trail back to
@@ -402,7 +405,7 @@ final class XPCProtocolTests: XCTestCase {
   func test_engineStatus_running_port_one_encode_succeeds() throws {
     // Smallest legal port. Proves the guard is on `== 0`, not on a
     // wider range.
-    let original = EngineStatus.running(port: 1, profileID: "x")
+    let original = EngineStatus.running(EngineSessionSnapshot(port: 1, profileID: "x"))
     let data = try XPCPayload.encode(original)
     XCTAssertEqual(try XPCPayload.decode(EngineStatus.self, from: data), original)
   }
@@ -424,7 +427,7 @@ final class XPCProtocolTests: XCTestCase {
     // payloads. Whichever variant we hand in, the inner encode
     // throws → catch fires → logger called → fallback bytes emitted.
     PieHelperXPCWire._replyStartEngine(
-      .success(7777),
+      .success(EngineSessionSnapshot(port: 7777, profileID: "chat")),
       via: { captured = ($0, $1) },
       encode: { _ in throw AlwaysThrowingEncodable.Boom() },
       onEncodeFailure: { loggedError = $0 }

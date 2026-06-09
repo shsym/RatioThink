@@ -298,9 +298,9 @@ final class HelperResumeActionTests: XCTestCase {
     // supervisor.start was actually invoked: wait for handshake so we
     // confirm the fake pie was spawned (not just .starting).
     waitForRunning(engineHost, timeout: 5)
-    if case .running(let port, let profileID) = engineHost.status {
-      XCTAssertEqual(port, 47474)
-      XCTAssertEqual(profileID, "chat")
+    if case .running(let snap) = engineHost.status {
+      XCTAssertEqual(snap.port, 47474)
+      XCTAssertEqual(snap.profileID, "chat")
     } else {
       XCTFail("expected engineHost to reach .running after Resume, got \(engineHost.status)")
     }
@@ -650,7 +650,7 @@ final class HelperResumeActionTests: XCTestCase {
     // (e.g. the user clicked Resume manually). Do not pile a second
     // auto-relaunch on top.
     XCTAssertFalse(HelperResumeAction.shouldCommitAutoRelaunch(
-      status: .running(port: 50001, profileID: "chat")
+      status: .running(EngineSessionSnapshot(port: 50001, profileID: "chat"))
     ))
   }
 
@@ -688,7 +688,7 @@ final class HelperResumeActionTests: XCTestCase {
     // back in the `.vetoed` payload so HelperMain can log why it skipped.
     let states: [EngineStatus] = [
       .stopped,
-      .running(port: 50001, profileID: "chat"),
+      .running(EngineSessionSnapshot(port: 50001, profileID: "chat")),
       .starting,
       .stopping,
     ]

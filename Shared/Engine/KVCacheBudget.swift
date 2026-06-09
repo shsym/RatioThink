@@ -20,11 +20,44 @@ import Foundation
 /// bounding the output `max_tokens` by it is conservative (output ≤ total
 /// is always safe).
 public enum KVCacheBudget {
-  /// Engine default KV-pool capacity in tokens = `kv_page_size (32) *
-  /// default max_num_kv_pages (1024)`. The pool is not resized, so this
-  /// is the hard upper bound; an override is only written when it would
+  /// KV page size in tokens — pie's `kv_page_size` default
+  /// (`server/src/config.rs` `default_kv_page_size() = 32`). One pool page
+  /// holds this many tokens of KV.
+  public static let kvPageSizeTokens: Int = 32
+
+  /// Engine default KV-pool page count — pie's portable-driver
+  /// `max_num_kv_pages` default (`server/src/config.rs` `= 1024`). Used as
+  /// the divisor-free fallback when a `LaunchSpec` leaves `maxNumKvPages`
+  /// `nil` (the production case — the launcher does not override it).
+  public static let defaultMaxNumKvPages: Int = 1024
+
+  /// Engine default KV-pool capacity in tokens = `kvPageSizeTokens *
+  /// defaultMaxNumKvPages` (32 × 1024 = 32768). The pool is not resized, so
+  /// this is the hard upper bound; an override is only written when it would
   /// LOWER the ceiling below this.
-  public static let defaultPoolCapacityTokens: Int = 32 * 1024  // 32768
+  public static let defaultPoolCapacityTokens: Int = kvPageSizeTokens * defaultMaxNumKvPages
+
+  /// The effective per-request output-token ceiling the engine ENFORCES for a
+  /// launched session, derived from the two `LaunchSpec` knobs the helper owns.
+  /// Mirrors pie `runtime::max_output_tokens` exactly
+  /// (`Vendor/pie/runtime/src/model.rs` `output_token_ceiling_for_model`):
+  ///
+  ///   `effective = default_token_limit.unwrap_or(kvCap).min(kvCap)`
+  ///   `kvCap     = (max_num_kv_pages ?? defaultMaxNumKvPages) * kvPageSizeTokens`
+  ///
+  /// There is deliberately **no** `minCeilingTokens` floor here: that 512 floor
+  /// lives only in `outputTokenCeiling` (the pre-launch EMIT path, which floors
+  /// `default_token_limit` before it is written). pie's runtime applies no floor,
+  /// so this OBSERVE-path value matches what `GET /v1/models` reports as
+  /// `max_output_tokens`. Because the helper sets both knobs, it can publish this
+  /// in the session snapshot without an engine round-trip (insight 184: pie
+  /// always allocates the full default pool in production — no RAM backoff — so
+  /// the `nil`-knobs production case equals the engine's `kvCap`).
+  public static func effectiveOutputCeiling(defaultTokenLimit: Int?,
+                                            maxNumKvPages: Int?) -> Int {
+    let kvCap = (maxNumKvPages ?? defaultMaxNumKvPages) * kvPageSizeTokens
+    return min(defaultTokenLimit ?? kvCap, kvCap)
+  }
 
   /// Conservative overhead reserved on top of the weights before KV:
   /// `max(floor, fraction * weights)` (activations, compute/graph

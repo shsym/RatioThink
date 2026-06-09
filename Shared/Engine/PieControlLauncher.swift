@@ -199,6 +199,21 @@ public enum PieControlLauncher {
     /// forward-pass code path as the production Resume flow without
     /// requiring a fully wired profile + downloader.
     case metal(modelID: String)
+
+    /// The model id the engine ADVERTISES on `/v1/models` for this config —
+    /// the `[[model]].name` `renderConfigBody` writes, which is also the
+    /// chat-completion `model` field the App must send. Surfaced into
+    /// `EngineSessionSnapshot.servedModelID` (#476) so the App reads the
+    /// served id off the snapshot instead of a separate `/v1/models` fetch.
+    /// `.dummy` has no real model → the synthetic `"default"` name.
+    public var servedModelID: String {
+      switch self {
+      case .dummy:                       return "default"
+      case .portable(let slug, _):       return slug
+      case .portableResolved(let id, _): return id
+      case .metal(let modelID):          return modelID
+      }
+    }
   }
 
   public struct LaunchSpec: Sendable {

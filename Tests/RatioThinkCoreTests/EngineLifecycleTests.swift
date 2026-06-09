@@ -41,7 +41,7 @@ final class EngineLifecycleTests: XCTestCase {
 
   func test_initial_indicator_folds_engine_and_load() {
     let center = ModelLoadCenter(initialResident: "org/m")
-    let store = makeStore(.running(port: 8080, profileID: "chat"))
+    let store = makeStore(.running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
     let lifecycle = EngineLifecycle(engineStatus: store, modelLoad: center)
     XCTAssertEqual(lifecycle.indicator, .running(modelID: "org/m"))
   }
@@ -52,7 +52,7 @@ final class EngineLifecycleTests: XCTestCase {
   /// dead engine with no resident.
   func test_running_then_stop_invalidates_residency_and_folds_offline() {
     let center = ModelLoadCenter(initialResident: "org/m")
-    let store = makeStore(.running(port: 8080, profileID: "chat"))
+    let store = makeStore(.running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
     let lifecycle = EngineLifecycle(engineStatus: store, modelLoad: center)
     XCTAssertEqual(lifecycle.indicator, .running(modelID: "org/m"))
 
@@ -76,7 +76,7 @@ final class EngineLifecycleTests: XCTestCase {
     XCTAssertEqual(lifecycle.indicator, .offline)
 
     // Engine comes up and a model becomes resident (reconcile path).
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
     center.reconcileEngineResident("org/m")
     XCTAssertEqual(lifecycle.indicator, .running(modelID: "org/m"))
 
@@ -86,5 +86,45 @@ final class EngineLifecycleTests: XCTestCase {
     if case .running = lifecycle.indicator {
       XCTFail("a failed engine must not fold to .running/resident")
     }
+  }
+
+  // MARK: - #476 enter-`.running` edge feeds the session snapshot
+
+  /// On the enter-`.running` edge, the coordinator feeds the authoritative
+  /// snapshot's served model + effective ceiling into `ModelLoadCenter` — so
+  /// the send path has the ceiling BEFORE the first send, with no `/v1/models`
+  /// round-trip. (Mirror of the leave-edge invalidation.)
+  func test_enter_running_feeds_servedModel_and_ceiling_from_snapshot() {
+    let center = ModelLoadCenter()
+    let store = makeStore(.starting)
+    let lifecycle = EngineLifecycle(engineStatus: store, modelLoad: center)
+    XCTAssertNil(center.residentModelID)
+    XCTAssertNil(center.residentMaxOutputTokens)
+
+    let snapshot = EngineSessionSnapshot(
+      generation: 1, port: 8080, profileID: "chat",
+      servedModelID: "org/model", maxOutputTokens: 8000)
+    store._applyPollForTesting(next: .running(snapshot), error: nil)
+
+    XCTAssertEqual(center.residentModelID, "org/model",
+                   "the enter-running edge must publish the snapshot's served model")
+    XCTAssertEqual(center.residentMaxOutputTokens, 8000,
+                   "the enter-running edge must publish the snapshot's effective ceiling")
+    withExtendedLifetime(lifecycle) {}
+  }
+
+  /// A minimal (legacy/pin) snapshot with an empty `servedModelID` must NOT
+  /// clobber residency — it carries no real model resolution.
+  func test_enter_running_skips_feed_for_empty_servedModelID() {
+    let center = ModelLoadCenter()
+    let store = makeStore(.starting)
+    let lifecycle = EngineLifecycle(engineStatus: store, modelLoad: center)
+
+    store._applyPollForTesting(
+      next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
+
+    XCTAssertNil(center.residentModelID, "an empty servedModelID must not set residency")
+    XCTAssertNil(center.residentMaxOutputTokens, "no real session → no ceiling feed")
+    withExtendedLifetime(lifecycle) {}
   }
 }

@@ -147,10 +147,10 @@ public struct HelperStatusItemModel: Equatable, Sendable {
                                  enabled: true,
                                  action: .pause)
       )
-    case .running(let port, let profileID):
+    case .running(let snapshot):
       return HelperStatusItemModel(
         dot: .running,
-        engineLabel: "Engine: running — \(profileID) @ port \(port)",
+        engineLabel: "Engine: running — \(snapshot.profileID) @ port \(snapshot.port)",
         pauseResume: PauseResume(title: "Pause Engine",
                                  enabled: true,
                                  action: .pause)

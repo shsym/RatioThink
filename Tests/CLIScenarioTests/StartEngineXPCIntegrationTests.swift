@@ -88,6 +88,85 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
                    "supervisor must return the port pie printed over HTTP_LISTEN, round-tripped through NSXPCCoder")
   }
 
+  // MARK: - #476 session-snapshot contract
+
+  /// The `startEngine` reply carries the full `EngineSessionSnapshot` (port,
+  /// profileID, servedModelID, effective ceiling, generation), and the SAME
+  /// snapshot rides the `engineStatus` poll — one snapshot, two transports.
+  func test_startEngine_overXPC_replyAndStatusCarryIdenticalSnapshot() async throws {
+    let store = try makeProfileStoreWithChat(model: "ignored-by-fake-pie.gguf")
+    defer { store.stop() }
+    let host = makeEngineHost(port: 24611)
+    defer { host.stop() }
+    let exported = try makeExportedAPI(store: store, host: host) { modelsRoot in
+      try Data("ignored".utf8).write(
+        to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false))
+    }
+    let peer = try makeXPCPeer(exported: exported)
+    defer { peer.owner.invalidate(); peer.connection.invalidate() }
+
+    let snapshot = try await callStartEngineSnapshot(api: peer.api, profileID: "chat", timeout: 8)
+    XCTAssertEqual(snapshot.port, 24611)
+    XCTAssertEqual(snapshot.profileID, "chat")
+    XCTAssertEqual(snapshot.servedModelID, "ignored-by-fake-pie.gguf",
+                   "servedModelID must be the resolved boot model, not empty")
+    // A fake (non-GGUF) artifact yields no arch metadata → no scheduler cap →
+    // the engine's effective ceiling is the default pool capacity.
+    XCTAssertEqual(snapshot.maxOutputTokens, KVCacheBudget.defaultPoolCapacityTokens)
+    XCTAssertGreaterThan(snapshot.generation, 0, "generation must be a real launch id")
+
+    let status = try await callEngineStatus(api: peer.api, timeout: 4)
+    guard case .running(let polled) = status else {
+      return XCTFail("expected .running over the status wire, got \(status)")
+    }
+    XCTAssertEqual(polled, snapshot,
+                   "the engineStatus poll must carry the IDENTICAL snapshot the start reply returned")
+  }
+
+  /// An explicit per-start model override is reflected in the snapshot's
+  /// `servedModelID` — the App reads the served id off the snapshot, not the
+  /// profile default (#459 repro 1 / #476).
+  func test_startEngine_explicitOverride_snapshotReportsOverriddenModel() async throws {
+    let store = try makeProfileStoreWithChat(model: "profile-default.gguf")
+    defer { store.stop() }
+    let host = makeEngineHost(port: 24612)
+    defer { host.stop() }
+    let exported = try makeExportedAPI(store: store, host: host) { modelsRoot in
+      try Data("a".utf8).write(to: modelsRoot.appendingPathComponent("profile-default.gguf", isDirectory: false))
+      try Data("b".utf8).write(to: modelsRoot.appendingPathComponent("explicit-override.gguf", isDirectory: false))
+    }
+    let peer = try makeXPCPeer(exported: exported)
+    defer { peer.owner.invalidate(); peer.connection.invalidate() }
+
+    let snapshot = try await callStartEngineSnapshot(
+      api: peer.api, profileID: "chat", modelOverride: "explicit-override.gguf", timeout: 8)
+    XCTAssertEqual(snapshot.servedModelID, "explicit-override.gguf",
+                   "an explicit override must be the served model, overriding the profile default")
+  }
+
+  /// A restart bumps the launch generation, so a snapshot the App composed
+  /// against the prior session is detectably stale (#476 stale-state id).
+  func test_restartEngine_overXPC_bumpsGenerationMakingPriorSnapshotStale() async throws {
+    let store = try makeProfileStoreWithChat(model: "ignored-by-fake-pie.gguf")
+    defer { store.stop() }
+    let host = makeEngineHost(port: 24613)
+    defer { host.stop() }
+    let exported = try makeExportedAPI(store: store, host: host) { modelsRoot in
+      try Data("ignored".utf8).write(
+        to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false))
+    }
+    let peer = try makeXPCPeer(exported: exported)
+    defer { peer.owner.invalidate(); peer.connection.invalidate() }
+
+    let first = try await callStartEngineSnapshot(api: peer.api, profileID: "chat", timeout: 8)
+    let second = try await callStartEngineSnapshot(
+      api: peer.api, profileID: "chat", restart: true, timeout: 8)
+    XCTAssertGreaterThan(second.generation, first.generation,
+                         "a restart must mint a new launch generation")
+    XCTAssertFalse(second.isSameSession(as: first),
+                   "the prior snapshot must be detectably stale after a restart")
+  }
+
   ///  G1: a mid-session engine death must surface as a coded
   /// `.failed(.engineGone)` through the real `engineStatus()` XPC wire
   /// (NSXPCCoder round-trip), not just inside the host. Drives the
@@ -249,8 +328,12 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     // production default (135s+slack) is what guarantees a real large-model
     // boot is awaited rather than timed out at 2s.
     try await client.startEngine(profileID: "chat", modelOverride: nil)
-    XCTAssertEqual(host.status, .running(port: 24700, profileID: "chat"),
-                   "App route must converge on the same .running state the host reached")
+    guard case .running(let snap) = host.status else {
+      return XCTFail("App route must converge on .running; got \(host.status)")
+    }
+    XCTAssertEqual(snap.port, 24700,
+                   "App route must converge on the same .running port the host reached")
+    XCTAssertEqual(snap.profileID, "chat")
   }
 
   /// #461 acceptance 2: an App reply timeout (the App giving up early) must
@@ -866,7 +949,7 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
   private func pollHostUntilRunning(_ host: PieEngineHost,
                                     port: EnginePort,
                                     deadline seconds: TimeInterval) async throws {
-    let expected = EngineStatus.running(port: port, profileID: "chat")
+    let expected = EngineStatus.running(EngineSessionSnapshot(port: port, profileID: "chat"))
     let deadline = Date().addingTimeInterval(seconds)
     while Date() < deadline {
       if host.status == expected { return }
@@ -908,12 +991,55 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
             successData: successData, errorData: errorData
           )
           switch result {
-          case .success(let port): cont.resume(returning: port)
-          case .failure(let err):  cont.resume(throwing: XPCError.engine(err))
+          case .success(let snapshot): cont.resume(returning: snapshot.port)
+          case .failure(let err):      cont.resume(throwing: XPCError.engine(err))
           }
         } catch {
           cont.resume(throwing: XPCError.wireShape(underlying: error))
         }
+      }
+    }
+  }
+
+  /// Async bridge that returns the FULL `EngineSessionSnapshot` from a
+  /// `startEngine` / `restartEngine` reply (#476) — lets the snapshot-contract
+  /// tests assert servedModelID / maxOutputTokens / generation, not just the
+  /// port. `restart == true` exercises the strict rebuild selector.
+  private func callStartEngineSnapshot(api: PieHelperXPC,
+                                       profileID: String,
+                                       modelOverride: String? = nil,
+                                       restart: Bool = false,
+                                       timeout: TimeInterval) async throws -> EngineSessionSnapshot {
+    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<EngineSessionSnapshot, Error>) in
+      let resumed = ResumedOnceFlag()
+      let timer = DispatchSource.makeTimerSource(queue: .global())
+      timer.schedule(deadline: .now() + timeout)
+      timer.setEventHandler {
+        if resumed.markIfPending() {
+          cont.resume(throwing: XPCError.replyTimeout(timeout: timeout))
+        }
+      }
+      timer.resume()
+
+      let handler: (Data?, Data?) -> Void = { successData, errorData in
+        timer.cancel()
+        guard resumed.markIfPending() else { return }
+        do {
+          let result = try PieHelperXPCWire.decodeStartEngineReply(
+            successData: successData, errorData: errorData
+          )
+          switch result {
+          case .success(let snapshot): cont.resume(returning: snapshot)
+          case .failure(let err):      cont.resume(throwing: XPCError.engine(err))
+          }
+        } catch {
+          cont.resume(throwing: XPCError.wireShape(underlying: error))
+        }
+      }
+      if restart {
+        api.restartEngine(profileID: profileID, modelOverride: modelOverride, reply: handler)
+      } else {
+        api.startEngine(profileID: profileID, modelOverride: modelOverride, reply: handler)
       }
     }
   }

@@ -329,8 +329,8 @@ enum EngineHarness {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
       switch host.status {
-      case .running(let port, _):
-        return UInt16(port)
+      case .running(let snap):
+        return UInt16(snap.port)
       case .failed(let code, let message):
         throw HarnessError.engineFailed("\(code.rawValue): \(message)")
       default:

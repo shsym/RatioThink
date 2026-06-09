@@ -97,8 +97,10 @@ public protocol PieHelperXPC {
   /// allowed-class list.
   func engineMemory(reply: @escaping (Data) -> Void)
 
-  /// On success `successData` decodes to `EnginePort`; on failure
-  /// `errorData` decodes to `EngineError`. Exactly one is non-nil.
+  /// On success `successData` decodes to `EngineSessionSnapshot` (#476) — the
+  /// authoritative description of the launched session (port, profileID,
+  /// servedModelID, effective `max_tokens` ceiling, launch generation); on
+  /// failure `errorData` decodes to `EngineError`. Exactly one is non-nil.
   ///
   /// `modelOverride` is the caller's explicit per-start model selection
   /// (the chat toolbar / model-list pick). When non-nil it is the boot
@@ -240,9 +242,10 @@ public enum PieHelperXPCWire {
 
   // MARK: - startEngine
 
-  /// Reply-block helper for `startEngine`. Encodes either an
-  /// `EnginePort` or an `EngineError` and invokes the XPC reply block
-  /// with the success/error tuple that matches the protocol contract.
+  /// Reply-block helper for `startEngine` / `restartEngine`. Encodes either
+  /// the launched `EngineSessionSnapshot` (#476) or an `EngineError` and
+  /// invokes the XPC reply block with the success/error tuple that matches
+  /// the protocol contract.
   ///
   /// Non-throwing on purpose (review v2 F4): if the inner encode
   /// throws — encoder-strategy misconfig, future Codable change — we
@@ -251,7 +254,7 @@ public enum PieHelperXPCWire {
   /// waiting on a reply block that was never fired. Helper-side
   /// authors do NOT need to wrap calls in `do/catch`.
   public static func replyStartEngine(
-    _ result: Result<EnginePort, EngineError>,
+    _ result: Result<EngineSessionSnapshot, EngineError>,
     via reply: (Data?, Data?) -> Void
   ) {
     _replyStartEngine(
@@ -268,15 +271,15 @@ public enum PieHelperXPCWire {
   /// a throwing encoder.
   @usableFromInline
   internal static func _replyStartEngine(
-    _ result: Result<EnginePort, EngineError>,
+    _ result: Result<EngineSessionSnapshot, EngineError>,
     via reply: (Data?, Data?) -> Void,
     encode: (any Encodable) throws -> Data,
     onEncodeFailure: (Error) -> Void
   ) {
     do {
       switch result {
-      case .success(let port):
-        reply(try encode(port), nil)
+      case .success(let snapshot):
+        reply(try encode(snapshot), nil)
       case .failure(let error):
         reply(nil, try encode(error))
       }
@@ -286,8 +289,8 @@ public enum PieHelperXPCWire {
     }
   }
 
-  /// Decode a `startEngine` reply tuple back into a typed `Result`.
-  /// Throws `EngineError(code: .wireContractViolation)` for every
+  /// Decode a `startEngine` / `restartEngine` reply tuple back into a typed
+  /// `Result`. Throws `EngineError(code: .wireContractViolation)` for every
   /// plumbing failure — tuple-shape violation (review v1 F8) AND
   /// malformed payload bytes that fail inner decode (review v2 F1).
   /// A `try?` at the call site collapses to `nil` only for
@@ -295,12 +298,12 @@ public enum PieHelperXPCWire {
   public static func decodeStartEngineReply(
     successData: Data?,
     errorData: Data?
-  ) throws -> Result<EnginePort, EngineError> {
+  ) throws -> Result<EngineSessionSnapshot, EngineError> {
     switch (successData, errorData) {
     case (let s?, nil):
       return .success(try decodeOrWireViolation(
-        EnginePort.self, from: s,
-        slot: "startEngine.successData(EnginePort)"
+        EngineSessionSnapshot.self, from: s,
+        slot: "startEngine.successData(EngineSessionSnapshot)"
       ))
     case (nil, let e?):
       return .failure(try decodeOrWireViolation(

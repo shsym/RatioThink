@@ -29,14 +29,14 @@ final class EngineIndicatorStateTests: XCTestCase {
   }
 
   func test_running_engine_is_running_with_resident_model() {
-    let state = make(engine: .running(port: 51234, profileID: "chat"), resident: "Qwen3-0.6B")
+    let state = make(engine: .running(EngineSessionSnapshot(port: 51234, profileID: "chat")), resident: "Qwen3-0.6B")
     XCTAssertEqual(state, .running(modelID: "Qwen3-0.6B"))
     XCTAssertEqual(state.dot, .running)
     XCTAssertNil(state.bannerError)
   }
 
   func test_running_engine_with_no_resident_is_running_nil() {
-    XCTAssertEqual(make(engine: .running(port: 1, profileID: "chat")), .running(modelID: nil))
+    XCTAssertEqual(make(engine: .running(EngineSessionSnapshot(port: 1, profileID: "chat"))), .running(modelID: nil))
   }
 
   // MARK: - engine failures route to banner errors
@@ -117,7 +117,7 @@ final class EngineIndicatorStateTests: XCTestCase {
     }
     // The single legitimate resident cell.
     XCTAssertEqual(
-      make(engine: .running(port: 1, profileID: "chat"), resident: resident),
+      make(engine: .running(EngineSessionSnapshot(port: 1, profileID: "chat")), resident: resident),
       .running(modelID: resident)
     )
   }

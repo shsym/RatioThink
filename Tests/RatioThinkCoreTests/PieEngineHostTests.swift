@@ -149,9 +149,9 @@ final class PieEngineHostTests: XCTestCase {
     })
     let exp = expectation(description: "host reaches .running")
     let token = host.observe { status, _ in
-      if case .running(let port, let profileID) = status {
-        XCTAssertEqual(port, 42424)
-        XCTAssertEqual(profileID, "chat")
+      if case .running(let snap) = status {
+        XCTAssertEqual(snap.port, 42424)
+        XCTAssertEqual(snap.profileID, "chat")
         exp.fulfill()
       }
     }
@@ -324,9 +324,9 @@ final class PieEngineHostTests: XCTestCase {
 
     let exp = expectation(description: "host reaches running from the single launch")
     let token = host.observe { status, _ in
-      if case .running(let port, let profileID) = status {
-        XCTAssertEqual(port, 1234)
-        XCTAssertEqual(profileID, "chat")
+      if case .running(let snap) = status {
+        XCTAssertEqual(snap.port, 1234)
+        XCTAssertEqual(snap.profileID, "chat")
         exp.fulfill()
       }
     }
@@ -622,11 +622,11 @@ final class PieEngineHostTests: XCTestCase {
     wait(for: [timeoutWouldHaveExpired], timeout: 2)
     token.cancel()
 
-    guard case .running(let port, let profileID) = host.status else {
+    guard case .running(let snap) = host.status else {
       return XCTFail("stale launch timeout must not change a running host; status=\(host.status)")
     }
-    XCTAssertEqual(port, 9012)
-    XCTAssertEqual(profileID, "tree-of-thought")
+    XCTAssertEqual(snap.port, 9012)
+    XCTAssertEqual(snap.profileID, "tree-of-thought")
     XCTAssertEqual(session.shutdownCount, 0,
                    "stale launch timeout must not shut down a running engine")
     host.stop()
@@ -720,8 +720,8 @@ final class PieEngineHostTests: XCTestCase {
 
     let running = expectation(description: "launch #2 owns running state")
     let runningToken = host.observe { status, token in
-      if case .running(let port, let profileID) = status,
-         port == 2002, profileID == "tree-of-thought" {
+      if case .running(let snap) = status,
+         snap.port == 2002, snap.profileID == "tree-of-thought" {
         running.fulfill()
         token.cancel()
       }
@@ -730,8 +730,11 @@ final class PieEngineHostTests: XCTestCase {
     wait(for: [running], timeout: 2)
     runningToken.cancel()
 
-    XCTAssertEqual(host.status, .running(port: 2002, profileID: "tree-of-thought"),
-                   file: file, line: line)
+    guard case .running(let liveSnap) = host.status else {
+      return XCTFail("launch #2 must own .running; got \(host.status)", file: file, line: line)
+    }
+    XCTAssertEqual(liveSnap.port, 2002, file: file, line: line)
+    XCTAssertEqual(liveSnap.profileID, "tree-of-thought", file: file, line: line)
     XCTAssertEqual(secondSession.shutdownCount, 0, file: file, line: line)
     host.stop()
   }

@@ -76,8 +76,8 @@ public final class CLIRunner: ScenarioRunner {
   }
 
   public func xpcStartEngineReplyRoundTrip(
-    _ result: Result<RatioThinkCore.EnginePort, EngineError>
-  ) async throws -> Result<RatioThinkCore.EnginePort, EngineError> {
+    _ result: Result<EngineSessionSnapshot, EngineError>
+  ) async throws -> Result<EngineSessionSnapshot, EngineError> {
     var captured: (Data?, Data?) = (nil, nil)
     PieHelperXPCWire.replyStartEngine(result) { captured = ($0, $1) }
     return try PieHelperXPCWire.decodeStartEngineReply(

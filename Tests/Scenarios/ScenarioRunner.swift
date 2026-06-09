@@ -44,8 +44,8 @@ public protocol ScenarioRunner {
   func xpcRoundTripDownloadHandle(_ handle: DownloadHandle) async throws -> DownloadHandle
   func xpcRoundTripEngineError(_ error: EngineError) async throws -> EngineError
   func xpcStartEngineReplyRoundTrip(
-    _ result: Result<RatioThinkCore.EnginePort, EngineError>
-  ) async throws -> Result<RatioThinkCore.EnginePort, EngineError>
+    _ result: Result<EngineSessionSnapshot, EngineError>
+  ) async throws -> Result<EngineSessionSnapshot, EngineError>
 }
 
 // Note: S4 (Helper menu bar) and S5 (App window shell) are GUI-only and

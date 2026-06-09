@@ -112,10 +112,21 @@ public enum HelperProtocolCompatibility {
   /// must be repaired by the `>= currentVersion` gate before the model-switch
   /// path runs; otherwise the call dies into `.replyTimeout`.
   ///
+  /// Version 5: `EngineStatus.running` and the `startEngine`/`restartEngine`
+  /// success reply now carry an `EngineSessionSnapshot` (#476) instead of a
+  /// bare `EnginePort` / `(port, profileID)`. The `@objc` selector SIGNATURES
+  /// are unchanged (same `(Data?, Data?)` reply), so a stale v4 helper still
+  /// answers — but with the OLD payload BYTES, which fail the App's snapshot
+  /// decode (`engineStatus` poll → transport-error → synthesized engineGone;
+  /// start/restart reply → `.wireContractViolation`). The `>= currentVersion`
+  /// repair gate must unregister+reregister the stale helper after an in-place
+  /// app upgrade so the snapshot wire is served before any start/poll runs.
+  ///
   /// BUMP THIS whenever a new REQUIRED selector is added to `PieHelperXPC`,
   /// or an in-place upgrade leaves a running old helper that passes the
-  /// reachability gate yet cannot service the new call.
-  public static let currentVersion = 4
+  /// reachability gate yet cannot service the new call (incl. a reply/status
+  /// BYTE-format change like #476).
+  public static let currentVersion = 5
 
   public static func isCompatible(client: any AppXPCClient) async -> Bool {
     do {

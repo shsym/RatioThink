@@ -72,7 +72,7 @@ final class ChatStartGateTests: XCTestCase {
   }
 
   func test_running_without_default_is_noDefault() {
-    XCTAssertEqual(eval(engine: .running(port: 8080, profileID: "chat"), profileDefault: nil),
+    XCTAssertEqual(eval(engine: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), profileDefault: nil),
                    .noDefault)
   }
 
@@ -80,7 +80,7 @@ final class ChatStartGateTests: XCTestCase {
 
   func test_running_idle_with_default_needs_default_load() {
     XCTAssertEqual(
-      eval(engine: .running(port: 8080, profileID: "chat"), profileDefault: model),
+      eval(engine: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), profileDefault: model),
       .needsDefaultLoad(modelID: model)
     )
   }
@@ -150,7 +150,7 @@ final class ChatStartGateTests: XCTestCase {
     // If a model still resolves, a stale profile-marker error must not
     // block the send.
     XCTAssertEqual(
-      eval(engine: .running(port: 8080, profileID: "chat"),
+      eval(engine: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
            resolved: "resident", profileDefault: model, profileError: "marker unreadable"),
       .ready(modelID: "resident")
     )

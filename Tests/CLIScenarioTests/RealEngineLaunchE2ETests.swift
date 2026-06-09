@@ -495,8 +495,8 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
       switch host.status {
-      case .running(let port, _):
-        return .running(port: Int(port), slug: slug)
+      case .running(let snap):
+        return .running(port: Int(snap.port), slug: slug)
       case .failed(let code, let message):
         return .failed(code: code.rawValue, message: message)
       default:
@@ -618,8 +618,8 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
       switch host.status {
-      case .running(let port, _):
-        return Int(port)
+      case .running(let snap):
+        return Int(snap.port)
       case .failed(let code, let message):
         XCTFail("engine entered .failed(\(code.rawValue)): \(message)")
         return 0

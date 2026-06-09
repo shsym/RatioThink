@@ -348,7 +348,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       return
     }
     let replied = OSAllocatedUnfairLock<Bool>(initialState: false)
-    func fireOnce(_ result: Result<EnginePort, EngineError>) {
+    func fireOnce(_ result: Result<EngineSessionSnapshot, EngineError>) {
       let already = replied.withLock { (fired: inout Bool) -> Bool in
         defer { fired = true }
         return fired
@@ -383,7 +383,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       return
     }
     let replied = OSAllocatedUnfairLock<Bool>(initialState: false)
-    func fireOnce(_ result: Result<EnginePort, EngineError>) {
+    func fireOnce(_ result: Result<EngineSessionSnapshot, EngineError>) {
       let already = replied.withLock { (fired: inout Bool) -> Bool in
         defer { fired = true }
         return fired
@@ -494,7 +494,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     engineHost: PieEngineHost,
     spec: PieControlLauncher.LaunchSpec,
     mode: StartMode = .attachIfSameProfile,
-    fireOnce complete: @escaping (Result<EnginePort, EngineError>) -> Void
+    fireOnce complete: @escaping (Result<EngineSessionSnapshot, EngineError>) -> Void
   ) {
     let startResult: Result<Void, EngineError>
     switch mode {
@@ -521,7 +521,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     /// avoid duplicate XPC replies; engine launch cleanup remains owned by
     /// `PieEngineHost`'s attempt-scoped launch timeout.
     @discardableResult
-    func finish(_ result: Result<EnginePort, EngineError>) -> Bool {
+    func finish(_ result: Result<EngineSessionSnapshot, EngineError>) -> Bool {
       let already = replied.withLock { (fired: inout Bool) -> Bool in
         defer { fired = true }
         return fired
@@ -578,10 +578,10 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   private static func startEngineTerminalResult(
     for status: EngineStatus,
     requestedProfileID: String
-  ) -> Result<EnginePort, EngineError>? {
+  ) -> Result<EngineSessionSnapshot, EngineError>? {
     switch status {
-    case .running(let port, let pid) where pid == requestedProfileID:
-      return .success(port)
+    case .running(let snapshot) where snapshot.profileID == requestedProfileID:
+      return .success(snapshot)
     case .running:
       return .failure(EngineError(code: .alreadyRunning,
                                   message: "engine host running a different profile"))

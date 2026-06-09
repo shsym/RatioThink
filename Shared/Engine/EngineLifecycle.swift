@@ -66,15 +66,30 @@ public final class EngineLifecycle: ObservableObject {
     }
     .store(in: &cancellables)
 
-    // The dropped stop edge: on any transition OUT of `.running`, invalidate
-    // app-side residency so no surface outlives the freed model's RAM. Keyed
-    // off `status` ALONE so it fires once per edge — not on load churn, and
-    // not re-firing while the engine stays stopped. `engineLeftRunning()` is
-    // idempotent, so even a redundant call is safe.
+    // The session edges, keyed off `status` ALONE so they fire once per
+    // transition — not on load churn. `$status` is `@Published` + `Equatable`
+    // (the snapshot is the whole `.running` payload), so it re-emits only when
+    // the snapshot actually changes.
     engineStatus.$status
       .sink { [weak self] status in
         guard let self else { return }
         let nowRunning = Self.isRunning(status)
+        // Enter `.running` (or a snapshot change while running — a model-switch
+        // restart): feed the authoritative `EngineSessionSnapshot` (#476) into
+        // `ModelLoadCenter` the instant it lands, so the served model + effective
+        // `max_tokens` ceiling are available to the send path BEFORE the first
+        // send — no `/v1/models` round-trip race. The `/v1/models` reconcile in
+        // `ChatScaffoldView` remains the engine-authoritative cross-check.
+        // Setters are change-guarded. A legacy/pin snapshot carries an empty
+        // `servedModelID` (no model resolution happened on that path) — skip it
+        // so it never clobbers real residency.
+        if case .running(let snapshot) = status, !snapshot.servedModelID.isEmpty {
+          self.modelLoad.reconcileEngineResident(snapshot.servedModelID)
+          self.modelLoad.setResidentMaxOutputTokens(snapshot.maxOutputTokens)
+        }
+        // The dropped stop edge: on any transition OUT of `.running`, invalidate
+        // app-side residency so no surface outlives the freed model's RAM.
+        // `engineLeftRunning()` is idempotent, so a redundant call is safe.
         if self.wasRunning, !nowRunning {
           self.modelLoad.engineLeftRunning()
         }

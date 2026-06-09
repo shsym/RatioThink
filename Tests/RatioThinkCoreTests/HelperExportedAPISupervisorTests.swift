@@ -115,12 +115,12 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
       exp.fulfill()
     }
     wait(for: [exp], timeout: 1)
-    guard case let .running(port, profileID) = captured else {
+    guard case let .running(snap) = captured else {
       host.stop()
       return XCTFail("expected .running, got \(String(describing: captured))")
     }
-    XCTAssertEqual(port, 42424)
-    XCTAssertEqual(profileID, "chat")
+    XCTAssertEqual(snap.port, 42424)
+    XCTAssertEqual(snap.profileID, "chat")
     host.stop()
   }
 
@@ -131,7 +131,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     let api = HelperExportedAPI(engineHost: host, launchSpecResolver: nil)
 
     let exp = expectation(description: "startEngine reply")
-    var captured: Result<EnginePort, EngineError>?
+    var captured: Result<EngineSessionSnapshot, EngineError>?
     api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
@@ -151,7 +151,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     let api = HelperExportedAPI(engineHost: host, launchSpecResolver: { _, _ in .success(spec) })
 
     let exp = expectation(description: "startEngine reply")
-    var captured: Result<EnginePort, EngineError>?
+    var captured: Result<EngineSessionSnapshot, EngineError>?
     api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
@@ -159,11 +159,11 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
       exp.fulfill()
     }
     wait(for: [exp], timeout: 5)
-    guard case .success(let port)? = captured else {
+    guard case .success(let snap)? = captured else {
       host.stop()
       return XCTFail("expected .success, got \(String(describing: captured))")
     }
-    XCTAssertEqual(port, 31415)
+    XCTAssertEqual(snap.port, 31415)
     host.stop()
   }
 
@@ -178,7 +178,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     )
 
     let exp = expectation(description: "startEngine success reply before fallback")
-    var captured: Result<EnginePort, EngineError>?
+    var captured: Result<EngineSessionSnapshot, EngineError>?
     api.startEngine(profileID: "tree-of-thought", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
@@ -186,21 +186,21 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
       exp.fulfill()
     }
     wait(for: [exp], timeout: 2)
-    guard case .success(let port)? = captured else {
+    guard case .success(let snap)? = captured else {
       host.stop()
       return XCTFail("expected .success before fallback; got \(String(describing: captured))")
     }
-    XCTAssertEqual(port, 31416)
+    XCTAssertEqual(snap.port, 31416)
 
     let fallbackExpired = expectation(description: "fallback deadline passed")
     DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { fallbackExpired.fulfill() }
     wait(for: [fallbackExpired], timeout: 2)
 
-    guard case .running(let livePort, let liveProfile) = host.status else {
+    guard case .running(let liveSnap) = host.status else {
       return XCTFail("reply-timeout fallback stopped an already-acknowledged engine; status=\(host.status)")
     }
-    XCTAssertEqual(livePort, 31416)
-    XCTAssertEqual(liveProfile, "tree-of-thought")
+    XCTAssertEqual(liveSnap.port, 31416)
+    XCTAssertEqual(liveSnap.profileID, "tree-of-thought")
     XCTAssertEqual(session?.shutdownCount, 0,
                    "fallback must not shutdown a running engine after startEngine already replied success")
     host.stop()
@@ -218,8 +218,8 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
 
     let first = expectation(description: "first startEngine reply")
     let second = expectation(description: "second startEngine reply")
-    var firstResult: Result<EnginePort, EngineError>?
-    var secondResult: Result<EnginePort, EngineError>?
+    var firstResult: Result<EngineSessionSnapshot, EngineError>?
+    var secondResult: Result<EngineSessionSnapshot, EngineError>?
     api.startEngine(profileID: "tree-of-thought", modelOverride: nil) { successData, errorData in
       firstResult = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
@@ -234,16 +234,16 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     }
     wait(for: [first, second], timeout: 3)
 
-    guard case .success(let firstPort)? = firstResult else {
+    guard case .success(let firstSnap)? = firstResult else {
       host.stop()
       return XCTFail("first startEngine should attach to launch and succeed; got \(String(describing: firstResult))")
     }
-    guard case .success(let secondPort)? = secondResult else {
+    guard case .success(let secondSnap)? = secondResult else {
       host.stop()
       return XCTFail("second startEngine should attach to same launch and succeed; got \(String(describing: secondResult))")
     }
-    XCTAssertEqual(firstPort, 41414)
-    XCTAssertEqual(secondPort, 41414)
+    XCTAssertEqual(firstSnap.port, 41414)
+    XCTAssertEqual(secondSnap.port, 41414)
     XCTAssertEqual(launchCount.withLock { $0 }, 1,
                    "repeated startEngine(same profile) while starting must not spawn a second engine")
     host.stop()
@@ -262,7 +262,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     )
 
     let exp = expectation(description: "startEngine XPC fallback reply")
-    var captured: Result<EnginePort, EngineError>?
+    var captured: Result<EngineSessionSnapshot, EngineError>?
     api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
@@ -295,7 +295,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     let api = HelperExportedAPI(engineHost: host, launchSpecResolver: { _, _ in .success(spec) })
 
     let exp = expectation(description: "startEngine reply")
-    var captured: Result<EnginePort, EngineError>?
+    var captured: Result<EngineSessionSnapshot, EngineError>?
     api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
@@ -327,7 +327,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     )
 
     let exp = expectation(description: "startEngine memory-risk reply")
-    var captured: Result<EnginePort, EngineError>?
+    var captured: Result<EngineSessionSnapshot, EngineError>?
     api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
@@ -409,7 +409,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     waitForRunning(host, timeout: 2)
 
     let restartExp = expectation(description: "restart reply after replacement start")
-    var captured: Result<EnginePort, EngineError>?
+    var captured: Result<EngineSessionSnapshot, EngineError>?
     api.restartEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
@@ -425,11 +425,11 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
                    "restart must not launch replacement until the helper host has published terminal stop")
 
     wait(for: [restartExp], timeout: 3)
-    guard case .success(let port)? = captured else {
+    guard case .success(let snap)? = captured else {
       host.stop()
       return XCTFail("expected restart success, got \(String(describing: captured))")
     }
-    XCTAssertEqual(port, 22222)
+    XCTAssertEqual(snap.port, 22222)
     XCTAssertEqual(launchCount.withLock { $0 }, 2)
     host.stop()
   }
@@ -476,7 +476,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     )
     let baseline = host.observerCountForTesting
     let exp = expectation(description: "startEngine reply (deterministic fallback)")
-    var captured: Result<EnginePort, EngineError>?
+    var captured: Result<EngineSessionSnapshot, EngineError>?
     api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
@@ -514,7 +514,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
       replyTimeoutOverride: (start: 5, stop: 0.3)
     )
     let replyExp = expectation(description: "startEngine reply (host launch timeout)")
-    var captured: Result<EnginePort, EngineError>?
+    var captured: Result<EngineSessionSnapshot, EngineError>?
     api.startEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
       captured = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData

@@ -45,7 +45,7 @@ final class SamplingAndIndicatorSnapshotTests: XCTestCase {
 
   func test_render_running_pip_in_toolbar_row() throws {
     // Running stays quiet — a bare dot, no inline copy (scope 3).
-    try render(toolbarRow(indicator(.running(port: 8123, profileID: "chat"))), name: "pip-running")
+    try render(toolbarRow(indicator(.running(EngineSessionSnapshot(port: 8123, profileID: "chat")))), name: "pip-running")
   }
 
   // MARK: - builders

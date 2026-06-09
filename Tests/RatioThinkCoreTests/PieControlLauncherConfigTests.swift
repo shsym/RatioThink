@@ -42,6 +42,24 @@ final class PieControlLauncherConfigTests: XCTestCase {
                   "model name must remain \"default\" — chat-apc resolves against this name")
   }
 
+  func test_servedModelID_mirrors_model_name_per_config() {
+    // #476: the snapshot's servedModelID must equal the engine's advertised
+    // `[[model]].name` — the chat-completion `model` field the App sends.
+    XCTAssertEqual(PieControlLauncher.ModelConfig.dummy.servedModelID, "default")
+    XCTAssertEqual(
+      PieControlLauncher.ModelConfig.portable(
+        modelSlug: "org/repo/file.gguf",
+        modelsRoot: URL(fileURLWithPath: "/tmp/models", isDirectory: true)).servedModelID,
+      "org/repo/file.gguf")
+    XCTAssertEqual(
+      PieControlLauncher.ModelConfig.portableResolved(
+        servedModelID: "org/repo/file.gguf", modelRef: "/tmp/models/org/repo/file.gguf").servedModelID,
+      "org/repo/file.gguf")
+    XCTAssertEqual(
+      PieControlLauncher.ModelConfig.metal(modelID: "Qwen/Qwen3-0.6B").servedModelID,
+      "Qwen/Qwen3-0.6B")
+  }
+
   func test_portable_body_emits_portable_driver_with_resolved_hf_repo_path() {
     let modelsRoot = URL(fileURLWithPath: "/tmp/pie/models")
     let body = PieControlLauncher.renderConfigBody(

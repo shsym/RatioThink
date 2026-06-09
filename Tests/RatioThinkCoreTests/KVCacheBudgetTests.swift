@@ -76,4 +76,51 @@ final class KVCacheBudgetTests: XCTestCase {
     XCTAssertNil(c)
     XCTAssertGreaterThan(expected, KVCacheBudget.defaultPoolCapacityTokens)
   }
+
+  // MARK: - effectiveOutputCeiling (#476 OBSERVE path)
+
+  func test_effectiveCeiling_both_nil_is_default_pool() {
+    // Production case: launcher overrides neither knob → kvCap = 1024*32 = 32768
+    // and there is no scheduler cap → effective = 32768.
+    XCTAssertEqual(
+      KVCacheBudget.effectiveOutputCeiling(defaultTokenLimit: nil, maxNumKvPages: nil),
+      32_768)
+  }
+
+  func test_effectiveCeiling_matches_pie_unit_test() {
+    // pie's own model.rs test: output_token_ceiling_for_model(Some(4096), 1024) == 1024.
+    // kvCap = 32 pages * 32 = 1024; default_token_limit 4096 is clamped DOWN to kvCap.
+    XCTAssertEqual(
+      KVCacheBudget.effectiveOutputCeiling(defaultTokenLimit: 4096, maxNumKvPages: 32),
+      1024)
+  }
+
+  func test_effectiveCeiling_scheduler_cap_binds_when_below_kvCap() {
+    // default pool (32768), scheduler cap 8000 → min = 8000.
+    XCTAssertEqual(
+      KVCacheBudget.effectiveOutputCeiling(defaultTokenLimit: 8000, maxNumKvPages: nil),
+      8000)
+  }
+
+  func test_effectiveCeiling_kvCap_binds_when_pages_override_lowers_it() {
+    // maxNumKvPages 256 → kvCap = 256*32 = 8192; no scheduler cap → effective = 8192.
+    XCTAssertEqual(
+      KVCacheBudget.effectiveOutputCeiling(defaultTokenLimit: nil, maxNumKvPages: 256),
+      8192)
+  }
+
+  func test_effectiveCeiling_no_512_floor_on_observe_path() {
+    // The 512 floor is EMIT-path only; the observe path mirrors pie's runtime
+    // which applies no floor. 8 pages * 32 = 256 → effective = 256, not 512.
+    XCTAssertEqual(
+      KVCacheBudget.effectiveOutputCeiling(defaultTokenLimit: nil, maxNumKvPages: 8),
+      256)
+  }
+
+  func test_effectiveCeiling_scheduler_cap_above_pool_is_clamped_to_pool() {
+    // A scheduler cap above the pool can never raise the ceiling above kvCap.
+    XCTAssertEqual(
+      KVCacheBudget.effectiveOutputCeiling(defaultTokenLimit: 40_000, maxNumKvPages: nil),
+      32_768)
+  }
 }

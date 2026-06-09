@@ -112,19 +112,40 @@ public final class PieEngineHost: @unchecked Sendable {
   private enum State {
     case stopped
     case starting(profileID: String, launchID: UInt64, launchTask: Task<Void, Never>)
-    case running(port: EnginePort, profileID: String, launchID: UInt64, session: any EngineSession)
+    case running(snapshot: EngineSessionSnapshot, session: any EngineSession)
     case stopping(session: (any EngineSession)?, launchID: UInt64?)
     case failed(EngineErrorCode, String)
 
     var publicStatus: EngineStatus {
       switch self {
-      case .stopped:                                return .stopped
-      case .starting:                               return .starting
-      case .running(let port, let profileID, _, _): return .running(port: port, profileID: profileID)
-      case .stopping:                               return .stopping
-      case .failed(let code, let message):          return .failed(code: code, message: message)
+      case .stopped:                       return .stopped
+      case .starting:                      return .starting
+      case .running(let snapshot, _):      return .running(snapshot)
+      case .stopping:                      return .stopping
+      case .failed(let code, let message): return .failed(code: code, message: message)
       }
     }
+  }
+
+  /// Build the authoritative `EngineSessionSnapshot` (#476) for a session that
+  /// just reached `.running`, from the actual `LaunchSpec` the host launched
+  /// plus the OS-assigned port and the launch generation. `servedModelID` is
+  /// the engine's advertised `/v1/models` id; `maxOutputTokens` is the
+  /// effective per-request ceiling pie enforces, derived from the two KV knobs
+  /// the helper owns (see `KVCacheBudget.effectiveOutputCeiling`) — so the App
+  /// gets the served model + ceiling atomically on the `.running` edge with no
+  /// `/v1/models` round-trip.
+  private static func sessionSnapshot(port: EnginePort,
+                                      launchID: UInt64,
+                                      spec: LaunchSpec) -> EngineSessionSnapshot {
+    EngineSessionSnapshot(
+      generation: launchID,
+      port: port,
+      profileID: spec.profileID,
+      servedModelID: spec.modelConfig.servedModelID,
+      maxOutputTokens: KVCacheBudget.effectiveOutputCeiling(
+        defaultTokenLimit: spec.defaultTokenLimit,
+        maxNumKvPages: spec.maxNumKvPages))
   }
 
   // MARK: - Launcher seam
@@ -358,7 +379,7 @@ public final class PieEngineHost: @unchecked Sendable {
   /// open), never per frame.
   public func residentMemoryBytes() async -> UInt64? {
     let session: (any EngineSession)? = stateQueue.sync {
-      if case let .running(_, _, _, session) = _state { return session }
+      if case let .running(_, session) = _state { return session }
       return nil
     }
     guard let session else { return nil }
@@ -430,7 +451,7 @@ public final class PieEngineHost: @unchecked Sendable {
           ("action", "attach_existing"),
         ])
         return .success(())
-      case .running(_, let profileID, _, _) where profileID == spec.profileID:
+      case .running(let snapshot, _) where snapshot.profileID == spec.profileID:
         DiagnosticLog.helper.event("engine.start.request", [
           ("profile", spec.profileID),
           ("state", "running"),
@@ -705,7 +726,9 @@ public final class PieEngineHost: @unchecked Sendable {
           where currentProfileID == spec.profileID && currentLaunchID == launchID:
           self.launchTimeoutTask?.cancel()
           self.launchTimeoutTask = nil
-          self.setState(.running(port: port, profileID: spec.profileID, launchID: launchID, session: session))
+          self.setState(.running(
+            snapshot: Self.sessionSnapshot(port: port, launchID: launchID, spec: spec),
+            session: session))
           self.startLivenessMonitor(session: session)
           self.armHealthyUptimeTimer()
         case .stopping(_, let stoppingLaunchID) where stoppingLaunchID == launchID:
@@ -950,7 +973,8 @@ public final class PieEngineHost: @unchecked Sendable {
       healthyUptimeTask = nil
       recordStop()
       setState(.stopping(session: nil, launchID: launchID))
-    case .running(_, _, let launchID, let session):
+    case .running(let snapshot, let session):
+      let launchID = snapshot.generation
       Log.engine.info("PieEngineHost: stop() shutting running session down (pid path)")
       recordStop()
       DiagnosticLog.helper.event("engine.shutdown.request", [

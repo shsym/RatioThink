@@ -10,7 +10,7 @@ final class LocalAPIStateTests: XCTestCase {
   // MARK: - phase mapping
 
   func test_running_isServing_with_live_port() {
-    let s = LocalAPIState.make(status: .running(port: 8123, profileID: "chat"),
+    let s = LocalAPIState.make(status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat")),
                                hasActiveProfile: true)
     XCTAssertTrue(s.isServing)
     XCTAssertEqual(s.port, 8123)
