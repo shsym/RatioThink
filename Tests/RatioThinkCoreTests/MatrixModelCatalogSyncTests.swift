@@ -16,6 +16,7 @@ final class MatrixModelCatalogSyncTests: XCTestCase {
     let file: String
     let minBytes: Int64
     let thinking: Bool
+    let semantic: Bool
   }
 
   func test_matrixWrapperModelsMatchCuratedCatalog() throws {
@@ -30,7 +31,12 @@ final class MatrixModelCatalogSyncTests: XCTestCase {
           // Thinking models are the Qwen3 family (they emit `<think>`
           // scratchpads). The catalog has no explicit flag, so derive it
           // the same way the wrapper's `thinking=1` rows must: a Qwen3 repo.
-          thinking: m.huggingFaceRepo.contains("Qwen3"))
+          thinking: m.huggingFaceRepo.contains("Qwen3"),
+          // The weak semantic floor (#484) is capability-gated to the larger
+          // tier; the small 0.5–1B models stay contract-level. Derive it from
+          // the catalog param count the same way the wrapper's `semantic=1`
+          // rows must: anything above the 1B small tier.
+          semantic: m.parameterCountBillions > 1.0)
     }
 
     // Order-independent: compare as sets keyed by slug so a reordering of
@@ -50,7 +56,7 @@ final class MatrixModelCatalogSyncTests: XCTestCase {
     for slug in catalogSlugs.intersection(wrapperSlugs).sorted() {
       XCTAssertEqual(wrapperBySlug[slug], catalogBySlug[slug],
                      "matrix wrapper row for \(slug) does not match the catalog "
-                     + "(check minBytes = approximateSizeBytes and the thinking flag)")
+                     + "(check minBytes = approximateSizeBytes, the thinking flag, and the semantic flag)")
     }
 
     // Full matrix must be all 10 curated entries (operator-confirmed scope).
@@ -89,12 +95,14 @@ final class MatrixModelCatalogSyncTests: XCTestCase {
       guard line.hasPrefix("\"") else { continue }
       let body = line.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
       let parts = body.components(separatedBy: "|")
-      guard parts.count == 4, let minBytes = Int64(parts[2]),
-            parts[3] == "0" || parts[3] == "1" else {
+      guard parts.count == 5, let minBytes = Int64(parts[2]),
+            parts[3] == "0" || parts[3] == "1",
+            parts[4] == "0" || parts[4] == "1" else {
         XCTFail("malformed MATRIX_MODELS row: \(raw)")
         continue
       }
-      rows.append(Row(repo: parts[0], file: parts[1], minBytes: minBytes, thinking: parts[3] == "1"))
+      rows.append(Row(repo: parts[0], file: parts[1], minBytes: minBytes,
+                      thinking: parts[3] == "1", semantic: parts[4] == "1"))
     }
     XCTAssertFalse(rows.isEmpty, "parsed zero MATRIX_MODELS rows — parser or block drifted")
     return rows

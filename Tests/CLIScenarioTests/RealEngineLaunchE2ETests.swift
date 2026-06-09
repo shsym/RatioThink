@@ -135,6 +135,11 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
       .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
       .filter { !$0.isEmpty }
     let expectReasoning = ProcessInfo.processInfo.environment["PIE_TEST_REAL_EXPECT_REASONING"] == "1"
+    // Capability gate for the weak semantic floor (#484). The wrapper sets
+    // this only for the larger tier (params > 1B); the small 0.5–1B models
+    // stay contract-level so a missed `pong` echo — a capability limit, not
+    // an engine-compat failure — does not false-FAIL the matrix.
+    let expectSemantic = ProcessInfo.processInfo.environment["PIE_TEST_REAL_EXPECT_SEMANTIC"] == "1"
 
     let host = PieEngineHost()
     defer { host.stop() }
@@ -156,7 +161,9 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
       do {
         switch profile {
         case "chat":
-          try await assertChatCell(port: port, modelID: slug, expectReasoning: expectReasoning)
+          try await assertChatCell(port: port, modelID: slug,
+                                   expectReasoning: expectReasoning,
+                                   expectSemantic: expectSemantic)
         case "tree-of-thought":
           try await assertTreeOfThoughtCell(port: port, modelID: slug)
         case "fast-think":
@@ -328,7 +335,8 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
   /// scratchpad rides `reasoning_content` (#329); a thinking model that
   /// caps mid-reasoning legitimately yields empty `content`, so "produced
   /// output" is satisfied by either channel.
-  private func assertChatCell(port: Int, modelID: String, expectReasoning: Bool) async throws {
+  private func assertChatCell(port: Int, modelID: String,
+                              expectReasoning: Bool, expectSemantic: Bool) async throws {
     let json = try await postChatJSON(port: port, body: [
       "model": modelID,
       "messages": [["role": "user", "content": "Reply with the single word: pong"]],
@@ -350,6 +358,75 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
       try cellRequire(!reasoning.isEmpty,
                       "chat: thinking model must surface reasoning_content")
     }
+
+    // The answer channel: the visible content, or the reasoning scratchpad
+    // when a thinking model caps before emitting any content.
+    let answer = content.isEmpty ? reasoning : content
+
+    // Degenerate-output guard (#484): all-whitespace or pure-repetition
+    // output is template/tokenizer corruption — a model that loads but emits
+    // coherent-SHAPED garbage. Reject it across EVERY model (no capability
+    // gate) without grading quality.
+    try cellRequire(!Self.isDegenerateOutput(answer),
+                    "chat: degenerate output (all-whitespace or pure repetition): \(answer.prefix(120).debugDescription)")
+
+    // Weak semantic floor (#484): on the trivial 'pong' prompt a capable
+    // model must echo the word somewhere in its reply. Capability-gated to
+    // the larger tier (`expectSemantic`); checking either channel keeps a
+    // thinking model that answers inside its scratchpad from false-FAILing
+    // while a broken-template/tokenizer model — which never produces 'pong'
+    // anywhere — still trips it.
+    if expectSemantic {
+      let haystack = (content + " " + reasoning).lowercased()
+      try cellRequire(haystack.contains("pong"),
+                      "chat: semantic floor — reply did not contain 'pong' (content=\(content.prefix(120).debugDescription))")
+    }
+  }
+
+  /// Detect template/tokenizer corruption that still yields a well-FORMED
+  /// response: output that is all-whitespace, a single character repeated, or
+  /// the same word repeated. Deliberately conservative — it flags only
+  /// egregious degeneracy so a legitimate short answer (incl. the bare
+  /// `pong`) never trips it. This is a compatibility tripwire, NOT a quality
+  /// grader (#484).
+  static func isDegenerateOutput(_ text: String) -> Bool {
+    let collapsed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if collapsed.isEmpty { return true } // all-whitespace
+
+    // A single non-whitespace character repeated (e.g. "GGGGGGGG", "的的的的的的的的").
+    let nonWhitespace = collapsed.unicodeScalars.filter {
+      !CharacterSet.whitespacesAndNewlines.contains($0)
+    }
+    if nonWhitespace.count >= 8 && Set(nonWhitespace).count == 1 { return true }
+
+    // The same word repeated (e.g. "pong pong pong pong pong pong").
+    let words = collapsed.split(whereSeparator: { $0.isWhitespace }).map { $0.lowercased() }
+    if words.count >= 6 && Set(words).count == 1 { return true }
+
+    return false
+  }
+
+  /// Engine-free guard for the #484 degenerate-output classifier. Runs in the
+  /// deterministic scenario tier (no `realEngineEnvOrSkip`), so the matrix's
+  /// new tripwire logic is verified without a real engine: corruption shapes
+  /// must trip it, legitimate short answers (incl. a bare `pong`) must not.
+  func test_isDegenerateOutput_classifier() {
+    // Degenerate — must be rejected.
+    XCTAssertTrue(Self.isDegenerateOutput(""))
+    XCTAssertTrue(Self.isDegenerateOutput("   \n\t  "))
+    XCTAssertTrue(Self.isDegenerateOutput("GGGGGGGG"))          // single char ×8
+    XCTAssertTrue(Self.isDegenerateOutput("!!!!!!!!!!"))
+    XCTAssertTrue(Self.isDegenerateOutput("的的的的的的的的"))      // non-ASCII single char
+    XCTAssertTrue(Self.isDegenerateOutput("pong pong pong pong pong pong"))
+    XCTAssertTrue(Self.isDegenerateOutput("the the the the the the the"))
+
+    // Legitimate — must pass.
+    XCTAssertFalse(Self.isDegenerateOutput("pong"))
+    XCTAssertFalse(Self.isDegenerateOutput("Pong!"))
+    XCTAssertFalse(Self.isDegenerateOutput("The answer is pong."))
+    XCTAssertFalse(Self.isDegenerateOutput("GGG"))              // short repeat (<8) is not flagged
+    XCTAssertFalse(Self.isDegenerateOutput("pong pong"))        // <6 words is not flagged
+    XCTAssertFalse(Self.isDegenerateOutput("ping pong ping pong ping pong"))
   }
 
   /// tree-of-thought cell: dispatch the real `/v1/inferlet` ToT search
