@@ -256,18 +256,6 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
 
   // MARK: - engineMemory
 
-  /// Pre-encoded `Optional<EngineMemorySample>.none` reply — the "no
-  /// host / not running / encode failure" payload. Encoded at type init
-  /// so the catch path is provably dead, matching the other pre-encoded
-  /// blobs above.
-  private static let emptyMemoryData: Data = {
-    do {
-      return try XPCPayload.encode(Optional<EngineMemorySample>.none)
-    } catch {
-      preconditionFailure("HelperExportedAPI: failed to pre-encode nil EngineMemorySample: \(error)")
-    }
-  }()
-
   /// Samples the running engine's resident memory (parent pie process)
   /// and replies `XPCPayload.encode(EngineMemorySample?)`. No host
   /// wired, engine not running, or a sample failure ⇒ nil. Async
@@ -278,7 +266,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// syscall regardless).
   public func engineMemory(reply: @escaping (Data) -> Void) {
     guard let engineHost else {
-      reply(Self.emptyMemoryData)
+      reply(PieHelperXPCWire.emptyMemoryData)
       return
     }
     Task {
@@ -291,7 +279,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
         reply(try XPCPayload.encode(sample))
       } catch {
         Self.log.fault("engineMemory encode failed: \(String(describing: error), privacy: .public)")
-        reply(Self.emptyMemoryData)
+        reply(PieHelperXPCWire.emptyMemoryData)
       }
     }
   }
@@ -952,10 +940,11 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   }
 
   public func engineMemory(reply: @escaping (Data) -> Void) {
-    // No engine runs in degraded mode → RSS unavailable. `nil` cannot
-    // realistically fail to encode; the literal "null" fallback decodes
-    // to the same nil EngineMemorySample?.
-    reply((try? XPCPayload.encode(Optional<EngineMemorySample>.none)) ?? Data("null".utf8))
+    // No engine runs in degraded mode → RSS unavailable. Reuse the shared
+    // precondition-guarded nil-memory blob so this path carries the same
+    // "encode can't silently fail" guarantee as every other pre-encoded
+    // reply and can never desync from the live wire format.
+    reply(PieHelperXPCWire.emptyMemoryData)
   }
 
   public func startEngine(profileID: String,

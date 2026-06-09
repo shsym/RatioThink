@@ -147,4 +147,25 @@ final class DegradedHelperAPITests: XCTestCase {
     }
     wait(for: [expectation], timeout: 1.0)
   }
+
+  // MARK: - engineMemory replies the shared pre-encoded nil blob (#348)
+
+  /// The degraded path must reply bytes byte-equal to the shared
+  /// `PieHelperXPCWire.emptyMemoryData` blob — not a hand-written "null"
+  /// literal coupled to the JSON wire format. A decode-to-nil assertion can't
+  /// catch a wire-format desync (a real encode and the literal both decode to
+  /// nil today); byte-equality can, and ties the degraded reply to the single
+  /// precondition-guarded source of truth.
+  func test_degraded_engineMemory_is_shared_empty_blob() {
+    let api = makeAPI()
+    let expectation = XCTestExpectation(description: "engineMemory reply")
+    var captured: Data?
+    api.engineMemory { data in
+      captured = data
+      expectation.fulfill()
+    }
+    wait(for: [expectation], timeout: 1.0)
+    XCTAssertEqual(captured, PieHelperXPCWire.emptyMemoryData,
+                   "degraded engineMemory must reply the shared pre-encoded nil blob, byte-for-byte")
+  }
 }

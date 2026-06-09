@@ -212,6 +212,23 @@ public enum PieHelperXPCWire {
     #"{"code":"wireContractViolation","message":"reply payload encode failed; see helper log"}"#.utf8
   )
 
+  /// Pre-encoded `Optional<EngineMemorySample>.none` reply — the canonical
+  /// "no host / engine not running / sample unavailable / encode failure"
+  /// memory payload, shared by `HelperExportedAPI.engineMemory` (its
+  /// encode-failure fallback) and `DegradedHelperAPI.engineMemory` (no engine
+  /// runs in degraded mode). Encoded once at type init: a `preconditionFailure`
+  /// catches any encode drift, so neither path can silently emit a wire-format-
+  /// coupled literal that would decode as corruption on the App side.
+  public static let emptyMemoryData: Data = {
+    do {
+      return try XPCPayload.encode(Optional<EngineMemorySample>.none)
+    } catch {
+      preconditionFailure(
+        "PieHelperXPCWire: failed to pre-encode nil EngineMemorySample: \(error)"
+      )
+    }
+  }()
+
   /// Existential-erased adapter for `XPCPayload.encode`. The reply-
   /// block helpers consume `(any Encodable) throws -> Data` so tests
   /// can inject a throwing encoder via the `_reply*` seams (review v3
