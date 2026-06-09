@@ -324,6 +324,28 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
                    "the chosen model still loads even when the default-persist failed")
   }
 
+  func test_confirm_override_set_as_default_with_failed_commit_skips_default_write_and_load() async throws {
+    // #487: the chat-pin commit is the single gate. A model override with
+    // "Set as default" checked but a FAILING pin commit must persist NO
+    // profile default and fire NO load — otherwise the profile's default
+    // durably changes to a model the chat never adopted (pin rolled back),
+    // a divergent default surfaced only by the pin-failure toast.
+    let (coord, center, spy) = makeCoordinator(map: [:], resident: "m1")
+    coord.requestModelOverride(modelID: "m2", activeProfileID: "chat", fromModel: "m1") { _ in false }
+    confirmCurrent(coord, setAsDefault: true)
+
+    XCTAssertTrue(spy.writes.isEmpty,
+                  "a failed pin commit must gate the set-as-default profile write (#487)")
+    XCTAssertNil(coord.defaultModelWriteError,
+                 "no write was attempted, so no write-failure error should surface")
+    // Give any (erroneously) started load a chance to surface, then assert the
+    // resident model never changed — the `serveModel` reconciler would move it
+    // to "m2" had a load fired.
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    XCTAssertEqual(center.residentModelID, "m1",
+                   "a failed commit must not start a load — prior resident untouched (#487)")
+  }
+
   func test_set_as_default_error_clears_when_user_moves_on() {
     let (coord, _, _) = makeCoordinator(map: [:], resident: "m1",
                                         setDefaultModelError: StubWriteError())

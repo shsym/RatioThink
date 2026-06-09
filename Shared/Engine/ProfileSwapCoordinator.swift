@@ -379,28 +379,35 @@ public final class ProfileSwapCoordinator: ObservableObject {
       Self.log.notice("confirm token=\(token, privacy: .public) mismatch (current=\(p.token, privacy: .public)) — stale callback dropped")
       return
     }
-    if setAsDefault, let profileID = p.setAsDefaultProfileID {
+    let toModel = p.toModelID
+    let toProfile = p.toProfileID
+    let commit = p.commit
+    // Capture the set-as-default target BEFORE clearing the pending; the
+    // persist itself is deferred past the commit gate below so the chat-pin
+    // commit is the single authority on whether the swap took effect.
+    let setDefaultProfileID = setAsDefault ? p.setAsDefaultProfileID : nil
+    pendingState = nil
+    // Review F2 (#460): only proceed once the caller durably applied the swap.
+    // A failed model-pin save returns false → skip BOTH the set-as-default
+    // profile-default write and the load. Otherwise (#487) a failed pin would
+    // still durably change the profile's default to a model the chat did not
+    // adopt and fire no load — a divergent default surfaced only by the
+    // pin-failure toast. The chat-pin commit gates everything that follows.
+    guard commit() else { return }
+    // Pin committed — now persist the optional "Set as default" choice.
+    if let profileID = setDefaultProfileID {
       do {
-        try setDefaultModel(profileID, p.toModelID)
+        try setDefaultModel(profileID, toModel)
         defaultModelWriteError = nil
       } catch {
         // The model still loads below; only the persist failed. Surface
         // it (review F2) — never silent.
-        defaultModelWriteError = "Could not set \(p.toModelID) as the default for \(profileID): \(error)"
-        Self.log.error("setDefaultModel failed profile=\(profileID, privacy: .public) model=\(p.toModelID, privacy: .public): \(String(describing: error), privacy: .public)")
+        defaultModelWriteError = "Could not set \(toModel) as the default for \(profileID): \(error)"
+        Self.log.error("setDefaultModel failed profile=\(profileID, privacy: .public) model=\(toModel, privacy: .public): \(String(describing: error), privacy: .public)")
       }
     } else {
       defaultModelWriteError = nil
     }
-    let toModel = p.toModelID
-    let toProfile = p.toProfileID
-    let commit = p.commit
-    pendingState = nil
-    // Review F2 (#460): only load once the caller durably applied the swap. A
-    // failed model-pin save returns false → skip the load so the engine is
-    // not driven to a model the chat did not actually adopt (which would
-    // leave the toolbar label and the served model disagreeing).
-    guard commit() else { return }
     // #469: route the confirmed pick through the engine (re)launch on the
     // pending's profile — start a stopped engine bound to the pick, or
     // rebuild a running engine onto it — instead of a `/v1/models/load` that
