@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import MarkdownUI
 import os
@@ -32,6 +33,7 @@ struct MessageBubble: View {
                foreground: .white,
                alignment: .trailing)
       }
+      .contextMenu { copyMenuItems }
     case .assistant:
       HStack {
         VStack(alignment: .leading, spacing: 6) {
@@ -65,6 +67,7 @@ struct MessageBubble: View {
         }
         Spacer(minLength: 60)
       }
+      .contextMenu { copyMenuItems }
     case .system:
       HStack {
         Spacer()
@@ -72,6 +75,22 @@ struct MessageBubble: View {
           .font(.caption)
           .foregroundStyle(.secondary)
         Spacer()
+      }
+      .contextMenu { copyMenuItems }
+    }
+  }
+
+  /// Deterministic copy path (#515): MarkdownUI splits one message into
+  /// many selectable `Text` blocks, so mouse selection cannot span a whole
+  /// rendered message. The context menu copies the canonical backing text
+  /// from `ChatMessageItem` instead — see `MessageCopyPlan` for the
+  /// answer/thinking boundary policy.
+  @ViewBuilder
+  private var copyMenuItems: some View {
+    ForEach(MessageCopyPlan.plan(for: message).items, id: \.label) { item in
+      Button(item.label) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(item.text, forType: .string)
       }
     }
   }
