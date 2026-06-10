@@ -151,4 +151,57 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
         currentPin: nil, servedID: nil,
         profileDefault: "org/A/Default.gguf", isLoading: false))
   }
+
+  // MARK: - #501 centralization: the pin-over-default sites delegate to the
+  // single resolver (`ModelTarget.resolve`) with identical results. The
+  // precedence itself is owned and exhaustively tested by `ModelTargetTests`
+  // (SPM); these guard that each folded call site stays a thin pass-through.
+
+  /// The pin/default matrix the resolver covers — pin beats default; blank/nil
+  /// counts as absent; nothing resolvable is `nil`.
+  private static let pinDefaultMatrix: [(pin: String?, def: String?)] = [
+    ("pinned-model", "profile-default"),  // pin wins
+    (nil, "profile-default"),             // unpinned → default
+    ("pinned-model", nil),                // pinned, no default
+    (nil, nil),                           // nothing → nil
+  ]
+
+  func test_requestModelID_non_override_path_equals_ModelTarget_resolve() {
+    // With no GUI test override, `requestModelID` IS the resolver's pick →
+    // default → nil. (The `testModelID` seam is a harness override, proven
+    // separately above; it is not a pin/default source.)
+    for c in Self.pinDefaultMatrix {
+      XCTAssertEqual(
+        ChatScaffoldView.requestModelID(
+          selectedModelID: c.pin, profileDefaultModel: c.def, testModelID: nil),
+        ModelTarget.resolve(selectedModelID: c.pin, profileDefault: c.def)?.modelID,
+        "requestModelID (no override) must equal ModelTarget.resolve for pin=\(String(describing: c.pin)) default=\(String(describing: c.def))"
+      )
+    }
+  }
+
+  func test_effectiveModelID_equals_ModelTarget_resolve() {
+    // The swap policy's "current model" is the same pin-over-default pick.
+    for c in Self.pinDefaultMatrix {
+      XCTAssertEqual(
+        ContentToolbar.effectiveModelID(
+          selectedModelID: c.pin, profileDefaultModel: c.def),
+        ModelTarget.resolve(selectedModelID: c.pin, profileDefault: c.def)?.modelID,
+        "effectiveModelID must equal ModelTarget.resolve for pin=\(String(describing: c.pin)) default=\(String(describing: c.def))"
+      )
+    }
+  }
+
+  func test_effectiveModelID_pins_over_default_and_nils_when_empty() {
+    XCTAssertEqual(
+      ContentToolbar.effectiveModelID(selectedModelID: "pinned-model",
+                                      profileDefaultModel: "profile-default"),
+      "pinned-model")
+    XCTAssertEqual(
+      ContentToolbar.effectiveModelID(selectedModelID: nil,
+                                      profileDefaultModel: "profile-default"),
+      "profile-default")
+    XCTAssertNil(
+      ContentToolbar.effectiveModelID(selectedModelID: nil, profileDefaultModel: nil))
+  }
 }

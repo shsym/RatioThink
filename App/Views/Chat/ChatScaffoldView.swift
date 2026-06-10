@@ -727,6 +727,12 @@ struct ChatScaffoldView: View {
   /// the id to pin, or `nil` to leave `modelID` untouched (follow the
   /// profile default). Static + pure so the matrix is unit-testable without
   /// a view host.
+  ///
+  /// NOT routed through `ModelTarget.resolve`: this is a seed *guard*
+  /// (unpinned AND served == this chat's default), not a pin-over-default
+  /// pick. `ModelTarget.resolve` models pick → default → nil; folding this
+  /// in would change behavior (it would adopt the pin or a non-default
+  /// served id, the exact F1 defect this guard exists to prevent).
   static func seededModelID(
     currentPin: String?,
     servedID: String?,
@@ -922,12 +928,12 @@ struct ChatScaffoldView: View {
     if let testModel = testModelID, !testModel.isEmpty {
       return testModel
     }
-    if let selectedModelID, !selectedModelID.isEmpty {
-      return selectedModelID
-    }
-    if let profileDefaultModel, !profileDefaultModel.isEmpty {
-      return profileDefaultModel
-    }
-    return nil
+    // Pin-over-default precedence routes through the one derivation
+    // (`ModelTarget.resolve`) so the send path can never disagree with the
+    // gate/launch path about which model the chat means. The test override
+    // above is a GUI-harness seam, not a pin/default source, so it stays
+    // ahead of resolution (#504 tracks retiring it).
+    return ModelTarget.resolve(selectedModelID: selectedModelID,
+                               profileDefault: profileDefaultModel)?.modelID
   }
 }
