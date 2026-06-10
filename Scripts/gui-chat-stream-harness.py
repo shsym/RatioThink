@@ -9,11 +9,12 @@ cannot reproduce deterministically:
   --mode hold    The FIRST chat request streams a role frame + one content
                  delta (`--hold-token`) and then HOLDS the connection open
                  with NO finish frame and NO `[DONE]` sentinel, so the stream
-                 stays in flight until the client cancels (the App's
-                 `ChatScaffoldView.onDisappear` → `ChatSendController.cancel`).
-                 Every SUBSEQUENT request returns a normal, fully-finished
-                 reply (`--reply`) — the recovery proof that the composer
-                 re-enabled and a fresh send streams to completion.
+                 stays in flight until either the client cancels (same-chat
+                 supersede / chat deletion — #507 removed the navigate-away
+                 cancel) or the test releases it via `POST /control/release`,
+                 which finishes the held stream with `--reply` + a `stop`
+                 finish frame. Every SUBSEQUENT request returns a normal,
+                 fully-finished reply (`--reply`).
 
   --mode normal  EVERY chat request returns a normal finished reply
                  (`--reply`). Used by the no-model → Load-default follow-through
@@ -52,6 +53,9 @@ class State:
         self.args = args
         self.lock = threading.Lock()
         self.chat_count = 0
+        # #507: set by POST /control/release — a held stream finishes with
+        # the normal reply + stop frame instead of waiting for a cancel.
+        self.release = threading.Event()
 
     def next_request_index(self) -> int:
         with self.lock:
@@ -82,6 +86,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
         _ = self.rfile.read(length)  # drain the request body
+        if self.path == "/control/release":
+            self.server.state.release.set()
+            self.send_json({"released": True})
+            return
         if self.path != "/v1/chat/completions":
             self.send_error(404, "not found")
             return
@@ -91,7 +99,7 @@ class Handler(BaseHTTPRequestHandler):
         is_first = index == 1
 
         if args.mode == "hold" and is_first:
-            self.stream_hold(args.hold_token, args.hold_seconds)
+            self.stream_hold(args.hold_token, args.hold_seconds, args.reply)
         else:
             self.stream_reply(args.reply)
 
@@ -118,15 +126,24 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
-    def stream_hold(self, token: str, hold_seconds: float):
-        """Emit one partial delta, then hold the stream open until the client
-        disconnects (or the backstop elapses) WITHOUT a finish frame."""
+    def stream_hold(self, token: str, hold_seconds: float, reply: str):
+        """Emit one partial delta, then hold the stream open WITHOUT a finish
+        frame until the client disconnects, the backstop elapses, or the test
+        releases it (`POST /control/release`) — on release, finish normally
+        with `reply` + a `stop` frame (#507: proves a backgrounded stream
+        runs to completion instead of being cancelled)."""
         self.open_sse()
         self.write_frame({"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
         self.write_frame({"choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}]})
         deadline = time.monotonic() + hold_seconds
         while time.monotonic() < deadline:
             try:
+                if self.server.state.release.is_set():
+                    self.write_frame({"choices": [{"index": 0, "delta": {"content": reply}, "finish_reason": None}]})
+                    self.write_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    return
                 # SSE comment keep-alive: ignored by the client parser, but the
                 # write raises once the client closes the connection, so the
                 # thread exits promptly on cancel instead of sleeping the full

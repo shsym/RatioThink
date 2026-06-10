@@ -1,16 +1,18 @@
 #!/bin/bash
-# #381 part 1: cancel an in-flight chat stream and assert the partial bubble
-# survives + the composer recovers. Drives Rational.app against a deterministic
-# mock engine that streams one partial delta then HOLDS the connection open, so
-# the mid-stream window is reproducible.
+# #507: an in-flight chat stream survives switching chats (it used to be the
+# #381 navigate-away CANCEL path). Drives Rational.app against a deterministic
+# mock engine that streams one partial delta then HOLDS the connection open;
+# the test switches chats mid-stream, checks the per-row streaming indicator,
+# then releases the held stream via POST /control/release and asserts it
+# finished in the background.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 MODEL="gui-stream-deterministic"
-HOLD_TOKEN="PARTIAL-HOLD-381"
-RECOVERY_REPLY="Recovered reply after cancel."
+HOLD_TOKEN="PARTIAL-HOLD-507"
+RECOVERY_REPLY="Released reply after background switch."
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p381-cancel-$$}"
 GUI_HOME="$RUN_ROOT/g"
 URL_FILE="$RUN_ROOT/harness.url"
@@ -84,7 +86,7 @@ xcodebuild -project RatioThink.xcodeproj \
   -destination 'platform=macOS,arch=arm64' \
   -parallel-testing-enabled NO \
   test \
-  -only-testing:RatioThinkGUITests/S381_StreamCancelGUITests/test_cancel_mid_stream_keeps_partial_bubble_and_recovers_composer \
+  -only-testing:RatioThinkGUITests/S507_StreamContinuityGUITests/test_stream_survives_chat_switch_with_row_indicator_and_finishes_in_background \
   ENABLE_CODE_COVERAGE=NO
 
 echo "stream-cancel gui e2e: PASS"
