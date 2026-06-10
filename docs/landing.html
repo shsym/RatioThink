@@ -459,27 +459,28 @@
 
     // EVERY kept branch explores its own children (real beam search); pruned ones don't.
     // The eventual winner is held as 'kept' here and only STARRED at the finale.
-    var winner = null;
+    var winner = null, explored = 0;
     for (var bi=0; bi<d.branches.length; bi++){
       var br = d.branches[bi];
       if (br.beam === 'pruned' || !br.children.length) continue;
+      if (explored > 0) await sleep(480, myGen);   // breathe BETWEEN branch expansions only
+      explored++;
       var anchor = n1[bi];
       var kids = br.children.map(function(c){ var node = addChildAfter(anchor, c); anchor = node; return node; });
       for (var a=0;a<kids.length;a++){ kids[a].classList.add('in'); await sleep(240, myGen); }
       await sleep(220, myGen);
       for (var s=0;s<kids.length;s++){ kids[s].classList.add('scored'); await sleep(170, myGen); }
-      await sleep(320, myGen);
+      await sleep(300, myGen);
       for (var c2=0;c2<kids.length;c2++){
         var cb = br.children[c2].beam;
         if (cb === 'star'){ winner = kids[c2]; setBeam(kids[c2], 'kept'); }  // hold; the star lands last
         else { setBeam(kids[c2], cb); }
         await sleep(150, myGen);
       }
-      await sleep(500, myGen);
     }
 
-    // FINALE — explore everything first, select the best leaf LAST: the star lands with a pop.
-    await sleep(520, myGen);
+    // FINALE — select the best leaf right after the last score lands; just a tiny beat, no dead wait.
+    await sleep(260, myGen);
     if (winner){ setBeam(winner, 'star'); winner.classList.add('win-pop'); }
     var tstat = document.getElementById('tstatus');
     tstat.classList.remove('searching'); tstat.textContent = d.nodeCount + ' nodes';
