@@ -64,7 +64,7 @@ endef
         test-unit test-scenario test-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-load-default test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
-        test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-helper-respawn test-helper-recovery test-quit-structured \
+        test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-e2e-harsh-load \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
@@ -96,7 +96,7 @@ local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e
 
 local-gui-gate: test-gui-script test-gui ## Mandatory local GUI parity gate for UI changes; requires seated session + Automation/Accessibility TCC
 
-local-e2e-gate: test-e2e-engine test-e2e-models test-e2e-chat test-e2e-tot test-e2e-budget-sweep test-e2e-full test-gui-history test-gui-stream-cancel test-gui-load-default test-gui-first-launch-package test-helper-respawn test-helper-recovery test-quit-structured ## Operator-gated integration/E2E parity; requires documented models, engine, signing, TCC, or live services
+local-e2e-gate: test-e2e-engine test-e2e-models test-e2e-chat test-e2e-tot test-e2e-budget-sweep test-e2e-full test-gui-history test-gui-stream-cancel test-gui-load-default test-gui-first-launch-package test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured ## Operator-gated integration/E2E parity; requires documented models, engine, signing, TCC, or live services
 
 release-gate: local-pre-merge test-curated-hf test-dmg-layout ## Release readiness gate; additionally run release-preflight with ARTIFACT=<built .app|.dmg> after packaging/notarization
 
@@ -416,6 +416,7 @@ test-gui-script: ## Fast preflight regressions for GUI E2E wrappers
 	Scripts/test-run-stream-cancel-gui-e2e.sh
 	Scripts/test-run-load-default-gui-e2e.sh
 	Scripts/test-run-first-launch-package-e2e.sh
+	Scripts/test-run-first-launch-package-model-download-e2e.sh
 
 test-gui-history: genproject ## Deterministic  GUI history/resume E2E — needs seated session
 	Scripts/run-resume-gui-history-e2e.sh
@@ -550,6 +551,9 @@ bench-tot: ## Benchmark: ToT batched-vs-sequential strategies on real portable M
 
 test-e2e-full: ## E2E area: 3-layer real-model proof — GUI download → engine boot → chat persist (S204)
 	Scripts/run-full-e2e.sh
+
+test-e2e-package: ## E2E area: packaged first-launch → model download → chat uses persisted default (S7 packaged model-download, #379)
+	Scripts/run-first-launch-package-model-download-e2e.sh
 
 test-helper-respawn: ## Acceptance: live launchd Helper auto-respawn (needs signed/registered install)
 	Scripts/verify-helper-respawn.sh

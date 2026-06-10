@@ -49,6 +49,7 @@ below in the same change.
 | `make test-gui-stream-cancel` | #381 deterministic cancel-mid-stream E2E (partial bubble + composer recovery) | **seated session** | Local E2E gate |
 | `make test-gui-load-default` | #381 deterministic no-model → Load-default follow-through E2E | **seated session** | Local E2E gate |
 | `make test-gui-first-launch-package` | Package-backed first-launch E2E (Release `.app`) | **seated session** | Local E2E gate |
+| `make test-e2e-package` | #381-seam packaged first-launch → model download → Load-default → chat (#379) | **seated session** | Local E2E gate |
 | `make test-gui-script` | Fast preflight regressions for the GUI E2E wrapper scripts | anywhere | Local GUI gate via `local-gui-gate` |
 | `make test-e2e-tot` | Real-engine tree-of-thought app path completes without the #413 stall | local/operator only | Local E2E gate |
 | `make test-quit-structured` | Live structured-quit acceptance: idle engine persists; `ratiothink://quit` leaves no App/Helper/pie | signed install + running engine | Local E2E/manual live gate |
@@ -83,6 +84,7 @@ that wrapper, not bare `xcodebuild`.
 | `S5_AppWindowShellGUITests` | settings/shell | 3-column shell vocabulary (Chats + API Endpoints nav, #422), ⌘, → Settings (4 tabs, no API tab) | mock | `test-gui-shell` |
 | `S7_FirstLaunchWizardGUITests` | first-launch | wizard flow (register / approval-blocked) | mock (faked login-item) | `test-gui-first-launch` |
 | `S7_FirstLaunchWizardPackagedArtifactGUITests` | package/install | Release `.app` first-launch persists across relaunch; launched-artifact path | packaged-signed-app | `test-gui-first-launch-package` |
+| `S7_FirstLaunchWizardPackagedModelDownloadGUITests` | package/install | packaged `.app`: first-launch wizard → Settings model **download** (fixture lands file + probe) → no-model gate offers **Load** (not Download) → Load resolves the **persisted default** (no `PIE_TEST_CHAT_MODEL`) → send streams a reply that survives relaunch (#379) | packaged-app (Debug config) + #381 start→running stub + mock | `test-e2e-package` |
 | `S4_HelperMenuBarGUITests` | helper/engine | menu-bar shell; fresh seed enables Resume; oversized-model rejected; Resume boots pie → Pause | app+real-engine (GGUF fixture) | `test-gui-helper` |
 | `S204_ModelAcquisitionGUITests` | model discovery | Settings curated download → **verified** badge (sha256 == HF X-Linked-Etag) | real HF download (no inference) | `test-e2e-models` |
 | `S204_UnverifiedBadgeGUITests` | model discovery | `.unverified` sidecar row badges after rescan; clean row does not | no engine/network (staged files) | `test-e2e-models` |
@@ -100,11 +102,21 @@ that wrapper, not bare `xcodebuild`.
 | `S360_ModelsTopAlignGUITests` | settings/shell | Settings → Models empty state stays **top-aligned**, not vertically centered (mirrors S285) | mock (isolated empty `PIE_HOME`) | `test-gui` |
 | `S365_CachedModelDiscoveryGUITests` | model discovery | HF-cache-staged model surfaces as a Settings **"HF-cache" row** + in the profile picker; pure filesystem scan | staged HF cache (no engine/network) | `run-cache-discovery-gui-e2e.sh` |
 
-> Reconciled against `Tests/GUIScenarioTests/` on 2026-06-02 — every suite on
-> disk is listed above. A `S7_FirstLaunchWizardPackagedModelDownloadGUITests`
-> suite named in older catalogs does **not** exist on disk: a first-launch
-> **packaged model download** GUI suite is a tracked coverage gap, not an
-> existing test.
+> Reconciled against `Tests/GUIScenarioTests/` on 2026-06-10 — every suite on
+> disk is listed above. The first-launch **packaged model-download →
+> persisted-default chat** suite (`S7_FirstLaunchWizardPackagedModelDownloadGUITests`,
+> #379) now exists and closes the coverage gap the #373 audit filed. The chat
+> resolves the persisted default through the no-model gate's **Load-default**
+> path (the #381 `PIE_TEST_ENGINE_START_TO_RUNNING` stub), **without**
+> `PIE_TEST_CHAT_MODEL` — so the download → persisted-default → chat link is
+> causal (the gate offers Load only because the downloaded default is on disk
+> and the persisted profile default names it), not an injected echo. Its package
+> is built **Debug** (not Release): the engine seams (`PIE_TEST_ENGINE_BASE_URL`,
+> `PIE_TEST_ENGINE_START_TO_RUNNING`) are gated to DEBUG builds by
+> `HelperConfig.isTestOverrideAllowed` (the #325 hardening), so a deterministic
+> chat from a packaged bundle requires a Debug-configured package; the
+> Release-signed artifact + wizard persistence stay covered by
+> `S7_FirstLaunchWizardPackagedArtifactGUITests`.
 
 ## Modular suites by area
 
@@ -117,7 +129,7 @@ exact fix command when a human gate is unmet.
 |---|---|---|
 | settings / app shell | `make test-gui-shell` (S5) | `test-gui` |
 | first launch (wizard) | `make test-gui-first-launch` (S7 fast) | `test-gui` |
-| package / install | `make test-gui-first-launch-package` (S7 packaged `.app`) | — |
+| package / install | `make test-gui-first-launch-package` (S7 packaged `.app` wizard/persist); `make test-e2e-package` (S7 packaged model-download → persisted-default chat, #379) | — |
 | helper / engine startup | `make test-gui-helper` (S4); `make test-smoke` (S3 subprocess); `make test-e2e-engine` (real launch) | `test-gui` / `test-ssh` |
 | large curated model real-engine proof | `make test-e2e-large-model` (manual/local; representative Qwen3 14B single-file GGUF, override with `PIE_TEST_E2E_REPO`/`PIE_TEST_E2E_FILE`) | — |
 | engine-free chat surfaces | `make test-gui-chat` (S260/S279/S285/S286) | `test-gui` |
@@ -216,7 +228,7 @@ Every suite/job kept out of `make ci-pr` or the manual lightweight workflow maps
 | Deep link / URL scheme / login-item / menu-bar persistence copy (#420/#440) | `make local-pre-merge` (includes `make test-app-unit`; `SettingsDeepLinkBundleTests` and `LoginItemPersistenceSummaryTests` assert locally) |
 | SwiftUI views / layout / copy / a11y ids | `make local-pre-merge` + `make local-gui-gate` or the affected focused GUI suite(s) |
 | Chat ↔ engine send / streaming / persistence | `make local-pre-merge` + affected GUI suite + real-model proof: `make test-e2e-chat`, `Scripts/run-chat-gui-e2e.sh`, or `make test-gui-history` |
-| First-launch / wizard / model download | `make local-gui-gate` focused to S7 where possible + `make test-gui-first-launch-package`; add `make test-e2e-models` for real model acquisition/download paths |
+| First-launch / wizard / model download | `make local-gui-gate` focused to S7 where possible + `make test-gui-first-launch-package` + `make test-e2e-package` (#379 packaged download → Load-default chat); add `make test-e2e-models` for real model acquisition/download paths |
 | Engine launch / supervisor / XPC / helper | `make local-pre-merge` + `make test-e2e-engine`; add `make test-gui-helper` / `make test-helper-respawn` / `make test-helper-recovery` for helper lifecycle or signed-install changes |
 | Engine subprocess / inference contract | `make test-smoke` + `make test-real-pie-driver-contract`; add S3-real from Appendix A when launch args or inference semantics changed |
 | chat-apc HTTP routes / SSE / tool calling (`Inferlets/chat-apc/src`) | `make test-e2e-http`; `make stamp-inferlets`; `make verify-inferlets-inputs`; the manual GitHub workflow can also run `make test-stamp`, `make test-inferlets`, `make verify-inferlets` |
