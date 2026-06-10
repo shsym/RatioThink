@@ -17,8 +17,6 @@
     --bubble-user:var(--accent); --bubble-assistant:#efece2; --think-bg:#f1ede0;
     /* tree-search beam states (mirror TreeSearchSection glyph tints) */
     --kept:#5a6b25; --pruned:#a89b85; --star:#c8901f;
-    /* shipped chip */
-    --shipped:#5a6b25; --shipped-bg:#f4f4dc; --shipped-border:#c5cf94;
     /* type */
     --serif:'IBM Plex Serif','Charter','Iowan Old Style','Palatino',Georgia,serif;
     --sans:-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Arial,system-ui,sans-serif;
@@ -143,9 +141,6 @@
   /* scene caption strip under the window */
   .caption{margin:14px auto 0;max-width:680px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
     min-height:30px}
-  .chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:3px 10px;
-    border-radius:999px;border:1px solid;letter-spacing:.01em;
-    color:var(--shipped);background:var(--shipped-bg);border-color:var(--shipped-border)}
   .caption .ctext{font-size:13px;color:var(--ink-soft)}
 
   /* scene dots — real, focusable navigation buttons (live OUTSIDE the aria-hidden mock) */
@@ -161,14 +156,11 @@
   .why{margin:46px auto 0;max-width:760px}
   .why h2{font-family:var(--serif);font-size:25px;text-align:center;margin:0 0 8px;font-weight:600}
   .why .lede{text-align:center;font-size:14px;color:var(--ink-muted);max-width:62ch;margin:0 auto 22px}
-  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
   .card{background:var(--bg);border:1px solid var(--border);border-radius:13px;padding:16px 17px}
   .card .ct{display:flex;align-items:center;gap:8px;margin-bottom:6px}
   .card h3{font-size:15px;margin:0;font-weight:650}
   .card p{font-size:13px;color:var(--ink-soft);margin:0}
-  .card .tag{margin-left:auto;font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:999px;
-    border:1px solid;color:var(--shipped);background:var(--shipped-bg);border-color:var(--shipped-border)}
-  .why .compare{margin-top:18px;text-align:center;font-size:13px;color:var(--ink-muted)}
 
   /* ---------- footer ---------- */
   footer{margin:48px auto 0;max-width:760px;text-align:center;font-size:12.5px;color:var(--ink-muted);
@@ -261,23 +253,16 @@
        one click. Everything below is a profile.</p>
     <div class="grid">
       <div class="card">
-        <div class="ct"><h3>Thinking modes</h3><span class="tag">Shipped</span></div>
-        <p>A profile is a named, one-click preset — model + sampling + system prompt + workflow — saved
-           to disk and editable as TOML. Ollama exposes these only as per-request params; LM Studio has
-           no explicit profiles.</p>
-      </div>
-      <div class="card">
-        <div class="ct"><h3>Tree of Thought</h3><span class="tag">Shipped</span></div>
+        <div class="ct"><h3>Tree of Thought</h3></div>
         <p>A profile that turns one question into a scored search tree: the engine branches, scores each
            branch 1–10, and keeps the best beam — shown live in a foldable tree, then the chosen answer.</p>
       </div>
       <div class="card">
-        <div class="ct"><h3>Fast Think</h3><span class="tag">Shipped</span></div>
+        <div class="ct"><h3>Fast Think</h3></div>
         <p>A profile that runs the same model greedily with a <strong>speculative drafter</strong> —
            fewer waits, identical output — on the bundled Apple-Silicon engine. Just pick it.</p>
       </div>
     </div>
-    <p class="compare">Everything runs on your Mac. No accounts, no cloud, no telemetry.</p>
   </section>
 
   <footer>
@@ -368,7 +353,7 @@
   function resetComposer(){ composer.textContent='Message Rational…'; composer.classList.remove('typed'); }
 
   function setCaption(text){
-    captionEl.innerHTML = '<span class="chip">● In the app</span><span class="ctext">'+text+'</span>';
+    captionEl.innerHTML = '<span class="ctext">'+text+'</span>';
   }
   function setActiveDot(i){
     dotEls.forEach(function(d, k){
@@ -547,15 +532,15 @@
 
   var SCENES = [
     { run: sceneTreeOfThought, still: stillTot,
-      pausedCaption: 'Animation paused (reduced motion). Tree of Thought is a one-click profile in the app.' },
+      pausedCaption: 'Animation paused (reduced motion). Tree of Thought is a one-click profile.' },
     { run: sceneFastThink, still: stillFast,
-      pausedCaption: 'Animation paused (reduced motion). Fast Think runs speculative decoding in the app.' }
+      pausedCaption: 'Animation paused (reduced motion). Fast Think runs speculative decoding.' }
   ];
 
   // Error fallback: a clean, honest static frame (the lead Tree of Thought scene).
   function renderStaticFallback(){
     stillTot();
-    setCaption('Tree of Thought, Fast Think, and profiles are live in the app.');
+    setCaption('Tree of Thought and Fast Think are one-click profiles.');
     setActiveDot(0);
   }
 
