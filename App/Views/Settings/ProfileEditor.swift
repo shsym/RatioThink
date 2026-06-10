@@ -320,12 +320,19 @@ struct ProfileEditor: View {
   }
 
   /// Human, fault-domain-correct copy for a failed post-save engine reload.
-  /// Frames the save as done and the reload as the failed step.
+  /// Frames the save as done and the reload as the failed step. #477:
+  /// `EngineError.message` is a raw diagnostic — show the shared
+  /// taxonomy's curated line and log the raw text instead.
   static func engineReloadMessage(_ error: Error) -> String {
     if let e = error as? EngineError {
-      return "The new default was saved, but the engine couldn’t reload: \(e.message)"
+      let problem = EngineProblem(statusCode: e.code, rawMessage: e.message)
+      if let detail = problem.technicalDetail {
+        Log.engine.error("ProfileEditor: engine reload failed: \(detail, privacy: .public)")
+      }
+      return "The new default was saved, but the engine couldn’t reload. \(problem.message)"
     }
-    return "The new default was saved, but the engine couldn’t reload: \(error)"
+    Log.engine.error("ProfileEditor: engine reload failed: \(String(describing: error), privacy: .public)")
+    return "The new default was saved, but the engine couldn’t reload."
   }
 
   /// Loading indicator (rebuild in flight) / bounded failure banner for the

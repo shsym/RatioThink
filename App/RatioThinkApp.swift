@@ -560,7 +560,7 @@ private final class StartableStubXPCClient: AppXPCClient, @unchecked Sendable {
 
   func engineStatus() async throws -> EngineStatus {
     lock.lock(); defer { lock.unlock() }
-    return started ? .running(port: port, profileID: "chat") : .stopped
+    return started ? .running(EngineSessionSnapshot(port: port, profileID: "chat")) : .stopped
   }
 
   func startEngine(profileID: String, modelOverride: String?) async throws {
