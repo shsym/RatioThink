@@ -368,6 +368,48 @@ final class PieSupervisorTests: XCTestCase {
                    "the abandoned incarnation's stdout source must be cancelled, not left spinning")
   }
 
+  func test_stopDeadlineExceeded_cancelsStdoutSource_noLeak() throws {
+    // Review v2 F4: the stop-deadline path is the one abandon path the
+    // handleTermination backstop cannot reach — it fires precisely when
+    // the wedged child is never reaped (so its terminationHandler never
+    // runs). The engine reaches .running then ignores SIGTERM, and
+    // killProcessOverride makes the supervisor's SIGKILL a no-op, so
+    // only armStopDeadline closes the loop → .failed("stop deadline …").
+    // The stdout source must still be cancelled.
+    let fake = try writeScript("pie-wedge.sh", body: """
+      #!/bin/bash
+      trap '' TERM
+      echo "HTTP_LISTEN=127.0.0.1:45678"
+      # Bounded so the test never leaks a process even though the
+      # supervisor's SIGKILL is overridden to a no-op.
+      sleep 3
+      """)
+    let sup = PieSupervisor(
+      policy: .init(handshakeTimeout: 3,
+                    restartAttempts: 1,
+                    restartWindow: 30,
+                    stopGracePeriod: 0.3,
+                    stopOverrun: 0.3,
+                    stdoutCarryLimit: 64 * 1024),
+      logFileURL: logURL,
+      killProcessOverride: { _ in true }  // SIGKILL "succeeds" but reaps nothing
+    )
+    _ = sup.start(makeSpec(binary: fake, profileID: "chat"))
+    let running = waitFor(sup, predicate: { if case .running = $0 { return true }; return false },
+                          timeout: 5)
+    XCTAssertNotNil(running, "engine must reach .running before stop")
+    sup.stop()
+    let failed = waitFor(sup, predicate: { if case .failed = $0 { return true }; return false },
+                         timeout: 5)
+    guard case .failed(_, let msg)? = failed else {
+      return XCTFail("expected .failed via stop deadline, got \(String(describing: failed))")
+    }
+    XCTAssertTrue(msg.contains("stop deadline"),
+                  "expected the stop-deadline failure; got \(msg)")
+    XCTAssertEqual(sup.activeStdoutSourceCountForTesting, 0,
+                   "the stop-deadline abandon path must cancel the stdout source")
+  }
+
   // MARK: - F39: post-handshake crash consumes the retry ladder
 
   func test_postHandshakeCrash_retriesPerPolicy() throws {

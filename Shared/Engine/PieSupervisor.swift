@@ -443,9 +443,9 @@ public final class PieSupervisor: @unchecked Sendable {
   /// resumed and not yet cancelled. Incremented when `spawn` resumes a
   /// source, decremented by `cancelStdoutSource`. Any abandon path
   /// (handshake-timeout / malformed / carry-overflow / kill-rejected /
-  /// crash) must drive this back to 0; a nonzero value after a terminal
-  /// state means a source leaked and is busy-spinning at EOF on
-  /// `stateQueue`. Read via `activeStdoutSourceCountForTesting`.
+  /// crash / stop-deadline) must drive this back to 0; a nonzero value
+  /// after a terminal state means a source leaked and is busy-spinning
+  /// at EOF on `stateQueue`. Read via `activeStdoutSourceCountForTesting`.
   private var _activeStdoutSourceCount = 0
   internal var activeStdoutSourceCountForTesting: Int {
     performLocked { _activeStdoutSourceCount }
@@ -554,10 +554,13 @@ public final class PieSupervisor: @unchecked Sendable {
     /// CI flake #492). Cancelled via `cancelStdoutSource` on EVERY
     /// path that abandons the incarnation: EOF or a hard read error
     /// (`readStdout`), `Process.run()` failure, the kill/timeout paths
-    /// (`finishSpawnFailure`, `enterKillRejected`), and both branches
-    /// of `handleTermination` (the live exit and the stale-incarnation
-    /// backstop). Leaving it resumed past abandonment leaks a source
-    /// that busy-spins at EOF on `stateQueue` (review v1 F1).
+    /// (`finishSpawnFailure`, `enterKillRejected`), the stop-deadline
+    /// timeout (`armStopDeadline`, review v2 F4 — the one path the
+    /// `handleTermination` backstop cannot reach because the wedged
+    /// child is never reaped), and both branches of `handleTermination`
+    /// (the live exit and the stale-incarnation backstop). Leaving it
+    /// resumed past abandonment leaks a source that busy-spins at EOF
+    /// on `stateQueue` (review v1 F1).
     var stdoutSource: DispatchSourceRead?
     var stdoutCarry = Data()
     var handshakeFound = false
@@ -1316,6 +1319,12 @@ public final class PieSupervisor: @unchecked Sendable {
       guard let self else { return }
       guard case .stopping = self._state else { return }
       Log.engine.fault("PieSupervisor: stop deadline (\(self.policy.stopGracePeriod + self.policy.stopOverrun, privacy: .public)s) exceeded; forcing .failed")
+      // Review v2 F4: this is the one abandon path the handleTermination
+      // backstop cannot reach — it fires precisely when SIGTERM+SIGKILL
+      // produced no terminal observation, so the wedged child's
+      // terminationHandler never runs. Cancel the source here, before
+      // nil'ing `current`, mirroring finishSpawnFailure / enterKillRejected.
+      self.cancelStdoutSource(self.current)
       self.current = nil
       self.currentSpec = nil
       self.stopDeadlineTimer = nil
