@@ -17,7 +17,10 @@ import XCTest
 /// rows through the real "New Chat" affordance, which reproduces exactly
 /// the observed first-row shape: generated title + relative timestamp.
 ///
-/// On any geometry failure a window screenshot is attached for diagnosis.
+/// Geometry checks accumulate and raise ONE terminal failure per
+/// `assertRowGeometry` call, AFTER attaching a window screenshot and
+/// printing a frame dump — the suite runs with continueAfterFailure=false
+/// (a failed seed must abort), so diagnostics have to precede the fail.
 ///
 /// Follow-up (#507 / PR #114): once the per-chat streaming spinner
 /// (`chats.row.streaming`) lands in the chat list, extend `assertRowGeometry`
@@ -64,6 +67,10 @@ final class S511_ChatListGeometryGUITests: XCTestCase {
                   "chat list header New Chat affordance missing")
     let rows = app.descendants(matching: .any).matching(identifier: "chats.row")
     for i in 1...count {
+      // Space the clicks past the double-click interval — rapid clicks at
+      // the same point coalesce into a double-click and the second press
+      // is swallowed (observed as a missing row).
+      usleep(400_000)
       newButton.click()
       let deadline = Date().addingTimeInterval(5)
       while rows.count < i && Date() < deadline {
@@ -113,11 +120,13 @@ final class S511_ChatListGeometryGUITests: XCTestCase {
       return
     }
 
-    var failed = false
+    // Accumulate failures and raise ONE XCTFail at the end: the suite runs
+    // with continueAfterFailure=false, so a per-check XCTFail would halt
+    // the test before the screenshot + frame-dump diagnostics below run.
+    var failures: [String] = []
     func check(_ condition: Bool, _ message: String) {
       if !condition {
-        failed = true
-        XCTFail("[\(context)] \(message)", file: file, line: line)
+        failures.append(message)
       }
     }
 
@@ -161,12 +170,14 @@ final class S511_ChatListGeometryGUITests: XCTestCase {
       }
     }
 
-    if failed {
+    if !failures.isEmpty {
       attachScreenshot(app, name: "s511-\(context)-geometry-failure")
       // Frame dump for quick diagnosis without replaying the run.
       for (i, frame) in frames.enumerated() {
         print("[s511] \(context) row[\(i)] frame=\(frame)")
       }
+      XCTFail("[\(context)] \(failures.joined(separator: "\n"))",
+              file: file, line: line)
     }
   }
 
