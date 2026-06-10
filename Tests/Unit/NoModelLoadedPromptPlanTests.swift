@@ -183,9 +183,66 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   func test_noDefault_is_unavailable_with_settings() {
     let p = plan(.noDefault, unavailableAction)
     XCTAssertEqual(p.headline, "No model loaded")
-    XCTAssertTrue(p.showsUnavailableCopy)
+    XCTAssertEqual(p.unavailableCopy,
+                   "This profile has no model ready. Choose one from the Model menu in the toolbar, or add one in Settings → Models.")
     XCTAssertTrue(p.showsOpenSettings)
     XCTAssertEqual(p.primary, .none)
+  }
+
+  // MARK: - review v1 F1/F2/F5: source-honest copy lives in the pure Plan
+
+  func test_497_needsLoad_selected_unavailable_names_the_pin() {
+    // Review v1 F1: a pinned, non-loadable, non-downloadable model must be
+    // named as the SELECTION — never "this profile has no model ready".
+    let p = plan(.needsLoad(target: ModelTarget(
+      modelID: "org/picked", source: .selected)), unavailableAction)
+    XCTAssertEqual(p.headline, "Selected model isn't available")
+    XCTAssertEqual(p.unavailableCopy,
+                   "Your selected model isn't available on this Mac. Choose another from the Model menu in the toolbar, or add one in Settings → Models.")
+    XCTAssertTrue(p.showsOpenSettings)
+    XCTAssertEqual(p.primary, .none)
+  }
+
+  func test_497_needsLoad_default_unavailable_keeps_profile_framing() {
+    let p = plan(.needsLoad(target: ModelTarget(
+      modelID: "org/default", source: .profileDefault)), unavailableAction)
+    XCTAssertEqual(p.headline, "No model loaded")
+    XCTAssertEqual(p.unavailableCopy,
+                   "This profile has no model ready. Choose one from the Model menu in the toolbar, or add one in Settings → Models.")
+  }
+
+  func test_497_load_captions_follow_target_source() {
+    // Review v1 F5: captions are part of the pure Plan, asserted here.
+    let selected = plan(.needsLoad(target: ModelTarget(
+      modelID: ProfileStore.defaultChatModelID, source: .selected)), loadAction)
+    XCTAssertEqual(selected.loadCaption,
+                   "Load your selected model to send your message?")
+    let fallback = plan(.needsLoad(target: ModelTarget(
+      modelID: ProfileStore.defaultChatModelID, source: .profileDefault)), loadAction)
+    XCTAssertEqual(fallback.loadCaption,
+                   "Load this profile's default model to send your message?")
+  }
+
+  func test_497_download_captions_follow_target_source() {
+    let selected = plan(.needsLoad(target: ModelTarget(
+      modelID: ProfileStore.defaultChatModelID, source: .selected)), downloadAction)
+    XCTAssertEqual(selected.downloadCaption,
+                   "Your selected model isn't downloaded yet. Download it to send your message.")
+    let fallback = plan(.needsLoad(target: ModelTarget(
+      modelID: ProfileStore.defaultChatModelID, source: .profileDefault)), downloadAction)
+    XCTAssertEqual(fallback.downloadCaption,
+                   "This profile's model isn't downloaded yet. Download it to send your message.")
+  }
+
+  func test_497_busy_download_detail_is_target_neutral() {
+    // Review v1 F2: `.busy` has no target axis, so the spinner detail must
+    // never claim "this profile's model" while the CTA downloads a pin.
+    let p = plan(.busy(.startingEngine), downloadAction)
+    XCTAssertEqual(p.detail, "The model isn't downloaded yet — download it to continue.")
+    XCTAssertNil(p.downloadCaption, "the spinner detail explains the state; no second caption")
+    let loading = plan(.busy(.startingEngine), loadAction)
+    XCTAssertEqual(loading.detail, "Your model is loading — your message will send once it's ready.")
+    XCTAssertEqual(plan(.busy(.stoppingEngine), loadAction).detail, "One moment…")
   }
 
   // MARK: - #400: availability action is derived LIVE per render (drift fix)

@@ -61,9 +61,17 @@ surface must consume these — never re-derive its own.
 
 ## Invariants
 
-1. No UI surface reads `Profile.model` directly for a prompt/action —
-   only through `ModelTarget` (`selectedProfileDefault` feeds the
-   resolve and nothing else).
+1. No blocked-send prompt surface (gate state, prompt copy/chip,
+   availability action, missing-model banner keying, launch ask) reads
+   `Profile.model` directly — only through `ModelTarget`
+   (`ChatScaffoldView.gateTarget`). `selectedProfileDefault` has other
+   documented consumers outside the prompt domain: the toolbar current
+   summary + option list (`toolbarCurrentModelSummary` /
+   `toolbarModelOptions`), the swap policy's `effectiveModelID`
+   (`ContentToolbar`), the servable-send derivation (`requestModelID`),
+   and the residency seed (`seededModelID`). Each of those is its own
+   single derivation listed above — what is banned is a prompt surface
+   re-deriving pin-vs-default on its own.
 2. A pinned selection is never described or actioned as the profile
    default: the gate carries `needsLoad(target)` with
    `source == .selected`, and the boot path receives the pin as
@@ -79,4 +87,6 @@ surface must consume these — never re-derive its own.
   running-engine switch shipped via #469 (`restartEngine`). Remaining:
   `engineFailed(.modelMissing)` + download keeps the default-framed
   headline even when the failed boot targeted a pin (the failure state
-  carries no target axis).
+  carries no target axis). Its sibling `.busy` likewise carries no
+  target axis; its spinner detail is deliberately target-NEUTRAL ("The
+  model isn't downloaded yet…") so it can't misattribute a pin.

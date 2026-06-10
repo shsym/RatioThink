@@ -55,7 +55,9 @@ struct NoModelLoadedPrompt: View {
 
   /// Pure, Equatable description of what the prompt renders. The view
   /// maps this to SwiftUI and binds the primary button's callback to the
-  /// model id it pulls from `gateState`/`action`.
+  /// model id it pulls from `gateState`/`action`. Review v1 F5: every line
+  /// of copy — including the source-honest captions — lives HERE so it is
+  /// unit-tested without a view hierarchy; the view renders strings only.
   struct Plan: Equatable {
     var headline: String
     /// Failure reason shown at the gate (not only in the banner behind
@@ -64,9 +66,20 @@ struct NoModelLoadedPrompt: View {
     var showsWaitSpinner: Bool
     var showsModelChip: Bool        // ".load" copy + slug chip
     var showsDownloadCTA: Bool      // inline MissingModelDownloadCTA
-    var showsUnavailableCopy: Bool
     var primary: Primary
     var showsOpenSettings: Bool
+    /// Spinner detail line for `.busy` states. Nil otherwise.
+    var detail: String? = nil
+    /// Caption above the model chip (`showsModelChip`). Source-honest:
+    /// a pinned selection is never called the profile default (#497).
+    var loadCaption: String? = nil
+    /// Caption above the download CTA. Nil when a reason or spinner
+    /// already explains the state.
+    var downloadCaption: String? = nil
+    /// Body copy for the unavailable state. Non-nil replaces the old
+    /// `showsUnavailableCopy` flag and carries pin-framed copy when the
+    /// dropped target was a selection (review v1 F1).
+    var unavailableCopy: String? = nil
   }
 
   /// Fold the lifecycle state + availability action into a render plan.
@@ -77,8 +90,7 @@ struct NoModelLoadedPrompt: View {
       // Gate not shown; render nothing if a race presents it for a frame.
       return Plan(headline: "", reason: nil, showsWaitSpinner: false,
                   showsModelChip: false, showsDownloadCTA: false,
-                  showsUnavailableCopy: false, primary: .none,
-                  showsOpenSettings: false)
+                  primary: .none, showsOpenSettings: false)
 
     case let .busy(phase):
       // F2: while the engine is starting on a fresh install whose model
@@ -90,8 +102,8 @@ struct NoModelLoadedPrompt: View {
       }()
       return Plan(headline: busyTitle(phase), reason: nil, showsWaitSpinner: true,
                   showsModelChip: false, showsDownloadCTA: keepDownload,
-                  showsUnavailableCopy: false, primary: .none,
-                  showsOpenSettings: false)
+                  primary: .none, showsOpenSettings: false,
+                  detail: busyDetail(phase, action: action))
 
     case let .needsLoad(target):
       // #326 availability action is authoritative for load-vs-download.
@@ -99,8 +111,10 @@ struct NoModelLoadedPrompt: View {
       case .load:
         return Plan(headline: "Model not loaded yet", reason: nil, showsWaitSpinner: false,
                     showsModelChip: true, showsDownloadCTA: false,
-                    showsUnavailableCopy: false, primary: .load,
-                    showsOpenSettings: false)
+                    primary: .load, showsOpenSettings: false,
+                    loadCaption: target.source == .selected
+                      ? "Load your selected model to send your message?"
+                      : "Load this profile's default model to send your message?")
       case .download:
         // #446: the body says "isn't downloaded yet" — the headline must
         // agree. A target IS configured (this is `.needsLoad`); it simply
@@ -114,14 +128,19 @@ struct NoModelLoadedPrompt: View {
                       : "Default model isn't downloaded",
                     reason: nil, showsWaitSpinner: false,
                     showsModelChip: false, showsDownloadCTA: true,
-                    showsUnavailableCopy: false, primary: .none,
-                    showsOpenSettings: false)
+                    primary: .none, showsOpenSettings: false,
+                    downloadCaption: target.source == .selected
+                      ? "Your selected model isn't downloaded yet. Download it to send your message."
+                      : "This profile's model isn't downloaded yet. Download it to send your message.")
       case .unavailable:
-        return unavailablePlan()
+        // Review v1 F1: the target is in hand — don't drop it. A pinned
+        // selection that can't be loaded or downloaded must be named as
+        // the selection, never blamed on the profile.
+        return unavailablePlan(target: target)
       }
 
     case .noDefault:
-      return unavailablePlan()
+      return unavailablePlan(target: nil)
 
     case let .engineFailed(code, reason):
       // #477: headline, reason, AND the primary affordance all derive
@@ -138,15 +157,13 @@ struct NoModelLoadedPrompt: View {
       if code == .modelMissing, case .download = action {
         return Plan(headline: "Default model isn't downloaded", reason: nil,
                     showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: true,
-                    showsUnavailableCopy: false, primary: .none,
-                    showsOpenSettings: false)
+                    primary: .none, showsOpenSettings: false)
       }
       // `.chooseModel` routes to Models settings, never a re-fire (F3);
       // only `.restartEngine` earns a Retry — `.restartHelper`/`none`
       // faults would re-fail (or be refused) on a blind engine start.
       return Plan(headline: problem.title, reason: problem.message,
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
-                  showsUnavailableCopy: false,
                   primary: problem.recovery == .restartEngine ? .retryEngine : .none,
                   showsOpenSettings: problem.recovery == .chooseModel)
 
@@ -155,30 +172,51 @@ struct NoModelLoadedPrompt: View {
       return Plan(headline: "Can't reach the engine",
                   reason: "The app can't reach its background helper right now. Try again in a moment.",
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
-                  showsUnavailableCopy: false, primary: .refresh,
-                  showsOpenSettings: false)
+                  primary: .refresh, showsOpenSettings: false)
 
     case .configBroken:
       // #477: the raw profile-store error stays in logs; show fixed copy.
       return Plan(headline: "Can't read your profile selection",
                   reason: "Your profile settings couldn't be read. Open Settings → Models to fix them.",
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
-                  showsUnavailableCopy: false, primary: .none,
-                  showsOpenSettings: true)
+                  primary: .none, showsOpenSettings: true)
     }
   }
 
-  private static func unavailablePlan() -> Plan {
-    Plan(headline: "No model loaded", reason: nil, showsWaitSpinner: false,
-         showsModelChip: false, showsDownloadCTA: false,
-         showsUnavailableCopy: true, primary: .none,
-         showsOpenSettings: true)
+  private static func unavailablePlan(target: ModelTarget?) -> Plan {
+    if let target, target.source == .selected {
+      return Plan(headline: "Selected model isn't available", reason: nil,
+                  showsWaitSpinner: false, showsModelChip: false,
+                  showsDownloadCTA: false, primary: .none,
+                  showsOpenSettings: true,
+                  unavailableCopy: "Your selected model isn't available on this Mac. Choose another from the Model menu in the toolbar, or add one in Settings → Models.")
+    }
+    return Plan(headline: "No model loaded", reason: nil, showsWaitSpinner: false,
+                showsModelChip: false, showsDownloadCTA: false,
+                primary: .none, showsOpenSettings: true,
+                unavailableCopy: "This profile has no model ready. Choose one from the Model menu in the toolbar, or add one in Settings → Models.")
   }
 
   static func busyTitle(_ phase: ChatStartGate.BusyPhase) -> String {
     switch phase {
     case .startingEngine: return "Starting the engine…"
     case .stoppingEngine: return "Stopping the engine…"
+    }
+  }
+
+  /// Review v1 F2: `.busy` carries no target axis, so this copy is
+  /// deliberately target-NEUTRAL — it must never claim "this profile's
+  /// model" while the CTA below downloads a pinned selection.
+  static func busyDetail(_ phase: ChatStartGate.BusyPhase,
+                         action: MissingModelRecovery.PromptAction) -> String {
+    switch phase {
+    case .startingEngine:
+      if case .download = action {
+        return "The model isn't downloaded yet — download it to continue."
+      }
+      return "Your model is loading — your message will send once it's ready."
+    case .stoppingEngine:
+      return "One moment…"
     }
   }
 
@@ -220,7 +258,7 @@ struct NoModelLoadedPrompt: View {
     if plan.showsWaitSpinner {
       HStack(spacing: 8) {
         ProgressView().controlSize(.small)
-        Text(busyDetail).foregroundStyle(.secondary)
+        Text(plan.detail ?? "").foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
     }
@@ -228,19 +266,19 @@ struct NoModelLoadedPrompt: View {
       reasonText(reason)
     }
     if plan.showsModelChip, case let .load(model) = action {
-      Text(loadCaption)
+      Text(plan.loadCaption ?? "")
         .fixedSize(horizontal: false, vertical: true)
       modelChip(model)
     }
     if plan.showsDownloadCTA, case let .download(target) = action {
-      if plan.reason == nil, !plan.showsWaitSpinner {
-        Text(downloadCaption)
+      if let caption = plan.downloadCaption {
+        Text(caption)
           .fixedSize(horizontal: false, vertical: true)
       }
       MissingModelDownloadCTA(target: target, onDownloaded: onDownloaded, engineStatus: engineStatus)
     }
-    if plan.showsUnavailableCopy {
-      Text("This profile has no model ready. Choose one from the Model menu in the toolbar, or add one in Settings → Models.")
+    if let unavailable = plan.unavailableCopy {
+      Text(unavailable)
         .fixedSize(horizontal: false, vertical: true)
     }
   }
@@ -301,39 +339,6 @@ struct NoModelLoadedPrompt: View {
     case .engineFailed, .helperUnreachable, .configBroken: return .orange
     default:                                                return .secondary
     }
-  }
-
-  /// #497: a pinned selection is never described as "this profile's
-  /// default model" — the gate target's `source` decides the framing.
-  private var isSelectedTarget: Bool {
-    if case let .needsLoad(target) = gateState { return target.source == .selected }
-    return false
-  }
-
-  private var loadCaption: String {
-    isSelectedTarget
-      ? "Load your selected model to send your message?"
-      : "Load this profile's default model to send your message?"
-  }
-
-  private var downloadCaption: String {
-    isSelectedTarget
-      ? "Your selected model isn't downloaded yet. Download it to send your message."
-      : "This profile's model isn't downloaded yet. Download it to send your message."
-  }
-
-  private var busyDetail: String {
-    if case let .busy(phase) = gateState {
-      switch phase {
-      case .startingEngine:
-        if case .download = action {
-          return "This profile's model isn't downloaded yet — download it to continue."
-        }
-        return "Your model is loading — your message will send once it's ready."
-      case .stoppingEngine: return "One moment…"
-      }
-    }
-    return ""
   }
 
   private func reasonText(_ reason: String) -> some View {
