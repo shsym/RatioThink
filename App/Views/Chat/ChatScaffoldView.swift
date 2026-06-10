@@ -1,6 +1,5 @@
 import SwiftUI
 import SwiftData
-import ServiceManagement
 
 /// Composes the three pieces a chat detail surface needs:
 ///
@@ -57,6 +56,11 @@ struct ChatScaffoldView: View {
   /// persistence "Couldn't save" banner. Cleared when the engine status
   /// changes to a non-failed state.
   @State private var engineActionError: String?
+  /// #496: an engine action (Load / start / Unload) refused because the
+  /// background Helper isn't healthy. Surfaced as an inline, helper-framed
+  /// `HelperUnavailableNotice` — never the engine-failure banner, which would
+  /// re-attribute a Helper state to the engine.
+  @State private var helperBlock: HelperUnavailable?
 
   init(
     chatID: UUID,
@@ -101,8 +105,13 @@ struct ChatScaffoldView: View {
     Task { @MainActor in
       do {
         engineActionError = nil
+        helperBlock = nil
         try await engineStatusStore.stopEngine()
         modelLoadCenter.markUnloaded()
+      } catch let block as HelperUnavailable {
+        // #496: the Helper transport itself isn't healthy — surface a helper-
+        // framed inline refusal, never the engine-failure banner.
+        helperBlock = block
       } catch {
         // PR#15 F3: an engine STOP failure is an engine fault, not a
         // persistence/durability failure — route it to the engine-failure
@@ -191,7 +200,10 @@ struct ChatScaffoldView: View {
     Task { @MainActor in
       do {
         engineActionError = nil
+        helperBlock = nil
         try await engineStatusStore.startEngine(profileID: profileID, modelOverride: modelOverride)
+      } catch let block as HelperUnavailable {
+        helperBlock = block
       } catch {
         engineActionError = Self.engineErrorMessage(error, verb: "start")
       }
@@ -302,12 +314,14 @@ struct ChatScaffoldView: View {
         onStartEngine: startEngineForSelectedProfile
       )
       Divider().opacity(0.0001) // structural breather; no visible line per §5
-      // #496: while the background-helper overlay owns the chat body, suppress
-      // the in-chat engine banners. A Helper that's down would otherwise also
-      // surface an engine-framed banner (the ~30-poll synthesized
-      // `.failed(.engineGone)`), duplicating the fault and misattributing a dead
-      // Helper to the engine — exactly the conflation the overlay removes.
-      if helperRecoveryState == .hidden {
+      // #496: while the background Helper is the live fault, the window-level
+      // `UnifiedStatusBanner` already attributes it correctly (the helper axis
+      // outranks the engine axis). Suppress the in-chat ENGINE banners so a dead
+      // Helper is never ALSO re-framed here as an engine fault (the ~30-poll
+      // synthesized `.failed(.engineGone)`) — the mis-attribution the deleted
+      // full-bleed overlay used to prevent, now carried by the banner/
+      // attribution path (`StatusBannerReducer.helperOwnsBanner`).
+      if !helperOwnsStatusBanner {
         // #326 Path 2: surface a swallowed failed(modelMissing) engine
         // state with an inline download + auto-start, instead of leaving
         // the user to discover it by failing a send.
@@ -344,31 +358,29 @@ struct ChatScaffoldView: View {
               engineStatus: engineStatusStore.status) ? { engineActionError = nil } : nil)
         }
       }
-      // #496: the chat body (transcript + composer) carries the bounded
-      // helper-recovery overlay. It covers ONLY this region — the toolbar above
-      // and the app-wide status banner stay visible — and never starts the
-      // engine/model, so #286's no-surprise-memory policy holds.
-      ZStack {
-        VStack(spacing: 0) {
-          TranscriptView(chat: chat)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-          ComposerView(
-            chat: chat,
-            viewModel: viewModel,
-            isSending: sendController.isInFlight,
-            shouldAllowSend: { currentModelID(for: chat) != nil },
-            onSendBlocked: { presentNoModelPrompt() },
-            onUserMessageSaved: { _ in sendAssistantTurn(for: chat) }
-          )
-        }
-        if helperRecoveryState != .hidden {
-          HelperRecoveryOverlay(
-            state: helperRecoveryState,
-            onRestartHelper: { helperHealth.restartHelperManually() },
-            onOpenLoginItems: { SMAppService.openSystemSettingsLoginItems() },
-            onCollectDiagnostics: { Task { await DiagnosticsCollector.collectAndReveal() } }
-          )
-        }
+      // #496: an engine action refused because the Helper isn't healthy — an
+      // inline, helper-framed acknowledgment near the action. The authoritative
+      // helper status lives in the window-level `UnifiedStatusBanner` above.
+      if let helperBlock {
+        HelperUnavailableNotice(reason: helperBlock, onDismiss: { self.helperBlock = nil })
+      }
+      // #496: the chat body is the transcript + composer. It is NEVER covered by
+      // a full-bleed helper overlay — that earlier overlay's `maxHeight:.infinity`
+      // exploded the window layout and made the WHOLE window non-interactive. A
+      // dead/starting Helper now reads on the bounded window banner (+ the inline
+      // notice above for a refused action), keeping the sidebar/history/Settings
+      // live.
+      VStack(spacing: 0) {
+        TranscriptView(chat: chat)
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        ComposerView(
+          chat: chat,
+          viewModel: viewModel,
+          isSending: sendController.isInFlight,
+          shouldAllowSend: { currentModelID(for: chat) != nil },
+          onSendBlocked: { presentNoModelPrompt() },
+          onUserMessageSaved: { _ in sendAssistantTurn(for: chat) }
+        )
       }
     }
     .background(Color(nsColor: .windowBackgroundColor))
@@ -410,6 +422,12 @@ struct ChatScaffoldView: View {
       // #4: the engine no longer auto-starts on boot — once status settles
       // (.starting → .stopped), proactively ask to start the model.
       maybePromptEngineStartOnLaunch()
+    }
+    // #496: auto-dismiss the inline helper-refusal once the Helper recovers to
+    // a state where the op would be allowed again, so a stale "helper is
+    // starting" notice can't outlive the condition it described.
+    .onChange(of: helperHealth.health) { _, h in
+      if HelperOpGate.evaluate(h) == nil { helperBlock = nil }
     }
     // #397: auto-dismiss the gate once a model resolves (engine came up
     // and reconciled, or a load completed) so the user lands back at the
@@ -733,22 +751,15 @@ struct ChatScaffoldView: View {
     profileStore.model(forProfileID: viewModel.selectedProfileID)
   }
 
-  /// #496: whether (and how) the chat-body helper-recovery overlay should cover
-  /// the transcript + composer. Folds the SAME `HelperHealth` ladder the
-  /// app-wide status banner consumes (banner-parity, so the two surfaces never
-  /// disagree about whether the Helper is up), gated by `engineRunning` so a
-  /// transient mid-session helper poll blip on a live engine never flashes the
-  /// overlay over a working chat. The decision itself is the pure, SPM-tested
-  /// `HelperRecoveryGate`.
-  private var helperRecoveryState: HelperRecoveryGate.State {
-    let engineRunning: Bool = {
-      if case .running = engineStatusStore.status { return true }
-      return false
-    }()
-    return HelperRecoveryGate.evaluate(
-      helper: helperHealth.health,
-      engineRunning: engineRunning
-    )
+  /// #496: whether the background-Helper transport axis OWNS the window-level
+  /// status banner right now (it is being repaired or is unreachable, so
+  /// `StatusBannerReducer` surfaces a HELPER banner that outranks the engine
+  /// axis). While it does, the chat body suppresses its in-chat ENGINE banners
+  /// so a dead Helper is attributed to the Helper (one window banner) and never
+  /// re-framed as an engine fault here. Single source of truth with the banner
+  /// itself, so the two surfaces can never disagree.
+  private var helperOwnsStatusBanner: Bool {
+    StatusBannerReducer.helperOwnsBanner(helperHealth.health)
   }
 
   /// Profile ids the toolbar picker offers — the SAME set the Settings

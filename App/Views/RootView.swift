@@ -1,4 +1,5 @@
 import SwiftUI
+import ServiceManagement
 
 /// Three-column shell per design §5 (Notes-style information disclosure).
 /// Sidebar + item-list are independently collapsible via menu commands wired
@@ -38,7 +39,9 @@ struct RootView: View {
           policy: engineStatusStore.tierPolicy
         ),
         onRestartHelper: { helperHealth.restartHelperManually() },
-        onRestartEngine: { restartEngineFromBanner() }
+        onRestartEngine: { restartEngineFromBanner() },
+        onOpenLoginItems: { SMAppService.openSystemSettingsLoginItems() },
+        onCollectDiagnostics: { Task { await DiagnosticsCollector.collectAndReveal() } }
       )
       // #411: low-urgency, non-modal update prompt. Only present for a newer,
       // non-ignored release found by the once-per-launch check.

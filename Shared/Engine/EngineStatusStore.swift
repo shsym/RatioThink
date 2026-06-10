@@ -229,11 +229,24 @@ public final class EngineStatusStore: ObservableObject {
   /// `onPollOutcome`); the executor is the sole production consumer.
   @MainActor public var onExplicitStop: () -> Void = {}
 
+  /// #496: refuse a Helper MUTATION (start/stop/restart) while the Helper
+  /// transport isn't healthy. Reads the same `helperHealthProvider` the chat
+  /// recovery wait uses; a `nil` provider (default / tests with no helper
+  /// source) leaves every op allowed, preserving prior behavior. Read-only
+  /// polls (`refresh`/`engineMemory`/the loop) stay UNGATED so the ladder can
+  /// recover — see `HelperOpGate`. Throws `HelperUnavailable` so the call site
+  /// surfaces an inline, helper-framed refusal (never the engine banner).
+  private func requireHelperAvailable() throws {
+    guard let health = helperHealthProvider() else { return }
+    if let block = HelperOpGate.evaluate(health) { throw block }
+  }
+
   ///  Unload: ask the helper to stop the running engine, freeing the
   /// resident model's RAM. Throws on rejection / transport failure so
   /// the caller keeps the resident-model state when the stop did not
   /// actually happen. The next status poll reflects the stopped engine.
   public func stopEngine() async throws {
+    try requireHelperAvailable()
     onExplicitStop()
     try await client.stopEngine()
   }
@@ -263,6 +276,7 @@ public final class EngineStatusStore: ObservableObject {
   /// default-model-change restart that boots the freshly-saved profile
   /// default (set-as-default, post-download).
   public func restartEngine(profileID: String, modelOverride: String? = nil) async throws {
+    try requireHelperAvailable()
     do {
       try await client.restartEngine(profileID: profileID, modelOverride: modelOverride)
     } catch let error as AppXPCClientError {
@@ -364,6 +378,7 @@ public final class EngineStatusStore: ObservableObject {
   /// profile's persisted default, so a no-default profile starts cleanly
   /// from an explicit pick (#459 repro 1).
   public func startEngine(profileID: String, modelOverride: String? = nil) async throws {
+    try requireHelperAvailable()
     do {
       try await client.startEngine(profileID: profileID, modelOverride: modelOverride)
     } catch let error as AppXPCClientError {
