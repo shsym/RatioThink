@@ -51,7 +51,8 @@ struct ModelsSettingsTab: View {
       Task { await refresh() }
     }
     .sheet(isPresented: $showAddSheet) {
-      AddModelSheet(modelsDirectory: modelsDirectory) { outcome in
+      AddModelSheet(modelsDirectory: modelsDirectory,
+                    installed: installed) { outcome in
         handleSheetOutcome(outcome)
         Task { await refresh() }
       }
@@ -210,6 +211,22 @@ struct ModelsSettingsTab: View {
       actionError = Self.formatImportOutcome(successes: successes,
                                               failures: failures)
     case .queueDownload(let repo, let file):
+      // #514: duplicate prevention happens HERE, before enqueue — the
+      // downloader's overwrite semantics are not the user-facing
+      // guard. The sheet already hides Add for non-addable rows; this
+      // re-classification catches anything that slips past stale UI
+      // state (e.g. a download that started between render and click).
+      let status = ModelAvailability(
+        installed: installed,
+        inFlight: downloads.active.values
+          .filter { !$0.isTerminal }
+          .map { (repo: $0.repo, file: $0.file) }
+      ).status(repo: repo, file: file)
+      if let blocked = status.blockedReason(
+           slug: ModelAvailability.slug(repo: repo, file: file)) {
+        actionError = blocked
+        return
+      }
       if downloads.enqueue(repo: repo, file: file) == nil,
          let err = downloads.lastError {
         actionError = err
