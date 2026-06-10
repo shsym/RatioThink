@@ -73,8 +73,9 @@ struct NoModelLoadedPrompt: View {
     /// Caption above the model chip (`showsModelChip`). Source-honest:
     /// a pinned selection is never called the profile default (#497).
     var loadCaption: String? = nil
-    /// Caption above the download CTA. Nil when a reason or spinner
-    /// already explains the state.
+    /// Caption above the download CTA. Nil when the headline, a reason,
+    /// or the spinner detail already explains the state (the
+    /// `engineFailed(.modelMissing)` and `.busy` download cells).
     var downloadCaption: String? = nil
     /// Body copy for the unavailable state. Non-nil replaces the old
     /// `showsUnavailableCopy` flag and carries pin-framed copy when the
@@ -121,8 +122,8 @@ struct NoModelLoadedPrompt: View {
         // isn't on disk. "No model loaded" read as "nothing is set up".
         // #497: name the provenance honestly — a pinned selection is
         // never described as the profile's default. The
-        // `.engineFailed(.modelMissing)` + `.download` sibling below keeps
-        // the default framing (the boot that failed has no target axis).
+        // `.engineFailed(.modelMissing)` + `.download` sibling below is
+        // target-NEUTRAL instead (that failure state has no target axis).
         return Plan(headline: target.source == .selected
                       ? "Selected model isn't downloaded"
                       : "Default model isn't downloaded",
@@ -155,7 +156,12 @@ struct NoModelLoadedPrompt: View {
       // `.needsDefaultLoad` + `.download` sibling above; the #446
       // download framing keeps its bespoke headline).
       if code == .modelMissing, case .download = action {
-        return Plan(headline: "Default model isn't downloaded", reason: nil,
+        // Review v2 F1: the CTA downloads the GATE target (the chat's pin
+        // when present), but this failure state carries no target axis —
+        // so the headline is target-NEUTRAL, like `busyDetail`. It must
+        // never claim "Default" above a button that downloads a pin. The
+        // headline explains the state, so `downloadCaption` stays nil.
+        return Plan(headline: "Model isn't downloaded", reason: nil,
                     showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: true,
                     primary: .none, showsOpenSettings: false)
       }
@@ -258,16 +264,20 @@ struct NoModelLoadedPrompt: View {
     if plan.showsWaitSpinner {
       HStack(spacing: 8) {
         ProgressView().controlSize(.small)
-        Text(plan.detail ?? "").foregroundStyle(.secondary)
-          .fixedSize(horizontal: false, vertical: true)
+        if let detail = plan.detail {
+          Text(detail).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
       }
     }
     if let reason = plan.reason {
       reasonText(reason)
     }
     if plan.showsModelChip, case let .load(model) = action {
-      Text(plan.loadCaption ?? "")
-        .fixedSize(horizontal: false, vertical: true)
+      if let caption = plan.loadCaption {
+        Text(caption)
+          .fixedSize(horizontal: false, vertical: true)
+      }
       modelChip(model)
     }
     if plan.showsDownloadCTA, case let .download(target) = action {

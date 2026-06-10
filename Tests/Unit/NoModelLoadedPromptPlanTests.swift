@@ -87,9 +87,13 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   func test_modelMissing_downloadable_offers_inline_download() {
     // #326 inline download IS the fix for a missing-but-downloadable model.
     // #477: the CTA carries the action; no reason line under it.
+    // Review v2 F1: this failure state carries no target axis while the CTA
+    // downloads the gate target (the pin when present) — the headline is
+    // target-NEUTRAL and doubles as the explainer, so no downloadCaption.
     let p = plan(.engineFailed(code: .modelMissing, reason: "not downloaded"), downloadAction)
-    XCTAssertEqual(p.headline, "Default model isn't downloaded")
+    XCTAssertEqual(p.headline, "Model isn't downloaded")
     XCTAssertNil(p.reason)
+    XCTAssertNil(p.downloadCaption, "headline explains the state; no second caption")
     XCTAssertTrue(p.showsDownloadCTA)
     XCTAssertEqual(p.primary, .none)               // CTA owns the action, not Load
   }

@@ -85,8 +85,8 @@ surface must consume these — never re-derive its own.
 
 - #499 scope shipped via #460 (`Chat.modelID` persists); #498's
   running-engine switch shipped via #469 (`restartEngine`). Remaining:
-  `engineFailed(.modelMissing)` + download keeps the default-framed
-  headline even when the failed boot targeted a pin (the failure state
-  carries no target axis). Its sibling `.busy` likewise carries no
-  target axis; its spinner detail is deliberately target-NEUTRAL ("The
-  model isn't downloaded yet…") so it can't misattribute a pin.
+  the `engineFailed(.modelMissing)` and `.busy` states carry no target
+  axis, so their download copy is deliberately target-NEUTRAL ("Model
+  isn't downloaded" / "The model isn't downloaded yet…") — honest but
+  unable to say "selected". Threading a target through those states
+  would close the remaining sliver.
