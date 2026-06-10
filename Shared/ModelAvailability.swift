@@ -86,6 +86,17 @@ public struct ModelAvailability: Equatable, Sendable {
     var app = Set<String>()
     var hf = Set<String>()
     for row in installed {
+      // A partial (interrupted) download is NOT an install: marking it
+      // "Installed" would render a healthy badge over broken bytes AND
+      // block the re-download that repairs it (review v1 F1). Skipped
+      // rows stay `availableToDownload`, and `ModelDownloader.start`'s
+      // stale-resume cleanup handles the leftover `.partial` sibling.
+      //
+      // `metadataUnreadable` rows DO count: only the size/date read
+      // failed — the file itself is present, so a fresh download would
+      // still be redundant. `isUnverified` likewise counts (the bytes
+      // are complete; integrity badging is the Models table's job).
+      if row.isPartial { continue }
       switch row.source {
       case .appManaged:       app.insert(row.filename)
       case .huggingFaceCache: hf.insert(row.filename)

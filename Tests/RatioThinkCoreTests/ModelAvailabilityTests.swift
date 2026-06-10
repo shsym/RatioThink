@@ -9,12 +9,15 @@ import XCTest
 final class ModelAvailabilityTests: XCTestCase {
 
   private func row(_ filename: String,
-                   source: CachedModelSource = .appManaged) -> InstalledModel {
+                   source: CachedModelSource = .appManaged,
+                   isPartial: Bool = false,
+                   metadataUnreadable: Bool = false) -> InstalledModel {
     InstalledModel(filename: filename,
                    url: URL(fileURLWithPath: "/tmp/\(filename)"),
                    sizeBytes: 1,
                    modifiedAt: Date(timeIntervalSince1970: 0),
-                   isPartial: false,
+                   isPartial: isPartial,
+                   metadataUnreadable: metadataUnreadable,
                    source: source)
   }
 
@@ -62,6 +65,38 @@ final class ModelAvailabilityTests: XCTestCase {
     XCTAssertEqual(
       availability.status(repo: "Qwen/Qwen3-0.6B-GGUF", file: "Qwen3-0.6B-Q8_0.gguf"),
       .availableToDownload)
+  }
+
+  // MARK: - broken / degraded installs (review v1 F1)
+
+  func test_partial_install_stays_available_to_download() {
+    // An interrupted download (.partial sibling) is broken bytes, not
+    // an install — "Installed" would block the repairing re-download.
+    let availability = ModelAvailability(
+      installed: [row("Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf", isPartial: true)])
+    XCTAssertEqual(
+      availability.status(repo: "Qwen/Qwen3-0.6B-GGUF", file: "Qwen3-0.6B-Q8_0.gguf"),
+      .availableToDownload)
+  }
+
+  func test_partial_hf_cache_row_stays_available_to_download() {
+    let availability = ModelAvailability(
+      installed: [row("Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf",
+                      source: .huggingFaceCache, isPartial: true)])
+    XCTAssertEqual(
+      availability.status(repo: "Qwen/Qwen3-0.6B-GGUF", file: "Qwen3-0.6B-Q8_0.gguf"),
+      .availableToDownload)
+  }
+
+  func test_metadata_unreadable_install_still_counts_as_installed() {
+    // Policy: only the size/date read failed — the file is present, so
+    // a fresh download is still redundant.
+    let availability = ModelAvailability(
+      installed: [row("Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf",
+                      metadataUnreadable: true)])
+    XCTAssertEqual(
+      availability.status(repo: "Qwen/Qwen3-0.6B-GGUF", file: "Qwen3-0.6B-Q8_0.gguf"),
+      .installedAppManaged)
   }
 
   // MARK: - source mapping

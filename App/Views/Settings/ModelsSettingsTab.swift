@@ -213,19 +213,24 @@ struct ModelsSettingsTab: View {
     case .queueDownload(let repo, let file):
       // #514: duplicate prevention happens HERE, before enqueue — the
       // downloader's overwrite semantics are not the user-facing
-      // guard. The sheet already hides Add for non-addable rows; this
-      // re-classification catches anything that slips past stale UI
-      // state (e.g. a download that started between render and click).
-      let status = ModelAvailability(
+      // guard. Honest staleness note (review v1 F2): the downloading
+      // axis is LIVE (`downloads.active` right now); the installed
+      // axis is the same snapshot the sheet rendered from, so the
+      // decision adds a targeted filesystem existence check on the
+      // exact destination as the backstop for an install `refresh()`
+      // hasn't surfaced yet.
+      switch Self.duplicateAddDecision(
+        repo: repo, file: file,
         installed: installed,
         inFlight: downloads.active.values
           .filter { !$0.isTerminal }
-          .map { (repo: $0.repo, file: $0.file) }
-      ).status(repo: repo, file: file)
-      if let blocked = status.blockedReason(
-           slug: ModelAvailability.slug(repo: repo, file: file)) {
-        actionError = blocked
+          .map { (repo: $0.repo, file: $0.file) },
+        modelsDirectory: modelsDirectory) {
+      case .blocked(let reason):
+        actionError = reason
         return
+      case .proceed:
+        break
       }
       if downloads.enqueue(repo: repo, file: file) == nil,
          let err = downloads.lastError {
@@ -234,6 +239,52 @@ struct ModelsSettingsTab: View {
         actionError = nil
       }
     }
+  }
+
+  /// Outcome of the pre-enqueue duplicate guard (review v1 F4 — the
+  /// classify-or-enqueue decision, extracted so both branches are
+  /// directly unit-testable without the SwiftUI view).
+  enum AddDecision: Equatable {
+    case proceed
+    case blocked(String)
+  }
+
+  /// #514 duplicate guard, decided BEFORE `downloads.enqueue`.
+  ///
+  /// Two layers:
+  ///  1. `ModelAvailability` over the installed snapshot + the LIVE
+  ///     non-terminal download set.
+  ///  2. A targeted filesystem existence check on the exact
+  ///     destination `<modelsRoot>/<repo>/<file>` (the ticket's
+  ///     detection-strategy backstop) — catches an install the
+  ///     `installed` snapshot is too stale to know about (review v1
+  ///     F2). Consistent with the F1 partial policy: a destination
+  ///     with a `.partial` sibling is a broken install, NOT a
+  ///     duplicate — the re-download repairs it, so it proceeds.
+  static func duplicateAddDecision(
+    repo: String,
+    file: String,
+    installed: [InstalledModel],
+    inFlight: [(repo: String, file: String)],
+    modelsDirectory: URL?,
+    fileManager: FileManager = .default
+  ) -> AddDecision {
+    let slug = ModelAvailability.slug(repo: repo, file: file)
+    let status = ModelAvailability(installed: installed, inFlight: inFlight)
+      .status(repo: repo, file: file)
+    if let blocked = status.blockedReason(slug: slug) {
+      return .blocked(blocked)
+    }
+    if let dir = modelsDirectory {
+      let dest = dir.appendingPathComponent(slug)
+      if fileManager.fileExists(atPath: dest.path),
+         !fileManager.fileExists(atPath: dest.path + InstalledModels.partialSuffix) {
+        return .blocked(
+          ModelAvailability.Status.installedAppManaged.blockedReason(slug: slug)
+            ?? "'\(slug)' is already installed.")
+      }
+    }
+    return .proceed
   }
 
   /// Pure formatter — `nil` on a clean batch (no failures), otherwise
