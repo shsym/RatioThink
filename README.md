@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="Resources/AppIcon/pie-icon-highres.png" alt="Rational" width="120" />
+<img src="Resources/AppIcon/rational-icon-highres.png" alt="Rational" width="120" />
 
 # Rational
 
