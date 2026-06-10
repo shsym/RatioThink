@@ -307,7 +307,7 @@ struct ChatScaffoldView: View {
       if let bannerTarget = MissingModelRecovery.bannerTarget(
         engineStatus: engineStatusStore.status,
         profileDefaultModel: selectedProfileDefault,
-        sendGatePresented: showNoModelPrompt && noModelAction.isDownload
+        sendGatePresented: showNoModelPrompt && noModelAction(for: chat).isDownload
       ) {
         ModelMissingBanner(
           target: bannerTarget,
@@ -345,7 +345,7 @@ struct ChatScaffoldView: View {
         gateState: chatStartState(for: chat),
         // #326: the model-availability action (Load / Download /
         // unavailable) captured when the send was blocked.
-        action: noModelAction,
+        action: noModelAction(for: chat),
         onLoad: { model in
           // #397: ensure the engine is running FIRST, then load — the
           // pre-#397 `loadDirect` no-opped on a stopped engine. The sheet
@@ -733,7 +733,10 @@ struct ChatScaffoldView: View {
       // `ChatStartGate.evaluate` no longer takes a `load:` state — the load
       // state machine is gone (ModelLoadCenter is residency-only).
       resolvedModelID: currentModelID(for: chat),
-      profileDefault: selectedProfileDefault,
+      // The gate names the model the Load tap will BOOT — the chat's pick
+      // when present (`gateModelID`), not the profile default the boot
+      // path would ignore (#459 repro 1 vs #460's engine-running nil).
+      profileDefault: gateModelID(for: chat),
       profileError: profileStore.lastActiveProfileError?.description
     )
   }
@@ -752,8 +755,8 @@ struct ChatScaffoldView: View {
   /// the shared `ModelDownloadController` and then dismisses on
   /// completion.) The decision itself stays #326's pure
   /// `MissingModelRecovery.promptAction`.
-  private var noModelAction: MissingModelRecovery.PromptAction {
-    Self.availabilityAction(profileDefault: selectedProfileDefault,
+  private func noModelAction(for chat: Chat) -> MissingModelRecovery.PromptAction {
+    Self.availabilityAction(gateModel: gateModelID(for: chat),
                             isModelInstalled: Self.isModelInstalled)
   }
 
@@ -762,13 +765,38 @@ struct ChatScaffoldView: View {
   /// a view host (and so no stored/memoized copy can hide here): it
   /// re-reads `isModelInstalled` on every call, which is what keeps the
   /// availability axis live per render. `isModelInstalled` is injected so a
-  /// test can drive it; production passes `Self.isModelInstalled`.
-  static func availabilityAction(profileDefault slug: String?,
+  /// test can drive it; production passes `Self.isModelInstalled`. Keys on
+  /// the GATE model (chat pick ?? profile default, `gateModelID`) so the
+  /// install check probes the model the Load/Download will actually use.
+  static func availabilityAction(gateModel slug: String?,
                                  isModelInstalled: (String) -> Bool)
     -> MissingModelRecovery.PromptAction {
     MissingModelRecovery.promptAction(
       profileDefaultModel: slug,
       isInstalled: slug.map(isModelInstalled) ?? false)
+  }
+
+  /// The model identity the send GATE describes — mirrors the boot path's
+  /// precedence (`startEngineForSelectedProfile` boots
+  /// `chats.first?.modelID`, falling back to the profile default), so the
+  /// prompt's chip, download CTA, and Load action all name the model the
+  /// tap will actually boot (#459 repro 1). Distinct from
+  /// `currentModelID(for:)`, which deliberately nils the pick while the
+  /// engine isn't `.running` (#460 send-resolution semantics) and so can't
+  /// feed the gate's model-identity axis. Pure + static for SPM-free
+  /// unit-testing of the precedence.
+  static func gateModelID(selectedModelID: String?,
+                          profileDefaultModel: String?) -> String? {
+    if let pick = selectedModelID,
+       !pick.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      return pick
+    }
+    return profileDefaultModel
+  }
+
+  private func gateModelID(for chat: Chat) -> String? {
+    Self.gateModelID(selectedModelID: chat.modelID,
+                     profileDefaultModel: selectedProfileDefault)
   }
 
   /// "Load default" action. Honors the no-eager-load invariant — only

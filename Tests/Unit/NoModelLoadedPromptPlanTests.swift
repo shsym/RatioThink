@@ -194,7 +194,7 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     let probe: (String) -> Bool = { _ in probeCalls += 1; return installed }
 
     // Render 1 — model not on disk → Download.
-    let r1 = ChatScaffoldView.availabilityAction(profileDefault: slug, isModelInstalled: probe)
+    let r1 = ChatScaffoldView.availabilityAction(gateModel: slug, isModelInstalled: probe)
     guard case .download = r1 else { return XCTFail("render 1 expected .download, got \(r1)") }
 
     // The model lands on disk between renders.
@@ -203,7 +203,7 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     // Render 2 — SAME slug, install-state flipped → must re-probe and
     // return .load. A captured/memoized derivation returns the stale
     // .download here and fails.
-    let r2 = ChatScaffoldView.availabilityAction(profileDefault: slug, isModelInstalled: probe)
+    let r2 = ChatScaffoldView.availabilityAction(gateModel: slug, isModelInstalled: probe)
     guard case .load = r2 else { return XCTFail("render 2 expected .load after install, got \(r2)") }
 
     XCTAssertEqual(probeCalls, 2,
@@ -222,8 +222,77 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   func test_availabilityAction_no_default_is_unavailable_without_probing() {
     var probeCalls = 0
     let action = ChatScaffoldView.availabilityAction(
-      profileDefault: nil, isModelInstalled: { _ in probeCalls += 1; return true })
+      gateModel: nil, isModelInstalled: { _ in probeCalls += 1; return true })
     XCTAssertEqual(action, .unavailable)
     XCTAssertEqual(probeCalls, 0, "no slug → no install probe")
+  }
+
+  // MARK: - gate model identity follows the boot path (#459/#460 interaction)
+
+  /// With the engine stopped, `currentModelID` deliberately nils the chat's
+  /// pick (#460), so the gate's model-identity axis must come from
+  /// `gateModelID` — the same pick-over-default precedence the Load tap's
+  /// `startEngineForSelectedProfile` boots (#459 repro 1). The prompt must
+  /// name the PICK, never the profile default the boot would ignore.
+  func test_gate_with_pick_and_stopped_engine_carries_the_pick() {
+    let pick = "org/picked/picked.gguf"
+    let state = ChatStartGate.evaluate(
+      engineStatus: .stopped,
+      helperError: nil,
+      resolvedModelID: nil,  // engine stopped → currentModelID is nil (#460)
+      profileDefault: ChatScaffoldView.gateModelID(
+        selectedModelID: pick,
+        profileDefaultModel: ProfileStore.defaultChatModelID))
+    XCTAssertEqual(state, .needsDefaultLoad(modelID: pick))
+  }
+
+  func test_gateModelID_precedence_matches_boot_path() {
+    XCTAssertEqual(
+      ChatScaffoldView.gateModelID(selectedModelID: "pick", profileDefaultModel: "default"),
+      "pick")
+    XCTAssertEqual(
+      ChatScaffoldView.gateModelID(selectedModelID: nil, profileDefaultModel: "default"),
+      "default")
+    // Blank pick falls back, mirroring the helper's nil/blank boot fallback.
+    XCTAssertEqual(
+      ChatScaffoldView.gateModelID(selectedModelID: "  ", profileDefaultModel: "default"),
+      "default")
+    XCTAssertNil(ChatScaffoldView.gateModelID(selectedModelID: nil, profileDefaultModel: nil))
+  }
+
+  /// Availability keys on the gate model: a pick that IS installed while
+  /// the profile default is NOT must yield `.load(pick)` — never the
+  /// default's Download CTA (which would download a model the Load tap
+  /// wouldn't boot).
+  func test_availability_keys_on_the_pick_not_the_default() {
+    let pick = "org/picked/picked.gguf"
+    let installed: (String) -> Bool = { $0 == pick }  // default missing
+    let action = ChatScaffoldView.availabilityAction(
+      gateModel: ChatScaffoldView.gateModelID(
+        selectedModelID: pick,
+        profileDefaultModel: ProfileStore.defaultChatModelID),
+      isModelInstalled: installed)
+    XCTAssertEqual(action, .load(pick))
+  }
+
+  /// End-to-end through the plan: pick + stopped engine renders the Load
+  /// chip naming the PICK (the chip slug comes from the `.load` payload).
+  func test_prompt_plan_chip_names_the_pick() {
+    let pick = "org/picked/picked.gguf"
+    let gateModel = ChatScaffoldView.gateModelID(
+      selectedModelID: pick,
+      profileDefaultModel: ProfileStore.defaultChatModelID)
+    let state = ChatStartGate.evaluate(
+      engineStatus: .stopped, helperError: nil,
+      resolvedModelID: nil, profileDefault: gateModel)
+    let action = ChatScaffoldView.availabilityAction(
+      gateModel: gateModel, isModelInstalled: { $0 == pick })
+    let p = plan(state, action)
+    XCTAssertTrue(p.showsModelChip)
+    XCTAssertEqual(p.primary, .load)
+    guard case let .load(chipModel) = action else {
+      return XCTFail("expected .load, got \(action)")
+    }
+    XCTAssertEqual(chipModel, pick, "the chip must name the model the tap will boot")
   }
 }
