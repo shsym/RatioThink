@@ -158,6 +158,39 @@ final class ChatLifecycleTests: XCTestCase {
                    "reconcile must never delete the chat the user is looking at")
   }
 
+  // MARK: - fetch-failure reporting (review F1)
+
+  private enum StubError: Error { case fetchFailed }
+
+  func test_pruneIfEmpty_reports_fetch_failure_and_deletes_nothing() throws {
+    let context = try makeContext()
+    try insertChat(context)
+    let status = PersistenceStatus()
+
+    ChatLifecycle.pruneIfEmpty(in: context, persistenceStatus: status,
+                               fetchChat: { throw StubError.fetchFailed })
+
+    XCTAssertEqual(status.lastError?.context, "ChatLifecycle.pruneIfEmpty.fetch",
+                   "a store fetch failure must be reported, never silently skipped")
+    XCTAssertEqual(try context.fetchCount(FetchDescriptor<Chat>()), 1,
+                   "a failed fetch must not delete anything")
+  }
+
+  func test_pruneAllEmptyChats_reports_fetch_failure_and_deletes_nothing() throws {
+    let context = try makeContext()
+    try insertChat(context)
+    let status = PersistenceStatus()
+
+    ChatLifecycle.pruneAllEmptyChats(in: context, excluding: nil,
+                                     persistenceStatus: status,
+                                     fetchChats: { throw StubError.fetchFailed })
+
+    XCTAssertEqual(status.lastError?.context, "ChatLifecycle.pruneAllEmptyChats.fetch",
+                   "the launch reconcile must report a fetch failure, not no-op forever")
+    XCTAssertEqual(try context.fetchCount(FetchDescriptor<Chat>()), 1,
+                   "a failed fetch must not delete anything")
+  }
+
   // MARK: - ChatAutoTitle heuristic
 
   func test_autoTitle_trims_and_passes_short_text_through() {

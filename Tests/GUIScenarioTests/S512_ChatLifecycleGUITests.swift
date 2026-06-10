@@ -108,6 +108,11 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
 
     XCTAssertTrue(relaunched.buttons["chats.empty.newButton"].waitForExistence(timeout: 10),
                   "launch reconcile must prune the leftover empty draft (empty chat-list placeholder expected); app tree: \(relaunched.debugDescription)")
+    // Review F2: the row count is scoped to `chats.list`, which counts 0
+    // over a missing element — prove the sidebar actually rendered (list
+    // or its empty placeholder) before trusting count == 0.
+    XCTAssertTrue(chatList(in: relaunched).exists || relaunched.buttons["chats.empty.newButton"].exists,
+                  "sidebar never rendered — a scoped row count of 0 would be vacuous; app tree: \(relaunched.debugDescription)")
     XCTAssertTrue(waitForNewChatRowCount(0, in: relaunched),
                   "no 'New Chat' shell may survive the launch reconcile; app tree: \(relaunched.debugDescription)")
   }

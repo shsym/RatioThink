@@ -46,8 +46,29 @@ public enum ChatLifecycle {
     persistenceStatus: PersistenceStatus
   ) {
     let descriptor = FetchDescriptor<Chat>(predicate: #Predicate { $0.id == chatID })
-    guard let chat = (try? context.fetch(descriptor))?.first,
-          isPrunableEmpty(chat) else { return }
+    pruneIfEmpty(in: context, persistenceStatus: persistenceStatus,
+                 fetchChat: { try context.fetch(descriptor).first })
+  }
+
+  /// Fetch seam for the prune-on-leave path (review F1): a store fetch
+  /// failure must be REPORTED, not silently skipped — `try?` here would
+  /// make pruning appear to work while never running. Internal so the
+  /// report-and-bail contract is unit-testable (an in-memory SwiftData
+  /// store cannot be made to throw on demand).
+  @MainActor
+  static func pruneIfEmpty(
+    in context: ModelContext,
+    persistenceStatus: PersistenceStatus,
+    fetchChat: () throws -> Chat?
+  ) {
+    let chat: Chat?
+    do {
+      chat = try fetchChat()
+    } catch {
+      persistenceStatus.report(error, context: "ChatLifecycle.pruneIfEmpty.fetch")
+      return
+    }
+    guard let chat, isPrunableEmpty(chat) else { return }
     delete([chat], in: context, persistenceStatus: persistenceStatus,
            reportContext: "ChatLifecycle.pruneIfEmpty")
   }
@@ -62,7 +83,28 @@ public enum ChatLifecycle {
     excluding selectedID: UUID? = nil,
     persistenceStatus: PersistenceStatus
   ) {
-    guard let chats = try? context.fetch(FetchDescriptor<Chat>()) else { return }
+    pruneAllEmptyChats(in: context, excluding: selectedID,
+                       persistenceStatus: persistenceStatus,
+                       fetchChats: { try context.fetch(FetchDescriptor<Chat>()) })
+  }
+
+  /// Fetch seam for the launch reconcile (review F1): a fetch failure
+  /// (corrupt store, migration mismatch) is reported and the reconcile
+  /// bails — never a silent no-op that looks like a clean run.
+  @MainActor
+  static func pruneAllEmptyChats(
+    in context: ModelContext,
+    excluding selectedID: UUID?,
+    persistenceStatus: PersistenceStatus,
+    fetchChats: () throws -> [Chat]
+  ) {
+    let chats: [Chat]
+    do {
+      chats = try fetchChats()
+    } catch {
+      persistenceStatus.report(error, context: "ChatLifecycle.pruneAllEmptyChats.fetch")
+      return
+    }
     let shells = chats.filter { $0.id != selectedID && isPrunableEmpty($0) }
     guard !shells.isEmpty else { return }
     delete(shells, in: context, persistenceStatus: persistenceStatus,
