@@ -92,6 +92,7 @@ xcodebuild -project RatioThink.xcodeproj \
   -parallel-testing-enabled NO \
   test \
   -only-testing:RatioThinkGUITests/S381_NoModelLoadDefaultGUITests/test_no_model_gate_load_default_resolves_and_send_succeeds \
+  -only-testing:RatioThinkGUITests/S381_NoModelLoadDefaultGUITests/test_516_blocked_send_auto_submits_after_load \
   ENABLE_CODE_COVERAGE=NO
 
 echo "load-default gui e2e: PASS"

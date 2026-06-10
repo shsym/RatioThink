@@ -25,8 +25,16 @@ struct ComposerView: View {
   /// no-model confirm) — no user message is committed without a model
   /// to answer it.
   let shouldAllowSend: () -> Bool
-  let onSendBlocked: () -> Void
+  /// #516: carries the blocked draft so the parent can arm the pending
+  /// auto-send with the exact text the gate is promising to deliver.
+  let onSendBlocked: (String) -> Void
   let onUserMessageSaved: (Message) -> Void
+  /// #516: a fired pending auto-send. The composer re-runs its normal
+  /// `submit()` path — same persistence, same gate, same in-flight
+  /// lifecycle as a manual send — but ONLY while the live draft still
+  /// matches the text the gate promised; an edit made during the model
+  /// load cancels the auto-send rather than sending mid-rewrite text.
+  let autoSubmit: ComposerAutoSubmit?
   @Environment(\.modelContext) private var modelContext
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
   @State private var draft: String = ""
@@ -104,8 +112,9 @@ struct ComposerView: View {
     viewModel: ChatTranscriptViewModel,
     isSending: Bool = false,
     shouldAllowSend: @escaping () -> Bool = { true },
-    onSendBlocked: @escaping () -> Void = {},
-    onUserMessageSaved: @escaping (Message) -> Void = { _ in }
+    onSendBlocked: @escaping (String) -> Void = { _ in },
+    onUserMessageSaved: @escaping (Message) -> Void = { _ in },
+    autoSubmit: ComposerAutoSubmit? = nil
   ) {
     self.chat = chat
     self.viewModel = viewModel
@@ -113,6 +122,7 @@ struct ComposerView: View {
     self.shouldAllowSend = shouldAllowSend
     self.onSendBlocked = onSendBlocked
     self.onUserMessageSaved = onUserMessageSaved
+    self.autoSubmit = autoSubmit
   }
 
   var body: some View {
@@ -156,6 +166,13 @@ struct ComposerView: View {
     .padding(.horizontal, 16)
     .padding(.vertical, 10)
     .onAppear { isFocused = true }
+    // #516: a fired pending auto-send rides the normal submit path. The
+    // tick makes consecutive fires distinguishable; the text match is the
+    // edit guard (see `autoSubmit` doc).
+    .onChange(of: autoSubmit) { _, request in
+      guard let request, trimmedDraft == request.expectedText else { return }
+      submit()
+    }
   }
 
   private var trimmedDraft: String {
@@ -168,7 +185,7 @@ struct ComposerView: View {
     // : block before persisting if no model is resolvable. Keep the
     // draft so the user can send it once they load/choose a model.
     guard shouldAllowSend() else {
-      onSendBlocked()
+      onSendBlocked(payload)
       return
     }
     // Establish the relationship from the to-many owning side
@@ -200,6 +217,14 @@ struct ComposerView: View {
       persistenceStatus.report(error, context: "ComposerView.submit")
     }
   }
+}
+
+/// #516: one fired pending auto-send. `tick` increments per fire so equal
+/// text on a later block still triggers `.onChange`; `expectedText` is the
+/// edit guard the composer checks against its live draft.
+struct ComposerAutoSubmit: Equatable {
+  let tick: Int
+  let expectedText: String
 }
 
 // MARK: - AppKit bridge

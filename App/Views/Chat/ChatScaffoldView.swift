@@ -61,6 +61,14 @@ struct ChatScaffoldView: View {
   /// `HelperUnavailableNotice` — never the engine-failure banner, which would
   /// re-attribute a Helper state to the engine.
   @State private var helperBlock: HelperUnavailable?
+  /// #516: the send the gate is holding. Armed when a send is blocked
+  /// (with the blocked draft + the gate's load target), evaluated on every
+  /// model-resolution edge, fired exactly once through the composer's
+  /// normal submit path. Cleared on cancel, manual send, profile switch,
+  /// navigation away, or a stale resolution (different model/chat).
+  @State private var pendingAutoSend: PendingAutoSend?
+  /// #516: the fire signal handed to the composer (tick + edit-guard text).
+  @State private var composerAutoSubmit: ComposerAutoSubmit?
 
   init(
     chatID: UUID,
@@ -378,8 +386,23 @@ struct ChatScaffoldView: View {
           viewModel: viewModel,
           isSending: sendController.isInFlight,
           shouldAllowSend: { currentModelID(for: chat) != nil },
-          onSendBlocked: { presentNoModelPrompt() },
-          onUserMessageSaved: { _ in sendAssistantTurn(for: chat) }
+          onSendBlocked: { draft in
+            // #516: capture the blocked send so it can auto-submit once
+            // the gate's load target resolves — the promise the sheet's
+            // copy makes ("…to send your message").
+            pendingAutoSend = PendingAutoSend.arm(
+              chatID: chat.id,
+              targetModelID: gateTarget(for: chat)?.modelID,
+              messageText: draft)
+            presentNoModelPrompt()
+          },
+          onUserMessageSaved: { _ in
+            // A send committed (manual or fired auto-send) — any armed
+            // pending send is now satisfied or superseded. #516.
+            pendingAutoSend = nil
+            sendAssistantTurn(for: chat)
+          },
+          autoSubmit: composerAutoSubmit
         )
       }
     }
@@ -410,8 +433,17 @@ struct ChatScaffoldView: View {
         onRetryEngineStart: { startEngineForSelectedProfile() },
         // #397 F1: helper unreachable → force an immediate status re-poll.
         onRefresh: { refreshEngineStatus() },
-        onCancel: { showNoModelPrompt = false },
-        engineStatus: engineStatusStore.status
+        onCancel: {
+          // #516: a dismissed gate drops the pending send — the draft stays
+          // in the composer, but nothing auto-fires later.
+          pendingAutoSend = nil
+          showNoModelPrompt = false
+        },
+        engineStatus: engineStatusStore.status,
+        // #516: only promise "…to send your message" when a blocked send is
+        // actually armed to fire (the launch-time prompt raises this same
+        // sheet with an empty composer — there, the copy must not lie).
+        willAutoSend: pendingAutoSend != nil
       )
     }
     .onChange(of: engineStatusStore.status) { _, new in
@@ -432,8 +464,8 @@ struct ChatScaffoldView: View {
     // #397: auto-dismiss the gate once a model resolves (engine came up
     // and reconciled, or a load completed) so the user lands back at the
     // composer with their draft intact — no stale "starting…" sheet.
-    .onChange(of: modelLoadCenter.residentModelID) { _, _ in dismissPromptIfResolved(for: chat) }
-    .onChange(of: chat.modelID) { _, _ in dismissPromptIfResolved(for: chat) }
+    .onChange(of: modelLoadCenter.residentModelID) { _, _ in resolutionEdge(for: chat) }
+    .onChange(of: chat.modelID) { _, _ in resolutionEdge(for: chat) }
     // #413: open/close the helper-health generation gate around every stream.
     // While a chat / ToT generation is in flight a saturated engineStatus poll
     // path can time out for many consecutive polls; without this gate the
@@ -463,6 +495,9 @@ struct ChatScaffoldView: View {
       // the sidebar. Save explicitly so a quick relaunch lands the
       // new profile durably.
       guard chat.profileID != new else { return }
+      // #516: a profile switch makes the gate's promised load target stale —
+      // drop the pending send rather than auto-firing under a new profile.
+      pendingAutoSend = nil
       let previous = chat.profileID
       chat.profileID = new
       do {
@@ -492,6 +527,9 @@ struct ChatScaffoldView: View {
     }
     .onDisappear {
       sendController.cancel()
+      // #516: navigating away abandons the pending flow — no stale
+      // auto-send when the user later returns or switches chats.
+      pendingAutoSend = nil
     }
     .task(id: downloadController.completionTick) {
       await refreshToolbarModelOptions()
@@ -908,6 +946,29 @@ struct ChatScaffoldView: View {
   private func dismissPromptIfResolved(for chat: Chat) {
     if showNoModelPrompt, currentModelID(for: chat) != nil {
       showNoModelPrompt = false
+    }
+  }
+
+  /// #516: a model-resolution edge (residency reconciled, or the chat's
+  /// selection re-seeded to the served model). Closes the gate (#397) and
+  /// settles any armed pending send: fire it through the composer when the
+  /// INTENDED model resolved, drop it when a different one did (the user
+  /// switched model/profile mid-load), keep holding otherwise.
+  private func resolutionEdge(for chat: Chat) {
+    dismissPromptIfResolved(for: chat)
+    guard let pending = pendingAutoSend else { return }
+    switch pending.verdict(chatID: chat.id, resolvedModelID: currentModelID(for: chat)) {
+    case .hold:
+      break
+    case .disarm:
+      pendingAutoSend = nil
+    case .fire:
+      // Clear BEFORE signalling so re-entrant resolution edges (the send
+      // itself reconciles state) can never fire the same message twice.
+      pendingAutoSend = nil
+      composerAutoSubmit = ComposerAutoSubmit(
+        tick: (composerAutoSubmit?.tick ?? 0) + 1,
+        expectedText: pending.messageText)
     }
   }
 

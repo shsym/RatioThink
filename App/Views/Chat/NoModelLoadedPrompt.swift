@@ -42,6 +42,11 @@ struct NoModelLoadedPrompt: View {
   let onCancel: () -> Void
   /// Live engine status, threaded into the download CTA (PR#15 F1).
   let engineStatus: EngineStatus
+  /// #516: true when a blocked send is armed to auto-submit once the load
+  /// target resolves. Drives the "…to send your message" copy — the same
+  /// sheet is also raised by the launch-time engine-start prompt with an
+  /// empty composer, where that promise would be a lie.
+  let willAutoSend: Bool
 
   // MARK: - pure decision (testable)
 
@@ -84,8 +89,12 @@ struct NoModelLoadedPrompt: View {
   }
 
   /// Fold the lifecycle state + availability action into a render plan.
+  /// #516: `willAutoSend` selects between the promise copy ("…to send your
+  /// message") and the neutral copy — the promise is rendered only when the
+  /// pending auto-send is actually armed to keep it.
   static func plan(state: ChatStartGate.State,
-                   action: MissingModelRecovery.PromptAction) -> Plan {
+                   action: MissingModelRecovery.PromptAction,
+                   willAutoSend: Bool) -> Plan {
     switch state {
     case .ready:
       // Gate not shown; render nothing if a race presents it for a frame.
@@ -104,7 +113,7 @@ struct NoModelLoadedPrompt: View {
       return Plan(headline: busyTitle(phase), reason: nil, showsWaitSpinner: true,
                   showsModelChip: false, showsDownloadCTA: keepDownload,
                   primary: .none, showsOpenSettings: false,
-                  detail: busyDetail(phase, action: action))
+                  detail: busyDetail(phase, action: action, willAutoSend: willAutoSend))
 
     case let .needsLoad(target):
       // #326 availability action is authoritative for load-vs-download.
@@ -113,9 +122,19 @@ struct NoModelLoadedPrompt: View {
         return Plan(headline: "Model not loaded yet", reason: nil, showsWaitSpinner: false,
                     showsModelChip: true, showsDownloadCTA: false,
                     primary: .load, showsOpenSettings: false,
-                    loadCaption: target.source == .selected
-                      ? "Load your selected model to send your message?"
-                      : "Load this profile's default model to send your message?")
+                    loadCaption: {
+                      // #516: promise the send only when it will happen.
+                      switch (target.source, willAutoSend) {
+                      case (.selected, true):
+                        return "Load your selected model to send your message?"
+                      case (.selected, false):
+                        return "Load your selected model?"
+                      case (_, true):
+                        return "Load this profile's default model to send your message?"
+                      case (_, false):
+                        return "Load this profile's default model?"
+                      }
+                    }())
       case .download:
         // #446: the body says "isn't downloaded yet" — the headline must
         // agree. A target IS configured (this is `.needsLoad`); it simply
@@ -130,9 +149,19 @@ struct NoModelLoadedPrompt: View {
                     reason: nil, showsWaitSpinner: false,
                     showsModelChip: false, showsDownloadCTA: true,
                     primary: .none, showsOpenSettings: false,
-                    downloadCaption: target.source == .selected
-                      ? "Your selected model isn't downloaded yet. Download it to send your message."
-                      : "This profile's model isn't downloaded yet. Download it to send your message.")
+                    downloadCaption: {
+                      // #516: promise the send only when it will happen.
+                      switch (target.source, willAutoSend) {
+                      case (.selected, true):
+                        return "Your selected model isn't downloaded yet. Download it to send your message."
+                      case (.selected, false):
+                        return "Your selected model isn't downloaded yet. Download it to use it here."
+                      case (_, true):
+                        return "This profile's model isn't downloaded yet. Download it to send your message."
+                      case (_, false):
+                        return "This profile's model isn't downloaded yet. Download it to use it here."
+                      }
+                    }())
       case .unavailable:
         // Review v1 F1: the target is in hand — don't drop it. A pinned
         // selection that can't be loaded or downloaded must be named as
@@ -214,13 +243,18 @@ struct NoModelLoadedPrompt: View {
   /// deliberately target-NEUTRAL — it must never claim "this profile's
   /// model" while the CTA below downloads a pinned selection.
   static func busyDetail(_ phase: ChatStartGate.BusyPhase,
-                         action: MissingModelRecovery.PromptAction) -> String {
+                         action: MissingModelRecovery.PromptAction,
+                         willAutoSend: Bool) -> String {
     switch phase {
     case .startingEngine:
       if case .download = action {
         return "The model isn't downloaded yet — download it to continue."
       }
-      return "Your model is loading — your message will send once it's ready."
+      // #516: "your message will send" is now a kept promise (the armed
+      // pending send fires on resolution); without one armed, stay neutral.
+      return willAutoSend
+        ? "Your model is loading — your message will send once it's ready."
+        : "Your model is loading."
     case .stoppingEngine:
       return "One moment…"
     }
@@ -229,7 +263,7 @@ struct NoModelLoadedPrompt: View {
   // MARK: - body
 
   var body: some View {
-    let plan = Self.plan(state: gateState, action: action)
+    let plan = Self.plan(state: gateState, action: action, willAutoSend: willAutoSend)
     return VStack(alignment: .leading, spacing: 14) {
       if case .ready = gateState {
         EmptyView()
