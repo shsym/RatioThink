@@ -8,6 +8,9 @@ import SwiftData
 struct ChatListView: View {
   @Environment(\.modelContext) private var modelContext
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
+  /// #507: per-chat in-flight state — streaming rows show a right-aligned
+  /// spinner, and deleting a chat first cancels + drops its send pipeline.
+  @EnvironmentObject private var sendCoordinator: ChatSendCoordinator
   /// Sort by `updatedAt` desc at the query layer; pinned-first
   /// ordering happens client-side in `sortedChats` because `Bool`
   /// doesn't conform to `Comparable` and SwiftData rejects
@@ -90,6 +93,14 @@ struct ChatListView: View {
           .font(.caption2)
           .foregroundStyle(.secondary)
       }
+      // #507: compact waiting indicator after the title while this chat's
+      // response is streaming — clears when the stream finishes or fails.
+      if sendCoordinator.isInFlight(chat.id) {
+        Spacer(minLength: 4)
+        ProgressView()
+          .controlSize(.small)
+          .accessibilityIdentifier("chats.row.streaming")
+      }
     }
   }
 
@@ -151,6 +162,10 @@ struct ChatListView: View {
 
   private func delete(_ chat: Chat) {
     let wasSelected = (selectedItemID == chat.id)
+    // #507: stop any in-flight stream FIRST and drop its controller — the
+    // stream writer must never write onto a Message row the cascade is
+    // about to delete.
+    sendCoordinator.forget(chatID: chat.id)
     modelContext.delete(chat)
     do {
       try modelContext.save()
