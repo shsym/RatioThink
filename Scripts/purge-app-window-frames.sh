@@ -25,8 +25,14 @@ try:
         ["defaults", "export", domain, "-"],
         capture_output=True, check=True,
     ).stdout
-except subprocess.CalledProcessError:
-    sys.exit(0)  # domain does not exist yet — nothing to purge
+except subprocess.CalledProcessError as e:
+    if b"does not exist" in (e.stderr or b""):
+        sys.exit(0)  # domain does not exist yet — nothing to purge
+    # Any other export failure (corrupt plist, cfprefsd error) must be
+    # LOUD: a silently skipped purge resurfaces as offscreen / not-hittable
+    # GUI flakes with no breadcrumb (#507 trap).
+    sys.stderr.write(f"defaults export {domain} failed: {e.stderr.decode(errors='replace')}\n")
+    sys.exit(1)
 
 for key in [k for k in plistlib.loads(out) if k.startswith("NSWindow Frame")]:
     subprocess.run(["defaults", "delete", domain, key], check=True)

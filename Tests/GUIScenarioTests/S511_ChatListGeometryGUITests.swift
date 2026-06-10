@@ -27,6 +27,9 @@ final class S511_ChatListGeometryGUITests: XCTestCase {
 
   override func setUp() async throws {
     try guardSeatedGUI()
+    // A failed seed or geometry check makes every later assertion in the
+    // same test misattributed noise — stop at the first failure.
+    continueAfterFailure = false
   }
 
   override func tearDown() {
@@ -118,8 +121,14 @@ final class S511_ChatListGeometryGUITests: XCTestCase {
       }
     }
 
+    let windowFrame = app.windows.firstMatch.frame
     for frame in frames {
       check(!frame.isEmpty, "chat row has empty accessibility frame")
+      // #511's root-cause symptom was the whole hosting view drifting
+      // offscreen while rows stayed mutually consistent in AX coordinates
+      // — row-relative checks alone could pass that state.
+      check(windowFrame.intersects(frame),
+            "chat row (\(frame)) is outside the window (\(windowFrame))")
     }
 
     // 1. Rows are vertically ordered and pairwise non-overlapping.

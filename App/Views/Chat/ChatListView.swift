@@ -159,9 +159,10 @@ struct ChatListView: View {
   }
 }
 
-/// #511: chat-list row content as a standalone, SwiftData-free view so the
-/// Tests/Unit layout contract can host and measure it headlessly while the
-/// S511 GUI suite guards the same geometry in the real window.
+/// #511: chat-list row content as a standalone, SwiftData-free view — its
+/// real job is carrying the stable accessibility identifiers the S511
+/// geometry guard asserts on (and keeping the row hostable headlessly
+/// without a model container if a unit-tier layout test is ever added).
 ///
 /// Accessibility identifiers are load-bearing for S511: the container is
 /// `chats.row` and the texts are `chats.row.title` / `chats.row.timestamp`.
