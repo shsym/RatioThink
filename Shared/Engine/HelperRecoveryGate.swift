@@ -85,7 +85,24 @@ public enum HelperRecoveryGate {
   ///   - engineRunning: is the engine currently `.running`? A running engine
   ///     means the chat body is usable, so the overlay stays hidden even on a
   ///     transient helper poll blip — it must never cover a working chat.
-  public static func evaluate(helper: HelperHealth, engineRunning: Bool) -> State {
+  ///   - chatBypassesHelper: the chat engine client is hardwired to a fixed
+  ///     base URL (the DEBUG/test-mode `PIE_TEST_ENGINE_BASE_URL` seam) and
+  ///     never routes through the Helper. The Helper is then not load-bearing
+  ///     for the chat body, so the overlay — whose whole claim is "the engine
+  ///     can't run because the Helper is down" — must stay hidden: it would
+  ///     cover a fully working chat (the rule above) and misstate the fault.
+  ///     The app-wide status banner still reflects the helper axis. In Release
+  ///     the seam is refused (`HelperConfig.testEngineBaseURLOverride`), so
+  ///     this is constant `false` for real users and a genuinely absent
+  ///     Helper still raises the overlay.
+  public static func evaluate(
+    helper: HelperHealth,
+    engineRunning: Bool,
+    chatBypassesHelper: Bool = false
+  ) -> State {
+    // The chat body does not depend on the Helper — never cover a working
+    // chat with a helper-framed fault it doesn't have.
+    if chatBypassesHelper { return .hidden }
     // A usable engine wins outright — never cover a working chat body, even if
     // a single poll blipped the helper ladder off `.healthy`.
     if engineRunning { return .hidden }

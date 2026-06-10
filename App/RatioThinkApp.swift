@@ -184,7 +184,12 @@ struct RatioThinkApp: App {
       engineStatus: statusStore,
       modelLoad: center
     ))
-    _engineClientStore = StateObject(wrappedValue: EngineClientStore(client: engine))
+    // `chatBypassesHelper`: with a test base URL the chat client above is
+    // hardwired (`HTTPEngineClient(baseURL:)`) and never consults the Helper,
+    // so the helper-recovery overlay must not claim the chat body is down on
+    // a helper fault (#496 gate input). Constant false in Release.
+    _engineClientStore = StateObject(wrappedValue: EngineClientStore(
+      client: engine, chatBypassesHelper: testBaseURL != nil))
     // #469: the production status-aware executor a model PICK routes through.
     // v1 pie binds the served model at `pie serve` boot, so changing the
     // served model is an engine lifecycle event — start a stopped engine

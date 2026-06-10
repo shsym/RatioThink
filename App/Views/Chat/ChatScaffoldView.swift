@@ -747,7 +747,11 @@ struct ChatScaffoldView: View {
     }()
     return HelperRecoveryGate.evaluate(
       helper: helperHealth.health,
-      engineRunning: engineRunning
+      engineRunning: engineRunning,
+      // The chat client is hardwired to a test base URL and never routes
+      // through the Helper — the overlay must not cover a working chat with
+      // a helper fault it doesn't have (false in Release; see the gate doc).
+      chatBypassesHelper: engineStore.chatBypassesHelper
     )
   }
 

@@ -76,6 +76,38 @@ final class HelperRecoveryGateTests: XCTestCase {
     )
   }
 
+  // MARK: - chatBypassesHelper hides the overlay for EVERY helper state
+
+  func test_chat_bypassing_helper_hides_overlay_regardless_of_helper() {
+    // The chat client is hardwired to a test base URL and never routes
+    // through the Helper — the Helper is not load-bearing for the chat body,
+    // so the overlay must never cover it, even with the ladder fully
+    // escalated and the engine status mirror not `.running`.
+    let states: [HelperHealth] = [
+      .healthy,
+      .reconnecting(consecutiveFailures: 3),
+      .repairing(attempt: 1),
+      .repairCoolingDown(attempt: 1, failuresSinceRepair: 2),
+      .unreachable,
+    ]
+    for helper in states {
+      XCTAssertEqual(
+        HelperRecoveryGate.evaluate(helper: helper, engineRunning: false, chatBypassesHelper: true),
+        .hidden,
+        "a helper-independent chat body must never be covered (helper=\(helper))"
+      )
+    }
+  }
+
+  func test_default_does_not_bypass() {
+    // Omitting the parameter keeps the production (helper-routed) behavior —
+    // the Release path, where the seam is refused, must still escalate.
+    XCTAssertEqual(
+      HelperRecoveryGate.evaluate(helper: .unreachable, engineRunning: false),
+      HelperRecoveryGate.evaluate(helper: .unreachable, engineRunning: false, chatBypassesHelper: false)
+    )
+  }
+
   // MARK: - copy: helper-framed, never engine-framed (#496 core fix)
 
   func test_hidden_has_no_copy() {
