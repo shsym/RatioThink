@@ -30,7 +30,7 @@
   .wrap{max-width:920px;margin:0 auto;padding:40px 22px 64px}
 
   /* ---------- hero ---------- */
-  header.hero{text-align:center;padding:14px 0 18px}
+  header.hero{text-align:center;padding:14px 0 24px}
   header.hero img.icon{width:88px;height:88px;border-radius:20px;
     box-shadow:0 6px 26px rgba(var(--accent-rgb),.22);}
   header.hero h1{font-family:var(--serif);font-weight:600;font-size:40px;letter-spacing:-.015em;
@@ -42,7 +42,7 @@
   header.hero p.meta b{color:var(--accent-dark);font-weight:600}
 
   /* ---------- mock app window ---------- */
-  .stage{margin:56px auto 8px;max-width:680px}
+  .stage{margin:96px auto 8px;max-width:680px}
   .window{background:var(--win-bg);border:1px solid var(--border-strong);border-radius:14px;
     overflow:hidden;box-shadow:0 18px 50px rgba(44,39,34,.14);position:relative}
   .titlebar{display:flex;align-items:center;gap:8px;padding:9px 13px;background:var(--win-chrome);
@@ -128,6 +128,12 @@
   .burst::after{background:var(--accent);opacity:.8}
   @keyframes blink{50%{opacity:0}}
 
+  /* finale: the winning leaf is selected LAST and lands with a brief pop + glow */
+  @keyframes winpop{ 0%{transform:scale(1)} 38%{transform:scale(1.06)} 100%{transform:scale(1)} }
+  @keyframes starglow{ 0%{text-shadow:none} 45%{text-shadow:0 0 10px rgba(200,144,31,.85)} 100%{text-shadow:none} }
+  .tnode.win-pop{animation:winpop .7s ease-out; transform-origin:left center}
+  .tnode.win-pop .beam{animation:starglow .85s ease-out}
+
   /* composer */
   .composer{display:flex;align-items:center;gap:9px;padding:11px 13px;border-top:1px solid var(--win-line);
     background:var(--bg)}
@@ -153,7 +159,7 @@
   .dots .dot:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 
   /* ---------- why ---------- */
-  .why{margin:72px auto 0;max-width:760px}
+  .why{margin:120px auto 0;max-width:760px}
   .why h2{font-family:var(--serif);font-size:25px;text-align:center;margin:0 0 8px;font-weight:600}
   .why .lede{text-align:center;font-size:14px;color:var(--ink-muted);max-width:62ch;margin:0 auto 22px}
   .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
@@ -163,7 +169,7 @@
   .card p{font-size:13px;color:var(--ink-soft);margin:0}
 
   /* ---------- footer ---------- */
-  footer{margin:64px auto 0;max-width:760px;text-align:center;font-size:12.5px;color:var(--ink-muted);
+  footer{margin:96px auto 0;max-width:760px;text-align:center;font-size:12.5px;color:var(--ink-muted);
     border-top:1px solid var(--border);padding-top:20px}
   footer a{color:var(--ink-soft)}
   footer .credit{margin-top:7px;font-size:11.5px}
@@ -175,7 +181,7 @@
   }
   /* honor reduced motion: JS renders static frames; kill residual animation */
   @media (prefers-reduced-motion:reduce){
-    .caret::after,.burst::after,.tshead .status.searching{animation:none}
+    .caret::after,.burst::after,.tshead .status.searching,.tnode.win-pop,.tnode.win-pop .beam{animation:none}
     *{transition:none !important}
   }
 </style>
@@ -452,6 +458,8 @@
     await sleep(560, myGen);
 
     // EVERY kept branch explores its own children (real beam search); pruned ones don't.
+    // The eventual winner is held as 'kept' here and only STARRED at the finale.
+    var winner = null;
     for (var bi=0; bi<d.branches.length; bi++){
       var br = d.branches[bi];
       if (br.beam === 'pruned' || !br.children.length) continue;
@@ -461,12 +469,21 @@
       await sleep(220, myGen);
       for (var s=0;s<kids.length;s++){ kids[s].classList.add('scored'); await sleep(170, myGen); }
       await sleep(320, myGen);
-      for (var c2=0;c2<kids.length;c2++){ setBeam(kids[c2], br.children[c2].beam); await sleep(150, myGen); }
+      for (var c2=0;c2<kids.length;c2++){
+        var cb = br.children[c2].beam;
+        if (cb === 'star'){ winner = kids[c2]; setBeam(kids[c2], 'kept'); }  // hold; the star lands last
+        else { setBeam(kids[c2], cb); }
+        await sleep(150, myGen);
+      }
       await sleep(500, myGen);
     }
-    document.getElementById('tstatus').classList.remove('searching');
-    document.getElementById('tstatus').textContent = d.nodeCount + ' nodes';
-    await sleep(900, myGen);
+
+    // FINALE — explore everything first, select the best leaf LAST: the star lands with a pop.
+    await sleep(520, myGen);
+    if (winner){ setBeam(winner, 'star'); winner.classList.add('win-pop'); }
+    var tstat = document.getElementById('tstatus');
+    tstat.classList.remove('searching'); tstat.textContent = d.nodeCount + ' nodes';
+    await sleep(1700, myGen);
 
     // chosen answer arrives; the tree search folds away
     var ans = el('<div class="bubble assistant"></div>');
