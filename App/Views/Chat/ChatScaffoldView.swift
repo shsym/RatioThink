@@ -213,12 +213,15 @@ struct ChatScaffoldView: View {
   /// when it should stay hidden. modelMissing is owned by the download
   /// banner; other `.failed` codes show the live status detail; a thrown
   /// action error shows when the status itself isn't `.failed`.
-  private var engineFailureMessage: String? {
+  private func engineFailureMessage(for chat: Chat) -> String? {
     // PR#15 v2 F1: only suppress modelMissing when the download banner
     // will actually own it (a single-file-GGUF slug). A non-downloadable
     // modelMissing has no download banner, so it must fall through to the
-    // engine-failure banner rather than be menu-bar-dot-only.
-    let slug = selectedProfileDefault
+    // engine-failure banner rather than be menu-bar-dot-only. Keyed on the
+    // same GATE model as the display banner — if the two axes disagree
+    // (non-downloadable pick + downloadable default), both banners vanish
+    // and modelMissing becomes menu-bar-dot-only.
+    let slug = gateModelID(for: chat)
     let hasDownloadTarget = MissingModelRecovery.bannerTarget(
       engineStatus: engineStatusStore.status,
       profileDefaultModel: slug) != nil
@@ -317,7 +320,7 @@ struct ChatScaffoldView: View {
           onDownloaded: { startEngineForSelectedProfile() },
           engineStatus: engineStatusStore.status
         )
-      } else if let message = engineFailureMessage {
+      } else if let message = engineFailureMessage(for: chat) {
         // PR#15 F2/F3: surface a non-modelMissing engine failure (or a
         // thrown start/stop error) in-chat — the user just acted; it must
         // not be menu-bar-dot-only or hidden under "Couldn't save". v2 F2:

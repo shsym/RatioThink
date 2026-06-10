@@ -303,7 +303,11 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   /// load) — with the pick not in the curated catalog the banner is
   /// suppressed outright.
   func test_missingModel_banner_keys_on_the_pick_not_the_default() {
-    let pick = "org/picked/picked.gguf"  // not a curated download
+    // A 2-segment safetensors dir slug is genuinely non-downloadable —
+    // the catalog's generic fallback synthesizes targets for ANY
+    // 3-segment `<org>/<name>/<file>.gguf` slug (review v5 F1: a .gguf
+    // fixture here gets a target and defeats the suppression assert).
+    let pick = "org/picked"
     let failed = EngineStatus.failed(code: .modelMissing, message: "resolver trace")
     let gateModel = ChatScaffoldView.gateModelID(
       selectedModelID: pick,
@@ -327,5 +331,43 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
         profileDefaultModel: ChatScaffoldView.gateModelID(
           selectedModelID: nil,
           profileDefaultModel: ProfileStore.defaultChatModelID)))
+  }
+
+  /// Review v5 F2: with the display banner suppressed for a
+  /// non-downloadable pick, the engine-failure banner must take over —
+  /// if its suppression axis still keyed on the (downloadable) profile
+  /// default, BOTH banners would vanish and modelMissing would be
+  /// menu-bar-dot-only. Some in-chat surface always shows.
+  func test_missingModel_nonDownloadablePick_fallsThroughToEngineFailureBanner() {
+    let pick = "org/picked"  // non-downloadable (2-segment dir slug)
+    let failed = EngineStatus.failed(code: .modelMissing, message: "resolver trace")
+    let gateModel = ChatScaffoldView.gateModelID(
+      selectedModelID: pick,
+      profileDefaultModel: ProfileStore.defaultChatModelID)
+
+    // Both axes key on the same gate model, as ChatScaffoldView wires them.
+    let hasDownloadTarget = MissingModelRecovery.bannerTarget(
+      engineStatus: failed, profileDefaultModel: gateModel) != nil
+    XCTAssertFalse(hasDownloadTarget, "premise: the pick has no download target")
+    XCTAssertEqual(
+      MissingModelRecovery.engineFailureBannerMessage(
+        engineStatus: failed,
+        actionError: nil,
+        statusDetail: "status detail",
+        hasDownloadTarget: hasDownloadTarget),
+      "status detail",
+      "the engine-failure banner must surface a non-downloadable modelMissing")
+
+    // Premise guard: keying suppression on the DEFAULT (old axis) would
+    // have swallowed it — the downloadable default suppresses the message
+    // while the display banner (gate axis) is nil too.
+    let staleAxisTarget = MissingModelRecovery.bannerTarget(
+      engineStatus: failed,
+      profileDefaultModel: ProfileStore.defaultChatModelID) != nil
+    XCTAssertNil(MissingModelRecovery.engineFailureBannerMessage(
+      engineStatus: failed,
+      actionError: nil,
+      statusDetail: "status detail",
+      hasDownloadTarget: staleAxisTarget))
   }
 }
