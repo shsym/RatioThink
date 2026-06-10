@@ -32,7 +32,7 @@ $(LOGDIR):
 # recipes below, which run in a non-sandboxed shell after xcodebuild exits
 # (every test app already dead). Add a suite's prefix here if it stages a real
 # /tmp home. See TEST.md "GUI temp-home cleanup".
-GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-* /tmp/pie-s326dl-* /tmp/pie-s326done-* /tmp/pie-s459swap-*
+GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-* /tmp/pie-s326dl-* /tmp/pie-s326done-* /tmp/pie-s459swap-* /tmp/pie-s512-*
 
 # Canned recipe: run a focused set of RatioThinkGUITests suites via xcodebuild
 # with the seated-session warning + the standard log-capture/PIPESTATUS guard
@@ -64,7 +64,7 @@ endef
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-tot-real-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-load-default test-gui test-ssh test-all \
-        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
+        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-e2e-harsh-load \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
@@ -509,11 +509,14 @@ render-menubar-icon: ## Render the #424 branded menu-bar icon (4 states x light/
 	@/tmp/render-menubar-icon
 	@open /tmp/menubar-icon-preview.png 2>/dev/null || true
 
-test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate, composer auto-grow, profile-swap keep-current, model-menu no-resident confirm, helper-overlay removal, chat-list geometry (S260/S279/S285/S286/S446/S459/S486/S496/S511)
-	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests -only-testing:RatioThinkGUITests/S459_ProfileSwapKeepCurrentGUITests -only-testing:RatioThinkGUITests/S486_ModelMenuNoResidentConfirmGUITests -only-testing:RatioThinkGUITests/S496_HelperOverlayRemovedGUITests -only-testing:RatioThinkGUITests/S511_ChatListGeometryGUITests)
+test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate, composer auto-grow, profile-swap keep-current, model-menu no-resident confirm, helper-overlay removal, chat-list geometry, chat lifecycle prune/auto-title (S260/S279/S285/S286/S446/S459/S486/S496/S511/S512)
+	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests -only-testing:RatioThinkGUITests/S459_ProfileSwapKeepCurrentGUITests -only-testing:RatioThinkGUITests/S486_ModelMenuNoResidentConfirmGUITests -only-testing:RatioThinkGUITests/S496_HelperOverlayRemovedGUITests -only-testing:RatioThinkGUITests/S511_ChatListGeometryGUITests -only-testing:RatioThinkGUITests/S512_ChatLifecycleGUITests)
 
 test-gui-chat-geometry: genproject $(LOGDIR) ## GUI area: #511 chat-list row geometry guard — rows non-overlapping, text contained (S511)
 	$(call gui_suite_run,chat-geometry,-only-testing:RatioThinkGUITests/S511_ChatListGeometryGUITests)
+
+test-gui-chat-lifecycle: genproject $(LOGDIR) ## GUI area: #512 chat lifecycle — empty-draft prune + auto-title (S512)
+	$(call gui_suite_run,chat-lifecycle,-only-testing:RatioThinkGUITests/S512_ChatLifecycleGUITests)
 
 test-gui-helper-recovery: genproject $(LOGDIR) ## GUI area: #496 helper-recovery overlay — starting/unreachable/auto-dismiss + engineRunning gate (S496)
 	$(call gui_suite_run,helper-recovery,-only-testing:RatioThinkGUITests/S496_HelperRecoveryOverlayGUITests)

@@ -49,7 +49,7 @@ final class S258_ComposerSendGUITests: XCTestCase {
               "Rational.app did not relaunch")
     relaunched.activate()
 
-    try selectPersistedChat(in: relaunched)
+    selectPersistedChat(titled: prompt, in: relaunched)
     guard waitForAtLeastTwoStaticTextsContaining(visibleAssistantEcho, in: relaunched, timeout: 15) else {
       XCTFail("assistant response was not visible after relaunch with PIE_HOME=\(pieHome); app tree: \(relaunched.debugDescription)")
       return
@@ -90,13 +90,6 @@ final class S258_ComposerSendGUITests: XCTestCase {
                   "composer.send missing; app tree: \(app.debugDescription)")
     XCTAssertTrue(send.isEnabled, "composer.send was disabled after typing prompt")
     send.click()
-  }
-
-  private func selectPersistedChat(in app: XCUIApplication) throws {
-    let chatTitle = app.staticTexts["New Chat"].firstMatch
-    XCTAssertTrue(chatTitle.waitForExistence(timeout: 10),
-                  "persisted chat row 'New Chat' missing after relaunch; app tree: \(app.debugDescription)")
-    chatTitle.click()
   }
 
   /// MarkdownUI exposes the assistant answer to Accessibility as

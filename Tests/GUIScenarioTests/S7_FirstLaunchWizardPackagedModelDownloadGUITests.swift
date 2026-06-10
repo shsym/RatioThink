@@ -83,7 +83,7 @@ final class S7_FirstLaunchWizardPackagedModelDownloadGUITests: XCTestCase {
                    "gate must offer Load, not Download, once the default model has been downloaded")
     try driveLoadUntilDismissed(load, in: app)
 
-    typeComposerText("Confirm the persisted default is loaded.", in: app)
+    typeComposerText(Self.chatPrompt, in: app)
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5), "composer.send missing")
     XCTAssertTrue(send.isEnabled,
@@ -114,7 +114,7 @@ final class S7_FirstLaunchWizardPackagedModelDownloadGUITests: XCTestCase {
     XCTAssertTrue(relaunched.buttons["chats.newButton"].waitForExistence(timeout: 5),
                   "relaunch did not reach the main shell; app tree: \(relaunched.debugDescription)")
 
-    try selectPersistedChat(in: relaunched)
+    selectPersistedChat(titled: Self.chatPrompt, in: relaunched)
     // Selecting the chat re-raises the once-per-launch start prompt (engine
     // idle); dismiss it without loading so the persisted transcript shows.
     dismissNoModelGateIfPresent(in: relaunched)
@@ -202,12 +202,9 @@ final class S7_FirstLaunchWizardPackagedModelDownloadGUITests: XCTestCase {
                    "Load did not resolve the persisted default (gate still up after \(clicks) click(s)); app tree: \(app.debugDescription)")
   }
 
-  private func selectPersistedChat(in app: XCUIApplication) throws {
-    let chatTitle = app.staticTexts["New Chat"].firstMatch
-    XCTAssertTrue(chatTitle.waitForExistence(timeout: 10),
-                  "persisted chat row 'New Chat' missing after relaunch; app tree: \(app.debugDescription)")
-    chatTitle.click()
-  }
+  /// First user message — also the chat's auto-derived sidebar title
+  /// (#512), which `selectPersistedChat(titled:)` keys on after relaunch.
+  private static let chatPrompt = "Confirm the persisted default is loaded."
 
   private func dismissNoModelGateIfPresent(in app: XCUIApplication) {
     let cancel = app.buttons["noModel.cancel"]
