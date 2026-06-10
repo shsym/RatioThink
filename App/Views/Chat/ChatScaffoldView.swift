@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import ServiceManagement
 
 /// Composes the three pieces a chat detail surface needs:
 ///
@@ -301,51 +302,74 @@ struct ChatScaffoldView: View {
         onStartEngine: startEngineForSelectedProfile
       )
       Divider().opacity(0.0001) // structural breather; no visible line per §5
-      // #326 Path 2: surface a swallowed failed(modelMissing) engine
-      // state with an inline download + auto-start, instead of leaving
-      // the user to discover it by failing a send.
-      // #446: suppress the banner ONLY when the send-gate sheet is presented
-      // AND is itself showing the same inline download (action `.download`),
-      // so the user never sees two download prompts for one model. Review F1:
-      // gate on the sheet's REAL download condition, not bare presentation —
-      // in the present-but-invalid staged-model edge the sheet shows Open
-      // Settings (action `.load`), which does NOT duplicate the banner, so the
-      // banner (the only one-click download there) must stay visible.
-      if let bannerTarget = MissingModelRecovery.bannerTarget(
-        engineStatus: engineStatusStore.status,
-        // Keyed on the GATE model (pick ?? default) like the suppression
-        // axis below and the boot path — the banner must never offer a
-        // download for a default the Load tap wouldn't boot.
-        profileDefaultModel: gateTarget(for: chat)?.modelID,
-        sendGatePresented: showNoModelPrompt && noModelAction(for: chat).isDownload
-      ) {
-        ModelMissingBanner(
-          target: bannerTarget,
-          onDownloaded: { startEngineForSelectedProfile() },
-          engineStatus: engineStatusStore.status
-        )
-      } else if let message = engineFailureMessage(for: chat) {
-        // PR#15 F2/F3: surface a non-modelMissing engine failure (or a
-        // thrown start/stop error) in-chat — the user just acted; it must
-        // not be menu-bar-dot-only or hidden under "Couldn't save". v2 F2:
-        // only offer Dismiss for a dismissable (thrown action-error)
-        // message; a live `.failed` status self-clears on recovery, so its
-        // Dismiss would be a no-op and is hidden.
-        EngineFailureBanner(
-          message: message,
-          onDismiss: MissingModelRecovery.engineFailureDismissable(
-            engineStatus: engineStatusStore.status) ? { engineActionError = nil } : nil)
+      // #496: while the background-helper overlay owns the chat body, suppress
+      // the in-chat engine banners. A Helper that's down would otherwise also
+      // surface an engine-framed banner (the ~30-poll synthesized
+      // `.failed(.engineGone)`), duplicating the fault and misattributing a dead
+      // Helper to the engine — exactly the conflation the overlay removes.
+      if helperRecoveryState == .hidden {
+        // #326 Path 2: surface a swallowed failed(modelMissing) engine
+        // state with an inline download + auto-start, instead of leaving
+        // the user to discover it by failing a send.
+        // #446: suppress the banner ONLY when the send-gate sheet is presented
+        // AND is itself showing the same inline download (action `.download`),
+        // so the user never sees two download prompts for one model. Review F1:
+        // gate on the sheet's REAL download condition, not bare presentation —
+        // in the present-but-invalid staged-model edge the sheet shows Open
+        // Settings (action `.load`), which does NOT duplicate the banner, so the
+        // banner (the only one-click download there) must stay visible.
+        if let bannerTarget = MissingModelRecovery.bannerTarget(
+          engineStatus: engineStatusStore.status,
+          // #477/#497: keyed on the GATE target's model (pick ?? default) like
+          // the suppression axis below and the boot path — the banner must
+          // never offer a download for a default the Load tap wouldn't boot.
+          profileDefaultModel: gateTarget(for: chat)?.modelID,
+          sendGatePresented: showNoModelPrompt && noModelAction(for: chat).isDownload
+        ) {
+          ModelMissingBanner(
+            target: bannerTarget,
+            onDownloaded: { startEngineForSelectedProfile() },
+            engineStatus: engineStatusStore.status
+          )
+        } else if let message = engineFailureMessage(for: chat) {
+          // PR#15 F2/F3: surface a non-modelMissing engine failure (or a
+          // thrown start/stop error) in-chat — the user just acted; it must
+          // not be menu-bar-dot-only or hidden under "Couldn't save". v2 F2:
+          // only offer Dismiss for a dismissable (thrown action-error)
+          // message; a live `.failed` status self-clears on recovery, so its
+          // Dismiss would be a no-op and is hidden.
+          EngineFailureBanner(
+            message: message,
+            onDismiss: MissingModelRecovery.engineFailureDismissable(
+              engineStatus: engineStatusStore.status) ? { engineActionError = nil } : nil)
+        }
       }
-      TranscriptView(chat: chat)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-      ComposerView(
-        chat: chat,
-        viewModel: viewModel,
-        isSending: sendController.isInFlight,
-        shouldAllowSend: { currentModelID(for: chat) != nil },
-        onSendBlocked: { presentNoModelPrompt() },
-        onUserMessageSaved: { _ in sendAssistantTurn(for: chat) }
-      )
+      // #496: the chat body (transcript + composer) carries the bounded
+      // helper-recovery overlay. It covers ONLY this region — the toolbar above
+      // and the app-wide status banner stay visible — and never starts the
+      // engine/model, so #286's no-surprise-memory policy holds.
+      ZStack {
+        VStack(spacing: 0) {
+          TranscriptView(chat: chat)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+          ComposerView(
+            chat: chat,
+            viewModel: viewModel,
+            isSending: sendController.isInFlight,
+            shouldAllowSend: { currentModelID(for: chat) != nil },
+            onSendBlocked: { presentNoModelPrompt() },
+            onUserMessageSaved: { _ in sendAssistantTurn(for: chat) }
+          )
+        }
+        if helperRecoveryState != .hidden {
+          HelperRecoveryOverlay(
+            state: helperRecoveryState,
+            onRestartHelper: { helperHealth.restartHelperManually() },
+            onOpenLoginItems: { SMAppService.openSystemSettingsLoginItems() },
+            onCollectDiagnostics: { Task { await DiagnosticsCollector.collectAndReveal() } }
+          )
+        }
+      }
     }
     .background(Color(nsColor: .windowBackgroundColor))
     .sheet(isPresented: $showNoModelPrompt) {
@@ -707,6 +731,24 @@ struct ChatScaffoldView: View {
   /// the `profileStore` lookup is expressed once rather than four times.
   private var selectedProfileDefault: String? {
     profileStore.model(forProfileID: viewModel.selectedProfileID)
+  }
+
+  /// #496: whether (and how) the chat-body helper-recovery overlay should cover
+  /// the transcript + composer. Folds the SAME `HelperHealth` ladder the
+  /// app-wide status banner consumes (banner-parity, so the two surfaces never
+  /// disagree about whether the Helper is up), gated by `engineRunning` so a
+  /// transient mid-session helper poll blip on a live engine never flashes the
+  /// overlay over a working chat. The decision itself is the pure, SPM-tested
+  /// `HelperRecoveryGate`.
+  private var helperRecoveryState: HelperRecoveryGate.State {
+    let engineRunning: Bool = {
+      if case .running = engineStatusStore.status { return true }
+      return false
+    }()
+    return HelperRecoveryGate.evaluate(
+      helper: helperHealth.health,
+      engineRunning: engineRunning
+    )
   }
 
   /// Profile ids the toolbar picker offers — the SAME set the Settings
