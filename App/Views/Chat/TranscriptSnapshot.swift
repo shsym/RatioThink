@@ -37,10 +37,12 @@ struct TranscriptSnapshot: Equatable {
 @available(macOS 14, *)
 extension TranscriptSnapshot {
   init(messages: [Message]) {
-    self.init(
-      messages: messages,
-      timestamp: { $0.ts },
-      item: { ChatMessageItem($0) }
-    )
+    // Shared transcript order (ts, id-tiebreak — `Message.transcriptPrecedes`):
+    // the same comparator the request builder and the #513 retry truncation
+    // use, so what renders and what "everything after this turn" deletes can
+    // never disagree on timestamp ties.
+    self.init(items: messages
+      .sorted(by: Message.transcriptPrecedes)
+      .map { ChatMessageItem($0) })
   }
 }

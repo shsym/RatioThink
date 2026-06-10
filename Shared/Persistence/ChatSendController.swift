@@ -601,10 +601,7 @@ public final class ChatSendController: ObservableObject {
       turns.append(ChatMessage(role: .system, content: prompt))
     }
     turns.append(contentsOf: chat.messages
-      .sorted { lhs, rhs in
-        if lhs.ts == rhs.ts { return lhs.id.uuidString < rhs.id.uuidString }
-        return lhs.ts < rhs.ts
-      }
+      .sorted(by: Message.transcriptPrecedes)
       .compactMap { message in
         guard let role = ChatMessage.Role(rawValue: message.role) else { return nil }
         guard !Self.excludesFromRequestHistory(message, role: role) else { return nil }

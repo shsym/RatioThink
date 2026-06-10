@@ -73,6 +73,10 @@ struct ChatScaffoldView: View {
   /// profile switch, navigation away, or a stale resolution. The
   /// transitions live in `PendingSendState` so they are unit-tested.
   @State private var pendingSend = PendingSendState()
+  /// #513: the assistant message id awaiting the destructive-retry
+  /// confirmation. Non-nil presents the alert; Cancel clears it without
+  /// touching history.
+  @State private var pendingRetryMessageID: UUID?
 
   init(
     chatID: UUID,
@@ -384,8 +388,17 @@ struct ChatScaffoldView: View {
       // notice above for a refused action), keeping the sidebar/history/Settings
       // live.
       VStack(spacing: 0) {
-        TranscriptView(chat: chat)
-          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        TranscriptView(
+          chat: chat,
+          // #513: retry waits for the active stream — while this chat is
+          // in flight the controls are hidden entirely (nil), so a retry
+          // can never race the stream writer or cancel an unrelated
+          // chat's stream.
+          onRetryTurn: sendCoordinator.isInFlight(chatID)
+            ? nil
+            : { messageID in requestRetry(for: chat, messageID: messageID) }
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         ComposerView(
           chat: chat,
           viewModel: viewModel,
@@ -452,6 +465,27 @@ struct ChatScaffoldView: View {
         // sheet with an empty composer — there, the copy must not lie).
         willAutoSend: pendingSend.pending != nil
       )
+    }
+    // #513: destructive-retry confirmation. Required whenever the retry
+    // point has later conversation (the plan's `requiresConfirmation`);
+    // a latest-turn retry skips straight to `executeRetry`. Canceling
+    // leaves history untouched — nothing is mutated until Retry.
+    .alert(
+      "Retry from here?",
+      isPresented: Binding(
+        get: { pendingRetryMessageID != nil },
+        set: { if !$0 { pendingRetryMessageID = nil } }
+      )
+    ) {
+      Button("Retry", role: .destructive) {
+        if let messageID = pendingRetryMessageID {
+          executeRetry(for: chat, messageID: messageID)
+        }
+        pendingRetryMessageID = nil
+      }
+      Button("Cancel", role: .cancel) { pendingRetryMessageID = nil }
+    } message: {
+      Text("This will erase all later conversation after this point and generate a new response.")
     }
     .onChange(of: engineStatusStore.status) { _, new in
       // PR#15 F3: a thrown start/stop error is transient — once the poll
@@ -679,6 +713,41 @@ struct ChatScaffoldView: View {
       // on the leave-`.running` edge; nothing to do here.
       break
     }
+  }
+
+  /// #513 entry point from a transcript row's Retry control. Routes
+  /// through the destructive confirmation only when the plan says later
+  /// conversation would be erased; a latest-turn retry executes directly.
+  /// The model gate runs FIRST so a blocked retry raises the no-model
+  /// prompt without having mutated any history.
+  private func requestRetry(for chat: Chat, messageID: UUID) {
+    guard !sendCoordinator.isInFlight(chatID) else { return }
+    guard currentModelID(for: chat) != nil else {
+      presentNoModelPrompt()
+      return
+    }
+    guard let plan = ChatRetryPlan.plan(messages: chat.messages, retryPointID: messageID) else { return }
+    if plan.requiresConfirmation {
+      pendingRetryMessageID = messageID
+    } else {
+      executeRetry(for: chat, messageID: messageID)
+    }
+  }
+
+  /// #513: truncate from the retry point, then resend from the retained
+  /// prefix via the normal send path (same model/profile resolution, same
+  /// ToT dispatch, same per-chat controller — so an unrelated chat's
+  /// stream is never touched). The plan is recomputed here rather than
+  /// captured at confirm time, so it always reflects the live transcript.
+  /// A failed truncation save aborts the resend — the engine must never
+  /// see a prefix the store does not hold.
+  private func executeRetry(for chat: Chat, messageID: UUID) {
+    guard !sendCoordinator.isInFlight(chatID) else { return }
+    guard let plan = ChatRetryPlan.plan(messages: chat.messages, retryPointID: messageID),
+          ChatRetryPlan.execute(plan, chat: chat, context: modelContext,
+                                persistenceStatus: persistenceStatus)
+    else { return }
+    sendAssistantTurn(for: chat)
   }
 
   private func sendAssistantTurn(for chat: Chat) {

@@ -112,6 +112,16 @@ public extension Message {
     guard let meta else { return nil }
     return try? JSONDecoder().decode(MessageMeta.self, from: meta).generationPerformance
   }
+
+  /// THE transcript ordering — timestamp, with the stable `id` breaking
+  /// ties. One definition shared by the renderer (`TranscriptView`), the
+  /// request builder (`ChatSendController.makeRequest`), and the retry
+  /// truncation (`ChatRetryPlan`), so "everything after this turn" means
+  /// the same set of rows the user sees and the engine would replay. (#513)
+  static func transcriptPrecedes(_ lhs: Message, _ rhs: Message) -> Bool {
+    if lhs.ts == rhs.ts { return lhs.id.uuidString < rhs.id.uuidString }
+    return lhs.ts < rhs.ts
+  }
 }
 
 struct MessageMeta: Codable, Equatable {

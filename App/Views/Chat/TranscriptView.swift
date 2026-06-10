@@ -16,6 +16,11 @@ import SwiftUI
 /// text lengths are cheap and have zero false negatives for token growth.
 struct TranscriptView: View {
   let chat: Chat
+  /// #513: invoked with the assistant message id the user wants to retry
+  /// from. Nil (the default) hides every retry control — the scaffold
+  /// passes nil while this chat has a stream in flight, so retry waits for
+  /// the active stream to end.
+  var onRetryTurn: ((UUID) -> Void)? = nil
 
   var body: some View {
     let snapshot = TranscriptSnapshot(messages: chat.messages)
@@ -27,7 +32,7 @@ struct TranscriptView: View {
             emptyStatePlaceholder
           }
           ForEach(snapshot.items) { item in
-            MessageBubble(message: item)
+            MessageBubble(message: item, onRetry: retryAction(for: item))
               .id(item.id)
           }
           // Sentinel row so `scrollTo(.bottomSentinel)` lands at the
@@ -45,6 +50,19 @@ struct TranscriptView: View {
       .onAppear { scrollToBottom(proxy) }
     }
   }
+
+  /// #513: the row's retry closure, or nil when retry is invalid there —
+  /// not an assistant turn, or no user turn precedes it (`ChatRetryPlan
+  /// .plan` is the single validity authority; an always-visible button
+  /// that silently no-ops would be worse than no button).
+  private func retryAction(for item: ChatMessageItem) -> (() -> Void)? {
+    guard let onRetryTurn,
+          ChatRetryPlan.plan(messages: chat.messages, retryPointID: item.id) != nil
+    else { return nil }
+    let id = item.id
+    return { onRetryTurn(id) }
+  }
+
 
   private func scrollToBottom(_ proxy: ScrollViewProxy) {
     withAnimation(.easeOut(duration: 0.15)) {

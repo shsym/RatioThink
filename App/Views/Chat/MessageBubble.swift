@@ -23,6 +23,11 @@ import os
 /// the network until an explicit policy lands. Review v1 F3.
 struct MessageBubble: View {
   let message: ChatMessageItem
+  /// #513: retry-from-this-turn affordance, assistant rows only. Nil hides
+  /// the control — the scaffold passes nil while the chat is streaming
+  /// (retry waits for the active stream to end) and `TranscriptView` passes
+  /// nil for rows where no retained prefix exists to resend.
+  var onRetry: (() -> Void)? = nil
 
   var body: some View {
     switch message.role {
@@ -68,13 +73,29 @@ struct MessageBubble: View {
             GenerationPerformanceRow(text: text)
               .reportMessageBubbleFrame(.generationPerformance(message.id))
           }
-          // Deterministic copy path (#515): right-click on selectable
-          // MarkdownUI text surfaces AppKit's text menu, not our
-          // `.contextMenu`, so the guaranteed affordance is this explicit
-          // button. Copies the canonical answer source across every
-          // Markdown block — see `MessageCopyPlan`.
-          if !message.content.isEmpty {
-            CopyAnswerButton(text: message.content)
+          // One quiet chrome row under the turn: the deterministic copy
+          // path (#515 — right-click on selectable MarkdownUI text surfaces
+          // AppKit's text menu, not our `.contextMenu`, so the guaranteed
+          // affordance is this explicit button; see `MessageCopyPlan`) and
+          // the #513 retry control. Retry reads as turn chrome, not a
+          // primary action — the destructive part is guarded by the
+          // scaffold's confirmation when later conversation would be erased.
+          if !message.content.isEmpty || onRetry != nil {
+            HStack(spacing: 12) {
+              if !message.content.isEmpty {
+                CopyAnswerButton(text: message.content)
+              }
+              if let onRetry {
+                Button(action: onRetry) {
+                  Label("Retry", systemImage: "arrow.counterclockwise")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Retry from here — regenerates this response; any later conversation is erased after you confirm")
+                .accessibilityIdentifier("transcript.retry")
+              }
+            }
           }
         }
         Spacer(minLength: 60)
