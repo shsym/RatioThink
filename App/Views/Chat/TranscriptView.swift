@@ -24,6 +24,15 @@ struct TranscriptView: View {
 
   var body: some View {
     let snapshot = TranscriptSnapshot(messages: chat.messages)
+    // #513 review v1 F2: retry-anchor validity in ONE pass over the
+    // already-sorted snapshot rows — a per-row `ChatRetryPlan.plan` call
+    // re-sorted the transcript for every row (O(n² log n) on the render
+    // path). The click path still re-plans via `ChatRetryPlan`, which
+    // stays the single validity authority.
+    let retryableIDs = onRetryTurn == nil
+      ? Set<UUID>()
+      : ChatRetryPlan.validRetryPointIDs(
+          sortedRoles: snapshot.items.map { ($0.id, $0.role.rawValue) })
 
     return ScrollViewReader { proxy in
       ScrollView(.vertical) {
@@ -32,7 +41,8 @@ struct TranscriptView: View {
             emptyStatePlaceholder
           }
           ForEach(snapshot.items) { item in
-            MessageBubble(message: item, onRetry: retryAction(for: item))
+            MessageBubble(message: item,
+                          onRetry: retryAction(for: item, retryableIDs: retryableIDs))
               .id(item.id)
           }
           // Sentinel row so `scrollTo(.bottomSentinel)` lands at the
@@ -52,17 +62,14 @@ struct TranscriptView: View {
   }
 
   /// #513: the row's retry closure, or nil when retry is invalid there —
-  /// not an assistant turn, or no user turn precedes it (`ChatRetryPlan
-  /// .plan` is the single validity authority; an always-visible button
-  /// that silently no-ops would be worse than no button).
-  private func retryAction(for item: ChatMessageItem) -> (() -> Void)? {
-    guard let onRetryTurn,
-          ChatRetryPlan.plan(messages: chat.messages, retryPointID: item.id) != nil
-    else { return nil }
+  /// not an assistant turn, or no user turn precedes it. Validity comes
+  /// from the per-render `retryableIDs` set (a hidden button beats one
+  /// that silently no-ops).
+  private func retryAction(for item: ChatMessageItem, retryableIDs: Set<UUID>) -> (() -> Void)? {
+    guard let onRetryTurn, retryableIDs.contains(item.id) else { return nil }
     let id = item.id
     return { onRetryTurn(id) }
   }
-
 
   private func scrollToBottom(_ proxy: ScrollViewProxy) {
     withAnimation(.easeOut(duration: 0.15)) {

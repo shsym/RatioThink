@@ -726,7 +726,12 @@ struct ChatScaffoldView: View {
       presentNoModelPrompt()
       return
     }
-    guard let plan = ChatRetryPlan.plan(messages: chat.messages, retryPointID: messageID) else { return }
+    guard let plan = ChatRetryPlan.plan(messages: chat.messages, retryPointID: messageID) else {
+      // Review v1 F1 (lower-stakes sibling): the rendered control was
+      // stale — say so instead of a dead click.
+      engineActionError = Self.staleRetryNotice
+      return
+    }
     if plan.requiresConfirmation {
       pendingRetryMessageID = messageID
     } else {
@@ -734,20 +739,37 @@ struct ChatScaffoldView: View {
     }
   }
 
+  /// Review v1 F1: a user who consented to a destructive retry (or clicked
+  /// a rendered Retry control) must never get a silent no-op when the
+  /// transcript changed underneath. Surfaced through the existing
+  /// transient `engineActionError` banner (dismissable; cleared on the
+  /// next engine-status flip).
+  static let staleRetryNotice = "Retry no longer applies — the conversation changed."
+
   /// #513: truncate from the retry point, then resend from the retained
   /// prefix via the normal send path (same model/profile resolution, same
   /// ToT dispatch, same per-chat controller — so an unrelated chat's
-  /// stream is never touched). The plan is recomputed here rather than
-  /// captured at confirm time, so it always reflects the live transcript.
-  /// A failed truncation save aborts the resend — the engine must never
-  /// see a prefix the store does not hold.
+  /// stream is never touched). `ChatRetryPlan.apply` re-validates against
+  /// the live transcript and truncates atomically; review v1 F1: every
+  /// blocked branch surfaces — `.noLongerApplies` raises the stale-retry
+  /// notice, `.saveFailed` was already reported via the persistence
+  /// banner (and must not resend — the engine never sees a prefix the
+  /// store does not hold).
   private func executeRetry(for chat: Chat, messageID: UUID) {
-    guard !sendCoordinator.isInFlight(chatID) else { return }
-    guard let plan = ChatRetryPlan.plan(messages: chat.messages, retryPointID: messageID),
-          ChatRetryPlan.execute(plan, chat: chat, context: modelContext,
-                                persistenceStatus: persistenceStatus)
-    else { return }
-    sendAssistantTurn(for: chat)
+    switch ChatRetryPlan.apply(
+      retryPointID: messageID,
+      chat: chat,
+      isInFlight: sendCoordinator.isInFlight(chatID),
+      context: modelContext,
+      persistenceStatus: persistenceStatus
+    ) {
+    case .send:
+      sendAssistantTurn(for: chat)
+    case .noLongerApplies:
+      engineActionError = Self.staleRetryNotice
+    case .saveFailed:
+      break
+    }
   }
 
   private func sendAssistantTurn(for chat: Chat) {

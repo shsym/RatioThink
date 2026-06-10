@@ -27,6 +27,70 @@ public enum ChatRetryPlan {
     public let requiresConfirmation: Bool
   }
 
+  /// Outcome of a retry click after the user's intent is settled (the
+  /// confirmation was accepted, or none was needed). Review v1 F1: a
+  /// confirmed destructive action must never silently no-op, so every
+  /// blocked branch is an explicit case the caller can surface.
+  public enum Application: Equatable {
+    /// Truncation applied — issue the request from the retained prefix.
+    case send
+    /// The transcript changed (or a stream started) between the click and
+    /// now — re-planning failed. Nothing was deleted; tell the user.
+    case noLongerApplies
+    /// The truncation save failed. `execute` already rolled back and
+    /// reported via `persistenceStatus` (the persistence banner), so no
+    /// extra notice is owed — but the resend must not happen.
+    case saveFailed
+  }
+
+  /// Re-validate and apply a retry click in one step. Centralized here
+  /// (not in the view) so the stale-confirm path — confirm presented,
+  /// transcript mutated underneath, Retry clicked — is unit-testable:
+  /// it must come back `.noLongerApplies` with zero messages deleted.
+  @MainActor
+  public static func apply(
+    retryPointID: UUID,
+    chat: Chat,
+    isInFlight: Bool,
+    context: ModelContext,
+    persistenceStatus: PersistenceStatus
+  ) -> Application {
+    guard !isInFlight,
+          let plan = plan(messages: chat.messages, retryPointID: retryPointID) else {
+      return .noLongerApplies
+    }
+    guard execute(plan, chat: chat, context: context, persistenceStatus: persistenceStatus) else {
+      return .saveFailed
+    }
+    return .send
+  }
+
+  /// IDs of every valid retry anchor in one pass over the PRE-SORTED
+  /// transcript — the render-path companion of `plan` (review v1 F2:
+  /// calling `plan` per row re-sorted the array per row, O(n² log n) on
+  /// the render path). Same rule as `plan`'s guard: an assistant row with
+  /// at least one user row before it. `plan` stays the click-path
+  /// authority; a parity unit test pins the two to the same rule.
+  public static func validRetryPointIDs(sortedMessages: [Message]) -> Set<UUID> {
+    validRetryPointIDs(sortedRoles: sortedMessages.map { ($0.id, $0.role) })
+  }
+
+  /// Projection-friendly overload: the transcript renderer works from
+  /// value rows (`TranscriptSnapshot` items), not `Message` @Model
+  /// objects, so it passes pre-sorted `(id, raw role)` pairs directly.
+  public static func validRetryPointIDs(sortedRoles: [(id: UUID, role: String)]) -> Set<UUID> {
+    var seenUser = false
+    var ids: Set<UUID> = []
+    for row in sortedRoles {
+      if row.role == ChatMessage.Role.user.rawValue {
+        seenUser = true
+      } else if seenUser, row.role == ChatMessage.Role.assistant.rawValue {
+        ids.insert(row.id)
+      }
+    }
+    return ids
+  }
+
   /// Plan a retry anchored at the assistant message `retryPointID`.
   /// Returns nil when retry is not valid there: the id is missing, the row
   /// is not an assistant turn, or no user turn precedes it (an empty

@@ -150,6 +150,85 @@ final class ChatRetryPlanTests: XCTestCase {
     XCTAssertEqual(chat.messages.map(\.content), ["q1"])
   }
 
+  // MARK: - apply (review v1 F1: no silent no-op after a confirmed retry)
+
+  func test_apply_returns_noLongerApplies_without_deleting_when_transcript_changed_under_confirm() throws {
+    let (chat, context) = try makeChat(turns: [
+      ("user", "q1", 1), ("assistant", "a1", 2),
+      ("user", "q2", 3), ("assistant", "a2", 4),
+    ])
+    let a1 = try message(chat, content: "a1")
+    // Confirm was presented for a1, then the transcript changed underneath:
+    // the retry point itself is gone (e.g. another window already retried).
+    chat.messages.removeAll { $0.id == a1.id }
+    context.delete(a1)
+    try context.save()
+    let before = chat.messages.map(\.content).sorted()
+
+    let outcome = ChatRetryPlan.apply(
+      retryPointID: a1.id, chat: chat, isInFlight: false,
+      context: context, persistenceStatus: PersistenceStatus()
+    )
+
+    XCTAssertEqual(outcome, .noLongerApplies,
+                   "a confirmed retry that no longer applies must be reported, never a silent return")
+    XCTAssertEqual(chat.messages.map(\.content).sorted(), before,
+                   "nothing may be deleted on the stale-confirm path")
+  }
+
+  func test_apply_returns_noLongerApplies_when_a_stream_is_in_flight() throws {
+    let (chat, context) = try makeChat(turns: [
+      ("user", "q1", 1), ("assistant", "a1", 2),
+    ])
+    let a1 = try message(chat, content: "a1")
+
+    let outcome = ChatRetryPlan.apply(
+      retryPointID: a1.id, chat: chat, isInFlight: true,
+      context: context, persistenceStatus: PersistenceStatus()
+    )
+
+    XCTAssertEqual(outcome, .noLongerApplies)
+    XCTAssertEqual(chat.messages.count, 2, "an in-flight chat must not be truncated")
+  }
+
+  func test_apply_valid_point_truncates_and_returns_send() throws {
+    let (chat, context) = try makeChat(turns: [
+      ("user", "q1", 1), ("assistant", "a1", 2),
+    ])
+    let a1 = try message(chat, content: "a1")
+
+    let outcome = ChatRetryPlan.apply(
+      retryPointID: a1.id, chat: chat, isInFlight: false,
+      context: context, persistenceStatus: PersistenceStatus()
+    )
+
+    XCTAssertEqual(outcome, .send)
+    XCTAssertEqual(chat.messages.map(\.content), ["q1"])
+  }
+
+  // MARK: - render-path validity (review v1 F2)
+
+  func test_validRetryPointIDs_matches_plan_validity_row_for_row() throws {
+    // Parity pin: the one-pass render-path set and the click-path `plan`
+    // must agree on every row, including the orphan-assistant edge.
+    let (chat, _) = try makeChat(turns: [
+      ("assistant", "orphan", 1),
+      ("user", "q1", 2), ("assistant", "a1", 3),
+      ("system", "meta", 4),
+      ("user", "q2", 5), ("assistant", "a2", 6),
+    ])
+    let sorted = chat.messages.sorted(by: Message.transcriptPrecedes)
+
+    let rendered = ChatRetryPlan.validRetryPointIDs(sortedMessages: sorted)
+    let planned = Set(sorted.map(\.id).filter {
+      ChatRetryPlan.plan(messages: chat.messages, retryPointID: $0) != nil
+    })
+
+    XCTAssertEqual(rendered, planned)
+    XCTAssertEqual(rendered, Set([try message(chat, content: "a1").id,
+                                  try message(chat, content: "a2").id]))
+  }
+
   // MARK: - helpers
 
   private func makeChat(turns: [(role: String, content: String, ts: Double)]) throws -> (Chat, ModelContext) {
