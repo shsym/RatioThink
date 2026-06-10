@@ -95,16 +95,39 @@ PIE_TEST_EXPECTED_ANSWER_FILE=$ANSWER_FILE
 EOF
 
 echo "copy gui e2e: generating Xcode project"
-Scripts/genproject.sh
+# PIE_TEST_GENPROJECT: contract-test seam (test-run-copy-gui-e2e.sh) — the
+# stubbed run must not require xcodegen.
+"${PIE_TEST_GENPROJECT:-Scripts/genproject.sh}"
 
 echo "copy gui e2e: engine=$BASE_URL gui PIE_HOME=$GUI_HOME"
 echo "copy gui e2e: running XCUITest"
+TEST_NAME="test_context_menu_copy_answer_spans_all_markdown_sections"
+XCODE_LOG="$RUN_ROOT/xcodebuild.log"
+set +e
 xcodebuild -project RatioThink.xcodeproj \
   -scheme RatioThinkGUITests \
   -destination 'platform=macOS,arch=arm64' \
   -parallel-testing-enabled NO \
   test \
-  -only-testing:RatioThinkGUITests/S515_CopyTranscriptGUITests/test_context_menu_copy_answer_spans_all_markdown_sections \
-  ENABLE_CODE_COVERAGE=NO
+  -only-testing:"RatioThinkGUITests/S515_CopyTranscriptGUITests/$TEST_NAME" \
+  ENABLE_CODE_COVERAGE=NO 2>&1 | tee "$XCODE_LOG"
+status=${PIPESTATUS[0]}
+set -e
+if [ "$status" -ne 0 ]; then
+  echo "copy gui e2e: FAIL (xcodebuild exit $status)" >&2
+  exit "$status"
+fi
+
+# xcodebuild exits 0 when the only test ends in XCTSkip (no seated session,
+# config file vanished) — #427's "skip still prints 0 failures" trap. Require
+# the positive per-test pass line and refuse any skip before claiming PASS.
+if grep -q "Test Case .*$TEST_NAME.*skipped" "$XCODE_LOG"; then
+  echo "copy gui e2e: FAIL — test was SKIPPED, not run" >&2
+  exit 1
+fi
+if ! grep -q "Test Case .*$TEST_NAME.*passed" "$XCODE_LOG"; then
+  echo "copy gui e2e: FAIL — no positive pass signal for $TEST_NAME" >&2
+  exit 1
+fi
 
 echo "copy gui e2e: PASS"

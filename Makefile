@@ -415,6 +415,7 @@ test-gui-script: ## Fast preflight regressions for GUI E2E wrappers
 	Scripts/test-run-resume-gui-history-e2e.sh
 	Scripts/test-run-stream-cancel-gui-e2e.sh
 	Scripts/test-run-load-default-gui-e2e.sh
+	Scripts/test-run-copy-gui-e2e.sh
 	Scripts/test-run-first-launch-package-e2e.sh
 	Scripts/test-run-first-launch-package-model-download-e2e.sh
 
@@ -423,6 +424,9 @@ test-gui-history: genproject ## Deterministic  GUI history/resume E2E — needs 
 
 test-gui-stream-cancel: genproject ## #381 deterministic GUI cancel-mid-stream E2E (partial bubble + composer recovery) — needs seated session
 	Scripts/run-stream-cancel-gui-e2e.sh
+
+test-gui-copy: genproject ## #515 deterministic GUI copy E2E (Copy button → pasteboard == canonical multi-section Markdown) — needs seated session
+	Scripts/run-copy-gui-e2e.sh
 
 test-gui-load-default: genproject ## #381 deterministic GUI no-model → Load-default follow-through E2E — needs seated session
 	Scripts/run-load-default-gui-e2e.sh

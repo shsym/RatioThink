@@ -26,9 +26,11 @@ final class S515_CopyTranscriptGUITests: XCTestCase {
     let pieHome = try XCTUnwrap(config["PIE_TEST_GUI_HOME"],
                                 "\(Self.configPath) must define PIE_TEST_GUI_HOME")
     let model = config["PIE_TEST_CHAT_MODEL"] ?? "gui-stream-deterministic"
-    let expectedAnswer = try XCTUnwrap(config["PIE_TEST_EXPECTED_ANSWER_FILE"].flatMap {
-      try? String(contentsOf: URL(fileURLWithPath: $0), encoding: .utf8)
-    }, "\(Self.configPath) must point PIE_TEST_EXPECTED_ANSWER_FILE at the harness reply")
+    // Unwrap the path and read separately so "key missing" and "file
+    // unreadable" fail with distinct, correctly-attributed messages.
+    let answerPath = try XCTUnwrap(config["PIE_TEST_EXPECTED_ANSWER_FILE"],
+                                   "\(Self.configPath) must define PIE_TEST_EXPECTED_ANSWER_FILE")
+    let expectedAnswer = try String(contentsOf: URL(fileURLWithPath: answerPath), encoding: .utf8)
 
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
     app.launchArguments.append(contentsOf: [
