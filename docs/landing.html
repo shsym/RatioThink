@@ -30,7 +30,7 @@
   .wrap{max-width:920px;margin:0 auto;padding:40px 22px 64px}
 
   /* ---------- hero ---------- */
-  header.hero{text-align:center;padding:14px 0 8px}
+  header.hero{text-align:center;padding:14px 0 18px}
   header.hero img.icon{width:88px;height:88px;border-radius:20px;
     box-shadow:0 6px 26px rgba(var(--accent-rgb),.22);}
   header.hero h1{font-family:var(--serif);font-weight:600;font-size:40px;letter-spacing:-.015em;
@@ -42,7 +42,7 @@
   header.hero p.meta b{color:var(--accent-dark);font-weight:600}
 
   /* ---------- mock app window ---------- */
-  .stage{margin:30px auto 8px;max-width:680px}
+  .stage{margin:56px auto 8px;max-width:680px}
   .window{background:var(--win-bg);border:1px solid var(--border-strong);border-radius:14px;
     overflow:hidden;box-shadow:0 18px 50px rgba(44,39,34,.14);position:relative}
   .titlebar{display:flex;align-items:center;gap:8px;padding:9px 13px;background:var(--win-chrome);
@@ -153,7 +153,7 @@
   .dots .dot:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 
   /* ---------- why ---------- */
-  .why{margin:46px auto 0;max-width:760px}
+  .why{margin:72px auto 0;max-width:760px}
   .why h2{font-family:var(--serif);font-size:25px;text-align:center;margin:0 0 8px;font-weight:600}
   .why .lede{text-align:center;font-size:14px;color:var(--ink-muted);max-width:62ch;margin:0 auto 22px}
   .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
@@ -163,7 +163,7 @@
   .card p{font-size:13px;color:var(--ink-soft);margin:0}
 
   /* ---------- footer ---------- */
-  footer{margin:48px auto 0;max-width:760px;text-align:center;font-size:12.5px;color:var(--ink-muted);
+  footer{margin:64px auto 0;max-width:760px;text-align:center;font-size:12.5px;color:var(--ink-muted);
     border-top:1px solid var(--border);padding-top:20px}
   footer a{color:var(--ink-soft)}
   footer .credit{margin-top:7px;font-size:11.5px}
@@ -287,20 +287,19 @@
       profile: 'Tree of Thought',
       bounds: '· 3×2, beam 2 ·',
       prompt: 'Plan a surprise party for a close friend.',
-      // level 1 (breadth 3) — the beam keeps the top 2
-      level1: [
-        { t: 'Start with the guest list and theme', s: 8, beam: 'kept'   },
-        { t: 'Pick a date everyone can make',        s: 7, beam: 'kept'   },
-        { t: 'Book a venue first, invite later',     s: 4, beam: 'pruned' }
+      // Breadth 3 at the root; the beam keeps the top 2, and EACH kept branch
+      // then explores its own children — pruned branches are not expanded.
+      branches: [
+        { t: 'Start with the guest list and theme', s: 8, beam: 'kept', children: [
+            { t: 'Evening garden theme, ~12 friends', s: 9, beam: 'star' },
+            { t: 'Backyard cookout, ~15 friends',     s: 7, beam: 'kept' } ] },
+        { t: 'Pick a date everyone can make',        s: 7, beam: 'kept', children: [
+            { t: 'A free Saturday evening', s: 8, beam: 'kept'   },
+            { t: 'A weeknight after work',  s: 5, beam: 'pruned' } ] },
+        { t: 'Book a venue first, invite later',     s: 4, beam: 'pruned', children: [] }
       ],
-      // level 2 — expansions under the kept branches; one leaf is selected
-      level2: [
-        { t: 'Evening garden theme, ~12 close friends', s: 9, beam: 'star'   },
-        { t: 'Cozy dinner at home, 8 guests',           s: 7, beam: 'kept'   },
-        { t: 'Weekend brunch, 20 guests',               s: 5, beam: 'pruned' }
-      ],
-      nodeCount: 6,
-      answer: 'Go with an evening garden theme for ~12 — lock the guest list and a date first, then venue and food fall into place.'
+      nodeCount: 7,
+      answer: 'Go with an evening garden theme for ~12 on a free Saturday — lock the guest list and the date first, then venue and food fall into place.'
     },
     fast: {
       prompt: 'Summarize the water cycle in one sentence.',
@@ -400,13 +399,19 @@
 
   // ---- tree-search node helpers (mirror ToTNodeRow beam glyphs + score capsule) ----
   function beamChar(b){ return b==='star' ? '★' : b==='kept' ? '✓' : b==='pruned' ? '✕' : '◌'; }
-  function addNode(parent, cfg, child){
-    var n = el('<div class="tnode'+(child?' child':'')+'">'+
+  function nodeHTML(cfg, child){
+    return '<div class="tnode'+(child?' child':'')+'">'+
       '<span class="beam pending">◌</span>'+
       '<span class="score">'+cfg.s+'</span>'+
-      '<span class="label">'+cfg.t+'</span></div>');
-    parent.appendChild(n);
-    return n;
+      '<span class="label">'+cfg.t+'</span></div>';
+  }
+  function addNode(parent, cfg, child){
+    var n = el(nodeHTML(cfg, child)); parent.appendChild(n); return n;
+  }
+  // Insert a child row directly after `anchor` (the parent row, or the previous
+  // sibling) so children render nested under their own branch.
+  function addChildAfter(anchor, cfg){
+    var n = el(nodeHTML(cfg, true)); anchor.insertAdjacentElement('afterend', n); return n;
   }
   function setBeam(node, beam){
     var b = node.querySelector('.beam');
@@ -437,25 +442,31 @@
     transcript.appendChild(col);
     var tsbody = col.querySelector('#tsbody');
 
-    // level 1 — branches appear, score, then the beam keeps the top 2
-    var n1 = d.level1.map(function(c){ return addNode(tsbody, c, false); });
-    for (var i=0;i<n1.length;i++){ n1[i].classList.add('in'); await sleep(300, myGen); }
-    await sleep(320, myGen);
-    for (var j=0;j<n1.length;j++){ n1[j].classList.add('scored'); await sleep(210, myGen); }
-    await sleep(420, myGen);
-    for (var k=0;k<n1.length;k++){ setBeam(n1[k], d.level1[k].beam); await sleep(160, myGen); }
-    await sleep(640, myGen);
+    // root level — the three branches appear, score, then the beam keeps the top 2
+    var n1 = d.branches.map(function(b){ return addNode(tsbody, b, false); });
+    for (var i=0;i<n1.length;i++){ n1[i].classList.add('in'); await sleep(260, myGen); }
+    await sleep(300, myGen);
+    for (var j=0;j<n1.length;j++){ n1[j].classList.add('scored'); await sleep(180, myGen); }
+    await sleep(380, myGen);
+    for (var k=0;k<n1.length;k++){ setBeam(n1[k], d.branches[k].beam); await sleep(150, myGen); }
+    await sleep(560, myGen);
 
-    // level 2 — expand the kept branches, score, star the winning leaf
-    var n2 = d.level2.map(function(c){ return addNode(tsbody, c, true); });
-    for (var a=0;a<n2.length;a++){ n2[a].classList.add('in'); await sleep(300, myGen); }
-    await sleep(280, myGen);
-    for (var b=0;b<n2.length;b++){ n2[b].classList.add('scored'); await sleep(210, myGen); }
-    await sleep(420, myGen);
-    for (var c2=0;c2<n2.length;c2++){ setBeam(n2[c2], d.level2[c2].beam); await sleep(180, myGen); }
+    // EVERY kept branch explores its own children (real beam search); pruned ones don't.
+    for (var bi=0; bi<d.branches.length; bi++){
+      var br = d.branches[bi];
+      if (br.beam === 'pruned' || !br.children.length) continue;
+      var anchor = n1[bi];
+      var kids = br.children.map(function(c){ var node = addChildAfter(anchor, c); anchor = node; return node; });
+      for (var a=0;a<kids.length;a++){ kids[a].classList.add('in'); await sleep(240, myGen); }
+      await sleep(220, myGen);
+      for (var s=0;s<kids.length;s++){ kids[s].classList.add('scored'); await sleep(170, myGen); }
+      await sleep(320, myGen);
+      for (var c2=0;c2<kids.length;c2++){ setBeam(kids[c2], br.children[c2].beam); await sleep(150, myGen); }
+      await sleep(500, myGen);
+    }
     document.getElementById('tstatus').classList.remove('searching');
     document.getElementById('tstatus').textContent = d.nodeCount + ' nodes';
-    await sleep(950, myGen);
+    await sleep(900, myGen);
 
     // chosen answer arrives; the tree search folds away
     var ans = el('<div class="bubble assistant"></div>');
@@ -506,10 +517,10 @@
         '<span class="beam '+c.beam+'">'+beamChar(c.beam)+'</span>'+
         '<span class="score">'+c.s+'</span><span class="label">'+c.t+'</span></div>';
     }
-    rows += row(d.level1[0], false);
-    rows += row(d.level2[0], true);   // the starred leaf, indented under the first kept branch
-    rows += row(d.level1[1], false);
-    rows += row(d.level1[2], false);
+    d.branches.forEach(function(b){          // each branch, with its expanded children nested beneath
+      rows += row(b, false);
+      b.children.forEach(function(c){ rows += row(c, true); });
+    });
     return '<div class="tsearch"><div class="tshead">'+TREE+' Tree search '+
       '<span class="bounds">'+d.bounds+'</span> <span class="status">'+d.nodeCount+' nodes</span> '+
       '<span class="tchev">▾</span></div><div class="tsbody">'+rows+'</div></div>';
