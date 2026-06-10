@@ -80,14 +80,26 @@ func openFreshChat(
     ("header New Chat", app.buttons["chats.newButton"]),
   ]
 
+  // A LATER launch in a multi-test run can come up not-key, presenting an
+  // EMPTY accessibility tree (Application=Disabled) — every affordance
+  // query then misses even though the UI is fine. Re-activate and re-scan
+  // until the tree is live instead of failing on the first empty sweep.
   var sawCandidate = false
-  for (label, button) in candidates {
-    guard button.waitForExistence(timeout: 2) else { continue }
-    sawCandidate = true
-    button.click()
-    if composer.waitForExistence(timeout: 5) { return }
-    NSLog("openFreshChat: %@ click did not open composer; trying next affordance", label)
-  }
+  let scanDeadline = Date().addingTimeInterval(20)
+  repeat {
+    for (label, button) in candidates {
+      guard button.waitForExistence(timeout: 2) else { continue }
+      sawCandidate = true
+      button.click()
+      if composer.waitForExistence(timeout: 5) { return }
+      NSLog("openFreshChat: %@ click did not open composer; trying next affordance", label)
+    }
+    if !sawCandidate {
+      NSLog("openFreshChat: no affordance visible (empty tree?); re-activating")
+      app.activate()
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(1))
+    }
+  } while !sawCandidate && Date() < scanDeadline
 
   if !sawCandidate {
     XCTFail("New Chat affordance missing; app tree: \(app.debugDescription)", file: file, line: line)
