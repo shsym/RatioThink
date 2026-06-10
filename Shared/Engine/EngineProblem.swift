@@ -144,17 +144,20 @@ public extension EngineProblem {
     }
     if let totError = error as? ToTStreamError {
       switch totError {
-      case let .stream(code, _) where code == "model_not_found":
+      case let .stream(code, message) where code == "model_not_found":
         // Parity with the HTTP path's `isModelNotFound` routing — a ToT
         // terminal frame rejecting the model is the same user problem.
+        // Bracket convention keeps the wire code in the diagnostic
+        // (`ToTStreamError.errorDescription` drops it when a message is
+        // present).
         self.init(modelNotFound: requestedModelID,
-                  technicalDetail: totError.errorDescription)
-      case .stream:
+                  technicalDetail: Self.totStreamDetail(code: code, message: message))
+      case let .stream(code, message):
         self.init(
           title: "Engine couldn’t answer",
           message: "The engine couldn’t answer this message. Try sending it again.",
           recovery: .retrySend,
-          technicalDetail: totError.errorDescription)
+          technicalDetail: Self.totStreamDetail(code: code, message: message))
       case .malformedFrame:
         self.init(
           title: "Engine couldn’t answer",
@@ -177,6 +180,13 @@ public extension EngineProblem {
       message: "Something went wrong while sending this message. Try again.",
       recovery: .retrySend,
       technicalDetail: PersistenceStatus.formatError(error))
+  }
+
+  /// `[code] message` diagnostic for a ToT terminal `error` frame — the
+  /// same bracket convention the status-axis default arm uses, so the
+  /// wire code always survives in the log.
+  private static func totStreamDetail(code: String, message: String) -> String {
+    message.isEmpty ? "[\(code)]" : "[\(code)] \(message)"
   }
 
   /// One model-not-found mapping shared by the HTTP envelope/meta-frame

@@ -85,40 +85,40 @@ final class ChatStartGateTests: XCTestCase {
     )
   }
 
-  // MARK: - S6/S7/S8/S9: engine failed → reason + retryable flag
+  // MARK: - S6/S7/S8/S9: engine failed → code + raw reason (affordance derives from EngineProblem, #477)
 
-  func test_S6_modelMissing_is_retryable_engineFailed() {
+  func test_S6_modelMissing_is_engineFailed() {
     XCTAssertEqual(
       eval(engine: .failed(code: .modelMissing, message: "not downloaded"), profileDefault: model),
-      .engineFailed(code: .modelMissing, reason: "not downloaded", retryable: true)
+      .engineFailed(code: .modelMissing, reason: "not downloaded")
     )
   }
 
-  func test_S7_memoryRisk_is_not_retryable() {
+  func test_S7_memoryRisk_is_engineFailed() {
     XCTAssertEqual(
       eval(engine: .failed(code: .memoryRisk, message: "too large"), profileDefault: model),
-      .engineFailed(code: .memoryRisk, reason: "too large", retryable: false)
+      .engineFailed(code: .memoryRisk, reason: "too large")
     )
   }
 
-  func test_killRejected_is_not_retryable() {
+  func test_killRejected_is_engineFailed() {
     XCTAssertEqual(
       eval(engine: .failed(code: .killRejected, message: "zombie"), profileDefault: model),
-      .engineFailed(code: .killRejected, reason: "zombie", retryable: false)
+      .engineFailed(code: .killRejected, reason: "zombie")
     )
   }
 
-  func test_S8_spawnFailed_is_retryable() {
+  func test_S8_spawnFailed_is_engineFailed() {
     XCTAssertEqual(
       eval(engine: .failed(code: .spawnFailed, message: "ENOENT")),
-      .engineFailed(code: .spawnFailed, reason: "ENOENT", retryable: true)
+      .engineFailed(code: .spawnFailed, reason: "ENOENT")
     )
   }
 
-  func test_S9_engineGone_is_retryable() {
+  func test_S9_engineGone_is_engineFailed() {
     XCTAssertEqual(
       eval(engine: .failed(code: .engineGone, message: "exited 9")),
-      .engineFailed(code: .engineGone, reason: "exited 9", retryable: true)
+      .engineFailed(code: .engineGone, reason: "exited 9")
     )
   }
 

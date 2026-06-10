@@ -51,11 +51,12 @@ public enum ChatStartGate {
     /// The active profile has no default model. The only genuine
     /// "choose a model first" case. Offer Choose / Open Models settings.
     case noDefault
-    /// The engine reported `.failed`. Name the underlying reason; offer
-    /// Retry when the code invites one (see
-    /// `EngineErrorCode.invitesResumeRetry`) and route model-choice
-    /// faults (missing / too-large / profile) to Models settings.
-    case engineFailed(code: EngineErrorCode, reason: String, retryable: Bool)
+    /// The engine reported `.failed`. Carries the raw status diagnostic
+    /// as `reason`; the rendered copy AND the recovery affordance both
+    /// derive from `EngineProblem(statusCode:rawMessage:)` at the
+    /// presentation layer (#477) — the gate adds no parallel
+    /// retryability axis.
+    case engineFailed(code: EngineErrorCode, reason: String)
     /// The engine helper is unreachable over XPC (transport down) —
     /// distinct from a clean `.stopped` engine. Offer Retry + reason.
     case helperUnreachable(reason: String)
@@ -102,7 +103,7 @@ public enum ChatStartGate {
 
     switch engineStatus {
     case .failed(let code, let message):
-      return .engineFailed(code: code, reason: message, retryable: code.invitesResumeRetry)
+      return .engineFailed(code: code, reason: message)
     case .stopping:
       return .busy(.stoppingEngine)
     case .starting:

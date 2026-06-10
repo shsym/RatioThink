@@ -35,7 +35,7 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   func test_engineFailed_retryable_shows_curated_reason_and_retry() {
     // #477: headline, reason, AND the primary affordance all come from
     // the EngineProblem taxonomy — the gate's raw diagnostic never renders.
-    let p = plan(.engineFailed(code: .spawnFailed, reason: "fork ENOENT", retryable: true), unavailableAction)
+    let p = plan(.engineFailed(code: .spawnFailed, reason: "fork ENOENT"), unavailableAction)
     XCTAssertEqual(p.headline, "The engine couldn’t start")
     XCTAssertEqual(p.reason, "The engine failed to start. Try restarting it.")
     XCTAssertEqual(p.primary, .retryEngine)
@@ -46,7 +46,7 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     // Review F2: `.degraded` invitesResumeRetry on the menu axis, but its
     // taxonomy recovery is restart-HELPER — a Retry that re-fires an
     // engine start the degraded helper will refuse must not render.
-    let p = plan(.engineFailed(code: .degraded, reason: "helper boot fell back", retryable: true), unavailableAction)
+    let p = plan(.engineFailed(code: .degraded, reason: "helper boot fell back"), unavailableAction)
     XCTAssertEqual(p.headline, "Engine helper problem")
     XCTAssertEqual(p.reason, "The background helper hit a problem and needs to be restarted.")
     XCTAssertEqual(p.primary, .none)
@@ -54,7 +54,7 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   }
 
   func test_engineGone_is_retryable() {
-    let p = plan(.engineFailed(code: .engineGone, reason: "exited 9", retryable: true), loadAction)
+    let p = plan(.engineFailed(code: .engineGone, reason: "exited 9"), loadAction)
     XCTAssertEqual(p.headline, "Engine stopped unexpectedly")
     XCTAssertEqual(p.reason, "The engine process exited. Restart the engine to continue.")
     XCTAssertFalse(p.reason?.contains("exited 9") ?? false)
@@ -64,7 +64,7 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   func test_memoryRisk_routes_to_settings_never_retry_or_load() {
     // F3: non-retryable model-choice fault — no Load/Retry even though the
     // model is on disk (action == .load); route to Models settings.
-    let p = plan(.engineFailed(code: .memoryRisk, reason: "9.0 GB; choose smaller", retryable: false), loadAction)
+    let p = plan(.engineFailed(code: .memoryRisk, reason: "9.0 GB; choose smaller"), loadAction)
     XCTAssertEqual(p.headline, "Model too large")
     XCTAssertEqual(p.reason, "This model exceeds this Mac’s safe memory limit. Pick a smaller model.")
     XCTAssertEqual(p.primary, .none)               // F3: no re-fire
@@ -76,7 +76,7 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     // F3: non-retryable, non-model-choice → reason only, no Retry loop.
     // Review F2: the headline must match the body (refused to STOP), not
     // claim a failed start.
-    let p = plan(.engineFailed(code: .killRejected, reason: "zombie pid 42", retryable: false), loadAction)
+    let p = plan(.engineFailed(code: .killRejected, reason: "zombie pid 42"), loadAction)
     XCTAssertEqual(p.headline, "Engine couldn’t be stopped")
     XCTAssertEqual(p.reason, "The engine process refused to stop. Quit and reopen the app if this persists.")
     XCTAssertFalse(p.reason?.contains("pid 42") ?? false)
@@ -87,7 +87,7 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   func test_modelMissing_downloadable_offers_inline_download() {
     // #326 inline download IS the fix for a missing-but-downloadable model.
     // #477: the CTA carries the action; no reason line under it.
-    let p = plan(.engineFailed(code: .modelMissing, reason: "not downloaded", retryable: true), downloadAction)
+    let p = plan(.engineFailed(code: .modelMissing, reason: "not downloaded"), downloadAction)
     XCTAssertEqual(p.headline, "Default model isn't downloaded")
     XCTAssertNil(p.reason)
     XCTAssertTrue(p.showsDownloadCTA)
@@ -95,7 +95,7 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   }
 
   func test_modelMissing_not_downloadable_routes_to_settings() {
-    let p = plan(.engineFailed(code: .modelMissing, reason: "no HF fallback", retryable: true), unavailableAction)
+    let p = plan(.engineFailed(code: .modelMissing, reason: "no HF fallback"), unavailableAction)
     XCTAssertFalse(p.showsDownloadCTA)
     XCTAssertTrue(p.showsOpenSettings)
     XCTAssertEqual(p.primary, .none)

@@ -12,9 +12,10 @@ import SwiftUI
 /// instead of always falling through to the availability action:
 ///   · busy(starting/stopping) → calm wait (with the download
 ///     CTA still visible if a fresh-install model needs downloading);
-///   · engineFailed → the reason + Retry (retryable) / Open Models
-///     settings (model-choice faults: missing/too-large/profile) /
-///     inline download (missing + downloadable);
+///   · engineFailed → EngineProblem copy + the affordance its
+///     `recovery` names (#477): Retry (`.restartEngine`) / Open Models
+///     settings (`.chooseModel`) / inline download (missing +
+///     downloadable) / none (helper-restart or terminal faults);
 ///   · helperUnreachable → the reason + Retry (re-poll);
 ///   · configBroken → the reason + Open Settings;
 ///   · needsDefaultLoad / noDefault → the #326 availability action.
@@ -115,7 +116,7 @@ struct NoModelLoadedPrompt: View {
     case .noDefault:
       return unavailablePlan()
 
-    case let .engineFailed(code, reason, _):
+    case let .engineFailed(code, reason):
       // #477: headline, reason, AND the primary affordance all derive
       // from the one taxonomy — copy and action can't diverge (review F2:
       // a `.degraded` helper must not pair "restart the helper" copy with

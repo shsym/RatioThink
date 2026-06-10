@@ -346,7 +346,9 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     XCTAssertNotNil(failureTitle,
                     "oversized model rejection should surface memoryRisk status/copy in the menu; got \(titles)")
     if let failureTitle {
-      XCTAssertTrue(failureTitle.contains("choose a smaller model"),
+      // #477: the menu renders the curated EngineProblem line, not the
+      // raw guardrail prose.
+      XCTAssertTrue(failureTitle.contains("Pick a smaller model"),
                     "memoryRisk menu copy should include recovery guidance; got \(failureTitle)")
     }
     XCTAssertFalse(titles.contains(where: { $0 == "Engine: starting…" || $0 == "Pause Engine" }),

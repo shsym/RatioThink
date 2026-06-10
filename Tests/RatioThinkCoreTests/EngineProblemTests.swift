@@ -128,6 +128,16 @@ final class EngineProblemTests: XCTestCase {
     let p = EngineProblem(requestError: err, requestedModelID: "org/repo/m.gguf")
     XCTAssertEqual(p.recovery, .chooseModel)
     XCTAssertTrue(p.message.contains("isn’t installed"), p.message)
+    // v2 F3: the wire code must survive in the diagnostic — the
+    // errorDescription bridge drops it when a message is present.
+    XCTAssertEqual(p.technicalDetail, "[model_not_found] raw")
+  }
+
+  func test_totStream_genericFrame_diagnosticKeepsCode() {
+    let p = EngineProblem(requestError: ToTStreamError.stream(code: "budget_exhausted", message: "kv full"))
+    XCTAssertEqual(p.technicalDetail, "[budget_exhausted] kv full")
+    XCTAssertEqual(EngineProblem(requestError: ToTStreamError.stream(code: "x", message: "")).technicalDetail,
+                   "[x]")
   }
 
   // MARK: - request axis: FaultClass
