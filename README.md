@@ -23,29 +23,24 @@ v0.1.2 is an early release, focusing on core functionality and bug fixes.
 Since many components are still a work in progress, your feedback is incredibly valuable.
 Feel free to report any issues you find!
 
-## Why RatioThink
+## Why Rational
 
 **Local models, with thinking modes.** Ollama and LM Studio hand you a model and
-a prompt box. RatioThink adds **profiles** — named *thinking modes* you switch in
-one click, each bundling a model, sampling, a system prompt, the chat workflow,
-and (optionally) speculative decoding into a saved preset.
+a prompt box. Rational adds **profiles** — named *thinking modes* you switch in
+one click, each a saved preset bundling a model, sampling, a system prompt, and a
+chat workflow.
 
-- **Thinking modes, not just a model picker.** A profile is a complete preset —
-  model + sampling + system prompt + inferlet workflow + speculation — saved to
-  disk and editable as TOML. RatioThink ships with **Chat** (balanced) and
-  **Fast Think** (greedy + speculative). Make your own. Ollama exposes these only
-  as per-request parameters; LM Studio has no explicit profiles.
-- **Fast Think = speculative decoding, by switching a profile.** The Fast Think
-  profile runs the same model greedily with a speculative drafter — fewer waits,
-  identical output — on the bundled Apple-Silicon engine. No flags, no separate
-  model: just pick the profile.
-- **Reasoning kept separate from the answer.** For models that emit a `<think>`
-  scratchpad, RatioThink shows it in a collapsible **Thinking** section, so the
-  reasoning never mixes into — or gets copied with — the answer.
-- **Tree-of-Thought _(preview)_.** The bundled `chat-apc` engine can run a
-  bounded Tree-of-Thought search through the local API (`POST /v1/inferlet`).
-  Honest status: it's an **API capability today, not yet a one-click profile** in
-  the chat UI.
+- **Thinking modes, not just a model picker.** A profile is a complete preset,
+  saved to disk and editable as TOML. Rational ships with **Chat**, **Fast Think**,
+  and **Tree of Thought** — make your own, too. Ollama exposes these only as
+  per-request parameters; LM Studio has no explicit profiles.
+- **Fast Think — speculative decoding by switching a profile.** Runs the same
+  model greedily with a speculative drafter — fewer waits, identical output — on
+  the bundled Apple-Silicon engine. No flags, no separate model: just pick it.
+- **Tree of Thought — a search tree, in one click.** The Tree of Thought profile
+  turns one question into a scored search: the engine branches, scores each branch
+  1–10, and keeps the best beam — shown live in a foldable tree, then the chosen
+  answer.
 
 ▶ **[See the animated walkthrough](docs/landing.html)** — open it in your browser.
 
@@ -157,9 +152,9 @@ RatioThink/
 
 ## Documentation
 
-- [`docs/landing.html`](docs/landing.html) — an animated walkthrough of RatioThink's
-  thinking modes (profiles, Fast Think / speculative decoding, the Thinking disclosure,
-  and a Tree-of-Thought preview). Open it in a browser.
+- [`docs/landing.html`](docs/landing.html) — an animated walkthrough of Rational's
+  thinking modes (profiles, the live Tree of Thought search, and Fast Think
+  speculative decoding). Open it in a browser.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the app, helper, pie engine, and
   `chat-apc` inferlet fit together (plus an interactive [`architecture.html`](docs/architecture.html)).
 - [`TEST.md`](TEST.md) — test catalog and pre-PR gate: what to run for each change type.

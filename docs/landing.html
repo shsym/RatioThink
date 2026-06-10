@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RatioThink — Local models, with thinking modes</title>
+<title>Rational — Local models, with thinking modes</title>
 <style>
   /* ---- palette: mirrors the Pie site (Vendor/pie/website/src/css/theme.css) ---- */
   :root{
@@ -15,9 +15,10 @@
     /* mock app window */
     --win-chrome:#f4f1e8; --win-bg:#ffffff; --win-line:#e7e1cf;
     --bubble-user:var(--accent); --bubble-assistant:#efece2; --think-bg:#f1ede0;
-    /* status chips */
+    /* tree-search beam states (mirror TreeSearchSection glyph tints) */
+    --kept:#5a6b25; --pruned:#a89b85; --star:#c8901f;
+    /* shipped chip */
     --shipped:#5a6b25; --shipped-bg:#f4f4dc; --shipped-border:#c5cf94;
-    --preview:#9a5a1f; --preview-bg:#faefd2; --preview-border:#d8b078;
     /* type */
     --serif:'IBM Plex Serif','Charter','Iowan Old Style','Palatino',Georgia,serif;
     --sans:-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Arial,system-ui,sans-serif;
@@ -37,7 +38,8 @@
   header.hero h1{font-family:var(--serif);font-weight:600;font-size:40px;letter-spacing:-.015em;
     margin:16px 0 6px}
   header.hero p.tag{font-family:var(--serif);font-size:21px;color:var(--ink);margin:0 0 6px}
-  header.hero p.sub{font-size:15px;color:var(--ink-muted);max-width:60ch;margin:6px auto 0}
+  header.hero p.sub{font-size:15px;color:var(--ink-muted);max-width:58ch;margin:6px auto 0}
+  header.hero p.sub b{color:var(--ink);font-weight:600}
   header.hero p.meta{font-size:12.5px;color:var(--ink-muted);margin-top:14px;letter-spacing:.02em}
   header.hero p.meta b{color:var(--accent-dark);font-weight:600}
 
@@ -45,7 +47,6 @@
   .stage{margin:30px auto 8px;max-width:680px}
   .window{background:var(--win-bg);border:1px solid var(--border-strong);border-radius:14px;
     overflow:hidden;box-shadow:0 18px 50px rgba(44,39,34,.14);position:relative}
-  .window.preview{outline:3px dashed var(--preview);outline-offset:3px}
   .titlebar{display:flex;align-items:center;gap:8px;padding:9px 13px;background:var(--win-chrome);
     border-bottom:1px solid var(--win-line)}
   .lights{display:flex;gap:7px}
@@ -69,7 +70,7 @@
   .glyphs span{font-family:var(--serif)}
 
   /* the profile dropdown menu (animated) */
-  .menu{position:absolute;top:38px;left:12px;min-width:168px;background:var(--bg);
+  .menu{position:absolute;top:38px;left:12px;min-width:190px;background:var(--bg);
     border:1px solid var(--border-strong);border-radius:9px;box-shadow:0 10px 30px rgba(44,39,34,.18);
     padding:5px;z-index:5;opacity:0;transform:translateY(-6px) scale(.98);pointer-events:none;
     transition:opacity .14s ease,transform .14s ease}
@@ -80,7 +81,7 @@
   .menu .mrow.sel .check{opacity:1}
 
   /* transcript */
-  .transcript{min-height:268px;max-height:268px;overflow:hidden;padding:16px 16px 6px;
+  .transcript{min-height:288px;max-height:288px;overflow:hidden;padding:16px 16px 6px;
     background:var(--win-bg);display:flex;flex-direction:column;gap:10px}
   .row{display:flex;max-width:100%}
   .row.user{justify-content:flex-end}
@@ -89,41 +90,44 @@
     white-space:pre-wrap;word-wrap:break-word}
   .bubble.user{background:var(--bubble-user);color:var(--on-accent)}
   .bubble.assistant{background:var(--bubble-assistant);color:var(--ink)}
-  .acol{display:flex;flex-direction:column;gap:6px;align-items:flex-start;max-width:84%}
+  .acol{display:flex;flex-direction:column;gap:6px;align-items:flex-start;max-width:88%;width:88%}
 
-  /* thinking disclosure — mirrors MessageBubble.ThinkingSection */
-  .think{width:100%}
-  .think .thead{display:inline-flex;align-items:center;gap:5px;color:var(--ink-muted);
-    font-size:11.5px;font-weight:600;cursor:default}
-  .think .thead .tchev{transition:transform .15s}
-  .think.collapsed .thead .tchev{transform:rotate(-90deg)}
-  .think .tbody{margin-top:4px;font-family:var(--mono);font-size:11.5px;color:var(--ink-soft);
-    background:var(--think-bg);border-radius:10px;padding:8px 10px;white-space:pre-wrap;
-    overflow:hidden;transition:max-height .18s ease,opacity .18s ease;max-height:140px}
-  .think.collapsed .tbody{max-height:0;opacity:0;padding-top:0;padding-bottom:0}
+  /* ---- Tree search disclosure — mirrors App/Views/Chat/TreeSearchSection.swift ---- */
+  .tsearch{width:100%}
+  .tshead{display:inline-flex;align-items:center;gap:5px;color:var(--ink-soft);font-size:11.5px;
+    font-weight:600}
+  .tshead svg{flex:none;color:var(--ink-muted)}
+  .tshead .bounds{color:var(--ink-muted);opacity:.75;font-weight:500}
+  .tshead .status{color:var(--ink-muted);font-weight:500}
+  .tshead .status.searching{animation:breathe 1.2s ease-in-out infinite}
+  @keyframes breathe{50%{opacity:.4}}
+  .tshead .tchev{opacity:.6;transition:transform .15s}
+  .tsearch.collapsed .tshead .tchev{transform:rotate(-90deg)}
+  .tsbody{margin-top:6px;background:var(--think-bg);border-radius:10px;padding:9px 11px;
+    display:flex;flex-direction:column;gap:6px;overflow:hidden;
+    transition:max-height .2s ease,opacity .2s ease;max-height:260px}
+  .tsearch.collapsed .tsbody{max-height:0;opacity:0;padding-top:0;padding-bottom:0;margin-top:0}
+  .tnode{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11.5px;
+    color:var(--ink-soft);opacity:0;transform:translateY(4px);
+    transition:opacity .25s ease,transform .25s ease}
+  .tnode.in{opacity:1;transform:none}
+  .tnode.child{margin-left:16px}
+  .tnode .beam{width:13px;text-align:center;font-weight:700;flex:none}
+  .tnode .beam.kept{color:var(--kept)}
+  .tnode .beam.pruned{color:var(--pruned)}
+  .tnode .beam.star{color:var(--star)}
+  .tnode.pruned .label{text-decoration:line-through;color:var(--pruned);opacity:.7}
+  .tnode .score{min-width:19px;height:17px;padding:0 5px;border-radius:9px;
+    background:rgba(var(--accent-rgb),.14);color:var(--accent-dark);font-size:10.5px;font-weight:700;
+    display:inline-flex;align-items:center;justify-content:center;flex:none;
+    opacity:0;transition:opacity .2s}
+  .tnode.scored .score{opacity:1}
+  .tnode .label{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
   /* caret while streaming */
   .caret::after{content:'';display:inline-block;width:7px;height:1.05em;vertical-align:-2px;
     margin-left:1px;background:currentColor;opacity:.65;animation:blink 1s steps(1) infinite}
   @keyframes blink{50%{opacity:0}}
-
-  /* ToT tree */
-  .tot{width:100%;padding-top:2px}
-  .tot .root{font-size:12.5px;color:var(--ink-muted);margin-bottom:8px}
-  .tot .level{display:flex;gap:8px;flex-wrap:wrap}
-  .node{flex:1 1 0;min-width:110px;border:1px solid var(--border-strong);border-radius:9px;
-    padding:7px 9px;background:var(--cream);font-size:11.5px;position:relative;
-    opacity:0;transform:translateY(6px);transition:opacity .25s ease,transform .25s ease,
-    border-color .2s,background .2s,filter .25s}
-  .node.in{opacity:1;transform:translateY(0)}
-  .node.pruned{opacity:.32;filter:grayscale(.5)}
-  .node.best{border-color:var(--accent);background:rgba(var(--accent-rgb),.08);
-    box-shadow:0 0 0 2px rgba(var(--accent-rgb),.18)}
-  .node .score{position:absolute;top:-9px;right:-7px;min-width:20px;height:20px;border-radius:10px;
-    background:var(--accent);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;
-    justify-content:center;padding:0 5px;opacity:0;transform:scale(.5);transition:opacity .2s,transform .2s}
-  .node.scored .score{opacity:1;transform:scale(1)}
-  .node.pruned .score{background:var(--ink-muted)}
 
   /* composer */
   .composer{display:flex;align-items:center;gap:9px;padding:11px 13px;border-top:1px solid var(--win-line);
@@ -139,39 +143,28 @@
   .caption{margin:14px auto 0;max-width:680px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
     min-height:30px}
   .chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:3px 10px;
-    border-radius:999px;border:1px solid;letter-spacing:.01em}
-  .chip.shipped{color:var(--shipped);background:var(--shipped-bg);border-color:var(--shipped-border)}
-  .chip.preview{color:var(--preview);background:var(--preview-bg);border-color:var(--preview-border)}
+    border-radius:999px;border:1px solid;letter-spacing:.01em;
+    color:var(--shipped);background:var(--shipped-bg);border-color:var(--shipped-border)}
   .caption .ctext{font-size:13px;color:var(--ink-soft)}
-
-  /* loud preview banner inside the window for scene 3 */
-  .pvbanner{display:none;align-items:center;gap:8px;justify-content:center;padding:7px 12px;
-    background:var(--preview-bg);color:var(--preview);border-bottom:1px solid var(--preview-border);
-    font-size:12px;font-weight:700;letter-spacing:.03em;text-transform:uppercase}
-  .window.preview .pvbanner{display:flex}
-  .pvbanner .dot{width:7px;height:7px;border-radius:50%;background:var(--preview);
-    animation:pulse 1.1s ease-in-out infinite}
-  @keyframes pulse{50%{opacity:.35}}
 
   /* scene dots */
   .dots{display:flex;gap:7px;justify-content:center;margin:20px 0 0}
-  .dots b{width:7px;height:7px;border-radius:50%;background:var(--border-strong);display:block;
-    transition:background .2s,width .2s;border-radius:999px}
+  .dots b{width:7px;height:7px;border-radius:999px;background:var(--border-strong);display:block;
+    transition:background .2s,width .2s}
   .dots b.on{background:var(--accent);width:18px}
 
   /* ---------- why ---------- */
   .why{margin:46px auto 0;max-width:760px}
-  .why h2{font-family:var(--serif);font-size:25px;text-align:center;margin:0 0 22px;font-weight:600}
-  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+  .why h2{font-family:var(--serif);font-size:25px;text-align:center;margin:0 0 8px;font-weight:600}
+  .why .lede{text-align:center;font-size:14px;color:var(--ink-muted);max-width:62ch;margin:0 auto 22px}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
   .card{background:var(--bg);border:1px solid var(--border);border-radius:13px;padding:16px 17px}
   .card .ct{display:flex;align-items:center;gap:8px;margin-bottom:6px}
   .card h3{font-size:15px;margin:0;font-weight:650}
-  .card p{font-size:13.5px;color:var(--ink-soft);margin:0}
+  .card p{font-size:13px;color:var(--ink-soft);margin:0}
   .card .tag{margin-left:auto;font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:999px;
-    border:1px solid}
-  .card .tag.s{color:var(--shipped);background:var(--shipped-bg);border-color:var(--shipped-border)}
-  .card .tag.p{color:var(--preview);background:var(--preview-bg);border-color:var(--preview-border)}
-  .why .compare{margin-top:16px;text-align:center;font-size:13px;color:var(--ink-muted)}
+    border:1px solid;color:var(--shipped);background:var(--shipped-bg);border-color:var(--shipped-border)}
+  .why .compare{margin-top:18px;text-align:center;font-size:13px;color:var(--ink-muted)}
 
   /* ---------- footer ---------- */
   footer{margin:48px auto 0;max-width:760px;text-align:center;font-size:12.5px;color:var(--ink-muted);
@@ -179,14 +172,14 @@
   footer a{color:var(--ink-soft)}
   footer .credit{margin-top:7px;font-size:11.5px}
 
-  @media (max-width:620px){
+  @media (max-width:680px){
     .grid{grid-template-columns:1fr}
     header.hero h1{font-size:32px}
     header.hero p.tag{font-size:18px}
   }
   /* honor reduced motion: JS renders a static frame; kill residual animation */
   @media (prefers-reduced-motion:reduce){
-    .caret::after,.pvbanner .dot{animation:none}
+    .caret::after,.tshead .status.searching{animation:none}
     *{transition:none !important}
   }
 </style>
@@ -195,11 +188,11 @@
 <div class="wrap">
 
   <header class="hero">
-    <img class="icon" src="../Resources/AppIcon/pie-icon-highres.png" alt="RatioThink app icon">
-    <h1>RatioThink</h1>
+    <img class="icon" src="../Resources/AppIcon/pie-icon-highres.png" alt="Rational app icon">
+    <h1>Rational</h1>
     <p class="tag">Local models, with thinking modes.</p>
-    <p class="sub">A native macOS app that runs open-weight models entirely on your Mac — and turns
-      them into named <em>thinking modes</em> you switch in one click.</p>
+    <p class="sub">A native macOS app that runs open-weight models entirely on your Mac.
+      <b>Switch how it thinks in one click.</b></p>
     <p class="meta"><b>macOS 14+</b> · <b>Apple&nbsp;Silicon</b> · 100% on-device · powered by the bundled Pie engine</p>
   </header>
 
@@ -208,17 +201,13 @@
     <div class="window" id="win">
       <div class="titlebar">
         <div class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></div>
-        <div class="wtitle">RatioThink</div>
+        <div class="wtitle">Rational</div>
       </div>
-
-      <!-- loud preview banner (only visible in scene 3 via .window.preview) -->
-      <div class="pvbanner"><span class="dot"></span>Preview — Tree-of-Thought runs via the local API today, not a one-click profile yet</div>
 
       <div class="toolbar">
         <span class="pill active" id="profilePill">
-          <svg width="13" height="13" viewBox="0 0 16 16" id="profileIcon" fill="none"
-               stroke="currentColor" stroke-width="1.4"><path d="M2.5 6.5a3.5 3 0 0 1 3.5-3h4a3.5 3 0 0 1 0 6h-4l-2.5 2v-2a3 3 0 0 1-1-3z"/></svg>
-          <span class="lab">Profile:</span><span id="profileName">Chat</span>
+          <span id="profileIcon"></span>
+          <span class="lab">Profile:</span><span id="profileName">Tree of Thought</span>
           <span class="chev">▾</span>
         </span>
         <span class="pill"><span class="lab">Model:</span>&nbsp;Qwen3-0.6B <span class="chev">▾</span></span>
@@ -230,13 +219,16 @@
         </span>
 
         <div class="menu" id="profileMenu">
-          <div class="mrow" id="menuChat">
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 6.5a3.5 3 0 0 1 3.5-3h4a3.5 3 0 0 1 0 6h-4l-2.5 2v-2a3 3 0 0 1-1-3z"/></svg>
-            Chat<span class="check">✓</span>
+          <div class="mrow" id="menuTot">
+            <span class="ticon"></span> Tree of Thought<span class="check">✓</span>
           </div>
           <div class="mrow" id="menuFast">
             <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"><path d="M8.5 1 3 9h3.5L6 15l6-8.5H8z"/></svg>
             Fast Think<span class="check">✓</span>
+          </div>
+          <div class="mrow" id="menuChat">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 6.5a3.5 3 0 0 1 3.5-3h4a3.5 3 0 0 1 0 6h-4l-2.5 2v-2a3 3 0 0 1-1-3z"/></svg>
+            Chat<span class="check">✓</span>
           </div>
         </div>
       </div>
@@ -244,41 +236,36 @@
       <div class="transcript" id="transcript"></div>
 
       <div class="composer">
-        <div class="field" id="composer">Message RatioThink…</div>
+        <div class="field" id="composer">Message Rational…</div>
         <div class="send"><svg width="15" height="15" viewBox="0 0 16 16" fill="#fff"><path d="M8 2.5 13 13 8 10.5 3 13z"/></svg></div>
       </div>
     </div>
 
     <div class="caption" id="caption"></div>
-    <div class="dots" id="dots"><b></b><b></b><b></b></div>
+    <div class="dots" id="dots"><b></b><b></b></div>
   </div>
 
   <!-- ===================== why ===================== -->
   <section class="why">
     <h2>What you can't do in Ollama or LM Studio</h2>
+    <p class="lede">One real difference: <strong>profiles</strong> — named thinking modes you switch in
+       one click. Everything below is a profile.</p>
     <div class="grid">
       <div class="card">
-        <div class="ct"><h3>Thinking modes</h3><span class="tag s">Shipped</span></div>
-        <p>A profile bundles model + sampling + system prompt + workflow into one named, saved,
-           one-click preset. Editable as TOML. Ollama exposes these only as per-request params;
-           LM Studio has no explicit profiles.</p>
+        <div class="ct"><h3>Thinking modes</h3><span class="tag">Shipped</span></div>
+        <p>A profile is a named, one-click preset — model + sampling + system prompt + workflow — saved
+           to disk and editable as TOML. Ollama exposes these only as per-request params; LM Studio has
+           no explicit profiles.</p>
       </div>
       <div class="card">
-        <div class="ct"><h3>Fast Think</h3><span class="tag s">Shipped</span></div>
+        <div class="ct"><h3>Tree of Thought</h3><span class="tag">Shipped</span></div>
+        <p>A profile that turns one question into a scored search tree: the engine branches, scores each
+           branch 1–10, and keeps the best beam — shown live in a foldable tree, then the chosen answer.</p>
+      </div>
+      <div class="card">
+        <div class="ct"><h3>Fast Think</h3><span class="tag">Shipped</span></div>
         <p>A profile that runs the same model greedily with a <strong>speculative drafter</strong> —
-           fewer waits, identical output — on the bundled Apple-Silicon engine. Just pick the profile.</p>
-      </div>
-      <div class="card">
-        <div class="ct"><h3>Reasoning, separated</h3><span class="tag s">Shipped</span></div>
-        <p>Models that emit a <code>&lt;think&gt;</code> scratchpad get a collapsible
-           <strong>Thinking</strong> section, so the reasoning never mixes into — or gets copied
-           with — the answer.</p>
-      </div>
-      <div class="card">
-        <div class="ct"><h3>Tree-of-Thought</h3><span class="tag p">Preview</span></div>
-        <p>The <code>chat-apc</code> engine can run a bounded Tree-of-Thought search via the local
-           API (<code>POST /v1/inferlet</code>). Honest status: an API capability today, not yet a
-           one-click profile.</p>
+           fewer waits, identical output — on the bundled Apple-Silicon engine. Just pick it.</p>
       </div>
     </div>
     <p class="compare">Everything runs on your Mac. No accounts, no cloud, no telemetry.</p>
@@ -304,26 +291,32 @@
   var menu       = document.getElementById('profileMenu');
   var profileName= document.getElementById('profileName');
   var profileIcon= document.getElementById('profileIcon');
-  var menuChat   = document.getElementById('menuChat');
+  var menuTot    = document.getElementById('menuTot');
   var menuFast   = document.getElementById('menuFast');
+  var menuChat   = document.getElementById('menuChat');
   var captionEl  = document.getElementById('caption');
   var dotsEl     = document.getElementById('dots').children;
 
+  // SF-Symbol-flavoured inline glyphs (browser-safe).
   var BOLT = '<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"><path d="M8.5 1 3 9h3.5L6 15l6-8.5H8z"/></svg>';
-  var BUBBLE = '<path d="M2.5 6.5a3.5 3 0 0 1 3.5-3h4a3.5 3 0 0 1 0 6h-4l-2.5 2v-2a3 3 0 0 1-1-3z"/>';
+  // "point.3.connected.trianglepath.dotted" — three connected nodes.
+  var TREE = '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M8 3.2 3.5 11M8 3.2 12.5 11" stroke-dasharray="1.6 1.4"/><circle cx="8" cy="3" r="1.8" fill="currentColor" stroke="none"/><circle cx="3.2" cy="12" r="1.8" fill="currentColor" stroke="none"/><circle cx="12.8" cy="12" r="1.8" fill="currentColor" stroke="none"/></svg>';
 
   function sleep(ms){ return new Promise(function(r){ setTimeout(r, reduce ? 0 : ms); }); }
-  function clear(){ transcript.innerHTML=''; composer.textContent='Message RatioThink…';
+  function clear(){ transcript.innerHTML=''; composer.textContent='Message Rational…';
     composer.classList.remove('typed'); }
   function el(html){ var d=document.createElement('div'); d.innerHTML=html.trim(); return d.firstChild; }
+  function resetComposer(){ composer.textContent='Message Rational…'; composer.classList.remove('typed'); }
 
-  function setCaption(kind, text){
-    var chip = kind==='preview'
-      ? '<span class="chip preview">▲ Preview · API only</span>'
-      : '<span class="chip shipped">● Shipped · in the app</span>';
-    captionEl.innerHTML = chip + '<span class="ctext">'+text+'</span>';
+  function setCaption(text){
+    captionEl.innerHTML = '<span class="chip">● In the app</span><span class="ctext">'+text+'</span>';
   }
   function setDots(i){ for(var k=0;k<dotsEl.length;k++) dotsEl[k].classList.toggle('on', k===i); }
+  function selectMenu(which){
+    menuTot.classList.toggle('sel', which==='tot');
+    menuFast.classList.toggle('sel', which==='fast');
+    menuChat.classList.toggle('sel', which==='chat');
+  }
 
   function userRow(text){
     var r = el('<div class="row user"><div class="bubble user"></div></div>');
@@ -333,7 +326,7 @@
     composer.classList.add('typed'); composer.textContent='';
     if(reduce){ composer.textContent=text; return; }
     for(var i=0;i<text.length;i++){ composer.textContent+=text[i]; await sleep(22); }
-    await sleep(260);
+    await sleep(240);
   }
   async function streamInto(node, text, per){
     node.classList.add('caret');
@@ -342,121 +335,125 @@
     node.classList.remove('caret');
   }
 
-  // ---------------- Scene 1: Fast Think profile swap (REAL) ----------------
-  async function sceneFastThink(){
+  // ---- tree-search node helpers (mirror ToTNodeRow beam glyphs + score capsule) ----
+  function beamChar(b){ return b==='star' ? '★' : b==='kept' ? '✓' : b==='pruned' ? '✕' : '◌'; }
+  function addNode(parent, cfg, child){
+    var n = el('<div class="tnode'+(child?' child':'')+'">'+
+      '<span class="beam pending">◌</span>'+
+      '<span class="score">'+cfg.s+'</span>'+
+      '<span class="label">'+cfg.t+'</span></div>');
+    parent.appendChild(n);
+    return n;
+  }
+  function setBeam(node, beam){
+    var b = node.querySelector('.beam');
+    b.className = 'beam '+beam; b.textContent = beamChar(beam);
+    node.classList.toggle('pruned', beam==='pruned');
+  }
+
+  // ============== Scene 1 (LEAD): Tree of Thought — shipped one-click profile ==============
+  async function sceneTreeOfThought(){
     setDots(0);
-    win.classList.remove('preview');
-    // reset profile to Chat
-    profileName.textContent='Chat'; profileIcon.innerHTML=BUBBLE;
-    menuChat.classList.add('sel'); menuFast.classList.remove('sel');
+    profileName.textContent='Tree of Thought'; profileIcon.innerHTML=TREE; selectMenu('tot');
     clear();
-    setCaption('shipped','Switch profile → speculative decoding. Same model, fewer waits.');
-    await sleep(700);
-    // open menu, move selection to Fast Think, pick it
-    menu.classList.add('show'); await sleep(650);
-    menuChat.classList.remove('sel'); menuFast.classList.add('sel'); await sleep(550);
+    setCaption('Tree of Thought is a one-click profile: the engine branches, scores, and keeps the best.');
+    await sleep(750);
+    await typeComposer('Plan a surprise party.');
+    userRow('Plan a surprise party.'); resetComposer();
+    await sleep(260);
+
+    var col = el(
+      '<div class="row assistant"><div class="acol">'+
+        '<div class="tsearch" id="ts">'+
+          '<div class="tshead">'+TREE+' Tree search '+
+            '<span class="bounds">· 3×2, beam 2 ·</span> '+
+            '<span class="status searching" id="tstatus">searching…</span> '+
+            '<span class="tchev">▾</span></div>'+
+          '<div class="tsbody" id="tsbody"></div>'+
+        '</div>'+
+      '</div></div>');
+    transcript.appendChild(col);
+    var tsbody = col.querySelector('#tsbody');
+
+    // level 1 — three branches appear, then score, then the beam keeps the top 2
+    var l1 = [
+      addNode(tsbody, {t:'Theme + guest list first', s:8}, false),
+      addNode(tsbody, {t:'Book a venue, then invite', s:5}, false),
+      addNode(tsbody, {t:'Just order a cake',         s:3}, false)
+    ];
+    for(var i=0;i<l1.length;i++){ l1[i].classList.add('in'); await sleep(280); }
+    await sleep(260);
+    for(var j=0;j<l1.length;j++){ l1[j].classList.add('scored'); await sleep(190); }
+    await sleep(320);
+    setBeam(l1[0],'kept'); setBeam(l1[1],'kept'); setBeam(l1[2],'pruned');
+    await sleep(520);
+
+    // level 2 — expand the best branch, score, star the winning leaf
+    var l2 = [
+      addNode(tsbody, {t:'Evening garden theme, 12 guests', s:9}, true),
+      addNode(tsbody, {t:'Daytime brunch, 20 guests',       s:6}, true)
+    ];
+    for(var k=0;k<l2.length;k++){ l2[k].classList.add('in'); await sleep(280); }
+    await sleep(220);
+    for(var m=0;m<l2.length;m++){ l2[m].classList.add('scored'); await sleep(190); }
+    await sleep(340);
+    setBeam(l2[1],'kept'); setBeam(l2[0],'star');
+    document.getElementById('tstatus').classList.remove('searching');
+    document.getElementById('tstatus').textContent='5 nodes';
+    await sleep(750);
+
+    // chosen answer arrives; the tree search folds away
+    var ans = el('<div class="bubble assistant"></div>');
+    col.querySelector('.acol').appendChild(ans);
+    document.getElementById('ts').classList.add('collapsed');
+    await streamInto(ans,
+      'Go with an evening garden theme for 12 — lock the guest list, then plan venue and cake around it.', 16);
+    await sleep(2000);
+  }
+
+  // ============== Scene 2: Fast Think — speculative decoding, one profile away ==============
+  async function sceneFastThink(){
+    setDots(1);
+    clear();
+    setCaption('Switch to Fast Think — same model, greedy + a speculative drafter, fewer waits.');
+    await sleep(600);
+    // open the profile menu, move selection to Fast Think, pick it
+    menu.classList.add('show'); await sleep(620);
+    selectMenu('fast'); await sleep(520);
     menu.classList.remove('show');
     profileName.textContent='Fast Think'; profileIcon.innerHTML=BOLT;
-    await sleep(450);
-    // send a prompt; answer streams fast (speculative)
+    await sleep(420);
     await typeComposer('List three uses for a paperclip.');
-    userRow('List three uses for a paperclip.'); composer.textContent='Message RatioThink…'; composer.classList.remove('typed');
-    await sleep(280);
+    userRow('List three uses for a paperclip.'); resetComposer();
+    await sleep(260);
     var a = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
     transcript.appendChild(a);
     await streamInto(a.querySelector('.bubble'),
       '1. Reset a phone SIM tray.\n2. Bookmark a page.\n3. Clip loose cables together.', 11); // fast
-    await sleep(1200);
-  }
-
-  // ---------------- Scene 2: Thinking disclosure (REAL) ----------------
-  async function sceneThinking(){
-    setDots(1);
-    win.classList.remove('preview');
-    clear();
-    setCaption('shipped','Reasoning shows in a Thinking section — kept separate from the answer.');
-    await sleep(600);
-    await typeComposer('A train leaves at 3pm going 60 mph. How far by 5pm?');
-    userRow('A train leaves at 3pm going 60 mph. How far by 5pm?');
-    composer.textContent='Message RatioThink…'; composer.classList.remove('typed');
-    await sleep(260);
-    // assistant column: thinking section (expanded, streaming) then answer; thinking auto-folds
-    var col = el(
-      '<div class="row assistant"><div class="acol">'+
-      '<div class="think" id="thk"><div class="thead">🧠 Thinking <span class="tchev">▾</span></div>'+
-      '<div class="tbody" id="thkbody"></div></div>'+
-      '</div></div>');
-    transcript.appendChild(col);
-    var thk = col.querySelector('#thk'), thkbody = col.querySelector('#thkbody');
-    await streamInto(thkbody,
-      '3pm to 5pm is 2 hours.\nDistance = speed x time = 60 x 2.\nThat gives 120 miles.', 14);
-    await sleep(400);
-    // answer starts -> thinking folds
-    var ans = el('<div class="bubble assistant"></div>');
-    col.querySelector('.acol').appendChild(ans);
-    thk.classList.add('collapsed');
-    thk.querySelector('.thead').innerHTML = '🧠 Thinking <span class="tchev">▸</span>';
-    await streamInto(ans, '120 miles.', 26);
-    await sleep(1500);
-  }
-
-  // ---------------- Scene 3: Tree-of-Thought (PREVIEW) ----------------
-  async function sceneToT(){
-    setDots(2);
-    clear();
-    win.classList.add('preview');           // dashed outline + loud banner
-    setCaption('preview','Tree-of-Thought: branch, score 1–10, keep the best. Callable via /v1/inferlet today.');
-    await sleep(700);
-    userRow('Plan a surprise party. Think it through.');
-    await sleep(380);
-    var tot = el(
-      '<div class="row assistant"><div class="tot">'+
-      '<div class="root">root → branching 3 candidates · scoring · keep top 2</div>'+
-      '<div class="level" id="lvl"></div></div></div>');
-    transcript.appendChild(tot);
-    var lvl = tot.querySelector('#lvl');
-    var cands = [
-      {t:'Theme + guest list first',  s:8, best:true},
-      {t:'Book a venue, then invite', s:5, best:false},
-      {t:'Just buy a cake',           s:3, best:false}
-    ];
-    var nodes = cands.map(function(c){
-      var n = el('<div class="node">'+c.t+'<span class="score">'+c.s+'</span></div>');
-      lvl.appendChild(n); return n;
-    });
-    // reveal staggered
-    for(var i=0;i<nodes.length;i++){ nodes[i].classList.add('in'); await sleep(reduce?0:240); }
-    await sleep(300);
-    // scores pop
-    for(var j=0;j<nodes.length;j++){ nodes[j].classList.add('scored'); await sleep(reduce?0:160); }
-    await sleep(500);
-    // prune the lowest, mark best
-    nodes[2].classList.add('pruned');
-    await sleep(reduce?0:350);
-    nodes[1].classList.add('pruned');
-    nodes[0].classList.add('best');
-    await sleep(600);
-    var ans = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
-    transcript.appendChild(ans);
-    await streamInto(ans.querySelector('.bubble'),
-      'Best path: lock the theme and guest list first, then everything else follows.', 16);
-    await sleep(1700);
+    await sleep(1600);
   }
 
   function renderStatic(){
     // reduced-motion (and the loop's error fallback): one honest representative
-    // frame (Fast Think Q+A), preview noted in cards. clear() first so it's a
-    // clean frame even if a half-rendered scene was on screen.
+    // frame of the lead Tree of Thought profile. clear() first so it's a clean
+    // frame even if a half-rendered scene was on screen.
     clear();
-    win.classList.remove('preview');
-    profileName.textContent='Fast Think'; profileIcon.innerHTML=BOLT;
-    menuChat.classList.remove('sel'); menuFast.classList.add('sel');
-    userRow('List three uses for a paperclip.');
-    var a = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
-    a.querySelector('.bubble').textContent =
-      '1. Reset a phone SIM tray.\n2. Bookmark a page.\n3. Clip loose cables together.';
-    transcript.appendChild(a);
-    setCaption('shipped','Animation paused (reduced motion). Profiles, Fast Think, and the Thinking section are live in the app.');
+    profileName.textContent='Tree of Thought'; profileIcon.innerHTML=TREE; selectMenu('tot');
+    userRow('Plan a surprise party.');
+    var col = el(
+      '<div class="row assistant"><div class="acol">'+
+        '<div class="tsearch"><div class="tshead">'+TREE+' Tree search '+
+          '<span class="bounds">· 3×2, beam 2 ·</span> <span class="status">5 nodes</span> '+
+          '<span class="tchev">▾</span></div>'+
+        '<div class="tsbody">'+
+          '<div class="tnode scored in"><span class="beam kept">✓</span><span class="score">8</span><span class="label">Theme + guest list first</span></div>'+
+          '<div class="tnode child scored in"><span class="beam star">★</span><span class="score">9</span><span class="label">Evening garden theme, 12 guests</span></div>'+
+          '<div class="tnode pruned scored in"><span class="beam pruned">✕</span><span class="score">3</span><span class="label">Just order a cake</span></div>'+
+        '</div></div>'+
+        '<div class="bubble assistant">Go with an evening garden theme for 12 — lock the guest list, then plan venue and cake around it.</div>'+
+      '</div></div>');
+    transcript.appendChild(col);
+    setCaption('Animation paused (reduced motion). Tree of Thought, Fast Think, and profiles are live in the app.');
     setDots(0);
   }
 
@@ -465,10 +462,9 @@
     // eslint-disable-next-line no-constant-condition
     while(true){
       try {
+        await sceneTreeOfThought();   // lead demo
         await sceneFastThink();
-        await sceneThinking();
-        await sceneToT();
-        await sleep(900);
+        await sleep(800);
       } catch (e) {
         // A future markup/ID change could make a querySelector return null and
         // throw mid-scene. Degrade to the honest static frame instead of
