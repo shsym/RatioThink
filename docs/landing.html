@@ -41,6 +41,21 @@
   header.hero p.meta{font-size:12.5px;color:var(--ink-muted);margin-top:14px;letter-spacing:.02em}
   header.hero p.meta b{color:var(--accent-dark);font-weight:600}
 
+  /* ---------- download CTA ---------- */
+  .cta{margin:24px auto 0;display:flex;flex-direction:column;align-items:center;gap:9px}
+  .cta-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:center}
+  .btn-download{display:inline-flex;align-items:center;gap:8px;background:var(--accent);
+    color:var(--on-accent);font-weight:600;font-size:14.5px;padding:11px 20px;border-radius:11px;
+    text-decoration:none;box-shadow:0 4px 16px rgba(var(--accent-rgb),.28);
+    transition:background .15s ease,transform .08s ease}
+  .btn-download:hover{background:var(--accent-dark);color:var(--on-accent)}
+  .btn-download:active{transform:translateY(1px)}
+  .btn-download:focus-visible{outline:2px solid var(--accent-dark);outline-offset:3px}
+  .cta .ver{font-size:12.5px;color:var(--ink-muted);font-weight:600;font-variant-numeric:tabular-nums}
+  .cta .ver:empty{display:none}
+  .cta .all-releases{font-size:12.5px;color:var(--ink-muted);text-decoration:none}
+  .cta .all-releases:hover{color:var(--accent-dark);text-decoration:underline}
+
   /* ---------- mock app window ---------- */
   .stage{margin:96px auto 8px;max-width:680px}
   .window{background:var(--win-bg);border:1px solid var(--border-strong);border-radius:14px;
@@ -196,6 +211,16 @@
     <p class="sub">A native macOS app that runs open-weight models entirely on your Mac.
       <b>Switch how it thinks in one click.</b></p>
     <p class="meta"><b>macOS 14+</b> · <b>Apple&nbsp;Silicon</b> · 100% on-device · powered by the bundled Pie engine</p>
+    <div class="cta">
+      <div class="cta-row">
+        <a class="btn-download" href="https://github.com/shsym/RatioThink/releases/latest/download/Rational-arm64.dmg">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 13.5h11"/></svg>
+          Download for macOS (Apple Silicon)
+        </a>
+        <span class="ver" id="dlVersion" aria-live="polite"></span>
+      </div>
+      <a class="all-releases" href="https://github.com/shsym/RatioThink/releases">All releases</a>
+    </div>
   </header>
 
   <!-- ===================== mock app window ===================== -->
@@ -278,6 +303,23 @@
   </footer>
 
 </div>
+
+<!-- Download CTA version label. Isolated from the scene-reel script below so a
+     fetch failure can never reach (or trip) the animation's error boundary. The
+     download button works regardless of this fetch; on any failure the version
+     placeholder simply stays empty. -->
+<script>
+(function(){
+  "use strict";
+  var label = document.getElementById('dlVersion');
+  if (!label || !window.fetch) return;
+  fetch('https://api.github.com/repos/shsym/RatioThink/releases/latest',
+        { headers: { 'Accept': 'application/vnd.github+json' } })
+    .then(function(res){ return res.ok ? res.json() : null; })
+    .then(function(data){ if (data && data.tag_name) label.textContent = data.tag_name; })
+    .catch(function(){ /* offline / blocked / rate-limited — leave the version empty */ });
+})();
+</script>
 
 <script>
 (function(){
