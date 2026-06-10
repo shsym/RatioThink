@@ -111,11 +111,21 @@ public extension EngineProblem {
         title: "The engine couldn’t start",
         message: "The engine failed to start. Try restarting it.",
         recovery: .restartEngine, technicalDetail: technicalDetail)
+    case .wireContractViolation:
+      // An app–helper plumbing bug (type-skewed XPC reply), not an engine
+      // failure — restarting the engine cannot fix it.
+      self.init(
+        title: "App–helper communication problem",
+        message: "The app and its background helper are out of sync. Quit and reopen the app; if it keeps happening, report a bug.",
+        recovery: .none, technicalDetail: technicalDetail)
     default:
+      // The code discriminator moves to technicalDetail — enum case names
+      // are never user copy.
       self.init(
         title: "Engine failed",
-        message: "The engine hit an unexpected error (\(code.rawValue)). Try restarting it.",
-        recovery: .restartEngine, technicalDetail: technicalDetail)
+        message: "The engine hit an unexpected error. Try restarting it.",
+        recovery: .restartEngine,
+        technicalDetail: detail.isEmpty ? code.rawValue : "[\(code.rawValue)] \(detail)")
     }
   }
 }
@@ -134,6 +144,11 @@ public extension EngineProblem {
     }
     if let totError = error as? ToTStreamError {
       switch totError {
+      case let .stream(code, _) where code == "model_not_found":
+        // Parity with the HTTP path's `isModelNotFound` routing — a ToT
+        // terminal frame rejecting the model is the same user problem.
+        self.init(modelNotFound: requestedModelID,
+                  technicalDetail: totError.errorDescription)
       case .stream:
         self.init(
           title: "Engine couldn’t answer",
@@ -164,21 +179,27 @@ public extension EngineProblem {
       technicalDetail: PersistenceStatus.formatError(error))
   }
 
+  /// One model-not-found mapping shared by the HTTP envelope/meta-frame
+  /// path and the ToT terminal-frame path — names the model when known.
+  private init(modelNotFound requestedModelID: String?, technicalDetail: String?) {
+    let leaf = requestedModelID.flatMap {
+      $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        ? nil : ModelDisplayName.leaf($0)
+    }
+    let message = leaf.map {
+      "Model \($0) isn’t installed — download it in Settings → Models, or pick another model."
+    } ?? "The selected model isn’t installed — download it in Settings → Models, or pick another model."
+    self.init(title: "Model not installed", message: message,
+              recovery: .chooseModel, technicalDetail: technicalDetail)
+  }
+
   private init(httpEngineError error: HTTPEngineError, requestedModelID: String?) {
     // The raw diagnostic for every HTTP-boundary case is the error's own
     // description — the string the pre-#477 surfaces used as primary copy.
     let detail = error.description
 
     if error.isModelNotFound {
-      let leaf = requestedModelID.flatMap {
-        $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-          ? nil : ModelDisplayName.leaf($0)
-      }
-      let message = leaf.map {
-        "Model \($0) isn’t installed — download it in Settings → Models, or pick another model."
-      } ?? "The selected model isn’t installed — download it in Settings → Models, or pick another model."
-      self.init(title: "Model not installed", message: message,
-                recovery: .chooseModel, technicalDetail: detail)
+      self.init(modelNotFound: requestedModelID, technicalDetail: detail)
       return
     }
 

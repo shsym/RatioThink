@@ -33,12 +33,23 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   // MARK: - engineFailed (F1 + F3)
 
   func test_engineFailed_retryable_shows_curated_reason_and_retry() {
-    // #477: the gate's raw diagnostic never renders — the reason line is
-    // the EngineProblem taxonomy copy.
+    // #477: headline, reason, AND the primary affordance all come from
+    // the EngineProblem taxonomy — the gate's raw diagnostic never renders.
     let p = plan(.engineFailed(code: .spawnFailed, reason: "fork ENOENT", retryable: true), unavailableAction)
-    XCTAssertEqual(p.headline, "The engine couldn't start")
+    XCTAssertEqual(p.headline, "The engine couldn’t start")
     XCTAssertEqual(p.reason, "The engine failed to start. Try restarting it.")
     XCTAssertEqual(p.primary, .retryEngine)
+    XCTAssertFalse(p.showsOpenSettings)
+  }
+
+  func test_degraded_helper_never_offers_engine_retry() {
+    // Review F2: `.degraded` invitesResumeRetry on the menu axis, but its
+    // taxonomy recovery is restart-HELPER — a Retry that re-fires an
+    // engine start the degraded helper will refuse must not render.
+    let p = plan(.engineFailed(code: .degraded, reason: "helper boot fell back", retryable: true), unavailableAction)
+    XCTAssertEqual(p.headline, "Engine helper problem")
+    XCTAssertEqual(p.reason, "The background helper hit a problem and needs to be restarted.")
+    XCTAssertEqual(p.primary, .none)
     XCTAssertFalse(p.showsOpenSettings)
   }
 
@@ -54,7 +65,7 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     // F3: non-retryable model-choice fault — no Load/Retry even though the
     // model is on disk (action == .load); route to Models settings.
     let p = plan(.engineFailed(code: .memoryRisk, reason: "9.0 GB; choose smaller", retryable: false), loadAction)
-    XCTAssertEqual(p.headline, "Model is too large to load")
+    XCTAssertEqual(p.headline, "Model too large")
     XCTAssertEqual(p.reason, "This model exceeds this Mac’s safe memory limit. Pick a smaller model.")
     XCTAssertEqual(p.primary, .none)               // F3: no re-fire
     XCTAssertTrue(p.showsOpenSettings)
@@ -63,7 +74,10 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
 
   func test_killRejected_is_terminal_no_retry() {
     // F3: non-retryable, non-model-choice → reason only, no Retry loop.
+    // Review F2: the headline must match the body (refused to STOP), not
+    // claim a failed start.
     let p = plan(.engineFailed(code: .killRejected, reason: "zombie pid 42", retryable: false), loadAction)
+    XCTAssertEqual(p.headline, "Engine couldn’t be stopped")
     XCTAssertEqual(p.reason, "The engine process refused to stop. Quit and reopen the app if this persists.")
     XCTAssertFalse(p.reason?.contains("pid 42") ?? false)
     XCTAssertEqual(p.primary, .none)

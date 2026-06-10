@@ -346,6 +346,39 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
                    "resolver-level memory rejection must be observable through engineStatus/UI")
   }
 
+  func test_startEngine_resolverReject_leavesRawMessageInHelperLog() throws {
+    // #477 review F1: the resolver/guardrail prose never reaches UI copy
+    // anymore, so the reject path must leave the raw message in a durable
+    // sink — the DiagnosticLog helper.log breadcrumb.
+    let host = PieEngineHost(launcher: { _ in
+      XCTFail("resolver rejection must happen before launcher invocation")
+      throw CancellationError()
+    })
+    let rawMessage = "memory risk: oversized model at /tmp/big.gguf; choose a smaller model"
+    let api = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: { _, _ in
+        .failure(EngineError(code: .memoryRisk, message: rawMessage))
+      }
+    )
+    let temp = FileManager.default.temporaryDirectory
+      .appendingPathComponent("t477-diag-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: temp) }
+    // `resolveLaunchSpec` runs synchronously on the calling thread, so the
+    // TaskLocal home override covers the breadcrumb's directory resolution.
+    PieDirs.$homeOverride.withValue(temp) {
+      let exp = expectation(description: "startEngine reject reply")
+      api.startEngine(profileID: "chat", modelOverride: nil) { _, _ in exp.fulfill() }
+      wait(for: [exp], timeout: 1)
+    }
+    DiagnosticLog.helper.flush()
+    let log = try String(
+      contentsOf: temp.appendingPathComponent("logs/helper.log"), encoding: .utf8)
+    XCTAssertTrue(log.contains("engine.resolve.reject"), "got: \(log)")
+    XCTAssertTrue(log.contains(rawMessage),
+                  "raw resolver prose must be durably logged; got: \(log)")
+  }
+
   // MARK: - stopEngine
 
   func test_stopEngine_withoutHost_returnsNotImplemented() {

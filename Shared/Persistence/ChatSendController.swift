@@ -610,16 +610,6 @@ public final class ChatSendController: ObservableObject {
     }
   }
 
-  /// #477: every send failure routes through the shared `EngineProblem`
-  /// taxonomy, so the bubble shows one normalized, actionable line —
-  /// never the raw wire/`NSError` text (that survives on
-  /// `EngineProblem.technicalDetail`, logged by `markAssistant`). Pure +
-  /// static so the copy is unit-tested without a live engine or a
-  /// SwiftData context.
-  static func failureCopy(for error: Error, requestedModelID: String?) -> String {
-    EngineProblem(requestError: error, requestedModelID: requestedModelID).message
-  }
-
   private static func recordCancelledAssistant(
     _ assistant: Message,
     context: ModelContext,

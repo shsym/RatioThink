@@ -7,7 +7,7 @@ import XCTest
 /// folding so the view stays a dumb renderer.
 final class HelperEngineIndicatorTests: XCTestCase {
 
-  private let err = EngineIndicatorError(kind: .engineFailed, title: "Engine failed", message: "x", invitesModelChoice: false)
+  private let err = EngineIndicatorError(kind: .engineFailed, title: "Engine failed", message: "x")
 
   // MARK: - engine dot LED language
 

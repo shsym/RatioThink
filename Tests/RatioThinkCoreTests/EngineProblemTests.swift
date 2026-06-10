@@ -53,11 +53,24 @@ final class EngineProblemTests: XCTestCase {
       EngineProblem(statusCode: .degraded, rawMessage: "x").recovery, .restartHelper)
   }
 
-  func test_unknownCode_fallsBackToHonestGenericNamingTheCode() {
-    let p = EngineProblem(statusCode: .wireContractViolation, rawMessage: "")
+  func test_wireContractViolation_isPlumbingBug_notEngineRestart() {
+    // Documented as an app–helper plumbing bug — an engine restart can't
+    // fix a type-skewed XPC reply, and the case name is not user copy.
+    let p = EngineProblem(statusCode: .wireContractViolation, rawMessage: "decode failed")
+    XCTAssertEqual(p.recovery, .none)
+    XCTAssertEqual(p.title, "App–helper communication problem")
+    XCTAssertFalse(p.message.contains("wireContractViolation"), p.message)
+  }
+
+  func test_unknownCode_fallsBackToGeneric_codeOnlyInTechnicalDetail() {
+    let p = EngineProblem(statusCode: .unknown, rawMessage: "raw cause")
     XCTAssertEqual(p.recovery, .restartEngine)
-    XCTAssertTrue(p.message.contains("wireContractViolation"),
-                  "generic copy must still name the code: \(p.message)")
+    XCTAssertFalse(p.message.contains("unknown"),
+                   "enum case names are never user copy: \(p.message)")
+    XCTAssertEqual(p.technicalDetail, "[unknown] raw cause",
+                   "the code discriminator must survive in the diagnostic")
+    XCTAssertEqual(EngineProblem(statusCode: .unknown, rawMessage: "").technicalDetail,
+                   "unknown")
   }
 
   // MARK: - status axis: leak-proofing
@@ -89,16 +102,32 @@ final class EngineProblemTests: XCTestCase {
   // MARK: - request axis: model_not_found
 
   func test_modelNotFound_namesTheModelLeaf_andRoutesToChooseModel() {
+    let modelID = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
     let err = HTTPEngineError.api(status: 404, code: "model_not_found", message: "no such model")
-    let p = EngineProblem(requestError: err, requestedModelID: "qwen/qwen3-0.6b/model.gguf")
+    let p = EngineProblem(requestError: err, requestedModelID: modelID)
     XCTAssertEqual(p.recovery, .chooseModel)
-    XCTAssertTrue(p.message.contains("isn’t installed"), p.message)
+    XCTAssertEqual(
+      p.message,
+      "Model \(ModelDisplayName.leaf(modelID)) isn’t installed — download it in Settings → Models, or pick another model.")
     XCTAssertFalse(p.message.contains("model_not_found"), p.message)
   }
 
-  func test_modelNotFound_midStream_sameMapping() {
-    let err = HTTPEngineError.stream(code: "model_not_found", message: "raw")
-    XCTAssertEqual(EngineProblem(requestError: err).recovery, .chooseModel)
+  func test_modelNotFound_midStream_sameMapping_withoutModelID() {
+    let err = HTTPEngineError.stream(code: "model_not_found", message: "noisy detail")
+    let p = EngineProblem(requestError: err)
+    XCTAssertEqual(p.recovery, .chooseModel)
+    XCTAssertEqual(
+      p.message,
+      "The selected model isn’t installed — download it in Settings → Models, or pick another model.")
+  }
+
+  func test_modelNotFound_totTerminalFrame_paritiesHTTPPath() {
+    // Review F3: the ToT stream's model_not_found terminal frame is the
+    // same user problem as the HTTP envelope's — retrying would re-fail.
+    let err = ToTStreamError.stream(code: "model_not_found", message: "raw")
+    let p = EngineProblem(requestError: err, requestedModelID: "org/repo/m.gguf")
+    XCTAssertEqual(p.recovery, .chooseModel)
+    XCTAssertTrue(p.message.contains("isn’t installed"), p.message)
   }
 
   // MARK: - request axis: FaultClass

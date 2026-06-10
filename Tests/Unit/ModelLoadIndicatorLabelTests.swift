@@ -34,8 +34,7 @@ final class ModelLoadIndicatorLabelTests: XCTestCase {
     let err = EngineIndicatorError(
       kind: .engineFailed,
       title: "Engine failed",
-      message: "engine returned 502",
-      invitesModelChoice: false
+      message: "engine returned 502"
     )
     XCTAssertEqual(ModelLoadIndicator.pipLabel(for: .error(err)), "Engine failed")
   }
@@ -44,8 +43,7 @@ final class ModelLoadIndicatorLabelTests: XCTestCase {
     let err = EngineIndicatorError(
       kind: .memoryRisk,
       title: "Model too large",
-      message: "exceeds this Mac's safe memory limit",
-      invitesModelChoice: true
+      message: "exceeds this Mac's safe memory limit"
     )
     XCTAssertEqual(ModelLoadIndicator.pipLabel(for: .error(err)), "Model too large")
   }
@@ -67,7 +65,7 @@ final class ModelLoadIndicatorLabelTests: XCTestCase {
     XCTAssertEqual(StatusLED.engineDot(for: .offline), StatusLED(tint: .off, blink: false))
     XCTAssertEqual(StatusLED.engineDot(for: .starting(detail: "x")), StatusLED(tint: .white, blink: true))
     XCTAssertEqual(StatusLED.engineDot(for: .running(modelID: "m")), StatusLED(tint: .greenWhite, blink: false))
-    let err = EngineIndicatorError(kind: .engineFailed, title: "Engine failed", message: "x", invitesModelChoice: false)
+    let err = EngineIndicatorError(kind: .engineFailed, title: "Engine failed", message: "x")
     XCTAssertEqual(StatusLED.engineDot(for: .error(err)), StatusLED(tint: .amber, blink: true))
   }
 }

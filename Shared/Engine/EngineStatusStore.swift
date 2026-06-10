@@ -103,6 +103,11 @@ public final class EngineStatusStore: ObservableObject {
   /// banner shows the helper-axis tiers off `HelperHealth`; this counter is
   /// only the chat-recovery escalation, now aligned to the unified policy.
   private var consecutiveFailures = 0
+  /// True while the current `.failed(.engineGone)` was synthesized by THIS
+  /// store for sustained transport loss (#5a) rather than reported by the
+  /// helper. Drives honest "can't reach" copy in `statusDetail` — there is
+  /// no evidence the engine process exited in that case (#477 review F8).
+  private var engineGoneSynthesized = false
 
   /// Unified poll-count policy — single source of truth shared with the
   /// status banner (`StatusBannerReducer`) so the engine axis and the helper
@@ -377,8 +382,15 @@ public final class EngineStatusStore: ObservableObject {
       // decoder already rejects `port == 0`.
       return URL(string: "http://127.0.0.1:\(snapshot.port)")!
     }
-    if case .failed(.engineGone, _) = status {
-      throw HTTPEngineError.engineGone(detail: detailForStatus())
+    // The `detail` fields are the DIAGNOSTIC channel (they end up in
+    // `EngineProblem.technicalDetail` / logs, never primary copy) — feed
+    // them the raw `.failed` message, not the curated `statusDetail`
+    // line, so a chat-path failure keeps its cause (#477 review F8).
+    if case .failed(.engineGone, let message) = status {
+      throw HTTPEngineError.engineGone(detail: message)
+    }
+    if case .failed(let code, let message) = status {
+      throw HTTPEngineError.engineNotReady(detail: "[\(code.rawValue)] \(message)")
     }
     throw HTTPEngineError.engineNotReady(detail: detailForStatus())
   }
@@ -402,6 +414,11 @@ public final class EngineStatusStore: ObservableObject {
       return "Engine running"
     case .stopping:
       return "Engine stopping…"
+    case .failed(.engineGone, _) where engineGoneSynthesized:
+      // Store-synthesized transport loss (#5a): there is no evidence the
+      // engine process exited — only that the helper stopped answering.
+      // Honest copy instead of the taxonomy's process-exited line.
+      return "Can’t reach the engine — it stopped responding. Restart the engine to reconnect."
     case .failed(let code, let message):
       // #477: the status `message` is a raw diagnostic (stderr tails,
       // resolver traces) — surface the taxonomy's curated line instead.
@@ -464,6 +481,7 @@ public final class EngineStatusStore: ObservableObject {
         // grace exhausted — surface the failure below.
       }
       heldFailurePolls = 0
+      engineGoneSynthesized = false
       setStatusAndTrackStarting(next)
       if case .running = next { wasEverRunning = true }
       updateEngineGonePolls(for: next)
@@ -485,6 +503,7 @@ public final class EngineStatusStore: ObservableObject {
         // not re-publish a fresh message every poll.
         if !isEngineGone(self.status) {
           let cause = error.flatMap { $0.isEmpty ? nil : $0 } ?? "no response from the engine helper"
+          engineGoneSynthesized = true
           setStatusAndTrackStarting(.failed(
             code: .engineGone,
             message: "Can’t reach the engine — it stopped responding (\(cause)). Use Restart Engine to reconnect."

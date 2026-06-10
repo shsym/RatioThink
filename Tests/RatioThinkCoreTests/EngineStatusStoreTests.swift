@@ -548,6 +548,34 @@ final class EngineStatusStoreTests: XCTestCase {
     }
   }
 
+  /// #477 review F8: the store SYNTHESIZED this engineGone — there is no
+  /// evidence the engine process exited, so `statusDetail` must say
+  /// "can't reach", not the taxonomy's process-exited line; and the
+  /// diagnostic channel (`requireBaseURL`'s detail) keeps the raw cause.
+  func test_synthesized_engineGone_detail_is_honest_and_diagnostic_keeps_raw() async throws {
+    let client = StubXPCClient()
+    client.setNext(.running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
+    let store = EngineStatusStore(client: client, tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3))
+    _ = try await store.refresh()
+    for _ in 0..<3 {
+      store._applyPollForTesting(next: nil, error: "NSXPCConnectionInvalid")
+    }
+    XCTAssertEqual(store.statusDetail,
+                   "Can’t reach the engine — it stopped responding. Restart the engine to reconnect.")
+    XCTAssertThrowsError(try store.requireBaseURL()) { error in
+      guard case let HTTPEngineError.engineGone(detail) = error else {
+        return XCTFail("expected .engineGone, got \(error)")
+      }
+      XCTAssertTrue(detail.contains("NSXPCConnectionInvalid"),
+                    "diagnostic channel must keep the raw cause; got \(detail)")
+    }
+    // A helper-REPORTED engineGone goes back to the taxonomy line.
+    client.setNext(.failed(code: .engineGone, message: "liveness: pid 4 gone"))
+    _ = try await store.refresh()
+    XCTAssertEqual(store.statusDetail,
+                   "The engine process exited. Restart the engine to continue.")
+  }
+
   /// The escalation is "deaths without recovery": one successful poll
   /// resets the counter, so an intermittent helper never escalates.
   func test_successful_poll_resets_transport_failure_counter() async throws {

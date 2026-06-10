@@ -41,11 +41,12 @@ final class EngineIndicatorStateTests: XCTestCase {
 
   // MARK: - engine failures route to banner errors
 
-  func test_memoryRisk_failure_invites_model_choice() {
+  func test_memoryRisk_failure_carries_model_choice_copy() {
     let state = make(engine: .failed(code: .memoryRisk, message: "resolved size 12 GB exceeds limit"))
     guard case let .error(err) = state else { return XCTFail("expected .error, got \(state)") }
     XCTAssertEqual(err.kind, .memoryRisk)
-    XCTAssertTrue(err.invitesModelChoice)
+    XCTAssertTrue(err.message.contains("Pick a smaller model"),
+                  "the taxonomy copy itself names the model-choice action")
     XCTAssertEqual(state.dot, .error)
     XCTAssertEqual(state.bannerError, err)
   }
@@ -54,15 +55,15 @@ final class EngineIndicatorStateTests: XCTestCase {
     let state = make(engine: .failed(code: .engineGone, message: "process exited 9"))
     guard case let .error(err) = state else { return XCTFail("expected .error") }
     XCTAssertEqual(err.kind, .engineGone)
-    XCTAssertFalse(err.invitesModelChoice)
     XCTAssertEqual(err.title, "Engine stopped unexpectedly")
   }
 
-  func test_modelMissing_failure_invites_model_choice() {
+  func test_modelMissing_failure_carries_model_choice_copy() {
     let state = make(engine: .failed(code: .modelMissing, message: "no such model"))
     guard case let .error(err) = state else { return XCTFail("expected .error") }
     XCTAssertEqual(err.kind, .modelMissing)
-    XCTAssertTrue(err.invitesModelChoice)
+    XCTAssertTrue(err.message.contains("pick another model"),
+                  "the taxonomy copy itself names the model-choice action")
   }
 
   func test_other_failure_is_generic_engineFailed() {

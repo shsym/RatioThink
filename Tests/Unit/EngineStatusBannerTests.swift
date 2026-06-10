@@ -12,10 +12,9 @@ final class EngineStatusBannerTests: XCTestCase {
   private func error(
     kind: EngineIndicatorError.Kind = .engineFailed,
     title: String = "Engine failed",
-    message: String = "spawn ENOENT",
-    invitesModelChoice: Bool = false
+    message: String = "spawn ENOENT"
   ) -> EngineIndicatorError {
-    EngineIndicatorError(kind: kind, title: title, message: message, invitesModelChoice: invitesModelChoice)
+    EngineIndicatorError(kind: kind, title: title, message: message)
   }
 
   // MARK: - which states banner
@@ -40,8 +39,7 @@ final class EngineStatusBannerTests: XCTestCase {
     let err = error(
       kind: .memoryRisk,
       title: "Model too large",
-      message: "This model exceeds this Mac’s safe memory limit. Pick a smaller model.",
-      invitesModelChoice: true
+      message: "This model exceeds this Mac’s safe memory limit. Pick a smaller model."
     )
     let model = EngineStatusBanner.model(from: .error(err), acknowledgedSignature: nil)
     XCTAssertEqual(

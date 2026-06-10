@@ -284,38 +284,9 @@ final class ChatSendControllerTests: XCTestCase {
   }
 
   // MARK: - #2 model-not-found copy
-
-  /// A `model_not_found` rejection (engine running, requested model not
-  /// served) collapses into ONE plain, actionable line naming the model
-  /// — not the raw "Engine error (model_not_found): …" diagnostic.
-  func test_failureCopy_model_not_found_api_is_plain_actionable_line() {
-    let modelID = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
-    let error = HTTPEngineError.api(status: 404, code: "model_not_found",
-                                    message: "model not found in registry; available: [other]")
-    let copy = ChatSendController.failureCopy(for: error, requestedModelID: modelID)
-    XCTAssertEqual(
-      copy,
-      "Model \(ModelDisplayName.leaf(modelID)) isn’t installed — download it in Settings → Models, or pick another model.")
-    XCTAssertFalse(copy.contains("model_not_found"), "the raw engine code must not leak into the user copy")
-  }
-
-  /// Same plain copy for a mid-stream `model_not_found` meta-frame.
-  func test_failureCopy_model_not_found_stream_frame_without_modelID() {
-    let error = HTTPEngineError.stream(code: "model_not_found", message: "noisy detail")
-    let copy = ChatSendController.failureCopy(for: error, requestedModelID: nil)
-    XCTAssertEqual(
-      copy,
-      "The selected model isn’t installed — download it in Settings → Models, or pick another model.")
-  }
-
-  /// Every other engine error passes through the existing formatter — the
-  /// plain copy is scoped strictly to model-not-found.
-  func test_failureCopy_other_errors_pass_through_unchanged() {
-    let error = HTTPEngineError.engineGone(detail: "exit 1")
-    let copy = ChatSendController.failureCopy(for: error, requestedModelID: "x")
-    XCTAssertFalse(copy.contains("isn’t installed"),
-                   "a non-model-not-found error must not be rewritten; got \(copy)")
-  }
+  // (The copy itself is owned by `EngineProblem` — exact-line assertions
+  // live in EngineProblemTests; the bubble wiring is covered by the
+  // failure-path tests above.)
 
   func test_isModelNotFound_only_matches_that_code() {
     XCTAssertTrue(HTTPEngineError.api(status: 404, code: "model_not_found", message: "").isModelNotFound)

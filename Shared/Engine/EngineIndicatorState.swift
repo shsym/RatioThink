@@ -80,10 +80,10 @@ public enum EngineIndicatorState: Equatable, Sendable {
 }
 
 /// A failure surfaced by the engine-status pip + banner. Carries a
-/// discriminated `kind` (routed from `EngineErrorCode` where available),
-/// a short `title`, an actionable `message`, and whether the recovery is
-/// "pick a smaller / different model" (`invitesModelChoice`) — the
-/// banner appends a Model-menu hint in that case.
+/// discriminated `kind` (routed from `EngineErrorCode` where available)
+/// plus a short `title` and an actionable `message` from the shared
+/// `EngineProblem` taxonomy (#477) — the copy already names the next
+/// action, so no per-surface recovery flag rides along.
 public struct EngineIndicatorError: Equatable, Sendable {
   public enum Kind: Equatable, Sendable {
     case engineFailed   // generic engine failure (spawn, handshake, …)
@@ -95,19 +95,16 @@ public struct EngineIndicatorError: Equatable, Sendable {
   public let kind: Kind
   public let title: String
   public let message: String
-  public let invitesModelChoice: Bool
 
-  public init(kind: Kind, title: String, message: String, invitesModelChoice: Bool) {
+  public init(kind: Kind, title: String, message: String) {
     self.kind = kind
     self.title = title
     self.message = message
-    self.invitesModelChoice = invitesModelChoice
   }
 
   /// Route an `EngineStatus.failed` code to a banner-ready error. Copy
   /// comes from the shared `EngineProblem` taxonomy (#477) — the status
-  /// `message` is a raw diagnostic and never primary copy — and
-  /// `invitesModelChoice` is its `.chooseModel` recovery.
+  /// `message` is a raw diagnostic and never primary copy.
   static func make(code: EngineErrorCode, message: String) -> EngineIndicatorError {
     let problem = EngineProblem(statusCode: code, rawMessage: message)
     let kind: Kind
@@ -117,9 +114,6 @@ public struct EngineIndicatorError: Equatable, Sendable {
     case .modelMissing: kind = .modelMissing
     default:            kind = .engineFailed
     }
-    return EngineIndicatorError(
-      kind: kind, title: problem.title, message: problem.message,
-      invitesModelChoice: problem.recovery == .chooseModel
-    )
+    return EngineIndicatorError(kind: kind, title: problem.title, message: problem.message)
   }
 }

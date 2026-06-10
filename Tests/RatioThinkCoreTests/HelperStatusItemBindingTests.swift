@@ -107,7 +107,9 @@ final class HelperStatusItemBindingTests: XCTestCase {
       from: .failed(code: .spawnFailed, message: "binary missing")))
     let events = rec.events
     XCTAssertEqual(events.first, "dot=error")
-    XCTAssertTrue(events.contains { $0.contains("spawnFailed") && $0.contains("binary missing") })
+    // #477: the label carries the code + the curated taxonomy line, never
+    // the raw diagnostic.
+    XCTAssertTrue(events.contains { $0.contains("spawnFailed") && $0.contains("The engine failed to start") })
     // spawnFailed is user-recoverable → Resume stays enabled so a retry
     // is possible after the cause is fixed (EngineErrorCode.invitesResumeRetry).
     XCTAssertTrue(events.contains("pr.enabled=true"))

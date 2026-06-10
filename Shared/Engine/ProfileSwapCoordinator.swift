@@ -544,7 +544,13 @@ public final class ProfileSwapCoordinator: ObservableObject {
       do {
         try await serveModel(modelID, profileID)
       } catch {
-        serveModelError = "Couldn’t load \(modelID): \(error)"
+        // #477: tooltip/accessibility copy comes from the taxonomy; the
+        // raw error stays in the log line below.
+        if let e = error as? EngineError {
+          serveModelError = "Couldn’t load \(modelID). \(EngineProblem(statusCode: e.code, rawMessage: e.message).message)"
+        } else {
+          serveModelError = "Couldn’t load \(modelID)."
+        }
         Self.log.error("serveModel failed model=\(modelID, privacy: .public) profile=\(profileID, privacy: .public): \(String(describing: error), privacy: .public)")
       }
     }

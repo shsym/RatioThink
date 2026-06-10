@@ -46,6 +46,14 @@ struct EngineStatusBanner: View {
   ///   · otherwise → the title/message. #477: the message comes from the
   ///     shared `EngineProblem` taxonomy and already names the next
   ///     action, so no per-surface hint is appended.
+  ///
+  /// CAUTION (#477 review F9): this view currently has NO production
+  /// mounts — `UnifiedStatusBannerView` (StatusBannerReducer) superseded
+  /// it at the window root. With taxonomy copy the dedup `signature`
+  /// (kind|message) collapses to a per-code value AND the acknowledged
+  /// signature is never cleared, so one Dismiss would suppress every
+  /// future same-code failure. Any remount must re-key the signature on
+  /// a per-incident discriminator and clear the ack on leaving `.failed`.
   static func model(
     from state: EngineIndicatorState,
     acknowledgedSignature: String?

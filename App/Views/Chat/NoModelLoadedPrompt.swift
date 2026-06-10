@@ -115,35 +115,32 @@ struct NoModelLoadedPrompt: View {
     case .noDefault:
       return unavailablePlan()
 
-    case let .engineFailed(code, reason, retryable):
-      // #477: the gate's `reason` is the raw status diagnostic — render
-      // the taxonomy's curated line instead (raw stays in logs).
+    case let .engineFailed(code, reason, _):
+      // #477: headline, reason, AND the primary affordance all derive
+      // from the one taxonomy — copy and action can't diverge (review F2:
+      // a `.degraded` helper must not pair "restart the helper" copy with
+      // a Retry-engine button; `.killRejected` must not headline "couldn't
+      // start" over "refused to stop" body). The gate's raw `reason`
+      // diagnostic stays in logs.
       let problem = EngineProblem(statusCode: code, rawMessage: reason)
       // modelMissing + downloadable → the #326 inline download IS the fix;
       // the CTA says it all, so no reason line (matches the
-      // `.needsDefaultLoad` + `.download` sibling above).
+      // `.needsDefaultLoad` + `.download` sibling above; the #446
+      // download framing keeps its bespoke headline).
       if code == .modelMissing, case .download = action {
         return Plan(headline: "Default model isn't downloaded", reason: nil,
                     showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: true,
                     showsUnavailableCopy: false, primary: .none,
                     showsOpenSettings: false)
       }
-      // Model-choice faults (missing-not-downloadable / too-large /
-      // profile) route to Models settings, never a re-fire (F3).
-      if isModelChoiceFault(code) {
-        return Plan(headline: engineFailedTitle(code), reason: problem.message,
-                    showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
-                    showsUnavailableCopy: false, primary: .none,
-                    showsOpenSettings: true)
-      }
-      // Retryable engine fault (spawnFailed / engineGone / …) → Retry.
-      // Non-retryable, non-model-choice (killRejected) → terminal: reason
-      // only, no Retry that would re-fire a refused start (F3).
-      return Plan(headline: engineFailedTitle(code), reason: problem.message,
+      // `.chooseModel` routes to Models settings, never a re-fire (F3);
+      // only `.restartEngine` earns a Retry — `.restartHelper`/`none`
+      // faults would re-fail (or be refused) on a blind engine start.
+      return Plan(headline: problem.title, reason: problem.message,
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
                   showsUnavailableCopy: false,
-                  primary: retryable ? .retryEngine : .none,
-                  showsOpenSettings: false)
+                  primary: problem.recovery == .restartEngine ? .retryEngine : .none,
+                  showsOpenSettings: problem.recovery == .chooseModel)
 
     case .helperUnreachable:
       // #477: the raw XPC transport error stays in logs; show fixed copy.
@@ -168,23 +165,6 @@ struct NoModelLoadedPrompt: View {
          showsModelChip: false, showsDownloadCTA: false,
          showsUnavailableCopy: true, primary: .none,
          showsOpenSettings: true)
-  }
-
-  static func isModelChoiceFault(_ code: EngineErrorCode) -> Bool {
-    switch code {
-    case .modelMissing, .memoryRisk, .profileMissing: return true
-    default:                                          return false
-    }
-  }
-
-  static func engineFailedTitle(_ code: EngineErrorCode) -> String {
-    switch code {
-    case .modelMissing:   return "Default model isn't downloaded"
-    case .memoryRisk:     return "Model is too large to load"
-    case .profileMissing: return "Profile configuration problem"
-    case .engineGone:     return "Engine stopped unexpectedly"
-    default:              return "The engine couldn't start"
-    }
   }
 
   static func busyTitle(_ phase: ChatStartGate.BusyPhase) -> String {

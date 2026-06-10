@@ -164,11 +164,14 @@ public struct HelperStatusItemModel: Equatable, Sendable {
                                  action: .none)
       )
     case .failed(let code, let message):
-      // Truncate the message at a UI-sane width — full diagnostic is
-      // in `helper.log` / `engine.log`. The wire format already caps
-      // payload at `EngineStatus.failedMessageCap` (1 KiB), so this
-      // is a second, narrower cap for menu-item rendering.
-      let trimmed = HelperStatusItemModel.truncate(message, to: 120)
+      // #477: the menu line is user copy — render the taxonomy's curated
+      // message, not the raw status diagnostic (its durable sinks are
+      // helper.log / DiagnosticLog at the producers). The `failed (code)`
+      // prefix stays: it is the menu's operator discriminator and the
+      // S4 GUI suite keys on it. Truncation guards menu width — the wire
+      // already caps the payload at `EngineStatus.failedMessageCap`.
+      let problem = EngineProblem(statusCode: code, rawMessage: message)
+      let trimmed = HelperStatusItemModel.truncate(problem.message, to: 120)
       return HelperStatusItemModel(
         dot: .error,
         engineLabel: "Engine: failed (\(code.rawValue)) — \(trimmed)",

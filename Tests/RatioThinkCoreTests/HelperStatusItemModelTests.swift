@@ -51,7 +51,10 @@ final class HelperStatusItemModelTests: XCTestCase {
     )
     XCTAssertEqual(m.dot, .error)
     XCTAssertTrue(m.engineLabel.contains("spawnFailed"))
-    XCTAssertTrue(m.engineLabel.contains("binary missing"))
+    // #477: the menu renders the curated taxonomy line; the raw status
+    // diagnostic never appears.
+    XCTAssertTrue(m.engineLabel.contains("The engine failed to start"))
+    XCTAssertFalse(m.engineLabel.contains("binary missing"))
     XCTAssertEqual(m.pauseResume.title, "Resume Engine")
     XCTAssertTrue(m.pauseResume.enabled,
                   "recoverable failures must keep a working Resume so the user can retry after fixing the cause")
@@ -83,23 +86,29 @@ final class HelperStatusItemModelTests: XCTestCase {
     XCTAssertEqual(m.dot, .error)
     XCTAssertTrue(m.engineLabel.contains("memoryRisk"),
                   "GUI menu label must carry the structured memory-risk code; got \(m.engineLabel)")
-    XCTAssertTrue(m.engineLabel.contains("choose a smaller model"),
-                  "GUI menu label must include recovery copy; got \(m.engineLabel)")
+    XCTAssertTrue(m.engineLabel.contains("Pick a smaller model"),
+                  "GUI menu label must include the taxonomy recovery copy; got \(m.engineLabel)")
     XCTAssertEqual(m.pauseResume.title, "Resume Engine")
     XCTAssertFalse(m.pauseResume.enabled,
                    "memory-risk failures should not invite an immediate retry of the same unsafe model")
     XCTAssertEqual(m.pauseResume.action, .resume)
   }
 
-  func test_failed_truncatesLongMessage_inLabel() {
+  func test_failed_label_isBounded_andNeverShowsRawMessage() {
+    // #477: the label renders the (short) taxonomy copy regardless of the
+    // raw diagnostic's size; the raw text never appears.
     let long = String(repeating: "x", count: 500)
     let m = HelperStatusItemModel.make(
       from: .failed(code: .handshakeTimeout, message: long)
     )
-    XCTAssertTrue(m.engineLabel.hasSuffix("…"),
-                  "expected ellipsis suffix on truncated label")
+    XCTAssertFalse(m.engineLabel.contains("xxx"),
+                   "raw status diagnostic must not reach the menu; got \(m.engineLabel)")
     XCTAssertLessThan(m.engineLabel.count, 200,
                       "menu-item labels must be bounded; got \(m.engineLabel.count) chars")
+    // The width guard itself stays covered should future copy grow.
+    XCTAssertEqual(HelperStatusItemModel.truncate(long, to: 120).count, 121,
+                   "120-char prefix + ellipsis")
+    XCTAssertTrue(HelperStatusItemModel.truncate(long, to: 120).hasSuffix("…"))
   }
 
   func test_killRejected_isErrorDot_withResumeDisabled() {

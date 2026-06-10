@@ -476,7 +476,16 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     case .success(let spec):
       return spec
     case .failure(let err):
-      Self.log.error("\(operation, privacy: .public): resolver rejected profileID=\(profileID, privacy: .public) (\(err.code.rawValue, privacy: .public))")
+      // #477 F1: the resolver/guardrail prose (sizing, path-by-path trace)
+      // never reaches UI copy anymore, so this producer-side log + the
+      // DiagnosticLog breadcrumb are its durable sinks.
+      Self.log.error("\(operation, privacy: .public): resolver rejected profileID=\(profileID, privacy: .public) (\(err.code.rawValue, privacy: .public)): \(err.message, privacy: .public)")
+      DiagnosticLog.helper.event("engine.resolve.reject", [
+        ("operation", operation),
+        ("profile", profileID),
+        ("code", err.code.rawValue),
+        ("message", err.message),
+      ])
       if err.code == .memoryRisk {
         engineHost.recordPreStartFailure(err)
       }
