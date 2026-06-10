@@ -249,25 +249,24 @@
   <!-- ===================== why ===================== -->
   <section class="why">
     <h2>What you can't do in Ollama or LM Studio</h2>
-    <p class="lede">One real difference: <strong>profiles</strong> — named thinking modes you switch in
-       one click. Everything below is a profile.</p>
+    <p class="lede">One real difference: thinking <strong>profiles</strong> — the same model, different
+       reasoning styles, each optimized for what you're doing.</p>
     <div class="grid">
       <div class="card">
         <div class="ct"><h3>Tree of Thought</h3></div>
-        <p>A profile that turns one question into a scored search tree: the engine branches, scores each
-           branch 1–10, and keeps the best beam — shown live in a foldable tree, then the chosen answer.</p>
+        <p>Stuck on a knotty, many-option decision? Tree of Thought explores the possibilities and
+           surfaces the best one — and you watch it weigh the options in a live, foldable tree.</p>
       </div>
       <div class="card">
         <div class="ct"><h3>Fast Think</h3></div>
-        <p>A profile that runs the same model greedily with a <strong>speculative drafter</strong> —
-           fewer waits, identical output — on the bundled Apple-Silicon engine. Just pick it.</p>
+        <p>Tired of waiting on long answers? Fast Think gives you the same reply with far less waiting —
+           a speculative drafter races ahead so the text lands in bursts.</p>
       </div>
     </div>
   </section>
 
   <footer>
     <a href="https://github.com/shsym/RatioThink">github.com/shsym/RatioThink</a>
-    &nbsp;·&nbsp; <a href="ARCHITECTURE.md">Architecture</a>
     &nbsp;·&nbsp; Apache-2.0
     <div class="credit">Powered by the <a href="https://github.com/pie-project/pie">Pie</a> inference engine.</div>
   </footer>
@@ -419,7 +418,7 @@
   async function sceneTreeOfThought(myGen){
     var d = SCENARIO.tot;
     setProfile(d.profile, TREE, 'tot');
-    setCaption('Tree of Thought is a one-click profile: the engine branches, scores, and keeps the best.');
+    setCaption('Stuck on a many-option decision? Tree of Thought explores them and picks the best.');
     await sleep(800, myGen);
     await typeComposer(d.prompt, myGen);
     userRow(d.prompt); resetComposer();
@@ -471,7 +470,7 @@
     var d = SCENARIO.fast;
     // First pass: the normal Chat profile, token by token.
     setProfile('Chat', CHATG, 'chat');
-    setCaption('Chat profile — the model emits one token at a time.');
+    setCaption('The everyday Chat profile, answering at its normal pace.');
     await sleep(650, myGen);
     await typeComposer(d.prompt, myGen);
     userRow(d.prompt); resetComposer();
@@ -482,7 +481,7 @@
     await sleep(900, myGen);
 
     // Switch profiles: open the menu, pick Fast Think.
-    setCaption('Switch to Fast Think — same model, plus a speculative drafter.');
+    setCaption('Switch to Fast Think — same model, far less waiting.');
     menu.classList.add('show'); await sleep(680, myGen);
     setProfile('Fast Think', BOLT, 'fast'); await sleep(520, myGen);
     menu.classList.remove('show');
@@ -493,7 +492,7 @@
     await sleep(220, myGen);
     var a2 = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
     transcript.appendChild(a2);
-    setCaption('Same answer — but in multi-token bursts. That chunky cadence is accepted draft tokens.');
+    setCaption('Same answer, much less waiting — the text lands in quick bursts.');
     await streamBursts(a2.querySelector('.bubble'), d.answer, d.bursts, 150, myGen); // chunky + quicker
     await sleep(2200, myGen);
   }
@@ -532,15 +531,15 @@
 
   var SCENES = [
     { run: sceneTreeOfThought, still: stillTot,
-      pausedCaption: 'Animation paused (reduced motion). Tree of Thought is a one-click profile.' },
+      pausedCaption: 'Animation paused (reduced motion). Tree of Thought explores the options and picks the best.' },
     { run: sceneFastThink, still: stillFast,
-      pausedCaption: 'Animation paused (reduced motion). Fast Think runs speculative decoding.' }
+      pausedCaption: 'Animation paused (reduced motion). Fast Think gives the same answer, much faster.' }
   ];
 
   // Error fallback: a clean, honest static frame (the lead Tree of Thought scene).
   function renderStaticFallback(){
     stillTot();
-    setCaption('Tree of Thought and Fast Think are one-click profiles.');
+    setCaption('Tree of Thought and Fast Think — two ways this model can think.');
     setActiveDot(0);
   }
 
