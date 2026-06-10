@@ -77,20 +77,7 @@ struct ChatListView: View {
   }
 
   private func row(for chat: Chat) -> some View {
-    HStack(alignment: .firstTextBaseline, spacing: 6) {
-      if chat.pinned {
-        Image(systemName: "pin.fill")
-          .font(.caption2)
-          .foregroundStyle(.secondary)
-      }
-      VStack(alignment: .leading, spacing: 2) {
-        Text(chat.title)
-          .lineLimit(1)
-        Text(chat.updatedAt, format: .relative(presentation: .named))
-          .font(.caption2)
-          .foregroundStyle(.secondary)
-      }
-    }
+    ChatRowLabel(title: chat.title, updatedAt: chat.updatedAt, pinned: chat.pinned)
   }
 
   /// Top-aligned per design §5 ("Chats section empty → grayed
@@ -169,5 +156,40 @@ struct ChatListView: View {
     if wasSelected {
       selectedItemID = nil
     }
+  }
+}
+
+/// #511: chat-list row content as a standalone, SwiftData-free view so the
+/// Tests/Unit layout contract can host and measure it headlessly while the
+/// S511 GUI suite guards the same geometry in the real window.
+///
+/// Accessibility identifiers are load-bearing for S511: the container is
+/// `chats.row` and the texts are `chats.row.title` / `chats.row.timestamp`.
+/// `children: .contain` keeps the child identifiers reachable (a bare
+/// container id would swallow them — see `NoModelLoadedPrompt.body`).
+struct ChatRowLabel: View {
+  let title: String
+  let updatedAt: Date
+  let pinned: Bool
+
+  var body: some View {
+    HStack(alignment: .firstTextBaseline, spacing: 6) {
+      if pinned {
+        Image(systemName: "pin.fill")
+          .font(.caption2)
+          .foregroundStyle(.secondary)
+      }
+      VStack(alignment: .leading, spacing: 2) {
+        Text(title)
+          .lineLimit(1)
+          .accessibilityIdentifier("chats.row.title")
+        Text(updatedAt, format: .relative(presentation: .named))
+          .font(.caption2)
+          .foregroundStyle(.secondary)
+          .accessibilityIdentifier("chats.row.timestamp")
+      }
+    }
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("chats.row")
   }
 }
