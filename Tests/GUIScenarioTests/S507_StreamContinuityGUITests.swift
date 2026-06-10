@@ -51,20 +51,24 @@ final class S507_StreamContinuityGUITests: XCTestCase {
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
     app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = model
+    // #496 seam: there is no real background helper in this harness, so the
+    // helper-health ladder escalates mid-test and the recovery overlay
+    // covers the chat body (its base-URL bypass fix is tracked separately).
+    // Pin the ladder healthy — chat traffic goes straight to the mock via
+    // PIE_TEST_ENGINE_BASE_URL and never touches the helper.
+    app.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "healthy"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     app.launch()
     defer { app.terminate() }
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
               "Rational.app did not reach runningForeground")
     app.activate()
+    normalizeWindowToVisibleScreen(in: app)
 
     // Send a turn the mock will stream partially and then hold open.
     openFreshChat(in: app)
     typeComposerText("Generate a very long answer.", in: app)
-    let send = app.buttons["composer.send"]
-    XCTAssertTrue(send.waitForExistence(timeout: 5))
-    XCTAssertTrue(send.isEnabled, "composer.send disabled after typing; app tree: \(app.debugDescription)")
-    send.click()
+    sendComposerDraft(in: app)
 
     // The partial delta renders only after the stream writer flushes it to the
     // row — so its visibility PROVES we are genuinely mid-stream (the mock has
@@ -90,13 +94,22 @@ final class S507_StreamContinuityGUITests: XCTestCase {
     XCTAssertTrue(waitUntilGone(rowSpinner, timeout: 15),
                   "streaming row indicator did not clear after the stream finished; app tree: \(app.debugDescription)")
 
-    // 3) Return to the original chat (the OLDER row → second "New Chat" title):
-    //    the bubble holds partial + released tail, persisted while unmounted.
-    let originalRow = app.staticTexts.matching(identifier: "New Chat").element(boundBy: 1)
-    XCTAssertTrue(originalRow.waitForExistence(timeout: 5),
-                  "original chat row missing; app tree: \(app.debugDescription)")
-    originalRow.click()
-    XCTAssertTrue(waitForStaticTextContaining(holdToken, in: app, timeout: 10),
+    // 3) Return to the original chat: the bubble holds partial + released
+    //    tail, persisted while unmounted. Both rows are titled "New Chat"
+    //    and the sidebar's recency order is not part of this contract, so
+    //    select by CONTENT — click rows until the streamed transcript shows.
+    let rows = app.staticTexts.matching(identifier: "New Chat")
+    XCTAssertTrue(rows.element(boundBy: 1).waitForExistence(timeout: 5),
+                  "expected two chat rows; app tree: \(app.debugDescription)")
+    var foundOriginal = false
+    for index in 0..<rows.count {
+      rows.element(boundBy: index).click()
+      if waitForStaticTextContaining(holdToken, in: app, timeout: 3) {
+        foundOriginal = true
+        break
+      }
+    }
+    XCTAssertTrue(foundOriginal,
                   "partial delta lost after background completion; app tree: \(app.debugDescription)")
     XCTAssertTrue(waitForStaticTextContaining(releasedReply, in: app, timeout: 10),
                   "released tail '\(releasedReply)' missing — the backgrounded stream was cancelled instead of finishing; app tree: \(app.debugDescription)")
@@ -104,15 +117,42 @@ final class S507_StreamContinuityGUITests: XCTestCase {
     // 4) The composer is live after the background completion — a fresh send
     //    streams a normal reply to completion.
     typeComposerText("Follow up after the background finish.", in: app)
-    let send2 = app.buttons["composer.send"]
-    XCTAssertTrue(send2.waitForExistence(timeout: 5))
-    XCTAssertTrue(send2.isEnabled, "composer.send not enabled after stream finished; app tree: \(app.debugDescription)")
-    send2.click()
+    sendComposerDraft(in: app)
     XCTAssertTrue(waitForCountOfStaticTextsContaining(releasedReply, in: app, count: 2, timeout: 20),
                   "follow-up reply never rendered; app tree: \(app.debugDescription)")
   }
 
   // MARK: - helpers
+
+  /// The app restores its last window frame from the operator's real
+  /// defaults domain; a frame saved under a different display arrangement
+  /// can span past the current screen's edges, where XCUITest hit-testing
+  /// fails for the offscreen controls (composer at the bottom, sidebar
+  /// header at the top). Window ▸ Zoom snaps the window to the visible
+  /// screen — the menu bar itself is always hittable.
+  private func normalizeWindowToVisibleScreen(in app: XCUIApplication) {
+    let windowMenu = app.menuBarItems["Window"]
+    guard windowMenu.waitForExistence(timeout: 5) else { return }
+    windowMenu.click()
+    let zoom = app.menuItems["Zoom"]
+    if zoom.waitForExistence(timeout: 2), zoom.isEnabled {
+      zoom.click()
+    } else {
+      app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+    }
+  }
+
+  /// Submit the focused composer draft. Gates on the send button being
+  /// enabled (the real product affordance), then sends with the composer's
+  /// Enter shortcut: on tall windows the bottom-anchored send button can sit
+  /// below the visible screen, where `click()` fails hit-testing even though
+  /// the element is valid — keyboard delivery is geometry-independent.
+  private func sendComposerDraft(in app: XCUIApplication) {
+    let send = app.buttons["composer.send"]
+    XCTAssertTrue(send.waitForExistence(timeout: 5), "composer.send missing")
+    XCTAssertTrue(send.isEnabled, "composer.send disabled after typing; app tree: \(app.debugDescription)")
+    app.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
+  }
 
   /// `POST /control/release` — tells the harness to finish the held stream
   /// with the normal reply + stop frame.

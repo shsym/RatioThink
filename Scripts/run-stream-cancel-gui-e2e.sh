@@ -44,6 +44,27 @@ fi
 mkdir -p "$GUI_HOME" "$RUN_ROOT"
 rm -f "$URL_FILE" "$CONFIG_FILE"
 
+# Window-frame autosave keys live in the REAL com.ratiothink.app defaults
+# domain (not PIE_HOME), so a frame saved under a previous display
+# arrangement (e.g. a portrait monitor) can restore the test window TALLER
+# than the current screen — bottom-anchored controls (composer) and the
+# above-screen header then fail XCUITest hit-testing. Purge them so the
+# test window opens at the in-bounds default size.
+/usr/bin/python3 - <<'PURGE_FRAMES'
+import plistlib
+import subprocess
+
+export = subprocess.run(
+    ["defaults", "export", "com.ratiothink.app", "-"],
+    capture_output=True,
+)
+if export.returncode == 0 and export.stdout:
+    for key in plistlib.loads(export.stdout):
+        if key.startswith("NSWindow Frame "):
+            subprocess.run(["defaults", "delete", "com.ratiothink.app", key],
+                           capture_output=True)
+PURGE_FRAMES
+
 echo "stream-cancel gui e2e: starting holding mock engine"
 python3 Scripts/gui-chat-stream-harness.py \
   --port-file "$URL_FILE" \
