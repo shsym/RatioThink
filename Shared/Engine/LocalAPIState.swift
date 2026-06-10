@@ -115,19 +115,11 @@ public struct LocalAPIState: Equatable {
     }
   }
 
-  /// One-line human cause for a `.failed` engine status. Mirrors the
-  /// honest, code-aware framing used by `EngineStatusStore.statusDetail`
-  /// without dragging the store into the pure reducer.
+  /// One-line human cause for a `.failed` engine status, from the shared
+  /// `EngineProblem` taxonomy (#477) — the status `message` is a raw
+  /// diagnostic and never primary copy.
   static func failureReason(code: EngineErrorCode, message: String) -> String {
-    let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-    switch code {
-    case .memoryRisk:
-      return trimmed.isEmpty ? "Model too large for available memory." : trimmed
-    case .engineGone:
-      return trimmed.isEmpty ? "The engine stopped unexpectedly." : trimmed
-    default:
-      return trimmed.isEmpty ? "Engine failed (\(code.rawValue))." : "\(trimmed) (\(code.rawValue))"
-    }
+    EngineProblem(statusCode: code, rawMessage: message).message
   }
 }
 

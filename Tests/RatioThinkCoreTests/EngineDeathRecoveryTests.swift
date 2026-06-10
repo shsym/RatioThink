@@ -589,8 +589,10 @@ final class EngineDeathRecoveryTests: XCTestCase {
     XCTAssertNotNil(assistant, "the assistant row must remain (it was never cancelled/deleted)")
     XCTAssertTrue(assistant?.content.hasPrefix("⚠️") ?? false,
                   "failed recovery must surface the engine-gone marker, got: \(assistant?.content ?? "nil")")
-    XCTAssertTrue(assistant?.content.contains("Engine stopped unexpectedly") ?? false,
-                  "the surfaced error must be the engine-gone description")
+    // #477: the bubble shows the taxonomy's engine-gone copy, not the raw
+    // HTTPEngineError description.
+    XCTAssertTrue(assistant?.content.contains("The engine stopped while answering") ?? false,
+                  "the surfaced error must be the engine-gone copy, got: \(assistant?.content ?? "nil")")
   }
 
   // MARK: - 9. No recovery gate wired → engineGone surfaces, no hang

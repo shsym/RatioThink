@@ -384,10 +384,16 @@ public final class ChatSendController: ObservableObject {
         return  // cancel() owns the row (recordCancelledAssistant)
       } catch {
         guard self.generation == myGeneration, !Task.isCancelled else { return }
-        tree.fail(PersistenceStatus.formatError(error))
+        // #477: the bubble gets the normalized taxonomy line; the tree
+        // disclosure (a technical surface) keeps the raw diagnostic.
+        let problem = EngineProblem(requestError: error, requestedModelID: options.modelID)
+        tree.fail(problem.technicalDetail ?? problem.message)
         assistant.tot = try? encoder.encode(tree)
         if assistant.content.isEmpty {
-          assistant.content = "⚠️ \(PersistenceStatus.formatError(error))"
+          assistant.content = "⚠️ \(problem.message)"
+        }
+        if let detail = problem.technicalDetail {
+          Log.engine.error("ChatSendController: ToT send failed: \(detail, privacy: .public)")
         }
         Diag.app.event("chat.fail.tot", [("error", String(describing: type(of: error)))])
         Self.persistTree(context, status: persistenceStatus)
@@ -588,7 +594,13 @@ public final class ChatSendController: ObservableObject {
     context: ModelContext,
     persistenceStatus: PersistenceStatus
   ) {
-    assistant.content = "⚠️ \(failureCopy(for: error, requestedModelID: requestedModelID))"
+    let problem = EngineProblem(requestError: error, requestedModelID: requestedModelID)
+    assistant.content = "⚠️ \(problem.message)"
+    // The raw diagnostic never reaches the bubble (#477) — log it here so
+    // the failure stays traceable.
+    if let detail = problem.technicalDetail {
+      Log.engine.error("ChatSendController: send failed: \(detail, privacy: .public)")
+    }
     // Breadcrumb the error TYPE only — never the prompt/response content.
     Diag.app.event("chat.fail", [("error", String(describing: type(of: error)))])
     do {
@@ -598,21 +610,14 @@ public final class ChatSendController: ObservableObject {
     }
   }
 
-  /// #2: collapse the engine's noisy `model_not_found` rejection into one
-  /// plain, actionable line that names the model; pass everything else
-  /// through the existing formatter unchanged. Pure + static so the copy
-  /// is unit-tested without a live engine or a SwiftData context.
+  /// #477: every send failure routes through the shared `EngineProblem`
+  /// taxonomy, so the bubble shows one normalized, actionable line —
+  /// never the raw wire/`NSError` text (that survives on
+  /// `EngineProblem.technicalDetail`, logged by `markAssistant`). Pure +
+  /// static so the copy is unit-tested without a live engine or a
+  /// SwiftData context.
   static func failureCopy(for error: Error, requestedModelID: String?) -> String {
-    if let engineError = error as? HTTPEngineError, engineError.isModelNotFound {
-      let leaf = requestedModelID.flatMap {
-        $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : ModelDisplayName.leaf($0)
-      }
-      if let leaf {
-        return "Model \(leaf) isn’t installed — download it in Settings → Models, or pick another model."
-      }
-      return "The selected model isn’t installed — download it in Settings → Models, or pick another model."
-    }
-    return PersistenceStatus.formatError(error)
+    EngineProblem(requestError: error, requestedModelID: requestedModelID).message
   }
 
   private static func recordCancelledAssistant(

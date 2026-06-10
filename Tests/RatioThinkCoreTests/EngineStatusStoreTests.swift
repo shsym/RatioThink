@@ -599,9 +599,10 @@ final class EngineStatusStoreTests: XCTestCase {
     let store = EngineStatusStore(client: client, initialStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
     _ = try await store.refresh()
     XCTAssertEqual(store.status, .failed(code: .spawnFailed, message: "fork ENOENT"))
-    XCTAssertTrue(store.statusDetail.contains("spawnFailed"),
-                  "got \(store.statusDetail)")
-    XCTAssertTrue(store.statusDetail.contains("fork ENOENT"))
+    // #477: the detail line is the taxonomy's curated copy; the raw
+    // launcher diagnostic never reaches it.
+    XCTAssertEqual(store.statusDetail, "The engine failed to start. Try restarting it.")
+    XCTAssertFalse(store.statusDetail.contains("fork ENOENT"))
   }
 
   func test_memoryRisk_failed_status_surfaces_actionable_copy() async throws {
@@ -618,10 +619,12 @@ final class EngineStatusStoreTests: XCTestCase {
       code: .memoryRisk,
       message: "memory risk: model is 9.0 GB; choose a smaller model"
     ))
-    XCTAssertTrue(store.statusDetail.contains("Memory risk"),
-                  "got \(store.statusDetail)")
-    XCTAssertTrue(store.statusDetail.contains("choose a smaller model"),
-                  "got \(store.statusDetail)")
+    // #477: curated, actionable copy — the guardrail's diagnostic prose
+    // (sizes, paths) stays in logs / technicalDetail.
+    XCTAssertEqual(store.statusDetail,
+                   "This model exceeds this Mac’s safe memory limit. Pick a smaller model.")
+    XCTAssertFalse(store.statusDetail.contains("9.0 GB"),
+                   "got \(store.statusDetail)")
   }
 
   // MARK: - #412 review F1: recovery wait bounded by the ladder outcome

@@ -71,7 +71,17 @@ final class StatusBannerReducerTests: XCTestCase {
       let b = banner(engine: .failed(code: code, message: "boom"))
       XCTAssertEqual(b?.tier, .error, "\(code) must be Tier 2")
       XCTAssertEqual(b?.source, .engine)
-      XCTAssertEqual(b?.forceRestart, .engine)
+    }
+    // #477: Force Restart only where the taxonomy says a restart is the
+    // fix — a model-choice fault would re-fail on restart, so it offers
+    // none (the indicator banner carries the Model-menu hint instead).
+    XCTAssertEqual(
+      banner(engine: .failed(code: .spawnFailed, message: "boom"))?.forceRestart, .engine)
+    for code in [EngineErrorCode.modelMissing, .memoryRisk] {
+      XCTAssertEqual(
+        banner(engine: .failed(code: code, message: "boom"))?.forceRestart,
+        ForceRestartTarget.none,
+        "\(code) is a model-choice fault; Force Restart would re-fail")
     }
   }
 

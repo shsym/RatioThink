@@ -104,35 +104,22 @@ public struct EngineIndicatorError: Equatable, Sendable {
     self.invitesModelChoice = invitesModelChoice
   }
 
-  /// Route an `EngineStatus.failed` code to a banner-ready error. The
-  /// codes the GUI can act on (`memoryRisk`, `modelMissing`) invite a
-  /// model choice; everything else is a plain failure.
+  /// Route an `EngineStatus.failed` code to a banner-ready error. Copy
+  /// comes from the shared `EngineProblem` taxonomy (#477) — the status
+  /// `message` is a raw diagnostic and never primary copy — and
+  /// `invitesModelChoice` is its `.chooseModel` recovery.
   static func make(code: EngineErrorCode, message: String) -> EngineIndicatorError {
+    let problem = EngineProblem(statusCode: code, rawMessage: message)
+    let kind: Kind
     switch code {
-    case .memoryRisk:
-      return EngineIndicatorError(
-        kind: .memoryRisk, title: "Model too large",
-        message: message.isEmpty ? "The model exceeds this Mac’s safe memory limit." : message,
-        invitesModelChoice: true
-      )
-    case .engineGone:
-      return EngineIndicatorError(
-        kind: .engineGone, title: "Engine stopped unexpectedly",
-        message: message.isEmpty ? "The engine process exited." : message,
-        invitesModelChoice: false
-      )
-    case .modelMissing:
-      return EngineIndicatorError(
-        kind: .modelMissing, title: "Model not found",
-        message: message.isEmpty ? "The selected model isn’t available." : message,
-        invitesModelChoice: true
-      )
-    default:
-      return EngineIndicatorError(
-        kind: .engineFailed, title: "Engine failed",
-        message: message.isEmpty ? "Engine error (\(code.rawValue))." : message,
-        invitesModelChoice: false
-      )
+    case .memoryRisk:   kind = .memoryRisk
+    case .engineGone:   kind = .engineGone
+    case .modelMissing: kind = .modelMissing
+    default:            kind = .engineFailed
     }
+    return EngineIndicatorError(
+      kind: kind, title: problem.title, message: problem.message,
+      invitesModelChoice: problem.recovery == .chooseModel
+    )
   }
 }

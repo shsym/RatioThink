@@ -402,12 +402,10 @@ public final class EngineStatusStore: ObservableObject {
       return "Engine running"
     case .stopping:
       return "Engine stopping…"
-    case .failed(.memoryRisk, let message):
-      return "Memory risk: \(message)"
-    case .failed(.engineGone, let message):
-      return "Engine stopped unexpectedly: \(message)"
     case .failed(let code, let message):
-      return "Engine failed (\(code.rawValue)): \(message)"
+      // #477: the status `message` is a raw diagnostic (stderr tails,
+      // resolver traces) — surface the taxonomy's curated line instead.
+      return EngineProblem(statusCode: code, rawMessage: message).message
     }
   }
 

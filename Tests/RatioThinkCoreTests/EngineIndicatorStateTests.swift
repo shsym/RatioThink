@@ -66,10 +66,13 @@ final class EngineIndicatorStateTests: XCTestCase {
   }
 
   func test_other_failure_is_generic_engineFailed() {
+    // #477: the raw status message is a diagnostic — the banner shows the
+    // taxonomy's curated copy, never the raw text.
     let state = make(engine: .failed(code: .spawnFailed, message: "fork ENOENT"))
     guard case let .error(err) = state else { return XCTFail("expected .error") }
     XCTAssertEqual(err.kind, .engineFailed)
-    XCTAssertEqual(err.message, "fork ENOENT")
+    XCTAssertEqual(err.message, "The engine failed to start. Try restarting it.")
+    XCTAssertFalse(err.message.contains("fork ENOENT"))
   }
 
   // MARK: - anti-flap: transient unreachable is amber, never a red error

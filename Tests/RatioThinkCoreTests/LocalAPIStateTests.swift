@@ -58,14 +58,18 @@ final class LocalAPIStateTests: XCTestCase {
                                hasActiveProfile: true)
     XCTAssertEqual(s.statusLabel, "Engine failed")
     XCTAssertTrue(s.toggleEnabled, "modelMissing invites a resume retry")
-    XCTAssertEqual(s.detail, "model not found (modelMissing)")
+    // #477: the raw status message is a diagnostic — the card shows the
+    // taxonomy's curated copy.
+    XCTAssertEqual(s.detail,
+                   "The selected model isn’t downloaded. Download it in Settings → Models, or pick another model.")
   }
 
   func test_failed_memoryRisk_is_not_retryable() {
     let s = LocalAPIState.make(status: .failed(code: .memoryRisk, message: "too big"),
                                hasActiveProfile: true)
     XCTAssertFalse(s.toggleEnabled, "memoryRisk re-rejects on a plain start")
-    XCTAssertEqual(s.detail, "too big")
+    XCTAssertEqual(s.detail,
+                   "This model exceeds this Mac’s safe memory limit. Pick a smaller model.")
   }
 
   func test_failed_without_profile_is_never_retryable() {
@@ -74,16 +78,20 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertFalse(s.toggleEnabled)
   }
 
-  func test_failureReason_uses_friendly_text_for_empty_messages() {
-    XCTAssertEqual(
-      LocalAPIState.failureReason(code: .memoryRisk, message: "   "),
-      "Model too large for available memory.")
+  func test_failureReason_is_curated_taxonomy_copy() {
+    // #477: same copy whether the raw diagnostic is present or empty —
+    // the message never feeds primary copy.
+    for raw in ["", "memory risk: model is 9.0 GB at /Users/x/big.gguf"] {
+      XCTAssertEqual(
+        LocalAPIState.failureReason(code: .memoryRisk, message: raw),
+        "This model exceeds this Mac’s safe memory limit. Pick a smaller model.")
+    }
     XCTAssertEqual(
       LocalAPIState.failureReason(code: .engineGone, message: ""),
-      "The engine stopped unexpectedly.")
+      "The engine process exited. Restart the engine to continue.")
     XCTAssertEqual(
       LocalAPIState.failureReason(code: .spawnFailed, message: ""),
-      "Engine failed (spawnFailed).")
+      "The engine failed to start. Try restarting it.")
   }
 
   // MARK: - curl snippet

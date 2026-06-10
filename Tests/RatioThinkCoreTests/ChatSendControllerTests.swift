@@ -245,7 +245,7 @@ final class ChatSendControllerTests: XCTestCase {
     controller.cancel()
   }
 
-  func test_engineNotReady_failure_assistant_bubble_preserves_helper_detail() async throws {
+  func test_engineNotReady_failure_assistant_bubble_is_normalized_actionable_line() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)
     let chat = Chat()
@@ -267,13 +267,19 @@ final class ChatSendControllerTests: XCTestCase {
     )
 
     try await waitUntil("engineNotReady assistant failure is persisted") {
-      self.assistantMessages(in: chat).contains { $0.content.contains(detail) }
+      self.assistantMessages(in: chat).contains { $0.content.hasPrefix("⚠️") }
     }
 
+    // #477: the bubble shows the normalized taxonomy line; the raw helper
+    // lifecycle diagnostic stays in logs / technicalDetail, never the bubble.
     let assistant = try XCTUnwrap(assistantMessages(in: chat).first)
     XCTAssertTrue(
+      assistant.content.contains("isn’t ready yet"),
+      "assistant failure bubble must be the normalized not-ready line; got: \(assistant.content)"
+    )
+    XCTAssertFalse(
       assistant.content.contains(detail),
-      "assistant failure bubble must preserve helper lifecycle diagnostic; got: \(assistant.content)"
+      "raw lifecycle diagnostic must not leak into the bubble; got: \(assistant.content)"
     )
   }
 
