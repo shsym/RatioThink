@@ -81,7 +81,7 @@
   .menu .mrow.sel .check{opacity:1}
 
   /* transcript */
-  .transcript{min-height:288px;max-height:288px;overflow:hidden;padding:16px 16px 6px;
+  .transcript{min-height:320px;max-height:320px;overflow:hidden;padding:16px 16px 6px;
     background:var(--win-bg);display:flex;flex-direction:column;gap:10px}
   .row{display:flex;max-width:100%}
   .row.user{justify-content:flex-end}
@@ -105,7 +105,7 @@
   .tsearch.collapsed .tshead .tchev{transform:rotate(-90deg)}
   .tsbody{margin-top:6px;background:var(--think-bg);border-radius:10px;padding:9px 11px;
     display:flex;flex-direction:column;gap:6px;overflow:hidden;
-    transition:max-height .2s ease,opacity .2s ease;max-height:260px}
+    transition:max-height .2s ease,opacity .2s ease;max-height:280px}
   .tsearch.collapsed .tsbody{max-height:0;opacity:0;padding-top:0;padding-bottom:0;margin-top:0}
   .tnode{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11.5px;
     color:var(--ink-soft);opacity:0;transform:translateY(4px);
@@ -124,9 +124,10 @@
   .tnode.scored .score{opacity:1}
   .tnode .label{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-  /* caret while streaming */
-  .caret::after{content:'';display:inline-block;width:7px;height:1.05em;vertical-align:-2px;
+  /* caret while streaming (normal = ink, burst = accent so the chunky pass reads as different) */
+  .caret::after,.burst::after{content:'';display:inline-block;width:7px;height:1.05em;vertical-align:-2px;
     margin-left:1px;background:currentColor;opacity:.65;animation:blink 1s steps(1) infinite}
+  .burst::after{background:var(--accent);opacity:.8}
   @keyframes blink{50%{opacity:0}}
 
   /* composer */
@@ -147,11 +148,14 @@
     color:var(--shipped);background:var(--shipped-bg);border-color:var(--shipped-border)}
   .caption .ctext{font-size:13px;color:var(--ink-soft)}
 
-  /* scene dots */
-  .dots{display:flex;gap:7px;justify-content:center;margin:20px 0 0}
-  .dots b{width:7px;height:7px;border-radius:999px;background:var(--border-strong);display:block;
+  /* scene dots — real, focusable navigation buttons (live OUTSIDE the aria-hidden mock) */
+  .dots{display:flex;gap:9px;justify-content:center;margin:18px 0 0}
+  .dots .dot{appearance:none;-webkit-appearance:none;border:none;margin:0;padding:0;cursor:pointer;
+    width:9px;height:9px;border-radius:999px;background:var(--border-strong);
     transition:background .2s,width .2s}
-  .dots b.on{background:var(--accent);width:18px}
+  .dots .dot:hover{background:var(--accent-lift)}
+  .dots .dot.on{background:var(--accent);width:22px}
+  .dots .dot:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 
   /* ---------- why ---------- */
   .why{margin:46px auto 0;max-width:760px}
@@ -177,9 +181,9 @@
     header.hero h1{font-size:32px}
     header.hero p.tag{font-size:18px}
   }
-  /* honor reduced motion: JS renders a static frame; kill residual animation */
+  /* honor reduced motion: JS renders static frames; kill residual animation */
   @media (prefers-reduced-motion:reduce){
-    .caret::after,.tshead .status.searching{animation:none}
+    .caret::after,.burst::after,.tshead .status.searching{animation:none}
     *{transition:none !important}
   }
 </style>
@@ -197,8 +201,10 @@
   </header>
 
   <!-- ===================== mock app window ===================== -->
-  <div class="stage" aria-hidden="true">
-    <div class="window" id="win">
+  <div class="stage">
+    <!-- The animated mock is decorative; aria-hidden is scoped to the window ONLY so the
+         interactive scene dots below stay reachable by keyboard / assistive tech. -->
+    <div class="window" id="win" aria-hidden="true">
       <div class="titlebar">
         <div class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></div>
         <div class="wtitle">Rational</div>
@@ -242,7 +248,10 @@
     </div>
 
     <div class="caption" id="caption"></div>
-    <div class="dots" id="dots"><b></b><b></b></div>
+    <div class="dots" id="dots" role="group" aria-label="Choose a demo">
+      <button type="button" class="dot" data-scene="0" aria-label="Show the Tree of Thought demo"></button>
+      <button type="button" class="dot" data-scene="1" aria-label="Show the Fast Think demo"></button>
+    </div>
   </div>
 
   <!-- ===================== why ===================== -->
@@ -283,11 +292,45 @@
 <script>
 (function(){
   "use strict";
+
+  // ======================================================================
+  // SCENARIO DATA — swap these for a real prompt/output from Rational later.
+  // Each scene's prompts, node texts, and scores live here as plain data so
+  // the animation code never has to change to update the example.
+  // ======================================================================
+  var SCENARIO = {
+    tot: {
+      profile: 'Tree of Thought',
+      bounds: '· 3×2, beam 2 ·',
+      prompt: 'Plan a surprise party for a close friend.',
+      // level 1 (breadth 3) — the beam keeps the top 2
+      level1: [
+        { t: 'Start with the guest list and theme', s: 8, beam: 'kept'   },
+        { t: 'Pick a date everyone can make',        s: 7, beam: 'kept'   },
+        { t: 'Book a venue first, invite later',     s: 4, beam: 'pruned' }
+      ],
+      // level 2 — expansions under the kept branches; one leaf is selected
+      level2: [
+        { t: 'Evening garden theme, ~12 close friends', s: 9, beam: 'star'   },
+        { t: 'Cozy dinner at home, 8 guests',           s: 7, beam: 'kept'   },
+        { t: 'Weekend brunch, 20 guests',               s: 5, beam: 'pruned' }
+      ],
+      nodeCount: 6,
+      answer: 'Go with an evening garden theme for ~12 — lock the guest list and a date first, then venue and food fall into place.'
+    },
+    fast: {
+      prompt: 'Summarize the water cycle in one sentence.',
+      answer: 'Water evaporates from the sea, condenses into clouds, falls as rain or snow, and flows back downhill to the sea.',
+      bursts: [3, 2, 4, 2, 3]   // variable multi-token bursts = the speculative-acceptance signature
+    }
+  };
+
+  var AUTO_ADVANCE_MS = 1100;   // pause between scenes; a manual dot-click resumes the reel from there
+
   var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   var transcript = document.getElementById('transcript');
   var composer   = document.getElementById('composer');
-  var win        = document.getElementById('win');
   var menu       = document.getElementById('profileMenu');
   var profileName= document.getElementById('profileName');
   var profileIcon= document.getElementById('profileIcon');
@@ -295,24 +338,46 @@
   var menuFast   = document.getElementById('menuFast');
   var menuChat   = document.getElementById('menuChat');
   var captionEl  = document.getElementById('caption');
-  var dotsEl     = document.getElementById('dots').children;
+  var dotEls     = Array.prototype.slice.call(document.querySelectorAll('#dots .dot'));
 
   // SF-Symbol-flavoured inline glyphs (browser-safe).
   var BOLT = '<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"><path d="M8.5 1 3 9h3.5L6 15l6-8.5H8z"/></svg>';
+  var CHATG = '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 6.5a3.5 3 0 0 1 3.5-3h4a3.5 3 0 0 1 0 6h-4l-2.5 2v-2a3 3 0 0 1-1-3z"/></svg>';
   // "point.3.connected.trianglepath.dotted" — three connected nodes.
   var TREE = '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M8 3.2 3.5 11M8 3.2 12.5 11" stroke-dasharray="1.6 1.4"/><circle cx="8" cy="3" r="1.8" fill="currentColor" stroke="none"/><circle cx="3.2" cy="12" r="1.8" fill="currentColor" stroke="none"/><circle cx="12.8" cy="12" r="1.8" fill="currentColor" stroke="none"/></svg>';
 
-  function sleep(ms){ return new Promise(function(r){ setTimeout(r, reduce ? 0 : ms); }); }
+  // ---- cooperative cancellation: each scene captures a generation token; a dot
+  // click bumps `gen`, so the in-flight scene's next sleep rejects CANCELLED and
+  // stops cleanly. Only ONE scene ever writes the transcript at a time. ----
+  var gen = 0;
+  var advanceTimer = null;
+  var CANCELLED = { cancelled: true };
+
+  function sleep(ms, myGen){
+    return new Promise(function(resolve, reject){
+      setTimeout(function(){
+        if (myGen !== undefined && myGen !== gen) reject(CANCELLED);
+        else resolve();
+      }, reduce ? 0 : ms);
+    });
+  }
+
   function clear(){ transcript.innerHTML=''; composer.textContent='Message Rational…';
-    composer.classList.remove('typed'); }
+    composer.classList.remove('typed'); menu.classList.remove('show'); }
   function el(html){ var d=document.createElement('div'); d.innerHTML=html.trim(); return d.firstChild; }
   function resetComposer(){ composer.textContent='Message Rational…'; composer.classList.remove('typed'); }
 
   function setCaption(text){
     captionEl.innerHTML = '<span class="chip">● In the app</span><span class="ctext">'+text+'</span>';
   }
-  function setDots(i){ for(var k=0;k<dotsEl.length;k++) dotsEl[k].classList.toggle('on', k===i); }
-  function selectMenu(which){
+  function setActiveDot(i){
+    dotEls.forEach(function(d, k){
+      d.classList.toggle('on', k===i);
+      if (k===i) d.setAttribute('aria-current', 'true'); else d.removeAttribute('aria-current');
+    });
+  }
+  function setProfile(name, iconHTML, which){
+    profileName.textContent = name; profileIcon.innerHTML = iconHTML;
     menuTot.classList.toggle('sel', which==='tot');
     menuFast.classList.toggle('sel', which==='fast');
     menuChat.classList.toggle('sel', which==='chat');
@@ -322,17 +387,31 @@
     var r = el('<div class="row user"><div class="bubble user"></div></div>');
     r.querySelector('.bubble').textContent = text; transcript.appendChild(r); return r;
   }
-  async function typeComposer(text){
+  async function typeComposer(text, myGen){
     composer.classList.add('typed'); composer.textContent='';
-    if(reduce){ composer.textContent=text; return; }
-    for(var i=0;i<text.length;i++){ composer.textContent+=text[i]; await sleep(22); }
-    await sleep(240);
+    if (reduce){ composer.textContent=text; return; }
+    for (var i=0;i<text.length;i++){ composer.textContent+=text[i]; await sleep(22, myGen); }
+    await sleep(240, myGen);
   }
-  async function streamInto(node, text, per){
+  function words(s){ return s.split(' '); }
+  // normal pass: one token (word) at a time
+  async function streamWords(node, text, per, myGen){
     node.classList.add('caret');
-    if(reduce){ node.textContent=text; node.classList.remove('caret'); return; }
-    for(var i=0;i<text.length;i++){ node.textContent+=text[i]; await sleep(per); }
+    var w = words(text);
+    for (var i=0;i<w.length;i++){ node.textContent += (i?' ':'') + w[i]; await sleep(per, myGen); }
     node.classList.remove('caret');
+  }
+  // fast pass: variable multi-token bursts (3,2,4… land at once) = speculative acceptance
+  async function streamBursts(node, text, sizes, per, myGen){
+    node.classList.add('burst');
+    var w = words(text), i=0, b=0;
+    while (i < w.length){
+      var n = sizes[b % sizes.length];
+      node.textContent += (i?' ':'') + w.slice(i, i+n).join(' ');
+      i += n; b++;
+      await sleep(per, myGen);
+    }
+    node.classList.remove('burst');
   }
 
   // ---- tree-search node helpers (mirror ToTNodeRow beam glyphs + score capsule) ----
@@ -351,22 +430,21 @@
     node.classList.toggle('pruned', beam==='pruned');
   }
 
-  // ============== Scene 1 (LEAD): Tree of Thought — shipped one-click profile ==============
-  async function sceneTreeOfThought(){
-    setDots(0);
-    profileName.textContent='Tree of Thought'; profileIcon.innerHTML=TREE; selectMenu('tot');
-    clear();
+  // ============== Scene 0 (LEAD): Tree of Thought — shipped one-click profile ==============
+  async function sceneTreeOfThought(myGen){
+    var d = SCENARIO.tot;
+    setProfile(d.profile, TREE, 'tot');
     setCaption('Tree of Thought is a one-click profile: the engine branches, scores, and keeps the best.');
-    await sleep(750);
-    await typeComposer('Plan a surprise party.');
-    userRow('Plan a surprise party.'); resetComposer();
-    await sleep(260);
+    await sleep(800, myGen);
+    await typeComposer(d.prompt, myGen);
+    userRow(d.prompt); resetComposer();
+    await sleep(300, myGen);
 
     var col = el(
       '<div class="row assistant"><div class="acol">'+
         '<div class="tsearch" id="ts">'+
           '<div class="tshead">'+TREE+' Tree search '+
-            '<span class="bounds">· 3×2, beam 2 ·</span> '+
+            '<span class="bounds">'+d.bounds+'</span> '+
             '<span class="status searching" id="tstatus">searching…</span> '+
             '<span class="tchev">▾</span></div>'+
           '<div class="tsbody" id="tsbody"></div>'+
@@ -375,109 +453,142 @@
     transcript.appendChild(col);
     var tsbody = col.querySelector('#tsbody');
 
-    // level 1 — three branches appear, then score, then the beam keeps the top 2
-    var l1 = [
-      addNode(tsbody, {t:'Theme + guest list first', s:8}, false),
-      addNode(tsbody, {t:'Book a venue, then invite', s:5}, false),
-      addNode(tsbody, {t:'Just order a cake',         s:3}, false)
-    ];
-    for(var i=0;i<l1.length;i++){ l1[i].classList.add('in'); await sleep(280); }
-    await sleep(260);
-    for(var j=0;j<l1.length;j++){ l1[j].classList.add('scored'); await sleep(190); }
-    await sleep(320);
-    setBeam(l1[0],'kept'); setBeam(l1[1],'kept'); setBeam(l1[2],'pruned');
-    await sleep(520);
+    // level 1 — branches appear, score, then the beam keeps the top 2
+    var n1 = d.level1.map(function(c){ return addNode(tsbody, c, false); });
+    for (var i=0;i<n1.length;i++){ n1[i].classList.add('in'); await sleep(300, myGen); }
+    await sleep(320, myGen);
+    for (var j=0;j<n1.length;j++){ n1[j].classList.add('scored'); await sleep(210, myGen); }
+    await sleep(420, myGen);
+    for (var k=0;k<n1.length;k++){ setBeam(n1[k], d.level1[k].beam); await sleep(160, myGen); }
+    await sleep(640, myGen);
 
-    // level 2 — expand the best branch, score, star the winning leaf
-    var l2 = [
-      addNode(tsbody, {t:'Evening garden theme, 12 guests', s:9}, true),
-      addNode(tsbody, {t:'Daytime brunch, 20 guests',       s:6}, true)
-    ];
-    for(var k=0;k<l2.length;k++){ l2[k].classList.add('in'); await sleep(280); }
-    await sleep(220);
-    for(var m=0;m<l2.length;m++){ l2[m].classList.add('scored'); await sleep(190); }
-    await sleep(340);
-    setBeam(l2[1],'kept'); setBeam(l2[0],'star');
+    // level 2 — expand the kept branches, score, star the winning leaf
+    var n2 = d.level2.map(function(c){ return addNode(tsbody, c, true); });
+    for (var a=0;a<n2.length;a++){ n2[a].classList.add('in'); await sleep(300, myGen); }
+    await sleep(280, myGen);
+    for (var b=0;b<n2.length;b++){ n2[b].classList.add('scored'); await sleep(210, myGen); }
+    await sleep(420, myGen);
+    for (var c2=0;c2<n2.length;c2++){ setBeam(n2[c2], d.level2[c2].beam); await sleep(180, myGen); }
     document.getElementById('tstatus').classList.remove('searching');
-    document.getElementById('tstatus').textContent='5 nodes';
-    await sleep(750);
+    document.getElementById('tstatus').textContent = d.nodeCount + ' nodes';
+    await sleep(950, myGen);
 
     // chosen answer arrives; the tree search folds away
     var ans = el('<div class="bubble assistant"></div>');
     col.querySelector('.acol').appendChild(ans);
     document.getElementById('ts').classList.add('collapsed');
-    await streamInto(ans,
-      'Go with an evening garden theme for 12 — lock the guest list, then plan venue and cake around it.', 16);
-    await sleep(2000);
+    await streamWords(ans, d.answer, 30, myGen);
+    await sleep(2200, myGen);
   }
 
-  // ============== Scene 2: Fast Think — speculative decoding, one profile away ==============
-  async function sceneFastThink(){
-    setDots(1);
-    clear();
-    setCaption('Switch to Fast Think — same model, greedy + a speculative drafter, fewer waits.');
-    await sleep(600);
-    // open the profile menu, move selection to Fast Think, pick it
-    menu.classList.add('show'); await sleep(620);
-    selectMenu('fast'); await sleep(520);
+  // ============== Scene 1: Fast Think — speculative decoding, same prompt twice ==============
+  async function sceneFastThink(myGen){
+    var d = SCENARIO.fast;
+    // First pass: the normal Chat profile, token by token.
+    setProfile('Chat', CHATG, 'chat');
+    setCaption('Chat profile — the model emits one token at a time.');
+    await sleep(650, myGen);
+    await typeComposer(d.prompt, myGen);
+    userRow(d.prompt); resetComposer();
+    await sleep(260, myGen);
+    var a1 = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
+    transcript.appendChild(a1);
+    await streamWords(a1.querySelector('.bubble'), d.answer, 62, myGen); // slow, even cadence
+    await sleep(900, myGen);
+
+    // Switch profiles: open the menu, pick Fast Think.
+    setCaption('Switch to Fast Think — same model, plus a speculative drafter.');
+    menu.classList.add('show'); await sleep(680, myGen);
+    setProfile('Fast Think', BOLT, 'fast'); await sleep(520, myGen);
     menu.classList.remove('show');
-    profileName.textContent='Fast Think'; profileIcon.innerHTML=BOLT;
-    await sleep(420);
-    await typeComposer('List three uses for a paperclip.');
-    userRow('List three uses for a paperclip.'); resetComposer();
-    await sleep(260);
-    var a = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
-    transcript.appendChild(a);
-    await streamInto(a.querySelector('.bubble'),
-      '1. Reset a phone SIM tray.\n2. Bookmark a page.\n3. Clip loose cables together.', 11); // fast
-    await sleep(1600);
+    await sleep(360, myGen);
+
+    // Second pass: the SAME prompt + SAME answer, now in chunky multi-token bursts.
+    userRow(d.prompt);
+    await sleep(220, myGen);
+    var a2 = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
+    transcript.appendChild(a2);
+    setCaption('Same answer — but in multi-token bursts. That chunky cadence is accepted draft tokens.');
+    await streamBursts(a2.querySelector('.bubble'), d.answer, d.bursts, 150, myGen); // chunky + quicker
+    await sleep(2200, myGen);
   }
 
-  function renderStatic(){
-    // reduced-motion (and the loop's error fallback): one honest representative
-    // frame of the lead Tree of Thought profile. clear() first so it's a clean
-    // frame even if a half-rendered scene was on screen.
-    clear();
-    profileName.textContent='Tree of Thought'; profileIcon.innerHTML=TREE; selectMenu('tot');
-    userRow('Plan a surprise party.');
-    var col = el(
-      '<div class="row assistant"><div class="acol">'+
-        '<div class="tsearch"><div class="tshead">'+TREE+' Tree search '+
-          '<span class="bounds">· 3×2, beam 2 ·</span> <span class="status">5 nodes</span> '+
-          '<span class="tchev">▾</span></div>'+
-        '<div class="tsbody">'+
-          '<div class="tnode scored in"><span class="beam kept">✓</span><span class="score">8</span><span class="label">Theme + guest list first</span></div>'+
-          '<div class="tnode child scored in"><span class="beam star">★</span><span class="score">9</span><span class="label">Evening garden theme, 12 guests</span></div>'+
-          '<div class="tnode pruned scored in"><span class="beam pruned">✕</span><span class="score">3</span><span class="label">Just order a cake</span></div>'+
-        '</div></div>'+
-        '<div class="bubble assistant">Go with an evening garden theme for 12 — lock the guest list, then plan venue and cake around it.</div>'+
-      '</div></div>');
-    transcript.appendChild(col);
-    setCaption('Animation paused (reduced motion). Tree of Thought, Fast Think, and profiles are live in the app.');
-    setDots(0);
-  }
-
-  async function loop(){
-    if(reduce){ renderStatic(); return; }
-    // eslint-disable-next-line no-constant-condition
-    while(true){
-      try {
-        await sceneTreeOfThought();   // lead demo
-        await sceneFastThink();
-        await sleep(800);
-      } catch (e) {
-        // A future markup/ID change could make a querySelector return null and
-        // throw mid-scene. Degrade to the honest static frame instead of
-        // freezing on a half-rendered window, and surface the error.
-        console.error(e);
-        renderStatic();
-        break;
-      }
+  // ---- static frames (reduced motion, and the error fallback) ----
+  function buildTreeFinal(){
+    var d = SCENARIO.tot;
+    var rows = '';
+    function row(c, child){
+      return '<div class="tnode'+(child?' child':'')+(c.beam==='pruned'?' pruned':'')+' scored in">'+
+        '<span class="beam '+c.beam+'">'+beamChar(c.beam)+'</span>'+
+        '<span class="score">'+c.s+'</span><span class="label">'+c.t+'</span></div>';
     }
+    rows += row(d.level1[0], false);
+    rows += row(d.level2[0], true);   // the starred leaf, indented under the first kept branch
+    rows += row(d.level1[1], false);
+    rows += row(d.level1[2], false);
+    return '<div class="tsearch"><div class="tshead">'+TREE+' Tree search '+
+      '<span class="bounds">'+d.bounds+'</span> <span class="status">'+d.nodeCount+' nodes</span> '+
+      '<span class="tchev">▾</span></div><div class="tsbody">'+rows+'</div></div>';
   }
-  // kick off after first paint; never leave the rejection unhandled.
-  function start(){ loop().catch(function(e){ console.error(e); renderStatic(); }); }
-  if(document.readyState==='complete') start();
+  function stillTot(){
+    clear(); setProfile(SCENARIO.tot.profile, TREE, 'tot');
+    userRow(SCENARIO.tot.prompt);
+    var col = el('<div class="row assistant"><div class="acol">'+buildTreeFinal()+
+      '<div class="bubble assistant">'+SCENARIO.tot.answer+'</div></div></div>');
+    transcript.appendChild(col);
+  }
+  function stillFast(){
+    clear(); setProfile('Fast Think', BOLT, 'fast');
+    userRow(SCENARIO.fast.prompt);
+    var a = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
+    a.querySelector('.bubble').textContent = SCENARIO.fast.answer;
+    transcript.appendChild(a);
+  }
+
+  var SCENES = [
+    { run: sceneTreeOfThought, still: stillTot,
+      pausedCaption: 'Animation paused (reduced motion). Tree of Thought is a one-click profile in the app.' },
+    { run: sceneFastThink, still: stillFast,
+      pausedCaption: 'Animation paused (reduced motion). Fast Think runs speculative decoding in the app.' }
+  ];
+
+  // Error fallback: a clean, honest static frame (the lead Tree of Thought scene).
+  function renderStaticFallback(){
+    stillTot();
+    setCaption('Tree of Thought, Fast Think, and profiles are live in the app.');
+    setActiveDot(0);
+  }
+
+  // Play scene `i`. Bumping `gen` cancels any in-flight scene at its next await.
+  async function play(i){
+    gen++; var myGen = gen;
+    if (advanceTimer){ clearTimeout(advanceTimer); advanceTimer = null; }
+    setActiveDot(i);
+    if (reduce){                          // no animation: render the static frame
+      SCENES[i].still();
+      setCaption(SCENES[i].pausedCaption);
+      return;
+    }
+    clear();
+    try {
+      await SCENES[i].run(myGen);
+    } catch (e) {
+      if (e === CANCELLED) return;        // superseded by a newer scene — stop silently
+      console.error(e); renderStaticFallback(); return;  // a real error degrades to static
+    }
+    if (myGen !== gen) return;            // superseded during the final frame
+    // Auto-advance: a manual click jumps here and the reel then resumes from this scene.
+    advanceTimer = setTimeout(function(){ kick((i+1) % SCENES.length); }, AUTO_ADVANCE_MS);
+  }
+  // Always attach a .catch so a click-triggered rejection is never unhandled.
+  function kick(i){ play(i).catch(function(e){ if (e !== CANCELLED){ console.error(e); renderStaticFallback(); } }); }
+
+  dotEls.forEach(function(d){
+    d.addEventListener('click', function(){ kick(parseInt(d.getAttribute('data-scene'), 10) || 0); });
+  });
+
+  function start(){ kick(0); }
+  if (document.readyState === 'complete') start();
   else window.addEventListener('load', start);
 })();
 </script>
