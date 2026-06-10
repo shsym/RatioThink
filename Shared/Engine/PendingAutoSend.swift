@@ -61,9 +61,16 @@ public struct PendingAutoSend: Equatable, Sendable {
   /// Fold a model-resolution observation into a decision. `resolvedModelID`
   /// is the same value the send path itself resolves (`currentModelID`),
   /// so "fire" can never pass a model the send would then reject.
-  public func verdict(chatID: UUID, resolvedModelID: String?) -> Verdict {
+  ///
+  /// `isSending` — review v1 F2: the composer's `submit()` bails (silently)
+  /// while a send is in flight, so a fire delivered then would be swallowed
+  /// with the pending already cleared. Hold instead; the in-flight-cleared
+  /// edge re-evaluates and delivers the deferred fire.
+  public func verdict(chatID: UUID, resolvedModelID: String?,
+                      isSending: Bool = false) -> Verdict {
     guard chatID == self.chatID else { return .disarm }
     guard let resolved = resolvedModelID, !resolved.isEmpty else { return .hold }
-    return resolved == targetModelID ? .fire : .disarm
+    guard resolved == targetModelID else { return .disarm }
+    return isSending ? .hold : .fire
   }
 }

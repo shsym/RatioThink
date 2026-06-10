@@ -59,4 +59,25 @@ final class PendingAutoSendTests: XCTestCase {
   func test_disarms_on_chat_mismatch_even_for_the_intended_model() {
     XCTAssertEqual(armed().verdict(chatID: UUID(), resolvedModelID: target), .disarm)
   }
+
+  // MARK: - review v1 F2: fire defers while a send is in flight
+
+  func test_holds_while_a_send_is_in_flight_then_fires_when_clear() {
+    // The composer's submit() bails on its !isSending guard — a fire
+    // delivered mid-flight would be silently swallowed with the pending
+    // already cleared. The verdict must hold instead, and fire on the
+    // re-evaluation once in-flight clears.
+    let p = armed()
+    XCTAssertEqual(p.verdict(chatID: chatID, resolvedModelID: target, isSending: true), .hold,
+                   "fire must defer while a send is in flight")
+    XCTAssertEqual(p.verdict(chatID: chatID, resolvedModelID: target, isSending: false), .fire,
+                   "deferred fire must deliver once in-flight clears")
+  }
+
+  func test_stale_context_still_disarms_while_in_flight() {
+    // Staleness wins over deferral: a wrong model/chat must not stay armed
+    // just because a send happens to be streaming.
+    XCTAssertEqual(armed().verdict(chatID: chatID, resolvedModelID: "org/model-b", isSending: true), .disarm)
+    XCTAssertEqual(armed().verdict(chatID: UUID(), resolvedModelID: target, isSending: true), .disarm)
+  }
 }

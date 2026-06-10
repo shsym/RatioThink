@@ -454,6 +454,14 @@ struct ChatScaffoldView: View {
       // #4: the engine no longer auto-starts on boot — once status settles
       // (.starting → .stopped), proactively ask to start the model.
       maybePromptEngineStartOnLaunch()
+      // #516 review F1: `currentModelID` gates on THIS status being
+      // `.running`, but the residency feed (`EngineLifecycle` →
+      // `ModelLoadCenter`) observes the engine independently and can land
+      // FIRST — its `residentModelID` edge then evaluates to `.hold` and
+      // the change-guarded setters emit no later edge. The status flip is
+      // that missing edge; `resolutionEdge` is idempotent, so the extra
+      // call is safe in every other ordering.
+      resolutionEdge(for: chat)
     }
     // #496: auto-dismiss the inline helper-refusal once the Helper recovers to
     // a state where the op would be allowed again, so a stale "helper is
@@ -475,6 +483,11 @@ struct ChatScaffoldView: View {
     // ending the generation and releasing the gate).
     .onChange(of: sendController.isInFlight) { _, inFlight in
       helperHealth.setGenerating(inFlight)
+      // #516 review F2: a fire delivered while a send is in flight would be
+      // swallowed by `submit()`'s `!isSending` guard — so `verdict` holds
+      // while in flight, and THIS edge (in-flight clearing) re-evaluates
+      // and delivers the deferred fire.
+      if !inFlight { resolutionEdge(for: chat) }
     }
     .onAppear {
       // Seed the toolbar from the persisted profile so the menu
@@ -957,7 +970,9 @@ struct ChatScaffoldView: View {
   private func resolutionEdge(for chat: Chat) {
     dismissPromptIfResolved(for: chat)
     guard let pending = pendingAutoSend else { return }
-    switch pending.verdict(chatID: chat.id, resolvedModelID: currentModelID(for: chat)) {
+    switch pending.verdict(chatID: chat.id,
+                           resolvedModelID: currentModelID(for: chat),
+                           isSending: sendController.isInFlight) {
     case .hold:
       break
     case .disarm:
