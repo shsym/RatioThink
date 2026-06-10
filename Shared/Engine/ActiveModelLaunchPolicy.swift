@@ -34,6 +34,8 @@ public enum ActiveModelLaunchPolicy {
     case alreadyResident
     /// Engine is mid-transition (`.starting` / `.stopping`) — the in-flight
     /// launch already reflects a target; do not pile a second one on.
+    /// #488: not a drop — `ActiveModelServeExecutor` queues the pick
+    /// (coalesced to the latest) and re-decides it when the engine settles.
     case deferBusy
     /// Engine is in a terminal failure that a fresh start cannot clear
     /// (`memoryRisk` / `killRejected`). The failure banner owns the reason;

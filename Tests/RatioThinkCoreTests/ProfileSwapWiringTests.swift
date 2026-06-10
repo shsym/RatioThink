@@ -207,6 +207,55 @@ final class ProfileSwapWiringTests: XCTestCase {
     }
   }
 
+  // MARK: - #488: deferred pick wiring (executor → coordinator error surface)
+
+  /// #488 end-to-end across the production wiring shape (`RatioThinkApp`):
+  /// a pick against a transitional engine is QUEUED by
+  /// `ActiveModelServeExecutor` (not dropped), re-served on the settle, and a
+  /// re-serve failure lands in the coordinator's existing `serveModelError`
+  /// toolbar surface via `reportServeFailure` — never invisible.
+  func test_deferred_pick_failure_surfaces_through_serveModelError() async throws {
+    final class FailingStartClient: AppXPCClient, @unchecked Sendable {
+      func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
+      func engineStatus() async throws -> EngineStatus { .stopped }
+      func stopEngine() async throws {}
+      func startEngine(profileID: String, modelOverride: String?) async throws {
+        throw EngineError(code: .modelMissing, message: "evicted")
+      }
+      func restartEngine(profileID: String, modelOverride: String?) async throws {}
+    }
+
+    let store = EngineStatusStore(client: FailingStartClient(), initialStatus: .stopping)
+    let center = ModelLoadCenter()
+    let executor = ActiveModelServeExecutor(engineStatus: store, modelLoad: center)
+    let coord = ProfileSwapCoordinator(
+      center: center,
+      serveModel: { try await executor.serve(modelID: $0, profileID: $1) }
+    )
+    executor.onDeferredServeFailure = { [weak coord] modelID, error in
+      coord?.reportServeFailure(modelID: modelID, error: error)
+    }
+
+    // Pick mid-transition → queued, not dropped.
+    coord.loadDirect(modelID: "m-A.gguf", profileID: "chat")
+    let deadline = Date().addingTimeInterval(2)
+    while executor.deferredPick == nil && Date() < deadline {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTAssertEqual(executor.deferredPick?.modelID, "m-A.gguf",
+                   "a pick against a stopping engine must queue")
+    XCTAssertNil(coord.serveModelError)
+
+    // Engine settles stopped → re-serve fires, start rejects → surfaced.
+    store._applyPollForTesting(next: .stopped, error: nil)
+    while coord.serveModelError == nil && Date() < deadline {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    let surfaced = try XCTUnwrap(coord.serveModelError,
+                                 "a deferred pick's launch failure must surface like a direct pick's")
+    XCTAssertTrue(surfaced.contains("m-A.gguf"), "error copy must name the model: \(surfaced)")
+  }
+
   /// #486: the model-menu analog of the no-current-model re-select. Picking a
   /// model from the toolbar model menu with NO current model (`fromModel ==
   /// nil`: engine stopped / unpinned) must NOT raise a switch-model confirm —

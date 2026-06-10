@@ -507,6 +507,17 @@ public final class ProfileSwapCoordinator: ObservableObject {
     defaultModelWriteError = nil
   }
 
+  /// #488: surface a DEFERRED pick's launch failure through the same
+  /// channel as a direct pick's. A pick queued while the engine was
+  /// mid-transition (`ActiveModelServeExecutor.deferredPick`) re-serves
+  /// outside any `startLoad` Task, so its failure has no awaiting caller —
+  /// the executor reports it here so the toolbar copy is identical either
+  /// way. Mirrors `startLoad`'s catch verbatim.
+  public func reportServeFailure(modelID: String, error: Error) {
+    serveModelError = "Couldn’t load \(modelID): \(error)"
+    Self.log.error("deferred serveModel failed model=\(modelID, privacy: .public): \(String(describing: error), privacy: .public)")
+  }
+
   /// Direct-load entry — used when the user picks a model in the
   /// model pull-down (no confirmation needed; user explicitly chose).
   /// Short-circuits when the target is already resident and no load

@@ -194,28 +194,22 @@ struct RatioThinkApp: App {
     // The override is threaded through the start/restart XPC so the Helper
     // boots the chosen model; the resolver records it in the durable
     // active-model marker so a later menu-bar Resume honors the pick.
-    let serveModel: (@MainActor (String, String) async throws -> Void) = { [weak statusStore, weak center] modelID, profileID in
-      guard let statusStore, let center else { return }
-      switch ActiveModelLaunchPolicy.decide(
-        modelID: modelID,
-        status: statusStore.status,
-        residentModelID: center.residentModelID
-      ) {
-      case .startEngine(let model):
-        try await statusStore.startEngine(profileID: profileID, modelOverride: model)
-      case .restartEngine(let model):
-        try await statusStore.restartEngine(profileID: profileID, modelOverride: model)
-      case .alreadyResident, .deferBusy, .blockedTerminal:
-        // Already serving the pick, mid-transition, or terminally failed —
-        // no (re)launch. The indicator/banner already reflect the live state.
-        break
-      }
-    }
-    _swapCoordinator = StateObject(wrappedValue: ProfileSwapCoordinator(
+    // #488: the executor also QUEUES a pick made while the engine is
+    // mid-transition (policy `.deferBusy`) and re-serves it when the engine
+    // settles, instead of silently dropping it.
+    let serveExecutor = ActiveModelServeExecutor(engineStatus: statusStore, modelLoad: center)
+    let coordinator = ProfileSwapCoordinator(
       center: center,
       profileStore: store,
-      serveModel: serveModel
-    ))
+      serveModel: { try await serveExecutor.serve(modelID: $0, profileID: $1) }
+    )
+    // A deferred re-serve has no awaiting `startLoad` Task to throw to —
+    // route its failure into the same toolbar `serveModelError` surface a
+    // direct pick's failure uses (#488).
+    serveExecutor.onDeferredServeFailure = { [weak coordinator] modelID, error in
+      coordinator?.reportServeFailure(modelID: modelID, error: error)
+    }
+    _swapCoordinator = StateObject(wrappedValue: coordinator)
     _downloadController = StateObject(wrappedValue: Self.makeDownloadController())
 
     _persistenceStatus = StateObject(wrappedValue: status)
