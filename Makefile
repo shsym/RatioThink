@@ -495,8 +495,11 @@ render-menubar-icon: ## Render the #424 branded menu-bar icon (4 states x light/
 	@/tmp/render-menubar-icon
 	@open /tmp/menubar-icon-preview.png 2>/dev/null || true
 
-test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate, composer auto-grow, profile-swap keep-current, model-menu no-resident confirm (S260/S279/S285/S286/S446/S459/S486)
-	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests -only-testing:RatioThinkGUITests/S459_ProfileSwapKeepCurrentGUITests -only-testing:RatioThinkGUITests/S486_ModelMenuNoResidentConfirmGUITests)
+test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate, composer auto-grow, profile-swap keep-current, model-menu no-resident confirm, helper-recovery overlay (S260/S279/S285/S286/S446/S459/S486/S496)
+	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests -only-testing:RatioThinkGUITests/S459_ProfileSwapKeepCurrentGUITests -only-testing:RatioThinkGUITests/S486_ModelMenuNoResidentConfirmGUITests -only-testing:RatioThinkGUITests/S496_HelperRecoveryOverlayGUITests)
+
+test-gui-helper-recovery: genproject $(LOGDIR) ## GUI area: #496 helper-recovery overlay — starting/unreachable/auto-dismiss + engineRunning gate (S496)
+	$(call gui_suite_run,helper-recovery,-only-testing:RatioThinkGUITests/S496_HelperRecoveryOverlayGUITests)
 
 # --- E2E wrappers by product area ------------------------------------------
 # Operator-gated (seated session + TCC; real engine/model or deterministic

@@ -24,6 +24,13 @@ public final class HelperHealthController: ObservableObject {
 
   private let policy: HelperHealthPolicy
   private let repair: () async -> Bool
+  /// #496 GUI seam: when true the controller is PINNED — poll outcomes are
+  /// ignored so the overlay's three states render deterministically without a
+  /// real helper (mirrors the engine-status `PinnedRunningXPCClient` seam).
+  /// A manual restart from the pinned escalation simulates a successful repair
+  /// (→ `.healthy`) so the GUI can exercise the overlay's auto-dismiss. Set
+  /// ONLY from the DEBUG `PIE_TEST_PIN_HELPER_HEALTH` launch path.
+  private let isPinned: Bool
   /// In-flight repair. The reducer transitions to `.repairing` and THIS task
   /// owns the matching `repairFinished` event; a new repair / a recovery
   /// cancels it so attempts never overlap.
@@ -39,9 +46,12 @@ public final class HelperHealthController: ObservableObject {
   private nonisolated static let log = Logger(subsystem: "com.ratiothink.app", category: "helper-health")
 
   public init(policy: HelperHealthPolicy = HelperHealthPolicy(),
-              repair: @escaping () async -> Bool) {
+              repair: @escaping () async -> Bool,
+              pinnedHealth: HelperHealth? = nil) {
     self.policy = policy
     self.repair = repair
+    self.isPinned = pinnedHealth != nil
+    if let pinnedHealth { self.health = pinnedHealth }
   }
 
   /// Feed one background `engineStatus()` poll outcome (true = the XPC call
@@ -67,6 +77,9 @@ public final class HelperHealthController: ObservableObject {
   /// the next failed poll advances the ladder normally. A SUCCEEDED poll always
   /// recovers, even mid-generation.
   public func ingestPollOutcome(succeeded: Bool) {
+    // #496 GUI seam: a pinned controller holds its injected health regardless
+    // of the poll stream, so the overlay state stays deterministic.
+    if isPinned { return }
     if !succeeded, isGenerating {
       heldPollsDuringGeneration += 1
       return
@@ -96,6 +109,14 @@ public final class HelperHealthController: ObservableObject {
   /// ladder and fires a fresh repair attempt regardless of current state.
   public func restartHelperManually() {
     Self.log.notice("user requested Restart Helper")
+    // #496 GUI seam: in the pinned harness there is no real helper to repair,
+    // so a manual restart simulates the repair SUCCEEDING — the helper comes
+    // back `.healthy`, which drives the overlay's auto-dismiss. Production
+    // (non-pinned) runs the real ladder via `apply(.manualRestart)`.
+    if isPinned {
+      if health != .healthy { health = .healthy }
+      return
+    }
     apply(.manualRestart)
   }
 

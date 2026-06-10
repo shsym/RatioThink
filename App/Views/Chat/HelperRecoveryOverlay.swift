@@ -30,10 +30,16 @@ struct HelperRecoveryOverlay: View {
     // Copy lives in the pure, SPM-tested `HelperRecoveryGate` (mirroring
     // `StatusBannerReducer`); this view is thin presentation over it.
     if let copy = HelperRecoveryGate.copy(for: state) {
+      // NOTE: no `.accessibilityIdentifier` on this container — on current
+      // SwiftUI a container id propagates down and OVERRIDES the child controls'
+      // own identifiers (the title + the Restart/LoginItems/Diagnostics
+      // buttons), making them unqueryable (the same trap documented in
+      // `NoModelLoadedPrompt.body`). The title (`helperRecovery.title`) is the
+      // state-independent "overlay is up" marker; the controls carry their own
+      // ids.
       surface(copy)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
-        .accessibilityIdentifier("helperRecovery.overlay")
     }
   }
 
@@ -52,10 +58,13 @@ struct HelperRecoveryOverlay: View {
   private func header(_ copy: HelperRecoveryGate.Copy) -> some View {
     VStack(spacing: 10) {
       icon
+      // NOTE: no `.accessibilityIdentifier` here — applying one to a `Text`
+      // suppresses its accessibility LABEL (XCUITest then reads an empty
+      // string), so the title is queried by its visible copy instead. The
+      // copy itself is the state marker (and is pinned in HelperRecoveryGate).
       Text(copy.title)
         .font(.headline)
         .multilineTextAlignment(.center)
-        .accessibilityIdentifier("helperRecovery.title")
       Text(copy.message)
         .font(.callout)
         .foregroundStyle(.secondary)

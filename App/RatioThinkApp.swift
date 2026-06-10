@@ -225,7 +225,19 @@ struct RatioThinkApp: App {
     } else {
       helperRepair = { await HelperRegistrationRepair().repairAndReportReachable() }
     }
-    let helperHealthController = HelperHealthController(repair: helperRepair)
+    // #496 DEBUG GUI seam: pin the helper-health ladder to a fixed state so the
+    // chat-body recovery overlay's states (starting / unreachable / hidden)
+    // render deterministically without a real background helper — sibling of
+    // `PIE_TEST_PIN_ENGINE_RUNNING`. Compiled out of Release.
+    #if DEBUG
+    let pinnedHelperHealth = Self.pinnedHelperHealthForTesting()
+    #else
+    let pinnedHelperHealth: HelperHealth? = nil
+    #endif
+    let helperHealthController = HelperHealthController(
+      repair: helperRepair,
+      pinnedHealth: pinnedHelperHealth
+    )
     // Drive the ladder from the SAME poll the status mirror runs — no second
     // XPC surface. Set BEFORE statusStore.start() so the first ticks count.
     statusStore.onPollOutcome = { [weak helperHealthController] succeeded in
@@ -247,15 +259,34 @@ struct RatioThinkApp: App {
     // within ~one runloop tick when the helper is registered, longer
     // when launchd has not yet published the mach service.
     #if DEBUG
-    // Skipped when status is pinned for the S302 harness (no Helper to
-    // poll; a failed poll would reset the pinned `.running` → `.starting`).
-    if pinnedRunningPort == nil {
+    // Skipped when status is pinned for the S302 harness (no Helper to poll; a
+    // failed poll would reset the pinned `.running` → `.starting`), and for the
+    // #496 helper-health pin (a failed/successful poll would move the pinned
+    // ladder and could flip the engine off `.starting`, both of which would
+    // make the overlay state nondeterministic).
+    if pinnedRunningPort == nil && pinnedHelperHealth == nil {
       statusStore.start()
     }
     #else
     statusStore.start()
     #endif
   }
+
+  #if DEBUG
+  /// #496 GUI seam: map `PIE_TEST_PIN_HELPER_HEALTH` to a pinned `HelperHealth`
+  /// so the chat-body recovery overlay's states can be driven without a real
+  /// background helper. `starting` maps to an active-recovery ladder state
+  /// (`.repairing`) so the gate resolves to `.startingHelper`; `unreachable`
+  /// and `healthy` map directly. Unset / unrecognized ⇒ no pin (normal ladder).
+  private static func pinnedHelperHealthForTesting() -> HelperHealth? {
+    switch ProcessInfo.processInfo.environment["PIE_TEST_PIN_HELPER_HEALTH"] {
+    case "starting":    return .repairing(attempt: 1)
+    case "unreachable": return .unreachable
+    case "healthy":     return .healthy
+    default:            return nil
+    }
+  }
+  #endif
 
   /// Test-only engine base-URL override. `PIE_TEST_ENGINE_BASE_URL`
   /// points the chat client straight at an externally-launched engine,
