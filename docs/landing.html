@@ -204,7 +204,7 @@
   </header>
 
   <!-- ===================== mock app window ===================== -->
-  <div class="stage">
+  <div class="stage" aria-hidden="true">
     <div class="window" id="win">
       <div class="titlebar">
         <div class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></div>
@@ -302,7 +302,6 @@
   var composer   = document.getElementById('composer');
   var win        = document.getElementById('win');
   var menu       = document.getElementById('profileMenu');
-  var pill       = document.getElementById('profilePill');
   var profileName= document.getElementById('profileName');
   var profileIcon= document.getElementById('profileIcon');
   var menuChat   = document.getElementById('menuChat');
@@ -361,7 +360,7 @@
     await sleep(450);
     // send a prompt; answer streams fast (speculative)
     await typeComposer('List three uses for a paperclip.');
-    var u = userRow('List three uses for a paperclip.'); void u; composer.textContent='Message RatioThink…'; composer.classList.remove('typed');
+    userRow('List three uses for a paperclip.'); composer.textContent='Message RatioThink…'; composer.classList.remove('typed');
     await sleep(280);
     var a = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
     transcript.appendChild(a);
@@ -445,7 +444,10 @@
   }
 
   function renderStatic(){
-    // reduced-motion: one honest representative frame (Fast Think Q+A), preview noted in cards.
+    // reduced-motion (and the loop's error fallback): one honest representative
+    // frame (Fast Think Q+A), preview noted in cards. clear() first so it's a
+    // clean frame even if a half-rendered scene was on screen.
+    clear();
     win.classList.remove('preview');
     profileName.textContent='Fast Think'; profileIcon.innerHTML=BOLT;
     menuChat.classList.remove('sel'); menuFast.classList.add('sel');
@@ -462,15 +464,25 @@
     if(reduce){ renderStatic(); return; }
     // eslint-disable-next-line no-constant-condition
     while(true){
-      await sceneFastThink();
-      await sceneThinking();
-      await sceneToT();
-      await sleep(900);
+      try {
+        await sceneFastThink();
+        await sceneThinking();
+        await sceneToT();
+        await sleep(900);
+      } catch (e) {
+        // A future markup/ID change could make a querySelector return null and
+        // throw mid-scene. Degrade to the honest static frame instead of
+        // freezing on a half-rendered window, and surface the error.
+        console.error(e);
+        renderStatic();
+        break;
+      }
     }
   }
-  // kick off after first paint
-  if(document.readyState==='complete') loop();
-  else window.addEventListener('load', loop);
+  // kick off after first paint; never leave the rejection unhandled.
+  function start(){ loop().catch(function(e){ console.error(e); renderStatic(); }); }
+  if(document.readyState==='complete') start();
+  else window.addEventListener('load', start);
 })();
 </script>
 </body>
