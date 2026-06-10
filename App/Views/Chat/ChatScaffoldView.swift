@@ -306,7 +306,10 @@ struct ChatScaffoldView: View {
       // banner (the only one-click download there) must stay visible.
       if let bannerTarget = MissingModelRecovery.bannerTarget(
         engineStatus: engineStatusStore.status,
-        profileDefaultModel: selectedProfileDefault,
+        // Keyed on the GATE model (pick ?? default) like the suppression
+        // axis below and the boot path — the banner must never offer a
+        // download for a default the Load tap wouldn't boot.
+        profileDefaultModel: gateModelID(for: chat),
         sendGatePresented: showNoModelPrompt && noModelAction(for: chat).isDownload
       ) {
         ModelMissingBanner(

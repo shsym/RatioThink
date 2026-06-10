@@ -295,4 +295,37 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     }
     XCTAssertEqual(chipModel, pick, "the chip must name the model the tap will boot")
   }
+
+  /// Review v4 F1: the `ModelMissingBanner` target is keyed on the GATE
+  /// model like its suppression axis. Installed pick + missing-but-
+  /// downloadable default + `.failed(.modelMissing)` must never surface
+  /// the DEFAULT's download CTA (a model the boot override wouldn't
+  /// load) — with the pick not in the curated catalog the banner is
+  /// suppressed outright.
+  func test_missingModel_banner_keys_on_the_pick_not_the_default() {
+    let pick = "org/picked/picked.gguf"  // not a curated download
+    let failed = EngineStatus.failed(code: .modelMissing, message: "resolver trace")
+    let gateModel = ChatScaffoldView.gateModelID(
+      selectedModelID: pick,
+      profileDefaultModel: ProfileStore.defaultChatModelID)
+
+    XCTAssertNil(
+      MissingModelRecovery.bannerTarget(
+        engineStatus: failed, profileDefaultModel: gateModel),
+      "banner must not offer the default's download when the boot model is the pick")
+
+    // Premise guard: the OLD keying (profile default) WOULD have offered
+    // the default's download here — the substitution is load-bearing.
+    XCTAssertNotNil(
+      MissingModelRecovery.bannerTarget(
+        engineStatus: failed, profileDefaultModel: ProfileStore.defaultChatModelID))
+
+    // Unpinned chat: gate model IS the default — banner behavior unchanged.
+    XCTAssertNotNil(
+      MissingModelRecovery.bannerTarget(
+        engineStatus: failed,
+        profileDefaultModel: ChatScaffoldView.gateModelID(
+          selectedModelID: nil,
+          profileDefaultModel: ProfileStore.defaultChatModelID)))
+  }
 }
