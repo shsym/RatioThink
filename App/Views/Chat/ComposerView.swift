@@ -220,9 +220,18 @@ struct ComposerView: View {
       ts: Date()
     )
     let previousUpdatedAt = chat.updatedAt
+    let previousTitle = chat.title
     modelContext.insert(message)
     chat.messages.append(message)
     chat.updatedAt = message.ts
+    // #512: first real user message titles the chat — a deterministic
+    // local heuristic (trim/collapse/cap), committed in the SAME save as
+    // the message so it can never block or outlive the send. Only an
+    // untitled chat (still the default placeholder) is renamed, so a
+    // user-set title is never fought.
+    if chat.title == Chat.defaultTitle, let title = ChatAutoTitle.derive(from: payload) {
+      chat.title = title
+    }
     do {
       try modelContext.save()
       draft = ""
@@ -234,6 +243,7 @@ struct ComposerView: View {
       chat.messages.removeAll { $0.id == message.id }
       modelContext.delete(message)
       chat.updatedAt = previousUpdatedAt
+      chat.title = previousTitle
       persistenceStatus.report(error, context: "ComposerView.submit")
     }
   }

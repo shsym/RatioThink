@@ -13,6 +13,12 @@ import SwiftData
 @available(macOS 14, *)
 @Model
 public final class Chat {
+  /// Placeholder title for a chat with no conversation yet. The
+  /// empty-shell prune and the auto-title pipeline (#512) both key on
+  /// it: only a chat still carrying this exact title is considered
+  /// untitled (a user-set title is user intent and is never replaced).
+  public static let defaultTitle = "New Chat"
+
   /// Stable UUID. `@Attribute(.unique)` so a duplicate-id insert
   /// throws at save time rather than silently coexisting alongside
   /// an existing row.
@@ -46,7 +52,7 @@ public final class Chat {
 
   public init(
     id: UUID = UUID(),
-    title: String = "New Chat",
+    title: String = Chat.defaultTitle,
     profileID: String = "chat",
     modelID: String? = nil,
     createdAt: Date = Date(),
