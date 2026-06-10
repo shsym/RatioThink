@@ -32,10 +32,12 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
 
   // MARK: - engineFailed (F1 + F3)
 
-  func test_engineFailed_retryable_shows_reason_and_retry() {
+  func test_engineFailed_retryable_shows_curated_reason_and_retry() {
+    // #477: the gate's raw diagnostic never renders — the reason line is
+    // the EngineProblem taxonomy copy.
     let p = plan(.engineFailed(code: .spawnFailed, reason: "fork ENOENT", retryable: true), unavailableAction)
     XCTAssertEqual(p.headline, "The engine couldn't start")
-    XCTAssertEqual(p.reason, "fork ENOENT")        // reason AT the gate, not only the banner
+    XCTAssertEqual(p.reason, "The engine failed to start. Try restarting it.")
     XCTAssertEqual(p.primary, .retryEngine)
     XCTAssertFalse(p.showsOpenSettings)
   }
@@ -43,7 +45,8 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   func test_engineGone_is_retryable() {
     let p = plan(.engineFailed(code: .engineGone, reason: "exited 9", retryable: true), loadAction)
     XCTAssertEqual(p.headline, "Engine stopped unexpectedly")
-    XCTAssertEqual(p.reason, "exited 9")
+    XCTAssertEqual(p.reason, "The engine process exited. Restart the engine to continue.")
+    XCTAssertFalse(p.reason?.contains("exited 9") ?? false)
     XCTAssertEqual(p.primary, .retryEngine)
   }
 
@@ -52,7 +55,7 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     // model is on disk (action == .load); route to Models settings.
     let p = plan(.engineFailed(code: .memoryRisk, reason: "9.0 GB; choose smaller", retryable: false), loadAction)
     XCTAssertEqual(p.headline, "Model is too large to load")
-    XCTAssertEqual(p.reason, "9.0 GB; choose smaller")
+    XCTAssertEqual(p.reason, "This model exceeds this Mac’s safe memory limit. Pick a smaller model.")
     XCTAssertEqual(p.primary, .none)               // F3: no re-fire
     XCTAssertTrue(p.showsOpenSettings)
     XCTAssertFalse(p.showsModelChip)
@@ -61,16 +64,18 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   func test_killRejected_is_terminal_no_retry() {
     // F3: non-retryable, non-model-choice → reason only, no Retry loop.
     let p = plan(.engineFailed(code: .killRejected, reason: "zombie pid 42", retryable: false), loadAction)
-    XCTAssertEqual(p.reason, "zombie pid 42")
+    XCTAssertEqual(p.reason, "The engine process refused to stop. Quit and reopen the app if this persists.")
+    XCTAssertFalse(p.reason?.contains("pid 42") ?? false)
     XCTAssertEqual(p.primary, .none)
     XCTAssertFalse(p.showsOpenSettings)
   }
 
   func test_modelMissing_downloadable_offers_inline_download() {
     // #326 inline download IS the fix for a missing-but-downloadable model.
+    // #477: the CTA carries the action; no reason line under it.
     let p = plan(.engineFailed(code: .modelMissing, reason: "not downloaded", retryable: true), downloadAction)
     XCTAssertEqual(p.headline, "Default model isn't downloaded")
-    XCTAssertEqual(p.reason, "not downloaded")
+    XCTAssertNil(p.reason)
     XCTAssertTrue(p.showsDownloadCTA)
     XCTAssertEqual(p.primary, .none)               // CTA owns the action, not Load
   }
@@ -80,22 +85,23 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     XCTAssertFalse(p.showsDownloadCTA)
     XCTAssertTrue(p.showsOpenSettings)
     XCTAssertEqual(p.primary, .none)
-    XCTAssertEqual(p.reason, "no HF fallback")
+    XCTAssertEqual(p.reason, "The selected model isn’t downloaded. Download it in Settings → Models, or pick another model.")
   }
 
   // MARK: - helperUnreachable / configBroken (F1)
 
-  func test_helperUnreachable_shows_reason_and_refresh() {
+  func test_helperUnreachable_shows_fixed_copy_and_refresh() {
+    // #477: the raw XPC transport string stays in logs.
     let p = plan(.helperUnreachable(reason: "connection invalid"), unavailableAction)
     XCTAssertEqual(p.headline, "Can't reach the engine")
-    XCTAssertEqual(p.reason, "connection invalid")
+    XCTAssertEqual(p.reason, "The app can't reach its background helper right now. Try again in a moment.")
     XCTAssertEqual(p.primary, .refresh)
   }
 
-  func test_configBroken_shows_reason_and_settings() {
+  func test_configBroken_shows_fixed_copy_and_settings() {
     let p = plan(.configBroken(reason: "marker unreadable"), unavailableAction)
     XCTAssertEqual(p.headline, "Can't read your profile selection")
-    XCTAssertEqual(p.reason, "marker unreadable")
+    XCTAssertEqual(p.reason, "Your profile settings couldn't be read. Open Settings → Models to fix them.")
     XCTAssertEqual(p.primary, .none)
     XCTAssertTrue(p.showsOpenSettings)
   }

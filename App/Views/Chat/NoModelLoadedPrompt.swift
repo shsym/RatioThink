@@ -116,9 +116,14 @@ struct NoModelLoadedPrompt: View {
       return unavailablePlan()
 
     case let .engineFailed(code, reason, retryable):
-      // modelMissing + downloadable → the #326 inline download IS the fix.
+      // #477: the gate's `reason` is the raw status diagnostic — render
+      // the taxonomy's curated line instead (raw stays in logs).
+      let problem = EngineProblem(statusCode: code, rawMessage: reason)
+      // modelMissing + downloadable → the #326 inline download IS the fix;
+      // the CTA says it all, so no reason line (matches the
+      // `.needsDefaultLoad` + `.download` sibling above).
       if code == .modelMissing, case .download = action {
-        return Plan(headline: "Default model isn't downloaded", reason: reason,
+        return Plan(headline: "Default model isn't downloaded", reason: nil,
                     showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: true,
                     showsUnavailableCopy: false, primary: .none,
                     showsOpenSettings: false)
@@ -126,7 +131,7 @@ struct NoModelLoadedPrompt: View {
       // Model-choice faults (missing-not-downloadable / too-large /
       // profile) route to Models settings, never a re-fire (F3).
       if isModelChoiceFault(code) {
-        return Plan(headline: engineFailedTitle(code), reason: reason,
+        return Plan(headline: engineFailedTitle(code), reason: problem.message,
                     showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
                     showsUnavailableCopy: false, primary: .none,
                     showsOpenSettings: true)
@@ -134,20 +139,24 @@ struct NoModelLoadedPrompt: View {
       // Retryable engine fault (spawnFailed / engineGone / …) → Retry.
       // Non-retryable, non-model-choice (killRejected) → terminal: reason
       // only, no Retry that would re-fire a refused start (F3).
-      return Plan(headline: engineFailedTitle(code), reason: reason,
+      return Plan(headline: engineFailedTitle(code), reason: problem.message,
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
                   showsUnavailableCopy: false,
                   primary: retryable ? .retryEngine : .none,
                   showsOpenSettings: false)
 
-    case let .helperUnreachable(reason):
-      return Plan(headline: "Can't reach the engine", reason: reason,
+    case .helperUnreachable:
+      // #477: the raw XPC transport error stays in logs; show fixed copy.
+      return Plan(headline: "Can't reach the engine",
+                  reason: "The app can't reach its background helper right now. Try again in a moment.",
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
                   showsUnavailableCopy: false, primary: .refresh,
                   showsOpenSettings: false)
 
-    case let .configBroken(reason):
-      return Plan(headline: "Can't read your profile selection", reason: reason,
+    case .configBroken:
+      // #477: the raw profile-store error stays in logs; show fixed copy.
+      return Plan(headline: "Can't read your profile selection",
+                  reason: "Your profile settings couldn't be read. Open Settings → Models to fix them.",
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
                   showsUnavailableCopy: false, primary: .none,
                   showsOpenSettings: true)

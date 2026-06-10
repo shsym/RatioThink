@@ -43,8 +43,9 @@ struct EngineStatusBanner: View {
   /// render (a live failure that hasn't been dismissed), else nil:
   ///   · no `.error` state → nil (loading/steady never banner).
   ///   · failure whose signature was already acknowledged → nil.
-  ///   · otherwise → the title/message (+ a Model-menu hint when the
-  ///     failure `invitesModelChoice`).
+  ///   · otherwise → the title/message. #477: the message comes from the
+  ///     shared `EngineProblem` taxonomy and already names the next
+  ///     action, so no per-surface hint is appended.
   static func model(
     from state: EngineIndicatorState,
     acknowledgedSignature: String?
@@ -52,10 +53,7 @@ struct EngineStatusBanner: View {
     guard let error = state.bannerError else { return nil }
     let sig = signature(for: error)
     guard sig != acknowledgedSignature else { return nil }
-    let message = error.invitesModelChoice
-      ? error.message + " Pick a smaller model from the Model menu."
-      : error.message
-    return Model(title: error.title, message: message, signature: sig)
+    return Model(title: error.title, message: error.message, signature: sig)
   }
 
   var body: some View {

@@ -194,11 +194,19 @@ struct ChatScaffoldView: View {
   }
 
   /// Human, fault-domain-correct message for an engine start/stop error.
+  /// #477: `EngineError.message` is a raw diagnostic — show the shared
+  /// taxonomy's curated line instead and log the raw text here, so the
+  /// in-chat banner never carries launcher/resolver internals.
   static func engineErrorMessage(_ error: Error, verb: String) -> String {
     if let e = error as? EngineError {
-      return "Couldn't \(verb) the engine: \(e.message)"
+      let problem = EngineProblem(statusCode: e.code, rawMessage: e.message)
+      if let detail = problem.technicalDetail {
+        Log.engine.error("ChatScaffoldView: \(verb) engine failed: \(detail, privacy: .public)")
+      }
+      return "Couldn't \(verb) the engine. \(problem.message)"
     }
-    return "Couldn't \(verb) the engine: \(error)"
+    Log.engine.error("ChatScaffoldView: \(verb) engine failed: \(String(describing: error), privacy: .public)")
+    return "Couldn't \(verb) the engine."
   }
 
   /// Message for the in-chat engine-failure banner (PR#15 F2/F3), or nil
