@@ -18,7 +18,9 @@ import SwiftUI
 ///     downloadable) / none (helper-restart or terminal faults);
 ///   · helperUnreachable → the reason + Retry (re-poll);
 ///   · configBroken → the reason + Open Settings;
-///   · needsDefaultLoad / noDefault → the #326 availability action.
+///   · needsLoad / noDefault → the #326 availability action, framed
+///     for the resolved `ModelTarget` (pinned selection vs profile
+///     default — #497).
 ///
 /// The decision is a pure function (`plan(state:action:)`) so the
 /// per-state copy + affordances are unit-tested without a view
@@ -91,7 +93,7 @@ struct NoModelLoadedPrompt: View {
                   showsUnavailableCopy: false, primary: .none,
                   showsOpenSettings: false)
 
-    case .needsDefaultLoad:
+    case let .needsLoad(target):
       // #326 availability action is authoritative for load-vs-download.
       switch action {
       case .load:
@@ -101,11 +103,16 @@ struct NoModelLoadedPrompt: View {
                     showsOpenSettings: false)
       case .download:
         // #446: the body says "isn't downloaded yet" — the headline must
-        // agree. A default IS configured (this is `.needsDefaultLoad`); it
-        // simply isn't on disk. "No model loaded" read as "nothing is set
-        // up". Match the `.engineFailed(.modelMissing)` + `.download`
-        // sibling below so both download entry points say the same thing.
-        return Plan(headline: "Default model isn't downloaded", reason: nil, showsWaitSpinner: false,
+        // agree. A target IS configured (this is `.needsLoad`); it simply
+        // isn't on disk. "No model loaded" read as "nothing is set up".
+        // #497: name the provenance honestly — a pinned selection is
+        // never described as the profile's default. The
+        // `.engineFailed(.modelMissing)` + `.download` sibling below keeps
+        // the default framing (the boot that failed has no target axis).
+        return Plan(headline: target.source == .selected
+                      ? "Selected model isn't downloaded"
+                      : "Default model isn't downloaded",
+                    reason: nil, showsWaitSpinner: false,
                     showsModelChip: false, showsDownloadCTA: true,
                     showsUnavailableCopy: false, primary: .none,
                     showsOpenSettings: false)
@@ -221,13 +228,13 @@ struct NoModelLoadedPrompt: View {
       reasonText(reason)
     }
     if plan.showsModelChip, case let .load(model) = action {
-      Text("Load this profile's default model to send your message?")
+      Text(loadCaption)
         .fixedSize(horizontal: false, vertical: true)
       modelChip(model)
     }
     if plan.showsDownloadCTA, case let .download(target) = action {
       if plan.reason == nil, !plan.showsWaitSpinner {
-        Text("This profile's model isn't downloaded yet. Download it to send your message.")
+        Text(downloadCaption)
           .fixedSize(horizontal: false, vertical: true)
       }
       MissingModelDownloadCTA(target: target, onDownloaded: onDownloaded, engineStatus: engineStatus)
@@ -294,6 +301,25 @@ struct NoModelLoadedPrompt: View {
     case .engineFailed, .helperUnreachable, .configBroken: return .orange
     default:                                                return .secondary
     }
+  }
+
+  /// #497: a pinned selection is never described as "this profile's
+  /// default model" — the gate target's `source` decides the framing.
+  private var isSelectedTarget: Bool {
+    if case let .needsLoad(target) = gateState { return target.source == .selected }
+    return false
+  }
+
+  private var loadCaption: String {
+    isSelectedTarget
+      ? "Load your selected model to send your message?"
+      : "Load this profile's default model to send your message?"
+  }
+
+  private var downloadCaption: String {
+    isSelectedTarget
+      ? "Your selected model isn't downloaded yet. Download it to send your message."
+      : "This profile's model isn't downloaded yet. Download it to send your message."
   }
 
   private var busyDetail: String {

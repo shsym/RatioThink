@@ -12,6 +12,7 @@ final class ChatStartGateTests: XCTestCase {
     engine: EngineStatus = .stopped,
     helperError: String? = nil,
     resolved: String? = nil,
+    selected: String? = nil,
     profileDefault: String? = nil,
     profileError: String? = nil
   ) -> ChatStartGate.State {
@@ -19,9 +20,18 @@ final class ChatStartGateTests: XCTestCase {
       engineStatus: engine,
       helperError: helperError,
       resolvedModelID: resolved,
-      profileDefault: profileDefault,
+      target: ModelTarget.resolve(selectedModelID: selected,
+                                  profileDefault: profileDefault),
       profileError: profileError
     )
+  }
+
+  private func defaultTarget(_ id: String) -> ChatStartGate.State {
+    .needsLoad(target: ModelTarget(modelID: id, source: .profileDefault))
+  }
+
+  private func selectedTarget(_ id: String) -> ChatStartGate.State {
+    .needsLoad(target: ModelTarget(modelID: id, source: .selected))
   }
 
   // MARK: - S0: a model resolves → send proceeds
@@ -37,7 +47,7 @@ final class ChatStartGateTests: XCTestCase {
   func test_resolved_empty_string_is_not_ready() {
     // Defensive: an empty resolved id must not count as a model.
     XCTAssertEqual(eval(engine: .stopped, resolved: "", profileDefault: model),
-                   .needsDefaultLoad(modelID: model))
+                   defaultTarget(model))
   }
 
   // MARK: - S1: engine starting (the reported bug)
@@ -58,7 +68,7 @@ final class ChatStartGateTests: XCTestCase {
 
   func test_S2_stopped_with_default_needs_default_load() {
     XCTAssertEqual(eval(engine: .stopped, profileDefault: model),
-                   .needsDefaultLoad(modelID: model))
+                   defaultTarget(model))
   }
 
   // MARK: - S3 / S5: no default configured
@@ -81,7 +91,7 @@ final class ChatStartGateTests: XCTestCase {
   func test_running_idle_with_default_needs_default_load() {
     XCTAssertEqual(
       eval(engine: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), profileDefault: model),
-      .needsDefaultLoad(modelID: model)
+      defaultTarget(model)
     )
   }
 
@@ -153,6 +163,71 @@ final class ChatStartGateTests: XCTestCase {
       eval(engine: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
            resolved: "resident", profileDefault: model, profileError: "marker unreadable"),
       .ready(modelID: "resident")
+    )
+  }
+
+  // MARK: - #497: the pinned selection rides the target (cross-product)
+
+  func test_497_stopped_with_pin_offers_selected_not_default() {
+    // THE ticket symptom: a pinned selection must never fall back to the
+    // profile default in the stopped-engine prompt.
+    XCTAssertEqual(eval(engine: .stopped, selected: "user/picked.gguf", profileDefault: model),
+                   selectedTarget("user/picked.gguf"))
+  }
+
+  func test_497_stopped_with_pin_and_no_default_offers_selected() {
+    XCTAssertEqual(eval(engine: .stopped, selected: "user/picked.gguf", profileDefault: nil),
+                   selectedTarget("user/picked.gguf"))
+  }
+
+  func test_497_running_with_pin_unresolved_offers_selected() {
+    XCTAssertEqual(
+      eval(engine: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
+           selected: "user/picked.gguf", profileDefault: model),
+      selectedTarget("user/picked.gguf")
+    )
+  }
+
+  func test_497_blank_pin_falls_back_to_default() {
+    XCTAssertEqual(eval(engine: .stopped, selected: "  ", profileDefault: model),
+                   defaultTarget(model))
+  }
+
+  func test_497_no_pin_no_default_is_noDefault() {
+    XCTAssertEqual(eval(engine: .stopped, selected: nil, profileDefault: nil), .noDefault)
+  }
+
+  func test_497_pin_does_not_mask_engine_failure() {
+    XCTAssertEqual(
+      eval(engine: .failed(code: .spawnFailed, message: "ENOENT"),
+           selected: "user/picked.gguf", profileDefault: model),
+      .engineFailed(code: .spawnFailed, reason: "ENOENT")
+    )
+  }
+
+  func test_497_pin_does_not_mask_helper_unreachable() {
+    XCTAssertEqual(
+      eval(engine: .stopped, helperError: "connection invalid",
+           selected: "user/picked.gguf", profileDefault: model),
+      .helperUnreachable(reason: "connection invalid")
+    )
+  }
+
+  func test_497_profile_error_beats_pin() {
+    // Broken config is a structural fault; offering a Load that boots
+    // against an unreadable profile would diverge from the helper.
+    XCTAssertEqual(
+      eval(engine: .stopped, selected: "user/picked.gguf",
+           profileDefault: model, profileError: "marker unreadable"),
+      .configBroken(reason: "marker unreadable")
+    )
+  }
+
+  func test_497_resolved_send_model_still_wins_over_pin_target() {
+    XCTAssertEqual(
+      eval(engine: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
+           resolved: "served", selected: "user/picked.gguf", profileDefault: model),
+      .ready(modelID: "served")
     )
   }
 }

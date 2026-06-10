@@ -34,7 +34,7 @@ func stablePreferenceSuiteName(_ seed: String) -> String {
 /// Stable signal that the no-model send gate (`NoModelLoadedPrompt`) is
 /// raised. Asserts the gate's always-present Cancel control
 /// (`noModel.cancel`), which `NoModelLoadedPrompt.actions(_:)` renders
-/// unconditionally in EVERY gate state (busy / needsDefaultLoad / noDefault /
+/// unconditionally in EVERY gate state (busy / needsLoad / noDefault /
 /// download / engineFailed / …) — so it is the state-independent "gate is up"
 /// marker the engine-free gate tests want.
 ///

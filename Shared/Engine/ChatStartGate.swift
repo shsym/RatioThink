@@ -5,7 +5,8 @@ import Foundation
 /// rendered status indicator: the in-app model-load ring
 /// (`ModelLoadCenter` axis) and the menu-bar engine dot (`EngineStatus`
 /// axis) remain separate surfaces. `ChatStartGate` folds BOTH axes plus
-/// the active profile's default ONLY to decide what a *blocked send*
+/// the resolved `ModelTarget` (the chat's pinned selection, else the
+/// active profile's default — #497) ONLY to decide what a *blocked send*
 /// should tell the user and what action to offer next.
 ///
 /// #397 — removes the state conflation. The prior gate fired off
@@ -44,10 +45,13 @@ public enum ChatStartGate {
     /// Engine or model is busy — show a wait state, gate the send, do
     /// NOT offer a Load/Choose action that would conflict.
     case busy(BusyPhase)
-    /// A default model is configured for the active profile but is not
-    /// loaded yet. Primary action = Load (which first ensures the engine
-    /// is running). Framed benignly: "not loaded yet", never "no model".
-    case needsDefaultLoad(modelID: String)
+    /// A launch target resolves (the chat's pinned selection, else the
+    /// profile's default — `ModelTarget`) but is not loaded yet. Primary
+    /// action = Load (which first ensures the engine is running). Framed
+    /// benignly: "not loaded yet", never "no model". #497: carries the
+    /// full target so the prompt can frame a pinned selection honestly —
+    /// no surface re-derives (and drifts back to) the profile default.
+    case needsLoad(target: ModelTarget)
     /// The active profile has no default model. The only genuine
     /// "choose a model first" case. Offer Choose / Open Models settings.
     case noDefault
@@ -77,15 +81,17 @@ public enum ChatStartGate {
   ///   - resolvedModelID: the send target the app already computes
   ///     (`override ?? resident ?? PIE_TEST_CHAT_MODEL`). Non-nil ⇒ a
   ///     send can proceed and the gate is not shown.
-  ///   - profileDefault: the active profile's default model slug, or nil
-  ///     when the profile carries no default.
+  ///   - target: the launch/load target — the single
+  ///     `ModelTarget.resolve(selectedModelID:profileDefault:)` derivation
+  ///     (#497, the chat's pin else the profile default). Nil when
+  ///     neither exists.
   ///   - profileError: a structural problem with the active-profile
   ///     selection (unreadable marker / unparsable profile), if any.
   public static func evaluate(
     engineStatus: EngineStatus,
     helperError: String?,
     resolvedModelID: String?,
-    profileDefault: String?,
+    target: ModelTarget?,
     profileError: String? = nil
   ) -> State {
     // A resolvable model wins outright — this is the send-proceeds path
@@ -113,22 +119,22 @@ public enum ChatStartGate {
       // the default is on its way — wait, don't offer a redundant Load.
       return .busy(.startingEngine)
     case .running:
-      return defaultOrNo(profileDefault: profileDefault, profileError: profileError)
+      return targetOrNo(target: target, profileError: profileError)
     case .stopped:
-      return defaultOrNo(profileDefault: profileDefault, profileError: profileError)
+      return targetOrNo(target: target, profileError: profileError)
     }
   }
 
   // MARK: - per-engine-state resolution
 
-  /// Shared tail: broken profile config beats a present default beats
-  /// the genuine no-default state.
-  private static func defaultOrNo(profileDefault: String?, profileError: String?) -> State {
+  /// Shared tail: broken profile config beats a resolved target beats
+  /// the genuine no-target state.
+  private static func targetOrNo(target: ModelTarget?, profileError: String?) -> State {
     if let err = profileError, !err.isEmpty {
       return .configBroken(reason: err)
     }
-    if let model = profileDefault, !model.isEmpty {
-      return .needsDefaultLoad(modelID: model)
+    if let target {
+      return .needsLoad(target: target)
     }
     return .noDefault
   }

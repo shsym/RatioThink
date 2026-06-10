@@ -138,7 +138,11 @@ struct ChatScaffoldView: View {
     Self.didEvaluateLaunchStartPrompt = true
     if LaunchEngineStartPrompt.shouldAsk(
         status: engineStatusStore.status,
-        profileDefault: selectedProfileDefault) {
+        // #497: ask about the model the Load tap will BOOT (the chat's pin
+        // when present), not the bare profile default the boot path may
+        // ignore — the same target the gate sheet then names.
+        target: Self.gateTarget(selectedModelID: chats.first?.modelID,
+                                profileDefaultModel: selectedProfileDefault)) {
       showNoModelPrompt = true
     }
   }
@@ -221,7 +225,7 @@ struct ChatScaffoldView: View {
     // same GATE model as the display banner — if the two axes disagree
     // (non-downloadable pick + downloadable default), both banners vanish
     // and modelMissing becomes menu-bar-dot-only.
-    let slug = gateModelID(for: chat)
+    let slug = gateTarget(for: chat)?.modelID
     let hasDownloadTarget = MissingModelRecovery.bannerTarget(
       engineStatus: engineStatusStore.status,
       profileDefaultModel: slug) != nil
@@ -312,7 +316,7 @@ struct ChatScaffoldView: View {
         // Keyed on the GATE model (pick ?? default) like the suppression
         // axis below and the boot path — the banner must never offer a
         // download for a default the Load tap wouldn't boot.
-        profileDefaultModel: gateModelID(for: chat),
+        profileDefaultModel: gateTarget(for: chat)?.modelID,
         sendGatePresented: showNoModelPrompt && noModelAction(for: chat).isDownload
       ) {
         ModelMissingBanner(
@@ -740,9 +744,10 @@ struct ChatScaffoldView: View {
       // state machine is gone (ModelLoadCenter is residency-only).
       resolvedModelID: currentModelID(for: chat),
       // The gate names the model the Load tap will BOOT — the chat's pick
-      // when present (`gateModelID`), not the profile default the boot
-      // path would ignore (#459 repro 1 vs #460's engine-running nil).
-      profileDefault: gateModelID(for: chat),
+      // when present, not the profile default the boot path would ignore
+      // (#459 repro 1 vs #460's engine-running nil). #497: the full
+      // `ModelTarget` (id + source) so the prompt frames a pin honestly.
+      target: gateTarget(for: chat),
       profileError: profileStore.lastActiveProfileError?.description
     )
   }
@@ -762,7 +767,7 @@ struct ChatScaffoldView: View {
   /// completion.) The decision itself stays #326's pure
   /// `MissingModelRecovery.promptAction`.
   private func noModelAction(for chat: Chat) -> MissingModelRecovery.PromptAction {
-    Self.availabilityAction(gateModel: gateModelID(for: chat),
+    Self.availabilityAction(gateModel: gateTarget(for: chat)?.modelID,
                             isModelInstalled: Self.isModelInstalled)
   }
 
@@ -772,7 +777,7 @@ struct ChatScaffoldView: View {
   /// re-reads `isModelInstalled` on every call, which is what keeps the
   /// availability axis live per render. `isModelInstalled` is injected so a
   /// test can drive it; production passes `Self.isModelInstalled`. Keys on
-  /// the GATE model (chat pick ?? profile default, `gateModelID`) so the
+  /// the GATE model (chat pick ?? profile default, `gateTarget`) so the
   /// install check probes the model the Load/Download will actually use.
   static func availabilityAction(gateModel slug: String?,
                                  isModelInstalled: (String) -> Bool)
@@ -785,24 +790,23 @@ struct ChatScaffoldView: View {
   /// The model identity the send GATE describes — mirrors the boot path's
   /// precedence (`startEngineForSelectedProfile` boots
   /// `chats.first?.modelID`, falling back to the profile default), so the
-  /// prompt's chip, download CTA, and Load action all name the model the
-  /// tap will actually boot (#459 repro 1). Distinct from
+  /// prompt's chip, download CTA, Load action, missing-model banner, and
+  /// launch ask all name the model the tap will actually boot (#459 repro
+  /// 1). #497: returns the full `ModelTarget` (id + provenance) so copy
+  /// can frame a pinned selection honestly. Distinct from
   /// `currentModelID(for:)`, which deliberately nils the pick while the
   /// engine isn't `.running` (#460 send-resolution semantics) and so can't
   /// feed the gate's model-identity axis. Pure + static for SPM-free
   /// unit-testing of the precedence.
-  static func gateModelID(selectedModelID: String?,
-                          profileDefaultModel: String?) -> String? {
-    if let pick = selectedModelID,
-       !pick.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-      return pick
-    }
-    return profileDefaultModel
+  static func gateTarget(selectedModelID: String?,
+                         profileDefaultModel: String?) -> ModelTarget? {
+    ModelTarget.resolve(selectedModelID: selectedModelID,
+                        profileDefault: profileDefaultModel)
   }
 
-  private func gateModelID(for chat: Chat) -> String? {
-    Self.gateModelID(selectedModelID: chat.modelID,
-                     profileDefaultModel: selectedProfileDefault)
+  private func gateTarget(for chat: Chat) -> ModelTarget? {
+    Self.gateTarget(selectedModelID: chat.modelID,
+                    profileDefaultModel: selectedProfileDefault)
   }
 
   /// "Load default" action. Honors the no-eager-load invariant — only
