@@ -119,6 +119,8 @@ final class ChatSendCoordinatorTests: XCTestCase {
 
     let engine = ManualCoordinatorChatEngine()
     let coordinator = ChatSendCoordinator()
+    var edges: [Bool] = []
+    coordinator.onAnyInFlightChange = { edges.append($0) }
     let controller = coordinator.controller(for: chat.id)
     send(controller, chat: chat, context: context, engine: engine, model: "m")
     try await waitUntil("request starts") { engine.requests.count == 1 }
@@ -127,6 +129,11 @@ final class ChatSendCoordinatorTests: XCTestCase {
     coordinator.forget(chatID: chat.id)
 
     XCTAssertFalse(coordinator.isInFlight(chat.id))
+    // Review v1 F5: deleting a streaming chat must close the any-in-flight
+    // aggregate so the #413 helper-health gate is released — guarded here
+    // against a future async cancel breaking the cancel→sink ordering.
+    XCTAssertEqual(edges, [true, false],
+                   "forget of the only streaming chat must edge-fire the aggregate closed")
     try await waitUntil("stream torn down") { engine.terminationCount == 1 }
     XCTAssertFalse(coordinator.controller(for: chat.id) === controller,
                    "forget must drop the controller so a deleted chat's id gets a fresh one")

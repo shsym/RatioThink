@@ -70,6 +70,7 @@ python3 Scripts/gui-chat-stream-harness.py \
   --port-file "$URL_FILE" \
   --model-id "$MODEL" \
   --mode hold \
+  --hold-count 2 \
   --hold-token "$HOLD_TOKEN" \
   --reply "$RECOVERY_REPLY" \
   >"$HARNESS_LOG" 2>&1 &

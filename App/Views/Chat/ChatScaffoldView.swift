@@ -364,7 +364,10 @@ struct ChatScaffoldView: View {
             isSending: sendCoordinator.isInFlight(chatID),
             shouldAllowSend: { currentModelID(for: chat) != nil },
             onSendBlocked: { presentNoModelPrompt() },
-            onUserMessageSaved: { _ in sendAssistantTurn(for: chat) }
+            onUserMessageSaved: { _ in sendAssistantTurn(for: chat) },
+            // #507: the composer's stop button — the user-reachable cancel
+            // for this chat's in-flight turn (review v1 F1).
+            onStop: { sendCoordinator.cancel(chatID: chatID) }
           )
         }
         if helperRecoveryState != .hidden {
@@ -473,8 +476,9 @@ struct ChatScaffoldView: View {
       }
     }
     // #507: NO `.onDisappear` cancel — switching chats must not kill the
-    // stream. Cancellation is explicit only: same-chat supersede inside
-    // `ChatSendController.send`, or chat deletion (`forget`).
+    // stream. Cancellation is explicit only: the composer's stop button
+    // (`cancel(chatID:)`) or chat deletion (`forget`); a new send in the
+    // same chat still supersedes inside `ChatSendController.send`.
     .task(id: downloadController.completionTick) {
       await refreshToolbarModelOptions()
     }

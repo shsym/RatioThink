@@ -6,14 +6,16 @@ Serves the two `/v1` endpoints the App's `HTTPEngineClient` consumes — a
 fully controllable timing so a seated GUI test can assert paths a real engine
 cannot reproduce deterministically:
 
-  --mode hold    The FIRST chat request streams a role frame + one content
-                 delta (`--hold-token`) and then HOLDS the connection open
-                 with NO finish frame and NO `[DONE]` sentinel, so the stream
-                 stays in flight until either the client cancels (same-chat
-                 supersede / chat deletion — #507 removed the navigate-away
-                 cancel) or the test releases it via `POST /control/release`,
-                 which finishes the held stream with `--reply` + a `stop`
-                 finish frame. Every SUBSEQUENT request returns a normal,
+  --mode hold    The first `--hold-count` chat requests (default 1) stream a
+                 role frame + one content delta (`--hold-token`) and then
+                 HOLD the connection open with NO finish frame and NO
+                 `[DONE]` sentinel, so the stream stays in flight until
+                 either the client cancels (#507's composer stop button /
+                 chat deletion) or the test releases it via
+                 `POST /control/release`, which finishes ONE held stream
+                 with `--reply` + a `stop` finish frame (the release is
+                 one-shot so a later held request holds again). Every
+                 request past `--hold-count` returns a normal,
                  fully-finished reply (`--reply`).
 
   --mode normal  EVERY chat request returns a normal finished reply
@@ -53,8 +55,10 @@ class State:
         self.args = args
         self.lock = threading.Lock()
         self.chat_count = 0
-        # #507: set by POST /control/release — a held stream finishes with
-        # the normal reply + stop frame instead of waiting for a cancel.
+        # #507: set by POST /control/release — ONE held stream finishes with
+        # the normal reply + stop frame instead of waiting for a cancel
+        # (one-shot: the consuming stream clears it so a later held request
+        # holds again).
         self.release = threading.Event()
 
     def next_request_index(self) -> int:
@@ -96,9 +100,8 @@ class Handler(BaseHTTPRequestHandler):
 
         args = self.server.state.args
         index = self.server.state.next_request_index()
-        is_first = index == 1
 
-        if args.mode == "hold" and is_first:
+        if args.mode == "hold" and index <= args.hold_count:
             self.stream_hold(args.hold_token, args.hold_seconds, args.reply)
         else:
             self.stream_reply(args.reply)
@@ -139,6 +142,7 @@ class Handler(BaseHTTPRequestHandler):
         while time.monotonic() < deadline:
             try:
                 if self.server.state.release.is_set():
+                    self.server.state.release.clear()  # one-shot per held stream
                     self.write_frame({"choices": [{"index": 0, "delta": {"content": reply}, "finish_reason": None}]})
                     self.write_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
                     self.wfile.write(b"data: [DONE]\n\n")
@@ -173,6 +177,8 @@ def main() -> int:
     parser.add_argument("--port-file", required=True)
     parser.add_argument("--model-id", default="gui-stream-deterministic")
     parser.add_argument("--mode", choices=["hold", "normal"], default="normal")
+    parser.add_argument("--hold-count", type=int, default=1,
+                        help="hold mode: number of leading chat requests that hold")
     parser.add_argument("--hold-token", default="PARTIAL-HOLD-381")
     parser.add_argument("--reply", default="Recovered reply after cancel.")
     parser.add_argument("--hold-seconds", type=float, default=60.0)

@@ -17,9 +17,11 @@ import XCTest
 ///      the indicator clears (the stream ran to a normal finish off-screen),
 ///   3. returns to the original chat and asserts the bubble holds the FULL
 ///      reply (partial + released tail persisted via SwiftData — not a
-///      cancelled partial), and
-///   4. sends a fresh turn to prove the composer is live after the
-///      background completion.
+///      cancelled partial),
+///   4. sends a second held turn and cancels it via the composer's STOP
+///      button (#507's user-reachable cancel — review v1 F1), asserting the
+///      partial bubble is kept as a cancelled turn, and
+///   5. sends a final turn to prove the composer recovered after the stop.
 ///
 /// Engine-free of a real model: the mock (`Scripts/gui-chat-stream-harness.py`,
 /// `--mode hold`) makes the mid-stream window deterministic, which a real
@@ -114,12 +116,33 @@ final class S507_StreamContinuityGUITests: XCTestCase {
     XCTAssertTrue(waitForStaticTextContaining(releasedReply, in: app, timeout: 10),
                   "released tail '\(releasedReply)' missing — the backgrounded stream was cancelled instead of finishing; app tree: \(app.debugDescription)")
 
-    // 4) The composer is live after the background completion — a fresh send
-    //    streams a normal reply to completion.
-    typeComposerText("Follow up after the background finish.", in: app)
+    // 4) STOP affordance (review v1 F1): the second send holds too
+    //    (--hold-count 2); mid-stream the composer's trailing control is the
+    //    stop button — click it and the partial bubble must survive as a
+    //    cancelled turn (kept visible, stream torn down, composer back to
+    //    send).
+    typeComposerText("Second held turn to stop.", in: app)
+    sendComposerDraft(in: app)
+    XCTAssertTrue(waitForCountOfStaticTextsContaining(holdToken, in: app, count: 2, timeout: 20),
+                  "second held stream's partial never rendered; app tree: \(app.debugDescription)")
+    let stop = app.buttons["composer.stop"]
+    XCTAssertTrue(stop.waitForExistence(timeout: 5),
+                  "composer.stop missing while a turn streams; app tree: \(app.debugDescription)")
+    stop.click()
+    let sendBack = app.buttons["composer.send"]
+    XCTAssertTrue(sendBack.waitForExistence(timeout: 10),
+                  "composer did not return to send after stop; app tree: \(app.debugDescription)")
+    XCTAssertTrue(waitForCountOfStaticTextsContaining(holdToken, in: app, count: 2, timeout: 5),
+                  "stopped partial bubble was discarded instead of kept as a cancelled turn; app tree: \(app.debugDescription)")
+    XCTAssertTrue(waitUntilGone(rowSpinner, timeout: 10),
+                  "streaming row indicator did not clear after stop; app tree: \(app.debugDescription)")
+
+    // 5) The composer recovered after the stop — a fresh send (request 3,
+    //    past --hold-count) streams a normal reply to completion.
+    typeComposerText("Follow up after the stop.", in: app)
     sendComposerDraft(in: app)
     XCTAssertTrue(waitForCountOfStaticTextsContaining(releasedReply, in: app, count: 2, timeout: 20),
-                  "follow-up reply never rendered; app tree: \(app.debugDescription)")
+                  "follow-up reply never rendered after stop; app tree: \(app.debugDescription)")
   }
 
   // MARK: - helpers

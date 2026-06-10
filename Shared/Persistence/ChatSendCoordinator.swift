@@ -17,8 +17,10 @@ import Foundation
 /// - `inFlightChatIDs` exposes per-chat in-flight state to the sidebar
 ///   (row spinners) and the composer of the selected chat.
 ///
-/// Cancellation is explicit only: user intent (`cancel`/`forget`) or the
-/// same-chat supersede inside the controller — never view teardown.
+/// Cancellation is explicit only — never view teardown: the composer's
+/// stop button (`cancel(chatID:)`), chat deletion (`forget(chatID:)`),
+/// or the same-chat supersede inside the controller when a new turn is
+/// sent to a chat whose previous turn is still streaming.
 @available(macOS 14, *)
 @MainActor
 public final class ChatSendCoordinator: ObservableObject {
@@ -56,7 +58,9 @@ public final class ChatSendCoordinator: ObservableObject {
     inFlightChatIDs.contains(chatID)
   }
 
-  /// Explicit user-intent cancel of one chat's in-flight turn.
+  /// Explicit user-intent cancel of one chat's in-flight turn — wired to
+  /// the composer's stop button. A non-empty partial bubble is kept as a
+  /// cancelled turn (`ChatSendController.cancel` semantics).
   public func cancel(chatID: UUID) {
     controllers[chatID]?.cancel()
   }

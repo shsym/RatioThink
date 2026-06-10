@@ -27,6 +27,11 @@ struct ComposerView: View {
   let shouldAllowSend: () -> Bool
   let onSendBlocked: () -> Void
   let onUserMessageSaved: (Message) -> Void
+  /// #507: user-intent cancel of the selected chat's in-flight turn — the
+  /// composer's trailing button becomes a stop control while `isSending`.
+  /// `ChatSendController.cancel` keeps a non-empty partial bubble as a
+  /// cancelled turn (excluded from future request history).
+  let onStop: () -> Void
   @Environment(\.modelContext) private var modelContext
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
   @State private var draft: String = ""
@@ -105,7 +110,8 @@ struct ComposerView: View {
     isSending: Bool = false,
     shouldAllowSend: @escaping () -> Bool = { true },
     onSendBlocked: @escaping () -> Void = {},
-    onUserMessageSaved: @escaping (Message) -> Void = { _ in }
+    onUserMessageSaved: @escaping (Message) -> Void = { _ in },
+    onStop: @escaping () -> Void = {}
   ) {
     self.chat = chat
     self.viewModel = viewModel
@@ -113,6 +119,7 @@ struct ComposerView: View {
     self.shouldAllowSend = shouldAllowSend
     self.onSendBlocked = onSendBlocked
     self.onUserMessageSaved = onUserMessageSaved
+    self.onStop = onStop
   }
 
   var body: some View {
@@ -144,14 +151,27 @@ struct ComposerView: View {
       .focused($isFocused)
       .accessibilityIdentifier("composer.text")
 
-      Button(action: submit) {
-        Image(systemName: "arrow.up.circle.fill")
-          .font(.system(size: 26, weight: .regular))
+      if isSending {
+        // #507: while this chat's turn streams, the trailing control is a
+        // stop button — the user-reachable cancel (the navigate-away cancel
+        // is gone; switching chats no longer touches the stream).
+        Button(action: onStop) {
+          Image(systemName: "stop.circle.fill")
+            .font(.system(size: 26, weight: .regular))
+        }
+        .buttonStyle(.plain)
+        .help("Stop generating")
+        .accessibilityIdentifier("composer.stop")
+      } else {
+        Button(action: submit) {
+          Image(systemName: "arrow.up.circle.fill")
+            .font(.system(size: 26, weight: .regular))
+        }
+        .buttonStyle(.plain)
+        .disabled(trimmedDraft.isEmpty)
+        .help("Send (Return). Shift+Return inserts a newline.")
+        .accessibilityIdentifier("composer.send")
       }
-      .buttonStyle(.plain)
-      .disabled(trimmedDraft.isEmpty || isSending)
-      .help("Send (Return). Shift+Return inserts a newline.")
-      .accessibilityIdentifier("composer.send")
     }
     .padding(.horizontal, 16)
     .padding(.vertical, 10)
