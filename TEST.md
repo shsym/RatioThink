@@ -47,6 +47,7 @@ below in the same change.
 | `make test-gui` | GUI scenarios (S4, S5, and the rest of `Tests/GUIScenarioTests`) via XCUITest | **seated session** | Local GUI gate via `local-gui-gate` |
 | `make test-gui-history` | Deterministic multi-turn history/resume E2E | **seated session** | Local E2E gate |
 | `make test-gui-stream-cancel` | #507 deterministic stream-continuity E2E (stream survives chat switch + row indicator + background finish) | **seated session** | Local E2E gate |
+| `make test-gui-chat-retry` | #513 deterministic retry-from-a-prior-turn E2E (truncation confirm + regenerate from retained prefix) | **seated session** | Local E2E gate |
 | `make test-gui-load-default` | #381 deterministic no-model → Load-default follow-through E2E | **seated session** | Local E2E gate |
 | `make test-gui-first-launch-package` | Package-backed first-launch E2E (Release `.app`) | **seated session** | Local E2E gate |
 | `make test-e2e-package` | #381-seam packaged first-launch → model download → Load-default → chat (#379) | **seated session** | Local E2E gate |
@@ -94,6 +95,7 @@ that wrapper, not bare `xcodebuild`.
 | `S204_ChatSendGUITests` | chat send/persist | INSTRUCT model answers "Paris" → persists across relaunch | **app+real-engine (real GGUF)** | `test-e2e-full` |
 | `S275_MultiTurnResumeGUITests` | chat send/persist | ordered multi-turn history sent to engine + persisted across relaunch | app+fake-engine (deterministic HTTP) | `test-gui-history` |
 | `S507_StreamContinuityGUITests` | chat send/persist | switch chats mid-stream → stream survives (no cancel), row indicator, background release persists, stop affordance keeps partial; PLUS 5 chats streaming concurrently with per-row indicator count + per-chat reply persistence | app+fake-engine (holding SSE + atomic counting /control/release?n=K) | `test-gui-stream-cancel` |
+| `S513_ChatRetryGUITests` | chat send/persist | earlier-turn retry → "Retry from here?" confirm (Cancel = no-op; Retry erases later conversation + regenerates from retained prefix); latest-turn retry skips confirm, no duplicate assistant turns | app+fake-engine (numbered replies) | `test-gui-chat-retry` |
 | `S381_NoModelLoadDefaultGUITests` | model load/status | no-model gate's **Load default** → engine starts + serves → gate dismisses → send streams a reply | app+fake-engine (start→running stub + mock) | `test-gui-load-default` |
 | `S279_LifecycleRecoveryGUITests` | lifecycle/recovery | unreachable engine → visible recoverable error + composer re-enabled | app+real-engine seam (dead loopback) | `test-gui-chat` |
 | `S285_ZeroStateGUITests` | zero-state | empty-state top-alignment; Start Chat CTA opens a chat; API Endpoints section opens the single live `LocalAPIView` (#422) | mock (stops at composer; no send) | `test-gui-chat` |

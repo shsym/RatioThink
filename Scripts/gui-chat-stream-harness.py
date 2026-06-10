@@ -128,6 +128,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if args.mode == "hold" and index <= args.hold_count:
             self.stream_hold(args.hold_token, args.hold_seconds, args.reply)
+        elif args.number_replies:
+            # #513: distinguishable replies per request, so a retry test can
+            # assert the erased reply is GONE and the regenerated one is NEW
+            # (identical replies would make both assertions vacuous).
+            self.stream_reply(f"{args.reply} [turn {index}]")
         else:
             self.stream_reply(args.reply)
 
@@ -206,6 +211,9 @@ def main() -> int:
     parser.add_argument("--hold-token", default="PARTIAL-HOLD-381")
     parser.add_argument("--reply", default="Recovered reply after cancel.")
     parser.add_argument("--hold-seconds", type=float, default=60.0)
+    parser.add_argument("--number-replies", action="store_true",
+                        help="append ' [turn N]' (request index) to each normal "
+                             "reply so tests can tell regenerated replies apart (#513)")
     args = parser.parse_args()
 
     port_file = Path(args.port_file)
