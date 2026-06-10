@@ -57,11 +57,32 @@ public final class ActiveModelServeExecutor: ObservableObject {
   private let engineStatus: EngineStatusStore
   private let modelLoad: ModelLoadCenter
   private var cancellable: AnyCancellable?
+
+  /// Supersede ordering for everything that can act on the engine after an
+  /// await (review F2). Bumped by every `serve()` entry, every deferred
+  /// re-serve, and `cancelDeferredPick()`. A deferred re-serve captures the
+  /// value at dequeue and re-checks it at its two async boundaries — before
+  /// executing (a newer pick landed while it was scheduled) and before
+  /// reporting its failure (a newer pick landed during the minutes-long
+  /// start budget) — so superseded work is discarded instead of racing the
+  /// newest pick or surfacing a stale "Couldn't load A" over B's outcome.
+  private var generation: UInt64 = 0
+
   private static let log = Logger(subsystem: "com.ratiothink.app", category: "model-serve")
 
   public init(engineStatus: EngineStatusStore, modelLoad: ModelLoadCenter) {
     self.engineStatus = engineStatus
     self.modelLoad = modelLoad
+    // Review F1: an explicit user stop (ChatScaffold Unload / Local API
+    // stop — both funnel through `EngineStatusStore.stopEngine()`) is the
+    // user's NEWEST intent; a pick queued before it must not revive the
+    // engine at the `.stopped` settle. Only the stop call site knows the
+    // ordering — a pick made while a stop is already mirrored `.stopping`
+    // arrives after this hook and stays queued (the intended
+    // pick-during-shutdown case).
+    engineStatus.onExplicitStop = { [weak self] in
+      self?.cancelDeferredPick()
+    }
     // Re-serve the queued pick when the engine settles. `$status` is
     // change-guarded at the store (`setStatusAndTrackStarting`), so this
     // fires per transition, not per poll; the initial-value emission on
@@ -71,11 +92,22 @@ public final class ActiveModelServeExecutor: ObservableObject {
         guard let self else { return }
         guard Self.isSettled(status), let pick = self.deferredPick else { return }
         self.deferredPick = nil
+        let dequeued = self.generation
         Self.log.info("engine settled — serving deferred pick model=\(pick.modelID, privacy: .public) profile=\(pick.profileID, privacy: .public)")
         Task { @MainActor in
+          // Superseded while scheduled (a direct pick or an explicit stop
+          // beat this Task onto the actor) — the newer intent owns the
+          // engine; drop the revival (review F2).
+          guard self.generation == dequeued else { return }
+          self.generation &+= 1
+          let revival = self.generation
           do {
-            try await self.serve(modelID: pick.modelID, profileID: pick.profileID)
+            try await self.execute(modelID: pick.modelID, profileID: pick.profileID)
           } catch {
+            // Superseded mid-flight (the start budget is minutes for a
+            // large model) — the newer pick's outcome owns the error
+            // surface; a stale failure must not overwrite it (review F2).
+            guard self.generation == revival else { return }
             Self.log.error("deferred serve failed model=\(pick.modelID, privacy: .public) profile=\(pick.profileID, privacy: .public): \(String(describing: error), privacy: .public)")
             self.onDeferredServeFailure(pick.modelID, error)
           }
@@ -89,6 +121,27 @@ public final class ActiveModelServeExecutor: ObservableObject {
   /// it via `serveModelError`); a pick against a transitional engine is
   /// queued, not dropped (#488).
   public func serve(modelID: String, profileID: String) async throws {
+    generation &+= 1
+    try await execute(modelID: modelID, profileID: profileID)
+  }
+
+  /// Drop the queued pick and invalidate any scheduled/in-flight deferred
+  /// re-serve (review F1). Wired to `EngineStatusStore.onExplicitStop`: a
+  /// user who stops the engine AFTER picking must get a stopped engine, not
+  /// a relaunch onto the stale pick at the settle.
+  public func cancelDeferredPick() {
+    // Bump unconditionally: a revival dequeued the pick already (queue nil)
+    // but is still scheduled/awaiting — the bump is what discards it.
+    generation &+= 1
+    guard let pick = deferredPick else { return }
+    Self.log.info("explicit stop — dropping deferred pick model=\(pick.modelID, privacy: .public)")
+    deferredPick = nil
+  }
+
+  /// The policy dispatch shared by a direct `serve` and a deferred
+  /// re-serve. Does NOT bump `generation` — each caller owns its bump so a
+  /// re-serve can tell "I am the latest" apart from "I was superseded".
+  private func execute(modelID: String, profileID: String) async throws {
     // The newest pick is the user's intent — it supersedes any queued one,
     // whether this serve executes or re-queues (coalesce-to-latest).
     deferredPick = nil

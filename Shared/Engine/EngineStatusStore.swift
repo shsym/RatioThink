@@ -214,11 +214,22 @@ public final class EngineStatusStore: ObservableObject {
     }
   }
 
+  /// #488 review F1: fired at the entry of `stopEngine()` — the single
+  /// funnel both UI stop paths (ChatScaffold Unload, Local API stop) route
+  /// through — BEFORE the XPC call. `ActiveModelServeExecutor` wires this to
+  /// `cancelDeferredPick()` so an explicit user stop drops any queued model
+  /// pick instead of being reversed by it at the `.stopped` settle. Fired on
+  /// the attempt (not the outcome): the stop is the user's newest intent
+  /// whether or not the helper accepts it. Default no-op (mirrors
+  /// `onPollOutcome`); the executor is the sole production consumer.
+  @MainActor public var onExplicitStop: () -> Void = {}
+
   ///  Unload: ask the helper to stop the running engine, freeing the
   /// resident model's RAM. Throws on rejection / transport failure so
   /// the caller keeps the resident-model state when the stop did not
   /// actually happen. The next status poll reflects the stopped engine.
   public func stopEngine() async throws {
+    onExplicitStop()
     try await client.stopEngine()
   }
 

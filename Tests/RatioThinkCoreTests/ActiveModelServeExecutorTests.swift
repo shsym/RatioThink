@@ -37,14 +37,37 @@ final class ActiveModelServeExecutorTests: XCTestCase {
     func setStartResult(_ result: Result<Void, Error>) {
       lock.withLock { startResult = result }
     }
+
+    /// Review F2 race seam: a start for `gatedModel` suspends (recorded but
+    /// unresolved) until `releaseGate()`, then resolves with `gatedResult` —
+    /// lets a test interleave a newer direct pick while a deferred re-serve
+    /// is mid-flight inside its minutes-long start budget.
+    private var gatedModel: String?
+    private var gateOpen = false
+    private var gatedResult: Result<Void, Error> = .success(())
+    func gateStart(of model: String, result: Result<Void, Error>) {
+      lock.withLock {
+        gatedModel = model
+        gatedResult = result
+      }
+    }
+    func releaseGate() { lock.withLock { gateOpen = true } }
+
     func startEngine(profileID: String, modelOverride: String?) async throws {
-      let result: Result<Void, Error> = lock.withLock {
+      let gated: Bool = lock.withLock {
         startCalls += 1
         lastStartProfileID = profileID
         lastStartModelOverride = modelOverride
-        return startResult
+        return modelOverride != nil && modelOverride == gatedModel
       }
-      try result.get()
+      if gated {
+        while !(lock.withLock { gateOpen }) {
+          try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try lock.withLock { gatedResult }.get()
+        return
+      }
+      try lock.withLock { startResult }.get()
     }
 
     private(set) var restartCalls = 0
@@ -252,6 +275,76 @@ final class ActiveModelServeExecutorTests: XCTestCase {
     XCTAssertEqual(rig.client.restartCalls, 0)
     XCTAssertEqual(rig.executor.deferredPick?.modelID, "m-A.gguf",
                    "a transitional transition must not consume the queue")
+  }
+
+  // MARK: - review F1: explicit stop wins over a queued pick
+
+  func test_explicit_stop_cancels_the_queued_pick() async throws {
+    // Pick lands while the engine is starting; the user then explicitly
+    // stops it (Unload / Local API stop — both funnel through
+    // `EngineStatusStore.stopEngine()`). The stop is the newest intent: the
+    // `.stopped` settle must NOT revive the engine onto the stale pick.
+    let rig = makeRig(initialStatus: .starting)
+    try await rig.executor.serve(modelID: "m-A.gguf", profileID: "chat")
+    XCTAssertNotNil(rig.executor.deferredPick)
+
+    try await rig.store.stopEngine()
+    XCTAssertNil(rig.executor.deferredPick,
+                 "an explicit stop must drop the queued pick immediately")
+
+    rig.store._applyPollForTesting(next: .stopped, error: nil)
+    await settle()
+    XCTAssertEqual(rig.client.startCalls, 0,
+                   "a stopped engine must STAY stopped — the stale pick must not relaunch it")
+    XCTAssertEqual(rig.client.restartCalls, 0)
+  }
+
+  // MARK: - review F2: supersede guards on the deferred re-serve
+
+  func test_newer_pick_supersedes_a_scheduled_deferred_reserve() async throws {
+    // The settle dequeues pick A and schedules its revival Task; a direct
+    // pick B lands on the actor first. A's revival must observe the bump
+    // and discard itself — only B may reach the engine.
+    let rig = makeRig(initialStatus: .stopping)
+    try await rig.executor.serve(modelID: "m-A.gguf", profileID: "chat")
+    XCTAssertNotNil(rig.executor.deferredPick)
+
+    // Sink runs synchronously here: A dequeued, revival Task scheduled.
+    rig.store._applyPollForTesting(next: .stopped, error: nil)
+    // No suspension between the settle and this serve, so B's generation
+    // bump lands before the scheduled revival gets the actor.
+    try await rig.executor.serve(modelID: "m-B.gguf", profileID: "chat")
+    await settle()
+
+    XCTAssertEqual(rig.client.startCalls, 1, "the superseded revival must not start the engine")
+    XCTAssertEqual(rig.client.lastStartModelOverride, "m-B.gguf")
+  }
+
+  func test_stale_deferred_failure_is_discarded_when_superseded_mid_flight() async throws {
+    // A's revived start hangs inside its (minutes-long) budget; the user
+    // picks B, which succeeds. A's late failure must be discarded — a stale
+    // "Couldn't load A" over B's clean outcome is exactly the dishonest
+    // surfacing this ticket removes.
+    let rig = makeRig(initialStatus: .stopping)
+    var reported: String?
+    rig.executor.onDeferredServeFailure = { modelID, _ in reported = modelID }
+    rig.client.gateStart(of: "m-A.gguf",
+                         result: .failure(EngineError(code: .modelMissing, message: "gone")))
+
+    try await rig.executor.serve(modelID: "m-A.gguf", profileID: "chat")
+    rig.store._applyPollForTesting(next: .stopped, error: nil)
+    await waitUntil("A's revived start must be in flight (recorded, gated)") {
+      rig.client.startCalls == 1
+    }
+
+    // Newer direct pick while A is suspended mid-start.
+    try await rig.executor.serve(modelID: "m-B.gguf", profileID: "chat")
+    XCTAssertEqual(rig.client.lastStartModelOverride, "m-B.gguf")
+
+    rig.client.releaseGate()
+    await settle()
+    XCTAssertNil(reported,
+                 "a superseded revival's failure must be discarded — B's outcome owns the surface")
   }
 
   func test_deferred_serve_failure_reports_through_the_sink() async throws {
