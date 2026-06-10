@@ -318,6 +318,56 @@ final class PieSupervisorTests: XCTestCase {
     }
   }
 
+  // MARK: - review v1 F1: stdout source is cancelled on failure paths
+
+  func test_handshakeTimeout_cancelsStdoutSource_noLeak() throws {
+    // A silent engine drives the handshake timer to .failed. Regression
+    // for review v1 F1: the SIGKILLed child's stdout DispatchSource must
+    // be cancelled, not left resumed to busy-spin at EOF on stateQueue.
+    // The `activeStdoutSourceCountForTesting` read hops onto stateQueue,
+    // so it ALSO hangs the test (timeout) if a leaked source were
+    // saturating the queue — a second signal for the same regression.
+    let fake = try writeScript("pie-silent-src.sh", body: """
+      #!/bin/bash
+      sleep 30
+      """)
+    let sup = makeSupervisor(policy: .init(handshakeTimeout: 0.3,
+                                           restartAttempts: 1,
+                                           restartWindow: 30,
+                                           stopGracePeriod: 1,
+                                           stopOverrun: 1,
+                                           stdoutCarryLimit: 64 * 1024))
+    _ = sup.start(makeSpec(binary: fake, profileID: "chat"))
+    let failed = waitFor(sup, predicate: { if case .failed = $0 { return true }; return false },
+                         timeout: 5)
+    XCTAssertNotNil(failed, "silent engine must reach .failed via handshake timeout")
+    XCTAssertEqual(sup.activeStdoutSourceCountForTesting, 0,
+                   "the abandoned incarnation's stdout source must be cancelled, not left spinning")
+  }
+
+  func test_malformedHandshake_cancelsStdoutSource_noLeak() throws {
+    // A printed-but-malformed HTTP_LISTEN kills the engine and fails.
+    // Same review v1 F1 invariant on the malformed-handshake abandon
+    // path: no stdout source may survive resumed.
+    let fake = try writeScript("pie-malformed-src.sh", body: """
+      #!/bin/bash
+      echo "HTTP_LISTEN=not-a-valid-endpoint"
+      sleep 30
+      """)
+    let sup = makeSupervisor(policy: .init(handshakeTimeout: 3,
+                                           restartAttempts: 1,
+                                           restartWindow: 30,
+                                           stopGracePeriod: 1,
+                                           stopOverrun: 1,
+                                           stdoutCarryLimit: 64 * 1024))
+    _ = sup.start(makeSpec(binary: fake, profileID: "chat"))
+    let failed = waitFor(sup, predicate: { if case .failed = $0 { return true }; return false },
+                         timeout: 5)
+    XCTAssertNotNil(failed, "malformed HTTP_LISTEN must reach .failed")
+    XCTAssertEqual(sup.activeStdoutSourceCountForTesting, 0,
+                   "the abandoned incarnation's stdout source must be cancelled, not left spinning")
+  }
+
   // MARK: - F39: post-handshake crash consumes the retry ladder
 
   func test_postHandshakeCrash_retriesPerPolicy() throws {
