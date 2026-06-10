@@ -97,8 +97,13 @@ public final class ActiveModelServeExecutor: ObservableObject {
         Task { @MainActor in
           // Superseded while scheduled (a direct pick or an explicit stop
           // beat this Task onto the actor) — the newer intent owns the
-          // engine; drop the revival (review F2).
-          guard self.generation == dequeued else { return }
+          // engine; drop the revival (review F2). Logged so the "serving
+          // deferred pick" dequeue breadcrumb above is never the last word
+          // on a serve that did not run (review v2 F3).
+          guard self.generation == dequeued else {
+            Self.log.info("deferred re-serve superseded before it ran — discarded model=\(pick.modelID, privacy: .public)")
+            return
+          }
           self.generation &+= 1
           let revival = self.generation
           do {
@@ -107,7 +112,12 @@ public final class ActiveModelServeExecutor: ObservableObject {
             // Superseded mid-flight (the start budget is minutes for a
             // large model) — the newer pick's outcome owns the error
             // surface; a stale failure must not overwrite it (review F2).
-            guard self.generation == revival else { return }
+            // The XPC really executed, so its failure is still a diagnostics
+            // breadcrumb even though the UI must not surface it (review v2 F3).
+            guard self.generation == revival else {
+              Self.log.info("deferred serve failed AFTER being superseded — failure not surfaced model=\(pick.modelID, privacy: .public): \(String(describing: error), privacy: .public)")
+              return
+            }
             Self.log.error("deferred serve failed model=\(pick.modelID, privacy: .public) profile=\(pick.profileID, privacy: .public): \(String(describing: error), privacy: .public)")
             self.onDeferredServeFailure(pick.modelID, error)
           }
@@ -133,7 +143,13 @@ public final class ActiveModelServeExecutor: ObservableObject {
     // Bump unconditionally: a revival dequeued the pick already (queue nil)
     // but is still scheduled/awaiting — the bump is what discards it.
     generation &+= 1
-    guard let pick = deferredPick else { return }
+    guard let pick = deferredPick else {
+      // Most stops land here with nothing in flight; debug-level so the
+      // rare wedged-revival invalidation still leaves a trace (review v2 F3)
+      // without per-stop log noise.
+      Self.log.debug("explicit stop — no queued pick; any in-flight revival invalidated")
+      return
+    }
     Self.log.info("explicit stop — dropping deferred pick model=\(pick.modelID, privacy: .public)")
     deferredPick = nil
   }

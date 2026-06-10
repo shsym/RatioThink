@@ -41,9 +41,14 @@ final class ActiveModelServeExecutorTests: XCTestCase {
     /// Review F2 race seam: a start for `gatedModel` suspends (recorded but
     /// unresolved) until `releaseGate()`, then resolves with `gatedResult` —
     /// lets a test interleave a newer direct pick while a deferred re-serve
-    /// is mid-flight inside its minutes-long start budget.
+    /// is mid-flight inside its minutes-long start budget. `gateResolved`
+    /// flips just before the result is thrown/returned — the happens-before
+    /// signal a test must await after `releaseGate()` so its assertions run
+    /// AFTER the gated start actually resolved (review v2 F1: without it the
+    /// nil-assertion raced the resolution and pinned nothing).
     private var gatedModel: String?
     private var gateOpen = false
+    private(set) var gateResolved = false
     private var gatedResult: Result<Void, Error> = .success(())
     func gateStart(of model: String, result: Result<Void, Error>) {
       lock.withLock {
@@ -61,10 +66,20 @@ final class ActiveModelServeExecutorTests: XCTestCase {
         return modelOverride != nil && modelOverride == gatedModel
       }
       if gated {
+        // Bounded so a test that forgets releaseGate() fails loud, and the
+        // sleep is un-swallowed so cancellation propagates (review v2 F1).
+        let deadline = Date().addingTimeInterval(5)
         while !(lock.withLock { gateOpen }) {
-          try? await Task.sleep(nanoseconds: 10_000_000)
+          if Date() >= deadline {
+            throw EngineError(code: .unknown, message: "test bug: start gate never released")
+          }
+          try await Task.sleep(nanoseconds: 10_000_000)
         }
-        try lock.withLock { gatedResult }.get()
+        let result: Result<Void, Error> = lock.withLock {
+          gateResolved = true
+          return gatedResult
+        }
+        try result.get()
         return
       }
       try lock.withLock { startResult }.get()
@@ -299,6 +314,28 @@ final class ActiveModelServeExecutorTests: XCTestCase {
     XCTAssertEqual(rig.client.restartCalls, 0)
   }
 
+  func test_explicit_stop_invalidates_a_scheduled_revival() async throws {
+    // Review v2 F2: the F1×F2 intersection — the settle already DEQUEUED the
+    // pick (queue nil) and scheduled its revival when the user stops. Only
+    // `cancelDeferredPick`'s unconditional generation bump discards that
+    // scheduled revival; without it the engine relaunches onto the stale
+    // pick despite the stop.
+    let rig = makeRig(initialStatus: .stopping)
+    try await rig.executor.serve(modelID: "m-A.gguf", profileID: "chat")
+
+    // Sink runs synchronously: pick dequeued, revival Task scheduled.
+    rig.store._applyPollForTesting(next: .stopped, error: nil)
+    XCTAssertNil(rig.executor.deferredPick, "revival must have dequeued the pick")
+    // The hook's bump lands synchronously at stopEngine() entry, ahead of
+    // the scheduled revival getting the actor.
+    try await rig.store.stopEngine()
+
+    await settle()
+    XCTAssertEqual(rig.client.startCalls, 0,
+                   "an explicit stop must invalidate the scheduled revival, not just the queue")
+    XCTAssertEqual(rig.client.restartCalls, 0)
+  }
+
   // MARK: - review F2: supersede guards on the deferred re-serve
 
   func test_newer_pick_supersedes_a_scheduled_deferred_reserve() async throws {
@@ -341,10 +378,41 @@ final class ActiveModelServeExecutorTests: XCTestCase {
     try await rig.executor.serve(modelID: "m-B.gguf", profileID: "chat")
     XCTAssertEqual(rig.client.lastStartModelOverride, "m-B.gguf")
 
+    // Review v2 F1: the nil-assertion is meaningful only AFTER the gated
+    // start actually resolved (threw) and the revival's catch had the actor
+    // — without the resolution signal the assert raced the throw and passed
+    // even with the supersede guard deleted.
     rig.client.releaseGate()
+    await waitUntil("the gated start must resolve after release") {
+      rig.client.gateResolved
+    }
     await settle()
     XCTAssertNil(reported,
                  "a superseded revival's failure must be discarded — B's outcome owns the surface")
+  }
+
+  func test_unsuperseded_gated_failure_still_reports_through_the_sink() async throws {
+    // Positive-control twin of the test above (review v2 F1): identical
+    // gated harness, NO superseding pick — the failure MUST surface,
+    // proving the harness can observe a report at all (so the twin's nil
+    // means "discarded", not "never delivered").
+    let rig = makeRig(initialStatus: .stopping)
+    var reported: String?
+    rig.executor.onDeferredServeFailure = { modelID, _ in reported = modelID }
+    rig.client.gateStart(of: "m-A.gguf",
+                         result: .failure(EngineError(code: .modelMissing, message: "gone")))
+
+    try await rig.executor.serve(modelID: "m-A.gguf", profileID: "chat")
+    rig.store._applyPollForTesting(next: .stopped, error: nil)
+    await waitUntil("A's revived start must be in flight (recorded, gated)") {
+      rig.client.startCalls == 1
+    }
+
+    rig.client.releaseGate()
+    await waitUntil("an unsuperseded revival's failure must reach the sink") {
+      reported != nil
+    }
+    XCTAssertEqual(reported, "m-A.gguf")
   }
 
   func test_deferred_serve_failure_reports_through_the_sink() async throws {
