@@ -77,6 +77,13 @@ struct ChatScaffoldView: View {
   /// confirmation. Non-nil presents the alert; Cancel clears it without
   /// touching history.
   @State private var pendingRetryMessageID: UUID?
+  /// #513 review v2 F1: the stale-retry notice, on its OWN channel — it
+  /// must NOT ride `engineActionError`, whose banner hides action errors
+  /// behind `statusDetail` while the engine is `.failed` and whose value
+  /// is cleared on the next engine-status flip. This is a transcript
+  /// condition; its visibility and lifetime are independent of engine
+  /// state (explicit Dismiss, or the auto-clear on the rendered row).
+  @State private var staleRetryNotice: String?
 
   init(
     chatID: UUID,
@@ -380,6 +387,18 @@ struct ChatScaffoldView: View {
       // helper status lives in the window-level `UnifiedStatusBanner` above.
       if let helperBlock {
         HelperUnavailableNotice(reason: helperBlock, onDismiss: { self.helperBlock = nil })
+      }
+      // #513 review v2 F1: stale-retry notice on its own channel and
+      // surface — engine-status changes can neither shadow nor clear it.
+      // `.task(id:)` gives it a bounded lifetime: auto-clears after a few
+      // seconds (cancelled and restarted if a newer notice replaces it),
+      // and Dismiss clears it immediately.
+      if let notice = staleRetryNotice {
+        StaleRetryNotice(message: notice, onDismiss: { staleRetryNotice = nil })
+          .task(id: notice) {
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            if staleRetryNotice == notice { staleRetryNotice = nil }
+          }
       }
       // #496: the chat body is the transcript + composer. It is NEVER covered by
       // a full-bleed helper overlay — that earlier overlay's `maxHeight:.infinity`
@@ -729,7 +748,7 @@ struct ChatScaffoldView: View {
     guard let plan = ChatRetryPlan.plan(messages: chat.messages, retryPointID: messageID) else {
       // Review v1 F1 (lower-stakes sibling): the rendered control was
       // stale — say so instead of a dead click.
-      engineActionError = Self.staleRetryNotice
+      staleRetryNotice = Self.staleRetryNoticeCopy
       return
     }
     if plan.requiresConfirmation {
@@ -741,10 +760,12 @@ struct ChatScaffoldView: View {
 
   /// Review v1 F1: a user who consented to a destructive retry (or clicked
   /// a rendered Retry control) must never get a silent no-op when the
-  /// transcript changed underneath. Surfaced through the existing
-  /// transient `engineActionError` banner (dismissable; cleared on the
-  /// next engine-status flip).
-  static let staleRetryNotice = "Retry no longer applies — the conversation changed."
+  /// transcript changed underneath. Review v2 F1: rendered by the
+  /// dedicated `StaleRetryNotice` row off `staleRetryNotice` state —
+  /// never the engine-failure banner, whose `.failed`-status shadowing
+  /// and status-flip clearing could drop this unread.
+  static let staleRetryNoticeCopy =
+    "Retry no longer applies — the conversation changed or a response is in progress."
 
   /// #513: truncate from the retry point, then resend from the retained
   /// prefix via the normal send path (same model/profile resolution, same
@@ -766,7 +787,7 @@ struct ChatScaffoldView: View {
     case .send:
       sendAssistantTurn(for: chat)
     case .noLongerApplies:
-      engineActionError = Self.staleRetryNotice
+      staleRetryNotice = Self.staleRetryNoticeCopy
     case .saveFailed:
       break
     }
