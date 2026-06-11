@@ -73,6 +73,11 @@ struct ChatScaffoldView: View {
   /// profile switch, navigation away, or a stale resolution. The
   /// transitions live in `PendingSendState` so they are unit-tested.
   @State private var pendingSend = PendingSendState()
+  /// A blocked send may need to restart the single engine onto a different
+  /// model, but doing that while another chat is streaming would interrupt
+  /// that stream. Defer the automatic sync until the app-wide stream set is
+  /// idle; explicit user actions (Stop / Load) remain separate choices.
+  @State private var deferredEngineSyncTask: Task<Void, Never>?
   /// #513: the assistant message id awaiting the destructive-retry
   /// confirmation. Non-nil presents the alert; Cancel clears it without
   /// touching history.
@@ -458,6 +463,7 @@ struct ChatScaffoldView: View {
             // A send committed (manual or fired auto-send) — any armed
             // pending send is now satisfied or superseded. #516.
             pendingSend.disarm()
+            cancelDeferredEngineSync()
             sendAssistantTurn(for: chat)
           },
           // #507: the composer's stop button — the user-reachable cancel
@@ -498,6 +504,7 @@ struct ChatScaffoldView: View {
           // #516: a dismissed gate drops the pending send — the draft stays
           // in the composer, but nothing auto-fires later.
           pendingSend.disarm()
+          cancelDeferredEngineSync()
           showNoModelPrompt = false
         },
         engineStatus: engineStatusStore.status,
@@ -599,6 +606,7 @@ struct ChatScaffoldView: View {
       // #516: a profile switch makes the gate's promised load target stale —
       // drop the pending send rather than auto-firing under a new profile.
       pendingSend.disarm()
+      cancelDeferredEngineSync()
       let previous = chat.profileID
       chat.profileID = new
       do {
@@ -634,6 +642,7 @@ struct ChatScaffoldView: View {
       // #516: navigating away abandons the pending flow — no stale
       // auto-send when the user later returns or switches chats.
       pendingSend.disarm()
+      cancelDeferredEngineSync()
     }
     .task(id: downloadController.completionTick) {
       await refreshToolbarModelOptions()
@@ -741,7 +750,7 @@ struct ChatScaffoldView: View {
         guard (try? await Task.sleep(nanoseconds: 2_000_000_000)) != nil else { break }
         await reconcileEngineResidentModel(for: chat, isRetryPass: true)
       case .fallbackEdge:
-        resolutionEdge(for: chat, requiresResidency: false)
+        terminatePendingSendAfterReconcileFailure(for: chat)
       }
     case .empty:
       // Engine running but serving NO model — clear any stale residency so
@@ -1131,9 +1140,14 @@ struct ChatScaffoldView: View {
   /// and fires only after residency confirms this target.
   private func synchronizeEngineForPendingSend(_ chat: Chat) {
     guard let target = gateTarget(for: chat) else { return }
+    guard pendingSend.pending?.chatID == chat.id else { return }
     guard currentModelID(for: chat) == nil else { return }
     guard case .load = Self.availabilityAction(gateModel: target.modelID,
                                                isModelInstalled: Self.isModelInstalled) else {
+      return
+    }
+    guard !Self.shouldDeferEngineSyncForStreams(sendCoordinator.inFlightChatIDs) else {
+      deferEngineSyncUntilStreamsIdle(for: chat)
       return
     }
     if case .running = engineStatusStore.status,
@@ -1147,6 +1161,30 @@ struct ChatScaffoldView: View {
       return
     }
     loadDefaultModel(target.modelID)
+  }
+
+  static func shouldDeferEngineSyncForStreams(_ inFlightChatIDs: Set<UUID>) -> Bool {
+    !inFlightChatIDs.isEmpty
+  }
+
+  private func deferEngineSyncUntilStreamsIdle(for chat: Chat) {
+    guard deferredEngineSyncTask == nil else { return }
+    deferredEngineSyncTask = Task { @MainActor in
+      defer { deferredEngineSyncTask = nil }
+      while Self.shouldDeferEngineSyncForStreams(sendCoordinator.inFlightChatIDs) {
+        do {
+          try await Task.sleep(nanoseconds: 250_000_000)
+        } catch {
+          return
+        }
+      }
+      synchronizeEngineForPendingSend(chat)
+    }
+  }
+
+  private func cancelDeferredEngineSync() {
+    deferredEngineSyncTask?.cancel()
+    deferredEngineSyncTask = nil
   }
 
   /// #397 F1: re-poll the helper after an unreachable-transport failure.
@@ -1194,6 +1232,23 @@ struct ChatScaffoldView: View {
     return resolvedModelID
   }
 
+  /// The model observation used to settle a pending auto-send. This is
+  /// intentionally wider than the send-safe model: a different resident model
+  /// is not safe to send to, but it is exactly the evidence needed to disarm a
+  /// stale pending send instead of holding forever behind `currentModelID == nil`.
+  static func pendingSettlementModelID(targetModelID: String?,
+                                       residentModelID: String?) -> String? {
+    guard targetModelID?.isEmpty == false else { return nil }
+    if let residentModelID, !residentModelID.isEmpty {
+      return residentModelID
+    }
+    return nil
+  }
+
+  private func terminatePendingSendAfterReconcileFailure(for chat: Chat) {
+    pendingSend.terminate(chatID: chat.id)
+  }
+
   /// #516: a model-resolution edge (residency reconciled, or the chat's
   /// selection re-seeded to the served model). Closes the gate (#397) and
   /// settles any armed pending send: fire it through the composer when the
@@ -1209,12 +1264,14 @@ struct ChatScaffoldView: View {
       resolvedModelID: currentModelID(for: chat),
       residentModelID: modelLoadCenter.residentModelID,
       requiresResidency: requiresResidency)
+    let pendingResolved = Self.pendingSettlementModelID(
+      targetModelID: gateTarget(for: chat)?.modelID,
+      residentModelID: modelLoadCenter.residentModelID)
     // #397: close the gate once a model resolves so the user lands back at
-    // the composer with their draft intact. Review v3 F9: keyed on the SAME
-    // probe result as the verdict below — on a residency-required edge the
-    // sheet must not flash the dismiss-success signal while the fire is
-    // still held pending reconcile (a later disarm/strand would otherwise
-    // read as a silent success).
+    // the composer with their draft intact. Review v3 F9: dismissal stays
+    // keyed on the send-safe probe — on a residency-required edge the sheet
+    // must not flash the dismiss-success signal while pending settlement is
+    // still waiting for resident evidence.
     if showNoModelPrompt, resolved != nil {
       showNoModelPrompt = false
     }
@@ -1222,7 +1279,7 @@ struct ChatScaffoldView: View {
     // re-entrant edges can never double-send), disarm on stale, else hold.
     // The transition bookkeeping lives in `PendingSendState` (tested).
     pendingSend.settle(chatID: chat.id,
-                       resolvedModelID: resolved,
+                       resolvedModelID: pendingResolved,
                        isSending: sendCoordinator.isInFlight(chatID))
   }
 

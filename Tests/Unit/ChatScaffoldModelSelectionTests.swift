@@ -276,14 +276,61 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       ChatScaffoldView.reconcileFailureStep(hasPendingAutoSend: false, isRetryPass: true),
       .none)
 
-    // The fallback edge re-evaluates with the pre-F6 evidence: the chat's
-    // selection authority settles the verdict — fire on the intended model,
-    // disarm on a mismatch — bounded, never an infinite hold.
+    // The final fallback no longer invents a send-safe model from the chat's
+    // selection authority. With no resident evidence after bounded reconcile
+    // failure, the pending flow explicitly terminates instead of silently
+    // holding forever.
     let chatID = UUID()
-    let pending = PendingAutoSend.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")!
-    let fallback = ChatScaffoldView.resolutionProbe(
-      resolvedModelID: "org/A", residentModelID: nil, requiresResidency: false)
-    XCTAssertEqual(pending.verdict(chatID: chatID, resolvedModelID: fallback, isSending: false), .fire)
+    var state = PendingSendState()
+    state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
+    XCTAssertNotNil(state.pending)
+    XCTAssertNil(
+      ChatScaffoldView.pendingSettlementModelID(
+        targetModelID: "org/A", residentModelID: nil))
+    state.terminate(chatID: chatID)
+    XCTAssertNil(state.pending)
+    XCTAssertNil(state.autoSubmit)
+  }
+
+  func test_528_pending_settlement_disarms_on_different_resident_even_when_send_model_is_nil() {
+    let chatID = UUID()
+    var state = PendingSendState()
+    state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
+
+    let sendSafe = ChatScaffoldView.resolutionProbe(
+      resolvedModelID: nil, residentModelID: "org/B", requiresResidency: false)
+    XCTAssertNil(sendSafe, "production currentModelID is nil when target A and resident B differ")
+
+    let settlement = ChatScaffoldView.pendingSettlementModelID(
+      targetModelID: "org/A", residentModelID: "org/B")
+    XCTAssertEqual(settlement, "org/B", "resident B is stale-context evidence for the pending send")
+
+    state.settle(chatID: chatID, resolvedModelID: settlement, isSending: false)
+    XCTAssertNil(state.pending, "different resident must disarm instead of holding forever")
+    XCTAssertNil(state.autoSubmit)
+  }
+
+  func test_528_pending_settlement_fires_only_on_exact_target_resident_match() {
+    let chatID = UUID()
+    var state = PendingSendState()
+    state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
+
+    let settlement = ChatScaffoldView.pendingSettlementModelID(
+      targetModelID: "org/A", residentModelID: "org/A")
+    state.settle(chatID: chatID, resolvedModelID: settlement, isSending: false)
+
+    XCTAssertNil(state.pending)
+    XCTAssertEqual(state.autoSubmit, ComposerAutoSubmit(tick: 1, expectedText: "hi"))
+  }
+
+  func test_528_engine_sync_defers_until_all_chats_are_idle() {
+    let chatB = UUID()
+    XCTAssertTrue(
+      ChatScaffoldView.shouldDeferEngineSyncForStreams([chatB]),
+      "automatic model sync must not restart the single engine while another chat streams")
+    XCTAssertFalse(
+      ChatScaffoldView.shouldDeferEngineSyncForStreams([]),
+      "once the app-wide stream set is idle the deferred sync may run")
   }
 
   // MARK: - #516 review F9: sheet dismissal keys on the probe, not raw resolution

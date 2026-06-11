@@ -34,6 +34,15 @@ struct PendingSendState: Equatable {
     pending = nil
   }
 
+  /// End a pending flow for this chat without sending when the view has
+  /// reached a terminal no-resolution state (for example, bounded resident
+  /// reconciliation failed). This is distinct from `.hold`: callers use it
+  /// only when no later equal-status edge is expected to provide new evidence.
+  mutating func terminate(chatID: UUID) {
+    guard pending?.chatID == chatID else { return }
+    pending = nil
+  }
+
   /// Fold a resolution edge: fire exactly once when the intended model
   /// resolved (pending cleared BEFORE the signal is published), drop on a
   /// stale resolution, keep holding otherwise.
