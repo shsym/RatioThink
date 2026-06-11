@@ -98,6 +98,7 @@ Scripts/genproject.sh
 
 echo "chat-retry gui e2e: engine=$BASE_URL gui PIE_HOME=$GUI_HOME"
 echo "chat-retry gui e2e: running XCUITest"
+set +e
 xcodebuild -project RatioThink.xcodeproj \
   -scheme RatioThinkGUITests \
   -destination 'platform=macOS,arch=arm64' \
@@ -105,5 +106,12 @@ xcodebuild -project RatioThink.xcodeproj \
   test \
   -only-testing:RatioThinkGUITests/S513_ChatRetryGUITests/test_retry_prior_turn_confirms_truncation_and_latest_turn_skips_confirm \
   ENABLE_CODE_COVERAGE=NO
+status=$?
+set -e
+if [ "$status" -ne 0 ]; then
+  echo "chat-retry gui e2e: xcodebuild failed with status $status; harness log: $HARNESS_LOG" >&2
+  cat "$HARNESS_LOG" >&2 || true
+  exit "$status"
+fi
 
 echo "chat-retry gui e2e: PASS"

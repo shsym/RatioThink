@@ -60,6 +60,68 @@ FAKE_PGREP
   fi
 }
 
+test_dumps_harness_log_when_xcodebuild_fails() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  mkdir -p "$tmp/bin"
+  cat >"$tmp/bin/pgrep" <<'FAKE_PGREP'
+#!/bin/bash
+exit 0
+FAKE_PGREP
+  cat >"$tmp/bin/xcodegen" <<'FAKE_XCODEGEN'
+#!/bin/bash
+exit 0
+FAKE_XCODEGEN
+  cat >"$tmp/bin/xcodebuild" <<'FAKE_XCODEBUILD'
+#!/bin/bash
+echo "simulated xcodebuild failure" >&2
+exit 42
+FAKE_XCODEBUILD
+  cat >"$tmp/bin/python3" <<'FAKE_PYTHON3'
+#!/bin/bash
+port_file=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --port-file)
+      port_file="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+echo "retry harness diagnostic before xcodebuild failure"
+printf 'http://127.0.0.1:54321\n' >"$port_file"
+trap 'exit 0' TERM INT
+while true; do sleep 1; done
+FAKE_PYTHON3
+  chmod +x "$tmp/bin/pgrep" "$tmp/bin/xcodegen" "$tmp/bin/xcodebuild" "$tmp/bin/python3"
+
+  set +e
+  local output
+  output="$(
+    PATH="$tmp/bin:$PATH" \
+    PIE_TEST_TCC_GRANTED=1 \
+    PIE_TEST_RUN_ROOT="$tmp/run" \
+    "$SCRIPT" 2>&1
+  )"
+  local status=$?
+  set -e
+
+  if [[ "$status" -ne 42 ]]; then
+    echo "FAIL: expected xcodebuild status 42 to propagate, got $status" >&2
+    echo "--- output ---" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+  require_contains "$output" "simulated xcodebuild failure"
+  require_contains "$output" "retry harness diagnostic before xcodebuild failure"
+}
+
 test_make_target_does_not_inject_tcc_attestation
 test_requires_tcc_before_starting_harness
+test_dumps_harness_log_when_xcodebuild_fails
 echo "test-run-chat-retry-gui-e2e: PASS"
