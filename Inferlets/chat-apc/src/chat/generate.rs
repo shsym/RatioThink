@@ -23,6 +23,7 @@ use inferlet::Context;
 use inferlet::Generator;
 use inferlet::sample::Sampler;
 
+use super::spec::cache::NgramCache;
 use super::spec::{CachebackDrafter, SpecConfig, SpecMetrics};
 
 /// Map request sampling params to an SDK sampler. `temperature == 0`
@@ -66,6 +67,7 @@ pub fn start<'c>(
     stop: &[u32],
     strategy: DecodeStrategy,
     seed_tokens: &[u32],
+    sidecar_cache: Option<Arc<Mutex<NgramCache>>>,
 ) -> GenSession<'c> {
     match strategy {
         DecodeStrategy::Plain => GenSession {
@@ -74,7 +76,10 @@ pub fn start<'c>(
         },
         DecodeStrategy::Speculative(cfg) => {
             let start_cursor = ctx.seq_len() + ctx.buffer().len() as u32;
-            let mut drafter = CachebackDrafter::new(cfg, start_cursor);
+            let mut drafter = match sidecar_cache {
+                Some(cache) => CachebackDrafter::with_cache(cfg, start_cursor, cache),
+                None => CachebackDrafter::new(cfg, start_cursor),
+            };
             drafter.seed(seed_tokens);
             let metrics = Some(drafter.metrics_handle());
             let generator = ctx
@@ -103,9 +108,6 @@ mod tests {
 
     #[test]
     fn positive_temp_resolves_to_topp() {
-        assert!(matches!(
-            resolve_sampler(0.7, 0.9),
-            Sampler::TopP { .. }
-        ));
+        assert!(matches!(resolve_sampler(0.7, 0.9), Sampler::TopP { .. }));
     }
 }

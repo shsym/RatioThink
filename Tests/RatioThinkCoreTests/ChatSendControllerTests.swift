@@ -734,7 +734,8 @@ final class ChatSendControllerTests: XCTestCase {
   private func capturedRequest(
     speculation: Profile.Speculation?,
     responseFormat: ResponseFormat? = nil,
-    sampling: ChatSampling = ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 100)
+    sampling: ChatSampling = ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 100),
+    profileID: String = "fast-think"
   ) async throws -> ChatRequest {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)
@@ -754,6 +755,7 @@ final class ChatSendControllerTests: XCTestCase {
       options: ChatSendRequestOptions(
         modelID: "m",
         sampling: sampling,
+        profileID: profileID,
         speculation: speculation,
         responseFormat: responseFormat
       )
@@ -765,7 +767,12 @@ final class ChatSendControllerTests: XCTestCase {
   func test_send_enabledSpeculation_attaches_field_and_forces_greedy_temp() async throws {
     let req = try await capturedRequest(
       speculation: Profile.Speculation(enabled: true, leaderLen: 2, draftLen: 5))
-    XCTAssertEqual(req.speculation, ChatSpeculation(enabled: true, leaderLen: 2, draftLen: 5))
+    let spec = try XCTUnwrap(req.speculation)
+    XCTAssertEqual(spec.enabled, true)
+    XCTAssertEqual(spec.leaderLen, 2)
+    XCTAssertEqual(spec.draftLen, 5)
+    XCTAssertNotNil(spec.threadID, "enabled speculation must carry the chat id for sidecar reuse")
+    XCTAssertEqual(spec.profileID, "fast-think")
     XCTAssertEqual(req.sampling.temperature, 0, "enabled speculation must force greedy decode")
     XCTAssertEqual(req.sampling.topP, 0.9, "other sampling knobs preserved")
     XCTAssertEqual(req.sampling.maxTokens, 100)

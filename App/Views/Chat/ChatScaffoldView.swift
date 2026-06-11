@@ -912,6 +912,7 @@ struct ChatScaffoldView: View {
       systemPromptOverride: Self.resolvedSystemPrompt(
         profileDefault: profileStore.systemPrompt(forProfileID: viewModel.selectedProfileID),
         transientOverride: viewModel.systemPromptOverride),
+      profileID: viewModel.selectedProfileID,
       // #426: thread the selected profile's Fast Think (speculative-decoding)
       // settings into the request — a Fast Think profile attaches speculation
       // + forces greedy; a normal or tree-of-thought profile carries none.
@@ -965,8 +966,9 @@ struct ChatScaffoldView: View {
       modelLoadCenter: modelLoadCenter,
       persistenceStatus: persistenceStatus,
       // Reuses the `options` built above (now carrying #426 speculation +
-      // #572 response_format), so the normal send and the ToT dispatch
-      // share one options value.
+      // #572 response_format and the selected profile id for Cacheback
+      // sidecar scoping), so the normal send and the ToT dispatch share one
+      // options value.
       options: options,
       // `EngineStatusStore` conforms to `ChatRecoveryGate`; passing it
       // here lets the send pipeline classify a mid-stream

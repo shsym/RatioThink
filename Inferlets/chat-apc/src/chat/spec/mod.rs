@@ -32,6 +32,7 @@
 //! `docs/plans/2026-06-03-cacheback-speculative-decoding.md`.
 
 pub mod cache;
+pub mod sidecar;
 
 use std::sync::{Arc, Mutex};
 
@@ -98,7 +99,7 @@ pub struct SpecMetrics {
 }
 
 pub struct CachebackDrafter {
-    cache: NgramCache,
+    cache: Arc<Mutex<NgramCache>>,
     cfg: SpecConfig,
     /// Last `leader_len` committed tokens — the current leader.
     recent: Vec<u32>,
@@ -121,6 +122,10 @@ pub struct CachebackDrafter {
 impl CachebackDrafter {
     pub fn new(cfg: SpecConfig, start_cursor: u32) -> Self {
         let cache = NgramCache::new(cfg.leader_len, cfg.leader_cap, cfg.follower_cap);
+        Self::with_cache(cfg, start_cursor, Arc::new(Mutex::new(cache)))
+    }
+
+    pub fn with_cache(cfg: SpecConfig, start_cursor: u32, cache: Arc<Mutex<NgramCache>>) -> Self {
         Self {
             cache,
             cfg,
@@ -153,7 +158,7 @@ impl CachebackDrafter {
 
     #[cfg(test)]
     pub fn cache_len(&self) -> usize {
-        self.cache.len()
+        self.cache.lock().unwrap().len()
     }
 
     /// Seed the dynamic table from prompt tokens. Does NOT advance the
@@ -170,7 +175,7 @@ impl CachebackDrafter {
     /// window forward.
     fn ingest(&mut self, t: u32) {
         if self.recent.len() == self.cfg.leader_len {
-            self.cache.record(&self.recent, t);
+            self.cache.lock().unwrap().record(&self.recent, t);
         }
         self.recent.push(t);
         while self.recent.len() > self.cfg.leader_len {
@@ -190,7 +195,7 @@ impl inferlet::Speculator for CachebackDrafter {
         let mut hits = 0usize;
         let mut misses = 0usize;
         for _ in 0..self.cfg.draft_len {
-            match self.cache.get(&leader) {
+            match self.cache.lock().unwrap().get(&leader) {
                 Some(f) => {
                     hits += 1;
                     drafts.push(f);
@@ -255,7 +260,7 @@ impl inferlet::Speculator for CachebackDrafter {
     }
 
     fn reset(&mut self) {
-        self.cache = NgramCache::new(
+        *self.cache.lock().unwrap() = NgramCache::new(
             self.cfg.leader_len,
             self.cfg.leader_cap,
             self.cfg.follower_cap,
@@ -272,6 +277,7 @@ impl inferlet::Speculator for CachebackDrafter {
 mod tests {
     use super::*;
     use inferlet::Speculator;
+    use std::time::Duration;
 
     fn cfg() -> SpecConfig {
         SpecConfig {
@@ -285,7 +291,11 @@ mod tests {
     /// `draft()` -> verify each draft against the model's own sample ->
     /// `accept(accepted)` -> `rollback(rejected)`. Mirrors the SDK's
     /// acceptance walk in `generation.rs::GenStep::execute`.
-    fn step(d: &mut CachebackDrafter, model: &dyn Fn(&[u32]) -> u32, ctx: &mut Vec<u32>) -> Vec<u32> {
+    fn step(
+        d: &mut CachebackDrafter,
+        model: &dyn Fn(&[u32]) -> u32,
+        ctx: &mut Vec<u32>,
+    ) -> Vec<u32> {
         let (drafts, positions) = d.draft();
         assert_eq!(drafts.len(), positions.len());
         let free = model(ctx);
@@ -548,5 +558,139 @@ mod tests {
         assert_eq!(m.accepted, 3); // clamped: min(len - 1 = 4, 3)
         assert_eq!(m.rejected, 0); // 3 - 3, no underflow panic
         assert_eq!(m.proposed, m.accepted + m.rejected);
+    }
+
+    #[test]
+    fn sidecar_reuses_same_thread_when_prior_lineage_is_prefix() {
+        let mut store = sidecar::SidecarStore::new(Duration::from_millis(1_000));
+        let key = sidecar::SidecarKey::new("chat-a", "model-a", Some("fast-think"), 0x10, 1, 3);
+        let first_lineage = sidecar::Lineage::from_turns(&[("system", "sys"), ("user", "u1")]);
+        let first = store.checkout(0, key.clone(), first_lineage.clone());
+        assert_eq!(first.status, sidecar::SidecarStatus::Fresh);
+        first.cache.lock().unwrap().record(&[7], 8);
+
+        let continued = sidecar::Lineage::from_turns(&[
+            ("system", "sys"),
+            ("user", "u1"),
+            ("assistant", "a1"),
+            ("user", "u2"),
+        ]);
+        let second = store.checkout(10, key, continued);
+
+        assert_eq!(second.status, sidecar::SidecarStatus::Reused);
+        assert_eq!(second.cache.lock().unwrap().get(&[7]), Some(8));
+        assert_eq!(second.expired, 0);
+    }
+
+    #[test]
+    fn sidecar_does_not_leak_across_threads() {
+        let mut store = sidecar::SidecarStore::new(Duration::from_millis(1_000));
+        let lineage = sidecar::Lineage::from_turns(&[("user", "same prompt")]);
+        let a = sidecar::SidecarKey::new("chat-a", "model-a", None, 0, 1, 3);
+        let b = sidecar::SidecarKey::new("chat-b", "model-a", None, 0, 1, 3);
+        store
+            .checkout(0, a, lineage.clone())
+            .cache
+            .lock()
+            .unwrap()
+            .record(&[1], 2);
+
+        let checkout = store.checkout(10, b, lineage);
+
+        assert_eq!(checkout.status, sidecar::SidecarStatus::Fresh);
+        assert_eq!(checkout.cache.lock().unwrap().get(&[1]), None);
+    }
+
+    #[test]
+    fn sidecar_invalidates_on_model_profile_or_prefix_fork() {
+        let mut store = sidecar::SidecarStore::new(Duration::from_millis(1_000));
+        let base = sidecar::Lineage::from_turns(&[("system", "sys"), ("user", "u1")]);
+        let key = sidecar::SidecarKey::new("chat-a", "model-a", Some("fast-think"), 0, 1, 3);
+        store
+            .checkout(0, key.clone(), base.clone())
+            .cache
+            .lock()
+            .unwrap()
+            .record(&[1], 2);
+
+        let model_changed =
+            sidecar::SidecarKey::new("chat-a", "model-b", Some("fast-think"), 0, 1, 3);
+        assert_eq!(
+            store.checkout(10, model_changed, base.clone()).status,
+            sidecar::SidecarStatus::Fresh
+        );
+
+        let profile_changed =
+            sidecar::SidecarKey::new("chat-a", "model-a", Some("balanced"), 0, 1, 3);
+        assert_eq!(
+            store.checkout(20, profile_changed, base.clone()).status,
+            sidecar::SidecarStatus::Fresh
+        );
+
+        let forked = sidecar::Lineage::from_turns(&[
+            ("system", "different sys"),
+            ("user", "u1"),
+            ("assistant", "a1"),
+        ]);
+        assert_eq!(
+            store.checkout(30, key, forked).status,
+            sidecar::SidecarStatus::Fresh
+        );
+    }
+
+    #[test]
+    fn sidecar_prunes_expired_entries_deterministically() {
+        let mut store = sidecar::SidecarStore::new(Duration::from_millis(50));
+        let key = sidecar::SidecarKey::new("chat-a", "model-a", None, 0, 1, 3);
+        let lineage = sidecar::Lineage::from_turns(&[("user", "u1")]);
+        store
+            .checkout(0, key.clone(), lineage.clone())
+            .cache
+            .lock()
+            .unwrap()
+            .record(&[1], 2);
+
+        let checkout = store.checkout(51, key, lineage);
+
+        assert_eq!(checkout.status, sidecar::SidecarStatus::Fresh);
+        assert_eq!(checkout.expired, 1);
+        assert_eq!(checkout.cache.lock().unwrap().get(&[1]), None);
+    }
+
+    #[test]
+    fn shared_sidecar_preserves_learned_followers_across_drafters() {
+        let shared = Arc::new(Mutex::new(NgramCache::new(1, 16, 8)));
+        let model = |c: &[u32]| -> u32 {
+            match c.last() {
+                Some(7) => 1,
+                Some(1) => 2,
+                Some(2) => 3,
+                Some(3) => 1,
+                _ => 7,
+            }
+        };
+
+        let mut warm = CachebackDrafter::with_cache(cfg(), 0, Arc::clone(&shared));
+        warm.seed(&[7]);
+        let mut warm_ctx = vec![7];
+        while warm_ctx.len() < 6 {
+            let _ = step(&mut warm, &model, &mut warm_ctx);
+        }
+
+        let mut reused = CachebackDrafter::with_cache(cfg(), 0, Arc::clone(&shared));
+        reused.seed(&[7]);
+        reused.accept(&[1]); // first pure decode step can now draft from leader [1]
+        let (reused_drafts, _) = reused.draft();
+
+        let mut fresh = CachebackDrafter::new(cfg(), 0);
+        fresh.seed(&[7]);
+        fresh.accept(&[1]);
+        let (fresh_drafts, _) = fresh.draft();
+
+        assert_eq!(reused_drafts, vec![2, 3, 1]);
+        assert!(
+            fresh_drafts.is_empty(),
+            "fresh per-request cache should still be cold"
+        );
     }
 }

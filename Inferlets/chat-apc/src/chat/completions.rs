@@ -40,14 +40,15 @@
 //! max-tokens cap, returning a single OpenAI-shape `chat.completion`
 //! JSON 200.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::OnceLock;
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use inferlet::chat;
 use inferlet::Context;
 use inferlet::GrammarConstraint;
+use inferlet::chat;
 use inferlet::inference::SlotOutput;
 use inferlet::model::Model;
 use inferlet::runtime;
@@ -59,6 +60,7 @@ use wstd::http::{IntoBody, Request, Response};
 use super::apc::{ReasoningDecoder, ToolUseDecoder};
 use super::generate::{self, DecodeStrategy};
 use super::prefix_cache::{self, CacheDiag, ReusePlan};
+use super::spec::sidecar::{Lineage, SidecarKey, SidecarStatus, SidecarStore};
 use super::spec::{SpecConfig, SpecMetrics};
 use crate::sse::{self, EmitError, Emitter, SseError};
 
@@ -99,10 +101,7 @@ macro_rules! try_emit {
                 // stderr is discarded on the daemon path, see ).
                 // Disconnected is silent — peer is gone and there's
                 // nothing useful left to do.
-                match $em
-                    .emit_json(&SseError::new("serialize_bug", &msg))
-                    .await
-                {
+                match $em.emit_json(&SseError::new("serialize_bug", &msg)).await {
                     Ok(()) => {}
                     Err(EmitError::Disconnected) => {}
                     Err(EmitError::Serialize(e2)) => {
@@ -150,6 +149,7 @@ const MIN_LEADER_LEN: usize = 1;
 const MAX_LEADER_LEN: usize = 8;
 const MIN_DRAFT_LEN: usize = 1;
 const MAX_DRAFT_LEN: usize = 16;
+const CACHEBACK_SIDECAR_TTL: Duration = Duration::from_secs(30 * 60);
 
 // =============================================================================
 // Request schema
@@ -232,6 +232,13 @@ pub struct SpecRequest {
     pub enabled: bool,
     pub leader_len: Option<usize>,
     pub draft_len: Option<usize>,
+    /// Optional request-thread identity for per-chat Cacheback n-gram
+    /// persistence. Absent keeps the preexisting per-request behavior.
+    pub thread_id: Option<String>,
+    /// Optional profile identity; included in the sidecar key so a
+    /// profile switch with the same model does not reuse incompatible
+    /// learned followers.
+    pub profile_id: Option<String>,
 }
 
 impl SpecRequest {
@@ -455,6 +462,35 @@ struct SpecMetricsReport {
     /// (#591): index `k` = decode steps that committed exactly `k` accepted
     /// draft tokens (index 0 = free pick only — cold or fully-rejected step).
     accepted_prefix_len_histogram: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ngram_sidecar_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ngram_sidecar_leaders: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ngram_sidecars_expired: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidecarMetricStatus {
+    Fresh,
+    Reused,
+}
+
+impl SidecarMetricStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            SidecarMetricStatus::Fresh => "fresh",
+            SidecarMetricStatus::Reused => "reused",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SidecarMetrics {
+    status: SidecarMetricStatus,
+    ngram_leaders: usize,
+    expired: usize,
+>>>>>>> 97eeb55 (Persist Cacheback sidecars per chat thread)
 }
 
 #[derive(Serialize)]
@@ -489,6 +525,7 @@ impl SpecMetricsReport {
         generated_tokens: usize,
         decode_steps: usize,
         elapsed: Duration,
+        sidecar: Option<SidecarMetrics>,
     ) -> Self {
         let secs = elapsed.as_secs_f64();
         let cache_lookups = spec.cache_hits + spec.cache_misses;
@@ -521,6 +558,9 @@ impl SpecMetricsReport {
             },
             cache_size: spec.cache_size,
             accepted_prefix_len_histogram: spec.accepted_prefix_hist,
+            ngram_sidecar_status: sidecar.map(|s| s.status.as_str()),
+            ngram_sidecar_leaders: sidecar.map(|s| s.ngram_leaders),
+            ngram_sidecars_expired: sidecar.map(|s| s.expired),
         }
     }
 
@@ -533,7 +573,8 @@ impl SpecMetricsReport {
             "SPEC_STATS enabled={} fallback={} generated_tokens={} decode_steps={} \
              proposed={} accepted={} rejected={} avg_tokens_per_step={:.3} \
              decode_tokens_per_sec={:.2} cache_hits={} cache_misses={} \
-             cache_hit_rate={:.3} cache_size={} prefix_hist={:?}",
+             cache_hit_rate={:.3} cache_size={} prefix_hist={:?} \
+             sidecar={} sidecar_leaders={} sidecars_expired={}",
             self.enabled,
             self.fallback_reason.unwrap_or("none"),
             self.generated_tokens,
@@ -548,6 +589,9 @@ impl SpecMetricsReport {
             self.cache_hit_rate,
             self.cache_size,
             self.accepted_prefix_len_histogram,
+            self.ngram_sidecar_status.unwrap_or("none"),
+            self.ngram_sidecar_leaders.unwrap_or(0),
+            self.ngram_sidecars_expired.unwrap_or(0),
         );
     }
 }
@@ -598,9 +642,12 @@ fn plan_strategy(
             let dims = (cfg.leader_len, cfg.draft_len);
             (DecodeStrategy::Speculative(cfg), None, true, dims)
         }
-        Some(s) if s.enabled => {
-            (DecodeStrategy::Plain, Some("non_greedy_sampling"), true, (0, 0))
-        }
+        Some(s) if s.enabled => (
+            DecodeStrategy::Plain,
+            Some("non_greedy_sampling"),
+            true,
+            (0, 0),
+        ),
         Some(_) => (DecodeStrategy::Plain, Some("disabled"), true, (0, 0)),
     }
 }
@@ -974,6 +1021,75 @@ fn json_pure_failure_status(code: &str) -> u16 {
     }
 }
 
+fn cacheback_sidecars() -> &'static Mutex<SidecarStore> {
+    static STORE: OnceLock<Mutex<SidecarStore>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(SidecarStore::new(CACHEBACK_SIDECAR_TTL)))
+}
+
+fn tools_digest(tools: Option<&[ToolSchema]>) -> u64 {
+    let envelopes = tools.map(|t| tool_envelopes(t, None)).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    envelopes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn lineage_from(messages: &[ChatMessage]) -> Lineage {
+    let turns = messages
+        .iter()
+        .map(|m| (m.role.as_str(), m.content.as_str()))
+        .collect::<Vec<_>>();
+    Lineage::from_turns(&turns)
+}
+
+fn sidecar_for_request(
+    model: &str,
+    tools: Option<&[ToolSchema]>,
+    messages: &[ChatMessage],
+    spec: Option<&SpecRequest>,
+    cfg: &SpecConfig,
+) -> (
+    Option<Arc<Mutex<super::spec::cache::NgramCache>>>,
+    Option<SidecarMetrics>,
+) {
+    let Some(spec) = spec.filter(|s| s.enabled) else {
+        return (None, None);
+    };
+    let Some(thread_id) = spec
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return (None, None);
+    };
+    let key = SidecarKey::new(
+        thread_id,
+        model,
+        spec.profile_id.as_deref(),
+        tools_digest(tools),
+        cfg.leader_len,
+        cfg.draft_len,
+    );
+    let lineage = lineage_from(messages);
+    let checkout = cacheback_sidecars().lock().unwrap().checkout(
+        monotonic_nanos_since_anchor() / 1_000_000,
+        key,
+        lineage,
+    );
+    let status = match checkout.status {
+        SidecarStatus::Fresh => SidecarMetricStatus::Fresh,
+        SidecarStatus::Reused => SidecarMetricStatus::Reused,
+    };
+    (
+        Some(checkout.cache),
+        Some(SidecarMetrics {
+            status,
+            ngram_leaders: checkout.ngram_leaders,
+            expired: checkout.expired,
+        }),
+    )
+}
+
 #[derive(Serialize)]
 struct NonStreamWarning<'a> {
     code: &'a str,
@@ -1238,8 +1354,7 @@ fn forward_pass_starved(slots: &[SlotOutput]) -> bool {
 /// branch on the starvation case distinctly from a generic
 /// `forward_pass_failed`.
 const STARVED_CODE: &str = "forward_pass_starved";
-const STARVED_MESSAGE: &str =
-    "engine produced no tokens for a decode step (device failure, per-batch \
+const STARVED_MESSAGE: &str = "engine produced no tokens for a decode step (device failure, per-batch \
      timeout, or KV eviction); generation cannot continue";
 
 // =============================================================================
@@ -1420,7 +1535,10 @@ fn compute_launch_diags() -> Vec<LaunchDiag> {
              for this and all subsequent requests (one-shot)"
         );
         eprintln!("[chat-apc] {msg}");
-        diags.push(LaunchDiag { code: CODE_CLOCK_SKEW, message: msg });
+        diags.push(LaunchDiag {
+            code: CODE_CLOCK_SKEW,
+            message: msg,
+        });
     }
     init_seed_into(&mut diags);
     diags
@@ -1713,12 +1831,7 @@ fn build_launch_diags_payload(diags: &[LaunchDiag]) -> String {
         // conclude no budget drops occurred — when in truth no
         // budget check ran at all.
         Err(_) => {
-            return fallback_serialize_failed_payload(
-                Some(diags.len()),
-                None,
-                None,
-                None,
-            );
+            return fallback_serialize_failed_payload(Some(diags.len()), None, None, None);
         }
     };
     // Q3: partition dropped entries by REASON so operators can tell
@@ -1985,9 +2098,7 @@ fn with_launch_diags_header<B>(mut resp: Response<B>) -> Response<B> {
                      X-ChatAPC-Launch-Diags-Error sentinel. One-shot log."
                 );
             }
-            if let Ok(sentinel) =
-                wstd::http::HeaderValue::from_str("encoding_failed")
-            {
+            if let Ok(sentinel) = wstd::http::HeaderValue::from_str("encoding_failed") {
                 resp.headers_mut()
                     .insert("X-ChatAPC-Launch-Diags-Error", sentinel);
             }
@@ -2044,9 +2155,7 @@ fn init_seed_into(diags: &mut Vec<LaunchDiag>) {
     if SEED.load(Ordering::Relaxed) != 0 {
         return;
     }
-    let candidate = match std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-    {
+    let candidate = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_nanos() as u64,
         Err(e) => {
             // Mix wasi entropy + the SEED static's address. The
@@ -2124,8 +2233,7 @@ fn init_seed_into(diags: &mut Vec<LaunchDiag>) {
                     }
                 }
                 const BUILD_NONCE: u64 = 0x6368_6174_6170_6300; // "chatapc\0"
-                let mixed = skew_nanos
-                    .rotate_left(17)
+                let mixed = skew_nanos.rotate_left(17)
                     ^ addr.rotate_left(13)
                     ^ mono_nanos.rotate_left(31)
                     ^ BUILD_NONCE;
@@ -2138,7 +2246,10 @@ fn init_seed_into(diags: &mut Vec<LaunchDiag>) {
                      wasi:random host configuration."
                 );
                 eprintln!("[chat-apc] {msg}");
-                diags.push(LaunchDiag { code: CODE_ENTROPY_DEGRADED, message: msg });
+                diags.push(LaunchDiag {
+                    code: CODE_ENTROPY_DEGRADED,
+                    message: msg,
+                });
                 mixed
             } else {
                 let entropy = u64::from_le_bytes(buf);
@@ -2844,7 +2955,9 @@ fn validate_sampling(
             if !(MIN_LEADER_LEN..=MAX_LEADER_LEN).contains(&n) {
                 return Err((
                     "speculation.leader_len",
-                    format!("speculation.leader_len must be in [{MIN_LEADER_LEN}, {MAX_LEADER_LEN}]"),
+                    format!(
+                        "speculation.leader_len must be in [{MIN_LEADER_LEN}, {MAX_LEADER_LEN}]"
+                    ),
                 ));
             }
         }
@@ -3028,7 +3141,9 @@ async fn handle_streaming(
         Ok(c) => c,
         Err((status, code, msg)) => {
             return res
-                .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
+                .respond(with_launch_diags_header(sse::json_error(
+                    status, code, &msg,
+                )))
                 .await;
         }
     };
@@ -3234,6 +3349,16 @@ async fn handle_streaming(
     }
 
     let spec_enabled = matches!(strategy, DecodeStrategy::Speculative(_));
+    let (sidecar_cache, sidecar_metrics) = match &strategy {
+        DecodeStrategy::Speculative(cfg) => sidecar_for_request(
+            &req.model,
+            req.tools.as_deref(),
+            &req.messages,
+            req.speculation.as_ref(),
+            cfg,
+        ),
+        DecodeStrategy::Plain => (None, None),
+    };
     let sampler = generate::resolve_sampler(temperature, top_p);
     let seed_tokens = if spec_enabled {
         seed_tokens_from(&model, &req.messages)
@@ -3243,7 +3368,15 @@ async fn handle_streaming(
     let generate::GenSession {
         generator: mut stream,
         metrics: spec_metrics_handle,
-    } = generate::start(&mut ctx, sampler, max_tokens, &stop_tokens, strategy, &seed_tokens);
+    } = generate::start(
+        &mut ctx,
+        sampler,
+        max_tokens,
+        &stop_tokens,
+        strategy,
+        &seed_tokens,
+        sidecar_cache,
+    );
     // tool_choice enforcement (from main): constrain to the tool-call
     // grammar when a call is forced. Speculation is gated off in that
     // case (`forced_tool` above), so this only ever applies to the plain
@@ -3321,7 +3454,10 @@ async fn handle_streaming(
         // `missing_finish_reason` fallback), and so the loop never issues the
         // empty-input forward pass that hangs the Metal driver.
         if forward_pass_starved(&out.raw().slots) {
-            break (Outcome::Aborted, Some((STARVED_CODE, STARVED_MESSAGE.to_string())));
+            break (
+                Outcome::Aborted,
+                Some((STARVED_CODE, STARVED_MESSAGE.to_string())),
+            );
         }
         // #418: per-step decode accounting (one forward pass; `out.tokens`
         // is a burst of 1 free pick + accepted drafts under speculation).
@@ -3367,7 +3503,12 @@ async fn handle_streaming(
             Ok(inferlet::reasoning::Event::Idle) => {
                 reason_idle = true;
             }
-            Err(e) => break (Outcome::Aborted, Some(("reasoning_decode_failed", e.to_string()))),
+            Err(e) => {
+                break (
+                    Outcome::Aborted,
+                    Some(("reasoning_decode_failed", e.to_string())),
+                );
+            }
         }
 
         // Tool-use side: a completed `Call(name, args)` terminates
@@ -3409,7 +3550,9 @@ async fn handle_streaming(
             // `tool_calls` delta (OpenAI emits content:null alongside
             // tool_calls). Composes with the reasoning content gate; the
             // suppressed deltas fall through to the no-op arm below.
-            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) && !forced_tool => {
+            Ok(chat::Event::Delta(s))
+                if content_visible(reason_idle, was_in_reasoning) && !forced_tool =>
+            {
                 // #522: mirror the visible text the App persists, so the
                 // save gate can compare it against the generated tokens.
                 full_text.push_str(&s);
@@ -3445,7 +3588,10 @@ async fn handle_streaming(
             Ok(chat::Event::Interrupt(id)) => {
                 break (
                     Outcome::Aborted,
-                    Some(("chat_template_interrupt", format!("control token {id} from chat template")))
+                    Some((
+                        "chat_template_interrupt",
+                        format!("control token {id} from chat template"),
+                    )),
                 );
             }
             Ok(chat::Event::Idle) => continue,
@@ -3531,8 +3677,8 @@ async fn handle_streaming(
         let (distinct, overflow) = diag.dedup_counts();
         // N3: ship raw counts as structured fields so consumers don't
         // string-parse the rendered "(capped, total >= N)" tail.
-        let frame = SseError::new("tool_decode_disabled", &rendered)
-            .with_dedup_counts(distinct, overflow);
+        let frame =
+            SseError::new("tool_decode_disabled", &rendered).with_dedup_counts(distinct, overflow);
         match em.emit_json(&frame).await {
             Ok(()) => {}
             // H4: the warning meta-frame sits BETWEEN the terminal
@@ -3586,6 +3732,7 @@ async fn handle_streaming(
             spec_generated,
             spec_steps,
             spec_start.elapsed(),
+            sidecar_metrics,
         );
         report.log_spec_stats();
         let frame = SpecMetricsSse {
@@ -3711,7 +3858,9 @@ async fn handle_non_streaming(
         Ok(c) => c,
         Err((status, code, msg)) => {
             return res
-                .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
+                .respond(with_launch_diags_header(sse::json_error(
+                    status, code, &msg,
+                )))
                 .await;
         }
     };
@@ -3880,6 +4029,16 @@ async fn handle_non_streaming(
     }
 
     let spec_enabled = matches!(strategy, DecodeStrategy::Speculative(_));
+    let (sidecar_cache, sidecar_metrics) = match &strategy {
+        DecodeStrategy::Speculative(cfg) => sidecar_for_request(
+            &req.model,
+            req.tools.as_deref(),
+            &req.messages,
+            req.speculation.as_ref(),
+            cfg,
+        ),
+        DecodeStrategy::Plain => (None, None),
+    };
     let sampler = generate::resolve_sampler(temperature, top_p);
     let seed_tokens = if spec_enabled {
         seed_tokens_from(&model, &req.messages)
@@ -3889,7 +4048,15 @@ async fn handle_non_streaming(
     let generate::GenSession {
         generator: mut stream,
         metrics: spec_metrics_handle,
-    } = generate::start(&mut ctx, sampler, max_tokens, &stop_tokens, strategy, &seed_tokens);
+    } = generate::start(
+        &mut ctx,
+        sampler,
+        max_tokens,
+        &stop_tokens,
+        strategy,
+        &seed_tokens,
+        sidecar_cache,
+    );
     // tool_choice enforcement (from main); spec is gated off when forced,
     // so this only applies to the plain generator.
     if let Some(c) = tool_constraint {
@@ -3956,7 +4123,10 @@ async fn handle_non_streaming(
         // `missing_finish_reason` fallback), and so the loop never issues the
         // empty-input forward pass that hangs the Metal driver.
         if forward_pass_starved(&out.raw().slots) {
-            break (Outcome::Aborted, Some((STARVED_CODE, STARVED_MESSAGE.to_string())));
+            break (
+                Outcome::Aborted,
+                Some((STARVED_CODE, STARVED_MESSAGE.to_string())),
+            );
         }
         // #418: per-step decode accounting (one forward pass; `out.tokens`
         // is a burst of 1 free pick + accepted drafts under speculation).
@@ -3988,7 +4158,12 @@ async fn handle_non_streaming(
             Ok(inferlet::reasoning::Event::Idle) => {
                 reason_idle = true;
             }
-            Err(e) => break (Outcome::Aborted, Some(("reasoning_decode_failed", e.to_string()))),
+            Err(e) => {
+                break (
+                    Outcome::Aborted,
+                    Some(("reasoning_decode_failed", e.to_string())),
+                );
+            }
         }
 
         if tool_dec_active {
@@ -4020,7 +4195,9 @@ async fn handle_non_streaming(
         match decoder.feed(&out.tokens) {
             // Forced tool_choice suppresses visible content (see
             // handle_streaming) — the call surfaces only via tool_calls.
-            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) && !forced_tool => {
+            Ok(chat::Event::Delta(s))
+                if content_visible(reason_idle, was_in_reasoning) && !forced_tool =>
+            {
                 full_text.push_str(&s)
             }
             Ok(chat::Event::Delta(_)) => {}
@@ -4152,7 +4329,10 @@ async fn handle_non_streaming(
         Some(
             diag_snapshot
                 .iter()
-                .map(|d| NonStreamWarning { code: d.code, message: d.message.as_str() })
+                .map(|d| NonStreamWarning {
+                    code: d.code,
+                    message: d.message.as_str(),
+                })
                 .collect(),
         )
     };
@@ -4170,6 +4350,7 @@ async fn handle_non_streaming(
             spec_generated,
             spec_steps,
             spec_start.elapsed(),
+            sidecar_metrics,
         );
         report.log_spec_stats();
         Some(report)
@@ -4266,7 +4447,9 @@ enum ForcedToolChoice {
 /// (parsed-but-ignored) rather than erroring — matches the lenient
 /// `#[serde(default)]` posture on the field.
 fn forced_tool_choice(tc: Option<&serde_json::Value>) -> ForcedToolChoice {
-    let Some(v) = tc else { return ForcedToolChoice::No };
+    let Some(v) = tc else {
+        return ForcedToolChoice::No;
+    };
     if let Some(s) = v.as_str() {
         return if s == "required" {
             ForcedToolChoice::Any
@@ -4336,9 +4519,9 @@ fn build_forced_tool_constraint(
             400,
             "invalid_request",
             match &only {
-                Some(n) => format!(
-                    "tool_choice names function '{n}' but it is not present in tools[]"
-                ),
+                Some(n) => {
+                    format!("tool_choice names function '{n}' but it is not present in tools[]")
+                }
                 None => "tool_choice is \"required\" but tools[] is empty".to_string(),
             },
         ));
@@ -4734,14 +4917,20 @@ mod tests {
     #[test]
     fn not_starved_when_a_token_was_sampled() {
         assert!(!forward_pass_starved(&[SlotOutput::Token(5)]));
-        assert!(!forward_pass_starved(&[SlotOutput::Token(5), SlotOutput::Token(6)]));
+        assert!(!forward_pass_starved(&[
+            SlotOutput::Token(5),
+            SlotOutput::Token(6)
+        ]));
     }
 
     #[test]
     fn not_starved_when_token_leads_non_token_slots() {
         // A decode step with the auto-sampler at slot 0 plus probe slots:
         // the leading Token means the engine produced a pick.
-        assert!(!forward_pass_starved(&[SlotOutput::Token(5), SlotOutput::Entropy(0.5)]));
+        assert!(!forward_pass_starved(&[
+            SlotOutput::Token(5),
+            SlotOutput::Entropy(0.5)
+        ]));
     }
 
     #[test]
@@ -4793,10 +4982,10 @@ mod tests {
     /// the chat decoder's text for the same token batch. Models what the
     /// host decoders return without the wasm host.
     enum Step {
-        ThinkStart(&'static str),  // reasoning Start; chat surfaces the `<think>` text
-        Reason(&'static str),      // reasoning Delta; chat surfaces the same text
-        ThinkEnd(&'static str),    // reasoning End/Complete; chat surfaces the `</think>` text
-        Content(&'static str),     // reasoning Idle (outside); chat surfaces visible content
+        ThinkStart(&'static str), // reasoning Start; chat surfaces the `<think>` text
+        Reason(&'static str),     // reasoning Delta; chat surfaces the same text
+        ThinkEnd(&'static str),   // reasoning End/Complete; chat surfaces the `</think>` text
+        Content(&'static str),    // reasoning Idle (outside); chat surfaces visible content
     }
 
     /// Replays the generation loop's reasoning/content demux exactly as
@@ -4849,8 +5038,14 @@ mod tests {
         assert_eq!(content, "Hello!", "only the answer reaches visible content");
         assert_eq!(reasoning, "the user said hi");
         // The specific symptom: the CLOSING tag must not leak.
-        assert!(!content.contains("</think>"), "closing delimiter leaked: {content:?}");
-        assert!(!content.contains("<think>"), "opening delimiter leaked: {content:?}");
+        assert!(
+            !content.contains("</think>"),
+            "closing delimiter leaked: {content:?}"
+        );
+        assert!(
+            !content.contains("<think>"),
+            "opening delimiter leaked: {content:?}"
+        );
     }
 
     #[test]
@@ -4869,10 +5064,7 @@ mod tests {
     fn non_thinking_model_passes_all_content() {
         // NoopReasoningDecoder always reports Idle and never flips the
         // gate — every batch is visible content.
-        let (content, reasoning) = demux(&[
-            Step::Content("Plain "),
-            Step::Content("answer."),
-        ]);
+        let (content, reasoning) = demux(&[Step::Content("Plain "), Step::Content("answer.")]);
         assert_eq!(content, "Plain answer.");
         assert!(reasoning.is_empty());
     }
@@ -4892,11 +5084,53 @@ mod tests {
     }
 
     #[test]
-    fn absent_speculation_is_none() {
+    fn speculation_parses_optional_sidecar_identity() {
         let r: ChatCompletionsRequest = serde_json::from_str(
-            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "temperature":0,
+                "speculation":{"enabled":true,
+                               "thread_id":"chat-1",
+                               "profile_id":"fast-think"}}"#,
         )
         .unwrap();
+        let s = r.speculation.expect("speculation present");
+        assert_eq!(s.thread_id.as_deref(), Some("chat-1"));
+        assert_eq!(s.profile_id.as_deref(), Some("fast-think"));
+    }
+
+    #[test]
+    fn spec_metrics_reports_sidecar_reuse_state() {
+        let report = SpecMetricsReport::build(
+            true,
+            None,
+            (1, 3),
+            SpecMetrics {
+                proposed: 6,
+                accepted: 4,
+                rejected: 2,
+                steps: 2,
+                generated: 6,
+            },
+            6,
+            2,
+            Duration::from_secs(1),
+            Some(SidecarMetrics {
+                status: SidecarMetricStatus::Reused,
+                ngram_leaders: 42,
+                expired: 1,
+            }),
+        );
+        let json = serde_json::to_value(&report).expect("metrics serialize");
+        assert_eq!(json["ngram_sidecar_status"], "reused");
+        assert_eq!(json["ngram_sidecar_leaders"], 42);
+        assert_eq!(json["ngram_sidecars_expired"], 1);
+    }
+
+    #[test]
+    fn absent_speculation_is_none() {
+        let r: ChatCompletionsRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+                .unwrap();
         assert!(r.speculation.is_none());
     }
 
@@ -5386,7 +5620,13 @@ mod tests {
     #[test]
     fn plan_strategy_gates_on_greedy_and_enabled() {
         // requested + greedy + no forced tool + no json -> speculative, no fallback
-        let s = SpecRequest { enabled: true, leader_len: None, draft_len: None };
+        let s = SpecRequest {
+            enabled: true,
+            leader_len: None,
+            draft_len: None,
+            thread_id: None,
+            profile_id: None,
+        };
         let (st, fb, want, _) = plan_strategy(Some(&s), true, false, false);
         assert!(matches!(st, DecodeStrategy::Speculative(_)));
         assert!(fb.is_none());
@@ -5403,7 +5643,13 @@ mod tests {
         assert_eq!(fb, Some("tool_choice_forced"));
         assert!(want);
         // enabled:false -> plain, disabled
-        let off = SpecRequest { enabled: false, leader_len: None, draft_len: None };
+        let off = SpecRequest {
+            enabled: false,
+            leader_len: None,
+            draft_len: None,
+            thread_id: None,
+            profile_id: None,
+        };
         let (_, fb, want, _) = plan_strategy(Some(&off), true, false, false);
         assert_eq!(fb, Some("disabled"));
         assert!(want);
@@ -5899,7 +6145,10 @@ mod tests {
             "_schema_version must be JSON string, got {:?}",
             frame["_schema_version"]
         );
-        assert_eq!(frame["_schema_version"].as_str().unwrap(), HEARTBEAT_SCHEMA_VERSION);
+        assert_eq!(
+            frame["_schema_version"].as_str().unwrap(),
+            HEARTBEAT_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -5967,21 +6216,29 @@ mod tests {
         // the number as authoritative (per the W1 stability policy
         // "absent *_measured ≡ measured:true").
         let all = fallback_serialize_failed_payload(Some(1), Some(2), Some(3), Some(4));
-        let frame_all = serde_json::from_str::<serde_json::Value>(&all).unwrap()
-            .as_array().unwrap()[0].clone();
+        let frame_all = serde_json::from_str::<serde_json::Value>(&all)
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .clone();
         assert_eq!(frame_all["entries_lost_total_authoritative"], true);
 
         let partial = fallback_serialize_failed_payload(Some(5), None, None, None);
-        let frame_partial = serde_json::from_str::<serde_json::Value>(&partial).unwrap()
-            .as_array().unwrap()[0].clone();
+        let frame_partial = serde_json::from_str::<serde_json::Value>(&partial)
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .clone();
         assert_eq!(frame_partial["entries_lost_total_authoritative"], false);
 
         // One unmeasured slot is enough to flip the flag — even
         // if the other three are measured.
-        let three_measured =
-            fallback_serialize_failed_payload(Some(1), Some(2), Some(3), None);
-        let frame_three = serde_json::from_str::<serde_json::Value>(&three_measured).unwrap()
-            .as_array().unwrap()[0].clone();
+        let three_measured = fallback_serialize_failed_payload(Some(1), Some(2), Some(3), None);
+        let frame_three = serde_json::from_str::<serde_json::Value>(&three_measured)
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .clone();
         assert_eq!(frame_three["entries_lost_total_authoritative"], false);
     }
 
@@ -5991,8 +6248,11 @@ mod tests {
         // accidental int/string conversion fires here instead of
         // silently breaking dashboards.
         let s = fallback_serialize_failed_payload(Some(0), Some(0), Some(0), Some(0));
-        let frame = serde_json::from_str::<serde_json::Value>(&s).unwrap()
-            .as_array().unwrap()[0].clone();
+        let frame = serde_json::from_str::<serde_json::Value>(&s)
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .clone();
         assert!(
             frame["entries_lost_total_authoritative"].is_boolean(),
             "entries_lost_total_authoritative must be JSON boolean, got {:?}",
@@ -6011,8 +6271,7 @@ mod tests {
         // `f64::NAN` interpolation, etc.) fires this assertion
         // before consumers notice. Schema-version stability
         // depends on it.
-        let unmeasured =
-            fallback_serialize_failed_payload(Some(7), None, None, None);
+        let unmeasured = fallback_serialize_failed_payload(Some(7), None, None, None);
         let frame = serde_json::from_str::<serde_json::Value>(&unmeasured)
             .unwrap()
             .as_array()
@@ -6085,8 +6344,7 @@ mod tests {
         // extend the `expected` set in this test in the SAME commit.
         // The two-side update is the policy gate.
         use std::collections::BTreeSet;
-        let observed: BTreeSet<&'static str> =
-            STABLE_LAUNCH_DIAG_CODES.iter().copied().collect();
+        let observed: BTreeSet<&'static str> = STABLE_LAUNCH_DIAG_CODES.iter().copied().collect();
         let expected: BTreeSet<&'static str> = [
             "clock_skew",
             "clock_skew_fallback_entropy",
@@ -6154,11 +6412,8 @@ mod tests {
             "arr[0] is not the heartbeat (code={:?})",
             arr[0]["code"]
         );
-        let entry = arr[1]
-            .as_object()
-            .expect("arr[1] must be a JSON object");
-        let observed: BTreeSet<&str> =
-            entry.keys().map(String::as_str).collect();
+        let entry = arr[1].as_object().expect("arr[1] must be a JSON object");
+        let observed: BTreeSet<&str> = entry.keys().map(String::as_str).collect();
         let expected: BTreeSet<&str> = ["code", "message"].into_iter().collect();
         assert_eq!(
             observed, expected,
@@ -6247,20 +6502,16 @@ mod tests {
         // the test calls the extracted helper directly — same pattern
         // as the W2 fallback wire-type pins above.
         use std::collections::BTreeSet;
-        let frame =
-            serialize_fail_sentinel(&[("monotonic_clock_stubbed", "stub".to_string())]);
+        let frame = serialize_fail_sentinel(&[("monotonic_clock_stubbed", "stub".to_string())]);
         let observed: BTreeSet<&str> = frame
             .as_object()
             .expect("sentinel must be a JSON object")
             .keys()
             .map(String::as_str)
             .collect();
-        let expected: BTreeSet<&str> = [
-            "_serialize_failed",
-            "_serialize_failed_codes",
-        ]
-        .into_iter()
-        .collect();
+        let expected: BTreeSet<&str> = ["_serialize_failed", "_serialize_failed_codes"]
+            .into_iter()
+            .collect();
         assert_eq!(
             observed, expected,
             "serialize-fail sentinel field-name drift — see the schema contract \
@@ -6302,15 +6553,10 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        let expected: BTreeSet<&str> = [
-            "code",
-            "_schema_version",
-            "scope",
-            "launched_at",
-            "message",
-        ]
-        .into_iter()
-        .collect();
+        let expected: BTreeSet<&str> =
+            ["code", "_schema_version", "scope", "launched_at", "message"]
+                .into_iter()
+                .collect();
         assert_eq!(
             observed, expected,
             "heartbeat field-name drift — see  MUST4. \
