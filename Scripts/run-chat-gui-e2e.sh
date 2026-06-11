@@ -106,6 +106,7 @@ xcodebuild -project RatioThink.xcodeproj \
   -only-testing:RatioThinkGUITests/S258_ComposerSendGUITests/test_composer_send_streams_real_assistant_and_persists_after_relaunch \
   -only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests/test_chat_model_menu_contains_seeded_qwen3_default \
   -only-testing:RatioThinkGUITests/S426_FastThinkProfileGUITests/test_fast_think_profile_selectable_and_streams_real_reply \
+  -only-testing:RatioThinkGUITests/S520_MultiPartContentGUITests/test_external_multipart_client_succeeds_and_gui_chat_still_streams \
   ENABLE_CODE_COVERAGE=NO
 
 # The seeded Qwen3-0.6B is a *thinking* model: it can emit the answer inside

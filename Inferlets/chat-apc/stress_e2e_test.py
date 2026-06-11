@@ -392,6 +392,104 @@ async def section_protocol_stress(base: str, http: httpx.AsyncClient, rep: Repor
 # Scope 2 — SSE / streaming stress
 # ---------------------------------------------------------------------------
 
+async def section_content_parts(base: str, http: httpx.AsyncClient, rep: Report) -> None:
+    """OpenAI multi-part `messages[].content` arrays (PR #115): the array
+    form must behave exactly like its flattened-string equivalent on both
+    the non-stream and stream paths, and malformed parts must 400 at the
+    request boundary."""
+    P = "scope6/content-parts"
+
+    # non-stream: single text part -> 200, completion shape intact.
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [{"role": "user",
+                      "content": [{"type": "text", "text": "hello"}]}],
+    })
+    ok = r.status_code == 200 and r.json().get("object") == "chat.completion"
+    rep.ok(ok, f"{P}: single text part (non-stream) -> {r.status_code} (want 200 chat.completion)")
+
+    # non-stream: multi-part array across roles -> 200 (order/separators are
+    # unit-tested; here we prove the wire accepts the multi-part shape on
+    # every templated role).
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [
+            {"role": "system",
+             "content": [{"type": "text", "text": "be "}, {"type": "text", "text": "brief"}]},
+            {"role": "user",
+             "content": [{"type": "text", "text": "two "}, {"type": "text", "text": "parts"}]},
+        ],
+    })
+    rep.ok(r.status_code == 200, f"{P}: multi-part system+user -> {r.status_code} (want 200)")
+
+    # concatenation is observable on the wire via the blank-content gate:
+    # all-whitespace parts flatten to a blank string -> 400, while the same
+    # array plus one non-blank part -> 200. Both parts must therefore have
+    # contributed to the flattened content.
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [{"role": "user",
+                      "content": [{"type": "text", "text": " "}, {"type": "text", "text": " "}]}],
+    })
+    rep.ok(r.status_code == 400,
+           f"{P}: all-whitespace parts flatten blank -> {r.status_code} (want 400 blank-content gate)")
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [{"role": "user",
+                      "content": [{"type": "text", "text": " "}, {"type": "text", "text": "x"}]}],
+    })
+    rep.ok(r.status_code == 200,
+           f"{P}: same array + one non-blank part -> {r.status_code} (want 200 — proves concatenation)")
+
+    # empty array flattens to "" -> same 400 as content:"".
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [{"role": "user", "content": []}],
+    })
+    rep.ok(r.status_code == 400, f"{P}: empty content array -> {r.status_code} (want 400)")
+
+    # non-text part types are accepted but contribute no text.
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+            {"type": "text", "text": "caption"},
+        ]}],
+    })
+    rep.ok(r.status_code == 200, f"{P}: image_url part + text part -> {r.status_code} (want 200)")
+
+    # malformed part (non-object element) -> 400, never a silently dropped part.
+    for bad, label in (
+        (["bare string"], "bare-string part"),
+        ([{"type": "text", "text": "ok"}, 7], "mixed valid+scalar part"),
+        ({"type": "text", "text": "x"}, "object (non-array) content"),
+        (42, "numeric content"),
+    ):
+        r = await http.post(f"{base}/v1/chat/completions", json={
+            "model": MODEL, "stream": False, "max_tokens": 4,
+            "messages": [{"role": "user", "content": bad}],
+        })
+        rep.ok(r.status_code == 400, f"{P}: {label} -> {r.status_code} (want 400)")
+
+    # stream path: multi-part array -> 200 + well-formed SSE with a terminal
+    # finish_reason (the branch split is post-parse; this proves it end-to-end).
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": True, "max_tokens": 8,
+        "messages": [{"role": "user",
+                      "content": [{"type": "text", "text": "two "}, {"type": "text", "text": "parts"}]}],
+    })
+    rep.ok(r.headers.get("content-type", "").split(";")[0] == "text/event-stream",
+           f"{P}/stream: content-type {r.headers.get('content-type')!r}")
+    assert_sse_framing(sse_payloads(r.text), rep, f"{P}/stream")
+
+    # stream path: malformed part still 400s (no SSE leak before the gate).
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": True, "max_tokens": 8,
+        "messages": [{"role": "user", "content": ["bare string"]}],
+    })
+    rep.ok(r.status_code == 400, f"{P}/stream: bare-string part -> {r.status_code} (want 400)")
+
+
 def assert_sse_framing(payloads: list[str], rep: Report, ctx: str) -> None:
     """Shared SSE invariants: model_ready first, every non-[DONE] frame is
     valid JSON, exactly one terminal finish_reason, [DONE] is last and
@@ -1025,6 +1123,7 @@ async def main() -> int:
                 ("sse-stress", section_sse_stress),
                 ("concurrency", section_concurrency),
                 ("harsh-surface", section_harsh_surface),
+                ("content-parts", section_content_parts),
                 ("toolcall-parse", section_toolcall_parse),
             ]:
                 print(f"[stress-e2e] section: {name}", flush=True)
