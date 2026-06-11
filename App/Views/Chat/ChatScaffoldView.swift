@@ -546,10 +546,11 @@ struct ChatScaffoldView: View {
         }
       )
     }
-    // #513: destructive-retry confirmation. Required whenever the retry
-    // point has later conversation (the plan's `requiresConfirmation`);
-    // a latest-turn retry skips straight to `executeRetry`. Canceling
-    // leaves history untouched — nothing is mutated until Retry.
+    // #513: destructive-retry confirmation. Required whenever the plan
+    // erases more than the stale assistant itself: later conversation, or
+    // adjacent assistant rows that must be removed so the retained prefix
+    // ends at a user turn. Canceling leaves history untouched — nothing is
+    // mutated until Retry.
     .alert(
       "Retry from here?",
       isPresented: Binding(
@@ -565,7 +566,7 @@ struct ChatScaffoldView: View {
       }
       Button("Cancel", role: .cancel) { pendingRetryMessageID = nil }
     } message: {
-      Text("This will erase all later conversation after this point and generate a new response.")
+      Text("This will erase the affected responses back to the previous user message, plus any later conversation, and generate a new response.")
     }
     .onChange(of: engineStatusStore.status) { _, new in
       // PR#15 F3: a thrown start/stop error is transient — once the poll
@@ -796,8 +797,9 @@ struct ChatScaffoldView: View {
   }
 
   /// #513 entry point from a transcript row's Retry control. Routes
-  /// through the destructive confirmation only when the plan says later
-  /// conversation would be erased; a latest-turn retry executes directly.
+  /// through the destructive confirmation only when the plan says more
+  /// than the stale assistant itself would be erased; a simple latest-turn
+  /// retry executes directly.
   /// The model gate runs FIRST so a blocked retry raises the no-model or
   /// pinned/resident mismatch prompt without having mutated any history.
   private func requestRetry(for chat: Chat, messageID: UUID) {
@@ -836,8 +838,9 @@ struct ChatScaffoldView: View {
   static let staleRetryNoticeCopy =
     "Retry no longer applies — the conversation changed or a response is in progress."
 
-  /// #513: truncate from the retry point, then resend from the retained
-  /// prefix via the normal send path (same model/profile resolution, same
+  /// #513: truncate back to the last user before the retry point, then
+  /// resend from the retained prefix via the normal send path (same
+  /// model/profile resolution, same
   /// ToT dispatch, same per-chat controller — so an unrelated chat's
   /// stream is never touched). `ChatRetryPlan.apply` re-validates against
   /// the live transcript and truncates atomically; review v1 F1: every

@@ -2,12 +2,12 @@ import Foundation
 import SwiftData
 
 /// Retry-from-a-prior-turn semantics (#513): retrying an assistant turn
-/// truncates the conversation from that turn onward, then re-issues a new
-/// request from the retained prefix. Destructive by design — there is no
-/// branch/fork history; later turns (and any engine KV built on them) are
-/// dropped, and the engine sees only the retained prefix because every
-/// request rebuilds context from the persisted messages
-/// (`ChatSendController.makeRequest`).
+/// truncates the conversation back to the last user turn before that
+/// assistant, then re-issues a new request from that user-terminal
+/// retained prefix. Destructive by design — there is no branch/fork
+/// history; later turns (and any engine KV built on them) are dropped, and
+/// the engine sees only the retained prefix because every request rebuilds
+/// context from the persisted messages (`ChatSendController.makeRequest`).
 ///
 /// Split into a pure `plan` (what would be deleted, and whether the user
 /// must confirm) and an atomic `execute` (single save, rollback on
@@ -17,13 +17,16 @@ import SwiftData
 @available(macOS 14, *)
 public enum ChatRetryPlan {
   public struct Plan: Equatable {
-    /// The retry-point assistant row plus every later message, in
-    /// transcript order. Deleting the stale assistant itself is what keeps
-    /// a latest-turn retry from accumulating duplicate assistant turns.
+    /// Every row after the retained user prefix, in transcript order.
+    /// This always includes the retry-point assistant and every later
+    /// message; when multiple assistant rows are adjacent, it also deletes
+    /// the earlier assistants in that run so the retried request never
+    /// starts from an assistant-terminal prefix.
     public let deleteMessageIDs: [UUID]
-    /// True when the deletion reaches BEYOND the retry-point assistant —
-    /// i.e. later conversation exists and the UI must confirm the erase.
-    /// A latest-turn retry (only the stale assistant goes) skips it.
+    /// True when retry erases more than the stale assistant itself — i.e.
+    /// later conversation exists, or adjacent assistant rows before the
+    /// retry point must be removed to preserve the user-terminal prefix.
+    /// A simple latest-turn retry (only the stale assistant goes) skips it.
     public let requiresConfirmation: Bool
   }
 
@@ -94,16 +97,23 @@ public enum ChatRetryPlan {
   /// Plan a retry anchored at the assistant message `retryPointID`.
   /// Returns nil when retry is not valid there: the id is missing, the row
   /// is not an assistant turn, or no user turn precedes it (an empty
-  /// retained prefix has nothing to resend).
+  /// retained prefix has nothing to resend). The retained prefix is the
+  /// transcript through the LAST preceding user turn; every row after that
+  /// user is deleted so the retry request never carries an assistant-
+  /// terminal prefix into the engine/template layer.
   public static func plan(messages: [Message], retryPointID: UUID) -> Plan? {
     let sorted = messages.sorted(by: Message.transcriptPrecedes)
     guard let index = sorted.firstIndex(where: { $0.id == retryPointID }),
           sorted[index].role == ChatMessage.Role.assistant.rawValue,
-          sorted[..<index].contains(where: { $0.role == ChatMessage.Role.user.rawValue })
+          let retainedUserIndex = sorted[..<index].lastIndex(
+            where: { $0.role == ChatMessage.Role.user.rawValue }
+          )
     else { return nil }
+    let deleteStart = sorted.index(after: retainedUserIndex)
+    let deleteMessageIDs = sorted[deleteStart...].map(\.id)
     return Plan(
-      deleteMessageIDs: sorted[index...].map(\.id),
-      requiresConfirmation: sorted.count - index > 1
+      deleteMessageIDs: deleteMessageIDs,
+      requiresConfirmation: deleteMessageIDs.count > 1
     )
   }
 

@@ -79,7 +79,8 @@ struct MessageBubble: View {
           // affordance is this explicit button; see `MessageCopyPlan`) and
           // the #513 retry control. Retry reads as turn chrome, not a
           // primary action — the destructive part is guarded by the
-          // scaffold's confirmation when later conversation would be erased.
+          // scaffold's confirmation when retry would erase anything beyond
+          // this stale assistant.
           if !message.content.isEmpty || onRetry != nil {
             HStack(spacing: 12) {
               if !message.content.isEmpty {
@@ -92,7 +93,7 @@ struct MessageBubble: View {
                     .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
-                .help("Retry from here — regenerates this response; any later conversation is erased after you confirm")
+                .help("Retry from here — regenerates this response; affected responses and any later conversation are erased after you confirm")
                 .accessibilityIdentifier("transcript.retry")
               }
             }

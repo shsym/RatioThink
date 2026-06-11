@@ -26,6 +26,43 @@ final class ChatRetryPlanTests: XCTestCase {
                    "no later conversation exists, so no destructive confirmation")
   }
 
+  func test_plan_adjacent_assistant_retry_rewinds_to_preceding_user() async throws {
+    let (chat, context) = try makeChat(turns: [
+      ("user", "q1", 1),
+      ("assistant", "a1", 2),
+      ("assistant", "a2", 3),
+    ])
+    let a1 = try message(chat, content: "a1")
+    let a2 = try message(chat, content: "a2")
+
+    let plan = try XCTUnwrap(ChatRetryPlan.plan(messages: chat.messages, retryPointID: a2.id))
+
+    XCTAssertEqual(plan.deleteMessageIDs, [a1.id, a2.id],
+                   "retrying an assistant-adjacent turn must delete back through the assistant run so the retained prefix ends at the preceding user")
+    XCTAssertTrue(plan.requiresConfirmation,
+                  "deleting the earlier adjacent assistant is destructive even when no later user turn exists")
+
+    let status = PersistenceStatus()
+    XCTAssertTrue(ChatRetryPlan.execute(plan, chat: chat, context: context, persistenceStatus: status))
+
+    let engine = ImmediateRetryEngine(events: [
+      .delta(role: .assistant, content: "fresh"),
+      .finish(reason: .stop),
+    ])
+    let controller = ChatSendController()
+    controller.send(
+      chat: chat, context: context, engine: engine,
+      modelLoadCenter: ModelLoadCenter(), persistenceStatus: status,
+      options: ChatSendRequestOptions(modelID: "m1")
+    )
+    try await waitUntil("assistant-adjacent retry stream finishes") { !controller.isInFlight }
+
+    XCTAssertEqual(engine.requests.first?.messages,
+                   [ChatMessage(role: .user, content: "q1")],
+                   "the retried request must not retain an assistant-terminal prefix")
+    XCTAssertEqual(chat.messages.map(\.content), ["q1", "fresh"])
+  }
+
   func test_plan_earlier_turn_deletes_suffix_and_requires_confirmation() throws {
     let (chat, _) = try makeChat(turns: [
       ("user", "q1", 1), ("assistant", "a1", 2),
@@ -80,8 +117,9 @@ final class ChatRetryPlanTests: XCTestCase {
     XCTAssertTrue(plan.requiresConfirmation)
 
     let tailPlan = try XCTUnwrap(ChatRetryPlan.plan(messages: chat.messages, retryPointID: highID))
-    XCTAssertEqual(tailPlan.deleteMessageIDs, [highID])
-    XCTAssertFalse(tailPlan.requiresConfirmation)
+    XCTAssertEqual(tailPlan.deleteMessageIDs, [lowID, highID],
+                   "retrying the later adjacent assistant still rewinds to the preceding user")
+    XCTAssertTrue(tailPlan.requiresConfirmation)
   }
 
   // MARK: - execute + resend
