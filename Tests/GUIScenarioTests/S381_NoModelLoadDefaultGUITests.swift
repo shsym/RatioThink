@@ -127,9 +127,17 @@ final class S381_NoModelLoadDefaultGUITests: XCTestCase {
     let cancel = app.buttons["noModel.cancel"]
     XCTAssertTrue(cancel.waitForExistence(timeout: 15),
                   "launch-time no-model gate never appeared; app tree: \(app.debugDescription)")
-    cancel.click()
-    XCTAssertTrue(waitForDisappearance(of: cancel, timeout: 10),
-                  "launch gate did not dismiss on Cancel")
+    // Re-drive Cancel until the sheet dismisses — the same dropped-click
+    // defense as the Load loop below (a synthesized sheet-button click can
+    // be dropped while the app settles / is briefly not key).
+    let cancelDeadline = Date().addingTimeInterval(20)
+    while Date() < cancelDeadline {
+      if !cancel.exists { break }
+      app.activate()
+      if cancel.isHittable { cancel.click() }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(1))
+    }
+    XCTAssertFalse(cancel.exists, "launch gate did not dismiss on Cancel")
 
     // Type the message and try to send — the gate must BLOCK the send
     // (nothing resolves a model) and re-raise with Load, arming #516's

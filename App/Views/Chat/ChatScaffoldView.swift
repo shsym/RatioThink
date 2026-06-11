@@ -580,7 +580,8 @@ struct ChatScaffoldView: View {
   /// engine actually serves (`GET /v1/models`) — the only id its chat
   /// endpoint accepts. No-op when the engine isn't running or a load is
   /// already in flight.
-  private func reconcileEngineResidentModel(for chat: Chat) async {
+  private func reconcileEngineResidentModel(for chat: Chat,
+                                            isRetryPass: Bool = false) async {
     // Bounded retry while the engine stays running — a single transient
     // /v1/models failure must not strand residentModelID unset until a
     // status flip that may never come on equal .running polls (F2).
@@ -642,6 +643,24 @@ struct ChatScaffoldView: View {
     case .failedAfterRetries(let attempts):
       // Don't silently drop: engine running but unreachable for models.
       NSLog("ChatScaffold: /v1/models reconcile failed after \(attempts) attempts while engine .running")
+      // #516 review F8: residency-required edges hold the pending send
+      // until THIS reconcile lands — and equal `.running` polls never
+      // re-run the `.task`, so a bounded failure here would strand the
+      // promise forever. Settle instead: one backed-off retry round, and
+      // on the final failure fall back to the residency-free edge (the
+      // bounded pre-F6 behavior beats an infinite hold). The `.task`
+      // cancels this on a status flip (the sleep throws), so a real
+      // engine transition supersedes the fallback.
+      switch Self.reconcileFailureStep(hasPendingAutoSend: pendingAutoSend != nil,
+                                       isRetryPass: isRetryPass) {
+      case .none:
+        break
+      case .retry:
+        guard (try? await Task.sleep(nanoseconds: 2_000_000_000)) != nil else { break }
+        await reconcileEngineResidentModel(for: chat, isRetryPass: true)
+      case .fallbackEdge:
+        resolutionEdge(for: chat, requiresResidency: false)
+      }
     case .empty:
       // Engine running but serving NO model — clear any stale residency so
       // the send gate doesn't pass a model the engine no longer has (the
@@ -931,7 +950,7 @@ struct ChatScaffoldView: View {
   /// running FIRST (the App's only engine-start path), since a load
   /// against a stopped engine would otherwise just defer on
   /// `engineNotReady`. The sheet stays open and reflects busy→ready, then
-  /// auto-dismisses via `dismissPromptIfResolved`.
+  /// auto-dismisses via `resolutionEdge` (probe-gated — review v3 F9).
   private func loadDefaultModel(_ model: String) {
     switch engineStatusStore.status {
     case .running:
@@ -963,12 +982,21 @@ struct ChatScaffoldView: View {
     }
   }
 
-  /// #397: close the gate once a model resolves so the user lands back at
-  /// the composer with their draft intact.
-  private func dismissPromptIfResolved(for chat: Chat) {
-    if showNoModelPrompt, currentModelID(for: chat) != nil {
-      showNoModelPrompt = false
-    }
+
+  /// #516 review F8: the bounded reconcile-failure policy. Without a
+  /// pending send there is nothing to settle (the pre-existing NSLog
+  /// behavior stands — surfacing the failure in the gate UI is the
+  /// deferred FC1). With one armed: first pass earns a backed-off retry;
+  /// the final failure falls back to the residency-free resolution edge
+  /// so the promise settles (fire or disarm) instead of holding forever.
+  enum ReconcileFailureStep: Equatable {
+    case none, retry, fallbackEdge
+  }
+
+  static func reconcileFailureStep(hasPendingAutoSend: Bool,
+                                   isRetryPass: Bool) -> ReconcileFailureStep {
+    guard hasPendingAutoSend else { return .none }
+    return isRetryPass ? .fallbackEdge : .retry
   }
 
   /// #516 review F6: what a resolution edge may treat as resolved. On the
@@ -997,12 +1025,20 @@ struct ChatScaffoldView: View {
   /// authority (review F6, see `resolutionProbe`). No default: every new
   /// edge must decide explicitly.
   private func resolutionEdge(for chat: Chat, requiresResidency: Bool) {
-    dismissPromptIfResolved(for: chat)
-    guard let pending = pendingAutoSend else { return }
     let resolved = Self.resolutionProbe(
       resolvedModelID: currentModelID(for: chat),
       residentModelID: modelLoadCenter.residentModelID,
       requiresResidency: requiresResidency)
+    // #397: close the gate once a model resolves so the user lands back at
+    // the composer with their draft intact. Review v3 F9: keyed on the SAME
+    // probe result as the verdict below — on a residency-required edge the
+    // sheet must not flash the dismiss-success signal while the fire is
+    // still held pending reconcile (a later disarm/strand would otherwise
+    // read as a silent success).
+    if showNoModelPrompt, resolved != nil {
+      showNoModelPrompt = false
+    }
+    guard let pending = pendingAutoSend else { return }
     switch pending.verdict(chatID: chat.id,
                            resolvedModelID: resolved,
                            isSending: sendController.isInFlight) {
