@@ -371,6 +371,45 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       .runNow)
   }
 
+  func test_528_deferred_explicit_load_drops_when_current_target_changed_before_idle() {
+    let chatID = UUID()
+    let queued = ChatScaffoldView.DeferredEngineMutation.explicitLoad(
+      chatID: chatID,
+      targetModelID: "org/A",
+      generation: 1)
+
+    XCTAssertEqual(
+      ChatScaffoldView.deferredEngineMutationResolution(
+        queued: queued,
+        currentChatID: chatID,
+        currentTargetModelID: "org/C"),
+      .drop,
+      "a queued Load for A must not restart the engine after the chat target moves to C")
+  }
+
+  func test_528_deferred_explicit_load_is_latest_wins_for_same_chat() {
+    let chatID = UUID()
+    let queuedA = ChatScaffoldView.DeferredEngineMutation.explicitLoad(
+      chatID: chatID,
+      targetModelID: "org/A",
+      generation: 1)
+    let queuedC = ChatScaffoldView.DeferredEngineMutation.explicitLoad(
+      chatID: chatID,
+      targetModelID: "org/C",
+      generation: 2)
+
+    XCTAssertEqual(
+      ChatScaffoldView.replacingDeferredEngineMutation(current: queuedA, replacement: queuedC),
+      queuedC,
+      "pressing Load for C while A is queued must replace A instead of being ignored")
+    XCTAssertEqual(
+      ChatScaffoldView.deferredEngineMutationResolution(
+        queued: queuedC,
+        currentChatID: chatID,
+        currentTargetModelID: "org/C"),
+      .run(modelID: "org/C"))
+  }
+
   // MARK: - #516 review F9: sheet dismissal keys on the probe, not raw resolution
 
   /// On a residency-required edge that evaluates to hold, the probe is nil —

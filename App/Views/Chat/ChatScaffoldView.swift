@@ -78,6 +78,8 @@ struct ChatScaffoldView: View {
   /// that stream. Defer the automatic sync until the app-wide stream set is
   /// idle; explicit user actions (Stop / Load) remain separate choices.
   @State private var deferredEngineSyncTask: Task<Void, Never>?
+  @State private var deferredEngineMutation: DeferredEngineMutation?
+  @State private var deferredEngineMutationGeneration: Int = 0
   /// #513: the assistant message id awaiting the destructive-retry
   /// confirmation. Non-nil presents the alert; Cancel clears it without
   /// touching history.
@@ -489,7 +491,7 @@ struct ChatScaffoldView: View {
           // The common load path defers while any chat is streaming so this
           // prompt button can't restart the single engine out from under a
           // sibling chat.
-          loadDefaultModel(model)
+          loadDefaultModel(model, for: chat)
         },
         onDownloaded: {
           // Model is now on disk — boot the engine on this chat's
@@ -930,6 +932,7 @@ struct ChatScaffoldView: View {
     chat.modelID = modelID
     do {
       try modelContext.save()
+      cancelStaleDeferredEngineMutation(afterTargetChangeFor: chat, newTargetModelID: modelID)
       return true
     } catch {
       modelContext.rollback()
@@ -1113,12 +1116,14 @@ struct ChatScaffoldView: View {
   /// against a stopped engine would otherwise just defer on
   /// `engineNotReady`. The sheet stays open and reflects busy→ready, then
   /// auto-dismisses via `resolutionEdge` (probe-gated — review v3 F9).
-  private func loadDefaultModel(_ model: String) {
+  private func loadDefaultModel(_ model: String, for chat: Chat? = nil) {
     switch Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) {
     case .runNow:
       break
     case .deferUntilIdle:
-      deferEngineLoadUntilStreamsIdle(model)
+      if let chat {
+        deferEngineLoadUntilStreamsIdle(model, for: chat)
+      }
       return
     }
     switch engineStatusStore.status {
@@ -1165,12 +1170,12 @@ struct ChatScaffoldView: View {
       Task { @MainActor in
         await reconcileEngineResidentModel(for: chat)
         if currentModelID(for: chat) == nil {
-          loadDefaultModel(target.modelID)
+          loadDefaultModel(target.modelID, for: chat)
         }
       }
       return
     }
-    loadDefaultModel(target.modelID)
+    loadDefaultModel(target.modelID, for: chat)
   }
 
   static func shouldDeferEngineSyncForStreams(_ inFlightChatIDs: Set<UUID>) -> Bool {
@@ -1201,8 +1206,51 @@ struct ChatScaffoldView: View {
     }
   }
 
-  private func deferEngineLoadUntilStreamsIdle(_ model: String) {
-    guard deferredEngineSyncTask == nil else { return }
+  struct DeferredEngineMutation: Equatable {
+    let chatID: UUID
+    let targetModelID: String
+    let generation: Int
+
+    static func explicitLoad(chatID: UUID,
+                             targetModelID: String,
+                             generation: Int) -> DeferredEngineMutation {
+      DeferredEngineMutation(chatID: chatID, targetModelID: targetModelID, generation: generation)
+    }
+  }
+
+  enum DeferredEngineMutationResolution: Equatable {
+    case drop
+    case run(modelID: String)
+  }
+
+  static func deferredEngineMutationResolution(
+    queued: DeferredEngineMutation,
+    currentChatID: UUID,
+    currentTargetModelID: String?
+  ) -> DeferredEngineMutationResolution {
+    guard queued.chatID == currentChatID else { return .drop }
+    guard let currentTargetModelID, !currentTargetModelID.isEmpty else { return .drop }
+    guard currentTargetModelID == queued.targetModelID else { return .drop }
+    return .run(modelID: queued.targetModelID)
+  }
+
+  static func replacingDeferredEngineMutation(
+    current: DeferredEngineMutation?,
+    replacement: DeferredEngineMutation
+  ) -> DeferredEngineMutation {
+    replacement
+  }
+
+  private func deferEngineLoadUntilStreamsIdle(_ model: String, for chat: Chat) {
+    deferredEngineMutationGeneration += 1
+    let queued = DeferredEngineMutation.explicitLoad(
+      chatID: chat.id,
+      targetModelID: model,
+      generation: deferredEngineMutationGeneration)
+    deferredEngineMutation = Self.replacingDeferredEngineMutation(
+      current: deferredEngineMutation,
+      replacement: queued)
+    deferredEngineSyncTask?.cancel()
     deferredEngineSyncTask = Task { @MainActor in
       defer { deferredEngineSyncTask = nil }
       while Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) == .deferUntilIdle {
@@ -1212,13 +1260,34 @@ struct ChatScaffoldView: View {
           return
         }
       }
-      loadDefaultModel(model)
+      guard deferredEngineMutation == queued else { return }
+      deferredEngineMutation = nil
+      switch Self.deferredEngineMutationResolution(
+        queued: queued,
+        currentChatID: chat.id,
+        currentTargetModelID: gateTarget(for: chat)?.modelID
+      ) {
+      case .drop:
+        break
+      case .run(let modelID):
+        loadDefaultModel(modelID, for: chat)
+      }
     }
   }
 
   private func cancelDeferredEngineSync() {
     deferredEngineSyncTask?.cancel()
     deferredEngineSyncTask = nil
+    deferredEngineMutation = nil
+  }
+
+  private func cancelStaleDeferredEngineMutation(afterTargetChangeFor chat: Chat,
+                                                 newTargetModelID: String?) {
+    guard let queued = deferredEngineMutation, queued.chatID == chat.id else { return }
+    let currentTarget = Self.gateTarget(selectedModelID: newTargetModelID,
+                                        profileDefaultModel: selectedProfileDefault)?.modelID
+    guard currentTarget != queued.targetModelID else { return }
+    cancelDeferredEngineSync()
   }
 
   /// #397 F1: re-poll the helper after an unreachable-transport failure.
