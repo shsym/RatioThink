@@ -58,6 +58,18 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     XCTAssertFalse(p.showsModelChip)
   }
 
+  func test_modelUnsupported_routes_to_settings_never_retry() {
+    let reason = "Couldn’t load acme/model.gguf: the selected model is unsupported or not loadable. "
+      + "To recover, choose a curated model, remove or fix the cached repo, or install a supported artifact."
+    let p = plan(.engineFailed(code: .modelUnsupported, reason: reason, retryable: false), loadAction)
+    XCTAssertEqual(p.headline, "Model unsupported")
+    XCTAssertEqual(p.reason, reason)
+    XCTAssertEqual(p.primary, .none)
+    XCTAssertTrue(p.showsOpenSettings)
+    XCTAssertFalse(p.showsModelChip)
+    XCTAssertTrue(p.reason?.contains("choose a curated model") ?? false)
+  }
+
   func test_killRejected_is_terminal_no_retry() {
     // F3: non-retryable, non-model-choice → reason only, no Retry loop.
     let p = plan(.engineFailed(code: .killRejected, reason: "zombie pid 42", retryable: false), loadAction)

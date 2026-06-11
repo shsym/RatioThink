@@ -245,11 +245,14 @@ extension EngineErrorCode {
   ///
   /// Most failures ARE retryable: the user fixes the underlying cause
   /// (downloads the missing model, frees the port, reconnects the
-  /// network) and clicks Resume to try again. Two codes are NOT — a
+  /// network) and clicks Resume to try again. These codes are NOT: a
   /// blind retry of the same action either repeats a guaranteed failure
-  /// or is unsafe:
+  /// or takes the wrong recovery path.
   ///   · `memoryRisk` — the same model is still too large; a retry just
   ///     re-rejects. Recovery is choosing a smaller model, not Resume.
+  ///   · `modelUnsupported` — the same cached artifact/format is still
+  ///     unsupported. Recovery is choosing/fixing/installing a model, not
+  ///     re-starting the same active profile.
   ///   · `killRejected` — a prior engine process could not be reaped; a
   ///     plain start refuses (`alreadyRunning`) until the orphan is
   ///     cleared. Resume cannot perform that cleanup.
@@ -259,7 +262,7 @@ extension EngineErrorCode {
   /// longer strands the engine with a disabled Resume.
   public var invitesResumeRetry: Bool {
     switch self {
-    case .memoryRisk, .killRejected:
+    case .memoryRisk, .modelUnsupported, .killRejected:
       return false
     default:
       return true

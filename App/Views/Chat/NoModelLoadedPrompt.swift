@@ -13,7 +13,7 @@ import SwiftUI
 ///   · busy(starting/stopping/loading) → calm wait (with the download
 ///     CTA still visible if a fresh-install model needs downloading);
 ///   · engineFailed → the reason + Retry (retryable) / Open Models
-///     settings (model-choice faults: missing/too-large/profile) /
+///     settings (model-choice faults: missing/too-large/unsupported/profile) /
 ///     inline download (missing + downloadable);
 ///   · loadFailed → the reason + Retry the load;
 ///   · helperUnreachable → the reason + Retry (re-poll);
@@ -123,7 +123,8 @@ struct NoModelLoadedPrompt: View {
                     showsOpenSettings: false)
       }
       // Model-choice faults (missing-not-downloadable / too-large /
-      // profile) route to Models settings, never a re-fire (F3).
+      // unsupported / profile) route to Models settings, never a re-fire
+      // of the same failing active profile.
       if isModelChoiceFault(code) {
         return Plan(headline: engineFailedTitle(code), reason: reason,
                     showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
@@ -168,18 +169,19 @@ struct NoModelLoadedPrompt: View {
 
   static func isModelChoiceFault(_ code: EngineErrorCode) -> Bool {
     switch code {
-    case .modelMissing, .memoryRisk, .profileMissing: return true
+    case .modelMissing, .memoryRisk, .modelUnsupported, .profileMissing: return true
     default:                                          return false
     }
   }
 
   static func engineFailedTitle(_ code: EngineErrorCode) -> String {
     switch code {
-    case .modelMissing:   return "Default model isn't downloaded"
-    case .memoryRisk:     return "Model is too large to load"
-    case .profileMissing: return "Profile configuration problem"
-    case .engineGone:     return "Engine stopped unexpectedly"
-    default:              return "The engine couldn't start"
+    case .modelMissing:     return "Default model isn't downloaded"
+    case .memoryRisk:       return "Model is too large to load"
+    case .modelUnsupported: return "Model unsupported"
+    case .profileMissing:   return "Profile configuration problem"
+    case .engineGone:       return "Engine stopped unexpectedly"
+    default:                return "The engine couldn't start"
     }
   }
 

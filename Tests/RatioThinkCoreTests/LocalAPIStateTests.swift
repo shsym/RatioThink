@@ -68,6 +68,13 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertEqual(s.detail, "too big")
   }
 
+  func test_failed_modelUnsupported_is_not_retryable() {
+    let s = LocalAPIState.make(status: .failed(code: .modelUnsupported, message: "unsupported format"),
+                               hasActiveProfile: true)
+    XCTAssertFalse(s.toggleEnabled, "modelUnsupported would retry the same unloadable artifact")
+    XCTAssertEqual(s.detail, "unsupported format (modelUnsupported)")
+  }
+
   func test_failed_without_profile_is_never_retryable() {
     let s = LocalAPIState.make(status: .failed(code: .spawnFailed, message: "boom"),
                                hasActiveProfile: false)
