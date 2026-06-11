@@ -61,14 +61,13 @@ struct ChatScaffoldView: View {
   /// `HelperUnavailableNotice` — never the engine-failure banner, which would
   /// re-attribute a Helper state to the engine.
   @State private var helperBlock: HelperUnavailable?
-  /// #516: the send the gate is holding. Armed when a send is blocked
-  /// (with the blocked draft + the gate's load target), evaluated on every
-  /// model-resolution edge, fired exactly once through the composer's
-  /// normal submit path. Cleared on cancel, manual send, profile switch,
-  /// navigation away, or a stale resolution (different model/chat).
-  @State private var pendingAutoSend: PendingAutoSend?
-  /// #516: the fire signal handed to the composer (tick + edit-guard text).
-  @State private var composerAutoSubmit: ComposerAutoSubmit?
+  /// #516: the send the gate is holding plus its fire signal. Armed when a
+  /// send is blocked (with the blocked draft + the gate's load target),
+  /// settled on every model-resolution edge (fired exactly once through the
+  /// composer's normal submit path), and disarmed on cancel, manual send,
+  /// profile switch, navigation away, or a stale resolution. The
+  /// transitions live in `PendingSendState` so they are unit-tested.
+  @State private var pendingSend = PendingSendState()
 
   init(
     chatID: UUID,
@@ -390,19 +389,18 @@ struct ChatScaffoldView: View {
             // #516: capture the blocked send so it can auto-submit once
             // the gate's load target resolves — the promise the sheet's
             // copy makes ("…to send your message").
-            pendingAutoSend = PendingAutoSend.arm(
-              chatID: chat.id,
-              targetModelID: gateTarget(for: chat)?.modelID,
-              messageText: draft)
+            pendingSend.arm(chatID: chat.id,
+                            targetModelID: gateTarget(for: chat)?.modelID,
+                            messageText: draft)
             presentNoModelPrompt()
           },
           onUserMessageSaved: { _ in
             // A send committed (manual or fired auto-send) — any armed
             // pending send is now satisfied or superseded. #516.
-            pendingAutoSend = nil
+            pendingSend.disarm()
             sendAssistantTurn(for: chat)
           },
-          autoSubmit: composerAutoSubmit
+          autoSubmit: pendingSend.autoSubmit
         )
       }
     }
@@ -436,14 +434,14 @@ struct ChatScaffoldView: View {
         onCancel: {
           // #516: a dismissed gate drops the pending send — the draft stays
           // in the composer, but nothing auto-fires later.
-          pendingAutoSend = nil
+          pendingSend.disarm()
           showNoModelPrompt = false
         },
         engineStatus: engineStatusStore.status,
         // #516: only promise "…to send your message" when a blocked send is
         // actually armed to fire (the launch-time prompt raises this same
         // sheet with an empty composer — there, the copy must not lie).
-        willAutoSend: pendingAutoSend != nil
+        willAutoSend: pendingSend.pending != nil
       )
     }
     .onChange(of: engineStatusStore.status) { _, new in
@@ -519,7 +517,7 @@ struct ChatScaffoldView: View {
       guard chat.profileID != new else { return }
       // #516: a profile switch makes the gate's promised load target stale —
       // drop the pending send rather than auto-firing under a new profile.
-      pendingAutoSend = nil
+      pendingSend.disarm()
       let previous = chat.profileID
       chat.profileID = new
       do {
@@ -551,7 +549,7 @@ struct ChatScaffoldView: View {
       sendController.cancel()
       // #516: navigating away abandons the pending flow — no stale
       // auto-send when the user later returns or switches chats.
-      pendingAutoSend = nil
+      pendingSend.disarm()
     }
     .task(id: downloadController.completionTick) {
       await refreshToolbarModelOptions()
@@ -651,7 +649,7 @@ struct ChatScaffoldView: View {
       // bounded pre-F6 behavior beats an infinite hold). The `.task`
       // cancels this on a status flip (the sleep throws), so a real
       // engine transition supersedes the fallback.
-      switch Self.reconcileFailureStep(hasPendingAutoSend: pendingAutoSend != nil,
+      switch Self.reconcileFailureStep(hasPendingAutoSend: pendingSend.pending != nil,
                                        isRetryPass: isRetryPass) {
       case .none:
         break
@@ -1038,22 +1036,12 @@ struct ChatScaffoldView: View {
     if showNoModelPrompt, resolved != nil {
       showNoModelPrompt = false
     }
-    guard let pending = pendingAutoSend else { return }
-    switch pending.verdict(chatID: chat.id,
-                           resolvedModelID: resolved,
-                           isSending: sendController.isInFlight) {
-    case .hold:
-      break
-    case .disarm:
-      pendingAutoSend = nil
-    case .fire:
-      // Clear BEFORE signalling so re-entrant resolution edges (the send
-      // itself reconciles state) can never fire the same message twice.
-      pendingAutoSend = nil
-      composerAutoSubmit = ComposerAutoSubmit(
-        tick: (composerAutoSubmit?.tick ?? 0) + 1,
-        expectedText: pending.messageText)
-    }
+    // Settle the pending: fire-once (cleared before the signal so
+    // re-entrant edges can never double-send), disarm on stale, else hold.
+    // The transition bookkeeping lives in `PendingSendState` (tested).
+    pendingSend.settle(chatID: chat.id,
+                       resolvedModelID: resolved,
+                       isSending: sendController.isInFlight)
   }
 
   /// Resolve the model a send should target from the chat's SELECTION
