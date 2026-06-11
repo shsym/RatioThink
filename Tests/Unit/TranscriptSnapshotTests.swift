@@ -52,6 +52,20 @@ final class TranscriptSnapshotTests: XCTestCase {
     XCTAssertEqual(snapshot.scrollKey, "3:14")
   }
 
+  func test_snapshot_scroll_key_changes_when_reasoning_only_stream_grows() {
+    let id = UUID()
+    let first = TranscriptSnapshot(items: [
+      ChatMessageItem(id: id, role: .assistant, content: "", reasoning: "think")
+    ])
+    let updated = TranscriptSnapshot(items: [
+      ChatMessageItem(id: id, role: .assistant, content: "", reasoning: "thinking…")
+    ])
+
+    XCTAssertEqual(first.scrollKey, "1:5")
+    XCTAssertEqual(updated.scrollKey, "1:9")
+    XCTAssertNotEqual(first.scrollKey, updated.scrollKey)
+  }
+
   func test_snapshot_traverses_source_and_projects_each_message_once() {
     let counter = Counter()
     let rows = (0..<200).map { index in

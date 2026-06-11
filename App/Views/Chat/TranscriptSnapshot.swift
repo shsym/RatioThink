@@ -13,7 +13,9 @@ struct TranscriptSnapshot: Equatable {
 
   init(items: [ChatMessageItem]) {
     self.items = items
-    let lengthSum = items.reduce(0) { $0 &+ $1.content.count }
+    let lengthSum = items.reduce(0) { partial, item in
+      partial &+ item.content.count &+ item.reasoning.count
+    }
     self.scrollKey = "\(items.count):\(lengthSum)"
   }
 

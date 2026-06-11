@@ -9,10 +9,11 @@ import SwiftUI
 /// is streaming.
 ///
 /// Auto-scroll uses `ScrollViewReader` keyed on the snapshot's `(count,
-/// rolling-content-length)`. Bumping `count` covers insertions / removals; the
-/// rolling sum covers in-place edits (streaming-token growth). Hashing the full
-/// content would be more precise, but length sums are cheap and have zero false
-/// negatives for token growth.
+/// rolling-rendered-text-length)`. Bumping `count` covers insertions/removals;
+/// the rolling content+reasoning sum covers in-place edits that change visible
+/// transcript height, including reasoning-only thinking streams before answer
+/// content starts. Hashing the full strings would be more precise, but rendered
+/// text lengths are cheap and have zero false negatives for token growth.
 struct TranscriptView: View {
   let chat: Chat
 
