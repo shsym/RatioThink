@@ -16,7 +16,12 @@ struct ChatScaffoldView: View {
   @Query private var chats: [Chat]
   @Environment(\.modelContext) private var modelContext
   @StateObject private var viewModel: ChatTranscriptViewModel
-  @StateObject private var sendController = ChatSendController()
+  /// #507: send pipelines are app-scoped (one controller per chat, owned by
+  /// the coordinator) so an in-flight stream survives this view's teardown
+  /// when the user switches chats. This view only borrows its chat's
+  /// controller; it never cancels on disappear.
+  @EnvironmentObject private var sendCoordinator: ChatSendCoordinator
+  private let chatID: UUID
   let availableProfiles: [String]
   let availableModels: [String]
   @EnvironmentObject private var swapCoordinator: ProfileSwapCoordinator
@@ -79,6 +84,7 @@ struct ChatScaffoldView: View {
     let id = chatID
     _chats = Query(filter: #Predicate<Chat> { $0.id == id })
     _viewModel = StateObject(wrappedValue: ChatTranscriptViewModel())
+    self.chatID = id
     self.availableProfiles = availableProfiles
     self.availableModels = availableModels
   }
@@ -383,7 +389,7 @@ struct ChatScaffoldView: View {
         ComposerView(
           chat: chat,
           viewModel: viewModel,
-          isSending: sendController.isInFlight,
+          isSending: sendCoordinator.isInFlight(chatID),
           shouldAllowSend: { currentModelID(for: chat) != nil },
           onSendBlocked: { draft in
             // #516: capture the blocked send so it can auto-submit once
@@ -400,6 +406,9 @@ struct ChatScaffoldView: View {
             pendingSend.disarm()
             sendAssistantTurn(for: chat)
           },
+          // #507: the composer's stop button — the user-reachable cancel
+          // for this chat's in-flight turn (review v1 F1).
+          onStop: { sendCoordinator.cancel(chatID: chatID) },
           autoSubmit: pendingSend.autoSubmit
         )
       }
@@ -478,15 +487,12 @@ struct ChatScaffoldView: View {
     // selection) IS the new fact being observed, so no residency pre-check.
     .onChange(of: modelLoadCenter.residentModelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
     .onChange(of: chat.modelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
-    // #413: open/close the helper-health generation gate around every stream.
-    // While a chat / ToT generation is in flight a saturated engineStatus poll
-    // path can time out for many consecutive polls; without this gate the
-    // restart ladder reads those busy-timeouts as an unreachable helper and
-    // bounces it — killing the engine mid-search and closing the SSE. The gate
-    // holds those failed polls; genuine death still surfaces (the stream drops,
-    // ending the generation and releasing the gate).
-    .onChange(of: sendController.isInFlight) { _, inFlight in
-      helperHealth.setGenerating(inFlight)
+    // #413's helper-health generation gate is wired at app scope from
+    // `ChatSendCoordinator.onAnyInFlightChange` (#507) — streams outlive this
+    // view now, so a per-view forward would release the gate on navigate-away
+    // while the stream is still saturating the MainActor. THIS chat's
+    // in-flight edge is still observed here for #516:
+    .onChange(of: sendCoordinator.isInFlight(chatID)) { _, inFlight in
       // #516 review F2: a fire delivered while a send is in flight would be
       // swallowed by `submit()`'s `!isSending` guard — so `verdict` holds
       // while in flight, and THIS edge (in-flight clearing) re-evaluates
@@ -545,8 +551,11 @@ struct ChatScaffoldView: View {
         persistenceStatus.report(error, context: "ChatScaffoldView.profileSwap")
       }
     }
+    // #507: NO `.onDisappear` stream cancel — switching chats must not kill
+    // the stream. Cancellation is explicit only: the composer's stop button
+    // (`cancel(chatID:)`) or chat deletion (`forget`); a new send in the
+    // same chat still supersedes inside `ChatSendController.send`.
     .onDisappear {
-      sendController.cancel()
       // #516: navigating away abandons the pending flow — no stale
       // auto-send when the user later returns or switches chats.
       pendingSend.disarm()
@@ -700,6 +709,11 @@ struct ChatScaffoldView: View {
     // route the turn to the ToT dispatch (streamed tree search rendered
     // inline) instead of a chat completion. The launched inferlet is
     // still chat-apc — ToT is a per-request dispatch mode.
+    // #507: the chat's app-scoped controller — the send outlives this view.
+    let sendController = sendCoordinator.controller(for: chatID)
+
+    // #523 Part B binds the whole profile so the ToT dispatch can source its
+    // candidate-generation temperature from it (`toTRequestSampling` below).
     if let totProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
        let totConfig = totProfile.treeOfThought {
       sendController.sendTreeOfThought(
@@ -1044,7 +1058,7 @@ struct ChatScaffoldView: View {
     // The transition bookkeeping lives in `PendingSendState` (tested).
     pendingSend.settle(chatID: chat.id,
                        resolvedModelID: resolved,
-                       isSending: sendController.isInFlight)
+                       isSending: sendCoordinator.isInFlight(chatID))
   }
 
   /// Resolve the model a send should target from the chat's SELECTION
