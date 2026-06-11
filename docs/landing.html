@@ -32,6 +32,13 @@
   a:hover{color:var(--accent)}
   .wrap{max-width:920px;margin:0 auto;padding:40px 22px 64px}
 
+  /* ---------- top nav ---------- */
+  .top-nav{display:flex;justify-content:flex-end;align-items:center;margin:0 0 8px}
+  .nav-github{display:inline-flex;align-items:center;gap:7px;color:var(--ink-soft);
+    font-size:13px;font-weight:600;text-decoration:none;padding:6px 0}
+  .nav-github:hover{color:var(--accent-dark);text-decoration:underline}
+  .nav-github:focus-visible{outline:2px solid var(--accent);outline-offset:4px;border-radius:7px}
+
   /* ---------- hero ---------- */
   header.hero{text-align:center;padding:14px 0 24px}
   header.hero img.icon{width:88px;height:88px;
@@ -197,6 +204,7 @@
     .grid{grid-template-columns:1fr}
     header.hero h1{font-size:32px}
     header.hero p.tag{font-size:18px}
+    .top-nav{justify-content:center;margin-bottom:12px}
   }
   /* honor reduced motion: JS renders static frames; kill residual animation */
   @media (prefers-reduced-motion:reduce){
@@ -207,6 +215,10 @@
 </head>
 <body>
 <div class="wrap">
+
+  <nav class="top-nav" aria-label="Primary">
+    <a class="nav-github" href="https://github.com/shsym/RatioThink">GitHub</a>
+  </nav>
 
   <header class="hero">
     <img class="icon" src="assets/pie-icon.png" alt="Rational app icon">
@@ -279,7 +291,7 @@
       <button type="button" class="dot" data-scene="0" aria-label="Show the Tree of Thought demo"></button>
       <button type="button" class="dot" data-scene="1" aria-label="Show the Fast Think demo"></button>
     </div>
-    <p class="demo-note">An illustration, condensed for clarity — real answers are longer and more detailed.</p>
+    <p class="demo-note">An illustration, condensed for clarity.</p>
   </div>
 
   <!-- ===================== why ===================== -->
@@ -302,8 +314,7 @@
   </section>
 
   <footer>
-    <a href="https://github.com/shsym/RatioThink">github.com/shsym/RatioThink</a>
-    &nbsp;·&nbsp; Apache-2.0
+    Apache-2.0
     <div class="credit">Powered by the <a href="https://github.com/pie-project/pie">Pie</a> inference engine.
       Profiles are implemented as a Pie <a href="https://pie-project.org/docs/overview/what-is-pie">inferlet</a>.</div>
   </footer>

@@ -60,7 +60,7 @@ define gui_suite_run
 endef
 
 .PHONY: help genproject build build-static build-tests clean lint ci-pr check-vendor-pin local-pre-merge local-gui-gate local-e2e-gate release-gate \
-        verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
+        verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics test-landing-page \
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-tot-real-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
@@ -91,7 +91,7 @@ build-static: genproject ## Compile/type-check Rational app + helper without bui
 check-vendor-pin: ## Fail-closed guard: Vendor/pie gitlink must be reachable from its .gitmodules tracking branch (catches pin/branch drift)
 	Scripts/check-vendor-pie-pin.sh
 
-ci-pr: lint check-vendor-pin test-ci-v2-static-gate verify-app-icon-assets test-app-icon-assets build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
+ci-pr: lint check-vendor-pin test-ci-v2-static-gate verify-app-icon-assets test-app-icon-assets test-landing-page build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
 
 local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary test-harsh-load-selftest test-matrix-aggregator ## Mandatory local pre-merge parity for runtime/heavy checks kept out of the lightweight manual workflow
 
@@ -228,6 +228,9 @@ release-preflight: ## Assess a built artifact for Gatekeeper readiness (ARTIFACT
 test-release: ## Real-tool contract tests for the notarize + preflight scripts (CI-safe)
 	Scripts/test-release-preflight.sh
 	Scripts/test-notarize.sh
+
+test-landing-page: ## Published GitHub Pages landing page copy/nav regression guard
+	Scripts/test-landing-page.sh
 
 build-inferlets: ## Build chat-apc inferlet wasm (wasm32-wasip2) into Inferlets/chat-apc/prebuilt/
 	Scripts/stamp-chat-apc.sh build
