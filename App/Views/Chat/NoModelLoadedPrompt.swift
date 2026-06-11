@@ -14,8 +14,9 @@ import SwiftUI
 ///     CTA still visible if a fresh-install model needs downloading);
 ///   · engineFailed → EngineProblem copy + the affordance its
 ///     `recovery` names (#477): Retry (`.restartEngine`) / Open Models
-///     settings (`.chooseModel`) / inline download (missing +
-///     downloadable) / none (helper-restart or terminal faults);
+///     settings (`.chooseModel`, including unsupported models) / inline
+///     download (missing + downloadable) / none (helper-restart or
+///     terminal faults);
 ///   · helperUnreachable → the reason + Retry (re-poll);
 ///   · configBroken → the reason + Open Settings;
 ///   · needsLoad / noDefault → the #326 availability action, framed
@@ -195,8 +196,9 @@ struct NoModelLoadedPrompt: View {
                     primary: .none, showsOpenSettings: false)
       }
       // `.chooseModel` routes to Models settings, never a re-fire (F3);
-      // only `.restartEngine` earns a Retry — `.restartHelper`/`none`
-      // faults would re-fail (or be refused) on a blind engine start.
+      // this includes unsupported cached model artifacts. Only
+      // `.restartEngine` earns a Retry — `.restartHelper`/`none` faults
+      // would re-fail (or be refused) on a blind engine start.
       return Plan(headline: problem.title, reason: problem.message,
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
                   primary: problem.recovery == .restartEngine ? .retryEngine : .none,

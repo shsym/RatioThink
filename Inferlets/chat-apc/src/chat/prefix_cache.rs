@@ -83,18 +83,23 @@
 //! - **Engine restart / model unload / profile-prompt drift**: natural
 //!   misses (snapshot gone or name changed).
 //! - **Chat delete**: the chat's snapshots become unreachable (no future
-//!   request carries that key+prefix) — an "explicit miss". Reclaiming the
-//!   pages is smart-retention work owned by #524.
+//!   request carries that key+prefix) — an "explicit miss". Phase 2
+//!   retention reclaims inactive unreachable snapshots under runtime KV
+//!   pressure.
 //! - **policy = bypass**: never open, never save (privacy / ephemeral).
 //!
-//! ## Phase 1 / Phase 2 split
+//! ## Phase 2 retention
 //!
-//! Phase 1 (this module) is correctness-first: whole-snapshot
-//! save/open/delete and explicit miss/rebuild only. No global LRU, no
-//! page-pressure eviction, no committed-tail truncation — those wait on
-//! #517's authoritative global KV accounting and land in #524.
+//! The App may attach authoritative #517 runtime KV counters as a
+//! `cache.retention` budget. The inferlet passes that budget to pie's
+//! long-lived host `ContextManager`, which owns snapshot listing,
+//! per-request active protection, LRU selection, and deletion. Retention
+//! state intentionally does **not** live in WASM guest statics because the
+//! daemon creates a fresh component instance for each HTTP request.
 
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::collections::{HashMap, HashSet};
 
 // =============================================================================
 // Request directive
@@ -130,6 +135,11 @@ pub struct CacheDirective {
     pub compat: String,
     #[serde(default)]
     pub policy: Policy,
+    /// Optional Phase-2 retention budget supplied by the App from #517's
+    /// authoritative pie `model_status` counters. Absent means "do not evict
+    /// on this request" rather than guessing from tokens.
+    #[serde(default)]
+    pub retention: Option<RetentionBudget>,
 }
 
 impl CacheDirective {
@@ -137,6 +147,297 @@ impl CacheDirective {
     pub fn enabled(&self) -> bool {
         self.policy == Policy::Auto && !self.key.is_empty()
     }
+}
+
+// =============================================================================
+// Smart retention / LRU eviction
+// =============================================================================
+
+const DEFAULT_SOFT_PERCENT: u8 = 70;
+const DEFAULT_EVICT_PERCENT: u8 = 80;
+const DEFAULT_HARD_PERCENT: u8 = 95;
+
+fn default_soft_percent() -> u8 {
+    DEFAULT_SOFT_PERCENT
+}
+
+fn default_evict_percent() -> u8 {
+    DEFAULT_EVICT_PERCENT
+}
+
+fn default_hard_percent() -> u8 {
+    DEFAULT_HARD_PERCENT
+}
+
+/// Runtime-provided global KV pressure for the served model. These counters
+/// deliberately mirror #517's `KVUsageSnapshot` / pie `model_status` names;
+/// callers must pass runtime counters, not app-side token estimates.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetentionBudget {
+    pub kv_pages_used: u32,
+    pub kv_pages_total: u32,
+    #[serde(default = "default_soft_percent")]
+    pub soft_percent: u8,
+    #[serde(default = "default_evict_percent")]
+    pub evict_percent: u8,
+    #[serde(default = "default_hard_percent")]
+    pub hard_percent: u8,
+}
+
+impl Default for RetentionBudget {
+    fn default() -> Self {
+        Self {
+            kv_pages_used: 0,
+            kv_pages_total: 0,
+            soft_percent: DEFAULT_SOFT_PERCENT,
+            evict_percent: DEFAULT_EVICT_PERCENT,
+            hard_percent: DEFAULT_HARD_PERCENT,
+        }
+    }
+}
+
+#[cfg(test)]
+impl RetentionBudget {
+    fn coherent(&self) -> bool {
+        self.kv_pages_total > 0
+            && self.kv_pages_used <= self.kv_pages_total
+            && self.soft_percent <= 100
+            && self.evict_percent <= 100
+            && self.hard_percent <= 100
+            && self.soft_percent <= self.evict_percent
+            && self.evict_percent <= self.hard_percent
+    }
+
+    fn threshold_pages(&self, percent: u8) -> u32 {
+        ((self.kv_pages_total as u64 * percent as u64) / 100) as u32
+    }
+
+    fn soft_pages(&self) -> u32 {
+        self.threshold_pages(self.soft_percent)
+    }
+
+    fn evict_pages(&self) -> u32 {
+        self.threshold_pages(self.evict_percent)
+    }
+
+    fn hard_pages(&self) -> u32 {
+        self.threshold_pages(self.hard_percent)
+    }
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionReason {
+    RetainedBelowSoftLimit,
+    RetainedBelowEvictionLimit,
+    EvictedPressure,
+    HardCapStillExceeded,
+    RetentionDeleteFailed,
+    ProtectedActive,
+    NoInactiveSnapshots,
+    SkippedUncertainAccounting,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetentionReport {
+    pub evicted_names: Vec<String>,
+    pub pages_reclaimed: u32,
+    pub protected_active_pages: u32,
+    pub retained_snapshot_count: usize,
+    pub delete_failed_count: u32,
+    pub reason: RetentionReason,
+}
+
+impl Default for RetentionReason {
+    fn default() -> Self {
+        Self::RetainedBelowSoftLimit
+    }
+}
+
+fn map_host_retention_reason(reason: HostRetentionReason) -> RetentionReason {
+    match reason {
+        HostRetentionReason::RetainedBelowSoftLimit => RetentionReason::RetainedBelowSoftLimit,
+        HostRetentionReason::RetainedBelowEvictionLimit => RetentionReason::RetainedBelowEvictionLimit,
+        HostRetentionReason::EvictedPressure => RetentionReason::EvictedPressure,
+        HostRetentionReason::HardCapStillExceeded => RetentionReason::HardCapStillExceeded,
+        HostRetentionReason::RetentionDeleteFailed => RetentionReason::RetentionDeleteFailed,
+        HostRetentionReason::ProtectedActive => RetentionReason::ProtectedActive,
+        HostRetentionReason::NoInactiveSnapshots => RetentionReason::NoInactiveSnapshots,
+        HostRetentionReason::SkippedUncertainAccounting => RetentionReason::SkippedUncertainAccounting,
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct SnapshotRecord {
+    name: String,
+    key: String,
+    model_id: String,
+    pages: u32,
+    last_used_tick: u64,
+}
+
+#[cfg(test)]
+#[derive(Default, Debug)]
+pub struct RetentionRegistry {
+    records: HashMap<String, SnapshotRecord>,
+}
+
+#[cfg(test)]
+impl RetentionRegistry {
+    pub fn record_saved(
+        &mut self,
+        name: impl Into<String>,
+        key: impl Into<String>,
+        model_id: impl Into<String>,
+        pages: u32,
+        last_used_tick: u64,
+    ) {
+        let name = name.into();
+        self.records.insert(
+            name.clone(),
+            SnapshotRecord {
+                name,
+                key: key.into(),
+                model_id: model_id.into(),
+                pages,
+                last_used_tick,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub fn contains(&self, name: &str) -> bool {
+        self.records.contains_key(name)
+    }
+
+    pub fn enforce(
+        &mut self,
+        model_id: &str,
+        budget: RetentionBudget,
+        protected_names: &[&str],
+    ) -> RetentionReport {
+        let retained_snapshot_count = self
+            .records
+            .values()
+            .filter(|record| record.model_id == model_id)
+            .count();
+        if !budget.coherent() {
+            return RetentionReport {
+                retained_snapshot_count,
+                reason: RetentionReason::SkippedUncertainAccounting,
+                ..Default::default()
+            };
+        }
+
+        let protected: HashSet<&str> = protected_names.iter().copied().collect();
+        let protected_active_pages = self
+            .records
+            .values()
+            .filter(|record| {
+                record.model_id == model_id && protected.contains(record.name.as_str())
+            })
+            .map(|record| record.pages)
+            .sum();
+        let target = budget.evict_pages();
+        if budget.kv_pages_used <= budget.soft_pages() {
+            return RetentionReport {
+                retained_snapshot_count,
+                protected_active_pages,
+                reason: RetentionReason::RetainedBelowSoftLimit,
+                ..Default::default()
+            };
+        }
+        if budget.kv_pages_used <= target {
+            return RetentionReport {
+                retained_snapshot_count,
+                protected_active_pages,
+                reason: RetentionReason::RetainedBelowEvictionLimit,
+                ..Default::default()
+            };
+        }
+
+        let mut candidates: Vec<SnapshotRecord> = self
+            .records
+            .values()
+            .filter(|record| {
+                record.model_id == model_id && !protected.contains(record.name.as_str())
+            })
+            .cloned()
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.last_used_tick
+                .cmp(&b.last_used_tick)
+                .then_with(|| a.key.cmp(&b.key))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        let mut projected = budget.kv_pages_used;
+        let mut evicted_names = Vec::new();
+        let mut pages_reclaimed = 0u32;
+        for record in candidates {
+            if projected <= target {
+                break;
+            }
+            projected = projected.saturating_sub(record.pages);
+            pages_reclaimed = pages_reclaimed.saturating_add(record.pages);
+            evicted_names.push(record.name.clone());
+            self.records.remove(&record.name);
+        }
+
+        let reason = if !evicted_names.is_empty() {
+            if projected > budget.hard_pages() {
+                RetentionReason::HardCapStillExceeded
+            } else {
+                RetentionReason::EvictedPressure
+            }
+        } else if protected_active_pages > 0 {
+            RetentionReason::ProtectedActive
+        } else {
+            RetentionReason::NoInactiveSnapshots
+        };
+
+        let retained_snapshot_count = self
+            .records
+            .values()
+            .filter(|record| record.model_id == model_id)
+            .count();
+        RetentionReport {
+            evicted_names,
+            pages_reclaimed,
+            protected_active_pages,
+            retained_snapshot_count,
+            delete_failed_count: 0,
+            reason,
+        }
+    }
+}
+
+/// RAII guard for snapshots used by an in-flight generation. The deletion
+/// pass also receives the just-saved snapshot name, so both active streams
+/// and the current foreground generation are protected from LRU eviction.
+pub struct ActiveSnapshotGuard<'a> {
+    model: &'a Model,
+    names: Vec<String>,
+}
+
+impl Drop for ActiveSnapshotGuard<'_> {
+    fn drop(&mut self) {
+        for name in &self.names {
+            Context::release_snapshot(self.model, name);
+        }
+    }
+}
+
+pub fn protect<'a>(model: &'a Model, plan: &ReusePlan) -> ActiveSnapshotGuard<'a> {
+    let names: Vec<String> = plan.open_name.iter().cloned().collect();
+    for name in &names {
+        if let Err(e) = Context::retain_snapshot(model, name) {
+            eprintln!("[chat-apc] prefix-cache retain snapshot failed for {name}: {e}");
+        }
+    }
+    ActiveSnapshotGuard { model, names }
 }
 
 // =============================================================================
@@ -256,6 +557,25 @@ pub struct CacheDiag {
     pub save_result: String,
     /// Content-hash portion of the saved next-prefix name (empty when none).
     pub save_hash: String,
+    /// Number of same-model snapshots still tracked after retention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_snapshot_count: Option<usize>,
+    /// Number of whole inactive snapshots evicted by the retention pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evicted_snapshot_count: Option<usize>,
+    /// KV pages reclaimed by whole-snapshot LRU eviction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pages_reclaimed: Option<u32>,
+    /// Host-side delete failures observed during the retention pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_failed_count: Option<u32>,
+    /// Pages attributed to protected active/current snapshots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protected_active_pages: Option<u32>,
+    /// Retention decision reason (`evicted_pressure`,
+    /// `protected_active`, `skipped_uncertain_accounting`, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eviction_reason: Option<RetentionReason>,
 }
 
 impl CacheDiag {
@@ -276,7 +596,9 @@ impl CacheDiag {
 // =============================================================================
 
 use super::completions::{ChatMessage, ToolSchema, build_prompt_tokens};
-use inferlet::Context;
+use inferlet::{
+    Context, RetentionBudget as HostRetentionBudget, RetentionReason as HostRetentionReason,
+};
 use inferlet::chat;
 use inferlet::model::Model;
 
@@ -458,8 +780,10 @@ pub async fn finalize(plan: &ReusePlan, gen_content: &str, model: &Model, diag: 
         return;
     }
     // Authoritative engine state — emit, never guess.
-    diag.committed_pages = Some(save_ctx.inner().committed_page_count());
-    diag.working_pages = Some(save_ctx.inner().working_page_count());
+    let committed_pages = save_ctx.inner().committed_page_count();
+    let working_pages = save_ctx.inner().working_page_count();
+    diag.committed_pages = Some(committed_pages);
+    diag.working_pages = Some(working_pages);
     match save_ctx.save(&name) {
         Ok(()) => {
             diag.save_result = "saved".to_string();
@@ -475,6 +799,34 @@ pub async fn finalize(plan: &ReusePlan, gen_content: &str, model: &Model, diag: 
             } else {
                 eprintln!("[chat-apc] prefix-cache save failed: {es}");
                 diag.save_result = "failed:save".to_string();
+            }
+        }
+    }
+    if let Some(budget) = plan.directive.retention {
+        match Context::enforce_retention(
+            model,
+            "apc/",
+            &name,
+            HostRetentionBudget {
+                kv_pages_used: budget.kv_pages_used,
+                kv_pages_total: budget.kv_pages_total,
+                soft_percent: budget.soft_percent,
+                evict_percent: budget.evict_percent,
+                hard_percent: budget.hard_percent,
+            },
+        ) {
+            Ok(report) => {
+                diag.retained_snapshot_count = Some(report.retained_snapshot_count as usize);
+                diag.evicted_snapshot_count = Some(report.evicted_names.len());
+                diag.pages_reclaimed = Some(report.pages_reclaimed);
+                diag.protected_active_pages = Some(report.protected_active_pages);
+                diag.delete_failed_count = Some(report.delete_failed_count);
+                diag.eviction_reason = Some(map_host_retention_reason(report.reason));
+            }
+            Err(e) => {
+                eprintln!("[chat-apc] prefix-cache host retention failed: {e}");
+                diag.eviction_reason = Some(RetentionReason::SkippedUncertainAccounting);
+                diag.delete_failed_count = Some(1);
             }
         }
     }
@@ -665,6 +1017,7 @@ mod tests {
             turn: 0,
             compat: "1".to_string(),
             policy: Policy::Auto,
+            retention: None,
         };
         assert!(d.enabled());
         d.policy = Policy::Bypass;
@@ -683,5 +1036,125 @@ mod tests {
         let d2: CacheDirective = serde_json::from_str(r#"{"key":"c"}"#).unwrap();
         assert_eq!(d2.policy, Policy::Auto);
         assert!(d2.enabled());
+    }
+
+    // ─── smart retention / LRU eviction ──────────────────────
+
+    #[test]
+    fn retention_budget_deserializes_authoritative_runtime_usage() {
+        let d: CacheDirective = serde_json::from_str(
+            r#"{
+                "key":"chat-a",
+                "turn":3,
+                "retention":{
+                    "kv_pages_used":90,
+                    "kv_pages_total":100,
+                    "soft_percent":70,
+                    "evict_percent":80,
+                    "hard_percent":95
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let retention = d.retention.expect("retention directive should decode");
+        assert_eq!(retention.kv_pages_used, 90);
+        assert_eq!(retention.kv_pages_total, 100);
+        assert_eq!(retention.soft_percent, 70);
+        assert_eq!(retention.evict_percent, 80);
+        assert_eq!(retention.hard_percent, 95);
+    }
+
+    #[test]
+    fn retention_ignores_uncertain_or_incoherent_usage_accounting() {
+        let mut registry = RetentionRegistry::default();
+        registry.record_saved("apc/old/1/hash-old", "old", "m", 10, 1);
+
+        let report = registry.enforce(
+            "m",
+            RetentionBudget {
+                kv_pages_used: 120,
+                kv_pages_total: 0,
+                ..RetentionBudget::default()
+            },
+            &[],
+        );
+
+        assert!(report.evicted_names.is_empty());
+        assert_eq!(report.reason, RetentionReason::SkippedUncertainAccounting);
+    }
+
+    #[test]
+    fn retention_evicts_inactive_snapshots_by_lru_until_under_pressure() {
+        let mut registry = RetentionRegistry::default();
+        registry.record_saved("apc/oldest/1/hash-a", "oldest", "m", 8, 1);
+        registry.record_saved("apc/middle/1/hash-b", "middle", "m", 9, 2);
+        registry.record_saved("apc/recent/1/hash-c", "recent", "m", 25, 3);
+
+        let report = registry.enforce(
+            "m",
+            RetentionBudget {
+                kv_pages_used: 95,
+                kv_pages_total: 100,
+                evict_percent: 80,
+                ..RetentionBudget::default()
+            },
+            &["apc/recent/1/hash-c"],
+        );
+
+        assert_eq!(
+            report.evicted_names,
+            vec!["apc/oldest/1/hash-a", "apc/middle/1/hash-b"]
+        );
+        assert_eq!(report.pages_reclaimed, 17);
+        assert_eq!(report.protected_active_pages, 25);
+        assert_eq!(report.reason, RetentionReason::EvictedPressure);
+        assert!(registry.contains("apc/recent/1/hash-c"));
+        assert!(!registry.contains("apc/oldest/1/hash-a"));
+        assert!(!registry.contains("apc/middle/1/hash-b"));
+    }
+
+    #[test]
+    fn retention_preserves_recent_compatible_chat_when_one_lru_evict_satisfies_budget() {
+        let mut registry = RetentionRegistry::default();
+        registry.record_saved("apc/cold/1/hash-a", "cold", "m", 10, 1);
+        registry.record_saved("apc/warm/1/hash-b", "warm", "m", 10, 9);
+
+        let report = registry.enforce(
+            "m",
+            RetentionBudget {
+                kv_pages_used: 85,
+                kv_pages_total: 100,
+                evict_percent: 80,
+                ..RetentionBudget::default()
+            },
+            &[],
+        );
+
+        assert_eq!(report.evicted_names, vec!["apc/cold/1/hash-a"]);
+        assert!(registry.contains("apc/warm/1/hash-b"));
+    }
+
+    #[test]
+    fn retention_reports_protected_when_pressure_cannot_be_reclaimed_safely() {
+        let mut registry = RetentionRegistry::default();
+        registry.record_saved("apc/active/1/hash-a", "active", "m", 40, 1);
+
+        let report = registry.enforce(
+            "m",
+            RetentionBudget {
+                kv_pages_used: 95,
+                kv_pages_total: 100,
+                evict_percent: 80,
+                hard_percent: 90,
+                ..RetentionBudget::default()
+            },
+            &["apc/active/1/hash-a"],
+        );
+
+        assert!(report.evicted_names.is_empty());
+        assert_eq!(report.protected_active_pages, 40);
+        assert_eq!(report.reason, RetentionReason::ProtectedActive);
+        assert!(registry.contains("apc/active/1/hash-a"));
     }
 }

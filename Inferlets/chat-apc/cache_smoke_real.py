@@ -45,10 +45,9 @@ import tempfile
 import uuid
 from pathlib import Path
 
+import e2e_test as h  # boot/teardown helpers + PIE_BIN/WASM_PATH/MANIFEST_PATH
 import httpx
 from pie_client import PieClient
-
-import e2e_test as h  # boot/teardown helpers + PIE_BIN/WASM_PATH/MANIFEST_PATH
 
 MODEL = os.environ.get("MODEL", "Qwen/Qwen3-0.6B")
 
@@ -101,7 +100,11 @@ async def main() -> int:
         cfg.write_text(CONFIG_TOML)
         pie_home = tmp / "home"
         pie_home.mkdir()
-        env = {**os.environ, "PIE_HOME": str(pie_home), "PIE_SHMEM_NAME": f"/cache_real_{os.getpid()}"}
+        env = {
+            **os.environ,
+            "PIE_HOME": str(pie_home),
+            "PIE_SHMEM_NAME": f"/cache_real_{os.getpid()}",
+        }
         proc = subprocess.Popen(
             [str(h.PIE_BIN), "serve", "--config", str(cfg), "--no-auth", "--debug"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, bufsize=1,
@@ -125,8 +128,16 @@ async def main() -> int:
                 q1 = "What is the capital of France? Answer in one short sentence."
                 q2 = "And what is its most famous landmark? One short sentence."
 
-                def directive(k: str, turn: int, policy: str = "auto") -> dict:
-                    return {"key": k, "turn": turn, "compat": "1", "policy": policy}
+                def directive(
+                    k: str,
+                    turn: int,
+                    policy: str = "auto",
+                    retention: dict | None = None,
+                ) -> dict:
+                    out = {"key": k, "turn": turn, "compat": "1", "policy": policy}
+                    if retention is not None:
+                        out["retention"] = retention
+                    return out
 
                 async with httpx.AsyncClient(timeout=240) as http_c:
                     # ── Control: no cache directive (legacy path) ─────
@@ -147,7 +158,10 @@ async def main() -> int:
                         "temperature": 0, "max_tokens": 256, "stream": False,
                         "cache": directive(key, 1),
                     })
-                    print(f"[cache] turn1 -> {t1.status_code} diag={_diag(t1)} body={t1.text[:300]!r}")
+                    print(
+                        f"[cache] turn1 -> {t1.status_code} diag={_diag(t1)} "
+                        f"body={t1.text[:300]!r}"
+                    )
                     if t1.status_code != 200:
                         failures.append(f"turn1 status {t1.status_code}: {t1.text[:300]!r}")
                         return 1
@@ -158,7 +172,10 @@ async def main() -> int:
                         if d1["outcome"] != "miss":
                             failures.append(f"turn1 outcome={d1['outcome']!r} (want miss)")
                         if d1["save_result"] not in ("saved", "exists"):
-                            failures.append(f"turn1 save_result={d1['save_result']!r} (want saved/exists)")
+                            failures.append(
+                                f"turn1 save_result={d1['save_result']!r} "
+                                "(want saved/exists)"
+                            )
                     a1 = t1.json()["choices"][0]["message"].get("content") or ""
                     print(f"[cache] turn1 assistant content={a1[:80]!r}")
 
@@ -184,9 +201,14 @@ async def main() -> int:
                         if d2["outcome"] != "hit":
                             failures.append(
                                 f"turn2 outcome={d2['outcome']!r} (want hit) — second turn must "
-                                f"reuse the saved boundary. base_boundary={d2.get('base_boundary')}")
+                                f"reuse the saved boundary. "
+                                f"base_boundary={d2.get('base_boundary')}"
+                            )
                         elif d2["base_boundary"] <= 0:
-                            failures.append(f"turn2 hit but base_boundary={d2['base_boundary']} (want > 0)")
+                            failures.append(
+                                f"turn2 hit but base_boundary={d2['base_boundary']} "
+                                "(want > 0)"
+                            )
                         else:
                             print(f"[cache] HIT: reused {d2['base_boundary']} prefix tokens, "
                                   f"appended {d2['appended']}")
@@ -245,7 +267,10 @@ async def main() -> int:
                     hist_retry = [
                         {"role": "user", "content": q1},
                         {"role": "assistant", "content": a1},
-                        {"role": "user", "content": "Retry: answer with exactly one landmark name."},
+                        {
+                            "role": "user",
+                            "content": "Retry: answer with exactly one landmark name.",
+                        },
                     ]
                     tr = await http_c.post(f"{base}/v1/chat/completions", json={
                         "model": MODEL, "messages": hist_retry,
@@ -273,7 +298,9 @@ async def main() -> int:
                     # ── changed system prompt under same key → miss ───
                     ts = await http_c.post(f"{base}/v1/chat/completions", json={
                         "model": MODEL,
-                        "messages": [{"role": "system", "content": "You are a terse assistant."}] + hist2,
+                        "messages": [
+                            {"role": "system", "content": "You are a terse assistant."},
+                        ] + hist2,
                         "temperature": 0, "max_tokens": 32, "stream": False,
                         "cache": directive(key, 4),
                     })
@@ -283,6 +310,108 @@ async def main() -> int:
                         failures.append(
                             f"prompt-changing request outcome={ds['outcome']!r} (want miss): "
                             "a changed system prompt must not reuse physical KV")
+
+                    # ── retention: LRU state must survive HTTP requests ─
+                    # The daemon instantiates a fresh WASM component for
+                    # every request, so this proves eviction is driven by
+                    # host-owned snapshot state rather than inferlet-local
+                    # statics. Save an old snapshot, trigger a later request
+                    # with an intentionally tiny retention target, then
+                    # assert the old chat misses on the next HTTP request.
+                    old_key = str(uuid.uuid4())
+                    old_q1 = q1
+                    old_q2 = q2
+                    old1 = await http_c.post(f"{base}/v1/chat/completions", json={
+                        "model": MODEL,
+                        "messages": [{"role": "user", "content": old_q1}],
+                        "temperature": 0, "max_tokens": 256, "stream": False,
+                        "cache": directive(old_key, 1),
+                    })
+                    d_old1 = _diag(old1)
+                    print(f"[cache] retention-old-save -> {old1.status_code} diag={d_old1}")
+                    if old1.status_code != 200:
+                        failures.append(
+                            f"retention old save status {old1.status_code}: "
+                            f"{old1.text[:200]!r}"
+                        )
+                    elif d_old1 is None:
+                        failures.append("retention old save: missing X-ChatAPC-Cache header")
+                    elif d_old1["save_result"] not in ("saved", "exists"):
+                        failures.append(f"retention old save_result={d_old1['save_result']!r}")
+
+                    old_a1 = ""
+                    if old1.status_code == 200:
+                        old_a1 = old1.json()["choices"][0]["message"].get("content") or ""
+                    if old1.status_code == 200 and not old_a1.strip():
+                        failures.append(
+                            "retention old save produced empty visible assistant content; "
+                            "cannot construct the follow-up history"
+                        )
+
+                    pressure_key = str(uuid.uuid4())
+                    pressure = await http_c.post(f"{base}/v1/chat/completions", json={
+                        "model": MODEL,
+                        "messages": [{
+                            "role": "user",
+                            "content": "Retention pressure chat. Answer with one concise sentence.",
+                        }],
+                        "temperature": 0, "max_tokens": 64, "stream": False,
+                        "cache": directive(pressure_key, 1, retention={
+                            "kv_pages_used": 100,
+                            "kv_pages_total": 100,
+                            "soft_percent": 0,
+                            "evict_percent": 0,
+                            "hard_percent": 0,
+                        }),
+                    })
+                    d_pressure = _diag(pressure)
+                    print(f"[cache] retention-pressure -> {pressure.status_code} diag={d_pressure}")
+                    if pressure.status_code != 200:
+                        failures.append(
+                            f"retention pressure status {pressure.status_code}: "
+                            f"{pressure.text[:200]!r}"
+                        )
+                    elif d_pressure is None:
+                        failures.append("retention pressure: missing X-ChatAPC-Cache header")
+                    else:
+                        if (d_pressure.get("evicted_snapshot_count") or 0) < 1:
+                            failures.append(
+                                "retention pressure did not evict any inactive snapshot: "
+                                f"{d_pressure!r}"
+                            )
+                        if d_pressure.get("delete_failed_count") not in (0, None):
+                            failures.append(
+                                f"retention pressure delete_failed_count="
+                                f"{d_pressure.get('delete_failed_count')!r}"
+                            )
+
+                    old2 = await http_c.post(f"{base}/v1/chat/completions", json={
+                        "model": MODEL,
+                        "messages": [
+                            {"role": "user", "content": old_q1},
+                            {"role": "assistant", "content": old_a1},
+                            {"role": "user", "content": old_q2},
+                        ],
+                        "temperature": 0, "max_tokens": 64, "stream": False,
+                        "cache": directive(old_key, 3),
+                    })
+                    d_old2 = _diag(old2)
+                    print(
+                        f"[cache] retention-old-after-pressure -> {old2.status_code} "
+                        f"diag={d_old2}"
+                    )
+                    if old2.status_code != 200:
+                        failures.append(
+                            f"retention old follow-up status {old2.status_code}: "
+                            f"{old2.text[:200]!r}"
+                        )
+                    elif d_old2 is None:
+                        failures.append("retention old follow-up: missing X-ChatAPC-Cache header")
+                    elif d_old2["outcome"] != "miss":
+                        failures.append(
+                            "old snapshot remained reusable after later-request retention "
+                            f"pressure; outcome={d_old2['outcome']!r}"
+                        )
             finally:
                 drain.cancel()
         finally:
@@ -294,7 +423,7 @@ async def main() -> int:
             print(f"  ✗ {f}")
         return 1
     print("\n[cache] PASS: miss→save→hit, profile switch hit, retry safe, "
-          "bypass off, per-key + prompt-change misses")
+          "bypass off, per-key + prompt-change misses, retention evicts across requests")
     return 0
 
 

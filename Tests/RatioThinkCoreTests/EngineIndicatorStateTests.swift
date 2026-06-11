@@ -66,6 +66,15 @@ final class EngineIndicatorStateTests: XCTestCase {
                   "the taxonomy copy itself names the model-choice action")
   }
 
+  func test_modelUnsupported_failure_invites_model_choice() {
+    let state = make(engine: .failed(code: .modelUnsupported, message: "unsupported model architecture"))
+    guard case let .error(err) = state else { return XCTFail("expected .error") }
+    XCTAssertEqual(err.kind, .modelUnsupported)
+    XCTAssertEqual(err.title, "Model unsupported")
+    XCTAssertTrue(err.message.contains("Choose a curated model"),
+                  "taxonomy copy should point to model-choice recovery")
+  }
+
   func test_other_failure_is_generic_engineFailed() {
     // #477: the raw status message is a diagnostic — the banner shows the
     // taxonomy's curated copy, never the raw text.

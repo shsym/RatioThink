@@ -170,6 +170,15 @@ public enum CuratedModelCatalog {
     all.first { $0.id == id }
   }
 
+  /// True when `slug` is one of the engine-validated, curated GGUF
+  /// artifacts RatioThink offers through Add Model. HF-cache discovery can
+  /// surface arbitrary local repos; callers use this predicate to distinguish
+  /// "known supported" cache hits from "discovered but unverified" ones
+  /// without blocking the latter.
+  public static func isCuratedModelSlug(_ slug: String) -> Bool {
+    all.contains { "\($0.huggingFaceRepo)/\($0.huggingFaceFile)" == slug }
+  }
+
   /// Id of the recommended starter model surfaced with a "Recommended"
   /// badge in *Settings → Models → Add Model → Curated*. :
   /// small, modern, engine-detectable. Its `<huggingFaceRepo>/<huggingFaceFile>`

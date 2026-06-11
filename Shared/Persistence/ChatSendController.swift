@@ -579,7 +579,11 @@ public final class ChatSendController: ObservableObject {
     // the prefix; a changed model or system prompt shows up as different
     // tokens and misses. Reuse is correctness-safe by construction
     // (see chat-apc `prefix_cache`), so it is on for every chat.
-    let cache = ChatCacheDirective(key: chat.id.uuidString, turn: turns.count)
+    let cache = ChatCacheDirective(
+      key: chat.id.uuidString,
+      turn: turns.count,
+      retention: retentionDirective(from: options.kvUsageSnapshot, modelID: options.modelID)
+    )
     return ChatRequest(
       model: options.modelID,
       messages: turns,
@@ -608,6 +612,17 @@ public final class ChatSendController: ObservableObject {
         return ChatMessage(role: role, content: message.content)
       })
     return turns
+  }
+
+  private static func retentionDirective(from snapshot: KVUsageSnapshot?,
+                                         modelID: String) -> ChatCacheRetentionDirective? {
+    guard let snapshot,
+          snapshot.modelID == modelID,
+          let used = Int(exactly: snapshot.pagesUsed),
+          let total = Int(exactly: snapshot.pagesTotal) else {
+      return nil
+    }
+    return ChatCacheRetentionDirective(kvPagesUsed: used, kvPagesTotal: total)
   }
 
   /// Build the `/v1/inferlet` dispatch body for a tree-of-thought turn.
@@ -812,19 +827,26 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
   /// value verbatim. The profile default stays distinct from this
   /// per-launch effective limit.
   public let maxOutputTokensCeiling: Int?
+  /// Latest #517 runtime/inferlet-backed KV usage snapshot for `modelID`.
+  /// When present and model-matched, `makeRequest` passes it to chat-apc's
+  /// cache-retention directive so eviction uses pie `model_status`
+  /// accounting rather than app-side token estimates.
+  public let kvUsageSnapshot: KVUsageSnapshot?
 
   public init(
     modelID: String,
     sampling: ChatSampling = ChatSampling(),
     systemPromptOverride: String? = nil,
     speculation: Profile.Speculation? = nil,
-    maxOutputTokensCeiling: Int? = nil
+    maxOutputTokensCeiling: Int? = nil,
+    kvUsageSnapshot: KVUsageSnapshot? = nil
   ) {
     self.modelID = modelID
     self.sampling = sampling
     self.systemPromptOverride = systemPromptOverride
     self.speculation = speculation
     self.maxOutputTokensCeiling = maxOutputTokensCeiling
+    self.kvUsageSnapshot = kvUsageSnapshot
   }
 
   /// A copy with `sampling` replaced. Used by the tree-of-thought dispatch
@@ -836,7 +858,8 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
       sampling: sampling,
       systemPromptOverride: systemPromptOverride,
       speculation: speculation,
-      maxOutputTokensCeiling: maxOutputTokensCeiling
+      maxOutputTokensCeiling: maxOutputTokensCeiling,
+      kvUsageSnapshot: kvUsageSnapshot
     )
   }
 }

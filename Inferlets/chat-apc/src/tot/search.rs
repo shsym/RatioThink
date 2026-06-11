@@ -150,10 +150,13 @@ fn branch_directive(level: usize, branch_index: usize, breadth: usize, thinking:
 /// the integer.
 const SCORE_PROMPT: &str = "Rate the assistant's latest answer from 1 to 10 on how well it \
      actually satisfies the user's original request. Judge task relevance, factual and semantic \
-     correctness, specificity, and concrete usefulness. A fluent, polished, brief, or polite \
+     correctness, specificity, and concrete usefulness. Use the full scale: 1-3 for irrelevant \
+     or mostly off-task answers, 4-6 for partial/generic answers, 7-8 for useful answers with \
+     gaps, and 9-10 for directly actionable answers. A fluent, polished, brief, or polite \
      answer that does not directly address what was asked is a LOW score (1-3); do not reward \
-     style, brevity, or acknowledgment over substance. Respond with only a single integer from 1 \
-     to 10.";
+     style, brevity, or acknowledgment over substance. Avoid defaulting to 5: separate siblings \
+     by task fit when one answer is more relevant or useful. Respond with only a single integer \
+     from 1 to 10.";
 
 /// Token budget for a scoring generation — enough for a suppressed empty
 /// `<think></think>` plus the integer. The scorer is NOT demuxed (see
@@ -1153,6 +1156,11 @@ mod tests {
         // …and explicitly does NOT reward style/brevity/acknowledgment.
         assert!(p.contains("low score"));
         assert!(p.contains("do not reward"));
+        assert!(p.contains("1-3"));
+        assert!(p.contains("4-6"));
+        assert!(p.contains("7-8"));
+        assert!(p.contains("9-10"));
+        assert!(p.contains("avoid defaulting to 5"));
         assert!(p.contains("single integer"));
     }
 

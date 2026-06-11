@@ -62,7 +62,7 @@ endef
 .PHONY: help genproject build build-static build-tests clean lint ci-pr check-vendor-pin local-pre-merge local-gui-gate local-e2e-gate release-gate \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
-        test-unit test-scenario test-smoke test-tot-real-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
+        test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
@@ -394,7 +394,10 @@ test-e2e-http: $(LOGDIR) ## HTTP API stress + tool-call contract E2E (dummy driv
 	  echo "log: $$LOG"; \
 	  exit $$status
 
-test-tot-real-smoke: $(LOGDIR) ## Real-model Tree-of-Thought diversity + scorer smoke (#523; portable Metal driver + staged Qwen3-0.6B GGUF; gated, NOT CI)
+test-tot-real-smoke-unit: ## Pure unit guards for the real ToT smoke scorer gates
+	uv run --project Vendor/pie/client/python --with httpx python -m unittest Inferlets/chat-apc/tot_real_smoke_test.py
+
+test-tot-real-smoke: test-tot-real-smoke-unit $(LOGDIR) ## Real-model Tree-of-Thought diversity + scorer smoke (#523; portable Metal driver + staged Qwen3-0.6B GGUF; gated, NOT CI)
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-tot-real-smoke.log; \
 	  Scripts/run-tot-real-smoke.sh 2>&1 | tee $$LOG | tail -60; \

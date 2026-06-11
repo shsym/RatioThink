@@ -50,7 +50,7 @@ FAKE_PGREP
   fi
   require_contains "$output" "Automation/Accessibility permission required"
   require_contains "$output" "PIE_TEST_TCC_GRANTED=1"
-  if [[ "$output" == *"starting small-model engine harness"* ]]; then
+  if [[ "$output" == *"starting portable GGUF engine harness"* ]]; then
     echo "FAIL: TCC preflight must happen before starting the engine harness" >&2
     exit 1
   fi
@@ -94,10 +94,10 @@ test_missing_gguf_fixture_is_not_accepted() {
   trap 'rm -rf "$tmp"' RETURN
 
   # Fake a seated session and a runnable pie so the flow reaches the GGUF
-  # fixture gate, then stage only a *bare* hub dir — the partial/aborted-download
-  # shape that must not be accepted as a usable model. With autoprep off the
-  # gate must report the missing GGUF fixture and exit, not proceed.
-  mkdir -p "$tmp/bin" "$tmp/hf/hub/models--Qwen--Qwen3-0.6B-GGUF"
+  # fixture gate, then stage incomplete cache shapes under the exact repo dir
+  # stage-test-model.sh inspects. Partial/aborted downloads must be rejected
+  # before starting the portable GGUF engine harness.
+  mkdir -p "$tmp/bin"
   cat >"$tmp/bin/pgrep" <<'FAKE_PGREP'
 #!/bin/bash
 exit 0
@@ -106,35 +106,58 @@ FAKE_PGREP
   touch "$tmp/pie"
   chmod +x "$tmp/pie"
 
-  set +e
-  local output
-  output="$(
-    PATH="$tmp/bin:$PATH" \
-    HF_HOME="$tmp/hf" \
-    PIE_BIN="$tmp/pie" \
-    PIE_TEST_TCC_GRANTED=1 \
-    PIE_E2E_AUTOPREP=0 \
-    PIE_TEST_RUN_ROOT="$tmp/run" \
-    STAGE_TEST_MODEL_DEST="$tmp/staged/Qwen3-0.6B-Q8_0.gguf" \
-    "$SCRIPT" 2>&1
-  )"
-  local status=$?
-  set -e
+  local shape cache dest output status
+  for shape in bare-repo empty-snapshots metadata-only dangling-gguf; do
+    rm -rf "$tmp/hf" "$tmp/run" "$tmp/staged"
+    cache="$tmp/hf/hub/models--Qwen--Qwen3-0.6B-GGUF"
+    dest="$tmp/staged/$shape/Qwen3-0.6B-Q8_0.gguf"
+    case "$shape" in
+      bare-repo)
+        mkdir -p "$cache"
+        ;;
+      empty-snapshots)
+        mkdir -p "$cache/snapshots"
+        ;;
+      metadata-only)
+        mkdir -p "$cache/snapshots/rev"
+        printf '{}' >"$cache/snapshots/rev/config.json"
+        ;;
+      dangling-gguf)
+        mkdir -p "$cache/snapshots/rev" "$cache/blobs"
+        ln -s "../../blobs/missing-gguf" "$cache/snapshots/rev/Qwen3-0.6B-Q8_0.gguf"
+        ;;
+    esac
 
-  if [[ "$status" -ne 2 ]]; then
-    echo "FAIL: missing GGUF fixture must fail the model gate (exit 2), got $status" >&2
-    echo "--- output ---" >&2
-    printf '%s\n' "$output" >&2
-    exit 1
-  fi
-  require_contains "$output" "stage-test-model: model fixture NOT staged"
-  require_contains "$output" "GGUF fixture unavailable"
-  if [[ "$output" == *"starting portable GGUF engine harness"* ]]; then
-    echo "FAIL: bare GGUF cache wrongly accepted as a staged fixture — engine harness started" >&2
-    exit 1
-  fi
+    set +e
+    output="$(
+      PATH="$tmp/bin:$PATH" \
+      HF_HOME="$tmp/hf" \
+      PIE_BIN="$tmp/pie" \
+      PIE_TEST_TCC_GRANTED=1 \
+      PIE_E2E_AUTOPREP=0 \
+      PIE_TEST_RUN_ROOT="$tmp/run" \
+      STAGE_TEST_MODEL_DEST="$dest" \
+      "$SCRIPT" 2>&1
+    )"
+    status=$?
+    set -e
+
+    if [[ "$status" -ne 2 ]]; then
+      echo "FAIL: partial GGUF cache '$shape' must fail the model gate (exit 2), got $status" >&2
+      echo "--- output ---" >&2
+      printf '%s\n' "$output" >&2
+      exit 1
+    fi
+    require_contains "$output" "stage-test-model: model fixture NOT staged"
+    require_contains "$output" "Looked in HF cache: $cache"
+    require_contains "$output" "GGUF fixture unavailable"
+    require_contains "$output" "cannot run the GGUF chat E2E"
+    if [[ "$output" == *"starting portable GGUF engine harness"* ]]; then
+      echo "FAIL: partial GGUF cache '$shape' wrongly accepted as a staged fixture — engine harness started" >&2
+      exit 1
+    fi
+  done
 }
-
 # Direct contract assertions on _e2e_hf_model_cached, independent of the
 # wrapper's gate ordering ( F2): only a RESOLVED WEIGHT artifact
 # counts as cached. The bare-dir case above short-circuits at `[ -d snapshots ]`

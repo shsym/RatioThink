@@ -822,6 +822,14 @@ public final class PieEngineHost: @unchecked Sendable {
       }
     } catch {
       let msg = "\(error)"
+      let classification = EngineLoadFailureClassifier.classify(error)
+      let code: EngineErrorCode = classification == nil ? .spawnFailed : .modelUnsupported
+      let statusMessage = classification == nil
+        ? msg
+        : EngineLoadFailureClassifier.userFacingLoadFailureMessage(
+          modelID: Self.modelID(from: spec),
+          error: error
+        )
       Log.engine.error("PieEngineHost: launch failed: \(msg, privacy: .public)")
       let terminationEvidence = Self.terminationForLaunchError(error, guardrailBytes: guardrailBytes)
       let shutdownFailureMessage = Self.shutdownFailureMessage(from: error)
@@ -839,7 +847,7 @@ public final class PieEngineHost: @unchecked Sendable {
           if let shutdownFailureMessage {
             self.setState(.failed(.killRejected, shutdownFailureMessage))
           } else {
-            self.setState(.failed(.spawnFailed, msg))
+            self.setState(.failed(code, statusMessage))
           }
           if let (termination, tail) = terminationEvidence {
             self.emitTermination(termination, tail: tail)
@@ -870,6 +878,19 @@ public final class PieEngineHost: @unchecked Sendable {
           return
         }
       }
+    }
+  }
+
+  private static func modelID(from spec: LaunchSpec) -> String {
+    switch spec.modelConfig {
+    case .dummy:
+      return spec.profileID
+    case let .portable(modelSlug, _):
+      return modelSlug
+    case let .portableResolved(servedModelID, _):
+      return servedModelID
+    case let .metal(modelID):
+      return modelID
     }
   }
 

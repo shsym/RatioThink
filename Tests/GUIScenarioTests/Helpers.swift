@@ -49,6 +49,24 @@ func noModelPrompt(in app: XCUIApplication) -> XCUIElement {
     .firstMatch
 }
 
+@MainActor
+func closeSettingsWindowIfPresent(in app: XCUIApplication) {
+  let settings = app.windows.matching(identifier: "com_apple_SwiftUI_Settings_window").firstMatch
+  guard settings.waitForExistence(timeout: 0.5) else { return }
+  app.activate()
+  let close = settings.buttons[XCUIIdentifierCloseWindow]
+  if close.exists, close.isHittable {
+    close.click()
+  } else {
+    app.typeKey("w", modifierFlags: .command)
+  }
+
+  let deadline = Date().addingTimeInterval(3)
+  while settings.exists, Date() < deadline {
+    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+  }
+}
+
 func missingModelDownloadButton(in app: XCUIApplication) -> XCUIElement {
   let identified = app.buttons["missingModel.download"]
   if identified.exists { return identified }
@@ -63,6 +81,8 @@ func openFreshChat(
   file: StaticString = #filePath,
   line: UInt = #line
 ) {
+  closeSettingsWindowIfPresent(in: app)
+
   let composer = app.descendants(matching: .any)
     .matching(identifier: "composer.text")
     .firstMatch

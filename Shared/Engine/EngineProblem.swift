@@ -76,6 +76,11 @@ public extension EngineProblem {
         title: "Model too large",
         message: "This model exceeds this Mac’s safe memory limit. Pick a smaller model.",
         recovery: .chooseModel, technicalDetail: technicalDetail)
+    case .modelUnsupported:
+      self.init(
+        title: "Model unsupported",
+        message: "The selected model is unsupported or not loadable. Choose a curated model, remove or fix the cached repo, or install a supported artifact.",
+        recovery: .chooseModel, technicalDetail: technicalDetail)
     case .profileMissing:
       self.init(
         title: "Profile configuration problem",

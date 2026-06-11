@@ -543,6 +543,17 @@ private struct InstalledModelsTable: View {
                   .help("Discovered in the shared Hugging Face cache. Managed outside Rational — reveal in Finder to inspect.")
                   .accessibilityIdentifier("InstalledRow-HFCache-\(row.id)")
               }
+              if let warning = row.supportWarning {
+                Label("Unverified", systemImage: "exclamationmark.triangle.fill")
+                  .labelStyle(.titleAndIcon)
+                  .font(.caption2)
+                  .foregroundStyle(.orange)
+                  .padding(.horizontal, 5)
+                  .padding(.vertical, 1)
+                  .background(Capsule().fill(Color.orange.opacity(0.15)))
+                  .help(warning)
+                  .accessibilityIdentifier("InstalledRow-SupportWarning-\(row.id)")
+              }
             }
           }
           TableColumn("Size") { row in

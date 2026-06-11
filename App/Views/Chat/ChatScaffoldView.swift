@@ -32,6 +32,7 @@ struct ChatScaffoldView: View {
   /// #412: background-helper health, forwarded to the toolbar pip's outer ring.
   @EnvironmentObject private var helperHealth: HelperHealthController
   @EnvironmentObject private var profileStore: ProfileStore
+  @EnvironmentObject private var appPreferences: AppPreferences
   @EnvironmentObject private var downloadController: ModelDownloadController
   /// The reconciled engine-lifecycle fold, forwarded to the toolbar pip +
   /// popover so they derive the resident/offline distinction from the single
@@ -80,6 +81,30 @@ struct ChatScaffoldView: View {
   @State private var deferredEngineSyncTask: Task<Void, Never>?
   @State private var deferredEngineMutation: DeferredEngineMutation?
   @State private var deferredEngineMutationGeneration: Int = 0
+
+  /// #527: when an explicit per-chat model pin differs from the engine's
+  /// known resident model, a send would deterministically fail with
+  /// model_not_found. Block before persisting the user message and ask which
+  /// model identity should win.
+  @State private var pinnedModelMismatch: PinnedModelMismatch?
+
+  struct PinnedModelMismatch: Equatable, Identifiable {
+    let pinnedModelID: String
+    let residentModelID: String
+
+    var id: String { pinnedModelID + "\u{1f}" + residentModelID }
+  }
+
+  enum SendGateDecision: Equatable {
+    case ready(modelID: String)
+    case noResolvableModel
+    case pinnedModelMismatch(pinnedModelID: String, residentModelID: String)
+
+    var allowsSend: Bool {
+      if case .ready = self { return true }
+      return false
+    }
+  }
   /// #513: the assistant message id awaiting the destructive-retry
   /// confirmation. Non-nil presents the alert; Cancel clears it without
   /// touching history.
@@ -353,6 +378,7 @@ struct ChatScaffoldView: View {
         },
         commitModel: { modelID in persistChatModel(modelID, on: chat) },
         onUseProfileDefault: { _ = persistChatModel(nil, on: chat) },
+        followProfileDefaultModel: appPreferences.followProfileDefaultModel,
         swapCoordinator: swapCoordinator,
         modelLoadCenter: modelLoadCenter,
         engineStatus: engineStatusStore,
@@ -450,16 +476,9 @@ struct ChatScaffoldView: View {
           chat: chat,
           viewModel: viewModel,
           isSending: sendCoordinator.isInFlight(chatID),
-          shouldAllowSend: { currentModelID(for: chat) != nil },
+          shouldAllowSend: { sendGateDecision(for: chat).allowsSend },
           onSendBlocked: { draft in
-            // #516: capture the blocked send so it can auto-submit once
-            // the gate's load target resolves — the promise the sheet's
-            // copy makes ("…to send your message").
-            pendingSend.arm(chatID: chat.id,
-                            targetModelID: gateTarget(for: chat)?.modelID,
-                            messageText: draft)
-            synchronizeEngineForPendingSend(chat)
-            presentNoModelPrompt()
+            handleBlockedSend(draft: draft, for: chat)
           },
           onUserMessageSaved: { _ in
             // A send committed (manual or fired auto-send) — any armed
@@ -517,6 +536,27 @@ struct ChatScaffoldView: View {
         // actually armed to fire (the launch-time prompt raises this same
         // sheet with an empty composer — there, the copy must not lie).
         willAutoSend: pendingSend.pending != nil
+      )
+    }
+    .sheet(item: $pinnedModelMismatch) { mismatch in
+      PinnedModelMismatchPrompt(
+        mismatch: mismatch,
+        onRelaunchPinned: {
+          pinnedModelMismatch = nil
+          // #469 explicit-pick launch path: a confirmed model identity change
+          // routes through the coordinator's status-aware serve executor,
+          // which restarts a running engine onto the selected boot model.
+          swapCoordinator.loadDirect(modelID: mismatch.pinnedModelID,
+                                     profileID: viewModel.selectedProfileID)
+        },
+        onUseResident: {
+          if persistChatModel(mismatch.residentModelID, on: chat) {
+            pinnedModelMismatch = nil
+          }
+        },
+        onCancel: {
+          pinnedModelMismatch = nil
+        }
       )
     }
     // #513: destructive-retry confirmation. Required whenever the retry
@@ -773,11 +813,19 @@ struct ChatScaffoldView: View {
   /// #513 entry point from a transcript row's Retry control. Routes
   /// through the destructive confirmation only when the plan says later
   /// conversation would be erased; a latest-turn retry executes directly.
-  /// The model gate runs FIRST so a blocked retry raises the no-model
-  /// prompt without having mutated any history.
+  /// The model gate runs FIRST so a blocked retry raises the no-model or
+  /// pinned/resident mismatch prompt without having mutated any history.
   private func requestRetry(for chat: Chat, messageID: UUID) {
     guard !sendCoordinator.isInFlight(chatID) else { return }
-    guard currentModelID(for: chat) != nil else {
+    switch sendGateDecision(for: chat) {
+    case .ready:
+      break
+    case .pinnedModelMismatch(let pinned, let resident):
+      pendingSend.disarm()
+      pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
+                                                residentModelID: resident)
+      return
+    case .noResolvableModel:
       presentNoModelPrompt()
       return
     }
@@ -832,8 +880,17 @@ struct ChatScaffoldView: View {
   private func sendAssistantTurn(for chat: Chat) {
     // Defensive: ComposerView only invokes this after `shouldAllowSend`
     // passed, but never ask the engine to load a model the user did not
-    // choose ( invariant).
-    guard let modelID = currentModelID(for: chat) else {
+    // choose, and never send a pinned model into a known different resident
+    // engine (#527).
+    let modelID: String
+    switch sendGateDecision(for: chat) {
+    case .ready(let readyModelID):
+      modelID = readyModelID
+    case .pinnedModelMismatch(let pinned, let resident):
+      pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
+                                                residentModelID: resident)
+      return
+    case .noResolvableModel:
       presentNoModelPrompt()
       return
     }
@@ -850,7 +907,11 @@ struct ChatScaffoldView: View {
       // from GET /v1/models during resident-model reconcile. `makeRequest`
       // clamps the profile's max_tokens down to this so a memory-squeezed
       // launch never trips the engine's clean 400.
-      maxOutputTokensCeiling: modelLoadCenter.residentMaxOutputTokens
+      maxOutputTokensCeiling: modelLoadCenter.residentMaxOutputTokens,
+      // #524: seed chat-apc's APC snapshot-retention policy from the latest
+      // authoritative pie `model_status` KV counters. Nil/unknown means the
+      // inferlet must retain rather than guess.
+      kvUsageSnapshot: engineStatusStore.kvUsageSnapshot(for: modelID)
     )
 
     // #413: when the active profile declares `mode = "tree-of-thought"`,
@@ -914,6 +975,37 @@ struct ChatScaffoldView: View {
       profileDefaultModel: engineRunning ? selectedProfileDefault : nil,
       residentModelID: modelLoadCenter.residentModelID
     )
+  }
+
+  private func sendGateDecision(for chat: Chat) -> SendGateDecision {
+    Self.sendGateDecision(
+      engineStatus: engineStatusStore.status,
+      selectedModelID: chat.modelID,
+      profileDefaultModel: selectedProfileDefault,
+      residentModelID: modelLoadCenter.residentModelID)
+  }
+
+  private func handleBlockedSend(draft: String, for chat: Chat) {
+    switch sendGateDecision(for: chat) {
+    case .ready:
+      return
+    case .pinnedModelMismatch(let pinned, let resident):
+      pendingSend.disarm()
+      cancelDeferredEngineSync()
+      pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
+                                                residentModelID: resident)
+    case .noResolvableModel:
+      // #516: capture the blocked send so it can auto-submit once the gate's
+      // load target resolves — the promise the no-model sheet's copy makes
+      // ("…to send your message"). The #527 mismatch prompt deliberately does
+      // not arm auto-send: choosing relaunch or resident is an explicit model
+      // identity decision, not permission to send the draft afterwards.
+      pendingSend.arm(chatID: chat.id,
+                      targetModelID: gateTarget(for: chat)?.modelID,
+                      messageText: draft)
+      synchronizeEngineForPendingSend(chat)
+      presentNoModelPrompt()
+    }
   }
 
   /// #460: durably set (or clear) the chat's selected model — the single
@@ -1422,5 +1514,101 @@ struct ChatScaffoldView: View {
                                   profileDefault: profileDefaultModel),
       resident: EngineResidentState(modelID: residentModelID)
     ).resolvedModelID
+  }
+
+  /// #527: final send gate for model identity. The selection authority remains
+  /// `Chat.modelID` (or profile default when unpinned), but a known resident
+  /// engine model is an execution precondition: an explicit per-chat pin that
+  /// differs from `residentModelID` is guaranteed to be rejected by the engine,
+  /// so block and ask instead of surfacing a bare model_not_found after send.
+  ///
+  /// Explicit pins get the user-facing mismatch prompt. Unpinned
+  /// profile-default-vs-resident gaps fall through to `.noResolvableModel`,
+  /// where the request/resident sync path can converge the engine before send.
+  static func sendGateDecision(
+    engineStatus: EngineStatus,
+    selectedModelID: String?,
+    profileDefaultModel: String?,
+    residentModelID: String?
+  ) -> SendGateDecision {
+    guard case .running = engineStatus else { return .noResolvableModel }
+    guard ModelTarget.resolve(selectedModelID: selectedModelID,
+                              profileDefault: profileDefaultModel) != nil else {
+      return .noResolvableModel
+    }
+
+    let selected = selectedModelID?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let resident = residentModelID?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let selected, !selected.isEmpty,
+       let resident, !resident.isEmpty,
+       selected != resident {
+      return .pinnedModelMismatch(pinnedModelID: selected,
+                                  residentModelID: resident)
+    }
+    guard let resolved = requestModelID(selectedModelID: selectedModelID,
+                                        profileDefaultModel: profileDefaultModel,
+                                        residentModelID: residentModelID) else {
+      return .noResolvableModel
+    }
+    return .ready(modelID: resolved)
+  }
+}
+
+struct PinnedModelMismatchPrompt: View {
+  let mismatch: ChatScaffoldView.PinnedModelMismatch
+  let onRelaunchPinned: () -> Void
+  let onUseResident: () -> Void
+  let onCancel: () -> Void
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 14) {
+      HStack(spacing: 8) {
+        Image(systemName: "exclamationmark.triangle")
+          .foregroundStyle(.orange)
+        Text("Switch model before sending?")
+          .font(.headline)
+      }
+      Text("This chat is pinned to a different model than the engine is currently serving. Choose which model should be used before sending.")
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+      Divider()
+      modelRow(label: "Pinned chat model", modelID: mismatch.pinnedModelID)
+      modelRow(label: "Resident engine model", modelID: mismatch.residentModelID)
+      HStack {
+        Button("Cancel", role: .cancel) { onCancel() }
+          .keyboardShortcut(.cancelAction)
+        Spacer()
+        Button("Use \(Self.leaf(mismatch.residentModelID)) for this chat") {
+          onUseResident()
+        }
+        .accessibilityIdentifier("pinnedModelMismatch.useResident")
+        Button("Relaunch engine with \(Self.leaf(mismatch.pinnedModelID))") {
+          onRelaunchPinned()
+        }
+        .keyboardShortcut(.defaultAction)
+        .accessibilityIdentifier("pinnedModelMismatch.relaunchPinned")
+      }
+    }
+    .padding(18)
+    .frame(width: 420)
+    .accessibilityIdentifier("pinnedModelMismatch.prompt")
+  }
+
+  private func modelRow(label: String, modelID: String) -> some View {
+    VStack(alignment: .leading, spacing: 2) {
+      Text(label)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+      Text(modelID)
+        .font(.body.weight(.medium))
+        .lineLimit(2)
+        .truncationMode(.middle)
+        .textSelection(.enabled)
+    }
+  }
+
+  private static func leaf(_ modelID: String) -> String {
+    ModelDisplayName.leaf(modelID)
   }
 }

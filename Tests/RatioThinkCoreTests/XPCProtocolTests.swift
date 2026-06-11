@@ -147,24 +147,26 @@ final class XPCProtocolTests: XCTestCase {
                  .portUnavailable, .alreadyRunning, .cancelled,
                  .wireContractViolation, .degraded,
                  .integrityFailed, .networkFailed, .diskWriteFailed,
-                 .invalidInput, .killRejected, .memoryRisk, .unknown] {
+                 .invalidInput, .killRejected, .memoryRisk,
+                 .modelUnsupported, .unknown] {
       assertRoundTrip(EngineError(code: code, message: "msg-\(code.rawValue)"))
     }
   }
 
-  func test_invitesResumeRetry_only_memoryRisk_and_killRejected_are_terminal() throws {
-    // Exactly two codes must NOT invite a plain Resume retry: a blind
-    // retry re-fails (memoryRisk: same oversized model) or is blocked
-    // (killRejected: orphan must be reaped first). Everything else —
-    // notably modelMissing — is user-recoverable and keeps Resume live.
-    let nonRetryable: Set<EngineErrorCode> = [.memoryRisk, .killRejected]
+  func test_invitesResumeRetry_excludes_model_choice_terminal_failures() throws {
+    // These codes must NOT invite a plain Resume retry: a blind retry
+    // re-fails (memoryRisk: same oversized model, modelUnsupported: same
+    // unloadable artifact) or is blocked (killRejected: orphan must be
+    // reaped first). Everything else — notably modelMissing — is
+    // user-recoverable and keeps Resume live.
+    let nonRetryable: Set<EngineErrorCode> = [.memoryRisk, .modelUnsupported, .killRejected]
     for code in [EngineErrorCode.spawnFailed,
                  .handshakeTimeout, .modelMissing, .profileMissing,
                  .portUnavailable, .alreadyRunning, .cancelled,
                  .wireContractViolation, .degraded,
                  .integrityFailed, .networkFailed, .diskWriteFailed,
                  .invalidInput, .killRejected, .memoryRisk,
-                 .engineGone, .unknown] {
+                 .modelUnsupported, .engineGone, .unknown] {
       XCTAssertEqual(code.invitesResumeRetry, !nonRetryable.contains(code),
                      "invitesResumeRetry mismatch for \(code.rawValue)")
     }
