@@ -1216,6 +1216,25 @@ public actor LaunchedSession {
     }
   }
 
+  public func modelStatusJSON() async throws -> String? {
+    guard process.isRunning else { return nil }
+    guard let controlWSURL else { return nil }
+    let config = URLSessionConfiguration.ephemeral
+    config.timeoutIntervalForRequest = Self.livenessProbeTimeout
+    config.timeoutIntervalForResource = Self.livenessProbeTimeout
+    let client = PieControlClient(url: controlWSURL, session: URLSession(configuration: config))
+    do {
+      try await client.connect()
+      try await client.authIdentify("pie-mac-kv-usage")
+      let json = try await client.query(subject: "model_status", record: "")
+      await client.close()
+      return json
+    } catch {
+      await client.close()
+      throw error
+    }
+  }
+
   /// Idempotent: SIGINT → wait(10s) → SIGKILL → wait(5s) → shm_unlink.
   /// Mirrors Python `_terminate_subprocess` + `_shm_unlink_quiet`.
   /// Signal/wait failures are still logged, but they are also returned so the
