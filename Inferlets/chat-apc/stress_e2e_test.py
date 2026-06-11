@@ -458,6 +458,19 @@ async def section_content_parts(base: str, http: httpx.AsyncClient, rep: Report)
     })
     rep.ok(r.status_code == 200, f"{P}: image_url part + text part -> {r.status_code} (want 200)")
 
+    # image-only array: with no text part the flattened content is "" and
+    # the blank-content gate 400s — black-box proof that non-text parts
+    # really contribute no text (the mixed case above would pass even if
+    # the image part leaked text).
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+        ]}],
+    })
+    rep.ok(r.status_code == 400,
+           f"{P}: image_url-only array flattens blank -> {r.status_code} (want 400 — proves no text contributed)")
+
     # malformed part (non-object element) -> 400, never a silently dropped part.
     for bad, label in (
         (["bare string"], "bare-string part"),
