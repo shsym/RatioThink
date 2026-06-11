@@ -1,6 +1,8 @@
 import XCTest
 
-/// #459/#460 — the cross-model profile-swap popover offers THREE outcomes.
+/// #459/#460/#527 — explicit model picks now stay pinned across profile
+/// changes by default; the cross-model profile-swap popover remains available
+/// only when the user opts into "Follow profile default model" compatibility.
 ///
 /// The popover fires only on `ProfileSwapCoordinator.requestSwap` Policy 3:
 /// switching to a profile whose default model differs from the chat's CURRENT
@@ -16,8 +18,9 @@ import XCTest
 /// seeded model Y), and `PIE_TEST_CHAT_MODEL_PIN` (DEBUG seam) pins a
 /// DIFFERENT model X as the fresh chat's `Chat.modelID`. Switching
 /// `chat → fast-think` is therefore a cross-model swap (chat selection X ≠
-/// fast-think default Y) that raises the popover — no real engine, no
-/// network, no Helper.
+/// fast-think default Y). In default mode it switches silently and keeps X; in
+/// compatibility mode it raises the popover — no real engine, no network, no
+/// Helper.
 ///
 /// Outcomes asserted at the GUI level (the per-outcome coordinator logic —
 /// keep-current pins X, no reload, stale-token drop — is exhaustively
@@ -40,7 +43,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
 
   @MainActor
   func test_all_three_buttons_present_on_cross_model_swap() throws {
-    let app = launchPinnedX()
+    let app = launchPinnedX(followProfileDefault: true)
     defer { app.terminate() }
     _ = openSwapPopoverSwitchingToFastThink(in: app)
 
@@ -57,7 +60,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
 
   @MainActor
   func test_cancel_abandons_and_stays_on_the_old_profile() throws {
-    let app = launchPinnedX()
+    let app = launchPinnedX(followProfileDefault: true)
     defer { app.terminate() }
     let profileMenu = openSwapPopoverSwitchingToFastThink(in: app)
 
@@ -73,7 +76,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
 
   @MainActor
   func test_keep_current_switches_profile_but_keeps_pinned_model() throws {
-    let app = launchPinnedX()
+    let app = launchPinnedX(followProfileDefault: true)
     defer { app.terminate() }
     let profileMenu = openSwapPopoverSwitchingToFastThink(in: app)
 
@@ -95,7 +98,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
 
   @MainActor
   func test_switch_commits_the_profile_switch() throws {
-    let app = launchPinnedX()
+    let app = launchPinnedX(followProfileDefault: true)
     defer { app.terminate() }
     let profileMenu = openSwapPopoverSwitchingToFastThink(in: app)
 
@@ -109,6 +112,24 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
                   "Switch must commit the profile switch to fast-think; title=\(profileMenu.title)")
   }
 
+  @MainActor
+  func test_default_mode_switches_profile_without_prompt_and_keeps_pinned_model() throws {
+    let app = launchPinnedX(followProfileDefault: false)
+    defer { app.terminate() }
+
+    let profileMenu = selectFastThink(in: app)
+    let popover = app.descendants(matching: .any)
+      .matching(identifier: "profileSwap.popover").firstMatch
+
+    XCTAssertFalse(popover.waitForExistence(timeout: 2),
+                   "default explicit-model mode should not ask to swap to the destination profile default")
+    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "fast-think", timeout: 10),
+                  "default explicit-model mode still commits the profile switch; title=\(profileMenu.title)")
+    let modelMenu = app.menuButtons["toolbar.model"]
+    XCTAssertTrue(waitForElementValueContaining(modelMenu, "ghost-pinned", timeout: 10),
+                  "default explicit-model mode must keep the chat's pinned model X; toolbar.model value=\(String(describing: modelMenu.value))")
+  }
+
   // MARK: - setup
 
   /// Launch engine-free with a /tmp PIE_HOME the NON-sandboxed app seeds
@@ -117,7 +138,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   /// `chat`/`fast-think` profiles both default to model Y ≠ X, so swapping is
   /// cross-model on the chat's SELECTION (single-source #460), not residency.
   @MainActor
-  private func launchPinnedX() -> XCUIApplication {
+  private func launchPinnedX(followProfileDefault: Bool) -> XCUIApplication {
     let pieHome = "/tmp/pie-s459swap-" + UUID().uuidString
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
     app.launchArguments.append(contentsOf: [
@@ -132,6 +153,9 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
     // Engine-free: a stray developer Helper must not let reconcile run; the
     // swap keys on the chat's pin regardless, but keep the harness hermetic.
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
+    if followProfileDefault {
+      app.launchEnvironment["PIE_TEST_FOLLOW_PROFILE_DEFAULT_MODEL"] = "1"
+    }
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     app.launch()
 
@@ -139,7 +163,33 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
               "Rational.app did not reach runningForeground")
     app.activate()
     openFreshChat(in: app)
+    let modelMenu = app.menuButtons["toolbar.model"]
+    XCTAssertTrue(waitForElementValueContaining(modelMenu, "ghost-pinned", timeout: 10),
+                  "fresh chat did not expose the debug-pinned model before profile swap; toolbar.model value=\(String(describing: modelMenu.value)); app tree=\(app.debugDescription)")
     return app
+  }
+
+  /// Open the profile switcher, pick `fast-think`, and return the
+  /// toolbar.profile menu button without assuming whether a popover appears.
+  @MainActor
+  private func selectFastThink(in app: XCUIApplication) -> XCUIElement {
+    let profileMenu = app.menuButtons["toolbar.profile"]
+    XCTAssertTrue(profileMenu.waitForExistence(timeout: 10),
+                  "profile switcher (toolbar.profile) missing; app tree: \(app.debugDescription)")
+    let deadline = Date().addingTimeInterval(45)
+    while Date() < deadline {
+      app.activate()
+      profileMenu.click()
+      let item = app.menuItems["fast-think"]
+      if item.waitForExistence(timeout: 3) {
+        item.click()
+        return profileMenu
+      }
+      app.typeKey(.escape, modifierFlags: [])
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
+    }
+    XCTFail("could not select fast-think from the profile menu; app tree: \(app.debugDescription)")
+    return profileMenu
   }
 
   /// Open the profile switcher, pick `fast-think`, and return the
@@ -159,13 +209,8 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
       .matching(identifier: "profileSwap.popover").firstMatch
     let deadline = Date().addingTimeInterval(45)
     while Date() < deadline {
-      app.activate()
-      profileMenu.click()
-      let item = app.menuItems["fast-think"]
-      if item.waitForExistence(timeout: 3) {
-        item.click()
-        if popover.waitForExistence(timeout: 3) { return profileMenu }
-      }
+      _ = selectFastThink(in: app)
+      if popover.waitForExistence(timeout: 3) { return profileMenu }
       // Focus lost / menu didn't open / popover didn't present — reset + retry.
       app.typeKey(.escape, modifierFlags: [])
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))

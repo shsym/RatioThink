@@ -323,6 +323,9 @@ struct RatioThinkApp: App {
     if env["PIE_TEST_FIRST_LAUNCH_COMPLETED"] == "1" {
       defaults.set(true, forKey: AppPreferences.firstLaunchWizardCompletedKey)
     }
+    if env["PIE_TEST_FOLLOW_PROFILE_DEFAULT_MODEL"] == "1" {
+      defaults.set(true, forKey: AppPreferences.followProfileDefaultModelKey)
+    }
     return defaults
   }
 
