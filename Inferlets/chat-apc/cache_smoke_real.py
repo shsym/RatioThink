@@ -32,6 +32,9 @@ in `~/.cache/huggingface/hub`.
 
 Usage::
 
+    make test-e2e-cache-real
+
+    # or invoke the harness directly:
     MODEL=Qwen/Qwen3-0.6B uv run --project Vendor/pie/client/python \
         --with httpx python Inferlets/chat-apc/cache_smoke_real.py
 """
