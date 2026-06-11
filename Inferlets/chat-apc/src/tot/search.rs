@@ -447,6 +447,13 @@ pub struct SearchOutcome {
     pub root: Node,
     pub selected_node_id: Option<String>,
     pub final_answer: Option<String>,
+    /// `true` when the post-search synthesis produced `final_answer`; `false`
+    /// when the raw best-leaf content finalize() set stood (synthesis was
+    /// skipped or failed) — the fail-safe path. Carried onto the wire
+    /// (`tree_complete.synthesized` / `TreeResponse.synthesized`) so a
+    /// silently dead synthesizer is observable rather than masked by an
+    /// always-renderable best-leaf answer (#523 Part A F1).
+    pub synthesized: bool,
 }
 
 /// Run the beam search. `root_ctx` must already be filled (system +
@@ -600,8 +607,12 @@ pub async fn run(
         .and_then(|id| flat.iter().find(|n| n.id == id))
         .map(|n| (n.content.clone(), n.reasoning.clone()));
     let mut outcome = finalize(flat, &last_level);
-    if let (Some((content, reasoning)), Some(base)) = (best, synth_base)
-        && let Some(answer) = synthesize(
+    // Attempt synthesis only when an ok leaf exists AND its grounding fork
+    // survived; on any skip/failure emit a one-shot host diagnostic with the
+    // reason so a dead synthesizer is visible in production (#523 Part A F1),
+    // then fall through with `None` so the raw best-leaf content stands.
+    let synth: Option<String> = match (best, synth_base) {
+        (Some((content, reasoning)), Some(base)) => match synthesize(
             base,
             model,
             &content,
@@ -610,10 +621,37 @@ pub async fn run(
             emitter,
         )
         .await
-    {
-        outcome.final_answer = Some(answer);
-    }
+        {
+            Ok(answer) => Some(answer),
+            Err(reason) => {
+                eprintln!("[chat-apc] tot synthesis fell back to best leaf: {reason}");
+                None
+            }
+        },
+        (Some(_), None) => {
+            eprintln!("[chat-apc] tot synthesis skipped: fork_failed");
+            None
+        }
+        // No ok leaf → honest-null: no synthesis is attempted and
+        // finalize()'s null `final_answer` stands (no diagnostic — a total
+        // failure is already surfaced by the `error` terminal).
+        (None, _) => None,
+    };
+    reconcile_synthesis(&mut outcome, synth);
     outcome
+}
+
+/// Fold the post-search synthesis result into the finalized outcome. Pure →
+/// unit-tested, since [`run`]'s engine-bound [`synthesize`] cannot run
+/// natively. A produced answer replaces `final_answer` and marks
+/// `synthesized`; `None` (synthesis skipped or failed) leaves both untouched,
+/// so the raw best-leaf answer finalize() set is preserved and never nulled —
+/// the load-bearing fail-safe + honest-null invariant (#523 Part A F1/F3).
+fn reconcile_synthesis(outcome: &mut SearchOutcome, synth: Option<String>) {
+    if let Some(answer) = synth {
+        outcome.final_answer = Some(answer);
+        outcome.synthesized = true;
+    }
 }
 
 /// Materialize one level's **successfully forked** branches into tree
@@ -704,6 +742,9 @@ fn finalize(flat: Vec<Node>, last_level: &[Candidate]) -> SearchOutcome {
         root,
         selected_node_id: best,
         final_answer,
+        // finalize() sets the raw best-leaf answer; `run` flips this true only
+        // when the post-search synthesis replaces it (#523 Part A F1).
+        synthesized: false,
     }
 }
 
@@ -953,10 +994,12 @@ async fn score_node(ctx: &Context, model: &Model) -> ScoreOutcome {
 /// before the search consumed the root. Appends [`build_synthesis_directive`]
 /// (+ `/no_think`) and runs ONE low-temperature, demuxed generation grounded
 /// in the best leaf, streaming its answer as `final_delta` when an emitter is
-/// present. Returns the synthesized answer, or `None` on any failure / empty
-/// result so the caller falls back to the raw best-leaf content and never
-/// loses an answer. Search, scoring, and beam selection are untouched — this
-/// runs only after a best ok leaf is chosen.
+/// present. Returns the synthesized answer, or `Err(reason)` on any failure /
+/// empty result — the reason (`not_answered` / `empty` / `aborted: …`) is
+/// surfaced by the caller as a host diagnostic before it falls back to the raw
+/// best-leaf content, so a failed synthesis is never lost silently (#523 F1).
+/// Search, scoring, and beam selection are untouched — this runs only after a
+/// best ok leaf is chosen.
 async fn synthesize(
     mut base: Context,
     model: &Model,
@@ -964,7 +1007,7 @@ async fn synthesize(
     best_reasoning: &str,
     answer_budget: usize,
     emitter: Option<&mut Emitter>,
-) -> Option<String> {
+) -> Result<String, String> {
     let directive = with_thinking(&build_synthesis_directive(best_content, best_reasoning), false);
     base.user(&directive);
     base.cue();
@@ -984,8 +1027,10 @@ async fn synthesize(
     )
     .await;
     match demux.kind {
-        DemuxKind::Answered if !demux.answer.trim().is_empty() => Some(demux.answer),
-        _ => None,
+        DemuxKind::Answered if !demux.answer.trim().is_empty() => Ok(demux.answer),
+        DemuxKind::Answered => Err("empty".to_string()),
+        DemuxKind::Incomplete => Err("not_answered".to_string()),
+        DemuxKind::Aborted(e) => Err(format!("aborted: {e}")),
     }
 }
 
@@ -1496,5 +1541,50 @@ mod tests {
         let out = finalize(flat, &pool2);
         assert_eq!(out.selected_node_id.as_deref(), Some("n0"));
         assert_eq!(out.final_answer.as_deref(), Some("L1-best"));
+    }
+
+    // ── reconcile_synthesis (run()'s synthesis fold; the engine-bound
+    //    synthesize() can't run natively, so the reconciliation is its own
+    //    pure seam — #523 Part A F1/F3) ──
+
+    #[test]
+    fn reconcile_synthesis_replaces_answer_and_marks_synthesized() {
+        // A produced synthesis overrides the raw best-leaf answer and flips
+        // the observability flag true.
+        let mut out = finalize(
+            vec![Node::root(), ok_leaf("a", "raw-best-leaf", Some(9))],
+            &[cand("a", Some(9), true)],
+        );
+        assert_eq!(out.final_answer.as_deref(), Some("raw-best-leaf"));
+        assert!(!out.synthesized);
+
+        reconcile_synthesis(&mut out, Some("synthesized-final-answer".to_string()));
+        assert_eq!(out.final_answer.as_deref(), Some("synthesized-final-answer"));
+        assert!(out.synthesized);
+    }
+
+    #[test]
+    fn reconcile_synthesis_none_preserves_best_leaf_and_stays_unsynthesized() {
+        // The load-bearing fail-safe: a skipped/failed synthesis (`None`) must
+        // NOT null the raw best-leaf answer finalize() set, and leaves the
+        // flag false so a dead synthesizer is observable, never masked.
+        let mut out = finalize(
+            vec![Node::root(), ok_leaf("a", "raw-best-leaf", Some(9))],
+            &[cand("a", Some(9), true)],
+        );
+        reconcile_synthesis(&mut out, None);
+        assert_eq!(out.final_answer.as_deref(), Some("raw-best-leaf"));
+        assert!(!out.synthesized);
+    }
+
+    #[test]
+    fn reconcile_synthesis_none_keeps_honest_null_when_no_leaf() {
+        // No ok leaf → finalize() honestly nulled final_answer; a skipped
+        // synthesis leaves it null (and unsynthesized).
+        let mut out = finalize(vec![Node::root()], &[]);
+        assert!(out.final_answer.is_none());
+        reconcile_synthesis(&mut out, None);
+        assert!(out.final_answer.is_none());
+        assert!(!out.synthesized);
     }
 }

@@ -18,9 +18,11 @@ Assertions (only on the planning prompts, where diverse strategies exist):
   * the scorer parsed at least one real integer score across the run, so
     pruning is quality-driven rather than silently input-order.
 
-The homepage-illustration clarification prompt is recorded as evidence
-(its winning branch should address the clarification, not be a generic
-acknowledgment) but not hard-asserted, since branch text is sampled.
+The homepage-illustration clarification prompt additionally hard-asserts
+the post-search synthesis: a non-null final_answer, the `synthesized`
+flag true (the synthesizer actually ran — a best-leaf fallback no longer
+passes silently), and that the answer addresses the clarification. A null
+final_answer is attributed to an upstream search failure, not synthesis.
 
 Usage:
     Scripts/run-tot-real-smoke.sh
@@ -162,7 +164,8 @@ def report(label: str, prompt: str, body: dict) -> tuple[list[float], list[int]]
         print(f"  pairwise Jaccard: min={min(sims):.2f} mean={sum(sims)/len(sims):.2f} max={max(sims):.2f}")
     print(f"  scores parsed: {scores}")
     fa = (body.get("final_answer") or "").replace("\n", " ")
-    print(f"  selected={body.get('selected_node_id')} final_answer={fa[:240]}")
+    print(f"  selected={body.get('selected_node_id')} synthesized={body.get('synthesized')} "
+          f"final_answer={fa[:240]}")
     return sims, scores
 
 
@@ -250,20 +253,42 @@ async def main() -> int:
                         _, scores = report("homepage-clarification", CLARIFY_PROMPT, body)
                         if scores:
                             any_score_parsed = True
-                        fa = (body.get("final_answer") or "").lower()
-                        # Substantive (synthesis produced a real answer)…
-                        if len(fa.split()) < 12:
+                        # Branch on null FIRST: a null final_answer means no ok
+                        # leaf was selected (an upstream SEARCH failure), not a
+                        # synthesis failure — attribute it correctly and skip
+                        # the answer-shape checks (which would otherwise blame
+                        # synthesis). (#523 F2)
+                        raw_fa = body.get("final_answer")
+                        if raw_fa is None:
                             failures.append(
-                                f"homepage-clarification final answer too thin ({len(fa.split())} words); "
-                                "synthesis did not produce a complete answer"
+                                "homepage-clarification: final_answer is null — no leaf selected / "
+                                "synthesis skipped (upstream search failure, not a synthesis failure)"
                             )
-                        # …and on-topic: it addresses the illustration vs real
-                        # output, not a generic 'looks good' acknowledgment.
-                        if not any(k in fa for k in ("illustrat", "token", "real output", "real product", "example")):
-                            failures.append(
-                                "homepage-clarification final answer does not address the requested "
-                                f"clarification (illustration / token-heaviness): {fa[:200]!r}"
-                            )
+                        else:
+                            # The post-search synthesizer must have actually run
+                            # — a best-leaf fallback (synthesized=false) is
+                            # typically substantive and on-topic too, so the
+                            # shape checks alone can't catch a dead synthesizer
+                            # (#523 F1/F2).
+                            if not body.get("synthesized"):
+                                failures.append(
+                                    "homepage-clarification: synthesized=false — the raw best-leaf "
+                                    "content stood; the post-search synthesizer did not run"
+                                )
+                            fa = raw_fa.lower()
+                            # Substantive (synthesis produced a real answer)…
+                            if len(fa.split()) < 12:
+                                failures.append(
+                                    f"homepage-clarification final answer too thin ({len(fa.split())} words); "
+                                    "synthesis did not produce a complete answer"
+                                )
+                            # …and on-topic: it addresses the illustration vs
+                            # real output, not a generic 'looks good' ack.
+                            if not any(k in fa for k in ("illustrat", "token", "real output", "real product", "example")):
+                                failures.append(
+                                    "homepage-clarification final answer does not address the requested "
+                                    f"clarification (illustration / token-heaviness): {fa[:200]!r}"
+                                )
             finally:
                 drain.cancel()
                 with __import__("contextlib").suppress(asyncio.CancelledError, Exception):

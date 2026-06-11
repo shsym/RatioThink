@@ -305,6 +305,7 @@ pub async fn dispatch(
         root: outcome.root,
         selected_node_id: outcome.selected_node_id,
         final_answer: outcome.final_answer,
+        synthesized: outcome.synthesized,
     };
     let body = match serde_json::to_string(&response_body) {
         Ok(s) => s,
@@ -369,6 +370,7 @@ async fn dispatch_streaming(
             &mut em,
             outcome.selected_node_id.as_deref(),
             outcome.final_answer.as_deref(),
+            outcome.synthesized,
         )
         .await;
     }

@@ -96,6 +96,10 @@ pub struct TreeResponse {
     pub root: Node,
     pub selected_node_id: Option<String>,
     pub final_answer: Option<String>,
+    /// `true` when `final_answer` is the post-search synthesis, `false` when
+    /// the raw best-leaf content stood (#523 Part A F1) — lets a non-streaming
+    /// caller (e.g. the gated smoke) assert the synthesizer actually ran.
+    pub synthesized: bool,
 }
 
 static NODE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -494,6 +498,7 @@ mod tests {
             root: Node::root(),
             selected_node_id: None,
             final_answer: None,
+            synthesized: false,
         };
         let v = serde_json::to_value(&resp).unwrap();
         for k in [
@@ -506,6 +511,7 @@ mod tests {
             "root",
             "selected_node_id",
             "final_answer",
+            "synthesized",
         ] {
             assert!(v.get(k).is_some(), "response missing key {k}");
         }
