@@ -79,6 +79,18 @@ FAKE_XCODEGEN
 echo "simulated xcodebuild failure" >&2
 exit 42
 FAKE_XCODEBUILD
+  cat >"$tmp/bin/defaults" <<'FAKE_DEFAULTS'
+#!/bin/bash
+case "${1:-}" in
+  export|delete)
+    exit 0
+    ;;
+  *)
+    echo "unexpected defaults invocation: $*" >&2
+    exit 1
+    ;;
+esac
+FAKE_DEFAULTS
   cat >"$tmp/bin/python3" <<'FAKE_PYTHON3'
 #!/bin/bash
 port_file=""
@@ -98,7 +110,7 @@ printf 'http://127.0.0.1:54321\n' >"$port_file"
 trap 'exit 0' TERM INT
 while true; do sleep 1; done
 FAKE_PYTHON3
-  chmod +x "$tmp/bin/pgrep" "$tmp/bin/xcodegen" "$tmp/bin/xcodebuild" "$tmp/bin/python3"
+  chmod +x "$tmp/bin/pgrep" "$tmp/bin/xcodegen" "$tmp/bin/xcodebuild" "$tmp/bin/defaults" "$tmp/bin/python3"
 
   set +e
   local output
