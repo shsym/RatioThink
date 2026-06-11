@@ -14,11 +14,6 @@ import UniformTypeIdentifiers
 /// `ModelImporter` which is synchronous and self-contained.
 struct AddModelSheet: View {
   let modelsDirectory: URL?
-  /// Snapshot of the installed library (app-managed + HF-cache rows)
-  /// from `ModelsSettingsTab.refresh()`. Feeds `ModelAvailability` so
-  /// curated/HF rows that are already local show their state instead
-  /// of a misleading Add (#514).
-  let installed: [InstalledModel]
   let onClose: (Outcome) -> Void
 
   /// One row in `Outcome.imported(successes:failures:)` — preserves
@@ -70,10 +65,13 @@ struct AddModelSheet: View {
   }
 
   @Environment(\.dismiss) private var dismiss
-  /// Live in-flight downloads — same instance the Models tab observes,
-  /// inherited through the sheet's environment. Re-renders the rows to
-  /// "Downloading…" the moment an Add is accepted (#514).
-  @EnvironmentObject private var downloads: ModelDownloadController
+  /// The one live source of truth for local availability (#514
+  /// rescope) — inherited through the sheet's environment. Its
+  /// published `availability` already folds in scan results, the
+  /// non-terminal download set, and the completion overlay, so rows
+  /// flip to "Downloading…" the moment an Add is accepted and to
+  /// "Installed" the moment a download completes — no flicker window.
+  @EnvironmentObject private var library: ModelLibraryStore
   @State private var selectedSource: Source = .curated
   /// Caption for the Local file pane. Owned at sheet scope so it
   /// survives the `Group { switch selectedSource }` tear-down when
@@ -164,17 +162,7 @@ struct AddModelSheet: View {
     .accessibilityIdentifier("AddModelSheet")
   }
 
-  /// Built fresh on every render: installed snapshot from the parent +
-  /// the live non-terminal download set. A lingering completed/failed
-  /// row is not "downloading" — the post-completion `refresh()` flips
-  /// the same slug to `installedAppManaged` via `installed` instead.
-  private var availability: ModelAvailability {
-    ModelAvailability(
-      installed: installed,
-      inFlight: downloads.active.values
-        .filter { !$0.isTerminal }
-        .map { (repo: $0.repo, file: $0.file) })
-  }
+  private var availability: ModelAvailability { library.availability }
 
   private func queueDownload(_ repo: String, _ file: String) {
     onClose(.queueDownload(repo: repo, file: file))
