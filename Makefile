@@ -45,6 +45,7 @@ define gui_suite_run
   if ! pgrep -x Dock >/dev/null 2>&1; then \
     echo "warning: no seated GUI session — GUI tests will XCTSkip."; \
   fi; \
+  Scripts/purge-app-window-frames.sh || echo "warning: window-frame purge failed — saved NSWindow Frame keys may poison GUI runs"; \
   if [ -n "$$PIE_TEST_TCC_GRANTED" ]; then export TEST_RUNNER_PIE_TEST_TCC_GRANTED="$$PIE_TEST_TCC_GRANTED"; fi; \
   if [ -n "$$PIE_TEST_MODEL" ]; then export TEST_RUNNER_PIE_TEST_MODEL="$$PIE_TEST_MODEL"; fi; \
   xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkGUITests \
@@ -500,8 +501,11 @@ render-menubar-icon: ## Render the #424 branded menu-bar icon (4 states x light/
 	@/tmp/render-menubar-icon
 	@open /tmp/menubar-icon-preview.png 2>/dev/null || true
 
-test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate, composer auto-grow, profile-swap keep-current, model-menu no-resident confirm, helper-recovery overlay (S260/S279/S285/S286/S446/S459/S486/S496)
-	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests -only-testing:RatioThinkGUITests/S459_ProfileSwapKeepCurrentGUITests -only-testing:RatioThinkGUITests/S486_ModelMenuNoResidentConfirmGUITests -only-testing:RatioThinkGUITests/S496_HelperRecoveryOverlayGUITests)
+test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate, composer auto-grow, profile-swap keep-current, model-menu no-resident confirm, helper-overlay removal, chat-list geometry (S260/S279/S285/S286/S446/S459/S486/S496/S511)
+	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests -only-testing:RatioThinkGUITests/S459_ProfileSwapKeepCurrentGUITests -only-testing:RatioThinkGUITests/S486_ModelMenuNoResidentConfirmGUITests -only-testing:RatioThinkGUITests/S496_HelperOverlayRemovedGUITests -only-testing:RatioThinkGUITests/S511_ChatListGeometryGUITests)
+
+test-gui-chat-geometry: genproject $(LOGDIR) ## GUI area: #511 chat-list row geometry guard — rows non-overlapping, text contained (S511)
+	$(call gui_suite_run,chat-geometry,-only-testing:RatioThinkGUITests/S511_ChatListGeometryGUITests)
 
 test-gui-helper-recovery: genproject $(LOGDIR) ## GUI area: #496 helper-recovery overlay — starting/unreachable/auto-dismiss + engineRunning gate (S496)
 	$(call gui_suite_run,helper-recovery,-only-testing:RatioThinkGUITests/S496_HelperRecoveryOverlayGUITests)

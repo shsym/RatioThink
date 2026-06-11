@@ -46,7 +46,10 @@ final class ChatSendControllerTests: XCTestCase {
           ChatMessage(role: .system, content: "Be concise."),
           ChatMessage(role: .user, content: "hello"),
         ],
-        sampling: ChatSampling(temperature: 0.2, topP: 0.8, maxTokens: 64)
+        sampling: ChatSampling(temperature: 0.2, topP: 0.8, maxTokens: 64),
+        // #522: every send carries a per-chat prefix-cache directive
+        // (system override + 1 user message → boundary turn 2).
+        cache: ChatCacheDirective(key: chat.id.uuidString, turn: 2)
       )
     ])
     XCTAssertEqual(chat.messages.count, 2)
@@ -342,6 +345,36 @@ final class ChatSendControllerTests: XCTestCase {
     let req = try await capturedRequest(speculation: nil)
     XCTAssertNil(req.speculation, "no profile speculation → byte-identical normal chat")
     XCTAssertEqual(req.sampling.temperature, 0.7, "temperature untouched without speculation")
+  }
+
+  // #522: every send carries an auto prefix-cache directive keyed on the
+  // chat id, so the inferlet can content-address and reuse the per-chat KV.
+  func test_send_attaches_prefix_cache_directive_keyed_on_chat() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [.delta(role: .assistant, content: "ok"), .finish(reason: .stop)])
+    let controller = ChatSendController()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m", sampling: ChatSampling())
+    )
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+
+    let req = try XCTUnwrap(engine.requests.first)
+    let cache = try XCTUnwrap(req.cache, "every send must carry a cache directive")
+    XCTAssertEqual(cache.key, chat.id.uuidString, "thread key is the chat id")
+    XCTAssertEqual(cache.policy, "auto", "default policy engages reuse")
+    XCTAssertEqual(cache.compat, ChatCacheDirective.compatVersion)
+    XCTAssertEqual(cache.turn, 1, "one user message → boundary turn 1")
   }
 
   func test_send_disabledSpeculation_no_field_and_temp_unchanged() async throws {

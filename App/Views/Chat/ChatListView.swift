@@ -80,28 +80,12 @@ struct ChatListView: View {
   }
 
   private func row(for chat: Chat) -> some View {
-    HStack(alignment: .firstTextBaseline, spacing: 6) {
-      if chat.pinned {
-        Image(systemName: "pin.fill")
-          .font(.caption2)
-          .foregroundStyle(.secondary)
-      }
-      VStack(alignment: .leading, spacing: 2) {
-        Text(chat.title)
-          .lineLimit(1)
-        Text(chat.updatedAt, format: .relative(presentation: .named))
-          .font(.caption2)
-          .foregroundStyle(.secondary)
-      }
-      // #507: compact waiting indicator after the title while this chat's
-      // response is streaming — clears when the stream finishes or fails.
-      if sendCoordinator.isInFlight(chat.id) {
-        Spacer(minLength: 4)
-        ProgressView()
-          .controlSize(.small)
-          .accessibilityIdentifier("chats.row.streaming")
-      }
-    }
+    ChatRowLabel(title: chat.title,
+                 updatedAt: chat.updatedAt,
+                 pinned: chat.pinned,
+                 // #507: compact waiting indicator after the title while this
+                 // chat's response streams — clears on finish/fail.
+                 isStreaming: sendCoordinator.isInFlight(chat.id))
   }
 
   /// Top-aligned per design §5 ("Chats section empty → grayed
@@ -184,5 +168,50 @@ struct ChatListView: View {
     if wasSelected {
       selectedItemID = nil
     }
+  }
+}
+
+/// #511: chat-list row content as a standalone, SwiftData-free view — its
+/// real job is carrying the stable accessibility identifiers the S511
+/// geometry guard asserts on (and keeping the row hostable headlessly
+/// without a model container if a unit-tier layout test is ever added).
+///
+/// Accessibility identifiers are load-bearing for S511: the container is
+/// `chats.row` and the texts are `chats.row.title` / `chats.row.timestamp`.
+/// `children: .contain` keeps the child identifiers reachable (a bare
+/// container id would swallow them — see `NoModelLoadedPrompt.body`).
+struct ChatRowLabel: View {
+  let title: String
+  let updatedAt: Date
+  let pinned: Bool
+  /// #507: show the compact per-row streaming indicator
+  /// (`chats.row.streaming`) while this chat has a turn in flight.
+  var isStreaming: Bool = false
+
+  var body: some View {
+    HStack(alignment: .firstTextBaseline, spacing: 6) {
+      if pinned {
+        Image(systemName: "pin.fill")
+          .font(.caption2)
+          .foregroundStyle(.secondary)
+      }
+      VStack(alignment: .leading, spacing: 2) {
+        Text(title)
+          .lineLimit(1)
+          .accessibilityIdentifier("chats.row.title")
+        Text(updatedAt, format: .relative(presentation: .named))
+          .font(.caption2)
+          .foregroundStyle(.secondary)
+          .accessibilityIdentifier("chats.row.timestamp")
+      }
+      if isStreaming {
+        Spacer(minLength: 4)
+        ProgressView()
+          .controlSize(.small)
+          .accessibilityIdentifier("chats.row.streaming")
+      }
+    }
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("chats.row")
   }
 }
