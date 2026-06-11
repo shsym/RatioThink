@@ -100,6 +100,8 @@ struct MessageBubble: View {
         }
         Spacer(minLength: 60)
       }
+      .accessibilityElement(children: .contain)
+      .accessibilityIdentifier("message.assistant")
       .contextMenu { copyMenuItems }
     case .system:
       HStack {

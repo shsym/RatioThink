@@ -34,7 +34,7 @@ final class S258_ComposerSendGUITests: XCTestCase {
     app.activate()
 
     try createChatAndSend(prompt, in: app)
-    guard waitForAssistantEchoStaticTexts(visibleAssistantEcho, in: app, timeout: 120) else {
+    guard waitForAssistantEchoInAssistantBubble(visibleAssistantEcho, in: app, timeout: 120) else {
       XCTFail("assistant response did not become visible through the GUI; app tree: \(app.debugDescription)")
       return
     }
@@ -50,7 +50,7 @@ final class S258_ComposerSendGUITests: XCTestCase {
     relaunched.activate()
 
     selectPersistedChat(titled: prompt, in: relaunched)
-    guard waitForAssistantEchoStaticTexts(visibleAssistantEcho, in: relaunched, timeout: 15) else {
+    guard waitForAssistantEchoInAssistantBubble(visibleAssistantEcho, in: relaunched, timeout: 15) else {
       XCTFail("assistant response was not visible after relaunch with PIE_HOME=\(pieHome); app tree: \(relaunched.debugDescription)")
       return
     }
@@ -92,17 +92,14 @@ final class S258_ComposerSendGUITests: XCTestCase {
     send.click()
   }
 
-  /// MarkdownUI exposes the assistant answer to Accessibility as
-  /// separate/truncated static text runs (for example `The capital of
-  /// Fra...`); the wrapper script performs the semantic/persistence
-  /// assertion against the SwiftData SQLite store after the XCUITest
-  /// returns. The visibility bar here is THREE matching static texts:
-  /// two exist without any assistant output — the user bubble and (#512)
-  /// the sidebar row auto-titled from the same first message — so only
-  /// the third proves the assistant's echoed answer actually rendered.
-  /// At two this passed vacuously and the test terminated the app
-  /// mid-stream (the wrapper's sqlite check caught the empty assistant).
-  private func waitForAssistantEchoStaticTexts(
+  /// MarkdownUI may fragment a single message into multiple Accessibility
+  /// static-text runs, and the prompt text also appears in the user bubble
+  /// plus the auto-titled sidebar row. Scope the visibility assertion to the
+  /// assistant message container so a fragmented user bubble can never make
+  /// this pass with zero assistant output. The wrapper script still performs
+  /// the semantic/persistence assertion against SwiftData after XCUITest
+  /// returns.
+  private func waitForAssistantEchoInAssistantBubble(
     _ needle: String,
     in app: XCUIApplication,
     timeout: TimeInterval
@@ -114,10 +111,16 @@ final class S258_ComposerSendGUITests: XCTestCase {
       needle
     )
     while Date() < deadline {
-      if app.descendants(matching: .staticText)
-        .matching(predicate)
-        .count >= 3 {
-        return true
+      let assistantMessages = app.descendants(matching: .any)
+        .matching(identifier: "message.assistant")
+      for index in 0..<assistantMessages.count {
+        if assistantMessages.element(boundBy: index)
+          .descendants(matching: .staticText)
+          .matching(predicate)
+          .firstMatch
+          .exists {
+          return true
+        }
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
     }

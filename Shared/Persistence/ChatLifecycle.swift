@@ -92,7 +92,10 @@ public enum ChatLifecycle {
   /// Launch-time reconcile: prune every persisted empty shell (old
   /// builds accumulated them; quitting with an empty chat selected
   /// leaves one). `excluding` protects the currently-selected chat —
-  /// pruning never deletes what the user is looking at.
+  /// pruning never deletes what the user is looking at. Runs in the app's
+  /// shared main `ModelContext`; if save fails, SwiftData can only roll back
+  /// the whole context, so callers must save unrelated edits before invoking
+  /// this if those edits need a narrower failure boundary.
   @MainActor
   public static func pruneAllEmptyChats(
     in context: ModelContext,
@@ -140,7 +143,10 @@ public enum ChatLifecycle {
     } catch {
       // `delete` mutates the in-memory graph immediately; roll the
       // pending deletes back so the sidebar and the on-disk store stay
-      // in sync (same recovery as ChatListView.delete).
+      // in sync (same recovery as ChatListView.delete). SwiftData rollback
+      // is scoped to the shared main context, not to this batch alone; this
+      // lifecycle helper therefore assumes callers do not leave unrelated
+      // unsaved edits pending across prune calls.
       context.rollback()
       persistenceStatus.report(error, context: reportContext)
     }
