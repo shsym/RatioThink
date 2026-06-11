@@ -149,6 +149,11 @@ public enum ToTEvent: Equatable, Sendable {
   /// failure, not an empty success — the server emits the `error` frame
   /// for it now, and the consumer treats a null selection as failure (F1).
   case treeComplete(selectedNodeID: String?, finalAnswer: String?)
+  /// A streamed chunk of the final synthesized answer (#523 Part A). After
+  /// the search picks the best leaf, ONE synthesis generation produces the
+  /// final answer; its text streams as `finalDelta` chunks before
+  /// `treeComplete` (whose `finalAnswer` is the authoritative full text).
+  case finalDelta(text: String)
 }
 
 /// Which channel a streamed `nodeDelta` chunk fills (#413).
@@ -231,6 +236,12 @@ public func decodeToTFrame(_ data: Data) throws -> ToTEvent? {
       throw ToTStreamError.malformedFrame(payload: String(decoding: data, as: UTF8.self))
     }
     return .levelPruned(level: level, kept: kept)
+  case "final_delta":
+    // #523 Part A: a streamed chunk of the synthesized final answer.
+    guard let text = raw.text else {
+      throw ToTStreamError.malformedFrame(payload: String(decoding: data, as: UTF8.self))
+    }
+    return .finalDelta(text: text)
   case "tree_complete":
     // selected_node_id / final_answer are legitimately null; their
     // absence from the optionals is indistinguishable from explicit

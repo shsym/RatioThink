@@ -10,8 +10,10 @@ import TOMLKit
 /// max_tokens_per_node 256`) so an under-specified ToT profile behaves the
 /// same whether or not the keys are present.
 ///
-/// `temperature` / `top_p` are NOT here — they come from the profile's
-/// `sampling`, reusing the same toolbar popover the chat path edits.
+/// `temperature` / `top_p` are NOT here — the dispatch sources them from the
+/// profile's `sampling` directly (`Profile.toTRequestSampling`, #523 Part B),
+/// so a ToT profile's configured temperature drives candidate generation
+/// rather than the unseeded toolbar default.
 public struct ToTProfileConfig: Equatable, Sendable {
   public var breadth: Int
   public var depth: Int
@@ -58,6 +60,25 @@ public extension Profile {
       depth: intArg("depth", default: defaults.depth),
       beamWidth: intArg("beam_width", default: defaults.beamWidth),
       maxTokensPerNode: intArg("max_tokens_per_node", default: defaults.maxTokensPerNode)
+    )
+  }
+
+  /// The sampling a tree-of-thought dispatch should send (#523 Part B).
+  ///
+  /// Sourced from the profile's own `sampling` so a ToT profile's configured
+  /// temperature is the candidate-**generation** temperature on the wire —
+  /// not the toolbar default (`viewModel.sampling`, which is never seeded
+  /// from the profile). `max_tokens` is irrelevant to ToT (the per-node
+  /// budget comes from the search config), so only `temperature`/`top_p` are
+  /// load-bearing; all three are carried for fidelity. The engine keeps the
+  /// scorer greedy and the final synthesis low regardless of this value, so
+  /// raising it buys branch diversity without destabilizing pruning or the
+  /// answer. Pure → unit-tested.
+  var toTRequestSampling: ChatSampling {
+    ChatSampling(
+      temperature: sampling.temperature,
+      topP: sampling.topP,
+      maxTokens: sampling.maxTokens
     )
   }
 }

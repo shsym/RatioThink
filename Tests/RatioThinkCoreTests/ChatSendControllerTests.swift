@@ -5,6 +5,24 @@ import SwiftData
 @available(macOS 14, *)
 @MainActor
 final class ChatSendControllerTests: XCTestCase {
+  func test_with_sampling_replaces_sampling_and_keeps_other_options() {
+    // #523 Part B: the ToT dispatch swaps in the profile's sampling while
+    // leaving model id, system prompt, speculation, and the ceiling intact.
+    let base = ChatSendRequestOptions(
+      modelID: "qwen",
+      sampling: ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 64),
+      systemPromptOverride: "sys",
+      speculation: nil,
+      maxOutputTokensCeiling: 1024
+    )
+    let swapped = base.withSampling(ChatSampling(temperature: 1.3, topP: 0.8, maxTokens: 64))
+    XCTAssertEqual(swapped.sampling.temperature, 1.3)
+    XCTAssertEqual(swapped.sampling.topP, 0.8)
+    XCTAssertEqual(swapped.modelID, "qwen")
+    XCTAssertEqual(swapped.systemPromptOverride, "sys")
+    XCTAssertEqual(swapped.maxOutputTokensCeiling, 1024)
+  }
+
   func test_send_builds_request_streams_assistant_and_routes_model_meta() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)

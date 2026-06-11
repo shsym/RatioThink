@@ -700,14 +700,17 @@ struct ChatScaffoldView: View {
     // route the turn to the ToT dispatch (streamed tree search rendered
     // inline) instead of a chat completion. The launched inferlet is
     // still chat-apc — ToT is a per-request dispatch mode.
-    if let totConfig = profileStore.profile(forProfileID: viewModel.selectedProfileID)?.treeOfThought {
+    if let totProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
+       let totConfig = totProfile.treeOfThought {
       sendController.sendTreeOfThought(
         chat: chat,
         context: modelContext,
         engine: engineStore.client,
         config: totConfig,
         persistenceStatus: persistenceStatus,
-        options: options
+        // #523 Part B: source the ToT candidate-generation temperature from
+        // the profile, not the toolbar default.
+        options: options.withSampling(totProfile.toTRequestSampling)
       )
       return
     }

@@ -319,7 +319,12 @@ public final class ChatSendController: ObservableObject {
         for try await event in toTEventStream(from: engine.dispatchInferlet(request)) {
           guard self.generation == myGeneration, !Task.isCancelled else { return }
           tree.apply(event)
-          let isDelta: Bool = { if case .nodeDelta = event { return true } else { return false } }()
+          let isDelta: Bool = {
+            switch event {
+            case .nodeDelta, .finalDelta: return true
+            default: return false
+            }
+          }()
           let now = Date()
           if !isDelta || now.timeIntervalSince(lastLiveEncode) >= Self.totLiveEncodeInterval {
             lastLiveEncode = now
@@ -350,6 +355,11 @@ public final class ChatSendController: ObservableObject {
             self.activeAssistant = nil
             self.activeContext = nil
             self.activePersistenceStatus = nil
+          case let .finalDelta(text):
+            // #523 Part A: stream the synthesized final answer into the row
+            // live (the row's content is otherwise empty until the terminal);
+            // `treeComplete` then sets the authoritative full text.
+            assistant.content += text
           case .levelPruned:
             Self.persistTree(context, status: persistenceStatus)
           case .treeStart, .nodeStart, .nodeDelta, .nodeComplete:
@@ -695,6 +705,19 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
     self.systemPromptOverride = systemPromptOverride
     self.speculation = speculation
     self.maxOutputTokensCeiling = maxOutputTokensCeiling
+  }
+
+  /// A copy with `sampling` replaced. Used by the tree-of-thought dispatch
+  /// to source its temperature from the active profile (#523 Part B) rather
+  /// than the toolbar default, leaving every other option intact.
+  public func withSampling(_ sampling: ChatSampling) -> ChatSendRequestOptions {
+    ChatSendRequestOptions(
+      modelID: modelID,
+      sampling: sampling,
+      systemPromptOverride: systemPromptOverride,
+      speculation: speculation,
+      maxOutputTokensCeiling: maxOutputTokensCeiling
+    )
   }
 }
 

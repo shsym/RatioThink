@@ -53,6 +53,38 @@ final class ToTProfileTests: XCTestCase {
     XCTAssertEqual(p.inferlet, "chat-apc")
   }
 
+  func test_tot_request_sampling_sources_temperature_from_profile() throws {
+    // #523 Part B: a ToT dispatch's generation temperature/top_p come from
+    // the profile's [sampling], not the toolbar default.
+    let p = try parse("""
+    id = "tot"
+    name = "Tree of Thought"
+    model = "qwen"
+    inferlet = "chat-apc"
+    [inferlet_args]
+    mode = "tree-of-thought"
+    [sampling]
+    temperature = 1.2
+    top_p = 0.85
+    """)
+    XCTAssertEqual(p.toTRequestSampling.temperature, 1.2)
+    XCTAssertEqual(p.toTRequestSampling.topP, 0.85)
+  }
+
+  func test_tot_request_sampling_defaults_when_unspecified() throws {
+    let p = try parse("""
+    id = "tot"
+    name = "Tree of Thought"
+    model = "qwen"
+    inferlet = "chat-apc"
+    [inferlet_args]
+    mode = "tree-of-thought"
+    """)
+    // Profile.Sampling defaults (0.7 / 0.9) flow through.
+    XCTAssertEqual(p.toTRequestSampling.temperature, 0.7)
+    XCTAssertEqual(p.toTRequestSampling.topP, 0.9)
+  }
+
   func test_tot_profile_falls_back_to_engine_defaults() throws {
     let p = try parse("""
     id = "tot"
