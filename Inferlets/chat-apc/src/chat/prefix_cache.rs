@@ -539,6 +539,20 @@ mod tests {
     }
 
     #[test]
+    fn model_switch_misses_but_switch_back_recovers_original_name() {
+        // Cross-profile safety matrix:
+        // - switching to a different model must miss because physical KV is
+        //   model-specific;
+        // - switching back to the original model with the same rendered
+        //   prefix must recompute the original name and hit.
+        let before = snapshot_name("chat-1", "1", "qwen-0.6b", "tmpl", &[1, 2, 3]);
+        let other_model = snapshot_name("chat-1", "1", "llama-8b", "tmpl", &[1, 2, 3]);
+        let switched_back = snapshot_name("chat-1", "1", "qwen-0.6b", "tmpl", &[1, 2, 3]);
+        assert_ne!(before, other_model);
+        assert_eq!(before, switched_back);
+    }
+
+    #[test]
     fn empty_compat_normalizes() {
         // An empty compat must not collide with a literal "0" caller and
         // must still be stable.
@@ -619,6 +633,21 @@ mod tests {
             retry_lookup, after_turn2,
             "stale suffix boundary is unreachable"
         );
+    }
+
+    #[test]
+    fn retry_in_one_chat_cannot_reach_other_chats_boundary() {
+        // Dedicated no-contamination guard: even if two chats have identical
+        // rendered history, their snapshot names differ by chat key, so a
+        // retry in chat A can only hit chat A's valid earlier boundary.
+        let chat_a_after_turn1 = snapshot_name("chat-a", "1", "m", "t", &[1, 2, 3]);
+        let chat_a_stale_after_turn2 = snapshot_name("chat-a", "1", "m", "t", &[1, 2, 3, 4, 5]);
+        let chat_b_after_turn1_same_tokens = snapshot_name("chat-b", "1", "m", "t", &[1, 2, 3]);
+        let chat_a_retry_lookup = snapshot_name("chat-a", "1", "m", "t", &[1, 2, 3]);
+
+        assert_eq!(chat_a_retry_lookup, chat_a_after_turn1);
+        assert_ne!(chat_a_retry_lookup, chat_a_stale_after_turn2);
+        assert_ne!(chat_a_retry_lookup, chat_b_after_turn1_same_tokens);
     }
 
     // ─── directive gating ─────────────────────────────────────

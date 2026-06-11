@@ -12,7 +12,9 @@ contract end to end:
      reused — the history prefill was skipped).
   3. A `policy:"bypass"` request emits NO cache diagnostics (reuse off).
   4. A different chat key → MISS (per-chat namespacing).
-  5. A changed system prompt under the same key → MISS (prompt-affecting
+  5. A retry/truncate-shaped request after turn 2 reopens the turn-1
+     boundary, never the now-erased turn-2 suffix boundary.
+  6. A changed system prompt under the same key → MISS (prompt-affecting
      change is not reused).
 
 The diagnostics ride the `X-ChatAPC-Cache` response header (non-streaming).
@@ -189,6 +191,28 @@ async def main() -> int:
                             print(f"[cache] HIT: reused {d2['base_boundary']} prefix tokens, "
                                   f"appended {d2['appended']}")
 
+                    # ── same-model profile/sampling switch → still HIT ─
+                    tp = await http_c.post(f"{base}/v1/chat/completions", json={
+                        "model": MODEL, "messages": hist2,
+                        # Different sampling knobs model a profile switch
+                        # that should not invalidate the same-model prefix.
+                        "temperature": 0.7, "top_p": 0.95, "max_tokens": 32, "stream": False,
+                        "cache": directive(key, 3),
+                    })
+                    dp = _diag(tp)
+                    print(f"[cache] same-model-profile-switch -> {tp.status_code} diag={dp}")
+                    if tp.status_code == 200 and dp is None:
+                        failures.append("same-model profile switch: missing X-ChatAPC-Cache header")
+                    elif tp.status_code == 200 and dp is not None:
+                        if dp["outcome"] != "hit":
+                            failures.append(
+                                f"same-model profile switch outcome={dp['outcome']!r} (want hit)")
+                        elif d1 is not None and dp.get("prefix_hash") != d1.get("save_hash"):
+                            failures.append(
+                                "same-model profile switch hit the wrong boundary: "
+                                f"prefix_hash={dp.get('prefix_hash')!r} "
+                                f"turn1_save_hash={d1.get('save_hash')!r}")
+
                     # ── bypass: no reuse, no diagnostics ──────────────
                     tb = await http_c.post(f"{base}/v1/chat/completions", json={
                         "model": MODEL, "messages": hist2,
@@ -209,6 +233,42 @@ async def main() -> int:
                     print(f"[cache] otherkey -> {tk.status_code} diag={dk}")
                     if tk.status_code == 200 and dk is not None and dk["outcome"] != "miss":
                         failures.append(f"different key outcome={dk['outcome']!r} (want miss)")
+
+                    # ── retry/truncate: erased suffix must not leak ────
+                    # After turn2, the engine may have saved a longer
+                    # [q1,a1,q2,a2] boundary. A retry of turn2 resends only
+                    # [q1,a1,new_user], so it must reopen turn1's saved
+                    # boundary and must not hit the stale turn2 suffix.
+                    a2 = ""
+                    if t2.status_code == 200:
+                        a2 = t2.json()["choices"][0]["message"].get("content") or ""
+                    hist_retry = [
+                        {"role": "user", "content": q1},
+                        {"role": "assistant", "content": a1},
+                        {"role": "user", "content": "Retry: answer with exactly one landmark name."},
+                    ]
+                    tr = await http_c.post(f"{base}/v1/chat/completions", json={
+                        "model": MODEL, "messages": hist_retry,
+                        "temperature": 0, "max_tokens": 32, "stream": False,
+                        "cache": directive(key, 3),
+                    })
+                    dr = _diag(tr)
+                    print(f"[cache] retry-after-turn2 -> {tr.status_code} diag={dr} "
+                          f"turn2_content={a2[:60]!r}")
+                    if tr.status_code == 200 and dr is None:
+                        failures.append("retry lookup: missing X-ChatAPC-Cache header")
+                    elif tr.status_code == 200 and dr is not None:
+                        if dr["outcome"] != "hit":
+                            failures.append(f"retry lookup outcome={dr['outcome']!r} (want hit)")
+                        elif d1 is not None and dr.get("prefix_hash") != d1.get("save_hash"):
+                            failures.append(
+                                "retry lookup must hit turn1's boundary, not rebuild/leak: "
+                                f"prefix_hash={dr.get('prefix_hash')!r} "
+                                f"turn1_save_hash={d1.get('save_hash')!r}")
+                        elif d2 is not None and dr.get("prefix_hash") == d2.get("save_hash"):
+                            failures.append(
+                                "retry lookup hit the stale turn2 suffix boundary; "
+                                "erased assistant/user tokens leaked into reuse")
 
                     # ── changed system prompt under same key → miss ───
                     ts = await http_c.post(f"{base}/v1/chat/completions", json={
@@ -233,7 +293,8 @@ async def main() -> int:
         for f in failures:
             print(f"  ✗ {f}")
         return 1
-    print("\n[cache] PASS: miss→save→hit, bypass off, per-key + prompt-change misses")
+    print("\n[cache] PASS: miss→save→hit, profile switch hit, retry safe, "
+          "bypass off, per-key + prompt-change misses")
     return 0
 
 
