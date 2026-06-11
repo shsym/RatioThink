@@ -23,6 +23,43 @@ final class ChatSendControllerTests: XCTestCase {
     XCTAssertEqual(swapped.maxOutputTokensCeiling, 1024)
   }
 
+  func test_send_threads_authoritative_kv_usage_into_cache_retention_budget() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [.modelReady, .finish(reason: .stop)])
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(
+        modelID: "m",
+        kvUsageSnapshot: KVUsageSnapshot(
+          modelID: "m",
+          pagesUsed: 90,
+          pagesTotal: 100,
+          observedAt: Date(timeIntervalSince1970: 1),
+          generation: 1,
+          source: .pieModelStatus
+        )
+      )
+    )
+
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+    XCTAssertEqual(
+      engine.requests.first?.cache?.retention,
+      ChatCacheRetentionDirective(kvPagesUsed: 90, kvPagesTotal: 100)
+    )
+  }
+
   func test_send_builds_request_streams_assistant_and_routes_model_meta() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)

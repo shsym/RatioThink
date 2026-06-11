@@ -892,7 +892,11 @@ struct ChatScaffoldView: View {
       // from GET /v1/models during resident-model reconcile. `makeRequest`
       // clamps the profile's max_tokens down to this so a memory-squeezed
       // launch never trips the engine's clean 400.
-      maxOutputTokensCeiling: modelLoadCenter.residentMaxOutputTokens
+      maxOutputTokensCeiling: modelLoadCenter.residentMaxOutputTokens,
+      // #524: seed chat-apc's APC snapshot-retention policy from the latest
+      // authoritative pie `model_status` KV counters. Nil/unknown means the
+      // inferlet must retain rather than guess.
+      kvUsageSnapshot: engineStatusStore.kvUsageSnapshot(for: modelID)
     )
 
     // #413: when the active profile declares `mode = "tree-of-thought"`,
