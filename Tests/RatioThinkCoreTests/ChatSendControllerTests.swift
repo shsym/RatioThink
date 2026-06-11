@@ -248,6 +248,66 @@ final class ChatSendControllerTests: XCTestCase {
     controller.cancel()
   }
 
+  func test_send_marksContextUsageRequestLocalActiveAndDestroyedOnFinish() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [.modelReady, .finish(reason: .stop)])
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"),
+      contextUsageTracker: tracker
+    )
+
+    try await waitUntil("usage record destroyed") {
+      tracker.records.first?.residency == .requestLocalDestroyed
+    }
+    let record = try XCTUnwrap(tracker.records.first)
+    XCTAssertEqual(record.chatID, chat.id)
+    XCTAssertEqual(record.modelID, "m")
+    XCTAssertNotNil(record.requestID)
+    XCTAssertNil(record.usage, "no context_usage frame exists yet, so usage must stay unknown")
+  }
+
+  func test_cancel_marksContextUsageDestroyed() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ManualChatEngine()
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"),
+      contextUsageTracker: tracker
+    )
+    try await waitUntil("usage active") { tracker.records.first?.residency == .requestLocalActive }
+
+    controller.cancel()
+
+    XCTAssertEqual(tracker.records.first?.residency, .requestLocalDestroyed)
+  }
+
   func test_engineNotReady_failure_assistant_bubble_is_normalized_actionable_line() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)

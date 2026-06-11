@@ -23,6 +23,7 @@ public final class ChatSendController: ObservableObject {
   private var activeAssistant: Message?
   private var activeContext: ModelContext?
   private var activePersistenceStatus: PersistenceStatus?
+  private var activeUsageIdentity: (tracker: ContextUsageTracker, chatID: UUID, modelID: String, requestID: String)?
 
   public init() {}
 
@@ -34,12 +35,22 @@ public final class ChatSendController: ObservableObject {
     persistenceStatus: PersistenceStatus,
     options: ChatSendRequestOptions,
     recoveryGate: ChatRecoveryGate? = nil,
-    recoveryPolicy: ChatRecoveryPolicy = .default
+    recoveryPolicy: ChatRecoveryPolicy = .default,
+    contextUsageTracker: ContextUsageTracker? = nil
   ) {
     cancel()
     generation &+= 1
     let myGeneration = generation
     let request = Self.makeRequest(chat: chat, options: options)
+    let usageRequestID = UUID().uuidString
+    contextUsageTracker?.markRequestStarted(
+      chatID: chat.id,
+      modelID: options.modelID,
+      requestID: usageRequestID
+    )
+    self.activeUsageIdentity = contextUsageTracker.map {
+      (tracker: $0, chatID: chat.id, modelID: options.modelID, requestID: usageRequestID)
+    }
     isInFlight = true
     Diag.app.event("chat.send", [("model", options.modelID)])
 
@@ -47,6 +58,16 @@ public final class ChatSendController: ObservableObject {
       guard let self else { return }
       var writer: MessageStreamWriter?
       defer {
+        if self.generation == myGeneration,
+           let usage = self.activeUsageIdentity,
+           usage.requestID == usageRequestID {
+          usage.tracker.markRequestFinished(
+            chatID: usage.chatID,
+            modelID: usage.modelID,
+            requestID: usage.requestID
+          )
+          self.activeUsageIdentity = nil
+        }
         if self.generation == myGeneration {
           self.activeWriter = nil
           self.activeAssistant = nil
@@ -439,6 +460,14 @@ public final class ChatSendController: ObservableObject {
         persistenceStatus: status
       )
     }
+    if let usage = activeUsageIdentity {
+      usage.tracker.markRequestFinished(
+        chatID: usage.chatID,
+        modelID: usage.modelID,
+        requestID: usage.requestID
+      )
+    }
+    activeUsageIdentity = nil
     activeWriter = nil
     activeAssistant = nil
     activeContext = nil
