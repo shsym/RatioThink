@@ -156,13 +156,19 @@ public final class ChatSendController: ObservableObject {
           writer?.cancel()
           return
         } catch {
-          // A throw AFTER the terminal `.finish` chunk (engine died between
-          // `.finish` and the `[DONE]` sentinel) is not a lost turn — the
-          // answer is already persisted and the active* fields nilled. Treat
-          // as terminal: do not retry/reset (would discard a correct answer)
-          // and do not markAssistant (would overwrite it with the engine-gone
-          // warning). The writer already finished, so no cleanup is needed.
-          if didFinish { return }
+          // A transport closure AFTER the terminal `.finish` chunk (engine
+          // died between `.finish` and the `[DONE]` sentinel) is not a lost
+          // turn — the answer is already persisted. Protocol/decode errors
+          // after `.finish`, however, are still contract violations (for
+          // example malformed terminal `generation_metrics`) and must leave a
+          // diagnostic instead of looking identical to historical no-metric
+          // rows.
+          if didFinish {
+            if !Self.isBenignPostFinishTransportClosure(error) {
+              persistenceStatus.report(error, context: "ChatSendController.postFinishStreamError")
+            }
+            return
+          }
           guard self.generation == myGeneration, !Task.isCancelled else {
             writer?.cancel()
             return
@@ -651,6 +657,28 @@ public final class ChatSendController: ObservableObject {
     } catch {
       persistenceStatus.report(error, context: "ChatSendController.persistGenerationMetrics")
     }
+  }
+
+  private static func isBenignPostFinishTransportClosure(_ error: Error) -> Bool {
+    if error is CancellationError { return true }
+    if let urlError = error as? URLError {
+      switch urlError.code {
+      case .cancelled,
+           .networkConnectionLost,
+           .cannotConnectToHost,
+           .cannotFindHost,
+           .notConnectedToInternet,
+           .timedOut:
+        return true
+      default:
+        return false
+      }
+    }
+    if let engineError = error as? HTTPEngineError,
+       case .engineGone = engineError {
+      return true
+    }
+    return false
   }
 
   private static func markAssistant(

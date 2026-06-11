@@ -96,6 +96,43 @@ final class ChatSendControllerTests: XCTestCase {
     XCTAssertEqual(assistant.tokens, 10)
   }
 
+  func test_postFinishNonTransportStreamError_isReported() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ThrowingAfterEventsChatEngine(
+      events: [
+        .modelReady,
+        .delta(role: .assistant, content: "Hi"),
+        .finish(reason: .stop),
+      ],
+      error: HTTPEngineError.stream(code: "bad_generation_metrics", message: "malformed metrics")
+    )
+    let status = PersistenceStatus()
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: status,
+      options: ChatSendRequestOptions(modelID: "m1")
+    )
+
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(assistantMessages(in: chat).first)
+    XCTAssertEqual(assistant.content, "Hi")
+    XCTAssertEqual(assistant.finishReason, "stop")
+    XCTAssertEqual(status.lastError?.context, "ChatSendController.postFinishStreamError")
+    XCTAssertTrue(status.lastError?.message.contains("bad_generation_metrics") == true)
+  }
+
   func test_cancelled_partial_assistant_does_not_keep_generation_metrics() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)
@@ -536,6 +573,30 @@ private final class ImmediateChatEngine: EngineClient, @unchecked Sendable {
     return AsyncThrowingStream { continuation in
       for event in events { continuation.yield(event) }
       continuation.finish()
+    }
+  }
+  func dispatchInferlet(_ req: InferletRequest) -> AsyncThrowingStream<Data, Error> {
+    AsyncThrowingStream { $0.finish() }
+  }
+}
+
+private final class ThrowingAfterEventsChatEngine: EngineClient, @unchecked Sendable {
+  private let events: [ChatEvent]
+  private let error: Error
+
+  init(events: [ChatEvent], error: Error) {
+    self.events = events
+    self.error = error
+  }
+
+  func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
+  func models() async throws -> [ModelInfo] { [] }
+  func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
+    let events = self.events
+    let error = self.error
+    return AsyncThrowingStream { continuation in
+      for event in events { continuation.yield(event) }
+      continuation.finish(throwing: error)
     }
   }
   func dispatchInferlet(_ req: InferletRequest) -> AsyncThrowingStream<Data, Error> {
