@@ -465,6 +465,7 @@ public enum ChatEvent: Equatable, Sendable {
   case modelReady
   case delta(role: ChatMessage.Role?, content: String)
   case reasoningDelta(String)
+  case generationMetrics(GenerationMetrics)
   case finish(reason: FinishReason)
 
   public enum FinishReason: Equatable, Sendable {
@@ -472,6 +473,24 @@ public enum ChatEvent: Equatable, Sendable {
     case length
     case cancelled
     case other(String)
+  }
+}
+
+public struct GenerationMetrics: Codable, Equatable, Sendable {
+  public let outputTokens: Int
+  public let elapsedSeconds: Double
+  public let tokensPerSecond: Double
+
+  public init(outputTokens: Int, elapsedSeconds: Double, tokensPerSecond: Double) {
+    self.outputTokens = outputTokens
+    self.elapsedSeconds = elapsedSeconds
+    self.tokensPerSecond = tokensPerSecond
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case outputTokens = "output_tokens"
+    case elapsedSeconds = "elapsed_s"
+    case tokensPerSecond = "tokens_per_sec"
   }
 }
 

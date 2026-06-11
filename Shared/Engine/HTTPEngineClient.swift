@@ -209,6 +209,13 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
                 throw HTTPEngineError.stream(
                   code: meta.code ?? "unknown_error",
                   message: meta.message ?? "")
+              case "generation_metrics":
+                let meta = try decoder.decode(MetaFrame.self, from: frame.dataBytes)
+                continuation.yield(.generationMetrics(GenerationMetrics(
+                  outputTokens: meta.output_tokens ?? 0,
+                  elapsedSeconds: meta.elapsed_s ?? 0,
+                  tokensPerSecond: meta.tokens_per_sec ?? 0
+                )))
               default:
                 continue
               }
@@ -553,6 +560,9 @@ private struct MetaFrame: Decodable {
   let loaded_bytes: UInt64?
   let total_bytes: UInt64?
   let eta_s: Double?
+  let output_tokens: Int?
+  let elapsed_s: Double?
+  let tokens_per_sec: Double?
 }
 
 /// `chat.completion.chunk` body per OpenAI's streaming schema. Only

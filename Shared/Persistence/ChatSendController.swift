@@ -101,6 +101,7 @@ public final class ChatSendController: ObservableObject {
       // engine-gone fault — the answer is already persisted; retrying would
       // discard a correct, finished turn.
       var didFinish = false
+      var generationMetrics: GenerationMetrics?
       streamLoop: while attemptsRemaining > 0 {
         attemptsRemaining -= 1
         do {
@@ -126,8 +127,19 @@ public final class ChatSendController: ObservableObject {
               writer?.appendDelta(content)
             case let .reasoningDelta(text):
               writer?.appendReasoningDelta(text)
+            case let .generationMetrics(metrics):
+              generationMetrics = metrics
+              if didFinish {
+                Self.persistGenerationMetrics(
+                  metrics,
+                  on: assistant,
+                  finishReason: assistant.finishReason,
+                  context: context,
+                  persistenceStatus: persistenceStatus
+                )
+              }
             case let .finish(reason):
-              writer?.finish(meta: Self.finishMeta(for: reason))
+              writer?.finish(meta: Self.finishMeta(for: reason, generationMetrics: generationMetrics))
               didFinish = true
               let reasonValue = Self.finishReasonValue(for: reason)
               Diag.app.event(reasonValue == "length" ? "chat.truncated" : "chat.stream_end",
@@ -211,6 +223,7 @@ public final class ChatSendController: ObservableObject {
           assistant.content = ""
           assistant.reasoning = ""
           assistant.meta = nil
+          generationMetrics = nil
           do {
             try context.save()
           } catch {
@@ -592,10 +605,52 @@ public final class ChatSendController: ObservableObject {
   }
 
   private static func finishMeta(for reason: ChatEvent.FinishReason) -> Data? {
-    struct FinishMeta: Encodable { let finishReason: String }
-    let encoder = JSONEncoder()
-    encoder.keyEncodingStrategy = .convertToSnakeCase
-    return try? encoder.encode(FinishMeta(finishReason: finishReasonValue(for: reason)))
+    finishMeta(for: reason, generationMetrics: nil)
+  }
+
+  private static func finishMeta(
+    for reason: ChatEvent.FinishReason,
+    generationMetrics: GenerationMetrics?
+  ) -> Data? {
+    let validMetrics = finishReasonValue(for: reason) == finishReasonValue(for: .cancelled)
+      ? nil
+      : validGenerationMetrics(generationMetrics)
+    let meta = MessageMeta(
+      finishReason: finishReasonValue(for: reason),
+      generationPerformance: validMetrics
+    )
+    return try? JSONEncoder().encode(meta)
+  }
+
+  private static func validGenerationMetrics(_ metrics: GenerationMetrics?) -> GenerationMetrics? {
+    guard let metrics,
+          metrics.outputTokens > 0,
+          metrics.elapsedSeconds > 0,
+          metrics.elapsedSeconds.isFinite,
+          metrics.tokensPerSecond > 0,
+          metrics.tokensPerSecond.isFinite else { return nil }
+    return metrics
+  }
+
+  private static func persistGenerationMetrics(
+    _ metrics: GenerationMetrics,
+    on assistant: Message,
+    finishReason: String?,
+    context: ModelContext,
+    persistenceStatus: PersistenceStatus
+  ) {
+    guard finishReason != finishReasonValue(for: .cancelled),
+          let valid = validGenerationMetrics(metrics) else { return }
+    assistant.tokens = valid.outputTokens
+    assistant.meta = try? JSONEncoder().encode(MessageMeta(
+      finishReason: finishReason,
+      generationPerformance: valid
+    ))
+    do {
+      try context.save()
+    } catch {
+      persistenceStatus.report(error, context: "ChatSendController.persistGenerationMetrics")
+    }
   }
 
   private static func markAssistant(

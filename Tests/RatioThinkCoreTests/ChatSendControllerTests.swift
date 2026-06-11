@@ -61,6 +61,106 @@ final class ChatSendControllerTests: XCTestCase {
     XCTAssertNil(status.lastError)
   }
 
+  func test_send_persists_generation_metrics_from_engine_meta_frame() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [
+      .modelReady,
+      .delta(role: .assistant, content: "Hi"),
+      .finish(reason: .stop),
+      .generationMetrics(GenerationMetrics(outputTokens: 10, elapsedSeconds: 0.25, tokensPerSecond: 40.0)),
+    ])
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1")
+    )
+
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(assistantMessages(in: chat).first)
+    let meta = try XCTUnwrap(assistant.generationPerformance)
+    XCTAssertEqual(meta.outputTokens, 10)
+    XCTAssertEqual(meta.elapsedSeconds, 0.25)
+    XCTAssertEqual(meta.tokensPerSecond, 40.0)
+    XCTAssertEqual(assistant.tokens, 10)
+  }
+
+  func test_cancelled_partial_assistant_does_not_keep_generation_metrics() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ManualChatEngine()
+    let controller = ChatSendController()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1")
+    )
+    try await waitUntil("request starts") { engine.requests.count == 1 && self.assistantMessages(in: chat).count == 1 }
+    let assistant = try XCTUnwrap(assistantMessages(in: chat).first)
+
+    engine.yield(.generationMetrics(GenerationMetrics(outputTokens: 10, elapsedSeconds: 0.25, tokensPerSecond: 40.0)), at: 0)
+    engine.yield(.delta(role: .assistant, content: "partial"), at: 0)
+    engine.yield(.modelReady, at: 0)
+    try await waitUntil("partial flushes") { assistant.content == "partial" }
+
+    controller.cancel()
+
+    XCTAssertEqual(assistant.finishReason, "cancelled")
+    XCTAssertNil(assistant.generationPerformance)
+  }
+
+  func test_cancelled_finish_drops_pending_generation_metrics() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [
+      .modelReady,
+      .generationMetrics(GenerationMetrics(outputTokens: 10, elapsedSeconds: 0.25, tokensPerSecond: 40.0)),
+      .delta(role: .assistant, content: "partial"),
+      .finish(reason: .cancelled),
+    ])
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1")
+    )
+
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(assistantMessages(in: chat).first)
+    XCTAssertEqual(assistant.finishReason, "cancelled")
+    XCTAssertNil(assistant.generationPerformance)
+  }
+
+
   /// #474: the outgoing request's `max_tokens` is clamped DOWN to the
   /// launched engine ceiling carried on `ChatSendRequestOptions`. End-to-end
   /// through `send` so the options → `makeRequest` → wire path is exercised,

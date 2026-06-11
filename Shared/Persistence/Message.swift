@@ -104,4 +104,27 @@ public extension Message {
     }
     return object["finish_reason"] as? String
   }
+
+  /// Engine-reported per-response generation throughput decoded from
+  /// `meta.generation_performance`. Nil for historical rows, cancelled /
+  /// failed rows that deliberately omit metrics, and corrupt/future blobs.
+  var generationPerformance: GenerationMetrics? {
+    guard let meta else { return nil }
+    return try? JSONDecoder().decode(MessageMeta.self, from: meta).generationPerformance
+  }
+}
+
+struct MessageMeta: Codable, Equatable {
+  var finishReason: String?
+  var generationPerformance: GenerationMetrics?
+
+  init(finishReason: String? = nil, generationPerformance: GenerationMetrics? = nil) {
+    self.finishReason = finishReason
+    self.generationPerformance = generationPerformance
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case finishReason = "finish_reason"
+    case generationPerformance = "generation_performance"
+  }
 }

@@ -64,6 +64,9 @@ struct MessageBubble: View {
           if let text = message.notice.message {
             TurnNoticeRow(text: text, footnote: message.notice.isFootnote)
           }
+          if let text = message.generationPerformanceText {
+            GenerationPerformanceRow(text: text)
+          }
           // Deterministic copy path (#515): right-click on selectable
           // MarkdownUI text surfaces AppKit's text menu, not our
           // `.contextMenu`, so the guaranteed affordance is this explicit
@@ -181,6 +184,18 @@ private struct TurnNoticeRow: View {
     .foregroundStyle(.secondary)
     .frame(maxWidth: .infinity, alignment: .leading)
     .accessibilityElement(children: .combine)
+  }
+}
+
+private struct GenerationPerformanceRow: View {
+  let text: String
+
+  var body: some View {
+    Text(text)
+      .font(.caption2)
+      .foregroundStyle(.secondary)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .accessibilityIdentifier("message.generationPerformance")
   }
 }
 
