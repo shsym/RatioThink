@@ -5,7 +5,7 @@ final class HelperExportedAPIKVUsageTests: XCTestCase {
   final class KVSession: PieEngineHost.EngineSession, @unchecked Sendable {
     let json: String?
     init(json: String?) { self.json = json }
-    func shutdown() async {}
+    func shutdown() async -> EngineShutdownResult { .reaped }
     func modelStatusJSON() async throws -> String? { json }
   }
 

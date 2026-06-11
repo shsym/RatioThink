@@ -389,7 +389,7 @@ public final class PieEngineHost: @unchecked Sendable {
 
   public func kvUsageSnapshots(now: @Sendable () -> Date = { Date() }) async throws -> [KVUsageSnapshot] {
     let session: (any EngineSession)? = stateQueue.sync {
-      guard case .running(_, _, let session) = self._state else { return nil }
+      guard case .running(_, let session) = self._state else { return nil }
       return session
     }
     guard let session else { return [] }
