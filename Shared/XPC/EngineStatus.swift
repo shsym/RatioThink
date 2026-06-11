@@ -231,6 +231,11 @@ public enum EngineErrorCode: String, Codable, Sendable {
   /// unreachable"); the rich death reason from captured engine stderr
   /// is deferred to . Detection is client-side and needs no .
   case engineGone
+  /// Engine/helper reported that the selected model artifact or format is
+  /// unsupported/not loadable. This is a recoverable model-choice problem,
+  /// distinct from generic spawn/crash/timeouts and from the app-side
+  /// advisory "outside curated list" warning.
+  case modelUnsupported
   case unknown
 }
 

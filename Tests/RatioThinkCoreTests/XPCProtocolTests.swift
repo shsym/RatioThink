@@ -144,7 +144,8 @@ final class XPCProtocolTests: XCTestCase {
                  .portUnavailable, .alreadyRunning, .cancelled,
                  .wireContractViolation, .degraded,
                  .integrityFailed, .networkFailed, .diskWriteFailed,
-                 .invalidInput, .killRejected, .memoryRisk, .unknown] {
+                 .invalidInput, .killRejected, .memoryRisk,
+                 .modelUnsupported, .unknown] {
       assertRoundTrip(EngineError(code: code, message: "msg-\(code.rawValue)"))
     }
   }
@@ -161,7 +162,7 @@ final class XPCProtocolTests: XCTestCase {
                  .wireContractViolation, .degraded,
                  .integrityFailed, .networkFailed, .diskWriteFailed,
                  .invalidInput, .killRejected, .memoryRisk,
-                 .engineGone, .unknown] {
+                 .modelUnsupported, .engineGone, .unknown] {
       XCTAssertEqual(code.invitesResumeRetry, !nonRetryable.contains(code),
                      "invitesResumeRetry mismatch for \(code.rawValue)")
     }

@@ -75,6 +75,31 @@ final class PieEngineHostTests: XCTestCase {
     token.cancel()
   }
 
+  func test_start_classifies_unsupported_model_launcher_failure() {
+    let host = PieEngineHost(launcher: { _ in
+      throw PieControlLauncher.LaunchError.engineExitedEarly(
+        code: 1,
+        stderrTail: "load_model: unsupported model architecture 'mamba2'"
+      )
+    })
+    let exp = expectation(description: "host reaches .failed unsupported")
+    let token = host.observe { status, _ in
+      if case .failed(let code, let message) = status {
+        XCTAssertEqual(code, .modelUnsupported)
+        XCTAssertTrue(message.contains("acme/mamba/model.gguf"),
+                      "message should name the selected model; got \(message)")
+        XCTAssertTrue(message.contains("choose a curated model"),
+                      "message should include recovery guidance; got \(message)")
+        XCTAssertTrue(message.contains("unsupported model architecture"),
+                      "underlying engine reason should be preserved; got \(message)")
+        exp.fulfill()
+      }
+    }
+    _ = host.start(makeSpec(profileID: "acme/mamba/model.gguf"))
+    wait(for: [exp], timeout: 2)
+    token.cancel()
+  }
+
   // MARK: - double-start rejected
 
   func test_double_start_returns_alreadyRunning() {

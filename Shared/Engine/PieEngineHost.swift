@@ -455,6 +455,14 @@ public final class PieEngineHost: @unchecked Sendable {
       }
     } catch {
       let msg = "\(error)"
+      let classification = EngineLoadFailureClassifier.classify(error)
+      let code: EngineErrorCode = classification == nil ? .spawnFailed : .modelUnsupported
+      let statusMessage = classification == nil
+        ? msg
+        : EngineLoadFailureClassifier.userFacingLoadFailureMessage(
+          modelID: Self.modelID(from: spec),
+          error: error
+        )
       Log.engine.error("PieEngineHost: launch failed: \(msg, privacy: .public)")
       stateQueue.async { [weak self] in
         guard let self else { return }
@@ -462,7 +470,7 @@ public final class PieEngineHost: @unchecked Sendable {
         // the cancellation winner already published .stopped.
         switch self._state {
         case .starting:
-          self.setState(.failed(.spawnFailed, msg))
+          self.setState(.failed(code, statusMessage))
         case .stopping:
           self.setState(.stopped)
         default:
@@ -471,6 +479,19 @@ public final class PieEngineHost: @unchecked Sendable {
           return
         }
       }
+    }
+  }
+
+  private static func modelID(from spec: LaunchSpec) -> String {
+    switch spec.modelConfig {
+    case .dummy:
+      return spec.profileID
+    case let .portable(modelSlug, _):
+      return modelSlug
+    case let .portableResolved(servedModelID, _):
+      return servedModelID
+    case let .metal(modelID):
+      return modelID
     }
   }
 

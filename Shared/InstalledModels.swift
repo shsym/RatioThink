@@ -76,6 +76,22 @@ public struct InstalledModel: Equatable, Identifiable, Sendable {
   /// split-file support. `nil` = launchable.
   public let unsupportedReason: String?
 
+  /// Whether this row maps to a curated artifact that RatioThink has
+  /// engine-validated. App-managed imports are user-owned and do not need
+  /// cache-origin warnings; HF-cache rows outside this list are still
+  /// selectable, but the UI marks them advisory/unverified.
+  public var isCuratedEngineSupported: Bool {
+    CuratedModelCatalog.isCuratedModelSlug(filename)
+  }
+
+  /// Advisory warning for arbitrary HF-cache discoveries. This is
+  /// deliberately separate from `unsupportedReason`: it must not disable
+  /// selection, because a non-curated GGUF may still load successfully.
+  public var supportWarning: String? {
+    guard source == .huggingFaceCache, !isCuratedEngineSupported else { return nil }
+    return "Unverified — may not be supported"
+  }
+
   public init(filename: String,
               url: URL,
               sizeBytes: Int64,

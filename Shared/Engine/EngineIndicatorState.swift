@@ -110,6 +110,7 @@ public struct EngineIndicatorError: Equatable, Sendable {
     case loadFailed     // HTTP /v1/models/load failure
     case memoryRisk     // model too large for this Mac's safe limit
     case modelMissing   // engine has no such model
+    case modelUnsupported // selected model artifact/format is unsupported
   }
 
   public let kind: Kind
@@ -145,6 +146,12 @@ public struct EngineIndicatorError: Equatable, Sendable {
       return EngineIndicatorError(
         kind: .modelMissing, title: "Model not found",
         message: message.isEmpty ? "The selected model isn’t available." : message,
+        invitesModelChoice: true
+      )
+    case .modelUnsupported:
+      return EngineIndicatorError(
+        kind: .modelUnsupported, title: "Model unsupported",
+        message: message.isEmpty ? "The selected model is unsupported or not loadable." : message,
         invitesModelChoice: true
       )
     default:

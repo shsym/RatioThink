@@ -187,7 +187,10 @@ public final class ModelLoadCenter: ObservableObject {
           )
         }
       } catch {
-        let message = "\(error)"
+        let message = EngineLoadFailureClassifier.userFacingLoadFailureMessage(
+          modelID: modelID,
+          error: error
+        )
         await MainActor.run {
           guard let self else { return }
           self.dispatchFailureTerminal(

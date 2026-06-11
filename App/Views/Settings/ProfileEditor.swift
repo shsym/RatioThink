@@ -134,6 +134,8 @@ struct ProfileEditor: View {
       Label(text, systemImage: "checkmark")
     } else if option.isOverLimit || option.unsupportedReason != nil {
       Label(text, systemImage: "exclamationmark.triangle")
+    } else if option.supportWarning != nil {
+      Label(text, systemImage: "exclamationmark.triangle")
     } else {
       Text(text)
     }
@@ -152,6 +154,8 @@ struct ProfileEditor: View {
       text += " — exceeds \(InstalledModels.formattedSize(policy.maxResolvedModelBytes)) limit"
     } else if let reason = option.unsupportedReason {
       text += " — \(reason)"
+    } else if let warning = option.supportWarning {
+      text += " — \(warning)"
     }
     return text
   }

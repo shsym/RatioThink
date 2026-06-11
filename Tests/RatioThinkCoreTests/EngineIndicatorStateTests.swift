@@ -66,6 +66,14 @@ final class EngineIndicatorStateTests: XCTestCase {
     XCTAssertTrue(err.invitesModelChoice)
   }
 
+  func test_modelUnsupported_failure_invites_model_choice() {
+    let state = make(engine: .failed(code: .modelUnsupported, message: "unsupported model architecture"))
+    guard case let .error(err) = state else { return XCTFail("expected .error") }
+    XCTAssertEqual(err.kind, .modelUnsupported)
+    XCTAssertEqual(err.title, "Model unsupported")
+    XCTAssertTrue(err.invitesModelChoice)
+  }
+
   func test_other_failure_is_generic_engineFailed() {
     let state = make(engine: .failed(code: .spawnFailed, message: "fork ENOENT"))
     guard case let .error(err) = state else { return XCTFail("expected .error") }

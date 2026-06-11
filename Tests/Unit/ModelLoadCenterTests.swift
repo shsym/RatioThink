@@ -541,6 +541,31 @@ final class ModelLoadCenterTests: XCTestCase {
     }
   }
 
+  func test_unsupported_load_failure_uses_actionable_model_specific_message() async {
+    let center = ModelLoadCenter()
+    let factory: @Sendable () -> AsyncThrowingStream<LoadEvent, Error> = { @Sendable in
+      AsyncThrowingStream { continuation in
+        continuation.finish(throwing: HTTPEngineError.stream(
+          code: "unsupported_format",
+          message: "unsupported gguf tensor type"
+        ))
+      }
+    }
+    center.load(modelID: "org/Repo/model.gguf", streamFactory: factory)
+
+    await waitUntil(timeout: 1.0) {
+      if case .failed = center.state { return true }
+      return false
+    }
+    guard case let .failed(id, message) = center.state else {
+      return XCTFail("expected .failed, got \(center.state)")
+    }
+    XCTAssertEqual(id, "org/Repo/model.gguf")
+    XCTAssertTrue(message.contains("org/Repo/model.gguf"))
+    XCTAssertTrue(message.contains("choose a curated model"))
+    XCTAssertTrue(message.contains("unsupported gguf tensor type"))
+  }
+
   // MARK: -  follow-up: reflect an engine-resident model
 
   func test_reconcileEngineResident_sets_resident_when_idle() {
