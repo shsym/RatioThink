@@ -64,7 +64,7 @@ endef
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
-        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle \
+        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-menubar-icon-template \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-e2e-harsh-load test-e2e-cache-real \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
@@ -524,6 +524,10 @@ test-gui-first-launch: genproject $(LOGDIR) ## GUI area: first-launch wizard, fa
 test-gui-helper: genproject $(LOGDIR) ## GUI area: menu-bar helper + engine startup (S4)
 	$(call gui_suite_run,helper,-only-testing:RatioThinkGUITests/S4_HelperMenuBarGUITests)
 
+test-menubar-icon-template: ## Unit-style renderer contract: status icon uses native template semantics
+	@swiftc -parse-as-library Helper/MenuBarBrandIcon.swift Scripts/test-menubar-icon-template.swift -o /tmp/test-menubar-icon-template
+	@/tmp/test-menubar-icon-template
+
 render-menubar-icon: ## Render the #424 branded menu-bar icon (4 states x light/dark) to a PNG for eyeballing
 	@swiftc -parse-as-library Helper/MenuBarBrandIcon.swift Scripts/render-menubar-icon.swift -o /tmp/render-menubar-icon
 	@/tmp/render-menubar-icon
@@ -603,7 +607,7 @@ test-helper-recovery: ## Acceptance: App-side runtime helper recovery #412 (need
 test-quit-structured: ## Acceptance: #448 structured quit — idle engine persists + ratiothink://quit leaves nothing (needs signed install + engine running)
 	Scripts/verify-structured-quit.sh
 
-test-ssh: test-unit test-scenario test-smoke test-install-guards ## Everything runnable under SSH (no GUI; SPM-only, no xcodebuild app build)
+test-ssh: test-menubar-icon-template test-unit test-scenario test-smoke test-install-guards ## Everything runnable under SSH (no GUI; SPM-only, no xcodebuild app build)
 
 test-all: test-ssh test-app-unit test-gui ## Everything (app-unit bundle + GUI; GUI tests skip if no seated session)
 
