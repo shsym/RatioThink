@@ -269,6 +269,8 @@ pub struct CacheDiag {
     pub outcome: &'static str,
     /// Short tag of the chat key (raw key never sent).
     pub key_tag: String,
+    /// The boundary turn the request expected (echoed from the directive).
+    pub turn: u64,
     /// Content-hash portion of the opened prefix name (empty when none).
     pub prefix_hash: String,
     /// Prefix tokens reused from the snapshot (0 on a miss).
@@ -296,6 +298,194 @@ impl CacheDiag {
             key_tag: short_tag(key),
             save_result: "none".to_string(),
             ..Default::default()
+        }
+    }
+}
+
+// =============================================================================
+// Engine glue (calls WIT host imports; not unit-tested — covered by the
+// real-engine e2e suite. The correctness lives in the pure helpers above.)
+// =============================================================================
+
+use super::completions::{build_prompt_tokens, ChatMessage, ToolSchema};
+use inferlet::Context;
+use inferlet::chat;
+use inferlet::model::Model;
+
+/// Inferlet/template version folded into every snapshot name. A chat-apc
+/// build bump (which can change templating, tokenization wrappers, or the
+/// generation loop) invalidates every prior snapshot — the "inferlet
+/// version" the ticket's key schema calls for, on top of the per-token
+/// content hash.
+const TEMPLATE_MARKER: &str = concat!("chat-apc-", env!("CARGO_PKG_VERSION"));
+
+/// Trailing content-hash segment of a snapshot name, for diagnostics
+/// (the raw key never rides the wire — see [`short_tag`]).
+fn name_hash_part(name: &str) -> String {
+    name.rsplit('/').next().unwrap_or_default().to_string()
+}
+
+/// Everything the request handler needs to open a prefix snapshot, rebuild
+/// on a miss, and save the next boundary. Built once per request.
+pub struct ReusePlan {
+    pub directive: CacheDirective,
+    pub model_id: String,
+    /// All messages tokenized, no trailing cue.
+    pub prompt_no_cue: Vec<u32>,
+    /// The generation cue (assistant-turn opener).
+    pub cue: Vec<u32>,
+    /// `messages[..last]` tokenized, no cue — the reusable-prefix basis.
+    pub prefix_tokens: Vec<u32>,
+    /// Snapshot name to open on a hit; `None` when the prefix is empty
+    /// (nothing worth reusing).
+    pub open_name: Option<String>,
+}
+
+/// Build the reuse plan for an enabled directive. Tokenizes the prompt via
+/// the same [`build_prompt_tokens`] the rebuild path uses, so the cached
+/// and rebuilt prefills are bit-identical.
+pub fn plan(
+    model: &Model,
+    model_id: &str,
+    messages: &[ChatMessage],
+    tools: Option<&[ToolSchema]>,
+    directive: CacheDirective,
+) -> Result<ReusePlan, (&'static str, String)> {
+    let prompt_no_cue = build_prompt_tokens(model, messages, tools, false)?;
+    let cue = chat::cue(model);
+    let last = messages.len().saturating_sub(1);
+    let prefix_tokens = build_prompt_tokens(model, &messages[..last], tools, false)?;
+    let open_name = if !prefix_tokens.is_empty() {
+        Some(snapshot_name(
+            &directive.key,
+            &directive.compat,
+            model_id,
+            TEMPLATE_MARKER,
+            &prefix_tokens,
+        ))
+    } else {
+        None
+    };
+    Ok(ReusePlan {
+        directive,
+        model_id: model_id.to_string(),
+        prompt_no_cue,
+        cue,
+        prefix_tokens,
+        open_name,
+    })
+}
+
+/// Acquire a context for generation: open the prefix snapshot and append
+/// only the suffix on a hit, otherwise create a fresh context and append
+/// the full prompt. Returns the context plus the diagnostics seeded with
+/// the hit/miss outcome (the handler fills in save_result / page counts via
+/// [`finalize`]).
+pub fn acquire(model: &Model, plan: &ReusePlan) -> Result<(Context, CacheDiag), (&'static str, String)> {
+    let mut diag = CacheDiag::new("miss", &plan.directive.key);
+    diag.turn = plan.directive.turn;
+
+    if let Some(name) = &plan.open_name {
+        if let Ok(mut ctx) = Context::open(model, name) {
+            match suffix_start(plan.prompt_no_cue.len(), plan.prefix_tokens.len()) {
+                Some(s) => {
+                    // Hit: the snapshot already holds `prefix_tokens`; append
+                    // only the trailing new-user turn + cue.
+                    let mut suffix = plan.prompt_no_cue[s..].to_vec();
+                    suffix.extend_from_slice(&plan.cue);
+                    diag.outcome = "hit";
+                    diag.prefix_hash = name_hash_part(name);
+                    diag.base_boundary = plan.prefix_tokens.len();
+                    diag.appended = suffix.len();
+                    ctx.append(&suffix);
+                    return Ok((ctx, diag));
+                }
+                None => {
+                    // Non-monotone tokenization (prefix longer than the full
+                    // prompt) — a tokenizer bug. Discard the fork and fall
+                    // through to a clean rebuild rather than trust the split.
+                    ctx.destroy();
+                }
+            }
+        }
+        // Err / non-monotone → miss (outcome already "miss").
+    }
+
+    // Miss / nothing to open: full rebuild.
+    let mut ctx = Context::new(model)
+        .map_err(|e| ("context_create_failed", format!("Failed to create context: {e}")))?;
+    let mut full = plan.prompt_no_cue.clone();
+    full.extend_from_slice(&plan.cue);
+    diag.base_boundary = 0;
+    diag.appended = full.len();
+    ctx.append(&full);
+    Ok((ctx, diag))
+}
+
+/// After a successful turn, record page counts and save the next reusable
+/// boundary when the generation round-trips through the chat template (see
+/// [`decide_save`]). Mutates `diag` in place with the save result.
+///
+/// `gen_content` is the visible assistant text the App persists and
+/// resends; `gen_tokens` is every generated token in KV order (including
+/// reasoning), which is what the live KV actually holds.
+pub async fn finalize(
+    ctx: &mut Context,
+    plan: &ReusePlan,
+    gen_content: &str,
+    gen_tokens: &[u32],
+    model: &Model,
+    diag: &mut CacheDiag,
+) {
+    // Page counts are authoritative engine state — emit them, never guess.
+    diag.committed_pages = Some(ctx.inner().committed_page_count());
+    diag.working_pages = Some(ctx.inner().working_page_count());
+
+    let assistant = chat::assistant(model, gen_content);
+    let seal = chat::seal(model);
+    match decide_save(&plan.cue, gen_tokens, &seal, &assistant) {
+        SaveDecision::Skip(reason) => {
+            diag.save_result = format!("skipped:{reason}");
+        }
+        SaveDecision::Save => {
+            let mut next_prefix = plan.prompt_no_cue.clone();
+            next_prefix.extend_from_slice(&assistant);
+            let name = snapshot_name(
+                &plan.directive.key,
+                &plan.directive.compat,
+                &plan.model_id,
+                TEMPLATE_MARKER,
+                &next_prefix,
+            );
+            // Append the turn-closing tokens so the saved KV equals the
+            // canonical next-prefix, then flush them into working pages
+            // (save ignores the SDK-side buffer).
+            ctx.append(&seal);
+            if let Err(e) = ctx.flush().await {
+                eprintln!("[chat-apc] prefix-cache save flush failed: {e}");
+                diag.save_result = "failed:flush".to_string();
+                return;
+            }
+            diag.committed_pages = Some(ctx.inner().committed_page_count());
+            diag.working_pages = Some(ctx.inner().working_page_count());
+            match ctx.save(&name) {
+                Ok(()) => {
+                    diag.save_result = "saved".to_string();
+                    diag.save_hash = name_hash_part(&name);
+                }
+                Err(e) => {
+                    let es = e.to_string();
+                    if es.contains("already exists") {
+                        // Same content hash already saved — identical KV, a
+                        // benign no-op, still a valid future hit.
+                        diag.save_result = "exists".to_string();
+                        diag.save_hash = name_hash_part(&name);
+                    } else {
+                        eprintln!("[chat-apc] prefix-cache save failed: {es}");
+                        diag.save_result = "failed:save".to_string();
+                    }
+                }
+            }
         }
     }
 }

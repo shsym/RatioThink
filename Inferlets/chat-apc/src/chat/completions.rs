@@ -57,6 +57,7 @@ use wstd::http::{IntoBody, Request, Response};
 
 use super::apc::{ReasoningDecoder, ToolUseDecoder};
 use super::generate::{self, DecodeStrategy};
+use super::prefix_cache::{self, CacheDiag, ReusePlan};
 use super::spec::{SpecConfig, SpecMetrics};
 use crate::sse::{self, EmitError, Emitter, SseError};
 
@@ -179,6 +180,13 @@ pub struct ChatCompletionsRequest {
     /// when `enabled` + greedy (`temperature == 0`), drafting engages.
     #[serde(default)]
     pub speculation: Option<SpecRequest>,
+    /// #522 cross-request KV prefix-cache directive. Absent → reuse
+    /// disabled (byte-identical to the pre-#522 full-rebuild path).
+    /// Present + `policy:"auto"` + non-empty `key` → the inferlet opens a
+    /// matching prefix snapshot on a hit and saves the new boundary on
+    /// success. See [`super::prefix_cache`].
+    #[serde(default)]
+    pub cache: Option<prefix_cache::CacheDirective>,
 }
 
 /// Request-side speculation knobs (chat-apc extension). Dimensions
@@ -2126,23 +2134,54 @@ async fn handle_streaming(
                 .await;
         }
     };
-    let mut ctx = match Context::new(&model) {
-        Ok(c) => c,
-        Err(e) => {
-            return res
-                .respond(with_launch_diags_header(sse::json_error(
-                    500,
-                    "context_create_failed",
-                    &format!("Failed to create context: {e}"),
-                )))
-                .await;
+    // #522: cross-request KV prefix cache. Engaged only for an enabled
+    // `cache` directive; absent/disabled/bypass falls through to the
+    // legacy full-rebuild path below (byte-identical to pre-#522).
+    let cache_plan: Option<ReusePlan> = match req.cache.clone() {
+        Some(d) if d.enabled() => {
+            match prefix_cache::plan(&model, &req.model, &req.messages, req.tools.as_deref(), d) {
+                Ok(p) => Some(p),
+                Err((code, msg)) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                        .await;
+                }
+            }
+        }
+        _ => None,
+    };
+    let (mut ctx, mut cache_diag): (Context, Option<CacheDiag>) = match &cache_plan {
+        Some(plan) => match prefix_cache::acquire(&model, plan) {
+            Ok((ctx, diag)) => (ctx, Some(diag)),
+            Err((code, msg)) => {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+        },
+        None => {
+            let mut ctx = match Context::new(&model) {
+                Ok(c) => c,
+                Err(e) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(
+                            500,
+                            "context_create_failed",
+                            &format!("Failed to create context: {e}"),
+                        )))
+                        .await;
+                }
+            };
+            if let Err((code, msg)) =
+                fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true)
+            {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+            (ctx, None)
         }
     };
-    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true) {
-        return res
-            .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
-            .await;
-    }
 
     // `tool_choice: "required" | {function}` constrains generation to the
     // model's native tool-call grammar (OpenAI tool_choice enforcement).
@@ -2274,6 +2313,12 @@ async fn handle_streaming(
     let mut tool_disabled_diag: Option<ToolDisabledDiag> = None;
     let mut pending_tool: Option<PendingToolCall> = None;
     let mut in_reasoning = false;
+    // #522: every generated token (KV order, including reasoning) and the
+    // visible assistant text, captured so the prefix cache can decide
+    // whether this turn round-trips into a reusable boundary. Only used
+    // when `cache_plan` is engaged.
+    let mut gen_tokens: Vec<u32> = Vec::new();
+    let mut full_text = String::new();
 
     // F1/F2/F3/F5: explicit-match loop with an `Outcome` set at the
     // exit point. `Generator::next` Err, decoder Err, and chat-
@@ -2325,6 +2370,11 @@ async fn handle_streaming(
         // is a burst of 1 free pick + accepted drafts under speculation).
         spec_steps += 1;
         spec_generated += out.tokens.len();
+        // #522: accumulate the KV-order token stream for the save gate.
+        // The sampled stop token never reaches `out.tokens` (the SDK
+        // truncates it) and is never fed back into the KV, so this matches
+        // the live KV tail exactly.
+        gen_tokens.extend_from_slice(&out.tokens);
 
         // Reasoning side: thinking-blocks become `reasoning_content`
         // deltas. `Idle` is the no-op signal; `Start` flips the
@@ -2408,6 +2458,9 @@ async fn handle_streaming(
             // tool_calls). Composes with the reasoning content gate; the
             // suppressed deltas fall through to the no-op arm below.
             Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) && !forced_tool => {
+                // #522: mirror the visible text the App persists, so the
+                // save gate can compare it against the generated tokens.
+                full_text.push_str(&s);
                 let chunk = ChatCompletionChunk {
                     id: &id,
                     object: "chat.completion.chunk",
@@ -2579,6 +2632,20 @@ async fn handle_streaming(
             eprintln!("[chat-apc] spec_metrics serialize bug: {e}");
         }
     }
+    // #522: save the next reusable boundary on a clean completion and emit
+    // the cache diagnostics frame. Saving is gated on a real assistant turn
+    // (Natural/MaxTokens) — a cancelled/aborted/tool-call turn must not
+    // advance the stable boundary. Dropping `stream` releases the &mut on
+    // `ctx` that the generator held.
+    if let (Some(plan), Some(mut diag)) = (cache_plan.as_ref(), cache_diag.take()) {
+        if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
+            drop(stream);
+            prefix_cache::finalize(&mut ctx, plan, &full_text, &gen_tokens, &model, &mut diag).await;
+        }
+        if let Err(EmitError::Serialize(e)) = em.emit_json(&diag).await {
+            eprintln!("[chat-apc] cache diag serialize bug: {e}");
+        }
+    }
     sse::emit_done_logged(&mut em, "stream_exit").await;
     em.finish()
 }
@@ -2610,23 +2677,54 @@ async fn handle_non_streaming(
                 .await;
         }
     };
-    let mut ctx = match Context::new(&model) {
-        Ok(c) => c,
-        Err(e) => {
-            return res
-                .respond(with_launch_diags_header(sse::json_error(
-                    500,
-                    "context_create_failed",
-                    &format!("Failed to create context: {e}"),
-                )))
-                .await;
+    // #522: cross-request KV prefix cache (see handle_streaming). Legacy
+    // callers (no enabled `cache` directive) take the unchanged rebuild
+    // path below.
+    let cache_plan: Option<ReusePlan> = match req.cache.clone() {
+        Some(d) if d.enabled() => {
+            match prefix_cache::plan(&model, &req.model, &req.messages, req.tools.as_deref(), d) {
+                Ok(p) => Some(p),
+                Err((code, msg)) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                        .await;
+                }
+            }
+        }
+        _ => None,
+    };
+    let (mut ctx, mut cache_diag): (Context, Option<CacheDiag>) = match &cache_plan {
+        Some(plan) => match prefix_cache::acquire(&model, plan) {
+            Ok((ctx, diag)) => (ctx, Some(diag)),
+            Err((code, msg)) => {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+        },
+        None => {
+            let mut ctx = match Context::new(&model) {
+                Ok(c) => c,
+                Err(e) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(
+                            500,
+                            "context_create_failed",
+                            &format!("Failed to create context: {e}"),
+                        )))
+                        .await;
+                }
+            };
+            if let Err((code, msg)) =
+                fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true)
+            {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+            (ctx, None)
         }
     };
-    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true) {
-        return res
-            .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
-            .await;
-    }
 
     // tool_choice enforcement (mirrors handle_streaming): constrain to the
     // model's native tool-call grammar when a call is forced; an
@@ -2681,6 +2779,8 @@ async fn handle_non_streaming(
     let mut reasoning_text = String::new();
     let mut pending_tool: Option<PendingToolCall> = None;
     let mut in_reasoning = false;
+    // #522: KV-order generated tokens for the prefix-cache save gate.
+    let mut gen_tokens: Vec<u32> = Vec::new();
 
     // F4: drive the loop ourselves so we can record the actual
     // termination reason. `collect_text` collapsed natural stop and
@@ -2733,6 +2833,7 @@ async fn handle_non_streaming(
         // is a burst of 1 free pick + accepted drafts under speculation).
         spec_steps += 1;
         spec_generated += out.tokens.len();
+        gen_tokens.extend_from_slice(&out.tokens); // #522 save gate
 
         // capture the gate state BEFORE feeding the reasoning
         // decoder (see streaming branch + `content_visible`). Mirrors the
@@ -2947,6 +3048,21 @@ async fn handle_non_streaming(
     } else {
         None
     };
+    // #522: save the next reusable boundary (gated on a real assistant
+    // turn — never on a cancelled/aborted/tool-call turn) and stash the
+    // cache diagnostics for the `X-ChatAPC-Cache` response header.
+    // Dropping `stream` releases the &mut on `ctx`.
+    let cache_header: Option<String> = if let (Some(plan), Some(mut diag)) =
+        (cache_plan.as_ref(), cache_diag.take())
+    {
+        if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
+            drop(stream);
+            prefix_cache::finalize(&mut ctx, plan, &full_text, &gen_tokens, &model, &mut diag).await;
+        }
+        Some(serde_json::to_string(&diag).expect("CacheDiag must serialize"))
+    } else {
+        None
+    };
     let body = ChatCompletion {
         id: &id,
         object: "chat.completion",
@@ -2993,6 +3109,9 @@ async fn handle_non_streaming(
         .header("Content-Type", "application/json");
     if let Some(kind) = partial_kind {
         builder = builder.header("X-ChatAPC-Partial-Error", kind);
+    }
+    if let Some(h) = &cache_header {
+        builder = builder.header("X-ChatAPC-Cache", h.as_str());
     }
     let response = builder.body(json.into_body()).unwrap();
     res.respond(with_launch_diags_header(response)).await
@@ -3132,6 +3251,24 @@ pub(crate) fn fill_context(
     tools: Option<&[ToolSchema]>,
     cue: bool,
 ) -> Result<(), (&'static str, String)> {
+    let tokens = build_prompt_tokens(model, messages, tools, cue)?;
+    ctx.append(&tokens);
+    Ok(())
+}
+
+/// Tokenize the same prompt [`fill_context`] would build, returning the raw
+/// token sequence instead of mutating a context. The cross-request prefix
+/// cache ([`super::prefix_cache`]) needs the exact token ids to
+/// content-address snapshots; routing both `fill_context` and the cache
+/// through this one function keeps the prefill bytes identical, which is
+/// the invariant the snapshot keys depend on.
+pub(crate) fn build_prompt_tokens(
+    model: &Model,
+    messages: &[ChatMessage],
+    tools: Option<&[ToolSchema]>,
+    cue: bool,
+) -> Result<Vec<u32>, (&'static str, String)> {
+    let mut out = Vec::new();
     if let Some(tools) = tools {
         // The SDK's `equip_prefix` expects `{name, description,
         // parameters}` per entry; the OpenAI `type:"function"` wrapper is
@@ -3142,24 +3279,19 @@ pub(crate) fn fill_context(
         if !envelopes.is_empty() {
             let prefix = inferlet::tools::equip_prefix(model, &envelopes)
                 .map_err(|e| ("tool_equip_failed", format!("equip_prefix: {e}")))?;
-            ctx.append(&prefix);
+            out.extend_from_slice(&prefix);
         }
     }
     for (i, msg) in messages.iter().enumerate() {
         match msg.role.as_str() {
-            "system" => {
-                ctx.system(&msg.content);
-            }
-            "assistant" => {
-                ctx.assistant(&msg.content);
-            }
-            "user" => {
-                ctx.user(&msg.content);
-            }
+            "system" => out.extend(chat::system(model, &msg.content)),
+            "assistant" => out.extend(chat::assistant(model, &msg.content)),
+            "user" => out.extend(chat::user(model, &msg.content)),
             // #468: reject any other role here rather than demoting it to
             // `user`. This is the root-cause guard — every caller goes
-            // through `fill_context`, so the tree-of-thought path can't
-            // bypass the policy the way it did before.
+            // through `fill_context` / `build_prompt_tokens`, so the
+            // tree-of-thought and prefix-cache paths can't bypass the
+            // policy.
             other => {
                 let code = role_error_code(other).unwrap_or("unsupported_role");
                 return Err((code, role_error_message(i, other, code)));
@@ -3172,9 +3304,9 @@ pub(crate) fn fill_context(
     // context still has tokens to process — an empty forward pass spins
     // the generator), so it is opt-out here.
     if cue {
-        ctx.cue();
+        out.extend(chat::cue(model));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// One detected tool call buffered for emit on the terminal chunk.
