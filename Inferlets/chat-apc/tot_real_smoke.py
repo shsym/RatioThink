@@ -15,8 +15,13 @@ kept/pruned shape, and the final answer.
 Assertions (only on the planning prompts, where diverse strategies exist):
   * branches are NOT all near-duplicates — at least one sibling pair is
     below the duplicate threshold, i.e. the search actually branched;
-  * the scorer parsed at least one real integer score across the run, so
-    pruning is quality-driven rather than silently input-order.
+  * every planning prompt parses at least one real integer score, so one
+    lucky parse elsewhere can no longer mask prompt-local input-order
+    pruning;
+  * full (non-quick) runs include at least one planning prompt where the
+    parsed sibling scores are not all tied, keeping the smoke sensitive to
+    small-model scorer discrimination without requiring every prompt to
+    separate cleanly.
 
 The homepage-illustration clarification prompt additionally hard-asserts
 the post-search synthesis: a non-null final_answer, the `synthesized`
@@ -38,6 +43,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -135,6 +141,13 @@ CLARIFY_PROMPT = (
 )
 
 
+@dataclass(frozen=True)
+class PlanningEvidence:
+    label: str
+    sims: list[float]
+    scores: list[int]
+
+
 def level1(tree: dict) -> list[dict]:
     return [c for c in tree.get("root", {}).get("children", []) if c.get("depth") == 1]
 
@@ -169,6 +182,50 @@ def report(label: str, prompt: str, body: dict) -> tuple[list[float], list[int]]
     return sims, scores
 
 
+def scores_are_tied(scores: list[int]) -> bool:
+    return len(scores) >= 2 and len(set(scores)) == 1
+
+
+def scores_discriminate(scores: list[int]) -> bool:
+    return len(scores) >= 2 and len(set(scores)) > 1
+
+
+def validate_planning_evidence(
+    evidence: PlanningEvidence,
+    *,
+    dup_threshold: float = DUP_THRESHOLD,
+    min_parsed_scores: int = 1,
+) -> list[str]:
+    failures: list[str] = []
+    if not (evidence.sims and min(evidence.sims) < dup_threshold):
+        failures.append(
+            f"{evidence.label}: all level-1 siblings are near-duplicates "
+            f"(min pairwise Jaccard >= {dup_threshold}); search did not branch"
+        )
+    if len(evidence.scores) < min_parsed_scores:
+        failures.append(
+            f"{evidence.label}: scorer parsed zero integer scores for this planning prompt — "
+            "pruning would fall back to input order"
+        )
+    return failures
+
+
+def validate_planning_evidences(
+    evidences: list[PlanningEvidence],
+    *,
+    require_non_tied: bool,
+) -> list[str]:
+    failures: list[str] = []
+    for evidence in evidences:
+        failures.extend(validate_planning_evidence(evidence))
+    if require_non_tied and not any(scores_discriminate(e.scores) for e in evidences):
+        failures.append(
+            "planning scorer did not discriminate any prompt: every prompt with 2+ parsed "
+            "sibling scores was tied"
+        )
+    return failures
+
+
 async def run_tot(http: httpx.AsyncClient, base: str, prompt: str, *, breadth, depth, beam_width):
     r = await http.post(
         f"{base}/v1/inferlet",
@@ -197,8 +254,8 @@ async def main() -> int:
     assert MODEL_PATH.exists(), f"missing model at {MODEL_PATH} (stage: Scripts/stage-test-model.sh)"
 
     failures: list[str] = []
-    any_score_parsed = False
     branched_prompts = 0
+    planning_evidences: list[PlanningEvidence] = []
 
     shmem_base = f"/pie_tot_{os.getpid()}"
     with tempfile.TemporaryDirectory(prefix="tot-smoke-") as tmp:
@@ -234,15 +291,9 @@ async def main() -> int:
                     for label, prompt in prompts:
                         body = await run_tot(http, base, prompt, breadth=5, depth=1, beam_width=5)
                         sims, scores = report(label, prompt, body)
-                        if scores:
-                            any_score_parsed = True
+                        planning_evidences.append(PlanningEvidence(label, sims, scores))
                         if sims and min(sims) < DUP_THRESHOLD:
                             branched_prompts += 1
-                        else:
-                            failures.append(
-                                f"{label}: all level-1 siblings are near-duplicates "
-                                f"(min pairwise Jaccard >= {DUP_THRESHOLD}); search did not branch"
-                            )
 
                     # Scorer-calibration / refinement + final-answer synthesis
                     # evidence (depth 2). The synthesized final answer must
@@ -251,8 +302,6 @@ async def main() -> int:
                     if not quick:
                         body = await run_tot(http, base, CLARIFY_PROMPT, breadth=4, depth=2, beam_width=2)
                         _, scores = report("homepage-clarification", CLARIFY_PROMPT, body)
-                        if scores:
-                            any_score_parsed = True
                         # Branch on null FIRST: a null final_answer means no ok
                         # leaf was selected (an upstream SEARCH failure), not a
                         # synthesis failure — attribute it correctly and skip
@@ -296,15 +345,19 @@ async def main() -> int:
         finally:
             e2e._terminate_subprocess(proc, "pie")
 
-    if not any_score_parsed:
-        failures.append(
-            "scorer parsed zero integer scores across the whole run — value evaluator "
-            "degraded to input-order pruning (reasoning strip / score budget regression)"
-        )
+    quick = os.environ.get("TOT_SMOKE_QUICK") == "1"
+    failures.extend(validate_planning_evidences(planning_evidences, require_non_tied=not quick))
 
     print("\n==================== SMOKE RESULT ====================")
     print(f"planning prompts that branched: {branched_prompts}/{len(PLANNING_PROMPTS)}")
-    print(f"scorer produced parsed scores: {any_score_parsed}")
+    parsed_by_prompt = {e.label: len(e.scores) for e in planning_evidences}
+    tied_by_prompt = {
+        e.label: scores_are_tied(e.scores)
+        for e in planning_evidences
+        if len(e.scores) >= 2
+    }
+    print(f"planning prompt parsed score counts: {parsed_by_prompt}")
+    print(f"planning prompt score ties: {tied_by_prompt}")
     if failures:
         print("RESULT: FAIL")
         for f in failures:
