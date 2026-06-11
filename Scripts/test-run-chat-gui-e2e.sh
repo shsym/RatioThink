@@ -94,11 +94,11 @@ test_partial_hf_cache_is_not_accepted() {
   trap 'rm -rf "$tmp"' RETURN
 
   # Fake a seated session and a runnable pie so the flow reaches the HF model
-  # gate, then stage only a *bare* hub dir — the partial/aborted-download shape
-  # the old `[ -d "$dir" ]` check wrongly accepted ( F3). The wrapper now
-  # delegates the GGUF fixture gate to stage-test-model.sh; the contract is
-  # still that an incomplete cache exits before starting the engine harness.
-  mkdir -p "$tmp/bin" "$tmp/hf/hub/models--Qwen--Qwen3-0.6B"
+  # gate, then stage incomplete shapes under the exact repo dir
+  # stage-test-model.sh inspects. The old `[ -d "$dir" ]` check wrongly
+  # accepted partial/aborted downloads (F3); the wrapper must reject them
+  # before starting the engine harness.
+  mkdir -p "$tmp/bin"
   cat >"$tmp/bin/pgrep" <<'FAKE_PGREP'
 #!/bin/bash
 exit 0
@@ -107,32 +107,56 @@ FAKE_PGREP
   touch "$tmp/pie"
   chmod +x "$tmp/pie"
 
-  set +e
-  local output
-  output="$(
-    PATH="$tmp/bin:$PATH" \
-    HF_HOME="$tmp/hf" \
-    PIE_BIN="$tmp/pie" \
-    PIE_TEST_TCC_GRANTED=1 \
-    PIE_E2E_AUTOPREP=0 \
-    PIE_TEST_RUN_ROOT="$tmp/run" \
-    "$SCRIPT" 2>&1
-  )"
-  local status=$?
-  set -e
+  local shape cache dest output status
+  for shape in bare-repo empty-snapshots metadata-only dangling-gguf; do
+    rm -rf "$tmp/hf" "$tmp/run" "$tmp/staged"
+    cache="$tmp/hf/hub/models--Qwen--Qwen3-0.6B-GGUF"
+    dest="$tmp/staged/$shape/Qwen3-0.6B-Q8_0.gguf"
+    case "$shape" in
+      bare-repo)
+        mkdir -p "$cache"
+        ;;
+      empty-snapshots)
+        mkdir -p "$cache/snapshots"
+        ;;
+      metadata-only)
+        mkdir -p "$cache/snapshots/rev"
+        printf '{}' >"$cache/snapshots/rev/config.json"
+        ;;
+      dangling-gguf)
+        mkdir -p "$cache/snapshots/rev" "$cache/blobs"
+        ln -s "../../blobs/missing-gguf" "$cache/snapshots/rev/Qwen3-0.6B-Q8_0.gguf"
+        ;;
+    esac
 
-  if [[ "$status" -ne 2 ]]; then
-    echo "FAIL: a bare/partial HF cache must fail the model gate (exit 2), got $status" >&2
-    echo "--- output ---" >&2
-    printf '%s\n' "$output" >&2
-    exit 1
-  fi
-  require_contains "$output" "GGUF fixture unavailable"
-  require_contains "$output" "cannot run the GGUF chat E2E"
-  if [[ "$output" == *"starting small-model engine harness"* ]]; then
-    echo "FAIL: bare HF cache wrongly accepted as cached — engine harness started" >&2
-    exit 1
-  fi
+    set +e
+    output="$(
+      PATH="$tmp/bin:$PATH" \
+      HF_HOME="$tmp/hf" \
+      STAGE_TEST_MODEL_DEST="$dest" \
+      PIE_BIN="$tmp/pie" \
+      PIE_TEST_TCC_GRANTED=1 \
+      PIE_E2E_AUTOPREP=0 \
+      PIE_TEST_RUN_ROOT="$tmp/run" \
+      "$SCRIPT" 2>&1
+    )"
+    status=$?
+    set -e
+
+    if [[ "$status" -ne 2 ]]; then
+      echo "FAIL: partial HF cache '$shape' must fail the model gate (exit 2), got $status" >&2
+      echo "--- output ---" >&2
+      printf '%s\n' "$output" >&2
+      exit 1
+    fi
+    require_contains "$output" "Looked in HF cache: $cache"
+    require_contains "$output" "GGUF fixture unavailable"
+    require_contains "$output" "cannot run the GGUF chat E2E"
+    if [[ "$output" == *"starting small-model engine harness"* ]]; then
+      echo "FAIL: partial HF cache '$shape' wrongly accepted — engine harness started" >&2
+      exit 1
+    fi
+  done
 }
 
 # Direct contract assertions on _e2e_hf_model_cached, independent of the

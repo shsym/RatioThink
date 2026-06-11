@@ -904,22 +904,14 @@ public final class PieSupervisor: @unchecked Sendable {
     inc.stderrPipe.fileHandleForReading.readabilityHandler = nil
 
     // Final flush: an engine that exited without a trailing newline
-    // may have parked the handshake line either in stdoutCarry OR still
-    // in the pipe if termination beat FileHandle's readability callback.
-    // Drain the closed pipe once here, then re-parse the tail BUT do not
-    // let processLine call setState / kill / finishSpawnFailure (review
-    // v2 F29 — the prior side-effecting flush published a transient
-    // `.running` for an already-exited engine). The flush only updates
-    // `inc.handshakeFound` / `inc.malformedHandshakeRaw`; the unified
-    // failure path below produces a precise diagnostic without ever
-    // crossing through `.running`.
-    if !inc.handshakeFound {
-      let remaining = inc.stdoutPipe.fileHandleForReading.availableData
-      if !remaining.isEmpty {
-        inc.stdoutCarry.append(remaining)
-        appendLog(remaining)
-      }
-    }
+    // may have parked the handshake line in stdoutCarry. Re-parse
+    // the tail BUT do not let processLine call setState / kill /
+    // finishSpawnFailure (review v2 F29 — the prior side-effecting
+    // flush published a transient `.running` for an already-exited
+    // engine). The flush only updates `inc.handshakeFound` /
+    // `inc.malformedHandshakeRaw`; the unified failure path below
+    // produces a precise diagnostic without ever crossing through
+    // `.running`.
     if !inc.handshakeFound, !inc.stdoutCarry.isEmpty {
       let tail = inc.stdoutCarry
       inc.stdoutCarry = Data()
