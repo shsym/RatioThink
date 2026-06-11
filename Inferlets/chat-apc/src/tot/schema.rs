@@ -29,6 +29,25 @@ pub const DEFAULT_MAX_TOKENS_PER_NODE: usize = 256;
 /// Default reasoning budget — generous so a thinking model finishes its
 /// `<think>` block before the answer phase begins.
 pub const DEFAULT_MAX_REASONING_TOKENS: usize = 1024;
+/// Branch-generation temperature. Level-1 sibling diversity comes from
+/// sampling temperature ALONE (no per-branch instruction variation, no
+/// seed jitter — see `search.rs`), so this default must actually buy
+/// distinct branches.
+///
+/// MEASURED (not assumed), portable Metal + Qwen3-0.6B-Q8_0,
+/// `Scripts/run-tot-diversity-probe.sh` (2026-06-10, log
+/// `test-20260610-230258-tot-diversity-probe.log`): depth-1 searches at
+/// `DEFAULT_BREADTH`, thinking on, over short-factual / math /
+/// open-ended prompts, 2 repeats per cell. At 0.7: zero byte-identical
+/// sibling pairs in every cell; the diversity-sensitive open-ended
+/// prompt produced 3/3 distinct 8-word prefixes both repeats (mean
+/// pairwise word-Jaccard 0.21). Factual siblings converge on content
+/// (one right answer, shared prefix) but still differ in completion —
+/// convergence, not sampling collapse. Raising to 1.0/1.3 increased
+/// divergence monotonically (open-ended Jaccard 0.19/0.10) but bought
+/// nothing that was missing, and 1.3 produced the sweep's only branch
+/// failure (a math cell at 2/3 answered). 0.7 is kept: healthy
+/// divergence, no observed quality cliff.
 pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 pub const DEFAULT_TOP_P: f32 = 0.95;
 /// Reasoning is the POINT of a tree-of-thought search, so thinking is ON by
@@ -283,6 +302,12 @@ mod tests {
         // #413: thinking ON by default, with a generous reasoning budget.
         assert!(p.thinking);
         assert_eq!(p.max_reasoning_tokens, 1024);
+        // Branch-generation sampling defaults. 0.7 is measurement-backed
+        // (see DEFAULT_TEMPERATURE docs) — a silent default change would
+        // invalidate the recorded sibling-diversity justification.
+        assert_eq!(p.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(p.temperature, 0.7);
+        assert_eq!(p.top_p, DEFAULT_TOP_P);
     }
 
     #[test]
