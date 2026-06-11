@@ -27,6 +27,7 @@ struct ChatScaffoldView: View {
   /// #412: background-helper health, forwarded to the toolbar pip's outer ring.
   @EnvironmentObject private var helperHealth: HelperHealthController
   @EnvironmentObject private var profileStore: ProfileStore
+  @EnvironmentObject private var appPreferences: AppPreferences
   @EnvironmentObject private var downloadController: ModelDownloadController
   /// The reconciled engine-lifecycle fold, forwarded to the toolbar pip +
   /// popover so they derive the resident/offline distinction from the single
@@ -312,6 +313,7 @@ struct ChatScaffoldView: View {
         },
         commitModel: { modelID in persistChatModel(modelID, on: chat) },
         onUseProfileDefault: { _ = persistChatModel(nil, on: chat) },
+        followProfileDefaultModel: appPreferences.followProfileDefaultModel,
         swapCoordinator: swapCoordinator,
         modelLoadCenter: modelLoadCenter,
         engineStatus: engineStatusStore,

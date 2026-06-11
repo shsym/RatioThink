@@ -74,7 +74,7 @@ final class ToolbarModelOptionsTests: XCTestCase {
     XCTAssertNil(summary?.annotation)
   }
 
-  func test_profile_default_row_different_from_current_requests_swap_but_commits_nil_override() {
+  func test_profile_default_row_different_from_current_requests_swap_and_commits_explicit_pin() {
     let option = ToolbarModelOptions.Option(
       slug: "profile/Default.gguf",
       displayName: "Default.gguf",
@@ -85,11 +85,11 @@ final class ToolbarModelOptionsTests: XCTestCase {
 
     let action = ToolbarModelOptions.selectionAction(for: option, residentModelID: "resident/Loaded.gguf")
 
-    XCTAssertEqual(action, .requestModel(modelID: "profile/Default.gguf", overrideAfterConfirmation: nil),
-                   "a concrete default row that differs from the resident model must still request the normal swap/load path, then leave the chat using profile default semantics")
+    XCTAssertEqual(action, .requestModel(modelID: "profile/Default.gguf", overrideAfterConfirmation: "profile/Default.gguf"),
+                   "choosing a concrete profile-default row is still an explicit model pick, so the chat must pin that slug after confirmation")
   }
 
-  func test_profile_default_row_matching_effective_override_but_not_resident_requests_swap() {
+  func test_profile_default_row_matching_effective_override_but_not_resident_keeps_explicit_pin_after_swap() {
     let option = ToolbarModelOptions.Option(
       slug: "profile/Default.gguf",
       displayName: "Default.gguf",
@@ -107,11 +107,11 @@ final class ToolbarModelOptionsTests: XCTestCase {
                    "the collapsed display can legitimately show the override/default model")
     XCTAssertEqual(ToolbarModelOptions.selectionAction(for: option,
                                                        residentModelID: "resident/Loaded.gguf"),
-                   .requestModel(modelID: "profile/Default.gguf", overrideAfterConfirmation: nil),
-                   "clear-vs-load must not use the effective display model; resident A still needs a load for profile default B")
+                   .requestModel(modelID: "profile/Default.gguf", overrideAfterConfirmation: "profile/Default.gguf"),
+                   "clear-vs-load must not use the effective display model; resident A still needs a load for profile default B, and the concrete row remains an explicit pin")
   }
 
-  func test_profile_default_row_same_as_resident_only_clears_override() {
+  func test_profile_default_row_same_as_current_selection_recommits_explicit_pin() {
     let option = ToolbarModelOptions.Option(
       slug: "profile/Default.gguf",
       displayName: "Default.gguf",
@@ -121,7 +121,8 @@ final class ToolbarModelOptionsTests: XCTestCase {
       unavailableReason: nil)
 
     XCTAssertEqual(ToolbarModelOptions.selectionAction(for: option, residentModelID: "profile/Default.gguf"),
-                   .clearOverride)
+                   .requestModel(modelID: "profile/Default.gguf", overrideAfterConfirmation: "profile/Default.gguf"),
+                   "choosing the concrete profile-default row must not clear into follow-default mode; it enters explicit model mode even when it is already current")
   }
 
   func test_partial_and_unsupported_discovered_models_are_disabled_with_reasons() {

@@ -9,6 +9,7 @@ import ServiceManagement
 /// launchd-managed RatioThinkHelper's `SMAppService` registration, not the
 /// app process — and routes to System Settings → Login Items to change it.
 struct GeneralSettingsTab: View {
+  @EnvironmentObject private var appPreferences: AppPreferences
   @State private var resolvedPieHome: String = "—"
   @State private var menuBarPersistenceText =
     "Checking whether Rational stays in your menu bar after you quit…"
@@ -51,6 +52,20 @@ struct GeneralSettingsTab: View {
               .lineLimit(2)
               .truncationMode(.middle)
           }
+        }
+
+        Divider()
+
+        SettingsSectionHeader(title: "Model behavior")
+        VStack(alignment: .leading, spacing: 8) {
+          Toggle("Follow profile default model", isOn: Binding(
+            get: { appPreferences.followProfileDefaultModel },
+            set: { appPreferences.setFollowProfileDefaultModel($0) }
+          ))
+          .accessibilityIdentifier("FollowProfileDefaultModelToggle")
+          Text("When off, choosing any concrete model keeps that model pinned as you switch profiles. Turn this on to be asked about switching to each profile’s default model.")
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
         }
 
         Divider()

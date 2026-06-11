@@ -51,6 +51,10 @@ struct ContentToolbar: View {
   /// #460: clears the per-chat model pin so the chat follows the profile
   /// default again — wired by `ChatScaffoldView`.
   let onUseProfileDefault: () -> Void
+  /// Compatibility preference. Default false means a concrete model row acts
+  /// as an explicit pin across later profile changes; true restores the older
+  /// follow-profile-default prompt behavior.
+  let followProfileDefaultModel: Bool
   /// Swap coordinator. Required — review v1 F9: defaulting this to a
   /// preview-only `previewDefault()` let a forgotten injection at any
   /// call site silently fall through to an orphan coordinator the
@@ -102,6 +106,7 @@ struct ContentToolbar: View {
     commitSwap: @escaping ProfileSwapCoordinator.SwapCommit = { _, _ in true },
     commitModel: @escaping (String) -> Bool = { _ in true },
     onUseProfileDefault: @escaping () -> Void = {},
+    followProfileDefaultModel: Bool = false,
     swapCoordinator: ProfileSwapCoordinator,
     modelLoadCenter: ModelLoadCenter?,
     engineStatus: EngineStatusStore?,
@@ -119,6 +124,7 @@ struct ContentToolbar: View {
     self.commitSwap = commitSwap
     self.commitModel = commitModel
     self.onUseProfileDefault = onUseProfileDefault
+    self.followProfileDefaultModel = followProfileDefaultModel
     self.swapCoordinator = swapCoordinator
     self.modelLoadCenter = modelLoadCenter
     self.engineStatus = engineStatus
@@ -241,6 +247,13 @@ struct ContentToolbar: View {
                         profileDefault: profileDefaultModel)?.modelID
   }
 
+  static func shouldPreserveExplicitModelSelection(selectedModelID: String?,
+                                                   followProfileDefaultModel: Bool) -> Bool {
+    guard !followProfileDefaultModel else { return false }
+    let trimmed = selectedModelID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return !trimmed.isEmpty
+  }
+
   private var modelMenu: some View {
     Menu {
       // #459's richer option list (checkmark on current, profile-default
@@ -359,6 +372,9 @@ struct ContentToolbar: View {
     swapCoordinator.requestSwap(
       toProfileID: id,
       fromModel: effectiveModelID,
+      preserveExplicitModelSelection: Self.shouldPreserveExplicitModelSelection(
+        selectedModelID: selectedModelID,
+        followProfileDefaultModel: followProfileDefaultModel),
       commit: commitSwap
     )
   }
@@ -373,15 +389,11 @@ struct ContentToolbar: View {
                                                residentModelID: selectedModelID) {
     case .unavailable:
       return
-    case .clearOverride:
-      // Picking the profile-default row while it is already the chat's
-      // selection clears the pin so the chat follows the profile default.
-      onUseProfileDefault()
     case let .requestModel(modelID, overrideAfterConfirmation):
       // Confirm gate against the chat's current pin; on confirm, persist the
-      // result onto `Chat.modelID`. A `nil` `overrideAfterConfirmation`
-      // (concrete profile-default row) clears the pin so the chat keeps
-      // profile-default semantics rather than persisting a redundant pin.
+      // result onto `Chat.modelID`. All selectable concrete rows pass their
+      // slug as `overrideAfterConfirmation`; choosing the profile-default row
+      // is still an explicit model pick, not a request to follow defaults.
       swapCoordinator.requestModelOverride(
         modelID: modelID,
         activeProfileID: viewModel.selectedProfileID,

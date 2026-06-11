@@ -190,6 +190,30 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       ContentToolbar.effectiveModelID(selectedModelID: nil, profileDefaultModel: nil))
   }
 
+  func test_profile_swap_preserves_explicit_pin_by_default() {
+    XCTAssertTrue(
+      ContentToolbar.shouldPreserveExplicitModelSelection(
+        selectedModelID: "pinned-model",
+        followProfileDefaultModel: false),
+      "a concrete model selection should suppress later profile-default swap prompts by default")
+  }
+
+  func test_profile_swap_does_not_preserve_unpinned_app_run_state() {
+    XCTAssertFalse(
+      ContentToolbar.shouldPreserveExplicitModelSelection(
+        selectedModelID: nil,
+        followProfileDefaultModel: false),
+      "a fresh app-run/chat with no explicit concrete row selected should keep follow-default behavior")
+  }
+
+  func test_follow_profile_default_toggle_reenables_compatibility_prompting() {
+    XCTAssertFalse(
+      ContentToolbar.shouldPreserveExplicitModelSelection(
+        selectedModelID: "pinned-model",
+        followProfileDefaultModel: true),
+      "the compatibility toggle should let profile changes ask/suggest the destination default again")
+  }
+
 
   // MARK: - #516 review F6: status edge must not fire before residency reconcile
 
