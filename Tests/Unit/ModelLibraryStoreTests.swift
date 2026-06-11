@@ -171,6 +171,54 @@ final class ModelLibraryStoreTests: XCTestCase {
                    .installedAppManaged)
   }
 
+  func test_overlay_retires_on_eviction_when_scan_never_confirms() async throws {
+    // Review v4 F1/F2 — the eviction edge. The scan NEVER reports the
+    // file (models an externally deleted install, or a scan walk that
+    // raced placement and was never re-run): while the terminal row
+    // lingers the overlay honestly classifies installed, but the
+    // moment the row evicts, the phantom must retire so the repairing
+    // re-download is not blocked.
+    let stub = StubDownloader()
+    let downloads = ModelDownloadController(downloader: stub,
+                                            terminalRowLingerSeconds: 1)
+    let box = ScanBox(emptyScan())
+    let store = ModelLibraryStore(downloads: downloads, scan: { box.result })
+    await store.refresh()
+
+    let id = try XCTUnwrap(downloads.enqueue(repo: repo, file: file))
+    stub.emit(DownloadProgress(handleID: id, phase: .completed,
+                               bytesReceived: 1, bytesExpected: 1,
+                               etaSeconds: nil), for: id)
+    stub.finish(id)
+
+    // Linger window: overlay claims installed (positive control for
+    // the assertion below — proves retirement is what flips it back).
+    let sawInstalled = await waitUntil {
+      store.availability.status(repo: self.repo, file: self.file) == .installedAppManaged
+    }
+    XCTAssertTrue(sawInstalled, "overlay must classify installed while the row lingers")
+
+    // Eviction (linger 1s): the row leaves `active`, retirement runs
+    // on that emission, and — with no scan ever confirming the file —
+    // the slug must return to addable, with nothing else triggering a
+    // refresh.
+    let retired = await waitUntil(timeout: 10) {
+      store.availability.status(repo: self.repo, file: self.file) == .availableToDownload
+    }
+    XCTAssertTrue(retired,
+                  "an unconfirmed overlay slug must retire when its download row "
+                  + "evicts — a phantom Installed would block the repairing "
+                  + "re-download (review v4 F1)")
+    XCTAssertEqual(
+      ModelsSettingsTab.duplicateAddDecision(
+        repo: repo, file: file,
+        availability: store.availability,
+        modelsDirectory: nil,
+        fallbackModelsDirectory: { nil }),
+      .proceed,
+      "after retirement the duplicate guard must allow the re-download")
+  }
+
   func test_overlay_retires_to_scan_truth_once_confirmed() async throws {
     let stub = StubDownloader()
     let downloads = ModelDownloadController(downloader: stub,

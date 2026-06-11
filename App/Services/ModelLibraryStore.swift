@@ -92,24 +92,38 @@ final class ModelLibraryStore: ObservableObject {
     let appSlugs = Set(result.appManaged.map(\.filename))
     installed = result.appManaged
       + result.huggingFaceCache.filter { !appSlugs.contains($0.filename) }
-    // Overlay retirement. A slug the scan CONFIRMED is retired — the
-    // `installed` list owns it now. A slug the scan did NOT report is
-    // kept only while its download row still lingers in
-    // `downloads.active`: a scan whose filesystem walk raced the
-    // placement can innocently miss a just-completed file (the
-    // completion-triggered re-scan confirms it moments later), but
-    // once the row has evicted, every applied scan started well after
-    // placement — a missing file then means the install genuinely is
-    // not there (e.g. externally deleted) and the overlay must not
-    // keep claiming it is.
-    let lingering = Set(downloads.active.values.map {
+    retireOverlay(active: downloads.active)
+    // GC: a download id can never re-enter `active`, so ids whose rows
+    // have evicted are dead weight in the reconciled set.
+    reconciledCompletions.formIntersection(Set(downloads.active.keys))
+    freshness = .scanned
+    recomputeAvailability(active: downloads.active)
+  }
+
+  /// Overlay retirement — runs on EVERY state edge that can change the
+  /// answer (each applied scan in `refresh()`, and each `$active`
+  /// emission in `reconcile(active:)`, which covers the eviction edge
+  /// review v4 F1 found missing). A pending slug is kept only while
+  /// BOTH hold:
+  ///  - no finished scan has confirmed it (once `installed` — app-
+  ///    managed OR HF-cache — reports the slug, the list owns the
+  ///    classification and the overlay is redundant), and
+  ///  - its download row still lingers in `active`: a scan whose
+  ///    filesystem walk raced the placement can innocently miss a
+  ///    just-completed file (the completion-triggered re-scan confirms
+  ///    it moments later), but once the row has evicted, a missing
+  ///    file means the install genuinely is not there (e.g. externally
+  ///    deleted) — the overlay must not keep claiming it is, or the
+  ///    phantom "Installed" would block the repairing re-download.
+  private func retireOverlay(active: [UUID: ModelDownloadController.ActiveDownload]) {
+    guard !pendingInstalledSlugs.isEmpty else { return }
+    let installedSlugs = Set(installed.map(\.filename))
+    let lingering = Set(active.values.map {
       ModelAvailability.slug(repo: $0.repo, file: $0.file)
     })
     pendingInstalledSlugs = pendingInstalledSlugs.filter {
-      !appSlugs.contains($0) && lingering.contains($0)
+      !installedSlugs.contains($0) && lingering.contains($0)
     }
-    freshness = .scanned
-    recomputeAvailability(active: downloads.active)
   }
 
   /// Sink over `downloads.$active`. Two jobs: flip the in-flight axis
@@ -127,6 +141,11 @@ final class ModelLibraryStore: ObservableObject {
         ModelAvailability.slug(repo: entry.repo, file: entry.file))
       Task { await refresh() }
     }
+    // Eviction edge (review v4 F1): a terminal row leaving `active` is
+    // an emission with NO completion transition — retirement must run
+    // here too, or a scan-race-missed slug would keep classifying
+    // installed until some unrelated refresh().
+    retireOverlay(active: active)
     recomputeAvailability(active: active)
   }
 
