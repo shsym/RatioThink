@@ -98,22 +98,45 @@ use crate::sse::Emitter;
 use super::schema::TotParams;
 use super::stream;
 use super::tree::{
-    assemble, best_leaf, error_leaf, new_node_id, parse_score, select_beam, Candidate, Node,
-    NodeStatus,
+    assemble, best_leaf, error_leaf, new_node_id, parse_score, select_beam_diverse, Candidate,
+    Node, NodeStatus,
 };
 
-/// Built-in expansion instruction appended before forking at levels > 1.
-/// Level-1 children answer the conversation directly (sibling diversity
-/// comes from sampling temperature).
+/// Per-branch directive appended to each forked child before it generates
+/// (#523). The branch index makes every sibling's prompt textually distinct
+/// — breaking the prior collapse where all `breadth` children shared one
+/// prompt and diverged only by sampling temperature — and instructs ONE
+/// mutually-exclusive, *named* strategy that differs by primary objective or
+/// tradeoff, not wording. Level 1 proposes a fresh strategy directly; deeper
+/// levels critique the parent then refine along a distinct axis (this
+/// replaces the old single shared `REFINE_INSTRUCTION`, which was flushed
+/// identically into every sibling and so could not diversify them).
 ///
-/// Reasoning-aware (#413/#437): a node generates a `<think>` block then an
-/// answer, which [`generate_demuxed`] splits apart — reasoning IS the point
-/// of a tree-of-thought search, so the candidate keeps its thought trace
-/// while the beam and the scorer see only the clean answer. The instruction
-/// carries no `/no_think`; [`with_thinking`] appends one only when the
-/// search runs with `thinking:false`.
-const REFINE_INSTRUCTION: &str = "Critique your previous answer, then give a distinct, \
-     improved continuation toward correctly answering the original question. Be concise.";
+/// Reasoning-aware (#413/#437): a node may generate a `<think>` block then
+/// an answer, which [`generate_demuxed`] splits apart — reasoning IS the
+/// point of a tree-of-thought search, so the candidate keeps its thought
+/// trace while the beam and scorer see only the clean answer. The directive
+/// is wrapped in [`with_thinking`], which appends `/no_think` only when the
+/// search runs with `thinking:false`. Pure → unit-tested.
+fn branch_directive(level: usize, branch_index: usize, breadth: usize, thinking: bool) -> String {
+    let n = branch_index + 1;
+    let body = if level <= 1 {
+        format!(
+            "Explore solution path {n} of {breadth} for the user's request. Commit to ONE \
+             specific strategy that differs from the other paths by its primary objective or key \
+             tradeoff — not just by wording. Name your strategy in a short phrase, then answer the \
+             request fully using only that strategy. Be concrete and specific."
+        )
+    } else {
+        format!(
+            "Critique your previous answer, then continue along refinement path {n} of {breadth}: \
+             pick ONE distinct improvement focus that differs from the sibling paths by primary \
+             objective or tradeoff. Name the focus in a short phrase, then give an improved, \
+             concrete answer committed to it."
+        )
+    };
+    with_thinking(&body, thinking)
+}
 
 /// Value-evaluator prompt (independent per-node scoring). The node already
 /// did its reasoning; the scorer is a value HEAD that rates the resulting
@@ -125,9 +148,12 @@ const REFINE_INSTRUCTION: &str = "Critique your previous answer, then give a dis
 /// stays on. The directive is inert on a non-reasoning model, and the score
 /// output is demuxed regardless so a stray empty think block can't swallow
 /// the integer.
-const SCORE_PROMPT: &str = "On a scale of 1 to 10, rate how promising the assistant's \
-     latest answer is toward correctly and completely answering the original question. \
-     Respond with only a single integer from 1 to 10.";
+const SCORE_PROMPT: &str = "Rate the assistant's latest answer from 1 to 10 on how well it \
+     actually satisfies the user's original request. Judge task relevance, factual and semantic \
+     correctness, specificity, and concrete usefulness. A fluent, polished, brief, or polite \
+     answer that does not directly address what was asked is a LOW score (1-3); do not reward \
+     style, brevity, or acknowledgment over substance. Respond with only a single integer from 1 \
+     to 10.";
 
 /// Token budget for a scoring generation — enough for a suppressed empty
 /// `<think></think>` plus the integer. The scorer is NOT demuxed (see
@@ -405,56 +431,14 @@ pub async fn run(
         // exact slice the streaming sink replays as `node_complete` frames.
         let level_start = flat.len();
 
-        // Levels > 1 refine the parent before forking: append the refine
-        // user-turn and flush it into the shared prefix. The assistant
-        // turn itself is opened per child in `expand` (every level cues
-        // its own fork), so the shared prefix stays cue-free and KV pages
-        // are shared across the branches. Concurrent (#458 / part B): the
-        // ≤ beam_width parent flushes are independent forward passes, so
-        // `join_all` lets the engine batch them into one prefill pass
-        // instead of running them serially. `join_all` preserves input
-        // order, so error leaves are still appended in deterministic
-        // frontier order (the streaming `emit_level` slice depends on it).
-        //
-        // A flush failure here is NOT best-effort: `Context::flush` takes
-        // the token buffer before its fallible forward pass, so on error
-        // the REFINE_INSTRUCTION tokens are discarded while `seq_len` is
-        // left unchanged — and `fork()` clones that now-empty buffer.
-        // Forking such a parent would silently generate a re-roll of its
-        // PRE-refine answer and record it as `status:"ok"`: an invisible
-        // downgrade, since this flush is the only thing that makes a
-        // level a refinement rather than a re-roll. So drop the parent and
-        // record error leaves for its children, mirroring the fork-failure
-        // path below.
-        if level > 1 {
-            let refine = with_thinking(REFINE_INSTRUCTION, params.thinking);
-            let refine_ref = refine.as_str();
-            let flushed = join_all(frontier.into_iter().map(|mut f| async move {
-                f.ctx.user(refine_ref);
-                match f.ctx.flush().await {
-                    Ok(()) => Ok(f),
-                    Err(e) => Err((f.node_id, e)),
-                }
-            }))
-            .await;
-            let mut refined: Vec<Frontier> = Vec::with_capacity(flushed.len());
-            for r in flushed {
-                match r {
-                    Ok(f) => refined.push(f),
-                    Err((node_id, e)) => {
-                        for b in 0..params.breadth {
-                            flat.push(error_leaf(
-                                &node_id,
-                                level,
-                                b,
-                                format!("refine flush failed: {e}"),
-                            ));
-                        }
-                    }
-                }
-            }
-            frontier = refined;
-        }
+        // Per-branch diversity (#523): the refinement instruction is no
+        // longer flushed once into the shared parent prefix (which made
+        // every sibling identical). Instead each forked child appends its
+        // OWN `branch_directive` in `generate_branch` — distinct per branch
+        // index, steering each sibling to a different strategy — so the
+        // parent prefix stays shared (KV-cache reuse) while the siblings
+        // diverge. At levels > 1 the directive carries the critique-then-
+        // refine framing the shared flush used to provide.
 
         // Fork every child. A fork failure has no context to carry → record
         // it as an inline error leaf (shared with the refine-flush path); a
@@ -547,8 +531,10 @@ pub async fn run(
 /// [`run`] records those as [`error_leaf`] nodes directly, since they have
 /// no content to score or context to expand. A successful branch becomes
 /// an `ok`/`error` leaf; an `ok` leaf may still carry a `score_error` when
-/// the scorer infra failed (F4). Pruning reuses [`select_beam`], which
-/// keeps only the top `beam_width` **ok** candidates. Node ids are
+/// the scorer infra failed (F4). Pruning reuses [`select_beam_diverse`],
+/// which keeps the top `beam_width` **ok** candidates by score but demotes
+/// a paraphrase of an already-kept sibling so a distinct branch takes the
+/// slot (#523). Node ids are
 /// caller-assigned (paired with the engine contexts), so the returned
 /// `keep` ids map straight back to surviving [`Frontier`] entries.
 fn materialize_level(level: usize, branches: Vec<Branch>, beam_width: usize) -> LevelMaterialized {
@@ -561,10 +547,14 @@ fn materialize_level(level: usize, branches: Vec<Branch>, beam_width: usize) -> 
         // so the beam never keeps a node that has no answer — and a
         // think-only candidate can no longer win the search (#437).
         let is_ok = b.outcome.status == NodeStatus::Ok;
+        // Diversity dedup compares only ok candidates' answers (non-ok are
+        // filtered out in `select_beam_diverse`), so the candidate carries
+        // the clean answer; an Error/Incomplete node has empty content.
         candidates.push(Candidate {
             id: b.id.clone(),
             score: b.outcome.score,
             ok: is_ok,
+            content: b.outcome.content.clone(),
         });
         nodes.push(Node {
             id: b.id,
@@ -581,7 +571,7 @@ fn materialize_level(level: usize, branches: Vec<Branch>, beam_width: usize) -> 
         });
     }
 
-    let keep = select_beam(&candidates, beam_width);
+    let keep = select_beam_diverse(&candidates, beam_width, super::diversity::DUP_THRESHOLD);
     LevelMaterialized {
         nodes,
         candidates,
@@ -658,7 +648,7 @@ async fn resolve_level(
             join_all(
                 ctxs.into_iter()
                     .zip(metas.iter())
-                    .map(|(c, m)| generate_branch(c, model, params, None, &m.0)),
+                    .map(|(c, m)| generate_branch(c, model, params, None, &m.0, level, m.2)),
             )
             .await
         } else {
@@ -667,7 +657,10 @@ async fn resolve_level(
                 if let Some(em) = emitter.as_deref_mut() {
                     let _ = stream::emit_node_start(em, &m.0, &m.1, level, m.2).await;
                 }
-                out.push(generate_branch(c, model, params, emitter.as_deref_mut(), &m.0).await);
+                out.push(
+                    generate_branch(c, model, params, emitter.as_deref_mut(), &m.0, level, m.2)
+                        .await,
+                );
             }
             out
         };
@@ -698,7 +691,7 @@ async fn resolve_level(
             join_all(
                 ctxs.into_iter()
                     .zip(metas.iter())
-                    .map(|(c, m)| expand(c, model, params, None, &m.0)),
+                    .map(|(c, m)| expand(c, model, params, None, &m.0, level, m.2)),
             )
             .await
         } else {
@@ -707,7 +700,9 @@ async fn resolve_level(
                 if let Some(em) = emitter.as_deref_mut() {
                     let _ = stream::emit_node_start(em, &m.0, &m.1, level, m.2).await;
                 }
-                out.push(expand(c, model, params, emitter.as_deref_mut(), &m.0).await);
+                out.push(
+                    expand(c, model, params, emitter.as_deref_mut(), &m.0, level, m.2).await,
+                );
             }
             out
         }
@@ -727,10 +722,15 @@ async fn generate_branch(
     params: &TotParams,
     emitter: Option<&mut Emitter>,
     node_id: &str,
+    level: usize,
+    branch_index: usize,
 ) -> (Context, Demux) {
-    // Open the assistant turn for this branch. The forked context shares a
-    // fully-flushed, cue-free prefix, so without this the first forward
-    // pass would carry zero new tokens and spin the generator.
+    // Append this branch's per-branch directive (#523), then open the
+    // assistant turn. The forked context shares a fully-flushed, cue-free
+    // prefix; the directive steers this sibling toward a distinct strategy
+    // (its text also makes the first forward pass carry real new tokens
+    // rather than spin).
+    ctx.user(&branch_directive(level, branch_index, params.breadth, params.thinking));
     ctx.cue();
     let stops = chat::stop_tokens(model);
     let demux = generate_demuxed(
@@ -807,8 +807,11 @@ async fn expand(
     params: &TotParams,
     emitter: Option<&mut Emitter>,
     node_id: &str,
+    level: usize,
+    branch_index: usize,
 ) -> (Context, NodeOutcome) {
-    let (ctx, demux) = generate_branch(ctx, model, params, emitter, node_id).await;
+    let (ctx, demux) =
+        generate_branch(ctx, model, params, emitter, node_id, level, branch_index).await;
     let score = if matches!(demux.kind, DemuxKind::Answered) {
         Some(score_node(&ctx, model).await)
     } else {
@@ -916,7 +919,64 @@ mod tests {
             id: id.to_string(),
             score,
             ok,
+            content: String::new(),
         }
+    }
+
+    // ── branch_directive (#523 A): per-branch diversity ──
+
+    #[test]
+    fn branch_directives_are_distinct_across_siblings() {
+        // The core diversity guarantee: no two siblings get the same prompt,
+        // so the old identical-prefix collapse is impossible by construction.
+        let breadth = 5;
+        let ds: Vec<String> = (0..breadth)
+            .map(|b| branch_directive(1, b, breadth, true))
+            .collect();
+        for i in 0..breadth {
+            for j in (i + 1)..breadth {
+                assert_ne!(ds[i], ds[j], "siblings {i} and {j} share a directive");
+            }
+        }
+    }
+
+    #[test]
+    fn branch_directive_level1_proposes_a_named_strategy() {
+        let d = branch_directive(1, 0, 3, true);
+        assert!(d.contains("path 1 of 3"));
+        assert!(d.to_lowercase().contains("strategy"));
+        // Level 1 proposes fresh; it does not ask to critique a prior answer.
+        assert!(!d.to_lowercase().contains("critique"));
+    }
+
+    #[test]
+    fn branch_directive_deeper_levels_critique_then_refine() {
+        let d = branch_directive(2, 1, 3, true);
+        assert!(d.contains("path 2 of 3"));
+        assert!(d.to_lowercase().contains("critique"));
+    }
+
+    #[test]
+    fn branch_directive_honors_thinking_knob() {
+        // thinking:false suppresses per-node reasoning via the /no_think
+        // marker (reused from `with_thinking`); thinking:true keeps it.
+        assert!(branch_directive(1, 0, 3, false).contains("/no_think"));
+        assert!(!branch_directive(1, 0, 3, true).contains("/no_think"));
+    }
+
+    // ── SCORE_PROMPT (#523 B): rubric weights task relevance over style ──
+
+    #[test]
+    fn score_prompt_rubric_weights_substance_not_fluency() {
+        let p = SCORE_PROMPT.to_lowercase();
+        assert!(p.contains("satisf"));
+        assert!(p.contains("relevance"));
+        assert!(p.contains("correct"));
+        assert!(p.contains("specific"));
+        // …and explicitly does NOT reward style/brevity/acknowledgment.
+        assert!(p.contains("low score"));
+        assert!(p.contains("do not reward"));
+        assert!(p.contains("single integer"));
     }
 
     // ── ScoreOutcome (F4): the three classes the old Option<u8> merged ──
