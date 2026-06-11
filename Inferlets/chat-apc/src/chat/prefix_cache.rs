@@ -56,20 +56,23 @@
 //!   generate — the long history prefill is skipped. On a miss, rebuild the
 //!   full prompt.
 //!
-//! ## Save (next boundary)
+//! ## Save (next boundary — canonical rebuild)
 //!
-//! After a successful natural/length completion the KV holds
-//! `prompt_no_cue ‖ cue ‖ gen` (the sampled stop token is never fed back,
-//! so it is absent from both `gen` and the KV). The next turn's reusable
-//! prefix is `prompt_no_cue ‖ assistant(gen_content)`, which a chat
-//! template renders as `cue ‖ retokenize(gen_content) ‖ seal`. We save iff
-//! `cue ‖ gen ‖ seal == assistant(gen_content)` — i.e. the generated
-//! tokens round-trip through the template exactly. When they do, we append
-//! `seal`, flush, and save under the canonical next-prefix name; the saved
-//! KV is then *exactly* what the next turn will request. When they don't
-//! (round-trip drift, or a thinking model whose reasoning tokens are not
-//! replayed into history), we skip the save and the next turn is a clean
-//! miss. Either way: never corruption.
+//! The next turn does not resend this turn's reasoning: a thinking model's
+//! `<think>…</think>` tokens live in the generation KV but are dropped from
+//! the persisted/resent history. So the boundary we save is *not* the
+//! generation KV — it is the **canonical text rendering** the next request
+//! will actually send: `prompt_no_cue ‖ assistant(visible_content)`. We
+//! materialize that KV cheaply by re-opening the same prefix snapshot used
+//! for generation (an immutable fork) and appending only this turn's tail
+//! (the last user message + `assistant(visible_content)`) — a single
+//! forward pass over one turn, not the whole history. On a miss (no prefix
+//! snapshot) we rebuild the full boundary, which is unavoidable there but
+//! only happens on the first turn or after an engine restart, where the
+//! history is short. The snapshot is named by the exact `next_prefix`
+//! tokens, so the next turn recomputes the identical name and hits. This is
+//! correct for thinking *and* non-thinking models: we never reuse the
+//! reasoning-bearing generation KV, only the canonical history KV.
 //!
 //! ## Lifecycle / invalidation
 //!
@@ -211,47 +214,6 @@ pub fn short_tag(s: &str) -> String {
 /// must fall back to a full rebuild rather than trust a bad split).
 pub fn suffix_start(full_len: usize, prefix_len: usize) -> Option<usize> {
     (prefix_len <= full_len).then_some(prefix_len)
-}
-
-// =============================================================================
-// Save decision (pure gate)
-// =============================================================================
-
-/// Outcome of the post-generation save gate.
-#[derive(Debug, PartialEq, Eq)]
-pub enum SaveDecision {
-    /// The generated turn round-trips through the chat template exactly;
-    /// append `seal` and save the canonical next-prefix snapshot.
-    Save,
-    /// Do not save; the `&'static str` is the diagnostic reason.
-    Skip(&'static str),
-}
-
-/// Decide whether the just-finished turn can be saved as a reusable
-/// boundary. Pure over token vectors so it is exhaustively unit-testable
-/// without an engine.
-///
-/// `cue` / `gen` / `seal` are the generation header, the generated tokens
-/// (no stop — pie never feeds the sampled stop back), and the turn-closing
-/// tokens. `assistant` is `chat::assistant(model, gen_content)` — how the
-/// *next* request will render this turn from its persisted text. They match
-/// iff the generated tokens round-trip, which is the exact condition under
-/// which the live KV equals the next request's reusable prefix.
-pub fn decide_save(cue: &[u32], gen_tokens: &[u32], seal: &[u32], assistant: &[u32]) -> SaveDecision {
-    if gen_tokens.is_empty() {
-        return SaveDecision::Skip("empty_generation");
-    }
-    if cue.len() + gen_tokens.len() + seal.len() != assistant.len() {
-        return SaveDecision::Skip("noncanonical_generation");
-    }
-    let matches = assistant[..cue.len()] == *cue
-        && assistant[cue.len()..cue.len() + gen_tokens.len()] == *gen_tokens
-        && assistant[cue.len() + gen_tokens.len()..] == *seal;
-    if matches {
-        SaveDecision::Save
-    } else {
-        SaveDecision::Skip("noncanonical_generation")
-    }
 }
 
 // =============================================================================
@@ -402,9 +364,9 @@ pub fn acquire(model: &Model, plan: &ReusePlan) -> Result<(Context, CacheDiag), 
                 }
                 None => {
                     // Non-monotone tokenization (prefix longer than the full
-                    // prompt) — a tokenizer bug. Discard the fork and fall
-                    // through to a clean rebuild rather than trust the split.
-                    ctx.destroy();
+                    // prompt) — a tokenizer bug. Drop the fork (scope-drop
+                    // releases the context) and fall through to a clean
+                    // rebuild rather than trust the split.
                 }
             }
         }
@@ -422,72 +384,86 @@ pub fn acquire(model: &Model, plan: &ReusePlan) -> Result<(Context, CacheDiag), 
     Ok((ctx, diag))
 }
 
-/// After a successful turn, record page counts and save the next reusable
-/// boundary when the generation round-trips through the chat template (see
-/// [`decide_save`]). Mutates `diag` in place with the save result.
+/// After a successful turn, build and save the next reusable boundary —
+/// the canonical text KV the *next* request will send,
+/// `prompt_no_cue ‖ assistant(visible_content)`. Builds it in a dedicated
+/// context (cheap fork+tail on a hit, full rebuild on a miss) so the saved
+/// KV never carries this turn's reasoning. Mutates `diag` with the result.
 ///
-/// `gen_content` is the visible assistant text the App persists and
-/// resends; `gen_tokens` is every generated token in KV order (including
-/// reasoning), which is what the live KV actually holds.
-pub async fn finalize(
-    ctx: &mut Context,
-    plan: &ReusePlan,
-    gen_content: &str,
-    gen_tokens: &[u32],
-    model: &Model,
-    diag: &mut CacheDiag,
-) {
-    // Page counts are authoritative engine state — emit them, never guess.
-    diag.committed_pages = Some(ctx.inner().committed_page_count());
-    diag.working_pages = Some(ctx.inner().working_page_count());
-
+/// `gen_content` is the visible assistant text the App persists and resends.
+pub async fn finalize(plan: &ReusePlan, gen_content: &str, model: &Model, diag: &mut CacheDiag) {
     let assistant = chat::assistant(model, gen_content);
-    let seal = chat::seal(model);
-    match decide_save(&plan.cue, gen_tokens, &seal, &assistant) {
-        SaveDecision::Skip(reason) => {
-            diag.save_result = format!("skipped:{reason}");
-        }
-        SaveDecision::Save => {
-            let mut next_prefix = plan.prompt_no_cue.clone();
-            next_prefix.extend_from_slice(&assistant);
-            let name = snapshot_name(
-                &plan.directive.key,
-                &plan.directive.compat,
-                &plan.model_id,
-                TEMPLATE_MARKER,
-                &next_prefix,
-            );
-            // Append the turn-closing tokens so the saved KV equals the
-            // canonical next-prefix, then flush them into working pages
-            // (save ignores the SDK-side buffer).
-            ctx.append(&seal);
-            if let Err(e) = ctx.flush().await {
-                eprintln!("[chat-apc] prefix-cache save flush failed: {e}");
-                diag.save_result = "failed:flush".to_string();
+    if assistant.is_empty() {
+        // Nothing to commit as history (e.g. an all-reasoning turn cut off
+        // before any visible content). No boundary to save.
+        diag.save_result = "skipped:empty_turn".to_string();
+        return;
+    }
+    // The boundary the next request will recompute and look up.
+    let mut next_prefix = plan.prompt_no_cue.clone();
+    next_prefix.extend_from_slice(&assistant);
+    let name = snapshot_name(
+        &plan.directive.key,
+        &plan.directive.compat,
+        &plan.model_id,
+        TEMPLATE_MARKER,
+        &next_prefix,
+    );
+
+    // Cheap path: re-open the prefix snapshot we generated against (an
+    // immutable fork) and append only this turn's tail — one forward pass
+    // over a single turn. Fall back to a full rebuild on a miss.
+    let reused = match (plan.open_name.as_deref(), suffix_start(plan.prompt_no_cue.len(), plan.prefix_tokens.len())) {
+        (Some(n), Some(s)) => Context::open(model, n).ok().map(|mut ctx| {
+            let mut tail = plan.prompt_no_cue[s..].to_vec();
+            tail.extend_from_slice(&assistant);
+            ctx.append(&tail);
+            ctx
+        }),
+        _ => None,
+    };
+    let mut save_ctx = match reused {
+        Some(ctx) => ctx,
+        None => match Context::new(model) {
+            Ok(mut ctx) => {
+                ctx.append(&next_prefix);
+                ctx
+            }
+            Err(e) => {
+                eprintln!("[chat-apc] prefix-cache boundary ctx failed: {e}");
+                diag.save_result = "failed:ctx".to_string();
                 return;
             }
-            diag.committed_pages = Some(ctx.inner().committed_page_count());
-            diag.working_pages = Some(ctx.inner().working_page_count());
-            match ctx.save(&name) {
-                Ok(()) => {
-                    diag.save_result = "saved".to_string();
-                    diag.save_hash = name_hash_part(&name);
-                }
-                Err(e) => {
-                    let es = e.to_string();
-                    if es.contains("already exists") {
-                        // Same content hash already saved — identical KV, a
-                        // benign no-op, still a valid future hit.
-                        diag.save_result = "exists".to_string();
-                        diag.save_hash = name_hash_part(&name);
-                    } else {
-                        eprintln!("[chat-apc] prefix-cache save failed: {es}");
-                        diag.save_result = "failed:save".to_string();
-                    }
-                }
+        },
+    };
+    if let Err(e) = save_ctx.flush().await {
+        eprintln!("[chat-apc] prefix-cache boundary flush failed: {e}");
+        diag.save_result = "failed:flush".to_string();
+        return;
+    }
+    // Authoritative engine state — emit, never guess.
+    diag.committed_pages = Some(save_ctx.inner().committed_page_count());
+    diag.working_pages = Some(save_ctx.inner().working_page_count());
+    match save_ctx.save(&name) {
+        Ok(()) => {
+            diag.save_result = "saved".to_string();
+            diag.save_hash = name_hash_part(&name);
+        }
+        Err(e) => {
+            let es = e.to_string();
+            if es.contains("already exists") {
+                // Same content hash already saved — identical KV, benign,
+                // still a valid future hit.
+                diag.save_result = "exists".to_string();
+                diag.save_hash = name_hash_part(&name);
+            } else {
+                eprintln!("[chat-apc] prefix-cache save failed: {es}");
+                diag.save_result = "failed:save".to_string();
             }
         }
     }
+    // `save_ctx` drops here, releasing the context resource (the snapshot it
+    // saved is independent and survives).
 }
 
 #[cfg(test)]
@@ -589,56 +565,25 @@ mod tests {
         assert_eq!(suffix_start(3, 5), None);
     }
 
-    // ─── decide_save gate ─────────────────────────────────────
+    // ─── next-boundary ↔ next-turn-prefix identity ────────────
 
     #[test]
-    fn save_when_generation_round_trips() {
-        // cue ‖ gen ‖ seal == assistant(gen_content) → safe to save.
-        let cue = vec![100u32];
-        let gen_tokens = vec![5u32, 6, 7];
-        let seal = vec![200u32];
-        let assistant = vec![100u32, 5, 6, 7, 200];
-        assert_eq!(decide_save(&cue, &gen_tokens, &seal, &assistant), SaveDecision::Save);
-    }
+    fn saved_boundary_matches_next_turn_prefix_lookup() {
+        // Turn N saves a boundary named by `prompt_no_cue ‖ assistant`.
+        // Turn N+1, before its new user message, computes its reusable
+        // prefix as exactly those same tokens (canonical text rendering,
+        // reasoning excluded) and must recompute the identical name → hit.
+        let prompt_no_cue = vec![1u32, 2, 3]; // sys + user_N
+        let assistant = vec![10u32, 11]; // assistant(visible_content_N)
+        let mut saved = prompt_no_cue.clone();
+        saved.extend_from_slice(&assistant);
+        let save_name = snapshot_name("c", "1", "m", "t", &saved);
 
-    #[test]
-    fn skip_when_content_tokens_drift() {
-        // Re-tokenizing the decoded text yields different ids than the
-        // generated stream (a round-trip failure) → conservative skip,
-        // never a corrupt snapshot.
-        let cue = vec![100u32];
-        let gen_tokens = vec![5u32, 6, 7];
-        let seal = vec![200u32];
-        let assistant = vec![100u32, 5, 99, 7, 200]; // middle id differs
-        assert_eq!(
-            decide_save(&cue, &gen_tokens, &seal, &assistant),
-            SaveDecision::Skip("noncanonical_generation")
-        );
-    }
-
-    #[test]
-    fn skip_when_length_differs() {
-        // Thinking model: reasoning tokens live in the KV/gen but are not
-        // replayed into history, so assistant() is shorter → skip.
-        let cue = vec![100u32];
-        let gen_tokens = vec![5u32, 6, 7, 8, 9];
-        let seal = vec![200u32];
-        let assistant = vec![100u32, 5, 6, 200];
-        assert_eq!(
-            decide_save(&cue, &gen_tokens, &seal, &assistant),
-            SaveDecision::Skip("noncanonical_generation")
-        );
-    }
-
-    #[test]
-    fn skip_when_generation_empty() {
-        let cue = vec![100u32];
-        let seal = vec![200u32];
-        let assistant = vec![100u32, 200];
-        assert_eq!(
-            decide_save(&cue, &[], &seal, &assistant),
-            SaveDecision::Skip("empty_generation")
-        );
+        // Turn N+1: history prefix (everything before the new user turn) is
+        // the same token sequence the boundary was named by.
+        let lookup_prefix = saved.clone();
+        let open_name = snapshot_name("c", "1", "m", "t", &lookup_prefix);
+        assert_eq!(open_name, save_name, "next turn must hit the saved boundary");
     }
 
     // ─── retry / truncate invalidation (reasoning over names) ──

@@ -2313,11 +2313,9 @@ async fn handle_streaming(
     let mut tool_disabled_diag: Option<ToolDisabledDiag> = None;
     let mut pending_tool: Option<PendingToolCall> = None;
     let mut in_reasoning = false;
-    // #522: every generated token (KV order, including reasoning) and the
-    // visible assistant text, captured so the prefix cache can decide
-    // whether this turn round-trips into a reusable boundary. Only used
-    // when `cache_plan` is engaged.
-    let mut gen_tokens: Vec<u32> = Vec::new();
+    // #522: visible assistant text, captured so the prefix cache can save
+    // the canonical next-turn boundary. Only used when `cache_plan` is
+    // engaged.
     let mut full_text = String::new();
 
     // F1/F2/F3/F5: explicit-match loop with an `Outcome` set at the
@@ -2370,11 +2368,6 @@ async fn handle_streaming(
         // is a burst of 1 free pick + accepted drafts under speculation).
         spec_steps += 1;
         spec_generated += out.tokens.len();
-        // #522: accumulate the KV-order token stream for the save gate.
-        // The sampled stop token never reaches `out.tokens` (the SDK
-        // truncates it) and is never fed back into the KV, so this matches
-        // the live KV tail exactly.
-        gen_tokens.extend_from_slice(&out.tokens);
 
         // Reasoning side: thinking-blocks become `reasoning_content`
         // deltas. `Idle` is the no-op signal; `Start` flips the
@@ -2635,12 +2628,11 @@ async fn handle_streaming(
     // #522: save the next reusable boundary on a clean completion and emit
     // the cache diagnostics frame. Saving is gated on a real assistant turn
     // (Natural/MaxTokens) — a cancelled/aborted/tool-call turn must not
-    // advance the stable boundary. Dropping `stream` releases the &mut on
-    // `ctx` that the generator held.
+    // advance the stable boundary. `finalize` builds the boundary in its
+    // own context, so the generator's borrow of `ctx` is irrelevant here.
     if let (Some(plan), Some(mut diag)) = (cache_plan.as_ref(), cache_diag.take()) {
         if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
-            drop(stream);
-            prefix_cache::finalize(&mut ctx, plan, &full_text, &gen_tokens, &model, &mut diag).await;
+            prefix_cache::finalize(plan, &full_text, &model, &mut diag).await;
         }
         if let Err(EmitError::Serialize(e)) = em.emit_json(&diag).await {
             eprintln!("[chat-apc] cache diag serialize bug: {e}");
@@ -2779,8 +2771,6 @@ async fn handle_non_streaming(
     let mut reasoning_text = String::new();
     let mut pending_tool: Option<PendingToolCall> = None;
     let mut in_reasoning = false;
-    // #522: KV-order generated tokens for the prefix-cache save gate.
-    let mut gen_tokens: Vec<u32> = Vec::new();
 
     // F4: drive the loop ourselves so we can record the actual
     // termination reason. `collect_text` collapsed natural stop and
@@ -2833,7 +2823,6 @@ async fn handle_non_streaming(
         // is a burst of 1 free pick + accepted drafts under speculation).
         spec_steps += 1;
         spec_generated += out.tokens.len();
-        gen_tokens.extend_from_slice(&out.tokens); // #522 save gate
 
         // capture the gate state BEFORE feeding the reasoning
         // decoder (see streaming branch + `content_visible`). Mirrors the
@@ -3051,13 +3040,12 @@ async fn handle_non_streaming(
     // #522: save the next reusable boundary (gated on a real assistant
     // turn — never on a cancelled/aborted/tool-call turn) and stash the
     // cache diagnostics for the `X-ChatAPC-Cache` response header.
-    // Dropping `stream` releases the &mut on `ctx`.
+    // `finalize` builds the boundary in its own context.
     let cache_header: Option<String> = if let (Some(plan), Some(mut diag)) =
         (cache_plan.as_ref(), cache_diag.take())
     {
         if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
-            drop(stream);
-            prefix_cache::finalize(&mut ctx, plan, &full_text, &gen_tokens, &model, &mut diag).await;
+            prefix_cache::finalize(plan, &full_text, &model, &mut diag).await;
         }
         Some(serde_json::to_string(&diag).expect("CacheDiag must serialize"))
     } else {
