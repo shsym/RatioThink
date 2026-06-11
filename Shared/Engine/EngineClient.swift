@@ -201,6 +201,31 @@ public struct ChatSpeculation: Codable, Equatable, Sendable {
   }
 }
 
+/// #522 cross-request KV prefix-cache directive. Rides as a nested
+/// `"cache": {…}` object matching the inferlet's `CacheDirective` schema.
+/// Carries the local thread key (the chat id), the expected turn boundary,
+/// a compatibility/version marker the App bumps to force misses on schema
+/// or template drift, and the reuse policy. The inferlet content-addresses
+/// snapshots, so this directive scopes/attributes them per chat and gates
+/// reuse — it does not, by itself, make any unsafe reuse possible.
+public struct ChatCacheDirective: Codable, Equatable, Sendable {
+  /// Schema/template compatibility marker. Bump to invalidate every
+  /// snapshot the App previously caused to be saved.
+  public static let compatVersion = "1"
+
+  public let key: String
+  public let turn: Int
+  public let compat: String
+  public let policy: String
+
+  public init(key: String, turn: Int, compat: String = ChatCacheDirective.compatVersion, policy: String = "auto") {
+    self.key = key
+    self.turn = turn
+    self.compat = compat
+    self.policy = policy
+  }
+}
+
 /// Body of POST /v1/chat/completions. `stream` is required on the wire
 /// (engine has different code paths for streaming vs non-streaming); we
 /// expose it but `EngineClient.chatCompletion` only models the streaming
@@ -223,17 +248,22 @@ public struct ChatRequest: Codable, Equatable, Sendable {
   /// Optional chat-apc speculation extension. `nil` → no `speculation`
   /// key on the wire (normal decode). Nested-encoded (not flattened).
   public let speculation: ChatSpeculation?
+  /// #522 prefix-cache directive. `nil` → no `cache` key on the wire
+  /// (reuse disabled, byte-identical to pre-#522). Nested-encoded.
+  public let cache: ChatCacheDirective?
 
   public init(model: String,
               messages: [ChatMessage],
               sampling: ChatSampling = ChatSampling(),
               stream: Bool = true,
-              speculation: ChatSpeculation? = nil) {
+              speculation: ChatSpeculation? = nil,
+              cache: ChatCacheDirective? = nil) {
     self.model = model
     self.messages = messages
     self.sampling = sampling
     self.stream = stream
     self.speculation = speculation
+    self.cache = cache
   }
 
   /// Flat wire keys for sampling. No `sampling` envelope — OpenAI's
@@ -249,6 +279,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     case topP = "top_p"
     case maxTokens = "max_tokens"
     case speculation
+    case cache
   }
 
   public func encode(to encoder: Encoder) throws {
@@ -260,6 +291,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     try c.encode(sampling.topP, forKey: .topP)
     try c.encode(sampling.maxTokens, forKey: .maxTokens)
     try c.encodeIfPresent(speculation, forKey: .speculation)
+    try c.encodeIfPresent(cache, forKey: .cache)
   }
 
   public init(from decoder: Decoder) throws {
@@ -273,6 +305,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
       maxTokens: try c.decode(Int.self, forKey: .maxTokens)
     )
     self.speculation = try c.decodeIfPresent(ChatSpeculation.self, forKey: .speculation)
+    self.cache = try c.decodeIfPresent(ChatCacheDirective.self, forKey: .cache)
   }
 }
 

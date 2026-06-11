@@ -485,6 +485,7 @@ public final class ChatSendController: ObservableObject {
   }
 
   private static func makeRequest(chat: Chat, options: ChatSendRequestOptions) -> ChatRequest {
+    let turns = transcriptTurns(chat: chat, options: options)
     // Authoritative speculation coupling (#426). An enabled-speculation
     // profile is a greedy "Fast Think" profile: the chat-apc drafter only
     // engages when the request is greedy (temperature 0, #418), so force it
@@ -512,12 +513,22 @@ public final class ChatSendController: ObservableObject {
           topP: options.sampling.topP,
           maxTokens: effectiveMaxTokens)
       : ChatSampling(temperature: 0, topP: options.sampling.topP, maxTokens: effectiveMaxTokens)
+    // #522: per-chat prefix-cache directive. The chat id is the thread
+    // key; `turn` is the message count at send time (diagnostics — the
+    // inferlet content-addresses snapshots, so identity comes from the
+    // tokens, not this counter). Sampling/speculation changes do not
+    // affect the snapshot key, so a same-model profile switch still reuses
+    // the prefix; a changed model or system prompt shows up as different
+    // tokens and misses. Reuse is correctness-safe by construction
+    // (see chat-apc `prefix_cache`), so it is on for every chat.
+    let cache = ChatCacheDirective(key: chat.id.uuidString, turn: turns.count)
     return ChatRequest(
       model: options.modelID,
-      messages: transcriptTurns(chat: chat, options: options),
+      messages: turns,
       sampling: sampling,
       stream: true,
-      speculation: wireSpec
+      speculation: wireSpec,
+      cache: cache
     )
   }
 
