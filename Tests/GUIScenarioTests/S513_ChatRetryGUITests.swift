@@ -25,7 +25,7 @@ final class S513_ChatRetryGUITests: XCTestCase {
                                 "\(Self.configPath) must define PIE_TEST_ENGINE_BASE_URL")
     let pieHome = try XCTUnwrap(config["PIE_TEST_GUI_HOME"],
                                 "\(Self.configPath) must define PIE_TEST_GUI_HOME")
-    let model = config["PIE_TEST_CHAT_MODEL"] ?? "gui-stream-deterministic"
+    let model = config["PIE_TEST_CHAT_MODEL_PIN"] ?? "gui-stream-deterministic"
 
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
     app.launchArguments.append(contentsOf: [
@@ -34,7 +34,12 @@ final class S513_ChatRetryGUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = model
+    // #504: the send-gate bypass (`PIE_TEST_CHAT_MODEL`) is retired — pass
+    // the REAL gate instead: new chats are pinned to the mock's model id
+    // (`ChatCreation` seeds `Chat.modelID` from the PIN seam) and the
+    // engine is pinned `.running` on the mock's port.
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = model
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     // No real background helper in this harness — pin the health ladder so
     // the #496 recovery overlay never covers the transcript (chat traffic
     // goes straight to the mock via PIE_TEST_ENGINE_BASE_URL).
