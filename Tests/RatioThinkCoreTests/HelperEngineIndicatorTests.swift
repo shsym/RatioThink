@@ -7,7 +7,7 @@ import XCTest
 /// folding so the view stays a dumb renderer.
 final class HelperEngineIndicatorTests: XCTestCase {
 
-  private let err = EngineIndicatorError(kind: .engineFailed, title: "Engine failed", message: "x", invitesModelChoice: false)
+  private let err = EngineIndicatorError(kind: .engineFailed, title: "Engine failed", message: "x")
 
   // MARK: - engine dot LED language
 
@@ -49,10 +49,12 @@ final class HelperEngineIndicatorTests: XCTestCase {
     XCTAssertEqual(dot, .led(StatusLED(tint: .greenWhite, blink: false)))
   }
 
-  func test_healthy_loading_showsProgressRing_notDot() {
-    let (ring, dot) = HelperEngineIndicator.make(helper: .healthy, engine: .loading(modelID: "m", fraction: 0.5))
+  func test_healthy_starting_showsAmberDot() {
+    // #469: a model switch is an engine restart (`.starting`), not a separate
+    // load — it reads as the amber starting LED, not a progress ring.
+    let (ring, dot) = HelperEngineIndicator.make(helper: .healthy, engine: .starting(detail: "Engine starting…"))
     XCTAssertNil(ring)
-    XCTAssertEqual(dot, .progressRing(fraction: 0.5))
+    XCTAssertEqual(dot, .led(StatusLED(tint: .white, blink: true)))
   }
 
   func test_reconnecting_keeps_last_engine_dot_under_white_ring() {

@@ -1,6 +1,6 @@
 import AppKit
 
-/// Renders the RatioThink brand mark — a rounded, downward-pointing
+/// Renders the Rational brand mark — a rounded, downward-pointing
 /// triangle (the app-icon glyph, see `Resources/AppIcon/`) — as a
 /// menu-bar status image (#424).
 ///

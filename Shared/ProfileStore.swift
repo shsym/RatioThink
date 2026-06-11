@@ -142,6 +142,75 @@ public struct ProfileStoreSnapshot {
   }
 }
 
+/// Minimal profile identity shown when a model delete would clear one
+/// or more profile defaults.
+public struct ProfileModelReference: Equatable, Sendable {
+  public let id: String
+  public let name: String
+
+  public init(id: String, name: String) {
+    self.id = id
+    self.name = name
+  }
+}
+
+public enum ProfileModelDefaultsRollbackState: Equatable, Sendable, CustomStringConvertible {
+  case notNeeded
+  case succeeded
+  case failed(String)
+
+  public var description: String {
+    switch self {
+    case .notNeeded:
+      return "no profile defaults needed restoration"
+    case .succeeded:
+      return "profile defaults were restored"
+    case .failed(let reason):
+      return "profile defaults could not be fully restored: \(reason)"
+    }
+  }
+}
+
+public struct ProfileModelDefaultsOperationResult<Output> {
+  public let affectedProfiles: [ProfileModelReference]
+  public let output: Output
+
+  public init(affectedProfiles: [ProfileModelReference], output: Output) {
+    self.affectedProfiles = affectedProfiles
+    self.output = output
+  }
+}
+
+public enum ProfileModelDefaultsTransactionError: Error, CustomStringConvertible {
+  case clearFailed(
+    modelID: String,
+    cleared: [ProfileModelReference],
+    underlying: String,
+    rollback: ProfileModelDefaultsRollbackState
+  )
+  case operationFailed(
+    modelID: String,
+    cleared: [ProfileModelReference],
+    underlying: String,
+    rollback: ProfileModelDefaultsRollbackState
+  )
+
+  public var description: String {
+    switch self {
+    case .clearFailed(let modelID, let cleared, let underlying, let rollback):
+      return "Clearing profile defaults for \(modelID) failed after \(cleared.count) profile(s) changed: \(underlying); \(rollback)"
+    case .operationFailed(let modelID, let cleared, let underlying, let rollback):
+      return "Model operation for \(modelID) failed after clearing \(cleared.count) profile default(s): \(underlying); \(rollback)"
+    }
+  }
+}
+
+private struct ProfileModelDefaultTarget {
+  let profile: Profile
+  let filename: String
+  let reference: ProfileModelReference
+}
+
 /// Watches `~/Library/Application Support/RatioThink/profiles/` (or any
 /// directory passed at init) via `DispatchSource.makeFileSystemObject
 /// Source`. Reloads on change, parses each `*.toml` file, surfaces
@@ -174,6 +243,24 @@ public final class ProfileStore: ObservableObject {
   /// `directory.deletingLastPathComponent()/active-profile`.
   public let activeProfileURL: URL
 
+  /// On-disk location of the durable active-MODEL marker (#469) — one line
+  /// of UTF-8 holding the slug of the model the engine was last (re)launched
+  /// with. Distinct from each profile's `.toml` default: a plain model pick
+  /// records the active model here WITHOUT clobbering the profile's saved
+  /// default, and the Helper's menu-bar Resume / crash auto-relaunch boot
+  /// THIS marker (precedence: explicit XPC override > this marker > profile
+  /// default) so a stopped-engine Resume honors the user's last pick instead
+  /// of silently reverting to the profile default.
+  ///
+  /// Sibling of `activeProfileURL` (outside `directory`, so the FS watcher's
+  /// `*.toml` scan is unaffected). Written by the Helper's
+  /// `LaunchSpecResolver` on every successful launch resolve and read by
+  /// `HelperResumeAction`; the App never touches it (it routes picks through
+  /// the `startEngine`/`restartEngine` XPC override). Tests inject a custom
+  /// URL; production defaults to
+  /// `directory.deletingLastPathComponent()/active-model`.
+  public let activeModelURL: URL
+
   /// Debounce window for FS-event coalescing. The system fires
   /// multiple `.write` events for a single `mv tmp final.toml`
   /// rename; coalescing avoids a thundering-herd of rescans.
@@ -196,7 +283,7 @@ public final class ProfileStore: ObservableObject {
   /// HF repo the seeded default lives in — the SAME repo the recommended
   /// curated entry downloads from. Used by the resolver's HF-cache
   /// fallback (`LaunchSpecResolver.hfIdentity`) when the model is not
-  /// staged in RatioThink's app models directory.
+  /// staged in Rational's app models directory.
   public static let defaultChatHFRepoID = "Qwen/Qwen3-0.6B-GGUF"
 
   public static let defaultChatTOML: String = """
@@ -216,6 +303,38 @@ public final class ProfileStore: ObservableObject {
 
   /// Filename written by `seedDefaultsIfEmpty()` on first launch.
   public static let defaultChatFilename = "chat.toml"
+
+  /// Example tree-of-thought profile (#413) seeded alongside `chat.toml`
+  /// on first launch so the live tree-search feature is reachable: the
+  /// user just switches to it. Reuses the same default model + the
+  /// `chat-apc` inferlet (ToT is a per-request dispatch mode, not a
+  /// separate wasm); `inferlet_args.mode = "tree-of-thought"` is what
+  /// `Profile.treeOfThought` keys on, and the breadth/depth/beam_width
+  /// are the bounded search shape (server-validated). The profiles editor
+  /// only displays `inferlet_args`, so seeding the file is how a user gets
+  /// a ToT profile without hand-editing TOML.
+  public static let treeOfThoughtFilename = "tree-of-thought.toml"
+  public static let treeOfThoughtTOML: String = """
+  id = "tree-of-thought"
+  name = "Tree of Thought"
+  icon = "point.3.connected.trianglepath.dotted"
+  model = "\(defaultChatModelID)"
+  inferlet = "chat-apc"
+  system_prompt = "You are a helpful assistant."
+
+  [sampling]
+  temperature = 0.7
+  top_p = 0.9
+  max_tokens = 2048
+
+  [inferlet_args]
+  mode = "tree-of-thought"
+  breadth = 3
+  depth = 2
+  beam_width = 2
+  max_tokens_per_node = 256
+
+  """
 
   /// Profile id encoded in `defaultChatTOML`. Also the value written
   /// to the `activeProfileURL` marker on first launch:
@@ -372,15 +491,27 @@ public final class ProfileStore: ObservableObject {
   public init(
     directory: URL,
     activeProfileURL: URL? = nil,
-    queue: DispatchQueue = DispatchQueue(label: "com.ratiothink.profile-store")
+    activeModelURL: URL? = nil,
+    queue: DispatchQueue = DispatchQueue(label: "com.ratiothink.profile-store"),
+    seedsExampleProfiles: Bool = true
   ) {
     self.directory = directory
     self.activeProfileURL = activeProfileURL
       ?? directory.deletingLastPathComponent()
         .appendingPathComponent("active-profile", isDirectory: false)
+    self.activeModelURL = activeModelURL
+      ?? directory.deletingLastPathComponent()
+        .appendingPathComponent("active-model", isDirectory: false)
     self.queue = queue
+    self.seedsExampleProfiles = seedsExampleProfiles
     queue.setSpecific(key: queueKey, value: ())
   }
+
+  /// When false, `start()` skips the #413 tree-of-thought example-profile
+  /// backfill. Production defaults to true; scan/lifecycle tests that
+  /// assert exact directory contents pass false to keep their fixture
+  /// hermetic.
+  private let seedsExampleProfiles: Bool
 
   /// Run `work` on `queue` exactly once: inline when the caller is
   /// already on `queue` (listener callback, post-reload work),
@@ -449,6 +580,11 @@ public final class ProfileStore: ObservableObject {
     // directory but does NOT touch the marker.
     queue.sync {
       let seed = self.seedDefaultsIfEmpty()
+      // #413: backfill the example tree-of-thought profile if absent —
+      // runs BEFORE the `reloadLocked()` scan below so the first snapshot
+      // already lists it. Independent of the dir-empty seed, so existing
+      // installs get it too.
+      self.backfillTreeOfThoughtProfile()
       // Ensure the built-in Fast Think profile exists even on installs
       // that already seeded chat.toml (the empty-dir seed above is a no-op
       // there). Runs before `reloadLocked()` below so the initial scan
@@ -640,6 +776,60 @@ public final class ProfileStore: ObservableObject {
     }
   }
 
+  // MARK: - active model marker (#469)
+
+  /// The model slug the engine was last (re)launched with, read from the
+  /// durable `activeModelURL` marker. `nil` when the marker is absent, empty,
+  /// or unreadable — the caller (`HelperResumeAction`) then falls back to the
+  /// profile's `.toml` default.
+  ///
+  /// Read on demand (only at menu-bar Resume / crash auto-relaunch — both
+  /// rare), so no in-memory mirror or FS-watch is kept: the resolver's
+  /// `setActiveModelID` atomic write is the single on-disk source of truth,
+  /// and the Helper writes + reads it in one process. The atomic write
+  /// (temp + rename) means a concurrent read sees the old or new file whole,
+  /// never a torn line — no lock needed.
+  public var activeModelID: String? {
+    guard let data = try? Data(contentsOf: activeModelURL),
+          let raw = String(data: data, encoding: .utf8) else {
+      return nil
+    }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  /// Persist `id` as the active model. Atomic write (temp + rename) so a
+  /// crashed write never leaves a half-line a later Resume misreads. Called
+  /// by `LaunchSpecResolver.resolveLauncherSpec` on every successful launch
+  /// resolve, so the marker always reflects the model the engine was last
+  /// asked to serve. Throws on an I/O failure (the caller uses `try?` —
+  /// recording the active model is best-effort and must never fail a launch).
+  public func setActiveModelID(_ id: String) throws {
+    let parent = activeModelURL.deletingLastPathComponent()
+    try FileManager.default.createDirectory(at: parent,
+                                            withIntermediateDirectories: true)
+    do {
+      try id.write(to: activeModelURL, atomically: true, encoding: .utf8)
+    } catch {
+      Log.store.error("setActiveModelID: write to \(self.activeModelURL.path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+      throw error
+    }
+  }
+
+  /// Forget the active-model selection. Removes the on-disk marker; safe to
+  /// call when the file is already absent. A subsequent Resume then boots the
+  /// profile default.
+  public func clearActiveModelID() throws {
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: activeModelURL.path) else { return }
+    do {
+      try fm.removeItem(at: activeModelURL)
+    } catch {
+      Log.store.error("clearActiveModelID: remove of \(self.activeModelURL.path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+      throw error
+    }
+  }
+
   // MARK: - per-profile default model
 
   /// The model a profile carries as its default. This is the value the
@@ -649,7 +839,34 @@ public final class ProfileStore: ObservableObject {
   /// `modelForProfile` in `ProfileSwapCoordinator` is wired to this.
   public func model(forProfileID id: String) -> String? {
     stateLock.withLock {
-      _entries.first { $0.profile?.id == id }?.profile?.model
+      guard let model = _entries.first(where: { $0.profile?.id == id })?.profile?.model,
+            !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+      }
+      return model
+    }
+  }
+
+  /// Valid profiles whose default model is exactly `modelID`, in the
+  /// same stable order as `entries`. Used before deleting an installed
+  /// model so the confirmation can name/count affected profiles.
+  public func profilesReferencingModel(_ modelID: String) -> [ProfileModelReference] {
+    stateLock.withLock {
+      _entries.compactMap { entry in
+        guard let profile = entry.profile,
+              profile.model == modelID else { return nil }
+        return ProfileModelReference(id: profile.id, name: profile.name)
+      }
+    }
+  }
+
+  /// The full parsed `Profile` for `id`, or nil when the id is absent or
+  /// its file failed to parse. The chat send path reads this to detect a
+  /// tree-of-thought profile (`Profile.treeOfThought`) and route the turn
+  /// to the ToT dispatch (#413); ordinary callers want `model(forProfileID:)`.
+  public func profile(forProfileID id: String) -> Profile? {
+    stateLock.withLock {
+      _entries.first { $0.profile?.id == id }?.profile
     }
   }
 
@@ -664,6 +881,7 @@ public final class ProfileStore: ObservableObject {
       _entries.first { $0.profile?.id == id }?.profile?.speculation
     }
   }
+
 
   /// Persist a new default `model` onto the profile with `id`, leaving
   /// every other field untouched. Writes back to the profile's own
@@ -682,6 +900,118 @@ public final class ProfileStore: ObservableObject {
     var updated = target.profile
     updated.model = model
     try createProfile(updated, filename: target.filename)
+  }
+
+  /// Clear a profile's default model, preserving every other field and
+  /// keeping the profile parseable as an explicit no-default state.
+  public func clearModel(forProfileID id: String) throws {
+    let target: (profile: Profile, filename: String) = try stateLock.withLock {
+      guard let entry = _entries.first(where: { $0.profile?.id == id }),
+            let profile = entry.profile else {
+        throw ProfileStoreError.profileNotFound(id: id)
+      }
+      return (profile, entry.url.lastPathComponent)
+    }
+    var updated = target.profile
+    updated.model = nil
+    try createProfile(updated, filename: target.filename)
+  }
+
+  /// Clear every valid profile whose default references `modelID`.
+  /// Matching is exact; no fallback model is selected. If any profile
+  /// write fails mid-batch, earlier writes are restored before the
+  /// error is surfaced so callers do not observe silently partial
+  /// no-default state.
+  @discardableResult
+  public func clearModelDefaults(referencing modelID: String) throws -> [ProfileModelReference] {
+    try withClearedModelDefaults(referencing: modelID) { () }.affectedProfiles
+  }
+
+  /// Temporarily clear every default referencing `modelID`, perform a
+  /// caller-supplied operation, and restore the original defaults if
+  /// that operation fails. This lets model deletion treat the profile
+  /// cleanup and Trash move as one recoverable operation: a failed
+  /// Trash move cannot leave profiles silently cleared.
+  @discardableResult
+  public func withClearedModelDefaults<Output>(
+    referencing modelID: String,
+    operation: () throws -> Output
+  ) throws -> ProfileModelDefaultsOperationResult<Output> {
+    try withClearedModelDefaults(
+      referencing: modelID,
+      writeProfile: { [self] profile, filename in
+        try createProfile(profile, filename: filename)
+      },
+      operation: operation
+    )
+  }
+
+  @discardableResult
+  internal func withClearedModelDefaults<Output>(
+    referencing modelID: String,
+    writeProfile: (Profile, String) throws -> Void,
+    operation: () throws -> Output
+  ) throws -> ProfileModelDefaultsOperationResult<Output> {
+    let targets: [ProfileModelDefaultTarget] = stateLock.withLock {
+      _entries.compactMap { entry in
+        guard let profile = entry.profile,
+              profile.model == modelID else { return nil }
+        return ProfileModelDefaultTarget(
+          profile: profile,
+          filename: entry.url.lastPathComponent,
+          reference: ProfileModelReference(id: profile.id, name: profile.name)
+        )
+      }
+    }
+    var cleared: [ProfileModelDefaultTarget] = []
+    do {
+      for target in targets {
+        var updated = target.profile
+        updated.model = nil
+        try writeProfile(updated, target.filename)
+        cleared.append(target)
+      }
+    } catch {
+      let rollback = restoreModelDefaultTargets(cleared, writeProfile: writeProfile)
+      throw ProfileModelDefaultsTransactionError.clearFailed(
+        modelID: modelID,
+        cleared: cleared.map(\.reference),
+        underlying: String(describing: error),
+        rollback: rollback
+      )
+    }
+
+    do {
+      let output = try operation()
+      return ProfileModelDefaultsOperationResult(
+        affectedProfiles: targets.map(\.reference),
+        output: output
+      )
+    } catch {
+      let rollback = restoreModelDefaultTargets(cleared, writeProfile: writeProfile)
+      throw ProfileModelDefaultsTransactionError.operationFailed(
+        modelID: modelID,
+        cleared: cleared.map(\.reference),
+        underlying: String(describing: error),
+        rollback: rollback
+      )
+    }
+  }
+
+  private func restoreModelDefaultTargets(
+    _ targets: [ProfileModelDefaultTarget],
+    writeProfile: (Profile, String) throws -> Void
+  ) -> ProfileModelDefaultsRollbackState {
+    guard !targets.isEmpty else { return .notNeeded }
+    var failures: [String] = []
+    for target in targets.reversed() {
+      do {
+        try writeProfile(target.profile, target.filename)
+      } catch {
+        failures.append("\(target.reference.id): \(error)")
+      }
+    }
+    return failures.isEmpty ? .succeeded : .failed(failures.joined(separator: "; "))
   }
 
   /// Persist `id` as the active profile. Writes atomically to
@@ -976,6 +1306,36 @@ public final class ProfileStore: ObservableObject {
   /// against a populated directory is a no-op for the chat.toml seed,
   /// and the marker seed uses exclusive-create semantics so a
   /// concurrent process's marker always wins (review v1 F3).
+  /// #413: ensure the example tree-of-thought profile exists so the live
+  /// tree-search feature is reachable (the user just switches to it).
+  ///
+  /// Unlike `seedDefaultsIfEmpty` (which writes only when the profiles dir
+  /// is TRULY EMPTY = fresh install), this WRITE-IF-ABSENT backfill runs on
+  /// every `start()`, so an EXISTING install — whose dir already holds
+  /// `chat.toml` from before #413, making the seed a no-op — gets the
+  /// profile too. It never clobbers a user-edited copy (writes only when
+  /// the file is missing). Best-effort: a failure must NOT fail `start()`
+  /// (the user can still chat). The Settings editor only DISPLAYS
+  /// `inferlet_args`, so seeding the file is the only way a user gets a ToT
+  /// profile without hand-writing TOML.
+  ///
+  /// Runs on `queue` (called from `start()` inside `queue.sync`). Does not
+  /// touch the active-profile marker — `chat` stays the default; ToT is
+  /// opt-in via the picker.
+  private func backfillTreeOfThoughtProfile() {
+    guard seedsExampleProfiles else { return }
+    let target = directory.appendingPathComponent(Self.treeOfThoughtFilename)
+    guard !FileManager.default.fileExists(atPath: target.path) else { return }
+    do {
+      try Self.treeOfThoughtTOML.write(to: target, atomically: true, encoding: .utf8)
+      Log.store.info("backfilled tree-of-thought profile at \(target.path, privacy: .public)")
+    } catch {
+      Log.store.error(
+        "backfill tree-of-thought profile failed (non-fatal): \(String(describing: error), privacy: .public)"
+      )
+    }
+  }
+
   private func seedDefaultsIfEmpty() -> SeedResult {
     let existing = (try? FileManager.default.contentsOfDirectory(
       at: directory,
@@ -1002,6 +1362,11 @@ public final class ProfileStore: ObservableObject {
         markerError: nil
       )
     }
+
+    // #413: the example tree-of-thought profile is NOT written here. It is
+    // backfilled by `backfillTreeOfThoughtProfile()` (write-if-absent on
+    // every start), so EXISTING installs — whose profiles dir is non-empty,
+    // making this seed a no-op — get it too, not just fresh installs.
 
     // : pair the chat.toml seed with an active-profile
     // marker so the first-run menu-bar Resume click resolves into a

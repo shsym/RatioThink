@@ -17,7 +17,7 @@ import Foundation
 ///   on `ChatRequest` that flattens `ChatSampling` onto the top
 ///   level, and on `InferletRequest` that embeds `input` as an
 ///   inline JSON sub-tree rather than a base64 blob.
-/// - **Streaming events** (`LoadEvent`, `ChatEvent`) are
+/// - **Streaming events** (`ChatEvent`) are
 ///   decoder-output types, NOT direct Codable mirrors of the wire.
 ///   Their on-the-wire counterparts are OpenAI-style SSE frames
 ///   (`data: {...}\n\n`) parsed by a separate frame decoder in
@@ -40,8 +40,8 @@ import Foundation
 /// Response shape of GET /healthz (design doc §HTTP API):
 /// `{"status":"ok","model":"<id>","uptime_s":…}`. `loadedModel` is
 /// optional because the engine starts up with no model resident — the
-/// healthz handler reports `"model": null` until the first
-/// `loadModel`/inferlet activation. Modeling that as `String?` keeps
+/// healthz handler reports `"model": null` until the engine boots with a
+/// model registered. Modeling that as `String?` keeps
 /// the GUI from string-matching `"none"`/`""` sentinels.
 public struct EngineHealth: Codable, Equatable, Sendable {
   public enum Status: String, Codable, Sendable {
@@ -86,17 +86,27 @@ public struct ModelInfo: Codable, Equatable, Sendable, Identifiable {
   /// authoritatively quote. The chat UI sorts by `id` for now;
   /// `created` returns when pie surfaces a registration timestamp.
   public let created: Date?
+  /// The effective per-request `max_tokens` ceiling the launched engine
+  /// will accept for this model (#474): chat-apc reports the runtime's
+  /// `max-output-tokens` — the memory-aware scheduler `default_token_limit`
+  /// (#438) capped by raw KV capacity. The App clamps its profile
+  /// `max_tokens` down to this before sending so a memory-squeezed launch
+  /// never trips the engine's clean 400. Optional so a pre-#474 engine
+  /// (no field) decodes to `nil` = "ceiling unknown, do not clamp".
+  public let maxOutputTokens: Int?
 
-  public init(id: String, ownedBy: String, created: Date? = nil) {
+  public init(id: String, ownedBy: String, created: Date? = nil, maxOutputTokens: Int? = nil) {
     self.id = id
     self.ownedBy = ownedBy
     self.created = created
+    self.maxOutputTokens = maxOutputTokens
   }
 
   private enum CodingKeys: String, CodingKey {
     case id
     case ownedBy = "owned_by"
     case created
+    case maxOutputTokens = "max_output_tokens"
   }
 }
 
@@ -191,6 +201,72 @@ public struct ChatSpeculation: Codable, Equatable, Sendable {
   }
 }
 
+/// #522 cross-request KV prefix-cache directive. Rides as a nested
+/// `"cache": {…}` object matching the inferlet's `CacheDirective` schema.
+/// Carries the local thread key (the chat id), the expected turn boundary,
+/// a compatibility/version marker the App bumps to force misses on schema
+/// or template drift, and the reuse policy. The inferlet content-addresses
+/// snapshots, so this directive scopes/attributes them per chat and gates
+/// reuse — it does not, by itself, make any unsafe reuse possible.
+public struct ChatCacheDirective: Codable, Equatable, Sendable {
+  /// Schema/template compatibility marker. Bump to invalidate every
+  /// snapshot the App previously caused to be saved.
+  public static let compatVersion = "1"
+
+  public let key: String
+  public let turn: Int
+  public let compat: String
+  public let policy: String
+  /// Optional #524 retention budget. Values must come from #517's
+  /// authoritative pie `model_status` counters; nil means "do not ask the
+  /// inferlet to evict on this request" rather than estimating.
+  public let retention: ChatCacheRetentionDirective?
+
+  public init(key: String,
+              turn: Int,
+              compat: String = ChatCacheDirective.compatVersion,
+              policy: String = "auto",
+              retention: ChatCacheRetentionDirective? = nil) {
+    self.key = key
+    self.turn = turn
+    self.compat = compat
+    self.policy = policy
+    self.retention = retention
+  }
+}
+
+/// #524 APC retention budget passed through the chat-apc `cache.retention`
+/// object. The App only constructs this from runtime/inferlet-backed
+/// `KVUsageSnapshot` data; the inferlet treats absent/invalid accounting as
+/// a safe no-eviction diagnostic.
+public struct ChatCacheRetentionDirective: Codable, Equatable, Sendable {
+  public let kvPagesUsed: Int
+  public let kvPagesTotal: Int
+  public let softPercent: Int
+  public let evictPercent: Int
+  public let hardPercent: Int
+
+  public init(kvPagesUsed: Int,
+              kvPagesTotal: Int,
+              softPercent: Int = 70,
+              evictPercent: Int = 80,
+              hardPercent: Int = 95) {
+    self.kvPagesUsed = kvPagesUsed
+    self.kvPagesTotal = kvPagesTotal
+    self.softPercent = softPercent
+    self.evictPercent = evictPercent
+    self.hardPercent = hardPercent
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case kvPagesUsed = "kv_pages_used"
+    case kvPagesTotal = "kv_pages_total"
+    case softPercent = "soft_percent"
+    case evictPercent = "evict_percent"
+    case hardPercent = "hard_percent"
+  }
+}
+
 /// Body of POST /v1/chat/completions. `stream` is required on the wire
 /// (engine has different code paths for streaming vs non-streaming); we
 /// expose it but `EngineClient.chatCompletion` only models the streaming
@@ -213,17 +289,22 @@ public struct ChatRequest: Codable, Equatable, Sendable {
   /// Optional chat-apc speculation extension. `nil` → no `speculation`
   /// key on the wire (normal decode). Nested-encoded (not flattened).
   public let speculation: ChatSpeculation?
+  /// #522 prefix-cache directive. `nil` → no `cache` key on the wire
+  /// (reuse disabled, byte-identical to pre-#522). Nested-encoded.
+  public let cache: ChatCacheDirective?
 
   public init(model: String,
               messages: [ChatMessage],
               sampling: ChatSampling = ChatSampling(),
               stream: Bool = true,
-              speculation: ChatSpeculation? = nil) {
+              speculation: ChatSpeculation? = nil,
+              cache: ChatCacheDirective? = nil) {
     self.model = model
     self.messages = messages
     self.sampling = sampling
     self.stream = stream
     self.speculation = speculation
+    self.cache = cache
   }
 
   /// Flat wire keys for sampling. No `sampling` envelope — OpenAI's
@@ -239,6 +320,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     case topP = "top_p"
     case maxTokens = "max_tokens"
     case speculation
+    case cache
   }
 
   public func encode(to encoder: Encoder) throws {
@@ -250,6 +332,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     try c.encode(sampling.topP, forKey: .topP)
     try c.encode(sampling.maxTokens, forKey: .maxTokens)
     try c.encodeIfPresent(speculation, forKey: .speculation)
+    try c.encodeIfPresent(cache, forKey: .cache)
   }
 
   public init(from decoder: Decoder) throws {
@@ -263,6 +346,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
       maxTokens: try c.decode(Int.self, forKey: .maxTokens)
     )
     self.speculation = try c.decodeIfPresent(ChatSpeculation.self, forKey: .speculation)
+    self.cache = try c.decodeIfPresent(ChatCacheDirective.self, forKey: .cache)
   }
 }
 
@@ -396,22 +480,13 @@ internal enum JSONValue: Codable, Equatable, Sendable {
 
 // MARK: - Events
 
-/// One frame of /v1/models/load (or the SSE meta-frame prefix on a chat
-/// stream). `loading` carries the byte counters the design doc pins on
-/// the meta-frame schema; `etaSeconds` is optional because the engine
-/// only reports it once it has a transfer-rate sample. Closed enum so a
-/// `switch` in the loading-indicator view is exhaustive.
-public enum LoadEvent: Equatable, Sendable {
-  case loading(loadedBytes: UInt64, totalBytes: UInt64, etaSeconds: Double?)
-  case ready
-}
-
 /// One SSE frame from POST /v1/chat/completions. Maps 1:1 to the wire
 /// schema:
 /// - `.modelLoading` / `.modelReady` are the meta-frame prefix (design
-///   doc §SSE meta-frame schema). The GUI feeds them straight into
-///   `ModelLoadCenter` — same observable a bare `loadModel` call drives,
-///   so the loading indicator's source-of-truth doesn't bifurcate.
+///   doc §SSE meta-frame schema). v1 pie binds its model at boot, so
+///   `.modelLoading` never arrives in practice; `.modelReady` confirms the
+///   engine is serving the model for this turn and is fed to
+///   `ModelLoadCenter.reconcileEngineResident` (#469).
 /// - `.delta` is OpenAI's `choices[0].delta`. `role` only appears on
 ///   the first delta of a turn; subsequent deltas carry content alone.
 /// - `.reasoningDelta` is OpenAI's `choices[0].delta.reasoning_content`
@@ -431,6 +506,7 @@ public enum ChatEvent: Equatable, Sendable {
   case modelReady
   case delta(role: ChatMessage.Role?, content: String)
   case reasoningDelta(String)
+  case generationMetrics(GenerationMetrics)
   case finish(reason: FinishReason)
 
   public enum FinishReason: Equatable, Sendable {
@@ -438,6 +514,24 @@ public enum ChatEvent: Equatable, Sendable {
     case length
     case cancelled
     case other(String)
+  }
+}
+
+public struct GenerationMetrics: Codable, Equatable, Sendable {
+  public let outputTokens: Int
+  public let elapsedSeconds: Double
+  public let tokensPerSecond: Double
+
+  public init(outputTokens: Int, elapsedSeconds: Double, tokensPerSecond: Double) {
+    self.outputTokens = outputTokens
+    self.elapsedSeconds = elapsedSeconds
+    self.tokensPerSecond = tokensPerSecond
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case outputTokens = "output_tokens"
+    case elapsedSeconds = "elapsed_s"
+    case tokensPerSecond = "tokens_per_sec"
   }
 }
 
@@ -462,7 +556,6 @@ public enum ChatEvent: Equatable, Sendable {
 public protocol EngineClient: Sendable {
   func health() async throws -> EngineHealth
   func models() async throws -> [ModelInfo]
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error>
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error>
   func dispatchInferlet(_ req: InferletRequest) -> AsyncThrowingStream<Data, Error>
 }

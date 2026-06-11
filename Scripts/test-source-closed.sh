@@ -105,4 +105,21 @@ else
   echo "FAIL: restore trap/flag not armed before launchctl bootout (arm=$arm_ln trap=$trap_ln mut=$mut_ln)"; fails=$((fails+1))
 fi
 
+# --- rename migration: installer keeps build identity, installs Rational ---
+if grep -q 'xcodebuild -project RatioThink.xcodeproj -scheme RatioThink' "$INSTALL"; then
+  echo "ok:  install-app builds kept project/scheme identity (RatioThink.xcodeproj / RatioThink)"
+else
+  echo "FAIL: install-app must build kept project/scheme identity RatioThink.xcodeproj / RatioThink"; fails=$((fails+1))
+fi
+if grep -q '/Rational.app"' "$INSTALL"; then
+  echo "ok:  install-app still resolves produced app as Rational.app"
+else
+  echo "FAIL: install-app must resolve the produced app bundle as Rational.app"; fails=$((fails+1))
+fi
+if grep -q 'RatioThinkHelper' "$INSTALL"; then
+  echo "ok:  install-app explicitly reaps/checks legacy RatioThinkHelper during migration"
+else
+  echo "FAIL: install-app must include legacy RatioThinkHelper in stale helper cleanup"; fails=$((fails+1))
+fi
+
 if [ "$fails" -eq 0 ]; then echo "PASS: source-closed/enable/signal"; exit 0; else echo "FAIL: $fails check(s)"; exit 1; fi

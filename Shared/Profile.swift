@@ -50,7 +50,10 @@ public struct Profile {
   public var id: String
   public var name: String
   public var icon: String?
-  public var model: String
+  /// Default model slug for this profile. `nil` is an explicit
+  /// no-default state: the UI should prompt the operator to choose or
+  /// download a model instead of inventing a fallback.
+  public var model: String?
   public var inferlet: String
   public var systemPrompt: String?
   public var sampling: Sampling
@@ -66,7 +69,7 @@ public struct Profile {
     id: String,
     name: String,
     icon: String? = nil,
-    model: String,
+    model: String?,
     inferlet: String,
     systemPrompt: String? = nil,
     sampling: Sampling = Sampling(),
@@ -103,7 +106,8 @@ public struct Profile {
 
     let id       = try requireString("id")
     let name     = try requireString("name")
-    let model    = try requireString("model")
+    let rawModel = table["model"]?.string?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let model    = rawModel?.isEmpty == false ? rawModel : nil
     let inferlet = try requireString("inferlet")
 
     let icon = table["icon"]?.string
@@ -187,10 +191,11 @@ public struct Profile {
     table.remove(at: "system_prompt")
     table.remove(at: "inferlet_args")
     table.remove(at: "speculation")
+    table.remove(at: "model")
     table["id"]       = TOMLValue(stringLiteral: id)
     table["name"]     = TOMLValue(stringLiteral: name)
-    table["model"]    = TOMLValue(stringLiteral: model)
     table["inferlet"] = TOMLValue(stringLiteral: inferlet)
+    if let model, !model.isEmpty { table["model"] = TOMLValue(stringLiteral: model) }
     if let icon { table["icon"] = TOMLValue(stringLiteral: icon) }
     if let systemPrompt { table["system_prompt"] = TOMLValue(stringLiteral: systemPrompt) }
     let samplingTable = TOMLTable([

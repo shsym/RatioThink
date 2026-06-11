@@ -3,7 +3,7 @@ import Foundation
 /// Where a discovered model lives, which decides what the app may do
 /// with it.
 public enum CachedModelSource: String, Equatable, Sendable {
-  /// Staged in RatioThink's app-managed models directory
+  /// Staged in Rational's app-managed models directory
   /// (`PieDirs.models()`) — imported or downloaded through the app, and
   /// deletable from it.
   case appManaged

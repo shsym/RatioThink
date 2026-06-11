@@ -8,7 +8,7 @@ import XCTest
 final class StatusBannerReducerTests: XCTestCase {
   private let policy = StatusTierPolicy(tier1Polls: 15, tier2Polls: 30)
 
-  private func banner(engine: EngineStatus = .running(port: 8080, profileID: "chat"),
+  private func banner(engine: EngineStatus = .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
                       wasEverRunning: Bool = true,
                       helper: HelperHealth = .healthy,
                       engineGonePolls: Int = 0) -> UnifiedStatusBanner? {
@@ -19,7 +19,7 @@ final class StatusBannerReducerTests: XCTestCase {
   // MARK: - Tier 0 (silent)
 
   func test_running_or_stopped_or_starting_with_healthy_helper_is_silent() {
-    XCTAssertNil(banner(engine: .running(port: 8080, profileID: "chat")))
+    XCTAssertNil(banner(engine: .running(EngineSessionSnapshot(port: 8080, profileID: "chat"))))
     XCTAssertNil(banner(engine: .stopped))
     XCTAssertNil(banner(engine: .starting, wasEverRunning: false))
   }
@@ -71,7 +71,17 @@ final class StatusBannerReducerTests: XCTestCase {
       let b = banner(engine: .failed(code: code, message: "boom"))
       XCTAssertEqual(b?.tier, .error, "\(code) must be Tier 2")
       XCTAssertEqual(b?.source, .engine)
-      XCTAssertEqual(b?.forceRestart, .engine)
+    }
+    // #477: Force Restart only where the taxonomy says a restart is the
+    // fix — a model-choice fault would re-fail on restart, so it offers
+    // none (the indicator banner carries the Model-menu hint instead).
+    XCTAssertEqual(
+      banner(engine: .failed(code: .spawnFailed, message: "boom"))?.forceRestart, .engine)
+    for code in [EngineErrorCode.modelMissing, .memoryRisk] {
+      XCTAssertEqual(
+        banner(engine: .failed(code: code, message: "boom"))?.forceRestart,
+        ForceRestartTarget.none,
+        "\(code) is a model-choice fault; Force Restart would re-fail")
     }
   }
 
@@ -79,7 +89,7 @@ final class StatusBannerReducerTests: XCTestCase {
 
   func test_helper_axis_outranks_engine_axis() {
     // Helper unreachable makes the reported engine status stale → helper wins.
-    let b = banner(engine: .running(port: 8080, profileID: "chat"), helper: .unreachable)
+    let b = banner(engine: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), helper: .unreachable)
     XCTAssertEqual(b?.source, .helper)
     XCTAssertEqual(b?.tier, .error)
   }

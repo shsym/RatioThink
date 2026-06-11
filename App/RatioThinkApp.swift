@@ -4,6 +4,11 @@ import ServiceManagement
 
 @main
 struct RatioThinkApp: App {
+  /// #448: window-close = background, ⌘Q / "Quit" / `ratiothink://quit` =
+  /// coordinated full quit. The delegate owns `applicationShouldTerminate`
+  /// (which SwiftUI's `App` does not expose) and
+  /// `applicationShouldTerminateAfterLastWindowClosed`.
+  @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
   /// One-shot guard so the launch-time Helper registration reconcile
   /// runs once even if a second window opens.
   @MainActor private static var didReconcileHelperRegistration = false
@@ -45,16 +50,26 @@ struct RatioThinkApp: App {
   /// and surfaced as the toolbar helper-ring + the escalation banner.
   @StateObject private var helperHealth: HelperHealthController
   @StateObject private var engineClientStore: EngineClientStore
+  /// #507: app-scoped per-chat send pipelines, so an in-flight stream
+  /// survives chat switches and multiple chats can stream concurrently.
+  /// Also feeds the #413 generation gate (any chat in flight → hold
+  /// failed helper polls).
+  @StateObject private var sendCoordinator: ChatSendCoordinator
   /// Phase 3.8 (review v2 F1): the Add Model sheet's `.queueDownload`
   /// outcome runs through this controller so the existing
   /// `ModelDownloader` is actually invoked. Lives at app scope so
   /// closing + reopening the Settings sheet does not orphan an
   /// in-flight download.
   @StateObject private var downloadController: ModelDownloadController
+  /// #514: the one live source of truth for local model availability
+  /// (scan results + in-flight downloads + completion reconciliation).
+  /// App-scoped beside the download controller it observes.
+  @StateObject private var modelLibrary: ModelLibraryStore
   /// #411: once-per-launch GitHub-Releases update check. App-scoped so the
   /// check (and its single network call) fires once per process; RootView
   /// observes `pending` to render the non-modal update banner.
   @StateObject private var updateAvailability = UpdateAvailabilityModel()
+  @StateObject private var settingsNavigation = SettingsNavigation()
 
   @MainActor
   init() {
@@ -88,7 +103,23 @@ struct RatioThinkApp: App {
             let port = EnginePort(exactly: rawPort) else { return nil }
       return port
     }()
+    // #381: a SECOND helperless GUI seam, distinct from the pinned-running pin
+    // above. The no-model → Load-default follow-through needs the engine to
+    // start STOPPED so the send gate raises its Load affordance, then become
+    // `.running` the instant the user taps Load — without a real Helper or
+    // `pie serve` (the heavy, seated-session-flaky start that wedged the path).
+    // The stub reports `.stopped` until `startEngine` is called, then
+    // `.running(port)` — the one fact the absent Helper would report once the
+    // engine is up — pointed at the same mock base URL. Its own DEBUG flag so a
+    // pinned-running launch (S302/S486) is unaffected.
+    let startToRunningPort: EnginePort? = {
+      guard ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_START_TO_RUNNING"] == "1",
+            let rawPort = testBaseURL?.port,
+            let port = EnginePort(exactly: rawPort) else { return nil }
+      return port
+    }()
     if let pinnedRunningPort {
+      let servedModelID = ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_SERVED_MODEL"] ?? ""
       // Inject a stub XPC client (NOT HelperXPCClient): the helperless
       // harness has no Helper, so a real stopEngine() during Unload would
       // throw and ChatScaffoldView.unloadModel would never reach
@@ -96,8 +127,16 @@ struct RatioThinkApp: App {
       // the pinned running status and accepts stopEngine as a no-op so
       // the Unload confirm path completes to .idle (#359 Path2).
       statusStore = EngineStatusStore(
-        client: PinnedRunningXPCClient(port: pinnedRunningPort),
-        initialStatus: .running(port: pinnedRunningPort, profileID: "chat")
+        client: PinnedRunningXPCClient(port: pinnedRunningPort,
+                                       servedModelID: servedModelID),
+        initialStatus: .running(EngineSessionSnapshot(port: pinnedRunningPort,
+                                                      profileID: "chat",
+                                                      servedModelID: servedModelID))
+      )
+    } else if let startToRunningPort {
+      statusStore = EngineStatusStore(
+        client: StartableStubXPCClient(port: startToRunningPort),
+        initialStatus: .stopped
       )
     } else {
       statusStore = EngineStatusStore(client: HelperXPCClient())
@@ -159,12 +198,34 @@ struct RatioThinkApp: App {
       modelLoad: center
     ))
     _engineClientStore = StateObject(wrappedValue: EngineClientStore(client: engine))
-    _swapCoordinator = StateObject(wrappedValue: ProfileSwapCoordinator(
+    // #469: the production status-aware executor a model PICK routes through.
+    // v1 pie binds the served model at `pie serve` boot, so changing the
+    // served model is an engine lifecycle event — start a stopped engine
+    // bound to the pick, rebuild a running one onto a different pick, or
+    // no-op when it is already resident — NOT a `/v1/models/load` (which a
+    // stopped engine ignores and a running one only acks for its boot model).
+    // The override is threaded through the start/restart XPC so the Helper
+    // boots the chosen model; the resolver records it in the durable
+    // active-model marker so a later menu-bar Resume honors the pick.
+    // #488: the executor also QUEUES a pick made while the engine is
+    // mid-transition (policy `.deferBusy`) and re-serves it when the engine
+    // settles, instead of silently dropping it.
+    let serveExecutor = ActiveModelServeExecutor(engineStatus: statusStore, modelLoad: center)
+    let coordinator = ProfileSwapCoordinator(
       center: center,
-      engine: engine,
-      profileStore: store
-    ))
-    _downloadController = StateObject(wrappedValue: Self.makeDownloadController())
+      profileStore: store,
+      serveModel: { try await serveExecutor.serve(modelID: $0, profileID: $1) }
+    )
+    // A deferred re-serve has no awaiting `startLoad` Task to throw to —
+    // route its failure into the same toolbar `serveModelError` surface a
+    // direct pick's failure uses (#488).
+    serveExecutor.onDeferredServeFailure = { [weak coordinator] modelID, error in
+      coordinator?.reportServeFailure(modelID: modelID, error: error)
+    }
+    _swapCoordinator = StateObject(wrappedValue: coordinator)
+    let downloadController = Self.makeDownloadController()
+    _downloadController = StateObject(wrappedValue: downloadController)
+    _modelLibrary = StateObject(wrappedValue: ModelLibraryStore(downloads: downloadController))
 
     _persistenceStatus = StateObject(wrappedValue: status)
     chatContainer = RatioThinkModelContainer.openWithFallback(status: status)
@@ -179,7 +240,19 @@ struct RatioThinkApp: App {
     } else {
       helperRepair = { await HelperRegistrationRepair().repairAndReportReachable() }
     }
-    let helperHealthController = HelperHealthController(repair: helperRepair)
+    // #496 DEBUG GUI seam: pin the helper-health ladder to a fixed state so the
+    // chat-body recovery overlay's states (starting / unreachable / hidden)
+    // render deterministically without a real background helper — sibling of
+    // `PIE_TEST_PIN_ENGINE_RUNNING`. Compiled out of Release.
+    #if DEBUG
+    let pinnedHelperHealth = Self.pinnedHelperHealthForTesting()
+    #else
+    let pinnedHelperHealth: HelperHealth? = nil
+    #endif
+    let helperHealthController = HelperHealthController(
+      repair: helperRepair,
+      pinnedHealth: pinnedHelperHealth
+    )
     // Drive the ladder from the SAME poll the status mirror runs — no second
     // XPC surface. Set BEFORE statusStore.start() so the first ticks count.
     statusStore.onPollOutcome = { [weak helperHealthController] succeeded in
@@ -193,13 +266,29 @@ struct RatioThinkApp: App {
     }
     _helperHealth = StateObject(wrappedValue: helperHealthController)
 
+    // #507: chat sends are app-scoped (per-chat controllers) so streams
+    // outlive the detail view. The #413 generation gate moves here with
+    // them: hold failed helper polls while ANY chat is streaming.
+    let chatSendCoordinator = ChatSendCoordinator()
+    chatSendCoordinator.onAnyInFlightChange = { [weak helperHealthController] active in
+      helperHealthController?.setGenerating(active)
+    }
+    _sendCoordinator = StateObject(wrappedValue: chatSendCoordinator)
+
+    // #448: give the full-product quit coordinator the poll loop it must stop
+    // before tearing down, so no late on-demand poll respawns the Helper.
+    AppQuitCoordinator.shared.engineStatusStore = statusStore
+
     // Kick the XPC poll loop. Idempotent + cheap — first reply lands
     // within ~one runloop tick when the helper is registered, longer
     // when launchd has not yet published the mach service.
     #if DEBUG
-    // Skipped when status is pinned for the S302 harness (no Helper to
-    // poll; a failed poll would reset the pinned `.running` → `.starting`).
-    if pinnedRunningPort == nil {
+    // Skipped when status is pinned for the S302 harness (no Helper to poll; a
+    // failed poll would reset the pinned `.running` → `.starting`), and for the
+    // #496 helper-health pin (a failed/successful poll would move the pinned
+    // ladder and could flip the engine off `.starting`, both of which would
+    // make the overlay state nondeterministic).
+    if pinnedRunningPort == nil && pinnedHelperHealth == nil {
       statusStore.start()
     }
     #else
@@ -207,13 +296,29 @@ struct RatioThinkApp: App {
     #endif
   }
 
+  #if DEBUG
+  /// #496 GUI seam: map `PIE_TEST_PIN_HELPER_HEALTH` to a pinned `HelperHealth`
+  /// so the chat-body recovery overlay's states can be driven without a real
+  /// background helper. `starting` maps to an active-recovery ladder state
+  /// (`.repairing`) so the gate resolves to `.startingHelper`; `unreachable`
+  /// and `healthy` map directly. Unset / unrecognized ⇒ no pin (normal ladder).
+  private static func pinnedHelperHealthForTesting() -> HelperHealth? {
+    switch ProcessInfo.processInfo.environment["PIE_TEST_PIN_HELPER_HEALTH"] {
+    case "starting":    return .repairing(attempt: 1)
+    case "unreachable": return .unreachable
+    case "healthy":     return .healthy
+    default:            return nil
+    }
+  }
+  #endif
+
   /// Test-only engine base-URL override. `PIE_TEST_ENGINE_BASE_URL`
   /// points the chat client straight at an externally-launched engine,
   /// bypassing the entire production launch boundary (Helper XPC,
   /// `EngineStatusStore`, `LaunchSpecResolver`, `PieControlLauncher`,
   /// `pie serve`). It is honored ONLY in a test harness
   /// (`PIE_TEST_MODE=1`) or a DEBUG build — a shipped Release
-  /// `RatioThink.app` MUST use the real Helper→engine path. Refusing it
+  /// `Rational.app` MUST use the real Helper→engine path. Refusing it
   /// in Release closes the parity gap two ways: a shipped app can't be
   /// redirected at a foreign URL, and a "real binary" (Release/packaged)
   /// scenario cannot silently pass on a fake base URL — if the override
@@ -242,10 +347,18 @@ struct RatioThinkApp: App {
     if env["PIE_TEST_FIRST_LAUNCH_COMPLETED"] == "1" {
       defaults.set(true, forKey: AppPreferences.firstLaunchWizardCompletedKey)
     }
+    if env["PIE_TEST_FOLLOW_PROFILE_DEFAULT_MODEL"] == "1" {
+      defaults.set(true, forKey: AppPreferences.followProfileDefaultModelKey)
+    }
     return defaults
   }
 
   private static func makeDownloadController() -> ModelDownloadController {
+    // DEBUG-only GUI/e2e seams: a faked or fixture-backed downloader so a test
+    // exercises the download UI without hitting the network. `#if DEBUG` so the
+    // env reads (and the test downloaders) compile out of Release entirely —
+    // a shipped app can never be redirected onto a fake download path.
+    #if DEBUG
     if ProcessInfo.processInfo.environment["PIE_TEST_FAKE_DOWNLOADS"] == "1" {
       return ModelDownloadController(
         downloader: EnvironmentFakeModelDownloader(),
@@ -258,6 +371,7 @@ struct RatioThinkApp: App {
         terminalRowLingerSeconds: 60
       )
     }
+    #endif
     return ModelDownloadController()
   }
 
@@ -342,7 +456,9 @@ struct RatioThinkApp: App {
     Diag.app.event("app.launch", [
       ("version", info?["CFBundleShortVersionString"] as? String ?? "?"),
       ("build", info?["CFBundleVersion"] as? String ?? "?"),
+      ("pid", String(ProcessInfo.processInfo.processIdentifier)),
       ("bundle", DiagnosticLog.redactHome(bundlePath)),
+      ("executable", DiagnosticLog.redactHome(Bundle.main.executableURL?.path ?? "?")),
       ("quarantine", quarantined ? "present" : "absent"),
     ])
   }
@@ -369,7 +485,7 @@ struct RatioThinkApp: App {
   }
 
   var body: some Scene {
-    WindowGroup("RatioThink") {
+    WindowGroup("Rational") {
       Group {
         if appPreferences.firstLaunchWizardCompleted {
           RootView()
@@ -390,8 +506,11 @@ struct RatioThinkApp: App {
         .environmentObject(engineStatusStore)
         .environmentObject(engineLifecycle)
         .environmentObject(helperHealth)
+        .environmentObject(sendCoordinator)
         .environmentObject(downloadController)
+        .environmentObject(modelLibrary)
         .environmentObject(updateAvailability)
+        .environmentObject(settingsNavigation)
         // #420: route the menu-bar Helper's `ratiothink://settings` deep
         // link straight to the Settings scene (not just app-foreground).
         .handlesSettingsDeepLink()
@@ -401,7 +520,7 @@ struct RatioThinkApp: App {
     .defaultSize(width: 1200, height: 800)
     .commands {
       // #411: the MANUAL "Check for Updates…" entry, in the standard macOS
-      // spot (App menu, directly under "About RatioThink"). It always checks
+      // spot (App menu, directly under "About Rational"). It always checks
       // and bypasses the ignore-set, complementing the once-per-launch auto
       // check that surfaces the non-modal UpdateAvailableBanner (RootView /
       // UpdateAvailabilityModel). Both compare the running version to the
@@ -445,16 +564,26 @@ struct RatioThinkApp: App {
           Task { await DiagnosticsCollector.collectAndReveal() }
         }
       }
+      #if DEBUG
+      CommandMenu("Debug") {
+        Button("Reset Onboarding State") {
+          appPreferences.resetFirstLaunchWizard()
+        }
+        .keyboardShortcut("r", modifiers: [.command, .control, .option])
+      }
+      #endif
     }
 
     Settings {
       SettingsRoot()
+        .environmentObject(settingsNavigation)
         .environmentObject(modelLoadCenter)
         .environmentObject(appPreferences)
         .environmentObject(profileStore)
         .environmentObject(swapCoordinator)
         .environmentObject(engineClientStore)
         .environmentObject(downloadController)
+        .environmentObject(modelLibrary)
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
     }
@@ -469,13 +598,78 @@ struct RatioThinkApp: App {
 /// reports the pinned `.running` status and treats `stopEngine()` as a
 /// no-op success, so the Unload confirm path completes to `.idle`. DEBUG
 /// only — compiled out of Release alongside the pin itself.
-private struct PinnedRunningXPCClient: AppXPCClient {
-  let port: EnginePort
-  func engineStatus() async throws -> EngineStatus { .running(port: port, profileID: "chat") }
+private final class PinnedRunningXPCClient: AppXPCClient, @unchecked Sendable {
+  private let port: EnginePort
+  private let lock = NSLock()
+  private var servedModelID: String
+
+  init(port: EnginePort, servedModelID: String) {
+    self.port = port
+    self.servedModelID = servedModelID
+  }
+
+  func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
+  func engineStatus() async throws -> EngineStatus {
+    lock.lock()
+    let model = servedModelID
+    lock.unlock()
+    return .running(EngineSessionSnapshot(port: port,
+                                          profileID: "chat",
+                                          servedModelID: model))
+  }
+
   func stopEngine() async throws {}
   // The pinned harness has no Helper to launch an engine; the engine is
   // already pinned `.running`, so a start is a no-op success (mirrors
   // `stopEngine`).
-  func startEngine(profileID: String) async throws {}
+  func startEngine(profileID: String, modelOverride: String?) async throws {
+    updateServedModel(modelOverride)
+  }
+
+  func restartEngine(profileID: String, modelOverride: String?) async throws {
+    updateServedModel(modelOverride)
+  }
+
+  private func updateServedModel(_ modelOverride: String?) {
+    guard let modelOverride, !modelOverride.isEmpty else { return }
+    lock.lock()
+    servedModelID = modelOverride
+    lock.unlock()
+  }
+}
+
+/// #381: helperless `AppXPCClient` whose engine starts `.stopped` and flips to
+/// `.running(port)` the first time the App calls `startEngine` — the GUI seam
+/// for the no-model → Load-default follow-through. It models the single fact
+/// the absent Helper would report across a `pie serve` start (stopped →
+/// running) so the send gate's Load button drives a deterministic engine start
+/// with NO real Helper or engine. `stopEngine` flips it back so the path is
+/// repeatable within a launch. DEBUG only — compiled out of Release alongside
+/// its `PIE_TEST_ENGINE_START_TO_RUNNING` flag.
+private final class StartableStubXPCClient: AppXPCClient, @unchecked Sendable {
+  private let port: EnginePort
+  private let lock = NSLock()
+  private var started = false
+
+  init(port: EnginePort) { self.port = port }
+
+  func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
+
+  func engineStatus() async throws -> EngineStatus {
+    lock.lock(); defer { lock.unlock() }
+    return started ? .running(EngineSessionSnapshot(port: port, profileID: "chat")) : .stopped
+  }
+
+  func startEngine(profileID: String, modelOverride: String?) async throws {
+    lock.lock(); started = true; lock.unlock()
+  }
+
+  func restartEngine(profileID: String, modelOverride: String?) async throws {
+    lock.lock(); started = true; lock.unlock()
+  }
+
+  func stopEngine() async throws {
+    lock.lock(); started = false; lock.unlock()
+  }
 }
 #endif

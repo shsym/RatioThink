@@ -18,6 +18,7 @@ final class EngineLoadFailureClassifierTests: XCTestCase {
   func test_narrow_stderr_signature_classifies_unsupported_model() {
     let error = PieControlLauncher.LaunchError.engineExitedEarly(
       code: 1,
+      reason: .exit,
       stderrTail: "load_model: unsupported model architecture 'mamba2'"
     )
 

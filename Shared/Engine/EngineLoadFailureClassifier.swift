@@ -58,7 +58,7 @@ public enum EngineLoadFailureClassifier {
 
   private static func classify(_ error: PieControlLauncher.LaunchError) -> Classification? {
     switch error {
-    case let .engineExitedEarly(_, stderrTail):
+    case let .engineExitedEarly(_, _, stderrTail, _):
       return classify(text: stderrTail)
     case .driverUnsupported:
       // Structured helper-side driver support is a real unsupported-engine

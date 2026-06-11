@@ -8,10 +8,12 @@ import UniformTypeIdentifiers
 /// every model load is now always confirmed.)
 struct ModelsSettingsTab: View {
   @EnvironmentObject private var downloads: ModelDownloadController
-  @State private var installed: [InstalledModel] = []
-  @State private var scanError: String?
+  /// The one live source of truth for local model availability (#514
+  /// rescope): scan results, modelsDirectory, scanError, freshness,
+  /// and the classification the Add sheet + duplicate guard consume.
+  @EnvironmentObject private var library: ModelLibraryStore
+  @EnvironmentObject private var profileStore: ProfileStore
   @State private var showAddSheet: Bool = false
-  @State private var modelsDirectory: URL?
 
   /// Sticky non-fatal error from the most recent table-level action
   /// (drop import, delete, download enqueue). Replaces the old
@@ -26,9 +28,10 @@ struct ModelsSettingsTab: View {
 
       DownloadsInFlightSection()
 
-      InstalledModelsTable(rows: installed,
-                            error: scanError,
+      InstalledModelsTable(rows: library.installed,
+                            error: library.scanError,
                             actionError: actionError,
+                            isScanned: library.freshness == .scanned,
                             onReveal: revealInFinder,
                             onDelete: deleteFile,
                             onDrop: handleDrop)
@@ -45,14 +48,13 @@ struct ModelsSettingsTab: View {
     // Frame goes AFTER `.padding(20)` so the inset stays inside the greedy
     // frame; before it, the filled frame + outer padding would overflow the pane.
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    .task { await refresh() }
-    .onChange(of: downloads.completionTick) { _, _ in
-      Task { await refresh() }
-    }
+    .task { await library.refresh() }
+    // No completionTick plumbing: the store reconciles download
+    // completions itself (overlay + self-triggered rescan).
     .sheet(isPresented: $showAddSheet) {
-      AddModelSheet(modelsDirectory: modelsDirectory) { outcome in
+      AddModelSheet(modelsDirectory: library.modelsDirectory) { outcome in
         handleSheetOutcome(outcome)
-        Task { await refresh() }
+        Task { await library.refresh() }
       }
     }
   }
@@ -74,35 +76,28 @@ struct ModelsSettingsTab: View {
 
   // MARK: - Side effects
 
-  @MainActor
-  private func refresh() async {
-    // Filesystem walks run off the main actor. Surface models already
-    // staged in the shared HF cache (safetensors / GGUF) alongside
-    // app-managed files, deduped by slug keeping the app-managed row (the
-    // resolver's app-staged-first precedence). HF rows are read-only in
-    // the table. On an app-dir scan failure the HF rows are KEPT and the
-    // error shows as a banner above the table rather than emptying it.
-    let scan = await CachedModelScan.run()
-    modelsDirectory = scan.modelsDirectory
-    let appSlugs = Set(scan.appManaged.map(\.filename))
-    installed = scan.appManaged + scan.huggingFaceCache.filter { !appSlugs.contains($0.filename) }
-    scanError = scan.appError
-  }
-
   private func revealInFinder(_ row: InstalledModel) {
     NSWorkspace.shared.activateFileViewerSelecting([row.url])
   }
 
   private func deleteFile(_ row: InstalledModel) {
+    let affected = profileStore.profilesReferencingModel(row.filename)
     let alert = NSAlert()
     alert.messageText = "Delete \(row.displayName)?"
-    alert.informativeText = "The file will be moved to the Trash. This does not affect profiles that reference it."
-    alert.addButton(withTitle: "Delete")
+    if affected.isEmpty {
+      alert.informativeText = "The file will be moved to the Trash."
+    } else {
+      alert.informativeText = Self.deleteReferencedModelMessage(
+        row: row,
+        affectedProfiles: affected
+      )
+    }
+    alert.addButton(withTitle: affected.isEmpty ? "Delete" : "Delete and Clear Defaults")
     alert.addButton(withTitle: "Cancel")
     alert.alertStyle = .warning
     guard alert.runModal() == .alertFirstButtonReturn else { return }
     do {
-      try FileManager.default.trashItem(at: row.url, resultingItemURL: nil)
+      try Self.deleteInstalledModel(row: row, profileStore: profileStore)
       actionError = nil
     } catch {
       // Label the failure explicitly so the user knows it was a
@@ -110,16 +105,52 @@ struct ModelsSettingsTab: View {
       actionError = "Delete '\(row.filename)' failed: \(error)"
       return
     }
+    Task { await library.refresh() }
+  }
+
+  static func deleteInstalledModel(
+    row: InstalledModel,
+    profileStore: ProfileStore,
+    trashModel: (URL) throws -> Void = { url in
+      try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+    },
+    trashSidecar: (URL) throws -> Void = { url in
+      try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+    }
+  ) throws {
+    try profileStore.withClearedModelDefaults(referencing: row.filename) {
+      try trashModel(row.url)
+    }
+    // #469: complete the active-model marker's lifecycle at the delete choke
+    // point. The marker has precedence over the profile default in
+    // `HelperResumeAction`, so if the deleted model was the marker, a later
+    // menu-bar Resume / crash auto-relaunch would resolve the now-missing model
+    // ahead of the still-valid profile default and dead-end on `modelMissing`.
+    // Clearing it here lets Resume fall through to the profile default.
+    // Best-effort (`try?`): `clearActiveModelID` logs on failure, and
+    // `HelperResumeAction`'s marker-miss retry is the backstop for any marker
+    // that goes stale outside this path (external deletion / HF-cache eviction).
+    if profileStore.activeModelID == row.filename {
+      try? profileStore.clearActiveModelID()
+    }
     //  F10/F12: move the durable `.unverified` sidecar to the Trash
     // ALONGSIDE the GGUF — same recoverable semantics. The GGUF is
     // trashed (recoverable), so the marker must be too: a hard-remove
     // here would let a Trash-restore bring back the file WITHOUT its
     // marker, re-introducing the silent-verified downgrade (F12). A
     // missing sidecar is fine (`try?`).
-    try? FileManager.default.trashItem(
-      at: URL(fileURLWithPath: row.url.path + InstalledModels.unverifiedSuffix),
-      resultingItemURL: nil)
-    Task { await refresh() }
+    try? trashSidecar(URL(fileURLWithPath: row.url.path + InstalledModels.unverifiedSuffix))
+  }
+
+  static func deleteReferencedModelMessage(
+    row: InstalledModel,
+    affectedProfiles: [ProfileModelReference]
+  ) -> String {
+    let count = affectedProfiles.count
+    let names = affectedProfiles.map(\.name).joined(separator: ", ")
+    let profileWord = count == 1 ? "profile uses" : "profiles use"
+    let defaultsWord = count == 1 ? "default" : "defaults"
+    return "\(count) \(profileWord) this model as its default: \(names). The file will be moved to the Trash and those profile \(defaultsWord) will be cleared. Profiles with no default will show Choose/Download actions the next time you use them; a running engine is not stopped."
   }
 
   /// Drag-drop handler. Surfaces a per-file aggregate so partial
@@ -127,7 +158,7 @@ struct ModelsSettingsTab: View {
   /// "Imported 4 of 5. Failed: foo.gguf (extension); bar.gguf
   /// (already exists)."
   private func handleDrop(_ urls: [URL], _ providerErrors: [String]) {
-    guard let dir = modelsDirectory else {
+    guard let dir = library.modelsDirectory else {
       actionError = "models directory not ready"
       return
     }
@@ -149,7 +180,7 @@ struct ModelsSettingsTab: View {
     actionError = formatDropSummary(total: urls.count + providerErrors.count,
                                      succeeded: succeeded,
                                      failures: failures)
-    Task { await refresh() }
+    Task { await library.refresh() }
   }
 
   /// Forwarded from `AddModelSheet`. `.queueDownload` was previously
@@ -165,13 +196,92 @@ struct ModelsSettingsTab: View {
       actionError = Self.formatImportOutcome(successes: successes,
                                               failures: failures)
     case .queueDownload(let repo, let file):
-      if downloads.enqueue(repo: repo, file: file) == nil,
-         let err = downloads.lastError {
-        actionError = err
+      // #514: duplicate prevention happens HERE, before enqueue — the
+      // downloader's overwrite semantics are not the user-facing
+      // guard. `library.availability` is the store's LIVE truth on
+      // every axis (in-flight set, completion overlay, scan results).
+      switch Self.duplicateAddDecision(
+        repo: repo, file: file,
+        availability: library.availability,
+        modelsDirectory: library.modelsDirectory) {
+      case .blocked(let reason):
+        actionError = reason
+        return
+      case .proceed:
+        break
+      }
+      // A nil enqueue is unconditionally an error: `start` failed and
+      // no progress stream exists, so without a message the click
+      // reads as silent success. The fallback copy covers a (today
+      // unreachable) failure that didn't populate `lastError`.
+      if downloads.enqueue(repo: repo, file: file) == nil {
+        actionError = Self.enqueueFailureMessage(downloads.lastError)
       } else {
         actionError = nil
       }
     }
+  }
+
+  /// `downloads.enqueue == nil` copy — the producer's reason when it
+  /// gave one, an explicit failure line otherwise (never silence).
+  static func enqueueFailureMessage(_ lastError: String?) -> String {
+    lastError ?? "Download could not be queued."
+  }
+
+  /// Outcome of the pre-enqueue duplicate guard (review v1 F4 — the
+  /// classify-or-enqueue decision, extracted so both branches are
+  /// directly unit-testable without the SwiftUI view).
+  enum AddDecision: Equatable {
+    case proceed
+    case blocked(String)
+  }
+
+  /// #514 duplicate guard, decided BEFORE `downloads.enqueue`.
+  ///
+  /// Two layers:
+  ///  1. The `ModelAvailability` classification fed by
+  ///     `ModelLibraryStore` — live on every axis the app can know
+  ///     about (non-terminal downloads, the completion overlay, the
+  ///     latest scan, and the explicit first-scan state).
+  ///  2. A targeted filesystem check on the exact destination
+  ///     `<modelsRoot>/<repo>/<file>` (the ticket's detection-strategy
+  ///     backstop). KEPT as defense-in-depth after the store rescope:
+  ///     the store structurally closes the pre-first-scan and
+  ///     post-completion windows, but a file placed EXTERNALLY between
+  ///     scans (Finder copy, another tool) is invisible to any
+  ///     in-process bookkeeping until the next walk — this one cheap
+  ///     `stat` at the decision point catches it. Consistent with the
+  ///     F1 partial policy: a destination with a `.partial` sibling is
+  ///     a broken install, NOT a duplicate — the re-download repairs
+  ///     it, so it proceeds. A DIRECTORY at the destination path is
+  ///     not an installed model and proceeds (cycle-607 minor). When
+  ///     the caller has no scanned `modelsDirectory` yet, the backstop
+  ///     resolves the same models root itself (cycle-607 minor) —
+  ///     injectable so tests stay hermetic.
+  static func duplicateAddDecision(
+    repo: String,
+    file: String,
+    availability: ModelAvailability,
+    modelsDirectory: URL?,
+    fallbackModelsDirectory: () -> URL? = { try? PieDirs.models() },
+    fileManager: FileManager = .default
+  ) -> AddDecision {
+    let slug = ModelAvailability.slug(repo: repo, file: file)
+    if let blocked = availability.status(repo: repo, file: file).blockedReason(slug: slug) {
+      return .blocked(blocked)
+    }
+    if let dir = modelsDirectory ?? fallbackModelsDirectory() {
+      let dest = dir.appendingPathComponent(slug)
+      var isDirectory: ObjCBool = false
+      if fileManager.fileExists(atPath: dest.path, isDirectory: &isDirectory),
+         !isDirectory.boolValue,
+         !fileManager.fileExists(atPath: dest.path + InstalledModels.partialSuffix) {
+        return .blocked(
+          ModelAvailability.Status.installedAppManaged.blockedReason(slug: slug)
+            ?? "'\(slug)' is already installed.")
+      }
+    }
+    return .proceed
   }
 
   /// Pure formatter — `nil` on a clean batch (no failures), otherwise
@@ -358,6 +468,11 @@ private struct InstalledModelsTable: View {
   let rows: [InstalledModel]
   let error: String?
   let actionError: String?
+  /// `false` until the store's first scan has applied. An empty row
+  /// list before that means "haven't looked yet", not "no models" —
+  /// rendering the no-models empty state then would be a false claim
+  /// (#514 rescope, freshness axis).
+  let isScanned: Bool
   let onReveal: (InstalledModel) -> Void
   let onDelete: (InstalledModel) -> Void
   let onDrop: ([URL], [String]) -> Void
@@ -375,7 +490,13 @@ private struct InstalledModelsTable: View {
           .frame(maxWidth: .infinity, alignment: .leading)
       }
       if rows.isEmpty {
-        if error == nil { emptyState }
+        if error == nil {
+          if isScanned {
+            emptyState
+          } else {
+            scanningState
+          }
+        }
       } else {
         Table(rows) {
           TableColumn("Name") { row in
@@ -395,6 +516,18 @@ private struct InstalledModelsTable: View {
                   .foregroundStyle(.orange)
                   .help("Installed without a verified sha256 (no X-Linked-Etag advertised — e.g. a resumed download). Integrity was not checked.")
                   .accessibilityIdentifier("InstalledRow-Unverified-\(row.id)")
+              } else if let reason = row.unsupportedReason {
+                // #349: a discovered-but-unlaunchable row (a collapsed
+                // split-GGUF shard set) carries `unsupportedReason`. The
+                // profile picker + LaunchSpecResolver already refuse it;
+                // surface it here too so the inventory view doesn't show it
+                // as a normal, loadable model. `nosign` (distinct from the
+                // partial/unverified warnings) reads as "the engine can't
+                // load this", with the reason in the tooltip.
+                Image(systemName: "nosign")
+                  .foregroundStyle(.orange)
+                  .help(reason)
+                  .accessibilityIdentifier("InstalledRow-Unsupported-\(row.id)")
               }
               Text(row.displayName).lineLimit(1).truncationMode(.middle)
               if row.source == .huggingFaceCache {
@@ -407,7 +540,7 @@ private struct InstalledModelsTable: View {
                   .padding(.horizontal, 5)
                   .padding(.vertical, 1)
                   .background(Capsule().fill(Color.secondary.opacity(0.15)))
-                  .help("Discovered in the shared Hugging Face cache. Managed outside RatioThink — reveal in Finder to inspect.")
+                  .help("Discovered in the shared Hugging Face cache. Managed outside Rational — reveal in Finder to inspect.")
                   .accessibilityIdentifier("InstalledRow-HFCache-\(row.id)")
               }
               if let warning = row.supportWarning {
@@ -457,7 +590,7 @@ private struct InstalledModelsTable: View {
               // shared cache, so deletion is out of scope.
               .disabled(row.source == .huggingFaceCache)
               .help(row.source == .huggingFaceCache
-                    ? "Cached Hugging Face models are managed outside RatioThink"
+                    ? "Cached Hugging Face models are managed outside Rational"
                     : "Move to Trash")
             }
           }
@@ -485,6 +618,20 @@ private struct InstalledModelsTable: View {
       }
       return true
     }
+  }
+
+  /// Pre-first-scan placeholder: distinguishable from the no-models
+  /// empty state so the UI never claims "No models installed yet"
+  /// before it has actually looked.
+  private var scanningState: some View {
+    VStack(spacing: 8) {
+      ProgressView().controlSize(.small)
+      Text("Scanning for models…")
+        .font(.callout)
+        .foregroundStyle(.tertiary)
+    }
+    .frame(maxWidth: .infinity, minHeight: 140)
+    .accessibilityIdentifier("InstalledModelsScanning")
   }
 
   private var emptyState: some View {
@@ -527,7 +674,7 @@ private struct MemoryGuardrailSection: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
       SettingsSectionHeader(title: "Memory guardrail")
-      Text("Largest model RatioThink will load, as a fraction of this Mac's memory after reserving headroom for the system. Higher is riskier under memory pressure.")
+      Text("Largest model Rational will load, as a fraction of this Mac's memory after reserving headroom for the system. Higher is riskier under memory pressure.")
         .font(.callout)
         .foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)
