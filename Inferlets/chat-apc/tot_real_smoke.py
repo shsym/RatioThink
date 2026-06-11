@@ -189,7 +189,7 @@ async def run_tot(http: httpx.AsyncClient, base: str, prompt: str, *, breadth, d
 
 
 async def main() -> int:
-    assert e2e.PIE_BIN.exists(), f"missing pie binary at {e2e.PIE_BIN} (build: make build-pie-engine)"
+    assert e2e.PIE_BIN.exists(), f"missing pie binary at {e2e.PIE_BIN} (build: make engine-build)"
     assert e2e.WASM_PATH.exists(), f"missing wasm at {e2e.WASM_PATH} (build: make build-inferlets)"
     assert MODEL_PATH.exists(), f"missing model at {MODEL_PATH} (stage: Scripts/stage-test-model.sh)"
 
