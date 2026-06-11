@@ -258,8 +258,25 @@ def _mock_response(status: int = 200, diag: dict | None = None) -> _SelfTestResp
     return _SelfTestResponse(status, body="mock probe failure")
 
 
+_KNOWN_SELFTEST_SCENARIOS = {
+    "post-turn2-same-model-profile-switch-500",
+    "post-turn2-bypass-500",
+    "post-turn2-otherkey-500",
+    "post-turn2-retry-after-turn2-500",
+    "post-turn2-sysprompt-change-500",
+    "post-turn2-same-model-profile-switch-missing-diag",
+    "post-turn2-otherkey-missing-diag",
+    "post-turn2-retry-after-turn2-missing-diag",
+    "post-turn2-sysprompt-change-missing-diag",
+}
+
+
 async def _selftest_post_turn2_probes() -> int:
     scenario = os.environ.get("CACHE_SMOKE_REAL_SELFTEST", "")
+    if scenario not in _KNOWN_SELFTEST_SCENARIOS:
+        print(f"[cache-selftest] unknown CACHE_SMOKE_REAL_SELFTEST scenario: {scenario}")
+        return 1
+
     forced = scenario.removeprefix("post-turn2-")
     d1 = {"save_hash": "turn1"}
     d2 = {"save_hash": "turn2"}

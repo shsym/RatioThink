@@ -105,9 +105,15 @@ test_cache_smoke_harness_fails_required_missing_diagnostics() {
     "prompt-changing request: missing X-ChatAPC-Cache header"
 }
 
+test_cache_smoke_harness_rejects_unknown_selftest_scenario() {
+  assert_harness_selftest_fails "typo" \
+    "unknown CACHE_SMOKE_REAL_SELFTEST scenario: post-turn2-typo"
+}
+
 test_exports_default_model_to_cache_smoke_runner
 test_preserves_operator_model_override
 test_cache_smoke_harness_fails_post_turn2_non_200_probes
 test_cache_smoke_harness_fails_required_missing_diagnostics
+test_cache_smoke_harness_rejects_unknown_selftest_scenario
 
 echo "test-run-cache-smoke-real-e2e: PASS"
