@@ -66,7 +66,7 @@ final class S275_MultiTurnResumeGUITests: XCTestCase {
     XCTAssert(relaunched.wait(for: .runningForeground, timeout: 10),
               "Rational.app did not relaunch")
     relaunched.activate()
-    try selectPersistedChat(in: relaunched)
+    selectPersistedChat(titled: user1, in: relaunched)
 
     try sendPrompt(user3, in: relaunched)
     XCTAssertTrue(waitForStaticTextContaining("Again: cerulean-275.", in: relaunched, timeout: 15),
@@ -119,13 +119,6 @@ final class S275_MultiTurnResumeGUITests: XCTestCase {
                   "composer.send missing; app tree: \(app.debugDescription)")
     XCTAssertTrue(send.isEnabled, "composer.send was disabled after typing prompt")
     send.click()
-  }
-
-  private func selectPersistedChat(in app: XCUIApplication) throws {
-    let chatTitle = app.staticTexts["New Chat"].firstMatch
-    XCTAssertTrue(chatTitle.waitForExistence(timeout: 10),
-                  "persisted chat row 'New Chat' missing after relaunch; app tree: \(app.debugDescription)")
-    chatTitle.click()
   }
 
   private func waitForStaticTextContaining(

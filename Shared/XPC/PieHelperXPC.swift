@@ -97,6 +97,10 @@ public protocol PieHelperXPC {
   /// allowed-class list.
   func engineMemory(reply: @escaping (Data) -> Void)
 
+  /// Reply is `XPCPayload.encode([KVUsageSnapshot])` on success or
+  /// `XPCPayload.encode(EngineError)` on failure. Exactly one slot is non-nil.
+  func kvUsage(reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
+
   /// On success `successData` decodes to `EngineSessionSnapshot` (#476) — the
   /// authoritative description of the launched session (port, profileID,
   /// servedModelID, effective `max_tokens` ceiling, launch generation); on
@@ -405,6 +409,31 @@ public enum PieHelperXPCWire {
       successData: successData,
       errorData: errorData,
       slot: "downloadModel"
+    )
+  }
+
+  // MARK: - kvUsage (handle-or-error)
+
+  public static func replyKVUsage(
+    _ result: Result<[KVUsageSnapshot], EngineError>,
+    via reply: (Data?, Data?) -> Void
+  ) {
+    _replyHandleOrError(
+      result, via: reply,
+      encode: defaultEncode,
+      onEncodeFailure: { PieHelperXPCLog.encodeFailure($0, site: "replyKVUsage") }
+    )
+  }
+
+  public static func decodeKVUsageReply(
+    successData: Data?,
+    errorData: Data?
+  ) throws -> Result<[KVUsageSnapshot], EngineError> {
+    try decodeHandleOrErrorReply(
+      [KVUsageSnapshot].self,
+      successData: successData,
+      errorData: errorData,
+      slot: "kvUsage"
     )
   }
 

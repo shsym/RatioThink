@@ -16,7 +16,12 @@ struct ChatScaffoldView: View {
   @Query private var chats: [Chat]
   @Environment(\.modelContext) private var modelContext
   @StateObject private var viewModel: ChatTranscriptViewModel
-  @StateObject private var sendController = ChatSendController()
+  /// #507: send pipelines are app-scoped (one controller per chat, owned by
+  /// the coordinator) so an in-flight stream survives this view's teardown
+  /// when the user switches chats. This view only borrows its chat's
+  /// controller; it never cancels on disappear.
+  @EnvironmentObject private var sendCoordinator: ChatSendCoordinator
+  private let chatID: UUID
   let availableProfiles: [String]
   let availableModels: [String]
   @EnvironmentObject private var swapCoordinator: ProfileSwapCoordinator
@@ -92,6 +97,34 @@ struct ChatScaffoldView: View {
       return false
     }
   }
+  /// #513: the assistant message id awaiting the destructive-retry
+  /// confirmation. Non-nil presents the alert; Cancel clears it without
+  /// touching history.
+  @State private var pendingRetryMessageID: UUID?
+  /// #513 review v2 F1: the stale-retry notice, on its OWN channel — it
+  /// must NOT ride `engineActionError`, whose banner hides action errors
+  /// behind `statusDetail` while the engine is `.failed` and whose value
+  /// is cleared on the next engine-status flip. This is a transcript
+  /// condition; its visibility and lifetime are independent of engine
+  /// state (explicit Dismiss, or the auto-clear on the rendered row).
+  ///
+  /// Identity-bearing (review v3 F1): the message is a single static
+  /// string, so a bare `String?` state makes every re-raise a same-value
+  /// write — `.task(id:)` would never restart and a second stale click
+  /// near the end of the window would get almost no banner time. Each
+  /// raise mints a fresh `id`, so the auto-clear timer restarts per raise
+  /// by construction.
+  struct RetryNoticeState: Equatable {
+    let id: UUID
+    let message: String
+
+    init(message: String) {
+      self.id = UUID()
+      self.message = message
+    }
+  }
+
+  @State private var staleRetryNotice: RetryNoticeState?
 
   init(
     chatID: UUID,
@@ -103,6 +136,7 @@ struct ChatScaffoldView: View {
     let id = chatID
     _chats = Query(filter: #Predicate<Chat> { $0.id == id })
     _viewModel = StateObject(wrappedValue: ChatTranscriptViewModel())
+    self.chatID = id
     self.availableProfiles = availableProfiles
     self.availableModels = availableModels
   }
@@ -396,6 +430,22 @@ struct ChatScaffoldView: View {
       if let helperBlock {
         HelperUnavailableNotice(reason: helperBlock, onDismiss: { self.helperBlock = nil })
       }
+      // #513 review v2 F1: stale-retry notice on its own channel and
+      // surface — engine-status changes can neither shadow nor clear it.
+      // `.task(id:)` keyed on the per-raise `id` gives it a bounded
+      // lifetime: every raise (including re-raising the same message)
+      // restarts the auto-clear, and Dismiss clears it immediately.
+      if let notice = staleRetryNotice {
+        StaleRetryNotice(message: notice.message, onDismiss: { staleRetryNotice = nil })
+          .task(id: notice.id) {
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            // The sleep's cancellation error is swallowed by `try?`, so
+            // re-check before clearing: a cancelled timer (row replaced or
+            // removed) must not wipe a newer notice.
+            guard !Task.isCancelled else { return }
+            if staleRetryNotice?.id == notice.id { staleRetryNotice = nil }
+          }
+      }
       // #496: the chat body is the transcript + composer. It is NEVER covered by
       // a full-bleed helper overlay — that earlier overlay's `maxHeight:.infinity`
       // exploded the window layout and made the WHOLE window non-interactive. A
@@ -403,12 +453,21 @@ struct ChatScaffoldView: View {
       // notice above for a refused action), keeping the sidebar/history/Settings
       // live.
       VStack(spacing: 0) {
-        TranscriptView(chat: chat)
-          .frame(maxWidth: .infinity, maxHeight: .infinity)
+        TranscriptView(
+          chat: chat,
+          // #513: retry waits for the active stream — while this chat is
+          // in flight the controls are hidden entirely (nil), so a retry
+          // can never race the stream writer or cancel an unrelated
+          // chat's stream.
+          onRetryTurn: sendCoordinator.isInFlight(chatID)
+            ? nil
+            : { messageID in requestRetry(for: chat, messageID: messageID) }
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         ComposerView(
           chat: chat,
           viewModel: viewModel,
-          isSending: sendController.isInFlight,
+          isSending: sendCoordinator.isInFlight(chatID),
           shouldAllowSend: { sendGateDecision(for: chat).allowsSend },
           onSendBlocked: { draft in
             handleBlockedSend(draft: draft, for: chat)
@@ -419,6 +478,9 @@ struct ChatScaffoldView: View {
             pendingSend.disarm()
             sendAssistantTurn(for: chat)
           },
+          // #507: the composer's stop button — the user-reachable cancel
+          // for this chat's in-flight turn (review v1 F1).
+          onStop: { sendCoordinator.cancel(chatID: chatID) },
           autoSubmit: pendingSend.autoSubmit
         )
       }
@@ -484,6 +546,27 @@ struct ChatScaffoldView: View {
         }
       )
     }
+    // #513: destructive-retry confirmation. Required whenever the retry
+    // point has later conversation (the plan's `requiresConfirmation`);
+    // a latest-turn retry skips straight to `executeRetry`. Canceling
+    // leaves history untouched — nothing is mutated until Retry.
+    .alert(
+      "Retry from here?",
+      isPresented: Binding(
+        get: { pendingRetryMessageID != nil },
+        set: { if !$0 { pendingRetryMessageID = nil } }
+      )
+    ) {
+      Button("Retry", role: .destructive) {
+        if let messageID = pendingRetryMessageID {
+          executeRetry(for: chat, messageID: messageID)
+        }
+        pendingRetryMessageID = nil
+      }
+      Button("Cancel", role: .cancel) { pendingRetryMessageID = nil }
+    } message: {
+      Text("This will erase all later conversation after this point and generate a new response.")
+    }
     .onChange(of: engineStatusStore.status) { _, new in
       // PR#15 F3: a thrown start/stop error is transient — once the poll
       // observes the engine in any non-failed state, drop it so a stale
@@ -518,15 +601,12 @@ struct ChatScaffoldView: View {
     // selection) IS the new fact being observed, so no residency pre-check.
     .onChange(of: modelLoadCenter.residentModelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
     .onChange(of: chat.modelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
-    // #413: open/close the helper-health generation gate around every stream.
-    // While a chat / ToT generation is in flight a saturated engineStatus poll
-    // path can time out for many consecutive polls; without this gate the
-    // restart ladder reads those busy-timeouts as an unreachable helper and
-    // bounces it — killing the engine mid-search and closing the SSE. The gate
-    // holds those failed polls; genuine death still surfaces (the stream drops,
-    // ending the generation and releasing the gate).
-    .onChange(of: sendController.isInFlight) { _, inFlight in
-      helperHealth.setGenerating(inFlight)
+    // #413's helper-health generation gate is wired at app scope from
+    // `ChatSendCoordinator.onAnyInFlightChange` (#507) — streams outlive this
+    // view now, so a per-view forward would release the gate on navigate-away
+    // while the stream is still saturating the MainActor. THIS chat's
+    // in-flight edge is still observed here for #516:
+    .onChange(of: sendCoordinator.isInFlight(chatID)) { _, inFlight in
       // #516 review F2: a fire delivered while a send is in flight would be
       // swallowed by `submit()`'s `!isSending` guard — so `verdict` holds
       // while in flight, and THIS edge (in-flight clearing) re-evaluates
@@ -585,8 +665,11 @@ struct ChatScaffoldView: View {
         persistenceStatus.report(error, context: "ChatScaffoldView.profileSwap")
       }
     }
+    // #507: NO `.onDisappear` stream cancel — switching chats must not kill
+    // the stream. Cancellation is explicit only: the composer's stop button
+    // (`cancel(chatID:)`) or chat deletion (`forget`); a new send in the
+    // same chat still supersedes inside `ChatSendController.send`.
     .onDisappear {
-      sendController.cancel()
       // #516: navigating away abandons the pending flow — no stale
       // auto-send when the user later returns or switches chats.
       pendingSend.disarm()
@@ -712,6 +795,73 @@ struct ChatScaffoldView: View {
     }
   }
 
+  /// #513 entry point from a transcript row's Retry control. Routes
+  /// through the destructive confirmation only when the plan says later
+  /// conversation would be erased; a latest-turn retry executes directly.
+  /// The model gate runs FIRST so a blocked retry raises the no-model or
+  /// pinned/resident mismatch prompt without having mutated any history.
+  private func requestRetry(for chat: Chat, messageID: UUID) {
+    guard !sendCoordinator.isInFlight(chatID) else { return }
+    switch sendGateDecision(for: chat) {
+    case .ready:
+      break
+    case .pinnedModelMismatch(let pinned, let resident):
+      pendingSend.disarm()
+      pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
+                                                residentModelID: resident)
+      return
+    case .noResolvableModel:
+      presentNoModelPrompt()
+      return
+    }
+    guard let plan = ChatRetryPlan.plan(messages: chat.messages, retryPointID: messageID) else {
+      // Review v1 F1 (lower-stakes sibling): the rendered control was
+      // stale — say so instead of a dead click.
+      staleRetryNotice = RetryNoticeState(message: Self.staleRetryNoticeCopy)
+      return
+    }
+    if plan.requiresConfirmation {
+      pendingRetryMessageID = messageID
+    } else {
+      executeRetry(for: chat, messageID: messageID)
+    }
+  }
+
+  /// Review v1 F1: a user who consented to a destructive retry (or clicked
+  /// a rendered Retry control) must never get a silent no-op when the
+  /// transcript changed underneath. Review v2 F1: rendered by the
+  /// dedicated `StaleRetryNotice` row off `staleRetryNotice` state —
+  /// never the engine-failure banner, whose `.failed`-status shadowing
+  /// and status-flip clearing could drop this unread.
+  static let staleRetryNoticeCopy =
+    "Retry no longer applies — the conversation changed or a response is in progress."
+
+  /// #513: truncate from the retry point, then resend from the retained
+  /// prefix via the normal send path (same model/profile resolution, same
+  /// ToT dispatch, same per-chat controller — so an unrelated chat's
+  /// stream is never touched). `ChatRetryPlan.apply` re-validates against
+  /// the live transcript and truncates atomically; review v1 F1: every
+  /// blocked branch surfaces — `.noLongerApplies` raises the stale-retry
+  /// notice, `.saveFailed` was already reported via the persistence
+  /// banner (and must not resend — the engine never sees a prefix the
+  /// store does not hold).
+  private func executeRetry(for chat: Chat, messageID: UUID) {
+    switch ChatRetryPlan.apply(
+      retryPointID: messageID,
+      chat: chat,
+      isInFlight: sendCoordinator.isInFlight(chatID),
+      context: modelContext,
+      persistenceStatus: persistenceStatus
+    ) {
+    case .send:
+      sendAssistantTurn(for: chat)
+    case .noLongerApplies:
+      staleRetryNotice = RetryNoticeState(message: Self.staleRetryNoticeCopy)
+    case .saveFailed:
+      break
+    }
+  }
+
   private func sendAssistantTurn(for chat: Chat) {
     // Defensive: ComposerView only invokes this after `shouldAllowSend`
     // passed, but never ask the engine to load a model the user did not
@@ -749,14 +899,22 @@ struct ChatScaffoldView: View {
     // route the turn to the ToT dispatch (streamed tree search rendered
     // inline) instead of a chat completion. The launched inferlet is
     // still chat-apc — ToT is a per-request dispatch mode.
-    if let totConfig = profileStore.profile(forProfileID: viewModel.selectedProfileID)?.treeOfThought {
+    // #507: the chat's app-scoped controller — the send outlives this view.
+    let sendController = sendCoordinator.controller(for: chatID)
+
+    // #523 Part B binds the whole profile so the ToT dispatch can source its
+    // candidate-generation temperature from it (`toTRequestSampling` below).
+    if let totProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
+       let totConfig = totProfile.treeOfThought {
       sendController.sendTreeOfThought(
         chat: chat,
         context: modelContext,
         engine: engineStore.client,
         config: totConfig,
         persistenceStatus: persistenceStatus,
-        options: options
+        // #523 Part B: source the ToT candidate-generation temperature from
+        // the profile, not the toolbar default.
+        options: options.withSampling(totProfile.toTRequestSampling)
       )
       return
     }
@@ -1119,7 +1277,7 @@ struct ChatScaffoldView: View {
     // The transition bookkeeping lives in `PendingSendState` (tested).
     pendingSend.settle(chatID: chat.id,
                        resolvedModelID: resolved,
-                       isSending: sendController.isInFlight)
+                       isSending: sendCoordinator.isInFlight(chatID))
   }
 
   /// Resolve the model a send should target from the chat's SELECTION

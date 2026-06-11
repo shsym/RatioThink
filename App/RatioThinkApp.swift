@@ -50,12 +50,21 @@ struct RatioThinkApp: App {
   /// and surfaced as the toolbar helper-ring + the escalation banner.
   @StateObject private var helperHealth: HelperHealthController
   @StateObject private var engineClientStore: EngineClientStore
+  /// #507: app-scoped per-chat send pipelines, so an in-flight stream
+  /// survives chat switches and multiple chats can stream concurrently.
+  /// Also feeds the #413 generation gate (any chat in flight → hold
+  /// failed helper polls).
+  @StateObject private var sendCoordinator: ChatSendCoordinator
   /// Phase 3.8 (review v2 F1): the Add Model sheet's `.queueDownload`
   /// outcome runs through this controller so the existing
   /// `ModelDownloader` is actually invoked. Lives at app scope so
   /// closing + reopening the Settings sheet does not orphan an
   /// in-flight download.
   @StateObject private var downloadController: ModelDownloadController
+  /// #514: the one live source of truth for local model availability
+  /// (scan results + in-flight downloads + completion reconciliation).
+  /// App-scoped beside the download controller it observes.
+  @StateObject private var modelLibrary: ModelLibraryStore
   /// #411: once-per-launch GitHub-Releases update check. App-scoped so the
   /// check (and its single network call) fires once per process; RootView
   /// observes `pending` to render the non-modal update banner.
@@ -214,7 +223,9 @@ struct RatioThinkApp: App {
       coordinator?.reportServeFailure(modelID: modelID, error: error)
     }
     _swapCoordinator = StateObject(wrappedValue: coordinator)
-    _downloadController = StateObject(wrappedValue: Self.makeDownloadController())
+    let downloadController = Self.makeDownloadController()
+    _downloadController = StateObject(wrappedValue: downloadController)
+    _modelLibrary = StateObject(wrappedValue: ModelLibraryStore(downloads: downloadController))
 
     _persistenceStatus = StateObject(wrappedValue: status)
     chatContainer = RatioThinkModelContainer.openWithFallback(status: status)
@@ -254,6 +265,15 @@ struct RatioThinkApp: App {
       helperHealthController?.health
     }
     _helperHealth = StateObject(wrappedValue: helperHealthController)
+
+    // #507: chat sends are app-scoped (per-chat controllers) so streams
+    // outlive the detail view. The #413 generation gate moves here with
+    // them: hold failed helper polls while ANY chat is streaming.
+    let chatSendCoordinator = ChatSendCoordinator()
+    chatSendCoordinator.onAnyInFlightChange = { [weak helperHealthController] active in
+      helperHealthController?.setGenerating(active)
+    }
+    _sendCoordinator = StateObject(wrappedValue: chatSendCoordinator)
 
     // #448: give the full-product quit coordinator the poll loop it must stop
     // before tearing down, so no late on-demand poll respawns the Helper.
@@ -486,7 +506,9 @@ struct RatioThinkApp: App {
         .environmentObject(engineStatusStore)
         .environmentObject(engineLifecycle)
         .environmentObject(helperHealth)
+        .environmentObject(sendCoordinator)
         .environmentObject(downloadController)
+        .environmentObject(modelLibrary)
         .environmentObject(updateAvailability)
         .environmentObject(settingsNavigation)
         // #420: route the menu-bar Helper's `ratiothink://settings` deep
@@ -553,6 +575,7 @@ struct RatioThinkApp: App {
         .environmentObject(swapCoordinator)
         .environmentObject(engineClientStore)
         .environmentObject(downloadController)
+        .environmentObject(modelLibrary)
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
     }

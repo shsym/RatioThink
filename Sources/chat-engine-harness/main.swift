@@ -214,6 +214,10 @@ enum EngineHarness {
         case .reasoning: reasoningDeltas += 1
         case .answer: answerDeltas += 1
         }
+      case .finalDelta:
+        // #523 Part A: synthesized final-answer chunks — folded into the
+        // tree's finalAnswer by `tree.apply`; nothing extra to print here.
+        break
       case let .nodeComplete(node):
         print(String(format: "  +%6.1fs node_complete depth=\(node.depth) status=\(node.status) score=\(node.score.map(String.init) ?? "nil") answer_len=\(node.content.count) reasoning_len=\(node.reasoning.count)", dt))
       case let .levelPruned(level, kept):

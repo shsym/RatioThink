@@ -69,25 +69,26 @@
 //! stable wire seam: a future move to a dynamically-loaded or separate
 //! inferlet requires no client change.
 //!
-//! ## Scoring caveat (v1)
+//! ## Diversity + scoring (#523)
 //!
-//! The value evaluator asks the model for a single 1–10 integer and
-//! parses the first in-range integer it emits. **Reasoning models**
-//! (e.g. Qwen3, which wraps output in `<think>…</think>`) tend to
-//! restate the problem before answering, so the first integer is often
-//! out of range and the score parses to `null`. A `null` score ranks
-//! lowest, so the beam falls back to deterministic (input-order)
-//! selection — the search still runs and returns a well-formed tree,
-//! but pruning is not quality-driven. Real score-driven pruning needs a
-//! non-reasoning model, a `/no_think`-style directive, or reasoning-tag
-//! stripping + a larger score budget (future work).
+//! Sibling branches do not rely on sampling temperature alone: each fork
+//! gets a distinct per-branch directive (a named, mutually-exclusive
+//! strategy that differs by primary objective/tradeoff; critique-then-
+//! refine at deeper levels — see `search::branch_directive`), and beam
+//! selection demotes a paraphrase of an already-kept sibling so a distinct
+//! branch takes the slot (`tree::select_beam_diverse`). The value evaluator
+//! scores for task relevance, correctness, specificity, and usefulness —
+//! not fluency or brevity — so a polished generic acknowledgment can no
+//! longer outrank a candidate that actually addresses the request.
 //!
-//! This benign `null` (the model emitted no in-range integer) is
-//! distinct from a scorer-*infrastructure* failure (the value-evaluator
-//! fork or generation itself failed): the latter surfaces as a per-node
-//! `score_error`, so an infra collapse that silently degrades the beam to
-//! input-order pruning is observable rather than indistinguishable from
-//! an ordinary `null`.
+//! The scorer is a `/no_think` value head reading the clean (demuxed)
+//! answer; it parses the first in-range 1–10 integer. A `null` score (the
+//! model emitted no in-range integer) ranks lowest and falls back to
+//! input-order, and is distinct from a scorer-*infrastructure* failure
+//! (the value-evaluator fork or generation itself failed), which surfaces
+//! as a per-node `score_error` so an infra collapse is observable rather
+//! than indistinguishable from a benign `null`. Real-model evidence:
+//! `Scripts/run-tot-real-smoke.sh` (gated, NOT CI).
 //!
 //! ## Future
 //!
@@ -98,6 +99,7 @@
 //!   `max_tokens` status granularity; per-node partial content on error;
 //!   streaming (#413).
 
+mod diversity;
 mod schema;
 mod search;
 mod stream;
@@ -303,6 +305,7 @@ pub async fn dispatch(
         root: outcome.root,
         selected_node_id: outcome.selected_node_id,
         final_answer: outcome.final_answer,
+        synthesized: outcome.synthesized,
     };
     let body = match serde_json::to_string(&response_body) {
         Ok(s) => s,
@@ -367,6 +370,7 @@ async fn dispatch_streaming(
             &mut em,
             outcome.selected_node_id.as_deref(),
             outcome.final_answer.as_deref(),
+            outcome.synthesized,
         )
         .await;
     }

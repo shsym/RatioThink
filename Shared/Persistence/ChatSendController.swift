@@ -23,6 +23,7 @@ public final class ChatSendController: ObservableObject {
   private var activeAssistant: Message?
   private var activeContext: ModelContext?
   private var activePersistenceStatus: PersistenceStatus?
+  private var activeUsageIdentity: (tracker: ContextUsageTracker, chatID: UUID, modelID: String, requestID: String)?
 
   public init() {}
 
@@ -34,12 +35,22 @@ public final class ChatSendController: ObservableObject {
     persistenceStatus: PersistenceStatus,
     options: ChatSendRequestOptions,
     recoveryGate: ChatRecoveryGate? = nil,
-    recoveryPolicy: ChatRecoveryPolicy = .default
+    recoveryPolicy: ChatRecoveryPolicy = .default,
+    contextUsageTracker: ContextUsageTracker? = nil
   ) {
     cancel()
     generation &+= 1
     let myGeneration = generation
     let request = Self.makeRequest(chat: chat, options: options)
+    let usageRequestID = UUID().uuidString
+    contextUsageTracker?.markRequestStarted(
+      chatID: chat.id,
+      modelID: options.modelID,
+      requestID: usageRequestID
+    )
+    self.activeUsageIdentity = contextUsageTracker.map {
+      (tracker: $0, chatID: chat.id, modelID: options.modelID, requestID: usageRequestID)
+    }
     isInFlight = true
     Diag.app.event("chat.send", [("model", options.modelID)])
 
@@ -47,6 +58,16 @@ public final class ChatSendController: ObservableObject {
       guard let self else { return }
       var writer: MessageStreamWriter?
       defer {
+        if self.generation == myGeneration,
+           let usage = self.activeUsageIdentity,
+           usage.requestID == usageRequestID {
+          usage.tracker.markRequestFinished(
+            chatID: usage.chatID,
+            modelID: usage.modelID,
+            requestID: usage.requestID
+          )
+          self.activeUsageIdentity = nil
+        }
         if self.generation == myGeneration {
           self.activeWriter = nil
           self.activeAssistant = nil
@@ -101,6 +122,7 @@ public final class ChatSendController: ObservableObject {
       // engine-gone fault — the answer is already persisted; retrying would
       // discard a correct, finished turn.
       var didFinish = false
+      var generationMetrics: GenerationMetrics?
       streamLoop: while attemptsRemaining > 0 {
         attemptsRemaining -= 1
         do {
@@ -126,8 +148,19 @@ public final class ChatSendController: ObservableObject {
               writer?.appendDelta(content)
             case let .reasoningDelta(text):
               writer?.appendReasoningDelta(text)
+            case let .generationMetrics(metrics):
+              generationMetrics = metrics
+              if didFinish {
+                Self.persistGenerationMetrics(
+                  metrics,
+                  on: assistant,
+                  finishReason: assistant.finishReason,
+                  context: context,
+                  persistenceStatus: persistenceStatus
+                )
+              }
             case let .finish(reason):
-              writer?.finish(meta: Self.finishMeta(for: reason))
+              writer?.finish(meta: Self.finishMeta(for: reason, generationMetrics: generationMetrics))
               didFinish = true
               let reasonValue = Self.finishReasonValue(for: reason)
               Diag.app.event(reasonValue == "length" ? "chat.truncated" : "chat.stream_end",
@@ -144,13 +177,19 @@ public final class ChatSendController: ObservableObject {
           writer?.cancel()
           return
         } catch {
-          // A throw AFTER the terminal `.finish` chunk (engine died between
-          // `.finish` and the `[DONE]` sentinel) is not a lost turn — the
-          // answer is already persisted and the active* fields nilled. Treat
-          // as terminal: do not retry/reset (would discard a correct answer)
-          // and do not markAssistant (would overwrite it with the engine-gone
-          // warning). The writer already finished, so no cleanup is needed.
-          if didFinish { return }
+          // A transport closure AFTER the terminal `.finish` chunk (engine
+          // died between `.finish` and the `[DONE]` sentinel) is not a lost
+          // turn — the answer is already persisted. Protocol/decode errors
+          // after `.finish`, however, are still contract violations (for
+          // example malformed terminal `generation_metrics`) and must leave a
+          // diagnostic instead of looking identical to historical no-metric
+          // rows.
+          if didFinish {
+            if !Self.isBenignPostFinishTransportClosure(error) {
+              persistenceStatus.report(error, context: "ChatSendController.postFinishStreamError")
+            }
+            return
+          }
           guard self.generation == myGeneration, !Task.isCancelled else {
             writer?.cancel()
             return
@@ -211,6 +250,7 @@ public final class ChatSendController: ObservableObject {
           assistant.content = ""
           assistant.reasoning = ""
           assistant.meta = nil
+          generationMetrics = nil
           do {
             try context.save()
           } catch {
@@ -319,7 +359,12 @@ public final class ChatSendController: ObservableObject {
         for try await event in toTEventStream(from: engine.dispatchInferlet(request)) {
           guard self.generation == myGeneration, !Task.isCancelled else { return }
           tree.apply(event)
-          let isDelta: Bool = { if case .nodeDelta = event { return true } else { return false } }()
+          let isDelta: Bool = {
+            switch event {
+            case .nodeDelta, .finalDelta: return true
+            default: return false
+            }
+          }()
           let now = Date()
           if !isDelta || now.timeIntervalSince(lastLiveEncode) >= Self.totLiveEncodeInterval {
             lastLiveEncode = now
@@ -350,6 +395,11 @@ public final class ChatSendController: ObservableObject {
             self.activeAssistant = nil
             self.activeContext = nil
             self.activePersistenceStatus = nil
+          case let .finalDelta(text):
+            // #523 Part A: stream the synthesized final answer into the row
+            // live (the row's content is otherwise empty until the terminal);
+            // `treeComplete` then sets the authoritative full text.
+            assistant.content += text
           case .levelPruned:
             Self.persistTree(context, status: persistenceStatus)
           case .treeStart, .nodeStart, .nodeDelta, .nodeComplete:
@@ -439,6 +489,14 @@ public final class ChatSendController: ObservableObject {
         persistenceStatus: status
       )
     }
+    if let usage = activeUsageIdentity {
+      usage.tracker.markRequestFinished(
+        chatID: usage.chatID,
+        modelID: usage.modelID,
+        requestID: usage.requestID
+      )
+    }
+    activeUsageIdentity = nil
     activeWriter = nil
     activeAssistant = nil
     activeContext = nil
@@ -543,10 +601,7 @@ public final class ChatSendController: ObservableObject {
       turns.append(ChatMessage(role: .system, content: prompt))
     }
     turns.append(contentsOf: chat.messages
-      .sorted { lhs, rhs in
-        if lhs.ts == rhs.ts { return lhs.id.uuidString < rhs.id.uuidString }
-        return lhs.ts < rhs.ts
-      }
+      .sorted(by: Message.transcriptPrecedes)
       .compactMap { message in
         guard let role = ChatMessage.Role(rawValue: message.role) else { return nil }
         guard !Self.excludesFromRequestHistory(message, role: role) else { return nil }
@@ -592,10 +647,74 @@ public final class ChatSendController: ObservableObject {
   }
 
   private static func finishMeta(for reason: ChatEvent.FinishReason) -> Data? {
-    struct FinishMeta: Encodable { let finishReason: String }
-    let encoder = JSONEncoder()
-    encoder.keyEncodingStrategy = .convertToSnakeCase
-    return try? encoder.encode(FinishMeta(finishReason: finishReasonValue(for: reason)))
+    finishMeta(for: reason, generationMetrics: nil)
+  }
+
+  private static func finishMeta(
+    for reason: ChatEvent.FinishReason,
+    generationMetrics: GenerationMetrics?
+  ) -> Data? {
+    let validMetrics = finishReasonValue(for: reason) == finishReasonValue(for: .cancelled)
+      ? nil
+      : validGenerationMetrics(generationMetrics)
+    let meta = MessageMeta(
+      finishReason: finishReasonValue(for: reason),
+      generationPerformance: validMetrics
+    )
+    return try? JSONEncoder().encode(meta)
+  }
+
+  private static func validGenerationMetrics(_ metrics: GenerationMetrics?) -> GenerationMetrics? {
+    guard let metrics,
+          metrics.outputTokens > 0,
+          metrics.elapsedSeconds > 0,
+          metrics.elapsedSeconds.isFinite,
+          metrics.tokensPerSecond > 0,
+          metrics.tokensPerSecond.isFinite else { return nil }
+    return metrics
+  }
+
+  private static func persistGenerationMetrics(
+    _ metrics: GenerationMetrics,
+    on assistant: Message,
+    finishReason: String?,
+    context: ModelContext,
+    persistenceStatus: PersistenceStatus
+  ) {
+    guard finishReason != finishReasonValue(for: .cancelled),
+          let valid = validGenerationMetrics(metrics) else { return }
+    assistant.tokens = valid.outputTokens
+    assistant.meta = try? JSONEncoder().encode(MessageMeta(
+      finishReason: finishReason,
+      generationPerformance: valid
+    ))
+    do {
+      try context.save()
+    } catch {
+      persistenceStatus.report(error, context: "ChatSendController.persistGenerationMetrics")
+    }
+  }
+
+  private static func isBenignPostFinishTransportClosure(_ error: Error) -> Bool {
+    if error is CancellationError { return true }
+    if let urlError = error as? URLError {
+      switch urlError.code {
+      case .cancelled,
+           .networkConnectionLost,
+           .cannotConnectToHost,
+           .cannotFindHost,
+           .notConnectedToInternet,
+           .timedOut:
+        return true
+      default:
+        return false
+      }
+    }
+    if let engineError = error as? HTTPEngineError,
+       case .engineGone = engineError {
+      return true
+    }
+    return false
   }
 
   private static func markAssistant(
@@ -706,6 +825,19 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
     self.systemPromptOverride = systemPromptOverride
     self.speculation = speculation
     self.maxOutputTokensCeiling = maxOutputTokensCeiling
+  }
+
+  /// A copy with `sampling` replaced. Used by the tree-of-thought dispatch
+  /// to source its temperature from the active profile (#523 Part B) rather
+  /// than the toolbar default, leaving every other option intact.
+  public func withSampling(_ sampling: ChatSampling) -> ChatSendRequestOptions {
+    ChatSendRequestOptions(
+      modelID: modelID,
+      sampling: sampling,
+      systemPromptOverride: systemPromptOverride,
+      speculation: speculation,
+      maxOutputTokensCeiling: maxOutputTokensCeiling
+    )
   }
 }
 

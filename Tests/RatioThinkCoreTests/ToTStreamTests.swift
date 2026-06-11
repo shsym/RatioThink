@@ -147,6 +147,22 @@ final class ToTStreamTests: XCTestCase {
     XCTAssertEqual(e, .treeComplete(selectedNodeID: nil, finalAnswer: nil))
   }
 
+  func test_decodes_final_delta() throws {
+    // #523 Part A: streamed chunk of the synthesized final answer.
+    let e = try decodeToTFrame(frame(
+      #"{"event":"final_delta","text":"the answer is "}"#
+    ))
+    XCTAssertEqual(e, .finalDelta(text: "the answer is "))
+  }
+
+  func test_final_delta_missing_text_is_malformed() {
+    XCTAssertThrowsError(try decodeToTFrame(frame(#"{"event":"final_delta"}"#))) { err in
+      guard case .malformedFrame = (err as? ToTStreamError) else {
+        return XCTFail("expected malformedFrame, got \(err)")
+      }
+    }
+  }
+
   func test_error_frame_throws_stream_error() {
     XCTAssertThrowsError(try decodeToTFrame(frame(
       #"{"event":"error","code":"serialize_bug","message":"boom"}"#

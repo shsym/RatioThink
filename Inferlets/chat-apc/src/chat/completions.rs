@@ -393,6 +393,29 @@ struct SpecMetricsReport {
     draft_len: usize,
 }
 
+#[derive(Serialize)]
+struct GenerationMetricsSse {
+    event: &'static str,
+    output_tokens: usize,
+    elapsed_s: f64,
+    tokens_per_sec: f64,
+}
+
+impl GenerationMetricsSse {
+    fn build(output_tokens: usize, elapsed: Duration) -> Option<Self> {
+        let elapsed_s = elapsed.as_secs_f64();
+        if output_tokens == 0 || elapsed_s <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            event: "generation_metrics",
+            output_tokens,
+            elapsed_s,
+            tokens_per_sec: output_tokens as f64 / elapsed_s,
+        })
+    }
+}
+
 impl SpecMetricsReport {
     fn build(
         enabled: bool,
@@ -2601,6 +2624,18 @@ async fn handle_streaming(
             eprintln!("[chat-apc] error-meta serialize bug: {e}");
         }
     }
+    // Terminal generation-throughput frame for UI/benchmark consumers.
+    // The counter is engine-side generated output tokens (including
+    // reasoning tokens); the timer is decode-loop elapsed, so this is
+    // throughput, not prefill latency / TTFT. Failed/tool-call partials do
+    // not emit a metric until a reliable display policy exists.
+    if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
+        if let Some(frame) = GenerationMetricsSse::build(spec_generated, spec_start.elapsed()) {
+            if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
+                eprintln!("[chat-apc] generation_metrics serialize bug: {e}");
+            }
+        }
+    }
     // #418: terminal spec_metrics frame (only when the caller opted into
     // the speculation surface, so normal streams are byte-identical).
     if want_metrics {
@@ -3328,6 +3363,21 @@ fn next_tool_call_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_metrics_frame_field_names_and_boundaries_are_stable() {
+        assert!(GenerationMetricsSse::build(0, Duration::from_millis(500)).is_none());
+        assert!(GenerationMetricsSse::build(3, Duration::ZERO).is_none());
+
+        let frame = GenerationMetricsSse::build(21, Duration::from_millis(500))
+            .expect("positive token count and elapsed time should emit metrics");
+        let json = serde_json::to_value(frame).expect("generation metrics serialize");
+
+        assert_eq!(json["event"].as_str(), Some("generation_metrics"));
+        assert_eq!(json["output_tokens"].as_u64(), Some(21));
+        assert_eq!(json["elapsed_s"].as_f64(), Some(0.5));
+        assert_eq!(json["tokens_per_sec"].as_f64(), Some(42.0));
+    }
 
     // ─── Multi-part message content (#115) ─────────────────
 
