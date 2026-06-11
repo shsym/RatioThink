@@ -4,13 +4,12 @@ import XCTest
 @MainActor
 final class ChatScaffoldModelSelectionTests: XCTestCase {
   func test_nothing_resolvable_returns_nil_so_send_is_blocked() {
-    // : no hidden fallback. With no test override, no pinned model, and no
-    // profile default, resolution yields nil — the caller blocks the send
-    // and shows the no-model confirm rather than silently loading something.
+    // : no hidden fallback. With no pinned model and no profile default,
+    // resolution yields nil — the caller blocks the send and shows the
+    // no-model confirm rather than silently loading something.
     let selected = ChatScaffoldView.requestModelID(
       selectedModelID: nil,
-      profileDefaultModel: nil,
-      testModelID: nil
+      profileDefaultModel: nil
     )
     XCTAssertNil(selected)
   }
@@ -30,8 +29,7 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     XCTAssertEqual(
       ChatScaffoldView.requestModelID(
         selectedModelID: "pinned-model",
-        profileDefaultModel: "profile-default",
-        testModelID: nil
+        profileDefaultModel: "profile-default"
       ),
       "pinned-model"
     )
@@ -43,21 +41,9 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     XCTAssertEqual(
       ChatScaffoldView.requestModelID(
         selectedModelID: nil,
-        profileDefaultModel: "profile-default",
-        testModelID: nil
+        profileDefaultModel: "profile-default"
       ),
       "profile-default"
-    )
-  }
-
-  func test_chat_gui_override_still_points_at_small_model_harness() {
-    XCTAssertEqual(
-      ChatScaffoldView.requestModelID(
-        selectedModelID: nil,
-        profileDefaultModel: nil,
-        testModelID: "Qwen/Qwen3-0.6B"
-      ),
-      "Qwen/Qwen3-0.6B"
     )
   }
 
@@ -166,16 +152,15 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     (nil, nil),                           // nothing → nil
   ]
 
-  func test_requestModelID_non_override_path_equals_ModelTarget_resolve() {
-    // With no GUI test override, `requestModelID` IS the resolver's pick →
-    // default → nil. (The `testModelID` seam is a harness override, proven
-    // separately above; it is not a pin/default source.)
+  func test_requestModelID_equals_ModelTarget_resolve() {
+    // `requestModelID` IS the resolver's pick → default → nil — no parallel
+    // send-model override (#504 retired `PIE_TEST_CHAT_MODEL`).
     for c in Self.pinDefaultMatrix {
       XCTAssertEqual(
         ChatScaffoldView.requestModelID(
-          selectedModelID: c.pin, profileDefaultModel: c.def, testModelID: nil),
+          selectedModelID: c.pin, profileDefaultModel: c.def),
         ModelTarget.resolve(selectedModelID: c.pin, profileDefault: c.def)?.modelID,
-        "requestModelID (no override) must equal ModelTarget.resolve for pin=\(String(describing: c.pin)) default=\(String(describing: c.def))"
+        "requestModelID must equal ModelTarget.resolve for pin=\(String(describing: c.pin)) default=\(String(describing: c.def))"
       )
     }
   }

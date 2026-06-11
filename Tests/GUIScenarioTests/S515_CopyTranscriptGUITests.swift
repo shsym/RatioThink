@@ -25,7 +25,7 @@ final class S515_CopyTranscriptGUITests: XCTestCase {
                                 "\(Self.configPath) must define PIE_TEST_ENGINE_BASE_URL")
     let pieHome = try XCTUnwrap(config["PIE_TEST_GUI_HOME"],
                                 "\(Self.configPath) must define PIE_TEST_GUI_HOME")
-    let model = config["PIE_TEST_CHAT_MODEL"] ?? "gui-stream-deterministic"
+    let model = config["PIE_TEST_CHAT_MODEL_PIN"] ?? "gui-stream-deterministic"
     // Unwrap the path and read separately so "key missing" and "file
     // unreadable" fail with distinct, correctly-attributed messages.
     let answerPath = try XCTUnwrap(config["PIE_TEST_EXPECTED_ANSWER_FILE"],
@@ -39,11 +39,13 @@ final class S515_CopyTranscriptGUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = model
-    // Without a real helper, the #496 recovery overlay can sit over the chat
-    // body and swallow every transcript click (keyboard still reaches the
-    // composer — exactly the observed failure). Pin helper health for the
-    // engine-base-URL seam.
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = model
+    // #504: pin the engine `.running` so the real send-gate passes (the
+    // `PIE_TEST_CHAT_MODEL` bypass is gone); the actual send still hits
+    // `PIE_TEST_ENGINE_BASE_URL`, whose port the pin is derived from.
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
+    // Pin helper health so the transcript stays interactive on the
+    // engine-base-URL seam (no real helper).
     app.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "healthy"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     app.launch()

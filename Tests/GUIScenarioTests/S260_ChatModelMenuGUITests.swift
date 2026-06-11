@@ -26,7 +26,7 @@ final class S260_ChatModelMenuGUITests: XCTestCase {
     let pieHome = try XCTUnwrap(
       config["PIE_TEST_GUI_HOME"],
       "\(Self.configPath) must define PIE_TEST_GUI_HOME")
-    let servedModelID = config["PIE_TEST_CHAT_MODEL"]
+    let servedModelID = config["PIE_TEST_CHAT_MODEL_PIN"]
       ?? "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
 
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")

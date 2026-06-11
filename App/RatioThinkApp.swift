@@ -327,6 +327,11 @@ struct RatioThinkApp: App {
   }
 
   private static func makeDownloadController() -> ModelDownloadController {
+    // DEBUG-only GUI/e2e seams: a faked or fixture-backed downloader so a test
+    // exercises the download UI without hitting the network. `#if DEBUG` so the
+    // env reads (and the test downloaders) compile out of Release entirely —
+    // a shipped app can never be redirected onto a fake download path.
+    #if DEBUG
     if ProcessInfo.processInfo.environment["PIE_TEST_FAKE_DOWNLOADS"] == "1" {
       return ModelDownloadController(
         downloader: EnvironmentFakeModelDownloader(),
@@ -339,6 +344,7 @@ struct RatioThinkApp: App {
         terminalRowLingerSeconds: 60
       )
     }
+    #endif
     return ModelDownloadController()
   }
 

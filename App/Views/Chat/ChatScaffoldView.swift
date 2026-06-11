@@ -660,10 +660,9 @@ struct ChatScaffoldView: View {
   /// than a send that passes the gate then fails at HTTP); `EngineLifecycle`
   /// clears residency on the leave-`.running` edge and `reconcileEngine
   /// ResidentModel` re-seeds `chat.modelID` to the served id once running,
-  /// so by send time the authority matches what the engine serves. The
-  /// test override (`PIE_TEST_CHAT_MODEL`) bypasses the running gate for the
-  /// GUI harness. No `residentModelID` read here — residency is an engine
-  /// fact reconciled INTO the authority, not a parallel selection source.
+  /// so by send time the authority matches what the engine serves. No
+  /// `residentModelID` read here — residency is an engine fact reconciled
+  /// INTO the authority, not a parallel selection source.
   private func currentModelID(for chat: Chat) -> String? {
     let engineRunning: Bool = {
       if case .running = engineStatusStore.status { return true }
@@ -671,8 +670,7 @@ struct ChatScaffoldView: View {
     }()
     return Self.requestModelID(
       selectedModelID: engineRunning ? chat.modelID : nil,
-      profileDefaultModel: engineRunning ? selectedProfileDefault : nil,
-      testModelID: ProcessInfo.processInfo.environment["PIE_TEST_CHAT_MODEL"]
+      profileDefaultModel: engineRunning ? selectedProfileDefault : nil
     )
   }
 
@@ -918,22 +916,19 @@ struct ChatScaffoldView: View {
   /// else the active profile's default, else nil. : no hidden fallback —
   /// when nothing resolves the caller blocks the send behind the no-model
   /// confirm rather than asking the engine to load something the user never
-  /// chose. The test override wins for the GUI harness. Pure + static so the
-  /// precedence is unit-tested without a view.
+  /// chose. Pure + static so the precedence is unit-tested without a view.
+  ///
+  /// Pin-over-default precedence routes through the one derivation
+  /// (`ModelTarget.resolve`) so the send path can never disagree with the
+  /// gate/launch path about which model the chat means. GUI tests reach this
+  /// path the same way a user does — a pinned `Chat.modelID` and a running
+  /// engine — never a parallel send-model override (#504 retired the
+  /// `PIE_TEST_CHAT_MODEL` bypass).
   static func requestModelID(
     selectedModelID: String?,
-    profileDefaultModel: String?,
-    testModelID: String? = nil
+    profileDefaultModel: String?
   ) -> String? {
-    if let testModel = testModelID, !testModel.isEmpty {
-      return testModel
-    }
-    // Pin-over-default precedence routes through the one derivation
-    // (`ModelTarget.resolve`) so the send path can never disagree with the
-    // gate/launch path about which model the chat means. The test override
-    // above is a GUI-harness seam, not a pin/default source, so it stays
-    // ahead of resolution (#504 tracks retiring it).
-    return ModelTarget.resolve(selectedModelID: selectedModelID,
-                               profileDefault: profileDefaultModel)?.modelID
+    ModelTarget.resolve(selectedModelID: selectedModelID,
+                        profileDefault: profileDefaultModel)?.modelID
   }
 }

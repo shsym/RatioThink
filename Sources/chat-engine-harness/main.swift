@@ -7,7 +7,10 @@ enum EngineHarness {
   static func main() async throws {
     let env = ProcessInfo.processInfo.environment
     let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-    let model = env["PIE_TEST_CHAT_MODEL"].flatMap { $0.isEmpty ? nil : $0 } ?? "Qwen/Qwen3-0.6B"
+    // The model the engine serves is the SAME id the app pins as the chat's
+    // selection (`PIE_TEST_CHAT_MODEL_PIN` → `Chat.modelID`), so the request the
+    // app sends and the model this harness advertises always match (#504).
+    let model = env["PIE_TEST_CHAT_MODEL_PIN"].flatMap { $0.isEmpty ? nil : $0 } ?? "Qwen/Qwen3-0.6B"
     let pieBinary = URL(fileURLWithPath: env["PIE_BIN"] ?? cwd.appendingPathComponent("Vendor/pie/target/aarch64-apple-darwin/release/pie").path)
     let urlFile = URL(fileURLWithPath: env["PIE_TEST_ENGINE_URL_FILE"] ?? "/tmp/pie-chat-engine.url")
     let pieHome: URL

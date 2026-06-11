@@ -67,7 +67,15 @@ final class S279_LifecycleRecoveryGUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = staleBaseURL
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = "stale-engine-scenario"
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = "stale-engine-scenario"
+    // #504: the send-gate bypass override is gone, so pin the engine `.running`
+    // to PASS the gate for real — but the base URL points at a DEAD port
+    // (127.0.0.1:9), so the send still fails at the socket. The asserted
+    // user-visible outcome (a recoverable connection error + the composer
+    // re-enables) is unchanged; only the injected fault shifts from "engine
+    // never came up" to "engine reports running but is unreachable" — a faithful
+    // stale-engine-config fault.
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
   }
 

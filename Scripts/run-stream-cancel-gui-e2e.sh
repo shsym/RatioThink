@@ -71,7 +71,7 @@ BASE_URL="$(cat "$URL_FILE")"
 cat >"$CONFIG_FILE" <<EOF
 PIE_TEST_ENGINE_BASE_URL=$BASE_URL
 PIE_TEST_GUI_HOME=$GUI_HOME
-PIE_TEST_CHAT_MODEL=$MODEL
+PIE_TEST_CHAT_MODEL_PIN=$MODEL
 EOF
 
 echo "stream-cancel gui e2e: generating Xcode project"
