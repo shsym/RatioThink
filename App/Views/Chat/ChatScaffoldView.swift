@@ -486,6 +486,9 @@ struct ChatScaffoldView: View {
           // #397: ensure the engine is running FIRST, then load — the
           // pre-#397 `loadDirect` no-opped on a stopped engine. The sheet
           // stays open, reflects busy→ready, and auto-dismisses below.
+          // The common load path defers while any chat is streaming so this
+          // prompt button can't restart the single engine out from under a
+          // sibling chat.
           loadDefaultModel(model)
         },
         onDownloaded: {
@@ -1111,6 +1114,13 @@ struct ChatScaffoldView: View {
   /// `engineNotReady`. The sheet stays open and reflects busy→ready, then
   /// auto-dismisses via `resolutionEdge` (probe-gated — review v3 F9).
   private func loadDefaultModel(_ model: String) {
+    switch Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) {
+    case .runNow:
+      break
+    case .deferUntilIdle:
+      deferEngineLoadUntilStreamsIdle(model)
+      return
+    }
     switch engineStatusStore.status {
     case .running:
       // Engine up — make it serve this model. #469: a model that differs from
@@ -1146,7 +1156,7 @@ struct ChatScaffoldView: View {
                                                isModelInstalled: Self.isModelInstalled) else {
       return
     }
-    guard !Self.shouldDeferEngineSyncForStreams(sendCoordinator.inFlightChatIDs) else {
+    guard Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) == .runNow else {
       deferEngineSyncUntilStreamsIdle(for: chat)
       return
     }
@@ -1167,11 +1177,20 @@ struct ChatScaffoldView: View {
     !inFlightChatIDs.isEmpty
   }
 
+  enum EngineMutationDecision: Equatable {
+    case runNow
+    case deferUntilIdle
+  }
+
+  static func engineMutationDecision(inFlightChatIDs: Set<UUID>) -> EngineMutationDecision {
+    shouldDeferEngineSyncForStreams(inFlightChatIDs) ? .deferUntilIdle : .runNow
+  }
+
   private func deferEngineSyncUntilStreamsIdle(for chat: Chat) {
     guard deferredEngineSyncTask == nil else { return }
     deferredEngineSyncTask = Task { @MainActor in
       defer { deferredEngineSyncTask = nil }
-      while Self.shouldDeferEngineSyncForStreams(sendCoordinator.inFlightChatIDs) {
+      while Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) == .deferUntilIdle {
         do {
           try await Task.sleep(nanoseconds: 250_000_000)
         } catch {
@@ -1179,6 +1198,21 @@ struct ChatScaffoldView: View {
         }
       }
       synchronizeEngineForPendingSend(chat)
+    }
+  }
+
+  private func deferEngineLoadUntilStreamsIdle(_ model: String) {
+    guard deferredEngineSyncTask == nil else { return }
+    deferredEngineSyncTask = Task { @MainActor in
+      defer { deferredEngineSyncTask = nil }
+      while Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) == .deferUntilIdle {
+        do {
+          try await Task.sleep(nanoseconds: 250_000_000)
+        } catch {
+          return
+        }
+      }
+      loadDefaultModel(model)
     }
   }
 
@@ -1200,8 +1234,8 @@ struct ChatScaffoldView: View {
   /// pending send there is nothing to settle (the pre-existing NSLog
   /// behavior stands — surfacing the failure in the gate UI is the
   /// deferred FC1). With one armed: first pass earns a backed-off retry;
-  /// the final failure falls back to the residency-free resolution edge
-  /// so the promise settles (fire or disarm) instead of holding forever.
+  /// the final failure explicitly terminates the pending flow instead of
+  /// holding forever on equal `.running` polls that will not re-run reconcile.
   enum ReconcileFailureStep: Equatable {
     case none, retry, fallbackEdge
   }
@@ -1232,17 +1266,20 @@ struct ChatScaffoldView: View {
     return resolvedModelID
   }
 
-  /// The model observation used to settle a pending auto-send. This is
-  /// intentionally wider than the send-safe model: a different resident model
-  /// is not safe to send to, but it is exactly the evidence needed to disarm a
-  /// stale pending send instead of holding forever behind `currentModelID == nil`.
-  static func pendingSettlementModelID(targetModelID: String?,
-                                       residentModelID: String?) -> String? {
-    guard targetModelID?.isEmpty == false else { return nil }
-    if let residentModelID, !residentModelID.isEmpty {
-      return residentModelID
-    }
-    return nil
+  enum PendingSettlementResolution: Equatable {
+    case hold
+    case disarm
+    case model(String)
+  }
+
+  static func pendingSettlementResolution(currentTargetModelID: String?,
+                                          pendingTargetModelID: String?,
+                                          residentModelID: String?) -> PendingSettlementResolution {
+    guard let pendingTargetModelID, !pendingTargetModelID.isEmpty else { return .hold }
+    guard let currentTargetModelID, !currentTargetModelID.isEmpty else { return .disarm }
+    guard currentTargetModelID == pendingTargetModelID else { return .disarm }
+    guard let residentModelID, !residentModelID.isEmpty else { return .hold }
+    return .model(residentModelID)
   }
 
   private func terminatePendingSendAfterReconcileFailure(for chat: Chat) {
@@ -1264,8 +1301,9 @@ struct ChatScaffoldView: View {
       resolvedModelID: currentModelID(for: chat),
       residentModelID: modelLoadCenter.residentModelID,
       requiresResidency: requiresResidency)
-    let pendingResolved = Self.pendingSettlementModelID(
-      targetModelID: gateTarget(for: chat)?.modelID,
+    let pendingResolution = Self.pendingSettlementResolution(
+      currentTargetModelID: gateTarget(for: chat)?.modelID,
+      pendingTargetModelID: pendingSend.pending?.targetModelID,
       residentModelID: modelLoadCenter.residentModelID)
     // #397: close the gate once a model resolves so the user lands back at
     // the composer with their draft intact. Review v3 F9: dismissal stays
@@ -1278,9 +1316,18 @@ struct ChatScaffoldView: View {
     // Settle the pending: fire-once (cleared before the signal so
     // re-entrant edges can never double-send), disarm on stale, else hold.
     // The transition bookkeeping lives in `PendingSendState` (tested).
-    pendingSend.settle(chatID: chat.id,
-                       resolvedModelID: pendingResolved,
-                       isSending: sendCoordinator.isInFlight(chatID))
+    switch pendingResolution {
+    case .hold:
+      pendingSend.settle(chatID: chat.id,
+                         resolvedModelID: nil,
+                         isSending: sendCoordinator.isInFlight(chatID))
+    case .disarm:
+      pendingSend.disarm()
+    case .model(let modelID):
+      pendingSend.settle(chatID: chat.id,
+                         resolvedModelID: modelID,
+                         isSending: sendCoordinator.isInFlight(chatID))
+    }
   }
 
   /// Resolve the model a send may target only when the chat's SELECTION

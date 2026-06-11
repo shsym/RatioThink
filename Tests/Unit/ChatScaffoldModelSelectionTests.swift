@@ -284,9 +284,10 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     var state = PendingSendState()
     state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
     XCTAssertNotNil(state.pending)
-    XCTAssertNil(
-      ChatScaffoldView.pendingSettlementModelID(
-        targetModelID: "org/A", residentModelID: nil))
+    XCTAssertEqual(
+      ChatScaffoldView.pendingSettlementResolution(
+        currentTargetModelID: "org/A", pendingTargetModelID: "org/A", residentModelID: nil),
+      .hold)
     state.terminate(chatID: chatID)
     XCTAssertNil(state.pending)
     XCTAssertNil(state.autoSubmit)
@@ -301,13 +302,37 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       resolvedModelID: nil, residentModelID: "org/B", requiresResidency: false)
     XCTAssertNil(sendSafe, "production currentModelID is nil when target A and resident B differ")
 
-    let settlement = ChatScaffoldView.pendingSettlementModelID(
-      targetModelID: "org/A", residentModelID: "org/B")
-    XCTAssertEqual(settlement, "org/B", "resident B is stale-context evidence for the pending send")
+    XCTAssertEqual(
+      ChatScaffoldView.pendingSettlementResolution(
+        currentTargetModelID: "org/A", pendingTargetModelID: "org/A", residentModelID: "org/B"),
+      .model("org/B"),
+      "resident B is stale-context evidence for the pending send")
 
-    state.settle(chatID: chatID, resolvedModelID: settlement, isSending: false)
+    state.settle(chatID: chatID, resolvedModelID: "org/B", isSending: false)
     XCTAssertNil(state.pending, "different resident must disarm instead of holding forever")
     XCTAssertNil(state.autoSubmit)
+  }
+
+  func test_528_pending_settlement_disarms_when_current_target_changes_from_pending_target() {
+    let chatID = UUID()
+    var state = PendingSendState()
+    state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
+
+    switch ChatScaffoldView.pendingSettlementResolution(
+      currentTargetModelID: "org/B",
+      pendingTargetModelID: "org/A",
+      residentModelID: "org/A"
+    ) {
+    case .disarm:
+      state.disarm()
+    case .model(let modelID):
+      state.settle(chatID: chatID, resolvedModelID: modelID, isSending: false)
+    case .hold:
+      state.settle(chatID: chatID, resolvedModelID: nil, isSending: false)
+    }
+
+    XCTAssertNil(state.autoSubmit, "a resident old target must not auto-fire after the chat target changes")
+    XCTAssertNil(state.pending, "changed current target makes the armed pending send stale")
   }
 
   func test_528_pending_settlement_fires_only_on_exact_target_resident_match() {
@@ -315,9 +340,11 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     var state = PendingSendState()
     state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
 
-    let settlement = ChatScaffoldView.pendingSettlementModelID(
-      targetModelID: "org/A", residentModelID: "org/A")
-    state.settle(chatID: chatID, resolvedModelID: settlement, isSending: false)
+    XCTAssertEqual(
+      ChatScaffoldView.pendingSettlementResolution(
+        currentTargetModelID: "org/A", pendingTargetModelID: "org/A", residentModelID: "org/A"),
+      .model("org/A"))
+    state.settle(chatID: chatID, resolvedModelID: "org/A", isSending: false)
 
     XCTAssertNil(state.pending)
     XCTAssertEqual(state.autoSubmit, ComposerAutoSubmit(tick: 1, expectedText: "hi"))
@@ -331,6 +358,17 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     XCTAssertFalse(
       ChatScaffoldView.shouldDeferEngineSyncForStreams([]),
       "once the app-wide stream set is idle the deferred sync may run")
+  }
+
+  func test_528_explicit_prompt_load_uses_same_stream_guard_as_automatic_sync() {
+    let chatB = UUID()
+    XCTAssertEqual(
+      ChatScaffoldView.engineMutationDecision(inFlightChatIDs: [chatB]),
+      .deferUntilIdle,
+      "the prompt Load action and automatic sync must both avoid restarting the single engine while another chat streams")
+    XCTAssertEqual(
+      ChatScaffoldView.engineMutationDecision(inFlightChatIDs: []),
+      .runNow)
   }
 
   // MARK: - #516 review F9: sheet dismissal keys on the probe, not raw resolution
