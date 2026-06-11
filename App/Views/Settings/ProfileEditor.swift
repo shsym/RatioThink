@@ -422,11 +422,11 @@ struct ProfileModelPickerLabel: View {
     .frame(idealWidth: Self.maxLayoutWidth,
            maxWidth: Self.maxLayoutWidth,
            alignment: .leading)
-    .help(Self.accessibilityHelp(for: modelID))
+    .help(Self.accessibilityHelpText(for: modelID))
     .accessibilityElement(children: .ignore)
     .accessibilityLabel(Self.accessibilityText(for: displayName))
-    .accessibilityHint(Self.accessibilityHelp(for: modelID))
-    .accessibilityValue(Self.accessibilityHelp(for: modelID))
+    .accessibilityHint(Self.accessibilityHelpText(for: modelID))
+    .accessibilityValue(Self.accessibilityHelpText(for: modelID))
   }
 
   private var displayName: String {
@@ -437,11 +437,11 @@ struct ProfileModelPickerLabel: View {
     modelID.map(ModelDisplayName.leaf) ?? "No default model"
   }
 
-  static func accessibilityText(for displayName: String) -> String {
-    "Default model: \(displayName)"
+  static func accessibilityHelpText(for modelID: String?) -> String {
+    modelID ?? displayText(for: modelID)
   }
 
-  static func accessibilityHelp(for modelID: String?) -> String {
-    modelID ?? displayText(for: modelID)
+  static func accessibilityText(for displayName: String) -> String {
+    "Default model: \(displayName)"
   }
 }

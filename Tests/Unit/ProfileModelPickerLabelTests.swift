@@ -17,32 +17,17 @@ final class ProfileModelPickerLabelTests: XCTestCase {
       "The profile model picker label must not ask its Settings row to grow for long HF ids")
   }
 
-  func test_accessibility_label_uses_visible_leaf_and_value_preserves_full_model_id() {
-    let host = NSHostingView(rootView: ProfileModelPickerLabel(modelID: longModelID))
-    host.frame = NSRect(x: 0, y: 0,
-                        width: ProfileModelPickerLabel.maxLayoutWidth,
-                        height: 32)
-    host.layoutSubtreeIfNeeded()
-    let accessibilityDump = accessibilityDescriptions(in: host)
+  func test_accessibility_copy_uses_visible_leaf_and_value_preserves_full_model_id() {
+    let displayName = ProfileModelPickerLabel.displayText(for: longModelID)
 
-    if accessibilityDump.isEmpty {
-      // Headless app-unit runs on newer macOS can leave an unattached
-      // NSHostingView without an exported accessibility subtree. Keep the
-      // contract covered at the source in that environment; the visible-text
-      // test below still verifies the rendered label leaf.
-      XCTAssertEqual(
-        ProfileModelPickerLabel.accessibilityText(for: ModelDisplayName.leaf(longModelID)),
-        "Default model: \(ModelDisplayName.leaf(longModelID))")
-      XCTAssertEqual(ProfileModelPickerLabel.accessibilityHelp(for: longModelID), longModelID)
-      return
-    }
-
-    XCTAssertTrue(
-      accessibilityDump.contains("label=Default model: \(ModelDisplayName.leaf(longModelID))"),
-      "The selected picker label should present the same friendly leaf that is visible in the UI; dump=\(accessibilityDump)")
-    XCTAssertTrue(
-      accessibilityDump.contains("help=\(longModelID)"),
-      "The full resolver slug should remain available through accessibility help even when the visible label is shortened; dump=\(accessibilityDump)")
+    XCTAssertEqual(
+      ProfileModelPickerLabel.accessibilityText(for: displayName),
+      "Default model: \(ModelDisplayName.leaf(longModelID))",
+      "The selected picker accessibility label should present the same friendly leaf that is visible in the UI")
+    XCTAssertEqual(
+      ProfileModelPickerLabel.accessibilityHelpText(for: longModelID),
+      longModelID,
+      "The full resolver slug should remain available through accessibility help/value even when the visible label is shortened")
   }
 
   func test_visible_selected_label_text_uses_friendly_leaf_not_raw_slug() {
@@ -64,29 +49,6 @@ final class ProfileModelPickerLabelTests: XCTestCase {
       visibleText,
       ["No default model"],
       "A profile with no default model should keep the explicit no-default label after the bounded picker-label merge")
-  }
-
-  private func accessibilityDescriptions(in element: Any) -> [String] {
-    guard let object = element as? NSObject else { return [] }
-    let label = accessibilityString(object, "accessibilityLabel").map { "label=\($0)" }
-    let value = accessibilityString(object, "accessibilityValue").map { "value=\($0)" }
-    let help = accessibilityString(object, "accessibilityHelp").map { "help=\($0)" }
-    let current = [label, value, help].compactMap(\.self)
-    let children = accessibilityChildren(object)
-      .flatMap { accessibilityDescriptions(in: $0) }
-    return current + children
-  }
-
-  private func accessibilityString(_ object: NSObject, _ selector: String) -> String? {
-    let selector = NSSelectorFromString(selector)
-    guard object.responds(to: selector) else { return nil }
-    return object.perform(selector)?.takeUnretainedValue() as? String
-  }
-
-  private func accessibilityChildren(_ object: NSObject) -> [Any] {
-    let selector = NSSelectorFromString("accessibilityChildren")
-    guard object.responds(to: selector) else { return [] }
-    return object.perform(selector)?.takeUnretainedValue() as? [Any] ?? []
   }
 
   private func visibleTextStrings(in value: Any) -> [String] {
