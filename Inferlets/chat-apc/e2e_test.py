@@ -505,8 +505,9 @@ async def main() -> int:
                     if r.status_code != 404:
                         failures.append(f"DELETE /v1/models/load should be removed (404), got {r.status_code}")
 
-                    # POST /v1/chat/completions — unknown model → 404
-                    # (validation path, no forward pass triggered).
+                    # POST /v1/chat/completions — wrong model for the
+                    # resident engine → 409 target_mismatch (validation path,
+                    # no forward pass triggered).
                     r = await http.post(
                         f"{base}/v1/chat/completions",
                         json={
@@ -516,8 +517,10 @@ async def main() -> int:
                         },
                     )
                     print(f"[harness] POST /v1/chat/completions(bad model) -> {r.status_code}")
-                    if r.status_code != 404:
+                    if r.status_code != 409:
                         failures.append(f"/v1/chat/completions unknown model status {r.status_code}")
+                    elif r.json().get("error", {}).get("code") != "target_mismatch":
+                        failures.append("/v1/chat/completions bad model did not return target_mismatch")
 
                     # POST /v1/chat/completions — empty messages → 400.
                     r = await http.post(
@@ -539,8 +542,8 @@ async def main() -> int:
                     if r.status_code != 404:
                         failures.append(f"/v1/inferlet unknown status {r.status_code}")
 
-                    # POST /v1/inferlet — chat-apc with unknown model
-                    # in `input` → 404 from the chat layer.
+                    # POST /v1/inferlet — chat-apc with wrong model
+                    # in `input` → 409 target_mismatch from the chat layer.
                     r = await http.post(
                         f"{base}/v1/inferlet",
                         json={
@@ -551,10 +554,12 @@ async def main() -> int:
                         },
                     )
                     print(f"[harness] POST /v1/inferlet(chat-apc + bad model) -> {r.status_code}")
-                    if r.status_code != 404:
+                    if r.status_code != 409:
                         failures.append(
                             f"/v1/inferlet chat-apc bad model status {r.status_code}"
                         )
+                    elif r.json().get("error", {}).get("code") != "target_mismatch":
+                        failures.append("/v1/inferlet chat-apc bad model did not return target_mismatch")
 
                     # ── tree-of-thought (#407) ───────────────────────
                     # The `tree-of-thought` dispatch name is accepted

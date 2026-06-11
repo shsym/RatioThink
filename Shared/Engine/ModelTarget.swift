@@ -46,3 +46,49 @@ public struct ModelTarget: Equatable, Sendable {
     return nil
   }
 }
+
+/// Helper-observed engine state that matters before constructing a request.
+///
+/// The app's `ModelTarget` is user intent; this value is what the helper /
+/// running engine can actually serve. Keeping them separate makes the
+/// send-time preflight explicit: request construction may use engine-bound
+/// constraints such as the `max_tokens` ceiling only when they came from the
+/// same resident model the app intends to target.
+public struct EngineResidentState: Equatable, Sendable {
+  public let modelID: String?
+  public let maxOutputTokensCeiling: Int?
+
+  public init(modelID: String?, maxOutputTokensCeiling: Int? = nil) {
+    self.modelID = modelID
+    self.maxOutputTokensCeiling = maxOutputTokensCeiling
+  }
+}
+
+/// Desired-vs-resident request preflight contract.
+///
+/// `resolvedModelID` is non-nil only when the app's single target derivation
+/// (`ModelTarget.resolve`) matches the helper-observed resident model. Any
+/// mismatch means the caller must synchronize the engine first rather than
+/// sending a request that the engine will reject with `model_not_found`.
+public struct EngineRequestSync: Equatable, Sendable {
+  public let target: ModelTarget?
+  public let resident: EngineResidentState
+
+  public init(target: ModelTarget?, resident: EngineResidentState) {
+    self.target = target
+    self.resident = resident
+  }
+
+  public var resolvedModelID: String? {
+    guard let target,
+          let residentModelID = resident.modelID,
+          target.modelID == residentModelID else {
+      return nil
+    }
+    return target.modelID
+  }
+
+  public var maxOutputTokensCeiling: Int? {
+    resolvedModelID == nil ? nil : resident.maxOutputTokensCeiling
+  }
+}

@@ -1941,12 +1941,12 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
     }
 
     let registered = runtime::models();
-    if !registered.iter().any(|m| m == &request.model) {
+    if let Some(err) = model_registration_error(&request.model, &registered) {
         return res
             .respond(with_launch_diags_header(sse::json_error(
-                404,
-                "model_not_found",
-                &format!("Model '{}' not registered with this engine", request.model),
+                err.status,
+                err.code,
+                &err.message,
             )))
             .await;
     }
@@ -1961,6 +1961,36 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
     } else {
         handle_non_streaming(request, res, effective_max_tokens).await
     }
+}
+
+struct ModelRegistrationError {
+    status: u16,
+    code: &'static str,
+    message: String,
+}
+
+fn model_registration_error(
+    requested: &str,
+    registered: &[String],
+) -> Option<ModelRegistrationError> {
+    if registered.iter().any(|m| m == requested) {
+        return None;
+    }
+    if registered.is_empty() {
+        return Some(ModelRegistrationError {
+            status: 404,
+            code: "model_not_found",
+            message: format!("Model '{requested}' not registered with this engine"),
+        });
+    }
+    Some(ModelRegistrationError {
+        status: 409,
+        code: "target_mismatch",
+        message: format!(
+            "Requested model '{requested}' does not match this engine's resident model '{}'; retry after synchronizing the engine target or use the model from /v1/models",
+            registered[0]
+        ),
+    })
 }
 
 // =============================================================================
@@ -3377,6 +3407,23 @@ mod tests {
         assert_eq!(json["output_tokens"].as_u64(), Some(21));
         assert_eq!(json["elapsed_s"].as_f64(), Some(0.5));
         assert_eq!(json["tokens_per_sec"].as_f64(), Some(42.0));
+    }
+
+    #[test]
+    fn model_registration_error_reports_target_mismatch_for_wrong_resident_model() {
+        let err = model_registration_error("selected", &["resident".to_string()])
+            .expect("wrong model should produce a preflight error");
+
+        assert_eq!(err.status, 409);
+        assert_eq!(err.code, "target_mismatch");
+        assert!(err.message.contains("selected"));
+        assert!(err.message.contains("resident"));
+        assert!(err.message.contains("/v1/models"));
+    }
+
+    #[test]
+    fn model_registration_error_allows_the_resident_model() {
+        assert!(model_registration_error("resident", &["resident".to_string()]).is_none());
     }
 
     // ─── Multi-part message content (#115) ─────────────────

@@ -9,7 +9,8 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     // no-model confirm rather than silently loading something.
     let selected = ChatScaffoldView.requestModelID(
       selectedModelID: nil,
-      profileDefaultModel: nil
+      profileDefaultModel: nil,
+      residentModelID: nil
     )
     XCTAssertNil(selected)
   }
@@ -23,13 +24,35 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     )
   }
 
+  // MARK: - #528 request/resident synchronization
+
+  func test_request_model_requires_matching_resident_engine_model() {
+    XCTAssertNil(
+      ChatScaffoldView.requestModelID(
+        selectedModelID: "pinned-model",
+        profileDefaultModel: "profile-default",
+        residentModelID: "profile-default"
+      ),
+      "a pinned-model request must not be constructed while the engine still serves the profile default"
+    )
+    XCTAssertEqual(
+      ChatScaffoldView.requestModelID(
+        selectedModelID: "pinned-model",
+        profileDefaultModel: "profile-default",
+        residentModelID: "pinned-model"
+      ),
+      "pinned-model"
+    )
+  }
+
   // MARK: - #460 single-source selection resolution
 
   func test_pinned_model_takes_precedence_over_profile_default() {
     XCTAssertEqual(
       ChatScaffoldView.requestModelID(
         selectedModelID: "pinned-model",
-        profileDefaultModel: "profile-default"
+        profileDefaultModel: "profile-default",
+        residentModelID: "pinned-model"
       ),
       "pinned-model"
     )
@@ -41,7 +64,8 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     XCTAssertEqual(
       ChatScaffoldView.requestModelID(
         selectedModelID: nil,
-        profileDefaultModel: "profile-default"
+        profileDefaultModel: "profile-default",
+        residentModelID: "profile-default"
       ),
       "profile-default"
     )
@@ -158,7 +182,11 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     for c in Self.pinDefaultMatrix {
       XCTAssertEqual(
         ChatScaffoldView.requestModelID(
-          selectedModelID: c.pin, profileDefaultModel: c.def),
+          selectedModelID: c.pin,
+          profileDefaultModel: c.def,
+          residentModelID: ModelTarget.resolve(
+            selectedModelID: c.pin,
+            profileDefault: c.def)?.modelID),
         ModelTarget.resolve(selectedModelID: c.pin, profileDefault: c.def)?.modelID,
         "requestModelID must equal ModelTarget.resolve for pin=\(String(describing: c.pin)) default=\(String(describing: c.def))"
       )

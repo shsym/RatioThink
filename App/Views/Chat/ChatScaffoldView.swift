@@ -451,6 +451,7 @@ struct ChatScaffoldView: View {
             pendingSend.arm(chatID: chat.id,
                             targetModelID: gateTarget(for: chat)?.modelID,
                             messageText: draft)
+            synchronizeEngineForPendingSend(chat)
             presentNoModelPrompt()
           },
           onUserMessageSaved: { _ in
@@ -885,11 +886,10 @@ struct ChatScaffoldView: View {
   /// default when unpinned. The engine must actually be `.running` for the
   /// selection to count (a stopped engine yields a "Load X?" prompt rather
   /// than a send that passes the gate then fails at HTTP); `EngineLifecycle`
-  /// clears residency on the leave-`.running` edge and `reconcileEngine
-  /// ResidentModel` re-seeds `chat.modelID` to the served id once running,
-  /// so by send time the authority matches what the engine serves. No
-  /// `residentModelID` read here — residency is an engine fact reconciled
-  /// INTO the authority, not a parallel selection source.
+  /// clears residency on the leave-`.running` edge; this preflight then
+  /// requires the helper-observed resident model to match the app's target
+  /// before returning a request model id. A mismatch blocks the send and
+  /// synchronizes the engine instead of leaking `model_not_found`.
   private func currentModelID(for chat: Chat) -> String? {
     let engineRunning: Bool = {
       if case .running = engineStatusStore.status { return true }
@@ -897,7 +897,8 @@ struct ChatScaffoldView: View {
     }()
     return Self.requestModelID(
       selectedModelID: engineRunning ? chat.modelID : nil,
-      profileDefaultModel: engineRunning ? selectedProfileDefault : nil
+      profileDefaultModel: engineRunning ? selectedProfileDefault : nil,
+      residentModelID: modelLoadCenter.residentModelID
     )
   }
 
@@ -1027,6 +1028,7 @@ struct ChatScaffoldView: View {
       // `ChatStartGate.evaluate` no longer takes a `load:` state — the load
       // state machine is gone (ModelLoadCenter is residency-only).
       resolvedModelID: currentModelID(for: chat),
+      residentModelID: modelLoadCenter.residentModelID,
       // The gate names the model the Load tap will BOOT — the chat's pick
       // when present, not the profile default the boot path would ignore
       // (#459 repro 1 vs #460's engine-running nil). #497: the full
@@ -1122,6 +1124,31 @@ struct ChatScaffoldView: View {
     }
   }
 
+  /// #528 send preflight: if a user presses Send while the app's target and
+  /// helper resident model disagree, immediately converge the engine onto the
+  /// intended target instead of letting the request reach chat completions and
+  /// fail as `model_not_found`. `PendingAutoSend` still owns the actual submit
+  /// and fires only after residency confirms this target.
+  private func synchronizeEngineForPendingSend(_ chat: Chat) {
+    guard let target = gateTarget(for: chat) else { return }
+    guard currentModelID(for: chat) == nil else { return }
+    guard case .load = Self.availabilityAction(gateModel: target.modelID,
+                                               isModelInstalled: Self.isModelInstalled) else {
+      return
+    }
+    if case .running = engineStatusStore.status,
+       modelLoadCenter.residentModelID == nil {
+      Task { @MainActor in
+        await reconcileEngineResidentModel(for: chat)
+        if currentModelID(for: chat) == nil {
+          loadDefaultModel(target.modelID)
+        }
+      }
+      return
+    }
+    loadDefaultModel(target.modelID)
+  }
+
   /// #397 F1: re-poll the helper after an unreachable-transport failure.
   /// The 1 Hz loop would catch up anyway; this makes Retry immediate.
   private func refreshEngineStatus() {
@@ -1158,7 +1185,12 @@ struct ChatScaffoldView: View {
   static func resolutionProbe(resolvedModelID: String?,
                               residentModelID: String?,
                               requiresResidency: Bool) -> String? {
-    if requiresResidency, residentModelID == nil { return nil }
+    guard let resolvedModelID, !resolvedModelID.isEmpty else { return nil }
+    if let residentModelID {
+      guard residentModelID == resolvedModelID else { return nil }
+    } else if requiresResidency {
+      return nil
+    }
     return resolvedModelID
   }
 
@@ -1194,12 +1226,12 @@ struct ChatScaffoldView: View {
                        isSending: sendCoordinator.isInFlight(chatID))
   }
 
-  /// Resolve the model a send should target from the chat's SELECTION
-  /// authority (#460): the explicit pin (`selectedModelID` = `Chat.modelID`),
-  /// else the active profile's default, else nil. : no hidden fallback —
-  /// when nothing resolves the caller blocks the send behind the no-model
-  /// confirm rather than asking the engine to load something the user never
-  /// chose. Pure + static so the precedence is unit-tested without a view.
+  /// Resolve the model a send may target only when the chat's SELECTION
+  /// authority (#460) and the helper-observed resident engine state agree.
+  /// The app target is still the explicit pin (`selectedModelID` =
+  /// `Chat.modelID`) else the active profile's default; residency is the
+  /// separate engine fact that proves the running helper can serve it. Nil
+  /// means the caller blocks the send and synchronizes the engine first.
   ///
   /// Pin-over-default precedence routes through the one derivation
   /// (`ModelTarget.resolve`) so the send path can never disagree with the
@@ -1209,9 +1241,13 @@ struct ChatScaffoldView: View {
   /// `PIE_TEST_CHAT_MODEL` bypass).
   static func requestModelID(
     selectedModelID: String?,
-    profileDefaultModel: String?
+    profileDefaultModel: String?,
+    residentModelID: String?
   ) -> String? {
-    ModelTarget.resolve(selectedModelID: selectedModelID,
-                        profileDefault: profileDefaultModel)?.modelID
+    EngineRequestSync(
+      target: ModelTarget.resolve(selectedModelID: selectedModelID,
+                                  profileDefault: profileDefaultModel),
+      resident: EngineResidentState(modelID: residentModelID)
+    ).resolvedModelID
   }
 }

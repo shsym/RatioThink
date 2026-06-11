@@ -12,6 +12,7 @@ final class ChatStartGateTests: XCTestCase {
     engine: EngineStatus = .stopped,
     helperError: String? = nil,
     resolved: String? = nil,
+    resident: String? = nil,
     selected: String? = nil,
     profileDefault: String? = nil,
     profileError: String? = nil
@@ -20,6 +21,7 @@ final class ChatStartGateTests: XCTestCase {
       engineStatus: engine,
       helperError: helperError,
       resolvedModelID: resolved,
+      residentModelID: resident,
       target: ModelTarget.resolve(selectedModelID: selected,
                                   profileDefault: profileDefault),
       profileError: profileError
@@ -36,11 +38,20 @@ final class ChatStartGateTests: XCTestCase {
 
   // MARK: - S0: a model resolves → send proceeds
 
-  func test_S0_resolved_model_is_ready_even_if_engine_failed() {
-    // Override/resident wins outright — the gate is not shown.
+  func test_S0_running_resolved_model_is_ready_only_when_resident_matches() {
     XCTAssertEqual(
-      eval(engine: .failed(code: .spawnFailed, message: "x"), resolved: "explicit"),
+      eval(engine: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
+           resolved: "explicit", resident: "explicit", profileDefault: "explicit"),
       .ready(modelID: "explicit")
+    )
+  }
+
+  func test_running_resolved_model_with_different_resident_needs_target_sync() {
+    XCTAssertEqual(
+      eval(engine: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
+           resolved: "selected", resident: "profile-default", selected: "selected", profileDefault: "profile-default"),
+      selectedTarget("selected"),
+      "a send must not proceed until the helper resident model matches the app's selected target"
     )
   }
 
@@ -161,7 +172,7 @@ final class ChatStartGateTests: XCTestCase {
     // block the send.
     XCTAssertEqual(
       eval(engine: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
-           resolved: "resident", profileDefault: model, profileError: "marker unreadable"),
+           resolved: "resident", resident: "resident", profileDefault: model, profileError: "marker unreadable"),
       .ready(modelID: "resident")
     )
   }
@@ -226,7 +237,7 @@ final class ChatStartGateTests: XCTestCase {
   func test_497_resolved_send_model_still_wins_over_pin_target() {
     XCTAssertEqual(
       eval(engine: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
-           resolved: "served", selected: "user/picked.gguf", profileDefault: model),
+           resolved: "served", resident: "served", selected: "user/picked.gguf", profileDefault: model),
       .ready(modelID: "served")
     )
   }

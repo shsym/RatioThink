@@ -78,10 +78,14 @@ public enum ChatStartGate {
   ///     `engineStatus()` XPC poll itself failed (helper transport down).
   ///     Takes priority over `engineStatus` because a failed poll leaves
   ///     a stale/placeholder status that must not be read as truth.
-  ///   - resolvedModelID: the send target the app already computes
-  ///     (`ChatScaffoldView.requestModelID` — the chat's pin else the
-  ///     profile default, via `ModelTarget.resolve`). Non-nil ⇒ a send can
+  ///   - resolvedModelID: the send target the app already computes after
+  ///     desired-vs-resident preflight (`EngineRequestSync`). Non-nil means
+  ///     the app target and helper resident model match, so a send can
   ///     proceed and the gate is not shown.
+  ///   - residentModelID: helper-observed resident model id. Kept on the
+  ///     reducer boundary so tests pin the app/helper synchronization
+  ///     contract directly; callers should pass the same resident state used
+  ///     to derive `resolvedModelID`.
   ///   - target: the launch/load target — the single
   ///     `ModelTarget.resolve(selectedModelID:profileDefault:)` derivation
   ///     (#497, the chat's pin else the profile default). Nil when
@@ -92,15 +96,10 @@ public enum ChatStartGate {
     engineStatus: EngineStatus,
     helperError: String?,
     resolvedModelID: String?,
+    residentModelID: String? = nil,
     target: ModelTarget?,
     profileError: String? = nil
   ) -> State {
-    // A resolvable model wins outright — this is the send-proceeds path
-    // and matches `ChatScaffoldView.requestModelID` precedence.
-    if let id = resolvedModelID, !id.isEmpty {
-      return .ready(modelID: id)
-    }
-
     // Helper transport down: the polled status is stale/placeholder, so
     // surface the reachability failure rather than misreading it as
     // `.stopped`/`.starting`.
@@ -120,6 +119,11 @@ public enum ChatStartGate {
       // the default is on its way — wait, don't offer a redundant Load.
       return .busy(.startingEngine)
     case .running:
+      if let id = resolvedModelID,
+         !id.isEmpty,
+         residentModelID == id {
+        return .ready(modelID: id)
+      }
       return targetOrNo(target: target, profileError: profileError)
     case .stopped:
       return targetOrNo(target: target, profileError: profileError)

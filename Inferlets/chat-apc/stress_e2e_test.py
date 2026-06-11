@@ -306,10 +306,11 @@ async def section_protocol_stress(base: str, http: httpx.AsyncClient, rep: Repor
     ok = r.status_code == 400 and (r.json().get("error", {}).get("param") == "model")
     rep.ok(ok, f"{P}: blank model -> {r.status_code} {r.text[:120]!r} (want 400 param=model)")
 
-    # unknown model -> 404.
+    # wrong model for the resident engine -> 409 target_mismatch.
     r = await http.post(f"{base}/v1/chat/completions",
                         json={"model": "nope", "messages": [{"role": "user", "content": "hi"}]})
-    rep.ok(r.status_code == 404, f"{P}: unknown model -> {r.status_code} (want 404)")
+    ok = r.status_code == 409 and r.json().get("error", {}).get("code") == "target_mismatch"
+    rep.ok(ok, f"{P}: unknown model -> {r.status_code} {r.text[:120]!r} (want 409 target_mismatch)")
 
     # invalid role "tool" -> 400 tool_role_unsupported.
     r = await http.post(f"{base}/v1/chat/completions", json={

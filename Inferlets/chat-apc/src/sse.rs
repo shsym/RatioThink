@@ -293,7 +293,8 @@ pub async fn emit_done_logged(em: &mut Emitter, site: &str) {
 
 /// Build a single JSON response with an OpenAI-shape `error` envelope.
 /// Status codes follow OpenAI conventions: 400 invalid_request,
-/// 404 model_not_found, 413 payload_too_large, 500 server_error.
+/// 404 model_not_found, 409 target_mismatch, 413 payload_too_large,
+/// 500 server_error.
 pub fn json_error(
     status: u16,
     code: &str,
@@ -304,6 +305,7 @@ pub fn json_error(
             "type": match status {
                 400 => "invalid_request_error",
                 404 => "not_found_error",
+                409 => "conflict_error",
                 413 => "payload_too_large_error",
                 _ => "server_error",
             },

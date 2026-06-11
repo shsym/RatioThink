@@ -137,6 +137,18 @@ struct RatioThinkApp: App {
     } else {
       statusStore = EngineStatusStore(client: HelperXPCClient())
     }
+    if pinnedRunningPort != nil,
+       let pinnedResident = ProcessInfo.processInfo.environment["PIE_TEST_CHAT_MODEL_PIN"]?
+         .trimmingCharacters(in: .whitespacesAndNewlines),
+       !pinnedResident.isEmpty {
+      // The pinned-running GUI seam claims the helper has a running engine.
+      // Seed the matching resident model too so the real desired-vs-resident
+      // send preflight is satisfied; without this, the seam would be an
+      // impossible "running but no resident" state and the stricter gate would
+      // correctly block sends that these tests intend to route to their
+      // mock/stale HTTP endpoint.
+      center.reconcileEngineResident(pinnedResident)
+    }
     #else
     statusStore = EngineStatusStore(client: HelperXPCClient())
     #endif
