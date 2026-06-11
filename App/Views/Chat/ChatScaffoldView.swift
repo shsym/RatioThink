@@ -542,12 +542,7 @@ struct ChatScaffoldView: View {
       PinnedModelMismatchPrompt(
         mismatch: mismatch,
         onRelaunchPinned: {
-          pinnedModelMismatch = nil
-          // #469 explicit-pick launch path: a confirmed model identity change
-          // routes through the coordinator's status-aware serve executor,
-          // which restarts a running engine onto the selected boot model.
-          swapCoordinator.loadDirect(modelID: mismatch.pinnedModelID,
-                                     profileID: viewModel.selectedProfileID)
+          relaunchPinnedMismatch(mismatch, for: chat)
         },
         onUseResident: {
           if persistChatModel(mismatch.residentModelID, on: chat) {
@@ -1008,6 +1003,22 @@ struct ChatScaffoldView: View {
     }
   }
 
+  private func relaunchPinnedMismatch(_ mismatch: PinnedModelMismatch, for chat: Chat) {
+    pinnedModelMismatch = nil
+    // The mismatch prompt is a blocked-send surface, not a permission to
+    // interrupt unrelated chats. Route its Relaunch action through the same
+    // stream-aware, target-bound engine-mutation path as the no-model prompt's
+    // explicit Load button, so a running chat elsewhere defers the restart and
+    // a stale prompt target is dropped before it can mutate the shared engine.
+    guard gateTarget(for: chat)?.modelID == mismatch.pinnedModelID else { return }
+    switch Self.pinnedMismatchRelaunchDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) {
+    case .runNow:
+      loadDefaultModel(mismatch.pinnedModelID, for: chat)
+    case .deferUntilIdle:
+      deferEngineLoadUntilStreamsIdle(mismatch.pinnedModelID, for: chat)
+    }
+  }
+
   /// #460: durably set (or clear) the chat's selected model — the single
   /// selection authority. `nil` clears the pin so the chat follows the
   /// active profile's default again. Does NOT bump `updatedAt` (a config
@@ -1281,6 +1292,10 @@ struct ChatScaffoldView: View {
 
   static func engineMutationDecision(inFlightChatIDs: Set<UUID>) -> EngineMutationDecision {
     shouldDeferEngineSyncForStreams(inFlightChatIDs) ? .deferUntilIdle : .runNow
+  }
+
+  static func pinnedMismatchRelaunchDecision(inFlightChatIDs: Set<UUID>) -> EngineMutationDecision {
+    engineMutationDecision(inFlightChatIDs: inFlightChatIDs)
   }
 
   private func deferEngineSyncUntilStreamsIdle(for chat: Chat) {

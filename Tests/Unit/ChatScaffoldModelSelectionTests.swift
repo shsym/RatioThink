@@ -518,6 +518,17 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       .runNow)
   }
 
+  func test_528_pinned_mismatch_relaunch_uses_stream_guard_before_restart() {
+    let chatB = UUID()
+    XCTAssertEqual(
+      ChatScaffoldView.pinnedMismatchRelaunchDecision(inFlightChatIDs: [chatB]),
+      .deferUntilIdle,
+      "relaunching a pinned mismatch must not restart the single engine while another chat streams")
+    XCTAssertEqual(
+      ChatScaffoldView.pinnedMismatchRelaunchDecision(inFlightChatIDs: []),
+      .runNow)
+  }
+
   func test_528_deferred_explicit_load_drops_when_current_target_changed_before_idle() {
     let chatID = UUID()
     let queued = ChatScaffoldView.DeferredEngineMutation.explicitLoad(
