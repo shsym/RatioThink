@@ -83,7 +83,24 @@ struct ChatScaffoldView: View {
   /// is cleared on the next engine-status flip. This is a transcript
   /// condition; its visibility and lifetime are independent of engine
   /// state (explicit Dismiss, or the auto-clear on the rendered row).
-  @State private var staleRetryNotice: String?
+  ///
+  /// Identity-bearing (review v3 F1): the message is a single static
+  /// string, so a bare `String?` state makes every re-raise a same-value
+  /// write — `.task(id:)` would never restart and a second stale click
+  /// near the end of the window would get almost no banner time. Each
+  /// raise mints a fresh `id`, so the auto-clear timer restarts per raise
+  /// by construction.
+  struct RetryNoticeState: Equatable {
+    let id: UUID
+    let message: String
+
+    init(message: String) {
+      self.id = UUID()
+      self.message = message
+    }
+  }
+
+  @State private var staleRetryNotice: RetryNoticeState?
 
   init(
     chatID: UUID,
@@ -390,14 +407,18 @@ struct ChatScaffoldView: View {
       }
       // #513 review v2 F1: stale-retry notice on its own channel and
       // surface — engine-status changes can neither shadow nor clear it.
-      // `.task(id:)` gives it a bounded lifetime: auto-clears after a few
-      // seconds (cancelled and restarted if a newer notice replaces it),
-      // and Dismiss clears it immediately.
+      // `.task(id:)` keyed on the per-raise `id` gives it a bounded
+      // lifetime: every raise (including re-raising the same message)
+      // restarts the auto-clear, and Dismiss clears it immediately.
       if let notice = staleRetryNotice {
-        StaleRetryNotice(message: notice, onDismiss: { staleRetryNotice = nil })
-          .task(id: notice) {
+        StaleRetryNotice(message: notice.message, onDismiss: { staleRetryNotice = nil })
+          .task(id: notice.id) {
             try? await Task.sleep(nanoseconds: 8_000_000_000)
-            if staleRetryNotice == notice { staleRetryNotice = nil }
+            // The sleep's cancellation error is swallowed by `try?`, so
+            // re-check before clearing: a cancelled timer (row replaced or
+            // removed) must not wipe a newer notice.
+            guard !Task.isCancelled else { return }
+            if staleRetryNotice?.id == notice.id { staleRetryNotice = nil }
           }
       }
       // #496: the chat body is the transcript + composer. It is NEVER covered by
@@ -748,7 +769,7 @@ struct ChatScaffoldView: View {
     guard let plan = ChatRetryPlan.plan(messages: chat.messages, retryPointID: messageID) else {
       // Review v1 F1 (lower-stakes sibling): the rendered control was
       // stale — say so instead of a dead click.
-      staleRetryNotice = Self.staleRetryNoticeCopy
+      staleRetryNotice = RetryNoticeState(message: Self.staleRetryNoticeCopy)
       return
     }
     if plan.requiresConfirmation {
@@ -787,7 +808,7 @@ struct ChatScaffoldView: View {
     case .send:
       sendAssistantTurn(for: chat)
     case .noLongerApplies:
-      staleRetryNotice = Self.staleRetryNoticeCopy
+      staleRetryNotice = RetryNoticeState(message: Self.staleRetryNoticeCopy)
     case .saveFailed:
       break
     }
