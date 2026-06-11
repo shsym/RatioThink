@@ -461,7 +461,11 @@ struct ChatScaffoldView: View {
       // the change-guarded setters emit no later edge. The status flip is
       // that missing edge; `resolutionEdge` is idempotent, so the extra
       // call is safe in every other ordering.
-      resolutionEdge(for: chat)
+      // Review F6: at the `.running` flip the selection authority is still
+      // pre-reconcile (the `.task` reconcile runs after) — require
+      // reconciled residency so this edge can't fire a stale pin into an
+      // engine serving a different model.
+      resolutionEdge(for: chat, requiresResidency: true)
     }
     // #496: auto-dismiss the inline helper-refusal once the Helper recovers to
     // a state where the op would be allowed again, so a stale "helper is
@@ -472,8 +476,10 @@ struct ChatScaffoldView: View {
     // #397: auto-dismiss the gate once a model resolves (engine came up
     // and reconciled, or a load completed) so the user lands back at the
     // composer with their draft intact — no stale "starting…" sheet.
-    .onChange(of: modelLoadCenter.residentModelID) { _, _ in resolutionEdge(for: chat) }
-    .onChange(of: chat.modelID) { _, _ in resolutionEdge(for: chat) }
+    // These two are the post-reconcile edges — residency (or the re-seeded
+    // selection) IS the new fact being observed, so no residency pre-check.
+    .onChange(of: modelLoadCenter.residentModelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
+    .onChange(of: chat.modelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
     // #413: open/close the helper-health generation gate around every stream.
     // While a chat / ToT generation is in flight a saturated engineStatus poll
     // path can time out for many consecutive polls; without this gate the
@@ -487,7 +493,10 @@ struct ChatScaffoldView: View {
       // swallowed by `submit()`'s `!isSending` guard — so `verdict` holds
       // while in flight, and THIS edge (in-flight clearing) re-evaluates
       // and delivers the deferred fire.
-      if !inFlight { resolutionEdge(for: chat) }
+      // Residency-checked (F6): a deferred fire must not consume the
+      // pending against a relaunched-but-unreconciled engine either; if
+      // residency is still nil this holds and the residency edge delivers.
+      if !inFlight { resolutionEdge(for: chat, requiresResidency: true) }
     }
     .onAppear {
       // Seed the toolbar from the persisted profile so the menu
@@ -962,16 +971,40 @@ struct ChatScaffoldView: View {
     }
   }
 
+  /// #516 review F6: what a resolution edge may treat as resolved. On the
+  /// STATUS edge (`requiresResidency: true`) the selection authority is
+  /// still pre-reconcile — `chat.modelID`/profile default can name model A
+  /// while the engine just came up serving model B (helper auto-relaunch
+  /// boots the active-profile marker's model) — so until
+  /// `residentModelID` is reconciled nothing counts as resolved; the
+  /// post-reconcile residency/`chat.modelID` edges then deliver the real
+  /// fire-or-disarm. Pure + static so the ordering matrix is unit-tested.
+  static func resolutionProbe(resolvedModelID: String?,
+                              residentModelID: String?,
+                              requiresResidency: Bool) -> String? {
+    if requiresResidency, residentModelID == nil { return nil }
+    return resolvedModelID
+  }
+
   /// #516: a model-resolution edge (residency reconciled, or the chat's
   /// selection re-seeded to the served model). Closes the gate (#397) and
   /// settles any armed pending send: fire it through the composer when the
   /// INTENDED model resolved, drop it when a different one did (the user
   /// switched model/profile mid-load), keep holding otherwise.
-  private func resolutionEdge(for chat: Chat) {
+  ///
+  /// `requiresResidency` — true ONLY for the engine-status edge, which can
+  /// arrive before `reconcileEngineResidentModel` re-seeds the selection
+  /// authority (review F6, see `resolutionProbe`). No default: every new
+  /// edge must decide explicitly.
+  private func resolutionEdge(for chat: Chat, requiresResidency: Bool) {
     dismissPromptIfResolved(for: chat)
     guard let pending = pendingAutoSend else { return }
+    let resolved = Self.resolutionProbe(
+      resolvedModelID: currentModelID(for: chat),
+      residentModelID: modelLoadCenter.residentModelID,
+      requiresResidency: requiresResidency)
     switch pending.verdict(chatID: chat.id,
-                           resolvedModelID: currentModelID(for: chat),
+                           resolvedModelID: resolved,
                            isSending: sendController.isInFlight) {
     case .hold:
       break

@@ -40,24 +40,24 @@ final class PendingAutoSendTests: XCTestCase {
   // MARK: - verdicts
 
   func test_fires_when_intended_model_resolves_for_same_chat() {
-    XCTAssertEqual(armed().verdict(chatID: chatID, resolvedModelID: target), .fire)
+    XCTAssertEqual(armed().verdict(chatID: chatID, resolvedModelID: target, isSending: false), .fire)
   }
 
   func test_holds_while_nothing_resolves() {
     // Engine still starting, model still loading — and the load-FAILURE
     // case (nothing resolvable) also lands here: stay armed so a retry
     // that succeeds still delivers the message.
-    XCTAssertEqual(armed().verdict(chatID: chatID, resolvedModelID: nil), .hold)
-    XCTAssertEqual(armed().verdict(chatID: chatID, resolvedModelID: ""), .hold)
+    XCTAssertEqual(armed().verdict(chatID: chatID, resolvedModelID: nil, isSending: false), .hold)
+    XCTAssertEqual(armed().verdict(chatID: chatID, resolvedModelID: "", isSending: false), .hold)
   }
 
   func test_disarms_when_a_different_model_resolves() {
     // The user switched model/profile mid-load; the gate's promise is stale.
-    XCTAssertEqual(armed().verdict(chatID: chatID, resolvedModelID: "org/model-b"), .disarm)
+    XCTAssertEqual(armed().verdict(chatID: chatID, resolvedModelID: "org/model-b", isSending: false), .disarm)
   }
 
   func test_disarms_on_chat_mismatch_even_for_the_intended_model() {
-    XCTAssertEqual(armed().verdict(chatID: UUID(), resolvedModelID: target), .disarm)
+    XCTAssertEqual(armed().verdict(chatID: UUID(), resolvedModelID: target, isSending: false), .disarm)
   }
 
   // MARK: - review v1 F2: fire defers while a send is in flight

@@ -65,9 +65,11 @@ public struct PendingAutoSend: Equatable, Sendable {
   /// `isSending` — review v1 F2: the composer's `submit()` bails (silently)
   /// while a send is in flight, so a fire delivered then would be swallowed
   /// with the pending already cleared. Hold instead; the in-flight-cleared
-  /// edge re-evaluates and delivers the deferred fire.
+  /// edge re-evaluates and delivers the deferred fire. No default (review
+  /// v2 F7): a verdict computed without in-flight state re-opens that hole,
+  /// so every caller must pass it explicitly.
   public func verdict(chatID: UUID, resolvedModelID: String?,
-                      isSending: Bool = false) -> Verdict {
+                      isSending: Bool) -> Verdict {
     guard chatID == self.chatID else { return .disarm }
     guard let resolved = resolvedModelID, !resolved.isEmpty else { return .hold }
     guard resolved == targetModelID else { return .disarm }

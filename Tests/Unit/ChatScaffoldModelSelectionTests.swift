@@ -189,4 +189,40 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     XCTAssertNil(
       ContentToolbar.effectiveModelID(selectedModelID: nil, profileDefaultModel: nil))
   }
+
+
+  // MARK: - #516 review F6: status edge must not fire before residency reconcile
+
+  /// The full ordering the review names: arm with target A; the `.running`
+  /// status flip arrives while the chat pin still says A but residency is
+  /// unreconciled (the engine may be serving B) → HOLD. Then the reconcile
+  /// lands: residency B (relaunch booted a different model) → DISARM;
+  /// residency A → FIRE. `resolutionProbe` is the status-edge gate and
+  /// `PendingAutoSend.verdict` the decision — composed here exactly as
+  /// `resolutionEdge` composes them.
+  func test_516_status_edge_holds_until_residency_reconciles_then_settles() {
+    let chatID = UUID()
+    let pending = PendingAutoSend.arm(
+      chatID: chatID, targetModelID: "org/A", messageText: "hello")!
+
+    // Status edge: pin resolves to A, but residency not reconciled yet —
+    // the probe must report nothing resolved, so the verdict holds.
+    let preReconcile = ChatScaffoldView.resolutionProbe(
+      resolvedModelID: "org/A", residentModelID: nil, requiresResidency: true)
+    XCTAssertNil(preReconcile, "status edge must treat an unreconciled engine as unresolved")
+    XCTAssertEqual(pending.verdict(chatID: chatID, resolvedModelID: preReconcile, isSending: false),
+                   .hold)
+
+    // Reconcile lands on B (relaunch booted the active-profile marker's
+    // model): the selection authority re-seeds to B → stale pending drops.
+    XCTAssertEqual(pending.verdict(chatID: chatID, resolvedModelID: "org/B", isSending: false),
+                   .disarm)
+
+    // Reconcile lands on A: the residency edge passes A through (no
+    // residency pre-check on post-reconcile edges) → the pending fires.
+    let postReconcile = ChatScaffoldView.resolutionProbe(
+      resolvedModelID: "org/A", residentModelID: "org/A", requiresResidency: false)
+    XCTAssertEqual(pending.verdict(chatID: chatID, resolvedModelID: postReconcile, isSending: false),
+                   .fire)
+  }
 }
