@@ -1,7 +1,7 @@
 import XCTest
 
 /// full GUI send path:
-/// RatioThink.app → ChatListView → ComposerView → HTTPEngineClient →
+/// Rational.app → ChatListView → ComposerView → HTTPEngineClient →
 /// real pie engine stream → MessageStreamWriter → SwiftData persistence.
 final class S258_ComposerSendGUITests: XCTestCase {
   override func setUp() async throws {
@@ -19,7 +19,7 @@ final class S258_ComposerSendGUITests: XCTestCase {
       config["PIE_TEST_GUI_HOME"],
       "\(Self.configPath) must define PIE_TEST_GUI_HOME"
     )
-    let model = config["PIE_TEST_CHAT_MODEL"] ?? "Qwen/Qwen3-0.6B"
+    let model = config["PIE_TEST_CHAT_MODEL_PIN"] ?? "Qwen/Qwen3-0.6B"
 
     let prompt = "The capital of France is"
     let visibleAssistantEcho = "The capital of Fra"
@@ -30,11 +30,11 @@ final class S258_ComposerSendGUITests: XCTestCase {
     defer { app.terminate() }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     try createChatAndSend(prompt, in: app)
-    guard waitForAtLeastTwoStaticTextsContaining(visibleAssistantEcho, in: app, timeout: 120) else {
+    guard waitForAssistantEchoStaticTexts(visibleAssistantEcho, in: app, timeout: 120) else {
       XCTFail("assistant response did not become visible through the GUI; app tree: \(app.debugDescription)")
       return
     }
@@ -46,11 +46,11 @@ final class S258_ComposerSendGUITests: XCTestCase {
     relaunched.launch()
     defer { relaunched.terminate() }
     XCTAssert(relaunched.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not relaunch")
+              "Rational.app did not relaunch")
     relaunched.activate()
 
-    try selectPersistedChat(in: relaunched)
-    guard waitForAtLeastTwoStaticTextsContaining(visibleAssistantEcho, in: relaunched, timeout: 15) else {
+    selectPersistedChat(titled: prompt, in: relaunched)
+    guard waitForAssistantEchoStaticTexts(visibleAssistantEcho, in: relaunched, timeout: 15) else {
       XCTFail("assistant response was not visible after relaunch with PIE_HOME=\(pieHome); app tree: \(relaunched.debugDescription)")
       return
     }
@@ -63,7 +63,11 @@ final class S258_ComposerSendGUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = model
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = model
+    // #504: pin the engine `.running` so the real send-gate passes (the
+    // `PIE_TEST_CHAT_MODEL` bypass is gone); the actual send still hits
+    // `PIE_TEST_ENGINE_BASE_URL`, whose port the pin is derived from.
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
   }
 
@@ -88,20 +92,17 @@ final class S258_ComposerSendGUITests: XCTestCase {
     send.click()
   }
 
-  private func selectPersistedChat(in app: XCUIApplication) throws {
-    let chatTitle = app.staticTexts["New Chat"].firstMatch
-    XCTAssertTrue(chatTitle.waitForExistence(timeout: 10),
-                  "persisted chat row 'New Chat' missing after relaunch; app tree: \(app.debugDescription)")
-    chatTitle.click()
-  }
-
   /// MarkdownUI exposes the assistant answer to Accessibility as
-  /// separate/truncated static text runs (for example
-  /// `The capital of Fra...`), so this GUI assertion only proves
-  /// that a second assistant bubble became visible. The wrapper
-  /// script performs the semantic/persistence assertion directly
-  /// against the SwiftData SQLite store after the XCUITest returns.
-  private func waitForAtLeastTwoStaticTextsContaining(
+  /// separate/truncated static text runs (for example `The capital of
+  /// Fra...`); the wrapper script performs the semantic/persistence
+  /// assertion against the SwiftData SQLite store after the XCUITest
+  /// returns. The visibility bar here is THREE matching static texts:
+  /// two exist without any assistant output — the user bubble and (#512)
+  /// the sidebar row auto-titled from the same first message — so only
+  /// the third proves the assistant's echoed answer actually rendered.
+  /// At two this passed vacuously and the test terminated the app
+  /// mid-stream (the wrapper's sqlite check caught the empty assistant).
+  private func waitForAssistantEchoStaticTexts(
     _ needle: String,
     in app: XCUIApplication,
     timeout: TimeInterval
@@ -115,7 +116,7 @@ final class S258_ComposerSendGUITests: XCTestCase {
     while Date() < deadline {
       if app.descendants(matching: .staticText)
         .matching(predicate)
-        .count >= 2 {
+        .count >= 3 {
         return true
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))

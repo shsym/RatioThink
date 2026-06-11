@@ -1,54 +1,30 @@
 name: lint
 
-# CI-scope policy: CI runs only the DETERMINISTIC tier — `make lint` +
-# the SPM unit/scenario tests + the contract/canary/inferlet/release jobs
-# + a compile-only smoke of the xcodebuild targets. Every test that
-# depends on a real timer, wall-clock, real subprocess/network timing, a
-# seated GUI session, or a real engine/model is a LOCAL responsibility,
-# not CI:
-#   · app-tier unit bundle (RatioThinkTests) → `make test-app-unit`
-#     (the #420 deep-link/login-item guards, ChatScaffold, ZeroState, …);
-#   · GUI suites (RatioThinkGUITests)        → `make test-gui*`;
-#   · integration / real-engine / e2e        → `make test-e2e*`.
-# Rationale: a CI test that races a timer or a seated session is a flake,
-# and a flaky required check erodes trust in the gate. Anything that must
-# stay in CI is made deterministic with an injected seam (e.g. the
-# `PieEngineHost` clock/sleep seams behind EngineDeathRecoveryTests)
-# rather than a sleep. See TEST.md "Pre-PR gate" for the full split.
+# CI v2 (#456): the lightweight GitHub gate is manual/on-demand only.
+# Normal merge evidence is local: run `make ci-pr` plus the documented local
+# parity gates in TEST.md for affected runtime/UI/release paths. This workflow
+# remains available as an explicit operator-triggered verification run when a
+# GitHub-hosted copy of the lightweight/static evidence is useful.
 #
-# Wires `make lint` + the lint-self-test + the unit/scenario test
-# bundles into CI per  review findings F8 (lint in CI) and
-# F4 (the ResolveProbe CI hard-fail path was dead until CI actually
-# ran the tests).
+# Heavy/runtime coverage is preserved through the local make tiers:
+#   - make local-pre-merge      (xcodebuild test-bundle compile, app-unit,
+#                                scenario/smoke, HTTP E2E, real-pie contract,
+#                                gmake canary)
+#   - make local-gui-gate       (seated GUI/XCUITest)
+#   - make local-e2e-gate       (real-engine/model/signing/live-service paths)
+#   - make release-gate         (live-HF/packaging/readiness checks)
+# The manual jobs below keep only static/lint/provenance, compile/type checks,
+# cheap deterministic unit/contract tests, and release-script contracts.
 
 on:
-  push:
-    branches: ["**"]
-  pull_request:
-    branches: ["**"]
+  workflow_dispatch:
 
 jobs:
-  # Path-change detector for the conditional jobs (#389). The workflow
-  # itself stays UNFILTERED (no top-level `on.paths`) so it always runs
-  # and every check reports a status. Conditional jobs gate on these
-  # outputs via a job-level `if:` — a job skipped by `if:` reports
-  # "Success" to branch protection, whereas a workflow skipped by an
-  # `on.paths` filter stays "Pending" and would block a protected PR
-  # (GitHub docs: "do not use path or branch filtering to skip workflow
-  # runs if the workflow is required to pass before merging"). This keeps
-  # the path-filtering safe even after `main` becomes a protected branch.
-  # The gated `if:`s are FAIL-OPEN (`!cancelled() && <out> != 'false'`):
-  # GitHub implicitly ANDs `success(needs)` into a bare `if:`, so if THIS
-  # detector errored the dependents would skip-as-Success and a real
-  # change could merge unverified. `!cancelled()` overrides that implicit
-  # success-gate and the empty output on failure makes `!= 'false'` true,
-  # so the dependents RUN instead.
   changes:
     name: detect changed paths
     runs-on: ubuntu-latest
     outputs:
       inferlets: ${{ steps.filter.outputs.inferlets }}
-      makefile: ${{ steps.filter.outputs.makefile }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,436 +33,52 @@ jobs:
       - uses: dorny/paths-filter@v3
         id: filter
         with:
-          # `Vendor/pie` matches the submodule gitlink, so a pie SHA bump
-          # re-runs the inferlet job (the wasm links pie's wit/crates and
-          # the stamp can drift). `Makefile` is in both families because a
-          # recipe edit can change what either job builds.
           filters: |
             inferlets:
               - 'Inferlets/**'
               - 'Vendor/pie'
               - 'Scripts/stamp-chat-apc.sh'
               - 'Makefile'
-            makefile:
-              - 'Makefile'
-              - 'Tests/RatioThinkCoreTests/SanityFailInjectionTests.swift'
 
-  lint-helper-side-effects:
-    name: lint Helper side-effect APIs
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: false
-
-      - name: Run lint
-        run: make lint
-
-      - name: Self-test the lint script
-        run: ./Scripts/test-lint-helper-side-effects.sh
-
-      - name: Install-time launchd-safety regression guards
-        # Deterministic, fully-stubbed regressions for the launchd source-
-        # closed / agent-reenable / new-bundle-acceptance logic in
-        # Scripts/lib/proc-acceptance.sh that ships inside install-app.sh.
-        # Were green but unwired (surfaced by the GUI/E2E audit) — a regression in the install
-        # safety lib would otherwise pass CI unnoticed.
-        run: make test-install-guards
-
-  build-tests:
-    name: build every xcodebuild target
+  pr-static-gate:
+    name: PR static gate
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      # The long pole (#389): `make build` / `make build-tests` drive the
-      # `Build pie engine binary` Xcode phase, which runs
-      # Scripts/build-pie-engine.sh -> `cargo build --release -p pie-server`
-      # against Vendor/pie/target (~734 crates). Cache the cargo target so
-      # the dependency crates incremental-skip across runs. rust-cache keys
-      # on rustc version + Cargo.lock + job_id by default, so the key
-      # invalidates on a pie SHA / Cargo.lock / toolchain change, and the
-      # engine is always actually recompiled from the current source (cargo
-      # re-fingerprints) — the cache only accelerates, it never substitutes
-      # a stale binary (cache-on-failure stays false).
-      - name: Cache pie-server cargo target
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "Vendor/pie"
 
       - name: Set up xcodegen
         run: brew install xcodegen
 
-      - name: Generate RatioThink.xcodeproj
-        run: make genproject
+      - name: Run lightweight deterministic PR gate
+        run: make ci-pr
 
-      - name: Verify app icon assets
-        run: make verify-app-icon-assets
-
-      - name: Regression-test app icon verifier
-        run: make test-app-icon-assets
-
-      - name: Regression-test DMG drag-install layout verifier
-        run: make test-dmg-layout
-
-      - name: Build app + helper
-        run: make build
-
-      # Compile-only smoke for every xcodebuild target (app, helper, and the
-      # RatioThinkTests/RatioThinkGUITests bundles). This job BUILDS the
-      # app-tier test bundles but does NOT run them: under the CI-scope
-      # policy (see the header), the RatioThinkTests app-unit bundle
-      # (the #420 deep-link/login-item guards, ChatScaffold, ZeroState, …)
-      # and every GUI/e2e suite are a local responsibility (`make
-      # test-app-unit`, `make test-gui*`, `make test-e2e*`). Keeping the
-      # compile here still catches app-tier test-code rot — a bundle that
-      # won't compile silently voids the entire local tier — without
-      # asserting non-deterministic, seated, or real-engine behaviour in CI.
-      - name: Compile every test target (review v4 F1)
-        run: make build-tests
-
-  real-pie-driver-contract:
-    # Real-binary contract test for the driver-readiness probe: builds the
-    # bundled pie once and runs the SPM contract test against it with
-    # PIE_TEST_REAL_PIE_BIN set. The unit suite stubs the probe (so it stays
-    # green even if the real `pie driver list` surface is renamed/removed),
-    # which is exactly the stub-only blind spot that let the original
-    # probe-contract regression ship. This job gives the contract test a
-    # REAL binary and HARD-FAILS if it skips, so the drift guard cannot
-    # silently no-op in CI.
-    name: real pie driver-list contract
+  inferlet-provenance:
+    name: chat-apc inferlet provenance
     runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Resolve pinned pie submodule SHA
-        id: piesha
-        run: echo "sha=$(git rev-parse HEAD:Vendor/pie)" >> "$GITHUB_OUTPUT"
-
-      # Cache the built engine keyed on the EXACT pinned pie SHA + the build
-      # script hash. No restore-keys: a fuzzy prefix match could restore a
-      # different pie's binary and the contract would silently test a stale
-      # engine (false green). Exact-match-or-rebuild only.
-      - name: Restore cached pie engine
-        id: piecache
-        uses: actions/cache@v4
-        with:
-          path: build/pie-engine/arm64
-          key: pie-engine-${{ runner.os }}-${{ runner.arch }}-${{ steps.piesha.outputs.sha }}-${{ hashFiles('Scripts/build-pie-engine.sh') }}
-
-      - name: Build pie engine
-        if: steps.piecache.outputs.cache-hit != 'true'
-        run: Scripts/build-pie-engine.sh --arch arm64
-
-      - name: Run real-binary driver-list contract test
-        env:
-          PIE_TEST_REAL_PIE_BIN: ${{ github.workspace }}/build/pie-engine/arm64/pie
-        run: |
-          set +e
-          xcrun swift test --filter test_realPie_driverList_subcommand_exists_and_reports_portable 2>&1 | tee contract.out
-          rc=${PIPESTATUS[0]}
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            echo "FAIL: real-binary contract test exited $rc"
-            exit "$rc"
-          fi
-          # A silent skip would green the job and re-open the blind spot
-          # the contract test exists to close — treat it as a hard failure.
-          if grep -q 'Test skipped' contract.out; then
-            echo "FAIL: contract test was SKIPPED in CI — PIE_TEST_REAL_PIE_BIN not honored or binary missing; the driver-list drift guard must not silently skip"
-            exit 1
-          fi
-          # `--filter` matching zero tests exits 0 (renamed/moved test) —
-          # require a real 'Executed N>=1 ... 0 failures' line.
-          if ! grep -Eq 'Executed [1-9][0-9]* tests?, with 0 failures' contract.out; then
-            echo "FAIL: expected 'Executed N tests, with 0 failures' (N>=1) — filter matched zero tests?"
-            exit 1
-          fi
-          echo "real-pie-contract: $(grep -E 'Executed [0-9]+ tests?' contract.out | tail -1)"
-
-  unit-and-scenario-tests:
-    # Runs the SPM test bundles. Exercises the production env-fallback
-    # code paths via the `pie-resolve-probe` binary (review v6 F4) so
-    # `ResolveProbe.find()`'s CI hard-fail branch is not dead code.
-    name: swift test (unit + scenario)
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: false
-
-      - name: Build SPM probe (review v5 F2)
-        run: xcrun swift build --product pie-resolve-probe
-
-      - name: Unit tests
-        run: make test-unit
-
-      - name: Scenario tests
-        run: make test-scenario
-
-      - name: Collect-diagnostics script self-test (#358)
-        run: make test-collect-diagnostics
-
-  sanitizer-stability-canary:
-    #  F8. Catches drift between SpawnEnvSanitizer's
-    # declared prefix/exact-key policy and its actual filter behavior
-    # by injecting one canary key per documented family and asserting
-    # the live process env round-trips through `sanitize(...)` per
-    # the contract. Unit tests cover synthetic input; this job covers
-    # the `swift test → xctest → bundle` env-propagation path.
-    name: SpawnEnvSanitizer canary
-    runs-on: macos-15
-    env:
-      SPAWN_SANITIZER_CANARY: "1"
-      # Prefix-family canaries — one per family in stripPrefixes
-      # that survives `swift test → xctest` env propagation AND
-      # does not poison the Swift toolchain mid-run.
-      # DYLD_* and __XPC_XCTEST_* are stripped on exec by hardened-
-      # runtime xctest, so they cannot be e2e-injected.
-      # MallocStackLogging activates malloc stack logging in every
-      # child swift-frontend/clang/ld spawned during compile and
-      # trips swift-driver out with "error: fatalError" before any
-      # test runs; there is no inert value.
-      # All three are covered by SpawnEnvSanitizerTests against
-      # synthetic input.
-      PIE_SANITIZER_CANARY: canary
-      RUST_SANITIZER_CANARY: canary
-      MTL_SANITIZER_CANARY: canary
-      XCTestSanitizerCanary: canary
-      XCTEST_SANITIZER_CANARY: canary
-      __XCODE_SANITIZER_CANARY: canary
-      OS_ACTIVITY_SANITIZER_CANARY: canary
-      OBJC_SANITIZER_CANARY: canary
-      # Exact-key canary. SDKROOT / DEVELOPER_DIR / TOOLCHAINS
-      # would break xcrun / Swift toolchain resolution if overridden
-      # to canary values; NSZombieEnabled is inert at runtime.
-      NSZombieEnabled: canary
-      # Survival canaries.
-      #   · `PIESURVIVES_CANARY` is NOT `PIE_*` (no underscore) — proves
-      #     the prefix policy requires the trailing underscore.
-      #   · `MallocCanarySurvives` does not start with
-      #     `MallocStackLogging` — proves the prefix policy does not
-      #     over-match unrelated `Malloc` siblings.
-      PIESURVIVES_CANARY: canary
-      MallocCanarySurvives: canary
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: false
-
-      - name: Run sanitizer canary
-        # Review v1 F2: `--filter` matching zero tests would exit 0 and
-        # silently green the job (renamed class, file moved out of test
-        # target, build product not re-emitted). Capture output and
-        # assert an `Executed N tests` line with N >= 3 (matches the
-        # current count of test_* functions in
-        # SpawnEnvSanitizerCanaryTests). Bump the lower bound whenever
-        # the suite grows.
-        run: |
-          set +e
-          xcrun swift test --filter SpawnEnvSanitizerCanaryTests 2>&1 | tee canary.out
-          rc=${PIPESTATUS[0]}
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            echo "FAIL: canary recipe exited $rc"
-            exit "$rc"
-          fi
-          if ! grep -Eq 'Executed [3-9][0-9]* tests, with 0 failures' canary.out; then
-            echo "FAIL: expected 'Executed N tests, with 0 failures' line with N>=3 — filter may have matched zero tests (renamed class? bundle stale?)"
-            exit 1
-          fi
-          echo "sanitizer-canary: $(grep -E 'Executed [0-9]+ tests' canary.out | tail -1)"
-
-  build-inferlets:
-    #  — item 4. Wires `make build-inferlets` (cargo build
-    # --release --target wasm32-wasip2 -> prebuilt/) and the stamp
-    # checksum verify into CI so a `src/` edit, a Vendor/pie bump, or
-    # a wasm byte-drift surfaces as a red build instead of an opaque
-    # harness failure in .
-    #
-    # `verify-inferlets` runs against the committed prebuilt+stamp
-    # (does not depend on a fresh cargo build) so the verify result
-    # is independent of cross-machine wasm reproducibility. The
-    # cargo step that follows proves the inferlet still builds on a
-    # clean checkout with the pinned toolchain target.
-    name: chat-apc inferlet build + stamp verify
-    runs-on: macos-15
-    # Conditional (#389): only build/verify the inferlet when its sources,
-    # the stamp script, the Vendor/pie pin, or the Makefile recipe change.
-    # Skipped via `if:` (not an `on.paths` filter) so a no-op reports
-    # "Success" under branch protection. FAIL-OPEN on detector failure —
-    # see the `changes` job comment. Keep `!= 'false'`, not `== 'true'`
-    # (the latter skips-as-Success when `changes` errors = false-green).
-    # `${{ }}` is required: a bare leading `!` is a YAML tag indicator.
     needs: changes
+    # Fail-open on detector failure: an errored/empty detector output must run
+    # the cheap provenance checks rather than skip-as-Success. Keep != 'false'.
     if: ${{ !cancelled() && needs.changes.outputs.inferlets != 'false' }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # chat-apc is a separate cargo workspace (its own target dir), so it
-      # gets its own keyed cache. Cold-compiles on every Vendor/pie bump
-      # otherwise (#389).
       - name: Cache chat-apc cargo target
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "Inferlets/chat-apc"
 
-      - name: Install wasm32-wasip2 target
-        run: rustup target add wasm32-wasip2
-
-      - name: Run chat-apc host unit tests
-        # Host-target unit tests for the inferlet's pure logic — chat-apc
-        # builds against the vendored inferlet SDK, which compiles for the
-        # host, so `cargo test` runs the LRU cache, CachebackDrafter
-        # (#418) deterministic accounting + greedy-equivalence regression,
-        # and the launch-diag / sse helpers without a wasm runner. These
-        # were previously not run in CI at all.
-        run: cd Inferlets/chat-apc && cargo test --lib
-
       - name: Stamp helper unit tests
         run: make test-stamp
 
       - name: Inferlet Rust unit tests (native)
-        # Pure-logic unit tests (tree-of-thought schema/tree/score/beam,
-        # launch-diag wire freezes, sse helpers) run on the host target —
-        # the wasm/WIT deps compile for host and the pure tests never call
-        # the imports. Gates `Inferlets/chat-apc/src/**` logic regressions.
         run: make test-inferlets
 
-      - name: Verify committed prebuilt matches stamp (full)
+      - name: Inferlet Rust unit tests (exec-strategies feature)
+        run: make test-inferlets-gated
+
+      - name: Verify committed prebuilt matches stamp
         run: make verify-inferlets
-
-      - name: Build inferlet wasm
-        run: make build-inferlets
-
-      - name: Verify rebuilt-tree inputs still match stamp (review v1 F3)
-        # Re-asserts vendor_pie_sha + src_sha256 against the freshly
-        # rebuilt tree, tolerating only wasm_sha256 / wasm_size drift.
-        # Catches Cargo.lock divergence and stale-cache resolution
-        # that the pre-build verify cannot see. wasm-byte
-        # reproducibility across machines / rust-stable patch
-        # versions is intentionally NOT enforced.
-        run: make verify-inferlets-inputs
-
-  gmake-sanity-fail-injection:
-    #  v8 F2 / . macOS ships /usr/bin/make 3.81 which
-    # silently ignores `.SHELLFLAGS` (so `set -e -o pipefail` never
-    # activates) — the Makefile's `set +e +o pipefail` per-recipe
-    # guard was theoretically necessary for gmake 4.x compatibility
-    # but had no locally available 4.x to verify against. This job
-    # installs Homebrew gmake 4.x, runs `make test-unit` with a
-    # transient XCTFail injection, and asserts:
-    #   1. recipe exits nonzero (pipeline status propagated, not
-    #      swallowed by gmake's `set -e`), AND
-    #   2. `log: <path>` line printed BEFORE the recipe aborts (the
-    #      guard neutralized gmake 4.x's `set -e -o pipefail`).
-    name: Makefile recipe under gmake 4.x
-    runs-on: macos-15
-    # Conditional (#389): the invariants this job guards live in the
-    # Makefile recipe + the SanityFailInjection sentinel, so only run it
-    # when one of those changes. Skipped via `if:` (not `on.paths`) so a
-    # no-op reports "Success" under branch protection. FAIL-OPEN on
-    # detector failure — see the `changes` job comment. Keep `!= 'false'`,
-    # not `== 'true'` (the latter skips-as-Success when `changes` errors).
-    # `${{ }}` is required: a bare leading `!` is a YAML tag indicator.
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.makefile != 'false' }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: false
-
-      - name: Install Homebrew gmake
-        run: brew install make
-
-      - name: Resolve gmake binary
-        id: gmake
-        run: |
-          set -eu
-          gmake_bin="$(brew --prefix)/opt/make/libexec/gnubin/make"
-          if [ ! -x "$gmake_bin" ]; then
-            gmake_bin="$(command -v gmake)"
-          fi
-          "$gmake_bin" --version | head -1
-          echo "bin=$gmake_bin" >> "$GITHUB_OUTPUT"
-
-      - name: Run sanity-fail injection under gmake
-        env:
-          PIE_SANITY_FAIL_INJECTION: "1"
-        run: |
-          # Deliberately allow nonzero — the recipe MUST fail for the
-          # invariants to be meaningful. Capture stdout+stderr.
-          set +e
-          "${{ steps.gmake.outputs.bin }}" test-unit > sanity.out 2>&1
-          rc=$?
-          set -e
-          echo "--- recipe output (last 60 lines) ---"
-          tail -60 sanity.out
-          echo "--- recipe exit code: $rc ---"
-          if [ "$rc" -eq 0 ]; then
-            echo "FAIL: expected nonzero recipe exit (sanity-fail injection should propagate); got 0"
-            exit 1
-          fi
-          if ! grep -Eq '^log: ' sanity.out; then
-            echo "FAIL: expected '^log: <path>$' line in recipe output but did not find one — gmake 4.x set -e -o pipefail may have aborted before the log-path echo (Makefile guard regression)"
-            exit 1
-          fi
-          # Review v1 F1: rc != 0 + `log:` line are both satisfied
-          # by ANY recipe-side red (compile error, missing toolchain,
-          # unrelated XCTFail, SwiftPM resolve flake) — neither
-          # proves the injected XCTFail actually fired. Bind the
-          # green-light to the sentinel string XCTFail prints
-          # (Tests/RatioThinkCoreTests/SanityFailInjectionTests.swift
-          # `Self.sentinel`). If the sentinel ever changes there,
-          # mirror it here.
-          #
-          # The Makefile recipe pipes test output through `tee $LOG |
-          # tail -20`, so the XCTFail line (which contains the
-          # sentinel) lands in the log file but typically not in the
-          # last 20 lines of stdout — read both. Extract the log
-          # path from the recipe's `^log: <path>$` echo, fall back
-          # to stdout-only grep if the path is unreadable.
-          log_path="$(grep -Eo '^log: .+' sanity.out | head -1 | sed -E 's/^log: //' || true)"
-          search_sources="sanity.out"
-          if [ -n "$log_path" ] && [ -r "$log_path" ]; then
-            search_sources="sanity.out $log_path"
-          else
-            echo "warning: could not read recipe log file path='$log_path' — sentinel grep will only see stdout"
-          fi
-          if ! grep -Fq 'PIE_SANITY_FAIL_INJECTION_FIRED_v1' $search_sources; then
-            echo "FAIL: sentinel 'PIE_SANITY_FAIL_INJECTION_FIRED_v1' not found in recipe stdout OR log file ($log_path) — recipe failed for an UNRELATED reason (compile error, toolchain, flake) and the canary would have false-greened on the gmake-guard claim."
-            echo "--- log file tail ---"
-            [ -n "$log_path" ] && [ -r "$log_path" ] && tail -40 "$log_path" || echo "(log file unreadable: $log_path)"
-            exit 1
-          fi
-          # Also assert at least one suite actually ran (catches the
-          # silent no-tests-discovered path where the bundle compiled
-          # but the filter matched nothing).
-          if ! grep -Eq 'Executed [0-9]+ tests' $search_sources; then
-            echo "FAIL: no 'Executed N tests' line in stdout or log — recipe failed before any tests ran"
-            exit 1
-          fi
-          echo "gmake-canary: rc=$rc, log line + injection sentinel + Executed line present (sources: $search_sources), recipe guard works under gmake 4.x"
-
-  release-scripts:
-    # Real-tool contract tests for the notarization + preflight scripts
-    # (Scripts/test-{notarize,release-preflight}.sh). They drive codesign /
-    # spctl / hdiutil against throwaway ad-hoc bundles — no xcodegen, no
-    # rust, no Apple round-trip — so they are fast and deterministic, and
-    # they keep the loud-fail / Gatekeeper-rejection contracts (#357) from
-    # silently regressing.
-    name: release script contract tests
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: false
-
-      - name: Notarize + preflight contract tests
-        run: make test-release

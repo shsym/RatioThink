@@ -86,17 +86,18 @@ final class ProfileTests: XCTestCase {
     }
   }
 
-  func test_throws_missing_field_when_model_omitted() {
-    XCTAssertThrowsError(try Profile.parse(toml: """
+  func test_model_omitted_is_explicit_no_default_state() throws {
+    let profile = try Profile.parse(toml: """
     id = "x"
     name = "X"
     inferlet = "chat-apc"
-    """)) { err in
-      guard case ProfileError.missingField(let f) = err else {
-        return XCTFail("expected .missingField, got \(err)")
-      }
-      XCTAssertEqual(f, "model")
-    }
+    """)
+
+    XCTAssertNil(profile.model,
+                 "missing model is an explicit no-default state, not a parse failure")
+    let dumped = try profile.dump()
+    XCTAssertFalse(dumped.contains("model ="),
+                   "round-trip must preserve no-default by omitting the model key")
   }
 
   func test_throws_parse_failure_on_invalid_toml() {

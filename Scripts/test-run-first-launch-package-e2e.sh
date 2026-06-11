@@ -61,7 +61,7 @@ FAKE_XCODEBUILD
     printf '%s\n' "$output" >&2
     exit 1
   fi
-  require_contains "$output" "RatioThink.app Automation/Accessibility permissions required"
+  require_contains "$output" "Rational.app Automation/Accessibility permissions required"
   require_contains "$output" "PIE_TEST_TCC_GRANTED=1"
   if [[ "$output" == *"generating Xcode project"* || "$output" == *"packaging Release app"* ]]; then
     echo "FAIL: default E2E must check TCC before package/build work" >&2
@@ -88,8 +88,8 @@ while [[ $# -gt 0 ]]; do
     *) shift ;;
   esac
 done
-mkdir -p "$PWD/build/xcode-${arch:-arm64}/sym/RatioThink.app" "$out"
-: >"$out/RatioThink-${arch:-arm64}.dmg"
+mkdir -p "$PWD/build/xcode-${arch:-arm64}/sym/Rational.app" "$out"
+: >"$out/Rational-${arch:-arm64}.dmg"
 FAKE_PACKAGE
   chmod +x "$tmp/package-dmg" "$tmp/genproject"
 
@@ -106,8 +106,8 @@ FAKE_PACKAGE
   fi
   local handoff
   handoff="$(cat "$artifact_env")"
-  require_contains "$handoff" "PIE_TEST_APP_PATH=$ROOT/build/xcode-arm64/sym/RatioThink.app"
-  require_contains "$handoff" "PIE_TEST_DMG_PATH=$tmp/run/package/RatioThink-arm64.dmg"
+  require_contains "$handoff" "PIE_TEST_APP_PATH=$ROOT/build/xcode-arm64/sym/Rational.app"
+  require_contains "$handoff" "PIE_TEST_DMG_PATH=$tmp/run/package/Rational-arm64.dmg"
   require_contains "$handoff" "PIE_TEST_FAKE_DOWNLOADS=1"
   require_contains "$handoff" "PIE_TEST_LOGIN_ITEM_STATUS=notRegistered"
   require_contains "$handoff" "PIE_TEST_INITIAL_ARTIFACT_PATH_PROBE_FILE=$tmp/run/launched-app-path-initial.txt"
@@ -123,7 +123,7 @@ test_scenario_success_removes_config_preferences_probes_and_safe_run_root() {
   run_root="$(mktemp -d /tmp/p175-first-launch-success.XXXXXX)"
   trap 'rm -rf "$run_root"' RETURN
 
-  local app_path="$run_root/RatioThink.app"
+  local app_path="$run_root/Rational.app"
   local export_root="$TEST_ARTIFACT_ROOT/success"
   local initial_probe="$run_root/launched-app-path-initial.txt"
   local relaunch_probe="$run_root/launched-app-path-relaunch.txt"
@@ -151,7 +151,7 @@ FAKE_DEFAULTS
 
   cat >"$run_root/artifact.env" <<EOF_ENV
 PIE_TEST_APP_PATH=$app_path
-PIE_TEST_DMG_PATH=$run_root/RatioThink-arm64.dmg
+PIE_TEST_DMG_PATH=$run_root/Rational-arm64.dmg
 PIE_TEST_RUN_ROOT=$run_root
 PIE_TEST_GUI_HOME=$run_root/gui-home
 PIE_APP_PREFERENCES_SUITE=com.ratiothink.app.gui.s7.testcleanup
@@ -177,11 +177,11 @@ EOF_ENV
     find "$run_root" -maxdepth 2 -print >&2 || true
     exit 1
   fi
-  if [[ ! -f "$export_root/latest/RatioThink.app.zip" ]]; then
-    echo "FAIL: expected human-testable app artifact zip at $export_root/latest/RatioThink.app.zip" >&2
+  if [[ ! -f "$export_root/latest/Rational.app.zip" ]]; then
+    echo "FAIL: expected human-testable app artifact zip at $export_root/latest/Rational.app.zip" >&2
     exit 1
   fi
-  if [[ ! -f "$export_root/latest/RatioThink.app.zip.sha256" ]]; then
+  if [[ ! -f "$export_root/latest/Rational.app.zip.sha256" ]]; then
     echo "FAIL: expected checksum next to latest human-testable app artifact" >&2
     exit 1
   fi
@@ -201,15 +201,15 @@ assert manifest["schema_version"] == 1
 assert manifest["artifact_kind"] == "macos_app_zip"
 assert manifest["check"] == "first-launch-package-e2e"
 assert manifest["run_id"] == "success-run"
-assert manifest["app"]["name"] == "RatioThink.app"
+assert manifest["app"]["name"] == "Rational.app"
 assert manifest["app"]["source_path"] == app_path
 assert manifest["verification"]["passed"] is True
 assert manifest["verification"]["artifact_path_assertions"] == "initial and relaunch probes matched PIE_TEST_APP_PATH"
 assert manifest["verification"]["relaunch_persistence_assertion"] == "passed"
-assert manifest["artifact"]["latest_zip_path"] == os.path.join(export_root, "latest", "RatioThink.app.zip")
+assert manifest["artifact"]["latest_zip_path"] == os.path.join(export_root, "latest", "Rational.app.zip")
 assert len(manifest["artifact"]["sha256"]) == 64
 PY
-  (cd "$export_root/latest" && shasum -a 256 -c RatioThink.app.zip.sha256 >/dev/null)
+  (cd "$export_root/latest" && shasum -a 256 -c Rational.app.zip.sha256 >/dev/null)
 }
 
 test_scenario_failure_preserves_run_root_but_cleans_external_state() {
@@ -217,7 +217,7 @@ test_scenario_failure_preserves_run_root_but_cleans_external_state() {
   run_root="$(mktemp -d /tmp/p175-first-launch-failure.XXXXXX)"
   trap 'rm -rf "$run_root"' RETURN
 
-  local app_path="$run_root/RatioThink.app"
+  local app_path="$run_root/Rational.app"
   local defaults_log
   defaults_log="$(mktemp)"
   trap 'rm -rf "$run_root"; rm -f "$defaults_log"' RETURN
@@ -240,7 +240,7 @@ FAKE_DEFAULTS
 
   cat >"$run_root/artifact.env" <<EOF_ENV
 PIE_TEST_APP_PATH=$app_path
-PIE_TEST_DMG_PATH=$run_root/RatioThink-arm64.dmg
+PIE_TEST_DMG_PATH=$run_root/Rational-arm64.dmg
 PIE_TEST_RUN_ROOT=$run_root
 PIE_TEST_GUI_HOME=$run_root/gui-home
 PIE_APP_PREFERENCES_SUITE=com.ratiothink.app.gui.s7.testfailure
@@ -271,7 +271,7 @@ EOF_ENV
     echo "FAIL: expected failed run root to be preserved: $run_root" >&2
     exit 1
   fi
-  if [[ -e "$TEST_ARTIFACT_ROOT/failure/latest/RatioThink.app.zip" ]]; then
+  if [[ -e "$TEST_ARTIFACT_ROOT/failure/latest/Rational.app.zip" ]]; then
     echo "FAIL: failed scenario must not export a human-testable app artifact" >&2
     exit 1
   fi
@@ -285,7 +285,7 @@ test_scenario_latest_update_and_retention() {
   for run_id in "${run_ids[@]}"; do
     local run_root
     run_root="$(mktemp -d /tmp/p175-first-launch-retention.XXXXXX)"
-    local app_path="$run_root/RatioThink.app"
+    local app_path="$run_root/Rational.app"
     mkdir -p "$run_root/bin" "$app_path" "$run_root/gui-home"
     cat >"$run_root/bin/pgrep" <<'FAKE_PGREP'
 #!/bin/bash
@@ -304,7 +304,7 @@ FAKE_DEFAULTS
     chmod +x "$run_root/bin/pgrep" "$run_root/bin/xcodebuild" "$run_root/bin/defaults"
     cat >"$run_root/artifact.env" <<EOF_ENV
 PIE_TEST_APP_PATH=$app_path
-PIE_TEST_DMG_PATH=$run_root/RatioThink-arm64.dmg
+PIE_TEST_DMG_PATH=$run_root/Rational-arm64.dmg
 PIE_TEST_RUN_ROOT=$run_root
 PIE_TEST_GUI_HOME=$run_root/gui-home
 PIE_APP_PREFERENCES_SUITE=com.ratiothink.app.gui.s7.$run_id
@@ -332,7 +332,7 @@ with open(latest_path, "r", encoding="utf-8") as fh:
 with open(manifest_path, "r", encoding="utf-8") as fh:
     manifest = json.load(fh)
 assert latest["run_id"] == "retention-run-4"
-assert latest["latest_zip_path"].endswith("/latest/RatioThink.app.zip")
+assert latest["latest_zip_path"].endswith("/latest/Rational.app.zip")
 assert manifest["run_id"] == "retention-run-4"
 PY
   if [[ -d "$export_root/runs/retention-run-1" ]]; then
@@ -340,7 +340,7 @@ PY
     exit 1
   fi
   for run_id in retention-run-2 retention-run-3 retention-run-4; do
-    if [[ ! -f "$export_root/runs/$run_id/RatioThink.app.zip" ]]; then
+    if [[ ! -f "$export_root/runs/$run_id/Rational.app.zip" ]]; then
       echo "FAIL: expected retained run artifact for $run_id" >&2
       exit 1
     fi

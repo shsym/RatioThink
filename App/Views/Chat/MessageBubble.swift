@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import MarkdownUI
 import os
@@ -22,6 +23,11 @@ import os
 /// the network until an explicit policy lands. Review v1 F3.
 struct MessageBubble: View {
   let message: ChatMessageItem
+  /// #513: retry-from-this-turn affordance, assistant rows only. Nil hides
+  /// the control — the scaffold passes nil while the chat is streaming
+  /// (retry waits for the active stream to end) and `TranscriptView` passes
+  /// nil for rows where no retained prefix exists to resend.
+  var onRetry: (() -> Void)? = nil
 
   var body: some View {
     switch message.role {
@@ -32,23 +38,28 @@ struct MessageBubble: View {
                foreground: .white,
                alignment: .trailing)
       }
+      .contextMenu { copyMenuItems }
     case .assistant:
       HStack {
         VStack(alignment: .leading, spacing: 6) {
+          // #413: a tree-of-thought turn renders its live search above the
+          // answer, the structured sibling of the reasoning section.
+          if let tot = message.tot {
+            TreeSearchSection(tree: tot, answerStarted: !message.content.isEmpty)
+          }
           if !message.reasoning.isEmpty {
-            ThinkingSection(
+            ReasoningDisclosure(
               reasoning: message.reasoning,
               answerStarted: !message.content.isEmpty
             )
           }
-          // Always show whatever the turn produced. A partial answer
-          // (truncated mid-content) still renders its bubble; a freshly
-          // inserted streaming row with nothing yet keeps the immediate
-          // placeholder bubble. A FINISHED turn with no answer
-          // (`finishReason != nil`) skips the empty bubble and shows the
-          // notice below instead of a silent blank. (#434)
+          // Show the answer bubble once content arrives. When it is still
+          // empty, render a placeholder bubble ONLY for a fresh streaming row
+          // — not when a reasoning section (#329) or a live tree (#413) is
+          // already showing, and not when the turn FINISHED with no answer
+          // (#434: the notice below explains that instead of a silent blank).
           if !message.content.isEmpty
-            || (message.finishReason == nil && message.reasoning.isEmpty) {
+            || (message.reasoning.isEmpty && message.tot == nil && message.finishReason == nil) {
             bubble(background: Color.secondary.opacity(0.15),
                    foreground: .primary,
                    alignment: .leading)
@@ -58,9 +69,38 @@ struct MessageBubble: View {
           if let text = message.notice.message {
             TurnNoticeRow(text: text, footnote: message.notice.isFootnote)
           }
+          if let text = message.generationPerformanceText {
+            GenerationPerformanceRow(text: text)
+              .reportMessageBubbleFrame(.generationPerformance(message.id))
+          }
+          // One quiet chrome row under the turn: the deterministic copy
+          // path (#515 — right-click on selectable MarkdownUI text surfaces
+          // AppKit's text menu, not our `.contextMenu`, so the guaranteed
+          // affordance is this explicit button; see `MessageCopyPlan`) and
+          // the #513 retry control. Retry reads as turn chrome, not a
+          // primary action — the destructive part is guarded by the
+          // scaffold's confirmation when later conversation would be erased.
+          if !message.content.isEmpty || onRetry != nil {
+            HStack(spacing: 12) {
+              if !message.content.isEmpty {
+                CopyAnswerButton(text: message.content)
+              }
+              if let onRetry {
+                Button(action: onRetry) {
+                  Label("Retry", systemImage: "arrow.counterclockwise")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Retry from here — regenerates this response; any later conversation is erased after you confirm")
+                .accessibilityIdentifier("transcript.retry")
+              }
+            }
+          }
         }
         Spacer(minLength: 60)
       }
+      .contextMenu { copyMenuItems }
     case .system:
       HStack {
         Spacer()
@@ -68,6 +108,22 @@ struct MessageBubble: View {
           .font(.caption)
           .foregroundStyle(.secondary)
         Spacer()
+      }
+      .contextMenu { copyMenuItems }
+    }
+  }
+
+  /// Deterministic copy path (#515): MarkdownUI splits one message into
+  /// many selectable `Text` blocks, so mouse selection cannot span a whole
+  /// rendered message. The context menu copies the canonical backing text
+  /// from `ChatMessageItem` instead — see `MessageCopyPlan` for the
+  /// answer/thinking boundary policy.
+  @ViewBuilder
+  private var copyMenuItems: some View {
+    ForEach(MessageCopyPlan.plan(for: message).items, id: \.label) { item in
+      Button(item.label) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(item.text, forType: .string)
       }
     }
   }
@@ -82,6 +138,7 @@ struct MessageBubble: View {
       .markdownImageProvider(BlockedImageProvider())
       .environment(\.openURL, SafeLinkOpenURLAction.action)
       .textSelection(.enabled)
+      .reportMessageBubbleFrame(.content(message.id))
       .padding(.horizontal, 12)
       .padding(.vertical, 8)
       .background(background, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -89,68 +146,84 @@ struct MessageBubble: View {
   }
 }
 
-// MARK: - thinking section
 
-/// Collapsible "Thinking" disclosure for an assistant turn's reasoning
-/// (`reasoning_content`). Distinct from the answer bubble so the model's
-/// scratchpad never mixes into — or gets copied with — the visible
-/// answer.
-///
-/// Expansion policy: auto-expanded while the answer hasn't started
-/// (reasoning streaming live), auto-folds the moment visible content
-/// arrives. A manual toggle wins and sticks for the turn's lifetime, so
-/// a user who opens the section to watch the model think keeps it open
-/// past the answer's first token. Folded by default once a completed
-/// turn is reloaded from disk.
-///
-/// Reasoning is rendered as plain (monospaced, secondary) text rather
-/// than Markdown — it's an internal scratchpad, not authored prose, and
-/// keeping it un-rendered avoids re-interpreting half-formed markup mid
-/// stream. It is selectable only while expanded; collapsed, it is absent
-/// from the view tree so a copy of the answer can't pull it in.
-private struct ThinkingSection: View {
-  let reasoning: String
-  let answerStarted: Bool
-  @State private var userExpanded: Bool?
+// MARK: - layout frame reporting
 
-  private var isExpanded: Bool { userExpanded ?? !answerStarted }
+/// Internal, no-op-unless-observed layout telemetry for app-unit geometry
+/// guards. The production transcript does not read this preference; tests use
+/// it to validate the real SwiftUI/AppKit-hosted `MessageBubble` tree instead
+/// of duplicating fragile headless layout math.
+enum MessageBubbleLayoutFrameID: Hashable {
+  case content(UUID)
+  case generationPerformance(UUID)
+}
 
-  var body: some View {
-    VStack(alignment: .leading, spacing: 4) {
-      Button {
-        userExpanded = !isExpanded
-      } label: {
-        HStack(spacing: 4) {
-          Image(systemName: "brain")
-          Text("Thinking")
-            .fontWeight(.medium)
-          Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .contentShape(Rectangle())
-      }
-      .buttonStyle(.plain)
-      .help(isExpanded ? "Hide the model's reasoning" : "Show the model's reasoning")
+struct MessageBubbleLayoutFramePreferenceKey: PreferenceKey {
+  static var defaultValue: [MessageBubbleLayoutFrameID: CGRect] = [:]
 
-      if isExpanded {
-        Text(reasoning)
-          .font(.caption.monospaced())
-          .foregroundStyle(.secondary)
-          .textSelection(.enabled)
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .padding(.horizontal, 10)
-          .padding(.vertical, 8)
-          .background(
-            Color.secondary.opacity(0.08),
-            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-          )
-      }
-    }
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .animation(.easeInOut(duration: 0.15), value: isExpanded)
+  static func reduce(
+    value: inout [MessageBubbleLayoutFrameID: CGRect],
+    nextValue: () -> [MessageBubbleLayoutFrameID: CGRect]
+  ) {
+    value.merge(nextValue(), uniquingKeysWith: { _, new in new })
   }
 }
+
+private struct MessageBubbleFrameReporter: View {
+  let id: MessageBubbleLayoutFrameID
+
+  var body: some View {
+    GeometryReader { proxy in
+      Color.clear.preference(key: MessageBubbleLayoutFramePreferenceKey.self,
+                             value: [id: proxy.frame(in: .global)])
+    }
+  }
+}
+
+private extension View {
+  func reportMessageBubbleFrame(_ id: MessageBubbleLayoutFrameID) -> some View {
+    background(MessageBubbleFrameReporter(id: id))
+  }
+}
+
+// MARK: - copy button
+
+/// Quiet always-available "Copy" under an assistant answer (#515). Writes
+/// the message's canonical Markdown source to the general pasteboard and
+/// flips to a brief "Copied" confirmation.
+private struct CopyAnswerButton: View {
+  let text: String
+  @State private var copied = false
+
+  var body: some View {
+    Button {
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(text, forType: .string)
+      copied = true
+      Task {
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        copied = false
+      }
+    } label: {
+      HStack(spacing: 3) {
+        Image(systemName: copied ? "checkmark" : "doc.on.doc")
+        Text(copied ? "Copied" : "Copy")
+      }
+      .font(.caption2)
+      .foregroundStyle(.secondary)
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .help("Copy the full answer as Markdown source")
+    .accessibilityIdentifier("message.copyAnswer")
+  }
+}
+
+// MARK: - thinking section
+
+// The assistant turn's reasoning disclosure (#329) is now the shared
+// `ReasoningDisclosure` (see ReasoningDisclosure.swift) — the same component
+// each tree-of-thought node uses for its per-node thinking (#413).
 
 // MARK: - truncation notice
 
@@ -174,6 +247,18 @@ private struct TurnNoticeRow: View {
     .foregroundStyle(.secondary)
     .frame(maxWidth: .infinity, alignment: .leading)
     .accessibilityElement(children: .combine)
+  }
+}
+
+private struct GenerationPerformanceRow: View {
+  let text: String
+
+  var body: some View {
+    Text(text)
+      .font(.caption2)
+      .foregroundStyle(.secondary)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .accessibilityIdentifier("message.generationPerformance")
   }
 }
 

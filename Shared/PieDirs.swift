@@ -31,7 +31,7 @@ public enum PieDirsError: Error, CustomStringConvertible, Equatable {
   }
 }
 
-/// Resolves RatioThink's on-disk locations. Default root is
+/// Resolves Rational's on-disk locations. Default root is
 /// `~/Library/Application Support/RatioThink/`. Tests and other isolated runs
 /// override it via either the in-process `homeOverride` injection seam
 /// (a `@TaskLocal` so concurrent test methods cannot alias each other)

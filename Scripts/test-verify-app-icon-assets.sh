@@ -146,7 +146,7 @@ expect_failure() {
 }
 
 mutate_source_png() {
-  append_png_text_chunk "$1/Resources/AppIcon/pie-icon-highres.png"
+  append_png_text_chunk "$1/Resources/AppIcon/rational-icon-highres.png"
 }
 
 mutate_generated_png() {

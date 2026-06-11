@@ -14,8 +14,11 @@ public typealias EnginePort = UInt16
 
 /// Engine lifecycle state observed by `PieSupervisor`. Single source of
 /// truth for menu-bar dot color and chat startup gating. The `running`
-/// case carries the live port + active profile id so the GUI doesn't
-/// have to keep a parallel cache.
+/// case carries the full `EngineSessionSnapshot` (#476) — port, active
+/// profile id, served model id, effective `max_tokens` ceiling, and the
+/// launch generation — so the App reads the whole session off ONE channel
+/// instead of reconciling served-model + request limits through `/v1/models`
+/// and transient view state.
 ///
 /// `failed` carries a discriminator (`EngineErrorCode`) plus a bounded
 /// message so the GUI can route on the code rather than substring-match
@@ -24,7 +27,7 @@ public typealias EnginePort = UInt16
 public enum EngineStatus: Codable, Equatable, Sendable {
   case stopped
   case starting
-  case running(port: EnginePort, profileID: String)
+  case running(EngineSessionSnapshot)
   case stopping
   case failed(code: EngineErrorCode, message: String)
 
@@ -36,7 +39,7 @@ public enum EngineStatus: Codable, Equatable, Sendable {
   public static let failedMessageTruncationMarker = "…[truncated]"
 
   private enum Kind: String, Codable { case stopped, starting, running, stopping, failed }
-  private enum CodingKeys: String, CodingKey { case kind, port, profileID, code, message }
+  private enum CodingKeys: String, CodingKey { case kind, snapshot, code, message }
 
   public init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -44,20 +47,17 @@ public enum EngineStatus: Codable, Equatable, Sendable {
     case .stopped:  self = .stopped
     case .starting: self = .starting
     case .running:
-      let port = try c.decode(EnginePort.self, forKey: .port)
+      let snapshot = try c.decode(EngineSessionSnapshot.self, forKey: .snapshot)
       // Port 0 means "any" to bind(2) but the engine always picks an
       // explicit port and reports it in the handshake. A 0 here is a
       // helper bug or wire corruption — fail closed.
-      guard port != 0 else {
+      guard snapshot.port != 0 else {
         throw DecodingError.dataCorruptedError(
-          forKey: .port, in: c,
-          debugDescription: "EngineStatus.running port=0 is invalid; engine never reports auto-bind"
+          forKey: .snapshot, in: c,
+          debugDescription: "EngineStatus.running snapshot.port=0 is invalid; engine never reports auto-bind"
         )
       }
-      self = .running(
-        port: port,
-        profileID: try c.decode(String.self, forKey: .profileID)
-      )
+      self = .running(snapshot)
     case .stopping: self = .stopping
     case .failed:
       self = .failed(
@@ -72,25 +72,23 @@ public enum EngineStatus: Codable, Equatable, Sendable {
     switch self {
     case .stopped:  try c.encode(Kind.stopped,  forKey: .kind)
     case .starting: try c.encode(Kind.starting, forKey: .kind)
-    case .running(let port, let profileID):
+    case .running(let snapshot):
       // Symmetric guard with the decoder (review v2 F5). UInt16
       // forbids negative/oversized at the type level but admits 0,
       // and the engine never auto-binds — so a helper bug that
-      // produces `.running(port: 0, ...)` must surface at the
-      // encode site, not on the GUI's decode where the trail is
-      // cold.
-      guard port != 0 else {
+      // produces a `snapshot.port == 0` must surface at the encode
+      // site, not on the GUI's decode where the trail is cold.
+      guard snapshot.port != 0 else {
         throw EncodingError.invalidValue(
-          port,
+          snapshot.port,
           EncodingError.Context(
-            codingPath: encoder.codingPath + [CodingKeys.port],
-            debugDescription: "EngineStatus.running must not carry port=0; the engine never auto-binds"
+            codingPath: encoder.codingPath + [CodingKeys.snapshot],
+            debugDescription: "EngineStatus.running must not carry snapshot.port=0; the engine never auto-binds"
           )
         )
       }
       try c.encode(Kind.running, forKey: .kind)
-      try c.encode(port,       forKey: .port)
-      try c.encode(profileID,  forKey: .profileID)
+      try c.encode(snapshot,     forKey: .snapshot)
     case .stopping: try c.encode(Kind.stopping, forKey: .kind)
     case .failed(let code, let message):
       try c.encode(Kind.failed, forKey: .kind)
@@ -132,26 +130,13 @@ public struct DownloadHandle: Codable, Equatable, Hashable, Sendable {
   }
 }
 
-/// Opaque ticket for an in-flight `loadModel` pre-warm. Same shape as
-/// `DownloadHandle` but distinct type so GUI code can't accidentally
-/// cancel the wrong subsystem.
-public struct LoadHandle: Codable, Equatable, Hashable, Sendable {
-  public let id: UUID
-  public let modelID: String
-
-  public init(id: UUID = UUID(), modelID: String) {
-    self.id = id
-    self.modelID = modelID
-  }
-}
-
 /// Discriminated engine failure category. Kept narrow on purpose; new
 /// cases require a deliberate decision about how the GUI should render
 /// them. Bag any extra detail in `message`.
 ///
 /// `wireContractViolation` exists so XPC plumbing bugs (double-set
 /// reply tuple, missing payload, type-skewed Data) route to a distinct
-/// "this is a RatioThink bug, not an engine failure" path in the GUI rather
+/// "this is a Rational bug, not an engine failure" path in the GUI rather
 /// than being lumped with `.unknown` (review F8).
 public enum EngineErrorCode: String, Codable, Sendable {
   case spawnFailed
@@ -188,8 +173,8 @@ public enum EngineErrorCode: String, Codable, Sendable {
   /// Caller-supplied input failed validation BEFORE any engine work:
   /// `repo`/`file` path-traversal, malformed URL, NUL byte, etc.
   /// Distinct from `.wireContractViolation` (which is reserved for
-  /// RatioThink-internal plumbing bugs — see comment above) so the GUI can
-  /// surface "please correct repo/file" instead of "RatioThink internal bug
+  /// Rational-internal plumbing bugs — see comment above) so the GUI can
+  /// surface "please correct repo/file" instead of "Rational internal bug
   /// — please file a bug report" (review v17 F5). Added Phase 2.5.
   case invalidInput
   /// Engine subprocess could not be reaped (SIGKILL rejected:
@@ -217,7 +202,7 @@ public enum EngineErrorCode: String, Codable, Sendable {
   ///  · `kill -9 <pid>` manually (pid is in the fault log).
   case killRejected
   /// The requested model was rejected before launch because its
-  /// resolved local artifact size is above RatioThink.app's v1 memory safety
+  /// resolved local artifact size is above Rational.app's v1 memory safety
   /// limit, or because the app could not determine the artifact size
   /// safely. This is a user-recoverable model choice problem, not a
   /// Pie binary/process failure.

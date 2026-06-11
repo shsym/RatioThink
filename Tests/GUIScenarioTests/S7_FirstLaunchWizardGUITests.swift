@@ -32,7 +32,7 @@ final class S7_FirstLaunchWizardGUITests: XCTestCase {
     XCTAssert(app.wait(for: .runningForeground, timeout: 5))
     app.activate()
 
-    XCTAssertTrue(app.staticTexts["Welcome to RatioThink"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["Welcome to Rational"].waitForExistence(timeout: 5))
     XCTAssertTrue(app.staticTexts["Step 1 of 2"].waitForExistence(timeout: 2),
                   "wizard must advertise the reduced two-step flow")
     // : step 1 leads with the user-facing value proposition.
@@ -42,23 +42,23 @@ final class S7_FirstLaunchWizardGUITests: XCTestCase {
     )
     app.buttons["Continue"].click()
 
-    XCTAssertTrue(app.staticTexts["Keep RatioThink ready in the menu bar"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["Keep Rational ready in the menu bar"].waitForExistence(timeout: 5))
     XCTAssertTrue(
-      app.staticTexts["RatioThinkHelper must run in the menu bar for RatioThink to work. Register it as a login item so macOS can launch the helper."].waitForExistence(timeout: 5),
-      "step 2 must frame RatioThinkHelper registration as required"
+      app.staticTexts["Rational Helper must run in the menu bar for Rational to work. Register it as a login item so macOS can launch the helper."].waitForExistence(timeout: 5),
+      "step 2 must frame Rational Helper registration as required"
     )
     XCTAssertFalse(
-      app.buttons["Open RatioThink"].isEnabled,
-      "Open RatioThink must not look actionable before helper registration succeeds"
+      app.buttons["Open Rational"].isEnabled,
+      "Open Rational must not look actionable before helper registration succeeds"
     )
     let statusIndicator = app.images["FirstLaunchLoginStatusIndicator"]
     XCTAssertTrue(statusIndicator.waitForExistence(timeout: 2),
                   "helper status row must expose a non-clickable status indicator")
     XCTAssertEqual(statusIndicator.label, "Helper registration required")
 
-    app.buttons["Register RatioThinkHelper"].click()
-    XCTAssertTrue(app.staticTexts["RatioThinkHelper is registered"].waitForExistence(timeout: 5))
-    XCTAssertTrue(app.buttons["Open RatioThink"].isEnabled)
+    app.buttons["Register Rational Helper"].click()
+    XCTAssertTrue(app.staticTexts["Rational Helper is registered"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.buttons["Open Rational"].isEnabled)
     XCTAssertEqual(statusIndicator.label, "Helper registered")
 
     // : the wizard never forces a model download — there is
@@ -66,7 +66,7 @@ final class S7_FirstLaunchWizardGUITests: XCTestCase {
     XCTAssertFalse(app.staticTexts["Choose a default model"].exists,
                    "first-launch wizard must not include a model download step")
 
-    app.buttons["Open RatioThink"].click()
+    app.buttons["Open Rational"].click()
     XCTAssertTrue(app.buttons["chats.newButton"].waitForExistence(timeout: 5),
                   "main shell must open after the two-step wizard completes")
   }
@@ -81,12 +81,12 @@ final class S7_FirstLaunchWizardGUITests: XCTestCase {
     XCTAssert(app.wait(for: .runningForeground, timeout: 5))
     app.activate()
 
-    XCTAssertTrue(app.staticTexts["Welcome to RatioThink"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["Welcome to Rational"].waitForExistence(timeout: 5))
     app.buttons["Continue"].click()
 
-    XCTAssertTrue(app.staticTexts["RatioThinkHelper needs approval in System Settings"].waitForExistence(timeout: 5))
-    XCTAssertTrue(app.staticTexts["Open System Settings → General → Login Items and approve RatioThinkHelper, then return here."].waitForExistence(timeout: 5))
-    XCTAssertFalse(app.buttons["Open RatioThink"].isEnabled)
+    XCTAssertTrue(app.staticTexts["Rational Helper needs approval in System Settings"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["Open System Settings → General → Login Items and approve Rational Helper, then return here."].waitForExistence(timeout: 5))
+    XCTAssertFalse(app.buttons["Open Rational"].isEnabled)
   }
 
   @MainActor
@@ -112,7 +112,7 @@ final class S7_FirstLaunchWizardGUITests: XCTestCase {
                   "Debug menu must include onboarding reset for setup-flow retesting")
     resetOnboarding.click()
 
-    XCTAssertTrue(app.staticTexts["Welcome to RatioThink"].waitForExistence(timeout: 5),
+    XCTAssertTrue(app.staticTexts["Welcome to Rational"].waitForExistence(timeout: 5),
                   "debug reset should return the running app to the onboarding wizard")
   }
 

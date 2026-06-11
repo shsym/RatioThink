@@ -2,7 +2,7 @@
 # Manual seated-console smoke for Phase 2.3 menu-bar status item.
 #
 # Walks the helper through every dot state (gray/amber/green/red)
-# WITHOUT a RatioThink.app GUI by driving `PieSupervisor` via the XPC
+# WITHOUT a Rational.app GUI by driving `PieSupervisor` via the XPC
 # `startEngine` / `stopEngine` selectors. Requires a seated console
 # (the helper publishes NSStatusItem, which a non-GUI session
 # cannot render).
@@ -12,11 +12,11 @@
 #
 #   --keep    leave the helper running after the script finishes,
 #             so you can eyeball the dot in the menu bar. Otherwise
-#             the script SIGTERMs RatioThinkHelper at exit.
+#             the script SIGTERMs RationalHelper at exit.
 #
 # What the script does:
-#   1. make build       — produce RatioThink.app + RatioThinkHelper.app
-#   2. launch RatioThinkHelper directly (no RatioThink.app, no SMAppService).
+#   1. make build       — produce Rational.app + RationalHelper.app
+#   2. launch RationalHelper directly (no Rational.app, no SMAppService).
 #      Skips login-item registration; we just want the menu bar item.
 #   3. tail helper logs in the background so you see supervisor state
 #      transitions in real time.
@@ -80,7 +80,7 @@ HELPER_LOG="$LOG_DIR/smoke-helper-$STAMP.log"
 # would launch — silently running a stale binary from another branch.
 DERIVED_DIR="$ROOT/.DerivedData-smoke"
 BUILD_LOG="$LOG_DIR/smoke-build-$STAMP.log"
-echo "==> Building RatioThink.app + RatioThinkHelper.app (DerivedData=$DERIVED_DIR)"
+echo "==> Building Rational.app + RationalHelper.app (DerivedData=$DERIVED_DIR)"
 # Review v1 F8: under `set -e`, `xcodebuild` failure aborts the
 # script BEFORE the post-hoc `BUILD_RC=$?` check could fire, so the
 # operator saw a silent exit with no stderr (build output was
@@ -98,12 +98,12 @@ then
   exit 1
 fi
 
-HELPER_APP="$DERIVED_DIR/Build/Products/Debug/RatioThink.app/Contents/Library/LoginItems/RatioThinkHelper.app"
+HELPER_APP="$DERIVED_DIR/Build/Products/Debug/Rational.app/Contents/Library/LoginItems/RationalHelper.app"
 if [ ! -d "$HELPER_APP" ]; then
-  echo "error: RatioThinkHelper.app not found at $HELPER_APP" >&2
+  echo "error: RationalHelper.app not found at $HELPER_APP" >&2
   exit 1
 fi
-HELPER_BIN="$HELPER_APP/Contents/MacOS/RatioThinkHelper"
+HELPER_BIN="$HELPER_APP/Contents/MacOS/RationalHelper"
 echo "==> Helper: $HELPER_BIN"
 
 # Kill any stale helper from a prior run. Review v1 F9: don't
@@ -111,11 +111,11 @@ echo "==> Helper: $HELPER_BIN"
 # a "permission denied" (helper owned by launchd ctx) means the
 # stale process survives and races the fresh helper for the menu-bar
 # slot. After kill, verify nothing answers to the name anymore.
-pkill -x RatioThinkHelper 2>/dev/null || true
+pkill -x RationalHelper 2>/dev/null || true
 sleep 0.3
-if pgrep -x RatioThinkHelper >/dev/null 2>&1; then
-  echo "error: stale RatioThinkHelper still running after pkill — refusing to launch a second instance" >&2
-  echo "       pid(s): $(pgrep -x RatioThinkHelper | tr '\n' ' ')" >&2
+if pgrep -x RationalHelper >/dev/null 2>&1; then
+  echo "error: stale RationalHelper still running after pkill — refusing to launch a second instance" >&2
+  echo "       pid(s): $(pgrep -x RationalHelper | tr '\n' ' ')" >&2
   exit 1
 fi
 
@@ -133,7 +133,7 @@ FAKE
   echo "==> --drive-engine: fake engine at $FAKE_ENGINE (green-hold=${GREEN_HOLD}s)"
 fi
 
-echo "==> Launching RatioThinkHelper (log: $HELPER_LOG)"
+echo "==> Launching RationalHelper (log: $HELPER_LOG)"
 # DEBUG dev builds are ad-hoc-signed (no Team ID).
 # `HelperXPCListener.verifyStartupInvariants` preconditionFails on
 # `.teamIDAbsent` unless a bypass env is set. Smoke is local-only;
@@ -171,13 +171,13 @@ cat <<'EOF'
 Seated-console smoke for Phase 2.3 menu-bar status item
 ────────────────────────────────────────────────────────────────────
 
-  Look at the menu bar (top-right). You should see a RatioThink status item.
+  Look at the menu bar (top-right). You should see a Rational status item.
 
   Checklist:
 
     [ ] Dot is GRAY (outline circle) — supervisor is .stopped.
     [ ] Click the dot. Menu shows:
-          · Show RatioThink                          (Cmd+0)
+          · Show Rational                          (Cmd+0)
           · ─────
           · Engine: stopped                   (disabled)
           · Resume Engine                     (disabled —  wires it)
@@ -185,7 +185,7 @@ Seated-console smoke for Phase 2.3 menu-bar status item
           · Settings…                         (Cmd+,)
           · Open Logs…
           · ─────
-          · Quit RatioThink                          (Cmd+Q)
+          · Quit Rational                          (Cmd+Q)
     [ ] Click "Open Logs…" → Finder opens ~/Library/Application Support/RatioThink/logs/.
 
   To see LIVE dot transitions, re-run with --drive-engine:

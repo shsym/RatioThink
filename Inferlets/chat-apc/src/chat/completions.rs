@@ -57,6 +57,7 @@ use wstd::http::{IntoBody, Request, Response};
 
 use super::apc::{ReasoningDecoder, ToolUseDecoder};
 use super::generate::{self, DecodeStrategy};
+use super::prefix_cache::{self, CacheDiag, ReusePlan};
 use super::spec::{SpecConfig, SpecMetrics};
 use crate::sse::{self, EmitError, Emitter, SseError};
 
@@ -132,10 +133,13 @@ const DEFAULT_MAX_TOKENS: usize = 1024;
 const MAX_TEMPERATURE: f32 = 2.0;
 /// Inclusive upper bound on `top_p` (the canonical nucleus cap).
 const MAX_TOP_P: f32 = 1.0;
-/// Inclusive upper bound on `max_tokens`. Picked to cap worst-case
-/// per-request scheduler residency; well above any sensible chat
-/// reply length.
-const MAX_MAX_TOKENS: usize = 8192;
+/// Fallback ceiling on `max_tokens`, used only when the engine reports
+/// no capacity (`runtime::max-output-tokens()` == 0 — e.g. no model
+/// registered yet). In normal operation the live engine value — its
+/// launch-time KV-cache capacity, which is memory-aware — is used
+/// instead (see `max_output_ceiling`). 8192 is a conservative cap well
+/// above any sensible chat reply length.
+const MAX_OUTPUT_TOKENS_FALLBACK: usize = 8192;
 
 /// Inclusive bounds on the #418 speculation knobs. Out-of-range values
 /// are rejected at the 400 boundary (see `validate_sampling`), mirroring
@@ -176,6 +180,13 @@ pub struct ChatCompletionsRequest {
     /// when `enabled` + greedy (`temperature == 0`), drafting engages.
     #[serde(default)]
     pub speculation: Option<SpecRequest>,
+    /// #522 cross-request KV prefix-cache directive. Absent → reuse
+    /// disabled (byte-identical to the pre-#522 full-rebuild path).
+    /// Present + `policy:"auto"` + non-empty `key` → the inferlet opens a
+    /// matching prefix snapshot on a hit and saves the new boundary on
+    /// success. See [`super::prefix_cache`].
+    #[serde(default)]
+    pub cache: Option<prefix_cache::CacheDirective>,
 }
 
 /// Request-side speculation knobs (chat-apc extension). Dimensions
@@ -211,7 +222,43 @@ impl SpecRequest {
 #[derive(Deserialize, Serialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(deserialize_with = "deserialize_message_content")]
     pub content: String,
+}
+
+/// OpenAI content-part shape (`{"type":"text","text":"..."}`); other part
+/// types (image_url, etc.) are accepted but contribute no text.
+#[derive(Deserialize)]
+struct ContentPart {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// `messages[].content` accepts either the simple string form or the
+/// multi-part array form (`[{"type":"text","text":"..."}, ...]`) that many
+/// OpenAI-compatible clients send (e.g. for retries/multi-modal turns).
+/// The array form is flattened into a single string by concatenating each
+/// part's `text` field, so every downstream consumer keeps treating
+/// `content` as a plain `String`.
+fn deserialize_message_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Content {
+        Text(String),
+        Parts(Vec<ContentPart>),
+    }
+
+    match Content::deserialize(deserializer)? {
+        Content::Text(s) => Ok(s),
+        Content::Parts(parts) => Ok(parts
+            .into_iter()
+            .filter_map(|p| p.text)
+            .collect::<Vec<_>>()
+            .join("")),
+    }
 }
 
 /// OpenAI tool entry. Only `function`-type tools are recognized; the
@@ -344,6 +391,29 @@ struct SpecMetricsReport {
     decode_tokens_per_sec: f64,
     leader_len: usize,
     draft_len: usize,
+}
+
+#[derive(Serialize)]
+struct GenerationMetricsSse {
+    event: &'static str,
+    output_tokens: usize,
+    elapsed_s: f64,
+    tokens_per_sec: f64,
+}
+
+impl GenerationMetricsSse {
+    fn build(output_tokens: usize, elapsed: Duration) -> Option<Self> {
+        let elapsed_s = elapsed.as_secs_f64();
+        if output_tokens == 0 || elapsed_s <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            event: "generation_metrics",
+            output_tokens,
+            elapsed_s,
+            tokens_per_sec: output_tokens as f64 / elapsed_s,
+        })
+    }
 }
 
 impl SpecMetricsReport {
@@ -723,6 +793,42 @@ const STARVED_CODE: &str = "forward_pass_starved";
 const STARVED_MESSAGE: &str =
     "engine produced no tokens for a decode step (device failure, per-batch \
      timeout, or KV eviction); generation cannot continue";
+
+// =============================================================================
+// Over-capacity / backpressure classification (#470)
+// =============================================================================
+
+/// Stable sentinel the pie runtime prefixes onto a KV-page **acquisition
+/// timeout** (`runtime::context::reserve_working_pages`). When concurrent
+/// requests exceed the engine's KV slot count, a reservation defers on the
+/// scheduler's alloc/restore queues with no timer of its own; the host now
+/// bounds that wait and fails the call with this prefix. The chat-apc
+/// handler matches it to surface backpressure as `server_busy` + HTTP 503
+/// instead of a generic `forward_pass_failed` 500 — so an over-capacity
+/// client gets an explicit, retryable signal rather than a hung connection.
+///
+/// The trailing colon is load-bearing: `GenStep::execute` errors are an
+/// opaque free-text channel that also carries verbatim device/driver text,
+/// so a bare `server_busy` substring could appear in an unrelated fatal
+/// error and get mislabeled retryable. The host's contract is the
+/// colon-suffixed prefix (`"server_busy: …"`); bind to exactly that. (The
+/// real fix is a structured WIT error code — tracked as a follow-up.)
+const SERVER_BUSY_SENTINEL: &str = "server_busy:";
+
+/// Distinct terminal/error code for the over-capacity case.
+const SERVER_BUSY_CODE: &str = "server_busy";
+
+/// Classify a `Generator::next` / `GenStep::execute` error string into a
+/// stable terminal code. An over-capacity acquisition timeout (carrying the
+/// [`SERVER_BUSY_SENTINEL`]) maps to [`SERVER_BUSY_CODE`]; everything else
+/// is a generic `forward_pass_failed`.
+fn classify_forward_error(msg: &str) -> &'static str {
+    if msg.contains(SERVER_BUSY_SENTINEL) {
+        SERVER_BUSY_CODE
+    } else {
+        "forward_pass_failed"
+    }
+}
 
 // =============================================================================
 // Reasoning/content channel demux
@@ -1796,39 +1902,36 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
         return res.respond(with_launch_diags_header(response)).await;
     }
 
-    if let Err((field, msg)) = validate_sampling(&request) {
-        return res
-            .respond(with_launch_diags_header(json_error_param(
-                400,
-                "invalid_request",
-                &msg,
-                field,
-            )))
-            .await;
-    }
+    let max_output_ceiling = max_output_ceiling();
+    let effective_max_tokens = match validate_sampling(&request, max_output_ceiling) {
+        Ok(max_tokens) => max_tokens,
+        Err((field, msg)) => {
+            return res
+                .respond(with_launch_diags_header(json_error_param(
+                    400,
+                    "invalid_request",
+                    &msg,
+                    field,
+                )))
+                .await;
+        }
+    };
 
-    // F4: reject `role:"tool"` until the chat template grows a real
-    // tool slot. Silent demotion to `user` (the prior `_` arm in
-    // `fill_context`) makes multi-turn tool-call round-trips quietly
-    // wrong — better to fail loud than ship half-wired tool support.
-    if let Some((i, m)) = request
-        .messages
-        .iter()
-        .enumerate()
-        .find(|(_, m)| m.role == "tool")
-    {
+    // F4 + #468: reject any role outside the supported set at the 400
+    // boundary rather than silently demoting it to `user` in
+    // `fill_context`. `tool` keeps its dedicated `tool_role_unsupported`
+    // code (no tool slot yet); a typo'd or unsupported role (`developer`,
+    // `banana`, …) is `unsupported_role` — fail loud, the way an
+    // OpenAI-compatible SDK expects, instead of mis-templating it.
+    if let Err((i, code, message)) = validate_roles(&request.messages) {
         let body = serde_json::json!({
             "error": {
                 "type": "invalid_request_error",
-                "code": "tool_role_unsupported",
-                "message": format!(
-                    "messages[{i}].role=\"tool\" is not yet supported (chat template has no tool slot); \
-                     post the tool result as a user turn or wait for the SDK tool-answer surface to land"
-                ),
+                "code": code,
+                "message": message,
                 "param": format!("messages[{i}].role"),
             }
         });
-        let _ = m;
         let response = Response::builder()
             .status(400)
             .header("Content-Type", "application/json")
@@ -1854,9 +1957,9 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
     // and non-stream `warnings` field and `X-ChatAPC-Launch-Diags`
     // header all source from the same place.
     if request.stream {
-        handle_streaming(request, res).await
+        handle_streaming(request, res, effective_max_tokens).await
     } else {
-        handle_non_streaming(request, res).await
+        handle_non_streaming(request, res, effective_max_tokens).await
     }
 }
 
@@ -1864,10 +1967,95 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
 // Validation (F7)
 // =============================================================================
 
-/// Validate sampling parameters. Returns `Err((field, message))`
-/// where `field` names the offending JSON key (passed to the
-/// OpenAI-shape error envelope's `param`).
-fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, String)> {
+/// Roles the chat template has a real slot for. `tool` is parsed but
+/// rejected with a dedicated code (F4 — no tool slot yet); every other
+/// role outside this set is an OpenAI-compatibility error (#468).
+const SUPPORTED_ROLES: [&str; 3] = ["system", "user", "assistant"];
+
+/// Single source of truth for the role policy. `None` = fillable;
+/// `Some(code)` = rejected with that 400 envelope `code`. `tool` keeps
+/// its dedicated `tool_role_unsupported` code (no tool slot in v1); any
+/// other unknown role — typo, `developer`, `function`, … — is
+/// `unsupported_role`. Used by both `validate_roles` (the early request
+/// gate) and `fill_context` (the callee guard), so the two can't drift.
+fn role_error_code(role: &str) -> Option<&'static str> {
+    if SUPPORTED_ROLES.contains(&role) {
+        None
+    } else if role == "tool" {
+        Some("tool_role_unsupported")
+    } else {
+        Some("unsupported_role")
+    }
+}
+
+/// Build the 400-envelope message for a rejected role at index `i`.
+fn role_error_message(i: usize, role: &str, code: &str) -> String {
+    if code == "tool_role_unsupported" {
+        format!(
+            "messages[{i}].role=\"tool\" is not yet supported (chat template has no tool slot); \
+             post the tool result as a user turn or wait for the SDK tool-answer surface to land"
+        )
+    } else {
+        format!(
+            "messages[{i}].role={role:?} is not a supported role (expected one of: system, user, assistant)"
+        )
+    }
+}
+
+/// Error `code`s emitted by the role policy (vs. internal failures like
+/// `tool_equip_failed`). A `fill_context` `Err` carrying one of these is
+/// a client error (400); anything else is an internal 500. Callers that
+/// surface `fill_context` failures (e.g. `tot::dispatch`) use this to
+/// pick the status.
+pub(crate) fn is_role_error_code(code: &str) -> bool {
+    matches!(code, "unsupported_role" | "tool_role_unsupported")
+}
+
+/// Validate message roles against the supported set. Returns the
+/// offending message index plus the 400 envelope `code`/`message`.
+///
+/// This is the early request gate ([`handle_parsed`]); [`fill_context`]
+/// guards the same policy at the callee so any non-completions caller
+/// (e.g. the tree-of-thought dispatch path) also rejects rather than
+/// silently demoting an unknown role to `user`.
+fn validate_roles(messages: &[ChatMessage]) -> Result<(), (usize, &'static str, String)> {
+    for (i, m) in messages.iter().enumerate() {
+        if let Some(code) = role_error_code(&m.role) {
+            return Err((i, code, role_error_message(i, &m.role, code)));
+        }
+    }
+    Ok(())
+}
+
+/// Per-request `max_tokens` ceiling, read live from the engine. This is
+/// `runtime::max-output-tokens()` — the runtime-reported output-token
+/// ceiling: configured scheduler `default_token_limit` capped by raw KV
+/// capacity when set, otherwise raw KV capacity. Falls back to
+/// `MAX_OUTPUT_TOKENS_FALLBACK` when the engine reports 0 (no model
+/// registered / ceiling unknown).
+fn max_output_ceiling() -> usize {
+    match runtime::max_output_tokens() as usize {
+        0 => MAX_OUTPUT_TOKENS_FALLBACK,
+        n => n,
+    }
+}
+
+/// `max_output_ceiling` is the inclusive upper bound on `max_tokens`,
+/// supplied by the caller from `runtime::max-output-tokens` so validation
+/// follows the runtime-reported ceiling (configured `default_token_limit`
+/// capped by KV capacity, or raw KV capacity when unset) instead of a
+/// hardcoded constant. Kept as a parameter — rather than reading the host
+/// import in here — so this stays a pure function the unit tests can drive
+/// without an engine host.
+/// Returns the effective generation `max_tokens` budget. For omitted
+/// `max_tokens`, the default is clamped down to the runtime ceiling so the
+/// common default request path cannot exceed a memory-aware engine limit.
+/// Returns `Err((field, message))` where `field` names the offending JSON key
+/// (passed to the OpenAI-shape error envelope's `param`).
+fn validate_sampling(
+    req: &ChatCompletionsRequest,
+    max_output_ceiling: usize,
+) -> Result<usize, (&'static str, String)> {
     if let Some(t) = req.temperature {
         if !(t.is_finite() && (0.0..=MAX_TEMPERATURE).contains(&t)) {
             return Err((
@@ -1881,14 +2069,16 @@ fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, 
             return Err(("top_p", format!("top_p must be in (0.0, {MAX_TOP_P}]")));
         }
     }
-    if let Some(n) = req.max_tokens {
-        if n == 0 || n > MAX_MAX_TOKENS {
+    let effective_max_tokens = match req.max_tokens {
+        Some(n) if n == 0 || n > max_output_ceiling => {
             return Err((
                 "max_tokens",
-                format!("max_tokens must be in [1, {MAX_MAX_TOKENS}]"),
+                format!("max_tokens must be in [1, {max_output_ceiling}]"),
             ));
         }
-    }
+        Some(n) => n,
+        None => DEFAULT_MAX_TOKENS.min(max_output_ceiling),
+    };
     // #418: range-check the speculation knobs at the 400 boundary so an
     // out-of-range value is rejected with a `param`, mirroring
     // `max_tokens` — rather than silently coerced by `to_config`'s
@@ -1912,7 +2102,7 @@ fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, 
             }
         }
     }
-    Ok(())
+    Ok(effective_max_tokens)
 }
 
 /// Build an OpenAI-shape error JSON with a populated `param` field.
@@ -1941,10 +2131,13 @@ pub(crate) fn json_error_param(
 // Streaming branch
 // =============================================================================
 
-async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finished {
+async fn handle_streaming(
+    req: ChatCompletionsRequest,
+    res: Responder,
+    max_tokens: usize,
+) -> Finished {
     let temperature = req.temperature.unwrap_or(DEFAULT_TEMPERATURE);
     let top_p = req.top_p.unwrap_or(DEFAULT_TOP_P);
-    let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
     // F9: load the model BEFORE opening the SSE response so a load
     // failure returns a clean 5xx JSON envelope rather than a
@@ -1964,23 +2157,54 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
                 .await;
         }
     };
-    let mut ctx = match Context::new(&model) {
-        Ok(c) => c,
-        Err(e) => {
-            return res
-                .respond(with_launch_diags_header(sse::json_error(
-                    500,
-                    "context_create_failed",
-                    &format!("Failed to create context: {e}"),
-                )))
-                .await;
+    // #522: cross-request KV prefix cache. Engaged only for an enabled
+    // `cache` directive; absent/disabled/bypass falls through to the
+    // legacy full-rebuild path below (byte-identical to pre-#522).
+    let cache_plan: Option<ReusePlan> = match req.cache.clone() {
+        Some(d) if d.enabled() => {
+            match prefix_cache::plan(&model, &req.model, &req.messages, req.tools.as_deref(), d) {
+                Ok(p) => Some(p),
+                Err((code, msg)) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                        .await;
+                }
+            }
+        }
+        _ => None,
+    };
+    let (mut ctx, mut cache_diag): (Context, Option<CacheDiag>) = match &cache_plan {
+        Some(plan) => match prefix_cache::acquire(&model, plan) {
+            Ok((ctx, diag)) => (ctx, Some(diag)),
+            Err((code, msg)) => {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+        },
+        None => {
+            let mut ctx = match Context::new(&model) {
+                Ok(c) => c,
+                Err(e) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(
+                            500,
+                            "context_create_failed",
+                            &format!("Failed to create context: {e}"),
+                        )))
+                        .await;
+                }
+            };
+            if let Err((code, msg)) =
+                fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true)
+            {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+            (ctx, None)
         }
     };
-    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true) {
-        return res
-            .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
-            .await;
-    }
 
     // `tool_choice: "required" | {function}` constrains generation to the
     // model's native tool-call grammar (OpenAI tool_choice enforcement).
@@ -2112,6 +2336,10 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
     let mut tool_disabled_diag: Option<ToolDisabledDiag> = None;
     let mut pending_tool: Option<PendingToolCall> = None;
     let mut in_reasoning = false;
+    // #522: visible assistant text, captured so the prefix cache can save
+    // the canonical next-turn boundary. Only used when `cache_plan` is
+    // engaged.
+    let mut full_text = String::new();
 
     // F1/F2/F3/F5: explicit-match loop with an `Outcome` set at the
     // exit point. `Generator::next` Err, decoder Err, and chat-
@@ -2136,11 +2364,17 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
                 break (reason, None);
             }
             Ok(Some(s)) => s,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         let out = match step.execute().await {
             Ok(o) => o,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         // #439: a decode step that returns no sampled token means the
         // forward-pass layer starved — pie swallows a device failure / batch
@@ -2240,6 +2474,9 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             // tool_calls). Composes with the reasoning content gate; the
             // suppressed deltas fall through to the no-op arm below.
             Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) && !forced_tool => {
+                // #522: mirror the visible text the App persists, so the
+                // save gate can compare it against the generated tokens.
+                full_text.push_str(&s);
                 let chunk = ChatCompletionChunk {
                     id: &id,
                     object: "chat.completion.chunk",
@@ -2387,6 +2624,18 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             eprintln!("[chat-apc] error-meta serialize bug: {e}");
         }
     }
+    // Terminal generation-throughput frame for UI/benchmark consumers.
+    // The counter is engine-side generated output tokens (including
+    // reasoning tokens); the timer is decode-loop elapsed, so this is
+    // throughput, not prefill latency / TTFT. Failed/tool-call partials do
+    // not emit a metric until a reliable display policy exists.
+    if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
+        if let Some(frame) = GenerationMetricsSse::build(spec_generated, spec_start.elapsed()) {
+            if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
+                eprintln!("[chat-apc] generation_metrics serialize bug: {e}");
+            }
+        }
+    }
     // #418: terminal spec_metrics frame (only when the caller opted into
     // the speculation surface, so normal streams are byte-identical).
     if want_metrics {
@@ -2411,6 +2660,19 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             eprintln!("[chat-apc] spec_metrics serialize bug: {e}");
         }
     }
+    // #522: save the next reusable boundary on a clean completion and emit
+    // the cache diagnostics frame. Saving is gated on a real assistant turn
+    // (Natural/MaxTokens) — a cancelled/aborted/tool-call turn must not
+    // advance the stable boundary. `finalize` builds the boundary in its
+    // own context, so the generator's borrow of `ctx` is irrelevant here.
+    if let (Some(plan), Some(mut diag)) = (cache_plan.as_ref(), cache_diag.take()) {
+        if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
+            prefix_cache::finalize(plan, &full_text, &model, &mut diag).await;
+        }
+        if let Err(EmitError::Serialize(e)) = em.emit_json(&diag).await {
+            eprintln!("[chat-apc] cache diag serialize bug: {e}");
+        }
+    }
     sse::emit_done_logged(&mut em, "stream_exit").await;
     em.finish()
 }
@@ -2419,10 +2681,13 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
 // Non-streaming branch (F4 — finish_reason driven by actual termination)
 // =============================================================================
 
-async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Finished {
+async fn handle_non_streaming(
+    req: ChatCompletionsRequest,
+    res: Responder,
+    max_tokens: usize,
+) -> Finished {
     let temperature = req.temperature.unwrap_or(DEFAULT_TEMPERATURE);
     let top_p = req.top_p.unwrap_or(DEFAULT_TOP_P);
-    let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
     // N1: pre-loop 500 paths attach the immutable launch-diags
     // snapshot via the response header. No drain/restore needed —
@@ -2439,23 +2704,54 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
                 .await;
         }
     };
-    let mut ctx = match Context::new(&model) {
-        Ok(c) => c,
-        Err(e) => {
-            return res
-                .respond(with_launch_diags_header(sse::json_error(
-                    500,
-                    "context_create_failed",
-                    &format!("Failed to create context: {e}"),
-                )))
-                .await;
+    // #522: cross-request KV prefix cache (see handle_streaming). Legacy
+    // callers (no enabled `cache` directive) take the unchanged rebuild
+    // path below.
+    let cache_plan: Option<ReusePlan> = match req.cache.clone() {
+        Some(d) if d.enabled() => {
+            match prefix_cache::plan(&model, &req.model, &req.messages, req.tools.as_deref(), d) {
+                Ok(p) => Some(p),
+                Err((code, msg)) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                        .await;
+                }
+            }
+        }
+        _ => None,
+    };
+    let (mut ctx, mut cache_diag): (Context, Option<CacheDiag>) = match &cache_plan {
+        Some(plan) => match prefix_cache::acquire(&model, plan) {
+            Ok((ctx, diag)) => (ctx, Some(diag)),
+            Err((code, msg)) => {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+        },
+        None => {
+            let mut ctx = match Context::new(&model) {
+                Ok(c) => c,
+                Err(e) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(
+                            500,
+                            "context_create_failed",
+                            &format!("Failed to create context: {e}"),
+                        )))
+                        .await;
+                }
+            };
+            if let Err((code, msg)) =
+                fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true)
+            {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+            (ctx, None)
         }
     };
-    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true) {
-        return res
-            .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
-            .await;
-    }
 
     // tool_choice enforcement (mirrors handle_streaming): constrain to the
     // model's native tool-call grammar when a call is forced; an
@@ -2535,11 +2831,17 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
                 break (reason, None);
             }
             Ok(Some(s)) => s,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         let out = match step.execute().await {
             Ok(o) => o,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         // #439: a decode step that returns no sampled token means the
         // forward-pass layer starved — pie swallows a device failure / batch
@@ -2670,11 +2972,17 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
     let has_partial = !full_text.is_empty() || pending_tool.is_some() || !reasoning_text.is_empty();
     if error_diag.is_some() && !has_partial {
         let (code, msg) = error_diag.unwrap();
-        // N1: pure-failure 500 attaches launch diags via header —
+        // #470: over-capacity backpressure is a retryable 503, not a 500.
+        // The reservation timed out before any token was produced (the
+        // common over-subscription case lands here, with no partial body),
+        // so the client should back off and retry rather than treat it as a
+        // hard server fault. Every other abort stays a 500.
+        let status = if code == SERVER_BUSY_CODE { 503 } else { 500 };
+        // N1: pure-failure 5xx attaches launch diags via header —
         // the snapshot is immutable, so the next request gets the
         // same diags regardless.
         return res
-            .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+            .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
             .await;
     }
 
@@ -2764,6 +3072,20 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
     } else {
         None
     };
+    // #522: save the next reusable boundary (gated on a real assistant
+    // turn — never on a cancelled/aborted/tool-call turn) and stash the
+    // cache diagnostics for the `X-ChatAPC-Cache` response header.
+    // `finalize` builds the boundary in its own context.
+    let cache_header: Option<String> = if let (Some(plan), Some(mut diag)) =
+        (cache_plan.as_ref(), cache_diag.take())
+    {
+        if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
+            prefix_cache::finalize(plan, &full_text, &model, &mut diag).await;
+        }
+        Some(serde_json::to_string(&diag).expect("CacheDiag must serialize"))
+    } else {
+        None
+    };
     let body = ChatCompletion {
         id: &id,
         object: "chat.completion",
@@ -2810,6 +3132,9 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         .header("Content-Type", "application/json");
     if let Some(kind) = partial_kind {
         builder = builder.header("X-ChatAPC-Partial-Error", kind);
+    }
+    if let Some(h) = &cache_header {
+        builder = builder.header("X-ChatAPC-Cache", h.as_str());
     }
     let response = builder.body(json.into_body()).unwrap();
     res.respond(with_launch_diags_header(response)).await
@@ -2936,9 +3261,12 @@ fn build_forced_tool_constraint(
 /// before any chat turn so the schemas land in the system slot the
 /// chat template expects.
 ///
-/// Roles outside the OpenAI canonical set are demoted to `user` so
-/// future SDK extensions (e.g. `tool`) don't crash the handler — a
-/// pessimistic but loss-of-information-preserving choice.
+/// Enforces the role policy at the callee (#468): an unknown role returns
+/// `Err((code, message))` rather than being silently demoted to `user`.
+/// Both user-reachable callers — `handle_parsed` (which also gates early
+/// via `validate_roles`) and the tree-of-thought `tot::dispatch` — go
+/// through here, so no caller can forget the check. The `code` is a role
+/// policy code ([`is_role_error_code`]); callers map it to a 400.
 pub(crate) fn fill_context(
     ctx: &mut Context,
     model: &Model,
@@ -2946,6 +3274,24 @@ pub(crate) fn fill_context(
     tools: Option<&[ToolSchema]>,
     cue: bool,
 ) -> Result<(), (&'static str, String)> {
+    let tokens = build_prompt_tokens(model, messages, tools, cue)?;
+    ctx.append(&tokens);
+    Ok(())
+}
+
+/// Tokenize the same prompt [`fill_context`] would build, returning the raw
+/// token sequence instead of mutating a context. The cross-request prefix
+/// cache ([`super::prefix_cache`]) needs the exact token ids to
+/// content-address snapshots; routing both `fill_context` and the cache
+/// through this one function keeps the prefill bytes identical, which is
+/// the invariant the snapshot keys depend on.
+pub(crate) fn build_prompt_tokens(
+    model: &Model,
+    messages: &[ChatMessage],
+    tools: Option<&[ToolSchema]>,
+    cue: bool,
+) -> Result<Vec<u32>, (&'static str, String)> {
+    let mut out = Vec::new();
     if let Some(tools) = tools {
         // The SDK's `equip_prefix` expects `{name, description,
         // parameters}` per entry; the OpenAI `type:"function"` wrapper is
@@ -2956,22 +3302,22 @@ pub(crate) fn fill_context(
         if !envelopes.is_empty() {
             let prefix = inferlet::tools::equip_prefix(model, &envelopes)
                 .map_err(|e| ("tool_equip_failed", format!("equip_prefix: {e}")))?;
-            ctx.append(&prefix);
+            out.extend_from_slice(&prefix);
         }
     }
-    for msg in messages {
+    for (i, msg) in messages.iter().enumerate() {
         match msg.role.as_str() {
-            "system" => {
-                ctx.system(&msg.content);
-            }
-            "assistant" => {
-                ctx.assistant(&msg.content);
-            }
-            // `user`, `tool`, anything else → user. The chat template
-            // doesn't have a `tool` slot in v1; surfacing the content
-            // as a user message is closer-to-correct than dropping it.
-            _ => {
-                ctx.user(&msg.content);
+            "system" => out.extend(chat::system(model, &msg.content)),
+            "assistant" => out.extend(chat::assistant(model, &msg.content)),
+            "user" => out.extend(chat::user(model, &msg.content)),
+            // #468: reject any other role here rather than demoting it to
+            // `user`. This is the root-cause guard — every caller goes
+            // through `fill_context` / `build_prompt_tokens`, so the
+            // tree-of-thought and prefix-cache paths can't bypass the
+            // policy.
+            other => {
+                let code = role_error_code(other).unwrap_or("unsupported_role");
+                return Err((code, role_error_message(i, other, code)));
             }
         }
     }
@@ -2981,9 +3327,9 @@ pub(crate) fn fill_context(
     // context still has tokens to process — an empty forward pass spins
     // the generator), so it is opt-out here.
     if cue {
-        ctx.cue();
+        out.extend(chat::cue(model));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// One detected tool call buffered for emit on the terminal chunk.
@@ -3018,6 +3364,101 @@ fn next_tool_call_id() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn generation_metrics_frame_field_names_and_boundaries_are_stable() {
+        assert!(GenerationMetricsSse::build(0, Duration::from_millis(500)).is_none());
+        assert!(GenerationMetricsSse::build(3, Duration::ZERO).is_none());
+
+        let frame = GenerationMetricsSse::build(21, Duration::from_millis(500))
+            .expect("positive token count and elapsed time should emit metrics");
+        let json = serde_json::to_value(frame).expect("generation metrics serialize");
+
+        assert_eq!(json["event"].as_str(), Some("generation_metrics"));
+        assert_eq!(json["output_tokens"].as_u64(), Some(21));
+        assert_eq!(json["elapsed_s"].as_f64(), Some(0.5));
+        assert_eq!(json["tokens_per_sec"].as_f64(), Some(42.0));
+    }
+
+    // ─── Multi-part message content (#115) ─────────────────
+
+    fn parse_message(json: &str) -> Result<ChatMessage, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn content_plain_string_unchanged() {
+        let m = parse_message(r#"{"role":"user","content":"hello"}"#).unwrap();
+        assert_eq!(m.content, "hello");
+    }
+
+    #[test]
+    fn content_single_text_part_flattens() {
+        let m = parse_message(r#"{"role":"user","content":[{"type":"text","text":"hello"}]}"#)
+            .unwrap();
+        assert_eq!(m.content, "hello");
+    }
+
+    #[test]
+    fn content_multiple_text_parts_concatenate_in_order() {
+        let m = parse_message(
+            r#"{"role":"user","content":[
+                {"type":"text","text":"a"},
+                {"type":"text","text":"b"},
+                {"type":"text","text":"c"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "abc");
+    }
+
+    #[test]
+    fn content_empty_array_yields_empty_string() {
+        // Flattens to "" — downstream the blank-content 400 gate in
+        // `handle_parsed` rejects it, same as `content:""`.
+        let m = parse_message(r#"{"role":"user","content":[]}"#).unwrap();
+        assert_eq!(m.content, "");
+    }
+
+    #[test]
+    fn content_non_text_parts_contribute_nothing() {
+        // image_url and other part types are accepted but textless.
+        let m = parse_message(
+            r#"{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"http://x/y.png"}},
+                {"type":"text","text":"caption"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "caption");
+    }
+
+    #[test]
+    fn content_part_with_null_text_is_skipped() {
+        let m = parse_message(
+            r#"{"role":"user","content":[{"type":"text","text":null},{"type":"text","text":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "x");
+    }
+
+    #[test]
+    fn content_rejects_non_string_non_array() {
+        assert!(parse_message(r#"{"role":"user","content":42}"#).is_err());
+        assert!(parse_message(r#"{"role":"user","content":{"text":"x"}}"#).is_err());
+        assert!(parse_message(r#"{"role":"user","content":null}"#).is_err());
+    }
+
+    #[test]
+    fn content_rejects_array_with_non_object_part() {
+        // One malformed part poisons the whole array → 400 at the
+        // request boundary, never a silently dropped part.
+        assert!(parse_message(r#"{"role":"user","content":["bare string"]}"#).is_err());
+        assert!(
+            parse_message(r#"{"role":"user","content":[{"type":"text","text":"ok"}, 7]}"#)
+                .is_err()
+        );
+    }
+
     // ─── Forward-pass starvation guard (#439) ─────────────
 
     #[test]
@@ -3047,6 +3488,41 @@ mod tests {
         // starvation for a decode step (the loop always attaches the
         // auto-sampler, so a missing Token slot is the host producing none).
         assert!(forward_pass_starved(&[SlotOutput::Entropy(0.5)]));
+    }
+
+    // ─── Over-capacity backpressure classification (#470) ──
+
+    #[test]
+    fn server_busy_sentinel_classifies_as_server_busy() {
+        // The host wraps the acquisition-timeout message; the SDK then
+        // prefixes its own context ("GenStep::execute reserve: ..."). The
+        // sentinel survives both wraps as a substring.
+        let host = "server_busy: KV page acquisition timed out after 120s; \
+                    engine is over capacity";
+        let sdk_wrapped = format!("GenStep::execute reserve: {host}");
+        assert_eq!(classify_forward_error(host), SERVER_BUSY_CODE);
+        assert_eq!(classify_forward_error(&sdk_wrapped), SERVER_BUSY_CODE);
+    }
+
+    #[test]
+    fn generic_forward_error_classifies_as_forward_pass_failed() {
+        assert_eq!(
+            classify_forward_error("device RPC returned an error"),
+            "forward_pass_failed"
+        );
+        assert_eq!(classify_forward_error(""), "forward_pass_failed");
+    }
+
+    #[test]
+    fn bare_server_busy_token_in_device_error_is_not_backpressure() {
+        // The host's contract is the colon-suffixed `server_busy:` prefix.
+        // A verbatim device/driver error that merely contains the bare token
+        // `server_busy` (no colon) must stay a fatal `forward_pass_failed`,
+        // not get mislabeled as retryable backpressure (a 503 a client would
+        // retry forever against a genuinely dead engine).
+        let device_err =
+            "GenStep::execute forward: driver reported server_busy flag set on dead queue";
+        assert_eq!(classify_forward_error(device_err), "forward_pass_failed");
     }
 
     // ─── Reasoning/content channel demux ──────────────────
@@ -3173,7 +3649,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            validate_sampling(&req).unwrap_err().0,
+            validate_sampling(&req, MAX_OUTPUT_TOKENS_FALLBACK).unwrap_err().0,
             "speculation.leader_len"
         );
 
@@ -3184,7 +3660,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            validate_sampling(&req).unwrap_err().0,
+            validate_sampling(&req, MAX_OUTPUT_TOKENS_FALLBACK).unwrap_err().0,
             "speculation.draft_len"
         );
 
@@ -3195,9 +3671,111 @@ mod tests {
                 "temperature":0,"speculation":{"enabled":true,"leader_len":2,"draft_len":4}}"#,
         )
         .unwrap();
-        assert!(validate_sampling(&req).is_ok());
+        assert!(validate_sampling(&req, MAX_OUTPUT_TOKENS_FALLBACK).is_ok());
         let cfg = req.speculation.unwrap().to_config();
         assert_eq!((cfg.leader_len, cfg.draft_len), (2, 4));
+    }
+
+    #[test]
+    fn validate_roles_accepts_supported_set() {
+        let msgs = vec![
+            ChatMessage { role: "system".into(), content: "s".into() },
+            ChatMessage { role: "user".into(), content: "u".into() },
+            ChatMessage { role: "assistant".into(), content: "a".into() },
+            ChatMessage { role: "user".into(), content: "u2".into() },
+        ];
+        assert!(validate_roles(&msgs).is_ok());
+    }
+
+    #[test]
+    fn validate_roles_rejects_tool_with_dedicated_code() {
+        // F4: `tool` keeps its own code so SDKs can branch on it.
+        let msgs = vec![
+            ChatMessage { role: "user".into(), content: "u".into() },
+            ChatMessage { role: "tool".into(), content: "t".into() },
+        ];
+        let (i, code, _msg) = validate_roles(&msgs).unwrap_err();
+        assert_eq!(i, 1);
+        assert_eq!(code, "tool_role_unsupported");
+    }
+
+    #[test]
+    fn validate_roles_rejects_unknown_role() {
+        // #468: a typo'd / unsupported role is a 400, not a silent
+        // demotion to `user` that generates a mis-templated completion.
+        for role in ["banana", "developer", "function", "User", ""] {
+            let msgs = vec![ChatMessage { role: role.into(), content: "c".into() }];
+            let (i, code, msg) = validate_roles(&msgs).unwrap_err();
+            assert_eq!(i, 0, "role={role:?}");
+            assert_eq!(code, "unsupported_role", "role={role:?}");
+            assert!(msg.contains("messages[0].role"), "role={role:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn is_role_error_code_splits_client_from_internal() {
+        // Role-policy codes are client errors (400); internal failures
+        // (e.g. tool_equip_failed) are not — the tot::dispatch status
+        // split (400 vs 500) keys on this.
+        assert!(is_role_error_code("unsupported_role"));
+        assert!(is_role_error_code("tool_role_unsupported"));
+        assert!(!is_role_error_code("tool_equip_failed"));
+    }
+
+    #[test]
+    fn validate_roles_reports_first_offending_index() {
+        let msgs = vec![
+            ChatMessage { role: "user".into(), content: "u".into() },
+            ChatMessage { role: "assistant".into(), content: "a".into() },
+            ChatMessage { role: "banana".into(), content: "b".into() },
+        ];
+        let (i, _code, _msg) = validate_roles(&msgs).unwrap_err();
+        assert_eq!(i, 2);
+    }
+
+    #[test]
+    fn max_tokens_ceiling_is_dynamic() {
+        // The `max_tokens` ceiling is the engine value passed in, not a
+        // hardcoded constant: a request at the ceiling passes, one above
+        // is rejected, 0 is always rejected, and a larger engine capacity
+        // lifts the ceiling. Drives the pure `validate_sampling` directly
+        // with an explicit ceiling (no engine host needed).
+        let mk = |mt: usize| -> ChatCompletionsRequest {
+            serde_json::from_str(&format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"max_tokens":{mt}}}"#
+            ))
+            .unwrap()
+        };
+        assert!(validate_sampling(&mk(4096), 4096).is_ok());
+        assert_eq!(
+            validate_sampling(&mk(4097), 4096).unwrap_err().0,
+            "max_tokens"
+        );
+        // A larger engine KV capacity lifts the ceiling: 40000 now passes
+        // where the old hardcoded 8192 would have rejected it.
+        assert!(validate_sampling(&mk(40000), 65536).is_ok());
+        // Zero is invalid regardless of ceiling.
+        assert_eq!(
+            validate_sampling(&mk(0), 65536).unwrap_err().0,
+            "max_tokens"
+        );
+        // The 400 message reflects the dynamic ceiling, not a constant.
+        let (_, msg) = validate_sampling(&mk(99999), 8192).unwrap_err();
+        assert!(msg.contains("[1, 8192]"), "got: {msg}");
+    }
+
+    #[test]
+    fn omitted_max_tokens_uses_dynamic_ceiling_when_below_default() {
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(validate_sampling(&req, 512).unwrap(), 512);
+        assert_eq!(
+            validate_sampling(&req, DEFAULT_MAX_TOKENS + 1).unwrap(),
+            DEFAULT_MAX_TOKENS
+        );
     }
 
     #[test]

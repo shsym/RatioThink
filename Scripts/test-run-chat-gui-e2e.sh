@@ -50,7 +50,7 @@ FAKE_PGREP
   fi
   require_contains "$output" "Automation/Accessibility permission required"
   require_contains "$output" "PIE_TEST_TCC_GRANTED=1"
-  if [[ "$output" == *"starting small-model engine harness"* ]]; then
+  if [[ "$output" == *"starting portable GGUF engine harness"* ]]; then
     echo "FAIL: TCC preflight must happen before starting the engine harness" >&2
     exit 1
   fi
@@ -88,16 +88,15 @@ FAKE_PGREP
   fi
 }
 
-test_partial_hf_cache_is_not_accepted() {
+test_missing_gguf_fixture_is_not_accepted() {
   local tmp
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
 
-  # Fake a seated session and a runnable pie so the flow reaches the HF model
-  # gate, then stage incomplete shapes under the exact repo dir
-  # stage-test-model.sh inspects. The old `[ -d "$dir" ]` check wrongly
-  # accepted partial/aborted downloads (F3); the wrapper must reject them
-  # before starting the engine harness.
+  # Fake a seated session and a runnable pie so the flow reaches the GGUF
+  # fixture gate, then stage incomplete cache shapes under the exact repo dir
+  # stage-test-model.sh inspects. Partial/aborted downloads must be rejected
+  # before starting the portable GGUF engine harness.
   mkdir -p "$tmp/bin"
   cat >"$tmp/bin/pgrep" <<'FAKE_PGREP'
 #!/bin/bash
@@ -133,32 +132,32 @@ FAKE_PGREP
     output="$(
       PATH="$tmp/bin:$PATH" \
       HF_HOME="$tmp/hf" \
-      STAGE_TEST_MODEL_DEST="$dest" \
       PIE_BIN="$tmp/pie" \
       PIE_TEST_TCC_GRANTED=1 \
       PIE_E2E_AUTOPREP=0 \
       PIE_TEST_RUN_ROOT="$tmp/run" \
+      STAGE_TEST_MODEL_DEST="$dest" \
       "$SCRIPT" 2>&1
     )"
     status=$?
     set -e
 
     if [[ "$status" -ne 2 ]]; then
-      echo "FAIL: partial HF cache '$shape' must fail the model gate (exit 2), got $status" >&2
+      echo "FAIL: partial GGUF cache '$shape' must fail the model gate (exit 2), got $status" >&2
       echo "--- output ---" >&2
       printf '%s\n' "$output" >&2
       exit 1
     fi
+    require_contains "$output" "stage-test-model: model fixture NOT staged"
     require_contains "$output" "Looked in HF cache: $cache"
     require_contains "$output" "GGUF fixture unavailable"
     require_contains "$output" "cannot run the GGUF chat E2E"
-    if [[ "$output" == *"starting small-model engine harness"* ]]; then
-      echo "FAIL: partial HF cache '$shape' wrongly accepted — engine harness started" >&2
+    if [[ "$output" == *"starting portable GGUF engine harness"* ]]; then
+      echo "FAIL: partial GGUF cache '$shape' wrongly accepted as a staged fixture — engine harness started" >&2
       exit 1
     fi
   done
 }
-
 # Direct contract assertions on _e2e_hf_model_cached, independent of the
 # wrapper's gate ordering ( F2): only a RESOLVED WEIGHT artifact
 # counts as cached. The bare-dir case above short-circuits at `[ -d snapshots ]`
@@ -211,6 +210,6 @@ test_hf_model_cached_helper_contract() {
 
 test_requires_tcc_before_starting_engine
 test_removes_stale_config_on_exit
-test_partial_hf_cache_is_not_accepted
+test_missing_gguf_fixture_is_not_accepted
 test_hf_model_cached_helper_contract
 echo "test-run-chat-gui-e2e: PASS"
