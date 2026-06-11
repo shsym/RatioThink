@@ -110,6 +110,9 @@
     white-space:pre-wrap;word-wrap:break-word}
   .bubble.user{background:var(--bubble-user);color:var(--on-accent)}
   .bubble.assistant{background:var(--bubble-assistant);color:var(--ink)}
+  .assistant-turn{display:flex;flex-direction:column;gap:6px;align-items:flex-start;max-width:80%}
+  .assistant-turn .bubble{max-width:100%}
+  .generation-performance{font-size:11.5px;color:var(--ink-muted);line-height:1.2}
   .acol{display:flex;flex-direction:column;gap:6px;align-items:flex-start;max-width:88%;width:88%}
 
   /* ---- Tree search disclosure — mirrors App/Views/Chat/TreeSearchSection.swift ---- */
@@ -295,8 +298,7 @@
       <div class="card">
         <div class="ct"><h3>Fast Think</h3></div>
         <p>Tired of waiting on long answers? Fast Think gives you the same reply with far less waiting —
-           a speculative drafter races ahead so the text lands in bursts.
-           For illustration: 30 tok/s → 42 tok/s.</p>
+           a speculative drafter races ahead so the text lands in bursts.</p>
       </div>
     </div>
   </section>
@@ -415,6 +417,11 @@
   function userRow(text){
     var r = el('<div class="row user"><div class="bubble user"></div></div>');
     r.querySelector('.bubble').textContent = text; transcript.appendChild(r); return r;
+  }
+  function addGenerationPerformance(row, text){
+    row.querySelector('.assistant-turn').appendChild(
+      el('<div class="generation-performance" data-accessibility-id="message.generationPerformance">'+text+'</div>')
+    );
   }
   async function typeComposer(text, myGen){
     composer.classList.add('typed'); composer.textContent='';
@@ -544,9 +551,10 @@
     await typeComposer(d.prompt, myGen);
     userRow(d.prompt); resetComposer();
     await sleep(260, myGen);
-    var a1 = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
+    var a1 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
     transcript.appendChild(a1);
     await streamWords(a1.querySelector('.bubble'), d.answer, 62, myGen); // slow, even cadence
+    addGenerationPerformance(a1, '30 tok/s');
     await sleep(900, myGen);
 
     // Switch profiles: open the menu, pick Fast Think.
@@ -559,10 +567,11 @@
     // Second pass: the SAME prompt + SAME answer, now in chunky multi-token bursts.
     userRow(d.prompt);
     await sleep(220, myGen);
-    var a2 = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
+    var a2 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
     transcript.appendChild(a2);
-    setCaption('Same answer, much less waiting — for illustration: 30 tok/s → 42 tok/s.');
+    setCaption('Same answer, much less waiting — the text lands in quick bursts.');
     await streamBursts(a2.querySelector('.bubble'), d.answer, d.bursts, 150, myGen); // chunky + quicker
+    addGenerationPerformance(a2, '42 tok/s');
     await sleep(2200, myGen);
   }
 
@@ -593,8 +602,9 @@
   function stillFast(){
     clear(); setProfile('Fast Think', 'fast');
     userRow(SCENARIO.fast.prompt);
-    var a = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
+    var a = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
     a.querySelector('.bubble').textContent = SCENARIO.fast.answer;
+    addGenerationPerformance(a, '42 tok/s');
     transcript.appendChild(a);
   }
 

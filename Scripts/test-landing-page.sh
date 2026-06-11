@@ -117,6 +117,8 @@ def validate_html(html: str) -> list[str]:
     forbidden = " — real answers are longer and more detailed."
     if forbidden in html:
         failures.append("demo note still overclaims answer length/detail")
+    if "For illustration:" in html:
+        failures.append("landing page still uses ad-hoc 'For illustration' tok/s copy")
 
     demo_note = first_node(root, "p", "demo-note")
     if not demo_note:
@@ -183,8 +185,17 @@ def validate_html(html: str) -> list[str]:
     ]
     if not fast_cards:
         failures.append("missing Fast Think card")
-    elif not any("For illustration: 30 tok/s → 42 tok/s." in text_content(card) for card in fast_cards):
-        failures.append("Fast Think card is missing the illustrative tokens/sec comparison")
+    elif any("tok/s" in text_content(card) for card in fast_cards):
+        failures.append("Fast Think card still contains tok/s marketing copy instead of app-style mock metrics")
+
+    if "message.generationPerformance" not in html:
+        failures.append("landing mock is missing the app-side generation performance accessibility hook")
+    if "generation-performance" not in html:
+        failures.append("landing mock is missing generation performance row styling")
+    if "30 tok/s" not in html:
+        failures.append("landing mock is missing the normal-scene generation performance row")
+    if "42 tok/s" not in html:
+        failures.append("landing mock is missing the Fast Think generation performance row")
 
     return failures
 
@@ -196,7 +207,8 @@ VALID_FIXTURE = """
 <header class="hero"></header>
 <div class="toolbar"><span class="pill">Profile:</span><div class="menu"></div></div>
 <p class="demo-note">A simplified illustration of how it works.</p>
-<div class="card"><h3>Fast Think</h3><p>For illustration: 30 tok/s → 42 tok/s.</p></div>
+<div class="card"><h3>Fast Think</h3><p>Speculative decoding makes the text land in bursts.</p></div>
+<script>var hook = "message.generationPerformance"; var cls = "generation-performance"; var normal = "30 tok/s"; var fast = "42 tok/s";</script>
 <footer>Apache-2.0</footer>
 </div></body></html>
 """
@@ -209,7 +221,8 @@ NEGATIVE_FIXTURES = {
         <header class="hero"></header>
         <div class="toolbar"><span class="pill">Profile:</span><div class="menu"></div></div>
         <p class="demo-note">A simplified illustration of how it works.</p>
-        <div class="card"><h3>Fast Think</h3><p>For illustration: 30 tok/s → 42 tok/s.</p></div>
+        <div class="card"><h3>Fast Think</h3><p>Speculative decoding makes the text land in bursts.</p></div>
+        <script>var hook = "message.generationPerformance"; var cls = "generation-performance"; var normal = "30 tok/s"; var fast = "42 tok/s";</script>
         <footer>Apache-2.0</footer>
         </div></body></html>
     """,
@@ -220,7 +233,8 @@ NEGATIVE_FIXTURES = {
         <header class="hero"></header>
         <div class="toolbar"><span class="pill">Profile:</span><div class="menu"></div><span>Model:</span><span>Qwen3-0.6B</span></div>
         <p class="demo-note">A simplified illustration of how it works.</p>
-        <div class="card"><h3>Fast Think</h3><p>For illustration: 30 tok/s → 42 tok/s.</p></div>
+        <div class="card"><h3>Fast Think</h3><p>Speculative decoding makes the text land in bursts.</p></div>
+        <script>var hook = "message.generationPerformance"; var cls = "generation-performance"; var normal = "30 tok/s"; var fast = "42 tok/s";</script>
         <footer>Apache-2.0</footer>
         </div></body></html>
     """,
