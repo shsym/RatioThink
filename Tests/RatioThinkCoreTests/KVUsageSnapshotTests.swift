@@ -43,24 +43,41 @@ final class KVUsageSnapshotTests: XCTestCase {
     XCTAssertEqual(snapshots.map(\.modelID), ["alpha", "zeta"])
   }
 
-  func test_parseModelStatus_missingTotalDoesNotFabricateZero() throws {
+  func test_parseModelStatus_missingTotalFailsDiagnosticContract() throws {
     let json = #"{"default.kv_pages_used":5}"#
-    let snapshots = try KVUsageModelStatusParser.parse(
+    XCTAssertThrowsError(try KVUsageModelStatusParser.parse(
       json,
       observedAt: Date(timeIntervalSince1970: 30),
       generation: 1
-    )
-    XCTAssertTrue(snapshots.isEmpty, "incomplete rows must be omitted, not decoded as total=0")
+    )) { error in
+      XCTAssertEqual(
+        error as? KVUsageModelStatusParser.ParseError,
+        .missingCounter(modelID: "default", key: "kv_pages_total")
+      )
+    }
   }
 
-  func test_parseModelStatus_missingUsedDoesNotFabricateZero() throws {
+  func test_parseModelStatus_missingUsedFailsDiagnosticContract() throws {
     let json = #"{"default.kv_pages_total":256}"#
-    let snapshots = try KVUsageModelStatusParser.parse(
+    XCTAssertThrowsError(try KVUsageModelStatusParser.parse(
       json,
       observedAt: Date(timeIntervalSince1970: 31),
       generation: 1
+    )) { error in
+      XCTAssertEqual(
+        error as? KVUsageModelStatusParser.ParseError,
+        .missingCounter(modelID: "default", key: "kv_pages_used")
+      )
+    }
+  }
+
+  func test_parseModelStatus_emptyKVRowsRemainSuccessfulEmptyList() throws {
+    let snapshots = try KVUsageModelStatusParser.parse(
+      #"{"default.total_batches":9}"#,
+      observedAt: Date(timeIntervalSince1970: 32),
+      generation: 1
     )
-    XCTAssertTrue(snapshots.isEmpty, "incomplete rows must be omitted, not decoded as used=0")
+    XCTAssertEqual(snapshots, [])
   }
 
   func test_parseModelStatus_rejectsNegativeAndWrongTypeValues() {

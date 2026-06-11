@@ -392,7 +392,10 @@ public final class PieEngineHost: @unchecked Sendable {
       guard case .running(_, _, let session) = self._state else { return nil }
       return session
     }
-    guard let session, let json = try await session.modelStatusJSON() else { return [] }
+    guard let session else { return [] }
+    guard let json = try await session.modelStatusJSON() else {
+      throw KVUsageRefreshError.modelStatusUnavailable(reason: "running engine did not provide model_status")
+    }
     let generation = kvUsageGeneration.withLock { value -> UInt64 in
       value &+= 1
       return value

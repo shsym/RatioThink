@@ -50,4 +50,26 @@ final class PieEngineHostKVUsageTests: XCTestCase {
     XCTAssertEqual(second.first?.generation, 2)
     token.cancel()
   }
+
+  func test_kvUsageSnapshots_runningSessionMissingModelStatusThrows() async throws {
+    let session = KVSession(json: nil)
+    let host = PieEngineHost(launcher: { _ in (port: EnginePort(45678), session: session) })
+    let running = expectation(description: "running")
+    let token = host.observe { status, _ in
+      if case .running = status { running.fulfill() }
+    }
+    _ = host.start(makeSpec())
+    await fulfillment(of: [running], timeout: 2)
+
+    do {
+      _ = try await host.kvUsageSnapshots(now: { Date(timeIntervalSince1970: 102) })
+      XCTFail("expected missing running model_status to throw")
+    } catch {
+      XCTAssertEqual(
+        error as? KVUsageRefreshError,
+        .modelStatusUnavailable(reason: "running engine did not provide model_status")
+      )
+    }
+    token.cancel()
+  }
 }

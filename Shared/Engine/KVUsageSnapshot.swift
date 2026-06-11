@@ -32,6 +32,7 @@ public enum KVUsageModelStatusParser {
   public enum ParseError: Error, Equatable, Sendable, CustomStringConvertible {
     case notJSONObject
     case invalidCounter(key: String)
+    case missingCounter(modelID: String, key: String)
 
     public var description: String {
       switch self {
@@ -39,6 +40,8 @@ public enum KVUsageModelStatusParser {
         return "model_status result was not a JSON object"
       case .invalidCounter(let key):
         return "model_status counter '\(key)' was not a non-negative integer"
+      case .missingCounter(let modelID, let key):
+        return "model_status KV row for model '\(modelID)' was missing counter '\(key)'"
       }
     }
   }
@@ -72,8 +75,13 @@ public enum KVUsageModelStatusParser {
       }
     }
 
-    return rows.compactMap { modelID, row in
-      guard let used = row.used, let total = row.total else { return nil }
+    return try rows.map { modelID, row in
+      guard let used = row.used else {
+        throw ParseError.missingCounter(modelID: modelID, key: "kv_pages_used")
+      }
+      guard let total = row.total else {
+        throw ParseError.missingCounter(modelID: modelID, key: "kv_pages_total")
+      }
       return KVUsageSnapshot(
         modelID: modelID,
         pagesUsed: used,
@@ -100,5 +108,16 @@ public enum KVUsageModelStatusParser {
       throw ParseError.invalidCounter(key: key)
     }
     return number.uint64Value
+  }
+}
+
+public enum KVUsageRefreshError: Error, Equatable, Sendable, CustomStringConvertible {
+  case modelStatusUnavailable(reason: String)
+
+  public var description: String {
+    switch self {
+    case .modelStatusUnavailable(let reason):
+      return "KV usage model_status unavailable: \(reason)"
+    }
   }
 }

@@ -1217,8 +1217,14 @@ public actor LaunchedSession {
   }
 
   public func modelStatusJSON() async throws -> String? {
-    guard process.isRunning else { return nil }
-    guard let controlWSURL else { return nil }
+    guard process.isRunning else {
+      throw KVUsageRefreshError.modelStatusUnavailable(
+        reason: "engine process exited (status \(process.terminationStatus))"
+      )
+    }
+    guard let controlWSURL else {
+      throw KVUsageRefreshError.modelStatusUnavailable(reason: "engine control plane URL missing")
+    }
     let config = URLSessionConfiguration.ephemeral
     config.timeoutIntervalForRequest = Self.livenessProbeTimeout
     config.timeoutIntervalForResource = Self.livenessProbeTimeout

@@ -93,6 +93,28 @@ final class HelperExportedAPIKVUsageTests: XCTestCase {
     token.cancel()
   }
 
+  func test_kvUsage_runningHostMissingModelStatusReturnsFailureNotEmptySuccess() async throws {
+    let session = KVSession(json: nil)
+    let host = PieEngineHost(launcher: { _ in (port: EnginePort(45678), session: session) })
+    let running = expectation(description: "running")
+    let token = host.observe { status, _ in
+      if case .running = status { running.fulfill() }
+    }
+    _ = host.start(makeSpec())
+    await fulfillment(of: [running], timeout: 2)
+
+    let result = await kvUsage(HelperExportedAPI(engineHost: host, launchSpecResolver: nil))
+    guard case .failure(let error) = result else {
+      token.cancel()
+      return XCTFail("expected missing running model_status to fail, got \(result)")
+    }
+
+    XCTAssertEqual(error.code, .engineGone)
+    XCTAssertTrue(error.message.localizedCaseInsensitiveContains("kv usage"))
+    XCTAssertTrue(error.message.localizedCaseInsensitiveContains("model_status"))
+    token.cancel()
+  }
+
   private func kvUsage(_ api: PieHelperXPC) async -> Result<[KVUsageSnapshot], EngineError> {
     await withCheckedContinuation { cont in
       api.kvUsage { successData, errorData in
