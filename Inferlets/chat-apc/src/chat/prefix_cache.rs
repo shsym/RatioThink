@@ -615,6 +615,16 @@ fn name_hash_part(name: &str) -> String {
     name.rsplit('/').next().unwrap_or_default().to_string()
 }
 
+/// Interim structured duplicate-save discriminator until the pie SDK exposes
+/// a first-class `AlreadyExists` error from `RawContext::save`.
+///
+/// Keep this anchored to the runtime's current message prefix
+/// (`runtime/src/context/snapshot.rs`) so unrelated host errors that merely
+/// contain "already exists" are not mislabeled as benign duplicate saves.
+fn is_snapshot_already_exists_error(message: &str) -> bool {
+    message.starts_with("Snapshot name already exists:")
+}
+
 /// Everything the request handler needs to open a prefix snapshot, rebuild
 /// on a miss, and save the next boundary. Built once per request.
 pub struct ReusePlan {
@@ -791,7 +801,7 @@ pub async fn finalize(plan: &ReusePlan, gen_content: &str, model: &Model, diag: 
         }
         Err(e) => {
             let es = e.to_string();
-            if es.contains("already exists") {
+            if is_snapshot_already_exists_error(&es) {
                 // Same content hash already saved — identical KV, benign,
                 // still a valid future hit.
                 diag.save_result = "exists".to_string();
@@ -945,6 +955,29 @@ mod tests {
         // A non-monotone tokenizer (prefix longer than full) must be
         // caught, not silently sliced.
         assert_eq!(suffix_start(3, 5), None);
+    }
+
+    // ─── snapshot-save duplicate classification ─────────────────
+
+    #[test]
+    fn snapshot_already_exists_detection_matches_current_pie_runtime_string() {
+        // Vendor/pie runtime/src/context/snapshot.rs currently emits this
+        // exact prefix when RawContext::save rejects a duplicate name. Pin it
+        // here so a runtime reword breaks a unit test instead of silently
+        // turning duplicate saves into failed saves.
+        assert!(is_snapshot_already_exists_error(
+            "Snapshot name already exists: apc/chat/1/deadbeef"
+        ));
+    }
+
+    #[test]
+    fn snapshot_already_exists_detection_rejects_unanchored_phrases() {
+        assert!(!is_snapshot_already_exists_error(
+            "host bridge failed before save: path already exists"
+        ));
+        assert!(!is_snapshot_already_exists_error(
+            "context save failed: Snapshot name already exists: apc/chat/1/deadbeef"
+        ));
     }
 
     // ─── next-boundary ↔ next-turn-prefix identity ────────────

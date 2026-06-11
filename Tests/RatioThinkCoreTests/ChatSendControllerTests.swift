@@ -801,6 +801,73 @@ final class ChatSendControllerTests: XCTestCase {
     XCTAssertEqual(cache.turn, 1, "one user message → boundary turn 1")
   }
 
+  func test_reasoning_deltas_are_excluded_from_persisted_and_replayed_assistant_content() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "first question", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let firstEngine = ImmediateChatEngine(events: [
+      .modelReady,
+      .reasoningDelta("<think>private chain"),
+      .delta(role: .assistant, content: "Visible"),
+      .reasoningDelta(" of thought</think>"),
+      .delta(role: nil, content: " answer"),
+      .finish(reason: .stop),
+    ])
+    let controller = ChatSendController()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: firstEngine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m", sampling: ChatSampling())
+    )
+    try await waitUntil("first stream finishes") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(assistantMessages(in: chat).last)
+    XCTAssertEqual(
+      assistant.content,
+      "Visible answer",
+      "persisted assistant content must be exactly the concatenated visible stream deltas"
+    )
+    XCTAssertEqual(
+      assistant.reasoning,
+      "<think>private chain of thought</think>",
+      "reasoning_content deltas persist separately and must not contaminate replayed visible content"
+    )
+
+    chat.messages.append(Message(role: "user", content: "follow up", ts: assistant.ts.addingTimeInterval(1)))
+    try context.save()
+    let secondEngine = ImmediateChatEngine(events: [
+      .modelReady,
+      .delta(role: .assistant, content: "second"),
+      .finish(reason: .stop),
+    ])
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: secondEngine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m", sampling: ChatSampling())
+    )
+    try await waitUntil("second stream finishes") { !controller.isInFlight }
+
+    XCTAssertEqual(
+      secondEngine.requests.first?.messages,
+      [
+        ChatMessage(role: .user, content: "first question"),
+        ChatMessage(role: .assistant, content: "Visible answer"),
+        ChatMessage(role: .user, content: "follow up"),
+      ],
+      "turn N+1 must resend the same visible-only assistant text that APC saved as the reuse boundary"
+    )
+  }
+
   func test_send_disabledSpeculation_no_field_and_temp_unchanged() async throws {
     let req = try await capturedRequest(speculation: Profile.Speculation(enabled: false))
     XCTAssertNil(req.speculation, "disabled speculation must not attach the field")

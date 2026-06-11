@@ -66,7 +66,7 @@ endef
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
-        test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-e2e-harsh-load \
+        test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-e2e-harsh-load test-e2e-cache-real \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
         build-inferlets stamp-inferlets verify-inferlets verify-inferlets-inputs \
@@ -420,9 +420,18 @@ test-e2e-harsh-load: $(LOGDIR) ## REAL-engine harsh LOAD eval (#467): concurrent
 	  echo "log: $$LOG"; \
 	  exit $$status
 
-test-gui-script: ## Fast preflight regressions for GUI E2E wrappers
+test-e2e-cache-real: $(LOGDIR) ## REAL-engine APC prefix-cache smoke (#529): actual save/open KV reuse + turn-2 hit against portable-Metal Qwen3-0.6B. Operator-gated, NOT CI; needs real weights.
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-cache-real.log; \
+	  Scripts/run-cache-smoke-real-e2e.sh 2>&1 | tee $$LOG | tail -60; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  exit $$status
+
+test-gui-script: ## Fast preflight regressions for GUI/E2E wrapper scripts
 	Scripts/test-run-stage-test-model.sh
 	Scripts/test-run-chat-gui-e2e.sh
+	Scripts/test-run-cache-smoke-real-e2e.sh
 	Scripts/test-run-large-model-e2e.sh
 	Scripts/test-run-resume-gui-history-e2e.sh
 	Scripts/test-run-stream-cancel-gui-e2e.sh

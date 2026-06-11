@@ -32,6 +32,9 @@ in `~/.cache/huggingface/hub`.
 
 Usage::
 
+    make test-e2e-cache-real
+
+    # or invoke the harness directly:
     MODEL=Qwen/Qwen3-0.6B uv run --project Vendor/pie/client/python \
         --with httpx python Inferlets/chat-apc/cache_smoke_real.py
 """
@@ -45,9 +48,16 @@ import tempfile
 import uuid
 from pathlib import Path
 
-import e2e_test as h  # boot/teardown helpers + PIE_BIN/WASM_PATH/MANIFEST_PATH
-import httpx
-from pie_client import PieClient
+SELFTEST = os.environ.get("CACHE_SMOKE_REAL_SELFTEST")
+
+if SELFTEST:
+    httpx = None
+    PieClient = None
+    h = None
+else:
+    import httpx
+    from pie_client import PieClient
+    import e2e_test as h  # boot/teardown helpers + PIE_BIN/WASM_PATH/MANIFEST_PATH
 
 MODEL = os.environ.get("MODEL", "Qwen/Qwen3-0.6B")
 
@@ -88,7 +98,241 @@ def _diag(resp: httpx.Response) -> dict | None:
     return json.loads(raw) if raw else None
 
 
+def _require_status_ok(label: str, resp: httpx.Response, failures: list[str]) -> bool:
+    if resp.status_code == 200:
+        return True
+    failures.append(f"{label} status {resp.status_code}: {resp.text[:200]!r}")
+    return False
+
+
+async def _run_post_turn2_probes(
+    http_c,
+    base: str,
+    *,
+    model: str,
+    hist2: list[dict],
+    key: str,
+    a1: str,
+    t2: httpx.Response,
+    d1: dict | None,
+    d2: dict | None,
+    directive,
+    failures: list[str],
+) -> None:
+    # ── same-model profile/sampling switch → still HIT ─
+    tp = await http_c.post(f"{base}/v1/chat/completions", json={
+        "model": model, "messages": hist2,
+        # Different sampling knobs model a profile switch
+        # that should not invalidate the same-model prefix.
+        "temperature": 0.7, "top_p": 0.95, "max_tokens": 32, "stream": False,
+        "cache": directive(key, 3),
+    })
+    dp = _diag(tp)
+    print(f"[cache] same-model-profile-switch -> {tp.status_code} diag={dp}")
+    if _require_status_ok("same-model profile switch", tp, failures):
+        if dp is None:
+            failures.append("same-model profile switch: missing X-ChatAPC-Cache header")
+        elif dp["outcome"] != "hit":
+            failures.append(
+                f"same-model profile switch outcome={dp['outcome']!r} (want hit)")
+        elif d1 is not None and dp.get("prefix_hash") != d1.get("save_hash"):
+            failures.append(
+                "same-model profile switch hit the wrong boundary: "
+                f"prefix_hash={dp.get('prefix_hash')!r} "
+                f"turn1_save_hash={d1.get('save_hash')!r}")
+
+    # ── bypass: no reuse, no diagnostics ──────────────
+    tb = await http_c.post(f"{base}/v1/chat/completions", json={
+        "model": model, "messages": hist2,
+        "temperature": 0, "max_tokens": 32, "stream": False,
+        "cache": directive(key, 3, policy="bypass"),
+    })
+    db = _diag(tb)
+    print(f"[cache] bypass -> {tb.status_code} diag={db}")
+    if _require_status_ok("bypass", tb, failures):
+        if db is not None:
+            failures.append("bypass policy must not emit cache diagnostics")
+
+    # ── different key → miss (per-chat namespacing) ───
+    tk = await http_c.post(f"{base}/v1/chat/completions", json={
+        "model": model, "messages": hist2,
+        "temperature": 0, "max_tokens": 32, "stream": False,
+        "cache": directive(str(uuid.uuid4()), 3),
+    })
+    dk = _diag(tk)
+    print(f"[cache] otherkey -> {tk.status_code} diag={dk}")
+    if _require_status_ok("different key", tk, failures):
+        if dk is None:
+            failures.append("different key: missing X-ChatAPC-Cache header")
+        elif dk["outcome"] != "miss":
+            failures.append(f"different key outcome={dk['outcome']!r} (want miss)")
+
+    # ── retry/truncate: erased suffix must not leak ────
+    # After turn2, the engine may have saved a longer
+    # [q1,a1,q2,a2] boundary. A retry of turn2 resends only
+    # [q1,a1,new_user], so it must reopen turn1's saved
+    # boundary and must not hit the stale turn2 suffix.
+    a2 = ""
+    if t2.status_code == 200:
+        a2 = t2.json()["choices"][0]["message"].get("content") or ""
+    hist_retry = [
+        {"role": "user", "content": hist2[0]["content"]},
+        {"role": "assistant", "content": a1},
+        {"role": "user", "content": "Retry: answer with exactly one landmark name."},
+    ]
+    tr = await http_c.post(f"{base}/v1/chat/completions", json={
+        "model": model, "messages": hist_retry,
+        "temperature": 0, "max_tokens": 32, "stream": False,
+        "cache": directive(key, 3),
+    })
+    dr = _diag(tr)
+    print(f"[cache] retry-after-turn2 -> {tr.status_code} diag={dr} "
+          f"turn2_content={a2[:60]!r}")
+    if _require_status_ok("retry lookup", tr, failures):
+        if dr is None:
+            failures.append("retry lookup: missing X-ChatAPC-Cache header")
+        elif dr["outcome"] != "hit":
+            failures.append(f"retry lookup outcome={dr['outcome']!r} (want hit)")
+        elif d1 is not None and dr.get("prefix_hash") != d1.get("save_hash"):
+            failures.append(
+                "retry lookup must hit turn1's boundary, not rebuild/leak: "
+                f"prefix_hash={dr.get('prefix_hash')!r} "
+                f"turn1_save_hash={d1.get('save_hash')!r}")
+        elif d2 is not None and dr.get("prefix_hash") == d2.get("save_hash"):
+            failures.append(
+                "retry lookup hit the stale turn2 suffix boundary; "
+                "erased assistant/user tokens leaked into reuse")
+
+    # ── changed system prompt under same key → miss ───
+    ts = await http_c.post(f"{base}/v1/chat/completions", json={
+        "model": model,
+        "messages": [{"role": "system", "content": "You are a terse assistant."}] + hist2,
+        "temperature": 0, "max_tokens": 32, "stream": False,
+        "cache": directive(key, 4),
+    })
+    ds = _diag(ts)
+    print(f"[cache] sysprompt-change -> {ts.status_code} diag={ds}")
+    if _require_status_ok("prompt-changing request", ts, failures):
+        if ds is None:
+            failures.append("prompt-changing request: missing X-ChatAPC-Cache header")
+        elif ds["outcome"] != "miss":
+            failures.append(
+                f"prompt-changing request outcome={ds['outcome']!r} (want miss): "
+                "a changed system prompt must not reuse physical KV")
+
+
+class _FakeAsyncClient:
+    def __init__(self, responses: list):
+        self._responses = responses
+
+    async def post(self, *_args, **_kwargs):
+        if not self._responses:
+            raise AssertionError("mock cache-smoke probe exhausted fake responses")
+        return self._responses.pop(0)
+
+
+class _SelfTestResponse:
+    def __init__(self, status_code: int, *, headers: dict | None = None,
+                 body: str = "", json_body: dict | None = None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = body
+        self._json_body = json_body
+
+    def json(self) -> dict:
+        if self._json_body is None:
+            raise ValueError("self-test response has no JSON body")
+        return self._json_body
+
+
+def _mock_response(status: int = 200, diag: dict | None = None) -> _SelfTestResponse:
+    headers = {}
+    if diag is not None:
+        headers["X-ChatAPC-Cache"] = json.dumps(diag)
+    if status == 200:
+        return _SelfTestResponse(
+            status,
+            headers=headers,
+            json_body={"choices": [{"message": {"content": "mock assistant"}}]},
+        )
+    return _SelfTestResponse(status, body="mock probe failure")
+
+
+_KNOWN_SELFTEST_SCENARIOS = {
+    "post-turn2-same-model-profile-switch-500",
+    "post-turn2-bypass-500",
+    "post-turn2-otherkey-500",
+    "post-turn2-retry-after-turn2-500",
+    "post-turn2-sysprompt-change-500",
+    "post-turn2-same-model-profile-switch-missing-diag",
+    "post-turn2-otherkey-missing-diag",
+    "post-turn2-retry-after-turn2-missing-diag",
+    "post-turn2-sysprompt-change-missing-diag",
+}
+
+
+async def _selftest_post_turn2_probes() -> int:
+    scenario = os.environ.get("CACHE_SMOKE_REAL_SELFTEST", "")
+    if scenario not in _KNOWN_SELFTEST_SCENARIOS:
+        print(f"[cache-selftest] unknown CACHE_SMOKE_REAL_SELFTEST scenario: {scenario}")
+        return 1
+
+    forced = scenario.removeprefix("post-turn2-")
+    d1 = {"save_hash": "turn1"}
+    d2 = {"save_hash": "turn2"}
+    probe_defaults: list[tuple[str, _SelfTestResponse]] = [
+        ("same-model-profile-switch", _mock_response(diag={"outcome": "hit", "prefix_hash": "turn1"})),
+        ("bypass", _mock_response()),
+        ("otherkey", _mock_response(diag={"outcome": "miss"})),
+        ("retry-after-turn2", _mock_response(diag={"outcome": "hit", "prefix_hash": "turn1"})),
+        ("sysprompt-change", _mock_response(diag={"outcome": "miss"})),
+    ]
+    responses: list[_SelfTestResponse] = []
+    for name, response in probe_defaults:
+        if forced == f"{name}-500":
+            responses.append(_mock_response(500))
+        elif forced == f"{name}-missing-diag":
+            responses.append(_mock_response())
+        else:
+            responses.append(response)
+
+    failures: list[str] = []
+
+    def directive(k: str, turn: int, policy: str = "auto") -> dict:
+        return {"key": k, "turn": turn, "compat": "1", "policy": policy}
+
+    await _run_post_turn2_probes(
+        _FakeAsyncClient(responses),
+        "http://cache-smoke-selftest",
+        model=MODEL,
+        hist2=[
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"},
+        ],
+        key="selftest-key",
+        a1="a1",
+        t2=_mock_response(diag={"outcome": "hit", "save_hash": "turn2"}),
+        d1=d1,
+        d2=d2,
+        directive=directive,
+        failures=failures,
+    )
+    if failures:
+        print("\n[cache-selftest] FAILURES:")
+        for f in failures:
+            print(f"  ✗ {f}")
+        return 1
+    print("[cache-selftest] PASS")
+    return 0
+
+
 async def main() -> int:
+    if SELFTEST:
+        return await _selftest_post_turn2_probes()
+
+    assert h is not None
+    assert PieClient is not None
     assert h.PIE_BIN.exists(), f"missing pie binary at {h.PIE_BIN}"
     assert h.WASM_PATH.exists(), f"missing wasm at {h.WASM_PATH}"
     h.verify_stamp()
@@ -213,103 +457,19 @@ async def main() -> int:
                             print(f"[cache] HIT: reused {d2['base_boundary']} prefix tokens, "
                                   f"appended {d2['appended']}")
 
-                    # ── same-model profile/sampling switch → still HIT ─
-                    tp = await http_c.post(f"{base}/v1/chat/completions", json={
-                        "model": MODEL, "messages": hist2,
-                        # Different sampling knobs model a profile switch
-                        # that should not invalidate the same-model prefix.
-                        "temperature": 0.7, "top_p": 0.95, "max_tokens": 32, "stream": False,
-                        "cache": directive(key, 3),
-                    })
-                    dp = _diag(tp)
-                    print(f"[cache] same-model-profile-switch -> {tp.status_code} diag={dp}")
-                    if tp.status_code == 200 and dp is None:
-                        failures.append("same-model profile switch: missing X-ChatAPC-Cache header")
-                    elif tp.status_code == 200 and dp is not None:
-                        if dp["outcome"] != "hit":
-                            failures.append(
-                                f"same-model profile switch outcome={dp['outcome']!r} (want hit)")
-                        elif d1 is not None and dp.get("prefix_hash") != d1.get("save_hash"):
-                            failures.append(
-                                "same-model profile switch hit the wrong boundary: "
-                                f"prefix_hash={dp.get('prefix_hash')!r} "
-                                f"turn1_save_hash={d1.get('save_hash')!r}")
-
-                    # ── bypass: no reuse, no diagnostics ──────────────
-                    tb = await http_c.post(f"{base}/v1/chat/completions", json={
-                        "model": MODEL, "messages": hist2,
-                        "temperature": 0, "max_tokens": 32, "stream": False,
-                        "cache": directive(key, 3, policy="bypass"),
-                    })
-                    print(f"[cache] bypass -> {tb.status_code} diag={_diag(tb)}")
-                    if tb.status_code == 200 and _diag(tb) is not None:
-                        failures.append("bypass policy must not emit cache diagnostics")
-
-                    # ── different key → miss (per-chat namespacing) ───
-                    tk = await http_c.post(f"{base}/v1/chat/completions", json={
-                        "model": MODEL, "messages": hist2,
-                        "temperature": 0, "max_tokens": 32, "stream": False,
-                        "cache": directive(str(uuid.uuid4()), 3),
-                    })
-                    dk = _diag(tk)
-                    print(f"[cache] otherkey -> {tk.status_code} diag={dk}")
-                    if tk.status_code == 200 and dk is not None and dk["outcome"] != "miss":
-                        failures.append(f"different key outcome={dk['outcome']!r} (want miss)")
-
-                    # ── retry/truncate: erased suffix must not leak ────
-                    # After turn2, the engine may have saved a longer
-                    # [q1,a1,q2,a2] boundary. A retry of turn2 resends only
-                    # [q1,a1,new_user], so it must reopen turn1's saved
-                    # boundary and must not hit the stale turn2 suffix.
-                    a2 = ""
-                    if t2.status_code == 200:
-                        a2 = t2.json()["choices"][0]["message"].get("content") or ""
-                    hist_retry = [
-                        {"role": "user", "content": q1},
-                        {"role": "assistant", "content": a1},
-                        {
-                            "role": "user",
-                            "content": "Retry: answer with exactly one landmark name.",
-                        },
-                    ]
-                    tr = await http_c.post(f"{base}/v1/chat/completions", json={
-                        "model": MODEL, "messages": hist_retry,
-                        "temperature": 0, "max_tokens": 32, "stream": False,
-                        "cache": directive(key, 3),
-                    })
-                    dr = _diag(tr)
-                    print(f"[cache] retry-after-turn2 -> {tr.status_code} diag={dr} "
-                          f"turn2_content={a2[:60]!r}")
-                    if tr.status_code == 200 and dr is None:
-                        failures.append("retry lookup: missing X-ChatAPC-Cache header")
-                    elif tr.status_code == 200 and dr is not None:
-                        if dr["outcome"] != "hit":
-                            failures.append(f"retry lookup outcome={dr['outcome']!r} (want hit)")
-                        elif d1 is not None and dr.get("prefix_hash") != d1.get("save_hash"):
-                            failures.append(
-                                "retry lookup must hit turn1's boundary, not rebuild/leak: "
-                                f"prefix_hash={dr.get('prefix_hash')!r} "
-                                f"turn1_save_hash={d1.get('save_hash')!r}")
-                        elif d2 is not None and dr.get("prefix_hash") == d2.get("save_hash"):
-                            failures.append(
-                                "retry lookup hit the stale turn2 suffix boundary; "
-                                "erased assistant/user tokens leaked into reuse")
-
-                    # ── changed system prompt under same key → miss ───
-                    ts = await http_c.post(f"{base}/v1/chat/completions", json={
-                        "model": MODEL,
-                        "messages": [
-                            {"role": "system", "content": "You are a terse assistant."},
-                        ] + hist2,
-                        "temperature": 0, "max_tokens": 32, "stream": False,
-                        "cache": directive(key, 4),
-                    })
-                    ds = _diag(ts)
-                    print(f"[cache] sysprompt-change -> {ts.status_code} diag={ds}")
-                    if ts.status_code == 200 and ds is not None and ds["outcome"] != "miss":
-                        failures.append(
-                            f"prompt-changing request outcome={ds['outcome']!r} (want miss): "
-                            "a changed system prompt must not reuse physical KV")
+                    await _run_post_turn2_probes(
+                        http_c,
+                        base,
+                        model=MODEL,
+                        hist2=hist2,
+                        key=key,
+                        a1=a1,
+                        t2=t2,
+                        d1=d1,
+                        d2=d2,
+                        directive=directive,
+                        failures=failures,
+                    )
 
                     # ── retention: LRU state must survive HTTP requests ─
                     # The daemon instantiates a fresh WASM component for
