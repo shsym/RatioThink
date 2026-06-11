@@ -152,8 +152,11 @@ const SCORE_PROMPT: &str = "Rate the assistant's latest answer from 1 to 10 on h
      actually satisfies the user's original request. Judge task relevance, factual and semantic \
      correctness, specificity, and concrete usefulness. A fluent, polished, brief, or polite \
      answer that does not directly address what was asked is a LOW score (1-3); do not reward \
-     style, brevity, or acknowledgment over substance. Respond with only a single integer from 1 \
-     to 10.";
+     style, brevity, or acknowledgment over substance. Use the full scale: 1-3 means off-task \
+     or mostly unusable, 4-6 means partially useful or generic, 7-8 means strong and specific, \
+     and 9-10 means exceptional. Avoid defaulting to 5 when the answer is on-topic but generic \
+     or when it is clearly stronger than its alternatives. Respond with only a single integer \
+     from 1 to 10.";
 
 /// Token budget for a scoring generation — enough for a suppressed empty
 /// `<think></think>` plus the integer. The scorer is NOT demuxed (see
@@ -1154,6 +1157,17 @@ mod tests {
         assert!(p.contains("low score"));
         assert!(p.contains("do not reward"));
         assert!(p.contains("single integer"));
+    }
+
+    #[test]
+    fn score_prompt_anchors_scale_to_reduce_small_model_ties() {
+        let p = SCORE_PROMPT.to_lowercase();
+        assert!(p.contains("use the full scale"));
+        assert!(p.contains("1-3"));
+        assert!(p.contains("4-6"));
+        assert!(p.contains("7-8"));
+        assert!(p.contains("9-10"));
+        assert!(p.contains("avoid defaulting to 5"));
     }
 
     // ── build_synthesis_directive (#523 Part A): final-answer assembly seam ──

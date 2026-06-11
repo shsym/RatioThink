@@ -5,8 +5,9 @@
 # Boots `pie serve` with the portable Metal driver over the staged
 # Qwen3-0.6B-Q8_0 GGUF and drives real ToT searches, asserting that
 # candidate branches are not near-duplicates and that the value evaluator
-# parses real scores (not the input-order fallback). Records raw branch
-# diversity + scorer evidence to the log.
+# parses real scores for every planning prompt, with at least one prompt
+# showing non-tied sibling scores (not the input-order fallback). Records
+# raw branch diversity + scorer evidence to the log.
 #
 # Self-bootstraps its three inputs, failing loud with the exact fix
 # command (never a bare error-exit / silent skip).
