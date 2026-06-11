@@ -214,6 +214,57 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       "the compatibility toggle should let profile changes ask/suggest the destination default again")
   }
 
+  // MARK: - #527 send-time explicit pin vs resident engine mismatch
+
+  func test_send_gate_blocks_explicit_pin_that_differs_from_resident_model() throws {
+    let decision = ChatScaffoldView.sendGateDecision(
+      engineStatus: .running(EngineSessionSnapshot(
+        port: try XCTUnwrap(EnginePort(exactly: 48484)),
+        profileID: "chat",
+        servedModelID: "resident-model")),
+      selectedModelID: "pinned-model",
+      profileDefaultModel: "profile-default",
+      residentModelID: "resident-model"
+    )
+
+    XCTAssertEqual(
+      decision,
+      .pinnedModelMismatch(pinnedModelID: "pinned-model",
+                           residentModelID: "resident-model"),
+      "an explicit Chat.modelID pin must not send into an engine serving a different model")
+  }
+
+  func test_send_gate_allows_explicit_pin_when_it_matches_resident_model() throws {
+    let decision = ChatScaffoldView.sendGateDecision(
+      engineStatus: .running(EngineSessionSnapshot(
+        port: try XCTUnwrap(EnginePort(exactly: 48484)),
+        profileID: "chat",
+        servedModelID: "pinned-model")),
+      selectedModelID: "pinned-model",
+      profileDefaultModel: "profile-default",
+      residentModelID: "pinned-model"
+    )
+
+    XCTAssertEqual(decision, .ready(modelID: "pinned-model"))
+  }
+
+  func test_send_gate_does_not_treat_unpinned_profile_default_as_pin_mismatch() throws {
+    let decision = ChatScaffoldView.sendGateDecision(
+      engineStatus: .running(EngineSessionSnapshot(
+        port: try XCTUnwrap(EnginePort(exactly: 48484)),
+        profileID: "chat",
+        servedModelID: "resident-model")),
+      selectedModelID: nil,
+      profileDefaultModel: "profile-default",
+      residentModelID: "resident-model"
+    )
+
+    XCTAssertEqual(
+      decision,
+      .ready(modelID: "profile-default"),
+      "the #527 prompt is scoped to explicit per-chat pins; follow-default gaps remain out of scope for #528")
+  }
+
 
   // MARK: - #516 review F6: status edge must not fire before residency reconcile
 
