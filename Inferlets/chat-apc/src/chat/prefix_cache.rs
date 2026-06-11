@@ -14,7 +14,7 @@
 //! drops. The history is re-prefilled on every turn — O(history) work per
 //! request.
 //!
-//! ## pie save/open semantics (verified against Vendor/pie @ 2e080d8)
+//! ## pie save/open semantics (verified against Vendor/pie @ e742a1cb)
 //!
 //! - `Context::save(name)` snapshots the context's committed + working KV
 //!   pages under `name`. The SDK-side `buffer()` of un-flushed tokens is
@@ -156,13 +156,19 @@ fn fnv64(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-/// Stable 128-bit content hash (two independent FNV-1a lanes) rendered as
-/// 32 lowercase hex chars. No external crate — deterministic across builds
-/// and platforms, which a snapshot name keyed across processes requires.
+/// Stable wide (128-bit-rendered) content digest from two FNV-1a lanes,
+/// emitted as 32 lowercase hex chars. No external crate — deterministic
+/// across builds and platforms, which a snapshot name keyed across
+/// processes requires.
 ///
-/// The probability that two *different* token sequences collide here is
-/// ~2⁻¹²⁸; a collision is the only way a hit could return wrong KV, so the
-/// wide digest is deliberate.
+/// The lanes share [`FNV64_PRIME`] and differ only in offset basis, so they
+/// are correlated rather than two independent hash functions — the
+/// effective collision resistance is wider than a single 64-bit lane (the
+/// XOR-before-multiply step makes the lane differential input-dependent, so
+/// lane B adds real bits) but is NOT a proven 2⁻¹²⁸. That margin is ample
+/// here: a collision can only mislead within the same `(chat_key, compat,
+/// model)` namespace, i.e. two *distinct* histories the same user actually
+/// sends — for which 64+ effective bits is already far beyond reach.
 pub fn content_hash(model_id: &str, template_marker: &str, prefix_tokens: &[u32]) -> String {
     // Domain separators (0xFF is not a valid UTF-8 continuation lead, so it
     // cannot appear inside the model/template strings) prevent field-shift
