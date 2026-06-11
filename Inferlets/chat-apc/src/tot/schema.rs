@@ -153,6 +153,12 @@ pub struct TotParams {
     pub max_tokens_per_node: usize,
     /// Reasoning-phase token budget per node (only spent when `thinking`).
     pub max_reasoning_tokens: usize,
+    /// Candidate-**generation** temperature (#523 Part B). This is the only
+    /// client-tunable temperature axis and may run high for branch diversity
+    /// headroom; the scorer is fixed greedy (`0.0`) for deterministic pruning
+    /// and the final synthesis is a fixed low temperature for a coherent
+    /// answer — neither is exposed here. Sourced from the app profile's
+    /// `sampling.temperature` for a tree-of-thought profile.
     pub temperature: f32,
     pub top_p: f32,
     /// When true, nodes generate a `<think>` reasoning block before the
@@ -290,6 +296,18 @@ mod tests {
         let mut i = input();
         i.thinking = Some(false);
         assert!(!resolve(&i).unwrap().thinking);
+    }
+
+    #[test]
+    fn generation_temperature_defaults_then_passes_through() {
+        // #523 Part B: the generation temperature defaults to 0.7 and
+        // otherwise comes straight from the request (sourced app-side from
+        // the profile's sampling.temperature) — including the high end of
+        // the range, for branch-diversity headroom.
+        assert_eq!(resolve(&input()).unwrap().temperature, DEFAULT_TEMPERATURE);
+        let mut i = input();
+        i.temperature = Some(1.4);
+        assert_eq!(resolve(&i).unwrap().temperature, 1.4);
     }
 
     #[test]

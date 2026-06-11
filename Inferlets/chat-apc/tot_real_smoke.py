@@ -241,12 +241,29 @@ async def main() -> int:
                                 f"(min pairwise Jaccard >= {DUP_THRESHOLD}); search did not branch"
                             )
 
-                    # Scorer-calibration / refinement evidence (depth 2).
+                    # Scorer-calibration / refinement + final-answer synthesis
+                    # evidence (depth 2). The synthesized final answer must
+                    # actually address the clarification request (#523 Part A),
+                    # not echo a branch fragment or a generic acknowledgment.
                     if not quick:
                         body = await run_tot(http, base, CLARIFY_PROMPT, breadth=4, depth=2, beam_width=2)
                         _, scores = report("homepage-clarification", CLARIFY_PROMPT, body)
                         if scores:
                             any_score_parsed = True
+                        fa = (body.get("final_answer") or "").lower()
+                        # Substantive (synthesis produced a real answer)…
+                        if len(fa.split()) < 12:
+                            failures.append(
+                                f"homepage-clarification final answer too thin ({len(fa.split())} words); "
+                                "synthesis did not produce a complete answer"
+                            )
+                        # …and on-topic: it addresses the illustration vs real
+                        # output, not a generic 'looks good' acknowledgment.
+                        if not any(k in fa for k in ("illustrat", "token", "real output", "real product", "example")):
+                            failures.append(
+                                "homepage-clarification final answer does not address the requested "
+                                f"clarification (illustration / token-heaviness): {fa[:200]!r}"
+                            )
             finally:
                 drain.cancel()
                 with __import__("contextlib").suppress(asyncio.CancelledError, Exception):

@@ -240,6 +240,28 @@ pub async fn emit_node_delta(
     .await
 }
 
+/// `final_delta` — one streamed chunk of the final synthesized answer
+/// (#523 Part A). After the search picks the best leaf, ONE synthesis
+/// generation produces the final answer grounded in that leaf; its answer
+/// text streams as `final_delta` chunks before the terminal
+/// `tree_complete` (whose `final_answer` carries the full text as the
+/// authoritative value). Additive: a client that doesn't know the event
+/// ignores it and still renders `tree_complete.final_answer`.
+#[derive(Serialize)]
+struct FinalDeltaFrame<'a> {
+    event: &'static str,
+    text: &'a str,
+}
+
+/// Emit one streamed chunk of the synthesized final answer.
+pub async fn emit_final_delta(em: &mut Emitter, text: &str) -> Result<(), EmitError> {
+    em.emit_json(&FinalDeltaFrame {
+        event: "final_delta",
+        text,
+    })
+    .await
+}
+
 /// Emit one search level: a `node_complete` for every node generated on
 /// the level (ok, generation-error, fork/refine-flush error-leaf — all of
 /// them, so the UI sees the full breadth that was attempted), then the

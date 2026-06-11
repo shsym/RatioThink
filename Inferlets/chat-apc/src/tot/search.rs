@@ -160,6 +160,23 @@ const SCORE_PROMPT: &str = "Rate the assistant's latest answer from 1 to 10 on h
 /// [`score_node`]), so this is the whole budget.
 const SCORE_MAX_TOKENS: usize = 32;
 
+/// Temperature for the final-answer synthesis (#523 Part A). Deliberately
+/// LOW and fixed, independent of the candidate-generation temperature
+/// (`TotParams.temperature`, which can run high for branch diversity) and
+/// of the scorer (greedy `0.0`): synthesis must be a coherent, faithful
+/// answer, so it never inherits the exploration entropy. The three roles —
+/// generation (tunable, high) / scoring (greedy) / synthesis (low) — are
+/// the temperature split; only generation is exposed on the wire, because
+/// a tunable scorer or synthesis temperature would trade away deterministic
+/// pruning and answer coherence for no benefit.
+const SYNTHESIS_TEMPERATURE: f32 = 0.3;
+const SYNTHESIS_TOP_P: f32 = 0.9;
+
+/// Reasoning budget for the synthesis generation. Synthesis runs
+/// `/no_think` (it produces the answer, not a thought trace), so this only
+/// needs to absorb a suppressed empty `<think></think>` before the answer.
+const SYNTHESIS_REASONING_TOKENS: usize = 32;
+
 /// Append the `/no_think` directive when reasoning is disabled for this
 /// search (`thinking:false`). On a Qwen3-style model this suppresses the
 /// `<think>` block; on a non-reasoning model it is an inert token.
@@ -169,6 +186,33 @@ fn with_thinking(base: &str, thinking: bool) -> String {
     } else {
         format!("{base} /no_think")
     }
+}
+
+/// Build the synthesis user-turn (#523 Part A): the instruction appended to
+/// a fork of the ORIGINAL conversation that turns the best search leaf into
+/// the final answer. It embeds the chosen candidate (and its reasoning, when
+/// present) and directs a thorough, faithful answer to the user's request —
+/// not an echo of the candidate or a restatement of the strategy. Pure →
+/// unit-tested. (`/no_think` + the low synthesis temperature are applied by
+/// [`synthesize`].)
+fn build_synthesis_directive(best_content: &str, best_reasoning: &str) -> String {
+    let mut s = String::from(
+        "An internal tree-of-thought search explored several strategies and selected the most \
+         promising one. Its result:\n\n",
+    );
+    s.push_str(best_content.trim());
+    let r = best_reasoning.trim();
+    if !r.is_empty() {
+        s.push_str("\n\nThe reasoning behind it:\n\n");
+        s.push_str(r);
+    }
+    s.push_str(
+        "\n\nUsing this as your foundation, write the final, complete answer to my original \
+         request. Directly and fully address what I asked, be accurate and thorough, and resolve \
+         any gaps. Do not merely echo the result above, name the strategy, or restate the \
+         question — give the actual answer.",
+    );
+    s
 }
 
 /// A generated batch is visible answer content only when it lands entirely
@@ -200,6 +244,17 @@ struct Demux {
     kind: DemuxKind,
 }
 
+/// Where [`generate_demuxed`]'s streamed deltas go. `Node` tags a tree
+/// node id and streams both the reasoning and answer channels as
+/// `node_delta` (#413). `Final` streams only the answer as `final_delta`
+/// (#523 Part A) — the post-search synthesis surfaces an answer, not a
+/// thought trace, so its reasoning channel is not emitted.
+#[derive(Clone, Copy)]
+enum DeltaSink<'a> {
+    Node(&'a str),
+    Final,
+}
+
 /// Generate one assistant turn with two-phase budgeting and `<think>` demux.
 ///
 /// Phase 1 (reasoning) runs until the model closes its think block or
@@ -219,7 +274,7 @@ async fn generate_demuxed(
     answer_budget: usize,
     stops: &[u32],
     mut emitter: Option<&mut Emitter>,
-    node_id: &str,
+    sink: DeltaSink<'_>,
 ) -> Demux {
     let mut reason_dec = reasoning::Decoder::new(model);
     let mut chat_dec = chat::Decoder::new(model);
@@ -258,8 +313,9 @@ async fn generate_demuxed(
                 in_reasoning = true;
                 reasoning.push_str(&s);
                 // #413 token stream: live-fill this node's reasoning channel.
-                if let Some(em) = emitter.as_deref_mut() {
-                    let _ = stream::emit_node_delta(em, node_id, stream::DELTA_REASONING, &s).await;
+                // The `Final` synthesis sink surfaces only the answer.
+                if let (Some(em), DeltaSink::Node(id)) = (emitter.as_deref_mut(), sink) {
+                    let _ = stream::emit_node_delta(em, id, stream::DELTA_REASONING, &s).await;
                 }
             }
             Ok(reasoning::Event::End(_)) => {
@@ -272,9 +328,13 @@ async fn generate_demuxed(
         match chat_dec.feed(&out.tokens) {
             Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) => {
                 answer.push_str(&s);
-                // #413 token stream: live-fill this node's answer channel.
+                // #413 token stream: live-fill the answer channel — a tree
+                // node's `node_delta` or, for synthesis, `final_delta` (#523).
                 if let Some(em) = emitter.as_deref_mut() {
-                    let _ = stream::emit_node_delta(em, node_id, stream::DELTA_ANSWER, &s).await;
+                    let _ = match sink {
+                        DeltaSink::Node(id) => stream::emit_node_delta(em, id, stream::DELTA_ANSWER, &s).await,
+                        DeltaSink::Final => stream::emit_final_delta(em, &s).await,
+                    };
                 }
             }
             Ok(chat::Event::Delta(_)) | Ok(chat::Event::Idle) => {}
@@ -413,6 +473,14 @@ pub async fn run(
     model: &Model,
     mut emitter: Option<&mut Emitter>,
 ) -> SearchOutcome {
+    // #523 Part A: preserve a fork of the original conversation (system +
+    // user turns, flushed, cue-free) BEFORE the search consumes `root_ctx`.
+    // The final-answer synthesis grounds on this, so it works regardless of
+    // which level the best leaf came from (the leaf's own context may have
+    // been dropped by an earlier-level F7 fallback). `None` if the fork
+    // fails → synthesis is skipped and the best-leaf content stands.
+    let synth_base: Option<Context> = root_ctx.fork().ok();
+
     let mut flat: Vec<Node> = vec![Node::root()];
     let mut frontier: Vec<Frontier> = vec![Frontier {
         ctx: root_ctx,
@@ -522,7 +590,30 @@ pub async fn run(
         }
     }
 
-    finalize(flat, &last_level)
+    // #523 Part A: capture the best leaf's answer + reasoning (before
+    // `finalize` consumes `flat`), assemble the outcome, then run ONE
+    // grounded synthesis as the final answer. `best` is `Some` exactly when
+    // an ok leaf exists (so honest-null is preserved: no leaf → no synthesis,
+    // `final_answer` stays null). Synthesis streams as `final_delta`; on any
+    // failure it returns `None` and the raw best-leaf content stands.
+    let best = best_leaf(&last_level)
+        .and_then(|id| flat.iter().find(|n| n.id == id))
+        .map(|n| (n.content.clone(), n.reasoning.clone()));
+    let mut outcome = finalize(flat, &last_level);
+    if let (Some((content, reasoning)), Some(base)) = (best, synth_base)
+        && let Some(answer) = synthesize(
+            base,
+            model,
+            &content,
+            &reasoning,
+            params.max_tokens_per_node,
+            emitter,
+        )
+        .await
+    {
+        outcome.final_answer = Some(answer);
+    }
+    outcome
 }
 
 /// Materialize one level's **successfully forked** branches into tree
@@ -744,7 +835,7 @@ async fn generate_branch(
         params.max_tokens_per_node,
         &stops,
         emitter,
-        node_id,
+        DeltaSink::Node(node_id),
     )
     .await;
     (ctx, demux)
@@ -854,6 +945,47 @@ async fn score_node(ctx: &Context, model: &Model) -> ScoreOutcome {
     match parse_score(&text) {
         Some(v) => ScoreOutcome::Scored(v),
         None => ScoreOutcome::Unparseable,
+    }
+}
+
+/// Final-answer synthesis (#523 Part A). Forks-free: `base` is already a
+/// fork of the ORIGINAL conversation (system + user turns), preserved
+/// before the search consumed the root. Appends [`build_synthesis_directive`]
+/// (+ `/no_think`) and runs ONE low-temperature, demuxed generation grounded
+/// in the best leaf, streaming its answer as `final_delta` when an emitter is
+/// present. Returns the synthesized answer, or `None` on any failure / empty
+/// result so the caller falls back to the raw best-leaf content and never
+/// loses an answer. Search, scoring, and beam selection are untouched — this
+/// runs only after a best ok leaf is chosen.
+async fn synthesize(
+    mut base: Context,
+    model: &Model,
+    best_content: &str,
+    best_reasoning: &str,
+    answer_budget: usize,
+    emitter: Option<&mut Emitter>,
+) -> Option<String> {
+    let directive = with_thinking(&build_synthesis_directive(best_content, best_reasoning), false);
+    base.user(&directive);
+    base.cue();
+    let stops = chat::stop_tokens(model);
+    let demux = generate_demuxed(
+        &mut base,
+        model,
+        Sampler::TopP {
+            temperature: SYNTHESIS_TEMPERATURE,
+            p: SYNTHESIS_TOP_P,
+        },
+        SYNTHESIS_REASONING_TOKENS,
+        answer_budget,
+        &stops,
+        emitter,
+        DeltaSink::Final,
+    )
+    .await;
+    match demux.kind {
+        DemuxKind::Answered if !demux.answer.trim().is_empty() => Some(demux.answer),
+        _ => None,
     }
 }
 
@@ -977,6 +1109,47 @@ mod tests {
         assert!(p.contains("low score"));
         assert!(p.contains("do not reward"));
         assert!(p.contains("single integer"));
+    }
+
+    // ── build_synthesis_directive (#523 Part A): final-answer assembly seam ──
+
+    #[test]
+    fn synthesis_directive_embeds_best_content_and_directs_a_full_answer() {
+        let d = build_synthesis_directive("Book a private venue that fits 20 guests.", "");
+        // The chosen candidate is embedded as the grounding…
+        assert!(d.contains("Book a private venue that fits 20 guests."));
+        // …and the instruction directs the final answer, not an echo.
+        let lo = d.to_lowercase();
+        assert!(lo.contains("final"));
+        assert!(lo.contains("answer to my original request"));
+        assert!(lo.contains("do not merely echo"));
+        // No reasoning section when reasoning is empty.
+        assert!(!d.contains("reasoning behind it"));
+    }
+
+    #[test]
+    fn synthesis_directive_includes_reasoning_when_present() {
+        let d = build_synthesis_directive("Answer X.", "First consider the budget, then the venue.");
+        assert!(d.contains("The reasoning behind it:"));
+        assert!(d.contains("First consider the budget, then the venue."));
+    }
+
+    #[test]
+    fn synthesis_directive_trims_whitespace_only_reasoning() {
+        // Whitespace-only reasoning must not open an empty reasoning section.
+        let d = build_synthesis_directive("Answer.", "   \n  ");
+        assert!(!d.contains("reasoning behind it"));
+    }
+
+    // ── Temperature split (#523 Part B): three roles, three temperatures ──
+
+    #[test]
+    fn synthesis_temperature_is_low_and_distinct_from_generation_default() {
+        // Synthesis stays coherent (low) regardless of how high candidate
+        // generation runs; the scorer is greedy (0.0) — see `score_node`.
+        let (synth, gen_default) = (SYNTHESIS_TEMPERATURE, super::super::schema::DEFAULT_TEMPERATURE);
+        assert!(synth > 0.0, "synthesis temperature must be a real low value");
+        assert!(synth < gen_default, "synthesis must stay below the generation default");
     }
 
     // ── ScoreOutcome (F4): the three classes the old Option<u8> merged ──
