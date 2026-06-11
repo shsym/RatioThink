@@ -88,9 +88,6 @@
   .pill .lab{color:var(--ink-muted)}
   .pill svg{flex:none}
   .chev{opacity:.6}
-  .tdiv{width:1px;height:18px;background:var(--win-line);margin:0 2px}
-  .glyphs{display:flex;align-items:center;gap:11px;color:var(--ink-muted);font-size:13px}
-  .glyphs span{font-family:var(--serif)}
 
   /* the profile dropdown menu (animated) */
   .menu{position:absolute;top:38px;left:12px;min-width:190px;background:var(--bg);
@@ -251,28 +248,18 @@
 
       <div class="toolbar">
         <span class="pill active" id="profilePill">
-          <span id="profileIcon"></span>
           <span class="lab">Profile:</span><span id="profileName">Tree of Thought</span>
           <span class="chev">▾</span>
-        </span>
-        <span class="pill"><span class="lab">Model:</span>&nbsp;Qwen3-0.6B <span class="chev">▾</span></span>
-        <span class="tdiv"></span>
-        <span class="glyphs">
-          <span title="Sampling"><i>𝑇</i></span>
-          <svg title="Attach" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M11.5 5.5 6 11a2 2 0 0 1-2.8-2.8l5.8-5.8a3 3 0 0 1 4.3 4.3l-6 6a4.5 4.5 0 0 1-6.4-6.4L6 4"/></svg>
-          <svg title="System prompt" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M4 2.5h5L12.5 6v7.5h-9z"/><path d="M9 2.5V6h3.5M5.8 8.5h4.4M5.8 10.7h4.4"/></svg>
         </span>
 
         <div class="menu" id="profileMenu">
           <div class="mrow" id="menuTot">
-            <span class="ticon"></span> Tree of Thought<span class="check">✓</span>
+            Tree of Thought<span class="check">✓</span>
           </div>
           <div class="mrow" id="menuFast">
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"><path d="M8.5 1 3 9h3.5L6 15l6-8.5H8z"/></svg>
             Fast Think<span class="check">✓</span>
           </div>
           <div class="mrow" id="menuChat">
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 6.5a3.5 3 0 0 1 3.5-3h4a3.5 3 0 0 1 0 6h-4l-2.5 2v-2a3 3 0 0 1-1-3z"/></svg>
             Chat<span class="check">✓</span>
           </div>
         </div>
@@ -381,18 +368,11 @@
   var composer   = document.getElementById('composer');
   var menu       = document.getElementById('profileMenu');
   var profileName= document.getElementById('profileName');
-  var profileIcon= document.getElementById('profileIcon');
   var menuTot    = document.getElementById('menuTot');
   var menuFast   = document.getElementById('menuFast');
   var menuChat   = document.getElementById('menuChat');
   var captionEl  = document.getElementById('caption');
   var dotEls     = Array.prototype.slice.call(document.querySelectorAll('#dots .dot'));
-
-  // SF-Symbol-flavoured inline glyphs (browser-safe).
-  var BOLT = '<svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"><path d="M8.5 1 3 9h3.5L6 15l6-8.5H8z"/></svg>';
-  var CHATG = '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 6.5a3.5 3 0 0 1 3.5-3h4a3.5 3 0 0 1 0 6h-4l-2.5 2v-2a3 3 0 0 1-1-3z"/></svg>';
-  // "point.3.connected.trianglepath.dotted" — three connected nodes.
-  var TREE = '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M8 3.2 3.5 11M8 3.2 12.5 11" stroke-dasharray="1.6 1.4"/><circle cx="8" cy="3" r="1.8" fill="currentColor" stroke="none"/><circle cx="3.2" cy="12" r="1.8" fill="currentColor" stroke="none"/><circle cx="12.8" cy="12" r="1.8" fill="currentColor" stroke="none"/></svg>';
 
   // ---- cooperative cancellation: each scene captures a generation token; a dot
   // click bumps `gen`, so the in-flight scene's next sleep rejects CANCELLED and
@@ -424,8 +404,8 @@
       if (k===i) d.setAttribute('aria-current', 'true'); else d.removeAttribute('aria-current');
     });
   }
-  function setProfile(name, iconHTML, which){
-    profileName.textContent = name; profileIcon.innerHTML = iconHTML;
+  function setProfile(name, which){
+    profileName.textContent = name;
     menuTot.classList.toggle('sel', which==='tot');
     menuFast.classList.toggle('sel', which==='fast');
     menuChat.classList.toggle('sel', which==='chat');
@@ -487,7 +467,7 @@
   // ============== Scene 0 (LEAD): Tree of Thought — shipped one-click profile ==============
   async function sceneTreeOfThought(myGen){
     var d = SCENARIO.tot;
-    setProfile(d.profile, TREE, 'tot');
+    setProfile(d.profile, 'tot');
     setCaption('Stuck on a many-option decision? Tree of Thought explores them and picks the best.');
     await sleep(800, myGen);
     await typeComposer(d.prompt, myGen);
@@ -497,7 +477,7 @@
     var col = el(
       '<div class="row assistant"><div class="acol">'+
         '<div class="tsearch" id="ts">'+
-          '<div class="tshead">'+TREE+' Tree search '+
+          '<div class="tshead">Tree search '+
             '<span class="bounds">'+d.bounds+'</span> '+
             '<span class="status searching" id="tstatus">searching…</span> '+
             '<span class="tchev">▾</span></div>'+
@@ -557,7 +537,7 @@
   async function sceneFastThink(myGen){
     var d = SCENARIO.fast;
     // First pass: the normal Chat profile, token by token.
-    setProfile('Chat', CHATG, 'chat');
+    setProfile('Chat', 'chat');
     setCaption('The everyday Chat profile, answering at its normal pace.');
     await sleep(650, myGen);
     await typeComposer(d.prompt, myGen);
@@ -571,7 +551,7 @@
     // Switch profiles: open the menu, pick Fast Think.
     setCaption('Switch to Fast Think — same model, far less waiting.');
     menu.classList.add('show'); await sleep(680, myGen);
-    setProfile('Fast Think', BOLT, 'fast'); await sleep(520, myGen);
+    setProfile('Fast Think', 'fast'); await sleep(520, myGen);
     menu.classList.remove('show');
     await sleep(360, myGen);
 
@@ -598,19 +578,19 @@
       rows += row(b, false);
       b.children.forEach(function(c){ rows += row(c, true); });
     });
-    return '<div class="tsearch"><div class="tshead">'+TREE+' Tree search '+
+    return '<div class="tsearch"><div class="tshead">Tree search '+
       '<span class="bounds">'+d.bounds+'</span> <span class="status">'+d.nodeCount+' nodes</span> '+
       '<span class="tchev">▾</span></div><div class="tsbody">'+rows+'</div></div>';
   }
   function stillTot(){
-    clear(); setProfile(SCENARIO.tot.profile, TREE, 'tot');
+    clear(); setProfile(SCENARIO.tot.profile, 'tot');
     userRow(SCENARIO.tot.prompt);
     var col = el('<div class="row assistant"><div class="acol">'+buildTreeFinal()+
       '<div class="bubble assistant">'+SCENARIO.tot.answer+'</div></div></div>');
     transcript.appendChild(col);
   }
   function stillFast(){
-    clear(); setProfile('Fast Think', BOLT, 'fast');
+    clear(); setProfile('Fast Think', 'fast');
     userRow(SCENARIO.fast.prompt);
     var a = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
     a.querySelector('.bubble').textContent = SCENARIO.fast.answer;

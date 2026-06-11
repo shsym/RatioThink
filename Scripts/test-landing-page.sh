@@ -45,6 +45,24 @@ footer_match = re.search(r"<footer>(.*?)</footer>", html, re.S)
 if footer_match and "https://github.com/shsym/RatioThink" in footer_match.group(1):
     failures.append("GitHub repository link is still in the footer instead of being moved")
 
+toolbar_match = re.search(r'<div class="toolbar">(.*?)<div class="menu"', html, re.S)
+if not toolbar_match:
+    failures.append("missing landing mock toolbar")
+else:
+    toolbar_html = toolbar_match.group(1)
+    removed_toolbar_markers = [
+        ("Model:", "model selector is still present in the landing mock toolbar"),
+        ("Qwen3-0.6B", "model name is still present in the landing mock toolbar"),
+        ('class="glyphs"', "decorative toolbar icon group is still present"),
+        ('title="Sampling"', "sampling toolbar icon is still present"),
+        ('title="Attach"', "attach toolbar icon is still present"),
+        ('title="System prompt"', "system-prompt toolbar icon is still present"),
+        ('class="tdiv"', "toolbar divider for removed controls is still present"),
+    ]
+    for marker, message in removed_toolbar_markers:
+        if marker in toolbar_html:
+            failures.append(message)
+
 if failures:
     for failure in failures:
         print(f"FAIL: {failure}", file=sys.stderr)
