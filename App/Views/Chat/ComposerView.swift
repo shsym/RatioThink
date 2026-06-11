@@ -226,10 +226,10 @@ struct ComposerView: View {
     chat.updatedAt = message.ts
     // #512: first real user message titles the chat — a deterministic
     // local heuristic (trim/collapse/cap), committed in the SAME save as
-    // the message so it can never block or outlive the send. Only an
-    // untitled chat (still the default placeholder) is renamed, so a
-    // user-set title is never fought.
-    if chat.title == Chat.defaultTitle, let title = ChatAutoTitle.derive(from: payload) {
+    // the message so it can never block or outlive the send. Only a
+    // never-user-titled chat still carrying the placeholder is renamed
+    // (`shouldAutoTitle`), so a manual rename wins permanently.
+    if ChatLifecycle.shouldAutoTitle(chat), let title = ChatAutoTitle.derive(from: payload) {
       chat.title = title
     }
     do {

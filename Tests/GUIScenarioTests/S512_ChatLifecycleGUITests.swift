@@ -117,6 +117,57 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
                   "no 'New Chat' shell may survive the launch reconcile; app tree: \(relaunched.debugDescription)")
   }
 
+  /// Manual rename via the row context menu: the new title shows in the
+  /// sidebar, and the renamed chat — though EMPTY — survives switch-away
+  /// and relaunch (a user-set title is permanent intent, never pruned).
+  @MainActor
+  func test_context_menu_rename_persists_and_protects_empty_chat() async throws {
+    let customTitle = "Research scratchpad"
+    let home = freshHome("rename")
+    let app = makeApp(pieHome: home)
+    app.launch()
+    defer { app.terminate() }
+    XCTAssert(app.wait(for: .runningForeground, timeout: 10))
+    app.activate()
+
+    openFreshChat(in: app)
+    XCTAssertTrue(waitForNewChatRowCount(1, in: app),
+                  "draft chat row missing; app tree: \(app.debugDescription)")
+
+    let row = sidebarRow(titled: "New Chat", in: app)
+    XCTAssertTrue(row.waitForExistence(timeout: 5))
+    row.rightClick()
+    let rename = app.menuItems["Rename"]
+    XCTAssertTrue(rename.waitForExistence(timeout: 5),
+                  "Rename missing from row context menu; app tree: \(app.debugDescription)")
+    rename.click()
+
+    let field = app.textFields["chats.rename.field"]
+    XCTAssertTrue(field.waitForExistence(timeout: 5),
+                  "rename field missing; app tree: \(app.debugDescription)")
+    field.click()
+    field.typeKey("a", modifierFlags: .command)
+    field.typeText(customTitle)
+    let confirm = app.buttons["chats.rename.confirm"]
+    XCTAssertTrue(confirm.waitForExistence(timeout: 5))
+    confirm.click()
+
+    XCTAssertTrue(sidebarRow(titled: customTitle, in: app).waitForExistence(timeout: 5),
+                  "renamed title not shown in sidebar; app tree: \(app.debugDescription)")
+
+    // Relaunch: the renamed chat is EMPTY, but a user-set title is
+    // intent — the launch reconcile must keep it.
+    app.terminate()
+    let relaunched = makeApp(pieHome: home)
+    relaunched.launch()
+    defer { relaunched.terminate() }
+    XCTAssert(relaunched.wait(for: .runningForeground, timeout: 10))
+    relaunched.activate()
+
+    XCTAssertTrue(sidebarRow(titled: customTitle, in: relaunched).waitForExistence(timeout: 10),
+                  "user-titled empty chat must survive the launch reconcile; app tree: \(relaunched.debugDescription)")
+  }
+
   /// A chat whose send FAILED is real conversation: the user turn committed,
   /// so the chat is kept across switch-away AND relaunch — and the sidebar
   /// row carries the auto-derived title (the first user message) instead of

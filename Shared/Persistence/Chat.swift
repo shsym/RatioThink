@@ -9,7 +9,9 @@ import SwiftData
 /// reaching for a `PersistentIdentifier` opaque box.
 ///
 /// `updatedAt` is the source of truth the sidebar sorts on — bumped on
-/// new messages and on title edits.
+/// new messages only. Config-style edits (pin toggle, profile swap,
+/// manual rename) deliberately do not bump it, so a chat's sidebar
+/// position tracks conversation recency.
 @available(macOS 14, *)
 @Model
 public final class Chat {
@@ -42,6 +44,14 @@ public final class Chat {
   public var createdAt: Date
   public var updatedAt: Date
   public var pinned: Bool
+  /// True once the USER has set the title (manual rename). A user-set
+  /// title is permanent intent: it is never auto-overwritten and the chat
+  /// is never pruned as an empty shell — even if the user typed exactly
+  /// the "New Chat" placeholder text. Non-optional with an **inline
+  /// (declaration-site) default** so SwiftData lightweight migration
+  /// backfills `false` on pre-existing stores (same pattern as
+  /// `Message.reasoning`).
+  public var userTitled: Bool = false
   /// Cascade-delete relationship. The inverse keyPath
   /// (`\Message.chat`) is what tells SwiftData this is the owning
   /// side; both sides must agree on the relationship or a save
@@ -57,7 +67,8 @@ public final class Chat {
     modelID: String? = nil,
     createdAt: Date = Date(),
     updatedAt: Date? = nil,
-    pinned: Bool = false
+    pinned: Bool = false,
+    userTitled: Bool = false
   ) {
     self.id = id
     self.title = title
@@ -66,5 +77,6 @@ public final class Chat {
     self.createdAt = createdAt
     self.updatedAt = updatedAt ?? createdAt
     self.pinned = pinned
+    self.userTitled = userTitled
   }
 }

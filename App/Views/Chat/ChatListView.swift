@@ -17,6 +17,12 @@ struct ChatListView: View {
   /// `SortDescriptor(\.pinned)` at compile time.
   @Query(sort: \Chat.updatedAt, order: .reverse) private var chats: [Chat]
   @Binding var selectedItemID: UUID?
+  /// #512 manual rename: the chat being renamed (drives the alert) and
+  /// the in-flight title draft. Kept as the chat's stable UUID, not the
+  /// `Chat` reference, so a row deleted while the alert is up can't leave
+  /// a dangling @Model in view state.
+  @State private var renamingChatID: UUID?
+  @State private var renameDraft: String = ""
 
   private var sortedChats: [Chat] {
     chats.sorted { lhs, rhs in
@@ -62,6 +68,10 @@ struct ChatListView: View {
             Button(chat.pinned ? "Unpin" : "Pin") {
               togglePin(chat)
             }
+            Button("Rename") {
+              renameDraft = chat.title
+              renamingChatID = chat.id
+            }
             Divider()
             Button("Delete", role: .destructive) {
               delete(chat)
@@ -77,6 +87,24 @@ struct ChatListView: View {
     }
     .listStyle(.sidebar)
     .accessibilityIdentifier("chats.list")
+    // #512 manual rename. An alert (not an inline TextField) keeps the
+    // row view free of per-row edit state; the alert's implicit Cancel
+    // dismisses without touching the chat.
+    .alert(
+      "Rename Chat",
+      isPresented: Binding(
+        get: { renamingChatID != nil },
+        set: { if !$0 { renamingChatID = nil } }
+      )
+    ) {
+      TextField("Title", text: $renameDraft)
+        .accessibilityIdentifier("chats.rename.field")
+      Button("Rename") {
+        commitRename()
+      }
+      .accessibilityIdentifier("chats.rename.confirm")
+      Button("Cancel", role: .cancel) {}
+    }
   }
 
   private func row(for chat: Chat) -> some View {
@@ -126,6 +154,31 @@ struct ChatListView: View {
       modelID: source?.modelID
     ) {
       selectedItemID = id
+    }
+  }
+
+  /// #512 manual rename: trim, refuse an empty result (keep the old
+  /// title), set `userTitled` so the title is permanent user intent —
+  /// never auto-overwritten and never pruned, even when the typed text
+  /// equals the "New Chat" placeholder. `updatedAt` is untouched, like
+  /// `togglePin`: the sidebar sorts on message-activity recency, and a
+  /// rename would otherwise float the chat to a wrong position.
+  private func commitRename() {
+    defer { renamingChatID = nil }
+    guard let id = renamingChatID,
+          let chat = chats.first(where: { $0.id == id }) else { return }
+    let trimmed = renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    let previousTitle = chat.title
+    let previousUserTitled = chat.userTitled
+    chat.title = trimmed
+    chat.userTitled = true
+    do {
+      try modelContext.save()
+    } catch {
+      chat.title = previousTitle
+      chat.userTitled = previousUserTitled
+      persistenceStatus.report(error, context: "ChatListView.rename")
     }
   }
 

@@ -101,6 +101,38 @@ final class ChatLifecycleTests: XCTestCase {
                   "an all-whitespace row carries no conversation")
   }
 
+  // MARK: - manual rename (userTitled)
+
+  /// The sentinel edge: renaming a chat to exactly the "New Chat"
+  /// placeholder must NOT re-enter the prunable regime — `userTitled`
+  /// is the authoritative manual-rename signal, not the title text.
+  func test_userTitled_chat_named_exactly_default_is_kept() throws {
+    let context = try makeContext()
+    let chat = Chat(title: Chat.defaultTitle, userTitled: true)
+    context.insert(chat)
+    try context.save()
+    XCTAssertFalse(ChatLifecycle.isPrunableEmpty(chat),
+                   "a manual rename to the literal placeholder is still user intent")
+  }
+
+  func test_shouldAutoTitle_skips_userTitled_chat_even_with_default_text() throws {
+    let context = try makeContext()
+    let renamed = Chat(title: Chat.defaultTitle, userTitled: true)
+    context.insert(renamed)
+    try context.save()
+    XCTAssertFalse(ChatLifecycle.shouldAutoTitle(renamed),
+                   "manual rename wins permanently — auto-title must never overwrite it")
+  }
+
+  func test_shouldAutoTitle_applies_only_to_untouched_placeholder() throws {
+    let context = try makeContext()
+    let fresh = try insertChat(context)
+    XCTAssertTrue(ChatLifecycle.shouldAutoTitle(fresh))
+    fresh.title = "Derived title"
+    XCTAssertFalse(ChatLifecycle.shouldAutoTitle(fresh),
+                   "once titled (auto or otherwise), never re-titled")
+  }
+
   // MARK: - pruneIfEmpty
 
   func test_pruneIfEmpty_deletes_empty_shell_and_cascades() throws {

@@ -92,6 +92,10 @@ public enum RatioThinkModelContainer {
     public var createdAt: Date
     public var updatedAt: Date
     public var pinned: Bool
+    /// #512: whether the user manually titled the chat. Optional +
+    /// omitted-when-false so older exports decode without it (nil ⇒
+    /// not user-titled).
+    public var userTitled: Bool?
     public var messages: [ExportedMessage]
 
     public init(
@@ -102,6 +106,7 @@ public enum RatioThinkModelContainer {
       createdAt: Date,
       updatedAt: Date,
       pinned: Bool,
+      userTitled: Bool? = nil,
       messages: [ExportedMessage]
     ) {
       self.id = id
@@ -111,6 +116,7 @@ public enum RatioThinkModelContainer {
       self.createdAt = createdAt
       self.updatedAt = updatedAt
       self.pinned = pinned
+      self.userTitled = userTitled
       self.messages = messages
     }
   }
@@ -175,6 +181,7 @@ public enum RatioThinkModelContainer {
         createdAt: chat.createdAt,
         updatedAt: chat.updatedAt,
         pinned: chat.pinned,
+        userTitled: chat.userTitled ? true : nil,
         messages: chat.messages
           .sorted { $0.ts < $1.ts }
           .map { ExportedMessage(

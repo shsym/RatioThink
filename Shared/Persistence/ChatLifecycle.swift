@@ -10,9 +10,16 @@ import SwiftData
 @available(macOS 14, *)
 public enum ChatLifecycle {
   /// A chat is a prunable empty shell when nothing about it carries user
-  /// intent: never pinned, never titled away from the default, and no
-  /// message with real content. Profile/model metadata alone does not
-  /// make a conversation real — every new chat carries those.
+  /// intent: never pinned, never user-titled, never titled away from the
+  /// default, and no message with real content. Profile/model metadata
+  /// alone does not make a conversation real — every new chat carries
+  /// those.
+  ///
+  /// `userTitled` is the authoritative manual-rename signal: a user who
+  /// renamed a chat — even to exactly the "New Chat" placeholder text —
+  /// keeps it. The textual `title == defaultTitle` check stays alongside
+  /// it for migration safety: a chat renamed on a pre-`userTitled` build
+  /// backfills `userTitled == false`, and only the text check protects it.
   ///
   /// Kept deliberately conservative: a chat with a user-authored message
   /// survives even if the send failed or was cancelled (the user started
@@ -20,9 +27,18 @@ public enum ChatLifecycle {
   /// whatever its role — counts as real, so unexpected data is never
   /// deleted.
   public static func isPrunableEmpty(_ chat: Chat) -> Bool {
-    guard !chat.pinned else { return false }
+    guard !chat.pinned, !chat.userTitled else { return false }
     guard chat.title == Chat.defaultTitle else { return false }
     return !chat.messages.contains(where: isRealContent)
+  }
+
+  /// Whether the first-message auto-title may run: only a chat the user
+  /// has never titled, still carrying the placeholder. A manual rename
+  /// (`userTitled`) wins permanently — including a rename to the literal
+  /// "New Chat" text, which without the flag would re-enter the
+  /// auto-title regime.
+  public static func shouldAutoTitle(_ chat: Chat) -> Bool {
+    !chat.userTitled && chat.title == Chat.defaultTitle
   }
 
   /// Whether a message row makes its chat a real conversation: any
