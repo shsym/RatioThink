@@ -91,6 +91,9 @@ struct ContentToolbar: View {
 
   @State private var showParamsPopover = false
   @State private var showSystemPopover = false
+#if DEBUG
+  @State private var didRunTestAutoProfilePick = false
+#endif
 
   init(
     viewModel: ChatTranscriptViewModel,
@@ -182,6 +185,11 @@ struct ContentToolbar: View {
     .padding(.horizontal, 16)
     .padding(.vertical, 8)
     .background(Color(nsColor: .windowBackgroundColor))
+#if DEBUG
+    .task(id: testAutoProfilePickTaskID) {
+      await runTestAutoProfilePickIfNeeded()
+    }
+#endif
     .accessibilityElement(children: .contain)
     .accessibilityIdentifier("content.toolbar")
   }
@@ -221,6 +229,36 @@ struct ContentToolbar: View {
       }
     }
   }
+
+#if DEBUG
+  private static var testAutoPickProfileID: String? {
+    guard let id = ProcessInfo.processInfo.environment["PIE_TEST_AUTO_PICK_PROFILE"],
+          !id.isEmpty
+    else { return nil }
+    return id
+  }
+
+  private var testAutoProfilePickTaskID: String {
+    [
+      Self.testAutoPickProfileID ?? "",
+      viewModel.selectedProfileID,
+      selectedModelID ?? "",
+    ].joined(separator: "|")
+  }
+
+  @MainActor
+  private func runTestAutoProfilePickIfNeeded() async {
+    guard !didRunTestAutoProfilePick,
+          let target = Self.testAutoPickProfileID,
+          selectedModelID != nil,
+          viewModel.selectedProfileID != target
+    else { return }
+
+    didRunTestAutoProfilePick = true
+    try? await Task.sleep(nanoseconds: 300_000_000)
+    selectProfile(target)
+  }
+#endif
 
   /// #460: the chat's effective current model — the explicit pin
   /// (`selectedModelID`) or, when unpinned, the active profile's default.

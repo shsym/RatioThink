@@ -40,14 +40,13 @@ final class S446_ComposerAutoGrowGUITests: XCTestCase {
       .matching(identifier: "composer.text")
       .firstMatch
     XCTAssertTrue(composer.waitForExistence(timeout: 10), "composer.text missing")
-    composer.click()
-
     let singleLineHeight = composer.frame.height
     XCTAssertGreaterThan(singleLineHeight, 0)
 
     // A long line with NO newlines — this is the case the old hard-`\n` count
     // could not detect, so the box stayed one line and clipped the wrap.
-    composer.typeText(String(repeating: "The capital of France is a long sentence ", count: 6))
+    typeComposerText(String(repeating: "The capital of France is a long sentence ", count: 6),
+                     in: app)
 
     // The reported height is applied on the next runloop tick; poll for growth.
     let deadline = Date().addingTimeInterval(8)

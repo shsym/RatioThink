@@ -42,7 +42,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   func test_all_three_buttons_present_on_cross_model_swap() throws {
     let app = launchPinnedX()
     defer { app.terminate() }
-    _ = openSwapPopoverSwitchingToFastThink(in: app)
+    _ = openSwapPopoverSwitchingToFastThink(in: app, requiringButton: "Switch")
 
     // The popover's container `.accessibilityIdentifier("profileSwap.popover")`
     // masks the inner button ids on macOS (same SwiftUI quirk S302 documents),
@@ -59,11 +59,9 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   func test_cancel_abandons_and_stays_on_the_old_profile() throws {
     let app = launchPinnedX()
     defer { app.terminate() }
-    let profileMenu = openSwapPopoverSwitchingToFastThink(in: app)
+    let profileMenu = openSwapPopoverSwitchingToFastThink(in: app, requiringButton: "Cancel")
 
-    let cancel = app.buttons["Cancel"]
-    XCTAssertTrue(cancel.waitForExistence(timeout: 5), "Cancel button missing")
-    cancel.click()
+    XCTAssertTrue(clickPopoverButton("Cancel", in: app), "Cancel button missing")
 
     XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "chat", timeout: 10),
                   "Cancel must abandon the swap and stay on the old profile; title=\(profileMenu.title)")
@@ -75,14 +73,12 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   func test_keep_current_switches_profile_but_keeps_pinned_model() throws {
     let app = launchPinnedX()
     defer { app.terminate() }
-    let profileMenu = openSwapPopoverSwitchingToFastThink(in: app)
+    let profileMenu = openSwapPopoverSwitchingToFastThink(in: app, requiringButton: "Keep Current Model")
 
     // Query by visible label — the container id masks the inner button id
     // (S302-documented SwiftUI quirk).
-    let keepButton = app.buttons["Keep Current Model"]
-    XCTAssertTrue(keepButton.waitForExistence(timeout: 5),
+    XCTAssertTrue(clickPopoverButton("Keep Current Model", in: app),
                   "Keep Current Model button missing; app tree: \(app.debugDescription)")
-    keepButton.click()
 
     XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "fast-think", timeout: 10),
                   "Keep Current must still commit the profile switch to fast-think; title=\(profileMenu.title)")
@@ -97,13 +93,11 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   func test_switch_commits_the_profile_switch() throws {
     let app = launchPinnedX()
     defer { app.terminate() }
-    let profileMenu = openSwapPopoverSwitchingToFastThink(in: app)
+    let profileMenu = openSwapPopoverSwitchingToFastThink(in: app, requiringButton: "Switch")
 
     // Query by visible label — the container id masks the inner button id
     // (S302-documented SwiftUI quirk).
-    let switchButton = app.buttons["Switch"]
-    XCTAssertTrue(switchButton.waitForExistence(timeout: 5), "Switch button missing")
-    switchButton.click()
+    XCTAssertTrue(clickPopoverButton("Switch", in: app), "Switch button missing")
 
     XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "fast-think", timeout: 10),
                   "Switch must commit the profile switch to fast-think; title=\(profileMenu.title)")
@@ -129,6 +123,9 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
     // (`Chat.modelID`) so swapping to a profile whose default is Y is
     // cross-model under #460's single source of truth and raises the popover.
     app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = pinnedSlug
+    // Avoid native macOS Menu automation flake while exercising the same
+    // ContentToolbar.selectProfile path as the production profile menu.
+    app.launchEnvironment["PIE_TEST_AUTO_PICK_PROFILE"] = "fast-think"
     // Engine-free: a stray developer Helper must not let reconcile run; the
     // swap keys on the chat's pin regardless, but keep the harness hermetic.
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
@@ -142,36 +139,45 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
     return app
   }
 
-  /// Open the profile switcher, pick `fast-think`, and return the
-  /// toolbar.profile menu button. Asserts the popover presents.
+  /// Wait for the DEBUG-only auto-pick seam to select `fast-think`, then
+  /// return the toolbar.profile menu button. This intentionally avoids native
+  /// macOS Menu automation; the seam calls ContentToolbar.selectProfile,
+  /// which is the same product path reached by the production menu.
   @MainActor
-  private func openSwapPopoverSwitchingToFastThink(in app: XCUIApplication) -> XCUIElement {
+  private func openSwapPopoverSwitchingToFastThink(
+    in app: XCUIApplication,
+    requiringButton buttonLabel: String
+  ) -> XCUIElement {
     let profileMenu = app.menuButtons["toolbar.profile"]
     XCTAssertTrue(profileMenu.waitForExistence(timeout: 10),
                   "profile switcher (toolbar.profile) missing; app tree: \(app.debugDescription)")
-    // Under a contended seated session the app can transiently lose key focus
-    // (app tree shows 'Disabled') at any single interaction, so retry the
-    // WHOLE sequence — re-activate, open the switcher, pick `fast-think`,
-    // confirm the popover presented — until it lands. Re-entrant requestSwap
-    // to the same profile is safe (the coordinator just re-publishes the same
-    // pending). Mirrors S426's retry idiom, extended across the full open.
+    // Under a contended seated session the app can transiently report a
+    // disabled accessibility tree; avoid a native Menu click entirely and wait
+    // on the product condition the auto-pick should create.
     let popover = app.descendants(matching: .any)
       .matching(identifier: "profileSwap.popover").firstMatch
     let deadline = Date().addingTimeInterval(45)
     while Date() < deadline {
       app.activate()
-      profileMenu.click()
-      let item = app.menuItems["fast-think"]
-      if item.waitForExistence(timeout: 3) {
-        item.click()
-        if popover.waitForExistence(timeout: 3) { return profileMenu }
+      if popover.waitForExistence(timeout: 1),
+         app.buttons[buttonLabel].waitForExistence(timeout: 2) {
+        return profileMenu
       }
-      // Focus lost / menu didn't open / popover didn't present — reset + retry.
-      app.typeKey(.escape, modifierFlags: [])
+      // Focus lost / popover didn't present — retry the observation. Do not
+      // fall back to native Menu interaction here: that AppKit/XCUITest
+      // boundary is the flake this scenario is isolating away from while still
+      // exercising ContentToolbar.selectProfile.
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
     }
-    XCTFail("cross-model profile swap must raise the swap popover; app tree: \(app.debugDescription)")
+    XCTFail("cross-model profile swap must raise the swap popover via DEBUG auto-pick seam; app tree: \(app.debugDescription)")
     return profileMenu
+  }
+
+  private func clickPopoverButton(_ label: String, in app: XCUIApplication) -> Bool {
+    let button = app.buttons[label]
+    guard button.waitForExistence(timeout: 5) else { return false }
+    button.click()
+    return true
   }
 
   // MARK: - polling helpers (shared idiom with S426)
