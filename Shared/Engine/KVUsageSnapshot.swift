@@ -88,7 +88,8 @@ public enum KVUsageModelStatusParser {
 
   private static func uint64(_ value: Any, key: String) throws -> UInt64 {
     guard CFGetTypeID(value as CFTypeRef) == CFNumberGetTypeID(),
-          let number = value as? NSNumber else {
+          let number = value as? NSNumber,
+          !CFNumberIsFloatType(number) else {
       throw ParseError.invalidCounter(key: key)
     }
 

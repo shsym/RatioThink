@@ -43,6 +43,16 @@ final class KVUsageSnapshotTests: XCTestCase {
     XCTAssertTrue(snapshots.isEmpty, "incomplete rows must be omitted, not decoded as total=0")
   }
 
+  func test_parseModelStatus_missingUsedDoesNotFabricateZero() throws {
+    let json = #"{"default.kv_pages_total":256}"#
+    let snapshots = try KVUsageModelStatusParser.parse(
+      json,
+      observedAt: Date(timeIntervalSince1970: 31),
+      generation: 1
+    )
+    XCTAssertTrue(snapshots.isEmpty, "incomplete rows must be omitted, not decoded as used=0")
+  }
+
   func test_parseModelStatus_rejectsNegativeAndWrongTypeValues() {
     XCTAssertThrowsError(try KVUsageModelStatusParser.parse(
       #"{"default.kv_pages_used":-1,"default.kv_pages_total":256}"#,
@@ -51,6 +61,16 @@ final class KVUsageSnapshotTests: XCTestCase {
     ))
     XCTAssertThrowsError(try KVUsageModelStatusParser.parse(
       #"{"default.kv_pages_used":"1","default.kv_pages_total":256}"#,
+      observedAt: Date(),
+      generation: 1
+    ))
+    XCTAssertThrowsError(try KVUsageModelStatusParser.parse(
+      #"{"default.kv_pages_used":1.0,"default.kv_pages_total":256}"#,
+      observedAt: Date(),
+      generation: 1
+    ))
+    XCTAssertThrowsError(try KVUsageModelStatusParser.parse(
+      #"{"default.kv_pages_used":1e0,"default.kv_pages_total":256}"#,
       observedAt: Date(),
       generation: 1
     ))
