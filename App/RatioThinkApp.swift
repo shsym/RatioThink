@@ -445,6 +445,14 @@ struct RatioThinkApp: App {
           Task { await DiagnosticsCollector.collectAndReveal() }
         }
       }
+      #if DEBUG
+      CommandMenu("Debug") {
+        Button("Reset Onboarding State") {
+          appPreferences.resetFirstLaunchWizard()
+        }
+        .keyboardShortcut("r", modifiers: [.command, .control, .option])
+      }
+      #endif
     }
 
     Settings {
