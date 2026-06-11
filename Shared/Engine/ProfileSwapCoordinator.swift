@@ -22,7 +22,12 @@ import os
 ///      There is no model to REPLACE, so a swap-confirm "swap from — to X"
 ///      is meaningless. The model loads later through the normal start gate.
 ///   2. New profile's default == the chat's current model → swap silently.
-///   3. Otherwise (new profile's default differs from the current model)
+///   3. Explicit-model mode (`preserveExplicitModelSelection == true`) and
+///      the new profile's default differs → swap silently, pinning the current
+///      concrete model and firing no load. This is the default product mode:
+///      a user-picked model stays picked across profile changes.
+///   4. Otherwise (compatibility/follow-default mode: new profile's default
+///      differs from the current model)
 ///      → publish a `PendingSwap` so the toolbar can present
 ///      `ProfileSwapPopover`. The popover calls `confirm(token:setAsDefault:)`
 ///      (switch + pin the new model) or `cancel(token:)` (keep the current
@@ -252,9 +257,16 @@ public final class ProfileSwapCoordinator: ObservableObject {
   /// single authority it needs no separate `setOverride`: the coordinator
   /// builds it from the same `commit`, pinning `fromModel` (the current
   /// model) instead of the new default, which writes `Chat.modelID`.
+  /// `preserveExplicitModelSelection` is the non-popover version of the same
+  /// keep-current outcome for default explicit-model mode: the caller already
+  /// knows `fromModel` came from an explicit concrete row (`Chat.modelID`),
+  /// so a profile change should keep that row rather than prompt for the
+  /// destination default. Passing `false` preserves the compatibility/follow-
+  /// default prompt path.
   public func requestSwap(
     toProfileID: String,
     fromModel: String?,
+    preserveExplicitModelSelection: Bool = false,
     commit: @escaping SwapCommit
   ) {
     if let prior = pendingState {
@@ -295,6 +307,12 @@ public final class ProfileSwapCoordinator: ObservableObject {
       Self.log.debug("swap silent (same model) profile=\(toProfileID, privacy: .public) model=\(to, privacy: .public)")
       pendingState = nil
       _ = commit(toProfileID, nil)  // silent path fires no load — result irrelevant
+      return
+    }
+    if preserveExplicitModelSelection {
+      Self.log.debug("swap silent (explicit model selection preserved) profile=\(toProfileID, privacy: .public) keep=\(fromModel, privacy: .public)")
+      pendingState = nil
+      _ = commit(toProfileID, fromModel)  // pin current explicit model; silent path fires no load
       return
     }
     let token = UUID()

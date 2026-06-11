@@ -119,6 +119,7 @@ struct RatioThinkApp: App {
       return port
     }()
     if let pinnedRunningPort {
+      let servedModelID = ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_SERVED_MODEL"] ?? ""
       // Inject a stub XPC client (NOT HelperXPCClient): the helperless
       // harness has no Helper, so a real stopEngine() during Unload would
       // throw and ChatScaffoldView.unloadModel would never reach
@@ -126,8 +127,11 @@ struct RatioThinkApp: App {
       // the pinned running status and accepts stopEngine as a no-op so
       // the Unload confirm path completes to .idle (#359 Path2).
       statusStore = EngineStatusStore(
-        client: PinnedRunningXPCClient(port: pinnedRunningPort),
-        initialStatus: .running(EngineSessionSnapshot(port: pinnedRunningPort, profileID: "chat"))
+        client: PinnedRunningXPCClient(port: pinnedRunningPort,
+                                       servedModelID: servedModelID),
+        initialStatus: .running(EngineSessionSnapshot(port: pinnedRunningPort,
+                                                      profileID: "chat",
+                                                      servedModelID: servedModelID))
       )
     } else if let startToRunningPort {
       statusStore = EngineStatusStore(
@@ -342,6 +346,9 @@ struct RatioThinkApp: App {
     }
     if env["PIE_TEST_FIRST_LAUNCH_COMPLETED"] == "1" {
       defaults.set(true, forKey: AppPreferences.firstLaunchWizardCompletedKey)
+    }
+    if env["PIE_TEST_FOLLOW_PROFILE_DEFAULT_MODEL"] == "1" {
+      defaults.set(true, forKey: AppPreferences.followProfileDefaultModelKey)
     }
     return defaults
   }
@@ -583,16 +590,44 @@ struct RatioThinkApp: App {
 /// reports the pinned `.running` status and treats `stopEngine()` as a
 /// no-op success, so the Unload confirm path completes to `.idle`. DEBUG
 /// only — compiled out of Release alongside the pin itself.
-private struct PinnedRunningXPCClient: AppXPCClient {
-  let port: EnginePort
+private final class PinnedRunningXPCClient: AppXPCClient, @unchecked Sendable {
+  private let port: EnginePort
+  private let lock = NSLock()
+  private var servedModelID: String
+
+  init(port: EnginePort, servedModelID: String) {
+    self.port = port
+    self.servedModelID = servedModelID
+  }
+
   func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
-  func engineStatus() async throws -> EngineStatus { .running(EngineSessionSnapshot(port: port, profileID: "chat")) }
+  func engineStatus() async throws -> EngineStatus {
+    lock.lock()
+    let model = servedModelID
+    lock.unlock()
+    return .running(EngineSessionSnapshot(port: port,
+                                          profileID: "chat",
+                                          servedModelID: model))
+  }
+
   func stopEngine() async throws {}
   // The pinned harness has no Helper to launch an engine; the engine is
   // already pinned `.running`, so a start is a no-op success (mirrors
   // `stopEngine`).
-  func startEngine(profileID: String, modelOverride: String?) async throws {}
-  func restartEngine(profileID: String, modelOverride: String?) async throws {}
+  func startEngine(profileID: String, modelOverride: String?) async throws {
+    updateServedModel(modelOverride)
+  }
+
+  func restartEngine(profileID: String, modelOverride: String?) async throws {
+    updateServedModel(modelOverride)
+  }
+
+  private func updateServedModel(_ modelOverride: String?) {
+    guard let modelOverride, !modelOverride.isEmpty else { return }
+    lock.lock()
+    servedModelID = modelOverride
+    lock.unlock()
+  }
 }
 
 /// #381: helperless `AppXPCClient` whose engine starts `.stopped` and flips to
