@@ -45,8 +45,14 @@ final class S520_MultiPartContentGUITests: XCTestCase {
     XCTAssertEqual(obj["object"] as? String, "chat.completion")
     let choices = try XCTUnwrap(obj["choices"] as? [[String: Any]])
     let message = try XCTUnwrap(choices.first?["message"] as? [String: Any])
-    let content = try XCTUnwrap(message["content"] as? String)
-    XCTAssertFalse(content.isEmpty, "multi-part request produced an empty assistant message")
+    // The seeded Qwen3-0.6B is a *thinking* model: within a small token
+    // budget the whole answer can land in `reasoning_content` with empty
+    // final `content` (same convention as the wrapper script's semantic
+    // gate). Either channel being non-empty proves real generation.
+    let content = (message["content"] as? String) ?? ""
+    let reasoning = (message["reasoning_content"] as? String) ?? ""
+    XCTAssertFalse(content.isEmpty && reasoning.isEmpty,
+                   "multi-part request produced no assistant text in content or reasoning_content: \(message)")
 
     // 2) External client, stream, multi-part array content -> SSE with a
     //    terminal [DONE].
