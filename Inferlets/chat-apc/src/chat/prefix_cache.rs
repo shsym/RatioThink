@@ -291,6 +291,7 @@ impl RetentionRegistry {
         }
     }
 
+    #[cfg(test)]
     pub fn contains(&self, name: &str) -> bool {
         self.records.contains_key(name)
     }
