@@ -89,4 +89,19 @@ final class MessageCopyPlanTests: XCTestCase {
     XCTAssertEqual(
       MessageCopyPlan.plan(for: item).items[0].text, "partial answer, now longer")
   }
+
+  func test_generationPerformanceMetadata_isNeverIncludedInCopyAnswer() {
+    let item = ChatMessageItem(
+      role: .assistant,
+      content: "visible answer",
+      finishReason: "stop",
+      generationPerformance: GenerationMetrics(outputTokens: 21, elapsedSeconds: 0.5, tokensPerSecond: 42.0)
+    )
+
+    let plan = MessageCopyPlan.plan(for: item)
+
+    XCTAssertEqual(plan.items.map(\.label), ["Copy Answer"])
+    XCTAssertEqual(plan.items[0].text, "visible answer")
+    XCTAssertFalse(plan.items[0].text.contains("tok/s"))
+  }
 }

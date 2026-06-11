@@ -21,6 +21,7 @@ final class XPCProtocolTests: XCTestCase {
     let expected = [
       "helperProtocolVersionWithReply:",
       "engineStatusWithReply:",
+      "kvUsageWithReply:",
       "startEngineWithProfileID:modelOverride:reply:",
       "restartEngineWithProfileID:modelOverride:reply:",
       "stopEngineWithReply:",
@@ -244,6 +245,26 @@ final class XPCProtocolTests: XCTestCase {
       }
       XCTAssertEqual(ee.code, .wireContractViolation)
     }
+  }
+
+  func test_kvUsage_reply_success_encodes_snapshots_only() throws {
+    let snapshots = [KVUsageSnapshot(
+      modelID: "default",
+      pagesUsed: 1,
+      pagesTotal: 256,
+      observedAt: Date(timeIntervalSince1970: 5),
+      generation: 1,
+      source: .pieModelStatus
+    )]
+    var captured: (Data?, Data?)?
+    PieHelperXPCWire.replyKVUsage(.success(snapshots)) { captured = ($0, $1) }
+    let tuple = try XCTUnwrap(captured)
+    XCTAssertNotNil(tuple.0)
+    XCTAssertNil(tuple.1)
+    XCTAssertEqual(
+      try PieHelperXPCWire.decodeKVUsageReply(successData: tuple.0, errorData: tuple.1).get(),
+      snapshots
+    )
   }
 
   // MARK: - tailLog wire convention
@@ -553,14 +574,16 @@ final class XPCProtocolTests: XCTestCase {
     func restartEngine(profileID: String, modelOverride: String?) async throws {}
   }
 
-  func test_currentVersion_bumped_for_snapshot_wire() {
+  func test_currentVersion_bumped_for_kvUsage_selector() {
     // #476 changed the `EngineStatus.running` + start/restart reply BYTES to
     // carry an `EngineSessionSnapshot` (selector signatures unchanged). A stale
     // v4 helper would answer with old-shape bytes that fail the App's snapshot
-    // decode, so the repair gate must fire — which requires this bump. Pin the
-    // version so a future wire/selector change fails here until it is bumped.
-    XCTAssertEqual(HelperProtocolCompatibility.currentVersion, 5,
-                   "bump currentVersion whenever a REQUIRED PieHelperXPC selector is added OR the reply/status wire BYTES change (#476)")
+    // decode, so the repair gate must fire. #517 then added the required
+    // `kvUsageWithReply:` selector, so stale v5 helpers must also be repaired
+    // before the App calls the selector. Pin the version so a future
+    // wire/selector change fails here until it is bumped.
+    XCTAssertEqual(HelperProtocolCompatibility.currentVersion, 6,
+                   "bump currentVersion whenever a REQUIRED PieHelperXPC selector is added OR reply/status wire BYTES change")
   }
 
   func test_isCompatible_routes_stale_lower_version_helper_to_repair() async {

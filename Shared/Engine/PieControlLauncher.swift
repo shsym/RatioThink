@@ -1216,6 +1216,31 @@ public actor LaunchedSession {
     }
   }
 
+  public func modelStatusJSON() async throws -> String? {
+    guard process.isRunning else {
+      throw KVUsageRefreshError.modelStatusUnavailable(
+        reason: "engine process exited (status \(process.terminationStatus))"
+      )
+    }
+    guard let controlWSURL else {
+      throw KVUsageRefreshError.modelStatusUnavailable(reason: "engine control plane URL missing")
+    }
+    let config = URLSessionConfiguration.ephemeral
+    config.timeoutIntervalForRequest = Self.livenessProbeTimeout
+    config.timeoutIntervalForResource = Self.livenessProbeTimeout
+    let client = PieControlClient(url: controlWSURL, session: URLSession(configuration: config))
+    do {
+      try await client.connect()
+      try await client.authIdentify("pie-mac-kv-usage")
+      let json = try await client.query(subject: "model_status", record: "")
+      await client.close()
+      return json
+    } catch {
+      await client.close()
+      throw error
+    }
+  }
+
   /// Idempotent: SIGINT → wait(10s) → SIGKILL → wait(5s) → shm_unlink.
   /// Mirrors Python `_terminate_subprocess` + `_shm_unlink_quiet`.
   /// Signal/wait failures are still logged, but they are also returned so the

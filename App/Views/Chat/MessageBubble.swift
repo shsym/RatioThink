@@ -64,6 +64,10 @@ struct MessageBubble: View {
           if let text = message.notice.message {
             TurnNoticeRow(text: text, footnote: message.notice.isFootnote)
           }
+          if let text = message.generationPerformanceText {
+            GenerationPerformanceRow(text: text)
+              .reportMessageBubbleFrame(.generationPerformance(message.id))
+          }
           // Deterministic copy path (#515): right-click on selectable
           // MarkdownUI text surfaces AppKit's text menu, not our
           // `.contextMenu`, so the guaranteed affordance is this explicit
@@ -113,10 +117,51 @@ struct MessageBubble: View {
       .markdownImageProvider(BlockedImageProvider())
       .environment(\.openURL, SafeLinkOpenURLAction.action)
       .textSelection(.enabled)
+      .reportMessageBubbleFrame(.content(message.id))
       .padding(.horizontal, 12)
       .padding(.vertical, 8)
       .background(background, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
       .frame(maxWidth: .infinity, alignment: alignment == .trailing ? .trailing : .leading)
+  }
+}
+
+
+// MARK: - layout frame reporting
+
+/// Internal, no-op-unless-observed layout telemetry for app-unit geometry
+/// guards. The production transcript does not read this preference; tests use
+/// it to validate the real SwiftUI/AppKit-hosted `MessageBubble` tree instead
+/// of duplicating fragile headless layout math.
+enum MessageBubbleLayoutFrameID: Hashable {
+  case content(UUID)
+  case generationPerformance(UUID)
+}
+
+struct MessageBubbleLayoutFramePreferenceKey: PreferenceKey {
+  static var defaultValue: [MessageBubbleLayoutFrameID: CGRect] = [:]
+
+  static func reduce(
+    value: inout [MessageBubbleLayoutFrameID: CGRect],
+    nextValue: () -> [MessageBubbleLayoutFrameID: CGRect]
+  ) {
+    value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+  }
+}
+
+private struct MessageBubbleFrameReporter: View {
+  let id: MessageBubbleLayoutFrameID
+
+  var body: some View {
+    GeometryReader { proxy in
+      Color.clear.preference(key: MessageBubbleLayoutFramePreferenceKey.self,
+                             value: [id: proxy.frame(in: .global)])
+    }
+  }
+}
+
+private extension View {
+  func reportMessageBubbleFrame(_ id: MessageBubbleLayoutFrameID) -> some View {
+    background(MessageBubbleFrameReporter(id: id))
   }
 }
 
@@ -181,6 +226,18 @@ private struct TurnNoticeRow: View {
     .foregroundStyle(.secondary)
     .frame(maxWidth: .infinity, alignment: .leading)
     .accessibilityElement(children: .combine)
+  }
+}
+
+private struct GenerationPerformanceRow: View {
+  let text: String
+
+  var body: some View {
+    Text(text)
+      .font(.caption2)
+      .foregroundStyle(.secondary)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .accessibilityIdentifier("message.generationPerformance")
   }
 }
 

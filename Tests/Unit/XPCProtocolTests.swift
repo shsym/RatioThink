@@ -21,6 +21,7 @@ final class XPCProtocolTests: XCTestCase {
     let expected = [
       "helperProtocolVersionWithReply:",
       "engineStatusWithReply:",
+      "kvUsageWithReply:",
       "startEngineWithProfileID:modelOverride:reply:",
       "restartEngineWithProfileID:modelOverride:reply:",
       "stopEngineWithReply:",
@@ -208,6 +209,26 @@ final class XPCProtocolTests: XCTestCase {
       }
       XCTAssertEqual(ee.code, .wireContractViolation)
     }
+  }
+
+  func test_kvUsage_reply_success_encodes_snapshots_only() throws {
+    let snapshots = [KVUsageSnapshot(
+      modelID: "default",
+      pagesUsed: 1,
+      pagesTotal: 256,
+      observedAt: Date(timeIntervalSince1970: 5),
+      generation: 1,
+      source: .pieModelStatus
+    )]
+    var captured: (Data?, Data?)?
+    PieHelperXPCWire.replyKVUsage(.success(snapshots)) { captured = ($0, $1) }
+    let tuple = try XCTUnwrap(captured)
+    XCTAssertNotNil(tuple.0)
+    XCTAssertNil(tuple.1)
+    XCTAssertEqual(
+      try PieHelperXPCWire.decodeKVUsageReply(successData: tuple.0, errorData: tuple.1).get(),
+      snapshots
+    )
   }
 
   // MARK: - tailLog wire convention
