@@ -33,6 +33,16 @@ final class KVUsageSnapshotTests: XCTestCase {
     XCTAssertEqual(snapshots.first?.pagesTotal, 1024)
   }
 
+  func test_parseModelStatus_sortsSnapshotsByModelID() throws {
+    let json = #"{"zeta.kv_pages_used":9,"zeta.kv_pages_total":90,"alpha.kv_pages_used":1,"alpha.kv_pages_total":10}"#
+    let snapshots = try KVUsageModelStatusParser.parse(
+      json,
+      observedAt: Date(timeIntervalSince1970: 25),
+      generation: 3
+    )
+    XCTAssertEqual(snapshots.map(\.modelID), ["alpha", "zeta"])
+  }
+
   func test_parseModelStatus_missingTotalDoesNotFabricateZero() throws {
     let json = #"{"default.kv_pages_used":5}"#
     let snapshots = try KVUsageModelStatusParser.parse(
