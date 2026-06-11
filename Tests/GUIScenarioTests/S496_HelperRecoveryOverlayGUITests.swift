@@ -141,6 +141,40 @@ final class S496_HelperRecoveryOverlayGUITests: XCTestCase {
     XCTAssertFalse(app.buttons["helperRecovery.restart"].exists,
                    "a running engine must not be covered by the helper overlay; app tree: \(app.debugDescription)")
   }
+
+  // MARK: - the chatBypassesHelper gate: a helper-independent chat is never covered
+
+  @MainActor
+  func test_chat_bypassing_helper_is_not_covered_by_overlay() async throws {
+    // The exact regression this gate input fixes: a BARE test base URL (the
+    // chat client is hardwired and never routes through the Helper) with the
+    // helper pinned unreachable and the engine NOT pinned running — so neither
+    // of the other two hiding rules can fire (helper is `.unreachable`, and
+    // with the health pin set the status poll loop is skipped, freezing the
+    // engine mirror at its non-running `.starting` placeholder). Bypass is
+    // therefore the SOLE hiding cause; the positive control
+    // (test_unreachable_…) proves the overlay WOULD appear without the base
+    // URL. Pins the end-to-end wiring (RatioThinkApp → EngineClientStore →
+    // ChatScaffoldView → gate): dropping the `chatBypassesHelper:` argument at
+    // either construction or evaluate is absorbed by the `= false` defaults
+    // with no compile error, and only this case would catch it.
+    let app = launch(
+      pinHelperHealth: "unreachable",
+      extraEnv: ["PIE_TEST_ENGINE_BASE_URL": "http://127.0.0.1:9999"]
+    )
+    defer { app.terminate() }
+
+    // The chat body (composer) must be present and uncovered.
+    let composer = app.descendants(matching: .any)
+      .matching(identifier: "composer.text").firstMatch
+    XCTAssertTrue(composer.waitForExistence(timeout: 8),
+                  "helper-independent chat body must render; app tree: \(app.debugDescription)")
+    // And the helper OVERLAY must NOT be up — keyed on the overlay-unique
+    // Restart button (the app-wide status banner may still note the helper;
+    // different surface, different id).
+    XCTAssertFalse(app.buttons["helperRecovery.restart"].exists,
+                   "a helper-independent chat must not be covered by the helper overlay; app tree: \(app.debugDescription)")
+  }
 }
 
 /// Poll-based wait for an element to LEAVE the tree (XCUIElement has no

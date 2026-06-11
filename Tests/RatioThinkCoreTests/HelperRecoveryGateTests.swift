@@ -106,6 +106,13 @@ final class HelperRecoveryGateTests: XCTestCase {
       HelperRecoveryGate.evaluate(helper: .unreachable, engineRunning: false),
       HelperRecoveryGate.evaluate(helper: .unreachable, engineRunning: false, chatBypassesHelper: false)
     )
+    // Positive control: the equality above would also hold if the gate
+    // regressed to unconditional `.hidden` — pin that the non-bypass path
+    // actually escalates, so this test cannot pass vacuously.
+    XCTAssertNotEqual(
+      HelperRecoveryGate.evaluate(helper: .unreachable, engineRunning: false, chatBypassesHelper: false),
+      .hidden
+    )
   }
 
   // MARK: - copy: helper-framed, never engine-framed (#496 core fix)
