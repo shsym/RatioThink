@@ -38,7 +38,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     let pieHome = try XCTUnwrap(
       config["PIE_TEST_GUI_HOME"],
       "\(Self.configPath) must define PIE_TEST_GUI_HOME")
-    let model = config["PIE_TEST_CHAT_MODEL"] ?? "Qwen/Qwen3-0.6B"
+    let model = config["PIE_TEST_CHAT_MODEL_PIN"] ?? "Qwen/Qwen3-0.6B"
 
     // The seeded Fast Think profile uses the SAME default model as Chat, so
     // selecting it is a same-model swap. Pinning `.running` (S302 seam) lets
@@ -138,7 +138,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = model
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = model
     // Pin `.running` so the model reconcile resolves the resident model and
     // the same-model Fast Think swap is silent (S302 DEBUG seam; the GUI
     // suite runs the Debug build).

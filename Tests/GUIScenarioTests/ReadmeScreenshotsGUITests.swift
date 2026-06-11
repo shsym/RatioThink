@@ -5,9 +5,9 @@ import XCTest
 ///
 /// The app is pointed at `Scripts/readme-screenshot-harness.py` (a mock pie
 /// engine, no real engine / no model download) via `PIE_TEST_ENGINE_BASE_URL`,
-/// and `PIE_TEST_CHAT_MODEL` satisfies the composer send-gate
-/// (`ChatScaffoldView.currentModelID()`), so a sent prompt streams a canned
-/// assistant reply. Models tab is populated by dummy `.gguf` files the wrapper
+/// and the composer send-gate is satisfied for real — `PIE_TEST_CHAT_MODEL_PIN`
+/// pins `Chat.modelID` and `PIE_TEST_PIN_ENGINE_RUNNING` reports the engine
+/// `.running` — so a sent prompt streams a canned assistant reply. Models tab is populated by dummy `.gguf` files the wrapper
 /// drops in `$PIE_HOME/models`. Each test attaches one window screenshot
 /// (`.keepAlways`); `Scripts/capture-readme-screenshots.sh` exports them from
 /// the `.xcresult` into `docs/assets/`.
@@ -107,7 +107,7 @@ final class ReadmeScreenshotsGUITests: XCTestCase {
 
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5), "composer.send missing")
-    XCTAssertTrue(send.isEnabled, "composer.send disabled (PIE_TEST_CHAT_MODEL not honored?)")
+    XCTAssertTrue(send.isEnabled, "composer.send disabled (model pin / running-engine seam not honored?)")
     send.click()
   }
 
@@ -130,7 +130,10 @@ final class ReadmeScreenshotsGUITests: XCTestCase {
     if let baseURL = cfg["PIE_TEST_ENGINE_BASE_URL"] {
       app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
     }
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = cfg["PIE_TEST_CHAT_MODEL"] ?? "Qwen3-8B-Instruct"
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = cfg["PIE_TEST_CHAT_MODEL_PIN"] ?? "Qwen3-8B-Instruct"
+    // #504: pin the engine `.running` so the composer send-gate is enabled for
+    // real (the `PIE_TEST_CHAT_MODEL` bypass is gone).
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     configureCompletedFirstLaunch(
       app, suiteName: stablePreferenceSuiteName(cfg["PIE_TEST_GUI_HOME"] ?? "readme"))
     return app

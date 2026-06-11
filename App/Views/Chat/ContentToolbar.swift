@@ -227,7 +227,18 @@ struct ContentToolbar: View {
   /// This is the single value the swap policy treats as "the current
   /// model", so it stays correct whether the model is loaded or loading.
   private var effectiveModelID: String? {
-    selectedModelID ?? profileDefaultModel
+    Self.effectiveModelID(selectedModelID: selectedModelID,
+                          profileDefaultModel: profileDefaultModel)
+  }
+
+  /// Pure pin-over-default derivation, routed through the one resolver
+  /// (`ModelTarget.resolve`) so the swap policy's "current model" can never
+  /// disagree with the gate/send/label derivation. Static so the precedence
+  /// is unit-tested without a view host (mirrors `modelLabel`).
+  static func effectiveModelID(selectedModelID: String?,
+                               profileDefaultModel: String?) -> String? {
+    ModelTarget.resolve(selectedModelID: selectedModelID,
+                        profileDefault: profileDefaultModel)?.modelID
   }
 
   private var modelMenu: some View {
@@ -324,8 +335,13 @@ struct ContentToolbar: View {
   /// `modelMenuTitle` (built from `currentModelSummary`); this pure helper
   /// pins the leaf-derivation contract that the summary relies on.
   static func modelLabel(selectedModelID: String?, profileDefaultModel: String?) -> String {
-    if let selectedModelID, !selectedModelID.isEmpty { return ModelDisplayName.leaf(selectedModelID) }
-    if let profileDefaultModel, !profileDefaultModel.isEmpty { return ModelDisplayName.leaf(profileDefaultModel) }
+    // Pin-over-default precedence via the one resolver, so the collapsed
+    // label names the same model the gate/send paths resolve. The nil tail
+    // (nothing pinned or defaulted) keeps the generic "Profile default" text.
+    if let target = ModelTarget.resolve(selectedModelID: selectedModelID,
+                                        profileDefault: profileDefaultModel) {
+      return ModelDisplayName.leaf(target.modelID)
+    }
     return "Profile default"
   }
 

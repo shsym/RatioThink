@@ -165,7 +165,7 @@ xcrun swift run api-probe
 cat >"$CHAT_CONFIG" <<EOF
 PIE_TEST_ENGINE_BASE_URL=$BASE_URL
 PIE_TEST_GUI_HOME=$GUI_HOME
-PIE_TEST_CHAT_MODEL=$REPO/$FILE
+PIE_TEST_CHAT_MODEL_PIN=$REPO/$FILE
 EOF
 
 echo "full e2e: PHASE B — chat send/persist against the acquired model"

@@ -62,6 +62,14 @@ public enum ToolbarModelOptions {
     }
   }
 
+  /// Three-tier `override → resident → default` precedence, NOT the
+  /// pin-over-default pair (`ModelTarget.resolve`). The middle RESIDENT tier
+  /// — the model the engine is actually serving — has no analogue in
+  /// `ModelTarget` (which models pick → default → nil) and is what keeps the
+  /// collapsed toolbar honest about what is loaded right now. Folding this
+  /// into `resolve` would drop the resident tier and change what the toolbar
+  /// shows, so it is intentionally a separate derivation. Only the
+  /// profile-default tail carries the "Profile default" annotation.
   public static func currentSummary(modelOverride: String?,
                                     residentModelID: String?,
                                     profileDefaultModelID: String?) -> CurrentSummary? {

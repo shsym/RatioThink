@@ -112,7 +112,7 @@ start_harness() {
   cat >"$CONFIG_FILE" <<EOF
 PIE_TEST_ENGINE_BASE_URL=$base_url
 PIE_TEST_GUI_HOME=$gui_home
-PIE_TEST_CHAT_MODEL=$MODEL
+PIE_TEST_CHAT_MODEL_PIN=$MODEL
 EOF
   echo "stream-cancel gui e2e: engine=$base_url gui PIE_HOME=$gui_home"
 }

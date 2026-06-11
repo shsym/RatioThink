@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-MODEL="${PIE_TEST_CHAT_MODEL:-resume-deterministic}"
+MODEL="${PIE_TEST_CHAT_MODEL_PIN:-resume-deterministic}"
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p275-history-$$}"
 GUI_HOME="$RUN_ROOT/g"
 URL_FILE="$RUN_ROOT/harness.url"
@@ -65,7 +65,7 @@ BASE_URL="$(cat "$URL_FILE")"
 cat >"$CONFIG_FILE" <<EOF
 PIE_TEST_ENGINE_BASE_URL=$BASE_URL
 PIE_TEST_GUI_HOME=$GUI_HOME
-PIE_TEST_CHAT_MODEL=$MODEL
+PIE_TEST_CHAT_MODEL_PIN=$MODEL
 PIE_TEST_REQUEST_LOG=$REQUEST_LOG
 EOF
 

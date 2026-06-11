@@ -29,9 +29,10 @@ surface must consume these — never re-derive its own.
   `chat.modelID ?? profile default`), so what the prompt names IS what
   the tap boots.
 - **Servable send model**: `ChatScaffoldView.requestModelID` =
-  `PIE_TEST_CHAT_MODEL`, else (engine `.running` only) pin ?? profile
-  default (#460). Selection intent is not servability: with the engine
-  stopped/failed the gate raises instead of letting a send die at HTTP.
+  `PIE_TEST_CHAT_MODEL`, else (engine `.running` only) `ModelTarget.resolve`
+  (pin, else profile default; #460). Selection intent is not servability:
+  with the engine stopped/failed the gate raises instead of letting a send
+  die at HTTP.
 - **Blocked-send prompt state**: `ChatStartGate.evaluate` (pure reducer)
   → ready / busy / needsLoad(target) / noDefault / engineFailed /
   helperUnreachable / configBroken.
@@ -64,13 +65,18 @@ surface must consume these — never re-derive its own.
 1. No blocked-send prompt surface (gate state, prompt copy/chip,
    availability action, missing-model banner keying, launch ask) reads
    `Profile.model` directly — only through `ModelTarget`
-   (`ChatScaffoldView.gateTarget`). `selectedProfileDefault` has other
-   documented consumers outside the prompt domain: the toolbar current
+   (`ChatScaffoldView.gateTarget`). Outside the prompt domain, every
+   pin-over-default derivation likewise routes through
+   `ModelTarget.resolve`: the servable-send model (`requestModelID`), the
+   swap policy's current model (`ContentToolbar.effectiveModelID`), and the
+   collapsed model label (`ContentToolbar.modelLabel`). Two consumers of
+   `selectedProfileDefault` stay deliberately NOT `ModelTarget` because the
+   rule differs and folding them would change behavior: the toolbar current
    summary + option list (`toolbarCurrentModelSummary` /
-   `toolbarModelOptions`), the swap policy's `effectiveModelID`
-   (`ContentToolbar`), the servable-send derivation (`requestModelID`),
-   and the residency seed (`seededModelID`). Each of those is its own
-   single derivation listed above — what is banned is a prompt surface
+   `toolbarModelOptions`) is `override -> resident -> default` (the live
+   resident tier has no `ModelTarget` analogue), and the residency seed
+   (`seededModelID`) is a seed-guard (unpinned AND served == default), not a
+   pin-over-default pick — what is banned is a prompt surface
    re-deriving pin-vs-default on its own.
 2. A pinned selection is never described or actioned as the profile
    default: the gate carries `needsLoad(target)` with

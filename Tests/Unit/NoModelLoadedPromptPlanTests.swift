@@ -18,9 +18,13 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
   private let unavailableAction = MissingModelRecovery.promptAction(
     profileDefaultModel: nil, isInstalled: false)
 
+  /// Defaults to `willAutoSend: true` — the blocked-send path, where the
+  /// "…to send your message" promise copy is the expected rendering. #516
+  /// tests pass false explicitly to assert the neutral (launch-prompt) copy.
   private func plan(_ state: ChatStartGate.State,
-                    _ action: MissingModelRecovery.PromptAction) -> NoModelLoadedPrompt.Plan {
-    NoModelLoadedPrompt.plan(state: state, action: action)
+                    _ action: MissingModelRecovery.PromptAction,
+                    willAutoSend: Bool = true) -> NoModelLoadedPrompt.Plan {
+    NoModelLoadedPrompt.plan(state: state, action: action, willAutoSend: willAutoSend)
   }
 
   func test_action_fixtures_are_what_we_expect() {
@@ -449,5 +453,57 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
       actionError: nil,
       statusDetail: "status detail",
       hasDownloadTarget: staleAxisTarget))
+  }
+
+  // MARK: - #516: the "…to send your message" promise tracks willAutoSend
+
+  /// The copy guard the ticket requires: every "your message will send" /
+  /// "…to send your message" line renders ONLY when a pending auto-send is
+  /// armed to keep that promise. The same sheet raised with an empty
+  /// composer (the launch-time engine-start prompt) must stay neutral.
+  func test_516_promise_copy_only_when_auto_send_armed() {
+    // busy spinner detail.
+    let armed = plan(.busy(.startingEngine), loadAction, willAutoSend: true)
+    XCTAssertEqual(armed.detail, "Your model is loading — your message will send once it's ready.")
+    let unarmed = plan(.busy(.startingEngine), loadAction, willAutoSend: false)
+    XCTAssertEqual(unarmed.detail, "Your model is loading.")
+
+    // load captions, both target sources.
+    let target = ModelTarget(modelID: ProfileStore.defaultChatModelID, source: .profileDefault)
+    XCTAssertEqual(plan(.needsLoad(target: target), loadAction, willAutoSend: false).loadCaption,
+                   "Load this profile's default model?")
+    let pinned = ModelTarget(modelID: ProfileStore.defaultChatModelID, source: .selected)
+    XCTAssertEqual(plan(.needsLoad(target: pinned), loadAction, willAutoSend: false).loadCaption,
+                   "Load your selected model?")
+
+    // download captions, both target sources.
+    XCTAssertEqual(plan(.needsLoad(target: target), downloadAction, willAutoSend: false).downloadCaption,
+                   "This profile's model isn't downloaded yet. Download it to use it here.")
+    XCTAssertEqual(plan(.needsLoad(target: pinned), downloadAction, willAutoSend: false).downloadCaption,
+                   "Your selected model isn't downloaded yet. Download it to use it here.")
+  }
+
+  /// Sweep guard: with `willAutoSend: false`, NO rendered string anywhere in
+  /// the plan may promise a send — across every state × action cell.
+  func test_516_no_state_promises_a_send_when_unarmed() {
+    let states: [ChatStartGate.State] = [
+      .busy(.startingEngine), .busy(.stoppingEngine),
+      .needsLoad(target: ModelTarget(modelID: ProfileStore.defaultChatModelID, source: .profileDefault)),
+      .needsLoad(target: ModelTarget(modelID: ProfileStore.defaultChatModelID, source: .selected)),
+      .noDefault,
+      .engineFailed(code: .modelMissing, reason: "x"),
+      .helperUnreachable(reason: "x"),
+      .configBroken(reason: "x"),
+    ]
+    for state in states {
+      for action in [loadAction, downloadAction, unavailableAction] {
+        let p = plan(state, action, willAutoSend: false)
+        let rendered = [p.headline, p.reason, p.detail, p.loadCaption,
+                        p.downloadCaption, p.unavailableCopy]
+          .compactMap { $0 }.joined(separator: " ").lowercased()
+        XCTAssertFalse(rendered.contains("will send") || rendered.contains("send your message"),
+                       "unarmed gate promises a send in \(state) × \(action): \(rendered)")
+      }
+    }
   }
 }

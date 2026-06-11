@@ -23,7 +23,7 @@ final class S204_ChatSendGUITests: XCTestCase {
                                 "\(Self.configPath) must define PIE_TEST_ENGINE_BASE_URL")
     let pieHome = try XCTUnwrap(config["PIE_TEST_GUI_HOME"],
                                 "\(Self.configPath) must define PIE_TEST_GUI_HOME")
-    let model = config["PIE_TEST_CHAT_MODEL"] ?? "default"
+    let model = config["PIE_TEST_CHAT_MODEL_PIN"] ?? "default"
 
     let prompt = "The capital of France is"
     let answer = "Paris"
@@ -67,7 +67,11 @@ final class S204_ChatSendGUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = model
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = model
+    // #504: pin the engine `.running` so the real send-gate passes (the
+    // `PIE_TEST_CHAT_MODEL` bypass is gone); the actual send still hits
+    // `PIE_TEST_ENGINE_BASE_URL`, whose port the pin is derived from.
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
   }
 
