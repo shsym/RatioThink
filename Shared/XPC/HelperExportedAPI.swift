@@ -295,11 +295,26 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
         PieHelperXPCWire.replyKVUsage(.success(snapshots), via: reply)
       } catch {
         PieHelperXPCWire.replyKVUsage(
-          .failure(EngineError(code: .engineGone, message: "KV usage refresh failed: \(error)")),
+          .failure(Self.classifyKVUsageError(error)),
           via: reply
         )
       }
     }
+  }
+
+  private static func classifyKVUsageError(_ error: any Error) -> EngineError {
+    let nsError = error as NSError
+    if error is KVUsageModelStatusParser.ParseError ||
+        error is DecodingError ||
+        (nsError.domain == NSCocoaErrorDomain &&
+         nsError.code == CocoaError.propertyListReadCorrupt.rawValue) {
+      return EngineError(
+        code: .wireContractViolation,
+        message: "KV usage model_status decode failed: \(error)"
+      )
+    }
+
+    return EngineError(code: .engineGone, message: "KV usage refresh failed: \(error)")
   }
 
   // MARK: - startEngine / stopEngine
