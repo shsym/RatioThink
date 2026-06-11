@@ -97,12 +97,12 @@ struct ChatListView: View {
         set: { if !$0 { renamingChatID = nil } }
       )
     ) {
+      // No accessibilityIdentifiers here: macOS alert accessories drop
+      // them, so GUI tests anchor on the field itself + button label.
       TextField("Title", text: $renameDraft)
-        .accessibilityIdentifier("chats.rename.field")
       Button("Rename") {
         commitRename()
       }
-      .accessibilityIdentifier("chats.rename.confirm")
       Button("Cancel", role: .cancel) {}
     }
   }

@@ -134,23 +134,41 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
     XCTAssertTrue(waitForNewChatRowCount(1, in: app),
                   "draft chat row missing; app tree: \(app.debugDescription)")
 
+    // Open the row context menu and pick Rename. The synthesized
+    // right-click can leave the menu half-presented or miss the item on a
+    // busy session (the S486 hazard) — reset with Escape and retry.
     let row = sidebarRow(titled: "New Chat", in: app)
     XCTAssertTrue(row.waitForExistence(timeout: 5))
-    row.rightClick()
-    let rename = app.menuItems["Rename"]
-    XCTAssertTrue(rename.waitForExistence(timeout: 5),
+    var openedRename = false
+    for _ in 0..<3 {
+      row.rightClick()
+      let rename = app.menuItems["Rename"]
+      if rename.waitForExistence(timeout: 3), rename.isHittable {
+        rename.click()
+        openedRename = true
+        break
+      }
+      app.typeKey(.escape, modifierFlags: [])
+    }
+    XCTAssertTrue(openedRename,
                   "Rename missing from row context menu; app tree: \(app.debugDescription)")
-    rename.click()
 
-    let field = app.textFields["chats.rename.field"]
+    // SwiftUI's macOS `.alert` drops accessibility identifiers from its
+    // accessory TextField and action buttons, so anchor on the alert's
+    // single text field and the action's visible "Rename" label (the
+    // context-menu item of the same name is a menuItem, not a button,
+    // and is gone once the alert is up).
+    let field = app.textFields.firstMatch
     XCTAssertTrue(field.waitForExistence(timeout: 5),
                   "rename field missing; app tree: \(app.debugDescription)")
     field.click()
     field.typeKey("a", modifierFlags: .command)
     field.typeText(customTitle)
-    let confirm = app.buttons["chats.rename.confirm"]
-    XCTAssertTrue(confirm.waitForExistence(timeout: 5))
-    confirm.click()
+    // Confirm with Return — the alert's default action. An unscoped
+    // buttons["Rename"] query matches a Touch Bar proxy element that
+    // XCUITest refuses to click ("cannot be called with Touch Bar
+    // elements"), so don't click the button at all.
+    app.typeKey(.return, modifierFlags: [])
 
     XCTAssertTrue(sidebarRow(titled: customTitle, in: app).waitForExistence(timeout: 5),
                   "renamed title not shown in sidebar; app tree: \(app.debugDescription)")
@@ -177,9 +195,11 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
     let prompt = "Plan a trip to Kyoto in autumn"
     let home = freshHome("title")
     let app = makeApp(pieHome: home)
-    // A model override lets the send gate pass without a Helper/engine;
-    // the closed port makes the stream fail AFTER the user turn commits.
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = "s512-deterministic"
+    // #504: pin the chat's model and the engine `.running` so the real
+    // send gate passes without a Helper/engine; the closed port makes the
+    // stream fail AFTER the user turn commits.
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = "s512-deterministic"
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
     // Pin helper health so the #496 recovery overlay never covers the
     // composer on this helper-less launch.
