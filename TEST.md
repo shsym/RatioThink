@@ -147,6 +147,20 @@ focused targets are `-only-testing` slices of it. A few suites have **no**
 focused target and run only in the full matrix: `S326` (fresh-install
 download), `S327` (engine-status pip), `S360` (Models top-align).
 
+## Live CLI diagnostics
+
+### KV usage model_status diagnostic
+
+`KVUsageModelStatusLiveTests` is gated behind:
+
+- `PIE_TEST_REAL_PIE_BIN`
+- `PIE_TEST_REAL_CHATAPC_WASM`
+- `PIE_TEST_REAL_CHATAPC_MANIFEST`
+
+It launches dummy pie, queries the existing control-plane `model_status`
+endpoint, parses `kv_pages_used/total`, and confirms the App parser sees the
+runtime-reported totals.
+
 ### GUI temp-home cleanup
 
 A GUI suite that needs the non-sandboxed `Rational.app` to write a real
