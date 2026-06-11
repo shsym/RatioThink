@@ -34,7 +34,7 @@ final class S258_ComposerSendGUITests: XCTestCase {
     app.activate()
 
     try createChatAndSend(prompt, in: app)
-    guard waitForAtLeastTwoStaticTextsContaining(visibleAssistantEcho, in: app, timeout: 120) else {
+    guard waitForAssistantEchoStaticTexts(visibleAssistantEcho, in: app, timeout: 120) else {
       XCTFail("assistant response did not become visible through the GUI; app tree: \(app.debugDescription)")
       return
     }
@@ -49,8 +49,8 @@ final class S258_ComposerSendGUITests: XCTestCase {
               "Rational.app did not relaunch")
     relaunched.activate()
 
-    try selectPersistedChat(in: relaunched)
-    guard waitForAtLeastTwoStaticTextsContaining(visibleAssistantEcho, in: relaunched, timeout: 15) else {
+    selectPersistedChat(titled: prompt, in: relaunched)
+    guard waitForAssistantEchoStaticTexts(visibleAssistantEcho, in: relaunched, timeout: 15) else {
       XCTFail("assistant response was not visible after relaunch with PIE_HOME=\(pieHome); app tree: \(relaunched.debugDescription)")
       return
     }
@@ -92,20 +92,17 @@ final class S258_ComposerSendGUITests: XCTestCase {
     send.click()
   }
 
-  private func selectPersistedChat(in app: XCUIApplication) throws {
-    let chatTitle = app.staticTexts["New Chat"].firstMatch
-    XCTAssertTrue(chatTitle.waitForExistence(timeout: 10),
-                  "persisted chat row 'New Chat' missing after relaunch; app tree: \(app.debugDescription)")
-    chatTitle.click()
-  }
-
   /// MarkdownUI exposes the assistant answer to Accessibility as
-  /// separate/truncated static text runs (for example
-  /// `The capital of Fra...`), so this GUI assertion only proves
-  /// that a second assistant bubble became visible. The wrapper
-  /// script performs the semantic/persistence assertion directly
-  /// against the SwiftData SQLite store after the XCUITest returns.
-  private func waitForAtLeastTwoStaticTextsContaining(
+  /// separate/truncated static text runs (for example `The capital of
+  /// Fra...`); the wrapper script performs the semantic/persistence
+  /// assertion against the SwiftData SQLite store after the XCUITest
+  /// returns. The visibility bar here is THREE matching static texts:
+  /// two exist without any assistant output — the user bubble and (#512)
+  /// the sidebar row auto-titled from the same first message — so only
+  /// the third proves the assistant's echoed answer actually rendered.
+  /// At two this passed vacuously and the test terminated the app
+  /// mid-stream (the wrapper's sqlite check caught the empty assistant).
+  private func waitForAssistantEchoStaticTexts(
     _ needle: String,
     in app: XCUIApplication,
     timeout: TimeInterval
@@ -119,7 +116,7 @@ final class S258_ComposerSendGUITests: XCTestCase {
     while Date() < deadline {
       if app.descendants(matching: .staticText)
         .matching(predicate)
-        .count >= 2 {
+        .count >= 3 {
         return true
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))

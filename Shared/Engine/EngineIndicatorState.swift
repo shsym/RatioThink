@@ -90,6 +90,7 @@ public struct EngineIndicatorError: Equatable, Sendable {
     case engineGone     // engine died after a good launch
     case memoryRisk     // model too large for this Mac's safe limit
     case modelMissing   // engine has no such model
+    case modelUnsupported // selected model artifact/format is unsupported
   }
 
   public let kind: Kind
@@ -109,10 +110,11 @@ public struct EngineIndicatorError: Equatable, Sendable {
     let problem = EngineProblem(statusCode: code, rawMessage: message)
     let kind: Kind
     switch code {
-    case .memoryRisk:   kind = .memoryRisk
-    case .engineGone:   kind = .engineGone
-    case .modelMissing: kind = .modelMissing
-    default:            kind = .engineFailed
+    case .memoryRisk:       kind = .memoryRisk
+    case .engineGone:       kind = .engineGone
+    case .modelMissing:     kind = .modelMissing
+    case .modelUnsupported: kind = .modelUnsupported
+    default:                kind = .engineFailed
     }
     return EngineIndicatorError(kind: kind, title: problem.title, message: problem.message)
   }

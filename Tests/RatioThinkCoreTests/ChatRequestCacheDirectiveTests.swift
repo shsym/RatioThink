@@ -35,6 +35,32 @@ final class ChatRequestCacheDirectiveTests: XCTestCase {
     XCTAssertEqual(cache["policy"] as? String, "bypass")
   }
 
+  func test_retention_budget_rides_authoritative_kv_usage() throws {
+    let req = ChatRequest(
+      model: "m",
+      messages: [],
+      cache: ChatCacheDirective(
+        key: "c",
+        turn: 0,
+        retention: ChatCacheRetentionDirective(
+          kvPagesUsed: 90,
+          kvPagesTotal: 100,
+          softPercent: 70,
+          evictPercent: 80,
+          hardPercent: 95
+        )
+      )
+    )
+
+    let cache = try XCTUnwrap(try encodedKeys(req)["cache"] as? [String: Any])
+    let retention = try XCTUnwrap(cache["retention"] as? [String: Any])
+    XCTAssertEqual(retention["kv_pages_used"] as? Int, 90)
+    XCTAssertEqual(retention["kv_pages_total"] as? Int, 100)
+    XCTAssertEqual(retention["soft_percent"] as? Int, 70)
+    XCTAssertEqual(retention["evict_percent"] as? Int, 80)
+    XCTAssertEqual(retention["hard_percent"] as? Int, 95)
+  }
+
   func test_round_trips_cache() throws {
     let req = ChatRequest(model: "m", messages: [],
                           cache: ChatCacheDirective(key: "c", turn: 7, compat: "1", policy: "auto"))

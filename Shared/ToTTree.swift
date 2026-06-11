@@ -168,6 +168,12 @@ public struct ToTTree: Equatable, Sendable, Codable {
       }
       prunedLevels.insert(level)
 
+    case let .finalDelta(text):
+      // #523 Part A: accumulate the streamed synthesized answer live; the
+      // terminal `treeComplete` overwrites it with the authoritative full
+      // text (so a dropped/again-set value can't diverge).
+      self.finalAnswer = (self.finalAnswer ?? "") + text
+
     case let .treeComplete(selectedNodeID, finalAnswer):
       self.selectedNodeID = selectedNodeID
       self.finalAnswer = finalAnswer

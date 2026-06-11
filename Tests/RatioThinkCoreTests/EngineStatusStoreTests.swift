@@ -19,7 +19,9 @@ final class EngineStatusStoreTests: XCTestCase {
   final class StubXPCClient: AppXPCClient, @unchecked Sendable {
     private let lock = NSLock()
     private var queue: [Result<EngineStatus, Error>] = []
+    private var kvUsageQueue: [Result<[KVUsageSnapshot], Error>] = []
     private(set) var calls = 0
+    private(set) var kvUsageCalls = 0
 
     func helperProtocolVersion() async throws -> Int {
       HelperProtocolCompatibility.currentVersion
@@ -44,6 +46,21 @@ final class EngineStatusStoreTests: XCTestCase {
           ))
         }
         return queue.removeFirst()
+      }
+      return try result.get()
+    }
+
+    func setNextKVUsage(_ result: Result<[KVUsageSnapshot], Error>) {
+      lock.withLock { kvUsageQueue.append(result) }
+    }
+
+    func kvUsageSnapshots() async throws -> [KVUsageSnapshot] {
+      let result: Result<[KVUsageSnapshot], Error> = lock.withLock {
+        kvUsageCalls += 1
+        if kvUsageQueue.isEmpty {
+          return .success([])
+        }
+        return kvUsageQueue.removeFirst()
       }
       return try result.get()
     }
@@ -631,6 +648,42 @@ final class EngineStatusStoreTests: XCTestCase {
     // launcher diagnostic never reaches it.
     XCTAssertEqual(store.statusDetail, "The engine failed to start. Try restarting it.")
     XCTAssertFalse(store.statusDetail.contains("fork ENOENT"))
+  }
+
+  func test_kvUsageSnapshot_clears_after_running_usage_refresh_failure() async throws {
+    struct KVFailure: Error {}
+
+    let client = StubXPCClient()
+    let running = EngineStatus.running(EngineSessionSnapshot(port: 8080, profileID: "chat"))
+    client.setNext(running)
+    client.setNextKVUsage(.success([
+      KVUsageSnapshot(
+        modelID: "m",
+        pagesUsed: 90,
+        pagesTotal: 100,
+        observedAt: Date(timeIntervalSince1970: 1),
+        generation: 1,
+        source: .pieModelStatus
+      )
+    ]))
+    let store = EngineStatusStore(client: client, pollInterval: 10)
+    store.start()
+
+    try await waitUntil("initial KV usage refresh") { client.kvUsageCalls >= 1 }
+    store.stop()
+    XCTAssertNotNil(store.kvUsageSnapshot(for: "m"))
+
+    client.setNext(running)
+    client.setNextKVUsage(.failure(KVFailure()))
+    store.start()
+    defer { store.stop() }
+
+    try await waitUntil("second KV usage refresh") { client.kvUsageCalls >= 2 }
+
+    XCTAssertNil(
+      store.kvUsageSnapshot(for: "m"),
+      "failed KV refresh during a running poll must not leave stale counters available for cache.retention"
+    )
   }
 
   func test_memoryRisk_failed_status_surfaces_actionable_copy() async throws {

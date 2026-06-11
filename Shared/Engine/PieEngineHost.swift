@@ -171,6 +171,7 @@ public final class PieEngineHost: @unchecked Sendable {
     func shutdown(reason: String) async -> EngineShutdownResult
     func checkLiveness() async -> EngineLiveness
     func diagnosticProcessID() async -> pid_t?
+    func modelStatusJSON() async throws -> String?
     /// Resident memory of the live engine process in bytes, or nil when
     /// unavailable. Default nil (see extension) so test fakes that
     /// only model shutdown/liveness need no change; the production
@@ -386,6 +387,22 @@ public final class PieEngineHost: @unchecked Sendable {
     return await session.residentMemoryBytes()
   }
 
+  public func kvUsageSnapshots(now: @Sendable () -> Date = { Date() }) async throws -> [KVUsageSnapshot] {
+    let session: (any EngineSession)? = stateQueue.sync {
+      guard case .running(_, let session) = self._state else { return nil }
+      return session
+    }
+    guard let session else { return [] }
+    guard let json = try await session.modelStatusJSON() else {
+      throw KVUsageRefreshError.modelStatusUnavailable(reason: "running engine did not provide model_status")
+    }
+    let generation = kvUsageGeneration.withLock { value -> UInt64 in
+      value &+= 1
+      return value
+    }
+    return try KVUsageModelStatusParser.parse(json, observedAt: now(), generation: generation)
+  }
+
   /// Diagnostic-only observer count. Mirrors `PieSupervisor
   /// .observerCountForTesting` so the HelperStatusItem integration
   /// tests can pin "observers cleaned up on cancel".
@@ -570,6 +587,7 @@ public final class PieEngineHost: @unchecked Sendable {
     didSet { publish(_state.publicStatus) }
   }
   private let statusLock = OSAllocatedUnfairLock<EngineStatus>(initialState: .stopped)
+  private let kvUsageGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
   private let observers = OSAllocatedUnfairLock<[UUID: (EngineStatus) -> Void]>(initialState: [:])
 
   /// Post-launch liveness probe loop ( G1). Owned by `stateQueue`:
@@ -804,6 +822,14 @@ public final class PieEngineHost: @unchecked Sendable {
       }
     } catch {
       let msg = "\(error)"
+      let classification = EngineLoadFailureClassifier.classify(error)
+      let code: EngineErrorCode = classification == nil ? .spawnFailed : .modelUnsupported
+      let statusMessage = classification == nil
+        ? msg
+        : EngineLoadFailureClassifier.userFacingLoadFailureMessage(
+          modelID: Self.modelID(from: spec),
+          error: error
+        )
       Log.engine.error("PieEngineHost: launch failed: \(msg, privacy: .public)")
       let terminationEvidence = Self.terminationForLaunchError(error, guardrailBytes: guardrailBytes)
       let shutdownFailureMessage = Self.shutdownFailureMessage(from: error)
@@ -821,7 +847,7 @@ public final class PieEngineHost: @unchecked Sendable {
           if let shutdownFailureMessage {
             self.setState(.failed(.killRejected, shutdownFailureMessage))
           } else {
-            self.setState(.failed(.spawnFailed, msg))
+            self.setState(.failed(code, statusMessage))
           }
           if let (termination, tail) = terminationEvidence {
             self.emitTermination(termination, tail: tail)
@@ -852,6 +878,19 @@ public final class PieEngineHost: @unchecked Sendable {
           return
         }
       }
+    }
+  }
+
+  private static func modelID(from spec: LaunchSpec) -> String {
+    switch spec.modelConfig {
+    case .dummy:
+      return spec.profileID
+    case let .portable(modelSlug, _):
+      return modelSlug
+    case let .portableResolved(servedModelID, _):
+      return servedModelID
+    case let .metal(modelID):
+      return modelID
     }
   }
 
@@ -1298,6 +1337,8 @@ public extension PieEngineHost.EngineSession {
   /// Default: no process identity. Production sessions override this so
   /// lifecycle diagnostics can correlate liveness misses, exits, and relaunches.
   func diagnosticProcessID() async -> pid_t? { nil }
+  /// Default: no control-plane model status available.
+  func modelStatusJSON() async throws -> String? { nil }
   /// Default: memory unavailable. Only the production `LaunchedSession`
   /// samples real RSS; test fakes inherit nil.
   func residentMemoryBytes() async -> UInt64? { nil }

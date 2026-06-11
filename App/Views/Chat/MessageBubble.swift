@@ -23,6 +23,11 @@ import os
 /// the network until an explicit policy lands. Review v1 F3.
 struct MessageBubble: View {
   let message: ChatMessageItem
+  /// #513: retry-from-this-turn affordance, assistant rows only. Nil hides
+  /// the control — the scaffold passes nil while the chat is streaming
+  /// (retry waits for the active stream to end) and `TranscriptView` passes
+  /// nil for rows where no retained prefix exists to resend.
+  var onRetry: (() -> Void)? = nil
 
   var body: some View {
     switch message.role {
@@ -64,13 +69,33 @@ struct MessageBubble: View {
           if let text = message.notice.message {
             TurnNoticeRow(text: text, footnote: message.notice.isFootnote)
           }
-          // Deterministic copy path (#515): right-click on selectable
-          // MarkdownUI text surfaces AppKit's text menu, not our
-          // `.contextMenu`, so the guaranteed affordance is this explicit
-          // button. Copies the canonical answer source across every
-          // Markdown block — see `MessageCopyPlan`.
-          if !message.content.isEmpty {
-            CopyAnswerButton(text: message.content)
+          if let text = message.generationPerformanceText {
+            GenerationPerformanceRow(text: text)
+              .reportMessageBubbleFrame(.generationPerformance(message.id))
+          }
+          // One quiet chrome row under the turn: the deterministic copy
+          // path (#515 — right-click on selectable MarkdownUI text surfaces
+          // AppKit's text menu, not our `.contextMenu`, so the guaranteed
+          // affordance is this explicit button; see `MessageCopyPlan`) and
+          // the #513 retry control. Retry reads as turn chrome, not a
+          // primary action — the destructive part is guarded by the
+          // scaffold's confirmation when later conversation would be erased.
+          if !message.content.isEmpty || onRetry != nil {
+            HStack(spacing: 12) {
+              if !message.content.isEmpty {
+                CopyAnswerButton(text: message.content)
+              }
+              if let onRetry {
+                Button(action: onRetry) {
+                  Label("Retry", systemImage: "arrow.counterclockwise")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Retry from here — regenerates this response; any later conversation is erased after you confirm")
+                .accessibilityIdentifier("transcript.retry")
+              }
+            }
           }
         }
         Spacer(minLength: 60)
@@ -113,10 +138,51 @@ struct MessageBubble: View {
       .markdownImageProvider(BlockedImageProvider())
       .environment(\.openURL, SafeLinkOpenURLAction.action)
       .textSelection(.enabled)
+      .reportMessageBubbleFrame(.content(message.id))
       .padding(.horizontal, 12)
       .padding(.vertical, 8)
       .background(background, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
       .frame(maxWidth: .infinity, alignment: alignment == .trailing ? .trailing : .leading)
+  }
+}
+
+
+// MARK: - layout frame reporting
+
+/// Internal, no-op-unless-observed layout telemetry for app-unit geometry
+/// guards. The production transcript does not read this preference; tests use
+/// it to validate the real SwiftUI/AppKit-hosted `MessageBubble` tree instead
+/// of duplicating fragile headless layout math.
+enum MessageBubbleLayoutFrameID: Hashable {
+  case content(UUID)
+  case generationPerformance(UUID)
+}
+
+struct MessageBubbleLayoutFramePreferenceKey: PreferenceKey {
+  static var defaultValue: [MessageBubbleLayoutFrameID: CGRect] = [:]
+
+  static func reduce(
+    value: inout [MessageBubbleLayoutFrameID: CGRect],
+    nextValue: () -> [MessageBubbleLayoutFrameID: CGRect]
+  ) {
+    value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+  }
+}
+
+private struct MessageBubbleFrameReporter: View {
+  let id: MessageBubbleLayoutFrameID
+
+  var body: some View {
+    GeometryReader { proxy in
+      Color.clear.preference(key: MessageBubbleLayoutFramePreferenceKey.self,
+                             value: [id: proxy.frame(in: .global)])
+    }
+  }
+}
+
+private extension View {
+  func reportMessageBubbleFrame(_ id: MessageBubbleLayoutFrameID) -> some View {
+    background(MessageBubbleFrameReporter(id: id))
   }
 }
 
@@ -181,6 +247,18 @@ private struct TurnNoticeRow: View {
     .foregroundStyle(.secondary)
     .frame(maxWidth: .infinity, alignment: .leading)
     .accessibilityElement(children: .combine)
+  }
+}
+
+private struct GenerationPerformanceRow: View {
+  let text: String
+
+  var body: some View {
+    Text(text)
+      .font(.caption2)
+      .foregroundStyle(.secondary)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .accessibilityIdentifier("message.generationPerformance")
   }
 }
 

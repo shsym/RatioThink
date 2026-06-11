@@ -32,7 +32,7 @@ $(LOGDIR):
 # recipes below, which run in a non-sandboxed shell after xcodebuild exits
 # (every test app already dead). Add a suite's prefix here if it stages a real
 # /tmp home. See TEST.md "GUI temp-home cleanup".
-GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-* /tmp/pie-s326dl-* /tmp/pie-s326done-* /tmp/pie-s459swap-*
+GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-* /tmp/pie-s326dl-* /tmp/pie-s326done-* /tmp/pie-s459swap-* /tmp/pie-s512-*
 
 # Canned recipe: run a focused set of RatioThinkGUITests suites via xcodebuild
 # with the seated-session warning + the standard log-capture/PIPESTATUS guard
@@ -62,9 +62,9 @@ endef
 .PHONY: help genproject build build-static build-tests clean lint ci-pr check-vendor-pin local-pre-merge local-gui-gate local-e2e-gate release-gate \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
-        test-unit test-scenario test-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
-        test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-load-default test-gui test-ssh test-all \
-        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
+        test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-readme-harness test-e2e-http \
+        test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
+        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-e2e-harsh-load test-e2e-cache-real \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
@@ -97,7 +97,7 @@ local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e
 
 local-gui-gate: test-gui-script test-gui ## Mandatory local GUI parity gate for UI changes; requires seated session + Automation/Accessibility TCC
 
-local-e2e-gate: test-e2e-engine test-e2e-models test-e2e-chat test-e2e-tot test-e2e-budget-sweep test-e2e-full test-gui-history test-gui-stream-cancel test-gui-load-default test-gui-first-launch-package test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured ## Operator-gated integration/E2E parity; requires documented models, engine, signing, TCC, or live services
+local-e2e-gate: test-e2e-engine test-e2e-models test-e2e-chat test-e2e-tot test-e2e-budget-sweep test-e2e-full test-gui-history test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui-first-launch-package test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured ## Operator-gated integration/E2E parity; requires documented models, engine, signing, TCC, or live services
 
 release-gate: local-pre-merge test-curated-hf test-dmg-layout ## Release readiness gate; additionally run release-preflight with ARTIFACT=<built .app|.dmg> after packaging/notarization
 
@@ -394,6 +394,17 @@ test-e2e-http: $(LOGDIR) ## HTTP API stress + tool-call contract E2E (dummy driv
 	  echo "log: $$LOG"; \
 	  exit $$status
 
+test-tot-real-smoke-unit: ## Pure unit guards for the real ToT smoke scorer gates
+	uv run --project Vendor/pie/client/python --with httpx python -m unittest Inferlets/chat-apc/tot_real_smoke_test.py
+
+test-tot-real-smoke: test-tot-real-smoke-unit $(LOGDIR) ## Real-model Tree-of-Thought diversity + scorer smoke (#523; portable Metal driver + staged Qwen3-0.6B GGUF; gated, NOT CI)
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-tot-real-smoke.log; \
+	  Scripts/run-tot-real-smoke.sh 2>&1 | tee $$LOG | tail -60; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  exit $$status
+
 test-harsh-load-selftest: ## Engine-free guard for the harsh-load generation assertion (#467 F1): an all-400-normalizing corpus must report FAIL, not a hollow PASS. Deterministic, CI-safe.
 	uv run --project Vendor/pie/client/python --with httpx \
 	  python Inferlets/chat-apc/harsh_load_real.py --self-test
@@ -424,6 +435,7 @@ test-gui-script: ## Fast preflight regressions for GUI/E2E wrapper scripts
 	Scripts/test-run-large-model-e2e.sh
 	Scripts/test-run-resume-gui-history-e2e.sh
 	Scripts/test-run-stream-cancel-gui-e2e.sh
+	Scripts/test-run-chat-retry-gui-e2e.sh
 	Scripts/test-run-load-default-gui-e2e.sh
 	Scripts/test-run-copy-gui-e2e.sh
 	Scripts/test-run-first-launch-package-e2e.sh
@@ -432,11 +444,15 @@ test-gui-script: ## Fast preflight regressions for GUI/E2E wrapper scripts
 test-gui-history: genproject ## Deterministic  GUI history/resume E2E — needs seated session
 	Scripts/run-resume-gui-history-e2e.sh
 
-test-gui-stream-cancel: genproject ## #381 deterministic GUI cancel-mid-stream E2E (partial bubble + composer recovery) — needs seated session
+test-gui-stream-cancel: genproject ## #507 deterministic GUI stream-continuity E2E (stream survives chat switch + row indicator) — needs seated session
 	Scripts/run-stream-cancel-gui-e2e.sh
 
 test-gui-copy: genproject ## #515 deterministic GUI copy E2E (Copy button → pasteboard == canonical multi-section Markdown) — needs seated session
 	Scripts/run-copy-gui-e2e.sh
+
+test-gui-chat-retry: genproject ## #513 deterministic GUI retry-from-a-prior-turn E2E (truncation confirm + regenerate) — needs seated session
+	Scripts/run-chat-retry-gui-e2e.sh
+
 
 test-gui-load-default: genproject ## #381 deterministic GUI no-model → Load-default follow-through E2E — needs seated session
 	Scripts/run-load-default-gui-e2e.sh
@@ -510,11 +526,14 @@ render-menubar-icon: ## Render the #424 branded menu-bar icon (4 states x light/
 	@/tmp/render-menubar-icon
 	@open /tmp/menubar-icon-preview.png 2>/dev/null || true
 
-test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate, composer auto-grow, profile-swap keep-current, model-menu no-resident confirm, helper-overlay removal, chat-list geometry (S260/S279/S285/S286/S446/S459/S486/S496/S511)
-	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests -only-testing:RatioThinkGUITests/S459_ProfileSwapKeepCurrentGUITests -only-testing:RatioThinkGUITests/S486_ModelMenuNoResidentConfirmGUITests -only-testing:RatioThinkGUITests/S496_HelperOverlayRemovedGUITests -only-testing:RatioThinkGUITests/S511_ChatListGeometryGUITests)
+test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate, composer auto-grow, profile-swap keep-current, model-menu no-resident confirm, helper-overlay removal, chat-list geometry, chat lifecycle prune/auto-title (S260/S279/S285/S286/S446/S459/S486/S496/S511/S512)
+	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests -only-testing:RatioThinkGUITests/S459_ProfileSwapKeepCurrentGUITests -only-testing:RatioThinkGUITests/S486_ModelMenuNoResidentConfirmGUITests -only-testing:RatioThinkGUITests/S496_HelperOverlayRemovedGUITests -only-testing:RatioThinkGUITests/S511_ChatListGeometryGUITests -only-testing:RatioThinkGUITests/S512_ChatLifecycleGUITests)
 
 test-gui-chat-geometry: genproject $(LOGDIR) ## GUI area: #511 chat-list row geometry guard — rows non-overlapping, text contained (S511)
 	$(call gui_suite_run,chat-geometry,-only-testing:RatioThinkGUITests/S511_ChatListGeometryGUITests)
+
+test-gui-chat-lifecycle: genproject $(LOGDIR) ## GUI area: #512 chat lifecycle — empty-draft prune + auto-title (S512)
+	$(call gui_suite_run,chat-lifecycle,-only-testing:RatioThinkGUITests/S512_ChatLifecycleGUITests)
 
 test-gui-helper-recovery: genproject $(LOGDIR) ## GUI area: #496 helper-recovery overlay — starting/unreachable/auto-dismiss + engineRunning gate (S496)
 	$(call gui_suite_run,helper-recovery,-only-testing:RatioThinkGUITests/S496_HelperRecoveryOverlayGUITests)

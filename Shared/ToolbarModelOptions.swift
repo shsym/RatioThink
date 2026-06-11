@@ -40,11 +40,10 @@ public enum ToolbarModelOptions {
   public enum SelectionAction: Equatable, Sendable {
     /// Row is visible but cannot be selected as a load target.
     case unavailable(reason: String)
-    /// Current concrete profile-default row: remove any override, no load needed.
-    case clearOverride
     /// Request the normal coordinator path for `modelID`. `overrideAfterConfirmation`
-    /// is nil for concrete profile-default rows so a confirmed load leaves the chat
-    /// using profile-default semantics rather than persisting a redundant override.
+    /// is the concrete slug to write to the chat after confirmation. Selecting
+    /// any concrete row is an explicit model pick, even when that row is also
+    /// the current profile default.
     case requestModel(modelID: String, overrideAfterConfirmation: String?)
   }
 
@@ -96,12 +95,9 @@ public enum ToolbarModelOptions {
     if let reason = option.unavailableReason {
       return .unavailable(reason: reason)
     }
-    if option.isProfileDefault, normalized(residentModelID) == option.slug {
-      return .clearOverride
-    }
     return .requestModel(
       modelID: option.slug,
-      overrideAfterConfirmation: option.isProfileDefault ? nil : option.slug)
+      overrideAfterConfirmation: option.slug)
   }
 
   public static func build(discoveredModels: [InstalledModel],

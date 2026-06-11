@@ -93,8 +93,7 @@ struct FirstLaunchWizardView: View {
         .fixedSize(horizontal: false, vertical: true)
 
       HStack(spacing: 10) {
-        Image(systemName: loginStatus.canContinue ? "checkmark.circle.fill" : "circle")
-          .foregroundStyle(loginStatus.canContinue ? .green : .secondary)
+        loginStatusIndicator
         Text(loginStatus.userVisibleText)
           .accessibilityIdentifier("FirstLaunchLoginStatus")
       }
@@ -137,6 +136,14 @@ struct FirstLaunchWizardView: View {
       Text(text)
         .fixedSize(horizontal: false, vertical: true)
     }
+  }
+
+  private var loginStatusIndicator: some View {
+    Image(systemName: loginStatus.canContinue ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+      .symbolRenderingMode(.hierarchical)
+      .foregroundStyle(loginStatus.canContinue ? .green : .red)
+      .accessibilityIdentifier("FirstLaunchLoginStatusIndicator")
+      .accessibilityLabel(loginStatus.canContinue ? "Helper registered" : "Helper registration required")
   }
 
   private func registerLoginItem() {

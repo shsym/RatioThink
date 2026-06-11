@@ -72,6 +72,16 @@ final class LocalAPIStateTests: XCTestCase {
                    "This model exceeds this Mac’s safe memory limit. Pick a smaller model.")
   }
 
+  func test_failed_modelUnsupported_is_not_retryable() {
+    let s = LocalAPIState.make(status: .failed(code: .modelUnsupported, message: "unsupported format"),
+                               hasActiveProfile: true)
+    XCTAssertFalse(s.toggleEnabled, "modelUnsupported would retry the same unloadable artifact")
+    XCTAssertEqual(
+      s.detail,
+      "The selected model is unsupported or not loadable. Choose a curated model, remove or fix the cached repo, or install a supported artifact."
+    )
+  }
+
   func test_failed_without_profile_is_never_retryable() {
     let s = LocalAPIState.make(status: .failed(code: .spawnFailed, message: "boom"),
                                hasActiveProfile: false)

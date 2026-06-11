@@ -49,6 +49,24 @@ func noModelPrompt(in app: XCUIApplication) -> XCUIElement {
     .firstMatch
 }
 
+@MainActor
+func closeSettingsWindowIfPresent(in app: XCUIApplication) {
+  let settings = app.windows.matching(identifier: "com_apple_SwiftUI_Settings_window").firstMatch
+  guard settings.waitForExistence(timeout: 0.5) else { return }
+  app.activate()
+  let close = settings.buttons[XCUIIdentifierCloseWindow]
+  if close.exists, close.isHittable {
+    close.click()
+  } else {
+    app.typeKey("w", modifierFlags: .command)
+  }
+
+  let deadline = Date().addingTimeInterval(3)
+  while settings.exists, Date() < deadline {
+    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+  }
+}
+
 func missingModelDownloadButton(in app: XCUIApplication) -> XCUIElement {
   let identified = app.buttons["missingModel.download"]
   if identified.exists { return identified }
@@ -63,6 +81,8 @@ func openFreshChat(
   file: StaticString = #filePath,
   line: UInt = #line
 ) {
+  closeSettingsWindowIfPresent(in: app)
+
   let composer = app.descendants(matching: .any)
     .matching(identifier: "composer.text")
     .firstMatch
@@ -107,6 +127,25 @@ func openFreshChat(
     XCTFail("New Chat action must open the chat scaffold; app tree: \(app.debugDescription)",
             file: file, line: line)
   }
+}
+
+/// Select a persisted chat row in the sidebar by its title. #512: a chat
+/// with real conversation is auto-titled from its first user message, so
+/// after a relaunch the persisted row is found by that derived title — the
+/// "New Chat" placeholder now only ever names an empty draft (which pruning
+/// deletes). Shared by every suite that relaunches and reselects a chat.
+@MainActor
+func selectPersistedChat(
+  titled title: String,
+  in app: XCUIApplication,
+  file: StaticString = #filePath,
+  line: UInt = #line
+) {
+  let chatTitle = app.staticTexts[title].firstMatch
+  XCTAssertTrue(chatTitle.waitForExistence(timeout: 10),
+                "persisted chat row '\(title)' missing after relaunch; app tree: \(app.debugDescription)",
+                file: file, line: line)
+  chatTitle.click()
 }
 
 @MainActor

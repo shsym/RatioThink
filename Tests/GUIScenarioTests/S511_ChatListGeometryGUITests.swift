@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 
 /// S511 — chat-list row geometry guard.
 ///
@@ -14,8 +15,10 @@ import XCTest
 ///
 /// Runs against an isolated `PIE_HOME` (real /tmp path — the sandboxed
 /// runner's NSTemporaryDirectory() is unwritable for the app) and seeds
-/// rows through the real "New Chat" affordance, which reproduces exactly
-/// the observed first-row shape: generated title + relative timestamp.
+/// rows through the real "New Chat" affordance plus failed sends. Empty
+/// draft chats are intentionally singletons under #512 lifecycle pruning, so
+/// a geometry guard that needs several rows must make each seeded row a real
+/// conversation before asking for the next draft.
 ///
 /// Geometry checks accumulate and raise ONE terminal failure per
 /// `assertRowGeometry` call, AFTER attaching a window screenshot and
@@ -53,13 +56,16 @@ final class S511_ChatListGeometryGUITests: XCTestCase {
     let home = "/tmp/pie-s511-" + UUID().uuidString
     tempHomes.append(home)
     app.launchEnvironment["PIE_HOME"] = home
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = "s511-deterministic"
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
+    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
+    app.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "healthy"
     return app
   }
 
-  /// Create `count` chats through the header affordance — each row gets the
-  /// generated "New Chat" title plus a fresh relative timestamp, matching
-  /// the observed overlap case. Waits for each row to land before the next
-  /// click so a slow render never swallows a creation.
+  /// Create `count` real chats through the header affordance. The closed
+  /// engine URL makes each send fail after the user turn is saved and
+  /// auto-titled, giving deterministic rows without a live engine.
   @MainActor
   private func seedChats(_ count: Int, in app: XCUIApplication) {
     let newButton = app.buttons["chats.newButton"]
@@ -67,16 +73,26 @@ final class S511_ChatListGeometryGUITests: XCTestCase {
                   "chat list header New Chat affordance missing")
     let rows = app.descendants(matching: .any).matching(identifier: "chats.row")
     for i in 1...count {
-      // Space the clicks past the double-click interval — rapid clicks at
-      // the same point coalesce into a double-click and the second press
-      // is swallowed (observed as a missing row).
-      usleep(400_000)
+      // Space clicks past the host double-click interval so repeated header
+      // clicks cannot coalesce into a swallowed double-click.
+      let clickSpacing = max(NSEvent.doubleClickInterval, 0.4) + 0.1
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(clickSpacing))
       newButton.click()
       let deadline = Date().addingTimeInterval(5)
       while rows.count < i && Date() < deadline {
         usleep(200_000)
       }
       XCTAssertEqual(rows.count, i, "chat \(i) did not appear after New Chat click")
+      let title = "Geometry seed chat \(i)"
+      typeComposerText(title, in: app)
+      let send = app.buttons["composer.send"]
+      XCTAssertTrue(send.waitForExistence(timeout: 5),
+                    "composer.send missing while seeding chat \(i); app tree: \(app.debugDescription)")
+      XCTAssertTrue(send.isEnabled,
+                    "composer.send disabled while seeding chat \(i); app tree: \(app.debugDescription)")
+      send.click()
+      XCTAssertTrue(app.staticTexts[title].waitForExistence(timeout: 10),
+                    "chat \(i) did not auto-title after failed send; app tree: \(app.debugDescription)")
     }
   }
 

@@ -50,12 +50,21 @@ struct RatioThinkApp: App {
   /// and surfaced as the toolbar helper-ring + the escalation banner.
   @StateObject private var helperHealth: HelperHealthController
   @StateObject private var engineClientStore: EngineClientStore
+  /// #507: app-scoped per-chat send pipelines, so an in-flight stream
+  /// survives chat switches and multiple chats can stream concurrently.
+  /// Also feeds the #413 generation gate (any chat in flight → hold
+  /// failed helper polls).
+  @StateObject private var sendCoordinator: ChatSendCoordinator
   /// Phase 3.8 (review v2 F1): the Add Model sheet's `.queueDownload`
   /// outcome runs through this controller so the existing
   /// `ModelDownloader` is actually invoked. Lives at app scope so
   /// closing + reopening the Settings sheet does not orphan an
   /// in-flight download.
   @StateObject private var downloadController: ModelDownloadController
+  /// #514: the one live source of truth for local model availability
+  /// (scan results + in-flight downloads + completion reconciliation).
+  /// App-scoped beside the download controller it observes.
+  @StateObject private var modelLibrary: ModelLibraryStore
   /// #411: once-per-launch GitHub-Releases update check. App-scoped so the
   /// check (and its single network call) fires once per process; RootView
   /// observes `pending` to render the non-modal update banner.
@@ -110,6 +119,7 @@ struct RatioThinkApp: App {
       return port
     }()
     if let pinnedRunningPort {
+      let servedModelID = ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_SERVED_MODEL"] ?? ""
       // Inject a stub XPC client (NOT HelperXPCClient): the helperless
       // harness has no Helper, so a real stopEngine() during Unload would
       // throw and ChatScaffoldView.unloadModel would never reach
@@ -117,8 +127,11 @@ struct RatioThinkApp: App {
       // the pinned running status and accepts stopEngine as a no-op so
       // the Unload confirm path completes to .idle (#359 Path2).
       statusStore = EngineStatusStore(
-        client: PinnedRunningXPCClient(port: pinnedRunningPort),
-        initialStatus: .running(EngineSessionSnapshot(port: pinnedRunningPort, profileID: "chat"))
+        client: PinnedRunningXPCClient(port: pinnedRunningPort,
+                                       servedModelID: servedModelID),
+        initialStatus: .running(EngineSessionSnapshot(port: pinnedRunningPort,
+                                                      profileID: "chat",
+                                                      servedModelID: servedModelID))
       )
     } else if let startToRunningPort {
       statusStore = EngineStatusStore(
@@ -210,7 +223,9 @@ struct RatioThinkApp: App {
       coordinator?.reportServeFailure(modelID: modelID, error: error)
     }
     _swapCoordinator = StateObject(wrappedValue: coordinator)
-    _downloadController = StateObject(wrappedValue: Self.makeDownloadController())
+    let downloadController = Self.makeDownloadController()
+    _downloadController = StateObject(wrappedValue: downloadController)
+    _modelLibrary = StateObject(wrappedValue: ModelLibraryStore(downloads: downloadController))
 
     _persistenceStatus = StateObject(wrappedValue: status)
     chatContainer = RatioThinkModelContainer.openWithFallback(status: status)
@@ -250,6 +265,15 @@ struct RatioThinkApp: App {
       helperHealthController?.health
     }
     _helperHealth = StateObject(wrappedValue: helperHealthController)
+
+    // #507: chat sends are app-scoped (per-chat controllers) so streams
+    // outlive the detail view. The #413 generation gate moves here with
+    // them: hold failed helper polls while ANY chat is streaming.
+    let chatSendCoordinator = ChatSendCoordinator()
+    chatSendCoordinator.onAnyInFlightChange = { [weak helperHealthController] active in
+      helperHealthController?.setGenerating(active)
+    }
+    _sendCoordinator = StateObject(wrappedValue: chatSendCoordinator)
 
     // #448: give the full-product quit coordinator the poll loop it must stop
     // before tearing down, so no late on-demand poll respawns the Helper.
@@ -322,6 +346,9 @@ struct RatioThinkApp: App {
     }
     if env["PIE_TEST_FIRST_LAUNCH_COMPLETED"] == "1" {
       defaults.set(true, forKey: AppPreferences.firstLaunchWizardCompletedKey)
+    }
+    if env["PIE_TEST_FOLLOW_PROFILE_DEFAULT_MODEL"] == "1" {
+      defaults.set(true, forKey: AppPreferences.followProfileDefaultModelKey)
     }
     return defaults
   }
@@ -479,7 +506,9 @@ struct RatioThinkApp: App {
         .environmentObject(engineStatusStore)
         .environmentObject(engineLifecycle)
         .environmentObject(helperHealth)
+        .environmentObject(sendCoordinator)
         .environmentObject(downloadController)
+        .environmentObject(modelLibrary)
         .environmentObject(updateAvailability)
         .environmentObject(settingsNavigation)
         // #420: route the menu-bar Helper's `ratiothink://settings` deep
@@ -535,6 +564,14 @@ struct RatioThinkApp: App {
           Task { await DiagnosticsCollector.collectAndReveal() }
         }
       }
+      #if DEBUG
+      CommandMenu("Debug") {
+        Button("Reset Onboarding State") {
+          appPreferences.resetFirstLaunchWizard()
+        }
+        .keyboardShortcut("r", modifiers: [.command, .control, .option])
+      }
+      #endif
     }
 
     Settings {
@@ -546,6 +583,7 @@ struct RatioThinkApp: App {
         .environmentObject(swapCoordinator)
         .environmentObject(engineClientStore)
         .environmentObject(downloadController)
+        .environmentObject(modelLibrary)
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
     }
@@ -560,16 +598,44 @@ struct RatioThinkApp: App {
 /// reports the pinned `.running` status and treats `stopEngine()` as a
 /// no-op success, so the Unload confirm path completes to `.idle`. DEBUG
 /// only — compiled out of Release alongside the pin itself.
-private struct PinnedRunningXPCClient: AppXPCClient {
-  let port: EnginePort
+private final class PinnedRunningXPCClient: AppXPCClient, @unchecked Sendable {
+  private let port: EnginePort
+  private let lock = NSLock()
+  private var servedModelID: String
+
+  init(port: EnginePort, servedModelID: String) {
+    self.port = port
+    self.servedModelID = servedModelID
+  }
+
   func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
-  func engineStatus() async throws -> EngineStatus { .running(EngineSessionSnapshot(port: port, profileID: "chat")) }
+  func engineStatus() async throws -> EngineStatus {
+    lock.lock()
+    let model = servedModelID
+    lock.unlock()
+    return .running(EngineSessionSnapshot(port: port,
+                                          profileID: "chat",
+                                          servedModelID: model))
+  }
+
   func stopEngine() async throws {}
   // The pinned harness has no Helper to launch an engine; the engine is
   // already pinned `.running`, so a start is a no-op success (mirrors
   // `stopEngine`).
-  func startEngine(profileID: String, modelOverride: String?) async throws {}
-  func restartEngine(profileID: String, modelOverride: String?) async throws {}
+  func startEngine(profileID: String, modelOverride: String?) async throws {
+    updateServedModel(modelOverride)
+  }
+
+  func restartEngine(profileID: String, modelOverride: String?) async throws {
+    updateServedModel(modelOverride)
+  }
+
+  private func updateServedModel(_ modelOverride: String?) {
+    guard let modelOverride, !modelOverride.isEmpty else { return }
+    lock.lock()
+    servedModelID = modelOverride
+    lock.unlock()
+  }
 }
 
 /// #381: helperless `AppXPCClient` whose engine starts `.stopped` and flips to

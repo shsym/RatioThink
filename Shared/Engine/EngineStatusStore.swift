@@ -33,6 +33,12 @@ public final class EngineStatusStore: ObservableObject {
   /// the caller to introspect `EngineStatus` for a `.failed` case.
   @Published public private(set) var lastError: String?
 
+  /// Latest authoritative KV usage rows from pie `model_status` (#517),
+  /// refreshed opportunistically while the engine is running. Chat sends read
+  /// this synchronously to seed APC retention; an empty array means unknown
+  /// and must not be treated as zero usage.
+  @Published public private(set) var latestKVUsageSnapshots: [KVUsageSnapshot] = []
+
   /// Number of `engineStatus()` polls that have returned (success or
   /// failure). Test seam — lets tests `await` a transition without
   /// polling `status` in a tight loop.
@@ -83,6 +89,10 @@ public final class EngineStatusStore: ObservableObject {
   public var currentSnapshot: EngineSessionSnapshot? {
     if case .running(let snapshot) = status { return snapshot }
     return nil
+  }
+
+  public func kvUsageSnapshot(for modelID: String) -> KVUsageSnapshot? {
+    latestKVUsageSnapshots.first { $0.modelID == modelID }
   }
 
   private let client: any AppXPCClient
@@ -466,6 +476,25 @@ public final class EngineStatusStore: ObservableObject {
       await MainActor.run { [weak self] in
         self?.apply(next: next, error: nil)
       }
+      if case .running = next {
+        do {
+          let usage = try await client.kvUsageSnapshots()
+          await MainActor.run { [weak self] in
+            self?.latestKVUsageSnapshots = usage
+          }
+        } catch {
+          let message = String(describing: error)
+          Self.log.error("kvUsageSnapshots poll failed: \(message, privacy: .public)")
+          DiagnosticLog.app.event("engine.kv_usage", [("result", "fail"), ("reason", message)])
+          await MainActor.run { [weak self] in
+            self?.latestKVUsageSnapshots = []
+          }
+        }
+      } else {
+        await MainActor.run { [weak self] in
+          self?.latestKVUsageSnapshots = []
+        }
+      }
     } catch {
       let message = String(describing: error)
       let took = Date().timeIntervalSince(started)
@@ -480,6 +509,7 @@ public final class EngineStatusStore: ObservableObject {
       ])
       await MainActor.run { [weak self] in
         self?.apply(next: nil, error: message)
+        self?.latestKVUsageSnapshots = []
       }
     }
   }

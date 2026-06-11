@@ -54,4 +54,23 @@ final class AppPreferencesTests: XCTestCase {
     let reopened = AppPreferences(defaults: defaults)
     XCTAssertFalse(reopened.firstLaunchWizardCompleted)
   }
+
+  func test_follow_profile_default_model_defaults_off() throws {
+    let defaults = try makeScratchDefaults()
+    let prefs = AppPreferences(defaults: defaults)
+
+    XCTAssertFalse(prefs.followProfileDefaultModel,
+                   "explicit model selections should stay pinned across profile changes unless the user opts into follow-default compatibility")
+  }
+
+  func test_follow_profile_default_model_preference_persists() throws {
+    let defaults = try makeScratchDefaults()
+    let prefs = AppPreferences(defaults: defaults)
+
+    prefs.setFollowProfileDefaultModel(true)
+
+    XCTAssertTrue(prefs.followProfileDefaultModel)
+    let reopened = AppPreferences(defaults: defaults)
+    XCTAssertTrue(reopened.followProfileDefaultModel)
+  }
 }

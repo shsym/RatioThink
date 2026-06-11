@@ -183,6 +183,10 @@ struct TreeCompleteFrame<'a> {
     event: &'static str,
     selected_node_id: Option<&'a str>,
     final_answer: Option<&'a str>,
+    /// `true` when `final_answer` came from the post-search synthesis, `false`
+    /// when the raw best-leaf content stood — lets the client and the gated
+    /// smoke assert the synthesizer actually ran (#523 Part A F1).
+    synthesized: bool,
 }
 
 /// Emit the opening `tree_start` frame.
@@ -240,6 +244,28 @@ pub async fn emit_node_delta(
     .await
 }
 
+/// `final_delta` — one streamed chunk of the final synthesized answer
+/// (#523 Part A). After the search picks the best leaf, ONE synthesis
+/// generation produces the final answer grounded in that leaf; its answer
+/// text streams as `final_delta` chunks before the terminal
+/// `tree_complete` (whose `final_answer` carries the full text as the
+/// authoritative value). Additive: a client that doesn't know the event
+/// ignores it and still renders `tree_complete.final_answer`.
+#[derive(Serialize)]
+struct FinalDeltaFrame<'a> {
+    event: &'static str,
+    text: &'a str,
+}
+
+/// Emit one streamed chunk of the synthesized final answer.
+pub async fn emit_final_delta(em: &mut Emitter, text: &str) -> Result<(), EmitError> {
+    em.emit_json(&FinalDeltaFrame {
+        event: "final_delta",
+        text,
+    })
+    .await
+}
+
 /// Emit one search level: a `node_complete` for every node generated on
 /// the level (ok, generation-error, fork/refine-flush error-leaf — all of
 /// them, so the UI sees the full breadth that was attempted), then the
@@ -272,11 +298,13 @@ pub async fn emit_tree_complete(
     em: &mut Emitter,
     selected_node_id: Option<&str>,
     final_answer: Option<&str>,
+    synthesized: bool,
 ) -> Result<(), EmitError> {
     em.emit_json(&TreeCompleteFrame {
         event: "tree_complete",
         selected_node_id,
         final_answer,
+        synthesized,
     })
     .await
 }
@@ -504,11 +532,12 @@ mod tests {
             event: "tree_complete",
             selected_node_id: Some("tot-n3"),
             final_answer: Some("4"),
+            synthesized: true,
         })
         .unwrap();
         assert_eq!(
             v,
-            json!({"event":"tree_complete","selected_node_id":"tot-n3","final_answer":"4"})
+            json!({"event":"tree_complete","selected_node_id":"tot-n3","final_answer":"4","synthesized":true})
         );
     }
 
@@ -529,9 +558,11 @@ mod tests {
             event: "tree_complete",
             selected_node_id: None,
             final_answer: None,
+            synthesized: false,
         })
         .unwrap();
         assert!(v["selected_node_id"].is_null());
         assert!(v["final_answer"].is_null());
+        assert_eq!(v["synthesized"], json!(false));
     }
 }

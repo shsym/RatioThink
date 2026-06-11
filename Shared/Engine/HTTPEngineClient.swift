@@ -209,6 +209,9 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
                 throw HTTPEngineError.stream(
                   code: meta.code ?? "unknown_error",
                   message: meta.message ?? "")
+              case "generation_metrics":
+                let meta = try decoder.decode(GenerationMetricsFrame.self, from: frame.dataBytes)
+                continuation.yield(.generationMetrics(meta.metrics))
               default:
                 continue
               }
@@ -553,6 +556,48 @@ private struct MetaFrame: Decodable {
   let loaded_bytes: UInt64?
   let total_bytes: UInt64?
   let eta_s: Double?
+}
+
+/// Strict `generation_metrics` SSE contract. Unlike best-effort generic
+/// meta frames, malformed performance data must fail at the stream
+/// boundary; otherwise protocol drift becomes indistinguishable from a
+/// historical row that intentionally lacks metrics.
+private struct GenerationMetricsFrame: Decodable {
+  let outputTokens: Int
+  let elapsedSeconds: Double
+  let tokensPerSecond: Double
+
+  var metrics: GenerationMetrics {
+    GenerationMetrics(
+      outputTokens: outputTokens,
+      elapsedSeconds: elapsedSeconds,
+      tokensPerSecond: tokensPerSecond
+    )
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case outputTokens = "output_tokens"
+    case elapsedSeconds = "elapsed_s"
+    case tokensPerSecond = "tokens_per_sec"
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    outputTokens = try container.decode(Int.self, forKey: .outputTokens)
+    elapsedSeconds = try container.decode(Double.self, forKey: .elapsedSeconds)
+    tokensPerSecond = try container.decode(Double.self, forKey: .tokensPerSecond)
+
+    guard outputTokens > 0,
+          elapsedSeconds > 0,
+          elapsedSeconds.isFinite,
+          tokensPerSecond > 0,
+          tokensPerSecond.isFinite else {
+      throw DecodingError.dataCorrupted(.init(
+        codingPath: decoder.codingPath,
+        debugDescription: "generation_metrics values must be finite and positive"
+      ))
+    }
+  }
 }
 
 /// `chat.completion.chunk` body per OpenAI's streaming schema. Only

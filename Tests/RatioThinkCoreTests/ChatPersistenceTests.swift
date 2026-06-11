@@ -483,6 +483,45 @@ final class ChatPersistenceTests: XCTestCase {
                  "a legacy export with no modelID key must decode with modelID == nil (additive)")
   }
 
+  /// #512: `userTitled` is an ADDITIVE column with an inline default —
+  /// existing rows backfill `false`, a manual rename round-trips `true`,
+  /// and a legacy export without the key decodes as nil.
+  func test_chat_userTitled_defaults_false_and_round_trips() throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+
+    let chat = Chat(title: "Untouched")
+    context.insert(chat)
+    try context.save()
+    XCTAssertFalse(chat.userTitled, "default chat is not user-titled")
+
+    chat.userTitled = true
+    try context.save()
+    let reloaded = try XCTUnwrap(
+      context.fetch(FetchDescriptor<Chat>()).first { $0.id == chat.id })
+    XCTAssertTrue(reloaded.userTitled)
+  }
+
+  func test_exportedChat_decodes_legacy_json_without_userTitled_as_nil() throws {
+    let legacy = """
+    [{
+      "id": "00000000-0000-0000-0000-000000000002",
+      "title": "Legacy",
+      "profileID": "chat",
+      "createdAt": "2024-01-01T00:00:00Z",
+      "updatedAt": "2024-01-01T00:00:00Z",
+      "pinned": false,
+      "messages": []
+    }]
+    """
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let decoded = try decoder.decode([RatioThinkModelContainer.ExportedChat].self,
+                                     from: Data(legacy.utf8))
+    XCTAssertNil(decoded.first?.userTitled,
+                 "a legacy export with no userTitled key must decode with nil (additive)")
+  }
+
   /// #460: a chat created on the pre-#460 default initializer (no modelID)
   /// is unpinned, and a model can be pinned + read back — the migration adds
   /// the column without disturbing existing rows.

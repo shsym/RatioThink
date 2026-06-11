@@ -118,6 +118,13 @@ final class ChatStartGateTests: XCTestCase {
     )
   }
 
+  func test_modelUnsupported_is_engineFailed() {
+    XCTAssertEqual(
+      eval(engine: .failed(code: .modelUnsupported, message: "unsupported format"), profileDefault: model),
+      .engineFailed(code: .modelUnsupported, reason: "unsupported format")
+    )
+  }
+
   func test_S8_spawnFailed_is_engineFailed() {
     XCTAssertEqual(
       eval(engine: .failed(code: .spawnFailed, message: "ENOENT")),

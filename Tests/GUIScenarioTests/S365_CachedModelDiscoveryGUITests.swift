@@ -18,7 +18,9 @@ import XCTest
 ///
 /// Three legs:
 ///  - Models tab: a cached safetensors repo shows an "HF-cache" row
-///    (`InstalledRow-HFCache-<slug>`), read-only (no Delete).
+///    (`InstalledRow-HFCache-<slug>`), read-only (no Delete), and
+///    advisory "Unverified" support warning because it is outside the
+///    curated engine-validated list.
 ///  - Models tab: a cached split-GGUF shard set — which the engine cannot
 ///    load — collapses to one inventory row carrying the "unsupported"
 ///    badge (`InstalledRow-Unsupported-<slug>`, #349), so the inventory
@@ -70,6 +72,11 @@ final class S365_CachedModelDiscoveryGUITests: XCTestCase {
     XCTAssertTrue(elementExists(rowID, in: settings, timeout: 15),
                   "cached safetensors model did not surface as an HF-cache row "
                   + "in Settings → Models; window: \(settings.debugDescription)")
+
+    let warningID = "InstalledRow-SupportWarning-\(Self.safetensorsSlug)"
+    XCTAssertTrue(elementExists(warningID, in: settings, timeout: 5),
+                  "non-curated HF-cache row did not render advisory support warning; "
+                  + "window: \(settings.debugDescription)")
   }
 
   @MainActor

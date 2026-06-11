@@ -123,7 +123,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     XCTAssertTrue(send.isEnabled, "composer.send was disabled after typing prompt")
     send.click()
 
-    guard waitForAtLeastTwoStaticTextsContaining(visibleAssistantEcho, in: app, timeout: 120) else {
+    guard waitForAssistantEchoStaticTexts(visibleAssistantEcho, in: app, timeout: 120) else {
       XCTFail("assistant reply did not stream back under Fast Think; app tree: \(app.debugDescription)")
       return
     }
@@ -165,17 +165,19 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
   }
 
   /// MarkdownUI exposes the assistant answer as separate/truncated static
-  /// text runs, so — like S258 — a second matching run proves the assistant
-  /// bubble streamed in (beyond the user's own prompt bubble). The wrapper's
-  /// post-run SQLite assertion covers the semantic answer.
-  private func waitForAtLeastTwoStaticTextsContaining(_ needle: String,
-                                                      in app: XCUIApplication,
-                                                      timeout: TimeInterval) -> Bool {
+  /// text runs, so — like S258 — the THIRD matching run proves the assistant
+  /// bubble streamed in: two exist without any assistant output (the user's
+  /// prompt bubble and, since #512, the sidebar row auto-titled from that
+  /// same first message). The wrapper's post-run SQLite assertion covers the
+  /// semantic answer.
+  private func waitForAssistantEchoStaticTexts(_ needle: String,
+                                               in app: XCUIApplication,
+                                               timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
                                 needle, needle)
     while Date() < deadline {
-      if app.descendants(matching: .staticText).matching(predicate).count >= 2 {
+      if app.descendants(matching: .staticText).matching(predicate).count >= 3 {
         return true
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))

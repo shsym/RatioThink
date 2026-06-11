@@ -47,7 +47,8 @@ below in the same change.
 | `make test-ssh` | `test-unit` + `test-scenario` + `test-smoke` + `test-install-guards` | local (no GUI) | Convenience local subset; not part of `ci-pr` |
 | `make test-gui` | GUI scenarios (S4, S5, and the rest of `Tests/GUIScenarioTests`) via XCUITest | **seated session** | Local GUI gate via `local-gui-gate` |
 | `make test-gui-history` | Deterministic multi-turn history/resume E2E | **seated session** | Local E2E gate |
-| `make test-gui-stream-cancel` | #381 deterministic cancel-mid-stream E2E (partial bubble + composer recovery) | **seated session** | Local E2E gate |
+| `make test-gui-stream-cancel` | #507 deterministic stream-continuity E2E (stream survives chat switch + row indicator + background finish) | **seated session** | Local E2E gate |
+| `make test-gui-chat-retry` | #513 deterministic retry-from-a-prior-turn E2E (truncation confirm + regenerate from retained prefix) | **seated session** | Local E2E gate |
 | `make test-gui-load-default` | #381 deterministic no-model → Load-default follow-through E2E | **seated session** | Local E2E gate |
 | `make test-gui-first-launch-package` | Package-backed first-launch E2E (Release `.app`) | **seated session** | Local E2E gate |
 | `make test-e2e-package` | #381-seam packaged first-launch → model download → Load-default → chat (#379) | **seated session** | Local E2E gate |
@@ -94,7 +95,8 @@ that wrapper, not bare `xcodebuild`.
 | `S258_ComposerSendGUITests` | chat send/persist | send → **real pie stream** → bubble → SwiftData persist across relaunch | **app+real-engine (real Qwen3-0.6B)** | `test-e2e-chat` |
 | `S204_ChatSendGUITests` | chat send/persist | INSTRUCT model answers "Paris" → persists across relaunch | **app+real-engine (real GGUF)** | `test-e2e-full` |
 | `S275_MultiTurnResumeGUITests` | chat send/persist | ordered multi-turn history sent to engine + persisted across relaunch | app+fake-engine (deterministic HTTP) | `test-gui-history` |
-| `S381_StreamCancelGUITests` | chat send/persist | cancel an IN-FLIGHT stream mid-generation → partial bubble survives + composer recovers (fresh send streams to completion) | app+fake-engine (holding SSE) | `test-gui-stream-cancel` |
+| `S507_StreamContinuityGUITests` | chat send/persist | switch chats mid-stream → stream survives (no cancel), row indicator, background release persists, stop affordance keeps partial; PLUS 5 chats streaming concurrently with per-row indicator count + per-chat reply persistence | app+fake-engine (holding SSE + atomic counting /control/release?n=K) | `test-gui-stream-cancel` |
+| `S513_ChatRetryGUITests` | chat send/persist | earlier-turn retry → "Retry from here?" confirm (Cancel = no-op; Retry erases later conversation + regenerates from retained prefix); latest-turn retry skips confirm, no duplicate assistant turns | app+fake-engine (numbered replies) | `test-gui-chat-retry` |
 | `S381_NoModelLoadDefaultGUITests` | model load/status | no-model gate's **Load default** → engine starts + serves → gate dismisses → send streams a reply | app+fake-engine (start→running stub + mock) | `test-gui-load-default` |
 | `S279_LifecycleRecoveryGUITests` | lifecycle/recovery | unreachable engine → visible recoverable error + composer re-enabled | app+real-engine seam (dead loopback) | `test-gui-chat` |
 | `S285_ZeroStateGUITests` | zero-state | empty-state top-alignment; Start Chat CTA opens a chat; API Endpoints section opens the single live `LocalAPIView` (#422) | mock (stops at composer; no send) | `test-gui-chat` |
@@ -102,6 +104,7 @@ that wrapper, not bare `xcodebuild`.
 | `S327_EngineStatusIndicatorGUITests` | model load/status | always-visible engine-status pip; popover **stays open** across 1 Hz poll ticks (`pollCount` demoted from `@Published`) | mock (no engine) | `test-gui` |
 | `S360_ModelsTopAlignGUITests` | settings/shell | Settings → Models empty state stays **top-aligned**, not vertically centered (mirrors S285) | mock (isolated empty `PIE_HOME`) | `test-gui` |
 | `S365_CachedModelDiscoveryGUITests` | model discovery | HF-cache-staged model surfaces as a Settings **"HF-cache" row** + in the profile picker; pure filesystem scan | staged HF cache (no engine/network) | `run-cache-discovery-gui-e2e.sh` |
+| `S514_AddModelDuplicateGUITests` | model discovery | Add Model → Curated marks a staged app-managed install **"Installed"** and an HF-cache mirror **"In library"** (no Add button); a not-staged row keeps Add | staged HF cache + `PIE_HOME/models` (no engine/network) | `run-cache-discovery-gui-e2e.sh` |
 
 > Reconciled against `Tests/GUIScenarioTests/` on 2026-06-10 — every suite on
 > disk is listed above. The first-launch **packaged model-download →
@@ -147,6 +150,29 @@ exact fix command when a human gate is unmet.
 focused targets are `-only-testing` slices of it. A few suites have **no**
 focused target and run only in the full matrix: `S326` (fresh-install
 download), `S327` (engine-status pip), `S360` (Models top-align).
+
+## Live CLI diagnostics
+
+### KV usage model_status diagnostic
+
+`KVUsageModelStatusLiveTests` is gated behind:
+
+- `PIE_TEST_REAL_PIE_BIN`
+- `PIE_TEST_REAL_CHATAPC_WASM`
+- `PIE_TEST_REAL_CHATAPC_MANIFEST`
+
+It launches dummy pie, queries the existing control-plane `model_status`
+endpoint, parses `kv_pages_used/total`, and confirms the App parser sees the
+runtime-reported totals.
+
+Run it with:
+
+```bash
+PIE_TEST_REAL_PIE_BIN="$PWD/Vendor/pie/target/debug/pie" \
+PIE_TEST_REAL_CHATAPC_WASM="$PWD/Inferlets/chat-apc/prebuilt/chat-apc.wasm" \
+PIE_TEST_REAL_CHATAPC_MANIFEST="$PWD/Inferlets/chat-apc/Pie.toml" \
+swift test --filter KVUsageModelStatusLiveTests
+```
 
 ### GUI temp-home cleanup
 

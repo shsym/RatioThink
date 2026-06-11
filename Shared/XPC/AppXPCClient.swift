@@ -36,6 +36,7 @@ public protocol AppXPCClient: Sendable {
   /// unavailable. Read on demand while the status popover is open; never
   /// polled into a published field.
   func engineMemory() async throws -> EngineMemorySample?
+  func kvUsageSnapshots() async throws -> [KVUsageSnapshot]
   /// Start (resolve + launch) the engine on `profileID`. Resolves on a
   /// successful launch handshake; throws the helper-side `EngineError`
   /// when the start is rejected (e.g. `.modelMissing`, `.profileMissing`),
@@ -86,6 +87,10 @@ public extension AppXPCClient {
   /// engineMemory selector inherit nil and need no change.
   func engineMemory() async throws -> EngineMemorySample? { nil }
 
+  /// Default: KV usage unavailable. Test stubs and helperless DEBUG
+  /// harnesses inherit an empty snapshot list.
+  func kvUsageSnapshots() async throws -> [KVUsageSnapshot] { [] }
+
   /// Default: no helper to quit. Test stubs and the helperless DEBUG
   /// harness inherit this no-op; only the production `HelperXPCClient`
   /// drives the real `quitHelper` selector.
@@ -122,11 +127,16 @@ public enum HelperProtocolCompatibility {
   /// repair gate must unregister+reregister the stale helper after an in-place
   /// app upgrade so the snapshot wire is served before any start/poll runs.
   ///
+  /// Version 6: helper exports `kvUsage(reply:)` (#517). The App can now ask
+  /// for authoritative pie `model_status` KV snapshots over XPC; a stale v5
+  /// helper would not implement `kvUsageWithReply:` and the call would time
+  /// out instead of returning a diagnostic result.
+  ///
   /// BUMP THIS whenever a new REQUIRED selector is added to `PieHelperXPC`,
   /// or an in-place upgrade leaves a running old helper that passes the
   /// reachability gate yet cannot service the new call (incl. a reply/status
   /// BYTE-format change like #476).
-  public static let currentVersion = 5
+  public static let currentVersion = 6
 
   public static func isCompatible(client: any AppXPCClient) async -> Bool {
     do {
@@ -767,6 +777,57 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
           resumeOnce(.success(sample))
         } catch {
           resumeOnce(.failure(AppXPCClientError.decode(error as NSError)))
+        }
+      }
+    }
+  }
+
+  public func kvUsageSnapshots() async throws -> [KVUsageSnapshot] {
+    let connection = ensureConnection()
+    do {
+      return try await kvUsageSnapshots(on: connection)
+    } catch let error as AppXPCClientError {
+      if case .replyTimeout = error { invalidateIfCurrent(connection) }
+      throw error
+    }
+  }
+
+  private func kvUsageSnapshots(on connection: NSXPCConnection) async throws -> [KVUsageSnapshot] {
+    let timeout = replyTimeout
+    return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[KVUsageSnapshot], Error>) in
+      let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
+      func resumeOnce(_ result: Result<[KVUsageSnapshot], Error>) {
+        let shouldResume = resumed.withLock { fired -> Bool in
+          if fired { return false }
+          fired = true
+          return true
+        }
+        guard shouldResume else { return }
+        switch result {
+        case .success(let snapshots): continuation.resume(returning: snapshots)
+        case .failure(let error): continuation.resume(throwing: error)
+        }
+      }
+      if timeout > 0 {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+          resumeOnce(.failure(AppXPCClientError.replyTimeout(selector: "kvUsage", timeout: timeout)))
+        }
+      }
+      let proxy = connection.remoteObjectProxyWithErrorHandler { err in
+        resumeOnce(.failure(AppXPCClientError.proxyError(err as NSError)))
+      }
+      guard let api = proxy as? PieHelperXPC else {
+        resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
+        return
+      }
+      api.kvUsage { successData, errorData in
+        do {
+          switch try PieHelperXPCWire.decodeKVUsageReply(successData: successData, errorData: errorData) {
+          case .success(let snapshots): resumeOnce(.success(snapshots))
+          case .failure(let engineError): resumeOnce(.failure(engineError))
+          }
+        } catch {
+          resumeOnce(.failure(error))
         }
       }
     }

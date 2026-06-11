@@ -217,12 +217,53 @@ public struct ChatCacheDirective: Codable, Equatable, Sendable {
   public let turn: Int
   public let compat: String
   public let policy: String
+  /// Optional #524 retention budget. Values must come from #517's
+  /// authoritative pie `model_status` counters; nil means "do not ask the
+  /// inferlet to evict on this request" rather than estimating.
+  public let retention: ChatCacheRetentionDirective?
 
-  public init(key: String, turn: Int, compat: String = ChatCacheDirective.compatVersion, policy: String = "auto") {
+  public init(key: String,
+              turn: Int,
+              compat: String = ChatCacheDirective.compatVersion,
+              policy: String = "auto",
+              retention: ChatCacheRetentionDirective? = nil) {
     self.key = key
     self.turn = turn
     self.compat = compat
     self.policy = policy
+    self.retention = retention
+  }
+}
+
+/// #524 APC retention budget passed through the chat-apc `cache.retention`
+/// object. The App only constructs this from runtime/inferlet-backed
+/// `KVUsageSnapshot` data; the inferlet treats absent/invalid accounting as
+/// a safe no-eviction diagnostic.
+public struct ChatCacheRetentionDirective: Codable, Equatable, Sendable {
+  public let kvPagesUsed: Int
+  public let kvPagesTotal: Int
+  public let softPercent: Int
+  public let evictPercent: Int
+  public let hardPercent: Int
+
+  public init(kvPagesUsed: Int,
+              kvPagesTotal: Int,
+              softPercent: Int = 70,
+              evictPercent: Int = 80,
+              hardPercent: Int = 95) {
+    self.kvPagesUsed = kvPagesUsed
+    self.kvPagesTotal = kvPagesTotal
+    self.softPercent = softPercent
+    self.evictPercent = evictPercent
+    self.hardPercent = hardPercent
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case kvPagesUsed = "kv_pages_used"
+    case kvPagesTotal = "kv_pages_total"
+    case softPercent = "soft_percent"
+    case evictPercent = "evict_percent"
+    case hardPercent = "hard_percent"
   }
 }
 
@@ -465,6 +506,7 @@ public enum ChatEvent: Equatable, Sendable {
   case modelReady
   case delta(role: ChatMessage.Role?, content: String)
   case reasoningDelta(String)
+  case generationMetrics(GenerationMetrics)
   case finish(reason: FinishReason)
 
   public enum FinishReason: Equatable, Sendable {
@@ -472,6 +514,24 @@ public enum ChatEvent: Equatable, Sendable {
     case length
     case cancelled
     case other(String)
+  }
+}
+
+public struct GenerationMetrics: Codable, Equatable, Sendable {
+  public let outputTokens: Int
+  public let elapsedSeconds: Double
+  public let tokensPerSecond: Double
+
+  public init(outputTokens: Int, elapsedSeconds: Double, tokensPerSecond: Double) {
+    self.outputTokens = outputTokens
+    self.elapsedSeconds = elapsedSeconds
+    self.tokensPerSecond = tokensPerSecond
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case outputTokens = "output_tokens"
+    case elapsedSeconds = "elapsed_s"
+    case tokensPerSecond = "tokens_per_sec"
   }
 }
 

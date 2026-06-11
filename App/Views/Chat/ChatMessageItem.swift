@@ -29,6 +29,10 @@ struct ChatMessageItem: Identifiable, Equatable {
   /// `MessageBubble` surface a truncated-before-answer turn instead of a
   /// silent blank. (#434)
   var finishReason: String?
+  /// Engine-reported generation throughput for a completed assistant turn.
+  /// Nil for historical rows and turns whose metric policy is intentionally
+  /// hidden (cancelled/failed/invalid metrics).
+  var generationPerformance: GenerationMetrics?
 
   init(
     id: UUID = UUID(),
@@ -36,7 +40,8 @@ struct ChatMessageItem: Identifiable, Equatable {
     content: String,
     reasoning: String = "",
     tot: ToTTree? = nil,
-    finishReason: String? = nil
+    finishReason: String? = nil,
+    generationPerformance: GenerationMetrics? = nil
   ) {
     self.id = id
     self.role = role
@@ -44,12 +49,27 @@ struct ChatMessageItem: Identifiable, Equatable {
     self.reasoning = reasoning
     self.tot = tot
     self.finishReason = finishReason
+    self.generationPerformance = generationPerformance
   }
 
   /// Honest terminal state for the turn — drives the truncation notice so
   /// a reply that ran out of budget while thinking never renders blank.
   var notice: TurnNotice {
     TurnNotice.classify(content: content, reasoning: reasoning, finishReason: finishReason)
+  }
+
+  var generationPerformanceText: String? {
+    guard role == .assistant,
+          finishReason != "cancelled",
+          let generationPerformance,
+          generationPerformance.outputTokens > 0,
+          generationPerformance.elapsedSeconds > 0,
+          generationPerformance.elapsedSeconds.isFinite,
+          generationPerformance.tokensPerSecond > 0,
+          generationPerformance.tokensPerSecond.isFinite else { return nil }
+    let rounded = Int(generationPerformance.tokensPerSecond.rounded())
+    guard rounded > 0 else { return nil }
+    return "\(rounded) tok/s"
   }
 }
 
@@ -74,6 +94,7 @@ extension ChatMessageItem {
     let tot = message.tot.flatMap { try? JSONDecoder().decode(ToTTree.self, from: $0) }
     self.init(
       id: message.id, role: role, content: message.content,
-      reasoning: message.reasoning, tot: tot, finishReason: message.finishReason)
+      reasoning: message.reasoning, tot: tot, finishReason: message.finishReason,
+      generationPerformance: message.generationPerformance)
   }
 }

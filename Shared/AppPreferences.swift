@@ -27,9 +27,17 @@ public final class AppPreferences: ObservableObject {
   /// array of normalized version strings (e.g. `["0.1.1"]`).
   public static let ignoredUpdateVersionsKey = "ignoredUpdateVersions"
 
+  /// Compatibility toggle for users who want profile changes to keep offering
+  /// the destination profile's default model after a concrete model row was
+  /// selected. Default OFF: explicit model picks stay pinned across profile
+  /// changes for the current app flow.
+  public static let followProfileDefaultModelKey = "followProfileDefaultModel"
+
   private let defaults: UserDefaults
 
   @Published public private(set) var firstLaunchWizardCompleted: Bool
+
+  @Published public private(set) var followProfileDefaultModel: Bool
 
   /// Versions dismissed from the launch update banner. A dismissed version
   /// never re-surfaces; a strictly newer release is not in this set, so it
@@ -39,7 +47,15 @@ public final class AppPreferences: ObservableObject {
   public init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
     self.firstLaunchWizardCompleted = defaults.bool(forKey: Self.firstLaunchWizardCompletedKey)
+    self.followProfileDefaultModel = defaults.bool(forKey: Self.followProfileDefaultModelKey)
     self.ignoredUpdateVersions = Set(defaults.stringArray(forKey: Self.ignoredUpdateVersionsKey) ?? [])
+  }
+
+  public func setFollowProfileDefaultModel(_ enabled: Bool) {
+    guard followProfileDefaultModel != enabled else { return }
+    followProfileDefaultModel = enabled
+    defaults.set(enabled, forKey: Self.followProfileDefaultModelKey)
+    defaults.synchronize()
   }
 
   /// Persist a version as ignored. Flushed to disk now (like the first-launch

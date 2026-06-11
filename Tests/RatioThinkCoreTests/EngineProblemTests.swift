@@ -23,6 +23,14 @@ final class EngineProblemTests: XCTestCase {
     XCTAssertEqual(p.recovery, .chooseModel)
   }
 
+  func test_modelUnsupported_routesToChooseModelRecovery() {
+    let p = EngineProblem(statusCode: .modelUnsupported, rawMessage: "unsupported architecture")
+    XCTAssertEqual(p.title, "Model unsupported")
+    XCTAssertEqual(p.recovery, .chooseModel)
+    XCTAssertTrue(p.message.contains("Choose a curated model"))
+    XCTAssertEqual(p.technicalDetail, "unsupported architecture")
+  }
+
   func test_profileMissing_routesToChooseModel() {
     XCTAssertEqual(
       EngineProblem(statusCode: .profileMissing, rawMessage: "").recovery,

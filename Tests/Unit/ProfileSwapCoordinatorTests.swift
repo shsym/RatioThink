@@ -188,6 +188,60 @@ final class ProfileSwapCoordinatorTests: XCTestCase {
     XCTAssertEqual(pending.toModelID, "m2")
   }
 
+  func test_explicit_model_pin_keeps_current_model_on_cross_profile_switch_by_default() {
+    let (coord, center, _) = makeCoordinator(map: ["next": "m2"], resident: "m1")
+    let spy = CommitSpy()
+
+    coord.requestSwap(
+      toProfileID: "next",
+      fromModel: "m1",
+      preserveExplicitModelSelection: true,
+      commit: swapCommit(spy)
+    )
+
+    XCTAssertEqual(spy.swappedProfile, "next")
+    XCTAssertEqual(spy.pinnedModel, "m1",
+                   "an explicit model pick should stay pinned across profile changes by default")
+    XCTAssertNil(coord.pending,
+                 "default explicit-model mode should not ask to swap to the destination profile default")
+    XCTAssertEqual(center.residentModelID, "m1",
+                   "keeping the explicit model must not relaunch the engine to the destination profile default")
+  }
+
+  func test_explicit_current_profile_default_pick_is_preserved_on_later_profile_switch() {
+    let (coord, center, _) = makeCoordinator(map: ["next": "m2"], resident: "m1")
+    let spy = CommitSpy()
+
+    coord.requestSwap(
+      toProfileID: "next",
+      fromModel: "m1",
+      preserveExplicitModelSelection: true,
+      commit: swapCommit(spy)
+    )
+
+    XCTAssertEqual(spy.swappedProfile, "next")
+    XCTAssertEqual(spy.pinnedModel, "m1",
+                   "selecting the current profile default as a concrete row still enters explicit model mode")
+    XCTAssertNil(coord.pending)
+    XCTAssertEqual(center.residentModelID, "m1")
+  }
+
+  func test_follow_profile_default_compatibility_leaves_cross_model_prompt_enabled() {
+    let (coord, _, _) = makeCoordinator(map: ["next": "m2"], resident: "m1")
+    let spy = CommitSpy()
+
+    coord.requestSwap(
+      toProfileID: "next",
+      fromModel: "m1",
+      preserveExplicitModelSelection: false,
+      commit: swapCommit(spy)
+    )
+
+    XCTAssertEqual(spy.swapCommitCount, 0,
+                   "follow-profile-default compatibility should retain the existing prompt-before-swap behavior")
+    XCTAssertNotNil(coord.pending)
+  }
+
   func test_confirm_commits_swap_pins_new_model_and_kicks_off_load() async throws {
     let (coord, center, _) = makeCoordinator(map: ["next": "m2"], resident: "m1")
     let spy = CommitSpy()

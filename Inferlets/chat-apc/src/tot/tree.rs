@@ -96,6 +96,10 @@ pub struct TreeResponse {
     pub root: Node,
     pub selected_node_id: Option<String>,
     pub final_answer: Option<String>,
+    /// `true` when `final_answer` is the post-search synthesis, `false` when
+    /// the raw best-leaf content stood (#523 Part A F1) — lets a non-streaming
+    /// caller (e.g. the gated smoke) assert the synthesizer actually ran.
+    pub synthesized: bool,
 }
 
 static NODE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -163,6 +167,10 @@ pub struct Candidate {
     pub id: String,
     pub score: Option<u8>,
     pub ok: bool,
+    /// The candidate's generated answer, used by [`select_beam_diverse`]
+    /// for near-duplicate detection. Empty for non-`ok` candidates (no
+    /// answer to compare) and in tests that only exercise score selection.
+    pub content: String,
 }
 
 /// Ids of the top `m` **ok** candidates, score-descending (`None` ranks
@@ -175,6 +183,49 @@ pub fn select_beam(candidates: &[Candidate], m: usize) -> Vec<String> {
     // input order (deterministic beam + best-leaf selection).
     ok.sort_by(|a, b| b.score.cmp(&a.score));
     ok.into_iter().take(m).map(|c| c.id.clone()).collect()
+}
+
+/// Diversity-aware beam (#523): like [`select_beam`], but when two
+/// surviving siblings are near-duplicate answers (word-set Jaccard ≥
+/// `threshold`, see [`super::diversity`]) the lower-scored paraphrase is
+/// deferred so a *distinct* lower-scored branch can take the beam slot
+/// instead. The beam width is still honored — if diversity can't fill it,
+/// deferred paraphrases backfill in score order — so node counts and the
+/// expand-survivors invariant are unchanged; only *which* equally-deep
+/// branches survive shifts toward diversity.
+///
+/// This is what stops three paraphrases of one idea from filling the beam
+/// and being reported as a successful multi-branch search. Non-`ok`
+/// candidates are excluded exactly as in [`select_beam`]. Pure →
+/// unit-tested.
+pub fn select_beam_diverse(candidates: &[Candidate], m: usize, threshold: f32) -> Vec<String> {
+    let mut ranked: Vec<&Candidate> = candidates.iter().filter(|c| c.ok).collect();
+    ranked.sort_by(|a, b| b.score.cmp(&a.score));
+
+    let mut kept: Vec<&Candidate> = Vec::with_capacity(m);
+    let mut deferred: Vec<&Candidate> = Vec::new();
+    for c in ranked {
+        if kept.len() >= m {
+            break;
+        }
+        let dup = kept
+            .iter()
+            .any(|k| super::diversity::is_near_duplicate(&k.content, &c.content, threshold));
+        if dup {
+            deferred.push(c);
+        } else {
+            kept.push(c);
+        }
+    }
+    // Diversity left the beam under-full → backfill with the deferred
+    // paraphrases (score order) so beam_width is still honored.
+    for c in deferred {
+        if kept.len() >= m {
+            break;
+        }
+        kept.push(c);
+    }
+    kept.into_iter().map(|c| c.id.clone()).collect()
 }
 
 /// Id of the single best **ok** candidate (highest score, `None` last,
@@ -237,6 +288,16 @@ mod tests {
             id: id.to_string(),
             score,
             ok,
+            content: String::new(),
+        }
+    }
+
+    fn cand_text(id: &str, score: Option<u8>, content: &str) -> Candidate {
+        Candidate {
+            id: id.to_string(),
+            score,
+            ok: true,
+            content: content.to_string(),
         }
     }
 
@@ -273,6 +334,63 @@ mod tests {
     fn beam_all_error_keeps_nothing() {
         let c = vec![cand("e1", None, false), cand("e2", Some(8), false)];
         assert!(select_beam(&c, 5).is_empty());
+    }
+
+    // ── select_beam_diverse (#523): paraphrase guard ──
+
+    #[test]
+    fn diverse_beam_demotes_paraphrase_for_a_distinct_branch() {
+        // Two near-identical high-score paraphrases + one distinct lower
+        // score. A plain top-2 beam keeps both paraphrases; the diverse
+        // beam keeps the top paraphrase + the distinct branch, so
+        // three-paraphrases-of-one-idea can't pass as a multi-branch search.
+        let c = vec![
+            cand_text("p1", Some(9), "choose a date plan the party decorate food games"),
+            cand_text("p2", Some(8), "choose the date plan a party decorate food and games"),
+            cand_text("d", Some(5), "budget first: set spend cap then allocate per category"),
+        ];
+        let keep = select_beam_diverse(&c, 2, super::super::diversity::DUP_THRESHOLD);
+        assert_eq!(keep, vec!["p1", "d"]);
+    }
+
+    #[test]
+    fn diverse_beam_backfills_when_diversity_cannot_fill_width() {
+        // All three are paraphrases: the beam still fills to width 2 (node
+        // counts + survivor invariants preserved), preferring higher scores.
+        let c = vec![
+            cand_text("p1", Some(9), "alpha beta gamma delta epsilon"),
+            cand_text("p2", Some(8), "alpha beta gamma delta epsilon zeta"),
+            cand_text("p3", Some(7), "alpha beta gamma delta epsilon eta"),
+        ];
+        let keep = select_beam_diverse(&c, 2, super::super::diversity::DUP_THRESHOLD);
+        assert_eq!(keep, vec!["p1", "p2"]);
+    }
+
+    #[test]
+    fn diverse_beam_matches_plain_beam_when_all_distinct() {
+        let c = vec![
+            cand_text("a", Some(3), "venue first approach"),
+            cand_text("b", None, "guest list first approach"),
+            cand_text("c", Some(9), "theme first approach"),
+            cand_text("d", Some(5), "budget first approach"),
+        ];
+        assert_eq!(
+            select_beam_diverse(&c, 2, super::super::diversity::DUP_THRESHOLD),
+            vec!["c", "d"]
+        );
+    }
+
+    #[test]
+    fn diverse_beam_excludes_non_ok_candidates() {
+        let c = vec![
+            cand("err", Some(10), false),
+            cand_text("ok1", Some(4), "real answer one"),
+            cand_text("ok2", Some(2), "real answer two distinct"),
+        ];
+        assert_eq!(
+            select_beam_diverse(&c, 3, super::super::diversity::DUP_THRESHOLD),
+            vec!["ok1", "ok2"]
+        );
     }
 
     #[test]
@@ -380,6 +498,7 @@ mod tests {
             root: Node::root(),
             selected_node_id: None,
             final_answer: None,
+            synthesized: false,
         };
         let v = serde_json::to_value(&resp).unwrap();
         for k in [
@@ -392,6 +511,7 @@ mod tests {
             "root",
             "selected_node_id",
             "final_answer",
+            "synthesized",
         ] {
             assert!(v.get(k).is_some(), "response missing key {k}");
         }

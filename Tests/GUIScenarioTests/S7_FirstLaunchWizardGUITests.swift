@@ -47,8 +47,19 @@ final class S7_FirstLaunchWizardGUITests: XCTestCase {
       app.staticTexts["Rational Helper must run in the menu bar for Rational to work. Register it as a login item so macOS can launch the helper."].waitForExistence(timeout: 5),
       "step 2 must frame Rational Helper registration as required"
     )
+    XCTAssertFalse(
+      app.buttons["Open Rational"].isEnabled,
+      "Open Rational must not look actionable before helper registration succeeds"
+    )
+    let statusIndicator = app.images["FirstLaunchLoginStatusIndicator"]
+    XCTAssertTrue(statusIndicator.waitForExistence(timeout: 2),
+                  "helper status row must expose a non-clickable status indicator")
+    XCTAssertEqual(statusIndicator.label, "Helper registration required")
+
     app.buttons["Register Rational Helper"].click()
     XCTAssertTrue(app.staticTexts["Rational Helper is registered"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.buttons["Open Rational"].isEnabled)
+    XCTAssertEqual(statusIndicator.label, "Helper registered")
 
     // : the wizard never forces a model download — there is
     // no model step between login-item registration and the main shell.
@@ -76,6 +87,33 @@ final class S7_FirstLaunchWizardGUITests: XCTestCase {
     XCTAssertTrue(app.staticTexts["Rational Helper needs approval in System Settings"].waitForExistence(timeout: 5))
     XCTAssertTrue(app.staticTexts["Open System Settings → General → Login Items and approve Rational Helper, then return here."].waitForExistence(timeout: 5))
     XCTAssertFalse(app.buttons["Open Rational"].isEnabled)
+  }
+
+  @MainActor
+  func test_debug_menu_resets_onboarding_state_for_retesting() async throws {
+    let app = makeApp(suite: "com.ratiothink.app.gui.s7." + UUID().uuidString,
+                      loginStatus: "enabled")
+    app.launchEnvironment["PIE_TEST_FIRST_LAUNCH_COMPLETED"] = "1"
+    app.launch()
+    defer { app.terminate() }
+
+    XCTAssert(app.wait(for: .runningForeground, timeout: 5))
+    app.activate()
+    XCTAssertTrue(app.buttons["chats.newButton"].waitForExistence(timeout: 5))
+
+    let menuBar = app.menuBars.firstMatch
+    XCTAssertTrue(menuBar.waitForExistence(timeout: 5), "main menu bar missing")
+
+    let debugMenu = menuBar.menuBarItems["Debug"]
+    XCTAssertTrue(debugMenu.waitForExistence(timeout: 2),
+                  "Debug builds must expose a developer-only reset menu")
+    let resetOnboarding = debugMenu.menuItems["Reset Onboarding State"]
+    XCTAssertTrue(resetOnboarding.waitForExistence(timeout: 2),
+                  "Debug menu must include onboarding reset for setup-flow retesting")
+    resetOnboarding.click()
+
+    XCTAssertTrue(app.staticTexts["Welcome to Rational"].waitForExistence(timeout: 5),
+                  "debug reset should return the running app to the onboarding wizard")
   }
 
   @MainActor
