@@ -6,9 +6,10 @@ import XCTest
 /// GUI-only. Guards the App's half of the #420 wiring that PR #49 left without
 /// an automated check: `App/SettingsURLHandler.swift`'s `onOpenURL` →
 /// `SettingsDeepLink.isSettings` → `NSApp.activate()` + `openSettings()`,
-/// attached to the window-group root via `.handlesSettingsDeepLink()`. If that
-/// modifier is dropped (or the matcher drifts) the deep link silently degrades
-/// to a plain app-foreground — the app comes forward but Settings never opens.
+/// attached to the window-group root via
+/// `.handlesSettingsDeepLink(settingsNavigation:)`. If that modifier is dropped
+/// (or the matcher drifts) the deep link silently degrades to a plain
+/// app-foreground — the app comes forward but Settings never opens.
 ///
 /// The test delivers the deep link the same way the menu-bar Helper does —
 /// `NSWorkspace.open([url], withApplicationAt: <the running app's bundle>)` —
@@ -39,7 +40,15 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
 
   @MainActor
   func test_settings_deeplink_opens_settings_window() async throws {
-    let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
+    // Launch the staged app next to the UI-test bundle, not "whatever
+    // LaunchServices currently maps com.ratiothink.app to". Developer machines
+    // commonly have multiple DerivedData Rational.app bundles registered; the
+    // deep-link delivery below must target the same artifact this test launched.
+    let appURL = try XCTUnwrap(
+      Self.locateSiblingApp(named: "Rational.app", from: type(of: self)),
+      "Rational.app not found next to test bundle — verify RatioThinkGUITests depends on target RatioThink"
+    )
+    let app = XCUIApplication(url: appURL)
     app.launchArguments.append(contentsOf: Self.restorationOffArgs)
     configureCompletedFirstLaunch(app)
     app.launch()
@@ -62,7 +71,6 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
     // Deliver the deep link exactly as the menu-bar Helper does: to the
     // running app-under-test's own bundle, so LaunchServices can't route it to
     // some other registered Rational.app.
-    let appURL = try resolvedRunningAppURL()
     let cfg = NSWorkspace.OpenConfiguration()
     cfg.activates = true
     let delivered = expectation(description: "deep link delivered")
@@ -95,12 +103,18 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
     XCTAssertEqual(app.state, .runningForeground, "deep link did not foreground the app")
   }
 
-  /// The bundle URL of the running app under test. The deep link is delivered
-  /// to this exact bundle so it can't be routed to an installed copy.
-  private func resolvedRunningAppURL() throws -> URL {
-    let url = NSWorkspace.shared.runningApplications
-      .first { $0.bundleIdentifier == "com.ratiothink.app" }?
-      .bundleURL
-    return try XCTUnwrap(url, "Rational.app is not in runningApplications; launch() may have failed")
+  /// Locates a sibling `.app` next to the test bundle by walking up
+  /// `Bundle(for:)` until a directory containing `<name>` is found.
+  private static func locateSiblingApp(named name: String, from cls: AnyClass) -> URL? {
+    let fm = FileManager.default
+    var dir = Bundle(for: cls).bundleURL.deletingLastPathComponent()
+    for _ in 0..<8 {
+      let candidate = dir.appendingPathComponent(name)
+      if fm.fileExists(atPath: candidate.path) { return candidate }
+      let parent = dir.deletingLastPathComponent()
+      if parent == dir { return nil }
+      dir = parent
+    }
+    return nil
   }
 }
