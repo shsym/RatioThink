@@ -380,24 +380,48 @@ struct ContentToolbar: View {
   }
 
   private func selectModel(_ option: ToolbarModelOptions.Option) {
-    // #460: the clear-vs-load decision keys on the chat's SELECTION
-    // (`selectedModelID` = `Chat.modelID`), NOT engine residency — residency
-    // must not be a selection source. `selectionAction`'s `residentModelID`
-    // parameter is the "current concrete model" it compares the picked row
-    // against; under the single authority that is the chat's pin.
+    Self.performModelSelection(
+      option,
+      selectedModelID: selectedModelID,
+      profileDefaultModel: profileDefaultModel,
+      activeProfileID: viewModel.selectedProfileID,
+      swapCoordinator: swapCoordinator,
+      commitModel: commitModel,
+      onUseProfileDefault: onUseProfileDefault)
+  }
+
+  static func performModelSelection(
+    _ option: ToolbarModelOptions.Option,
+    selectedModelID: String?,
+    profileDefaultModel: String?,
+    activeProfileID: String,
+    swapCoordinator: ProfileSwapCoordinator,
+    commitModel: @escaping (String) -> Bool,
+    onUseProfileDefault: @escaping () -> Void
+  ) {
+    // #460/#527 review v1 F1: model-override decisions compare the picked row
+    // against the chat's EFFECTIVE current selection (explicit pin, else
+    // profile default), not just the raw pin. An unpinned chat following
+    // default A that picks B must raise/execute the override path instead of
+    // silently pinning B while the engine remains on A. Nil is reserved for
+    // the genuinely no-resolvable-model case, where there is no model to
+    // replace and the normal start gate will serve the new pin later.
+    let fromModel = effectiveModelID(selectedModelID: selectedModelID,
+                                     profileDefaultModel: profileDefaultModel)
     switch ToolbarModelOptions.selectionAction(for: option,
                                                residentModelID: selectedModelID) {
     case .unavailable:
       return
     case let .requestModel(modelID, overrideAfterConfirmation):
-      // Confirm gate against the chat's current pin; on confirm, persist the
-      // result onto `Chat.modelID`. All selectable concrete rows pass their
-      // slug as `overrideAfterConfirmation`; choosing the profile-default row
-      // is still an explicit model pick, not a request to follow defaults.
+      // Confirm gate against the effective current model; on confirm, persist
+      // the result onto `Chat.modelID`. All selectable concrete rows pass
+      // their slug as `overrideAfterConfirmation`; choosing the
+      // profile-default row is still an explicit model pick, not a request to
+      // follow defaults.
       swapCoordinator.requestModelOverride(
         modelID: modelID,
-        activeProfileID: viewModel.selectedProfileID,
-        fromModel: selectedModelID
+        activeProfileID: activeProfileID,
+        fromModel: fromModel
       ) { _ in
         if let overrideAfterConfirmation {
           return commitModel(overrideAfterConfirmation)

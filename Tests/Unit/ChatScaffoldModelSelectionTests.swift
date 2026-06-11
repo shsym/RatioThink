@@ -214,6 +214,78 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       "the compatibility toggle should let profile changes ask/suggest the destination default again")
   }
 
+  // MARK: - Review v1 F1: toolbar concrete picks compare against effective model
+
+  func test_toolbar_model_pick_from_unpinned_profile_default_raises_and_loads_override() async {
+    let center = ModelLoadCenter(initialResident: "profile-default-A")
+    let coord = ProfileSwapCoordinator(
+      center: center,
+      modelForProfile: { _ in nil },
+      serveModel: { modelID, _ in center.reconcileEngineResident(modelID) }
+    )
+    let option = ToolbarModelOptions.Option(
+      slug: "picked-model-B",
+      displayName: "picked-model-B",
+      source: nil,
+      isCurrent: false,
+      isProfileDefault: false
+    )
+    var committed: String?
+
+    ContentToolbar.performModelSelection(
+      option,
+      selectedModelID: nil,
+      profileDefaultModel: "profile-default-A",
+      activeProfileID: "chat",
+      swapCoordinator: coord,
+      commitModel: { committed = $0; return true },
+      onUseProfileDefault: {}
+    )
+
+    XCTAssertNil(committed, "cross-model pick must wait for explicit confirmation")
+    guard let token = coord.pending?.id else {
+      return XCTFail("unpinned default A -> pick B must raise the override confirm instead of silently pinning")
+    }
+    coord.confirm(token: token, setAsDefault: false)
+    await waitUntil(timeout: 2.0) { center.residentModelID == "picked-model-B" }
+    XCTAssertEqual(committed, "picked-model-B")
+    XCTAssertEqual(center.residentModelID, "picked-model-B",
+                   "confirming the toolbar pick must execute the override serve path")
+  }
+
+  func test_toolbar_model_pick_with_no_resolvable_model_stays_silent_and_does_not_load() {
+    let center = ModelLoadCenter()
+    let coord = ProfileSwapCoordinator(
+      center: center,
+      modelForProfile: { _ in nil },
+      serveModel: { modelID, _ in center.reconcileEngineResident(modelID) }
+    )
+    let option = ToolbarModelOptions.Option(
+      slug: "picked-model",
+      displayName: "picked-model",
+      source: nil,
+      isCurrent: false,
+      isProfileDefault: false
+    )
+    var committed: String?
+
+    ContentToolbar.performModelSelection(
+      option,
+      selectedModelID: nil,
+      profileDefaultModel: nil,
+      activeProfileID: "chat",
+      swapCoordinator: coord,
+      commitModel: { committed = $0; return true },
+      onUseProfileDefault: {}
+    )
+
+    XCTAssertEqual(committed, "picked-model",
+                   "with no effective current model, the intentional silent branch still just pins the pick")
+    XCTAssertNil(coord.pending)
+    XCTAssertNil(center.residentModelID,
+                 "no-resolvable-model picks must not serve until the normal start gate runs")
+  }
+
   // MARK: - #527 send-time explicit pin vs resident engine mismatch
 
   func test_send_gate_blocks_explicit_pin_that_differs_from_resident_model() throws {
@@ -350,5 +422,15 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
         resolvedModelID: "org/A", residentModelID: "org/A", requiresResidency: true),
       "org/A",
       "reconciled → probe passes resolution → dismissal and verdict settle on the same evidence")
+  }
+
+  private func waitUntil(
+    timeout: TimeInterval,
+    condition: () -> Bool
+  ) async {
+    let deadline = Date().addingTimeInterval(timeout)
+    while !condition(), Date() < deadline {
+      try? await Task.sleep(nanoseconds: 5_000_000)
+    }
   }
 }
