@@ -12,11 +12,13 @@ cannot reproduce deterministically:
                  `[DONE]` sentinel, so the stream stays in flight until
                  either the client cancels (#507's composer stop button /
                  chat deletion) or the test releases it via
-                 `POST /control/release`, which finishes ONE held stream
-                 with `--reply` + a `stop` finish frame (the release is
-                 one-shot so a later held request holds again). Every
-                 request past `--hold-count` returns a normal,
-                 fully-finished reply (`--reply`).
+                 `POST /control/release[?n=K]`, which grants K (default 1)
+                 release credits; each credit finishes exactly ONE held
+                 stream with `--reply` + a `stop` finish frame. Credit
+                 consumption is atomic (#518), so concurrent held streams
+                 each need their own credit. Every request past
+                 `--hold-count` returns a normal, fully-finished reply
+                 (`--reply`).
 
   --mode normal  EVERY chat request returns a normal finished reply
                  (`--reply`). Used by the no-model → Load-default follow-through
@@ -33,6 +35,7 @@ import json
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -55,11 +58,18 @@ class State:
         self.args = args
         self.lock = threading.Lock()
         self.chat_count = 0
-        # #507: set by POST /control/release — ONE held stream finishes with
-        # the normal reply + stop frame instead of waiting for a cancel
-        # (one-shot: the consuming stream clears it so a later held request
-        # holds again).
-        self.release = threading.Event()
+        # #507/#518: release credits granted by POST /control/release.
+        # Each credit finishes exactly ONE held stream; held threads consume
+        # credits atomically under `lock` (a bare Event's test-then-clear let
+        # two concurrent holders both finish on a single release).
+        self.release_credits = 0
+
+    def try_consume_release(self) -> bool:
+        with self.lock:
+            if self.release_credits > 0:
+                self.release_credits -= 1
+                return True
+            return False
 
     def next_request_index(self) -> int:
         with self.lock:
@@ -90,11 +100,26 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
         _ = self.rfile.read(length)  # drain the request body
-        if self.path == "/control/release":
-            self.server.state.release.set()
-            self.send_json({"released": True})
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/control/release":
+            # #518: counting release. `?n=K` (default 1) grants K credits;
+            # each credit finishes exactly ONE held stream — consumption is
+            # atomic under `state.lock`, so two concurrently-held streams can
+            # never both consume a single credit.
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                count = int(query.get("n", ["1"])[0])
+            except ValueError:
+                self.send_error(400, "n must be an integer")
+                return
+            if count < 1:
+                self.send_error(400, "n must be >= 1")
+                return
+            with self.server.state.lock:
+                self.server.state.release_credits += count
+            self.send_json({"released": count})
             return
-        if self.path != "/v1/chat/completions":
+        if parsed.path != "/v1/chat/completions":
             self.send_error(404, "not found")
             return
 
@@ -141,8 +166,7 @@ class Handler(BaseHTTPRequestHandler):
         deadline = time.monotonic() + hold_seconds
         while time.monotonic() < deadline:
             try:
-                if self.server.state.release.is_set():
-                    self.server.state.release.clear()  # one-shot per held stream
+                if self.server.state.try_consume_release():
                     self.write_frame({"choices": [{"index": 0, "delta": {"content": reply}, "finish_reason": None}]})
                     self.write_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
                     self.wfile.write(b"data: [DONE]\n\n")

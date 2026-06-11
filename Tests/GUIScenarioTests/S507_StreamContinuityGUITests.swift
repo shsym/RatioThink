@@ -38,34 +38,8 @@ final class S507_StreamContinuityGUITests: XCTestCase {
 
   @MainActor
   func test_stream_survives_chat_switch_with_row_indicator_and_finishes_in_background() async throws {
-    let config = try Self.loadConfig()
-    let baseURL = try XCTUnwrap(config["PIE_TEST_ENGINE_BASE_URL"],
-                                "\(Self.configPath) must define PIE_TEST_ENGINE_BASE_URL")
-    let pieHome = try XCTUnwrap(config["PIE_TEST_GUI_HOME"],
-                                "\(Self.configPath) must define PIE_TEST_GUI_HOME")
-    let model = config["PIE_TEST_CHAT_MODEL"] ?? "gui-stream-deterministic"
-
-    let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
-    app.launchArguments.append(contentsOf: [
-      "-NSQuitAlwaysKeepsWindows", "NO",
-      "-ApplePersistenceIgnoreState", "YES",
-    ])
-    app.launchEnvironment["PIE_HOME"] = pieHome
-    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = model
-    // #496 seam: there is no real background helper in this harness, so the
-    // helper-health ladder escalates mid-test and the recovery overlay
-    // covers the chat body (its base-URL bypass fix is tracked separately).
-    // Pin the ladder healthy — chat traffic goes straight to the mock via
-    // PIE_TEST_ENGINE_BASE_URL and never touches the helper.
-    app.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "healthy"
-    configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
-    app.launch()
+    let (app, baseURL) = try launchConfiguredApp()
     defer { app.terminate() }
-    XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "Rational.app did not reach runningForeground")
-    app.activate()
-    normalizeWindowToVisibleScreen(in: app)
 
     // Send a turn the mock will stream partially and then hold open.
     openFreshChat(in: app)
@@ -145,7 +119,118 @@ final class S507_StreamContinuityGUITests: XCTestCase {
                   "follow-up reply never rendered after stop; app tree: \(app.debugDescription)")
   }
 
+  /// Five chats streaming AT ONCE (#507 acceptance: independent in-flight
+  /// sends across chats, scaled past the pairwise case). Starts a held
+  /// stream in 5 separate chats, asserts the sidebar shows FIVE
+  /// `chats.row.streaming` indicators simultaneously (counted, not
+  /// firstMatch), releases all held streams (5 atomic credits — #518), and
+  /// verifies every indicator clears and every chat persisted its full
+  /// reply (rows selected by content, as row order is not a contract).
+  @MainActor
+  func test_five_chats_stream_concurrently_with_per_row_indicators() async throws {
+    let chatCount = 5
+    let (app, baseURL) = try launchConfiguredApp()
+    defer { app.terminate() }
+
+    // Start a held stream in each of 5 fresh chats. The first chat comes
+    // from the empty-state affordance; subsequent ones from the header's
+    // New Chat button. Each send must reach the harness (its partial
+    // renders) before creating the next chat, so all 5 requests land in
+    // hold slots deterministically.
+    openFreshChat(in: app)
+    for index in 1...chatCount {
+      if index > 1 {
+        let newChat = app.buttons["chats.newButton"]
+        XCTAssertTrue(newChat.waitForExistence(timeout: 5), "chats.newButton missing")
+        newChat.click()
+        let composer = app.descendants(matching: .any).matching(identifier: "composer.text").firstMatch
+        XCTAssertTrue(composer.waitForExistence(timeout: 5),
+                      "chat \(index) composer missing; app tree: \(app.debugDescription)")
+      }
+      typeComposerText("Concurrent stream \(index).", in: app)
+      sendComposerDraft(in: app)
+      XCTAssertTrue(waitForStaticTextContaining(holdToken, in: app, timeout: 20),
+                    "chat \(index)'s held partial never rendered; app tree: \(app.debugDescription)")
+    }
+
+    // All 5 chats in flight at once: one spinner PER streaming row.
+    XCTAssertTrue(waitForStreamingIndicatorCount(chatCount, in: app, timeout: 15),
+                  "expected \(chatCount) simultaneous chats.row.streaming indicators; app tree: \(app.debugDescription)")
+
+    // Release every held stream while most chats are backgrounded — each
+    // credit finishes exactly one held stream (#518 atomic consumption).
+    try await Self.releaseHeldStream(baseURL: baseURL, count: chatCount)
+    XCTAssertTrue(waitForStreamingIndicatorCount(0, in: app, timeout: 20),
+                  "streaming indicators did not all clear after releasing \(chatCount) streams; app tree: \(app.debugDescription)")
+
+    // Every chat persisted partial + released tail. Row order is not a
+    // contract — visit each row and check its transcript.
+    let rows = app.staticTexts.matching(identifier: "New Chat")
+    XCTAssertTrue(rows.element(boundBy: chatCount - 1).waitForExistence(timeout: 5),
+                  "expected \(chatCount) chat rows; app tree: \(app.debugDescription)")
+    var chatsWithFullReply = 0
+    for index in 0..<chatCount {
+      rows.element(boundBy: index).click()
+      if waitForStaticTextContaining(holdToken, in: app, timeout: 5),
+         waitForStaticTextContaining(releasedReply, in: app, timeout: 5) {
+        chatsWithFullReply += 1
+      }
+    }
+    XCTAssertEqual(chatsWithFullReply, chatCount,
+                   "every concurrently-streaming chat must persist partial + released tail; app tree: \(app.debugDescription)")
+  }
+
   // MARK: - helpers
+
+  /// Shared launch path for both scenarios: read the wrapper's env config,
+  /// launch with the engine base-URL + helper-health pin seams, and
+  /// normalize the window into the visible screen.
+  @MainActor
+  private func launchConfiguredApp() throws -> (XCUIApplication, String) {
+    let config = try Self.loadConfig()
+    let baseURL = try XCTUnwrap(config["PIE_TEST_ENGINE_BASE_URL"],
+                                "\(Self.configPath) must define PIE_TEST_ENGINE_BASE_URL")
+    let pieHome = try XCTUnwrap(config["PIE_TEST_GUI_HOME"],
+                                "\(Self.configPath) must define PIE_TEST_GUI_HOME")
+    let model = config["PIE_TEST_CHAT_MODEL"] ?? "gui-stream-deterministic"
+
+    let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
+    app.launchArguments.append(contentsOf: [
+      "-NSQuitAlwaysKeepsWindows", "NO",
+      "-ApplePersistenceIgnoreState", "YES",
+    ])
+    app.launchEnvironment["PIE_HOME"] = pieHome
+    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = model
+    // #496 seam: there is no real background helper in this harness — pin
+    // the health ladder healthy so it never escalates mid-test. Chat
+    // traffic goes straight to the mock via PIE_TEST_ENGINE_BASE_URL and
+    // never touches the helper.
+    app.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "healthy"
+    configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
+    app.launch()
+    XCTAssert(app.wait(for: .runningForeground, timeout: 10),
+              "Rational.app did not reach runningForeground")
+    app.activate()
+    normalizeWindowToVisibleScreen(in: app)
+    return (app, baseURL)
+  }
+
+  /// Wait until the sidebar shows exactly `count` per-row streaming
+  /// indicators — counted across the whole list, so five concurrent
+  /// streams require five simultaneous spinners (not just a firstMatch).
+  private func waitForStreamingIndicatorCount(_ count: Int,
+                                              in app: XCUIApplication,
+                                              timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if app.descendants(matching: .any).matching(identifier: "chats.row.streaming").count == count {
+        return true
+      }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25))
+    }
+    return false
+  }
 
   /// The app restores its last window frame from the operator's real
   /// defaults domain; a frame saved under a different display arrangement
@@ -177,10 +262,11 @@ final class S507_StreamContinuityGUITests: XCTestCase {
     app.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
   }
 
-  /// `POST /control/release` — tells the harness to finish the held stream
-  /// with the normal reply + stop frame.
-  private static func releaseHeldStream(baseURL: String) async throws {
-    var request = URLRequest(url: try XCTUnwrap(URL(string: "\(baseURL)/control/release")))
+  /// `POST /control/release?n=count` — grants `count` release credits;
+  /// each finishes exactly one held stream with the normal reply + stop
+  /// frame (#518 atomic consumption).
+  private static func releaseHeldStream(baseURL: String, count: Int = 1) async throws {
+    var request = URLRequest(url: try XCTUnwrap(URL(string: "\(baseURL)/control/release?n=\(count)")))
     request.httpMethod = "POST"
     let (_, response) = try await URLSession.shared.data(for: request)
     let status = (response as? HTTPURLResponse)?.statusCode
