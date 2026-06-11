@@ -42,8 +42,11 @@ final class S507_StreamContinuityGUITests: XCTestCase {
     defer { app.terminate() }
 
     // Send a turn the mock will stream partially and then hold open.
+    // #512: this first user message also becomes the chat's sidebar title,
+    // which the return-to-original step keys on.
+    let originalPrompt = "Generate a very long answer."
     openFreshChat(in: app)
-    typeComposerText("Generate a very long answer.", in: app)
+    typeComposerText(originalPrompt, in: app)
     sendComposerDraft(in: app)
 
     // The partial delta renders only after the stream writer flushes it to the
@@ -71,21 +74,14 @@ final class S507_StreamContinuityGUITests: XCTestCase {
                   "streaming row indicator did not clear after the stream finished; app tree: \(app.debugDescription)")
 
     // 3) Return to the original chat: the bubble holds partial + released
-    //    tail, persisted while unmounted. Both rows are titled "New Chat"
-    //    and the sidebar's recency order is not part of this contract, so
-    //    select by CONTENT — click rows until the streamed transcript shows.
-    let rows = app.staticTexts.matching(identifier: "New Chat")
-    XCTAssertTrue(rows.element(boundBy: 1).waitForExistence(timeout: 5),
-                  "expected two chat rows; app tree: \(app.debugDescription)")
-    var foundOriginal = false
-    for index in 0..<rows.count {
-      rows.element(boundBy: index).click()
-      if waitForStaticTextContaining(holdToken, in: app, timeout: 3) {
-        foundOriginal = true
-        break
-      }
-    }
-    XCTAssertTrue(foundOriginal,
+    //    tail, persisted while unmounted. #512: the original is auto-titled
+    //    from its first user message, so select it by that derived title
+    //    (the fresh chat keeps the "New Chat" placeholder).
+    let originalRow = sidebarRow(titled: originalPrompt, in: app)
+    XCTAssertTrue(originalRow.waitForExistence(timeout: 5),
+                  "original chat row (auto-titled '\(originalPrompt)') missing; app tree: \(app.debugDescription)")
+    originalRow.click()
+    XCTAssertTrue(waitForStaticTextContaining(holdToken, in: app, timeout: 5),
                   "partial delta lost after background completion; app tree: \(app.debugDescription)")
     XCTAssertTrue(waitForStaticTextContaining(releasedReply, in: app, timeout: 10),
                   "released tail '\(releasedReply)' missing — the backgrounded stream was cancelled instead of finishing; app tree: \(app.debugDescription)")
@@ -163,14 +159,15 @@ final class S507_StreamContinuityGUITests: XCTestCase {
     XCTAssertTrue(waitForStreamingIndicatorCount(0, in: app, timeout: 20),
                   "streaming indicators did not all clear after releasing \(chatCount) streams; app tree: \(app.debugDescription)")
 
-    // Every chat persisted partial + released tail. Row order is not a
-    // contract — visit each row and check its transcript.
-    let rows = app.staticTexts.matching(identifier: "New Chat")
-    XCTAssertTrue(rows.element(boundBy: chatCount - 1).waitForExistence(timeout: 5),
-                  "expected \(chatCount) chat rows; app tree: \(app.debugDescription)")
+    // Every chat persisted partial + released tail. #512: each chat is
+    // auto-titled from its first user message, so visit each row by its
+    // derived title (row order is not a contract).
     var chatsWithFullReply = 0
-    for index in 0..<chatCount {
-      rows.element(boundBy: index).click()
+    for index in 1...chatCount {
+      let row = sidebarRow(titled: "Concurrent stream \(index).", in: app)
+      XCTAssertTrue(row.waitForExistence(timeout: 5),
+                    "chat \(index) row (auto-titled) missing; app tree: \(app.debugDescription)")
+      row.click()
       if waitForStaticTextContaining(holdToken, in: app, timeout: 5),
          waitForStaticTextContaining(releasedReply, in: app, timeout: 5) {
         chatsWithFullReply += 1
@@ -181,6 +178,15 @@ final class S507_StreamContinuityGUITests: XCTestCase {
   }
 
   // MARK: - helpers
+
+  /// Sidebar row by title, scoped to `chats.list` so a transcript bubble
+  /// containing the same text can never satisfy the query (#512: a chat's
+  /// title is derived from its first user message, which also appears as
+  /// the user bubble).
+  private func sidebarRow(titled title: String, in app: XCUIApplication) -> XCUIElement {
+    app.descendants(matching: .any).matching(identifier: "chats.list").firstMatch
+      .staticTexts[title].firstMatch
+  }
 
   /// Shared launch path for both scenarios: read the wrapper's env config,
   /// launch with the engine base-URL + helper-health pin seams, and
