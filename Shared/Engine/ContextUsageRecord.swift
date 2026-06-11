@@ -4,10 +4,12 @@ import Foundation
 public struct ContextUsageID: Codable, Equatable, Hashable, Sendable {
   public let chatID: UUID
   public let modelID: String
+  public let requestID: String
 
-  public init(chatID: UUID, modelID: String) {
+  public init(chatID: UUID, modelID: String, requestID: String) {
     self.chatID = chatID
     self.modelID = modelID
+    self.requestID = requestID
   }
 }
 
@@ -48,7 +50,7 @@ public struct ContextUsageRecord: Codable, Equatable, Identifiable, Sendable {
   public let id: ContextUsageID
   public var chatID: UUID { id.chatID }
   public var modelID: String { id.modelID }
-  public var requestID: String?
+  public var requestID: String? { id.requestID }
   public var lastUsedAt: Date
   public var residency: ContextResidency
   public var usage: ContextPageUsage?
@@ -58,8 +60,8 @@ public struct ContextUsageRecord: Codable, Equatable, Identifiable, Sendable {
               lastUsedAt: Date,
               residency: ContextResidency,
               usage: ContextPageUsage?) {
+    assert(requestID == nil || requestID == id.requestID, "ContextUsageRecord.requestID must match id.requestID")
     self.id = id
-    self.requestID = requestID
     self.lastUsedAt = lastUsedAt
     self.residency = residency
     self.usage = usage
@@ -78,7 +80,7 @@ public final class ContextUsageTracker: ObservableObject {
   }
 
   public func markRequestStarted(chatID: UUID, modelID: String, requestID: String) {
-    let id = ContextUsageID(chatID: chatID, modelID: modelID)
+    let id = ContextUsageID(chatID: chatID, modelID: modelID, requestID: requestID)
     byID[id] = ContextUsageRecord(
       id: id,
       requestID: requestID,
@@ -90,8 +92,8 @@ public final class ContextUsageTracker: ObservableObject {
   }
 
   public func markRequestFinished(chatID: UUID, modelID: String, requestID: String) {
-    let id = ContextUsageID(chatID: chatID, modelID: modelID)
-    guard var record = byID[id], record.requestID == requestID else { return }
+    let id = ContextUsageID(chatID: chatID, modelID: modelID, requestID: requestID)
+    guard var record = byID[id] else { return }
     record.lastUsedAt = now()
     record.residency = .requestLocalDestroyed
     byID[id] = record
@@ -100,7 +102,11 @@ public final class ContextUsageTracker: ObservableObject {
 
   private func publish() {
     records = byID.values.sorted {
-      if $0.lastUsedAt == $1.lastUsedAt { return $0.modelID < $1.modelID }
+      if $0.lastUsedAt == $1.lastUsedAt {
+        if $0.modelID != $1.modelID { return $0.modelID < $1.modelID }
+        if $0.chatID != $1.chatID { return $0.chatID.uuidString < $1.chatID.uuidString }
+        return $0.id.requestID < $1.id.requestID
+      }
       return $0.lastUsedAt > $1.lastUsedAt
     }
   }

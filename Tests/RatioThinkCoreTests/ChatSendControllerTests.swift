@@ -411,6 +411,60 @@ final class ChatSendControllerTests: XCTestCase {
     XCTAssertEqual(contextUsageRecord(in: tracker, modelID: "m2")?.residency, .requestLocalDestroyed)
   }
 
+  func test_contextUsage_sameModelSupersessionKeepsNewRequestActive() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "first", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engineA = ManualChatEngine()
+    let engineB = ManualChatEngine()
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engineA,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"),
+      contextUsageTracker: tracker
+    )
+    try await waitUntil("request A usage active") {
+      engineA.requests.count == 1 &&
+        self.contextUsageRecord(in: tracker, modelID: "m")?.residency == .requestLocalActive
+    }
+    let requestAID = try XCTUnwrap(contextUsageRecord(in: tracker, modelID: "m")?.requestID)
+
+    chat.messages.append(Message(role: "user", content: "second", ts: Date(timeIntervalSinceReferenceDate: 2)))
+    try context.save()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engineB,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"),
+      contextUsageTracker: tracker
+    )
+
+    try await waitUntil("request B usage active while A remains tracked") {
+      tracker.records.count == 2 &&
+        self.contextUsageRecord(in: tracker, modelID: "m")?.residency == .requestLocalActive
+    }
+
+    let activeRecord = try XCTUnwrap(contextUsageRecord(in: tracker, modelID: "m"))
+    XCTAssertEqual(activeRecord.residency, .requestLocalActive)
+    XCTAssertNotEqual(activeRecord.requestID, requestAID)
+    XCTAssertEqual(
+      tracker.records.first(where: { $0.requestID == requestAID })?.residency,
+      .requestLocalDestroyed
+    )
+  }
+
   func test_engineNotReady_failure_assistant_bubble_is_normalized_actionable_line() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)
@@ -468,7 +522,18 @@ final class ChatSendControllerTests: XCTestCase {
   }
 
   private func contextUsageRecord(in tracker: ContextUsageTracker, modelID: String) -> ContextUsageRecord? {
-    tracker.records.first { $0.modelID == modelID }
+    tracker.records
+      .filter { $0.modelID == modelID }
+      .sorted { lhs, rhs in
+        if lhs.residency != rhs.residency {
+          return lhs.residency == .requestLocalActive
+        }
+        if lhs.lastUsedAt != rhs.lastUsedAt {
+          return lhs.lastUsedAt > rhs.lastUsedAt
+        }
+        return lhs.id.requestID > rhs.id.requestID
+      }
+      .first
   }
 
   // MARK: - speculation injection (#426 Fast Think)

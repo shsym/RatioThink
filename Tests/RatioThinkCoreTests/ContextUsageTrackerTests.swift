@@ -35,6 +35,47 @@ final class ContextUsageTrackerTests: XCTestCase {
     XCTAssertEqual(tracker.records.first?.lastUsedAt, Date(timeIntervalSince1970: 1))
   }
 
+  func test_sameChatSameModelSuccessiveRequestsProduceDistinctRecords() {
+    var tick: TimeInterval = 1
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: tick) })
+    let chatID = UUID()
+
+    tracker.markRequestStarted(chatID: chatID, modelID: "m", requestID: "r1")
+    tick = 2
+    tracker.markRequestFinished(chatID: chatID, modelID: "m", requestID: "r1")
+    tick = 3
+    tracker.markRequestStarted(chatID: chatID, modelID: "m", requestID: "r2")
+
+    XCTAssertEqual(tracker.records.map(\.requestID), ["r2", "r1"])
+    XCTAssertEqual(tracker.records.map(\.residency), [.requestLocalActive, .requestLocalDestroyed])
+    XCTAssertEqual(Set(tracker.records.map(\.id)), [
+      ContextUsageID(chatID: chatID, modelID: "m", requestID: "r1"),
+      ContextUsageID(chatID: chatID, modelID: "m", requestID: "r2"),
+    ])
+    XCTAssertTrue(tracker.records.allSatisfy { $0.usage == nil })
+  }
+
+  func test_staleFinishForPriorRequestDoesNotMutateNewerSameModelRecord() {
+    var tick: TimeInterval = 1
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: tick) })
+    let chatID = UUID()
+
+    tracker.markRequestStarted(chatID: chatID, modelID: "m", requestID: "r1")
+    tick = 2
+    tracker.markRequestStarted(chatID: chatID, modelID: "m", requestID: "r2")
+    tick = 3
+    tracker.markRequestFinished(chatID: chatID, modelID: "m", requestID: "r1")
+    tick = 4
+    tracker.markRequestFinished(chatID: chatID, modelID: "m", requestID: "missing")
+
+    XCTAssertEqual(tracker.records.map(\.requestID), ["r1", "r2"])
+    XCTAssertEqual(tracker.records.map(\.residency), [.requestLocalDestroyed, .requestLocalActive])
+    XCTAssertEqual(
+      tracker.records.first(where: { $0.requestID == "r2" })?.lastUsedAt,
+      Date(timeIntervalSince1970: 2)
+    )
+  }
+
   func test_modelSwitchCreatesDistinctRecordKey() {
     let chatID = UUID()
     let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
