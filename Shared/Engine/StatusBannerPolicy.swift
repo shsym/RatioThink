@@ -118,6 +118,17 @@ public enum StatusBannerReducer {
 
   // MARK: - helper axis
 
+  /// Whether the helper transport axis OWNS the unified banner for this state —
+  /// i.e. `helperBanner` renders (repairing / cooling-down / unreachable),
+  /// outranking the engine axis. The chat body reads this to suppress its
+  /// in-chat ENGINE banners while the Helper is the real fault, so a dead Helper
+  /// is attributed to the Helper (one window banner) and never ALSO re-framed as
+  /// an engine fault in the body (#496). Single source of truth with the banner
+  /// itself, so the two surfaces can never disagree.
+  public static func helperOwnsBanner(_ helper: HelperHealth) -> Bool {
+    helperBanner(helper: helper) != nil
+  }
+
   /// Map the helper transport ladder onto the three tiers:
   ///   · `.healthy`                       → Tier 0 (no banner)
   ///   · `.reconnecting` (transient win)  → Tier 0 (silent; pip stays calm)

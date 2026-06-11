@@ -1,11 +1,10 @@
 """Level-1 sibling-diversity probe for the tree-of-thought default
 temperature — MEASUREMENT, not a test.
 
-The ToT design relies on sampling temperature ALONE for level-1 sibling
-diversity (`search.rs`: level-1 children answer the conversation
-directly; no per-branch instruction variation, no seed jitter). This
-probe measures whether the default actually buys distinct branches on a
-real portable-Metal engine, instead of assuming it: for each candidate
+Sibling diversity has two sources — per-branch strategy directives
+(`search.rs` `strategy_directive`) and sampling temperature; this probe
+isolates and measures the TEMPERATURE contribution on a real
+portable-Metal engine, instead of assuming it: for each candidate
 temperature it runs depth-1 ToT searches (breadth = the production
 DEFAULT_BREADTH) over three representative prompts — short factual,
 math, open-ended — and reports pairwise similarity metrics across the

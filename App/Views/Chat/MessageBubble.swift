@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import MarkdownUI
 import os
@@ -32,6 +33,7 @@ struct MessageBubble: View {
                foreground: .white,
                alignment: .trailing)
       }
+      .contextMenu { copyMenuItems }
     case .assistant:
       HStack {
         VStack(alignment: .leading, spacing: 6) {
@@ -62,9 +64,22 @@ struct MessageBubble: View {
           if let text = message.notice.message {
             TurnNoticeRow(text: text, footnote: message.notice.isFootnote)
           }
+          if let text = message.generationPerformanceText {
+            GenerationPerformanceRow(text: text)
+              .reportMessageBubbleFrame(.generationPerformance(message.id))
+          }
+          // Deterministic copy path (#515): right-click on selectable
+          // MarkdownUI text surfaces AppKit's text menu, not our
+          // `.contextMenu`, so the guaranteed affordance is this explicit
+          // button. Copies the canonical answer source across every
+          // Markdown block — see `MessageCopyPlan`.
+          if !message.content.isEmpty {
+            CopyAnswerButton(text: message.content)
+          }
         }
         Spacer(minLength: 60)
       }
+      .contextMenu { copyMenuItems }
     case .system:
       HStack {
         Spacer()
@@ -72,6 +87,22 @@ struct MessageBubble: View {
           .font(.caption)
           .foregroundStyle(.secondary)
         Spacer()
+      }
+      .contextMenu { copyMenuItems }
+    }
+  }
+
+  /// Deterministic copy path (#515): MarkdownUI splits one message into
+  /// many selectable `Text` blocks, so mouse selection cannot span a whole
+  /// rendered message. The context menu copies the canonical backing text
+  /// from `ChatMessageItem` instead — see `MessageCopyPlan` for the
+  /// answer/thinking boundary policy.
+  @ViewBuilder
+  private var copyMenuItems: some View {
+    ForEach(MessageCopyPlan.plan(for: message).items, id: \.label) { item in
+      Button(item.label) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(item.text, forType: .string)
       }
     }
   }
@@ -86,10 +117,84 @@ struct MessageBubble: View {
       .markdownImageProvider(BlockedImageProvider())
       .environment(\.openURL, SafeLinkOpenURLAction.action)
       .textSelection(.enabled)
+      .reportMessageBubbleFrame(.content(message.id))
       .padding(.horizontal, 12)
       .padding(.vertical, 8)
       .background(background, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
       .frame(maxWidth: .infinity, alignment: alignment == .trailing ? .trailing : .leading)
+  }
+}
+
+
+// MARK: - layout frame reporting
+
+/// Internal, no-op-unless-observed layout telemetry for app-unit geometry
+/// guards. The production transcript does not read this preference; tests use
+/// it to validate the real SwiftUI/AppKit-hosted `MessageBubble` tree instead
+/// of duplicating fragile headless layout math.
+enum MessageBubbleLayoutFrameID: Hashable {
+  case content(UUID)
+  case generationPerformance(UUID)
+}
+
+struct MessageBubbleLayoutFramePreferenceKey: PreferenceKey {
+  static var defaultValue: [MessageBubbleLayoutFrameID: CGRect] = [:]
+
+  static func reduce(
+    value: inout [MessageBubbleLayoutFrameID: CGRect],
+    nextValue: () -> [MessageBubbleLayoutFrameID: CGRect]
+  ) {
+    value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+  }
+}
+
+private struct MessageBubbleFrameReporter: View {
+  let id: MessageBubbleLayoutFrameID
+
+  var body: some View {
+    GeometryReader { proxy in
+      Color.clear.preference(key: MessageBubbleLayoutFramePreferenceKey.self,
+                             value: [id: proxy.frame(in: .global)])
+    }
+  }
+}
+
+private extension View {
+  func reportMessageBubbleFrame(_ id: MessageBubbleLayoutFrameID) -> some View {
+    background(MessageBubbleFrameReporter(id: id))
+  }
+}
+
+// MARK: - copy button
+
+/// Quiet always-available "Copy" under an assistant answer (#515). Writes
+/// the message's canonical Markdown source to the general pasteboard and
+/// flips to a brief "Copied" confirmation.
+private struct CopyAnswerButton: View {
+  let text: String
+  @State private var copied = false
+
+  var body: some View {
+    Button {
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(text, forType: .string)
+      copied = true
+      Task {
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        copied = false
+      }
+    } label: {
+      HStack(spacing: 3) {
+        Image(systemName: copied ? "checkmark" : "doc.on.doc")
+        Text(copied ? "Copied" : "Copy")
+      }
+      .font(.caption2)
+      .foregroundStyle(.secondary)
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .help("Copy the full answer as Markdown source")
+    .accessibilityIdentifier("message.copyAnswer")
   }
 }
 
@@ -121,6 +226,18 @@ private struct TurnNoticeRow: View {
     .foregroundStyle(.secondary)
     .frame(maxWidth: .infinity, alignment: .leading)
     .accessibilityElement(children: .combine)
+  }
+}
+
+private struct GenerationPerformanceRow: View {
+  let text: String
+
+  var body: some View {
+    Text(text)
+      .font(.caption2)
+      .foregroundStyle(.secondary)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .accessibilityIdentifier("message.generationPerformance")
   }
 }
 

@@ -88,7 +88,108 @@ final class S381_NoModelLoadDefaultGUITests: XCTestCase {
                   "assistant reply '\(loadedReply)' never rendered after Load; app tree: \(app.debugDescription)")
   }
 
+  /// #516 — the gate's promise is now kept: a send blocked behind the
+  /// no-model gate auto-submits once Load resolves the model. The flow
+  /// differs from the test above (which Loads FIRST, then sends manually):
+  ///
+  ///   chat opens → launch gate cancelled → type a message → Send is
+  ///   BLOCKED (gate re-raises, pending send armed) → tap Load → engine
+  ///   starts + serves the model → the original message sends itself —
+  ///   the reply streams in with NO second interaction with the composer.
+  @MainActor
+  func test_516_blocked_send_auto_submits_after_load() async throws {
+    let config = try Self.loadConfig()
+    let baseURL = try XCTUnwrap(config["PIE_TEST_ENGINE_BASE_URL"],
+                                "\(Self.configPath) must define PIE_TEST_ENGINE_BASE_URL")
+    let pieHome = try XCTUnwrap(config["PIE_TEST_GUI_HOME"],
+                                "\(Self.configPath) must define PIE_TEST_GUI_HOME")
+
+    let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
+    app.launchArguments.append(contentsOf: [
+      "-NSQuitAlwaysKeepsWindows", "NO",
+      "-ApplePersistenceIgnoreState", "YES",
+    ])
+    app.launchEnvironment["PIE_HOME"] = pieHome
+    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
+    app.launchEnvironment["PIE_TEST_ENGINE_START_TO_RUNNING"] = "1"
+    configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
+    app.launch()
+    defer { app.terminate() }
+    XCTAssert(app.wait(for: .runningForeground, timeout: 10),
+              "Rational.app did not reach runningForeground")
+    app.activate()
+
+    openFreshChat(in: app)
+
+    // The launch-time engine-start prompt raises the same gate (no pending
+    // send — the composer is empty). Cancel it so we can type; the
+    // once-per-launch flag keeps it from re-popping on its own.
+    let cancel = app.buttons["noModel.cancel"]
+    XCTAssertTrue(cancel.waitForExistence(timeout: 15),
+                  "launch-time no-model gate never appeared; app tree: \(app.debugDescription)")
+    // Re-drive Cancel until the sheet dismisses — the same dropped-click
+    // defense as the Load loop below (a synthesized sheet-button click can
+    // be dropped while the app settles / is briefly not key).
+    let cancelDeadline = Date().addingTimeInterval(20)
+    while Date() < cancelDeadline {
+      if !cancel.exists { break }
+      app.activate()
+      if cancel.isHittable { cancel.click() }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(1))
+    }
+    XCTAssertFalse(cancel.exists, "launch gate did not dismiss on Cancel")
+
+    // Type the message and try to send — the gate must BLOCK the send
+    // (nothing resolves a model) and re-raise with Load, arming #516's
+    // pending auto-send for this exact draft.
+    let pendingMessage = "auto-send me once the model loads"
+    typeComposerText(pendingMessage, in: app)
+    let send = app.buttons["composer.send"]
+    XCTAssertTrue(send.waitForExistence(timeout: 5))
+    send.click()
+
+    let load = app.buttons["noModel.load"]
+    XCTAssertTrue(load.waitForExistence(timeout: 15),
+                  "blocked send did not raise the no-model gate; app tree: \(app.debugDescription)")
+
+    // Drive Load until the gate dismisses (same dropped-click defense as
+    // the test above).
+    let deadline = Date().addingTimeInterval(40)
+    var clicks = 0
+    while Date() < deadline {
+      if !load.exists { break }
+      if load.isHittable {
+        load.click()
+        clicks += 1
+      }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(2))
+    }
+    XCTAssertFalse(load.exists,
+                   "Load did not resolve the model (gate still up after \(clicks) click(s)); app tree: \(app.debugDescription)")
+
+    // The promise: the reply streams in WITHOUT any further composer
+    // interaction — no typing, no send click.
+    XCTAssertTrue(waitForStaticTextContaining(loadedReply, in: app, timeout: 30),
+                  "pending message did not auto-send after Load: reply '\(loadedReply)' never rendered; app tree: \(app.debugDescription)")
+
+    // Once and only once: exactly one user bubble carries the message.
+    let userBubbles = app.descendants(matching: .staticText)
+      .matching(NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+                            pendingMessage, pendingMessage))
+    XCTAssertEqual(userBubbles.count, 1,
+                   "pending message must send exactly once, found \(userBubbles.count); app tree: \(app.debugDescription)")
+  }
+
   // MARK: - helpers
+
+  private func waitForDisappearance(of element: XCUIElement, timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if !element.exists { return true }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25))
+    }
+    return !element.exists
+  }
 
   private func waitForStaticTextContaining(_ needle: String,
                                            in app: XCUIApplication,

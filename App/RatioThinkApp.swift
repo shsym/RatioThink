@@ -50,6 +50,11 @@ struct RatioThinkApp: App {
   /// and surfaced as the toolbar helper-ring + the escalation banner.
   @StateObject private var helperHealth: HelperHealthController
   @StateObject private var engineClientStore: EngineClientStore
+  /// #507: app-scoped per-chat send pipelines, so an in-flight stream
+  /// survives chat switches and multiple chats can stream concurrently.
+  /// Also feeds the #413 generation gate (any chat in flight → hold
+  /// failed helper polls).
+  @StateObject private var sendCoordinator: ChatSendCoordinator
   /// Phase 3.8 (review v2 F1): the Add Model sheet's `.queueDownload`
   /// outcome runs through this controller so the existing
   /// `ModelDownloader` is actually invoked. Lives at app scope so
@@ -257,6 +262,15 @@ struct RatioThinkApp: App {
     }
     _helperHealth = StateObject(wrappedValue: helperHealthController)
 
+    // #507: chat sends are app-scoped (per-chat controllers) so streams
+    // outlive the detail view. The #413 generation gate moves here with
+    // them: hold failed helper polls while ANY chat is streaming.
+    let chatSendCoordinator = ChatSendCoordinator()
+    chatSendCoordinator.onAnyInFlightChange = { [weak helperHealthController] active in
+      helperHealthController?.setGenerating(active)
+    }
+    _sendCoordinator = StateObject(wrappedValue: chatSendCoordinator)
+
     // #448: give the full-product quit coordinator the poll loop it must stop
     // before tearing down, so no late on-demand poll respawns the Helper.
     AppQuitCoordinator.shared.engineStatusStore = statusStore
@@ -333,6 +347,11 @@ struct RatioThinkApp: App {
   }
 
   private static func makeDownloadController() -> ModelDownloadController {
+    // DEBUG-only GUI/e2e seams: a faked or fixture-backed downloader so a test
+    // exercises the download UI without hitting the network. `#if DEBUG` so the
+    // env reads (and the test downloaders) compile out of Release entirely —
+    // a shipped app can never be redirected onto a fake download path.
+    #if DEBUG
     if ProcessInfo.processInfo.environment["PIE_TEST_FAKE_DOWNLOADS"] == "1" {
       return ModelDownloadController(
         downloader: EnvironmentFakeModelDownloader(),
@@ -345,6 +364,7 @@ struct RatioThinkApp: App {
         terminalRowLingerSeconds: 60
       )
     }
+    #endif
     return ModelDownloadController()
   }
 
@@ -479,6 +499,7 @@ struct RatioThinkApp: App {
         .environmentObject(engineStatusStore)
         .environmentObject(engineLifecycle)
         .environmentObject(helperHealth)
+        .environmentObject(sendCoordinator)
         .environmentObject(downloadController)
         .environmentObject(modelLibrary)
         .environmentObject(updateAvailability)

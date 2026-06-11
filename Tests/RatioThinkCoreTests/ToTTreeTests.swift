@@ -75,6 +75,20 @@ final class ToTTreeTests: XCTestCase {
     XCTAssertEqual(t.selectedNode?.content, "4")
   }
 
+  func test_final_delta_accumulates_then_tree_complete_is_authoritative() {
+    // #523 Part A: the synthesized answer streams as final_delta chunks; the
+    // terminal tree_complete overwrites with the authoritative full text.
+    var t = ToTTree()
+    t.apply(.nodeComplete(node("tot-n1", parent: "root", depth: 1, branch: 0, content: "raw", score: 9)))
+    t.apply(.levelPruned(level: 1, kept: ["tot-n1"]))
+    t.apply(.finalDelta(text: "The "))
+    t.apply(.finalDelta(text: "final answer."))
+    XCTAssertEqual(t.finalAnswer, "The final answer.")
+    t.apply(.treeComplete(selectedNodeID: "tot-n1", finalAnswer: "The final answer."))
+    XCTAssertEqual(t.finalAnswer, "The final answer.")
+    XCTAssertEqual(t.status, .complete)
+  }
+
   func test_tree_complete_null_selection_is_honest() {
     var t = ToTTree()
     t.apply(.treeStart(id: "x", model: "m", breadth: 1, depth: 1, beamWidth: 1))

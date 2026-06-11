@@ -38,7 +38,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     let pieHome = try XCTUnwrap(
       config["PIE_TEST_GUI_HOME"],
       "\(Self.configPath) must define PIE_TEST_GUI_HOME")
-    let model = config["PIE_TEST_CHAT_MODEL"] ?? "Qwen/Qwen3-0.6B"
+    let model = config["PIE_TEST_CHAT_MODEL_PIN"] ?? "Qwen/Qwen3-0.6B"
 
     // The seeded Fast Think profile uses the SAME default model as Chat, so
     // selecting it is a same-model swap. Pinning `.running` (S302 seam) lets
@@ -123,7 +123,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     XCTAssertTrue(send.isEnabled, "composer.send was disabled after typing prompt")
     send.click()
 
-    guard waitForAtLeastTwoStaticTextsContaining(visibleAssistantEcho, in: app, timeout: 120) else {
+    guard waitForAssistantEchoStaticTexts(visibleAssistantEcho, in: app, timeout: 120) else {
       XCTFail("assistant reply did not stream back under Fast Think; app tree: \(app.debugDescription)")
       return
     }
@@ -138,7 +138,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = model
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = model
     // Pin `.running` so the model reconcile resolves the resident model and
     // the same-model Fast Think swap is silent (S302 DEBUG seam; the GUI
     // suite runs the Debug build).
@@ -165,17 +165,19 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
   }
 
   /// MarkdownUI exposes the assistant answer as separate/truncated static
-  /// text runs, so — like S258 — a second matching run proves the assistant
-  /// bubble streamed in (beyond the user's own prompt bubble). The wrapper's
-  /// post-run SQLite assertion covers the semantic answer.
-  private func waitForAtLeastTwoStaticTextsContaining(_ needle: String,
-                                                      in app: XCUIApplication,
-                                                      timeout: TimeInterval) -> Bool {
+  /// text runs, so — like S258 — the THIRD matching run proves the assistant
+  /// bubble streamed in: two exist without any assistant output (the user's
+  /// prompt bubble and, since #512, the sidebar row auto-titled from that
+  /// same first message). The wrapper's post-run SQLite assertion covers the
+  /// semantic answer.
+  private func waitForAssistantEchoStaticTexts(_ needle: String,
+                                               in app: XCUIApplication,
+                                               timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
                                 needle, needle)
     while Date() < deadline {
-      if app.descendants(matching: .staticText).matching(predicate).count >= 2 {
+      if app.descendants(matching: .staticText).matching(predicate).count >= 3 {
         return true
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))

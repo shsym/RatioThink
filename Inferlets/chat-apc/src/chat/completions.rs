@@ -57,6 +57,7 @@ use wstd::http::{IntoBody, Request, Response};
 
 use super::apc::{ReasoningDecoder, ToolUseDecoder};
 use super::generate::{self, DecodeStrategy};
+use super::prefix_cache::{self, CacheDiag, ReusePlan};
 use super::spec::{SpecConfig, SpecMetrics};
 use crate::sse::{self, EmitError, Emitter, SseError};
 
@@ -179,6 +180,13 @@ pub struct ChatCompletionsRequest {
     /// when `enabled` + greedy (`temperature == 0`), drafting engages.
     #[serde(default)]
     pub speculation: Option<SpecRequest>,
+    /// #522 cross-request KV prefix-cache directive. Absent → reuse
+    /// disabled (byte-identical to the pre-#522 full-rebuild path).
+    /// Present + `policy:"auto"` + non-empty `key` → the inferlet opens a
+    /// matching prefix snapshot on a hit and saves the new boundary on
+    /// success. See [`super::prefix_cache`].
+    #[serde(default)]
+    pub cache: Option<prefix_cache::CacheDirective>,
 }
 
 /// Request-side speculation knobs (chat-apc extension). Dimensions
@@ -214,7 +222,43 @@ impl SpecRequest {
 #[derive(Deserialize, Serialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(deserialize_with = "deserialize_message_content")]
     pub content: String,
+}
+
+/// OpenAI content-part shape (`{"type":"text","text":"..."}`); other part
+/// types (image_url, etc.) are accepted but contribute no text.
+#[derive(Deserialize)]
+struct ContentPart {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// `messages[].content` accepts either the simple string form or the
+/// multi-part array form (`[{"type":"text","text":"..."}, ...]`) that many
+/// OpenAI-compatible clients send (e.g. for retries/multi-modal turns).
+/// The array form is flattened into a single string by concatenating each
+/// part's `text` field, so every downstream consumer keeps treating
+/// `content` as a plain `String`.
+fn deserialize_message_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Content {
+        Text(String),
+        Parts(Vec<ContentPart>),
+    }
+
+    match Content::deserialize(deserializer)? {
+        Content::Text(s) => Ok(s),
+        Content::Parts(parts) => Ok(parts
+            .into_iter()
+            .filter_map(|p| p.text)
+            .collect::<Vec<_>>()
+            .join("")),
+    }
 }
 
 /// OpenAI tool entry. Only `function`-type tools are recognized; the
@@ -347,6 +391,29 @@ struct SpecMetricsReport {
     decode_tokens_per_sec: f64,
     leader_len: usize,
     draft_len: usize,
+}
+
+#[derive(Serialize)]
+struct GenerationMetricsSse {
+    event: &'static str,
+    output_tokens: usize,
+    elapsed_s: f64,
+    tokens_per_sec: f64,
+}
+
+impl GenerationMetricsSse {
+    fn build(output_tokens: usize, elapsed: Duration) -> Option<Self> {
+        let elapsed_s = elapsed.as_secs_f64();
+        if output_tokens == 0 || elapsed_s <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            event: "generation_metrics",
+            output_tokens,
+            elapsed_s,
+            tokens_per_sec: output_tokens as f64 / elapsed_s,
+        })
+    }
 }
 
 impl SpecMetricsReport {
@@ -2090,23 +2157,54 @@ async fn handle_streaming(
                 .await;
         }
     };
-    let mut ctx = match Context::new(&model) {
-        Ok(c) => c,
-        Err(e) => {
-            return res
-                .respond(with_launch_diags_header(sse::json_error(
-                    500,
-                    "context_create_failed",
-                    &format!("Failed to create context: {e}"),
-                )))
-                .await;
+    // #522: cross-request KV prefix cache. Engaged only for an enabled
+    // `cache` directive; absent/disabled/bypass falls through to the
+    // legacy full-rebuild path below (byte-identical to pre-#522).
+    let cache_plan: Option<ReusePlan> = match req.cache.clone() {
+        Some(d) if d.enabled() => {
+            match prefix_cache::plan(&model, &req.model, &req.messages, req.tools.as_deref(), d) {
+                Ok(p) => Some(p),
+                Err((code, msg)) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                        .await;
+                }
+            }
+        }
+        _ => None,
+    };
+    let (mut ctx, mut cache_diag): (Context, Option<CacheDiag>) = match &cache_plan {
+        Some(plan) => match prefix_cache::acquire(&model, plan) {
+            Ok((ctx, diag)) => (ctx, Some(diag)),
+            Err((code, msg)) => {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+        },
+        None => {
+            let mut ctx = match Context::new(&model) {
+                Ok(c) => c,
+                Err(e) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(
+                            500,
+                            "context_create_failed",
+                            &format!("Failed to create context: {e}"),
+                        )))
+                        .await;
+                }
+            };
+            if let Err((code, msg)) =
+                fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true)
+            {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+            (ctx, None)
         }
     };
-    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true) {
-        return res
-            .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
-            .await;
-    }
 
     // `tool_choice: "required" | {function}` constrains generation to the
     // model's native tool-call grammar (OpenAI tool_choice enforcement).
@@ -2238,6 +2336,10 @@ async fn handle_streaming(
     let mut tool_disabled_diag: Option<ToolDisabledDiag> = None;
     let mut pending_tool: Option<PendingToolCall> = None;
     let mut in_reasoning = false;
+    // #522: visible assistant text, captured so the prefix cache can save
+    // the canonical next-turn boundary. Only used when `cache_plan` is
+    // engaged.
+    let mut full_text = String::new();
 
     // F1/F2/F3/F5: explicit-match loop with an `Outcome` set at the
     // exit point. `Generator::next` Err, decoder Err, and chat-
@@ -2372,6 +2474,9 @@ async fn handle_streaming(
             // tool_calls). Composes with the reasoning content gate; the
             // suppressed deltas fall through to the no-op arm below.
             Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) && !forced_tool => {
+                // #522: mirror the visible text the App persists, so the
+                // save gate can compare it against the generated tokens.
+                full_text.push_str(&s);
                 let chunk = ChatCompletionChunk {
                     id: &id,
                     object: "chat.completion.chunk",
@@ -2519,6 +2624,18 @@ async fn handle_streaming(
             eprintln!("[chat-apc] error-meta serialize bug: {e}");
         }
     }
+    // Terminal generation-throughput frame for UI/benchmark consumers.
+    // The counter is engine-side generated output tokens (including
+    // reasoning tokens); the timer is decode-loop elapsed, so this is
+    // throughput, not prefill latency / TTFT. Failed/tool-call partials do
+    // not emit a metric until a reliable display policy exists.
+    if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
+        if let Some(frame) = GenerationMetricsSse::build(spec_generated, spec_start.elapsed()) {
+            if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
+                eprintln!("[chat-apc] generation_metrics serialize bug: {e}");
+            }
+        }
+    }
     // #418: terminal spec_metrics frame (only when the caller opted into
     // the speculation surface, so normal streams are byte-identical).
     if want_metrics {
@@ -2541,6 +2658,19 @@ async fn handle_streaming(
         };
         if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
             eprintln!("[chat-apc] spec_metrics serialize bug: {e}");
+        }
+    }
+    // #522: save the next reusable boundary on a clean completion and emit
+    // the cache diagnostics frame. Saving is gated on a real assistant turn
+    // (Natural/MaxTokens) — a cancelled/aborted/tool-call turn must not
+    // advance the stable boundary. `finalize` builds the boundary in its
+    // own context, so the generator's borrow of `ctx` is irrelevant here.
+    if let (Some(plan), Some(mut diag)) = (cache_plan.as_ref(), cache_diag.take()) {
+        if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
+            prefix_cache::finalize(plan, &full_text, &model, &mut diag).await;
+        }
+        if let Err(EmitError::Serialize(e)) = em.emit_json(&diag).await {
+            eprintln!("[chat-apc] cache diag serialize bug: {e}");
         }
     }
     sse::emit_done_logged(&mut em, "stream_exit").await;
@@ -2574,23 +2704,54 @@ async fn handle_non_streaming(
                 .await;
         }
     };
-    let mut ctx = match Context::new(&model) {
-        Ok(c) => c,
-        Err(e) => {
-            return res
-                .respond(with_launch_diags_header(sse::json_error(
-                    500,
-                    "context_create_failed",
-                    &format!("Failed to create context: {e}"),
-                )))
-                .await;
+    // #522: cross-request KV prefix cache (see handle_streaming). Legacy
+    // callers (no enabled `cache` directive) take the unchanged rebuild
+    // path below.
+    let cache_plan: Option<ReusePlan> = match req.cache.clone() {
+        Some(d) if d.enabled() => {
+            match prefix_cache::plan(&model, &req.model, &req.messages, req.tools.as_deref(), d) {
+                Ok(p) => Some(p),
+                Err((code, msg)) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                        .await;
+                }
+            }
+        }
+        _ => None,
+    };
+    let (mut ctx, mut cache_diag): (Context, Option<CacheDiag>) = match &cache_plan {
+        Some(plan) => match prefix_cache::acquire(&model, plan) {
+            Ok((ctx, diag)) => (ctx, Some(diag)),
+            Err((code, msg)) => {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+        },
+        None => {
+            let mut ctx = match Context::new(&model) {
+                Ok(c) => c,
+                Err(e) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(
+                            500,
+                            "context_create_failed",
+                            &format!("Failed to create context: {e}"),
+                        )))
+                        .await;
+                }
+            };
+            if let Err((code, msg)) =
+                fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true)
+            {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+            (ctx, None)
         }
     };
-    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true) {
-        return res
-            .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
-            .await;
-    }
 
     // tool_choice enforcement (mirrors handle_streaming): constrain to the
     // model's native tool-call grammar when a call is forced; an
@@ -2911,6 +3072,20 @@ async fn handle_non_streaming(
     } else {
         None
     };
+    // #522: save the next reusable boundary (gated on a real assistant
+    // turn — never on a cancelled/aborted/tool-call turn) and stash the
+    // cache diagnostics for the `X-ChatAPC-Cache` response header.
+    // `finalize` builds the boundary in its own context.
+    let cache_header: Option<String> = if let (Some(plan), Some(mut diag)) =
+        (cache_plan.as_ref(), cache_diag.take())
+    {
+        if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
+            prefix_cache::finalize(plan, &full_text, &model, &mut diag).await;
+        }
+        Some(serde_json::to_string(&diag).expect("CacheDiag must serialize"))
+    } else {
+        None
+    };
     let body = ChatCompletion {
         id: &id,
         object: "chat.completion",
@@ -2957,6 +3132,9 @@ async fn handle_non_streaming(
         .header("Content-Type", "application/json");
     if let Some(kind) = partial_kind {
         builder = builder.header("X-ChatAPC-Partial-Error", kind);
+    }
+    if let Some(h) = &cache_header {
+        builder = builder.header("X-ChatAPC-Cache", h.as_str());
     }
     let response = builder.body(json.into_body()).unwrap();
     res.respond(with_launch_diags_header(response)).await
@@ -3096,6 +3274,24 @@ pub(crate) fn fill_context(
     tools: Option<&[ToolSchema]>,
     cue: bool,
 ) -> Result<(), (&'static str, String)> {
+    let tokens = build_prompt_tokens(model, messages, tools, cue)?;
+    ctx.append(&tokens);
+    Ok(())
+}
+
+/// Tokenize the same prompt [`fill_context`] would build, returning the raw
+/// token sequence instead of mutating a context. The cross-request prefix
+/// cache ([`super::prefix_cache`]) needs the exact token ids to
+/// content-address snapshots; routing both `fill_context` and the cache
+/// through this one function keeps the prefill bytes identical, which is
+/// the invariant the snapshot keys depend on.
+pub(crate) fn build_prompt_tokens(
+    model: &Model,
+    messages: &[ChatMessage],
+    tools: Option<&[ToolSchema]>,
+    cue: bool,
+) -> Result<Vec<u32>, (&'static str, String)> {
+    let mut out = Vec::new();
     if let Some(tools) = tools {
         // The SDK's `equip_prefix` expects `{name, description,
         // parameters}` per entry; the OpenAI `type:"function"` wrapper is
@@ -3106,24 +3302,19 @@ pub(crate) fn fill_context(
         if !envelopes.is_empty() {
             let prefix = inferlet::tools::equip_prefix(model, &envelopes)
                 .map_err(|e| ("tool_equip_failed", format!("equip_prefix: {e}")))?;
-            ctx.append(&prefix);
+            out.extend_from_slice(&prefix);
         }
     }
     for (i, msg) in messages.iter().enumerate() {
         match msg.role.as_str() {
-            "system" => {
-                ctx.system(&msg.content);
-            }
-            "assistant" => {
-                ctx.assistant(&msg.content);
-            }
-            "user" => {
-                ctx.user(&msg.content);
-            }
+            "system" => out.extend(chat::system(model, &msg.content)),
+            "assistant" => out.extend(chat::assistant(model, &msg.content)),
+            "user" => out.extend(chat::user(model, &msg.content)),
             // #468: reject any other role here rather than demoting it to
             // `user`. This is the root-cause guard — every caller goes
-            // through `fill_context`, so the tree-of-thought path can't
-            // bypass the policy the way it did before.
+            // through `fill_context` / `build_prompt_tokens`, so the
+            // tree-of-thought and prefix-cache paths can't bypass the
+            // policy.
             other => {
                 let code = role_error_code(other).unwrap_or("unsupported_role");
                 return Err((code, role_error_message(i, other, code)));
@@ -3136,9 +3327,9 @@ pub(crate) fn fill_context(
     // context still has tokens to process — an empty forward pass spins
     // the generator), so it is opt-out here.
     if cue {
-        ctx.cue();
+        out.extend(chat::cue(model));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// One detected tool call buffered for emit on the terminal chunk.
@@ -3172,6 +3363,101 @@ fn next_tool_call_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_metrics_frame_field_names_and_boundaries_are_stable() {
+        assert!(GenerationMetricsSse::build(0, Duration::from_millis(500)).is_none());
+        assert!(GenerationMetricsSse::build(3, Duration::ZERO).is_none());
+
+        let frame = GenerationMetricsSse::build(21, Duration::from_millis(500))
+            .expect("positive token count and elapsed time should emit metrics");
+        let json = serde_json::to_value(frame).expect("generation metrics serialize");
+
+        assert_eq!(json["event"].as_str(), Some("generation_metrics"));
+        assert_eq!(json["output_tokens"].as_u64(), Some(21));
+        assert_eq!(json["elapsed_s"].as_f64(), Some(0.5));
+        assert_eq!(json["tokens_per_sec"].as_f64(), Some(42.0));
+    }
+
+    // ─── Multi-part message content (#115) ─────────────────
+
+    fn parse_message(json: &str) -> Result<ChatMessage, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn content_plain_string_unchanged() {
+        let m = parse_message(r#"{"role":"user","content":"hello"}"#).unwrap();
+        assert_eq!(m.content, "hello");
+    }
+
+    #[test]
+    fn content_single_text_part_flattens() {
+        let m = parse_message(r#"{"role":"user","content":[{"type":"text","text":"hello"}]}"#)
+            .unwrap();
+        assert_eq!(m.content, "hello");
+    }
+
+    #[test]
+    fn content_multiple_text_parts_concatenate_in_order() {
+        let m = parse_message(
+            r#"{"role":"user","content":[
+                {"type":"text","text":"a"},
+                {"type":"text","text":"b"},
+                {"type":"text","text":"c"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "abc");
+    }
+
+    #[test]
+    fn content_empty_array_yields_empty_string() {
+        // Flattens to "" — downstream the blank-content 400 gate in
+        // `handle_parsed` rejects it, same as `content:""`.
+        let m = parse_message(r#"{"role":"user","content":[]}"#).unwrap();
+        assert_eq!(m.content, "");
+    }
+
+    #[test]
+    fn content_non_text_parts_contribute_nothing() {
+        // image_url and other part types are accepted but textless.
+        let m = parse_message(
+            r#"{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"http://x/y.png"}},
+                {"type":"text","text":"caption"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "caption");
+    }
+
+    #[test]
+    fn content_part_with_null_text_is_skipped() {
+        let m = parse_message(
+            r#"{"role":"user","content":[{"type":"text","text":null},{"type":"text","text":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "x");
+    }
+
+    #[test]
+    fn content_rejects_non_string_non_array() {
+        assert!(parse_message(r#"{"role":"user","content":42}"#).is_err());
+        assert!(parse_message(r#"{"role":"user","content":{"text":"x"}}"#).is_err());
+        assert!(parse_message(r#"{"role":"user","content":null}"#).is_err());
+    }
+
+    #[test]
+    fn content_rejects_array_with_non_object_part() {
+        // One malformed part poisons the whole array → 400 at the
+        // request boundary, never a silently dropped part.
+        assert!(parse_message(r#"{"role":"user","content":["bare string"]}"#).is_err());
+        assert!(
+            parse_message(r#"{"role":"user","content":[{"type":"text","text":"ok"}, 7]}"#)
+                .is_err()
+        );
+    }
 
     // ─── Forward-pass starvation guard (#439) ─────────────
 

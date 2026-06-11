@@ -79,8 +79,9 @@ public enum ChatStartGate {
   ///     Takes priority over `engineStatus` because a failed poll leaves
   ///     a stale/placeholder status that must not be read as truth.
   ///   - resolvedModelID: the send target the app already computes
-  ///     (`override ?? resident ?? PIE_TEST_CHAT_MODEL`). Non-nil ⇒ a
-  ///     send can proceed and the gate is not shown.
+  ///     (`ChatScaffoldView.requestModelID` — the chat's pin else the
+  ///     profile default, via `ModelTarget.resolve`). Non-nil ⇒ a send can
+  ///     proceed and the gate is not shown.
   ///   - target: the launch/load target — the single
   ///     `ModelTarget.resolve(selectedModelID:profileDefault:)` derivation
   ///     (#497, the chat's pin else the profile default). Nil when

@@ -98,22 +98,45 @@ use crate::sse::Emitter;
 use super::schema::TotParams;
 use super::stream;
 use super::tree::{
-    assemble, best_leaf, error_leaf, new_node_id, parse_score, select_beam, Candidate, Node,
-    NodeStatus,
+    assemble, best_leaf, error_leaf, new_node_id, parse_score, select_beam_diverse, Candidate,
+    Node, NodeStatus,
 };
 
-/// Built-in expansion instruction appended before forking at levels > 1.
-/// Level-1 children answer the conversation directly (sibling diversity
-/// comes from sampling temperature).
+/// Per-branch directive appended to each forked child before it generates
+/// (#523). The branch index makes every sibling's prompt textually distinct
+/// — breaking the prior collapse where all `breadth` children shared one
+/// prompt and diverged only by sampling temperature — and instructs ONE
+/// mutually-exclusive, *named* strategy that differs by primary objective or
+/// tradeoff, not wording. Level 1 proposes a fresh strategy directly; deeper
+/// levels critique the parent then refine along a distinct axis (this
+/// replaces the old single shared `REFINE_INSTRUCTION`, which was flushed
+/// identically into every sibling and so could not diversify them).
 ///
-/// Reasoning-aware (#413/#437): a node generates a `<think>` block then an
-/// answer, which [`generate_demuxed`] splits apart — reasoning IS the point
-/// of a tree-of-thought search, so the candidate keeps its thought trace
-/// while the beam and the scorer see only the clean answer. The instruction
-/// carries no `/no_think`; [`with_thinking`] appends one only when the
-/// search runs with `thinking:false`.
-const REFINE_INSTRUCTION: &str = "Critique your previous answer, then give a distinct, \
-     improved continuation toward correctly answering the original question. Be concise.";
+/// Reasoning-aware (#413/#437): a node may generate a `<think>` block then
+/// an answer, which [`generate_demuxed`] splits apart — reasoning IS the
+/// point of a tree-of-thought search, so the candidate keeps its thought
+/// trace while the beam and scorer see only the clean answer. The directive
+/// is wrapped in [`with_thinking`], which appends `/no_think` only when the
+/// search runs with `thinking:false`. Pure → unit-tested.
+fn branch_directive(level: usize, branch_index: usize, breadth: usize, thinking: bool) -> String {
+    let n = branch_index + 1;
+    let body = if level <= 1 {
+        format!(
+            "Explore solution path {n} of {breadth} for the user's request. Commit to ONE \
+             specific strategy that differs from the other paths by its primary objective or key \
+             tradeoff — not just by wording. Name your strategy in a short phrase, then answer the \
+             request fully using only that strategy. Be concrete and specific."
+        )
+    } else {
+        format!(
+            "Critique your previous answer, then continue along refinement path {n} of {breadth}: \
+             pick ONE distinct improvement focus that differs from the sibling paths by primary \
+             objective or tradeoff. Name the focus in a short phrase, then give an improved, \
+             concrete answer committed to it."
+        )
+    };
+    with_thinking(&body, thinking)
+}
 
 /// Value-evaluator prompt (independent per-node scoring). The node already
 /// did its reasoning; the scorer is a value HEAD that rates the resulting
@@ -125,14 +148,34 @@ const REFINE_INSTRUCTION: &str = "Critique your previous answer, then give a dis
 /// stays on. The directive is inert on a non-reasoning model, and the score
 /// output is demuxed regardless so a stray empty think block can't swallow
 /// the integer.
-const SCORE_PROMPT: &str = "On a scale of 1 to 10, rate how promising the assistant's \
-     latest answer is toward correctly and completely answering the original question. \
-     Respond with only a single integer from 1 to 10.";
+const SCORE_PROMPT: &str = "Rate the assistant's latest answer from 1 to 10 on how well it \
+     actually satisfies the user's original request. Judge task relevance, factual and semantic \
+     correctness, specificity, and concrete usefulness. A fluent, polished, brief, or polite \
+     answer that does not directly address what was asked is a LOW score (1-3); do not reward \
+     style, brevity, or acknowledgment over substance. Respond with only a single integer from 1 \
+     to 10.";
 
 /// Token budget for a scoring generation — enough for a suppressed empty
 /// `<think></think>` plus the integer. The scorer is NOT demuxed (see
 /// [`score_node`]), so this is the whole budget.
 const SCORE_MAX_TOKENS: usize = 32;
+
+/// Temperature for the final-answer synthesis (#523 Part A). Deliberately
+/// LOW and fixed, independent of the candidate-generation temperature
+/// (`TotParams.temperature`, which can run high for branch diversity) and
+/// of the scorer (greedy `0.0`): synthesis must be a coherent, faithful
+/// answer, so it never inherits the exploration entropy. The three roles —
+/// generation (tunable, high) / scoring (greedy) / synthesis (low) — are
+/// the temperature split; only generation is exposed on the wire, because
+/// a tunable scorer or synthesis temperature would trade away deterministic
+/// pruning and answer coherence for no benefit.
+const SYNTHESIS_TEMPERATURE: f32 = 0.3;
+const SYNTHESIS_TOP_P: f32 = 0.9;
+
+/// Reasoning budget for the synthesis generation. Synthesis runs
+/// `/no_think` (it produces the answer, not a thought trace), so this only
+/// needs to absorb a suppressed empty `<think></think>` before the answer.
+const SYNTHESIS_REASONING_TOKENS: usize = 32;
 
 /// Append the `/no_think` directive when reasoning is disabled for this
 /// search (`thinking:false`). On a Qwen3-style model this suppresses the
@@ -143,6 +186,33 @@ fn with_thinking(base: &str, thinking: bool) -> String {
     } else {
         format!("{base} /no_think")
     }
+}
+
+/// Build the synthesis user-turn (#523 Part A): the instruction appended to
+/// a fork of the ORIGINAL conversation that turns the best search leaf into
+/// the final answer. It embeds the chosen candidate (and its reasoning, when
+/// present) and directs a thorough, faithful answer to the user's request —
+/// not an echo of the candidate or a restatement of the strategy. Pure →
+/// unit-tested. (`/no_think` + the low synthesis temperature are applied by
+/// [`synthesize`].)
+fn build_synthesis_directive(best_content: &str, best_reasoning: &str) -> String {
+    let mut s = String::from(
+        "An internal tree-of-thought search explored several strategies and selected the most \
+         promising one. Its result:\n\n",
+    );
+    s.push_str(best_content.trim());
+    let r = best_reasoning.trim();
+    if !r.is_empty() {
+        s.push_str("\n\nThe reasoning behind it:\n\n");
+        s.push_str(r);
+    }
+    s.push_str(
+        "\n\nUsing this as your foundation, write the final, complete answer to my original \
+         request. Directly and fully address what I asked, be accurate and thorough, and resolve \
+         any gaps. Do not merely echo the result above, name the strategy, or restate the \
+         question — give the actual answer.",
+    );
+    s
 }
 
 /// A generated batch is visible answer content only when it lands entirely
@@ -174,6 +244,17 @@ struct Demux {
     kind: DemuxKind,
 }
 
+/// Where [`generate_demuxed`]'s streamed deltas go. `Node` tags a tree
+/// node id and streams both the reasoning and answer channels as
+/// `node_delta` (#413). `Final` streams only the answer as `final_delta`
+/// (#523 Part A) — the post-search synthesis surfaces an answer, not a
+/// thought trace, so its reasoning channel is not emitted.
+#[derive(Clone, Copy)]
+enum DeltaSink<'a> {
+    Node(&'a str),
+    Final,
+}
+
 /// Generate one assistant turn with two-phase budgeting and `<think>` demux.
 ///
 /// Phase 1 (reasoning) runs until the model closes its think block or
@@ -193,7 +274,7 @@ async fn generate_demuxed(
     answer_budget: usize,
     stops: &[u32],
     mut emitter: Option<&mut Emitter>,
-    node_id: &str,
+    sink: DeltaSink<'_>,
 ) -> Demux {
     let mut reason_dec = reasoning::Decoder::new(model);
     let mut chat_dec = chat::Decoder::new(model);
@@ -232,8 +313,9 @@ async fn generate_demuxed(
                 in_reasoning = true;
                 reasoning.push_str(&s);
                 // #413 token stream: live-fill this node's reasoning channel.
-                if let Some(em) = emitter.as_deref_mut() {
-                    let _ = stream::emit_node_delta(em, node_id, stream::DELTA_REASONING, &s).await;
+                // The `Final` synthesis sink surfaces only the answer.
+                if let (Some(em), DeltaSink::Node(id)) = (emitter.as_deref_mut(), sink) {
+                    let _ = stream::emit_node_delta(em, id, stream::DELTA_REASONING, &s).await;
                 }
             }
             Ok(reasoning::Event::End(_)) => {
@@ -246,9 +328,13 @@ async fn generate_demuxed(
         match chat_dec.feed(&out.tokens) {
             Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) => {
                 answer.push_str(&s);
-                // #413 token stream: live-fill this node's answer channel.
+                // #413 token stream: live-fill the answer channel — a tree
+                // node's `node_delta` or, for synthesis, `final_delta` (#523).
                 if let Some(em) = emitter.as_deref_mut() {
-                    let _ = stream::emit_node_delta(em, node_id, stream::DELTA_ANSWER, &s).await;
+                    let _ = match sink {
+                        DeltaSink::Node(id) => stream::emit_node_delta(em, id, stream::DELTA_ANSWER, &s).await,
+                        DeltaSink::Final => stream::emit_final_delta(em, &s).await,
+                    };
                 }
             }
             Ok(chat::Event::Delta(_)) | Ok(chat::Event::Idle) => {}
@@ -361,6 +447,13 @@ pub struct SearchOutcome {
     pub root: Node,
     pub selected_node_id: Option<String>,
     pub final_answer: Option<String>,
+    /// `true` when the post-search synthesis produced `final_answer`; `false`
+    /// when the raw best-leaf content finalize() set stood (synthesis was
+    /// skipped or failed) — the fail-safe path. Carried onto the wire
+    /// (`tree_complete.synthesized` / `TreeResponse.synthesized`) so a
+    /// silently dead synthesizer is observable rather than masked by an
+    /// always-renderable best-leaf answer (#523 Part A F1).
+    pub synthesized: bool,
 }
 
 /// Run the beam search. `root_ctx` must already be filled (system +
@@ -387,6 +480,14 @@ pub async fn run(
     model: &Model,
     mut emitter: Option<&mut Emitter>,
 ) -> SearchOutcome {
+    // #523 Part A: preserve a fork of the original conversation (system +
+    // user turns, flushed, cue-free) BEFORE the search consumes `root_ctx`.
+    // The final-answer synthesis grounds on this, so it works regardless of
+    // which level the best leaf came from (the leaf's own context may have
+    // been dropped by an earlier-level F7 fallback). `None` if the fork
+    // fails → synthesis is skipped and the best-leaf content stands.
+    let synth_base: Option<Context> = root_ctx.fork().ok();
+
     let mut flat: Vec<Node> = vec![Node::root()];
     let mut frontier: Vec<Frontier> = vec![Frontier {
         ctx: root_ctx,
@@ -405,56 +506,14 @@ pub async fn run(
         // exact slice the streaming sink replays as `node_complete` frames.
         let level_start = flat.len();
 
-        // Levels > 1 refine the parent before forking: append the refine
-        // user-turn and flush it into the shared prefix. The assistant
-        // turn itself is opened per child in `expand` (every level cues
-        // its own fork), so the shared prefix stays cue-free and KV pages
-        // are shared across the branches. Concurrent (#458 / part B): the
-        // ≤ beam_width parent flushes are independent forward passes, so
-        // `join_all` lets the engine batch them into one prefill pass
-        // instead of running them serially. `join_all` preserves input
-        // order, so error leaves are still appended in deterministic
-        // frontier order (the streaming `emit_level` slice depends on it).
-        //
-        // A flush failure here is NOT best-effort: `Context::flush` takes
-        // the token buffer before its fallible forward pass, so on error
-        // the REFINE_INSTRUCTION tokens are discarded while `seq_len` is
-        // left unchanged — and `fork()` clones that now-empty buffer.
-        // Forking such a parent would silently generate a re-roll of its
-        // PRE-refine answer and record it as `status:"ok"`: an invisible
-        // downgrade, since this flush is the only thing that makes a
-        // level a refinement rather than a re-roll. So drop the parent and
-        // record error leaves for its children, mirroring the fork-failure
-        // path below.
-        if level > 1 {
-            let refine = with_thinking(REFINE_INSTRUCTION, params.thinking);
-            let refine_ref = refine.as_str();
-            let flushed = join_all(frontier.into_iter().map(|mut f| async move {
-                f.ctx.user(refine_ref);
-                match f.ctx.flush().await {
-                    Ok(()) => Ok(f),
-                    Err(e) => Err((f.node_id, e)),
-                }
-            }))
-            .await;
-            let mut refined: Vec<Frontier> = Vec::with_capacity(flushed.len());
-            for r in flushed {
-                match r {
-                    Ok(f) => refined.push(f),
-                    Err((node_id, e)) => {
-                        for b in 0..params.breadth {
-                            flat.push(error_leaf(
-                                &node_id,
-                                level,
-                                b,
-                                format!("refine flush failed: {e}"),
-                            ));
-                        }
-                    }
-                }
-            }
-            frontier = refined;
-        }
+        // Per-branch diversity (#523): the refinement instruction is no
+        // longer flushed once into the shared parent prefix (which made
+        // every sibling identical). Instead each forked child appends its
+        // OWN `branch_directive` in `generate_branch` — distinct per branch
+        // index, steering each sibling to a different strategy — so the
+        // parent prefix stays shared (KV-cache reuse) while the siblings
+        // diverge. At levels > 1 the directive carries the critique-then-
+        // refine framing the shared flush used to provide.
 
         // Fork every child. A fork failure has no context to carry → record
         // it as an inline error leaf (shared with the refine-flush path); a
@@ -538,7 +597,61 @@ pub async fn run(
         }
     }
 
-    finalize(flat, &last_level)
+    // #523 Part A: capture the best leaf's answer + reasoning (before
+    // `finalize` consumes `flat`), assemble the outcome, then run ONE
+    // grounded synthesis as the final answer. `best` is `Some` exactly when
+    // an ok leaf exists (so honest-null is preserved: no leaf → no synthesis,
+    // `final_answer` stays null). Synthesis streams as `final_delta`; on any
+    // failure it returns `None` and the raw best-leaf content stands.
+    let best = best_leaf(&last_level)
+        .and_then(|id| flat.iter().find(|n| n.id == id))
+        .map(|n| (n.content.clone(), n.reasoning.clone()));
+    let mut outcome = finalize(flat, &last_level);
+    // Attempt synthesis only when an ok leaf exists AND its grounding fork
+    // survived; on any skip/failure emit a one-shot host diagnostic with the
+    // reason so a dead synthesizer is visible in production (#523 Part A F1),
+    // then fall through with `None` so the raw best-leaf content stands.
+    let synth: Option<String> = match (best, synth_base) {
+        (Some((content, reasoning)), Some(base)) => match synthesize(
+            base,
+            model,
+            &content,
+            &reasoning,
+            params.max_tokens_per_node,
+            emitter,
+        )
+        .await
+        {
+            Ok(answer) => Some(answer),
+            Err(reason) => {
+                eprintln!("[chat-apc] tot synthesis fell back to best leaf: {reason}");
+                None
+            }
+        },
+        (Some(_), None) => {
+            eprintln!("[chat-apc] tot synthesis skipped: fork_failed");
+            None
+        }
+        // No ok leaf → honest-null: no synthesis is attempted and
+        // finalize()'s null `final_answer` stands (no diagnostic — a total
+        // failure is already surfaced by the `error` terminal).
+        (None, _) => None,
+    };
+    reconcile_synthesis(&mut outcome, synth);
+    outcome
+}
+
+/// Fold the post-search synthesis result into the finalized outcome. Pure →
+/// unit-tested, since [`run`]'s engine-bound [`synthesize`] cannot run
+/// natively. A produced answer replaces `final_answer` and marks
+/// `synthesized`; `None` (synthesis skipped or failed) leaves both untouched,
+/// so the raw best-leaf answer finalize() set is preserved and never nulled —
+/// the load-bearing fail-safe + honest-null invariant (#523 Part A F1/F3).
+fn reconcile_synthesis(outcome: &mut SearchOutcome, synth: Option<String>) {
+    if let Some(answer) = synth {
+        outcome.final_answer = Some(answer);
+        outcome.synthesized = true;
+    }
 }
 
 /// Materialize one level's **successfully forked** branches into tree
@@ -547,8 +660,10 @@ pub async fn run(
 /// [`run`] records those as [`error_leaf`] nodes directly, since they have
 /// no content to score or context to expand. A successful branch becomes
 /// an `ok`/`error` leaf; an `ok` leaf may still carry a `score_error` when
-/// the scorer infra failed (F4). Pruning reuses [`select_beam`], which
-/// keeps only the top `beam_width` **ok** candidates. Node ids are
+/// the scorer infra failed (F4). Pruning reuses [`select_beam_diverse`],
+/// which keeps the top `beam_width` **ok** candidates by score but demotes
+/// a paraphrase of an already-kept sibling so a distinct branch takes the
+/// slot (#523). Node ids are
 /// caller-assigned (paired with the engine contexts), so the returned
 /// `keep` ids map straight back to surviving [`Frontier`] entries.
 fn materialize_level(level: usize, branches: Vec<Branch>, beam_width: usize) -> LevelMaterialized {
@@ -561,10 +676,14 @@ fn materialize_level(level: usize, branches: Vec<Branch>, beam_width: usize) -> 
         // so the beam never keeps a node that has no answer — and a
         // think-only candidate can no longer win the search (#437).
         let is_ok = b.outcome.status == NodeStatus::Ok;
+        // Diversity dedup compares only ok candidates' answers (non-ok are
+        // filtered out in `select_beam_diverse`), so the candidate carries
+        // the clean answer; an Error/Incomplete node has empty content.
         candidates.push(Candidate {
             id: b.id.clone(),
             score: b.outcome.score,
             ok: is_ok,
+            content: b.outcome.content.clone(),
         });
         nodes.push(Node {
             id: b.id,
@@ -581,7 +700,7 @@ fn materialize_level(level: usize, branches: Vec<Branch>, beam_width: usize) -> 
         });
     }
 
-    let keep = select_beam(&candidates, beam_width);
+    let keep = select_beam_diverse(&candidates, beam_width, super::diversity::DUP_THRESHOLD);
     LevelMaterialized {
         nodes,
         candidates,
@@ -623,6 +742,9 @@ fn finalize(flat: Vec<Node>, last_level: &[Candidate]) -> SearchOutcome {
         root,
         selected_node_id: best,
         final_answer,
+        // finalize() sets the raw best-leaf answer; `run` flips this true only
+        // when the post-search synthesis replaces it (#523 Part A F1).
+        synthesized: false,
     }
 }
 
@@ -658,7 +780,7 @@ async fn resolve_level(
             join_all(
                 ctxs.into_iter()
                     .zip(metas.iter())
-                    .map(|(c, m)| generate_branch(c, model, params, None, &m.0)),
+                    .map(|(c, m)| generate_branch(c, model, params, None, &m.0, level, m.2)),
             )
             .await
         } else {
@@ -667,7 +789,10 @@ async fn resolve_level(
                 if let Some(em) = emitter.as_deref_mut() {
                     let _ = stream::emit_node_start(em, &m.0, &m.1, level, m.2).await;
                 }
-                out.push(generate_branch(c, model, params, emitter.as_deref_mut(), &m.0).await);
+                out.push(
+                    generate_branch(c, model, params, emitter.as_deref_mut(), &m.0, level, m.2)
+                        .await,
+                );
             }
             out
         };
@@ -698,7 +823,7 @@ async fn resolve_level(
             join_all(
                 ctxs.into_iter()
                     .zip(metas.iter())
-                    .map(|(c, m)| expand(c, model, params, None, &m.0)),
+                    .map(|(c, m)| expand(c, model, params, None, &m.0, level, m.2)),
             )
             .await
         } else {
@@ -707,7 +832,9 @@ async fn resolve_level(
                 if let Some(em) = emitter.as_deref_mut() {
                     let _ = stream::emit_node_start(em, &m.0, &m.1, level, m.2).await;
                 }
-                out.push(expand(c, model, params, emitter.as_deref_mut(), &m.0).await);
+                out.push(
+                    expand(c, model, params, emitter.as_deref_mut(), &m.0, level, m.2).await,
+                );
             }
             out
         }
@@ -727,10 +854,15 @@ async fn generate_branch(
     params: &TotParams,
     emitter: Option<&mut Emitter>,
     node_id: &str,
+    level: usize,
+    branch_index: usize,
 ) -> (Context, Demux) {
-    // Open the assistant turn for this branch. The forked context shares a
-    // fully-flushed, cue-free prefix, so without this the first forward
-    // pass would carry zero new tokens and spin the generator.
+    // Append this branch's per-branch directive (#523), then open the
+    // assistant turn. The forked context shares a fully-flushed, cue-free
+    // prefix; the directive steers this sibling toward a distinct strategy
+    // (its text also makes the first forward pass carry real new tokens
+    // rather than spin).
+    ctx.user(&branch_directive(level, branch_index, params.breadth, params.thinking));
     ctx.cue();
     let stops = chat::stop_tokens(model);
     let demux = generate_demuxed(
@@ -744,7 +876,7 @@ async fn generate_branch(
         params.max_tokens_per_node,
         &stops,
         emitter,
-        node_id,
+        DeltaSink::Node(node_id),
     )
     .await;
     (ctx, demux)
@@ -807,8 +939,11 @@ async fn expand(
     params: &TotParams,
     emitter: Option<&mut Emitter>,
     node_id: &str,
+    level: usize,
+    branch_index: usize,
 ) -> (Context, NodeOutcome) {
-    let (ctx, demux) = generate_branch(ctx, model, params, emitter, node_id).await;
+    let (ctx, demux) =
+        generate_branch(ctx, model, params, emitter, node_id, level, branch_index).await;
     let score = if matches!(demux.kind, DemuxKind::Answered) {
         Some(score_node(&ctx, model).await)
     } else {
@@ -851,6 +986,51 @@ async fn score_node(ctx: &Context, model: &Model) -> ScoreOutcome {
     match parse_score(&text) {
         Some(v) => ScoreOutcome::Scored(v),
         None => ScoreOutcome::Unparseable,
+    }
+}
+
+/// Final-answer synthesis (#523 Part A). Forks-free: `base` is already a
+/// fork of the ORIGINAL conversation (system + user turns), preserved
+/// before the search consumed the root. Appends [`build_synthesis_directive`]
+/// (+ `/no_think`) and runs ONE low-temperature, demuxed generation grounded
+/// in the best leaf, streaming its answer as `final_delta` when an emitter is
+/// present. Returns the synthesized answer, or `Err(reason)` on any failure /
+/// empty result — the reason (`not_answered` / `empty` / `aborted: …`) is
+/// surfaced by the caller as a host diagnostic before it falls back to the raw
+/// best-leaf content, so a failed synthesis is never lost silently (#523 F1).
+/// Search, scoring, and beam selection are untouched — this runs only after a
+/// best ok leaf is chosen.
+async fn synthesize(
+    mut base: Context,
+    model: &Model,
+    best_content: &str,
+    best_reasoning: &str,
+    answer_budget: usize,
+    emitter: Option<&mut Emitter>,
+) -> Result<String, String> {
+    let directive = with_thinking(&build_synthesis_directive(best_content, best_reasoning), false);
+    base.user(&directive);
+    base.cue();
+    let stops = chat::stop_tokens(model);
+    let demux = generate_demuxed(
+        &mut base,
+        model,
+        Sampler::TopP {
+            temperature: SYNTHESIS_TEMPERATURE,
+            p: SYNTHESIS_TOP_P,
+        },
+        SYNTHESIS_REASONING_TOKENS,
+        answer_budget,
+        &stops,
+        emitter,
+        DeltaSink::Final,
+    )
+    .await;
+    match demux.kind {
+        DemuxKind::Answered if !demux.answer.trim().is_empty() => Ok(demux.answer),
+        DemuxKind::Answered => Err("empty".to_string()),
+        DemuxKind::Incomplete => Err("not_answered".to_string()),
+        DemuxKind::Aborted(e) => Err(format!("aborted: {e}")),
     }
 }
 
@@ -916,7 +1096,105 @@ mod tests {
             id: id.to_string(),
             score,
             ok,
+            content: String::new(),
         }
+    }
+
+    // ── branch_directive (#523 A): per-branch diversity ──
+
+    #[test]
+    fn branch_directives_are_distinct_across_siblings() {
+        // The core diversity guarantee: no two siblings get the same prompt,
+        // so the old identical-prefix collapse is impossible by construction.
+        let breadth = 5;
+        let ds: Vec<String> = (0..breadth)
+            .map(|b| branch_directive(1, b, breadth, true))
+            .collect();
+        for i in 0..breadth {
+            for j in (i + 1)..breadth {
+                assert_ne!(ds[i], ds[j], "siblings {i} and {j} share a directive");
+            }
+        }
+    }
+
+    #[test]
+    fn branch_directive_level1_proposes_a_named_strategy() {
+        let d = branch_directive(1, 0, 3, true);
+        assert!(d.contains("path 1 of 3"));
+        assert!(d.to_lowercase().contains("strategy"));
+        // Level 1 proposes fresh; it does not ask to critique a prior answer.
+        assert!(!d.to_lowercase().contains("critique"));
+    }
+
+    #[test]
+    fn branch_directive_deeper_levels_critique_then_refine() {
+        let d = branch_directive(2, 1, 3, true);
+        assert!(d.contains("path 2 of 3"));
+        assert!(d.to_lowercase().contains("critique"));
+    }
+
+    #[test]
+    fn branch_directive_honors_thinking_knob() {
+        // thinking:false suppresses per-node reasoning via the /no_think
+        // marker (reused from `with_thinking`); thinking:true keeps it.
+        assert!(branch_directive(1, 0, 3, false).contains("/no_think"));
+        assert!(!branch_directive(1, 0, 3, true).contains("/no_think"));
+    }
+
+    // ── SCORE_PROMPT (#523 B): rubric weights task relevance over style ──
+
+    #[test]
+    fn score_prompt_rubric_weights_substance_not_fluency() {
+        let p = SCORE_PROMPT.to_lowercase();
+        assert!(p.contains("satisf"));
+        assert!(p.contains("relevance"));
+        assert!(p.contains("correct"));
+        assert!(p.contains("specific"));
+        // …and explicitly does NOT reward style/brevity/acknowledgment.
+        assert!(p.contains("low score"));
+        assert!(p.contains("do not reward"));
+        assert!(p.contains("single integer"));
+    }
+
+    // ── build_synthesis_directive (#523 Part A): final-answer assembly seam ──
+
+    #[test]
+    fn synthesis_directive_embeds_best_content_and_directs_a_full_answer() {
+        let d = build_synthesis_directive("Book a private venue that fits 20 guests.", "");
+        // The chosen candidate is embedded as the grounding…
+        assert!(d.contains("Book a private venue that fits 20 guests."));
+        // …and the instruction directs the final answer, not an echo.
+        let lo = d.to_lowercase();
+        assert!(lo.contains("final"));
+        assert!(lo.contains("answer to my original request"));
+        assert!(lo.contains("do not merely echo"));
+        // No reasoning section when reasoning is empty.
+        assert!(!d.contains("reasoning behind it"));
+    }
+
+    #[test]
+    fn synthesis_directive_includes_reasoning_when_present() {
+        let d = build_synthesis_directive("Answer X.", "First consider the budget, then the venue.");
+        assert!(d.contains("The reasoning behind it:"));
+        assert!(d.contains("First consider the budget, then the venue."));
+    }
+
+    #[test]
+    fn synthesis_directive_trims_whitespace_only_reasoning() {
+        // Whitespace-only reasoning must not open an empty reasoning section.
+        let d = build_synthesis_directive("Answer.", "   \n  ");
+        assert!(!d.contains("reasoning behind it"));
+    }
+
+    // ── Temperature split (#523 Part B): three roles, three temperatures ──
+
+    #[test]
+    fn synthesis_temperature_is_low_and_distinct_from_generation_default() {
+        // Synthesis stays coherent (low) regardless of how high candidate
+        // generation runs; the scorer is greedy (0.0) — see `score_node`.
+        let (synth, gen_default) = (SYNTHESIS_TEMPERATURE, super::super::schema::DEFAULT_TEMPERATURE);
+        assert!(synth > 0.0, "synthesis temperature must be a real low value");
+        assert!(synth < gen_default, "synthesis must stay below the generation default");
     }
 
     // ── ScoreOutcome (F4): the three classes the old Option<u8> merged ──
@@ -1263,5 +1541,50 @@ mod tests {
         let out = finalize(flat, &pool2);
         assert_eq!(out.selected_node_id.as_deref(), Some("n0"));
         assert_eq!(out.final_answer.as_deref(), Some("L1-best"));
+    }
+
+    // ── reconcile_synthesis (run()'s synthesis fold; the engine-bound
+    //    synthesize() can't run natively, so the reconciliation is its own
+    //    pure seam — #523 Part A F1/F3) ──
+
+    #[test]
+    fn reconcile_synthesis_replaces_answer_and_marks_synthesized() {
+        // A produced synthesis overrides the raw best-leaf answer and flips
+        // the observability flag true.
+        let mut out = finalize(
+            vec![Node::root(), ok_leaf("a", "raw-best-leaf", Some(9))],
+            &[cand("a", Some(9), true)],
+        );
+        assert_eq!(out.final_answer.as_deref(), Some("raw-best-leaf"));
+        assert!(!out.synthesized);
+
+        reconcile_synthesis(&mut out, Some("synthesized-final-answer".to_string()));
+        assert_eq!(out.final_answer.as_deref(), Some("synthesized-final-answer"));
+        assert!(out.synthesized);
+    }
+
+    #[test]
+    fn reconcile_synthesis_none_preserves_best_leaf_and_stays_unsynthesized() {
+        // The load-bearing fail-safe: a skipped/failed synthesis (`None`) must
+        // NOT null the raw best-leaf answer finalize() set, and leaves the
+        // flag false so a dead synthesizer is observable, never masked.
+        let mut out = finalize(
+            vec![Node::root(), ok_leaf("a", "raw-best-leaf", Some(9))],
+            &[cand("a", Some(9), true)],
+        );
+        reconcile_synthesis(&mut out, None);
+        assert_eq!(out.final_answer.as_deref(), Some("raw-best-leaf"));
+        assert!(!out.synthesized);
+    }
+
+    #[test]
+    fn reconcile_synthesis_none_keeps_honest_null_when_no_leaf() {
+        // No ok leaf → finalize() honestly nulled final_answer; a skipped
+        // synthesis leaves it null (and unsynthesized).
+        let mut out = finalize(vec![Node::root()], &[]);
+        assert!(out.final_answer.is_none());
+        reconcile_synthesis(&mut out, None);
+        assert!(out.final_answer.is_none());
+        assert!(!out.synthesized);
     }
 }

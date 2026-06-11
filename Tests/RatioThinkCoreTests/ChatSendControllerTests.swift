@@ -5,6 +5,24 @@ import SwiftData
 @available(macOS 14, *)
 @MainActor
 final class ChatSendControllerTests: XCTestCase {
+  func test_with_sampling_replaces_sampling_and_keeps_other_options() {
+    // #523 Part B: the ToT dispatch swaps in the profile's sampling while
+    // leaving model id, system prompt, speculation, and the ceiling intact.
+    let base = ChatSendRequestOptions(
+      modelID: "qwen",
+      sampling: ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 64),
+      systemPromptOverride: "sys",
+      speculation: nil,
+      maxOutputTokensCeiling: 1024
+    )
+    let swapped = base.withSampling(ChatSampling(temperature: 1.3, topP: 0.8, maxTokens: 64))
+    XCTAssertEqual(swapped.sampling.temperature, 1.3)
+    XCTAssertEqual(swapped.sampling.topP, 0.8)
+    XCTAssertEqual(swapped.modelID, "qwen")
+    XCTAssertEqual(swapped.systemPromptOverride, "sys")
+    XCTAssertEqual(swapped.maxOutputTokensCeiling, 1024)
+  }
+
   func test_send_builds_request_streams_assistant_and_routes_model_meta() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)
@@ -46,7 +64,10 @@ final class ChatSendControllerTests: XCTestCase {
           ChatMessage(role: .system, content: "Be concise."),
           ChatMessage(role: .user, content: "hello"),
         ],
-        sampling: ChatSampling(temperature: 0.2, topP: 0.8, maxTokens: 64)
+        sampling: ChatSampling(temperature: 0.2, topP: 0.8, maxTokens: 64),
+        // #522: every send carries a per-chat prefix-cache directive
+        // (system override + 1 user message → boundary turn 2).
+        cache: ChatCacheDirective(key: chat.id.uuidString, turn: 2)
       )
     ])
     XCTAssertEqual(chat.messages.count, 2)
@@ -57,6 +78,143 @@ final class ChatSendControllerTests: XCTestCase {
     XCTAssertEqual(center.residentModelID, "override-model")
     XCTAssertNil(status.lastError)
   }
+
+  func test_send_persists_generation_metrics_from_engine_meta_frame() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [
+      .modelReady,
+      .delta(role: .assistant, content: "Hi"),
+      .finish(reason: .stop),
+      .generationMetrics(GenerationMetrics(outputTokens: 10, elapsedSeconds: 0.25, tokensPerSecond: 40.0)),
+    ])
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1")
+    )
+
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(assistantMessages(in: chat).first)
+    let meta = try XCTUnwrap(assistant.generationPerformance)
+    XCTAssertEqual(meta.outputTokens, 10)
+    XCTAssertEqual(meta.elapsedSeconds, 0.25)
+    XCTAssertEqual(meta.tokensPerSecond, 40.0)
+    XCTAssertEqual(assistant.tokens, 10)
+  }
+
+  func test_postFinishNonTransportStreamError_isReported() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ThrowingAfterEventsChatEngine(
+      events: [
+        .modelReady,
+        .delta(role: .assistant, content: "Hi"),
+        .finish(reason: .stop),
+      ],
+      error: HTTPEngineError.stream(code: "bad_generation_metrics", message: "malformed metrics")
+    )
+    let status = PersistenceStatus()
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: status,
+      options: ChatSendRequestOptions(modelID: "m1")
+    )
+
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(assistantMessages(in: chat).first)
+    XCTAssertEqual(assistant.content, "Hi")
+    XCTAssertEqual(assistant.finishReason, "stop")
+    XCTAssertEqual(status.lastError?.context, "ChatSendController.postFinishStreamError")
+    XCTAssertTrue(status.lastError?.message.contains("bad_generation_metrics") == true)
+  }
+
+  func test_cancelled_partial_assistant_does_not_keep_generation_metrics() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ManualChatEngine()
+    let controller = ChatSendController()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1")
+    )
+    try await waitUntil("request starts") { engine.requests.count == 1 && self.assistantMessages(in: chat).count == 1 }
+    let assistant = try XCTUnwrap(assistantMessages(in: chat).first)
+
+    engine.yield(.generationMetrics(GenerationMetrics(outputTokens: 10, elapsedSeconds: 0.25, tokensPerSecond: 40.0)), at: 0)
+    engine.yield(.delta(role: .assistant, content: "partial"), at: 0)
+    engine.yield(.modelReady, at: 0)
+    try await waitUntil("partial flushes") { assistant.content == "partial" }
+
+    controller.cancel()
+
+    XCTAssertEqual(assistant.finishReason, "cancelled")
+    XCTAssertNil(assistant.generationPerformance)
+  }
+
+  func test_cancelled_finish_drops_pending_generation_metrics() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [
+      .modelReady,
+      .generationMetrics(GenerationMetrics(outputTokens: 10, elapsedSeconds: 0.25, tokensPerSecond: 40.0)),
+      .delta(role: .assistant, content: "partial"),
+      .finish(reason: .cancelled),
+    ])
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1")
+    )
+
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(assistantMessages(in: chat).first)
+    XCTAssertEqual(assistant.finishReason, "cancelled")
+    XCTAssertNil(assistant.generationPerformance)
+  }
+
 
   /// #474: the outgoing request's `max_tokens` is clamped DOWN to the
   /// launched engine ceiling carried on `ChatSendRequestOptions`. End-to-end
@@ -245,6 +403,223 @@ final class ChatSendControllerTests: XCTestCase {
     controller.cancel()
   }
 
+  func test_send_marksContextUsageRequestLocalActiveAndDestroyedOnFinish() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [.modelReady, .finish(reason: .stop)])
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"),
+      contextUsageTracker: tracker
+    )
+
+    try await waitUntil("usage record destroyed") {
+      tracker.records.first?.residency == .requestLocalDestroyed
+    }
+    let record = try XCTUnwrap(tracker.records.first)
+    XCTAssertEqual(record.chatID, chat.id)
+    XCTAssertEqual(record.modelID, "m")
+    XCTAssertNotNil(record.requestID)
+    XCTAssertNil(record.usage, "no context_usage frame exists yet, so usage must stay unknown")
+  }
+
+  func test_cancel_marksContextUsageDestroyed() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ManualChatEngine()
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"),
+      contextUsageTracker: tracker
+    )
+    try await waitUntil("usage active") { tracker.records.first?.residency == .requestLocalActive }
+
+    controller.cancel()
+
+    XCTAssertEqual(tracker.records.first?.residency, .requestLocalDestroyed)
+  }
+
+  func test_contextUsage_errorPathMarksTrackedRequestDestroyed() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hello", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let controller = ChatSendController()
+    let engine = FailingChatEngine(error: HTTPEngineError.engineGone(detail: "synthetic failure"))
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"),
+      contextUsageTracker: tracker
+    )
+
+    try await waitUntil("error-path usage record destroyed") {
+      self.contextUsageRecord(in: tracker, modelID: "m")?.residency == .requestLocalDestroyed
+    }
+
+    let record = try XCTUnwrap(contextUsageRecord(in: tracker, modelID: "m"))
+    XCTAssertEqual(record.chatID, chat.id)
+    XCTAssertEqual(record.modelID, "m")
+    XCTAssertNotNil(record.requestID)
+    XCTAssertNil(record.usage, "error path should not invent context usage without a frame")
+  }
+
+  func test_contextUsage_supersededRequestLateEventsDoNotDestroyNewActiveRecord() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "first", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engineA = ManualChatEngine()
+    let engineB = ManualChatEngine()
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engineA,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1"),
+      contextUsageTracker: tracker
+    )
+    try await waitUntil("request A usage active") {
+      engineA.requests.count == 1 &&
+        self.contextUsageRecord(in: tracker, modelID: "m1")?.residency == .requestLocalActive
+    }
+    let requestA = try XCTUnwrap(contextUsageRecord(in: tracker, modelID: "m1"))
+    let requestAID = try XCTUnwrap(requestA.requestID)
+
+    chat.messages.append(Message(role: "user", content: "second", ts: Date(timeIntervalSinceReferenceDate: 2)))
+    try context.save()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engineB,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m2"),
+      contextUsageTracker: tracker
+    )
+
+    try await waitUntil("request A destroyed and request B active") {
+      self.contextUsageRecord(in: tracker, modelID: "m1")?.residency == .requestLocalDestroyed &&
+        self.contextUsageRecord(in: tracker, modelID: "m2")?.residency == .requestLocalActive
+    }
+
+    let destroyedA = try XCTUnwrap(contextUsageRecord(in: tracker, modelID: "m1"))
+    let activeB = try XCTUnwrap(contextUsageRecord(in: tracker, modelID: "m2"))
+    let requestBID = try XCTUnwrap(activeB.requestID)
+    XCTAssertEqual(destroyedA.requestID, requestAID)
+    XCTAssertNotEqual(requestAID, requestBID)
+    XCTAssertNil(destroyedA.usage)
+    XCTAssertNil(activeB.usage)
+
+    engineA.yield(.delta(role: .assistant, content: "late"), at: 0)
+    engineA.yield(.finish(reason: .stop), at: 0)
+    engineA.finish(at: 0)
+    await Task.yield()
+
+    XCTAssertEqual(
+      contextUsageRecord(in: tracker, modelID: "m2")?.residency,
+      .requestLocalActive,
+      "late events from superseded request A must not destroy the newer active request B record"
+    )
+
+    controller.cancel()
+
+    XCTAssertEqual(contextUsageRecord(in: tracker, modelID: "m2")?.residency, .requestLocalDestroyed)
+  }
+
+  func test_contextUsage_sameModelSupersessionKeepsNewRequestActive() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "first", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engineA = ManualChatEngine()
+    let engineB = ManualChatEngine()
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engineA,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"),
+      contextUsageTracker: tracker
+    )
+    try await waitUntil("request A usage active") {
+      engineA.requests.count == 1 &&
+        self.contextUsageRecord(in: tracker, modelID: "m")?.residency == .requestLocalActive
+    }
+    let requestAID = try XCTUnwrap(contextUsageRecord(in: tracker, modelID: "m")?.requestID)
+
+    chat.messages.append(Message(role: "user", content: "second", ts: Date(timeIntervalSinceReferenceDate: 2)))
+    try context.save()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engineB,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"),
+      contextUsageTracker: tracker
+    )
+
+    try await waitUntil("request B usage active while A remains tracked") {
+      tracker.records.count == 2 &&
+        self.contextUsageRecord(in: tracker, modelID: "m")?.residency == .requestLocalActive
+    }
+
+    let activeRecord = try XCTUnwrap(contextUsageRecord(in: tracker, modelID: "m"))
+    XCTAssertEqual(activeRecord.residency, .requestLocalActive)
+    XCTAssertNotEqual(activeRecord.requestID, requestAID)
+    XCTAssertEqual(
+      tracker.records.first(where: { $0.requestID == requestAID })?.residency,
+      .requestLocalDestroyed
+    )
+  }
+
   func test_engineNotReady_failure_assistant_bubble_is_normalized_actionable_line() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)
@@ -301,6 +676,21 @@ final class ChatSendControllerTests: XCTestCase {
       .sorted { $0.ts < $1.ts }
   }
 
+  private func contextUsageRecord(in tracker: ContextUsageTracker, modelID: String) -> ContextUsageRecord? {
+    tracker.records
+      .filter { $0.modelID == modelID }
+      .sorted { lhs, rhs in
+        if lhs.residency != rhs.residency {
+          return lhs.residency == .requestLocalActive
+        }
+        if lhs.lastUsedAt != rhs.lastUsedAt {
+          return lhs.lastUsedAt > rhs.lastUsedAt
+        }
+        return lhs.id.requestID > rhs.id.requestID
+      }
+      .first
+  }
+
   // MARK: - speculation injection (#426 Fast Think)
 
   /// Drive `send` and return the single `ChatRequest` the engine saw.
@@ -342,6 +732,36 @@ final class ChatSendControllerTests: XCTestCase {
     let req = try await capturedRequest(speculation: nil)
     XCTAssertNil(req.speculation, "no profile speculation → byte-identical normal chat")
     XCTAssertEqual(req.sampling.temperature, 0.7, "temperature untouched without speculation")
+  }
+
+  // #522: every send carries an auto prefix-cache directive keyed on the
+  // chat id, so the inferlet can content-address and reuse the per-chat KV.
+  func test_send_attaches_prefix_cache_directive_keyed_on_chat() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [.delta(role: .assistant, content: "ok"), .finish(reason: .stop)])
+    let controller = ChatSendController()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m", sampling: ChatSampling())
+    )
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+
+    let req = try XCTUnwrap(engine.requests.first)
+    let cache = try XCTUnwrap(req.cache, "every send must carry a cache directive")
+    XCTAssertEqual(cache.key, chat.id.uuidString, "thread key is the chat id")
+    XCTAssertEqual(cache.policy, "auto", "default policy engages reuse")
+    XCTAssertEqual(cache.compat, ChatCacheDirective.compatVersion)
+    XCTAssertEqual(cache.turn, 1, "one user message → boundary turn 1")
   }
 
   func test_send_disabledSpeculation_no_field_and_temp_unchanged() async throws {
@@ -403,6 +823,30 @@ private final class ImmediateChatEngine: EngineClient, @unchecked Sendable {
     return AsyncThrowingStream { continuation in
       for event in events { continuation.yield(event) }
       continuation.finish()
+    }
+  }
+  func dispatchInferlet(_ req: InferletRequest) -> AsyncThrowingStream<Data, Error> {
+    AsyncThrowingStream { $0.finish() }
+  }
+}
+
+private final class ThrowingAfterEventsChatEngine: EngineClient, @unchecked Sendable {
+  private let events: [ChatEvent]
+  private let error: Error
+
+  init(events: [ChatEvent], error: Error) {
+    self.events = events
+    self.error = error
+  }
+
+  func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
+  func models() async throws -> [ModelInfo] { [] }
+  func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
+    let events = self.events
+    let error = self.error
+    return AsyncThrowingStream { continuation in
+      for event in events { continuation.yield(event) }
+      continuation.finish(throwing: error)
     }
   }
   func dispatchInferlet(_ req: InferletRequest) -> AsyncThrowingStream<Data, Error> {

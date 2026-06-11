@@ -306,6 +306,55 @@ final class HTTPEngineClientTests: XCTestCase {
     XCTAssertEqual(events.last, .finish(reason: .other("content_filter")))
   }
 
+  func test_chatCompletion_decodesGenerationMetricsMetaFrame() async throws {
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        #"data: {"event":"model_ready"}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"generation_metrics","output_tokens":12,"elapsed_s":0.5,"tokens_per_sec":24.0}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    var events: [ChatEvent] = []
+    for try await event in makeClient().chatCompletion(ChatRequest(model: "m", messages: [])) {
+      events.append(event)
+    }
+
+    let expected = GenerationMetrics(outputTokens: 12, elapsedSeconds: 0.5, tokensPerSecond: 24.0)
+    XCTAssertTrue(events.contains(.generationMetrics(expected)), "events=\(events)")
+  }
+
+  func test_chatCompletion_malformedGenerationMetricsAfterFinishThrows() async {
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        #"data: {"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"generation_metrics","output_tokens":12,"elapsed_s":0.5}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    var events: [ChatEvent] = []
+    do {
+      for try await event in makeClient().chatCompletion(ChatRequest(model: "m", messages: [])) {
+        events.append(event)
+      }
+      XCTFail("expected malformed generation_metrics to throw")
+    } catch {
+      XCTAssertEqual(events.last, .finish(reason: .stop))
+      XCTAssertFalse(
+        events.contains(.generationMetrics(GenerationMetrics(
+          outputTokens: 12,
+          elapsedSeconds: 0.5,
+          tokensPerSecond: 0
+        ))),
+        "malformed metrics must not be zero-filled: events=\(events)"
+      )
+      XCTAssertTrue(error is DecodingError, "expected strict frame decode error, got \(error)")
+    }
+  }
+
   func test_chatCompletion_inline_error_frame_surfaces_as_stream_error() async {
     FakeSSEURLProtocol.handler = { _ in
       .sse(chunks: [

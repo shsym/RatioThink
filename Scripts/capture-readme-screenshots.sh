@@ -20,7 +20,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-MODEL="${PIE_TEST_CHAT_MODEL:-Qwen3-8B-Instruct}"
+MODEL="${PIE_TEST_CHAT_MODEL_PIN:-Qwen3-8B-Instruct}"
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/readme-shots-$$}"
 GUI_HOME="$RUN_ROOT/g"
 URL_FILE="$RUN_ROOT/harness.url"
@@ -88,7 +88,7 @@ BASE_URL="$(cat "$URL_FILE")"
 cat >"$CONFIG_FILE" <<EOF
 PIE_TEST_ENGINE_BASE_URL=$BASE_URL
 PIE_TEST_GUI_HOME=$GUI_HOME
-PIE_TEST_CHAT_MODEL=$MODEL
+PIE_TEST_CHAT_MODEL_PIN=$MODEL
 EOF
 
 echo "readme shots: engine=$BASE_URL  model=$MODEL  PIE_HOME=$GUI_HOME"

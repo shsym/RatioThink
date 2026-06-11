@@ -25,8 +25,21 @@ struct ComposerView: View {
   /// no-model confirm) — no user message is committed without a model
   /// to answer it.
   let shouldAllowSend: () -> Bool
-  let onSendBlocked: () -> Void
+  /// #516: carries the blocked draft so the parent can arm the pending
+  /// auto-send with the exact text the gate is promising to deliver.
+  let onSendBlocked: (String) -> Void
   let onUserMessageSaved: (Message) -> Void
+  /// #507: user-intent cancel of the selected chat's in-flight turn — the
+  /// composer's trailing button becomes a stop control while `isSending`.
+  /// `ChatSendController.cancel` keeps a non-empty partial bubble as a
+  /// cancelled turn (excluded from future request history).
+  let onStop: () -> Void
+  /// #516: a fired pending auto-send. The composer re-runs its normal
+  /// `submit()` path — same persistence, same gate, same in-flight
+  /// lifecycle as a manual send — but ONLY while the live draft still
+  /// matches the text the gate promised; an edit made during the model
+  /// load cancels the auto-send rather than sending mid-rewrite text.
+  let autoSubmit: ComposerAutoSubmit?
   @Environment(\.modelContext) private var modelContext
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
   @State private var draft: String = ""
@@ -104,8 +117,10 @@ struct ComposerView: View {
     viewModel: ChatTranscriptViewModel,
     isSending: Bool = false,
     shouldAllowSend: @escaping () -> Bool = { true },
-    onSendBlocked: @escaping () -> Void = {},
-    onUserMessageSaved: @escaping (Message) -> Void = { _ in }
+    onSendBlocked: @escaping (String) -> Void = { _ in },
+    onUserMessageSaved: @escaping (Message) -> Void = { _ in },
+    onStop: @escaping () -> Void = {},
+    autoSubmit: ComposerAutoSubmit? = nil
   ) {
     self.chat = chat
     self.viewModel = viewModel
@@ -113,6 +128,8 @@ struct ComposerView: View {
     self.shouldAllowSend = shouldAllowSend
     self.onSendBlocked = onSendBlocked
     self.onUserMessageSaved = onUserMessageSaved
+    self.onStop = onStop
+    self.autoSubmit = autoSubmit
   }
 
   var body: some View {
@@ -144,18 +161,38 @@ struct ComposerView: View {
       .focused($isFocused)
       .accessibilityIdentifier("composer.text")
 
-      Button(action: submit) {
-        Image(systemName: "arrow.up.circle.fill")
-          .font(.system(size: 26, weight: .regular))
+      if isSending {
+        // #507: while this chat's turn streams, the trailing control is a
+        // stop button — the user-reachable cancel (the navigate-away cancel
+        // is gone; switching chats no longer touches the stream).
+        Button(action: onStop) {
+          Image(systemName: "stop.circle.fill")
+            .font(.system(size: 26, weight: .regular))
+        }
+        .buttonStyle(.plain)
+        .help("Stop generating")
+        .accessibilityIdentifier("composer.stop")
+      } else {
+        Button(action: submit) {
+          Image(systemName: "arrow.up.circle.fill")
+            .font(.system(size: 26, weight: .regular))
+        }
+        .buttonStyle(.plain)
+        .disabled(trimmedDraft.isEmpty)
+        .help("Send (Return). Shift+Return inserts a newline.")
+        .accessibilityIdentifier("composer.send")
       }
-      .buttonStyle(.plain)
-      .disabled(trimmedDraft.isEmpty || isSending)
-      .help("Send (Return). Shift+Return inserts a newline.")
-      .accessibilityIdentifier("composer.send")
     }
     .padding(.horizontal, 16)
     .padding(.vertical, 10)
     .onAppear { isFocused = true }
+    // #516: a fired pending auto-send rides the normal submit path. The
+    // tick makes consecutive fires distinguishable; the text match is the
+    // edit guard (see `autoSubmit` doc).
+    .onChange(of: autoSubmit) { _, request in
+      guard let request, trimmedDraft == request.expectedText else { return }
+      submit()
+    }
   }
 
   private var trimmedDraft: String {
@@ -168,7 +205,7 @@ struct ComposerView: View {
     // : block before persisting if no model is resolvable. Keep the
     // draft so the user can send it once they load/choose a model.
     guard shouldAllowSend() else {
-      onSendBlocked()
+      onSendBlocked(payload)
       return
     }
     // Establish the relationship from the to-many owning side
@@ -183,9 +220,18 @@ struct ComposerView: View {
       ts: Date()
     )
     let previousUpdatedAt = chat.updatedAt
+    let previousTitle = chat.title
     modelContext.insert(message)
     chat.messages.append(message)
     chat.updatedAt = message.ts
+    // #512: first real user message titles the chat — a deterministic
+    // local heuristic (trim/collapse/cap), committed in the SAME save as
+    // the message so it can never block or outlive the send. Only a
+    // never-user-titled chat still carrying the placeholder is renamed
+    // (`shouldAutoTitle`), so a manual rename wins permanently.
+    if ChatLifecycle.shouldAutoTitle(chat), let title = ChatAutoTitle.derive(from: payload) {
+      chat.title = title
+    }
     do {
       try modelContext.save()
       draft = ""
@@ -197,9 +243,18 @@ struct ComposerView: View {
       chat.messages.removeAll { $0.id == message.id }
       modelContext.delete(message)
       chat.updatedAt = previousUpdatedAt
+      chat.title = previousTitle
       persistenceStatus.report(error, context: "ComposerView.submit")
     }
   }
+}
+
+/// #516: one fired pending auto-send. `tick` increments per fire so equal
+/// text on a later block still triggers `.onChange`; `expectedText` is the
+/// edit guard the composer checks against its live draft.
+struct ComposerAutoSubmit: Equatable {
+  let tick: Int
+  let expectedText: String
 }
 
 // MARK: - AppKit bridge

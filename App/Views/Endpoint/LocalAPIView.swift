@@ -36,6 +36,10 @@ struct LocalAPIView: View {
   /// leaves status `.running` (toggle stuck on). Mirrors
   /// `ChatScaffoldView`'s `engineActionError` channel.
   @State private var engineActionError: String?
+  /// #496: a start/stop refused because the background Helper isn't healthy.
+  /// Surfaced as a helper-framed inline notice, never the engine action-error
+  /// row, so a Helper state never reads as an engine fault.
+  @State private var helperBlock: HelperUnavailable?
 
   private var state: LocalAPIState {
     LocalAPIState.make(
@@ -52,6 +56,9 @@ struct LocalAPIView: View {
         if let engineActionError {
           actionErrorRow(engineActionError)
         }
+        if let helperBlock {
+          HelperUnavailableNotice(reason: helperBlock, onDismiss: { self.helperBlock = nil })
+        }
         if state.isServing {
           servingDetails
         }
@@ -66,7 +73,7 @@ struct LocalAPIView: View {
     // Clear a stale start/stop error once the engine actually reaches
     // `.running` (the action succeeded, possibly via another surface).
     .onChange(of: state.isServing) { _, serving in
-      if serving { engineActionError = nil }
+      if serving { engineActionError = nil; helperBlock = nil }
     }
     .confirmationDialog(
       "Turn off the local API?",
@@ -333,8 +340,11 @@ struct LocalAPIView: View {
     guard let profileID = profileStore.activeProfileID, !profileID.isEmpty else { return }
     Task { @MainActor in
       engineActionError = nil
+      helperBlock = nil
       do {
         try await engineStatusStore.startEngine(profileID: profileID)
+      } catch let block as HelperUnavailable {
+        helperBlock = block
       } catch {
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "start")
       }
@@ -347,8 +357,11 @@ struct LocalAPIView: View {
   private func stop() {
     Task { @MainActor in
       engineActionError = nil
+      helperBlock = nil
       do {
         try await engineStatusStore.stopEngine()
+      } catch let block as HelperUnavailable {
+        helperBlock = block
       } catch {
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "stop")
       }

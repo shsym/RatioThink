@@ -1,4 +1,5 @@
 import SwiftUI
+import ServiceManagement
 
 /// Three-column shell per design §5 (Notes-style information disclosure).
 /// Sidebar + item-list are independently collapsible via menu commands wired
@@ -6,6 +7,10 @@ import SwiftUI
 struct RootView: View {
   @EnvironmentObject private var windowState: WindowState
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
+  /// #512: empty-chat pruning needs the store — runs on selection change
+  /// (prune the chat the user just left) and once at launch (reconcile
+  /// shells left behind by quit or by pre-prune builds).
+  @Environment(\.modelContext) private var modelContext
   /// Engine lifecycle + in-flight load, folded into the unified
   /// indicator state that gates the engine-error banner. Both are
   /// injected at app scope (`RatioThinkApp`).
@@ -38,7 +43,9 @@ struct RootView: View {
           policy: engineStatusStore.tierPolicy
         ),
         onRestartHelper: { helperHealth.restartHelperManually() },
-        onRestartEngine: { restartEngineFromBanner() }
+        onRestartEngine: { restartEngineFromBanner() },
+        onOpenLoginItems: { SMAppService.openSystemSettingsLoginItems() },
+        onCollectDiagnostics: { Task { await DiagnosticsCollector.collectAndReveal() } }
       )
       // #411: low-urgency, non-modal update prompt. Only present for a newer,
       // non-ignored release found by the once-per-launch check.
@@ -77,6 +84,24 @@ struct RootView: View {
       .navigationTitle("Rational")
     }
     .task { await runLaunchUpdateCheck() }
+    // #512: leaving an empty "New Chat" shell deletes it. Hooked on the
+    // selection (not view teardown) so it covers chat-switch, new-chat
+    // creation, and deselect alike — and only ever prunes the chat the
+    // user LEFT, never the selected one, so selection stays untouched.
+    .onChange(of: windowState.selectedItemID) { previous, current in
+      guard let previous, previous != current else { return }
+      ChatLifecycle.pruneIfEmpty(
+        chatID: previous, in: modelContext, persistenceStatus: persistenceStatus)
+    }
+    // #512: launch-time reconcile for persisted empty shells (quit with an
+    // empty chat selected, or user data from builds before pruning).
+    // Selection starts nil at launch, so `excluding` is belt-and-braces.
+    .task {
+      ChatLifecycle.pruneAllEmptyChats(
+        in: modelContext,
+        excluding: windowState.selectedItemID,
+        persistenceStatus: persistenceStatus)
+    }
   }
 
   /// #411: run the once-per-launch update check. Skipped on test/automation

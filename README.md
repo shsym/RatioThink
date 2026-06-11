@@ -8,7 +8,7 @@
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black)
-![Version](https://img.shields.io/badge/version-v0.1.2-blue)
+![Version](https://img.shields.io/badge/version-v0.1.3-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 
 </div>
@@ -19,7 +19,7 @@ local models using specialized _thinking profiles_.
 
 ## Early release
 
-v0.1.2 is an early release, focusing on core functionality and bug fixes.
+This an early release, focusing on core functionality and bug fixes.
 Since many components are still a work in progress, your feedback is incredibly valuable.
 Feel free to report any issues you find!
 
@@ -30,19 +30,16 @@ a prompt box. Rational adds **profiles** — named *thinking modes* you switch i
 one click, each a saved preset bundling a model, sampling, a system prompt, and a
 chat workflow.
 
-- **Thinking modes, not just a model picker.** A profile is a complete preset,
-  saved to disk and editable as TOML. Rational ships with **Chat**, **Fast Think**,
-  and **Tree of Thought** — make your own, too. Ollama exposes these only as
-  per-request parameters; LM Studio has no explicit profiles.
 - **Fast Think — speculative decoding by switching a profile.** Runs the same
   model greedily with a speculative drafter — fewer waits, identical output — on
   the bundled Apple-Silicon engine. No flags, no separate model: just pick it.
+  It currently implements [Cacheback algorithm](https://www.yecl.org/publications/ma2025emnlp.pdf).
 - **Tree of Thought — a search tree, in one click.** The Tree of Thought profile
   turns one question into a scored search: the engine branches, scores each branch
   1–10, and keeps the best beam — shown live in a foldable tree, then the chosen
   answer.
 
-▶ **[See the animated walkthrough](docs/landing.html)** — open it in your browser.
+▶ **[See the animated walkthrough](https://shsym.github.io/RatioThink/landing)**
 
 ## Install
 
@@ -125,9 +122,6 @@ metadata only. Flags: `--window <dur>` (Unified Logging look-back, default
 
 A few known issues in the v0.1.2 release, with workarounds:
 
-- **Very large GGUF models can still respond poorly or truncate misleadingly.** Prefer the
-  starter model or smaller curated models until the large-model rendering fixes land
-  ([tracking PR](https://github.com/shsym/RatioThink/pull/64)).
 - **Deleting a model that a profile uses as its default may need a restart to fully settle.**
   If a deleted model still appears selected, restart RatioThink and choose a new profile model
   ([tracking PR](https://github.com/shsym/RatioThink/pull/62)).

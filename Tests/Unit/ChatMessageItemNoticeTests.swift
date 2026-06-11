@@ -36,4 +36,46 @@ final class ChatMessageItemNoticeTests: XCTestCase {
     let m = Message(role: "assistant", content: "Hello!", meta: meta("stop"))
     XCTAssertEqual(ChatMessageItem(m).notice, .none)
   }
+
+  func test_item_lifts_generation_performance_from_message_meta() {
+    let meta = try! JSONSerialization.data(withJSONObject: [
+      "finish_reason": "stop",
+      "generation_performance": [
+        "output_tokens": 21,
+        "elapsed_s": 0.5,
+        "tokens_per_sec": 42.0,
+      ],
+    ])
+    let item = ChatMessageItem(Message(role: "assistant", content: "Hello!", meta: meta))
+
+    XCTAssertEqual(item.generationPerformanceText, "42 tok/s")
+  }
+
+  func test_item_hides_generation_performance_for_missing_cancelled_or_invalid_metrics() {
+    XCTAssertNil(ChatMessageItem(Message(role: "assistant", content: "old")).generationPerformanceText)
+
+    let cancelled = try! JSONSerialization.data(withJSONObject: [
+      "finish_reason": "cancelled",
+      "generation_performance": ["output_tokens": 21, "elapsed_s": 0.5, "tokens_per_sec": 42.0],
+    ])
+    XCTAssertNil(ChatMessageItem(Message(role: "assistant", content: "partial", meta: cancelled)).generationPerformanceText)
+
+    let invalid = try! JSONSerialization.data(withJSONObject: [
+      "finish_reason": "stop",
+      "generation_performance": ["output_tokens": 0, "elapsed_s": 0.5, "tokens_per_sec": 0.0],
+    ])
+    XCTAssertNil(ChatMessageItem(Message(role: "assistant", content: "bad", meta: invalid)).generationPerformanceText)
+
+    let nonFiniteElapsed = ChatMessageItem(
+      role: .assistant,
+      content: "bad",
+      finishReason: "stop",
+      generationPerformance: GenerationMetrics(
+        outputTokens: 21,
+        elapsedSeconds: .infinity,
+        tokensPerSecond: 42.0
+      )
+    )
+    XCTAssertNil(nonFiniteElapsed.generationPerformanceText)
+  }
 }

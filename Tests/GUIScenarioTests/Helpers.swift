@@ -80,14 +80,26 @@ func openFreshChat(
     ("header New Chat", app.buttons["chats.newButton"]),
   ]
 
+  // A LATER launch in a multi-test run can come up not-key, presenting an
+  // EMPTY accessibility tree (Application=Disabled) — every affordance
+  // query then misses even though the UI is fine. Re-activate and re-scan
+  // until the tree is live instead of failing on the first empty sweep.
   var sawCandidate = false
-  for (label, button) in candidates {
-    guard button.waitForExistence(timeout: 2) else { continue }
-    sawCandidate = true
-    button.click()
-    if composer.waitForExistence(timeout: 5) { return }
-    NSLog("openFreshChat: %@ click did not open composer; trying next affordance", label)
-  }
+  let scanDeadline = Date().addingTimeInterval(20)
+  repeat {
+    for (label, button) in candidates {
+      guard button.waitForExistence(timeout: 2) else { continue }
+      sawCandidate = true
+      button.click()
+      if composer.waitForExistence(timeout: 5) { return }
+      NSLog("openFreshChat: %@ click did not open composer; trying next affordance", label)
+    }
+    if !sawCandidate {
+      NSLog("openFreshChat: no affordance visible (empty tree?); re-activating")
+      app.activate()
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(1))
+    }
+  } while !sawCandidate && Date() < scanDeadline
 
   if !sawCandidate {
     XCTFail("New Chat affordance missing; app tree: \(app.debugDescription)", file: file, line: line)
@@ -95,6 +107,25 @@ func openFreshChat(
     XCTFail("New Chat action must open the chat scaffold; app tree: \(app.debugDescription)",
             file: file, line: line)
   }
+}
+
+/// Select a persisted chat row in the sidebar by its title. #512: a chat
+/// with real conversation is auto-titled from its first user message, so
+/// after a relaunch the persisted row is found by that derived title — the
+/// "New Chat" placeholder now only ever names an empty draft (which pruning
+/// deletes). Shared by every suite that relaunches and reselects a chat.
+@MainActor
+func selectPersistedChat(
+  titled title: String,
+  in app: XCUIApplication,
+  file: StaticString = #filePath,
+  line: UInt = #line
+) {
+  let chatTitle = app.staticTexts[title].firstMatch
+  XCTAssertTrue(chatTitle.waitForExistence(timeout: 10),
+                "persisted chat row '\(title)' missing after relaunch; app tree: \(app.debugDescription)",
+                file: file, line: line)
+  chatTitle.click()
 }
 
 @MainActor

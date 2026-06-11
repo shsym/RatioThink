@@ -162,6 +162,10 @@ private final class FixedStatusExportedObject: NSObject, PieHelperXPC, @unchecke
     reply((try? XPCPayload.encode(Optional<EngineMemorySample>.none)) ?? Data("null".utf8))
   }
 
+  func kvUsage(reply: @escaping (Data?, Data?) -> Void) {
+    PieHelperXPCWire.replyKVUsage(.success([]), via: reply)
+  }
+
   func startEngine(profileID: String,
                    modelOverride: String?,
                    reply: @escaping (Data?, Data?) -> Void) {
@@ -229,6 +233,8 @@ private final class NeverReplyStatusExportedObject: NSObject, PieHelperXPC, @unc
   func engineMemory(reply: @escaping (Data) -> Void) {
     // Wedged: intentionally never replies, like engineStatus above.
   }
+
+  func kvUsage(reply: @escaping (Data?, Data?) -> Void) {}
 
   func startEngine(profileID: String,
                    modelOverride: String?,
