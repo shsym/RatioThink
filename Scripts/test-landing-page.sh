@@ -84,6 +84,10 @@ def first_node(root: Node, tag: str, class_name: str | None = None) -> Node | No
     return None
 
 
+def contains_descendant_text(node: Node, tag: str, expected: str) -> bool:
+    return any(child.tag == tag and expected in text_content(child) for child in walk(node))
+
+
 REMOVED_TOOLBAR_MARKERS = [
     ("Model:", "model selector is still present in the landing mock toolbar"),
     ("Qwen3-0.6B", "model name is still present in the landing mock toolbar"),
@@ -113,6 +117,12 @@ def validate_html(html: str) -> list[str]:
     forbidden = " — real answers are longer and more detailed."
     if forbidden in html:
         failures.append("demo note still overclaims answer length/detail")
+
+    demo_note = first_node(root, "p", "demo-note")
+    if not demo_note:
+        failures.append("missing landing demo note")
+    elif text_content(demo_note).strip() != "A simplified illustration of how it works.":
+        failures.append("landing demo note is not the friendly illustration copy")
 
     if re.search(r'''(?:href|src)=["']\.\./''', html):
         failures.append("landing page contains an asset/link path that escapes docs/")
@@ -164,6 +174,18 @@ def validate_html(html: str) -> list[str]:
                 if toolbar_marker_present(toolbar, marker):
                     failures.append(message)
 
+    fast_cards = [
+        node
+        for node in walk(root)
+        if node.tag == "div"
+        and has_class(node, "card")
+        and contains_descendant_text(node, "h3", "Fast Think")
+    ]
+    if not fast_cards:
+        failures.append("missing Fast Think card")
+    elif not any("For illustration: 30 tok/s → 42 tok/s." in text_content(card) for card in fast_cards):
+        failures.append("Fast Think card is missing the illustrative tokens/sec comparison")
+
     return failures
 
 
@@ -173,6 +195,8 @@ VALID_FIXTURE = """
 <nav class="top-nav" aria-label="Primary"><a class="nav-github" href="https://github.com/shsym/RatioThink">GitHub</a></nav>
 <header class="hero"></header>
 <div class="toolbar"><span class="pill">Profile:</span><div class="menu"></div></div>
+<p class="demo-note">A simplified illustration of how it works.</p>
+<div class="card"><h3>Fast Think</h3><p>For illustration: 30 tok/s → 42 tok/s.</p></div>
 <footer>Apache-2.0</footer>
 </div></body></html>
 """
@@ -184,6 +208,8 @@ NEGATIVE_FIXTURES = {
         <!-- <nav class="top-nav" aria-label="Primary"><a class="nav-github" href="https://github.com/shsym/RatioThink">GitHub</a></nav> -->
         <header class="hero"></header>
         <div class="toolbar"><span class="pill">Profile:</span><div class="menu"></div></div>
+        <p class="demo-note">A simplified illustration of how it works.</p>
+        <div class="card"><h3>Fast Think</h3><p>For illustration: 30 tok/s → 42 tok/s.</p></div>
         <footer>Apache-2.0</footer>
         </div></body></html>
     """,
@@ -193,6 +219,8 @@ NEGATIVE_FIXTURES = {
         <nav class="top-nav" aria-label="Primary"><a class="nav-github" href="https://github.com/shsym/RatioThink">GitHub</a></nav>
         <header class="hero"></header>
         <div class="toolbar"><span class="pill">Profile:</span><div class="menu"></div><span>Model:</span><span>Qwen3-0.6B</span></div>
+        <p class="demo-note">A simplified illustration of how it works.</p>
+        <div class="card"><h3>Fast Think</h3><p>For illustration: 30 tok/s → 42 tok/s.</p></div>
         <footer>Apache-2.0</footer>
         </div></body></html>
     """,

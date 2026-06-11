@@ -278,7 +278,7 @@
       <button type="button" class="dot" data-scene="0" aria-label="Show the Tree of Thought demo"></button>
       <button type="button" class="dot" data-scene="1" aria-label="Show the Fast Think demo"></button>
     </div>
-    <p class="demo-note">An illustration, condensed for clarity.</p>
+    <p class="demo-note">A simplified illustration of how it works.</p>
   </div>
 
   <!-- ===================== why ===================== -->
@@ -295,7 +295,8 @@
       <div class="card">
         <div class="ct"><h3>Fast Think</h3></div>
         <p>Tired of waiting on long answers? Fast Think gives you the same reply with far less waiting —
-           a speculative drafter races ahead so the text lands in bursts.</p>
+           a speculative drafter races ahead so the text lands in bursts.
+           For illustration: 30 tok/s → 42 tok/s.</p>
       </div>
     </div>
   </section>
@@ -560,7 +561,7 @@
     await sleep(220, myGen);
     var a2 = el('<div class="row assistant"><div class="bubble assistant"></div></div>');
     transcript.appendChild(a2);
-    setCaption('Same answer, much less waiting — the text lands in quick bursts.');
+    setCaption('Same answer, much less waiting — for illustration: 30 tok/s → 42 tok/s.');
     await streamBursts(a2.querySelector('.bubble'), d.answer, d.bursts, 150, myGen); // chunky + quicker
     await sleep(2200, myGen);
   }
