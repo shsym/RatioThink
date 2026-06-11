@@ -284,6 +284,24 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     }
   }
 
+  public func kvUsage(reply: @escaping (Data?, Data?) -> Void) {
+    guard let engineHost else {
+      PieHelperXPCWire.replyKVUsage(.success([]), via: reply)
+      return
+    }
+    Task {
+      do {
+        let snapshots = try await engineHost.kvUsageSnapshots()
+        PieHelperXPCWire.replyKVUsage(.success(snapshots), via: reply)
+      } catch {
+        PieHelperXPCWire.replyKVUsage(
+          .failure(EngineError(code: .engineGone, message: "KV usage refresh failed: \(error)")),
+          via: reply
+        )
+      }
+    }
+  }
+
   // MARK: - startEngine / stopEngine
 
   /// Slack added on top of the engine host's timeout budget before
@@ -954,6 +972,10 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
     // "encode can't silently fail" guarantee as every other pre-encoded
     // reply and can never desync from the live wire format.
     reply(PieHelperXPCWire.emptyMemoryData)
+  }
+
+  public func kvUsage(reply: @escaping (Data?, Data?) -> Void) {
+    reply(nil, degradedErrorData)
   }
 
   public func startEngine(profileID: String,
