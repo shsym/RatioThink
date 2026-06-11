@@ -269,7 +269,7 @@ impl CacheDiag {
 // real-engine e2e suite. The correctness lives in the pure helpers above.)
 // =============================================================================
 
-use super::completions::{build_prompt_tokens, ChatMessage, ToolSchema};
+use super::completions::{ChatMessage, ToolSchema, build_prompt_tokens};
 use inferlet::Context;
 use inferlet::chat;
 use inferlet::model::Model;
@@ -343,7 +343,10 @@ pub fn plan(
 /// the full prompt. Returns the context plus the diagnostics seeded with
 /// the hit/miss outcome (the handler fills in save_result / page counts via
 /// [`finalize`]).
-pub fn acquire(model: &Model, plan: &ReusePlan) -> Result<(Context, CacheDiag), (&'static str, String)> {
+pub fn acquire(
+    model: &Model,
+    plan: &ReusePlan,
+) -> Result<(Context, CacheDiag), (&'static str, String)> {
     let mut diag = CacheDiag::new("miss", &plan.directive.key);
     diag.turn = plan.directive.turn;
 
@@ -374,8 +377,12 @@ pub fn acquire(model: &Model, plan: &ReusePlan) -> Result<(Context, CacheDiag), 
     }
 
     // Miss / nothing to open: full rebuild.
-    let mut ctx = Context::new(model)
-        .map_err(|e| ("context_create_failed", format!("Failed to create context: {e}")))?;
+    let mut ctx = Context::new(model).map_err(|e| {
+        (
+            "context_create_failed",
+            format!("Failed to create context: {e}"),
+        )
+    })?;
     let mut full = plan.prompt_no_cue.clone();
     full.extend_from_slice(&plan.cue);
     diag.base_boundary = 0;
@@ -413,7 +420,10 @@ pub async fn finalize(plan: &ReusePlan, gen_content: &str, model: &Model, diag: 
     // Cheap path: re-open the prefix snapshot we generated against (an
     // immutable fork) and append only this turn's tail — one forward pass
     // over a single turn. Fall back to a full rebuild on a miss.
-    let reused = match (plan.open_name.as_deref(), suffix_start(plan.prompt_no_cue.len(), plan.prefix_tokens.len())) {
+    let reused = match (
+        plan.open_name.as_deref(),
+        suffix_start(plan.prompt_no_cue.len(), plan.prefix_tokens.len()),
+    ) {
         (Some(n), Some(s)) => Context::open(model, n).ok().map(|mut ctx| {
             let mut tail = plan.prompt_no_cue[s..].to_vec();
             tail.extend_from_slice(&assistant);
@@ -583,7 +593,10 @@ mod tests {
         // the same token sequence the boundary was named by.
         let lookup_prefix = saved.clone();
         let open_name = snapshot_name("c", "1", "m", "t", &lookup_prefix);
-        assert_eq!(open_name, save_name, "next turn must hit the saved boundary");
+        assert_eq!(
+            open_name, save_name,
+            "next turn must hit the saved boundary"
+        );
     }
 
     // ─── retry / truncate invalidation (reasoning over names) ──
@@ -598,8 +611,14 @@ mod tests {
         let after_turn1 = snapshot_name("c", "1", "m", "t", &[1, 2, 3]); // sys,u1,a1
         let after_turn2 = snapshot_name("c", "1", "m", "t", &[1, 2, 3, 4, 5]); // ..u2,a2
         let retry_lookup = snapshot_name("c", "1", "m", "t", &[1, 2, 3]); // erased back to a1
-        assert_eq!(retry_lookup, after_turn1, "retry hits the valid earlier boundary");
-        assert_ne!(retry_lookup, after_turn2, "stale suffix boundary is unreachable");
+        assert_eq!(
+            retry_lookup, after_turn1,
+            "retry hits the valid earlier boundary"
+        );
+        assert_ne!(
+            retry_lookup, after_turn2,
+            "stale suffix boundary is unreachable"
+        );
     }
 
     // ─── directive gating ─────────────────────────────────────
