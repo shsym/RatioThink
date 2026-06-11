@@ -2173,7 +2173,7 @@ async fn handle_streaming(
         }
         _ => None,
     };
-    let _cache_guard = cache_plan.as_ref().map(prefix_cache::protect);
+    let _cache_guard = cache_plan.as_ref().map(|plan| prefix_cache::protect(&model, plan));
     let (mut ctx, mut cache_diag): (Context, Option<CacheDiag>) = match &cache_plan {
         Some(plan) => match prefix_cache::acquire(&model, plan) {
             Ok((ctx, diag)) => (ctx, Some(diag)),
@@ -2721,7 +2721,7 @@ async fn handle_non_streaming(
         }
         _ => None,
     };
-    let _cache_guard = cache_plan.as_ref().map(prefix_cache::protect);
+    let _cache_guard = cache_plan.as_ref().map(|plan| prefix_cache::protect(&model, plan));
     let (mut ctx, mut cache_diag): (Context, Option<CacheDiag>) = match &cache_plan {
         Some(plan) => match prefix_cache::acquire(&model, plan) {
             Ok((ctx, diag)) => (ctx, Some(diag)),

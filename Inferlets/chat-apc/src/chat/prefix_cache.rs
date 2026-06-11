@@ -83,21 +83,23 @@
 //! - **Engine restart / model unload / profile-prompt drift**: natural
 //!   misses (snapshot gone or name changed).
 //! - **Chat delete**: the chat's snapshots become unreachable (no future
-//!   request carries that key+prefix) — an "explicit miss". Reclaiming the
-//!   pages is smart-retention work owned by #524.
+//!   request carries that key+prefix) — an "explicit miss". Phase 2
+//!   retention reclaims inactive unreachable snapshots under runtime KV
+//!   pressure.
 //! - **policy = bypass**: never open, never save (privacy / ephemeral).
 //!
-//! ## Phase 1 / Phase 2 split
+//! ## Phase 2 retention
 //!
-//! Phase 1 (this module) is correctness-first: whole-snapshot
-//! save/open/delete and explicit miss/rebuild only. No global LRU, no
-//! page-pressure eviction, no committed-tail truncation — those wait on
-//! #517's authoritative global KV accounting and land in #524.
+//! The App may attach authoritative #517 runtime KV counters as a
+//! `cache.retention` budget. The inferlet passes that budget to pie's
+//! long-lived host `ContextManager`, which owns snapshot listing,
+//! per-request active protection, LRU selection, and deletion. Retention
+//! state intentionally does **not** live in WASM guest statics because the
+//! daemon creates a fresh component instance for each HTTP request.
 
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 // =============================================================================
 // Request directive
@@ -194,6 +196,7 @@ impl Default for RetentionBudget {
     }
 }
 
+#[cfg(test)]
 impl RetentionBudget {
     fn coherent(&self) -> bool {
         self.kv_pages_total > 0
@@ -234,12 +237,14 @@ pub enum RetentionReason {
     SkippedUncertainAccounting,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RetentionReport {
     pub evicted_names: Vec<String>,
     pub pages_reclaimed: u32,
     pub protected_active_pages: u32,
     pub retained_snapshot_count: usize,
+    pub delete_failed_count: u32,
     pub reason: RetentionReason,
 }
 
@@ -249,6 +254,19 @@ impl Default for RetentionReason {
     }
 }
 
+fn map_host_retention_reason(reason: HostRetentionReason) -> RetentionReason {
+    match reason {
+        HostRetentionReason::RetainedBelowSoftLimit => RetentionReason::RetainedBelowSoftLimit,
+        HostRetentionReason::RetainedBelowEvictionLimit => RetentionReason::RetainedBelowEvictionLimit,
+        HostRetentionReason::EvictedPressure => RetentionReason::EvictedPressure,
+        HostRetentionReason::HardCapStillExceeded => RetentionReason::HardCapStillExceeded,
+        HostRetentionReason::ProtectedActive => RetentionReason::ProtectedActive,
+        HostRetentionReason::NoInactiveSnapshots => RetentionReason::NoInactiveSnapshots,
+        HostRetentionReason::SkippedUncertainAccounting => RetentionReason::SkippedUncertainAccounting,
+    }
+}
+
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct SnapshotRecord {
     name: String,
@@ -258,11 +276,13 @@ struct SnapshotRecord {
     last_used_tick: u64,
 }
 
+#[cfg(test)]
 #[derive(Default, Debug)]
 pub struct RetentionRegistry {
     records: HashMap<String, SnapshotRecord>,
 }
 
+#[cfg(test)]
 impl RetentionRegistry {
     pub fn record_saved(
         &mut self,
@@ -283,12 +303,6 @@ impl RetentionRegistry {
                 last_used_tick,
             },
         );
-    }
-
-    fn touch(&mut self, name: &str, last_used_tick: u64) {
-        if let Some(record) = self.records.get_mut(name) {
-            record.last_used_tick = last_used_tick;
-        }
     }
 
     #[cfg(test)]
@@ -392,58 +406,36 @@ impl RetentionRegistry {
             pages_reclaimed,
             protected_active_pages,
             retained_snapshot_count,
+            delete_failed_count: 0,
             reason,
         }
     }
 }
 
-static RETENTION_REGISTRY: OnceLock<Mutex<RetentionRegistry>> = OnceLock::new();
-static ACTIVE_SNAPSHOTS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
-static RETENTION_TICK: AtomicU64 = AtomicU64::new(1);
-
-fn retention_registry() -> &'static Mutex<RetentionRegistry> {
-    RETENTION_REGISTRY.get_or_init(|| Mutex::new(RetentionRegistry::default()))
-}
-
-fn active_snapshots() -> &'static Mutex<HashMap<String, u32>> {
-    ACTIVE_SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn next_retention_tick() -> u64 {
-    RETENTION_TICK.fetch_add(1, Ordering::Relaxed)
-}
-
 /// RAII guard for snapshots used by an in-flight generation. The deletion
 /// pass also receives the just-saved snapshot name, so both active streams
 /// and the current foreground generation are protected from LRU eviction.
-pub struct ActiveSnapshotGuard {
+pub struct ActiveSnapshotGuard<'a> {
+    model: &'a Model,
     names: Vec<String>,
 }
 
-impl Drop for ActiveSnapshotGuard {
+impl Drop for ActiveSnapshotGuard<'_> {
     fn drop(&mut self) {
-        let mut active = active_snapshots().lock().unwrap();
         for name in &self.names {
-            match active.get_mut(name) {
-                Some(count) if *count > 1 => *count -= 1,
-                Some(_) => {
-                    active.remove(name);
-                }
-                None => {}
-            }
+            Context::release_snapshot(self.model, name);
         }
     }
 }
 
-pub fn protect(plan: &ReusePlan) -> ActiveSnapshotGuard {
+pub fn protect<'a>(model: &'a Model, plan: &ReusePlan) -> ActiveSnapshotGuard<'a> {
     let names: Vec<String> = plan.open_name.iter().cloned().collect();
-    if !names.is_empty() {
-        let mut active = active_snapshots().lock().unwrap();
-        for name in &names {
-            *active.entry(name.clone()).or_insert(0) += 1;
+    for name in &names {
+        if let Err(e) = Context::retain_snapshot(model, name) {
+            eprintln!("[chat-apc] prefix-cache retain snapshot failed for {name}: {e}");
         }
     }
-    ActiveSnapshotGuard { names }
+    ActiveSnapshotGuard { model, names }
 }
 
 // =============================================================================
@@ -572,6 +564,9 @@ pub struct CacheDiag {
     /// KV pages reclaimed by whole-snapshot LRU eviction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pages_reclaimed: Option<u32>,
+    /// Host-side delete failures observed during the retention pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_failed_count: Option<u32>,
     /// Pages attributed to protected active/current snapshots.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protected_active_pages: Option<u32>,
@@ -599,7 +594,9 @@ impl CacheDiag {
 // =============================================================================
 
 use super::completions::{ChatMessage, ToolSchema, build_prompt_tokens};
-use inferlet::Context;
+use inferlet::{
+    Context, RetentionBudget as HostRetentionBudget, RetentionReason as HostRetentionReason,
+};
 use inferlet::chat;
 use inferlet::model::Model;
 
@@ -691,10 +688,6 @@ pub fn acquire(
                     diag.prefix_hash = name_hash_part(name);
                     diag.base_boundary = plan.prefix_tokens.len();
                     diag.appended = suffix.len();
-                    retention_registry()
-                        .lock()
-                        .unwrap()
-                        .touch(name, next_retention_tick());
                     ctx.append(&suffix);
                     return Ok((ctx, diag));
                 }
@@ -793,13 +786,6 @@ pub async fn finalize(plan: &ReusePlan, gen_content: &str, model: &Model, diag: 
         Ok(()) => {
             diag.save_result = "saved".to_string();
             diag.save_hash = name_hash_part(&name);
-            retention_registry().lock().unwrap().record_saved(
-                name.clone(),
-                plan.directive.key.clone(),
-                plan.model_id.clone(),
-                committed_pages.saturating_add(working_pages),
-                next_retention_tick(),
-            );
         }
         Err(e) => {
             let es = e.to_string();
@@ -808,10 +794,6 @@ pub async fn finalize(plan: &ReusePlan, gen_content: &str, model: &Model, diag: 
                 // still a valid future hit.
                 diag.save_result = "exists".to_string();
                 diag.save_hash = name_hash_part(&name);
-                retention_registry()
-                    .lock()
-                    .unwrap()
-                    .touch(&name, next_retention_tick());
             } else {
                 eprintln!("[chat-apc] prefix-cache save failed: {es}");
                 diag.save_result = "failed:save".to_string();
@@ -819,25 +801,32 @@ pub async fn finalize(plan: &ReusePlan, gen_content: &str, model: &Model, diag: 
         }
     }
     if let Some(budget) = plan.directive.retention {
-        let mut protected_owned: Vec<String> =
-            active_snapshots().lock().unwrap().keys().cloned().collect();
-        protected_owned.push(name.clone());
-        let protected: Vec<&str> = protected_owned.iter().map(String::as_str).collect();
-        let report =
-            retention_registry()
-                .lock()
-                .unwrap()
-                .enforce(&plan.model_id, budget, &protected);
-        for evicted in &report.evicted_names {
-            if let Err(e) = Context::delete(model, evicted) {
-                eprintln!("[chat-apc] prefix-cache retention delete failed for {evicted}: {e}");
+        match Context::enforce_retention(
+            model,
+            "apc/",
+            &name,
+            HostRetentionBudget {
+                kv_pages_used: budget.kv_pages_used,
+                kv_pages_total: budget.kv_pages_total,
+                soft_percent: budget.soft_percent,
+                evict_percent: budget.evict_percent,
+                hard_percent: budget.hard_percent,
+            },
+        ) {
+            Ok(report) => {
+                diag.retained_snapshot_count = Some(report.retained_snapshot_count as usize);
+                diag.evicted_snapshot_count = Some(report.evicted_names.len());
+                diag.pages_reclaimed = Some(report.pages_reclaimed);
+                diag.protected_active_pages = Some(report.protected_active_pages);
+                diag.delete_failed_count = Some(report.delete_failed_count);
+                diag.eviction_reason = Some(map_host_retention_reason(report.reason));
+            }
+            Err(e) => {
+                eprintln!("[chat-apc] prefix-cache host retention failed: {e}");
+                diag.eviction_reason = Some(RetentionReason::SkippedUncertainAccounting);
+                diag.delete_failed_count = Some(1);
             }
         }
-        diag.retained_snapshot_count = Some(report.retained_snapshot_count);
-        diag.evicted_snapshot_count = Some(report.evicted_names.len());
-        diag.pages_reclaimed = Some(report.pages_reclaimed);
-        diag.protected_active_pages = Some(report.protected_active_pages);
-        diag.eviction_reason = Some(report.reason);
     }
     // `save_ctx` drops here, releasing the context resource (the snapshot it
     // saved is independent and survives).

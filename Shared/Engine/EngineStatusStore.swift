@@ -486,6 +486,9 @@ public final class EngineStatusStore: ObservableObject {
           let message = String(describing: error)
           Self.log.error("kvUsageSnapshots poll failed: \(message, privacy: .public)")
           DiagnosticLog.app.event("engine.kv_usage", [("result", "fail"), ("reason", message)])
+          await MainActor.run { [weak self] in
+            self?.latestKVUsageSnapshots = []
+          }
         }
       } else {
         await MainActor.run { [weak self] in
