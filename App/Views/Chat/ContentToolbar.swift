@@ -52,6 +52,10 @@ struct ContentToolbar: View {
   /// like the others so snapshot/preview sites stay pip-less; the pip renders
   /// only when it (with center/engineStatus/helperHealth) is wired.
   let engineLifecycle: EngineLifecycle?
+  /// Current selected-profile sampling defaults. Read through a closure so
+  /// Settings saves affect newly opened params popovers even though
+  /// `ProfileStore` does not publish SwiftUI updates.
+  let profileSampling: () -> ChatSampling
   /// Forwarded to the indicator's running/ready popover Unload action.
   let onUnload: () -> Void
   /// Forwarded to the indicator's offline (engine-stopped) popover "Start
@@ -70,6 +74,7 @@ struct ContentToolbar: View {
     engineStatus: EngineStatusStore?,
     helperHealth: HelperHealthController?,
     engineLifecycle: EngineLifecycle?,
+    profileSampling: @escaping () -> ChatSampling = { ChatSampling() },
     onUnload: @escaping () -> Void,
     onStartEngine: @escaping () -> Void = {}
   ) {
@@ -81,6 +86,7 @@ struct ContentToolbar: View {
     self.engineStatus = engineStatus
     self.helperHealth = helperHealth
     self.engineLifecycle = engineLifecycle
+    self.profileSampling = profileSampling
     self.onUnload = onUnload
     self.onStartEngine = onStartEngine
   }
@@ -227,7 +233,10 @@ struct ContentToolbar: View {
     .buttonStyle(.plain)
     .help("Sampling parameters")
     .popover(isPresented: $showParamsPopover, arrowEdge: .top) {
-      ParamsPopover(sampling: $viewModel.sampling)
+      ParamsPopover(sampling: Binding(
+        get: { viewModel.samplingOverride ?? profileSampling() },
+        set: { viewModel.samplingOverride = $0 }
+      ))
     }
     .accessibilityIdentifier("toolbar.params")
   }

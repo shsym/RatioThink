@@ -239,6 +239,7 @@ struct ChatScaffoldView: View {
         engineStatus: engineStatusStore,
         helperHealth: helperHealth,
         engineLifecycle: engineLifecycle,
+        profileSampling: { selectedProfileSamplingDefault },
         onUnload: unloadModel,
         onStartEngine: startEngineForSelectedProfile
       )
@@ -327,12 +328,11 @@ struct ChatScaffoldView: View {
     .onChange(of: modelLoadCenter.residentModelID) { _, _ in dismissPromptIfResolved() }
     .onChange(of: viewModel.modelOverride) { _, _ in dismissPromptIfResolved() }
     .onAppear {
-      // Seed the toolbar from the persisted profile so the menu
-      // label and transient request defaults match what the chat was
-      // created with. Toolbar edits after this remain per-chat and are
-      // not written back to the profile.
+      // Seed the toolbar from the persisted profile so the menu label matches
+      // what the chat was created with, and clear transient overrides because
+      // toolbar edits are per-chat session state.
       viewModel.selectedProfileID = chat.profileID
-      applyDefaultsForSelectedProfile()
+      clearTransientOverridesForSelectedProfile()
       // #4: covers the case where the engine status already settled before
       // this view appeared (no .onChange fires) — evaluate the launch ask
       // here too; the once-flag keeps it from double-prompting.
@@ -363,7 +363,7 @@ struct ChatScaffoldView: View {
         // write failure (the marker simply stays on the prior profile), so
         // the `try?` does not silently drop the signal.
         try? profileStore.setActiveProfileID(new)
-        applyDefaultsForSelectedProfile()
+        clearTransientOverridesForSelectedProfile()
       } catch {
         chat.profileID = previous
         // Also revert the toolbar selection so the menu label
@@ -445,7 +445,9 @@ struct ChatScaffoldView: View {
       persistenceStatus: persistenceStatus,
       options: ChatSendRequestOptions(
         modelID: modelID,
-        sampling: viewModel.sampling,
+        sampling: Self.resolvedSampling(
+          profileDefault: profileStore.sampling(forProfileID: viewModel.selectedProfileID),
+          transientOverride: viewModel.samplingOverride),
         systemPromptOverride: Self.resolvedSystemPrompt(
           profileDefault: profileStore.systemPrompt(forProfileID: viewModel.selectedProfileID),
           transientOverride: viewModel.systemPromptOverride),
@@ -464,24 +466,33 @@ struct ChatScaffoldView: View {
     )
   }
 
-  private func applyDefaultsForSelectedProfile() {
-    Self.applyProfileDefaults(
-      to: viewModel,
-      sampling: profileStore.sampling(forProfileID: viewModel.selectedProfileID))
+  private var selectedProfileSamplingDefault: ChatSampling {
+    Self.chatSampling(from: profileStore.sampling(forProfileID: viewModel.selectedProfileID))
   }
 
-  /// Copy selected-profile sampling into the transient toolbar model and clear
-  /// any prior per-chat prompt override. The profile prompt itself is resolved
-  /// at send time by `resolvedSystemPrompt`, so a blank toolbar prompt keeps
-  /// meaning "use the profile default" instead of becoming an empty override.
-  static func applyProfileDefaults(to viewModel: ChatTranscriptViewModel,
-                                   sampling: Sampling?) {
+  private func clearTransientOverridesForSelectedProfile() {
+    Self.clearTransientOverridesForProfileSwitch(to: viewModel)
+  }
+
+  /// Profile switches reset per-chat toolbar overrides. Profile defaults are
+  /// not copied into cached view-model state; `sendAssistantTurn` resolves them
+  /// from `ProfileStore` at send time so Settings saves affect open chats.
+  static func clearTransientOverridesForProfileSwitch(to viewModel: ChatTranscriptViewModel) {
+    viewModel.samplingOverride = nil
+    viewModel.systemPromptOverride = nil
+  }
+
+  static func resolvedSampling(profileDefault: Sampling?,
+                               transientOverride: ChatSampling?) -> ChatSampling {
+    transientOverride ?? chatSampling(from: profileDefault)
+  }
+
+  static func chatSampling(from sampling: Sampling?) -> ChatSampling {
     let defaults = sampling ?? Sampling()
-    viewModel.sampling = ChatSampling(
+    return ChatSampling(
       temperature: defaults.temperature,
       topP: defaults.topP,
       maxTokens: defaults.maxTokens)
-    viewModel.systemPromptOverride = nil
   }
 
   static func resolvedSystemPrompt(profileDefault: String?,

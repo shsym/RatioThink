@@ -44,19 +44,17 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     )
   }
 
-  func test_profile_sampling_defaults_seed_toolbar_state_without_persisting_overrides() {
+  func test_profile_switch_clears_transient_toolbar_overrides_without_caching_profile_sampling() {
     let viewModel = ChatTranscriptViewModel(
       selectedProfileID: "creative",
-      sampling: ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 4096),
+      samplingOverride: ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 4096),
       systemPromptOverride: "temporary override"
     )
 
-    ChatScaffoldView.applyProfileDefaults(
-      to: viewModel,
-      sampling: Sampling(temperature: 1.1, topP: 0.65, maxTokens: 777)
-    )
+    ChatScaffoldView.clearTransientOverridesForProfileSwitch(to: viewModel)
 
-    XCTAssertEqual(viewModel.sampling, ChatSampling(temperature: 1.1, topP: 0.65, maxTokens: 777))
+    XCTAssertNil(viewModel.samplingOverride,
+                 "profile switches should clear the transient toolbar sampling override")
     XCTAssertNil(viewModel.systemPromptOverride,
                  "profile switches should clear the transient toolbar prompt override; send resolves the profile prompt separately")
   }
@@ -78,6 +76,63 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     XCTAssertNil(ChatScaffoldView.resolvedSystemPrompt(profileDefault: "", transientOverride: nil))
   }
 
+  func test_resolvedSampling_uses_latest_profile_defaults_for_open_chat_without_toolbar_override() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(
+        into: dir,
+        id: "chat",
+        temperature: 0.4,
+        topP: 0.75,
+        maxTokens: 1536)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      let viewModel = ChatTranscriptViewModel(selectedProfileID: "chat")
+
+      try store.setEditableDefaults(
+        systemPrompt: "prompt",
+        temperature: 0.2,
+        topP: 0.95,
+        forProfileID: "chat")
+
+      XCTAssertEqual(
+        ChatScaffoldView.resolvedSampling(
+          profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+          transientOverride: viewModel.samplingOverride),
+        ChatSampling(temperature: 0.2, topP: 0.95, maxTokens: 1536),
+        "an already-open chat with no toolbar override must pick up Settings-saved sampling defaults on its next send")
+    }
+  }
+
+  func test_resolvedSampling_keeps_toolbar_override_over_later_profile_default_edits() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(
+        into: dir,
+        id: "chat",
+        temperature: 0.4,
+        topP: 0.75,
+        maxTokens: 1536)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      let viewModel = ChatTranscriptViewModel(selectedProfileID: "chat")
+      viewModel.samplingOverride = ChatSampling(temperature: 1.3, topP: 0.55, maxTokens: 1536)
+
+      try store.setEditableDefaults(
+        systemPrompt: "prompt",
+        temperature: 0.2,
+        topP: 0.95,
+        forProfileID: "chat")
+
+      XCTAssertEqual(
+        ChatScaffoldView.resolvedSampling(
+          profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+          transientOverride: viewModel.samplingOverride),
+        ChatSampling(temperature: 1.3, topP: 0.55, maxTokens: 1536),
+        "a real toolbar override must remain transiently authoritative until cleared")
+    }
+  }
+
   func test_chat_gui_override_still_points_at_small_model_harness() {
     XCTAssertEqual(
       ChatScaffoldView.requestModelID(
@@ -88,4 +143,35 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       "Qwen/Qwen3-0.6B"
     )
   }
+
+  private func withTempProfilesDir(_ body: (URL) throws -> Void) throws {
+    let dir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("rt-chat-scaffold-profile-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try body(dir)
+  }
+
+  private func writeProfile(into dir: URL,
+                            id: String,
+                            temperature: Double,
+                            topP: Double,
+                            maxTokens: Int) throws {
+    let body = """
+    id = "\(id)"
+    name = "Chat"
+    model = "model.gguf"
+    inferlet = "chat-apc"
+    system_prompt = "Old prompt"
+
+    [sampling]
+    temperature = \(temperature)
+    top_p = \(topP)
+    max_tokens = \(maxTokens)
+    """
+    try body.write(to: dir.appendingPathComponent("\(id).toml"),
+                   atomically: true,
+                   encoding: .utf8)
+  }
+
 }
