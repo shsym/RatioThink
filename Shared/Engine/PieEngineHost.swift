@@ -624,6 +624,7 @@ public final class PieEngineHost: @unchecked Sendable {
   /// Owned by `stateQueue` and guarded by `launchIncarnation` so a stale timer
   /// can only cancel the same still-starting launch it was armed for.
   private var launchTimeoutTask: Task<Void, Never>?
+  private var mostRecentLaunchTimeoutTaskForTesting: Task<Void, Never>?
   private var launchIncarnation: UInt64 = 0
 
   private enum LaunchCancellationReason {
@@ -689,7 +690,7 @@ public final class PieEngineHost: @unchecked Sendable {
                                 timeout: TimeInterval) {
     let sleepFor = self.sleepFor
     launchTimeoutTask?.cancel()
-    launchTimeoutTask = Task { [weak self, timeout, launchID, profileID, sleepFor] in
+    let task = Task { [weak self, timeout, launchID, profileID, sleepFor] in
       await sleepFor(timeout)
       if Task.isCancelled { return }
       guard let self else { return }
@@ -730,6 +731,8 @@ public final class PieEngineHost: @unchecked Sendable {
         self.setState(.stopping(session: nil, launchID: currentLaunchID))
       }
     }
+    launchTimeoutTask = task
+    mostRecentLaunchTimeoutTaskForTesting = task
   }
 
   /// Body of the launch task. Lives outside `doStart` so it can hop
@@ -1312,6 +1315,15 @@ public final class PieEngineHost: @unchecked Sendable {
   }
 
   // MARK: - Test seams
+
+  internal var launchTimeoutTaskForTesting: Task<Void, Never>? {
+    stateQueue.sync { mostRecentLaunchTimeoutTaskForTesting }
+  }
+
+  internal func waitForLaunchTimeoutTaskAndDrainForTesting(_ task: Task<Void, Never>?) async {
+    await task?.value
+    stateQueue.sync {}
+  }
 
   /// Diagnostic-only attempt count for tests. Mirrors the rolling
   /// window the policy uses (entries older than `window` are pruned

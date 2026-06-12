@@ -67,23 +67,63 @@ final class PieEngineHostTests: XCTestCase {
   final class LaunchGate: @unchecked Sendable {
     typealias LaunchResult = (port: EnginePort, session: any PieEngineHost.EngineSession)
 
+    final class Attempt: @unchecked Sendable {
+      private let lock = NSLock()
+      private var cancelledExpectation: XCTestExpectation?
+      private var didCancel = false
+
+      func setCancelledExpectation(_ expectation: XCTestExpectation?) {
+        var fulfillImmediately: XCTestExpectation?
+        lock.lock()
+        if didCancel {
+          fulfillImmediately = expectation
+        } else {
+          cancelledExpectation = expectation
+        }
+        lock.unlock()
+        fulfillImmediately?.fulfill()
+      }
+
+      func cancel() {
+        var expectation: XCTestExpectation?
+        lock.lock()
+        if !didCancel {
+          didCancel = true
+          expectation = cancelledExpectation
+          cancelledExpectation = nil
+        }
+        lock.unlock()
+        expectation?.fulfill()
+      }
+    }
+
     private let lock = NSLock()
     private var continuations: [CheckedContinuation<LaunchResult, Error>] = []
     let started: [XCTestExpectation]
+    let cancelled: [XCTestExpectation]
 
-    init(started: [XCTestExpectation]) {
+    init(started: [XCTestExpectation], cancelled: [XCTestExpectation] = []) {
       self.started = started
+      self.cancelled = cancelled
     }
 
     func launch(_ spec: PieControlLauncher.LaunchSpec) async throws -> LaunchResult {
-      try await withCheckedThrowingContinuation { continuation in
-        let index = lock.withLock { () -> Int in
-          continuations.append(continuation)
-          return continuations.count - 1
+      let attempt = Attempt()
+      return try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { continuation in
+          let index = lock.withLock { () -> Int in
+            continuations.append(continuation)
+            return continuations.count - 1
+          }
+          if index < cancelled.count {
+            attempt.setCancelledExpectation(cancelled[index])
+          }
+          if index < started.count {
+            started[index].fulfill()
+          }
         }
-        if index < started.count {
-          started[index].fulfill()
-        }
+      } onCancel: {
+        attempt.cancel()
       }
     }
 
@@ -102,26 +142,20 @@ final class PieEngineHostTests: XCTestCase {
     private let lock = NSLock()
     private var continuations: [CheckedContinuation<Void, Never>] = []
     let armed: [XCTestExpectation]
-    let returned: [XCTestExpectation]
 
-    init(armed: [XCTestExpectation], returned: [XCTestExpectation] = []) {
+    init(armed: [XCTestExpectation]) {
       self.armed = armed
-      self.returned = returned
     }
 
     func sleep(_ seconds: TimeInterval) async {
-      var index = 0
       await withCheckedContinuation { continuation in
-        index = lock.withLock { () -> Int in
+        let index = lock.withLock { () -> Int in
           continuations.append(continuation)
           return continuations.count - 1
         }
         if index < armed.count {
           armed[index].fulfill()
         }
-      }
-      if index < returned.count {
-        returned[index].fulfill()
       }
     }
 
@@ -400,7 +434,8 @@ final class PieEngineHostTests: XCTestCase {
   func test_launch_timeout_is_owned_by_host_and_cancels_only_still_starting_attempt() {
     let firstStarted = expectation(description: "launch started")
     let timeoutArmed = expectation(description: "launch timeout armed")
-    let launches = LaunchGate(started: [firstStarted])
+    let launchCancelled = expectation(description: "launch task cancelled by timeout")
+    let launches = LaunchGate(started: [firstStarted], cancelled: [launchCancelled])
     let sleeps = SleepGate(armed: [timeoutArmed])
     let host = PieEngineHost(
       launcher: { spec in try await launches.launch(spec) },
@@ -424,7 +459,7 @@ final class PieEngineHostTests: XCTestCase {
       }
     }
     sleeps.wake(0)
-    wait(for: [stoppingObserved], timeout: 2)
+    wait(for: [stoppingObserved, launchCancelled], timeout: 2)
     stoppingToken.cancel()
     launches.fail(0, CancellationError())
     wait(for: [exp], timeout: 2)
@@ -650,17 +685,22 @@ final class PieEngineHostTests: XCTestCase {
     failedToken.cancel()
   }
 
-  func test_stale_launch_timeout_after_running_is_inert() {
+  func test_stale_launch_timeout_after_running_is_inert() async {
     let session = FakeSession()
+    let firstStarted = expectation(description: "launch started")
     let timeoutArmed = expectation(description: "launch timeout armed")
-    let timeoutReturned = expectation(description: "launch timeout sleep returned")
-    let sleeps = SleepGate(armed: [timeoutArmed], returned: [timeoutReturned])
+    let launches = LaunchGate(started: [firstStarted])
+    let sleeps = SleepGate(armed: [timeoutArmed])
     let host = PieEngineHost(
-      launcher: { _ in (port: EnginePort(9012), session: session) },
+      launcher: { spec in try await launches.launch(spec) },
       launchTimeoutSlack: 0,
       sleepFor: { seconds in await sleeps.sleep(seconds) }
     )
     XCTAssertNoThrow(try host.start(makeSpec(profileID: "tree-of-thought", handshakeTimeout: 0.2)).get())
+    await fulfillment(of: [firstStarted, timeoutArmed], timeout: 2)
+    let timeoutTask = host.launchTimeoutTaskForTesting
+    XCTAssertNotNil(timeoutTask, "host should retain the armed timeout task for deterministic test synchronization")
+
     let running = expectation(description: "host reaches running")
     var hitRunning = false
     let token = host.observe { status, _ in
@@ -669,10 +709,11 @@ final class PieEngineHostTests: XCTestCase {
         running.fulfill()
       }
     }
-    wait(for: [running, timeoutArmed], timeout: 2)
+    launches.succeed(0, port: EnginePort(9012), session: session)
+    await fulfillment(of: [running], timeout: 2)
 
     sleeps.wake(0)
-    wait(for: [timeoutReturned], timeout: 2)
+    await host.waitForLaunchTimeoutTaskAndDrainForTesting(timeoutTask)
     token.cancel()
 
     guard case .running(let snap) = host.status else {
