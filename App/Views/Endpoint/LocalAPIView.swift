@@ -3,9 +3,10 @@ import SwiftUI
 /// The single "Local API" surface (#422).
 ///
 /// The app serves exactly ONE OpenAI-compatible HTTP endpoint: the pie
-/// engine's loopback server, the same one in-app chat uses. This view is a
-/// live, read-mostly mirror of that real endpoint — there is nothing to
-/// "create" or configure per-endpoint (that placeholder CRUD is gone).
+/// engine's loopback server, the same one in-app chat uses. This view mirrors
+/// the real endpoint and exposes the one supported endpoint policy knob:
+/// whether the shared engine should start automatically on app launch. Port,
+/// auth, and CORS remain fixed by the current engine launch contract.
 ///
 /// Everything shown is bound to a real source:
 ///  · status / base URL / port ← `EngineStatusStore` (`EngineStatus.running`)
@@ -23,6 +24,7 @@ struct LocalAPIView: View {
   @EnvironmentObject private var engineStatusStore: EngineStatusStore
   @EnvironmentObject private var profileStore: ProfileStore
   @EnvironmentObject private var engineClientStore: EngineClientStore
+  @EnvironmentObject private var appPreferences: AppPreferences
 
   @State private var memory: EngineMemorySample?
   @State private var servedModel: String?
@@ -62,6 +64,7 @@ struct LocalAPIView: View {
         if state.isServing {
           servingDetails
         }
+        configurationSection
         securitySection
       }
       .padding(20)
@@ -255,6 +258,37 @@ struct LocalAPIView: View {
   }
 
   // MARK: - security posture (always visible, read-only)
+
+  private var configurationSection: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      sectionHeader("Configuration")
+      Toggle(isOn: autoStartBinding) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Start Local API when RatioThink opens")
+          Text("Off by default. When enabled, RatioThink starts the shared engine on the active profile after launch.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      .toggleStyle(.switch)
+      .accessibilityIdentifier("LocalAPIAutoStartToggle")
+
+      postureRow(title: "Profile", value: profileStore.activeProfileID ?? "Select a profile in Settings → Profiles.")
+      Text("Port, authentication, and CORS are fixed by the current engine launch contract. Change the startup policy here; use the Local API switch above for immediate on/off.")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+    .accessibilityIdentifier("LocalAPIConfiguration")
+  }
+
+  private var autoStartBinding: Binding<Bool> {
+    Binding(
+      get: { appPreferences.localAPIAutoStartEnabled },
+      set: { appPreferences.setLocalAPIAutoStartEnabled($0) }
+    )
+  }
 
   private var securitySection: some View {
     VStack(alignment: .leading, spacing: 8) {

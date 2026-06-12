@@ -5,8 +5,8 @@ import XCTest
 /// `UserDefaults` reads/writes hop on the right actor without needing
 /// per-test `await MainActor.run` blocks.
 ///
-///  removed the swap skip-set; the only surviving preference is the
-/// first-launch completion flag.
+///  removed the swap skip-set; the remaining preferences are user-visible
+/// launch-time flags.
 @MainActor
 final class AppPreferencesTests: XCTestCase {
 
@@ -53,6 +53,30 @@ final class AppPreferencesTests: XCTestCase {
     XCTAssertFalse(prefs.firstLaunchWizardCompleted)
     let reopened = AppPreferences(defaults: defaults)
     XCTAssertFalse(reopened.firstLaunchWizardCompleted)
+  }
+
+
+  func test_local_api_auto_start_defaults_off() throws {
+    let defaults = try makeScratchDefaults()
+    let prefs = AppPreferences(defaults: defaults)
+
+    XCTAssertFalse(prefs.localAPIAutoStartEnabled,
+                   "Local API must not start automatically unless the user opts in")
+  }
+
+  func test_local_api_auto_start_preference_persists() throws {
+    let defaults = try makeScratchDefaults()
+    let prefs = AppPreferences(defaults: defaults)
+
+    prefs.setLocalAPIAutoStartEnabled(true)
+
+    XCTAssertTrue(prefs.localAPIAutoStartEnabled)
+    let reopened = AppPreferences(defaults: defaults)
+    XCTAssertTrue(reopened.localAPIAutoStartEnabled)
+
+    reopened.setLocalAPIAutoStartEnabled(false)
+    let reopenedAgain = AppPreferences(defaults: defaults)
+    XCTAssertFalse(reopenedAgain.localAPIAutoStartEnabled)
   }
 
   func test_follow_profile_default_model_defaults_off() throws {

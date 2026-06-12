@@ -219,6 +219,7 @@ struct ChatScaffoldView: View {
     guard !Self.didEvaluateLaunchStartPrompt else { return }
     if case .starting = engineStatusStore.status { return }
     Self.didEvaluateLaunchStartPrompt = true
+    if appPreferences.localAPIAutoStartEnabled { return }
     if LaunchEngineStartPrompt.shouldAsk(
         status: engineStatusStore.status,
         // #497: ask about the model the Load tap will BOOT (the chat's pin

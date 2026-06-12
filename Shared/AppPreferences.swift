@@ -27,6 +27,11 @@ public final class AppPreferences: ObservableObject {
   /// array of normalized version strings (e.g. `["0.1.1"]`).
   public static let ignoredUpdateVersionsKey = "ignoredUpdateVersions"
 
+  /// Storage key for the Local API launch policy. Defaults off so the app
+  /// never loads a model or opens the local HTTP endpoint at startup unless
+  /// the user explicitly opts in from the Local API page.
+  public static let localAPIAutoStartEnabledKey = "localAPIAutoStartEnabled"
+
   /// Compatibility toggle for users who want profile changes to keep offering
   /// the destination profile's default model after a concrete model row was
   /// selected. Default OFF: explicit model picks stay pinned across profile
@@ -44,11 +49,16 @@ public final class AppPreferences: ObservableObject {
   /// prompts again. The manual "Check for Updates…" command ignores this set.
   @Published public private(set) var ignoredUpdateVersions: Set<String>
 
+  /// Whether RatioThink should start the shared engine (and therefore the
+  /// Local API) automatically on app launch. User-controlled; default false.
+  @Published public private(set) var localAPIAutoStartEnabled: Bool
+
   public init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
     self.firstLaunchWizardCompleted = defaults.bool(forKey: Self.firstLaunchWizardCompletedKey)
     self.followProfileDefaultModel = defaults.bool(forKey: Self.followProfileDefaultModelKey)
     self.ignoredUpdateVersions = Set(defaults.stringArray(forKey: Self.ignoredUpdateVersionsKey) ?? [])
+    self.localAPIAutoStartEnabled = defaults.bool(forKey: Self.localAPIAutoStartEnabledKey)
   }
 
   public func setFollowProfileDefaultModel(_ enabled: Bool) {
@@ -90,5 +100,15 @@ public final class AppPreferences: ObservableObject {
   public func resetFirstLaunchWizard() {
     firstLaunchWizardCompleted = false
     defaults.removeObject(forKey: Self.firstLaunchWizardCompletedKey)
+  }
+
+  /// Persist the Local API launch policy. Flushed immediately so a user can
+  /// toggle it and quit before the next automatic UserDefaults sync without
+  /// losing the startup intent.
+  public func setLocalAPIAutoStartEnabled(_ enabled: Bool) {
+    guard localAPIAutoStartEnabled != enabled else { return }
+    localAPIAutoStartEnabled = enabled
+    defaults.set(enabled, forKey: Self.localAPIAutoStartEnabledKey)
+    defaults.synchronize()
   }
 }

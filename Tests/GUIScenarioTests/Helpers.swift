@@ -141,11 +141,31 @@ func selectPersistedChat(
   file: StaticString = #filePath,
   line: UInt = #line
 ) {
-  let chatTitle = app.staticTexts[title].firstMatch
+  let chatList = app.descendants(matching: .any)
+    .matching(identifier: "chats.list")
+    .firstMatch
+  XCTAssertTrue(chatList.waitForExistence(timeout: 10),
+                "chat list missing before selecting persisted row '\(title)'; app tree: \(app.debugDescription)",
+                file: file, line: line)
+
+  let chatTitle = chatList.staticTexts[title].firstMatch
   XCTAssertTrue(chatTitle.waitForExistence(timeout: 10),
                 "persisted chat row '\(title)' missing after relaunch; app tree: \(app.debugDescription)",
                 file: file, line: line)
-  chatTitle.click()
+
+  let composer = app.descendants(matching: .any)
+    .matching(identifier: "composer.text")
+    .firstMatch
+  let deadline = Date().addingTimeInterval(10)
+  repeat {
+    app.activate()
+    chatTitle.click()
+    if composer.waitForExistence(timeout: 1) { return }
+    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25))
+  } while Date() < deadline
+
+  XCTFail("persisted chat row '\(title)' did not open the chat scaffold; app tree: \(app.debugDescription)",
+          file: file, line: line)
 }
 
 @MainActor

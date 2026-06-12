@@ -25,6 +25,8 @@ struct RootView: View {
   @EnvironmentObject private var appPreferences: AppPreferences
   @EnvironmentObject private var updateAvailability: UpdateAvailabilityModel
   @Environment(\.openURL) private var openURL
+  @State private var didEvaluateLocalAPIAutoStart = false
+  @State private var localAPIAutoStartError: String?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -47,6 +49,11 @@ struct RootView: View {
         onOpenLoginItems: { SMAppService.openSystemSettingsLoginItems() },
         onCollectDiagnostics: { Task { await DiagnosticsCollector.collectAndReveal() } }
       )
+      if let localAPIAutoStartError {
+        LocalAPIAutoStartErrorBanner(message: localAPIAutoStartError) {
+          self.localAPIAutoStartError = nil
+        }
+      }
       // #411: low-urgency, non-modal update prompt. Only present for a newer,
       // non-ignored release found by the once-per-launch check.
       if let pending = updateAvailability.pending {
@@ -84,6 +91,13 @@ struct RootView: View {
       .navigationTitle("Rational")
     }
     .task { await runLaunchUpdateCheck() }
+    .onAppear { maybeAutoStartLocalAPIOnLaunch() }
+    .onChange(of: engineStatusStore.status) { _, new in
+      if case .running = new {
+        localAPIAutoStartError = nil
+      }
+      maybeAutoStartLocalAPIOnLaunch()
+    }
     // #512: leaving an empty "New Chat" shell deletes it. Hooked on the
     // selection (not view teardown) so it covers chat-switch, new-chat
     // creation, and deselect alike — and only ever prunes the chat the
@@ -125,6 +139,73 @@ struct RootView: View {
       guard let profileID, !profileID.isEmpty else { return }
       try? await engineStatusStore.startEngine(profileID: profileID)
     }
+  }
+
+  /// Honor the Local API startup preference once per window lifetime after
+  /// the helper's initial placeholder status settles. Default-off preserves
+  /// the no-surprise model-load contract; when enabled, this starts the same
+  /// shared engine that in-app chat and the Local API page use.
+  private func maybeAutoStartLocalAPIOnLaunch() {
+    guard !didEvaluateLocalAPIAutoStart else { return }
+    if case .starting = engineStatusStore.status { return }
+    didEvaluateLocalAPIAutoStart = true
+
+    guard LocalAPIAutoStartPolicy.shouldStartOnLaunch(
+      enabled: appPreferences.localAPIAutoStartEnabled,
+      status: engineStatusStore.status,
+      activeProfileID: profileStore.activeProfileID
+    ), let profileID = profileStore.activeProfileID else {
+      return
+    }
+
+    Task { @MainActor in
+      let result = await LocalAPIAutoStartLauncher.run(
+        enabled: appPreferences.localAPIAutoStartEnabled,
+        status: engineStatusStore.status,
+        activeProfileID: profileID,
+        startEngine: { try await engineStatusStore.startEngine(profileID: $0) },
+        errorMessage: { ChatScaffoldView.engineErrorMessage($0, verb: "start") }
+      )
+      switch result {
+      case .skipped, .started:
+        localAPIAutoStartError = nil
+      case .failed(let message):
+        localAPIAutoStartError = message
+      }
+    }
+  }
+}
+
+private struct LocalAPIAutoStartErrorBanner: View {
+  let message: String
+  let onDismiss: () -> Void
+
+  var body: some View {
+    HStack(alignment: .top, spacing: 8) {
+      Image(systemName: "exclamationmark.triangle.fill")
+        .foregroundStyle(.orange)
+        .accessibilityHidden(true)
+      VStack(alignment: .leading, spacing: 2) {
+        Text("Local API didn't start")
+          .font(.callout)
+          .fontWeight(.medium)
+        Text(message)
+          .font(.caption)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      Spacer(minLength: 8)
+      Button(action: onDismiss) {
+        Image(systemName: "xmark")
+          .imageScale(.small)
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel("Dismiss")
+    }
+    .padding(.horizontal, 12)
+    .padding(.vertical, 8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(Color.orange.opacity(0.12))
+    .accessibilityIdentifier("LocalAPIAutoStartError")
   }
 }
 

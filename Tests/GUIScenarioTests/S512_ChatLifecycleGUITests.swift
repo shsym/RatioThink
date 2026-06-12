@@ -186,6 +186,92 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
                   "user-titled empty chat must survive the launch reconcile; app tree: \(relaunched.debugDescription)")
   }
 
+  /// Probe for the prune-vs-scaffold-teardown ordering from ticket #534: an
+  /// empty draft can have the no-model sheet raised (blocked send, no user
+  /// message persisted) when the user leaves it. The selection-change prune
+  /// deletes the outgoing chat while `ChatScaffoldView` teardown/onChange
+  /// closures may still be unwinding; this must not trap, and the empty draft
+  /// must still be pruned. If the macOS sheet consumes the first sidebar
+  /// click, dismiss it and complete the switch so the test does not confuse a
+  /// modal event-routing limitation with a lifecycle crash.
+  @MainActor
+  func test_switching_from_empty_chat_with_noModelPrompt_visible_does_not_crash() async throws {
+    let anchorPrompt = "Anchor chat for no model prune probe"
+    let blockedDraft = "Draft that should remain uncommitted"
+    let home = freshHome("prompt-prune")
+
+    let seeded = makeApp(pieHome: home)
+    seeded.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = "s512-deterministic"
+    seeded.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
+    seeded.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
+    seeded.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "healthy"
+    seeded.launch()
+    XCTAssert(seeded.wait(for: .runningForeground, timeout: 10))
+    seeded.activate()
+
+    openFreshChat(in: seeded)
+    typeComposerText(anchorPrompt, in: seeded)
+    let seedSend = seeded.buttons["composer.send"]
+    XCTAssertTrue(seedSend.waitForExistence(timeout: 5))
+    XCTAssertTrue(seedSend.isEnabled, "composer.send disabled after typing; app tree: \(seeded.debugDescription)")
+    seedSend.click()
+    XCTAssertTrue(sidebarRow(titled: anchorPrompt, in: seeded).waitForExistence(timeout: 10),
+                  "anchor chat was not auto-titled; app tree: \(seeded.debugDescription)")
+    seeded.terminate()
+
+    let app = makeApp(pieHome: home)
+    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
+    app.launchEnvironment["PIE_TEST_ENGINE_START_TO_RUNNING"] = "1"
+    app.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "healthy"
+    app.launch()
+    defer { app.terminate() }
+    XCTAssert(app.wait(for: .runningForeground, timeout: 10))
+    app.activate()
+
+    // A launch-start prompt may appear before selection; dismiss it so this
+    // test controls exactly which empty draft owns the visible prompt.
+    dismissNoModelGateIfPresent(in: app)
+    selectPersistedChat(titled: anchorPrompt, in: app)
+    // The launch-start prompt is evaluated on the scaffold's appear/status
+    // edges; it can land just after selecting the anchor chat. Clear that
+    // launch prompt too so the later visible prompt belongs to the empty
+    // draft created below.
+    dismissNoModelGateIfPresent(in: app)
+    let newChat = app.buttons["chats.newButton"]
+    XCTAssertTrue(newChat.waitForExistence(timeout: 5),
+                  "New Chat button missing before prompt-prune probe; app tree: \(app.debugDescription)")
+    newChat.click()
+    XCTAssertTrue(waitForNewChatRowCount(1, in: app),
+                  "empty draft row missing before blocked send; app tree: \(app.debugDescription)")
+
+    typeComposerText(blockedDraft, in: app)
+    let send = app.buttons["composer.send"]
+    XCTAssertTrue(send.waitForExistence(timeout: 5))
+    XCTAssertTrue(send.isEnabled, "composer.send disabled after typing blocked draft; app tree: \(app.debugDescription)")
+    send.click()
+
+    let gate = noModelPrompt(in: app)
+    XCTAssertTrue(gate.waitForExistence(timeout: 10),
+                  "no-model prompt should be visible for the empty blocked draft; app tree: \(app.debugDescription)")
+
+    sidebarRow(titled: anchorPrompt, in: app).click()
+    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(1))
+    XCTAssertEqual(app.state, .runningForeground,
+                   "switching away while the no-model prompt was visible should not crash; app tree: \(app.debugDescription)")
+
+    if gate.exists {
+      gate.click()
+      sidebarRow(titled: anchorPrompt, in: app).click()
+    }
+
+    XCTAssertTrue(sidebarRow(titled: anchorPrompt, in: app).waitForExistence(timeout: 5),
+                  "anchor chat missing after leaving empty prompted draft; app tree: \(app.debugDescription)")
+    XCTAssertTrue(waitForNewChatRowCount(0, in: app),
+                  "leaving the empty prompted draft must prune it; app tree: \(app.debugDescription)")
+    XCTAssertFalse(app.staticTexts[blockedDraft].exists,
+                   "blocked draft text must not have been committed as a user message")
+  }
+
   /// A chat whose send FAILED is real conversation: the user turn committed,
   /// so the chat is kept across switch-away AND relaunch — and the sidebar
   /// row carries the auto-derived title (the first user message) instead of

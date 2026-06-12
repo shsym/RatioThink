@@ -123,7 +123,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     XCTAssertTrue(send.isEnabled, "composer.send was disabled after typing prompt")
     send.click()
 
-    guard waitForAssistantEchoStaticTexts(visibleAssistantEcho, in: app, timeout: 120) else {
+    guard waitForAssistantEchoInAssistantBubble(visibleAssistantEcho, in: app, timeout: 120) else {
       XCTFail("assistant reply did not stream back under Fast Think; app tree: \(app.debugDescription)")
       return
     }
@@ -164,21 +164,29 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     return false
   }
 
-  /// MarkdownUI exposes the assistant answer as separate/truncated static
-  /// text runs, so — like S258 — the THIRD matching run proves the assistant
-  /// bubble streamed in: two exist without any assistant output (the user's
-  /// prompt bubble and, since #512, the sidebar row auto-titled from that
-  /// same first message). The wrapper's post-run SQLite assertion covers the
-  /// semantic answer.
-  private func waitForAssistantEchoStaticTexts(_ needle: String,
-                                               in app: XCUIApplication,
-                                               timeout: TimeInterval) -> Bool {
+  /// MarkdownUI may fragment a single message into multiple Accessibility
+  /// static-text runs, and the prompt text also appears in the user bubble
+  /// plus the auto-titled sidebar row. Scope the visibility assertion to the
+  /// assistant message container so a fragmented user bubble can never make
+  /// this pass with zero assistant output. The wrapper's post-run SQLite
+  /// assertion covers the semantic answer.
+  private func waitForAssistantEchoInAssistantBubble(_ needle: String,
+                                                    in app: XCUIApplication,
+                                                    timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
                                 needle, needle)
     while Date() < deadline {
-      if app.descendants(matching: .staticText).matching(predicate).count >= 3 {
-        return true
+      let assistantMessages = app.descendants(matching: .any)
+        .matching(identifier: "message.assistant")
+      for index in 0..<assistantMessages.count {
+        if assistantMessages.element(boundBy: index)
+          .descendants(matching: .staticText)
+          .matching(predicate)
+          .firstMatch
+          .exists {
+          return true
+        }
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
     }
