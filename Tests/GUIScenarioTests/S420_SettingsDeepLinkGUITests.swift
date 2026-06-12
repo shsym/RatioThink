@@ -42,14 +42,15 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
   func test_settings_deeplink_opens_settings_window() async throws {
     // The app-under-test should be the staged app next to the UI-test bundle,
     // not "whatever LaunchServices currently maps com.ratiothink.app to".
-    // Keep XCUITest responsible for launch/ownership (bundle-id launch matches
-    // the rest of this suite), then assert the running app is the staged
-    // artifact before delivering the deep link to that exact running bundle.
+    // Launch through the UI-test target's configured AUT so XCUITest owns the
+    // staged bundle from the start, then assert the running app is that staged
+    // artifact before delivering the deep link to the exact running bundle.
     let stagedAppURL = try XCTUnwrap(
       Self.locateSiblingApp(named: "Rational.app", from: type(of: self)),
       "Rational.app not found next to test bundle — verify RatioThinkGUITests depends on target RatioThink"
     )
-    let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
+    try terminateRunningRationalApps()
+    let app = XCUIApplication()
     app.launchArguments.append(contentsOf: Self.restorationOffArgs)
     configureCompletedFirstLaunch(app)
     app.launch()
@@ -78,11 +79,14 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
     // NSApp.activate() for user-initiated helper/menu-bar deep links.
     backgroundRationalBeforeDeepLink(app)
 
-    // Deliver the deep link exactly as the menu-bar Helper does: to the
-    // running app-under-test's own bundle, so LaunchServices can't route it to
-    // some other registered Rational.app.
+    // Deliver the deep link to the running app-under-test's own bundle, so
+    // LaunchServices can't route it to some other registered Rational.app.
+    // For this handler-focused assertion path, do NOT ask LaunchServices to
+    // activate the app: foregrounding must come from SettingsURLHandler's
+    // NSApp.activate(), otherwise the final foreground check is a false
+    // positive that passes without app-side activation.
     let cfg = NSWorkspace.OpenConfiguration()
-    cfg.activates = true
+    cfg.activates = false
     let delivered = expectation(description: "deep link delivered")
     NSWorkspace.shared.open([Self.settingsDeepLink], withApplicationAt: appURL, configuration: cfg) { _, error in
       XCTAssertNil(error, "NSWorkspace failed to deliver the deep link: \(String(describing: error))")
@@ -136,6 +140,59 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
       "Rational must be backgrounded before deep-link delivery",
       file: file,
       line: line)
+  }
+
+  /// XCUITest's configured app launch is path-backed by the UI-test target, but
+  /// a still-running same-bundle-id Rational from another DerivedData can be
+  /// attached/activated before Xcode gets to spawn the staged AUT. Remove that
+  /// running-process collision first; the subsequent `XCUIApplication()`
+  /// launch remains XCUITest-owned and the staged-path guard below fails closed
+  /// if Xcode/LaunchServices still picks the wrong artifact.
+  private func terminateRunningRationalApps() throws {
+    let apps = NSWorkspace.shared.runningApplications
+      .filter { $0.bundleIdentifier == "com.ratiothink.app" }
+    guard !apps.isEmpty else { return }
+
+    for app in apps {
+      app.terminate()
+    }
+
+    if waitUntilNoRationalAppsAreRunning(timeout: 2) { return }
+
+    for app in NSWorkspace.shared.runningApplications
+      .filter({ $0.bundleIdentifier == "com.ratiothink.app" }) {
+      app.forceTerminate()
+    }
+
+    if waitUntilNoRationalAppsAreRunning(timeout: 3) { return }
+
+    let paths = NSWorkspace.shared.runningApplications
+      .filter { $0.bundleIdentifier == "com.ratiothink.app" }
+      .compactMap { $0.bundleURL?.path }
+      .joined(separator: ", ")
+    throw S420LaunchError.timedOutTerminatingPreExistingApps(paths)
+  }
+
+  private func waitUntilNoRationalAppsAreRunning(timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+      let stillRunning = NSWorkspace.shared.runningApplications
+        .contains { $0.bundleIdentifier == "com.ratiothink.app" }
+      if !stillRunning { return true }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+    } while Date() < deadline
+    return false
+  }
+
+  private enum S420LaunchError: Error, CustomStringConvertible {
+    case timedOutTerminatingPreExistingApps(String)
+
+    var description: String {
+      switch self {
+      case let .timedOutTerminatingPreExistingApps(paths):
+        return "Timed out terminating pre-existing Rational.app instances before S420 launch: \(paths)"
+      }
+    }
   }
 
   /// The bundle URL of the running app under test. The deep link is delivered
