@@ -383,9 +383,7 @@ public final class ChatSendController: ObservableObject {
               // total failure never persists as a blank SUCCESSFUL turn.
               tree.fail(Self.totNoAnswerMessage)
               assistant.tot = try? encoder.encode(tree)
-              if assistant.content.isEmpty {
-                assistant.content = "⚠️ \(Self.totNoAnswerMessage)"
-              }
+              assistant.content = "⚠️ \(Self.totNoAnswerMessage)"
               Diag.app.event("chat.fail.tot", [("reason", "no_answer")])
             } else if finalAnswer == nil {
               // Review v4 F1 (client defensive): selectedNodeID is an
@@ -446,9 +444,7 @@ public final class ChatSendController: ObservableObject {
           if !reachedTerminal {
             tree.fail(Self.totIncompleteMessage)
             assistant.tot = try? encoder.encode(tree)
-            if assistant.content.isEmpty {
-              assistant.content = "⚠️ \(Self.totIncompleteMessage)"
-            }
+            assistant.content = "⚠️ \(Self.totIncompleteMessage)"
             Diag.app.event("chat.fail.tot", [
               ("reason", "no_terminal"),
               ("elapsed", String(format: "%.1f", Date().timeIntervalSince(totStart))),
@@ -466,9 +462,7 @@ public final class ChatSendController: ObservableObject {
         let problem = EngineProblem(requestError: error, requestedModelID: options.modelID)
         tree.fail(problem.technicalDetail ?? problem.message)
         assistant.tot = try? encoder.encode(tree)
-        if assistant.content.isEmpty {
-          assistant.content = "⚠️ \(problem.message)"
-        }
+        assistant.content = "⚠️ \(problem.message)"
         if let detail = problem.technicalDetail {
           Log.engine.error("ChatSendController: ToT send failed: \(detail, privacy: .public)")
         }

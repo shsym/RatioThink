@@ -251,6 +251,47 @@ final class ToTChatSendTests: XCTestCase {
     }
   }
 
+  func test_terminal_error_after_final_delta_overrides_partial_answer() async throws {
+    // Review v5 F1: final_delta is optimistic synthesis text, not an
+    // authoritative answer. A later terminal error must override it in both
+    // the assistant row and the persisted tree snapshot.
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ToTFrameEngine(frames: [
+      #"{"event":"tree_start","id":"tot-1","model":"qwen","breadth":1,"depth":2,"beam_width":1}"#,
+      #"{"event":"node_complete","node":{"id":"tot-n1","parent_id":"root","depth":1,"branch_index":0,"content":"intermediate path step","score":8,"status":"ok"}}"#,
+      #"{"event":"level_pruned","level":1,"kept":["tot-n1"]}"#,
+      #"{"event":"final_delta","text":"partial"}"#,
+      #"{"event":"error","code":"final_answer_unavailable","message":"tree-of-thought search selected an inspection node but produced no final answer"}"#,
+    ])
+    let controller = ChatSendController()
+    controller.sendTreeOfThought(
+      chat: chat,
+      context: context,
+      engine: engine,
+      config: ToTProfileConfig(breadth: 1, depth: 2, beamWidth: 1),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "qwen")
+    )
+    try await waitUntil("tot final-delta then error stream finishes") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(chat.messages.first { $0.role == "assistant" })
+    XCTAssertTrue(assistant.content.hasPrefix("⚠️"),
+                  "terminal error must override optimistic final_delta content: \(assistant.content.debugDescription)")
+    XCTAssertFalse(assistant.content.contains("partial"),
+                   "partial final_delta must not remain visible as the assistant answer")
+    let tree = try JSONDecoder().decode(ToTTree.self, from: try XCTUnwrap(assistant.tot))
+    guard case .failed = tree.status else {
+      return XCTFail("expected .failed, got \(tree.status)")
+    }
+    XCTAssertNil(tree.finalAnswer, "failed tree must not persist partial synthesis as authoritative finalAnswer")
+  }
+
   func test_no_ok_leaf_treeComplete_marks_assistant_failed_not_blank_success() async throws {
     // F1 (client defensive): an all-error search that terminates with
     // tree_complete{nil,nil} (no ok leaf — a total failure) must mark the
