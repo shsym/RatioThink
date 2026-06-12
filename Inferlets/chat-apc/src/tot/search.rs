@@ -227,6 +227,7 @@ fn merge_no_think_retry(first: Demux, retry: Demux) -> Demux {
         reasoning,
         answer: retry.answer,
         kind: retry.kind,
+        incomplete_reason: retry.incomplete_reason,
         generated_tokens,
     }
 }
@@ -252,6 +253,7 @@ fn retry_fork_failed(first: Demux, err: String) -> Demux {
         reasoning: first.reasoning,
         answer: String::new(),
         kind: DemuxKind::Aborted(format!("no-think retry fork failed: {err}")),
+        incomplete_reason: None,
         generated_tokens: first.generated_tokens,
     }
 }
@@ -345,10 +347,25 @@ enum DemuxKind {
     Answered,
     /// Reasoning ran but no usable answer followed — truncated mid-thought
     /// (the reasoning budget elapsed before `</think>`) or an empty/closed
-    /// think block with nothing after it (#434).
+    /// think block with nothing after it (#434). The exact root cause is
+    /// preserved on [`Demux::incomplete_reason`].
     Incomplete,
     /// The generator or a decoder failed mid-generation.
     Aborted(String),
+}
+
+/// Why a generation has no visible answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DemuxIncompleteReason {
+    /// The model was still inside hidden reasoning when the reasoning budget
+    /// elapsed. Hidden text from this state is truncated chain-of-thought and
+    /// must never be promoted to a user-visible synthesized answer.
+    ReasoningBudgetExhausted,
+    /// The model completed cleanly, but no visible answer span followed. Some
+    /// small `/no_think` models route a concise answer-like completion through
+    /// the hidden channel in this state; only this clean variant is eligible
+    /// for the narrow synthesis salvage path.
+    NoVisibleAnswer,
 }
 
 /// One generation, demuxed into its reasoning trace and its answer.
@@ -356,6 +373,7 @@ struct Demux {
     reasoning: String,
     answer: String,
     kind: DemuxKind,
+    incomplete_reason: Option<DemuxIncompleteReason>,
     /// All model-generated decode tokens consumed by this generation,
     /// including reasoning delimiters/hidden thinking and visible answer
     /// tokens. Prompt/input tokens are never counted here (#542).
@@ -408,6 +426,7 @@ async fn generate_demuxed(
     let mut reasoning_tokens = 0usize;
     let mut answer_tokens = 0usize;
     let mut generated_tokens = 0usize;
+    let mut incomplete_reason = None;
 
     let kind = loop {
         let step = match generator.next() {
@@ -481,6 +500,7 @@ async fn generate_demuxed(
         } else {
             reasoning_tokens += out.tokens.len();
             if reasoning_tokens >= reasoning_budget && !reasoning_done {
+                incomplete_reason = Some(DemuxIncompleteReason::ReasoningBudgetExhausted);
                 break DemuxKind::Incomplete;
             }
         }
@@ -489,13 +509,17 @@ async fn generate_demuxed(
     // A clean stop (chat Done / max-tokens) that produced no answer text is
     // still Incomplete: an empty or closed-but-unanswered think block (#434).
     let kind = match kind {
-        DemuxKind::Answered if answer.trim().is_empty() => DemuxKind::Incomplete,
+        DemuxKind::Answered if answer.trim().is_empty() => {
+            incomplete_reason = Some(DemuxIncompleteReason::NoVisibleAnswer);
+            DemuxKind::Incomplete
+        }
         other => other,
     };
     Demux {
         reasoning,
         answer,
         kind,
+        incomplete_reason,
         generated_tokens,
     }
 }
@@ -1316,8 +1340,11 @@ async fn score_node(ctx: &Context, model: &Model, is_final_level: bool) -> Score
 /// generation grounded in the best leaf, streaming its answer as `final_delta`
 /// when an emitter is present. It uses the request's reasoning budget instead
 /// of a tiny fixed budget because small thinking models may still open a short
-/// private thought span before the no-think cue takes effect. Returns the
-/// synthesized answer plus generated-token count, or
+/// private thought span before the no-think cue takes effect. Hidden-channel
+/// salvage is only permitted when demux proves the model completed cleanly
+/// with no visible answer span; budget-exhausted hidden text remains
+/// `not_answered`, so truncated chain-of-thought cannot become a synthesized
+/// final answer. Returns the synthesized answer plus generated-token count, or
 /// `Err(reason, generated_tokens)` on any failure / empty result — the reason
 /// (`not_answered` / `empty` / `aborted: …`) is surfaced by the caller as a
 /// host diagnostic before it falls back to the raw best-leaf content, so a
@@ -1354,16 +1381,27 @@ async fn synthesize(
         DeltaSink::Final,
     )
     .await;
+    resolve_synthesis_demux(demux)
+}
+
+fn resolve_synthesis_demux(demux: Demux) -> Result<(String, usize), (String, usize)> {
     let generated_tokens = demux.generated_tokens;
     match demux.kind {
         DemuxKind::Answered if !demux.answer.trim().is_empty() => {
             Ok((demux.answer, generated_tokens))
         }
         DemuxKind::Answered => Err(("empty".to_string(), generated_tokens)),
-        DemuxKind::Incomplete => match salvage_no_think_answer(&demux.reasoning) {
-            Some(answer) => Ok((answer, generated_tokens)),
-            None => Err(("not_answered".to_string(), generated_tokens)),
-        },
+        DemuxKind::Incomplete => {
+            if matches!(
+                demux.incomplete_reason,
+                Some(DemuxIncompleteReason::NoVisibleAnswer)
+            ) {
+                if let Some(answer) = salvage_no_think_answer(&demux.reasoning) {
+                    return Ok((answer, generated_tokens));
+                }
+            }
+            Err(("not_answered".to_string(), generated_tokens))
+        }
         DemuxKind::Aborted(e) => Err((format!("aborted: {e}"), generated_tokens)),
     }
 }
@@ -1459,6 +1497,31 @@ mod tests {
         );
         assert!(salvage_no_think_answer("Use the material above to answer the user.").is_none());
         assert!(salvage_no_think_answer("This follows the previous answer.").is_none());
+    }
+
+    #[test]
+    fn synthesis_hidden_answer_salvage_rejects_reasoning_budget_exhaustion() {
+        let result = resolve_synthesis_demux(demux_incomplete_with_tokens(
+            "Maya's final total is $18.",
+            DemuxIncompleteReason::ReasoningBudgetExhausted,
+            7,
+        ));
+
+        assert_eq!(result, Err(("not_answered".to_string(), 7)));
+    }
+
+    #[test]
+    fn synthesis_hidden_answer_salvage_allows_clean_no_visible_answer_completion() {
+        let result = resolve_synthesis_demux(demux_incomplete_with_tokens(
+            "Jane Austen wrote *Pride and Prejudice*.",
+            DemuxIncompleteReason::NoVisibleAnswer,
+            5,
+        ));
+
+        assert_eq!(
+            result,
+            Ok(("Jane Austen wrote *Pride and Prejudice*.".to_string(), 5))
+        );
     }
 
     #[test]
@@ -1681,6 +1744,21 @@ mod tests {
             reasoning: reasoning.to_string(),
             answer: answer.to_string(),
             kind,
+            incomplete_reason: None,
+            generated_tokens,
+        }
+    }
+
+    fn demux_incomplete_with_tokens(
+        reasoning: &str,
+        reason: DemuxIncompleteReason,
+        generated_tokens: usize,
+    ) -> Demux {
+        Demux {
+            reasoning: reasoning.to_string(),
+            answer: String::new(),
+            kind: DemuxKind::Incomplete,
+            incomplete_reason: Some(reason),
             generated_tokens,
         }
     }
