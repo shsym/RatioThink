@@ -57,7 +57,7 @@ that wrapper, not bare `xcodebuild`.
 
 | Suite | Area | Proves | Boundary / real model? | Run via |
 |---|---|---|---|---|
-| `S5_AppWindowShellGUITests` | settings/shell | 3-column shell vocabulary (Chats + API Endpoints nav, #422), ⌘, → Settings (4 tabs, no API tab) | mock | `test-gui-shell` |
+| `S5_AppWindowShellGUITests` | settings/shell | simplified Chat/API shell vocabulary (Chats + API Endpoints nav, chat search, #422), ⌘, → Settings (4 tabs, no API tab) | mock | `test-gui-shell` |
 | `S7_FirstLaunchWizardGUITests` | first-launch | wizard flow (register / approval-blocked) | mock (faked login-item) | `test-gui-first-launch` |
 | `S7_FirstLaunchWizardPackagedArtifactGUITests` | package/install | Release `.app` first-launch persists across relaunch; launched-artifact path | packaged-signed-app | `test-gui-first-launch-package` |
 | `S4_HelperMenuBarGUITests` | helper/engine | menu-bar shell; fresh seed enables Resume; oversized-model rejected; Resume boots pie → Pause | app+real-engine (GGUF fixture) | `test-gui-helper` |

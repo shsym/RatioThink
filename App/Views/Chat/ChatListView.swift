@@ -1,16 +1,16 @@
 import SwiftUI
 import SwiftData
 
-/// Col 2 chat list — backed by SwiftData. Pinned chats sort to the
-/// top, then most-recently-updated. "New Chat" inserts a fresh row
-/// and selects it; per-row delete cascades to its messages via
-/// `Chat.messages`' `.cascade` rule.
+/// Searchable chat list embedded under the left Chat navigation entry. Backed
+/// by SwiftData: pinned chats sort to the top, then most-recently-updated.
+/// "New Chat" inserts a fresh row and selects it; per-row delete cascades to
+/// its messages via `Chat.messages`' `.cascade` rule.
 struct ChatListView: View {
   @Environment(\.modelContext) private var modelContext
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
-  /// Sort by `updatedAt` desc at the query layer; pinned-first
-  /// ordering happens client-side in `sortedChats` because `Bool`
-  /// doesn't conform to `Comparable` and SwiftData rejects
+  /// Sort by `updatedAt` desc at the query layer; pinned-first ordering and
+  /// title filtering happen client-side in `ChatListPresentation` because
+  /// `Bool` doesn't conform to `Comparable` and SwiftData rejects
   /// `SortDescriptor(\.pinned)` at compile time.
   @Query(sort: \Chat.updatedAt, order: .reverse) private var chats: [Chat]
   @Binding var selectedItemID: UUID?
