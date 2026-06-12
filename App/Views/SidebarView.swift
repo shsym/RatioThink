@@ -11,8 +11,8 @@ struct SidebarView: View {
     VStack(alignment: .leading, spacing: 6) {
       sidebarRow(.chats)
       // #422: the API Endpoints section now mirrors the live engine HTTP
-      // endpoint (LocalAPIView). Selecting it collapses the item-list column
-      // and shows the single status view in the detail column.
+      // endpoint (LocalAPIView). Selecting it shows the single status view in
+      // the detail column.
       sidebarRow(.apiEndpoints)
       if selection == .chats && !isItemListHidden {
         ChatListView(selectedItemID: $selectedItemID)

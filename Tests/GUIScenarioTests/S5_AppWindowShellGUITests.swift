@@ -1,6 +1,6 @@
 import XCTest
 
-/// S5 — RatioThink.app window shell matches Notes-style 3-column design (§5).
+/// S5 — RatioThink.app window shell matches the simplified Chat/API shell.
 ///
 /// GUI-only. Asserts against FINAL design strings — sidebar shows the nav
 /// labels `Chats` and `API Endpoints` (the latter now mirrors the live engine

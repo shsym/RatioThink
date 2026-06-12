@@ -20,8 +20,7 @@ struct DetailView: View {
         .id(id)
     case (.apiEndpoints, _):
       // One engine, one endpoint: the section maps to a single live view
-      // regardless of item selection (the item-list column is collapsed
-      // for this section in `RootView`).
+      // regardless of chat selection.
       LocalAPIView()
     case (_, nil):
       EmptyStateView()
