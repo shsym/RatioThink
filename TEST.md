@@ -206,6 +206,15 @@ signing secrets, notarization service call, GUI session, engine, or network.
 Coverage kept out of `make ci-pr` is mandatory locally through the exact targets
 below.
 
+**Unit-test timing rule:** unit tests must not rely on real wall-clock budgets
+(`Task.sleep`, `asyncAfter`, timer deadlines, short timeout slack) to make a
+state-machine assertion true. Components that own timers must expose an
+injectable clock/sleep seam, and unit tests must advance that seam explicitly;
+timeout-fired, process-died, handshake-done, and cleanup-finished should be
+modeled as data/events with generation or lease tokens making stale events
+no-ops. Keep real-clock coverage in an integration/local tier with generous
+budgets when it is specifically valuable.
+
 ### Manual GitHub verification workflow
 
 `.github/workflows/lint.yml` is intentionally `workflow_dispatch`-only. It does

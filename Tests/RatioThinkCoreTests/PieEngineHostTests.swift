@@ -102,20 +102,26 @@ final class PieEngineHostTests: XCTestCase {
     private let lock = NSLock()
     private var continuations: [CheckedContinuation<Void, Never>] = []
     let armed: [XCTestExpectation]
+    let returned: [XCTestExpectation]
 
-    init(armed: [XCTestExpectation]) {
+    init(armed: [XCTestExpectation], returned: [XCTestExpectation] = []) {
       self.armed = armed
+      self.returned = returned
     }
 
     func sleep(_ seconds: TimeInterval) async {
+      var index = 0
       await withCheckedContinuation { continuation in
-        let index = lock.withLock { () -> Int in
+        index = lock.withLock { () -> Int in
           continuations.append(continuation)
           return continuations.count - 1
         }
         if index < armed.count {
           armed[index].fulfill()
         }
+      }
+      if index < returned.count {
+        returned[index].fulfill()
       }
     }
 
@@ -321,31 +327,34 @@ final class PieEngineHostTests: XCTestCase {
   // MARK: - repeated start semantics
 
   func test_double_start_different_profile_returns_alreadyRunning() {
-    let host = PieEngineHost(launcher: { _ in
-      // Hold past the second start so the host stays in .starting.
-      try await Task.sleep(nanoseconds: 200_000_000)
-      return (port: EnginePort(1234), session: FakeSession())
-    })
+    let firstStarted = expectation(description: "first launch started")
+    let launches = LaunchGate(started: [firstStarted])
+    let host = PieEngineHost(launcher: { spec in try await launches.launch(spec) })
     let firstSpec = makeSpec(profileID: "chat-1")
     let secondSpec = makeSpec(profileID: "chat-2")
     _ = host.start(firstSpec)
+    wait(for: [firstStarted], timeout: 2)
+
     let second = host.start(secondSpec)
     guard case .failure(let err) = second else {
       return XCTFail("second start must be rejected while first is .starting")
     }
     XCTAssertEqual(err.code, .alreadyRunning)
     host.stop()
+    launches.fail(0, CancellationError())
   }
 
   func test_startOrAttach_same_profile_while_starting_is_idempotent_and_does_not_launch_again() {
+    let firstStarted = expectation(description: "first launch started")
+    let launches = LaunchGate(started: [firstStarted])
     let launchCount = OSAllocatedUnfairLock<Int>(initialState: 0)
-    let host = PieEngineHost(launcher: { _ in
+    let host = PieEngineHost(launcher: { spec in
       launchCount.withLock { $0 += 1 }
-      try await Task.sleep(nanoseconds: 200_000_000)
-      return (port: EnginePort(1234), session: FakeSession())
+      return try await launches.launch(spec)
     })
     let spec = makeSpec(profileID: "chat")
     XCTAssertNoThrow(try host.start(spec).get())
+    wait(for: [firstStarted], timeout: 2)
     XCTAssertNoThrow(try host.startOrAttach(spec).get())
 
     let exp = expectation(description: "host reaches running from the single launch")
@@ -356,6 +365,7 @@ final class PieEngineHostTests: XCTestCase {
         exp.fulfill()
       }
     }
+    launches.succeed(0, port: EnginePort(1234), session: FakeSession())
     wait(for: [exp], timeout: 2)
     token.cancel()
     XCTAssertEqual(launchCount.withLock { $0 }, 1,
@@ -388,14 +398,14 @@ final class PieEngineHostTests: XCTestCase {
   }
 
   func test_launch_timeout_is_owned_by_host_and_cancels_only_still_starting_attempt() {
+    let firstStarted = expectation(description: "launch started")
+    let timeoutArmed = expectation(description: "launch timeout armed")
+    let launches = LaunchGate(started: [firstStarted])
+    let sleeps = SleepGate(armed: [timeoutArmed])
     let host = PieEngineHost(
-      launcher: { _ in
-        while !Task.isCancelled {
-          try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-        throw CancellationError()
-      },
-      launchTimeoutSlack: 0
+      launcher: { spec in try await launches.launch(spec) },
+      launchTimeoutSlack: 0,
+      sleepFor: { seconds in await sleeps.sleep(seconds) }
     )
     let exp = expectation(description: "host launch timeout fails with handshakeTimeout")
     let token = host.observe { status, _ in
@@ -405,6 +415,18 @@ final class PieEngineHostTests: XCTestCase {
       }
     }
     XCTAssertNoThrow(try host.start(makeSpec(handshakeTimeout: 0.2)).get())
+    wait(for: [firstStarted, timeoutArmed], timeout: 2)
+    let stoppingObserved = expectation(description: "timed out launch moves to stopping")
+    let stoppingToken = host.observe { status, token in
+      if case .stopping = status {
+        stoppingObserved.fulfill()
+        token.cancel()
+      }
+    }
+    sleeps.wake(0)
+    wait(for: [stoppingObserved], timeout: 2)
+    stoppingToken.cancel()
+    launches.fail(0, CancellationError())
     wait(for: [exp], timeout: 2)
     token.cancel()
     guard case .failed(.handshakeTimeout, _) = host.status else {
@@ -630,22 +652,27 @@ final class PieEngineHostTests: XCTestCase {
 
   func test_stale_launch_timeout_after_running_is_inert() {
     let session = FakeSession()
+    let timeoutArmed = expectation(description: "launch timeout armed")
+    let timeoutReturned = expectation(description: "launch timeout sleep returned")
+    let sleeps = SleepGate(armed: [timeoutArmed], returned: [timeoutReturned])
     let host = PieEngineHost(
       launcher: { _ in (port: EnginePort(9012), session: session) },
-      launchTimeoutSlack: 0
+      launchTimeoutSlack: 0,
+      sleepFor: { seconds in await sleeps.sleep(seconds) }
     )
     XCTAssertNoThrow(try host.start(makeSpec(profileID: "tree-of-thought", handshakeTimeout: 0.2)).get())
     let running = expectation(description: "host reaches running")
+    var hitRunning = false
     let token = host.observe { status, _ in
-      if case .running = status { running.fulfill() }
+      if case .running = status, !hitRunning {
+        hitRunning = true
+        running.fulfill()
+      }
     }
-    wait(for: [running], timeout: 2)
+    wait(for: [running, timeoutArmed], timeout: 2)
 
-    let timeoutWouldHaveExpired = expectation(description: "launch timeout deadline passed")
-    DispatchQueue.global().asyncAfter(deadline: .now() + 0.35) {
-      timeoutWouldHaveExpired.fulfill()
-    }
-    wait(for: [timeoutWouldHaveExpired], timeout: 2)
+    sleeps.wake(0)
+    wait(for: [timeoutReturned], timeout: 2)
     token.cancel()
 
     guard case .running(let snap) = host.status else {
