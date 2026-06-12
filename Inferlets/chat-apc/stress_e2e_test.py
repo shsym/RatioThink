@@ -18,9 +18,8 @@ Extends the baseline `e2e_test.py` engine-side coverage with:
           ->  client runs a fake tool  ->  submits the result turn
           ->  receives a final assistant answer.
      Non-streaming + streaming wire shapes are both asserted. The
-     `role:"tool"` follow-up shape is a documented gap (chat-apc returns
-     400 `tool_role_unsupported`); the contract uses the server's
-     documented user-turn path and pins the 400 as a known limitation.
+     continuation uses the OpenAI-native history shape: assistant
+     `tool_calls`, then `role:"tool"` with the matching `tool_call_id`.
 
 Determinism (no large model required): everything runs against pie's
 **dummy driver**. `tool_choice: "required" | {function}` constrains
@@ -304,12 +303,18 @@ async def section_protocol_stress(base: str, http: httpx.AsyncClient, rep: Repor
                         json={"model": "nope", "messages": [{"role": "user", "content": "hi"}]})
     rep.ok(r.status_code == 404, f"{P}: unknown model -> {r.status_code} (want 404)")
 
-    # invalid role "tool" -> 400 tool_role_unsupported.
+    # Orphan role "tool" -> 400 with a precise tool_call_id param.
     r = await http.post(f"{base}/v1/chat/completions", json={
         "model": MODEL, "messages": [{"role": "tool", "content": "x"}], "stream": False,
     })
-    ok = r.status_code == 400 and r.json().get("error", {}).get("code") == "tool_role_unsupported"
-    rep.ok(ok, f"{P}: role=tool -> {r.status_code} {r.text[:120]!r} (want 400 tool_role_unsupported)")
+    err = r.json().get("error", {}) if r.status_code == 400 else {}
+    ok = (
+        r.status_code == 400
+        and err.get("code") == "missing_tool_call_id"
+        and err.get("param") == "messages[0].tool_call_id"
+    )
+    rep.ok(ok, f"{P}: orphan role=tool -> {r.status_code} {r.text[:120]!r} "
+               "(want 400 missing_tool_call_id param=messages[0].tool_call_id)")
 
     # whitespace-only content -> 400 param messages[i].content.
     r = await http.post(f"{base}/v1/chat/completions", json={
@@ -580,18 +585,21 @@ async def section_toolcall_parse(base: str, http: httpx.AsyncClient, rep: Report
     rep.ok(r.status_code in (200, 404),
            f"{P}: tools[]+auto -> {r.status_code} (want 200/404; tools[] must deserialize, no 5xx)")
 
-    # role:"tool" follow-up shape is unsupported -> documented 400. Pin it so
-    # the gap can't silently change shape.
+    # role:"tool" without preceding assistant tool_calls is still malformed;
+    # the OpenAI-compatible path requires preserving the assistant call ID.
     r = await http.post(f"{base}/v1/chat/completions", json={
         "model": MODEL,
         "messages": [{"role": "tool", "tool_call_id": "call_x", "content": "4"}],
         "stream": False,
     })
-    ok = r.status_code == 400 and r.json().get("error", {}).get("code") == "tool_role_unsupported"
-    rep.ok(ok, f"{P}: role=tool gap -> {r.status_code} {r.text[:120]!r} (want 400 tool_role_unsupported)")
-    rep.skip("scope4: OpenAI-native role=\"tool\"+tool_call_id follow-up is a documented gap "
-             "(chat-apc returns 400 tool_role_unsupported); contract uses the server's user-turn "
-             "path. Native tool-result turn tracked as a follow-up (SDK answer_prefix unwired).")
+    err = r.json().get("error", {}) if r.status_code == 400 else {}
+    ok = (
+        r.status_code == 400
+        and err.get("code") == "unknown_tool_call_id"
+        and err.get("param") == "messages[0].tool_call_id"
+    )
+    rep.ok(ok, f"{P}: orphan role=tool -> {r.status_code} {r.text[:120]!r} "
+               "(want 400 unknown_tool_call_id param=messages[0].tool_call_id)")
 
     # tool_choice forcing a call but the named function is absent -> 400.
     r = await http.post(f"{base}/v1/chat/completions", json={
@@ -693,14 +701,23 @@ async def section_toolcall_nonstream_roundtrip(rep: Report) -> None:
                 except (json.JSONDecodeError, TypeError):
                     rep.fail(f"{P}: arguments not parseable JSON: {fn.get('arguments')!r}")
 
-            # TURN 2: client ran the tool; submit the result as a user turn
-            # (server's documented path) and expect a final assistant answer.
+            if not (tcs and len(tcs) == 1):
+                return
+            tc = tcs[0]
+
+            # TURN 2: client ran the tool; submit OpenAI-native history with
+            # the assistant tool_calls message plus a role=tool result carrying
+            # the matching tool_call_id. Expect a normal assistant answer.
             r = await http.post(f"{base}/v1/chat/completions", json={
                 "model": MODEL,
                 "messages": [
                     {"role": "user", "content": "What is 2+2?"},
-                    {"role": "assistant", "content": "Let me use the calculator."},
-                    {"role": "user", "content": "Tool calculator returned: 4. Now answer."},
+                    {
+                        "role": "assistant",
+                        "content": msg.get("content"),
+                        "tool_calls": tcs,
+                    },
+                    {"role": "tool", "tool_call_id": tc["id"], "content": "4"},
                 ],
                 "stream": False, "max_tokens": 32,
             })

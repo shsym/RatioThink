@@ -158,11 +158,10 @@ pub async fn dispatch(
             ))
             .await;
     }
-    if let Some((i, _)) = messages
-        .iter()
-        .enumerate()
-        .find(|(_, m)| m.content.trim().is_empty())
-    {
+    if let Some((i, _)) = messages.iter().enumerate().find(|(_, m)| {
+        m.content_str()
+            .is_none_or(|content| content.trim().is_empty())
+    }) {
         return res
             .respond(sse::json_error(
                 400,
@@ -176,7 +175,12 @@ pub async fn dispatch(
         Ok(p) => p,
         Err((field, msg)) => {
             return res
-                .respond(completions::json_error_param(400, "invalid_request", &msg, field))
+                .respond(completions::json_error_param(
+                    400,
+                    "invalid_request",
+                    &msg,
+                    field,
+                ))
                 .await;
         }
     };
@@ -237,7 +241,8 @@ pub async fn dispatch(
     // cue:false — the assistant turn is opened per branch in `search`
     // (each fork re-cues), so the shared prefix stays cue-free and KV
     // pages are shared across branches.
-    if let Err((code, msg)) = completions::fill_context(&mut root_ctx, &model, &messages, None, false)
+    if let Err((code, msg)) =
+        completions::fill_context(&mut root_ctx, &model, &messages, None, false)
     {
         return res.respond(sse::json_error(500, code, &msg)).await;
     }
