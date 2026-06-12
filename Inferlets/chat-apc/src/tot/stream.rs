@@ -27,6 +27,7 @@
 //! node_delta     {event,id,kind:"reasoning"|"answer",text}   // streamed token chunks for that node
 //! node_complete  {event,node:{…}}                            // per-node terminal: full node + score + status
 //! level_pruned   {event,level,kept:[id,…]}                   // per level, the beam
+//! generation_metrics {event,output_tokens,elapsed_s,tokens_per_sec} // once, before success terminal (#542)
 //! tree_complete  {event,selected_node_id,final_answer}       // once, terminal success
 //! error          {event:"error",code,message}                // terminal failure (crate::sse::SseError)
 //! [DONE]                                                     // sentinel
@@ -358,6 +359,9 @@ pub fn is_total_failure(selected_node_id: &Option<String>) -> bool {
 pub const NO_ANSWER_CODE: &str = "no_answer";
 pub const NO_ANSWER_MESSAGE: &str =
     "tree-of-thought search produced no answer: every branch failed to generate";
+pub const METRICS_UNAVAILABLE_CODE: &str = "generation_metrics_unavailable";
+pub const METRICS_UNAVAILABLE_MESSAGE: &str =
+    "tree-of-thought search finished without generation metrics";
 
 #[cfg(test)]
 mod tests {

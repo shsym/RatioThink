@@ -24,6 +24,7 @@ final class ToTChatSendTests: XCTestCase {
       #"{"event":"node_complete","node":{"id":"tot-n1","parent_id":"root","depth":1,"branch_index":0,"content":"4","score":9,"status":"ok"}}"#,
       #"{"event":"node_complete","node":{"id":"tot-n2","parent_id":"root","depth":1,"branch_index":1,"content":"5","score":3,"status":"ok"}}"#,
       #"{"event":"level_pruned","level":1,"kept":["tot-n1"]}"#,
+      #"{"event":"generation_metrics","output_tokens":84,"elapsed_s":2.0,"tokens_per_sec":42.0}"#,
       #"{"event":"tree_complete","selected_node_id":"tot-n1","final_answer":"4"}"#,
     ])
     let controller = ChatSendController()
@@ -78,8 +79,8 @@ final class ToTChatSendTests: XCTestCase {
       #"{"event":"tree_start","id":"tot-1","model":"qwen","breadth":1,"depth":1,"beam_width":1}"#,
       #"{"event":"node_complete","node":{"id":"tot-n1","parent_id":"root","depth":1,"branch_index":0,"content":"4","reasoning":"counting on fingers","score":9,"status":"ok"}}"#,
       #"{"event":"level_pruned","level":1,"kept":["tot-n1"]}"#,
-      #"{"event":"tree_complete","selected_node_id":"tot-n1","final_answer":"4"}"#,
       #"{"event":"generation_metrics","output_tokens":84,"elapsed_s":2.0,"tokens_per_sec":42.0}"#,
+      #"{"event":"tree_complete","selected_node_id":"tot-n1","final_answer":"4"}"#,
     ])
     let controller = ChatSendController()
     controller.sendTreeOfThought(
@@ -99,6 +100,42 @@ final class ToTChatSendTests: XCTestCase {
     XCTAssertEqual(metrics.elapsedSeconds, 2.0)
     XCTAssertEqual(metrics.tokensPerSecond, 42.0)
     XCTAssertEqual(assistant.tokens, 84)
+  }
+
+  func test_tree_complete_without_generation_metrics_marks_assistant_failed() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "What is 2+2?",
+                                 ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ToTFrameEngine(frames: [
+      #"{"event":"tree_start","id":"tot-1","model":"qwen","breadth":1,"depth":1,"beam_width":1}"#,
+      #"{"event":"node_complete","node":{"id":"tot-n1","parent_id":"root","depth":1,"branch_index":0,"content":"4","score":9,"status":"ok"}}"#,
+      #"{"event":"level_pruned","level":1,"kept":["tot-n1"]}"#,
+      #"{"event":"tree_complete","selected_node_id":"tot-n1","final_answer":"4"}"#,
+    ])
+    let controller = ChatSendController()
+    controller.sendTreeOfThought(
+      chat: chat,
+      context: context,
+      engine: engine,
+      config: ToTProfileConfig(breadth: 1, depth: 1, beamWidth: 1),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "qwen")
+    )
+    try await waitUntil("tot tree_complete without metrics finishes") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(chat.messages.first { $0.role == "assistant" })
+    XCTAssertTrue(assistant.content.hasPrefix("⚠️"),
+                  "selected tree_complete without generation_metrics must not persist a clean success")
+    XCTAssertNil(assistant.generationPerformance)
+    let tree = try JSONDecoder().decode(ToTTree.self, from: try XCTUnwrap(assistant.tot))
+    guard case .failed = tree.status else {
+      return XCTFail("expected .failed, got \(tree.status)")
+    }
   }
 
   func test_stream_ends_without_terminal_marks_assistant_failed_not_silent_hang() async throws {

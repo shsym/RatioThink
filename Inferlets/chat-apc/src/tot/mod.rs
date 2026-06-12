@@ -390,17 +390,28 @@ async fn dispatch_streaming(
             ))
             .await;
     } else {
-        let _ = stream::emit_tree_complete(
-            &mut em,
-            outcome.selected_node_id.as_deref(),
-            outcome.final_answer.as_deref(),
-            outcome.synthesized,
-        )
-        .await;
         if let Some(metrics) =
             tree::GenerationMetrics::build(outcome.total_generated_tokens, started.elapsed())
         {
-            let _ = stream::emit_generation_metrics(&mut em, &metrics).await;
+            if stream::emit_generation_metrics(&mut em, &metrics)
+                .await
+                .is_ok()
+            {
+                let _ = stream::emit_tree_complete(
+                    &mut em,
+                    outcome.selected_node_id.as_deref(),
+                    outcome.final_answer.as_deref(),
+                    outcome.synthesized,
+                )
+                .await;
+            }
+        } else {
+            let _ = em
+                .emit_json(&sse::SseError::new(
+                    stream::METRICS_UNAVAILABLE_CODE,
+                    stream::METRICS_UNAVAILABLE_MESSAGE,
+                ))
+                .await;
         }
     }
     sse::emit_done_logged(&mut em, "tot_terminal").await;

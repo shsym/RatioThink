@@ -336,6 +336,8 @@ struct RawToTFrame: Decodable {
 /// malformed or non-positive values are protocol errors, not silently
 /// treated as a historical no-metric stream.
 private struct ToTGenerationMetricsFrame: Decodable {
+  private static let ratioTolerance = 1e-6
+
   let outputTokens: Int
   let elapsedSeconds: Double
   let tokensPerSecond: Double
@@ -356,18 +358,29 @@ private struct ToTGenerationMetricsFrame: Decodable {
 
   init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
-    outputTokens = try c.decode(Int.self, forKey: .outputTokens)
-    elapsedSeconds = try c.decode(Double.self, forKey: .elapsedSeconds)
-    tokensPerSecond = try c.decode(Double.self, forKey: .tokensPerSecond)
-    guard outputTokens > 0,
-          elapsedSeconds > 0,
-          elapsedSeconds.isFinite,
-          tokensPerSecond > 0,
-          tokensPerSecond.isFinite else {
+    let decodedOutputTokens = try c.decode(Int.self, forKey: .outputTokens)
+    let decodedElapsedSeconds = try c.decode(Double.self, forKey: .elapsedSeconds)
+    let decodedTokensPerSecond = try c.decode(Double.self, forKey: .tokensPerSecond)
+    guard decodedOutputTokens > 0,
+          decodedElapsedSeconds > 0,
+          decodedElapsedSeconds.isFinite,
+          decodedTokensPerSecond > 0,
+          decodedTokensPerSecond.isFinite else {
       throw DecodingError.dataCorrupted(.init(
         codingPath: decoder.codingPath,
         debugDescription: "generation_metrics values must be finite and positive"
       ))
     }
+    let expectedTokensPerSecond = Double(decodedOutputTokens) / decodedElapsedSeconds
+    let tolerance = max(Self.ratioTolerance, abs(expectedTokensPerSecond) * Self.ratioTolerance)
+    guard abs(decodedTokensPerSecond - expectedTokensPerSecond) <= tolerance else {
+      throw DecodingError.dataCorrupted(.init(
+        codingPath: decoder.codingPath,
+        debugDescription: "generation_metrics tokens_per_sec must equal output_tokens / elapsed_s"
+      ))
+    }
+    outputTokens = decodedOutputTokens
+    elapsedSeconds = decodedElapsedSeconds
+    tokensPerSecond = expectedTokensPerSecond
   }
 }
