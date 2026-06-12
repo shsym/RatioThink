@@ -57,6 +57,7 @@ define gui_suite_run
   status=$${PIPESTATUS[0]}; \
   rm -rf $(GUI_TMP_HOMES) 2>/dev/null || true; \
   echo "log: $$LOG"; \
+  if [ "$$status" -ne 0 ]; then sandbox_diag_report_from_log "test-gui-$(1)" "$$LOG"; fi; \
   exit $$status
 endef
 
@@ -113,7 +114,7 @@ test-xcode-chat-scaffold: genproject $(LOGDIR) ## Run Xcode-only ChatScaffold un
 	    test 2>&1 | tee $$LOG | tail -40; \
 	  status=$${PIPESTATUS[0]}; \
 	  echo "log: $$LOG"; \
-	  if [ "$$status" -ne 0 ]; then exit "$$status"; fi; \
+	  if [ "$$status" -ne 0 ]; then sandbox_diag_report_from_log "test-xcode-chat-scaffold" "$$LOG"; exit "$$status"; fi; \
 	  if ! grep -Eq "Test Suite 'ChatScaffoldModelSelectionTests' passed" $$LOG; then \
 	    echo "FAIL: ChatScaffoldModelSelectionTests did not execute (filter may have matched zero tests)"; \
 	    exit 1; \
@@ -143,7 +144,7 @@ test-app-unit: genproject $(LOGDIR) ## App-tier unit bundle (xcodebuild RatioThi
 	    test 2>&1 | tee $$LOG | tail -40; \
 	  status=$${PIPESTATUS[0]}; \
 	  echo "log: $$LOG"; \
-	  if [ "$$status" -ne 0 ]; then exit "$$status"; fi; \
+	  if [ "$$status" -ne 0 ]; then sandbox_diag_report_from_log "test-app-unit" "$$LOG"; exit "$$status"; fi; \
 	  if ! grep -Eq 'Executed [1-9][0-9]* tests, with 0 failures' $$LOG; then \
 	    echo "FAIL: RatioThinkTests bundle did not report an executed-test summary (zero-test guard — filter matched nothing or the bundle did not run)"; \
 	    exit 1; \
@@ -342,6 +343,7 @@ test-gui: genproject $(LOGDIR) ## GUI scenarios — full RatioThinkGUITests matr
 	  status=$${PIPESTATUS[0]}; \
 	  rm -rf $(GUI_TMP_HOMES) 2>/dev/null || true; \
 	  echo "log: $$LOG"; \
+	  if [ "$$status" -ne 0 ]; then sandbox_diag_report_from_log "test-gui" "$$LOG"; fi; \
 	  exit $$status
 
 # --- Focused GUI suites by product area (xcodebuild -only-testing) ----------

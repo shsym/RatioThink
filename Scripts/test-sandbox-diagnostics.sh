@@ -117,12 +117,59 @@ LOG
   require_contains "$output" "CPM_SOURCE_CACHE" "cpm classifier"
 }
 
+test_swift_wrapper_classifies_runtime_modulecache_failure() {
+  local tmp status output
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "$tmp/bin" "$tmp/module-cache"
+  cat >"$tmp/bin/xcrun" <<'FAKE_XCRUN'
+#!/usr/bin/env bash
+printf 'Invalid manifest: clang ModuleCache Operation not permitted\n' >&2
+exit 44
+FAKE_XCRUN
+  chmod +x "$tmp/bin/xcrun"
+
+  capture_status_output status output env PATH="$tmp/bin:$PATH" \
+    SANDBOX_DIAG_SWIFTPM_MODULE_CACHE="$tmp/module-cache" \
+    "$ROOT/Scripts/run-swift-test.sh" --filter RatioThinkCoreTests
+  expect_status "$status" 44 "swift wrapper runtime classifier preserves status"
+  require_contains "$output" "Invalid manifest: clang ModuleCache Operation not permitted" "swift wrapper runtime classifier"
+  require_contains "$output" "swift-test: detected SwiftPM/clang ModuleCache permission failure" "swift wrapper runtime classifier"
+  require_contains "$output" "Run outside the restricted sandbox" "swift wrapper runtime classifier"
+}
+
+test_xcode_make_recipe_classifies_runtime_mach_ipc_failure() {
+  local tmp status output
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "$tmp/bin" "$tmp/DerivedData" "$tmp/swiftpm" "$tmp/CoreSimulator" "$tmp/logs"
+  cat >"$tmp/bin/xcodebuild" <<'FAKE_XCODEBUILD'
+#!/usr/bin/env bash
+printf 'RpcServer::create failed: Unknown Mach error 44c\n' >&2
+exit 45
+FAKE_XCODEBUILD
+  chmod +x "$tmp/bin/xcodebuild"
+
+  capture_status_output status output env PATH="$tmp/bin:$PATH" \
+    SANDBOX_DIAG_XCODE_DERIVED_DATA="$tmp/DerivedData" \
+    SANDBOX_DIAG_XCODE_SWIFTPM_CACHE="$tmp/swiftpm" \
+    SANDBOX_DIAG_XCODE_CORESIM_LOGS="$tmp/CoreSimulator" \
+    make -C "$ROOT" LOGDIR="$tmp/logs" test-gui-shell
+  expect_status "$status" 2 "xcode make recipe runtime classifier make status"
+  require_contains "$output" "RpcServer::create failed: Unknown Mach error 44c" "xcode make recipe runtime classifier"
+  require_contains "$output" "Error 45" "xcode make recipe runtime classifier preserves recipe status"
+  require_contains "$output" "test-gui-shell: detected sandbox/IPC permission failure" "xcode make recipe runtime classifier"
+  require_contains "$output" "Run outside the restricted sandbox" "xcode make recipe runtime classifier"
+}
+
 test_swiftpm_cache_permission_guidance
 test_xcodebuild_cache_permission_guidance
 test_uv_cache_permission_guidance
 test_healthy_cache_preflights_pass
 test_mach_ipc_classifier_guidance
 test_cpm_classifier_guidance
+test_swift_wrapper_classifies_runtime_modulecache_failure
+test_xcode_make_recipe_classifies_runtime_mach_ipc_failure
 
 if [ "$fails" -eq 0 ]; then
   echo "sandbox-diagnostics self-test: PASS"

@@ -48,4 +48,4 @@ done
 
 sandbox_diag_require_swiftpm_cache "swift-test" || exit 2
 
-exec xcrun swift test "$@"
+sandbox_diag_run_with_recovery "swift-test" xcrun swift test "$@"
