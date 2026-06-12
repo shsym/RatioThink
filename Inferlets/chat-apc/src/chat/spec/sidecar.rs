@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::cache::NgramCache;
 
@@ -60,7 +61,7 @@ pub struct Lineage(Vec<LineageTurn>);
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LineageTurn {
     role: String,
-    content: String,
+    content_sha256: String,
 }
 
 impl Lineage {
@@ -70,10 +71,19 @@ impl Lineage {
                 .iter()
                 .map(|(role, content)| LineageTurn {
                     role: (*role).to_string(),
-                    content: (*content).to_string(),
+                    content_sha256: sha256_hex(content.as_bytes()),
                 })
                 .collect(),
         )
+    }
+
+    pub fn with_turn(&self, role: &str, content: &str) -> Self {
+        let mut turns = self.0.clone();
+        turns.push(LineageTurn {
+            role: role.to_string(),
+            content_sha256: sha256_hex(content.as_bytes()),
+        });
+        Self(turns)
     }
 
     pub fn is_continuation_of(&self, prior: &Self) -> bool {
@@ -81,10 +91,22 @@ impl Lineage {
     }
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SidecarStatus {
     Fresh,
     Reused,
+    DecodeFailed,
+    LineageForked,
 }
 
 pub struct SidecarCheckout {
@@ -92,6 +114,8 @@ pub struct SidecarCheckout {
     pub status: SidecarStatus,
     pub expired: usize,
     pub ngram_leaders: usize,
+    pub delete_persisted: bool,
+    pub diagnostic: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -154,29 +178,46 @@ impl SidecarStore {
                     status: SidecarStatus::Reused,
                     expired,
                     ngram_leaders,
+                    delete_persisted: false,
+                    diagnostic: None,
                 };
             }
         }
 
+        let mut non_reuse_status = SidecarStatus::Fresh;
+        let mut delete_persisted = false;
+        let mut diagnostic = None;
         if let Some(bytes) = persisted {
-            if let Ok((prior_lineage, persisted_cache)) = decode_sidecar_blob(&bytes) {
-                if lineage.is_continuation_of(&prior_lineage) {
-                    let ngram_leaders = persisted_cache.len();
-                    let cache = Arc::new(Mutex::new(persisted_cache));
-                    self.entries.insert(
-                        key,
-                        SidecarEntry {
-                            lineage,
-                            last_used_ms: now_ms,
-                            cache: Arc::clone(&cache),
-                        },
-                    );
-                    return SidecarCheckout {
-                        cache,
-                        status: SidecarStatus::Reused,
-                        expired,
-                        ngram_leaders,
-                    };
+            match decode_sidecar_blob(&bytes) {
+                Ok((prior_lineage, persisted_cache)) => {
+                    if lineage.is_continuation_of(&prior_lineage) {
+                        let ngram_leaders = persisted_cache.len();
+                        let cache = Arc::new(Mutex::new(persisted_cache));
+                        self.entries.insert(
+                            key,
+                            SidecarEntry {
+                                lineage,
+                                last_used_ms: now_ms,
+                                cache: Arc::clone(&cache),
+                            },
+                        );
+                        return SidecarCheckout {
+                            cache,
+                            status: SidecarStatus::Reused,
+                            expired,
+                            ngram_leaders,
+                            delete_persisted: false,
+                            diagnostic: None,
+                        };
+                    }
+                    non_reuse_status = SidecarStatus::LineageForked;
+                    diagnostic =
+                        Some("persisted lineage is not a prefix of request lineage".to_string());
+                }
+                Err(e) => {
+                    non_reuse_status = SidecarStatus::DecodeFailed;
+                    delete_persisted = true;
+                    diagnostic = Some(e.to_string());
                 }
             }
         }
@@ -192,9 +233,11 @@ impl SidecarStore {
         );
         SidecarCheckout {
             cache,
-            status: SidecarStatus::Fresh,
+            status: non_reuse_status,
             expired,
             ngram_leaders: 0,
+            delete_persisted,
+            diagnostic,
         }
     }
 
@@ -207,7 +250,6 @@ impl SidecarStore {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,11 +258,8 @@ mod tests {
     fn hydrates_persisted_blob_when_lineage_continues() {
         let key = SidecarKey::new("chat-a", "model-a", Some("profile"), 7, 1, 3);
         let prior_lineage = Lineage::from_turns(&[("user", "hello")]);
-        let next_lineage = Lineage::from_turns(&[
-            ("user", "hello"),
-            ("assistant", "hi"),
-            ("user", "continue"),
-        ]);
+        let next_lineage =
+            Lineage::from_turns(&[("user", "hello"), ("assistant", "hi"), ("user", "continue")]);
         let mut cache = NgramCache::new(1, 16, 8);
         cache.record(&[10], 20);
         let bytes = encode_sidecar_blob(&prior_lineage, &cache).unwrap();
@@ -245,7 +284,7 @@ mod tests {
         let mut store = SidecarStore::new(Duration::from_millis(1_000));
         let checkout = store.checkout_with_persisted(10, key, forked_lineage, Some(bytes));
 
-        assert_eq!(checkout.status, SidecarStatus::Fresh);
+        assert_eq!(checkout.status, SidecarStatus::LineageForked);
         assert_eq!(checkout.ngram_leaders, 0);
         assert_eq!(checkout.cache.lock().unwrap().get(&[10]), None);
     }
@@ -257,5 +296,72 @@ mod tests {
 
         assert_ne!(a.blob_name(), b.blob_name());
         assert!(a.blob_name().starts_with("chat-apc/cacheback/v1/"));
+    }
+
+    #[test]
+    fn persisted_lineage_can_include_generated_assistant_output_to_detect_forks() {
+        let key = SidecarKey::new("chat-a", "model-a", None, 7, 1, 3);
+        let pre_response = Lineage::from_turns(&[("user", "hello")]);
+        let assistant_a = pre_response.with_turn("assistant", "answer A");
+        let forked_after_b = Lineage::from_turns(&[
+            ("user", "hello"),
+            ("assistant", "answer B"),
+            ("user", "continue"),
+        ]);
+        let mut cache = NgramCache::new(1, 16, 8);
+        cache.record(&[10], 20);
+        let bytes = encode_sidecar_blob(&assistant_a, &cache).unwrap();
+
+        let mut store = SidecarStore::new(Duration::from_millis(1_000));
+        let checkout = store.checkout_with_persisted(10, key, forked_after_b, Some(bytes));
+
+        assert_eq!(checkout.status, SidecarStatus::LineageForked);
+        assert_eq!(checkout.ngram_leaders, 0);
+        assert!(!checkout.delete_persisted);
+        assert_eq!(checkout.cache.lock().unwrap().get(&[10]), None);
+    }
+
+    #[test]
+    fn corrupt_persisted_blob_reports_decode_failed_and_requests_delete() {
+        let key = SidecarKey::new("chat-a", "model-a", None, 7, 1, 3);
+        let lineage = Lineage::from_turns(&[("user", "hello")]);
+
+        let mut store = SidecarStore::new(Duration::from_millis(1_000));
+        let checkout = store.checkout_with_persisted(10, key, lineage, Some(b"{not json".to_vec()));
+
+        assert_eq!(checkout.status, SidecarStatus::DecodeFailed);
+        assert!(checkout.delete_persisted);
+        assert!(checkout.diagnostic.is_some());
+    }
+
+    #[test]
+    fn mismatched_persisted_blob_reports_lineage_forked() {
+        let key = SidecarKey::new("chat-a", "model-a", None, 7, 1, 3);
+        let prior_lineage = Lineage::from_turns(&[("user", "hello")]);
+        let forked_lineage = Lineage::from_turns(&[("user", "edited")]);
+        let cache = NgramCache::new(1, 16, 8);
+        let bytes = encode_sidecar_blob(&prior_lineage, &cache).unwrap();
+
+        let mut store = SidecarStore::new(Duration::from_millis(1_000));
+        let checkout = store.checkout_with_persisted(10, key, forked_lineage, Some(bytes));
+
+        assert_eq!(checkout.status, SidecarStatus::LineageForked);
+        assert!(!checkout.delete_persisted);
+        assert!(checkout.diagnostic.is_some());
+    }
+
+    #[test]
+    fn serialized_lineage_hashes_prompt_content_without_plaintext() {
+        let secret = "sentinel-secret-please-do-not-persist";
+        let lineage = Lineage::from_turns(&[("user", secret)]);
+        let continued = Lineage::from_turns(&[("user", secret), ("assistant", "ok")]);
+        let forked = Lineage::from_turns(&[("user", "different")]);
+        let cache = NgramCache::new(1, 16, 8);
+        let bytes = encode_sidecar_blob(&lineage, &cache).unwrap();
+
+        assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+        let (decoded, _) = decode_sidecar_blob(&bytes).unwrap();
+        assert!(continued.is_continuation_of(&decoded));
+        assert!(!forked.is_continuation_of(&decoded));
     }
 }

@@ -474,6 +474,8 @@ struct SpecMetricsReport {
 enum SidecarMetricStatus {
     Fresh,
     Reused,
+    DecodeFailed,
+    LineageForked,
 }
 
 impl SidecarMetricStatus {
@@ -481,6 +483,8 @@ impl SidecarMetricStatus {
         match self {
             SidecarMetricStatus::Fresh => "fresh",
             SidecarMetricStatus::Reused => "reused",
+            SidecarMetricStatus::DecodeFailed => "decode_failed",
+            SidecarMetricStatus::LineageForked => "lineage_forked",
         }
     }
 }
@@ -1081,19 +1085,39 @@ fn sidecar_for_request(
             None
         }
     };
-    let checkout = cacheback_sidecars().lock().unwrap().checkout_with_persisted(
-        monotonic_nanos_since_anchor() / 1_000_000,
-        key.clone(),
-        lineage.clone(),
-        persisted,
-    );
+    let checkout = cacheback_sidecars()
+        .lock()
+        .unwrap()
+        .checkout_with_persisted(
+            monotonic_nanos_since_anchor() / 1_000_000,
+            key.clone(),
+            lineage.clone(),
+            persisted,
+        );
     let status = match checkout.status {
         SidecarStatus::Fresh => SidecarMetricStatus::Fresh,
         SidecarStatus::Reused => SidecarMetricStatus::Reused,
+        SidecarStatus::DecodeFailed => SidecarMetricStatus::DecodeFailed,
+        SidecarStatus::LineageForked => SidecarMetricStatus::LineageForked,
     };
+    if let Some(diagnostic) = &checkout.diagnostic {
+        eprintln!(
+            "[chat-apc] cacheback sidecar non-reuse status={}: {diagnostic}",
+            status.as_str()
+        );
+    }
+    if checkout.delete_persisted {
+        if let Err(e) = inferlet::blob_store::delete_blob(&key.blob_name()) {
+            eprintln!("[chat-apc] cacheback sidecar delete failed: {e}");
+        }
+    }
     let cache = checkout.cache;
     (
-        Some(SidecarLease { key, lineage, cache }),
+        Some(SidecarLease {
+            key,
+            lineage,
+            cache,
+        }),
         Some(SidecarMetrics {
             status,
             ngram_leaders: checkout.ngram_leaders,
@@ -1102,15 +1126,19 @@ fn sidecar_for_request(
     )
 }
 
-fn persist_sidecar(lease: Option<&SidecarLease>) {
+fn persist_sidecar(lease: Option<&SidecarLease>, terminal_turn: Option<(&str, &str)>) {
     let Some(lease) = lease else {
+        return;
+    };
+    let Some((role, content)) = terminal_turn else {
         return;
     };
     let Ok(cache) = lease.cache.lock() else {
         eprintln!("[chat-apc] cacheback sidecar cache lock poisoned; skipping save");
         return;
     };
-    let bytes = match encode_sidecar_blob(&lease.lineage, &cache) {
+    let persisted_lineage = lease.lineage.with_turn(role, content);
+    let bytes = match encode_sidecar_blob(&persisted_lineage, &cache) {
         Ok(bytes) => bytes,
         Err(e) => {
             eprintln!("[chat-apc] cacheback sidecar encode failed: {e}");
@@ -3440,6 +3468,7 @@ async fn handle_streaming(
     // plain content with no client-visible signal.
     let mut tool_disabled_diag: Option<ToolDisabledDiag> = None;
     let mut pending_tool: Option<PendingToolCall> = None;
+    let mut sidecar_assistant_content = String::new();
     let mut in_reasoning = false;
     // #522: visible assistant text, captured so the prefix cache can save
     // the canonical next-turn boundary. Only used when `cache_plan` is
@@ -3592,6 +3621,7 @@ async fn handle_streaming(
                 // #522: mirror the visible text the App persists, so the
                 // save gate can compare it against the generated tokens.
                 full_text.push_str(&s);
+                sidecar_assistant_content.push_str(&s);
                 let chunk = ChatCompletionChunk {
                     id: &id,
                     object: "chat.completion.chunk",
@@ -3754,7 +3784,13 @@ async fn handle_streaming(
             }
         }
     }
-    persist_sidecar(sidecar_lease.as_ref());
+    let sidecar_terminal_turn = match (outcome, error_diag.is_none()) {
+        (Outcome::Natural | Outcome::MaxTokens, true) => {
+            Some(("assistant", sidecar_assistant_content.as_str()))
+        }
+        _ => None,
+    };
+    persist_sidecar(sidecar_lease.as_ref(), sidecar_terminal_turn);
     // #418: terminal spec_metrics frame (only when the caller opted into
     // the speculation surface, so normal streams are byte-identical).
     if want_metrics {
@@ -4373,7 +4409,11 @@ async fn handle_non_streaming(
                 .collect(),
         )
     };
-    persist_sidecar(sidecar_lease.as_ref());
+    let sidecar_terminal_turn = match (outcome, error_diag.is_none()) {
+        (Outcome::Natural | Outcome::MaxTokens, true) => Some(("assistant", full_text.as_str())),
+        _ => None,
+    };
+    persist_sidecar(sidecar_lease.as_ref(), sidecar_terminal_turn);
     // #418: speculation metrics, only when the caller opted into the
     // surface (so normal responses are byte-identical).
     let spec_metrics = if want_metrics {
@@ -5162,6 +5202,31 @@ mod tests {
         assert_eq!(json["ngram_sidecar_status"], "reused");
         assert_eq!(json["ngram_sidecar_leaders"], 42);
         assert_eq!(json["ngram_sidecars_expired"], 1);
+    }
+
+    #[test]
+    fn spec_metrics_reports_sidecar_non_reuse_reasons() {
+        for (status, expected) in [
+            (SidecarMetricStatus::DecodeFailed, "decode_failed"),
+            (SidecarMetricStatus::LineageForked, "lineage_forked"),
+        ] {
+            let report = SpecMetricsReport::build(
+                true,
+                None,
+                (1, 3),
+                SpecMetrics::default(),
+                0,
+                0,
+                Duration::from_secs(1),
+                Some(SidecarMetrics {
+                    status,
+                    ngram_leaders: 0,
+                    expired: 0,
+                }),
+            );
+            let json = serde_json::to_value(&report).expect("metrics serialize");
+            assert_eq!(json["ngram_sidecar_status"], expected);
+        }
     }
 
     #[test]

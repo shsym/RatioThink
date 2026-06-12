@@ -1,7 +1,7 @@
 [submodule "Vendor/pie"]
 	path = Vendor/pie
-	url = https://github.com/pie-project/pie.git
-	branch = pie.app/v1-base-shmem
+	url = https://github.com/shsym/pie.git
+	branch = task/466-blob-store
 [submodule "Scripts/vendor/ds_store"]
 	path = Scripts/vendor/ds_store
 	url = https://github.com/dmgbuild/ds_store.git
