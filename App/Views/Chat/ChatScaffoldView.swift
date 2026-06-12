@@ -27,6 +27,7 @@ struct ChatScaffoldView: View {
   /// #412: background-helper health, forwarded to the toolbar pip's outer ring.
   @EnvironmentObject private var helperHealth: HelperHealthController
   @EnvironmentObject private var profileStore: ProfileStore
+  @EnvironmentObject private var appPreferences: AppPreferences
   /// The reconciled engine-lifecycle fold, forwarded to the toolbar pip +
   /// popover so they derive the resident/offline distinction from the single
   /// published `indicator`.
@@ -133,6 +134,7 @@ struct ChatScaffoldView: View {
     guard !Self.didEvaluateLaunchStartPrompt else { return }
     if case .starting = engineStatusStore.status { return }
     Self.didEvaluateLaunchStartPrompt = true
+    if appPreferences.localAPIAutoStartEnabled { return }
     if LaunchEngineStartPrompt.shouldAsk(
         status: engineStatusStore.status,
         profileDefault: selectedProfileDefault) {

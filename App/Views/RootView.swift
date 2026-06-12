@@ -20,6 +20,7 @@ struct RootView: View {
   @EnvironmentObject private var appPreferences: AppPreferences
   @EnvironmentObject private var updateAvailability: UpdateAvailabilityModel
   @Environment(\.openURL) private var openURL
+  @State private var didEvaluateLocalAPIAutoStart = false
 
   var body: some View {
     VStack(spacing: 0) {
@@ -77,6 +78,10 @@ struct RootView: View {
       .navigationTitle("RatioThink")
     }
     .task { await runLaunchUpdateCheck() }
+    .onAppear { maybeAutoStartLocalAPIOnLaunch() }
+    .onChange(of: engineStatusStore.status) { _, _ in
+      maybeAutoStartLocalAPIOnLaunch()
+    }
   }
 
   /// #411: run the once-per-launch update check. Skipped on test/automation
@@ -98,6 +103,28 @@ struct RootView: View {
     let profileID = profileStore.activeProfileID
     Task { @MainActor in
       guard let profileID, !profileID.isEmpty else { return }
+      try? await engineStatusStore.startEngine(profileID: profileID)
+    }
+  }
+
+  /// Honor the Local API startup preference once per window lifetime after
+  /// the helper's initial placeholder status settles. Default-off preserves
+  /// the no-surprise model-load contract; when enabled, this starts the same
+  /// shared engine that in-app chat and the Local API page use.
+  private func maybeAutoStartLocalAPIOnLaunch() {
+    guard !didEvaluateLocalAPIAutoStart else { return }
+    if case .starting = engineStatusStore.status { return }
+    didEvaluateLocalAPIAutoStart = true
+
+    guard LocalAPIAutoStartPolicy.shouldStartOnLaunch(
+      enabled: appPreferences.localAPIAutoStartEnabled,
+      status: engineStatusStore.status,
+      activeProfileID: profileStore.activeProfileID
+    ), let profileID = profileStore.activeProfileID else {
+      return
+    }
+
+    Task { @MainActor in
       try? await engineStatusStore.startEngine(profileID: profileID)
     }
   }

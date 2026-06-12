@@ -27,6 +27,11 @@ public final class AppPreferences: ObservableObject {
   /// array of normalized version strings (e.g. `["0.1.1"]`).
   public static let ignoredUpdateVersionsKey = "ignoredUpdateVersions"
 
+  /// Storage key for the Local API launch policy. Defaults off so the app
+  /// never loads a model or opens the local HTTP endpoint at startup unless
+  /// the user explicitly opts in from the Local API page.
+  public static let localAPIAutoStartEnabledKey = "localAPIAutoStartEnabled"
+
   private let defaults: UserDefaults
 
   @Published public private(set) var firstLaunchWizardCompleted: Bool
@@ -36,10 +41,15 @@ public final class AppPreferences: ObservableObject {
   /// prompts again. The manual "Check for Updates…" command ignores this set.
   @Published public private(set) var ignoredUpdateVersions: Set<String>
 
+  /// Whether RatioThink should start the shared engine (and therefore the
+  /// Local API) automatically on app launch. User-controlled; default false.
+  @Published public private(set) var localAPIAutoStartEnabled: Bool
+
   public init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
     self.firstLaunchWizardCompleted = defaults.bool(forKey: Self.firstLaunchWizardCompletedKey)
     self.ignoredUpdateVersions = Set(defaults.stringArray(forKey: Self.ignoredUpdateVersionsKey) ?? [])
+    self.localAPIAutoStartEnabled = defaults.bool(forKey: Self.localAPIAutoStartEnabledKey)
   }
 
   /// Persist a version as ignored. Flushed to disk now (like the first-launch
@@ -74,5 +84,15 @@ public final class AppPreferences: ObservableObject {
   public func resetFirstLaunchWizard() {
     firstLaunchWizardCompleted = false
     defaults.removeObject(forKey: Self.firstLaunchWizardCompletedKey)
+  }
+
+  /// Persist the Local API launch policy. Flushed immediately so a user can
+  /// toggle it and quit before the next automatic UserDefaults sync without
+  /// losing the startup intent.
+  public func setLocalAPIAutoStartEnabled(_ enabled: Bool) {
+    guard localAPIAutoStartEnabled != enabled else { return }
+    localAPIAutoStartEnabled = enabled
+    defaults.set(enabled, forKey: Self.localAPIAutoStartEnabledKey)
+    defaults.synchronize()
   }
 }
