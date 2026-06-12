@@ -50,6 +50,8 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRCROOT="${SRCROOT:-$REPO_ROOT}"
+# shellcheck source=lib/sandbox-diagnostics.sh
+. "$REPO_ROOT/Scripts/lib/sandbox-diagnostics.sh"
 
 if [[ -z "$ARCH" ]]; then
   # Xcode build-phase mode. $ARCHS is space-separated.
@@ -213,11 +215,12 @@ CPREFIX_MAP="-ffile-prefix-map=$HOME=/home -ffile-prefix-map=$SRCROOT=/src"
 echo "build-pie-engine.sh: cargo build pie-server ($TRIPLE)"
 (
   cd "$PIE_DIR"
-  RUSTFLAGS="${RUSTFLAGS:-} -C linker=$CC_BIN -C link-arg=-L$RT_DIR -C link-arg=-lclang_rt.osx $REMAP_FLAGS" \
-  CFLAGS="${CFLAGS:-} $CPREFIX_MAP" \
-  CXXFLAGS="${CXXFLAGS:-} $CPREFIX_MAP" \
-  OBJCFLAGS="${OBJCFLAGS:-} $CPREFIX_MAP" \
-  OBJCXXFLAGS="${OBJCXXFLAGS:-} $CPREFIX_MAP" \
+  sandbox_diag_run_with_recovery "build-pie-engine" env \
+    RUSTFLAGS="${RUSTFLAGS:-} -C linker=$CC_BIN -C link-arg=-L$RT_DIR -C link-arg=-lclang_rt.osx $REMAP_FLAGS" \
+    CFLAGS="${CFLAGS:-} $CPREFIX_MAP" \
+    CXXFLAGS="${CXXFLAGS:-} $CPREFIX_MAP" \
+    OBJCFLAGS="${OBJCFLAGS:-} $CPREFIX_MAP" \
+    OBJCXXFLAGS="${OBJCXXFLAGS:-} $CPREFIX_MAP" \
     PIE_PORTABLE_METAL=1 "$CARGO" build --release -p pie-server --target "$TRIPLE"
 )
 

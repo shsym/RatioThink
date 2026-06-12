@@ -42,6 +42,8 @@ GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-*
 define gui_suite_run
 @set +e +o pipefail; \
   LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-gui-$(1).log; \
+  . Scripts/lib/sandbox-diagnostics.sh; \
+  sandbox_diag_require_xcodebuild_caches "test-gui-$(1)" || exit 2; \
   if ! pgrep -x Dock >/dev/null 2>&1; then \
     echo "warning: no seated GUI session — GUI tests will XCTSkip."; \
   fi; \
@@ -61,7 +63,7 @@ endef
 .PHONY: help genproject build build-tests clean lint \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
         test-xcode-chat-scaffold test-app-unit \
-        test-unit test-scenario test-smoke test-curated-hf test-install-guards test-e2e-http \
+        test-unit test-scenario test-smoke test-curated-hf test-install-guards test-sandbox-diagnostics test-e2e-http \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat \
         test-e2e-engine test-e2e-models test-e2e-load test-e2e-chat test-e2e-full test-helper-respawn \
@@ -100,6 +102,8 @@ build-tests: genproject ## Compile every xcodebuild target + the SPM probe (revi
 test-xcode-chat-scaffold: genproject $(LOGDIR) ## Run Xcode-only ChatScaffold unit regressions with zero-test guard
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-xcode-chat-scaffold.log; \
+	  . Scripts/lib/sandbox-diagnostics.sh; \
+	  sandbox_diag_require_xcodebuild_caches "test-xcode-chat-scaffold" || exit 2; \
 	  xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
 	    -destination 'platform=macOS,arch=arm64' \
 	    -configuration Debug \
@@ -128,6 +132,8 @@ test-app-unit: genproject $(LOGDIR) ## App-tier unit bundle (xcodebuild RatioThi
 	@# actually assert. Headless (unit, not GUI) — no seated session needed.
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-app-unit.log; \
+	  . Scripts/lib/sandbox-diagnostics.sh; \
+	  sandbox_diag_require_xcodebuild_caches "test-app-unit" || exit 2; \
 	  xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
 	    -destination 'platform=macOS,arch=arm64' \
 	    -configuration Debug \
@@ -144,7 +150,7 @@ test-app-unit: genproject $(LOGDIR) ## App-tier unit bundle (xcodebuild RatioThi
 	  fi
 
 engine-build: ## Build pie engine binary (host arch, no triple) — used by test-smoke
-	cd Vendor/pie && PIE_PORTABLE_METAL=1 cargo build -p pie-server --release
+	Scripts/run-engine-build.sh
 
 # Default ARCH to the host's native arch so Intel-host devs do not get
 # a silent arm64 cross-build (review v1 F7). Override with
@@ -262,6 +268,10 @@ test-curated-hf: $(LOGDIR) ## Live-HF existence audit of the curated catalog (PI
 test-install-guards: ## Install-time launchd-safety regression guards (stubbed, deterministic — runs anywhere)
 	Scripts/test-proc-acceptance.sh
 	Scripts/test-source-closed.sh
+	Scripts/test-sandbox-diagnostics.sh
+
+test-sandbox-diagnostics: ## Regression-test sandbox/cache/IPC recovery guidance for test wrappers
+	Scripts/test-sandbox-diagnostics.sh
 
 test-e2e-http: $(LOGDIR) ## HTTP API stress + tool-call contract E2E (dummy driver; self-bootstraps pie+wasm; needs uv + Qwen3-0.6B config/tokenizer in HF cache)
 	@set +e +o pipefail; \
@@ -311,6 +321,8 @@ test-gui: genproject $(LOGDIR) ## GUI scenarios — full RatioThinkGUITests matr
 	@Scripts/stage-test-model.sh || echo "warning: model fixture unavailable — model-dependent GUI tests will XCTSkip; see guidance above."
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-gui.log; \
+	  . Scripts/lib/sandbox-diagnostics.sh; \
+	  sandbox_diag_require_xcodebuild_caches "test-gui" || exit 2; \
 	  if ! pgrep -x Dock >/dev/null 2>&1; then \
 	    echo "warning: no seated GUI session — GUI tests will XCTSkip."; \
 	  fi; \
