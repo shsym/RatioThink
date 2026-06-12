@@ -26,9 +26,12 @@ pub const DEFAULT_BREADTH: usize = 3;
 pub const DEFAULT_DEPTH: usize = 2;
 pub const DEFAULT_BEAM_WIDTH: usize = 2;
 pub const DEFAULT_MAX_TOKENS_PER_NODE: usize = 256;
-/// Default reasoning budget — generous so a thinking model finishes its
-/// `<think>` block before the answer phase begins.
-pub const DEFAULT_MAX_REASONING_TOKENS: usize = 1024;
+/// Default reasoning budget — generous so a small thinking model finishes its
+/// `<think>` block before the answer phase begins. Qwen3-0.6B can exceed 1024
+/// on short deterministic ToT turns after the extra synthesis cue, so default
+/// to the next power-of-two tier rather than silently surfacing
+/// `final_answer_unavailable`.
+pub const DEFAULT_MAX_REASONING_TOKENS: usize = 2048;
 /// Branch-generation temperature. Sibling diversity now has two
 /// sources — per-branch strategy directives (`search.rs`
 /// `strategy_directive`) plus sampling temperature — but temperature
@@ -256,7 +259,10 @@ pub fn resolve(input: &TotInput) -> Result<TotParams, (&'static str, String)> {
         ));
     }
     if !(temperature.is_finite() && (0.0..=2.0).contains(&temperature)) {
-        return Err(("temperature", "temperature must be in [0.0, 2.0]".to_string()));
+        return Err((
+            "temperature",
+            "temperature must be in [0.0, 2.0]".to_string(),
+        ));
     }
     if !(top_p.is_finite() && top_p > 0.0 && top_p <= 1.0) {
         return Err(("top_p", "top_p must be in (0.0, 1.0]".to_string()));
@@ -309,7 +315,7 @@ mod tests {
         assert_eq!(p.max_tokens_per_node, 256);
         // #413: thinking ON by default, with a generous reasoning budget.
         assert!(p.thinking);
-        assert_eq!(p.max_reasoning_tokens, 1024);
+        assert_eq!(p.max_reasoning_tokens, 2048);
         // Branch-generation sampling defaults. 0.7 is measurement-backed
         // (see DEFAULT_TEMPERATURE docs) — a silent default change would
         // invalidate the recorded sibling-diversity justification.
@@ -343,7 +349,10 @@ mod tests {
         // single inferlet, and phasing can regress 2–3× under KV pressure, so
         // the coupled-sequential (#413) shape is the default. An unset `exec`
         // resolves to it — production behavior is unchanged.
-        assert_eq!(resolve(&input()).unwrap().exec, ExecStrategy::CoupledSequential);
+        assert_eq!(
+            resolve(&input()).unwrap().exec,
+            ExecStrategy::CoupledSequential
+        );
         assert_eq!(ExecStrategy::default(), ExecStrategy::CoupledSequential);
     }
 
@@ -407,8 +416,7 @@ mod tests {
     #[cfg(feature = "exec-strategies")]
     #[test]
     fn exec_deserializes_snake_case() {
-        let i: TotInput =
-            serde_json::from_str(r#"{"exec":"coupled_concurrent"}"#).unwrap();
+        let i: TotInput = serde_json::from_str(r#"{"exec":"coupled_concurrent"}"#).unwrap();
         assert_eq!(resolve(&i).unwrap().exec, ExecStrategy::CoupledConcurrent);
     }
 
