@@ -9,6 +9,21 @@ import XCTest
 /// first-launch completion flag.
 @MainActor
 final class AppPreferencesTests: XCTestCase {
+  private var tempRoot: URL!
+
+  override func invokeTest() {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("app-prefs-\(UUID().uuidString)", isDirectory: true)
+    try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    tempRoot = root
+    defer {
+      try? FileManager.default.removeItem(at: root)
+      tempRoot = nil
+    }
+    PieDirs.$homeOverride.withValue(root) {
+      super.invokeTest()
+    }
+  }
 
   /// Each test gets a scratch `UserDefaults` suite so process-wide
   /// state is never touched. The suite name is keyed on the test
@@ -67,7 +82,7 @@ final class AppPreferencesTests: XCTestCase {
     let defaults = try makeScratchDefaults()
     let prefs = AppPreferences(defaults: defaults)
 
-    prefs.setLocalAPIExternalAccessEnabled(true)
+    try prefs.setLocalAPIExternalAccessEnabled(true)
 
     XCTAssertTrue(prefs.localAPIExternalAccessEnabled)
     XCTAssertEqual(prefs.localAPIBindMode, .external)
@@ -79,16 +94,34 @@ final class AppPreferencesTests: XCTestCase {
 
   func test_local_api_external_access_persists_to_shared_helper_readable_file() throws {
     let defaults = try makeScratchDefaults()
-    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-      .appendingPathComponent("app-prefs-local-api-\(UUID().uuidString)", isDirectory: true)
-    defer { try? FileManager.default.removeItem(at: root) }
 
-    try PieDirs.$homeOverride.withValue(root) {
-      let prefs = AppPreferences(defaults: defaults)
-      prefs.setLocalAPIExternalAccessEnabled(true)
+    let prefs = AppPreferences(defaults: defaults)
+    try prefs.setLocalAPIExternalAccessEnabled(true)
 
-      XCTAssertEqual(LocalAPIExposurePreference.loadEnabled(root: root), true)
-      XCTAssertEqual(EngineHTTPBindMode.persistedLocalAPIBindMode(root: root), .external)
-    }
+    XCTAssertEqual(LocalAPIExposurePreference.loadEnabled(root: tempRoot), true)
+    XCTAssertEqual(EngineHTTPBindMode.persistedLocalAPIBindMode(root: tempRoot), .external)
+  }
+
+  func test_local_api_external_access_write_failure_leaves_app_and_shared_state_external() throws {
+    struct StubError: Error {}
+    let defaults = try makeScratchDefaults()
+    defaults.set(true, forKey: AppPreferences.localAPIExternalAccessEnabledKey)
+    try LocalAPIExposurePreference.saveEnabled(true, root: tempRoot)
+    let prefs = AppPreferences(
+      defaults: defaults,
+      localAPIExposurePreference: LocalAPIExposurePreference.Store(
+        loadEnabled: { true },
+        saveEnabled: { _ in throw StubError() }
+      )
+    )
+
+    XCTAssertThrowsError(try prefs.setLocalAPIExternalAccessEnabled(false))
+
+    XCTAssertTrue(prefs.localAPIExternalAccessEnabled,
+                  "app state must not claim loopback when the helper-readable file could not be updated")
+    XCTAssertEqual(prefs.localAPIBindMode, .external)
+    XCTAssertTrue(defaults.bool(forKey: AppPreferences.localAPIExternalAccessEnabledKey),
+                  "UserDefaults mirror must not flip until the shared source-of-truth write succeeds")
+    XCTAssertEqual(LocalAPIExposurePreference.loadEnabled(root: tempRoot), true)
   }
 }

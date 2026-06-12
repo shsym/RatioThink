@@ -507,7 +507,7 @@ struct LocalAPIView: View {
           enabled: enabled,
           phase: state.phase,
           profileID: profileID,
-          setPreference: { appPreferences.setLocalAPIExternalAccessEnabled($0) },
+          setPreference: { try appPreferences.setLocalAPIExternalAccessEnabled($0) },
           stopEngine: { try await engineStatusStore.stopEngine() },
           startEngine: { requestedMode in
             guard let profileID, !profileID.isEmpty else { return }

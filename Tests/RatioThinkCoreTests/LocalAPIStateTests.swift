@@ -204,6 +204,32 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertEqual(requestedStarts, [.external])
   }
 
+  func test_bind_mode_change_propagates_preference_write_failure() async {
+    struct StubError: Error {}
+    let preferenceEnabled = true
+    var requestedStarts: [EngineHTTPBindMode] = []
+
+    do {
+      try await LocalAPIBindModeChange.apply(
+        enabled: false,
+        phase: .serving(port: 8123),
+        profileID: "chat",
+        setPreference: { _ in throw StubError() },
+        stopEngine: {},
+        startEngine: { requestedStarts.append($0) }
+      )
+      XCTFail("shared preference write failure must surface to the UI")
+    } catch is StubError {
+      // expected
+    } catch {
+      XCTFail("unexpected error: \(error)")
+    }
+
+    XCTAssertTrue(preferenceEnabled,
+                  "preference state must stay external when the helper-visible write fails")
+    XCTAssertEqual(requestedStarts, [.loopback])
+  }
+
   func test_bind_mode_change_does_not_mutate_preference_while_starting() async throws {
     var preferenceEnabled = true
     var stopCalls = 0

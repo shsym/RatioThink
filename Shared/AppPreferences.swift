@@ -33,6 +33,7 @@ public final class AppPreferences: ObservableObject {
     EngineHTTPBindMode.localAPIExternalAccessEnabledPreferenceKey
 
   private let defaults: UserDefaults
+  private let localAPIExposurePreference: LocalAPIExposurePreference.Store
 
   @Published public private(set) var firstLaunchWizardCompleted: Bool
 
@@ -49,17 +50,24 @@ public final class AppPreferences: ObservableObject {
     localAPIExternalAccessEnabled ? .external : .loopback
   }
 
-  public init(defaults: UserDefaults = .standard) {
+  public init(defaults: UserDefaults = .standard,
+              localAPIExposurePreference: LocalAPIExposurePreference.Store = .live()) {
     self.defaults = defaults
+    self.localAPIExposurePreference = localAPIExposurePreference
     self.firstLaunchWizardCompleted = defaults.bool(forKey: Self.firstLaunchWizardCompletedKey)
     self.ignoredUpdateVersions = Set(defaults.stringArray(forKey: Self.ignoredUpdateVersionsKey) ?? [])
-    let root = try? PieDirs.applicationSupport()
-    let fileBacked = root.flatMap { LocalAPIExposurePreference.loadEnabled(root: $0) }
+    let fileBacked = localAPIExposurePreference.loadEnabled()
     let defaultsBacked = defaults.bool(forKey: Self.localAPIExternalAccessEnabledKey)
     let effectiveExternalAccess = fileBacked ?? defaultsBacked
     self.localAPIExternalAccessEnabled = effectiveExternalAccess
-    if fileBacked == nil, defaultsBacked, let root {
-      try? LocalAPIExposurePreference.saveEnabled(defaultsBacked, root: root)
+    if fileBacked == nil, defaultsBacked {
+      do {
+        try localAPIExposurePreference.saveEnabled(defaultsBacked)
+      } catch {
+        self.localAPIExternalAccessEnabled = false
+        defaults.set(false, forKey: Self.localAPIExternalAccessEnabledKey)
+        defaults.synchronize()
+      }
     }
     if fileBacked != nil, defaultsBacked != effectiveExternalAccess {
       defaults.set(effectiveExternalAccess, forKey: Self.localAPIExternalAccessEnabledKey)
@@ -79,13 +87,11 @@ public final class AppPreferences: ObservableObject {
     defaults.synchronize()
   }
 
-  public func setLocalAPIExternalAccessEnabled(_ enabled: Bool) {
+  public func setLocalAPIExternalAccessEnabled(_ enabled: Bool) throws {
     guard localAPIExternalAccessEnabled != enabled else { return }
+    try localAPIExposurePreference.saveEnabled(enabled)
     localAPIExternalAccessEnabled = enabled
     defaults.set(enabled, forKey: Self.localAPIExternalAccessEnabledKey)
-    if let root = try? PieDirs.applicationSupport() {
-      try? LocalAPIExposurePreference.saveEnabled(enabled, root: root)
-    }
     defaults.synchronize()
   }
 

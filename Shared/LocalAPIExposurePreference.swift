@@ -10,6 +10,37 @@ import Foundation
 public enum LocalAPIExposurePreference {
   public static let fileName = "local-api.json"
 
+  public struct Store {
+    public var loadEnabled: () -> Bool?
+    public var saveEnabled: (Bool) throws -> Void
+
+    public init(loadEnabled: @escaping () -> Bool?,
+                saveEnabled: @escaping (Bool) throws -> Void) {
+      self.loadEnabled = loadEnabled
+      self.saveEnabled = saveEnabled
+    }
+
+    public static func live(root: URL) -> Store {
+      Store(
+        loadEnabled: { LocalAPIExposurePreference.loadEnabled(root: root) },
+        saveEnabled: { try LocalAPIExposurePreference.saveEnabled($0, root: root) }
+      )
+    }
+
+    public static func live() -> Store {
+      Store(
+        loadEnabled: {
+          guard let root = try? PieDirs.applicationSupport() else { return nil }
+          return LocalAPIExposurePreference.loadEnabled(root: root)
+        },
+        saveEnabled: {
+          let root = try PieDirs.applicationSupport()
+          try LocalAPIExposurePreference.saveEnabled($0, root: root)
+        }
+      )
+    }
+  }
+
   public static func fileURL(root: URL) -> URL {
     root.appendingPathComponent(fileName, isDirectory: false)
   }

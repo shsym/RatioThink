@@ -201,7 +201,7 @@ public enum LocalAPIBindModeChange {
     enabled: Bool,
     phase: LocalAPIState.Phase,
     profileID: String?,
-    setPreference: (Bool) -> Void,
+    setPreference: (Bool) throws -> Void,
     stopEngine: () async throws -> Void,
     startEngine: (EngineHTTPBindMode) async throws -> Void
   ) async throws {
@@ -209,7 +209,7 @@ public enum LocalAPIBindModeChange {
     case .starting, .stopping:
       return
     case .off, .failed:
-      setPreference(enabled)
+      try setPreference(enabled)
       return
     case .serving:
       break
@@ -219,7 +219,7 @@ public enum LocalAPIBindModeChange {
     let requestedMode: EngineHTTPBindMode = enabled ? .external : .loopback
     try await stopEngine()
     try await startEngine(requestedMode)
-    setPreference(enabled)
+    try setPreference(enabled)
   }
 }
 
