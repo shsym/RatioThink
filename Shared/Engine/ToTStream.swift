@@ -154,6 +154,11 @@ public enum ToTEvent: Equatable, Sendable {
   /// final answer; its text streams as `finalDelta` chunks before
   /// `treeComplete` (whose `finalAnswer` is the authoritative full text).
   case finalDelta(text: String)
+  /// Terminal total generated-token throughput for a completed ToT run
+  /// (#542). Counts all model-generated decode tokens spent by the search
+  /// (reasoning, branch answers, scorer generations, and synthesis), never
+  /// prompt/input tokens.
+  case generationMetrics(GenerationMetrics)
 }
 
 /// Which channel a streamed `nodeDelta` chunk fills (#413).
@@ -242,6 +247,12 @@ public func decodeToTFrame(_ data: Data) throws -> ToTEvent? {
       throw ToTStreamError.malformedFrame(payload: String(decoding: data, as: UTF8.self))
     }
     return .finalDelta(text: text)
+  case "generation_metrics":
+    do {
+      return .generationMetrics(try JSONDecoder().decode(ToTGenerationMetricsFrame.self, from: data).metrics)
+    } catch {
+      throw ToTStreamError.malformedFrame(payload: String(decoding: data, as: UTF8.self))
+    }
   case "tree_complete":
     // selected_node_id / final_answer are legitimately null; their
     // absence from the optionals is indistinguishable from explicit
@@ -318,5 +329,45 @@ struct RawToTFrame: Decodable {
     case branchIndex = "branch_index"
     case kind
     case text
+  }
+}
+
+/// Strict ToT throughput meta-frame. Kept separate from `RawToTFrame` so
+/// malformed or non-positive values are protocol errors, not silently
+/// treated as a historical no-metric stream.
+private struct ToTGenerationMetricsFrame: Decodable {
+  let outputTokens: Int
+  let elapsedSeconds: Double
+  let tokensPerSecond: Double
+
+  var metrics: GenerationMetrics {
+    GenerationMetrics(
+      outputTokens: outputTokens,
+      elapsedSeconds: elapsedSeconds,
+      tokensPerSecond: tokensPerSecond
+    )
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case outputTokens = "output_tokens"
+    case elapsedSeconds = "elapsed_s"
+    case tokensPerSecond = "tokens_per_sec"
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    outputTokens = try c.decode(Int.self, forKey: .outputTokens)
+    elapsedSeconds = try c.decode(Double.self, forKey: .elapsedSeconds)
+    tokensPerSecond = try c.decode(Double.self, forKey: .tokensPerSecond)
+    guard outputTokens > 0,
+          elapsedSeconds > 0,
+          elapsedSeconds.isFinite,
+          tokensPerSecond > 0,
+          tokensPerSecond.isFinite else {
+      throw DecodingError.dataCorrupted(.init(
+        codingPath: decoder.codingPath,
+        debugDescription: "generation_metrics values must be finite and positive"
+      ))
+    }
   }
 }

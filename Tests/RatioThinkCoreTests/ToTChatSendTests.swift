@@ -65,6 +65,42 @@ final class ToTChatSendTests: XCTestCase {
     XCTAssertEqual(msgs?.first?["content"] as? String, "What is 2+2?")
   }
 
+  func test_completed_tot_persists_total_generation_metrics() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "What is 2+2?",
+                                 ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ToTFrameEngine(frames: [
+      #"{"event":"tree_start","id":"tot-1","model":"qwen","breadth":1,"depth":1,"beam_width":1}"#,
+      #"{"event":"node_complete","node":{"id":"tot-n1","parent_id":"root","depth":1,"branch_index":0,"content":"4","reasoning":"counting on fingers","score":9,"status":"ok"}}"#,
+      #"{"event":"level_pruned","level":1,"kept":["tot-n1"]}"#,
+      #"{"event":"tree_complete","selected_node_id":"tot-n1","final_answer":"4"}"#,
+      #"{"event":"generation_metrics","output_tokens":84,"elapsed_s":2.0,"tokens_per_sec":42.0}"#,
+    ])
+    let controller = ChatSendController()
+    controller.sendTreeOfThought(
+      chat: chat,
+      context: context,
+      engine: engine,
+      config: ToTProfileConfig(breadth: 1, depth: 1, beamWidth: 1),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "qwen")
+    )
+    try await waitUntil("tot stream with metrics finishes") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(chat.messages.first { $0.role == "assistant" })
+    XCTAssertEqual(assistant.content, "4")
+    let metrics = try XCTUnwrap(assistant.generationPerformance)
+    XCTAssertEqual(metrics.outputTokens, 84)
+    XCTAssertEqual(metrics.elapsedSeconds, 2.0)
+    XCTAssertEqual(metrics.tokensPerSecond, 42.0)
+    XCTAssertEqual(assistant.tokens, 84)
+  }
+
   func test_stream_ends_without_terminal_marks_assistant_failed_not_silent_hang() async throws {
     // The real-stall repro: the engine streamed level 1 + its beam, then
     // closed the connection mid-level-2 (per-request timeout on a slow

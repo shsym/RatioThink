@@ -6,6 +6,7 @@
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Lifecycle status of a tree node. Serializes to the snake_case wire
 /// strings `"root" | "ok" | "error"` — byte-identical to the prior
@@ -100,6 +101,35 @@ pub struct TreeResponse {
     /// the raw best-leaf content stood (#523 Part A F1) — lets a non-streaming
     /// caller (e.g. the gated smoke) assert the synthesizer actually ran.
     pub synthesized: bool,
+    /// Total generated-token throughput for the completed ToT run (#542).
+    /// Counts model-generated decode tokens only — branch reasoning/answers,
+    /// scorer generations, and synthesis/finalization generations — never
+    /// prompt/input tokens. Omitted only when a completed run somehow has no
+    /// positive token/elapsed denominator, to avoid bogus UI metrics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_metrics: Option<GenerationMetrics>,
+}
+
+/// Total generated-token throughput for one completed tree-of-thought run.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct GenerationMetrics {
+    pub output_tokens: usize,
+    pub elapsed_s: f64,
+    pub tokens_per_sec: f64,
+}
+
+impl GenerationMetrics {
+    pub fn build(output_tokens: usize, elapsed: Duration) -> Option<Self> {
+        let elapsed_s = elapsed.as_secs_f64();
+        if output_tokens == 0 || elapsed_s <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            output_tokens,
+            elapsed_s,
+            tokens_per_sec: output_tokens as f64 / elapsed_s,
+        })
+    }
 }
 
 static NODE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -345,9 +375,21 @@ mod tests {
         // beam keeps the top paraphrase + the distinct branch, so
         // three-paraphrases-of-one-idea can't pass as a multi-branch search.
         let c = vec![
-            cand_text("p1", Some(9), "choose a date plan the party decorate food games"),
-            cand_text("p2", Some(8), "choose the date plan a party decorate food and games"),
-            cand_text("d", Some(5), "budget first: set spend cap then allocate per category"),
+            cand_text(
+                "p1",
+                Some(9),
+                "choose a date plan the party decorate food games",
+            ),
+            cand_text(
+                "p2",
+                Some(8),
+                "choose the date plan a party decorate food and games",
+            ),
+            cand_text(
+                "d",
+                Some(5),
+                "budget first: set spend cap then allocate per category",
+            ),
         ];
         let keep = select_beam_diverse(&c, 2, super::super::diversity::DUP_THRESHOLD);
         assert_eq!(keep, vec!["p1", "d"]);
@@ -499,6 +541,7 @@ mod tests {
             selected_node_id: None,
             final_answer: None,
             synthesized: false,
+            generation_metrics: None,
         };
         let v = serde_json::to_value(&resp).unwrap();
         for k in [
@@ -529,7 +572,10 @@ mod tests {
             assert!(root.get(k).is_some(), "node missing key {k}");
         }
         // `error` / `score_error` are omitted when None.
-        assert!(root.get("error").is_none(), "error should be omitted when None");
+        assert!(
+            root.get("error").is_none(),
+            "error should be omitted when None"
+        );
         assert!(
             root.get("score_error").is_none(),
             "score_error should be omitted when None"
@@ -554,11 +600,17 @@ mod tests {
         let mut n = error_leaf("root", 1, 0, "x".to_string());
         // Empty reasoning is omitted from the wire (clean default).
         let v = serde_json::to_value(&n).unwrap();
-        assert!(v.get("reasoning").is_none(), "empty reasoning should be omitted");
+        assert!(
+            v.get("reasoning").is_none(),
+            "empty reasoning should be omitted"
+        );
         // A present reasoning trace serializes under "reasoning".
         n.reasoning = "first, consider…".to_string();
         let v = serde_json::to_value(&n).unwrap();
-        assert_eq!(v.get("reasoning").and_then(|r| r.as_str()), Some("first, consider…"));
+        assert_eq!(
+            v.get("reasoning").and_then(|r| r.as_str()),
+            Some("first, consider…")
+        );
     }
 
     #[test]

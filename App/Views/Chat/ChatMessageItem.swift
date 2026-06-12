@@ -67,8 +67,12 @@ struct ChatMessageItem: Identifiable, Equatable {
           generationPerformance.elapsedSeconds.isFinite,
           generationPerformance.tokensPerSecond > 0,
           generationPerformance.tokensPerSecond.isFinite else { return nil }
+    if let tot, tot.status != .complete { return nil }
     let rounded = Int(generationPerformance.tokensPerSecond.rounded())
     guard rounded > 0 else { return nil }
+    if tot != nil {
+      return "ToT total \(rounded) tok/s"
+    }
     return "\(rounded) tok/s"
   }
 }

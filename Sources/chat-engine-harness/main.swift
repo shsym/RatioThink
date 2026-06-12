@@ -225,6 +225,9 @@ enum EngineHarness {
       case let .treeComplete(sel, ans):
         sawTerminal = true
         print(String(format: "  +%6.1fs tree_complete selected=\(sel ?? "nil") answer_len=\(ans?.count ?? 0)", dt))
+      case let .generationMetrics(metrics):
+        print(String(format: "  +%6.1fs generation_metrics total_tokens=%d tok_s=%.1f",
+                     dt, metrics.outputTokens, metrics.tokensPerSecond))
       }
     }
     let total = Date().timeIntervalSince(t0)

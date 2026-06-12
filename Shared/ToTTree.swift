@@ -178,6 +178,10 @@ public struct ToTTree: Equatable, Sendable, Codable {
       self.selectedNodeID = selectedNodeID
       self.finalAnswer = finalAnswer
       self.status = .complete
+
+    case .generationMetrics:
+      // Metrics live on Message.meta, not inside the persisted tree snapshot.
+      break
     }
   }
 

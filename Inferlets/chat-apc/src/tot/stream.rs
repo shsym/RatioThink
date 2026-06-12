@@ -76,7 +76,7 @@ use serde::Serialize;
 use crate::sse::{EmitError, Emitter};
 
 use super::schema::TotParams;
-use super::tree::{Node, NodeStatus};
+use super::tree::{GenerationMetrics, Node, NodeStatus};
 
 /// The flat projection of a [`Node`] sent on a `node_complete` frame.
 /// Borrows every field from the live node so emission allocates only the
@@ -187,6 +187,28 @@ struct TreeCompleteFrame<'a> {
     /// when the raw best-leaf content stood — lets the client and the gated
     /// smoke assert the synthesizer actually ran (#523 Part A F1).
     synthesized: bool,
+}
+
+/// `generation_metrics` — terminal total generated-token throughput for a
+/// successful ToT run (#542). Mirrors chat's compact metric payload, but the
+/// token count is ToT-total (branch reasoning/answers + scorer + synthesis).
+#[derive(Serialize)]
+struct GenerationMetricsFrame {
+    event: &'static str,
+    output_tokens: usize,
+    elapsed_s: f64,
+    tokens_per_sec: f64,
+}
+
+impl From<&GenerationMetrics> for GenerationMetricsFrame {
+    fn from(metrics: &GenerationMetrics) -> Self {
+        GenerationMetricsFrame {
+            event: "generation_metrics",
+            output_tokens: metrics.output_tokens,
+            elapsed_s: metrics.elapsed_s,
+            tokens_per_sec: metrics.tokens_per_sec,
+        }
+    }
 }
 
 /// Emit the opening `tree_start` frame.
@@ -307,6 +329,16 @@ pub async fn emit_tree_complete(
         synthesized,
     })
     .await
+}
+
+/// Emit the terminal total generated-token throughput metric. The caller only
+/// invokes this after a successful `tree_complete`; failures/cancellations do
+/// not receive a metric frame.
+pub async fn emit_generation_metrics(
+    em: &mut Emitter,
+    metrics: &GenerationMetrics,
+) -> Result<(), EmitError> {
+    em.emit_json(&GenerationMetricsFrame::from(metrics)).await
 }
 
 /// Whether a finished search totally failed: it selected no ok leaf. The
@@ -435,6 +467,21 @@ mod tests {
     }
 
     #[test]
+    fn generation_metrics_frame_field_names_and_boundaries_are_stable() {
+        assert!(GenerationMetrics::build(0, std::time::Duration::from_millis(500)).is_none());
+        assert!(GenerationMetrics::build(3, std::time::Duration::ZERO).is_none());
+
+        let metrics = GenerationMetrics::build(84, std::time::Duration::from_secs(2))
+            .expect("positive token count and elapsed time should emit metrics");
+        let v = serde_json::to_value(GenerationMetricsFrame::from(&metrics)).unwrap();
+
+        assert_eq!(v["event"].as_str(), Some("generation_metrics"));
+        assert_eq!(v["output_tokens"].as_u64(), Some(84));
+        assert_eq!(v["elapsed_s"].as_f64(), Some(2.0));
+        assert_eq!(v["tokens_per_sec"].as_f64(), Some(42.0));
+    }
+
+    #[test]
     fn node_start_frame_carries_position() {
         let v = serde_json::to_value(NodeStartFrame {
             event: "node_start",
@@ -511,7 +558,10 @@ mod tests {
             kept: &kept,
         })
         .unwrap();
-        assert_eq!(v, json!({"event":"level_pruned","level":1,"kept":["tot-n1","tot-n2"]}));
+        assert_eq!(
+            v,
+            json!({"event":"level_pruned","level":1,"kept":["tot-n1","tot-n2"]})
+        );
     }
 
     #[test]

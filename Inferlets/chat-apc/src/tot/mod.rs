@@ -107,6 +107,7 @@ mod tree;
 
 use crate::chat::completions::{self, ChatMessage};
 use crate::sse::{self, Emitter};
+use std::time::Instant;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Response};
 
@@ -179,7 +180,12 @@ pub async fn dispatch(
         Ok(p) => p,
         Err((field, msg)) => {
             return res
-                .respond(completions::json_error_param(400, "invalid_request", &msg, field))
+                .respond(completions::json_error_param(
+                    400,
+                    "invalid_request",
+                    &msg,
+                    field,
+                ))
                 .await;
         }
     };
@@ -253,12 +259,17 @@ pub async fn dispatch(
     // cue:false — the assistant turn is opened per branch in `search`
     // (each fork re-cues), so the shared prefix stays cue-free and KV
     // pages are shared across branches.
-    if let Err((code, msg)) = completions::fill_context(&mut root_ctx, &model, &messages, None, false)
+    if let Err((code, msg)) =
+        completions::fill_context(&mut root_ctx, &model, &messages, None, false)
     {
         // #468: an unknown role is a client error (400, same envelope as
         // the completions path); other fill_context failures (e.g.
         // tool_equip_failed) stay 500.
-        let status = if completions::is_role_error_code(code) { 400 } else { 500 };
+        let status = if completions::is_role_error_code(code) {
+            400
+        } else {
+            500
+        };
         return res.respond(sse::json_error(status, code, &msg)).await;
     }
     if let Err(e) = root_ctx.flush().await {
@@ -282,6 +293,7 @@ pub async fn dispatch(
         return dispatch_streaming(root_ctx, &params, &model, &tree_id, &model_id, res).await;
     }
 
+    let started = Instant::now();
     let outcome = search::run(root_ctx, &params, &model, None).await;
 
     // F1: a search that selected no ok leaf totally failed (every branch
@@ -291,7 +303,11 @@ pub async fn dispatch(
     // success-shaped tree with null answer.
     if stream::is_total_failure(&outcome.selected_node_id) {
         return res
-            .respond(sse::json_error(500, stream::NO_ANSWER_CODE, stream::NO_ANSWER_MESSAGE))
+            .respond(sse::json_error(
+                500,
+                stream::NO_ANSWER_CODE,
+                stream::NO_ANSWER_MESSAGE,
+            ))
             .await;
     }
 
@@ -306,6 +322,10 @@ pub async fn dispatch(
         selected_node_id: outcome.selected_node_id,
         final_answer: outcome.final_answer,
         synthesized: outcome.synthesized,
+        generation_metrics: tree::GenerationMetrics::build(
+            outcome.total_generated_tokens,
+            started.elapsed(),
+        ),
     };
     let body = match serde_json::to_string(&response_body) {
         Ok(s) => s,
@@ -357,13 +377,17 @@ async fn dispatch_streaming(
     {
         return em.finish();
     }
+    let started = Instant::now();
     let outcome = search::run(root_ctx, params, model, Some(&mut em)).await;
     if stream::is_total_failure(&outcome.selected_node_id) {
         // F1: total failure — emit the documented terminal `error` frame
         // (the client's catch marks the turn failed) instead of a
         // success-shaped `tree_complete{null,null}`.
         let _ = em
-            .emit_json(&sse::SseError::new(stream::NO_ANSWER_CODE, stream::NO_ANSWER_MESSAGE))
+            .emit_json(&sse::SseError::new(
+                stream::NO_ANSWER_CODE,
+                stream::NO_ANSWER_MESSAGE,
+            ))
             .await;
     } else {
         let _ = stream::emit_tree_complete(
@@ -373,6 +397,11 @@ async fn dispatch_streaming(
             outcome.synthesized,
         )
         .await;
+        if let Some(metrics) =
+            tree::GenerationMetrics::build(outcome.total_generated_tokens, started.elapsed())
+        {
+            let _ = stream::emit_generation_metrics(&mut em, &metrics).await;
+        }
     }
     sse::emit_done_logged(&mut em, "tot_terminal").await;
     em.finish()
