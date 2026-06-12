@@ -204,6 +204,71 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertEqual(requestedStarts, [.external])
   }
 
+  func test_bind_mode_change_enable_write_failure_does_not_launch_external_daemon() async {
+    struct StubError: Error {}
+    var stopCalls = 0
+    var preferenceWrites: [Bool] = []
+    var requestedStarts: [EngineHTTPBindMode] = []
+
+    do {
+      try await LocalAPIBindModeChange.apply(
+        enabled: true,
+        phase: .serving(port: 8123),
+        profileID: "chat",
+        setPreference: {
+          preferenceWrites.append($0)
+          throw StubError()
+        },
+        stopEngine: { stopCalls += 1 },
+        startEngine: { requestedStarts.append($0) }
+      )
+      XCTFail("enabling external access must throw when the helper-visible preference cannot be persisted")
+    } catch is StubError {
+      // expected
+    } catch {
+      XCTFail("unexpected error: \(error)")
+    }
+
+    XCTAssertEqual(stopCalls, 1)
+    XCTAssertEqual(preferenceWrites, [true])
+    XCTAssertTrue(requestedStarts.isEmpty,
+                  "never launch an external listener while the helper-visible preference still says loopback")
+  }
+
+  func test_bind_mode_change_enable_start_failure_rolls_back_preference() async {
+    struct StubError: Error {}
+    var preferenceEnabled = false
+    var preferenceWrites: [Bool] = []
+    var requestedStarts: [EngineHTTPBindMode] = []
+
+    do {
+      try await LocalAPIBindModeChange.apply(
+        enabled: true,
+        phase: .serving(port: 8123),
+        profileID: "chat",
+        setPreference: {
+          preferenceEnabled = $0
+          preferenceWrites.append($0)
+        },
+        stopEngine: {},
+        startEngine: {
+          requestedStarts.append($0)
+          throw StubError()
+        }
+      )
+      XCTFail("start failure after enabling external access must surface")
+    } catch is StubError {
+      // expected
+    } catch {
+      XCTFail("unexpected error: \(error)")
+    }
+
+    XCTAssertFalse(preferenceEnabled,
+                   "rollback restores loopback preference when the external daemon did not start")
+    XCTAssertEqual(preferenceWrites, [true, false])
+    XCTAssertEqual(requestedStarts, [.external])
+  }
+
   func test_bind_mode_change_propagates_preference_write_failure() async {
     struct StubError: Error {}
     let preferenceEnabled = true

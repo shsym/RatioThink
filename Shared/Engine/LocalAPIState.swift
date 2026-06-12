@@ -191,11 +191,14 @@ public struct LocalAPIState: Equatable {
 
 /// Transactional bind-mode preference application for Local API exposure.
 ///
-/// The dangerous transition is external → loopback while the daemon is
-/// running: if stop/restart fails, the old `0.0.0.0` listener may still be
-/// alive, so the persisted preference/warning must not flip to loopback until
-/// the requested restart has been accepted. Off-engine changes are safe to
-/// persist immediately because no listener can be under-reported.
+/// The serving transaction is direction-aware:
+/// - enabling must persist the helper-visible exposure preference before
+///   starting `0.0.0.0`, so write failures cannot expose a listener while the
+///   shared source of truth still says loopback;
+/// - disabling must restart loopback before persisting `false`, so a failed
+///   stop/restart cannot hide an already-exposed listener.
+/// Off-engine changes are safe to persist immediately because no listener can
+/// be under-reported.
 public enum LocalAPIBindModeChange {
   public static func apply(
     enabled: Bool,
@@ -216,10 +219,19 @@ public enum LocalAPIBindModeChange {
     }
 
     guard let profileID, !profileID.isEmpty else { return }
-    let requestedMode: EngineHTTPBindMode = enabled ? .external : .loopback
     try await stopEngine()
-    try await startEngine(requestedMode)
-    try setPreference(enabled)
+    if enabled {
+      try setPreference(true)
+      do {
+        try await startEngine(.external)
+      } catch {
+        try? setPreference(false)
+        throw error
+      }
+    } else {
+      try await startEngine(.loopback)
+      try setPreference(false)
+    }
   }
 }
 
