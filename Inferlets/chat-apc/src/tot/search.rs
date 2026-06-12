@@ -107,9 +107,10 @@ use super::tree::{
 /// Per-branch directive appended to each forked child before it generates
 /// (#523/#555). The branch index makes every sibling's prompt textually
 /// distinct, while the wording stays user-facing so small models cannot copy
-/// search machinery into node content. Non-final nodes produce one answer
-/// component; final nodes turn the accumulated material into the response the
-/// user should receive.
+/// search machinery into node content. Non-final nodes produce one standalone
+/// increment that adds new useful material without rerolling prior text; final
+/// nodes turn the accumulated material into the response the user should
+/// receive.
 ///
 /// Reasoning-aware (#413/#437): a node may generate a `<think>` block then
 /// an answer, which [`generate_demuxed`] splits apart — reasoning IS the
@@ -126,21 +127,32 @@ fn branch_directive(
 ) -> String {
     let n = branch_index + 1;
     let focus = match branch_index % 4 {
-        0 => "Use the shortest accurate wording.",
-        1 => "Add one helpful context detail only if it improves the reply.",
+        0 => "Use the shortest accurate addition.",
+        1 => "Add one helpful context detail only if it is not already present.",
         2 => "Check names, numbers, and units carefully.",
-        _ => "Make the wording practical and specific.",
+        _ => "Make the added material practical and specific.",
     };
     let body = if level >= max_depth {
         format!(
-            "Answer the user now in polished one- or two-sentence form. Use the useful facts in this chat and correct any mistakes. Keep currency symbols on money amounts. Write only the answer. Do not start with a heading. Option {n} of {breadth}: {focus}"
+            "Reply to the user now in polished one- or two-sentence form. Use the useful facts in this conversation and correct any mistakes. If the answer is a money amount, include the currency symbol, such as $18 instead of 18. Write only the reply. Do not start with a heading. Option {n} of {breadth}: {focus}"
+        )
+    } else if level == 1 {
+        format!(
+            "Write one short standalone useful note for answering the user. It can be a key fact, a calculation result, a correction, or a concrete detail. Keep currency symbols on money amounts. Do not repeat the user's wording. Output only that note. Do not start with a heading. Option {n} of {breadth}: {focus}"
         )
     } else {
         format!(
-            "Answer the user now in one or two sentences. Include correct information useful to the question, and keep it concise. Write only the answer. Do not start with a heading. Option {n} of {breadth}: {focus}"
+            "Write one short standalone useful note that adds to the answer material already written. Choose a missing fact, a correction, a check of names/numbers/units, or a concrete detail. Keep currency symbols on money amounts. Do not restate earlier sentences. Output only that note. Do not start with a heading. Option {n} of {breadth}: {focus}"
         )
     };
-    with_thinking(&body, thinking)
+    // Final-depth nodes are answer candidates, not exploratory notes. Use
+    // the no-think path there so small thinking models do not spend the
+    // whole budget in hidden reasoning before a direct answer.
+    with_thinking(&body, branch_uses_thinking(level, max_depth, thinking))
+}
+
+fn branch_uses_thinking(level: usize, max_depth: usize, thinking: bool) -> bool {
+    thinking && level < max_depth
 }
 
 /// Value-evaluator prompts (independent per-node scoring). The node already
@@ -151,7 +163,7 @@ fn branch_directive(
 /// `thinking` knob, which stays on. The directive is inert on a non-reasoning
 /// model, and the score output is demuxed regardless so a stray empty think
 /// block can't swallow the integer.
-const INTERMEDIATE_SCORE_PROMPT: &str = "Rate the latest assistant reply from 1 to 10 for usefulness to the user. Prefer accurate facts, careful arithmetic, concise wording, and details that are directly useful. Use the full scale: 1-3 for off-topic or self-referential text; 4-6 for generic or thin text; 7-8 for useful but incomplete text; and 9-10 for a strong, relevant reply. Respond with only a single integer from 1 to 10.";
+const INTERMEDIATE_SCORE_PROMPT: &str = "Rate the latest assistant reply from 1 to 10 as one short useful note for answering the user. Prefer accurate facts, careful arithmetic, concise wording, and material not already present. Penalize repetition, generic filler, or self-referential text. Use the full scale: 1-3 for off-topic or repeated text; 4-6 for thin or generic notes; 7-8 for useful notes with gaps; and 9-10 for a novel, correct, directly useful note. Respond with only a single integer from 1 to 10.";
 
 const FINAL_SCORE_PROMPT: &str = "Rate the latest assistant reply from 1 to 10 as the final response to the user. Judge relevance, correctness, specificity, completeness, and concrete usefulness. Use the full scale: 1-3 for irrelevant or self-referential text, 4-6 for partial or generic answers, 7-8 for useful answers with gaps, and 9-10 for clear, complete, directly useful answers. Avoid defaulting to 5: separate similar answers by task fit. Respond with only a single integer from 1 to 10.";
 
@@ -189,6 +201,30 @@ const SYNTHESIS_TOP_P: f32 = 0.9;
 /// production-sized reasoning budget.
 const NO_THINK_RETRY_REASONING_TOKENS: usize = 32;
 
+/// Intermediate nodes now add a compact increment instead of a full final
+/// answer. Keep the final level at the caller-requested budgets, but cap
+/// non-final work to reduce reroll cost. Reasoning still has enough room for
+/// Qwen3-class models (see project insight #251); if it exhausts, the node
+/// remains `Incomplete` and is never salvaged into a fake answer.
+const INTERMEDIATE_REASONING_TOKEN_CAP: usize = 1024;
+const INTERMEDIATE_ANSWER_TOKEN_CAP: usize = 96;
+
+fn branch_reasoning_budget(level: usize, max_depth: usize, requested: usize) -> usize {
+    if level < max_depth {
+        requested.min(INTERMEDIATE_REASONING_TOKEN_CAP)
+    } else {
+        requested
+    }
+}
+
+fn branch_answer_budget(level: usize, max_depth: usize, requested: usize) -> usize {
+    if level < max_depth {
+        requested.min(INTERMEDIATE_ANSWER_TOKEN_CAP)
+    } else {
+        requested
+    }
+}
+
 /// Append the `/no_think` directive when reasoning is disabled for this
 /// search (`thinking:false`). On a Qwen3-style model this suppresses the
 /// `<think>` block; on a non-reasoning model it is an inert token.
@@ -199,6 +235,13 @@ fn with_thinking(base: &str, thinking: bool) -> String {
         format!("{base} /no_think")
     }
 }
+
+/// Structural no-think prefill used after a Qwen3-style generation cue.
+/// Pie's generic cue is `<|im_start|>assistant\n`; the reference Qwen3
+/// no-think template then writes an empty think block before visible answer
+/// text. Appending that prefill to the context makes `/no_think` operational
+/// instead of relying on the small model to emit `</think>` itself.
+const NO_THINK_PREFILL: &str = "<think>\n\n</think>\n\n";
 
 /// Retry only the specific starvation mode #544 cares about: a thinking
 /// branch produced reasoning but no answer. Normal answered branches keep
@@ -242,8 +285,13 @@ fn retry_branch_directive(
     branch_index: usize,
     breadth: usize,
 ) -> String {
+    let lead = if level >= max_depth {
+        "Answer the user now. Keep it concise. Write only the answer."
+    } else {
+        "Add the new material now. Keep it concise. Write only the new material."
+    };
     format!(
-        "Answer the user now. Keep it concise. Write only the answer.\n\n{}",
+        "{lead}\n\n{}",
         branch_directive(level, max_depth, branch_index, breadth, false)
     )
 }
@@ -270,12 +318,19 @@ struct BranchGenerateRequest<'a> {
 trait BranchDriver<C> {
     fn fork_retry_base(&mut self, ctx: &C) -> Result<C, String>;
     fn push_user(&mut self, ctx: &mut C, directive: &str);
-    fn cue(&mut self, ctx: &mut C);
+    fn cue(&mut self, ctx: &mut C, no_think: bool);
     fn generate<'a>(
         &'a mut self,
         ctx: &'a mut C,
         request: BranchGenerateRequest<'a>,
     ) -> DemuxFuture<'a>;
+}
+
+fn cue_generation(ctx: &mut Context, model: &Model, no_think: bool) {
+    ctx.cue();
+    if no_think {
+        ctx.append(&model.tokenizer().encode(NO_THINK_PREFILL));
+    }
 }
 
 /// Build the synthesis user-turn (#523 Part A): the instruction appended to
@@ -288,7 +343,7 @@ fn build_synthesis_directive(best_content: &str, _best_reasoning: &str) -> Strin
     let mut s = String::from("Useful facts:\n\n");
     s.push_str(best_content.trim());
     s.push_str(
-        "\n\nAnswer the user in one or two polished sentences. Fix any obvious mistake. Preserve important names, numbers, units, and currency symbols; keep currency symbols on money amounts. Write only the answer. No heading.",
+        "\n\nReply to the user in one or two polished sentences. Fix any obvious mistake. Preserve important names, numbers, units, and currency symbols. If the answer is a money amount, include the currency symbol, such as $18 instead of 18. Write only the reply. No heading.",
     );
     s
 }
@@ -766,15 +821,19 @@ pub async fn run(
         }
     }
 
-    // #523 Part A: capture the best leaf's answer + reasoning (before
+    // #523 Part A: capture the selected path's visible content + best leaf's
+    // reasoning (before
     // `finalize` consumes `flat`), assemble the outcome, then run ONE
     // grounded synthesis as the final answer. `best` is `Some` exactly when
     // an ok leaf exists (so honest-null is preserved: no leaf → no synthesis,
     // `final_answer` stays null). Synthesis streams as `final_delta`; on any
-    // failure it returns `None` and the raw best-leaf content stands.
-    let best = best_leaf(&last_level)
-        .and_then(|id| flat.iter().find(|n| n.id == id))
-        .map(|n| (n.content.clone(), n.reasoning.clone()));
+    // failure it returns `None` and the raw final-depth best-leaf content
+    // stands when eligible.
+    let best = best_leaf(&last_level).and_then(|id| {
+        let node = flat.iter().find(|n| n.id == id)?;
+        let content = selected_path_content(&flat, &id).unwrap_or_else(|| node.content.clone());
+        Some((content, node.reasoning.clone()))
+    });
     let mut outcome = finalize(flat, &last_level, params.depth);
     // Attempt synthesis only when an ok leaf exists AND its grounding fork
     // survived; on any skip/failure emit a one-shot host diagnostic with the
@@ -903,6 +962,37 @@ fn fold_level(
         (prev, true) // no survivor → retain prior pool, stop the search
     } else {
         (this, false) // this level advances → it is the new deepest pool
+    }
+}
+
+/// Return visible generated content along the selected node's ancestry,
+/// oldest-to-newest, skipping root/blank nodes and all hidden reasoning. This
+/// gives synthesis the accumulated user-facing material when intermediate
+/// levels are increments rather than full answer rerolls.
+fn selected_path_content(flat: &[Node], selected_id: &str) -> Option<String> {
+    let mut ids = Vec::new();
+    let mut current = selected_id;
+    loop {
+        let node = flat.iter().find(|n| n.id == current)?;
+        if node.status != NodeStatus::Root {
+            ids.push(node.id.as_str());
+        }
+        match node.parent_id.as_deref() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    ids.reverse();
+    let material: Vec<&str> = ids
+        .into_iter()
+        .filter_map(|id| flat.iter().find(|n| n.id == id))
+        .map(|n| n.content.trim())
+        .filter(|content| !content.is_empty())
+        .collect();
+    if material.is_empty() {
+        None
+    } else {
+        Some(material.join("\n\n"))
     }
 }
 
@@ -1066,14 +1156,20 @@ where
         params.thinking,
     );
     driver.push_user(&mut ctx, &first_directive);
-    driver.cue(&mut ctx);
+    driver.cue(
+        &mut ctx,
+        !branch_uses_thinking(level, params.depth, params.thinking),
+    );
+    let reasoning_budget =
+        branch_reasoning_budget(level, params.depth, params.max_reasoning_tokens);
+    let answer_budget = branch_answer_budget(level, params.depth, params.max_tokens_per_node);
     let demux = driver
         .generate(
             &mut ctx,
             BranchGenerateRequest {
                 directive: &first_directive,
-                reasoning_budget: params.max_reasoning_tokens,
-                answer_budget: params.max_tokens_per_node,
+                reasoning_budget,
+                answer_budget,
                 sink_node_id: node_id,
             },
         )
@@ -1085,14 +1181,14 @@ where
                 let retry_directive =
                     retry_branch_directive(level, params.depth, branch_index, params.breadth);
                 driver.push_user(&mut retry_ctx, &retry_directive);
-                driver.cue(&mut retry_ctx);
+                driver.cue(&mut retry_ctx, true);
                 let retry = driver
                     .generate(
                         &mut retry_ctx,
                         BranchGenerateRequest {
                             directive: &retry_directive,
                             reasoning_budget: NO_THINK_RETRY_REASONING_TOKENS,
-                            answer_budget: params.max_tokens_per_node,
+                            answer_budget,
                             sink_node_id: node_id,
                         },
                     )
@@ -1133,8 +1229,8 @@ async fn generate_branch(
             ctx.user(directive);
         }
 
-        fn cue(&mut self, ctx: &mut Context) {
-            ctx.cue();
+        fn cue(&mut self, ctx: &mut Context, no_think: bool) {
+            cue_generation(ctx, self.model, no_think);
         }
 
         fn generate<'a>(
@@ -1275,7 +1371,7 @@ async fn score_node(ctx: &Context, model: &Model, is_final_level: bool) -> Score
         }
     };
     sctx.user(&with_thinking(score_prompt(is_final_level), false));
-    sctx.cue();
+    cue_generation(&mut sctx, model, true);
     let stops = chat::stop_tokens(model);
     let mut generator = sctx
         .generate(Sampler::TopP {
@@ -1365,7 +1461,7 @@ async fn synthesize(
         false,
     );
     base.user(&directive);
-    base.cue();
+    cue_generation(&mut base, model, true);
     let stops = chat::stop_tokens(model);
     let demux = generate_demuxed(
         &mut base,
@@ -1602,20 +1698,37 @@ mod tests {
     #[test]
     fn branch_directive_intermediate_advances_selected_path_without_rerolling() {
         let d = branch_directive(1, 3, 0, 3, true);
-        assert!(d.contains("Answer the user"), "{d}");
-        assert!(d.contains("one or two sentences"), "{d}");
-        assert!(d.contains("useful to the question"), "{d}");
+        assert!(d.contains("one short standalone useful note"), "{d}");
+        assert!(d.contains("Do not repeat the user's wording"), "{d}");
+        assert!(d.contains("Output only that note"), "{d}");
         assert!(d.contains("Do not start with a heading"), "{d}");
+        assert!(!d.contains("what is written above"), "{d}");
         assert!(!d.contains("reasoning path"), "{d}");
         assert!(!d.contains("prior path"), "{d}");
+        assert!(!d.contains("one or two sentences"), "{d}");
+    }
+
+    #[test]
+    fn later_intermediate_directive_adds_without_repeating_existing_material() {
+        let d = branch_directive(2, 4, 1, 3, true);
+        assert!(
+            d.contains("adds to the answer material already written"),
+            "{d}"
+        );
+        assert!(d.contains("Do not restate earlier sentences"), "{d}");
+        assert!(d.contains("Output only that note"), "{d}");
+        assert!(!d.contains("what is written above"), "{d}");
+        assert!(!d.contains("previous answer"), "{d}");
     }
 
     #[test]
     fn branch_directive_final_requests_direct_answer() {
         let d = branch_directive(3, 3, 1, 3, true);
-        assert!(d.contains("Answer the user"), "{d}");
+        assert!(d.contains("Reply to the user now"), "{d}");
         assert!(d.contains("polished"), "{d}");
         assert!(d.contains("correct any mistakes"), "{d}");
+        assert!(d.contains("$18 instead of 18"), "{d}");
+        assert!(d.contains("/no_think"), "{d}");
         assert!(!d.contains("original user prompt"), "{d}");
         assert!(!d.contains("tree search"), "{d}");
     }
@@ -1626,6 +1739,7 @@ mod tests {
         // marker (reused from `with_thinking`); thinking:true keeps it.
         assert!(branch_directive(1, 3, 0, 3, false).contains("/no_think"));
         assert!(!branch_directive(1, 3, 0, 3, true).contains("/no_think"));
+        assert!(branch_directive(3, 3, 0, 3, true).contains("/no_think"));
     }
 
     // ── score_prompt (#555): intermediate progress vs final answer quality ──
@@ -1633,12 +1747,30 @@ mod tests {
     #[test]
     fn score_prompt_intermediate_rates_path_progress_not_final_quality() {
         let p = score_prompt(false).to_lowercase();
-        assert!(p.contains("usefulness to the user"));
+        assert!(p.contains("one short useful note"));
+        assert!(p.contains("penalize repetition"));
         assert!(p.contains("accurate facts"));
-        assert!(p.contains("directly useful"));
         assert!(p.contains("single integer"));
         assert!(!p.contains("path progress"));
         assert!(!p.contains("reasoning path"));
+    }
+
+    #[test]
+    fn intermediate_generation_budgets_are_capped_without_affecting_final_budget() {
+        assert_eq!(branch_reasoning_budget(1, 3, 2048), 1024);
+        assert_eq!(branch_reasoning_budget(2, 3, 512), 512);
+        assert_eq!(branch_reasoning_budget(3, 3, 2048), 2048);
+        assert_eq!(branch_answer_budget(1, 3, 256), 96);
+        assert_eq!(branch_answer_budget(2, 3, 48), 48);
+        assert_eq!(branch_answer_budget(3, 3, 256), 256);
+    }
+
+    #[test]
+    fn branch_thinking_policy_keeps_intermediate_thinking_but_not_final() {
+        assert!(branch_uses_thinking(1, 3, true));
+        assert!(branch_uses_thinking(2, 3, true));
+        assert!(!branch_uses_thinking(3, 3, true));
+        assert!(!branch_uses_thinking(1, 3, false));
     }
 
     #[test]
@@ -1663,8 +1795,9 @@ mod tests {
         assert!(d.contains("Book a private venue that fits 20 guests."));
         // …and the instruction directs the final answer, not an echo of search internals.
         let lo = d.to_lowercase();
-        assert!(lo.contains("answer the user"));
-        assert!(lo.contains("write only the answer"));
+        assert!(lo.contains("reply to the user"));
+        assert!(lo.contains("write only the reply"));
+        assert!(d.contains("$18 instead of 18"));
         assert!(lo.contains("no heading"));
         assert!(!lo.contains("tree search"));
         assert!(!lo.contains("branches"));
@@ -1673,6 +1806,34 @@ mod tests {
         assert!(!lo.contains("internal reasoning"));
         assert!(!lo.contains("tree-of-thought"));
         assert!(!d.contains("Private supporting notes"));
+    }
+
+    #[test]
+    fn selected_path_content_collects_visible_contributions_in_order() {
+        let mut parent = ok_leaf("n1", "Maya's pre-discount total is $22.", Some(7));
+        parent.depth = 1;
+        let child = Node {
+            id: "n2".to_string(),
+            parent_id: Some("n1".to_string()),
+            depth: 2,
+            branch_index: Some(0),
+            content: "Subtracting the $4 discount leaves $18.".to_string(),
+            reasoning: "hidden arithmetic".to_string(),
+            score: Some(8),
+            status: NodeStatus::Ok,
+            error: None,
+            score_error: None,
+            children: Vec::new(),
+        };
+        let flat = vec![Node::root(), parent, child];
+
+        assert_eq!(
+            selected_path_content(&flat, "n2"),
+            Some(
+                "Maya's pre-discount total is $22.\n\nSubtracting the $4 discount leaves $18."
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -1932,6 +2093,7 @@ mod tests {
         id: &'static str,
         users: Vec<String>,
         cues: usize,
+        no_think_cues: Vec<bool>,
     }
 
     impl FakeBranchCtx {
@@ -1940,6 +2102,7 @@ mod tests {
                 id,
                 users: Vec::new(),
                 cues: 0,
+                no_think_cues: Vec::new(),
             }
         }
     }
@@ -1948,6 +2111,7 @@ mod tests {
     struct FakeBranchCall {
         ctx_id: &'static str,
         directive: String,
+        no_think_cue: bool,
         reasoning_budget: usize,
         answer_budget: usize,
         sink_node_id: String,
@@ -1979,8 +2143,9 @@ mod tests {
             ctx.users.push(directive.to_string());
         }
 
-        fn cue(&mut self, ctx: &mut FakeBranchCtx) {
+        fn cue(&mut self, ctx: &mut FakeBranchCtx, no_think: bool) {
             ctx.cues += 1;
+            ctx.no_think_cues.push(no_think);
         }
 
         fn generate<'a>(
@@ -1991,6 +2156,7 @@ mod tests {
             self.calls.push(FakeBranchCall {
                 ctx_id: ctx.id,
                 directive: request.directive.to_string(),
+                no_think_cue: ctx.no_think_cues.last().copied().unwrap_or(false),
                 reasoning_budget: request.reasoning_budget,
                 answer_budget: request.answer_budget,
                 sink_node_id: request.sink_node_id.to_string(),
@@ -2044,6 +2210,10 @@ mod tests {
         assert_eq!(demux.answer, "retry answer");
         assert_eq!(driver.calls.len(), 2);
         assert_eq!(driver.calls[0].ctx_id, "first");
+        assert!(
+            driver.calls[0].no_think_cue,
+            "final-depth first attempt should use the structural no-think prefill"
+        );
         assert_eq!(
             driver.calls[0].reasoning_budget,
             params.max_reasoning_tokens
@@ -2056,6 +2226,10 @@ mod tests {
         );
         assert_eq!(driver.calls[1].answer_budget, params.max_tokens_per_node);
         assert_eq!(driver.calls[1].sink_node_id, "tot-n1");
+        assert!(
+            driver.calls[1].no_think_cue,
+            "retry should use the structural no-think prefill"
+        );
         assert!(driver.calls[1].directive.contains("/no_think"));
         assert!(driver.calls[1].directive.contains("Answer the user now"));
         assert!(!driver.calls[1].directive.contains("previous attempt"));
