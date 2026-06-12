@@ -525,7 +525,7 @@ struct RatioThinkApp: App {
         .environmentObject(settingsNavigation)
         // #420: route the menu-bar Helper's `ratiothink://settings` deep
         // link straight to the Settings scene (not just app-foreground).
-        .handlesSettingsDeepLink()
+        .handlesSettingsDeepLink(settingsNavigation: settingsNavigation)
         .frame(minWidth: 900, minHeight: 600)
     }
     .modelContainer(chatContainer)

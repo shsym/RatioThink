@@ -14,7 +14,12 @@ import AppKit
 /// a cold or background launch without a private selector.
 struct SettingsURLHandler: ViewModifier {
   @Environment(\.openSettings) private var openSettings
-  @EnvironmentObject private var settingsNavigation: SettingsNavigation
+
+  // Pass this explicitly from RatioThinkApp instead of reading it as an
+  // @EnvironmentObject here: the modifier is attached after the WindowGroup
+  // content's environmentObject calls, so the modifier itself is outside that
+  // injected environment and would trap when a deep link reads it.
+  let settingsNavigation: SettingsNavigation
 
   func body(content: Content) -> some View {
     content.onOpenURL { url in
@@ -46,7 +51,7 @@ struct SettingsURLHandler: ViewModifier {
 
 extension View {
   /// Attach the `ratiothink://settings` → Settings-scene router.
-  func handlesSettingsDeepLink() -> some View {
-    modifier(SettingsURLHandler())
+  func handlesSettingsDeepLink(settingsNavigation: SettingsNavigation) -> some View {
+    modifier(SettingsURLHandler(settingsNavigation: settingsNavigation))
   }
 }
