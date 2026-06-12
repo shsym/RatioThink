@@ -292,6 +292,47 @@ final class ToTChatSendTests: XCTestCase {
     XCTAssertTrue(tree.nodes.allSatisfy { $0.status == .error })
   }
 
+  func test_selected_node_without_final_answer_marks_assistant_failed_not_blank_success() async throws {
+    // Review v4 F1 (client defensive): selected_node_id identifies an
+    // inspection node, not a completed answer. If a buggy/old engine ever
+    // sends selected_node_id != nil with final_answer == nil, the turn must
+    // fail rather than persist an empty successful assistant row.
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ToTFrameEngine(frames: [
+      #"{"event":"tree_start","id":"tot-1","model":"qwen","breadth":1,"depth":2,"beam_width":1}"#,
+      #"{"event":"node_complete","node":{"id":"tot-n1","parent_id":"root","depth":1,"branch_index":0,"content":"intermediate path step","score":8,"status":"ok"}}"#,
+      #"{"event":"level_pruned","level":1,"kept":["tot-n1"]}"#,
+      #"{"event":"generation_metrics","output_tokens":84,"elapsed_s":2.0,"tokens_per_sec":42.0}"#,
+      #"{"event":"tree_complete","selected_node_id":"tot-n1","final_answer":null}"#,
+    ])
+    let controller = ChatSendController()
+    controller.sendTreeOfThought(
+      chat: chat,
+      context: context,
+      engine: engine,
+      config: ToTProfileConfig(breadth: 1, depth: 2, beamWidth: 1),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "qwen")
+    )
+    try await waitUntil("tot selected-without-answer stream finishes") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(chat.messages.first { $0.role == "assistant" })
+    XCTAssertTrue(assistant.content.hasPrefix("⚠️"),
+                  "selected_node_id with nil final_answer must not persist a blank successful turn: \(assistant.content.debugDescription)")
+    let tree = try JSONDecoder().decode(ToTTree.self, from: try XCTUnwrap(assistant.tot))
+    guard case .failed = tree.status else {
+      return XCTFail("expected .failed, got \(tree.status)")
+    }
+    XCTAssertEqual(tree.selectedNodeID, "tot-n1")
+    XCTAssertNil(tree.finalAnswer)
+  }
+
   func test_non_tot_profile_does_not_route_to_dispatch() {
     // A profile with no mode key is not a ToT profile, so the routing
     // guard in the view never calls sendTreeOfThought. This documents the

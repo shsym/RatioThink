@@ -2226,6 +2226,10 @@ mod tests {
         assert_eq!(out.selected_node_id.as_deref(), Some("n0"));
         assert_ne!(out.final_answer.as_deref(), Some("intermediate path step"));
         assert!(out.final_answer.is_none());
+        let (code, _) =
+            crate::tot::stream::terminal_error(&out.selected_node_id, &out.final_answer)
+                .expect("selected intermediate without a final answer must be terminal failure");
+        assert_eq!(code, crate::tot::stream::FINAL_ANSWER_UNAVAILABLE_CODE);
     }
 
     #[test]
