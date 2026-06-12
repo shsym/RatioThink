@@ -15,6 +15,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 /// Bounded LRU map: leader (n-gram) -> recency-ordered followers.
 pub struct NgramCache {
     leader_len: usize,
@@ -27,6 +29,22 @@ pub struct NgramCache {
 
 struct LeaderEntry {
     /// Recency-ordered; last element is the most-recent follower.
+    followers: Vec<u32>,
+    last_used: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NgramCacheSnapshot {
+    leader_len: usize,
+    leader_cap: usize,
+    follower_cap: usize,
+    tick: u64,
+    entries: Vec<NgramCacheSnapshotEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct NgramCacheSnapshotEntry {
+    leader: Vec<u32>,
     followers: Vec<u32>,
     last_used: u64,
 }
@@ -48,6 +66,56 @@ impl NgramCache {
     #[allow(clippy::len_without_is_empty)] // cache size, not a collection API
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    pub fn snapshot(&self) -> NgramCacheSnapshot {
+        NgramCacheSnapshot {
+            leader_len: self.leader_len,
+            leader_cap: self.leader_cap,
+            follower_cap: self.follower_cap,
+            tick: self.tick,
+            entries: self
+                .map
+                .iter()
+                .map(|(leader, entry)| NgramCacheSnapshotEntry {
+                    leader: leader.clone(),
+                    followers: entry.followers.clone(),
+                    last_used: entry.last_used,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: NgramCacheSnapshot) -> Self {
+        let mut cache = Self {
+            leader_len: snapshot.leader_len.max(1),
+            leader_cap: snapshot.leader_cap.max(1),
+            follower_cap: snapshot.follower_cap.max(1),
+            map: HashMap::new(),
+            tick: snapshot.tick,
+        };
+        let mut entries = snapshot.entries;
+        entries.sort_by_key(|entry| entry.last_used);
+        for entry in entries {
+            if entry.leader.len() != cache.leader_len {
+                continue;
+            }
+            if cache.map.len() >= cache.leader_cap {
+                cache.evict_lru_leader();
+            }
+            let mut followers = entry.followers;
+            if followers.len() > cache.follower_cap {
+                followers = followers[followers.len() - cache.follower_cap..].to_vec();
+            }
+            cache.map.insert(
+                entry.leader,
+                LeaderEntry {
+                    followers,
+                    last_used: entry.last_used,
+                },
+            );
+        }
+        cache
     }
 
     fn next_tick(&mut self) -> u64 {
@@ -134,6 +202,24 @@ mod tests {
         let mut c = NgramCache::new(1, 16, 8);
         c.record(&[10], 20);
         assert_eq!(c.get(&[99]), None);
+    }
+
+    #[test]
+    fn snapshot_round_trips_cache_contents_and_lru_state() {
+        let mut c = NgramCache::new(2, 3, 2);
+        c.record(&[1, 2], 10);
+        c.record(&[1, 2], 11);
+        c.record(&[2, 3], 12);
+        assert_eq!(c.get(&[1, 2]), Some(11));
+
+        let snapshot = c.snapshot();
+        let mut restored = NgramCache::from_snapshot(snapshot);
+
+        assert_eq!(restored.get(&[1, 2]), Some(11));
+        assert_eq!(restored.followers(&[1, 2]), vec![10, 11]);
+        restored.record(&[3, 4], 13);
+        restored.record(&[4, 5], 14);
+        assert_eq!(restored.get(&[2, 3]), None);
     }
 
     #[test]

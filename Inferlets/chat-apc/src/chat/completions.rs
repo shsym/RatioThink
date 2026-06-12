@@ -60,7 +60,7 @@ use wstd::http::{IntoBody, Request, Response};
 use super::apc::{ReasoningDecoder, ToolUseDecoder};
 use super::generate::{self, DecodeStrategy};
 use super::prefix_cache::{self, CacheDiag, ReusePlan};
-use super::spec::sidecar::{Lineage, SidecarKey, SidecarStatus, SidecarStore};
+use super::spec::sidecar::{encode_sidecar_blob, Lineage, SidecarKey, SidecarStatus, SidecarStore};
 use super::spec::{SpecConfig, SpecMetrics};
 use crate::sse::{self, EmitError, Emitter, SseError};
 
@@ -491,6 +491,12 @@ struct SidecarMetrics {
     ngram_leaders: usize,
     expired: usize,
 >>>>>>> 97eeb55 (Persist Cacheback sidecars per chat thread)
+}
+
+struct SidecarLease {
+    key: SidecarKey,
+    lineage: Lineage,
+    cache: Arc<Mutex<super::spec::cache::NgramCache>>,
 }
 
 #[derive(Serialize)]
@@ -1047,10 +1053,7 @@ fn sidecar_for_request(
     messages: &[ChatMessage],
     spec: Option<&SpecRequest>,
     cfg: &SpecConfig,
-) -> (
-    Option<Arc<Mutex<super::spec::cache::NgramCache>>>,
-    Option<SidecarMetrics>,
-) {
+) -> (Option<SidecarLease>, Option<SidecarMetrics>) {
     let Some(spec) = spec.filter(|s| s.enabled) else {
         return (None, None);
     };
@@ -1071,23 +1074,56 @@ fn sidecar_for_request(
         cfg.draft_len,
     );
     let lineage = lineage_from(messages);
-    let checkout = cacheback_sidecars().lock().unwrap().checkout(
+    let persisted = match inferlet::blob_store::open_blob(&key.blob_name()) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("[chat-apc] cacheback sidecar open failed: {e}");
+            None
+        }
+    };
+    let checkout = cacheback_sidecars().lock().unwrap().checkout_with_persisted(
         monotonic_nanos_since_anchor() / 1_000_000,
-        key,
-        lineage,
+        key.clone(),
+        lineage.clone(),
+        persisted,
     );
     let status = match checkout.status {
         SidecarStatus::Fresh => SidecarMetricStatus::Fresh,
         SidecarStatus::Reused => SidecarMetricStatus::Reused,
     };
+    let cache = checkout.cache;
     (
-        Some(checkout.cache),
+        Some(SidecarLease { key, lineage, cache }),
         Some(SidecarMetrics {
             status,
             ngram_leaders: checkout.ngram_leaders,
             expired: checkout.expired,
         }),
     )
+}
+
+fn persist_sidecar(lease: Option<&SidecarLease>) {
+    let Some(lease) = lease else {
+        return;
+    };
+    let Ok(cache) = lease.cache.lock() else {
+        eprintln!("[chat-apc] cacheback sidecar cache lock poisoned; skipping save");
+        return;
+    };
+    let bytes = match encode_sidecar_blob(&lease.lineage, &cache) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("[chat-apc] cacheback sidecar encode failed: {e}");
+            return;
+        }
+    };
+    let ttl_ms = CACHEBACK_SIDECAR_TTL
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    if let Err(e) = inferlet::blob_store::save_blob(&lease.key.blob_name(), &bytes, ttl_ms) {
+        eprintln!("[chat-apc] cacheback sidecar save failed: {e}");
+    }
 }
 
 #[derive(Serialize)]
@@ -3349,7 +3385,7 @@ async fn handle_streaming(
     }
 
     let spec_enabled = matches!(strategy, DecodeStrategy::Speculative(_));
-    let (sidecar_cache, sidecar_metrics) = match &strategy {
+    let (sidecar_lease, sidecar_metrics) = match &strategy {
         DecodeStrategy::Speculative(cfg) => sidecar_for_request(
             &req.model,
             req.tools.as_deref(),
@@ -3375,7 +3411,7 @@ async fn handle_streaming(
         &stop_tokens,
         strategy,
         &seed_tokens,
-        sidecar_cache,
+        sidecar_lease.as_ref().map(|lease| Arc::clone(&lease.cache)),
     );
     // tool_choice enforcement (from main): constrain to the tool-call
     // grammar when a call is forced. Speculation is gated off in that
@@ -3718,6 +3754,7 @@ async fn handle_streaming(
             }
         }
     }
+    persist_sidecar(sidecar_lease.as_ref());
     // #418: terminal spec_metrics frame (only when the caller opted into
     // the speculation surface, so normal streams are byte-identical).
     if want_metrics {
@@ -4029,7 +4066,7 @@ async fn handle_non_streaming(
     }
 
     let spec_enabled = matches!(strategy, DecodeStrategy::Speculative(_));
-    let (sidecar_cache, sidecar_metrics) = match &strategy {
+    let (sidecar_lease, sidecar_metrics) = match &strategy {
         DecodeStrategy::Speculative(cfg) => sidecar_for_request(
             &req.model,
             req.tools.as_deref(),
@@ -4055,7 +4092,7 @@ async fn handle_non_streaming(
         &stop_tokens,
         strategy,
         &seed_tokens,
-        sidecar_cache,
+        sidecar_lease.as_ref().map(|lease| Arc::clone(&lease.cache)),
     );
     // tool_choice enforcement (from main); spec is gated off when forced,
     // so this only applies to the plain generator.
@@ -4336,6 +4373,7 @@ async fn handle_non_streaming(
                 .collect(),
         )
     };
+    persist_sidecar(sidecar_lease.as_ref());
     // #418: speculation metrics, only when the caller opted into the
     // surface (so normal responses are byte-identical).
     let spec_metrics = if want_metrics {
