@@ -233,12 +233,21 @@ struct ContentToolbar: View {
     .buttonStyle(.plain)
     .help("Sampling parameters")
     .popover(isPresented: $showParamsPopover, arrowEdge: .top) {
-      ParamsPopover(sampling: Binding(
-        get: { viewModel.samplingOverride ?? profileSampling() },
-        set: { viewModel.samplingOverride = $0 }
-      ))
+      ParamsPopover(sampling: viewModel.samplingOverride ?? profileSampling()) { committed, didEdit in
+        viewModel.samplingOverride = Self.samplingOverrideAfterParamsCommit(
+          currentOverride: viewModel.samplingOverride,
+          committed: committed,
+          didEdit: didEdit)
+      }
     }
     .accessibilityIdentifier("toolbar.params")
+  }
+
+  static func samplingOverrideAfterParamsCommit(currentOverride: ChatSampling?,
+                                                committed: ChatSampling,
+                                                didEdit: Bool) -> ChatSampling? {
+    guard didEdit else { return currentOverride }
+    return committed
   }
 
   private var attachButton: some View {
@@ -277,9 +286,14 @@ struct ContentToolbar: View {
 /// ticks and the removed Max-tokens row — can be rendered to a PNG via
 /// `ImageRenderer` in a snapshot test (`SamplingAndIndicatorSnapshotTests`).
 struct ParamsPopover: View {
-  @Binding var sampling: ChatSampling
+  let sampling: ChatSampling
+  let onCommit: (ChatSampling, Bool) -> Void
   @State private var temperature: Double
   @State private var topP: Double
+  /// Distinguishes an actual slider edit from merely inspecting the popover.
+  /// Without this, dismissal writes the displayed profile defaults back through
+  /// the toolbar and creates a stale explicit override.
+  @State private var hasUncommittedEdits = false
   /// Latches once `commit()` runs so the dismissal flush on
   /// `.onDisappear` does not re-fire after an explicit Apply click.
   /// Today `commit()` is pure value-assignment, but Phase 6 wiring
@@ -293,10 +307,12 @@ struct ParamsPopover: View {
   /// dismissal. Review v4 F1.
   @State private var didCommit = false
 
-  init(sampling: Binding<ChatSampling>) {
-    self._sampling = sampling
-    _temperature = State(initialValue: sampling.wrappedValue.temperature)
-    _topP = State(initialValue: sampling.wrappedValue.topP)
+  init(sampling: ChatSampling,
+       onCommit: @escaping (ChatSampling, Bool) -> Void = { _, _ in }) {
+    self.sampling = sampling
+    self.onCommit = onCommit
+    _temperature = State(initialValue: sampling.temperature)
+    _topP = State(initialValue: sampling.topP)
   }
 
   var body: some View {
@@ -322,11 +338,18 @@ struct ParamsPopover: View {
     .frame(width: 280)
     // Any post-Apply slider edit re-arms the dismissal flush so an
     // Apply-then-edit-then-Esc sequence does not silently drop the
-    // second edit. Review v4 F1. `commit()` writes to `sampling` only
-    // (not the local @State values), so these `onChange` handlers are
-    // not retriggered by `commit()` itself — no feedback loop.
-    .onChange(of: temperature) { _, _ in didCommit = false }
-    .onChange(of: topP)        { _, _ in didCommit = false }
+    // second edit. Review v4 F1. `commit()` sends the buffered value through
+    // `onCommit` only (not back into the local @State values), so these
+    // `onChange` handlers are not retriggered by `commit()` itself — no
+    // feedback loop.
+    .onChange(of: temperature) { _, _ in
+      hasUncommittedEdits = true
+      didCommit = false
+    }
+    .onChange(of: topP) { _, _ in
+      hasUncommittedEdits = true
+      didCommit = false
+    }
     // macOS popover dismissal (click-outside, Esc) is treated as
     // accept — flush the local buffer so silent edit loss is not a
     // thing. Review v1 F4. Latch prevents double-commit when Apply
@@ -366,11 +389,12 @@ struct ParamsPopover: View {
     // engine-launch concern (#438), not a per-chat knob. Preserve the
     // existing max_tokens (profile default) so dropping the control never
     // silently resets it.
-    sampling = ChatSampling(
+    onCommit(ChatSampling(
       temperature: temperature,
       topP: topP,
       maxTokens: sampling.maxTokens
-    )
+    ), hasUncommittedEdits)
+    hasUncommittedEdits = false
     didCommit = true
   }
 }

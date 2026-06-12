@@ -27,9 +27,9 @@ final class SamplingAndIndicatorSnapshotTests: XCTestCase {
   }
 
   func test_render_sampling_popover() throws {
-    let view = ParamsPopover(sampling: .constant(
-      ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 2048)
-    ))
+    let view = ParamsPopover(
+      sampling: ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 2048)
+    )
     try render(view, name: "sampling-popover")
   }
 

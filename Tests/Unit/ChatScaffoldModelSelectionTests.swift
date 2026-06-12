@@ -133,6 +133,80 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     }
   }
 
+  func test_noop_params_popover_close_preserves_profile_sampling_source_for_open_chat() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(
+        into: dir,
+        id: "chat",
+        temperature: 0.4,
+        topP: 0.75,
+        maxTokens: 1536)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      let viewModel = ChatTranscriptViewModel(selectedProfileID: "chat")
+      let displayedSampling = ChatScaffoldView.resolvedSampling(
+        profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+        transientOverride: viewModel.samplingOverride)
+
+      viewModel.samplingOverride = ContentToolbar.samplingOverrideAfterParamsCommit(
+        currentOverride: viewModel.samplingOverride,
+        committed: displayedSampling,
+        didEdit: false)
+
+      XCTAssertNil(
+        viewModel.samplingOverride,
+        "opening and closing the params popover without slider edits must not create a stale explicit override")
+
+      try store.setEditableDefaults(
+        systemPrompt: "prompt",
+        temperature: 0.2,
+        topP: 0.95,
+        forProfileID: "chat")
+
+      XCTAssertEqual(
+        ChatScaffoldView.resolvedSampling(
+          profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+          transientOverride: viewModel.samplingOverride),
+        ChatSampling(temperature: 0.2, topP: 0.95, maxTokens: 1536),
+        "after a no-op params inspection, the next send should still use the latest Settings-saved profile defaults")
+    }
+  }
+
+  func test_dirty_params_popover_commit_creates_override_that_wins_over_later_profile_edits() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(
+        into: dir,
+        id: "chat",
+        temperature: 0.4,
+        topP: 0.75,
+        maxTokens: 1536)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      let viewModel = ChatTranscriptViewModel(selectedProfileID: "chat")
+      let editedSampling = ChatSampling(temperature: 1.3, topP: 0.55, maxTokens: 1536)
+
+      viewModel.samplingOverride = ContentToolbar.samplingOverrideAfterParamsCommit(
+        currentOverride: viewModel.samplingOverride,
+        committed: editedSampling,
+        didEdit: true)
+
+      try store.setEditableDefaults(
+        systemPrompt: "prompt",
+        temperature: 0.2,
+        topP: 0.95,
+        forProfileID: "chat")
+
+      XCTAssertEqual(
+        ChatScaffoldView.resolvedSampling(
+          profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+          transientOverride: viewModel.samplingOverride),
+        editedSampling,
+        "a dirty params popover commit is an explicit toolbar override until cleared")
+    }
+  }
+
   func test_chat_gui_override_still_points_at_small_model_harness() {
     XCTAssertEqual(
       ChatScaffoldView.requestModelID(
