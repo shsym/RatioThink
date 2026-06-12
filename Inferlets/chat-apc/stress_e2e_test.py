@@ -622,6 +622,22 @@ async def section_toolcall_parse(base: str, http: httpx.AsyncClient, rep: Report
             {"id": "call_x", "type": "function", "function": {"name": "calculator"}},
             "messages[0].tool_calls[0].function.arguments",
         ),
+        (
+            {"id": 123, "type": "function", "function": {"name": "calculator", "arguments": "{}"}},
+            "messages[0].tool_calls[0].id",
+        ),
+        (
+            {"id": "call_x", "type": 7, "function": {"name": "calculator", "arguments": "{}"}},
+            "messages[0].tool_calls[0].type",
+        ),
+        (
+            {"id": "call_x", "type": "function", "function": []},
+            "messages[0].tool_calls[0].function",
+        ),
+        (
+            {"id": "call_x", "type": "function", "function": {"name": {}, "arguments": "{}"}},
+            "messages[0].tool_calls[0].function.name",
+        ),
     ]
     for tool_call, param in malformed_tool_calls:
         r = await http.post(f"{base}/v1/chat/completions", json={
@@ -657,6 +673,52 @@ async def section_toolcall_parse(base: str, http: httpx.AsyncClient, rep: Report
     )
     rep.ok(ok, f"{P}: out-of-order tool results -> {r.status_code} {r.text[:160]!r} "
                "(want 400 invalid_tool_order param=messages[1].tool_call_id)")
+
+    r = await http.post(f"{base}/v1/inferlet", json={
+        "inferlet": "tree-of-thought",
+        "stream": False,
+        "input": {
+            "model": MODEL,
+            "messages": [{"role": "assistant", "content": None, "tool_calls": [
+                {"id": 123, "type": "function", "function": {"name": "calculator", "arguments": "{}"}}
+            ]}],
+            "breadth": 1,
+            "depth": 1,
+            "beam_width": 1,
+            "max_tokens_per_node": 1,
+        },
+    })
+    err = r.json().get("error", {}) if r.status_code == 400 else {}
+    ok = (
+        r.status_code == 400
+        and err.get("code") == "malformed_tool_calls"
+        and err.get("param") == "messages[0].tool_calls[0].id"
+    )
+    rep.ok(ok, f"{P}: ToT malformed assistant tool_call -> {r.status_code} {r.text[:160]!r} "
+               "(want 400 malformed_tool_calls param=messages[0].tool_calls[0].id)")
+
+    r = await http.post(f"{base}/v1/inferlet", json={
+        "inferlet": "tree-of-thought",
+        "stream": False,
+        "input": {
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi", "tool_calls": [
+                {"id": "call_x", "type": "function", "function": {"name": "calculator", "arguments": "{}"}}
+            ]}],
+            "breadth": 1,
+            "depth": 1,
+            "beam_width": 1,
+            "max_tokens_per_node": 1,
+        },
+    })
+    err = r.json().get("error", {}) if r.status_code == 400 else {}
+    ok = (
+        r.status_code == 400
+        and err.get("code") == "malformed_tool_calls"
+        and err.get("param") == "messages[0].tool_calls"
+    )
+    rep.ok(ok, f"{P}: ToT user tool_calls rejected at boundary -> {r.status_code} {r.text[:160]!r} "
+               "(want 400 malformed_tool_calls param=messages[0].tool_calls)")
 
     # tool_choice forcing a call but the named function is absent -> 400.
     r = await http.post(f"{base}/v1/chat/completions", json={
