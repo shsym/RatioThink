@@ -56,6 +56,7 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
     defer {
       // Close Settings before quit so macOS captures no Settings window in
       // restoration state for the next test (S5 convention).
+      app.activate()
       app.typeKey("w", modifierFlags: .command)
       app.terminate()
     }
@@ -69,6 +70,13 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
     // is unambiguously the deep link's doing, not launch-time restoration.
     let settings = app.windows.matching(identifier: Self.settingsWindowID).firstMatch
     XCTAssertFalse(settings.exists, "a Settings window was already open before the deep link")
+
+    // Start delivery from a backgrounded Rational.app. Without this
+    // precondition the final foreground assertion would be a silent
+    // false-positive: the test itself foregrounds Rational above so the
+    // assertion would pass even if SettingsURLHandler stopped calling
+    // NSApp.activate() for user-initiated helper/menu-bar deep links.
+    backgroundRationalBeforeDeepLink(app)
 
     // Deliver the deep link exactly as the menu-bar Helper does: to the
     // running app-under-test's own bundle, so LaunchServices can't route it to
@@ -105,6 +113,29 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
     XCTAssertTrue(
       app.wait(for: .runningForeground, timeout: 5),
       "deep link did not foreground the app; final state=\(app.state)")
+  }
+
+  /// Move focus away from Rational before URL delivery so the post-delivery
+  /// `.runningForeground` wait proves the deep-link handler foregrounded the
+  /// app instead of inheriting a foreground state created by the test setup.
+  @MainActor
+  private func backgroundRationalBeforeDeepLink(
+    _ app: XCUIApplication,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    XCUIApplication(bundleIdentifier: "com.apple.finder").activate()
+    let deadline = Date().addingTimeInterval(5)
+    while app.state == .runningForeground, Date() < deadline {
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+    }
+
+    XCTAssertEqual(
+      app.state,
+      .runningBackground,
+      "Rational must be backgrounded before deep-link delivery",
+      file: file,
+      line: line)
   }
 
   /// The bundle URL of the running app under test. The deep link is delivered
