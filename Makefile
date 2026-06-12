@@ -69,7 +69,7 @@ endef
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-menubar-icon-template \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
-        test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-e2e-harsh-load test-e2e-cache-real \
+        test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-apc-bench-selftest test-e2e-harsh-load test-e2e-cache-real bench-apc-real \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
         build-inferlets stamp-inferlets verify-inferlets verify-inferlets-inputs \
@@ -425,6 +425,9 @@ test-harsh-load-selftest: ## Engine-free guard for the harsh-load generation ass
 	uv run --project Vendor/pie/client/python --with httpx \
 	  python Inferlets/chat-apc/harsh_load_real.py --self-test
 
+test-apc-bench-selftest: ## Engine-free unit guard for the APC real-continuation benchmark parser/report helpers. Deterministic, CI-safe.
+	python3 Inferlets/chat-apc/apc_bench_real_test.py
+
 test-matrix-aggregator: ## Engine-free guard for the #473 matrix verdict aggregator (review F1 fail-closed): an all-PASS cell log + non-zero swift-test exit must record FAIL, not a hollow PASS. Deterministic, CI-safe.
 	Scripts/test-matrix-aggregator.sh
 
@@ -442,6 +445,18 @@ test-e2e-cache-real: $(LOGDIR) ## REAL-engine APC prefix-cache smoke (#529): act
 	  Scripts/run-cache-smoke-real-e2e.sh 2>&1 | tee $$LOG | tail -60; \
 	  status=$${PIPESTATUS[0]}; \
 	  echo "log: $$LOG"; \
+	  exit $$status
+
+bench-apc-real: $(LOGDIR) ## BENCHMARK: real-engine APC cold/miss vs warm/hit chat continuations; writes JSON+Markdown artifacts. Operator-gated, NOT CI; needs real weights.
+	@set +e +o pipefail; \
+	  OUT=$(LOGDIR)/apc-bench-$$(date +%Y%m%d-%H%M%S).json; \
+	  LOG=$${OUT%.json}.log; \
+	  uv run --project Vendor/pie/client/python --with httpx \
+	    python Inferlets/chat-apc/apc_bench_real.py --output $$OUT 2>&1 | tee $$LOG | tail -80; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  [ -f "$$OUT" ] && echo "artifact: $$OUT"; \
+	  [ -f "$${OUT%.json}.md" ] && echo "summary: $${OUT%.json}.md"; \
 	  exit $$status
 
 test-gui-script: ## Fast preflight regressions for GUI/E2E wrapper scripts
