@@ -197,6 +197,10 @@ pub struct Candidate {
     pub id: String,
     pub score: Option<u8>,
     pub ok: bool,
+    /// Search depth at which this candidate was generated. The final-answer
+    /// fallback uses this to avoid exposing an intermediate path step as the
+    /// terminal `final_answer` when the final depth failed.
+    pub depth: usize,
     /// The candidate's generated answer, used by [`select_beam_diverse`]
     /// for near-duplicate detection. Empty for non-`ok` candidates (no
     /// answer to compare) and in tests that only exercise score selection.
@@ -318,6 +322,7 @@ mod tests {
             id: id.to_string(),
             score,
             ok,
+            depth: 1,
             content: String::new(),
         }
     }
@@ -327,6 +332,7 @@ mod tests {
             id: id.to_string(),
             score,
             ok: true,
+            depth: 1,
             content: content.to_string(),
         }
     }

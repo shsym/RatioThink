@@ -719,7 +719,7 @@ pub async fn run(
     let best = best_leaf(&last_level)
         .and_then(|id| flat.iter().find(|n| n.id == id))
         .map(|n| (n.content.clone(), n.reasoning.clone()));
-    let mut outcome = finalize(flat, &last_level);
+    let mut outcome = finalize(flat, &last_level, params.depth);
     // Attempt synthesis only when an ok leaf exists AND its grounding fork
     // survived; on any skip/failure emit a one-shot host diagnostic with the
     // reason so a dead synthesizer is visible in production (#523 Part A F1),
@@ -803,6 +803,7 @@ fn materialize_level(level: usize, branches: Vec<Branch>, beam_width: usize) -> 
             id: b.id.clone(),
             score: b.outcome.score,
             ok: is_ok,
+            depth: level,
             content: b.outcome.content.clone(),
         });
         nodes.push(Node {
@@ -850,21 +851,29 @@ fn fold_level(
 
 /// Assemble the final [`SearchOutcome`] from the flat node list and the
 /// deepest surviving level's candidates. The best **ok** leaf (errors
-/// excluded, `None` scores last, stable on ties) is the selected node +
-/// final answer; both honestly null out when no ok leaf exists. Pure →
-/// unit-tested.
-fn finalize(flat: Vec<Node>, last_level: &[Candidate]) -> SearchOutcome {
+/// excluded, `None` scores last, stable on ties) is still selected, but its
+/// raw content is only exposed as `final_answer` when it was generated at the
+/// final-answer depth. If F7 retained an intermediate path step after a later
+/// full failure, synthesis may still replace it later; without synthesis the
+/// terminal `final_answer` stays null rather than presenting an intermediate
+/// step as a direct answer. Pure → unit-tested.
+fn finalize(flat: Vec<Node>, last_level: &[Candidate], final_answer_depth: usize) -> SearchOutcome {
     let best = best_leaf(last_level);
-    let final_answer = best
-        .as_ref()
-        .and_then(|id| flat.iter().find(|n| &n.id == id).map(|n| n.content.clone()));
+    let final_answer = best.as_ref().and_then(|id| {
+        let candidate = last_level.iter().find(|c| &c.id == id)?;
+        if candidate.depth < final_answer_depth {
+            return None;
+        }
+        flat.iter().find(|n| &n.id == id).map(|n| n.content.clone())
+    });
     let root = assemble(&flat, "root");
     SearchOutcome {
         root,
         selected_node_id: best,
         final_answer,
-        // finalize() sets the raw best-leaf answer; `run` flips this true only
-        // when the post-search synthesis replaces it (#523 Part A F1).
+        // finalize() sets a raw best-leaf answer only for final-depth leaves;
+        // `run` flips this true only when post-search synthesis replaces it
+        // (#523 Part A F1, review v3 F1).
         synthesized: false,
         // Filled by `run`, which owns the engine-bound token accounting.
         total_generated_tokens: 0,
@@ -1385,6 +1394,7 @@ mod tests {
             id: id.to_string(),
             score,
             ok,
+            depth: 1,
             content: String::new(),
         }
     }
@@ -2152,7 +2162,7 @@ mod tests {
             ok_leaf("b", "answer-b", Some(9)),
         ];
         let last = vec![cand("a", Some(3), true), cand("b", Some(9), true)];
-        let out = finalize(flat, &last);
+        let out = finalize(flat, &last, 1);
         assert_eq!(out.selected_node_id.as_deref(), Some("b"));
         assert_eq!(out.final_answer.as_deref(), Some("answer-b"));
     }
@@ -2161,25 +2171,69 @@ mod tests {
     fn finalize_all_error_last_level_nulls_answer() {
         let flat = vec![Node::root()];
         let last = vec![cand("e0", None, false), cand("e1", Some(8), false)];
-        let out = finalize(flat, &last);
+        let out = finalize(flat, &last, 1);
         assert!(out.selected_node_id.is_none());
         assert!(out.final_answer.is_none());
     }
 
     #[test]
     fn finalize_empty_last_level_nulls_answer() {
-        let out = finalize(vec![Node::root()], &[]);
+        let out = finalize(vec![Node::root()], &[], 1);
         assert!(out.selected_node_id.is_none());
         assert!(out.final_answer.is_none());
     }
 
     #[test]
-    fn f7_late_full_failure_keeps_earlier_level_answer() {
-        // End-to-end F7 regression: level 1 produces an ok leaf; level 2
-        // fully fails (every fork dies → `run` pushes error_leaf nodes and
-        // materialize sees no successful branch). The fold keeps level 1 as
-        // the pool, so the final answer is level 1's best — not null, even
-        // though the deepest *attempted* level had no leaf.
+    fn f7_late_full_failure_does_not_expose_intermediate_step_when_synthesis_missing() {
+        // Review v3 F1: with #555 path-advancing prompts, a retained
+        // non-final level is only an intermediate path step. If the final
+        // depth fully fails and synthesis returns None/skips, the terminal
+        // response must not present that path step as a successful final
+        // answer.
+        let mut flat = vec![Node::root()];
+        let LevelMaterialized {
+            nodes,
+            candidates,
+            keep,
+            generated_tokens: _,
+        } = materialize_level(
+            1,
+            vec![branch(
+                "n0",
+                "root",
+                0,
+                ok_outcome("intermediate path step", Some(6)),
+            )],
+            2,
+        );
+        flat.extend(nodes);
+        let (pool1, stop1) = fold_level(Vec::new(), candidates, &keep);
+        assert!(!stop1);
+
+        flat.push(error_leaf("n0", 2, 0, "fork failed: gone".to_string()));
+        let LevelMaterialized {
+            nodes,
+            candidates,
+            keep,
+            generated_tokens: _,
+        } = materialize_level(2, vec![], 2);
+        flat.extend(nodes);
+        let (pool2, stop2) = fold_level(pool1, candidates, &keep);
+        assert!(stop2);
+
+        let mut out = finalize(flat, &pool2, 2);
+        reconcile_synthesis(&mut out, None);
+        assert_eq!(out.selected_node_id.as_deref(), Some("n0"));
+        assert_ne!(out.final_answer.as_deref(), Some("intermediate path step"));
+        assert!(out.final_answer.is_none());
+    }
+
+    #[test]
+    fn final_depth_leaf_can_still_be_raw_fallback_answer() {
+        // The review v3 guard above covers depth=2 where a retained level-1
+        // node is intermediate and must not be exposed as final_answer without
+        // synthesis. This keeps the original raw fallback invariant for a
+        // selected node that is already final-answer-eligible.
         let mut flat = vec![Node::root()];
 
         let LevelMaterialized {
@@ -2210,7 +2264,7 @@ mod tests {
         let (pool2, stop2) = fold_level(pool1, candidates, &keep);
         assert!(stop2);
 
-        let out = finalize(flat, &pool2);
+        let out = finalize(flat, &pool2, 1);
         assert_eq!(out.selected_node_id.as_deref(), Some("n0"));
         assert_eq!(out.final_answer.as_deref(), Some("L1-best"));
     }
@@ -2226,6 +2280,7 @@ mod tests {
         let mut out = finalize(
             vec![Node::root(), ok_leaf("a", "raw-best-leaf", Some(9))],
             &[cand("a", Some(9), true)],
+            1,
         );
         assert_eq!(out.final_answer.as_deref(), Some("raw-best-leaf"));
         assert!(!out.synthesized);
@@ -2246,6 +2301,7 @@ mod tests {
         let mut out = finalize(
             vec![Node::root(), ok_leaf("a", "raw-best-leaf", Some(9))],
             &[cand("a", Some(9), true)],
+            1,
         );
         reconcile_synthesis(&mut out, None);
         assert_eq!(out.final_answer.as_deref(), Some("raw-best-leaf"));
@@ -2256,7 +2312,7 @@ mod tests {
     fn reconcile_synthesis_none_keeps_honest_null_when_no_leaf() {
         // No ok leaf → finalize() honestly nulled final_answer; a skipped
         // synthesis leaves it null (and unsynthesized).
-        let mut out = finalize(vec![Node::root()], &[]);
+        let mut out = finalize(vec![Node::root()], &[], 1);
         assert!(out.final_answer.is_none());
         reconcile_synthesis(&mut out, None);
         assert!(out.final_answer.is_none());
