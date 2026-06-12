@@ -653,6 +653,49 @@ async def section_toolcall_parse(base: str, http: httpx.AsyncClient, rep: Report
         )
         rep.ok(ok, f"{P}: malformed tool_call param={param} -> {r.status_code} {r.text[:160]!r}")
 
+    malformed_continuation_fields = [
+        (
+            [{"role": "user", "content": "hi", "tool_call_id": "call_x"}],
+            "messages[0].tool_call_id",
+        ),
+        (
+            [{"role": "assistant", "content": "hi", "tool_call_id": "call_x"}],
+            "messages[0].tool_call_id",
+        ),
+        (
+            [{"role": "future", "content": "hi", "tool_calls": [
+                {"id": "call_x", "type": "function", "function": {"name": "calculator", "arguments": "{}"}}
+            ]}],
+            "messages[0].tool_calls",
+        ),
+        (
+            [{"role": "user", "content": "hi", "tool_call_id": 123}],
+            "messages[0].tool_call_id",
+        ),
+        (
+            [{"role": "assistant", "content": None, "tool_calls": {}}],
+            "messages[0].tool_calls",
+        ),
+        (
+            [{"role": "assistant", "content": None, "tool_calls": [None]}],
+            "messages[0].tool_calls",
+        ),
+    ]
+    for messages, param in malformed_continuation_fields:
+        r = await http.post(f"{base}/v1/chat/completions", json={
+            "model": MODEL,
+            "messages": messages,
+            "stream": False,
+        })
+        err = r.json().get("error", {}) if r.status_code == 400 else {}
+        ok = (
+            r.status_code == 400
+            and err.get("code") == "malformed_tool_calls"
+            and err.get("param") == param
+        )
+        rep.ok(ok, f"{P}: malformed continuation field param={param} -> "
+                   f"{r.status_code} {r.text[:160]!r}")
+
     r = await http.post(f"{base}/v1/chat/completions", json={
         "model": MODEL,
         "messages": [
@@ -719,6 +762,41 @@ async def section_toolcall_parse(base: str, http: httpx.AsyncClient, rep: Report
     )
     rep.ok(ok, f"{P}: ToT user tool_calls rejected at boundary -> {r.status_code} {r.text[:160]!r} "
                "(want 400 malformed_tool_calls param=messages[0].tool_calls)")
+
+    for messages, param in [
+        (
+            [{"role": "user", "content": "hi", "tool_call_id": 123}],
+            "messages[0].tool_call_id",
+        ),
+        (
+            [{"role": "assistant", "content": None, "tool_calls": {}}],
+            "messages[0].tool_calls",
+        ),
+        (
+            [{"role": "assistant", "content": None, "tool_calls": [None]}],
+            "messages[0].tool_calls",
+        ),
+    ]:
+        r = await http.post(f"{base}/v1/inferlet", json={
+            "inferlet": "tree-of-thought",
+            "stream": False,
+            "input": {
+                "model": MODEL,
+                "messages": messages,
+                "breadth": 1,
+                "depth": 1,
+                "beam_width": 1,
+                "max_tokens_per_node": 1,
+            },
+        })
+        err = r.json().get("error", {}) if r.status_code == 400 else {}
+        ok = (
+            r.status_code == 400
+            and err.get("code") == "malformed_tool_calls"
+            and err.get("param") == param
+        )
+        rep.ok(ok, f"{P}: ToT malformed continuation container param={param} -> "
+                   f"{r.status_code} {r.text[:160]!r}")
 
     # tool_choice forcing a call but the named function is absent -> 400.
     r = await http.post(f"{base}/v1/chat/completions", json={

@@ -215,9 +215,9 @@ pub struct ChatMessage {
     #[serde(default)]
     pub content: Option<serde_json::Value>,
     #[serde(default)]
-    pub tool_call_id: Option<String>,
+    pub tool_call_id: Option<serde_json::Value>,
     #[serde(default)]
-    pub tool_calls: Option<Vec<RequestToolCall>>,
+    pub tool_calls: Option<serde_json::Value>,
 }
 
 impl ChatMessage {
@@ -226,19 +226,11 @@ impl ChatMessage {
     }
 
     pub(crate) fn has_tool_calls(&self) -> bool {
-        self.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty())
+        tool_calls_array(self).is_some_and(|calls| !calls.is_empty())
     }
 }
 
-#[derive(Deserialize, Serialize, Clone)]
-pub struct RequestToolCall {
-    #[serde(default)]
-    pub id: Option<serde_json::Value>,
-    #[serde(rename = "type", default)]
-    pub kind: Option<serde_json::Value>,
-    #[serde(default)]
-    pub function: Option<serde_json::Value>,
-}
+pub type RequestToolCall = serde_json::Value;
 
 /// OpenAI tool entry. Only `function`-type tools are recognized; the
 /// `type` discriminator is parsed but other variants are ignored at
@@ -1867,6 +1859,21 @@ pub(crate) fn validate_messages(messages: &[ChatMessage]) -> Result<(), MessageV
     let mut pending_tool_call_ids = VecDeque::<String>::new();
 
     for (i, msg) in messages.iter().enumerate() {
+        if msg.role != "assistant" && msg.tool_calls.is_some() {
+            return Err(MessageValidationError::new(
+                "malformed_tool_calls",
+                "tool_calls are only valid on assistant messages",
+                format!("messages[{i}].tool_calls"),
+            ));
+        }
+        if msg.role != "tool" && msg.tool_call_id.is_some() {
+            return Err(MessageValidationError::new(
+                "malformed_tool_calls",
+                "tool_call_id is only valid on tool messages",
+                format!("messages[{i}].tool_call_id"),
+            ));
+        }
+
         match msg.role.as_str() {
             "system" | "user" => {
                 if !pending_tool_call_ids.is_empty() {
@@ -1877,13 +1884,6 @@ pub(crate) fn validate_messages(messages: &[ChatMessage]) -> Result<(), MessageV
                     ));
                 }
                 validate_text_content(msg, i, false)?;
-                if msg.has_tool_calls() {
-                    return Err(MessageValidationError::new(
-                        "malformed_tool_calls",
-                        "tool_calls are only valid on assistant messages",
-                        format!("messages[{i}].tool_calls"),
-                    ));
-                }
             }
             "assistant" => {
                 if !pending_tool_call_ids.is_empty() {
@@ -1893,8 +1893,9 @@ pub(crate) fn validate_messages(messages: &[ChatMessage]) -> Result<(), MessageV
                         format!("messages[{i}].role"),
                     ));
                 }
-                validate_text_content(msg, i, msg.has_tool_calls())?;
-                if let Some(calls) = msg.tool_calls.as_ref() {
+                let calls = validate_tool_calls_container(msg, i)?;
+                validate_text_content(msg, i, calls.is_some_and(|calls| !calls.is_empty()))?;
+                if let Some(calls) = calls {
                     for (j, call) in calls.iter().enumerate() {
                         validate_tool_call(call, i, j)?;
                         let id = tool_call_id(call).expect("validated tool call id");
@@ -1914,20 +1915,7 @@ pub(crate) fn validate_messages(messages: &[ChatMessage]) -> Result<(), MessageV
             }
             "tool" => {
                 validate_text_content(msg, i, false)?;
-                let Some(tool_call_id) = msg.tool_call_id.as_deref() else {
-                    return Err(MessageValidationError::new(
-                        "missing_tool_call_id",
-                        "tool messages must include tool_call_id",
-                        format!("messages[{i}].tool_call_id"),
-                    ));
-                };
-                if tool_call_id.trim().is_empty() {
-                    return Err(MessageValidationError::new(
-                        "missing_tool_call_id",
-                        "tool messages must include a non-empty tool_call_id",
-                        format!("messages[{i}].tool_call_id"),
-                    ));
-                }
+                let tool_call_id = validate_tool_call_id(msg, i)?;
                 if !known_tool_names.contains_key(tool_call_id) {
                     return Err(MessageValidationError::new(
                         "unknown_tool_call_id",
@@ -2015,18 +2003,71 @@ fn validate_text_content(
     Ok(())
 }
 
+fn tool_calls_array(msg: &ChatMessage) -> Option<&[RequestToolCall]> {
+    msg.tool_calls.as_ref()?.as_array().map(Vec::as_slice)
+}
+
+fn validate_tool_calls_container(
+    msg: &ChatMessage,
+    i: usize,
+) -> Result<Option<&[RequestToolCall]>, MessageValidationError> {
+    let Some(value) = msg.tool_calls.as_ref() else {
+        return Ok(None);
+    };
+    let Some(calls) = value.as_array() else {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls must be a list of objects",
+            format!("messages[{i}].tool_calls"),
+        ));
+    };
+    if calls.iter().any(|call| !call.is_object()) {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls must be a list of objects",
+            format!("messages[{i}].tool_calls"),
+        ));
+    }
+    Ok(Some(calls))
+}
+
+fn validate_tool_call_id(msg: &ChatMessage, i: usize) -> Result<&str, MessageValidationError> {
+    let Some(value) = msg.tool_call_id.as_ref() else {
+        return Err(MessageValidationError::new(
+            "missing_tool_call_id",
+            "tool messages must include tool_call_id",
+            format!("messages[{i}].tool_call_id"),
+        ));
+    };
+    let Some(tool_call_id) = value.as_str() else {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "tool_call_id must be a string",
+            format!("messages[{i}].tool_call_id"),
+        ));
+    };
+    if tool_call_id.trim().is_empty() {
+        return Err(MessageValidationError::new(
+            "missing_tool_call_id",
+            "tool messages must include a non-empty tool_call_id",
+            format!("messages[{i}].tool_call_id"),
+        ));
+    }
+    Ok(tool_call_id)
+}
+
 fn tool_call_id(call: &RequestToolCall) -> Option<&str> {
-    call.id.as_ref()?.as_str()
+    call.as_object()?.get("id")?.as_str()
 }
 
 fn tool_call_kind(call: &RequestToolCall) -> Option<&str> {
-    call.kind.as_ref()?.as_str()
+    call.as_object()?.get("type")?.as_str()
 }
 
 fn tool_call_function_object(
     call: &RequestToolCall,
 ) -> Option<&serde_json::Map<String, serde_json::Value>> {
-    call.function.as_ref()?.as_object()
+    call.as_object()?.get("function")?.as_object()
 }
 
 fn tool_call_function_name(call: &RequestToolCall) -> Option<&str> {
@@ -3226,7 +3267,7 @@ pub(crate) fn fill_context(
             "assistant" => {
                 let content = assistant_replay_content(msg);
                 ctx.assistant(&content);
-                if let Some(calls) = msg.tool_calls.as_ref() {
+                if let Some(calls) = tool_calls_array(msg) {
                     for call in calls {
                         let id = tool_call_id(call).expect("validated tool call id");
                         let name = tool_call_function_name(call)
@@ -3238,7 +3279,8 @@ pub(crate) fn fill_context(
             "tool" => {
                 let tool_call_id = msg
                     .tool_call_id
-                    .as_deref()
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| ("invalid_tool_history", "tool message missing tool_call_id".to_string()))?;
                 let name = tool_names_by_id.get(tool_call_id).ok_or_else(|| {
                     (
@@ -3268,7 +3310,7 @@ pub(crate) fn fill_context(
 
 fn assistant_replay_content(msg: &ChatMessage) -> String {
     let content = msg.content_str().unwrap_or("");
-    match msg.tool_calls.as_deref() {
+    match tool_calls_array(msg) {
         Some(calls) if !calls.is_empty() => {
             let rendered = render_assistant_tool_calls(calls);
             if content.is_empty() {
@@ -3313,7 +3355,7 @@ where
     F: Fn(&str) -> Option<(String, String)>,
 {
     for (i, msg) in messages.iter().enumerate() {
-        let Some(calls) = msg.tool_calls.as_deref() else {
+        let Some(calls) = tool_calls_array(msg) else {
             continue;
         };
         for call in calls {
@@ -3751,6 +3793,50 @@ mod tests {
                 "messages[0].tool_calls[0].function.name",
             ),
             (
+                r#"{"model":"m","messages":[{
+                    "role":"user","content":"hi","tool_call_id":"call_x"
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_call_id",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":"hi","tool_call_id":"call_x"
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_call_id",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"future","content":"hi","tool_calls":[
+                        {"id":"call_x","type":"function","function":{"name":"calculator","arguments":"{}"}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"user","content":"hi","tool_call_id":123
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_call_id",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":{}
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[null]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls",
+            ),
+            (
                 r#"{"model":"m","messages":[
                     {"role":"assistant","content":null,"tool_calls":[
                         {"id":"call_x","type":"function","function":{"name":"calculator","arguments":"{}"}}
@@ -3840,7 +3926,7 @@ mod tests {
                 }]
             }"#,
         );
-        let rendered = render_assistant_tool_calls(messages[0].tool_calls.as_deref().unwrap());
+        let rendered = render_assistant_tool_calls(tool_calls_array(&messages[0]).unwrap());
 
         assert!(rendered.contains("<tool_call>"), "{rendered}");
         assert!(rendered.contains("</tool_call>"), "{rendered}");
