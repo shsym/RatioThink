@@ -15,10 +15,10 @@ import Darwin
 ///      hand it to pie before pie itself binds.
 ///   2. Spawn `pie serve --no-auth --debug --config <tmp/config.toml>`
 ///      with `PIE_HOME=<tmp>` + `PIE_SHMEM_NAME=/pie_t_<pid>_<uuid8>`.
-///   3. Parse the engine's stdout for
-///        `pie-server serving on <host>:<port>`
-///        `internal token: <token>`
-///      Both must appear within `handshakeTimeout`.
+///   3. Parse the engine's stdout for a WS host/port handshake line
+///      (`pie-server serving on <host>:<port>` or the newer
+///      `Server ready at ws://<host>:<port>`) plus
+///      `internal token: <token>`.
 ///   4. Open a WebSocket to `ws://<host>:<port>`, auth_by_token,
 ///      install_program(wasm, manifest, force=true), launch_daemon
 ///      ("chat-apc@0.1.0", <free port>).
@@ -764,6 +764,37 @@ public enum PieControlLauncher {
     let address: String
     let token: String
   }
+
+  struct HandshakeState {
+    var address: String?
+    var token: String?
+  }
+
+  private static let legacyServingRegex = try! NSRegularExpression(pattern: #"pie-server serving on (\S+:\d+)"#)
+  private static let serverReadyWSRegex = try! NSRegularExpression(pattern: #"Server ready at ws://(\S+:\d+)"#)
+  private static let internalTokenRegex = try! NSRegularExpression(pattern: #"internal token: (\S+)"#)
+
+  static func parseHandshakeLine(_ line: String, into state: inout HandshakeState) {
+    if state.address == nil {
+      if let address = firstMatch(legacyServingRegex, in: line) {
+        state.address = address
+      } else if let address = firstMatch(serverReadyWSRegex, in: line) {
+        state.address = address
+      }
+    }
+    if state.token == nil, let token = firstMatch(internalTokenRegex, in: line) {
+      state.token = token
+    }
+  }
+
+  private static func firstMatch(_ regex: NSRegularExpression, in line: String) -> String? {
+    let range = NSRange(line.startIndex..., in: line)
+    guard let match = regex.firstMatch(in: line, range: range),
+          match.numberOfRanges >= 2,
+          let matchedRange = Range(match.range(at: 1), in: line)
+    else { return nil }
+    return String(line[matchedRange])
+  }
 }
 
 // MARK: - LaunchedSession
@@ -945,8 +976,6 @@ public actor LaunchedSession {
   /// AsyncStream covers both the "burst then quiet" and "early-exit"
   /// cases without us spinning a poll loop on a DispatchSource.
   fileprivate func awaitHandshake(timeout: TimeInterval) async throws -> PieControlLauncher.Handshake {
-    let urlRegex = try! NSRegularExpression(pattern: #"pie-server serving on (\S+:\d+)"#)
-    let tokRegex = try! NSRegularExpression(pattern: #"internal token: (\S+)"#)
     let started = Date()
     let lines = startLineStream()
 
@@ -954,13 +983,11 @@ public actor LaunchedSession {
       // Reader child — yields the Handshake when both markers
       // appear or throws engineExitedEarly when pie dies.
       group.addTask { [weak self] in
-        var address: String?
-        var token: String?
+        var state = PieControlLauncher.HandshakeState()
         for await line in lines {
           await self?.append(line: line)
-          if address == nil, let m = await self?.match(urlRegex, in: line) { address = m }
-          if token == nil, let m = await self?.match(tokRegex, in: line) { token = m }
-          if let a = address, let t = token {
+          PieControlLauncher.parseHandshakeLine(line, into: &state)
+          if let a = state.address, let t = state.token {
             return PieControlLauncher.Handshake(address: a, token: t)
           }
           // #2 root: confirm a REAL exit before classifying engineExitedEarly.
@@ -1088,14 +1115,6 @@ public actor LaunchedSession {
     return regex.stringByReplacingMatches(in: line,
                                           range: range,
                                           withTemplate: "internal token: <REDACTED>")
-  }
-
-  private func match(_ regex: NSRegularExpression, in line: String) -> String? {
-    let range = NSRange(line.startIndex..., in: line)
-    guard let m = regex.firstMatch(in: line, range: range), m.numberOfRanges >= 2,
-          let r = Range(m.range(at: 1), in: line)
-    else { return nil }
-    return String(line[r])
   }
 
   private func sendSignalQuiet(_ sig: Int32, label: String) {
