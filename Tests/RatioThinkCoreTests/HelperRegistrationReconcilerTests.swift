@@ -14,7 +14,7 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
   /// reconciler awaits each closure in order, so the unsynchronized
   /// mutation is safe here.
   private final class Harness: @unchecked Sendable {
-    var probeResults: [Bool]
+    var probeResults: [HelperRegistrationProbeResult]
     var state: HelperRegistrationState
     var registerResult: HelperRegistrationState
     var registerError: Error?
@@ -24,7 +24,7 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
     private(set) var registerCalls = 0
     private(set) var unregisterCalls = 0
 
-    init(probeResults: [Bool],
+    init(probeResults: [HelperRegistrationProbeResult],
          state: HelperRegistrationState,
          registerResult: HelperRegistrationState = .enabled,
          registerError: Error? = nil,
@@ -40,7 +40,7 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
       HelperRegistrationReconciler(
         probeReachable: { [self] in
           probeCalls += 1
-          return probeResults.isEmpty ? false : probeResults.removeFirst()
+          return probeResults.isEmpty ? .unreachable : probeResults.removeFirst()
         },
         currentState: { [self] in state },
         register: { [self] in
@@ -89,7 +89,7 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
   }
 
   func test_healthyHelper_isLeftUntouched() async {
-    let h = Harness(probeResults: [true], state: .enabled)
+    let h = Harness(probeResults: [.healthy], state: .enabled)
     let outcome = await h.makeReconciler().reconcile()
     XCTAssertEqual(outcome, .healthy)
     XCTAssertEqual(h.probeCalls, 1)
@@ -97,10 +97,25 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
     XCTAssertEqual(h.unregisterCalls, 0, "a reachable Helper must not be unregistered")
   }
 
+  func test_reachableButWrongHelperIdentity_forcesUnregisterThenRegister() async {
+    // Upgrade/rename blocker: an old RatioThinkHelper can still answer on the
+    // preserved com.ratiothink.helper mach service. Reachability alone must
+    // not be treated as healthy; mismatched identity must force a launchd
+    // reload so the registered job points at RationalHelper.
+    let h = Harness(probeResults: [.identityMismatch("executable=RatioThinkHelper"), .healthy],
+                    state: .enabled,
+                    registerResult: .enabled)
+    let outcome = await h.makeReconciler().reconcile()
+    XCTAssertEqual(outcome, .repaired)
+    XCTAssertEqual(h.unregisterCalls, 1, "wrong-but-reachable Helper must be unregistered")
+    XCTAssertEqual(h.registerCalls, 1, "wrong-but-reachable Helper must be registered again")
+    XCTAssertEqual(h.probeCalls, 2, "repair must re-probe and confirm the expected Helper identity")
+  }
+
   func test_enabledButUnreachable_forcesUnregisterThenRegister() async {
     // The stale-after-update case: BTM enabled, Helper unreachable, then
     // reachable once the job is reloaded.
-    let h = Harness(probeResults: [false, true], state: .enabled, registerResult: .enabled)
+    let h = Harness(probeResults: [.unreachable, .healthy], state: .enabled, registerResult: .enabled)
     let outcome = await h.makeReconciler().reconcile()
     XCTAssertEqual(outcome, .repaired)
     XCTAssertEqual(h.unregisterCalls, 1, "must force a reload via unregister")
@@ -108,7 +123,7 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
   }
 
   func test_notRegistered_registersFresh() async {
-    let h = Harness(probeResults: [false, true], state: .notRegistered, registerResult: .enabled)
+    let h = Harness(probeResults: [.unreachable, .healthy], state: .notRegistered, registerResult: .enabled)
     let outcome = await h.makeReconciler().reconcile()
     XCTAssertEqual(outcome, .registered)
     XCTAssertEqual(h.unregisterCalls, 0, "fresh registration must not unregister first")
@@ -116,28 +131,45 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
   }
 
   func test_requiresApproval_surfacedNotClaimedHealthy() async {
-    let h = Harness(probeResults: [false], state: .requiresApproval)
+    let h = Harness(probeResults: [.unreachable], state: .requiresApproval)
     let outcome = await h.makeReconciler().reconcile()
     XCTAssertEqual(outcome, .needsApproval)
   }
 
   func test_registerReportsRequiresApproval_surfacesNeedsApproval() async {
     // register() itself can land in requiresApproval after a code change.
-    let h = Harness(probeResults: [false], state: .enabled, registerResult: .requiresApproval)
+    let h = Harness(probeResults: [.unreachable], state: .enabled, registerResult: .requiresApproval)
     let outcome = await h.makeReconciler().reconcile()
     XCTAssertEqual(outcome, .needsApproval)
   }
 
   func test_registerSucceedsButStillUnreachable_reportsRepairFailed() async {
-    let h = Harness(probeResults: [false, false], state: .enabled, registerResult: .enabled)
+    let h = Harness(probeResults: [.unreachable, .unreachable], state: .enabled, registerResult: .enabled)
     let outcome = await h.makeReconciler().reconcile()
     guard case .repairFailed = outcome else {
       return XCTFail("expected .repairFailed, got \(outcome)")
     }
   }
 
+  func test_registerSucceedsButStillWrongIdentity_reportsIdentityMismatch() async {
+    let h = Harness(probeResults: [.identityMismatch("executable=RatioThinkHelper"),
+                                   .identityMismatch("executable=RatioThinkHelper")],
+                    state: .enabled,
+                    registerResult: .enabled)
+    let outcome = await h.makeReconciler().reconcile()
+    guard case let .repairFailed(msg) = outcome else {
+      return XCTFail("expected .repairFailed, got \(outcome)")
+    }
+    XCTAssertTrue(msg.contains("identity mismatch after register"),
+                  "repair failure must distinguish wrong identity from unreachable; got: \(msg)")
+    XCTAssertTrue(msg.contains("executable=RatioThinkHelper"),
+                  "repair failure must preserve identity evidence; got: \(msg)")
+    XCTAssertFalse(msg.contains("helper unreachable after register"),
+                   "wrong-but-reachable helper must not be reported as unreachable; got: \(msg)")
+  }
+
   func test_registerThrows_reportsRepairFailed() async {
-    let h = Harness(probeResults: [false], state: .notRegistered, registerError: StubError())
+    let h = Harness(probeResults: [.unreachable], state: .notRegistered, registerError: StubError())
     let outcome = await h.makeReconciler().reconcile()
     guard case .repairFailed = outcome else {
       return XCTFail("expected .repairFailed, got \(outcome)")
@@ -149,7 +181,7 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
     // failure must name the unregister error (the root operation), not
     // just "unreachable after register".
     struct NamedError: Error, CustomStringConvertible { var description = "boom-unregister-42" }
-    let h = Harness(probeResults: [false, false], state: .enabled,
+    let h = Harness(probeResults: [.unreachable, .unreachable], state: .enabled,
                     registerResult: .enabled, unregisterError: NamedError())
     let outcome = await h.makeReconciler().reconcile()
     guard case let .repairFailed(msg) = outcome else {
@@ -161,7 +193,7 @@ final class HelperRegistrationReconcilerTests: XCTestCase {
 
   func test_unregisterThrowsButRegisterRecovers_stillRepairs() async {
     // unregister() throwing (item already gone) is benign — register still runs.
-    let h = Harness(probeResults: [false, true], state: .enabled,
+    let h = Harness(probeResults: [.unreachable, .healthy], state: .enabled,
                     registerResult: .enabled, unregisterError: StubError())
     let outcome = await h.makeReconciler().reconcile()
     XCTAssertEqual(outcome, .repaired)

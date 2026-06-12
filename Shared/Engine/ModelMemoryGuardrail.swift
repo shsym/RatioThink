@@ -168,6 +168,14 @@ public enum ModelMemoryGuardrail {
     return .success(())
   }
 
+  /// Total resolved artifact size in bytes (the weight footprint), or
+  /// `nil` if it can't be measured. Reuses the same traversal as
+  /// `validate`; used by `KVCacheBudget` to size the KV token ceiling.
+  public static func resolvedBytes(resolvedModelURL: URL,
+                                   fileManager: FileManager = .default) -> Int64? {
+    (try? summarize(resolvedModelURL: resolvedModelURL, fileManager: fileManager))?.totalBytes
+  }
+
   private static func summarize(resolvedModelURL: URL,
                                 fileManager: FileManager) throws -> SizeSummary {
     var isDir: ObjCBool = false

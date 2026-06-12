@@ -24,29 +24,99 @@ public final class HelperHealthController: ObservableObject {
 
   private let policy: HelperHealthPolicy
   private let repair: () async -> Bool
+  /// #496 GUI seam: when true the controller is PINNED — poll outcomes are
+  /// ignored so the overlay's three states render deterministically without a
+  /// real helper (mirrors the engine-status `PinnedRunningXPCClient` seam).
+  /// A manual restart from the pinned escalation simulates a successful repair
+  /// (→ `.healthy`) so the GUI can exercise the overlay's auto-dismiss. Set
+  /// ONLY from the DEBUG `PIE_TEST_PIN_HELPER_HEALTH` launch path.
+  private let isPinned: Bool
   /// In-flight repair. The reducer transitions to `.repairing` and THIS task
   /// owns the matching `repairFinished` event; a new repair / a recovery
   /// cancels it so attempts never overlap.
   private var repairTask: Task<Void, Never>?
+  /// Whether a chat / tree-of-thought generation is currently streaming
+  /// (mirrors `ChatSendController.isInFlight`, wired from the chat view). While
+  /// true, a FAILED `engineStatus()` poll is held rather than advanced through
+  /// the ladder — see `ingestPollOutcome`.
+  private var isGenerating = false
+  /// Failed polls absorbed by the generation gate this stream. Logged once on
+  /// release so a run shows the ladder was held (not silently disabled).
+  private var heldPollsDuringGeneration = 0
   private nonisolated static let log = Logger(subsystem: "com.ratiothink.app", category: "helper-health")
 
   public init(policy: HelperHealthPolicy = HelperHealthPolicy(),
-              repair: @escaping () async -> Bool) {
+              repair: @escaping () async -> Bool,
+              pinnedHealth: HelperHealth? = nil) {
     self.policy = policy
     self.repair = repair
+    self.isPinned = pinnedHealth != nil
+    if let pinnedHealth { self.health = pinnedHealth }
   }
 
   /// Feed one background `engineStatus()` poll outcome (true = the XPC call
   /// returned a value; false = it threw a transport error). Wired from
   /// `EngineStatusStore.onPollOutcome`.
+  ///
+  /// #413 root cause: the helper-restart ladder treats a FAILED poll as the
+  /// helper being unreachable. But a failed poll is most often an XPC reply
+  /// *timeout*, which means the helper was too busy to answer within the 2 s
+  /// reply window — NOT that it is dead. A long tree-of-thought search
+  /// saturates the poll path (the live tree floods the MainActor that receives
+  /// the XPC reply, and/or the helper drains a busy engine's output), so ~12
+  /// consecutive polls time out, the ladder crosses `transientThreshold`, and
+  /// its registration reconcile (`unregister()` + `register()`) bounces the
+  /// Helper — killing the in-flight engine and closing the SSE with no
+  /// terminal frame (the operator's "engine closed the connection" at ~58 s).
+  ///
+  /// Fix: while a generation is streaming, HOLD failed polls instead of
+  /// advancing the ladder. A busy helper is not a dead one. Genuine death is
+  /// still caught — the Helper-side liveness monitor detects real engine-
+  /// process exit independently, and a Helper that truly dies drops the
+  /// stream's connection, which ENDS the generation and releases this gate, so
+  /// the next failed poll advances the ladder normally. A SUCCEEDED poll always
+  /// recovers, even mid-generation.
   public func ingestPollOutcome(succeeded: Bool) {
+    // #496 GUI seam: a pinned controller holds its injected health regardless
+    // of the poll stream, so the overlay state stays deterministic.
+    if isPinned { return }
+    if !succeeded, isGenerating {
+      heldPollsDuringGeneration += 1
+      return
+    }
     apply(succeeded ? .pollSucceeded : .pollFailed)
+  }
+
+  /// Open/close the generation gate (wired from `ChatSendController.isInFlight`
+  /// via the chat view). While open, failed polls are held — see
+  /// `ingestPollOutcome`. Toggling it does not itself touch the ladder, so a
+  /// helper that recovered on its own during the stream stays `.healthy`.
+  public func setGenerating(_ active: Bool) {
+    guard active != isGenerating else { return }
+    if !active, heldPollsDuringGeneration > 0 {
+      // One summary breadcrumb per stream: proof the ladder was held (and how
+      // many busy-timeouts it absorbed) instead of bouncing the engine.
+      Diag.app.event("helper.health", [
+        ("state", "busy_hold_released"),
+        ("held", String(heldPollsDuringGeneration)),
+      ])
+      heldPollsDuringGeneration = 0
+    }
+    isGenerating = active
   }
 
   /// User-triggered "Restart helper" from the escalation surface. Resets the
   /// ladder and fires a fresh repair attempt regardless of current state.
   public func restartHelperManually() {
     Self.log.notice("user requested Restart Helper")
+    // #496 GUI seam: in the pinned harness there is no real helper to repair,
+    // so a manual restart simulates the repair SUCCEEDING — the helper comes
+    // back `.healthy`, which drives the overlay's auto-dismiss. Production
+    // (non-pinned) runs the real ladder via `apply(.manualRestart)`.
+    if isPinned {
+      if health != .healthy { health = .healthy }
+      return
+    }
     apply(.manualRestart)
   }
 

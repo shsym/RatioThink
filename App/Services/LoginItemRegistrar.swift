@@ -11,15 +11,15 @@ enum LoginItemRegistrationStatus: Equatable {
   var userVisibleText: String {
     switch self {
     case .notRegistered:
-      return "RatioThinkHelper is not registered yet"
+      return "Rational Helper is not registered yet"
     case .enabled:
-      return "RatioThinkHelper is registered"
+      return "Rational Helper is registered"
     case .requiresApproval:
-      return "RatioThinkHelper needs approval in System Settings"
+      return "Rational Helper needs approval in System Settings"
     case .notFound:
-      return "RatioThinkHelper was not found in the app bundle"
+      return "Rational Helper was not found in the app bundle"
     case .unavailable(let reason):
-      return "RatioThinkHelper registration unavailable: \(reason)"
+      return "Rational Helper registration unavailable: \(reason)"
     }
   }
 
@@ -33,9 +33,9 @@ enum LoginItemRegistrationStatus: Equatable {
   }
 
   /// One-line description, for *Settings → General → Startup*, of whether
-  /// RatioThink keeps its menu-bar icon / background helper after the main
+  /// Rational keeps its menu-bar icon / background helper after the main
   /// app quits. The menu-bar presence is owned by the launchd-managed
-  /// RatioThinkHelper agent (registered via `SMAppService`), so this
+  /// Rational Helper agent (registered via `SMAppService`), so this
   /// registration state — not the app process — decides whether the icon
   /// and the engine survive a quit. Phrased honestly: the app cannot tear
   /// down a running helper, so we surface the persistence the user has
@@ -43,13 +43,13 @@ enum LoginItemRegistrationStatus: Equatable {
   var menuBarPersistenceSummary: String {
     switch self {
     case .enabled:
-      return "RatioThink stays in your menu bar after you quit, so the engine resumes instantly."
+      return "Rational stays in your menu bar after you quit, so the engine resumes instantly."
     case .notRegistered:
-      return "RatioThink won't stay in your menu bar after you quit until RatioThinkHelper is registered."
+      return "Rational won't stay in your menu bar after you quit until Rational Helper is registered."
     case .requiresApproval:
-      return "Approve RatioThinkHelper in System Settings to keep RatioThink in your menu bar after you quit."
+      return "Approve Rational Helper in System Settings to keep it in your menu bar after you quit."
     case .notFound:
-      return "RatioThinkHelper is missing from the app bundle, so RatioThink can't stay in your menu bar after you quit."
+      return "Rational Helper is missing from the app bundle, so Rational can't stay in your menu bar after you quit."
     case .unavailable(let reason):
       return "Menu-bar persistence is unavailable: \(reason)."
     }
@@ -84,7 +84,7 @@ extension LoginItemRegistrationStatus {
 
 final class SMAppServiceLoginItemRegistrar: LoginItemRegistering {
   /// Name of the launchd plist staged at
-  /// `RatioThink.app/Contents/Library/LaunchAgents/<plistName>`. Registered as
+  /// `Rational.app/Contents/Library/LaunchAgents/<plistName>`. Registered as
   /// an agent (not a login item) so the plist's `MachServices` entry
   /// makes `com.ratiothink.helper` an on-demand launchd service: launchd
   /// (re)launches the Helper when the App connects, even after the
@@ -93,7 +93,7 @@ final class SMAppServiceLoginItemRegistrar: LoginItemRegistering {
   /// never republished `com.ratiothink.helper` and the App saw 4099 until
   /// logout/login.
   /// Filename of the launchd agent plist staged into
-  /// `RatioThink.app/Contents/Library/LaunchAgents/`. Single source of truth
+  /// `Rational.app/Contents/Library/LaunchAgents/`. Single source of truth
   /// shared with the plist-contract test so the registrar and the
   /// bundled plist cannot drift.
   static let defaultPlistName = "com.ratiothink.app.helper.plist"

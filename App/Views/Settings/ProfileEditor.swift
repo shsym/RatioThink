@@ -12,6 +12,9 @@ struct ProfileEditor: View {
   /// hands back a refreshed `entry`. .
   var onModelChanged: () -> Void = {}
   @EnvironmentObject private var profileStore: ProfileStore
+  @EnvironmentObject private var downloads: ModelDownloadController
+  @EnvironmentObject private var settingsNavigation: SettingsNavigation
+  @EnvironmentObject private var engineStatusStore: EngineStatusStore
   @State private var showAdvanced: Bool = false
   /// Discovered model options (app-managed + HF cache), each carrying
   /// size + over-limit / unsupported state for the model-size guardrail.
@@ -19,12 +22,27 @@ struct ProfileEditor: View {
   /// Guardrail policy (ceiling), shown in the "exceeds …" reason on
   /// over-limit options. `nil` until the first scan.
   @State private var memoryPolicy: ModelMemoryGuardrail.Policy?
+  /// Failure of the DEFAULT-MODEL SAVE itself (`ProfileStore.setModel`).
+  /// Kept strictly separate from an engine reload failure (#459 repro 2):
+  /// a saved default must never be reported as "couldn't save" just because
+  /// the engine rebuild that follows it failed. Short, single-line copy.
   @State private var modelWriteError: String?
   /// Set when the model scan throws. Without this the picker silently
   /// rendered empty on a scan failure, so a permission glitch on the
   /// models dir looked like "no models installed". Mirrors
   /// `ModelsSettingsTab`'s `scanError` surfacing.
   @State private var modelScanError: String?
+  /// Lifecycle of the post-save engine rebuild (#459 repro 2/3). The save
+  /// already succeeded; this tracks the SEPARATE reload so the route shows a
+  /// loading indicator while the engine restarts and surfaces any failure in
+  /// a bounded banner — never as layout-breaking inline error text.
+  @State private var engineReload: EngineReloadState = .idle
+
+  enum EngineReloadState: Equatable {
+    case idle
+    case reloading
+    case failed(String)
+  }
 
   var body: some View {
     ScrollView {
@@ -50,6 +68,9 @@ struct ProfileEditor: View {
     }
     .accessibilityIdentifier("ProfileEditor")
     .task { await refreshModelOptions(current: entry.profile?.model ?? "") }
+    .onChange(of: downloads.completionTick) { _, _ in
+      Task { await refreshModelOptions(current: entry.profile?.model ?? "") }
+    }
   }
 
   // MARK: - Sections
@@ -76,7 +97,9 @@ struct ProfileEditor: View {
           .font(.callout)
           .foregroundStyle(.red)
           .frame(maxWidth: .infinity, alignment: .leading)
+          .accessibilityIdentifier("ProfileEditorModelWriteError")
       }
+      engineReloadStatus
       if let modelScanError {
         Text(modelScanError)
           .font(.callout)
@@ -114,16 +137,32 @@ struct ProfileEditor: View {
         // Block selecting an unloadable model — over-limit (too large for
         // this host) or unsupported (a split GGUF the engine can't load)
         // — but never the current value, which stays a no-op.
+        .help(option.slug)
+        .accessibilityValue(option.slug)
         .disabled((option.isOverLimit || option.unsupportedReason != nil) && !option.isCurrent)
       }
+      Divider()
+      Button {
+        settingsNavigation.open(.models)
+      } label: {
+        Label("Manage Models…", systemImage: "gearshape")
+      }
+      .help("Open Settings → Models")
+      .accessibilityIdentifier("ProfileEditorModelPickerManageModels")
     } label: {
-      ProfileModelPickerSelectionLabel(model: ProfileModelPickerSelectionLabelModel(
-        fallbackModel: profile.model,
-        selectedOption: modelOptions.first { $0.slug == profile.model },
-        memoryPolicy: memoryPolicy
-      ))
+      ProfileModelPickerLabel(
+        model: ProfileModelPickerSelectionLabelModel(
+          fallbackModel: profile.model,
+          selectedOption: modelOptions.first { $0.slug == profile.model },
+          memoryPolicy: memoryPolicy
+        ),
+        modelID: profile.model
+      )
     }
     .menuStyle(.borderlessButton)
+    .fixedSize()
+    .help(ProfileModelPickerLabel.accessibilityHelpText(for: profile.model))
+    .accessibilityValue(ProfileModelPickerLabel.accessibilityHelpText(for: profile.model))
     .accessibilityIdentifier("ProfileEditorModelPicker")
   }
 
@@ -133,6 +172,8 @@ struct ProfileEditor: View {
     if option.isCurrent {
       Label(text, systemImage: "checkmark")
     } else if option.isOverLimit || option.unsupportedReason != nil {
+      Label(text, systemImage: "exclamationmark.triangle")
+    } else if option.supportWarning != nil {
       Label(text, systemImage: "exclamationmark.triangle")
     } else {
       Text(text)
@@ -152,6 +193,8 @@ struct ProfileEditor: View {
       text += " — exceeds \(InstalledModels.formattedSize(policy.maxResolvedModelBytes)) limit"
     } else if let reason = option.unsupportedReason {
       text += " — \(reason)"
+    } else if let warning = option.supportWarning {
+      text += " — \(warning)"
     }
     return text
   }
@@ -247,12 +290,82 @@ struct ProfileEditor: View {
 
   private func persistModel(_ model: String, profileID: String) {
     guard model != entry.profile?.model else { return }
+    // Fresh interaction — clear any prior reload banner so a new save's
+    // outcome can't read against a stale one.
+    engineReload = .idle
     do {
       try profileStore.setModel(model, forProfileID: profileID)
       modelWriteError = nil
       onModelChanged()
+      Task { await refreshModelOptions(current: model) }
+      restartActiveEngineIfNeeded(profileID: profileID)
     } catch {
       modelWriteError = "Could not set default model: \(error)"
+    }
+  }
+
+  /// If the edited profile is the active engine target, rebuild the
+  /// helper engine after the default-model write so pie's boot-time
+  /// model registry contains the newly selected model. Without this,
+  /// `/v1/models/load` keeps rejecting the fresh slug as
+  /// `model_not_found` until the user restarts the whole product.
+  ///
+  /// The default-model SAVE has already succeeded by the time this runs
+  /// (#459 repro 2): a reload failure is reported on its own
+  /// `engineReload` channel — never folded back into `modelWriteError`,
+  /// which would mislabel a saved default as a failed save. The route shows
+  /// a loading indicator while the rebuild is in flight (#459 repro 3) and a
+  /// bounded banner if it fails (#459 acceptance: stable surface, no
+  /// layout-breaking inline text).
+  private func restartActiveEngineIfNeeded(profileID: String) {
+    guard profileStore.activeProfileID == profileID else { return }
+    engineReload = .reloading
+    Task { @MainActor in
+      do {
+        try await engineStatusStore.restartEngine(profileID: profileID)
+        engineReload = .idle
+      } catch {
+        engineReload = .failed(Self.engineReloadMessage(error))
+      }
+    }
+  }
+
+  /// Human, fault-domain-correct copy for a failed post-save engine reload.
+  /// Frames the save as done and the reload as the failed step. #477:
+  /// `EngineError.message` is a raw diagnostic — show the shared
+  /// taxonomy's curated line and log the raw text instead.
+  static func engineReloadMessage(_ error: Error) -> String {
+    if let e = error as? EngineError {
+      let problem = EngineProblem(statusCode: e.code, rawMessage: e.message)
+      if let detail = problem.technicalDetail {
+        Log.engine.error("ProfileEditor: engine reload failed: \(detail, privacy: .public)")
+      }
+      return "The new default was saved, but the engine couldn’t reload. \(problem.message)"
+    }
+    Log.engine.error("ProfileEditor: engine reload failed: \(String(describing: error), privacy: .public)")
+    return "The new default was saved, but the engine couldn’t reload."
+  }
+
+  /// Loading indicator (rebuild in flight) / bounded failure banner for the
+  /// post-save engine reload. Idle renders nothing.
+  @ViewBuilder
+  private var engineReloadStatus: some View {
+    switch engineReload {
+    case .idle:
+      EmptyView()
+    case .reloading:
+      HStack(spacing: 8) {
+        ProgressView().controlSize(.small)
+        Text("Reloading the engine with the new default model…")
+          .font(.callout)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .accessibilityIdentifier("ProfileEditorEngineReloading")
+    case .failed(let message):
+      EngineFailureBanner(message: message, onDismiss: { engineReload = .idle })
+        .accessibilityIdentifier("ProfileEditorEngineReloadFailed")
     }
   }
 
@@ -286,11 +399,36 @@ struct ProfileEditor: View {
     return table.convert()
   }
 }
-
 typealias ProfileModelPickerSelectionLabelModel = ProfileModelSelectionLabelContent
 
-struct ProfileModelPickerSelectionLabel: View {
+/// Bounded selected-model label for the Profile editor's model `Menu`.
+///
+/// Long Hugging Face ids are useful to inspect, but they must not become the
+/// row's ideal width: `SettingsLabeledRow` has neighboring fixed-width labels,
+/// so an unbounded/fixed-size menu label pushes the whole Profile pane wider.
+/// Keep the label flexible, cap its ideal size, and let SwiftUI middle-truncate
+/// inside that cap while exposing the unmodified id through help + a11y. When
+/// the current/default model is unloadable, the same selected label also shows
+/// the warning icon so users see the problem without opening the menu.
+struct ProfileModelPickerLabel: View {
+  static let maxLayoutWidth: CGFloat = 360
+
   let model: ProfileModelPickerSelectionLabelModel
+  let modelID: String?
+
+  init(modelID: String?) {
+    self.modelID = modelID
+    self.model = ProfileModelPickerSelectionLabelModel(
+      fallbackModel: modelID,
+      selectedOption: nil,
+      memoryPolicy: nil
+    )
+  }
+
+  init(model: ProfileModelPickerSelectionLabelModel, modelID: String?) {
+    self.model = model
+    self.modelID = modelID
+  }
 
   var body: some View {
     HStack(spacing: 4) {
@@ -300,25 +438,43 @@ struct ProfileModelPickerSelectionLabel: View {
           .help(warningText)
           .accessibilityHidden(true)
       }
+
+      // #462: shared truncation primitive — middle-truncate one line and
+      // fill the slot whose width the outer `.frame` fixes below. The full
+      // id stays inspectable via the `.help`/a11y on the outer frame.
       Text(model.displayName)
         .monospaced()
-        .lineLimit(ProfileModelPickerSelectionLabelModel.nameLineLimit)
-        .truncationMode(ProfileModelPickerSelectionLabelModel.nameTruncationMode.swiftUI)
-        .frame(width: CGFloat(ProfileModelPickerSelectionLabelModel.maxNameWidth), alignment: .leading)
+        .foregroundStyle(modelID == nil ? .secondary : .primary)
+        .boundedModelName(maxWidth: .infinity)
+
       Image(systemName: "chevron.up.chevron.down")
         .font(.caption)
         .accessibilityHidden(true)
     }
-    .frame(maxWidth: CGFloat(ProfileModelPickerSelectionLabelModel.maxSelectionWidth), alignment: .leading)
-    .help(model.warningText ?? model.displayName)
+    .frame(idealWidth: Self.maxLayoutWidth,
+           maxWidth: Self.maxLayoutWidth,
+           alignment: .leading)
+    .help(Self.accessibilityHelpText(for: modelID, warningText: model.warningText))
+    .accessibilityElement(children: .ignore)
     .accessibilityLabel(model.accessibilityLabel)
+    .accessibilityHint(Self.accessibilityHelpText(for: modelID, warningText: model.warningText))
+    .accessibilityValue(Self.accessibilityHelpText(for: modelID))
   }
-}
 
-private extension ProfileModelSelectionLabelContent.NameTruncationMode {
-  var swiftUI: Text.TruncationMode {
-    switch self {
-    case .middle: .middle
-    }
+  static func displayText(for modelID: String?) -> String {
+    ProfileModelPickerSelectionLabelModel.displayText(for: modelID)
+  }
+
+  static func accessibilityHelpText(for modelID: String?) -> String {
+    modelID ?? displayText(for: modelID)
+  }
+
+  static func accessibilityHelpText(for modelID: String?, warningText: String?) -> String {
+    guard let warningText else { return accessibilityHelpText(for: modelID) }
+    return "\(warningText)\n\(accessibilityHelpText(for: modelID))"
+  }
+
+  static func accessibilityText(for displayName: String) -> String {
+    "Default model: \(displayName)"
   }
 }

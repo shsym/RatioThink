@@ -6,7 +6,7 @@ public struct ProfileModelSelectionLabelContent: Equatable, Sendable {
   }
 
   public static let maxNameWidth: Double = 240
-  public static let maxSelectionWidth: Double = 292
+  public static let maxSelectionWidth: Double = 360
   public static let nameLineLimit = 1
   public static let nameTruncationMode: NameTruncationMode = .middle
 
@@ -14,12 +14,16 @@ public struct ProfileModelSelectionLabelContent: Equatable, Sendable {
   public let warningText: String?
 
   public init(
-    fallbackModel: String,
+    fallbackModel: String?,
     selectedOption: ProfileModelOptions.Option?,
     memoryPolicy: ModelMemoryGuardrail.Policy?
   ) {
-    displayName = selectedOption?.displayName ?? ModelDisplayName.leaf(fallbackModel)
+    displayName = selectedOption?.displayName ?? Self.displayText(for: fallbackModel)
     warningText = Self.warningText(for: selectedOption, memoryPolicy: memoryPolicy)
+  }
+
+  public static func displayText(for modelID: String?) -> String {
+    modelID.map(ModelDisplayName.leaf) ?? "No default model"
   }
 
   public var accessibilityLabel: String {

@@ -57,7 +57,7 @@ final class ProfileModelPickerSelectionLabelTests: XCTestCase {
 
   func test_long_selected_model_label_contract_is_constrained_to_one_truncated_line() {
     XCTAssertEqual(ProfileModelPickerSelectionLabelModel.maxNameWidth, 240)
-    XCTAssertEqual(ProfileModelPickerSelectionLabelModel.maxSelectionWidth, 292)
+    XCTAssertEqual(ProfileModelPickerSelectionLabelModel.maxSelectionWidth, 360)
     XCTAssertEqual(ProfileModelPickerSelectionLabelModel.nameLineLimit, 1)
     XCTAssertEqual(ProfileModelPickerSelectionLabelModel.nameTruncationMode, .middle)
   }

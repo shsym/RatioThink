@@ -55,7 +55,7 @@ final class ProfileModelSelectionLabelContentTests: XCTestCase {
 
   func test_long_model_label_contract_is_widthConstrainedToOneMiddleTruncatedLine() {
     XCTAssertEqual(ProfileModelSelectionLabelContent.maxNameWidth, 240)
-    XCTAssertEqual(ProfileModelSelectionLabelContent.maxSelectionWidth, 292)
+    XCTAssertEqual(ProfileModelSelectionLabelContent.maxSelectionWidth, 360)
     XCTAssertEqual(ProfileModelSelectionLabelContent.nameLineLimit, 1)
     XCTAssertEqual(ProfileModelSelectionLabelContent.nameTruncationMode, .middle)
   }

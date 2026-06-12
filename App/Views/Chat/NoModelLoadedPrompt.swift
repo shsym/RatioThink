@@ -10,15 +10,18 @@ import SwiftUI
 /// #397 — engine/model LIFECYCLE (`ChatStartGate.State`): the prompt
 /// renders the real reason AND the correct action for every gate state,
 /// instead of always falling through to the availability action:
-///   · busy(starting/stopping/loading) → calm wait (with the download
+///   · busy(starting/stopping) → calm wait (with the download
 ///     CTA still visible if a fresh-install model needs downloading);
-///   · engineFailed → the reason + Retry (retryable) / Open Models
-///     settings (model-choice faults: missing/too-large/profile) /
-///     inline download (missing + downloadable);
-///   · loadFailed → the reason + Retry the load;
+///   · engineFailed → EngineProblem copy + the affordance its
+///     `recovery` names (#477): Retry (`.restartEngine`) / Open Models
+///     settings (`.chooseModel`, including unsupported models) / inline
+///     download (missing + downloadable) / none (helper-restart or
+///     terminal faults);
 ///   · helperUnreachable → the reason + Retry (re-poll);
 ///   · configBroken → the reason + Open Settings;
-///   · needsDefaultLoad / noDefault → the #326 availability action.
+///   · needsLoad / noDefault → the #326 availability action, framed
+///     for the resolved `ModelTarget` (pinned selection vs profile
+///     default — #497).
 ///
 /// The decision is a pure function (`plan(state:action:)`) so the
 /// per-state copy + affordances are unit-tested without a view
@@ -35,13 +38,16 @@ struct NoModelLoadedPrompt: View {
   let onDownloaded: () -> Void
   /// Retry starting the engine after a retryable engine failure.
   let onRetryEngineStart: () -> Void
-  /// Retry a failed model load.
-  let onRetryLoad: (String) -> Void
   /// Re-poll the helper after an unreachable-transport failure.
   let onRefresh: () -> Void
   let onCancel: () -> Void
   /// Live engine status, threaded into the download CTA (PR#15 F1).
   let engineStatus: EngineStatus
+  /// #516: true when a blocked send is armed to auto-submit once the load
+  /// target resolves. Drives the "…to send your message" copy — the same
+  /// sheet is also raised by the launch-time engine-start prompt with an
+  /// empty composer, where that promise would be a lie.
+  let willAutoSend: Bool
 
   // MARK: - pure decision (testable)
 
@@ -50,13 +56,14 @@ struct NoModelLoadedPrompt: View {
     case none
     case load          // load the on-disk default (ensures engine running first)
     case retryEngine   // re-start the engine after a retryable failure
-    case retryLoad     // re-run a failed model load
     case refresh       // re-poll an unreachable helper
   }
 
   /// Pure, Equatable description of what the prompt renders. The view
   /// maps this to SwiftUI and binds the primary button's callback to the
-  /// model id it pulls from `gateState`/`action`.
+  /// model id it pulls from `gateState`/`action`. Review v1 F5: every line
+  /// of copy — including the source-honest captions — lives HERE so it is
+  /// unit-tested without a view hierarchy; the view renders strings only.
   struct Plan: Equatable {
     var headline: String
     /// Failure reason shown at the gate (not only in the banner behind
@@ -65,21 +72,36 @@ struct NoModelLoadedPrompt: View {
     var showsWaitSpinner: Bool
     var showsModelChip: Bool        // ".load" copy + slug chip
     var showsDownloadCTA: Bool      // inline MissingModelDownloadCTA
-    var showsUnavailableCopy: Bool
     var primary: Primary
     var showsOpenSettings: Bool
+    /// Spinner detail line for `.busy` states. Nil otherwise.
+    var detail: String? = nil
+    /// Caption above the model chip (`showsModelChip`). Source-honest:
+    /// a pinned selection is never called the profile default (#497).
+    var loadCaption: String? = nil
+    /// Caption above the download CTA. Nil when the headline, a reason,
+    /// or the spinner detail already explains the state (the
+    /// `engineFailed(.modelMissing)` and `.busy` download cells).
+    var downloadCaption: String? = nil
+    /// Body copy for the unavailable state. Non-nil replaces the old
+    /// `showsUnavailableCopy` flag and carries pin-framed copy when the
+    /// dropped target was a selection (review v1 F1).
+    var unavailableCopy: String? = nil
   }
 
   /// Fold the lifecycle state + availability action into a render plan.
+  /// #516: `willAutoSend` selects between the promise copy ("…to send your
+  /// message") and the neutral copy — the promise is rendered only when the
+  /// pending auto-send is actually armed to keep it.
   static func plan(state: ChatStartGate.State,
-                   action: MissingModelRecovery.PromptAction) -> Plan {
+                   action: MissingModelRecovery.PromptAction,
+                   willAutoSend: Bool) -> Plan {
     switch state {
     case .ready:
       // Gate not shown; render nothing if a race presents it for a frame.
       return Plan(headline: "", reason: nil, showsWaitSpinner: false,
                   showsModelChip: false, showsDownloadCTA: false,
-                  showsUnavailableCopy: false, primary: .none,
-                  showsOpenSettings: false)
+                  primary: .none, showsOpenSettings: false)
 
     case let .busy(phase):
       // F2: while the engine is starting on a fresh install whose model
@@ -91,110 +113,159 @@ struct NoModelLoadedPrompt: View {
       }()
       return Plan(headline: busyTitle(phase), reason: nil, showsWaitSpinner: true,
                   showsModelChip: false, showsDownloadCTA: keepDownload,
-                  showsUnavailableCopy: false, primary: .none,
-                  showsOpenSettings: false)
+                  primary: .none, showsOpenSettings: false,
+                  detail: busyDetail(phase, action: action, willAutoSend: willAutoSend))
 
-    case .needsDefaultLoad:
+    case let .needsLoad(target):
       // #326 availability action is authoritative for load-vs-download.
       switch action {
       case .load:
         return Plan(headline: "Model not loaded yet", reason: nil, showsWaitSpinner: false,
                     showsModelChip: true, showsDownloadCTA: false,
-                    showsUnavailableCopy: false, primary: .load,
-                    showsOpenSettings: false)
+                    primary: .load, showsOpenSettings: false,
+                    loadCaption: {
+                      // #516: promise the send only when it will happen.
+                      switch (target.source, willAutoSend) {
+                      case (.selected, true):
+                        return "Load your selected model to send your message?"
+                      case (.selected, false):
+                        return "Load your selected model?"
+                      case (_, true):
+                        return "Load this profile's default model to send your message?"
+                      case (_, false):
+                        return "Load this profile's default model?"
+                      }
+                    }())
       case .download:
-        return Plan(headline: "No model loaded", reason: nil, showsWaitSpinner: false,
+        // #446: the body says "isn't downloaded yet" — the headline must
+        // agree. A target IS configured (this is `.needsLoad`); it simply
+        // isn't on disk. "No model loaded" read as "nothing is set up".
+        // #497: name the provenance honestly — a pinned selection is
+        // never described as the profile's default. The
+        // `.engineFailed(.modelMissing)` + `.download` sibling below is
+        // target-NEUTRAL instead (that failure state has no target axis).
+        return Plan(headline: target.source == .selected
+                      ? "Selected model isn't downloaded"
+                      : "Default model isn't downloaded",
+                    reason: nil, showsWaitSpinner: false,
                     showsModelChip: false, showsDownloadCTA: true,
-                    showsUnavailableCopy: false, primary: .none,
-                    showsOpenSettings: false)
+                    primary: .none, showsOpenSettings: false,
+                    downloadCaption: {
+                      // #516: promise the send only when it will happen.
+                      switch (target.source, willAutoSend) {
+                      case (.selected, true):
+                        return "Your selected model isn't downloaded yet. Download it to send your message."
+                      case (.selected, false):
+                        return "Your selected model isn't downloaded yet. Download it to use it here."
+                      case (_, true):
+                        return "This profile's model isn't downloaded yet. Download it to send your message."
+                      case (_, false):
+                        return "This profile's model isn't downloaded yet. Download it to use it here."
+                      }
+                    }())
       case .unavailable:
-        return unavailablePlan()
+        // Review v1 F1: the target is in hand — don't drop it. A pinned
+        // selection that can't be loaded or downloaded must be named as
+        // the selection, never blamed on the profile.
+        return unavailablePlan(target: target)
       }
 
     case .noDefault:
-      return unavailablePlan()
+      return unavailablePlan(target: nil)
 
-    case let .engineFailed(code, reason, retryable):
-      // modelMissing + downloadable → the #326 inline download IS the fix.
+    case let .engineFailed(code, reason):
+      // #477: headline, reason, AND the primary affordance all derive
+      // from the one taxonomy — copy and action can't diverge (review F2:
+      // a `.degraded` helper must not pair "restart the helper" copy with
+      // a Retry-engine button; `.killRejected` must not headline "couldn't
+      // start" over "refused to stop" body). The gate's raw `reason`
+      // diagnostic stays in logs.
+      let problem = EngineProblem(statusCode: code, rawMessage: reason)
+      // modelMissing + downloadable → the #326 inline download IS the fix;
+      // the CTA says it all, so no reason line (matches the
+      // `.needsDefaultLoad` + `.download` sibling above; the #446
+      // download framing keeps its bespoke headline).
       if code == .modelMissing, case .download = action {
-        return Plan(headline: "Default model isn't downloaded", reason: reason,
+        // Review v2 F1: the CTA downloads the GATE target (the chat's pin
+        // when present), but this failure state carries no target axis —
+        // so the headline is target-NEUTRAL, like `busyDetail`. It must
+        // never claim "Default" above a button that downloads a pin. The
+        // headline explains the state, so `downloadCaption` stays nil.
+        return Plan(headline: "Model isn't downloaded", reason: nil,
                     showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: true,
-                    showsUnavailableCopy: false, primary: .none,
-                    showsOpenSettings: false)
+                    primary: .none, showsOpenSettings: false)
       }
-      // Model-choice faults (missing-not-downloadable / too-large /
-      // profile) route to Models settings, never a re-fire (F3).
-      if isModelChoiceFault(code) {
-        return Plan(headline: engineFailedTitle(code), reason: reason,
-                    showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
-                    showsUnavailableCopy: false, primary: .none,
-                    showsOpenSettings: true)
-      }
-      // Retryable engine fault (spawnFailed / engineGone / …) → Retry.
-      // Non-retryable, non-model-choice (killRejected) → terminal: reason
-      // only, no Retry that would re-fire a refused start (F3).
-      return Plan(headline: engineFailedTitle(code), reason: reason,
+      // `.chooseModel` routes to Models settings, never a re-fire (F3);
+      // this includes unsupported cached model artifacts. Only
+      // `.restartEngine` earns a Retry — `.restartHelper`/`none` faults
+      // would re-fail (or be refused) on a blind engine start.
+      return Plan(headline: problem.title, reason: problem.message,
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
-                  showsUnavailableCopy: false,
-                  primary: retryable ? .retryEngine : .none,
-                  showsOpenSettings: false)
+                  primary: problem.recovery == .restartEngine ? .retryEngine : .none,
+                  showsOpenSettings: problem.recovery == .chooseModel)
 
-    case let .loadFailed(_, reason):
-      return Plan(headline: "Couldn't load the model", reason: reason,
+    case .helperUnreachable:
+      // #477: the raw XPC transport error stays in logs; show fixed copy.
+      return Plan(headline: "Can't reach the engine",
+                  reason: "The app can't reach its background helper right now. Try again in a moment.",
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
-                  showsUnavailableCopy: false, primary: .retryLoad,
-                  showsOpenSettings: false)
+                  primary: .refresh, showsOpenSettings: false)
 
-    case let .helperUnreachable(reason):
-      return Plan(headline: "Can't reach the engine", reason: reason,
+    case .configBroken:
+      // #477: the raw profile-store error stays in logs; show fixed copy.
+      return Plan(headline: "Can't read your profile selection",
+                  reason: "Your profile settings couldn't be read. Open Settings → Models to fix them.",
                   showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
-                  showsUnavailableCopy: false, primary: .refresh,
-                  showsOpenSettings: false)
-
-    case let .configBroken(reason):
-      return Plan(headline: "Can't read your profile selection", reason: reason,
-                  showsWaitSpinner: false, showsModelChip: false, showsDownloadCTA: false,
-                  showsUnavailableCopy: false, primary: .none,
-                  showsOpenSettings: true)
+                  primary: .none, showsOpenSettings: true)
     }
   }
 
-  private static func unavailablePlan() -> Plan {
-    Plan(headline: "No model loaded", reason: nil, showsWaitSpinner: false,
-         showsModelChip: false, showsDownloadCTA: false,
-         showsUnavailableCopy: true, primary: .none,
-         showsOpenSettings: true)
-  }
-
-  static func isModelChoiceFault(_ code: EngineErrorCode) -> Bool {
-    switch code {
-    case .modelMissing, .memoryRisk, .profileMissing: return true
-    default:                                          return false
+  private static func unavailablePlan(target: ModelTarget?) -> Plan {
+    if let target, target.source == .selected {
+      return Plan(headline: "Selected model isn't available", reason: nil,
+                  showsWaitSpinner: false, showsModelChip: false,
+                  showsDownloadCTA: false, primary: .none,
+                  showsOpenSettings: true,
+                  unavailableCopy: "Your selected model isn't available on this Mac. Choose another from the Model menu in the toolbar, or add one in Settings → Models.")
     }
-  }
-
-  static func engineFailedTitle(_ code: EngineErrorCode) -> String {
-    switch code {
-    case .modelMissing:   return "Default model isn't downloaded"
-    case .memoryRisk:     return "Model is too large to load"
-    case .profileMissing: return "Profile configuration problem"
-    case .engineGone:     return "Engine stopped unexpectedly"
-    default:              return "The engine couldn't start"
-    }
+    return Plan(headline: "No model loaded", reason: nil, showsWaitSpinner: false,
+                showsModelChip: false, showsDownloadCTA: false,
+                primary: .none, showsOpenSettings: true,
+                unavailableCopy: "This profile has no model ready. Choose one from the Model menu in the toolbar, or add one in Settings → Models.")
   }
 
   static func busyTitle(_ phase: ChatStartGate.BusyPhase) -> String {
     switch phase {
-    case .startingEngine:          return "Starting the engine…"
-    case .stoppingEngine:          return "Stopping the engine…"
-    case let .loadingModel(model): return "Loading \(ModelDisplayName.leaf(model))…"
+    case .startingEngine: return "Starting the engine…"
+    case .stoppingEngine: return "Stopping the engine…"
+    }
+  }
+
+  /// Review v1 F2: `.busy` carries no target axis, so this copy is
+  /// deliberately target-NEUTRAL — it must never claim "this profile's
+  /// model" while the CTA below downloads a pinned selection.
+  static func busyDetail(_ phase: ChatStartGate.BusyPhase,
+                         action: MissingModelRecovery.PromptAction,
+                         willAutoSend: Bool) -> String {
+    switch phase {
+    case .startingEngine:
+      if case .download = action {
+        return "The model isn't downloaded yet — download it to continue."
+      }
+      // #516: "your message will send" is now a kept promise (the armed
+      // pending send fires on resolution); without one armed, stay neutral.
+      return willAutoSend
+        ? "Your model is loading — your message will send once it's ready."
+        : "Your model is loading."
+    case .stoppingEngine:
+      return "One moment…"
     }
   }
 
   // MARK: - body
 
   var body: some View {
-    let plan = Self.plan(state: gateState, action: action)
+    let plan = Self.plan(state: gateState, action: action, willAutoSend: willAutoSend)
     return VStack(alignment: .leading, spacing: 14) {
       if case .ready = gateState {
         EmptyView()
@@ -229,27 +300,31 @@ struct NoModelLoadedPrompt: View {
     if plan.showsWaitSpinner {
       HStack(spacing: 8) {
         ProgressView().controlSize(.small)
-        Text(busyDetail).foregroundStyle(.secondary)
-          .fixedSize(horizontal: false, vertical: true)
+        if let detail = plan.detail {
+          Text(detail).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
       }
     }
     if let reason = plan.reason {
       reasonText(reason)
     }
     if plan.showsModelChip, case let .load(model) = action {
-      Text("Load this profile's default model to send your message?")
-        .fixedSize(horizontal: false, vertical: true)
+      if let caption = plan.loadCaption {
+        Text(caption)
+          .fixedSize(horizontal: false, vertical: true)
+      }
       modelChip(model)
     }
     if plan.showsDownloadCTA, case let .download(target) = action {
-      if plan.reason == nil, !plan.showsWaitSpinner {
-        Text("This profile's model isn't downloaded yet. Download it to send your message.")
+      if let caption = plan.downloadCaption {
+        Text(caption)
           .fixedSize(horizontal: false, vertical: true)
       }
       MissingModelDownloadCTA(target: target, onDownloaded: onDownloaded, engineStatus: engineStatus)
     }
-    if plan.showsUnavailableCopy {
-      Text("This profile has no model ready. Choose one from the Model menu in the toolbar, or add one in Settings → Models.")
+    if let unavailable = plan.unavailableCopy {
+      Text(unavailable)
         .fixedSize(horizontal: false, vertical: true)
     }
   }
@@ -286,13 +361,6 @@ struct NoModelLoadedPrompt: View {
         .buttonStyle(.borderedProminent)
         .keyboardShortcut(.defaultAction)
         .accessibilityIdentifier("noModel.retry")
-    case .retryLoad:
-      Button("Retry") {
-        if case let .loadFailed(model, _) = gateState { onRetryLoad(model) }
-      }
-      .buttonStyle(.borderedProminent)
-      .keyboardShortcut(.defaultAction)
-      .accessibilityIdentifier("noModel.retry")
     case .refresh:
       Button("Retry") { onRefresh() }
         .buttonStyle(.borderedProminent)
@@ -305,33 +373,18 @@ struct NoModelLoadedPrompt: View {
 
   private var glyph: String {
     switch gateState {
-    case .busy:                                                    return "hourglass"
-    case .engineFailed, .loadFailed, .helperUnreachable, .configBroken:
+    case .busy:                                              return "hourglass"
+    case .engineFailed, .helperUnreachable, .configBroken:
       return "exclamationmark.triangle"
-    default:                                                       return "cpu"
+    default:                                                 return "cpu"
     }
   }
 
   private var tint: Color {
     switch gateState {
-    case .engineFailed, .loadFailed, .helperUnreachable, .configBroken: return .orange
-    default:                                                            return .secondary
+    case .engineFailed, .helperUnreachable, .configBroken: return .orange
+    default:                                                return .secondary
     }
-  }
-
-  private var busyDetail: String {
-    if case let .busy(phase) = gateState {
-      switch phase {
-      case .startingEngine:
-        if case .download = action {
-          return "This profile's model isn't downloaded yet — download it to continue."
-        }
-        return "Your model is loading — your message will send once it's ready."
-      case .stoppingEngine: return "One moment…"
-      case .loadingModel:   return "Hang tight — the model is loading."
-      }
-    }
-    return ""
   }
 
   private func reasonText(_ reason: String) -> some View {

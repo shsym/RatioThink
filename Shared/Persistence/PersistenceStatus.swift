@@ -83,7 +83,7 @@ public final class PersistenceStatus: ObservableObject {
   /// file path + result code in `userInfo`, and bare
   /// `localizedDescription` drops it. Used by both this type and
   /// `MessageStreamWriter`'s reporter callback.
-  public static func formatError(_ error: Error) -> String {
+  public nonisolated static func formatError(_ error: Error) -> String {
     let nsError = error as NSError
     let base = error.localizedDescription
     if nsError.userInfo.isEmpty {

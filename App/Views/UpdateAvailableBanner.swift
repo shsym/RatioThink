@@ -22,7 +22,7 @@ struct UpdateAvailableBanner: View {
       VStack(alignment: .leading, spacing: 2) {
         Text("Update available")
           .font(.callout.weight(.medium))
-        Text("RatioThink \(pending.latest) is available. Download it from GitHub, or ignore this version.")
+        Text("Rational \(pending.latest) is available. Download it from GitHub, or ignore this version.")
           .font(.caption)
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
