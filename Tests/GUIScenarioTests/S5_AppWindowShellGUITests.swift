@@ -82,6 +82,8 @@ final class S5_AppWindowShellGUITests: XCTestCase {
     // and routes to the single LocalAPIView.
     XCTAssertTrue(allStrings.contains("API Endpoints"),
                   "sidebar missing 'API Endpoints'; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
+    XCTAssertTrue(app.textFields["chats.searchField"].waitForExistence(timeout: 5),
+                  "simplified left navigation must show chat search above chat rows")
 
     // Detail empty-state — design §5 CTA. Only `Start Chat` is a zero-state
     // CTA; there is no `Add Endpoint` (the local API is the engine's single

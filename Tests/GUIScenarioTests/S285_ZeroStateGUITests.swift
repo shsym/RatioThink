@@ -56,6 +56,9 @@ final class S285_ZeroStateGUITests: XCTestCase {
     let headerNew = app.buttons["chats.newButton"]
     XCTAssertTrue(headerNew.waitForExistence(timeout: 5),
                   "chat list header New Chat affordance missing")
+    let searchField = app.textFields["chats.searchField"]
+    XCTAssertTrue(searchField.waitForExistence(timeout: 5),
+                  "chat search field must sit above chat rows in the simplified left navigation")
     let emptyNew = app.buttons["chats.empty.newButton"]
     XCTAssertTrue(emptyNew.waitForExistence(timeout: 5),
                   "empty-state New Chat affordance missing (empty chat DB expected)")
@@ -67,6 +70,8 @@ final class S285_ZeroStateGUITests: XCTestCase {
     // And it stays below the header, preserving top-down reading order.
     XCTAssertGreaterThan(emptyNew.frame.minY, headerNew.frame.minY,
                          "empty-state placeholder must sit below the list header")
+    XCTAssertGreaterThan(emptyNew.frame.minY, searchField.frame.maxY,
+                         "empty-state placeholder must sit below the search field")
   }
 
   /// The col-3 zero-state "Start Chat" CTA must create a chat and open it,

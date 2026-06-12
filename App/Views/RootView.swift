@@ -1,8 +1,8 @@
 import SwiftUI
 
-/// Three-column shell per design §5 (Notes-style information disclosure).
-/// Sidebar + item-list are independently collapsible via menu commands wired
-/// in `RatioThinkApp` against `WindowState`.
+/// Simplified chat shell: primary navigation plus the searchable chat list live
+/// in the left column, while the middle split-view column stays collapsed.
+/// Sidebar visibility remains wired through `WindowState`.
 struct RootView: View {
   @EnvironmentObject private var windowState: WindowState
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
@@ -53,20 +53,18 @@ struct RootView: View {
         )
       }
       NavigationSplitView(columnVisibility: $windowState.columnVisibility) {
-        SidebarView(selection: $windowState.selectedSection)
+        SidebarView(
+          selection: $windowState.selectedSection,
+          selectedItemID: $windowState.selectedItemID,
+          isItemListHidden: windowState.isItemListHidden
+        )
       } content: {
-        if windowState.isItemListHidden || windowState.selectedSection == .apiEndpoints {
-          // Collapse col 2 to zero width when toggled off via View > Hide
-          // List, or for the API Endpoints section, which has no item list —
-          // its single `LocalAPIView` fills the detail column (#422).
-          Color.clear
-            .navigationSplitViewColumnWidth(min: 0, ideal: 0, max: 0)
-        } else {
-          ItemListView(
-            section: windowState.selectedSection,
-            selectedItemID: $windowState.selectedItemID
-          )
-        }
+        // Ticket #565 simplifies the shell: the searchable chat list now
+        // lives under the primary Chat entry in the left navigation panel.
+        // Keep the split view's content column collapsed so API Endpoints is
+        // also a direct left-nav → detail route.
+        Color.clear
+          .navigationSplitViewColumnWidth(min: 0, ideal: 0, max: 0)
       } detail: {
         DetailView(
           section: windowState.selectedSection,
