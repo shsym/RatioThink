@@ -80,7 +80,7 @@ public struct LocalAPIState: Equatable {
         toggleOn: true,
         toggleEnabled: false,
         statusLabel: "Starting…",
-        detail: "The local API becomes available once the engine finishes loading the model."
+        detail: "Available once the model finishes loading."
       )
     case .stopping:
       return LocalAPIState(
@@ -97,8 +97,8 @@ public struct LocalAPIState: Equatable {
         toggleEnabled: hasActiveProfile,
         statusLabel: "Off",
         detail: hasActiveProfile
-          ? "Turn on to serve OpenAI-compatible requests on 127.0.0.1."
-          : "Select a model in Settings → Models to enable the local API."
+          ? "Turn on to start the engine and serve requests on 127.0.0.1."
+          : "Select a profile in Settings → Profiles to enable the local API."
       )
     case .failed(let code, let message):
       // A retry (start) only makes sense for a recoverable failure that has
@@ -173,7 +173,7 @@ public enum EngineHTTPPosture {
   public static let authSummary =
     "None. Any process on this Mac can call it. Treat it as local-only."
   public static let corsSummary =
-    "No CORS headers are sent, so browser cross-origin requests are blocked. Use curl, an SDK, or a server-side client."
+    "Browser pages can’t call it directly (no CORS headers); use curl or a local client."
 }
 
 /// Pure builders for the copyable snippets the view shows. Kept here so the

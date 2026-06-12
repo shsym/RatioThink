@@ -42,13 +42,13 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertFalse(s.toggleOn)
     XCTAssertTrue(s.toggleEnabled, "a selected model means we can start the engine")
     XCTAssertEqual(s.statusLabel, "Off")
-    XCTAssertEqual(s.detail, "Turn on to serve OpenAI-compatible requests on 127.0.0.1.")
+    XCTAssertEqual(s.detail, "Turn on to start the engine and serve requests on 127.0.0.1.")
   }
 
   func test_stopped_without_profile_is_disabled_with_guidance() {
     let s = LocalAPIState.make(status: .stopped, hasActiveProfile: false)
     XCTAssertFalse(s.toggleEnabled, "nothing to serve → can't turn on")
-    XCTAssertEqual(s.detail, "Select a model in Settings → Models to enable the local API.")
+    XCTAssertEqual(s.detail, "Select a profile in Settings → Profiles to enable the local API.")
   }
 
   // MARK: - failure mapping

@@ -86,7 +86,7 @@ struct LocalAPIView: View {
       Button("Turn Off", role: .destructive) { stop() }
       Button("Cancel", role: .cancel) {}
     } message: {
-      Text("This stops the Rational engine. In-app chat will also stop until you turn it back on.")
+      Text("This stops the engine. In-app chat stops too.")
     }
   }
 
@@ -97,7 +97,7 @@ struct LocalAPIView: View {
       VStack(alignment: .leading, spacing: 4) {
         Text("Local API")
           .font(.title2.weight(.semibold))
-        Text("An OpenAI-compatible HTTP endpoint served by the Rational engine on this Mac. It’s the same engine that powers in-app chat.")
+        Text("An OpenAI-compatible HTTP endpoint on this Mac. One engine serves both this API and in-app chat — there is no separate API server.")
           .font(.callout)
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
@@ -189,12 +189,18 @@ struct LocalAPIView: View {
       labeledCopyRow(
         title: "Base URL",
         value: baseURL,
-        caption: "Loopback only. The port is assigned fresh each time the engine starts.",
+        caption: "Loopback only. The port changes on every engine start, including model switches.",
         identifier: "LocalAPIBaseURL"
       )
 
       if let model = servedModel {
-        infoRow(title: "Model", value: model, identifier: "LocalAPIModel")
+        VStack(alignment: .leading, spacing: 4) {
+          infoRow(title: "Model", value: model, identifier: "LocalAPIModel")
+          Text("Serves only this model. Requests must use this exact model id.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
       }
       if let memory {
         infoRow(title: "Memory (RSS)", value: memory.formattedResident, identifier: "LocalAPIMemory")
@@ -265,7 +271,7 @@ struct LocalAPIView: View {
       Toggle(isOn: autoStartBinding) {
         VStack(alignment: .leading, spacing: 2) {
           Text("Start Local API when RatioThink opens")
-          Text("Off by default. When enabled, RatioThink starts the shared engine on the active profile after launch.")
+          Text("When enabled, the engine starts after launch; API and chat both come online.")
             .font(.caption)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
@@ -275,7 +281,7 @@ struct LocalAPIView: View {
       .accessibilityIdentifier("LocalAPIAutoStartToggle")
 
       postureRow(title: "Profile", value: profileStore.activeProfileID ?? "Select a profile in Settings → Profiles.")
-      Text("Port, authentication, and CORS are fixed by the current engine launch contract. Change the startup policy here; use the Local API switch above for immediate on/off.")
+      Text("Port and authentication are fixed and can’t be configured. Use the switch at the top for on/off.")
         .font(.caption)
         .foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)
@@ -293,7 +299,7 @@ struct LocalAPIView: View {
   private var securitySection: some View {
     VStack(alignment: .leading, spacing: 8) {
       sectionHeader("Security")
-      Text("This endpoint is unauthenticated and local-only for 0.1.2. Don’t treat it as a secured service.")
+      Text("Unauthenticated, loopback-only. Any process on this Mac can call it.")
         .font(.callout)
         .foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)
