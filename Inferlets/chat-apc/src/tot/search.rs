@@ -105,14 +105,11 @@ use super::tree::{
 };
 
 /// Per-branch directive appended to each forked child before it generates
-/// (#523). The branch index makes every sibling's prompt textually distinct
-/// — breaking the prior collapse where all `breadth` children shared one
-/// prompt and diverged only by sampling temperature — and instructs ONE
-/// mutually-exclusive, *named* strategy that differs by primary objective or
-/// tradeoff, not wording. Level 1 proposes a fresh strategy directly; deeper
-/// levels critique the parent then refine along a distinct axis (this
-/// replaces the old single shared `REFINE_INSTRUCTION`, which was flushed
-/// identically into every sibling and so could not diversify them).
+/// (#523/#555). The branch index makes every sibling's prompt textually
+/// distinct, while the level wording keeps the search path-advancing instead
+/// of re-rolling another full answer at each depth. Non-final nodes advance
+/// the selected path by one useful step; final nodes turn that path into a
+/// direct answer candidate.
 ///
 /// Reasoning-aware (#413/#437): a node may generate a `<think>` block then
 /// an answer, which [`generate_demuxed`] splits apart — reasoning IS the
@@ -120,45 +117,45 @@ use super::tree::{
 /// trace while the beam and scorer see only the clean answer. The directive
 /// is wrapped in [`with_thinking`], which appends `/no_think` only when the
 /// search runs with `thinking:false`. Pure → unit-tested.
-fn branch_directive(level: usize, branch_index: usize, breadth: usize, thinking: bool) -> String {
+fn branch_directive(
+    level: usize,
+    max_depth: usize,
+    branch_index: usize,
+    breadth: usize,
+    thinking: bool,
+) -> String {
     let n = branch_index + 1;
-    let body = if level <= 1 {
+    let body = if level >= max_depth {
         format!(
-            "Explore solution path {n} of {breadth} for the user's request. Commit to ONE \
-             specific strategy that differs from the other paths by its primary objective or key \
-             tradeoff — not just by wording. Name your strategy in a short phrase, then answer the \
-             request fully using only that strategy. Be concrete and specific."
+            "Using the selected reasoning path so far, write direct final answer candidate {n}              of {breadth} for the original user prompt. Build on the prior path; do not restart              or re-roll a sibling variant. Do not mention tree search, branches, scores,              strategies, or internal reasoning."
         )
     } else {
         format!(
-            "Critique your previous answer, then continue along refinement path {n} of {breadth}: \
-             pick ONE distinct improvement focus that differs from the sibling paths by primary \
-             objective or tradeoff. Name the focus in a short phrase, then give an improved, \
-             concrete answer committed to it."
+            "Advance selected reasoning path {n} of {breadth} by adding the next useful step              toward answering the original user prompt. Build on the prior path. Do not restart              or re-roll. Keep the step concise, concrete, and useful for              the next depth."
         )
     };
     with_thinking(&body, thinking)
 }
 
-/// Value-evaluator prompt (independent per-node scoring). The node already
-/// did its reasoning; the scorer is a value HEAD that rates the resulting
-/// ANSWER (#437), so it always runs with `/no_think` appended (see
-/// [`score_node`]) to emit a bare integer cheaply — a thinking scorer burns
-/// its budget restating the problem and lands no parseable integer at deeper
-/// levels (observed: depth-2 scores all null → input-order pruning, and ~2×
-/// slower). This is orthogonal to the node-generation `thinking` knob, which
-/// stays on. The directive is inert on a non-reasoning model, and the score
-/// output is demuxed regardless so a stray empty think block can't swallow
-/// the integer.
-const SCORE_PROMPT: &str = "Rate the assistant's latest answer from 1 to 10 on how well it \
-     actually satisfies the user's original request. Judge task relevance, factual and semantic \
-     correctness, specificity, and concrete usefulness. Use the full scale: 1-3 for irrelevant \
-     or mostly off-task answers, 4-6 for partial/generic answers, 7-8 for useful answers with \
-     gaps, and 9-10 for directly actionable answers. A fluent, polished, brief, or polite \
-     answer that does not directly address what was asked is a LOW score (1-3); do not reward \
-     style, brevity, or acknowledgment over substance. Avoid defaulting to 5: separate siblings \
-     by task fit when one answer is more relevant or useful. Respond with only a single integer \
-     from 1 to 10.";
+/// Value-evaluator prompts (independent per-node scoring). The node already
+/// did its reasoning; the scorer is a value HEAD (#437), so it always runs
+/// with `/no_think` appended (see [`score_node`]) to emit a bare integer
+/// cheaply. Intermediate nodes are judged for path progress; final nodes are
+/// judged for direct-answer quality. This is orthogonal to the node-generation
+/// `thinking` knob, which stays on. The directive is inert on a non-reasoning
+/// model, and the score output is demuxed regardless so a stray empty think
+/// block can't swallow the integer.
+const INTERMEDIATE_SCORE_PROMPT: &str = "Rate this node's path progress from 1 to 10 toward      correctly answering the user's original request. Judge whether it concretely advances the      selected reasoning path from its parent, preserves task relevance, and sets up a better      final answer. Use the full scale: 1-3 for restarts, duplicate sibling variants, or      off-task paths; 4-6 for partial or generic progress; 7-8 for useful progress with gaps;      and 9-10 for a strong next step. Do not reward polish, brevity, or a complete-looking      answer over genuine path progress. Respond with only a single integer from 1 to 10.";
+
+const FINAL_SCORE_PROMPT: &str = "Rate the direct final answer quality from 1 to 10 for the      user's original request. Judge task relevance, factual and semantic correctness,      specificity, completeness, and concrete usefulness. Use the full scale: 1-3 for irrelevant      or mostly off-task answers, 4-6 for partial/generic answers, 7-8 for useful answers with      gaps, and 9-10 for directly actionable answers. Penalize mentions of tree search,      branches, scores, strategies, or internal reasoning. Avoid defaulting to 5: separate      siblings by task fit when one answer is more relevant or useful. Respond with only a      single integer from 1 to 10.";
+
+fn score_prompt(is_final_level: bool) -> &'static str {
+    if is_final_level {
+        FINAL_SCORE_PROMPT
+    } else {
+        INTERMEDIATE_SCORE_PROMPT
+    }
+}
 
 /// Token budget for a scoring generation — enough for a suppressed empty
 /// `<think></think>` plus the integer. The scorer is NOT demuxed (see
@@ -237,11 +234,16 @@ fn merge_no_think_retry(first: Demux, retry: Demux) -> Demux {
 /// same sibling path/focus as the original directive but adds explicit
 /// recovery wording so a model that spent the first attempt inside `<think>`
 /// gets a fresh, answer-first instruction.
-fn retry_branch_directive(level: usize, branch_index: usize, breadth: usize) -> String {
+fn retry_branch_directive(
+    level: usize,
+    max_depth: usize,
+    branch_index: usize,
+    breadth: usize,
+) -> String {
     format!(
         "The previous attempt spent its budget in hidden reasoning without producing an answer. \
          Retry now with no hidden reasoning: produce the answer directly and concisely.\n\n{}",
-        branch_directive(level, branch_index, breadth, false)
+        branch_directive(level, max_depth, branch_index, breadth, false)
     )
 }
 
@@ -282,21 +284,15 @@ trait BranchDriver<C> {
 /// unit-tested. (`/no_think` + the low synthesis temperature are applied by
 /// [`synthesize`].)
 fn build_synthesis_directive(best_content: &str, best_reasoning: &str) -> String {
-    let mut s = String::from(
-        "An internal tree-of-thought search explored several strategies and selected the most \
-         promising one. Its result:\n\n",
-    );
+    let mut s = String::from("Selected draft answer:\n\n");
     s.push_str(best_content.trim());
     let r = best_reasoning.trim();
     if !r.is_empty() {
-        s.push_str("\n\nThe reasoning behind it:\n\n");
+        s.push_str("\n\nPrivate supporting notes:\n\n");
         s.push_str(r);
     }
     s.push_str(
-        "\n\nUsing this as your foundation, write the final, complete answer to my original \
-         request. Directly and fully address what I asked, be accurate and thorough, and resolve \
-         any gaps. Do not merely echo the result above, name the strategy, or restate the \
-         question — give the actual answer.",
+        "\n\nAnswer the original user prompt directly. Use the selected draft only as private grounding; improve correctness, completeness, and clarity where needed. Return only the final answer. Do not mention tree search, branches, scores, strategies, or internal reasoning.",
     );
     s
 }
@@ -931,7 +927,7 @@ async fn resolve_level(
         let scores: Vec<Option<ScoreResult>> =
             join_all(gens.iter().map(|(ctx, demux)| async move {
                 if matches!(demux.kind, DemuxKind::Answered) {
-                    Some(score_node(ctx, model).await)
+                    Some(score_node(ctx, model, level == params.depth).await)
                 } else {
                     None
                 }
@@ -996,7 +992,13 @@ where
     // prefix; the directive steers this sibling toward a distinct strategy
     // (its text also makes the first forward pass carry real new tokens
     // rather than spin).
-    let first_directive = branch_directive(level, branch_index, params.breadth, params.thinking);
+    let first_directive = branch_directive(
+        level,
+        params.depth,
+        branch_index,
+        params.breadth,
+        params.thinking,
+    );
     driver.push_user(&mut ctx, &first_directive);
     driver.cue(&mut ctx);
     let demux = driver
@@ -1014,7 +1016,8 @@ where
     if should_retry_reasoning_starved(params.thinking, &demux) {
         match retry_base {
             Some(Ok(mut retry_ctx)) => {
-                let retry_directive = retry_branch_directive(level, branch_index, params.breadth);
+                let retry_directive =
+                    retry_branch_directive(level, params.depth, branch_index, params.breadth);
                 driver.push_user(&mut retry_ctx, &retry_directive);
                 driver.cue(&mut retry_ctx);
                 let retry = driver
@@ -1175,7 +1178,7 @@ async fn expand(
     let (ctx, demux) =
         generate_branch(ctx, model, params, emitter, node_id, level, branch_index).await;
     let score = if matches!(demux.kind, DemuxKind::Answered) {
-        Some(score_node(&ctx, model).await)
+        Some(score_node(&ctx, model, level == params.depth).await)
     } else {
         None
     };
@@ -1195,7 +1198,7 @@ async fn expand(
 /// case the content-channel gate would drop. The three outcomes stay distinct
 /// so an infra failure (fork/generate) is not mistaken for a benign
 /// unparseable score — see [`ScoreOutcome`].
-async fn score_node(ctx: &Context, model: &Model) -> ScoreResult {
+async fn score_node(ctx: &Context, model: &Model, is_final_level: bool) -> ScoreResult {
     let mut sctx = match ctx.fork() {
         Ok(c) => c,
         Err(e) => {
@@ -1205,7 +1208,7 @@ async fn score_node(ctx: &Context, model: &Model) -> ScoreResult {
             };
         }
     };
-    sctx.user(&with_thinking(SCORE_PROMPT, false));
+    sctx.user(&with_thinking(score_prompt(is_final_level), false));
     sctx.cue();
     let stops = chat::stop_tokens(model);
     let mut generator = sctx
@@ -1386,7 +1389,7 @@ mod tests {
         }
     }
 
-    // ── branch_directive (#523 A): per-branch diversity ──
+    // ── branch_directive (#523/#555): per-branch diversity + path advancement ──
 
     #[test]
     fn branch_directives_are_distinct_across_siblings() {
@@ -1394,7 +1397,7 @@ mod tests {
         // so the old identical-prefix collapse is impossible by construction.
         let breadth = 5;
         let ds: Vec<String> = (0..breadth)
-            .map(|b| branch_directive(1, b, breadth, true))
+            .map(|b| branch_directive(1, 3, b, breadth, true))
             .collect();
         for i in 0..breadth {
             for j in (i + 1)..breadth {
@@ -1404,78 +1407,94 @@ mod tests {
     }
 
     #[test]
-    fn branch_directive_level1_proposes_a_named_strategy() {
-        let d = branch_directive(1, 0, 3, true);
-        assert!(d.contains("path 1 of 3"));
-        assert!(d.to_lowercase().contains("strategy"));
-        // Level 1 proposes fresh; it does not ask to critique a prior answer.
-        assert!(!d.to_lowercase().contains("critique"));
+    fn branch_directive_intermediate_advances_selected_path_without_rerolling() {
+        let d = branch_directive(1, 3, 0, 3, true);
+        assert!(d.contains("selected reasoning path 1 of 3"), "{d}");
+        assert!(d.contains("Build on the prior path"), "{d}");
+        assert!(d.contains("Do not restart"), "{d}");
+        assert!(d.contains("next depth"), "{d}");
+        assert!(!d.contains("Critique your previous answer"), "{d}");
+        assert!(!d.contains("another complete answer"), "{d}");
     }
 
     #[test]
-    fn branch_directive_deeper_levels_critique_then_refine() {
-        let d = branch_directive(2, 1, 3, true);
-        assert!(d.contains("path 2 of 3"));
-        assert!(d.to_lowercase().contains("critique"));
+    fn branch_directive_final_requests_direct_answer() {
+        let d = branch_directive(3, 3, 1, 3, true);
+        assert!(d.contains("direct final answer"), "{d}");
+        assert!(d.contains("original user prompt"), "{d}");
+        assert!(d.contains("Do not mention tree search"), "{d}");
     }
 
     #[test]
     fn branch_directive_honors_thinking_knob() {
         // thinking:false suppresses per-node reasoning via the /no_think
         // marker (reused from `with_thinking`); thinking:true keeps it.
-        assert!(branch_directive(1, 0, 3, false).contains("/no_think"));
-        assert!(!branch_directive(1, 0, 3, true).contains("/no_think"));
+        assert!(branch_directive(1, 3, 0, 3, false).contains("/no_think"));
+        assert!(!branch_directive(1, 3, 0, 3, true).contains("/no_think"));
     }
 
-    // ── SCORE_PROMPT (#523 B): rubric weights task relevance over style ──
+    // ── score_prompt (#555): intermediate progress vs final answer quality ──
 
     #[test]
-    fn score_prompt_rubric_weights_substance_not_fluency() {
-        let p = SCORE_PROMPT.to_lowercase();
-        assert!(p.contains("satisf"));
-        assert!(p.contains("relevance"));
-        assert!(p.contains("correct"));
-        assert!(p.contains("specific"));
-        // …and explicitly does NOT reward style/brevity/acknowledgment.
-        assert!(p.contains("low score"));
-        assert!(p.contains("do not reward"));
-        assert!(p.contains("1-3"));
-        assert!(p.contains("4-6"));
-        assert!(p.contains("7-8"));
-        assert!(p.contains("9-10"));
-        assert!(p.contains("avoid defaulting to 5"));
+    fn score_prompt_intermediate_rates_path_progress_not_final_quality() {
+        let p = score_prompt(false).to_lowercase();
+        assert!(p.contains("path progress"));
+        assert!(p.contains("concretely advances"));
+        assert!(p.contains("duplicate sibling variants"));
         assert!(p.contains("single integer"));
+        assert!(!p.contains("direct final answer quality"));
     }
 
-    // ── build_synthesis_directive (#523 Part A): final-answer assembly seam ──
+    #[test]
+    fn score_prompt_final_rates_direct_answer_quality() {
+        let p = score_prompt(true).to_lowercase();
+        assert!(p.contains("direct final answer quality"));
+        assert!(p.contains("relevance"));
+        assert!(p.contains("correctness"));
+        assert!(p.contains("specificity"));
+        assert!(p.contains("completeness"));
+        assert!(p.contains("tree search"));
+        assert!(p.contains("single integer"));
+        assert!(!p.contains("path progress"));
+    }
+
+    // ── build_synthesis_directive (#523/#555): final-answer assembly seam ──
 
     #[test]
     fn synthesis_directive_embeds_best_content_and_directs_a_full_answer() {
         let d = build_synthesis_directive("Book a private venue that fits 20 guests.", "");
-        // The chosen candidate is embedded as the grounding…
+        // The chosen candidate is embedded as private grounding…
         assert!(d.contains("Book a private venue that fits 20 guests."));
-        // …and the instruction directs the final answer, not an echo.
+        // …and the instruction directs the final answer, not an echo of search internals.
         let lo = d.to_lowercase();
-        assert!(lo.contains("final"));
-        assert!(lo.contains("answer to my original request"));
-        assert!(lo.contains("do not merely echo"));
-        // No reasoning section when reasoning is empty.
-        assert!(!d.contains("reasoning behind it"));
+        assert!(lo.contains("answer the original user prompt directly"));
+        assert!(lo.contains("return only the final answer"));
+        assert!(lo.contains("do not mention tree search"));
+        assert!(lo.contains("branches"));
+        assert!(lo.contains("scores"));
+        assert!(lo.contains("strategies"));
+        assert!(lo.contains("internal reasoning"));
+        assert!(!lo.contains("tree-of-thought"));
+        // No notes section when reasoning is empty.
+        assert!(!d.contains("Private supporting notes"));
     }
 
     #[test]
-    fn synthesis_directive_includes_reasoning_when_present() {
+    fn synthesis_directive_includes_private_notes_when_present() {
         let d =
             build_synthesis_directive("Answer X.", "First consider the budget, then the venue.");
-        assert!(d.contains("The reasoning behind it:"));
+        assert!(d.contains("Private supporting notes:"));
         assert!(d.contains("First consider the budget, then the venue."));
     }
 
     #[test]
     fn synthesis_directive_trims_whitespace_only_reasoning() {
-        // Whitespace-only reasoning must not open an empty reasoning section.
-        let d = build_synthesis_directive("Answer.", "   \n  ");
-        assert!(!d.contains("reasoning behind it"));
+        // Whitespace-only reasoning must not open an empty notes section.
+        let d = build_synthesis_directive(
+            "Answer.", "   
+  ",
+        );
+        assert!(!d.contains("Private supporting notes"));
     }
 
     // ── Temperature split (#523 Part B): three roles, three temperatures ──

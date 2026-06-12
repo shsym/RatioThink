@@ -111,7 +111,6 @@ use std::time::Instant;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Response};
 
-
 fn validate_tot_messages(
     messages: &[ChatMessage],
 ) -> Result<(), completions::MessageValidationError> {
@@ -461,7 +460,6 @@ async fn dispatch_streaming(
     sse::emit_done_logged(&mut em, "tot_terminal").await;
     em.finish()
 }
-
 
 #[cfg(test)]
 mod tests {

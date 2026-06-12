@@ -728,6 +728,8 @@ async def main() -> int:
                             failures.append(f"tot root shape {root!r}")
                         if (body.get("breadth"), body.get("depth"), body.get("beam_width")) != (bd, dp, bw):
                             failures.append(f"tot echoed params {body!r}")
+                        if not isinstance(body.get("synthesized"), bool):
+                            failures.append(f"tot synthesized flag {body.get('synthesized')!r} (want bool)")
 
                         def _walk(n):
                             out = [n]
