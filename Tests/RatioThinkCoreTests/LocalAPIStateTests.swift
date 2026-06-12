@@ -48,7 +48,37 @@ final class LocalAPIStateTests: XCTestCase {
   func test_stopped_without_profile_is_disabled_with_guidance() {
     let s = LocalAPIState.make(status: .stopped, hasActiveProfile: false)
     XCTAssertFalse(s.toggleEnabled, "nothing to serve → can't turn on")
-    XCTAssertEqual(s.detail, "Select a profile in Settings → Profiles to enable the local API.")
+    XCTAssertEqual(s.detail, "Choose a profile in the chat toolbar to enable the local API.")
+  }
+
+  // MARK: - served model id (exact-id guidance must be authoritative)
+
+  /// The reducer takes no profile-model input at all, so the served id can
+  /// only ever come from the running snapshot — a profile fallback is
+  /// impossible by construction. This pins the snapshot pass-through for a
+  /// model that intentionally differs from any plausible profile default.
+  func test_running_servedModelID_comes_from_snapshot_only() {
+    let s = LocalAPIState.make(
+      status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat",
+                                             servedModelID: "org/override-model.gguf")),
+      hasActiveProfile: true)
+    XCTAssertEqual(s.servedModelID, "org/override-model.gguf")
+  }
+
+  /// A legacy snapshot carries `servedModelID = ""` — the exact-id row and
+  /// curl example must fail closed (hidden), never guess a substitute.
+  func test_running_empty_snapshot_servedModelID_fails_closed_to_nil() {
+    let s = LocalAPIState.make(
+      status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat")),
+      hasActiveProfile: true)
+    XCTAssertNil(s.servedModelID)
+  }
+
+  func test_non_running_states_have_no_servedModelID() {
+    for status: EngineStatus in [.starting, .stopping, .stopped,
+                                 .failed(code: .modelMissing, message: "x")] {
+      XCTAssertNil(LocalAPIState.make(status: status, hasActiveProfile: true).servedModelID)
+    }
   }
 
   // MARK: - failure mapping

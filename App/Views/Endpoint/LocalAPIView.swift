@@ -10,8 +10,9 @@ import SwiftUI
 ///
 /// Everything shown is bound to a real source:
 ///  · status / base URL / port ← `EngineStatusStore` (`EngineStatus.running`)
-///  · served model            ← `/v1/models` (`EngineClient.models()`),
-///                               cross-checked with the active profile
+///  · served model            ← `LocalAPIState.servedModelID` (authoritative
+///                               `EngineSessionSnapshot.servedModelID`; never
+///                               a `/v1/models` re-fetch or profile fallback)
 ///  · health                  ← `/healthz` (`EngineClient.health()`)
 ///  · resident memory (RSS)   ← `EngineStatusStore.engineMemory()`
 ///  · security posture        ← `EngineHTTPPosture` (pinned to the launch
@@ -27,7 +28,6 @@ struct LocalAPIView: View {
   @EnvironmentObject private var appPreferences: AppPreferences
 
   @State private var memory: EngineMemorySample?
-  @State private var servedModel: String?
   @State private var health: EngineHealth.Status?
   @State private var confirmStop = false
   /// Last engine start/stop failure, surfaced near the status card. The
@@ -193,7 +193,7 @@ struct LocalAPIView: View {
         identifier: "LocalAPIBaseURL"
       )
 
-      if let model = servedModel {
+      if let model = state.servedModelID {
         VStack(alignment: .leading, spacing: 4) {
           infoRow(title: "Model", value: model, identifier: "LocalAPIModel")
           Text("Serves only this model. Requests must use this exact model id.")
@@ -214,7 +214,9 @@ struct LocalAPIView: View {
       }
 
       endpointsSection
-      curlSection(baseURL: baseURL)
+      if let model = state.servedModelID {
+        curlSection(baseURL: baseURL, model: model)
+      }
     }
   }
 
@@ -240,8 +242,8 @@ struct LocalAPIView: View {
     .accessibilityIdentifier("LocalAPIEndpoints")
   }
 
-  private func curlSection(baseURL: String) -> some View {
-    let snippet = LocalAPICurl.chatCompletions(baseURL: baseURL, model: servedModel ?? "<model>")
+  private func curlSection(baseURL: String, model: String) -> some View {
+    let snippet = LocalAPICurl.chatCompletions(baseURL: baseURL, model: model)
     return VStack(alignment: .leading, spacing: 4) {
       HStack {
         sectionHeader("curl example")
@@ -280,7 +282,7 @@ struct LocalAPIView: View {
       .toggleStyle(.switch)
       .accessibilityIdentifier("LocalAPIAutoStartToggle")
 
-      postureRow(title: "Profile", value: profileStore.activeProfileID ?? "Select a profile in Settings → Profiles.")
+      postureRow(title: "Profile", value: profileStore.activeProfileID ?? "Choose a profile in the chat toolbar.")
       Text("Port and authentication are fixed and can’t be configured. Use the switch at the top for on/off.")
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -418,8 +420,9 @@ struct LocalAPIView: View {
   /// on every fresh launch (the port changes) and tears down when the view
   /// goes away.
   ///
-  /// The served-model id and health are read once per launch — both are
-  /// stable for a given engine. Resident memory drifts, so it refreshes on a
+  /// Health is read once per launch — it is stable for a given engine (the
+  /// served-model id comes from the running snapshot via `LocalAPIState`,
+  /// not from a fetch). Resident memory drifts, so it refreshes on a
   /// modest interval to stay an honest *live* figure. The refresh loop is
   /// skipped on test launches so GUI/E2E suites don't see per-tick churn
   /// (the same gate `RootView` uses for its launch-time work); the values are
@@ -427,12 +430,10 @@ struct LocalAPIView: View {
   /// status-popover flap #327 warns about.
   private func runLiveStats() async {
     guard state.isServing else {
-      memory = nil; servedModel = nil; health = nil
+      memory = nil; health = nil
       return
     }
     let client = engineClientStore.client
-    servedModel = (try? await client.models())?.first?.id
-      ?? profileStore.activeProfile?.model
     health = (try? await client.health())?.status
     memory = await engineStatusStore.engineMemory()
 

@@ -43,6 +43,14 @@ public struct LocalAPIState: Equatable {
   /// Optional sub-line: failure cause or guidance when not serving.
   public let detail: String?
 
+  /// The authoritative served-model id from the running
+  /// `EngineSessionSnapshot`, else `nil`. The Local API surface labels this
+  /// as the EXACT id requests must use, so it is never approximated: no
+  /// `/v1/models` re-fetch, no `activeProfile.model` fallback. A legacy
+  /// snapshot with an empty `servedModelID` maps to `nil` (fail closed —
+  /// the exact-id row and curl example are hidden rather than guessed).
+  public let servedModelID: String?
+
   /// True only while the engine is running — gates the live-stat rows
   /// (base URL, model, memory, routes, curl).
   public var isServing: Bool {
@@ -72,7 +80,8 @@ public struct LocalAPIState: Equatable {
         toggleOn: true,
         toggleEnabled: true,
         statusLabel: "Running",
-        detail: nil
+        detail: nil,
+        servedModelID: snapshot.servedModelID.isEmpty ? nil : snapshot.servedModelID
       )
     case .starting:
       return LocalAPIState(
@@ -80,7 +89,8 @@ public struct LocalAPIState: Equatable {
         toggleOn: true,
         toggleEnabled: false,
         statusLabel: "Starting…",
-        detail: "Available once the model finishes loading."
+        detail: "Available once the model finishes loading.",
+        servedModelID: nil
       )
     case .stopping:
       return LocalAPIState(
@@ -88,7 +98,8 @@ public struct LocalAPIState: Equatable {
         toggleOn: false,
         toggleEnabled: false,
         statusLabel: "Stopping…",
-        detail: nil
+        detail: nil,
+        servedModelID: nil
       )
     case .stopped:
       return LocalAPIState(
@@ -98,7 +109,8 @@ public struct LocalAPIState: Equatable {
         statusLabel: "Off",
         detail: hasActiveProfile
           ? "Turn on to start the engine and serve requests on 127.0.0.1."
-          : "Select a profile in Settings → Profiles to enable the local API."
+          : "Choose a profile in the chat toolbar to enable the local API.",
+        servedModelID: nil
       )
     case .failed(let code, let message):
       // A retry (start) only makes sense for a recoverable failure that has
@@ -110,7 +122,8 @@ public struct LocalAPIState: Equatable {
         toggleOn: false,
         toggleEnabled: canRetry,
         statusLabel: "Engine failed",
-        detail: failureReason(code: code, message: message)
+        detail: failureReason(code: code, message: message),
+        servedModelID: nil
       )
     }
   }
