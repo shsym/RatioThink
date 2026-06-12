@@ -49,7 +49,7 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
       Self.locateSiblingApp(named: "Rational.app", from: type(of: self)),
       "Rational.app not found next to test bundle — verify RatioThinkGUITests depends on target RatioThink"
     )
-    try terminateRunningRationalApps()
+    try terminateRunningRationalApps(at: stagedAppURL)
     let app = XCUIApplication()
     app.launchArguments.append(contentsOf: Self.restorationOffArgs)
     configureCompletedFirstLaunch(app)
@@ -119,6 +119,21 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
       "deep link did not foreground the app; final state=\(app.state)")
   }
 
+  func test_cleanupPlanRejectsNonStagedBundleURL() throws {
+    let staged = URL(fileURLWithPath: "/tmp/current/Build/Products/Debug/Rational.app")
+    let stale = URL(fileURLWithPath: "/Users/dev/Library/Developer/Xcode/DerivedData/Other/Build/Products/Debug/Rational.app")
+
+    let plan = Self.rationalAppCleanupPlan(
+      runningAppBundleURLs: [stale],
+      stagedAppURL: staged)
+
+    XCTAssertEqual(
+      plan,
+      .failNonStaged([
+        "/Users/dev/Library/Developer/Xcode/DerivedData/Other/Build/Products/Debug/Rational.app",
+      ]))
+  }
+
   /// Move focus away from Rational before URL delivery so the post-delivery
   /// `.runningForeground` wait proves the deep-link handler foregrounded the
   /// app instead of inheriting a foreground state created by the test setup.
@@ -142,55 +157,107 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
       line: line)
   }
 
-  /// XCUITest's configured app launch is path-backed by the UI-test target, but
-  /// a still-running same-bundle-id Rational from another DerivedData can be
-  /// attached/activated before Xcode gets to spawn the staged AUT. Remove that
-  /// running-process collision first; the subsequent `XCUIApplication()`
-  /// launch remains XCUITest-owned and the staged-path guard below fails closed
-  /// if Xcode/LaunchServices still picks the wrong artifact.
-  private func terminateRunningRationalApps() throws {
+  /// XCUITest's configured app launch is path-backed by the UI-test target.
+  /// It is safe to remove only a previous instance of that same staged AUT; a
+  /// different same-bundle-id Rational belongs to another install/worktree and
+  /// must fail closed instead of being terminated by this test.
+  private func terminateRunningRationalApps(at stagedAppURL: URL) throws {
     let apps = NSWorkspace.shared.runningApplications
       .filter { $0.bundleIdentifier == "com.ratiothink.app" }
     guard !apps.isEmpty else { return }
 
-    for app in apps {
+    switch Self.rationalAppCleanupPlan(
+      runningAppBundleURLs: apps.map(\.bundleURL),
+      stagedAppURL: stagedAppURL) {
+    case .terminateStaged:
+      break
+    case let .failNonStaged(paths):
+      throw S420LaunchError.nonStagedAppsAlreadyRunning(paths)
+    }
+
+    for app in apps where Self.isStagedRationalApp(
+      bundleURL: app.bundleURL,
+      stagedAppURL: stagedAppURL) {
       app.terminate()
     }
 
-    if waitUntilNoRationalAppsAreRunning(timeout: 2) { return }
+    if waitUntilNoStagedRationalAppsAreRunning(stagedAppURL: stagedAppURL, timeout: 2) { return }
 
     for app in NSWorkspace.shared.runningApplications
-      .filter({ $0.bundleIdentifier == "com.ratiothink.app" }) {
+      .filter({
+        $0.bundleIdentifier == "com.ratiothink.app"
+          && Self.isStagedRationalApp(bundleURL: $0.bundleURL, stagedAppURL: stagedAppURL)
+      }) {
       app.forceTerminate()
     }
 
-    if waitUntilNoRationalAppsAreRunning(timeout: 3) { return }
+    if waitUntilNoStagedRationalAppsAreRunning(stagedAppURL: stagedAppURL, timeout: 3) { return }
 
     let paths = NSWorkspace.shared.runningApplications
-      .filter { $0.bundleIdentifier == "com.ratiothink.app" }
+      .filter {
+        $0.bundleIdentifier == "com.ratiothink.app"
+          && Self.isStagedRationalApp(bundleURL: $0.bundleURL, stagedAppURL: stagedAppURL)
+      }
       .compactMap { $0.bundleURL?.path }
       .joined(separator: ", ")
-    throw S420LaunchError.timedOutTerminatingPreExistingApps(paths)
+    throw S420LaunchError.timedOutTerminatingStagedApps(paths)
   }
 
-  private func waitUntilNoRationalAppsAreRunning(timeout: TimeInterval) -> Bool {
+  private func waitUntilNoStagedRationalAppsAreRunning(
+    stagedAppURL: URL,
+    timeout: TimeInterval
+  ) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     repeat {
       let stillRunning = NSWorkspace.shared.runningApplications
-        .contains { $0.bundleIdentifier == "com.ratiothink.app" }
+        .contains {
+          $0.bundleIdentifier == "com.ratiothink.app"
+            && Self.isStagedRationalApp(bundleURL: $0.bundleURL, stagedAppURL: stagedAppURL)
+        }
       if !stillRunning { return true }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
     } while Date() < deadline
     return false
   }
 
+  private static func rationalAppCleanupPlan(
+    runningAppBundleURLs: [URL?],
+    stagedAppURL: URL
+  ) -> RationalAppCleanupPlan {
+    let nonStagedPaths = runningAppBundleURLs.compactMap { bundleURL -> String? in
+      guard let bundleURL else { return "<unknown bundle URL>" }
+      let actual = canonicalAppURL(bundleURL)
+      return actual == canonicalAppURL(stagedAppURL) ? nil : actual.path
+    }
+
+    if !nonStagedPaths.isEmpty {
+      return .failNonStaged(nonStagedPaths)
+    }
+    return .terminateStaged
+  }
+
+  private static func isStagedRationalApp(bundleURL: URL?, stagedAppURL: URL) -> Bool {
+    guard let bundleURL else { return false }
+    return canonicalAppURL(bundleURL) == canonicalAppURL(stagedAppURL)
+  }
+
+  private enum RationalAppCleanupPlan: Equatable {
+    case terminateStaged
+    case failNonStaged([String])
+  }
+
   private enum S420LaunchError: Error, CustomStringConvertible {
-    case timedOutTerminatingPreExistingApps(String)
+    case nonStagedAppsAlreadyRunning([String])
+    case timedOutTerminatingStagedApps(String)
 
     var description: String {
       switch self {
-      case let .timedOutTerminatingPreExistingApps(paths):
-        return "Timed out terminating pre-existing Rational.app instances before S420 launch: \(paths)"
+      case let .nonStagedAppsAlreadyRunning(paths):
+        return "Non-staged Rational.app instances are already running; S420 will not terminate "
+          + "apps outside its staged AUT boundary. Quit these apps and retry. Observed: "
+          + paths.joined(separator: ", ")
+      case let .timedOutTerminatingStagedApps(paths):
+        return "Timed out terminating staged Rational.app instances before S420 launch: \(paths)"
       }
     }
   }
