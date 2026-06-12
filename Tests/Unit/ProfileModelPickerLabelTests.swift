@@ -30,6 +30,29 @@ final class ProfileModelPickerLabelTests: XCTestCase {
       "The full resolver slug should remain available through accessibility help/value even when the visible label is shortened")
   }
 
+  func test_closed_picker_control_accessibility_text_includes_advisory_warning() {
+    let warning = "Unverified — may not be supported"
+    let option = option(
+      slug: "community/Unverified-GGUF/Unverified-Q4_K_M.gguf",
+      supportWarning: warning
+    )
+    let model = ProfileModelPickerSelectionLabelModel(
+      fallbackModel: option.slug,
+      selectedOption: option,
+      memoryPolicy: nil
+    )
+
+    let accessibilityText = ProfileModelPickerLabel.controlAccessibilityText(
+      for: option.slug,
+      model: model
+    )
+
+    XCTAssertEqual(accessibilityText, "\(warning)\n\(option.slug)")
+    XCTAssertTrue(
+      accessibilityText.contains(warning),
+      "The closed ProfileEditor model picker control help/value must include advisory support warnings")
+  }
+
   func test_visible_selected_label_text_uses_friendly_leaf_not_raw_slug() {
     let visibleText = visibleTextStrings(in: ProfileModelPickerLabel(modelID: longModelID).body)
 
@@ -49,6 +72,22 @@ final class ProfileModelPickerLabelTests: XCTestCase {
       visibleText,
       ["No default model"],
       "A profile with no default model should keep the explicit no-default label after the bounded picker-label merge")
+  }
+
+  private func option(
+    slug: String,
+    supportWarning: String? = nil
+  ) -> ProfileModelOptions.Option {
+    ProfileModelOptions.Option(
+      slug: slug,
+      displayName: ModelDisplayName.leaf(slug),
+      sizeBytes: nil,
+      source: nil,
+      isOverLimit: false,
+      isCurrent: true,
+      unsupportedReason: nil,
+      supportWarning: supportWarning
+    )
   }
 
   private func visibleTextStrings(in value: Any) -> [String] {

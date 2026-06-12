@@ -125,7 +125,17 @@ struct ProfileEditor: View {
   /// default via `ProfileStore.setModel`. This is a default for the
   /// swap-confirm PRE-FILL only — it never triggers a load.
   private func modelPicker(profile: Profile) -> some View {
-    Menu {
+    let selectedLabelModel = ProfileModelPickerSelectionLabelModel(
+      fallbackModel: profile.model,
+      selectedOption: modelOptions.first { $0.slug == profile.model },
+      memoryPolicy: memoryPolicy
+    )
+    let selectedAccessibilityText = ProfileModelPickerLabel.controlAccessibilityText(
+      for: profile.model,
+      model: selectedLabelModel
+    )
+
+    return Menu {
       ForEach(modelOptions) { option in
         Button {
           persistModel(option.slug, profileID: profile.id)
@@ -151,18 +161,14 @@ struct ProfileEditor: View {
       .accessibilityIdentifier("ProfileEditorModelPickerManageModels")
     } label: {
       ProfileModelPickerLabel(
-        model: ProfileModelPickerSelectionLabelModel(
-          fallbackModel: profile.model,
-          selectedOption: modelOptions.first { $0.slug == profile.model },
-          memoryPolicy: memoryPolicy
-        ),
+        model: selectedLabelModel,
         modelID: profile.model
       )
     }
     .menuStyle(.borderlessButton)
     .fixedSize()
-    .help(ProfileModelPickerLabel.accessibilityHelpText(for: profile.model))
-    .accessibilityValue(ProfileModelPickerLabel.accessibilityHelpText(for: profile.model))
+    .help(selectedAccessibilityText)
+    .accessibilityValue(selectedAccessibilityText)
     .accessibilityIdentifier("ProfileEditorModelPicker")
   }
 
@@ -454,11 +460,11 @@ struct ProfileModelPickerLabel: View {
     .frame(idealWidth: Self.maxLayoutWidth,
            maxWidth: Self.maxLayoutWidth,
            alignment: .leading)
-    .help(Self.accessibilityHelpText(for: modelID, warningText: model.warningText))
+    .help(Self.controlAccessibilityText(for: modelID, model: model))
     .accessibilityElement(children: .ignore)
     .accessibilityLabel(model.accessibilityLabel)
-    .accessibilityHint(Self.accessibilityHelpText(for: modelID, warningText: model.warningText))
-    .accessibilityValue(Self.accessibilityHelpText(for: modelID))
+    .accessibilityHint(Self.controlAccessibilityText(for: modelID, model: model))
+    .accessibilityValue(Self.controlAccessibilityText(for: modelID, model: model))
   }
 
   static func displayText(for modelID: String?) -> String {
@@ -467,6 +473,13 @@ struct ProfileModelPickerLabel: View {
 
   static func accessibilityHelpText(for modelID: String?) -> String {
     modelID ?? displayText(for: modelID)
+  }
+
+  static func controlAccessibilityText(
+    for modelID: String?,
+    model: ProfileModelPickerSelectionLabelModel
+  ) -> String {
+    accessibilityHelpText(for: modelID, warningText: model.warningText)
   }
 
   static func accessibilityHelpText(for modelID: String?, warningText: String?) -> String {
