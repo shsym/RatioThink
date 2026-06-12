@@ -18,9 +18,8 @@ Extends the baseline `e2e_test.py` engine-side coverage with:
           ->  client runs a fake tool  ->  submits the result turn
           ->  receives a final assistant answer.
      Non-streaming + streaming wire shapes are both asserted. The
-     `role:"tool"` follow-up shape is a documented gap (chat-apc returns
-     400 `tool_role_unsupported`); the contract uses the server's
-     documented user-turn path and pins the 400 as a known limitation.
+     continuation uses the OpenAI-native history shape: assistant
+     `tool_calls`, then `role:"tool"` with the matching `tool_call_id`.
   5. Harsh live-surface evaluation (#467) — the malformed/abusive inputs a
      normal SDK never sends, on the no-auth loopback surface: HTTP method
      abuse, the closed-CORS security posture (no `Access-Control-*`),
@@ -312,12 +311,18 @@ async def section_protocol_stress(base: str, http: httpx.AsyncClient, rep: Repor
     ok = r.status_code == 409 and r.json().get("error", {}).get("code") == "target_mismatch"
     rep.ok(ok, f"{P}: unknown model -> {r.status_code} {r.text[:120]!r} (want 409 target_mismatch)")
 
-    # invalid role "tool" -> 400 tool_role_unsupported.
+    # Orphan role "tool" -> 400 with a precise tool_call_id param.
     r = await http.post(f"{base}/v1/chat/completions", json={
         "model": MODEL, "messages": [{"role": "tool", "content": "x"}], "stream": False,
     })
-    ok = r.status_code == 400 and r.json().get("error", {}).get("code") == "tool_role_unsupported"
-    rep.ok(ok, f"{P}: role=tool -> {r.status_code} {r.text[:120]!r} (want 400 tool_role_unsupported)")
+    err = r.json().get("error", {}) if r.status_code == 400 else {}
+    ok = (
+        r.status_code == 400
+        and err.get("code") == "missing_tool_call_id"
+        and err.get("param") == "messages[0].tool_call_id"
+    )
+    rep.ok(ok, f"{P}: orphan role=tool -> {r.status_code} {r.text[:120]!r} "
+               "(want 400 missing_tool_call_id param=messages[0].tool_call_id)")
 
     # unknown role (#468) -> 400 unsupported_role, NOT a silently mis-templated
     # 200. `developer` is included: OpenAI accepts it but the chat template has
@@ -720,18 +725,218 @@ async def section_toolcall_parse(base: str, http: httpx.AsyncClient, rep: Report
     rep.ok(r.status_code in (200, 404),
            f"{P}: tools[]+auto -> {r.status_code} (want 200/404; tools[] must deserialize, no 5xx)")
 
-    # role:"tool" follow-up shape is unsupported -> documented 400. Pin it so
-    # the gap can't silently change shape.
+    # role:"tool" without preceding assistant tool_calls is still malformed;
+    # the OpenAI-compatible path requires preserving the assistant call ID.
     r = await http.post(f"{base}/v1/chat/completions", json={
         "model": MODEL,
         "messages": [{"role": "tool", "tool_call_id": "call_x", "content": "4"}],
         "stream": False,
     })
-    ok = r.status_code == 400 and r.json().get("error", {}).get("code") == "tool_role_unsupported"
-    rep.ok(ok, f"{P}: role=tool gap -> {r.status_code} {r.text[:120]!r} (want 400 tool_role_unsupported)")
-    rep.skip("scope4: OpenAI-native role=\"tool\"+tool_call_id follow-up is a documented gap "
-             "(chat-apc returns 400 tool_role_unsupported); contract uses the server's user-turn "
-             "path. Native tool-result turn tracked as a follow-up (SDK answer_prefix unwired).")
+    err = r.json().get("error", {}) if r.status_code == 400 else {}
+    ok = (
+        r.status_code == 400
+        and err.get("code") == "unknown_tool_call_id"
+        and err.get("param") == "messages[0].tool_call_id"
+    )
+    rep.ok(ok, f"{P}: orphan role=tool -> {r.status_code} {r.text[:120]!r} "
+               "(want 400 unknown_tool_call_id param=messages[0].tool_call_id)")
+
+    malformed_tool_calls = [
+        (
+            {"type": "function", "function": {"name": "calculator", "arguments": "{}"}},
+            "messages[0].tool_calls[0].id",
+        ),
+        (
+            {"id": "call_x", "function": {"name": "calculator", "arguments": "{}"}},
+            "messages[0].tool_calls[0].type",
+        ),
+        (
+            {"id": "call_x", "type": "function"},
+            "messages[0].tool_calls[0].function",
+        ),
+        (
+            {"id": "call_x", "type": "function", "function": {"arguments": "{}"}},
+            "messages[0].tool_calls[0].function.name",
+        ),
+        (
+            {"id": "call_x", "type": "function", "function": {"name": "calculator"}},
+            "messages[0].tool_calls[0].function.arguments",
+        ),
+        (
+            {"id": 123, "type": "function", "function": {"name": "calculator", "arguments": "{}"}},
+            "messages[0].tool_calls[0].id",
+        ),
+        (
+            {"id": "call_x", "type": 7, "function": {"name": "calculator", "arguments": "{}"}},
+            "messages[0].tool_calls[0].type",
+        ),
+        (
+            {"id": "call_x", "type": "function", "function": []},
+            "messages[0].tool_calls[0].function",
+        ),
+        (
+            {"id": "call_x", "type": "function", "function": {"name": {}, "arguments": "{}"}},
+            "messages[0].tool_calls[0].function.name",
+        ),
+    ]
+    for tool_call, param in malformed_tool_calls:
+        r = await http.post(f"{base}/v1/chat/completions", json={
+            "model": MODEL,
+            "messages": [{"role": "assistant", "content": None, "tool_calls": [tool_call]}],
+            "stream": False,
+        })
+        err = r.json().get("error", {}) if r.status_code == 400 else {}
+        ok = (
+            r.status_code == 400
+            and err.get("code") == "malformed_tool_calls"
+            and err.get("param") == param
+        )
+        rep.ok(ok, f"{P}: malformed tool_call param={param} -> {r.status_code} {r.text[:160]!r}")
+
+    malformed_continuation_fields = [
+        (
+            [{"role": "user", "content": "hi", "tool_call_id": "call_x"}],
+            "messages[0].tool_call_id",
+        ),
+        (
+            [{"role": "assistant", "content": "hi", "tool_call_id": "call_x"}],
+            "messages[0].tool_call_id",
+        ),
+        (
+            [{"role": "future", "content": "hi", "tool_calls": [
+                {"id": "call_x", "type": "function", "function": {"name": "calculator", "arguments": "{}"}}
+            ]}],
+            "messages[0].tool_calls",
+        ),
+        (
+            [{"role": "user", "content": "hi", "tool_call_id": 123}],
+            "messages[0].tool_call_id",
+        ),
+        (
+            [{"role": "assistant", "content": None, "tool_calls": {}}],
+            "messages[0].tool_calls",
+        ),
+        (
+            [{"role": "assistant", "content": None, "tool_calls": [None]}],
+            "messages[0].tool_calls",
+        ),
+    ]
+    for messages, param in malformed_continuation_fields:
+        r = await http.post(f"{base}/v1/chat/completions", json={
+            "model": MODEL,
+            "messages": messages,
+            "stream": False,
+        })
+        err = r.json().get("error", {}) if r.status_code == 400 else {}
+        ok = (
+            r.status_code == 400
+            and err.get("code") == "malformed_tool_calls"
+            and err.get("param") == param
+        )
+        rep.ok(ok, f"{P}: malformed continuation field param={param} -> "
+                   f"{r.status_code} {r.text[:160]!r}")
+
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL,
+        "messages": [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_a", "type": "function", "function": {"name": "calculator", "arguments": "{\"expr\":\"2+2\"}"}},
+                {"id": "call_b", "type": "function", "function": {"name": "calculator", "arguments": "{\"expr\":\"3+3\"}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_b", "content": "6"},
+            {"role": "tool", "tool_call_id": "call_a", "content": "4"},
+        ],
+        "stream": False,
+    })
+    err = r.json().get("error", {}) if r.status_code == 400 else {}
+    ok = (
+        r.status_code == 400
+        and err.get("code") == "invalid_tool_order"
+        and err.get("param") == "messages[1].tool_call_id"
+    )
+    rep.ok(ok, f"{P}: out-of-order tool results -> {r.status_code} {r.text[:160]!r} "
+               "(want 400 invalid_tool_order param=messages[1].tool_call_id)")
+
+    r = await http.post(f"{base}/v1/inferlet", json={
+        "inferlet": "tree-of-thought",
+        "stream": False,
+        "input": {
+            "model": MODEL,
+            "messages": [{"role": "assistant", "content": None, "tool_calls": [
+                {"id": 123, "type": "function", "function": {"name": "calculator", "arguments": "{}"}}
+            ]}],
+            "breadth": 1,
+            "depth": 1,
+            "beam_width": 1,
+            "max_tokens_per_node": 1,
+        },
+    })
+    err = r.json().get("error", {}) if r.status_code == 400 else {}
+    ok = (
+        r.status_code == 400
+        and err.get("code") == "malformed_tool_calls"
+        and err.get("param") == "messages[0].tool_calls[0].id"
+    )
+    rep.ok(ok, f"{P}: ToT malformed assistant tool_call -> {r.status_code} {r.text[:160]!r} "
+               "(want 400 malformed_tool_calls param=messages[0].tool_calls[0].id)")
+
+    r = await http.post(f"{base}/v1/inferlet", json={
+        "inferlet": "tree-of-thought",
+        "stream": False,
+        "input": {
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi", "tool_calls": [
+                {"id": "call_x", "type": "function", "function": {"name": "calculator", "arguments": "{}"}}
+            ]}],
+            "breadth": 1,
+            "depth": 1,
+            "beam_width": 1,
+            "max_tokens_per_node": 1,
+        },
+    })
+    err = r.json().get("error", {}) if r.status_code == 400 else {}
+    ok = (
+        r.status_code == 400
+        and err.get("code") == "malformed_tool_calls"
+        and err.get("param") == "messages[0].tool_calls"
+    )
+    rep.ok(ok, f"{P}: ToT user tool_calls rejected at boundary -> {r.status_code} {r.text[:160]!r} "
+               "(want 400 malformed_tool_calls param=messages[0].tool_calls)")
+
+    for messages, param in [
+        (
+            [{"role": "user", "content": "hi", "tool_call_id": 123}],
+            "messages[0].tool_call_id",
+        ),
+        (
+            [{"role": "assistant", "content": None, "tool_calls": {}}],
+            "messages[0].tool_calls",
+        ),
+        (
+            [{"role": "assistant", "content": None, "tool_calls": [None]}],
+            "messages[0].tool_calls",
+        ),
+    ]:
+        r = await http.post(f"{base}/v1/inferlet", json={
+            "inferlet": "tree-of-thought",
+            "stream": False,
+            "input": {
+                "model": MODEL,
+                "messages": messages,
+                "breadth": 1,
+                "depth": 1,
+                "beam_width": 1,
+                "max_tokens_per_node": 1,
+            },
+        })
+        err = r.json().get("error", {}) if r.status_code == 400 else {}
+        ok = (
+            r.status_code == 400
+            and err.get("code") == "malformed_tool_calls"
+            and err.get("param") == param
+        )
+        rep.ok(ok, f"{P}: ToT malformed continuation container param={param} -> "
+                   f"{r.status_code} {r.text[:160]!r}")
 
     # tool_choice forcing a call but the named function is absent -> 400.
     r = await http.post(f"{base}/v1/chat/completions", json={
@@ -833,14 +1038,23 @@ async def section_toolcall_nonstream_roundtrip(rep: Report) -> None:
                 except (json.JSONDecodeError, TypeError):
                     rep.fail(f"{P}: arguments not parseable JSON: {fn.get('arguments')!r}")
 
-            # TURN 2: client ran the tool; submit the result as a user turn
-            # (server's documented path) and expect a final assistant answer.
+            if not (tcs and len(tcs) == 1):
+                return
+            tc = tcs[0]
+
+            # TURN 2: client ran the tool; submit OpenAI-native history with
+            # the assistant tool_calls message plus a role=tool result carrying
+            # the matching tool_call_id. Expect a normal assistant answer.
             r = await http.post(f"{base}/v1/chat/completions", json={
                 "model": MODEL,
                 "messages": [
                     {"role": "user", "content": "What is 2+2?"},
-                    {"role": "assistant", "content": "Let me use the calculator."},
-                    {"role": "user", "content": "Tool calculator returned: 4. Now answer."},
+                    {
+                        "role": "assistant",
+                        "content": msg.get("content"),
+                        "tool_calls": tcs,
+                    },
+                    {"role": "tool", "tool_call_id": tc["id"], "content": "4"},
                 ],
                 "stream": False, "max_tokens": 32,
             })
@@ -1048,19 +1262,16 @@ async def section_harsh_surface(base: str, http: httpx.AsyncClient, rep: Report)
     r = await http.post(f"{base}/v1/chat/completions",
                         json={"model": None, "messages": [{"role": "user", "content": "hi"}]})
     rep.ok(r.status_code == 400, f"{P}/msg: model=null -> {r.status_code} (want 400)")
-    # MEASURED GAP: an unknown role (anything but the explicitly-blocked
-    # "tool") is NOT validated — it deserializes and generates (200). Only
-    # role=="tool" is rejected (tool_role_unsupported). This is a permissive
-    # OpenAI-compat gap, not a crash/security hole; pin that it stays
-    # non-5xx and surface it as a known gap for the follow-up ticket.
+    # Unknown roles are rejected at the shared validation boundary — never
+    # demoted into a user turn or allowed to carry dropped continuation fields.
     r = await http.post(f"{base}/v1/chat/completions", json={
         "model": MODEL, "messages": [{"role": "banana", "content": "hi"}],
         "stream": False, "max_tokens": 2,
     })
-    rep.ok(r.status_code < 500,
-           f"{P}/role: unknown role=banana -> {r.status_code} (must not 5xx)")
-    rep.skip(f"{P}/role: unknown roles (other than the blocked \"tool\") are accepted, "
-             f"not 400'd — OpenAI-compat gap, no crash/security impact; follow-up ticket")
+    err = r.json().get("error", {}) if r.status_code == 400 else {}
+    rep.ok(r.status_code == 400 and err.get("code") == "unsupported_role",
+           f"{P}/role: unknown role=banana -> {r.status_code} {r.text[:120]!r} "
+           "(want 400 unsupported_role)")
 
     # ── G8: /v1/models/load is REMOVED (#469 — pie binds the served model at
     # boot; `GET /v1/models` is the served-model source of truth). Every abuse

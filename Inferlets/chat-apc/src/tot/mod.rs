@@ -111,6 +111,39 @@ use std::time::Instant;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Response};
 
+
+fn validate_tot_messages(
+    messages: &[ChatMessage],
+) -> Result<(), completions::MessageValidationError> {
+    completions::validate_messages(messages)?;
+
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.has_tool_calls() {
+            return Err(completions::MessageValidationError::new(
+                "tool_continuation_unsupported",
+                "tree-of-thought does not support assistant tool_call continuation history",
+                format!("messages[{i}].tool_calls"),
+            ));
+        }
+        if msg.role == "tool" {
+            return Err(completions::MessageValidationError::new(
+                "tool_continuation_unsupported",
+                "tree-of-thought does not support role=\"tool\" messages",
+                format!("messages[{i}].role"),
+            ));
+        }
+        if msg.tool_call_id.is_some() {
+            return Err(completions::MessageValidationError::new(
+                "tool_continuation_unsupported",
+                "tree-of-thought does not support tool_call_id continuation fields",
+                format!("messages[{i}].tool_call_id"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Handle a `inferlet:"tree-of-thought"` dispatch. `input` is the
 /// inferlet-specific payload; `messages` is the optional top-level
 /// chat-sugar; `stream` is the dispatch-envelope flag.
@@ -162,11 +195,20 @@ pub async fn dispatch(
             ))
             .await;
     }
-    if let Some((i, _)) = messages
-        .iter()
-        .enumerate()
-        .find(|(_, m)| m.content.trim().is_empty())
-    {
+    if let Err(err) = validate_tot_messages(&messages) {
+        return res
+            .respond(completions::json_error_param(
+                400,
+                err.code,
+                &err.message,
+                &err.param,
+            ))
+            .await;
+    }
+    if let Some((i, _)) = messages.iter().enumerate().find(|(_, m)| {
+        m.content_str()
+            .is_none_or(|content| content.trim().is_empty())
+    }) {
         return res
             .respond(sse::json_error(
                 400,
@@ -199,7 +241,9 @@ pub async fn dispatch(
     // an inert token on a non-reasoning model.
     if !params.thinking {
         if let Some(last) = messages.iter_mut().rev().find(|m| m.role == "user") {
-            last.content.push_str(" /no_think");
+            if let Some(content) = last.content.as_mut() {
+                content.push_str(" /no_think");
+            }
         }
     }
 
@@ -416,4 +460,49 @@ async fn dispatch_streaming(
     }
     sse::emit_done_logged(&mut em, "tot_terminal").await;
     em.finish()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn messages(json: &str) -> Vec<ChatMessage> {
+        serde_json::from_str(json).expect("messages should deserialize")
+    }
+
+    #[test]
+    fn tot_rejects_malformed_tool_continuations_before_context_fill() {
+        let malformed = messages(
+            r#"[{
+                "role":"assistant",
+                "content":null,
+                "tool_calls":[{
+                    "id":123,
+                    "type":"function",
+                    "function":{"name":"calculator","arguments":"{}"}
+                }]
+            }]"#,
+        );
+        let err = validate_tot_messages(&malformed)
+            .expect_err("malformed assistant tool_calls should fail before fill_context");
+        assert_eq!(err.code, "malformed_tool_calls");
+        assert_eq!(err.param, "messages[0].tool_calls[0].id");
+
+        let non_assistant = messages(
+            r#"[{
+                "role":"user",
+                "content":"hi",
+                "tool_calls":[{
+                    "id":"call_x",
+                    "type":"function",
+                    "function":{"name":"calculator","arguments":"{}"}
+                }]
+            }]"#,
+        );
+        let err = validate_tot_messages(&non_assistant)
+            .expect_err("tool_calls on non-assistant roles should fail before fill_context");
+        assert_eq!(err.code, "malformed_tool_calls");
+        assert_eq!(err.param, "messages[0].tool_calls");
+    }
 }
