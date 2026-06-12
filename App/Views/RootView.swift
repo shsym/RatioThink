@@ -21,6 +21,7 @@ struct RootView: View {
   @EnvironmentObject private var updateAvailability: UpdateAvailabilityModel
   @Environment(\.openURL) private var openURL
   @State private var didEvaluateLocalAPIAutoStart = false
+  @State private var localAPIAutoStartError: String?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -41,6 +42,11 @@ struct RootView: View {
         onRestartHelper: { helperHealth.restartHelperManually() },
         onRestartEngine: { restartEngineFromBanner() }
       )
+      if let localAPIAutoStartError {
+        LocalAPIAutoStartErrorBanner(message: localAPIAutoStartError) {
+          self.localAPIAutoStartError = nil
+        }
+      }
       // #411: low-urgency, non-modal update prompt. Only present for a newer,
       // non-ignored release found by the once-per-launch check.
       if let pending = updateAvailability.pending {
@@ -79,7 +85,10 @@ struct RootView: View {
     }
     .task { await runLaunchUpdateCheck() }
     .onAppear { maybeAutoStartLocalAPIOnLaunch() }
-    .onChange(of: engineStatusStore.status) { _, _ in
+    .onChange(of: engineStatusStore.status) { _, new in
+      if case .running = new {
+        localAPIAutoStartError = nil
+      }
       maybeAutoStartLocalAPIOnLaunch()
     }
   }
@@ -125,8 +134,53 @@ struct RootView: View {
     }
 
     Task { @MainActor in
-      try? await engineStatusStore.startEngine(profileID: profileID)
+      let result = await LocalAPIAutoStartLauncher.run(
+        enabled: appPreferences.localAPIAutoStartEnabled,
+        status: engineStatusStore.status,
+        activeProfileID: profileID,
+        startEngine: { try await engineStatusStore.startEngine(profileID: $0) },
+        errorMessage: { ChatScaffoldView.engineErrorMessage($0, verb: "start") }
+      )
+      switch result {
+      case .skipped, .started:
+        localAPIAutoStartError = nil
+      case .failed(let message):
+        localAPIAutoStartError = message
+      }
     }
+  }
+}
+
+private struct LocalAPIAutoStartErrorBanner: View {
+  let message: String
+  let onDismiss: () -> Void
+
+  var body: some View {
+    HStack(alignment: .top, spacing: 8) {
+      Image(systemName: "exclamationmark.triangle.fill")
+        .foregroundStyle(.orange)
+        .accessibilityHidden(true)
+      VStack(alignment: .leading, spacing: 2) {
+        Text("Local API didn't start")
+          .font(.callout)
+          .fontWeight(.medium)
+        Text(message)
+          .font(.caption)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      Spacer(minLength: 8)
+      Button(action: onDismiss) {
+        Image(systemName: "xmark")
+          .imageScale(.small)
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel("Dismiss")
+    }
+    .padding(.horizontal, 12)
+    .padding(.vertical, 8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(Color.orange.opacity(0.12))
+    .accessibilityIdentifier("LocalAPIAutoStartError")
   }
 }
 
