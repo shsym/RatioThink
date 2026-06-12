@@ -554,7 +554,7 @@
     var a1 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
     transcript.appendChild(a1);
     await streamWords(a1.querySelector('.bubble'), d.answer, 62, myGen); // slow, even cadence
-    addGenerationPerformance(a1, '30 tok/s');
+    addGenerationPerformance(a1, '19 tok/s');
     await sleep(900, myGen);
 
     // Switch profiles: open the menu, pick Fast Think.
@@ -571,7 +571,7 @@
     transcript.appendChild(a2);
     setCaption('Same answer, much less waiting — the text lands in quick bursts.');
     await streamBursts(a2.querySelector('.bubble'), d.answer, d.bursts, 150, myGen); // chunky + quicker
-    addGenerationPerformance(a2, '42 tok/s');
+    addGenerationPerformance(a2, '25 tok/s');
     await sleep(2200, myGen);
   }
 
@@ -604,7 +604,7 @@
     userRow(SCENARIO.fast.prompt);
     var a = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
     a.querySelector('.bubble').textContent = SCENARIO.fast.answer;
-    addGenerationPerformance(a, '42 tok/s');
+    addGenerationPerformance(a, '25 tok/s');
     transcript.appendChild(a);
   }
 

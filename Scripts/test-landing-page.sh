@@ -192,9 +192,9 @@ def validate_html(html: str) -> list[str]:
         failures.append("landing mock is missing the app-side generation performance accessibility hook")
     if "generation-performance" not in html:
         failures.append("landing mock is missing generation performance row styling")
-    if "30 tok/s" not in html:
+    if "19 tok/s" not in html:
         failures.append("landing mock is missing the normal-scene generation performance row")
-    if "42 tok/s" not in html:
+    if "25 tok/s" not in html:
         failures.append("landing mock is missing the Fast Think generation performance row")
 
     return failures
@@ -208,7 +208,7 @@ VALID_FIXTURE = """
 <div class="toolbar"><span class="pill">Profile:</span><div class="menu"></div></div>
 <p class="demo-note">A simplified illustration of how it works.</p>
 <div class="card"><h3>Fast Think</h3><p>Speculative decoding makes the text land in bursts.</p></div>
-<script>var hook = "message.generationPerformance"; var cls = "generation-performance"; var normal = "30 tok/s"; var fast = "42 tok/s";</script>
+<script>var hook = "message.generationPerformance"; var cls = "generation-performance"; var normal = "19 tok/s"; var fast = "25 tok/s";</script>
 <footer>Apache-2.0</footer>
 </div></body></html>
 """
@@ -222,7 +222,7 @@ NEGATIVE_FIXTURES = {
         <div class="toolbar"><span class="pill">Profile:</span><div class="menu"></div></div>
         <p class="demo-note">A simplified illustration of how it works.</p>
         <div class="card"><h3>Fast Think</h3><p>Speculative decoding makes the text land in bursts.</p></div>
-        <script>var hook = "message.generationPerformance"; var cls = "generation-performance"; var normal = "30 tok/s"; var fast = "42 tok/s";</script>
+        <script>var hook = "message.generationPerformance"; var cls = "generation-performance"; var normal = "19 tok/s"; var fast = "25 tok/s";</script>
         <footer>Apache-2.0</footer>
         </div></body></html>
     """,
@@ -234,7 +234,7 @@ NEGATIVE_FIXTURES = {
         <div class="toolbar"><span class="pill">Profile:</span><div class="menu"></div><span>Model:</span><span>Qwen3-0.6B</span></div>
         <p class="demo-note">A simplified illustration of how it works.</p>
         <div class="card"><h3>Fast Think</h3><p>Speculative decoding makes the text land in bursts.</p></div>
-        <script>var hook = "message.generationPerformance"; var cls = "generation-performance"; var normal = "30 tok/s"; var fast = "42 tok/s";</script>
+        <script>var hook = "message.generationPerformance"; var cls = "generation-performance"; var normal = "19 tok/s"; var fast = "25 tok/s";</script>
         <footer>Apache-2.0</footer>
         </div></body></html>
     """,
