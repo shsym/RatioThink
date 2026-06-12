@@ -93,11 +93,12 @@ test_partial_hf_cache_is_not_accepted() {
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
 
-  # Fake a seated session and a runnable pie so the flow reaches the HF model
+  # Fake a seated session and a runnable pie so the flow reaches the GGUF model
   # gate, then stage only a *bare* hub dir — the partial/aborted-download shape
-  # the old `[ -d "$dir" ]` check wrongly accepted ( F3). With
-  # autoprep off the gate must report "not cached" and exit, not proceed.
-  mkdir -p "$tmp/bin" "$tmp/hf/hub/models--Qwen--Qwen3-0.6B"
+  # the old `[ -d "$dir" ]` check wrongly accepted ( F3). The current wrapper
+  # gates through stage-test-model.sh, so the partial GGUF cache must print the
+  # staging guidance and exit, not proceed.
+  mkdir -p "$tmp/bin" "$tmp/hf/hub/models--Qwen--Qwen3-0.6B-GGUF"
   cat >"$tmp/bin/pgrep" <<'FAKE_PGREP'
 #!/bin/bash
 exit 0
@@ -126,7 +127,8 @@ FAKE_PGREP
     printf '%s\n' "$output" >&2
     exit 1
   fi
-  require_contains "$output" "not cached and autoprep disabled"
+  require_contains "$output" "stage-test-model: model fixture NOT staged."
+  require_contains "$output" "GGUF fixture unavailable"
   if [[ "$output" == *"starting small-model engine harness"* ]]; then
     echo "FAIL: bare HF cache wrongly accepted as cached — engine harness started" >&2
     exit 1
