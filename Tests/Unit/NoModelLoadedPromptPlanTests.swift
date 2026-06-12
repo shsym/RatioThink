@@ -432,12 +432,12 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
           profileDefaultModel: ProfileStore.defaultChatModelID)?.modelID))
   }
 
-  /// Review v5 F2: with the display banner suppressed for a
-  /// non-downloadable pick, the engine-failure banner must take over —
-  /// if its suppression axis still keyed on the (downloadable) profile
-  /// default, BOTH banners would vanish and modelMissing would be
-  /// menu-bar-dot-only. Some in-chat surface always shows.
-  func test_missingModel_nonDownloadablePick_fallsThroughToEngineFailureBanner() {
+  /// #568: with the display banner suppressed for a non-downloadable pick,
+  /// the chat-local action-error banner must NOT take over for the live
+  /// `.failed` status. RootView's unified status banner owns live engine
+  /// failures; the chat-local banner is only for thrown action errors while
+  /// status itself is not failed.
+  func test_missingModel_nonDownloadablePick_doesNotRenderActionErrorBanner() {
     let pick = "org/picked"  // non-downloadable (2-segment dir slug)
     let failed = EngineStatus.failed(code: .modelMissing, message: "resolver trace")
     let gateModel = ChatScaffoldView.gateTarget(
@@ -448,26 +448,23 @@ final class NoModelLoadedPromptPlanTests: XCTestCase {
     let hasDownloadTarget = MissingModelRecovery.bannerTarget(
       engineStatus: failed, profileDefaultModel: gateModel) != nil
     XCTAssertFalse(hasDownloadTarget, "premise: the pick has no download target")
-    XCTAssertEqual(
-      MissingModelRecovery.engineFailureBannerMessage(
+    XCTAssertNil(
+      MissingModelRecovery.engineActionFailureBannerMessage(
         engineStatus: failed,
-        actionError: nil,
-        statusDetail: "status detail",
-        hasDownloadTarget: hasDownloadTarget),
-      "status detail",
-      "the engine-failure banner must surface a non-downloadable modelMissing")
+        actionError: nil),
+      "live modelMissing failures are owned by the unified status banner")
 
-    // Premise guard: keying suppression on the DEFAULT (old axis) would
-    // have swallowed it — the downloadable default suppresses the message
-    // while the display banner (gate axis) is nil too.
+    // Premise guard: keying the display banner on the DEFAULT (old axis)
+    // would still find a download target, while the gate-axis display banner
+    // is nil. The action-error banner remains nil either way because live
+    // `.failed` status is not its responsibility.
     let staleAxisTarget = MissingModelRecovery.bannerTarget(
       engineStatus: failed,
       profileDefaultModel: ProfileStore.defaultChatModelID) != nil
-    XCTAssertNil(MissingModelRecovery.engineFailureBannerMessage(
+    XCTAssertTrue(staleAxisTarget)
+    XCTAssertNil(MissingModelRecovery.engineActionFailureBannerMessage(
       engineStatus: failed,
-      actionError: nil,
-      statusDetail: "status detail",
-      hasDownloadTarget: staleAxisTarget))
+      actionError: nil))
   }
 
   // MARK: - #516: the "…to send your message" promise tracks willAutoSend

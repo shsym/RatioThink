@@ -208,67 +208,65 @@ final class MissingModelRecoveryTests: XCTestCase {
       didComplete: false, engineStatus: .failed(code: .modelMissing, message: "x")))
   }
 
-  // MARK: - engineFailureBannerMessage (PR#15 F2/F3: one engine-failure channel)
+  // MARK: - engineActionFailureBannerMessage (chat-local action-error channel)
 
-  /// A non-modelMissing engine failure surfaces the live status detail —
-  /// the user just acted (download → start), so the failure can't be
-  /// menu-bar-dot-only (F2).
-  func test_engineFailureBannerMessage_uses_status_detail_for_non_modelMissing_failure() {
-    XCTAssertEqual(
-      MissingModelRecovery.engineFailureBannerMessage(
+  /// Live engine-status failures are owned by the app-level unified status
+  /// banner. The chat-local engine banner is reserved for distinct thrown
+  /// action errors that the status poll may not reflect; otherwise the same
+  /// failure copy appears both above the window and inside the chat.
+  func test_engineActionFailureBannerMessage_nil_for_live_nonModelMissing_failure() {
+    XCTAssertNil(
+      MissingModelRecovery.engineActionFailureBannerMessage(
         engineStatus: .failed(code: .spawnFailed, message: "fork ENOENT"),
-        actionError: nil,
-        statusDetail: "Engine failed (spawnFailed): fork ENOENT",
-        hasDownloadTarget: false),
-      "Engine failed (spawnFailed): fork ENOENT")
+        actionError: nil))
   }
 
-  /// modelMissing WITH a download target is owned by the download banner,
-  /// so the generic engine-failure banner stays silent for it (even if an
-  /// action error is also pending).
-  func test_engineFailureBannerMessage_nil_for_modelMissing_with_download_target() {
-    XCTAssertNil(MissingModelRecovery.engineFailureBannerMessage(
+  /// modelMissing is owned by either the download banner or the app-level
+  /// unified status banner, so the chat-local action banner stays silent for
+  /// live failures even if an action error is also pending.
+  func test_engineActionFailureBannerMessage_nil_for_modelMissing_failure() {
+    XCTAssertNil(MissingModelRecovery.engineActionFailureBannerMessage(
       engineStatus: .failed(code: .modelMissing, message: "missing"),
-      actionError: "boom",
-      statusDetail: "Engine failed (modelMissing): missing",
-      hasDownloadTarget: true))
+      actionError: "boom"))
   }
 
-  /// PR#15 v2 F1: modelMissing for a NON-downloadable slug (2-seg
-  /// safetensors dir, bare leaf, nil default whose snapshot was deleted)
-  /// has no download banner to own it — so the engine-failure banner must
-  /// cover it, never leaving it menu-bar-dot-only. This is the boundary
-  /// the blanket modelMissing suppression slipped through.
-  func test_engineFailureBannerMessage_surfaces_non_downloadable_modelMissing() {
-    XCTAssertEqual(
-      MissingModelRecovery.engineFailureBannerMessage(
+  /// modelMissing for a NON-downloadable slug (2-seg safetensors dir, bare
+  /// leaf, nil default whose snapshot was deleted) still belongs to the
+  /// app-level unified status banner. It must not also render the chat-local
+  /// engine banner.
+  func test_engineActionFailureBannerMessage_nil_for_non_downloadable_modelMissing() {
+    XCTAssertNil(
+      MissingModelRecovery.engineActionFailureBannerMessage(
         engineStatus: .failed(code: .modelMissing, message: "missing"),
-        actionError: nil,
-        statusDetail: "Engine failed (modelMissing): missing",
-        hasDownloadTarget: false),
-      "Engine failed (modelMissing): missing")
+        actionError: nil))
+  }
+
+  /// Even if a thrown action error is pending, once the poll reports a live
+  /// engine failure the app-level status banner owns the failure surface.
+  /// Rendering the chat-local banner too duplicates the same recovery state.
+  func test_engineActionFailureBannerMessage_nil_for_live_failure_even_with_action_error() {
+    XCTAssertNil(
+      MissingModelRecovery.engineActionFailureBannerMessage(
+        engineStatus: .failed(code: .spawnFailed, message: "fork ENOENT"),
+        actionError: "Couldn't start the engine: transport failed"))
   }
 
   /// A thrown engine-action error (e.g. a stop that left the engine
   /// .running, or a transport error) surfaces via the engine channel —
   /// NOT the persistence "Couldn't save" banner (F3).
-  func test_engineFailureBannerMessage_surfaces_action_error_when_status_not_failed() {
+  func test_engineActionFailureBannerMessage_surfaces_action_error_when_status_not_failed() {
     XCTAssertEqual(
-      MissingModelRecovery.engineFailureBannerMessage(
+      MissingModelRecovery.engineActionFailureBannerMessage(
         engineStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
-        actionError: "Couldn't stop the engine: kill rejected",
-        statusDetail: "Engine running",
-        hasDownloadTarget: false),
+        actionError: "Couldn't stop the engine: kill rejected"),
       "Couldn't stop the engine: kill rejected")
   }
 
   /// Healthy engine, no action error → no banner.
-  func test_engineFailureBannerMessage_nil_when_healthy() {
-    XCTAssertNil(MissingModelRecovery.engineFailureBannerMessage(
+  func test_engineActionFailureBannerMessage_nil_when_healthy() {
+    XCTAssertNil(MissingModelRecovery.engineActionFailureBannerMessage(
       engineStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
-      actionError: nil,
-      statusDetail: "Engine running",
-      hasDownloadTarget: false))
+      actionError: nil))
   }
 
   // MARK: - engineFailureDismissable (PR#15 v2 F2)

@@ -99,31 +99,23 @@ public enum MissingModelRecovery {
     return false
   }
 
-  /// Message for the generic in-chat engine-failure banner, or nil when
-  /// it should stay hidden. The single engine-failure channel (PR#15
-  /// F2/F3): a user-initiated start/stop that fails must surface IN-CHAT,
-  /// not only on the menu-bar dot and never under the persistence
-  /// "Couldn't save" banner (wrong fault domain).
+  /// Message for the chat-local engine-action failure banner, or nil when
+  /// it should stay hidden. Live `EngineStatus.failed` is owned by the
+  /// app-level unified status banner and toolbar status control; rendering
+  /// the same status again inside the chat duplicates the failure and can
+  /// crowd the model/profile recovery controls. This local banner is only
+  /// for a user-initiated start/stop error that the status poll may not
+  /// reflect (for example, a transport throw while status remains running),
+  /// and it still stays out of the persistence "Couldn't save" channel
+  /// (wrong fault domain).
   ///
-  ///   · `.failed(.modelMissing)` → nil ONLY when `hasDownloadTarget`
-  ///     (the download banner owns that surface). For a NON-downloadable
-  ///     modelMissing slug (2-seg safetensors dir, bare leaf, non-`.gguf`,
-  ///     or a default whose snapshot was deleted) NO download banner
-  ///     exists, so it falls through to `statusDetail` here — otherwise it
-  ///     would be the menu-bar-dot-only state this channel exists to kill
-  ///     (PR#15 v2 F1).
-  ///   · `.failed(otherCode)` → the live `statusDetail` (e.g. spawnFailed,
-  ///     handshakeTimeout, engineGone).
-  ///   · otherwise → a pending thrown `actionError` (a stop that left the
-  ///     engine running, or a transport error the poll won't reflect).
-  public static func engineFailureBannerMessage(engineStatus: EngineStatus,
-                                                actionError: String?,
-                                                statusDetail: String,
-                                                hasDownloadTarget: Bool) -> String? {
-    if case .failed(let code, _) = engineStatus {
-      if code == .modelMissing, hasDownloadTarget { return nil }
-      return statusDetail
-    }
+  ///   · any `.failed` → nil (global unified status banner owns it; a
+  ///     modelMissing download target is separately owned by
+  ///     `ModelMissingBanner` before this helper is consulted).
+  ///   · otherwise → a pending thrown `actionError`.
+  public static func engineActionFailureBannerMessage(engineStatus: EngineStatus,
+                                                      actionError: String?) -> String? {
+    if case .failed = engineStatus { return nil }
     return actionError
   }
 

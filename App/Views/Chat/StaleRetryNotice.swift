@@ -3,12 +3,13 @@ import SwiftUI
 /// Transient in-chat notice for a retry click that no longer applies
 /// (#513, review v2 F1). Deliberately its OWN surface with its own
 /// state channel: the first cut rode `engineActionError`, whose banner
-/// is rendered through `MissingModelRecovery.engineFailureBannerMessage`
-/// — that helper shows `statusDetail` instead of the action error for
-/// any `.failed` engine status, and the scaffold clears the field on
-/// the next engine-status flip. Both rules are correct ENGINE semantics
-/// and exactly wrong for a TRANSCRIPT condition: the notice could be
-/// shadowed or wiped unread in the very windows it was added for.
+/// is rendered through `MissingModelRecovery.engineActionFailureBannerMessage`
+/// — that helper hides action errors for any `.failed` engine status because
+/// the app-level unified status banner owns live engine failures, and the
+/// scaffold clears the field on the next engine-status flip. Both rules are
+/// correct ENGINE semantics and exactly wrong for a TRANSCRIPT condition:
+/// the notice could be shadowed or wiped unread in the very windows it was
+/// added for.
 /// Rendering from a dedicated value keeps its visibility and lifetime
 /// independent of engine state; the owner dismisses it explicitly or
 /// via its own auto-clear.
