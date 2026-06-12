@@ -117,13 +117,13 @@ struct ProfileEditor: View {
         .disabled((option.isOverLimit || option.unsupportedReason != nil) && !option.isCurrent)
       }
     } label: {
-      HStack(spacing: 4) {
-        Text(ModelDisplayName.leaf(profile.model)).monospaced()
-        Image(systemName: "chevron.up.chevron.down").font(.caption)
-      }
+      ProfileModelPickerSelectionLabel(model: ProfileModelPickerSelectionLabelModel(
+        fallbackModel: profile.model,
+        selectedOption: modelOptions.first { $0.slug == profile.model },
+        memoryPolicy: memoryPolicy
+      ))
     }
     .menuStyle(.borderlessButton)
-    .fixedSize()
     .accessibilityIdentifier("ProfileEditorModelPicker")
   }
 
@@ -284,5 +284,41 @@ struct ProfileEditor: View {
       if let v = args[k] { table[k] = v }
     }
     return table.convert()
+  }
+}
+
+typealias ProfileModelPickerSelectionLabelModel = ProfileModelSelectionLabelContent
+
+struct ProfileModelPickerSelectionLabel: View {
+  let model: ProfileModelPickerSelectionLabelModel
+
+  var body: some View {
+    HStack(spacing: 4) {
+      if let warningText = model.warningText {
+        Image(systemName: "exclamationmark.triangle")
+          .foregroundStyle(.orange)
+          .help(warningText)
+          .accessibilityHidden(true)
+      }
+      Text(model.displayName)
+        .monospaced()
+        .lineLimit(ProfileModelPickerSelectionLabelModel.nameLineLimit)
+        .truncationMode(ProfileModelPickerSelectionLabelModel.nameTruncationMode.swiftUI)
+        .frame(width: CGFloat(ProfileModelPickerSelectionLabelModel.maxNameWidth), alignment: .leading)
+      Image(systemName: "chevron.up.chevron.down")
+        .font(.caption)
+        .accessibilityHidden(true)
+    }
+    .frame(maxWidth: CGFloat(ProfileModelPickerSelectionLabelModel.maxSelectionWidth), alignment: .leading)
+    .help(model.warningText ?? model.displayName)
+    .accessibilityLabel(model.accessibilityLabel)
+  }
+}
+
+private extension ProfileModelSelectionLabelContent.NameTruncationMode {
+  var swiftUI: Text.TruncationMode {
+    switch self {
+    case .middle: .middle
+    }
   }
 }
