@@ -125,7 +125,17 @@ struct ProfileEditor: View {
   /// default via `ProfileStore.setModel`. This is a default for the
   /// swap-confirm PRE-FILL only — it never triggers a load.
   private func modelPicker(profile: Profile) -> some View {
-    Menu {
+    let selectedLabelModel = ProfileModelPickerSelectionLabelModel(
+      fallbackModel: profile.model,
+      selectedOption: modelOptions.first { $0.slug == profile.model },
+      memoryPolicy: memoryPolicy
+    )
+    let selectedAccessibilityText = ProfileModelPickerLabel.controlAccessibilityText(
+      for: profile.model,
+      model: selectedLabelModel
+    )
+
+    return Menu {
       ForEach(modelOptions) { option in
         Button {
           persistModel(option.slug, profileID: profile.id)
@@ -150,12 +160,15 @@ struct ProfileEditor: View {
       .help("Open Settings → Models")
       .accessibilityIdentifier("ProfileEditorModelPickerManageModels")
     } label: {
-      ProfileModelPickerLabel(modelID: profile.model)
+      ProfileModelPickerLabel(
+        model: selectedLabelModel,
+        modelID: profile.model
+      )
     }
     .menuStyle(.borderlessButton)
     .fixedSize()
-    .help(profile.model ?? "")
-    .accessibilityValue(profile.model ?? "")
+    .help(selectedAccessibilityText)
+    .accessibilityValue(selectedAccessibilityText)
     .accessibilityIdentifier("ProfileEditorModelPicker")
   }
 
@@ -392,6 +405,7 @@ struct ProfileEditor: View {
     return table.convert()
   }
 }
+typealias ProfileModelPickerSelectionLabelModel = ProfileModelSelectionLabelContent
 
 /// Bounded selected-model label for the Profile editor's model `Menu`.
 ///
@@ -399,18 +413,42 @@ struct ProfileEditor: View {
 /// row's ideal width: `SettingsLabeledRow` has neighboring fixed-width labels,
 /// so an unbounded/fixed-size menu label pushes the whole Profile pane wider.
 /// Keep the label flexible, cap its ideal size, and let SwiftUI middle-truncate
-/// inside that cap while exposing the unmodified id through help + a11y.
+/// inside that cap while exposing the unmodified id through help + a11y. When
+/// the current/default model is unloadable, the same selected label also shows
+/// the warning icon so users see the problem without opening the menu.
 struct ProfileModelPickerLabel: View {
   static let maxLayoutWidth: CGFloat = 360
 
+  let model: ProfileModelPickerSelectionLabelModel
   let modelID: String?
+
+  init(modelID: String?) {
+    self.modelID = modelID
+    self.model = ProfileModelPickerSelectionLabelModel(
+      fallbackModel: modelID,
+      selectedOption: nil,
+      memoryPolicy: nil
+    )
+  }
+
+  init(model: ProfileModelPickerSelectionLabelModel, modelID: String?) {
+    self.model = model
+    self.modelID = modelID
+  }
 
   var body: some View {
     HStack(spacing: 4) {
+      if let warningText = model.warningText {
+        Image(systemName: "exclamationmark.triangle")
+          .foregroundStyle(.orange)
+          .help(warningText)
+          .accessibilityHidden(true)
+      }
+
       // #462: shared truncation primitive — middle-truncate one line and
       // fill the slot whose width the outer `.frame` fixes below. The full
       // id stays inspectable via the `.help`/a11y on the outer frame.
-      Text(displayName)
+      Text(model.displayName)
         .monospaced()
         .foregroundStyle(modelID == nil ? .secondary : .primary)
         .boundedModelName(maxWidth: .infinity)
@@ -422,23 +460,31 @@ struct ProfileModelPickerLabel: View {
     .frame(idealWidth: Self.maxLayoutWidth,
            maxWidth: Self.maxLayoutWidth,
            alignment: .leading)
-    .help(Self.accessibilityHelpText(for: modelID))
+    .help(Self.controlAccessibilityText(for: modelID, model: model))
     .accessibilityElement(children: .ignore)
-    .accessibilityLabel(Self.accessibilityText(for: displayName))
-    .accessibilityHint(Self.accessibilityHelpText(for: modelID))
-    .accessibilityValue(Self.accessibilityHelpText(for: modelID))
-  }
-
-  private var displayName: String {
-    Self.displayText(for: modelID)
+    .accessibilityLabel(model.accessibilityLabel)
+    .accessibilityHint(Self.controlAccessibilityText(for: modelID, model: model))
+    .accessibilityValue(Self.controlAccessibilityText(for: modelID, model: model))
   }
 
   static func displayText(for modelID: String?) -> String {
-    modelID.map(ModelDisplayName.leaf) ?? "No default model"
+    ProfileModelPickerSelectionLabelModel.displayText(for: modelID)
   }
 
   static func accessibilityHelpText(for modelID: String?) -> String {
     modelID ?? displayText(for: modelID)
+  }
+
+  static func controlAccessibilityText(
+    for modelID: String?,
+    model: ProfileModelPickerSelectionLabelModel
+  ) -> String {
+    accessibilityHelpText(for: modelID, warningText: model.warningText)
+  }
+
+  static func accessibilityHelpText(for modelID: String?, warningText: String?) -> String {
+    guard let warningText else { return accessibilityHelpText(for: modelID) }
+    return "\(warningText)\n\(accessibilityHelpText(for: modelID))"
   }
 
   static func accessibilityText(for displayName: String) -> String {
