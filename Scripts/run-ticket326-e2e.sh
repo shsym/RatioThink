@@ -23,12 +23,12 @@ if [ -z "$PIE_BIN" ]; then
   if [ -x "$ROOT/Vendor/pie/target/release/pie" ]; then
     PIE_BIN="$ROOT/Vendor/pie/target/release/pie"
   else
-    # Most-recent RatioThink.app pie-engine binary built by `make build`.
+    # Most-recent Rational.app pie-engine binary built by `make build`.
     PIE_BIN="$(find "$HOME/Library/Developer/Xcode/DerivedData" \
-      -path '*RatioThink*/Build/Products/Debug/RatioThink.app/Contents/Resources/pie-engine/pie' \
+      -path '*RatioThink*/Build/Products/Debug/Rational.app/Contents/Resources/pie-engine/pie' \
       -type f 2>/dev/null | xargs -I{} stat -f '%m %N' {} 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
-    if [ -z "$PIE_BIN" ] && [ -x "/Applications/RatioThink.app/Contents/Resources/pie-engine/pie" ]; then
-      PIE_BIN="/Applications/RatioThink.app/Contents/Resources/pie-engine/pie"
+    if [ -z "$PIE_BIN" ] && [ -x "/Applications/Rational.app/Contents/Resources/pie-engine/pie" ]; then
+      PIE_BIN="/Applications/Rational.app/Contents/Resources/pie-engine/pie"
     fi
   fi
 fi

@@ -28,6 +28,13 @@ public enum ProfileModelOptions {
     /// surfaces this reason — like `isOverLimit`, but the engine can
     /// never load it regardless of host RAM.
     public let unsupportedReason: String?
+    /// Advisory-only cache support warning. Unlike `unsupportedReason`,
+    /// this does not make the option unloadable; it tells the user this
+    /// HF-cache discovery is outside RatioThink's curated support list.
+    public let supportWarning: String?
+    /// True when the slug is in RatioThink's curated, engine-validated
+    /// catalog.
+    public let isCuratedEngineSupported: Bool
     /// `true` for the profile's current model (checkmarked).
     public let isCurrent: Bool
 
@@ -39,7 +46,9 @@ public enum ProfileModelOptions {
                 source: CachedModelSource?,
                 isOverLimit: Bool,
                 isCurrent: Bool,
-                unsupportedReason: String? = nil) {
+                unsupportedReason: String? = nil,
+                supportWarning: String? = nil,
+                isCuratedEngineSupported: Bool = false) {
       self.slug = slug
       self.displayName = displayName
       self.sizeBytes = sizeBytes
@@ -47,6 +56,8 @@ public enum ProfileModelOptions {
       self.isOverLimit = isOverLimit
       self.isCurrent = isCurrent
       self.unsupportedReason = unsupportedReason
+      self.supportWarning = supportWarning
+      self.isCuratedEngineSupported = isCuratedEngineSupported
     }
   }
 
@@ -88,7 +99,9 @@ public enum ProfileModelOptions {
           source: model?.source,
           isOverLimit: isOverLimit(sizeBytes: model?.sizeBytes, limitBytes: limitBytes),
           isCurrent: slug == current,
-          unsupportedReason: reason
+          unsupportedReason: reason,
+          supportWarning: model?.supportWarning,
+          isCuratedEngineSupported: model?.isCuratedEngineSupported ?? CuratedModelCatalog.isCuratedModelSlug(slug)
         )
       }
       .sorted { $0.slug < $1.slug }

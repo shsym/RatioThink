@@ -22,13 +22,17 @@ final class CuratedModelCatalogLiveHFTests: XCTestCase {
   /// wrong quant.
   private static let sizeTolerance = 0.05
 
-  func test_everyCuratedEntryExistsAsASingleGGUFFileOnHuggingFace() async throws {
-    try XCTSkipUnless(
-      ProcessInfo.processInfo.environment["PIE_TEST_REAL_HF"] == "1",
-      "Live Hugging Face curated-catalog audit is opt-in (one real network "
-      + "call per curated repo). Set PIE_TEST_REAL_HF=1 to run."
-    )
+  func test_everyCuratedEntryExistsAsASingleGGUFFileOnHuggingFace() throws {
+    guard ProcessInfo.processInfo.environment["PIE_TEST_REAL_HF"] == "1" else {
+      throw XCTSkip(
+        "Live Hugging Face curated-catalog audit is opt-in (one real network "
+        + "call per curated repo). Set PIE_TEST_REAL_HF=1 to run.")
+    }
 
+    try Self.runAsyncAudit()
+  }
+
+  private static func verifyEveryCuratedEntryExistsAsASingleGGUFFileOnHuggingFace() async throws {
     let client = HuggingFaceSearchClient()
 
     for m in CuratedModelCatalog.all {
@@ -79,6 +83,51 @@ final class CuratedModelCatalogLiveHFTests: XCTestCase {
           + "reports no positive size (size=\(published)) — suspicious repo "
           + "metadata; declared \(m.approximateSizeBytes) B unverifiable")
       }
+    }
+  }
+
+  private static func runAsyncAudit() throws {
+    let finished = DispatchSemaphore(value: 0)
+    let result = AsyncAuditResult()
+
+    Task {
+      do {
+        try await verifyEveryCuratedEntryExistsAsASingleGGUFFileOnHuggingFace()
+        result.store(.success(()))
+      } catch {
+        result.store(.failure(error))
+      }
+      finished.signal()
+    }
+
+    while finished.wait(timeout: .now() + 0.1) == .timedOut {
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+
+    try result.take().get()
+  }
+
+  private final class AsyncAuditResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<Void, Error>?
+
+    func store(_ result: Result<Void, Error>) {
+      lock.lock()
+      self.result = result
+      lock.unlock()
+    }
+
+    func take() -> Result<Void, Error> {
+      lock.lock()
+      defer { lock.unlock() }
+
+      guard let result else {
+        return .failure(NSError(
+          domain: "CuratedModelCatalogLiveHFTests.AsyncAuditResult",
+          code: 1,
+          userInfo: [NSLocalizedDescriptionKey: "Live HF audit finished without reporting a result"]))
+      }
+      return result
     }
   }
 }

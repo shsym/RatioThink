@@ -96,9 +96,9 @@ reenable_helper_agent() {
     return 0
   fi
   echo "install: WARNING — RatioThink Helper agent $HELPER_LABEL is NOT restored (disabled and/or not registered after install)." >&2
-  echo "install: relaunch RatioThink.app to re-register it via SMAppService, or run:" >&2
+  echo "install: relaunch Rational.app to re-register it via SMAppService, or run:" >&2
   echo "install:   launchctl enable $GUI_DOMAIN/$HELPER_LABEL" >&2
-  echo "install:   launchctl bootstrap $GUI_DOMAIN \"${HELPER_PLIST:-/Applications/RatioThink.app/Contents/Library/LaunchAgents/$HELPER_LABEL.plist}\"" >&2
+  echo "install:   launchctl bootstrap $GUI_DOMAIN \"${HELPER_PLIST:-/Applications/Rational.app/Contents/Library/LaunchAgents/$HELPER_LABEL.plist}\"" >&2
 }
 
 # handle_install_signal <sig> -> INT/TERM trap body (F3). Restore the agent
@@ -148,10 +148,10 @@ http_port() {
 }
 
 # stale_procs <app_dest> <accept_epoch> -> prints one line per surviving
-# pie/RatioThinkHelper that is NOT from this install.
+# pie/RationalHelper/legacy RatioThinkHelper that is NOT from this install.
 stale_procs() {
   local app_dest="$1" accept_epoch="$2" pid
-  for pid in $(pgrep -x pie 2>/dev/null) $(pgrep -x RatioThinkHelper 2>/dev/null); do
+  for pid in $(pgrep -x pie 2>/dev/null) $(pgrep -x RationalHelper 2>/dev/null) $(pgrep -x RatioThinkHelper 2>/dev/null); do
     proc_is_new_bundle "$pid" "$app_dest" "$accept_epoch" \
       || ps -o pid=,comm=,etimes= -p "$pid" 2>/dev/null
   done

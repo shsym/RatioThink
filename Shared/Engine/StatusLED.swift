@@ -36,28 +36,27 @@ public struct StatusLED: Equatable, Sendable {
   /// A calm, non-blinking dim element.
   public static let dim = StatusLED(tint: .off, blink: false)
 
-  /// Engine-dot LED for a folded `EngineIndicatorState`. `.loading` maps to a
-  /// blink-white LED for completeness, but the view renders a progress ring
-  /// for loading (see `IndicatorDot`), so this value is only the fallback.
+  /// Engine-dot LED for a folded `EngineIndicatorState`. #469: a model switch
+  /// is now an engine restart (`.starting` → `.running`), so there is no
+  /// separate `.loading` state — "loading a model" reads as the amber starting
+  /// LED.
   public static func engineDot(for state: EngineIndicatorState) -> StatusLED {
     switch state {
     case .offline:  return StatusLED(tint: .off, blink: false)
     case .starting: return StatusLED(tint: .white, blink: true)
-    case .loading:  return StatusLED(tint: .white, blink: true)
     case .running:  return StatusLED(tint: .greenWhite, blink: false)
     case .error:    return StatusLED(tint: .amber, blink: true)
     }
   }
 }
 
-/// What the inner (engine) element should render. Folds the dot-vs-progress
-/// decision into the pure layer so the view stays dumb.
+/// What the inner (engine) element should render. #469: the engine element is
+/// always a tinted dot now (the former model-load progress ring went with the
+/// removed `/v1/models/load` UI). Kept an enum for the helper-ring composition
+/// and forward-compat.
 public enum IndicatorDot: Equatable, Sendable {
   /// A tinted (possibly blinking) dot.
   case led(StatusLED)
-  /// The model-load progress ring — determinate `fraction` or `nil` for
-  /// indeterminate.
-  case progressRing(fraction: Double?)
 }
 
 /// Pure mapping of `HelperHealth` → the outer helper-ring LED.
@@ -95,11 +94,7 @@ public enum HelperEngineIndicator {
       // Healthy or a transient blip: show the live engine state. During a
       // blip the engine is almost certainly still fine, so keep its dot
       // ("dot = last") rather than dimming on a single missed poll.
-      if case let .loading(_, fraction) = engine {
-        dot = .progressRing(fraction: fraction)
-      } else {
-        dot = .led(StatusLED.engineDot(for: engine))
-      }
+      dot = .led(StatusLED.engineDot(for: engine))
     case .repairing, .repairCoolingDown, .unreachable:
       // We've given up on a transient explanation and are restarting the
       // helper — the engine state it last reported is stale/unknown, so the

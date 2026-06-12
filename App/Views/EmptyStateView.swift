@@ -14,7 +14,7 @@ struct EmptyStateView: View {
       Image(systemName: "sparkles")
         .font(.system(size: 56, weight: .regular))
         .foregroundStyle(.secondary)
-      Text("Welcome to RatioThink")
+      Text("Welcome to Rational")
         .font(.title2.weight(.semibold))
       Text("Run local models. Serve them over HTTP.")
         .font(.body)

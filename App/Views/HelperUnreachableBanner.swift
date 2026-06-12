@@ -28,7 +28,7 @@ struct HelperUnreachableBanner: View {
     guard case .unreachable = health else { return nil }
     return Model(
       title: "Background helper isn’t responding",
-      message: "RatioThink couldn’t restart its background engine helper, so the engine can’t run. Try restarting it, re-enable it in Login Items, or collect diagnostics."
+      message: "Rational couldn’t restart its background engine helper, so the engine can’t run. Try restarting it, re-enable it in Login Items, or collect diagnostics."
     )
   }
 
