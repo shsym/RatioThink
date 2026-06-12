@@ -77,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: false
+          submodules: recursive
 
       - name: Run lint
         run: make lint

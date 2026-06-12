@@ -58,7 +58,7 @@ define gui_suite_run
   exit $$status
 endef
 
-.PHONY: help genproject build build-tests clean lint \
+.PHONY: help genproject build build-tests clean lint verify-tot-docs \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics \
         test-xcode-chat-scaffold test-app-unit \
         test-unit test-scenario test-smoke test-curated-hf test-install-guards test-e2e-http \
@@ -283,8 +283,11 @@ test-gui-history: genproject ## Deterministic  GUI history/resume E2E — needs 
 test-gui-first-launch-package: ## Package-backed  first-launch E2E — needs seated session
 	Scripts/run-first-launch-package-e2e.sh
 
-lint: ## Static checks for  helper-side-effect invariants
+lint: verify-tot-docs ## Static checks for helper-side-effect and ToT docs/example invariants
 	@Scripts/lint-helper-side-effects.sh
+
+verify-tot-docs: ## Verify Tree-of-Thought docs/example beam-search semantics
+	python3 Scripts/verify-tot-docs.py
 
 verify-app-icon-assets: ## Verify committed app-icon source, generated PNGs, and XcodeGen wiring
 	Scripts/verify-app-icon-assets.sh
