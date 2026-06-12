@@ -76,4 +76,19 @@ final class AppPreferencesTests: XCTestCase {
     XCTAssertTrue(reopened.localAPIExternalAccessEnabled)
     XCTAssertEqual(reopened.localAPIBindMode, .external)
   }
+
+  func test_local_api_external_access_persists_to_shared_helper_readable_file() throws {
+    let defaults = try makeScratchDefaults()
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("app-prefs-local-api-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try PieDirs.$homeOverride.withValue(root) {
+      let prefs = AppPreferences(defaults: defaults)
+      prefs.setLocalAPIExternalAccessEnabled(true)
+
+      XCTAssertEqual(LocalAPIExposurePreference.loadEnabled(root: root), true)
+      XCTAssertEqual(EngineHTTPBindMode.persistedLocalAPIBindMode(root: root), .external)
+    }
+  }
 }

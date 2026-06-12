@@ -15,8 +15,9 @@ import Darwin
 ///      hand it to pie before pie itself binds.
 ///   2. Spawn `pie serve --no-auth --debug --config <tmp/config.toml>`
 ///      with `PIE_HOME=<tmp>` + `PIE_SHMEM_NAME=/pie_t_<pid>_<uuid8>`.
-///   3. Parse the engine's stdout for
-///        `pie-server serving on <host>:<port>`
+///   3. Parse the engine's stdout for a ready address
+///        `pie-server serving on <host>:<port>` (legacy) OR
+///        `Server ready at ws://<host>:<port>`
 ///        `internal token: <token>`
 ///      Both must appear within `handshakeTimeout`.
 ///   4. Open a WebSocket to `ws://<host>:<port>`, auth_by_token,
@@ -956,7 +957,8 @@ public actor LaunchedSession {
   /// AsyncStream covers both the "burst then quiet" and "early-exit"
   /// cases without us spinning a poll loop on a DispatchSource.
   fileprivate func awaitHandshake(timeout: TimeInterval) async throws -> PieControlLauncher.Handshake {
-    let urlRegex = try! NSRegularExpression(pattern: #"pie-server serving on (\S+:\d+)"#)
+    let legacyURLRegex = try! NSRegularExpression(pattern: #"pie-server serving on (\S+:\d+)"#)
+    let serverReadyURLRegex = try! NSRegularExpression(pattern: #"Server ready at ws://(\S+:\d+)"#)
     let tokRegex = try! NSRegularExpression(pattern: #"internal token: (\S+)"#)
     let started = Date()
     let lines = startLineStream()
@@ -969,7 +971,13 @@ public actor LaunchedSession {
         var token: String?
         for await line in lines {
           await self?.append(line: line)
-          if address == nil, let m = await self?.match(urlRegex, in: line) { address = m }
+          if address == nil {
+            if let m = await self?.match(legacyURLRegex, in: line) {
+              address = m
+            } else if let m = await self?.match(serverReadyURLRegex, in: line) {
+              address = m
+            }
+          }
           if token == nil, let m = await self?.match(tokRegex, in: line) { token = m }
           if let a = address, let t = token {
             return PieControlLauncher.Handshake(address: a, token: t)

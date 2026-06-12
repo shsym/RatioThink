@@ -53,7 +53,18 @@ public final class AppPreferences: ObservableObject {
     self.defaults = defaults
     self.firstLaunchWizardCompleted = defaults.bool(forKey: Self.firstLaunchWizardCompletedKey)
     self.ignoredUpdateVersions = Set(defaults.stringArray(forKey: Self.ignoredUpdateVersionsKey) ?? [])
-    self.localAPIExternalAccessEnabled = defaults.bool(forKey: Self.localAPIExternalAccessEnabledKey)
+    let root = try? PieDirs.applicationSupport()
+    let fileBacked = root.flatMap { LocalAPIExposurePreference.loadEnabled(root: $0) }
+    let defaultsBacked = defaults.bool(forKey: Self.localAPIExternalAccessEnabledKey)
+    let effectiveExternalAccess = fileBacked ?? defaultsBacked
+    self.localAPIExternalAccessEnabled = effectiveExternalAccess
+    if fileBacked == nil, defaultsBacked, let root {
+      try? LocalAPIExposurePreference.saveEnabled(defaultsBacked, root: root)
+    }
+    if fileBacked != nil, defaultsBacked != effectiveExternalAccess {
+      defaults.set(effectiveExternalAccess, forKey: Self.localAPIExternalAccessEnabledKey)
+      defaults.synchronize()
+    }
   }
 
   /// Persist a version as ignored. Flushed to disk now (like the first-launch
@@ -72,6 +83,9 @@ public final class AppPreferences: ObservableObject {
     guard localAPIExternalAccessEnabled != enabled else { return }
     localAPIExternalAccessEnabled = enabled
     defaults.set(enabled, forKey: Self.localAPIExternalAccessEnabledKey)
+    if let root = try? PieDirs.applicationSupport() {
+      try? LocalAPIExposurePreference.saveEnabled(enabled, root: root)
+    }
     defaults.synchronize()
   }
 

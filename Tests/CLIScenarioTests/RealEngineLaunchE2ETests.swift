@@ -394,7 +394,7 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
   /// would surface as `.handshakeTimeout` and fail (b).
   func test_launch_fires_pidSink_with_spawned_pid_engineFree() async throws {
     let deadPort = try Self.reserveClosedLoopbackPort()
-    let stub = try writeStubPie(advertisedWSPort: deadPort)
+    let stub = try writeStubPie(advertisedWSPort: deadPort, readiness: .legacy)
     let captured = OSAllocatedUnfairLock<pid_t>(initialState: 0)
 
     let spec = try PieControlLauncher.LaunchSpec(
@@ -427,17 +427,55 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
                          "PieControlLauncher.launch must fire pidSink with the spawned pie pid — the production fact the hand-rolled seam test does not cover")
   }
 
+  func test_launch_accepts_new_server_ready_handshake_format_engineFree() async throws {
+    let deadPort = try Self.reserveClosedLoopbackPort()
+    let stub = try writeStubPie(advertisedWSPort: deadPort, readiness: .serverReady)
+    let spec = try PieControlLauncher.LaunchSpec(
+      pieBinary: stub,
+      wasmURL: tempPieHome.appendingPathComponent("chat-apc.wasm"),
+      manifestURL: tempPieHome.appendingPathComponent("Pie.toml"),
+      subprocessEnvironment: subprocessEnvironment,
+      pieHome: tempPieHome,
+      shmemName: shmemName,
+      handshakeTimeout: 5,
+      modelConfig: .dummy
+    )
+
+    do {
+      let (_, session) = try await PieControlLauncher.launch(spec: spec)
+      await session.shutdown()
+      XCTFail("engine-free stub cannot complete the WS install; launch must throw")
+    } catch let error as PieControlLauncher.LaunchError {
+      guard case .clientError = error else {
+        return XCTFail("expected .clientError after parsing new 'Server ready at ws://...' handshake; got \(error)")
+      }
+    }
+  }
+
   /// Write an executable stub mimicking `pie serve` only as far as
   /// `PieControlLauncher.awaitHandshake` reads: emit the serving-address
   /// line and the internal-token line (the exact two markers the launcher
   /// captures), then re-exec as `sleep` so the pid stays stable for the
   /// launcher's shutdown SIGINT. It runs no WS server, so the launcher's
   /// install step fails by design — after the pidSink has already fired.
-  private func writeStubPie(advertisedWSPort port: UInt16) throws -> URL {
-    let url = tempPieHome.appendingPathComponent("stub-pie")
+  private enum StubReadiness {
+    case legacy
+    case serverReady
+  }
+
+  private func writeStubPie(advertisedWSPort port: UInt16,
+                            readiness: StubReadiness) throws -> URL {
+    let url = tempPieHome.appendingPathComponent("stub-pie-\(UUID().uuidString.prefix(8))")
+    let readyLine: String
+    switch readiness {
+    case .legacy:
+      readyLine = #"pie-server serving on 127.0.0.1:\#(port)"#
+    case .serverReady:
+      readyLine = #"✓ Server ready at ws://127.0.0.1:\#(port)"#
+    }
     let script = """
     #!/bin/sh
-    echo "pie-server serving on 127.0.0.1:\(port)"
+    echo "\(readyLine)"
     echo "internal token: stub-token-deadbeef"
     exec sleep 30
     """

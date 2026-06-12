@@ -30,11 +30,10 @@ public enum EngineHTTPBindMode: String, Codable, Equatable, Sendable {
   /// auto-relaunch outside the SwiftUI app process, so its launch resolver
   /// needs the same on-disk preference at the spec boundary.
   public static func persistedLocalAPIBindMode(
-    defaults: UserDefaults = .standard
+    root: URL? = try? PieDirs.applicationSupport()
   ) -> EngineHTTPBindMode {
-    defaults.bool(forKey: Self.localAPIExternalAccessEnabledPreferenceKey)
-      ? .external
-      : .loopback
+    guard let root else { return .loopback }
+    return LocalAPIExposurePreference.loadBindMode(root: root)
   }
 }
 

@@ -953,6 +953,13 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
           physicalMemoryBytes: SystemMemory.physicalBytes(),
           fraction: fraction
         )
+      },
+      // Local API exposure is security-sensitive and must cross the
+      // App↔Helper process boundary. Read the file-backed shared preference
+      // from the real PieDirs root rather than this helper process's
+      // UserDefaults domain.
+      daemonBindMode: {
+        EngineHTTPBindMode.persistedLocalAPIBindMode()
       }
     )
     let closure = resolver.asClosure

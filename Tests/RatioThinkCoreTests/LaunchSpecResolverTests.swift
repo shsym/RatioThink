@@ -263,6 +263,43 @@ final class LaunchSpecResolverTests: XCTestCase {
                    "helper-owned Resume/auto-relaunch starts must inherit the persisted Local API bind mode before engineHost.start(spec)")
   }
 
+  func test_default_helper_bind_mode_reads_shared_app_persisted_preference() throws {
+    let store = try makeStoreWithChatProfile()
+    defer { store.stop() }
+    let binary = tempDir.appendingPathComponent("pie-fake-shared-bind", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models-shared-bind", isDirectory: true)
+    try stageModel(named: "llama-3.1-8b-instruct", in: modelsRoot)
+    let appSharedRoot = tempDir.appendingPathComponent("shared-app-root", isDirectory: true)
+    try FileManager.default.createDirectory(at: appSharedRoot, withIntermediateDirectories: true)
+    try LocalAPIExposurePreference.saveEnabled(true, root: appSharedRoot)
+
+    let helperSuite = "com.ratiothink.helper.false.\(UUID().uuidString)"
+    let helperDefaults = UserDefaults(suiteName: helperSuite)!
+    defer { helperDefaults.removePersistentDomain(forName: helperSuite) }
+    helperDefaults.set(false, forKey: EngineHTTPBindMode.localAPIExternalAccessEnabledPreferenceKey)
+
+    let result = PieDirs.$homeOverride.withValue(appSharedRoot) {
+      let resolver = LaunchSpecResolver(
+        profileStore: store,
+        pieBinary: { binary },
+        modelsRoot: { modelsRoot },
+        inferletsDir: { self.tempDir.appendingPathComponent("inferlets-shared-bind") },
+        pieControlResources: { resources },
+        pieHome: { self.tempDir },
+        subprocessEnvironment: { [:] }
+      )
+      return resolver.resolveLauncherSpec(profileID: "chat")
+    }
+
+    guard case .success(let spec) = result else {
+      return XCTFail("expected helper resolver to produce a launch spec")
+    }
+    XCTAssertEqual(spec.daemonBindHost, .external,
+                   "helper resolver must read the app/helper shared file-backed preference, not the helper process defaults domain")
+  }
+
   /// Review v1 F1: first-run seeded profiles still use the public
   /// profile schema's bare inferlet name (`chat-apc`). The launcher
   /// resolver must qualify that selector from the installed manifest
