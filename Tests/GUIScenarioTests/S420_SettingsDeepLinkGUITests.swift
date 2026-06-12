@@ -40,15 +40,16 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
 
   @MainActor
   func test_settings_deeplink_opens_settings_window() async throws {
-    // Launch the staged app next to the UI-test bundle, not "whatever
-    // LaunchServices currently maps com.ratiothink.app to". Developer machines
-    // commonly have multiple DerivedData Rational.app bundles registered; the
-    // deep-link delivery below must target the same artifact this test launched.
-    let appURL = try XCTUnwrap(
+    // The app-under-test should be the staged app next to the UI-test bundle,
+    // not "whatever LaunchServices currently maps com.ratiothink.app to".
+    // Keep XCUITest responsible for launch/ownership (bundle-id launch matches
+    // the rest of this suite), then assert the running app is the staged
+    // artifact before delivering the deep link to that exact running bundle.
+    let stagedAppURL = try XCTUnwrap(
       Self.locateSiblingApp(named: "Rational.app", from: type(of: self)),
       "Rational.app not found next to test bundle — verify RatioThinkGUITests depends on target RatioThink"
     )
-    let app = XCUIApplication(url: appURL)
+    let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
     app.launchArguments.append(contentsOf: Self.restorationOffArgs)
     configureCompletedFirstLaunch(app)
     app.launch()
@@ -62,6 +63,7 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
     XCTAssert(app.wait(for: .runningForeground, timeout: 5),
               "Rational.app did not reach runningForeground")
     app.activate()
+    let appURL = try resolvedRunningAppURL(expected: stagedAppURL)
 
     // Precondition: no Settings window yet — so a post-delivery Settings window
     // is unambiguously the deep link's doing, not launch-time restoration.
@@ -100,7 +102,33 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
         + "reach the real Settings scene")
     // …and the deep link must bring Rational forward (NSApp.activate() in the
     // handler), the foreground half of "open straight to Settings".
-    XCTAssertEqual(app.state, .runningForeground, "deep link did not foreground the app")
+    XCTAssertTrue(
+      app.wait(for: .runningForeground, timeout: 5),
+      "deep link did not foreground the app; final state=\(app.state)")
+  }
+
+  /// The bundle URL of the running app under test. The deep link is delivered
+  /// to this exact bundle so it can't be routed to an installed copy. The
+  /// explicit equality check catches stale LaunchServices/Xcode state where a
+  /// same-bundle-id app outside the current build products was launched.
+  private func resolvedRunningAppURL(expected stagedAppURL: URL) throws -> URL {
+    let expected = Self.canonicalAppURL(stagedAppURL)
+    let deadline = Date().addingTimeInterval(5)
+    var observed: URL?
+    repeat {
+      observed = NSWorkspace.shared.runningApplications
+        .first { $0.bundleIdentifier == "com.ratiothink.app" }?
+        .bundleURL
+        .map(Self.canonicalAppURL)
+      if observed == expected { return expected }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+    } while Date() < deadline
+
+    let got = observed?.path ?? "<none>"
+    return try XCTUnwrap(
+      nil as URL?,
+      "XCUITest launched a different com.ratiothink.app bundle; expected staged "
+        + "\(expected.path), got \(got)")
   }
 
   /// Locates a sibling `.app` next to the test bundle by walking up
@@ -116,5 +144,9 @@ final class S420_SettingsDeepLinkGUITests: XCTestCase {
       dir = parent
     }
     return nil
+  }
+
+  private static func canonicalAppURL(_ url: URL) -> URL {
+    url.standardizedFileURL.resolvingSymlinksInPath()
   }
 }
