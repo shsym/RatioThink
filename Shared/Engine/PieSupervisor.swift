@@ -5,7 +5,7 @@ import os
 /// of RatioThinkHelper.
 ///
 /// Responsibilities (per design doc §3 + Phase 2.2 work):
-///  · Spawn `RatioThink.app/Contents/Resources/pie-engine/pie` with arguments
+///  · Spawn `Rational.app/Contents/Resources/pie-engine/pie` with arguments
 ///    derived from the active `Profile`.
 ///  · Capture the `HTTP_LISTEN=host:port\n` handshake line written to
 ///    stdout. Transition to `.running(port, profileID)` once captured.
@@ -411,7 +411,10 @@ public final class PieSupervisor: @unchecked Sendable {
       switch self {
       case .stopped:                          return .stopped
       case .starting:                         return .starting
-      case .running(let port, let spec):      return .running(port: port, profileID: spec.profileID)
+      // Legacy supervisor (test-bundle only): no LaunchSpec KV knobs, so
+      // project a minimal snapshot (#476). Production runs through PieEngineHost.
+      case .running(let port, let spec):
+        return .running(EngineSessionSnapshot(port: port, profileID: spec.profileID))
       case .stopping:                         return .stopping
       case .failed(let code, let message):    return .failed(code: code, message: message)
       }
@@ -436,6 +439,17 @@ public final class PieSupervisor: @unchecked Sendable {
   /// init that sets it, so production liveness always uses the real
   /// `Process.isRunning` (review v5 F59 pid-reuse safety intact).
   private let livenessOverride: ((Process) -> Bool)?
+  /// Test seam (review v1 F1): count of stdout read sources currently
+  /// resumed and not yet cancelled. Incremented when `spawn` resumes a
+  /// source, decremented by `cancelStdoutSource`. Any abandon path
+  /// (handshake-timeout / malformed / carry-overflow / kill-rejected /
+  /// crash / stop-deadline) must drive this back to 0; a nonzero value
+  /// after a terminal state means a source leaked and is busy-spinning
+  /// at EOF on `stateQueue`. Read via `activeStdoutSourceCountForTesting`.
+  private var _activeStdoutSourceCount = 0
+  internal var activeStdoutSourceCountForTesting: Int {
+    performLocked { _activeStdoutSourceCount }
+  }
   #endif
 
   private let stateQueue = DispatchQueue(label: "com.ratiothink.supervisor.state", qos: .userInitiated)
@@ -534,6 +548,20 @@ public final class PieSupervisor: @unchecked Sendable {
     let process: Process
     let stdoutPipe = Pipe()
     let stderrPipe = Pipe()
+    /// Reads the child's stdout on the supervisor's `stateQueue` so
+    /// the handshake parser, the carry buffer, and the termination
+    /// flush never race a private FileHandle queue (review v9 F92,
+    /// CI flake #492). Cancelled via `cancelStdoutSource` on EVERY
+    /// path that abandons the incarnation: EOF or a hard read error
+    /// (`readStdout`), `Process.run()` failure, the kill/timeout paths
+    /// (`finishSpawnFailure`, `enterKillRejected`), the stop-deadline
+    /// timeout (`armStopDeadline`, review v2 F4 — the one path the
+    /// `handleTermination` backstop cannot reach because the wedged
+    /// child is never reaped), and both branches of `handleTermination`
+    /// (the live exit and the stale-incarnation backstop). Leaving it
+    /// resumed past abandonment leaks a source that busy-spins at EOF
+    /// on `stateQueue` (review v1 F1).
+    var stdoutSource: DispatchSourceRead?
     var stdoutCarry = Data()
     var handshakeFound = false
     /// Port carried by the most-recently-parsed valid handshake line.
@@ -597,26 +625,44 @@ public final class PieSupervisor: @unchecked Sendable {
     Log.engine.info("PieSupervisor: spawning attempt=\(self.attemptCount, privacy: .public) profile=\(spec.profileID, privacy: .public) binary=\(spec.binaryURL.path, privacy: .public)")
 
     // Hook readers BEFORE run so we never miss the handshake line.
-    let stdoutHandle = inc.stdoutPipe.fileHandleForReading
-    let stderrHandle = inc.stderrPipe.fileHandleForReading
-    stdoutHandle.readabilityHandler = { [weak self, weak inc] fh in
-      guard let self, let inc else { return }
-      let data = fh.availableData
-      if data.isEmpty {
-        // Empty data = EOF OR a read error (EBADF/EIO). FileHandle
-        // does not expose the difference; the terminationHandler is
-        // the authoritative signal that the child is done. Detach
-        // the handler so it doesn't busy-loop, but defer the final
-        // carry-buffer flush to `handleTermination` — that path
-        // already runs on stateQueue and can race-free re-parse the
-        // tail (review v1 F9).
-        Log.engine.debug("PieSupervisor: stdout readabilityHandler observed EOF/error")
-        fh.readabilityHandler = nil
-        return
-      }
-      self.stateQueue.async { self.consumeStdout(inc: inc, chunk: data) }
-      self.appendLog(data)
+    //
+    // stdout is read by a DispatchSource targeting `stateQueue`
+    // (review v9 F92, CI flake #492) rather than a FileHandle
+    // `readabilityHandler`. The handshake parser, the carry buffer,
+    // and `handleTermination`'s final flush all run on `stateQueue`; a
+    // readabilityHandler fires on a private queue and hands its bytes
+    // over via a `stateQueue.async` hop, which loses the race to the
+    // independently-dispatched `terminationHandler` when the engine
+    // prints HTTP_LISTEN (no trailing newline) then exits instantly —
+    // the chunk lands on the queue AFTER termination already
+    // classified the exit, so it is dropped at the stale-incarnation
+    // guard and the printed-handshake diagnostic is lost. Reading on
+    // `stateQueue` makes stdout consumption and termination strictly
+    // serial: a pending read can never interleave with the
+    // termination flush, so the parked handshake is always recovered.
+    let stdoutFD = inc.stdoutPipe.fileHandleForReading.fileDescriptor
+    let stdoutFlags = fcntl(stdoutFD, F_GETFL)
+    // Review v1 F3: a failed non-blocking setup would leave a BLOCKING
+    // fd, and `readStdout`'s read-until-EAGAIN loop on `stateQueue`
+    // could then park the whole state queue waiting on a quiet child.
+    // Effectively impossible on a fresh pipe fd, but surface it so the
+    // wedge is observable rather than silent. `&&` short-circuits so
+    // F_SETFL is skipped when F_GETFL already failed.
+    if stdoutFlags == -1 || fcntl(stdoutFD, F_SETFL, stdoutFlags | O_NONBLOCK) == -1 {
+      Log.engine.fault("PieSupervisor: stdout fd O_NONBLOCK setup failed errno=\(errno, privacy: .public) (\(String(cString: strerror(errno)), privacy: .public)); reads may block stateQueue")
     }
+    let stdoutSource = DispatchSource.makeReadSource(fileDescriptor: stdoutFD, queue: stateQueue)
+    stdoutSource.setEventHandler { [weak self, weak inc] in
+      guard let self, let inc, self.current?.id == inc.id else { return }
+      self.readStdout(inc: inc, fd: stdoutFD)
+    }
+    inc.stdoutSource = stdoutSource
+    stdoutSource.resume()
+    #if DEBUG
+    _activeStdoutSourceCount += 1
+    #endif
+
+    let stderrHandle = inc.stderrPipe.fileHandleForReading
     stderrHandle.readabilityHandler = { [weak self] fh in
       let data = fh.availableData
       if data.isEmpty {
@@ -635,7 +681,7 @@ public final class PieSupervisor: @unchecked Sendable {
       // burning the full attempt ladder (review v1 F2).
       let msg = "Process.run() failed for \(spec.binaryURL.path): \(error)"
       Log.engine.fault("\(msg, privacy: .public)")
-      stdoutHandle.readabilityHandler = nil
+      cancelStdoutSource(inc)
       stderrHandle.readabilityHandler = nil
       current = nil
       currentSpec = nil
@@ -711,6 +757,57 @@ public final class PieSupervisor: @unchecked Sendable {
     timer.resume()
   }
 
+  /// Cancel and release an incarnation's stdout read source.
+  /// Idempotent — safe on an already-cancelled / nil source. Must be
+  /// called on EVERY path that abandons an incarnation (review v1 F1):
+  /// the event handler's `current?.id == inc.id` gate stops reading a
+  /// non-current child, so a source left resumed never reaches its EOF
+  /// self-cancel and instead busy-spins at EOF on `stateQueue` for the
+  /// supervisor's lifetime (and closes the fd under an active source
+  /// when the pipe deallocs — libdispatch UB).
+  private func cancelStdoutSource(_ inc: Incarnation?) {
+    guard let source = inc?.stdoutSource else { return }
+    source.cancel()
+    inc?.stdoutSource = nil
+    #if DEBUG
+    _activeStdoutSourceCount -= 1
+    #endif
+  }
+
+  /// Event handler for the stdout DispatchSource (runs on
+  /// `stateQueue`). Drains every byte currently readable on the
+  /// non-blocking fd and feeds it through the handshake parser. A
+  /// 0-length read is EOF and cancels the source; EAGAIN/EWOULDBLOCK
+  /// means nothing more is buffered right now and the source will
+  /// re-fire when the child writes again; EINTR retries; any other
+  /// error (EIO/EBADF) tears the source down with a fault log rather
+  /// than being silently swallowed (review v1 F2).
+  private func readStdout(inc: Incarnation, fd: Int32) {
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+      let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+      if n > 0 {
+        let data = Data(buffer[0..<n])
+        appendLog(data)
+        consumeStdout(inc: inc, chunk: data)
+        // consumeStdout may have driven a terminal state (handshake,
+        // carry overflow, malformed line); stop reading a child we no
+        // longer own.
+        if current?.id != inc.id { return }
+      } else if n == 0 {
+        cancelStdoutSource(inc)
+        return
+      } else {
+        let err = errno
+        if err == EINTR { continue }
+        if err == EAGAIN || err == EWOULDBLOCK { return }
+        Log.engine.fault("PieSupervisor: stdout read failed errno=\(err, privacy: .public) (\(String(cString: strerror(err)), privacy: .public)) — cancelling source")
+        cancelStdoutSource(inc)
+        return
+      }
+    }
+  }
+
   private func consumeStdout(inc: Incarnation, chunk: Data) {
     guard current?.id == inc.id else { return }
     inc.stdoutCarry.append(chunk)
@@ -746,6 +843,51 @@ public final class PieSupervisor: @unchecked Sendable {
       // processLine may have driven us to a terminal state; bail if
       // current was cleared.
       if current?.id != inc.id { return }
+    }
+  }
+
+  /// Synchronously drain whatever stdout the child left buffered in
+  /// the pipe straight into `inc.stdoutCarry`.
+  ///
+  /// Called from `handleTermination` when no handshake has been
+  /// observed yet (review v9 F92, CI flake #492). stdout is normally
+  /// consumed by the `stdoutSource` DispatchSource (also on
+  /// `stateQueue`), but the `terminationHandler` can be processed
+  /// before a pending source read event runs — and since both are
+  /// serialized on `stateQueue`, that pending event cannot run while
+  /// this termination flush is executing. The bytes the child printed
+  /// without a trailing newline — e.g. an `HTTP_LISTEN=` line before
+  /// an immediate exit — are therefore still sitting unread in the
+  /// pipe (the child has been reaped, so its write end is closed).
+  /// Reading them here, after cancelling the source, makes the
+  /// printed-handshake diagnostic deterministic.
+  ///
+  /// Uses a non-blocking read so a defensively-still-open write end
+  /// can never wedge the supervisor's serial queue: `read` returns the
+  /// buffered bytes, then 0 (EOF) or EAGAIN, and the loop stops. EINTR
+  /// retries so a signal can't drop the final pre-EOF byte — the very
+  /// diagnostic this drain exists to recover (review v1 F2). If the
+  /// non-blocking setup fails the loop is SKIPPED rather than risking a
+  /// blocking `read` on `stateQueue` (review v1 F3).
+  private func drainBufferedStdout(_ inc: Incarnation) {
+    let fd = inc.stdoutPipe.fileHandleForReading.fileDescriptor
+    let flags = fcntl(fd, F_GETFL)
+    guard flags != -1, fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1 else {
+      Log.engine.fault("PieSupervisor: drainBufferedStdout O_NONBLOCK setup failed errno=\(errno, privacy: .public) (\(String(cString: strerror(errno)), privacy: .public)); skipping pipe drain to avoid a blocking read on stateQueue")
+      return
+    }
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+      let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+      if n > 0 {
+        let data = Data(buffer[0..<n])
+        inc.stdoutCarry.append(data)
+        appendLog(data)
+      } else if n < 0 && errno == EINTR {
+        continue
+      } else {
+        break
+      }
     }
   }
 
@@ -872,6 +1014,12 @@ public final class PieSupervisor: @unchecked Sendable {
     // Drop stale callbacks from a prior incarnation that we've
     // already moved past (the new spawn took over `current`).
     guard current?.id == inc.id else {
+      // Backstop for review v1 F1: a non-current incarnation is always
+      // abandoned, and its stdout source must not survive resumed (the
+      // abandon helpers below cancel it eagerly, but a killed child
+      // whose terminationHandler funnels here is the catch-all). Cancel
+      // before any early return.
+      cancelStdoutSource(inc)
       // The handshake-timer path may have already TERMINALLY failed
       // this incarnation as `.handshakeTimeout` (it nils `current`, so
       // we land here, not in the `.failed` branch below). Under load
@@ -900,18 +1048,30 @@ public final class PieSupervisor: @unchecked Sendable {
       return
     }
     inc.handshakeTimer?.cancel()
-    inc.stdoutPipe.fileHandleForReading.readabilityHandler = nil
+    cancelStdoutSource(inc)
     inc.stderrPipe.fileHandleForReading.readabilityHandler = nil
 
-    // Final flush: an engine that exited without a trailing newline
-    // may have parked the handshake line in stdoutCarry. Re-parse
-    // the tail BUT do not let processLine call setState / kill /
-    // finishSpawnFailure (review v2 F29 — the prior side-effecting
-    // flush published a transient `.running` for an already-exited
-    // engine). The flush only updates `inc.handshakeFound` /
-    // `inc.malformedHandshakeRaw`; the unified failure path below
-    // produces a precise diagnostic without ever crossing through
-    // `.running`.
+    // An engine that printed the handshake WITHOUT a trailing newline
+    // then exited immediately may have parked that line in the pipe.
+    // stdout is consumed by the `stdoutSource` DispatchSource (also on
+    // `stateQueue`), but for an instant-exit child this termination
+    // callback can be dequeued before a pending source read event —
+    // and the two are serialized on `stateQueue`, so that event cannot
+    // run while we hold the queue here. The parked bytes are therefore
+    // still unread in the pipe. Drain them straight into the carry
+    // (the source was just cancelled, so there is no competing reader)
+    // before re-parsing (review v9 F92, CI flake #492).
+    if !inc.handshakeFound {
+      drainBufferedStdout(inc)
+    }
+
+    // Final flush: re-parse the tail BUT do not let processLine call
+    // setState / kill / finishSpawnFailure (review v2 F29 — the prior
+    // side-effecting flush published a transient `.running` for an
+    // already-exited engine). The flush only updates
+    // `inc.handshakeFound` / `inc.malformedHandshakeRaw`; the unified
+    // failure path below produces a precise diagnostic without ever
+    // crossing through `.running`.
     if !inc.handshakeFound, !inc.stdoutCarry.isEmpty {
       let tail = inc.stdoutCarry
       inc.stdoutCarry = Data()
@@ -1060,6 +1220,11 @@ public final class PieSupervisor: @unchecked Sendable {
   /// not consult `Process.terminationStatus` because the child was
   /// force-killed before any exit code became meaningful.
   private func finishSpawnFailure(code: EngineErrorCode, message: String) {
+    // Review v1 F1: this abandons the current incarnation (terminal
+    // .failed or a re-spawn). Cancel its stdout source before nil'ing
+    // `current` so the killed child's EOF can't busy-spin a stale
+    // source on `stateQueue`.
+    cancelStdoutSource(current)
     attemptHistory.append("attempt \(attemptCount): \(code.rawValue) — \(message)")
     if attemptCount >= policy.restartAttempts {
       currentSpec = nil
@@ -1154,6 +1319,12 @@ public final class PieSupervisor: @unchecked Sendable {
       guard let self else { return }
       guard case .stopping = self._state else { return }
       Log.engine.fault("PieSupervisor: stop deadline (\(self.policy.stopGracePeriod + self.policy.stopOverrun, privacy: .public)s) exceeded; forcing .failed")
+      // Review v2 F4: this is the one abandon path the handleTermination
+      // backstop cannot reach — it fires precisely when SIGTERM+SIGKILL
+      // produced no terminal observation, so the wedged child's
+      // terminationHandler never runs. Cancel the source here, before
+      // nil'ing `current`, mirroring finishSpawnFailure / enterKillRejected.
+      self.cancelStdoutSource(self.current)
       self.current = nil
       self.currentSpec = nil
       self.stopDeadlineTimer = nil
@@ -1178,6 +1349,12 @@ public final class PieSupervisor: @unchecked Sendable {
     // will reap the orphan via the persisted manifest), or kill
     // the pid manually.
     Log.engine.fault("PieSupervisor: entering .failed(.killRejected) pid=\(pid, privacy: .public) — \(message, privacy: .public). Recovery options: (1) call clearKillRejected via XPC (selector wired in HelperExportedAPI; no App-side button yet), (2) relaunch the helper (boot will reap the orphan via the persisted manifest), or (3) `kill -9 \(pid, privacy: .public)` manually.")
+    // Review v1 F1: the rejected-SIGKILL child stays alive, so its
+    // terminationHandler may never fire to cancel the source via
+    // handleTermination. Cancel here, before nil'ing `current`, so the
+    // source can't outlive the incarnation (the fd closes under it when
+    // the zombie is finally reaped and `inc` deallocs).
+    cancelStdoutSource(current)
     current = nil
     currentSpec = nil
     killRejectedProcess = process

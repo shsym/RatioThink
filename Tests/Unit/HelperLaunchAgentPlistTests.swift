@@ -18,7 +18,7 @@ import XCTest
 /// also covers the project.yml postCompileScript wiring.
 final class HelperLaunchAgentPlistTests: XCTestCase {
   private func stagedPlist() throws -> [String: Any] {
-    // RatioThinkTests is hosted by RatioThink, so this class's bundle IS RatioThink.app.
+    // RatioThinkTests is hosted by RatioThink, so this class's bundle IS Rational.app.
     let appBundle = Bundle(for: SMAppServiceLoginItemRegistrar.self)
     let plistURL = appBundle.bundleURL
       .appendingPathComponent("Contents/Library/LaunchAgents")

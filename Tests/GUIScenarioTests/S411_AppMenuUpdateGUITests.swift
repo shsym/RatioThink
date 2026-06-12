@@ -2,9 +2,9 @@ import XCTest
 
 /// S411 — App menu update surface + New Chat removal (#411).
 ///
-/// GUI-only. Drives the real `RatioThink.app` main menu bar and asserts the
+/// GUI-only. Drives the real `Rational.app` main menu bar and asserts the
 /// two user-visible outcomes of #411:
-///   1. The App menu (▸ "RatioThink") carries "Check for Updates…" — the
+///   1. The App menu (▸ "Rational") carries "Check for Updates…" — the
 ///      truthful manual update entry point, in the standard macOS slot.
 ///   2. The menu bar no longer exposes the orphaned no-op "New Chat" /
 ///      "New Chat (Always)" commands, and the default "New Window" stays
@@ -33,7 +33,7 @@ final class S411_AppMenuUpdateGUITests: XCTestCase {
     defer { app.terminate() }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 5),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     // XCUITest launches with the app not frontmost; activate so the main
     // menu populates the accessibility tree before we query it.
     app.activate()
@@ -44,8 +44,8 @@ final class S411_AppMenuUpdateGUITests: XCTestCase {
     // 1. "Check for Updates…" lives specifically under the App menu (the
     //    menu bar item titled with the app name) — querying through it
     //    pins placement, not just existence somewhere in the bar.
-    let appMenu = menuBar.menuBarItems["RatioThink"]
-    XCTAssertTrue(appMenu.waitForExistence(timeout: 5), "App menu (RatioThink) missing")
+    let appMenu = menuBar.menuBarItems["Rational"]
+    XCTAssertTrue(appMenu.waitForExistence(timeout: 5), "App menu (Rational) missing")
     let checkForUpdates = appMenu.menuItems["Check for Updates…"]
     XCTAssertTrue(
       checkForUpdates.waitForExistence(timeout: 5),
