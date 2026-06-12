@@ -342,12 +342,13 @@
       profile: 'Tree of Thought',
       bounds: '· 3×2, beam 2 ·',
       prompt: 'Plan a surprise party for a close friend.',
-      // Breadth 3 at the root; the beam keeps the top 2, and EACH kept branch
-      // then explores its own children — pruned branches are not expanded.
+      // Breadth 3 at the root; the beam keeps the top 2, and level 2 keeps
+      // the global top-2 leaf frontier. The score-7 cookout is shown as a
+      // provisional check, then demoted when the later score-8 child arrives.
       branches: [
         { t: 'Start with the guest list and theme', s: 8, beam: 'kept', children: [
             { t: 'Evening garden theme, ~12 friends', s: 9, beam: 'star' },
-            { t: 'Backyard cookout, ~15 friends',     s: 7, beam: 'kept' } ] },
+            { t: 'Backyard cookout, ~15 friends',     s: 7, beam: 'pruned', provisionalBeam: 'kept' } ] },
         { t: 'Pick a date everyone can make',        s: 7, beam: 'kept', children: [
             { t: 'A free Saturday evening', s: 8, beam: 'kept'   },
             { t: 'A weeknight after work',  s: 5, beam: 'pruned' } ] },
@@ -504,9 +505,11 @@
     for (var k=0;k<n1.length;k++){ setBeam(n1[k], d.branches[k].beam); await sleep(150, myGen); }
     await sleep(560, myGen);
 
-    // EVERY kept branch explores its own children (real beam search); pruned ones don't.
+    // EVERY kept branch explores its own children; the next frontier is global
+    // across the level, so a checked child can be demoted when a later child
+    // enters the top 2.
     // The eventual winner is held as 'kept' here and only STARRED at the finale.
-    var winner = null, explored = 0;
+    var winner = null, explored = 0, provisionalLoser = null;
     for (var bi=0; bi<d.branches.length; bi++){
       var br = d.branches[bi];
       if (br.beam === 'pruned' || !br.children.length) continue;
@@ -519,9 +522,23 @@
       for (var s=0;s<kids.length;s++){ kids[s].classList.add('scored'); await sleep(170, myGen); }
       await sleep(300, myGen);
       for (var c2=0;c2<kids.length;c2++){
-        var cb = br.children[c2].beam;
-        if (cb === 'star'){ winner = kids[c2]; setBeam(kids[c2], 'kept'); }  // hold; the star lands last
-        else { setBeam(kids[c2], cb); }
+        var childCfg = br.children[c2];
+        var cb = childCfg.beam;
+        if (childCfg.provisionalBeam){
+          setBeam(kids[c2], childCfg.provisionalBeam);
+          provisionalLoser = kids[c2];
+        } else if (cb === 'star'){
+          winner = kids[c2]; setBeam(kids[c2], 'kept'); // hold; the star lands last
+        } else if (cb === 'kept'){
+          if (provisionalLoser){
+            setBeam(provisionalLoser, 'pruned');
+            await sleep(130, myGen);
+            provisionalLoser = null;
+          }
+          setBeam(kids[c2], 'kept');
+        } else {
+          setBeam(kids[c2], cb);
+        }
         await sleep(150, myGen);
       }
     }
