@@ -11,6 +11,18 @@ struct RasterStats {
   let alphaCoverage: Double
 }
 
+struct RegionStats {
+  let transparentPixels: Int
+  let averageAlpha: Double
+}
+
+struct TriangleHoleStats {
+  let centerAlpha: Double
+  let mirroredCenterAlpha: Double
+  let sideRingAlpha: Double
+  let apexAlpha: Double
+}
+
 @main
 struct MenuBarIconTemplateTest {
   static func main() {
@@ -43,6 +55,57 @@ struct MenuBarIconTemplateTest {
       if raster.alphaCoverage <= 1 {
         failures.append("\(state.name) alpha mask is empty: coverage=\(raster.alphaCoverage)")
       }
+
+      if state.name == "running" {
+        let largeCenter = centerKnockoutStats(largeImage, pixels: 96, radius: 7)
+        if largeCenter.averageAlpha >= 0.35 || largeCenter.transparentPixels < 50 {
+          failures.append(
+            "running center must be visibly knocked out at preview size: avgAlpha=\(largeCenter.averageAlpha), transparentPixels=\(largeCenter.transparentPixels)"
+          )
+        }
+        let largeTriangle = runningTriangleHoleStats(largeImage, pixels: 96)
+        if largeTriangle.centerAlpha >= 0.15 {
+          failures.append("running triangle hole center must be transparent at preview size: alpha=\(largeTriangle.centerAlpha)")
+        }
+        if largeTriangle.mirroredCenterAlpha <= 0.60 {
+          failures.append("running triangle hole must not accept mirrored preview center: alpha=\(largeTriangle.mirroredCenterAlpha)")
+        }
+        if largeTriangle.sideRingAlpha <= 0.60 {
+          failures.append("running hollow must be triangular, not circular, at preview size: side ring alpha=\(largeTriangle.sideRingAlpha)")
+        }
+        if largeTriangle.apexAlpha >= 0.30 {
+          failures.append("running hollow triangle apex must be transparent at preview size: alpha=\(largeTriangle.apexAlpha)")
+        }
+
+        let nativeCenter = centerKnockoutStats(image, pixels: 18, radius: 2)
+        if nativeCenter.averageAlpha >= 0.75 || nativeCenter.transparentPixels < 3 {
+          failures.append(
+            "running center must remain hollow at native menu-bar size: avgAlpha=\(nativeCenter.averageAlpha), transparentPixels=\(nativeCenter.transparentPixels)"
+          )
+        }
+        let nativeTriangle = runningTriangleHoleStats(image, pixels: 18)
+        if nativeTriangle.centerAlpha >= 0.35 {
+          failures.append("running triangle hole center must be transparent at native size: alpha=\(nativeTriangle.centerAlpha)")
+        }
+        if nativeTriangle.mirroredCenterAlpha <= 0.60 {
+          failures.append("running triangle hole must not accept mirrored native center: alpha=\(nativeTriangle.mirroredCenterAlpha)")
+        }
+        if nativeTriangle.sideRingAlpha <= 0.35 {
+          failures.append("running hollow must stay triangular, not circular, at native size: side ring alpha=\(nativeTriangle.sideRingAlpha)")
+        }
+        if nativeTriangle.apexAlpha >= 0.90 {
+          failures.append("running hollow triangle apex must remain transparent at native size: alpha=\(nativeTriangle.apexAlpha)")
+        }
+      }
+
+      if state.name == "error" {
+        let badge = errorBadgeKnockoutStats(largeImage, pixels: 96, radius: 5)
+        if badge.averageAlpha >= 0.60 || badge.transparentPixels < 20 {
+          failures.append(
+            "error badge knockout must remain visible: avgAlpha=\(badge.averageAlpha), transparentPixels=\(badge.transparentPixels)"
+          )
+        }
+      }
     }
 
     if let stopped = stats["stopped"],
@@ -50,21 +113,14 @@ struct MenuBarIconTemplateTest {
        let running = stats["running"],
        let error = stats["error"] {
       let maxOutlineCoverage = max(stopped.alphaCoverage, loading.alphaCoverage)
-      if running.alphaCoverage <= maxOutlineCoverage * 1.35 {
+      if running.alphaCoverage <= maxOutlineCoverage * 1.10 {
         failures.append(
-          "running filled coverage \(running.alphaCoverage) must exceed outline coverage \(maxOutlineCoverage) by at least 35%"
+          "running filled-ring coverage \(running.alphaCoverage) must exceed outline coverage \(maxOutlineCoverage) by at least 10%"
         )
       }
       if error.alphaCoverage <= maxOutlineCoverage * 1.25 {
         failures.append(
           "error filled coverage \(error.alphaCoverage) must exceed outline coverage \(maxOutlineCoverage) by at least 25% despite badge knockout"
-        )
-      }
-
-      let knockoutCoverage = running.alphaCoverage - error.alphaCoverage
-      if knockoutCoverage < 25 {
-        failures.append(
-          "error badge knockout too small: running=\(running.alphaCoverage), error=\(error.alphaCoverage), delta=\(knockoutCoverage)"
         )
       }
     } else {
@@ -84,6 +140,162 @@ struct MenuBarIconTemplateTest {
   }
 
   private static func rasterize(_ image: NSImage, pixels: Int) -> RasterStats {
+    let rep = bitmapRep(for: image, pixels: pixels)
+    var litPixels = 0
+    var alphaCoverage = 0.0
+    for y in 0..<pixels {
+      for x in 0..<pixels {
+        guard let color = rep.colorAt(x: x, y: y) else { continue }
+        let alpha = color.alphaComponent
+        if alpha > 0.01 { litPixels += 1 }
+        alphaCoverage += alpha
+      }
+    }
+    return RasterStats(litPixels: litPixels, alphaCoverage: alphaCoverage)
+  }
+
+  private static func centerKnockoutStats(_ image: NSImage, pixels: Int, radius: Int) -> RegionStats {
+    let rep = bitmapRep(for: image, pixels: pixels)
+    let metrics = drawingMetrics(pixels: pixels)
+    return regionStats(rep: rep,
+                       pixels: pixels,
+                       center: bitmapPoint(x: metrics.cx, drawingY: metrics.centroidY, pixels: pixels),
+                       radius: radius)
+  }
+
+  private static func runningTriangleHoleStats(_ image: NSImage, pixels: Int) -> TriangleHoleStats {
+    let rep = bitmapRep(for: image, pixels: pixels)
+    let metrics = drawingMetrics(pixels: pixels)
+    let edge = Double(pixels)
+
+    let sideDx = max(2, Int((edge * 0.105).rounded()))
+    let apexDy = max(3, Int((edge * 0.16).rounded()))
+    return triangleHoleStats(rep: rep,
+                             pixels: pixels,
+                             cx: metrics.cx,
+                             centroidY: metrics.centroidY,
+                             mirroredCentroidY: metrics.mirroredCentroidY,
+                             sideDx: sideDx,
+                             apexDy: apexDy)
+  }
+
+  private static func triangleHoleStats(rep: NSBitmapImageRep,
+                                        pixels: Int,
+                                        cx: Int,
+                                        centroidY: Int,
+                                        mirroredCentroidY: Int,
+                                        sideDx: Int,
+                                        apexDy: Int) -> TriangleHoleStats {
+    let sideAlphas = [
+      alpha(atDrawingX: cx - sideDx, drawingY: centroidY, rep: rep, pixels: pixels),
+      alpha(atDrawingX: cx + sideDx, drawingY: centroidY, rep: rep, pixels: pixels),
+    ]
+    return TriangleHoleStats(
+      centerAlpha: alpha(atDrawingX: cx, drawingY: centroidY, rep: rep, pixels: pixels),
+      mirroredCenterAlpha: alpha(atDrawingX: cx, drawingY: mirroredCentroidY, rep: rep, pixels: pixels),
+      sideRingAlpha: sideAlphas.reduce(0, +) / Double(sideAlphas.count),
+      apexAlpha: alpha(atDrawingX: cx, drawingY: centroidY - apexDy, rep: rep, pixels: pixels)
+    )
+  }
+
+  private static func drawingMetrics(pixels: Int) -> (cx: Int, centroidY: Int, mirroredCentroidY: Int) {
+    let edge = Double(pixels)
+    let stroke = edge * 0.10
+    let inset = stroke / 2 + edge * 0.05
+    let innerHeight = edge - 2 * inset
+    let cx = Int((edge / 2).rounded())
+    let centroidY = Int(((edge - inset) - innerHeight / 3).rounded())
+    let mirroredCentroidY = Int((inset + innerHeight / 3).rounded())
+    return (cx, centroidY, mirroredCentroidY)
+  }
+
+  private static func errorBadgeKnockoutStats(_ image: NSImage, pixels: Int, radius: Int) -> RegionStats {
+    let rep = bitmapRep(for: image, pixels: pixels)
+    let edge = Double(pixels)
+    let stroke = edge * 0.10
+    let inset = stroke / 2 + edge * 0.05
+    let innerHeight = edge - 2 * inset
+    let cx = Int((edge / 2).rounded())
+    let centroidY = (edge - inset) - innerHeight / 3
+    // Sample the exclamation bar, above the triangle centroid. Its dot is
+    // intentionally smaller, so the bar gives the most stable mask signal.
+    let barY = Int((centroidY + innerHeight * 0.10).rounded())
+    let flippedBarY = pixels - 1 - barY
+    return minAlphaRegionStats(rep: rep, pixels: pixels, centers: [(cx, barY), (cx, flippedBarY)], radius: radius)
+  }
+
+  private static func minAlphaRegionStats(rep: NSBitmapImageRep,
+                                          pixels: Int,
+                                          centers: [(Int, Int)],
+                                          radius: Int) -> RegionStats {
+    var best: RegionStats?
+    for (cx, cy) in centers {
+      var transparentPixels = 0
+      var alphaTotal = 0.0
+      var count = 0
+      for y in max(0, cy - radius)...min(pixels - 1, cy + radius) {
+        for x in max(0, cx - radius)...min(pixels - 1, cx + radius) {
+          guard let color = rep.colorAt(x: x, y: y) else { continue }
+          let alpha = color.alphaComponent
+          if alpha < 0.10 { transparentPixels += 1 }
+          alphaTotal += alpha
+          count += 1
+        }
+      }
+      let stat = RegionStats(
+        transparentPixels: transparentPixels,
+        averageAlpha: count == 0 ? 1 : alphaTotal / Double(count)
+      )
+      if best == nil || stat.averageAlpha < best!.averageAlpha {
+        best = stat
+      }
+    }
+    return best ?? RegionStats(transparentPixels: 0, averageAlpha: 1)
+  }
+
+  private static func regionStats(rep: NSBitmapImageRep,
+                                  pixels: Int,
+                                  center: (Int, Int),
+                                  radius: Int) -> RegionStats {
+    let (cx, cy) = center
+    var transparentPixels = 0
+    var alphaTotal = 0.0
+    var count = 0
+    for y in max(0, cy - radius)...min(pixels - 1, cy + radius) {
+      for x in max(0, cx - radius)...min(pixels - 1, cx + radius) {
+        guard let color = rep.colorAt(x: x, y: y) else { continue }
+        let alpha = color.alphaComponent
+        if alpha < 0.10 { transparentPixels += 1 }
+        alphaTotal += alpha
+        count += 1
+      }
+    }
+    return RegionStats(
+      transparentPixels: transparentPixels,
+      averageAlpha: count == 0 ? 1 : alphaTotal / Double(count)
+    )
+  }
+
+  private static func alpha(atDrawingX x: Int, drawingY: Int, rep: NSBitmapImageRep, pixels: Int) -> Double {
+    let (_, y) = bitmapPoint(x: x, drawingY: drawingY, pixels: pixels)
+    return alpha(atX: x, y: y, rep: rep, pixels: pixels)
+  }
+
+  private static func bitmapPoint(x: Int, drawingY: Int, pixels: Int) -> (Int, Int) {
+    // MenuBarBrandIcon draws in non-flipped AppKit coordinates (origin at the
+    // bottom-left). NSBitmapImageRep.colorAt reads rows from the top edge, so
+    // convert once here instead of accepting whichever vertical mirror happens
+    // to look more transparent.
+    (x, pixels - 1 - drawingY)
+  }
+
+  private static func alpha(atX x: Int, y: Int, rep: NSBitmapImageRep, pixels: Int) -> Double {
+    guard x >= 0, x < pixels, y >= 0, y < pixels,
+          let color = rep.colorAt(x: x, y: y) else { return 1 }
+    return color.alphaComponent
+  }
+
+  private static func bitmapRep(for image: NSImage, pixels: Int) -> NSBitmapImageRep {
     guard let rep = NSBitmapImageRep(
       bitmapDataPlanes: nil,
       pixelsWide: pixels,
@@ -108,17 +320,6 @@ struct MenuBarIconTemplateTest {
                operation: .sourceOver,
                fraction: 1)
     NSGraphicsContext.restoreGraphicsState()
-
-    var litPixels = 0
-    var alphaCoverage = 0.0
-    for y in 0..<pixels {
-      for x in 0..<pixels {
-        guard let color = rep.colorAt(x: x, y: y) else { continue }
-        let alpha = color.alphaComponent
-        if alpha > 0.01 { litPixels += 1 }
-        alphaCoverage += alpha
-      }
-    }
-    return RasterStats(litPixels: litPixels, alphaCoverage: alphaCoverage)
+    return rep
   }
 }

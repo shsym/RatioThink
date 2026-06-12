@@ -6,9 +6,12 @@ import AppKit
 ///
 /// Status is carried by native menu-bar glyph treatment rather than a
 /// colored LED/status-dot language:
-///   · `filled`     — solid mark (engine present: running/error) vs a
+///   · `filled`     — filled mark (engine present: running/error) vs a
 ///                    thick rounded OUTLINE (idle/working: stopped/loading).
-///   · `errorBadge` — an exclamation knocked OUT of the solid mark, so
+///                    The healthy running fill keeps a concentric
+///                    rounded-triangle hollow so it never reads as a fully
+///                    filled blob at menu-bar size.
+///   · `errorBadge` — an exclamation knocked OUT of the filled mark, so
 ///                    `.error` reads as the universal warning sign and
 ///                    is distinguishable from `.running` without color.
 ///
@@ -31,8 +34,9 @@ enum MenuBarBrandIcon {
   /// Build the status-button image for one `Dot` rendering.
   ///
   /// - Parameters:
-  ///   - filled: solid mark vs rounded outline.
-  ///   - errorBadge: knock an exclamation out of the (solid) mark.
+  ///   - filled: filled mark vs rounded outline. A filled non-error mark is
+  ///     rendered as a hollow-centered running state.
+  ///   - errorBadge: knock an exclamation out of the filled mark.
   ///   - pointSize: square edge in points. ~18 matches the macOS menu-bar
   ///     icon area; the image is resolution-independent (the drawing
   ///     handler re-runs per backing scale).
@@ -105,9 +109,12 @@ enum MenuBarBrandIcon {
     color.setFill()
     color.setStroke()
     if filled {
-      // The rounded path's own corners give the solid silhouette its
+      // The rounded path's own corners give the filled silhouette its
       // brand curvature — no extra stroke needed.
       triangle.fill()
+      if !errorBadge {
+        knockOutCenter(in: r, cornerRadius: cornerRadius)
+      }
       if errorBadge {
         knockOutExclamation(in: r)
       }
@@ -137,7 +144,35 @@ enum MenuBarBrandIcon {
     return path
   }
 
-  /// Carve an exclamation mark out of the solid triangle using
+  /// Carve a concentric rounded-triangle center out of the healthy filled
+  /// mark. The inner triangle is a scaled version of the same outer
+  /// silhouette around the visual centroid, so `.running` stays branded at
+  /// native menu-bar size instead of mixing in a circular counter-shape. Error
+  /// uses the exclamation knockout instead, so the two filled states stay
+  /// distinct without color.
+  private static func knockOutCenter(in r: NSRect, cornerRadius: CGFloat) {
+    let center = NSPoint(x: r.midX, y: r.maxY - r.height / 3) // centroid of a down triangle
+    let scale: CGFloat = 0.36
+
+    func scaled(_ p: NSPoint) -> NSPoint {
+      NSPoint(x: center.x + (p.x - center.x) * scale,
+              y: center.y + (p.y - center.y) * scale)
+    }
+
+    let topLeft = scaled(NSPoint(x: r.minX, y: r.maxY))
+    let topRight = scaled(NSPoint(x: r.maxX, y: r.maxY))
+    let apex = scaled(NSPoint(x: r.midX, y: r.minY))
+    let hole = roundedTriangle(topLeft, topRight, apex, radius: cornerRadius * scale)
+
+    guard let ctx = NSGraphicsContext.current else { return }
+    ctx.saveGraphicsState()
+    ctx.compositingOperation = .destinationOut
+    NSColor.black.setFill()
+    hole.fill()
+    ctx.restoreGraphicsState()
+  }
+
+  /// Carve an exclamation mark out of the filled triangle using
   /// `.destinationOut` compositing, so the menu-bar background shows
   /// through the "!" regardless of the bar's color. Centered on the
   /// triangle's visual centroid (one third down from the top edge for a

@@ -131,7 +131,7 @@ final class HelperStatusItemModelTests: XCTestCase {
     XCTAssertFalse(HelperStatusItemModel.Dot.loading.isFilled,
                    "loading is an outline triangle")
     XCTAssertTrue(HelperStatusItemModel.Dot.running.isFilled,
-                  "running is a solid triangle")
+                  "running is a filled brand mark; the AppKit renderer knocks out its center")
     XCTAssertNotEqual(
       HelperStatusItemModel.Dot.loading.isFilled,
       HelperStatusItemModel.Dot.running.isFilled,
@@ -153,7 +153,7 @@ final class HelperStatusItemModelTests: XCTestCase {
 
   /// The view no longer owns the brand-mark shape decision — it reads
   /// `isFilled` / `showsErrorBadge` off the pure model so the mapping is
-  /// testable without AppKit (#424). Outline = idle/working; solid =
+  /// testable without AppKit (#424). Outline = idle/working; filled =
   /// engine present; badge = error only.
   func test_brand_mark_shape_mapping_is_stable() {
     XCTAssertEqual(HelperStatusItemModel.Dot.stopped.isFilled, false)

@@ -19,7 +19,7 @@ public struct HelperStatusItemModel: Equatable, Sendable {
 
   /// Semantic dot state. The view (HelperMain) renders the brand mark —
   /// a rounded down-pointing triangle (the app-icon glyph, #424) — and
-  /// maps `Dot` to its tint color (AppKit). The SHAPE decisions (filled
+  /// maps `Dot` to its AppKit template mask. The SHAPE decisions (filled
   /// vs outline, error badge, motion) live here so they are testable
   /// without an `NSStatusBar` (#396/#424).
   public enum Dot: String, Equatable, Sendable {
@@ -34,10 +34,12 @@ public struct HelperStatusItemModel: Equatable, Sendable {
     /// is `.failed`.
     case error
 
-    /// Whether the brand triangle is rendered SOLID (`true`) or as a
+    /// Whether the brand triangle is rendered as a filled mask (`true`) or a
     /// thick rounded OUTLINE (`false`). Outline = idle/working
-    /// (stopped, loading); solid = steady engine presence (running,
-    /// error). This fill difference — not tint — is what distinguishes
+    /// (stopped, loading); filled = steady engine presence (running,
+    /// error). Running's renderer additionally knocks out the center so the
+    /// native menu-bar mark stays hollow-centered rather than blob-solid.
+    /// This fill difference — not tint — is what distinguishes
     /// `.loading` from `.running` without color, the #396 invariant
     /// (the old amber-vs-green pair was an "ambiguous dot"
     /// accessibility gap).
@@ -48,10 +50,10 @@ public struct HelperStatusItemModel: Equatable, Sendable {
       }
     }
 
-    /// Whether an exclamation mark is knocked out of the solid triangle.
+    /// Whether an exclamation mark is knocked out of the filled triangle.
     /// Only `.error` carries it — this badge (a shape cue, not just the
     /// amber tint) is what distinguishes `.error` from `.running`
-    /// without color (#396 invariant); the filled amber triangle plus
+    /// without color (#396 invariant); the filled triangle plus
     /// the "!" reads as the universal warning sign.
     public var showsErrorBadge: Bool { self == .error }
 
