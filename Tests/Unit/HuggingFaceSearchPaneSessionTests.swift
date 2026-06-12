@@ -29,7 +29,7 @@ final class HuggingFaceSearchPaneSessionTests: XCTestCase {
     // user's query is written through the parent-owned binding,
     // and then the pane goes out of scope (Picker swap).
     do {
-      _ = HuggingFaceSearchPane(onPick: { _, _ in }, session: binding)
+      _ = HuggingFaceSearchPane(availability: ModelAvailability(), onPick: { _, _ in }, session: binding)
       binding.wrappedValue.query = "test"
     }
 
@@ -39,7 +39,7 @@ final class HuggingFaceSearchPaneSessionTests: XCTestCase {
     // that re-puts the search state on the pane as `@State` would
     // re-initialise to a fresh `HFSession()` on the rebuilt pane
     // and the assertion would fire.
-    let rebuilt = HuggingFaceSearchPane(onPick: { _, _ in }, session: binding)
+    let rebuilt = HuggingFaceSearchPane(availability: ModelAvailability(), onPick: { _, _ in }, session: binding)
 
     XCTAssertEqual(
       rebuilt.session.query, "test",
@@ -59,9 +59,9 @@ final class HuggingFaceSearchPaneSessionTests: XCTestCase {
     stored.rawCount = 10
     let binding = Binding<HFSession>(get: { stored }, set: { stored = $0 })
 
-    _ = HuggingFaceSearchPane(onPick: { _, _ in }, session: binding)
+    _ = HuggingFaceSearchPane(availability: ModelAvailability(), onPick: { _, _ in }, session: binding)
     // Pane discarded — Picker swap equivalent.
-    let rebuilt = HuggingFaceSearchPane(onPick: { _, _ in }, session: binding)
+    let rebuilt = HuggingFaceSearchPane(availability: ModelAvailability(), onPick: { _, _ in }, session: binding)
 
     XCTAssertEqual(rebuilt.session.query, "phi")
     XCTAssertEqual(rebuilt.session.expanded, ["acme/repo"])
@@ -80,7 +80,7 @@ final class HuggingFaceSearchPaneSessionTests: XCTestCase {
   /// `State<…>` to `Binding<…>` and this test fires.
   func test_task_plumbing_is_pane_local_state_not_lifted_binding() {
     let binding = Binding<HFSession>(get: { HFSession() }, set: { _ in })
-    let pane = HuggingFaceSearchPane(onPick: { _, _ in }, session: binding)
+    let pane = HuggingFaceSearchPane(availability: ModelAvailability(), onPick: { _, _ in }, session: binding)
     let mirror = Mirror(reflecting: pane)
 
     // `_session` is the @Binding — sanity check.

@@ -17,7 +17,7 @@ final class LocalAPIAutoStartLauncherTests: XCTestCase {
     )
 
     XCTAssertEqual(client.startCalls, 1)
-    XCTAssertEqual(result, .failed(message: "Couldn't start the engine: model not staged"))
+    XCTAssertEqual(result, .failed(message: "Couldn't start the engine. The selected model isn’t downloaded. Download it in Settings → Models, or pick another model."))
   }
 
   private final class ThrowingStartClient: AppXPCClient, @unchecked Sendable {
@@ -30,11 +30,13 @@ final class LocalAPIAutoStartLauncherTests: XCTestCase {
       self.startError = startError
     }
 
+    func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
     func engineStatus() async throws -> EngineStatus { .stopped }
     func stopEngine() async throws {}
-    func startEngine(profileID: String) async throws {
+    func startEngine(profileID: String, modelOverride: String?) async throws {
       lock.withLock { _startCalls += 1 }
       throw startError
     }
+    func restartEngine(profileID: String, modelOverride: String?) async throws {}
   }
 }

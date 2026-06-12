@@ -11,7 +11,7 @@ final class HelperExportedAPIMemoryTests: XCTestCase {
   final class MemSession: PieEngineHost.EngineSession, @unchecked Sendable {
     let bytes: UInt64
     init(_ bytes: UInt64) { self.bytes = bytes }
-    func shutdown() async {}
+    func shutdown() async -> EngineShutdownResult { .reaped }
     func residentMemoryBytes() async -> UInt64? { bytes }
   }
 

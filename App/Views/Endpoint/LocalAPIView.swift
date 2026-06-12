@@ -38,6 +38,10 @@ struct LocalAPIView: View {
   /// leaves status `.running` (toggle stuck on). Mirrors
   /// `ChatScaffoldView`'s `engineActionError` channel.
   @State private var engineActionError: String?
+  /// #496: a start/stop refused because the background Helper isn't healthy.
+  /// Surfaced as a helper-framed inline notice, never the engine action-error
+  /// row, so a Helper state never reads as an engine fault.
+  @State private var helperBlock: HelperUnavailable?
 
   private var state: LocalAPIState {
     LocalAPIState.make(
@@ -54,6 +58,9 @@ struct LocalAPIView: View {
         if let engineActionError {
           actionErrorRow(engineActionError)
         }
+        if let helperBlock {
+          HelperUnavailableNotice(reason: helperBlock, onDismiss: { self.helperBlock = nil })
+        }
         if state.isServing {
           servingDetails
         }
@@ -69,7 +76,7 @@ struct LocalAPIView: View {
     // Clear a stale start/stop error once the engine actually reaches
     // `.running` (the action succeeded, possibly via another surface).
     .onChange(of: state.isServing) { _, serving in
-      if serving { engineActionError = nil }
+      if serving { engineActionError = nil; helperBlock = nil }
     }
     .confirmationDialog(
       "Turn off the local API?",
@@ -79,7 +86,7 @@ struct LocalAPIView: View {
       Button("Turn Off", role: .destructive) { stop() }
       Button("Cancel", role: .cancel) {}
     } message: {
-      Text("This stops the RatioThink engine. In-app chat will also stop until you turn it back on.")
+      Text("This stops the Rational engine. In-app chat will also stop until you turn it back on.")
     }
   }
 
@@ -90,7 +97,7 @@ struct LocalAPIView: View {
       VStack(alignment: .leading, spacing: 4) {
         Text("Local API")
           .font(.title2.weight(.semibold))
-        Text("An OpenAI-compatible HTTP endpoint served by the RatioThink engine on this Mac. It’s the same engine that powers in-app chat.")
+        Text("An OpenAI-compatible HTTP endpoint served by the Rational engine on this Mac. It’s the same engine that powers in-app chat.")
           .font(.callout)
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
@@ -357,14 +364,21 @@ struct LocalAPIView: View {
   /// Start the engine on the active profile. A resolver-stage rejection
   /// (`.profileMissing`/`.modelMissing`/…) is re-thrown by
   /// `EngineStatusStore.startEngine` and leaves the polled status `.stopped`,
-  /// so it MUST surface here — the reducer never sees it. (`.replyTimeout` /
-  /// `.alreadyRunning` are swallowed by the store as non-failures.)
+  /// so it MUST surface here — the reducer never sees it. Only
+  /// App-side `.replyTimeout` is swallowed by the store because the
+  /// helper start remains in flight; same-profile idempotency is handled
+  /// inside `HelperExportedAPI` / `PieEngineHost.startOrAttach`, so any
+  /// `.alreadyRunning` that reaches the app is an incompatible-start
+  /// conflict and surfaces to the caller.
   private func start() {
     guard let profileID = profileStore.activeProfileID, !profileID.isEmpty else { return }
     Task { @MainActor in
       engineActionError = nil
+      helperBlock = nil
       do {
         try await engineStatusStore.startEngine(profileID: profileID)
+      } catch let block as HelperUnavailable {
+        helperBlock = block
       } catch {
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "start")
       }
@@ -377,8 +391,11 @@ struct LocalAPIView: View {
   private func stop() {
     Task { @MainActor in
       engineActionError = nil
+      helperBlock = nil
       do {
         try await engineStatusStore.stopEngine()
+      } catch let block as HelperUnavailable {
+        helperBlock = block
       } catch {
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "stop")
       }

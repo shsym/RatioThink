@@ -61,9 +61,9 @@ final class PieSupervisorTests: XCTestCase {
                                             stopGracePeriod: 1))
     let runningExp = expectation(description: ".running observed")
     let token = sup.observe { status, _ in
-      if case .running(let port, let profileID) = status {
-        XCTAssertEqual(port, 54321)
-        XCTAssertEqual(profileID, "chat")
+      if case .running(let snap) = status {
+        XCTAssertEqual(snap.port, 54321)
+        XCTAssertEqual(snap.profileID, "chat")
         runningExp.fulfill()
       }
     }
@@ -316,6 +316,98 @@ final class PieSupervisorTests: XCTestCase {
     } else {
       XCTFail("expected .failed, got \(sup.status)")
     }
+  }
+
+  // MARK: - review v1 F1: stdout source is cancelled on failure paths
+
+  func test_handshakeTimeout_cancelsStdoutSource_noLeak() throws {
+    // A silent engine drives the handshake timer to .failed. Regression
+    // for review v1 F1: the SIGKILLed child's stdout DispatchSource must
+    // be cancelled, not left resumed to busy-spin at EOF on stateQueue.
+    // The `activeStdoutSourceCountForTesting` read hops onto stateQueue,
+    // so it ALSO hangs the test (timeout) if a leaked source were
+    // saturating the queue — a second signal for the same regression.
+    let fake = try writeScript("pie-silent-src.sh", body: """
+      #!/bin/bash
+      sleep 30
+      """)
+    let sup = makeSupervisor(policy: .init(handshakeTimeout: 0.3,
+                                           restartAttempts: 1,
+                                           restartWindow: 30,
+                                           stopGracePeriod: 1,
+                                           stopOverrun: 1,
+                                           stdoutCarryLimit: 64 * 1024))
+    _ = sup.start(makeSpec(binary: fake, profileID: "chat"))
+    let failed = waitFor(sup, predicate: { if case .failed = $0 { return true }; return false },
+                         timeout: 5)
+    XCTAssertNotNil(failed, "silent engine must reach .failed via handshake timeout")
+    XCTAssertEqual(sup.activeStdoutSourceCountForTesting, 0,
+                   "the abandoned incarnation's stdout source must be cancelled, not left spinning")
+  }
+
+  func test_malformedHandshake_cancelsStdoutSource_noLeak() throws {
+    // A printed-but-malformed HTTP_LISTEN kills the engine and fails.
+    // Same review v1 F1 invariant on the malformed-handshake abandon
+    // path: no stdout source may survive resumed.
+    let fake = try writeScript("pie-malformed-src.sh", body: """
+      #!/bin/bash
+      echo "HTTP_LISTEN=not-a-valid-endpoint"
+      sleep 30
+      """)
+    let sup = makeSupervisor(policy: .init(handshakeTimeout: 3,
+                                           restartAttempts: 1,
+                                           restartWindow: 30,
+                                           stopGracePeriod: 1,
+                                           stopOverrun: 1,
+                                           stdoutCarryLimit: 64 * 1024))
+    _ = sup.start(makeSpec(binary: fake, profileID: "chat"))
+    let failed = waitFor(sup, predicate: { if case .failed = $0 { return true }; return false },
+                         timeout: 5)
+    XCTAssertNotNil(failed, "malformed HTTP_LISTEN must reach .failed")
+    XCTAssertEqual(sup.activeStdoutSourceCountForTesting, 0,
+                   "the abandoned incarnation's stdout source must be cancelled, not left spinning")
+  }
+
+  func test_stopDeadlineExceeded_cancelsStdoutSource_noLeak() throws {
+    // Review v2 F4: the stop-deadline path is the one abandon path the
+    // handleTermination backstop cannot reach — it fires precisely when
+    // the wedged child is never reaped (so its terminationHandler never
+    // runs). The engine reaches .running then ignores SIGTERM, and
+    // killProcessOverride makes the supervisor's SIGKILL a no-op, so
+    // only armStopDeadline closes the loop → .failed("stop deadline …").
+    // The stdout source must still be cancelled.
+    let fake = try writeScript("pie-wedge.sh", body: """
+      #!/bin/bash
+      trap '' TERM
+      echo "HTTP_LISTEN=127.0.0.1:45678"
+      # Bounded so the test never leaks a process even though the
+      # supervisor's SIGKILL is overridden to a no-op.
+      sleep 3
+      """)
+    let sup = PieSupervisor(
+      policy: .init(handshakeTimeout: 3,
+                    restartAttempts: 1,
+                    restartWindow: 30,
+                    stopGracePeriod: 0.3,
+                    stopOverrun: 0.3,
+                    stdoutCarryLimit: 64 * 1024),
+      logFileURL: logURL,
+      killProcessOverride: { _ in true }  // SIGKILL "succeeds" but reaps nothing
+    )
+    _ = sup.start(makeSpec(binary: fake, profileID: "chat"))
+    let running = waitFor(sup, predicate: { if case .running = $0 { return true }; return false },
+                          timeout: 5)
+    XCTAssertNotNil(running, "engine must reach .running before stop")
+    sup.stop()
+    let failed = waitFor(sup, predicate: { if case .failed = $0 { return true }; return false },
+                         timeout: 5)
+    guard case .failed(_, let msg)? = failed else {
+      return XCTFail("expected .failed via stop deadline, got \(String(describing: failed))")
+    }
+    XCTAssertTrue(msg.contains("stop deadline"),
+                  "expected the stop-deadline failure; got \(msg)")
+    XCTAssertEqual(sup.activeStdoutSourceCountForTesting, 0,
+                   "the stop-deadline abandon path must cancel the stdout source")
   }
 
   // MARK: - F39: post-handshake crash consumes the retry ladder

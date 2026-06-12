@@ -21,7 +21,7 @@ final class LocalAPIAutoStartPolicyTests: XCTestCase {
       activeProfileID: "chat"))
     XCTAssertFalse(LocalAPIAutoStartPolicy.shouldStartOnLaunch(
       enabled: true,
-      status: .running(port: 8123, profileID: "chat"),
+      status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat")),
       activeProfileID: "chat"))
     XCTAssertFalse(LocalAPIAutoStartPolicy.shouldStartOnLaunch(
       enabled: true,

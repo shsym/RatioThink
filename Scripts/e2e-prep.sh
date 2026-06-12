@@ -29,7 +29,7 @@ e2e_require_seated_gui() {
 e2e_require_tcc() {
   local tag="$1"
   if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-    echo "$tag: RatioThink.app + XCTest-runner Automation/Accessibility permission required (cannot be auto-granted)." >&2
+    echo "$tag: Rational.app + XCTest-runner Automation/Accessibility permission required (cannot be auto-granted)." >&2
     echo "$tag: 1) System Settings → Privacy & Security → Accessibility AND Automation → enable Xcode + the test runner." >&2
     echo "$tag:    Open it with: open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'" >&2
     echo "$tag: 2) Re-run with PIE_TEST_TCC_GRANTED=1 prefixed." >&2

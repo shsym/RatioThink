@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the styled drag-install DMG from an already-built RatioThink.app:
+# Build the styled drag-install DMG from an already-built Rational.app:
 # stage the app + an `Applications` symlink + the background art into a writable
 # image, write the styled `.DS_Store` (icon positions + background picture) via
 # make-dmg-dsstore.py, then convert to a compressed read-only DMG.
@@ -7,13 +7,13 @@
 # No Finder/osascript — the window layout is written to the `.DS_Store`
 # directly, so this runs identically on a dev Mac and in CI.
 #
-# The staging image is mounted at /Volumes/RatioThink, NOT a private `mktemp`
+# The staging image is mounted at /Volumes/Rational, NOT a private `mktemp`
 # `-mountpoint`. mac_alias only emits a correct volume-relative background alias
-# ("RatioThink:.background:background.png") when the volume is mounted under
+# ("Rational:.background:background.png") when the volume is mounted under
 # /Volumes; a private mountpoint yields a broken "..:..:..:tmp:..." alias path
 # (measured), which would ship a background that cannot resolve on the user's
 # machine. Because that mountpoint is fixed, we refuse to run when a volume
-# named RatioThink is already mounted and assert our image actually landed
+# named Rational is already mounted and assert our image actually landed
 # there — instead of blindly assuming the path, force-ejecting an unrelated
 # volume, or letting a concurrent build leg corrupt the staging volume.
 #
@@ -34,10 +34,10 @@ if [[ ! -d "$APP_PATH" ]]; then
   exit 66
 fi
 
-VOLNAME="RatioThink"
+VOLNAME="Rational"
 STAGE_MOUNT="/Volumes/$VOLNAME"
 
-# Refuse if a RatioThink volume is already mounted: we must use this exact
+# Refuse if a Rational volume is already mounted: we must use this exact
 # mountpoint (see header), and we will neither write into nor eject a volume we
 # did not create — which also makes a concurrent dmg-arm64/dmg-x86_64 leg fail
 # loud here rather than corrupt a shared staging volume.
@@ -50,9 +50,9 @@ fi
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pie-styled-dmg.XXXXXX")"
 RW_DMG="$WORK/rw.dmg"
 BG_PNG="$WORK/background.png"
-# Detach ONLY the mount this script created, never a bare /Volumes/RatioThink:
+# Detach ONLY the mount this script created, never a bare /Volumes/Rational:
 # if a racing process mounts there between the pre-check and our attach, our
-# image lands at "/Volumes/RatioThink 1" and the mismatch branch ejects that
+# image lands at "/Volumes/Rational 1" and the mismatch branch ejects that
 # (ours); the trap must not then force-eject the racing volume we did not create.
 # Set only after the post-attach match check passes.
 CREATED_MOUNT=""
@@ -75,7 +75,7 @@ hdiutil create -size "${IMG_MB}m" -fs HFS+ -volname "$VOLNAME" "$RW_DMG" >/dev/n
 
 # Attach, then confirm it actually mounted where we expect. A stray same-name
 # volume that appeared between the check above and now would push macOS to
-# "/Volumes/RatioThink 1"; refuse rather than stage the wrong volume.
+# "/Volumes/Rational 1"; refuse rather than stage the wrong volume.
 ATTACH_OUT="$(hdiutil attach "$RW_DMG" -nobrowse -noverify)"
 ACTUAL_MOUNT="$(printf '%s\n' "$ATTACH_OUT" | awk '/\/Volumes\//{print substr($0, index($0, "/Volumes/"))}' | tail -1)"
 if [[ "$ACTUAL_MOUNT" != "$STAGE_MOUNT" ]]; then
@@ -88,7 +88,7 @@ CREATED_MOUNT="$ACTUAL_MOUNT"
 
 # Populate the volume: the verified app (ditto preserves its signature and
 # leaves $APP_PATH untouched), the Applications drag target, and the background.
-ditto "$APP_PATH" "$STAGE_MOUNT/RatioThink.app"
+ditto "$APP_PATH" "$STAGE_MOUNT/Rational.app"
 ln -s /Applications "$STAGE_MOUNT/Applications"
 mkdir -p "$STAGE_MOUNT/.background"
 cp "$BG_PNG" "$STAGE_MOUNT/.background/background.png"
