@@ -97,13 +97,23 @@ struct RatioThinkApp: App {
       // the Unload confirm path completes to .idle (#359 Path2).
       statusStore = EngineStatusStore(
         client: PinnedRunningXPCClient(port: pinnedRunningPort),
-        initialStatus: .running(port: pinnedRunningPort, profileID: "chat")
+        initialStatus: .running(port: pinnedRunningPort, profileID: "chat"),
+        initialDaemonBindMode: prefs.localAPIBindMode,
+        daemonBindModeProvider: { prefs.localAPIBindMode }
       )
     } else {
-      statusStore = EngineStatusStore(client: HelperXPCClient())
+      statusStore = EngineStatusStore(
+        client: HelperXPCClient(),
+        initialDaemonBindMode: prefs.localAPIBindMode,
+        daemonBindModeProvider: { prefs.localAPIBindMode }
+      )
     }
     #else
-    statusStore = EngineStatusStore(client: HelperXPCClient())
+    statusStore = EngineStatusStore(
+      client: HelperXPCClient(),
+      initialDaemonBindMode: prefs.localAPIBindMode,
+      daemonBindModeProvider: { prefs.localAPIBindMode }
+    )
     #endif
     //  wire-in completed by : `HTTPEngineClient.baseURLProvider`
     // resolves `EngineStatusStore.requireBaseURL()` on each request.
@@ -477,5 +487,6 @@ private struct PinnedRunningXPCClient: AppXPCClient {
   // already pinned `.running`, so a start is a no-op success (mirrors
   // `stopEngine`).
   func startEngine(profileID: String) async throws {}
+  func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws {}
 }
 #endif

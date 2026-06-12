@@ -46,7 +46,9 @@ struct LocalAPIView: View {
     )
   }
 
-  private var bindMode: EngineHTTPBindMode { appPreferences.localAPIBindMode }
+  private var bindMode: EngineHTTPBindMode {
+    state.isServing ? engineStatusStore.runtimeDaemonBindMode : appPreferences.localAPIBindMode
+  }
   private var posture: EngineHTTPPosture { EngineHTTPPosture.make(bindMode: bindMode) }
 
   private var runtimeProfileID: String? {
@@ -232,8 +234,8 @@ struct LocalAPIView: View {
   }
 
   private var visibleBaseURL: String? {
-    guard let port = state.port else { return engineStatusStore.baseURL?.absoluteString }
-    return "http://\(bindMode.baseURLHost):\(port)"
+    guard state.port != nil else { return engineStatusStore.localAPIBaseURL?.absoluteString }
+    return engineStatusStore.localAPIBaseURL?.absoluteString
   }
 
   private var baseURLCaption: String {
@@ -259,6 +261,7 @@ struct LocalAPIView: View {
           }
         }
         .pickerStyle(.segmented)
+        .disabled(!state.profileSelectionEnabled)
         .accessibilityIdentifier("LocalAPIProfileTabs")
 
         if let selected = selectedProfileOption {
@@ -473,6 +476,7 @@ struct LocalAPIView: View {
 
   private func selectProfile(_ profileID: String) {
     guard !profileID.isEmpty else { return }
+    guard state.profileSelectionEnabled else { return }
     selectedProfileID = profileID
     do {
       try profileStore.setActiveProfileID(profileID)
@@ -485,9 +489,25 @@ struct LocalAPIView: View {
   }
 
   private func setExternalAccess(_ enabled: Bool) {
-    appPreferences.setLocalAPIExternalAccessEnabled(enabled)
-    guard state.isServing, let profileID = runtimeProfileID ?? selectedOrActiveProfileID else { return }
-    restartEngine(profileID: profileID)
+    let profileID = runtimeProfileID ?? selectedOrActiveProfileID
+    Task { @MainActor in
+      engineActionError = nil
+      do {
+        try await LocalAPIBindModeChange.apply(
+          enabled: enabled,
+          currentlyServing: state.isServing,
+          profileID: profileID,
+          setPreference: { appPreferences.setLocalAPIExternalAccessEnabled($0) },
+          stopEngine: { try await engineStatusStore.stopEngine() },
+          startEngine: { requestedMode in
+            guard let profileID, !profileID.isEmpty else { return }
+            try await engineStatusStore.startEngine(profileID: profileID, daemonBindHost: requestedMode)
+          }
+        )
+      } catch {
+        engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "switch")
+      }
+    }
   }
 
   private func restartEngine(profileID: String) {

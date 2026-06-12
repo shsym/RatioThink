@@ -26,6 +26,8 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertNil(s.port)
     XCTAssertTrue(s.toggleOn, "show 'on' while coming up so the control doesn't flicker")
     XCTAssertFalse(s.toggleEnabled, "no flipping mid-transition")
+    XCTAssertFalse(s.profileSelectionEnabled,
+                   "profile picker must be disabled during in-flight restarts so a selection is not silently lost")
     XCTAssertEqual(s.statusLabel, "Starting…")
   }
 
@@ -33,6 +35,8 @@ final class LocalAPIStateTests: XCTestCase {
     let s = LocalAPIState.make(status: .stopping, hasActiveProfile: true)
     XCTAssertFalse(s.toggleOn)
     XCTAssertFalse(s.toggleEnabled)
+    XCTAssertFalse(s.profileSelectionEnabled,
+                   "profile picker must be disabled during in-flight restarts so a selection is not silently lost")
     XCTAssertEqual(s.statusLabel, "Stopping…")
   }
 
@@ -41,6 +45,7 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertFalse(s.isServing)
     XCTAssertFalse(s.toggleOn)
     XCTAssertTrue(s.toggleEnabled, "a selected model means we can start the engine")
+    XCTAssertTrue(s.profileSelectionEnabled)
     XCTAssertEqual(s.statusLabel, "Off")
     XCTAssertEqual(s.detail, "Turn on to serve OpenAI-compatible requests on 127.0.0.1.")
   }
@@ -145,6 +150,53 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertEqual(posture.networkSummary, "External access enabled (0.0.0.0). Other devices on reachable networks can connect to this Mac’s local API port.")
     XCTAssertEqual(posture.warningTitle, "Network exposure risk")
     XCTAssertEqual(posture.warningDetail?.contains("unauthenticated"), true)
+  }
+
+  func test_bind_mode_change_does_not_clear_external_preference_when_stop_fails() async {
+    var preferenceEnabled = true
+    var stopCalls = 0
+    var startCalls = 0
+
+    do {
+      try await LocalAPIBindModeChange.apply(
+        enabled: false,
+        currentlyServing: true,
+        profileID: "chat",
+        setPreference: { preferenceEnabled = $0 },
+        stopEngine: {
+          stopCalls += 1
+          throw EngineError(code: .killRejected, message: "still running")
+        },
+        startEngine: { _ in startCalls += 1 }
+      )
+      XCTFail("disabling external access must throw when the exposed daemon could not be stopped")
+    } catch let error as EngineError {
+      XCTAssertEqual(error.code, .killRejected)
+    } catch {
+      XCTFail("unexpected error: \(error)")
+    }
+
+    XCTAssertTrue(preferenceEnabled,
+                  "preference/warning must stay external while a 0.0.0.0 daemon may still be running")
+    XCTAssertEqual(stopCalls, 1)
+    XCTAssertEqual(startCalls, 0)
+  }
+
+  func test_bind_mode_change_commits_preference_after_successful_restart() async throws {
+    var preferenceEnabled = false
+    var requestedStarts: [EngineHTTPBindMode] = []
+
+    try await LocalAPIBindModeChange.apply(
+      enabled: true,
+      currentlyServing: true,
+      profileID: "chat",
+      setPreference: { preferenceEnabled = $0 },
+      stopEngine: {},
+      startEngine: { requestedStarts.append($0) }
+    )
+
+    XCTAssertTrue(preferenceEnabled)
+    XCTAssertEqual(requestedStarts, [.external])
   }
 
   func test_profile_options_ignore_invalid_entries_and_mark_runtime_profile() throws {

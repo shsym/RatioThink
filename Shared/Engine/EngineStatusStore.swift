@@ -27,6 +27,13 @@ public final class EngineStatusStore: ObservableObject {
   /// placeholder before the first poll completes).
   @Published public private(set) var status: EngineStatus
 
+  /// Effective Local API daemon bind mode for the currently launched engine.
+  /// This is a runtime fact recorded at the shared start boundary, not merely
+  /// the user's desired preference. Views that warn about external exposure
+  /// read this while `.running` so they do not claim loopback-only posture for
+  /// a daemon that was actually launched on `0.0.0.0`.
+  @Published public private(set) var runtimeDaemonBindMode: EngineHTTPBindMode
+
   /// Most recent error string from a failed `engineStatus()` poll.
   /// `nil` after a successful poll. Surfaces helper-down vs
   /// supervisor-running-but-still-starting in the UI without forcing
@@ -75,7 +82,18 @@ public final class EngineStatusStore: ObservableObject {
     return nil
   }
 
+  /// User-facing Local API URL for the effective runtime bind mode. In-app
+  /// clients keep using `baseURL` (loopback), but the endpoint explorer should
+  /// render the listener mode the engine was actually launched with.
+  public var localAPIBaseURL: URL? {
+    if case .running(let port, _) = status {
+      return URL(string: "http://\(runtimeDaemonBindMode.baseURLHost):\(port)")
+    }
+    return nil
+  }
+
   private let client: any AppXPCClient
+  private let daemonBindModeProvider: @MainActor @Sendable () -> EngineHTTPBindMode
   private let pollInterval: TimeInterval
   private var task: Task<Void, Never>?
   private nonisolated static let log = Logger(subsystem: "com.ratiothink.app", category: "engine-status")
@@ -127,14 +145,18 @@ public final class EngineStatusStore: ObservableObject {
     client: any AppXPCClient,
     pollInterval: TimeInterval = 1.0,
     initialStatus: EngineStatus = .starting,
+    initialDaemonBindMode: EngineHTTPBindMode = .loopback,
+    daemonBindModeProvider: @escaping @MainActor @Sendable () -> EngineHTTPBindMode = { .loopback },
     tierPolicy: StatusTierPolicy = StatusTierPolicy(),
     now: @escaping @Sendable () -> Date = { Date() }
   ) {
     self.client = client
+    self.daemonBindModeProvider = daemonBindModeProvider
     self.pollInterval = pollInterval
     self.tierPolicy = tierPolicy
     self.now = now
     self.status = initialStatus
+    self.runtimeDaemonBindMode = initialDaemonBindMode
     if case .running = initialStatus { self.wasEverRunning = true }
     if case .starting = initialStatus { self.startingSince = now() }
   }
@@ -290,12 +312,15 @@ public final class EngineStatusStore: ObservableObject {
   /// `EngineError` (resolver rejected, still `.modelMissing`, etc.)
   /// propagates so the UI can surface the reason.
   public func startEngine(profileID: String,
-                          daemonBindHost: EngineHTTPBindMode = .loopback) async throws {
+                          daemonBindHost: EngineHTTPBindMode? = nil) async throws {
+    let requestedBindMode = daemonBindHost ?? daemonBindModeProvider()
     do {
-      try await client.startEngine(profileID: profileID, daemonBindHost: daemonBindHost)
+      try await client.startEngine(profileID: profileID, daemonBindHost: requestedBindMode)
+      runtimeDaemonBindMode = requestedBindMode
     } catch let error as AppXPCClientError {
       if case .replyTimeout = error {
         Self.log.notice("startEngine(profileID=\(profileID, privacy: .public)) reply timed out — start in flight; status poll will surface the outcome")
+        runtimeDaemonBindMode = requestedBindMode
         return
       }
       throw error

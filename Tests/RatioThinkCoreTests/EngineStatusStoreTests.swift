@@ -61,14 +61,20 @@ final class EngineStatusStoreTests: XCTestCase {
     // #326: capture startEngine calls + let tests inject a result.
     private(set) var startCalls = 0
     private(set) var lastStartProfileID: String?
+    private(set) var lastStartBindMode: EngineHTTPBindMode?
     private var startResult: Result<Void, Error> = .success(())
     func setStartResult(_ result: Result<Void, Error>) {
       lock.withLock { startResult = result }
     }
     func startEngine(profileID: String) async throws {
+      try await startEngine(profileID: profileID, daemonBindHost: .loopback)
+    }
+
+    func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws {
       let result: Result<Void, Error> = lock.withLock {
         startCalls += 1
         lastStartProfileID = profileID
+        lastStartBindMode = daemonBindHost
         return startResult
       }
       try result.get()
@@ -105,6 +111,33 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(client.startCalls, 1,
                    "startEngine must forward to the helper XPC client")
     XCTAssertEqual(client.lastStartProfileID, "chat")
+    XCTAssertEqual(client.lastStartBindMode, .loopback)
+  }
+
+  func test_startEngine_without_explicit_bind_uses_shared_bind_mode_provider() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      daemonBindModeProvider: { .external }
+    )
+
+    try await store.startEngine(profileID: "chat")
+
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(client.lastStartProfileID, "chat")
+    XCTAssertEqual(client.lastStartBindMode, .external,
+                   "every production caller of startEngine(profileID:) must inherit the shared Local API bind preference")
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+  }
+
+  func test_startEngine_explicit_external_bind_is_required_and_recorded() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client)
+
+    try await store.startEngine(profileID: "chat", daemonBindHost: .external)
+
+    XCTAssertEqual(client.lastStartBindMode, .external)
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
   }
 
   func test_startEngine_propagates_real_failure() async {

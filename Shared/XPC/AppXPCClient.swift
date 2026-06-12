@@ -49,10 +49,6 @@ public extension AppXPCClient {
   /// Default: memory unavailable. Test stubs that don't model the
   /// engineMemory selector inherit nil and need no change.
   func engineMemory() async throws -> EngineMemorySample? { nil }
-
-  func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws {
-    try await startEngine(profileID: profileID)
-  }
 }
 
 public enum AppXPCClientError: Error, Sendable, CustomStringConvertible {

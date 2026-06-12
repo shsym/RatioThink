@@ -61,6 +61,11 @@ public struct LocalAPIState: Equatable {
   /// (`starting`/`stopping`) and when off with no model to start.
   public let toggleEnabled: Bool
 
+  /// Whether profile tabs are actionable. Disabled mid-transition so a
+  /// profile selection cannot be accepted while an already-captured restart
+  /// is moving through `.stopping`/`.starting`.
+  public let profileSelectionEnabled: Bool
+
   /// One-word status for the header ("Running", "Starting…", …).
   public let statusLabel: String
 
@@ -95,6 +100,7 @@ public struct LocalAPIState: Equatable {
         phase: .serving(port: port),
         toggleOn: true,
         toggleEnabled: true,
+        profileSelectionEnabled: true,
         statusLabel: "Running",
         detail: nil
       )
@@ -103,6 +109,7 @@ public struct LocalAPIState: Equatable {
         phase: .starting,
         toggleOn: true,
         toggleEnabled: false,
+        profileSelectionEnabled: false,
         statusLabel: "Starting…",
         detail: "The local API becomes available once the engine finishes loading the model."
       )
@@ -111,6 +118,7 @@ public struct LocalAPIState: Equatable {
         phase: .stopping,
         toggleOn: false,
         toggleEnabled: false,
+        profileSelectionEnabled: false,
         statusLabel: "Stopping…",
         detail: nil
       )
@@ -119,6 +127,7 @@ public struct LocalAPIState: Equatable {
         phase: .off,
         toggleOn: false,
         toggleEnabled: hasActiveProfile,
+        profileSelectionEnabled: true,
         statusLabel: "Off",
         detail: hasActiveProfile
           ? "Turn on to serve OpenAI-compatible requests on 127.0.0.1."
@@ -133,6 +142,7 @@ public struct LocalAPIState: Equatable {
         phase: .failed(reason: failureReason(code: code, message: message)),
         toggleOn: false,
         toggleEnabled: canRetry,
+        profileSelectionEnabled: true,
         statusLabel: "Engine failed",
         detail: failureReason(code: code, message: message)
       )
@@ -152,6 +162,34 @@ public struct LocalAPIState: Equatable {
     default:
       return trimmed.isEmpty ? "Engine failed (\(code.rawValue))." : "\(trimmed) (\(code.rawValue))"
     }
+  }
+}
+
+/// Transactional bind-mode preference application for Local API exposure.
+///
+/// The dangerous transition is external → loopback while the daemon is
+/// running: if stop/restart fails, the old `0.0.0.0` listener may still be
+/// alive, so the persisted preference/warning must not flip to loopback until
+/// the requested restart has been accepted. Off-engine changes are safe to
+/// persist immediately because no listener can be under-reported.
+public enum LocalAPIBindModeChange {
+  public static func apply(
+    enabled: Bool,
+    currentlyServing: Bool,
+    profileID: String?,
+    setPreference: (Bool) -> Void,
+    stopEngine: () async throws -> Void,
+    startEngine: (EngineHTTPBindMode) async throws -> Void
+  ) async throws {
+    guard currentlyServing, let profileID, !profileID.isEmpty else {
+      setPreference(enabled)
+      return
+    }
+
+    let requestedMode: EngineHTTPBindMode = enabled ? .external : .loopback
+    try await stopEngine()
+    try await startEngine(requestedMode)
+    setPreference(enabled)
   }
 }
 

@@ -114,4 +114,5 @@ private struct SnapshotStubXPC: AppXPCClient {
   func engineStatus() async throws -> EngineStatus { status }
   func stopEngine() async throws {}
   func startEngine(profileID: String) async throws {}
+  func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws {}
 }
