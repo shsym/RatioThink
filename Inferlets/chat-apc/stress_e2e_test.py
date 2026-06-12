@@ -601,6 +601,63 @@ async def section_toolcall_parse(base: str, http: httpx.AsyncClient, rep: Report
     rep.ok(ok, f"{P}: orphan role=tool -> {r.status_code} {r.text[:120]!r} "
                "(want 400 unknown_tool_call_id param=messages[0].tool_call_id)")
 
+    malformed_tool_calls = [
+        (
+            {"type": "function", "function": {"name": "calculator", "arguments": "{}"}},
+            "messages[0].tool_calls[0].id",
+        ),
+        (
+            {"id": "call_x", "function": {"name": "calculator", "arguments": "{}"}},
+            "messages[0].tool_calls[0].type",
+        ),
+        (
+            {"id": "call_x", "type": "function"},
+            "messages[0].tool_calls[0].function",
+        ),
+        (
+            {"id": "call_x", "type": "function", "function": {"arguments": "{}"}},
+            "messages[0].tool_calls[0].function.name",
+        ),
+        (
+            {"id": "call_x", "type": "function", "function": {"name": "calculator"}},
+            "messages[0].tool_calls[0].function.arguments",
+        ),
+    ]
+    for tool_call, param in malformed_tool_calls:
+        r = await http.post(f"{base}/v1/chat/completions", json={
+            "model": MODEL,
+            "messages": [{"role": "assistant", "content": None, "tool_calls": [tool_call]}],
+            "stream": False,
+        })
+        err = r.json().get("error", {}) if r.status_code == 400 else {}
+        ok = (
+            r.status_code == 400
+            and err.get("code") == "malformed_tool_calls"
+            and err.get("param") == param
+        )
+        rep.ok(ok, f"{P}: malformed tool_call param={param} -> {r.status_code} {r.text[:160]!r}")
+
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL,
+        "messages": [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_a", "type": "function", "function": {"name": "calculator", "arguments": "{\"expr\":\"2+2\"}"}},
+                {"id": "call_b", "type": "function", "function": {"name": "calculator", "arguments": "{\"expr\":\"3+3\"}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_b", "content": "6"},
+            {"role": "tool", "tool_call_id": "call_a", "content": "4"},
+        ],
+        "stream": False,
+    })
+    err = r.json().get("error", {}) if r.status_code == 400 else {}
+    ok = (
+        r.status_code == 400
+        and err.get("code") == "invalid_tool_order"
+        and err.get("param") == "messages[1].tool_call_id"
+    )
+    rep.ok(ok, f"{P}: out-of-order tool results -> {r.status_code} {r.text[:160]!r} "
+               "(want 400 invalid_tool_order param=messages[1].tool_call_id)")
+
     # tool_choice forcing a call but the named function is absent -> 400.
     r = await http.post(f"{base}/v1/chat/completions", json={
         "model": MODEL, "messages": [{"role": "user", "content": "hi"}], "stream": False,

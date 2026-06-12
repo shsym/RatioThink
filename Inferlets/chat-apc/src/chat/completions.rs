@@ -40,7 +40,7 @@
 //! max-tokens cap, returning a single OpenAI-shape `chat.completion`
 //! JSON 200.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -232,16 +232,20 @@ impl ChatMessage {
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct RequestToolCall {
-    pub id: String,
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(rename = "type", default)]
-    pub kind: String,
-    pub function: RequestToolCallFunction,
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub function: Option<RequestToolCallFunction>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct RequestToolCallFunction {
-    pub name: String,
-    pub arguments: serde_json::Value,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<serde_json::Value>,
 }
 
 /// OpenAI tool entry. Only `function`-type tools are recognized; the
@@ -1868,7 +1872,7 @@ impl MessageValidationError {
 fn validate_messages(messages: &[ChatMessage]) -> Result<(), MessageValidationError> {
     let mut seen_tool_call_ids = HashSet::<String>::new();
     let mut known_tool_names = HashMap::<String, String>::new();
-    let mut pending_tool_call_ids = HashSet::<String>::new();
+    let mut pending_tool_call_ids = VecDeque::<String>::new();
 
     for (i, msg) in messages.iter().enumerate() {
         match msg.role.as_str() {
@@ -1901,15 +1905,21 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), MessageValidationEr
                 if let Some(calls) = msg.tool_calls.as_ref() {
                     for (j, call) in calls.iter().enumerate() {
                         validate_tool_call(call, i, j)?;
-                        if !seen_tool_call_ids.insert(call.id.clone()) {
+                        let id = call.id.as_deref().expect("validated tool call id");
+                        let name = call
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.name.as_deref())
+                            .expect("validated tool call function name");
+                        if !seen_tool_call_ids.insert(id.to_string()) {
                             return Err(MessageValidationError::new(
                                 "duplicate_tool_call_id",
-                                format!("tool_call_id '{}' appears more than once", call.id),
+                                format!("tool_call_id '{id}' appears more than once"),
                                 format!("messages[{i}].tool_calls[{j}].id"),
                             ));
                         }
-                        known_tool_names.insert(call.id.clone(), call.function.name.clone());
-                        pending_tool_call_ids.insert(call.id.clone());
+                        known_tool_names.insert(id.to_string(), name.to_string());
+                        pending_tool_call_ids.push_back(id.to_string());
                     }
                 }
             }
@@ -1936,12 +1946,26 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), MessageValidationEr
                         format!("messages[{i}].tool_call_id"),
                     ));
                 }
-                if !pending_tool_call_ids.remove(tool_call_id) {
-                    return Err(MessageValidationError::new(
-                        "invalid_tool_order",
-                        format!("tool_call_id '{tool_call_id}' was already answered or is not pending"),
-                        format!("messages[{i}].tool_call_id"),
-                    ));
+                match pending_tool_call_ids.front() {
+                    Some(expected) if expected == tool_call_id => {
+                        pending_tool_call_ids.pop_front();
+                    }
+                    Some(expected) => {
+                        return Err(MessageValidationError::new(
+                            "invalid_tool_order",
+                            format!(
+                                "tool_call_id '{tool_call_id}' answered out of order; expected '{expected}'"
+                            ),
+                            format!("messages[{i}].tool_call_id"),
+                        ));
+                    }
+                    None => {
+                        return Err(MessageValidationError::new(
+                            "invalid_tool_order",
+                            format!("tool_call_id '{tool_call_id}' was already answered or is not pending"),
+                            format!("messages[{i}].tool_call_id"),
+                        ));
+                    }
                 }
             }
             _ => {
@@ -2007,28 +2031,56 @@ fn validate_tool_call(
     i: usize,
     j: usize,
 ) -> Result<(), MessageValidationError> {
-    if call.id.trim().is_empty() {
+    let Some(id) = call.id.as_deref() else {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls must include a non-empty id",
+            format!("messages[{i}].tool_calls[{j}].id"),
+        ));
+    };
+    if id.trim().is_empty() {
         return Err(MessageValidationError::new(
             "malformed_tool_calls",
             "assistant tool_calls must include a non-empty id",
             format!("messages[{i}].tool_calls[{j}].id"),
         ));
     }
-    if !(call.kind.is_empty() || call.kind == "function") {
+    if call.kind.as_deref() != Some("function") {
         return Err(MessageValidationError::new(
             "malformed_tool_calls",
-            "only function tool_calls are supported",
+            "assistant tool_calls must include type=\"function\"",
             format!("messages[{i}].tool_calls[{j}].type"),
         ));
     }
-    if call.function.name.trim().is_empty() {
+    let Some(function) = call.function.as_ref() else {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls must include function",
+            format!("messages[{i}].tool_calls[{j}].function"),
+        ));
+    };
+    let Some(name) = function.name.as_deref() else {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls must include a non-empty function.name",
+            format!("messages[{i}].tool_calls[{j}].function.name"),
+        ));
+    };
+    if name.trim().is_empty() {
         return Err(MessageValidationError::new(
             "malformed_tool_calls",
             "assistant tool_calls must include a non-empty function.name",
             format!("messages[{i}].tool_calls[{j}].function.name"),
         ));
     }
-    if !call.function.arguments.is_string() {
+    let Some(arguments) = function.arguments.as_ref() else {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls[].function.arguments must be a string",
+            format!("messages[{i}].tool_calls[{j}].function.arguments"),
+        ));
+    };
+    if !arguments.is_string() {
         return Err(MessageValidationError::new(
             "malformed_tool_calls",
             "assistant tool_calls[].function.arguments must be a string",
@@ -2139,6 +2191,16 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
                 .await;
         }
     };
+    if let Err(err) = validate_tool_replay_for_model(&req.messages, &model) {
+        return res
+            .respond(with_launch_diags_header(json_error_param(
+                400,
+                err.code,
+                &err.message,
+                err.param,
+            )))
+            .await;
+    }
     let mut ctx = match Context::new(&model) {
         Ok(c) => c,
         Err(e) => {
@@ -2614,6 +2676,16 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
                 .await;
         }
     };
+    if let Err(err) = validate_tool_replay_for_model(&req.messages, &model) {
+        return res
+            .respond(with_launch_diags_header(json_error_param(
+                400,
+                err.code,
+                &err.message,
+                err.param,
+            )))
+            .await;
+    }
     let mut ctx = match Context::new(&model) {
         Ok(c) => c,
         Err(e) => {
@@ -3145,7 +3217,13 @@ pub(crate) fn fill_context(
                 ctx.assistant(&content);
                 if let Some(calls) = msg.tool_calls.as_ref() {
                     for call in calls {
-                        tool_names_by_id.insert(call.id.clone(), call.function.name.clone());
+                        let id = call.id.as_deref().expect("validated tool call id");
+                        let name = call
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.name.as_deref())
+                            .expect("validated tool call function name");
+                        tool_names_by_id.insert(id.to_string(), name.to_string());
                     }
                 }
             }
@@ -3198,29 +3276,102 @@ fn assistant_replay_content(msg: &ChatMessage) -> String {
 fn render_assistant_tool_calls(calls: &[RequestToolCall]) -> String {
     calls
         .iter()
-        .map(|call| {
-            let arguments = call
-                .function
-                .arguments
-                .as_str()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                .unwrap_or_else(|| {
-                    call.function
-                        .arguments
-                        .as_str()
-                        .map(|raw| serde_json::Value::String(raw.to_string()))
-                        .unwrap_or_else(|| call.function.arguments.clone())
-                });
-            format!(
-                "<tool_call>\n{}\n</tool_call>",
-                serde_json::json!({
-                    "name": &call.function.name,
-                    "arguments": arguments,
-                })
-            )
-        })
+        .map(render_assistant_tool_call)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_assistant_tool_call(call: &RequestToolCall) -> String {
+    let function = call.function.as_ref().expect("validated tool call function");
+    let name = function
+        .name
+        .as_deref()
+        .expect("validated tool call function name");
+    let raw_arguments = function
+        .arguments
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .expect("validated tool call arguments");
+    let arguments = serde_json::from_str::<serde_json::Value>(raw_arguments)
+        .unwrap_or_else(|_| serde_json::Value::String(raw_arguments.to_string()));
+    format!(
+        "<tool_call>\n{}\n</tool_call>",
+        serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        })
+    )
+}
+
+fn validate_tool_replay_with<F>(
+    messages: &[ChatMessage],
+    parse_rendered: F,
+) -> Result<(), MessageValidationError>
+where
+    F: Fn(&str) -> Option<(String, String)>,
+{
+    for (i, msg) in messages.iter().enumerate() {
+        let Some(calls) = msg.tool_calls.as_deref() else {
+            continue;
+        };
+        for call in calls {
+            let rendered = render_assistant_tool_call(call);
+            let Some((parsed_name, parsed_args)) = parse_rendered(&rendered) else {
+                return Err(MessageValidationError::new(
+                    "tool_call_replay_unsupported",
+                    "assistant tool_calls cannot be replayed with this model's native tool-call parser",
+                    format!("messages[{i}].tool_calls"),
+                ));
+            };
+            let function = call.function.as_ref().expect("validated tool call function");
+            let expected_name = function
+                .name
+                .as_deref()
+                .expect("validated tool call function name");
+            let expected_args = function
+                .arguments
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .expect("validated tool call arguments");
+            if parsed_name != expected_name || !same_json_arguments(&parsed_args, expected_args) {
+                return Err(MessageValidationError::new(
+                    "tool_call_replay_unsupported",
+                    "assistant tool_calls do not round-trip through this model's native tool-call parser",
+                    format!("messages[{i}].tool_calls"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_tool_replay_for_model(
+    messages: &[ChatMessage],
+    model: &Model,
+) -> Result<(), MessageValidationError> {
+    validate_tool_replay_with(messages, |rendered| parse_rendered_tool_call(model, rendered))
+}
+
+fn same_json_arguments(left: &str, right: &str) -> bool {
+    match (
+        serde_json::from_str::<serde_json::Value>(left),
+        serde_json::from_str::<serde_json::Value>(right),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => left == right,
+    }
+}
+
+fn parse_rendered_tool_call(model: &Model, rendered: &str) -> Option<(String, String)> {
+    let tokens = model.tokenizer().encode(rendered);
+    let mut decoder = inferlet::tools::Decoder::new(model);
+    for token in tokens {
+        match decoder.feed(&[token]).ok()? {
+            inferlet::tools::Event::Call(name, arguments) => return Some((name, arguments)),
+            inferlet::tools::Event::Start => {}
+        }
+    }
+    None
 }
 
 /// One detected tool call buffered for emit on the terminal chunk.
@@ -3515,6 +3666,51 @@ mod tests {
             (
                 r#"{"model":"m","messages":[{
                     "role":"assistant","content":null,"tool_calls":[
+                        {"type":"function","function":{"name":"calculator","arguments":"{}"}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].id",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","function":{"name":"calculator","arguments":"{}"}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].type",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","type":"function"}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].function",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","type":"function","function":{"arguments":"{}"}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].function.name",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","type":"function","function":{"name":"calculator"}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].function.arguments",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
                         {"id":"call_x","type":"function","function":{"name":"calculator","arguments":{}}}
                     ]
                 }]}"#,
@@ -3549,6 +3745,50 @@ mod tests {
             assert_eq!(err.code, code, "{json}");
             assert_eq!(err.param, param, "{json}");
         }
+    }
+
+    #[test]
+    fn tool_results_must_follow_assistant_declared_order() {
+        let messages = parsed_messages(
+            r#"{
+                "model":"m",
+                "messages":[
+                    {"role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_a","type":"function","function":{"name":"calculator","arguments":"{\"expr\":\"2+2\"}"}},
+                        {"id":"call_b","type":"function","function":{"name":"calculator","arguments":"{\"expr\":\"3+3\"}"}}
+                    ]},
+                    {"role":"tool","tool_call_id":"call_b","content":"6"},
+                    {"role":"tool","tool_call_id":"call_a","content":"4"}
+                ]
+            }"#,
+        );
+
+        let err = validate_messages(&messages).expect_err("out-of-order tool results should fail");
+        assert_eq!(err.code, "invalid_tool_order");
+        assert_eq!(err.param, "messages[1].tool_call_id");
+    }
+
+    #[test]
+    fn assistant_tool_replay_requires_native_parser_confirmation() {
+        let messages = parsed_messages(
+            r#"{
+                "model":"m",
+                "messages":[{
+                    "role":"assistant",
+                    "content":null,
+                    "tool_calls":[{
+                        "id":"call_calc",
+                        "type":"function",
+                        "function":{"name":"calculator","arguments":"{\"expr\":\"2+2\"}"}
+                    }]
+                }]
+            }"#,
+        );
+
+        let err = validate_tool_replay_with(&messages, |_rendered| None)
+            .expect_err("unsupported native replay should fail closed");
+        assert_eq!(err.code, "tool_call_replay_unsupported");
+        assert_eq!(err.param, "messages[0].tool_calls");
     }
 
     #[test]
