@@ -55,6 +55,25 @@ final class ProfileModelPickerSelectionLabelTests: XCTestCase {
     XCTAssertEqual(model.warningText, "exceeds 2.0 GB limit")
   }
 
+  func test_supportWarning_current_model_exposes_advisory_warning() {
+    let option = option(
+      slug: "community/Unverified-GGUF/Unverified-Q4_K_M.gguf",
+      supportWarning: "Unverified — may not be supported"
+    )
+
+    let model = ProfileModelPickerSelectionLabelModel(
+      fallbackModel: option.slug,
+      selectedOption: option,
+      memoryPolicy: nil
+    )
+
+    XCTAssertEqual(model.warningText, "Unverified — may not be supported")
+    XCTAssertEqual(
+      model.accessibilityLabel,
+      "Default model: Unverified-Q4_K_M.gguf. Warning: Unverified — may not be supported"
+    )
+  }
+
   func test_long_selected_model_label_contract_is_constrained_to_one_truncated_line() {
     XCTAssertEqual(ProfileModelPickerSelectionLabelModel.maxNameWidth, 240)
     XCTAssertEqual(ProfileModelPickerSelectionLabelModel.maxSelectionWidth, 360)
@@ -66,7 +85,8 @@ final class ProfileModelPickerSelectionLabelTests: XCTestCase {
     slug: String,
     sizeBytes: Int64? = nil,
     isOverLimit: Bool = false,
-    unsupportedReason: String? = nil
+    unsupportedReason: String? = nil,
+    supportWarning: String? = nil
   ) -> ProfileModelOptions.Option {
     ProfileModelOptions.Option(
       slug: slug,
@@ -75,7 +95,8 @@ final class ProfileModelPickerSelectionLabelTests: XCTestCase {
       source: nil,
       isOverLimit: isOverLimit,
       isCurrent: true,
-      unsupportedReason: unsupportedReason
+      unsupportedReason: unsupportedReason,
+      supportWarning: supportWarning
     )
   }
 }

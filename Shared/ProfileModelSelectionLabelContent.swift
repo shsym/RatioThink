@@ -41,6 +41,9 @@ public struct ProfileModelSelectionLabelContent: Equatable, Sendable {
     if option.isOverLimit, let memoryPolicy {
       return "exceeds \(InstalledModels.formattedSize(memoryPolicy.maxResolvedModelBytes)) limit"
     }
-    return option.unsupportedReason
+    if let unsupportedReason = option.unsupportedReason {
+      return unsupportedReason
+    }
+    return option.supportWarning
   }
 }
