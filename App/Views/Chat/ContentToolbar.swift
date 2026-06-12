@@ -233,20 +233,26 @@ struct ContentToolbar: View {
     .buttonStyle(.plain)
     .help("Sampling parameters")
     .popover(isPresented: $showParamsPopover, arrowEdge: .top) {
-      ParamsPopover(sampling: viewModel.samplingOverride ?? profileSampling()) { committed, didEdit in
+      let sourceSampling = profileSampling()
+      ParamsPopover(sampling: viewModel.samplingOverride ?? sourceSampling) { committed in
         viewModel.samplingOverride = Self.samplingOverrideAfterParamsCommit(
           currentOverride: viewModel.samplingOverride,
-          committed: committed,
-          didEdit: didEdit)
+          sourceSampling: sourceSampling,
+          committed: committed)
       }
     }
     .accessibilityIdentifier("toolbar.params")
   }
 
   static func samplingOverrideAfterParamsCommit(currentOverride: ChatSampling?,
-                                                committed: ChatSampling,
-                                                didEdit: Bool) -> ChatSampling? {
-    guard didEdit else { return currentOverride }
+                                                sourceSampling: ChatSampling,
+                                                committed: ChatSampling) -> ChatSampling? {
+    if committed == sourceSampling {
+      return nil
+    }
+    if committed == currentOverride {
+      return currentOverride
+    }
     return committed
   }
 
@@ -287,13 +293,9 @@ struct ContentToolbar: View {
 /// `ImageRenderer` in a snapshot test (`SamplingAndIndicatorSnapshotTests`).
 struct ParamsPopover: View {
   let sampling: ChatSampling
-  let onCommit: (ChatSampling, Bool) -> Void
+  let onCommit: (ChatSampling) -> Void
   @State private var temperature: Double
   @State private var topP: Double
-  /// Distinguishes an actual slider edit from merely inspecting the popover.
-  /// Without this, dismissal writes the displayed profile defaults back through
-  /// the toolbar and creates a stale explicit override.
-  @State private var hasUncommittedEdits = false
   /// Latches once `commit()` runs so the dismissal flush on
   /// `.onDisappear` does not re-fire after an explicit Apply click.
   /// Today `commit()` is pure value-assignment, but Phase 6 wiring
@@ -308,7 +310,7 @@ struct ParamsPopover: View {
   @State private var didCommit = false
 
   init(sampling: ChatSampling,
-       onCommit: @escaping (ChatSampling, Bool) -> Void = { _, _ in }) {
+       onCommit: @escaping (ChatSampling) -> Void = { _ in }) {
     self.sampling = sampling
     self.onCommit = onCommit
     _temperature = State(initialValue: sampling.temperature)
@@ -341,15 +343,11 @@ struct ParamsPopover: View {
     // second edit. Review v4 F1. `commit()` sends the buffered value through
     // `onCommit` only (not back into the local @State values), so these
     // `onChange` handlers are not retriggered by `commit()` itself — no
-    // feedback loop.
-    .onChange(of: temperature) { _, _ in
-      hasUncommittedEdits = true
-      didCommit = false
-    }
-    .onChange(of: topP) { _, _ in
-      hasUncommittedEdits = true
-      didCommit = false
-    }
+    // feedback loop. Whether that buffered value is an actual override is
+    // decided by comparing it to the source profile sampling at the toolbar
+    // boundary, not by whether any transient slider event occurred.
+    .onChange(of: temperature) { _, _ in didCommit = false }
+    .onChange(of: topP) { _, _ in didCommit = false }
     // macOS popover dismissal (click-outside, Esc) is treated as
     // accept — flush the local buffer so silent edit loss is not a
     // thing. Review v1 F4. Latch prevents double-commit when Apply
@@ -393,8 +391,7 @@ struct ParamsPopover: View {
       temperature: temperature,
       topP: topP,
       maxTokens: sampling.maxTokens
-    ), hasUncommittedEdits)
-    hasUncommittedEdits = false
+    ))
     didCommit = true
   }
 }

@@ -151,8 +151,8 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
 
       viewModel.samplingOverride = ContentToolbar.samplingOverrideAfterParamsCommit(
         currentOverride: viewModel.samplingOverride,
-        committed: displayedSampling,
-        didEdit: false)
+        sourceSampling: displayedSampling,
+        committed: displayedSampling)
 
       XCTAssertNil(
         viewModel.samplingOverride,
@@ -173,6 +173,46 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     }
   }
 
+  func test_netZero_params_edits_preserve_profile_sampling_source_for_open_chat() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(
+        into: dir,
+        id: "chat",
+        temperature: 0.4,
+        topP: 0.75,
+        maxTokens: 1536)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      let viewModel = ChatTranscriptViewModel(selectedProfileID: "chat")
+      let displayedSampling = ChatScaffoldView.resolvedSampling(
+        profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+        transientOverride: viewModel.samplingOverride)
+
+      viewModel.samplingOverride = ContentToolbar.samplingOverrideAfterParamsCommit(
+        currentOverride: viewModel.samplingOverride,
+        sourceSampling: displayedSampling,
+        committed: displayedSampling)
+
+      XCTAssertNil(
+        viewModel.samplingOverride,
+        "dragging params sliders away and back to the displayed profile defaults must not create a stale explicit override")
+
+      try store.setEditableDefaults(
+        systemPrompt: "prompt",
+        temperature: 0.2,
+        topP: 0.95,
+        forProfileID: "chat")
+
+      XCTAssertEqual(
+        ChatScaffoldView.resolvedSampling(
+          profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+          transientOverride: viewModel.samplingOverride),
+        ChatSampling(temperature: 0.2, topP: 0.95, maxTokens: 1536),
+        "after a net-zero params edit, the next send should still use the latest Settings-saved profile defaults")
+    }
+  }
+
   func test_dirty_params_popover_commit_creates_override_that_wins_over_later_profile_edits() throws {
     try withTempProfilesDir { dir in
       try writeProfile(
@@ -185,12 +225,15 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       try store.start()
       defer { store.stop() }
       let viewModel = ChatTranscriptViewModel(selectedProfileID: "chat")
+      let sourceSampling = ChatScaffoldView.resolvedSampling(
+        profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+        transientOverride: nil)
       let editedSampling = ChatSampling(temperature: 1.3, topP: 0.55, maxTokens: 1536)
 
       viewModel.samplingOverride = ContentToolbar.samplingOverrideAfterParamsCommit(
         currentOverride: viewModel.samplingOverride,
-        committed: editedSampling,
-        didEdit: true)
+        sourceSampling: sourceSampling,
+        committed: editedSampling)
 
       try store.setEditableDefaults(
         systemPrompt: "prompt",
