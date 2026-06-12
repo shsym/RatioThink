@@ -27,6 +27,10 @@ public final class AppPreferences: ObservableObject {
   /// array of normalized version strings (e.g. `["0.1.1"]`).
   public static let ignoredUpdateVersionsKey = "ignoredUpdateVersions"
 
+  /// Storage key for allowing other devices to reach the Local API by
+  /// binding its daemon listener to `0.0.0.0` instead of loopback.
+  public static let localAPIExternalAccessEnabledKey = "localAPIExternalAccessEnabled"
+
   private let defaults: UserDefaults
 
   @Published public private(set) var firstLaunchWizardCompleted: Bool
@@ -36,10 +40,19 @@ public final class AppPreferences: ObservableObject {
   /// prompts again. The manual "Check for Updates…" command ignores this set.
   @Published public private(set) var ignoredUpdateVersions: Set<String>
 
+  /// Whether the Local API daemon should bind all interfaces. Defaults false
+  /// because the endpoint is unauthenticated.
+  @Published public private(set) var localAPIExternalAccessEnabled: Bool
+
+  public var localAPIBindMode: EngineHTTPBindMode {
+    localAPIExternalAccessEnabled ? .external : .loopback
+  }
+
   public init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
     self.firstLaunchWizardCompleted = defaults.bool(forKey: Self.firstLaunchWizardCompletedKey)
     self.ignoredUpdateVersions = Set(defaults.stringArray(forKey: Self.ignoredUpdateVersionsKey) ?? [])
+    self.localAPIExternalAccessEnabled = defaults.bool(forKey: Self.localAPIExternalAccessEnabledKey)
   }
 
   /// Persist a version as ignored. Flushed to disk now (like the first-launch
@@ -51,6 +64,13 @@ public final class AppPreferences: ObservableObject {
     ignoredUpdateVersions.insert(trimmed)
     // Store sorted for a stable, debuggable `defaults read`.
     defaults.set(ignoredUpdateVersions.sorted(), forKey: Self.ignoredUpdateVersionsKey)
+    defaults.synchronize()
+  }
+
+  public func setLocalAPIExternalAccessEnabled(_ enabled: Bool) {
+    guard localAPIExternalAccessEnabled != enabled else { return }
+    localAPIExternalAccessEnabled = enabled
+    defaults.set(enabled, forKey: Self.localAPIExternalAccessEnabledKey)
     defaults.synchronize()
   }
 

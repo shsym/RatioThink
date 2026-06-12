@@ -54,4 +54,26 @@ final class AppPreferencesTests: XCTestCase {
     let reopened = AppPreferences(defaults: defaults)
     XCTAssertFalse(reopened.firstLaunchWizardCompleted)
   }
+
+  func test_local_api_external_access_defaults_to_disabled() throws {
+    let defaults = try makeScratchDefaults()
+    let prefs = AppPreferences(defaults: defaults)
+
+    XCTAssertFalse(prefs.localAPIExternalAccessEnabled)
+    XCTAssertEqual(prefs.localAPIBindMode, .loopback)
+  }
+
+  func test_local_api_external_access_persists() throws {
+    let defaults = try makeScratchDefaults()
+    let prefs = AppPreferences(defaults: defaults)
+
+    prefs.setLocalAPIExternalAccessEnabled(true)
+
+    XCTAssertTrue(prefs.localAPIExternalAccessEnabled)
+    XCTAssertEqual(prefs.localAPIBindMode, .external)
+
+    let reopened = AppPreferences(defaults: defaults)
+    XCTAssertTrue(reopened.localAPIExternalAccessEnabled)
+    XCTAssertEqual(reopened.localAPIBindMode, .external)
+  }
 }

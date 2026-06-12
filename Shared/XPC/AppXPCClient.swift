@@ -41,12 +41,18 @@ public protocol AppXPCClient: Sendable {
   /// or an `AppXPCClientError` on transport failure. Driven by #326's
   /// fresh-install auto-start.
   func startEngine(profileID: String) async throws
+  /// Start the engine with an explicit Local API daemon bind mode.
+  func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws
 }
 
 public extension AppXPCClient {
   /// Default: memory unavailable. Test stubs that don't model the
   /// engineMemory selector inherit nil and need no change.
   func engineMemory() async throws -> EngineMemorySample? { nil }
+
+  func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws {
+    try await startEngine(profileID: profileID)
+  }
 }
 
 public enum AppXPCClientError: Error, Sendable, CustomStringConvertible {
@@ -225,9 +231,13 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
   }
 
   public func startEngine(profileID: String) async throws {
+    try await startEngine(profileID: profileID, daemonBindHost: .loopback)
+  }
+
+  public func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws {
     let connection = ensureConnection()
     do {
-      try await startEngine(profileID: profileID, on: connection)
+      try await startEngine(profileID: profileID, daemonBindHost: daemonBindHost, on: connection)
     } catch let error as AppXPCClientError {
       if case .replyTimeout = error {
         invalidateIfCurrent(connection)
@@ -236,7 +246,9 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
     }
   }
 
-  private func startEngine(profileID: String, on connection: NSXPCConnection) async throws {
+  private func startEngine(profileID: String,
+                           daemonBindHost: EngineHTTPBindMode,
+                           on connection: NSXPCConnection) async throws {
     let timeout = replyTimeout
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       let resumed = OSAllocatedUnfairLock<Bool>(initialState: false)
@@ -267,7 +279,7 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
         resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
         return
       }
-      api.startEngine(profileID: profileID) { successData, errorData in
+      api.startEngine(profileID: profileID, daemonBindHost: daemonBindHost.daemonHost) { successData, errorData in
         // Contract (PieHelperXPC): exactly one of (successData=EnginePort,
         // errorData=EngineError) is non-nil. We discard the port — the
         // caller relies on the engine-status poll for the live `.running`

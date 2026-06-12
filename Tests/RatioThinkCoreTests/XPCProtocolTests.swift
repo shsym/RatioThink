@@ -21,6 +21,7 @@ final class XPCProtocolTests: XCTestCase {
     let expected = [
       "engineStatusWithReply:",
       "startEngineWithProfileID:reply:",
+      "startEngineWithProfileID:daemonBindHost:reply:",
       "stopEngineWithReply:",
       "loadModelWithModelID:reply:",
       "cancelLoadWithHandle:reply:",

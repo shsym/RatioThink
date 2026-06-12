@@ -45,6 +45,13 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertEqual(s.detail, "Turn on to serve OpenAI-compatible requests on 127.0.0.1.")
   }
 
+  func test_bind_modes_carry_explicit_daemon_hosts() {
+    XCTAssertEqual(EngineHTTPBindMode.loopback.daemonHost, "127.0.0.1")
+    XCTAssertEqual(EngineHTTPBindMode.external.daemonHost, "0.0.0.0")
+    XCTAssertEqual(EngineHTTPBindMode.loopback.baseURLHost, "127.0.0.1")
+    XCTAssertEqual(EngineHTTPBindMode.external.baseURLHost, "0.0.0.0")
+  }
+
   func test_stopped_without_profile_is_disabled_with_guidance() {
     let s = LocalAPIState.make(status: .stopped, hasActiveProfile: false)
     XCTAssertFalse(s.toggleEnabled, "nothing to serve → can't turn on")
@@ -113,19 +120,68 @@ final class LocalAPIStateTests: XCTestCase {
 
   // MARK: - posture drift guard (binds UI claims to the real launch config)
 
-  func test_posture_matches_real_engine_launch_config() {
-    // The view's read-only "Security" rows claim loopback-only + no-auth.
-    // Those claims are only honest if the app actually launches the engine
-    // that way. Pin them to `renderConfigBody`'s preamble so a future TOML
-    // change can't silently make the UI lie.
+  func test_loopback_posture_matches_default_daemon_launch_contract() {
+    // The view's default "Security" rows claim loopback-only + no-auth.
+    // Those claims are only honest if the app actually launches the daemon
+    // that way. Pin them to the typed launch default and the config preamble
+    // so a future drift can't silently make the UI lie.
     let body = PieControlLauncher.renderConfigBody(modelConfig: .dummy)
+    let posture = EngineHTTPPosture.make(bindMode: .loopback)
 
-    XCTAssertEqual(EngineHTTPPosture.loopbackOnly, true)
+    XCTAssertEqual(posture.loopbackOnly, true)
+    XCTAssertEqual(PieControlLauncher.LaunchSpec.defaultDaemonBindHost, .loopback)
     XCTAssertTrue(body.contains("host = \"127.0.0.1\""),
-                  "EngineHTTPPosture.loopbackOnly claims 127.0.0.1 — config must bind there")
+                  "pie control websocket remains loopback-only; the OpenAI daemon host is configured separately")
 
-    XCTAssertEqual(EngineHTTPPosture.authenticated, false)
+    XCTAssertEqual(posture.authenticated, false)
     XCTAssertTrue(body.contains("[auth]\nenabled = false"),
                   "EngineHTTPPosture.authenticated=false claims no auth — config must disable it")
+  }
+
+  func test_external_posture_warns_about_lan_exposure() {
+    let posture = EngineHTTPPosture.make(bindMode: .external)
+
+    XCTAssertFalse(posture.loopbackOnly)
+    XCTAssertEqual(posture.networkSummary, "External access enabled (0.0.0.0). Other devices on reachable networks can connect to this Mac’s local API port.")
+    XCTAssertEqual(posture.warningTitle, "Network exposure risk")
+    XCTAssertEqual(posture.warningDetail?.contains("unauthenticated"), true)
+  }
+
+  func test_profile_options_ignore_invalid_entries_and_mark_runtime_profile() throws {
+    let chat = try Profile.parse(toml: """
+    id = "chat"
+    name = "Chat"
+    model = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    inferlet = "chat-apc"
+    """)
+    let fast = try Profile.parse(toml: """
+    id = "fast-think"
+    name = "Fast Think"
+    model = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    inferlet = "chat-apc"
+    """)
+
+    let options = LocalAPIProfileOption.make(
+      entries: [
+        ProfileLoadResult(url: URL(fileURLWithPath: "/profiles/bad.toml"),
+                          profile: nil,
+                          error: .missingField("id"),
+                          warnings: []),
+        ProfileLoadResult(url: URL(fileURLWithPath: "/profiles/chat.toml"),
+                          profile: chat,
+                          error: nil,
+                          warnings: []),
+        ProfileLoadResult(url: URL(fileURLWithPath: "/profiles/fast-think.toml"),
+                          profile: fast,
+                          error: nil,
+                          warnings: []),
+      ],
+      runtimeProfileID: "fast-think"
+    )
+
+    XCTAssertEqual(options.map(\.id), ["chat", "fast-think"])
+    XCTAssertEqual(options.map(\.title), ["Chat", "Fast Think"])
+    XCTAssertEqual(options.map(\.modelDisplayName), ["Qwen3-0.6B-Q8_0.gguf", "Qwen3-0.6B-Q8_0.gguf"])
+    XCTAssertEqual(options.map(\.isRuntimeProfile), [false, true])
   }
 }

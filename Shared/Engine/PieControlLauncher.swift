@@ -121,6 +121,8 @@ public enum PieControlLauncher {
   }
 
   public struct LaunchSpec: Sendable {
+    public static let defaultDaemonBindHost: EngineHTTPBindMode = .loopback
+
     public var pieBinary: URL
     public var wasmURL: URL
     public var manifestURL: URL
@@ -154,6 +156,9 @@ public enum PieControlLauncher {
     /// pass `.dummy`, the resolver passes `.portable(...)` or
     /// `.metal(...)`.
     public var modelConfig: ModelConfig
+    /// Host for the OpenAI-compatible daemon listener. This is distinct from
+    /// the pie control websocket's `[server] host`, which remains loopback.
+    public var daemonBindHost: EngineHTTPBindMode
 
     public init(pieBinary: URL,
                 wasmURL: URL,
@@ -165,6 +170,7 @@ public enum PieControlLauncher {
                 handshakeTimeout: TimeInterval = 30,
                 pidSink: (@Sendable (pid_t) -> Void)? = nil,
                 profileID: String = "isolated",
+                daemonBindHost: EngineHTTPBindMode = Self.defaultDaemonBindHost,
                 modelConfig: ModelConfig) throws {
       try PieControlLauncher.validateDriverSupport(
         pieBinary: pieBinary,
@@ -183,6 +189,7 @@ public enum PieControlLauncher {
       self.handshakeTimeout = handshakeTimeout
       self.pidSink = pidSink
       self.profileID = profileID
+      self.daemonBindHost = daemonBindHost
       self.modelConfig = modelConfig
     }
   }
@@ -532,7 +539,11 @@ public enum PieControlLauncher {
       try await client.installProgram(wasmURL: spec.wasmURL,
                                       manifestURL: spec.manifestURL,
                                       forceOverwrite: true)
-      try await client.launchDaemon(inferlet: spec.inferletNameAtVersion, port: UInt32(httpPort))
+      try await client.launchDaemon(
+        inferlet: spec.inferletNameAtVersion,
+        port: UInt32(httpPort),
+        host: spec.daemonBindHost.daemonHost
+      )
       await client.close()
     } catch {
       await client.close()

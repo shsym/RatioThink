@@ -23,11 +23,13 @@ struct LocalAPIView: View {
   @EnvironmentObject private var engineStatusStore: EngineStatusStore
   @EnvironmentObject private var profileStore: ProfileStore
   @EnvironmentObject private var engineClientStore: EngineClientStore
+  @EnvironmentObject private var appPreferences: AppPreferences
 
   @State private var memory: EngineMemorySample?
   @State private var servedModel: String?
   @State private var health: EngineHealth.Status?
   @State private var confirmStop = false
+  @State private var selectedProfileID: String?
   /// Last engine start/stop failure, surfaced near the status card. The
   /// engine's poll channel does NOT cover resolver-stage start rejections
   /// (`.profileMissing`/`.invalidInput`/`.spawnFailed`/`.modelMissing`):
@@ -44,6 +46,22 @@ struct LocalAPIView: View {
     )
   }
 
+  private var bindMode: EngineHTTPBindMode { appPreferences.localAPIBindMode }
+  private var posture: EngineHTTPPosture { EngineHTTPPosture.make(bindMode: bindMode) }
+
+  private var runtimeProfileID: String? {
+    if case .running(_, let profileID) = engineStatusStore.status { return profileID }
+    return nil
+  }
+
+  private var profileOptions: [LocalAPIProfileOption] {
+    LocalAPIProfileOption.make(entries: profileStore.entries, runtimeProfileID: runtimeProfileID)
+  }
+
+  private var selectedOrActiveProfileID: String? {
+    selectedProfileID ?? runtimeProfileID ?? profileStore.activeProfileID ?? profileOptions.first?.id
+  }
+
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 20) {
@@ -52,6 +70,7 @@ struct LocalAPIView: View {
         if let engineActionError {
           actionErrorRow(engineActionError)
         }
+        profileExplorerSection
         if state.isServing {
           servingDetails
         }
@@ -67,6 +86,16 @@ struct LocalAPIView: View {
     // `.running` (the action succeeded, possibly via another surface).
     .onChange(of: state.isServing) { _, serving in
       if serving { engineActionError = nil }
+    }
+    .onChange(of: engineStatusStore.status) { _, newStatus in
+      if case .running(_, let profileID) = newStatus {
+        selectedProfileID = profileID
+      } else if selectedProfileID == nil {
+        selectedProfileID = profileStore.activeProfileID ?? profileOptions.first?.id
+      }
+    }
+    .onAppear {
+      selectedProfileID = selectedOrActiveProfileID
     }
     .confirmationDialog(
       "Turn off the local API?",
@@ -175,11 +204,11 @@ struct LocalAPIView: View {
 
   @ViewBuilder
   private var servingDetails: some View {
-    if let baseURL = engineStatusStore.baseURL?.absoluteString {
+    if let baseURL = visibleBaseURL {
       labeledCopyRow(
         title: "Base URL",
         value: baseURL,
-        caption: "Loopback only. The port is assigned fresh each time the engine starts.",
+        caption: baseURLCaption,
         identifier: "LocalAPIBaseURL"
       )
 
@@ -200,6 +229,68 @@ struct LocalAPIView: View {
       endpointsSection
       curlSection(baseURL: baseURL)
     }
+  }
+
+  private var visibleBaseURL: String? {
+    guard let port = state.port else { return engineStatusStore.baseURL?.absoluteString }
+    return "http://\(bindMode.baseURLHost):\(port)"
+  }
+
+  private var baseURLCaption: String {
+    switch bindMode {
+    case .loopback:
+      return "Loopback only. The port is assigned fresh each time the engine starts."
+    case .external:
+      return "External access is enabled. From another device, replace 0.0.0.0 with this Mac’s LAN IP address."
+    }
+  }
+
+  private var profileExplorerSection: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      sectionHeader("Profiles")
+      if profileOptions.isEmpty {
+        Text("No valid profiles are available yet.")
+          .font(.callout)
+          .foregroundStyle(.secondary)
+      } else {
+        Picker("Profile", selection: profileSelectionBinding) {
+          ForEach(profileOptions) { option in
+            Text(option.title).tag(option.id)
+          }
+        }
+        .pickerStyle(.segmented)
+        .accessibilityIdentifier("LocalAPIProfileTabs")
+
+        if let selected = selectedProfileOption {
+          HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("Model")
+              .foregroundStyle(.secondary)
+            Spacer()
+            Text(selected.modelDisplayName)
+              .font(.system(.body, design: .monospaced))
+              .lineLimit(1)
+            if selected.isRuntimeProfile {
+              Text("Running")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.green)
+            }
+          }
+          .accessibilityIdentifier("LocalAPISelectedProfile")
+        }
+      }
+    }
+  }
+
+  private var selectedProfileOption: LocalAPIProfileOption? {
+    guard let selectedOrActiveProfileID else { return nil }
+    return profileOptions.first { $0.id == selectedOrActiveProfileID }
+  }
+
+  private var profileSelectionBinding: Binding<String> {
+    Binding(
+      get: { selectedOrActiveProfileID ?? "" },
+      set: { selectProfile($0) }
+    )
   }
 
   private var endpointsSection: some View {
@@ -252,15 +343,44 @@ struct LocalAPIView: View {
   private var securitySection: some View {
     VStack(alignment: .leading, spacing: 8) {
       sectionHeader("Security")
-      Text("This endpoint is unauthenticated and local-only for 0.1.2. Don’t treat it as a secured service.")
+      Toggle("Allow access from other devices", isOn: externalAccessBinding)
+        .toggleStyle(.switch)
+        .accessibilityIdentifier("LocalAPIExternalAccessToggle")
+      if let warningTitle = posture.warningTitle,
+         let warningDetail = posture.warningDetail {
+        HStack(alignment: .top, spacing: 8) {
+          Image(systemName: "exclamationmark.triangle.fill")
+            .foregroundStyle(.orange)
+            .accessibilityHidden(true)
+          VStack(alignment: .leading, spacing: 2) {
+            Text(warningTitle)
+              .font(.callout.weight(.semibold))
+            Text(warningDetail)
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .fixedSize(horizontal: false, vertical: true)
+          }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.10)))
+        .accessibilityIdentifier("LocalAPIExternalAccessWarning")
+      }
+      Text("This endpoint is unauthenticated. Don’t treat it as a secured service.")
         .font(.callout)
         .foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)
-      postureRow(title: "Network", value: EngineHTTPPosture.networkSummary)
-      postureRow(title: "Authentication", value: EngineHTTPPosture.authSummary)
-      postureRow(title: "CORS", value: EngineHTTPPosture.corsSummary)
+      postureRow(title: "Network", value: posture.networkSummary)
+      postureRow(title: "Authentication", value: posture.authSummary)
+      postureRow(title: "CORS", value: posture.corsSummary)
     }
     .accessibilityIdentifier("LocalAPISecurity")
+  }
+
+  private var externalAccessBinding: Binding<Bool> {
+    Binding(
+      get: { appPreferences.localAPIExternalAccessEnabled },
+      set: { setExternalAccess($0) }
+    )
   }
 
   private func postureRow(title: String, value: String) -> some View {
@@ -326,11 +446,11 @@ struct LocalAPIView: View {
   /// so it MUST surface here — the reducer never sees it. (`.replyTimeout` /
   /// `.alreadyRunning` are swallowed by the store as non-failures.)
   private func start() {
-    guard let profileID = profileStore.activeProfileID, !profileID.isEmpty else { return }
+    guard let profileID = selectedOrActiveProfileID, !profileID.isEmpty else { return }
     Task { @MainActor in
       engineActionError = nil
       do {
-        try await engineStatusStore.startEngine(profileID: profileID)
+        try await engineStatusStore.startEngine(profileID: profileID, daemonBindHost: bindMode)
       } catch {
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "start")
       }
@@ -347,6 +467,37 @@ struct LocalAPIView: View {
         try await engineStatusStore.stopEngine()
       } catch {
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "stop")
+      }
+    }
+  }
+
+  private func selectProfile(_ profileID: String) {
+    guard !profileID.isEmpty else { return }
+    selectedProfileID = profileID
+    do {
+      try profileStore.setActiveProfileID(profileID)
+    } catch {
+      engineActionError = "Couldn't select profile: \(error)"
+      return
+    }
+    guard runtimeProfileID != nil, runtimeProfileID != profileID else { return }
+    restartEngine(profileID: profileID)
+  }
+
+  private func setExternalAccess(_ enabled: Bool) {
+    appPreferences.setLocalAPIExternalAccessEnabled(enabled)
+    guard state.isServing, let profileID = runtimeProfileID ?? selectedOrActiveProfileID else { return }
+    restartEngine(profileID: profileID)
+  }
+
+  private func restartEngine(profileID: String) {
+    Task { @MainActor in
+      engineActionError = nil
+      do {
+        try await engineStatusStore.stopEngine()
+        try await engineStatusStore.startEngine(profileID: profileID, daemonBindHost: bindMode)
+      } catch {
+        engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "switch")
       }
     }
   }

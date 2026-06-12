@@ -90,6 +90,26 @@ final class PieControlLauncherConfigTests: XCTestCase {
                   "embedded quotes must be backslash-escaped; got:\n\(body)")
   }
 
+  func test_launchSpec_defaults_daemon_bind_host_to_loopback() throws {
+    let binary = try writeDriverListProbe(portable: true)
+    let spec = try makeSpec(binary: binary, modelConfig: .dummy)
+
+    XCTAssertEqual(spec.daemonBindHost, .loopback)
+    XCTAssertEqual(spec.daemonBindHost.daemonHost, "127.0.0.1")
+  }
+
+  func test_launchSpec_accepts_external_daemon_bind_host() throws {
+    let binary = try writeDriverListProbe(portable: true)
+    let spec = try makeSpec(
+      binary: binary,
+      modelConfig: .dummy,
+      daemonBindHost: .external
+    )
+
+    XCTAssertEqual(spec.daemonBindHost, .external)
+    XCTAssertEqual(spec.daemonBindHost.daemonHost, "0.0.0.0")
+  }
+
   func test_writeConfig_writes_file_under_pieHome() throws {
     let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
       .appendingPathComponent("pie-config-\(UUID().uuidString.prefix(8))",
@@ -307,7 +327,8 @@ final class PieControlLauncherConfigTests: XCTestCase {
 
   private func makeSpec(binary: URL,
                         subprocessEnvironment: [String: String] = [:],
-                        modelConfig: PieControlLauncher.ModelConfig) throws -> PieControlLauncher.LaunchSpec {
+                        modelConfig: PieControlLauncher.ModelConfig,
+                        daemonBindHost: EngineHTTPBindMode = .loopback) throws -> PieControlLauncher.LaunchSpec {
     let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
       .appendingPathComponent("pie-launchspec-\(UUID().uuidString.prefix(8))",
                               isDirectory: true)
@@ -318,6 +339,7 @@ final class PieControlLauncherConfigTests: XCTestCase {
       subprocessEnvironment: subprocessEnvironment,
       pieHome: tmp.appendingPathComponent("home"),
       shmemName: "/pie_test_\(UUID().uuidString.prefix(8))",
+      daemonBindHost: daemonBindHost,
       modelConfig: modelConfig
     )
   }

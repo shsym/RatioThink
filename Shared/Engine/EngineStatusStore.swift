@@ -289,9 +289,10 @@ public final class EngineStatusStore: ObservableObject {
   /// is in flight — so `.replyTimeout` is swallowed. A real helper
   /// `EngineError` (resolver rejected, still `.modelMissing`, etc.)
   /// propagates so the UI can surface the reason.
-  public func startEngine(profileID: String) async throws {
+  public func startEngine(profileID: String,
+                          daemonBindHost: EngineHTTPBindMode = .loopback) async throws {
     do {
-      try await client.startEngine(profileID: profileID)
+      try await client.startEngine(profileID: profileID, daemonBindHost: daemonBindHost)
     } catch let error as AppXPCClientError {
       if case .replyTimeout = error {
         Self.log.notice("startEngine(profileID=\(profileID, privacy: .public)) reply timed out — start in flight; status poll will surface the outcome")

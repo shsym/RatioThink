@@ -291,6 +291,14 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// `PieEngineHost.observe` (review v1 F3) — no tokenBox race.
   public func startEngine(profileID: String,
                           reply: @escaping (Data?, Data?) -> Void) {
+    startEngine(profileID: profileID,
+                daemonBindHost: EngineHTTPBindMode.loopback.daemonHost,
+                reply: reply)
+  }
+
+  public func startEngine(profileID: String,
+                          daemonBindHost: String,
+                          reply: @escaping (Data?, Data?) -> Void) {
     guard let engineHost else {
       Self.log.error("startEngine: no engineHost wired (early boot or unit test)")
       reply(nil, Self.notImplementedErrorData)
@@ -305,8 +313,23 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       )
       return
     }
+    let bindMode: EngineHTTPBindMode
+    switch daemonBindHost {
+    case EngineHTTPBindMode.loopback.daemonHost:
+      bindMode = .loopback
+    case EngineHTTPBindMode.external.daemonHost:
+      bindMode = .external
+    default:
+      PieHelperXPCWire.replyStartEngine(
+        .failure(EngineError(code: .invalidInput,
+                             message: "Unsupported Local API bind host: \(daemonBindHost)")),
+        via: reply
+      )
+      return
+    }
+
     let resolved = launchSpecResolver(profileID)
-    let spec: PieControlLauncher.LaunchSpec
+    var spec: PieControlLauncher.LaunchSpec
     switch resolved {
     case .success(let s): spec = s
     case .failure(let err):
@@ -317,6 +340,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       PieHelperXPCWire.replyStartEngine(.failure(err), via: reply)
       return
     }
+    spec.daemonBindHost = bindMode
     if case .failure(let err) = engineHost.start(spec) {
       PieHelperXPCWire.replyStartEngine(.failure(err), via: reply)
       return
@@ -672,6 +696,13 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   public func startEngine(profileID: String,
                           reply: @escaping (Data?, Data?) -> Void) {
     Self.log.error("startEngine refused in degraded mode (profileID=\(profileID, privacy: .public))")
+    reply(nil, degradedErrorData)
+  }
+
+  public func startEngine(profileID: String,
+                          daemonBindHost: String,
+                          reply: @escaping (Data?, Data?) -> Void) {
+    Self.log.error("startEngine refused in degraded mode (profileID=\(profileID, privacy: .public) daemonBindHost=\(daemonBindHost, privacy: .public))")
     reply(nil, degradedErrorData)
   }
 

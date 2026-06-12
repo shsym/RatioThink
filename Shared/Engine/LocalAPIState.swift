@@ -1,5 +1,29 @@
 import Foundation
 
+/// Where the OpenAI-compatible daemon should bind its HTTP listener.
+///
+/// Important distinction: pie's `[server] host` config controls the
+/// control-plane websocket. The user-facing Local API is the long-lived
+/// inferlet daemon launched over that control plane, so this value is
+/// threaded through `launch_daemon` instead of changing the control server.
+public enum EngineHTTPBindMode: String, Codable, Equatable, Sendable {
+  /// Only processes on this Mac can connect.
+  case loopback
+  /// Bind all IPv4 interfaces so other reachable devices can connect.
+  case external
+
+  public var daemonHost: String {
+    switch self {
+    case .loopback: return "127.0.0.1"
+    case .external: return "0.0.0.0"
+    }
+  }
+
+  /// Host rendered in examples that describe the bind target. In-app HTTP
+  /// clients still talk to `127.0.0.1`; this is for the Local API explorer.
+  public var baseURLHost: String { daemonHost }
+}
+
 /// Pure view-state for the "Local API" surface (#422).
 ///
 /// The app exposes exactly ONE OpenAI-compatible HTTP endpoint: the pie
@@ -170,17 +194,64 @@ public struct LocalAPIRoute: Equatable, Identifiable {
 /// These are constants because they are fixed by the app's launch contract
 /// for 0.1.2 (no per-endpoint configuration). If the launch contract gains
 /// a knob, this type becomes a computed projection of it.
-public enum EngineHTTPPosture {
-  public static let loopbackOnly = true
-  public static let authenticated = false
-  public static let sendsCORSHeaders = false
+public struct EngineHTTPPosture: Equatable {
+  public let bindMode: EngineHTTPBindMode
+  public let loopbackOnly: Bool
+  public let authenticated: Bool
+  public let sendsCORSHeaders: Bool
+  public let networkSummary: String
+  public let authSummary: String
+  public let corsSummary: String
+  public let warningTitle: String?
+  public let warningDetail: String?
 
-  public static let networkSummary =
-    "Loopback only (127.0.0.1). Not reachable from other devices."
-  public static let authSummary =
-    "None. Any process on this Mac can call it. Treat it as local-only."
-  public static let corsSummary =
-    "No CORS headers are sent, so browser cross-origin requests are blocked. Use curl, an SDK, or a server-side client."
+  public static func make(bindMode: EngineHTTPBindMode) -> EngineHTTPPosture {
+    EngineHTTPPosture(
+      bindMode: bindMode,
+      loopbackOnly: bindMode == .loopback,
+      authenticated: false,
+      sendsCORSHeaders: false,
+      networkSummary: networkSummary(bindMode: bindMode),
+      authSummary: "None. Any process that can reach the listener can call it.",
+      corsSummary: "No CORS headers are sent, so browser cross-origin requests are blocked. Use curl, an SDK, or a server-side client.",
+      warningTitle: bindMode == .external ? "Network exposure risk" : nil,
+      warningDetail: bindMode == .external
+        ? "External access binds the unauthenticated local API to 0.0.0.0. Only enable it on trusted networks, and turn it off when you are done."
+        : nil
+    )
+  }
+
+  private static func networkSummary(bindMode: EngineHTTPBindMode) -> String {
+    switch bindMode {
+    case .loopback:
+      return "Loopback only (127.0.0.1). Not reachable from other devices."
+    case .external:
+      return "External access enabled (0.0.0.0). Other devices on reachable networks can connect to this Mac’s local API port."
+    }
+  }
+}
+
+/// One selectable profile tab in the Local API explorer.
+public struct LocalAPIProfileOption: Equatable, Identifiable {
+  public let id: String
+  public let title: String
+  public let modelID: String
+  public let modelDisplayName: String
+  public let isRuntimeProfile: Bool
+
+  public static func make(entries: [ProfileLoadResult],
+                          runtimeProfileID: String?) -> [LocalAPIProfileOption] {
+    entries.compactMap { entry -> LocalAPIProfileOption? in
+      guard entry.error == nil, let profile = entry.profile else { return nil }
+      return LocalAPIProfileOption(
+        id: profile.id,
+        title: profile.name,
+        modelID: profile.model,
+        modelDisplayName: ModelDisplayName.leaf(profile.model),
+        isRuntimeProfile: profile.id == runtimeProfileID
+      )
+    }
+  }
 }
 
 /// Pure builders for the copyable snippets the view shows. Kept here so the

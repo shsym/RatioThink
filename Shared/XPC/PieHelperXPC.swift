@@ -46,6 +46,13 @@ public protocol PieHelperXPC {
   func startEngine(profileID: String,
                    reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
 
+  /// Bind-host-aware start used by the Local API settings surface. `daemonBindHost`
+  /// is the OpenAI-compatible daemon host (`127.0.0.1` or `0.0.0.0`), not the
+  /// pie control websocket host.
+  func startEngine(profileID: String,
+                   daemonBindHost: String,
+                   reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
+
   /// Reply is `XPCPayload.encode(EngineError)` when the stop request
   /// could not be honored (helper degraded, engine missing, transport
   /// race) or nil on acceptance. The prior `() -> Void` shape had no

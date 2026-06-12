@@ -142,7 +142,10 @@ public actor PieControlClient {
     if !response.ok { throw ClientError.serverRejected(message: response.result) }
   }
 
-  public func launchDaemon(inferlet: String, port: UInt32, input: [String: Any] = [:]) async throws {
+  public func launchDaemon(inferlet: String,
+                           port: UInt32,
+                           host: String = EngineHTTPBindMode.loopback.daemonHost,
+                           input: [String: Any] = [:]) async throws {
     let inputJSON: String
     if input.isEmpty {
       inputJSON = "{}"
@@ -152,6 +155,7 @@ public actor PieControlClient {
     }
     try await sendAndAwait(type: "launch_daemon", extra: [
       ("port", .uint(UInt64(port))),
+      ("host", .string(host)),
       ("inferlet", .string(inferlet)),
       ("input", .string(inputJSON)),
     ])

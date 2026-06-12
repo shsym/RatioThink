@@ -159,6 +159,14 @@ private final class FixedStatusExportedObject: NSObject, PieHelperXPC, @unchecke
 
   func startEngine(profileID: String,
                    reply: @escaping (Data?, Data?) -> Void) {
+    startEngine(profileID: profileID,
+                daemonBindHost: EngineHTTPBindMode.loopback.daemonHost,
+                reply: reply)
+  }
+
+  func startEngine(profileID: String,
+                   daemonBindHost: String,
+                   reply: @escaping (Data?, Data?) -> Void) {
     PieHelperXPCWire.replyStartEngine(
       .failure(EngineError(code: .wireContractViolation,
                            message: "FixedStatusExportedObject is read-only")),
@@ -220,6 +228,10 @@ private final class NeverReplyStatusExportedObject: NSObject, PieHelperXPC, @unc
   }
 
   func startEngine(profileID: String,
+                   reply: @escaping (Data?, Data?) -> Void) {}
+
+  func startEngine(profileID: String,
+                   daemonBindHost: String,
                    reply: @escaping (Data?, Data?) -> Void) {}
 
   func stopEngine(reply: @escaping (Data?) -> Void) {}
