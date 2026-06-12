@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build an arch-specific RatioThink.app and wrap it in RatioThink-<arch>.dmg.
+# Build an arch-specific Rational.app and wrap it in Rational-<arch>.dmg.
 #
-# v1 ships separate `RatioThink-arm64.dmg` and `RatioThink-x86_64.dmg`
+# v1 ships separate `Rational-arm64.dmg` and `Rational-x86_64.dmg`
 # instead of a universal binary. Universal-binary packaging is deferred
 #
 # Usage:
@@ -9,7 +9,7 @@
 #                          [--out <dir>] [--configuration <Debug|Release>]
 #                          [--notarize]
 #
-# Output: <out>/RatioThink-<arch>.dmg  (default <out> = build/dmg/)
+# Output: <out>/Rational-<arch>.dmg  (default <out> = build/dmg/)
 #
 # With --notarize the app is signed with a Developer ID Application identity
 # (auto-detected, or --identity / DEVELOPER_ID_IDENTITY), then the app AND the
@@ -161,9 +161,9 @@ xcodebuild \
   ${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"} \
   build
 
-APP_PATH="$SYM_ROOT/RatioThink.app"
+APP_PATH="$SYM_ROOT/Rational.app"
 if [[ ! -d "$APP_PATH" ]]; then
-  echo "package-dmg.sh: build succeeded but RatioThink.app not found at $APP_PATH" >&2
+  echo "package-dmg.sh: build succeeded but Rational.app not found at $APP_PATH" >&2
   exit 70
 fi
 
@@ -192,7 +192,7 @@ fi
 # resigned cleanly inside a valid bundle" and "engine present in a
 # bundle whose CodeResources seal is broken" — notarization rejects
 # both, but only the strict --verify catches the broken-seal case
-# (review v2 F2). --deep walks nested binaries (RatioThinkHelper, the
+# (review v2 F2). --deep walks nested binaries (RationalHelper, the
 # engine, frameworks); --strict enforces sealed-resource integrity.
 if ! codesign --verify --strict --deep --verbose=2 "$APP_PATH"; then
   echo "package-dmg.sh: bundle signature verification failed for $APP_PATH" >&2
@@ -224,7 +224,7 @@ for key in com.apple.security.cs.allow-jit \
 done
 
 # Notarize + staple the APP before it goes into the dmg, so a user who drags
-# RatioThink.app out of the image gets a stapled bundle that passes Gatekeeper
+# Rational.app out of the image gets a stapled bundle that passes Gatekeeper
 # offline (not just the dmg). notarize.sh refuses a non-Developer ID artifact
 # and fails loudly if creds are missing.
 if [[ "$NOTARIZE" -eq 1 ]]; then
@@ -232,10 +232,10 @@ if [[ "$NOTARIZE" -eq 1 ]]; then
   "$SCRIPT_DIR/notarize.sh" "$APP_PATH"
 fi
 
-DMG_PATH="$OUT_DIR/RatioThink-$ARCH.dmg"
+DMG_PATH="$OUT_DIR/Rational-$ARCH.dmg"
 rm -f "$DMG_PATH"
 
-# Build the styled drag-install DMG window (ticket #354): RatioThink.app on the
+# Build the styled drag-install DMG window (ticket #354): Rational.app on the
 # left, an `Applications` symlink target on the right, and a background showing
 # an arrow app -> Applications. make-styled-dmg.sh stages into a writable image,
 # writes the window layout to the volume `.DS_Store` directly (no Finder/

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-MODEL="${PIE_TEST_CHAT_MODEL:-resume-deterministic}"
+MODEL="${PIE_TEST_CHAT_MODEL_PIN:-resume-deterministic}"
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p275-history-$$}"
 GUI_HOME="$RUN_ROOT/g"
 URL_FILE="$RUN_ROOT/harness.url"
@@ -27,8 +27,8 @@ if ! pgrep -x Dock >/dev/null 2>&1; then
   exit 2
 fi
 if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "resume gui history e2e: RatioThink.app Automation/Accessibility permissions required." >&2
-  echo "resume gui history e2e: grant Xcode/XCTest runner and RatioThink.app Automation + Accessibility in System Settings, then rerun:" >&2
+  echo "resume gui history e2e: Rational.app Automation/Accessibility permissions required." >&2
+  echo "resume gui history e2e: grant Xcode/XCTest runner and Rational.app Automation + Accessibility in System Settings, then rerun:" >&2
   echo "resume gui history e2e: PIE_TEST_TCC_GRANTED=1 Scripts/run-resume-gui-history-e2e.sh" >&2
   exit 2
 fi
@@ -65,7 +65,7 @@ BASE_URL="$(cat "$URL_FILE")"
 cat >"$CONFIG_FILE" <<EOF
 PIE_TEST_ENGINE_BASE_URL=$BASE_URL
 PIE_TEST_GUI_HOME=$GUI_HOME
-PIE_TEST_CHAT_MODEL=$MODEL
+PIE_TEST_CHAT_MODEL_PIN=$MODEL
 PIE_TEST_REQUEST_LOG=$REQUEST_LOG
 EOF
 

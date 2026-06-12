@@ -86,9 +86,11 @@ struct MissingModelDownloadCTA: View {
         handleID = existing
       } else if isTargetInstalled() {
         // PR#15 F5: a sibling surface already finished + evicted this
-        // download. Reflect "done" and (idempotently — startEngine
-        // swallows .alreadyRunning) ensure the engine is kicked, rather
-        // than re-offering a redundant Download.
+        // download. Reflect "done" and ensure the engine is kicked,
+        // rather than re-offering a redundant Download. Same-profile
+        // idempotency is handled in the helper (`startOrAttach`);
+        // an .alreadyRunning reaching the app is an incompatible-start
+        // conflict and should surface to the caller.
         didComplete = true
         onDownloaded()
       }

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Write a styled `.DS_Store` for the RatioThink drag-install DMG.
+"""Write a styled `.DS_Store` for the Rational drag-install DMG.
 
 Finder AppleScript cannot style a DMG under automation (it times out on every
 Apple event) and is impossible in CI, so we generate the icon-view layout
 directly — the same approach `dmgbuild` uses. Given a *mounted* writable DMG
-volume that already contains `RatioThink.app`, an `Applications` symlink and
+volume that already contains `Rational.app`, an `Applications` symlink and
 `.background/background.png`, this writes a `.DS_Store` at the volume root that:
 
   * shows the window as 128pt icons with no auto-arrangement,
-  * pins RatioThink.app on the LEFT and Applications on the RIGHT so the
+  * pins Rational.app on the LEFT and Applications on the RIGHT so the
     background arrow points app -> Applications, and
   * sets the background picture to the staged `.background/background.png`.
 
@@ -56,7 +56,7 @@ for _src in _SUBMODULE_SRC.values():
 from ds_store import DSStore  # noqa: E402
 from mac_alias import Alias  # noqa: E402
 
-APP_NAME = "RatioThink.app"
+APP_NAME = "Rational.app"
 APPS_NAME = "Applications"
 BACKGROUND_REL = ".background/background.png"
 
@@ -84,7 +84,7 @@ def build(volume: str) -> None:
         sys.exit(f"make-dmg-dsstore.py: {APP_NAME} missing in {volume}")
 
     # mac_alias resolves the on-volume background to a volume-relative classic
-    # alias ("RatioThink:.background:background.png"), so it re-resolves when an
+    # alias ("Rational:.background:background.png"), so it re-resolves when an
     # end user mounts the shipped DMG.
     background_alias = Alias.for_file(bg_path).to_bytes()
 

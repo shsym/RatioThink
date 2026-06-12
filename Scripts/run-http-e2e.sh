@@ -35,6 +35,7 @@ cd "$ROOT"
 . "$ROOT/Scripts/lib/sandbox-diagnostics.sh"
 
 PIE_BIN="Vendor/pie/target/release/pie"
+PIE_STAMP="${PIE_BIN}.vendor-sha"
 WASM="Inferlets/chat-apc/prebuilt/chat-apc.wasm"
 PYDIR="Vendor/pie/client/python"
 TAG="http-e2e"
@@ -46,10 +47,28 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 sandbox_diag_require_uv_cache "$TAG" || exit 2
 
-# Self-bootstrap: build the pie engine binary if missing.
+# Self-bootstrap: build the pie engine binary when missing OR when the
+# existing binary was built from a different Vendor/pie checkout. The WIT host
+# ABI lives in Vendor/pie, so a stale binary can instantiate-fail every request
+# even though chat-apc.wasm + its stamp are current. Record the submodule HEAD
+# next to the binary after each wrapper-owned build and compare it before E2E.
+current_pie_sha="$(git -C Vendor/pie rev-parse HEAD)"
+build_pie=0
 if [ ! -x "$PIE_BIN" ]; then
   echo "[http-e2e] pie engine binary missing — building (make engine-build)…"
+  build_pie=1
+elif [ ! -f "$PIE_STAMP" ]; then
+  echo "[http-e2e] pie engine binary has no Vendor/pie stamp — rebuilding (make engine-build)…"
+  build_pie=1
+elif [ "$(cat "$PIE_STAMP")" != "$current_pie_sha" ]; then
+  echo "[http-e2e] pie engine binary stale for current Vendor/pie checkout — rebuilding (make engine-build)…"
+  echo "[http-e2e]   binary stamp: $(cat "$PIE_STAMP")"
+  echo "[http-e2e]   current head:  $current_pie_sha"
+  build_pie=1
+fi
+if [ "$build_pie" -eq 1 ]; then
   Scripts/run-engine-build.sh
+  printf '%s\n' "$current_pie_sha" > "$PIE_STAMP"
 fi
 
 # Self-bootstrap: build the chat-apc wasm if missing.

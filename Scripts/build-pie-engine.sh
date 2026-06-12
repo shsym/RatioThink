@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the pie engine binary (Vendor/pie -> `pie-server` crate, bin `pie`)
 # for one macOS architecture, codesign it with the same identity used by
-# the host RatioThink.app target, and copy the result into the app bundle's
+# the host Rational.app target, and copy the result into the app bundle's
 # Resources/pie-engine/ directory.
 #
 # Two invocation modes:
@@ -52,6 +52,15 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRCROOT="${SRCROOT:-$REPO_ROOT}"
 # shellcheck source=lib/sandbox-diagnostics.sh
 . "$REPO_ROOT/Scripts/lib/sandbox-diagnostics.sh"
+
+# CI/static verification mode: Xcode still type-checks and packages the app +
+# helper target, but the Rust pie engine build is the slow/runtime long pole.
+# This mode is intentionally opt-in and auditable; release/package targets must
+# leave it unset so the app bundle contains a real signed engine.
+if [[ "${PIE_SKIP_ENGINE_BUILD:-0}" == "1" ]]; then
+  echo "build-pie-engine.sh: PIE_SKIP_ENGINE_BUILD=1; skipping cargo pie engine build for compile-only/static verification"
+  exit 0
+fi
 
 if [[ -z "$ARCH" ]]; then
   # Xcode build-phase mode. $ARCHS is space-separated.

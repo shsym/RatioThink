@@ -23,6 +23,15 @@ public enum MissingModelRecovery {
     /// single-file GGUF download — the UI points the user at the
     /// toolbar / Settings → Models instead of offering a broken action.
     case unavailable
+
+    /// Whether this action is the inline download — i.e. the send-gate sheet
+    /// renders the same Download the banner does. The banner-gate keys on
+    /// this (not bare sheet presentation) so it only defers when the sheet
+    /// actually duplicates the download (review F1).
+    public var isDownload: Bool {
+      if case .download = self { return true }
+      return false
+    }
   }
 
   /// Decide the prompt action. `isInstalled` is the caller's filesystem
@@ -41,16 +50,33 @@ public enum MissingModelRecovery {
     return .unavailable
   }
 
-  /// Download target for the failed(modelMissing) banner, or nil when
-  /// the banner must stay hidden.
+  /// Download target the in-chat `ModelMissingBanner` should show, or nil
+  /// when the banner must stay hidden.
   ///
-  /// Non-nil ONLY when the engine failed *specifically* because the
-  /// model is missing AND the active profile's default resolves to a
-  /// single-file GGUF download. A `.memoryRisk` / `.spawnFailed` failure
-  /// is a different problem (model present but too large, binary broken)
-  /// and must not be papered over with a download prompt.
+  /// Non-nil ONLY when the engine failed *specifically* because the model is
+  /// missing AND the active profile's default resolves to a single-file GGUF
+  /// download. A `.memoryRisk` / `.spawnFailed` failure is a different problem
+  /// (model present but too large, binary broken) and must not be papered over
+  /// with a download prompt.
+  ///
+  /// #446 `sendGatePresented`: the banner and the send-gate sheet
+  /// (`NoModelLoadedPrompt`) can BOTH recover a missing-but-downloadable
+  /// default with an inline Download — two prompts for one recovery. When the
+  /// caller knows the sheet is presented AND is itself showing that download,
+  /// pass `true` so the banner defers (the modal, user-initiated sheet owns
+  /// the recovery); the banner re-takes the surface when the sheet closes.
+  /// The caller must gate on the sheet's REAL download condition, not bare
+  /// presentation — if the sheet shows Open Settings (a non-`.download`
+  /// action, e.g. a present-but-invalid staged model) it does NOT duplicate
+  /// the banner, so the banner must stay (review F1). Defaulting to `false`
+  /// keeps this the single `bannerTarget` entry point: an ungated caller (the
+  /// fault-routing `hasDownloadTarget` check) omits the argument and gets the
+  /// pre-#446 behavior, while the gate is opt-in by name — no arity-only
+  /// overload that a dropped argument could silently rebind to (review F3).
   public static func bannerTarget(engineStatus: EngineStatus,
-                                  profileDefaultModel: String?) -> ModelDownloadTarget? {
+                                  profileDefaultModel: String?,
+                                  sendGatePresented: Bool = false) -> ModelDownloadTarget? {
+    guard !sendGatePresented else { return nil }
     guard case .failed(.modelMissing, _) = engineStatus else { return nil }
     guard let slug = profileDefaultModel else { return nil }
     return CuratedModelCatalog.downloadTarget(forModelSlug: slug)

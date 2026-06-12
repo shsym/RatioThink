@@ -3,9 +3,10 @@ import SwiftUI
 /// The single "Local API" surface (#422).
 ///
 /// The app serves exactly ONE OpenAI-compatible HTTP endpoint: the pie
-/// engine's loopback server, the same one in-app chat uses. This view is a
-/// live, read-mostly mirror of that real endpoint — there is nothing to
-/// "create" or configure per-endpoint (that placeholder CRUD is gone).
+/// engine's loopback server, the same one in-app chat uses. This view mirrors
+/// the real endpoint and exposes the one supported endpoint policy knob:
+/// whether the shared engine should start automatically on app launch. Port,
+/// auth, and CORS remain fixed by the current engine launch contract.
 ///
 /// Everything shown is bound to a real source:
 ///  · status / base URL / port ← `EngineStatusStore` (`EngineStatus.running`)
@@ -23,6 +24,7 @@ struct LocalAPIView: View {
   @EnvironmentObject private var engineStatusStore: EngineStatusStore
   @EnvironmentObject private var profileStore: ProfileStore
   @EnvironmentObject private var engineClientStore: EngineClientStore
+  @EnvironmentObject private var appPreferences: AppPreferences
 
   @State private var memory: EngineMemorySample?
   @State private var servedModel: String?
@@ -36,6 +38,10 @@ struct LocalAPIView: View {
   /// leaves status `.running` (toggle stuck on). Mirrors
   /// `ChatScaffoldView`'s `engineActionError` channel.
   @State private var engineActionError: String?
+  /// #496: a start/stop refused because the background Helper isn't healthy.
+  /// Surfaced as a helper-framed inline notice, never the engine action-error
+  /// row, so a Helper state never reads as an engine fault.
+  @State private var helperBlock: HelperUnavailable?
 
   private var state: LocalAPIState {
     LocalAPIState.make(
@@ -52,9 +58,13 @@ struct LocalAPIView: View {
         if let engineActionError {
           actionErrorRow(engineActionError)
         }
+        if let helperBlock {
+          HelperUnavailableNotice(reason: helperBlock, onDismiss: { self.helperBlock = nil })
+        }
         if state.isServing {
           servingDetails
         }
+        configurationSection
         securitySection
       }
       .padding(20)
@@ -66,7 +76,7 @@ struct LocalAPIView: View {
     // Clear a stale start/stop error once the engine actually reaches
     // `.running` (the action succeeded, possibly via another surface).
     .onChange(of: state.isServing) { _, serving in
-      if serving { engineActionError = nil }
+      if serving { engineActionError = nil; helperBlock = nil }
     }
     .confirmationDialog(
       "Turn off the local API?",
@@ -76,7 +86,7 @@ struct LocalAPIView: View {
       Button("Turn Off", role: .destructive) { stop() }
       Button("Cancel", role: .cancel) {}
     } message: {
-      Text("This stops the RatioThink engine. In-app chat will also stop until you turn it back on.")
+      Text("This stops the Rational engine. In-app chat will also stop until you turn it back on.")
     }
   }
 
@@ -87,7 +97,7 @@ struct LocalAPIView: View {
       VStack(alignment: .leading, spacing: 4) {
         Text("Local API")
           .font(.title2.weight(.semibold))
-        Text("An OpenAI-compatible HTTP endpoint served by the RatioThink engine on this Mac. It’s the same engine that powers in-app chat.")
+        Text("An OpenAI-compatible HTTP endpoint served by the Rational engine on this Mac. It’s the same engine that powers in-app chat.")
           .font(.callout)
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
@@ -249,6 +259,37 @@ struct LocalAPIView: View {
 
   // MARK: - security posture (always visible, read-only)
 
+  private var configurationSection: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      sectionHeader("Configuration")
+      Toggle(isOn: autoStartBinding) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Start Local API when RatioThink opens")
+          Text("Off by default. When enabled, RatioThink starts the shared engine on the active profile after launch.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      .toggleStyle(.switch)
+      .accessibilityIdentifier("LocalAPIAutoStartToggle")
+
+      postureRow(title: "Profile", value: profileStore.activeProfileID ?? "Select a profile in Settings → Profiles.")
+      Text("Port, authentication, and CORS are fixed by the current engine launch contract. Change the startup policy here; use the Local API switch above for immediate on/off.")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+    .accessibilityIdentifier("LocalAPIConfiguration")
+  }
+
+  private var autoStartBinding: Binding<Bool> {
+    Binding(
+      get: { appPreferences.localAPIAutoStartEnabled },
+      set: { appPreferences.setLocalAPIAutoStartEnabled($0) }
+    )
+  }
+
   private var securitySection: some View {
     VStack(alignment: .leading, spacing: 8) {
       sectionHeader("Security")
@@ -323,14 +364,21 @@ struct LocalAPIView: View {
   /// Start the engine on the active profile. A resolver-stage rejection
   /// (`.profileMissing`/`.modelMissing`/…) is re-thrown by
   /// `EngineStatusStore.startEngine` and leaves the polled status `.stopped`,
-  /// so it MUST surface here — the reducer never sees it. (`.replyTimeout` /
-  /// `.alreadyRunning` are swallowed by the store as non-failures.)
+  /// so it MUST surface here — the reducer never sees it. Only
+  /// App-side `.replyTimeout` is swallowed by the store because the
+  /// helper start remains in flight; same-profile idempotency is handled
+  /// inside `HelperExportedAPI` / `PieEngineHost.startOrAttach`, so any
+  /// `.alreadyRunning` that reaches the app is an incompatible-start
+  /// conflict and surfaces to the caller.
   private func start() {
     guard let profileID = profileStore.activeProfileID, !profileID.isEmpty else { return }
     Task { @MainActor in
       engineActionError = nil
+      helperBlock = nil
       do {
         try await engineStatusStore.startEngine(profileID: profileID)
+      } catch let block as HelperUnavailable {
+        helperBlock = block
       } catch {
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "start")
       }
@@ -343,8 +391,11 @@ struct LocalAPIView: View {
   private func stop() {
     Task { @MainActor in
       engineActionError = nil
+      helperBlock = nil
       do {
         try await engineStatusStore.stopEngine()
+      } catch let block as HelperUnavailable {
+        helperBlock = block
       } catch {
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "stop")
       }
