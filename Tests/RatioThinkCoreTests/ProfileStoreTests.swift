@@ -1887,6 +1887,84 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  /// Settings → Profiles write-back: system_prompt plus user-facing sampling
+  /// defaults (temperature/top_p) are editable, while max_tokens stays an
+  /// engine-owned ceiling and is preserved from the existing profile TOML.
+  func test_setEditableDefaults_persists_prompt_temperature_topP_and_preserves_maxTokens() throws {
+    try withTempProfilesDir { dir in
+      let body = """
+      id = "chat"
+      name = "Chat"
+      icon = "bubble.left.and.bubble.right"
+      model = "model.gguf"
+      inferlet = "chat-apc"
+      system_prompt = "Old prompt"
+
+      [sampling]
+      temperature = 0.4
+      top_p = 0.75
+      max_tokens = 1536
+
+      [inferlet_args]
+      mode = "kept"
+      """
+      try body.write(to: dir.appendingPathComponent("chat.toml"),
+                     atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      try store.setEditableDefaults(
+        systemPrompt: "New prompt",
+        temperature: 0.2,
+        topP: 0.95,
+        forProfileID: "chat")
+
+      let profile = try XCTUnwrap(store.entries.first { $0.profile?.id == "chat" }?.profile)
+      XCTAssertEqual(profile.systemPrompt, "New prompt")
+      XCTAssertEqual(profile.sampling.temperature, 0.2, accuracy: 0.0001)
+      XCTAssertEqual(profile.sampling.topP, 0.95, accuracy: 0.0001)
+      XCTAssertEqual(profile.sampling.maxTokens, 1536,
+                     "Settings must not expose or overwrite max_tokens as a normal editable profile knob")
+      XCTAssertEqual(profile.inferletArgs["mode"]?.string, "kept")
+
+      let (reloaded, _) = ProfileStore.scan(directory: dir)
+      let fromDisk = try XCTUnwrap(reloaded.first { $0.profile?.id == "chat" }?.profile)
+      XCTAssertEqual(fromDisk.systemPrompt, "New prompt")
+      XCTAssertEqual(fromDisk.sampling.temperature, 0.2, accuracy: 0.0001)
+      XCTAssertEqual(fromDisk.sampling.topP, 0.95, accuracy: 0.0001)
+      XCTAssertEqual(fromDisk.sampling.maxTokens, 1536)
+    }
+  }
+
+  func test_profileDefaultAccessors_return_prompt_and_sampling_for_chat_initialization() throws {
+    try withTempProfilesDir { dir in
+      let body = """
+      id = "creative"
+      name = "Creative"
+      model = "model.gguf"
+      inferlet = "chat-apc"
+      system_prompt = "Think creatively."
+
+      [sampling]
+      temperature = 1.1
+      top_p = 0.65
+      max_tokens = 777
+      """
+      try body.write(to: dir.appendingPathComponent("creative.toml"),
+                     atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(store.systemPrompt(forProfileID: "creative"), "Think creatively.")
+      XCTAssertEqual(store.sampling(forProfileID: "creative"),
+                     Sampling(temperature: 1.1, topP: 0.65, maxTokens: 777))
+      XCTAssertNil(store.systemPrompt(forProfileID: "missing"))
+      XCTAssertNil(store.sampling(forProfileID: "missing"))
+    }
+  }
+
   func test_setModel_throws_for_unknown_profile() throws {
     try withTempProfilesDir { dir in
       try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")

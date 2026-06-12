@@ -328,8 +328,11 @@ struct ChatScaffoldView: View {
     .onChange(of: viewModel.modelOverride) { _, _ in dismissPromptIfResolved() }
     .onAppear {
       // Seed the toolbar from the persisted profile so the menu
-      // label matches what the chat was created with.
+      // label and transient request defaults match what the chat was
+      // created with. Toolbar edits after this remain per-chat and are
+      // not written back to the profile.
       viewModel.selectedProfileID = chat.profileID
+      applyDefaultsForSelectedProfile()
       // #4: covers the case where the engine status already settled before
       // this view appeared (no .onChange fires) — evaluate the launch ask
       // here too; the once-flag keeps it from double-prompting.
@@ -360,6 +363,7 @@ struct ChatScaffoldView: View {
         // write failure (the marker simply stays on the prior profile), so
         // the `try?` does not silently drop the signal.
         try? profileStore.setActiveProfileID(new)
+        applyDefaultsForSelectedProfile()
       } catch {
         chat.profileID = previous
         // Also revert the toolbar selection so the menu label
@@ -442,7 +446,9 @@ struct ChatScaffoldView: View {
       options: ChatSendRequestOptions(
         modelID: modelID,
         sampling: viewModel.sampling,
-        systemPromptOverride: viewModel.systemPromptOverride,
+        systemPromptOverride: Self.resolvedSystemPrompt(
+          profileDefault: profileStore.systemPrompt(forProfileID: viewModel.selectedProfileID),
+          transientOverride: viewModel.systemPromptOverride),
         // Inject the selected profile's speculative-decoding settings
         // (#426). For a "Fast Think" profile this makes `makeRequest`
         // attach the `speculation` field and force greedy decoding; a
@@ -456,6 +462,34 @@ struct ChatScaffoldView: View {
       // recovery without the user re-clicking Send.
       recoveryGate: engineStatusStore
     )
+  }
+
+  private func applyDefaultsForSelectedProfile() {
+    Self.applyProfileDefaults(
+      to: viewModel,
+      sampling: profileStore.sampling(forProfileID: viewModel.selectedProfileID))
+  }
+
+  /// Copy selected-profile sampling into the transient toolbar model and clear
+  /// any prior per-chat prompt override. The profile prompt itself is resolved
+  /// at send time by `resolvedSystemPrompt`, so a blank toolbar prompt keeps
+  /// meaning "use the profile default" instead of becoming an empty override.
+  static func applyProfileDefaults(to viewModel: ChatTranscriptViewModel,
+                                   sampling: Sampling?) {
+    let defaults = sampling ?? Sampling()
+    viewModel.sampling = ChatSampling(
+      temperature: defaults.temperature,
+      topP: defaults.topP,
+      maxTokens: defaults.maxTokens)
+    viewModel.systemPromptOverride = nil
+  }
+
+  static func resolvedSystemPrompt(profileDefault: String?,
+                                   transientOverride: String?) -> String? {
+    let override = transientOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let override, !override.isEmpty { return override }
+    let profile = profileDefault?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return (profile?.isEmpty == false) ? profile : nil
   }
 
   private func currentModelID() -> String? {

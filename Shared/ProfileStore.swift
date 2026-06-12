@@ -653,6 +653,24 @@ public final class ProfileStore: ObservableObject {
     }
   }
 
+  /// The selected profile's system prompt default. A nil return means the
+  /// profile is missing/unparsable or carries no prompt; chat surfaces treat
+  /// that as "no profile prompt" rather than inventing a fallback.
+  public func systemPrompt(forProfileID id: String) -> String? {
+    stateLock.withLock {
+      _entries.first { $0.profile?.id == id }?.profile?.systemPrompt
+    }
+  }
+
+  /// The selected profile's sampling defaults. Includes `maxTokens` so chat
+  /// request state preserves the engine/config-owned ceiling from the loaded
+  /// profile, but Settings only writes the user-facing temperature/top_p knobs.
+  public func sampling(forProfileID id: String) -> Sampling? {
+    stateLock.withLock {
+      _entries.first { $0.profile?.id == id }?.profile?.sampling
+    }
+  }
+
   /// The speculative-decoding ("Fast Think") settings a profile carries,
   /// or `nil` when the profile has no `[speculation]` section / does not
   /// exist / failed to parse. `ChatScaffoldView.sendAssistantTurn` reads
@@ -663,6 +681,30 @@ public final class ProfileStore: ObservableObject {
     stateLock.withLock {
       _entries.first { $0.profile?.id == id }?.profile?.speculation
     }
+  }
+
+  /// Persist the Settings → Profiles editable defaults: `system_prompt`,
+  /// `sampling.temperature`, and `sampling.top_p`. `sampling.max_tokens`
+  /// is intentionally not an editable profile-control surface; preserve the
+  /// existing value from disk because the effective ceiling is owned by the
+  /// launched engine/config.
+  public func setEditableDefaults(systemPrompt: String?,
+                                  temperature: Double,
+                                  topP: Double,
+                                  forProfileID id: String) throws {
+    let target: (profile: Profile, filename: String) = try stateLock.withLock {
+      guard let entry = _entries.first(where: { $0.profile?.id == id }),
+            let profile = entry.profile else {
+        throw ProfileStoreError.profileNotFound(id: id)
+      }
+      return (profile, entry.url.lastPathComponent)
+    }
+    var updated = target.profile
+    let normalizedPrompt = systemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+    updated.systemPrompt = normalizedPrompt?.isEmpty == true ? nil : normalizedPrompt
+    updated.sampling.temperature = temperature
+    updated.sampling.topP = topP
+    try createProfile(updated, filename: target.filename)
   }
 
   /// Persist a new default `model` onto the profile with `id`, leaving

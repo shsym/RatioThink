@@ -1,18 +1,15 @@
 import SwiftUI
-import TOMLKit
 
-/// Read-only per-profile editor (Phase 3.8). The *Show advanced*
-/// toggle uncovers the inferlet picker + raw `inferlet_args` so users
-/// can inspect what would be sent to the engine; writing is deferred
-/// to a follow-up so this pane can land without touching the
-/// `ProfileStore` FS-watcher path.
+/// Settings editor for one profile. The model picker persists the profile's
+/// default model; system prompt plus user-facing sampling defaults
+/// (temperature/top_p) are editable here. Max tokens remains engine/config
+/// owned and is intentionally not exposed as a normal profile setting.
 struct ProfileEditor: View {
   let entry: ProfileLoadResult
-  /// Invoked after a successful model write so the parent re-scans and
-  /// hands back a refreshed `entry`. .
+  /// Invoked after a successful profile write so the parent re-scans and hands
+  /// back a refreshed `entry`.
   var onModelChanged: () -> Void = {}
   @EnvironmentObject private var profileStore: ProfileStore
-  @State private var showAdvanced: Bool = false
   /// Discovered model options (app-managed + HF cache), each carrying
   /// size + over-limit / unsupported state for the model-size guardrail.
   @State private var modelOptions: [ProfileModelOptions.Option] = []
@@ -20,6 +17,10 @@ struct ProfileEditor: View {
   /// over-limit options. `nil` until the first scan.
   @State private var memoryPolicy: ModelMemoryGuardrail.Policy?
   @State private var modelWriteError: String?
+  @State private var defaultsWriteError: String?
+  @State private var systemPromptDraft = ""
+  @State private var temperatureDraft = Sampling().temperature
+  @State private var topPDraft = Sampling().topP
   /// Set when the model scan throws. Without this the picker silently
   /// rendered empty on a scan failure, so a permission glitch on the
   /// models dir looked like "no models installed". Mirrors
@@ -32,15 +33,8 @@ struct ProfileEditor: View {
         if let profile = entry.profile {
           headerRow(profile: profile)
           coreSection(profile: profile)
-          if !(profile.systemPrompt ?? "").isEmpty {
-            systemPromptSection(profile.systemPrompt!)
-          }
-          samplingSection(profile: profile)
+          editableDefaultsSection(profile: profile)
           warningsSection
-          advancedToggle
-          if showAdvanced {
-            advancedSection(profile: profile)
-          }
         } else if let error = entry.error {
           unparsableSection(error)
         }
@@ -49,7 +43,10 @@ struct ProfileEditor: View {
       .padding(20)
     }
     .accessibilityIdentifier("ProfileEditor")
-    .task { await refreshModelOptions(current: entry.profile?.model ?? "") }
+    .task(id: entry.url) {
+      resetEditableDefaults(from: entry.profile)
+      await refreshModelOptions(current: entry.profile?.model ?? "")
+    }
   }
 
   // MARK: - Sections
@@ -156,31 +153,84 @@ struct ProfileEditor: View {
     return text
   }
 
-  private func systemPromptSection(_ prompt: String) -> some View {
-    VStack(alignment: .leading, spacing: 6) {
-      SettingsSectionHeader(title: "System prompt")
-      Text(prompt)
-        .textSelection(.enabled)
-        .padding(8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+  private func editableDefaultsSection(profile: Profile) -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+      SettingsSectionHeader(title: "Profile defaults")
+      Text("These defaults initialize chats that use this profile. Toolbar edits remain temporary per-chat overrides.")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+
+      VStack(alignment: .leading, spacing: 6) {
+        Text("System prompt")
+          .font(.callout)
+          .foregroundStyle(.secondary)
+        TextEditor(text: $systemPromptDraft)
+          .font(.body)
+          .frame(minHeight: 88)
+          .overlay(
+            RoundedRectangle(cornerRadius: 6)
+              .strokeBorder(Color.secondary.opacity(0.3))
+          )
+          .accessibilityIdentifier("ProfileEditorSystemPromptEditor")
+        Text("Leave blank to omit the profile system prompt.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+
+      VStack(alignment: .leading, spacing: 8) {
+        SettingsSectionHeader(title: "Sampling")
+        profileSlider(
+          "Temperature",
+          value: $temperatureDraft,
+          range: 0...2,
+          format: "%.2f",
+          accessibilityID: "ProfileEditorTemperatureSlider")
+        profileSlider(
+          "Top P",
+          value: $topPDraft,
+          range: 0...1,
+          format: "%.2f",
+          accessibilityID: "ProfileEditorTopPSlider")
+        Text("Max tokens is controlled by the launched engine/config and is not a normal profile setting.")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+
+      if let defaultsWriteError {
+        Text(defaultsWriteError)
+          .font(.callout)
+          .foregroundStyle(.red)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .accessibilityIdentifier("ProfileEditorDefaultsWriteError")
+      }
+
+      HStack {
+        Button("Save defaults") { persistEditableDefaults(profileID: profile.id) }
+          .keyboardShortcut(.defaultAction)
+          .disabled(!defaultsDirty(comparedTo: profile))
+          .accessibilityIdentifier("ProfileEditorSaveDefaultsButton")
+        Button("Revert") { resetEditableDefaults(from: profile) }
+          .disabled(!defaultsDirty(comparedTo: profile))
+        Spacer()
+      }
     }
   }
 
-  private func samplingSection(profile: Profile) -> some View {
-    VStack(alignment: .leading, spacing: 6) {
-      SettingsSectionHeader(title: "Sampling")
-      SettingsLabeledRow(label: "Temperature") {
-        Text(String(format: "%.2f", profile.sampling.temperature))
-          .monospaced()
+  private func profileSlider(_ label: String,
+                             value: Binding<Double>,
+                             range: ClosedRange<Double>,
+                             format: String,
+                             accessibilityID: String) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      HStack {
+        Text(label)
+        Spacer()
+        Text(String(format: format, value.wrappedValue))
+          .foregroundStyle(.secondary)
+          .monospacedDigit()
       }
-      SettingsLabeledRow(label: "Top P") {
-        Text(String(format: "%.2f", profile.sampling.topP))
-          .monospaced()
-      }
-      SettingsLabeledRow(label: "Max tokens") {
-        Text("\(profile.sampling.maxTokens)").monospaced()
-      }
+      Slider(value: value, in: range)
+        .accessibilityIdentifier(accessibilityID)
     }
   }
 
@@ -197,37 +247,6 @@ struct ProfileEditor: View {
           }
         }
       }
-    }
-  }
-
-  private var advancedToggle: some View {
-    Toggle("Show advanced", isOn: $showAdvanced)
-      .toggleStyle(.switch)
-      .accessibilityIdentifier("ProfileEditorShowAdvancedToggle")
-  }
-
-  private func advancedSection(profile: Profile) -> some View {
-    VStack(alignment: .leading, spacing: 6) {
-      SettingsSectionHeader(title: "Inferlet picker")
-      // Phase 3.8: picker shows the current inferlet only — actual
-      // wasm enumeration lives in RatioThinkHelper and is not yet exposed
-      // back to the App for selection. Surfacing the field here
-      // documents the eventual interaction without faking choices
-      // the engine wouldn't accept.
-      SettingsLabeledRow(label: "Inferlet binary") {
-        Text(profile.inferlet).monospaced().textSelection(.enabled)
-      }
-
-      Text("`inferlet_args` (raw)")
-        .font(.callout)
-        .foregroundStyle(.secondary)
-        .padding(.top, 4)
-      Text(rawInferletArgs(profile.inferletArgs))
-        .monospaced()
-        .textSelection(.enabled)
-        .padding(8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
     }
   }
 
@@ -256,6 +275,20 @@ struct ProfileEditor: View {
     }
   }
 
+  private func persistEditableDefaults(profileID: String) {
+    do {
+      try profileStore.setEditableDefaults(
+        systemPrompt: systemPromptDraft,
+        temperature: temperatureDraft,
+        topP: topPDraft,
+        forProfileID: profileID)
+      defaultsWriteError = nil
+      onModelChanged()
+    } catch {
+      defaultsWriteError = "Could not save profile defaults: \(error)"
+    }
+  }
+
   @MainActor
   private func refreshModelOptions(current: String) async {
     let policy = ModelMemoryGuardrail.defaultPolicy
@@ -274,15 +307,20 @@ struct ProfileEditor: View {
 
   // MARK: - helpers
 
-  /// Stable, locale-free dump of `inferlet_args`. Encoding through a
-  /// `TOMLTable` keeps the string identical to what would land on
-  /// disk when write-back ships.
-  private func rawInferletArgs(_ args: [String: TOMLValueConvertible]) -> String {
-    if args.isEmpty { return "(none)" }
-    let table = TOMLTable()
-    for k in args.keys.sorted() {
-      if let v = args[k] { table[k] = v }
-    }
-    return table.convert()
+  private func resetEditableDefaults(from profile: Profile?) {
+    systemPromptDraft = profile?.systemPrompt ?? ""
+    temperatureDraft = profile?.sampling.temperature ?? Sampling().temperature
+    topPDraft = profile?.sampling.topP ?? Sampling().topP
+    defaultsWriteError = nil
+  }
+
+  private func defaultsDirty(comparedTo profile: Profile) -> Bool {
+    normalizedPrompt(systemPromptDraft) != normalizedPrompt(profile.systemPrompt ?? "")
+      || abs(temperatureDraft - profile.sampling.temperature) > 0.0001
+      || abs(topPDraft - profile.sampling.topP) > 0.0001
+  }
+
+  private func normalizedPrompt(_ prompt: String) -> String {
+    prompt.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 }
