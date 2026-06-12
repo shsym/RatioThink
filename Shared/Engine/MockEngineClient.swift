@@ -125,31 +125,6 @@ public final class MockEngineClient: EngineClient, @unchecked Sendable {
     return config.models
   }
 
-  public func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    let steps = config.loadSteps
-    let total = config.totalBytes
-    let interval = config.loadStepInterval
-    let sleeper = sleep
-
-    return AsyncThrowingStream { continuation in
-      let task = Task {
-        do {
-          try await Self.streamLoadProgress(
-            steps: steps,
-            totalBytes: total,
-            interval: interval,
-            sleep: sleeper,
-            yield: { continuation.yield($0) }
-          )
-          continuation.finish()
-        } catch {
-          continuation.finish(throwing: error)
-        }
-      }
-      continuation.onTermination = { _ in task.cancel() }
-    }
-  }
-
   public func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     let simulateLoad = config.simulateChatLoad
     let steps = config.loadSteps
@@ -168,18 +143,7 @@ public final class MockEngineClient: EngineClient, @unchecked Sendable {
               totalBytes: total,
               interval: loadInterval,
               sleep: sleeper,
-              yield: { event in
-                switch event {
-                case .loading(let loaded, let totalBytes, let eta):
-                  continuation.yield(.modelLoading(
-                    loadedBytes: loaded,
-                    totalBytes: totalBytes,
-                    etaSeconds: eta
-                  ))
-                case .ready:
-                  continuation.yield(.modelReady)
-                }
-              }
+              yield: { continuation.yield($0) }
             )
           }
 
@@ -232,20 +196,21 @@ public final class MockEngineClient: EngineClient, @unchecked Sendable {
 
   // MARK: - Helpers
 
-  /// Shared between `loadModel` and the meta-frame prefix of
-  /// `chatCompletion`. Emits `steps` `.loading` frames followed by a
-  /// single `.ready`. `etaSeconds` is reported from the second frame
-  /// onward (the first has no transfer-rate sample yet) so the field's
-  /// `Optional`-ness gets exercised in tests without a separate flag.
+  /// Simulated chat-stream model-loading prefix: `steps` `.modelLoading`
+  /// frames followed by a single `.modelReady`. `etaSeconds` is reported from
+  /// the second frame onward (the first has no transfer-rate sample yet).
+  /// #469: the standalone `loadModel` consumer is gone; only
+  /// `chatCompletion`'s `simulateChatLoad` uses this now, so it yields
+  /// `ChatEvent` directly.
   static func streamLoadProgress(
     steps: Int,
     totalBytes: UInt64,
     interval: Duration,
     sleep: @Sendable (Duration) async throws -> Void,
-    yield: (LoadEvent) -> Void
+    yield: (ChatEvent) -> Void
   ) async throws {
     guard steps > 0 else {
-      yield(.ready)
+      yield(.modelReady)
       return
     }
     let stepBytes = totalBytes / UInt64(steps)
@@ -258,10 +223,10 @@ public final class MockEngineClient: EngineClient, @unchecked Sendable {
       let eta: Double? = (step == 1)
         ? nil
         : intervalSeconds * Double(steps - step)
-      yield(.loading(loadedBytes: loaded, totalBytes: totalBytes, etaSeconds: eta))
+      yield(.modelLoading(loadedBytes: loaded, totalBytes: totalBytes, etaSeconds: eta))
     }
     try Task.checkCancellation()
-    yield(.ready)
+    yield(.modelReady)
   }
 }
 

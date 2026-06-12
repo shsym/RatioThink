@@ -10,7 +10,7 @@ Extends the baseline `e2e_test.py` engine-side coverage with:
      that never corrupt OpenAI chunk parsing, repeated streams that don't
      cross-contaminate, client-disconnect behavior recorded against #200).
   3. Frequency/concurrency (sequential `/healthz` + `/v1/models` storms,
-     repeated `/v1/models/load`, frequent short chats, bounded concurrent
+     frequent short chats, bounded concurrent
      chats, a request storm with cancellation that must not hang or leak).
   4. Agent-client tool-call CONTRACT — the OpenAI client-side execution
      loop proven deterministically against the dummy driver:
@@ -21,6 +21,13 @@ Extends the baseline `e2e_test.py` engine-side coverage with:
      `role:"tool"` follow-up shape is a documented gap (chat-apc returns
      400 `tool_role_unsupported`); the contract uses the server's
      documented user-turn path and pins the 400 as a known limitation.
+  5. Harsh live-surface evaluation (#467) — the malformed/abusive inputs a
+     normal SDK never sends, on the no-auth loopback surface: HTTP method
+     abuse, the closed-CORS security posture (no `Access-Control-*`),
+     JSON type confusion, structural abuse + nested-value recursion DoS,
+     hostile content (NUL/emoji/control/RTL), and removed-endpoint (`/v1/models/load`) 404 abuse.
+     Every case must fail as a 4xx JSON envelope (never a bare 5xx, hang,
+     or crash) and the engine must still serve afterward.
 
 Determinism (no large model required): everything runs against pie's
 **dummy driver**. `tool_choice: "required" | {function}` constrains
@@ -299,10 +306,11 @@ async def section_protocol_stress(base: str, http: httpx.AsyncClient, rep: Repor
     ok = r.status_code == 400 and (r.json().get("error", {}).get("param") == "model")
     rep.ok(ok, f"{P}: blank model -> {r.status_code} {r.text[:120]!r} (want 400 param=model)")
 
-    # unknown model -> 404.
+    # wrong model for the resident engine -> 409 target_mismatch.
     r = await http.post(f"{base}/v1/chat/completions",
                         json={"model": "nope", "messages": [{"role": "user", "content": "hi"}]})
-    rep.ok(r.status_code == 404, f"{P}: unknown model -> {r.status_code} (want 404)")
+    ok = r.status_code == 409 and r.json().get("error", {}).get("code") == "target_mismatch"
+    rep.ok(ok, f"{P}: unknown model -> {r.status_code} {r.text[:120]!r} (want 409 target_mismatch)")
 
     # invalid role "tool" -> 400 tool_role_unsupported.
     r = await http.post(f"{base}/v1/chat/completions", json={
@@ -310,6 +318,27 @@ async def section_protocol_stress(base: str, http: httpx.AsyncClient, rep: Repor
     })
     ok = r.status_code == 400 and r.json().get("error", {}).get("code") == "tool_role_unsupported"
     rep.ok(ok, f"{P}: role=tool -> {r.status_code} {r.text[:120]!r} (want 400 tool_role_unsupported)")
+
+    # unknown role (#468) -> 400 unsupported_role, NOT a silently mis-templated
+    # 200. `developer` is included: OpenAI accepts it but the chat template has
+    # no slot, so chat-apc rejects rather than demote it to `user`.
+    for bad_role in ("banana", "developer"):
+        r = await http.post(f"{base}/v1/chat/completions", json={
+            "model": MODEL, "messages": [{"role": bad_role, "content": "hi"}], "stream": False,
+        })
+        ok = r.status_code == 400 and r.json().get("error", {}).get("code") == "unsupported_role"
+        rep.ok(ok, f"{P}: role={bad_role} -> {r.status_code} {r.text[:120]!r} (want 400 unsupported_role)")
+
+    # #468: the tree-of-thought dispatch path (POST /v1/inferlet) shares
+    # `fill_context`, so the same unknown-role rejection must hold there —
+    # NOT a 500, and not a silently mis-templated tree.
+    for bad_role in ("banana", "developer"):
+        r = await http.post(f"{base}/v1/inferlet", json={
+            "inferlet": "tree-of-thought", "stream": False,
+            "input": {"messages": [{"role": bad_role, "content": "hi"}]},
+        })
+        ok = r.status_code == 400 and r.json().get("error", {}).get("code") == "unsupported_role"
+        rep.ok(ok, f"{P}: tot role={bad_role} -> {r.status_code} {r.text[:120]!r} (want 400 unsupported_role)")
 
     # whitespace-only content -> 400 param messages[i].content.
     r = await http.post(f"{base}/v1/chat/completions", json={
@@ -363,6 +392,117 @@ async def section_protocol_stress(base: str, http: httpx.AsyncClient, rep: Repor
 # ---------------------------------------------------------------------------
 # Scope 2 — SSE / streaming stress
 # ---------------------------------------------------------------------------
+
+async def section_content_parts(base: str, http: httpx.AsyncClient, rep: Report) -> None:
+    """OpenAI multi-part `messages[].content` arrays (PR #115): the array
+    form must behave exactly like its flattened-string equivalent on both
+    the non-stream and stream paths, and malformed parts must 400 at the
+    request boundary."""
+    P = "scope6/content-parts"
+
+    # non-stream: single text part -> 200, completion shape intact.
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [{"role": "user",
+                      "content": [{"type": "text", "text": "hello"}]}],
+    })
+    ok = r.status_code == 200 and r.json().get("object") == "chat.completion"
+    rep.ok(ok, f"{P}: single text part (non-stream) -> {r.status_code} (want 200 chat.completion)")
+
+    # non-stream: multi-part array across roles -> 200 (order/separators are
+    # unit-tested; here we prove the wire accepts the multi-part shape on
+    # every templated role).
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [
+            {"role": "system",
+             "content": [{"type": "text", "text": "be "}, {"type": "text", "text": "brief"}]},
+            {"role": "user",
+             "content": [{"type": "text", "text": "two "}, {"type": "text", "text": "parts"}]},
+        ],
+    })
+    rep.ok(r.status_code == 200, f"{P}: multi-part system+user -> {r.status_code} (want 200)")
+
+    # concatenation is observable on the wire via the blank-content gate:
+    # all-whitespace parts flatten to a blank string -> 400, while the same
+    # array plus one non-blank part -> 200. Both parts must therefore have
+    # contributed to the flattened content.
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [{"role": "user",
+                      "content": [{"type": "text", "text": " "}, {"type": "text", "text": " "}]}],
+    })
+    rep.ok(r.status_code == 400,
+           f"{P}: all-whitespace parts flatten blank -> {r.status_code} (want 400 blank-content gate)")
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [{"role": "user",
+                      "content": [{"type": "text", "text": " "}, {"type": "text", "text": "x"}]}],
+    })
+    rep.ok(r.status_code == 200,
+           f"{P}: same array + one non-blank part -> {r.status_code} (want 200 — proves concatenation)")
+
+    # empty array flattens to "" -> same 400 as content:"".
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [{"role": "user", "content": []}],
+    })
+    rep.ok(r.status_code == 400, f"{P}: empty content array -> {r.status_code} (want 400)")
+
+    # non-text part types are accepted but contribute no text.
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+            {"type": "text", "text": "caption"},
+        ]}],
+    })
+    rep.ok(r.status_code == 200, f"{P}: image_url part + text part -> {r.status_code} (want 200)")
+
+    # image-only array: with no text part the flattened content is "" and
+    # the blank-content gate 400s — black-box proof that non-text parts
+    # really contribute no text (the mixed case above would pass even if
+    # the image part leaked text).
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": False, "max_tokens": 4,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+        ]}],
+    })
+    rep.ok(r.status_code == 400,
+           f"{P}: image_url-only array flattens blank -> {r.status_code} (want 400 — proves no text contributed)")
+
+    # malformed part (non-object element) -> 400, never a silently dropped part.
+    for bad, label in (
+        (["bare string"], "bare-string part"),
+        ([{"type": "text", "text": "ok"}, 7], "mixed valid+scalar part"),
+        ({"type": "text", "text": "x"}, "object (non-array) content"),
+        (42, "numeric content"),
+    ):
+        r = await http.post(f"{base}/v1/chat/completions", json={
+            "model": MODEL, "stream": False, "max_tokens": 4,
+            "messages": [{"role": "user", "content": bad}],
+        })
+        rep.ok(r.status_code == 400, f"{P}: {label} -> {r.status_code} (want 400)")
+
+    # stream path: multi-part array -> 200 + well-formed SSE with a terminal
+    # finish_reason (the branch split is post-parse; this proves it end-to-end).
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": True, "max_tokens": 8,
+        "messages": [{"role": "user",
+                      "content": [{"type": "text", "text": "two "}, {"type": "text", "text": "parts"}]}],
+    })
+    rep.ok(r.headers.get("content-type", "").split(";")[0] == "text/event-stream",
+           f"{P}/stream: content-type {r.headers.get('content-type')!r}")
+    assert_sse_framing(sse_payloads(r.text), rep, f"{P}/stream")
+
+    # stream path: malformed part still 400s (no SSE leak before the gate).
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "stream": True, "max_tokens": 8,
+        "messages": [{"role": "user", "content": ["bare string"]}],
+    })
+    rep.ok(r.status_code == 400, f"{P}/stream: bare-string part -> {r.status_code} (want 400)")
+
 
 def assert_sse_framing(payloads: list[str], rep: Report, ctx: str) -> None:
     """Shared SSE invariants: model_ready first, every non-[DONE] frame is
@@ -507,14 +647,14 @@ async def section_concurrency(base: str, http: httpx.AsyncClient, rep: Report) -
             bad += 1
     rep.ok(bad == 0, f"{P}: 50 sequential /v1/models had {bad} failures")
 
-    # repeated /v1/models/load on the same model — instant registry lookup.
+    # #469: /v1/models/load is REMOVED (pie binds the model at boot). Hammer
+    # the removed route to prove it stays a clean 404, not a 500/hang.
     bad = 0
     for _ in range(10):
         r = await http.post(f"{base}/v1/models/load", json={"model": MODEL})
-        if r.status_code != 200 or 'data: {"event":"model_ready"}' not in r.text \
-                or "data: [DONE]" not in r.text:
+        if r.status_code != 404:
             bad += 1
-    rep.ok(bad == 0, f"{P}: 10 repeated /v1/models/load had {bad} failures")
+    rep.ok(bad == 0, f"{P}: 10 repeated /v1/models/load (removed) had {bad} non-404")
 
     # frequent short sequential chats.
     bad = 0
@@ -762,6 +902,207 @@ async def section_toolcall_stream(rep: Report) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Scope 5 — harsh live-surface evaluation (#467)
+#
+# The local API binds 127.0.0.1 with [auth] enabled=false (see
+# PieControlLauncher.renderConfigBody + LocalAPIStateTests): a no-auth
+# loopback surface whose threat model is a hostile/buggy LOCAL client
+# (a script, or a website driving it via the user's browser). #398 above
+# covers the well-formed-but-extreme inputs; this scope covers the truly
+# malformed/abusive ones a normal SDK never sends, and pins the security
+# posture. Every case must fail CLEANLY — a 4xx JSON envelope, never a
+# bare 5xx, a hang, or a crash — and the engine must still serve afterward.
+# All assertions encode behavior MEASURED against the dummy engine.
+# ---------------------------------------------------------------------------
+
+async def section_harsh_surface(base: str, http: httpx.AsyncClient, rep: Report) -> None:
+    P = "scope5/harsh"
+
+    # ── G1: HTTP method abuse. The router matches on (method, path); any
+    # other pairing falls through to the JSON `endpoint_not_found` 404
+    # (lib.rs `not_found`, F11). A wrong method must NEVER 405-with-no-body,
+    # return bare text/plain, or 5xx — it must be the same structured 404
+    # envelope an OpenAI client can JSON.parse on a non-2xx.
+    method_abuse = [
+        ("GET", "/v1/chat/completions"), ("PUT", "/v1/chat/completions"),
+        ("DELETE", "/v1/chat/completions"), ("OPTIONS", "/v1/chat/completions"),
+        ("POST", "/v1/models"), ("POST", "/healthz"),
+        ("PATCH", "/v1/models/load"), ("GET", "/v1/models/load"),
+    ]
+    for method, route in method_abuse:
+        r = await http.request(method, f"{base}{route}", json={})
+        code = ""
+        try:
+            code = r.json().get("error", {}).get("code", "")
+        except Exception:
+            pass
+        rep.ok(r.status_code == 404 and code == "endpoint_not_found",
+               f"{P}/method: {method} {route} -> {r.status_code} code={code!r} "
+               f"(want 404 endpoint_not_found)")
+    # HEAD has no response body to parse, but must still 404 (not 405/crash).
+    r = await http.head(f"{base}/v1/chat/completions")
+    rep.ok(r.status_code == 404, f"{P}/method: HEAD -> {r.status_code} (want 404)")
+
+    # ── G2: CORS posture (security). The engine ships NO CORS handler
+    # (no OPTIONS route, no Access-Control-* headers — verified absent in
+    # both the inferlet and pie's host HTTP layer). For a no-auth loopback
+    # API that is the SAFE posture: a malicious website's cross-origin JS
+    # is preflight-blocked and cannot read responses. Pin it so a future
+    # change can't silently open the local model to drive-by browser
+    # attacks. An OPTIONS preflight is just an unmatched method -> 404.
+    pre = await http.options(f"{base}/v1/chat/completions", headers={
+        "Origin": "https://evil.example",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type",
+    })
+    rep.ok(pre.status_code == 404 and "access-control-allow-origin" not in pre.headers,
+           f"{P}/cors: preflight -> {pre.status_code} "
+           f"acao={pre.headers.get('access-control-allow-origin')!r} (want 404, no ACAO)")
+    # A real cross-origin request executes (no preflight for a simple GET),
+    # but the response must NOT grant the origin read access via ACAO.
+    for label, coro in [
+        ("chat", http.post(f"{base}/v1/chat/completions",
+                           headers={"Origin": "https://evil.example"},
+                           json={"model": MODEL, "max_tokens": 2,
+                                 "messages": [{"role": "user", "content": "hi"}]})),
+        ("models", http.get(f"{base}/v1/models", headers={"Origin": "https://evil.example"})),
+    ]:
+        r = await coro
+        rep.ok("access-control-allow-origin" not in r.headers,
+               f"{P}/cors: {label} w/ Origin leaked ACAO="
+               f"{r.headers.get('access-control-allow-origin')!r} (want none — closed CORS)")
+
+    # ── G3: type confusion. Every field at the wrong JSON type must be
+    # rejected by deserialization at the 400 boundary (code invalid_request),
+    # NOT coerced and NOT 5xx/panicked.
+    type_confusion = [
+        ("temperature", "hot"), ("top_p", "x"), ("max_tokens", -5),
+        ("max_tokens", "10"), ("max_tokens", 1.5), ("stream", "true"),
+        ("model", 123),
+    ]
+    for field, value in type_confusion:
+        r = await http.post(f"{base}/v1/chat/completions", json={
+            "model": MODEL, "messages": [{"role": "user", "content": "hi"}], field: value,
+        })
+        code = _err_code(r)
+        rep.ok(r.status_code == 400 and code == "invalid_request",
+               f"{P}/type: {field}={value!r} -> {r.status_code} code={code!r} "
+               f"(want 400 invalid_request, never 5xx)")
+    # `messages` as a scalar instead of an array.
+    r = await http.post(f"{base}/v1/chat/completions", json={"model": MODEL, "messages": "hi"})
+    rep.ok(r.status_code == 400, f"{P}/type: messages='hi' -> {r.status_code} (want 400)")
+
+    # ── G4: structural abuse + JSON-recursion DoS. A wrong-shape top-level
+    # body (array/string/null/number) -> 400 at column 1 (struct expected).
+    for label, payload in [("array", [1, 2, 3]), ("string", "x"), ("number", 42)]:
+        r = await http.post(f"{base}/v1/chat/completions", json=payload)
+        rep.ok(r.status_code == 400 and _err_code(r) == "invalid_request",
+               f"{P}/struct: body={label} -> {r.status_code} (want 400 invalid_request)")
+    r = await http.post(f"{base}/v1/chat/completions", content=b"null",
+                        headers={"Content-Type": "application/json"})
+    rep.ok(r.status_code == 400, f"{P}/struct: body=null -> {r.status_code} (want 400)")
+    # The real recursion vector is a deeply-nested value inside a free-form
+    # field (`tool_choice`/`tools[].parameters` are serde_json::Value). A
+    # top-level array is rejected instantly at the struct boundary, but a
+    # nested Value descends — serde_json's recursion limit (128) is the
+    # guard. Depth 2000 must hit it as a 400 "recursion limit exceeded",
+    # NOT a stack-overflow/crash. Closed allow-set so a 5xx fails loud.
+    deep = "[" * 2000 + "]" * 2000
+    body = ('{"model":"%s","messages":[{"role":"user","content":"hi"}],'
+            '"tool_choice":%s}' % (MODEL, deep))
+    r = await http.post(f"{base}/v1/chat/completions", content=body.encode(),
+                        headers={"Content-Type": "application/json"})
+    rep.ok(r.status_code == 400 and _err_code(r) == "invalid_request",
+           f"{P}/deep: nested tool_choice depth=2000 -> {r.status_code} "
+           f"(want 400 recursion-limit, never a 5xx/stack-overflow)")
+
+    # ── G5: hostile content payloads. A NUL byte, astral-plane emoji,
+    # ANSI/control chars, an RTL override, and a long no-space token are
+    # all valid non-empty JSON strings — they must generate cleanly (200),
+    # never wedge the tokenizer/decoder into a 5xx.
+    hostile = [
+        ("nul", "a" + chr(0) + "b"),
+        ("emoji", chr(0x1F525) * 40),
+        ("control", chr(27) + "[31m" + chr(9) + chr(13)),
+        ("rtl", "abc" + chr(0x202E) + "def"),
+        ("long-token", "x" * 1000),
+    ]
+    for label, content in hostile:
+        r = await http.post(f"{base}/v1/chat/completions", json={
+            "model": MODEL, "messages": [{"role": "user", "content": content}],
+            "stream": False, "max_tokens": 2,
+        })
+        rep.ok(r.status_code == 200,
+               f"{P}/content: {label} -> {r.status_code} (want 200; never 5xx on valid text)")
+
+    # ── G6: malformed message objects. A null/missing required field is a
+    # 400 deserialize error.
+    for label, msg in [
+        ("content=null", {"role": "user", "content": None}),
+        ("missing-role", {"content": "hi"}),
+    ]:
+        r = await http.post(f"{base}/v1/chat/completions",
+                            json={"model": MODEL, "messages": [msg]})
+        rep.ok(r.status_code == 400 and _err_code(r) == "invalid_request",
+               f"{P}/msg: {label} -> {r.status_code} (want 400 invalid_request)")
+    r = await http.post(f"{base}/v1/chat/completions",
+                        json={"model": None, "messages": [{"role": "user", "content": "hi"}]})
+    rep.ok(r.status_code == 400, f"{P}/msg: model=null -> {r.status_code} (want 400)")
+    # MEASURED GAP: an unknown role (anything but the explicitly-blocked
+    # "tool") is NOT validated — it deserializes and generates (200). Only
+    # role=="tool" is rejected (tool_role_unsupported). This is a permissive
+    # OpenAI-compat gap, not a crash/security hole; pin that it stays
+    # non-5xx and surface it as a known gap for the follow-up ticket.
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "messages": [{"role": "banana", "content": "hi"}],
+        "stream": False, "max_tokens": 2,
+    })
+    rep.ok(r.status_code < 500,
+           f"{P}/role: unknown role=banana -> {r.status_code} (must not 5xx)")
+    rep.skip(f"{P}/role: unknown roles (other than the blocked \"tool\") are accepted, "
+             f"not 400'd — OpenAI-compat gap, no crash/security impact; follow-up ticket")
+
+    # ── G8: /v1/models/load is REMOVED (#469 — pie binds the served model at
+    # boot; `GET /v1/models` is the served-model source of truth). Every abuse
+    # input that used to probe its validation must now hit the unknown-route
+    # fallthrough: a clean 404 `endpoint_not_found` JSON envelope, never a
+    # 400/413/500/hang.
+    removed_load_bodies = [
+        ('{}', "missing model"),
+        ('{"model":null}', "model=null"),
+        ('xxx', "non-json"),
+        ('{"model":"' + "a" * 5000 + '"}', "oversized"),
+        ('{"model":"  "}', "blank model"),
+    ]
+    for body, label in removed_load_bodies:
+        r = await http.post(f"{base}/v1/models/load", content=body.encode(),
+                            headers={"Content-Type": "application/json"})
+        rep.ok(r.status_code == 404 and _err_code(r) == "endpoint_not_found",
+               f"{P}/load: {label} -> {r.status_code} code={_err_code(r)!r} "
+               f"(want 404 endpoint_not_found — endpoint removed)")
+
+    # ── Survival: after the full malformed-input barrage the engine must
+    # still be healthy and serve a normal request (no wedge / leaked task).
+    r = await http.get(f"{base}/healthz")
+    rep.ok(r.status_code == 200 and r.json() == {"status": "ok"},
+           f"{P}/survival: /healthz after barrage -> {r.status_code}")
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "messages": [{"role": "user", "content": "hi"}],
+        "stream": False, "max_tokens": 2,
+    })
+    rep.ok(r.status_code == 200,
+           f"{P}/survival: normal chat after barrage -> {r.status_code} (engine not wedged)")
+
+
+def _err_code(r: httpx.Response) -> str:
+    """Best-effort `error.code` from a JSON error envelope ('' if absent)."""
+    try:
+        return r.json().get("error", {}).get("code", "")
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -795,6 +1136,8 @@ async def main() -> int:
                 ("protocol-stress", section_protocol_stress),
                 ("sse-stress", section_sse_stress),
                 ("concurrency", section_concurrency),
+                ("harsh-surface", section_harsh_surface),
+                ("content-parts", section_content_parts),
                 ("toolcall-parse", section_toolcall_parse),
             ]:
                 print(f"[stress-e2e] section: {name}", flush=True)

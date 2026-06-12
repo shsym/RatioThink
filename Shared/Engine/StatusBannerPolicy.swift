@@ -118,6 +118,17 @@ public enum StatusBannerReducer {
 
   // MARK: - helper axis
 
+  /// Whether the helper transport axis OWNS the unified banner for this state —
+  /// i.e. `helperBanner` renders (repairing / cooling-down / unreachable),
+  /// outranking the engine axis. The chat body reads this to suppress its
+  /// in-chat ENGINE banners while the Helper is the real fault, so a dead Helper
+  /// is attributed to the Helper (one window banner) and never ALSO re-framed as
+  /// an engine fault in the body (#496). Single source of truth with the banner
+  /// itself, so the two surfaces can never disagree.
+  public static func helperOwnsBanner(_ helper: HelperHealth) -> Bool {
+    helperBanner(helper: helper) != nil
+  }
+
   /// Map the helper transport ladder onto the three tiers:
   ///   · `.healthy`                       → Tier 0 (no banner)
   ///   · `.reconnecting` (transient win)  → Tier 0 (silent; pip stays calm)
@@ -158,6 +169,10 @@ public enum StatusBannerReducer {
       // `.starting` during the first-load window, so it never reaches here.
       return nil
     case let .failed(code, message):
+      // #477: banner copy comes from the shared `EngineProblem` taxonomy —
+      // the status `message` is a raw diagnostic (stderr tails, resolver
+      // traces) and never primary copy.
+      let problem = EngineProblem(statusCode: code, rawMessage: message)
       if code == .engineGone {
         // Engine died after a good launch; the Helper-side relaunch ladder is
         // retrying. Calm "reconnecting" until the recovery count exhausts.
@@ -173,22 +188,29 @@ public enum StatusBannerReducer {
         case .error:
           return UnifiedStatusBanner(
             tier: .error, source: .engine,
-            title: "Engine stopped",
-            message: message.isEmpty
-              ? "The engine isn’t responding. Use Force Restart to restart it."
-              : message,
+            title: problem.title,
+            message: problem.message,
             forceRestart: .engine)
         }
       }
       // Any other explicit failure (spawn / model-missing / memory-risk /
       // kill-rejected) is a real, immediate Tier-2 error — never a transient
       // reconnect. (#2's hold only defers `.spawnFailed`/`.engineGone` during
-      // the first-load window, upstream in the store.)
+      // the first-load window, upstream in the store.) Force Restart is
+      // offered only where the taxonomy says a restart is the fix — a
+      // model-choice fault (missing / too-large / profile) or a refused
+      // kill would not be solved by one.
+      let forceRestart: ForceRestartTarget
+      switch problem.recovery {
+      case .restartEngine: forceRestart = .engine
+      case .restartHelper: forceRestart = .helper
+      default:             forceRestart = .none
+      }
       return UnifiedStatusBanner(
         tier: .error, source: .engine,
-        title: "Engine failed",
-        message: message.isEmpty ? "The engine couldn’t start (\(code.rawValue))." : message,
-        forceRestart: .engine)
+        title: problem.title,
+        message: problem.message,
+        forceRestart: forceRestart)
     }
   }
 

@@ -9,10 +9,9 @@ final class EngineIndicatorStateTests: XCTestCase {
   private func make(
     engine: EngineStatus,
     detail: String = "",
-    load: ModelLoadCenter.State = .idle,
     resident: String? = nil
   ) -> EngineIndicatorState {
-    EngineIndicatorState.make(engine: engine, engineDetail: detail, load: load, residentModelID: resident)
+    EngineIndicatorState.make(engine: engine, engineDetail: detail, residentModelID: resident)
   }
 
   // MARK: - engine lifecycle (no active load)
@@ -30,23 +29,24 @@ final class EngineIndicatorStateTests: XCTestCase {
   }
 
   func test_running_engine_is_running_with_resident_model() {
-    let state = make(engine: .running(port: 51234, profileID: "chat"), resident: "Qwen3-0.6B")
+    let state = make(engine: .running(EngineSessionSnapshot(port: 51234, profileID: "chat")), resident: "Qwen3-0.6B")
     XCTAssertEqual(state, .running(modelID: "Qwen3-0.6B"))
     XCTAssertEqual(state.dot, .running)
     XCTAssertNil(state.bannerError)
   }
 
   func test_running_engine_with_no_resident_is_running_nil() {
-    XCTAssertEqual(make(engine: .running(port: 1, profileID: "chat")), .running(modelID: nil))
+    XCTAssertEqual(make(engine: .running(EngineSessionSnapshot(port: 1, profileID: "chat"))), .running(modelID: nil))
   }
 
   // MARK: - engine failures route to banner errors
 
-  func test_memoryRisk_failure_invites_model_choice() {
+  func test_memoryRisk_failure_carries_model_choice_copy() {
     let state = make(engine: .failed(code: .memoryRisk, message: "resolved size 12 GB exceeds limit"))
     guard case let .error(err) = state else { return XCTFail("expected .error, got \(state)") }
     XCTAssertEqual(err.kind, .memoryRisk)
-    XCTAssertTrue(err.invitesModelChoice)
+    XCTAssertTrue(err.message.contains("Pick a smaller model"),
+                  "the taxonomy copy itself names the model-choice action")
     XCTAssertEqual(state.dot, .error)
     XCTAssertEqual(state.bannerError, err)
   }
@@ -55,68 +55,34 @@ final class EngineIndicatorStateTests: XCTestCase {
     let state = make(engine: .failed(code: .engineGone, message: "process exited 9"))
     guard case let .error(err) = state else { return XCTFail("expected .error") }
     XCTAssertEqual(err.kind, .engineGone)
-    XCTAssertFalse(err.invitesModelChoice)
     XCTAssertEqual(err.title, "Engine stopped unexpectedly")
   }
 
-  func test_modelMissing_failure_invites_model_choice() {
+  func test_modelMissing_failure_carries_model_choice_copy() {
     let state = make(engine: .failed(code: .modelMissing, message: "no such model"))
     guard case let .error(err) = state else { return XCTFail("expected .error") }
     XCTAssertEqual(err.kind, .modelMissing)
-    XCTAssertTrue(err.invitesModelChoice)
+    XCTAssertTrue(err.message.contains("pick another model"),
+                  "the taxonomy copy itself names the model-choice action")
+  }
+
+  func test_modelUnsupported_failure_invites_model_choice() {
+    let state = make(engine: .failed(code: .modelUnsupported, message: "unsupported model architecture"))
+    guard case let .error(err) = state else { return XCTFail("expected .error") }
+    XCTAssertEqual(err.kind, .modelUnsupported)
+    XCTAssertEqual(err.title, "Model unsupported")
+    XCTAssertTrue(err.message.contains("Choose a curated model"),
+                  "taxonomy copy should point to model-choice recovery")
   }
 
   func test_other_failure_is_generic_engineFailed() {
+    // #477: the raw status message is a diagnostic — the banner shows the
+    // taxonomy's curated copy, never the raw text.
     let state = make(engine: .failed(code: .spawnFailed, message: "fork ENOENT"))
     guard case let .error(err) = state else { return XCTFail("expected .error") }
     XCTAssertEqual(err.kind, .engineFailed)
-    XCTAssertEqual(err.message, "fork ENOENT")
-  }
-
-  // MARK: - load is foreground (precedence over engine)
-
-  func test_active_load_outranks_running_engine() {
-    let state = make(
-      engine: .running(port: 51234, profileID: "chat"),
-      load: .loading(modelID: "Llama-3.2-3B", loadedBytes: 50, totalBytes: 200, etaSeconds: nil),
-      resident: "Qwen3-0.6B"
-    )
-    XCTAssertEqual(state, .loading(modelID: "Llama-3.2-3B", fraction: 0.25))
-    XCTAssertEqual(state.dot, .busy)
-  }
-
-  func test_indeterminate_load_has_nil_fraction() {
-    let zeroTotal = make(engine: .running(port: 1, profileID: "chat"),
-                         load: .loading(modelID: "m", loadedBytes: 10, totalBytes: 0, etaSeconds: nil))
-    XCTAssertEqual(zeroTotal, .loading(modelID: "m", fraction: nil))
-    // loaded > total is a protocol bug → indeterminate, never pinned at 100%+.
-    let overflow = make(engine: .running(port: 1, profileID: "chat"),
-                        load: .loading(modelID: "m", loadedBytes: 300, totalBytes: 200, etaSeconds: nil))
-    XCTAssertEqual(overflow, .loading(modelID: "m", fraction: nil))
-  }
-
-  func test_failed_load_outranks_running_engine() {
-    let state = make(
-      engine: .running(port: 51234, profileID: "chat"),
-      load: .failed(modelID: "Llama-3.2-3B", message: "stream reset")
-    )
-    guard case let .error(err) = state else { return XCTFail("expected .error") }
-    XCTAssertEqual(err.kind, .loadFailed)
-    XCTAssertEqual(err.message, "stream reset")
-  }
-
-  func test_engineNotReady_load_reads_as_starting() {
-    let state = make(engine: .stopped,  // engine says stopped, but a deferred load is queued
-                     load: .engineNotReady(modelID: "m", detail: "Engine stopped"))
-    XCTAssertEqual(state, .starting(detail: "Engine stopped"))
-    XCTAssertEqual(state.dot, .busy)
-  }
-
-  func test_ready_and_cancelled_loads_fall_through_to_engine() {
-    XCTAssertEqual(make(engine: .running(port: 1, profileID: "chat"),
-                        load: .ready(modelID: "m"), resident: "m"),
-                   .running(modelID: "m"))
-    XCTAssertEqual(make(engine: .stopped, load: .cancelled(modelID: "m")), .offline)
+    XCTAssertEqual(err.message, "The engine failed to start. Try restarting it.")
+    XCTAssertFalse(err.message.contains("fork ENOENT"))
   }
 
   // MARK: - anti-flap: transient unreachable is amber, never a red error
@@ -137,7 +103,7 @@ final class EngineIndicatorStateTests: XCTestCase {
   /// app-side `.ready`. The fold MUST be `.offline` (engine wins), so no
   /// surface deriving from it can show `Loaded — resident` on a dead engine.
   func test_stopped_engine_with_stale_ready_load_is_offline_not_resident() {
-    let state = make(engine: .stopped, load: .ready(modelID: "org/m"), resident: "org/m")
+    let state = make(engine: .stopped, resident: "org/m")
     XCTAssertEqual(state, .offline)
     XCTAssertEqual(state.dot, .offline)
     if case .running = state { XCTFail("a stopped engine must never fold to .running/resident") }
@@ -157,15 +123,14 @@ final class EngineIndicatorStateTests: XCTestCase {
       .failed(code: .spawnFailed, message: "x"),
     ]
     for engine in nonRunning {
-      let state = make(engine: engine, load: .ready(modelID: resident), resident: resident)
+      let state = make(engine: engine, resident: resident)
       if case .running = state {
-        XCTFail("engine \(engine) with stale .ready folded to .running — resident leaked")
+        XCTFail("engine \(engine) with a stale resident folded to .running — resident leaked")
       }
     }
     // The single legitimate resident cell.
     XCTAssertEqual(
-      make(engine: .running(port: 1, profileID: "chat"),
-           load: .ready(modelID: resident), resident: resident),
+      make(engine: .running(EngineSessionSnapshot(port: 1, profileID: "chat")), resident: resident),
       .running(modelID: resident)
     )
   }

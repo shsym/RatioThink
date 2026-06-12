@@ -66,9 +66,9 @@ public struct LocalAPIState: Equatable {
   ///     would immediately fail `profileMissing`.
   public static func make(status: EngineStatus, hasActiveProfile: Bool) -> LocalAPIState {
     switch status {
-    case .running(let port, _):
+    case .running(let snapshot):
       return LocalAPIState(
-        phase: .serving(port: port),
+        phase: .serving(port: snapshot.port),
         toggleOn: true,
         toggleEnabled: true,
         statusLabel: "Running",
@@ -115,19 +115,11 @@ public struct LocalAPIState: Equatable {
     }
   }
 
-  /// One-line human cause for a `.failed` engine status. Mirrors the
-  /// honest, code-aware framing used by `EngineStatusStore.statusDetail`
-  /// without dragging the store into the pure reducer.
+  /// One-line human cause for a `.failed` engine status, from the shared
+  /// `EngineProblem` taxonomy (#477) — the status `message` is a raw
+  /// diagnostic and never primary copy.
   static func failureReason(code: EngineErrorCode, message: String) -> String {
-    let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-    switch code {
-    case .memoryRisk:
-      return trimmed.isEmpty ? "Model too large for available memory." : trimmed
-    case .engineGone:
-      return trimmed.isEmpty ? "The engine stopped unexpectedly." : trimmed
-    default:
-      return trimmed.isEmpty ? "Engine failed (\(code.rawValue))." : "\(trimmed) (\(code.rawValue))"
-    }
+    EngineProblem(statusCode: code, rawMessage: message).message
   }
 }
 
@@ -148,9 +140,10 @@ public struct LocalAPIRoute: Equatable, Identifiable {
   }
 
   /// The routes `chat-apc` serves that are useful to an OpenAI-compatible
-  /// client. `/v1/inferlet` (raw dispatch) and `DELETE /v1/models/load`
-  /// (no-op) are intentionally omitted — they aren't part of the standard
-  /// client surface a user would call.
+  /// client. `/v1/inferlet` (raw dispatch) is intentionally omitted — it
+  /// isn't part of the standard client surface a user would call. (#469:
+  /// there is no `/v1/models/load` — the served model is fixed at engine boot
+  /// and read from `GET /v1/models`.)
   public static let clientFacing: [LocalAPIRoute] = [
     LocalAPIRoute(method: "POST", path: "/v1/chat/completions", summary: "Chat completions (SSE streaming)"),
     LocalAPIRoute(method: "GET", path: "/v1/models", summary: "List served models"),

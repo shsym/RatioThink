@@ -25,6 +25,10 @@ struct ProfileSwapPopover: View {
   let estimatedEtaSeconds: Double?
   let onConfirm: (_ setAsDefault: Bool) -> Void
   let onCancel: () -> Void
+  /// #459 third outcome (profile-swap path only): switch the profile but
+  /// keep the already-resident model loaded, with no reload. Rendered only
+  /// when `pending.canKeepCurrentModel`.
+  let onKeepCurrent: () -> Void
 
   /// : only meaningful for a runtime model override
   /// (`pending.canSetAsDefault`). Checking it persists the picked model
@@ -52,11 +56,20 @@ struct ProfileSwapPopover: View {
         .accessibilityIdentifier("profileSwap.setAsDefaultToggle")
       }
       HStack {
-        Spacer()
         Button("Cancel", role: .cancel) {
           onCancel()
         }
         .keyboardShortcut(.cancelAction)
+        Spacer()
+        // #459: third outcome on the profile-swap path — switch the profile
+        // but keep the model already loaded (no reload). Not offered on the
+        // model-override path (the user explicitly picked a model to load).
+        if pending.canKeepCurrentModel {
+          Button("Keep Current Model") {
+            onKeepCurrent()
+          }
+          .accessibilityIdentifier("profileSwap.keepCurrent")
+        }
         Button("Switch") {
           onConfirm(setAsDefault)
         }

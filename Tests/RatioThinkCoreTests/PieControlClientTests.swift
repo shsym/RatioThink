@@ -96,4 +96,23 @@ final class PieControlClientTests: XCTestCase {
     XCTAssertEqual(PieControlClient.classifyFrame(data: bytes),
                    .resolved(corrID: 13, response: .init(ok: true, result: "")))
   }
+
+  // MARK: - request framing
+
+  func test_queryRequestFrame_matchesPieModelStatusWireShape() throws {
+    let bytes = PieControlClient.encodeRequestFrame(
+      type: "query",
+      corrID: 42,
+      extra: [
+        ("subject", .string("model_status")),
+        ("record", .string("")),
+      ]
+    )
+
+    let decoded = try MessagePack.decode(bytes)
+    XCTAssertEqual(decoded.field("type")?.asString, "query")
+    XCTAssertEqual(decoded.field("corr_id")?.asUInt, 42)
+    XCTAssertEqual(decoded.field("subject")?.asString, "model_status")
+    XCTAssertEqual(decoded.field("record")?.asString, "")
+  }
 }

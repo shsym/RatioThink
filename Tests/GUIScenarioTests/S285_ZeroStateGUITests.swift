@@ -1,7 +1,7 @@
 import XCTest
 
 /// S285 — UI soundness audit: empty/zero states stay top-aligned and the
-/// col-3 zero-state CTAs are live affordances (not dead buttons).
+/// shipped col-3 zero-state CTA is a live affordance (not a dead button).
 ///
 /// Each test runs against an isolated `PIE_HOME` temp root so the on-disk
 /// `chats.sqlite` starts empty and creating a chat/endpoint here never
@@ -30,7 +30,7 @@ final class S285_ZeroStateGUITests: XCTestCase {
     configureCompletedFirstLaunch(app)
     // Use a real shared /tmp path, NOT NSTemporaryDirectory(): the
     // XCUITest runner is sandboxed, so NSTemporaryDirectory() resolves
-    // to the runner's container tmp, which the non-sandboxed RatioThink.app
+    // to the runner's container tmp, which the non-sandboxed Rational.app
     // cannot write — its on-disk store would silently fall back to
     // in-memory and the "isolated empty store" intent would be a no-op.
     let home = "/tmp/pie-s285-" + UUID().uuidString
@@ -92,16 +92,21 @@ final class S285_ZeroStateGUITests: XCTestCase {
                   "zero-state CTAs must dismiss once a chat is selected")
   }
 
-  /// #422: selecting the "API Endpoints" sidebar section opens the single
-  /// live `LocalAPIView` (there is no per-endpoint creation — the local API
-  /// is the engine's one endpoint). Replaces the old "Add Endpoint" CTA test.
+  /// #422: the old per-endpoint "Add Endpoint" CTA stays absent from the
+  /// col-3 zero-state, while selecting the sidebar's "API Endpoints" section
+  /// opens the single live `LocalAPIView` for Rational's engine endpoint.
   @MainActor
-  func test_api_endpoints_section_opens_local_api_view() async throws {
+  func test_api_endpoints_section_opens_local_api_view_without_add_endpoint_cta() async throws {
     let app = makeApp()
     app.launch()
     defer { app.terminate() }
     XCTAssert(app.wait(for: .runningForeground, timeout: 5))
     app.activate()
+
+    XCTAssertTrue(app.buttons["Start Chat"].waitForExistence(timeout: 5),
+                  "shipped col-3 zero-state Start Chat CTA missing")
+    XCTAssertFalse(app.buttons["Add Endpoint"].exists,
+                   "zero-state must not expose the removed per-endpoint Add Endpoint CTA")
 
     let navRow = app.descendants(matching: .any).matching(identifier: "API Endpoints").firstMatch
     XCTAssertTrue(navRow.waitForExistence(timeout: 5),
@@ -116,5 +121,6 @@ final class S285_ZeroStateGUITests: XCTestCase {
     XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "LocalAPISecurity")
                     .firstMatch.waitForExistence(timeout: 5),
                   "LocalAPIView must always show the read-only security posture")
+
   }
 }

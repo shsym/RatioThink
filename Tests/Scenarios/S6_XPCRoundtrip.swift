@@ -17,7 +17,7 @@ public enum S6_XPCRoundtrip {
     }
 
     try await r.step("EngineStatus.running carries port + profileID") {
-      let original = EngineStatus.running(port: 51234, profileID: "chat")
+      let original = EngineStatus.running(EngineSessionSnapshot(port: 51234, profileID: "chat"))
       let out = try await r.xpcRoundTripEngineStatus(original)
       try r.require(out == original, "got \(out)")
     }
@@ -36,13 +36,6 @@ public enum S6_XPCRoundtrip {
                     "round-trip mutated handle: \(original) → \(out)")
     }
 
-    try await r.step("LoadHandle survives round-trip with stable UUID") {
-      let original = LoadHandle(modelID: "bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M.gguf")
-      let out = try await r.xpcRoundTripLoadHandle(original)
-      try r.require(out == original,
-                    "round-trip mutated handle: \(original) → \(out)")
-    }
-
     try await r.step("EngineError round-trips for every code") {
       for code in [EngineErrorCode.spawnFailed,
                    .handshakeTimeout, .modelMissing, .profileMissing,
@@ -56,18 +49,21 @@ public enum S6_XPCRoundtrip {
       }
     }
 
-    try await r.step("startEngine success reply round-trips as Result.success(port)") {
-      let result: Result<EnginePort, EngineError> = .success(7777)
+    try await r.step("startEngine success reply round-trips as Result.success(snapshot)") {
+      let snapshot = EngineSessionSnapshot(
+        generation: 1, port: 7777, profileID: "chat",
+        servedModelID: "org/repo/m.gguf", maxOutputTokens: 4096)
+      let result: Result<EngineSessionSnapshot, EngineError> = .success(snapshot)
       let out = try await r.xpcStartEngineReplyRoundTrip(result)
       switch out {
-      case .success(let port): try r.require(port == 7777, "wrong port: \(port)")
+      case .success(let s):    try r.require(s == snapshot, "snapshot mutated: \(s)")
       case .failure(let e):    try r.require(false, "expected .success, got .failure(\(e))")
       }
     }
 
     try await r.step("startEngine failure reply round-trips as Result.failure(error)") {
       let err = EngineError(code: .portUnavailable, message: "EADDRINUSE")
-      let result: Result<EnginePort, EngineError> = .failure(err)
+      let result: Result<EngineSessionSnapshot, EngineError> = .failure(err)
       let out = try await r.xpcStartEngineReplyRoundTrip(result)
       switch out {
       case .success(let p): try r.require(false, "expected .failure, got .success(\(p))")

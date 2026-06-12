@@ -1,4 +1,4 @@
-# RatioThink — E2E ↔ production parity matrix
+# Rational — E2E ↔ production parity matrix
 
 How each test/script tier maps to the **real packaged-binary chat path**, and
 every intentional bypass it takes. Companion to [`TEST.md`](TEST.md) (which is
@@ -12,7 +12,7 @@ is only as honest as the boundary it actually crosses.
 
 ## The production boundary (what "real" means)
 
-A normally-launched, signed `/Applications/RatioThink.app` does **all** of:
+A normally-launched, signed `/Applications/Rational.app` does **all** of:
 
 1. **Launch topology** — App registers an `SMAppService.agent` so **launchd**
    owns the `com.ratiothink.helper` MachService; App↔Helper talk over that
@@ -26,7 +26,7 @@ A normally-launched, signed `/Applications/RatioThink.app` does **all** of:
    the app-staged models root then the HF/pie cache; rejects symlinks /
    directories / oversized / incomplete snapshots; served model id == profile
    slug.
-5. **Filesystem** — `/Applications/RatioThink.app` bundle resources (embedded
+5. **Filesystem** — `/Applications/Rational.app` bundle resources (embedded
    Helper, `pie-engine/pie`, `chat-apc` wasm + manifest, staged LaunchAgent
    plist), `PIE_HOME = ~/Library/Application Support/RatioThink`.
 6. **UI observability** — missing model / resolver failure / engine-start
@@ -83,7 +83,7 @@ is **operator-only** via `install-app.sh`. Every automated "real model" tier is
 
 | Knob | Bypasses | Gated so production is safe? |
 |---|---|---|
-| `PIE_TEST_ENGINE_BASE_URL` | Helper XPC + `EngineStatusStore` + `LaunchSpecResolver` + `PieControlLauncher` + `pie serve` (points client at a URL) | **Fully gated** — both consumers route through the shared `HelperConfig.isTestOverrideAllowed` (`PIE_TEST_MODE=1` or `#if DEBUG` only). `RatioThinkApp.isEngineBaseURLOverrideAllowed`: a Release build **ignores the redirect and logs**, so a shipped app can't be pointed at a foreign URL and a "real binary" scenario can't silently run on a fake URL. `HelperRegistrationReconciler.isTestLaunch`: the same marker no longer counts in Release, so a Release launch with the var set **still runs the launchd self-heal reconcile** instead of skipping it. |
+| `PIE_TEST_ENGINE_BASE_URL` | the App-side redirect swaps the chat client's base URL *ahead of* the launch chain (Helper XPC → `EngineStatusStore` → `LaunchSpecResolver` → `PieControlLauncher` → `pie serve`), so none of that chain runs — the var is read only by the redirect, not inside each listed component | **Fully gated** — both consumers route through the shared `HelperConfig.isTestOverrideAllowed` (`PIE_TEST_MODE=1` or `#if DEBUG` only). `RatioThinkApp.isEngineBaseURLOverrideAllowed`: a Release build **ignores the redirect and logs**, so a shipped app can't be pointed at a foreign URL and a "real binary" scenario can't silently run on a fake URL. `HelperRegistrationReconciler.isTestLaunch`: the same marker no longer counts in Release, so a Release launch with the var set **still runs the launchd self-heal reconcile** instead of skipping it. |
 | `PIE_ALLOW_UNSIGNED_CALLERS` | Helper XPC caller Team-ID identity check (publishes an anonymous listener) | **Yes** — `HelperXPCListener.isAnonymousModeAllowed`: `PIE_TEST_MODE` or `#if DEBUG` only; Release returns `false` + `preconditionFailure` at the call site |
 | `PIE_TEST_MODE` | Helper system side effects (NSStatusBar/NSAlert/SMAppService/IOPM) | **Yes** — `HelperConfig.assertSystemSideEffectAllowed` `fatalError`s if set in a real side-effect path; override seam cannot suppress it |
 | `PIE_TEST_SKIP_HELPER_RECONCILE` | launch-time SMAppService self-heal reconcile | test-launch only — `HelperRegistrationReconciler.isTestLaunch` skips the real registrar |
