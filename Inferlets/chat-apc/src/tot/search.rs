@@ -88,18 +88,18 @@
 //! `cargo test --lib`.
 
 use futures::future::join_all;
+use inferlet::Context;
 use inferlet::model::Model;
 use inferlet::sample::Sampler;
 use inferlet::{chat, reasoning};
-use inferlet::Context;
 
 use crate::sse::Emitter;
 
 use super::schema::TotParams;
 use super::stream;
 use super::tree::{
-    assemble, best_leaf, error_leaf, new_node_id, parse_score, select_beam_diverse, Candidate,
-    Node, NodeStatus,
+    Candidate, Node, NodeStatus, assemble, best_leaf, error_leaf, new_node_id, parse_score,
+    select_beam_diverse,
 };
 
 /// Per-branch directive appended to each forked child before it generates
@@ -180,6 +180,15 @@ const SYNTHESIS_TOP_P: f32 = 0.9;
 /// needs to absorb a suppressed empty `<think></think>` before the answer.
 const SYNTHESIS_REASONING_TOKENS: usize = 32;
 
+/// Reasoning budget for the bounded branch retry after a thinking attempt
+/// starves before answer content. The retry appends `/no_think`, so this is
+/// not a second full-thinking budget; it only allows a template that emits an
+/// empty `<think></think>` prelude to close before the answer. If a model
+/// ignores `/no_think` and keeps thinking, the retry is intentionally cut off
+/// quickly and the node remains `Incomplete` rather than consuming another
+/// production-sized reasoning budget.
+const NO_THINK_RETRY_REASONING_TOKENS: usize = 32;
+
 /// Append the `/no_think` directive when reasoning is disabled for this
 /// search (`thinking:false`). On a Qwen3-style model this suppresses the
 /// `<think>` block; on a non-reasoning model it is an inert token.
@@ -189,6 +198,47 @@ fn with_thinking(base: &str, thinking: bool) -> String {
     } else {
         format!("{base} /no_think")
     }
+}
+
+/// Retry only the specific starvation mode #544 cares about: a thinking
+/// branch produced reasoning but no answer. Normal answered branches keep
+/// their useful reasoning; explicit `thinking:false` requests already use the
+/// safe no-think policy; infrastructure aborts stay errors rather than being
+/// disguised by a retry.
+fn should_retry_reasoning_starved(thinking: bool, demux: &Demux) -> bool {
+    thinking && matches!(demux.kind, DemuxKind::Incomplete)
+}
+
+/// Fold a bounded `/no_think` retry back into the node result. If the retry
+/// answers, the node becomes `Ok` with the retry answer while preserving the
+/// useful reasoning trace from the first attempt. If the retry also starves
+/// (or aborts), its terminal kind stands, so the node remains non-selectable.
+fn merge_no_think_retry(first: Demux, retry: Demux) -> Demux {
+    let mut reasoning = first.reasoning;
+    let retry_reasoning = retry.reasoning.trim();
+    if !retry_reasoning.is_empty() {
+        if !reasoning.trim().is_empty() {
+            reasoning.push_str("\n\nRetry reasoning:\n");
+        }
+        reasoning.push_str(retry_reasoning);
+    }
+    Demux {
+        reasoning,
+        answer: retry.answer,
+        kind: retry.kind,
+    }
+}
+
+/// Stricter branch directive for the bounded no-think retry. It keeps the
+/// same sibling path/focus as the original directive but adds explicit
+/// recovery wording so a model that spent the first attempt inside `<think>`
+/// gets a fresh, answer-first instruction.
+fn retry_branch_directive(level: usize, branch_index: usize, breadth: usize) -> String {
+    format!(
+        "The previous attempt spent its budget in hidden reasoning without producing an answer. \
+         Retry now with no hidden reasoning: produce the answer directly and concisely.\n\n{}",
+        branch_directive(level, branch_index, breadth, false)
+    )
 }
 
 /// Build the synthesis user-turn (#523 Part A): the instruction appended to
@@ -335,7 +385,9 @@ async fn generate_demuxed(
                 // node's `node_delta` or, for synthesis, `final_delta` (#523).
                 if let Some(em) = emitter.as_deref_mut() {
                     let _ = match sink {
-                        DeltaSink::Node(id) => stream::emit_node_delta(em, id, stream::DELTA_ANSWER, &s).await,
+                        DeltaSink::Node(id) => {
+                            stream::emit_node_delta(em, id, stream::DELTA_ANSWER, &s).await
+                        }
                         DeltaSink::Final => stream::emit_final_delta(em, &s).await,
                     };
                 }
@@ -343,7 +395,7 @@ async fn generate_demuxed(
             Ok(chat::Event::Delta(_)) | Ok(chat::Event::Idle) => {}
             Ok(chat::Event::Done(_)) => break DemuxKind::Answered,
             Ok(chat::Event::Interrupt(_)) => {
-                break DemuxKind::Aborted("chat template interrupt".to_string())
+                break DemuxKind::Aborted("chat template interrupt".to_string());
             }
             Err(e) => break DemuxKind::Aborted(format!("chat decode failed: {e}")),
         }
@@ -531,9 +583,12 @@ pub async fn run(
                         metas.push((new_node_id(), f.node_id.clone(), b));
                         ctxs.push(child);
                     }
-                    Err(e) => {
-                        flat.push(error_leaf(&f.node_id, level, b, format!("fork failed: {e}")))
-                    }
+                    Err(e) => flat.push(error_leaf(
+                        &f.node_id,
+                        level,
+                        b,
+                        format!("fork failed: {e}"),
+                    )),
                 }
             }
         }
@@ -804,14 +859,15 @@ async fn resolve_level(
         // (#458): the short greedy scoring generations decode in flight at
         // once so the engine coalesces them, instead of one score forward
         // pass at a time. `Incomplete`/`Error` nodes have no answer to rate.
-        let scores: Vec<Option<ScoreOutcome>> = join_all(gens.iter().map(|(ctx, demux)| async move {
-            if matches!(demux.kind, DemuxKind::Answered) {
-                Some(score_node(ctx, model).await)
-            } else {
-                None
-            }
-        }))
-        .await;
+        let scores: Vec<Option<ScoreOutcome>> =
+            join_all(gens.iter().map(|(ctx, demux)| async move {
+                if matches!(demux.kind, DemuxKind::Answered) {
+                    Some(score_node(ctx, model).await)
+                } else {
+                    None
+                }
+            }))
+            .await;
 
         gens.into_iter()
             .zip(scores)
@@ -835,9 +891,7 @@ async fn resolve_level(
                 if let Some(em) = emitter.as_deref_mut() {
                     let _ = stream::emit_node_start(em, &m.0, &m.1, level, m.2).await;
                 }
-                out.push(
-                    expand(c, model, params, emitter.as_deref_mut(), &m.0, level, m.2).await,
-                );
+                out.push(expand(c, model, params, emitter.as_deref_mut(), &m.0, level, m.2).await);
             }
             out
         }
@@ -855,17 +909,28 @@ async fn generate_branch(
     mut ctx: Context,
     model: &Model,
     params: &TotParams,
-    emitter: Option<&mut Emitter>,
+    mut emitter: Option<&mut Emitter>,
     node_id: &str,
     level: usize,
     branch_index: usize,
 ) -> (Context, Demux) {
+    let retry_base = if params.thinking {
+        ctx.fork().ok()
+    } else {
+        None
+    };
+
     // Append this branch's per-branch directive (#523), then open the
     // assistant turn. The forked context shares a fully-flushed, cue-free
     // prefix; the directive steers this sibling toward a distinct strategy
     // (its text also makes the first forward pass carry real new tokens
     // rather than spin).
-    ctx.user(&branch_directive(level, branch_index, params.breadth, params.thinking));
+    ctx.user(&branch_directive(
+        level,
+        branch_index,
+        params.breadth,
+        params.thinking,
+    ));
     ctx.cue();
     let stops = chat::stop_tokens(model);
     let demux = generate_demuxed(
@@ -878,10 +943,33 @@ async fn generate_branch(
         params.max_reasoning_tokens,
         params.max_tokens_per_node,
         &stops,
-        emitter,
+        emitter.as_deref_mut(),
         DeltaSink::Node(node_id),
     )
     .await;
+
+    if should_retry_reasoning_starved(params.thinking, &demux) {
+        if let Some(mut retry_ctx) = retry_base {
+            retry_ctx.user(&retry_branch_directive(level, branch_index, params.breadth));
+            retry_ctx.cue();
+            let retry = generate_demuxed(
+                &mut retry_ctx,
+                model,
+                Sampler::TopP {
+                    temperature: params.temperature,
+                    p: params.top_p,
+                },
+                NO_THINK_RETRY_REASONING_TOKENS,
+                params.max_tokens_per_node,
+                &stops,
+                emitter.as_deref_mut(),
+                DeltaSink::Node(node_id),
+            )
+            .await;
+            return (retry_ctx, merge_no_think_retry(demux, retry));
+        }
+    }
+
     (ctx, demux)
 }
 
@@ -977,7 +1065,10 @@ async fn score_node(ctx: &Context, model: &Model) -> ScoreOutcome {
     sctx.cue();
     let stops = chat::stop_tokens(model);
     let text = match sctx
-        .generate(Sampler::TopP { temperature: 0.0, p: 1.0 }) // greedy
+        .generate(Sampler::TopP {
+            temperature: 0.0,
+            p: 1.0,
+        }) // greedy
         .max_tokens(SCORE_MAX_TOKENS)
         .stop(&stops)
         .collect_text()
@@ -1011,7 +1102,10 @@ async fn synthesize(
     answer_budget: usize,
     emitter: Option<&mut Emitter>,
 ) -> Result<String, String> {
-    let directive = with_thinking(&build_synthesis_directive(best_content, best_reasoning), false);
+    let directive = with_thinking(
+        &build_synthesis_directive(best_content, best_reasoning),
+        false,
+    );
     base.user(&directive);
     base.cue();
     let stops = chat::stop_tokens(model);
@@ -1182,7 +1276,8 @@ mod tests {
 
     #[test]
     fn synthesis_directive_includes_reasoning_when_present() {
-        let d = build_synthesis_directive("Answer X.", "First consider the budget, then the venue.");
+        let d =
+            build_synthesis_directive("Answer X.", "First consider the budget, then the venue.");
         assert!(d.contains("The reasoning behind it:"));
         assert!(d.contains("First consider the budget, then the venue."));
     }
@@ -1200,9 +1295,18 @@ mod tests {
     fn synthesis_temperature_is_low_and_distinct_from_generation_default() {
         // Synthesis stays coherent (low) regardless of how high candidate
         // generation runs; the scorer is greedy (0.0) — see `score_node`.
-        let (synth, gen_default) = (SYNTHESIS_TEMPERATURE, super::super::schema::DEFAULT_TEMPERATURE);
-        assert!(synth > 0.0, "synthesis temperature must be a real low value");
-        assert!(synth < gen_default, "synthesis must stay below the generation default");
+        let (synth, gen_default) = (
+            SYNTHESIS_TEMPERATURE,
+            super::super::schema::DEFAULT_TEMPERATURE,
+        );
+        assert!(
+            synth > 0.0,
+            "synthesis temperature must be a real low value"
+        );
+        assert!(
+            synth < gen_default,
+            "synthesis must stay below the generation default"
+        );
     }
 
     // ── ScoreOutcome (F4): the three classes the old Option<u8> merged ──
@@ -1232,7 +1336,10 @@ mod tests {
 
     #[test]
     fn classify_answered_scored_is_ok_with_score() {
-        let o = classify(demux("r", "a", DemuxKind::Answered), Some(ScoreOutcome::Scored(7)));
+        let o = classify(
+            demux("r", "a", DemuxKind::Answered),
+            Some(ScoreOutcome::Scored(7)),
+        );
         assert_eq!(o.status, NodeStatus::Ok);
         assert_eq!(o.content, "a");
         assert_eq!(o.reasoning, "r");
@@ -1245,7 +1352,10 @@ mod tests {
     fn classify_answered_unparseable_is_ok_null_score_no_error() {
         // Benign unparseable score (reasoning model emits no in-range int):
         // ok + null score, NO score_error — distinct from an infra failure.
-        let o = classify(demux("", "a", DemuxKind::Answered), Some(ScoreOutcome::Unparseable));
+        let o = classify(
+            demux("", "a", DemuxKind::Answered),
+            Some(ScoreOutcome::Unparseable),
+        );
         assert_eq!(o.status, NodeStatus::Ok);
         assert_eq!(o.score, None);
         assert_eq!(o.score_error, None);
@@ -1289,6 +1399,68 @@ mod tests {
         assert_eq!(o.content, "");
         assert_eq!(o.reasoning, "r");
         assert_eq!(o.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn retry_policy_only_retries_thinking_starvation() {
+        assert!(should_retry_reasoning_starved(
+            true,
+            &demux("long hidden reasoning", "", DemuxKind::Incomplete)
+        ));
+        assert!(!should_retry_reasoning_starved(
+            false,
+            &demux("long hidden reasoning", "", DemuxKind::Incomplete)
+        ));
+        assert!(!should_retry_reasoning_starved(
+            true,
+            &demux("useful reasoning", "visible answer", DemuxKind::Answered)
+        ));
+        assert!(!should_retry_reasoning_starved(
+            true,
+            &demux(
+                "partial",
+                "",
+                DemuxKind::Aborted("forward failed".to_string())
+            )
+        ));
+    }
+
+    #[test]
+    fn no_think_retry_can_recover_reasoning_starved_branch() {
+        let recovered = merge_no_think_retry(
+            demux(
+                "first attempt kept thinking until the budget",
+                "",
+                DemuxKind::Incomplete,
+            ),
+            demux("", "42", DemuxKind::Answered),
+        );
+
+        assert!(matches!(recovered.kind, DemuxKind::Answered));
+        assert_eq!(recovered.answer, "42");
+        // Preserve the useful first-pass thought trace even though the
+        // survivor context/answer came from the bounded no-think retry.
+        assert_eq!(
+            recovered.reasoning,
+            "first attempt kept thinking until the budget"
+        );
+    }
+
+    #[test]
+    fn no_think_retry_does_not_turn_second_starvation_into_ok() {
+        let still_starved = merge_no_think_retry(
+            demux("first long thought", "", DemuxKind::Incomplete),
+            demux("retry also ignored /no_think", "", DemuxKind::Incomplete),
+        );
+
+        assert!(matches!(still_starved.kind, DemuxKind::Incomplete));
+        assert!(still_starved.answer.is_empty());
+        assert!(still_starved.reasoning.contains("first long thought"));
+        assert!(
+            still_starved
+                .reasoning
+                .contains("retry also ignored /no_think")
+        );
     }
 
     // ── materialize_level (F4 + F6) ──
@@ -1567,7 +1739,10 @@ mod tests {
         assert!(!out.synthesized);
 
         reconcile_synthesis(&mut out, Some("synthesized-final-answer".to_string()));
-        assert_eq!(out.final_answer.as_deref(), Some("synthesized-final-answer"));
+        assert_eq!(
+            out.final_answer.as_deref(),
+            Some("synthesized-final-answer")
+        );
         assert!(out.synthesized);
     }
 
