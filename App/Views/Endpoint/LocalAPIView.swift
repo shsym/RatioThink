@@ -30,6 +30,7 @@ struct LocalAPIView: View {
   @State private var health: EngineHealth.Status?
   @State private var confirmStop = false
   @State private var selectedProfileID: String?
+  @State private var profileRestartInFlight = false
   /// Last engine start/stop failure, surfaced near the status card. The
   /// engine's poll channel does NOT cover resolver-stage start rejections
   /// (`.profileMissing`/`.invalidInput`/`.spawnFailed`/`.modelMissing`):
@@ -48,6 +49,9 @@ struct LocalAPIView: View {
 
   private var bindMode: EngineHTTPBindMode {
     state.isServing ? engineStatusStore.runtimeDaemonBindMode : appPreferences.localAPIBindMode
+  }
+  private var profileSelectionEnabled: Bool {
+    state.profileSelectionEnabled && !profileRestartInFlight
   }
   private var posture: EngineHTTPPosture { EngineHTTPPosture.make(bindMode: bindMode) }
 
@@ -261,7 +265,7 @@ struct LocalAPIView: View {
           }
         }
         .pickerStyle(.segmented)
-        .disabled(!state.profileSelectionEnabled)
+        .disabled(!profileSelectionEnabled)
         .accessibilityIdentifier("LocalAPIProfileTabs")
 
         if let selected = selectedProfileOption {
@@ -348,6 +352,7 @@ struct LocalAPIView: View {
       sectionHeader("Security")
       Toggle("Allow access from other devices", isOn: externalAccessBinding)
         .toggleStyle(.switch)
+        .disabled(!state.externalAccessToggleEnabled)
         .accessibilityIdentifier("LocalAPIExternalAccessToggle")
       if let warningTitle = posture.warningTitle,
          let warningDetail = posture.warningDetail {
@@ -475,12 +480,17 @@ struct LocalAPIView: View {
   }
 
   private func selectProfile(_ profileID: String) {
-    guard !profileID.isEmpty else { return }
-    guard state.profileSelectionEnabled else { return }
+    guard LocalAPIProfileSwitchGate.acceptSelection(
+      selectedProfileID: profileID,
+      runtimeProfileID: runtimeProfileID,
+      state: state,
+      restartInFlight: &profileRestartInFlight
+    ) else { return }
     selectedProfileID = profileID
     do {
       try profileStore.setActiveProfileID(profileID)
     } catch {
+      profileRestartInFlight = false
       engineActionError = "Couldn't select profile: \(error)"
       return
     }
@@ -495,7 +505,7 @@ struct LocalAPIView: View {
       do {
         try await LocalAPIBindModeChange.apply(
           enabled: enabled,
-          currentlyServing: state.isServing,
+          phase: state.phase,
           profileID: profileID,
           setPreference: { appPreferences.setLocalAPIExternalAccessEnabled($0) },
           stopEngine: { try await engineStatusStore.stopEngine() },
@@ -513,9 +523,14 @@ struct LocalAPIView: View {
   private func restartEngine(profileID: String) {
     Task { @MainActor in
       engineActionError = nil
+      defer { profileRestartInFlight = false }
       do {
         try await engineStatusStore.stopEngine()
-        try await engineStatusStore.startEngine(profileID: profileID, daemonBindHost: bindMode)
+        try await engineStatusStore.startEngine(
+          profileID: profileID,
+          daemonBindHost: bindMode,
+          allowAlreadyRunning: false
+        )
       } catch {
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "switch")
       }

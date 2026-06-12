@@ -237,6 +237,32 @@ final class LaunchSpecResolverTests: XCTestCase {
     }
   }
 
+  func test_resolveLauncherSpec_applies_external_bind_mode_for_helper_resume() throws {
+    let store = try makeStoreWithChatProfile()
+    defer { store.stop() }
+    let binary = tempDir.appendingPathComponent("pie-fake-external-bind", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models-external-bind", isDirectory: true)
+    try stageModel(named: "llama-3.1-8b-instruct", in: modelsRoot)
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-external-bind") },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      daemonBindMode: { .external }
+    )
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(profileID: "chat") else {
+      return XCTFail("expected helper resolver to produce a launch spec")
+    }
+    XCTAssertEqual(spec.daemonBindHost, .external,
+                   "helper-owned Resume/auto-relaunch starts must inherit the persisted Local API bind mode before engineHost.start(spec)")
+  }
+
   /// Review v1 F1: first-run seeded profiles still use the public
   /// profile schema's bare inferlet name (`chat-apc`). The launcher
   /// resolver must qualify that selector from the installed manifest

@@ -26,6 +26,8 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertNil(s.port)
     XCTAssertTrue(s.toggleOn, "show 'on' while coming up so the control doesn't flicker")
     XCTAssertFalse(s.toggleEnabled, "no flipping mid-transition")
+    XCTAssertFalse(s.externalAccessToggleEnabled,
+                   "security posture changes must not persist while an external-bound daemon may still be starting")
     XCTAssertFalse(s.profileSelectionEnabled,
                    "profile picker must be disabled during in-flight restarts so a selection is not silently lost")
     XCTAssertEqual(s.statusLabel, "Starting…")
@@ -35,6 +37,8 @@ final class LocalAPIStateTests: XCTestCase {
     let s = LocalAPIState.make(status: .stopping, hasActiveProfile: true)
     XCTAssertFalse(s.toggleOn)
     XCTAssertFalse(s.toggleEnabled)
+    XCTAssertFalse(s.externalAccessToggleEnabled,
+                   "security posture changes must not persist while an exposed daemon may still be stopping")
     XCTAssertFalse(s.profileSelectionEnabled,
                    "profile picker must be disabled during in-flight restarts so a selection is not silently lost")
     XCTAssertEqual(s.statusLabel, "Stopping…")
@@ -45,6 +49,7 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertFalse(s.isServing)
     XCTAssertFalse(s.toggleOn)
     XCTAssertTrue(s.toggleEnabled, "a selected model means we can start the engine")
+    XCTAssertTrue(s.externalAccessToggleEnabled)
     XCTAssertTrue(s.profileSelectionEnabled)
     XCTAssertEqual(s.statusLabel, "Off")
     XCTAssertEqual(s.detail, "Turn on to serve OpenAI-compatible requests on 127.0.0.1.")
@@ -160,7 +165,7 @@ final class LocalAPIStateTests: XCTestCase {
     do {
       try await LocalAPIBindModeChange.apply(
         enabled: false,
-        currentlyServing: true,
+        phase: .serving(port: 8123),
         profileID: "chat",
         setPreference: { preferenceEnabled = $0 },
         stopEngine: {
@@ -188,7 +193,7 @@ final class LocalAPIStateTests: XCTestCase {
 
     try await LocalAPIBindModeChange.apply(
       enabled: true,
-      currentlyServing: true,
+      phase: .serving(port: 8123),
       profileID: "chat",
       setPreference: { preferenceEnabled = $0 },
       stopEngine: {},
@@ -197,6 +202,49 @@ final class LocalAPIStateTests: XCTestCase {
 
     XCTAssertTrue(preferenceEnabled)
     XCTAssertEqual(requestedStarts, [.external])
+  }
+
+  func test_bind_mode_change_does_not_mutate_preference_while_starting() async throws {
+    var preferenceEnabled = true
+    var stopCalls = 0
+    var startCalls: [EngineHTTPBindMode] = []
+
+    try await LocalAPIBindModeChange.apply(
+      enabled: false,
+      phase: .starting,
+      profileID: "chat",
+      setPreference: { preferenceEnabled = $0 },
+      stopEngine: { stopCalls += 1 },
+      startEngine: { startCalls.append($0) }
+    )
+
+    XCTAssertTrue(preferenceEnabled,
+                  "do not persist loopback posture while an external-bound daemon may still come up")
+    XCTAssertEqual(stopCalls, 0)
+    XCTAssertTrue(startCalls.isEmpty)
+  }
+
+  func test_profile_switch_gate_rejects_second_selection_while_restart_in_flight() {
+    let state = LocalAPIState.make(status: .running(port: 8123, profileID: "chat"),
+                                   hasActiveProfile: true)
+    var restartInFlight = false
+
+    XCTAssertTrue(LocalAPIProfileSwitchGate.acceptSelection(
+      selectedProfileID: "beta",
+      runtimeProfileID: "chat",
+      state: state,
+      restartInFlight: &restartInFlight
+    ))
+    XCTAssertTrue(restartInFlight,
+                  "the first profile switch must synchronously mark a restart in flight before spawning async stop/start")
+
+    XCTAssertFalse(LocalAPIProfileSwitchGate.acceptSelection(
+      selectedProfileID: "gamma",
+      runtimeProfileID: "chat",
+      state: state,
+      restartInFlight: &restartInFlight
+    ))
+    XCTAssertTrue(restartInFlight)
   }
 
   func test_profile_options_ignore_invalid_entries_and_mark_runtime_profile() throws {

@@ -29,7 +29,8 @@ public final class AppPreferences: ObservableObject {
 
   /// Storage key for allowing other devices to reach the Local API by
   /// binding its daemon listener to `0.0.0.0` instead of loopback.
-  public static let localAPIExternalAccessEnabledKey = "localAPIExternalAccessEnabled"
+  public static let localAPIExternalAccessEnabledKey =
+    EngineHTTPBindMode.localAPIExternalAccessEnabledPreferenceKey
 
   private let defaults: UserDefaults
 

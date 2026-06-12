@@ -7,6 +7,8 @@ import Foundation
 /// inferlet daemon launched over that control plane, so this value is
 /// threaded through `launch_daemon` instead of changing the control server.
 public enum EngineHTTPBindMode: String, Codable, Equatable, Sendable {
+  public static let localAPIExternalAccessEnabledPreferenceKey = "localAPIExternalAccessEnabled"
+
   /// Only processes on this Mac can connect.
   case loopback
   /// Bind all IPv4 interfaces so other reachable devices can connect.
@@ -22,6 +24,18 @@ public enum EngineHTTPBindMode: String, Codable, Equatable, Sendable {
   /// Host rendered in examples that describe the bind target. In-app HTTP
   /// clients still talk to `127.0.0.1`; this is for the Local API explorer.
   public var baseURLHost: String { daemonHost }
+
+  /// Read the persisted Local API exposure preference without requiring an
+  /// `AppPreferences` instance. The helper owns menu-bar Resume and
+  /// auto-relaunch outside the SwiftUI app process, so its launch resolver
+  /// needs the same on-disk preference at the spec boundary.
+  public static func persistedLocalAPIBindMode(
+    defaults: UserDefaults = .standard
+  ) -> EngineHTTPBindMode {
+    defaults.bool(forKey: Self.localAPIExternalAccessEnabledPreferenceKey)
+      ? .external
+      : .loopback
+  }
 }
 
 /// Pure view-state for the "Local API" surface (#422).
@@ -60,6 +74,12 @@ public struct LocalAPIState: Equatable {
   /// Whether the on/off control is actionable. Disabled mid-transition
   /// (`starting`/`stopping`) and when off with no model to start.
   public let toggleEnabled: Bool
+
+  /// Whether the security exposure toggle is actionable. Disabled during
+  /// `.starting`/`.stopping` because the daemon may already be committed to a
+  /// previously requested bind host and a preference-only write would under-
+  /// report the listener that is about to appear or is still shutting down.
+  public let externalAccessToggleEnabled: Bool
 
   /// Whether profile tabs are actionable. Disabled mid-transition so a
   /// profile selection cannot be accepted while an already-captured restart
@@ -100,6 +120,7 @@ public struct LocalAPIState: Equatable {
         phase: .serving(port: port),
         toggleOn: true,
         toggleEnabled: true,
+        externalAccessToggleEnabled: true,
         profileSelectionEnabled: true,
         statusLabel: "Running",
         detail: nil
@@ -109,6 +130,7 @@ public struct LocalAPIState: Equatable {
         phase: .starting,
         toggleOn: true,
         toggleEnabled: false,
+        externalAccessToggleEnabled: false,
         profileSelectionEnabled: false,
         statusLabel: "Starting…",
         detail: "The local API becomes available once the engine finishes loading the model."
@@ -118,6 +140,7 @@ public struct LocalAPIState: Equatable {
         phase: .stopping,
         toggleOn: false,
         toggleEnabled: false,
+        externalAccessToggleEnabled: false,
         profileSelectionEnabled: false,
         statusLabel: "Stopping…",
         detail: nil
@@ -127,6 +150,7 @@ public struct LocalAPIState: Equatable {
         phase: .off,
         toggleOn: false,
         toggleEnabled: hasActiveProfile,
+        externalAccessToggleEnabled: true,
         profileSelectionEnabled: true,
         statusLabel: "Off",
         detail: hasActiveProfile
@@ -142,6 +166,7 @@ public struct LocalAPIState: Equatable {
         phase: .failed(reason: failureReason(code: code, message: message)),
         toggleOn: false,
         toggleEnabled: canRetry,
+        externalAccessToggleEnabled: true,
         profileSelectionEnabled: true,
         statusLabel: "Engine failed",
         detail: failureReason(code: code, message: message)
@@ -175,21 +200,47 @@ public struct LocalAPIState: Equatable {
 public enum LocalAPIBindModeChange {
   public static func apply(
     enabled: Bool,
-    currentlyServing: Bool,
+    phase: LocalAPIState.Phase,
     profileID: String?,
     setPreference: (Bool) -> Void,
     stopEngine: () async throws -> Void,
     startEngine: (EngineHTTPBindMode) async throws -> Void
   ) async throws {
-    guard currentlyServing, let profileID, !profileID.isEmpty else {
+    switch phase {
+    case .starting, .stopping:
+      return
+    case .off, .failed:
       setPreference(enabled)
       return
+    case .serving:
+      break
     }
 
+    guard let profileID, !profileID.isEmpty else { return }
     let requestedMode: EngineHTTPBindMode = enabled ? .external : .loopback
     try await stopEngine()
     try await startEngine(requestedMode)
     setPreference(enabled)
+  }
+}
+
+/// Synchronous guard for runtime profile switches from the Local API surface.
+/// It exists so the view can reject a second selection immediately, before
+/// SwiftUI observes `.stopping`/`.starting` from the poll channel.
+public enum LocalAPIProfileSwitchGate {
+  public static func acceptSelection(
+    selectedProfileID: String,
+    runtimeProfileID: String?,
+    state: LocalAPIState,
+    restartInFlight: inout Bool
+  ) -> Bool {
+    guard !selectedProfileID.isEmpty else { return false }
+    guard state.profileSelectionEnabled, !restartInFlight else { return false }
+    guard let runtimeProfileID, runtimeProfileID != selectedProfileID else {
+      return true
+    }
+    restartInFlight = true
+    return true
   }
 }
 

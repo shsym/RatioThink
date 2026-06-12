@@ -38,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -166,34 +167,55 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-async def _parse_handshake(proc: subprocess.Popen, timeout: float) -> tuple[str, str]:
-    """Read pie stdout until we have `pie-server serving on <host>:<port>` + `internal token: <tok>`."""
-    url_re = re.compile(r"pie-server serving on ([^\s]+:[0-9]+)")
-    tok_re = re.compile(r"internal token: ([^\s]+)")
+@dataclass
+class _HandshakeState:
     url: str | None = None
     token: str | None = None
+
+
+_LEGACY_READY_RE = re.compile(r"pie-server serving on ([^\s]+:[0-9]+)")
+_SERVER_READY_RE = re.compile(r"Server ready at ws://([^\s]+:[0-9]+)")
+_TOKEN_RE = re.compile(r"internal token: ([^\s]+)")
+
+
+def _parse_handshake_line(line: str, state: _HandshakeState) -> None:
+    if state.url is None:
+        m = _LEGACY_READY_RE.search(line) or _SERVER_READY_RE.search(line)
+        if m:
+            state.url = m.group(1)
+    if state.token is None:
+        m = _TOKEN_RE.search(line)
+        if m:
+            state.token = m.group(1)
+
+
+async def _parse_handshake(proc: subprocess.Popen, timeout: float) -> tuple[str, str]:
+    """Read pie stdout until server readiness + `internal token: <tok>` appear."""
+    state = _HandshakeState()
     deadline = time.monotonic() + timeout
     loop = asyncio.get_event_loop()
-    while time.monotonic() < deadline and (url is None or token is None):
+    while time.monotonic() < deadline and (state.url is None or state.token is None):
         if proc.poll() is not None:
             raise RuntimeError(f"pie exited early (code={proc.returncode})")
-        line = await loop.run_in_executor(None, proc.stdout.readline)
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            line = await asyncio.wait_for(
+                loop.run_in_executor(None, proc.stdout.readline),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            break
         if not line:
             await asyncio.sleep(0.05)
             continue
         sys.stdout.write(f"[pie] {line}")
         sys.stdout.flush()
-        if url is None:
-            m = url_re.search(line)
-            if m:
-                url = m.group(1)
-        if token is None:
-            m = tok_re.search(line)
-            if m:
-                token = m.group(1)
-    if url is None or token is None:
-        raise RuntimeError(f"timeout parsing pie handshake (url={url!r} token={token!r})")
-    return url, token
+        _parse_handshake_line(line, state)
+    if state.url is None or state.token is None:
+        raise RuntimeError(
+            f"timeout parsing pie handshake (url={state.url!r} token={state.token!r})"
+        )
+    return state.url, state.token
 
 
 async def _drain_stdout(proc: subprocess.Popen) -> None:

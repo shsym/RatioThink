@@ -312,7 +312,8 @@ public final class EngineStatusStore: ObservableObject {
   /// `EngineError` (resolver rejected, still `.modelMissing`, etc.)
   /// propagates so the UI can surface the reason.
   public func startEngine(profileID: String,
-                          daemonBindHost: EngineHTTPBindMode? = nil) async throws {
+                          daemonBindHost: EngineHTTPBindMode? = nil,
+                          allowAlreadyRunning: Bool = true) async throws {
     let requestedBindMode = daemonBindHost ?? daemonBindModeProvider()
     do {
       try await client.startEngine(profileID: profileID, daemonBindHost: requestedBindMode)
@@ -325,6 +326,13 @@ public final class EngineStatusStore: ObservableObject {
       }
       throw error
     } catch let error as EngineError where error.code == .alreadyRunning {
+      guard allowAlreadyRunning else {
+        throw error
+      }
+      if case .running(_, let runningProfileID) = status,
+         runningProfileID != profileID {
+        throw error
+      }
       // A concurrent start found the engine already starting/running.
       // For a "kick the start" caller that IS the desired end state —
       // #326's no-model prompt and failed(modelMissing) banner can both

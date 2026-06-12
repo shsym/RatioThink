@@ -82,6 +82,13 @@ public struct LaunchSpecResolver {
   /// host's real memory.
   public let memoryPolicy: () -> ModelMemoryGuardrail.Policy
 
+  /// Desired OpenAI-compatible daemon bind mode for helper-owned starts.
+  /// XPC-driven app starts can still override the resolved spec explicitly,
+  /// but menu-bar Resume and auto-relaunch call `engineHost.start(spec)`
+  /// directly, so the shared resolver must stamp the persisted preference
+  /// before the spec reaches the host.
+  public let daemonBindMode: () -> EngineHTTPBindMode
+
   private static let log = Logger(subsystem: "com.ratiothink.app.helper",
                                   category: "launchspec.resolver")
 
@@ -96,7 +103,9 @@ public struct LaunchSpecResolver {
                 = { SpawnEnvSanitizer.sanitize(ProcessInfo.processInfo.environment) },
               hfHome: @escaping () -> URL = { LaunchSpecResolver.defaultHFHome() },
               memoryPolicy: @escaping () -> ModelMemoryGuardrail.Policy
-                = { ModelMemoryGuardrail.defaultPolicy }) {
+                = { ModelMemoryGuardrail.defaultPolicy },
+              daemonBindMode: @escaping () -> EngineHTTPBindMode
+                = { EngineHTTPBindMode.persistedLocalAPIBindMode() }) {
     self.profileStore = profileStore
     self.pieBinary = pieBinary
     self.modelsRoot = modelsRoot
@@ -106,6 +115,7 @@ public struct LaunchSpecResolver {
     self.subprocessEnvironment = subprocessEnvironment
     self.hfHome = hfHome
     self.memoryPolicy = memoryPolicy
+    self.daemonBindMode = daemonBindMode
   }
 
   /// Core mapping. Pure on injected state — no Bundle / PieDirs reads
@@ -222,6 +232,7 @@ public struct LaunchSpecResolver {
         shmemName: shmem,
         inferletNameAtVersion: inferletNameAtVersion,
         profileID: profile.id,
+        daemonBindHost: daemonBindMode(),
         modelConfig: .portableResolved(servedModelID: profile.model, modelRef: modelRef)
       )
       return .success(spec)
