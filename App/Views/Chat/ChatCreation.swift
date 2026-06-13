@@ -26,6 +26,16 @@ enum ChatCreation {
     profileID: String = "chat",
     modelID: String? = nil
   ) -> UUID? {
+    // #577 review v2 F4: DEBUG-only seam to force a create failure so a GUI
+    // test can exercise the new-chat draft-retention contract (a failed create
+    // must keep the typed text). Mirrors a real `save()` failure: nothing
+    // persists and `nil` is returned. Compiled out of Release; the env var is
+    // unset in production.
+    #if DEBUG
+    if ProcessInfo.processInfo.environment["PIE_TEST_FORCE_CHAT_CREATE_FAILURE"] == "1" {
+      return nil
+    }
+    #endif
     let resolvedModelID = modelID ?? debugPinnedChatModel()
     let chat = Chat(profileID: profileID, modelID: resolvedModelID)
     context.insert(chat)

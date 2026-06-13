@@ -17,6 +17,12 @@ struct ChatListView: View {
   /// `SortDescriptor(\.pinned)` at compile time.
   @Query(sort: \Chat.updatedAt, order: .reverse) private var chats: [Chat]
   @Binding var selectedItemID: UUID?
+  /// #577: the chat list is now an always-mounted bottom region of the
+  /// sidebar, visible regardless of the selected section. Selecting a row
+  /// (or creating a chat) must therefore also route the main view back to
+  /// `.chats`, so a chat opened while the API view is up actually switches
+  /// the detail surface to that chat.
+  @Binding var selectedSection: SidebarSection?
   @State private var searchText = ""
   @State private var hoveredChatID: UUID?
   /// #512 manual rename: the chat being renamed (drives the alert) and
@@ -89,8 +95,28 @@ struct ChatListView: View {
     .padding(.bottom, 8)
   }
 
+  /// Row selection routes through this binding so picking a chat both
+  /// selects it AND switches the main view to `.chats` (#577) — a chat
+  /// chosen while the API view is up replaces the detail surface.
+  ///
+  /// The getter is section-aware: it reports a selected row ONLY while the
+  /// `.chats` section is active. In any other section the list shows no
+  /// selection, so clicking even the previously-selected row is a genuine
+  /// change and fires the setter — otherwise `List(selection:)` (which only
+  /// fires on change) would swallow the tap and leave the user stuck in the
+  /// API view.
+  private var rowSelection: Binding<UUID?> {
+    Binding(
+      get: { selectedSection == .chats ? selectedItemID : nil },
+      set: { newID in
+        selectedItemID = newID
+        if newID != nil { selectedSection = .chats }
+      }
+    )
+  }
+
   private var list: some View {
-    List(selection: $selectedItemID) {
+    List(selection: rowSelection) {
       ForEach(visibleChats) { chat in
         row(for: chat)
           .tag(chat.id)
@@ -192,7 +218,7 @@ struct ChatListView: View {
       Text("No matching chats")
         .font(.subheadline)
         .foregroundStyle(.secondary)
-      Text("Try a different title search.")
+      Text("Try a different search. Titles and message text are both searched.")
         .font(.caption)
         .foregroundStyle(.secondary)
       Spacer(minLength: 0)
@@ -218,6 +244,9 @@ struct ChatListView: View {
       modelID: source?.modelID
     ) {
       selectedItemID = id
+      // #577: the list is visible from any section; a New Chat created here
+      // must also route the main view to the chat surface.
+      selectedSection = .chats
     }
   }
 

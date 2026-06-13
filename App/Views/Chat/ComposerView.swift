@@ -17,7 +17,26 @@ import os
 /// Opt insert a newline, Cmd-Return is reserved for menu shortcuts,
 /// etc.) — review v1 F1.
 struct ComposerView: View {
-  let chat: Chat
+  /// The owning chat for a normal persisting composer, or `nil` in #577
+  /// DRAFT MODE — the new-chat composer, which has no `Chat` row yet (none is
+  /// created until the first send). In draft mode `submit()` forwards the text
+  /// via `onDraftSubmit` instead of persisting; the caller creates + selects
+  /// the chat and routes the real send.
+  let chat: Chat?
+  /// #577 draft mode: when set, a send forwards the trimmed text here instead
+  /// of persisting a `Message`. Mutually exclusive with `chat` (a draft-mode
+  /// composer passes `chat: nil`). The no-model gate is NOT run here — the
+  /// scaffold the text is handed to runs it on the real send. Returns `true`
+  /// when the chat was created (so the composer clears its draft) and `false`
+  /// on a create failure (the draft is kept so the user can retry) — review
+  /// v1 F1.
+  let onDraftSubmit: ((String) -> Bool)?
+  /// #577 first-message handoff: when a new chat is created from the draft
+  /// composer, the scaffold mounts and seeds its composer with the typed text,
+  /// then auto-runs the normal send path (persist + assistant turn + gates).
+  /// Consumed exactly once on appear; `onConsumed` lets the owner clear the
+  /// pending handoff so a re-render can't re-seed it.
+  let handoff: ComposerHandoff?
   @ObservedObject var viewModel: ChatTranscriptViewModel
   let isSending: Bool
   /// : gate evaluated before the user message is persisted. When it
@@ -49,6 +68,9 @@ struct ComposerView: View {
   /// are known — no `NSTextView` round-trip whose width isn't valid yet at
   /// `updateNSView` time (the timing trap the first cut of #446 hit).
   @State private var editorWidth: CGFloat = 0
+  /// #577: ensures the first-message `handoff` is seeded + auto-sent only once
+  /// per appearance, even if the body re-renders before the owner clears it.
+  @State private var didConsumeHandoff = false
   @FocusState private var isFocused: Bool
 
   /// Auto-grow envelope. The box height tracks the editor's REAL laid-out
@@ -113,14 +135,16 @@ struct ComposerView: View {
   }
 
   init(
-    chat: Chat,
+    chat: Chat?,
     viewModel: ChatTranscriptViewModel,
     isSending: Bool = false,
     shouldAllowSend: @escaping () -> Bool = { true },
     onSendBlocked: @escaping (String) -> Void = { _ in },
     onUserMessageSaved: @escaping (Message) -> Void = { _ in },
     onStop: @escaping () -> Void = {},
-    autoSubmit: ComposerAutoSubmit? = nil
+    autoSubmit: ComposerAutoSubmit? = nil,
+    onDraftSubmit: ((String) -> Bool)? = nil,
+    handoff: ComposerHandoff? = nil
   ) {
     self.chat = chat
     self.viewModel = viewModel
@@ -130,6 +154,8 @@ struct ComposerView: View {
     self.onUserMessageSaved = onUserMessageSaved
     self.onStop = onStop
     self.autoSubmit = autoSubmit
+    self.onDraftSubmit = onDraftSubmit
+    self.handoff = handoff
   }
 
   var body: some View {
@@ -185,7 +211,10 @@ struct ComposerView: View {
     }
     .padding(.horizontal, 16)
     .padding(.vertical, 10)
-    .onAppear { isFocused = true }
+    .onAppear {
+      isFocused = true
+      consumeHandoffIfNeeded()
+    }
     // #516: a fired pending auto-send rides the normal submit path. The
     // tick makes consecutive fires distinguishable; the text match is the
     // edit guard (see `autoSubmit` doc).
@@ -199,15 +228,45 @@ struct ComposerView: View {
     draft.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
+  /// #577: seed the typed first message from the new-chat handoff and run the
+  /// normal send path once. The owner's `onConsumed` clears the pending
+  /// handoff so a re-render can't re-seed it; the actual `submit()` is deferred
+  /// to the next runloop tick so the scaffold's gate/handlers are fully wired
+  /// before the synthesized send fires.
+  private func consumeHandoffIfNeeded() {
+    guard !didConsumeHandoff, let handoff else { return }
+    didConsumeHandoff = true
+    // Consume only when the handoff is actually seeded — clearing the pending
+    // before the empty-draft guard would destroy the text on the (unreached)
+    // non-empty branch. Review v1 F2.
+    guard draft.isEmpty else { return }
+    handoff.onConsumed()
+    draft = handoff.text
+    DispatchQueue.main.async { submit() }
+  }
+
   private func submit() {
     let payload = trimmedDraft
     guard !payload.isEmpty, !isSending else { return }
+    // #577 draft mode (new-chat composer): no chat row exists yet, so forward
+    // the text instead of persisting. The caller creates + selects the chat
+    // and routes the real send (which runs the no-model gate there). Clear the
+    // draft ONLY when the caller confirms the chat was created — on a create
+    // failure the text is kept so the user can retry, matching the
+    // existing-chat persist path below. Review v1 F1.
+    if let onDraftSubmit {
+      if onDraftSubmit(payload) { draft = "" }
+      return
+    }
     // : block before persisting if no model is resolvable. Keep the
     // draft so the user can send it once they load/choose a model.
     guard shouldAllowSend() else {
       onSendBlocked(payload)
       return
     }
+    // A persisting composer always has a chat; nil here means a misuse
+    // (draft mode without `onDraftSubmit`) — bail rather than crash.
+    guard let chat else { return }
     // Establish the relationship from the to-many owning side
     // exclusively ( F11). Setting `Message.chat` AND appending
     // to `chat.messages` double-wires the inverse and has surfaced
@@ -247,6 +306,15 @@ struct ComposerView: View {
       persistenceStatus.report(error, context: "ComposerView.submit")
     }
   }
+}
+
+/// #577: the new-chat first-message handoff. When a chat is created from the
+/// draft composer, the scaffold mounts and hands the typed text here; the
+/// composer seeds its draft with `text`, calls `onConsumed` (so the owner
+/// clears the pending handoff), and auto-runs the normal send path once.
+struct ComposerHandoff {
+  let text: String
+  let onConsumed: () -> Void
 }
 
 /// #516: one fired pending auto-send. `tick` increments per fire so equal

@@ -188,6 +188,39 @@ pub struct ChatCompletionsRequest {
     /// success. See [`super::prefix_cache`].
     #[serde(default)]
     pub cache: Option<prefix_cache::CacheDirective>,
+    /// OpenAI-shape `response_format`. When `{"type":"json_object"}` the
+    /// assistant content is constrained to valid JSON via real
+    /// grammar-guided decoding (the "JSON Think" profile, #572). Absent or
+    /// `{"type":"text"}` → unconstrained, byte-identical to the prior
+    /// behavior. `json_schema` is NOT supported in v1 — see `json_mode`.
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// OpenAI-shape `response_format` discriminator. Only `json_object` is
+/// honored in v1; `text` is the explicit no-op; any other `type`
+/// (including `json_schema`) is parsed-but-rejected at the 400 boundary
+/// (`validate_response_format`) rather than silently ignored.
+#[derive(Deserialize, Clone)]
+pub struct ResponseFormat {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+}
+
+impl ResponseFormat {
+    /// The one supported constrained mode: any valid JSON value.
+    pub const JSON_OBJECT: &'static str = "json_object";
+    /// Explicit unconstrained mode (OpenAI default). A no-op here.
+    pub const TEXT: &'static str = "text";
+}
+
+/// True when the request asks for JSON-constrained output. Centralizes the
+/// `response_format.type == "json_object"` test so the validation, the
+/// speculation gate, and the two-phase decode all read one predicate.
+fn json_mode(req: &ChatCompletionsRequest) -> bool {
+    req.response_format
+        .as_ref()
+        .is_some_and(|rf| rf.kind == ResponseFormat::JSON_OBJECT)
 }
 
 /// Request-side speculation knobs (chat-apc extension). Dimensions
@@ -511,13 +544,24 @@ struct SpecMetricsSse<'a> {
 /// verify must not run against a grammar-constrained sampler. Forced-tool
 /// is checked before the greedy gate so a forced+greedy request reports
 /// `tool_choice_forced`, not speculative.
+///
+/// `json_mode` gates speculation OFF for the same reason (#572): the JSON
+/// phase runs a grammar-constrained sampler, which the drafter's verify
+/// must not run against. Checked first (alongside forced-tool) so a
+/// JSON+greedy request reports `json_constrained`, not speculative.
+/// JSON mode and forced tool_choice are mutually exclusive (rejected at
+/// the 400 boundary), so their order relative to each other is moot.
 fn plan_strategy(
     spec: Option<&SpecRequest>,
     greedy: bool,
     forced_tool: bool,
+    json_mode: bool,
 ) -> (DecodeStrategy, Option<&'static str>, bool, (usize, usize)) {
     match spec {
         None => (DecodeStrategy::Plain, None, false, (0, 0)),
+        Some(s) if s.enabled && json_mode => {
+            (DecodeStrategy::Plain, Some("json_constrained"), true, (0, 0))
+        }
         Some(s) if s.enabled && forced_tool => {
             (DecodeStrategy::Plain, Some("tool_choice_forced"), true, (0, 0))
         }
@@ -543,6 +587,363 @@ fn seed_tokens_from(model: &Model, messages: &[ChatMessage]) -> Vec<u32> {
         .collect::<Vec<_>>()
         .join("\n");
     model.tokenizer().encode(&joined)
+}
+
+// =============================================================================
+// JSON Think — two-phase constrained decode (#572)
+// =============================================================================
+//
+// "JSON Think" runs TWO sequential generations on the SAME `Context` so a
+// thinking model can reason freely and still answer in grammar-valid JSON:
+//
+//   · Phase 1 (reasoning): unconstrained. Emit `reasoning_content`,
+//     SUPPRESS visible content. Stop the instant the reasoning block
+//     closes (`reasoning::Event::End`) OR the first visible-content batch
+//     appears (non-thinking models never enter a `<think>` block) OR the
+//     model stops / hits the cap.
+//   · Phase 2 (answer): a `GrammarConstraint::json` is attached, so every
+//     newly sampled token is masked to valid JSON. Emit content, no
+//     reasoning. Phase 1's tail (the `</think>` batch, or a single
+//     discarded answer-start token on a non-thinking model) is flushed
+//     into Phase 2's first forward pass as plain context — it conditions
+//     the answer but is never emitted and is not subject to the grammar,
+//     so Phase 2's output is pure JSON.
+//
+// No second `fill_context`/`cue()` runs between the phases, so the
+// assistant turn stays open and the model never re-opens `<think>`. The
+// helper is sink-parameterized so the streaming and non-streaming handlers
+// share ONE decode loop, called once per phase.
+//
+// Budget (#572 F2): the request's `max_tokens` is a single ceiling SHARED
+// across both phases, not a per-phase grant. Phase 1 runs against the full
+// ceiling; Phase 2 receives `json_phase2_budget(max_tokens, phase1_generated)`
+// — the remainder, floored at `JSON_PHASE2_MIN_TOKENS` so a thinking model
+// that burns the whole budget before `</think>` can still emit a value. This
+// keeps a JSON request's total generated tokens (hence cost/latency/KV) bound
+// by what the caller asked for instead of silently doubling it.
+
+/// Where a JSON-phase decode loop sends its decoded text.
+enum JsonSink<'a> {
+    /// Streaming: each delta becomes an SSE `chat.completion.chunk`.
+    Stream {
+        em: &'a mut Emitter,
+        id: &'a str,
+        created: i64,
+        model: &'a str,
+    },
+    /// Non-streaming: deltas accumulate into the final `ChatCompletion`.
+    Buffer {
+        content: &'a mut String,
+        reasoning: &'a mut String,
+    },
+}
+
+impl JsonSink<'_> {
+    async fn reasoning_delta(&mut self, text: &str) -> Result<(), EmitError> {
+        match self {
+            JsonSink::Stream { em, id, created, model } => {
+                let chunk = ChatCompletionChunk {
+                    id,
+                    object: "chat.completion.chunk",
+                    created: *created,
+                    model,
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            reasoning_content: Some(text),
+                            ..Default::default()
+                        },
+                        finish_reason: None,
+                    }],
+                };
+                em.emit_json(&chunk).await
+            }
+            JsonSink::Buffer { reasoning, .. } => {
+                reasoning.push_str(text);
+                Ok(())
+            }
+        }
+    }
+
+    async fn content_delta(&mut self, text: &str) -> Result<(), EmitError> {
+        match self {
+            JsonSink::Stream { em, id, created, model } => {
+                let chunk = ChatCompletionChunk {
+                    id,
+                    object: "chat.completion.chunk",
+                    created: *created,
+                    model,
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            content: Some(text),
+                            ..Default::default()
+                        },
+                        finish_reason: None,
+                    }],
+                };
+                em.emit_json(&chunk).await
+            }
+            JsonSink::Buffer { content, .. } => {
+                content.push_str(text);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Per-phase knobs for [`run_json_phase`].
+struct JsonPhaseOpts {
+    /// Forward reasoning text to the sink (Phase 1 only). Drives the
+    /// reasoning demux.
+    emit_reasoning: bool,
+    /// Forward visible content to the sink (Phase 2 only).
+    emit_content: bool,
+    /// Phase-1 semantics: stop the moment the reasoning block closes OR the
+    /// first visible-content batch appears (so a non-thinking model yields
+    /// to the constrained phase immediately). Drives the reasoning demux.
+    stop_after_reasoning: bool,
+    /// Phase-2 semantics: emit EVERY decoded chat delta as content without
+    /// the `content_visible` reasoning gate. Phase 2 runs under a JSON
+    /// grammar that cannot emit a `<think>` block, so its output is
+    /// definitionally the answer — there is nothing to suppress. This is
+    /// load-bearing: when Phase 1 ends mid-`<think>` (a thinking model that
+    /// exhausts its budget before `</think>`), the reasoning gate would
+    /// otherwise stay latched and silently swallow the entire JSON answer.
+    raw_content: bool,
+    /// Hard cap on tokens generated in **this phase**. The two phases SHARE
+    /// the request's `max_tokens` ceiling (#572 F2): Phase 1 runs against the
+    /// full ceiling and Phase 2 receives [`json_phase2_budget`] of what Phase
+    /// 1 left (floored at [`JSON_PHASE2_MIN_TOKENS`]), so a JSON request never
+    /// silently spends ~2× the caller's cost/latency/KV bound.
+    max_tokens: usize,
+}
+
+/// Result of one JSON-phase decode loop.
+struct JsonPhaseResult {
+    outcome: Outcome,
+    error_diag: Option<(&'static str, String)>,
+    /// The streaming peer closed mid-phase; the caller should finalize the
+    /// SSE response without emitting further frames.
+    disconnected: bool,
+    /// Tokens generated in this phase (`Generator::tokens_generated`). Read
+    /// once at phase exit so the caller can share the request's `max_tokens`
+    /// budget across both phases (#572 F2) rather than handing each phase an
+    /// independent full budget.
+    tokens_generated: usize,
+    /// Whether this phase emitted at least one visible-content delta. Phase 2
+    /// uses this to detect a contractually-empty JSON answer (#572 F3): a
+    /// `json_object` request that ends Natural/MaxTokens with no content is a
+    /// failure (the empty string is not valid JSON), not a 200 success.
+    produced_content: bool,
+}
+
+/// Drive one generation phase to completion, demuxing reasoning vs visible
+/// content exactly like the canonical loop (`content_visible`) and routing
+/// each through `sink`. `stream` is consumed (dropped on return) so the
+/// caller can build the next phase's generator on the same `Context`.
+/// `in_reasoning` carries the reasoning-block gate across phases.
+async fn run_json_phase(
+    mut stream: inferlet::Generator<'_>,
+    chat_dec: &mut chat::Decoder,
+    reason_dec: &mut ReasoningDecoder,
+    sink: &mut JsonSink<'_>,
+    in_reasoning: &mut bool,
+    opts: JsonPhaseOpts,
+) -> JsonPhaseResult {
+    // Each loop branch breaks the `'phase` loop with its terminal triple;
+    // `tokens_generated` / `produced_content` are read once after the loop so
+    // every exit path reports them uniformly (the generator outlives the loop).
+    let mut produced_content = false;
+    let (outcome, error_diag, disconnected): (Outcome, Option<(&'static str, String)>, bool) =
+        'phase: loop {
+            macro_rules! emit_or_bail {
+                ($call:expr) => {
+                    match $call.await {
+                        Ok(()) => {}
+                        Err(EmitError::Disconnected) => break 'phase (Outcome::Aborted, None, true),
+                        Err(EmitError::Serialize(e)) => {
+                            // Same static chunk schema as the proven canonical
+                            // path, so this is unreachable in practice; log to
+                            // pie-server's capture and end the phase rather than
+                            // shipping corruption.
+                            eprintln!("[chat-apc] json-phase chunk serialize bug: {e}");
+                            break 'phase (
+                                Outcome::Aborted,
+                                Some(("serialize_bug", e.to_string())),
+                                false,
+                            );
+                        }
+                    }
+                };
+            }
+
+            let step = match stream.next() {
+                Ok(None) => {
+                    let outcome = if stream.tokens_generated() >= opts.max_tokens {
+                        Outcome::MaxTokens
+                    } else {
+                        Outcome::Natural
+                    };
+                    break 'phase (outcome, None, false);
+                }
+                Ok(Some(s)) => s,
+                Err(e) => {
+                    // #470/#485 F1: classify the forward error so an
+                    // over-capacity KV-acquire timeout (the `server_busy:`
+                    // sentinel) surfaces as the retryable `server_busy` code
+                    // exactly like the canonical loops — not a flat
+                    // `forward_pass_failed`.
+                    let m = e.to_string();
+                    break 'phase (Outcome::Aborted, Some((classify_forward_error(&m), m)), false);
+                }
+            };
+            let out = match step.execute().await {
+                Ok(o) => o,
+                Err(e) => {
+                    let m = e.to_string();
+                    break 'phase (Outcome::Aborted, Some((classify_forward_error(&m), m)), false);
+                }
+            };
+            if forward_pass_starved(&out.raw().slots) {
+                break 'phase (
+                    Outcome::Aborted,
+                    Some((STARVED_CODE, STARVED_MESSAGE.to_string())),
+                    false,
+                );
+            }
+
+            // Reasoning demux — only the reasoning phase needs it (to emit
+            // reasoning and to detect the </think> / first-visible stop). Phase
+            // 2 skips it entirely: it emits raw JSON content (see below), and
+            // feeding the host reasoning decoder there would mis-latch on the
+            // leftover mid-`<think>` state from a budget-truncated Phase 1.
+            let mut visible = true;
+            if opts.emit_reasoning || opts.stop_after_reasoning {
+                let was_in_reasoning = *in_reasoning;
+                let mut reason_idle = false;
+                let mut reasoning_ended = false;
+                match reason_dec.feed(&out.tokens) {
+                    Ok(inferlet::reasoning::Event::Start) => *in_reasoning = true,
+                    Ok(inferlet::reasoning::Event::Delta(s)) => {
+                        *in_reasoning = true;
+                        if opts.emit_reasoning {
+                            emit_or_bail!(sink.reasoning_delta(&s));
+                        }
+                    }
+                    Ok(inferlet::reasoning::Event::End(_)) => {
+                        *in_reasoning = false;
+                        reasoning_ended = true;
+                    }
+                    Ok(inferlet::reasoning::Event::Idle) => reason_idle = true,
+                    Err(e) => {
+                        break 'phase (
+                            Outcome::Aborted,
+                            Some(("reasoning_decode_failed", e.to_string())),
+                            false,
+                        );
+                    }
+                }
+                visible = content_visible(reason_idle, was_in_reasoning);
+
+                // Phase 1 stops as soon as reasoning ends OR the first visible
+                // batch appears (covers thinking AND non-thinking models). The
+                // visible batch is intentionally NOT emitted here (emit_content
+                // is false in Phase 1); its tokens are already staged in the
+                // context buffer and flow into Phase 2 as plain conditioning
+                // context.
+                if opts.stop_after_reasoning && (reasoning_ended || visible) {
+                    break 'phase (Outcome::Natural, None, false);
+                }
+            }
+
+            match chat_dec.feed(&out.tokens) {
+                Ok(chat::Event::Delta(s)) if opts.emit_content && (opts.raw_content || visible) => {
+                    produced_content = true;
+                    emit_or_bail!(sink.content_delta(&s));
+                }
+                Ok(chat::Event::Delta(_)) => {}
+                Ok(chat::Event::Done(_)) => break 'phase (Outcome::Natural, None, false),
+                Ok(chat::Event::Interrupt(id)) => {
+                    break 'phase (
+                        Outcome::Aborted,
+                        Some((
+                            "chat_template_interrupt",
+                            format!("control token {id} from chat template"),
+                        )),
+                        false,
+                    );
+                }
+                Ok(chat::Event::Idle) => continue,
+                Err(e) => {
+                    break 'phase (Outcome::Aborted, Some(("decode_failed", e.to_string())), false);
+                }
+            }
+        };
+
+    JsonPhaseResult {
+        outcome,
+        error_diag,
+        disconnected,
+        tokens_generated: stream.tokens_generated(),
+        produced_content,
+    }
+}
+
+/// Distinct code/HTTP status for a JSON Phase-2 that ended cleanly
+/// (`Natural`/`MaxTokens`) yet emitted zero content (#572 F3). For a
+/// `json_object` request the empty string is not valid JSON, so this is a
+/// contract failure — analogous to the canonical `tool_call_not_produced`
+/// reclassification — not a deceptive `200 / finish_reason:"stop" / ""`.
+const JSON_EMPTY_OUTPUT_CODE: &str = "json_empty_output";
+const JSON_EMPTY_OUTPUT_MESSAGE: &str =
+    "JSON-constrained generation produced no content; the model emitted no answer tokens \
+     under the JSON grammar (raise max_tokens or verify the model supports constrained decoding)";
+
+/// Minimum token budget handed to Phase 2 after Phase 1's generation is
+/// debited from the request ceiling (#572 F2). The floor guarantees a
+/// thinking model that exhausts the whole budget before `</think>` still has
+/// room to emit a complete JSON value rather than being starved to zero.
+const JSON_PHASE2_MIN_TOKENS: usize = 64;
+
+/// #572 F2: share the request's `max_tokens` ceiling across the two phases.
+/// Phase 1 (reasoning) runs against the full ceiling; Phase 2 (answer) gets
+/// what Phase 1 left, floored at [`JSON_PHASE2_MIN_TOKENS`] so the constrained
+/// answer is never budgeted to zero. Without this each phase received an
+/// independent full budget, silently doubling the caller's cost/latency/KV
+/// bound for a JSON request.
+fn json_phase2_budget(max_tokens: usize, phase1_generated: usize) -> usize {
+    max_tokens.saturating_sub(phase1_generated).max(JSON_PHASE2_MIN_TOKENS)
+}
+
+/// #572 F3: finalize a JSON Phase-2 result, reclassifying a clean-but-empty
+/// answer as an explicit `json_empty_output` error. Returns the terminal
+/// `(outcome, error_diag, disconnected)` triple the handlers emit. A phase
+/// that already errored, disconnected, or produced content passes through
+/// unchanged.
+fn json_phase2_finalize(r2: JsonPhaseResult) -> (Outcome, Option<(&'static str, String)>, bool) {
+    if r2.error_diag.is_none()
+        && !r2.produced_content
+        && matches!(r2.outcome, Outcome::Natural | Outcome::MaxTokens)
+    {
+        return (
+            Outcome::Aborted,
+            Some((JSON_EMPTY_OUTPUT_CODE, JSON_EMPTY_OUTPUT_MESSAGE.to_string())),
+            r2.disconnected,
+        );
+    }
+    (r2.outcome, r2.error_diag, r2.disconnected)
+}
+
+/// HTTP status for a JSON-mode pure-failure (no partial body): an
+/// over-capacity `server_busy` is a retryable 503, everything else a 500 —
+/// mirrors the canonical non-streaming branch (#470/#485 F1).
+fn json_pure_failure_status(code: &str) -> u16 {
+    if code == SERVER_BUSY_CODE {
+        503
+    } else {
+        500
+    }
 }
 
 #[derive(Serialize)]
@@ -1920,6 +2321,22 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
         }
     };
 
+    // #572: validate `response_format` before opening any stream. Only
+    // `json_object` (constrained) and `text` (no-op) are honored; an
+    // unknown `type` (incl. `json_schema`) is rejected loudly rather than
+    // silently ignored. JSON mode + a forced `tool_choice` both constrain
+    // the sampler to different grammars, so they cannot combine. The
+    // `role:"tool"` handling that lived here moved into `validate_messages`
+    // (main now supports tool turns with ids/ordering), so it is not
+    // re-checked inline.
+    if let Err((code, msg, param)) = validate_response_format(&request) {
+        return res
+            .respond(with_launch_diags_header(json_error_param(
+                400, code, &msg, param,
+            )))
+            .await;
+    }
+
     let registered = runtime::models();
     if let Some(err) = model_registration_error(&request.model, &registered) {
         return res
@@ -2415,6 +2832,50 @@ fn validate_sampling(
     Ok(effective_max_tokens)
 }
 
+/// Validate `response_format` (#572). Returns `Err((code, message,
+/// param))` for an unsupported shape. Three outcomes:
+///   · absent / `{"type":"text"}` → Ok (unconstrained, the default).
+///   · `{"type":"json_object"}` → Ok, UNLESS a forced `tool_choice` is
+///     also present (the two constrain the sampler to different grammars
+///     and cannot compose) → 400 `invalid_request`.
+///   · any other `type` (incl. `json_schema`) → 400
+///     `response_format_unsupported`, naming the offending value so the
+///     caller learns v1 only supports `json_object`.
+fn validate_response_format(
+    req: &ChatCompletionsRequest,
+) -> Result<(), (&'static str, String, &'static str)> {
+    let Some(rf) = req.response_format.as_ref() else {
+        return Ok(());
+    };
+    match rf.kind.as_str() {
+        ResponseFormat::TEXT | "" => Ok(()),
+        ResponseFormat::JSON_OBJECT => {
+            // JSON mode constrains the whole answer to a JSON grammar; a
+            // forced tool_choice constrains it to the tool-call grammar.
+            // They are mutually exclusive — reject rather than silently
+            // letting one win.
+            if !matches!(forced_tool_choice(req.tool_choice.as_ref()), ForcedToolChoice::No) {
+                return Err((
+                    "invalid_request",
+                    "response_format \"json_object\" cannot combine with a forced tool_choice \
+                     (the two constrain decoding to different grammars); send one or the other"
+                        .to_string(),
+                    "response_format",
+                ));
+            }
+            Ok(())
+        }
+        other => Err((
+            "response_format_unsupported",
+            format!(
+                "response_format.type=\"{other}\" is not supported; v1 supports only \
+                 \"json_object\" (any valid JSON) and \"text\" (unconstrained)"
+            ),
+            "response_format",
+        )),
+    }
+}
+
 /// Build an OpenAI-shape error JSON with a populated `param` field.
 pub(crate) fn json_error_param(
     status: u16,
@@ -2616,8 +3077,134 @@ async fn handle_streaming(
     // grammar-constrained sampler. Otherwise plain decode, with
     // `fallback_reason` reporting why (no silent no-op).
     let greedy = temperature <= 0.0;
+    let json_constrained = json_mode(&req);
     let (strategy, fallback_reason, want_metrics, dims) =
-        plan_strategy(req.speculation.as_ref(), greedy, forced_tool);
+        plan_strategy(req.speculation.as_ref(), greedy, forced_tool, json_constrained);
+
+    // #572: JSON Think runs the dedicated two-phase constrained path and
+    // returns its own terminal frames. The single-loop path below is left
+    // byte-identical for every non-JSON request (normal / Fast Think /
+    // ToT / tool_choice). JSON mode is mutually exclusive with a forced
+    // tool_choice (400-rejected upstream), so `tool_constraint` is None
+    // here and the tool surface is irrelevant.
+    if json_constrained {
+        let mut in_reasoning = false;
+        let mut reason_dec = ReasoningDecoder::new(&model);
+        let (outcome, error_diag, disconnected) = {
+            let mut sink = JsonSink::Stream {
+                em: &mut em,
+                id: &id,
+                created,
+                model: &req.model,
+            };
+            // Phase 1: capture reasoning, suppress content, stop when the
+            // thinking block closes (or the first content batch on a
+            // non-thinking model).
+            let mut chat_dec1 = chat::Decoder::new(&model);
+            let gen1 = ctx
+                .generate(generate::resolve_sampler(temperature, top_p))
+                .max_tokens(max_tokens)
+                .stop(&stop_tokens);
+            let r1 = run_json_phase(
+                gen1,
+                &mut chat_dec1,
+                &mut reason_dec,
+                &mut sink,
+                &mut in_reasoning,
+                JsonPhaseOpts {
+                    emit_reasoning: true,
+                    emit_content: false,
+                    stop_after_reasoning: true,
+                    raw_content: false,
+                    max_tokens,
+                },
+            )
+            .await;
+            if r1.disconnected {
+                (Outcome::Aborted, None, true)
+            } else if let Some(diag) = r1.error_diag {
+                (Outcome::Aborted, Some(diag), false)
+            } else {
+                // Phase 2: JSON-grammar-constrained answer. The fresh chat
+                // decoder + fresh generator continue the open assistant
+                // turn; Phase 1's tail is flushed into this generator's
+                // first forward pass as context (never re-emitted).
+                let phase2_budget = json_phase2_budget(max_tokens, r1.tokens_generated);
+                let mut chat_dec2 = chat::Decoder::new(&model);
+                let gen2 = ctx
+                    .generate(generate::resolve_sampler(temperature, top_p))
+                    .max_tokens(phase2_budget)
+                    .stop(&stop_tokens)
+                    .constrain(GrammarConstraint::json(&model));
+                let r2 = run_json_phase(
+                    gen2,
+                    &mut chat_dec2,
+                    &mut reason_dec,
+                    &mut sink,
+                    &mut in_reasoning,
+                    JsonPhaseOpts {
+                        emit_reasoning: false,
+                        emit_content: true,
+                        stop_after_reasoning: false,
+                        raw_content: true,
+                        max_tokens: phase2_budget,
+                    },
+                )
+                .await;
+                // F3: a clean-but-empty JSON answer is a contract failure.
+                json_phase2_finalize(r2)
+            }
+        };
+        if disconnected {
+            return em.finish();
+        }
+        let final_chunk = ChatCompletionChunk {
+            id: &id,
+            object: "chat.completion.chunk",
+            created,
+            model: &req.model,
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta::default(),
+                finish_reason: Some(outcome.finish_reason()),
+            }],
+        };
+        if let Err(EmitError::Serialize(e)) = em.emit_json(&final_chunk).await {
+            eprintln!("[chat-apc] json final-chunk serialize bug: {e}");
+        }
+        if let Some((code, message)) = &error_diag {
+            if let Err(EmitError::Serialize(e)) =
+                em.emit_json(&SseError::new(code, message)).await
+            {
+                eprintln!("[chat-apc] json error-meta serialize bug: {e}");
+            }
+        }
+        // Only when the caller ALSO sent a speculation block (uncommon for
+        // a JSON profile) do we surface why drafting didn't engage —
+        // `json_constrained`. A normal JSON Think request is byte-clean.
+        if want_metrics {
+            let report = SpecMetricsReport::build(
+                false,
+                fallback_reason,
+                dims,
+                SpecMetrics::default(),
+                0,
+                0,
+                Duration::ZERO,
+            );
+            report.log_spec_stats();
+            let frame = SpecMetricsSse {
+                event: "spec_metrics",
+                report: &report,
+            };
+            if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
+                eprintln!("[chat-apc] json spec_metrics serialize bug: {e}");
+            }
+        }
+        sse::emit_done_logged(&mut em, "json_stream_exit").await;
+        return em.finish();
+    }
+
     let spec_enabled = matches!(strategy, DecodeStrategy::Speculative(_));
     let sampler = generate::resolve_sampler(temperature, top_p);
     let seed_tokens = if spec_enabled {
@@ -3105,8 +3692,165 @@ async fn handle_non_streaming(
     // #418: plain vs speculative decode (see handle_streaming for the
     // greedy + forced-tool gate rationale).
     let greedy = temperature <= 0.0;
+    let json_constrained = json_mode(&req);
     let (strategy, fallback_reason, want_metrics, dims) =
-        plan_strategy(req.speculation.as_ref(), greedy, forced_tool);
+        plan_strategy(req.speculation.as_ref(), greedy, forced_tool, json_constrained);
+
+    // #572: JSON Think two-phase constrained path (mirrors handle_streaming).
+    // The canonical loop below is untouched for every non-JSON request.
+    if json_constrained {
+        let mut full_text = String::new();
+        let mut reasoning_text = String::new();
+        let mut in_reasoning = false;
+        let mut reason_dec = ReasoningDecoder::new(&model);
+        let (outcome, error_diag): (Outcome, Option<(&str, String)>) = {
+            let mut sink = JsonSink::Buffer {
+                content: &mut full_text,
+                reasoning: &mut reasoning_text,
+            };
+            // Phase 1: reasoning only, suppress content.
+            let mut chat_dec1 = chat::Decoder::new(&model);
+            let gen1 = ctx
+                .generate(generate::resolve_sampler(temperature, top_p))
+                .max_tokens(max_tokens)
+                .stop(&stop_tokens);
+            let r1 = run_json_phase(
+                gen1,
+                &mut chat_dec1,
+                &mut reason_dec,
+                &mut sink,
+                &mut in_reasoning,
+                JsonPhaseOpts {
+                    emit_reasoning: true,
+                    emit_content: false,
+                    stop_after_reasoning: true,
+                    raw_content: false,
+                    max_tokens,
+                },
+            )
+            .await;
+            if let Some(diag) = r1.error_diag {
+                (Outcome::Aborted, Some(diag))
+            } else {
+                // Phase 2: JSON-grammar-constrained answer.
+                let phase2_budget = json_phase2_budget(max_tokens, r1.tokens_generated);
+                let mut chat_dec2 = chat::Decoder::new(&model);
+                let gen2 = ctx
+                    .generate(generate::resolve_sampler(temperature, top_p))
+                    .max_tokens(phase2_budget)
+                    .stop(&stop_tokens)
+                    .constrain(GrammarConstraint::json(&model));
+                let r2 = run_json_phase(
+                    gen2,
+                    &mut chat_dec2,
+                    &mut reason_dec,
+                    &mut sink,
+                    &mut in_reasoning,
+                    JsonPhaseOpts {
+                        emit_reasoning: false,
+                        emit_content: true,
+                        stop_after_reasoning: false,
+                        raw_content: true,
+                        max_tokens: phase2_budget,
+                    },
+                )
+                .await;
+                // F3: a clean-but-empty JSON answer is a contract failure
+                // (Buffer sink never disconnects, so the flag is unused here).
+                let (outcome, error_diag, _) = json_phase2_finalize(r2);
+                (outcome, error_diag)
+            }
+        };
+
+        // Pure failure (no content AND no reasoning produced) → 500, or a
+        // retryable 503 for over-capacity `server_busy` (#470/#485 F1) — same
+        // as the canonical no-tokens-produced branch.
+        let has_partial = !full_text.is_empty() || !reasoning_text.is_empty();
+        if error_diag.is_some() && !has_partial {
+            let (code, msg) = error_diag.unwrap();
+            let status = json_pure_failure_status(code);
+            return res
+                .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
+                .await;
+        }
+
+        let id = next_id();
+        let reasoning_opt = if reasoning_text.is_empty() {
+            None
+        } else {
+            Some(reasoning_text.as_str())
+        };
+        let error_block = error_diag.as_ref().map(|(code, msg)| PartialError {
+            kind: "server_error",
+            code,
+            message: msg.as_str(),
+            param: None,
+            distinct_modes: None,
+            overflow_modes: None,
+        });
+        let diag_snapshot = launch_diags();
+        let warnings_vec: Option<Vec<NonStreamWarning>> = if diag_snapshot.is_empty() {
+            None
+        } else {
+            Some(
+                diag_snapshot
+                    .iter()
+                    .map(|d| NonStreamWarning { code: d.code, message: d.message.as_str() })
+                    .collect(),
+            )
+        };
+        // Surface why drafting didn't engage only when the caller also
+        // sent a speculation block (`json_constrained`); a plain JSON
+        // request is byte-clean.
+        let spec_metrics = if want_metrics {
+            let report = SpecMetricsReport::build(
+                false,
+                fallback_reason,
+                dims,
+                SpecMetrics::default(),
+                0,
+                0,
+                Duration::ZERO,
+            );
+            report.log_spec_stats();
+            Some(report)
+        } else {
+            None
+        };
+        let body = ChatCompletion {
+            id: &id,
+            object: "chat.completion",
+            created: now_unix_secs(),
+            model: &req.model,
+            choices: vec![NonStreamChoice {
+                index: 0,
+                message: NonStreamMessage {
+                    role: "assistant",
+                    content: &full_text,
+                    reasoning_content: reasoning_opt,
+                    tool_calls: None,
+                },
+                finish_reason: outcome.finish_reason(),
+            }],
+            error: error_block,
+            warnings: warnings_vec,
+            spec_metrics,
+        };
+        let json = serde_json::to_string(&body).expect("ChatCompletion must serialize");
+        let (status, partial_kind) = match &error_diag {
+            Some(_) => (502u16, Some("fatal")),
+            None => (200u16, None),
+        };
+        let mut builder = Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json");
+        if let Some(kind) = partial_kind {
+            builder = builder.header("X-ChatAPC-Partial-Error", kind);
+        }
+        let response = builder.body(json.into_body()).unwrap();
+        return res.respond(with_launch_diags_header(response)).await;
+    }
+
     let spec_enabled = matches!(strategy, DecodeStrategy::Speculative(_));
     let sampler = generate::resolve_sampler(temperature, top_p);
     let seed_tokens = if spec_enabled {
@@ -4613,32 +5357,255 @@ mod tests {
 
     #[test]
     fn plan_strategy_gates_on_greedy_and_enabled() {
-        // requested + greedy + no forced tool -> speculative, no fallback
+        // requested + greedy + no forced tool + no json -> speculative, no fallback
         let s = SpecRequest { enabled: true, leader_len: None, draft_len: None };
-        let (st, fb, want, _) = plan_strategy(Some(&s), true, false);
+        let (st, fb, want, _) = plan_strategy(Some(&s), true, false, false);
         assert!(matches!(st, DecodeStrategy::Speculative(_)));
         assert!(fb.is_none());
         assert!(want);
         // requested + non-greedy -> plain, fallback reason
-        let (st, fb, want, _) = plan_strategy(Some(&s), false, false);
+        let (st, fb, want, _) = plan_strategy(Some(&s), false, false, false);
         assert!(matches!(st, DecodeStrategy::Plain));
         assert_eq!(fb, Some("non_greedy_sampling"));
         assert!(want);
         // requested + greedy BUT a tool call is forced -> plain, gated off
         // with a distinct reason (checked before the greedy gate).
-        let (st, fb, want, _) = plan_strategy(Some(&s), true, true);
+        let (st, fb, want, _) = plan_strategy(Some(&s), true, true, false);
         assert!(matches!(st, DecodeStrategy::Plain));
         assert_eq!(fb, Some("tool_choice_forced"));
         assert!(want);
         // enabled:false -> plain, disabled
         let off = SpecRequest { enabled: false, leader_len: None, draft_len: None };
-        let (_, fb, want, _) = plan_strategy(Some(&off), true, false);
+        let (_, fb, want, _) = plan_strategy(Some(&off), true, false, false);
         assert_eq!(fb, Some("disabled"));
         assert!(want);
         // absent -> plain, no metrics surface
-        let (_, fb, want, _) = plan_strategy(None, true, false);
+        let (_, fb, want, _) = plan_strategy(None, true, false, false);
         assert!(fb.is_none());
         assert!(!want);
+    }
+
+    #[test]
+    fn plan_strategy_json_mode_gates_speculation_off() {
+        // #572: JSON mode runs a grammar-constrained sampler, so the
+        // drafter must not engage even when requested + greedy. The
+        // fallback reason names the JSON gate, distinct from the
+        // tool-choice gate, and is checked first.
+        let s = SpecRequest { enabled: true, leader_len: None, draft_len: None };
+        let (st, fb, want, _) = plan_strategy(Some(&s), true, false, true);
+        assert!(matches!(st, DecodeStrategy::Plain));
+        assert_eq!(fb, Some("json_constrained"));
+        assert!(want, "a requested-but-inactive run still surfaces metrics");
+        // json_mode wins the precedence even if forced_tool were somehow
+        // also set (they are 400-rejected upstream, but the gate is
+        // defensive): the reported reason is `json_constrained`.
+        let (_, fb, _, _) = plan_strategy(Some(&s), true, true, true);
+        assert_eq!(fb, Some("json_constrained"));
+    }
+
+    // ─── response_format (#572) ───────────────────────────────
+
+    fn req_with_response_format(body: &str) -> ChatCompletionsRequest {
+        serde_json::from_str(body).expect("valid request JSON")
+    }
+
+    #[test]
+    fn json_mode_detected_only_for_json_object() {
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"}}"#,
+        );
+        assert!(json_mode(&r));
+
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"text"}}"#,
+        );
+        assert!(!json_mode(&r));
+
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert!(!json_mode(&r), "absent response_format is not JSON mode");
+        assert!(r.response_format.is_none());
+    }
+
+    #[test]
+    fn validate_response_format_accepts_supported_and_default() {
+        // absent -> ok
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert!(validate_response_format(&r).is_ok());
+        // text -> ok (explicit no-op)
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"text"}}"#,
+        );
+        assert!(validate_response_format(&r).is_ok());
+        // json_object -> ok
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"}}"#,
+        );
+        assert!(validate_response_format(&r).is_ok());
+    }
+
+    #[test]
+    fn validate_response_format_rejects_json_schema_and_unknown() {
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema"}}"#,
+        );
+        let (code, _msg, param) = validate_response_format(&r).unwrap_err();
+        assert_eq!(code, "response_format_unsupported");
+        assert_eq!(param, "response_format");
+
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"banana"}}"#,
+        );
+        assert_eq!(
+            validate_response_format(&r).unwrap_err().0,
+            "response_format_unsupported"
+        );
+    }
+
+    #[test]
+    fn validate_response_format_rejects_json_plus_forced_tool() {
+        // json_object + tool_choice:"required" -> 400 invalid_request
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"},
+                "tool_choice":"required",
+                "tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}"#,
+        );
+        let (code, _msg, param) = validate_response_format(&r).unwrap_err();
+        assert_eq!(code, "invalid_request");
+        assert_eq!(param, "response_format");
+
+        // json_object + tool_choice:{named} -> rejected too
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"},
+                "tool_choice":{"type":"function","function":{"name":"f"}}}"#,
+        );
+        assert_eq!(validate_response_format(&r).unwrap_err().0, "invalid_request");
+
+        // json_object + tool_choice:"auto" -> NOT forced, so allowed
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"},
+                "tool_choice":"auto"}"#,
+        );
+        assert!(validate_response_format(&r).is_ok());
+    }
+
+    // ─── two-phase JSON decode contract (#572 F1/F2/F3) ──────────
+    //
+    // The full `run_json_phase` loop needs a live `inferlet::Generator` +
+    // chat/reasoning decoders bound to a real model, so it stays covered by
+    // the dummy/HTTP e2e and the opt-in real-model smoke (incl. the
+    // tiny-budget mid-`<think>` regression). The pure decision points it
+    // feeds — forward-error classification, the empty-output guard, the
+    // shared-budget split, and the pure-failure status — are isolated here so
+    // each contract is asserted deterministically without an engine.
+
+    fn json_phase_result(
+        outcome: Outcome,
+        error_diag: Option<(&'static str, String)>,
+        produced_content: bool,
+    ) -> JsonPhaseResult {
+        JsonPhaseResult {
+            outcome,
+            error_diag,
+            disconnected: false,
+            tokens_generated: 0,
+            produced_content,
+        }
+    }
+
+    #[test]
+    fn json_forward_error_classifies_server_busy_vs_generic() {
+        // F1: the same sentinel the canonical loop honors must drive the JSON
+        // path's terminal code (run_json_phase calls this on both the
+        // `next()` and `execute()` error arms).
+        assert_eq!(
+            classify_forward_error("server_busy: KV page acquisition timed out after 120s"),
+            SERVER_BUSY_CODE
+        );
+        assert_eq!(
+            classify_forward_error("GenStep::execute forward: device queue fault"),
+            "forward_pass_failed"
+        );
+    }
+
+    #[test]
+    fn json_pure_failure_status_maps_server_busy_to_503() {
+        // F1: over-capacity backpressure is retryable (503); every other
+        // pure failure is a hard 500 — mirrors the canonical branch.
+        assert_eq!(json_pure_failure_status(SERVER_BUSY_CODE), 503);
+        assert_eq!(json_pure_failure_status("forward_pass_failed"), 500);
+        assert_eq!(json_pure_failure_status("decode_failed"), 500);
+    }
+
+    #[test]
+    fn json_aborted_outcome_finishes_as_error() {
+        // F4: an aborted phase must surface finish_reason "error" (the
+        // streaming final-chunk + non-stream choice both read this).
+        assert_eq!(Outcome::Aborted.finish_reason(), "error");
+        assert_eq!(Outcome::Natural.finish_reason(), "stop");
+        assert_eq!(Outcome::MaxTokens.finish_reason(), "length");
+    }
+
+    #[test]
+    fn json_phase2_budget_shares_ceiling_and_floors() {
+        // F2: Phase 2 gets the remainder of the shared ceiling…
+        assert_eq!(json_phase2_budget(2048, 100), 1948);
+        // …and total stays within the request bound when Phase 1 is cheap.
+        assert!(100 + json_phase2_budget(2048, 100) <= 2048);
+        // …but a Phase 1 that burned (nearly) everything still leaves a floor
+        // so the constrained answer is never budgeted to zero.
+        assert_eq!(json_phase2_budget(2048, 2048), JSON_PHASE2_MIN_TOKENS);
+        assert_eq!(json_phase2_budget(16, 16), JSON_PHASE2_MIN_TOKENS);
+        assert_eq!(json_phase2_budget(10, 9999), JSON_PHASE2_MIN_TOKENS);
+    }
+
+    #[test]
+    fn json_phase2_finalize_flags_empty_output_as_error() {
+        // F3: a clean phase that emitted no content is a contract failure for
+        // json_object — reclassified as an explicit error, not a 200/"".
+        for outcome in [Outcome::Natural, Outcome::MaxTokens] {
+            let (o, diag, _) = json_phase2_finalize(json_phase_result(outcome, None, false));
+            assert_eq!(o, Outcome::Aborted);
+            assert_eq!(diag.unwrap().0, JSON_EMPTY_OUTPUT_CODE);
+        }
+    }
+
+    #[test]
+    fn json_phase2_finalize_passes_through_content_and_errors() {
+        // Produced content → success passes through untouched.
+        let (o, diag, _) =
+            json_phase2_finalize(json_phase_result(Outcome::Natural, None, true));
+        assert_eq!(o, Outcome::Natural);
+        assert!(diag.is_none());
+
+        // An existing error is preserved (never masked by the empty guard).
+        let (o, diag, _) = json_phase2_finalize(json_phase_result(
+            Outcome::Aborted,
+            Some(("forward_pass_failed", "boom".into())),
+            false,
+        ));
+        assert_eq!(o, Outcome::Aborted);
+        assert_eq!(diag.unwrap().0, "forward_pass_failed");
+
+        // A server_busy abort survives finalize so the 503 mapping still fires.
+        let (_, diag, _) = json_phase2_finalize(json_phase_result(
+            Outcome::Aborted,
+            Some((SERVER_BUSY_CODE, "busy".into())),
+            false,
+        ));
+        assert_eq!(json_pure_failure_status(diag.unwrap().0), 503);
     }
 
     #[test]

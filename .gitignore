@@ -62,6 +62,9 @@ default.profraw
 # Local-only docs backup (not part of the public repo)
 docs.bak/
 
+# Local-only planning scratch (not part of the public repo)
+docs/plans/
+
 # Python bytecode (e.g. Scripts/make-dmg-dsstore.py imported by tests)
 __pycache__/
 *.pyc

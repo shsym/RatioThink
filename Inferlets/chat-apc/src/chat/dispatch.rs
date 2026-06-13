@@ -171,6 +171,10 @@ async fn dispatch_chat_apc(dispatch: InferletDispatch, res: Responder) -> Finish
         tool_choice: input.tool_choice,
         speculation: input.speculation,
         cache: input.cache,
+        // Tree-of-thought drives its own constrained scoring grammar and
+        // never asks for JSON-mode answer decoding (#572) — keep this
+        // dispatch path unconstrained so ToT is unaffected.
+        response_format: None,
     };
     completions::handle_parsed(request, res).await
 }

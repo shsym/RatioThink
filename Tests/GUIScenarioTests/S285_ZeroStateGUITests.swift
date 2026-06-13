@@ -74,32 +74,48 @@ final class S285_ZeroStateGUITests: XCTestCase {
                          "empty-state placeholder must sit below the search field")
   }
 
-  /// The col-3 zero-state "Start Chat" CTA must create a chat and open it,
-  /// not dead-end (previously wired to an empty closure).
+  /// #577: the Chats "start" landing is a ready new-chat composer — selecting
+  /// it (the default at launch) opens an editable composer directly, with NO
+  /// separate "Start Chat" click and NO chat row persisted until the first
+  /// send. The empty chat DB must therefore still show the sidebar's empty
+  /// placeholder (no draft was created just by landing on the composer).
   @MainActor
-  func test_start_chat_cta_opens_a_live_chat() async throws {
+  func test_start_lands_in_new_chat_composer_without_persisting_a_draft() async throws {
     let app = makeApp()
     app.launch()
     defer { app.terminate() }
     XCTAssert(app.wait(for: .runningForeground, timeout: 5))
     app.activate()
 
-    let startChat = app.buttons["Start Chat"]
-    XCTAssertTrue(startChat.waitForExistence(timeout: 5),
-                  "col-3 zero-state Start Chat CTA missing")
-    startChat.click()
+    // The composer is the landing surface — present without any New Chat click.
+    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "composer.text")
+                    .firstMatch.waitForExistence(timeout: 5),
+                  "Chats landing must open the editable new-chat composer directly")
+    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "newChat.view")
+                    .firstMatch.waitForExistence(timeout: 5),
+                  "Chats landing must mount NewChatView")
+    XCTAssertFalse(app.buttons["Start Chat"].exists,
+                   "the new-chat composer replaces the old 'Start Chat' CTA")
 
-    // Selecting the new chat swaps col-3 from the zero-state to the chat
-    // scaffold — the composer send button only exists inside a live chat.
-    XCTAssertTrue(app.buttons["composer.send"].waitForExistence(timeout: 5),
-                  "Start Chat must create a chat and open the chat scaffold")
-    XCTAssertTrue(startChat.waitForNonExistence(timeout: 5),
-                  "zero-state CTAs must dismiss once a chat is selected")
+    // No chat row was persisted just by landing on the composer: the empty DB
+    // still shows the sidebar empty-state placeholder (#577 "no draft until
+    // first send"; #512 prune stays the belt-and-braces net).
+    XCTAssertTrue(app.buttons["chats.empty.newButton"].waitForExistence(timeout: 5),
+                  "landing on the new-chat composer must not persist a draft chat")
+
+    // Typing enables send without creating a row yet (the send is what would
+    // create + route the chat).
+    typeComposerText("hello", in: app)
+    XCTAssertTrue(app.buttons["composer.send"].isEnabled,
+                  "composer send must enable once the new-chat draft is non-empty")
+    XCTAssertTrue(app.buttons["chats.empty.newButton"].exists,
+                  "typing (without sending) must still not persist a draft chat")
   }
 
-  /// #422: the old per-endpoint "Add Endpoint" CTA stays absent from the
-  /// col-3 zero-state, while selecting the sidebar's "API Endpoints" section
-  /// opens the single live `LocalAPIView` for Rational's engine endpoint.
+  /// #422 + #577: the old per-endpoint "Add Endpoint" CTA stays absent, the
+  /// sidebar's "API Endpoints" section opens the single live `LocalAPIView`,
+  /// AND the chat list stays mounted in the left panel across that selection
+  /// (it is no longer hidden when a non-Chat view is shown).
   @MainActor
   func test_api_endpoints_section_opens_local_api_view_without_add_endpoint_cta() async throws {
     let app = makeApp()
@@ -108,15 +124,25 @@ final class S285_ZeroStateGUITests: XCTestCase {
     XCTAssert(app.wait(for: .runningForeground, timeout: 5))
     app.activate()
 
-    XCTAssertTrue(app.buttons["Start Chat"].waitForExistence(timeout: 5),
-                  "shipped col-3 zero-state Start Chat CTA missing")
+    // Settle on the landing before interacting (the composer is the start
+    // landing) so the synthesized nav-row click below lands on a key window.
+    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "composer.text")
+                    .firstMatch.waitForExistence(timeout: 5),
+                  "start landing (new-chat composer) did not appear")
     XCTAssertFalse(app.buttons["Add Endpoint"].exists,
-                   "zero-state must not expose the removed per-endpoint Add Endpoint CTA")
+                   "landing must not expose the removed per-endpoint Add Endpoint CTA")
 
-    let navRow = app.descendants(matching: .any).matching(identifier: "API Endpoints").firstMatch
-    XCTAssertTrue(navRow.waitForExistence(timeout: 5),
-                  "sidebar 'API Endpoints' nav row missing")
-    navRow.click()
+    // Switch to the API Endpoints view (activate-and-retry to survive a
+    // not-key launch where a single click can be dropped).
+    let localAPI = app.descendants(matching: .any).matching(identifier: "LocalAPIView").firstMatch
+    selectSidebarSection("API Endpoints", until: localAPI, in: app)
+
+    // #577 item 1: the chat list (its search field + New Chat header button)
+    // stays visible in the left panel even though the detail shows LocalAPIView.
+    XCTAssertTrue(app.textFields["chats.searchField"].waitForExistence(timeout: 5),
+                  "chat search must stay visible when the API Endpoints view is selected")
+    XCTAssertTrue(app.buttons["chats.newButton"].exists,
+                  "chat list New Chat button must stay visible in the API Endpoints view")
 
     // The single live view mounts in the detail column; its security section
     // (read-only posture) is always present whether or not the engine runs.

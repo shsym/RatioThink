@@ -99,9 +99,6 @@ struct ContentToolbar: View {
 
   @State private var showParamsPopover = false
   @State private var showSystemPopover = false
-#if DEBUG
-  @State private var didRunTestAutoProfilePick = false
-#endif
 
   init(
     viewModel: ChatTranscriptViewModel,
@@ -255,19 +252,35 @@ struct ContentToolbar: View {
       Self.testAutoPickProfileID ?? "",
       viewModel.selectedProfileID,
       selectedModelID ?? "",
+      // Track pending-presence so a popover dismissed by a focus blip (the
+      // `.popover` is transient and dies when the window resigns key under a
+      // contended seated session) re-runs this task and re-raises the swap —
+      // the seam mirrors a user who would simply re-open the profile menu. A
+      // one-shot latch could never recover that dismissal.
+      swapCoordinator.pending == nil ? "no-pending" : "pending",
     ].joined(separator: "|")
   }
 
   @MainActor
   private func runTestAutoProfilePickIfNeeded() async {
-    guard !didRunTestAutoProfilePick,
-          let target = Self.testAutoPickProfileID,
+    guard let target = Self.testAutoPickProfileID,
           selectedModelID != nil,
-          viewModel.selectedProfileID != target
+          viewModel.selectedProfileID != target,
+          swapCoordinator.pending == nil
     else { return }
 
-    didRunTestAutoProfilePick = true
+    // Settle briefly so a still-resolving model selection doesn't race the
+    // pick. NO one-shot latch: the latch-before-await was the solo flake —
+    // `.task(id:)` cancels this task whenever the id changes (e.g.
+    // `selectedModelID` resolves nil→X during the sleep), so a latch set here
+    // permanently skipped the cancelled `selectProfile` and the popover never
+    // appeared. Re-checking after the await fires exactly once per stable
+    // pendable state instead.
     try? await Task.sleep(nanoseconds: 300_000_000)
+    guard !Task.isCancelled,
+          viewModel.selectedProfileID != target,
+          swapCoordinator.pending == nil
+    else { return }
     selectProfile(target)
   }
 #endif

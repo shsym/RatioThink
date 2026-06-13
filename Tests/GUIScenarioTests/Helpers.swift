@@ -86,17 +86,25 @@ func openFreshChat(
   let composer = app.descendants(matching: .any)
     .matching(identifier: "composer.text")
     .firstMatch
-  if composer.waitForExistence(timeout: 1) { return }
+  // #577: the Chats launch landing is now a NON-persisting new-chat draft
+  // composer (no chat row until the first send). Most callers of
+  // `openFreshChat` want a PERSISTED chat to interact with (type/send, prune,
+  // rename, select), so we cannot early-return on the draft composer's
+  // presence — that would hand back a chat with no row. Always click a New
+  // Chat affordance (which persists immediately) and confirm a real row landed
+  // in the sidebar before returning.
+  let firstRow = app.descendants(matching: .any)
+    .matching(identifier: "chats.row")
+    .firstMatch
 
-  // Prefer the larger empty-state affordances when a test starts from an empty
-  // chat DB and fall back to the tiny 14pt header icon only when needed. In
-  // macOS GUI runs XCTest can synthesize a click yet leave the SwiftUI action
-  // undelivered while the app is busy settling; after each real user affordance
-  // click, wait on the product condition (chat scaffold appears) before trying
+  // Prefer the larger empty-state affordance when a test starts from an empty
+  // chat DB and fall back to the header icon otherwise. In macOS GUI runs
+  // XCTest can synthesize a click yet leave the SwiftUI action undelivered
+  // while the app is busy settling; after each real user affordance click,
+  // wait on the product condition (a persisted row + composer) before trying
   // the next affordance.
   let candidates: [(String, XCUIElement)] = [
     ("empty chat-list New Chat", app.buttons["chats.empty.newButton"]),
-    ("detail Start Chat", app.buttons["Start Chat"]),
     ("header New Chat", app.buttons["chats.newButton"]),
   ]
 
@@ -111,8 +119,8 @@ func openFreshChat(
       guard button.waitForExistence(timeout: 2) else { continue }
       sawCandidate = true
       button.click()
-      if composer.waitForExistence(timeout: 5) { return }
-      NSLog("openFreshChat: %@ click did not open composer; trying next affordance", label)
+      if firstRow.waitForExistence(timeout: 5), composer.waitForExistence(timeout: 5) { return }
+      NSLog("openFreshChat: %@ click did not open a persisted chat; trying next affordance", label)
     }
     if !sawCandidate {
       NSLog("openFreshChat: no affordance visible (empty tree?); re-activating")
@@ -165,6 +173,36 @@ func selectPersistedChat(
   } while Date() < deadline
 
   XCTFail("persisted chat row '\(title)' did not open the chat scaffold; app tree: \(app.debugDescription)",
+          file: file, line: line)
+}
+
+/// Click a sidebar nav row (by accessibility identifier) and wait until
+/// `target` mounts in the detail column, re-activating + retrying the click to
+/// survive a not-key launch where a synthesized click can be silently dropped
+/// (the multi-launch focus hazard — a later launch in a multi-test run comes up
+/// not-key, so a single click is unreliable). Mirrors `selectPersistedChat`'s
+/// activate-and-retry loop for the nav-row case (#577).
+@MainActor
+func selectSidebarSection(
+  _ identifier: String,
+  until target: XCUIElement,
+  in app: XCUIApplication,
+  file: StaticString = #filePath,
+  line: UInt = #line
+) {
+  let navRow = app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+  XCTAssertTrue(navRow.waitForExistence(timeout: 10),
+                "sidebar nav row '\(identifier)' missing; app tree: \(app.debugDescription)",
+                file: file, line: line)
+  let deadline = Date().addingTimeInterval(15)
+  repeat {
+    app.activate()
+    navRow.click()
+    if target.waitForExistence(timeout: 2) { return }
+    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25))
+  } while Date() < deadline
+
+  XCTFail("selecting sidebar section '\(identifier)' did not mount the expected detail; app tree: \(app.debugDescription)",
           file: file, line: line)
 }
 

@@ -300,4 +300,65 @@ final class ProfileTests: XCTestCase {
     p.speculation = nil
     XCTAssertNil(try Profile.parse(toml: try p.dump()).speculation)
   }
+
+  // MARK: - [constraint] (#572 JSON Think)
+
+  func test_parses_constraint_json_object() throws {
+    let p = try Profile.parse(toml: """
+    id = "json-think"
+    name = "JSON Think"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [constraint]
+    response_format = "json_object"
+    """)
+    XCTAssertEqual(p.responseFormat, .jsonObject)
+  }
+
+  func test_absent_constraint_section_is_nil() throws {
+    let toml = """
+    id = "x"
+    name = "X"
+    model = "m"
+    inferlet = "chat-apc"
+    """
+    XCTAssertNil(try Profile.parse(toml: toml).responseFormat)
+  }
+
+  func test_unknown_response_format_parses_to_nil_not_error() throws {
+    // Forward-compat: an unrecognized value is unconstrained, not a hard
+    // parse failure (mirrors the lenient v2-section posture).
+    let p = try Profile.parse(toml: """
+    id = "x"
+    name = "X"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [constraint]
+    response_format = "json_schema"
+    """)
+    XCTAssertNil(p.responseFormat)
+  }
+
+  func test_dump_round_trips_constraint() throws {
+    let p = Profile(id: "x", name: "X", model: "m", inferlet: "chat-apc",
+                    responseFormat: .jsonObject)
+    let reparsed = try Profile.parse(toml: try p.dump())
+    XCTAssertEqual(reparsed.responseFormat, .jsonObject)
+  }
+
+  func test_dump_drops_constraint_when_cleared_to_nil() throws {
+    var p = try Profile.parse(toml: """
+    id = "x"
+    name = "X"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [constraint]
+    response_format = "json_object"
+    """)
+    p.responseFormat = nil
+    XCTAssertNil(try Profile.parse(toml: try p.dump()).responseFormat)
+  }
 }
