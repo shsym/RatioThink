@@ -2,7 +2,7 @@ import Foundation
 
 /// App-side deterministic downloader used only by package-backed GUI
 /// E2E. Unlike `EnvironmentFakeModelDownloader`, this writes the
-/// requested curated file to RatioThink's canonical model cache path so the
+/// requested curated file to Rational's canonical model cache path so the
 /// first-launch wizard exercises a real downloaded-model state under
 /// the isolated `PIE_HOME`.
 final class EnvironmentFixtureModelDownloader: ModelDownloading, @unchecked Sendable {

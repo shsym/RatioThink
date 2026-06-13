@@ -66,13 +66,13 @@ struct FirstLaunchWizardView: View {
 
   private var helperPurposeStep: some View {
     VStack(alignment: .leading, spacing: 16) {
-      Label("Welcome to RatioThink", systemImage: "sparkles")
+      Label("Welcome to Rational", systemImage: "sparkles")
         .font(.largeTitle.bold())
       Text("Run AI models locally on your Mac — private and offline.")
         .font(.title3)
         .foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)
-      bullet("Chat with your models in RatioThink, or serve them to other apps over an OpenAI-compatible endpoint.")
+      bullet("Chat with your models in Rational, or serve them to other apps over an OpenAI-compatible endpoint.")
       bullet("Download and manage models anytime in Settings → Models.")
 
       HStack {
@@ -85,22 +85,21 @@ struct FirstLaunchWizardView: View {
 
   private var loginItemStep: some View {
     VStack(alignment: .leading, spacing: 16) {
-      Label("Keep RatioThink ready in the menu bar", systemImage: "menubar.rectangle")
+      Label("Keep Rational ready in the menu bar", systemImage: "menubar.rectangle")
         .font(.largeTitle.bold())
-      Text("RatioThinkHelper must run in the menu bar for RatioThink to work. Register it as a login item so macOS can launch the helper.")
+      Text("Rational Helper must run in the menu bar for Rational to work. Register it as a login item so macOS can launch the helper.")
         .font(.title3)
         .foregroundStyle(.secondary)
         .fixedSize(horizontal: false, vertical: true)
 
       HStack(spacing: 10) {
-        Image(systemName: loginStatus.canContinue ? "checkmark.circle.fill" : "circle")
-          .foregroundStyle(loginStatus.canContinue ? .green : .secondary)
+        loginStatusIndicator
         Text(loginStatus.userVisibleText)
           .accessibilityIdentifier("FirstLaunchLoginStatus")
       }
 
       if loginStatus == .requiresApproval {
-        Text("Open System Settings → General → Login Items and approve RatioThinkHelper, then return here.")
+        Text("Open System Settings → General → Login Items and approve Rational Helper, then return here.")
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
@@ -114,14 +113,14 @@ struct FirstLaunchWizardView: View {
       HStack {
         Button("Back") { step = .helperPurpose }
         Spacer()
-        Button("Register RatioThinkHelper") { registerLoginItem() }
+        Button("Register Rational Helper") { registerLoginItem() }
           .buttonStyle(.bordered)
           .disabled(loginStatus == .enabled)
         if loginStatus == .requiresApproval {
           Button("Refresh status") { loginStatus = registrar.status }
             .buttonStyle(.bordered)
         }
-        Button("Open RatioThink") {
+        Button("Open Rational") {
           appPreferences.completeFirstLaunch()
         }
         .buttonStyle(.borderedProminent)
@@ -137,6 +136,14 @@ struct FirstLaunchWizardView: View {
       Text(text)
         .fixedSize(horizontal: false, vertical: true)
     }
+  }
+
+  private var loginStatusIndicator: some View {
+    Image(systemName: loginStatus.canContinue ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+      .symbolRenderingMode(.hierarchical)
+      .foregroundStyle(loginStatus.canContinue ? .green : .red)
+      .accessibilityIdentifier("FirstLaunchLoginStatusIndicator")
+      .accessibilityLabel(loginStatus.canContinue ? "Helper registered" : "Helper registration required")
   }
 
   private func registerLoginItem() {

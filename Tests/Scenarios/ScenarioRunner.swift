@@ -42,11 +42,10 @@ public protocol ScenarioRunner {
   // before Phase 2 brings up the helper listener.
   func xpcRoundTripEngineStatus(_ status: EngineStatus) async throws -> EngineStatus
   func xpcRoundTripDownloadHandle(_ handle: DownloadHandle) async throws -> DownloadHandle
-  func xpcRoundTripLoadHandle(_ handle: LoadHandle) async throws -> LoadHandle
   func xpcRoundTripEngineError(_ error: EngineError) async throws -> EngineError
   func xpcStartEngineReplyRoundTrip(
-    _ result: Result<RatioThinkCore.EnginePort, EngineError>
-  ) async throws -> Result<RatioThinkCore.EnginePort, EngineError>
+    _ result: Result<EngineSessionSnapshot, EngineError>
+  ) async throws -> Result<EngineSessionSnapshot, EngineError>
 }
 
 // Note: S4 (Helper menu bar) and S5 (App window shell) are GUI-only and

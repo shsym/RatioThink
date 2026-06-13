@@ -3,7 +3,7 @@
 #   Settings acquisition → chat-apc → chat send/persist.
 #
 # Verifies THREE layers against one acquired model:
-#   Phase A: RatioThink.app downloads a curated GGUF through Settings → Models
+#   Phase A: Rational.app downloads a curated GGUF through Settings → Models
 #            (the real ModelDownloader, ) into GUI_HOME/models.
 #   Engine:  boot pie + chat-apc serving THAT downloaded GGUF via the
 #            portable driver (.portable(modelSlug, modelsRoot)).
@@ -11,7 +11,7 @@
 #            HTTPEngineClient → /v1/chat/completions path the app uses
 #            and asserts the engine reply contains "Paris" (engine
 #            contract, decoupled from the GUI; UI<->API parity seed).
-#   Layer 2 — GUI: RatioThink.app sends the prompt; the on-screen assistant
+#   Layer 2 — GUI: Rational.app sends the prompt; the on-screen assistant
 #            answer is verified (S204_ChatSendGUITests).
 #   Layer 3 — persistence: the assistant answer is verified in the
 #            SwiftData store after relaunch (sqlite "Paris" check).
@@ -165,7 +165,7 @@ xcrun swift run api-probe
 cat >"$CHAT_CONFIG" <<EOF
 PIE_TEST_ENGINE_BASE_URL=$BASE_URL
 PIE_TEST_GUI_HOME=$GUI_HOME
-PIE_TEST_CHAT_MODEL=$REPO/$FILE
+PIE_TEST_CHAT_MODEL_PIN=$REPO/$FILE
 EOF
 
 echo "full e2e: PHASE B — chat send/persist against the acquired model"
