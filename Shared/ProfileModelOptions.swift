@@ -30,6 +30,10 @@ public enum ProfileModelOptions {
     public let unsupportedReason: String?
     /// `true` for the profile's current model (checkmarked).
     public let isCurrent: Bool
+    /// Structured identity parsed from `slug` (#580) — the picker renders
+    /// `parts.base` prominent + `parts.quant` as a tag, and groups rows by
+    /// `parts.groupKey`. Derived from the slug so it always agrees with it.
+    public let parts: ModelNameParts
 
     public var id: String { slug }
 
@@ -47,6 +51,7 @@ public enum ProfileModelOptions {
       self.isOverLimit = isOverLimit
       self.isCurrent = isCurrent
       self.unsupportedReason = unsupportedReason
+      self.parts = ModelNameParts.parse(slug)
     }
   }
 
@@ -60,13 +65,25 @@ public enum ProfileModelOptions {
   public static func build(models: [InstalledModel],
                            current: String,
                            limitBytes: Int64?) -> [Option] {
+    // #580 Q1: dedup by STRUCTURED IDENTITY (base+quant+format), not exact
+    // slug — so an app-managed copy and an HF-cache copy of the same file
+    // collapse to one row (app-managed first wins, the resolver's
+    // app-staged-first precedence). Distinct quants (Q4 vs Q8) keep
+    // separate identities and stay as separate rows.
     var bySlug: [String: InstalledModel] = [:]
+    var seenIdentity = Set<String>()
     var order: [String] = []
-    for model in models where bySlug[model.filename] == nil {
+    for model in models {
+      let identity = ModelNameParts.parse(model.filename).identity
+      guard seenIdentity.insert(identity).inserted else { continue }
       bySlug[model.filename] = model
       order.append(model.filename)
     }
-    if !current.isEmpty, bySlug[current] == nil {
+    // The profile's current model must always be visible + checkmarked,
+    // even when not installed. Keyed by SLUG (not identity) so the exact
+    // value the profile carries is the one marked current; only skipped
+    // when that very slug is already among the discovered rows.
+    if !current.isEmpty, bySlug[current] == nil, !order.contains(current) {
       order.append(current)
     }
 

@@ -62,6 +62,39 @@ final class ProfileModelOptionsTests: XCTestCase {
     XCTAssertEqual(dup?.isOverLimit, false, "app entry (100 B) wins, so not over the 1 GiB limit")
   }
 
+  // #580 Q1: dedup is by STRUCTURED IDENTITY, not exact slug. An
+  // app-managed copy and an HF-cache copy of the same file carry different
+  // slugs but the same identity → one row, app-managed wins.
+  func test_dedup_collapses_app_and_hf_copies_by_identity() {
+    let options = ProfileModelOptions.build(
+      models: [appModel("Qwen3-0.6B-Q8_0.gguf", sizeBytes: 100),
+               hfModel("Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf", sizeBytes: 999)],
+      current: "",
+      limitBytes: nil)
+    XCTAssertEqual(options.count, 1, "the two copies share one structured identity")
+    XCTAssertEqual(options.first?.source, .appManaged, "app-managed copy wins")
+    XCTAssertEqual(options.first?.sizeBytes, 100)
+  }
+
+  // Distinct quants are distinct loadable models — never collapsed.
+  func test_dedup_keeps_distinct_quants_separate() {
+    let options = ProfileModelOptions.build(
+      models: [appModel("Llama-3.2-1B-Instruct-Q4_K_M.gguf"),
+               appModel("Llama-3.2-1B-Instruct-Q8_0.gguf")],
+      current: "",
+      limitBytes: nil)
+    XCTAssertEqual(options.count, 2)
+  }
+
+  func test_option_carries_parsed_parts() {
+    let options = ProfileModelOptions.build(
+      models: [appModel("Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf")],
+      current: "",
+      limitBytes: nil)
+    XCTAssertEqual(options.first?.parts.base, "Qwen3 0.6B")
+    XCTAssertEqual(options.first?.parts.quant, "Q8_0")
+  }
+
   func test_over_limit_flag_uses_size_and_ceiling() {
     let options = ProfileModelOptions.build(
       models: [hfModel("Qwen/Big", sizeBytes: 56 * gib),

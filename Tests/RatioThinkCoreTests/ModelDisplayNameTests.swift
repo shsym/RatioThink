@@ -94,6 +94,18 @@ final class ModelNamePartsTests: XCTestCase {
     XCTAssertNil(parts.format)
   }
 
+  // MARK: - format tag (Q3: dropped when redundant)
+
+  func test_gguf_format_tag_is_suppressed_as_redundant() {
+    let parts = ModelNameParts.parse("Qwen3-0.6B-Q8_0.gguf")
+    XCTAssertEqual(parts.format, "GGUF", "format is still parsed for the dedup key")
+    XCTAssertNil(parts.formatTag, "a GGUF tag is noise on every row — dropped")
+  }
+
+  func test_no_format_has_no_tag() {
+    XCTAssertNil(ModelNameParts.parse("Qwen/Qwen3-0.6B").formatTag)
+  }
+
   // MARK: - structured identity (dedup/group key, #580 Q1)
 
   func test_identity_collapses_app_and_hf_copies_of_same_file() {

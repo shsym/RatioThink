@@ -57,6 +57,16 @@ public struct ModelNameParts: Equatable, Sendable {
   /// cluster under a single section header.
   public var groupKey: String { base }
 
+  /// Format to render as a chip, or nil when it adds nothing (Q3:
+  /// "dropped when redundant"). `GGUF` is the universal v1 container, so a
+  /// `GGUF` tag is pure noise on every row — suppress it. A non-GGUF
+  /// format (should one ever appear) still surfaces, keeping the tag
+  /// honest rather than hard-coding it away.
+  public var formatTag: String? {
+    guard let format, format != "GGUF" else { return nil }
+    return format
+  }
+
   /// Recognized GGUF quant token: `Q<digits>` optionally followed by
   /// `_<alnum>` segments (`Q8_0`, `Q4_K_M`, `Q6_K`, `Q5_K_S`). Anchored to
   /// a full path segment so it matches the trailing quant token only.
