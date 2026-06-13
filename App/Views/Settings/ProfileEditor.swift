@@ -103,22 +103,30 @@ struct ProfileEditor: View {
   /// swap-confirm PRE-FILL only — it never triggers a load.
   private func modelPicker(profile: Profile) -> some View {
     Menu {
-      ForEach(modelOptions) { option in
-        Button {
-          persistModel(option.slug, profileID: profile.id)
-        } label: {
-          // Value is the resolvable slug; label is the friendly leaf
-          // plus size + over-limit / unsupported reason.
-          modelOptionLabel(option)
+      // #580 #4: cluster all quants of a family under one base-name section
+      // header so the menu reads as "Llama 3.2 1B Instruct → Q4 / Q8"
+      // instead of a flat list of long leaf names.
+      ForEach(ModelIdentityGrouping.grouped(modelOptions, slug: \.slug)) { group in
+        Section(group.base) {
+          ForEach(group.items) { option in
+            Button {
+              persistModel(option.slug, profileID: profile.id)
+            } label: {
+              // Within a base section the row's primary text is the quant
+              // tag (the distinguishing part) plus size + over-limit /
+              // unsupported reason.
+              modelOptionLabel(option)
+            }
+            // Block selecting an unloadable model — over-limit (too large for
+            // this host) or unsupported (a split GGUF the engine can't load)
+            // — but never the current value, which stays a no-op.
+            .disabled((option.isOverLimit || option.unsupportedReason != nil) && !option.isCurrent)
+          }
         }
-        // Block selecting an unloadable model — over-limit (too large for
-        // this host) or unsupported (a split GGUF the engine can't load)
-        // — but never the current value, which stays a no-op.
-        .disabled((option.isOverLimit || option.unsupportedReason != nil) && !option.isCurrent)
       }
     } label: {
       HStack(spacing: 4) {
-        Text(ModelDisplayName.leaf(profile.model)).monospaced()
+        Text(Self.friendlyModelLabel(profile.model)).monospaced()
         Image(systemName: "chevron.up.chevron.down").font(.caption)
       }
     }
@@ -130,21 +138,27 @@ struct ProfileEditor: View {
   @ViewBuilder
   private func modelOptionLabel(_ option: ProfileModelOptions.Option) -> some View {
     let text = modelOptionText(option)
+    // One systemImage per native menu row: current (checkmark) wins, then a
+    // blocking reason (triangle), then the unverified shield (#580 #5).
     if option.isCurrent {
       Label(text, systemImage: "checkmark")
     } else if option.isOverLimit || option.unsupportedReason != nil {
       Label(text, systemImage: "exclamationmark.triangle")
+    } else if option.isUnverified {
+      Label(text, systemImage: "exclamationmark.shield")
     } else {
       Text(text)
     }
   }
 
-  /// "<leaf>  <size>" plus "— exceeds <limit> limit" when the model is
-  /// too large for this host, or "— <reason>" when the engine can't load
-  /// it at all. Size is omitted when unknown (the synthesized
-  /// current-model entry).
+  /// "<quant>  <size>" plus "— exceeds <limit> limit" when too large for
+  /// this host, or "— <reason>" when the engine can't load it. When there
+  /// is no clean quant (a safetensors dir, a split GGUF) the row keeps the
+  /// FULL leaf — the only stable identifier for such a row — rather than a
+  /// stem that dropped `.gguf`. Size is omitted when unknown (the
+  /// synthesized current-model entry).
   private func modelOptionText(_ option: ProfileModelOptions.Option) -> String {
-    var text = option.displayName
+    var text = option.parts.quantOrLeaf
     if let size = option.sizeBytes {
       text += "  \(InstalledModels.formattedSize(size))"
     }
@@ -154,6 +168,14 @@ struct ProfileEditor: View {
       text += " — \(reason)"
     }
     return text
+  }
+
+  /// Friendly collapsed-picker label for a stored slug: "<base> <quant>"
+  /// (e.g. "Qwen3 0.6B Q8_0"). Falls back to the full leaf when there is no
+  /// clean quant, so a split GGUF / safetensors row keeps its stable
+  /// identifier instead of a `.gguf`-stripped stem.
+  static func friendlyModelLabel(_ slug: String) -> String {
+    ModelNameParts.parse(slug).display
   }
 
   private func systemPromptSection(_ prompt: String) -> some View {

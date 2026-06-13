@@ -84,8 +84,12 @@ struct ModelsSettingsTab: View {
     // error shows as a banner above the table rather than emptying it.
     let scan = await CachedModelScan.run()
     modelsDirectory = scan.modelsDirectory
-    let appSlugs = Set(scan.appManaged.map(\.filename))
-    installed = scan.appManaged + scan.huggingFaceCache.filter { !appSlugs.contains($0.filename) }
+    // #580 Q1: dedup by STRUCTURED IDENTITY (base+quant+format), not exact
+    // slug — an app-managed copy and an HF-cache copy of the same file
+    // collapse to one row, app-managed first (the resolver's
+    // app-staged-first precedence). Distinct quants stay separate rows.
+    installed = ModelIdentityGrouping.deduped(
+      scan.appManaged + scan.huggingFaceCache, slug: \.filename)
     scanError = scan.appError
   }
 
@@ -377,7 +381,12 @@ private struct InstalledModelsTable: View {
       if rows.isEmpty {
         if error == nil { emptyState }
       } else {
-        Table(rows) {
+        // #580 #4: cluster all quants of a family under one base-name
+        // section header. `grouped` preserves the input mtime-desc order, so
+        // the most-recently-touched family stays on top and quants within a
+        // family stay mtime-ordered — grouping clusters without losing
+        // recency.
+        Table(of: InstalledModel.self) {
           TableColumn("Name") { row in
             HStack(spacing: 6) {
               if row.metadataUnreadable {
@@ -396,7 +405,11 @@ private struct InstalledModelsTable: View {
                   .help("Installed without a verified sha256 (no X-Linked-Etag advertised — e.g. a resumed download). Integrity was not checked.")
                   .accessibilityIdentifier("InstalledRow-Unverified-\(row.id)")
               }
-              Text(row.displayName).lineLimit(1).truncationMode(.middle)
+              // #580: within a base-name section the row's primary text is
+              // the quant tag (the distinguishing part), falling back to the
+              // full leaf when there is no clean quant.
+              Text(ModelNameParts.parse(row.filename).quantOrLeaf)
+                .lineLimit(1).truncationMode(.middle)
               if row.source == .huggingFaceCache {
                 // Cached HF models are read-only here (the app does not
                 // own ~/.cache/huggingface). Tag them so the user
@@ -451,6 +464,14 @@ private struct InstalledModelsTable: View {
             }
           }
           .width(min: 50, ideal: 60)
+        } rows: {
+          ForEach(ModelIdentityGrouping.grouped(rows, slug: \.filename)) { group in
+            Section(group.base) {
+              ForEach(group.items) { row in
+                TableRow(row)
+              }
+            }
+          }
         }
         .frame(minHeight: 140)
       }

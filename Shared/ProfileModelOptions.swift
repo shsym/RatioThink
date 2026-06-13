@@ -30,6 +30,11 @@ public enum ProfileModelOptions {
     public let unsupportedReason: String?
     /// `true` for the profile's current model (checkmarked).
     public let isCurrent: Bool
+    /// `true` when the discovered model was installed without a verified
+    /// sha256 (#580 #5 — surfaced as a shield in the picker, mirroring the
+    /// Settings table). The synthesized current entry (not discovered) is
+    /// never unverified.
+    public let isUnverified: Bool
     /// Structured identity parsed from `slug` (#580) — the picker renders
     /// `parts.base` prominent + `parts.quant` as a tag, and groups rows by
     /// `parts.groupKey`. Derived from the slug so it always agrees with it.
@@ -43,7 +48,8 @@ public enum ProfileModelOptions {
                 source: CachedModelSource?,
                 isOverLimit: Bool,
                 isCurrent: Bool,
-                unsupportedReason: String? = nil) {
+                unsupportedReason: String? = nil,
+                isUnverified: Bool = false) {
       self.slug = slug
       self.displayName = displayName
       self.sizeBytes = sizeBytes
@@ -51,6 +57,7 @@ public enum ProfileModelOptions {
       self.isOverLimit = isOverLimit
       self.isCurrent = isCurrent
       self.unsupportedReason = unsupportedReason
+      self.isUnverified = isUnverified
       self.parts = ModelNameParts.parse(slug)
     }
   }
@@ -105,7 +112,8 @@ public enum ProfileModelOptions {
           source: model?.source,
           isOverLimit: isOverLimit(sizeBytes: model?.sizeBytes, limitBytes: limitBytes),
           isCurrent: slug == current,
-          unsupportedReason: reason
+          unsupportedReason: reason,
+          isUnverified: model?.isUnverified ?? false
         )
       }
       .sorted { $0.slug < $1.slug }

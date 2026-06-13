@@ -47,6 +47,12 @@ struct ChatScaffoldView: View {
   /// verified empty/not-running/unreachable engine never re-surfaces
   /// placeholder models the engine would reject ( F2).
   @State private var engineModels: ToolbarModelList = .unknown
+  /// #580 #5: slugs whose staged file is unverified (no sha256 check),
+  /// derived from a read-only model scan. Forwarded to the toolbar model
+  /// menu so a served-but-unverified model carries the same shield the
+  /// Settings table + profile picker show. Refreshed on appear and on
+  /// engine-status change (a load may have brought a new model on disk).
+  @State private var unverifiedModels: Set<String> = []
   /// PR#15 F2/F3: a thrown engine start/stop error (transport failure, a
   /// stop that left the engine running) that the status poll won't
   /// reflect. Surfaced via the in-chat engine-failure banner — NOT the
@@ -234,6 +240,7 @@ struct ChatScaffoldView: View {
         // ( follow-up). Falls back to the injected list only until
         // the first reconcile lands (previews/tests/first paint).
         availableModels: engineModels.resolved(fallback: availableModels),
+        unverifiedModels: unverifiedModels,
         swapCoordinator: swapCoordinator,
         modelLoadCenter: modelLoadCenter,
         engineStatus: engineStatusStore,
@@ -381,7 +388,20 @@ struct ChatScaffoldView: View {
     // ( follow-up). Re-runs whenever the engine status flips.
     .task(id: engineStatusStore.status) {
       await reconcileEngineResidentModel()
+      await refreshUnverifiedModels()
     }
+  }
+
+  /// #580 #5: collect the slugs of staged models that are unverified (no
+  /// sha256 check) via a read-only scan, so the toolbar model menu shields
+  /// a served-but-unverified model. Read-only — never writes the models
+  /// dir; failures degrade to an empty set (no shield) rather than surface.
+  private func refreshUnverifiedModels() async {
+    let scan = await CachedModelScan.run()
+    let unverified = (scan.appManaged + scan.huggingFaceCache)
+      .filter(\.isUnverified)
+      .map(\.filename)
+    unverifiedModels = Set(unverified)
   }
 
   /// When the engine is running, sync `residentModelID` to the id the

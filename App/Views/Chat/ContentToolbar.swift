@@ -23,6 +23,11 @@ struct ContentToolbar: View {
   @ObservedObject var viewModel: ChatTranscriptViewModel
   let availableProfiles: [String]
   let availableModels: [String]
+  /// #580 #5: slugs whose staged file is unverified (no sha256 check). The
+  /// chat dropdown renders a shield on these rows, matching the Settings
+  /// table + profile picker. Empty by default so snapshot/preview call
+  /// sites stay shield-less.
+  let unverifiedModels: Set<String>
   /// Swap coordinator. Required — review v1 F9: defaulting this to a
   /// preview-only `previewDefault()` let a forgotten injection at any
   /// call site silently fall through to an orphan coordinator the
@@ -65,6 +70,7 @@ struct ContentToolbar: View {
     viewModel: ChatTranscriptViewModel,
     availableProfiles: [String] = ["chat"],
     availableModels: [String] = ChatTranscriptViewModel.placeholderModels,
+    unverifiedModels: Set<String> = [],
     swapCoordinator: ProfileSwapCoordinator,
     modelLoadCenter: ModelLoadCenter?,
     engineStatus: EngineStatusStore?,
@@ -76,6 +82,7 @@ struct ContentToolbar: View {
     self.viewModel = viewModel
     self.availableProfiles = availableProfiles
     self.availableModels = availableModels
+    self.unverifiedModels = unverifiedModels
     self.swapCoordinator = swapCoordinator
     self.modelLoadCenter = modelLoadCenter
     self.engineStatus = engineStatus
@@ -170,29 +177,56 @@ struct ContentToolbar: View {
     Menu {
       Button("Use profile default") { viewModel.modelOverride = nil }
       Divider()
-      ForEach(availableModels, id: \.self) { id in
-        // Stored id is the resolvable `<repo>/<file>` slug; show the
-        // friendly leaf.
-        Button(ModelDisplayName.leaf(id)) {
-          // : route through the confirm gate. Picking a model that
-          // differs from the resident model publishes a swap confirm
-          // (with "Set as default for this profile"); picking the
-          // already-resident model just sets the override, no load.
-          swapCoordinator.requestModelOverride(
-            modelID: id,
-            activeProfileID: viewModel.selectedProfileID
-          ) { viewModel.modelOverride = $0 }
+      // #580 #4: cluster all quants of a family under one base-name section
+      // header; each row shows the quant tag (the distinguisher) + an
+      // unverified shield (#580 #5) when the staged file was not sha256-checked.
+      ForEach(ModelIdentityGrouping.grouped(availableModels, slug: { $0 })) { group in
+        Section(group.base) {
+          ForEach(group.items, id: \.self) { id in
+            Button {
+              // : route through the confirm gate. Picking a model that
+              // differs from the resident model publishes a swap confirm
+              // (with "Set as default for this profile"); picking the
+              // already-resident model just sets the override, no load.
+              swapCoordinator.requestModelOverride(
+                modelID: id,
+                activeProfileID: viewModel.selectedProfileID
+              ) { viewModel.modelOverride = $0 }
+            } label: {
+              modelRowLabel(id)
+            }
+          }
         }
       }
     } label: {
       HStack(spacing: 4) {
         Image(systemName: "shippingbox")
-        Text("Model: \(viewModel.modelOverride.map(ModelDisplayName.leaf) ?? "Profile default")")
+        Text("Model: \(modelMenuTitle)")
       }
     }
     .menuStyle(.borderlessButton)
     .fixedSize()
     .accessibilityIdentifier("toolbar.model")
+  }
+
+  /// Collapsed model-menu title: the friendly base+quant of the per-chat
+  /// override, or "Profile default" when none is set.
+  private var modelMenuTitle: String {
+    viewModel.modelOverride.map { ModelNameParts.parse($0).display } ?? "Profile default"
+  }
+
+  /// One native menu row: the quant tag (or full leaf when there is no
+  /// clean quant), with the unverified shield when the staged file was not
+  /// sha256-verified (#580 #5).
+  @ViewBuilder
+  private func modelRowLabel(_ id: String) -> some View {
+    let text = ModelNameParts.parse(id).quantOrLeaf
+    if unverifiedModels.contains(id) {
+      Label(text, systemImage: "exclamationmark.shield")
+        .accessibilityIdentifier("ModelMenu-Unverified-\(id)")
+    } else {
+      Text(text)
+    }
   }
 
   // MARK: - swap helpers

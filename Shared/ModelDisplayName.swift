@@ -57,6 +57,20 @@ public struct ModelNameParts: Equatable, Sendable {
   /// cluster under a single section header.
   public var groupKey: String { base }
 
+  /// Full friendly label replacing the raw leaf everywhere a single model
+  /// is named: `Qwen3 0.6B Q8_0`. Falls back to the raw leaf when there is
+  /// no clean quant (a safetensors dir, a split GGUF) so such a row keeps
+  /// its only stable identifier rather than a `.gguf`-stripped stem.
+  public var display: String {
+    guard let quant else { return raw }
+    return "\(base) \(quant)"
+  }
+
+  /// The within-a-base-section distinguisher: the quant tag, or the raw
+  /// leaf when there is none. Used by grouped surfaces where the section
+  /// header already shows the base.
+  public var quantOrLeaf: String { quant ?? raw }
+
   /// Format to render as a chip, or nil when it adds nothing (Q3:
   /// "dropped when redundant"). `GGUF` is the universal v1 container, so a
   /// `GGUF` tag is pure noise on every row — suppress it. A non-GGUF
