@@ -4,6 +4,7 @@ import SwiftUI
 /// Routines / MCP Servers / Remote Engines as additional cases.
 enum SidebarSection: Hashable, CaseIterable, Identifiable {
   case chats
+  case search
   case apiEndpoints
 
   var id: Self { self }
@@ -11,6 +12,7 @@ enum SidebarSection: Hashable, CaseIterable, Identifiable {
   var title: String {
     switch self {
     case .chats: return "Chats"
+    case .search: return "Search"
     case .apiEndpoints: return "API Endpoints"
     }
   }
@@ -18,8 +20,16 @@ enum SidebarSection: Hashable, CaseIterable, Identifiable {
   var systemImage: String {
     switch self {
     case .chats: return "bubble.left.and.bubble.right"
+    case .search: return "magnifyingglass"
     case .apiEndpoints: return "network"
     }
+  }
+
+  /// Whether the section populates col 2 (the item list). `chats` lists its
+  /// conversations there; `search` and `apiEndpoints` drive a single
+  /// detail-column view, so `RootView` collapses col 2 for them.
+  var hasItemList: Bool {
+    self == .chats
   }
 }
 

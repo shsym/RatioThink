@@ -20,6 +20,10 @@ struct RootView: View {
   @EnvironmentObject private var appPreferences: AppPreferences
   @EnvironmentObject private var updateAvailability: UpdateAvailabilityModel
   @Environment(\.openURL) private var openURL
+  /// Backing store for the titlebar new-chat affordance (below). The chat
+  /// list owns its own context for its own mutations; this one drives the
+  /// global "new chat" that replaced the window branding.
+  @Environment(\.modelContext) private var modelContext
 
   var body: some View {
     VStack(spacing: 0) {
@@ -55,10 +59,11 @@ struct RootView: View {
       NavigationSplitView(columnVisibility: $windowState.columnVisibility) {
         SidebarView(selection: $windowState.selectedSection)
       } content: {
-        if windowState.isItemListHidden || windowState.selectedSection == .apiEndpoints {
+        if windowState.isItemListHidden || !(windowState.selectedSection?.hasItemList ?? false) {
           // Collapse col 2 to zero width when toggled off via View > Hide
-          // List, or for the API Endpoints section, which has no item list —
-          // its single `LocalAPIView` fills the detail column (#422).
+          // List, or for sections with no item list (API Endpoints → its
+          // single `LocalAPIView` fills the detail column, #422; Search →
+          // its panel fills the detail column).
           Color.clear
             .navigationSplitViewColumnWidth(min: 0, ideal: 0, max: 0)
         } else {
@@ -74,9 +79,38 @@ struct RootView: View {
         )
         .navigationSplitViewColumnWidth(min: 480, ideal: 720)
       }
-      .navigationTitle("RatioThink")
+      // Branding removed from the titlebar (was `.navigationTitle("RatioThink")`);
+      // an emphasized new-chat button now occupies that spot. Empty title keeps
+      // the titlebar clear rather than falling back to the bundle name.
+      .navigationTitle("")
+      .toolbar {
+        ToolbarItem(placement: .navigation) {
+          Button(action: createChat) {
+            Image(systemName: "square.and.pencil")
+          }
+          .help("New Chat")
+          .accessibilityIdentifier("chats.newButton")
+        }
+      }
     }
     .task { await runLaunchUpdateCheck() }
+  }
+
+  /// Global new-chat affordance hosted in the titlebar where the app name
+  /// used to render. Creates a chat, switches to the Chats section, and
+  /// selects it so the new conversation opens regardless of which section
+  /// was active. Routes through the same `ChatCreation` seam as the
+  /// list/empty-state buttons so the "don't persist until first send"
+  /// scaffold policy stays in one place.
+  private func createChat() {
+    if let id = ChatCreation.create(
+      in: modelContext,
+      persistenceStatus: persistenceStatus,
+      contextLabel: "RootView.newChat"
+    ) {
+      windowState.selectedSection = .chats
+      windowState.selectedItemID = id
+    }
   }
 
   /// #411: run the once-per-launch update check. Skipped on test/automation

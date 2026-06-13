@@ -7,6 +7,9 @@ struct SidebarView: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 4) {
       sidebarRow(.chats)
+      // Sibling destination: drives a search panel in the detail column
+      // (col 2 collapses). Matches conversation titles + message bodies.
+      sidebarRow(.search)
       // #422: the API Endpoints section now mirrors the live engine HTTP
       // endpoint (LocalAPIView). Selecting it collapses the item-list column
       // and shows the single status view in the detail column.
@@ -22,16 +25,16 @@ struct SidebarView: View {
     Button {
       selection = section
     } label: {
-      HStack(spacing: 6) {
+      HStack(spacing: SidebarMetrics.rowSpacing) {
         Image(systemName: section.systemImage)
-          .frame(width: 18, alignment: .center)
+          .sidebarIcon()
           .foregroundStyle(.secondary)
         Text(section.title)
           .foregroundStyle(.primary)
         Spacer()
       }
-      .padding(.horizontal, 10)
-      .padding(.vertical, 6)
+      .padding(.horizontal, SidebarMetrics.rowHorizontalPadding)
+      .padding(.vertical, SidebarMetrics.rowVerticalPadding)
       .background(
         RoundedRectangle(cornerRadius: 6)
           .fill(selection == section ? Color.accentColor.opacity(0.18) : Color.clear)

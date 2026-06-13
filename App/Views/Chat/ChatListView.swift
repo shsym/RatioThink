@@ -34,20 +34,19 @@ struct ChatListView: View {
     }
   }
 
+  // De-emphasized list header. Renamed "Chats" → "Conversations" and dropped
+  // the bold headline weight for a quiet secondary label. The new-chat button
+  // moved to the titlebar (RootView) so this header carries no control — the
+  // `chats.newButton` identity lives there now.
   private var header: some View {
     HStack {
-      Text("Chats")
-        .font(.headline)
+      Text("Conversations")
+        .font(.subheadline)
+        .foregroundStyle(.secondary)
       Spacer()
-      Button(action: createChat) {
-        Image(systemName: "square.and.pencil")
-      }
-      .buttonStyle(.plain)
-      .help("New Chat")
-      .accessibilityIdentifier("chats.newButton")
     }
-    .padding(.horizontal, 12)
-    .padding(.vertical, 8)
+    .padding(.horizontal, SidebarMetrics.rowHorizontalPadding)
+    .padding(.vertical, SidebarMetrics.rowVerticalPadding)
   }
 
   private var list: some View {
@@ -55,6 +54,14 @@ struct ChatListView: View {
       ForEach(sortedChats) { chat in
         row(for: chat)
           .tag(chat.id)
+          // Share the left-menu horizontal/vertical metric so list rows line
+          // up with the col-1 nav rows and the header above them.
+          .listRowInsets(EdgeInsets(
+            top: SidebarMetrics.rowVerticalPadding,
+            leading: SidebarMetrics.rowHorizontalPadding,
+            bottom: SidebarMetrics.rowVerticalPadding,
+            trailing: SidebarMetrics.rowHorizontalPadding
+          ))
           .contextMenu {
             Button(chat.pinned ? "Unpin" : "Pin") {
               togglePin(chat)
@@ -77,10 +84,10 @@ struct ChatListView: View {
   }
 
   private func row(for chat: Chat) -> some View {
-    HStack(alignment: .firstTextBaseline, spacing: 6) {
+    HStack(alignment: .firstTextBaseline, spacing: SidebarMetrics.rowSpacing) {
       if chat.pinned {
         Image(systemName: "pin.fill")
-          .font(.caption2)
+          .sidebarIcon()
           .foregroundStyle(.secondary)
       }
       VStack(alignment: .leading, spacing: 2) {
@@ -111,8 +118,8 @@ struct ChatListView: View {
       Spacer(minLength: 0)
     }
     .frame(maxWidth: .infinity, alignment: .leading)
-    .padding(.horizontal, 12)
-    .padding(.vertical, 8)
+    .padding(.horizontal, SidebarMetrics.rowHorizontalPadding)
+    .padding(.vertical, SidebarMetrics.rowVerticalPadding)
   }
 
   // MARK: - mutations

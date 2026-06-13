@@ -18,6 +18,10 @@ struct DetailView: View {
       // row via `@Query` keyed on `id`.
       ChatScaffoldView(chatID: id)
         .id(id)
+    case (.search, _):
+      // Sibling destination: a search panel over conversation titles +
+      // message bodies. Selecting a result routes back to the Chats section.
+      ConversationSearchView()
     case (.apiEndpoints, _):
       // One engine, one endpoint: the section maps to a single live view
       // regardless of item selection (the item-list column is collapsed

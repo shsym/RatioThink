@@ -12,8 +12,9 @@ struct ItemListView: View {
       switch section {
       case .chats:
         ChatListView(selectedItemID: $selectedItemID)
-      case .apiEndpoints:
-        // No item list — the single `LocalAPIView` fills the detail column.
+      case .search, .apiEndpoints:
+        // No item list — the search panel / single `LocalAPIView` fills the
+        // detail column (col 2 is collapsed for these sections in RootView).
         EmptyView()
       case .none:
         Text("Select a section")

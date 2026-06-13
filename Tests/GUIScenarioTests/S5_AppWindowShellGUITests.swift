@@ -55,7 +55,12 @@ final class S5_AppWindowShellGUITests: XCTestCase {
 
     let window = app.windows.firstMatch
     XCTAssert(window.waitForExistence(timeout: 5), "main window missing")
-    XCTAssertEqual(window.title, "RatioThink", "title was '\(window.title)'")
+    // Branding label was removed from the titlebar; an emphasized new-chat
+    // button now occupies that spot. The titlebar no longer reads "RatioThink".
+    XCTAssertNotEqual(window.title, "RatioThink",
+                      "titlebar branding should be gone; title was '\(window.title)'")
+    XCTAssertTrue(app.buttons["chats.newButton"].waitForExistence(timeout: 5),
+                  "titlebar New Chat affordance missing")
 
     // Sidebar (col 1) — design §5 final nav vocabulary.
     // SwiftUI can expose nav row text as label/identifier/title/value on
@@ -82,6 +87,13 @@ final class S5_AppWindowShellGUITests: XCTestCase {
     // and routes to the single LocalAPIView.
     XCTAssertTrue(allStrings.contains("API Endpoints"),
                   "sidebar missing 'API Endpoints'; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
+    // Search is a sibling sidebar destination (col 1), at the same level as
+    // Chats and API Endpoints.
+    XCTAssertTrue(allStrings.contains("Search"),
+                  "sidebar missing 'Search'; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
+    // The conversation-list header was renamed Chats → Conversations.
+    XCTAssertTrue(allStrings.contains("Conversations"),
+                  "list header missing 'Conversations'; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
 
     // Detail empty-state — design §5 CTA. Only `Start Chat` is a zero-state
     // CTA; there is no `Add Endpoint` (the local API is the engine's single
