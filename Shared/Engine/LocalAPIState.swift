@@ -199,6 +199,20 @@ public struct LocalAPIState: Equatable {
 ///   stop/restart cannot hide an already-exposed listener.
 /// Off-engine changes are safe to persist immediately because no listener can
 /// be under-reported.
+public struct LocalAPIBindModeRollbackError: Error, LocalizedError {
+  public let startError: Error
+  public let rollbackError: Error
+
+  public init(startError: Error, rollbackError: Error) {
+    self.startError = startError
+    self.rollbackError = rollbackError
+  }
+
+  public var errorDescription: String? {
+    "External access did not start, and the external-access preference could not be restored. The helper-visible preference may still allow external binding on a later relaunch. Start error: \(startError). Rollback error: \(rollbackError)."
+  }
+}
+
 public enum LocalAPIBindModeChange {
   public static func apply(
     enabled: Bool,
@@ -225,7 +239,11 @@ public enum LocalAPIBindModeChange {
       do {
         try await startEngine(.external)
       } catch {
-        try? setPreference(false)
+        do {
+          try setPreference(false)
+        } catch let rollbackError {
+          throw LocalAPIBindModeRollbackError(startError: error, rollbackError: rollbackError)
+        }
         throw error
       }
     } else {

@@ -269,6 +269,40 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertEqual(requestedStarts, [.external])
   }
 
+  func test_bind_mode_change_enable_start_failure_surfaces_rollback_failure() async {
+    struct StartError: Error {}
+    struct RollbackError: Error {}
+    var preferenceWrites: [Bool] = []
+    var requestedStarts: [EngineHTTPBindMode] = []
+
+    do {
+      try await LocalAPIBindModeChange.apply(
+        enabled: true,
+        phase: .serving(port: 8123),
+        profileID: "chat",
+        setPreference: {
+          preferenceWrites.append($0)
+          if $0 == false { throw RollbackError() }
+        },
+        stopEngine: {},
+        startEngine: {
+          requestedStarts.append($0)
+          throw StartError()
+        }
+      )
+      XCTFail("rollback write failure must be surfaced when external start fails")
+    } catch let error as LocalAPIBindModeRollbackError {
+      XCTAssertTrue(error.startError is StartError)
+      XCTAssertTrue(error.rollbackError is RollbackError)
+      XCTAssertEqual(error.errorDescription?.contains("could not be restored"), true)
+    } catch {
+      XCTFail("expected rollback composite error, got: \(error)")
+    }
+
+    XCTAssertEqual(preferenceWrites, [true, false])
+    XCTAssertEqual(requestedStarts, [.external])
+  }
+
   func test_bind_mode_change_propagates_preference_write_failure() async {
     struct StubError: Error {}
     let preferenceEnabled = true
