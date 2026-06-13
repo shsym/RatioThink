@@ -413,8 +413,11 @@ struct ContentToolbar: View {
     // (nothing pinned or defaulted) keeps the generic "Profile default" text.
     if let target = ModelTarget.resolve(selectedModelID: selectedModelID,
                                         profileDefault: profileDefaultModel) {
-      // #580: structured friendly name (base + quant) rather than the raw leaf.
-      return ModelNameParts.parse(target.modelID).display
+      // Leaf — consistent with the live collapsed label (#459
+      // `currentModelSummary` / `modelMenuTitle`, also leaf-derived). #580's
+      // structured base+quant rendering applies to the DROPDOWN ROWS, not this
+      // collapsed-title contract.
+      return ModelDisplayName.leaf(target.modelID)
     }
     return "Profile default"
   }
