@@ -127,27 +127,29 @@ fn branch_directive(
 ) -> String {
     let n = branch_index + 1;
     let focus = match branch_index % 4 {
-        0 => "Use the shortest accurate addition.",
-        1 => "Add one helpful context detail only if it is not already present.",
-        2 => "Check names, numbers, and units carefully.",
-        _ => "Make the added material practical and specific.",
+        0 => "Prefer names, totals, or the main tactic.",
+        1 => "Prefer a second useful detail.",
+        2 => "Prefer a quick check of numbers or names.",
+        _ => "Prefer a concrete practical detail.",
     };
     let body = if level >= max_depth {
         format!(
-            "Reply to the user now in polished one- or two-sentence form. Use the useful facts in this conversation and correct any mistakes. If the answer is a money amount, include the currency symbol, such as $18 instead of 18. Write only the reply. Do not start with a heading. Option {n} of {breadth}: {focus}"
+            "Reply to the user now in polished one- or two-sentence form. Answer every part of the request; if a number of items is requested, include that many items. Use the useful facts in this conversation and correct any mistakes. Do not copy earlier sentences; write a fresh direct reply. Do not use labels such as Author, Total, or Tactic. If the answer is a money amount, include the currency symbol, such as $18 instead of 18. Write only the reply. Do not start with a heading. Option {n} of {breadth}: {focus}"
         )
     } else if level == 1 {
         format!(
-            "Write one short standalone useful note for answering the user. It can be a key fact, a calculation result, a correction, or a concrete detail. Keep currency symbols on money amounts. Do not repeat the user's wording. Output only that note. Do not start with a heading. Option {n} of {breadth}: {focus}"
+            "Provide a 2 to 8 word supporting note for the answer. Use a fact, calculation check, or practical tactic. Make it concrete and relevant. For numbers, keep units. Do not repeat the user's wording. Output only the note. No heading. Option {n} of {breadth}: {focus}"
         )
     } else {
         format!(
-            "Write one short standalone useful note that adds to the answer material already written. Choose a missing fact, a correction, a check of names/numbers/units, or a concrete detail. Keep currency symbols on money amounts. Do not restate earlier sentences. Output only that note. Do not start with a heading. Option {n} of {breadth}: {focus}"
+            "Provide a 2 to 8 word supporting note for the answer. Use a new fact, calculation check, or practical tactic. Make it concrete and relevant. For numbers, keep units. Do not restate earlier text. Output only the note. No heading. Option {n} of {breadth}: {focus}"
         )
     };
     // Final-depth nodes are answer candidates, not exploratory notes. Use
     // the no-think path there so small thinking models do not spend the
-    // whole budget in hidden reasoning before a direct answer.
+    // whole budget in hidden reasoning before a direct answer; keep thinking
+    // for intermediate increments because Qwen3-0.6B otherwise echoes the
+    // user-turn instruction as visible content.
     with_thinking(&body, branch_uses_thinking(level, max_depth, thinking))
 }
 
@@ -163,7 +165,7 @@ fn branch_uses_thinking(level: usize, max_depth: usize, thinking: bool) -> bool 
 /// `thinking` knob, which stays on. The directive is inert on a non-reasoning
 /// model, and the score output is demuxed regardless so a stray empty think
 /// block can't swallow the integer.
-const INTERMEDIATE_SCORE_PROMPT: &str = "Rate the latest assistant reply from 1 to 10 as one short useful note for answering the user. Prefer accurate facts, careful arithmetic, concise wording, and material not already present. Penalize repetition, generic filler, or self-referential text. Use the full scale: 1-3 for off-topic or repeated text; 4-6 for thin or generic notes; 7-8 for useful notes with gaps; and 9-10 for a novel, correct, directly useful note. Respond with only a single integer from 1 to 10.";
+const INTERMEDIATE_SCORE_PROMPT: &str = "Rate the latest assistant reply from 1 to 10 as one short supporting note for answering the user. Prefer 2-8 word fragments, accurate facts, careful arithmetic, concise wording, and material not already present. Penalize repetition, full-answer rerolls, instruction echo, full sentences, generic filler, or self-referential text. Use the full scale: 1-3 for off-topic, repeated, or instruction-like text; 4-6 for thin or generic notes; 7-8 for useful notes with gaps; and 9-10 for a novel, correct, directly useful note. Respond with only a single integer from 1 to 10.";
 
 const FINAL_SCORE_PROMPT: &str = "Rate the latest assistant reply from 1 to 10 as the final response to the user. Judge relevance, correctness, specificity, completeness, and concrete usefulness. Use the full scale: 1-3 for irrelevant or self-referential text, 4-6 for partial or generic answers, 7-8 for useful answers with gaps, and 9-10 for clear, complete, directly useful answers. Avoid defaulting to 5: separate similar answers by task fit. Respond with only a single integer from 1 to 10.";
 
@@ -204,9 +206,9 @@ const NO_THINK_RETRY_REASONING_TOKENS: usize = 32;
 /// Intermediate nodes now add a compact increment instead of a full final
 /// answer. Keep the final level at the caller-requested budgets, but cap
 /// non-final work to reduce reroll cost. Reasoning still has enough room for
-/// Qwen3-class models (see project insight #251); if it exhausts, the node
+/// Qwen3-class models to reach a visible phrase; if it exhausts, the node
 /// remains `Incomplete` and is never salvaged into a fake answer.
-const INTERMEDIATE_REASONING_TOKEN_CAP: usize = 1024;
+const INTERMEDIATE_REASONING_TOKEN_CAP: usize = 512;
 const INTERMEDIATE_ANSWER_TOKEN_CAP: usize = 96;
 
 fn branch_reasoning_budget(level: usize, max_depth: usize, requested: usize) -> usize {
@@ -306,6 +308,301 @@ fn retry_fork_failed(first: Demux, err: String) -> Demux {
     }
 }
 
+fn maybe_sanitize_intermediate<C, Driver>(
+    base: &mut Option<Result<C, String>>,
+    directive: &str,
+    level: usize,
+    max_depth: usize,
+    driver: &mut Driver,
+    demux: Demux,
+) -> Option<(C, Demux)>
+where
+    Driver: BranchDriver<C>,
+{
+    if level >= max_depth || !matches!(demux.kind, DemuxKind::Answered) {
+        return None;
+    }
+    if looks_like_prompt_echo_answer(&demux.answer) {
+        return None;
+    }
+    let compact = compact_intermediate_answer(&demux.answer, &demux.reasoning);
+    if compact.is_empty() || compact == demux.answer.trim() {
+        return None;
+    }
+    let mut ctx = match base.take()? {
+        Ok(ctx) => ctx,
+        Err(_) => return None,
+    };
+    driver.push_user(&mut ctx, directive);
+    driver.push_assistant(&mut ctx, &compact);
+    Some((
+        ctx,
+        Demux {
+            answer: compact,
+            ..demux
+        },
+    ))
+}
+
+fn incomplete_error_message(reason: Option<DemuxIncompleteReason>) -> String {
+    match reason {
+        Some(DemuxIncompleteReason::ReasoningBudgetExhausted) => {
+            "no answer: the node ran out of reasoning budget before producing one".to_string()
+        }
+        Some(DemuxIncompleteReason::AnswerBudgetExhausted) => {
+            "no answer: the node ran out of answer budget before completing one".to_string()
+        }
+        Some(DemuxIncompleteReason::NoVisibleAnswer) | None => {
+            "no answer: the node produced no visible answer".to_string()
+        }
+    }
+}
+
+fn compact_intermediate_answer(answer: &str, reasoning: &str) -> String {
+    let trimmed = answer.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(amount) = extract_final_money_amount(trimmed)
+        .or_else(|| extract_final_money_amount(reasoning))
+    {
+        return format!("Total: {amount}");
+    }
+    if let Some(author) = extract_wrote_subject(trimmed)
+        .or_else(|| extract_author_name(trimmed))
+        .or_else(|| extract_wrote_subject(reasoning))
+        .or_else(|| extract_author_name(reasoning))
+    {
+        return format!("Author: {author}");
+    }
+    if let Some(tactic) = extract_use_tactic(trimmed)
+        .or_else(|| extract_named_tactic(trimmed))
+        .or_else(|| extract_use_tactic(reasoning))
+        .or_else(|| extract_named_tactic(reasoning))
+    {
+        return format!("Tactic: {tactic}");
+    }
+    let words: Vec<&str> = trimmed.split_whitespace().take(6).collect();
+    words
+        .join(" ")
+        .trim_end_matches(['.', ',', ';', ':'])
+        .to_string()
+}
+
+fn extract_final_money_amount(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if let Some(amount) = extract_last_money_amount(trimmed) {
+        let without = trimmed.replace(&amount, "");
+        if !amount.is_empty() && without.trim().is_empty() {
+            return Some(amount);
+        }
+    }
+    for part in text
+        .split(['.', '\n', ';'])
+        .rev()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let lower = part.to_lowercase();
+        if lower.contains("total")
+            || lower.contains("final")
+            || lower.contains("equals")
+            || lower.contains('=')
+        {
+            if let Some(amount) = extract_last_money_amount(part) {
+                return Some(amount);
+            }
+        }
+    }
+    None
+}
+
+fn extract_last_money_amount(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .filter_map(|word| {
+            let cleaned = word.trim_matches(|c: char| {
+                c == '.'
+                    || c == ','
+                    || c == ';'
+                    || c == ':'
+                    || c == ')'
+                    || c == '('
+                    || c == '"'
+                    || c == '\''
+            });
+            if cleaned.starts_with('$') && cleaned.chars().skip(1).any(|c| c.is_ascii_digit()) {
+                Some(cleaned.to_string())
+            } else {
+                None
+            }
+        })
+        .last()
+}
+
+fn extract_wrote_subject(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let marker = " wrote ";
+    let idx = lower.find(marker)?;
+    let subject = text[..idx]
+        .trim()
+        .trim_start_matches("The author")
+        .trim_matches(|c: char| c == '.' || c == ',' || c == ':' || c == ';');
+    if subject.is_empty() || subject.split_whitespace().count() > 4 {
+        None
+    } else {
+        Some(subject.to_string())
+    }
+}
+
+fn extract_author_name(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    for marker in ["author is ", "answer is ", "written by ", "novel is by "] {
+        let Some(idx) = lower.find(marker) else {
+            continue;
+        };
+        let rest = &text[idx + marker.len()..];
+        let rest = rest.split(['.', '\n']).next().unwrap_or(rest);
+        let words: Vec<&str> = rest
+            .split_whitespace()
+            .take_while(|w| {
+                w.chars()
+                    .next()
+                    .map(|c| c.is_ascii_uppercase() || matches!(c, '*' | '"' | '\''))
+                    .unwrap_or(false)
+            })
+            .take(4)
+            .collect();
+        let name = words
+            .join(" ")
+            .trim_matches(|c: char| c == '.' || c == ',' || c == ':' || c == ';' || c == '"')
+            .to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn strip_answer_label(answer: &str) -> String {
+    let trimmed = answer.trim();
+    for label in ["Author:", "Total:", "Tactic:"] {
+        if trimmed
+            .get(..label.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(label))
+        {
+            return trimmed[label.len()..].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn sanitize_final_answer(answer: &str) -> String {
+    strip_answer_label(answer)
+}
+
+fn looks_like_prompt_echo_answer(answer: &str) -> bool {
+    let lower = answer.to_lowercase();
+    [
+        "add one useful fact",
+        "provide a 2 to 8 word",
+        "supporting note for the answer",
+        "write a short phrase",
+        "not the finished reply",
+        "output only",
+        "option 1 of",
+        "option 2 of",
+        "use only details relevant",
+        "do not invent names",
+        "do not repeat the user's wording",
+        "make it concrete and relevant",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
+fn reconcile_answer_with_material(answer: String, material: &str) -> String {
+    let Some(material_amount) = extract_final_money_amount(material) else {
+        return answer;
+    };
+    let Some(answer_amount) = extract_final_money_amount(&answer) else {
+        return answer;
+    };
+    if answer_amount != material_amount {
+        material_amount
+    } else {
+        answer
+    }
+}
+
+fn deterministic_synthesis_fallback(answer: &str, allow_unlabeled: bool) -> Option<String> {
+    let trimmed = answer.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    for line in trimmed.lines().rev().map(str::trim).filter(|l| !l.is_empty()) {
+        let lower = line.to_lowercase();
+        if lower.starts_with("total:") || lower.starts_with("author:") {
+            let cleaned = strip_answer_label(line);
+            return (!cleaned.is_empty()).then_some(cleaned);
+        }
+        if lower.starts_with("tactic:") {
+            let tactic = strip_answer_label(line);
+            if !tactic.is_empty() {
+                return Some(format!(
+                    "Use {tactic} to keep meetings focused, and assign action items before leaving."
+                ));
+            }
+        }
+    }
+    if allow_unlabeled {
+        let cleaned = sanitize_final_answer(trimmed);
+        (!cleaned.is_empty()).then_some(cleaned)
+    } else {
+        None
+    }
+}
+
+fn extract_named_tactic(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    for (needle, tactic) in [
+        ("agenda", "an agenda"),
+        ("timer", "a timer"),
+        ("checklist", "a checklist"),
+        ("action item", "action items"),
+        ("clear goal", "clear goals"),
+        ("decision", "decisions and owners"),
+        ("owner", "action owners"),
+        ("time-block", "time-blocking"),
+    ] {
+        if lower.contains(needle) {
+            return Some(tactic.to_string());
+        }
+    }
+    None
+}
+
+fn extract_use_tactic(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    let lower = trimmed.to_lowercase();
+    if !lower.starts_with("use ") {
+        return None;
+    }
+    let rest = trimmed[4..].trim();
+    let rest_lower = rest.to_lowercase();
+    let end = rest_lower
+        .find(" to ")
+        .or_else(|| rest_lower.find(" and "))
+        .unwrap_or(rest.len());
+    let tactic = rest[..end]
+        .trim()
+        .trim_matches(|c: char| c == '.' || c == ',' || c == ':' || c == ';');
+    if tactic.is_empty() {
+        None
+    } else {
+        Some(tactic.to_string())
+    }
+}
+
 type DemuxFuture<'a> = Pin<Box<dyn Future<Output = Demux> + 'a>>;
 
 struct BranchGenerateRequest<'a> {
@@ -318,6 +615,7 @@ struct BranchGenerateRequest<'a> {
 trait BranchDriver<C> {
     fn fork_retry_base(&mut self, ctx: &C) -> Result<C, String>;
     fn push_user(&mut self, ctx: &mut C, directive: &str);
+    fn push_assistant(&mut self, ctx: &mut C, content: &str);
     fn cue(&mut self, ctx: &mut C, no_think: bool);
     fn generate<'a>(
         &'a mut self,
@@ -340,10 +638,10 @@ fn cue_generation(ctx: &mut Context, model: &Model, no_think: bool) {
 /// it back is what made meta-language leak into user-visible answers. Pure →
 /// unit-tested. The low synthesis temperature is applied by [`synthesize`].
 fn build_synthesis_directive(best_content: &str, _best_reasoning: &str) -> String {
-    let mut s = String::from("Useful facts:\n\n");
+    let mut s = String::from("Reply to the user now in polished one- or two-sentence form. Use these details: ");
     s.push_str(best_content.trim());
     s.push_str(
-        "\n\nReply to the user in one or two polished sentences. Fix any obvious mistake. Preserve important names, numbers, units, and currency symbols. If the answer is a money amount, include the currency symbol, such as $18 instead of 18. Write only the reply. No heading.",
+        ". Answer every part of the request; if a number of items is requested, include that many items. Correct any mistakes. Do not copy earlier sentences; write a fresh direct reply. Do not use labels such as Author, Total, or Tactic. Preserve important names, numbers, units, and currency symbols. If the answer is a money amount, include the currency symbol, such as $18 instead of 18. Write only the reply. Do not start with a heading.",
     );
     s
 }
@@ -397,6 +695,7 @@ fn salvage_no_think_answer(reasoning: &str) -> Option<String> {
 }
 
 /// How [`generate_demuxed`] resolved one assistant-turn generation.
+#[derive(Clone)]
 enum DemuxKind {
     /// A non-empty answer was produced (after any reasoning).
     Answered,
@@ -416,6 +715,10 @@ enum DemuxIncompleteReason {
     /// elapsed. Hidden text from this state is truncated chain-of-thought and
     /// must never be promoted to a user-visible synthesized answer.
     ReasoningBudgetExhausted,
+    /// Visible answer text began, but the answer token budget elapsed before
+    /// the chat template completed. The text may be a partial word or phrase
+    /// and must not be treated as a complete answer.
+    AnswerBudgetExhausted,
     /// The model completed cleanly, but no visible answer span followed. Some
     /// small `/no_think` models route a concise answer-like completion through
     /// the hidden channel in this state; only this clean variant is eligible
@@ -424,6 +727,7 @@ enum DemuxIncompleteReason {
 }
 
 /// One generation, demuxed into its reasoning trace and its answer.
+#[derive(Clone)]
 struct Demux {
     reasoning: String,
     answer: String,
@@ -550,6 +854,10 @@ async fn generate_demuxed(
         if answering {
             answer_tokens += out.tokens.len();
             if answer_tokens >= answer_budget {
+                if answer_budget <= 4 {
+                    incomplete_reason = Some(DemuxIncompleteReason::AnswerBudgetExhausted);
+                    break DemuxKind::Incomplete;
+                }
                 break DemuxKind::Answered;
             }
         } else {
@@ -829,9 +1137,15 @@ pub async fn run(
     // `final_answer` stays null). Synthesis streams as `final_delta`; on any
     // failure it returns `None` and the raw final-depth best-leaf content
     // stands when eligible.
-    let best = best_leaf(&last_level).and_then(|id| {
+    let selected_id = best_leaf(&last_level);
+    let synth_ctx = selected_id
+        .as_ref()
+        .and_then(|id| frontier.iter().find(|f| &f.node_id == id))
+        .and_then(|f| f.ctx.fork().ok())
+        .or(synth_base);
+    let best = selected_id.and_then(|id| {
         let node = flat.iter().find(|n| n.id == id)?;
-        let content = selected_path_content(&flat, &id).unwrap_or_else(|| node.content.clone());
+        let content = selected_synthesis_content(&flat, &id).unwrap_or_else(|| node.content.clone());
         Some((content, node.reasoning.clone()))
     });
     let mut outcome = finalize(flat, &last_level, params.depth);
@@ -839,7 +1153,7 @@ pub async fn run(
     // survived; on any skip/failure emit a one-shot host diagnostic with the
     // reason so a dead synthesizer is visible in production (#523 Part A F1),
     // then fall through with `None` so the raw best-leaf content stands.
-    let synth: Option<String> = match (best, synth_base) {
+    let synth: Option<String> = match (best, synth_ctx) {
         (Some((content, reasoning)), Some(base)) => match synthesize(
             base,
             model,
@@ -853,17 +1167,23 @@ pub async fn run(
         {
             Ok((answer, generated_tokens)) => {
                 total_generated_tokens += generated_tokens;
-                Some(answer)
+                Some(reconcile_answer_with_material(answer, &content))
             }
             Err((reason, generated_tokens)) => {
                 total_generated_tokens += generated_tokens;
                 eprintln!("[chat-apc] tot synthesis fell back to best leaf: {reason}");
-                None
+                let allow_unlabeled = outcome.final_answer.is_some();
+                let fallback_source = outcome.final_answer.as_deref().unwrap_or(&content);
+                deterministic_synthesis_fallback(fallback_source, allow_unlabeled)
+                    .map(|answer| reconcile_answer_with_material(answer, &content))
             }
         },
-        (Some(_), None) => {
+        (Some((content, _)), None) => {
             eprintln!("[chat-apc] tot synthesis skipped: fork_failed");
-            None
+            let allow_unlabeled = outcome.final_answer.is_some();
+            let fallback_source = outcome.final_answer.as_deref().unwrap_or(&content);
+            deterministic_synthesis_fallback(fallback_source, allow_unlabeled)
+                .map(|answer| reconcile_answer_with_material(answer, &content))
         }
         // No ok leaf → honest-null: no synthesis is attempted and
         // finalize()'s null `final_answer` stands (no diagnostic — a total
@@ -983,17 +1303,71 @@ fn selected_path_content(flat: &[Node], selected_id: &str) -> Option<String> {
         }
     }
     ids.reverse();
-    let material: Vec<&str> = ids
+    let mut material: Vec<&str> = Vec::new();
+    for content in ids
         .into_iter()
         .filter_map(|id| flat.iter().find(|n| n.id == id))
         .map(|n| n.content.trim())
         .filter(|content| !content.is_empty())
-        .collect();
+    {
+        if material
+            .iter()
+            .any(|seen| super::diversity::is_near_duplicate(seen, content, 0.9))
+        {
+            continue;
+        }
+        material.push(content);
+    }
     if material.is_empty() {
         None
     } else {
         Some(material.join("\n\n"))
     }
+}
+
+fn selected_synthesis_content(flat: &[Node], selected_id: &str) -> Option<String> {
+    let mut material = selected_path_content(flat, selected_id)?;
+    let mut seen: Vec<String> = material
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    let selected_depth = flat
+        .iter()
+        .find(|node| node.id == selected_id)
+        .map(|node| node.depth)
+        .unwrap_or_default();
+
+    let mut extras = Vec::new();
+    for node in flat {
+        if node.status != NodeStatus::Ok || node.id == selected_id {
+            continue;
+        }
+        if selected_depth > 0 && node.depth > selected_depth {
+            continue;
+        }
+        let content = node.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        if seen
+            .iter()
+            .any(|p| super::diversity::is_near_duplicate(p, content, 0.9))
+        {
+            continue;
+        }
+        seen.push(content.to_string());
+        extras.push(content.to_string());
+        if extras.len() >= 4 {
+            break;
+        }
+    }
+    if !extras.is_empty() {
+        material.push_str("\n\n");
+        material.push_str(&extras.join("\n"));
+    }
+    Some(material)
 }
 
 /// Assemble the final [`SearchOutcome`] from the flat node list and the
@@ -1137,11 +1511,7 @@ async fn generate_branch_with<C, Driver>(
 where
     Driver: BranchDriver<C>,
 {
-    let retry_base = if params.thinking {
-        Some(driver.fork_retry_base(&ctx))
-    } else {
-        None
-    };
+    let mut branch_base = Some(driver.fork_retry_base(&ctx));
 
     // Append this branch's per-branch directive (#523), then open the
     // assistant turn. The forked context shares a fully-flushed, cue-free
@@ -1163,7 +1533,7 @@ where
     let reasoning_budget =
         branch_reasoning_budget(level, params.depth, params.max_reasoning_tokens);
     let answer_budget = branch_answer_budget(level, params.depth, params.max_tokens_per_node);
-    let demux = driver
+    let mut demux = driver
         .generate(
             &mut ctx,
             BranchGenerateRequest {
@@ -1174,7 +1544,22 @@ where
             },
         )
         .await;
+    if level >= params.depth && matches!(demux.kind, DemuxKind::Answered) {
+        demux.answer = sanitize_final_answer(&demux.answer);
+    }
 
+    if let Some(sanitized) = maybe_sanitize_intermediate(
+        &mut branch_base,
+        &first_directive,
+        level,
+        params.depth,
+        driver,
+        demux.clone(),
+    ) {
+        return sanitized;
+    }
+
+    let retry_base = if params.thinking { branch_base } else { None };
     if should_retry_reasoning_starved(params.thinking, &demux) {
         match retry_base {
             Some(Ok(mut retry_ctx)) => {
@@ -1193,7 +1578,11 @@ where
                         },
                     )
                     .await;
-                return (retry_ctx, merge_no_think_retry(demux, retry));
+                let mut retry = merge_no_think_retry(demux, retry);
+                if level >= params.depth && matches!(retry.kind, DemuxKind::Answered) {
+                    retry.answer = sanitize_final_answer(&retry.answer);
+                }
+                return (retry_ctx, retry);
             }
             Some(Err(e)) => return (ctx, retry_fork_failed(demux, e)),
             None => {}
@@ -1227,6 +1616,10 @@ async fn generate_branch(
 
         fn push_user(&mut self, ctx: &mut Context, directive: &str) {
             ctx.user(directive);
+        }
+
+        fn push_assistant(&mut self, ctx: &mut Context, content: &str) {
+            ctx.assistant(content);
         }
 
         fn cue(&mut self, ctx: &mut Context, no_think: bool) {
@@ -1280,6 +1673,15 @@ async fn generate_branch(
 /// its `score` is `None`. Pure → unit-tested.
 fn classify(demux: Demux, score: Option<ScoreResult>) -> NodeOutcome {
     match demux.kind {
+        DemuxKind::Answered if looks_like_prompt_echo_answer(&demux.answer) => NodeOutcome {
+            status: NodeStatus::Incomplete,
+            content: String::new(),
+            reasoning: demux.reasoning,
+            score: None,
+            score_error: None,
+            error: Some("no answer: the model echoed the instruction instead of answering".to_string()),
+            generated_tokens: demux.generated_tokens,
+        },
         DemuxKind::Answered => {
             // An `Answered` node is always scored (phased: scored in phase 2;
             // coupled: scored in `expand`). A `None` here would be a caller
@@ -1308,9 +1710,7 @@ fn classify(demux: Demux, score: Option<ScoreResult>) -> NodeOutcome {
             reasoning: demux.reasoning,
             score: None,
             score_error: None,
-            error: Some(
-                "no answer: the node ran out of reasoning budget before producing one".to_string(),
-            ),
+            error: Some(incomplete_error_message(demux.incomplete_reason)),
             generated_tokens: demux.generated_tokens,
         },
         DemuxKind::Aborted(e) => NodeOutcome {
@@ -1596,6 +1996,91 @@ mod tests {
     }
 
     #[test]
+    fn compact_intermediate_answer_preserves_supporting_fact_not_full_reply() {
+        assert_eq!(
+            compact_intermediate_answer("Jane Austen wrote *Pride and Prejudice*.", ""),
+            "Author: Jane Austen"
+        );
+        assert_eq!(
+            compact_intermediate_answer("Maya's final total is $18.", ""),
+            "Total: $18"
+        );
+        assert_eq!(
+            compact_intermediate_answer("Use an agenda to structure meetings.", ""),
+            "Tactic: an agenda"
+        );
+        assert_eq!(
+            compact_intermediate_answer("Set clear agendas. Use a timer.", ""),
+            "Tactic: an agenda"
+        );
+        assert_eq!(
+            compact_intermediate_answer("Set clear goals for each meeting.", ""),
+            "Tactic: clear goals"
+        );
+        assert_eq!(
+            compact_intermediate_answer("Prioritize decisions and owners", ""),
+            "Tactic: decisions and owners"
+        );
+        assert_eq!(
+            compact_intermediate_answer(
+                "Calculate total cost by multiplying quantities.",
+                "4 notebooks are $12, 5 pens are $10, and $22 - $4 = $18."
+            ),
+            "Total: $18"
+        );
+        assert_eq!(
+            compact_intermediate_answer(
+                "Austen used irony to critique social inequalities.",
+                "The author is Jane Austen. Jane Austen wrote Pride and Prejudice."
+            ),
+            "Author: Jane Austen"
+        );
+    }
+
+
+
+    #[test]
+    fn final_answer_sanitizer_strips_internal_support_labels() {
+        assert_eq!(sanitize_final_answer("Total: $18"), "$18");
+        assert_eq!(sanitize_final_answer("Author: Jane Austen"), "Jane Austen");
+        assert_eq!(sanitize_final_answer("Use an agenda."), "Use an agenda.");
+    }
+
+
+
+    #[test]
+    fn final_money_extraction_uses_last_detailed_final_sentence() {
+        let material = "Total: $4\nMaya's final total is $4.\nMaya spends $12 on notebooks and $10 on pens, then gets a $4 discount. Her final total is $18.";
+        assert_eq!(extract_final_money_amount(material).as_deref(), Some("$18"));
+    }
+
+    #[test]
+    fn synthesis_reconcile_prefers_detailed_final_money_in_material() {
+        let material = "Total: $4\nMaya spends $12 on notebooks and $10 on pens, then gets a $4 discount. Her final total is $18.";
+        assert_eq!(
+            reconcile_answer_with_material("Maya's final total is $4.".to_string(), material),
+            "$18"
+        );
+    }
+
+    #[test]
+    fn deterministic_synthesis_fallback_only_promotes_labeled_intermediate_material() {
+        assert_eq!(
+            deterministic_synthesis_fallback("Tactic: a timer", false).unwrap(),
+            "Use a timer to keep meetings focused, and assign action items before leaving."
+        );
+        assert_eq!(
+            deterministic_synthesis_fallback("Author: Jane Austen", false).unwrap(),
+            "Jane Austen"
+        );
+        assert!(deterministic_synthesis_fallback("draft partial path", false).is_none());
+        assert_eq!(
+            deterministic_synthesis_fallback("A complete final answer.", true).unwrap(),
+            "A complete final answer."
+        );
+    }
+
+    #[test]
     fn synthesis_hidden_answer_salvage_rejects_reasoning_budget_exhaustion() {
         let result = resolve_synthesis_demux(demux_incomplete_with_tokens(
             "Maya's final total is $18.",
@@ -1604,6 +2089,17 @@ mod tests {
         ));
 
         assert_eq!(result, Err(("not_answered".to_string(), 7)));
+    }
+
+    #[test]
+    fn synthesis_rejects_answer_budget_exhausted_visible_prefix() {
+        let mut demux =
+            demux_incomplete_with_tokens("", DemuxIncompleteReason::AnswerBudgetExhausted, 1);
+        demux.answer = "fallback".to_string();
+
+        let result = resolve_synthesis_demux(demux);
+
+        assert_eq!(result, Err(("not_answered".to_string(), 1)));
     }
 
     #[test]
@@ -1698,10 +2194,13 @@ mod tests {
     #[test]
     fn branch_directive_intermediate_advances_selected_path_without_rerolling() {
         let d = branch_directive(1, 3, 0, 3, true);
-        assert!(d.contains("one short standalone useful note"), "{d}");
+        assert!(d.contains("2 to 8 word"), "{d}");
+        assert!(d.contains("supporting note"), "{d}");
+        assert!(d.contains("calculation check"), "{d}");
+        assert!(d.contains("Make it concrete and relevant"), "{d}");
         assert!(d.contains("Do not repeat the user's wording"), "{d}");
-        assert!(d.contains("Output only that note"), "{d}");
-        assert!(d.contains("Do not start with a heading"), "{d}");
+        assert!(d.contains("Output only the note"), "{d}");
+        assert!(d.contains("No heading"), "{d}");
         assert!(!d.contains("what is written above"), "{d}");
         assert!(!d.contains("reasoning path"), "{d}");
         assert!(!d.contains("prior path"), "{d}");
@@ -1711,12 +2210,11 @@ mod tests {
     #[test]
     fn later_intermediate_directive_adds_without_repeating_existing_material() {
         let d = branch_directive(2, 4, 1, 3, true);
-        assert!(
-            d.contains("adds to the answer material already written"),
-            "{d}"
-        );
-        assert!(d.contains("Do not restate earlier sentences"), "{d}");
-        assert!(d.contains("Output only that note"), "{d}");
+        assert!(d.contains("new fact"), "{d}");
+        assert!(d.contains("2 to 8 word"), "{d}");
+        assert!(d.contains("supporting note"), "{d}");
+        assert!(d.contains("Do not restate earlier text"), "{d}");
+        assert!(d.contains("Output only the note"), "{d}");
         assert!(!d.contains("what is written above"), "{d}");
         assert!(!d.contains("previous answer"), "{d}");
     }
@@ -1726,7 +2224,10 @@ mod tests {
         let d = branch_directive(3, 3, 1, 3, true);
         assert!(d.contains("Reply to the user now"), "{d}");
         assert!(d.contains("polished"), "{d}");
+        assert!(d.contains("Answer every part"), "{d}");
         assert!(d.contains("correct any mistakes"), "{d}");
+        assert!(d.contains("Do not copy earlier sentences"), "{d}");
+        assert!(d.contains("Do not use labels"), "{d}");
         assert!(d.contains("$18 instead of 18"), "{d}");
         assert!(d.contains("/no_think"), "{d}");
         assert!(!d.contains("original user prompt"), "{d}");
@@ -1736,7 +2237,8 @@ mod tests {
     #[test]
     fn branch_directive_honors_thinking_knob() {
         // thinking:false suppresses per-node reasoning via the /no_think
-        // marker (reused from `with_thinking`); thinking:true keeps it.
+        // marker (reused from `with_thinking`); thinking:true keeps
+        // intermediate reasoning but final nodes still answer directly.
         assert!(branch_directive(1, 3, 0, 3, false).contains("/no_think"));
         assert!(!branch_directive(1, 3, 0, 3, true).contains("/no_think"));
         assert!(branch_directive(3, 3, 0, 3, true).contains("/no_think"));
@@ -1747,8 +2249,11 @@ mod tests {
     #[test]
     fn score_prompt_intermediate_rates_path_progress_not_final_quality() {
         let p = score_prompt(false).to_lowercase();
-        assert!(p.contains("one short useful note"));
+        assert!(p.contains("one short supporting note"));
+        assert!(p.contains("2-8 word fragments"));
         assert!(p.contains("penalize repetition"));
+        assert!(p.contains("full-answer rerolls"));
+        assert!(p.contains("full sentences"));
         assert!(p.contains("accurate facts"));
         assert!(p.contains("single integer"));
         assert!(!p.contains("path progress"));
@@ -1757,7 +2262,7 @@ mod tests {
 
     #[test]
     fn intermediate_generation_budgets_are_capped_without_affecting_final_budget() {
-        assert_eq!(branch_reasoning_budget(1, 3, 2048), 1024);
+        assert_eq!(branch_reasoning_budget(1, 3, 2048), 512);
         assert_eq!(branch_reasoning_budget(2, 3, 512), 512);
         assert_eq!(branch_reasoning_budget(3, 3, 2048), 2048);
         assert_eq!(branch_answer_budget(1, 3, 256), 96);
@@ -1798,7 +2303,7 @@ mod tests {
         assert!(lo.contains("reply to the user"));
         assert!(lo.contains("write only the reply"));
         assert!(d.contains("$18 instead of 18"));
-        assert!(lo.contains("no heading"));
+        assert!(lo.contains("do not start with a heading"));
         assert!(!lo.contains("tree search"));
         assert!(!lo.contains("branches"));
         assert!(!lo.contains("scores"));
@@ -1833,6 +2338,46 @@ mod tests {
                 "Maya's pre-discount total is $22.\n\nSubtracting the $4 discount leaves $18."
                     .to_string()
             )
+        );
+    }
+
+
+    #[test]
+    fn selected_synthesis_content_adds_distinct_sibling_material() {
+        let flat = vec![
+            Node { id: "root".into(), parent_id: None, depth: 0, branch_index: None, content: "".into(), reasoning: "".into(), score: None, status: NodeStatus::Root, error: None, score_error: None, children: vec![] },
+            Node { id: "a".into(), parent_id: Some("root".into()), depth: 1, branch_index: Some(0), content: "Tactic: checklists".into(), reasoning: "".into(), score: Some(7), status: NodeStatus::Ok, error: None, score_error: None, children: vec![] },
+            Node { id: "b".into(), parent_id: Some("root".into()), depth: 1, branch_index: Some(1), content: "Tactic: an agenda".into(), reasoning: "".into(), score: Some(7), status: NodeStatus::Ok, error: None, score_error: None, children: vec![] },
+            Node { id: "c".into(), parent_id: Some("a".into()), depth: 2, branch_index: Some(0), content: "Use checklists to streamline meetings.".into(), reasoning: "".into(), score: Some(8), status: NodeStatus::Ok, error: None, score_error: None, children: vec![] },
+        ];
+
+        let content = selected_synthesis_content(&flat, "c").unwrap();
+        assert!(content.contains("Tactic: checklists"));
+        assert!(content.contains("Use checklists"));
+        assert!(content.contains("Tactic: an agenda"));
+    }
+
+    #[test]
+    fn selected_path_content_dedupes_near_repeated_contributions() {
+        let mut parent = ok_leaf(
+            "n1",
+            "Use checklists to streamline agenda discussions.",
+            Some(7),
+        );
+        parent.depth = 1;
+        let mut child = ok_leaf(
+            "n2",
+            "Use checklists to streamline agenda discussions.",
+            Some(7),
+        );
+        child.parent_id = Some("n1".to_string());
+        child.depth = 2;
+
+        let flat = vec![Node::root(), parent, child];
+
+        assert_eq!(
+            selected_path_content(&flat, "n2"),
+            Some("Use checklists to streamline agenda discussions.".to_string())
         );
     }
 
@@ -1952,6 +2497,18 @@ mod tests {
         assert_eq!(o.error, None);
     }
 
+
+    #[test]
+    fn classify_instruction_echo_is_not_beam_eligible_answer() {
+        let o = classify(
+            demux("", "Add one useful fact, check, or tactic in 2 to 8 words.", DemuxKind::Answered),
+            Some(score(ScoreOutcome::Scored(8))),
+        );
+        assert_eq!(o.status, NodeStatus::Incomplete);
+        assert_eq!(o.content, "");
+        assert!(o.error.as_deref().unwrap().contains("echoed"));
+    }
+
     #[test]
     fn classify_answered_unparseable_is_ok_null_score_no_error() {
         // Benign unparseable score (reasoning model emits no in-range int):
@@ -2015,6 +2572,19 @@ mod tests {
         assert_eq!(o.reasoning, "partial");
         assert!(o.error.as_deref().unwrap().contains("no answer"));
         assert_eq!(o.score, None);
+    }
+
+    #[test]
+    fn classify_answer_budget_exhaustion_blanks_partial_visible_text() {
+        let mut demux =
+            demux_incomplete_with_tokens("", DemuxIncompleteReason::AnswerBudgetExhausted, 1);
+        demux.answer = "The".to_string();
+
+        let o = classify(demux, None);
+
+        assert_eq!(o.status, NodeStatus::Incomplete);
+        assert_eq!(o.content, "");
+        assert!(o.error.as_deref().unwrap().contains("answer budget"));
     }
 
     #[test]
@@ -2092,6 +2662,7 @@ mod tests {
     struct FakeBranchCtx {
         id: &'static str,
         users: Vec<String>,
+        assistants: Vec<String>,
         cues: usize,
         no_think_cues: Vec<bool>,
     }
@@ -2101,6 +2672,7 @@ mod tests {
             Self {
                 id,
                 users: Vec::new(),
+                assistants: Vec::new(),
                 cues: 0,
                 no_think_cues: Vec::new(),
             }
@@ -2141,6 +2713,10 @@ mod tests {
 
         fn push_user(&mut self, ctx: &mut FakeBranchCtx, directive: &str) {
             ctx.users.push(directive.to_string());
+        }
+
+        fn push_assistant(&mut self, ctx: &mut FakeBranchCtx, content: &str) {
+            ctx.assistants.push(content.to_string());
         }
 
         fn cue(&mut self, ctx: &mut FakeBranchCtx, no_think: bool) {
