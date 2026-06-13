@@ -35,6 +35,49 @@ final class S577_LeftPanelGUITests: XCTestCase {
     return app
   }
 
+  /// #577 item 3 end-to-end: the start landing is a NON-persisting new-chat
+  /// composer (no draft row), and the FIRST send routes the typed text through
+  /// the handoff into a freshly-created, auto-titled chat — i.e. the chat is
+  /// created on send, not on landing. A pinned model + pinned-running engine
+  /// make the send gate pass without a real engine (the closed port only fails
+  /// the stream AFTER the user turn commits), so the auto-title proves the
+  /// handoff persisted the message.
+  @MainActor
+  func test_first_send_from_new_chat_composer_creates_and_auto_titles_chat() async throws {
+    let prompt = "Summarize the KV cache design"
+    let app = makeApp()
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = "s577-deterministic"
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
+    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
+    app.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "healthy"
+    app.launch()
+    defer { app.terminate() }
+    XCTAssert(app.wait(for: .runningForeground, timeout: 10))
+    app.activate()
+
+    // Landing is the draft composer with NO persisted chat (empty list).
+    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "composer.text")
+                    .firstMatch.waitForExistence(timeout: 5),
+                  "start must land in the new-chat composer")
+    XCTAssertTrue(app.buttons["chats.empty.newButton"].waitForExistence(timeout: 5),
+                  "landing on the new-chat composer must not persist a draft chat")
+
+    // First send: the draft composer hands the text to a freshly-created chat,
+    // whose scaffold runs the real send → the user message persists and the
+    // sidebar row auto-titles from it.
+    typeComposerText(prompt, in: app)
+    let send = app.buttons["composer.send"]
+    XCTAssertTrue(send.waitForExistence(timeout: 5))
+    XCTAssertTrue(send.isEnabled, "composer.send disabled after typing in the new-chat composer; app tree: \(app.debugDescription)")
+    send.click()
+
+    let chatList = app.descendants(matching: .any).matching(identifier: "chats.list").firstMatch
+    XCTAssertTrue(chatList.staticTexts[prompt].waitForExistence(timeout: 10),
+                  "the first send must create + auto-title a chat from the typed text (handoff routed the message); app tree: \(app.debugDescription)")
+    XCTAssertFalse(app.buttons["chats.empty.newButton"].exists,
+                   "a real chat now exists, so the empty-list placeholder must be gone")
+  }
+
   /// The chat list stays mounted when the API Endpoints view is selected, and
   /// clicking a chat row while that view is up switches the detail surface
   /// back to the chat (its composer reappears, the API view goes away).
