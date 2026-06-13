@@ -185,7 +185,7 @@ struct ChatScaffoldView: View {
     if let e = error as? EngineError {
       return "Couldn't \(verb) the engine: \(e.message)"
     }
-    return "Couldn't \(verb) the engine: \(error)"
+    return "Couldn't \(verb) the engine: \(error.localizedDescription)"
   }
 
   /// Message for the in-chat engine-failure banner (PR#15 F2/F3), or nil

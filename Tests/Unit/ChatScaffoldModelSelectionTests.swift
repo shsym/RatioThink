@@ -54,4 +54,21 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       "Qwen/Qwen3-0.6B"
     )
   }
+
+  func test_engine_error_message_uses_localized_rollback_warning() {
+    struct StartError: Error {}
+    struct RollbackError: Error {}
+    let error = LocalAPIBindModeRollbackError(
+      startError: StartError(),
+      rollbackError: RollbackError()
+    )
+
+    let message = ChatScaffoldView.engineErrorMessage(error, verb: "switch")
+
+    XCTAssertTrue(message.contains("Couldn't switch the engine:"))
+    XCTAssertTrue(message.contains("external-access preference could not be restored"))
+    XCTAssertTrue(message.contains("helper-visible preference may still allow external binding"))
+    XCTAssertFalse(message.contains("LocalAPIBindModeRollbackError("),
+                   "user-facing action errors must show the localized rollback warning, not a Swift struct dump")
+  }
 }
