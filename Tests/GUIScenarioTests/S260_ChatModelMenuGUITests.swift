@@ -113,8 +113,13 @@ final class S260_ChatModelMenuGUITests: XCTestCase {
   }
 
   private func menuItem(containingModelLeaf leaf: String, in app: XCUIApplication) -> XCUIElement {
-    let predicate = NSPredicate(format: "title CONTAINS[c] %@ OR label CONTAINS[c] %@ OR value CONTAINS[c] %@",
-                                leaf, leaf, leaf)
+    // #580: rows render the structured quant tag (not the leaf), so the stable
+    // target is the row's `ModelRow-<slug>` accessibility IDENTIFIER (the slug
+    // contains the leaf); `identifier` surfaces on the NSMenuItem where `value`
+    // does not. title/label/value kept as a fallback.
+    let predicate = NSPredicate(
+      format: "identifier CONTAINS[c] %@ OR title CONTAINS[c] %@ OR label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+      leaf, leaf, leaf, leaf)
     return app.menuItems.matching(predicate).firstMatch
   }
 

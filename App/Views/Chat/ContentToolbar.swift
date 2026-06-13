@@ -303,14 +303,21 @@ struct ContentToolbar: View {
       // #459's richer option list (checkmark on current, profile-default
       // annotation, unavailable reasons, "Manage Models…") kept; the write is
       // routed to `Chat.modelID` (the #460 authority) in `selectModel`.
-      // #580 #4: cluster all quants of a family under one base-name header — a
-      // disabled `Text` row, NOT a SwiftUI `Section` (a Section header in a
-      // `.borderlessButton` Menu breaks the NSMenu so it never opens, verified
-      // via the profile picker's S365). Rows keep the full leaf as their text
-      // (the header supplies the family grouping; the leaf stays identifiable
-      // and automation-matchable — `.accessibilityValue` does not reliably
-      // surface on an NSMenuItem, so S486/S260 key on the leaf in the title);
-      // `modelOptionLabel` adds the unverified shield (#580 #5).
+      // #580: structured identity — cluster all quants of a family under one
+      // base-name header (a disabled `Text` row, NOT a SwiftUI `Section`: a
+      // Section header in a `.borderlessButton` Menu breaks the NSMenu so it
+      // never opens, verified via the profile picker's S365). The row's text is
+      // the quant TAG (Q1: base prominent in the header + quant as the row tag;
+      // Q3: GGUF format dropped), with the unverified shield (#580 #5) via
+      // `modelOptionLabel`. Each row carries `ModelRow-<slug>` as its
+      // accessibility IDENTIFIER (which DOES surface on an NSMenuItem, unlike
+      // `.accessibilityValue`) so automation (S486/S260) can target a concrete
+      // model without depending on the no-longer-leaf row text.
+      // Long lists scroll natively: a SwiftUI `Menu` renders an NSMenu, which
+      // auto-scrolls past a screen-height threshold (a `ScrollView` cannot be
+      // embedded in a `Menu`), so a long grouped list never runs off-screen.
+      // The grouped pipeline that feeds it is guarded against truncation by
+      // `ModelIdentityGroupingTests.test_long_multi_family_list_is_never_truncated`.
       ForEach(ModelIdentityGrouping.grouped(
         ModelIdentityGrouping.deduped(modelOptions, slug: \.slug), slug: \.slug)) { group in
         Text(group.base)
@@ -321,7 +328,7 @@ struct ContentToolbar: View {
             modelOptionLabel(option)
           }
           .help(option.unavailableReason.map { "\(option.slug) — \($0)" } ?? option.slug)
-          .accessibilityValue(option.unavailableReason.map { "\(option.slug), \($0)" } ?? option.slug)
+          .accessibilityIdentifier("ModelRow-\(option.slug)")
           .disabled(!option.isSelectable)
         }
       }
@@ -370,13 +377,14 @@ struct ContentToolbar: View {
     }
   }
 
-  /// Row text keeps the FULL leaf (not the quant tag): the base-name section
-  /// header already supplies the #580 family grouping, and the leaf keeps the
-  /// concrete model identifiable in-row (and matchable by automation, which
-  /// keys on the leaf — `.accessibilityValue` does not reliably surface on an
-  /// NSMenuItem). Keeps the profile-default annotation + any unavailable reason.
+  /// Row text is the quant TAG (#580 Q1/Q3: the base-name header supplies the
+  /// family name, the row distinguishes by quant, GGUF format dropped), falling
+  /// back to the full leaf when there is no clean quant (a safetensors dir / a
+  /// split GGUF). Keeps the profile-default annotation + any unavailable reason.
+  /// The concrete model stays automation-targetable via the row's
+  /// `ModelRow-<slug>` accessibility identifier.
   private func modelOptionText(_ option: ToolbarModelOptions.Option) -> String {
-    var text = option.displayName + (option.isProfileDefault ? " (profile default)" : "")
+    var text = option.parts.quantOrLeaf + (option.isProfileDefault ? " (profile default)" : "")
     if let reason = option.unavailableReason { text += " — \(reason)" }
     return text
   }

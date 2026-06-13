@@ -44,4 +44,28 @@ final class ModelIdentityGroupingTests: XCTestCase {
     XCTAssertEqual(groups.count, 1)
     XCTAssertEqual(groups[0].items.count, 2, "grouping clusters but never drops")
   }
+
+  // #580 long-list: the dedup→group pipeline that feeds the (scrollable) model
+  // menus must never truncate a long installed-model list — every distinct
+  // model survives into exactly one group. The on-screen scrolling of the long
+  // result is the native SwiftUI `Menu`/NSMenu's job (a `ScrollView` cannot be
+  // embedded in a `Menu`); this guards the data path that the menu renders.
+  func test_long_multi_family_list_is_never_truncated() {
+    // 40 families × 2 distinct quants = 80 distinct models.
+    let rows: [Row] = (1...40).flatMap { i -> [Row] in
+      let fam = String(format: "Fam%02d/Fam%02d-GGUF", i, i)
+      return [
+        Row(slug: "\(fam)/Fam\(i)-Q4_K_M.gguf", tag: "q4-\(i)"),
+        Row(slug: "\(fam)/Fam\(i)-Q8_0.gguf", tag: "q8-\(i)"),
+      ]
+    }
+    let deduped = ModelIdentityGrouping.deduped(rows, slug: \.slug)
+    XCTAssertEqual(deduped.count, 80, "distinct quants must not collapse")
+    let groups = ModelIdentityGrouping.grouped(deduped, slug: \.slug)
+    XCTAssertEqual(groups.count, 40, "one base-name group per family")
+    XCTAssertEqual(groups.reduce(0) { $0 + $1.items.count }, 80,
+                   "every model survives into exactly one group — the long list is never clipped")
+    XCTAssertTrue(groups.allSatisfy { $0.items.count == 2 },
+                  "each family clusters its two quants")
+  }
 }

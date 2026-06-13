@@ -227,8 +227,12 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
   }
 
   private func menuItem(containingModelLeaf leaf: String, in app: XCUIApplication) -> XCUIElement {
-    let predicate = NSPredicate(format: "title CONTAINS[c] %@ OR label CONTAINS[c] %@ OR value CONTAINS[c] %@",
-                                leaf, leaf, leaf)
+    // #580: rows render the structured quant tag (not the leaf); target the
+    // row's `ModelRow-<slug>` accessibility IDENTIFIER (the slug contains the
+    // leaf), which surfaces on the NSMenuItem where `value` does not.
+    let predicate = NSPredicate(
+      format: "identifier CONTAINS[c] %@ OR title CONTAINS[c] %@ OR label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+      leaf, leaf, leaf, leaf)
     return app.menuItems.matching(predicate).firstMatch
   }
 
