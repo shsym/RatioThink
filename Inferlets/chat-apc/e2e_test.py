@@ -186,24 +186,31 @@ class HandshakeState:
     token: str | None = None
 
 
-_OLD_URL_RE = re.compile(r"pie-server serving on ([^\s]+:[0-9]+)")
-_NEW_WS_URL_RE = re.compile(r"Server ready at ws://([^\s]+:[0-9]+)")
+def _parse_control_address(line: str) -> str | None:
+    """Extract the pie control-plane host:port from supported ready banners."""
+    for pattern in (
+        r"pie-server serving on ([^\s]+:[0-9]+)",
+        r"Server ready at wss?://([^/\s]+)",
+    ):
+        match = re.search(pattern, line)
+        if match:
+            return match.group(1)
+    return None
+
+
 _TOKEN_RE = re.compile(r"internal token: ([^\s]+)")
 
 
 def _parse_handshake_line(state: HandshakeState, line: str) -> None:
     if state.url is None:
-        if m := _OLD_URL_RE.search(line):
-            state.url = m.group(1)
-        elif m := _NEW_WS_URL_RE.search(line):
-            state.url = m.group(1)
+        state.url = _parse_control_address(line)
     if state.token is None:
         if m := _TOKEN_RE.search(line):
             state.token = m.group(1)
 
 
 async def _parse_handshake(proc: subprocess.Popen, timeout: float) -> tuple[str, str]:
-    """Read pie stdout until we have a WS host:port + `internal token: <tok>`."""
+    """Read pie stdout until we have a supported ready banner + `internal token: <tok>`."""
     state = HandshakeState()
     deadline = time.monotonic() + timeout
     loop = asyncio.get_event_loop()
@@ -220,7 +227,6 @@ async def _parse_handshake(proc: subprocess.Popen, timeout: float) -> tuple[str,
     if state.url is None or state.token is None:
         raise RuntimeError(f"timeout parsing pie handshake (url={state.url!r} token={state.token!r})")
     return state.url, state.token
-
 
 async def _drain_stdout(proc: subprocess.Popen) -> None:
     """Keep reading pie's stdout in background so the pipe buffer doesn't fill."""
