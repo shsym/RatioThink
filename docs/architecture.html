@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RatioThink Architecture</title>
+<link rel="icon" type="image/png" sizes="256x256" href="assets/pie-icon.png">
+<link rel="shortcut icon" href="favicon.ico">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png">
 <style>
   :root{
     --bg:#0f1117; --panel:#171a23; --panel-2:#1d2130; --line:#2a2f40;
@@ -214,17 +217,17 @@
       tag:"Front-end · SwiftUI", title:"RatioThink.app",
       user:"The SwiftUI front end. It owns every user action — typing a message, picking a model, switching profiles, changing settings — and shows engine and model status. It never runs the model itself: it talks to the engine directly for chat and only asks the helper to manage the engine's lifecycle.",
       facts:[["Owns","chat UI, persistence (SwiftData), the direct HTTP link to the engine"],
-             ["Status","poll-only — EngineStatusStore polls engineStatus() ~1 Hz; the app never starts the engine"]],
+             ["Status","poll-only — EngineStatusStore polls engineStatus() ~1 Hz; launch prompt/user-confirm, Restart, Local API, and post-download recovery can request startEngine(profileID:)"]],
       calls:["<b>Send:</b> ComposerView.submit() → ChatScaffoldView.sendAssistantTurn(for:) → ChatSendController.send(…) → HTTPEngineClient.chatCompletion(_:)",
              "<b>Status:</b> EngineStatusStore poll → HelperXPCClient.engineStatus() → on .running(port) → requireBaseURL()"],
       files:["App/RatioThinkApp.swift","App/Views/Chat/","Shared/Persistence/ChatSendController.swift","Shared/Engine/EngineStatusStore.swift"]},
     helper:{accent:css('--helper'),
       tag:"Background · menu bar", title:"RatioThinkHelper",
-      user:"A menu-bar background agent. It starts, supervises, and stops the pie engine, and manages the on-disk model profiles and downloads. It keeps running when the app is closed — and on boot it auto-resumes the last active profile, so the engine comes up with no user action.",
+      user:"A menu-bar background agent. It starts, supervises, and stops the pie engine, and manages the on-disk model profiles and downloads. It keeps running when the app is closed; boot leaves the engine stopped until the launch prompt/user-confirm path, Restart, Local API, or post-download recovery requests a start.",
       facts:[["Launched as","launchd agent via SMAppService (not a login item)"],
              ["Mach service","com.ratiothink.helper"],
              ["Owns","PieEngineHost (engine lifecycle), ProfileStore, ModelDownloader"]],
-      calls:["<b>Boot auto-resume:</b> HelperMain.autoResumeEngineOnBoot() → HelperResumeAction.run(engineHost:profileStore:resolver:) → resolver(profileID) → PieEngineHost.start(spec)",
+      calls:["<b>Start request:</b> HelperExportedAPI.startEngine(profileID:) → launchSpecResolver(profileID) → PieEngineHost.startOrAttach(spec)",
              "<b>XPC impl:</b> HelperExportedAPI implements engineStatus / startEngine / stopEngine / downloadModel / listProfiles"],
       files:["Helper/HelperMain.swift","Shared/XPC/HelperExportedAPI.swift","Shared/HelperResumeAction.swift"]},
     engine:{accent:css('--engine'),
@@ -239,25 +242,25 @@
     inferlet:{accent:css('--inferlet'),
       tag:"Inferlet · wasm", title:"chat-apc (wasm)",
       user:"The only inferlet RatioThink ships. pie installs it at startup and routes HTTP requests to it. It presents the OpenAI-compatible endpoints — chat completions plus health and model listing — so any OpenAI client can talk to your local engine.",
-      facts:[["Serves","/healthz · /v1/models · /v1/chat/completions · /v1/models/load · /v1/inferlet"],
+      facts:[["Serves","/healthz · /v1/models · /v1/chat/completions · /v1/inferlet"],
              ["APC","Adaptive Personality/Capability decoders. Reasoning active; the tool-use decoder is fully implemented (emits OpenAI tool_calls when a request supplies a tools array) but the v1 app never sends tools, so it stays dormant in the shipping product."],
              ["Note","ONE inferlet for both planes — there is no separate pie-control inferlet"]],
-      calls:["<b>Route:</b> lib.rs match (method, path) → chat::completions::handle / control::{health,models,load}",
+      calls:["<b>Route:</b> lib.rs match (method, path) → chat::completions::handle / control::{health,models}",
              "<b>Install:</b> wasm staged via Shared/InferletResources, uploaded by PieControlClient.installProgram + launchDaemon"],
-      files:["Inferlets/chat-apc/src/lib.rs","src/chat/completions.rs","src/chat/apc.rs","src/control/load.rs"]}
+      files:["Inferlets/chat-apc/src/lib.rs","src/chat/completions.rs","src/chat/apc.rs"]}
   };
 
   var EDGES = {
     xpc:{from:"app",to:"helper",side:"left",
       hi:"XPC · control", lo:"NSXPC · Codable→Data",
       title:"App ↔ Helper — XPC control plane", accent:NODES.helper.accent,
-      user:"The app asks the helper to do privileged, long-lived work — stop the engine, download a model, list profiles — and polls “is the engine up, and on what port?” about once a second. The app is poll-only; the helper auto-resumes the engine itself.",
+      user:"The app asks the helper to do privileged, long-lived work — start or stop the engine, download a model, list profiles — and polls “is the engine up, and on what port?” about once a second. Status delivery is pull-only; launch prompt/user-confirm, Restart, Local API, and post-download recovery paths can request startEngine(profileID:).",
       facts:[["Transport","NSXPCConnection → mach service com.ratiothink.helper"],
              ["Protocol","@objc(PieHelperXPC); payloads Codable→Data via XPCPayload (JSON: sortedKeys, ISO-8601, base64)"],
              ["Direction","pull, not push — the helper does not stream status changes"]],
       calls:["<b>Selectors:</b> engineStatus (polled) · startEngine(profileID:) · stopEngine · downloadModel(repo:file:) · listProfiles · tailLog",
              "<b>App side:</b> HelperXPCClient.engineStatus() / .stopEngine() (AppXPCClient)",
-             "<b>Helper side:</b> HelperExportedAPI.startEngine(profileID:reply:) → PieEngineHost.start(spec)"],
+             "<b>Helper side:</b> HelperExportedAPI.startEngine(profileID:reply:) → PieEngineHost.startOrAttach(spec)"],
       files:["Shared/XPC/PieHelperXPC.swift","Shared/XPC/AppXPCClient.swift","Shared/XPC/HelperXPCListener.swift","Shared/XPC/HelperExportedAPI.swift"]},
     launch:{from:"helper",to:"engine",side:"left",
       hi:"launch + WS control", lo:"spawn · install chat-apc",
@@ -276,7 +279,7 @@
       user:"Chat does NOT go through the helper. The app connects straight to the engine on a local port and uses ordinary OpenAI-style HTTP; replies stream back token by token over Server-Sent Events.",
       facts:[["Target","127.0.0.1:&lt;port&gt; — port from EngineStatus.running(port:)"],
              ["Chat","POST /v1/chat/completions → SSE: {event:model_ready} → chat.completion.chunk → data:[DONE]"],
-             ["Also","GET /healthz · GET /v1/models · POST /v1/models/load (instant — model loaded at boot)"]],
+             ["Also","GET /healthz · GET /v1/models"]],
       calls:["<b>Request:</b> ChatSendController.send(…) → EngineClient.chatCompletion(req) → HTTPEngineClient.chatCompletion(_:) → baseURLProvider()",
              "<b>Stream sink:</b> AsyncThrowingStream&lt;ChatEvent&gt; → MessageStreamWriter.appendDelta() → flush() → SwiftData"],
       files:["Shared/Engine/HTTPEngineClient.swift","Shared/Engine/EngineClient.swift","Shared/Persistence/ChatSendController.swift","Shared/Persistence/MessageStreamWriter.swift"]}
@@ -285,8 +288,8 @@
   var SCN = {
     cold:{name:"Cold start", steps:[
       {nodes:["helper"],edges:[],focus:{node:"helper"},
-       cap:'The helper boots as a launchd agent and <b>auto-resumes</b> the last active profile. The app never starts the engine — it is poll-only.',
-       chain:'HelperMain.autoResumeEngineOnBoot() → HelperResumeAction.run(engineHost:profileStore:resolver:) → resolver(profileID) → <b>PieEngineHost.start(spec)</b>'},
+       cap:'The helper boots as a launchd agent, publishes XPC/menu-bar state, and leaves the engine stopped. Status delivery remains pull-only; the launch prompt/user-confirm path, explicit restart, Local API, and post-download recovery can request startEngine.',
+       chain:'Helper boot → HelperExportedAPI.engineStatus() reports .stopped; app/user start → HelperExportedAPI.startEngine(profileID:) → <b>PieEngineHost.startOrAttach(spec)</b>'},
       {nodes:["helper","engine"],edges:["launch"],focus:{edge:"launch"},
        cap:'The host launches <span class="n">pie serve</span> and waits for the stdout handshake (serving address + internal token).',
        chain:'PieEngineHost.start → doStart(spec) → <b>PieControlLauncher.launch(spec:)</b> → spawn pie serve --config &lt;toml&gt; --no-auth --debug'},

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Mount a packaged RatioThink DMG read-only and assert the drag-install
+# Mount a packaged Rational DMG read-only and assert the drag-install
 # layout + window styling (ticket #354):
-#   * the mounted root contains RatioThink.app,
+#   * the mounted root contains Rational.app,
 #   * the root contains an `Applications` symlink to /Applications so the
 #     window offers the familiar drag-install target,
 #   * the app still passes a strict codesign seal check — i.e. packaging
 #     did not corrupt the signed bundle,
 #   * the background asset is present, and
-#   * the `.DS_Store` pins the icons with RatioThink.app LEFT of Applications
+#   * the `.DS_Store` pins the icons with Rational.app LEFT of Applications
 #     and sets the background picture.
 #
 # The styling checks read the `.DS_Store` directly (via the vendored ds_store
@@ -44,15 +44,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Explicit -mountpoint avoids clobbering an existing /Volumes/RatioThink
+# Explicit -mountpoint avoids clobbering an existing /Volumes/Rational
 # and keeps cleanup unambiguous. -nobrowse keeps the verify mount out of
 # Finder/sidebar.
 if ! hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$DMG" >/dev/null; then
   fail "could not attach DMG: $DMG"
 fi
 
-APP="$MNT/RatioThink.app"
-[[ -d "$APP" ]] || fail "mounted DMG root is missing RatioThink.app"
+APP="$MNT/Rational.app"
+[[ -d "$APP" ]] || fail "mounted DMG root is missing Rational.app"
 
 LINK="$MNT/Applications"
 [[ -L "$LINK" ]] || fail "mounted DMG root is missing the /Applications drag-install symlink"
@@ -64,7 +64,7 @@ target="$(readlink "$LINK")"
 # pre-package bundle; here it confirms staging/hdiutil preserved that
 # seal so the shipped app still verifies (drag-install acceptance).
 if ! codesign --verify --strict --deep --verbose=2 "$APP" >/dev/null 2>&1; then
-  fail "RatioThink.app inside the DMG fails codesign verification"
+  fail "Rational.app inside the DMG fails codesign verification"
 fi
 
 # Styling: the background art and the .DS_Store icon layout.
@@ -109,7 +109,7 @@ with DSStore.open(ds_path, "r") as d:
 # ordering), so the icons stay aligned with the drawn arrow.
 if pos != expected:
     sys.exit(f"icon positions {pos} do not match the geometry contract {expected}")
-app = expected["RatioThink.app"]
+app = expected["Rational.app"]
 apps = expected["Applications"]
 if app[0] >= apps[0]:
     sys.exit(f"geometry contract is inconsistent — app ({app}) is not left of Applications ({apps})")
@@ -120,4 +120,4 @@ then
   fail "DMG window styling check failed (see above)"
 fi
 
-echo "verify-dmg-layout.sh: ok — RatioThink.app + Applications target, codesign valid, styled window ($DMG)"
+echo "verify-dmg-layout.sh: ok — Rational.app + Applications target, codesign valid, styled window ($DMG)"

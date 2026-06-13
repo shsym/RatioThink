@@ -1,18 +1,16 @@
 import SwiftUI
 
-/// In-chat banner for engine failures that are NOT "model missing"
-/// (PR#15 F2/F3). The model-missing case has its own download banner
-/// (`ModelMissingBanner`); everything else — `spawnFailed`,
-/// `handshakeTimeout`, `engineGone`, a stop that left the engine running,
-/// a transport error — surfaced here so a user who just acted sees the
-/// failure in-chat instead of only on the menu-bar dot, and never under
-/// the persistence "Couldn't save" banner (wrong fault domain).
+/// In-chat banner for thrown engine-action errors that the live status
+/// poll does not own (for example, a stop that left the engine running or
+/// a transport error while status remains non-failed). Live
+/// `EngineStatus.failed` is rendered once by the app-level unified status
+/// banner; keeping this view for distinct action errors avoids routing
+/// engine faults to the persistence "Couldn't save" banner (wrong fault
+/// domain) without duplicating the global failure copy inside chat.
 ///
-/// The message is decided by `MissingModelRecovery.engineFailureBannerMessage`;
-/// this view only renders it. `onDismiss` is non-nil ONLY for a
-/// dismissable message (a thrown action error); a live `.failed` status
-/// re-derives the banner every render, so its Dismiss would be a no-op
-/// and the button is hidden (PR#15 v2 F2).
+/// The message is decided by `MissingModelRecovery.engineActionFailureBannerMessage`;
+/// this view only renders it. `onDismiss` is non-nil only for a dismissable
+/// thrown action error.
 struct EngineFailureBanner: View {
   let message: String
   let onDismiss: (() -> Void)?

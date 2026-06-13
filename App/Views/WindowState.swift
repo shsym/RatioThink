@@ -25,7 +25,8 @@ enum SidebarSection: Hashable, CaseIterable, Identifiable {
 
 /// Per-window UI state shared between the SwiftUI `App` (for `.commands`) and
 /// `RootView`'s `NavigationSplitView`. Lives at App level so menu items can
-/// toggle the sidebar / item-list visibility without reaching into view state.
+/// toggle sidebar / embedded chat-list visibility without reaching into view
+/// state.
 @MainActor
 final class WindowState: ObservableObject {
   @Published var columnVisibility: NavigationSplitViewVisibility = .all

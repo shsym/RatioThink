@@ -12,10 +12,9 @@ final class EngineStatusBannerTests: XCTestCase {
   private func error(
     kind: EngineIndicatorError.Kind = .engineFailed,
     title: String = "Engine failed",
-    message: String = "spawn ENOENT",
-    invitesModelChoice: Bool = false
+    message: String = "spawn ENOENT"
   ) -> EngineIndicatorError {
-    EngineIndicatorError(kind: kind, title: title, message: message, invitesModelChoice: invitesModelChoice)
+    EngineIndicatorError(kind: kind, title: title, message: message)
   }
 
   // MARK: - which states banner
@@ -24,8 +23,6 @@ final class EngineStatusBannerTests: XCTestCase {
     XCTAssertNil(EngineStatusBanner.model(from: .offline, acknowledgedSignature: nil))
     XCTAssertNil(EngineStatusBanner.model(from: .starting(detail: "Engine starting…"), acknowledgedSignature: nil))
     XCTAssertNil(EngineStatusBanner.model(from: .running(modelID: "m"), acknowledgedSignature: nil))
-    XCTAssertNil(EngineStatusBanner.model(from: .loading(modelID: "m", fraction: 0.5), acknowledgedSignature: nil))
-    XCTAssertNil(EngineStatusBanner.model(from: .loading(modelID: "m", fraction: nil), acknowledgedSignature: nil))
   }
 
   func test_error_state_banners_with_title_and_message() {
@@ -34,26 +31,22 @@ final class EngineStatusBannerTests: XCTestCase {
     XCTAssertEqual(model?.message, "spawn ENOENT")
   }
 
-  // MARK: - invitesModelChoice hint
+  // MARK: - no per-surface hint (#477)
 
-  func test_model_choice_failure_appends_model_menu_hint() {
+  func test_banner_renders_taxonomy_message_without_appended_hint() {
+    // The EngineProblem copy already names the next action; the banner
+    // must not append its own hint on top.
     let err = error(
       kind: .memoryRisk,
       title: "Model too large",
-      message: "The model exceeds this Mac's safe memory limit.",
-      invitesModelChoice: true
+      message: "This model exceeds this Mac’s safe memory limit. Pick a smaller model."
     )
     let model = EngineStatusBanner.model(from: .error(err), acknowledgedSignature: nil)
     XCTAssertEqual(
       model?.message,
-      "The model exceeds this Mac's safe memory limit. Pick a smaller model from the Model menu.",
-      "a model-choice failure must invite the user to the Model menu"
+      "This model exceeds this Mac’s safe memory limit. Pick a smaller model.",
+      "the banner must render the taxonomy copy verbatim"
     )
-  }
-
-  func test_non_model_choice_failure_has_no_hint() {
-    let model = EngineStatusBanner.model(from: .error(error(invitesModelChoice: false)), acknowledgedSignature: nil)
-    XCTAssertEqual(model?.message, "spawn ENOENT")
     XCTAssertFalse(model?.message.contains("Model menu") ?? true)
   }
 

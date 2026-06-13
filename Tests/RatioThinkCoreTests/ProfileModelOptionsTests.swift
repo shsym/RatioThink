@@ -28,6 +28,30 @@ final class ProfileModelOptionsTests: XCTestCase {
                    source: .huggingFaceCache)
   }
 
+  func test_hf_cache_curated_rows_do_not_get_advisory_warning() {
+    let slug = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    let options = ProfileModelOptions.build(models: [hfModel(slug, sizeBytes: 100)],
+                                            current: "",
+                                            limitBytes: nil)
+
+    XCTAssertEqual(options.first?.isCuratedEngineSupported, true)
+    XCTAssertNil(options.first?.supportWarning,
+                 "curated engine-validated cache hits should not be labeled unverified")
+  }
+
+  func test_non_curated_hf_cache_rows_get_advisory_warning_but_stay_launchable() {
+    let slug = "somebody/Experimental-GGUF/experimental-q4_k_m.gguf"
+    let options = ProfileModelOptions.build(models: [hfModel(slug, sizeBytes: 100)],
+                                            current: "",
+                                            limitBytes: nil)
+
+    let option = options.first
+    XCTAssertEqual(option?.isCuratedEngineSupported, false)
+    XCTAssertEqual(option?.supportWarning, "Unverified — may not be supported")
+    XCTAssertNil(option?.unsupportedReason,
+                 "advisory support warnings must not reuse unsupportedReason, because that disables selection")
+  }
+
   func test_current_model_is_included_even_when_not_installed() {
     let options = ProfileModelOptions.build(models: [appModel("b.gguf")],
                                             current: "a.gguf",

@@ -1,10 +1,10 @@
 #!/bin/bash
-# Robust install of RatioThink.app into /Applications — signed, and VERIFIED
+# Robust install of Rational.app into /Applications — signed, and VERIFIED
 # end-to-end (background Helper + engine + a real chat round-trip) before
 # it claims success.
 #
-# Why this exists: a naive "build then cp over /Applications/RatioThink.app"
-# breaks the background Helper. RatioThink registers an on-demand launchd agent
+# Why this exists: a naive "build then cp over /Applications/Rational.app"
+# breaks the background Helper. Rational registers an on-demand launchd agent
 # for `com.ratiothink.helper` via SMAppService. Two traps:
 #   1. Replacing the bundle under a LIVE registration leaves it stale —
 #      BTM still says `enabled` but launchd never reloads the job against
@@ -30,7 +30,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-APP_DEST="/Applications/RatioThink.app"
+APP_DEST="/Applications/Rational.app"
 DERIVED_APP=""   # resolved after build
 VERIFY_TIMEOUT="${PIE_INSTALL_VERIFY_TIMEOUT:-90}"  # seconds to wait for engine
 
@@ -69,17 +69,17 @@ xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
 DERIVED_APP="$(xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
   -destination 'platform=macOS,arch=arm64' -configuration Debug \
   -showBuildSettings 2>/dev/null \
-  | awk '/ BUILT_PRODUCTS_DIR =/ {print $3; exit}')/RatioThink.app"
+  | awk '/ BUILT_PRODUCTS_DIR =/ {print $3; exit}')/Rational.app"
 if [ ! -d "$DERIVED_APP" ]; then
-  echo "install: could not locate built RatioThink.app at '$DERIVED_APP'" >&2
+  echo "install: could not locate built Rational.app at '$DERIVED_APP'" >&2
   exit 1
 fi
 
 # The "Build pie engine binary" build phase re-signs the nested
-# Contents/Resources/pie-engine/pie AFTER Xcode seals RatioThink.app, which
+# Contents/Resources/pie-engine/pie AFTER Xcode seals Rational.app, which
 # invalidates the outer bundle's seal ("a sealed resource is missing or
 # invalid"). Re-seal the top-level bundle over its now-final contents
-# before verifying. (Nested code — RatioThinkHelper.app, the engine — keep their
+# before verifying. (Nested code — RationalHelper.app, the engine — keep their
 # own valid signatures; only the outer seal is recomputed.)
 echo "install: re-sealing app bundle (nested engine was re-signed post-seal)..."
 codesign --force --sign "$CODE_SIGN_IDENTITY" \
@@ -137,19 +137,21 @@ fi
 # Order matters: quit the App first, then stop the stale Helper+engine so
 # the freshly-launched App finds com.ratiothink.helper unreachable and the
 # reconciler force-reloads the NEW Helper binary (trap 2 above).
-echo "install: quitting running RatioThink..."
-osascript -e 'tell application "RatioThink" to quit' >/dev/null 2>&1 || true
+echo "install: quitting running Rational..."
+osascript -e 'tell application "Rational" to quit' >/dev/null 2>&1 || true
 sleep 2
-pkill -x RatioThink 2>/dev/null || true
+pkill -x Rational 2>/dev/null || true
 
 echo "install: stopping stale Helper + engine so the new binary loads..."
-pkill -x RatioThinkHelper 2>/dev/null || true
+for helper_name in RationalHelper RatioThinkHelper; do
+  pkill -x "$helper_name" 2>/dev/null || true
+done
 pkill -x pie 2>/dev/null || true
 sleep 1
 
 # --- atomic bundle swap (ditto preserves signing/xattrs) --------------
 echo "install: installing into ${APP_DEST}..."
-STAGE="$(dirname "$APP_DEST")/.RatioThink.app.installing.$$"
+STAGE="$(dirname "$APP_DEST")/.Rational.app.installing.$$"
 rm -rf "$STAGE"
 ditto "$DERIVED_APP" "$STAGE"
 rm -rf "$APP_DEST"
@@ -161,16 +163,18 @@ echo "install: installed + verified."
 # The agent is disabled (above), so nothing can respawn independently.
 # Reap once more AFTER the bundle is in place and confirm nothing survives.
 echo "install: reaping any respawned stale Helper/engine post-swap..."
-pkill -x RatioThinkHelper 2>/dev/null || true
+for helper_name in RationalHelper RatioThinkHelper; do
+  pkill -x "$helper_name" 2>/dev/null || true
+done
 pkill -x pie 2>/dev/null || true
 sleep 1
-for pid in $(pgrep -x pie 2>/dev/null) $(pgrep -x RatioThinkHelper 2>/dev/null); do
+for pid in $(pgrep -x pie 2>/dev/null) $(pgrep -x RationalHelper 2>/dev/null) $(pgrep -x RatioThinkHelper 2>/dev/null); do
   kill -9 "$pid" 2>/dev/null || true
 done
 sleep 1
-if pgrep -x pie >/dev/null 2>&1 || pgrep -x RatioThinkHelper >/dev/null 2>&1; then
+if pgrep -x pie >/dev/null 2>&1 || pgrep -x RationalHelper >/dev/null 2>&1 || pgrep -x RatioThinkHelper >/dev/null 2>&1; then
   echo "install: FAILED — could not reap stale Helper/engine before launch:" >&2
-  ps -o pid=,comm=,etimes= $(pgrep -x pie; pgrep -x RatioThinkHelper) 2>/dev/null | sed 's/^/install:   /' >&2
+  ps -o pid=,comm=,etimes= $(pgrep -x pie; pgrep -x RationalHelper; pgrep -x RatioThinkHelper) 2>/dev/null | sed 's/^/install:   /' >&2
   echo "install: kill them manually (kill -9 <pid>) and re-run." >&2
   exit 1
 fi
@@ -225,16 +229,16 @@ done
 if [ -z "$PORT" ]; then
   echo "" >&2
   echo "install: FAILED — no engine from the NEW install (${APP_DEST}) served within ${VERIFY_TIMEOUT}s." >&2
-  echo "install: Helper running: $(pgrep -x RatioThinkHelper >/dev/null && echo yes || echo NO)" >&2
+  echo "install: Helper running: $(pgrep -x RationalHelper >/dev/null && echo yes || pgrep -x RatioThinkHelper >/dev/null && echo legacy-RatioThinkHelper || echo NO)" >&2
   echo "install: engine running: $(pgrep -x pie >/dev/null && echo yes || echo NO)" >&2
   STALE="$(stale_procs "$APP_DEST" "$INSTALL_EPOCH")"
   if [ -n "$STALE" ]; then
     echo "install: STALE processes from a previous install survived the pkill — the new Helper was NOT loaded:" >&2
     echo "$STALE" | sed 's/^/install:   /' >&2
-    echo "install: kill them (kill -9 <pid>) and re-run, or quit RatioThink fully first." >&2
+    echo "install: kill them (kill -9 <pid>) and re-run, or quit Rational fully first." >&2
   else
     echo "install: Most likely cause: SMAppService needs your approval (or the seeded model isn't downloaded yet)." >&2
-    echo "install:   System Settings > General > Login Items & Extensions → enable 'RatioThink', then re-run." >&2
+    echo "install:   System Settings > General > Login Items & Extensions → enable 'Rational', then re-run." >&2
   fi
   exit 1
 fi
@@ -255,4 +259,4 @@ if [ -z "$REPLY" ]; then
 fi
 echo "install: chat OK — engine replied: ${REPLY:0:80}"
 echo ""
-echo "install: SUCCESS — RatioThink installed, Helper + engine running, chat verified."
+echo "install: SUCCESS — Rational installed, Helper + engine running, chat verified."

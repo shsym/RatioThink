@@ -1,6 +1,6 @@
 import XCTest
 
-/// S5 — RatioThink.app window shell matches Notes-style 3-column design (§5).
+/// S5 — Rational.app window shell matches the simplified Chat/API shell.
 ///
 /// GUI-only. Asserts against FINAL design strings — sidebar shows the nav
 /// labels `Chats` and `API Endpoints` (the latter now mirrors the live engine
@@ -46,7 +46,7 @@ final class S5_AppWindowShellGUITests: XCTestCase {
     defer { app.terminate() }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 5),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
 
     // XCUITest launches with `LSLaunchDoNotBringFrontmost=1`, so SwiftUI may
     // defer rendering until the window becomes active. Force activation so the
@@ -55,7 +55,7 @@ final class S5_AppWindowShellGUITests: XCTestCase {
 
     let window = app.windows.firstMatch
     XCTAssert(window.waitForExistence(timeout: 5), "main window missing")
-    XCTAssertEqual(window.title, "RatioThink", "title was '\(window.title)'")
+    XCTAssertEqual(window.title, "Rational", "title was '\(window.title)'")
 
     // Sidebar (col 1) — design §5 final nav vocabulary.
     // SwiftUI can expose nav row text as label/identifier/title/value on
@@ -82,6 +82,8 @@ final class S5_AppWindowShellGUITests: XCTestCase {
     // and routes to the single LocalAPIView.
     XCTAssertTrue(allStrings.contains("API Endpoints"),
                   "sidebar missing 'API Endpoints'; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
+    XCTAssertTrue(app.textFields["chats.searchField"].waitForExistence(timeout: 5),
+                  "simplified left navigation must show chat search above chat rows")
 
     // Detail empty-state — design §5 CTA. Only `Start Chat` is a zero-state
     // CTA; there is no `Add Endpoint` (the local API is the engine's single

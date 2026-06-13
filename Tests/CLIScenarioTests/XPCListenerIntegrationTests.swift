@@ -216,6 +216,29 @@ final class XPCListenerIntegrationTests: IsolatedTestCase {
                   "expected NSXPCConnectionInvalid/Interrupted, got \(nsErr.code) — domain=\(nsErr.domain)")
   }
 
+  /// Upgrade guard for PR #63 Review v2 F1. An app updated in place can
+  /// still be talking to the previous build's helper: `engineStatus`
+  /// answers, but the new strict restart selector is absent. The
+  /// launch/runtime registration reconcile must not classify that helper
+  /// as compatible, or the first active-profile model change strands the
+  /// restart path until a manual helper restart.
+  func testOldHelperThatAnswersEngineStatusButLacksRestartIsIncompatible() async throws {
+    let old = OldHelperXPCListener()
+    let client = HelperXPCClient(
+      endpoint: .listenerEndpoint(old.endpoint),
+      replyTimeout: 0.2,
+      restartReplyTimeout: 0.2
+    )
+
+    let status = try await client.engineStatus()
+    XCTAssertEqual(status, .stopped,
+                   "fixture must model the old-but-reachable helper: engineStatus still works")
+
+    let compatible = await HelperProtocolCompatibility.isCompatible(client: client)
+    XCTAssertFalse(compatible,
+                   "reachable old helper without restartEngine/capability selector must trigger registration repair")
+  }
+
   // MARK: - helpers
 
   /// Async-bridge over the callback-based `engineStatus(reply:)`. Times
@@ -241,6 +264,40 @@ final class XPCListenerIntegrationTests: IsolatedTestCase {
       }
     }
   }
+}
+
+@objc(OldRatioThinkHelperXPCForCompatibilityTest)
+private protocol OldRatioThinkHelperXPCForCompatibilityTest {
+  func engineStatus(reply: @escaping (Data) -> Void)
+}
+
+private final class OldHelperExportedObject: NSObject, OldRatioThinkHelperXPCForCompatibilityTest {
+  func engineStatus(reply: @escaping (Data) -> Void) {
+    reply((try? XPCPayload.encode(EngineStatus.stopped)) ?? Data())
+  }
+}
+
+private final class OldHelperXPCListener: NSObject, NSXPCListenerDelegate {
+  private let listener: NSXPCListener
+  private let exported = OldHelperExportedObject()
+  var endpoint: NSXPCListenerEndpoint { listener.endpoint }
+
+  override init() {
+    self.listener = .anonymous()
+    super.init()
+    listener.delegate = self
+    listener.resume()
+  }
+
+  func listener(_ listener: NSXPCListener,
+                shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
+    newConnection.exportedInterface = NSXPCInterface(with: OldRatioThinkHelperXPCForCompatibilityTest.self)
+    newConnection.exportedObject = exported
+    newConnection.resume()
+    return true
+  }
+
+  deinit { listener.invalidate() }
 }
 
 /// One-shot flag so the timer race vs reply race never double-resumes

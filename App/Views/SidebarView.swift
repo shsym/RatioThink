@@ -1,21 +1,28 @@
 import SwiftUI
 
-/// Col 1 — stable navigation. Per design §5: nav-only, no items, no settings.
+/// Left navigation: stable Chat/API entry points plus the searchable chat list
+/// mounted under the Chat entry.
 struct SidebarView: View {
   @Binding var selection: SidebarSection?
+  @Binding var selectedItemID: UUID?
+  let isItemListHidden: Bool
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 4) {
+    VStack(alignment: .leading, spacing: 6) {
       sidebarRow(.chats)
       // #422: the API Endpoints section now mirrors the live engine HTTP
-      // endpoint (LocalAPIView). Selecting it collapses the item-list column
-      // and shows the single status view in the detail column.
+      // endpoint (LocalAPIView). Selecting it shows the single status view in
+      // the detail column.
       sidebarRow(.apiEndpoints)
+      if selection == .chats && !isItemListHidden {
+        ChatListView(selectedItemID: $selectedItemID)
+          .padding(.top, 2)
+      }
       Spacer()
     }
     .padding(.top, 8)
     .frame(maxWidth: .infinity, alignment: .leading)
-    .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
+    .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 380)
   }
 
   private func sidebarRow(_ section: SidebarSection) -> some View {

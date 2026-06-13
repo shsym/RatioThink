@@ -38,6 +38,145 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  /// #413: first launch also seeds an example tree-of-thought profile so
+  /// the live tree-search feature is reachable by switching to it. chat
+  /// stays the active default; the ToT profile is a valid ToT profile.
+  func test_seeds_tree_of_thought_profile_on_first_launch() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      let seeded = dir.appendingPathComponent(ProfileStore.treeOfThoughtFilename)
+      XCTAssertTrue(FileManager.default.fileExists(atPath: seeded.path),
+                    "first launch should seed tree-of-thought.toml")
+
+      let entry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "tree-of-thought.toml" })
+      let profile = try XCTUnwrap(entry.profile)
+      XCTAssertEqual(profile.id, "tree-of-thought")
+      XCTAssertEqual(profile.inferlet, "chat-apc", "ToT is a dispatch mode; the launched inferlet stays chat-apc")
+      XCTAssertEqual(profile.treeOfThought, ToTProfileConfig(breadth: 3, depth: 2, beamWidth: 2, maxTokensPerNode: 256))
+      // chat remains the active default; ToT is opt-in via profile switch.
+      XCTAssertEqual(store.activeProfileID, "chat")
+    }
+  }
+
+  // MARK: - #469 active-model marker
+
+  func test_activeModel_marker_roundTrips_and_clears() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertNil(store.activeModelID, "no marker before any launch")
+
+      try store.setActiveModelID("Org/Repo/picked.gguf")
+      XCTAssertEqual(store.activeModelID, "Org/Repo/picked.gguf")
+      // Default marker location is a sibling of active-profile.
+      XCTAssertTrue(FileManager.default.fileExists(atPath: store.activeModelURL.path),
+                    "setActiveModelID must persist the marker on disk")
+
+      // Overwrite is last-write-wins.
+      try store.setActiveModelID("Org/Repo/other.gguf")
+      XCTAssertEqual(store.activeModelID, "Org/Repo/other.gguf")
+
+      try store.clearActiveModelID()
+      XCTAssertNil(store.activeModelID, "clear removes the marker")
+      try store.clearActiveModelID()  // idempotent when already absent
+    }
+  }
+
+  func test_activeModel_marker_is_durable_across_store_instances() throws {
+    // The marker is the durable source of truth the Helper boots from after a
+    // relaunch (#469): a fresh ProfileStore over the same directory reads it.
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      let writer = ProfileStore(directory: dir, activeProfileURL: active)
+      try writer.start()
+      try writer.setActiveModelID("Org/Repo/durable.gguf")
+      writer.stop()
+
+      let reader = ProfileStore(directory: dir, activeProfileURL: active)
+      try reader.start()
+      defer { reader.stop() }
+      XCTAssertEqual(reader.activeModelID, "Org/Repo/durable.gguf",
+                     "a relaunched Helper must read the last-launched model from disk")
+    }
+  }
+
+  func test_activeModel_marker_blankFile_readsAsNil() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+      try "   \n".write(to: store.activeModelURL, atomically: true, encoding: .utf8)
+      XCTAssertNil(store.activeModelID, "a blank/whitespace marker reads as no selection")
+    }
+  }
+
+  /// #413 (operator ITEM 2A): an EXISTING install — profiles dir already
+  /// holds `chat.toml` from before #413, so the empty-dir seed is a no-op —
+  /// must STILL get the tree-of-thought profile, via the write-if-absent
+  /// backfill on `start()`. (Reproduces the operator's "ToT profile appears
+  /// nowhere" on an upgraded install.)
+  func test_backfills_tree_of_thought_profile_into_existing_install() throws {
+    try withTempProfilesDir { dir in
+      try ProfileStore.defaultChatTOML.write(
+        to: dir.appendingPathComponent(ProfileStore.defaultChatFilename),
+        atomically: true, encoding: .utf8)
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      try "chat".write(to: active, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      let totURL = dir.appendingPathComponent(ProfileStore.treeOfThoughtFilename)
+      XCTAssertTrue(FileManager.default.fileExists(atPath: totURL.path),
+                    "existing install (non-empty dir) must still get tree-of-thought.toml backfilled")
+      let entry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "tree-of-thought.toml" })
+      XCTAssertEqual(entry.profile?.id, "tree-of-thought")
+      XCTAssertNotNil(entry.profile?.treeOfThought)
+      XCTAssertEqual(store.activeProfileID, "chat", "backfill must not change the active profile")
+    }
+  }
+
+  /// #413: the backfill is write-IF-ABSENT — it must never clobber a
+  /// user-edited tree-of-thought.toml.
+  func test_backfill_does_not_clobber_user_edited_tree_of_thought_profile() throws {
+    try withTempProfilesDir { dir in
+      try ProfileStore.defaultChatTOML.write(
+        to: dir.appendingPathComponent(ProfileStore.defaultChatFilename),
+        atomically: true, encoding: .utf8)
+      let edited = """
+      id = "tree-of-thought"
+      name = "My ToT"
+      model = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+      inferlet = "chat-apc"
+
+      [inferlet_args]
+      mode = "tree-of-thought"
+      breadth = 5
+      """
+      let totURL = dir.appendingPathComponent(ProfileStore.treeOfThoughtFilename)
+      try edited.write(to: totURL, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(try String(contentsOf: totURL, encoding: .utf8), edited,
+                     "backfill must not clobber a user-edited tree-of-thought.toml")
+      XCTAssertEqual(
+        store.entries.first { $0.url.lastPathComponent == "tree-of-thought.toml" }?.profile?.treeOfThought?.breadth,
+        5)
+    }
+  }
+
   /// : seeding the default `chat.toml` on a fresh install
   /// must also write the active-profile marker. Without this, the
   /// menu-bar Resume click returns `.noActiveProfile` on first launch
@@ -232,7 +371,9 @@ final class ProfileStoreTests: XCTestCase {
       try writeProfile(into: dir, name: "zeta.toml", id: "zeta", displayName: "Zeta")
       try writeProfile(into: dir, name: "alpha.toml", id: "alpha", displayName: "Alpha")
 
-      let store = ProfileStore(directory: dir)
+      // Opt out of the #413 example-profile backfill so this scan-ordering
+      // fixture stays hermetic (alpha + zeta only).
+      let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
       try store.start()
       defer { store.stop() }
 
@@ -1328,7 +1469,9 @@ final class ProfileStoreTests: XCTestCase {
     try withTempProfilesDir { dir in
       try writeProfile(into: dir, name: "a.toml", id: "a", displayName: "A")
       try writeProfile(into: dir, name: "b.toml", id: "b", displayName: "B")
-      let store = ProfileStore(directory: dir)
+      // Opt out of the #413 example-profile backfill so the entry count is
+      // exactly the two fixtures.
+      let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
       try store.start()
       // Seed-count-agnostic: the built-in Fast Think profile is auto-seeded
       // (#426) on top of the authored set, so assert "populated", not a count.
@@ -1459,7 +1602,9 @@ final class ProfileStoreTests: XCTestCase {
     // pins it.
     try withTempProfilesDir { dir in
       try writeProfile(into: dir, name: "a.toml", id: "a", displayName: "A")
-      let store = ProfileStore(directory: dir)
+      // Opt out of the #413 example-profile backfill so the count is exactly
+      // the one fixture (the test then drops a 2nd to schedule a reload).
+      let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
       try store.start()
       // Seed-count-agnostic (#426 auto-seeds Fast Think on top of the
       // authored set); this test only needs the store populated post-start.
@@ -1887,6 +2032,152 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+
+  func test_clearModel_removes_default_and_preserves_profile_as_valid_no_default_state() throws {
+    try withTempProfilesDir { dir in
+      let body = """
+      id = "chat"
+      name = "Chat"
+      icon = "bubble.left.and.bubble.right"
+      model = "deleted-model.gguf"
+      inferlet = "chat-apc"
+      system_prompt = "You are helpful."
+
+      [sampling]
+      temperature = 0.5
+      top_p = 0.8
+      max_tokens = 1024
+      """
+      try body.write(to: dir.appendingPathComponent("chat.toml"),
+                     atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      try store.clearModel(forProfileID: "chat")
+
+      XCTAssertNil(store.model(forProfileID: "chat"),
+                   "cleared profile default must resolve as no default, not a fabricated fallback")
+      let profile = try XCTUnwrap(store.entries.first { $0.profile?.id == "chat" }?.profile)
+      XCTAssertNil(profile.model,
+                   "profile remains valid while explicitly carrying no default model")
+      XCTAssertEqual(profile.name, "Chat", "name must survive the model clear")
+      XCTAssertEqual(profile.icon, "bubble.left.and.bubble.right")
+      XCTAssertEqual(profile.inferlet, "chat-apc")
+      XCTAssertEqual(profile.systemPrompt, "You are helpful.")
+      XCTAssertEqual(profile.sampling.temperature, 0.5, accuracy: 0.0001)
+      XCTAssertEqual(profile.sampling.maxTokens, 1024)
+
+      let disk = try String(contentsOf: dir.appendingPathComponent("chat.toml"), encoding: .utf8)
+      XCTAssertFalse(disk.contains("model ="),
+                     "clearing the default should remove the TOML model key rather than write an empty or fallback value")
+      let (reloaded, _) = ProfileStore.scan(directory: dir)
+      let reparsed = try XCTUnwrap(reloaded.first { $0.profile?.id == "chat" }?.profile)
+      XCTAssertNil(reparsed.model,
+                   "a fresh scan must keep the cleared profile parseable as no-default")
+    }
+  }
+
+  func test_profilesReferencingModel_returns_names_and_clearModels_updates_all_matches() throws {
+    try withTempProfilesDir { dir in
+      let shared = "deleted-model.gguf"
+      let profiles = [
+        ("chat.toml", "chat", "Chat", shared),
+        ("fast.toml", "fast", "Fast Think", shared),
+        ("code.toml", "code", "Code", "other-model.gguf"),
+      ]
+      for (filename, id, name, model) in profiles {
+        let body = """
+        id = "\(id)"
+        name = "\(name)"
+        model = "\(model)"
+        inferlet = "chat-apc"
+        """
+        try body.write(to: dir.appendingPathComponent(filename),
+                       atomically: true, encoding: .utf8)
+      }
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let affected = store.profilesReferencingModel(shared)
+      XCTAssertEqual(affected.map(\.name), ["Chat", "Fast Think"],
+                     "delete confirmation must be able to show affected profile names in stable order")
+
+      try store.clearModelDefaults(referencing: shared)
+
+      XCTAssertNil(store.model(forProfileID: "chat"))
+      XCTAssertNil(store.model(forProfileID: "fast"))
+      XCTAssertEqual(store.model(forProfileID: "code"), "other-model.gguf",
+                     "non-referencing profiles must not be changed")
+    }
+  }
+
+  func test_withClearedModelDefaults_restores_defaults_when_operation_fails() throws {
+    try withTempProfilesDir { dir in
+      let shared = "deleted-model.gguf"
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat", model: shared)
+      try writeProfile(into: dir, name: "fast.toml", id: "fast", displayName: "Fast Think", model: shared)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertThrowsError(try store.withClearedModelDefaults(referencing: shared) {
+        throw ProfileStoreDefaultsTransactionProbeError.trashFailed
+      }) { error in
+        guard case let transaction as ProfileModelDefaultsTransactionError = error,
+              case .operationFailed(_, _, _, let rollback) = transaction else {
+          return XCTFail("expected operationFailed transaction error, got \(error)")
+        }
+        XCTAssertEqual(rollback, .succeeded,
+                       "failed model trash must report that cleared defaults were restored")
+        XCTAssertTrue(transaction.description.contains("restored"),
+                      "user-visible delete error must distinguish recovered profile defaults; got: \(transaction)")
+      }
+
+      XCTAssertEqual(store.model(forProfileID: "chat"), shared)
+      XCTAssertEqual(store.model(forProfileID: "fast"), shared)
+    }
+  }
+
+  func test_withClearedModelDefaults_rolls_back_previously_cleared_profile_when_later_clear_fails() throws {
+    try withTempProfilesDir { dir in
+      let shared = "deleted-model.gguf"
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat", model: shared)
+      try writeProfile(into: dir, name: "fast.toml", id: "fast", displayName: "Fast Think", model: shared)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      var operationRan = false
+
+      XCTAssertThrowsError(try store.withClearedModelDefaults(
+        referencing: shared,
+        writeProfile: { profile, filename in
+          if profile.id == "fast", profile.model == nil {
+            throw ProfileStoreDefaultsTransactionProbeError.profileWriteFailed
+          }
+          try store.createProfile(profile, filename: filename)
+        },
+        operation: {
+          operationRan = true
+        }
+      )) { error in
+        guard case let transaction as ProfileModelDefaultsTransactionError = error,
+              case .clearFailed(_, let cleared, _, let rollback) = transaction else {
+          return XCTFail("expected clearFailed transaction error, got \(error)")
+        }
+        XCTAssertEqual(cleared.map(\.id), ["chat"],
+                       "error must report the exact profile defaults that needed rollback")
+        XCTAssertEqual(rollback, .succeeded,
+                       "partial profile clear failure must roll back earlier clears before surfacing")
+      }
+
+      XCTAssertFalse(operationRan, "model trash operation must not run after a partial profile clear failure")
+      XCTAssertEqual(store.model(forProfileID: "chat"), shared)
+      XCTAssertEqual(store.model(forProfileID: "fast"), shared)
+    }
+  }
+
   func test_setModel_throws_for_unknown_profile() throws {
     try withTempProfilesDir { dir in
       try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
@@ -2048,6 +2339,84 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  /// Settings → Profiles write-back: system_prompt plus user-facing sampling
+  /// defaults (temperature/top_p) are editable, while max_tokens stays an
+  /// engine-owned ceiling and is preserved from the existing profile TOML.
+  func test_setEditableDefaults_persists_prompt_temperature_topP_and_preserves_maxTokens() throws {
+    try withTempProfilesDir { dir in
+      let body = """
+      id = "chat"
+      name = "Chat"
+      icon = "bubble.left.and.bubble.right"
+      model = "model.gguf"
+      inferlet = "chat-apc"
+      system_prompt = "Old prompt"
+
+      [sampling]
+      temperature = 0.4
+      top_p = 0.75
+      max_tokens = 1536
+
+      [inferlet_args]
+      mode = "kept"
+      """
+      try body.write(to: dir.appendingPathComponent("chat.toml"),
+                     atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      try store.setEditableDefaults(
+        systemPrompt: "New prompt",
+        temperature: 0.2,
+        topP: 0.95,
+        forProfileID: "chat")
+
+      let profile = try XCTUnwrap(store.entries.first { $0.profile?.id == "chat" }?.profile)
+      XCTAssertEqual(profile.systemPrompt, "New prompt")
+      XCTAssertEqual(profile.sampling.temperature, 0.2, accuracy: 0.0001)
+      XCTAssertEqual(profile.sampling.topP, 0.95, accuracy: 0.0001)
+      XCTAssertEqual(profile.sampling.maxTokens, 1536,
+                     "Settings must not expose or overwrite max_tokens as a normal editable profile knob")
+      XCTAssertEqual(profile.inferletArgs["mode"]?.string, "kept")
+
+      let (reloaded, _) = ProfileStore.scan(directory: dir)
+      let fromDisk = try XCTUnwrap(reloaded.first { $0.profile?.id == "chat" }?.profile)
+      XCTAssertEqual(fromDisk.systemPrompt, "New prompt")
+      XCTAssertEqual(fromDisk.sampling.temperature, 0.2, accuracy: 0.0001)
+      XCTAssertEqual(fromDisk.sampling.topP, 0.95, accuracy: 0.0001)
+      XCTAssertEqual(fromDisk.sampling.maxTokens, 1536)
+    }
+  }
+
+  func test_profileDefaultAccessors_return_prompt_and_sampling_for_chat_initialization() throws {
+    try withTempProfilesDir { dir in
+      let body = """
+      id = "creative"
+      name = "Creative"
+      model = "model.gguf"
+      inferlet = "chat-apc"
+      system_prompt = "Think creatively."
+
+      [sampling]
+      temperature = 1.1
+      top_p = 0.65
+      max_tokens = 777
+      """
+      try body.write(to: dir.appendingPathComponent("creative.toml"),
+                     atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(store.systemPrompt(forProfileID: "creative"), "Think creatively.")
+      XCTAssertEqual(store.sampling(forProfileID: "creative"),
+                     Sampling(temperature: 1.1, topP: 0.65, maxTokens: 777))
+      XCTAssertNil(store.systemPrompt(forProfileID: "missing"))
+      XCTAssertNil(store.sampling(forProfileID: "missing"))
+    }
+  }
+
   // MARK: - helpers
 
   private func withTempProfilesDir(_ body: (URL) throws -> Void) throws {
@@ -2077,16 +2446,22 @@ final class ProfileStoreTests: XCTestCase {
     into dir: URL,
     name: String,
     id: String,
-    displayName: String
+    displayName: String,
+    model: String = "m"
   ) throws {
     let body = """
     id = "\(id)"
     name = "\(displayName)"
-    model = "m"
+    model = "\(model)"
     inferlet = "i"
     """
     try body.write(to: dir.appendingPathComponent(name),
                    atomically: true,
                    encoding: .utf8)
   }
+}
+
+private enum ProfileStoreDefaultsTransactionProbeError: Error {
+  case trashFailed
+  case profileWriteFailed
 }
