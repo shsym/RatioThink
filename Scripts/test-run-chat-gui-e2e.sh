@@ -116,6 +116,7 @@ FAKE_PGREP
     PIE_TEST_TCC_GRANTED=1 \
     PIE_E2E_AUTOPREP=0 \
     PIE_TEST_RUN_ROOT="$tmp/run" \
+    STAGE_TEST_MODEL_DEST="$tmp/isolated-fixture/Qwen3-0.6B-Q8_0.gguf" \
     "$SCRIPT" 2>&1
   )"
   local status=$?

@@ -140,6 +140,23 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(store.runtimeDaemonBindMode, .external)
   }
 
+  func test_legacy_running_status_with_external_preference_does_not_hide_exposure() throws {
+    let data = Data(#"{"kind":"running","port":8123,"profileID":"chat"}"#.utf8)
+    let legacyStatus = try XPCPayload.decode(EngineStatus.self, from: data)
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialDaemonBindMode: .external,
+      daemonBindModeProvider: { .external }
+    )
+
+    store._applyPollForTesting(next: legacyStatus, error: nil)
+
+    XCTAssertEqual(store.status, .running(port: 8123, profileID: "chat"))
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+    XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8123")
+  }
+
   func test_running_status_poll_updates_runtime_daemon_bind_mode_from_helper() {
     let client = StubXPCClient()
     let store = EngineStatusStore(client: client, initialDaemonBindMode: .loopback)

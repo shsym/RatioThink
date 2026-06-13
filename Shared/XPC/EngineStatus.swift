@@ -14,9 +14,10 @@ public typealias EnginePort = UInt16
 
 /// Engine lifecycle state observed by `PieSupervisor`. Single source of
 /// truth for menu-bar dot color and chat startup gating. The `running`
-/// case carries the live port, active profile id, and effective Local API
-/// daemon bind mode so the GUI doesn't have to keep a parallel cache or infer
-/// helper-owned starts from preferences.
+/// case carries the live port, active profile id, and (for v9+ helpers) the
+/// effective Local API daemon bind mode so the GUI doesn't have to keep a
+/// parallel cache or infer helper-owned starts from preferences. A missing
+/// bind mode means an older helper payload, not confirmed loopback.
 ///
 /// `failed` carries a discriminator (`EngineErrorCode`) plus a bounded
 /// message so the GUI can route on the code rather than substring-match
@@ -25,7 +26,7 @@ public typealias EnginePort = UInt16
 public enum EngineStatus: Codable, Equatable, Sendable {
   case stopped
   case starting
-  case running(port: EnginePort, profileID: String, daemonBindHost: EngineHTTPBindMode = .loopback)
+  case running(port: EnginePort, profileID: String, daemonBindHost: EngineHTTPBindMode? = nil)
   case stopping
   case failed(code: EngineErrorCode, message: String)
 
@@ -60,7 +61,7 @@ public enum EngineStatus: Codable, Equatable, Sendable {
       self = .running(
         port: port,
         profileID: try c.decode(String.self, forKey: .profileID),
-        daemonBindHost: try c.decodeIfPresent(EngineHTTPBindMode.self, forKey: .daemonBindHost) ?? .loopback
+        daemonBindHost: try c.decodeIfPresent(EngineHTTPBindMode.self, forKey: .daemonBindHost)
       )
     case .stopping: self = .stopping
     case .failed:
@@ -93,9 +94,11 @@ public enum EngineStatus: Codable, Equatable, Sendable {
         )
       }
       try c.encode(Kind.running, forKey: .kind)
-      try c.encode(port,           forKey: .port)
-      try c.encode(profileID,      forKey: .profileID)
-      try c.encode(daemonBindHost, forKey: .daemonBindHost)
+      try c.encode(port,      forKey: .port)
+      try c.encode(profileID, forKey: .profileID)
+      if let daemonBindHost {
+        try c.encode(daemonBindHost, forKey: .daemonBindHost)
+      }
     case .stopping: try c.encode(Kind.stopping, forKey: .kind)
     case .failed(let code, let message):
       try c.encode(Kind.failed, forKey: .kind)

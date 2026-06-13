@@ -18,6 +18,7 @@ MODELS_ROOT="$RUN_ROOT/models"
 URL_FILE="$RUN_ROOT/engine.url"
 HARNESS_LOG="$RUN_ROOT/engine-harness.log"
 CONFIG_FILE="/tmp/pie-chat-gui-e2e.env"
+MODEL_FIXTURE="${STAGE_TEST_MODEL_DEST:-$ROOT/test-models/Qwen3-0.6B-Q8_0.gguf}"
 ENGINE_PID=""
 
 cleanup() {
@@ -41,11 +42,11 @@ PIE_BIN="$(e2e_ensure_pie "$ROOT" "$TAG")" || exit 2
 # exact download command and exit non-zero — honest-skip only when the GGUF is
 # genuinely unavailable), then materialize the app-staged slug path the harness
 # serves in portable mode.
-if ! Scripts/stage-test-model.sh >&2; then
+if ! STAGE_TEST_MODEL_DEST="$MODEL_FIXTURE" Scripts/stage-test-model.sh >&2; then
   echo "$TAG: GGUF fixture unavailable (see guidance above); cannot run the GGUF chat E2E." >&2
   exit 2
 fi
-GGUF_REAL="$(realpath "$ROOT/test-models/Qwen3-0.6B-Q8_0.gguf")"
+GGUF_REAL="$(realpath "$MODEL_FIXTURE")"
 GGUF_DEST="$MODELS_ROOT/$SLUG"
 mkdir -p "$(dirname "$GGUF_DEST")"
 # Regular file (hard-link; copy across volumes) so pie loads the weight directly.

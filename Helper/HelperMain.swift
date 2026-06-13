@@ -763,7 +763,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       Diag.helper.event("engine.ready", [
         ("port", String(port)),
         ("profile", profileID),
-        ("daemonBindHost", daemonBindHost.rawValue),
+        ("daemonBindHost", daemonBindHost?.rawValue ?? "unknown"),
       ])
     case let .failed(code, _):
       Diag.helper.event("engine.fail", [("code", code.rawValue)])

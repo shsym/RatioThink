@@ -59,7 +59,7 @@ final class XPCProtocolTests: XCTestCase {
     if case .running(let port, let id, let daemonBindHost) = decoded {
       XCTAssertEqual(port, 51234)
       XCTAssertEqual(id, "chat")
-      XCTAssertEqual(daemonBindHost, .loopback)
+      XCTAssertNil(daemonBindHost)
     } else {
       XCTFail("expected .running, got \(decoded)")
     }
@@ -77,10 +77,10 @@ final class XPCProtocolTests: XCTestCase {
     }
   }
 
-  func test_engineStatus_legacy_running_payload_defaults_daemon_bind_mode_to_loopback() throws {
+  func test_engineStatus_legacy_running_payload_preserves_missing_daemon_bind_mode() throws {
     let data = Data(#"{"kind":"running","port":51234,"profileID":"chat"}"#.utf8)
     let decoded = try XPCPayload.decode(EngineStatus.self, from: data)
-    XCTAssertEqual(decoded, .running(port: 51234, profileID: "chat", daemonBindHost: .loopback))
+    XCTAssertEqual(decoded, .running(port: 51234, profileID: "chat"))
   }
 
   func test_engineStatus_running_port_zero_is_rejected() throws {

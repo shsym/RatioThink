@@ -141,6 +141,12 @@ public final class EngineStatusStore: ObservableObject {
   /// `tierPolicy.firstLoadFailureGracePolls`.
   private var heldFailurePolls = 0
 
+  /// True only when `runtimeDaemonBindMode` came from an explicit app start
+  /// request or a helper status payload that carried `daemonBindHost`. Legacy
+  /// running payloads lack that field, so they must not silently certify a
+  /// loopback-only posture.
+  private var runtimeDaemonBindModeIsConfirmed = false
+
   public init(
     client: any AppXPCClient,
     pollInterval: TimeInterval = 1.0,
@@ -159,7 +165,16 @@ public final class EngineStatusStore: ObservableObject {
     self.runtimeDaemonBindMode = initialDaemonBindMode
     if case .running(_, _, let daemonBindHost) = initialStatus {
       self.wasEverRunning = true
-      self.runtimeDaemonBindMode = daemonBindHost
+      if let daemonBindHost {
+        self.runtimeDaemonBindMode = daemonBindHost
+        self.runtimeDaemonBindModeIsConfirmed = true
+      } else {
+        self.runtimeDaemonBindMode = Self.failSafeLegacyBindMode(
+          current: initialDaemonBindMode,
+          currentIsConfirmed: false,
+          desired: daemonBindModeProvider()
+        )
+      }
     }
     if case .starting = initialStatus { self.startingSince = now() }
   }
@@ -321,10 +336,12 @@ public final class EngineStatusStore: ObservableObject {
     do {
       try await client.startEngine(profileID: profileID, daemonBindHost: requestedBindMode)
       runtimeDaemonBindMode = requestedBindMode
+      runtimeDaemonBindModeIsConfirmed = true
     } catch let error as AppXPCClientError {
       if case .replyTimeout = error {
         Self.log.notice("startEngine(profileID=\(profileID, privacy: .public)) reply timed out — start in flight; status poll will surface the outcome")
         runtimeDaemonBindMode = requestedBindMode
+        runtimeDaemonBindModeIsConfirmed = true
         return
       }
       throw error
@@ -436,9 +453,7 @@ public final class EngineStatusStore: ObservableObject {
         // grace exhausted — surface the failure below.
       }
       heldFailurePolls = 0
-      if case .running(_, _, let daemonBindHost) = next {
-        runtimeDaemonBindMode = daemonBindHost
-      }
+      updateRuntimeDaemonBindMode(from: next)
       setStatusAndTrackStarting(next)
       if case .running = next { wasEverRunning = true }
       updateEngineGonePolls(for: next)
@@ -501,6 +516,35 @@ public final class EngineStatusStore: ObservableObject {
   /// #2 hold predicate: a held-eligible transient failure is an explicit
   /// `.spawnFailed`/`.engineGone` while the engine has NEVER run this
   /// session and is still inside its `.starting` window.
+  private func updateRuntimeDaemonBindMode(from next: EngineStatus) {
+    guard case .running(_, _, let daemonBindHost) = next else { return }
+    if let daemonBindHost {
+      runtimeDaemonBindMode = daemonBindHost
+      runtimeDaemonBindModeIsConfirmed = true
+      return
+    }
+
+    runtimeDaemonBindMode = Self.failSafeLegacyBindMode(
+      current: runtimeDaemonBindMode,
+      currentIsConfirmed: runtimeDaemonBindModeIsConfirmed,
+      desired: daemonBindModeProvider()
+    )
+  }
+
+  private static func failSafeLegacyBindMode(
+    current: EngineHTTPBindMode,
+    currentIsConfirmed: Bool,
+    desired: EngineHTTPBindMode
+  ) -> EngineHTTPBindMode {
+    if currentIsConfirmed { return current }
+    if current == .external || desired == .external { return .external }
+    // Missing daemonBindHost is unknown, not proof of loopback. When no
+    // confirmed app start or persisted external preference can explain the
+    // running daemon, over-report exposure so the Local API UI keeps the
+    // network warning visible instead of claiming loopback-only safety.
+    return .external
+  }
+
   private func shouldHoldTransientFailure(_ next: EngineStatus) -> Bool {
     guard !wasEverRunning, startingSince != nil else { return false }
     guard case let .failed(code, _) = next else { return false }
