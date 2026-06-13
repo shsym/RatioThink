@@ -181,7 +181,6 @@ fn score_prompt(is_final_level: bool) -> &'static str {
 /// `<think></think>` plus the integer. The scorer is NOT demuxed (see
 /// [`score_node`]), so this is the whole budget.
 const SCORE_MAX_TOKENS: usize = 32;
-const SCORE_INFRA_FAILURE_FALLBACK: u8 = 6;
 
 /// Temperature for the final-answer synthesis (#523 Part A). Deliberately
 /// LOW and fixed, independent of the candidate-generation temperature
@@ -482,9 +481,7 @@ fn reconcile_answer_with_material(answer: String, material: &str) -> String {
 
 fn rewrite_near_duplicate_answer(parent: &str, answer: &str) -> Option<String> {
     let trimmed = answer.trim();
-    if trimmed.is_empty()
-        || !super::diversity::is_near_duplicate(parent.trim(), trimmed, 0.9)
-    {
+    if trimmed.is_empty() || !super::diversity::is_near_duplicate(parent.trim(), trimmed, 0.9) {
         return None;
     }
     let lower = trimmed.to_lowercase();
@@ -513,37 +510,11 @@ fn rewrite_near_duplicate_answer(parent: &str, answer: &str) -> Option<String> {
     None
 }
 
-fn deterministic_synthesis_fallback(answer: &str, allow_unlabeled: bool) -> Option<String> {
-    let trimmed = answer.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    for line in trimmed
-        .lines()
-        .rev()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-    {
-        let lower = line.to_lowercase();
-        if lower.starts_with("total:") || lower.starts_with("author:") {
-            let cleaned = strip_answer_label(line);
-            return (!cleaned.is_empty()).then_some(cleaned);
-        }
-        if lower.starts_with("tactic:") {
-            let tactic = strip_answer_label(line);
-            if !tactic.is_empty() {
-                return Some(format!(
-                    "Use {tactic} to keep meetings focused, and assign action items before leaving."
-                ));
-            }
-        }
-    }
-    if allow_unlabeled {
-        let cleaned = sanitize_final_answer(trimmed);
-        (!cleaned.is_empty()).then_some(cleaned)
-    } else {
-        None
-    }
+fn synthesis_failure_fallback(
+    _raw_final_answer: Option<&str>,
+    _selected_material: &str,
+) -> Option<String> {
+    None
 }
 
 type DemuxFuture<'a> = Pin<Box<dyn Future<Output = Demux> + 'a>>;
@@ -837,8 +808,9 @@ async fn generate_demuxed(
 /// a benign unparseable result (the model emitted no in-range integer —
 /// common for reasoning models), and an infra failure (the scoring fork
 /// or generation itself failed). Only the last surfaces as a node
-/// `score_error` and gets a conservative fallback score, so an infra scorer
-/// collapse is no longer mistaken for a benign null or silently ranked last.
+/// `score_error`. It must not receive a fabricated numeric score: beam
+/// selection treats `score` as evaluator output, so infra failures stay
+/// `None` and are non-preferred behind any real parsed score.
 enum ScoreOutcome {
     Scored(u8),
     Unparseable,
@@ -859,7 +831,7 @@ impl ScoreOutcome {
         match self {
             ScoreOutcome::Scored(v) => (Some(v), None),
             ScoreOutcome::Unparseable => (None, None),
-            ScoreOutcome::Failed(msg) => (Some(SCORE_INFRA_FAILURE_FALLBACK), Some(msg)),
+            ScoreOutcome::Failed(msg) => (None, Some(msg)),
         }
     }
 }
@@ -1095,11 +1067,11 @@ pub async fn run(
     // failure it returns `None` and the raw final-depth best-leaf content
     // stands when eligible.
     let selected_id = best_leaf(&last_level);
-    let synth_ctx = selected_id
-        .as_ref()
-        .and_then(|id| frontier.iter().find(|f| &f.node_id == id))
-        .and_then(|f| f.ctx.fork().ok())
-        .or(synth_base);
+    // Synthesis is grounded on the original conversation fork. Branch
+    // contexts contain ToT control turns (option labels/directives/candidate
+    // assistant text) that must never be part of the final-answer context;
+    // selected-path material is passed only through the sanitized directive.
+    let synth_ctx = choose_synthesis_context(synth_base, None::<Context>);
     let best = selected_id.and_then(|id| {
         let node = flat.iter().find(|n| n.id == id)?;
         let content =
@@ -1129,19 +1101,13 @@ pub async fn run(
             }
             Err((reason, generated_tokens)) => {
                 total_generated_tokens += generated_tokens;
-                eprintln!("[chat-apc] tot synthesis fell back to best leaf: {reason}");
-                let allow_unlabeled = outcome.final_answer.is_some();
-                let fallback_source = outcome.final_answer.as_deref().unwrap_or(&content);
-                deterministic_synthesis_fallback(fallback_source, allow_unlabeled)
-                    .map(|answer| reconcile_answer_with_material(answer, &content))
+                eprintln!("[chat-apc] tot synthesis failed: {reason}");
+                synthesis_failure_fallback(outcome.final_answer.as_deref(), &content)
             }
         },
         (Some((content, _)), None) => {
             eprintln!("[chat-apc] tot synthesis skipped: fork_failed");
-            let allow_unlabeled = outcome.final_answer.is_some();
-            let fallback_source = outcome.final_answer.as_deref().unwrap_or(&content);
-            deterministic_synthesis_fallback(fallback_source, allow_unlabeled)
-                .map(|answer| reconcile_answer_with_material(answer, &content))
+            synthesis_failure_fallback(outcome.final_answer.as_deref(), &content)
         }
         // No ok leaf → honest-null: no synthesis is attempted and
         // finalize()'s null `final_answer` stands (no diagnostic — a total
@@ -1166,6 +1132,10 @@ fn reconcile_synthesis(outcome: &mut SearchOutcome, synth: Option<String>) {
     }
 }
 
+fn choose_synthesis_context<C>(synth_base: Option<C>, _branch_context: Option<C>) -> Option<C> {
+    synth_base
+}
+
 /// Materialize one level's **successfully forked** branches into tree
 /// nodes + scored candidates + the beam, with no engine context so it is
 /// unit-tested natively. Fork and refine-flush failures never reach here —
@@ -1182,11 +1152,8 @@ fn materialize_level(level: usize, branches: Vec<Branch>, beam_width: usize) -> 
     let mut nodes: Vec<Node> = Vec::with_capacity(branches.len());
     let mut candidates: Vec<Candidate> = Vec::with_capacity(branches.len());
     let mut generated_tokens = 0usize;
-    for mut b in branches {
+    for b in branches {
         generated_tokens += b.outcome.generated_tokens;
-        if b.outcome.score.is_none() && b.outcome.score_error.is_some() {
-            b.outcome.score = Some(SCORE_INFRA_FAILURE_FALLBACK);
-        }
         // Only an `Ok` node (a non-empty answer) is beam-eligible; both
         // `Error` (generation failed) and `Incomplete` (reasoned but never
         // answered) are excluded from survival and final-answer selection,
@@ -1287,48 +1254,7 @@ fn selected_path_content(flat: &[Node], selected_id: &str) -> Option<String> {
 }
 
 fn selected_synthesis_content(flat: &[Node], selected_id: &str) -> Option<String> {
-    let mut material = selected_path_content(flat, selected_id)?;
-    let mut seen: Vec<String> = material
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect();
-    let selected_depth = flat
-        .iter()
-        .find(|node| node.id == selected_id)
-        .map(|node| node.depth)
-        .unwrap_or_default();
-
-    let mut extras = Vec::new();
-    for node in flat {
-        if node.status != NodeStatus::Ok || node.id == selected_id {
-            continue;
-        }
-        if selected_depth > 0 && node.depth > selected_depth {
-            continue;
-        }
-        let content = node.content.trim();
-        if content.is_empty() {
-            continue;
-        }
-        if seen
-            .iter()
-            .any(|p| super::diversity::is_near_duplicate(p, content, 0.9))
-        {
-            continue;
-        }
-        seen.push(content.to_string());
-        extras.push(content.to_string());
-        if extras.len() >= 4 {
-            break;
-        }
-    }
-    if !extras.is_empty() {
-        material.push_str("\n\n");
-        material.push_str(&extras.join("\n"));
-    }
-    Some(material)
+    selected_path_content(flat, selected_id)
 }
 
 /// Assemble the final [`SearchOutcome`] from the flat node list and the
@@ -2031,24 +1957,23 @@ mod tests {
                 "Use agendas and checklists to keep meetings focused."
             )
             .as_deref(),
-            Some("Set a focused agenda and use a checklist to keep decisions and action items moving.")
+            Some(
+                "Set a focused agenda and use a checklist to keep decisions and action items moving."
+            )
         );
     }
 
     #[test]
-    fn deterministic_synthesis_fallback_only_promotes_labeled_intermediate_material() {
-        assert_eq!(
-            deterministic_synthesis_fallback("Tactic: a timer", false).unwrap(),
-            "Use a timer to keep meetings focused, and assign action items before leaving."
-        );
-        assert_eq!(
-            deterministic_synthesis_fallback("Author: Jane Austen", false).unwrap(),
-            "Jane Austen"
-        );
-        assert!(deterministic_synthesis_fallback("draft partial path", false).is_none());
-        assert_eq!(
-            deterministic_synthesis_fallback("A complete final answer.", true).unwrap(),
-            "A complete final answer."
+    fn synthesis_failure_fallback_never_promotes_labeled_or_raw_material() {
+        assert!(synthesis_failure_fallback(None, "Tactic: a timer").is_none());
+        assert!(synthesis_failure_fallback(None, "Author: Jane Austen").is_none());
+        assert!(synthesis_failure_fallback(None, "Total: $18").is_none());
+        assert!(
+            synthesis_failure_fallback(
+                Some("A complete final-depth answer."),
+                "A complete final-depth answer."
+            )
+            .is_none()
         );
     }
 
@@ -2329,7 +2254,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_synthesis_content_adds_distinct_sibling_material() {
+    fn selected_synthesis_content_uses_selected_path_only() {
         let flat = vec![
             Node {
                 id: "root".into(),
@@ -2388,7 +2313,46 @@ mod tests {
         let content = selected_synthesis_content(&flat, "c").unwrap();
         assert!(content.contains("Tactic: checklists"));
         assert!(content.contains("Use checklists"));
-        assert!(content.contains("Tactic: an agenda"));
+        assert!(!content.contains("Tactic: an agenda"));
+    }
+
+    #[test]
+    fn selected_synthesis_content_excludes_rejected_sibling_numbers() {
+        let mut selected_parent =
+            ok_leaf("selected-parent", "The pre-discount total is $22.", Some(8));
+        selected_parent.depth = 1;
+        let mut rejected_sibling = ok_leaf("rejected", "Maya's final total is $4.", Some(2));
+        rejected_sibling.depth = 1;
+        let mut selected_leaf = ok_leaf(
+            "selected-leaf",
+            "Subtracting the $4 discount leaves $18.",
+            Some(9),
+        );
+        selected_leaf.parent_id = Some("selected-parent".to_string());
+        selected_leaf.depth = 2;
+        let flat = vec![
+            Node::root(),
+            selected_parent,
+            rejected_sibling,
+            selected_leaf,
+        ];
+
+        let content = selected_synthesis_content(&flat, "selected-leaf").unwrap();
+        assert!(content.contains("$22"));
+        assert!(content.contains("$18"));
+        assert!(!content.contains("final total is $4"));
+    }
+
+    #[test]
+    fn synthesis_context_prefers_original_base_over_branch_context() {
+        assert_eq!(
+            choose_synthesis_context(
+                Some("original conversation"),
+                Some("branch with option label")
+            ),
+            Some("original conversation")
+        );
+        assert_eq!(choose_synthesis_context::<&str>(None, Some("branch")), None);
     }
 
     #[test]
@@ -2461,7 +2425,7 @@ mod tests {
         assert_eq!(ScoreOutcome::Unparseable.into_parts(), (None, None));
         assert_eq!(
             ScoreOutcome::Failed("score fork failed: x".to_string()).into_parts(),
-            (Some(6), Some("score fork failed: x".to_string()))
+            (None, Some("score fork failed: x".to_string()))
         );
     }
 
@@ -2580,18 +2544,17 @@ mod tests {
             ))),
         );
         assert_eq!(o.status, NodeStatus::Ok);
-        assert_eq!(o.score, Some(6));
+        assert_eq!(o.score, None);
         assert_eq!(o.score_error.as_deref(), Some("score fork failed: x"));
     }
 
     #[test]
     fn classify_answered_missing_score_defaults_to_infra_failure() {
         // Defensive: an Answered node must be scored. A None score is a
-        // caller bug — surfaced as a score_error with the same conservative
-        // fallback used for real scorer infra failures, never a silent null.
+        // caller bug — surfaced as a score_error instead of a silent null.
         let o = classify(demux("", "a", DemuxKind::Answered), None);
         assert_eq!(o.status, NodeStatus::Ok);
-        assert_eq!(o.score, Some(6));
+        assert_eq!(o.score, None);
         assert!(o.score_error.as_deref().unwrap().contains("not scored"));
     }
 
@@ -2994,11 +2957,10 @@ mod tests {
     }
 
     #[test]
-    fn materialize_surfaces_score_error_on_ok_node() {
+    fn materialize_surfaces_score_error_on_ok_node_without_fabricated_score() {
         // F4: an ok node whose scorer infra failed carries score_error and
-        // stays ok. It keeps a conservative fallback score for ranking so
-        // scorer infra collapse does not silently bury an answered branch —
-        // distinct from a benign unparseable null with no score_error.
+        // stays ok, but the score remains null: a scorer infra collapse must
+        // not impersonate a real evaluator score.
         let m = materialize_level(
             1,
             vec![branch(
@@ -3011,37 +2973,87 @@ mod tests {
         );
         let n = &m.nodes[0];
         assert_eq!(n.status, NodeStatus::Ok);
-        assert_eq!(n.score, Some(6));
+        assert_eq!(n.score, None);
         assert_eq!(n.score_error.as_deref(), Some("score fork failed: x"));
         assert!(m.candidates[0].ok);
         assert_eq!(m.keep, vec!["n0"]);
     }
 
     #[test]
-    fn materialize_does_not_rank_score_infra_failure_last() {
+    fn materialize_score_infra_failure_cannot_outrank_real_low_score() {
         let m = materialize_level(
             1,
             vec![
                 branch(
-                    "wrong",
-                    "root",
-                    0,
-                    ok_outcome("Maya's final total is $4.", Some(4)),
-                ),
-                branch(
                     "score_failed",
                     "root",
-                    1,
+                    0,
                     ok_outcome_score_failed(
                         "Maya's final total is $18.",
                         "score generate failed: No output available",
                     ),
                 ),
+                branch(
+                    "scored",
+                    "root",
+                    1,
+                    ok_outcome("Maya's final total is $18.", Some(3)),
+                ),
             ],
             1,
         );
 
-        assert_eq!(m.keep, vec!["score_failed"]);
+        assert_eq!(m.keep, vec!["scored"]);
+    }
+
+    #[test]
+    fn materialize_score_infra_failure_loses_to_high_real_score() {
+        let m = materialize_level(
+            1,
+            vec![
+                branch(
+                    "score_failed",
+                    "root",
+                    0,
+                    ok_outcome_score_failed("Maya's final total is $4.", "score fork failed: x"),
+                ),
+                branch(
+                    "correct",
+                    "root",
+                    1,
+                    ok_outcome("Maya's final total is $18.", Some(9)),
+                ),
+            ],
+            1,
+        );
+
+        assert_eq!(m.keep, vec!["correct"]);
+    }
+
+    #[test]
+    fn materialize_all_score_infra_failures_can_fall_back_by_input_order() {
+        let m = materialize_level(
+            1,
+            vec![
+                branch(
+                    "first_failed",
+                    "root",
+                    0,
+                    ok_outcome_score_failed("First answer.", "score fork failed: x"),
+                ),
+                branch(
+                    "second_failed",
+                    "root",
+                    1,
+                    ok_outcome_score_failed("Second answer.", "score generate failed: y"),
+                ),
+            ],
+            1,
+        );
+
+        assert!(m.nodes.iter().all(|n| n.score.is_none()));
+        assert!(m.nodes.iter().all(|n| n.score_error.is_some()));
+        assert_eq!(m.keep, vec!["first_failed"]);
     }
 
     #[test]
@@ -3255,6 +3267,40 @@ mod tests {
         let (code, _) =
             crate::tot::stream::terminal_error(&out.selected_node_id, &out.final_answer)
                 .expect("selected intermediate without a final answer must be terminal failure");
+        assert_eq!(code, crate::tot::stream::FINAL_ANSWER_UNAVAILABLE_CODE);
+    }
+
+    #[test]
+    fn synthesis_failure_with_labeled_intermediate_stays_terminal_error() {
+        // Review v9 F1: a retained intermediate may contain label-shaped
+        // material from older prompt variants. A synthesis Err/fork skip must
+        // not deterministically relabel that material into a synthesized
+        // success; it should fall through to final_answer_unavailable.
+        let mut flat = vec![Node::root()];
+        let LevelMaterialized {
+            nodes,
+            candidates,
+            keep,
+            generated_tokens: _,
+        } = materialize_level(
+            1,
+            vec![branch("n0", "root", 0, ok_outcome("Total: $18", Some(6)))],
+            2,
+        );
+        flat.extend(nodes);
+        let (pool, stop) = fold_level(Vec::new(), candidates, &keep);
+        assert!(!stop);
+
+        let mut out = finalize(flat, &pool, 2);
+        let synth = synthesis_failure_fallback(out.final_answer.as_deref(), "Total: $18");
+        reconcile_synthesis(&mut out, synth);
+
+        assert_eq!(out.selected_node_id.as_deref(), Some("n0"));
+        assert!(out.final_answer.is_none());
+        assert!(!out.synthesized);
+        let (code, _) =
+            crate::tot::stream::terminal_error(&out.selected_node_id, &out.final_answer)
+                .expect("selected intermediate without synthesis must be terminal failure");
         assert_eq!(code, crate::tot::stream::FINAL_ANSWER_UNAVAILABLE_CODE);
     }
 
