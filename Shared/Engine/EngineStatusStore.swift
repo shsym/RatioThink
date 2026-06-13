@@ -517,7 +517,10 @@ public final class EngineStatusStore: ObservableObject {
   /// `.spawnFailed`/`.engineGone` while the engine has NEVER run this
   /// session and is still inside its `.starting` window.
   private func updateRuntimeDaemonBindMode(from next: EngineStatus) {
-    guard case .running(_, _, let daemonBindHost) = next else { return }
+    guard case .running(_, _, let daemonBindHost) = next else {
+      runtimeDaemonBindModeIsConfirmed = false
+      return
+    }
     if let daemonBindHost {
       runtimeDaemonBindMode = daemonBindHost
       runtimeDaemonBindModeIsConfirmed = true
@@ -536,9 +539,12 @@ public final class EngineStatusStore: ObservableObject {
     currentIsConfirmed: Bool,
     desired: EngineHTTPBindMode
   ) -> EngineHTTPBindMode {
+    if desired == .external { return .external }
     if currentIsConfirmed { return current }
-    if current == .external || desired == .external { return .external }
-    // Missing daemonBindHost is unknown, not proof of loopback. When no
+    if current == .external { return .external }
+    // Missing daemonBindHost is unknown, not proof of loopback. Prefer the
+    // current desired external posture over stale confirmed state from an
+    // earlier running generation. When no
     // confirmed app start or persisted external preference can explain the
     // running daemon, over-report exposure so the Local API UI keeps the
     // network warning visible instead of claiming loopback-only safety.

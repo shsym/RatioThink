@@ -102,6 +102,14 @@ final class EngineStatusStoreTests: XCTestCase {
     }
   }
 
+  private final class MutableBindMode: @unchecked Sendable {
+    var value: EngineHTTPBindMode
+
+    init(_ value: EngineHTTPBindMode) {
+      self.value = value
+    }
+  }
+
   // MARK: - startEngine (#326 fresh-install recovery)
 
   func test_startEngine_forwards_profileID_to_client() async throws {
@@ -155,6 +163,32 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(store.status, .running(port: 8123, profileID: "chat"))
     XCTAssertEqual(store.runtimeDaemonBindMode, .external)
     XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8123")
+  }
+
+  func test_legacy_running_after_stop_prefers_current_external_preference_over_stale_confirmed_loopback() throws {
+    let data = Data(#"{"kind":"running","port":8124,"profileID":"chat"}"#.utf8)
+    let legacyStatus = try XPCPayload.decode(EngineStatus.self, from: data)
+    let desiredBindMode = MutableBindMode(.loopback)
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialDaemonBindMode: .loopback,
+      daemonBindModeProvider: { desiredBindMode.value }
+    )
+
+    store._applyPollForTesting(
+      next: .running(port: 8123, profileID: "chat", daemonBindHost: .loopback),
+      error: nil
+    )
+    XCTAssertEqual(store.runtimeDaemonBindMode, .loopback)
+
+    store._applyPollForTesting(next: .stopped, error: nil)
+    desiredBindMode.value = .external
+    store._applyPollForTesting(next: legacyStatus, error: nil)
+
+    XCTAssertEqual(store.status, .running(port: 8124, profileID: "chat"))
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+    XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8124")
   }
 
   func test_running_status_poll_updates_runtime_daemon_bind_mode_from_helper() {
