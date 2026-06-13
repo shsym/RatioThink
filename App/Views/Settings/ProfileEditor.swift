@@ -103,25 +103,27 @@ struct ProfileEditor: View {
   /// swap-confirm PRE-FILL only — it never triggers a load.
   private func modelPicker(profile: Profile) -> some View {
     Menu {
-      // #580 #4: cluster all quants of a family under one base-name section
-      // header so the menu reads as "Llama 3.2 1B Instruct → Q4 / Q8"
-      // instead of a flat list of long leaf names.
+      // #580 #4: cluster all quants of a family under one base-name header
+      // so the menu reads as "Llama 3.2 1B Instruct → Q4 / Q8" instead of a
+      // flat list of long leaf names. The header is a disabled `Text` row
+      // (NOT a SwiftUI `Section`): a `Section` header inside a
+      // `.borderlessButton` Menu breaks the NSMenu so it never opens —
+      // verified by S365. A plain `Text` renders as a disabled label and
+      // keeps every Button a direct, selectable menu item.
       ForEach(ModelIdentityGrouping.grouped(modelOptions, slug: \.slug)) { group in
-        Section(group.base) {
-          ForEach(group.items) { option in
-            Button {
-              persistModel(option.slug, profileID: profile.id)
-            } label: {
-              // Within a base section the row's primary text is the quant
-              // tag (the distinguishing part) plus size + over-limit /
-              // unsupported reason.
-              modelOptionLabel(option)
-            }
-            // Block selecting an unloadable model — over-limit (too large for
-            // this host) or unsupported (a split GGUF the engine can't load)
-            // — but never the current value, which stays a no-op.
-            .disabled((option.isOverLimit || option.unsupportedReason != nil) && !option.isCurrent)
+        Text(group.base)
+        ForEach(group.items) { option in
+          Button {
+            persistModel(option.slug, profileID: profile.id)
+          } label: {
+            // The row's primary text is the quant tag (the distinguishing
+            // part) plus size + over-limit / unsupported reason.
+            modelOptionLabel(option)
           }
+          // Block selecting an unloadable model — over-limit (too large for
+          // this host) or unsupported (a split GGUF the engine can't load) —
+          // but never the current value, which stays a no-op.
+          .disabled((option.isOverLimit || option.unsupportedReason != nil) && !option.isCurrent)
         }
       }
     } label: {

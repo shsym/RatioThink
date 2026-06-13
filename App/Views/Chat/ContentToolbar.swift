@@ -177,24 +177,28 @@ struct ContentToolbar: View {
     Menu {
       Button("Use profile default") { viewModel.modelOverride = nil }
       Divider()
-      // #580 #4: cluster all quants of a family under one base-name section
-      // header; each row shows the quant tag (the distinguisher) + an
-      // unverified shield (#580 #5) when the staged file was not sha256-checked.
+      // #580 #4: cluster all quants of a family under one base-name header;
+      // each row shows the quant tag (the distinguisher) + an unverified
+      // shield (#580 #5) when the staged file was not sha256-checked. The
+      // header is a disabled `Text` row (NOT a SwiftUI `Section`): a
+      // `Section` header inside a `.borderlessButton` Menu breaks the NSMenu
+      // so it never opens (verified via the profile picker's S365). A plain
+      // `Text` renders as a disabled label and keeps every Button a direct,
+      // selectable menu item.
       ForEach(ModelIdentityGrouping.grouped(availableModels, slug: { $0 })) { group in
-        Section(group.base) {
-          ForEach(group.items, id: \.self) { id in
-            Button {
-              // : route through the confirm gate. Picking a model that
-              // differs from the resident model publishes a swap confirm
-              // (with "Set as default for this profile"); picking the
-              // already-resident model just sets the override, no load.
-              swapCoordinator.requestModelOverride(
-                modelID: id,
-                activeProfileID: viewModel.selectedProfileID
-              ) { viewModel.modelOverride = $0 }
-            } label: {
-              modelRowLabel(id)
-            }
+        Text(group.base)
+        ForEach(group.items, id: \.self) { id in
+          Button {
+            // : route through the confirm gate. Picking a model that
+            // differs from the resident model publishes a swap confirm
+            // (with "Set as default for this profile"); picking the
+            // already-resident model just sets the override, no load.
+            swapCoordinator.requestModelOverride(
+              modelID: id,
+              activeProfileID: viewModel.selectedProfileID
+            ) { viewModel.modelOverride = $0 }
+          } label: {
+            modelRowLabel(id)
           }
         }
       }
