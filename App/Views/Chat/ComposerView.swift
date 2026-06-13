@@ -26,8 +26,11 @@ struct ComposerView: View {
   /// #577 draft mode: when set, a send forwards the trimmed text here instead
   /// of persisting a `Message`. Mutually exclusive with `chat` (a draft-mode
   /// composer passes `chat: nil`). The no-model gate is NOT run here — the
-  /// scaffold the text is handed to runs it on the real send.
-  let onDraftSubmit: ((String) -> Void)?
+  /// scaffold the text is handed to runs it on the real send. Returns `true`
+  /// when the chat was created (so the composer clears its draft) and `false`
+  /// on a create failure (the draft is kept so the user can retry) — review
+  /// v1 F1.
+  let onDraftSubmit: ((String) -> Bool)?
   /// #577 first-message handoff: when a new chat is created from the draft
   /// composer, the scaffold mounts and seeds its composer with the typed text,
   /// then auto-runs the normal send path (persist + assistant turn + gates).
@@ -140,7 +143,7 @@ struct ComposerView: View {
     onUserMessageSaved: @escaping (Message) -> Void = { _ in },
     onStop: @escaping () -> Void = {},
     autoSubmit: ComposerAutoSubmit? = nil,
-    onDraftSubmit: ((String) -> Void)? = nil,
+    onDraftSubmit: ((String) -> Bool)? = nil,
     handoff: ComposerHandoff? = nil
   ) {
     self.chat = chat
@@ -233,8 +236,11 @@ struct ComposerView: View {
   private func consumeHandoffIfNeeded() {
     guard !didConsumeHandoff, let handoff else { return }
     didConsumeHandoff = true
-    handoff.onConsumed()
+    // Consume only when the handoff is actually seeded — clearing the pending
+    // before the empty-draft guard would destroy the text on the (unreached)
+    // non-empty branch. Review v1 F2.
     guard draft.isEmpty else { return }
+    handoff.onConsumed()
     draft = handoff.text
     DispatchQueue.main.async { submit() }
   }
@@ -244,10 +250,12 @@ struct ComposerView: View {
     guard !payload.isEmpty, !isSending else { return }
     // #577 draft mode (new-chat composer): no chat row exists yet, so forward
     // the text instead of persisting. The caller creates + selects the chat
-    // and routes the real send (which runs the no-model gate there).
+    // and routes the real send (which runs the no-model gate there). Clear the
+    // draft ONLY when the caller confirms the chat was created — on a create
+    // failure the text is kept so the user can retry, matching the
+    // existing-chat persist path below. Review v1 F1.
     if let onDraftSubmit {
-      draft = ""
-      onDraftSubmit(payload)
+      if onDraftSubmit(payload) { draft = "" }
       return
     }
     // : block before persisting if no model is resolvable. Keep the

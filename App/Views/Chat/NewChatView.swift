@@ -56,17 +56,20 @@ struct NewChatView: View {
   }
 
   /// First send: create + persist the chat, select it, and hand the typed
-  /// text to the mounting scaffold. If creation fails the text is dropped
-  /// (the error is already reported by `ChatCreation.create`); the composer
-  /// has cleared its draft, mirroring a failed persist on an existing chat.
-  private func startChat(with text: String) {
+  /// text to the mounting scaffold. Returns `true` on success so the composer
+  /// clears its draft; on a create failure it returns `false` (the error is
+  /// already reported by `ChatCreation.create`) so the composer KEEPS the
+  /// typed text for the user to retry — matching the existing-chat persist
+  /// path's draft-retry contract (review v1 F1).
+  private func startChat(with text: String) -> Bool {
     guard let id = ChatCreation.create(
       in: modelContext,
       persistenceStatus: persistenceStatus,
       contextLabel: "NewChatView.startChat"
-    ) else { return }
+    ) else { return false }
     windowState.selectedSection = .chats
     windowState.selectedItemID = id
     windowState.pendingFirstMessage = PendingFirstMessage(chatID: id, text: text)
+    return true
   }
 }
