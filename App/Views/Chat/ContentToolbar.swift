@@ -318,8 +318,13 @@ struct ContentToolbar: View {
       // embedded in a `Menu`), so a long grouped list never runs off-screen.
       // The grouped pipeline that feeds it is guarded against truncation by
       // `ModelIdentityGroupingTests.test_long_multi_family_list_is_never_truncated`.
+      // `prefer: \.isCurrent` keeps the persisted/served row on an identity
+      // tie (app-managed bare slug vs served full-path copy) so the surviving
+      // row's slug matches `selectedModelID` — checkmark renders and the tap
+      // writes the persisted slug, not the sort-first duplicate.
       ForEach(ModelIdentityGrouping.grouped(
-        ModelIdentityGrouping.deduped(modelOptions, slug: \.slug), slug: \.slug)) { group in
+        ModelIdentityGrouping.deduped(modelOptions, slug: \.slug, prefer: { $0.isCurrent }),
+        slug: \.slug)) { group in
         Text(group.base)
         ForEach(group.items) { option in
           Button {

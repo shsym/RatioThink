@@ -15,13 +15,27 @@ public enum ModelIdentityGrouping {
   /// the app-managed row wins a true duplicate — matching the resolver's
   /// app-staged-first precedence (#580 Q1). Relative order is otherwise
   /// preserved.
+  ///
+  /// `prefer` breaks an identity tie: when a later duplicate satisfies it and
+  /// the already-held element does not, the held element is upgraded IN PLACE
+  /// (its slot, hence group order, is preserved). The chat menu passes
+  /// `isCurrent` so the survivor's slug matches the persisted selection —
+  /// otherwise the menu keeps an arbitrary same-identity slug (e.g. a served
+  /// full-path copy that sorts before the app-managed bare slug), dropping the
+  /// checkmark and writing a different slug on tap than the one persisted.
   public static func deduped<Item>(_ items: [Item],
-                                   slug: (Item) -> String) -> [Item] {
-    var seen = Set<String>()
+                                   slug: (Item) -> String,
+                                   prefer: ((Item) -> Bool)? = nil) -> [Item] {
+    var slotByIdentity: [String: Int] = [:]
     var out: [Item] = []
     for item in items {
       let identity = ModelNameParts.parse(slug(item)).identity
-      if seen.insert(identity).inserted { out.append(item) }
+      if let slot = slotByIdentity[identity] {
+        if let prefer, prefer(item), !prefer(out[slot]) { out[slot] = item }
+      } else {
+        slotByIdentity[identity] = out.count
+        out.append(item)
+      }
     }
     return out
   }

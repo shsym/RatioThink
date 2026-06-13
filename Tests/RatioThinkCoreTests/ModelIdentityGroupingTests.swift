@@ -17,6 +17,33 @@ final class ModelIdentityGroupingTests: XCTestCase {
                    "true dupe collapses to the first (app-managed) row")
   }
 
+  // F1 (PR #174 review): on an identity tie the chat menu must keep the
+  // CURRENT row, not the slug-sort-first one. ToolbarModelOptions.build dedups
+  // by exact slug, so a served full-path copy (`Qwen/…/…-Q8_0.gguf`, which
+  // sorts first) and the persisted app-managed bare slug (`…-Q8_0.gguf`) both
+  // survive with the same identity. Without `prefer`, the render-time collapse
+  // keeps the full-path row → no checkmark + tapping writes the wrong slug.
+  func test_deduped_prefer_upgrades_to_current_on_identity_tie() {
+    let rows = [
+      Row(slug: "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf", tag: "served"),
+      Row(slug: "Qwen3-0.6B-Q8_0.gguf", tag: "current"),
+    ]
+    let out = ModelIdentityGrouping.deduped(rows, slug: \.slug,
+                                            prefer: { $0.tag == "current" })
+    XCTAssertEqual(out, [Row(slug: "Qwen3-0.6B-Q8_0.gguf", tag: "current")],
+                   "the preferred (current) row wins the tie and holds the first slot")
+  }
+
+  func test_deduped_prefer_is_noop_without_a_match() {
+    // No element satisfies `prefer` → first-wins, unchanged from the default.
+    let rows = [
+      Row(slug: "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf", tag: "served"),
+      Row(slug: "Qwen3-0.6B-Q8_0.gguf", tag: "app"),
+    ]
+    let out = ModelIdentityGrouping.deduped(rows, slug: \.slug, prefer: { _ in false })
+    XCTAssertEqual(out.map(\.tag), ["served"], "no preferred element → first-wins holds")
+  }
+
   func test_deduped_keeps_distinct_quants() {
     let rows = [
       Row(slug: "Llama-3.2-1B-Instruct-Q4_K_M.gguf", tag: "q4"),
