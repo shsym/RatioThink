@@ -78,6 +78,44 @@ final class S577_LeftPanelGUITests: XCTestCase {
                    "a real chat now exists, so the empty-list placeholder must be gone")
   }
 
+  /// #577 review v2 F4: when the first send's chat creation FAILS, the new-chat
+  /// composer must KEEP the typed text (not clear it) and persist no chat —
+  /// the `onDraftSubmit -> false` draft-retention contract, mirroring the
+  /// existing-chat failed-persist path. A DEBUG seam forces
+  /// `ChatCreation.create` to return nil deterministically.
+  @MainActor
+  func test_first_send_keeps_draft_when_chat_creation_fails() async throws {
+    let prompt = "this text must survive a failed create"
+    let app = makeApp()
+    app.launchEnvironment["PIE_TEST_FORCE_CHAT_CREATE_FAILURE"] = "1"
+    app.launch()
+    defer { app.terminate() }
+    XCTAssert(app.wait(for: .runningForeground, timeout: 10))
+    app.activate()
+
+    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "composer.text")
+                    .firstMatch.waitForExistence(timeout: 5),
+                  "start must land in the new-chat composer")
+    XCTAssertTrue(app.buttons["chats.empty.newButton"].waitForExistence(timeout: 5),
+                  "no chat exists yet on the landing")
+
+    typeComposerText(prompt, in: app)
+    let send = app.buttons["composer.send"]
+    XCTAssertTrue(send.waitForExistence(timeout: 5))
+    XCTAssertTrue(send.isEnabled, "send must enable once the draft is non-empty")
+    send.click()
+
+    // Create failed → no chat persisted, still on the new-chat landing, and the
+    // typed text is retained (a non-empty draft keeps the send button enabled).
+    XCTAssertTrue(app.buttons["chats.empty.newButton"].waitForExistence(timeout: 5),
+                  "a failed create must not persist a chat; the empty-list placeholder must remain")
+    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "newChat.view")
+                    .firstMatch.exists,
+                  "a failed create must keep the new-chat composer mounted (no handoff to a scaffold)")
+    XCTAssertTrue(app.buttons["composer.send"].isEnabled,
+                  "the typed message must be preserved after a failed create (send stays enabled); app tree: \(app.debugDescription)")
+  }
+
   /// The chat list stays mounted when the API Endpoints view is selected, and
   /// clicking a chat row while that view is up switches the detail surface
   /// back to the chat (its composer reappears, the API view goes away).
