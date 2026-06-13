@@ -337,7 +337,12 @@ struct ContentToolbar: View {
           .disabled(!option.isSelectable)
         }
       }
-      if !modelOptions.isEmpty { Divider() }
+      // No heavy Divider before the action: an NSMenu separator (what
+      // SwiftUI's `Divider` becomes in a `.borderlessButton` Menu) is the
+      // OS-standard line and is NOT restylable to a lighter weight, so the
+      // subtlest option the operator asked for is to drop it — the disabled
+      // base-name headers already structure the list, and the gearshape icon
+      // sets "Manage Models…" apart from the model rows.
       Button {
         openModelsSettings()
       } label: {
@@ -389,7 +394,11 @@ struct ContentToolbar: View {
   /// The concrete model stays automation-targetable via the row's
   /// `ModelRow-<slug>` accessibility identifier.
   private func modelOptionText(_ option: ToolbarModelOptions.Option) -> String {
-    var text = option.parts.quantOrLeaf + (option.isProfileDefault ? " (profile default)" : "")
+    // Quant tag is the primary text; an HF-cache source suffix disambiguates
+    // a same-quant app-vs-cache pair that the full-slug dedup keeps as two rows.
+    var text = option.parts.quantOrLeaf
+    if let tag = option.sourceTag { text += " (\(tag))" }
+    if option.isProfileDefault { text += " (profile default)" }
     if let reason = option.unavailableReason { text += " — \(reason)" }
     return text
   }

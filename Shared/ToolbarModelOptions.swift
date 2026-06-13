@@ -28,6 +28,14 @@ public enum ToolbarModelOptions {
 
     public var id: String { slug }
     public var isSelectable: Bool { unavailableReason == nil }
+    /// Disambiguating source suffix for the row text. After the full-slug
+    /// dedup (review v2 F2) a family can list an app-managed copy AND an
+    /// HF-cache copy of the same quant (distinct slugs, same visible tag) —
+    /// mark the HF-cache row so the two differ in the menu, not just on hover.
+    /// App-managed rows carry no suffix (the unmarked default).
+    public var sourceTag: String? {
+      source == .huggingFaceCache ? "hf cache" : nil
+    }
 
     public init(slug: String,
                 displayName: String,
