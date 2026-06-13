@@ -176,6 +176,36 @@ func selectPersistedChat(
           file: file, line: line)
 }
 
+/// Click a sidebar nav row (by accessibility identifier) and wait until
+/// `target` mounts in the detail column, re-activating + retrying the click to
+/// survive a not-key launch where a synthesized click can be silently dropped
+/// (the multi-launch focus hazard — a later launch in a multi-test run comes up
+/// not-key, so a single click is unreliable). Mirrors `selectPersistedChat`'s
+/// activate-and-retry loop for the nav-row case (#577).
+@MainActor
+func selectSidebarSection(
+  _ identifier: String,
+  until target: XCUIElement,
+  in app: XCUIApplication,
+  file: StaticString = #filePath,
+  line: UInt = #line
+) {
+  let navRow = app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+  XCTAssertTrue(navRow.waitForExistence(timeout: 10),
+                "sidebar nav row '\(identifier)' missing; app tree: \(app.debugDescription)",
+                file: file, line: line)
+  let deadline = Date().addingTimeInterval(15)
+  repeat {
+    app.activate()
+    navRow.click()
+    if target.waitForExistence(timeout: 2) { return }
+    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25))
+  } while Date() < deadline
+
+  XCTFail("selecting sidebar section '\(identifier)' did not mount the expected detail; app tree: \(app.debugDescription)",
+          file: file, line: line)
+}
+
 @MainActor
 func typeComposerText(
   _ text: String,

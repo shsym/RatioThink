@@ -124,13 +124,18 @@ final class S285_ZeroStateGUITests: XCTestCase {
     XCTAssert(app.wait(for: .runningForeground, timeout: 5))
     app.activate()
 
+    // Settle on the landing before interacting (the composer is the start
+    // landing) so the synthesized nav-row click below lands on a key window.
+    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "composer.text")
+                    .firstMatch.waitForExistence(timeout: 5),
+                  "start landing (new-chat composer) did not appear")
     XCTAssertFalse(app.buttons["Add Endpoint"].exists,
                    "landing must not expose the removed per-endpoint Add Endpoint CTA")
 
-    let navRow = app.descendants(matching: .any).matching(identifier: "API Endpoints").firstMatch
-    XCTAssertTrue(navRow.waitForExistence(timeout: 5),
-                  "sidebar 'API Endpoints' nav row missing")
-    navRow.click()
+    // Switch to the API Endpoints view (activate-and-retry to survive a
+    // not-key launch where a single click can be dropped).
+    let localAPI = app.descendants(matching: .any).matching(identifier: "LocalAPIView").firstMatch
+    selectSidebarSection("API Endpoints", until: localAPI, in: app)
 
     // #577 item 1: the chat list (its search field + New Chat header button)
     // stays visible in the left panel even though the detail shows LocalAPIView.

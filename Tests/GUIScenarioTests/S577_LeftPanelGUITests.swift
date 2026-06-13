@@ -98,13 +98,10 @@ final class S577_LeftPanelGUITests: XCTestCase {
                     .firstMatch.waitForExistence(timeout: 5),
                   "New Chat must open the chat scaffold composer")
 
-    // Switch to the API Endpoints view.
-    let navRow = app.descendants(matching: .any).matching(identifier: "API Endpoints").firstMatch
-    XCTAssertTrue(navRow.waitForExistence(timeout: 5), "API Endpoints nav row missing")
-    navRow.click()
-    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "LocalAPIView")
-                    .firstMatch.waitForExistence(timeout: 5),
-                  "API Endpoints must open the LocalAPIView")
+    // Switch to the API Endpoints view (activate-and-retry to survive a
+    // not-key launch where a single click can be dropped).
+    let localAPI = app.descendants(matching: .any).matching(identifier: "LocalAPIView").firstMatch
+    selectSidebarSection("API Endpoints", until: localAPI, in: app)
 
     // #577 item 1: the chat list is still mounted in the left panel even
     // though the detail shows the API view.
@@ -114,15 +111,10 @@ final class S577_LeftPanelGUITests: XCTestCase {
 
     // Clicking the chat row (already the selected id, but the list shows no
     // selection while the API view is up) switches the main view back to the
-    // chat — the composer returns and the API view goes away.
-    let row = chatList.staticTexts["New Chat"].firstMatch
-    XCTAssertTrue(row.waitForExistence(timeout: 5), "persisted chat row missing in the list")
-    row.click()
-    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "composer.text")
-                    .firstMatch.waitForExistence(timeout: 5),
-                  "clicking a chat row from the API view must switch the main view back to the chat")
-    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "LocalAPIView")
-                    .firstMatch.waitForNonExistence(timeout: 5),
+    // chat. `selectPersistedChat` activates + retries the row click and only
+    // returns once the composer is back — i.e. the main view switched.
+    selectPersistedChat(titled: "New Chat", in: app)
+    XCTAssertTrue(localAPI.waitForNonExistence(timeout: 5),
                   "the API view must be replaced by the chat detail after selecting a chat row")
   }
 }
