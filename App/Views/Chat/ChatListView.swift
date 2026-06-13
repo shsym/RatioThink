@@ -98,9 +98,16 @@ struct ChatListView: View {
   /// Row selection routes through this binding so picking a chat both
   /// selects it AND switches the main view to `.chats` (#577) — a chat
   /// chosen while the API view is up replaces the detail surface.
+  ///
+  /// The getter is section-aware: it reports a selected row ONLY while the
+  /// `.chats` section is active. In any other section the list shows no
+  /// selection, so clicking even the previously-selected row is a genuine
+  /// change and fires the setter — otherwise `List(selection:)` (which only
+  /// fires on change) would swallow the tap and leave the user stuck in the
+  /// API view.
   private var rowSelection: Binding<UUID?> {
     Binding(
-      get: { selectedItemID },
+      get: { selectedSection == .chats ? selectedItemID : nil },
       set: { newID in
         selectedItemID = newID
         if newID != nil { selectedSection = .chats }

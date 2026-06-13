@@ -48,6 +48,10 @@ struct NewChatView: View {
       )
     }
     .background(Color(nsColor: .windowBackgroundColor))
+    // `children: .contain` keeps the nested composer/placeholder identifiers
+    // reachable — a bare container id would swallow them (the lesson from
+    // `NoModelLoadedPrompt` / `ChatRowLabel`).
+    .accessibilityElement(children: .contain)
     .accessibilityIdentifier("newChat.view")
   }
 

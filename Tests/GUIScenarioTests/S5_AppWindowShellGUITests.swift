@@ -85,21 +85,25 @@ final class S5_AppWindowShellGUITests: XCTestCase {
     XCTAssertTrue(app.textFields["chats.searchField"].waitForExistence(timeout: 5),
                   "simplified left navigation must show chat search above chat rows")
 
-    // Detail empty-state — design §5 CTA. Only `Start Chat` is a zero-state
-    // CTA; there is no `Add Endpoint` (the local API is the engine's single
-    // endpoint, reached via the sidebar section, not created here).
-    XCTAssertTrue(allStrings.contains("Start Chat"),
-                  "detail missing 'Start Chat' CTA; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
-    XCTAssertFalse(allStrings.contains("Add Endpoint"),
-                   "empty-state must not show an 'Add Endpoint' CTA; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
-
-    // Pin the spoken VoiceOver label exactly — guards against SwiftUI
-    // synthesizing the SF Symbol name into the Button's a11y label
-    // (e.g. "bubble.left.and.bubble.right, Start Chat"). The Image inside
-    // each CTA is `.accessibilityHidden(true)` so the Text is the sole
-    // contributor to the spoken label.
-    XCTAssertEqual(app.buttons["Start Chat"].label, "Start Chat",
-                   "Start Chat VoiceOver label drifted from the Text content")
+    // #577: the Chats landing is a ready new-chat composer (the "start" entry
+    // opens an editable composer directly — no separate New Chat click and no
+    // "Start Chat" CTA dead-end). The detail surface mounts NewChatView, whose
+    // composer is present immediately.
+    XCTAssertTrue(
+      app.descendants(matching: .any).matching(identifier: "composer.text")
+        .firstMatch.waitForExistence(timeout: 5),
+      "Chats landing must show the ready new-chat composer; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
+    XCTAssertTrue(
+      app.descendants(matching: .any).matching(identifier: "newChat.view")
+        .firstMatch.waitForExistence(timeout: 5),
+      "Chats landing must mount the new-chat view")
+    // No per-endpoint `Add Endpoint` CTA (the local API is the engine's single
+    // endpoint, reached via the sidebar section) — and the old "Start Chat"
+    // zero-state CTA is gone now that the composer is the landing.
+    XCTAssertFalse(app.buttons["Add Endpoint"].exists,
+                   "landing must not show an 'Add Endpoint' CTA")
+    XCTAssertFalse(app.buttons["Start Chat"].exists,
+                   "the new-chat composer replaces the old 'Start Chat' CTA dead-end")
   }
 
   @MainActor
