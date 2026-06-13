@@ -392,6 +392,14 @@ fn extract_final_money_amount(text: &str) -> Option<String> {
             || lower.contains("equals")
             || lower.contains('=')
         {
+            // Pick the amount tied to the total/final keyword — the first money
+            // after it — not the last money in the sentence (#555). A step like
+            // "the final total is $18, after applying the $4 discount" puts the
+            // total first and a secondary amount last; taking the last extracts
+            // the $4 discount and clobbered a correct $18 final at depth>1.
+            if let Some(amount) = money_after_total_keyword(part) {
+                return Some(amount);
+            }
             if let Some(amount) = extract_last_money_amount(part) {
                 return Some(amount);
             }
@@ -400,26 +408,39 @@ fn extract_final_money_amount(text: &str) -> Option<String> {
     None
 }
 
+/// First money amount appearing after the last total/final/equals keyword in
+/// `part`. `None` when no keyword is followed by a money amount (the caller
+/// then falls back to the last money amount in the sentence).
+fn money_after_total_keyword(part: &str) -> Option<String> {
+    let lower = part.to_lowercase();
+    let keyword_end = ["total", "final", "equals", "="]
+        .iter()
+        .filter_map(|kw| lower.rfind(kw).map(|pos| pos + kw.len()))
+        .max()?;
+    extract_first_money_amount(&part[keyword_end..])
+}
+
+fn extract_first_money_amount(text: &str) -> Option<String> {
+    money_amounts(text).next()
+}
+
 fn extract_last_money_amount(text: &str) -> Option<String> {
-    text.split_whitespace()
-        .filter_map(|word| {
-            let cleaned = word.trim_matches(|c: char| {
-                c == '.'
-                    || c == ','
-                    || c == ';'
-                    || c == ':'
-                    || c == ')'
-                    || c == '('
-                    || c == '"'
-                    || c == '\''
-            });
-            if cleaned.starts_with('$') && cleaned.chars().skip(1).any(|c| c.is_ascii_digit()) {
-                Some(cleaned.to_string())
-            } else {
-                None
-            }
-        })
-        .last()
+    money_amounts(text).last()
+}
+
+/// Iterator over `$`-prefixed money tokens in `text`, in order.
+fn money_amounts(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split_whitespace().filter_map(|word| {
+        let cleaned = word.trim_matches(|c: char| {
+            c == '.' || c == ',' || c == ';' || c == ':' || c == ')' || c == '(' || c == '"'
+                || c == '\''
+        });
+        if cleaned.starts_with('$') && cleaned.chars().skip(1).any(|c| c.is_ascii_digit()) {
+            Some(cleaned.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 fn strip_answer_label(answer: &str) -> String {
@@ -2051,6 +2072,19 @@ mod tests {
         assert_eq!(
             reconcile_answer_with_material("Maya's final total is $4.".to_string(), material),
             "$18"
+        );
+    }
+
+    #[test]
+    fn final_money_extraction_binds_amount_to_total_keyword_not_trailing_clause() {
+        // #555: a depth>1 path step states the total first and a secondary
+        // amount (a discount) last. The total is $18, not the trailing $4.
+        let step = "The final total is $18, after applying the $4 discount.";
+        assert_eq!(extract_final_money_amount(step).as_deref(), Some("$18"));
+        // And reconcile must not clobber a correct synthesized $18 with the $4.
+        assert_eq!(
+            reconcile_answer_with_material("The final total is $18.".to_string(), step),
+            "The final total is $18."
         );
     }
 
