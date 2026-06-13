@@ -494,7 +494,6 @@ struct SidecarMetrics {
     status: SidecarMetricStatus,
     ngram_leaders: usize,
     expired: usize,
->>>>>>> 97eeb55 (Persist Cacheback sidecars per chat thread)
 }
 
 struct SidecarLease {
@@ -1046,7 +1045,7 @@ fn tools_digest(tools: Option<&[ToolSchema]>) -> u64 {
 fn lineage_from(messages: &[ChatMessage]) -> Lineage {
     let turns = messages
         .iter()
-        .map(|m| (m.role.as_str(), m.content.as_str()))
+        .map(|m| (m.role.as_str(), m.content_str().unwrap_or("")))
         .collect::<Vec<_>>();
     Lineage::from_turns(&turns)
 }
