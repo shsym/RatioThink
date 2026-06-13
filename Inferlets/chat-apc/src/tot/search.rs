@@ -157,17 +157,23 @@ fn branch_uses_thinking(level: usize, max_depth: usize, thinking: bool) -> bool 
     thinking && level < max_depth
 }
 
-/// Value-evaluator prompts (independent per-node scoring). The node already
-/// did its reasoning; the scorer is a value HEAD (#437), so it always runs
-/// with `/no_think` appended (see [`score_node`]) to emit a bare integer
-/// cheaply. Intermediate nodes are judged for additive user-facing usefulness;
-/// final nodes are judged for direct-answer quality. This is orthogonal to the node-generation
-/// `thinking` knob, which stays on. The directive is inert on a non-reasoning
-/// model, and the score output is demuxed regardless so a stray empty think
-/// block can't swallow the integer.
-const INTERMEDIATE_SCORE_PROMPT: &str = "Rate the latest assistant reply from 1 to 10 as a complete answer to the user that adds a useful correction, supported fact, computed value, qualifier, or concrete tactic. Correctness comes first: accurate facts and careful arithmetic are required. Unsupported invented names or numbers, or any arithmetic or factual error, must score 1 or 2 even when the wording is concise. Penalize repetition, instruction echo, generic filler, and self-referential text. Use the full scale: 1-3 for wrong, off-topic, repeated, or instruction-like text; 4-6 for partly useful but incomplete answers; 7-8 for correct useful answers with gaps; and 9-10 for clear, correct, directly useful answers. Respond with only a single integer from 1 to 10.";
+/// Value-evaluator prompts (independent per-node scoring). The scorer is a
+/// value HEAD, but a small model rating its own fluency is unreliable — it
+/// over-ranks confident-but-wrong arithmetic and trap answers (#555: discount
+/// "$17", bat-and-ball "$2", "a pound of bricks weighs more" all won the beam).
+/// So the prompt is a VERIFICATION, not an opinion: the scorer must re-solve
+/// the user's question itself, recompute any arithmetic/logic, compare its
+/// result to the reply, and only then rate. A wrong reply scores 1-2 no matter
+/// how fluent; a correct reply that adds genuinely new, supported information
+/// scores high; a mere restatement of an earlier step scores low. The scorer
+/// runs `/no_think` (see [`score_node`]) so the recomputation is written as
+/// visible text and ends with a `SCORE: N` line that [`parse_score`] anchors
+/// on (a bare-integer-anywhere parse would grab a recomputed dollar amount).
+/// Intermediate nodes are judged for additive user-facing usefulness; final
+/// nodes for direct-answer quality. Orthogonal to the node `thinking` knob.
+const INTERMEDIATE_SCORE_PROMPT: &str = "You are verifying the latest assistant reply before it is used as a step toward the user's answer. First, solve the user's question yourself: recompute any arithmetic and recheck any logic step by step — do not trust the reply's numbers or claims. Then compare your result to the reply. Rules, correctness first: if the reply is factually wrong, has any arithmetic or logic error, contradicts your worked result, invents unsupported names or numbers, or merely repeats an earlier step without adding new correct information, give it 1 or 2 no matter how fluent or concise it reads. A correct reply that only partly helps or restates known facts: give it 4-6. A correct reply that adds genuinely new, supported, useful information toward the answer: give it 7-10. After your check, end your response with a line in exactly this form: SCORE: N — where N is a single integer from 1 to 10.";
 
-const FINAL_SCORE_PROMPT: &str = "Rate the latest assistant reply from 1 to 10 as the final response to the user. Judge relevance, correctness, specificity, completeness, and concrete usefulness. Penalize copied earlier sentences, unsupported names or numbers, arithmetic errors, and missing requested item counts. Use the full scale: 1-3 for irrelevant, wrong, copied, or self-referential text, 4-6 for partial or generic answers, 7-8 for useful answers with gaps, and 9-10 for clear, complete, directly useful answers. Avoid defaulting to 5: separate similar answers by task fit. Respond with only a single integer from 1 to 10.";
+const FINAL_SCORE_PROMPT: &str = "You are verifying the latest assistant reply as the FINAL answer to the user. First, solve the user's question yourself: recompute any arithmetic and recheck any logic step by step — do not trust the reply's numbers or claims. Then compare your result to the reply. Rules, correctness first: if the reply is factually wrong, has any arithmetic or logic error, contradicts your worked result, copies earlier sentences, invents unsupported names or numbers, or misses a requested item count or format, give it 1 or 2 no matter how fluent it reads. A correct but partial or generic answer: give it 4-6. A clear, correct, complete, directly useful answer: give it 7-10. After your check, end your response with a line in exactly this form: SCORE: N — where N is a single integer from 1 to 10.";
 
 fn score_prompt(is_final_level: bool) -> &'static str {
     if is_final_level {
@@ -177,10 +183,13 @@ fn score_prompt(is_final_level: bool) -> &'static str {
     }
 }
 
-/// Token budget for a scoring generation — enough for a suppressed empty
-/// `<think></think>` plus the integer. The scorer is NOT demuxed (see
-/// [`score_node`]), so this is the whole budget.
-const SCORE_MAX_TOKENS: usize = 32;
+/// Token budget for a scoring generation. The scorer now re-solves the
+/// question and recomputes the arithmetic/logic as visible text before its
+/// `SCORE: N` line (#555 verification scoring), so it needs room for a short
+/// worked check — not just a bare integer. Kept tight so deeper trees don't
+/// blow up cost; a check that overruns still lands no `SCORE:` line and the
+/// node is treated as unscored (`None`, ranked behind any real score).
+const SCORE_MAX_TOKENS: usize = 160;
 
 /// Temperature for the final-answer synthesis (#523 Part A). Deliberately
 /// LOW and fixed, independent of the candidate-generation temperature
@@ -203,29 +212,24 @@ const SYNTHESIS_TOP_P: f32 = 0.9;
 /// production-sized reasoning budget.
 const NO_THINK_RETRY_REASONING_TOKENS: usize = 32;
 
-/// Intermediate nodes now produce concise standalone answers with an
-/// anti-redundancy constraint. Keep the final level at the caller-requested
-/// budgets, but cap non-final work to reduce reroll cost. Reasoning still has
-/// enough room for Qwen3-class models to reach a visible answer; if it
-/// exhausts, the node remains `Incomplete` and is never salvaged into a fake
-/// answer.
-const INTERMEDIATE_REASONING_TOKEN_CAP: usize = 256;
-const INTERMEDIATE_ANSWER_TOKEN_CAP: usize = 96;
-
-fn branch_reasoning_budget(level: usize, max_depth: usize, requested: usize) -> usize {
-    if level < max_depth {
-        requested.min(INTERMEDIATE_REASONING_TOKEN_CAP)
-    } else {
-        requested
-    }
+/// Every level — intermediate and final — gets the caller-requested
+/// reasoning and answer budget (#555). The previous intermediate caps
+/// (reasoning 256, answer 96) traded correctness for reroll cost: they
+/// starved Qwen3-class thinking models at depth>1 — the node spent the whole
+/// 256-token budget inside `<think>` and never reached a visible answer, so it
+/// stayed `Incomplete` and the final synthesis had nothing to ground on (8/9
+/// empty final answers at depth 3 in the expanded eval). Token economy is a
+/// measured outcome reported per request, not a hard cap that breaks
+/// correctness. The invariant still holds: a node that genuinely exhausts its
+/// full budget before answering stays `Incomplete` and is never salvaged into
+/// a fabricated answer. These stay seam functions (rather than inlining the
+/// field) so per-depth budget shaping has one home if a future model needs it.
+fn branch_reasoning_budget(_level: usize, _max_depth: usize, requested: usize) -> usize {
+    requested
 }
 
-fn branch_answer_budget(level: usize, max_depth: usize, requested: usize) -> usize {
-    if level < max_depth {
-        requested.min(INTERMEDIATE_ANSWER_TOKEN_CAP)
-    } else {
-        requested
-    }
+fn branch_answer_budget(_level: usize, _max_depth: usize, requested: usize) -> usize {
+    requested
 }
 
 /// Append the `/no_think` directive when reasoning is disabled for this
@@ -432,7 +436,9 @@ fn strip_answer_label(answer: &str) -> String {
 }
 
 fn sanitize_final_answer(answer: &str) -> String {
-    strip_answer_label(answer)
+    // Defense-in-depth at the user-facing boundary: a final answer must carry
+    // neither a search label nor a leaked think delimiter (#555 Fix 4).
+    strip_answer_label(&strip_think_delimiters(answer))
 }
 
 fn looks_like_prompt_echo_answer(answer: &str) -> bool {
@@ -538,11 +544,87 @@ trait BranchDriver<C> {
     ) -> DemuxFuture<'a>;
 }
 
+/// Probe whether `model`'s reasoning template recognizes the `<think>`
+/// channel (#555 Fix 4). A model whose template uses `<think>` fires a
+/// reasoning `Start`/`Delta` when the marker is fed to its decoder; a model
+/// with a no-op reasoning decoder (Qwen2.5, Gemma, Phi, Mistral…) stays
+/// `Idle`. This gates the Qwen-style `<think>\n\n</think>` no-think prefill so
+/// genuine non-reasoning models are never handed a foreign template artifact
+/// that teaches them to emit literal `<think>`/`</think>` tokens into the
+/// visible answer.
+///
+/// Note: pie's runtime gives Llama-3.2 a `<think>`-marked reasoning decoder
+/// too, so this probe alone cannot exclude Llama — for that model the prefill
+/// stays, and [`strip_think_delimiters`] is the model-agnostic safety net that
+/// removes any delimiter that still leaks through a token-boundary mismatch.
+fn model_uses_reasoning_template(model: &Model) -> bool {
+    let mut dec = reasoning::Decoder::new(model);
+    let probe = model.tokenizer().encode("<think>\n\n</think>");
+    !matches!(dec.feed(&probe), Ok(reasoning::Event::Idle))
+}
+
 fn cue_generation(ctx: &mut Context, model: &Model, no_think: bool) {
     ctx.cue();
-    if no_think {
+    if no_think && model_uses_reasoning_template(model) {
         ctx.append(&model.tokenizer().encode(NO_THINK_PREFILL));
     }
+}
+
+/// Remove leaked reasoning-channel delimiters (`<think>`, `</think>`, and the
+/// near-miss variants small models emit such as `</thinks>`) from visible
+/// answer text (#555 Fix 4). The demux already routes a *recognized* think
+/// block to the reasoning channel, but the host decoder matches an exact
+/// token-id sequence — when a small model emits the same delimiter text via
+/// different token boundaries the match fails and the literal tag reaches the
+/// answer channel. A user-visible answer must never contain a template
+/// delimiter regardless of model, so this strips them unconditionally and
+/// collapses the surrounding whitespace. Pure → unit-tested.
+fn strip_think_delimiters(text: &str) -> String {
+    // Length of a think delimiter (`<think>`, `</think>`, `</thinks>`, …)
+    // starting at byte index `i`, or `None` if none matches there. ASCII-only
+    // delimiters keep byte indexing char-boundary safe.
+    fn delimiter_len(b: &[u8], i: usize) -> Option<usize> {
+        if b[i] != b'<' {
+            return None;
+        }
+        let mut j = i + 1;
+        if j < b.len() && b[j] == b'/' {
+            j += 1;
+        }
+        let word = b"think";
+        if j + word.len() > b.len() || !b[j..j + word.len()].eq_ignore_ascii_case(word) {
+            return None;
+        }
+        let mut k = j + word.len();
+        // Tolerate a trailing letter run (the malformed `</thinks>` small
+        // models emit) before the closing `>`.
+        while k < b.len() && b[k].is_ascii_alphabetic() {
+            k += 1;
+        }
+        if k < b.len() && b[k] == b'>' {
+            Some(k + 1 - i)
+        } else {
+            None
+        }
+    }
+
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(len) = delimiter_len(bytes, i) {
+            i += len;
+            continue;
+        }
+        // Copy one whole UTF-8 char starting at `i` (delimiters are ASCII, so
+        // we only land here on a char boundary).
+        let ch = text[i..].chars().next().expect("char at boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    // Only trim the ends the strip exposes — internal formatting (line breaks,
+    // spacing) of a legitimate answer is left untouched.
+    out.trim().to_string()
 }
 
 /// Build the synthesis user-turn (#523 Part A): the instruction appended to
@@ -784,6 +866,12 @@ async fn generate_demuxed(
             }
         }
     };
+
+    // Strip any reasoning-channel delimiter that leaked into the answer via a
+    // token-boundary mismatch (#555 Fix 4) BEFORE the empty-answer check, so an
+    // answer that was nothing but a stray `</think>` is correctly demoted to
+    // Incomplete rather than promoted as a tag-only answer.
+    let answer = strip_think_delimiters(&answer);
 
     // A clean stop (chat Done / max-tokens) that produced no answer text is
     // still Incomplete: an empty or closed-but-unanswered think block (#434).
@@ -1636,16 +1724,14 @@ async fn expand(
     (ctx, classify(demux, score))
 }
 
-/// Value evaluator: fork the answered context, ask for a 1–10 rating, and
-/// parse the first in-range integer. The node already did its reasoning, so
-/// the scorer is a cheap value HEAD — it always runs `/no_think` (NOT the
-/// node `thinking` knob) to emit a bare integer rather than re-reasoning the
-/// problem; a thinking scorer burns its budget restating the question and
-/// lands no parseable integer at deeper levels (→ unscored, input-order
-/// pruning, ~2× slower). Unlike node generation this does NOT demux: it reads
-/// the raw text and lets [`parse_score`] find the integer anywhere in it
-/// (skipping the empty `<think></think>` `/no_think` leaves), which is
-/// robust to the integer landing in the same token batch as `</think>` — a
+/// Value evaluator: fork the answered context and run a VERIFICATION rating
+/// (#555). The scorer re-solves the question and recomputes the arithmetic/logic
+/// as visible text, then ends with a `SCORE: N` verdict line. It runs `/no_think`
+/// (NOT the node `thinking` knob) so the recomputation is plain visible text
+/// rather than a hidden block that could blow the budget. Unlike node generation
+/// this does NOT demux: it reads the raw text and lets [`parse_score`] anchor on
+/// the `SCORE:` line (past any out-of-range numbers in the worked check), which
+/// is robust to the integer landing in the same token batch as `</think>` — a
 /// case the content-channel gate would drop. The three outcomes stay distinct
 /// so an infra failure (fork/generate) is not mistaken for a benign
 /// unparseable score — see [`ScoreOutcome`].
@@ -1921,6 +2007,38 @@ mod tests {
         assert_eq!(sanitize_final_answer("Use an agenda."), "Use an agenda.");
     }
 
+    // ── strip_think_delimiters (#555 Fix 4): no template tokens in answers ──
+
+    #[test]
+    fn strip_think_delimiters_removes_leaked_tags() {
+        // The exact leak shapes the expanded eval caught on Llama-3.2.
+        assert_eq!(
+            strip_think_delimiters("<think>\n\nTom bought 18 new stickers, so he has 27."),
+            "Tom bought 18 new stickers, so he has 27."
+        );
+        assert_eq!(strip_think_delimiters("</think>"), "");
+        assert_eq!(strip_think_delimiters("Cara is shortest.</thinks>"), "Cara is shortest.");
+        assert_eq!(
+            strip_think_delimiters("The ball costs $0.05.</think>"),
+            "The ball costs $0.05."
+        );
+    }
+
+    #[test]
+    fn strip_think_delimiters_is_inert_on_clean_text_and_unicode() {
+        assert_eq!(strip_think_delimiters("They weigh the same."), "They weigh the same.");
+        // A real `<` that is not a think delimiter survives.
+        assert_eq!(strip_think_delimiters("3 < 5 is true"), "3 < 5 is true");
+        // Non-ASCII content is preserved byte-correctly.
+        assert_eq!(strip_think_delimiters("Café—résumé"), "Café—résumé");
+    }
+
+    #[test]
+    fn final_answer_sanitizer_also_strips_think_tags() {
+        assert_eq!(sanitize_final_answer("<think>\n\nParis"), "Paris");
+        assert_eq!(sanitize_final_answer("Total: $18</think>"), "$18");
+    }
+
     #[test]
     fn final_money_extraction_uses_last_detailed_final_sentence() {
         let material = "Total: $4\nMaya's final total is $4.\nMaya spends $12 on notebooks and $10 on pens, then gets a $4 discount. Her final total is $18.";
@@ -2156,28 +2274,34 @@ mod tests {
     // ── score_prompt (#555): intermediate progress vs final answer quality ──
 
     #[test]
-    fn score_prompt_intermediate_rates_path_progress_not_final_quality() {
+    fn score_prompt_intermediate_verifies_then_rewards_additive_correctness() {
         let p = score_prompt(false).to_lowercase();
-        assert!(p.contains("complete answer"));
-        assert!(p.contains("adds a useful correction"));
-        assert!(p.contains("unsupported invented names or numbers"));
-        assert!(p.contains("arithmetic or factual error"));
-        assert!(p.contains("score 1 or 2"));
-        assert!(p.contains("penalize repetition"));
-        assert!(p.contains("accurate facts"));
-        assert!(p.contains("single integer"));
+        // Verification, not opinion: the scorer must re-solve and recompute.
+        assert!(p.contains("solve the user's question yourself"));
+        assert!(p.contains("recompute"));
+        assert!(p.contains("do not trust the reply"));
+        // Correctness gates the score; wrong answers score 1-2 regardless of fluency.
+        assert!(p.contains("arithmetic or logic error"));
+        assert!(p.contains("1 or 2"));
+        // Additive correctness wins; pure restatement loses (#555 Fix 3).
+        assert!(p.contains("repeats an earlier step"));
+        assert!(p.contains("genuinely new"));
+        // Anchored verdict line the parser keys on.
+        assert!(p.contains("score: n"));
         assert!(!p.contains("path progress"));
         assert!(!p.contains("reasoning path"));
-        assert!(!p.contains("supporting note"));
-        assert!(!p.contains("2-8"));
     }
 
     #[test]
-    fn intermediate_generation_budgets_are_capped_without_affecting_final_budget() {
-        assert_eq!(branch_reasoning_budget(1, 3, 2048), 256);
-        assert_eq!(branch_reasoning_budget(2, 3, 512), 256);
+    fn generation_budgets_use_requested_amount_at_every_level() {
+        // #555: intermediate levels no longer starve. Every level — including
+        // the non-final ones that previously capped reasoning at 256 and the
+        // answer at 96 — gets the full caller-requested budget so a thinking
+        // model can think THEN answer at depth>1.
+        assert_eq!(branch_reasoning_budget(1, 3, 2048), 2048);
+        assert_eq!(branch_reasoning_budget(2, 3, 512), 512);
         assert_eq!(branch_reasoning_budget(3, 3, 2048), 2048);
-        assert_eq!(branch_answer_budget(1, 3, 256), 96);
+        assert_eq!(branch_answer_budget(1, 3, 256), 256);
         assert_eq!(branch_answer_budget(2, 3, 48), 48);
         assert_eq!(branch_answer_budget(3, 3, 256), 256);
     }
@@ -2191,14 +2315,15 @@ mod tests {
     }
 
     #[test]
-    fn score_prompt_final_rates_direct_answer_quality() {
+    fn score_prompt_final_verifies_direct_answer_quality() {
         let p = score_prompt(true).to_lowercase();
-        assert!(p.contains("final response to the user"));
-        assert!(p.contains("relevance"));
-        assert!(p.contains("correctness"));
-        assert!(p.contains("specificity"));
-        assert!(p.contains("completeness"));
-        assert!(p.contains("single integer"));
+        assert!(p.contains("final answer to the user"));
+        assert!(p.contains("solve the user's question yourself"));
+        assert!(p.contains("recompute"));
+        assert!(p.contains("arithmetic or logic error"));
+        assert!(p.contains("1 or 2"));
+        assert!(p.contains("requested item count or format"));
+        assert!(p.contains("score: n"));
         assert!(!p.contains("tree search"));
         assert!(!p.contains("path progress"));
     }
