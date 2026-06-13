@@ -6,9 +6,9 @@ import Foundation
 /// three can never disagree on what counts as "the same model" or how a
 /// family clusters.
 ///
-/// Keyed off `ModelNameParts`: `identity` (base+quant+format) for dedup,
-/// `groupKey` (base) for grouping. Callers supply a `slug` accessor so the
-/// helper stays element-type agnostic.
+/// Keyed off `ModelNameParts`: `identity` (the full resolvable slug, review
+/// v2 F2) for dedup, `groupKey` (the prettified leaf base) for grouping.
+/// Callers supply a `slug` accessor so the helper stays element-type agnostic.
 public enum ModelIdentityGrouping {
   /// Dedup by `ModelNameParts.identity`, keeping the FIRST occurrence.
   /// Callers order app-managed entries before Hugging-Face-cache copies, so
@@ -19,10 +19,10 @@ public enum ModelIdentityGrouping {
   /// `prefer` breaks an identity tie: when a later duplicate satisfies it and
   /// the already-held element does not, the held element is upgraded IN PLACE
   /// (its slot, hence group order, is preserved). The chat menu passes
-  /// `isCurrent` so the survivor's slug matches the persisted selection —
-  /// otherwise the menu keeps an arbitrary same-identity slug (e.g. a served
-  /// full-path copy that sorts before the app-managed bare slug), dropping the
-  /// checkmark and writing a different slug on tap than the one persisted.
+  /// `isCurrent` so that when an app-managed download and an HF-cache copy of
+  /// the SAME resolvable slug collapse, the survivor is the current one — its
+  /// slug matches the persisted selection, so the checkmark renders and a tap
+  /// writes the persisted slug rather than the other copy's.
   public static func deduped<Item>(_ items: [Item],
                                    slug: (Item) -> String,
                                    prefer: ((Item) -> Bool)? = nil) -> [Item] {

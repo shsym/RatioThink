@@ -41,8 +41,8 @@ final class ModelLibraryStore: ObservableObject {
   }
 
   @Published private(set) var freshness: Freshness = .notScanned
-  /// Table-facing rows: app-managed + HF-cache, deduped by structured
-  /// identity (base+quant+format, #580) keeping the app-managed row (the
+  /// Table-facing rows: app-managed + HF-cache, deduped by the full
+  /// resolvable slug (review v2 F2) keeping the app-managed row (the
   /// resolver's app-staged-first precedence — migrated from
   /// `ModelsSettingsTab.refresh()`).
   @Published private(set) var installed: [InstalledModel] = []
@@ -90,11 +90,11 @@ final class ModelLibraryStore: ObservableObject {
     guard epoch == scanEpoch else { return }
     modelsDirectory = result.modelsDirectory
     scanError = result.appError
-    // #580 Q1: dedup by STRUCTURED IDENTITY (base+quant+format), not exact
-    // slug — an app-managed copy and an HF-cache copy of the same file
-    // collapse to one row, app-managed first (the resolver's app-staged-first
-    // precedence). Distinct quants (Q4 vs Q8) keep separate identities and
-    // stay as separate rows.
+    // Dedup by the full resolvable slug (review v2 F2): an app-managed
+    // download and an HF-cache copy of the SAME <repo>/<file> slug collapse
+    // to one row, app-managed first (the resolver's app-staged-first
+    // precedence). Distinct files that merely share a leaf — an app-bare copy
+    // vs a repo-qualified one, or different repos — stay as separate rows.
     installed = ModelIdentityGrouping.deduped(
       result.appManaged + result.huggingFaceCache, slug: \.filename)
     retireOverlay(active: downloads.active)
