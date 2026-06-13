@@ -306,8 +306,11 @@ struct ContentToolbar: View {
       // #580 #4: cluster all quants of a family under one base-name header — a
       // disabled `Text` row, NOT a SwiftUI `Section` (a Section header in a
       // `.borderlessButton` Menu breaks the NSMenu so it never opens, verified
-      // via the profile picker's S365). Each row shows the quant tag + an
-      // unverified shield (#580 #5) via `modelOptionLabel`.
+      // via the profile picker's S365). Rows keep the full leaf as their text
+      // (the header supplies the family grouping; the leaf stays identifiable
+      // and automation-matchable — `.accessibilityValue` does not reliably
+      // surface on an NSMenuItem, so S486/S260 key on the leaf in the title);
+      // `modelOptionLabel` adds the unverified shield (#580 #5).
       ForEach(ModelIdentityGrouping.grouped(
         ModelIdentityGrouping.deduped(modelOptions, slug: \.slug), slug: \.slug)) { group in
         Text(group.base)
@@ -367,11 +370,13 @@ struct ContentToolbar: View {
     }
   }
 
-  /// #580: within a base-name section the row's primary text is the quant tag
-  /// (the distinguishing part), falling back to the full leaf when there is no
-  /// clean quant. Keeps the profile-default annotation + any unavailable reason.
+  /// Row text keeps the FULL leaf (not the quant tag): the base-name section
+  /// header already supplies the #580 family grouping, and the leaf keeps the
+  /// concrete model identifiable in-row (and matchable by automation, which
+  /// keys on the leaf — `.accessibilityValue` does not reliably surface on an
+  /// NSMenuItem). Keeps the profile-default annotation + any unavailable reason.
   private func modelOptionText(_ option: ToolbarModelOptions.Option) -> String {
-    var text = option.parts.quantOrLeaf + (option.isProfileDefault ? " (profile default)" : "")
+    var text = option.displayName + (option.isProfileDefault ? " (profile default)" : "")
     if let reason = option.unavailableReason { text += " — \(reason)" }
     return text
   }
