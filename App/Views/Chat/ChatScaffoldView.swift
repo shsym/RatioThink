@@ -897,6 +897,11 @@ struct ChatScaffoldView: View {
       // + forces greedy; a normal or tree-of-thought profile carries none.
       // Built once here so both the ToT dispatch and the normal send get it.
       speculation: profileStore.speculation(forProfileID: viewModel.selectedProfileID),
+      // #572: thread the selected profile's output-constraint mode. A "JSON
+      // Think" profile attaches `response_format: json_object` so chat-apc runs
+      // JSON-grammar-constrained decoding; other profiles carry none. Built
+      // here so both the ToT dispatch and the normal send get it.
+      responseFormat: profileStore.responseFormat(forProfileID: viewModel.selectedProfileID),
       // #474: the launched engine's effective max_tokens ceiling, learned
       // from GET /v1/models during resident-model reconcile. `makeRequest`
       // clamps the profile's max_tokens down to this so a memory-squeezed
@@ -938,8 +943,9 @@ struct ChatScaffoldView: View {
       engine: engineStore.client,
       modelLoadCenter: modelLoadCenter,
       persistenceStatus: persistenceStatus,
-      // Reuses the `options` built above (now carrying #426 speculation), so
-      // the normal send and the ToT dispatch share one options value.
+      // Reuses the `options` built above (now carrying #426 speculation +
+      // #572 response_format), so the normal send and the ToT dispatch
+      // share one options value.
       options: options,
       // `EngineStatusStore` conforms to `ChatRecoveryGate`; passing it
       // here lets the send pipeline classify a mid-stream

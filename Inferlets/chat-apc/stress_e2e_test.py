@@ -625,6 +625,38 @@ async def section_sse_stress(base: str, http: httpx.AsyncClient, rep: Report) ->
         pass
     r = await http.get(f"{base}/healthz")
     rep.ok(r.status_code == 200, f"{P}: engine alive after client disconnect -> {r.status_code}")
+
+    # #572 JSON Think: streaming response_format engages the two-phase
+    # constrained decode. The dummy samples randomly WITHIN the JSON grammar
+    # mask, so the concatenated content is grammar-valid JSON (a value or a
+    # value-prefix under max_tokens truncation). Deterministic invariants:
+    #   · SSE framing stays valid (exactly one terminal finish_reason, [DONE]),
+    #   · content deltas concatenate to something beginning with a JSON value,
+    #   · NO `<think>`/`</think>` ever appears in the content channel (reasoning
+    #     rides `reasoning_content` only).
+    r = await http.post(f"{base}/v1/chat/completions", json={
+        "model": MODEL, "messages": [{"role": "user", "content": "give me json"}],
+        "stream": True, "max_tokens": 64, "response_format": {"type": "json_object"},
+    })
+    rep.ok(r.headers.get("content-type", "").split(";")[0] == "text/event-stream",
+           f"{P}/json: content-type {r.headers.get('content-type')!r}")
+    payloads = sse_payloads(r.text)
+    assert_sse_framing(payloads, rep, f"{P}/json")
+    content = ""
+    for d in payloads:
+        if d == "[DONE]":
+            continue
+        obj = json.loads(d)
+        if obj.get("object") != "chat.completion.chunk":
+            continue
+        delta = obj["choices"][0].get("delta", {})
+        if delta.get("content"):
+            content += delta["content"]
+    rep.ok("<think>" not in content and "</think>" not in content,
+           f"{P}/json: reasoning delimiter leaked into streamed content: {content!r}")
+    stripped = content.lstrip()
+    rep.ok(not stripped or stripped[0] in '{["-0123456789tfn',
+           f"{P}/json: streamed content does not begin with a JSON value: {content!r}")
     rep.skip(f"{P}: server-side cancellation on client disconnect is a known gap (#200) — "
              f"disconnect does not abort in-flight generation; only survival is asserted here")
 

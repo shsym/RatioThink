@@ -733,6 +733,7 @@ final class ChatSendControllerTests: XCTestCase {
   /// Drive `send` and return the single `ChatRequest` the engine saw.
   private func capturedRequest(
     speculation: Profile.Speculation?,
+    responseFormat: ResponseFormat? = nil,
     sampling: ChatSampling = ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 100)
   ) async throws -> ChatRequest {
     let container = try RatioThinkModelContainer.makeInMemory()
@@ -750,7 +751,12 @@ final class ChatSendControllerTests: XCTestCase {
       engine: engine,
       modelLoadCenter: ModelLoadCenter(),
       persistenceStatus: PersistenceStatus(),
-      options: ChatSendRequestOptions(modelID: "m", sampling: sampling, speculation: speculation)
+      options: ChatSendRequestOptions(
+        modelID: "m",
+        sampling: sampling,
+        speculation: speculation,
+        responseFormat: responseFormat
+      )
     )
     try await waitUntil("stream finishes") { !controller.isInFlight }
     return try XCTUnwrap(engine.requests.first)
@@ -895,6 +901,51 @@ final class ChatSendControllerTests: XCTestCase {
     XCTAssertEqual(spec["enabled"] as? Bool, true)
     XCTAssertEqual(body["temperature"] as? Double, 0,
                    "Fast Think body must be greedy (temp 0) so the drafter engages")
+  }
+
+  // MARK: - response_format injection (#572 JSON Think)
+
+  func test_send_jsonObject_attaches_response_format_field() async throws {
+    let req = try await capturedRequest(speculation: nil, responseFormat: .jsonObject)
+    XCTAssertEqual(req.responseFormat, ChatResponseFormat.jsonObject)
+  }
+
+  func test_send_jsonObject_does_not_force_greedy_temp() async throws {
+    // Unlike speculation, JSON mode leaves sampling untouched — the
+    // grammar masks the sampler regardless of temperature.
+    let req = try await capturedRequest(
+      speculation: nil,
+      responseFormat: .jsonObject,
+      sampling: ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 100))
+    XCTAssertEqual(req.sampling.temperature, 0.7, "JSON mode must not force greedy")
+    XCTAssertEqual(req.sampling.topP, 0.9)
+    XCTAssertEqual(req.sampling.maxTokens, 100)
+  }
+
+  func test_send_nilResponseFormat_no_field() async throws {
+    let req = try await capturedRequest(speculation: nil, responseFormat: nil)
+    XCTAssertNil(req.responseFormat, "no profile constraint → byte-identical normal chat")
+  }
+
+  /// End-to-end golden tie: the seeded built-in "JSON Think" profile must
+  /// produce a body carrying `response_format: {type:"json_object"}` and
+  /// NO `speculation` field (the two grammars are mutually exclusive). (#572)
+  func test_seeded_json_think_profile_yields_json_response_format_body() async throws {
+    let profile = try Profile.parse(toml: ProfileStore.defaultJSONThinkTOML)
+    XCTAssertEqual(profile.responseFormat, .jsonObject,
+                   "seeded JSON Think profile must request json_object")
+    XCTAssertNil(profile.speculation, "JSON Think must not enable speculation")
+
+    let req = try await capturedRequest(
+      speculation: profile.speculation,
+      responseFormat: profile.responseFormat,
+      sampling: ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 100))
+
+    let body = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try JSONEncoder().encode(req)) as? [String: Any])
+    let rf = try XCTUnwrap(body["response_format"] as? [String: Any])
+    XCTAssertEqual(rf["type"] as? String, "json_object")
+    XCTAssertNil(body["speculation"], "JSON Think body must not carry speculation")
   }
 
   private func waitUntil(

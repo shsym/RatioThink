@@ -378,10 +378,65 @@ final class ProfileStoreTests: XCTestCase {
       defer { store.stop() }
 
       let names = store.entries.map { $0.url.lastPathComponent }
-      // fast-think.toml is auto-seeded into every install (#426 ensure-exists),
-      // so it appears in the scan alongside the authored profiles, sorted.
-      XCTAssertEqual(names, ["alpha.toml", "fast-think.toml", "zeta.toml"],
+      // fast-think.toml (#426) and json-think.toml (#572) are auto-seeded
+      // into every install (ensure-exists), so they appear in the scan
+      // alongside the authored profiles, sorted.
+      XCTAssertEqual(names, ["alpha.toml", "fast-think.toml", "json-think.toml", "zeta.toml"],
                      "entries must be sorted by filename for stable UI ordering")
+    }
+  }
+
+  // MARK: - built-in JSON Think seed (#572)
+
+  func test_seeds_builtin_json_think_profile_into_populated_dir() throws {
+    try withTempProfilesDir { dir in
+      // A populated dir (the empty-dir chat seed is a no-op here) must
+      // still gain the built-in JSON Think profile on start.
+      try writeProfile(into: dir, name: "alpha.toml", id: "alpha", displayName: "Alpha")
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let jsonThink = store.entries.first { $0.profile?.id == ProfileStore.defaultJSONThinkProfileID }
+      let profile = try XCTUnwrap(jsonThink?.profile, "JSON Think profile must be seeded")
+      XCTAssertEqual(profile.responseFormat, .jsonObject)
+      XCTAssertNil(store.lastDirectoryError, "a clean seed must not surface a directory error")
+    }
+  }
+
+  func test_response_format_accessor_reads_seeded_json_think() throws {
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(
+        store.responseFormat(forProfileID: ProfileStore.defaultJSONThinkProfileID),
+        .jsonObject)
+      // The default chat profile carries no constraint.
+      XCTAssertNil(store.responseFormat(forProfileID: ProfileStore.defaultProfileID))
+    }
+  }
+
+  func test_does_not_overwrite_existing_json_think_toml() throws {
+    try withTempProfilesDir { dir in
+      // A user edit to json-think.toml must survive a restart (existence-gated).
+      let edited = """
+      id = "json-think"
+      name = "My JSON"
+      model = "m"
+      inferlet = "chat-apc"
+      """
+      try edited.write(to: dir.appendingPathComponent(ProfileStore.defaultJSONThinkFilename),
+                       atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let jsonThink = store.entries.first { $0.profile?.id == ProfileStore.defaultJSONThinkProfileID }
+      XCTAssertEqual(jsonThink?.profile?.name, "My JSON", "user edit must not be overwritten")
     }
   }
 

@@ -267,6 +267,27 @@ public struct ChatCacheRetentionDirective: Codable, Equatable, Sendable {
   }
 }
 
+/// Wire shape of the OpenAI `response_format` field (#572). Rides as a
+/// nested `"response_format": {"type": "json_object"}` object, matching
+/// chat-apc's `ResponseFormat` schema. The request omits the whole object
+/// when there is no constraint (byte-identical normal decode);
+/// `ChatSendController.makeRequest` attaches it only for a profile whose
+/// `[constraint]` requests JSON. v1 only encodes `json_object`.
+public struct ChatResponseFormat: Codable, Equatable, Sendable {
+  public let kind: String
+
+  public init(kind: String = "json_object") {
+    self.kind = kind
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case kind = "type"
+  }
+
+  /// The single supported constrained mode.
+  public static let jsonObject = ChatResponseFormat(kind: "json_object")
+}
+
 /// Body of POST /v1/chat/completions. `stream` is required on the wire
 /// (engine has different code paths for streaming vs non-streaming); we
 /// expose it but `EngineClient.chatCompletion` only models the streaming
@@ -292,19 +313,24 @@ public struct ChatRequest: Codable, Equatable, Sendable {
   /// #522 prefix-cache directive. `nil` → no `cache` key on the wire
   /// (reuse disabled, byte-identical to pre-#522). Nested-encoded.
   public let cache: ChatCacheDirective?
+  /// Optional OpenAI `response_format` (#572). `nil` → no key on the wire
+  /// (unconstrained). `.jsonObject` → JSON-grammar-constrained decoding.
+  public let responseFormat: ChatResponseFormat?
 
   public init(model: String,
               messages: [ChatMessage],
               sampling: ChatSampling = ChatSampling(),
               stream: Bool = true,
               speculation: ChatSpeculation? = nil,
-              cache: ChatCacheDirective? = nil) {
+              cache: ChatCacheDirective? = nil,
+              responseFormat: ChatResponseFormat? = nil) {
     self.model = model
     self.messages = messages
     self.sampling = sampling
     self.stream = stream
     self.speculation = speculation
     self.cache = cache
+    self.responseFormat = responseFormat
   }
 
   /// Flat wire keys for sampling. No `sampling` envelope — OpenAI's
@@ -321,6 +347,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     case maxTokens = "max_tokens"
     case speculation
     case cache
+    case responseFormat = "response_format"
   }
 
   public func encode(to encoder: Encoder) throws {
@@ -333,6 +360,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     try c.encode(sampling.maxTokens, forKey: .maxTokens)
     try c.encodeIfPresent(speculation, forKey: .speculation)
     try c.encodeIfPresent(cache, forKey: .cache)
+    try c.encodeIfPresent(responseFormat, forKey: .responseFormat)
   }
 
   public init(from decoder: Decoder) throws {
@@ -347,6 +375,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     )
     self.speculation = try c.decodeIfPresent(ChatSpeculation.self, forKey: .speculation)
     self.cache = try c.decodeIfPresent(ChatCacheDirective.self, forKey: .cache)
+    self.responseFormat = try c.decodeIfPresent(ChatResponseFormat.self, forKey: .responseFormat)
   }
 }
 

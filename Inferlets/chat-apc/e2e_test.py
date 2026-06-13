@@ -996,6 +996,101 @@ async def main() -> int:
                                     f"param tag {err!r} (expected speculation.{sub})"
                                 )
 
+                    # #572 JSON Think: response_format validation + engagement.
+                    import json as _json572
+                    # (a) Unknown response_format.type (incl. json_schema) → 400
+                    #     response_format_unsupported with param "response_format".
+                    for bad_type in ("json_schema", "banana"):
+                        r = await http.post(
+                            f"{base}/v1/chat/completions",
+                            json={
+                                "model": model_id,
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "stream": False,
+                                "response_format": {"type": bad_type},
+                            },
+                        )
+                        print(f"[harness] POST chat(response_format={bad_type}) -> {r.status_code}")
+                        if r.status_code != 400:
+                            failures.append(
+                                f"/v1/chat/completions response_format={bad_type} status {r.status_code} (want 400)"
+                            )
+                        else:
+                            err = (r.json().get("error", {}) if r.headers.get("content-type", "").startswith("application/json") else {})
+                            if err.get("code") != "response_format_unsupported":
+                                failures.append(
+                                    f"response_format={bad_type} code {err!r} (want response_format_unsupported)"
+                                )
+
+                    # (b) json_object + forced tool_choice → 400 invalid_request
+                    #     (the two grammars are mutually exclusive).
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                            "response_format": {"type": "json_object"},
+                            "tool_choice": "required",
+                            "tools": [{"type": "function",
+                                       "function": {"name": "f", "parameters": {"type": "object"}}}],
+                        },
+                    )
+                    print(f"[harness] POST chat(json_object + tool_choice) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(
+                            f"/v1/chat/completions json+tool status {r.status_code} (want 400)"
+                        )
+
+                    # (c) json_object non-stream → 200, JSON-constrained content.
+                    #     The dummy samples randomly WITHIN the grammar mask, so
+                    #     the answer is grammar-valid JSON tokens but may truncate
+                    #     at max_tokens. Deterministic invariants on the dummy:
+                    #       · no `spec_metrics` (no speculation requested),
+                    #       · NO `<think>`/`</think>` leaks into content,
+                    #       · a natural stop ("stop") yields a COMPLETE, parseable
+                    #         JSON value. Full parse-validity under truncation is
+                    #         proven by the real-engine smoke (spec_smoke_real-style).
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "give me json"}],
+                            "stream": False,
+                            "max_tokens": 64,
+                            "response_format": {"type": "json_object"},
+                        },
+                    )
+                    print(f"[harness] POST chat(json_object) -> {r.status_code}")
+                    if r.status_code != 200:
+                        failures.append(f"json_object status {r.status_code} (want 200)")
+                    else:
+                        b572 = r.json()
+                        if b572.get("spec_metrics") is not None:
+                            failures.append(f"json_object carried spec_metrics: {b572.get('spec_metrics')!r}")
+                        choice = (b572.get("choices") or [{}])[0]
+                        msg = choice.get("message", {})
+                        content = msg.get("content", "") or ""
+                        finish = choice.get("finish_reason")
+                        print(f"[harness]   json content={content!r} finish={finish}", flush=True)
+                        if "<think>" in content or "</think>" in content:
+                            failures.append(f"reasoning delimiter leaked into json content: {content!r}")
+                        # Grammar-engagement proof, deterministic even under the
+                        # dummy's random-within-mask sampling: the FIRST non-ws
+                        # char must begin a JSON value (`{ [ " - digit t f n`).
+                        # A non-JSON (unconstrained) decode would emit arbitrary
+                        # leading text.
+                        stripped = content.lstrip()
+                        if stripped and stripped[0] not in '{["-0123456789tfn':
+                            failures.append(
+                                f"json content does not begin with a JSON value: {content!r}"
+                            )
+                        if finish == "stop":
+                            try:
+                                _json572.loads(content)
+                            except _json572.JSONDecodeError as e:
+                                failures.append(f"json_object natural-stop content not valid JSON: {content!r} ({e})")
+
                     # Malformed JSON body → 400.
                     r = await http.post(
                         f"{base}/v1/chat/completions",

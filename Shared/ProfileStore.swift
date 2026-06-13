@@ -374,6 +374,38 @@ public final class ProfileStore: ObservableObject {
 
   """
 
+  /// Built-in "JSON Think" profile id (#572). A third seeded profile that
+  /// constrains the assistant's final answer to valid JSON via real
+  /// grammar-guided decoding (`[constraint] response_format = "json_object"`).
+  /// Reasoning is captured separately and never leaks into the JSON.
+  public static let defaultJSONThinkProfileID = "json-think"
+
+  /// Filename for the seeded JSON Think profile.
+  public static let defaultJSONThinkFilename = "json-think.toml"
+
+  /// Seed body for the JSON Think profile. Same model + inferlet as the
+  /// default Chat profile (so selecting it is a silent same-model swap, no
+  /// reload). The system prompt nudges the model toward JSON; the real
+  /// guarantee is the `[constraint]` grammar, not the prompt. Sampling is
+  /// left at the chat default (JSON mode does not require greedy decode).
+  public static let defaultJSONThinkTOML: String = """
+  id = "json-think"
+  name = "JSON Think"
+  icon = "curlybraces"
+  model = "\(defaultChatModelID)"
+  inferlet = "chat-apc"
+  system_prompt = "You are a helpful assistant. Respond with a single valid JSON value."
+
+  [sampling]
+  temperature = 0.7
+  top_p = 0.9
+  max_tokens = 2048
+
+  [constraint]
+  response_format = "json_object"
+
+  """
+
   private let queue: DispatchQueue
   /// Per-instance specific key so any method can detect whether the
   /// current thread is already running on THIS store's `queue`
@@ -590,6 +622,11 @@ public final class ProfileStore: ObservableObject {
       // there). Runs before `reloadLocked()` below so the initial scan
       // picks it up. (#426)
       let fastThinkSeedError = self.ensureBuiltinFastThinkProfile()
+      // Same for the built-in JSON Think profile (#572). A seed failure on
+      // EITHER built-in rides the shared `_builtinSeedError` channel; keep
+      // the first failure so the snapshot surfaces a concrete cause.
+      let jsonThinkSeedError = self.ensureBuiltinJSONThinkProfile()
+      let builtinSeedError = fastThinkSeedError ?? jsonThinkSeedError
       let readResult = self.readActiveProfileIDFromDisk()
       self.stateLock.withLock {
         self._lastSeedError = seed.dirError
@@ -597,7 +634,7 @@ public final class ProfileStore: ObservableObject {
         // is seeded into populated dirs, so it must surface even when
         // `_entries` is non-empty (review v1 F1) — `_lastSeedError` is
         // gated on an empty dir and cleared by the next non-empty scan.
-        self._builtinSeedError = fastThinkSeedError
+        self._builtinSeedError = builtinSeedError
         self.commitActiveReadResultLocked(readResult, source: .start)
         //  review v1 F2: a marker-seed failure must NOT
         // be silent. The override below fills `_activeProfileError`
@@ -924,6 +961,17 @@ public final class ProfileStore: ObservableObject {
     try createProfile(updated, filename: target.filename)
   }
 
+  /// The output-constraint mode ("JSON Think") a profile carries, or `nil`
+  /// when the profile has no `[constraint]` section / does not exist /
+  /// failed to parse. `ChatScaffoldView.sendAssistantTurn` reads this for
+  /// the chat's selected profile and threads it into the request options so
+  /// `ChatSendController` can attach `response_format` (#572). Mirrors
+  /// `speculation(forProfileID:)`.
+  public func responseFormat(forProfileID id: String) -> ResponseFormat? {
+    stateLock.withLock {
+      _entries.first { $0.profile?.id == id }?.profile?.responseFormat
+    }
+  }
 
   /// Persist a new default `model` onto the profile with `id`, leaving
   /// every other field untouched. Writes back to the profile's own
@@ -1442,6 +1490,26 @@ public final class ProfileStore: ObservableObject {
     } catch {
       let underlying = String(describing: error)
       Log.store.error("seed Fast Think profile failed: \(underlying, privacy: .public)")
+      return .seedFailed(path: target.path, underlying: underlying)
+    }
+  }
+
+  /// Ensure the built-in "JSON Think" profile exists (#572). Same
+  /// existence-gated contract as `ensureBuiltinFastThinkProfile`: writes
+  /// `json-think.toml` whenever ABSENT, survives user edits, re-creates on
+  /// delete, never touches the active-profile marker. Returns `.seedFailed`
+  /// on a write failure; `start()` routes it to the shared
+  /// `_builtinSeedError` channel. A nil return is success-or-exists.
+  private func ensureBuiltinJSONThinkProfile() -> ProfileStoreError? {
+    let target = directory.appendingPathComponent(Self.defaultJSONThinkFilename)
+    if FileManager.default.fileExists(atPath: target.path) { return nil }
+    do {
+      try Self.defaultJSONThinkTOML.write(to: target, atomically: true, encoding: .utf8)
+      Log.store.info("seeded built-in JSON Think profile at \(target.path, privacy: .public)")
+      return nil
+    } catch {
+      let underlying = String(describing: error)
+      Log.store.error("seed JSON Think profile failed: \(underlying, privacy: .public)")
       return .seedFailed(path: target.path, underlying: underlying)
     }
   }

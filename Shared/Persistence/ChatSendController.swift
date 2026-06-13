@@ -605,13 +605,21 @@ public final class ChatSendController: ObservableObject {
       turn: turns.count,
       retention: retentionDirective(from: options.kvUsageSnapshot, modelID: options.modelID)
     )
+    // #572: attach `response_format` for a JSON Think profile. Unlike
+    // speculation it does NOT force greedy decoding — the grammar masks the
+    // sampler regardless of temperature. A profile with no `[constraint]`
+    // attaches nothing, leaving the request byte-identical to a normal chat.
+    let wireResponseFormat: ChatResponseFormat? = options.responseFormat == .jsonObject
+      ? .jsonObject
+      : nil
     return ChatRequest(
       model: options.modelID,
       messages: turns,
       sampling: sampling,
       stream: true,
       speculation: wireSpec,
-      cache: cache
+      cache: cache,
+      responseFormat: wireResponseFormat
     )
   }
 
@@ -853,6 +861,10 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
   /// cache-retention directive so eviction uses pie `model_status`
   /// accounting rather than app-side token estimates.
   public let kvUsageSnapshot: KVUsageSnapshot?
+  /// Output-constraint mode of the chat's selected profile, or `nil` when
+  /// the profile has no `[constraint]`. `makeRequest` attaches the OpenAI
+  /// `response_format` wire field when `.jsonObject` — see #572.
+  public let responseFormat: ResponseFormat?
 
   public init(
     modelID: String,
@@ -860,7 +872,8 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
     systemPromptOverride: String? = nil,
     speculation: Profile.Speculation? = nil,
     maxOutputTokensCeiling: Int? = nil,
-    kvUsageSnapshot: KVUsageSnapshot? = nil
+    kvUsageSnapshot: KVUsageSnapshot? = nil,
+    responseFormat: ResponseFormat? = nil
   ) {
     self.modelID = modelID
     self.sampling = sampling
@@ -868,6 +881,7 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
     self.speculation = speculation
     self.maxOutputTokensCeiling = maxOutputTokensCeiling
     self.kvUsageSnapshot = kvUsageSnapshot
+    self.responseFormat = responseFormat
   }
 
   /// A copy with `sampling` replaced. Used by the tree-of-thought dispatch
@@ -880,7 +894,8 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
       systemPromptOverride: systemPromptOverride,
       speculation: speculation,
       maxOutputTokensCeiling: maxOutputTokensCeiling,
-      kvUsageSnapshot: kvUsageSnapshot
+      kvUsageSnapshot: kvUsageSnapshot,
+      responseFormat: responseFormat
     )
   }
 }

@@ -15,6 +15,14 @@ public enum ProfileError: Error, Equatable, CustomStringConvertible {
   }
 }
 
+/// Output-constraint mode for a profile (#572). Maps to the OpenAI
+/// `response_format` wire field. v1 supports only `jsonObject` — real
+/// JSON-grammar-constrained decoding, the "JSON Think" profile. Parsed
+/// from the profile's `[constraint] response_format = "json_object"`.
+public enum ResponseFormat: String, Equatable, Sendable {
+  case jsonObject = "json_object"
+}
+
 public struct Sampling: Equatable {
   public var temperature: Double = 0.7
   public var topP: Double = 0.9
@@ -61,6 +69,11 @@ public struct Profile {
   /// Speculative-decoding settings from the `[speculation]` section;
   /// `nil` when the profile has no such section.
   public var speculation: Speculation?
+  /// Output-constraint mode from the `[constraint]` section (#572);
+  /// `nil` when absent. `.jsonObject` makes the send path attach the
+  /// OpenAI `response_format: {type:"json_object"}` wire field so
+  /// chat-apc runs JSON-grammar-constrained decoding ("JSON Think").
+  public var responseFormat: ResponseFormat?
 
   // Preserve unknown v2 sections (mcp_servers, routine, remote, agent) verbatim.
   private var rawTable: TOMLTable
@@ -75,6 +88,7 @@ public struct Profile {
     sampling: Sampling = Sampling(),
     inferletArgs: [String: TOMLValueConvertible] = [:],
     speculation: Speculation? = nil,
+    responseFormat: ResponseFormat? = nil,
     rawTable: TOMLTable = TOMLTable()
   ) {
     self.id = id
@@ -86,6 +100,7 @@ public struct Profile {
     self.sampling = sampling
     self.inferletArgs = inferletArgs
     self.speculation = speculation
+    self.responseFormat = responseFormat
     self.rawTable = rawTable
   }
 
@@ -136,6 +151,16 @@ public struct Profile {
       )
     }
 
+    // `[constraint] response_format = "json_object"` (#572). An unknown
+    // value parses to `nil` (unconstrained) rather than failing the whole
+    // profile — forward-compat with future modes, mirroring the lenient
+    // posture on v2 sections.
+    var responseFormat: ResponseFormat? = nil
+    if let c = table["constraint"]?.table,
+       let raw = c["response_format"]?.string {
+      responseFormat = ResponseFormat(rawValue: raw)
+    }
+
     return Profile(
       id: id, name: name, icon: icon,
       model: model, inferlet: inferlet,
@@ -143,6 +168,7 @@ public struct Profile {
       sampling: sampling,
       inferletArgs: args,
       speculation: speculation,
+      responseFormat: responseFormat,
       rawTable: table
     )
   }
@@ -191,6 +217,7 @@ public struct Profile {
     table.remove(at: "system_prompt")
     table.remove(at: "inferlet_args")
     table.remove(at: "speculation")
+    table.remove(at: "constraint")
     table.remove(at: "model")
     table["id"]       = TOMLValue(stringLiteral: id)
     table["name"]     = TOMLValue(stringLiteral: name)
@@ -214,6 +241,12 @@ public struct Profile {
       if let l = speculation.leaderLen { specTable["leader_len"] = TOMLValue(integerLiteral: l) }
       if let d = speculation.draftLen  { specTable["draft_len"]  = TOMLValue(integerLiteral: d) }
       table["speculation"] = TOMLValue(specTable)
+    }
+    if let responseFormat {
+      let constraintTable = TOMLTable([
+        "response_format": TOMLValue(stringLiteral: responseFormat.rawValue),
+      ])
+      table["constraint"] = TOMLValue(constraintTable)
     }
     return table.convert()
   }
