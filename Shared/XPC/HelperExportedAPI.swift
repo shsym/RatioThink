@@ -365,7 +365,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     let token = engineHost.observe { status, _ in
       let shouldFire: (Result<EnginePort, EngineError>)?
       switch status {
-      case .running(let port, let pid) where pid == spec.profileID:
+      case .running(let port, let pid, _) where pid == spec.profileID:
         shouldFire = .success(port)
       case .running:
         shouldFire = .failure(EngineError(code: .alreadyRunning,

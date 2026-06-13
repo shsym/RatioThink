@@ -77,7 +77,7 @@ public final class PieEngineHost: @unchecked Sendable {
   private enum State {
     case stopped
     case starting(profileID: String, launchTask: Task<Void, Never>)
-    case running(port: EnginePort, profileID: String, session: any EngineSession)
+    case running(port: EnginePort, profileID: String, daemonBindHost: EngineHTTPBindMode, session: any EngineSession)
     case stopping(session: (any EngineSession)?)
     case failed(EngineErrorCode, String)
 
@@ -85,7 +85,8 @@ public final class PieEngineHost: @unchecked Sendable {
       switch self {
       case .stopped:                                return .stopped
       case .starting:                               return .starting
-      case .running(let port, let profileID, _):    return .running(port: port, profileID: profileID)
+      case .running(let port, let profileID, let daemonBindHost, _):
+        return .running(port: port, profileID: profileID, daemonBindHost: daemonBindHost)
       case .stopping:                               return .stopping
       case .failed(let code, let message):          return .failed(code: code, message: message)
       }
@@ -256,7 +257,7 @@ public final class PieEngineHost: @unchecked Sendable {
   /// open), never per frame.
   public func residentMemoryBytes() async -> UInt64? {
     let session: (any EngineSession)? = stateQueue.sync {
-      if case let .running(_, _, session) = _state { return session }
+      if case let .running(_, _, _, session) = _state { return session }
       return nil
     }
     guard let session else { return nil }
@@ -408,7 +409,12 @@ public final class PieEngineHost: @unchecked Sendable {
         guard let self else { return }
         switch self._state {
         case .starting:
-          self.setState(.running(port: port, profileID: spec.profileID, session: session))
+          self.setState(.running(
+            port: port,
+            profileID: spec.profileID,
+            daemonBindHost: spec.daemonBindHost,
+            session: session
+          ))
           self.startLivenessMonitor(session: session)
           self.armHealthyUptimeTimer()
         case .stopping:
@@ -526,7 +532,7 @@ public final class PieEngineHost: @unchecked Sendable {
       healthyUptimeTask?.cancel()
       healthyUptimeTask = nil
       setState(.stopping(session: nil))
-    case .running(_, _, let session):
+    case .running(_, _, _, let session):
       Log.engine.info("PieEngineHost: stop() shutting running session down (pid path)")
       livenessMonitor?.cancel()
       livenessMonitor = nil

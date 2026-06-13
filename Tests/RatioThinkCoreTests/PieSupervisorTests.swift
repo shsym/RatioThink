@@ -61,7 +61,7 @@ final class PieSupervisorTests: XCTestCase {
                                             stopGracePeriod: 1))
     let runningExp = expectation(description: ".running observed")
     let token = sup.observe { status, _ in
-      if case .running(let port, let profileID) = status {
+      if case .running(let port, let profileID, _) = status {
         XCTAssertEqual(port, 54321)
         XCTAssertEqual(profileID, "chat")
         runningExp.fulfill()

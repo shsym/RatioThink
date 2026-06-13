@@ -158,7 +158,7 @@ final class S326FreshInstallDownloadE2ETests: XCTestCase {
     let runningDeadline = Date().addingTimeInterval(120)
     while Date() < runningDeadline {
       let status = try await statusStore.refresh()
-      if case .running(let p, _) = status {
+      if case .running(let p, _, _) = status {
         port = Int(p)
         break
       }

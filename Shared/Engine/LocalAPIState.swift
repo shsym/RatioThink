@@ -114,7 +114,7 @@ public struct LocalAPIState: Equatable {
   ///     would immediately fail `profileMissing`.
   public static func make(status: EngineStatus, hasActiveProfile: Bool) -> LocalAPIState {
     switch status {
-    case .running(let port, _):
+    case .running(let port, _, _):
       return LocalAPIState(
         phase: .serving(port: port),
         toggleOn: true,

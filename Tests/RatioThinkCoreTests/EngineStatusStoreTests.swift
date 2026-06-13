@@ -140,6 +140,20 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(store.runtimeDaemonBindMode, .external)
   }
 
+  func test_running_status_poll_updates_runtime_daemon_bind_mode_from_helper() {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client, initialDaemonBindMode: .loopback)
+
+    store._applyPollForTesting(
+      next: .running(port: 8123, profileID: "chat", daemonBindHost: .external),
+      error: nil
+    )
+
+    XCTAssertEqual(store.status, .running(port: 8123, profileID: "chat", daemonBindHost: .external))
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+    XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8123")
+  }
+
   func test_startEngine_propagates_real_failure() async {
     let client = StubXPCClient()
     client.setStartResult(.failure(

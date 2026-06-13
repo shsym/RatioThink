@@ -56,12 +56,31 @@ final class XPCProtocolTests: XCTestCase {
     let data = try XPCPayload.encode(original)
     let decoded = try XPCPayload.decode(EngineStatus.self, from: data)
     XCTAssertEqual(decoded, original)
-    if case .running(let port, let id) = decoded {
+    if case .running(let port, let id, let daemonBindHost) = decoded {
       XCTAssertEqual(port, 51234)
       XCTAssertEqual(id, "chat")
+      XCTAssertEqual(daemonBindHost, .loopback)
     } else {
       XCTFail("expected .running, got \(decoded)")
     }
+  }
+
+  func test_engineStatus_roundtrip_running_carries_external_bind_mode() throws {
+    let original = EngineStatus.running(port: 51234, profileID: "chat", daemonBindHost: .external)
+    let data = try XPCPayload.encode(original)
+    let decoded = try XPCPayload.decode(EngineStatus.self, from: data)
+    XCTAssertEqual(decoded, original)
+    if case .running(_, _, let daemonBindHost) = decoded {
+      XCTAssertEqual(daemonBindHost, .external)
+    } else {
+      XCTFail("expected .running, got \(decoded)")
+    }
+  }
+
+  func test_engineStatus_legacy_running_payload_defaults_daemon_bind_mode_to_loopback() throws {
+    let data = Data(#"{"kind":"running","port":51234,"profileID":"chat"}"#.utf8)
+    let decoded = try XPCPayload.decode(EngineStatus.self, from: data)
+    XCTAssertEqual(decoded, .running(port: 51234, profileID: "chat", daemonBindHost: .loopback))
   }
 
   func test_engineStatus_running_port_zero_is_rejected() throws {

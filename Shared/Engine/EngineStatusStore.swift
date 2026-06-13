@@ -76,7 +76,7 @@ public final class EngineStatusStore: ObservableObject {
   /// `nil`. Computed live off `status` so the SwiftUI dependency
   /// graph re-evaluates dependent views when status flips.
   public var baseURL: URL? {
-    if case .running(let port, _) = status {
+    if case .running(let port, _, _) = status {
       return URL(string: "http://127.0.0.1:\(port)")
     }
     return nil
@@ -86,7 +86,7 @@ public final class EngineStatusStore: ObservableObject {
   /// clients keep using `baseURL` (loopback), but the endpoint explorer should
   /// render the listener mode the engine was actually launched with.
   public var localAPIBaseURL: URL? {
-    if case .running(let port, _) = status {
+    if case .running(let port, _, _) = status {
       return URL(string: "http://\(runtimeDaemonBindMode.baseURLHost):\(port)")
     }
     return nil
@@ -157,7 +157,10 @@ public final class EngineStatusStore: ObservableObject {
     self.now = now
     self.status = initialStatus
     self.runtimeDaemonBindMode = initialDaemonBindMode
-    if case .running = initialStatus { self.wasEverRunning = true }
+    if case .running(_, _, let daemonBindHost) = initialStatus {
+      self.wasEverRunning = true
+      self.runtimeDaemonBindMode = daemonBindHost
+    }
     if case .starting = initialStatus { self.startingSince = now() }
   }
 
@@ -329,7 +332,7 @@ public final class EngineStatusStore: ObservableObject {
       guard allowAlreadyRunning else {
         throw error
       }
-      if case .running(_, let runningProfileID) = status,
+      if case .running(_, let runningProfileID, _) = status,
          runningProfileID != profileID {
         throw error
       }
@@ -355,7 +358,7 @@ public final class EngineStatusStore: ObservableObject {
   /// boundary. `ChatSendController` keys its recovery retry on that
   /// discrete case rather than parsing the `engineNotReady` detail.
   public func requireBaseURL() throws -> URL {
-    if case .running(let port, _) = status {
+    if case .running(let port, _, _) = status {
       // Force-unwrap is safe: `EnginePort` (UInt16) interpolates into
       // a valid IPv4 loopback URL by construction, and the `running`
       // decoder already rejects `port == 0`.
@@ -433,6 +436,9 @@ public final class EngineStatusStore: ObservableObject {
         // grace exhausted — surface the failure below.
       }
       heldFailurePolls = 0
+      if case .running(_, _, let daemonBindHost) = next {
+        runtimeDaemonBindMode = daemonBindHost
+      }
       setStatusAndTrackStarting(next)
       if case .running = next { wasEverRunning = true }
       updateEngineGonePolls(for: next)

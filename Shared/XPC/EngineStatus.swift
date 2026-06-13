@@ -14,8 +14,9 @@ public typealias EnginePort = UInt16
 
 /// Engine lifecycle state observed by `PieSupervisor`. Single source of
 /// truth for menu-bar dot color and chat startup gating. The `running`
-/// case carries the live port + active profile id so the GUI doesn't
-/// have to keep a parallel cache.
+/// case carries the live port, active profile id, and effective Local API
+/// daemon bind mode so the GUI doesn't have to keep a parallel cache or infer
+/// helper-owned starts from preferences.
 ///
 /// `failed` carries a discriminator (`EngineErrorCode`) plus a bounded
 /// message so the GUI can route on the code rather than substring-match
@@ -24,7 +25,7 @@ public typealias EnginePort = UInt16
 public enum EngineStatus: Codable, Equatable, Sendable {
   case stopped
   case starting
-  case running(port: EnginePort, profileID: String)
+  case running(port: EnginePort, profileID: String, daemonBindHost: EngineHTTPBindMode = .loopback)
   case stopping
   case failed(code: EngineErrorCode, message: String)
 
@@ -36,7 +37,9 @@ public enum EngineStatus: Codable, Equatable, Sendable {
   public static let failedMessageTruncationMarker = "…[truncated]"
 
   private enum Kind: String, Codable { case stopped, starting, running, stopping, failed }
-  private enum CodingKeys: String, CodingKey { case kind, port, profileID, code, message }
+  private enum CodingKeys: String, CodingKey {
+    case kind, port, profileID, daemonBindHost, code, message
+  }
 
   public init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -56,7 +59,8 @@ public enum EngineStatus: Codable, Equatable, Sendable {
       }
       self = .running(
         port: port,
-        profileID: try c.decode(String.self, forKey: .profileID)
+        profileID: try c.decode(String.self, forKey: .profileID),
+        daemonBindHost: try c.decodeIfPresent(EngineHTTPBindMode.self, forKey: .daemonBindHost) ?? .loopback
       )
     case .stopping: self = .stopping
     case .failed:
@@ -72,7 +76,7 @@ public enum EngineStatus: Codable, Equatable, Sendable {
     switch self {
     case .stopped:  try c.encode(Kind.stopped,  forKey: .kind)
     case .starting: try c.encode(Kind.starting, forKey: .kind)
-    case .running(let port, let profileID):
+    case .running(let port, let profileID, let daemonBindHost):
       // Symmetric guard with the decoder (review v2 F5). UInt16
       // forbids negative/oversized at the type level but admits 0,
       // and the engine never auto-binds — so a helper bug that
@@ -89,8 +93,9 @@ public enum EngineStatus: Codable, Equatable, Sendable {
         )
       }
       try c.encode(Kind.running, forKey: .kind)
-      try c.encode(port,       forKey: .port)
-      try c.encode(profileID,  forKey: .profileID)
+      try c.encode(port,           forKey: .port)
+      try c.encode(profileID,      forKey: .profileID)
+      try c.encode(daemonBindHost, forKey: .daemonBindHost)
     case .stopping: try c.encode(Kind.stopping, forKey: .kind)
     case .failed(let code, let message):
       try c.encode(Kind.failed, forKey: .kind)

@@ -103,7 +103,7 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
       exp.fulfill()
     }
     wait(for: [exp], timeout: 1)
-    guard case let .running(port, profileID) = captured else {
+    guard case let .running(port, profileID, _) = captured else {
       host.stop()
       return XCTFail("expected .running, got \(String(describing: captured))")
     }

@@ -298,7 +298,7 @@ final class HelperResumeActionTests: XCTestCase {
     // supervisor.start was actually invoked: wait for handshake so we
     // confirm the fake pie was spawned (not just .starting).
     waitForRunning(engineHost, timeout: 5)
-    if case .running(let port, let profileID) = engineHost.status {
+    if case .running(let port, let profileID, _) = engineHost.status {
       XCTAssertEqual(port, 47474)
       XCTAssertEqual(profileID, "chat")
     } else {

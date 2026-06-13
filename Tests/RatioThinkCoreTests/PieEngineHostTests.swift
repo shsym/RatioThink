@@ -19,7 +19,10 @@ final class PieEngineHostTests: XCTestCase {
     func shutdown() async { lock.lock(); _count += 1; lock.unlock() }
   }
 
-  private func makeSpec(profileID: String = "chat") -> PieControlLauncher.LaunchSpec {
+  private func makeSpec(
+    profileID: String = "chat",
+    daemonBindHost: EngineHTTPBindMode = .loopback
+  ) -> PieControlLauncher.LaunchSpec {
     let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
     return try! PieControlLauncher.LaunchSpec(
       pieBinary: tmp.appendingPathComponent("ignored-pie"),
@@ -29,6 +32,7 @@ final class PieEngineHostTests: XCTestCase {
       pieHome: tmp.appendingPathComponent("home"),
       shmemName: "/pie_test_\(UUID().uuidString.prefix(8))",
       profileID: profileID,
+      daemonBindHost: daemonBindHost,
       modelConfig: .dummy
     )
   }
@@ -41,7 +45,7 @@ final class PieEngineHostTests: XCTestCase {
     })
     let exp = expectation(description: "host reaches .running")
     let token = host.observe { status, _ in
-      if case .running(let port, let profileID) = status {
+      if case .running(let port, let profileID, _) = status {
         XCTAssertEqual(port, 42424)
         XCTAssertEqual(profileID, "chat")
         exp.fulfill()
@@ -52,6 +56,29 @@ final class PieEngineHostTests: XCTestCase {
     if case .failure = result {
       XCTFail("start must succeed on a fresh host")
     }
+    wait(for: [exp], timeout: 2)
+    token.cancel()
+  }
+
+  func test_start_publishes_launch_spec_daemon_bind_mode_in_running_status() {
+    let host = PieEngineHost(launcher: { _ in
+      return (port: EnginePort(42425), session: FakeSession())
+    })
+    let exp = expectation(description: "host reaches external .running")
+    let token = host.observe { status, _ in
+      if case .running(let port, let profileID, let daemonBindHost) = status {
+        XCTAssertEqual(port, 42425)
+        XCTAssertEqual(profileID, "chat")
+        XCTAssertEqual(daemonBindHost, .external)
+        exp.fulfill()
+      }
+    }
+
+    let result = host.start(makeSpec(profileID: "chat", daemonBindHost: .external))
+    if case .failure(let err) = result {
+      XCTFail("start must succeed on a fresh host: \(err)")
+    }
+
     wait(for: [exp], timeout: 2)
     token.cancel()
   }

@@ -56,7 +56,7 @@ struct LocalAPIView: View {
   private var posture: EngineHTTPPosture { EngineHTTPPosture.make(bindMode: bindMode) }
 
   private var runtimeProfileID: String? {
-    if case .running(_, let profileID) = engineStatusStore.status { return profileID }
+    if case .running(_, let profileID, _) = engineStatusStore.status { return profileID }
     return nil
   }
 
@@ -94,7 +94,7 @@ struct LocalAPIView: View {
       if serving { engineActionError = nil }
     }
     .onChange(of: engineStatusStore.status) { _, newStatus in
-      if case .running(_, let profileID) = newStatus {
+      if case .running(_, let profileID, _) = newStatus {
         selectedProfileID = profileID
       } else if selectedProfileID == nil {
         selectedProfileID = profileStore.activeProfileID ?? profileOptions.first?.id

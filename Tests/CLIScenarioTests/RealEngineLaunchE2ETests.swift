@@ -114,7 +114,7 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
       switch host.status {
-      case .running(let port, _):
+      case .running(let port, _, _):
         return Int(port)
       case .failed(let code, let message):
         XCTFail("engine entered .failed(\(code.rawValue)): \(message)")

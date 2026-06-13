@@ -759,8 +759,12 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     switch status {
     case .starting:
       Diag.helper.event("engine.start")
-    case let .running(port, profileID):
-      Diag.helper.event("engine.ready", [("port", String(port)), ("profile", profileID)])
+    case let .running(port, profileID, daemonBindHost):
+      Diag.helper.event("engine.ready", [
+        ("port", String(port)),
+        ("profile", profileID),
+        ("daemonBindHost", daemonBindHost.rawValue),
+      ])
     case let .failed(code, _):
       Diag.helper.event("engine.fail", [("code", code.rawValue)])
     case .stopped:

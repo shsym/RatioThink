@@ -147,7 +147,7 @@ public struct HelperStatusItemModel: Equatable, Sendable {
                                  enabled: true,
                                  action: .pause)
       )
-    case .running(let port, let profileID):
+    case .running(let port, let profileID, _):
       return HelperStatusItemModel(
         dot: .running,
         engineLabel: "Engine: running — \(profileID) @ port \(port)",
