@@ -897,11 +897,6 @@ struct ChatScaffoldView: View {
       // + forces greedy; a normal or tree-of-thought profile carries none.
       // Built once here so both the ToT dispatch and the normal send get it.
       speculation: profileStore.speculation(forProfileID: viewModel.selectedProfileID),
-      // #572: thread the selected profile's output-constraint mode. A "JSON
-      // Think" profile attaches `response_format: json_object` so chat-apc runs
-      // JSON-grammar-constrained decoding; other profiles carry none. Built
-      // here so both the ToT dispatch and the normal send get it.
-      responseFormat: profileStore.responseFormat(forProfileID: viewModel.selectedProfileID),
       // #474: the launched engine's effective max_tokens ceiling, learned
       // from GET /v1/models during resident-model reconcile. `makeRequest`
       // clamps the profile's max_tokens down to this so a memory-squeezed
@@ -910,7 +905,13 @@ struct ChatScaffoldView: View {
       // #524: seed chat-apc's APC snapshot-retention policy from the latest
       // authoritative pie `model_status` KV counters. Nil/unknown means the
       // inferlet must retain rather than guess.
-      kvUsageSnapshot: engineStatusStore.kvUsageSnapshot(for: modelID)
+      kvUsageSnapshot: engineStatusStore.kvUsageSnapshot(for: modelID),
+      // #572: thread the selected profile's output-constraint mode. A "JSON
+      // Think" profile attaches `response_format: json_object` so chat-apc runs
+      // JSON-grammar-constrained decoding; other profiles carry none. Built
+      // here so both the ToT dispatch and the normal send get it. Ordered last
+      // to match the `ChatSendRequestOptions` init parameter order.
+      responseFormat: profileStore.responseFormat(forProfileID: viewModel.selectedProfileID)
     )
 
     // #413: when the active profile declares `mode = "tree-of-thought"`,

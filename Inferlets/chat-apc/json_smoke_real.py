@@ -76,13 +76,22 @@ PROMPT = (
 )
 
 
-def _check_json_content(label: str, content: str, reasoning: str, failures: list[str]) -> None:
+_JSON_START = set('{["-0123456789tfn')
+
+
+def _check_json_content(label: str, content: str, reasoning: str, failures: list[str],
+                        require_parse: bool = True) -> None:
     print(f"[smoke] {label}: content={content!r}")
     print(f"[smoke] {label}: reasoning_len={len(reasoning)}")
     if "<think>" in content or "</think>" in content:
         failures.append(f"{label}: reasoning delimiter leaked into content: {content!r}")
-    if not content.strip():
+    stripped = content.lstrip()
+    if not stripped:
         failures.append(f"{label}: empty content (expected a JSON value)")
+        return
+    if stripped[0] not in _JSON_START:
+        failures.append(f"{label}: content does not begin with a JSON value: {content!r}")
+    if not require_parse:
         return
     try:
         parsed = json.loads(content)
@@ -165,6 +174,29 @@ async def main() -> int:
                             if delta.get("reasoning_content"):
                                 reasoning += delta["reasoning_content"]
                         _check_json_content("stream", content, reasoning, failures)
+
+                    # Phase-1 mid-<think> truncation regression (#572): a tiny
+                    # token budget means a thinking model NEVER reaches </think>
+                    # in phase 1 — it hits the cap mid-block, so the reasoning
+                    # gate is still latched entering phase 2. Phase 2 must STILL
+                    # emit JSON content (raw_content), not silently swallow it as
+                    # reasoning. Content is expected to truncate (finish=length),
+                    # so we assert non-empty + begins-with-JSON-value, not parse.
+                    r = await http_c.post(f"{base}/v1/chat/completions", json={
+                        "model": MODEL,
+                        "messages": [{"role": "user", "content": PROMPT}],
+                        "max_tokens": 16,
+                        "response_format": {"type": "json_object"},
+                        "stream": False,
+                    })
+                    print(f"[smoke] tiny-budget non-stream -> {r.status_code}")
+                    if r.status_code != 200:
+                        failures.append(f"tiny-budget status {r.status_code}: {r.text[:300]!r}")
+                    else:
+                        m = json.loads(r.text)["choices"][0]["message"]
+                        _check_json_content(
+                            "tiny-budget", m.get("content") or "", m.get("reasoning_content") or "",
+                            failures, require_parse=False)
             finally:
                 drain.cancel()
         finally:

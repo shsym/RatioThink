@@ -686,14 +686,23 @@ impl JsonSink<'_> {
 
 /// Per-phase knobs for [`run_json_phase`].
 struct JsonPhaseOpts {
-    /// Forward reasoning text to the sink (Phase 1 only).
+    /// Forward reasoning text to the sink (Phase 1 only). Drives the
+    /// reasoning demux.
     emit_reasoning: bool,
     /// Forward visible content to the sink (Phase 2 only).
     emit_content: bool,
     /// Phase-1 semantics: stop the moment the reasoning block closes OR the
     /// first visible-content batch appears (so a non-thinking model yields
-    /// to the constrained phase immediately).
+    /// to the constrained phase immediately). Drives the reasoning demux.
     stop_after_reasoning: bool,
+    /// Phase-2 semantics: emit EVERY decoded chat delta as content without
+    /// the `content_visible` reasoning gate. Phase 2 runs under a JSON
+    /// grammar that cannot emit a `<think>` block, so its output is
+    /// definitionally the answer — there is nothing to suppress. This is
+    /// load-bearing: when Phase 1 ends mid-`<think>` (a thinking model that
+    /// exhausts its budget before `</think>`), the reasoning gate would
+    /// otherwise stay latched and silently swallow the entire JSON answer.
+    raw_content: bool,
     /// Hard cap on tokens generated in this phase.
     max_tokens: usize,
 }
@@ -784,49 +793,56 @@ async fn run_json_phase(
             };
         }
 
-        // Reasoning demux — identical gate to the canonical loop.
-        let was_in_reasoning = *in_reasoning;
-        let mut reason_idle = false;
-        let mut reasoning_ended = false;
-        match reason_dec.feed(&out.tokens) {
-            Ok(inferlet::reasoning::Event::Start) => *in_reasoning = true,
-            Ok(inferlet::reasoning::Event::Delta(s)) => {
-                *in_reasoning = true;
-                if opts.emit_reasoning {
-                    emit_or_bail!(sink.reasoning_delta(&s));
+        // Reasoning demux — only the reasoning phase needs it (to emit
+        // reasoning and to detect the </think> / first-visible stop). Phase
+        // 2 skips it entirely: it emits raw JSON content (see below), and
+        // feeding the host reasoning decoder there would mis-latch on the
+        // leftover mid-`<think>` state from a budget-truncated Phase 1.
+        let mut visible = true;
+        if opts.emit_reasoning || opts.stop_after_reasoning {
+            let was_in_reasoning = *in_reasoning;
+            let mut reason_idle = false;
+            let mut reasoning_ended = false;
+            match reason_dec.feed(&out.tokens) {
+                Ok(inferlet::reasoning::Event::Start) => *in_reasoning = true,
+                Ok(inferlet::reasoning::Event::Delta(s)) => {
+                    *in_reasoning = true;
+                    if opts.emit_reasoning {
+                        emit_or_bail!(sink.reasoning_delta(&s));
+                    }
+                }
+                Ok(inferlet::reasoning::Event::End(_)) => {
+                    *in_reasoning = false;
+                    reasoning_ended = true;
+                }
+                Ok(inferlet::reasoning::Event::Idle) => reason_idle = true,
+                Err(e) => {
+                    return JsonPhaseResult {
+                        outcome: Outcome::Aborted,
+                        error_diag: Some(("reasoning_decode_failed", e.to_string())),
+                        disconnected: false,
+                    };
                 }
             }
-            Ok(inferlet::reasoning::Event::End(_)) => {
-                *in_reasoning = false;
-                reasoning_ended = true;
-            }
-            Ok(inferlet::reasoning::Event::Idle) => reason_idle = true,
-            Err(e) => {
+            visible = content_visible(reason_idle, was_in_reasoning);
+
+            // Phase 1 stops as soon as reasoning ends OR the first visible
+            // batch appears (covers thinking AND non-thinking models). The
+            // visible batch is intentionally NOT emitted here (emit_content
+            // is false in Phase 1); its tokens are already staged in the
+            // context buffer and flow into Phase 2 as plain conditioning
+            // context.
+            if opts.stop_after_reasoning && (reasoning_ended || visible) {
                 return JsonPhaseResult {
-                    outcome: Outcome::Aborted,
-                    error_diag: Some(("reasoning_decode_failed", e.to_string())),
+                    outcome: Outcome::Natural,
+                    error_diag: None,
                     disconnected: false,
                 };
             }
         }
 
-        let visible = content_visible(reason_idle, was_in_reasoning);
-
-        // Phase 1 stops as soon as reasoning ends OR the first visible
-        // batch appears (covers thinking AND non-thinking models). The
-        // visible batch is intentionally NOT emitted here (emit_content is
-        // false in Phase 1); its tokens are already staged in the context
-        // buffer and flow into Phase 2 as plain conditioning context.
-        if opts.stop_after_reasoning && (reasoning_ended || visible) {
-            return JsonPhaseResult {
-                outcome: Outcome::Natural,
-                error_diag: None,
-                disconnected: false,
-            };
-        }
-
         match chat_dec.feed(&out.tokens) {
-            Ok(chat::Event::Delta(s)) if opts.emit_content && visible => {
+            Ok(chat::Event::Delta(s)) if opts.emit_content && (opts.raw_content || visible) => {
                 emit_or_bail!(sink.content_delta(&s));
             }
             Ok(chat::Event::Delta(_)) => {}
@@ -3028,6 +3044,7 @@ async fn handle_streaming(
                     emit_reasoning: true,
                     emit_content: false,
                     stop_after_reasoning: true,
+                    raw_content: false,
                     max_tokens,
                 },
             )
@@ -3057,6 +3074,7 @@ async fn handle_streaming(
                         emit_reasoning: false,
                         emit_content: true,
                         stop_after_reasoning: false,
+                        raw_content: true,
                         max_tokens,
                     },
                 )
@@ -3633,6 +3651,7 @@ async fn handle_non_streaming(
                     emit_reasoning: true,
                     emit_content: false,
                     stop_after_reasoning: true,
+                    raw_content: false,
                     max_tokens,
                 },
             )
@@ -3657,6 +3676,7 @@ async fn handle_non_streaming(
                         emit_reasoning: false,
                         emit_content: true,
                         stop_after_reasoning: false,
+                        raw_content: true,
                         max_tokens,
                     },
                 )
