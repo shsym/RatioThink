@@ -253,21 +253,23 @@ async def main() -> int:
                     # for a >=96-token continuation: plain-vs-plain must be
                     # stable, and both rebuilt-per-request and persisted-sidecar
                     # speculation must stay greedy-identical.
+                    # `/no_think` keeps the reasoning block empty and
+                    # deterministic (`<think>\n\n</think>`) — a minimal think
+                    # boundary that a warmed sidecar tends to accept together
+                    # with the following content in a single multi-token
+                    # speculative batch. That batch is the #466 regression
+                    # trigger for reasoning text dropped at the close.
                     warm_messages = [{
                         "role": "user",
                         "content": (
                             "Output exactly this sequence, with spaces, and no commentary: "
                             + "red blue green yellow orange purple " * 14
-                        ).strip(),
+                        ).strip() + " /no_think",
                     }]
-                    cont_messages = warm_messages + [{
-                        "role": "user",
-                        "content": (
-                            "Continue the same color sequence for fourteen more repetitions. "
-                            "Output only the sequence, with spaces, no bullets, no explanation."
-                        ),
-                    }]
-                    gate_common = {"model": MODEL, "messages": cont_messages, "temperature": 0, "max_tokens": 96}
+                    continuation_user = (
+                        "Continue the same color sequence for fourteen more repetitions. "
+                        "Output only the sequence, with spaces, no bullets, no explanation. /no_think"
+                    )
                     spec_rebuilt = {"enabled": True, "leader_len": 1, "draft_len": 3}
                     spec_sidecar = {
                         **spec_rebuilt,
@@ -275,6 +277,7 @@ async def main() -> int:
                         "profile_id": "determinism-gate",
                     }
                     async with httpx.AsyncClient(timeout=300) as http_c:
+                        # Turn 1 warms the per-thread sidecar.
                         warm_sidecar = await http_c.post(
                             f"{base}/v1/chat/completions",
                             json={
@@ -285,6 +288,22 @@ async def main() -> int:
                                 "speculation": spec_sidecar,
                             },
                         )
+                        # A real chat client echoes the assistant turn back.
+                        # The continuation lineage [user, assistant, user2]
+                        # must extend the persisted lineage [user, assistant]
+                        # or the sidecar (correctly) forks and never reuses —
+                        # the earlier gate omitted this and silently tested a
+                        # COLD cache.
+                        warm_assistant = ""
+                        if warm_sidecar.status_code == 200:
+                            warm_assistant = (
+                                json.loads(warm_sidecar.text)["choices"][0]["message"].get("content") or ""
+                            )
+                        cont_messages = warm_messages + [
+                            {"role": "assistant", "content": warm_assistant},
+                            {"role": "user", "content": continuation_user},
+                        ]
+                        gate_common = {"model": MODEL, "messages": cont_messages, "temperature": 0, "max_tokens": 96}
                         gate_responses = {
                             "plain1": await http_c.post(f"{base}/v1/chat/completions", json=gate_common),
                             "plain2": await http_c.post(f"{base}/v1/chat/completions", json=gate_common),
@@ -299,6 +318,8 @@ async def main() -> int:
                         }
                     if warm_sidecar.status_code != 200:
                         failures.append(f"96-token sidecar warmup status {warm_sidecar.status_code}: {warm_sidecar.text[:200]!r}")
+                    elif not warm_assistant.strip():
+                        failures.append("96-token warm turn produced empty assistant content; continuation cannot reuse the sidecar")
                     if warm_sidecar.status_code != 200 or any(r.status_code != 200 for r in gate_responses.values()):
                         failures.append(
                             "96-token determinism gate non-200: "
@@ -332,6 +353,38 @@ async def main() -> int:
                             _compare_token_ids("plain1", "plain2", ids)
                             _compare_token_ids("plain1", "rebuilt", ids)
                             _compare_token_ids("plain1", "persisted", ids)
+
+                            # The persisted sidecar must actually REUSE the
+                            # warmed table on a real same-thread continuation
+                            # (not silently fork to a cold cache).
+                            persisted_sm = gate_bodies["persisted"].get("spec_metrics") or {}
+                            rebuilt_sm = gate_bodies["rebuilt"].get("spec_metrics") or {}
+                            sidecar_status = persisted_sm.get("ngram_sidecar_status")
+                            if sidecar_status != "reused":
+                                failures.append(
+                                    "96-token persisted sidecar did not reuse the warmed table: "
+                                    f"ngram_sidecar_status={sidecar_status!r} "
+                                    f"leaders={persisted_sm.get('ngram_sidecar_leaders')}"
+                                )
+                            # Warming must not COST throughput: the warmed
+                            # cache proposes more drafts, so the acceptance
+                            # RATE can dip while absolute work drops. Gate on
+                            # the honest signals — accepted-token count and
+                            # decode steps — not the proposal-normalized rate.
+                            p_acc = persisted_sm.get("accepted_draft_tokens", 0) or 0
+                            r_acc = rebuilt_sm.get("accepted_draft_tokens", 0) or 0
+                            p_steps = persisted_sm.get("decode_steps", 0) or 0
+                            r_steps = rebuilt_sm.get("decode_steps", 0) or 0
+                            print(
+                                f"[smoke] 96-token warming accepted persisted/rebuilt={p_acc}/{r_acc} "
+                                f"decode_steps={p_steps}/{r_steps}"
+                            )
+                            if p_acc < r_acc or (r_steps and p_steps > r_steps):
+                                failures.append(
+                                    "96-token warmed sidecar did not help: "
+                                    f"accepted persisted/rebuilt={p_acc}/{r_acc}, "
+                                    f"decode_steps={p_steps}/{r_steps} (want accepted>= and steps<=)"
+                                )
 
                 # #418 x tool_choice: speculation gates OFF when a tool call
                 # is FORCED (sampler constrained to the tool-call grammar).

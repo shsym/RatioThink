@@ -3397,6 +3397,9 @@ async fn handle_streaming(
                 0,
                 0,
                 Duration::ZERO,
+                // JSON Think runs Plain/json_constrained with speculation
+                // gated off, so there is no Cacheback sidecar to report.
+                None,
             );
             report.log_spec_stats();
             let frame = SpecMetricsSse {
@@ -3469,6 +3472,11 @@ async fn handle_streaming(
     let mut pending_tool: Option<PendingToolCall> = None;
     let mut sidecar_assistant_content = String::new();
     let mut in_reasoning = false;
+    // #466: reasoning text already streamed as `reasoning_content` deltas.
+    // On a reasoning `End(s)` we emit only the un-streamed suffix so text
+    // that arrived in the SAME multi-token batch as the closing boundary
+    // (one `End` event, no prior `Delta`) is not dropped.
+    let mut reasoning_streamed = String::new();
     // #522: visible assistant text, captured so the prefix cache can save
     // the canonical next-turn boundary. Only used when `cache_plan` is
     // engaged.
@@ -3545,6 +3553,7 @@ async fn handle_streaming(
             }
             Ok(inferlet::reasoning::Event::Delta(s)) => {
                 in_reasoning = true;
+                reasoning_streamed.push_str(&s);
                 let chunk = ChatCompletionChunk {
                     id: &id,
                     object: "chat.completion.chunk",
@@ -3561,8 +3570,34 @@ async fn handle_streaming(
                 };
                 try_emit!(em, &chunk, "reasoning_delta");
             }
-            Ok(inferlet::reasoning::Event::End(_)) => {
+            Ok(inferlet::reasoning::Event::End(s)) => {
                 in_reasoning = false;
+                // #466: a multi-token speculative batch can carry the
+                // reasoning text AND the closing boundary in one feed, so
+                // the decoder reports it only via `End(s)` with no prior
+                // `Delta`. Emit the un-streamed suffix so that text is not
+                // dropped; if `End(s)` disagrees with the streamed deltas
+                // (detok re-segmentation) trust the deltas (F5 parity).
+                if let Some(residual) = s.strip_prefix(reasoning_streamed.as_str()) {
+                    if !residual.is_empty() {
+                        let chunk = ChatCompletionChunk {
+                            id: &id,
+                            object: "chat.completion.chunk",
+                            created,
+                            model: &req.model,
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    reasoning_content: Some(residual),
+                                    ..Default::default()
+                                },
+                                finish_reason: None,
+                            }],
+                        };
+                        reasoning_streamed.push_str(residual);
+                        try_emit!(em, &chunk, "reasoning_delta");
+                    }
+                }
             }
             Ok(inferlet::reasoning::Event::Idle) => {
                 reason_idle = true;
@@ -4060,6 +4095,9 @@ async fn handle_non_streaming(
                 0,
                 0,
                 Duration::ZERO,
+                // JSON Think runs Plain/json_constrained with speculation
+                // gated off, so there is no Cacheback sidecar to report.
+                None,
             );
             report.log_spec_stats();
             Some(report)
@@ -4216,16 +4254,21 @@ async fn handle_non_streaming(
                 in_reasoning = true;
                 reasoning_text.push_str(&s);
             }
-            // F5: discard the End payload to stay byte-identical with
-            // the streaming branch (which also ignores it). The
-            // delta-stitched `reasoning_text` is the single source of
-            // truth across stream + non-stream; trusting `End(s)` on
-            // one branch and not the other made the same prompt
-            // produce divergent `reasoning_content` on `stream:true`
-            // vs `stream:false` whenever the decoder's End payload
-            // disagreed with the accumulated deltas.
-            Ok(inferlet::reasoning::Event::End(_)) => {
+            // #466: recover reasoning text that arrived in the SAME
+            // multi-token batch as the closing boundary. A warmed
+            // speculative cache can make the engine accept the reasoning
+            // token(s) and `</think>` together, so the decoder reports
+            // them only via `End(s)` with no prior `Delta` and the
+            // delta-stitched `reasoning_text` would miss them. Append only
+            // the un-streamed suffix. If `End(s)` disagrees with the
+            // accumulated deltas (detok re-segmentation) trust the deltas,
+            // which keeps stream + non-stream byte-identical (F5 parity:
+            // the streaming branch applies the identical suffix rule).
+            Ok(inferlet::reasoning::Event::End(s)) => {
                 in_reasoning = false;
+                if s.starts_with(reasoning_text.as_str()) {
+                    reasoning_text = s;
+                }
             }
             Ok(inferlet::reasoning::Event::Idle) => {
                 reason_idle = true;
@@ -5061,8 +5104,14 @@ mod tests {
     enum Step {
         ThinkStart(&'static str), // reasoning Start; chat surfaces the `<think>` text
         Reason(&'static str),     // reasoning Delta; chat surfaces the same text
-        ThinkEnd(&'static str),   // reasoning End/Complete; chat surfaces the `</think>` text
-        Content(&'static str),    // reasoning Idle (outside); chat surfaces visible content
+        // reasoning End/Complete. `.0` is the decoder's FULL accumulated
+        // reasoning text for the block (what `End(s)` carries); `.1` is the
+        // chat `</think>` delimiter surfaced on the suppressed chat channel.
+        // A multi-token speculative batch that contains reasoning text AND
+        // the boundary arrives as a single `End(s)` with no prior `Delta`,
+        // so `.0` can be longer than the streamed `Reason` deltas.
+        ThinkEnd(&'static str, &'static str),
+        Content(&'static str), // reasoning Idle (outside); chat surfaces visible content
     }
 
     /// Replays the generation loop's reasoning/content demux exactly as
@@ -5087,9 +5136,16 @@ mod tests {
                     reasoning.push_str(t);
                     *t
                 }
-                Step::ThinkEnd(t) => {
+                Step::ThinkEnd(end_s, close) => {
                     in_reasoning = false;
-                    *t
+                    // Mirror the production End arm: recover reasoning text
+                    // that arrived in the SAME batch as the boundary by
+                    // appending only the un-streamed suffix; fall back to
+                    // trusting the streamed deltas if `End(s)` disagrees.
+                    if let Some(residual) = end_s.strip_prefix(reasoning.as_str()) {
+                        reasoning.push_str(residual);
+                    }
+                    *close
                 }
                 Step::Content(t) => {
                     reason_idle = true;
@@ -5106,10 +5162,12 @@ mod tests {
     #[test]
     fn think_delimiters_never_leak_into_visible_content() {
         // A canonical Qwen reasoning turn: <think> reasoning </think> answer.
+        // End(s) carries the full accumulated reasoning, already streamed
+        // via the Reason delta, so the End residual is empty.
         let (content, reasoning) = demux(&[
             Step::ThinkStart("<think>"),
             Step::Reason("the user said hi"),
-            Step::ThinkEnd("</think>"),
+            Step::ThinkEnd("the user said hi", "</think>"),
             Step::Content("Hello!"),
         ]);
         assert_eq!(content, "Hello!", "only the answer reaches visible content");
@@ -5123,6 +5181,57 @@ mod tests {
             !content.contains("<think>"),
             "opening delimiter leaked: {content:?}"
         );
+    }
+
+    #[test]
+    fn reasoning_in_same_batch_as_close_is_not_dropped() {
+        // Speculative regression (#466): a warmed n-gram cache can make the
+        // engine accept the reasoning token(s) AND the closing boundary in a
+        // single multi-token batch. The reasoning decoder then fires only
+        // `End(s)` (one event per feed) with no prior `Delta`, so trusting
+        // the streamed deltas alone drops the reasoning text. The empty
+        // `/no_think` block (`<think>\n\n</think>`) is the minimal trigger.
+        let (content, reasoning) = demux(&[
+            Step::ThinkStart("<think>"),
+            // No Reason delta: the `\n\n` and the close arrive together, so
+            // the decoder reports the reasoning only inside End(s).
+            Step::ThinkEnd("\n\n", "</think>"),
+            Step::Content("\n\nred blue green"),
+        ]);
+        assert_eq!(
+            reasoning, "\n\n",
+            "same-batch reasoning text must survive the close boundary"
+        );
+        assert_eq!(content, "\n\nred blue green");
+    }
+
+    #[test]
+    fn partial_streamed_reasoning_recovers_only_the_unstreamed_suffix() {
+        // The last reasoning token shares the batch with the close: part of
+        // the reasoning streamed via Delta, the rest rides End(s). Only the
+        // un-streamed suffix is appended — no duplication of the streamed
+        // prefix, and the dropped tail is recovered.
+        let (_content, reasoning) = demux(&[
+            Step::ThinkStart("<think>"),
+            Step::Reason("the user "),
+            Step::ThinkEnd("the user said hi", "</think>"),
+            Step::Content("answer"),
+        ]);
+        assert_eq!(reasoning, "the user said hi");
+    }
+
+    #[test]
+    fn end_payload_disagreeing_with_streamed_deltas_is_discarded() {
+        // F5 invariant: if End(s) is NOT a clean superset of the streamed
+        // deltas (detokenization re-segmentation), trust the deltas so
+        // stream and non-stream stay byte-identical.
+        let (_content, reasoning) = demux(&[
+            Step::ThinkStart("<think>"),
+            Step::Reason("the user said hi"),
+            Step::ThinkEnd("DIFFERENT accumulated text", "</think>"),
+            Step::Content("answer"),
+        ]);
+        assert_eq!(reasoning, "the user said hi");
     }
 
     #[test]
@@ -5187,6 +5296,10 @@ mod tests {
                 rejected: 2,
                 steps: 2,
                 generated: 6,
+                cache_hits: 0,
+                cache_misses: 0,
+                cache_size: 0,
+                accepted_prefix_hist: Vec::new(),
             },
             6,
             2,
@@ -5767,7 +5880,13 @@ mod tests {
         // drafter must not engage even when requested + greedy. The
         // fallback reason names the JSON gate, distinct from the
         // tool-choice gate, and is checked first.
-        let s = SpecRequest { enabled: true, leader_len: None, draft_len: None };
+        let s = SpecRequest {
+            enabled: true,
+            leader_len: None,
+            draft_len: None,
+            thread_id: None,
+            profile_id: None,
+        };
         let (st, fb, want, _) = plan_strategy(Some(&s), true, false, true);
         assert!(matches!(st, DecodeStrategy::Plain));
         assert_eq!(fb, Some("json_constrained"));

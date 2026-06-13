@@ -246,7 +246,7 @@ impl inferlet::Speculator for CachebackDrafter {
         self.cursor += accepted.len() as u32;
         // Record cache growth after this step's tokens are ingested; the
         // final accept leaves the end-of-turn cache size.
-        self.metrics.lock().unwrap().cache_size = self.cache.len();
+        self.metrics.lock().unwrap().cache_size = self.cache.lock().unwrap().len();
         // The prefill step's output has now been committed; drafts may
         // engage from the next (pure decode) step.
         self.prefilled = true;
