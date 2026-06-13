@@ -44,7 +44,7 @@ final class HelperResumeActionTests: XCTestCase {
     let outcome = HelperResumeAction.run(
       engineHost: makeEngineHost(),
       profileStore: nil,
-      resolver: { _ in .success(self.makeSpec(profileID: "chat")) }
+      resolver: { _, _ in .success(self.makeSpec(profileID: "chat")) }
     )
     XCTAssertEqual(outcome, .profileStoreMissing)
   }
@@ -73,7 +73,7 @@ final class HelperResumeActionTests: XCTestCase {
     let outcome = HelperResumeAction.run(
       engineHost: engineHost,
       profileStore: store,
-      resolver: { _ in
+      resolver: { _, _ in
         resolverCalls.increment()
         return .success(self.makeSpec(profileID: "chat"))
       }
@@ -97,7 +97,7 @@ final class HelperResumeActionTests: XCTestCase {
     let store = try makeStoreWithChatProfile(active: "ghost")
     defer { store.stop() }
     let resolverCalls = AtomicCounter()
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { id in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, _ in
       resolverCalls.increment()
       return .failure(EngineError(code: .profileMissing,
                                   message: "no profile with id=\(id)"))
@@ -159,7 +159,7 @@ final class HelperResumeActionTests: XCTestCase {
     let outcome = HelperResumeAction.run(
       engineHost: makeEngineHost(),
       profileStore: store,
-      resolver: { _ in .success(self.makeSpec(profileID: "chat")) }
+      resolver: { _, _ in .success(self.makeSpec(profileID: "chat")) }
     )
     if case .activeProfileUnreadableAfterRetry(let err) = outcome {
       if case .activeProfileReadFailed = err {
@@ -210,7 +210,7 @@ final class HelperResumeActionTests: XCTestCase {
     let fakeBin = try writeFakePie(port: 52525)
     let engineHost = makeEngineHost()
     defer { engineHost.stop() }
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { id in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, _ in
       .success(self.makeSpec(profileID: id))
     }
     let outcome = HelperResumeAction.run(
@@ -258,7 +258,7 @@ final class HelperResumeActionTests: XCTestCase {
 
     let engineHost = makeEngineHost()
     defer { engineHost.stop() }
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { _ in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { _, _ in
       XCTFail("resolver must not be invoked when retry heals to absent")
       return .failure(EngineError(code: .profileMissing, message: "unreachable"))
     }
@@ -282,7 +282,7 @@ final class HelperResumeActionTests: XCTestCase {
     defer { engineHost.stop() }
 
     let resolverCalls = AtomicCounter()
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { id in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, _ in
       resolverCalls.increment()
       return .success(self.makeSpec(profileID: id))
     }
@@ -298,12 +298,120 @@ final class HelperResumeActionTests: XCTestCase {
     // supervisor.start was actually invoked: wait for handshake so we
     // confirm the fake pie was spawned (not just .starting).
     waitForRunning(engineHost, timeout: 5)
-    if case .running(let port, let profileID) = engineHost.status {
-      XCTAssertEqual(port, 47474)
-      XCTAssertEqual(profileID, "chat")
+    if case .running(let snap) = engineHost.status {
+      XCTAssertEqual(snap.port, 47474)
+      XCTAssertEqual(snap.profileID, "chat")
     } else {
       XCTFail("expected engineHost to reach .running after Resume, got \(engineHost.status)")
     }
+  }
+
+  // MARK: - #469: Resume honors the durable active-model marker
+
+  func test_resume_passes_activeModel_marker_to_resolver() throws {
+    // The user's last pick lives in the durable active-model marker. A
+    // stopped-engine Resume must boot THAT model (as the resolver's explicit
+    // override), not silently revert to the profile default.
+    let store = try makeStoreWithChatProfile(active: "chat")
+    defer { store.stop() }
+    try store.setActiveModelID("Org/Repo/picked.gguf")
+
+    let captured = CapturedModel()
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, model in
+      captured.value = model
+      captured.wasNil = (model == nil)
+      return .success(self.makeSpec(profileID: id))
+    }
+    let engineHost = makeEngineHost()
+    defer { engineHost.stop() }
+    let outcome = HelperResumeAction.run(
+      engineHost: engineHost, profileStore: store, resolver: resolver)
+
+    XCTAssertEqual(outcome, .started(profileID: "chat"))
+    XCTAssertEqual(captured.value, "Org/Repo/picked.gguf",
+                   "Resume must pass the active-model marker as the resolver's explicit boot model")
+  }
+
+  func test_resume_passes_nil_when_no_activeModel_marker() throws {
+    // Never launched → no marker → the resolver falls back to the profile
+    // default (it receives a nil override).
+    let store = try makeStoreWithChatProfile(active: "chat")
+    defer { store.stop() }
+
+    let captured = CapturedModel()
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, model in
+      captured.value = model
+      captured.wasNil = (model == nil)
+      return .success(self.makeSpec(profileID: id))
+    }
+    let engineHost = makeEngineHost()
+    defer { engineHost.stop() }
+    _ = HelperResumeAction.run(
+      engineHost: engineHost, profileStore: store, resolver: resolver)
+
+    XCTAssertTrue(captured.wasNil,
+                  "with no active-model marker the resolver must receive nil → profile default")
+  }
+
+  // MARK: - #469 F1: stale active-model marker falls back to the profile default
+
+  func test_resume_stale_marker_modelMissing_retries_profile_default() throws {
+    // The marker names a model deleted/evicted out from under it. The
+    // marker-driven resolve fails modelMissing; Resume must retry the profile
+    // default (which is still valid) rather than dead-end on the missing pick.
+    let store = try makeStoreWithChatProfile(active: "chat")
+    defer { store.stop() }
+    try store.setActiveModelID("Org/Deleted/gone.gguf")
+
+    let captured = CapturedModel()
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, model in
+      captured.value = model      // last call's override
+      captured.wasNil = (model == nil)
+      if model == "Org/Deleted/gone.gguf" {
+        return .failure(EngineError(code: .modelMissing, message: "model gone"))
+      }
+      return .success(self.makeSpec(profileID: id))   // nil (profile default) resolves
+    }
+    let engineHost = makeEngineHost()
+    defer { engineHost.stop() }
+    let outcome = HelperResumeAction.run(
+      engineHost: engineHost, profileStore: store, resolver: resolver)
+
+    XCTAssertEqual(outcome, .started(profileID: "chat"),
+                   "a stale marker (modelMissing) must retry the profile default, not dead-end; got \(outcome)")
+    XCTAssertTrue(captured.wasNil, "the retry must resolve with the profile default (nil override)")
+  }
+
+  func test_resume_marker_and_default_both_missing_surfaces_modelMissing() throws {
+    // Marker missing AND the profile default also missing → the single retry
+    // also fails → surface the original modelMissing (no dead-loop, real error).
+    let store = try makeStoreWithChatProfile(active: "chat")
+    defer { store.stop() }
+    try store.setActiveModelID("Org/Deleted/gone.gguf")
+    let err = EngineError(code: .modelMissing, message: "nothing resolves")
+    let engineHost = makeEngineHost()
+    let outcome = HelperResumeAction.run(
+      engineHost: engineHost, profileStore: store,
+      resolver: { _, _ in .failure(err) })   // both marker and default fail
+    XCTAssertEqual(outcome, .resolverFailed(err),
+                   "when both the marker and the profile default are missing, the real error must surface")
+  }
+
+  func test_resume_marker_non_modelMissing_failure_does_not_retry() throws {
+    // A non-modelMissing marker failure (e.g. memoryRisk) must NOT retry the
+    // default — the model is present but unsafe; retrying would not help and
+    // the reason must surface as-is.
+    let store = try makeStoreWithChatProfile(active: "chat")
+    defer { store.stop() }
+    try store.setActiveModelID("Org/Big/huge.gguf")
+    let calls = AtomicCounter()
+    let err = EngineError(code: .memoryRisk, message: "too large")
+    let engineHost = makeEngineHost()
+    let outcome = HelperResumeAction.run(
+      engineHost: engineHost, profileStore: store,
+      resolver: { _, _ in calls.increment(); return .failure(err) })
+    XCTAssertEqual(outcome, .resolverFailed(err))
+    XCTAssertEqual(calls.value, 1, "a non-modelMissing marker failure must not trigger the default retry")
   }
 
   // MARK: - resolver failure
@@ -316,7 +424,7 @@ final class HelperResumeActionTests: XCTestCase {
     let outcome = HelperResumeAction.run(
       engineHost: engineHost,
       profileStore: store,
-      resolver: { _ in .failure(err) }
+      resolver: { _, _ in .failure(err) }
     )
     XCTAssertEqual(outcome, .resolverFailed(err))
     XCTAssertEqual(engineHost.status, .failed(code: .spawnFailed, message: err.message),
@@ -337,7 +445,7 @@ final class HelperResumeActionTests: XCTestCase {
     let outcome = HelperResumeAction.run(
       engineHost: engineHost,
       profileStore: store,
-      resolver: { _ in .failure(err) }
+      resolver: { _, _ in .failure(err) }
     )
 
     XCTAssertEqual(outcome, .resolverFailed(err))
@@ -355,7 +463,7 @@ final class HelperResumeActionTests: XCTestCase {
     let outcome = HelperResumeAction.run(
       engineHost: engineHost,
       profileStore: store,
-      resolver: { _ in .failure(err) }
+      resolver: { _, _ in .failure(err) }
     )
 
     XCTAssertEqual(outcome, .resolverFailed(err))
@@ -372,7 +480,7 @@ final class HelperResumeActionTests: XCTestCase {
     let engineHost = makeEngineHost()
     defer { engineHost.stop() }
 
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { id in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, _ in
       .success(self.makeSpec(profileID: id))
     }
     // First resume drives supervisor to .running.
@@ -413,7 +521,7 @@ final class HelperResumeActionTests: XCTestCase {
     // `.started(profileID:)` outcome reflects the resolved selection.
     let before = HelperResumeAction.run(
       engineHost: makeEngineHost(), profileStore: store,
-      resolver: { id in .success(self.makeSpec(profileID: id)) }
+      resolver: { id, _ in .success(self.makeSpec(profileID: id)) }
     )
     XCTAssertEqual(before, .started(profileID: "chat"),
                    "Resume must start the active-profile marker (chat)")
@@ -424,7 +532,7 @@ final class HelperResumeActionTests: XCTestCase {
 
     let after = HelperResumeAction.run(
       engineHost: makeEngineHost(), profileStore: store,
-      resolver: { id in .success(self.makeSpec(profileID: id)) }
+      resolver: { id, _ in .success(self.makeSpec(profileID: id)) }
     )
     XCTAssertEqual(after, .started(profileID: "beta"),
                    "after a swap updates the active-profile marker, the menu-icon start must launch the NEW profile, not the old one")
@@ -542,7 +650,7 @@ final class HelperResumeActionTests: XCTestCase {
     // (e.g. the user clicked Resume manually). Do not pile a second
     // auto-relaunch on top.
     XCTAssertFalse(HelperResumeAction.shouldCommitAutoRelaunch(
-      status: .running(port: 50001, profileID: "chat")
+      status: .running(EngineSessionSnapshot(port: 50001, profileID: "chat"))
     ))
   }
 
@@ -580,7 +688,7 @@ final class HelperResumeActionTests: XCTestCase {
     // back in the `.vetoed` payload so HelperMain can log why it skipped.
     let states: [EngineStatus] = [
       .stopped,
-      .running(port: 50001, profileID: "chat"),
+      .running(EngineSessionSnapshot(port: 50001, profileID: "chat")),
       .starting,
       .stopping,
     ]
@@ -603,7 +711,10 @@ final class HelperResumeActionTests: XCTestCase {
     private let count = NSLock()
     private var _value = 0
     var shutdownCount: Int { count.lock(); defer { count.unlock() }; return _value }
-    func shutdown() async { count.lock(); _value += 1; count.unlock() }
+    func shutdown() async -> EngineShutdownResult {
+      count.lock(); _value += 1; count.unlock()
+      return .reaped
+    }
   }
 }
 
@@ -614,4 +725,12 @@ private final class AtomicCounter {
   private let lock = NSLock()
   func increment() { lock.lock(); _value += 1; lock.unlock() }
   var value: Int { lock.lock(); defer { lock.unlock() }; return _value }
+}
+
+/// Captures the `explicitModel` argument the resolver received (#469). `run`
+/// invokes the resolver synchronously before returning, so a plain reference
+/// box suffices.
+private final class CapturedModel {
+  var value: String?
+  var wasNil = false
 }

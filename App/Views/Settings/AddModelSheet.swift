@@ -65,6 +65,13 @@ struct AddModelSheet: View {
   }
 
   @Environment(\.dismiss) private var dismiss
+  /// The one live source of truth for local availability (#514
+  /// rescope) — inherited through the sheet's environment. Its
+  /// published `availability` already folds in scan results, the
+  /// non-terminal download set, and the completion overlay, so rows
+  /// flip to "Downloading…" the moment an Add is accepted and to
+  /// "Installed" the moment a download completes — no flicker window.
+  @EnvironmentObject private var library: ModelLibraryStore
   @State private var selectedSource: Source = .curated
   /// Caption for the Local file pane. Owned at sheet scope so it
   /// survives the `Group { switch selectedSource }` tear-down when
@@ -122,9 +129,10 @@ struct AddModelSheet: View {
       Group {
         switch selectedSource {
         case .curated:
-          CuratedCatalogPane(onPick: queueDownload)
+          CuratedCatalogPane(availability: availability, onPick: queueDownload)
         case .search:
-          HuggingFaceSearchPane(onPick: queueDownload,
+          HuggingFaceSearchPane(availability: availability,
+                                onPick: queueDownload,
                                 session: $hfSession)
         case .local:
           LocalFilePane(modelsDirectory: modelsDirectory,
@@ -154,6 +162,8 @@ struct AddModelSheet: View {
     .accessibilityIdentifier("AddModelSheet")
   }
 
+  private var availability: ModelAvailability { library.availability }
+
   private func queueDownload(_ repo: String, _ file: String) {
     onClose(.queueDownload(repo: repo, file: file))
     dismiss()
@@ -174,13 +184,16 @@ struct AddModelSheet: View {
 // MARK: - Curated pane
 
 private struct CuratedCatalogPane: View {
+  let availability: ModelAvailability
   let onPick: (_ repo: String, _ file: String) -> Void
 
   var body: some View {
     ScrollView {
       LazyVStack(spacing: 8) {
         ForEach(CuratedModelCatalog.all) { model in
-          CuratedRow(model: model) {
+          CuratedRow(model: model,
+                     status: availability.status(repo: model.huggingFaceRepo,
+                                                 file: model.huggingFaceFile)) {
             onPick(model.huggingFaceRepo, model.huggingFaceFile)
           }
         }
@@ -192,6 +205,7 @@ private struct CuratedCatalogPane: View {
 
 private struct CuratedRow: View {
   let model: CuratedModel
+  let status: ModelAvailability.Status
   let onAdd: () -> Void
 
   var body: some View {
@@ -199,31 +213,51 @@ private struct CuratedRow: View {
       VStack(alignment: .leading, spacing: 2) {
         HStack(spacing: 6) {
           Text(model.displayName).font(.headline)
-          if model.id == CuratedModelCatalog.recommendedModelID {
-            Text("Recommended")
+          if let badge = model.installIntent.badgeText {
+            Text(badge)
               .font(.caption.bold())
               .padding(.horizontal, 6)
               .padding(.vertical, 2)
               .background(Capsule().fill(Color.accentColor.opacity(0.15)))
-              .accessibilityIdentifier("CuratedRecommended-\(model.id)")
+              .accessibilityIdentifier(model.installIntent == .defaultRecommended
+                                       ? "CuratedRecommended-\(model.id)"
+                                       : "CuratedIntent-\(model.id)")
           }
         }
         Text("\(model.publisher) · \(formattedParams) · \(model.quantization)")
           .font(.callout)
           .foregroundStyle(.secondary)
+        if let memory = model.recommendedSystemMemoryBytes {
+          Text("Recommended memory: \(InstalledModels.formattedSize(memory))")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+        }
         Text(model.summary)
           .font(.callout)
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
+        if !model.pieSupportNotes.isEmpty {
+          Text(model.pieSupportNotes)
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
       }
       Spacer()
       VStack(alignment: .trailing, spacing: 6) {
         Text(InstalledModels.formattedSize(model.approximateSizeBytes))
           .foregroundStyle(.secondary)
           .monospacedDigit()
-        Button("Add") { onAdd() }
-          .buttonStyle(.borderedProminent)
-          .accessibilityIdentifier("CuratedAdd-\(model.id)")
+        if status.allowsAdd {
+          Button("Add") { onAdd() }
+            .buttonStyle(.borderedProminent)
+            .accessibilityIdentifier("CuratedAdd-\(model.id)")
+        } else {
+          // #514: already local (or already in flight) — show the
+          // state instead of a misleading Add action.
+          AvailabilityStatusBadge(status: status,
+                                  identifier: "CuratedStatus-\(model.id)")
+        }
       }
     }
     .padding(10)
@@ -235,6 +269,33 @@ private struct CuratedRow: View {
       return String(format: "%.1fB params", model.parameterCountBillions)
     }
     return String(format: "%.0fM params", model.parameterCountBillions * 1000)
+  }
+}
+
+// MARK: - Availability badge
+
+/// Non-addable row state (#514): "Installed" / "Downloading…" /
+/// "In library" in place of the Add button. The accessibility VALUE
+/// carries the state so GUI tests can assert which one it is through
+/// a single stable identifier per row.
+private struct AvailabilityStatusBadge: View {
+  let status: ModelAvailability.Status
+  let identifier: String
+
+  var body: some View {
+    if let text = status.badgeText {
+      Text(text)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Capsule().fill(Color.secondary.opacity(0.12)))
+        .help(status == .availableInHFCache
+              ? "Already available from the shared Hugging Face cache — downloading again would be redundant."
+              : text)
+        .accessibilityIdentifier(identifier)
+        .accessibilityValue(text)
+    }
   }
 }
 
@@ -274,6 +335,9 @@ struct HFSession {
 /// session storage must live on the parent so it survives the
 /// Picker swap.
 struct HuggingFaceSearchPane: View {
+  /// Local-availability classifier (#514) — file rows that are already
+  /// installed / cached / downloading show their state, not Add.
+  let availability: ModelAvailability
   let onPick: (_ repo: String, _ file: String) -> Void
   /// Bound to `AddModelSheet.hfSession`. A `@Binding` (not `@State`)
   /// is what makes the entire search session survive when SwiftUI
@@ -342,6 +406,7 @@ struct HuggingFaceSearchPane: View {
             ForEach(session.results) { row in
               SearchRow(
                 row: row,
+                availability: availability,
                 expanded: session.expanded.contains(row.repo),
                 files: session.files[row.repo] ?? [],
                 isLoadingFiles: session.expanded.contains(row.repo)
@@ -521,6 +586,7 @@ struct HuggingFaceSearchPane: View {
 
 private struct SearchRow: View {
   let row: HFSearchResult
+  let availability: ModelAvailability
   let expanded: Bool
   let files: [HFRepoFile]
   /// `true` only while `listFiles` is in flight — distinct from
@@ -584,8 +650,15 @@ private struct SearchRow: View {
                 .monospacedDigit()
                 .font(.callout)
             }
-            Button("Add") { onPickFile(f.path) }
-              .buttonStyle(.borderless)
+            let status = availability.status(repo: row.repo, file: f.path)
+            if status.allowsAdd {
+              Button("Add") { onPickFile(f.path) }
+                .buttonStyle(.borderless)
+            } else {
+              AvailabilityStatusBadge(
+                status: status,
+                identifier: "HFFileStatus-\(row.repo)/\(f.path)")
+            }
           }
           .padding(.vertical, 2)
           .padding(.leading, 22)
@@ -622,7 +695,7 @@ struct LocalFilePane: View {
         .foregroundStyle(.tertiary)
       Text("Drop a .gguf file here")
         .font(.headline)
-      Text("Or click *Choose File…* to import from disk. The file is copied into your RatioThink models directory; the original is left untouched.")
+      Text("Or click *Choose File…* to import from disk. The file is copied into your Rational models directory; the original is left untouched.")
         .multilineTextAlignment(.center)
         .foregroundStyle(.secondary)
         .padding(.horizontal, 40)

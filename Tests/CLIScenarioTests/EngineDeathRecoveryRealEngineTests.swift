@@ -151,10 +151,10 @@ final class EngineDeathRecoveryRealEngineTests: IsolatedTestCase {
     var firstRunningPort: UInt16?
     let token = host.observe { status, _ in
       switch status {
-      case .running(let port, _):
+      case .running(let snap):
         runningCount += 1
         if runningCount == 1 {
-          firstRunningPort = UInt16(port)
+          firstRunningPort = UInt16(snap.port)
           firstRunning.fulfill()
         } else if runningCount == 2 {
           secondRunning.fulfill()
@@ -185,7 +185,7 @@ final class EngineDeathRecoveryRealEngineTests: IsolatedTestCase {
     // newly-relaunched engine and assert the first SSE event arrives
     // — that's the "engine + model can serve generation" proof.
     let secondPort = try XCTUnwrap({ () -> UInt16? in
-      if case .running(let port, _) = host.status { return UInt16(port) }
+      if case .running(let snap) = host.status { return UInt16(snap.port) }
       return nil
     }(), "host must be .running after auto-relaunch")
     XCTAssertNotEqual(secondPort, firstRunningPort,
@@ -332,7 +332,7 @@ final class EngineDeathRecoveryRealEngineTests: IsolatedTestCase {
     // need to prove the engine accepts the request shape and emits
     // at least one SSE frame.
     let port1 = try XCTUnwrap({ () -> UInt16? in
-      if case .running(let p, _) = host.status { return UInt16(p) }; return nil
+      if case .running(let snap) = host.status { return UInt16(snap.port) }; return nil
     }())
     let client1 = HTTPEngineClient(baseURL: URL(string: "http://127.0.0.1:\(port1)")!, unaryTimeout: 15)
     let modelID = try await Self.resolveFirstRegisteredModel(client: client1)
@@ -355,7 +355,7 @@ final class EngineDeathRecoveryRealEngineTests: IsolatedTestCase {
     // request as supplied. Assert: the relaunched engine accepts the
     // multi-turn request shape and streams at least one SSE event.
     let port2 = try XCTUnwrap({ () -> UInt16? in
-      if case .running(let p, _) = host.status { return UInt16(p) }; return nil
+      if case .running(let snap) = host.status { return UInt16(snap.port) }; return nil
     }())
     XCTAssertNotEqual(port2, port1, "auto-relaunch must bind a fresh port")
     let client2 = HTTPEngineClient(baseURL: URL(string: "http://127.0.0.1:\(port2)")!, unaryTimeout: 15)

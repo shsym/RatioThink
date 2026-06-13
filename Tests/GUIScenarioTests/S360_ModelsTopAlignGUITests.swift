@@ -39,7 +39,7 @@ final class S360_ModelsTopAlignGUITests: XCTestCase {
     configureCompletedFirstLaunch(app)
     // Real shared /tmp path, NOT NSTemporaryDirectory(): the XCUITest
     // runner is sandboxed, so NSTemporaryDirectory() resolves to the
-    // runner's container the non-sandboxed RatioThink.app cannot write.
+    // runner's container the non-sandboxed Rational.app cannot write.
     // A fresh dir gives an empty `PIE_HOME/models`, so the Models tab
     // renders its empty state rather than the populated `Table`.
     let home = "/tmp/pie-s360-" + UUID().uuidString
@@ -59,7 +59,7 @@ final class S360_ModelsTopAlignGUITests: XCTestCase {
     app.launch()
     defer { app.terminate() }
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     app.typeKey(",", modifierFlags: .command)
