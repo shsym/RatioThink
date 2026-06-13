@@ -10,10 +10,12 @@ import os
 ///
 /// Why poll rather than push? `PieHelperXPC` exposes only a one-shot
 /// reply selector — there is no streaming `subscribeEngineStatus` yet.
-/// Polling at 1 Hz is well within the helper's idle budget (selector
-/// is a property read on the supervisor's state queue) and keeps the
-/// GUI's "engine reachable?" signal current without standing up a
-/// second XPC surface.
+/// The cadence is adaptive (#587): fast (`pollInterval`, ~1 s) while the
+/// engine state is changing, slow (`steadyPollInterval`, ~10 s) once it is
+/// established `.running`, and paused entirely when no engine session is
+/// expected (stopped/idle) so macOS App Nap can engage. This keeps the
+/// GUI's "engine reachable?" signal current without standing up a second
+/// XPC surface and without 60 idle wakeups/min on the app + helper.
 ///
 /// Initial status is `.starting` (not `.stopped`) because the helper's
 /// reachability is genuinely unknown until the first reply lands —
@@ -52,9 +54,9 @@ public final class EngineStatusStore: ObservableObject {
   ///
   /// Deliberately NOT `@Published`: the poll loop bumps this every tick,
   /// and publishing it would re-render every observer (incl. the toolbar
-  /// that hosts the engine-status popover) once per second and dismiss
-  /// the popover. Real state changes ride `status`/`lastError`, which
-  /// are `@Published` and change-guarded; tests observe those.
+  /// that hosts the engine-status popover) on each poll and dismiss the
+  /// popover. Real state changes ride `status`/`lastError`, which are
+  /// `@Published` and change-guarded; tests observe those.
   public private(set) var pollCount: UInt64 = 0
 
   /// Signature of the engine failure the user has dismissed from the
@@ -114,7 +116,15 @@ public final class EngineStatusStore: ObservableObject {
 
   private let client: any AppXPCClient
   private let daemonBindModeProvider: @MainActor @Sendable () -> EngineHTTPBindMode
+  /// Fast cadence — the interval used while the engine state is actively
+  /// changing (transition tier: `.starting`/`.stopping`, an engine-death or
+  /// transport-loss recovery episode). Named `pollInterval` for back-compat
+  /// with the original fixed-cadence constructor.
   private let pollInterval: TimeInterval
+  /// Steady cadence — the (slower) interval used once the engine is
+  /// established `.running` and stable. Cuts idle wakeups ~10× vs the old
+  /// fixed 1 Hz loop so macOS App Nap can engage (#587).
+  private let steadyPollInterval: TimeInterval
   private var task: Task<Void, Never>?
   private nonisolated static let log = Logger(subsystem: "com.ratiothink.app", category: "engine-status")
 
@@ -175,6 +185,7 @@ public final class EngineStatusStore: ObservableObject {
   public init(
     client: any AppXPCClient,
     pollInterval: TimeInterval = 1.0,
+    steadyPollInterval: TimeInterval = 10.0,
     initialStatus: EngineStatus = .starting,
     initialDaemonBindMode: EngineHTTPBindMode = .loopback,
     daemonBindModeProvider: @escaping @MainActor @Sendable () -> EngineHTTPBindMode = { .loopback },
@@ -184,6 +195,7 @@ public final class EngineStatusStore: ObservableObject {
     self.client = client
     self.daemonBindModeProvider = daemonBindModeProvider
     self.pollInterval = pollInterval
+    self.steadyPollInterval = steadyPollInterval
     self.tierPolicy = tierPolicy
     self.now = now
     self.status = initialStatus
@@ -204,24 +216,99 @@ public final class EngineStatusStore: ObservableObject {
     if case .starting = initialStatus { self.startingSince = now() }
   }
 
+  /// Adaptive poll cadence resolved from the current state (#587). The
+  /// loop drives its next sleep from this tier instead of a fixed interval
+  /// so an idle/stopped app lets macOS App Nap engage while transitions
+  /// stay responsive.
+  enum PollCadence: Equatable {
+    /// Engine state actively changing — poll fast (`pollInterval`).
+    case transition
+    /// Engine established `.running` and stable — poll slow (`steadyPollInterval`).
+    case steady
+    /// No engine session expected — suspend the loop entirely (no wakeups).
+    case paused
+  }
+
+  /// Resolve the poll cadence from the current state. A recovery episode
+  /// (sustained transport loss climbing toward escalation, or a live
+  /// `.failed(.engineGone)` death) stays on the fast tier so the recovery is
+  /// detected promptly. A `.running` engine with no in-flight blip drops to
+  /// the steady tier. A `.stopped` or persistently `.failed` engine — no
+  /// session expected, nothing a timer can change — pauses the loop; an
+  /// explicit resume trigger (a start request or app foreground) re-arms it.
+  func currentCadence() -> PollCadence {
+    // Active recovery: a transport blip in progress (held last status) or a
+    // reachable-helper engine-death episode. Poll fast to catch the recovery.
+    if consecutiveFailures > 0 || engineGonePolls > 0 { return .transition }
+    switch status {
+    case .running:
+      return .steady
+    case .starting, .stopping:
+      return .transition
+    case .stopped:
+      return .paused
+    case .failed(.engineGone, _):
+      // Covered by `engineGonePolls > 0` above in steady operation; kept
+      // explicit so a synthesized engineGone never falls through to paused.
+      return .transition
+    case .failed:
+      // memoryRisk / spawnFailed / modelMissing etc. — terminal until the
+      // user acts (Restart Engine / pick a model), which re-arms via the
+      // start path. Polling cannot change it, so pause.
+      return .paused
+    }
+  }
+
+  /// Seconds to sleep before the next poll for a non-paused cadence
+  /// (`.infinity` for `.paused`, which the loop never sleeps on — it
+  /// suspends instead). Test seam so cadence selection is asserted by the
+  /// chosen interval, never by elapsed wall-clock.
+  func sleepInterval(for cadence: PollCadence) -> TimeInterval {
+    switch cadence {
+    case .transition: return pollInterval
+    case .steady: return steadyPollInterval
+    case .paused: return .infinity
+    }
+  }
+
   /// Begin the background poll loop. Idempotent — re-entry while a
   /// task is already running is a no-op so `RatioThinkApp.init` can safely
-  /// `start()` without tracking a "did we already start" flag.
+  /// `start()` without tracking a "did we already start" flag. Also the
+  /// resume primitive (#587): a paused loop nils `task`, so any start path
+  /// or foreground hook that calls `start()` re-arms it.
   public func start() {
     guard task == nil else { return }
     let client = self.client
-    let interval = self.pollInterval
-    Self.log.info("starting engine-status poll loop (interval=\(interval, privacy: .public)s)")
+    Self.log.info("starting engine-status poll loop (fast=\(self.pollInterval, privacy: .public)s steady=\(self.steadyPollInterval, privacy: .public)s)")
     task = Task { [weak self] in
       while !Task.isCancelled {
         await self?.refreshOnce(client: client)
         if Task.isCancelled { return }
+        // Reacquire `self` only briefly to read the cadence off the
+        // just-applied state (a synchronous main-actor read — the Task
+        // inherits this @MainActor context); never hold it across the sleep.
+        guard let cadence = self?.currentCadence() else { return }
+        if cadence == .paused {
+          // Suspend: no engine session expected, so stop waking the app and
+          // the helper. Nil `task` so a resume trigger's `start()` re-arms.
+          self?.suspendLoop()
+          return
+        }
+        guard let interval = self?.sleepInterval(for: cadence) else { return }
         // `Task.sleep` is the cancellation-aware sleep; an
         // intermediate `cancel()` wakes us with `CancellationError`
         // which we swallow because the outer loop checks the flag.
         try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
       }
     }
+  }
+
+  /// Suspend the poll loop from inside its own task: drop the `task`
+  /// reference so a later `start()` (resume trigger) re-arms it. The
+  /// caller `return`s immediately after, ending the task.
+  private func suspendLoop() {
+    task = nil
+    Self.log.info("engine-status poll loop paused (no engine session — App Nap may engage)")
   }
 
   /// Cancel the poll loop. Idempotent. After `stop()` the published
@@ -439,6 +526,12 @@ public final class EngineStatusStore: ObservableObject {
   public func startEngine(profileID: String,
                           modelOverride: String? = nil,
                           daemonBindHost: EngineHTTPBindMode? = nil) async throws {
+    // #587 resume trigger: a start request means an engine session is now
+    // expected, so re-arm the poll loop if it paused while stopped/idle.
+    // Idempotent — a no-op when the loop is already running. Re-arm BEFORE
+    // the XPC call so the `.starting` → `.running`/`.failed` transition the
+    // start produces is surfaced even if the loop was paused.
+    start()
     try requireHelperAvailable()
     let requestedBindMode = daemonBindHost ?? daemonBindModeProvider()
     do {

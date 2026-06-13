@@ -957,6 +957,122 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(store.engineGonePolls, 0)
   }
 
+  // MARK: - #587 adaptive poll cadence
+
+  /// Cadence selection is a pure function of the resolved state — asserted
+  /// by the chosen tier, never by elapsed wall-clock (avoids real sleeps).
+  func test_cadence_running_is_steady() {
+    let store = EngineStatusStore(client: StubXPCClient(),
+                                  initialStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
+    XCTAssertEqual(store.currentCadence(), .steady)
+  }
+
+  func test_cadence_starting_and_stopping_are_transition() {
+    let starting = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting)
+    XCTAssertEqual(starting.currentCadence(), .transition)
+    let stopping = EngineStatusStore(client: StubXPCClient(), initialStatus: .stopping)
+    XCTAssertEqual(stopping.currentCadence(), .transition)
+  }
+
+  func test_cadence_stopped_is_paused() {
+    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .stopped)
+    XCTAssertEqual(store.currentCadence(), .paused,
+                   "a stopped engine expects no session — the loop must pause so App Nap can engage")
+  }
+
+  func test_cadence_persistent_failure_is_paused() {
+    // memoryRisk is terminal until the user acts; polling cannot change it.
+    let store = EngineStatusStore(client: StubXPCClient(),
+                                  initialStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
+    store._applyPollForTesting(next: .failed(code: .memoryRisk, message: "model too large"), error: nil)
+    XCTAssertEqual(store.currentCadence(), .paused)
+  }
+
+  func test_cadence_engineGone_recovery_is_transition() {
+    let store = EngineStatusStore(client: StubXPCClient(),
+                                  initialStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
+    store._applyPollForTesting(next: .failed(code: .engineGone, message: "exit 1"), error: nil)
+    XCTAssertEqual(store.engineGonePolls, 1)
+    XCTAssertEqual(store.currentCadence(), .transition,
+                   "an engine-death recovery episode must stay on the fast tier")
+  }
+
+  func test_cadence_transport_blip_holds_fast_even_while_running() {
+    // A sub-threshold transport blip holds the last `.running` status, but the
+    // loss is in progress — poll fast to catch the recovery, don't drop to steady.
+    let store = EngineStatusStore(client: StubXPCClient(),
+                                  initialStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
+                                  tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 5))
+    store._applyPollForTesting(next: nil, error: "NSXPCConnectionInterrupted")
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
+    XCTAssertEqual(store.currentCadence(), .transition,
+                   "a transport blip in progress must keep the fast cadence")
+  }
+
+  func test_sleepInterval_maps_tier_to_configured_interval() {
+    let store = EngineStatusStore(client: StubXPCClient(),
+                                  pollInterval: 1.0, steadyPollInterval: 10.0)
+    XCTAssertEqual(store.sleepInterval(for: .transition), 1.0)
+    XCTAssertEqual(store.sleepInterval(for: .steady), 10.0)
+    XCTAssertEqual(store.sleepInterval(for: .paused), .infinity)
+  }
+
+  /// The live loop must SUSPEND once a poll resolves to a no-session state —
+  /// exactly one poll lands and no further wakeups follow. With a 10 ms fast
+  /// interval an un-paused loop would poll ~10× in 120 ms; pinning `calls == 1`
+  /// proves the suspend without asserting on elapsed time.
+  func test_loop_pauses_after_stopped_poll() async throws {
+    let client = StubXPCClient()
+    client.setNext(.stopped)
+    let store = EngineStatusStore(client: client, pollInterval: 0.01, steadyPollInterval: 0.01)
+    store.start()
+    try await waitUntil("first poll applies .stopped") { store.status == .stopped }
+    try await Task.sleep(nanoseconds: 120_000_000)
+    XCTAssertEqual(client.calls, 1,
+                   "loop must pause after a .stopped poll — no further wakeups")
+  }
+
+  /// Resume: `start()` re-arms a loop that paused itself (idempotency makes
+  /// it the single resume primitive for every wake trigger).
+  func test_start_rearms_paused_loop() async throws {
+    let client = StubXPCClient()
+    client.setNext(.stopped)
+    let store = EngineStatusStore(client: client, pollInterval: 0.01, steadyPollInterval: 0.01)
+    store.start()
+    try await waitUntil("paused on .stopped") { store.status == .stopped }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    let callsAtPause = client.calls
+
+    client.setNext(.running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
+    store.start()  // resume
+    try await waitUntil("loop re-armed and saw .running") {
+      if case .running = store.status { return true }
+      return false
+    }
+    XCTAssertGreaterThan(client.calls, callsAtPause,
+                         "start() must re-arm a paused loop")
+    store.stop()
+  }
+
+  /// A start request is a resume trigger: `startEngine` re-arms a paused loop
+  /// (before the XPC call) so the start's transition is surfaced.
+  func test_startEngine_rearms_paused_loop() async throws {
+    let client = StubXPCClient()
+    client.setNext(.stopped)
+    let store = EngineStatusStore(client: client, pollInterval: 0.01, steadyPollInterval: 0.01)
+    store.start()
+    try await waitUntil("paused on .stopped") { store.status == .stopped }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    let callsAtPause = client.calls
+
+    client.setNext(.starting)
+    try await store.startEngine(profileID: "chat")
+    try await waitUntil("loop polling resumed") { client.calls > callsAtPause }
+    XCTAssertGreaterThan(client.calls, callsAtPause,
+                         "startEngine must re-arm a paused loop")
+    store.stop()
+  }
+
   private func waitUntil(
     _ description: String,
     timeout: TimeInterval = 1.0,
