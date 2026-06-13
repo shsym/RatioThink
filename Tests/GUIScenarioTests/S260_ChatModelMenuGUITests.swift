@@ -3,10 +3,11 @@ import XCTest
 /// S260 — the chat model menu surfaces the seeded GGUF the engine serves.
 ///
 /// The menu reflects the ids the engine ACTUALLY serves (`GET /v1/models`,
-/// via `ChatScaffoldView`'s reconcile, which is gated on engine `.running`):
-/// the menu item label is `ModelDisplayName.leaf(servedID)`, so a served id
-/// of `Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` renders as
-/// `Qwen3-0.6B-Q8_0.gguf`. This needs a real engine serving that GGUF, so —
+/// via `ChatScaffoldView`'s reconcile, which is gated on engine `.running`).
+/// Since #580 the row is rendered as structured identity: a served id of
+/// `Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` clusters under a base-name
+/// section header `Qwen3 0.6B` with the quant `Q8_0` as the pickable row.
+/// This needs a real engine serving that GGUF, so —
 /// like its sibling S258 — it is driven by `Scripts/run-chat-gui-e2e.sh`,
 /// which boots the harness in portable mode against the staged weight and
 /// writes the engine URL into the shared config file. Absent that config
@@ -57,13 +58,15 @@ final class S260_ChatModelMenuGUITests: XCTestCase {
                   "model menu missing after creating chat; app tree: \(app.debugDescription)")
     modelMenu.click()
 
-    // The served id `Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` renders as its
-    // leaf. Status is pinned `.running`, so allow time for the reconcile to
-    // fetch `/v1/models` (the menu only resolves to the served id once
-    // `engineModels` is `.known([...])`).
-    let seededModel = app.menuItems["Qwen3-0.6B-Q8_0.gguf"]
+    // #580: the served id `Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` renders
+    // as structured identity — a `Qwen3 0.6B` base-name section header with
+    // the quant `Q8_0` as the pickable row. Status is pinned `.running`, so
+    // allow time for the reconcile to fetch `/v1/models` (the menu only
+    // resolves to the served id once `engineModels` is `.known([...])`).
+    let seededModel = app.menuItems["Q8_0"]
     XCTAssertTrue(seededModel.waitForExistence(timeout: 10),
-                  "seeded Qwen3 GGUF missing from chat model menu; app tree: \(app.debugDescription)")
+                  "seeded Qwen3 GGUF quant row (Q8_0) missing from chat model menu; "
+                  + "app tree: \(app.debugDescription)")
     app.typeKey(.escape, modifierFlags: [])
   }
 
