@@ -41,10 +41,32 @@ from typing import Iterable, Iterator, Any
 
 MODEL = os.environ.get("MODEL", "Qwen/Qwen3-0.6B")
 DEFAULT_OUTPUT = Path(os.environ.get("APC_BENCH_OUTPUT", "test-logs/apc-bench-real.json"))
+MAX_SAFE_PIE_HOME_BYTES = 72
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
+
+
+@contextlib.contextmanager
+def benchmark_tempdir() -> Iterator[Path]:
+    """Create a temp root whose PIE_HOME fits Pie's real-driver aux socket budget.
+
+    The portable/Metal driver binds
+    ``$PIE_HOME/standalone/<pid>/g0/aux.sock`` and macOS caps Unix socket paths
+    at 104 bytes including NUL. RatioThink's launcher reserves 31 bytes for the
+    engine suffix, leaving 72 bytes for PIE_HOME. Python's default TMPDIR on
+    macOS lives under /var/folders/... and can exceed that budget, so live
+    benchmarks intentionally anchor their short-lived home at /tmp.
+    """
+    with tempfile.TemporaryDirectory(prefix="apcb-", dir="/tmp") as tmp_s:
+        tmp = Path(tmp_s)
+        pie_home = tmp / "home"
+        if len(str(pie_home).encode("utf-8")) > MAX_SAFE_PIE_HOME_BYTES:
+            raise RuntimeError(
+                f"benchmark PIE_HOME path too long for pie aux socket budget: {pie_home}"
+            )
+        yield tmp
 
 
 @dataclasses.dataclass(frozen=True)
@@ -99,6 +121,9 @@ class Scenario:
 
 
 def default_scenarios(max_tokens: int) -> list[Scenario]:
+    def visible_answer(prompt: str) -> str:
+        return f"{prompt} /no_think"
+
     long_system = (
         "You are helping triage a long agent transcript. Preserve factual details, "
         "answer concisely, and do not invent missing evidence. "
@@ -115,20 +140,24 @@ def default_scenarios(max_tokens: int) -> list[Scenario]:
             name="short_qa",
             messages_turn1=[{
                 "role": "user",
-                "content": "What is the capital of France? Answer in one short sentence.",
+                "content": visible_answer(
+                    "What is the capital of France? Answer in one short sentence."
+                ),
             }],
-            continuation_user="And what is its most famous landmark? One short sentence.",
+            continuation_user=visible_answer("And what is its most famous landmark? One short sentence."),
             max_tokens=max_tokens,
         ),
         Scenario(
             name="long_agent_summary",
             messages_turn1=[
                 {"role": "system", "content": long_system},
-                {"role": "user", "content": long_user},
+                {"role": "user", "content": visible_answer(long_user)},
             ],
             continuation_user=(
-                "Continue from that context: give the next concrete benchmark step and "
-                "state which measurement would prove prefix reuse helped."
+                visible_answer(
+                    "Continue from that context: give the next concrete benchmark step and "
+                    "state which measurement would prove prefix reuse helped."
+                )
             ),
             max_tokens=max_tokens,
         ),
@@ -487,8 +516,7 @@ device = ["metal"]
     comparisons: list[dict[str, Any]] = []
     runs = max(1, args.runs)
 
-    with tempfile.TemporaryDirectory(prefix="apc-bench-real-") as tmp_s:
-        tmp = Path(tmp_s)
+    with benchmark_tempdir() as tmp:
         cfg = tmp / "config.toml"
         cfg.write_text(config_toml)
         pie_home = tmp / "home"

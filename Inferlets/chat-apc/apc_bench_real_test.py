@@ -89,6 +89,27 @@ class ApcBenchRealTests(unittest.TestCase):
         self.assertIn("artifacts/apc.json", md)
         self.assertIn("0.800", md)
 
+    def test_benchmark_tempdir_keeps_pie_home_under_aux_socket_budget(self):
+        with bench.benchmark_tempdir() as tmp:
+            pie_home = tmp / "home"
+
+            self.assertEqual(tmp.parent.as_posix(), "/tmp")
+            self.assertLessEqual(
+                len(str(pie_home).encode("utf-8")),
+                bench.MAX_SAFE_PIE_HOME_BYTES,
+            )
+
+    def test_default_scenarios_request_visible_answers_for_thinking_models(self):
+        user_turns = [
+            m["content"]
+            for scenario in bench.default_scenarios(max_tokens=32)
+            for m in [*scenario.messages_turn1, {"role": "user", "content": scenario.continuation_user}]
+            if m["role"] == "user"
+        ]
+
+        self.assertTrue(user_turns)
+        self.assertTrue(all("/no_think" in content for content in user_turns))
+
 
 if __name__ == "__main__":
     unittest.main()
