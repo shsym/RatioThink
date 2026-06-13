@@ -18,6 +18,10 @@ struct DetailView: View {
       // row via `@Query` keyed on `id`.
       ChatScaffoldView(chatID: id)
         .id(id)
+    case (.chats, nil):
+      // #577: the Chats section with no selection is the "start" landing — a
+      // ready new-chat composer. No chat row is created until the first send.
+      NewChatView()
     case (.apiEndpoints, _):
       // One engine, one endpoint: the section maps to a single live view
       // regardless of chat selection.
