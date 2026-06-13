@@ -83,11 +83,12 @@ public enum ProfileModelOptions {
   public static func build(models: [InstalledModel],
                            current: String,
                            limitBytes: Int64?) -> [Option] {
-    // #580 Q1: dedup by STRUCTURED IDENTITY (base+quant+format), not exact
-    // slug — so an app-managed copy and an HF-cache copy of the same file
-    // collapse to one row (app-managed first wins, the resolver's
-    // app-staged-first precedence). Distinct quants (Q4 vs Q8) keep
-    // separate identities and stay as separate rows.
+    // Dedup by IDENTITY = the full resolvable slug (review v2 F2): an
+    // app-managed download and an HF-cache copy of the SAME `<repo>/<file>`
+    // slug collapse to one row (app-managed first wins, the resolver's
+    // app-staged-first precedence); distinct files that merely share a leaf
+    // stay apart. Quant distinctness (Q4 vs Q8) falls out for free.
+    let currentIdentity = current.isEmpty ? nil : ModelNameParts.parse(current).identity
     var bySlug: [String: InstalledModel] = [:]
     var seenIdentity = Set<String>()
     var order: [String] = []
@@ -97,11 +98,12 @@ public enum ProfileModelOptions {
       bySlug[model.filename] = model
       order.append(model.filename)
     }
-    // The profile's current model must always be visible + checkmarked,
-    // even when not installed. Keyed by SLUG (not identity) so the exact
-    // value the profile carries is the one marked current; only skipped
-    // when that very slug is already among the discovered rows.
-    if !current.isEmpty, bySlug[current] == nil, !order.contains(current) {
+    // The profile's current model must always be visible + checkmarked, even
+    // when not installed. Presence-check by IDENTITY (review v2 F3): only
+    // synthesize a "Not downloaded" current row when NO discovered row shares
+    // its identity. When one does, that surviving row is marked current below
+    // (isCurrent is identity-based) — no duplicate, no false "Not downloaded".
+    if let currentIdentity, !seenIdentity.contains(currentIdentity) {
       order.append(current)
     }
 
@@ -122,7 +124,11 @@ public enum ProfileModelOptions {
           sizeBytes: model?.sizeBytes,
           source: model?.source,
           isOverLimit: isOverLimit(sizeBytes: model?.sizeBytes, limitBytes: limitBytes),
-          isCurrent: slug == current,
+          // Identity-based (review v2 F3): a discovered row whose identity
+          // matches the current model is marked current even when the profile
+          // persisted a different-but-equivalent slug, so the checkmark never
+          // splits onto a synthesized duplicate.
+          isCurrent: ModelNameParts.parse(slug).identity == currentIdentity,
           unsupportedReason: reason,
           isUnverified: model?.isUnverified ?? false,
           supportWarning: model?.supportWarning,

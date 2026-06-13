@@ -7,39 +7,53 @@ import XCTest
 final class ModelIdentityGroupingTests: XCTestCase {
   private struct Row: Equatable { let slug: String; let tag: String }
 
-  func test_deduped_collapses_app_and_hf_copies_keeping_first() {
-    let rows = [
-      Row(slug: "Qwen3-0.6B-Q8_0.gguf", tag: "app"),
-      Row(slug: "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf", tag: "hf"),
-    ]
+  func test_deduped_collapses_exact_duplicate_slugs_keeping_first() {
+    // The dedup key is the full resolvable slug (review v2 F2): an
+    // app-managed download and an HF-cache copy of the SAME `<repo>/<file>`
+    // slug collapse to the first (app-managed) row.
+    let slug = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    let rows = [Row(slug: slug, tag: "app"), Row(slug: slug, tag: "hf")]
     let out = ModelIdentityGrouping.deduped(rows, slug: \.slug)
-    XCTAssertEqual(out, [Row(slug: "Qwen3-0.6B-Q8_0.gguf", tag: "app")],
-                   "true dupe collapses to the first (app-managed) row")
+    XCTAssertEqual(out, [Row(slug: slug, tag: "app")],
+                   "same resolvable slug collapses to the first (app-managed) row")
   }
 
-  // F1 (PR #174 review): on an identity tie the chat menu must keep the
-  // CURRENT row, not the slug-sort-first one. ToolbarModelOptions.build dedups
-  // by exact slug, so a served full-path copy (`Qwen/…/…-Q8_0.gguf`, which
-  // sorts first) and the persisted app-managed bare slug (`…-Q8_0.gguf`) both
-  // survive with the same identity. Without `prefer`, the render-time collapse
-  // keeps the full-path row → no checkmark + tapping writes the wrong slug.
-  func test_deduped_prefer_upgrades_to_current_on_identity_tie() {
+  // F2 regression: distinct files that merely share a leaf must NOT collapse —
+  // main deduped by full filename and kept them all visible.
+  func test_deduped_keeps_same_leaf_across_repos_and_bare_distinct() {
     let rows = [
-      Row(slug: "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf", tag: "served"),
-      Row(slug: "Qwen3-0.6B-Q8_0.gguf", tag: "current"),
+      Row(slug: "RepoA/Model-GGUF/Model-Q4_K_M.gguf", tag: "a"),
+      Row(slug: "RepoB/Model-GGUF/Model-Q4_K_M.gguf", tag: "b"),
+      Row(slug: "Model-Q4_K_M.gguf", tag: "bare"),
     ]
+    XCTAssertEqual(ModelIdentityGrouping.deduped(rows, slug: \.slug).count, 3,
+                   "same leaf across two repos plus a bare copy are three distinct files")
+  }
+
+  func test_deduped_does_not_over_normalize_underscore_vs_hyphen() {
+    let rows = [Row(slug: "Model_A-Q4_K_M.gguf", tag: "u"),
+                Row(slug: "Model-A-Q4_K_M.gguf", tag: "h")]
+    XCTAssertEqual(ModelIdentityGrouping.deduped(rows, slug: \.slug).count, 2,
+                   "underscore vs hyphen are distinct files, not one over-normalized row")
+  }
+
+  // F1 (PR #174 review v1): when an app-download and an HF-cache copy of the
+  // SAME resolvable slug collapse, the chat menu must keep the CURRENT one so
+  // the surviving row's slug matches the persisted selection (checkmark + the
+  // tap writes the right slug). `prefer` breaks the identity tie.
+  func test_deduped_prefer_upgrades_to_current_on_identity_tie() {
+    let slug = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    let rows = [Row(slug: slug, tag: "served"), Row(slug: slug, tag: "current")]
     let out = ModelIdentityGrouping.deduped(rows, slug: \.slug,
                                             prefer: { $0.tag == "current" })
-    XCTAssertEqual(out, [Row(slug: "Qwen3-0.6B-Q8_0.gguf", tag: "current")],
+    XCTAssertEqual(out, [Row(slug: slug, tag: "current")],
                    "the preferred (current) row wins the tie and holds the first slot")
   }
 
   func test_deduped_prefer_is_noop_without_a_match() {
     // No element satisfies `prefer` → first-wins, unchanged from the default.
-    let rows = [
-      Row(slug: "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf", tag: "served"),
-      Row(slug: "Qwen3-0.6B-Q8_0.gguf", tag: "app"),
-    ]
+    let slug = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    let rows = [Row(slug: slug, tag: "served"), Row(slug: slug, tag: "app")]
     let out = ModelIdentityGrouping.deduped(rows, slug: \.slug, prefer: { _ in false })
     XCTAssertEqual(out.map(\.tag), ["served"], "no preferred element → first-wins holds")
   }

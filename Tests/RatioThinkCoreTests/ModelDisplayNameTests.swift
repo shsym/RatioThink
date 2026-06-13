@@ -98,7 +98,7 @@ final class ModelNamePartsTests: XCTestCase {
 
   func test_gguf_format_tag_is_suppressed_as_redundant() {
     let parts = ModelNameParts.parse("Qwen3-0.6B-Q8_0.gguf")
-    XCTAssertEqual(parts.format, "GGUF", "format is still parsed for the dedup key")
+    XCTAssertEqual(parts.format, "GGUF", "format is still parsed for the formatTag chip")
     XCTAssertNil(parts.formatTag, "a GGUF tag is noise on every row — dropped")
   }
 
@@ -106,14 +106,18 @@ final class ModelNamePartsTests: XCTestCase {
     XCTAssertNil(ModelNameParts.parse("Qwen/Qwen3-0.6B").formatTag)
   }
 
-  // MARK: - structured identity (dedup/group key, #580 Q1)
+  // MARK: - dedup identity = full resolvable slug (review v2 F2)
 
-  func test_identity_collapses_app_and_hf_copies_of_same_file() {
-    // An app-managed copy and an HF-cache copy of the same file carry
-    // different slugs but the SAME structured identity → one row.
-    let app = ModelNameParts.parse("Qwen3-0.6B-Q8_0.gguf")
-    let hf = ModelNameParts.parse("Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf")
-    XCTAssertEqual(app.identity, hf.identity)
+  func test_identity_is_the_full_slug_so_only_the_same_file_collapses() {
+    // The SAME resolvable `<repo>/<file>` slug (an app-managed download and
+    // an HF-cache copy) collapses to one identity; an app-BARE copy of the
+    // same leaf is a distinct file and stays apart — restoring main's
+    // full-filename dedup, not the leaf-only collapse.
+    let full = ModelNameParts.parse("Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf")
+    let fullCopy = ModelNameParts.parse("Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf")
+    let bare = ModelNameParts.parse("Qwen3-0.6B-Q8_0.gguf")
+    XCTAssertEqual(full.identity, fullCopy.identity, "same resolvable slug → one identity")
+    XCTAssertNotEqual(full.identity, bare.identity, "repo-qualified vs bare are distinct files")
   }
 
   func test_identity_keeps_distinct_quants_apart() {
@@ -122,14 +126,19 @@ final class ModelNamePartsTests: XCTestCase {
     XCTAssertNotEqual(q4.identity, q8.identity, "Q4 and Q8 are distinct loadable models")
   }
 
-  func test_identity_of_unparseable_name_is_stable_across_equal_leaves() {
-    // `identity` is an opaque key (not a display string). Two slugs whose
-    // leaves are the same unparseable name share one identity; a different
-    // leaf does not collide.
+  func test_identity_distinguishes_same_leaf_across_repos() {
+    // F2 regression: two different repos that share a leaf are different
+    // files — main kept both visible; the leaf-only key wrongly dropped one.
     let a = ModelNameParts.parse("Qwen/Qwen3-0.6B")
     let b = ModelNameParts.parse("mirror/Qwen3-0.6B")
-    let other = ModelNameParts.parse("Qwen/Qwen3-1.7B")
-    XCTAssertEqual(a.identity, b.identity)
-    XCTAssertNotEqual(a.identity, other.identity)
+    XCTAssertNotEqual(a.identity, b.identity, "same leaf, different repo → distinct")
+  }
+
+  func test_identity_does_not_over_normalize_underscore_vs_hyphen() {
+    // F2: the display prettifier folds `_` and `-` to spaces, so a leaf-base
+    // key collided `Model_A` with `Model-A`. The full-slug key keeps them apart.
+    let underscore = ModelNameParts.parse("Model_A-Q4_K_M.gguf")
+    let hyphen = ModelNameParts.parse("Model-A-Q4_K_M.gguf")
+    XCTAssertNotEqual(underscore.identity, hyphen.identity, "underscore vs hyphen are distinct files")
   }
 }

@@ -36,22 +36,28 @@ public struct ModelNameParts: Equatable, Sendable {
   public let format: String?
   /// The raw leaf (last path component) — stable fallback + display source.
   public let raw: String
+  /// The full resolvable slug this was parsed from (`<repo>/<file>` or a bare
+  /// filename) — the dedup key (PR #174 review v2 F2).
+  public let slug: String
 
-  public init(base: String, quant: String?, format: String?, raw: String) {
+  public init(base: String, quant: String?, format: String?, raw: String, slug: String) {
     self.base = base
     self.quant = quant
     self.format = format
     self.raw = raw
+    self.slug = slug
   }
 
-  /// Structured-identity key for dedup/grouping (#580 Q1): base + quant +
-  /// format. Two slugs that parse to the same identity are the same
-  /// loadable model (an app-managed copy and an HF-cache copy collapse);
-  /// distinct quants (Q4 vs Q8) stay apart. For an unparseable name this
-  /// is just the raw leaf, so today's exact-slug-ish behavior is preserved.
-  public var identity: String {
-    "\(base)\u{1F}\(quant ?? "")\u{1F}\(format ?? "")"
-  }
+  /// Dedup key: the FULL resolvable slug, NOT the leaf-derived base (review
+  /// v2 F2). Two entries collapse only when they name the same resolvable
+  /// file — an app-managed download and an HF-cache copy of the same
+  /// `<repo>/<file>` slug. Distinct files that merely share a leaf (different
+  /// repos, an app-bare copy vs a repo-qualified one, or `Model_A` vs
+  /// `Model-A` that the display prettifier would fold together) stay apart,
+  /// matching origin/main's full-filename dedup. Quant distinctness (Q4 vs
+  /// Q8) falls out for free since the quant is part of the slug. Grouping and
+  /// display still use the prettified leaf `base`/`groupKey`.
+  public var identity: String { slug }
 
   /// Group key (#580 #4): the base name alone, so all quants of one family
   /// cluster under a single section header.
@@ -102,7 +108,7 @@ public struct ModelNameParts: Equatable, Sendable {
        segments.count >= 2 {
       let baseSegments = segments.dropLast()
       let base = prettify(baseSegments.joined(separator: "-"))
-      return ModelNameParts(base: base, quant: last.uppercased(), format: format, raw: raw)
+      return ModelNameParts(base: base, quant: last.uppercased(), format: format, raw: raw, slug: id)
     }
 
     // Fail-soft: no recognized quant.
@@ -110,9 +116,9 @@ public struct ModelNameParts: Equatable, Sendable {
     //   · everything else (safetensors dir-slug, extension-less) → the raw
     //     leaf verbatim, no format.
     if format != nil {
-      return ModelNameParts(base: stem, quant: nil, format: format, raw: raw)
+      return ModelNameParts(base: stem, quant: nil, format: format, raw: raw, slug: id)
     }
-    return ModelNameParts(base: raw, quant: nil, format: nil, raw: raw)
+    return ModelNameParts(base: raw, quant: nil, format: nil, raw: raw, slug: id)
   }
 
   /// Split a leaf into (stem-without-extension, FORMAT) for known model
