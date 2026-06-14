@@ -6,9 +6,10 @@
 # Runs the chat-apc speculative-decode suites against pie's **portable
 # Metal** driver with a REAL cached model (real weights, real GPU):
 #
-#   * spec_smoke_real.py — correctness/equivalence smoke: greedy
-#                          token-equivalence (spec == plain), at least one
-#                          accepted draft, and the forced-tool gate.
+#   * spec_smoke_real.py — correctness smoke: SHORT-WINDOW greedy
+#                          token-equivalence (spec == plain at 64 tok; not
+#                          unconditional — see #592), at least one accepted
+#                          draft, and the forced-tool gate.
 #   * spec_bench_real.py — measurement harness: per-scenario latency
 #                          (TTFT / wall / decode tok/s) and speculation
 #                          metrics (proposed/accepted/rejected, accepted

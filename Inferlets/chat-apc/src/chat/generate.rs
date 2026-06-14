@@ -10,8 +10,12 @@
 //! - [`DecodeStrategy::Plain`] — the default token-by-token decode.
 //! - [`DecodeStrategy::Speculative`] — attaches a [`CachebackDrafter`]
 //!   (linear LRU n-gram speculation) seeded from the prompt. Greedy-only:
-//!   the caller gates this to `temperature == 0` so output stays
-//!   token-identical to plain decode.
+//!   the caller gates this to `temperature == 0` so output stays a valid
+//!   greedy continuation. Identity with plain decode is a SHORT-WINDOW
+//!   guarantee only: the batched verify forward rounds differently from
+//!   single-token decode and can flip a near-tie argmax, so the spec
+//!   trajectory drifts off plain past a short window on the portable
+//!   Metal backend (#592, see `super::spec`).
 
 use std::sync::{Arc, Mutex};
 

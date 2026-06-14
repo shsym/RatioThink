@@ -460,7 +460,7 @@ bench-apc-real: $(LOGDIR) ## BENCHMARK: real-engine APC cold/miss vs warm/hit ch
 	  [ -f "$${OUT%.json}.md" ] && echo "summary: $${OUT%.json}.md"; \
 	  exit $$status
 
-test-spec-smoke: $(LOGDIR) ## Fast Think real-model correctness/equivalence smoke (opt-in, portable Metal, needs uv + real Qwen3-0.6B weights). Greedy spec==plain + ≥1 accepted draft + forced-tool gate.
+test-spec-smoke: $(LOGDIR) ## Fast Think real-model correctness smoke (opt-in, portable Metal, needs uv + real Qwen3-0.6B weights). Short-window greedy spec==plain (64 tok; #592) + ≥1 accepted draft + forced-tool gate.
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-spec-smoke.log; \
 	  SMOKE_ONLY=1 Scripts/run-spec-bench.sh 2>&1 | tee $$LOG | tail -40; \
