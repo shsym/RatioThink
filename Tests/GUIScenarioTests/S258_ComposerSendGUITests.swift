@@ -26,12 +26,9 @@ final class S258_ComposerSendGUITests: XCTestCase {
 
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
     configure(app, pieHome: pieHome, baseURL: baseURL, model: model)
-    app.launch()
     defer { app.terminate() }
-
-    XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "Rational.app did not reach runningForeground")
-    app.activate()
+    // Launch + win key reliably even on a later not-key launch (#545).
+    app.launchActivated(landmark: { $0.buttons["chats.newButton"] })
 
     try createChatAndSend(prompt, in: app)
     guard waitForAssistantEchoInAssistantBubble(visibleAssistantEcho, in: app, timeout: 120) else {
@@ -43,11 +40,8 @@ final class S258_ComposerSendGUITests: XCTestCase {
 
     let relaunched = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
     configure(relaunched, pieHome: pieHome, baseURL: baseURL, model: model)
-    relaunched.launch()
     defer { relaunched.terminate() }
-    XCTAssert(relaunched.wait(for: .runningForeground, timeout: 10),
-              "Rational.app did not relaunch")
-    relaunched.activate()
+    relaunched.launchActivated(landmark: { $0.buttons["chats.newButton"] })
 
     selectPersistedChat(titled: prompt, in: relaunched)
     guard waitForAssistantEchoInAssistantBubble(visibleAssistantEcho, in: relaunched, timeout: 15) else {
@@ -88,7 +82,11 @@ final class S258_ComposerSendGUITests: XCTestCase {
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5),
                   "composer.send missing; app tree: \(app.debugDescription)")
-    XCTAssertTrue(send.isEnabled, "composer.send was disabled after typing prompt")
+    // Action-based proof: wait until send is genuinely tappable (app key +
+    // enabled) rather than reading a one-shot `.isEnabled` that races the
+    // not-key window transition (#545).
+    XCTAssertTrue(send.waitForHittable(timeout: 5),
+                  "composer.send not tappable after typing prompt; app tree: \(app.debugDescription)")
     send.click()
   }
 

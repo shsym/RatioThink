@@ -250,3 +250,73 @@ func typeComposerText(
   pasteboard.setString(text, forType: .string)
   app.typeKey("v", modifierFlags: .command)
 }
+
+// MARK: - multi-launch activation race (shared launch mechanism, #545)
+//
+// `openFreshChat` / `selectPersistedChat` / `selectSidebarSection` above already
+// re-activate-and-retry to survive a not-key launch. The remaining brittle
+// spots are the LAUNCH itself and snapshot `.isEnabled` preconditions: under a
+// single `xcodebuild test` that launches Rational.app across several scenarios,
+// a LATER launch frequently comes up NOT-KEY — the app reaches
+// `.runningForeground` but another process still owns key focus, so the whole
+// AX tree reads `Disabled` and every `.isEnabled` / `.isHittable` snapshot is
+// false. A one-shot `app.activate()` races that key transition, so a following
+// `XCTAssertTrue(send.isEnabled, …)` fails on a perfectly healthy app — a
+// harness focus flake, not a product fault.
+//
+// These two helpers fix the mechanism so any multi-launch scenario can adopt
+// it: poll the LIVE AX tree for genuine hittability and RE-activate until a
+// landmark is actually interactable, instead of trusting a stale snapshot.
+// Nothing is weakened — a genuinely disabled control never becomes hittable and
+// still fails honestly.
+
+extension XCUIElement {
+  /// Wait until the element is genuinely hittable (app key + on-screen +
+  /// enabled). Uses `XCTNSPredicateExpectation` so it re-evaluates the live AX
+  /// tree rather than trusting a one-shot `.isHittable` / `.isEnabled` read.
+  /// Returns false on timeout — callers assert on the result, so the proof is
+  /// action-based (the control can actually be tapped), not a stale snapshot.
+  @discardableResult
+  func waitForHittable(timeout: TimeInterval = 10) -> Bool {
+    let predicate = NSPredicate(format: "isHittable == true")
+    let expectation = XCTNSPredicateExpectation(predicate: predicate, object: self)
+    return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
+  }
+}
+
+extension XCUIApplication {
+  /// Launch, reach `.runningForeground`, then RE-activate until `landmark` is
+  /// actually hittable — defeating the not-key multi-launch focus race (#545).
+  /// Replaces the brittle `launch(); wait(for: .runningForeground); activate()`
+  /// trio every scenario open-coded: a single `activate()` does not reliably
+  /// win key on a later launch, so subsequent `.isEnabled` reads race it.
+  ///
+  /// `landmark` should be the first element the scenario interacts with (e.g.
+  /// the New Chat button) so success proves that element is tappable, not just
+  /// that a window exists.
+  func launchActivated(
+    landmark: (XCUIApplication) -> XCUIElement = { $0.windows.firstMatch },
+    foregroundTimeout: TimeInterval = 10,
+    activationTimeout: TimeInterval = 20,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    launch()
+    XCTAssertTrue(
+      wait(for: .runningForeground, timeout: foregroundTimeout),
+      "Rational.app did not reach runningForeground",
+      file: file, line: line
+    )
+    let sentinel = landmark(self)
+    let deadline = Date().addingTimeInterval(activationTimeout)
+    repeat {
+      activate()
+      if sentinel.waitForHittable(timeout: 2) { return }
+    } while Date() < deadline
+    XCTFail(
+      "Rational.app never became key/interactable within \(activationTimeout)s "
+        + "(not-key multi-launch focus race); app tree: \(debugDescription)",
+      file: file, line: line
+    )
+  }
+}

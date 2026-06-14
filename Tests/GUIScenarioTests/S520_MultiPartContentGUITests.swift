@@ -80,11 +80,12 @@ final class S520_MultiPartContentGUITests: XCTestCase {
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
     app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = model
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
-    app.launch()
     defer { app.terminate() }
-    XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "Rational.app did not reach runningForeground")
-    app.activate()
+    // Launch + win key reliably even on a later not-key launch (#545). Use the
+    // default window sentinel — this scenario starts from an empty DB where
+    // openFreshChat picks among New-Chat affordances, so don't presume which
+    // one renders; openFreshChat re-activates further as needed.
+    app.launchActivated()
 
     openFreshChat(in: app)
     typeComposerText("The capital of France is", in: app)
