@@ -133,20 +133,30 @@ struct ProfileEditor: View {
     )
 
     return Menu {
-      ForEach(modelOptions) { option in
-        Button {
-          persistModel(option.slug, profileID: profile.id)
-        } label: {
-          // Value is the resolvable slug; label is the friendly leaf
-          // plus size + over-limit / unsupported reason.
-          modelOptionLabel(option)
+      // #580 #4: cluster all quants of a family under one base-name header
+      // so the menu reads as "Llama 3.2 1B Instruct → Q4 / Q8" instead of a
+      // flat list of long leaf names. The header is a disabled `Text` row
+      // (NOT a SwiftUI `Section`): a `Section` header inside a
+      // `.borderlessButton` Menu breaks the NSMenu so it never opens —
+      // verified by S365. A plain `Text` renders as a disabled label and
+      // keeps every Button a direct, selectable menu item.
+      ForEach(ModelIdentityGrouping.grouped(modelOptions, slug: \.slug)) { group in
+        Text(group.base)
+        ForEach(group.items) { option in
+          Button {
+            persistModel(option.slug, profileID: profile.id)
+          } label: {
+            // The row's primary text is the quant tag (the distinguishing
+            // part) plus size + over-limit / unsupported reason.
+            modelOptionLabel(option)
+          }
+          // Block selecting an unloadable model — over-limit (too large for
+          // this host) or unsupported (a split GGUF the engine can't load) —
+          // but never the current value, which stays a no-op.
+          .help(option.slug)
+          .accessibilityValue(option.slug)
+          .disabled((option.isOverLimit || option.unsupportedReason != nil) && !option.isCurrent)
         }
-        // Block selecting an unloadable model — over-limit (too large for
-        // this host) or unsupported (a split GGUF the engine can't load)
-        // — but never the current value, which stays a no-op.
-        .help(option.slug)
-        .accessibilityValue(option.slug)
-        .disabled((option.isOverLimit || option.unsupportedReason != nil) && !option.isCurrent)
       }
       Divider()
       Button {
@@ -172,23 +182,32 @@ struct ProfileEditor: View {
   @ViewBuilder
   private func modelOptionLabel(_ option: ProfileModelOptions.Option) -> some View {
     let text = modelOptionText(option)
+    // One systemImage per native menu row: current (checkmark) wins, then a
+    // blocking reason (triangle), then the unverified shield (#580 #5).
     if option.isCurrent {
       Label(text, systemImage: "checkmark")
     } else if option.isOverLimit || option.unsupportedReason != nil {
       Label(text, systemImage: "exclamationmark.triangle")
     } else if option.supportWarning != nil {
       Label(text, systemImage: "exclamationmark.triangle")
+    } else if option.isUnverified {
+      Label(text, systemImage: "exclamationmark.shield")
     } else {
       Text(text)
     }
   }
 
-  /// "<leaf>  <size>" plus "— exceeds <limit> limit" when the model is
-  /// too large for this host, or "— <reason>" when the engine can't load
-  /// it at all. Size is omitted when unknown (the synthesized
-  /// current-model entry).
+  /// "<quant>  <size>" plus "— exceeds <limit> limit" when too large for
+  /// this host, or "— <reason>" when the engine can't load it. When there
+  /// is no clean quant (a safetensors dir, a split GGUF) the row keeps the
+  /// FULL leaf — the only stable identifier for such a row — rather than a
+  /// stem that dropped `.gguf`. Size is omitted when unknown (the
+  /// synthesized current-model entry).
   private func modelOptionText(_ option: ProfileModelOptions.Option) -> String {
-    var text = option.displayName
+    var text = option.parts.quantOrLeaf
+    // An HF-cache source suffix disambiguates a same-quant app-vs-cache pair the
+    // full-slug dedup keeps as two rows (#590, mirrors the chat dropdown).
+    if let tag = option.sourceTag { text += " (\(tag))" }
     if let size = option.sizeBytes {
       text += "  \(InstalledModels.formattedSize(size))"
     }

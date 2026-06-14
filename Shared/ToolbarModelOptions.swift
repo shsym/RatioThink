@@ -18,22 +18,40 @@ public enum ToolbarModelOptions {
     /// Non-nil when the row is visible for context but must not be sent
     /// through the normal model-load path (partial download, split GGUF, etc.).
     public let unavailableReason: String?
+    /// `true` when the staged file was installed without a verified sha256
+    /// (#580 #5 — the chat menu renders a shield, matching the Settings table
+    /// + profile picker).
+    public let isUnverified: Bool
+    /// Structured identity parsed from `slug` (#580): the menu groups rows by
+    /// `parts.groupKey` (base) and shows `parts.quant` as the row tag.
+    public let parts: ModelNameParts
 
     public var id: String { slug }
     public var isSelectable: Bool { unavailableReason == nil }
+    /// Disambiguating source suffix for the row text. After the full-slug
+    /// dedup (review v2 F2) a family can list an app-managed copy AND an
+    /// HF-cache copy of the same quant (distinct slugs, same visible tag) —
+    /// mark the HF-cache row so the two differ in the menu, not just on hover.
+    /// App-managed rows carry no suffix (the unmarked default).
+    public var sourceTag: String? {
+      source == .huggingFaceCache ? "hf cache" : nil
+    }
 
     public init(slug: String,
                 displayName: String,
                 source: CachedModelSource?,
                 isCurrent: Bool,
                 isProfileDefault: Bool,
-                unavailableReason: String? = nil) {
+                unavailableReason: String? = nil,
+                isUnverified: Bool = false) {
       self.slug = slug
       self.displayName = displayName
       self.source = source
       self.isCurrent = isCurrent
       self.isProfileDefault = isProfileDefault
       self.unavailableReason = unavailableReason
+      self.isUnverified = isUnverified
+      self.parts = ModelNameParts.parse(slug)
     }
   }
 
@@ -131,7 +149,8 @@ public enum ToolbarModelOptions {
                     source: model?.source,
                     isCurrent: slug == currentSlug,
                     isProfileDefault: slug == profileDefault,
-                    unavailableReason: unavailableReason(for: model))
+                    unavailableReason: unavailableReason(for: model),
+                    isUnverified: model?.isUnverified ?? false)
     }
   }
 

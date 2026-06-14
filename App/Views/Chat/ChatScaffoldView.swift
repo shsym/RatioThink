@@ -57,6 +57,10 @@ struct ChatScaffoldView: View {
   /// verified empty/not-running/unreachable engine never re-surfaces
   /// placeholder models the engine would reject ( F2).
   @State private var engineModels: ToolbarModelList = .unknown
+  // #580 #5: the unverified shield in the chat menu flows through
+  // `toolbarDiscoveredModels` → `ToolbarModelOptions.build` (which carries
+  // each model's `isUnverified`), so no separate unverified-slug plumbing is
+  // needed here.
   @State private var toolbarDiscoveredModels: [InstalledModel] = []
   @State private var didScanToolbarModels = false
   /// PR#15 F2/F3: a thrown engine start/stop error (transport failure, a
@@ -356,7 +360,9 @@ struct ChatScaffoldView: View {
         viewModel: viewModel,
         availableProfiles: pickerProfileIDs,
         // #459's richer model menu (option list + collapsed summary), built
-        // from `Chat.modelID` (the #460 authority).
+        // from `Chat.modelID` (the #460 authority). #580 grouping + quant tag
+        // + unverified shield render inside `ContentToolbar` from these
+        // options (each carries its parsed `ModelNameParts` + `isUnverified`).
         modelOptions: toolbarModelOptions,
         currentModelSummary: toolbarCurrentModelSummary,
         // #460: the chat's persisted selection authority + the active

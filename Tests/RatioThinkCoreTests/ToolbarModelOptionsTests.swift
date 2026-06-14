@@ -52,6 +52,25 @@ final class ToolbarModelOptionsTests: XCTestCase {
     XCTAssertEqual(options.first { $0.slug == "HF/Beta.safetensors" }?.displayName, "Beta.safetensors")
   }
 
+  // Disambiguation suffix: an HF-cache row is marked so an app-vs-cache pair
+  // sharing a quant tag differs in the menu; app-managed + synthesized rows
+  // (served/profile-default with no discovered model) stay unmarked.
+  func test_source_tag_marks_hf_cache_rows_only() {
+    let options = ToolbarModelOptions.build(
+      discoveredModels: [appModel("App/Model-Q4_K_M.gguf"),
+                         hfModel("HF/Repo-GGUF/Model-Q4_K_M.gguf")],
+      servedModelIDs: ["served/RemoteOnly.gguf"],
+      profileDefaultModelID: nil,
+      modelOverride: nil,
+      residentModelID: nil)
+    XCTAssertNil(options.first { $0.slug == "App/Model-Q4_K_M.gguf" }?.sourceTag,
+                 "app-managed rows are unmarked (the default)")
+    XCTAssertEqual(options.first { $0.slug == "HF/Repo-GGUF/Model-Q4_K_M.gguf" }?.sourceTag,
+                   "hf cache")
+    XCTAssertNil(options.first { $0.slug == "served/RemoteOnly.gguf" }?.sourceTag,
+                 "a synthesized served row has no source → no suffix")
+  }
+
   func test_current_label_uses_actual_model_leaf_not_default_when_profile_default_is_selected() {
     let summary = ToolbarModelOptions.currentSummary(
       modelOverride: nil,

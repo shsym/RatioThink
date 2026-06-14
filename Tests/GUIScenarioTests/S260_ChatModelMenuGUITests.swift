@@ -3,10 +3,11 @@ import XCTest
 /// S260 — the chat model menu surfaces the seeded GGUF the engine serves.
 ///
 /// The menu reflects the ids the engine ACTUALLY serves (`GET /v1/models`,
-/// via `ChatScaffoldView`'s reconcile, which is gated on engine `.running`):
-/// the menu item label is `ModelDisplayName.leaf(servedID)`, so a served id
-/// of `Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` renders as
-/// `Qwen3-0.6B-Q8_0.gguf`. This needs a real engine serving that GGUF, so —
+/// via `ChatScaffoldView`'s reconcile, which is gated on engine `.running`).
+/// Since #580 the row is rendered as structured identity: a served id of
+/// `Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` clusters under a base-name
+/// section header `Qwen3 0.6B` with the quant `Q8_0` as the pickable row.
+/// This needs a real engine serving that GGUF, so —
 /// like its sibling S258 — it is driven by `Scripts/run-chat-gui-e2e.sh`,
 /// which boots the harness in portable mode against the staged weight and
 /// writes the engine URL into the shared config file. Absent that config
@@ -67,7 +68,9 @@ final class S260_ChatModelMenuGUITests: XCTestCase {
 
     // After the resident barrier, the menu row can carry the secondary
     // "(profile default)" annotation while still proving the served model is
-    // present in the selectable model menu.
+    // present in the selectable model menu. #580: the row text is the quant
+    // tag, but each row's accessibility VALUE still carries the full slug, so
+    // matching the leaf on value remains valid.
     XCTAssertTrue(waitForModelMenuItem(containingModelLeaf: "Qwen3-0.6B-Q8_0.gguf",
                                        in: app,
                                        openedBy: modelMenu,
@@ -110,8 +113,13 @@ final class S260_ChatModelMenuGUITests: XCTestCase {
   }
 
   private func menuItem(containingModelLeaf leaf: String, in app: XCUIApplication) -> XCUIElement {
-    let predicate = NSPredicate(format: "title CONTAINS[c] %@ OR label CONTAINS[c] %@ OR value CONTAINS[c] %@",
-                                leaf, leaf, leaf)
+    // #580: rows render the structured quant tag (not the leaf), so the stable
+    // target is the row's `ModelRow-<slug>` accessibility IDENTIFIER (the slug
+    // contains the leaf); `identifier` surfaces on the NSMenuItem where `value`
+    // does not. title/label/value kept as a fallback.
+    let predicate = NSPredicate(
+      format: "identifier CONTAINS[c] %@ OR title CONTAINS[c] %@ OR label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+      leaf, leaf, leaf, leaf)
     return app.menuItems.matching(predicate).firstMatch
   }
 

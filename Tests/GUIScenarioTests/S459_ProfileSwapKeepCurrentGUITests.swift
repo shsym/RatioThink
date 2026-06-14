@@ -106,6 +106,63 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
                   "Switch must commit the profile switch to fast-think; title=\(profileMenu.title)")
   }
 
+  /// #582: the swap popover must survive the window resigning key. The old
+  /// transient SwiftUI `.popover` was auto-closed by AppKit the instant the
+  /// window lost key (Cmd-Tab, Dock click, Spotlight, a notification), silently
+  /// dropping the pending swap. The production fix drives it from a
+  /// coordinator-owned `.applicationDefined` NSPopover. The DEBUG auto-pick seam
+  /// no longer re-raises a dismissed popover (that #579 re-raise MASKED this
+  /// gap), so a popover still present after a real focus steal proves genuine
+  /// resign-key survival — not a re-raise. This case FAILS if the popover dies
+  /// on focus loss.
+  @MainActor
+  func test_popover_survives_window_resigning_key() throws {
+    let app = launchPinnedX(followProfileDefault: true)
+    defer { app.terminate() }
+    _ = openSwapPopoverSwitchingToFastThink(in: app, requiringButton: "Switch")
+
+    let popover = app.descendants(matching: .any)
+      .matching(identifier: "profileSwap.popover").firstMatch
+    XCTAssertTrue(popover.exists,
+                  "precondition: swap popover must be present before the focus steal; app tree: \(app.debugDescription)")
+
+    // #582 review F1: the popover must present BELOW the profile menu (matching
+    // the former `arrowEdge: .bottom`), so the `preferredEdge` direction can't
+    // silently regress. XCUITest frames are screen coordinates (y increases
+    // downward), so "below" means the popover's top edge sits at/under the
+    // menu's bottom edge.
+    let profileMenuForGeometry = app.menuButtons["toolbar.profile"]
+    XCTAssertTrue(profileMenuForGeometry.exists, "profile menu missing for geometry check")
+    XCTAssertGreaterThanOrEqual(
+      popover.frame.minY, profileMenuForGeometry.frame.maxY,
+      "swap popover must present below the profile menu (#582 F1); popover=\(popover.frame) menu=\(profileMenuForGeometry.frame)")
+
+    // Steal key focus so our window resigns key — the exact condition that
+    // auto-closes a transient `.popover`. Finder is always running, so
+    // activating it is the lightest deterministic resign-key trigger.
+    let finder = XCUIApplication(bundleIdentifier: "com.apple.finder")
+    finder.activate()
+    XCTAssertTrue(finder.wait(for: .runningForeground, timeout: 10),
+                  "could not steal focus to Finder to force the window to resign key")
+    app.activate()
+    XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10),
+                  "Rational.app did not return to the foreground after the focus steal")
+
+    // The pending swap must NOT have been dropped by the focus loss.
+    XCTAssertTrue(popover.waitForExistence(timeout: 10),
+                  "profile-swap popover died when the window resigned key (#582); app tree: \(app.debugDescription)")
+    // …and its actions must still be live, not an empty shell.
+    XCTAssertTrue(app.buttons["Switch"].waitForExistence(timeout: 5),
+                  "popover survived but its Switch action is gone after focus loss; app tree: \(app.debugDescription)")
+    // The surviving popover still commits a real switch — prove it is the same
+    // live coordinator-owned swap, not a stale husk.
+    XCTAssertTrue(clickPopoverButton("Switch", in: app),
+                  "Switch button missing on the survived popover")
+    let profileMenu = app.menuButtons["toolbar.profile"]
+    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "fast-think", timeout: 10),
+                  "the survived popover's Switch must still commit the profile switch; title=\(profileMenu.title)")
+  }
+
   @MainActor
   func test_default_mode_switches_profile_without_prompt_and_keeps_pinned_model() throws {
     let app = launchPinnedX(followProfileDefault: false)

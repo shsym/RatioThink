@@ -132,6 +132,35 @@ final class S365_CachedModelDiscoveryGUITests: XCTestCase {
     app.typeKey(.escape, modifierFlags: [])
   }
 
+  @MainActor
+  func test_hf_cache_model_shows_source_suffix_in_picker() async throws {
+    let app = try launchApp()
+    defer { app.terminate() }
+    let settings = try openSettingsTab("Profiles", in: app)
+
+    let picker = app.menuButtons["ProfileEditorModelPicker"]
+    XCTAssertTrue(picker.waitForExistence(timeout: 15),
+                  "model picker missing on Profiles tab (no seeded profile?); "
+                  + "window: \(settings.debugDescription)")
+    picker.click()
+
+    // #590: the staged safetensors model is an HF-cache row, so the picker
+    // appends a "(hf cache)" source suffix (ProfileEditor.modelOptionText),
+    // mirroring the chat dropdown for app-vs-cache parity. Its leaf has no
+    // clean quant so the row keeps the full leaf; match on it plus the suffix.
+    // The safetensors option is launchable (advisory warning only), so it
+    // renders as `Label(text, systemImage:)` and the composed text lands in
+    // `title` — match `title`, the S365 unsupported-row pattern.
+    let leaf = String(Self.safetensorsSlug.split(separator: "/").last!)
+    let option = app.menuItems
+      .matching(NSPredicate(format: "title CONTAINS %@ AND title CONTAINS %@",
+                            leaf, "hf cache")).firstMatch
+    XCTAssertTrue(option.waitForExistence(timeout: 10),
+                  "HF-cache model is missing its '(hf cache)' source suffix in the "
+                  + "picker; menu tree: \(app.debugDescription)")
+    app.typeKey(.escape, modifierFlags: [])
+  }
+
   // MARK: - Launch / navigation
 
   @MainActor

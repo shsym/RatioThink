@@ -112,6 +112,58 @@ final class S486_ModelMenuNoResidentConfirmGUITests: XCTestCase {
     app.typeKey(.escape, modifierFlags: [])
   }
 
+  // MARK: - #580 structured-name rendering (visual verification)
+
+  /// The chat model dropdown renders the agreed STRUCTURED identity (Q1/Q3):
+  /// the base name as the section header, the quant as the row tag, and the
+  /// GGUF format dropped — NOT the raw `qwen3…gguf` leaf. Engine-free: the
+  /// seeded `chat` default (`Qwen3-0.6B-Q8_0.gguf`) is enough to open the menu.
+  @MainActor
+  func test_model_menu_renders_structured_quant_tag_not_raw_leaf() throws {
+    let app = launch(pinned: nil)
+    defer { app.terminate() }
+
+    let modelMenu = app.menuButtons["toolbar.model"]
+    XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
+                  "toolbar.model missing; app tree: \(app.debugDescription)")
+    XCTAssertTrue(openModelMenu(modelMenu, in: app),
+                  "model menu did not open; app tree: \(app.debugDescription)")
+
+    // Base name is the section header (#580 #4 / Q1 "base prominent").
+    XCTAssertTrue(app.menuItems["Qwen3 0.6B"].waitForExistence(timeout: 3),
+                  "base-name section header 'Qwen3 0.6B' missing; app tree: \(app.debugDescription)")
+
+    // The concrete row is targetable by its ModelRow-<slug> identifier and
+    // renders the QUANT tag as its visible text (Q1 "quant as a tag").
+    let row = app.menuItems
+      .matching(NSPredicate(format: "identifier CONTAINS[c] %@", defaultModelLeaf)).firstMatch
+    XCTAssertTrue(row.waitForExistence(timeout: 3),
+                  "ModelRow-<slug> identifier missing for the seeded model; app tree: \(app.debugDescription)")
+    XCTAssertTrue(row.title.localizedCaseInsensitiveContains("Q8_0"),
+                  "the model row must render the quant tag (Q8_0); title=\(row.title)")
+
+    // Q3 / "no raw leaf": no model ROW renders the `.gguf` leaf as its text.
+    XCTAssertFalse(row.title.localizedCaseInsensitiveContains(".gguf"),
+                   "the model row must NOT render the raw .gguf leaf; title=\(row.title)")
+    app.typeKey(.escape, modifierFlags: [])
+  }
+
+  /// Open the toolbar model menu (no row click), retrying under seated-session
+  /// focus contention. The `toolbar.model.manageModels` item is the
+  /// menu-is-open signal (it has no other source).
+  @MainActor
+  private func openModelMenu(_ modelMenu: XCUIElement, in app: XCUIApplication) -> Bool {
+    let deadline = Date().addingTimeInterval(20)
+    while Date() < deadline {
+      app.activate()
+      modelMenu.click()
+      if app.menuItems["toolbar.model.manageModels"].waitForExistence(timeout: 2) { return true }
+      app.typeKey(.escape, modifierFlags: [])
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.4))
+    }
+    return false
+  }
+
   // MARK: - setup
 
   /// Launch engine-free against a fresh `/tmp` PIE_HOME the NON-sandboxed app
@@ -174,8 +226,13 @@ final class S486_ModelMenuNoResidentConfirmGUITests: XCTestCase {
   /// accessibility value also carries the slug.
   private func modelMenuRow(containingLeaf leaf: String,
                             in app: XCUIApplication) -> XCUIElement {
-    let predicate = NSPredicate(format: "value CONTAINS[c] %@ OR label CONTAINS[c] %@ OR title CONTAINS[c] %@",
-                                leaf, leaf, leaf)
+    // #580: rows now render the structured quant tag, not the leaf, so the
+    // stable target is the row's `ModelRow-<slug>` accessibility IDENTIFIER
+    // (the slug contains the leaf). `identifier` surfaces on the NSMenuItem
+    // where `value` does not. value/label/title kept as a fallback.
+    let predicate = NSPredicate(
+      format: "identifier CONTAINS[c] %@ OR value CONTAINS[c] %@ OR label CONTAINS[c] %@ OR title CONTAINS[c] %@",
+      leaf, leaf, leaf, leaf)
     return app.menuItems.matching(predicate).firstMatch
   }
 

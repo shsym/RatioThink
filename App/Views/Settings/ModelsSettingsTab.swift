@@ -498,7 +498,12 @@ private struct InstalledModelsTable: View {
           }
         }
       } else {
-        Table(rows) {
+        // #580 #4: cluster all quants of a family under one base-name
+        // section header. `grouped` preserves the input mtime-desc order, so
+        // the most-recently-touched family stays on top and quants within a
+        // family stay mtime-ordered — grouping clusters without losing
+        // recency.
+        Table(of: InstalledModel.self) {
           TableColumn("Name") { row in
             HStack(spacing: 6) {
               if row.metadataUnreadable {
@@ -529,7 +534,11 @@ private struct InstalledModelsTable: View {
                   .help(reason)
                   .accessibilityIdentifier("InstalledRow-Unsupported-\(row.id)")
               }
-              Text(row.displayName).lineLimit(1).truncationMode(.middle)
+              // #580: within a base-name section the row's primary text is
+              // the quant tag (the distinguishing part), falling back to the
+              // full leaf when there is no clean quant.
+              Text(ModelNameParts.parse(row.filename).quantOrLeaf)
+                .lineLimit(1).truncationMode(.middle)
               if row.source == .huggingFaceCache {
                 // Cached HF models are read-only here (the app does not
                 // own ~/.cache/huggingface). Tag them so the user
@@ -595,6 +604,14 @@ private struct InstalledModelsTable: View {
             }
           }
           .width(min: 50, ideal: 60)
+        } rows: {
+          ForEach(ModelIdentityGrouping.grouped(rows, slug: \.filename)) { group in
+            Section(group.base) {
+              ForEach(group.items) { row in
+                TableRow(row)
+              }
+            }
+          }
         }
         .frame(minHeight: 140)
       }

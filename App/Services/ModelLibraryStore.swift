@@ -41,9 +41,10 @@ final class ModelLibraryStore: ObservableObject {
   }
 
   @Published private(set) var freshness: Freshness = .notScanned
-  /// Table-facing rows: app-managed + HF-cache, deduped by slug
-  /// keeping the app-managed row (the resolver's app-staged-first
-  /// precedence — migrated from `ModelsSettingsTab.refresh()`).
+  /// Table-facing rows: app-managed + HF-cache, deduped by the full
+  /// resolvable slug (review v2 F2) keeping the app-managed row (the
+  /// resolver's app-staged-first precedence — migrated from
+  /// `ModelsSettingsTab.refresh()`).
   @Published private(set) var installed: [InstalledModel] = []
   /// App models directory when it was prepared — the Add sheet's
   /// local-file import and the duplicate guard's backstop need it.
@@ -89,9 +90,13 @@ final class ModelLibraryStore: ObservableObject {
     guard epoch == scanEpoch else { return }
     modelsDirectory = result.modelsDirectory
     scanError = result.appError
-    let appSlugs = Set(result.appManaged.map(\.filename))
-    installed = result.appManaged
-      + result.huggingFaceCache.filter { !appSlugs.contains($0.filename) }
+    // Dedup by the full resolvable slug (review v2 F2): an app-managed
+    // download and an HF-cache copy of the SAME <repo>/<file> slug collapse
+    // to one row, app-managed first (the resolver's app-staged-first
+    // precedence). Distinct files that merely share a leaf — an app-bare copy
+    // vs a repo-qualified one, or different repos — stay as separate rows.
+    installed = ModelIdentityGrouping.deduped(
+      result.appManaged + result.huggingFaceCache, slug: \.filename)
     retireOverlay(active: downloads.active)
     // GC: a download id can never re-enter `active`, so ids whose rows
     // have evicted are dead weight in the reconciled set.

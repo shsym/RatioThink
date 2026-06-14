@@ -402,7 +402,15 @@ final class EngineTerminationWiringTests: XCTestCase {
       subprocessEnvironment: [:],
       pieHome: tmp.appendingPathComponent("home"),
       shmemName: "/pie_test_\(UUID().uuidString.prefix(8))",
-      handshakeTimeout: 0.05,
+      // Cleanup fires SIGINT at `handshakeTimeout`. It must outlast `/bin/sh`
+      // startup so the stub's `trap … INT TERM` is installed before the signal
+      // lands; an earlier SIGINT hits the still-starting shell with the default
+      // action, killing it uncaught (no trap, empty stderr) and making the
+      // refresh assertion vacuously fail. Production never races this — the
+      // 30s default handshake timeout always outlasts pie's signal-handler
+      // arming — so a generous fixture budget (0.05s/0.5s flaked under load)
+      // faithfully models that ordering.
+      handshakeTimeout: 3.0,
       profileID: "test-profile",
       modelConfig: .dummy)
 
