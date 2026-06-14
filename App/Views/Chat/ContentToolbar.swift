@@ -219,24 +219,24 @@ struct ContentToolbar: View {
     .menuStyle(.borderlessButton)
     .fixedSize()
     .accessibilityIdentifier("toolbar.profile")
-    // Anchor for Phase 3.6 confirmation popover. The popover content
-    // closure captures the token at present time (review v2 F4) and
-    // hands it back through `confirm(token:)` / `cancel(token:)` so a
-    // stale callback from a superseded swap is token-mismatched and
-    // dropped.
-    .popover(isPresented: swapPopoverBinding, arrowEdge: .bottom) {
-      if let pending = swapCoordinator.pending {
-        let capturedToken = pending.id
-        ProfileSwapPopover(
-          pending: pending,
-          estimatedTotalBytes: nil,
-          estimatedEtaSeconds: nil,
-          onConfirm: { setAsDefault in swapCoordinator.confirm(token: capturedToken, setAsDefault: setAsDefault) },
-          onCancel:  { swapCoordinator.cancel(token: capturedToken) },
-          onKeepCurrent: { swapCoordinator.keepCurrentModel(token: capturedToken) }
-        )
-      }
-    }
+    // Anchor for the Phase 3.6 confirmation popover. #582: a coordinator-owned
+    // `.applicationDefined` NSPopover (`ProfileSwapPopoverHost`) replaces the
+    // transient SwiftUI `.popover`, which AppKit auto-closed on resign-key —
+    // silently dropping a pending swap when the user Cmd-Tabbed / clicked
+    // another app. The host captures the pending token at present time (review
+    // v2 F4) and hands it back through `confirm(token:)` / `cancel(token:)` /
+    // `keepCurrentModel(token:)`, so a stale callback from a superseded swap is
+    // token-mismatched and dropped.
+    .background(
+      ProfileSwapPopoverHost(
+        pending: swapCoordinator.pending,
+        onConfirm: { token, setAsDefault in
+          swapCoordinator.confirm(token: token, setAsDefault: setAsDefault)
+        },
+        onCancel: { token in swapCoordinator.cancel(token: token) },
+        onKeepCurrent: { token in swapCoordinator.keepCurrentModel(token: token) }
+      )
+    )
   }
 
 #if DEBUG
@@ -248,16 +248,18 @@ struct ContentToolbar: View {
   }
 
   private var testAutoProfilePickTaskID: String {
+    // #582: the production swap popover is now a coordinator-owned
+    // `.applicationDefined` NSPopover that survives the window resigning key,
+    // so the seam no longer tracks pending-presence to re-raise a popover that
+    // a focus blip killed. #579 added that re-raise because the old transient
+    // `.popover` died on resign-key under a contended seated session — but that
+    // re-raise also MASKED the real production gap. With the gap fixed at the
+    // source, the auto-pick fires exactly once per stable pendable state, and
+    // S459's resign-key-survival case asserts the production NSPopover itself.
     [
       Self.testAutoPickProfileID ?? "",
       viewModel.selectedProfileID,
       selectedModelID ?? "",
-      // Track pending-presence so a popover dismissed by a focus blip (the
-      // `.popover` is transient and dies when the window resigns key under a
-      // contended seated session) re-runs this task and re-raises the swap —
-      // the seam mirrors a user who would simply re-open the profile menu. A
-      // one-shot latch could never recover that dismissal.
-      swapCoordinator.pending == nil ? "no-pending" : "pending",
     ].joined(separator: "|")
   }
 
@@ -492,20 +494,6 @@ struct ContentToolbar: View {
   private func openModelsSettings() {
     settingsNavigation.open(.models)
     openSettings()
-  }
-
-  /// `Binding<Bool>` derived from the coordinator's optional pending
-  /// swap. Setting `false` (popover dismissal — click-outside, Esc)
-  /// routes through `dismissCurrentPending()` which clears whatever
-  /// pending exists at that instant. The button callbacks above use
-  /// the token-checked `cancel(token:)` / `confirm(token:)` paths.
-  private var swapPopoverBinding: Binding<Bool> {
-    Binding(
-      get: { swapCoordinator.pending != nil },
-      set: { isPresented in
-        if !isPresented { swapCoordinator.dismissCurrentPending() }
-      }
-    )
   }
 
   private var paramsButton: some View {
