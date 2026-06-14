@@ -230,6 +230,57 @@ already dead). **A new GUI suite that stages a real `/tmp` home must add its
 glob to `GUI_TMP_HOMES` in the Makefile** — the in-suite `tearDown` is
 best-effort and a no-op under the sandboxed runner.
 
+### Test resource leases (`hc testlease`) — seated-GUI serialization
+
+The seated GUI seat is a single machine-local resource: two concurrent
+`xcodebuild ... RatioThinkGUITests ... test` runs collide on the one console
+session (focus theft, window-frame races, helper/PIE_HOME contention). The
+daemon exposes `hc testlease` (`gui-seat`, capacity 1; `xcode-build`,
+capacity 2) with a FIFO queue, automatic heartbeats, and crash-safe revocation
+(holder death → daemon revokes by TTL; no lock file to clean up).
+
+Every seated-GUI xcodebuild now runs through the lease wrapper, so a second
+`make test-gui*` **queues** behind the first instead of colliding:
+
+- `gui_suite_run` (all focused `test-gui-*` suites) →
+  `hc testlease run gui-seat --label "gui-<area>" -- xcodebuild …`
+- `test-gui` (full matrix) →
+  `hc testlease run gui-seat --label "test-gui" -- xcodebuild …`
+- `build-tests` build-for-testing trio →
+  `hc testlease run xcode-build --label "build-tests-*" -- xcodebuild …`
+
+The wrapper propagates the wrapped command's exit code, so the existing
+`| tee $LOG | tail` + `${PIPESTATUS[0]}` capture, `GUI_TMP_HOMES` sweep, and
+seated-session warning are unchanged. Inspect live state with
+`hc testlease status` (holders / queue / recent).
+
+**Daemon-side classifier gaps (follow-up, not worked around here).**
+`hc testlease classify` is the daemon's source of truth for whether a command
+*requires* a lease. It currently matches on the `make` target string, not the
+underlying xcodebuild, so two real GUI/build paths are mis-classified as
+"No daemon test lease required":
+
+1. A **raw** `xcodebuild -scheme RatioThinkGUITests … test` (run directly, not
+   via `make test-gui*`) — a genuine seated-GUI run that classify lets through
+   without a `gui-seat` lease.
+2. `build`/`build-tests`/`build-for-testing` invocations — classify reports no
+   lease even though the `xcode-build` resource exists explicitly for "native
+   build-for-testing invocations that consume build slots."
+
+The Makefile wrappers above acquire the correct lease regardless, but anyone
+invoking xcodebuild directly bypasses the seat. The fix belongs in the daemon
+classifier (match the xcodebuild scheme/action, not the make-target string);
+tracked under #545 as a daemon follow-up.
+
+**Frontend Tests tab (confirmed, lives in the daemon repo).** The left-nav
+"Tests" tab already exists in the Hephaestus daemon UI — not in this native
+app repo (it has no `frontend/`), but in the parent daemon's
+`frontend/src/components/Tests/TestsView.tsx`. It fetches
+`GET /api/testleases/status` (the same holders / queue / recent surfaced by
+`hc testlease status`), live-updates on `testlease.{queued,granted,released,
+revoked,priority_bumped}` events, and offers operator revoke / bump-priority.
+No work needed here; the wrappers above are exactly what populate it.
+
 ## Pre-PR, pre-merge, and release gates
 
 **CI v2 policy (#456): normal merge evidence is local.** Run `make ci-pr`

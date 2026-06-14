@@ -50,6 +50,7 @@ define gui_suite_run
   Scripts/purge-app-window-frames.sh || echo "warning: window-frame purge failed — saved NSWindow Frame keys may poison GUI runs"; \
   if [ -n "$$PIE_TEST_TCC_GRANTED" ]; then export TEST_RUNNER_PIE_TEST_TCC_GRANTED="$$PIE_TEST_TCC_GRANTED"; fi; \
   if [ -n "$$PIE_TEST_MODEL" ]; then export TEST_RUNNER_PIE_TEST_MODEL="$$PIE_TEST_MODEL"; fi; \
+  hc testlease run gui-seat --label "gui-$(1)" -- \
   xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkGUITests \
     -destination 'platform=macOS,arch=arm64' \
     -parallel-testing-enabled NO \
@@ -109,12 +110,15 @@ install-app: ## Signed install into /Applications, verified end-to-end (Helper+e
 	Scripts/install-app.sh
 
 build-tests: genproject ## Compile every xcodebuild target + the SPM probe (review v5 F2)
+	hc testlease run xcode-build --label "build-tests-app" -- \
 	xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build-for-testing
+	hc testlease run xcode-build --label "build-tests-gui" -- \
 	xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkGUITests \
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build-for-testing
+	hc testlease run xcode-build --label "build-tests-helper" -- \
 	xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkHelperTests \
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build-for-testing
@@ -553,6 +557,7 @@ test-gui: genproject $(LOGDIR) ## GUI scenarios — full RatioThinkGUITests matr
 	    echo "         macOS can prompt for permission. Subsequent SSH runs may"; \
 	    echo "         then work if the same shell binary holds the grant."; \
 	  fi; \
+	  hc testlease run gui-seat --label "test-gui" -- \
 	  xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkGUITests \
 	    -destination 'platform=macOS,arch=arm64' \
 	    -parallel-testing-enabled NO \
