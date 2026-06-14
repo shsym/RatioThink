@@ -36,6 +36,10 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
       config["PIE_TEST_GUI_HOME"],
       "\(Self.configPath) must define PIE_TEST_GUI_HOME")
     let model = config["PIE_TEST_CHAT_MODEL"] ?? "Qwen/Qwen3-0.6B"
+    // The concrete served slug the engine reconciles via /v1/models — the
+    // toolbar VALUE settles to this once residency lands (mirror S260).
+    let servedModelID = config["PIE_TEST_CHAT_MODEL_PIN"]
+      ?? "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
 
     // A prompt with NO JSON-value characters, so a static text carrying one
     // can only be the grammar-constrained assistant answer (not the echoed
@@ -53,16 +57,19 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
                   "New Chat button missing; app tree: \(app.debugDescription)")
     newChat.click()
 
-    // Resolve residentModelID before swapping profiles (same barrier as S426):
-    // the model menu renders the seeded leaf only after the reconcile, making
-    // the same-model JSON Think swap silent.
+    // Reconciliation barrier before swapping profiles (mirror the PASSING
+    // S260): the toolbar VALUE settles to the concrete served slug only after
+    // /v1/models reconciles, so this proves residency landed WITHOUT opening
+    // the model menu — eliminating that menu's not-key focus race entirely
+    // (#545). The same-model JSON Think swap is silent because the resident
+    // model is unchanged.
     let modelMenu = app.menuButtons["toolbar.model"]
     XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
                   "model menu missing after creating chat; app tree: \(app.debugDescription)")
-    let seededModel = app.menuItems["Qwen3-0.6B-Q8_0.gguf"]
-    // Open the model menu surviving a mid-test not-key transition (#545).
-    openMenuAndWaitForItem(modelMenu, item: seededModel, in: app)
-    app.typeKey(.escape, modifierFlags: [])
+    XCTAssertTrue(waitForResidentModelValue(modelMenu, servedModelID, timeout: 20),
+                  "toolbar.model never reflected reconciled resident model \(servedModelID); "
+                    + "title=\(modelMenu.title), value=\(String(describing: modelMenu.value)); "
+                    + "app tree: \(app.debugDescription)")
 
     // 1) JSON Think appears in the profile switcher and is selectable.
     let profileMenu = app.menuButtons["toolbar.profile"]
@@ -119,6 +126,27 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
   }
 
   // MARK: - assertions
+
+  /// Resident-model reconciliation barrier (mirror S260): the toolbar VALUE
+  /// equals the concrete served slug only after `/v1/models` reconciles, with
+  /// no "profile default"/"(Default)" annotation. Pure value read — no menu
+  /// open, so it cannot lose a not-key focus race (#545).
+  private func waitForResidentModelValue(_ element: XCUIElement,
+                                         _ expectedModelID: String,
+                                         timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      let value = element.value as? String ?? ""
+      let title = element.title
+      if value == expectedModelID,
+         !value.localizedCaseInsensitiveContains("profile default"),
+         !title.localizedCaseInsensitiveContains("(Default)") {
+        return true
+      }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.3))
+    }
+    return false
+  }
 
   private func waitForMenuButtonTitleContaining(_ element: XCUIElement,
                                                 _ needle: String,

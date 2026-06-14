@@ -295,21 +295,35 @@ func openMenuAndWaitForItem(
   item: XCUIElement,
   in app: XCUIApplication,
   attempts: Int = 4,
+  itemTimeout: TimeInterval = 10,
   file: StaticString = #filePath,
   line: UInt = #line
 ) {
   for _ in 0..<attempts {
-    app.activate()
-    guard menuButton.waitForHittable(timeout: 5) else { continue }
+    // Win key BEFORE clicking, the same launchActivated treatment the launch
+    // path uses: re-activate in a loop until the menu button is genuinely
+    // hittable, so the click OPENS the menu instead of being consumed by the
+    // not-key → key window transition (#545).
+    let keyDeadline = Date().addingTimeInterval(8)
+    var ready = false
+    repeat {
+      app.activate()
+      if menuButton.waitForHittable(timeout: 2) { ready = true; break }
+    } while Date() < keyDeadline
+    guard ready else { continue }
+
     menuButton.click()
-    if item.waitForExistence(timeout: 4) { return }
-    // Item absent — the click may have landed on a not-key window or the menu
-    // rendered stale. Dismiss any open menu and retry after re-activating.
+    // Wait the FULL item window before retrying. A toolbar model/profile menu
+    // renders its rows only after async reconciliation (/v1/models), so a short
+    // miss means "not reconciled yet", NOT "menu failed to open" — escaping and
+    // reopening on a 4s miss threw the pending reconcile away. Only retry if the
+    // item never appears within the window (the genuine not-key/closed case).
+    if item.waitForExistence(timeout: itemTimeout) { return }
     app.typeKey(.escape, modifierFlags: [])
     RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
   }
-  XCTFail("menu item did not appear after opening the menu within \(attempts) attempts "
-            + "(not-key focus race?); app tree: \(app.debugDescription)",
+  XCTFail("menu item did not appear after \(attempts) open attempts "
+            + "(not-key focus race or unreconciled menu?); app tree: \(app.debugDescription)",
           file: file, line: line)
 }
 
