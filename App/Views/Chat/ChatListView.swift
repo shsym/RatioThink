@@ -53,14 +53,17 @@ struct ChatListView: View {
     }
   }
 
+  // De-emphasized list header: renamed "Chat List" → "Conversations" and
+  // dropped the bold headline weight for a quiet secondary label.
   private var header: some View {
     HStack {
-      Text("Chat List")
-        .font(.headline)
+      Text("Conversations")
+        .font(.subheadline)
+        .foregroundStyle(.secondary)
       Spacer()
     }
-    .padding(.horizontal, 12)
-    .padding(.vertical, 8)
+    .padding(.horizontal, SidebarMetrics.rowHorizontalPadding)
+    .padding(.vertical, SidebarMetrics.rowVerticalPadding)
   }
 
   /// Row selection routes through this binding so picking a chat both
@@ -88,6 +91,14 @@ struct ChatListView: View {
       ForEach(sortedChats) { chat in
         row(for: chat)
           .tag(chat.id)
+          // Share the left-menu metric so rows line up with the nav rows and
+          // the header above them.
+          .listRowInsets(EdgeInsets(
+            top: SidebarMetrics.rowVerticalPadding,
+            leading: SidebarMetrics.rowHorizontalPadding,
+            bottom: SidebarMetrics.rowVerticalPadding,
+            trailing: SidebarMetrics.rowHorizontalPadding
+          ))
           .contextMenu {
             Button(chat.pinned ? "Unpin" : "Pin") {
               togglePin(chat)
@@ -289,7 +300,7 @@ struct ChatRowLabel: View {
     HStack(alignment: .firstTextBaseline, spacing: 6) {
       if pinned {
         Image(systemName: "pin.fill")
-          .font(.caption2)
+          .sidebarIcon()
           .foregroundStyle(.secondary)
       }
       VStack(alignment: .leading, spacing: 2) {

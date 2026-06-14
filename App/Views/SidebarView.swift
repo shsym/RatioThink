@@ -56,16 +56,16 @@ struct SidebarView: View {
 
   private func sidebarRow(_ section: SidebarSection, action: @escaping () -> Void) -> some View {
     Button(action: action) {
-      HStack(spacing: 6) {
+      HStack(spacing: SidebarMetrics.rowSpacing) {
         Image(systemName: section.systemImage)
-          .frame(width: 18, alignment: .center)
+          .sidebarIcon()
           .foregroundStyle(.secondary)
         Text(section.title)
           .foregroundStyle(.primary)
         Spacer()
       }
-      .padding(.horizontal, 10)
-      .padding(.vertical, 6)
+      .padding(.horizontal, SidebarMetrics.rowHorizontalPadding)
+      .padding(.vertical, SidebarMetrics.rowVerticalPadding)
       .background(
         RoundedRectangle(cornerRadius: 6)
           .fill(selection == section ? Color.accentColor.opacity(0.18) : Color.clear)

@@ -73,6 +73,9 @@ final class S5_AppWindowShellGUITests: XCTestCase {
     // Conversation search is a sibling sidebar destination.
     XCTAssertTrue(allStrings.contains("Search"),
                   "sidebar missing 'Search'; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
+    // The chat-list header was renamed Chat List → Conversations.
+    XCTAssertTrue(allStrings.contains("Conversations"),
+                  "chat-list header missing 'Conversations'; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
     // #422: the API Endpoints section is live — its sidebar nav row routes to
     // the single LocalAPIView.
     XCTAssertTrue(allStrings.contains("API Endpoints"),
