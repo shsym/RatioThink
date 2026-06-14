@@ -66,6 +66,7 @@ endef
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics test-landing-page \
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-sandbox-diagnostics test-readme-harness test-e2e-http \
+        test-spec-smoke test-spec-bench \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-menubar-icon-template \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
@@ -457,6 +458,22 @@ bench-apc-real: $(LOGDIR) ## BENCHMARK: real-engine APC cold/miss vs warm/hit ch
 	  echo "log: $$LOG"; \
 	  [ -f "$$OUT" ] && echo "artifact: $$OUT"; \
 	  [ -f "$${OUT%.json}.md" ] && echo "summary: $${OUT%.json}.md"; \
+	  exit $$status
+
+test-spec-smoke: $(LOGDIR) ## Fast Think real-model correctness/equivalence smoke (opt-in, portable Metal, needs uv + real Qwen3-0.6B weights). Greedy spec==plain + ≥1 accepted draft + forced-tool gate.
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-spec-smoke.log; \
+	  SMOKE_ONLY=1 Scripts/run-spec-bench.sh 2>&1 | tee $$LOG | tail -40; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  exit $$status
+
+test-spec-bench: $(LOGDIR) ## Fast Think vs baseline measurement harness (opt-in, portable Metal, needs uv + real weights). Latency + draft-acceptance metrics → JSON artifact. Knobs: MODEL, MAX_TOKENS, REPS, BENCH_OUT.
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-spec-bench.log; \
+	  Scripts/run-spec-bench.sh 2>&1 | tee $$LOG | tail -60; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
 	  exit $$status
 
 test-gui-script: ## Fast preflight regressions for GUI/E2E wrapper scripts
