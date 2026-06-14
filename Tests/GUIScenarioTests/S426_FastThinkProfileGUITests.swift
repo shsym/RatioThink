@@ -38,7 +38,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     let pieHome = try XCTUnwrap(
       config["PIE_TEST_GUI_HOME"],
       "\(Self.configPath) must define PIE_TEST_GUI_HOME")
-    let model = config["PIE_TEST_CHAT_MODEL"] ?? "Qwen/Qwen3-0.6B"
+    let model = config["PIE_TEST_CHAT_MODEL_PIN"] ?? "Qwen/Qwen3-0.6B"
 
     // The seeded Fast Think profile uses the SAME default model as Chat, so
     // selecting it is a same-model swap. Pinning `.running` (S302 seam) lets
@@ -54,7 +54,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     defer { app.terminate() }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     let newChat = app.buttons["chats.newButton"]
@@ -63,14 +63,28 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     newChat.click()
 
     // Resolve `residentModelID` to the served slug before swapping profiles:
-    // the model menu only renders the seeded leaf once the reconcile has run,
-    // so its appearance is our barrier that the swap below will be silent.
+    // `waitForResidentModelValue` below is the reconciliation barrier because
+    // it waits for the unannotated toolbar accessibility value to equal the
+    // served model id. A seeded-leaf menu row can exist earlier from the
+    // profile-default option, so row appearance alone is not the barrier.
     let modelMenu = app.menuButtons["toolbar.model"]
     XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
                   "model menu missing after creating chat; app tree: \(app.debugDescription)")
-    modelMenu.click()
-    let seededModel = app.menuItems["Qwen3-0.6B-Q8_0.gguf"]
-    XCTAssertTrue(seededModel.waitForExistence(timeout: 15),
+
+    // This is the silent same-resident swap barrier. A menu row containing the
+    // Qwen leaf can be present from the profile-default option before
+    // `/v1/models` reconciliation. The toolbar accessibility value only becomes
+    // the unannotated concrete served slug once resident reconciliation has
+    // landed, which is what makes the Fast Think profile swap silent.
+    XCTAssertTrue(waitForResidentModelValue(modelMenu, model, timeout: 15),
+                  "toolbar.model never reflected reconciled resident model \(model); title=\(modelMenu.title), value=\(String(describing: modelMenu.value)); app tree: \(app.debugDescription)")
+
+    // With resident reconciliation proven, separately verify the selectable
+    // model row is still present in the menu.
+    XCTAssertTrue(waitForModelMenuItem(containingModelLeaf: "Qwen3-0.6B-Q8_0.gguf",
+                                       in: app,
+                                       openedBy: modelMenu,
+                                       timeout: 15),
                   "seeded Qwen3 GGUF missing from chat model menu (reconcile did not land); app tree: \(app.debugDescription)")
     app.typeKey(.escape, modifierFlags: [])
 
@@ -109,7 +123,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     XCTAssertTrue(send.isEnabled, "composer.send was disabled after typing prompt")
     send.click()
 
-    guard waitForAtLeastTwoStaticTextsContaining(visibleAssistantEcho, in: app, timeout: 120) else {
+    guard waitForAssistantEchoInAssistantBubble(visibleAssistantEcho, in: app, timeout: 120) else {
       XCTFail("assistant reply did not stream back under Fast Think; app tree: \(app.debugDescription)")
       return
     }
@@ -124,7 +138,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = model
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = model
     // Pin `.running` so the model reconcile resolves the resident model and
     // the same-model Fast Think swap is silent (S302 DEBUG seam; the GUI
     // suite runs the Debug build).
@@ -150,23 +164,76 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     return false
   }
 
-  /// MarkdownUI exposes the assistant answer as separate/truncated static
-  /// text runs, so — like S258 — a second matching run proves the assistant
-  /// bubble streamed in (beyond the user's own prompt bubble). The wrapper's
-  /// post-run SQLite assertion covers the semantic answer.
-  private func waitForAtLeastTwoStaticTextsContaining(_ needle: String,
-                                                      in app: XCUIApplication,
-                                                      timeout: TimeInterval) -> Bool {
+  /// MarkdownUI may fragment a single message into multiple Accessibility
+  /// static-text runs, and the prompt text also appears in the user bubble
+  /// plus the auto-titled sidebar row. Scope the visibility assertion to the
+  /// assistant message container so a fragmented user bubble can never make
+  /// this pass with zero assistant output. The wrapper's post-run SQLite
+  /// assertion covers the semantic answer.
+  private func waitForAssistantEchoInAssistantBubble(_ needle: String,
+                                                    in app: XCUIApplication,
+                                                    timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
                                 needle, needle)
     while Date() < deadline {
-      if app.descendants(matching: .staticText).matching(predicate).count >= 2 {
-        return true
+      let assistantMessages = app.descendants(matching: .any)
+        .matching(identifier: "message.assistant")
+      for index in 0..<assistantMessages.count {
+        if assistantMessages.element(boundBy: index)
+          .descendants(matching: .staticText)
+          .matching(predicate)
+          .firstMatch
+          .exists {
+          return true
+        }
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
     }
     return false
+  }
+
+  private func waitForResidentModelValue(_ element: XCUIElement,
+                                         _ expectedModelID: String,
+                                         timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      let value = element.value as? String ?? ""
+      let title = element.title
+      if value == expectedModelID,
+         !value.localizedCaseInsensitiveContains("profile default"),
+         !title.localizedCaseInsensitiveContains("(Default)") {
+        return true
+      }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.3))
+    }
+    return false
+  }
+
+  private func waitForModelMenuItem(containingModelLeaf leaf: String,
+                                    in app: XCUIApplication,
+                                    openedBy modelMenu: XCUIElement,
+                                    timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      modelMenu.click()
+      if menuItem(containingModelLeaf: leaf, in: app).waitForExistence(timeout: 2) {
+        return true
+      }
+      app.typeKey(.escape, modifierFlags: [])
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.3))
+    }
+    return false
+  }
+
+  private func menuItem(containingModelLeaf leaf: String, in app: XCUIApplication) -> XCUIElement {
+    // #580: rows render the structured quant tag (not the leaf); target the
+    // row's `ModelRow-<slug>` accessibility IDENTIFIER (the slug contains the
+    // leaf), which surfaces on the NSMenuItem where `value` does not.
+    let predicate = NSPredicate(
+      format: "identifier CONTAINS[c] %@ OR title CONTAINS[c] %@ OR label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+      leaf, leaf, leaf, leaf)
+    return app.menuItems.matching(predicate).firstMatch
   }
 
   /// Shared with S258/S260: `Scripts/run-chat-gui-e2e.sh` writes this fixed

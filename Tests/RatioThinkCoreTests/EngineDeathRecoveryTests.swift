@@ -373,7 +373,7 @@ final class EngineDeathRecoveryTests: XCTestCase {
     // across the auto + user-Resume paths.
     let canonicalSpec = makeSpec(profileID: "chat")
     let resolverInvocations = OSAllocatedUnfairLock<[String]>(initialState: [])
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { id in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, _ in
       resolverInvocations.withLock { $0.append(id) }
       return .success(canonicalSpec)
     }
@@ -589,8 +589,10 @@ final class EngineDeathRecoveryTests: XCTestCase {
     XCTAssertNotNil(assistant, "the assistant row must remain (it was never cancelled/deleted)")
     XCTAssertTrue(assistant?.content.hasPrefix("⚠️") ?? false,
                   "failed recovery must surface the engine-gone marker, got: \(assistant?.content ?? "nil")")
-    XCTAssertTrue(assistant?.content.contains("Engine stopped unexpectedly") ?? false,
-                  "the surfaced error must be the engine-gone description")
+    // #477: the bubble shows the taxonomy's engine-gone copy, not the raw
+    // HTTPEngineError description.
+    XCTAssertTrue(assistant?.content.contains("The engine stopped while answering") ?? false,
+                  "the surfaced error must be the engine-gone copy, got: \(assistant?.content ?? "nil")")
   }
 
   // MARK: - 9. No recovery gate wired → engineGone surfaces, no hang
@@ -848,7 +850,7 @@ final class EngineDeathRecoveryTests: XCTestCase {
 
 @available(macOS 14, *)
 private final class HealthySession: PieEngineHost.EngineSession, @unchecked Sendable {
-  func shutdown() async {}
+  func shutdown() async -> EngineShutdownResult { .reaped }
   func checkLiveness() async -> EngineLiveness { .alive }
 }
 
@@ -856,7 +858,7 @@ private final class HealthySession: PieEngineHost.EngineSession, @unchecked Send
 private final class OneShotDeathSession: PieEngineHost.EngineSession, @unchecked Sendable {
   private let lock = NSLock()
   private var fired = false
-  func shutdown() async {}
+  func shutdown() async -> EngineShutdownResult { .reaped }
   func checkLiveness() async -> EngineLiveness {
     lock.lock(); defer { lock.unlock() }
     if !fired { fired = true; return .gone(reason: "synthetic crash") }
@@ -905,9 +907,6 @@ private final class ProbingChatEngine: EngineClient, @unchecked Sendable {
 
   func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
   func models() async throws -> [ModelInfo] { [] }
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    AsyncThrowingStream { $0.finish() }
-  }
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     callCount += 1
     let isFirst = (callCount == 1)
@@ -949,9 +948,6 @@ private final class ReasoningRetryEngine: EngineClient, @unchecked Sendable {
 
   func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
   func models() async throws -> [ModelInfo] { [] }
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    AsyncThrowingStream { $0.finish() }
-  }
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     callCount += 1
     let isFirst = (callCount == 1)

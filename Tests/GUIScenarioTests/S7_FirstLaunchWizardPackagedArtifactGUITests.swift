@@ -42,20 +42,20 @@ final class S7_FirstLaunchWizardPackagedArtifactGUITests: XCTestCase {
     defer { app.terminate() }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "Packaged RatioThink.app did not reach runningForeground")
+              "Packaged Rational.app did not reach runningForeground")
     app.activate()
     try assertLaunchedArtifact(probePath: initialProbePath, expectedAppPath: appPath)
 
-    XCTAssertTrue(app.staticTexts["Welcome to RatioThink"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["Welcome to Rational"].waitForExistence(timeout: 5))
     app.buttons["Continue"].click()
 
-    XCTAssertTrue(app.staticTexts["Keep RatioThink ready in the menu bar"].waitForExistence(timeout: 5))
-    app.buttons["Register RatioThinkHelper"].click()
-    XCTAssertTrue(app.staticTexts["RatioThinkHelper is registered"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["Keep Rational ready in the menu bar"].waitForExistence(timeout: 5))
+    app.buttons["Register Rational Helper"].click()
+    XCTAssertTrue(app.staticTexts["Rational Helper is registered"].waitForExistence(timeout: 5))
 
     // : no model step — login registration leads straight to
     // the main shell.
-    app.buttons["Open RatioThink"].click()
+    app.buttons["Open Rational"].click()
     XCTAssertTrue(app.buttons["chats.newButton"].waitForExistence(timeout: 5))
 
     app.terminate()
@@ -70,12 +70,12 @@ final class S7_FirstLaunchWizardPackagedArtifactGUITests: XCTestCase {
     defer { relaunched.terminate() }
 
     XCTAssert(relaunched.wait(for: .runningForeground, timeout: 10),
-              "Packaged RatioThink.app did not relaunch")
+              "Packaged Rational.app did not relaunch")
     relaunched.activate()
     try assertLaunchedArtifact(probePath: relaunchProbePath, expectedAppPath: appPath)
 
     XCTAssertTrue(relaunched.buttons["chats.newButton"].waitForExistence(timeout: 5))
-    XCTAssertFalse(relaunched.staticTexts["Welcome to RatioThink"].waitForExistence(timeout: 2),
+    XCTAssertFalse(relaunched.staticTexts["Welcome to Rational"].waitForExistence(timeout: 2),
                    "First-launch wizard reappeared after completion")
   }
 

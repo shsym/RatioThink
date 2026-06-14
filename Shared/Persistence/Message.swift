@@ -55,6 +55,17 @@ public final class Message {
   /// model id, future tool-call frames). Nil for plain
   /// non-streaming inserts.
   public var meta: Data?
+  /// Serialized `ToTTree` snapshot for a tree-of-thought turn (#413),
+  /// written as the search streams (one snapshot per level + terminal)
+  /// and rendered as a collapsible live tree-search section — the
+  /// structured analogue of `reasoning`'s "Thinking" section. Nil for
+  /// ordinary chat turns.
+  ///
+  /// Optional (nullable column) so SwiftData lightweight migration adds
+  /// it to a pre-existing `chats.sqlite` without a migration plan, and an
+  /// older export decodes without it. The `= nil` declaration-site
+  /// default mirrors `reasoning`'s migratability fix.
+  public var tot: Data? = nil
 
   public init(
     id: UUID = UUID(),
@@ -64,7 +75,8 @@ public final class Message {
     reasoning: String = "",
     tokens: Int = 0,
     ts: Date = Date(),
-    meta: Data? = nil
+    meta: Data? = nil,
+    tot: Data? = nil
   ) {
     self.id = id
     self.chat = chat
@@ -74,6 +86,7 @@ public final class Message {
     self.tokens = tokens
     self.ts = ts
     self.meta = meta
+    self.tot = tot
   }
 }
 
@@ -90,5 +103,38 @@ public extension Message {
       return nil
     }
     return object["finish_reason"] as? String
+  }
+
+  /// Engine-reported per-response generation throughput decoded from
+  /// `meta.generation_performance`. Nil for historical rows, cancelled /
+  /// failed rows that deliberately omit metrics, and corrupt/future blobs.
+  var generationPerformance: GenerationMetrics? {
+    guard let meta else { return nil }
+    return try? JSONDecoder().decode(MessageMeta.self, from: meta).generationPerformance
+  }
+
+  /// THE transcript ordering — timestamp, with the stable `id` breaking
+  /// ties. One definition shared by the renderer (`TranscriptView`), the
+  /// request builder (`ChatSendController.makeRequest`), and the retry
+  /// truncation (`ChatRetryPlan`), so "everything after this turn" means
+  /// the same set of rows the user sees and the engine would replay. (#513)
+  static func transcriptPrecedes(_ lhs: Message, _ rhs: Message) -> Bool {
+    if lhs.ts == rhs.ts { return lhs.id.uuidString < rhs.id.uuidString }
+    return lhs.ts < rhs.ts
+  }
+}
+
+struct MessageMeta: Codable, Equatable {
+  var finishReason: String?
+  var generationPerformance: GenerationMetrics?
+
+  init(finishReason: String? = nil, generationPerformance: GenerationMetrics? = nil) {
+    self.finishReason = finishReason
+    self.generationPerformance = generationPerformance
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case finishReason = "finish_reason"
+    case generationPerformance = "generation_performance"
   }
 }

@@ -2,22 +2,21 @@ import Foundation
 import SwiftUI
 
 /// Transient per-chat toolbar state — profile selection (mirrored into
-/// `Chat.profileID` by `ChatScaffoldView`), per-turn model override,
-/// sampling knobs and system-prompt override. The transcript itself
-/// lives in SwiftData as of Phase 4: `TranscriptView` reads
-/// `chat.messages` directly and `ComposerView` inserts a `Message`
-/// row through `ModelContext`.
+/// `Chat.profileID` by `ChatScaffoldView`), explicit sampling override and
+/// system-prompt override. The transcript itself lives in SwiftData as of
+/// Phase 4: `TranscriptView` reads `chat.messages` directly and
+/// `ComposerView` inserts a `Message` row through `ModelContext`.
 ///
-/// Model override / sampling / system-prompt override stay transient
-/// for v1 — they reset to defaults when navigating away from a chat,
-/// matching how popovers behave today. Persisting them onto `Chat`
-/// columns is a v2 follow-up; the schema column for `profileID`
-/// is the one piece that travels across navigations because the
-/// design doc lists the profile as the chat's identity.
+/// #460: the selected MODEL is no longer a transient view-model field. It
+/// is persisted on `Chat.modelID` (the single selection authority) and the
+/// toolbar reads/writes it directly through `ChatScaffoldView`, so the
+/// selection survives navigation/relaunch and a profile switch instead of
+/// resetting. Sampling / system-prompt override stay transient for v1 —
+/// they reset to defaults when navigating away, matching how popovers
+/// behave today; persisting them onto `Chat` is a separate follow-up.
 final class ChatTranscriptViewModel: ObservableObject {
   @Published var selectedProfileID: String
-  @Published var modelOverride: String?
-  @Published var sampling: ChatSampling
+  @Published var samplingOverride: ChatSampling?
   @Published var systemPromptOverride: String?
 
   /// Default model surface in the model pull-down until Phase 6 wires
@@ -32,13 +31,11 @@ final class ChatTranscriptViewModel: ObservableObject {
 
   init(
     selectedProfileID: String = "chat",
-    modelOverride: String? = nil,
-    sampling: ChatSampling = ChatSampling(),
+    samplingOverride: ChatSampling? = nil,
     systemPromptOverride: String? = nil
   ) {
     self.selectedProfileID = selectedProfileID
-    self.modelOverride = modelOverride
-    self.sampling = sampling
+    self.samplingOverride = samplingOverride
     self.systemPromptOverride = systemPromptOverride
   }
 }
