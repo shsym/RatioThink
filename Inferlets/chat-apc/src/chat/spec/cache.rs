@@ -42,7 +42,10 @@ impl NgramCache {
         }
     }
 
-    #[cfg(test)]
+    /// Distinct leaders currently held — the cache size. Grows as
+    /// generation observes new n-grams; surfaced as the `cache_size` spec
+    /// metric so the bench can see cache growth alongside hit rate.
+    #[allow(clippy::len_without_is_empty)] // cache size, not a collection API
     pub fn len(&self) -> usize {
         self.map.len()
     }

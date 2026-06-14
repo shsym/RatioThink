@@ -418,6 +418,17 @@ async def _bench(base: str) -> tuple[dict, list[str]]:
                     "generated_tokens": fsm.get("generated_tokens"),
                     "leader_len": fsm.get("leader_len"),
                     "draft_len": fsm.get("draft_len"),
+                    # #591: attribute a low accepted_ratio — distinguishes a
+                    # cold cache (drafter rarely proposes) from bad followers
+                    # (proposes but gets rejected), and shows the chain-length
+                    # spread behind avg_tokens_per_step.
+                    "cache_hits": fsm.get("cache_hits"),
+                    "cache_misses": fsm.get("cache_misses"),
+                    "cache_hit_rate": fsm.get("cache_hit_rate"),
+                    "cache_size": fsm.get("cache_size"),
+                    "accepted_prefix_len_histogram": fsm.get(
+                        "accepted_prefix_len_histogram"
+                    ),
                 },
                 "latency": {
                     "baseline": {
@@ -488,6 +499,30 @@ def _print_summary(artifact: dict) -> None:
     print("-" * len(hdr))
     print("speedup = fast_think engine decode tok/s ÷ baseline (ADVISORY; "
           "not a pass/fail criterion).")
+
+    # #591: cache effectiveness + chain-length spread, the signal that
+    # attributes a low accepted_ratio (cold cache vs bad followers).
+    print("\nn-gram cache (fast_think):")
+    cache_hdr = (
+        f"{'scenario':<10} {'hits':>7} {'misses':>7} {'hit_rate':>9} "
+        f"{'cache_sz':>9} {'accepted-prefix-len histogram':>32}"
+    )
+    print(cache_hdr)
+    print("-" * len(cache_hdr))
+    for s in artifact["scenarios"]:
+        spc = s["speculation"]
+        hr = spc.get("cache_hit_rate")
+        hr_s = f"{hr:.2f}" if isinstance(hr, (int, float)) else "--"
+        hist = spc.get("accepted_prefix_len_histogram")
+        hist_s = ",".join(str(x) for x in hist) if hist else "--"
+        print(
+            f"{s['scenario']:<10} {spc.get('cache_hits', '--')!s:>7} "
+            f"{spc.get('cache_misses', '--')!s:>7} {hr_s:>9} "
+            f"{spc.get('cache_size', '--')!s:>9} {hist_s:>32}"
+        )
+    print("-" * len(cache_hdr))
+    print("histogram index k = decode steps that committed k accepted draft "
+          "tokens (0 = free pick only).")
     drifted = [s["scenario"] for s in artifact["scenarios"]
                if s["greedy_equivalence"] == "drift_spec"]
     if drifted:

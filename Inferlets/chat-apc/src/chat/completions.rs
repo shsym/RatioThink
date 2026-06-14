@@ -443,6 +443,18 @@ struct SpecMetricsReport {
     decode_tokens_per_sec: f64,
     leader_len: usize,
     draft_len: usize,
+    /// n-gram cache effectiveness (#591): `draft()` lookups that hit a
+    /// follower vs returned empty (cold leader / chain ran dry), the
+    /// derived hit rate, and the end-of-turn cache size. Distinguishes
+    /// "drafter rarely proposes (cold cache)" from "proposes but rejected".
+    cache_hits: usize,
+    cache_misses: usize,
+    cache_hit_rate: f64,
+    cache_size: usize,
+    /// Accepted-prefix length distribution behind `avg_tokens_per_step`
+    /// (#591): index `k` = decode steps that committed exactly `k` accepted
+    /// draft tokens (index 0 = free pick only — cold or fully-rejected step).
+    accepted_prefix_len_histogram: Vec<usize>,
 }
 
 #[derive(Serialize)]
@@ -479,6 +491,7 @@ impl SpecMetricsReport {
         elapsed: Duration,
     ) -> Self {
         let secs = elapsed.as_secs_f64();
+        let cache_lookups = spec.cache_hits + spec.cache_misses;
         Self {
             enabled,
             fallback_reason,
@@ -499,6 +512,15 @@ impl SpecMetricsReport {
             },
             leader_len: dims.0,
             draft_len: dims.1,
+            cache_hits: spec.cache_hits,
+            cache_misses: spec.cache_misses,
+            cache_hit_rate: if cache_lookups > 0 {
+                spec.cache_hits as f64 / cache_lookups as f64
+            } else {
+                0.0
+            },
+            cache_size: spec.cache_size,
+            accepted_prefix_len_histogram: spec.accepted_prefix_hist,
         }
     }
 
@@ -510,7 +532,8 @@ impl SpecMetricsReport {
         eprintln!(
             "SPEC_STATS enabled={} fallback={} generated_tokens={} decode_steps={} \
              proposed={} accepted={} rejected={} avg_tokens_per_step={:.3} \
-             decode_tokens_per_sec={:.2}",
+             decode_tokens_per_sec={:.2} cache_hits={} cache_misses={} \
+             cache_hit_rate={:.3} cache_size={} prefix_hist={:?}",
             self.enabled,
             self.fallback_reason.unwrap_or("none"),
             self.generated_tokens,
@@ -520,6 +543,11 @@ impl SpecMetricsReport {
             self.rejected_draft_tokens,
             self.avg_tokens_per_step,
             self.decode_tokens_per_sec,
+            self.cache_hits,
+            self.cache_misses,
+            self.cache_hit_rate,
+            self.cache_size,
+            self.accepted_prefix_len_histogram,
         );
     }
 }
@@ -3548,7 +3576,7 @@ async fn handle_streaming(
     // the speculation surface, so normal streams are byte-identical).
     if want_metrics {
         let spec = spec_metrics_handle
-            .map(|h| *h.lock().unwrap())
+            .map(|h| h.lock().unwrap().clone())
             .unwrap_or_default();
         let report = SpecMetricsReport::build(
             spec_enabled,
@@ -4132,7 +4160,7 @@ async fn handle_non_streaming(
     // surface (so normal responses are byte-identical).
     let spec_metrics = if want_metrics {
         let spec = spec_metrics_handle
-            .map(|h| *h.lock().unwrap())
+            .map(|h| h.lock().unwrap().clone())
             .unwrap_or_default();
         let report = SpecMetricsReport::build(
             spec_enabled,

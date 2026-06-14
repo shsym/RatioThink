@@ -67,7 +67,10 @@ impl Default for SpecConfig {
 /// Acceptance accounting for one generation. Shared via `Arc<Mutex<_>>`
 /// because `Generator::speculator` takes ownership of the drafter, so the
 /// transport loop reads the final counts through a cloned handle.
-#[derive(Clone, Copy, Debug, Default)]
+/// Not `Copy`: carries the per-step accepted-prefix-length histogram as a
+/// `Vec`. The transport loop reads it via `.clone()` through the shared
+/// handle after generation completes.
+#[derive(Clone, Debug, Default)]
 pub struct SpecMetrics {
     /// Draft tokens proposed across all steps.
     pub proposed: usize,
@@ -79,6 +82,19 @@ pub struct SpecMetrics {
     pub steps: usize,
     /// Tokens committed (free picks + accepted drafts).
     pub generated: usize,
+    /// `NgramCache::get` lookups in `draft()` that returned a follower.
+    pub cache_hits: usize,
+    /// `NgramCache::get` lookups in `draft()` that returned empty — a cold
+    /// leader (no entry) or a chain that ran dry mid-draft.
+    pub cache_misses: usize,
+    /// Distinct leaders held after the last committed step — the cache size
+    /// (n-gram table growth over the turn).
+    pub cache_size: usize,
+    /// Accepted-prefix length distribution: `accepted_prefix_hist[k]` is the
+    /// number of decode steps that committed exactly `k` accepted draft
+    /// tokens (index 0 = free pick only — cold or fully-rejected step).
+    /// Exposes the chain-length spread behind `avg_tokens_per_step`.
+    pub accepted_prefix_hist: Vec<usize>,
 }
 
 pub struct CachebackDrafter {
@@ -127,7 +143,7 @@ impl CachebackDrafter {
     /// the shared [`Self::metrics_handle`] after generation completes.
     #[cfg(test)]
     pub fn metrics(&self) -> SpecMetrics {
-        *self.metrics.lock().unwrap()
+        self.metrics.lock().unwrap().clone()
     }
 
     #[cfg(test)]
@@ -171,15 +187,26 @@ impl inferlet::Speculator for CachebackDrafter {
         }
         let mut drafts = Vec::with_capacity(self.cfg.draft_len);
         let mut leader = self.recent.clone();
+        let mut hits = 0usize;
+        let mut misses = 0usize;
         for _ in 0..self.cfg.draft_len {
             match self.cache.get(&leader) {
                 Some(f) => {
+                    hits += 1;
                     drafts.push(f);
                     leader.remove(0);
                     leader.push(f);
                 }
-                None => break,
+                None => {
+                    misses += 1;
+                    break;
+                }
             }
+        }
+        {
+            let mut m = self.metrics.lock().unwrap();
+            m.cache_hits += hits;
+            m.cache_misses += misses;
         }
         self.last_proposed = drafts.len();
         let positions: Vec<u32> = (self.cursor..self.cursor + drafts.len() as u32).collect();
@@ -201,12 +228,20 @@ impl inferlet::Speculator for CachebackDrafter {
             m.rejected += self.last_proposed - hits;
             m.steps += 1;
             m.generated += accepted.len();
+            // Bucket this step by its accepted-prefix length (= hits).
+            if m.accepted_prefix_hist.len() <= hits {
+                m.accepted_prefix_hist.resize(hits + 1, 0);
+            }
+            m.accepted_prefix_hist[hits] += 1;
         }
         self.last_proposed = 0;
         for &t in accepted {
             self.ingest(t);
         }
         self.cursor += accepted.len() as u32;
+        // Record cache growth after this step's tokens are ingested; the
+        // final accept leaves the end-of-turn cache size.
+        self.metrics.lock().unwrap().cache_size = self.cache.len();
         // The prefill step's output has now been committed; drafts may
         // engage from the next (pure decode) step.
         self.prefilled = true;
@@ -449,6 +484,54 @@ mod tests {
         assert!(!next_drafts.is_empty());
         assert_eq!(next_positions[0], d.cursor());
         assert_eq!(next_positions[0], 2);
+    }
+
+    #[test]
+    fn draft_counts_cache_hits_on_warm_chain() {
+        let mut d = CachebackDrafter::new(cfg(), 0);
+        // Repeating a,b,c warms 3->1, 1->2, 2->3; recent=[3].
+        d.seed(&[1, 2, 3, 1, 2, 3]);
+        d.prefilled = true; // bypass the prefill-step gate for the unit test
+        let (drafts, _) = d.draft();
+        assert_eq!(drafts, vec![1, 2, 3]);
+        let m = d.metrics();
+        // Full draft_len chain: 3 hits, no terminal miss.
+        assert_eq!(m.cache_hits, 3);
+        assert_eq!(m.cache_misses, 0);
+    }
+
+    #[test]
+    fn draft_counts_cache_miss_on_cold_leader() {
+        let mut d = CachebackDrafter::new(cfg(), 0);
+        // Records only [1]->2, leaving recent=[2] with no entry for [2].
+        d.seed(&[1, 2]);
+        d.prefilled = true;
+        let (drafts, _) = d.draft();
+        assert!(drafts.is_empty());
+        let m = d.metrics();
+        assert_eq!(m.cache_hits, 0);
+        assert_eq!(m.cache_misses, 1); // cold leader: one empty lookup
+    }
+
+    #[test]
+    fn accept_records_prefix_length_histogram() {
+        let mut d = CachebackDrafter::new(cfg(), 0);
+        d.last_proposed = 3;
+        d.accept(&[100, 200, 201]); // free + 2 accepted drafts -> bucket 2
+        assert_eq!(d.metrics().accepted_prefix_hist, vec![0, 0, 1]);
+        d.last_proposed = 0;
+        d.accept(&[5]); // free pick only -> bucket 0
+        assert_eq!(d.metrics().accepted_prefix_hist, vec![1, 0, 1]);
+    }
+
+    #[test]
+    fn accept_tracks_cache_size_growth() {
+        let mut d = CachebackDrafter::new(cfg(), 0);
+        d.seed(&[1, 2, 3]); // cache {[1]:2, [2]:3}
+        d.last_proposed = 0;
+        d.accept(&[3, 4]); // ingest grows the table with [3]:{3,4}
+        assert_eq!(d.metrics().cache_size, d.cache_len());
+        assert_eq!(d.metrics().cache_size, 3);
     }
 
     #[test]
