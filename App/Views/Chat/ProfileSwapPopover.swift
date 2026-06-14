@@ -154,9 +154,10 @@ struct ProfileSwapPopover: View {
 /// `sync` then tears the popover down for.
 ///
 /// Attach via `.background(...)` on the profile menu so the empty anchor
-/// `NSView` tracks the menu's frame; the popover presents from the anchor's
-/// bottom edge (`.maxY` in the flipped SwiftUI hosting space), matching the
-/// former `arrowEdge: .bottom`.
+/// `NSView` tracks the menu's frame; the popover presents below it. The anchor
+/// is a plain unflipped `NSView` (`isFlipped == false`), so its bottom edge is
+/// `.minY` in AppKit geometry — that is the `preferredEdge` for a below-the-menu
+/// placement matching the former `arrowEdge: .bottom`.
 ///
 /// Token capture (review v2 F4) is preserved: `sync` captures `pending.id` when
 /// it builds the content, so each button callback carries the token that was
@@ -222,7 +223,9 @@ struct ProfileSwapPopoverHost: NSViewRepresentable {
       let popover = NSPopover()
       popover.behavior = .applicationDefined   // #582: survive resign-key
       popover.contentViewController = hosting
-      popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .maxY)
+      // `.minY` = the anchor's bottom edge (unflipped NSView), so the popover
+      // presents below the profile menu — the former `arrowEdge: .bottom`.
+      popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
       self.popover = popover
       self.shownToken = token
     }

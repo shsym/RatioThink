@@ -126,6 +126,17 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
     XCTAssertTrue(popover.exists,
                   "precondition: swap popover must be present before the focus steal; app tree: \(app.debugDescription)")
 
+    // #582 review F1: the popover must present BELOW the profile menu (matching
+    // the former `arrowEdge: .bottom`), so the `preferredEdge` direction can't
+    // silently regress. XCUITest frames are screen coordinates (y increases
+    // downward), so "below" means the popover's top edge sits at/under the
+    // menu's bottom edge.
+    let profileMenuForGeometry = app.menuButtons["toolbar.profile"]
+    XCTAssertTrue(profileMenuForGeometry.exists, "profile menu missing for geometry check")
+    XCTAssertGreaterThanOrEqual(
+      popover.frame.minY, profileMenuForGeometry.frame.maxY,
+      "swap popover must present below the profile menu (#582 F1); popover=\(popover.frame) menu=\(profileMenuForGeometry.frame)")
+
     // Steal key focus so our window resigns key — the exact condition that
     // auto-closes a transient `.popover`. Finder is always running, so
     // activating it is the lightest deterministic resign-key trigger.
