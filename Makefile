@@ -462,6 +462,7 @@ bench-apc-real: $(LOGDIR) ## BENCHMARK: real-engine APC cold/miss vs warm/hit ch
 test-gui-script: ## Fast preflight regressions for GUI/E2E wrapper scripts
 	Scripts/test-run-stage-test-model.sh
 	Scripts/test-run-chat-gui-e2e.sh
+	Scripts/test-run-ticket326-resolve.sh
 	Scripts/test-run-cache-smoke-real-e2e.sh
 	Scripts/test-run-large-model-e2e.sh
 	Scripts/test-run-resume-gui-history-e2e.sh

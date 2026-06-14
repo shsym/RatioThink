@@ -32,9 +32,13 @@ if [ -z "$PIE_BIN" ]; then
     # Rational.app (#445 rebrand, PRODUCT_NAME=Rational; the Xcode project name
     # stays RatioThink).
     if [ -d "$ROOT/RatioThink.xcodeproj" ]; then
+      # `|| true`: under set -euo pipefail (line 15) a non-zero xcodebuild
+      # (unconfigured scheme, signing/toolchain hiccup, transient project lock)
+      # would otherwise abort the whole script instead of falling through to the
+      # find + installed-app rungs below (#545 review v2 F2).
       products_dir="$(xcodebuild -project "$ROOT/RatioThink.xcodeproj" \
         -scheme RatioThink -configuration Debug -showBuildSettings 2>/dev/null \
-        | awk -F' = ' '/ BUILT_PRODUCTS_DIR = /{print $2; exit}')"
+        | awk -F' = ' '/ BUILT_PRODUCTS_DIR = /{print $2; exit}' || true)"
       if [ -n "$products_dir" ] \
          && [ -x "$products_dir/Rational.app/Contents/Resources/pie-engine/pie" ]; then
         PIE_BIN="$products_dir/Rational.app/Contents/Resources/pie-engine/pie"
@@ -45,9 +49,15 @@ if [ -z "$PIE_BIN" ]; then
     if [ -z "$PIE_BIN" ]; then
       derived_base="$(defaults read com.apple.dt.Xcode IDECustomDerivedDataLocation 2>/dev/null)"
       derived_base="${derived_base:-$HOME/Library/Developer/Xcode/DerivedData}"
+      # `|| true`: under set -euo pipefail a missing $derived_base (fresh
+      # machine, custom IDECustomDerivedDataLocation, cleaned DerivedData) makes
+      # `find` exit 1 — pipefail would abort the script before the
+      # /Applications/Rational.app fallback below. `head -1` can also SIGPIPE
+      # (141) on a large tree. Guard so resolution falls through (#545 review
+      # v2 F1, same class as the pgrep/engine_serve_pids guards).
       PIE_BIN="$(find "$derived_base" \
         -path '*RatioThink*/Build/Products/Debug/Rational.app/Contents/Resources/pie-engine/pie' \
-        -type f 2>/dev/null | xargs -I{} stat -f '%m %N' {} 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+        -type f 2>/dev/null | xargs -I{} stat -f '%m %N' {} 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)"
     fi
     if [ -z "$PIE_BIN" ] && [ -x "/Applications/Rational.app/Contents/Resources/pie-engine/pie" ]; then
       PIE_BIN="/Applications/Rational.app/Contents/Resources/pie-engine/pie"
