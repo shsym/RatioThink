@@ -91,6 +91,14 @@ public struct LocalAPIState: Equatable {
   /// Optional sub-line: failure cause or guidance when not serving.
   public let detail: String?
 
+  /// The authoritative served-model id from the running
+  /// `EngineSessionSnapshot`, else `nil`. The Local API surface labels this
+  /// as the EXACT id requests must use, so it is never approximated: no
+  /// `/v1/models` re-fetch, no `activeProfile.model` fallback. A legacy
+  /// snapshot with an empty `servedModelID` maps to `nil` (fail closed —
+  /// the exact-id row and curl example are hidden rather than guessed).
+  public let servedModelID: String?
+
   /// True only while the engine is running — gates the live-stat rows
   /// (base URL, model, memory, routes, curl).
   public var isServing: Bool {
@@ -114,15 +122,16 @@ public struct LocalAPIState: Equatable {
   ///     would immediately fail `profileMissing`.
   public static func make(status: EngineStatus, hasActiveProfile: Bool) -> LocalAPIState {
     switch status {
-    case .running(let port, _, _):
+    case .running(let snapshot):
       return LocalAPIState(
-        phase: .serving(port: port),
+        phase: .serving(port: snapshot.port),
         toggleOn: true,
         toggleEnabled: true,
         externalAccessToggleEnabled: true,
         profileSelectionEnabled: true,
         statusLabel: "Running",
-        detail: nil
+        detail: nil,
+        servedModelID: snapshot.servedModelID.isEmpty ? nil : snapshot.servedModelID
       )
     case .starting:
       return LocalAPIState(
@@ -132,7 +141,8 @@ public struct LocalAPIState: Equatable {
         externalAccessToggleEnabled: false,
         profileSelectionEnabled: false,
         statusLabel: "Starting…",
-        detail: "The local API becomes available once the engine finishes loading the model."
+        detail: "Available once the model finishes loading.",
+        servedModelID: nil
       )
     case .stopping:
       return LocalAPIState(
@@ -142,7 +152,8 @@ public struct LocalAPIState: Equatable {
         externalAccessToggleEnabled: false,
         profileSelectionEnabled: false,
         statusLabel: "Stopping…",
-        detail: nil
+        detail: nil,
+        servedModelID: nil
       )
     case .stopped:
       return LocalAPIState(
@@ -153,8 +164,9 @@ public struct LocalAPIState: Equatable {
         profileSelectionEnabled: true,
         statusLabel: "Off",
         detail: hasActiveProfile
-          ? "Turn on to serve OpenAI-compatible requests on 127.0.0.1."
-          : "Select a model in Settings → Models to enable the local API."
+          ? "Turn on to start the engine and serve requests on 127.0.0.1."
+          : "Choose a profile in the chat toolbar to enable the local API.",
+        servedModelID: nil
       )
     case .failed(let code, let message):
       // A retry (start) only makes sense for a recoverable failure that has
@@ -168,24 +180,17 @@ public struct LocalAPIState: Equatable {
         externalAccessToggleEnabled: true,
         profileSelectionEnabled: true,
         statusLabel: "Engine failed",
-        detail: failureReason(code: code, message: message)
+        detail: failureReason(code: code, message: message),
+        servedModelID: nil
       )
     }
   }
 
-  /// One-line human cause for a `.failed` engine status. Mirrors the
-  /// honest, code-aware framing used by `EngineStatusStore.statusDetail`
-  /// without dragging the store into the pure reducer.
+  /// One-line human cause for a `.failed` engine status, from the shared
+  /// `EngineProblem` taxonomy (#477) — the status `message` is a raw
+  /// diagnostic and never primary copy.
   static func failureReason(code: EngineErrorCode, message: String) -> String {
-    let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-    switch code {
-    case .memoryRisk:
-      return trimmed.isEmpty ? "Model too large for available memory." : trimmed
-    case .engineGone:
-      return trimmed.isEmpty ? "The engine stopped unexpectedly." : trimmed
-    default:
-      return trimmed.isEmpty ? "Engine failed (\(code.rawValue))." : "\(trimmed) (\(code.rawValue))"
-    }
+    EngineProblem(statusCode: code, rawMessage: message).message
   }
 }
 
@@ -290,9 +295,10 @@ public struct LocalAPIRoute: Equatable, Identifiable {
   }
 
   /// The routes `chat-apc` serves that are useful to an OpenAI-compatible
-  /// client. `/v1/inferlet` (raw dispatch) and `DELETE /v1/models/load`
-  /// (no-op) are intentionally omitted — they aren't part of the standard
-  /// client surface a user would call.
+  /// client. `/v1/inferlet` (raw dispatch) is intentionally omitted — it
+  /// isn't part of the standard client surface a user would call. (#469:
+  /// there is no `/v1/models/load` — the served model is fixed at engine boot
+  /// and read from `GET /v1/models`.)
   public static let clientFacing: [LocalAPIRoute] = [
     LocalAPIRoute(method: "POST", path: "/v1/chat/completions", summary: "Chat completions (SSE streaming)"),
     LocalAPIRoute(method: "GET", path: "/v1/models", summary: "List served models"),
@@ -310,7 +316,7 @@ public struct LocalAPIRoute: Equatable, Identifiable {
 ///    requests are blocked by the browser.
 ///
 /// These are constants because they are fixed by the app's launch contract
-/// for 0.1.2 (no per-endpoint configuration). If the launch contract gains
+/// for 0.1.4 (no per-endpoint configuration). If the launch contract gains
 /// a knob, this type becomes a computed projection of it.
 public struct EngineHTTPPosture: Equatable {
   public let bindMode: EngineHTTPBindMode
@@ -360,12 +366,15 @@ public struct LocalAPIProfileOption: Equatable, Identifiable {
   public static func make(entries: [ProfileLoadResult],
                           runtimeProfileID: String?) -> [LocalAPIProfileOption] {
     entries.compactMap { entry -> LocalAPIProfileOption? in
-      guard entry.error == nil, let profile = entry.profile else { return nil }
+      // A profile with no default model (#459) can't serve the Local API, so
+      // it has no endpoint to explore — skip it rather than list an empty row.
+      guard entry.error == nil, let profile = entry.profile,
+            let model = profile.model, !model.isEmpty else { return nil }
       return LocalAPIProfileOption(
         id: profile.id,
         title: profile.name,
-        modelID: profile.model,
-        modelDisplayName: ModelDisplayName.leaf(profile.model),
+        modelID: model,
+        modelDisplayName: ModelDisplayName.leaf(model),
         isRuntimeProfile: profile.id == runtimeProfileID
       )
     }

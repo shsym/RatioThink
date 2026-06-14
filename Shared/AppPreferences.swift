@@ -32,10 +32,23 @@ public final class AppPreferences: ObservableObject {
   public static let localAPIExternalAccessEnabledKey =
     EngineHTTPBindMode.localAPIExternalAccessEnabledPreferenceKey
 
+  /// Storage key for the Local API launch policy. Defaults off so the app
+  /// never loads a model or opens the local HTTP endpoint at startup unless
+  /// the user explicitly opts in from the Local API page.
+  public static let localAPIAutoStartEnabledKey = "localAPIAutoStartEnabled"
+
+  /// Compatibility toggle for users who want profile changes to keep offering
+  /// the destination profile's default model after a concrete model row was
+  /// selected. Default OFF: explicit model picks stay pinned across profile
+  /// changes for the current app flow.
+  public static let followProfileDefaultModelKey = "followProfileDefaultModel"
+
   private let defaults: UserDefaults
   private let localAPIExposurePreference: LocalAPIExposurePreference.Store
 
   @Published public private(set) var firstLaunchWizardCompleted: Bool
+
+  @Published public private(set) var followProfileDefaultModel: Bool
 
   /// Versions dismissed from the launch update banner. A dismissed version
   /// never re-surfaces; a strictly newer release is not in this set, so it
@@ -50,12 +63,18 @@ public final class AppPreferences: ObservableObject {
     localAPIExternalAccessEnabled ? .external : .loopback
   }
 
+  /// Whether RatioThink should start the shared engine (and therefore the
+  /// Local API) automatically on app launch. User-controlled; default false.
+  @Published public private(set) var localAPIAutoStartEnabled: Bool
+
   public init(defaults: UserDefaults = .standard,
               localAPIExposurePreference: LocalAPIExposurePreference.Store = .live()) {
     self.defaults = defaults
     self.localAPIExposurePreference = localAPIExposurePreference
     self.firstLaunchWizardCompleted = defaults.bool(forKey: Self.firstLaunchWizardCompletedKey)
+    self.followProfileDefaultModel = defaults.bool(forKey: Self.followProfileDefaultModelKey)
     self.ignoredUpdateVersions = Set(defaults.stringArray(forKey: Self.ignoredUpdateVersionsKey) ?? [])
+    self.localAPIAutoStartEnabled = defaults.bool(forKey: Self.localAPIAutoStartEnabledKey)
     let fileBacked = localAPIExposurePreference.loadEnabled()
     let defaultsBacked = defaults.bool(forKey: Self.localAPIExternalAccessEnabledKey)
     let effectiveExternalAccess = fileBacked ?? defaultsBacked
@@ -73,6 +92,13 @@ public final class AppPreferences: ObservableObject {
       defaults.set(effectiveExternalAccess, forKey: Self.localAPIExternalAccessEnabledKey)
       defaults.synchronize()
     }
+  }
+
+  public func setFollowProfileDefaultModel(_ enabled: Bool) {
+    guard followProfileDefaultModel != enabled else { return }
+    followProfileDefaultModel = enabled
+    defaults.set(enabled, forKey: Self.followProfileDefaultModelKey)
+    defaults.synchronize()
   }
 
   /// Persist a version as ignored. Flushed to disk now (like the first-launch
@@ -115,5 +141,15 @@ public final class AppPreferences: ObservableObject {
   public func resetFirstLaunchWizard() {
     firstLaunchWizardCompleted = false
     defaults.removeObject(forKey: Self.firstLaunchWizardCompletedKey)
+  }
+
+  /// Persist the Local API launch policy. Flushed immediately so a user can
+  /// toggle it and quit before the next automatic UserDefaults sync without
+  /// losing the startup intent.
+  public func setLocalAPIAutoStartEnabled(_ enabled: Bool) {
+    guard localAPIAutoStartEnabled != enabled else { return }
+    localAPIAutoStartEnabled = enabled
+    defaults.set(enabled, forKey: Self.localAPIAutoStartEnabledKey)
+    defaults.synchronize()
   }
 }

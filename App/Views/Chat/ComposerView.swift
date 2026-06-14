@@ -17,7 +17,26 @@ import os
 /// Opt insert a newline, Cmd-Return is reserved for menu shortcuts,
 /// etc.) — review v1 F1.
 struct ComposerView: View {
-  let chat: Chat
+  /// The owning chat for a normal persisting composer, or `nil` in #577
+  /// DRAFT MODE — the new-chat composer, which has no `Chat` row yet (none is
+  /// created until the first send). In draft mode `submit()` forwards the text
+  /// via `onDraftSubmit` instead of persisting; the caller creates + selects
+  /// the chat and routes the real send.
+  let chat: Chat?
+  /// #577 draft mode: when set, a send forwards the trimmed text here instead
+  /// of persisting a `Message`. Mutually exclusive with `chat` (a draft-mode
+  /// composer passes `chat: nil`). The no-model gate is NOT run here — the
+  /// scaffold the text is handed to runs it on the real send. Returns `true`
+  /// when the chat was created (so the composer clears its draft) and `false`
+  /// on a create failure (the draft is kept so the user can retry) — review
+  /// v1 F1.
+  let onDraftSubmit: ((String) -> Bool)?
+  /// #577 first-message handoff: when a new chat is created from the draft
+  /// composer, the scaffold mounts and seeds its composer with the typed text,
+  /// then auto-runs the normal send path (persist + assistant turn + gates).
+  /// Consumed exactly once on appear; `onConsumed` lets the owner clear the
+  /// pending handoff so a re-render can't re-seed it.
+  let handoff: ComposerHandoff?
   @ObservedObject var viewModel: ChatTranscriptViewModel
   let isSending: Bool
   /// : gate evaluated before the user message is persisted. When it
@@ -25,31 +44,107 @@ struct ComposerView: View {
   /// no-model confirm) — no user message is committed without a model
   /// to answer it.
   let shouldAllowSend: () -> Bool
-  let onSendBlocked: () -> Void
+  /// #516: carries the blocked draft so the parent can arm the pending
+  /// auto-send with the exact text the gate is promising to deliver.
+  let onSendBlocked: (String) -> Void
   let onUserMessageSaved: (Message) -> Void
+  /// #507: user-intent cancel of the selected chat's in-flight turn — the
+  /// composer's trailing button becomes a stop control while `isSending`.
+  /// `ChatSendController.cancel` keeps a non-empty partial bubble as a
+  /// cancelled turn (excluded from future request history).
+  let onStop: () -> Void
+  /// #516: a fired pending auto-send. The composer re-runs its normal
+  /// `submit()` path — same persistence, same gate, same in-flight
+  /// lifecycle as a manual send — but ONLY while the live draft still
+  /// matches the text the gate promised; an edit made during the model
+  /// load cancels the auto-send rather than sending mid-rewrite text.
+  let autoSubmit: ComposerAutoSubmit?
   @Environment(\.modelContext) private var modelContext
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
   @State private var draft: String = ""
+  /// The editor's live laid-out width, captured from SwiftUI via a
+  /// background `GeometryReader`. The box height is derived from `draft` +
+  /// this width (see `editorHeight`), so it is computed where both inputs
+  /// are known — no `NSTextView` round-trip whose width isn't valid yet at
+  /// `updateNSView` time (the timing trap the first cut of #446 hit).
+  @State private var editorWidth: CGFloat = 0
+  /// #577: ensures the first-message `handoff` is seeded + auto-sent only once
+  /// per appearance, even if the body re-renders before the owner clears it.
+  @State private var didConsumeHandoff = false
   @FocusState private var isFocused: Bool
 
-  /// Single line height target. SwiftUI's `TextEditor` measures itself
-  /// from intrinsic content height; we sample once via `lineHeight`
-  /// helper and clamp `1...maxLines` lines for the visual box.
-  private static let minLines = 1
+  /// Auto-grow envelope. The box height tracks the editor's REAL laid-out
+  /// content height (`draft` measured at the live `editorWidth`), clamped to
+  /// `[lineHeight, lineHeight * maxLines]`. #446: the previous height counted
+  /// only hard `\n`s, so a long line that SOFT-WRAPS stayed one line tall and
+  /// the wrapped text (descenders included) clipped. Real layout accounts for
+  /// wraps, hard newlines, and the font's actual metrics.
   private static let maxLines = 8
-  /// Empirically measured at 13pt system body; matches the `NSTextView`
-  /// default line height closely enough to avoid one-pixel jitter on
-  /// the first line.
+  /// Single-line floor for the box. 13pt system body lays out at ~16pt; the
+  /// 18pt floor adds ~2pt of breathing room so a single line's descenders
+  /// never touch the bottom edge, and serves as the per-line unit for the
+  /// `maxLines` ceiling.
   private static let lineHeight: CGFloat = 18
   private static let verticalPadding: CGFloat = 8
+  /// The 8-line ceiling; past it the editor scrolls internally.
+  private static var maxBoxHeight: CGFloat { lineHeight * CGFloat(maxLines) }
+
+  /// Clamp the editor's real content height into the visible box envelope.
+  /// Pure + static so the auto-grow contract is unit-tested without a view
+  /// host (the regression: a soft-wrapped line must yield a taller box than
+  /// a single short line — newline-counting could not tell them apart).
+  static func editorBoxHeight(forContentHeight h: CGFloat) -> CGFloat {
+    min(max(h, lineHeight), maxBoxHeight)
+  }
+
+  /// The text's real laid-out height at a given container width — the
+  /// measurement that drives auto-grow. Pure (throwaway TextKit stack, no
+  /// view host) and the single source the live editor also calls, so the
+  /// wrap contract is unit-testable: a soft-wrapped line is TALLER than a
+  /// short one — the distinction the old hard-`\n` count could not make.
+  static func contentHeight(forText text: String,
+                            containerWidth: CGFloat,
+                            inset: CGFloat = 0,
+                            lineFragmentPadding: CGFloat = 5,
+                            font: NSFont = .systemFont(ofSize: NSFont.systemFontSize)) -> CGFloat {
+    guard containerWidth > 1 else { return lineHeight }
+    let storage = NSTextStorage(string: text, attributes: [.font: font])
+    let layout = NSLayoutManager()
+    storage.addLayoutManager(layout)
+    let container = NSTextContainer(size: CGSize(width: containerWidth, height: .greatestFiniteMagnitude))
+    container.lineFragmentPadding = lineFragmentPadding
+    layout.addTextContainer(container)
+    layout.ensureLayout(for: container)
+    return layout.usedRect(for: container).height + inset * 2
+  }
+
+  /// The box height for the current draft at the live editor width.
+  private var editorHeight: CGFloat {
+    Self.editorHeight(forDraft: draft, editorWidth: editorWidth)
+  }
+
+  /// Compose the measure + clamp: the draft's real wrapped height at the live
+  /// editor width, clamped into the 1..maxLines envelope. The `NSTextView`'s
+  /// container tracks the view width, so measuring at `editorWidth` reproduces
+  /// the editor's own `usedRect` (verified). Static so the auto-grow contract
+  /// — a soft-wrapped draft yields a TALLER box than a short one at the same
+  /// width — is unit-tested without a view host (the wiring gap the first cut
+  /// of #446 missed).
+  static func editorHeight(forDraft draft: String, editorWidth: CGFloat) -> CGFloat {
+    editorBoxHeight(forContentHeight: contentHeight(forText: draft, containerWidth: editorWidth))
+  }
 
   init(
-    chat: Chat,
+    chat: Chat?,
     viewModel: ChatTranscriptViewModel,
     isSending: Bool = false,
     shouldAllowSend: @escaping () -> Bool = { true },
-    onSendBlocked: @escaping () -> Void = {},
-    onUserMessageSaved: @escaping (Message) -> Void = { _ in }
+    onSendBlocked: @escaping (String) -> Void = { _ in },
+    onUserMessageSaved: @escaping (Message) -> Void = { _ in },
+    onStop: @escaping () -> Void = {},
+    autoSubmit: ComposerAutoSubmit? = nil,
+    onDraftSubmit: ((String) -> Bool)? = nil,
+    handoff: ComposerHandoff? = nil
   ) {
     self.chat = chat
     self.viewModel = viewModel
@@ -57,6 +152,10 @@ struct ComposerView: View {
     self.shouldAllowSend = shouldAllowSend
     self.onSendBlocked = onSendBlocked
     self.onUserMessageSaved = onUserMessageSaved
+    self.onStop = onStop
+    self.autoSubmit = autoSubmit
+    self.onDraftSubmit = onDraftSubmit
+    self.handoff = handoff
   }
 
   var body: some View {
@@ -65,7 +164,16 @@ struct ComposerView: View {
         text: $draft,
         onSubmit: submit
       )
-      .frame(minHeight: minHeight, maxHeight: maxHeight)
+      .frame(height: editorHeight)
+      // Capture the editor's live width so `editorHeight` can wrap-measure
+      // the draft at the real width (#446). Width is set by the HStack and is
+      // independent of height, so this never feeds back into a layout loop.
+      .background(
+        GeometryReader { geo in
+          Color.clear.preference(key: ComposerEditorWidthKey.self, value: geo.size.width)
+        }
+      )
+      .onPreferenceChange(ComposerEditorWidthKey.self) { editorWidth = $0 }
       .padding(.horizontal, 10)
       .padding(.vertical, Self.verticalPadding)
       .background(
@@ -79,43 +187,86 @@ struct ComposerView: View {
       .focused($isFocused)
       .accessibilityIdentifier("composer.text")
 
-      Button(action: submit) {
-        Image(systemName: "arrow.up.circle.fill")
-          .font(.system(size: 26, weight: .regular))
+      if isSending {
+        // #507: while this chat's turn streams, the trailing control is a
+        // stop button — the user-reachable cancel (the navigate-away cancel
+        // is gone; switching chats no longer touches the stream).
+        Button(action: onStop) {
+          Image(systemName: "stop.circle.fill")
+            .font(.system(size: 26, weight: .regular))
+        }
+        .buttonStyle(.plain)
+        .help("Stop generating")
+        .accessibilityIdentifier("composer.stop")
+      } else {
+        Button(action: submit) {
+          Image(systemName: "arrow.up.circle.fill")
+            .font(.system(size: 26, weight: .regular))
+        }
+        .buttonStyle(.plain)
+        .disabled(trimmedDraft.isEmpty)
+        .help("Send (Return). Shift+Return inserts a newline.")
+        .accessibilityIdentifier("composer.send")
       }
-      .buttonStyle(.plain)
-      .disabled(trimmedDraft.isEmpty || isSending)
-      .help("Send (Return). Shift+Return inserts a newline.")
-      .accessibilityIdentifier("composer.send")
     }
     .padding(.horizontal, 16)
     .padding(.vertical, 10)
-    .onAppear { isFocused = true }
+    .onAppear {
+      isFocused = true
+      consumeHandoffIfNeeded()
+    }
+    // #516: a fired pending auto-send rides the normal submit path. The
+    // tick makes consecutive fires distinguishable; the text match is the
+    // edit guard (see `autoSubmit` doc).
+    .onChange(of: autoSubmit) { _, request in
+      guard let request, trimmedDraft == request.expectedText else { return }
+      submit()
+    }
   }
 
   private var trimmedDraft: String {
     draft.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
-  private var lineCount: Int {
-    // +1 because N newlines means N+1 lines; clamp to [min, max] for
-    // the visual envelope — overflow scrolls inside the editor.
-    let newlines = draft.reduce(0) { $0 + ($1 == "\n" ? 1 : 0) }
-    return max(Self.minLines, min(Self.maxLines, newlines + 1))
+  /// #577: seed the typed first message from the new-chat handoff and run the
+  /// normal send path once. The owner's `onConsumed` clears the pending
+  /// handoff so a re-render can't re-seed it; the actual `submit()` is deferred
+  /// to the next runloop tick so the scaffold's gate/handlers are fully wired
+  /// before the synthesized send fires.
+  private func consumeHandoffIfNeeded() {
+    guard !didConsumeHandoff, let handoff else { return }
+    didConsumeHandoff = true
+    // Consume only when the handoff is actually seeded — clearing the pending
+    // before the empty-draft guard would destroy the text on the (unreached)
+    // non-empty branch. Review v1 F2.
+    guard draft.isEmpty else { return }
+    handoff.onConsumed()
+    draft = handoff.text
+    DispatchQueue.main.async { submit() }
   }
-
-  private var minHeight: CGFloat { Self.lineHeight }
-  private var maxHeight: CGFloat { Self.lineHeight * CGFloat(lineCount) }
 
   private func submit() {
     let payload = trimmedDraft
     guard !payload.isEmpty, !isSending else { return }
+    // #577 draft mode (new-chat composer): no chat row exists yet, so forward
+    // the text instead of persisting. The caller creates + selects the chat
+    // and routes the real send (which runs the no-model gate there). Clear the
+    // draft ONLY when the caller confirms the chat was created — on a create
+    // failure the text is kept so the user can retry, matching the
+    // existing-chat persist path below. Review v1 F1.
+    if let onDraftSubmit {
+      if onDraftSubmit(payload) { draft = "" }
+      return
+    }
     // : block before persisting if no model is resolvable. Keep the
     // draft so the user can send it once they load/choose a model.
     guard shouldAllowSend() else {
-      onSendBlocked()
+      onSendBlocked(payload)
       return
     }
+    // A persisting composer always has a chat; nil here means a misuse
+    // (draft mode without `onDraftSubmit`) — bail rather than crash.
+    guard let chat else { return }
     // Establish the relationship from the to-many owning side
     // exclusively ( F11). Setting `Message.chat` AND appending
     // to `chat.messages` double-wires the inverse and has surfaced
@@ -128,9 +279,18 @@ struct ComposerView: View {
       ts: Date()
     )
     let previousUpdatedAt = chat.updatedAt
+    let previousTitle = chat.title
     modelContext.insert(message)
     chat.messages.append(message)
     chat.updatedAt = message.ts
+    // #512: first real user message titles the chat — a deterministic
+    // local heuristic (trim/collapse/cap), committed in the SAME save as
+    // the message so it can never block or outlive the send. Only a
+    // never-user-titled chat still carrying the placeholder is renamed
+    // (`shouldAutoTitle`), so a manual rename wins permanently.
+    if ChatLifecycle.shouldAutoTitle(chat), let title = ChatAutoTitle.derive(from: payload) {
+      chat.title = title
+    }
     do {
       try modelContext.save()
       draft = ""
@@ -142,21 +302,50 @@ struct ComposerView: View {
       chat.messages.removeAll { $0.id == message.id }
       modelContext.delete(message)
       chat.updatedAt = previousUpdatedAt
+      chat.title = previousTitle
       persistenceStatus.report(error, context: "ComposerView.submit")
     }
   }
+}
+
+/// #577: the new-chat first-message handoff. When a chat is created from the
+/// draft composer, the scaffold mounts and hands the typed text here; the
+/// composer seeds its draft with `text`, calls `onConsumed` (so the owner
+/// clears the pending handoff), and auto-runs the normal send path once.
+struct ComposerHandoff {
+  let text: String
+  let onConsumed: () -> Void
+}
+
+/// #516: one fired pending auto-send. `tick` increments per fire so equal
+/// text on a later block still triggers `.onChange`; `expectedText` is the
+/// edit guard the composer checks against its live draft.
+struct ComposerAutoSubmit: Equatable {
+  let tick: Int
+  let expectedText: String
 }
 
 // MARK: - AppKit bridge
 
 private let composerLog = Logger(subsystem: "com.ratiothink.app", category: "composer")
 
+/// Carries the composer editor's measured width up so `ComposerView` can
+/// wrap-measure the draft at the real width (#446 auto-grow).
+private struct ComposerEditorWidthKey: PreferenceKey {
+  static let defaultValue: CGFloat = 0
+  static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+    value = max(value, nextValue())
+  }
+}
+
 /// NSTextView-backed editor that:
 ///   · forwards plain Return to `onSubmit`
 ///   · lets any modifier+Return fall through to `super` (Shift / Opt
 ///     insert a newline; Cmd / Ctrl reach menu shortcuts) — review v1 F1.
-///   · auto-resizes by reporting its intrinsic content size through the
-///     SwiftUI layout system
+///
+/// Sizing is owned by SwiftUI (`ComposerView.editorHeight` from the draft +
+/// the live editor width), not by this view — so there is no intrinsic-size
+/// or height-binding plumbing here.
 private struct ComposerTextEditor: NSViewRepresentable {
   @Binding var text: String
   let onSubmit: () -> Void
@@ -237,6 +426,16 @@ private struct ComposerTextEditor: NSViewRepresentable {
     }
 
     let custom = SubmitNSTextView(frame: frame, textContainer: container)
+    // `init(frame:textContainer:)` does NOT replicate the geometry contract
+    // that `NSTextView.scrollableTextView()` applies to its own documentView:
+    // it leaves `isVerticallyResizable == false` and clamps `min/maxSize` to
+    // the seed frame height (measured ~14pt, whatever scrollableTextView()
+    // vends). Frozen below the ~16pt line height, the
+    // bottom of every line — descenders (q/g/p/y/j) and underline/marked
+    // decorations — is clipped (#463). Restore the resizable contract so the
+    // view grows to the full laid-out line height. (#446 auto-grow is the
+    // SwiftUI frame envelope; this is the AppKit-side per-line layout.)
+    applyResizableTextViewGeometry(to: custom)
     custom.delegate = coordinator
     custom.isEditable = true
     custom.isRichText = false
@@ -309,7 +508,24 @@ private struct ComposerTextEditor: NSViewRepresentable {
   }
 }
 
-private final class SubmitNSTextView: NSTextView {
+/// Reapplies the vertically-resizable geometry that
+/// `NSTextView.scrollableTextView()` gives its documentView but
+/// `init(frame:textContainer:)` drops. Without it the text view is frozen at
+/// its seed-frame height (measured ~14pt, whatever scrollableTextView()
+/// vends) — shorter than the line height — so the bottom of each line
+/// (descenders + underlines) is clipped (#463). Internal so the
+/// descender-clip regression can be unit-tested.
+func applyResizableTextViewGeometry(to textView: NSTextView) {
+  textView.isVerticallyResizable = true
+  textView.isHorizontallyResizable = false
+  textView.minSize = NSSize(width: 0, height: 0)
+  textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                            height: CGFloat.greatestFiniteMagnitude)
+}
+
+/// Internal (not `private`) so the #463 descender-clip regression test can
+/// install one as the scroll view's documentView and exercise the real seam.
+final class SubmitNSTextView: NSTextView {
   var onSubmit: (() -> Void)?
 
   override func keyDown(with event: NSEvent) {

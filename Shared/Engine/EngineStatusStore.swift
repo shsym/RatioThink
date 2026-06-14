@@ -40,6 +40,12 @@ public final class EngineStatusStore: ObservableObject {
   /// the caller to introspect `EngineStatus` for a `.failed` case.
   @Published public private(set) var lastError: String?
 
+  /// Latest authoritative KV usage rows from pie `model_status` (#517),
+  /// refreshed opportunistically while the engine is running. Chat sends read
+  /// this synchronously to seed APC retention; an empty array means unknown
+  /// and must not be treated as zero usage.
+  @Published public private(set) var latestKVUsageSnapshots: [KVUsageSnapshot] = []
+
   /// Number of `engineStatus()` polls that have returned (success or
   /// failure). Test seam — lets tests `await` a transition without
   /// polling `status` in a tight loop.
@@ -76,8 +82,8 @@ public final class EngineStatusStore: ObservableObject {
   /// `nil`. Computed live off `status` so the SwiftUI dependency
   /// graph re-evaluates dependent views when status flips.
   public var baseURL: URL? {
-    if case .running(let port, _, _) = status {
-      return URL(string: "http://127.0.0.1:\(port)")
+    if case .running(let snapshot) = status {
+      return URL(string: "http://127.0.0.1:\(snapshot.port)")
     }
     return nil
   }
@@ -86,10 +92,24 @@ public final class EngineStatusStore: ObservableObject {
   /// clients keep using `baseURL` (loopback), but the endpoint explorer should
   /// render the listener mode the engine was actually launched with.
   public var localAPIBaseURL: URL? {
-    if case .running(let port, _, _) = status {
-      return URL(string: "http://\(runtimeDaemonBindMode.baseURLHost):\(port)")
+    if case .running(let snapshot) = status {
+      return URL(string: "http://\(runtimeDaemonBindMode.baseURLHost):\(snapshot.port)")
     }
     return nil
+  }
+
+  /// The active engine session's `EngineSessionSnapshot` while `.running`,
+  /// else `nil` (#476). The single authoritative view of the launched
+  /// session — served model id, effective `max_tokens` ceiling, launch
+  /// generation — that `EngineLifecycle` feeds into `ModelLoadCenter` on the
+  /// `.running` edge and that callers use for stale-generation detection.
+  public var currentSnapshot: EngineSessionSnapshot? {
+    if case .running(let snapshot) = status { return snapshot }
+    return nil
+  }
+
+  public func kvUsageSnapshot(for modelID: String) -> KVUsageSnapshot? {
+    latestKVUsageSnapshots.first { $0.modelID == modelID }
   }
 
   private let client: any AppXPCClient
@@ -111,6 +131,11 @@ public final class EngineStatusStore: ObservableObject {
   /// banner shows the helper-axis tiers off `HelperHealth`; this counter is
   /// only the chat-recovery escalation, now aligned to the unified policy.
   private var consecutiveFailures = 0
+  /// True while the current `.failed(.engineGone)` was synthesized by THIS
+  /// store for sustained transport loss (#5a) rather than reported by the
+  /// helper. Drives honest "can't reach" copy in `statusDetail` — there is
+  /// no evidence the engine process exited in that case (#477 review F8).
+  private var engineGoneSynthesized = false
 
   /// Unified poll-count policy — single source of truth shared with the
   /// status banner (`StatusBannerReducer`) so the engine axis and the helper
@@ -163,9 +188,9 @@ public final class EngineStatusStore: ObservableObject {
     self.now = now
     self.status = initialStatus
     self.runtimeDaemonBindMode = initialDaemonBindMode
-    if case .running(_, _, let daemonBindHost) = initialStatus {
+    if case .running(let snapshot) = initialStatus {
       self.wasEverRunning = true
-      if let daemonBindHost {
+      if let daemonBindHost = snapshot.daemonBindHost {
         self.runtimeDaemonBindMode = daemonBindHost
         self.runtimeDaemonBindModeIsConfirmed = true
       } else {
@@ -244,12 +269,80 @@ public final class EngineStatusStore: ObservableObject {
     }
   }
 
+  /// #488 review F1: fired at the entry of `stopEngine()` — the single
+  /// funnel both UI stop paths (ChatScaffold Unload, Local API stop) route
+  /// through — BEFORE the XPC call. `ActiveModelServeExecutor` wires this to
+  /// `cancelDeferredPick()` so an explicit user stop drops any queued model
+  /// pick instead of being reversed by it at the `.stopped` settle. Fired on
+  /// the attempt (not the outcome): the stop is the user's newest intent
+  /// whether or not the helper accepts it. Default no-op (mirrors
+  /// `onPollOutcome`); the executor is the sole production consumer.
+  @MainActor public var onExplicitStop: () -> Void = {}
+
+  /// #496: refuse a Helper MUTATION (start/stop/restart) while the Helper
+  /// transport isn't healthy. Reads the same `helperHealthProvider` the chat
+  /// recovery wait uses; a `nil` provider (default / tests with no helper
+  /// source) leaves every op allowed, preserving prior behavior. Read-only
+  /// polls (`refresh`/`engineMemory`/the loop) stay UNGATED so the ladder can
+  /// recover — see `HelperOpGate`. Throws `HelperUnavailable` so the call site
+  /// surfaces an inline, helper-framed refusal (never the engine banner).
+  private func requireHelperAvailable() throws {
+    guard let health = helperHealthProvider() else { return }
+    if let block = HelperOpGate.evaluate(health) { throw block }
+  }
+
   ///  Unload: ask the helper to stop the running engine, freeing the
   /// resident model's RAM. Throws on rejection / transport failure so
   /// the caller keeps the resident-model state when the stop did not
   /// actually happen. The next status poll reflects the stopped engine.
   public func stopEngine() async throws {
+    try requireHelperAvailable()
+    onExplicitStop()
     try await client.stopEngine()
+  }
+
+  /// Intentionally rebuild the helper engine for `profileID`.
+  ///
+  /// pie's `/v1/models/load` endpoint is a registry lookup: the set of
+  /// loadable ids is fixed by the config written before `pie serve`
+  /// starts. When the active profile's default model changes (for
+  /// example after a just-finished download), a live engine still
+  /// advertises the old id until it is stopped and started again. This
+  /// helper performs that product-internal reload without requiring the
+  /// user to quit Rational.
+  ///
+  /// Restart deliberately routes through a helper-side selector instead
+  /// of composing `stopEngine()` + `startEngine(profileID:)` here:
+  /// the app's `status` is only a 1 Hz mirror, generic start swallows
+  /// `.alreadyRunning` as idempotent, and `stopEngine()` has a short
+  /// app-side reply timeout. The helper owns the authoritative state
+  /// machine and waits for terminal stop before starting the new
+  /// profile; any `.alreadyRunning` that escapes that contract is a
+  /// failed rebuild and must surface to the caller.
+  ///
+  /// `modelOverride` (#469) rebuilds the engine bound to an explicit pick —
+  /// the running-engine model switch, where `/v1/models/load` cannot swap the
+  /// served model. `nil` (the default) preserves the existing
+  /// default-model-change restart that boots the freshly-saved profile
+  /// default (set-as-default, post-download).
+  public func restartEngine(profileID: String, modelOverride: String? = nil) async throws {
+    try requireHelperAvailable()
+    do {
+      try await client.restartEngine(profileID: profileID, modelOverride: modelOverride)
+    } catch let error as AppXPCClientError {
+      // The helper only replies after the rebuild's cold-boot handshake.
+      // A boot slower than the App reply window is NOT a reload failure —
+      // the restart is in flight and the status poll surfaces the real
+      // `.running`/`.failed` outcome (#459 repro 2). Mirror `startEngine`'s
+      // in-flight swallow so a slow large-model reload is never reported to
+      // the caller as a failed reload. A real helper `EngineError`
+      // (resolver rejected, modelMissing, …) still propagates.
+      if case .replyTimeout = error {
+        Self.log.notice("restartEngine(profileID=\(profileID, privacy: .public)) reply timed out — rebuild in flight; status poll will surface the outcome")
+        return
+      }
+      throw error
+    }
   }
 
   /// Test seam: invoked with the human-readable cause whenever a
@@ -329,12 +422,36 @@ public final class EngineStatusStore: ObservableObject {
   /// is in flight — so `.replyTimeout` is swallowed. A real helper
   /// `EngineError` (resolver rejected, still `.modelMissing`, etc.)
   /// propagates so the UI can surface the reason.
+  ///
+  /// `modelOverride` is the explicit per-start model selection (chat
+  /// toolbar / model-list pick). Non-nil boots that model regardless of the
+  /// profile's persisted default, so a no-default profile starts cleanly
+  /// from an explicit pick (#459 repro 1).
+  ///
+  /// `daemonBindHost` overrides the shared Local API bind preference for this
+  /// start (the settings external-access toggle); `nil` inherits
+  /// `daemonBindModeProvider()`.
+  ///
+  /// Same-profile idempotency is owned by the helper's `startOrAttach`
+  /// boundary, so an `.alreadyRunning` that reaches here is an incompatible
+  /// start (different profile, stopping, …) and surfaces to the caller rather
+  /// than being swallowed.
   public func startEngine(profileID: String,
-                          daemonBindHost: EngineHTTPBindMode? = nil,
-                          allowAlreadyRunning: Bool = true) async throws {
+                          modelOverride: String? = nil,
+                          daemonBindHost: EngineHTTPBindMode? = nil) async throws {
+    try requireHelperAvailable()
     let requestedBindMode = daemonBindHost ?? daemonBindModeProvider()
     do {
-      try await client.startEngine(profileID: profileID, daemonBindHost: requestedBindMode)
+      if let modelOverride {
+        // Model-pick start: the helper resolver injects the persisted Local
+        // API bind mode into the spec, so this start still honors the user's
+        // exposure preference even though the model-override wire selector
+        // carries no explicit bind host. Record the shared preference as the
+        // optimistic runtime posture (it matches what the resolver injects).
+        try await client.startEngine(profileID: profileID, modelOverride: modelOverride)
+      } else {
+        try await client.startEngine(profileID: profileID, daemonBindHost: requestedBindMode)
+      }
       runtimeDaemonBindMode = requestedBindMode
       runtimeDaemonBindModeIsConfirmed = true
     } catch let error as AppXPCClientError {
@@ -345,21 +462,6 @@ public final class EngineStatusStore: ObservableObject {
         return
       }
       throw error
-    } catch let error as EngineError where error.code == .alreadyRunning {
-      guard allowAlreadyRunning else {
-        throw error
-      }
-      if case .running(_, let runningProfileID, _) = status,
-         runningProfileID != profileID {
-        throw error
-      }
-      // A concurrent start found the engine already starting/running.
-      // For a "kick the start" caller that IS the desired end state —
-      // #326's no-model prompt and failed(modelMissing) banner can both
-      // fire startEngine on the same completed download, and the loser
-      // must not surface a user-facing error. Idempotent no-op.
-      Self.log.notice("startEngine(profileID=\(profileID, privacy: .public)) → alreadyRunning; engine already coming up (idempotent)")
-      return
     }
   }
 
@@ -375,14 +477,21 @@ public final class EngineStatusStore: ObservableObject {
   /// boundary. `ChatSendController` keys its recovery retry on that
   /// discrete case rather than parsing the `engineNotReady` detail.
   public func requireBaseURL() throws -> URL {
-    if case .running(let port, _, _) = status {
+    if case .running(let snapshot) = status {
       // Force-unwrap is safe: `EnginePort` (UInt16) interpolates into
       // a valid IPv4 loopback URL by construction, and the `running`
       // decoder already rejects `port == 0`.
-      return URL(string: "http://127.0.0.1:\(port)")!
+      return URL(string: "http://127.0.0.1:\(snapshot.port)")!
     }
-    if case .failed(.engineGone, _) = status {
-      throw HTTPEngineError.engineGone(detail: detailForStatus())
+    // The `detail` fields are the DIAGNOSTIC channel (they end up in
+    // `EngineProblem.technicalDetail` / logs, never primary copy) — feed
+    // them the raw `.failed` message, not the curated `statusDetail`
+    // line, so a chat-path failure keeps its cause (#477 review F8).
+    if case .failed(.engineGone, let message) = status {
+      throw HTTPEngineError.engineGone(detail: message)
+    }
+    if case .failed(let code, let message) = status {
+      throw HTTPEngineError.engineNotReady(detail: "[\(code.rawValue)] \(message)")
     }
     throw HTTPEngineError.engineNotReady(detail: detailForStatus())
   }
@@ -406,26 +515,66 @@ public final class EngineStatusStore: ObservableObject {
       return "Engine running"
     case .stopping:
       return "Engine stopping…"
-    case .failed(.memoryRisk, let message):
-      return "Memory risk: \(message)"
-    case .failed(.engineGone, let message):
-      return "Engine stopped unexpectedly: \(message)"
+    case .failed(.engineGone, _) where engineGoneSynthesized:
+      // Store-synthesized transport loss (#5a): there is no evidence the
+      // engine process exited — only that the helper stopped answering.
+      // Honest copy instead of the taxonomy's process-exited line.
+      return "Can’t reach the engine — it stopped responding. Restart the engine to reconnect."
     case .failed(let code, let message):
-      return "Engine failed (\(code.rawValue)): \(message)"
+      // #477: the status `message` is a raw diagnostic (stderr tails,
+      // resolver traces) — surface the taxonomy's curated line instead.
+      return EngineProblem(statusCode: code, rawMessage: message).message
     }
   }
 
   private nonisolated func refreshOnce(client: any AppXPCClient) async {
+    let started = Date()
     do {
       let next = try await client.engineStatus()
+      let took = Date().timeIntervalSince(started)
+      // #413 diag: a slow-but-succeeding poll is the early warning that the
+      // helper is getting saturated (toward the 2 s reply timeout) — the next
+      // poll may time out and feed HelperHealthController's restart ladder.
+      if took > 0.5 {
+        DiagnosticLog.app.event("engine.poll", [("result", "slow"), ("took", String(format: "%.2f", took))])
+      }
       await MainActor.run { [weak self] in
         self?.apply(next: next, error: nil)
       }
+      if case .running = next {
+        do {
+          let usage = try await client.kvUsageSnapshots()
+          await MainActor.run { [weak self] in
+            self?.latestKVUsageSnapshots = usage
+          }
+        } catch {
+          let message = String(describing: error)
+          Self.log.error("kvUsageSnapshots poll failed: \(message, privacy: .public)")
+          DiagnosticLog.app.event("engine.kv_usage", [("result", "fail"), ("reason", message)])
+          await MainActor.run { [weak self] in
+            self?.latestKVUsageSnapshots = []
+          }
+        }
+      } else {
+        await MainActor.run { [weak self] in
+          self?.latestKVUsageSnapshots = []
+        }
+      }
     } catch {
       let message = String(describing: error)
+      let took = Date().timeIntervalSince(started)
       Self.log.error("engineStatus poll failed: \(message, privacy: .public)")
+      // #413 diag: a FAILED engineStatus XPC poll is exactly what drives the
+      // helper-restart ladder. A `replyTimeout` here = the helper was too slow
+      // to answer (e.g. saturated draining pie's --debug output during a busy
+      // search), NOT engine death. Persist it + the XPC latency so the
+      // operator's run shows whether the helper-restart path fired.
+      DiagnosticLog.app.event("engine.poll", [
+        ("result", "fail"), ("took", String(format: "%.2f", took)), ("reason", message),
+      ])
       await MainActor.run { [weak self] in
         self?.apply(next: nil, error: message)
+        self?.latestKVUsageSnapshots = []
       }
     }
   }
@@ -454,6 +603,7 @@ public final class EngineStatusStore: ObservableObject {
       }
       heldFailurePolls = 0
       updateRuntimeDaemonBindMode(from: next)
+      engineGoneSynthesized = false
       setStatusAndTrackStarting(next)
       if case .running = next { wasEverRunning = true }
       updateEngineGonePolls(for: next)
@@ -475,6 +625,7 @@ public final class EngineStatusStore: ObservableObject {
         // not re-publish a fresh message every poll.
         if !isEngineGone(self.status) {
           let cause = error.flatMap { $0.isEmpty ? nil : $0 } ?? "no response from the engine helper"
+          engineGoneSynthesized = true
           setStatusAndTrackStarting(.failed(
             code: .engineGone,
             message: "Can’t reach the engine — it stopped responding (\(cause)). Use Restart Engine to reconnect."
@@ -525,11 +676,11 @@ public final class EngineStatusStore: ObservableObject {
   /// `.spawnFailed`/`.engineGone` while the engine has NEVER run this
   /// session and is still inside its `.starting` window.
   private func updateRuntimeDaemonBindMode(from next: EngineStatus) {
-    guard case .running(_, _, let daemonBindHost) = next else {
+    guard case .running(let snapshot) = next else {
       runtimeDaemonBindModeIsConfirmed = false
       return
     }
-    if let daemonBindHost {
+    if let daemonBindHost = snapshot.daemonBindHost {
       runtimeDaemonBindMode = daemonBindHost
       runtimeDaemonBindModeIsConfirmed = true
       return

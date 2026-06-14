@@ -10,7 +10,7 @@ final class LocalAPIStateTests: XCTestCase {
   // MARK: - phase mapping
 
   func test_running_isServing_with_live_port() {
-    let s = LocalAPIState.make(status: .running(port: 8123, profileID: "chat"),
+    let s = LocalAPIState.make(status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat")),
                                hasActiveProfile: true)
     XCTAssertTrue(s.isServing)
     XCTAssertEqual(s.port, 8123)
@@ -52,7 +52,7 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertTrue(s.externalAccessToggleEnabled)
     XCTAssertTrue(s.profileSelectionEnabled)
     XCTAssertEqual(s.statusLabel, "Off")
-    XCTAssertEqual(s.detail, "Turn on to serve OpenAI-compatible requests on 127.0.0.1.")
+    XCTAssertEqual(s.detail, "Turn on to start the engine and serve requests on 127.0.0.1.")
   }
 
   func test_bind_modes_carry_explicit_daemon_hosts() {
@@ -65,7 +65,37 @@ final class LocalAPIStateTests: XCTestCase {
   func test_stopped_without_profile_is_disabled_with_guidance() {
     let s = LocalAPIState.make(status: .stopped, hasActiveProfile: false)
     XCTAssertFalse(s.toggleEnabled, "nothing to serve → can't turn on")
-    XCTAssertEqual(s.detail, "Select a model in Settings → Models to enable the local API.")
+    XCTAssertEqual(s.detail, "Choose a profile in the chat toolbar to enable the local API.")
+  }
+
+  // MARK: - served model id (exact-id guidance must be authoritative)
+
+  /// The reducer takes no profile-model input at all, so the served id can
+  /// only ever come from the running snapshot — a profile fallback is
+  /// impossible by construction. This pins the snapshot pass-through for a
+  /// model that intentionally differs from any plausible profile default.
+  func test_running_servedModelID_comes_from_snapshot_only() {
+    let s = LocalAPIState.make(
+      status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat",
+                                             servedModelID: "org/override-model.gguf")),
+      hasActiveProfile: true)
+    XCTAssertEqual(s.servedModelID, "org/override-model.gguf")
+  }
+
+  /// A legacy snapshot carries `servedModelID = ""` — the exact-id row and
+  /// curl example must fail closed (hidden), never guess a substitute.
+  func test_running_empty_snapshot_servedModelID_fails_closed_to_nil() {
+    let s = LocalAPIState.make(
+      status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat")),
+      hasActiveProfile: true)
+    XCTAssertNil(s.servedModelID)
+  }
+
+  func test_non_running_states_have_no_servedModelID() {
+    for status: EngineStatus in [.starting, .stopping, .stopped,
+                                 .failed(code: .modelMissing, message: "x")] {
+      XCTAssertNil(LocalAPIState.make(status: status, hasActiveProfile: true).servedModelID)
+    }
   }
 
   // MARK: - failure mapping
@@ -75,14 +105,28 @@ final class LocalAPIStateTests: XCTestCase {
                                hasActiveProfile: true)
     XCTAssertEqual(s.statusLabel, "Engine failed")
     XCTAssertTrue(s.toggleEnabled, "modelMissing invites a resume retry")
-    XCTAssertEqual(s.detail, "model not found (modelMissing)")
+    // #477: the raw status message is a diagnostic — the card shows the
+    // taxonomy's curated copy.
+    XCTAssertEqual(s.detail,
+                   "The selected model isn’t downloaded. Download it in Settings → Models, or pick another model.")
   }
 
   func test_failed_memoryRisk_is_not_retryable() {
     let s = LocalAPIState.make(status: .failed(code: .memoryRisk, message: "too big"),
                                hasActiveProfile: true)
     XCTAssertFalse(s.toggleEnabled, "memoryRisk re-rejects on a plain start")
-    XCTAssertEqual(s.detail, "too big")
+    XCTAssertEqual(s.detail,
+                   "This model exceeds this Mac’s safe memory limit. Pick a smaller model.")
+  }
+
+  func test_failed_modelUnsupported_is_not_retryable() {
+    let s = LocalAPIState.make(status: .failed(code: .modelUnsupported, message: "unsupported format"),
+                               hasActiveProfile: true)
+    XCTAssertFalse(s.toggleEnabled, "modelUnsupported would retry the same unloadable artifact")
+    XCTAssertEqual(
+      s.detail,
+      "The selected model is unsupported or not loadable. Choose a curated model, remove or fix the cached repo, or install a supported artifact."
+    )
   }
 
   func test_failed_without_profile_is_never_retryable() {
@@ -91,16 +135,20 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertFalse(s.toggleEnabled)
   }
 
-  func test_failureReason_uses_friendly_text_for_empty_messages() {
-    XCTAssertEqual(
-      LocalAPIState.failureReason(code: .memoryRisk, message: "   "),
-      "Model too large for available memory.")
+  func test_failureReason_is_curated_taxonomy_copy() {
+    // #477: same copy whether the raw diagnostic is present or empty —
+    // the message never feeds primary copy.
+    for raw in ["", "memory risk: model is 9.0 GB at /Users/x/big.gguf"] {
+      XCTAssertEqual(
+        LocalAPIState.failureReason(code: .memoryRisk, message: raw),
+        "This model exceeds this Mac’s safe memory limit. Pick a smaller model.")
+    }
     XCTAssertEqual(
       LocalAPIState.failureReason(code: .engineGone, message: ""),
-      "The engine stopped unexpectedly.")
+      "The engine process exited. Restart the engine to continue.")
     XCTAssertEqual(
       LocalAPIState.failureReason(code: .spawnFailed, message: ""),
-      "Engine failed (spawnFailed).")
+      "The engine failed to start. Try restarting it.")
   }
 
   // MARK: - curl snippet
@@ -350,7 +398,7 @@ final class LocalAPIStateTests: XCTestCase {
   }
 
   func test_profile_switch_gate_rejects_second_selection_while_restart_in_flight() {
-    let state = LocalAPIState.make(status: .running(port: 8123, profileID: "chat"),
+    let state = LocalAPIState.make(status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat")),
                                    hasActiveProfile: true)
     var restartInFlight = false
 

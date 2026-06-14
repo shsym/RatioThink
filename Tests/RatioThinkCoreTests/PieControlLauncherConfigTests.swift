@@ -11,6 +11,27 @@ import XCTest
 /// (which depends on the same emission shape).
 final class PieControlLauncherConfigTests: XCTestCase {
 
+  func test_configTimeout_matchesPieTemplateDefaultForSlowToTRequests() {
+    let body = PieControlLauncher.renderConfigBody(modelConfig: .dummy)
+    XCTAssertTrue(body.contains("request_timeout_secs = 120"),
+                  "app launcher config must not lower pie's template/default 120s request timeout; slow ToT node/scorer passes can otherwise close SSE without a terminal frame")
+    XCTAssertFalse(body.contains("request_timeout_secs = 60"),
+                   "60s was too low for packaged-app ToT runs on slower hardware/profiles")
+  }
+
+  func test_subprocessEnvironment_liftsShmemTimeoutToMatchSchedulerTimeout() {
+    let env = PieControlLauncher.renderSubprocessEnvironment(
+      base: ["PIE_SHMEM_TIMEOUT_S": "1", "KEEP": "yes"],
+      pieHome: URL(fileURLWithPath: "/tmp/pie-home", isDirectory: true),
+      shmemName: "/pie-test"
+    )
+    XCTAssertEqual(env["PIE_HOME"], "/tmp/pie-home")
+    XCTAssertEqual(env["PIE_SHMEM_NAME"], "/pie-test")
+    XCTAssertEqual(env["PIE_SHMEM_TIMEOUT_S"], "120",
+                   "the real fire_batch/shmem path reads PIE_SHMEM_TIMEOUT_S, not scheduler.request_timeout_secs directly")
+    XCTAssertEqual(env["KEEP"], "yes")
+  }
+
   func test_dummy_body_emits_dummy_driver_with_qwen3_fixture() {
     let body = PieControlLauncher.renderConfigBody(modelConfig: .dummy)
     XCTAssertTrue(body.contains("type = \"dummy\""),
@@ -19,6 +40,24 @@ final class PieControlLauncherConfigTests: XCTestCase {
                   "dummy config must keep the existing Qwen fixture so S0 tests stay stable")
     XCTAssertTrue(body.contains("name = \"default\""),
                   "model name must remain \"default\" — chat-apc resolves against this name")
+  }
+
+  func test_servedModelID_mirrors_model_name_per_config() {
+    // #476: the snapshot's servedModelID must equal the engine's advertised
+    // `[[model]].name` — the chat-completion `model` field the App sends.
+    XCTAssertEqual(PieControlLauncher.ModelConfig.dummy.servedModelID, "default")
+    XCTAssertEqual(
+      PieControlLauncher.ModelConfig.portable(
+        modelSlug: "org/repo/file.gguf",
+        modelsRoot: URL(fileURLWithPath: "/tmp/models", isDirectory: true)).servedModelID,
+      "org/repo/file.gguf")
+    XCTAssertEqual(
+      PieControlLauncher.ModelConfig.portableResolved(
+        servedModelID: "org/repo/file.gguf", modelRef: "/tmp/models/org/repo/file.gguf").servedModelID,
+      "org/repo/file.gguf")
+    XCTAssertEqual(
+      PieControlLauncher.ModelConfig.metal(modelID: "Qwen/Qwen3-0.6B").servedModelID,
+      "Qwen/Qwen3-0.6B")
   }
 
   func test_portable_body_emits_portable_driver_with_resolved_hf_repo_path() {
@@ -39,6 +78,74 @@ final class PieControlLauncherConfigTests: XCTestCase {
                    "pie serve config no longer accepts top-level hf_path; it resolves model.hf_repo")
     XCTAssertFalse(body.contains("type = \"dummy\""),
                    "portable config must not emit the dummy-driver block")
+  }
+
+  func test_portable_body_omits_default_token_limit_when_nil() {
+    // #438: with no memory-aware ceiling, the scheduler block must NOT
+    // carry default_token_limit — the engine keeps its default (no clamp),
+    // preserving pre-#438 behavior on hosts that sustain the full pool.
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      defaultTokenLimit: nil
+    )
+    XCTAssertFalse(body.contains("default_token_limit"),
+                   "nil defaultTokenLimit must not write the override; got:\n\(body)")
+    XCTAssertFalse(body.contains("[model.driver.options]"),
+                   "the pool-resize path is gone — no driver-options block; got:\n\(body)")
+  }
+
+  func test_portable_body_emits_default_token_limit_when_set() {
+    // #438: the memory-aware ceiling rides [model.scheduler].default_token_limit.
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      defaultTokenLimit: 5000
+    )
+    // Exact key = value line, under the scheduler section, not driver options.
+    XCTAssertTrue(body.contains("default_token_limit = 5000"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("[model.scheduler]"), "got:\n\(body)")
+    XCTAssertFalse(body.contains("max_num_kv_pages"),
+                   "the old pool-resize knob must not be emitted; got:\n\(body)")
+    XCTAssertTrue(body.contains("type = \"portable\""))
+  }
+
+  func test_metal_body_emits_default_token_limit_when_set() {
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .metal(modelID: "Qwen/Qwen3-0.6B"),
+      defaultTokenLimit: 4096
+    )
+    XCTAssertTrue(body.contains("default_token_limit = 4096"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
+  }
+
+  func test_portable_body_emits_max_num_kv_pages_when_set() {
+    // #475: the engine KV-pool override rides [model.driver.options].
+    // max_num_kv_pages — the knob the memory-budget sweep turns to lower the
+    // raw KV capacity (and so the effective ceiling) directly. Omitted when
+    // nil (guarded by `..._omits_default_token_limit_when_nil`).
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      defaultTokenLimit: nil,
+      maxNumKvPages: 256
+    )
+    XCTAssertTrue(body.contains("[model.driver.options]"),
+                  "a set maxNumKvPages must emit the driver-options block; got:\n\(body)")
+    XCTAssertTrue(body.contains("max_num_kv_pages = 256"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("type = \"portable\""), "got:\n\(body)")
+    // The override is independent of the scheduler ceiling.
+    XCTAssertFalse(body.contains("default_token_limit"), "got:\n\(body)")
+  }
+
+  func test_metal_body_emits_max_num_kv_pages_when_set() {
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .metal(modelID: "Qwen/Qwen3-0.6B"),
+      defaultTokenLimit: 4096,
+      maxNumKvPages: 512
+    )
+    XCTAssertTrue(body.contains("[model.driver.options]"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("max_num_kv_pages = 512"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("default_token_limit = 4096"),
+                  "both knobs coexist — scheduler cap + driver pool; got:\n\(body)")
+    XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
   }
 
   func test_portableResolved_serves_under_profile_slug_with_distinct_hf_repo_path() {
@@ -271,10 +378,10 @@ final class PieControlLauncherConfigTests: XCTestCase {
   func test_realPie_driverList_subcommand_exists_and_reports_portable() throws {
     let candidates = [
       ProcessInfo.processInfo.environment["PIE_TEST_REAL_PIE_BIN"],
-      "/Applications/RatioThink.app/Contents/Resources/pie-engine/pie",
+      "/Applications/Rational.app/Contents/Resources/pie-engine/pie",
     ].compactMap { $0 }
     guard let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-      throw XCTSkip("no real pie binary (set PIE_TEST_REAL_PIE_BIN or install RatioThink.app)")
+      throw XCTSkip("no real pie binary (set PIE_TEST_REAL_PIE_BIN or install Rational.app)")
     }
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: path)

@@ -12,6 +12,22 @@ public enum HelperRegistrationState: Equatable, Sendable {
   case other
 }
 
+/// Result of the launch-time Helper probe. Reachability alone is not enough
+/// during the RatioThink → Rational rename: the preserved mach service
+/// (`com.ratiothink.helper`) may still be answered by a legacy
+/// `RatioThinkHelper` process. Only `.healthy` means "reachable AND expected
+/// helper identity".
+public enum HelperRegistrationProbeResult: Equatable, Sendable {
+  case healthy
+  case unreachable
+  case identityMismatch(String)
+
+  var isHealthy: Bool {
+    if case .healthy = self { return true }
+    return false
+  }
+}
+
 /// Reconciles the Helper's launchd registration on app launch.
 ///
 /// **Why this exists ( robustness):** `SMAppService` registers an
@@ -30,13 +46,13 @@ public enum HelperRegistrationState: Equatable, Sendable {
 /// previously only registered inside the first-launch wizard, so it
 /// could never self-heal after an update.
 ///
-/// **Policy:** probe the Helper first; if it is REACHABLE, do nothing —
-/// never disturb a healthy background service. Only when it is
-/// unreachable do we repair, choosing the minimal action for the
-/// observed `HelperRegistrationState`. `.requiresApproval` is a hard
-/// macOS consent gate that code cannot bypass — we re-assert the
-/// registration and report `needsApproval` so the App can route the
-/// user to System Settings.
+/// **Policy:** probe the Helper first; if it is REACHABLE with the expected
+/// identity, do nothing — never disturb a healthy background service. If it is
+/// unreachable OR reachable with a legacy/mismatched identity, repair,
+/// choosing the minimal action for the observed `HelperRegistrationState`.
+/// `.requiresApproval` is a hard macOS consent gate that code cannot bypass —
+/// we re-assert the registration and report `needsApproval` so the App can
+/// route the user to System Settings.
 public struct HelperRegistrationReconciler: Sendable {
   public enum Outcome: Equatable, Sendable {
     /// Helper answered the probe — registration is healthy, nothing done.
@@ -55,9 +71,10 @@ public struct HelperRegistrationReconciler: Sendable {
     case repairFailed(String)
   }
 
-  /// Returns true iff the Helper answered (one bounded probe; the caller
-  /// supplies its own retry/timeout policy so this type stays pure).
-  let probeReachable: @Sendable () async -> Bool
+  /// Returns `.healthy` iff the Helper answered AND its identity matches the
+  /// expected Rational helper (one bounded probe; the caller supplies its own
+  /// retry/timeout policy so this type stays pure).
+  let probeReachable: @Sendable () async -> HelperRegistrationProbeResult
   let currentState: @Sendable () -> HelperRegistrationState
   /// Calls `SMAppService.agent(...).register()` and returns the resulting
   /// state. Throws if registration itself errors.
@@ -67,7 +84,7 @@ public struct HelperRegistrationReconciler: Sendable {
   let unregister: @Sendable () throws -> Void
 
   public init(
-    probeReachable: @escaping @Sendable () async -> Bool,
+    probeReachable: @escaping @Sendable () async -> HelperRegistrationProbeResult,
     currentState: @escaping @Sendable () -> HelperRegistrationState,
     register: @escaping @Sendable () throws -> HelperRegistrationState,
     unregister: @escaping @Sendable () throws -> Void
@@ -110,8 +127,10 @@ public struct HelperRegistrationReconciler: Sendable {
   }
 
   public func reconcile() async -> Outcome {
-    // Never disturb a working Helper.
-    if await probeReachable() { return .healthy }
+    // Never disturb a working Helper. A reachable legacy/mismatched helper is
+    // NOT healthy: force repair so launchd reloads BundleProgram to the
+    // current RationalHelper executable.
+    if (await probeReachable()).isHealthy { return .healthy }
 
     switch currentState() {
     case .enabled:
@@ -151,13 +170,21 @@ public struct HelperRegistrationReconciler: Sendable {
     if newState == .requiresApproval { return .needsApproval }
     // Give launchd a beat to load the RunAtLoad job — the probe closure
     // owns the retry/backoff window.
-    if await probeReachable() {
+    let confirmProbe = await probeReachable()
+    var msg: String
+    switch confirmProbe {
+    case .healthy:
       return freshRegistration ? .registered : .repaired
+    case .unreachable:
+      msg = "helper unreachable after register (state=\(newState))"
+    case .identityMismatch(let reason):
+      msg = "helper identity mismatch after register (state=\(newState)): \(reason)"
     }
     // Repair did not recover. If the root unregister() failed, surface it
     // — it is the most likely real cause (signing/plist/SMAppService), not
-    // just "still unreachable" (F3).
-    var msg = "helper unreachable after register (state=\(newState))"
+    // just "still unreachable" (F3). Also preserve identity-mismatch details:
+    // a reachable legacy helper is the rename migration signal operators need,
+    // not an unreachable helper.
     if let unregisterError {
       msg += "; unregister() had failed: \(unregisterError)"
     }

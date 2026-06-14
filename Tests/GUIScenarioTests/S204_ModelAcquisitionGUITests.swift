@@ -2,7 +2,7 @@ import XCTest
 
 /// Settings model-acquisition leg, driven through the GUI.
 ///
-/// RatioThink.app → Settings (⌘,) → Models tab → Add Model… → Curated → the
+/// Rational.app → Settings (⌘,) → Models tab → Add Model… → Curated → the
 /// real in-process `ModelDownloader` (no `PIE_TEST_*_DOWNLOADS` fakes)
 /// → a real Hugging Face download → the completed download row's badge.
 ///
@@ -43,7 +43,7 @@ final class S204_ModelAcquisitionGUITests: XCTestCase {
     app.launch()
     defer { app.terminate() }
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     let settings = try openModelsSettings(in: app)

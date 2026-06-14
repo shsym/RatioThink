@@ -15,9 +15,9 @@
 
 import AppKit
 
-// The PRODUCT tint mapping lives in `HelperMain.colorForDot` (private to
-// the Helper target). Mirror it here for the preview only — the drawing
-// code itself is shared via MenuBarBrandIcon, which is what we verify.
+// Production uses template images and lets macOS tint the status item.
+// The preview supplies explicit monochrome colors only to simulate how the
+// same template alpha mask appears on light and dark menu-bar backgrounds.
 struct StateRender {
   let name: String
   let filled: Bool
@@ -44,8 +44,8 @@ struct RenderMenuBarIcon {
     let states: [StateRender] = [
       .init(name: "stopped", filled: false, errorBadge: false, color: .secondaryLabelColor),
       .init(name: "starting", filled: false, errorBadge: false, color: .labelColor),
-      .init(name: "running", filled: true, errorBadge: false, color: .systemGreen),
-      .init(name: "error", filled: true, errorBadge: true, color: .systemOrange),
+      .init(name: "running", filled: true, errorBadge: false, color: .labelColor),
+      .init(name: "error", filled: true, errorBadge: true, color: .labelColor),
     ]
     let backgrounds: [(name: String, color: NSColor, appearance: NSAppearance.Name)] = [
       ("light", NSColor(white: 0.95, alpha: 1), .aqua),
@@ -92,13 +92,13 @@ struct RenderMenuBarIcon {
         guard let appearance = NSAppearance(named: bg.appearance) else { continue }
         appearance.performAsCurrentDrawingAppearance {
           // Big preview, left of the tile.
-          let big = MenuBarBrandIcon.image(filled: st.filled, errorBadge: st.errorBadge,
-                                           color: st.color, pointSize: bigSize)
+          let big = MenuBarBrandIcon.previewImage(filled: st.filled, errorBadge: st.errorBadge,
+                                                  color: st.color, pointSize: bigSize)
           big.draw(in: NSRect(x: x + 18, y: y + (tileH - bigSize) / 2,
                               width: bigSize, height: bigSize))
           // Actual menu-bar size, right of the tile.
-          let real = MenuBarBrandIcon.image(filled: st.filled, errorBadge: st.errorBadge,
-                                            color: st.color, pointSize: realSize)
+          let real = MenuBarBrandIcon.previewImage(filled: st.filled, errorBadge: st.errorBadge,
+                                                   color: st.color, pointSize: realSize)
           real.draw(in: NSRect(x: x + tileW - 18 - realSize, y: y + (tileH - realSize) / 2,
                                width: realSize, height: realSize))
         }

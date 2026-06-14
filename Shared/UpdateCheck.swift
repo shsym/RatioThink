@@ -2,7 +2,7 @@ import Foundation
 
 /// Pure, AppKit-free core of the "Check for Updates…" surface (#411).
 ///
-/// RatioThink ships via GitHub Releases (a notarized arm64 DMG); there is
+/// Rational ships via GitHub Releases (a notarized arm64 DMG); there is
 /// no in-app auto-update yet (Sparkle is the future follow-up #178). So
 /// this is a *manual* check: read the running version, fetch the latest
 /// published release, and decide whether the user is behind. The decision
@@ -119,7 +119,7 @@ public enum UpdateCheck {
 /// A lenient dotted-integer version (`major.minor.patch…`) parsed from a
 /// GitHub tag or a bundle version. Tolerates a leading `v`/`V` and ignores
 /// any SemVer pre-release/build metadata (`0.1.1-rc.1+build` → `0.1.1`),
-/// which is enough to order RatioThink's `vX.Y.Z` release tags. Returns
+/// which is enough to order Rational's `vX.Y.Z` release tags. Returns
 /// `nil` on anything non-numeric so the caller falls back to honest
 /// "couldn't determine" rather than guessing.
 public struct SemanticVersion: Comparable, Hashable, Sendable {

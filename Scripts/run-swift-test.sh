@@ -7,6 +7,10 @@
 # trap mid-suite. See  finding F1/F6.
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/sandbox-diagnostics.sh
+. "$ROOT/Scripts/lib/sandbox-diagnostics.sh"
+
 refuse() {
   echo "run-swift-test.sh: refusing '$1' — CLIScenarioTests must run serial-within-bundle ( F1/F6)" >&2
   exit 2
@@ -42,4 +46,6 @@ while [ $i -lt ${#args[@]} ]; do
   i=$((i + 1))
 done
 
-exec xcrun swift test "$@"
+sandbox_diag_require_swiftpm_cache "swift-test" || exit 2
+
+sandbox_diag_run_with_recovery "swift-test" xcrun swift test "$@"

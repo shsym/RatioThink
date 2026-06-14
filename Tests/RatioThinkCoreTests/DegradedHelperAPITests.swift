@@ -61,7 +61,7 @@ final class DegradedHelperAPITests: XCTestCase {
   func test_degraded_startEngine_returns_degraded_error() {
     let api = makeAPI()
     let expectation = XCTestExpectation(description: "startEngine reply")
-    api.startEngine(profileID: "p") { successData, errorData in
+    api.startEngine(profileID: "p", modelOverride: nil) { successData, errorData in
       XCTAssertNil(successData)
       let result = try? PieHelperXPCWire.decodeStartEngineReply(
         successData: successData, errorData: errorData
@@ -88,24 +88,6 @@ final class DegradedHelperAPITests: XCTestCase {
     wait(for: [expectation], timeout: 1.0)
   }
 
-  func test_degraded_loadModel_returns_degraded_error() {
-    let api = makeAPI()
-    let expectation = XCTestExpectation(description: "loadModel reply")
-    api.loadModel(modelID: "m") { successData, errorData in
-      XCTAssertNil(successData)
-      let result = try? PieHelperXPCWire.decodeLoadModelReply(
-        successData: successData, errorData: errorData
-      )
-      if case .failure(let err)? = result {
-        XCTAssertEqual(err.code, .degraded)
-      } else {
-        XCTFail("expected .failure(.degraded), got \(String(describing: result))")
-      }
-      expectation.fulfill()
-    }
-    wait(for: [expectation], timeout: 1.0)
-  }
-
   func test_degraded_downloadModel_returns_degraded_error() {
     let api = makeAPI()
     let expectation = XCTestExpectation(description: "downloadModel reply")
@@ -124,17 +106,6 @@ final class DegradedHelperAPITests: XCTestCase {
     wait(for: [expectation], timeout: 1.0)
   }
 
-  func test_degraded_cancelLoad_returns_degraded_error() {
-    let api = makeAPI()
-    let expectation = XCTestExpectation(description: "cancelLoad reply")
-    let handleData = (try? XPCPayload.encode(LoadHandle(modelID: "m"))) ?? Data()
-    api.cancelLoad(handle: handleData) { errorData in
-      let err = try? PieHelperXPCWire.decodeOptionalError(errorData)
-      XCTAssertEqual(err?.code, .degraded)
-      expectation.fulfill()
-    }
-    wait(for: [expectation], timeout: 1.0)
-  }
 
   func test_degraded_cancelDownload_returns_degraded_error() {
     let api = makeAPI()
@@ -175,5 +146,26 @@ final class DegradedHelperAPITests: XCTestCase {
       expectation.fulfill()
     }
     wait(for: [expectation], timeout: 1.0)
+  }
+
+  // MARK: - engineMemory replies the shared pre-encoded nil blob (#348)
+
+  /// The degraded path must reply bytes byte-equal to the shared
+  /// `PieHelperXPCWire.emptyMemoryData` blob — not a hand-written "null"
+  /// literal coupled to the JSON wire format. A decode-to-nil assertion can't
+  /// catch a wire-format desync (a real encode and the literal both decode to
+  /// nil today); byte-equality can, and ties the degraded reply to the single
+  /// precondition-guarded source of truth.
+  func test_degraded_engineMemory_is_shared_empty_blob() {
+    let api = makeAPI()
+    let expectation = XCTestExpectation(description: "engineMemory reply")
+    var captured: Data?
+    api.engineMemory { data in
+      captured = data
+      expectation.fulfill()
+    }
+    wait(for: [expectation], timeout: 1.0)
+    XCTAssertEqual(captured, PieHelperXPCWire.emptyMemoryData,
+                   "degraded engineMemory must reply the shared pre-encoded nil blob, byte-for-byte")
   }
 }

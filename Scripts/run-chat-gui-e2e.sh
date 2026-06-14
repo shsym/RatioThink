@@ -89,7 +89,7 @@ BASE_URL="$(cat "$URL_FILE")"
 cat >"$CONFIG_FILE" <<EOF
 PIE_TEST_ENGINE_BASE_URL=$BASE_URL
 PIE_TEST_GUI_HOME=$GUI_HOME
-PIE_TEST_CHAT_MODEL=$SLUG
+PIE_TEST_CHAT_MODEL_PIN=$SLUG
 EOF
 
 echo "chat gui e2e: engine=$BASE_URL"
@@ -107,6 +107,8 @@ xcodebuild -project RatioThink.xcodeproj \
   -only-testing:RatioThinkGUITests/S258_ComposerSendGUITests/test_composer_send_streams_real_assistant_and_persists_after_relaunch \
   -only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests/test_chat_model_menu_contains_seeded_qwen3_default \
   -only-testing:RatioThinkGUITests/S426_FastThinkProfileGUITests/test_fast_think_profile_selectable_and_streams_real_reply \
+  -only-testing:RatioThinkGUITests/S520_MultiPartContentGUITests/test_external_multipart_client_succeeds_and_gui_chat_still_streams \
+  -only-testing:RatioThinkGUITests/S572_JSONThinkProfileGUITests/test_json_think_profile_selectable_and_streams_json_reply \
   ENABLE_CODE_COVERAGE=NO
 
 # The seeded Qwen3-0.6B is a *thinking* model: it can emit the answer inside
@@ -125,4 +127,21 @@ if ! sqlite3 "$GUI_HOME/chats.sqlite" \
 fi
 
 echo "chat gui e2e: assistant produced Paris (content or reasoning)"
+
+# #572: the JSON Think chat must have produced a grammar-constrained answer
+# in VISIBLE content (the two-phase decode always runs phase 2 after the
+# reasoning block, so content is non-empty JSON — distinct from the plain
+# thinking-model case above where content may stay empty). Assert at least
+# one assistant row whose trimmed ZCONTENT begins with a JSON value char and
+# carries no `<think>` leak.
+if ! sqlite3 "$GUI_HOME/chats.sqlite" \
+  "select trim(ZCONTENT) from ZMESSAGE where ZROLE = 'assistant' and ZCONTENT is not null and ZCONTENT not like '%<think>%';" \
+  | grep -E '^[][{"0-9tfn-]' >/dev/null; then
+  echo "chat gui e2e: JSON Think chat produced no JSON-shaped assistant content in $GUI_HOME/chats.sqlite" >&2
+  sqlite3 "$GUI_HOME/chats.sqlite" \
+    "select ZROLE, ZCONTENT, ZREASONING from ZMESSAGE order by ZTS;" >&2 || true
+  exit 1
+fi
+
+echo "chat gui e2e: JSON Think produced JSON-shaped visible content"
 echo "chat gui e2e: PASS"

@@ -17,9 +17,9 @@
     <key>Label</key>
     <string>com.ratiothink.app.helper</string>
 
-    <!-- Path to the embedded Helper executable, relative to RatioThink.app. -->
+    <!-- Path to the embedded Helper executable, relative to Rational.app. -->
     <key>BundleProgram</key>
-    <string>Contents/Library/LoginItems/RatioThinkHelper.app/Contents/MacOS/RatioThinkHelper</string>
+    <string>Contents/Library/LoginItems/RationalHelper.app/Contents/MacOS/RationalHelper</string>
 
     <!-- On-demand publication of the XPC mach service the App connects to. -->
     <key>MachServices</key>
