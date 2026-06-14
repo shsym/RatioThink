@@ -4,9 +4,21 @@
 //! seeds the dynamic table from the prompt, drafts a linear chain of up
 //! to `draft_len` followers, records accepted tokens, and tracks
 //! acceptance metrics. Greedy-only: the Generator's accepted tokens are
-//! the model's own per-position samples, so a matched draft is
-//! token-identical to non-speculative greedy decode (verified against
+//! the model's own per-position samples, so a matched draft reproduces
+//! non-speculative greedy decode *as computed by the verify forward*
+//! (logic verified against
 //! `Vendor/pie/sdk/rust/inferlet/src/generation.rs`).
+//!
+//! SHORT-WINDOW guarantee, not unconditional byte-identity (#592): the
+//! verify is a batched multi-position forward (`kernel_mul_mm`) whose FP
+//! reduction order differs from single-token plain decode
+//! (`kernel_mul_mv`). At a near-tie logit those round differently and
+//! argmax flips, so on the portable Metal backend the spec trajectory
+//! drifts off plain greedy past a short window (~80-150 tok on
+//! Qwen3-0.6B) — staying a valid, self-consistent greedy continuation,
+//! just not token-for-token equal to plain. `spec_smoke_real.py` gates
+//! identity only inside the short window; `spec_bench_real.py` records
+//! the long-window drift with a baseline-determinism control.
 //!
 //! `rollback` is a no-op: the cache grows only from *accepted* tokens,
 //! and the SDK truncates rejected-draft KV itself, so there is nothing
@@ -354,9 +366,12 @@ mod tests {
 
     #[test]
     fn greedy_spec_matches_plain_token_stream() {
-        // The decisive equivalence check: a spec-driven decode and a
-        // plain (1 token/step) decode over the same deterministic model
-        // + seed must produce the identical token stream.
+        // Drafter-logic equivalence: under a DETERMINISTIC model oracle
+        // (no FP, same sample at every position), a spec-driven decode and
+        // a plain (1 token/step) decode over the same seed must produce
+        // the identical token stream. This pins the drafter's accept/
+        // reanchor logic — NOT the engine's mm-vs-mv near-tie behavior,
+        // which is the short-window/long-drift axis tracked in #592.
         let period = [5u32, 6, 7];
         let model = |c: &[u32]| -> u32 {
             let last = *c.last().unwrap();

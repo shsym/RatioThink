@@ -251,7 +251,7 @@ func typeComposerText(
   app.typeKey("v", modifierFlags: .command)
 }
 
-// MARK: - multi-launch activation race (shared launch mechanism, #545)
+// MARK: - multi-launch activation race (shared launch mechanism, #545/#559)
 //
 // `openFreshChat` / `selectPersistedChat` / `selectSidebarSection` above already
 // re-activate-and-retry to survive a not-key launch. The remaining brittle
@@ -264,22 +264,25 @@ func typeComposerText(
 // `XCTAssertTrue(send.isEnabled, …)` fails on a perfectly healthy app — a
 // harness focus flake, not a product fault.
 //
-// These two helpers fix the mechanism so any multi-launch scenario can adopt
-// it: poll the LIVE AX tree for genuine hittability and RE-activate until a
-// landmark is actually interactable, instead of trusting a stale snapshot.
-// Nothing is weakened — a genuinely disabled control never becomes hittable and
-// still fails honestly.
+// These helpers fix the mechanism so any multi-launch scenario can adopt it:
+// poll the LIVE AX tree for genuine hittability and RE-activate until a landmark
+// is actually interactable, instead of trusting a stale snapshot. Nothing is
+// weakened — a genuinely disabled control never becomes hittable and still fails
+// honestly.
 
 extension XCUIElement {
   /// Wait until the element is genuinely hittable (app key + on-screen +
-  /// enabled). Uses `XCTNSPredicateExpectation` so it re-evaluates the live AX
-  /// tree rather than trusting a one-shot `.isHittable` / `.isEnabled` read.
-  /// Returns false on timeout — callers assert on the result, so the proof is
-  /// action-based (the control can actually be tapped), not a stale snapshot.
+  /// enabled) — exactly the precondition XCUITest needs to synthesize a
+  /// click/type. Fast-path returns immediately if already hittable; otherwise
+  /// uses `XCTNSPredicateExpectation` to re-evaluate the LIVE AX tree rather
+  /// than trusting a one-shot `.isHittable` / `.isEnabled` read. Returns false
+  /// on timeout — callers assert on the result, so the proof is action-based
+  /// (the control can actually be tapped), not a stale snapshot.
   @discardableResult
   func waitForHittable(timeout: TimeInterval = 10) -> Bool {
-    let predicate = NSPredicate(format: "isHittable == true")
-    let expectation = XCTNSPredicateExpectation(predicate: predicate, object: self)
+    if isHittable { return true }
+    let expectation = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "isHittable == true"), object: self)
     return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
   }
 }
@@ -362,4 +365,39 @@ extension XCUIApplication {
       file: file, line: line
     )
   }
+
+  /// Return `element` only once it is actually interactable, re-activating
+  /// this app until it is. In the full GUI matrix a launch can come up
+  /// not-key — a sibling suite's window keeps keyboard focus, so the whole
+  /// app tree reports `Disabled`. A bare `waitForExistence` still passes,
+  /// but the subsequent synthesized click/type then times out ("Failed to
+  /// synthesize event"), which cascades into spurious "control absent"
+  /// failures downstream (#559). Activating and gating on `isHittable`
+  /// waits the focus settle out before the event is sent.
+  ///
+  /// THROWS on exhaustion rather than returning a dead element: a caller
+  /// like `try app.readyForInput(send).click()` then aborts on the `try`
+  /// before the `.click()` runs, so the clean "stuck not-key" diagnostic
+  /// is preserved instead of being buried by a re-triggered synthesize
+  /// -event failure on the bogus click.
+  @discardableResult
+  func readyForInput(_ element: XCUIElement, timeout: TimeInterval = 15,
+                     file: StaticString = #filePath, line: UInt = #line) throws -> XCUIElement {
+    XCTAssertTrue(element.waitForExistence(timeout: timeout),
+                  "element never appeared", file: file, line: line)
+    for _ in 0..<3 {
+      if element.isHittable { return element }
+      activate()
+      if element.waitForHittable(timeout: timeout) { return element }
+    }
+    throw NotKeyError.notHittable
+  }
+}
+
+/// Thrown by `XCUIApplication.readyForInput` when the element never becomes
+/// hittable — the app appears stuck not-key. Carries a readable message so
+/// the test failure names the real cause, not a synthesize-event timeout.
+enum NotKeyError: Error, CustomStringConvertible {
+  case notHittable
+  var description: String { "element never became hittable — app appears stuck not-key" }
 }

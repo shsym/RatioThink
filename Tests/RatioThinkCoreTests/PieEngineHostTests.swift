@@ -1058,4 +1058,116 @@ final class PieEngineHostTests: XCTestCase {
     XCTAssertFalse(sawEngineGone, "monitor must not flip a stopped host to engine-gone")
     token.cancel()
   }
+
+  /// Liveness session that always reports `.gone`, but parks its first
+  /// `terminationSnapshot()` (the first session await the gone path
+  /// performs after passing the monitor's `Task.isCancelled` check) on
+  /// a gate the test opens. Lets the test deterministically suspend a
+  /// monitor between its cancel-check and the `stateQueue.async`
+  /// gone-block hop, so the host can be driven to a FRESH `.running`
+  /// incarnation before that stale verdict is delivered — the exact
+  /// shape of the #336 race.
+  final class GatedGoneSession: PieEngineHost.EngineSession, @unchecked Sendable {
+    private let gate = DispatchSemaphore(value: 0)
+    private let onProbe: () -> Void
+    private let lock = NSLock()
+    private var parked = false
+    init(onProbe: @escaping () -> Void) { self.onProbe = onProbe }
+    func open() { gate.signal() }
+    func shutdown() async -> EngineShutdownResult { .reaped }
+    func checkLiveness() async -> EngineLiveness { .gone(reason: "stale-incarnation probe") }
+    func terminationSnapshot() async -> (reason: Process.TerminationReason, status: Int32)? {
+      let first: Bool = { lock.lock(); defer { lock.unlock() }; let f = !parked; parked = true; return f }()
+      if first {
+        onProbe()
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+          DispatchQueue.global().async { [gate] in gate.wait(); cont.resume() }
+        }
+      }
+      return nil
+    }
+  }
+
+  func test_stale_gone_verdict_does_not_poison_fresh_running_incarnation() {
+    // #336 root fix: a `.gone` verdict from a SUPERSEDED liveness
+    // monitor must never flip a fresh engine incarnation to
+    // `.failed(.engineGone)`. The first session's gone path parks in
+    // `terminationSnapshot()` — past the monitor's `Task.isCancelled`
+    // check, before the `stateQueue.async` hop. The host is then
+    // stopped and restarted onto a healthy second session (a new
+    // monitor incarnation). When the stale snapshot await is released,
+    // its gone-block hops onto stateQueue and — because the incarnation
+    // token no longer matches — must bail.
+    //
+    // Mutation check: drop the incarnation guard in the gone-block and
+    // this fails — the `guard case .running` alone cannot tell the new
+    // running engine apart from the dead one, so the stale verdict
+    // poisons it. Deterministic (no widened intervals, no sleeps tuned
+    // to lose a race): the gate, not the clock, orders the events.
+    let probing = expectation(description: "first monitor parked in terminationSnapshot")
+    var probingFulfilled = false
+    let sessionA = GatedGoneSession {
+      if !probingFulfilled { probingFulfilled = true; probing.fulfill() }
+    }
+    let sessionB = ControllableLivenessSession(.alive)
+    let launchCount = OSAllocatedUnfairLock<Int>(initialState: 0)
+    let host = PieEngineHost(
+      launcher: { _ in
+        let n = launchCount.withLock { c -> Int in c += 1; return c }
+        return n == 1
+          ? (port: EnginePort(40407), session: sessionA)
+          : (port: EnginePort(40408), session: sessionB)
+      },
+      livenessInterval: 0.02,
+      livenessFailureThreshold: 1
+    )
+
+    let firstRunning = expectation(description: "first .running (session A)")
+    let stopped = expectation(description: ".stopped after first stop")
+    let secondRunning = expectation(description: "second .running (session B)")
+    var runningCount = 0
+    var hitStopped = false
+    var sawEngineGoneAfterRestart = false
+    var restarted = false
+    let token = host.observe { status, _ in
+      switch status {
+      case .running:
+        runningCount += 1
+        if runningCount == 1 { firstRunning.fulfill() }
+        if runningCount == 2 { restarted = true; secondRunning.fulfill() }
+      case .stopped:
+        if !hitStopped { hitStopped = true; stopped.fulfill() }
+      case .failed(.engineGone, _):
+        if restarted { sawEngineGoneAfterRestart = true }
+      default:
+        break
+      }
+    }
+
+    _ = host.start(makeSpec())
+    wait(for: [firstRunning], timeout: 2)
+    // Monitor A is now parked inside its first gone-path snapshot await.
+    wait(for: [probing], timeout: 2)
+
+    // Tear down incarnation 1 and bring up a healthy incarnation 2.
+    host.stop()
+    wait(for: [stopped], timeout: 2)
+    _ = host.start(makeSpec())
+    wait(for: [secondRunning], timeout: 2)
+
+    // Release the stale probe: its `.gone` now races onto stateQueue
+    // against a host that is `.running` on a different incarnation.
+    sessionA.open()
+    let settle = expectation(description: "settle")
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { settle.fulfill() }
+    wait(for: [settle], timeout: 2)
+
+    XCTAssertFalse(sawEngineGoneAfterRestart,
+                   "a stale gone verdict from a superseded monitor must not flip the fresh running incarnation to engine-gone")
+    if case .running = host.status {} else {
+      XCTFail("host must remain .running after a stale gone verdict; got \(host.status)")
+    }
+    token.cancel()
+    host.stop()
+  }
 }

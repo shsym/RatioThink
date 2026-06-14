@@ -139,6 +139,40 @@ public enum HelperConfig {
     return raw
   }
 
+  /// Outcome of resolving the `PIE_TEST_ENGINE_BASE_URL` seam to a concrete
+  /// `URL`. Distinguishes a *malformed* (set-but-unparseable) override from an
+  /// absent/ignored one so the caller can fail loudly on a harness typo rather
+  /// than silently falling back to the real engine (#339).
+  public enum TestEngineBaseURL: Equatable {
+    /// Override absent, empty, or ignored (Release build).
+    case notSet
+    /// Override set, honored, and parsed to a usable `URL`.
+    case valid(URL)
+    /// Override set + honored but `URL(string:)` rejected it (bad scheme,
+    /// embedded whitespace, unbalanced bracket, …). Never silently dropped.
+    case malformed(raw: String)
+  }
+
+  /// Resolve `PIE_TEST_ENGINE_BASE_URL` to a `URL`, surfacing a malformed value
+  /// explicitly instead of collapsing it to `nil`. A non-empty but unparseable
+  /// override otherwise becomes `nil` and the caller silently builds the real
+  /// production engine client — a test author's typo'd URL would run against
+  /// the wrong engine and fail far downstream (#339). Pure + parameterized so
+  /// the parse is unit-testable; the loud-failure policy lives at the call
+  /// site.
+  public static func resolveTestEngineBaseURL(
+    env: [String: String] = ProcessInfo.processInfo.environment,
+    allowed: Bool = isTestOverrideAllowed
+  ) -> TestEngineBaseURL {
+    guard let raw = testEngineBaseURLOverride(env: env, allowed: allowed) else {
+      return .notSet
+    }
+    guard let url = URL(string: raw) else {
+      return .malformed(raw: raw)
+    }
+    return .valid(url)
+  }
+
   // MARK: - internals
 
   private static let log = Logger(subsystem: "com.ratiothink.app.helper", category: "config")

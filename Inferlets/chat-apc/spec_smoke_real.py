@@ -6,7 +6,14 @@ driver against a real cached model, then POSTs the SAME greedy
 (temperature=0) chat twice — once with `speculation:{enabled:true}` and
 once without — and checks:
 
-  1. spec output is TOKEN-IDENTICAL to plain output (greedy equivalence);
+  1. spec output is TOKEN-IDENTICAL to plain output within a SHORT WINDOW
+     (max_tokens=64). This is the genuine but BOUNDED greedy-equivalence
+     guarantee: the batched verify forward (`kernel_mul_mm`) rounds
+     differently from single-token plain decode (`kernel_mul_mv`), so past
+     a near-tie (~80-150 tok on Qwen3-0.6B) the spec trajectory drifts off
+     plain while staying a valid greedy continuation (#592). 64 tok stays
+     short of that, so identity here is a meaningful regression gate; the
+     LONG-window drift is recorded (not asserted) by `spec_bench_real.py`.
   2. the spec run accepted at least one draft token (proves the linear
      Cacheback drafter actually speeds up decode on real text).
 
@@ -153,10 +160,14 @@ async def main() -> int:
                     print(f"[smoke] plain content/reasoning lens={tuple(len(x) for x in full_plain)}")
                     print(f"[smoke] spec  content/reasoning lens={tuple(len(x) for x in full_spec)}")
                     print(f"[smoke] spec_metrics={sm}")
+                    # Short-window gate: at max_tokens=64 the spec and plain
+                    # greedy trajectories must be byte-identical. Drift only
+                    # appears past a near-tie further out (#592), which the
+                    # bench records; here it is a hard regression failure.
                     if full_spec != full_plain:
                         failures.append(
-                            "greedy equivalence broken: spec != plain "
-                            f"(plain={full_plain!r} spec={full_spec!r})"
+                            "short-window greedy equivalence broken: spec != plain "
+                            f"within 64 tok (plain={full_plain!r} spec={full_spec!r})"
                         )
                     if sm is None:
                         failures.append("spec_metrics missing")
@@ -209,7 +220,7 @@ async def main() -> int:
         for f in failures:
             print(f"  ✗ {f}")
         return 1
-    print("\n[smoke] PASS: greedy equivalence + real draft acceptance")
+    print("\n[smoke] PASS: short-window greedy equivalence (64 tok) + real draft acceptance")
     return 0
 
 

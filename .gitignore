@@ -68,3 +68,6 @@ docs/plans/
 # Python bytecode (e.g. Scripts/make-dmg-dsstore.py imported by tests)
 __pycache__/
 *.pyc
+
+# Generated Fast Think / speculative-decoding bench artifact (Scripts/run-spec-bench.sh)
+spec_bench_*.json

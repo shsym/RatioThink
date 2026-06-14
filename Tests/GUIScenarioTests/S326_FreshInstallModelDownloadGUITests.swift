@@ -38,6 +38,12 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
     XCTAssert(app.wait(for: .runningForeground, timeout: 10))
     app.activate()
 
+    // Open a chat and enter text via the shared focus-robust helpers
+    // (`openFreshChat` re-activates + rescans; `typeComposerText` anchors
+    // the click on the window and pastes) so a not-key full-suite launch
+    // can't time out event synthesis and cascade into a spurious "download
+    // absent" failure (#559). The remaining raw button clicks go through
+    // `app.readyForInput` for the same reason.
     openFreshChat(in: app)
 
     typeComposerText("Hello with no model on disk", in: app)
@@ -45,7 +51,7 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5))
     XCTAssertTrue(send.isEnabled, "composer.send disabled after typing prompt; app tree: \(app.debugDescription)")
-    send.click()
+    try app.readyForInput(send).click()
 
     // Send is blocked behind the no-model gate — never a silent load.
     // #397: assert the gate via its state-independent prompt container,
@@ -71,7 +77,7 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
     // states macOS can collapse child accessibility identifiers into the
     // parent prompt, so assert the stable transition: the Download button
     // disappears rather than pinning the row's nested Cancel identifier.
-    download.click()
+    try app.readyForInput(download).click()
     XCTAssertTrue(download.waitForNonExistence(timeout: 5),
                   "tapping Download must replace the Download affordance with the in-flight progress row; app tree: \(app.debugDescription)")
   }
@@ -108,12 +114,12 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5))
     XCTAssertTrue(send.isEnabled, "composer.send disabled after typing prompt; app tree: \(app.debugDescription)")
-    send.click()
+    try app.readyForInput(send).click()
 
     XCTAssertTrue(noModelPrompt(in: app).waitForExistence(timeout: 5))
     let download = missingModelDownloadButton(in: app)
     XCTAssertTrue(download.waitForExistence(timeout: 5))
-    download.click()
+    try app.readyForInput(download).click()
 
     // The fake stream completes → onDownloaded fires once → the prompt
     // dismisses (and the engine start is kicked). Assert the gate's
