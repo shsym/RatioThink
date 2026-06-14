@@ -479,6 +479,14 @@ public final class EngineStatusStore: ObservableObject {
             code: .engineGone,
             message: "Can’t reach the engine — it stopped responding (\(cause)). Use Restart Engine to reconnect."
           ))
+          // Symmetric to the success non-running clear in
+          // `updateRuntimeDaemonBindMode`: leaving a running generation must
+          // invalidate the confirmed bind posture, or a later legacy running
+          // payload (no `daemonBindHost`) would reuse the stale confirmed
+          // `.loopback` and hide the 0.0.0.0 exposure warning for an
+          // externally bound endpoint. Keep `runtimeDaemonBindMode` as the
+          // last-known value so the fail-safe still over-reports on doubt.
+          runtimeDaemonBindModeIsConfirmed = false
         }
         if self.lastError != nil { self.lastError = nil }
       }

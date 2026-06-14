@@ -191,6 +191,46 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8124")
   }
 
+  func test_engineGone_clears_confirmed_bind_mode_so_legacy_relaunch_over_reports_exposure() {
+    // Symmetry to the v10 success-path clear: a confirmed posture must not
+    // outlive its running generation. Sustained transport loss synthesizes
+    // `.engineGone` (the generation ended) — if the confirmed flag survives,
+    // a later legacy running payload (no daemonBindHost) reuses the stale
+    // confirmed `.loopback` and hides the 0.0.0.0 exposure warning for an
+    // externally bound, unauthenticated endpoint.
+    let data = Data(#"{"kind":"running","port":8125,"profileID":"chat"}"#.utf8)
+    let legacyStatus = try! XPCPayload.decode(EngineStatus.self, from: data)
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialDaemonBindMode: .loopback,
+      daemonBindModeProvider: { .loopback },
+      tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3)
+    )
+
+    store._applyPollForTesting(
+      next: .running(port: 8123, profileID: "chat", daemonBindHost: .loopback),
+      error: nil
+    )
+    XCTAssertEqual(store.runtimeDaemonBindMode, .loopback)
+
+    for _ in 0..<3 {
+      store._applyPollForTesting(next: nil, error: "NSXPCConnectionInvalid")
+    }
+    guard case .failed(.engineGone, _) = store.status else {
+      return XCTFail("sustained transport loss must escalate to .engineGone; got \(store.status)")
+    }
+
+    // Legacy relaunch without daemonBindHost while desired stays loopback:
+    // with the confirmed flag cleared, fail-safe over-reports as external.
+    store._applyPollForTesting(next: legacyStatus, error: nil)
+
+    XCTAssertEqual(store.status, .running(port: 8125, profileID: "chat"))
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external,
+                   "engineGone must clear confirmed bind mode so a legacy relaunch cannot claim stale loopback safety")
+    XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8125")
+  }
+
   func test_running_status_poll_updates_runtime_daemon_bind_mode_from_helper() {
     let client = StubXPCClient()
     let store = EngineStatusStore(client: client, initialDaemonBindMode: .loopback)
