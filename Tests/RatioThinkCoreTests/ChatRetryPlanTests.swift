@@ -60,7 +60,12 @@ final class ChatRetryPlanTests: XCTestCase {
     XCTAssertEqual(engine.requests.first?.messages,
                    [ChatMessage(role: .user, content: "q1")],
                    "the retried request must not retain an assistant-terminal prefix")
-    XCTAssertEqual(chat.messages.map(\.content), ["q1", "fresh"])
+    // `Chat.messages` is an unordered SwiftData to-many relationship; production
+    // reads the transcript via `sorted(by: Message.transcriptPrecedes)`, so the
+    // assertion must too — comparing the raw relationship order flakes on the
+    // store's fetch order.
+    XCTAssertEqual(chat.messages.sorted(by: Message.transcriptPrecedes).map(\.content),
+                   ["q1", "fresh"])
   }
 
   func test_plan_earlier_turn_deletes_suffix_and_requires_confirmation() throws {

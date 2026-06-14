@@ -520,8 +520,15 @@ final class EngineTerminationWiringTests: XCTestCase {
     """.write(to: script, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o755],
                                           ofItemAtPath: script.path)
-    let captured = OSAllocatedUnfairLock<EngineTermination?>(initialState: nil)
-    let got = expectation(description: "termination captured")
+    // Signal-based wait: the engine calls `terminationSink` exactly once when it
+    // detects the death, so bridge that callback into an AsyncStream and await
+    // the first element. This resolves the instant the real termination event
+    // fires, with no wall-clock deadline — spawning the stub subprocess can take
+    // well over a fixed few-second budget on a loaded CI runner, which made the
+    // previous `fulfillment(timeout:)` flake. A genuine regression (no
+    // termination) now hangs until the suite-level timeout rather than racing a
+    // tight per-wait deadline.
+    let (terminations, termContinuation) = AsyncStream.makeStream(of: EngineTermination.self)
     let host = PieEngineHost(
       launcher: { spec in
         let result = try await PieControlLauncher.launch(spec: spec)
@@ -530,8 +537,8 @@ final class EngineTerminationWiringTests: XCTestCase {
       livenessInterval: 0,
       relaunchPolicy: PieEngineHost.RelaunchPolicy(maxAttempts: 0),
       terminationSink: { t in
-        captured.withLock { $0 = t }
-        got.fulfill()
+        termContinuation.yield(t)
+        termContinuation.finish()
       },
       guardrailBytes: 8_000_000_000)
     let spec = try PieControlLauncher.LaunchSpec(
@@ -544,12 +551,12 @@ final class EngineTerminationWiringTests: XCTestCase {
       profileID: "test-profile",
       modelConfig: .dummy)
 
-    await LaunchedSession.withResidentMemorySamplerForTesting({ _ in 9_000_000_000 }) {
+    let termination = await LaunchedSession.withResidentMemorySamplerForTesting({ _ in 9_000_000_000 }) {
       _ = host.start(spec)
-      await fulfillment(of: [got], timeout: 3)
+      var iterator = terminations.makeAsyncIterator()
+      return await iterator.next()
     }
-
-    let t = try XCTUnwrap(captured.withLock { $0 })
+    let t = try XCTUnwrap(termination)
     XCTAssertEqual(t.cause, .oom)
     XCTAssertEqual(t.initiator, .launch)
     XCTAssertEqual(t.rssBytes, 9_000_000_000)
