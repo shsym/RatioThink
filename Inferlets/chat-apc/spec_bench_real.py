@@ -464,6 +464,31 @@ async def _bench(base: str) -> tuple[dict, list[str]]:
     return artifact, failures
 
 
+def _cache_cell(spc: dict, key: str) -> str:
+    """Format one n-gram-cache metric cell for the summary.
+
+    Distinguishes a DROPPED/renamed wire field from a genuinely cold turn:
+      * key absent from the dict          -> 'MISSING' (the field never
+        arrived — a wire-contract regression to investigate);
+      * key present but empty/non-numeric -> '--'      (a real zero-lookup
+        or empty-histogram turn).
+    Otherwise renders the value: 2-dp for the hit-rate float, comma-joined
+    for the histogram, plain int for the counters.
+    """
+    if key not in spc:
+        return "MISSING"
+    val = spc[key]
+    if key == "cache_hit_rate":
+        return f"{val:.2f}" if isinstance(val, (int, float)) else "--"
+    if key == "accepted_prefix_len_histogram":
+        if isinstance(val, (list, tuple)) and val:
+            return ",".join(str(x) for x in val)
+        return "--"
+    # Integer counters: cache_hits, cache_misses, cache_size. 0 is a valid
+    # value (renders "0"), only a non-numeric/None present value is '--'.
+    return str(val) if isinstance(val, (int, float)) else "--"
+
+
 def _print_summary(artifact: dict) -> None:
     print("\n" + "=" * 72)
     print(f"Fast Think measurement — {artifact['model']} ({artifact['driver']})")
@@ -511,14 +536,12 @@ def _print_summary(artifact: dict) -> None:
     print("-" * len(cache_hdr))
     for s in artifact["scenarios"]:
         spc = s["speculation"]
-        hr = spc.get("cache_hit_rate")
-        hr_s = f"{hr:.2f}" if isinstance(hr, (int, float)) else "--"
-        hist = spc.get("accepted_prefix_len_histogram")
-        hist_s = ",".join(str(x) for x in hist) if hist else "--"
         print(
-            f"{s['scenario']:<10} {spc.get('cache_hits', '--')!s:>7} "
-            f"{spc.get('cache_misses', '--')!s:>7} {hr_s:>9} "
-            f"{spc.get('cache_size', '--')!s:>9} {hist_s:>32}"
+            f"{s['scenario']:<10} {_cache_cell(spc, 'cache_hits'):>7} "
+            f"{_cache_cell(spc, 'cache_misses'):>7} "
+            f"{_cache_cell(spc, 'cache_hit_rate'):>9} "
+            f"{_cache_cell(spc, 'cache_size'):>9} "
+            f"{_cache_cell(spc, 'accepted_prefix_len_histogram'):>32}"
         )
     print("-" * len(cache_hdr))
     print("histogram index k = decode steps that committed k accepted draft "
