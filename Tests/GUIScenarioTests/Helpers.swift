@@ -250,3 +250,42 @@ func typeComposerText(
   pasteboard.setString(text, forType: .string)
   app.typeKey("v", modifierFlags: .command)
 }
+
+extension XCUIElement {
+  /// Poll `isHittable` (not just `exists`). `isHittable` is true only when
+  /// the element exists, is on-screen and enabled, AND its app is
+  /// key/frontmost — exactly the precondition XCUITest needs to synthesize
+  /// a click/type against it. Returns false if it never becomes hittable.
+  @discardableResult
+  func waitForHittable(timeout: TimeInterval) -> Bool {
+    if isHittable { return true }
+    let expectation = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "isHittable == true"), object: self)
+    return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
+  }
+}
+
+extension XCUIApplication {
+  /// Return `element` only once it is actually interactable, re-activating
+  /// this app until it is. In the full GUI matrix a launch can come up
+  /// not-key — a sibling suite's window keeps keyboard focus, so the whole
+  /// app tree reports `Disabled`. A bare `waitForExistence` still passes,
+  /// but the subsequent synthesized click/type then times out ("Failed to
+  /// synthesize event"), which cascades into spurious "control absent"
+  /// failures downstream (#559). Activating and gating on `isHittable`
+  /// waits the focus settle out before the event is sent.
+  @discardableResult
+  func readyForInput(_ element: XCUIElement, timeout: TimeInterval = 15,
+                     file: StaticString = #filePath, line: UInt = #line) -> XCUIElement {
+    XCTAssertTrue(element.waitForExistence(timeout: timeout),
+                  "element never appeared", file: file, line: line)
+    for _ in 0..<3 {
+      if element.isHittable { return element }
+      activate()
+      if element.waitForHittable(timeout: timeout) { return element }
+    }
+    XCTFail("element never became hittable — app appears stuck not-key",
+            file: file, line: line)
+    return element
+  }
+}
