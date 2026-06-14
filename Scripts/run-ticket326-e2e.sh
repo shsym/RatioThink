@@ -47,7 +47,13 @@ if [ -z "$PIE_BIN" ]; then
     # Fallback: scan the configured DerivedData root (custom location honored,
     # default otherwise) for the most-recent build, then the installed app.
     if [ -z "$PIE_BIN" ]; then
-      derived_base="$(defaults read com.apple.dt.Xcode IDECustomDerivedDataLocation 2>/dev/null)"
+      # `|| true`: `defaults read` exits 1 when the key is ABSENT — the default
+      # case on any machine without a custom DerivedData location — and under
+      # set -euo pipefail (line 15) that single-command substitution would abort
+      # the script before the `${derived_base:-…}` default below, making the
+      # find/installed-app fallback unreachable on standard machines (#545
+      # review v3 F3). The default on the next line supplies the fallback.
+      derived_base="$(defaults read com.apple.dt.Xcode IDECustomDerivedDataLocation 2>/dev/null || true)"
       derived_base="${derived_base:-$HOME/Library/Developer/Xcode/DerivedData}"
       # `|| true`: under set -euo pipefail a missing $derived_base (fresh
       # machine, custom IDECustomDerivedDataLocation, cleaned DerivedData) makes
