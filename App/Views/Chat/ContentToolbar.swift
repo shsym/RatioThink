@@ -256,6 +256,19 @@ struct ContentToolbar: View {
     // re-raise also MASKED the real production gap. With the gap fixed at the
     // source, the auto-pick fires exactly once per stable pendable state, and
     // S459's resign-key-survival case asserts the production NSPopover itself.
+    //
+    // #581 — CONSTRAINT (do not re-key this on `swapCoordinator.pending`):
+    // keying on pending-presence is what made #579's seam incompatible with a
+    // Cancel-outcome assertion. `cancel(token:)` / `dismissCurrentPending()`
+    // clear `pending` WITHOUT mutating `selectedProfileID` (only `commitSwap`
+    // sets it), so a pending-keyed taskID flips back to its pendable value the
+    // instant a deliberate Cancel clears the popover — re-raising the swap once
+    // and bouncing the popover back into a test that asserted it stayed
+    // dismissed. Keying on the stable `(profile, model)` selection instead
+    // means a Cancel leaves the axis untouched (no re-fire), a Confirm trips
+    // the `selectedProfileID != target` guard (no re-fire), so every outcome —
+    // Confirm, Keep-Current, AND Cancel — is safe to assert. A future
+    // cancel-driving GUI scenario relies on this; do not reintroduce pending.
     [
       Self.testAutoPickProfileID ?? "",
       viewModel.selectedProfileID,
