@@ -223,9 +223,43 @@ test_termination_classification() {
   require_contains "$out" "deep bundle:"            # still runs to completion
 }
 
+# DB-verification honesty pin (#545 review v5 F5): the post-xcodebuild content
+# gates were once downgraded to `if sqlite3 … 2>/dev/null; then …; else NOTE`,
+# which collapsed the wrapper's verdict to XCODEBUILD_RC and masked a genuinely
+# missing/corrupt chats.sqlite — a missing DB read as the benign "no match" NOTE
+# and PASSED, indistinguishable from the quarantined truncation. The gate body
+# runs only after a real xcodebuild flow (unreachable in this fast self-test), so
+# pin it structurally: a missing/empty DB MUST hard-fail, and each sqlite3 query
+# MUST capture its rc so a corrupt/unreadable DB stays fatal while an empty
+# result set stays a tolerated NOTE. Dropping any guard re-introduces the silent
+# failure this PR exists to prevent.
+test_db_gate_hard_fails_on_missing_or_corrupt_db() {
+  # 1) Missing/empty DB is fatal, not a benign NOTE.
+  if ! grep -qF '[ ! -s "$GUI_HOME/chats.sqlite" ]' "$SCRIPT"; then
+    echo "FAIL: run-chat-gui-e2e.sh dropped the missing/empty chats.sqlite hard-assert" >&2
+    echo "      — a DB that was never created would silently PASS via the content-gate NOTE." >&2
+    exit 1
+  fi
+  # 2) Each content gate captures sqlite3's rc so a QUERY ERROR is fatal.
+  local rc_guards
+  rc_guards="$(grep -cE 'sqlite3 query failed \(rc=' "$SCRIPT" || true)"
+  if [ "$rc_guards" -lt 2 ]; then
+    echo "FAIL: content gates missing per-query rc handling (found $rc_guards, need >= 2)" >&2
+    echo "      — a corrupt/unreadable DB must hard-fail, not collapse to the no-match NOTE." >&2
+    exit 1
+  fi
+  # 3) The blanket `2>/dev/null` that masked genuine sqlite3 errors must be gone
+  #    from the content-gate queries (stderr now goes to a captured .err file).
+  if grep -qE 'sqlite3 "\$GUI_HOME/chats.sqlite".*2>/dev/null' "$SCRIPT"; then
+    echo "FAIL: content-gate sqlite3 query still swallows stderr with 2>/dev/null — masks DB errors" >&2
+    exit 1
+  fi
+}
+
 test_requires_tcc_before_starting_engine
 test_removes_stale_config_on_exit
 test_missing_gguf_fixture_is_not_accepted
 test_engine_harness_banner_marker_is_current
 test_termination_classification
+test_db_gate_hard_fails_on_missing_or_corrupt_db
 echo "test-run-chat-gui-e2e: PASS"

@@ -129,20 +129,41 @@ if [ "$XCODEBUILD_RC" -ne 0 ]; then
   exit "$XCODEBUILD_RC"
 fi
 
+# DB-verification is the wrapper's purpose, so a missing/empty store is a hard
+# failure (wrong PIE_TEST_GUI_HOME, app crash before persist, or a persistence
+# regression) — distinct from the quarantined case below where the DB exists but
+# the assistant content is legitimately empty. Without this guard the content
+# gates' "no match" verdict is indistinguishable from "no DB at all".
+if [ ! -s "$GUI_HOME/chats.sqlite" ]; then
+  echo "$TAG: chats.sqlite missing/empty at $GUI_HOME — GUI never persisted any chat; failing" >&2
+  exit 1
+fi
+
 # The seeded Qwen3-0.6B is a *thinking* model: within the token budget the
 # answer can land in <think> reasoning with empty final ZCONTENT, OR the
 # reasoning itself can truncate before reaching the answer. The two send
 # scenarios that asserted a visible "Paris" reply (S258/S426) are QUARANTINED in
 # the GUI suite as a separate product/engine bug (thinking-model empty/truncated
 # final content), so this Paris check is now a NON-FATAL diagnostic — it must
-# not red-fail the seated run on the exact behavior we quarantined. The JSON
-# Think gate below stays the wrapper's hard product proof (its two-phase decode
-# always emits non-empty content). Re-arm this as fatal (restore the `exit 1`)
-# when the engine guarantees non-empty final content and S258/S426 are
-# un-quarantined.
-if sqlite3 "$GUI_HOME/chats.sqlite" \
+# not red-fail the seated run on the exact behavior we quarantined. Re-arm this
+# as fatal (restore the `exit 1` in the else branch) when the engine guarantees
+# non-empty final content and S258/S426 are un-quarantined.
+#
+# An EMPTY result set (truncation) is tolerated, but a sqlite3 QUERY ERROR
+# (corrupt/unreadable DB) is fatal — capture the rc separately so the genuine
+# error is never masked by the benign no-match.
+set +e
+paris_rows="$(sqlite3 "$GUI_HOME/chats.sqlite" \
   "select ZCONTENT, ZREASONING from ZMESSAGE where ZROLE = 'assistant';" \
-  2>/dev/null | grep -F "Paris" >/dev/null; then
+  2>"$RUN_ROOT/sqlite-paris.err")"
+paris_rc=$?
+set -e
+if [ "$paris_rc" -ne 0 ]; then
+  echo "$TAG: sqlite3 query failed (rc=$paris_rc) reading chats.sqlite — DB corrupt/unreadable" >&2
+  cat "$RUN_ROOT/sqlite-paris.err" >&2 || true
+  exit 1
+fi
+if printf '%s' "$paris_rows" | grep -F "Paris" >/dev/null; then
   echo "chat gui e2e: assistant produced Paris (content or reasoning)"
 else
   echo "chat gui e2e: NOTE — no Paris reply persisted (thinking-model empty/truncated content; S258/S426 quarantined); non-fatal" >&2
@@ -154,13 +175,27 @@ fi
 # ZREASONING="" — no reply persisted) — the SAME product/engine bug the
 # quarantined S258/S426 hit, just on the JSON path. So this content gate is a
 # NON-FATAL diagnostic too: the seated run must not red-fail on the quarantined
-# bug. The hard, deterministic content proof on this path is S520's external
-# /v1/chat/completions assertion (200 + chat.completion message), which runs in
-# the GUI suite and is independent of the GUI render. Re-arm this as fatal
-# (restore `exit 1`) when the engine guarantees non-empty JSON content here.
-if sqlite3 "$GUI_HOME/chats.sqlite" \
+# bug. The hard, deterministic JSON-visible-content proof on this path is S572's
+# `waitForStaticTextBeginningWithJSON` assertion, which is NOT quarantined and
+# runs in the same xcodebuild suite (S520's non-stream assert passes on empty
+# content when reasoning is non-empty, so it is not the JSON-content guarantee).
+# Re-arm this as fatal (restore `exit 1` in the else branch) when the engine
+# guarantees non-empty JSON content here.
+#
+# Same rc handling as the Paris gate: empty result set tolerated, query error
+# fatal.
+set +e
+json_rows="$(sqlite3 "$GUI_HOME/chats.sqlite" \
   "select trim(ZCONTENT) from ZMESSAGE where ZROLE = 'assistant' and ZCONTENT is not null and ZCONTENT not like '%<think>%';" \
-  2>/dev/null | grep -E '^[][{"0-9tfn-]' >/dev/null; then
+  2>"$RUN_ROOT/sqlite-json.err")"
+json_rc=$?
+set -e
+if [ "$json_rc" -ne 0 ]; then
+  echo "$TAG: sqlite3 query failed (rc=$json_rc) reading chats.sqlite — DB corrupt/unreadable" >&2
+  cat "$RUN_ROOT/sqlite-json.err" >&2 || true
+  exit 1
+fi
+if printf '%s' "$json_rows" | grep -E '^[][{"0-9tfn-]' >/dev/null; then
   echo "chat gui e2e: JSON Think produced JSON-shaped visible content"
 else
   echo "chat gui e2e: NOTE — JSON Think persisted no JSON content (thinking-model empty/truncated output; same quarantined product bug); non-fatal" >&2
