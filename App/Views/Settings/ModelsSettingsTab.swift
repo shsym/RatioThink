@@ -680,6 +680,7 @@ private struct InstalledModelsTable: View {
 /// when that merges it adds its own section here and does not touch this
 /// one — they share only the `Models` settings tab as a host.
 private struct MemoryGuardrailSection: View {
+  @EnvironmentObject private var guardrailRevision: GuardrailRevision
   @State private var fraction: Double = GuardrailSettings.defaultFraction
   @State private var saveError: String?
 
@@ -785,6 +786,10 @@ private struct MemoryGuardrailSection: View {
       let root = try PieDirs.applicationSupport()
       try GuardrailSettings.saveFraction(clamped, root: root)
       saveError = nil
+      // Tell the sibling Profiles tab to recompute its picker over-limit
+      // badges against the just-saved ceiling, instead of going stale
+      // until the ProfileEditor reappears (#334).
+      guardrailRevision.bump()
     } catch {
       saveError = "Could not save guardrail setting: \(error)"
     }

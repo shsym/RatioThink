@@ -25,11 +25,16 @@ if [ -z "$branch" ]; then
   exit 1
 fi
 
-# Make sure the declared branch ref is present locally (CI checks out the
-# submodule at the detached pin, so origin/<branch> may be absent until fetched).
+# Fetch the declared branch and compare against FETCH_HEAD, not the
+# `origin/<branch>` tracking ref. CI checks out the submodule with a narrow
+# clone whose fetch refspec only maps the default branch
+# (`+refs/heads/main:refs/remotes/origin/main`), so `fetch origin <branch>`
+# updates FETCH_HEAD but never creates/refreshes `origin/<branch>`. Reading the
+# tracking ref then sees a stale (or absent) lineage and reports a false
+# "not reachable". FETCH_HEAD is the freshly-fetched tip regardless of refspec.
 git -C "$SUB" fetch --quiet origin "$branch"
 
-if git -C "$SUB" merge-base --is-ancestor "$pin" "origin/$branch"; then
+if git -C "$SUB" merge-base --is-ancestor "$pin" FETCH_HEAD; then
   echo "[vendor-pin] OK: $SUB gitlink $pin is reachable from origin/$branch"
   exit 0
 fi

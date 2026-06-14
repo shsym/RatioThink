@@ -1,13 +1,16 @@
 import XCTest
 
-/// S5 — Rational.app window shell matches the simplified Chat/API shell.
+/// S5 — Rational.app window shell matches the simplified Chat/Search/API shell.
 ///
-/// GUI-only. Asserts against FINAL design strings — sidebar shows the nav
-/// labels `Chats` and `API Endpoints` (the latter now mirrors the live engine
-/// endpoint via `LocalAPIView`, #422). The detail empty-state shows the
-/// `Start Chat` CTA (there is no per-endpoint `Add Endpoint` CTA — the local
-/// API is the engine's single endpoint). Settings opens via Cmd+, with 4 tabs
-/// (no API settings tab — the local API's single surface is the main window).
+/// GUI-only. Asserts against FINAL design strings — the sidebar shows the nav
+/// labels `Chats`, `Search`, and `API Endpoints` (the last mirrors the live
+/// engine endpoint via `LocalAPIView`, #422). The titlebar branding label was
+/// removed and replaced by an emphasized new-chat button (`chats.newButton`).
+/// Conversation search is a sibling sidebar destination (a `Search` nav row →
+/// `ConversationSearchView` in the detail column), NOT an inline chat-list
+/// filter. The no-selection landing shows the `Start Chat` CTA. Settings opens
+/// via Cmd+, with 4 tabs (no API settings tab — the local API's single surface
+/// is the main window).
 final class S5_AppWindowShellGUITests: XCTestCase {
   override func setUp() async throws {
     try guardSeatedGUI()
@@ -18,20 +21,7 @@ final class S5_AppWindowShellGUITests: XCTestCase {
   /// Settings window) leaves macOS persisting the Settings window
   /// in restoration state; the next test's `launch()` then re-opens
   /// Settings and `app.windows.firstMatch` matches Settings instead
-  /// of the main window — observed under Phase 3.8 review on
-  /// 2026-05-19 (empty `title`, empty sidebar/CTA queries).
-  ///
-  /// `-NSQuitAlwaysKeepsWindows NO`     — per-launch override of the
-  ///                                       per-user `NSQuitAlways…`
-  ///                                       default that drives the
-  ///                                       AppKit-side restoration
-  ///                                       captureFile write at quit.
-  /// `-ApplePersistenceIgnoreState YES` — belt-and-braces; tells the
-  ///                                       launching app to ignore
-  ///                                       any persistence blob that
-  ///                                       *did* land before the
-  ///                                       above flag took effect on
-  ///                                       a prior test run.
+  /// of the main window.
   private static let restorationOffArgs: [String] = [
     "-NSQuitAlwaysKeepsWindows", "NO",
     "-ApplePersistenceIgnoreState", "YES",
@@ -55,12 +45,14 @@ final class S5_AppWindowShellGUITests: XCTestCase {
 
     let window = app.windows.firstMatch
     XCTAssert(window.waitForExistence(timeout: 5), "main window missing")
-    XCTAssertEqual(window.title, "Rational", "title was '\(window.title)'")
+    // Branding removed from the titlebar; an emphasized new-chat button took
+    // that spot, so the titlebar no longer reads the product name as a label.
+    XCTAssertNotEqual(window.title, "Rational",
+                      "titlebar branding should be gone; title was '\(window.title)'")
+    XCTAssertTrue(app.buttons["chats.newButton"].waitForExistence(timeout: 5),
+                  "titlebar New Chat affordance missing")
 
-    // Sidebar (col 1) — design §5 final nav vocabulary.
-    // SwiftUI can expose nav row text as label/identifier/title/value on
-    // either a StaticText or Button element depending on the row style, so
-    // scan the full descendant tree and check all string attributes.
+    // Sidebar (col 1) — final nav vocabulary.
     XCTAssertTrue(
       window.descendants(matching: .any).matching(identifier: "Chats")
         .firstMatch.waitForExistence(timeout: 5),
@@ -78,32 +70,27 @@ final class S5_AppWindowShellGUITests: XCTestCase {
 
     XCTAssertTrue(allStrings.contains("Chats"),
                   "sidebar missing 'Chats'; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
-    // #422: the API Endpoints section is live — its sidebar nav row is present
-    // and routes to the single LocalAPIView.
+    // Conversation search is a sibling sidebar destination.
+    XCTAssertTrue(allStrings.contains("Search"),
+                  "sidebar missing 'Search'; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
+    // The chat-list header was renamed Chat List → Conversations.
+    XCTAssertTrue(allStrings.contains("Conversations"),
+                  "chat-list header missing 'Conversations'; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
+    // #422: the API Endpoints section is live — its sidebar nav row routes to
+    // the single LocalAPIView.
     XCTAssertTrue(allStrings.contains("API Endpoints"),
                   "sidebar missing 'API Endpoints'; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
-    XCTAssertTrue(app.textFields["chats.searchField"].waitForExistence(timeout: 5),
-                  "simplified left navigation must show chat search above chat rows")
 
-    // #577: the Chats landing is a ready new-chat composer (the "start" entry
-    // opens an editable composer directly — no separate New Chat click and no
-    // "Start Chat" CTA dead-end). The detail surface mounts NewChatView, whose
-    // composer is present immediately.
-    XCTAssertTrue(
-      app.descendants(matching: .any).matching(identifier: "composer.text")
-        .firstMatch.waitForExistence(timeout: 5),
-      "Chats landing must show the ready new-chat composer; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
-    XCTAssertTrue(
-      app.descendants(matching: .any).matching(identifier: "newChat.view")
-        .firstMatch.waitForExistence(timeout: 5),
-      "Chats landing must mount the new-chat view")
-    // No per-endpoint `Add Endpoint` CTA (the local API is the engine's single
-    // endpoint, reached via the sidebar section) — and the old "Start Chat"
-    // zero-state CTA is gone now that the composer is the landing.
+    // Search is a dedicated nav destination, NOT an inline chat-list filter.
+    XCTAssertFalse(app.textFields["chats.searchField"].exists,
+                   "conversation search must be a sidebar destination, not an inline chat-list filter")
+
+    // The no-selection landing shows the Start Chat CTA; there is no
+    // per-endpoint Add Endpoint CTA.
+    XCTAssertTrue(allStrings.contains("Start Chat"),
+                  "detail missing 'Start Chat' CTA; got: \(allStrings.filter { !$0.isEmpty }.sorted())")
     XCTAssertFalse(app.buttons["Add Endpoint"].exists,
                    "landing must not show an 'Add Endpoint' CTA")
-    XCTAssertFalse(app.buttons["Start Chat"].exists,
-                   "the new-chat composer replaces the old 'Start Chat' CTA dead-end")
   }
 
   @MainActor
@@ -125,19 +112,12 @@ final class S5_AppWindowShellGUITests: XCTestCase {
     XCTAssert(app.wait(for: .runningForeground, timeout: 5))
 
     // Snapshot window count before ⌘, so we can assert a NEW window appeared.
-    // The previous title predicate ('Settings|Preferences|General') was
-    // localization-fragile — never matches 'Préférences' / '設定' / etc — and
-    // gave no signal when ⌘, was swallowed but a pre-existing window happened
-    // to satisfy the predicate.
     let before = app.windows.count
     app.typeKey(",", modifierFlags: .command)
 
     // SwiftUI tags the Settings scene's NSWindow with the stable AX
     // identifier `com_apple_SwiftUI_Settings_window` across all macOS
-    // localizations (verified via debugDescription dump in dev). Querying
-    // by identifier is localization-proof; index-based resolution does not
-    // work here because the new Settings window becomes Keyboard Focused
-    // and is sorted ahead of the main window in `app.windows`.
+    // localizations. Querying by identifier is localization-proof.
     let settings = app.windows.matching(identifier: "com_apple_SwiftUI_Settings_window").firstMatch
     XCTAssertTrue(
       settings.waitForExistence(timeout: 3),
@@ -148,22 +128,13 @@ final class S5_AppWindowShellGUITests: XCTestCase {
       "Expected exactly one new window after ⌘,; got delta=\(app.windows.count - before)"
     )
 
-    // Lock toolbar-button cardinality before identifier queries — the
-    // `buttons[id]` subscript resolves on label OR identifier across the
-    // entire query, so without an explicit count assertion a stale sibling
-    // (or the tab-pane content view) could satisfy `waitForExistence` while
-    // the TabView toolbar itself is broken.
+    // Lock toolbar-button cardinality before identifier queries.
     let toolbarButtons = settings.toolbars.buttons
     XCTAssertEqual(
       toolbarButtons.count, 4,
       "Expected 4 TabView toolbar buttons (no API settings tab — the local API's surface is the main window); window: \(settings.debugDescription)"
     )
 
-    // Query by identifier only (not the label-or-id subscript). Identifier
-    // is pinned on the tab content view in App/RatioThinkApp.swift, which is the
-    // verified propagation path for the toolbar button's AX identity on
-    // macOS 14+ (pinning only on the inner `.tabItem` Label drops the
-    // toolbar count from 5 to 2 — see commit notes).
     for expected in ["General", "Models", "Profiles", "Advanced"] {
       let tab = toolbarButtons.matching(identifier: expected).firstMatch
       XCTAssertTrue(
@@ -171,8 +142,6 @@ final class S5_AppWindowShellGUITests: XCTestCase {
         "Settings tab '\(expected)' missing; window: \(settings.debugDescription)"
       )
     }
-    // No API settings tab — the local API lives in the main window's API
-    // Endpoints section (LocalAPIView, #422), not in Settings.
     XCTAssertEqual(
       toolbarButtons.matching(identifier: "API").count, 0,
       "Settings should NOT show an 'API' tab (single surface is the main window); window: \(settings.debugDescription)"

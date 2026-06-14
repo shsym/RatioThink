@@ -418,6 +418,17 @@ async def _bench(base: str) -> tuple[dict, list[str]]:
                     "generated_tokens": fsm.get("generated_tokens"),
                     "leader_len": fsm.get("leader_len"),
                     "draft_len": fsm.get("draft_len"),
+                    # #591: attribute a low accepted_ratio — distinguishes a
+                    # cold cache (drafter rarely proposes) from bad followers
+                    # (proposes but gets rejected), and shows the chain-length
+                    # spread behind avg_tokens_per_step.
+                    "cache_hits": fsm.get("cache_hits"),
+                    "cache_misses": fsm.get("cache_misses"),
+                    "cache_hit_rate": fsm.get("cache_hit_rate"),
+                    "cache_size": fsm.get("cache_size"),
+                    "accepted_prefix_len_histogram": fsm.get(
+                        "accepted_prefix_len_histogram"
+                    ),
                 },
                 "latency": {
                     "baseline": {
@@ -451,6 +462,31 @@ async def _bench(base: str) -> tuple[dict, list[str]]:
         "scenarios": scenario_reports,
     }
     return artifact, failures
+
+
+def _cache_cell(spc: dict, key: str) -> str:
+    """Format one n-gram-cache metric cell for the summary.
+
+    Distinguishes a DROPPED/renamed wire field from a genuinely cold turn:
+      * key absent from the dict          -> 'MISSING' (the field never
+        arrived — a wire-contract regression to investigate);
+      * key present but empty/non-numeric -> '--'      (a real zero-lookup
+        or empty-histogram turn).
+    Otherwise renders the value: 2-dp for the hit-rate float, comma-joined
+    for the histogram, plain int for the counters.
+    """
+    if key not in spc:
+        return "MISSING"
+    val = spc[key]
+    if key == "cache_hit_rate":
+        return f"{val:.2f}" if isinstance(val, (int, float)) else "--"
+    if key == "accepted_prefix_len_histogram":
+        if isinstance(val, (list, tuple)) and val:
+            return ",".join(str(x) for x in val)
+        return "--"
+    # Integer counters: cache_hits, cache_misses, cache_size. 0 is a valid
+    # value (renders "0"), only a non-numeric/None present value is '--'.
+    return str(val) if isinstance(val, (int, float)) else "--"
 
 
 def _print_summary(artifact: dict) -> None:
@@ -488,6 +524,28 @@ def _print_summary(artifact: dict) -> None:
     print("-" * len(hdr))
     print("speedup = fast_think engine decode tok/s ÷ baseline (ADVISORY; "
           "not a pass/fail criterion).")
+
+    # #591: cache effectiveness + chain-length spread, the signal that
+    # attributes a low accepted_ratio (cold cache vs bad followers).
+    print("\nn-gram cache (fast_think):")
+    cache_hdr = (
+        f"{'scenario':<10} {'hits':>7} {'misses':>7} {'hit_rate':>9} "
+        f"{'cache_sz':>9} {'accepted-prefix-len histogram':>32}"
+    )
+    print(cache_hdr)
+    print("-" * len(cache_hdr))
+    for s in artifact["scenarios"]:
+        spc = s["speculation"]
+        print(
+            f"{s['scenario']:<10} {_cache_cell(spc, 'cache_hits'):>7} "
+            f"{_cache_cell(spc, 'cache_misses'):>7} "
+            f"{_cache_cell(spc, 'cache_hit_rate'):>9} "
+            f"{_cache_cell(spc, 'cache_size'):>9} "
+            f"{_cache_cell(spc, 'accepted_prefix_len_histogram'):>32}"
+        )
+    print("-" * len(cache_hdr))
+    print("histogram index k = decode steps that committed k accepted draft "
+          "tokens (0 = free pick only).")
     drifted = [s["scenario"] for s in artifact["scenarios"]
                if s["greedy_equivalence"] == "drift_spec"]
     if drifted:

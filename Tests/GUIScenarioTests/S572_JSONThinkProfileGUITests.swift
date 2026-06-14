@@ -36,6 +36,10 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
       config["PIE_TEST_GUI_HOME"],
       "\(Self.configPath) must define PIE_TEST_GUI_HOME")
     let model = config["PIE_TEST_CHAT_MODEL"] ?? "Qwen/Qwen3-0.6B"
+    // The concrete served slug the engine reconciles via /v1/models — the
+    // toolbar VALUE settles to this once residency lands (mirror S260).
+    let servedModelID = config["PIE_TEST_CHAT_MODEL_PIN"]
+      ?? "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
 
     // A prompt with NO JSON-value characters, so a static text carrying one
     // can only be the grammar-constrained assistant answer (not the echoed
@@ -44,42 +48,42 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
 
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
     configure(app, pieHome: pieHome, baseURL: baseURL, model: model)
-    app.launch()
     defer { app.terminate() }
-
-    XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
-    app.activate()
+    // Launch + win key reliably even on a later not-key launch (#545).
+    app.launchActivated(landmark: { $0.buttons["chats.newButton"] })
 
     let newChat = app.buttons["chats.newButton"]
     XCTAssertTrue(newChat.waitForExistence(timeout: 10),
                   "New Chat button missing; app tree: \(app.debugDescription)")
     newChat.click()
 
-    // Resolve residentModelID before swapping profiles (same barrier as S426):
-    // the model menu renders the seeded leaf only after the reconcile, making
-    // the same-model JSON Think swap silent.
+    // Reconciliation barrier before swapping profiles (mirror the PASSING
+    // S260): the toolbar VALUE settles to the concrete served slug only after
+    // /v1/models reconciles, so this proves residency landed WITHOUT opening
+    // the model menu — eliminating that menu's not-key focus race entirely
+    // (#545). The same-model JSON Think swap is silent because the resident
+    // model is unchanged.
     let modelMenu = app.menuButtons["toolbar.model"]
     XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
                   "model menu missing after creating chat; app tree: \(app.debugDescription)")
-    modelMenu.click()
-    let seededModel = app.menuItems["Qwen3-0.6B-Q8_0.gguf"]
-    XCTAssertTrue(seededModel.waitForExistence(timeout: 15),
-                  "seeded Qwen3 GGUF missing from chat model menu; app tree: \(app.debugDescription)")
-    app.typeKey(.escape, modifierFlags: [])
+    XCTAssertTrue(waitForResidentModelValue(modelMenu, servedModelID, timeout: 20),
+                  "toolbar.model never reflected reconciled resident model \(servedModelID); "
+                    + "title=\(modelMenu.title), value=\(String(describing: modelMenu.value)); "
+                    + "app tree: \(app.debugDescription)")
 
     // 1) JSON Think appears in the profile switcher and is selectable.
     let profileMenu = app.menuButtons["toolbar.profile"]
     XCTAssertTrue(profileMenu.waitForExistence(timeout: 10),
                   "profile switcher (toolbar.profile) missing; app tree: \(app.debugDescription)")
-    profileMenu.click()
     let jsonThinkItem = app.menuItems["json-think"]
-    XCTAssertTrue(jsonThinkItem.waitForExistence(timeout: 10),
-                  "seeded 'json-think' profile missing from the chat profile switcher; app tree: \(app.debugDescription)")
-    XCTAssertTrue(jsonThinkItem.isEnabled, "'json-think' profile menu item was not selectable")
+    openMenuAndWaitForItem(profileMenu, item: jsonThinkItem, in: app)
+    // Action-based: wait until the item is genuinely tappable, not a one-shot
+    // `.isEnabled` snapshot that races the not-key window transition (#545).
+    XCTAssertTrue(jsonThinkItem.waitForHittable(timeout: 5),
+                  "'json-think' profile menu item not tappable; app tree: \(app.debugDescription)")
     jsonThinkItem.click()
 
-    guard waitForMenuButtonTitleContaining(profileMenu, "json-think", timeout: 10) else {
+    guard waitForMenuButtonTitleContaining(profileMenu, "json-think", in: app, timeout: 10) else {
       XCTFail("toolbar.profile did not reflect the 'json-think' selection (title=\(profileMenu.title)); app tree: \(app.debugDescription)")
       return
     }
@@ -95,7 +99,10 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
 
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5), "composer.send missing")
-    XCTAssertTrue(send.isEnabled, "composer.send was disabled after typing prompt")
+    // Action-based: wait until send is genuinely tappable, not a one-shot
+    // `.isEnabled` that races the not-key window transition (#545).
+    XCTAssertTrue(send.waitForHittable(timeout: 5),
+                  "composer.send not tappable after typing prompt; app tree: \(app.debugDescription)")
     send.click()
 
     guard waitForStaticTextBeginningWithJSON(in: app, timeout: 120) else {
@@ -120,11 +127,36 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
 
   // MARK: - assertions
 
+  /// Resident-model reconciliation barrier (mirror S260): the toolbar VALUE
+  /// equals the concrete served slug only after `/v1/models` reconciles, with
+  /// no "profile default"/"(Default)" annotation. Pure value read — no menu
+  /// open, so it cannot lose a not-key focus race (#545).
+  private func waitForResidentModelValue(_ element: XCUIElement,
+                                         _ expectedModelID: String,
+                                         timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      let value = element.value as? String ?? ""
+      let title = element.title
+      if value == expectedModelID,
+         !value.localizedCaseInsensitiveContains("profile default"),
+         !title.localizedCaseInsensitiveContains("(Default)") {
+        return true
+      }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.3))
+    }
+    return false
+  }
+
   private func waitForMenuButtonTitleContaining(_ element: XCUIElement,
                                                 _ needle: String,
+                                                in app: XCUIApplication,
                                                 timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
+      // Keep the app key while polling the toolbar title: a mid-test not-key
+      // transition collapses the AX tree so `.title` reads stale/empty (#545).
+      app.activate()
       if element.title.localizedCaseInsensitiveContains(needle) {
         return true
       }
@@ -146,6 +178,8 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
     let predicate = NSPredicate(format: "value MATCHES %@ OR label MATCHES %@",
                                 "^\\s*[\\{\\[\"\\-0-9tfn].*", "^\\s*[\\{\\[\"\\-0-9tfn].*")
     while Date() < deadline {
+      // Keep the app key during the stream wait so the AX tree stays live (#545).
+      app.activate()
       if app.descendants(matching: .staticText).matching(predicate).count >= 1 {
         return true
       }

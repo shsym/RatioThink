@@ -87,11 +87,12 @@ final class GuardrailSettingsTests: XCTestCase {
   }
 
   /// Integration guard for the production wiring (Helper/HelperMain
-  /// `buildLaunchSpecResolver`): the `memoryPolicy` built from a persisted
-  /// `guardrail.json` must reflect the operator's fraction, NOT the
-  /// hardcoded default — otherwise the Settings dial silently no-ops at
-  /// the launch-time guard. Reproduces the production composition with a
-  /// fixed RAM value so it never depends on the host's real memory.
+  /// `buildLaunchSpecResolver` AND the ProfileEditor picker badge — both
+  /// now call `ModelMemoryGuardrail.livePolicy`): the policy built from a
+  /// persisted `guardrail.json` must reflect the operator's fraction, NOT
+  /// the hardcoded default — otherwise the Settings dial silently no-ops
+  /// at the launch-time guard and the picker badge disagrees with it (#334).
+  /// Uses a fixed RAM value so it never depends on the host's real memory.
   func test_persisted_fraction_drives_memoryPolicy_off_default() throws {
     let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
       .appendingPathComponent("guardrail-wiring-\(UUID().uuidString)", isDirectory: true)
@@ -103,12 +104,10 @@ final class GuardrailSettingsTests: XCTestCase {
                       "test fraction must differ from the default to prove the wiring")
     try GuardrailSettings.saveFraction(chosen, root: root)
 
-    // The exact composition HelperMain's production memoryPolicy closure
-    // uses.
-    let policy = ModelMemoryGuardrail.Policy.recommended(
-      physicalMemoryBytes: 64 * 1024 * 1024 * 1024,
-      fraction: GuardrailSettings.loadFraction(root: root)
-    )
+    // The shared derivation HelperMain's memoryPolicy closure and the
+    // ProfileEditor picker both call.
+    let policy = ModelMemoryGuardrail.livePolicy(
+      root: root, physicalMemoryBytes: 64 * 1024 * 1024 * 1024)
     XCTAssertEqual(policy.ramFraction, chosen,
                    "launch-time guardrail must honor the persisted dial fraction, not the default")
   }

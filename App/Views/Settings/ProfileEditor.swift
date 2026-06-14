@@ -13,6 +13,11 @@ struct ProfileEditor: View {
   @EnvironmentObject private var downloads: ModelDownloadController
   @EnvironmentObject private var settingsNavigation: SettingsNavigation
   @EnvironmentObject private var engineStatusStore: EngineStatusStore
+  /// Bumped by the Models-tab guardrail dial on a fraction write. Keying
+  /// the model-options refresh on it recomputes the over-limit badges
+  /// against the just-saved ceiling instead of letting them go stale
+  /// until this view reappears (#334).
+  @EnvironmentObject private var guardrailRevision: GuardrailRevision
   /// Discovered model options (app-managed + HF cache), each carrying
   /// size + over-limit / unsupported state for the model-size guardrail.
   @State private var modelOptions: [ProfileModelOptions.Option] = []
@@ -66,6 +71,14 @@ struct ProfileEditor: View {
       await refreshModelOptions(current: entry.profile?.model ?? "")
     }
     .onChange(of: downloads.completionTick) { _, _ in
+      Task { await refreshModelOptions(current: entry.profile?.model ?? "") }
+    }
+    // A guardrail-dial write recomputes ONLY the picker over-limit badges
+    // (#334). It deliberately mirrors the download-tick onChange and does
+    // NOT re-run the draft-reset task: folding the revision into
+    // `.task(id:)` would re-run `resetEditableDefaults` and discard
+    // unsaved systemPrompt/temperature/topP edits on a dial change.
+    .onChange(of: guardrailRevision.revision) { _, _ in
       Task { await refreshModelOptions(current: entry.profile?.model ?? "") }
     }
   }
@@ -429,7 +442,10 @@ struct ProfileEditor: View {
 
   @MainActor
   private func refreshModelOptions(current: String) async {
-    let policy = ModelMemoryGuardrail.defaultPolicy
+    // Use the LIVE dial-derived policy, not the 0.65-pinned `defaultPolicy`,
+    // and the SAME derivation the Helper's launch gate uses — so the
+    // picker's "exceeds …" badge can't disagree with what actually loads (#334).
+    let policy = ModelMemoryGuardrail.livePolicy()
     memoryPolicy = policy
     // Filesystem walks (app dir + HF cache) run off the main actor. HF
     // rows survive a models-dir prepare/scan failure; that failure still

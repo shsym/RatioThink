@@ -1,0 +1,63 @@
+"""Unit tests for spec_bench_real's pure formatting helpers (#591).
+
+Guards the n-gram cache-effectiveness printer's MISSING-vs-'--' contract:
+an absent wire field (a dropped/renamed key — a regression to investigate)
+must render distinctly from a present-but-empty value (a genuinely cold or
+zero-lookup turn). Run::
+
+    uv run --project Vendor/pie/client/python --with httpx \
+      python -m unittest Inferlets/chat-apc/spec_bench_real_test.py
+"""
+from __future__ import annotations
+
+import unittest
+
+import spec_bench_real as b
+
+
+class CacheCellFormatting(unittest.TestCase):
+    def test_absent_key_renders_missing_not_dash(self):
+        # speculation dict with every cache_* key omitted — e.g. an engine
+        # that dropped/renamed the wire fields.
+        spc = {"proposed_draft_tokens": 0, "accepted_draft_tokens": 0}
+        for key in (
+            "cache_hits",
+            "cache_misses",
+            "cache_hit_rate",
+            "cache_size",
+            "accepted_prefix_len_histogram",
+        ):
+            cell = b._cache_cell(spc, key)
+            self.assertEqual(cell, "MISSING", f"{key} absent -> {cell!r}")
+            self.assertNotEqual(cell, "--")
+
+    def test_present_but_empty_or_none_renders_dash(self):
+        spc = {
+            "cache_hits": None,
+            "cache_misses": None,
+            "cache_hit_rate": None,
+            "cache_size": None,
+            "accepted_prefix_len_histogram": [],
+        }
+        for key in spc:
+            self.assertEqual(b._cache_cell(spc, key), "--", key)
+
+    def test_present_values_render(self):
+        spc = {
+            "cache_hits": 0,  # a real zero, not missing
+            "cache_misses": 15,
+            "cache_hit_rate": 0.0,
+            "cache_size": 18,
+            "accepted_prefix_len_histogram": [16, 2, 1],
+        }
+        self.assertEqual(b._cache_cell(spc, "cache_hits"), "0")
+        self.assertEqual(b._cache_cell(spc, "cache_misses"), "15")
+        self.assertEqual(b._cache_cell(spc, "cache_hit_rate"), "0.00")
+        self.assertEqual(b._cache_cell(spc, "cache_size"), "18")
+        self.assertEqual(
+            b._cache_cell(spc, "accepted_prefix_len_histogram"), "16,2,1"
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

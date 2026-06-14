@@ -110,6 +110,25 @@ public enum ModelMemoryGuardrail {
   public static let defaultPolicy = Policy.recommended(
     physicalMemoryBytes: SystemMemory.physicalBytes())
 
+  /// Production policy honoring the operator's *Settings → Models* dial
+  /// fraction (persisted as `guardrail.json`). Reads the fraction FRESH
+  /// each call — unlike `defaultPolicy` (a `static let` pinned to the 0.65
+  /// default) — so a dial change applies with no restart. This is the
+  /// single derivation the Helper's launch-time guard and the
+  /// ProfileEditor picker badge both call, so the displayed "exceeds …"
+  /// ceiling and the enforced gate can never disagree (#334). Falls back
+  /// to the default fraction when the support root or file is unreadable.
+  /// `root` and `physicalMemoryBytes` are injectable so tests pin a fixed
+  /// RAM + fraction instead of depending on the host.
+  public static func livePolicy(
+    root: URL? = try? PieDirs.applicationSupport(),
+    physicalMemoryBytes: Int64? = SystemMemory.physicalBytes()
+  ) -> Policy {
+    let fraction = root.map { GuardrailSettings.loadFraction(root: $0) }
+      ?? GuardrailSettings.defaultFraction
+    return Policy.recommended(physicalMemoryBytes: physicalMemoryBytes, fraction: fraction)
+  }
+
   private struct SizeSummary {
     var totalBytes: Int64
     var largestPath: String

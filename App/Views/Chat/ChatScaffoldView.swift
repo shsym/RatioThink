@@ -38,9 +38,6 @@ struct ChatScaffoldView: View {
   /// popover so they derive the resident/offline distinction from the single
   /// published `indicator`.
   @EnvironmentObject private var engineLifecycle: EngineLifecycle
-  /// #577: app-window UI state — read here to consume the new-chat
-  /// first-message handoff when this scaffold is the freshly-created chat.
-  @EnvironmentObject private var windowState: WindowState
   /// Shown when a send is blocked because no model resolves yet. #326
   /// decides the model-availability action (Load / Download / unavailable
   /// via the live `noModelAction`); #397 layers the engine/model lifecycle
@@ -496,18 +493,7 @@ struct ChatScaffoldView: View {
           // #507: the composer's stop button — the user-reachable cancel
           // for this chat's in-flight turn (review v1 F1).
           onStop: { sendCoordinator.cancel(chatID: chatID) },
-          autoSubmit: pendingSend.autoSubmit,
-          // #577: when this scaffold is the chat just created from the
-          // new-chat draft composer, seed the typed first message and run the
-          // normal send once. `onConsumed` clears the pending handoff so a
-          // re-render can't re-seed it.
-          handoff: windowState.pendingFirstMessage.flatMap { pending in
-            pending.chatID == chatID
-              ? ComposerHandoff(
-                  text: pending.text,
-                  onConsumed: { windowState.pendingFirstMessage = nil })
-              : nil
-          }
+          autoSubmit: pendingSend.autoSubmit
         )
       }
     }
@@ -919,6 +905,7 @@ struct ChatScaffoldView: View {
       systemPromptOverride: Self.resolvedSystemPrompt(
         profileDefault: profileStore.systemPrompt(forProfileID: viewModel.selectedProfileID),
         transientOverride: viewModel.systemPromptOverride),
+      profileID: viewModel.selectedProfileID,
       // #426: thread the selected profile's Fast Think (speculative-decoding)
       // settings into the request — a Fast Think profile attaches speculation
       // + forces greedy; a normal or tree-of-thought profile carries none.
@@ -972,8 +959,9 @@ struct ChatScaffoldView: View {
       modelLoadCenter: modelLoadCenter,
       persistenceStatus: persistenceStatus,
       // Reuses the `options` built above (now carrying #426 speculation +
-      // #572 response_format), so the normal send and the ToT dispatch
-      // share one options value.
+      // #572 response_format and the selected profile id for Cacheback
+      // sidecar scoping), so the normal send and the ToT dispatch share one
+      // options value.
       options: options,
       // `EngineStatusStore` conforms to `ChatRecoveryGate`; passing it
       // here lets the send pipeline classify a mid-stream

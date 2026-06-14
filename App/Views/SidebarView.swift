@@ -1,16 +1,17 @@
 import SwiftUI
 
-/// Left navigation, two regions (#577):
-///   • TOP: the view selector (Chats, API Endpoints, …) — switches the
+/// Left navigation, two regions:
+///   • TOP: the view selector (Chats, Search, API Endpoints, …) — switches the
 ///     right-hand main view.
-///   • BOTTOM: a persistent shortcut area whose first occupant is the
-///     searchable chat list. It stays mounted across every section selection,
-///     so opening the API view no longer hides the chat list. Future foldable
+///   • BOTTOM: a persistent shortcut area whose first occupant is the chat
+///     list. It stays mounted across every section selection, so opening the
+///     Search or API view no longer hides the chat list. Future foldable
 ///     sections (Workflows, …) slot in alongside the list here.
 ///
-/// The Chats top entry is the "new chat" shortcut: selecting it clears the
-/// item selection so the detail surface lands on a ready new-chat composer
-/// (`DetailView` → `NewChatView`) with no separate New Chat click.
+/// The Chats top entry clears the item selection so the detail surface lands on
+/// the empty-state CTA; new chats are started from the titlebar new-chat
+/// button. Search is a sibling destination whose detail view searches
+/// conversation titles + message bodies.
 struct SidebarView: View {
   @Binding var selection: SidebarSection?
   @Binding var selectedItemID: UUID?
@@ -20,11 +21,14 @@ struct SidebarView: View {
     VStack(alignment: .leading, spacing: 6) {
       // TOP region: view selector.
       sidebarRow(.chats) {
-        // Selecting Chats is the new-chat shortcut: clear the selection so the
-        // detail surface shows the editable new-chat composer.
+        // Selecting Chats clears the selection so the detail surface shows the
+        // empty-state landing; the titlebar button starts a new chat.
         selection = .chats
         selectedItemID = nil
       }
+      // Sibling destination: a search panel (detail column) over conversation
+      // titles + message bodies.
+      sidebarRow(.search) { selection = .search }
       // #422: the API Endpoints section mirrors the live engine HTTP endpoint
       // (LocalAPIView). Selecting it shows the single status view in the
       // detail column; the chat list below stays put.
@@ -52,16 +56,16 @@ struct SidebarView: View {
 
   private func sidebarRow(_ section: SidebarSection, action: @escaping () -> Void) -> some View {
     Button(action: action) {
-      HStack(spacing: 6) {
+      HStack(spacing: SidebarMetrics.rowSpacing) {
         Image(systemName: section.systemImage)
-          .frame(width: 18, alignment: .center)
+          .sidebarIcon()
           .foregroundStyle(.secondary)
         Text(section.title)
           .foregroundStyle(.primary)
         Spacer()
       }
-      .padding(.horizontal, 10)
-      .padding(.vertical, 6)
+      .padding(.horizontal, SidebarMetrics.rowHorizontalPadding)
+      .padding(.vertical, SidebarMetrics.rowVerticalPadding)
       .background(
         RoundedRectangle(cornerRadius: 6)
           .fill(selection == section ? Color.accentColor.opacity(0.18) : Color.clear)

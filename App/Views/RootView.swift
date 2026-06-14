@@ -1,16 +1,23 @@
 import SwiftUI
+import SwiftData
 import ServiceManagement
 
-/// Simplified chat shell: primary navigation plus the searchable chat list live
-/// in the left column, while the middle split-view column stays collapsed.
-/// Sidebar visibility remains wired through `WindowState`.
+/// Simplified chat shell: primary navigation plus the chat list live in the
+/// left column, while the middle split-view column stays collapsed. Sidebar
+/// visibility remains wired through `WindowState`. New chats start from the
+/// titlebar new-chat button (the app-name branding was removed from that spot).
 struct RootView: View {
   @EnvironmentObject private var windowState: WindowState
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
   /// #512: empty-chat pruning needs the store — runs on selection change
   /// (prune the chat the user just left) and once at launch (reconcile
-  /// shells left behind by quit or by pre-prune builds).
+  /// shells left behind by quit or by pre-prune builds). Also backs the
+  /// titlebar new-chat affordance.
   @Environment(\.modelContext) private var modelContext
+  /// #460: the titlebar new-chat inherits the active profile + concrete model
+  /// from the chat the user is currently in, so a new chat keeps the same
+  /// context instead of resetting to the bare default.
+  @Query(sort: \Chat.updatedAt, order: .reverse) private var chats: [Chat]
   /// Engine lifecycle + in-flight load, folded into the unified
   /// indicator state that gates the engine-error banner. Both are
   /// injected at app scope (`RatioThinkApp`).
@@ -73,10 +80,10 @@ struct RootView: View {
           isItemListHidden: windowState.isItemListHidden
         )
       } content: {
-        // Ticket #565 simplifies the shell: the searchable chat list now
-        // lives under the primary Chat entry in the left navigation panel.
-        // Keep the split view's content column collapsed so API Endpoints is
-        // also a direct left-nav → detail route.
+        // The chat list lives in the left navigation panel; the search panel
+        // and API Endpoints view fill the detail column. Keep the split view's
+        // content column collapsed so every section is a direct left-nav →
+        // detail route.
         Color.clear
           .navigationSplitViewColumnWidth(min: 0, ideal: 0, max: 0)
       } detail: {
@@ -86,7 +93,19 @@ struct RootView: View {
         )
         .navigationSplitViewColumnWidth(min: 480, ideal: 720)
       }
-      .navigationTitle("Rational")
+      // Branding removed from the titlebar (was `.navigationTitle("Rational")`);
+      // an emphasized new-chat button occupies that spot. Empty title keeps the
+      // titlebar clear rather than showing the product name as a label.
+      .navigationTitle("")
+      .toolbar {
+        ToolbarItem(placement: .navigation) {
+          Button(action: createChat) {
+            Image(systemName: "square.and.pencil")
+          }
+          .help("New Chat")
+          .accessibilityIdentifier("chats.newButton")
+        }
+      }
     }
     .task { await runLaunchUpdateCheck() }
     .onAppear { maybeAutoStartLocalAPIOnLaunch() }
@@ -113,6 +132,25 @@ struct RootView: View {
         in: modelContext,
         excluding: windowState.selectedItemID,
         persistenceStatus: persistenceStatus)
+    }
+  }
+
+  /// Titlebar new-chat affordance (occupies the spot the app name used to
+  /// render). Creates a chat, switches to the Chats section, and selects it so
+  /// the new conversation opens regardless of which section was active. Routes
+  /// through the same `ChatCreation` seam as the list/empty-state buttons so the
+  /// save + #460 profile/model inheritance stay in one place.
+  private func createChat() {
+    let source = windowState.selectedItemID.flatMap { id in chats.first { $0.id == id } }
+    if let id = ChatCreation.create(
+      in: modelContext,
+      persistenceStatus: persistenceStatus,
+      contextLabel: "RootView.newChat",
+      profileID: source?.profileID ?? "chat",
+      modelID: source?.modelID
+    ) {
+      windowState.selectedSection = .chats
+      windowState.selectedItemID = id
     }
   }
 

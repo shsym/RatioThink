@@ -1,29 +1,31 @@
 import SwiftUI
 import SwiftData
 
-/// Searchable chat list embedded under the left Chat navigation entry. Backed
-/// by SwiftData: pinned chats sort to the top, then most-recently-updated.
-/// "New Chat" inserts a fresh row and selects it; per-row delete cascades to
-/// its messages via `Chat.messages`' `.cascade` rule.
+/// Chat list embedded under the left Chat navigation entry. Backed by
+/// SwiftData: pinned chats sort to the top, then most-recently-updated.
+/// New chats are started from the titlebar new-chat button; per-row delete
+/// cascades to its messages via `Chat.messages`' `.cascade` rule.
+///
+/// Conversation search is a sibling sidebar destination (`SidebarSection.search`
+/// → `ConversationSearchView`), not an inline filter here.
 struct ChatListView: View {
   @Environment(\.modelContext) private var modelContext
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
   /// #507: per-chat in-flight state — streaming rows show a right-aligned
   /// spinner, and deleting a chat first cancels + drops its send pipeline.
   @EnvironmentObject private var sendCoordinator: ChatSendCoordinator
-  /// Sort by `updatedAt` desc at the query layer; pinned-first ordering and
-  /// title filtering happen client-side in `ChatListPresentation` because
-  /// `Bool` doesn't conform to `Comparable` and SwiftData rejects
-  /// `SortDescriptor(\.pinned)` at compile time.
+  /// Sort by `updatedAt` desc at the query layer; pinned-first ordering happens
+  /// client-side in `sortedChats` because `Bool` doesn't conform to
+  /// `Comparable` and SwiftData rejects `SortDescriptor(\.pinned)` at compile
+  /// time.
   @Query(sort: \Chat.updatedAt, order: .reverse) private var chats: [Chat]
   @Binding var selectedItemID: UUID?
-  /// #577: the chat list is now an always-mounted bottom region of the
-  /// sidebar, visible regardless of the selected section. Selecting a row
-  /// (or creating a chat) must therefore also route the main view back to
-  /// `.chats`, so a chat opened while the API view is up actually switches
-  /// the detail surface to that chat.
+  /// The chat list is an always-mounted bottom region of the sidebar, visible
+  /// regardless of the selected section. Selecting a row (or creating a chat)
+  /// must therefore also route the main view back to `.chats`, so a chat opened
+  /// while the Search/API view is up actually switches the detail surface to
+  /// that chat.
   @Binding var selectedSection: SidebarSection?
-  @State private var searchText = ""
   @State private var hoveredChatID: UUID?
   /// #512 manual rename: the chat being renamed (drives the alert) and
   /// the in-flight title draft. Kept as the chat's stable UUID, not the
@@ -32,79 +34,48 @@ struct ChatListView: View {
   @State private var renamingChatID: UUID?
   @State private var renameDraft: String = ""
 
-  private var visibleChats: [Chat] {
-    ChatListPresentation.visibleChats(chats, searchText: searchText)
+  private var sortedChats: [Chat] {
+    chats.sorted { lhs, rhs in
+      if lhs.pinned != rhs.pinned { return lhs.pinned }
+      return lhs.updatedAt > rhs.updatedAt
+    }
   }
 
   var body: some View {
     VStack(spacing: 0) {
       header
-      searchField
       Divider().opacity(0.6)
       if chats.isEmpty {
         emptyState
-      } else if visibleChats.isEmpty {
-        noSearchResults
       } else {
         list
       }
     }
   }
 
+  // De-emphasized list header: renamed "Chat List" → "Conversations" and
+  // dropped the bold headline weight for a quiet secondary label.
   private var header: some View {
     HStack {
-      Text("Chat List")
-        .font(.headline)
-      Spacer()
-      Button(action: createChat) {
-        Image(systemName: "square.and.pencil")
-      }
-      .buttonStyle(.plain)
-      .help("New Chat")
-      .accessibilityIdentifier("chats.newButton")
-    }
-    .padding(.horizontal, 12)
-    .padding(.vertical, 8)
-  }
-
-  private var searchField: some View {
-    HStack(spacing: 6) {
-      Image(systemName: "magnifyingglass")
+      Text("Conversations")
+        .font(.subheadline)
         .foregroundStyle(.secondary)
-      TextField("Search chats", text: $searchText)
-        .textFieldStyle(.plain)
-        .accessibilityIdentifier("chats.searchField")
-      if !searchText.isEmpty {
-        Button {
-          searchText = ""
-        } label: {
-          Image(systemName: "xmark.circle.fill")
-            .foregroundStyle(.secondary)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Clear chat search")
-      }
+      Spacer()
     }
-    .padding(.horizontal, 8)
-    .padding(.vertical, 5)
-    .background(
-      RoundedRectangle(cornerRadius: 7)
-        .fill(Color(nsColor: .controlBackgroundColor))
-    )
-    .padding(.horizontal, 12)
-    .padding(.bottom, 8)
+    .padding(.horizontal, SidebarMetrics.rowHorizontalPadding)
+    .padding(.vertical, SidebarMetrics.rowVerticalPadding)
   }
 
   /// Row selection routes through this binding so picking a chat both
-  /// selects it AND switches the main view to `.chats` (#577) — a chat
-  /// chosen while the API view is up replaces the detail surface.
+  /// selects it AND switches the main view to `.chats` — a chat chosen while
+  /// the Search/API view is up replaces the detail surface.
   ///
   /// The getter is section-aware: it reports a selected row ONLY while the
   /// `.chats` section is active. In any other section the list shows no
   /// selection, so clicking even the previously-selected row is a genuine
   /// change and fires the setter — otherwise `List(selection:)` (which only
   /// fires on change) would swallow the tap and leave the user stuck in the
-  /// API view.
+  /// other view.
   private var rowSelection: Binding<UUID?> {
     Binding(
       get: { selectedSection == .chats ? selectedItemID : nil },
@@ -117,9 +88,17 @@ struct ChatListView: View {
 
   private var list: some View {
     List(selection: rowSelection) {
-      ForEach(visibleChats) { chat in
+      ForEach(sortedChats) { chat in
         row(for: chat)
           .tag(chat.id)
+          // Share the left-menu metric so rows line up with the nav rows and
+          // the header above them.
+          .listRowInsets(EdgeInsets(
+            top: SidebarMetrics.rowVerticalPadding,
+            leading: SidebarMetrics.rowHorizontalPadding,
+            bottom: SidebarMetrics.rowVerticalPadding,
+            trailing: SidebarMetrics.rowHorizontalPadding
+          ))
           .contextMenu {
             Button(chat.pinned ? "Unpin" : "Pin") {
               togglePin(chat)
@@ -135,7 +114,7 @@ struct ChatListView: View {
           }
       }
       .onDelete { offsets in
-        let snapshot = visibleChats
+        let snapshot = sortedChats
         for index in offsets {
           delete(snapshot[index])
         }
@@ -191,11 +170,9 @@ struct ChatListView: View {
     }
   }
 
-  /// Top-aligned per design §5 ("Chats section empty → grayed
-  /// placeholder row + inline New chat button"). The trailing `Spacer`
-  /// pins the placeholder directly under the header rather than letting
-  /// it float to the vertical center the way `ContentUnavailableView`
-  /// would.
+  /// Top-aligned empty placeholder + inline New Chat button. The trailing
+  /// `Spacer` pins the placeholder directly under the header rather than
+  /// letting it float to the vertical center.
   private var emptyState: some View {
     VStack(alignment: .leading, spacing: 8) {
       Text("No chats yet")
@@ -206,21 +183,6 @@ struct ChatListView: View {
       }
       .buttonStyle(.borderless)
       .accessibilityIdentifier("chats.empty.newButton")
-      Spacer(minLength: 0)
-    }
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .padding(.horizontal, 12)
-    .padding(.vertical, 8)
-  }
-
-  private var noSearchResults: some View {
-    VStack(alignment: .leading, spacing: 4) {
-      Text("No matching chats")
-        .font(.subheadline)
-        .foregroundStyle(.secondary)
-      Text("Try a different search. Titles and message text are both searched.")
-        .font(.caption)
-        .foregroundStyle(.secondary)
       Spacer(minLength: 0)
     }
     .frame(maxWidth: .infinity, alignment: .leading)
@@ -244,8 +206,8 @@ struct ChatListView: View {
       modelID: source?.modelID
     ) {
       selectedItemID = id
-      // #577: the list is visible from any section; a New Chat created here
-      // must also route the main view to the chat surface.
+      // The list is visible from any section; a New Chat created here must
+      // also route the main view to the chat surface.
       selectedSection = .chats
     }
   }
@@ -338,7 +300,7 @@ struct ChatRowLabel: View {
     HStack(alignment: .firstTextBaseline, spacing: 6) {
       if pinned {
         Image(systemName: "pin.fill")
-          .font(.caption2)
+          .sidebarIcon()
           .foregroundStyle(.secondary)
       }
       VStack(alignment: .leading, spacing: 2) {
