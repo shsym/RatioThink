@@ -344,17 +344,41 @@ struct RatioThinkApp: App {
     // key off this result, so a non-debug app falls back to the real
     // Helper-driven engine path (`HelperXPCClient()`) and never honors the
     // `PIE_TEST_ENGINE_BASE_URL` seam.
-    guard let raw = HelperConfig.testEngineBaseURLOverride() else { return nil }
-    #if DEBUG
-    return URL(string: raw)
-    #else
-    // Defense in depth (#340): the `HelperConfig` gate already returns `nil` in
-    // a Release build, so reaching here means the build gate was somehow wrong.
-    // Refuse rather than silently redirect a shipped app at an attacker-supplied
-    // URL — mirrors the call-site `preconditionFailure` that
-    // `HelperXPCListener.startAnonymous` raises when its own gate is violated.
-    preconditionFailure("PIE_TEST_ENGINE_BASE_URL resolved in a Release build — refuse to redirect the engine endpoint away from the real Helper-driven path")
-    #endif
+    switch HelperConfig.resolveTestEngineBaseURL() {
+    case .notSet:
+      return nil
+    case .valid(let url):
+      #if DEBUG
+      return url
+      #else
+      // Defense in depth (#340): the `HelperConfig` gate already returns
+      // `.notSet` in a Release build, so a resolved override here means the
+      // build gate was somehow wrong. Refuse rather than silently redirect a
+      // shipped app at an attacker-supplied URL — mirrors the call-site
+      // `preconditionFailure` that `HelperXPCListener.startAnonymous` raises
+      // when its own gate is violated.
+      preconditionFailure("PIE_TEST_ENGINE_BASE_URL resolved in a Release build — refuse to redirect the engine endpoint away from the real Helper-driven path")
+      #endif
+    case .malformed(let raw):
+      #if DEBUG
+      // The override was set and honored (DEBUG/test build) but is not a
+      // parseable URL (bad scheme, embedded whitespace, unbalanced bracket).
+      // Never silently fall back to the real engine — that would run a test
+      // author's typo'd override against the production path and fail far
+      // downstream from the cause (#339). Log it, and under an explicit
+      // harness (`PIE_TEST_MODE=1`) trap so the misconfiguration surfaces at
+      // launch instead of masquerading as a "no model" failure.
+      NSLog("PIE_TEST_ENGINE_BASE_URL is set but not a valid URL — refusing to silently fall back to the real engine: \(raw)")
+      if ProcessInfo.processInfo.environment[HelperConfig.testModeEnvVar] == "1" {
+        preconditionFailure("PIE_TEST_ENGINE_BASE_URL is not a valid URL: \(raw)")
+      }
+      return nil
+      #else
+      // Defense in depth (#340): same as `.valid` — the gate returns `.notSet`
+      // in Release, so any resolved override here means the gate was wrong.
+      preconditionFailure("PIE_TEST_ENGINE_BASE_URL resolved in a Release build — refuse to redirect the engine endpoint away from the real Helper-driven path")
+      #endif
+    }
   }
 
   private static func appPreferencesDefaults() -> UserDefaults {
