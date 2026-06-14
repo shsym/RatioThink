@@ -51,13 +51,13 @@
 //! Invariant (carried over from #407): every event identifies the node(s)
 //! it concerns by stable id, and the stream ends with exactly one terminal
 //! `tree_complete` (success) or `error` (failure) before `[DONE]`. The
-//! terminal is the `error` frame precisely when the search selected no ok
-//! leaf — `select_beam`/`best_leaf` pick the best ok leaf whenever ANY ok
-//! node exists, so a null selection means every branch failed to generate
-//! (total failure). Surfacing that as `tree_complete{null,null}` would be
-//! a success-shaped frame for a total failure (a blank "successful" turn
-//! on the client); [`is_total_failure`] gates the terminal so the
-//! documented `error` frame fires instead (F1).
+//! terminal is the `error` frame whenever the search produced no final
+//! answer: either no ok leaf was selected at all, or the selected node was
+//! only an inspection/intermediate node and synthesis did not recover a
+//! direct final answer. Surfacing either state as `tree_complete` would be
+//! a success-shaped frame for a failed final-answer stage (a blank
+//! "successful" turn on the client); [`terminal_error`] gates the terminal
+//! so the documented `error` frame fires instead (F1).
 //!
 //! `node_complete` carries the **flat** node (no nested `children`): the
 //! client assembles the tree from `parent_id` links exactly as the
@@ -346,11 +346,30 @@ pub async fn emit_generation_metrics(
 /// beam (`select_beam`/`best_leaf`) keeps the best ok leaf whenever ANY ok
 /// node exists, so a `None` selection means every fork/refine/generation
 /// failed across every level — a total failure, never a legitimate empty
-/// answer. Both dispatch paths gate the terminal on this (F1): `true` ⇒
-/// emit the `error` frame (stream) / a JSON `error` envelope (non-stream)
-/// instead of the success-shaped `tree_complete`/`TreeResponse`.
+/// answer.
 pub fn is_total_failure(selected_node_id: &Option<String>) -> bool {
     selected_node_id.is_none()
+}
+
+/// Server terminal-boundary check: a ToT success requires a final answer,
+/// not merely an inspection node. A retained intermediate candidate can
+/// remain selected so clients can inspect where the search got to, but if
+/// final synthesis did not produce an answer, both dispatch paths must emit
+/// the terminal `error` shape rather than `tree_complete`/`TreeResponse`.
+pub fn terminal_error(
+    selected_node_id: &Option<String>,
+    final_answer: &Option<String>,
+) -> Option<(&'static str, &'static str)> {
+    if is_total_failure(selected_node_id) {
+        Some((NO_ANSWER_CODE, NO_ANSWER_MESSAGE))
+    } else if final_answer.is_none() {
+        Some((
+            FINAL_ANSWER_UNAVAILABLE_CODE,
+            FINAL_ANSWER_UNAVAILABLE_MESSAGE,
+        ))
+    } else {
+        None
+    }
 }
 
 /// Wire `code`/`message` for the no-ok-leaf terminal failure, shared by
@@ -359,6 +378,9 @@ pub fn is_total_failure(selected_node_id: &Option<String>) -> bool {
 pub const NO_ANSWER_CODE: &str = "no_answer";
 pub const NO_ANSWER_MESSAGE: &str =
     "tree-of-thought search produced no answer: every branch failed to generate";
+pub const FINAL_ANSWER_UNAVAILABLE_CODE: &str = "final_answer_unavailable";
+pub const FINAL_ANSWER_UNAVAILABLE_MESSAGE: &str =
+    "tree-of-thought search selected an inspection node but produced no final answer";
 pub const METRICS_UNAVAILABLE_CODE: &str = "generation_metrics_unavailable";
 pub const METRICS_UNAVAILABLE_MESSAGE: &str =
     "tree-of-thought search finished without generation metrics";
@@ -602,6 +624,25 @@ mod tests {
         // Some selection is a real answer (tree_complete).
         assert!(is_total_failure(&None));
         assert!(!is_total_failure(&Some("tot-n3".to_string())));
+    }
+
+    #[test]
+    fn terminal_error_when_selected_leaf_has_no_final_answer() {
+        let selected = Some("tot-n3".to_string());
+        let final_answer = None;
+        let (code, message) = terminal_error(&selected, &final_answer)
+            .expect("selected inspection node without final answer is terminal failure");
+
+        assert_eq!(code, FINAL_ANSWER_UNAVAILABLE_CODE);
+        assert!(message.contains("final answer"));
+    }
+
+    #[test]
+    fn terminal_error_none_when_selected_leaf_has_final_answer() {
+        let selected = Some("tot-n3".to_string());
+        let final_answer = Some("4".to_string());
+
+        assert!(terminal_error(&selected, &final_answer).is_none());
     }
 
     #[test]

@@ -250,3 +250,54 @@ func typeComposerText(
   pasteboard.setString(text, forType: .string)
   app.typeKey("v", modifierFlags: .command)
 }
+
+extension XCUIElement {
+  /// Poll `isHittable` (not just `exists`). `isHittable` is true only when
+  /// the element exists, is on-screen and enabled, AND its app is
+  /// key/frontmost — exactly the precondition XCUITest needs to synthesize
+  /// a click/type against it. Returns false if it never becomes hittable.
+  @discardableResult
+  func waitForHittable(timeout: TimeInterval) -> Bool {
+    if isHittable { return true }
+    let expectation = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "isHittable == true"), object: self)
+    return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
+  }
+}
+
+extension XCUIApplication {
+  /// Return `element` only once it is actually interactable, re-activating
+  /// this app until it is. In the full GUI matrix a launch can come up
+  /// not-key — a sibling suite's window keeps keyboard focus, so the whole
+  /// app tree reports `Disabled`. A bare `waitForExistence` still passes,
+  /// but the subsequent synthesized click/type then times out ("Failed to
+  /// synthesize event"), which cascades into spurious "control absent"
+  /// failures downstream (#559). Activating and gating on `isHittable`
+  /// waits the focus settle out before the event is sent.
+  ///
+  /// THROWS on exhaustion rather than returning a dead element: a caller
+  /// like `try app.readyForInput(send).click()` then aborts on the `try`
+  /// before the `.click()` runs, so the clean "stuck not-key" diagnostic
+  /// is preserved instead of being buried by a re-triggered synthesize
+  /// -event failure on the bogus click.
+  @discardableResult
+  func readyForInput(_ element: XCUIElement, timeout: TimeInterval = 15,
+                     file: StaticString = #filePath, line: UInt = #line) throws -> XCUIElement {
+    XCTAssertTrue(element.waitForExistence(timeout: timeout),
+                  "element never appeared", file: file, line: line)
+    for _ in 0..<3 {
+      if element.isHittable { return element }
+      activate()
+      if element.waitForHittable(timeout: timeout) { return element }
+    }
+    throw NotKeyError.notHittable
+  }
+}
+
+/// Thrown by `XCUIApplication.readyForInput` when the element never becomes
+/// hittable — the app appears stuck not-key. Carries a readable message so
+/// the test failure names the real cause, not a synthesize-event timeout.
+enum NotKeyError: Error, CustomStringConvertible {
+  case notHittable
+  var description: String { "element never became hittable — app appears stuck not-key" }
+}

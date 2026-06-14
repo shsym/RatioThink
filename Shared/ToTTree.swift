@@ -187,6 +187,10 @@ public struct ToTTree: Equatable, Sendable, Codable {
 
   /// Mark the search failed (the stream threw). Idempotent terminal.
   public mutating func fail(_ message: String) {
+    // Any accumulated `finalDelta` text is optimistic synthesis output, not
+    // an authoritative final answer. Once the terminal state is failed, do
+    // not persist that partial text in `finalAnswer`.
+    self.finalAnswer = nil
     self.status = .failed(message)
   }
 

@@ -137,6 +137,24 @@ final class ProfileModelOptionsTests: XCTestCase {
     XCTAssertNil(options.first?.unsupportedReason, "an installed current model is never 'Not downloaded'")
   }
 
+  // #590: after the full-slug dedup a family can list an app-managed copy AND
+  // an HF-cache copy of the same quant (distinct slugs, same visible tag). The
+  // picker marks the HF-cache row so the two differ in the menu, mirroring the
+  // chat dropdown (ToolbarModelOptions.Option.sourceTag) for app-vs-cache parity.
+  func test_source_tag_marks_hf_cache_rows_only() {
+    let options = ProfileModelOptions.build(
+      models: [appModel("App/Model-Q4_K_M.gguf"),
+               hfModel("HF/Repo-GGUF/Model-Q4_K_M.gguf", sizeBytes: 100)],
+      current: "Synth/NotDiscovered.gguf",
+      limitBytes: nil)
+    XCTAssertNil(options.first { $0.slug == "App/Model-Q4_K_M.gguf" }?.sourceTag,
+                 "app-managed rows are unmarked (the default)")
+    XCTAssertEqual(options.first { $0.slug == "HF/Repo-GGUF/Model-Q4_K_M.gguf" }?.sourceTag,
+                   "hf cache")
+    XCTAssertNil(options.first { $0.slug == "Synth/NotDiscovered.gguf" }?.sourceTag,
+                 "a synthesized current row has no source → no suffix")
+  }
+
   func test_option_carries_parsed_parts() {
     let options = ProfileModelOptions.build(
       models: [appModel("Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf")],

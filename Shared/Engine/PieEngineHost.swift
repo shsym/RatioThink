@@ -594,6 +594,23 @@ public final class PieEngineHost: @unchecked Sendable {
   /// started when entering `.running`, cancelled when leaving it.
   private var livenessMonitor: Task<Void, Never>?
 
+  /// #336 — incarnation token for `livenessMonitor`. Bumped on every
+  /// `startLivenessMonitor`; each monitor Task captures its value and
+  /// the gone-block compares it on `stateQueue` before flipping state.
+  /// Cancelling a monitor Task cannot recall a `stateQueue.async`
+  /// gone-block it already enqueued, and the post-probe
+  /// `Task.isCancelled` check leaves a window — the gone path then
+  /// awaits `terminationSnapshot`/RSS/`diagnosticTail` before the hop —
+  /// in which a `stop→start` (or auto-relaunch) can bring up a FRESH
+  /// engine. The stale verdict would then land while the host is
+  /// `.running` on a new incarnation and wrongly flip it to
+  /// `.failed(.engineGone)`. The `guard case .running` check cannot
+  /// catch this — a new running incarnation also matches `.running`.
+  /// The token does: only the monitor whose incarnation still matches
+  /// owns the verdict. Same shape as `healthyUptimeIncarnation` (R3).
+  /// Owned by `stateQueue`.
+  private var livenessMonitorIncarnation: Int = 0
+
   /// Pending auto-relaunch task scheduled after `.failed(.engineGone)`.
   /// Owned by `stateQueue`; cancelled on user `start()`/`stop()` so a
   /// manual action wins over the ladder.
@@ -1079,8 +1096,10 @@ public final class PieEngineHost: @unchecked Sendable {
     let sleepFor = self.sleepFor
     guard interval > 0 else { return }
     livenessMonitor?.cancel()
+    livenessMonitorIncarnation += 1
+    let myIncarnation = livenessMonitorIncarnation
     let guardrail = guardrailBytes
-    livenessMonitor = Task { [weak self, sleepFor] in
+    livenessMonitor = Task { [weak self, sleepFor, myIncarnation] in
       var consecutiveGone = 0
       // Highest successful RSS sample from this child lifetime. Sample
       // immediately rather than waiting for the first `.alive` tick: early
@@ -1128,8 +1147,15 @@ public final class PieEngineHost: @unchecked Sendable {
             reason: snapshot?.reason, status: snapshot?.status,
             initiator: snapshot == nil ? .liveness : .engine,
             lastRSSBytes: maxRSS, guardrailBytes: guardrail)
-          self?.stateQueue.async { [weak self] in
+          self?.stateQueue.async { [weak self, myIncarnation] in
             guard let self else { return }
+            // #336: bail unless this monitor is still the live one. A
+            // superseded monitor (stop→start, or auto-relaunch) whose
+            // gone-block raced onto `stateQueue` after a fresh engine
+            // re-entered `.running` would otherwise poison the new
+            // incarnation — the `guard case .running` below cannot
+            // distinguish "this engine" from "a later engine".
+            guard self.livenessMonitorIncarnation == myIncarnation else { return }
             guard case .running = self._state else { return }
             Log.engine.error("PieEngineHost: liveness monitor declared engine gone (cause=\(termination.cause.rawValue, privacy: .public)): \(reason, privacy: .public)")
             DiagnosticLog.helper.event("engine.gone", [

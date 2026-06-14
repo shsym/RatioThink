@@ -15,13 +15,13 @@ import Foundation
 /// A `tree-of-thought` stream is exactly:
 ///
 ///   `treeStart` → (`nodeComplete`* then `levelPruned`) per level →
-///   one terminal `treeComplete` (an ok leaf was selected) | thrown
-///   `ToTStreamError` (the `error` frame — a total failure, no ok leaf;
-///   F1) → end.
+///   one terminal `treeComplete` (a final answer was produced) | thrown
+///   `ToTStreamError` (the `error` frame — no final answer; F1) → end.
 ///
-/// A `treeComplete` whose `selectedNodeID` is nil is ALSO a total failure
-/// (the server emits the `error` frame for it now, but the consumer treats
-/// a null selection as failure defensively — `ChatSendController`).
+/// A `treeComplete` whose `selectedNodeID` or `finalAnswer` is nil is ALSO
+/// a failure (the server emits the `error` frame for it now, but the
+/// consumer treats either missing field as failure defensively —
+/// `ChatSendController`).
 ///
 /// `nodeComplete` carries the **flat** node — the client assembles the
 /// hierarchy from `parentID`, exactly as the non-streaming server does.
@@ -144,10 +144,10 @@ public enum ToTEvent: Equatable, Sendable {
   /// A level's beam selection: the ids kept as the next frontier. Empty
   /// `kept` ⇒ the level produced no survivor and the search stopped.
   case levelPruned(level: Int, kept: [String])
-  /// Terminal: the selected best leaf. A non-nil `selectedNodeID` is a
-  /// real answer; a nil `selectedNodeID` (and `finalAnswer`) is a TOTAL
-  /// failure, not an empty success — the server emits the `error` frame
-  /// for it now, and the consumer treats a null selection as failure (F1).
+  /// Terminal success: the selected best leaf plus the final answer. A nil
+  /// `selectedNodeID` or nil `finalAnswer` is a failure, not an empty
+  /// success — the server emits the `error` frame for those now, and the
+  /// consumer treats either missing value as failure defensively (F1).
   case treeComplete(selectedNodeID: String?, finalAnswer: String?)
   /// A streamed chunk of the final synthesized answer (#523 Part A). After
   /// the search picks the best leaf, ONE synthesis generation produces the

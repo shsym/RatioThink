@@ -54,11 +54,12 @@
 //! `stream:true` returns an SSE stream that surfaces the search live —
 //! `tree_start`, then per level a `node_complete` for every generated node
 //! followed by a `level_pruned` beam selection, then ONE terminal:
-//! `tree_complete` when an ok leaf was selected, or `error` when none was
-//! (F1 — a null selection means every branch failed; see
-//! [`stream::is_total_failure`]). Non-streaming is symmetric: an ok-leaf
-//! search returns the 200 `TreeResponse`, a total failure returns the same
-//! JSON `error` envelope. The wire format + frame schema live in
+//! `tree_complete` when a final answer was produced, or `error` when the
+//! search could not produce one (F1 — either no selected leaf or a retained
+//! inspection node with no synthesized final answer; see
+//! [`stream::terminal_error`]). Non-streaming is symmetric: a search with a
+//! final answer returns the 200 `TreeResponse`; a terminal failure returns the
+//! same JSON `error` envelope. The wire format + frame schema live in
 //! [`stream`]; the same [`search::run`] orchestration drives both the
 //! streamed and non-streamed responses (it just takes an optional
 //! [`Emitter`]), so the two can never diverge. Pre-stream failures
@@ -110,7 +111,6 @@ use crate::sse::{self, Emitter};
 use std::time::Instant;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Response};
-
 
 fn validate_tot_messages(
     messages: &[ChatMessage],
@@ -340,19 +340,15 @@ pub async fn dispatch(
     let started = Instant::now();
     let outcome = search::run(root_ctx, &params, &model, None).await;
 
-    // F1: a search that selected no ok leaf totally failed (every branch
-    // failed to generate — the beam keeps the best ok leaf whenever one
-    // exists). Surface it as an error envelope, symmetric with the
-    // streaming path's terminal `error` frame, rather than a 200
-    // success-shaped tree with null answer.
-    if stream::is_total_failure(&outcome.selected_node_id) {
-        return res
-            .respond(sse::json_error(
-                500,
-                stream::NO_ANSWER_CODE,
-                stream::NO_ANSWER_MESSAGE,
-            ))
-            .await;
+    // F1/review v4: terminal success requires an actual final answer, not
+    // merely a selected inspection node. A retained intermediate candidate
+    // after a later full failure can be useful for tree inspection, but if
+    // synthesis did not produce a final answer, do not publish a 200
+    // success-shaped tree with `final_answer:null`.
+    if let Some((code, message)) =
+        stream::terminal_error(&outcome.selected_node_id, &outcome.final_answer)
+    {
+        return res.respond(sse::json_error(500, code, message)).await;
     }
 
     let response_body = tree::TreeResponse {
@@ -399,7 +395,7 @@ pub async fn dispatch(
 ///
 /// Frame order: `tree_start` → (`node_complete`* `level_pruned`)\* per
 /// level (emitted inside [`search::run`]) → one terminal `tree_complete`
-/// (an ok leaf was selected) OR `error` (F1: no ok leaf — total failure)
+/// (a final answer was produced) OR `error` (F1: no final answer)
 /// → `[DONE]`. The streamed `node_complete` frames carry the (error) tree
 /// regardless, so an `error` terminal still leaves the client a renderable
 /// tree plus a surfaced failure. A client that disconnects before the
@@ -423,16 +419,13 @@ async fn dispatch_streaming(
     }
     let started = Instant::now();
     let outcome = search::run(root_ctx, params, model, Some(&mut em)).await;
-    if stream::is_total_failure(&outcome.selected_node_id) {
-        // F1: total failure — emit the documented terminal `error` frame
-        // (the client's catch marks the turn failed) instead of a
-        // success-shaped `tree_complete{null,null}`.
-        let _ = em
-            .emit_json(&sse::SseError::new(
-                stream::NO_ANSWER_CODE,
-                stream::NO_ANSWER_MESSAGE,
-            ))
-            .await;
+    if let Some((code, message)) =
+        stream::terminal_error(&outcome.selected_node_id, &outcome.final_answer)
+    {
+        // F1/review v4: terminal failure — emit the documented terminal
+        // `error` frame (the client's catch marks the turn failed) instead
+        // of a success-shaped `tree_complete` without a final answer.
+        let _ = em.emit_json(&sse::SseError::new(code, message)).await;
     } else {
         if let Some(metrics) =
             tree::GenerationMetrics::build(outcome.total_generated_tokens, started.elapsed())
@@ -461,7 +454,6 @@ async fn dispatch_streaming(
     sse::emit_done_logged(&mut em, "tot_terminal").await;
     em.finish()
 }
-
 
 #[cfg(test)]
 mod tests {

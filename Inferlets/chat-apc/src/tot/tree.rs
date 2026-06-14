@@ -168,23 +168,62 @@ pub fn error_leaf(parent_id: &str, depth: usize, branch_index: usize, error: Str
     }
 }
 
-/// Parse the first integer in `[1, 10]` out of value-evaluator output.
-/// Returns `None` for no-digit text or an out-of-range value.
+/// Parse a score in `[1, 10]` out of value-evaluator output.
+///
+/// The verification scorer (#555) re-solves the question as visible text — which
+/// can contain out-of-range numbers like recomputed dollar amounts — and ends
+/// with a `SCORE: N` verdict line. So we anchor on the LAST `score` mention and
+/// read the integer that follows it; that is the rating. If the anchored value
+/// is out of range the scorer mis-formatted, and we stay unscored rather than
+/// grabbing a stray number from the worked check. With no `score` anchor at all
+/// (back-compat for bare `"8"` / `"10/10"`) we take the LAST in-range integer in
+/// the text. Returns `None` for no usable score.
 pub fn parse_score(text: &str) -> Option<u8> {
+    // Digits are case-invariant, so work entirely on the lowercased copy: its
+    // byte offsets line up with the digit runs we slice out of it.
+    let lower = text.to_lowercase();
+    if let Some(pos) = lower.rfind("score") {
+        // Skip the word "score" itself (5 ASCII bytes) so a stray digit inside
+        // it can't ever match; read the first digit run after the anchor.
+        if let Some(v) = first_digit_run_value(&lower[pos + 5..]) {
+            return if (1..=10).contains(&v) {
+                Some(v as u8)
+            } else {
+                None
+            };
+        }
+    }
+    last_in_range_integer(&lower)
+}
+
+/// Value of the first contiguous ASCII digit run in `s`, or `None` if `s`
+/// contains no digits.
+fn first_digit_run_value(s: &str) -> Option<u16> {
     let mut digits = String::new();
-    for ch in text.chars() {
+    for ch in s.chars() {
         if ch.is_ascii_digit() {
             digits.push(ch);
         } else if !digits.is_empty() {
             break;
         }
     }
-    let v: u16 = digits.parse().ok()?;
-    if (1..=10).contains(&v) {
-        Some(v as u8)
-    } else {
-        None
+    digits.parse().ok()
+}
+
+/// The last contiguous ASCII digit run in `s` whose value is in `[1, 10]`.
+fn last_in_range_integer(s: &str) -> Option<u8> {
+    let mut best = None;
+    for run in s.split(|c: char| !c.is_ascii_digit()) {
+        if run.is_empty() {
+            continue;
+        }
+        if let Ok(v) = run.parse::<u16>() {
+            if (1..=10).contains(&v) {
+                best = Some(v as u8);
+            }
+        }
     }
+    best
 }
 
 /// A scored candidate reduced to what beam selection needs. `ok` is
@@ -197,6 +236,10 @@ pub struct Candidate {
     pub id: String,
     pub score: Option<u8>,
     pub ok: bool,
+    /// Search depth at which this candidate was generated. The final-answer
+    /// fallback uses this to avoid exposing an intermediate path step as the
+    /// terminal `final_answer` when the final depth failed.
+    pub depth: usize,
     /// The candidate's generated answer, used by [`select_beam_diverse`]
     /// for near-duplicate detection. Empty for non-`ok` candidates (no
     /// answer to compare) and in tests that only exercise score selection.
@@ -313,11 +356,43 @@ mod tests {
         assert_eq!(parse_score("no number here"), None);
     }
 
+    #[test]
+    fn parse_score_anchors_on_final_score_line_past_recomputed_numbers() {
+        // The verification scorer (#555) writes its worked check first — full
+        // of out-of-range numbers — then the verdict line. The anchor must read
+        // the rating, not a recomputed dollar amount.
+        let text = "Let me check: 4 notebooks at $3 is $12, 5 pens at $2 is $10, \
+            minus $4 is $18. The reply says $17, which is wrong.\nSCORE: 2";
+        assert_eq!(parse_score(text), Some(2));
+    }
+
+    #[test]
+    fn parse_score_anchor_takes_last_score_mention() {
+        let text = "The reply scores poorly on correctness. Final SCORE: 3";
+        assert_eq!(parse_score(text), Some(3));
+    }
+
+    #[test]
+    fn parse_score_anchor_out_of_range_stays_unscored() {
+        // An explicit but malformed verdict is not silently rescued by grabbing
+        // a stray in-range number from the worked check above it.
+        let text = "I computed 8 dollars. SCORE: 42";
+        assert_eq!(parse_score(text), None);
+    }
+
+    #[test]
+    fn parse_score_no_anchor_falls_back_to_last_in_range_integer() {
+        // Back-compat for a bare rating with no `score` word.
+        assert_eq!(parse_score("8"), Some(8));
+        assert_eq!(parse_score("I think 9 is right, maybe 7"), Some(7));
+    }
+
     fn cand(id: &str, score: Option<u8>, ok: bool) -> Candidate {
         Candidate {
             id: id.to_string(),
             score,
             ok,
+            depth: 1,
             content: String::new(),
         }
     }
@@ -327,6 +402,7 @@ mod tests {
             id: id.to_string(),
             score,
             ok: true,
+            depth: 1,
             content: content.to_string(),
         }
     }

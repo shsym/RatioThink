@@ -383,10 +383,18 @@ public final class ChatSendController: ObservableObject {
               // total failure never persists as a blank SUCCESSFUL turn.
               tree.fail(Self.totNoAnswerMessage)
               assistant.tot = try? encoder.encode(tree)
-              if assistant.content.isEmpty {
-                assistant.content = "⚠️ \(Self.totNoAnswerMessage)"
-              }
+              assistant.content = "⚠️ \(Self.totNoAnswerMessage)"
               Diag.app.event("chat.fail.tot", [("reason", "no_answer")])
+            } else if finalAnswer == nil {
+              // Review v4 F1 (client defensive): selectedNodeID is an
+              // inspection pointer, not proof that a final answer exists.
+              // The server now emits `error` for this shape, but if an
+              // older/buggy engine sends it, do not persist a blank
+              // successful assistant message.
+              tree.fail(Self.totFinalAnswerUnavailableMessage)
+              assistant.tot = try? encoder.encode(tree)
+              assistant.content = "⚠️ \(Self.totFinalAnswerUnavailableMessage)"
+              Diag.app.event("chat.fail.tot", [("reason", "final_answer_unavailable")])
             } else {
               if let generationMetrics {
                 assistant.content = finalAnswer ?? ""
@@ -436,9 +444,7 @@ public final class ChatSendController: ObservableObject {
           if !reachedTerminal {
             tree.fail(Self.totIncompleteMessage)
             assistant.tot = try? encoder.encode(tree)
-            if assistant.content.isEmpty {
-              assistant.content = "⚠️ \(Self.totIncompleteMessage)"
-            }
+            assistant.content = "⚠️ \(Self.totIncompleteMessage)"
             Diag.app.event("chat.fail.tot", [
               ("reason", "no_terminal"),
               ("elapsed", String(format: "%.1f", Date().timeIntervalSince(totStart))),
@@ -456,9 +462,7 @@ public final class ChatSendController: ObservableObject {
         let problem = EngineProblem(requestError: error, requestedModelID: options.modelID)
         tree.fail(problem.technicalDetail ?? problem.message)
         assistant.tot = try? encoder.encode(tree)
-        if assistant.content.isEmpty {
-          assistant.content = "⚠️ \(problem.message)"
-        }
+        assistant.content = "⚠️ \(problem.message)"
         if let detail = problem.technicalDetail {
           Log.engine.error("ChatSendController: ToT send failed: \(detail, privacy: .public)")
         }
@@ -487,6 +491,10 @@ public final class ChatSendController: ObservableObject {
   /// User-facing copy when a selected ToT success arrives without the
   /// required terminal total-throughput metrics (#542 review F1).
   static let totMissingMetricsMessage = "Tree-of-thought search finished without generation metrics."
+
+  /// User-facing copy when the engine selected an inspection node but did
+  /// not produce the required direct final answer (review v4 F1).
+  static let totFinalAnswerUnavailableMessage = "Tree-of-thought search did not produce a final answer."
 
   private static func persistTree(_ context: ModelContext, status: PersistenceStatus) {
     do {

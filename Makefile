@@ -50,6 +50,7 @@ define gui_suite_run
   Scripts/purge-app-window-frames.sh || echo "warning: window-frame purge failed — saved NSWindow Frame keys may poison GUI runs"; \
   if [ -n "$$PIE_TEST_TCC_GRANTED" ]; then export TEST_RUNNER_PIE_TEST_TCC_GRANTED="$$PIE_TEST_TCC_GRANTED"; fi; \
   if [ -n "$$PIE_TEST_MODEL" ]; then export TEST_RUNNER_PIE_TEST_MODEL="$$PIE_TEST_MODEL"; fi; \
+  hc testlease run gui-seat --label "gui-$(1)" -- \
   xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkGUITests \
     -destination 'platform=macOS,arch=arm64' \
     -parallel-testing-enabled NO \
@@ -66,6 +67,7 @@ endef
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics test-landing-page \
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-sandbox-diagnostics test-readme-harness test-e2e-http \
+        test-spec-smoke test-spec-bench \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-menubar-icon-template \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
@@ -108,12 +110,15 @@ install-app: ## Signed install into /Applications, verified end-to-end (Helper+e
 	Scripts/install-app.sh
 
 build-tests: genproject ## Compile every xcodebuild target + the SPM probe (review v5 F2)
+	hc testlease run xcode-build --label "build-tests-app" -- \
 	xcodebuild -project RatioThink.xcodeproj -scheme RatioThink \
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build-for-testing
+	hc testlease run xcode-build --label "build-tests-gui" -- \
 	xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkGUITests \
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build-for-testing
+	hc testlease run xcode-build --label "build-tests-helper" -- \
 	xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkHelperTests \
 	  -destination 'platform=macOS,arch=arm64' \
 	  -configuration Debug ENABLE_CODE_COVERAGE=NO build-for-testing
@@ -459,6 +464,22 @@ bench-apc-real: $(LOGDIR) ## BENCHMARK: real-engine APC cold/miss vs warm/hit ch
 	  [ -f "$${OUT%.json}.md" ] && echo "summary: $${OUT%.json}.md"; \
 	  exit $$status
 
+test-spec-smoke: $(LOGDIR) ## Fast Think real-model correctness smoke (opt-in, portable Metal, needs uv + real Qwen3-0.6B weights). Short-window greedy spec==plain (64 tok; #592) + ≥1 accepted draft + forced-tool gate.
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-spec-smoke.log; \
+	  SMOKE_ONLY=1 Scripts/run-spec-bench.sh 2>&1 | tee $$LOG | tail -40; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  exit $$status
+
+test-spec-bench: $(LOGDIR) ## Fast Think vs baseline measurement harness (opt-in, portable Metal, needs uv + real weights). Latency + draft-acceptance metrics → JSON artifact. Knobs: MODEL, MAX_TOKENS, REPS, BENCH_OUT.
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-spec-bench.log; \
+	  Scripts/run-spec-bench.sh 2>&1 | tee $$LOG | tail -60; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  exit $$status
+
 test-gui-script: ## Fast preflight regressions for GUI/E2E wrapper scripts
 	Scripts/test-run-stage-test-model.sh
 	Scripts/test-run-chat-gui-e2e.sh
@@ -536,6 +557,7 @@ test-gui: genproject $(LOGDIR) ## GUI scenarios — full RatioThinkGUITests matr
 	    echo "         macOS can prompt for permission. Subsequent SSH runs may"; \
 	    echo "         then work if the same shell binary holds the grant."; \
 	  fi; \
+	  hc testlease run gui-seat --label "test-gui" -- \
 	  xcodebuild -project RatioThink.xcodeproj -scheme RatioThinkGUITests \
 	    -destination 'platform=macOS,arch=arm64' \
 	    -parallel-testing-enabled NO \

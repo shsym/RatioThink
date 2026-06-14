@@ -49,6 +49,16 @@ public enum ProfileModelOptions {
 
     public var id: String { slug }
 
+    /// Disambiguating source suffix for the row text (#590). After the
+    /// full-slug dedup a family can list an app-managed copy AND an HF-cache
+    /// copy of the same quant (distinct slugs, same visible tag) — mark the
+    /// HF-cache row so the two differ in the menu, mirroring the chat dropdown
+    /// (`ToolbarModelOptions.Option.sourceTag`) for app-vs-cache parity.
+    /// App-managed rows carry no suffix (the unmarked default).
+    public var sourceTag: String? {
+      source == .huggingFaceCache ? "hf cache" : nil
+    }
+
     public init(slug: String,
                 displayName: String,
                 sizeBytes: Int64?,
