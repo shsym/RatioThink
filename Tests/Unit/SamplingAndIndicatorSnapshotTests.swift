@@ -27,9 +27,9 @@ final class SamplingAndIndicatorSnapshotTests: XCTestCase {
   }
 
   func test_render_sampling_popover() throws {
-    let view = ParamsPopover(sampling: .constant(
-      ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 2048)
-    ))
+    let view = ParamsPopover(
+      sampling: ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 2048)
+    )
     try render(view, name: "sampling-popover")
   }
 
@@ -45,7 +45,7 @@ final class SamplingAndIndicatorSnapshotTests: XCTestCase {
 
   func test_render_running_pip_in_toolbar_row() throws {
     // Running stays quiet — a bare dot, no inline copy (scope 3).
-    try render(toolbarRow(indicator(.running(port: 8123, profileID: "chat"))), name: "pip-running")
+    try render(toolbarRow(indicator(.running(EngineSessionSnapshot(port: 8123, profileID: "chat")))), name: "pip-running")
   }
 
   // MARK: - builders
@@ -111,7 +111,9 @@ final class SamplingAndIndicatorSnapshotTests: XCTestCase {
 /// `initialStatus`.
 private struct SnapshotStubXPC: AppXPCClient {
   let status: EngineStatus
+  func helperProtocolVersion() async throws -> Int { HelperProtocolCompatibility.currentVersion }
   func engineStatus() async throws -> EngineStatus { status }
   func stopEngine() async throws {}
-  func startEngine(profileID: String) async throws {}
+  func startEngine(profileID: String, modelOverride: String?) async throws {}
+  func restartEngine(profileID: String, modelOverride: String?) async throws {}
 }

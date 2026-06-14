@@ -1,5 +1,5 @@
 #!/bin/bash
-# Capture README landing-page screenshots of the REAL RatioThink.app driven
+# Capture README landing-page screenshots of the REAL Rational.app driven
 # into a populated, OFFLINE state, and export them into docs/assets/.
 #
 # Mechanism (see Tests/GUIScenarioTests/ReadmeScreenshotsGUITests.swift):
@@ -13,14 +13,14 @@
 #   4. Export the attachments from the .xcresult into docs/assets/.
 #
 # Requires a seated GUI session (console / Screen Sharing) and a one-time TCC
-# grant for the XCTest runner + RatioThink.app (Automation + Accessibility),
+# grant for the XCTest runner + Rational.app (Automation + Accessibility),
 # same as the other GUI E2E scripts. Re-run with PIE_TEST_TCC_GRANTED=1.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-MODEL="${PIE_TEST_CHAT_MODEL:-Qwen3-8B-Instruct}"
+MODEL="${PIE_TEST_CHAT_MODEL_PIN:-Qwen3-8B-Instruct}"
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/readme-shots-$$}"
 GUI_HOME="$RUN_ROOT/g"
 URL_FILE="$RUN_ROOT/harness.url"
@@ -45,7 +45,7 @@ if ! pgrep -x Dock >/dev/null 2>&1; then
   exit 2
 fi
 if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "readme shots: RatioThink.app + XCTest runner need Automation + Accessibility." >&2
+  echo "readme shots: Rational.app + XCTest runner need Automation + Accessibility." >&2
   echo "readme shots: grant them once in System Settings → Privacy & Security, then rerun:" >&2
   echo "readme shots:   PIE_TEST_TCC_GRANTED=1 Scripts/capture-readme-screenshots.sh" >&2
   exit 2
@@ -88,7 +88,7 @@ BASE_URL="$(cat "$URL_FILE")"
 cat >"$CONFIG_FILE" <<EOF
 PIE_TEST_ENGINE_BASE_URL=$BASE_URL
 PIE_TEST_GUI_HOME=$GUI_HOME
-PIE_TEST_CHAT_MODEL=$MODEL
+PIE_TEST_CHAT_MODEL_PIN=$MODEL
 EOF
 
 echo "readme shots: engine=$BASE_URL  model=$MODEL  PIE_HOME=$GUI_HOME"

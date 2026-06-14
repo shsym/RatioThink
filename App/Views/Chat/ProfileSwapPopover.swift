@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Cross-model profile-swap confirmation (Phase 3.6, design §R8).
 ///
@@ -25,6 +26,10 @@ struct ProfileSwapPopover: View {
   let estimatedEtaSeconds: Double?
   let onConfirm: (_ setAsDefault: Bool) -> Void
   let onCancel: () -> Void
+  /// #459 third outcome (profile-swap path only): switch the profile but
+  /// keep the already-resident model loaded, with no reload. Rendered only
+  /// when `pending.canKeepCurrentModel`.
+  let onKeepCurrent: () -> Void
 
   /// : only meaningful for a runtime model override
   /// (`pending.canSetAsDefault`). Checking it persists the picked model
@@ -52,11 +57,20 @@ struct ProfileSwapPopover: View {
         .accessibilityIdentifier("profileSwap.setAsDefaultToggle")
       }
       HStack {
-        Spacer()
         Button("Cancel", role: .cancel) {
           onCancel()
         }
         .keyboardShortcut(.cancelAction)
+        Spacer()
+        // #459: third outcome on the profile-swap path — switch the profile
+        // but keep the model already loaded (no reload). Not offered on the
+        // model-override path (the user explicitly picked a model to load).
+        if pending.canKeepCurrentModel {
+          Button("Keep Current Model") {
+            onKeepCurrent()
+          }
+          .accessibilityIdentifier("profileSwap.keepCurrent")
+        }
         Button("Switch") {
           onConfirm(setAsDefault)
         }
@@ -124,5 +138,102 @@ struct ProfileSwapPopover: View {
     let mins = Int(seconds) / 60
     let secs = Int(seconds) % 60
     return "\(mins) min \(secs) s"
+  }
+}
+
+// MARK: - resign-key-surviving host (#582)
+
+/// Hosts `ProfileSwapPopover` in a coordinator-owned `NSPopover` whose
+/// `.applicationDefined` behavior survives the window resigning key — Cmd-Tab,
+/// a Dock click, Spotlight, a notification stealing focus, etc. SwiftUI's
+/// `.popover` (whether `isPresented:` or `item:`) is `.transient`, so AppKit
+/// auto-closes it the instant the window loses key, silently dropping a pending
+/// cross-model swap (#582). With `.applicationDefined` AppKit never closes it on
+/// its own: only the coordinator does, by clearing `pending` — which the
+/// token-checked Cancel / Keep Current / Switch actions (or `Esc`) do, and which
+/// `sync` then tears the popover down for.
+///
+/// Attach via `.background(...)` on the profile menu so the empty anchor
+/// `NSView` tracks the menu's frame; the popover presents below it. The anchor
+/// is a plain unflipped `NSView` (`isFlipped == false`), so its bottom edge is
+/// `.minY` in AppKit geometry — that is the `preferredEdge` for a below-the-menu
+/// placement matching the former `arrowEdge: .bottom`.
+///
+/// Token capture (review v2 F4) is preserved: `sync` captures `pending.id` when
+/// it builds the content, so each button callback carries the token that was
+/// live at present time. A re-entrant swap publishes a new token, `sync`
+/// rebuilds, and any stale callback from the superseded popover is
+/// token-mismatched and dropped by the coordinator.
+struct ProfileSwapPopoverHost: NSViewRepresentable {
+  let pending: ProfileSwapCoordinator.PendingSwap?
+  let onConfirm: (_ token: UUID, _ setAsDefault: Bool) -> Void
+  let onCancel: (_ token: UUID) -> Void
+  let onKeepCurrent: (_ token: UUID) -> Void
+
+  func makeCoordinator() -> Host { Host() }
+
+  func makeNSView(context: Context) -> NSView { NSView() }
+
+  func updateNSView(_ nsView: NSView, context: Context) {
+    context.coordinator.sync(
+      pending: pending,
+      anchor: nsView,
+      onConfirm: onConfirm,
+      onCancel: onCancel,
+      onKeepCurrent: onKeepCurrent
+    )
+  }
+
+  @MainActor
+  final class Host {
+    private var popover: NSPopover?
+    private var shownToken: UUID?
+
+    func sync(
+      pending: ProfileSwapCoordinator.PendingSwap?,
+      anchor: NSView,
+      onConfirm: @escaping (UUID, Bool) -> Void,
+      onCancel: @escaping (UUID) -> Void,
+      onKeepCurrent: @escaping (UUID) -> Void
+    ) {
+      guard let pending else {
+        close()
+        return
+      }
+      // The same pending is already on screen — leave it (and its anchored
+      // arrow) untouched so a focus blip never tears it down and rebuilds it.
+      if shownToken == pending.id, popover?.isShown == true { return }
+      // A re-entrant swap published a new token — replace the content.
+      close()
+      // Anchor not yet in a window (first layout pass) — a later update, once
+      // `pending` triggers a re-render with the view hosted, presents it.
+      guard anchor.window != nil else { return }
+
+      let token = pending.id
+      let hosting = NSHostingController(rootView: ProfileSwapPopover(
+        pending: pending,
+        estimatedTotalBytes: nil,
+        estimatedEtaSeconds: nil,
+        onConfirm: { onConfirm(token, $0) },
+        onCancel: { onCancel(token) },
+        onKeepCurrent: { onKeepCurrent(token) }
+      ))
+      hosting.sizingOptions = [.preferredContentSize]
+
+      let popover = NSPopover()
+      popover.behavior = .applicationDefined   // #582: survive resign-key
+      popover.contentViewController = hosting
+      // `.minY` = the anchor's bottom edge (unflipped NSView), so the popover
+      // presents below the profile menu — the former `arrowEdge: .bottom`.
+      popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
+      self.popover = popover
+      self.shownToken = token
+    }
+
+    private func close() {
+      popover?.performClose(nil)
+      popover = nil
+      shownToken = nil
+    }
   }
 }

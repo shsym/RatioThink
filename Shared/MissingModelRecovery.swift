@@ -23,6 +23,15 @@ public enum MissingModelRecovery {
     /// single-file GGUF download — the UI points the user at the
     /// toolbar / Settings → Models instead of offering a broken action.
     case unavailable
+
+    /// Whether this action is the inline download — i.e. the send-gate sheet
+    /// renders the same Download the banner does. The banner-gate keys on
+    /// this (not bare sheet presentation) so it only defers when the sheet
+    /// actually duplicates the download (review F1).
+    public var isDownload: Bool {
+      if case .download = self { return true }
+      return false
+    }
   }
 
   /// Decide the prompt action. `isInstalled` is the caller's filesystem
@@ -41,16 +50,33 @@ public enum MissingModelRecovery {
     return .unavailable
   }
 
-  /// Download target for the failed(modelMissing) banner, or nil when
-  /// the banner must stay hidden.
+  /// Download target the in-chat `ModelMissingBanner` should show, or nil
+  /// when the banner must stay hidden.
   ///
-  /// Non-nil ONLY when the engine failed *specifically* because the
-  /// model is missing AND the active profile's default resolves to a
-  /// single-file GGUF download. A `.memoryRisk` / `.spawnFailed` failure
-  /// is a different problem (model present but too large, binary broken)
-  /// and must not be papered over with a download prompt.
+  /// Non-nil ONLY when the engine failed *specifically* because the model is
+  /// missing AND the active profile's default resolves to a single-file GGUF
+  /// download. A `.memoryRisk` / `.spawnFailed` failure is a different problem
+  /// (model present but too large, binary broken) and must not be papered over
+  /// with a download prompt.
+  ///
+  /// #446 `sendGatePresented`: the banner and the send-gate sheet
+  /// (`NoModelLoadedPrompt`) can BOTH recover a missing-but-downloadable
+  /// default with an inline Download — two prompts for one recovery. When the
+  /// caller knows the sheet is presented AND is itself showing that download,
+  /// pass `true` so the banner defers (the modal, user-initiated sheet owns
+  /// the recovery); the banner re-takes the surface when the sheet closes.
+  /// The caller must gate on the sheet's REAL download condition, not bare
+  /// presentation — if the sheet shows Open Settings (a non-`.download`
+  /// action, e.g. a present-but-invalid staged model) it does NOT duplicate
+  /// the banner, so the banner must stay (review F1). Defaulting to `false`
+  /// keeps this the single `bannerTarget` entry point: an ungated caller (the
+  /// fault-routing `hasDownloadTarget` check) omits the argument and gets the
+  /// pre-#446 behavior, while the gate is opt-in by name — no arity-only
+  /// overload that a dropped argument could silently rebind to (review F3).
   public static func bannerTarget(engineStatus: EngineStatus,
-                                  profileDefaultModel: String?) -> ModelDownloadTarget? {
+                                  profileDefaultModel: String?,
+                                  sendGatePresented: Bool = false) -> ModelDownloadTarget? {
+    guard !sendGatePresented else { return nil }
     guard case .failed(.modelMissing, _) = engineStatus else { return nil }
     guard let slug = profileDefaultModel else { return nil }
     return CuratedModelCatalog.downloadTarget(forModelSlug: slug)
@@ -73,31 +99,23 @@ public enum MissingModelRecovery {
     return false
   }
 
-  /// Message for the generic in-chat engine-failure banner, or nil when
-  /// it should stay hidden. The single engine-failure channel (PR#15
-  /// F2/F3): a user-initiated start/stop that fails must surface IN-CHAT,
-  /// not only on the menu-bar dot and never under the persistence
-  /// "Couldn't save" banner (wrong fault domain).
+  /// Message for the chat-local engine-action failure banner, or nil when
+  /// it should stay hidden. Live `EngineStatus.failed` is owned by the
+  /// app-level unified status banner and toolbar status control; rendering
+  /// the same status again inside the chat duplicates the failure and can
+  /// crowd the model/profile recovery controls. This local banner is only
+  /// for a user-initiated start/stop error that the status poll may not
+  /// reflect (for example, a transport throw while status remains running),
+  /// and it still stays out of the persistence "Couldn't save" channel
+  /// (wrong fault domain).
   ///
-  ///   · `.failed(.modelMissing)` → nil ONLY when `hasDownloadTarget`
-  ///     (the download banner owns that surface). For a NON-downloadable
-  ///     modelMissing slug (2-seg safetensors dir, bare leaf, non-`.gguf`,
-  ///     or a default whose snapshot was deleted) NO download banner
-  ///     exists, so it falls through to `statusDetail` here — otherwise it
-  ///     would be the menu-bar-dot-only state this channel exists to kill
-  ///     (PR#15 v2 F1).
-  ///   · `.failed(otherCode)` → the live `statusDetail` (e.g. spawnFailed,
-  ///     handshakeTimeout, engineGone).
-  ///   · otherwise → a pending thrown `actionError` (a stop that left the
-  ///     engine running, or a transport error the poll won't reflect).
-  public static func engineFailureBannerMessage(engineStatus: EngineStatus,
-                                                actionError: String?,
-                                                statusDetail: String,
-                                                hasDownloadTarget: Bool) -> String? {
-    if case .failed(let code, _) = engineStatus {
-      if code == .modelMissing, hasDownloadTarget { return nil }
-      return statusDetail
-    }
+  ///   · any `.failed` → nil (global unified status banner owns it; a
+  ///     modelMissing download target is separately owned by
+  ///     `ModelMissingBanner` before this helper is consulted).
+  ///   · otherwise → a pending thrown `actionError`.
+  public static func engineActionFailureBannerMessage(engineStatus: EngineStatus,
+                                                      actionError: String?) -> String? {
+    if case .failed = engineStatus { return nil }
     return actionError
   }
 

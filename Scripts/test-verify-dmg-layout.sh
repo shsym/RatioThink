@@ -16,7 +16,7 @@ DSSTORE_PY="$ROOT/Scripts/make-dmg-dsstore.py"
 GEOMETRY_JSON="$ROOT/Scripts/dmg-window.json"
 VENDOR_DIR="$ROOT/Scripts/vendor"
 WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pie-dmg-verifier-tests.XXXXXX")"
-VOLNAME="RatioThink"
+VOLNAME="Rational"
 STAGE_MOUNT="/Volumes/$VOLNAME"
 
 cleanup() {
@@ -25,18 +25,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Build a minimal, ad-hoc-signed RatioThink.app at $1. /bin/echo is a real
+# Build a minimal, ad-hoc-signed Rational.app at $1. /bin/echo is a real
 # mach-o, so the bundle is a valid codesign target whose seal a `--strict`
 # verify can both accept (intact) and reject (tampered).
 make_dummy_app() {
   local app="$1"
   mkdir -p "$app/Contents/MacOS"
-  cp /bin/echo "$app/Contents/MacOS/RatioThink"
+  cp /bin/echo "$app/Contents/MacOS/Rational"
   cat >"$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleExecutable</key><string>RatioThink</string>
+  <key>CFBundleExecutable</key><string>Rational</string>
   <key>CFBundleIdentifier</key><string>com.ratiothink.app.dmgtest</string>
 </dict></plist>
 PLIST
@@ -79,7 +79,7 @@ build_dmg() {
 # Populate callbacks (run against the mounted writable volume).
 pop_with_background() {
   local mnt="$1"
-  make_dummy_app "$mnt/RatioThink.app"
+  make_dummy_app "$mnt/Rational.app"
   ln -s /Applications "$mnt/Applications"
   mkdir -p "$mnt/.background"
   cp "$WORK_ROOT/bg.png" "$mnt/.background/background.png"
@@ -88,7 +88,7 @@ pop_styled_reversed() {
   local mnt="$1"
   pop_with_background "$mnt"
   python3 "$DSSTORE_PY" "$mnt" >/dev/null
-  # Swap the pinned icon positions so RatioThink.app sits to the RIGHT of
+  # Swap the pinned icon positions so Rational.app sits to the RIGHT of
   # Applications — the exact regression the verifier must catch.
   VENDOR_DIR="$VENDOR_DIR" python3 - "$mnt/.DS_Store" <<'PY'
 import os, sys
@@ -97,7 +97,7 @@ for name in ("ds_store", "mac_alias"):
     sys.path.insert(0, os.path.join(vendor, name, "src"))
 from ds_store import DSStore
 with DSStore.open(sys.argv[1], "r+") as d:
-    d["RatioThink.app"]["Iloc"] = (450, 200)
+    d["Rational.app"]["Iloc"] = (450, 200)
     d["Applications"]["Iloc"] = (150, 200)
 PY
 }
@@ -122,7 +122,7 @@ expect_fail() {
 # make-styled-dmg.sh must refuse when a volume named RatioThink is already
 # mounted, and must neither write into nor detach that pre-existing volume.
 test_collision_guard() {
-  local app="$WORK_ROOT/collide-app/RatioThink.app"
+  local app="$WORK_ROOT/collide-app/Rational.app"
   make_dummy_app "$app"
   local dummy_rw="$WORK_ROOT/dummy-rw.dmg"
   hdiutil detach "$STAGE_MOUNT" >/dev/null 2>&1 || true
@@ -140,7 +140,7 @@ test_collision_guard() {
     echo "FAIL: make-styled-dmg detached the pre-existing $STAGE_MOUNT volume" >&2
     exit 1
   fi
-  if [[ ! -f "$STAGE_MOUNT/SENTINEL.txt" || -e "$STAGE_MOUNT/RatioThink.app" ]]; then
+  if [[ ! -f "$STAGE_MOUNT/SENTINEL.txt" || -e "$STAGE_MOUNT/Rational.app" ]]; then
     echo "FAIL: make-styled-dmg wrote into the pre-existing $STAGE_MOUNT volume" >&2
     hdiutil detach "$STAGE_MOUNT" >/dev/null 2>&1 || true
     exit 1
@@ -153,17 +153,17 @@ xcrun swift "$BG_SWIFT" "$WORK_ROOT/bg.png" "$GEOMETRY_JSON" >/dev/null
 
 # baseline: the fully styled DMG the production builder produces.
 hdiutil detach "$STAGE_MOUNT" >/dev/null 2>&1 || true
-make_dummy_app "$WORK_ROOT/app/RatioThink.app"
-"$STYLED_SH" "$WORK_ROOT/app/RatioThink.app" "$WORK_ROOT/baseline.dmg" >/dev/null
+make_dummy_app "$WORK_ROOT/app/Rational.app"
+"$STYLED_SH" "$WORK_ROOT/app/Rational.app" "$WORK_ROOT/baseline.dmg" >/dev/null
 expect_pass "baseline" "$WORK_ROOT/baseline.dmg"
 
 # missing Applications symlink → no drag-install target (fails before styling).
-S="$WORK_ROOT/noapps-stage"; mkdir -p "$S"; make_dummy_app "$S/RatioThink.app"
+S="$WORK_ROOT/noapps-stage"; mkdir -p "$S"; make_dummy_app "$S/Rational.app"
 make_dmg "$S" "$WORK_ROOT/noapps.dmg"
 expect_fail "missing-applications-symlink" "$WORK_ROOT/noapps.dmg"
 
 # Applications symlink resolves somewhere other than /Applications.
-S="$WORK_ROOT/wrongtarget-stage"; mkdir -p "$S"; make_dummy_app "$S/RatioThink.app"
+S="$WORK_ROOT/wrongtarget-stage"; mkdir -p "$S"; make_dummy_app "$S/Rational.app"
 ln -s /tmp "$S/Applications"
 make_dmg "$S" "$WORK_ROOT/wrongtarget.dmg"
 expect_fail "applications-symlink-wrong-target" "$WORK_ROOT/wrongtarget.dmg"
@@ -175,15 +175,15 @@ make_dmg "$S" "$WORK_ROOT/noapp.dmg"
 expect_fail "missing-app-bundle" "$WORK_ROOT/noapp.dmg"
 
 # tampered executable → codesign seal must reject it.
-S="$WORK_ROOT/broken-stage"; mkdir -p "$S"; make_dummy_app "$S/RatioThink.app"
+S="$WORK_ROOT/broken-stage"; mkdir -p "$S"; make_dummy_app "$S/Rational.app"
 ln -s /Applications "$S/Applications"
-printf 'tamper' >>"$S/RatioThink.app/Contents/MacOS/RatioThink"
+printf 'tamper' >>"$S/Rational.app/Contents/MacOS/Rational"
 make_dmg "$S" "$WORK_ROOT/broken.dmg"
 expect_fail "broken-codesign-seal" "$WORK_ROOT/broken.dmg"
 
 # valid layout but UNSTYLED (no background, no .DS_Store) → must be rejected so
 # we never silently ship a plain drag-install window.
-S="$WORK_ROOT/unstyled-stage"; mkdir -p "$S"; make_dummy_app "$S/RatioThink.app"
+S="$WORK_ROOT/unstyled-stage"; mkdir -p "$S"; make_dummy_app "$S/Rational.app"
 ln -s /Applications "$S/Applications"
 make_dmg "$S" "$WORK_ROOT/unstyled.dmg"
 expect_fail "unstyled-no-background" "$WORK_ROOT/unstyled.dmg"

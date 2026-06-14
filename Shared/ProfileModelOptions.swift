@@ -28,10 +28,36 @@ public enum ProfileModelOptions {
     /// surfaces this reason — like `isOverLimit`, but the engine can
     /// never load it regardless of host RAM.
     public let unsupportedReason: String?
+    /// Advisory-only cache support warning. Unlike `unsupportedReason`,
+    /// this does not make the option unloadable; it tells the user this
+    /// HF-cache discovery is outside RatioThink's curated support list.
+    public let supportWarning: String?
+    /// True when the slug is in RatioThink's curated, engine-validated
+    /// catalog.
+    public let isCuratedEngineSupported: Bool
     /// `true` for the profile's current model (checkmarked).
     public let isCurrent: Bool
+    /// `true` when the discovered model was installed without a verified
+    /// sha256 (#580 #5 — surfaced as a shield in the picker, mirroring the
+    /// Settings table). The synthesized current entry (not discovered) is
+    /// never unverified.
+    public let isUnverified: Bool
+    /// Structured identity parsed from `slug` (#580) — the picker renders
+    /// `parts.base` prominent + `parts.quant` as a tag, and groups rows by
+    /// `parts.groupKey`. Derived from the slug so it always agrees with it.
+    public let parts: ModelNameParts
 
     public var id: String { slug }
+
+    /// Disambiguating source suffix for the row text (#590). After the
+    /// full-slug dedup a family can list an app-managed copy AND an HF-cache
+    /// copy of the same quant (distinct slugs, same visible tag) — mark the
+    /// HF-cache row so the two differ in the menu, mirroring the chat dropdown
+    /// (`ToolbarModelOptions.Option.sourceTag`) for app-vs-cache parity.
+    /// App-managed rows carry no suffix (the unmarked default).
+    public var sourceTag: String? {
+      source == .huggingFaceCache ? "hf cache" : nil
+    }
 
     public init(slug: String,
                 displayName: String,
@@ -39,7 +65,10 @@ public enum ProfileModelOptions {
                 source: CachedModelSource?,
                 isOverLimit: Bool,
                 isCurrent: Bool,
-                unsupportedReason: String? = nil) {
+                unsupportedReason: String? = nil,
+                isUnverified: Bool = false,
+                supportWarning: String? = nil,
+                isCuratedEngineSupported: Bool = false) {
       self.slug = slug
       self.displayName = displayName
       self.sizeBytes = sizeBytes
@@ -47,6 +76,10 @@ public enum ProfileModelOptions {
       self.isOverLimit = isOverLimit
       self.isCurrent = isCurrent
       self.unsupportedReason = unsupportedReason
+      self.isUnverified = isUnverified
+      self.supportWarning = supportWarning
+      self.isCuratedEngineSupported = isCuratedEngineSupported
+      self.parts = ModelNameParts.parse(slug)
     }
   }
 
@@ -60,13 +93,27 @@ public enum ProfileModelOptions {
   public static func build(models: [InstalledModel],
                            current: String,
                            limitBytes: Int64?) -> [Option] {
+    // Dedup by IDENTITY = the full resolvable slug (review v2 F2): an
+    // app-managed download and an HF-cache copy of the SAME `<repo>/<file>`
+    // slug collapse to one row (app-managed first wins, the resolver's
+    // app-staged-first precedence); distinct files that merely share a leaf
+    // stay apart. Quant distinctness (Q4 vs Q8) falls out for free.
+    let currentIdentity = current.isEmpty ? nil : ModelNameParts.parse(current).identity
     var bySlug: [String: InstalledModel] = [:]
+    var seenIdentity = Set<String>()
     var order: [String] = []
-    for model in models where bySlug[model.filename] == nil {
+    for model in models {
+      let identity = ModelNameParts.parse(model.filename).identity
+      guard seenIdentity.insert(identity).inserted else { continue }
       bySlug[model.filename] = model
       order.append(model.filename)
     }
-    if !current.isEmpty, bySlug[current] == nil {
+    // The profile's current model must always be visible + checkmarked, even
+    // when not installed. Presence-check by IDENTITY (review v2 F3): only
+    // synthesize a "Not downloaded" current row when NO discovered row shares
+    // its identity. When one does, that surviving row is marked current below
+    // (isCurrent is identity-based) — no duplicate, no false "Not downloaded".
+    if let currentIdentity, !seenIdentity.contains(currentIdentity) {
       order.append(current)
     }
 
@@ -87,8 +134,15 @@ public enum ProfileModelOptions {
           sizeBytes: model?.sizeBytes,
           source: model?.source,
           isOverLimit: isOverLimit(sizeBytes: model?.sizeBytes, limitBytes: limitBytes),
-          isCurrent: slug == current,
-          unsupportedReason: reason
+          // Identity-based (review v2 F3): a discovered row whose identity
+          // matches the current model is marked current even when the profile
+          // persisted a different-but-equivalent slug, so the checkmark never
+          // splits onto a synthesized duplicate.
+          isCurrent: ModelNameParts.parse(slug).identity == currentIdentity,
+          unsupportedReason: reason,
+          isUnverified: model?.isUnverified ?? false,
+          supportWarning: model?.supportWarning,
+          isCuratedEngineSupported: model?.isCuratedEngineSupported ?? CuratedModelCatalog.isCuratedModelSlug(slug)
         )
       }
       .sorted { $0.slug < $1.slug }

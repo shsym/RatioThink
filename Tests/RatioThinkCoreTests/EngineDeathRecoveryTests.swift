@@ -373,7 +373,7 @@ final class EngineDeathRecoveryTests: XCTestCase {
     // across the auto + user-Resume paths.
     let canonicalSpec = makeSpec(profileID: "chat")
     let resolverInvocations = OSAllocatedUnfairLock<[String]>(initialState: [])
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { id in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, _ in
       resolverInvocations.withLock { $0.append(id) }
       return .success(canonicalSpec)
     }
@@ -589,8 +589,10 @@ final class EngineDeathRecoveryTests: XCTestCase {
     XCTAssertNotNil(assistant, "the assistant row must remain (it was never cancelled/deleted)")
     XCTAssertTrue(assistant?.content.hasPrefix("⚠️") ?? false,
                   "failed recovery must surface the engine-gone marker, got: \(assistant?.content ?? "nil")")
-    XCTAssertTrue(assistant?.content.contains("Engine stopped unexpectedly") ?? false,
-                  "the surfaced error must be the engine-gone description")
+    // #477: the bubble shows the taxonomy's engine-gone copy, not the raw
+    // HTTPEngineError description.
+    XCTAssertTrue(assistant?.content.contains("The engine stopped while answering") ?? false,
+                  "the surfaced error must be the engine-gone copy, got: \(assistant?.content ?? "nil")")
   }
 
   // MARK: - 9. No recovery gate wired → engineGone surfaces, no hang
@@ -696,6 +698,85 @@ final class EngineDeathRecoveryTests: XCTestCase {
                    "F1: markAssistant wrote the engine-gone warning onto the deleted row")
     XCTAssertFalse(chat.messages.contains { $0.content.contains("⚠️") },
                    "F1: no engine-gone warning may surface in the live transcript")
+  }
+
+  // MARK: - 10b. Superseded send during the recovery wait is not a failure (#337)
+
+  func test_supersededSendDuringRecoveryWait_doesNotMarkFailure() async throws {
+    // F7 (#337): attempt 1 throws engineGone and parks in waitUntilRunning,
+    // then a FRESHER send() supersedes it (the user re-sends). The internal
+    // cancel() bumps generation and deletes the empty assistant row; when the
+    // parked wait returns false (cancellation), the post-await generation guard
+    // must return cleanly — NOT call markAssistant. A recovery-wait cancellation
+    // must behave like the stream-side CancellationError arm: no warning bubble.
+    // Distinct from test #10, which exercises a bare cancel(); here the
+    // supersede also starts a second, winning turn whose answer must be the
+    // only thing left in the transcript.
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let entered = OSAllocatedUnfairLock<Bool>(initialState: false)
+    let gate = ParkingRecoveryGate(onEntered: { entered.withLock { $0 = true } })
+    // First send throws engineGone (-> parks in recovery wait); the second
+    // send is the engine's 2nd call and streams a clean answer.
+    let engine = ProbingChatEngine(
+      firstError: HTTPEngineError.engineGone(detail: "synthetic engine death"),
+      successEvents: [.delta(role: .assistant, content: "fresher reply"), .finish(reason: .stop)]
+    )
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1"),
+      recoveryGate: gate,
+      recoveryPolicy: ChatRecoveryPolicy(maxAttempts: 2, waitForReadyTimeout: 30)
+    )
+
+    // Park reached: attempt 1 threw, classified engine-gone, now waiting.
+    try await waitUntil("recovery wait entered") { entered.withLock { $0 } }
+    // Capture the FIRST turn's row reference: markAssistant would mutate this
+    // exact object, so asserting against it (not via chat.messages, which the
+    // supersede's delete already pruned) is what gives the regression teeth.
+    let supersededRow = try XCTUnwrap(chat.messages.first { $0.role == "assistant" },
+                                      "first turn's assistant row must exist while parked")
+    XCTAssertTrue(supersededRow.content.isEmpty, "row is empty before supersede (no content streamed)")
+
+    // A fresher send() supersedes the parked turn: cancel() bumps generation
+    // and deletes the empty row, then a new task issues the winning turn.
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1"),
+      recoveryGate: gate,
+      recoveryPolicy: ChatRecoveryPolicy(maxAttempts: 2, waitForReadyTimeout: 30)
+    )
+
+    try await waitUntil("fresher turn completes") { !controller.isInFlight }
+
+    // Core F7 assertion: the superseded turn must NOT gain a ⚠️ marker. If the
+    // post-await guard were missing, the stale task's markAssistant would write
+    // the engine-gone warning onto this (deleted) row.
+    XCTAssertFalse(supersededRow.content.contains("⚠️"),
+                   "F7: a superseded send must not be marked as a failure, got: \(supersededRow.content)")
+    XCTAssertFalse(chat.messages.contains { $0.content.contains("⚠️") },
+                   "F7: no failure warning may surface for a cancelled recovery wait")
+    // The fresher turn won and is the only assistant content in the transcript.
+    let assistants = chat.messages.filter { $0.role == "assistant" }
+    XCTAssertEqual(assistants.count, 1, "exactly one assistant row survives (the fresher turn)")
+    XCTAssertEqual(assistants.first?.content, "fresher reply",
+                   "the fresher turn's answer must be the surviving content")
+    XCTAssertEqual(engine.callCount, 2, "one parked first send + one winning second send")
   }
 
   // MARK: - 11. Mid-stream HELPER death is recoverable (#393/#412)
@@ -848,7 +929,7 @@ final class EngineDeathRecoveryTests: XCTestCase {
 
 @available(macOS 14, *)
 private final class HealthySession: PieEngineHost.EngineSession, @unchecked Sendable {
-  func shutdown() async {}
+  func shutdown() async -> EngineShutdownResult { .reaped }
   func checkLiveness() async -> EngineLiveness { .alive }
 }
 
@@ -856,7 +937,7 @@ private final class HealthySession: PieEngineHost.EngineSession, @unchecked Send
 private final class OneShotDeathSession: PieEngineHost.EngineSession, @unchecked Sendable {
   private let lock = NSLock()
   private var fired = false
-  func shutdown() async {}
+  func shutdown() async -> EngineShutdownResult { .reaped }
   func checkLiveness() async -> EngineLiveness {
     lock.lock(); defer { lock.unlock() }
     if !fired { fired = true; return .gone(reason: "synthetic crash") }
@@ -905,9 +986,6 @@ private final class ProbingChatEngine: EngineClient, @unchecked Sendable {
 
   func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
   func models() async throws -> [ModelInfo] { [] }
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    AsyncThrowingStream { $0.finish() }
-  }
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     callCount += 1
     let isFirst = (callCount == 1)
@@ -949,9 +1027,6 @@ private final class ReasoningRetryEngine: EngineClient, @unchecked Sendable {
 
   func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
   func models() async throws -> [ModelInfo] { [] }
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    AsyncThrowingStream { $0.finish() }
-  }
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     callCount += 1
     let isFirst = (callCount == 1)

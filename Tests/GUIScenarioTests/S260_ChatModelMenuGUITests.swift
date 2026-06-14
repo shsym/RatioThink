@@ -3,10 +3,11 @@ import XCTest
 /// S260 — the chat model menu surfaces the seeded GGUF the engine serves.
 ///
 /// The menu reflects the ids the engine ACTUALLY serves (`GET /v1/models`,
-/// via `ChatScaffoldView`'s reconcile, which is gated on engine `.running`):
-/// the menu item label is `ModelDisplayName.leaf(servedID)`, so a served id
-/// of `Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` renders as
-/// `Qwen3-0.6B-Q8_0.gguf`. This needs a real engine serving that GGUF, so —
+/// via `ChatScaffoldView`'s reconcile, which is gated on engine `.running`).
+/// Since #580 the row is rendered as structured identity: a served id of
+/// `Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` clusters under a base-name
+/// section header `Qwen3 0.6B` with the quant `Q8_0` as the pickable row.
+/// This needs a real engine serving that GGUF, so —
 /// like its sibling S258 — it is driven by `Scripts/run-chat-gui-e2e.sh`,
 /// which boots the harness in portable mode against the staged weight and
 /// writes the engine URL into the shared config file. Absent that config
@@ -26,6 +27,8 @@ final class S260_ChatModelMenuGUITests: XCTestCase {
     let pieHome = try XCTUnwrap(
       config["PIE_TEST_GUI_HOME"],
       "\(Self.configPath) must define PIE_TEST_GUI_HOME")
+    let servedModelID = config["PIE_TEST_CHAT_MODEL_PIN"]
+      ?? "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
 
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
     app.launchArguments.append(contentsOf: [
@@ -44,7 +47,7 @@ final class S260_ChatModelMenuGUITests: XCTestCase {
     defer { app.terminate() }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     let newChat = app.buttons["chats.newButton"]
@@ -55,16 +58,69 @@ final class S260_ChatModelMenuGUITests: XCTestCase {
     let modelMenu = app.menuButtons["toolbar.model"]
     XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
                   "model menu missing after creating chat; app tree: \(app.debugDescription)")
-    modelMenu.click()
 
-    // The served id `Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` renders as its
-    // leaf. Status is pinned `.running`, so allow time for the reconcile to
-    // fetch `/v1/models` (the menu only resolves to the served id once
-    // `engineModels` is `.known([...])`).
-    let seededModel = app.menuItems["Qwen3-0.6B-Q8_0.gguf"]
-    XCTAssertTrue(seededModel.waitForExistence(timeout: 10),
+    // First prove resident reconciliation, not merely profile-default fallback:
+    // before `/v1/models` lands the toolbar value is annotated as profile
+    // default. Once the served/resident id is reconciled, the toolbar exposes
+    // the concrete slug as its accessibility value with no default annotation.
+    XCTAssertTrue(waitForResidentModelValue(modelMenu, servedModelID, timeout: 15),
+                  "toolbar.model never reflected reconciled resident model \(servedModelID); title=\(modelMenu.title), value=\(String(describing: modelMenu.value)); app tree: \(app.debugDescription)")
+
+    // After the resident barrier, the menu row can carry the secondary
+    // "(profile default)" annotation while still proving the served model is
+    // present in the selectable model menu. #580: the row text is the quant
+    // tag, but each row's accessibility VALUE still carries the full slug, so
+    // matching the leaf on value remains valid.
+    XCTAssertTrue(waitForModelMenuItem(containingModelLeaf: "Qwen3-0.6B-Q8_0.gguf",
+                                       in: app,
+                                       openedBy: modelMenu,
+                                       timeout: 10),
                   "seeded Qwen3 GGUF missing from chat model menu; app tree: \(app.debugDescription)")
     app.typeKey(.escape, modifierFlags: [])
+  }
+
+  private func waitForResidentModelValue(_ element: XCUIElement,
+                                         _ expectedModelID: String,
+                                         timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      let value = element.value as? String ?? ""
+      let title = element.title
+      if value == expectedModelID,
+         !value.localizedCaseInsensitiveContains("profile default"),
+         !title.localizedCaseInsensitiveContains("(Default)") {
+        return true
+      }
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.3))
+    }
+    return false
+  }
+
+  private func waitForModelMenuItem(containingModelLeaf leaf: String,
+                                    in app: XCUIApplication,
+                                    openedBy modelMenu: XCUIElement,
+                                    timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      modelMenu.click()
+      if menuItem(containingModelLeaf: leaf, in: app).waitForExistence(timeout: 2) {
+        return true
+      }
+      app.typeKey(.escape, modifierFlags: [])
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.3))
+    }
+    return false
+  }
+
+  private func menuItem(containingModelLeaf leaf: String, in app: XCUIApplication) -> XCUIElement {
+    // #580: rows render the structured quant tag (not the leaf), so the stable
+    // target is the row's `ModelRow-<slug>` accessibility IDENTIFIER (the slug
+    // contains the leaf); `identifier` surfaces on the NSMenuItem where `value`
+    // does not. title/label/value kept as a fallback.
+    let predicate = NSPredicate(
+      format: "identifier CONTAINS[c] %@ OR title CONTAINS[c] %@ OR label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+      leaf, leaf, leaf, leaf)
+    return app.menuItems.matching(predicate).firstMatch
   }
 
   /// `xcodebuild test` does not reliably pass ad-hoc shell env vars through to
