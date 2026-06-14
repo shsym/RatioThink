@@ -183,25 +183,44 @@ test_engine_harness_banner_marker_is_current() {
 
 # Termination-source classifier (#545 / #549): a fresh crash report must be
 # reported as a CRASH; an empty crash dir must read as "not a process crash".
+# Runs the classifier under the SAME `set -euo pipefail` the wrapper uses, and
+# asserts the verdict runs to COMPLETION (the live-pids line + closing rule) —
+# the live run revealed the classifier aborting mid-verdict under macOS
+# /bin/bash 3.2 when `pgrep` found no match (pipefail+errexit killed the
+# `var="$(pgrep|tr)"` assignment). Asserting only the early lines would miss it.
 test_termination_classification() {
   source "$ROOT/Scripts/e2e-prep.sh"
   local tmp; tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   mkdir -p "$tmp/crash"
 
-  # Empty crash dir, since=now → not a crash.
-  local since out
+  # Empty crash dir, since=now → not a crash. Capture rc too: the classifier
+  # must RETURN 0 (run to completion), not die under set -e mid-pgrep.
+  local since out rc
   since="$(e2e_run_start_epoch)"
-  out="$(RATIOTHINK_DIAG_CRASH_DIR="$tmp/crash" e2e_classify_app_termination "selftest" "$since" 2>&1)"
+  set +e
+  out="$(set -euo pipefail; RATIOTHINK_DIAG_CRASH_DIR="$tmp/crash" \
+         e2e_classify_app_termination "selftest" "$since" 2>&1)"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL: classifier aborted (rc=$rc) under set -euo pipefail — pgrep no-match must not kill it" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
   require_contains "$out" "not a process crash"
+  require_contains "$out" "live Rational:"          # reached the live-pids line
+  require_contains "$out" "deep bundle:"            # reached the closing block
 
   # Seed a fresh Rational crash report → reported as CRASH. Classifier only
   # counts reports with mtime >= since, so stamp it at/after the reference.
   printf 'fake' >"$tmp/crash/Rational-2026-01-01-000000.ips"
   since="$(e2e_run_start_epoch)"
   touch "$tmp/crash/Rational-2026-01-01-000000.ips"   # mtime = now (>= since)
-  out="$(RATIOTHINK_DIAG_CRASH_DIR="$tmp/crash" e2e_classify_app_termination "selftest" "$since" 2>&1)"
+  out="$(set -euo pipefail; RATIOTHINK_DIAG_CRASH_DIR="$tmp/crash" \
+         e2e_classify_app_termination "selftest" "$since" 2>&1)"
   require_contains "$out" "CRASH: Rational-2026-01-01-000000.ips"
+  require_contains "$out" "deep bundle:"            # still runs to completion
 }
 
 test_requires_tcc_before_starting_engine

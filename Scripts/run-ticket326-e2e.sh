@@ -83,7 +83,10 @@ echo "e2e326: chat-apc wasm = $WASM"
 # `pkill -f 'pie .*serve'` would also kill a developer's seated/manual engine
 # (or a concurrent worker session's), the exact unscoped-reap hazard #545
 # absorbed (#493).
-engine_serve_pids() { pgrep -f 'pie .*serve' 2>/dev/null | sort -u; }
+# `|| true` guards against macOS /bin/bash 3.2 aborting `var="$(pipeline)"` under
+# `set -e`+`pipefail` when pgrep finds no engine (rc 1) — the common cold-start
+# case. Without it the snapshot line itself would kill the script (#545 / #493).
+engine_serve_pids() { pgrep -f 'pie .*serve' 2>/dev/null | sort -u || true; }
 PIE_SERVE_PIDS_BEFORE="$(engine_serve_pids)"
 cleanup() {
   local pid

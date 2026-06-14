@@ -162,10 +162,15 @@ EOF
   [ "$found_crash" -eq 0 ] && \
     echo "$tag:   no fresh Rational/Helper/pie crash report since run start — not a process crash" >&2
 
+  # `|| true` is load-bearing: macOS /bin/bash is 3.2, where `var="$(pipeline)"`
+  # aborts the whole script under `set -e` + `set -o pipefail` (the wrapper sets
+  # both) when the pipeline's rc is non-zero — and `pgrep` exits 1 on NO match,
+  # which is the common "no stray instance" case. Without the guard the
+  # classifier dies mid-verdict exactly when it has the most to report (#545).
   local app_pids helper_pids engine_pids
-  app_pids="$(pgrep -x Rational 2>/dev/null | tr '\n' ' ')"
-  helper_pids="$(pgrep -x RationalHelper 2>/dev/null | tr '\n' ' ')"
-  engine_pids="$(pgrep -f 'pie .*serve' 2>/dev/null | tr '\n' ' ')"
+  app_pids="$(pgrep -x Rational 2>/dev/null | tr '\n' ' ' || true)"
+  helper_pids="$(pgrep -x RationalHelper 2>/dev/null | tr '\n' ' ' || true)"
+  engine_pids="$(pgrep -f 'pie .*serve' 2>/dev/null | tr '\n' ' ' || true)"
   echo "$tag:   live Rational: ${app_pids:-none}  Helper: ${helper_pids:-none}  pie-serve: ${engine_pids:-none}" >&2
   [ -n "$app_pids" ] && \
     echo "$tag:   NOTE: a Rational instance is still alive — possible stray/seated collision (not this run's intentional terminate)" >&2
