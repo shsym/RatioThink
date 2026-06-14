@@ -284,6 +284,35 @@ extension XCUIElement {
   }
 }
 
+/// Open a toolbar menu button and wait until `item` appears, surviving a
+/// mid-test not-key transition (#545). A menu cannot be re-activated while open
+/// (activation dismisses it), so re-activate the app and RE-OPEN the menu until
+/// the item shows. On success the menu is left OPEN with `item` present — the
+/// caller clicks it or sends Escape. Fails loudly after `attempts` rounds.
+@MainActor
+func openMenuAndWaitForItem(
+  _ menuButton: XCUIElement,
+  item: XCUIElement,
+  in app: XCUIApplication,
+  attempts: Int = 4,
+  file: StaticString = #filePath,
+  line: UInt = #line
+) {
+  for _ in 0..<attempts {
+    app.activate()
+    guard menuButton.waitForHittable(timeout: 5) else { continue }
+    menuButton.click()
+    if item.waitForExistence(timeout: 4) { return }
+    // Item absent — the click may have landed on a not-key window or the menu
+    // rendered stale. Dismiss any open menu and retry after re-activating.
+    app.typeKey(.escape, modifierFlags: [])
+    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
+  }
+  XCTFail("menu item did not appear after opening the menu within \(attempts) attempts "
+            + "(not-key focus race?); app tree: \(app.debugDescription)",
+          file: file, line: line)
+}
+
 extension XCUIApplication {
   /// Launch, reach `.runningForeground`, then RE-activate until `landmark` is
   /// actually hittable — defeating the not-key multi-launch focus race (#545).

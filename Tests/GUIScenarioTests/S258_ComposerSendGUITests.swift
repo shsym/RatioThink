@@ -109,6 +109,11 @@ final class S258_ComposerSendGUITests: XCTestCase {
       needle
     )
     while Date() < deadline {
+      // Keep the app key during the long stream wait: a later multi-launch can
+      // lose key mid-test, collapsing the AX tree to Disabled so the assistant
+      // bubble is never found even though the engine streamed it (#545). Cheap
+      // to re-activate each poll; it does not disturb the HTTP stream.
+      app.activate()
       let assistantMessages = app.descendants(matching: .any)
         .matching(identifier: "message.assistant")
       for index in 0..<assistantMessages.count {

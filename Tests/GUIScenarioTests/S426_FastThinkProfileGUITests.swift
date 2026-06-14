@@ -177,6 +177,9 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
                                 needle, needle)
     while Date() < deadline {
+      // Keep the app key during the long stream wait (#545): a mid-test key
+      // loss collapses the AX tree to Disabled so the reply is never found.
+      app.activate()
       let assistantMessages = app.descendants(matching: .any)
         .matching(identifier: "message.assistant")
       for index in 0..<assistantMessages.count {

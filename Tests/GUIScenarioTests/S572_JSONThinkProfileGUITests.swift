@@ -59,24 +59,24 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
     let modelMenu = app.menuButtons["toolbar.model"]
     XCTAssertTrue(modelMenu.waitForExistence(timeout: 10),
                   "model menu missing after creating chat; app tree: \(app.debugDescription)")
-    modelMenu.click()
     let seededModel = app.menuItems["Qwen3-0.6B-Q8_0.gguf"]
-    XCTAssertTrue(seededModel.waitForExistence(timeout: 15),
-                  "seeded Qwen3 GGUF missing from chat model menu; app tree: \(app.debugDescription)")
+    // Open the model menu surviving a mid-test not-key transition (#545).
+    openMenuAndWaitForItem(modelMenu, item: seededModel, in: app)
     app.typeKey(.escape, modifierFlags: [])
 
     // 1) JSON Think appears in the profile switcher and is selectable.
     let profileMenu = app.menuButtons["toolbar.profile"]
     XCTAssertTrue(profileMenu.waitForExistence(timeout: 10),
                   "profile switcher (toolbar.profile) missing; app tree: \(app.debugDescription)")
-    profileMenu.click()
     let jsonThinkItem = app.menuItems["json-think"]
-    XCTAssertTrue(jsonThinkItem.waitForExistence(timeout: 10),
-                  "seeded 'json-think' profile missing from the chat profile switcher; app tree: \(app.debugDescription)")
-    XCTAssertTrue(jsonThinkItem.isEnabled, "'json-think' profile menu item was not selectable")
+    openMenuAndWaitForItem(profileMenu, item: jsonThinkItem, in: app)
+    // Action-based: wait until the item is genuinely tappable, not a one-shot
+    // `.isEnabled` snapshot that races the not-key window transition (#545).
+    XCTAssertTrue(jsonThinkItem.waitForHittable(timeout: 5),
+                  "'json-think' profile menu item not tappable; app tree: \(app.debugDescription)")
     jsonThinkItem.click()
 
-    guard waitForMenuButtonTitleContaining(profileMenu, "json-think", timeout: 10) else {
+    guard waitForMenuButtonTitleContaining(profileMenu, "json-think", in: app, timeout: 10) else {
       XCTFail("toolbar.profile did not reflect the 'json-think' selection (title=\(profileMenu.title)); app tree: \(app.debugDescription)")
       return
     }
@@ -122,9 +122,13 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
 
   private func waitForMenuButtonTitleContaining(_ element: XCUIElement,
                                                 _ needle: String,
+                                                in app: XCUIApplication,
                                                 timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
+      // Keep the app key while polling the toolbar title: a mid-test not-key
+      // transition collapses the AX tree so `.title` reads stale/empty (#545).
+      app.activate()
       if element.title.localizedCaseInsensitiveContains(needle) {
         return true
       }
@@ -146,6 +150,8 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
     let predicate = NSPredicate(format: "value MATCHES %@ OR label MATCHES %@",
                                 "^\\s*[\\{\\[\"\\-0-9tfn].*", "^\\s*[\\{\\[\"\\-0-9tfn].*")
     while Date() < deadline {
+      // Keep the app key during the stream wait so the AX tree stays live (#545).
+      app.activate()
       if app.descendants(matching: .staticText).matching(predicate).count >= 1 {
         return true
       }
