@@ -345,7 +345,16 @@ struct RatioThinkApp: App {
     // Helper-driven engine path (`HelperXPCClient()`) and never honors the
     // `PIE_TEST_ENGINE_BASE_URL` seam.
     guard let raw = HelperConfig.testEngineBaseURLOverride() else { return nil }
+    #if DEBUG
     return URL(string: raw)
+    #else
+    // Defense in depth (#340): the `HelperConfig` gate already returns `nil` in
+    // a Release build, so reaching here means the build gate was somehow wrong.
+    // Refuse rather than silently redirect a shipped app at an attacker-supplied
+    // URL — mirrors the call-site `preconditionFailure` that
+    // `HelperXPCListener.startAnonymous` raises when its own gate is violated.
+    preconditionFailure("PIE_TEST_ENGINE_BASE_URL resolved in a Release build — refuse to redirect the engine endpoint away from the real Helper-driven path")
+    #endif
   }
 
   private static func appPreferencesDefaults() -> UserDefaults {
