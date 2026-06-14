@@ -107,6 +107,7 @@ xcodebuild -project RatioThink.xcodeproj \
   -only-testing:RatioThinkGUITests/S365_CachedModelDiscoveryGUITests/test_staged_cache_model_surfaces_as_hf_cache_row_in_models_tab \
   -only-testing:RatioThinkGUITests/S365_CachedModelDiscoveryGUITests/test_split_gguf_cache_model_shows_unsupported_badge_in_models_tab \
   -only-testing:RatioThinkGUITests/S365_CachedModelDiscoveryGUITests/test_split_gguf_cache_model_shows_unsupported_reason_in_picker \
+  -only-testing:RatioThinkGUITests/S365_CachedModelDiscoveryGUITests/test_hf_cache_model_shows_source_suffix_in_picker \
   -only-testing:RatioThinkGUITests/S514_AddModelDuplicateGUITests/test_add_model_marks_installed_and_hf_cache_curated_rows \
   ENABLE_CODE_COVERAGE=NO 2>&1 | tee "$LOG"
 status=${PIPESTATUS[0]}

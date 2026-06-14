@@ -205,6 +205,9 @@ struct ProfileEditor: View {
   /// synthesized current-model entry).
   private func modelOptionText(_ option: ProfileModelOptions.Option) -> String {
     var text = option.parts.quantOrLeaf
+    // An HF-cache source suffix disambiguates a same-quant app-vs-cache pair the
+    // full-slug dedup keeps as two rows (#590, mirrors the chat dropdown).
+    if let tag = option.sourceTag { text += " (\(tag))" }
     if let size = option.sizeBytes {
       text += "  \(InstalledModels.formattedSize(size))"
     }
