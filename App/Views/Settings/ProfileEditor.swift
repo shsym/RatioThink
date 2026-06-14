@@ -66,24 +66,21 @@ struct ProfileEditor: View {
       .padding(20)
     }
     .accessibilityIdentifier("ProfileEditor")
-    // Re-run when the edited profile changes AND on a guardrail-dial write —
-    // the latter via `guardrailRevision` so a fraction change in the Models
-    // tab recomputes the picker's over-limit badges (#334).
-    .task(id: RefreshKey(entryURL: entry.url,
-                         guardrailRevision: guardrailRevision.revision)) {
+    .task(id: entry.url) {
       resetEditableDefaults(from: entry.profile)
       await refreshModelOptions(current: entry.profile?.model ?? "")
     }
     .onChange(of: downloads.completionTick) { _, _ in
       Task { await refreshModelOptions(current: entry.profile?.model ?? "") }
     }
-  }
-
-  /// Composite `.task(id:)` key: re-scan when the edited profile changes
-  /// or the guardrail dial writes a new fraction.
-  private struct RefreshKey: Equatable {
-    let entryURL: URL
-    let guardrailRevision: Int
+    // A guardrail-dial write recomputes ONLY the picker over-limit badges
+    // (#334). It deliberately mirrors the download-tick onChange and does
+    // NOT re-run the draft-reset task: folding the revision into
+    // `.task(id:)` would re-run `resetEditableDefaults` and discard
+    // unsaved systemPrompt/temperature/topP edits on a dial change.
+    .onChange(of: guardrailRevision.revision) { _, _ in
+      Task { await refreshModelOptions(current: entry.profile?.model ?? "") }
+    }
   }
 
   // MARK: - Sections
