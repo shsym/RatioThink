@@ -1136,7 +1136,13 @@ final class PieEngineHostTests: XCTestCase {
         if runningCount == 1 { firstRunning.fulfill() }
         if runningCount == 2 { restarted = true; secondRunning.fulfill() }
       case .stopped:
-        if !hitStopped { hitStopped = true; stopped.fulfill() }
+        // Only the stop AFTER the first .running counts. `observe()` replays
+        // the host's current status to a new observer, and the host starts in
+        // `.stopped`, so without the `runningCount >= 1` guard this fulfils on
+        // that initial replay — `wait(for: [stopped])` would then return before
+        // stop#1 actually completes and the following `start()` would race the
+        // still-in-flight `.stopping` shutdown (rejected as `.alreadyRunning`).
+        if runningCount >= 1, !hitStopped { hitStopped = true; stopped.fulfill() }
       case .failed(.engineGone, _):
         if restarted { sawEngineGoneAfterRestart = true }
       default:
