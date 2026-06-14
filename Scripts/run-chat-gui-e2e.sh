@@ -26,6 +26,7 @@ cleanup() {
     kill "$ENGINE_PID" >/dev/null 2>&1 || true
     wait "$ENGINE_PID" >/dev/null 2>&1 || true
   fi
+  e2e_restore_crash_reporter
 }
 trap cleanup EXIT
 
@@ -53,6 +54,13 @@ ln "$GGUF_REAL" "$GGUF_DEST" 2>/dev/null || cp "$GGUF_REAL" "$GGUF_DEST"
 
 mkdir -p "$ENGINE_HOME" "$GUI_HOME"
 rm -f "$URL_FILE" "$CONFIG_FILE"
+
+# All gates passed and we're about to launch the app under xcodebuild: mute the
+# "Rational quit unexpectedly" modal so a mid-test app crash can't wedge an
+# unattended run, and mark run start so termination classification only counts
+# crash reports from THIS run (#545 / #549). Restored in cleanup().
+RUN_START_EPOCH="$(e2e_run_start_epoch)"
+e2e_silence_crash_reporter "$TAG"
 
 echo "chat gui e2e: generating Xcode project"
 Scripts/genproject.sh
@@ -98,6 +106,7 @@ echo "chat gui e2e: config=$CONFIG_FILE"
 echo "chat gui e2e: retained run root: $RUN_ROOT"
 echo "chat gui e2e: running XCUITest"
 
+set +e
 xcodebuild -project RatioThink.xcodeproj \
   -scheme RatioThinkGUITests \
   -destination 'platform=macOS,arch=arm64' \
@@ -109,6 +118,16 @@ xcodebuild -project RatioThink.xcodeproj \
   -only-testing:RatioThinkGUITests/S520_MultiPartContentGUITests/test_external_multipart_client_succeeds_and_gui_chat_still_streams \
   -only-testing:RatioThinkGUITests/S572_JSONThinkProfileGUITests/test_json_think_profile_selectable_and_streams_json_reply \
   ENABLE_CODE_COVERAGE=NO
+XCODEBUILD_RC=$?
+set -e
+# On xcodebuild failure, attribute the termination source (genuine crash vs
+# stray-instance collision vs clean teardown) instead of leaving the reader to
+# guess why Rational "disappeared" (#545).
+if [ "$XCODEBUILD_RC" -ne 0 ]; then
+  echo "$TAG: xcodebuild test failed (rc=$XCODEBUILD_RC)" >&2
+  e2e_classify_app_termination "$TAG" "$RUN_START_EPOCH"
+  exit "$XCODEBUILD_RC"
+fi
 
 # The seeded Qwen3-0.6B is a *thinking* model: it can emit the answer inside
 # its <think> reasoning (persisted to ZREASONING) and not reach final ZCONTENT

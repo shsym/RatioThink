@@ -54,7 +54,17 @@ open class IsolatedTestCase: XCTestCase {
   /// PIDs of pie subprocesses spawned during this test. CLIRunner
   /// (and any other subprocess launcher) MUST register the pid via
   /// `trackSubprocess(_:)` so tearDown can SIGKILL+reap stragglers.
+  ///
+  /// `pidSink` is invoked from inside the async launch path
+  /// (`PieControlLauncher.launchEngine` → `spec.pidSink?(...)`), which
+  /// runs on an arbitrary cooperative-pool thread — NOT the XCTest
+  /// thread that drives `invokeTest`'s post-test `reapTrackedSubprocesses`.
+  /// Appending and draining the array from two threads is a data race
+  /// (lost pid → leaked engine into the next test's namespace, or a
+  /// torn `Array` reallocation → crash). `pidLock` serializes every
+  /// access to `trackedPIDs` (#388).
   private var trackedPIDs: [pid_t] = []
+  private let pidLock = NSLock()
 
   /// Where pie is expected to write its bound HTTP port on `:0`.
   /// `boundHTTPPort()` polls this with a timeout. The pie engine
@@ -135,7 +145,11 @@ open class IsolatedTestCase: XCTestCase {
   // MARK: - subprocess support
 
   /// Record a pid so the post-test reap loop SIGKILLs + waitpids it.
+  /// Safe to call from the async launch thread (`pidSink`); the lock
+  /// serializes against `reapTrackedSubprocesses` on the XCTest thread.
   public func trackSubprocess(_ pid: pid_t) {
+    pidLock.lock()
+    defer { pidLock.unlock() }
     trackedPIDs.append(pid)
   }
 
@@ -144,7 +158,11 @@ open class IsolatedTestCase: XCTestCase {
   /// subclass can assert it actually routed its spawned engine pid into
   /// the reap net via `trackSubprocess(_:)` — engine-free, no real spawn
   /// required (the pid-reap wiring guard).
-  internal var trackedSubprocessCountForTesting: Int { trackedPIDs.count }
+  internal var trackedSubprocessCountForTesting: Int {
+    pidLock.lock()
+    defer { pidLock.unlock() }
+    return trackedPIDs.count
+  }
 
   /// Build env for spawning the pie binary. Callers MUST pass this to
   /// `Process.environment` (never inherit). The base is the parent
@@ -280,7 +298,17 @@ open class IsolatedTestCase: XCTestCase {
   /// clean teardown while leaking a pie subprocess into the next
   /// test's namespace.
   private func reapTrackedSubprocesses() {
-    for pid in trackedPIDs where pid > 0 {
+    // Snapshot + clear under the lock, then do the blocking SIGKILL +
+    // waitpid work OUTSIDE it — holding `pidLock` across `waitpid`'s
+    // 500ms window would block a late `trackSubprocess` from the launch
+    // thread. invokeTest only calls this after super.invokeTest returns
+    // (all spawning done), so the snapshot is complete.
+    pidLock.lock()
+    let pids = trackedPIDs
+    trackedPIDs.removeAll()
+    pidLock.unlock()
+
+    for pid in pids where pid > 0 {
       let killRC = kill(pid, SIGKILL)
       if killRC != 0 && errno != ESRCH {
         XCTFail("IsolatedTestCase: kill(\(pid), SIGKILL) failed with errno=\(errno) (\(String(cString: strerror(errno))))")
@@ -302,7 +330,6 @@ open class IsolatedTestCase: XCTestCase {
         XCTFail("IsolatedTestCase: pid \(pid) survived SIGKILL + 500ms waitpid window")
       }
     }
-    trackedPIDs.removeAll()
   }
 }
 

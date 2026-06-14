@@ -159,58 +159,54 @@ FAKE_PGREP
     fi
   done
 }
-# Direct contract assertions on _e2e_hf_model_cached, independent of the
-# wrapper's gate ordering ( F2): only a RESOLVED WEIGHT artifact
-# counts as cached. The bare-dir case above short-circuits at `[ -d snapshots ]`
-# and never reaches the find predicate, so these pin the predicate itself — a
-# future loosening (dropping -L, the weight-extension filter, or reverting to
-# `[ -d snapshots ]`) is caught here.
-test_hf_model_cached_helper_contract() {
+# The GGUF-fixture caching contract (partial/dangling-state rejection) is now
+# enforced end-to-end by test_missing_gguf_fixture_is_not_accepted above, which
+# drives the wrapper against the live Scripts/stage-test-model.sh gate. The
+# former `_e2e_hf_model_cached` / `e2e_ensure_hf_model` helpers this wrapper
+# once used were orphaned by that migration and removed (#545 / #383), so the
+# direct-helper contract test that pinned them was removed here too.
+
+# The "engine harness started too early" negative assertions above are only
+# meaningful while their needle matches the wrapper's actual banner. If the
+# wrapper reworded the echo, the negative checks would pass vacuously (never
+# matching anything) and silently stop guarding ordering — the exact self-test
+# drift #545 absorbed (#500). Pin the coupling: the banner the guards key on
+# MUST exist verbatim in the wrapper source.
+test_engine_harness_banner_marker_is_current() {
+  if ! grep -qF "starting portable GGUF engine harness" "$SCRIPT"; then
+    echo "FAIL: run-chat-gui-e2e.sh no longer prints 'starting portable GGUF engine harness'" >&2
+    echo "      — the ordering negative-assertions are now vacuous; update both this" >&2
+    echo "      self-test's needle and the wrapper banner together." >&2
+    exit 1
+  fi
+}
+
+# Termination-source classifier (#545 / #549): a fresh crash report must be
+# reported as a CRASH; an empty crash dir must read as "not a process crash".
+test_termination_classification() {
   source "$ROOT/Scripts/e2e-prep.sh"
-  local tmp rev="abc123"
-  tmp="$(mktemp -d)"
+  local tmp; tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "$tmp/crash"
 
-  _assert_cached() {  # <dir> <want 0|1> <label>
-    local d="$1" want="$2" label="$3" got
-    if _e2e_hf_model_cached "$d"; then got=0; else got=1; fi
-    if [ "$got" -ne "$want" ]; then
-      echo "FAIL: helper contract [$label] — _e2e_hf_model_cached=$got want=$want" >&2
-      exit 1
-    fi
-  }
+  # Empty crash dir, since=now → not a crash.
+  local since out
+  since="$(e2e_run_start_epoch)"
+  out="$(RATIOTHINK_DIAG_CRASH_DIR="$tmp/crash" e2e_classify_app_termination "selftest" "$since" 2>&1)"
+  require_contains "$out" "not a process crash"
 
-  # 1) bare hub dir, no snapshots/                         -> not cached
-  mkdir -p "$tmp/bare/blobs" "$tmp/bare/refs"
-  _assert_cached "$tmp/bare" 1 "bare hub dir"
-
-  # 2) empty snapshots/ tree                               -> not cached
-  mkdir -p "$tmp/empty/snapshots/$rev"
-  _assert_cached "$tmp/empty" 1 "empty snapshots"
-
-  # 3) metadata-only resolved (config.json + stray .DS_Store, no weight) -> not cached (F1)
-  mkdir -p "$tmp/meta/snapshots/$rev"
-  printf '{}' >"$tmp/meta/snapshots/$rev/config.json"
-  printf 'x'  >"$tmp/meta/snapshots/$rev/.DS_Store"
-  _assert_cached "$tmp/meta" 1 "metadata-only + stray, no weight"
-
-  # 4) dangling weight symlink (blob missing)              -> not cached
-  mkdir -p "$tmp/dangling/snapshots/$rev" "$tmp/dangling/blobs"
-  printf '{}' >"$tmp/dangling/snapshots/$rev/config.json"
-  ln -s "../../blobs/deadbeef" "$tmp/dangling/snapshots/$rev/model.safetensors"
-  _assert_cached "$tmp/dangling" 1 "dangling weight symlink"
-
-  # 5) resolved weight (symlink -> real blob)              -> cached
-  mkdir -p "$tmp/ok/snapshots/$rev" "$tmp/ok/blobs"
-  printf 'SAFE' >"$tmp/ok/blobs/deadbeef"
-  ln -s "../../blobs/deadbeef" "$tmp/ok/snapshots/$rev/model.safetensors"
-  _assert_cached "$tmp/ok" 0 "resolved weight"
-
-  echo "test-run-chat-gui-e2e: _e2e_hf_model_cached contract OK"
+  # Seed a fresh Rational crash report → reported as CRASH. Classifier only
+  # counts reports with mtime >= since, so stamp it at/after the reference.
+  printf 'fake' >"$tmp/crash/Rational-2026-01-01-000000.ips"
+  since="$(e2e_run_start_epoch)"
+  touch "$tmp/crash/Rational-2026-01-01-000000.ips"   # mtime = now (>= since)
+  out="$(RATIOTHINK_DIAG_CRASH_DIR="$tmp/crash" e2e_classify_app_termination "selftest" "$since" 2>&1)"
+  require_contains "$out" "CRASH: Rational-2026-01-01-000000.ips"
 }
 
 test_requires_tcc_before_starting_engine
 test_removes_stale_config_on_exit
 test_missing_gguf_fixture_is_not_accepted
-test_hf_model_cached_helper_contract
+test_engine_harness_banner_marker_is_current
+test_termination_classification
 echo "test-run-chat-gui-e2e: PASS"
