@@ -51,7 +51,7 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5))
     XCTAssertTrue(send.isEnabled, "composer.send disabled after typing prompt; app tree: \(app.debugDescription)")
-    app.readyForInput(send).click()
+    try app.readyForInput(send).click()
 
     // Send is blocked behind the no-model gate — never a silent load.
     // #397: assert the gate via its state-independent prompt container,
@@ -77,7 +77,7 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
     // states macOS can collapse child accessibility identifiers into the
     // parent prompt, so assert the stable transition: the Download button
     // disappears rather than pinning the row's nested Cancel identifier.
-    app.readyForInput(download).click()
+    try app.readyForInput(download).click()
     XCTAssertTrue(download.waitForNonExistence(timeout: 5),
                   "tapping Download must replace the Download affordance with the in-flight progress row; app tree: \(app.debugDescription)")
   }
@@ -114,12 +114,12 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5))
     XCTAssertTrue(send.isEnabled, "composer.send disabled after typing prompt; app tree: \(app.debugDescription)")
-    app.readyForInput(send).click()
+    try app.readyForInput(send).click()
 
     XCTAssertTrue(noModelPrompt(in: app).waitForExistence(timeout: 5))
     let download = missingModelDownloadButton(in: app)
     XCTAssertTrue(download.waitForExistence(timeout: 5))
-    app.readyForInput(download).click()
+    try app.readyForInput(download).click()
 
     // The fake stream completes → onDownloaded fires once → the prompt
     // dismisses (and the engine start is kicked). Assert the gate's

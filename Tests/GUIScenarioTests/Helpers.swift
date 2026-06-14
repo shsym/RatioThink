@@ -274,9 +274,15 @@ extension XCUIApplication {
   /// synthesize event"), which cascades into spurious "control absent"
   /// failures downstream (#559). Activating and gating on `isHittable`
   /// waits the focus settle out before the event is sent.
+  ///
+  /// THROWS on exhaustion rather than returning a dead element: a caller
+  /// like `try app.readyForInput(send).click()` then aborts on the `try`
+  /// before the `.click()` runs, so the clean "stuck not-key" diagnostic
+  /// is preserved instead of being buried by a re-triggered synthesize
+  /// -event failure on the bogus click.
   @discardableResult
   func readyForInput(_ element: XCUIElement, timeout: TimeInterval = 15,
-                     file: StaticString = #filePath, line: UInt = #line) -> XCUIElement {
+                     file: StaticString = #filePath, line: UInt = #line) throws -> XCUIElement {
     XCTAssertTrue(element.waitForExistence(timeout: timeout),
                   "element never appeared", file: file, line: line)
     for _ in 0..<3 {
@@ -284,8 +290,14 @@ extension XCUIApplication {
       activate()
       if element.waitForHittable(timeout: timeout) { return element }
     }
-    XCTFail("element never became hittable — app appears stuck not-key",
-            file: file, line: line)
-    return element
+    throw NotKeyError.notHittable
   }
+}
+
+/// Thrown by `XCUIApplication.readyForInput` when the element never becomes
+/// hittable — the app appears stuck not-key. Carries a readable message so
+/// the test failure names the real cause, not a synthesize-event timeout.
+enum NotKeyError: Error, CustomStringConvertible {
+  case notHittable
+  var description: String { "element never became hittable — app appears stuck not-key" }
 }
