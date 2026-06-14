@@ -12,6 +12,11 @@ struct ProfileEditor: View {
   /// hands back a refreshed `entry`. .
   var onModelChanged: () -> Void = {}
   @EnvironmentObject private var profileStore: ProfileStore
+  /// Bumped by the Models-tab guardrail dial on a fraction write. Keying
+  /// the model-options refresh on it recomputes the over-limit badges
+  /// against the just-saved ceiling instead of letting them go stale
+  /// until this view reappears (#334).
+  @EnvironmentObject private var guardrailRevision: GuardrailRevision
   @State private var showAdvanced: Bool = false
   /// Discovered model options (app-managed + HF cache), each carrying
   /// size + over-limit / unsupported state for the model-size guardrail.
@@ -49,7 +54,20 @@ struct ProfileEditor: View {
       .padding(20)
     }
     .accessibilityIdentifier("ProfileEditor")
-    .task { await refreshModelOptions(current: entry.profile?.model ?? "") }
+    // Re-run on profile-model change AND on a guardrail-dial write — the
+    // latter via `guardrailRevision` so a fraction change in the Models
+    // tab recomputes the picker's over-limit badges (#334).
+    .task(id: RefreshKey(model: entry.profile?.model ?? "",
+                         guardrailRevision: guardrailRevision.revision)) {
+      await refreshModelOptions(current: entry.profile?.model ?? "")
+    }
+  }
+
+  /// Composite `.task(id:)` key: re-scan when the profile's model changes
+  /// or the guardrail dial writes a new fraction.
+  private struct RefreshKey: Equatable {
+    let model: String
+    let guardrailRevision: Int
   }
 
   // MARK: - Sections
@@ -258,7 +276,10 @@ struct ProfileEditor: View {
 
   @MainActor
   private func refreshModelOptions(current: String) async {
-    let policy = ModelMemoryGuardrail.defaultPolicy
+    // Use the LIVE dial-derived policy, not the 0.65-pinned `defaultPolicy`,
+    // and the SAME derivation the Helper's launch gate uses — so the
+    // picker's "exceeds …" badge can't disagree with what actually loads (#334).
+    let policy = ModelMemoryGuardrail.livePolicy()
     memoryPolicy = policy
     // Filesystem walks (app dir + HF cache) run off the main actor. HF
     // rows survive a models-dir prepare/scan failure; that failure still

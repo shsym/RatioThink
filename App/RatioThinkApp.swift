@@ -55,6 +55,9 @@ struct RatioThinkApp: App {
   /// check (and its single network call) fires once per process; RootView
   /// observes `pending` to render the non-modal update banner.
   @StateObject private var updateAvailability = UpdateAvailabilityModel()
+  // Cross-tab tick so the Profiles-tab ProfileEditor recomputes its
+  // picker over-limit badges when the Models-tab guardrail dial writes (#334).
+  @StateObject private var guardrailRevision = GuardrailRevision()
 
   @MainActor
   init() {
@@ -457,6 +460,7 @@ struct RatioThinkApp: App {
         .environmentObject(downloadController)
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
+        .environmentObject(guardrailRevision)
     }
   }
 }
