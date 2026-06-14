@@ -85,15 +85,19 @@ that wrapper, not bare `xcodebuild`.
 | Suite | Area | Proves | Boundary / real model? | Run via |
 |---|---|---|---|---|
 | `S5_AppWindowShellGUITests` | settings/shell | simplified Chat/API shell vocabulary (Chats + API Endpoints nav, chat search, #422), ⌘, → Settings (4 tabs, no API tab) | mock | `test-gui-shell` |
+| `S411_AppMenuUpdateGUITests` | settings/shell | app main-menu surface + New Chat removal (#411) | mock | full `test-gui` |
+| `S421_SamplingPopoverGUITests` | chat/sampling | sampling popover (#421): Temperature + Top-p carry labelled tick scales; Max-tokens slider removed (now an engine-launch concern, #438) | mock (engine-free; edits local `ChatSampling`) | full `test-gui` |
 | `S7_FirstLaunchWizardGUITests` | first-launch | wizard flow (register / approval-blocked) | mock (faked login-item) | `test-gui-first-launch` |
 | `S7_FirstLaunchWizardPackagedArtifactGUITests` | package/install | Release `.app` first-launch persists across relaunch; launched-artifact path | packaged-signed-app | `test-gui-first-launch-package` |
 | `S7_FirstLaunchWizardPackagedModelDownloadGUITests` | package/install | packaged `.app`: first-launch wizard → Settings model **download** (fixture lands file + probe) → no-model gate offers **Load** (not Download) → Load resolves the **persisted default** (no `PIE_TEST_CHAT_MODEL`) → send streams a reply that survives relaunch (#379) | packaged-app (Debug config) + #381 start→running stub + mock | `test-e2e-package` |
 | `S4_HelperMenuBarGUITests` | helper/engine | menu-bar shell; fresh seed enables Resume; oversized-model rejected; Resume boots pie → Pause | app+real-engine (GGUF fixture) | `test-gui-helper` |
 | `S204_ModelAcquisitionGUITests` | model discovery | Settings curated download → **verified** badge (sha256 == HF X-Linked-Etag) | real HF download (no inference) | `test-e2e-models` |
 | `S204_UnverifiedBadgeGUITests` | model discovery | `.unverified` sidecar row badges after rescan; clean row does not | no engine/network (staged files) | `test-e2e-models` |
+| `S218_CancelAffordancesGUITests` | model discovery | download cancel arms an inline Keep/Discard confirm; Discard hard-cancels to `.cancelled` | mock (fake downloader, `PIE_TEST_FAKE_DOWNLOADS`) | full `test-gui` |
 | `S260_ChatModelMenuGUITests` | model discovery | chat model menu contains seeded default profile model | mock (static placeholder menu) | `test-gui-chat` |
 | `S286_NoModelSendGateGUITests` | model load/status | send with nothing resolvable BLOCKS behind the "No model loaded" confirm (no silent load) | mock (gate fires pre-engine) | `test-gui-chat` |
 | `S258_ComposerSendGUITests` | chat send/persist | send → **real pie stream** → bubble → SwiftData persist across relaunch | **app+real-engine (real Qwen3-0.6B)** | `test-e2e-chat` |
+| `S426_FastThinkProfileGUITests` | chat send/persist | seeded "Fast Think" speculative-decoding profile is selectable + streams a real reply | **app+real-engine (real Qwen3-0.6B)** | `test-e2e-chat` (`run-chat-gui-e2e.sh`) |
 | `S204_ChatSendGUITests` | chat send/persist | INSTRUCT model answers "Paris" → persists across relaunch | **app+real-engine (real GGUF)** | `test-e2e-full` |
 | `S275_MultiTurnResumeGUITests` | chat send/persist | ordered multi-turn history sent to engine + persisted across relaunch | app+fake-engine (deterministic HTTP) | `test-gui-history` |
 | `S507_StreamContinuityGUITests` | chat send/persist | switch chats mid-stream → stream survives (no cancel), row indicator, background release persists, stop affordance keeps partial; PLUS 5 chats streaming concurrently with per-row indicator count + per-chat reply persistence | app+fake-engine (holding SSE + atomic counting /control/release?n=K) | `test-gui-stream-cancel` |
@@ -106,22 +110,40 @@ that wrapper, not bare `xcodebuild`.
 | `S360_ModelsTopAlignGUITests` | settings/shell | Settings → Models empty state stays **top-aligned**, not vertically centered (mirrors S285) | mock (isolated empty `PIE_HOME`) | `test-gui` |
 | `S365_CachedModelDiscoveryGUITests` | model discovery | HF-cache-staged model surfaces as a Settings **"HF-cache" row** + in the profile picker; pure filesystem scan | staged HF cache (no engine/network) | `run-cache-discovery-gui-e2e.sh` |
 | `S514_AddModelDuplicateGUITests` | model discovery | Add Model → Curated marks a staged app-managed install **"Installed"** and an HF-cache mirror **"In library"** (no Add button); a not-staged row keeps Add | staged HF cache + `PIE_HOME/models` (no engine/network) | `run-cache-discovery-gui-e2e.sh` |
+| `S420_SettingsDeepLinkGUITests` | settings/shell | `ratiothink://settings` deep link opens the Settings scene (`onOpenURL` → `SettingsDeepLink.isSettings` → `openSettings()`); guards the #420 window-group wiring | mock | full `test-gui` |
+| `S446_ComposerAutoGrowGUITests` | chat/composer | composer auto-grows for **soft-wrapped** lines (not just hard newlines); real SwiftUI + NSTextView layout (#446) | mock (engine-free; no send) | `test-gui-chat` |
+| `S459_ProfileSwapKeepCurrentGUITests` | model discovery | explicit model pins stay pinned across profile changes; cross-model swap popover fires only when "Follow profile default model" is opted in (#459/#460/#527) | mock (DEBUG `PIE_TEST_CHAT_MODEL_PIN`; dead loopback) | `test-gui-chat` |
+| `S486_ModelMenuNoResidentConfirmGUITests` | model discovery | toolbar model-menu pick with **no** resident model commits silently — no spurious "Switch model?" confirm (#486) | mock (DEBUG pin; dead loopback) | `test-gui-chat` |
+| `S496_HelperOverlayRemovedGUITests` | lifecycle/recovery | window stays fully interactive while the Helper is unreachable — the full-bleed recovery overlay is gone; state reads on the bounded window banner (#496) | mock (`PIE_TEST_PIN_HELPER_HEALTH` seam) | `test-gui-chat` |
+| `S511_ChatListGeometryGUITests` | settings/shell | chat-list rows stay vertically ordered + pairwise non-overlapping; each row's title/timestamp stay inside its own frame (asserts a11y FRAMES, not just existence) (#511) | mock (pinned-running + dead loopback) | `test-gui-chat-geometry` |
+| `S512_ChatLifecycleGUITests` | chat send/persist | untouched "New Chat" draft is pruned on leave + launch-reconcile; a chat with a committed message survives even when send **fails** + auto-titles in the sidebar (#512) | mock (dead loopback for fail-send; isolated `/tmp` `PIE_HOME`) | `test-gui-chat-lifecycle` |
+| `S515_CopyTranscriptGUITests` | chat/transcript | bubble context-menu "Copy Answer" puts the **canonical multi-section Markdown source** on `NSPasteboard` (MarkdownUI fragments block drag-select) (#515) | app+fake-engine (deterministic stream harness) | `test-gui-copy` (`run-copy-gui-e2e.sh`) |
+| `S520_MultiPartContentGUITests` | chat send/persist | external OpenAI-client multi-part `content[]` succeeds non-stream + stream on the shared engine; malformed part → 400 (never dropped); GUI chat still streams after (#115) | **app+real-engine (real Qwen3-0.6B)** | `test-e2e-chat` (`run-chat-gui-e2e.sh`) |
+| `S527_PinnedResidentMismatchGUITests` | model load/status | an explicit per-chat pin must not send into a running engine serving a **different** resident model; the mismatch guard fires before the user turn is persisted (#527) | mock (pinned-running + dead loopback) | full `test-gui` |
+| `S572_JSONThinkProfileGUITests` | chat send/persist | seeded "JSON Think" profile is selectable in the switcher + send streams a **JSON** reply (`response_format` attached) against a real engine (#572) | **app+real-engine (real Qwen3-0.6B)** | `test-e2e-chat` (`run-chat-gui-e2e.sh`) |
+| `S577_LeftPanelGUITests` | settings/shell | chat list persists as a bottom sidebar region across view selections; a row chosen from any view switches the main view back to that chat (#577) | mock (isolated `/tmp` `PIE_HOME`) | `test-gui-left-panel` |
 
-> Reconciled against `Tests/GUIScenarioTests/` on 2026-06-10 — every suite on
-> disk is listed above. The first-launch **packaged model-download →
-> persisted-default chat** suite (`S7_FirstLaunchWizardPackagedModelDownloadGUITests`,
-> #379) now exists and closes the coverage gap the #373 audit filed. The chat
-> resolves the persisted default through the no-model gate's **Load-default**
-> path (the #381 `PIE_TEST_ENGINE_START_TO_RUNNING` stub), **without**
-> `PIE_TEST_CHAT_MODEL` — so the download → persisted-default → chat link is
-> causal (the gate offers Load only because the downloaded default is on disk
-> and the persisted profile default names it), not an injected echo. Its package
-> is built **Debug** (not Release): the engine seams (`PIE_TEST_ENGINE_BASE_URL`,
+> Reconciled against `Tests/GUIScenarioTests/` on 2026-06-13 — every suite on
+> disk is listed above. The
+> first-launch **packaged model-download → persisted-default chat** suite
+> (`S7_FirstLaunchWizardPackagedModelDownloadGUITests`, #379) exists and closes
+> the coverage gap the #373 audit filed. The chat resolves the persisted
+> default through the no-model gate's **Load-default** path (the #381
+> `PIE_TEST_ENGINE_START_TO_RUNNING` stub), **without** `PIE_TEST_CHAT_MODEL` —
+> so the download → persisted-default → chat link is causal (the gate offers
+> Load only because the downloaded default is on disk and the persisted profile
+> default names it), not an injected echo. Its package is built **Debug** (not
+> Release): the engine seams (`PIE_TEST_ENGINE_BASE_URL`,
 > `PIE_TEST_ENGINE_START_TO_RUNNING`) are gated to DEBUG builds by
 > `HelperConfig.isTestOverrideAllowed` (the #325 hardening), so a deterministic
 > chat from a packaged bundle requires a Debug-configured package; the
 > Release-signed artifact + wizard persistence stay covered by
 > `S7_FirstLaunchWizardPackagedArtifactGUITests`.
+>
+> `ReadmeScreenshotsGUITests` is excluded from the catalog **by design**: it is
+> tooling, not coverage — it exports README screenshots (`.keepAlways`
+> attachments) and is driven by `Scripts/capture-readme-screenshots.sh`, not a
+> `make test*` target.
 
 ## Modular suites by area
 
@@ -137,10 +159,11 @@ exact fix command when a human gate is unmet.
 | package / install | `make test-gui-first-launch-package` (S7 packaged `.app` wizard/persist); `make test-e2e-package` (S7 packaged model-download → persisted-default chat, #379) | — |
 | helper / engine startup | `make test-gui-helper` (S4); `make test-smoke` (S3 subprocess); `make test-e2e-engine` (real launch) | `test-gui` / `test-ssh` |
 | large curated model real-engine proof | `make test-e2e-large-model` (manual/local; representative Qwen3 14B single-file GGUF, override with `PIE_TEST_E2E_REPO`/`PIE_TEST_E2E_FILE`) | — |
-| engine-free chat surfaces | `make test-gui-chat` (S260/S279/S285/S286) | `test-gui` |
-| model discovery / download | `make test-e2e-models` (S204 acquisition + unverified badge + live HF acquire); `Scripts/run-cache-discovery-gui-e2e.sh` (S365 HF-cache → Settings row) | — |
+| engine-free chat surfaces | `make test-gui-chat` (S260/S279/S285/S286/S446/S459/S486/S496/S511/S512/S577); split-out focused targets `make test-gui-chat-geometry` (S511), `make test-gui-chat-lifecycle` (S512), `make test-gui-left-panel` (S577) | `test-gui` |
+| copy transcript | `make test-gui-copy` (S515, via `run-copy-gui-e2e.sh`, deterministic stream harness) | — |
+| model discovery / download | `make test-e2e-models` (S204 acquisition + unverified badge + live HF acquire); `Scripts/run-cache-discovery-gui-e2e.sh` (S365 HF-cache → Settings row + S514 duplicate-block); `make test-gui-chat` (S446/S459/S486 model-menu/profile-swap surfaces) | — |
 | model load / status | engine-restart surface (#469: the `/v1/models/load` load-indicator UI was removed — a model switch is an engine restart). Unit: `EngineIndicatorStateTests` / `ChatStartGateTests` / `ModelLoadIndicatorLabelTests` / `ModelLoadPopoverConfirmTests`; restart-serves-X proven by `RealEngineLaunchE2ETests.test_realEngine_servesExplicitPick_andResumeHonorsMarker` (`test-e2e-engine`) | — |
-| chat send / persist (real) | `make test-e2e-chat` (S258); `make test-e2e-full` (S204 3-layer) | — |
+| chat send / persist (real) | `make test-e2e-chat` (S258 send + S260 seeded menu + S426 Fast-Think + S520 multi-part + S572 JSON-Think, via `run-chat-gui-e2e.sh`); `make test-e2e-full` (S204 3-layer) | — |
 | chat history / resume | `make test-gui-history` (S275 deterministic) | — |
 | install-time launchd safety | `make test-install-guards` (stubbed, runs anywhere — local/manual via `ci-pr`) | `test-ssh` / `ci-pr` |
 | live helper respawn | `make test-helper-respawn` (signed/registered install) | — |
@@ -150,7 +173,23 @@ exact fix command when a human gate is unmet.
 `make test-gui` still runs the **entire** `RatioThinkGUITests` matrix; the
 focused targets are `-only-testing` slices of it. A few suites have **no**
 focused target and run only in the full matrix: `S326` (fresh-install
-download), `S327` (engine-status pip), `S360` (Models top-align).
+download), `S327` (engine-status pip), `S360` (Models top-align), `S218`
+(download cancel confirm), `S411` (app menu update), `S421` (sampling
+popover), `S420` (settings deep link), `S527` (pinned-resident mismatch).
+
+### Manual / visual tools (not `make` targets)
+
+A couple of seated-console helpers are operator tools, not automated suites,
+so they are intentionally not wired to a `make` target:
+
+- `Scripts/smoke-helper-statusbar.sh` — manual visual smoke for the menu-bar
+  status-item render. Drives `RationalHelper` through every dot state
+  (gray/amber/green/red) via XPC so an operator can eyeball palette/SF-symbol/
+  dark-mode tint that the `HelperStatusItem*` unit tests cannot assert. It is
+  interactive (prompts the operator to press Enter), so it stays a hand-run
+  tool, not a CI/`make` step.
+- `Scripts/capture-readme-screenshots.sh` — exports README screenshots via the
+  `ReadmeScreenshotsGUITests` suite (see note under the catalog above).
 
 ## Live CLI diagnostics
 
