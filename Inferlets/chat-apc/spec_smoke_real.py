@@ -31,6 +31,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import os
 import subprocess
@@ -43,6 +44,47 @@ from pie_client import PieClient
 import e2e_test as h  # boot/teardown helpers + PIE_BIN/WASM_PATH/MANIFEST_PATH
 
 MODEL = os.environ.get("MODEL", "Qwen/Qwen3-0.6B")
+TOKENIZER_CLI = Path(os.environ.get("TOKENIZER_CLI", "/tmp/pie-tokenize/target/debug/pie-tokenize-once"))
+
+
+def _tokenizer_json_path() -> str:
+    parts = MODEL.split("/", 1)
+    if len(parts) != 2:
+        raise RuntimeError(f"MODEL {MODEL!r} is not an owner/repo Hugging Face id")
+    pattern = os.path.expanduser(
+        f"~/.cache/huggingface/hub/models--{parts[0]}--{parts[1]}/snapshots/*/tokenizer.json"
+    )
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        raise RuntimeError(f"no tokenizer.json for {MODEL} matching {pattern}")
+    return matches[-1]
+
+
+def _tokenize_all(texts: list[str]) -> list[list[int]]:
+    if not TOKENIZER_CLI.exists():
+        raise RuntimeError(
+            f"missing TOKENIZER_CLI at {TOKENIZER_CLI}; set TOKENIZER_CLI to a helper that "
+            "accepts '<tokenizer.json>' argv plus a JSON string-list on stdin and emits JSON token-id lists"
+        )
+    proc = subprocess.run(
+        [str(TOKENIZER_CLI), _tokenizer_json_path()],
+        input=json.dumps(texts),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return json.loads(proc.stdout)
+
+
+def _first_diff(a: list[int], b: list[int]) -> tuple[int | None, int | None, int | None]:
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return i, x, y
+    if len(a) != len(b):
+        i = min(len(a), len(b))
+        return i, a[i] if i < len(a) else None, b[i] if i < len(b) else None
+    return None, None, None
 
 CONFIG_TOML = f"""
 [server]
@@ -154,6 +196,31 @@ async def main() -> int:
                         m = msg["choices"][0]["message"]
                         return (m.get("content") or "", m.get("reasoning_content") or "")
 
+                    def _message_text(body: dict) -> tuple[str, str]:
+                        return _full(body)
+
+                    def _compare_token_ids(label_a: str, label_b: str, ids: dict[str, tuple[list[int], list[int]]]) -> bool:
+                        ok = True
+                        for idx, channel in enumerate(("content", "reasoning")):
+                            a = ids[label_a][idx]
+                            b = ids[label_b][idx]
+                            pos, x, y = _first_diff(a, b)
+                            print(
+                                f"[smoke] TOKEN_COMPARE {label_a} vs {label_b} "
+                                f"channel={channel} len={len(a)}/{len(b)} equal={pos is None}"
+                            )
+                            if pos is not None:
+                                lo = max(0, pos - 5)
+                                hi = pos + 6
+                                failures.append(
+                                    f"token-id equivalence broken for {label_a} vs {label_b} "
+                                    f"channel={channel} pos={pos} {label_a}_id={x} {label_b}_id={y} "
+                                    f"{label_a}[{lo}:{hi}]={a[lo:hi]} {label_b}[{lo}:{hi}]={b[lo:hi]}"
+                                )
+                                ok = False
+                                break
+                        return ok
+
                     full_plain = _full(b_plain)
                     full_spec = _full(b_spec)
                     sm = b_spec.get("spec_metrics")
@@ -179,6 +246,145 @@ async def main() -> int:
                         else:
                             print(f"[smoke] ACCEPTED {sm['accepted_draft_tokens']}/{sm['proposed_draft_tokens']} "
                                   f"draft tokens, avg {sm['avg_tokens_per_step']:.2f} tok/step")
+
+                    # Long deterministic token-id gate: this catches speculation
+                    # rollback/page-accounting bugs that only surface at page
+                    # boundaries. It intentionally compares token IDs (not text)
+                    # for a >=96-token continuation: plain-vs-plain must be
+                    # stable, and both rebuilt-per-request and persisted-sidecar
+                    # speculation must stay greedy-identical.
+                    # `/no_think` keeps the reasoning block empty and
+                    # deterministic (`<think>\n\n</think>`) — a minimal think
+                    # boundary that a warmed sidecar tends to accept together
+                    # with the following content in a single multi-token
+                    # speculative batch. That batch is the #466 regression
+                    # trigger for reasoning text dropped at the close.
+                    warm_messages = [{
+                        "role": "user",
+                        "content": (
+                            "Output exactly this sequence, with spaces, and no commentary: "
+                            + "red blue green yellow orange purple " * 14
+                        ).strip() + " /no_think",
+                    }]
+                    continuation_user = (
+                        "Continue the same color sequence for fourteen more repetitions. "
+                        "Output only the sequence, with spaces, no bullets, no explanation. /no_think"
+                    )
+                    spec_rebuilt = {"enabled": True, "leader_len": 1, "draft_len": 3}
+                    spec_sidecar = {
+                        **spec_rebuilt,
+                        "thread_id": "spec-smoke-real-96",
+                        "profile_id": "determinism-gate",
+                    }
+                    async with httpx.AsyncClient(timeout=300) as http_c:
+                        # Turn 1 warms the per-thread sidecar.
+                        warm_sidecar = await http_c.post(
+                            f"{base}/v1/chat/completions",
+                            json={
+                                "model": MODEL,
+                                "messages": warm_messages,
+                                "temperature": 0,
+                                "max_tokens": 96,
+                                "speculation": spec_sidecar,
+                            },
+                        )
+                        # A real chat client echoes the assistant turn back.
+                        # The continuation lineage [user, assistant, user2]
+                        # must extend the persisted lineage [user, assistant]
+                        # or the sidecar (correctly) forks and never reuses —
+                        # the earlier gate omitted this and silently tested a
+                        # COLD cache.
+                        warm_assistant = ""
+                        if warm_sidecar.status_code == 200:
+                            warm_assistant = (
+                                json.loads(warm_sidecar.text)["choices"][0]["message"].get("content") or ""
+                            )
+                        cont_messages = warm_messages + [
+                            {"role": "assistant", "content": warm_assistant},
+                            {"role": "user", "content": continuation_user},
+                        ]
+                        gate_common = {"model": MODEL, "messages": cont_messages, "temperature": 0, "max_tokens": 96}
+                        gate_responses = {
+                            "plain1": await http_c.post(f"{base}/v1/chat/completions", json=gate_common),
+                            "plain2": await http_c.post(f"{base}/v1/chat/completions", json=gate_common),
+                            "rebuilt": await http_c.post(
+                                f"{base}/v1/chat/completions",
+                                json={**gate_common, "speculation": spec_rebuilt},
+                            ),
+                            "persisted": await http_c.post(
+                                f"{base}/v1/chat/completions",
+                                json={**gate_common, "speculation": spec_sidecar},
+                            ),
+                        }
+                    if warm_sidecar.status_code != 200:
+                        failures.append(f"96-token sidecar warmup status {warm_sidecar.status_code}: {warm_sidecar.text[:200]!r}")
+                    elif not warm_assistant.strip():
+                        failures.append("96-token warm turn produced empty assistant content; continuation cannot reuse the sidecar")
+                    if warm_sidecar.status_code != 200 or any(r.status_code != 200 for r in gate_responses.values()):
+                        failures.append(
+                            "96-token determinism gate non-200: "
+                            + f"warm={warm_sidecar.status_code}, "
+                            + ", ".join(f"{k}={v.status_code}" for k, v in gate_responses.items())
+                        )
+                    else:
+                        gate_bodies = {k: json.loads(v.text) for k, v in gate_responses.items()}
+                        labels = list(gate_bodies)
+                        texts: list[str] = []
+                        for label in labels:
+                            content, reasoning = _message_text(gate_bodies[label])
+                            texts.extend([content, reasoning])
+                        try:
+                            encoded = _tokenize_all(texts)
+                        except Exception as exc:  # noqa: BLE001 - smoke should report the missing gate dependency.
+                            failures.append(f"96-token tokenization gate failed: {exc}")
+                        else:
+                            ids: dict[str, tuple[list[int], list[int]]] = {}
+                            it = iter(encoded)
+                            for label in labels:
+                                ids[label] = (next(it), next(it))
+                            print(f"[smoke] 96-token warm spec_metrics={json.loads(warm_sidecar.text).get('spec_metrics')}")
+                            for label, body_ in gate_bodies.items():
+                                content, reasoning = _message_text(body_)
+                                print(
+                                    f"[smoke] 96-token {label} text_lens content/reasoning="
+                                    f"{len(content)}/{len(reasoning)} token_lens="
+                                    f"{len(ids[label][0])}/{len(ids[label][1])} spec_metrics={body_.get('spec_metrics')}"
+                                )
+                            _compare_token_ids("plain1", "plain2", ids)
+                            _compare_token_ids("plain1", "rebuilt", ids)
+                            _compare_token_ids("plain1", "persisted", ids)
+
+                            # The persisted sidecar must actually REUSE the
+                            # warmed table on a real same-thread continuation
+                            # (not silently fork to a cold cache).
+                            persisted_sm = gate_bodies["persisted"].get("spec_metrics") or {}
+                            rebuilt_sm = gate_bodies["rebuilt"].get("spec_metrics") or {}
+                            sidecar_status = persisted_sm.get("ngram_sidecar_status")
+                            if sidecar_status != "reused":
+                                failures.append(
+                                    "96-token persisted sidecar did not reuse the warmed table: "
+                                    f"ngram_sidecar_status={sidecar_status!r} "
+                                    f"leaders={persisted_sm.get('ngram_sidecar_leaders')}"
+                                )
+                            # Warming must not COST throughput: the warmed
+                            # cache proposes more drafts, so the acceptance
+                            # RATE can dip while absolute work drops. Gate on
+                            # the honest signals — accepted-token count and
+                            # decode steps — not the proposal-normalized rate.
+                            p_acc = persisted_sm.get("accepted_draft_tokens", 0) or 0
+                            r_acc = rebuilt_sm.get("accepted_draft_tokens", 0) or 0
+                            p_steps = persisted_sm.get("decode_steps", 0) or 0
+                            r_steps = rebuilt_sm.get("decode_steps", 0) or 0
+                            print(
+                                f"[smoke] 96-token warming accepted persisted/rebuilt={p_acc}/{r_acc} "
+                                f"decode_steps={p_steps}/{r_steps}"
+                            )
+                            if p_acc < r_acc or (r_steps and p_steps > r_steps):
+                                failures.append(
+                                    "96-token warmed sidecar did not help: "
+                                    f"accepted persisted/rebuilt={p_acc}/{r_acc}, "
+                                    f"decode_steps={p_steps}/{r_steps} (want accepted>= and steps<=)"
+                                )
 
                 # #418 x tool_choice: speculation gates OFF when a tool call
                 # is FORCED (sampler constrained to the tool-call grammar).

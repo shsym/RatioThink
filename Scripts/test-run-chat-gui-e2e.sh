@@ -159,58 +159,107 @@ FAKE_PGREP
     fi
   done
 }
-# Direct contract assertions on _e2e_hf_model_cached, independent of the
-# wrapper's gate ordering ( F2): only a RESOLVED WEIGHT artifact
-# counts as cached. The bare-dir case above short-circuits at `[ -d snapshots ]`
-# and never reaches the find predicate, so these pin the predicate itself — a
-# future loosening (dropping -L, the weight-extension filter, or reverting to
-# `[ -d snapshots ]`) is caught here.
-test_hf_model_cached_helper_contract() {
+# The GGUF-fixture caching contract (partial/dangling-state rejection) is now
+# enforced end-to-end by test_missing_gguf_fixture_is_not_accepted above, which
+# drives the wrapper against the live Scripts/stage-test-model.sh gate. The
+# former `_e2e_hf_model_cached` / `e2e_ensure_hf_model` helpers this wrapper
+# once used were orphaned by that migration and removed (#545 / #383), so the
+# direct-helper contract test that pinned them was removed here too.
+
+# The "engine harness started too early" negative assertions above are only
+# meaningful while their needle matches the wrapper's actual banner. If the
+# wrapper reworded the echo, the negative checks would pass vacuously (never
+# matching anything) and silently stop guarding ordering — the exact self-test
+# drift #545 absorbed (#500). Pin the coupling: the banner the guards key on
+# MUST exist verbatim in the wrapper source.
+test_engine_harness_banner_marker_is_current() {
+  if ! grep -qF "starting portable GGUF engine harness" "$SCRIPT"; then
+    echo "FAIL: run-chat-gui-e2e.sh no longer prints 'starting portable GGUF engine harness'" >&2
+    echo "      — the ordering negative-assertions are now vacuous; update both this" >&2
+    echo "      self-test's needle and the wrapper banner together." >&2
+    exit 1
+  fi
+}
+
+# Termination-source classifier (#545 / #549): a fresh crash report must be
+# reported as a CRASH; an empty crash dir must read as "not a process crash".
+# Runs the classifier under the SAME `set -euo pipefail` the wrapper uses, and
+# asserts the verdict runs to COMPLETION (the live-pids line + closing rule) —
+# the live run revealed the classifier aborting mid-verdict under macOS
+# /bin/bash 3.2 when `pgrep` found no match (pipefail+errexit killed the
+# `var="$(pgrep|tr)"` assignment). Asserting only the early lines would miss it.
+test_termination_classification() {
   source "$ROOT/Scripts/e2e-prep.sh"
-  local tmp rev="abc123"
-  tmp="$(mktemp -d)"
+  local tmp; tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "$tmp/crash"
 
-  _assert_cached() {  # <dir> <want 0|1> <label>
-    local d="$1" want="$2" label="$3" got
-    if _e2e_hf_model_cached "$d"; then got=0; else got=1; fi
-    if [ "$got" -ne "$want" ]; then
-      echo "FAIL: helper contract [$label] — _e2e_hf_model_cached=$got want=$want" >&2
-      exit 1
-    fi
-  }
+  # Empty crash dir, since=now → not a crash. Capture rc too: the classifier
+  # must RETURN 0 (run to completion), not die under set -e mid-pgrep.
+  local since out rc
+  since="$(e2e_run_start_epoch)"
+  set +e
+  out="$(set -euo pipefail; RATIOTHINK_DIAG_CRASH_DIR="$tmp/crash" \
+         e2e_classify_app_termination "selftest" "$since" 2>&1)"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL: classifier aborted (rc=$rc) under set -euo pipefail — pgrep no-match must not kill it" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  require_contains "$out" "not a process crash"
+  require_contains "$out" "live Rational:"          # reached the live-pids line
+  require_contains "$out" "deep bundle:"            # reached the closing block
 
-  # 1) bare hub dir, no snapshots/                         -> not cached
-  mkdir -p "$tmp/bare/blobs" "$tmp/bare/refs"
-  _assert_cached "$tmp/bare" 1 "bare hub dir"
+  # Seed a fresh Rational crash report → reported as CRASH. Classifier only
+  # counts reports with mtime >= since, so stamp it at/after the reference.
+  printf 'fake' >"$tmp/crash/Rational-2026-01-01-000000.ips"
+  since="$(e2e_run_start_epoch)"
+  touch "$tmp/crash/Rational-2026-01-01-000000.ips"   # mtime = now (>= since)
+  out="$(set -euo pipefail; RATIOTHINK_DIAG_CRASH_DIR="$tmp/crash" \
+         e2e_classify_app_termination "selftest" "$since" 2>&1)"
+  require_contains "$out" "CRASH: Rational-2026-01-01-000000.ips"
+  require_contains "$out" "deep bundle:"            # still runs to completion
+}
 
-  # 2) empty snapshots/ tree                               -> not cached
-  mkdir -p "$tmp/empty/snapshots/$rev"
-  _assert_cached "$tmp/empty" 1 "empty snapshots"
-
-  # 3) metadata-only resolved (config.json + stray .DS_Store, no weight) -> not cached (F1)
-  mkdir -p "$tmp/meta/snapshots/$rev"
-  printf '{}' >"$tmp/meta/snapshots/$rev/config.json"
-  printf 'x'  >"$tmp/meta/snapshots/$rev/.DS_Store"
-  _assert_cached "$tmp/meta" 1 "metadata-only + stray, no weight"
-
-  # 4) dangling weight symlink (blob missing)              -> not cached
-  mkdir -p "$tmp/dangling/snapshots/$rev" "$tmp/dangling/blobs"
-  printf '{}' >"$tmp/dangling/snapshots/$rev/config.json"
-  ln -s "../../blobs/deadbeef" "$tmp/dangling/snapshots/$rev/model.safetensors"
-  _assert_cached "$tmp/dangling" 1 "dangling weight symlink"
-
-  # 5) resolved weight (symlink -> real blob)              -> cached
-  mkdir -p "$tmp/ok/snapshots/$rev" "$tmp/ok/blobs"
-  printf 'SAFE' >"$tmp/ok/blobs/deadbeef"
-  ln -s "../../blobs/deadbeef" "$tmp/ok/snapshots/$rev/model.safetensors"
-  _assert_cached "$tmp/ok" 0 "resolved weight"
-
-  echo "test-run-chat-gui-e2e: _e2e_hf_model_cached contract OK"
+# DB-verification honesty pin (#545 review v5 F5): the post-xcodebuild content
+# gates were once downgraded to `if sqlite3 … 2>/dev/null; then …; else NOTE`,
+# which collapsed the wrapper's verdict to XCODEBUILD_RC and masked a genuinely
+# missing/corrupt chats.sqlite — a missing DB read as the benign "no match" NOTE
+# and PASSED, indistinguishable from the quarantined truncation. The gate body
+# runs only after a real xcodebuild flow (unreachable in this fast self-test), so
+# pin it structurally: a missing/empty DB MUST hard-fail, and each sqlite3 query
+# MUST capture its rc so a corrupt/unreadable DB stays fatal while an empty
+# result set stays a tolerated NOTE. Dropping any guard re-introduces the silent
+# failure this PR exists to prevent.
+test_db_gate_hard_fails_on_missing_or_corrupt_db() {
+  # 1) Missing/empty DB is fatal, not a benign NOTE.
+  if ! grep -qF '[ ! -s "$GUI_HOME/chats.sqlite" ]' "$SCRIPT"; then
+    echo "FAIL: run-chat-gui-e2e.sh dropped the missing/empty chats.sqlite hard-assert" >&2
+    echo "      — a DB that was never created would silently PASS via the content-gate NOTE." >&2
+    exit 1
+  fi
+  # 2) Each content gate captures sqlite3's rc so a QUERY ERROR is fatal.
+  local rc_guards
+  rc_guards="$(grep -cE 'sqlite3 query failed \(rc=' "$SCRIPT" || true)"
+  if [ "$rc_guards" -lt 2 ]; then
+    echo "FAIL: content gates missing per-query rc handling (found $rc_guards, need >= 2)" >&2
+    echo "      — a corrupt/unreadable DB must hard-fail, not collapse to the no-match NOTE." >&2
+    exit 1
+  fi
+  # 3) The blanket `2>/dev/null` that masked genuine sqlite3 errors must be gone
+  #    from the content-gate queries (stderr now goes to a captured .err file).
+  if grep -qE 'sqlite3 "\$GUI_HOME/chats.sqlite".*2>/dev/null' "$SCRIPT"; then
+    echo "FAIL: content-gate sqlite3 query still swallows stderr with 2>/dev/null — masks DB errors" >&2
+    exit 1
+  fi
 }
 
 test_requires_tcc_before_starting_engine
 test_removes_stale_config_on_exit
 test_missing_gguf_fixture_is_not_accepted
-test_hf_model_cached_helper_contract
+test_engine_harness_banner_marker_is_current
+test_termination_classification
+test_db_gate_hard_fails_on_missing_or_corrupt_db
 echo "test-run-chat-gui-e2e: PASS"

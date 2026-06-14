@@ -251,13 +251,35 @@ func typeComposerText(
   app.typeKey("v", modifierFlags: .command)
 }
 
+// MARK: - multi-launch activation race (shared launch mechanism, #545/#559)
+//
+// `openFreshChat` / `selectPersistedChat` / `selectSidebarSection` above already
+// re-activate-and-retry to survive a not-key launch. The remaining brittle
+// spots are the LAUNCH itself and snapshot `.isEnabled` preconditions: under a
+// single `xcodebuild test` that launches Rational.app across several scenarios,
+// a LATER launch frequently comes up NOT-KEY — the app reaches
+// `.runningForeground` but another process still owns key focus, so the whole
+// AX tree reads `Disabled` and every `.isEnabled` / `.isHittable` snapshot is
+// false. A one-shot `app.activate()` races that key transition, so a following
+// `XCTAssertTrue(send.isEnabled, …)` fails on a perfectly healthy app — a
+// harness focus flake, not a product fault.
+//
+// These helpers fix the mechanism so any multi-launch scenario can adopt it:
+// poll the LIVE AX tree for genuine hittability and RE-activate until a landmark
+// is actually interactable, instead of trusting a stale snapshot. Nothing is
+// weakened — a genuinely disabled control never becomes hittable and still fails
+// honestly.
+
 extension XCUIElement {
-  /// Poll `isHittable` (not just `exists`). `isHittable` is true only when
-  /// the element exists, is on-screen and enabled, AND its app is
-  /// key/frontmost — exactly the precondition XCUITest needs to synthesize
-  /// a click/type against it. Returns false if it never becomes hittable.
+  /// Wait until the element is genuinely hittable (app key + on-screen +
+  /// enabled) — exactly the precondition XCUITest needs to synthesize a
+  /// click/type. Fast-path returns immediately if already hittable; otherwise
+  /// uses `XCTNSPredicateExpectation` to re-evaluate the LIVE AX tree rather
+  /// than trusting a one-shot `.isHittable` / `.isEnabled` read. Returns false
+  /// on timeout — callers assert on the result, so the proof is action-based
+  /// (the control can actually be tapped), not a stale snapshot.
   @discardableResult
-  func waitForHittable(timeout: TimeInterval) -> Bool {
+  func waitForHittable(timeout: TimeInterval = 10) -> Bool {
     if isHittable { return true }
     let expectation = XCTNSPredicateExpectation(
       predicate: NSPredicate(format: "isHittable == true"), object: self)
@@ -265,7 +287,85 @@ extension XCUIElement {
   }
 }
 
+/// Open a toolbar menu button and wait until `item` appears, surviving a
+/// mid-test not-key transition (#545). A menu cannot be re-activated while open
+/// (activation dismisses it), so re-activate the app and RE-OPEN the menu until
+/// the item shows. On success the menu is left OPEN with `item` present — the
+/// caller clicks it or sends Escape. Fails loudly after `attempts` rounds.
+@MainActor
+func openMenuAndWaitForItem(
+  _ menuButton: XCUIElement,
+  item: XCUIElement,
+  in app: XCUIApplication,
+  attempts: Int = 4,
+  itemTimeout: TimeInterval = 10,
+  file: StaticString = #filePath,
+  line: UInt = #line
+) {
+  for _ in 0..<attempts {
+    // Win key BEFORE clicking, the same launchActivated treatment the launch
+    // path uses: re-activate in a loop until the menu button is genuinely
+    // hittable, so the click OPENS the menu instead of being consumed by the
+    // not-key → key window transition (#545).
+    let keyDeadline = Date().addingTimeInterval(8)
+    var ready = false
+    repeat {
+      app.activate()
+      if menuButton.waitForHittable(timeout: 2) { ready = true; break }
+    } while Date() < keyDeadline
+    guard ready else { continue }
+
+    menuButton.click()
+    // Wait the FULL item window before retrying. A toolbar model/profile menu
+    // renders its rows only after async reconciliation (/v1/models), so a short
+    // miss means "not reconciled yet", NOT "menu failed to open" — escaping and
+    // reopening on a 4s miss threw the pending reconcile away. Only retry if the
+    // item never appears within the window (the genuine not-key/closed case).
+    if item.waitForExistence(timeout: itemTimeout) { return }
+    app.typeKey(.escape, modifierFlags: [])
+    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
+  }
+  XCTFail("menu item did not appear after \(attempts) open attempts "
+            + "(not-key focus race or unreconciled menu?); app tree: \(app.debugDescription)",
+          file: file, line: line)
+}
+
 extension XCUIApplication {
+  /// Launch, reach `.runningForeground`, then RE-activate until `landmark` is
+  /// actually hittable — defeating the not-key multi-launch focus race (#545).
+  /// Replaces the brittle `launch(); wait(for: .runningForeground); activate()`
+  /// trio every scenario open-coded: a single `activate()` does not reliably
+  /// win key on a later launch, so subsequent `.isEnabled` reads race it.
+  ///
+  /// `landmark` should be the first element the scenario interacts with (e.g.
+  /// the New Chat button) so success proves that element is tappable, not just
+  /// that a window exists.
+  func launchActivated(
+    landmark: (XCUIApplication) -> XCUIElement = { $0.windows.firstMatch },
+    foregroundTimeout: TimeInterval = 10,
+    activationTimeout: TimeInterval = 20,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    launch()
+    XCTAssertTrue(
+      wait(for: .runningForeground, timeout: foregroundTimeout),
+      "Rational.app did not reach runningForeground",
+      file: file, line: line
+    )
+    let sentinel = landmark(self)
+    let deadline = Date().addingTimeInterval(activationTimeout)
+    repeat {
+      activate()
+      if sentinel.waitForHittable(timeout: 2) { return }
+    } while Date() < deadline
+    XCTFail(
+      "Rational.app never became key/interactable within \(activationTimeout)s "
+        + "(not-key multi-launch focus race); app tree: \(debugDescription)",
+      file: file, line: line
+    )
+  }
+
   /// Return `element` only once it is actually interactable, re-activating
   /// this app until it is. In the full GUI matrix a launch can come up
   /// not-key — a sibling suite's window keeps keyboard focus, so the whole

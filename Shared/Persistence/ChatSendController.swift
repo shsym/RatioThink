@@ -582,7 +582,12 @@ public final class ChatSendController: ObservableObject {
     // normal chat (no `spec_metrics` overhead).
     let spec = options.speculation
     let wireSpec: ChatSpeculation? = (spec?.enabled == true)
-      ? ChatSpeculation(enabled: true, leaderLen: spec?.leaderLen, draftLen: spec?.draftLen)
+      ? ChatSpeculation(
+        enabled: true,
+        leaderLen: spec?.leaderLen,
+        draftLen: spec?.draftLen,
+        threadID: chat.id.uuidString,
+        profileID: options.profileID)
       : nil
     // #474: clamp the profile's max_tokens DOWN to the launched engine's
     // effective ceiling before send. On a memory-squeezed launch the engine
@@ -851,6 +856,10 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
   public let modelID: String
   public let sampling: ChatSampling
   public let systemPromptOverride: String?
+  /// Selected `Profile.id` for this send. Sent with enabled
+  /// speculation so chat-apc can fork Cacheback sidecars on profile
+  /// changes even when model/system prompt stay the same.
+  public let profileID: String?
   /// Speculative-decoding settings of the chat's selected profile, or
   /// `nil` when the profile has none. `makeRequest` injects this into the
   /// request (and forces greedy temperature) when `enabled` — see #426.
@@ -878,6 +887,7 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
     modelID: String,
     sampling: ChatSampling = ChatSampling(),
     systemPromptOverride: String? = nil,
+    profileID: String? = nil,
     speculation: Profile.Speculation? = nil,
     maxOutputTokensCeiling: Int? = nil,
     kvUsageSnapshot: KVUsageSnapshot? = nil,
@@ -886,6 +896,7 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
     self.modelID = modelID
     self.sampling = sampling
     self.systemPromptOverride = systemPromptOverride
+    self.profileID = profileID
     self.speculation = speculation
     self.maxOutputTokensCeiling = maxOutputTokensCeiling
     self.kvUsageSnapshot = kvUsageSnapshot
@@ -900,6 +911,7 @@ public struct ChatSendRequestOptions: Equatable, Sendable {
       modelID: modelID,
       sampling: sampling,
       systemPromptOverride: systemPromptOverride,
+      profileID: profileID,
       speculation: speculation,
       maxOutputTokensCeiling: maxOutputTokensCeiling,
       kvUsageSnapshot: kvUsageSnapshot,

@@ -173,17 +173,34 @@ public struct ChatSpeculation: Codable, Equatable, Sendable {
   public let enabled: Bool
   public let leaderLen: Int?
   public let draftLen: Int?
+  /// Stable chat/request-thread id used by chat-apc to keep Cacheback
+  /// n-gram state local to one conversation.
+  public let threadID: String?
+  /// Selected profile id. Included in the inferlet sidecar key so a
+  /// profile switch forks the learned n-gram table even when the model id
+  /// is unchanged.
+  public let profileID: String?
 
-  public init(enabled: Bool, leaderLen: Int? = nil, draftLen: Int? = nil) {
+  public init(
+    enabled: Bool,
+    leaderLen: Int? = nil,
+    draftLen: Int? = nil,
+    threadID: String? = nil,
+    profileID: String? = nil
+  ) {
     self.enabled = enabled
     self.leaderLen = leaderLen
     self.draftLen = draftLen
+    self.threadID = threadID
+    self.profileID = profileID
   }
 
   private enum CodingKeys: String, CodingKey {
     case enabled
     case leaderLen = "leader_len"
     case draftLen = "draft_len"
+    case threadID = "thread_id"
+    case profileID = "profile_id"
   }
 
   public func encode(to encoder: Encoder) throws {
@@ -191,6 +208,8 @@ public struct ChatSpeculation: Codable, Equatable, Sendable {
     try c.encode(enabled, forKey: .enabled)
     try c.encodeIfPresent(leaderLen, forKey: .leaderLen)
     try c.encodeIfPresent(draftLen, forKey: .draftLen)
+    try c.encodeIfPresent(threadID, forKey: .threadID)
+    try c.encodeIfPresent(profileID, forKey: .profileID)
   }
 
   public init(from decoder: Decoder) throws {
@@ -198,6 +217,8 @@ public struct ChatSpeculation: Codable, Equatable, Sendable {
     self.enabled = try c.decode(Bool.self, forKey: .enabled)
     self.leaderLen = try c.decodeIfPresent(Int.self, forKey: .leaderLen)
     self.draftLen = try c.decodeIfPresent(Int.self, forKey: .draftLen)
+    self.threadID = try c.decodeIfPresent(String.self, forKey: .threadID)
+    self.profileID = try c.decodeIfPresent(String.self, forKey: .profileID)
   }
 }
 

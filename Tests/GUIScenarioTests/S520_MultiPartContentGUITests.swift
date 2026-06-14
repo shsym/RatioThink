@@ -26,7 +26,14 @@ final class S520_MultiPartContentGUITests: XCTestCase {
       config["PIE_TEST_GUI_HOME"],
       "\(Self.configPath) must define PIE_TEST_GUI_HOME"
     )
-    let model = config["PIE_TEST_CHAT_MODEL"] ?? "Qwen/Qwen3-0.6B"
+    // The wrapper publishes the engine's resident model under
+    // PIE_TEST_CHAT_MODEL_PIN (the GGUF slug). Reading the old
+    // PIE_TEST_CHAT_MODEL key fell back to "Qwen/Qwen3-0.6B", so the external
+    // client requested a model the engine does not serve → 409 target_mismatch.
+    // Use the published pin so the request targets the resident model (#545).
+    let model = config["PIE_TEST_CHAT_MODEL_PIN"]
+      ?? config["PIE_TEST_CHAT_MODEL"]
+      ?? "Qwen/Qwen3-0.6B"
 
     // 1) External client, non-stream, multi-part array content -> 200
     //    chat.completion with non-empty assistant text.
@@ -78,19 +85,27 @@ final class S520_MultiPartContentGUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = model
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = model
+    // #504: pin the engine `.running` so the GUI send-gate passes (mirrors
+    // S258); the send still hits PIE_TEST_ENGINE_BASE_URL.
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
-    app.launch()
     defer { app.terminate() }
-    XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "Rational.app did not reach runningForeground")
-    app.activate()
+    // Launch + win key reliably even on a later not-key launch (#545). Use the
+    // default window sentinel — this scenario starts from an empty DB where
+    // openFreshChat picks among New-Chat affordances, so don't presume which
+    // one renders; openFreshChat re-activates further as needed.
+    app.launchActivated()
 
     openFreshChat(in: app)
     typeComposerText("The capital of France is", in: app)
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5),
                   "composer.send missing; app tree: \(app.debugDescription)")
+    // Action-based: wait until send is genuinely tappable, not a one-shot read
+    // that races the not-key window transition (#545).
+    XCTAssertTrue(send.waitForHittable(timeout: 5),
+                  "composer.send not tappable after typing prompt; app tree: \(app.debugDescription)")
     send.click()
 
     let predicate = NSPredicate(
@@ -99,6 +114,8 @@ final class S520_MultiPartContentGUITests: XCTestCase {
     let deadline = Date().addingTimeInterval(120)
     var visible = false
     while Date() < deadline {
+      // Keep the app key during the stream wait so the AX tree stays live (#545).
+      app.activate()
       if app.descendants(matching: .staticText).matching(predicate).count >= 2 {
         visible = true
         break

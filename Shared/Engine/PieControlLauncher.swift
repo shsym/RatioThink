@@ -47,8 +47,9 @@ private final class LaunchCancellationSignal: @unchecked Sendable {
 ///      hand it to pie before pie itself binds.
 ///   2. Spawn `pie serve --no-auth --debug --config <tmp/config.toml>`
 ///      with `PIE_HOME=<tmp>` + `PIE_SHMEM_NAME=/pie_t_<pid>_<uuid8>`.
-///   3. Parse the engine's stdout for
-///        `pie-server serving on <host>:<port>`
+///   3. Parse the engine's stdout for either serving-address marker
+///        `pie-server serving on <host>:<port>` (legacy)
+///        `✓ Server ready at ws://<host>:<port>` (upstream)
 ///        `internal token: <token>`
 ///      Both must appear within `handshakeTimeout`.
 ///   4. Open a WebSocket to `ws://<host>:<port>`, auth_by_token,
@@ -1336,11 +1337,6 @@ public actor LaunchedSession {
   /// and death diagnostics can snapshot bytes already written by the child
   /// without racing a `FileHandle.readabilityHandler` callback.
   func awaitHandshake(timeout: TimeInterval) async throws -> PieControlLauncher.Handshake {
-    // The engine's READY banner publishes the control-plane address. Both the
-    // current and legacy banner forms are matched by the shared, test-pinned
-    // `readyBannerAddressPattern` (the `ws://` scheme is re-added when the
-    // WebSocket URL is built below).
-    let urlRegex = try! NSRegularExpression(pattern: PieControlLauncher.readyBannerAddressPattern)
     let tokRegex = try! NSRegularExpression(pattern: #"internal token: (\S+)"#)
     let started = Date()
     let lines = outputTail.subscribe(replayRecent: true)
@@ -1356,7 +1352,7 @@ public actor LaunchedSession {
         var address: String?
         var token: String?
         for await line in lines {
-          if address == nil, let m = await self?.match(urlRegex, in: line) { address = m }
+          if address == nil { address = LaunchedSession.controlAddress(from: line) }
           if token == nil, let m = await self?.match(tokRegex, in: line) { token = m }
           if let a = address, let t = token {
             return PieControlLauncher.Handshake(address: a, token: t)
@@ -1685,6 +1681,30 @@ public actor LaunchedSession {
     return regex.stringByReplacingMatches(in: line,
                                           range: range,
                                           withTemplate: "internal token: <REDACTED>")
+  }
+
+  /// Extracts the control-plane host:port from either `pie serve`
+  /// readiness banner currently seen in supported pins:
+  ///   - legacy app-base: `pie-server serving on <host>:<port>`
+  ///   - upstream lineage: `✓ Server ready at ws://<host>:<port>`
+  ///
+  /// Keep this helper nonisolated/static so unit tests can pin the
+  /// stdout contract without spawning an engine, and so `awaitHandshake`
+  /// has one source of truth for launch-marker parsing.
+  static func controlAddress(from line: String) -> String? {
+    for pattern in [
+      #"pie-server serving on (\S+:\d+)"#,
+      #"Server ready at wss?://([^/\s]+)"#,
+    ] {
+      guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+      let range = NSRange(line.startIndex..., in: line)
+      guard let match = regex.firstMatch(in: line, range: range),
+            match.numberOfRanges >= 2,
+            let capture = Range(match.range(at: 1), in: line)
+      else { continue }
+      return String(line[capture])
+    }
+    return nil
   }
 
   private func match(_ regex: NSRegularExpression, in line: String) -> String? {

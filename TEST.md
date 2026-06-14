@@ -488,6 +488,38 @@ _Last verified 2026-05-22 — `S258_ComposerSendGUITests`, 1 test, 0 failures;
 wrapper printed `chat gui e2e: PASS` and the persisted assistant row contained
 `Paris`._
 
+## Harness reliability: termination classification & crash-reporter (#545)
+
+When a GUI/E2E run launches Rational.app under `xcodebuild`, a mid-test app
+crash used to leave only "the app disappeared" with no attribution, and a macOS
+"Rational quit unexpectedly" modal could wedge an unattended run. The GUI
+XCTRunner is sandboxed (`app-sandbox=true`) — it cannot read
+`~/Library/Logs/DiagnosticReports` or exec `pgrep` — so this classification
+lives in the **unsandboxed wrapper** (cf. the "classify by harness boundary"
+rule). `Scripts/e2e-prep.sh` provides:
+
+- `e2e_silence_crash_reporter` / `e2e_restore_crash_reporter` — mute the
+  CrashReporter modal for the run only (crash reports are still written), with
+  the prior `com.apple.CrashReporter DialogType` saved and restored on exit.
+  `run-chat-gui-e2e.sh` mutes only **after** the seated/TCC gates pass, so a
+  gate-fail (or the wrapper self-test) never touches your real preference.
+- `e2e_run_start_epoch` + `e2e_classify_app_termination <tag> <epoch>` — on
+  `xcodebuild` failure, attribute the source: a fresh `Rational-*` /
+  `RationalHelper-*` / `pie-*` crash report since run start (genuine crash; the
+  `RatioThink-*` compat names are still matched), a still-alive Rational
+  instance (stray/seated collision, **not** this run's intentional
+  `app.terminate()`), or neither (clean teardown). For a full redacted bundle,
+  run `Scripts/collect-diagnostics.sh --window 10m`.
+
+These wrappers are regression-guarded headlessly by
+`Scripts/test-run-chat-gui-e2e.sh` (`make test-gui-script`).
+
+**Residual seated caveat:** the per-run cleanup in `run-ticket326-e2e.sh` now
+only reaps `pie serve` engines that did **not** exist before the run (snapshot
+diff), so a developer's seated/manual engine survives. It still cannot
+distinguish two *concurrent* harness runs' engines from each other; run seated
+GUI/E2E wrappers one at a time, or under the `gui-seat` test lease.
+
 # Appendix B — deterministic GUI history/resume command
 
 Use this scenario for conversation-history correctness. It deliberately does
