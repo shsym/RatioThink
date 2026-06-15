@@ -60,9 +60,18 @@ if [[ -z "$ARCH" ]]; then
   # builds + restages + codesigns the engine into Rational.app. On a stale
   # signed app that re-stage fails "Operation not permitted" (insight:483),
   # and the multi-minute cargo build dwarfs the unit run. Set
-  # PIE_SKIP_ENGINE_BUILD=1 to no-op the phase. Scoped to build-phase mode
-  # only — the CLI/DMG path (--arch) must always produce the engine.
-  if [[ -n "${PIE_SKIP_ENGINE_BUILD:-}" && "${PIE_SKIP_ENGINE_BUILD}" != "0" ]]; then
+  # PIE_SKIP_ENGINE_BUILD=1 to no-op the phase.
+  #
+  # The DMG/release path (Scripts/package-dmg.sh) also runs THIS branch —
+  # it invokes xcodebuild without --arch, so the postCompile Run Script
+  # lands here, not the --arch CLI mode below. The skip reads ambient
+  # process env, which xcodebuild forwards into Run Script phases, so a
+  # globally-exported var would otherwise leak into a release build. Gate
+  # the skip mechanically on $CONFIGURATION (xcodebuild exports it into the
+  # phase): the unit recipes build Debug, package-dmg.sh builds Release, so
+  # this can never suppress the engine on the release/packaging path.
+  if [[ -n "${PIE_SKIP_ENGINE_BUILD:-}" && "${PIE_SKIP_ENGINE_BUILD}" != "0" \
+        && "${CONFIGURATION:-}" != "Release" ]]; then
     echo "build-pie-engine.sh: PIE_SKIP_ENGINE_BUILD set — skipping engine build"
     exit 0
   fi
