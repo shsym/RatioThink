@@ -309,6 +309,56 @@ public final class EngineStatusStore: ObservableObject {
     }
   }
 
+  /// Fire-and-forget engine (re)start on `profileID`, funneling any
+  /// surfaced start error to `onError` on the main actor. Owns the single
+  /// `Task { @MainActor }` + `try await startEngine(profileID:)` + catch
+  /// that was copy-pasted across the four engine-start call sites (#610).
+  /// Each caller passes ONLY its sink, so the per-site routing the #606
+  /// audit flagged "by design" — banner-swallow, in-view `engineActionError`,
+  /// or `NSLog` — is preserved while the orchestration lives in one place.
+  ///
+  /// `.replyTimeout` / `.alreadyRunning` never reach `onError`: the async
+  /// `startEngine(profileID:)` swallows them as non-failures (start in
+  /// flight / already coming up), so `onError` fires only on a real refusal
+  /// the status poll won't otherwise surface.
+  public func startEngine(profileID: String, onError: @escaping (Error) -> Void = { _ in }) {
+    Task { @MainActor in
+      do {
+        try await startEngine(profileID: profileID)
+      } catch {
+        onError(error)
+      }
+    }
+  }
+
+  /// (Re)start the engine on the active-profile marker, guarding a
+  /// missing/empty marker (no profile selected ⇒ nothing to start, a silent
+  /// no-op). The three marker-driven call sites — the banner Force Restart,
+  /// the Local API toggle, and the Restart-Engine menu — share this; the
+  /// chat scaffold starts its per-chat `selectedProfileID` via
+  /// `startEngine(profileID:onError:)` instead, since that target is the
+  /// chat's profile, not the global marker.
+  public func startOnActiveProfile(
+    profileStore: ProfileStore,
+    onError: @escaping (Error) -> Void = { _ in }
+  ) {
+    guard let profileID = profileStore.activeProfileID, !profileID.isEmpty else { return }
+    startEngine(profileID: profileID, onError: onError)
+  }
+
+  /// Human, fault-domain-correct message for an engine start/stop error,
+  /// used by the views that surface a thrown action error in their
+  /// `engineActionError` banner. Lives here — the engine-start layer both
+  /// the chat and Local API views already import — rather than on a single
+  /// view, so neither owns the other's copy (#610). A typed `EngineError`
+  /// shows its helper message; any other `Error` interpolates raw.
+  public static func engineErrorMessage(_ error: Error, verb: String) -> String {
+    if let e = error as? EngineError {
+      return "Couldn't \(verb) the engine: \(e.message)"
+    }
+    return "Couldn't \(verb) the engine: \(error)"
+  }
+
   /// Synchronous accessor for `HTTPEngineClient.baseURLProvider`.
   /// Throws `HTTPEngineError.engineNotReady` when the engine is not
   /// `.running` — the discriminator the HTTP client uses to surface

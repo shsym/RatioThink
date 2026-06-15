@@ -103,7 +103,7 @@ struct ChatScaffoldView: View {
         // PR#15 F3: an engine STOP failure is an engine fault, not a
         // persistence/durability failure — route it to the engine-failure
         // banner, never the "Couldn't save" persistence banner.
-        engineActionError = Self.engineErrorMessage(error, verb: "stop")
+        engineActionError = EngineStatusStore.engineErrorMessage(error, verb: "stop")
       }
     }
   }
@@ -169,23 +169,14 @@ struct ChatScaffoldView: View {
   /// failure banner); a thrown transport error routes to
   /// `engineActionError` (PR#15 F3) — never the persistence banner.
   private func startEngineForSelectedProfile() {
-    let profileID = viewModel.selectedProfileID
-    Task { @MainActor in
-      do {
-        engineActionError = nil
-        try await engineStatusStore.startEngine(profileID: profileID)
-      } catch {
-        engineActionError = Self.engineErrorMessage(error, verb: "start")
-      }
+    // #610: start on this chat's per-chat profile (NOT the global active
+    // marker) via the shared seam, routing a thrown error to the in-chat
+    // failure banner. Clear any prior action error optimistically so a
+    // retry doesn't show a stale message.
+    engineActionError = nil
+    engineStatusStore.startEngine(profileID: viewModel.selectedProfileID) { error in
+      engineActionError = EngineStatusStore.engineErrorMessage(error, verb: "start")
     }
-  }
-
-  /// Human, fault-domain-correct message for an engine start/stop error.
-  static func engineErrorMessage(_ error: Error, verb: String) -> String {
-    if let e = error as? EngineError {
-      return "Couldn't \(verb) the engine: \(e.message)"
-    }
-    return "Couldn't \(verb) the engine: \(error)"
   }
 
   /// Message for the in-chat engine-failure banner (PR#15 F2/F3), or nil

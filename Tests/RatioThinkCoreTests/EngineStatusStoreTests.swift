@@ -516,6 +516,125 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(store.engineGonePolls, 0)
   }
 
+  // MARK: - #610 single engine-start seam
+
+  /// The fire-and-forget `startEngine(profileID:onError:)` wrapper forwards
+  /// the profile id to the client exactly like the async variant.
+  func test_startEngine_onError_seam_forwards_profileID() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client)
+    store.startEngine(profileID: "chat") { _ in }
+    try await waitUntil("start forwarded") { client.startCalls == 1 }
+    XCTAssertEqual(client.lastStartProfileID, "chat")
+  }
+
+  /// A real resolver-stage refusal is routed to the caller's `onError` sink
+  /// (the per-site routing the four call sites preserve). Positive control
+  /// for the swallow test below.
+  func test_startEngine_onError_seam_routes_real_failure() async throws {
+    let client = StubXPCClient()
+    client.setStartResult(.failure(
+      EngineError(code: .modelMissing, message: "still missing")))
+    let store = EngineStatusStore(client: client)
+    var captured: Error?
+    store.startEngine(profileID: "chat") { captured = $0 }
+    try await waitUntil("onError fired") { captured != nil }
+    XCTAssertEqual((captured as? EngineError)?.code, .modelMissing,
+                   "onError must receive the typed EngineError so the sink can format it")
+  }
+
+  /// A `.replyTimeout` is an in-flight start, NOT a failure — the underlying
+  /// `startEngine(profileID:)` swallows it, so the wrapper's `onError` must
+  /// NOT fire. Non-vacuous: the twin above proves `onError` DOES fire on a
+  /// real throw, so this pins that swallow ≠ error. The `startCalls == 1`
+  /// wait is the resolution signal that the Task ran to completion.
+  func test_startEngine_onError_seam_swallows_replyTimeout() async throws {
+    let client = StubXPCClient()
+    client.setStartResult(.failure(
+      AppXPCClientError.replyTimeout(selector: "startEngine", timeout: 2.0)))
+    let store = EngineStatusStore(client: client)
+    var onErrorFired = false
+    store.startEngine(profileID: "chat") { _ in onErrorFired = true }
+    try await waitUntil("start completed") { client.startCalls == 1 }
+    await Task.yield()  // let the Task's post-call continuation run
+    XCTAssertFalse(onErrorFired,
+                   "an in-flight reply timeout must not reach the error sink")
+  }
+
+  /// `startOnActiveProfile` reads the marker, starts on it, and the success
+  /// path never touches `onError`.
+  func test_startOnActiveProfile_starts_on_marker() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client)
+    let profiles = try makeProfileStore(activeID: "chat")
+    var onErrorFired = false
+    store.startOnActiveProfile(profileStore: profiles) { _ in onErrorFired = true }
+    try await waitUntil("start forwarded") { client.startCalls == 1 }
+    XCTAssertEqual(client.lastStartProfileID, "chat",
+                   "must start the engine on the active-profile marker")
+    await Task.yield()
+    XCTAssertFalse(onErrorFired, "a successful start must not touch the error sink")
+  }
+
+  /// No active marker ⇒ nothing to start: the guard makes it a silent no-op
+  /// (the contract every marker-driven call site relied on), and `onError`
+  /// is never invoked.
+  func test_startOnActiveProfile_noop_without_active_marker() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client)
+    let profiles = try makeProfileStore(activeID: nil)
+    var onErrorFired = false
+    store.startOnActiveProfile(profileStore: profiles) { _ in onErrorFired = true }
+    // No start Task is spawned; give any erroneously-spawned one a chance.
+    await Task.yield()
+    await Task.yield()
+    XCTAssertEqual(client.startCalls, 0,
+                   "a missing active marker must not start the engine")
+    XCTAssertFalse(onErrorFired)
+  }
+
+  /// A start refusal on the marker routes to the caller's sink — proves the
+  /// guard wrapper still funnels the error.
+  func test_startOnActiveProfile_routes_error() async throws {
+    let client = StubXPCClient()
+    client.setStartResult(.failure(
+      EngineError(code: .profileMissing, message: "no such profile")))
+    let store = EngineStatusStore(client: client)
+    let profiles = try makeProfileStore(activeID: "ghost")
+    var captured: Error?
+    store.startOnActiveProfile(profileStore: profiles) { captured = $0 }
+    try await waitUntil("onError fired") { captured != nil }
+    XCTAssertEqual((captured as? EngineError)?.code, .profileMissing)
+  }
+
+  /// The relocated message formatter: a typed `EngineError` shows its helper
+  /// message; any other error interpolates raw. Pins the copy both action
+  /// banners render.
+  func test_engineErrorMessage_formats_typed_and_generic() {
+    let typed = EngineStatusStore.engineErrorMessage(
+      EngineError(code: .modelMissing, message: "no model"), verb: "start")
+    XCTAssertEqual(typed, "Couldn't start the engine: no model")
+
+    struct Generic: Error, CustomStringConvertible { var description: String { "boom" } }
+    let generic = EngineStatusStore.engineErrorMessage(Generic(), verb: "stop")
+    XCTAssertEqual(generic, "Couldn't stop the engine: boom")
+  }
+
+  /// Build a `ProfileStore` in an ephemeral temp dir with an optional active
+  /// marker. `setActiveProfileID` does not validate the id against on-disk
+  /// profiles (matches `ProfileStoreTests`), so no profile file is needed.
+  private func makeProfileStore(activeID: String?) throws -> ProfileStore {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("s610-\(UUID().uuidString)", isDirectory: true)
+    let dir = root.appendingPathComponent("profiles", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+    let active = root.appendingPathComponent("active-profile", isDirectory: false)
+    let store = ProfileStore(directory: dir, activeProfileURL: active)
+    if let activeID { try store.setActiveProfileID(activeID) }
+    return store
+  }
+
   private func waitUntil(
     _ description: String,
     timeout: TimeInterval = 1.0,

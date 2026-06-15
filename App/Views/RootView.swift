@@ -95,11 +95,10 @@ struct RootView: View {
   /// outcome. A slow-start `replyTimeout` is swallowed by
   /// `EngineStatusStore.startEngine`.
   private func restartEngineFromBanner() {
-    let profileID = profileStore.activeProfileID
-    Task { @MainActor in
-      guard let profileID, !profileID.isEmpty else { return }
-      try? await engineStatusStore.startEngine(profileID: profileID)
-    }
+    // #610: the guard + start now live in `startOnActiveProfile`; this site
+    // swallows the error (default sink) — the status poll surfaces the
+    // outcome in the same banner that hosts this action.
+    engineStatusStore.startOnActiveProfile(profileStore: profileStore)
   }
 }
 

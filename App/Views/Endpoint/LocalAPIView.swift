@@ -326,14 +326,11 @@ struct LocalAPIView: View {
   /// so it MUST surface here — the reducer never sees it. (`.replyTimeout` /
   /// `.alreadyRunning` are swallowed by the store as non-failures.)
   private func start() {
-    guard let profileID = profileStore.activeProfileID, !profileID.isEmpty else { return }
-    Task { @MainActor in
-      engineActionError = nil
-      do {
-        try await engineStatusStore.startEngine(profileID: profileID)
-      } catch {
-        engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "start")
-      }
+    // #610: guard active marker + start now live in `startOnActiveProfile`;
+    // this site supplies only its sink (the Local API action-error banner).
+    engineActionError = nil
+    engineStatusStore.startOnActiveProfile(profileStore: profileStore) { error in
+      engineActionError = EngineStatusStore.engineErrorMessage(error, verb: "start")
     }
   }
 
@@ -346,7 +343,7 @@ struct LocalAPIView: View {
       do {
         try await engineStatusStore.stopEngine()
       } catch {
-        engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "stop")
+        engineActionError = EngineStatusStore.engineErrorMessage(error, verb: "stop")
       }
     }
   }

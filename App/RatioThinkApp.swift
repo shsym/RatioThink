@@ -318,15 +318,10 @@ struct RatioThinkApp: App {
   private func restartEngine() {
     Task {
       await Self.performHelperRegistrationReconcile()
-      guard let profileID = profileStore.activeProfileID,
-            !profileID.isEmpty else {
-        NSLog("Restart Engine: no active profile to start")
-        return
-      }
-      do {
-        try await engineStatusStore.startEngine(profileID: profileID)
-      } catch {
-        NSLog("Restart Engine: startEngine(\(profileID)) failed: \(error)")
+      // #610: the guard + start now live in `startOnActiveProfile`; this
+      // site routes a refusal to NSLog (the menu has no banner surface).
+      engineStatusStore.startOnActiveProfile(profileStore: profileStore) { error in
+        NSLog("Restart Engine: startEngine failed: \(error)")
       }
     }
   }
