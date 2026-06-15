@@ -8,8 +8,9 @@ source "$ROOT/Scripts/e2e-prep.sh"
 TAG="chat gui e2e"
 # Serve the seeded GGUF the App's default "chat" profile resolves, under its
 # slug — so `/v1/models` reports the slug and the chat menu renders its leaf
-# (`Qwen3-0.6B-Q8_0.gguf`). S258 (send), S260 (model menu), and S426 (Fast
-# Think profile select + real reply) all consume it.
+# (`Qwen3-0.6B-Q8_0.gguf`). S258 (send) and S426 (Fast Think profile select +
+# real reply, which also asserts the seeded model surfaces in the chat menu)
+# both consume it.
 SLUG="Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p258-$$}"
 ENGINE_HOME="$RUN_ROOT/e"
@@ -114,7 +115,6 @@ xcodebuild -project RatioThink.xcodeproj \
   -parallel-testing-enabled NO \
   test \
   -only-testing:RatioThinkGUITests/S258_ComposerSendGUITests/test_composer_send_streams_real_assistant_and_persists_after_relaunch \
-  -only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests/test_chat_model_menu_contains_seeded_qwen3_default \
   -only-testing:RatioThinkGUITests/S426_FastThinkProfileGUITests/test_fast_think_profile_selectable_and_streams_real_reply \
   -only-testing:RatioThinkGUITests/S520_MultiPartContentGUITests/test_external_multipart_client_succeeds_and_gui_chat_still_streams \
   -only-testing:RatioThinkGUITests/S572_JSONThinkProfileGUITests/test_json_think_profile_selectable_and_streams_json_reply \

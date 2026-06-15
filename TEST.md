@@ -94,20 +94,18 @@ that wrapper, not bare `xcodebuild`.
 | `S204_ModelAcquisitionGUITests` | model discovery | Settings curated download → **verified** badge (sha256 == HF X-Linked-Etag) | real HF download (no inference) | `test-e2e-models` |
 | `S204_UnverifiedBadgeGUITests` | model discovery | `.unverified` sidecar row badges after rescan; clean row does not | no engine/network (staged files) | `test-e2e-models` |
 | `S218_CancelAffordancesGUITests` | model discovery | download cancel arms an inline Keep/Discard confirm; Discard hard-cancels to `.cancelled` | mock (fake downloader, `PIE_TEST_FAKE_DOWNLOADS`) | full `test-gui` |
-| `S260_ChatModelMenuGUITests` | model discovery | chat model menu contains seeded default profile model | mock (static placeholder menu) | `test-gui-chat` |
 | `S286_NoModelSendGateGUITests` | model load/status | send with nothing resolvable BLOCKS behind the "No model loaded" confirm (no silent load) | mock (gate fires pre-engine) | `test-gui-chat` |
 | `S258_ComposerSendGUITests` | chat send/persist | send → **real pie stream** → bubble → SwiftData persist across relaunch | **app+real-engine (real Qwen3-0.6B)** | `test-e2e-chat` |
 | `S426_FastThinkProfileGUITests` | chat send/persist | seeded "Fast Think" speculative-decoding profile is selectable + streams a real reply | **app+real-engine (real Qwen3-0.6B)** | `test-e2e-chat` (`run-chat-gui-e2e.sh`) |
-| `S204_ChatSendGUITests` | chat send/persist | INSTRUCT model answers "Paris" → persists across relaunch | **app+real-engine (real GGUF)** | `test-e2e-full` |
+| `S204_ChatSendGUITests` *(nightly)* | chat send/persist | INSTRUCT model answers "Paris" → persists across relaunch (3-layer download→boot→chat) | **app+real-engine (real GGUF)** | `test-e2e-full` *(nightly/on-demand; off the per-change hot path — send+persist covered by S258, download chain by S326FreshInstallDownloadE2ETests)* |
 | `S275_MultiTurnResumeGUITests` | chat send/persist | ordered multi-turn history sent to engine + persisted across relaunch | app+fake-engine (deterministic HTTP) | `test-gui-history` |
 | `S507_StreamContinuityGUITests` | chat send/persist | switch chats mid-stream → stream survives (no cancel), row indicator, background release persists, stop affordance keeps partial; PLUS 5 chats streaming concurrently with per-row indicator count + per-chat reply persistence | app+fake-engine (holding SSE + atomic counting /control/release?n=K) | `test-gui-stream-cancel` |
 | `S513_ChatRetryGUITests` | chat send/persist | earlier-turn retry → "Retry from here?" confirm (Cancel = no-op; Retry erases later conversation + regenerates from retained prefix); latest-turn retry skips confirm, no duplicate assistant turns | app+fake-engine (numbered replies) | `test-gui-chat-retry` |
 | `S381_NoModelLoadDefaultGUITests` | model load/status | no-model gate's **Load default** → engine starts + serves → gate dismisses → send streams a reply | app+fake-engine (start→running stub + mock) | `test-gui-load-default` |
 | `S279_LifecycleRecoveryGUITests` | lifecycle/recovery | unreachable engine → visible recoverable error + composer re-enabled | app+real-engine seam (dead loopback) | `test-gui-chat` |
-| `S285_ZeroStateGUITests` | zero-state | empty-state top-alignment; Start Chat CTA opens a chat; API Endpoints section opens the single live `LocalAPIView` (#422) | mock (stops at composer; no send) | `test-gui-chat` |
+| `S285_ZeroStateGUITests` | zero-state | empty-state top-alignment (chat **and** Settings→Models, folded in from the former S360); Start Chat CTA opens a chat; API Endpoints section opens the single live `LocalAPIView` (#422) | mock (stops at composer; no send) | `test-gui-chat` |
 | `S326_FreshInstallModelDownloadGUITests` | first-launch | fresh install (seeded profile, model absent) → no-model gate offers inline **download**, not a dead-end Load | mock (fake downloader, pre-engine) | `test-gui` |
 | `S327_EngineStatusIndicatorGUITests` | model load/status | always-visible engine-status pip; popover **stays open** across 1 Hz poll ticks (`pollCount` demoted from `@Published`) | mock (no engine) | `test-gui` |
-| `S360_ModelsTopAlignGUITests` | settings/shell | Settings → Models empty state stays **top-aligned**, not vertically centered (mirrors S285) | mock (isolated empty `PIE_HOME`) | `test-gui` |
 | `S365_CachedModelDiscoveryGUITests` | model discovery | HF-cache-staged model surfaces as a Settings **"HF-cache" row** + in the profile picker; pure filesystem scan | staged HF cache (no engine/network) | `run-cache-discovery-gui-e2e.sh` |
 | `S514_AddModelDuplicateGUITests` | model discovery | Add Model → Curated marks a staged app-managed install **"Installed"** and an HF-cache mirror **"In library"** (no Add button); a not-staged row keeps Add | staged HF cache + `PIE_HOME/models` (no engine/network) | `run-cache-discovery-gui-e2e.sh` |
 | `S420_SettingsDeepLinkGUITests` | settings/shell | `ratiothink://settings` deep link opens the Settings scene (`onOpenURL` → `SettingsDeepLink.isSettings` → `openSettings()`); guards the #420 window-group wiring | mock | full `test-gui` |
@@ -159,11 +157,11 @@ exact fix command when a human gate is unmet.
 | package / install | `make test-gui-first-launch-package` (S7 packaged `.app` wizard/persist); `make test-e2e-package` (S7 packaged model-download → persisted-default chat, #379) | — |
 | helper / engine startup | `make test-gui-helper` (S4); `make test-smoke` (S3 subprocess); `make test-e2e-engine` (real launch) | `test-gui` / `test-ssh` |
 | large curated model real-engine proof | `make test-e2e-large-model` (manual/local; representative Qwen3 14B single-file GGUF, override with `PIE_TEST_E2E_REPO`/`PIE_TEST_E2E_FILE`) | — |
-| engine-free chat surfaces | `make test-gui-chat` (S260/S279/S285/S286/S446/S459/S486/S496/S511/S512/S577); split-out focused targets `make test-gui-chat-geometry` (S511), `make test-gui-chat-lifecycle` (S512), `make test-gui-left-panel` (S577) | `test-gui` |
+| engine-free chat surfaces | `make test-gui-chat` (S279/S285/S286/S446/S459/S486/S496/S511/S512/S577); split-out focused targets `make test-gui-chat-geometry` (S511), `make test-gui-chat-lifecycle` (S512), `make test-gui-left-panel` (S577) | `test-gui` |
 | copy transcript | `make test-gui-copy` (S515, via `run-copy-gui-e2e.sh`, deterministic stream harness) | — |
 | model discovery / download | `make test-e2e-models` (S204 acquisition + unverified badge + live HF acquire); `Scripts/run-cache-discovery-gui-e2e.sh` (S365 HF-cache → Settings row + S514 duplicate-block); `make test-gui-chat` (S446/S459/S486 model-menu/profile-swap surfaces) | — |
 | model load / status | engine-restart surface (#469: the `/v1/models/load` load-indicator UI was removed — a model switch is an engine restart). Unit: `EngineIndicatorStateTests` / `ChatStartGateTests` / `ModelLoadIndicatorLabelTests` / `ModelLoadPopoverConfirmTests`; restart-serves-X proven by `RealEngineLaunchE2ETests.test_realEngine_servesExplicitPick_andResumeHonorsMarker` (`test-e2e-engine`) | — |
-| chat send / persist (real) | `make test-e2e-chat` (S258 send + S260 seeded menu + S426 Fast-Think + S520 multi-part + S572 JSON-Think, via `run-chat-gui-e2e.sh`); `make test-e2e-full` (S204 3-layer) | — |
+| chat send / persist (real) | `make test-e2e-chat` (S258 send + S426 Fast-Think incl. seeded-menu assertion + S520 multi-part + S572 JSON-Think, via `run-chat-gui-e2e.sh`); `make test-e2e-full` (S204 3-layer, **nightly tier**) | — |
 | chat history / resume | `make test-gui-history` (S275 deterministic) | — |
 | install-time launchd safety | `make test-install-guards` (stubbed, runs anywhere — local/manual via `ci-pr`) | `test-ssh` / `ci-pr` |
 | live helper respawn | `make test-helper-respawn` (signed/registered install) | — |
@@ -173,7 +171,7 @@ exact fix command when a human gate is unmet.
 `make test-gui` still runs the **entire** `RatioThinkGUITests` matrix; the
 focused targets are `-only-testing` slices of it. A few suites have **no**
 focused target and run only in the full matrix: `S326` (fresh-install
-download), `S327` (engine-status pip), `S360` (Models top-align), `S218`
+download), `S327` (engine-status pip), `S218`
 (download cancel confirm), `S411` (app menu update), `S421` (sampling
 popover), `S420` (settings deep link), `S527` (pinned-resident mismatch).
 

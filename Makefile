@@ -590,8 +590,8 @@ render-menubar-icon: ## Render the #424 branded menu-bar icon (4 states x light/
 	@/tmp/render-menubar-icon
 	@open /tmp/menubar-icon-preview.png 2>/dev/null || true
 
-test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — model menu, recovery, zero-state, send-gate, composer auto-grow, profile-swap keep-current, model-menu no-resident confirm, helper-overlay removal, chat-list geometry, chat lifecycle prune/auto-title, left-panel persistence (S260/S279/S285/S286/S446/S459/S486/S496/S511/S512/S577)
-	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S260_ChatModelMenuGUITests -only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests -only-testing:RatioThinkGUITests/S459_ProfileSwapKeepCurrentGUITests -only-testing:RatioThinkGUITests/S486_ModelMenuNoResidentConfirmGUITests -only-testing:RatioThinkGUITests/S496_HelperOverlayRemovedGUITests -only-testing:RatioThinkGUITests/S511_ChatListGeometryGUITests -only-testing:RatioThinkGUITests/S512_ChatLifecycleGUITests -only-testing:RatioThinkGUITests/S577_LeftPanelGUITests)
+test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — recovery, zero-state, send-gate, composer auto-grow, profile-swap keep-current, model-menu no-resident confirm, helper-overlay removal, chat-list geometry, chat lifecycle prune/auto-title, left-panel persistence (S279/S285/S286/S446/S459/S486/S496/S511/S512/S577)
+	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests -only-testing:RatioThinkGUITests/S459_ProfileSwapKeepCurrentGUITests -only-testing:RatioThinkGUITests/S486_ModelMenuNoResidentConfirmGUITests -only-testing:RatioThinkGUITests/S496_HelperOverlayRemovedGUITests -only-testing:RatioThinkGUITests/S511_ChatListGeometryGUITests -only-testing:RatioThinkGUITests/S512_ChatLifecycleGUITests -only-testing:RatioThinkGUITests/S577_LeftPanelGUITests)
 
 test-gui-left-panel: genproject $(LOGDIR) ## GUI area: #577 left-panel persistence — chat list stays mounted across views + row-click switches main view (S577)
 	$(call gui_suite_run,left-panel,-only-testing:RatioThinkGUITests/S577_LeftPanelGUITests)
@@ -652,7 +652,7 @@ test-e2e-matrix: ## E2E area: FULL real-engine matrix — 9 curated models × {c
 bench-tot: ## Benchmark: ToT batched-vs-sequential strategies on real portable Metal — wall-clock + tok/s (#458)
 	Scripts/run-tot-bench.sh
 
-test-e2e-full: ## E2E area: 3-layer real-model proof — GUI download → engine boot → chat persist (S204)
+test-e2e-full: ## E2E area (NIGHTLY tier): 3-layer real-model proof — GUI download → engine boot → chat persist (S204). Heaviest GUI E2E (large instruct GGUF); run nightly/on-demand, not on the per-change hot path — the send+persist mechanics are already covered by test-e2e-chat (S258) and the download chain by S326FreshInstallDownloadE2ETests.
 	Scripts/run-full-e2e.sh
 
 test-e2e-package: ## E2E area: packaged first-launch → model download → chat uses persisted default (S7 packaged model-download, #379)

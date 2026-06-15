@@ -37,7 +37,7 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
       "\(Self.configPath) must define PIE_TEST_GUI_HOME")
     let model = config["PIE_TEST_CHAT_MODEL"] ?? "Qwen/Qwen3-0.6B"
     // The concrete served slug the engine reconciles via /v1/models — the
-    // toolbar VALUE settles to this once residency lands (mirror S260).
+    // toolbar VALUE settles to this once residency lands (mirror S426).
     let servedModelID = config["PIE_TEST_CHAT_MODEL_PIN"]
       ?? "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
 
@@ -58,7 +58,7 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
     newChat.click()
 
     // Reconciliation barrier before swapping profiles (mirror the PASSING
-    // S260): the toolbar VALUE settles to the concrete served slug only after
+    // S426): the toolbar VALUE settles to the concrete served slug only after
     // /v1/models reconciles, so this proves residency landed WITHOUT opening
     // the model menu — eliminating that menu's not-key focus race entirely
     // (#545). The same-model JSON Think swap is silent because the resident
@@ -127,7 +127,7 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
 
   // MARK: - assertions
 
-  /// Resident-model reconciliation barrier (mirror S260): the toolbar VALUE
+  /// Resident-model reconciliation barrier (mirror S426): the toolbar VALUE
   /// equals the concrete served slug only after `/v1/models` reconciles, with
   /// no "profile default"/"(Default)" annotation. Pure value read — no menu
   /// open, so it cannot lose a not-key focus race (#545).

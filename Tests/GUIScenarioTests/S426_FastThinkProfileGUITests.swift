@@ -12,7 +12,7 @@ import XCTest
 ///      asserted at the wire level in `ChatSendControllerTests`) actually
 ///      produces a generation against a real model.
 ///
-/// Like its siblings S258/S260 this needs a real engine serving the
+/// Like its sibling S258 this needs a real engine serving the
 /// seeded GGUF, so it is driven by `Scripts/run-chat-gui-e2e.sh`, which
 /// boots `chat-engine-harness` in portable mode against the app-staged
 /// weight and writes the engine URL into the shared config file. Absent
@@ -139,7 +139,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     }
   }
 
-  // MARK: - configure (mirror S258/S260)
+  // MARK: - configure (mirror S258)
 
   private func configure(_ app: XCUIApplication, pieHome: String, baseURL: String, model: String) {
     app.launchArguments.append(contentsOf: [
@@ -249,7 +249,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     return app.menuItems.matching(predicate).firstMatch
   }
 
-  /// Shared with S258/S260: `Scripts/run-chat-gui-e2e.sh` writes this fixed
+  /// Shared with S258: `Scripts/run-chat-gui-e2e.sh` writes this fixed
   /// config after its engine harness has a live loopback URL (xcodebuild does
   /// not reliably forward ad-hoc env to the UI-test runner). Missing config →
   /// loud XCTSkip, never a silent pass.

@@ -27,7 +27,7 @@ import XCTest
 ///     a real switch and MUST raise the popover. Proves the menu can raise the
 ///     confirm, so the negative's absence is meaningful, not a dead control.
 ///
-/// Per the repo flake convention (#460 review / S260), model-menu rows are
+/// Per the repo flake convention (#460 review), model-menu rows are
 /// matched by a STABLE identity predicate (value/label/title CONTAINS the
 /// slug leaf), never by exact menu-item title.
 final class S486_ModelMenuNoResidentConfirmGUITests: XCTestCase {

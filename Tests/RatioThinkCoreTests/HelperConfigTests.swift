@@ -182,7 +182,7 @@ final class HelperConfigTests: XCTestCase {
   }
 
   /// A DEBUG build — including the `xcodebuild test` runner that drives the
-  /// chat-gui E2E — honors the seam so S258/S260 can point the App at the
+  /// chat-gui E2E — honors the seam so S258 can point the App at the
   /// wrapper-booted engine.
   func test_debug_build_honors_engine_base_url_override() {
     let env = ["PIE_TEST_ENGINE_BASE_URL": "http://127.0.0.1:9999"]
