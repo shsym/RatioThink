@@ -264,10 +264,17 @@ final class S511_ChatListGeometryGUITests: XCTestCase {
     assertRowGeometry(in: app, expectedRows: 3, context: "launch-width")
 
     let widthBefore = window.frame.width
+    // A Shrink of 200pt floors at the 900pt minimum, so a launch width ≤ 1100
+    // would make the resize a no-op; fail that as its own precondition rather
+    // than mis-attributing it to the resize step below.
+    XCTAssertGreaterThan(widthBefore, 1100,
+                         "seat too narrow for Shrink to clear the 900pt floor")
     // The DEBUG menu command shrinks the key window's width (floored at the
     // 900pt minimum); from any launch width the app ships (≥ the 1200 default)
     // this is always a real change.
     app.menuBars.menuBarItems["Debug"].click()
+    XCTAssertTrue(app.menuBars.menuItems["Shrink Window (Test)"].waitForExistence(timeout: 2),
+                  "Debug ▸ Shrink Window (Test) missing — DEBUG build required")
     app.menuBars.menuItems["Shrink Window (Test)"].click()
     let deadline = Date().addingTimeInterval(5)
     while window.frame.width == widthBefore && Date() < deadline {
