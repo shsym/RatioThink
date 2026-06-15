@@ -96,7 +96,7 @@ if [ ! -f "$PLACED" ]; then
   exit 1
 fi
 
-# Independent on-disk integrity re-verify ( F4): match the narrower
+# Independent on-disk integrity re-verify: match the narrower
 # sibling scripts (run-gui-e2e.sh, run-real-model-
 # acquisition.sh) so the FULL chain has the same integrity coverage —
 # the placed bytes' sha256 must equal HF's X-Linked-Etag (the LFS

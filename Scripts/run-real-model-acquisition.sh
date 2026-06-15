@@ -1,11 +1,11 @@
 #!/bin/bash
-# real-model acquisition leg.
+# Real-model acquisition leg.
 #
 # Drives the REAL ModelDownloader against live Hugging Face for the
 # smallest curated catalog entry (the same coordinates Settings →
 # Models → Add Model… enqueues) and asserts the download verifies and
-# completes. This is the end-to-end proof of the  fix and the one
-# leg  does not cover ( pre-seeds the HF cache).
+# completes. This is the end-to-end proof of the real-acquisition fix and the
+# one leg the cache-seeded tests do not cover (they pre-seed the HF cache).
 #
 # The acquisition substance lives at the integration tier, NOT the GUI
 # tier: pie-mac's SwiftUI Settings TabView is a documented unreliable

@@ -14,7 +14,7 @@
 #      builds out-of-band for arch-specific DMG packaging. $dest defaults
 #      to "$SRCROOT/build/pie-engine/<arch>/".
 #
-# Per : PIE_PORTABLE_METAL=1 so the Metal backend is portable
+# Set PIE_PORTABLE_METAL=1 so the Metal backend is portable
 # across Apple Silicon machines without machine-specific shader paths.
 # The bin name is `pie` (Vendor/pie/server/Cargo.toml `[[bin]]`).
 

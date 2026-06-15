@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+#
+# Build the pie engine (pie-server release crate in Vendor/pie) for local
+# development, wrapped in sandbox-diagnostics recovery so a sandbox-denied
+# cargo build surfaces actionable guidance instead of an opaque failure.
+#
+# Usage: Scripts/run-engine-build.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

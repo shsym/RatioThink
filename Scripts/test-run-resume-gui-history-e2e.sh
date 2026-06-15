@@ -1,4 +1,8 @@
 #!/bin/bash
+#
+# Fast, non-GUI preflight regressions for run-resume-gui-history-e2e.sh. Drives
+# the REAL wrapper to assert its TCC preflight runs before the deterministic
+# harness starts, without a seated session. Runs in `make test-gui-script`.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Deterministic local HTTP chat harness for the resume-history GUI E2E.
+# Serves canned OpenAI-style chat completions and logs each request, so the
+# App's multi-turn history can be exercised without a real engine or model
+# download.
 import argparse
 import json
 import sys

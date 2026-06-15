@@ -1,5 +1,5 @@
 #!/bin/bash
-# Live validation for : after the Helper is registered as a launchd
+# Live validation: after the Helper is registered as a launchd
 # agent (SMAppService.agent), launchd must own `com.ratiothink.helper` and
 # relaunch the Helper after an unclean death within ~1s.
 #

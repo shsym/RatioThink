@@ -1,4 +1,12 @@
 #!/bin/bash
+#
+# Resume-history GUI E2E (S275). Drives the App against a deterministic local
+# HTTP harness (resume-history-harness.py) serving canned replies, then verifies
+# multi-turn chat history survives an app relaunch and is re-sent to the engine.
+#
+# Usage: PIE_TEST_TCC_GRANTED=1 Scripts/run-resume-gui-history-e2e.sh
+#   (seated GUI session required)
+# Key env: PIE_TEST_RUN_ROOT (retained run dir), PIE_TEST_CHAT_MODEL_PIN.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

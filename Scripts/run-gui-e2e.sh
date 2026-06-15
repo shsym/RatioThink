@@ -1,5 +1,5 @@
 #!/bin/bash
-# real-model acquisition GUI E2E.
+# Real-model acquisition GUI E2E.
 #
 # Drives Rational.app's Settings → Models → Add Model… → Curated download
 # through the GUI (the real in-process ModelDownloader against live

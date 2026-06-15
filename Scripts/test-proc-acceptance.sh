@@ -1,5 +1,5 @@
 #!/bin/bash
-# Unit regression for Scripts/lib/proc-acceptance.sh ( F1).
+# Unit regression for Scripts/lib/proc-acceptance.sh.
 #
 # Verification must reject any pie/RationalHelper not PROVEN to be from this
 # launch: a stale image whose argv still shows the (replaced) bundle path,

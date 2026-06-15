@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+#
+# Structural regression test for docs/landing.html. Parses the landing page and
+# asserts its required structure/content so doc-site edits cannot silently break
+# it. Runs without a browser or network.
+#
+# Usage: Scripts/test-landing-page.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

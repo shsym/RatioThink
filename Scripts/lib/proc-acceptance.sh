@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Process-acceptance helpers for install verification ( F1/F4).
+# Process-acceptance helpers for install verification.
 #
 # Verification must only trust a Helper/engine that belongs to THIS
 # install: its executable lives in the freshly-installed bundle AND it

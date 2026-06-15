@@ -1,4 +1,8 @@
 #!/bin/bash
+#
+# Fast, non-GUI preflight regressions for run-chat-gui-e2e.sh. Drives the REAL
+# wrapper to assert its preflight gate ordering (seated-GUI, TCC, model cache)
+# and config cleanup without a seated session. Runs in `make test-gui-script`.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

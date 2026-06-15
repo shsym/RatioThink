@@ -1,4 +1,9 @@
 #!/bin/bash
+#
+# First-launch package E2E. Builds/packages a Release Rational.app artifact,
+# then launches it by file URL under XCUITest from fresh isolated state to
+# verify first-run behavior, and exports a human-testable signed zip. See the
+# usage() block below for the full invocation and environment contract.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -340,7 +345,7 @@ PY
   echo "first-launch package e2e: exported human-testable app artifact=$latest_zip_path"
   echo "first-launch package e2e: exported human-testable manifest=$latest_manifest_path"
   echo "first-launch package e2e: exported human-testable checksum=$latest_checksum_path"
-  echo "first-launch package e2e: hc download command: hc controller download-link --path $latest_zip_path --name Rational-first-launch-latest-${PIE_TEST_ARCH:-$ARCH_VALUE}.app.zip"
+  echo "first-launch package e2e: human-testable download path: $latest_zip_path"
 }
 
 prune_human_artifact_runs() {

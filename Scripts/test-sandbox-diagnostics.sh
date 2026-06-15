@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+#
+# Unit regression for Scripts/lib/sandbox-diagnostics.sh. Exercises the
+# sandbox-denied detection and recovery-guidance helpers against synthetic
+# inputs. Runs without a sandbox or seated session.
+#
+# Usage: Scripts/test-sandbox-diagnostics.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

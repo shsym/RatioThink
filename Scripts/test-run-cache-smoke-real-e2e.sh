@@ -1,4 +1,8 @@
 #!/bin/bash
+#
+# Fast, non-GUI preflight regressions for run-cache-smoke-real-e2e.sh. Drives the
+# REAL wrapper to assert its preflight gating and contract without a seated
+# session. Runs in `make test-gui-script`.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

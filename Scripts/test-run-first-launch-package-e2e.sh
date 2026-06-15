@@ -1,4 +1,9 @@
 #!/bin/bash
+#
+# Fast, non-GUI preflight regressions for run-first-launch-package-e2e.sh. Stubs
+# xcodebuild and the package/build steps to assert the wrapper's TCC preflight
+# ordering and artifact-env handoff without a seated session. Runs in
+# `make test-gui-script`.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

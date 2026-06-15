@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+#
+# Static contract test guarding run-http-e2e.sh's stale-engine rebuild logic:
+# asserts the wrapper declares a pie commit stamp, compares it against the live
+# Vendor/pie HEAD, explains stale rebuilds, and records the HEAD after rebuild —
+# so a pin bump can never silently run a stale engine. Source-only; no engine.
+#
+# Usage: Scripts/test-run-http-e2e-stale-pie.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

@@ -1,4 +1,13 @@
 #!/bin/bash
+#
+# Real-model chat GUI E2E (S258 composer send, S426 Repeat Boost profile).
+# Serves the seeded Qwen3-0.6B GGUF under its profile slug via the portable
+# chat-engine-harness, points the App at it through a /tmp config file, runs the
+# two XCUITests, then asserts the engine's reply persisted to chats.sqlite.
+#
+# Usage: Scripts/run-chat-gui-e2e.sh   (seated GUI session + TCC grant required)
+# Key env: PIE_TEST_RUN_ROOT (retained run dir), STAGE_TEST_MODEL_DEST (GGUF
+#   fixture path), PIE_E2E_AUTOPREP=0 (skip auto build/download of pie + GGUF).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

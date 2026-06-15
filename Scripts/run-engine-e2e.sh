@@ -1,5 +1,5 @@
 #!/bin/bash
-#  follow-up — REAL Helper-hosted engine E2E.
+# Real Helper-hosted engine E2E.
 #
 # Exercises the production engine-launch path with NO mock and NO
 # PIE_TEST_ENGINE_BASE_URL bypass: real LaunchSpecResolver → real
