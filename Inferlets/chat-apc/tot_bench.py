@@ -55,10 +55,16 @@ STRATEGIES = [
 
 # Representative search shapes. b*d1 is a single wide level (max sibling
 # batching, no refine); b3d2 is the default multi-level (exercises the
-# concurrent refine-flush + a second batched level).
+# concurrent refine-flush + a second batched level). The schema caps
+# breadth/beam at 5 (MAX_BREADTH/MAX_BEAM_WIDTH), so b5·d2·m5 is the
+# MAXIMUM-residency shape reachable — 25 concurrent forks at level 2, the
+# regime where a phased barrier holding every sibling + score-fork resident
+# would blow the KV budget (the #458 2–3× regression risk; #465 re-check).
 SHAPES = [
     {"breadth": 4, "depth": 1, "beam_width": 4, "label": "b4·d1·m4 single wide level"},
     {"breadth": 3, "depth": 2, "beam_width": 2, "label": "b3·d2·m2 default multi-level"},
+    {"breadth": 5, "depth": 1, "beam_width": 5, "label": "b5·d1·m5 max single level"},
+    {"breadth": 5, "depth": 2, "beam_width": 5, "label": "b5·d2·m5 max residency (25 forks)"},
 ]
 
 TRIALS = int(os.environ.get("PIE_BENCH_TRIALS", "3"))

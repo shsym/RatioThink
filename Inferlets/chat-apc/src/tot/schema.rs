@@ -82,53 +82,67 @@ pub const DEFAULT_THINKING: bool = true;
 /// this knob (a single SSE emitter cannot be shared across concurrent branch
 /// futures, so node deltas would have no exclusive writer).
 ///
-/// ## Why the default is `CoupledSequential` (#458, MEASURED)
+/// ## Why the default is `CoupledConcurrent` (#465, RE-MEASURED)
 ///
-/// The point of #458 was to batch sibling decode steps. Measurement on real
-/// portable Metal (`make bench-tot`, Qwen3-0.6B) showed it does not pay off
-/// from inside a single inferlet, on either axis:
+/// #458 measured concurrent ≈ sequential and made `CoupledSequential` the
+/// default, because the engine host resolved `forward-pass.execute()`
+/// **eagerly** — an async host call suspended the whole single-stack wasm
+/// guest, so `join_all` could never put two sibling decode steps in flight
+/// (probe: batch size 1, driver `contexts=1` always). That bottleneck is
+/// gone: pie `82e81034` ("Fix serialized forked branch generation", #369,
+/// on `pie.app/v1-base-shmem`) made `execute()` non-blocking — it spawns the
+/// pin→submit→await→fill→unpin pipeline and returns a pending `FutureOutput`
+/// immediately, so siblings stay in flight and the per-device scheduler
+/// coalesces them. (See `search` module docs for the host `execute()` shape.)
 ///
-/// - **Concurrency buys ~0%.** The SDK async surface exists, but the engine
-///   host resolves `forward-pass.execute()` eagerly (awaits the pass to
-///   completion before returning the future-output), and a wasm guest is a
-///   single execution stack — so an async host call suspends the whole guest
-///   and `join_all` can't put two sibling decode steps in flight. Forward
-///   passes from one inferlet reach the batch scheduler strictly serially
-///   (probe-measured: batch size 1 across 1503 passes at 25 concurrent forks;
-///   driver `contexts=1` always). Measured: concurrent ≈ sequential to within
-///   noise at every shape/regime (e.g. b4·d1 greedy: 3.36s seq vs 3.40s conc).
-///   The empirical form of #413's "engine batches forks only weakly"; NOT
-///   small-breadth economics. See the `search` module docs for the host
-///   `execute()` file:line + the upstream fix.
-/// - **Phasing buys ~0% and risks a 2–3× regression.** Holding every sibling
-///   context *and* its score-fork resident across a barrier spikes KV-page
-///   utilization past the engine's eviction threshold, so each forward pass
-///   then pays suspend/restore. Measured b3·d2 greedy: 7.8s coupled vs 16.9s
-///   (phased_concurrent) / 25.2s (phased_sequential) — a 2.2–3.2× regression;
-///   tied (no win) in the lower-residency sampled regime.
+/// Re-measured on real portable Metal (`make bench-tot`, Qwen3-0.6B-Q8_0,
+/// 3 trials) at the current `Vendor/pie` pin, sibling decode now co-batches —
+/// the driver logs `contexts` up to **23** at the 25-fork shape (was always
+/// `1` at the #458 pin). Greedy (wall-comparable) speedup vs `coupled_sequential`:
 ///
-/// So `CoupledSequential` — the pre-#458 / #413 shape, memory-frugal and
-/// fastest/tied everywhere — is the default. The other variants stay as the
-/// reproducible measurement apparatus: re-run `make bench-tot` to re-check
-/// when the SDK gains a guest async runtime that multiplexes forward passes
-/// (so siblings actually co-batch) or the KV budget grows. See the search.rs
-/// module docs for the upstream-pie blocker.
+/// | shape          | coupled_concurrent | phased_concurrent | phased_sequential |
+/// |----------------|--------------------|-------------------|-------------------|
+/// | b4·d1          | 1.45×              | 1.47×             | 1.21×             |
+/// | b3·d2 (default)| 1.22×              | 1.18×             | 1.02×             |
+/// | b5·d1          | 1.51×              | 1.56×             | 1.28×             |
+/// | b5·d2 (25-fork)| 1.68×              | 1.70×             | 1.34×             |
+///
+/// In the sampled (t=0.7) regime siblings desync, so wall-clock is not
+/// comparable across trials (the bench measures tokens/s there): by tok/s
+/// `coupled_concurrent` is 1.07–1.27× and `phased_concurrent` 1.08–1.43×.
+/// The strategy never changes the returned tree — only how it is computed.
+///
+/// `CoupledConcurrent` is the default: it wins monotonically in the
+/// wall-comparable greedy regime, never net-regresses by tok/s, and carries
+/// the **lowest KV residency** of the concurrent variants — it has no phase
+/// barrier, so a branch's score overlaps the next branch's generation and
+/// only a few contexts are resident at once. The phased variants add a
+/// barrier that holds every sibling context *plus* its score-fork resident
+/// simultaneously; #458 saw that spike past the eviction threshold and
+/// regress 2–3× under KV pressure. The prompt unpin in pie's deferred
+/// `execute()` relieved that enough that phasing did NOT regress here on a
+/// 0.6B model, but the headroom on production-size models is unmeasured —
+/// so the phased variants stay behind the `exec-strategies` feature as the
+/// benchmark apparatus, not a production path. `phased_sequential` also
+/// net-regresses in the sampled regime (tok/s ≤ 1.0× at b4·d1 / b3·d2).
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecStrategy {
-    /// Default (measured optimal): sequential generation, scoring coupled per
-    /// node — the pre-#458 / #413 production shape.
+    /// Default (#465, re-measured optimal): concurrent generation — siblings
+    /// decode in flight so the engine batches their forward passes — with
+    /// scoring coupled per branch (no phase barrier → lowest KV residency).
     #[default]
-    CoupledSequential,
-    /// Concurrent generation, scoring coupled per branch (#407-style overlap)
-    /// — isolates the concurrency axis. Measured: no gain.
     CoupledConcurrent,
+    /// Sequential generation, scoring coupled per node — the pre-#458 / #413
+    /// shape. Lowest concurrency; the explicit low-residency escape hatch.
+    CoupledSequential,
     /// Sequential generation, phased concurrent scoring — isolates the phase
-    /// barrier (and batched scoring). Measured: no gain; regresses under high
-    /// KV residency.
+    /// barrier (and batched scoring). Benchmark apparatus only: net-regresses
+    /// in the sampled regime and holds high KV residency.
     PhasedSequential,
     /// Concurrent generation + phased concurrent scoring — the "fully batched"
-    /// target. Measured: no gain; regresses under high KV residency.
+    /// variant. Wins on a 0.6B model but the phase barrier's KV residency is
+    /// unmeasured on production-size models. Benchmark apparatus only.
     PhasedConcurrent,
 }
 
@@ -218,18 +232,21 @@ pub fn resolve(input: &TotInput) -> Result<TotParams, (&'static str, String)> {
     let top_p = input.top_p.unwrap_or(DEFAULT_TOP_P);
     let thinking = input.thinking.unwrap_or(DEFAULT_THINKING);
     let exec = input.exec.unwrap_or_default();
-    // #458 gate: the non-default execution strategies are a benchmark/debug
-    // apparatus measured as no-win (see [`ExecStrategy`]). Production builds
-    // (feature off) accept only the default and REJECT a non-default `exec` —
-    // never silently coerce it, which would hide that the client asked for an
-    // unsupported (slower) path. The benchmark / strategy e2e build with
-    // `--features exec-strategies` to drive every variant.
+    // #465 gate: production builds (feature off) support the two *coupled*
+    // strategies — `coupled_concurrent` (the re-measured default) and
+    // `coupled_sequential` (the low-residency escape hatch) — and REJECT the
+    // *phased* variants, whose phase barrier holds high KV residency that is
+    // unmeasured on production-size models (and which net-regress in the
+    // sampled regime). Rejecting rather than silently coercing keeps the
+    // client from unknowingly getting a different path. The benchmark /
+    // strategy e2e build with `--features exec-strategies` to drive every
+    // variant. See [`ExecStrategy`] for the measurement.
     #[cfg(not(feature = "exec-strategies"))]
-    if exec != ExecStrategy::CoupledSequential {
+    if exec.phased_score() {
         return Err((
             "exec",
-            "exec strategy selection is not available on this build; omit \
-             `exec` (the default is the only supported strategy)"
+            "phased exec strategies are benchmark-only on this build; use \
+             `coupled_concurrent` (the default) or `coupled_sequential`"
                 .to_string(),
         ));
     }
@@ -344,34 +361,38 @@ mod tests {
     }
 
     #[test]
-    fn exec_defaults_to_coupled_sequential() {
-        // #458 (MEASURED): neither concurrency nor phasing pays off from a
-        // single inferlet, and phasing can regress 2–3× under KV pressure, so
-        // the coupled-sequential (#413) shape is the default. An unset `exec`
-        // resolves to it — production behavior is unchanged.
+    fn exec_defaults_to_coupled_concurrent() {
+        // #465 (RE-MEASURED): with pie's deferred `execute()` (#369) siblings
+        // co-batch, so concurrent generation + coupled scoring is the fastest
+        // (and lowest-residency) measured strategy and is now the default. An
+        // unset `exec` resolves to it.
         assert_eq!(
             resolve(&input()).unwrap().exec,
-            ExecStrategy::CoupledSequential
+            ExecStrategy::CoupledConcurrent
         );
-        assert_eq!(ExecStrategy::default(), ExecStrategy::CoupledSequential);
+        assert_eq!(ExecStrategy::default(), ExecStrategy::CoupledConcurrent);
     }
 
-    // The default is always accepted (both builds); production behavior is
-    // unchanged whether or not the strategy feature is compiled in.
+    // Both coupled strategies resolve on either build (#465): concurrent is
+    // the production default, sequential the low-residency escape hatch.
     #[test]
-    fn exec_default_always_accepted() {
-        let mut i = input();
-        i.exec = Some(ExecStrategy::CoupledSequential);
-        assert_eq!(resolve(&i).unwrap().exec, ExecStrategy::CoupledSequential);
-    }
-
-    // Production build (feature off): a non-default `exec` is REJECTED with a
-    // param-tagged error, never silently coerced to the default.
-    #[cfg(not(feature = "exec-strategies"))]
-    #[test]
-    fn exec_nondefault_rejected_without_feature() {
+    fn exec_coupled_variants_always_accepted() {
         for s in [
             ExecStrategy::CoupledConcurrent,
+            ExecStrategy::CoupledSequential,
+        ] {
+            let mut i = input();
+            i.exec = Some(s);
+            assert_eq!(resolve(&i).unwrap().exec, s);
+        }
+    }
+
+    // Production build (feature off): the phased variants are benchmark-only
+    // and REJECTED with a param-tagged error, never silently coerced (#465).
+    #[cfg(not(feature = "exec-strategies"))]
+    #[test]
+    fn exec_phased_rejected_without_feature() {
+        for s in [
             ExecStrategy::PhasedSequential,
             ExecStrategy::PhasedConcurrent,
         ] {

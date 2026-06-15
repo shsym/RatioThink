@@ -8,7 +8,7 @@
 //! surviving (beam-kept) candidate is the final answer — earlier levels
 //! are preserved when a later level fully fails (see `fold_level` / F7).
 //!
-//! ## Batched sibling decoding + parallel scoring (#458 — investigated, NOT a win)
+//! ## Batched sibling decoding + parallel scoring (#458 investigated → #465 shipped)
 //!
 //! A level's branches are sibling forks of one shared, flushed, cue-free
 //! prefix. There is **no multi-context forward-pass primitive** — the WIT
@@ -17,56 +17,41 @@
 //! time* and let the engine's per-device batch scheduler coalesce them. The
 //! idiomatic attempt is `futures::future::join_all` over the sibling decode
 //! loops (the pattern Pie's own `parallel-generation` / `tree-of-thought`
-//! examples use).
+//! examples use), which [`resolve_level`] does.
 //!
-//! **It does not pay off from inside a single inferlet** — verified by code
-//! + instrumentation, not wall-clock alone (#458):
+//! **#458 found it bought ~0%** because the engine host resolved
+//! `forward-pass.execute()` *eagerly*: the host impl awaited the pass to
+//! completion before returning the future-output, and a wasm guest is a
+//! single execution stack — so an async host call suspended the *whole*
+//! guest and `join_all` could not advance a sibling past its `execute()`
+//! until the current pass finished. Forward passes from one inferlet reached
+//! the scheduler strictly serially (probe: 1503 passes at 25 forks, every
+//! cycle `batch_len=1`, driver `contexts=1` always).
 //!
-//! - Concurrency buys ~0%. The SDK *does* have an async surface — `execute()`
-//!   returns a `future-output` and `ForwardPassExt::execute_async` awaits its
-//!   pollable — and the wstd reactor + `join_all` would submit every sibling
-//!   before blocking. But the engine host resolves `execute()` **eagerly**:
-//!   its host impl (`Vendor/pie/runtime/src/api/inference.rs:324`) is an
-//!   `async fn` that `inference::submit(...).await`s the forward pass to
-//!   completion and returns an already-done `FutureOutput { done: true }`
-//!   (ibid. ~447, 506) — the deferred `rx`/`done:false` path on `FutureOutput`
-//!   (ibid. 45–75) is left unused. A wasm guest is a single execution stack,
-//!   so an async host call suspends the *whole* guest: `join_all` cannot
-//!   advance a sibling past its `execute()` until the current pass finishes.
-//!   Forward passes from one inferlet therefore reach the per-device batch
-//!   scheduler **strictly serially** — measured with a scheduler probe over
-//!   1503 passes at 25 concurrent forks (breadth 5, depth 2, beam 5): every
-//!   cycle was `recv → batch_len=1 → fire size=1`, with the non-blocking drain
-//!   never once finding a second request, and the portable driver logging
-//!   `contexts=1` for every pass. Batch size is structurally 1 regardless of
-//!   breadth — this is the precise form of #413's "engine batches forks only
-//!   weakly", and it is NOT small-breadth economics (25 ≫ a level's nodes
-//!   still never co-batched).
-//! - A phased generate-then-score barrier buys ~0% and **regresses 2–3×**
-//!   under high KV residency: holding every sibling context plus its
-//!   score-fork resident spikes KV-page use past the eviction threshold, so
-//!   each pass then pays suspend/restore.
+//! **#465: pie made `execute()` non-blocking, so it now pays off.** pie
+//! `82e81034` ("Fix serialized forked branch generation", #369, on
+//! `pie.app/v1-base-shmem`) spawns the pin→submit→await→fill→unpin pipeline
+//! and returns a pending `FutureOutput` immediately (`Vendor/pie/runtime/src/
+//! api/inference.rs`, `execute()` + `inference::submit_nowait`). The guest no
+//! longer suspends on `execute()`, so `join_all` holds every sibling in
+//! flight and the per-device scheduler coalesces them. Re-measured on real
+//! portable Metal (`make bench-tot`, Qwen3-0.6B-Q8_0): the driver logs
+//! `contexts` up to **23** at the 25-fork shape (was always `1`), and greedy
+//! wall-clock speedup vs sequential is **1.22–1.68×** for concurrent
+//! generation (see [`ExecStrategy`](super::schema::ExecStrategy) for the full
+//! table). The prompt unpin in the deferred `execute()` also relieved the
+//! KV-residency pressure that made #458's phased barrier regress 2–3×, though
+//! that barrier's residency on production-size models stays unmeasured.
 //!
-//! So the default [`ExecStrategy`](super::schema::ExecStrategy) is
-//! `CoupledSequential` — generate-then-score one node at a time, the
-//! memory-frugal pre-#458 / #413 shape, fastest-or-tied at every shape. The
-//! knob still exposes two axes —
-//! - **generation** concurrent (engine-*would*-batch, if the host deferred
-//!   `execute()`) vs sequential;
-//! - **scoring** phased (barrier, all `Answered` nodes scored in one
-//!   concurrent batch) vs coupled (each branch generates then scores) —
-//! so the non-default variants remain as the reproducible measurement
-//! apparatus, never the production path. They never change the returned tree.
-//!
-//! **Upstream blocker (real capability gap):** batched sibling decode needs
-//! the engine host to make `forward-pass.execute()` genuinely deferred —
-//! enqueue the pass to the scheduler and return a pending `FutureOutput`
-//! (`rx: Some`, `done: false`) immediately, resolving it via the pollable —
-//! so a single guest can hold several passes in flight and the scheduler can
-//! coalesce them. (The `FutureOutput` deferral path already exists; only
-//! `execute()` short-circuits it.) Phased scoring additionally needs enough
-//! KV headroom to keep a level's contexts resident. The apparatus lets a
-//! future session re-run `make bench-tot` once that host change lands.
+//! So the default is now `CoupledConcurrent` — concurrent generation with
+//! coupled (no-barrier) scoring, the fastest + lowest-residency measured
+//! shape. `CoupledSequential` (the pre-#458 / #413 shape) stays as the
+//! low-residency escape hatch; the **phased** variants stay behind the
+//! `exec-strategies` feature as the measurement apparatus (their barrier
+//! residency is unverified at scale, and `phased_sequential` net-regresses in
+//! the sampled regime). The knob never changes the returned tree — only how
+//! it is computed. Re-run `make bench-tot` to re-check as the KV budget or
+//! production model size changes.
 //!
 //! ### Streaming constraint (#413)
 //!
@@ -1090,11 +1075,12 @@ pub async fn run(
             }
         }
 
-        // Generate + score this level's branches per the execution strategy
-        // (#458). Default is coupled-sequential (one node at a time); the
-        // concurrent / phased variants are the measurement apparatus (no
-        // measured win — see the module docs). Generation is always
-        // sequential when an emitter is present (#413 streaming). `results` is
+        // Generate + score this level's branches per the execution strategy.
+        // Default is coupled-concurrent (#465): siblings decode in flight so
+        // the engine batches their forward passes (1.2–1.7× on real Metal —
+        // see the module docs). The phased variants stay benchmark-only.
+        // Generation is always sequential when an emitter is present (#413
+        // streaming). `results` is
         // in `metas` order regardless (join_all and the sequential loop both
         // preserve it), so the tree shape is identical across strategies.
         let results: Vec<(Context, NodeOutcome)> =
