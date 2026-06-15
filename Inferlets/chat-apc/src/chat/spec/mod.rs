@@ -112,7 +112,7 @@ pub struct CachebackDrafter {
     /// processes the prompt prefill (a large `n_pending` pass); drafting
     /// there would fuse prefill with multi-position speculative samplers
     /// — a shape the SDK warns can drift off the greedy trajectory on
-    /// some backends (`inferlets/cacheback-decoding` notes). Suppressing
+    /// some backends (`inferlets/draft-model-decoding` notes). Suppressing
     /// the prefill-step draft keeps step 1 a plain prefill+1 pass; drafts
     /// engage from the first pure decode step onward.
     prefilled: bool,
