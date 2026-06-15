@@ -168,6 +168,7 @@ async fn dispatch_chat_apc(dispatch: InferletDispatch, res: Responder) -> Finish
         temperature: input.temperature,
         top_p: input.top_p,
         max_tokens: input.max_tokens,
+        max_completion_tokens: None,
         tools: input.tools,
         tool_choice: input.tool_choice,
         speculation: input.speculation,
@@ -176,6 +177,7 @@ async fn dispatch_chat_apc(dispatch: InferletDispatch, res: Responder) -> Finish
         // never asks for JSON-mode answer decoding (#572) — keep this
         // dispatch path unconstrained so ToT is unaffected.
         response_format: None,
+        stream_options: None,
     };
     completions::handle_parsed(request, res).await
 }

@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import MarkdownUI
 import os
 
 /// One transcript turn rendered Messages-style:
@@ -11,16 +10,20 @@ import os
 ///                 secondary text, no bubble — it's transcript chrome,
 ///                 not a conversational turn)
 ///
-/// Markdown is rendered via `MarkdownUI` so fenced code blocks, lists,
-/// and inline emphasis come out native instead of as raw `**bold**`
-/// literals. System turns deliberately skip Markdown — they're status
+/// Markdown is rendered into one selectable `NSTextView` surface via
+/// `SelectableMarkdownText` / `MarkdownAttributedString` so fenced code
+/// blocks, lists, and inline emphasis come out styled instead of as raw
+/// `**bold**` literals — AND a drag selection spans every paragraph (#158 /
+/// #636; MarkdownUI's per-block `Text` rendering trapped selection inside one
+/// block). System turns deliberately skip Markdown — they're status
 /// breadcrumbs, not prose.
 ///
-/// Security: assistant turns are untrusted model output. We gate link
-/// activation through `SafeLinkOpenURLAction` (http / https / mailto
-/// only) and replace MarkdownUI's default `ImageProvider` with
-/// `BlockedImageProvider` so remote image URLs cannot pull bytes off
-/// the network until an explicit policy lands. Review v1 F3.
+/// Security: assistant turns are untrusted model output. Link activation is
+/// gated through `SafeLinkOpenURLAction`'s allowlist (http / https / mailto
+/// only) — the builder withholds `.link` for other schemes and the text
+/// view re-checks at click time. Markdown images never fetch from the
+/// network (`NSAttributedString(markdown:)` does not load remote bytes; the
+/// builder renders a text placeholder). Review v1 F3.
 struct MessageBubble: View {
   let message: ChatMessageItem
   /// #513: retry-from-this-turn affordance, assistant rows only. Nil hides
@@ -96,11 +99,13 @@ struct MessageBubble: View {
             GenerationPerformanceRow(text: text)
               .reportMessageBubbleFrame(.generationPerformance(message.id))
           }
-          // One quiet chrome row under the turn: the deterministic copy
-          // path (#515 — right-click on selectable MarkdownUI text surfaces
-          // AppKit's text menu, not our `.contextMenu`, so the guaranteed
-          // affordance is this explicit button; see `MessageCopyPlan`) and
-          // the #513 retry control. Retry reads as turn chrome, not a
+          // One quiet chrome row under the turn: the canonical-source copy
+          // path (#515 — a drag selection now spans the whole bubble (#636)
+          // and copies the RENDERED text; this button copies the verbatim
+          // Markdown SOURCE, and right-click on the selectable text surfaces
+          // AppKit's own menu rather than our `.contextMenu`, so the button
+          // stays the guaranteed source-copy affordance; see `MessageCopyPlan`)
+          // and the #513 retry control. Retry reads as turn chrome, not a
           // primary action — the destructive part is guarded by the
           // scaffold's confirmation when retry would erase anything beyond
           // this stale assistant.
@@ -139,11 +144,12 @@ struct MessageBubble: View {
     }
   }
 
-  /// Deterministic copy path (#515): MarkdownUI splits one message into
-  /// many selectable `Text` blocks, so mouse selection cannot span a whole
-  /// rendered message. The context menu copies the canonical backing text
-  /// from `ChatMessageItem` instead — see `MessageCopyPlan` for the
-  /// answer/thinking boundary policy.
+  /// Canonical-source copy path (#515). A drag selection now spans the whole
+  /// rendered bubble (#636) and yields the displayed text; this menu copies the
+  /// verbatim Markdown SOURCE from `ChatMessageItem` instead — see
+  /// `MessageCopyPlan` for the answer/thinking boundary policy. (Right-click
+  /// over the selectable text surfaces AppKit's own text menu, so these items
+  /// appear on the surrounding bubble chrome.)
   @ViewBuilder
   private var copyMenuItems: some View {
     ForEach(MessageCopyPlan.plan(for: message).items, id: \.label) { item in
@@ -195,20 +201,23 @@ struct MessageBubble: View {
   }
 
   private func bubble(background: Color, foreground: Color, alignment: HorizontalAlignment) -> some View {
-    Markdown(message.content)
-      .markdownTextStyle(\.text) { ForegroundColor(foreground) }
-      .markdownTextStyle(\.code) {
-        FontFamilyVariant(.monospaced)
-        BackgroundColor(.black.opacity(0.10))
-      }
-      .markdownImageProvider(BlockedImageProvider())
-      .environment(\.openURL, SafeLinkOpenURLAction.action)
-      .textSelection(.enabled)
+    // #158/#636: a single selectable `NSTextView` surface (one text storage)
+    // replaces MarkdownUI's per-block `Text` rendering so a drag selection
+    // spans every paragraph. Link/image security and the rendered look move
+    // into `SelectableMarkdownText` / `MarkdownAttributedString`.
+    SelectableMarkdownText(markdown: message.content, foreground: Self.nsColor(for: foreground))
       .reportMessageBubbleFrame(.content(message.id))
       .padding(.horizontal, 12)
       .padding(.vertical, 8)
       .background(background, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
       .frame(maxWidth: .infinity, alignment: alignment == .trailing ? .trailing : .leading)
+  }
+
+  /// Maps the bubble's SwiftUI foreground to the AppKit color the attributed
+  /// surface paints text with. `.primary` → dynamic `labelColor` (adapts to
+  /// light/dark); the user bubble's `.white` stays opaque white on the accent.
+  private static func nsColor(for color: Color) -> NSColor {
+    color == .white ? .white : .labelColor
   }
 }
 
@@ -349,28 +358,3 @@ enum SafeLinkOpenURLAction {
   }
 }
 
-// MARK: - image policy
-
-/// Image provider that never fetches. Renders a small placeholder so
-/// the user knows an image was suppressed; the model cannot use it as
-/// a beacon (no GET to attacker-controlled origin). Phase 4+ can swap
-/// in a same-origin or content-addressed provider once we have one.
-/// Review v1 F3.
-struct BlockedImageProvider: ImageProvider {
-  func makeImage(url: URL?) -> some View {
-    HStack(spacing: 4) {
-      Image(systemName: "photo")
-        .foregroundStyle(.secondary)
-      Text("image suppressed")
-        .font(.caption2)
-        .foregroundStyle(.secondary)
-    }
-    .padding(.horizontal, 6)
-    .padding(.vertical, 2)
-    .background(
-      RoundedRectangle(cornerRadius: 4)
-        .strokeBorder(Color.secondary.opacity(0.3))
-    )
-    .help(url?.absoluteString ?? "")
-  }
-}

@@ -779,14 +779,16 @@ private struct MemoryGuardrailSection: View {
   }
 
   private func load() {
-    guard let root = try? PieDirs.applicationSupport() else { return }
     do {
+      let root = try PieDirs.applicationSupport()
       fraction = try GuardrailSettings.loadFraction(root: root)
       loadError = nil
     } catch {
-      // A corrupt/unreadable file would otherwise silently revert the
-      // operator's ceiling — show the default in the dial but tell them the
-      // saved value couldn't be read so they can re-set it.
+      // A corrupt/unreadable file OR an unresolvable support root would
+      // otherwise silently revert the operator's ceiling — show the default
+      // in the dial but tell them the saved value couldn't be read so they
+      // can re-set it. Root resolution lives inside the do/catch so a root
+      // failure surfaces here too, instead of a silent `try?` guard.
       fraction = GuardrailSettings.defaultFraction
       loadError = "Saved guardrail setting couldn't be read — showing the default. Adjust the dial to re-save. (\(error))"
     }

@@ -130,8 +130,17 @@ public final class EngineStatusStore: ObservableObject {
 
   /// Wall-clock source, injectable so a test can stamp `startingSince`
   /// deterministically. Defaults to `Date()` (production + existing
-  /// callers unaffected).
-  private let now: @Sendable () -> Date
+  /// callers unaffected). Module-internal (not `private`) so the
+  /// `ChatRecoveryGate` conformance in a sibling file can route
+  /// `waitUntilRunning`'s deadline through the same clock.
+  let now: @Sendable () -> Date
+
+  /// Cooperative sleep used by the `waitUntilRunning` recovery loop,
+  /// injectable so a test can drive the wait on a virtual clock instead of
+  /// burning real wall-clock budget (mirrors `PieEngineHost.sleepFor`).
+  /// Default: the cancellation-aware `Task.sleep` the loop used inline, so
+  /// production behaviour is byte-identical.
+  let sleepFor: @Sendable (TimeInterval) async -> Void
 
   /// Consecutive `engineStatus()` polls that FAILED at the transport layer
   /// (helper unreachable / reply timeout). Reset to 0 on the first
@@ -190,7 +199,10 @@ public final class EngineStatusStore: ObservableObject {
     initialDaemonBindMode: EngineHTTPBindMode = .loopback,
     daemonBindModeProvider: @escaping @MainActor @Sendable () -> EngineHTTPBindMode = { .loopback },
     tierPolicy: StatusTierPolicy = StatusTierPolicy(),
-    now: @escaping @Sendable () -> Date = { Date() }
+    now: @escaping @Sendable () -> Date = { Date() },
+    sleepFor: @escaping @Sendable (TimeInterval) async -> Void = { seconds in
+      try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+    }
   ) {
     self.client = client
     self.daemonBindModeProvider = daemonBindModeProvider
@@ -198,6 +210,7 @@ public final class EngineStatusStore: ObservableObject {
     self.steadyPollInterval = steadyPollInterval
     self.tierPolicy = tierPolicy
     self.now = now
+    self.sleepFor = sleepFor
     self.status = initialStatus
     self.runtimeDaemonBindMode = initialDaemonBindMode
     if case .running(let snapshot) = initialStatus {

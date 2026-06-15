@@ -160,6 +160,24 @@ final class EngineStatusStoreTests: XCTestCase {
     }
   }
 
+  /// Virtual clock backing the `now` / `sleepFor` seams so the recovery-wait
+  /// tests run on advanceable time with zero real wall-clock budget. Thread-
+  /// safe because the injected closures are `@Sendable`.
+  private final class VirtualClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seconds: TimeInterval = 0
+    /// Total virtual time advanced via `sleepFor` — the "budget burned".
+    var elapsed: TimeInterval { lock.lock(); defer { lock.unlock() }; return seconds }
+    func nowDate() -> Date {
+      lock.lock(); defer { lock.unlock() }
+      return Date(timeIntervalSinceReferenceDate: seconds)
+    }
+    func advance(_ dt: TimeInterval) {
+      lock.lock(); defer { lock.unlock() }
+      seconds += max(0, dt)
+    }
+  }
+
   // MARK: - startEngine (#326 fresh-install recovery)
 
   func test_startEngine_forwards_profileID_to_client() async throws {
@@ -870,37 +888,41 @@ final class EngineStatusStoreTests: XCTestCase {
     // When the App's helper-restart ladder reports `.unreachable` (gave up),
     // the recovery wait must return false IMMEDIATELY rather than burn the
     // full (helper-sized) budget — so the chat turn surfaces in lockstep with
-    // the escalation banner instead of spinning for tens of seconds.
-    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting)
+    // the escalation banner instead of spinning for tens of seconds. Driven on
+    // a virtual clock: the early-exit must fire before a single inter-poll
+    // sleep advances it, so the measured budget burned is zero (no real wait).
+    let clock = VirtualClock()
+    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting,
+                                  now: { clock.nowDate() }, sleepFor: { clock.advance($0) })
     store.helperHealthProvider = { .unreachable }
-    let start = Date()
     let recovered = await store.waitUntilRunning(timeout: 10)
-    let elapsed = Date().timeIntervalSince(start)
     XCTAssertFalse(recovered, "a ladder that gave up must not report recovery")
-    XCTAssertLessThan(elapsed, 1.0, "must early-exit on .unreachable, not wait the full 10s budget")
+    XCTAssertEqual(clock.elapsed, 0, "must early-exit on .unreachable, not burn any of the 10s budget")
   }
 
   func test_waitUntilRunning_keepsWaiting_while_ladder_still_repairing() async {
     // While the ladder is still working (not terminal), the wait honors its
-    // budget — it must NOT bail early on a non-terminal helper state.
-    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting)
+    // budget — it must NOT bail early on a non-terminal helper state. Driven on
+    // a virtual clock so the full budget is "spent" with zero real wall time.
+    let clock = VirtualClock()
+    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting,
+                                  now: { clock.nowDate() }, sleepFor: { clock.advance($0) })
     store.helperHealthProvider = { .repairing(attempt: 1) }
-    let start = Date()
     let recovered = await store.waitUntilRunning(timeout: 0.3)
-    let elapsed = Date().timeIntervalSince(start)
     XCTAssertFalse(recovered)
-    XCTAssertGreaterThanOrEqual(elapsed, 0.25, "a still-repairing ladder must not trip the give-up early-exit")
+    XCTAssertGreaterThanOrEqual(clock.elapsed, 0.3,
+                                "a still-repairing ladder must not trip the give-up early-exit")
   }
 
   func test_waitUntilRunning_noProvider_waits_full_budget() async {
     // Backward compat: with no helper-health source (engine-gone path / tests)
     // `helperRecoveryGaveUp` is false and the wait runs to its timeout.
-    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting)
-    let start = Date()
+    let clock = VirtualClock()
+    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting,
+                                  now: { clock.nowDate() }, sleepFor: { clock.advance($0) })
     let recovered = await store.waitUntilRunning(timeout: 0.3)
-    let elapsed = Date().timeIntervalSince(start)
     XCTAssertFalse(recovered)
-    XCTAssertGreaterThanOrEqual(elapsed, 0.25, "no give-up signal → honor the timeout")
+    XCTAssertGreaterThanOrEqual(clock.elapsed, 0.3, "no give-up signal → honor the timeout")
   }
 
   // MARK: - #2 first-load transient-failure hold

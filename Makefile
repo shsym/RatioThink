@@ -503,6 +503,9 @@ test-gui-stream-cancel: genproject ## #507 deterministic GUI stream-continuity E
 test-gui-copy: genproject ## #515 deterministic GUI copy E2E (Copy button → pasteboard == canonical multi-section Markdown) — needs seated session
 	Scripts/run-copy-gui-e2e.sh
 
+test-gui-select: genproject ## #636/GH#158 deterministic GUI drag-selection E2E (one drag spans paragraphs → Copy yields multi-paragraph span) — needs seated session
+	Scripts/run-select-gui-e2e.sh
+
 test-gui-chat-retry: genproject ## #513 deterministic GUI retry-from-a-prior-turn E2E (truncation confirm + regenerate) — needs seated session
 	Scripts/run-chat-retry-gui-e2e.sh
 

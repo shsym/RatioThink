@@ -168,9 +168,12 @@ final class S513_ChatRetryGUITests: XCTestCase {
     return false
   }
 
+  /// One message body is one selectable NSTextView now (#636, `.textView`)
+  /// rather than per-block `.staticText`; `transcriptTextMatchCount` searches
+  /// both, one element per message body — so the exact `== 1` reply-count
+  /// assertion (and the presence/absence waits) stay correct.
   private func countOfStaticTextsContaining(_ needle: String, in app: XCUIApplication) -> Int {
-    let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@", needle, needle)
-    return app.descendants(matching: .staticText).matching(predicate).count
+    transcriptTextMatchCount(needle, in: app)
   }
 
   private static let configPath = "/tmp/pie-chat-retry-gui-e2e.env"

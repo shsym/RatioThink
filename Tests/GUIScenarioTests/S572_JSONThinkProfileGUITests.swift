@@ -180,7 +180,13 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
     while Date() < deadline {
       // Keep the app key during the stream wait so the AX tree stays live (#545).
       app.activate()
-      if app.descendants(matching: .staticText).matching(predicate).count >= 1 {
+      // The assistant body is one selectable NSTextView now (#636, `.textView`)
+      // carrying the answer as its value, not the per-block `.staticText`
+      // MarkdownUI produced — match both narrow types (custom regex, so not the
+      // shared CONTAINS helper).
+      let matches = app.descendants(matching: .textView).matching(predicate).count
+                  + app.descendants(matching: .staticText).matching(predicate).count
+      if matches >= 1 {
         return true
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))

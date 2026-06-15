@@ -193,8 +193,11 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
       let assistantMessages = app.descendants(matching: .any)
         .matching(identifier: "message.assistant")
       for index in 0..<assistantMessages.count {
+        // The assistant body is one selectable NSTextView now (#636,
+        // `.textView`) within the message.assistant group, not the per-block
+        // `.staticText` MarkdownUI produced.
         if assistantMessages.element(boundBy: index)
-          .descendants(matching: .staticText)
+          .descendants(matching: .textView)
           .matching(predicate)
           .firstMatch
           .exists {

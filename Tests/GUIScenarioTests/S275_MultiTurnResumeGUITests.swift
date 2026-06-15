@@ -127,13 +127,11 @@ final class S275_MultiTurnResumeGUITests: XCTestCase {
     timeout: TimeInterval
   ) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
-    let predicate = NSPredicate(
-      format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
-      needle,
-      needle
-    )
     while Date() < deadline {
-      if app.descendants(matching: .staticText).matching(predicate).count >= 1 {
+      // Message bodies render as one selectable NSTextView each now (#636,
+      // `.textView`) rather than per-block `.staticText`;
+      // `transcriptTextMatchCount` searches both.
+      if transcriptTextMatchCount(needle, in: app) >= 1 {
         return true
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25))

@@ -146,6 +146,28 @@ final class ModelMemoryGuardrailTests: XCTestCase {
                    "corrupt guardrail.json → default fraction, not a propagated throw")
   }
 
+  /// A support-root *resolution* failure (rootMkdirFailed) is an
+  /// environmental fault, not an unset dial. `resolvedSupportRootOrLogged`
+  /// — the default-arg resolver for `livePolicy` — must log it and return
+  /// nil (→ default fraction) rather than launder it to a silent nil via a
+  /// bare `try?`. The nil return is the testable seam; a writable root
+  /// resolves to a real URL (positive control so the failure assertion
+  /// isn't vacuous).
+  func test_resolvedSupportRootOrLogged_returns_nil_on_root_failure() {
+    let unwritable = URL(fileURLWithPath: "/System/Library/pie-test-cannot-create")
+    PieDirs.$homeOverride.withValue(unwritable) {
+      XCTAssertNil(ModelMemoryGuardrail.resolvedSupportRootOrLogged(),
+                   "a support-root resolution failure must resolve to nil (logged fallback)")
+    }
+
+    // Positive control so the failure assertion isn't vacuous: a writable
+    // root resolves to a real URL. `tempDir` is created writable in setUp.
+    PieDirs.$homeOverride.withValue(tempDir) {
+      XCTAssertNotNil(ModelMemoryGuardrail.resolvedSupportRootOrLogged(),
+                      "a resolvable root must return a URL, not nil")
+    }
+  }
+
   // MARK: - validate() over a real (sparse) file
 
   func test_validate_8gb_host_blocks_4gib_model_with_terms_in_message() throws {

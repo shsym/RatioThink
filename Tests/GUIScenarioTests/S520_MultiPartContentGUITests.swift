@@ -108,15 +108,16 @@ final class S520_MultiPartContentGUITests: XCTestCase {
                   "composer.send not tappable after typing prompt; app tree: \(app.debugDescription)")
     send.click()
 
-    let predicate = NSPredicate(
-      format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
-      "The capital of Fra", "The capital of Fra")
     let deadline = Date().addingTimeInterval(120)
     var visible = false
     while Date() < deadline {
       // Keep the app key during the stream wait so the AX tree stays live (#545).
       app.activate()
-      if app.descendants(matching: .staticText).matching(predicate).count >= 2 {
+      // Two bubbles carry the phrase: the user echo and the assistant reply.
+      // Each message body is now one selectable NSTextView (#636, `.textView`)
+      // rather than per-block `.staticText`; `transcriptTextMatchCount` counts
+      // one element per message body, so the `>= 2` (user + assistant) holds.
+      if transcriptTextMatchCount("The capital of Fra", in: app) >= 2 {
         visible = true
         break
       }

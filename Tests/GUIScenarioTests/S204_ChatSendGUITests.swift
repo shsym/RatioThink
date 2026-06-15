@@ -95,17 +95,16 @@ final class S204_ChatSendGUITests: XCTestCase {
   }
 
   /// Wait for any rendered static text whose label OR value contains
-  /// `needle`. MarkdownUI exposes assistant runs via `value`, so the
-  /// predicate checks both (same approach S258 uses for its echo
-  /// check). Narrow `.staticText` query — not `descendants(.any)`.
+  /// `needle`. A message body is now one selectable NSTextView (#636) exposed
+  /// as a `.textView` carrying the full string as its value, not the per-block
+  /// `.staticText` MarkdownUI produced; `transcriptTextMatchCount` searches both
+  /// element types.
   private func waitForStaticTextContaining(_ needle: String,
                                            in app: XCUIApplication,
                                            timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
-    let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
-                                needle, needle)
     while Date() < deadline {
-      if app.descendants(matching: .staticText).matching(predicate).count >= 1 {
+      if transcriptTextMatchCount(needle, in: app) >= 1 {
         return true
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
