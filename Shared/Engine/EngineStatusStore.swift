@@ -332,17 +332,28 @@ public final class EngineStatusStore: ObservableObject {
   }
 
   /// (Re)start the engine on the active-profile marker, guarding a
-  /// missing/empty marker (no profile selected ⇒ nothing to start, a silent
-  /// no-op). The three marker-driven call sites — the banner Force Restart,
-  /// the Local API toggle, and the Restart-Engine menu — share this; the
-  /// chat scaffold starts its per-chat `selectedProfileID` via
+  /// missing/empty marker (no profile selected ⇒ nothing to start). The
+  /// three marker-driven call sites — the banner Force Restart, the Local
+  /// API toggle, and the Restart-Engine menu — share this; the chat scaffold
+  /// starts its per-chat `selectedProfileID` via
   /// `startEngine(profileID:onError:)` instead, since that target is the
   /// chat's profile, not the global marker.
+  ///
+  /// The empty-marker branch is a no-op by default, but invokes `onNoProfile`
+  /// first so a caller with no other surface can still trace the click. The
+  /// Restart-Engine menu wires this to its `NSLog` (no banner, and with no
+  /// profile there's no start attempt for the status poll to surface);
+  /// RootView / Local API keep the default no-op, preserving their
+  /// pre-existing silent guard.
   public func startOnActiveProfile(
     profileStore: ProfileStore,
-    onError: @escaping (Error) -> Void = { _ in }
+    onError: @escaping (Error) -> Void = { _ in },
+    onNoProfile: () -> Void = {}
   ) {
-    guard let profileID = profileStore.activeProfileID, !profileID.isEmpty else { return }
+    guard let profileID = profileStore.activeProfileID, !profileID.isEmpty else {
+      onNoProfile()
+      return
+    }
     startEngine(profileID: profileID, onError: onError)
   }
 

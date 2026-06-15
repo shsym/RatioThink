@@ -319,10 +319,14 @@ struct RatioThinkApp: App {
     Task {
       await Self.performHelperRegistrationReconcile()
       // #610: the guard + start now live in `startOnActiveProfile`; this
-      // site routes a refusal to NSLog (the menu has no banner surface).
-      engineStatusStore.startOnActiveProfile(profileStore: profileStore) { error in
-        NSLog("Restart Engine: startEngine failed: \(error)")
-      }
+      // site routes a refusal to NSLog (the menu has no banner surface). The
+      // empty-marker case is traceless at every other site, but this menu
+      // action keeps its pre-#610 no-profile diagnostic via `onNoProfile`.
+      engineStatusStore.startOnActiveProfile(
+        profileStore: profileStore,
+        onError: { error in NSLog("Restart Engine: startEngine failed: \(error)") },
+        onNoProfile: { NSLog("Restart Engine: no active profile to start") }
+      )
     }
   }
 

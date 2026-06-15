@@ -593,6 +593,27 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertFalse(onErrorFired)
   }
 
+  /// The empty-marker no-op still invokes `onNoProfile` so a caller with no
+  /// banner surface (the Restart-Engine menu) keeps a trace of the click —
+  /// the menu wires it to NSLog. Fires synchronously (no start Task), and
+  /// `onError` stays untouched (no start was attempted).
+  func test_startOnActiveProfile_fires_onNoProfile_without_active_marker() throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client)
+    let profiles = try makeProfileStore(activeID: nil)
+    var noProfileFired = false
+    var onErrorFired = false
+    store.startOnActiveProfile(
+      profileStore: profiles,
+      onError: { _ in onErrorFired = true },
+      onNoProfile: { noProfileFired = true }
+    )
+    XCTAssertTrue(noProfileFired,
+                  "the empty-marker guard must invoke onNoProfile so the menu site can trace it")
+    XCTAssertEqual(client.startCalls, 0, "no start may be attempted without a marker")
+    XCTAssertFalse(onErrorFired, "onError is for a real start refusal, not the no-profile guard")
+  }
+
   /// A start refusal on the marker routes to the caller's sink — proves the
   /// guard wrapper still funnels the error.
   func test_startOnActiveProfile_routes_error() async throws {
