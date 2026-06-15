@@ -33,15 +33,15 @@ public enum InferletResources {
 
   /// Returns the wasm + manifest URLs for the bundled `chat-apc`
   /// inferlet, resolving from:
-  ///   1. `bundle` directly (the in-app case — caller is RatioThink.app), OR
+  ///   1. `bundle` directly (the in-app case — caller is Rational.app), OR
   ///   2. the containing app bundle when `bundle` is an embedded
-  ///      helper (`RatioThink.app/Contents/Library/LoginItems/RatioThinkHelper.app`
+  ///      helper (`Rational.app/Contents/Library/LoginItems/RationalHelper.app`
   ///      walks two levels up).
   ///
   /// Step 2 lets RatioThinkHelper consume the artifacts without us
   /// double-bundling them into the helper too; the wasm is ~242 KiB
   /// and `cp`-duplicating it across two targets is gratuitous when
-  /// RatioThinkHelper already lives inside RatioThink.app's wrapper.
+  /// RationalHelper already lives inside Rational.app's wrapper.
   public static func pieControl(in bundle: Bundle = .main) throws -> (wasm: URL, manifest: URL) {
     let searchBundles = candidateBundles(starting: bundle)
     let wasm = try locate(name: wasmName, in: searchBundles) { searched in
@@ -56,15 +56,15 @@ public enum InferletResources {
   // MARK: - private
 
   /// Canonical embed layout is
-  /// `RatioThink.app/Contents/Library/LoginItems/RatioThinkHelper.app` — FOUR
+  /// `Rational.app/Contents/Library/LoginItems/RationalHelper.app` — FOUR
   /// `deletingLastPathComponent()` hops from the helper bundle to
-  /// reach the containing `RatioThink.app`. The prior `0..<3` bound stopped
-  /// at `RatioThink.app/Contents` and never found the parent (review v150
+  /// reach the containing `Rational.app`. The prior `0..<3` bound stopped
+  /// at `Rational.app/Contents` and never found the parent (review v150
   /// F6). Six gives two extra levels of headroom for a future
   /// versioned LoginItems subdir, matching `HelperAppDelegate
   /// .pieAppAncestorMaxDepth` and `LaunchSpecResolver.bundleWalkMaxDepth`.
   private static let bundleWalkMaxDepth = 6
-  private static let xcodeSiblingAppName = "RatioThink.app"
+  private static let xcodeSiblingAppName = "Rational.app"
 
   private static func candidateBundles(starting bundle: Bundle) -> [Bundle] {
     var out: [Bundle] = []
@@ -83,10 +83,10 @@ public enum InferletResources {
     var url = bundle.bundleURL
     for _ in 0..<bundleWalkMaxDepth {
       // Xcode UI tests can launch the RatioThinkHelper target as a
-      // standalone sibling of RatioThink.app instead of from the production
+      // standalone sibling of Rational.app instead of from the production
       // embedded LoginItems path. Include that sibling so the GUI
       // harness exercises the same single-bundled app resources
-      // production uses without duplicating them into RatioThinkHelper.app.
+      // production uses without duplicating them into RationalHelper.app.
       appendBundle(at: url.deletingLastPathComponent()
         .appendingPathComponent(xcodeSiblingAppName, isDirectory: true))
       url = url.deletingLastPathComponent()

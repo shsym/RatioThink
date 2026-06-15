@@ -38,6 +38,145 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  /// #413: first launch also seeds an example tree-of-thought profile so
+  /// the live tree-search feature is reachable by switching to it. chat
+  /// stays the active default; the ToT profile is a valid ToT profile.
+  func test_seeds_tree_of_thought_profile_on_first_launch() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      let seeded = dir.appendingPathComponent(ProfileStore.treeOfThoughtFilename)
+      XCTAssertTrue(FileManager.default.fileExists(atPath: seeded.path),
+                    "first launch should seed tree-of-thought.toml")
+
+      let entry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "tree-of-thought.toml" })
+      let profile = try XCTUnwrap(entry.profile)
+      XCTAssertEqual(profile.id, "tree-of-thought")
+      XCTAssertEqual(profile.inferlet, "chat-apc", "ToT is a dispatch mode; the launched inferlet stays chat-apc")
+      XCTAssertEqual(profile.treeOfThought, ToTProfileConfig(breadth: 3, depth: 2, beamWidth: 2, maxTokensPerNode: 256))
+      // chat remains the active default; ToT is opt-in via profile switch.
+      XCTAssertEqual(store.activeProfileID, "chat")
+    }
+  }
+
+  // MARK: - #469 active-model marker
+
+  func test_activeModel_marker_roundTrips_and_clears() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertNil(store.activeModelID, "no marker before any launch")
+
+      try store.setActiveModelID("Org/Repo/picked.gguf")
+      XCTAssertEqual(store.activeModelID, "Org/Repo/picked.gguf")
+      // Default marker location is a sibling of active-profile.
+      XCTAssertTrue(FileManager.default.fileExists(atPath: store.activeModelURL.path),
+                    "setActiveModelID must persist the marker on disk")
+
+      // Overwrite is last-write-wins.
+      try store.setActiveModelID("Org/Repo/other.gguf")
+      XCTAssertEqual(store.activeModelID, "Org/Repo/other.gguf")
+
+      try store.clearActiveModelID()
+      XCTAssertNil(store.activeModelID, "clear removes the marker")
+      try store.clearActiveModelID()  // idempotent when already absent
+    }
+  }
+
+  func test_activeModel_marker_is_durable_across_store_instances() throws {
+    // The marker is the durable source of truth the Helper boots from after a
+    // relaunch (#469): a fresh ProfileStore over the same directory reads it.
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      let writer = ProfileStore(directory: dir, activeProfileURL: active)
+      try writer.start()
+      try writer.setActiveModelID("Org/Repo/durable.gguf")
+      writer.stop()
+
+      let reader = ProfileStore(directory: dir, activeProfileURL: active)
+      try reader.start()
+      defer { reader.stop() }
+      XCTAssertEqual(reader.activeModelID, "Org/Repo/durable.gguf",
+                     "a relaunched Helper must read the last-launched model from disk")
+    }
+  }
+
+  func test_activeModel_marker_blankFile_readsAsNil() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+      try "   \n".write(to: store.activeModelURL, atomically: true, encoding: .utf8)
+      XCTAssertNil(store.activeModelID, "a blank/whitespace marker reads as no selection")
+    }
+  }
+
+  /// #413 (operator ITEM 2A): an EXISTING install — profiles dir already
+  /// holds `chat.toml` from before #413, so the empty-dir seed is a no-op —
+  /// must STILL get the tree-of-thought profile, via the write-if-absent
+  /// backfill on `start()`. (Reproduces the operator's "ToT profile appears
+  /// nowhere" on an upgraded install.)
+  func test_backfills_tree_of_thought_profile_into_existing_install() throws {
+    try withTempProfilesDir { dir in
+      try ProfileStore.defaultChatTOML.write(
+        to: dir.appendingPathComponent(ProfileStore.defaultChatFilename),
+        atomically: true, encoding: .utf8)
+      let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
+      try "chat".write(to: active, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      let totURL = dir.appendingPathComponent(ProfileStore.treeOfThoughtFilename)
+      XCTAssertTrue(FileManager.default.fileExists(atPath: totURL.path),
+                    "existing install (non-empty dir) must still get tree-of-thought.toml backfilled")
+      let entry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "tree-of-thought.toml" })
+      XCTAssertEqual(entry.profile?.id, "tree-of-thought")
+      XCTAssertNotNil(entry.profile?.treeOfThought)
+      XCTAssertEqual(store.activeProfileID, "chat", "backfill must not change the active profile")
+    }
+  }
+
+  /// #413: the backfill is write-IF-ABSENT — it must never clobber a
+  /// user-edited tree-of-thought.toml.
+  func test_backfill_does_not_clobber_user_edited_tree_of_thought_profile() throws {
+    try withTempProfilesDir { dir in
+      try ProfileStore.defaultChatTOML.write(
+        to: dir.appendingPathComponent(ProfileStore.defaultChatFilename),
+        atomically: true, encoding: .utf8)
+      let edited = """
+      id = "tree-of-thought"
+      name = "My ToT"
+      model = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+      inferlet = "chat-apc"
+
+      [inferlet_args]
+      mode = "tree-of-thought"
+      breadth = 5
+      """
+      let totURL = dir.appendingPathComponent(ProfileStore.treeOfThoughtFilename)
+      try edited.write(to: totURL, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(try String(contentsOf: totURL, encoding: .utf8), edited,
+                     "backfill must not clobber a user-edited tree-of-thought.toml")
+      XCTAssertEqual(
+        store.entries.first { $0.url.lastPathComponent == "tree-of-thought.toml" }?.profile?.treeOfThought?.breadth,
+        5)
+    }
+  }
+
   /// : seeding the default `chat.toml` on a fresh install
   /// must also write the active-profile marker. Without this, the
   /// menu-bar Resume click returns `.noActiveProfile` on first launch
@@ -232,15 +371,72 @@ final class ProfileStoreTests: XCTestCase {
       try writeProfile(into: dir, name: "zeta.toml", id: "zeta", displayName: "Zeta")
       try writeProfile(into: dir, name: "alpha.toml", id: "alpha", displayName: "Alpha")
 
-      let store = ProfileStore(directory: dir)
+      // Opt out of the #413 example-profile backfill so this scan-ordering
+      // fixture stays hermetic (alpha + zeta only).
+      let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
       try store.start()
       defer { store.stop() }
 
       let names = store.entries.map { $0.url.lastPathComponent }
-      // fast-think.toml is auto-seeded into every install (#426 ensure-exists),
-      // so it appears in the scan alongside the authored profiles, sorted.
-      XCTAssertEqual(names, ["alpha.toml", "fast-think.toml", "zeta.toml"],
+      // repeat-boost.toml (#426; slug #628) and json-think.toml (#572) are
+      // auto-seeded into every install (ensure-exists), so they appear in
+      // the scan alongside the authored profiles, sorted.
+      XCTAssertEqual(names, ["alpha.toml", "json-think.toml", "repeat-boost.toml", "zeta.toml"],
                      "entries must be sorted by filename for stable UI ordering")
+    }
+  }
+
+  // MARK: - built-in JSON Think seed (#572)
+
+  func test_seeds_builtin_json_think_profile_into_populated_dir() throws {
+    try withTempProfilesDir { dir in
+      // A populated dir (the empty-dir chat seed is a no-op here) must
+      // still gain the built-in JSON Think profile on start.
+      try writeProfile(into: dir, name: "alpha.toml", id: "alpha", displayName: "Alpha")
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let jsonThink = store.entries.first { $0.profile?.id == ProfileStore.defaultJSONThinkProfileID }
+      let profile = try XCTUnwrap(jsonThink?.profile, "JSON Think profile must be seeded")
+      XCTAssertEqual(profile.responseFormat, .jsonObject)
+      XCTAssertNil(store.lastDirectoryError, "a clean seed must not surface a directory error")
+    }
+  }
+
+  func test_response_format_accessor_reads_seeded_json_think() throws {
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(
+        store.responseFormat(forProfileID: ProfileStore.defaultJSONThinkProfileID),
+        .jsonObject)
+      // The default chat profile carries no constraint.
+      XCTAssertNil(store.responseFormat(forProfileID: ProfileStore.defaultProfileID))
+    }
+  }
+
+  func test_does_not_overwrite_existing_json_think_toml() throws {
+    try withTempProfilesDir { dir in
+      // A user edit to json-think.toml must survive a restart (existence-gated).
+      let edited = """
+      id = "json-think"
+      name = "My JSON"
+      model = "m"
+      inferlet = "chat-apc"
+      """
+      try edited.write(to: dir.appendingPathComponent(ProfileStore.defaultJSONThinkFilename),
+                       atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let jsonThink = store.entries.first { $0.profile?.id == ProfileStore.defaultJSONThinkProfileID }
+      XCTAssertEqual(jsonThink?.profile?.name, "My JSON", "user edit must not be overwritten")
     }
   }
 
@@ -1328,9 +1524,11 @@ final class ProfileStoreTests: XCTestCase {
     try withTempProfilesDir { dir in
       try writeProfile(into: dir, name: "a.toml", id: "a", displayName: "A")
       try writeProfile(into: dir, name: "b.toml", id: "b", displayName: "B")
-      let store = ProfileStore(directory: dir)
+      // Opt out of the #413 example-profile backfill so the entry count is
+      // exactly the two fixtures.
+      let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
       try store.start()
-      // Seed-count-agnostic: the built-in Fast Think profile is auto-seeded
+      // Seed-count-agnostic: the built-in Repeat Boost profile is auto-seeded
       // (#426) on top of the authored set, so assert "populated", not a count.
       XCTAssertFalse(store.entries.isEmpty, "sanity: populated post-start")
 
@@ -1459,9 +1657,11 @@ final class ProfileStoreTests: XCTestCase {
     // pins it.
     try withTempProfilesDir { dir in
       try writeProfile(into: dir, name: "a.toml", id: "a", displayName: "A")
-      let store = ProfileStore(directory: dir)
+      // Opt out of the #413 example-profile backfill so the count is exactly
+      // the one fixture (the test then drops a 2nd to schedule a reload).
+      let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
       try store.start()
-      // Seed-count-agnostic (#426 auto-seeds Fast Think on top of the
+      // Seed-count-agnostic (#426 auto-seeds Repeat Boost on top of the
       // authored set); this test only needs the store populated post-start.
       XCTAssertFalse(store.entries.isEmpty, "sanity: populated post-start")
 
@@ -1887,6 +2087,152 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+
+  func test_clearModel_removes_default_and_preserves_profile_as_valid_no_default_state() throws {
+    try withTempProfilesDir { dir in
+      let body = """
+      id = "chat"
+      name = "Chat"
+      icon = "bubble.left.and.bubble.right"
+      model = "deleted-model.gguf"
+      inferlet = "chat-apc"
+      system_prompt = "You are helpful."
+
+      [sampling]
+      temperature = 0.5
+      top_p = 0.8
+      max_tokens = 1024
+      """
+      try body.write(to: dir.appendingPathComponent("chat.toml"),
+                     atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      try store.clearModel(forProfileID: "chat")
+
+      XCTAssertNil(store.model(forProfileID: "chat"),
+                   "cleared profile default must resolve as no default, not a fabricated fallback")
+      let profile = try XCTUnwrap(store.entries.first { $0.profile?.id == "chat" }?.profile)
+      XCTAssertNil(profile.model,
+                   "profile remains valid while explicitly carrying no default model")
+      XCTAssertEqual(profile.name, "Chat", "name must survive the model clear")
+      XCTAssertEqual(profile.icon, "bubble.left.and.bubble.right")
+      XCTAssertEqual(profile.inferlet, "chat-apc")
+      XCTAssertEqual(profile.systemPrompt, "You are helpful.")
+      XCTAssertEqual(profile.sampling.temperature, 0.5, accuracy: 0.0001)
+      XCTAssertEqual(profile.sampling.maxTokens, 1024)
+
+      let disk = try String(contentsOf: dir.appendingPathComponent("chat.toml"), encoding: .utf8)
+      XCTAssertFalse(disk.contains("model ="),
+                     "clearing the default should remove the TOML model key rather than write an empty or fallback value")
+      let (reloaded, _) = ProfileStore.scan(directory: dir)
+      let reparsed = try XCTUnwrap(reloaded.first { $0.profile?.id == "chat" }?.profile)
+      XCTAssertNil(reparsed.model,
+                   "a fresh scan must keep the cleared profile parseable as no-default")
+    }
+  }
+
+  func test_profilesReferencingModel_returns_names_and_clearModels_updates_all_matches() throws {
+    try withTempProfilesDir { dir in
+      let shared = "deleted-model.gguf"
+      let profiles = [
+        ("chat.toml", "chat", "Chat", shared),
+        ("fast.toml", "fast", "Repeat Boost", shared),
+        ("code.toml", "code", "Code", "other-model.gguf"),
+      ]
+      for (filename, id, name, model) in profiles {
+        let body = """
+        id = "\(id)"
+        name = "\(name)"
+        model = "\(model)"
+        inferlet = "chat-apc"
+        """
+        try body.write(to: dir.appendingPathComponent(filename),
+                       atomically: true, encoding: .utf8)
+      }
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let affected = store.profilesReferencingModel(shared)
+      XCTAssertEqual(affected.map(\.name), ["Chat", "Repeat Boost"],
+                     "delete confirmation must be able to show affected profile names in stable order")
+
+      try store.clearModelDefaults(referencing: shared)
+
+      XCTAssertNil(store.model(forProfileID: "chat"))
+      XCTAssertNil(store.model(forProfileID: "fast"))
+      XCTAssertEqual(store.model(forProfileID: "code"), "other-model.gguf",
+                     "non-referencing profiles must not be changed")
+    }
+  }
+
+  func test_withClearedModelDefaults_restores_defaults_when_operation_fails() throws {
+    try withTempProfilesDir { dir in
+      let shared = "deleted-model.gguf"
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat", model: shared)
+      try writeProfile(into: dir, name: "fast.toml", id: "fast", displayName: "Repeat Boost", model: shared)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertThrowsError(try store.withClearedModelDefaults(referencing: shared) {
+        throw ProfileStoreDefaultsTransactionProbeError.trashFailed
+      }) { error in
+        guard case let transaction as ProfileModelDefaultsTransactionError = error,
+              case .operationFailed(_, _, _, let rollback) = transaction else {
+          return XCTFail("expected operationFailed transaction error, got \(error)")
+        }
+        XCTAssertEqual(rollback, .succeeded,
+                       "failed model trash must report that cleared defaults were restored")
+        XCTAssertTrue(transaction.description.contains("restored"),
+                      "user-visible delete error must distinguish recovered profile defaults; got: \(transaction)")
+      }
+
+      XCTAssertEqual(store.model(forProfileID: "chat"), shared)
+      XCTAssertEqual(store.model(forProfileID: "fast"), shared)
+    }
+  }
+
+  func test_withClearedModelDefaults_rolls_back_previously_cleared_profile_when_later_clear_fails() throws {
+    try withTempProfilesDir { dir in
+      let shared = "deleted-model.gguf"
+      try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat", model: shared)
+      try writeProfile(into: dir, name: "fast.toml", id: "fast", displayName: "Repeat Boost", model: shared)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      var operationRan = false
+
+      XCTAssertThrowsError(try store.withClearedModelDefaults(
+        referencing: shared,
+        writeProfile: { profile, filename in
+          if profile.id == "fast", profile.model == nil {
+            throw ProfileStoreDefaultsTransactionProbeError.profileWriteFailed
+          }
+          try store.createProfile(profile, filename: filename)
+        },
+        operation: {
+          operationRan = true
+        }
+      )) { error in
+        guard case let transaction as ProfileModelDefaultsTransactionError = error,
+              case .clearFailed(_, let cleared, _, let rollback) = transaction else {
+          return XCTFail("expected clearFailed transaction error, got \(error)")
+        }
+        XCTAssertEqual(cleared.map(\.id), ["chat"],
+                       "error must report the exact profile defaults that needed rollback")
+        XCTAssertEqual(rollback, .succeeded,
+                       "partial profile clear failure must roll back earlier clears before surfacing")
+      }
+
+      XCTAssertFalse(operationRan, "model trash operation must not run after a partial profile clear failure")
+      XCTAssertEqual(store.model(forProfileID: "chat"), shared)
+      XCTAssertEqual(store.model(forProfileID: "fast"), shared)
+    }
+  }
+
   func test_setModel_throws_for_unknown_profile() throws {
     try withTempProfilesDir { dir in
       try writeProfile(into: dir, name: "chat.toml", id: "chat", displayName: "Chat")
@@ -1899,31 +2245,31 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
-  // MARK: - built-in Fast Think seed (#426)
+  // MARK: - built-in Repeat Boost seed (#426; slug #628)
 
-  func test_seeds_fast_think_profile_on_fresh_install() throws {
+  func test_seeds_repeat_boost_profile_on_fresh_install() throws {
     try withTempProfilesDir { dir in
       let store = ProfileStore(directory: dir)
       try store.start()
       defer { store.stop() }
 
-      let seeded = dir.appendingPathComponent(ProfileStore.defaultFastThinkFilename)
+      let seeded = dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename)
       XCTAssertTrue(FileManager.default.fileExists(atPath: seeded.path),
-                    "fresh install should seed fast-think.toml")
+                    "fresh install should seed repeat-boost.toml")
       let entry = try XCTUnwrap(store.entries.first {
-        $0.profile?.id == ProfileStore.defaultFastThinkProfileID
+        $0.profile?.id == ProfileStore.defaultRepeatBoostProfileID
       })
       XCTAssertNil(entry.error)
       XCTAssertEqual(entry.profile?.speculation, Profile.Speculation(enabled: true))
       XCTAssertEqual(entry.profile?.sampling.temperature, 0,
-                     "Fast Think is greedy — temperature must be 0")
+                     "Repeat Boost is greedy — temperature must be 0")
     }
   }
 
-  func test_seeds_fast_think_into_existing_install_with_only_chat() throws {
+  func test_seeds_repeat_boost_into_existing_install_with_only_chat() throws {
     try withTempProfilesDir { dir in
       // Pre-existing chat.toml (existing install): the empty-dir seed is a
-      // no-op, so Fast Think must arrive via the ensure-exists path.
+      // no-op, so Repeat Boost must arrive via the ensure-exists path.
       try ProfileStore.defaultChatTOML.write(
         to: dir.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
       let store = ProfileStore(directory: dir)
@@ -1931,34 +2277,34 @@ final class ProfileStoreTests: XCTestCase {
       defer { store.stop() }
 
       XCTAssertTrue(FileManager.default.fileExists(
-        atPath: dir.appendingPathComponent(ProfileStore.defaultFastThinkFilename).path),
-        "existing install must gain Fast Think via ensure-exists")
+        atPath: dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename).path),
+        "existing install must gain Repeat Boost via ensure-exists")
     }
   }
 
-  func test_fast_think_seed_does_not_overwrite_existing_edited_copy() throws {
+  func test_repeat_boost_seed_does_not_overwrite_existing_edited_copy() throws {
     try withTempProfilesDir { dir in
       let edited = """
-      id = "fast-think"
-      name = "My Fast Think"
+      id = "repeat-boost"
+      name = "My Repeat Boost"
       model = "m"
       inferlet = "chat-apc"
 
       [speculation]
       enabled = true
       """
-      let url = dir.appendingPathComponent(ProfileStore.defaultFastThinkFilename)
+      let url = dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename)
       try edited.write(to: url, atomically: true, encoding: .utf8)
       let store = ProfileStore(directory: dir)
       try store.start()
       defer { store.stop() }
 
       XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), edited,
-                     "an existing fast-think.toml must not be clobbered by the seed")
+                     "an existing repeat-boost.toml must not be clobbered by the seed")
     }
   }
 
-  func test_fast_think_seed_does_not_change_active_profile_on_fresh_install() throws {
+  func test_repeat_boost_seed_does_not_change_active_profile_on_fresh_install() throws {
     try withTempProfilesDir { dir in
       let active = dir.deletingLastPathComponent()
         .appendingPathComponent("active-profile", isDirectory: false)
@@ -1967,11 +2313,11 @@ final class ProfileStoreTests: XCTestCase {
       defer { store.stop() }
 
       XCTAssertEqual(store.activeProfileID, ProfileStore.defaultProfileID,
-                     "seeding Fast Think must not steal the default active profile from chat")
+                     "seeding Repeat Boost must not steal the default active profile from chat")
     }
   }
 
-  func test_fast_think_seed_failure_surfaces_via_snapshot_directoryError() throws {
+  func test_repeat_boost_seed_failure_surfaces_via_snapshot_directoryError() throws {
     try withTempProfilesDir { dir in
       // A parseable chat.toml is present, so `_entries` is non-empty after
       // start — the empty-dir chat-seed error channel (`_lastSeedError`,
@@ -1981,7 +2327,7 @@ final class ProfileStoreTests: XCTestCase {
       try ProfileStore.defaultChatTOML.write(
         to: dir.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
       // Read-only dir: chat.toml still loads (r-x is readable), but the
-      // Fast Think write fails → its error must reach the snapshot.
+      // Repeat Boost write fails → its error must reach the snapshot.
       try setPermissions(dir, mode: 0o500)
       defer { try? setPermissions(dir, mode: 0o755) }
 
@@ -1992,17 +2338,160 @@ final class ProfileStoreTests: XCTestCase {
       XCTAssertFalse(store.entries.isEmpty,
                      "chat.toml must still load from a read-only (but readable) dir")
       XCTAssertFalse(FileManager.default.fileExists(
-        atPath: dir.appendingPathComponent(ProfileStore.defaultFastThinkFilename).path),
-        "precondition: the Fast Think write must have failed under the read-only dir")
+        atPath: dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename).path),
+        "precondition: the Repeat Boost write must have failed under the read-only dir")
       guard case .seedFailed(let path, _)? = store.snapshot.directoryError else {
-        return XCTFail("Fast Think seed failure must surface on snapshot.directoryError even with chat.toml present; got \(String(describing: store.snapshot.directoryError))")
+        return XCTFail("Repeat Boost seed failure must surface on snapshot.directoryError even with chat.toml present; got \(String(describing: store.snapshot.directoryError))")
       }
-      XCTAssertTrue(path.hasSuffix(ProfileStore.defaultFastThinkFilename),
-                    "directoryError must point at fast-think.toml, got \(path)")
+      XCTAssertTrue(path.hasSuffix(ProfileStore.defaultRepeatBoostFilename),
+                    "directoryError must point at repeat-boost.toml, got \(path)")
     }
   }
 
-  // MARK: - speculation accessor (#426 Fast Think)
+  // MARK: - fast-think -> repeat-boost on-disk migration (#628)
+
+  func test_migration_renames_legacy_fast_think_file_and_preserves_edits() throws {
+    try withTempProfilesDir { dir in
+      // A pre-rename install: the user edited the built-in (custom name +
+      // sampling) but kept the `fast-think` id. The migration must rename
+      // the file to `repeat-boost.toml`, rewrite ONLY the id line, and
+      // preserve the body edits.
+      let edited = """
+      id = "fast-think"
+      name = "My Fast Think"
+      model = "m"
+      inferlet = "chat-apc"
+
+      [sampling]
+      temperature = 0.0
+      max_tokens = 4096
+
+      [speculation]
+      enabled = true
+      """
+      try edited.write(
+        to: dir.appendingPathComponent(ProfileStore.legacyFastThinkFilename),
+        atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let legacyURL = dir.appendingPathComponent(ProfileStore.legacyFastThinkFilename)
+      let targetURL = dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path),
+                     "legacy fast-think.toml must be removed after migration")
+      XCTAssertTrue(FileManager.default.fileExists(atPath: targetURL.path),
+                    "migration must produce repeat-boost.toml")
+
+      let migrated = try String(contentsOf: targetURL, encoding: .utf8)
+      XCTAssertEqual(migrated, edited.replacingOccurrences(
+        of: "id = \"fast-think\"", with: "id = \"repeat-boost\""),
+        "only the id line is rewritten; every user edit survives")
+
+      // Exactly one built-in (no duplicate) and it resolves under the new id.
+      let entry = try XCTUnwrap(store.entries.first {
+        $0.profile?.id == ProfileStore.defaultRepeatBoostProfileID
+      })
+      XCTAssertEqual(entry.profile?.name, "My Fast Think")
+      XCTAssertEqual(entry.profile?.sampling.maxTokens, 4096,
+                     "preserved sampling edit")
+      XCTAssertEqual(store.entries.filter {
+        $0.url.lastPathComponent == ProfileStore.legacyFastThinkFilename
+        || $0.url.lastPathComponent == ProfileStore.defaultRepeatBoostFilename
+      }.count, 1, "no duplicate built-in after migration")
+    }
+  }
+
+  func test_migration_repoints_active_marker_from_legacy_slug() throws {
+    try withTempProfilesDir { dir in
+      let active = dir.deletingLastPathComponent()
+        .appendingPathComponent("active-profile", isDirectory: false)
+      // Pre-rename: a user had picked the built-in, so the marker names
+      // `fast-think`, and the legacy file is on disk.
+      try ProfileStore.legacyFastThinkProfileID.write(
+        to: active, atomically: true, encoding: .utf8)
+      try ProfileStore.defaultRepeatBoostTOML
+        .replacingOccurrences(of: "id = \"repeat-boost\"", with: "id = \"fast-think\"")
+        .write(to: dir.appendingPathComponent(ProfileStore.legacyFastThinkFilename),
+               atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir, activeProfileURL: active)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(store.activeProfileID, ProfileStore.defaultRepeatBoostProfileID,
+                     "marker must be repointed fast-think -> repeat-boost")
+      XCTAssertEqual(try String(contentsOf: active, encoding: .utf8),
+                     ProfileStore.defaultRepeatBoostProfileID,
+                     "on-disk marker must also be rewritten")
+    }
+  }
+
+  func test_migration_is_idempotent_when_already_migrated() throws {
+    try withTempProfilesDir { dir in
+      // Already-migrated install: only repeat-boost.toml exists (edited),
+      // no legacy file. A relaunch must not touch it.
+      let edited = """
+      id = "repeat-boost"
+      name = "Edited"
+      model = "m"
+      inferlet = "chat-apc"
+
+      [speculation]
+      enabled = true
+      """
+      let targetURL = dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename)
+      try edited.write(to: targetURL, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(try String(contentsOf: targetURL, encoding: .utf8), edited,
+                     "an already-migrated repeat-boost.toml must be left untouched")
+      XCTAssertFalse(FileManager.default.fileExists(
+        atPath: dir.appendingPathComponent(ProfileStore.legacyFastThinkFilename).path),
+        "no legacy file should be created")
+    }
+  }
+
+  func test_migration_dedupes_when_both_files_exist() throws {
+    try withTempProfilesDir { dir in
+      // Crash-between-write-and-delete (or hand-recreated legacy): both
+      // files present. The new file is authoritative; the legacy leftover
+      // must be removed so the built-in is not duplicated.
+      let target = """
+      id = "repeat-boost"
+      name = "Authoritative"
+      model = "m"
+      inferlet = "chat-apc"
+
+      [speculation]
+      enabled = true
+      """
+      try target.write(
+        to: dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename),
+        atomically: true, encoding: .utf8)
+      try ProfileStore.defaultRepeatBoostTOML
+        .replacingOccurrences(of: "id = \"repeat-boost\"", with: "id = \"fast-think\"")
+        .write(to: dir.appendingPathComponent(ProfileStore.legacyFastThinkFilename),
+               atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertFalse(FileManager.default.fileExists(
+        atPath: dir.appendingPathComponent(ProfileStore.legacyFastThinkFilename).path),
+        "legacy leftover must be deduped away")
+      XCTAssertEqual(try String(contentsOf:
+        dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename), encoding: .utf8),
+        target, "the pre-existing repeat-boost.toml must remain authoritative")
+    }
+  }
+
+  // MARK: - speculation accessor (#426 Repeat Boost)
 
   func test_speculation_accessor_returns_profile_setting() throws {
     try withTempProfilesDir { dir in
@@ -2048,6 +2537,84 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  /// Settings → Profiles write-back: system_prompt plus user-facing sampling
+  /// defaults (temperature/top_p) are editable, while max_tokens stays an
+  /// engine-owned ceiling and is preserved from the existing profile TOML.
+  func test_setEditableDefaults_persists_prompt_temperature_topP_and_preserves_maxTokens() throws {
+    try withTempProfilesDir { dir in
+      let body = """
+      id = "chat"
+      name = "Chat"
+      icon = "bubble.left.and.bubble.right"
+      model = "model.gguf"
+      inferlet = "chat-apc"
+      system_prompt = "Old prompt"
+
+      [sampling]
+      temperature = 0.4
+      top_p = 0.75
+      max_tokens = 1536
+
+      [inferlet_args]
+      mode = "kept"
+      """
+      try body.write(to: dir.appendingPathComponent("chat.toml"),
+                     atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      try store.setEditableDefaults(
+        systemPrompt: "New prompt",
+        temperature: 0.2,
+        topP: 0.95,
+        forProfileID: "chat")
+
+      let profile = try XCTUnwrap(store.entries.first { $0.profile?.id == "chat" }?.profile)
+      XCTAssertEqual(profile.systemPrompt, "New prompt")
+      XCTAssertEqual(profile.sampling.temperature, 0.2, accuracy: 0.0001)
+      XCTAssertEqual(profile.sampling.topP, 0.95, accuracy: 0.0001)
+      XCTAssertEqual(profile.sampling.maxTokens, 1536,
+                     "Settings must not expose or overwrite max_tokens as a normal editable profile knob")
+      XCTAssertEqual(profile.inferletArgs["mode"]?.string, "kept")
+
+      let (reloaded, _) = ProfileStore.scan(directory: dir)
+      let fromDisk = try XCTUnwrap(reloaded.first { $0.profile?.id == "chat" }?.profile)
+      XCTAssertEqual(fromDisk.systemPrompt, "New prompt")
+      XCTAssertEqual(fromDisk.sampling.temperature, 0.2, accuracy: 0.0001)
+      XCTAssertEqual(fromDisk.sampling.topP, 0.95, accuracy: 0.0001)
+      XCTAssertEqual(fromDisk.sampling.maxTokens, 1536)
+    }
+  }
+
+  func test_profileDefaultAccessors_return_prompt_and_sampling_for_chat_initialization() throws {
+    try withTempProfilesDir { dir in
+      let body = """
+      id = "creative"
+      name = "Creative"
+      model = "model.gguf"
+      inferlet = "chat-apc"
+      system_prompt = "Think creatively."
+
+      [sampling]
+      temperature = 1.1
+      top_p = 0.65
+      max_tokens = 777
+      """
+      try body.write(to: dir.appendingPathComponent("creative.toml"),
+                     atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(store.systemPrompt(forProfileID: "creative"), "Think creatively.")
+      XCTAssertEqual(store.sampling(forProfileID: "creative"),
+                     Sampling(temperature: 1.1, topP: 0.65, maxTokens: 777))
+      XCTAssertNil(store.systemPrompt(forProfileID: "missing"))
+      XCTAssertNil(store.sampling(forProfileID: "missing"))
+    }
+  }
+
   // MARK: - helpers
 
   private func withTempProfilesDir(_ body: (URL) throws -> Void) throws {
@@ -2077,16 +2644,22 @@ final class ProfileStoreTests: XCTestCase {
     into dir: URL,
     name: String,
     id: String,
-    displayName: String
+    displayName: String,
+    model: String = "m"
   ) throws {
     let body = """
     id = "\(id)"
     name = "\(displayName)"
-    model = "m"
+    model = "\(model)"
     inferlet = "i"
     """
     try body.write(to: dir.appendingPathComponent(name),
                    atomically: true,
                    encoding: .utf8)
   }
+}
+
+private enum ProfileStoreDefaultsTransactionProbeError: Error {
+  case trashFailed
+  case profileWriteFailed
 }

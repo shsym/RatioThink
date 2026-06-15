@@ -110,6 +110,37 @@ public enum ModelMemoryGuardrail {
   public static let defaultPolicy = Policy.recommended(
     physicalMemoryBytes: SystemMemory.physicalBytes())
 
+  /// Production policy honoring the operator's *Settings → Models* dial
+  /// fraction (persisted as `guardrail.json`). Reads the fraction FRESH
+  /// each call — unlike `defaultPolicy` (a `static let` pinned to the 0.65
+  /// default) — so a dial change applies with no restart. This is the
+  /// single derivation the Helper's launch-time guard and the
+  /// ProfileEditor picker badge both call, so the displayed "exceeds …"
+  /// ceiling and the enforced gate can never disagree (#334).
+  ///
+  /// An absent `guardrail.json` (or unavailable support root) is the
+  /// legitimate unset state → default fraction, no signal. A
+  /// present-but-unreadable/corrupt file must not brick either surface, so
+  /// it also falls back to the default — but logs the lost operator ceiling
+  /// rather than reverting silently (the operator-visible signal lives in
+  /// the Settings dial, which reads `loadFraction` directly). `root` and
+  /// `physicalMemoryBytes` are injectable so tests pin a fixed RAM +
+  /// fraction instead of depending on the host.
+  public static func livePolicy(
+    root: URL? = try? PieDirs.applicationSupport(),
+    physicalMemoryBytes: Int64? = SystemMemory.physicalBytes()
+  ) -> Policy {
+    let fraction: Double
+    do {
+      fraction = try root.map { try GuardrailSettings.loadFraction(root: $0) }
+        ?? GuardrailSettings.defaultFraction
+    } catch {
+      Log.store.error("guardrail.json present but unreadable/corrupt; using default fraction \(GuardrailSettings.defaultFraction, privacy: .public): \(String(describing: error), privacy: .public)")
+      fraction = GuardrailSettings.defaultFraction
+    }
+    return Policy.recommended(physicalMemoryBytes: physicalMemoryBytes, fraction: fraction)
+  }
+
   private struct SizeSummary {
     var totalBytes: Int64
     var largestPath: String
@@ -166,6 +197,14 @@ public enum ModelMemoryGuardrail {
       ))
     }
     return .success(())
+  }
+
+  /// Total resolved artifact size in bytes (the weight footprint), or
+  /// `nil` if it can't be measured. Reuses the same traversal as
+  /// `validate`; used by `KVCacheBudget` to size the KV token ceiling.
+  public static func resolvedBytes(resolvedModelURL: URL,
+                                   fileManager: FileManager = .default) -> Int64? {
+    (try? summarize(resolvedModelURL: resolvedModelURL, fileManager: fileManager))?.totalBytes
   }
 
   private static func summarize(resolvedModelURL: URL,

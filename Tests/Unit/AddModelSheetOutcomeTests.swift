@@ -58,6 +58,161 @@ final class AddModelSheetOutcomeTests: XCTestCase {
                   "all-failure case must still be visible — not silently dropped; got: \(formatted)")
   }
 
+  func test_delete_referenced_model_message_names_profiles_and_clears_defaults() {
+    let row = InstalledModel(
+      filename: "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf",
+      url: URL(fileURLWithPath: "/tmp/Qwen3-0.6B-Q8_0.gguf"),
+      sizeBytes: 10,
+      modifiedAt: Date(timeIntervalSince1970: 0),
+      isPartial: false
+    )
+    let message = ModelsSettingsTab.deleteReferencedModelMessage(
+      row: row,
+      affectedProfiles: [
+        ProfileModelReference(id: "chat", name: "Chat"),
+        ProfileModelReference(id: "fast-think", name: "Repeat Boost"),
+      ]
+    )
+
+    XCTAssertTrue(message.contains("2 profiles use this model as its default"),
+                  "message must show the affected count; got: \(message)")
+    XCTAssertTrue(message.contains("Chat, Repeat Boost"),
+                  "message must name affected profiles; got: \(message)")
+    XCTAssertTrue(message.contains("profile defaults will be cleared"),
+                  "message must make the destructive profile cleanup explicit; got: \(message)")
+    XCTAssertTrue(message.contains("Choose/Download actions"),
+                  "message must tell users the cleared profiles enter no-default recovery UI; got: \(message)")
+    XCTAssertTrue(message.contains("running engine is not stopped"),
+                  "message must define behavior when the model is currently loaded/running; got: \(message)")
+  }
+
+  func test_delete_installed_model_restores_profile_defaults_when_trash_fails() throws {
+    let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("delete-profile-defaults-\(UUID().uuidString)", isDirectory: true)
+    let profiles = temp.appendingPathComponent("profiles", isDirectory: true)
+    let models = temp.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: models, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: temp) }
+
+    let shared = "deleted-model.gguf"
+    for (filename, id, name) in [
+      ("chat.toml", "chat", "Chat"),
+      ("fast.toml", "fast", "Repeat Boost"),
+    ] {
+      let body = """
+      id = "\(id)"
+      name = "\(name)"
+      model = "\(shared)"
+      inferlet = "chat-apc"
+      """
+      try body.write(to: profiles.appendingPathComponent(filename),
+                     atomically: true,
+                     encoding: .utf8)
+    }
+    let modelURL = models.appendingPathComponent(shared)
+    try Data("model".utf8).write(to: modelURL)
+    let store = ProfileStore(directory: profiles)
+    try store.start()
+    defer { store.stop() }
+    let row = InstalledModel(
+      filename: shared,
+      url: modelURL,
+      sizeBytes: 5,
+      modifiedAt: Date(timeIntervalSince1970: 0),
+      isPartial: false
+    )
+
+    XCTAssertThrowsError(try ModelsSettingsTab.deleteInstalledModel(
+      row: row,
+      profileStore: store,
+      trashModel: { _ in throw DeleteModelProbeError.trashFailed },
+      trashSidecar: { _ in }
+    )) { error in
+      XCTAssertTrue(String(describing: error).contains("restored"),
+                    "delete failure should tell the user profile defaults were restored; got: \(error)")
+    }
+
+    XCTAssertEqual(store.model(forProfileID: "chat"), shared)
+    XCTAssertEqual(store.model(forProfileID: "fast"), shared)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: modelURL.path),
+                  "failed Trash move should leave the installed model in place")
+  }
+
+  // #469 F1: deleting the model that the durable active-model marker names must
+  // clear the marker, so a later menu-bar Resume / crash auto-relaunch resolves
+  // the still-valid profile default instead of dead-ending on the now-missing
+  // marker model.
+  func test_delete_installed_model_clears_active_model_marker_for_the_deleted_file() throws {
+    let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("delete-marker-\(UUID().uuidString)", isDirectory: true)
+    let profiles = temp.appendingPathComponent("profiles", isDirectory: true)
+    let models = temp.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: models, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: temp) }
+
+    let deleted = "deleted-model.gguf"
+    try """
+    id = "chat"
+    name = "Chat"
+    model = "\(deleted)"
+    inferlet = "chat-apc"
+    """.write(to: profiles.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
+    let modelURL = models.appendingPathComponent(deleted)
+    try Data("model".utf8).write(to: modelURL)
+    let store = ProfileStore(directory: profiles)
+    try store.start()
+    defer { store.stop() }
+    try store.setActiveModelID(deleted)   // marker == the model being deleted
+    XCTAssertEqual(store.activeModelID, deleted, "precondition: marker set")
+
+    let row = InstalledModel(filename: deleted, url: modelURL, sizeBytes: 5,
+                             modifiedAt: Date(timeIntervalSince1970: 0), isPartial: false)
+    try ModelsSettingsTab.deleteInstalledModel(
+      row: row, profileStore: store,
+      trashModel: { try FileManager.default.removeItem(at: $0) },
+      trashSidecar: { _ in })
+
+    XCTAssertNil(store.activeModelID,
+                 "deleting the active model must clear the marker so Resume falls through to the profile default")
+  }
+
+  func test_delete_installed_model_preserves_marker_for_a_different_model() throws {
+    let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("delete-marker-other-\(UUID().uuidString)", isDirectory: true)
+    let profiles = temp.appendingPathComponent("profiles", isDirectory: true)
+    let models = temp.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: models, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: temp) }
+
+    let deleted = "deleted-model.gguf"
+    let other = "still-resident.gguf"
+    try """
+    id = "chat"
+    name = "Chat"
+    model = "\(other)"
+    inferlet = "chat-apc"
+    """.write(to: profiles.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
+    let modelURL = models.appendingPathComponent(deleted)
+    try Data("model".utf8).write(to: modelURL)
+    let store = ProfileStore(directory: profiles)
+    try store.start()
+    defer { store.stop() }
+    try store.setActiveModelID(other)   // marker names a DIFFERENT model
+
+    let row = InstalledModel(filename: deleted, url: modelURL, sizeBytes: 5,
+                             modifiedAt: Date(timeIntervalSince1970: 0), isPartial: false)
+    try ModelsSettingsTab.deleteInstalledModel(
+      row: row, profileStore: store,
+      trashModel: { try FileManager.default.removeItem(at: $0) },
+      trashSidecar: { _ in })
+
+    XCTAssertEqual(store.activeModelID, other,
+                   "deleting a different model must not clear an unrelated active-model marker")
+  }
+
   // MARK: - F38: emit-gate helper (review v5)
 
   // The drop closure's gate condition lives in
@@ -163,4 +318,8 @@ final class AddModelSheetOutcomeTests: XCTestCase {
       XCTFail("expected .imported associated values to pattern-match")
     }
   }
+}
+
+private enum DeleteModelProbeError: Error {
+  case trashFailed
 }

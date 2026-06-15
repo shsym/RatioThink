@@ -108,7 +108,7 @@ public enum ProfileStoreError: Error, CustomStringConvertible, Equatable {
 ///   2. `.seedFailed` — first-launch chat seed write failed AND the
 ///      directory is still empty. Cleared as soon as a scan finds at
 ///      least one `*.toml` (user / external process repaired it).
-///   3. `.seedFailed` — the existence-gated built-in (Fast Think) seed
+///   3. `.seedFailed` — the existence-gated built-in (Repeat Boost) seed
 ///      write failed (review v1 F1). Surfaces regardless of whether the
 ///      directory has other profiles, since the built-in is seeded into
 ///      populated installs; not cleared by a non-empty scan.
@@ -140,6 +140,75 @@ public struct ProfileStoreSnapshot {
     self.activeProfileError = activeProfileError
     self.activeProfileID    = activeProfileID
   }
+}
+
+/// Minimal profile identity shown when a model delete would clear one
+/// or more profile defaults.
+public struct ProfileModelReference: Equatable, Sendable {
+  public let id: String
+  public let name: String
+
+  public init(id: String, name: String) {
+    self.id = id
+    self.name = name
+  }
+}
+
+public enum ProfileModelDefaultsRollbackState: Equatable, Sendable, CustomStringConvertible {
+  case notNeeded
+  case succeeded
+  case failed(String)
+
+  public var description: String {
+    switch self {
+    case .notNeeded:
+      return "no profile defaults needed restoration"
+    case .succeeded:
+      return "profile defaults were restored"
+    case .failed(let reason):
+      return "profile defaults could not be fully restored: \(reason)"
+    }
+  }
+}
+
+public struct ProfileModelDefaultsOperationResult<Output> {
+  public let affectedProfiles: [ProfileModelReference]
+  public let output: Output
+
+  public init(affectedProfiles: [ProfileModelReference], output: Output) {
+    self.affectedProfiles = affectedProfiles
+    self.output = output
+  }
+}
+
+public enum ProfileModelDefaultsTransactionError: Error, CustomStringConvertible {
+  case clearFailed(
+    modelID: String,
+    cleared: [ProfileModelReference],
+    underlying: String,
+    rollback: ProfileModelDefaultsRollbackState
+  )
+  case operationFailed(
+    modelID: String,
+    cleared: [ProfileModelReference],
+    underlying: String,
+    rollback: ProfileModelDefaultsRollbackState
+  )
+
+  public var description: String {
+    switch self {
+    case .clearFailed(let modelID, let cleared, let underlying, let rollback):
+      return "Clearing profile defaults for \(modelID) failed after \(cleared.count) profile(s) changed: \(underlying); \(rollback)"
+    case .operationFailed(let modelID, let cleared, let underlying, let rollback):
+      return "Model operation for \(modelID) failed after clearing \(cleared.count) profile default(s): \(underlying); \(rollback)"
+    }
+  }
+}
+
+private struct ProfileModelDefaultTarget {
+  let profile: Profile
+  let filename: String
+  let reference: ProfileModelReference
 }
 
 /// Watches `~/Library/Application Support/RatioThink/profiles/` (or any
@@ -174,6 +243,24 @@ public final class ProfileStore: ObservableObject {
   /// `directory.deletingLastPathComponent()/active-profile`.
   public let activeProfileURL: URL
 
+  /// On-disk location of the durable active-MODEL marker (#469) — one line
+  /// of UTF-8 holding the slug of the model the engine was last (re)launched
+  /// with. Distinct from each profile's `.toml` default: a plain model pick
+  /// records the active model here WITHOUT clobbering the profile's saved
+  /// default, and the Helper's menu-bar Resume / crash auto-relaunch boot
+  /// THIS marker (precedence: explicit XPC override > this marker > profile
+  /// default) so a stopped-engine Resume honors the user's last pick instead
+  /// of silently reverting to the profile default.
+  ///
+  /// Sibling of `activeProfileURL` (outside `directory`, so the FS watcher's
+  /// `*.toml` scan is unaffected). Written by the Helper's
+  /// `LaunchSpecResolver` on every successful launch resolve and read by
+  /// `HelperResumeAction`; the App never touches it (it routes picks through
+  /// the `startEngine`/`restartEngine` XPC override). Tests inject a custom
+  /// URL; production defaults to
+  /// `directory.deletingLastPathComponent()/active-model`.
+  public let activeModelURL: URL
+
   /// Debounce window for FS-event coalescing. The system fires
   /// multiple `.write` events for a single `mv tmp final.toml`
   /// rename; coalescing avoids a thundering-herd of rescans.
@@ -196,7 +283,7 @@ public final class ProfileStore: ObservableObject {
   /// HF repo the seeded default lives in — the SAME repo the recommended
   /// curated entry downloads from. Used by the resolver's HF-cache
   /// fallback (`LaunchSpecResolver.hfIdentity`) when the model is not
-  /// staged in RatioThink's app models directory.
+  /// staged in Rational's app models directory.
   public static let defaultChatHFRepoID = "Qwen/Qwen3-0.6B-GGUF"
 
   public static let defaultChatTOML: String = """
@@ -217,29 +304,68 @@ public final class ProfileStore: ObservableObject {
   /// Filename written by `seedDefaultsIfEmpty()` on first launch.
   public static let defaultChatFilename = "chat.toml"
 
+  /// Example tree-of-thought profile (#413) seeded alongside `chat.toml`
+  /// on first launch so the live tree-search feature is reachable: the
+  /// user just switches to it. Reuses the same default model + the
+  /// `chat-apc` inferlet (ToT is a per-request dispatch mode, not a
+  /// separate wasm); `inferlet_args.mode = "tree-of-thought"` is what
+  /// `Profile.treeOfThought` keys on, and the breadth/depth/beam_width
+  /// are the bounded search shape (server-validated). The profiles editor
+  /// only displays `inferlet_args`, so seeding the file is how a user gets
+  /// a ToT profile without hand-editing TOML.
+  public static let treeOfThoughtFilename = "tree-of-thought.toml"
+  public static let treeOfThoughtTOML: String = """
+  id = "tree-of-thought"
+  name = "Tree of Thought"
+  icon = "point.3.connected.trianglepath.dotted"
+  model = "\(defaultChatModelID)"
+  inferlet = "chat-apc"
+  system_prompt = "You are a helpful assistant."
+
+  [sampling]
+  temperature = 0.7
+  top_p = 0.9
+  max_tokens = 2048
+
+  [inferlet_args]
+  mode = "tree-of-thought"
+  breadth = 3
+  depth = 2
+  beam_width = 2
+  max_tokens_per_node = 256
+
+  """
+
   /// Profile id encoded in `defaultChatTOML`. Also the value written
   /// to the `activeProfileURL` marker on first launch:
   /// without seeding the marker the menu-bar Resume click is a silent
   /// no-op on fresh installs.
   public static let defaultProfileID = "chat"
 
-  /// Built-in "Fast Think" profile id (#426). A second seeded profile that
-  /// turns on the chat-apc speculative drafter. Greedy by definition
-  /// (temperature 0) so drafting actually engages — see
-  /// `ChatSendController.makeRequest`.
-  public static let defaultFastThinkProfileID = "fast-think"
+  /// Built-in "Repeat Boost" profile id (#426; slug renamed to
+  /// `repeat-boost` in #628). A second seeded profile that turns on the
+  /// chat-apc speculative drafter. Greedy by definition (temperature 0)
+  /// so drafting actually engages — see `ChatSendController.makeRequest`.
+  public static let defaultRepeatBoostProfileID = "repeat-boost"
 
-  /// Filename for the seeded Fast Think profile.
-  public static let defaultFastThinkFilename = "fast-think.toml"
+  /// Filename for the seeded Repeat Boost profile.
+  public static let defaultRepeatBoostFilename = "repeat-boost.toml"
 
-  /// Seed body for the Fast Think profile. Same model + inferlet as the
+  /// Legacy filename/id for the built-in speculative-decode profile,
+  /// renamed to `repeat-boost` in #628. Retained only so the one-time
+  /// `migrateFastThinkToRepeatBoost` migration can find and rename a
+  /// pre-existing on-disk copy and repoint a stale active-profile marker.
+  public static let legacyFastThinkFilename = "fast-think.toml"
+  public static let legacyFastThinkProfileID = "fast-think"
+
+  /// Seed body for the Repeat Boost profile. Same model + inferlet as the
   /// default Chat profile (so selecting it is a silent same-model swap,
   /// no reload), but greedy (`temperature = 0`) with `[speculation]`
   /// enabled. `leader_len`/`draft_len` are omitted so the inferlet applies
   /// its #418 defaults (1 / 3).
-  public static let defaultFastThinkTOML: String = """
-  id = "fast-think"
-  name = "Fast Think"
+  public static let defaultRepeatBoostTOML: String = """
+  id = "repeat-boost"
+  name = "Repeat Boost"
   icon = "bolt"
   model = "\(defaultChatModelID)"
   inferlet = "chat-apc"
@@ -252,6 +378,38 @@ public final class ProfileStore: ObservableObject {
 
   [speculation]
   enabled = true
+
+  """
+
+  /// Built-in "JSON Think" profile id (#572). A third seeded profile that
+  /// constrains the assistant's final answer to valid JSON via real
+  /// grammar-guided decoding (`[constraint] response_format = "json_object"`).
+  /// Reasoning is captured separately and never leaks into the JSON.
+  public static let defaultJSONThinkProfileID = "json-think"
+
+  /// Filename for the seeded JSON Think profile.
+  public static let defaultJSONThinkFilename = "json-think.toml"
+
+  /// Seed body for the JSON Think profile. Same model + inferlet as the
+  /// default Chat profile (so selecting it is a silent same-model swap, no
+  /// reload). The system prompt nudges the model toward JSON; the real
+  /// guarantee is the `[constraint]` grammar, not the prompt. Sampling is
+  /// left at the chat default (JSON mode does not require greedy decode).
+  public static let defaultJSONThinkTOML: String = """
+  id = "json-think"
+  name = "JSON Think"
+  icon = "curlybraces"
+  model = "\(defaultChatModelID)"
+  inferlet = "chat-apc"
+  system_prompt = "You are a helpful assistant. Respond with a single valid JSON value."
+
+  [sampling]
+  temperature = 0.7
+  top_p = 0.9
+  max_tokens = 2048
+
+  [constraint]
+  response_format = "json_object"
 
   """
 
@@ -270,7 +428,7 @@ public final class ProfileStore: ObservableObject {
   private var _entries: [ProfileLoadResult] = []
   private var _lastSeedError: ProfileStoreError?
   private var _lastScanError: ProfileStoreError?
-  /// Write failure from the existence-gated built-in (Fast Think) seed
+  /// Write failure from the existence-gated built-in (Repeat Boost) seed
   /// (review v1 F1). Distinct from `_lastSeedError` (the empty-dir chat
   /// seed): the built-in is seeded into installs that ALREADY have
   /// profiles, so its failure must surface even when `_entries` is
@@ -372,15 +530,27 @@ public final class ProfileStore: ObservableObject {
   public init(
     directory: URL,
     activeProfileURL: URL? = nil,
-    queue: DispatchQueue = DispatchQueue(label: "com.ratiothink.profile-store")
+    activeModelURL: URL? = nil,
+    queue: DispatchQueue = DispatchQueue(label: "com.ratiothink.profile-store"),
+    seedsExampleProfiles: Bool = true
   ) {
     self.directory = directory
     self.activeProfileURL = activeProfileURL
       ?? directory.deletingLastPathComponent()
         .appendingPathComponent("active-profile", isDirectory: false)
+    self.activeModelURL = activeModelURL
+      ?? directory.deletingLastPathComponent()
+        .appendingPathComponent("active-model", isDirectory: false)
     self.queue = queue
+    self.seedsExampleProfiles = seedsExampleProfiles
     queue.setSpecific(key: queueKey, value: ())
   }
+
+  /// When false, `start()` skips the #413 tree-of-thought example-profile
+  /// backfill. Production defaults to true; scan/lifecycle tests that
+  /// assert exact directory contents pass false to keep their fixture
+  /// hermetic.
+  private let seedsExampleProfiles: Bool
 
   /// Run `work` on `queue` exactly once: inline when the caller is
   /// already on `queue` (listener callback, post-reload work),
@@ -449,19 +619,35 @@ public final class ProfileStore: ObservableObject {
     // directory but does NOT touch the marker.
     queue.sync {
       let seed = self.seedDefaultsIfEmpty()
-      // Ensure the built-in Fast Think profile exists even on installs
+      // #413: backfill the example tree-of-thought profile if absent —
+      // runs BEFORE the `reloadLocked()` scan below so the first snapshot
+      // already lists it. Independent of the dir-empty seed, so existing
+      // installs get it too.
+      self.backfillTreeOfThoughtProfile()
+      // One-time slug rename `fast-think` -> `repeat-boost` (#628). Must run
+      // BEFORE the ensure-seed below (else a fresh `repeat-boost.toml` would
+      // be seeded beside a user's legacy `fast-think.toml` = duplicate
+      // built-in) and BEFORE the marker read further down (so a marker still
+      // naming the dead `fast-think` id is repointed before it is committed).
+      let migrationError = self.migrateFastThinkToRepeatBoost()
+      // Ensure the built-in Repeat Boost profile exists even on installs
       // that already seeded chat.toml (the empty-dir seed above is a no-op
       // there). Runs before `reloadLocked()` below so the initial scan
-      // picks it up. (#426)
-      let fastThinkSeedError = self.ensureBuiltinFastThinkProfile()
+      // picks it up. (#426; slug #628)
+      let repeatBoostSeedError = self.ensureBuiltinRepeatBoostProfile()
+      // Same for the built-in JSON Think profile (#572). A seed failure on
+      // ANY built-in rides the shared `_builtinSeedError` channel; keep
+      // the first failure so the snapshot surfaces a concrete cause.
+      let jsonThinkSeedError = self.ensureBuiltinJSONThinkProfile()
+      let builtinSeedError = migrationError ?? repeatBoostSeedError ?? jsonThinkSeedError
       let readResult = self.readActiveProfileIDFromDisk()
       self.stateLock.withLock {
         self._lastSeedError = seed.dirError
-        // The built-in (Fast Think) seed error rides its own channel: it
+        // The built-in (Repeat Boost) seed error rides its own channel: it
         // is seeded into populated dirs, so it must surface even when
         // `_entries` is non-empty (review v1 F1) — `_lastSeedError` is
         // gated on an empty dir and cleared by the next non-empty scan.
-        self._builtinSeedError = fastThinkSeedError
+        self._builtinSeedError = builtinSeedError
         self.commitActiveReadResultLocked(readResult, source: .start)
         //  review v1 F2: a marker-seed failure must NOT
         // be silent. The override below fills `_activeProfileError`
@@ -640,6 +826,60 @@ public final class ProfileStore: ObservableObject {
     }
   }
 
+  // MARK: - active model marker (#469)
+
+  /// The model slug the engine was last (re)launched with, read from the
+  /// durable `activeModelURL` marker. `nil` when the marker is absent, empty,
+  /// or unreadable — the caller (`HelperResumeAction`) then falls back to the
+  /// profile's `.toml` default.
+  ///
+  /// Read on demand (only at menu-bar Resume / crash auto-relaunch — both
+  /// rare), so no in-memory mirror or FS-watch is kept: the resolver's
+  /// `setActiveModelID` atomic write is the single on-disk source of truth,
+  /// and the Helper writes + reads it in one process. The atomic write
+  /// (temp + rename) means a concurrent read sees the old or new file whole,
+  /// never a torn line — no lock needed.
+  public var activeModelID: String? {
+    guard let data = try? Data(contentsOf: activeModelURL),
+          let raw = String(data: data, encoding: .utf8) else {
+      return nil
+    }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  /// Persist `id` as the active model. Atomic write (temp + rename) so a
+  /// crashed write never leaves a half-line a later Resume misreads. Called
+  /// by `LaunchSpecResolver.resolveLauncherSpec` on every successful launch
+  /// resolve, so the marker always reflects the model the engine was last
+  /// asked to serve. Throws on an I/O failure (the caller uses `try?` —
+  /// recording the active model is best-effort and must never fail a launch).
+  public func setActiveModelID(_ id: String) throws {
+    let parent = activeModelURL.deletingLastPathComponent()
+    try FileManager.default.createDirectory(at: parent,
+                                            withIntermediateDirectories: true)
+    do {
+      try id.write(to: activeModelURL, atomically: true, encoding: .utf8)
+    } catch {
+      Log.store.error("setActiveModelID: write to \(self.activeModelURL.path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+      throw error
+    }
+  }
+
+  /// Forget the active-model selection. Removes the on-disk marker; safe to
+  /// call when the file is already absent. A subsequent Resume then boots the
+  /// profile default.
+  public func clearActiveModelID() throws {
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: activeModelURL.path) else { return }
+    do {
+      try fm.removeItem(at: activeModelURL)
+    } catch {
+      Log.store.error("clearActiveModelID: remove of \(self.activeModelURL.path, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+      throw error
+    }
+  }
+
   // MARK: - per-profile default model
 
   /// The model a profile carries as its default. This is the value the
@@ -649,11 +889,56 @@ public final class ProfileStore: ObservableObject {
   /// `modelForProfile` in `ProfileSwapCoordinator` is wired to this.
   public func model(forProfileID id: String) -> String? {
     stateLock.withLock {
-      _entries.first { $0.profile?.id == id }?.profile?.model
+      guard let model = _entries.first(where: { $0.profile?.id == id })?.profile?.model,
+            !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+      }
+      return model
     }
   }
 
-  /// The speculative-decoding ("Fast Think") settings a profile carries,
+  /// Valid profiles whose default model is exactly `modelID`, in the
+  /// same stable order as `entries`. Used before deleting an installed
+  /// model so the confirmation can name/count affected profiles.
+  public func profilesReferencingModel(_ modelID: String) -> [ProfileModelReference] {
+    stateLock.withLock {
+      _entries.compactMap { entry in
+        guard let profile = entry.profile,
+              profile.model == modelID else { return nil }
+        return ProfileModelReference(id: profile.id, name: profile.name)
+      }
+    }
+  }
+
+  /// The full parsed `Profile` for `id`, or nil when the id is absent or
+  /// its file failed to parse. The chat send path reads this to detect a
+  /// tree-of-thought profile (`Profile.treeOfThought`) and route the turn
+  /// to the ToT dispatch (#413); ordinary callers want `model(forProfileID:)`.
+  public func profile(forProfileID id: String) -> Profile? {
+    stateLock.withLock {
+      _entries.first { $0.profile?.id == id }?.profile
+    }
+  }
+
+  /// The selected profile's system prompt default. A nil return means the
+  /// profile is missing/unparsable or carries no prompt; chat surfaces treat
+  /// that as "no profile prompt" rather than inventing a fallback.
+  public func systemPrompt(forProfileID id: String) -> String? {
+    stateLock.withLock {
+      _entries.first { $0.profile?.id == id }?.profile?.systemPrompt
+    }
+  }
+
+  /// The selected profile's sampling defaults. Includes `maxTokens` so chat
+  /// request state preserves the engine/config-owned ceiling from the loaded
+  /// profile, but Settings only writes the user-facing temperature/top_p knobs.
+  public func sampling(forProfileID id: String) -> Sampling? {
+    stateLock.withLock {
+      _entries.first { $0.profile?.id == id }?.profile?.sampling
+    }
+  }
+
+  /// The speculative-decoding ("Repeat Boost") settings a profile carries,
   /// or `nil` when the profile has no `[speculation]` section / does not
   /// exist / failed to parse. `ChatScaffoldView.sendAssistantTurn` reads
   /// this for the chat's selected profile and threads it into the request
@@ -662,6 +947,42 @@ public final class ProfileStore: ObservableObject {
   public func speculation(forProfileID id: String) -> Profile.Speculation? {
     stateLock.withLock {
       _entries.first { $0.profile?.id == id }?.profile?.speculation
+    }
+  }
+
+  /// Persist the Settings → Profiles editable defaults: `system_prompt`,
+  /// `sampling.temperature`, and `sampling.top_p`. `sampling.max_tokens`
+  /// is intentionally not an editable profile-control surface; preserve the
+  /// existing value from disk because the effective ceiling is owned by the
+  /// launched engine/config.
+  public func setEditableDefaults(systemPrompt: String?,
+                                  temperature: Double,
+                                  topP: Double,
+                                  forProfileID id: String) throws {
+    let target: (profile: Profile, filename: String) = try stateLock.withLock {
+      guard let entry = _entries.first(where: { $0.profile?.id == id }),
+            let profile = entry.profile else {
+        throw ProfileStoreError.profileNotFound(id: id)
+      }
+      return (profile, entry.url.lastPathComponent)
+    }
+    var updated = target.profile
+    let normalizedPrompt = systemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+    updated.systemPrompt = normalizedPrompt?.isEmpty == true ? nil : normalizedPrompt
+    updated.sampling.temperature = temperature
+    updated.sampling.topP = topP
+    try createProfile(updated, filename: target.filename)
+  }
+
+  /// The output-constraint mode ("JSON Think") a profile carries, or `nil`
+  /// when the profile has no `[constraint]` section / does not exist /
+  /// failed to parse. `ChatScaffoldView.sendAssistantTurn` reads this for
+  /// the chat's selected profile and threads it into the request options so
+  /// `ChatSendController` can attach `response_format` (#572). Mirrors
+  /// `speculation(forProfileID:)`.
+  public func responseFormat(forProfileID id: String) -> ResponseFormat? {
+    stateLock.withLock {
+      _entries.first { $0.profile?.id == id }?.profile?.responseFormat
     }
   }
 
@@ -682,6 +1003,118 @@ public final class ProfileStore: ObservableObject {
     var updated = target.profile
     updated.model = model
     try createProfile(updated, filename: target.filename)
+  }
+
+  /// Clear a profile's default model, preserving every other field and
+  /// keeping the profile parseable as an explicit no-default state.
+  public func clearModel(forProfileID id: String) throws {
+    let target: (profile: Profile, filename: String) = try stateLock.withLock {
+      guard let entry = _entries.first(where: { $0.profile?.id == id }),
+            let profile = entry.profile else {
+        throw ProfileStoreError.profileNotFound(id: id)
+      }
+      return (profile, entry.url.lastPathComponent)
+    }
+    var updated = target.profile
+    updated.model = nil
+    try createProfile(updated, filename: target.filename)
+  }
+
+  /// Clear every valid profile whose default references `modelID`.
+  /// Matching is exact; no fallback model is selected. If any profile
+  /// write fails mid-batch, earlier writes are restored before the
+  /// error is surfaced so callers do not observe silently partial
+  /// no-default state.
+  @discardableResult
+  public func clearModelDefaults(referencing modelID: String) throws -> [ProfileModelReference] {
+    try withClearedModelDefaults(referencing: modelID) { () }.affectedProfiles
+  }
+
+  /// Temporarily clear every default referencing `modelID`, perform a
+  /// caller-supplied operation, and restore the original defaults if
+  /// that operation fails. This lets model deletion treat the profile
+  /// cleanup and Trash move as one recoverable operation: a failed
+  /// Trash move cannot leave profiles silently cleared.
+  @discardableResult
+  public func withClearedModelDefaults<Output>(
+    referencing modelID: String,
+    operation: () throws -> Output
+  ) throws -> ProfileModelDefaultsOperationResult<Output> {
+    try withClearedModelDefaults(
+      referencing: modelID,
+      writeProfile: { [self] profile, filename in
+        try createProfile(profile, filename: filename)
+      },
+      operation: operation
+    )
+  }
+
+  @discardableResult
+  internal func withClearedModelDefaults<Output>(
+    referencing modelID: String,
+    writeProfile: (Profile, String) throws -> Void,
+    operation: () throws -> Output
+  ) throws -> ProfileModelDefaultsOperationResult<Output> {
+    let targets: [ProfileModelDefaultTarget] = stateLock.withLock {
+      _entries.compactMap { entry in
+        guard let profile = entry.profile,
+              profile.model == modelID else { return nil }
+        return ProfileModelDefaultTarget(
+          profile: profile,
+          filename: entry.url.lastPathComponent,
+          reference: ProfileModelReference(id: profile.id, name: profile.name)
+        )
+      }
+    }
+    var cleared: [ProfileModelDefaultTarget] = []
+    do {
+      for target in targets {
+        var updated = target.profile
+        updated.model = nil
+        try writeProfile(updated, target.filename)
+        cleared.append(target)
+      }
+    } catch {
+      let rollback = restoreModelDefaultTargets(cleared, writeProfile: writeProfile)
+      throw ProfileModelDefaultsTransactionError.clearFailed(
+        modelID: modelID,
+        cleared: cleared.map(\.reference),
+        underlying: String(describing: error),
+        rollback: rollback
+      )
+    }
+
+    do {
+      let output = try operation()
+      return ProfileModelDefaultsOperationResult(
+        affectedProfiles: targets.map(\.reference),
+        output: output
+      )
+    } catch {
+      let rollback = restoreModelDefaultTargets(cleared, writeProfile: writeProfile)
+      throw ProfileModelDefaultsTransactionError.operationFailed(
+        modelID: modelID,
+        cleared: cleared.map(\.reference),
+        underlying: String(describing: error),
+        rollback: rollback
+      )
+    }
+  }
+
+  private func restoreModelDefaultTargets(
+    _ targets: [ProfileModelDefaultTarget],
+    writeProfile: (Profile, String) throws -> Void
+  ) -> ProfileModelDefaultsRollbackState {
+    guard !targets.isEmpty else { return .notNeeded }
+    var failures: [String] = []
+    for target in targets.reversed() {
+      do {
+        try writeProfile(target.profile, target.filename)
+      } catch {
+        failures.append("\(target.reference.id): \(error)")
+      }
+    }
+    return failures.isEmpty ? .succeeded : .failed(failures.joined(separator: "; "))
   }
 
   /// Persist `id` as the active profile. Writes atomically to
@@ -976,13 +1409,43 @@ public final class ProfileStore: ObservableObject {
   /// against a populated directory is a no-op for the chat.toml seed,
   /// and the marker seed uses exclusive-create semantics so a
   /// concurrent process's marker always wins (review v1 F3).
+  /// #413: ensure the example tree-of-thought profile exists so the live
+  /// tree-search feature is reachable (the user just switches to it).
+  ///
+  /// Unlike `seedDefaultsIfEmpty` (which writes only when the profiles dir
+  /// is TRULY EMPTY = fresh install), this WRITE-IF-ABSENT backfill runs on
+  /// every `start()`, so an EXISTING install — whose dir already holds
+  /// `chat.toml` from before #413, making the seed a no-op — gets the
+  /// profile too. It never clobbers a user-edited copy (writes only when
+  /// the file is missing). Best-effort: a failure must NOT fail `start()`
+  /// (the user can still chat). The Settings editor only DISPLAYS
+  /// `inferlet_args`, so seeding the file is the only way a user gets a ToT
+  /// profile without hand-writing TOML.
+  ///
+  /// Runs on `queue` (called from `start()` inside `queue.sync`). Does not
+  /// touch the active-profile marker — `chat` stays the default; ToT is
+  /// opt-in via the picker.
+  private func backfillTreeOfThoughtProfile() {
+    guard seedsExampleProfiles else { return }
+    let target = directory.appendingPathComponent(Self.treeOfThoughtFilename)
+    guard !FileManager.default.fileExists(atPath: target.path) else { return }
+    do {
+      try Self.treeOfThoughtTOML.write(to: target, atomically: true, encoding: .utf8)
+      Log.store.info("backfilled tree-of-thought profile at \(target.path, privacy: .public)")
+    } catch {
+      Log.store.error(
+        "backfill tree-of-thought profile failed (non-fatal): \(String(describing: error), privacy: .public)"
+      )
+    }
+  }
+
   private func seedDefaultsIfEmpty() -> SeedResult {
     let existing = (try? FileManager.default.contentsOfDirectory(
       at: directory,
       includingPropertiesForKeys: nil,
       options: [.skipsHiddenFiles]
     )) ?? []
-    let tomls = existing.filter { $0.pathExtension == "toml" }
+    let tomls = existing.filter(Self.isProfileTOML)
     guard tomls.isEmpty else { return SeedResult(dirError: nil, markerError: nil) }
 
     let target = directory.appendingPathComponent(Self.defaultChatFilename)
@@ -1003,6 +1466,11 @@ public final class ProfileStore: ObservableObject {
       )
     }
 
+    // #413: the example tree-of-thought profile is NOT written here. It is
+    // backfilled by `backfillTreeOfThoughtProfile()` (write-if-absent on
+    // every start), so EXISTING installs — whose profiles dir is non-empty,
+    // making this seed a no-op — get it too, not just fresh installs.
+
     // : pair the chat.toml seed with an active-profile
     // marker so the first-run menu-bar Resume click resolves into a
     // real start instead of `.noActiveProfile`. A pre-existing marker
@@ -1013,28 +1481,125 @@ public final class ProfileStore: ObservableObject {
     return SeedResult(dirError: nil, markerError: markerError)
   }
 
-  /// Ensure the built-in "Fast Think" profile exists (#426). Unlike
-  /// `seedDefaultsIfEmpty` (gated on an empty dir), this writes
-  /// `fast-think.toml` whenever it is ABSENT — so installs that already
-  /// have a `chat.toml` (i.e. every install past first launch) still gain
-  /// Fast Think on the next start. Existence-gated, so a user's edits to
-  /// the file survive; deleting it re-creates it next launch, which is the
-  /// accepted contract for a built-in default (edit it, don't delete it).
-  /// Never touches the active-profile marker — the default selection stays
-  /// `chat`. Returns `.seedFailed` on a write failure; `start()` routes it
-  /// to the dedicated `_builtinSeedError` channel, which surfaces on the
-  /// snapshot's `directoryError` even when the directory already has
-  /// profiles (review v1 F1). A nil return is success-or-exists.
-  private func ensureBuiltinFastThinkProfile() -> ProfileStoreError? {
-    let target = directory.appendingPathComponent(Self.defaultFastThinkFilename)
+  /// Ensure the built-in "Repeat Boost" profile exists (#426; slug
+  /// #628). Unlike `seedDefaultsIfEmpty` (gated on an empty dir), this
+  /// writes `repeat-boost.toml` whenever it is ABSENT — so installs that
+  /// already have a `chat.toml` (i.e. every install past first launch)
+  /// still gain Repeat Boost on the next start. Existence-gated, so a
+  /// user's edits to the file survive; deleting it re-creates it next
+  /// launch, which is the accepted contract for a built-in default (edit
+  /// it, don't delete it). Never touches the active-profile marker — the
+  /// default selection stays `chat`. Returns `.seedFailed` on a write
+  /// failure; `start()` routes it to the dedicated `_builtinSeedError`
+  /// channel, which surfaces on the snapshot's `directoryError` even when
+  /// the directory already has profiles (review v1 F1). A nil return is
+  /// success-or-exists.
+  private func ensureBuiltinRepeatBoostProfile() -> ProfileStoreError? {
+    let target = directory.appendingPathComponent(Self.defaultRepeatBoostFilename)
     if FileManager.default.fileExists(atPath: target.path) { return nil }
     do {
-      try Self.defaultFastThinkTOML.write(to: target, atomically: true, encoding: .utf8)
-      Log.store.info("seeded built-in Fast Think profile at \(target.path, privacy: .public)")
+      try Self.defaultRepeatBoostTOML.write(to: target, atomically: true, encoding: .utf8)
+      Log.store.info("seeded built-in Repeat Boost profile at \(target.path, privacy: .public)")
       return nil
     } catch {
       let underlying = String(describing: error)
-      Log.store.error("seed Fast Think profile failed: \(underlying, privacy: .public)")
+      Log.store.error("seed Repeat Boost profile failed: \(underlying, privacy: .public)")
+      return .seedFailed(path: target.path, underlying: underlying)
+    }
+  }
+
+  /// One-time on-disk migration for the #628 slug rename
+  /// `fast-think` → `repeat-boost`.
+  ///
+  /// The built-in speculative-decode profile is existence-gated by
+  /// FILENAME (`ensureBuiltinRepeatBoostProfile`). Renaming the slug
+  /// without migrating would leave a user's existing `fast-think.toml`
+  /// in place AND seed a fresh `repeat-boost.toml` beside it — two
+  /// duplicate built-ins — while the active-profile marker kept pointing
+  /// at the now-dangling `fast-think` id. This rename-or-dedupe migration
+  /// closes both holes and is safe to run on every `start()`:
+  ///
+  ///   · Move: when `repeat-boost.toml` is ABSENT and `fast-think.toml`
+  ///     is PRESENT, rewrite only the `id` line (`fast-think` →
+  ///     `repeat-boost`) so a user's body edits survive, write the new
+  ///     file, then delete the legacy one.
+  ///   · Dedupe: when BOTH files exist (a crash between the write and the
+  ///     delete above, or a hand-recreated legacy file), the new file is
+  ///     authoritative — remove the legacy leftover so the built-in is
+  ///     not duplicated.
+  ///   · Repoint: whenever the active-profile marker still names the dead
+  ///     `fast-think` id, rewrite it to `repeat-boost`, independent of the
+  ///     file move (covers a marker left behind by a half-applied prior
+  ///     run).
+  ///
+  /// Idempotent: a second launch finds `repeat-boost.toml` present and no
+  /// legacy file, so the file branch is a no-op and the marker already
+  /// reads `repeat-boost`. Runs BEFORE `ensureBuiltinRepeatBoostProfile`
+  /// and the marker read in `start()`. Returns `.seedFailed` on a
+  /// write/move failure so it rides the shared `_builtinSeedError`
+  /// channel; nil on success-or-nothing-to-do.
+  private func migrateFastThinkToRepeatBoost() -> ProfileStoreError? {
+    let fm = FileManager.default
+    let legacy = directory.appendingPathComponent(Self.legacyFastThinkFilename)
+    let target = directory.appendingPathComponent(Self.defaultRepeatBoostFilename)
+
+    if fm.fileExists(atPath: legacy.path) {
+      do {
+        if fm.fileExists(atPath: target.path) {
+          Log.store.info("deduped leftover \(Self.legacyFastThinkFilename, privacy: .public): \(Self.defaultRepeatBoostFilename, privacy: .public) already present")
+        } else {
+          let body = try String(contentsOf: legacy, encoding: .utf8)
+          let rewritten = body.replacingOccurrences(
+            of: "id = \"\(Self.legacyFastThinkProfileID)\"",
+            with: "id = \"\(Self.defaultRepeatBoostProfileID)\"")
+          try rewritten.write(to: target, atomically: true, encoding: .utf8)
+          Log.store.info("migrated built-in \(Self.legacyFastThinkFilename, privacy: .public) -> \(Self.defaultRepeatBoostFilename, privacy: .public)")
+        }
+        try fm.removeItem(at: legacy)
+      } catch {
+        let underlying = String(describing: error)
+        Log.store.error("migrate \(Self.legacyFastThinkProfileID, privacy: .public) -> \(Self.defaultRepeatBoostProfileID, privacy: .public) failed: \(underlying, privacy: .public)")
+        return .seedFailed(path: target.path, underlying: underlying)
+      }
+    }
+
+    repointActiveMarkerFromLegacySlug()
+    return nil
+  }
+
+  /// Repoint the active-profile marker from the legacy `fast-think` id to
+  /// `repeat-boost` (#628). No-op unless the marker reads exactly the dead
+  /// id. A write failure is logged, not surfaced: the subsequent marker
+  /// read in `start()` would then commit the stale id with no matching
+  /// profile, which degrades to "no active selection" (operator re-picks)
+  /// rather than a hard failure.
+  private func repointActiveMarkerFromLegacySlug() {
+    guard case .ok(let id) = readActiveProfileIDFromDisk(),
+          id == Self.legacyFastThinkProfileID else { return }
+    do {
+      try writeActiveProfileIDToDisk(Self.defaultRepeatBoostProfileID)
+      Log.store.info("repointed active-profile marker \(Self.legacyFastThinkProfileID, privacy: .public) -> \(Self.defaultRepeatBoostProfileID, privacy: .public)")
+    } catch {
+      Log.store.error("repoint active-profile marker failed: \(String(describing: error), privacy: .public)")
+    }
+  }
+
+  /// Ensure the built-in "JSON Think" profile exists (#572). Same
+  /// existence-gated contract as `ensureBuiltinRepeatBoostProfile`: writes
+  /// `json-think.toml` whenever ABSENT, survives user edits, re-creates on
+  /// delete, never touches the active-profile marker. Returns `.seedFailed`
+  /// on a write failure; `start()` routes it to the shared
+  /// `_builtinSeedError` channel. A nil return is success-or-exists.
+  private func ensureBuiltinJSONThinkProfile() -> ProfileStoreError? {
+    let target = directory.appendingPathComponent(Self.defaultJSONThinkFilename)
+    if FileManager.default.fileExists(atPath: target.path) { return nil }
+    do {
+      try Self.defaultJSONThinkTOML.write(to: target, atomically: true, encoding: .utf8)
+      Log.store.info("seeded built-in JSON Think profile at \(target.path, privacy: .public)")
+      return nil
+    } catch {
+      let underlying = String(describing: error)
+      Log.store.error("seed JSON Think profile failed: \(underlying, privacy: .public)")
       return .seedFailed(path: target.path, underlying: underlying)
     }
   }
@@ -1376,7 +1941,7 @@ public final class ProfileStore: ObservableObject {
   /// Caller must hold `stateLock`. Scan errors take priority over
   /// seed errors (scan reflects the most recent FS interaction); the
   /// empty-dir chat seed error only surfaces while the directory is
-  /// still empty. The built-in (Fast Think) seed error surfaces
+  /// still empty. The built-in (Repeat Boost) seed error surfaces
   /// regardless of `_entries.isEmpty` — its whole purpose is populated
   /// installs (review v1 F1) — at lowest priority, since a scan failure
   /// or a failed empty-dir chat seed is the more actionable signal.
@@ -1391,14 +1956,20 @@ public final class ProfileStore: ObservableObject {
     Self.scan(directory: directory)
   }
 
+  /// Canonical profile-file predicate: a literal lowercase `toml` path
+  /// extension, matching what the FS-watcher keys on. Single source so the
+  /// seed scan and the public `scan` can never drift on the rule (review v2
+  /// F9: the Profiles tab once used `pathExtension.lowercased() == "toml"`
+  /// while the scans used the literal match).
+  static func isProfileTOML(_ url: URL) -> Bool {
+    url.pathExtension == "toml"
+  }
+
   /// Public re-entrant scan. Read-only consumers (Settings → Profiles
   /// tab, ad-hoc tools) call this directly instead of duplicating the
   /// `contentsOfDirectory` + `Profile.parse` + warning-aggregation
   /// logic — and so they don't drift on the extension-match rule
-  /// (review v2 F9: tab previously used `pathExtension.lowercased()
-  /// == "toml"` while this scan uses literal `== "toml"`; canonical
-  /// rule is now the literal lowercase match below, matching what
-  /// the FS-watcher actually keys on).
+  /// (`isProfileTOML`, review v2 F9).
   public static func scan(
     directory: URL,
     fileManager: FileManager = .default
@@ -1416,7 +1987,7 @@ public final class ProfileStore: ObservableObject {
       return ([], .scanFailed(path: directory.path, underlying: underlying))
     }
     let tomls = files
-      .filter { $0.pathExtension == "toml" }
+      .filter(Self.isProfileTOML)
       .sorted { $0.lastPathComponent < $1.lastPathComponent }
 
     let parsed = tomls.map { url -> ProfileLoadResult in
@@ -1451,13 +2022,5 @@ public final class ProfileStore: ObservableObject {
       }
     }
     return (parsed, nil)
-  }
-}
-
-private extension NSLock {
-  func withLock<T>(_ body: () throws -> T) rethrows -> T {
-    lock()
-    defer { unlock() }
-    return try body()
   }
 }

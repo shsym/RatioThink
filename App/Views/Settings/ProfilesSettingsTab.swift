@@ -2,10 +2,9 @@ import SwiftUI
 import AppKit
 
 /// *Settings → Profiles* — list of `<PIE_HOME>/profiles/*.toml` with a
-/// read-only per-profile editor. Phase 3.8 ships display + the
-/// "Show advanced" toggle that reveals the inferlet picker and raw
-/// `inferlet_args`. Write-back lives in a follow-up so this
-/// pane can land without touching `ProfileStore`'s FS-watcher path.
+/// per-profile editor. The detail pane lets users edit the default model,
+/// system prompt, and user-facing sampling defaults without exposing the
+/// empty Advanced/inferlet-args inspection surface.
 struct ProfilesSettingsTab: View {
   @State private var entries: [ProfileLoadResult] = []
   @State private var directoryError: String?

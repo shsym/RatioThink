@@ -54,6 +54,9 @@ struct ChatApcInput {
     tools: Option<Vec<ToolSchema>>,
     tool_choice: Option<serde_json::Value>,
     speculation: Option<SpecRequest>,
+    /// #522 cross-request KV prefix-cache directive (see
+    /// [`super::prefix_cache`]). Optional on the dispatch surface too.
+    cache: Option<super::prefix_cache::CacheDirective>,
 }
 
 pub async fn handle(req: Request<IncomingBody>, res: Responder) -> Finished {
@@ -167,6 +170,11 @@ async fn dispatch_chat_apc(dispatch: InferletDispatch, res: Responder) -> Finish
         tools: input.tools,
         tool_choice: input.tool_choice,
         speculation: input.speculation,
+        cache: input.cache,
+        // Tree-of-thought drives its own constrained scoring grammar and
+        // never asks for JSON-mode answer decoding (#572) — keep this
+        // dispatch path unconstrained so ToT is unaffected.
+        response_format: None,
     };
     completions::handle_parsed(request, res).await
 }

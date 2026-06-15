@@ -42,8 +42,8 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// here because dropping the owner tears the listener down.
   private var xpcListener: HelperXPCListener?
 
-  /// Production engine manager ( — replaces the stale
-  /// `PieSupervisor` argv path with `PieControlLauncher`).
+  /// Production engine manager (`PieEngineHost`, wrapping
+  /// `PieControlLauncher`).
   /// Constructed once per healthy helper boot and threaded into
   /// `HelperExportedAPI` so `engineStatus` / `startEngine` /
   /// `stopEngine` plumb through the live subprocess. Nil under
@@ -71,6 +71,19 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// "continue with a beep" failure mode (review v4 F4).
   private var degradedReason: PieDirsError?
 
+  /// Test seam over the `NSWorkspace` app-launch `openPieApp` performs.
+  /// Production leaves it `nil` and the real `NSWorkspace.shared`
+  /// launches/foregrounds the resolved parent bundle (delivering any
+  /// deep-link URLs). A unit test sets it to capture `(urls, appURL)` and
+  /// assert that the menu-bar "Settings…" item delivers exactly
+  /// `[SettingsDeepLink.settingsURL]` to `resolvedPieAppURL()` — the wiring
+  /// that otherwise silently degrades to a plain app-foreground on a refactor
+  /// (#440). A settable property rather than a constructor-injected closure
+  /// (a settable test-override property) because
+  /// `HelperAppDelegate` is `@main`-constructed with no init seam; `nil` in
+  /// production keeps the real launch path untouched.
+  var workspaceOpenOverride: ((_ urls: [URL], _ appURL: URL) -> Void)?
+
   static func main() {
     let app = NSApplication.shared
     let delegate = HelperAppDelegate()
@@ -79,12 +92,28 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationDidFinishLaunching(_ note: Notification) {
+    // When this helper hosts the #440 RatioThinkHelperTests unit bundle its
+    // code is loaded in-process, and the real boot would otherwise run: status
+    // item, login-item registration, and the XPC-listener bind whose
+    // `verifyStartupInvariants` hard-traps under the ad-hoc-signed test host
+    // (no Team Identifier). XCTest's own `XCTestConfigurationFilePath` marker is
+    // injected only AFTER launch, too late for this boot path, so the test
+    // scheme sets this env var instead — scheme env is present from launch. It
+    // is never set in production or by the App-spawned helper subprocess, so
+    // this skips boot ONLY under the unit-test scheme.
+    if ProcessInfo.processInfo.environment["PIE_TEST_HELPER_NO_BOOT"] == "1" {
+      Log.helper.info("PIE_TEST_HELPER_NO_BOOT=1; skipping helper boot (unit-test host)")
+      return
+    }
     HelperConfig.assertStartupContract()
     Log.helper.info("RatioThinkHelper launched (xpc=\(HelperConfig.xpcServiceName, privacy: .public) testMode=\(HelperConfig.isTestMode, privacy: .public))")
     let info = Bundle.main.infoDictionary
     Diag.helper.event("helper.launch", [
       ("version", info?["CFBundleShortVersionString"] as? String ?? "?"),
       ("build", info?["CFBundleVersion"] as? String ?? "?"),
+      ("pid", String(ProcessInfo.processInfo.processIdentifier)),
+      ("bundle", DiagnosticLog.redactHome(Bundle.main.bundleURL.path)),
+      ("executable", DiagnosticLog.redactHome(Bundle.main.executableURL?.path ?? "?")),
     ])
     eagerProbePieDirs()
     setupStatusItemIfNeeded()
@@ -99,7 +128,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     if let reason = degradedReason {
       Diag.helper.event("helper.degraded", [("reason", "\(reason)")])
       DispatchQueue.main.async { [weak self] in
-        self?.presentPieDirsAlert(title: "RatioThink cannot start", error: reason)
+        self?.presentPieDirsAlert(title: "Rational cannot start", error: reason)
       }
     }
   }
@@ -122,6 +151,10 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   ///    which therefore calls `xpcListener.invalidate()` inline
   ///    instead of relying on this hook.
   func applicationWillTerminate(_ note: Notification) {
+    Diag.helper.event("helper.quit", [
+      ("reason", "applicationWillTerminate"),
+      ("pid", String(ProcessInfo.processInfo.processIdentifier)),
+    ])
     // Order matters here (review v1 F1):
     //   1. Cancel the supervisor observer FIRST and nil out the
     //      status item so the `guard` in `applyStatusItemModel`
@@ -151,7 +184,10 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // paths reach this hook still apply — SIGKILL/SIGABRT/exit(_:)
     // skip the helper teardown entirely, in which case launchd
     // reaps the child via process-group cleanup.
-    engineHost?.stop()
+    // A graceful helper teardown takes the engine with it; preserve both the
+    // durable shutdown reason and the initiator so diagnostics distinguish this
+    // from an operator Pause.
+    engineHost?.stop(reason: "helper.applicationWillTerminate", initiator: .helper)
     profileStore?.stop()
     profileStore = nil
     if let xpcListener {
@@ -160,7 +196,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     xpcListener = nil
   }
 
-  /// Force-creates the RatioThink root + logs subdir. On failure, records the
+  /// Force-creates the Rational root + logs subdir. On failure, records the
   /// error in `degradedReason` so downstream setup branches degrade
   /// gracefully instead of registering a broken helper for relaunch
   /// or publishing a no-op status item (review v4 F4).
@@ -205,7 +241,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// returns `EngineError(.degraded, message: <PieDirsError>)` on
   /// every selector. A GUI that connects sees a *structured cause*
   /// instead of a mach-service-not-found, so the UI can render the
-  /// real reason even if the parallel "RatioThink cannot start" alert path
+  /// real reason even if the parallel "Rational cannot start" alert path
   /// fails.
   ///
   /// Pre-bind: `HelperXPCListener.verifyStartupInvariants()` opens a
@@ -229,10 +265,11 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     let exported: PieHelperXPC
     if let reason = degradedReason {
       Log.helper.error("publishing degraded XPC listener (reason=\(String(describing: reason), privacy: .public))")
-      exported = DegradedHelperAPI(reasonMessage: String(describing: reason))
+      exported = DegradedHelperAPI(reasonMessage: String(describing: reason),
+                                   onQuitRequested: Self.terminateSelf)
     } else {
-      // : PieEngineHost replaces PieSupervisor on the
-      // production helper boot path. Lazily constructed (not in
+      // PieEngineHost on the production helper boot path.
+      // Lazily constructed (not in
       // init) so degraded helpers never spawn the host they cannot
       // use.
       //
@@ -287,7 +324,18 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
               Log.helper.notice("auto-relaunch outcome: \(String(describing: outcome), privacy: .public)")
             }
           }
-        }
+        },
+        // #447: durable, chat-free engine death diagnostics. The sinks write
+        // the `engine.terminated` breadcrumb (helper.log) + the bounded
+        // redacted stderr tail (engine.log); the guardrail feeds the
+        // likely-OOM heuristic (SIGKILL-not-by-us + last-RSS >= ceiling).
+        terminationSink: PieEngineHost.productionTerminationSink,
+        tailWriter: PieEngineHost.productionTailWriter,
+        // #604: re-read the LIVE dial at death time (not the 0.65-pinned
+        // `defaultPolicy`) so the OOM ceiling matches the launch gate
+        // (`memoryPolicy`) and the picker badge — a raised dial would
+        // otherwise leave this breadcrumb mislabeling deaths as OOM.
+        guardrailBytes: { ModelMemoryGuardrail.livePolicy().maxResolvedModelBytes }
       )
       holder.helper = self
       self.engineHost = host
@@ -299,19 +347,20 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       // refusing every selector.
       let resolver = buildLaunchSpecResolver()
       exported = HelperExportedAPI(engineHost: host,
-                                   launchSpecResolver: resolver)
+                                   launchSpecResolver: resolver,
+                                   onQuitRequested: Self.terminateSelf)
       // Phase 2.3: wire engine-host state into the menu-bar dot
       // once a healthy host exists. Degraded boots skip this — the
       // degraded status item is already published and must not be
       // overwritten by a misleading "Engine: stopped" render.
       subscribeToEngineHost(host)
-      // Auto-start the engine for the active profile at boot (
-      // follow-up). The App is poll-only and never issues `startEngine`;
-      // before this the engine only started via a manual menu-bar Resume,
-      // so a freshly-booted Helper left the engine `.stopped` and every
-      // model load deferred forever on `engineNotReady`. Firing the same
-      // in-process resume path here yields a ready engine without user
-      // interaction. No active profile selected ⇒ benign no-op.
+      // Boot model-load is intentionally disabled: helper startup publishes
+      // XPC/menu state and leaves the engine `.stopped`. Status delivery is
+      // still poll-based via `engineStatus`, but the app can issue explicit
+      // lifecycle requests through `EngineStatusStore.startEngine` for the
+      // launch prompt/user confirmation, Restart, Local API, and post-download
+      // recovery paths. Engine-crash auto-relaunch remains separate and is
+      // wired through `HelperResumeAction` via `PieEngineHost`'s relauncher.
       autoResumeEngineOnBoot()
       #if DEBUG
       scheduleSmokeAutoDriveIfRequested(engineHost: host)
@@ -422,7 +471,8 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   @discardableResult
   private func transitionToDegraded(reason: String) -> Bool {
     guard let xpcListener else { return false }
-    let degraded = DegradedHelperAPI(reasonMessage: reason)
+    let degraded = DegradedHelperAPI(reasonMessage: reason,
+                                     onQuitRequested: Self.terminateSelf)
     xpcListener.setExportedObject(degraded)
     return true
   }
@@ -446,6 +496,10 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   private func transitionToDegradedOrTerminate(reason: String) {
     guard transitionToDegraded(reason: reason) else {
       Log.helper.fault("transitionToDegraded had no listener to mutate (reason=\(reason, privacy: .public)) — terminating: a live listener serving .degraded is the only acceptable post-resume failure mode")
+      Diag.helper.event("helper.quit", [
+        ("reason", "degraded_transition_failed"),
+        ("pid", String(ProcessInfo.processInfo.processIdentifier)),
+      ])
       xpcListener?.invalidate()
       xpcListener = nil
       exit(EXIT_FAILURE)
@@ -516,7 +570,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     HelperConfig.assertSystemSideEffectAllowed("NSStatusBar.statusItem")
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
-    menu.addItem(NSMenuItem(title: "Show RatioThink",
+    menu.addItem(NSMenuItem(title: "Show Rational",
                             action: #selector(showPie),
                             keyEquivalent: "0"))
     menu.addItem(.separator())
@@ -559,7 +613,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
                             action: #selector(openLogs),
                             keyEquivalent: ""))
     menu.addItem(.separator())
-    menu.addItem(NSMenuItem(title: "Quit RatioThink",
+    menu.addItem(NSMenuItem(title: "Quit Rational",
                             action: #selector(quitPie),
                             keyEquivalent: "q"))
     item.menu = menu
@@ -569,7 +623,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // Review v1 F3: no synthetic `.stopped` initial render here.
     // `subscribeToSupervisor` registers an observer whose
     // initial-status dispatch fires synchronously onto `stateQueue`
-    // (see `PieSupervisor.observe`), so the first paint reaches main
+    // (see `PieEngineHost.observe`), so the first paint reaches main
     // within one runloop turn — using the SUPERVISOR's actual state
     // rather than a guessed `.stopped`. A watchdog timer pins this
     // contract and logs a fault if no observer hop arrives within
@@ -661,14 +715,14 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     HelperStatusItemBinding(
       setDot: { [weak self] dot in
         guard let self, let button = self.statusItem?.button else { return }
-        // #424: render the RatioThink brand mark (a rounded down-pointing
-        // triangle) instead of a generic SF-Symbol circle. Fill + the
-        // error badge carry status WITHOUT color (#396); the #412 LED tint
-        // is applied here because `NSColor` is AppKit.
+        // #424: render the Rational brand mark (a rounded
+        // down-pointing triangle) as a native menu-bar template image,
+        // not a colored LED/status-light. Fill + the error badge carry
+        // status WITHOUT color (#396), while macOS owns light/dark menu-bar
+        // foreground treatment.
         let img = MenuBarBrandIcon.image(filled: dot.isFilled,
-                                         errorBadge: dot.showsErrorBadge,
-                                         color: Self.colorForDot(dot))
-        img.accessibilityDescription = "RatioThink engine \(dot.accessibilityWord)"
+                                         errorBadge: dot.showsErrorBadge)
+        img.accessibilityDescription = "Rational engine \(dot.accessibilityWord)"
         button.image = img
         // #396: a transitional dot (engine starting/stopping) is an
         // in-flight async op, so it must show MOTION — never a static
@@ -696,28 +750,6 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
         self?.pauseResumeMenuItem?.representedObject = action
       }
     )
-  }
-
-  /// Tint color for each dot state. Kept here (not in
-  /// `HelperStatusItemModel`) because `NSColor` lives in AppKit and the
-  /// model is RatioThinkCore (no AppKit). The pure model decides the
-  /// `Dot` enum AND the brand-mark shape (`dot.isFilled` /
-  /// `dot.showsErrorBadge`, #424 — so the shape mapping is unit-testable);
-  /// the view only picks the tint.
-  private static func colorForDot(_ dot: HelperStatusItemModel.Dot) -> NSColor {
-    // #412 LED language (shared with the App toolbar pip via StatusLED):
-    // waiting = white (pulses via applyDotPulse), success = green-ish white,
-    // recoverable trouble = amber. Red is reserved for the App-side
-    // helper-given-up ring, which the menu bar never shows (a dead Helper
-    // has no menu). The brand-mark shape (`dot.isFilled` /
-    // `dot.showsErrorBadge`) still distinguishes states without color
-    // (#396 accessibility), so the tint change is safe.
-    switch dot {
-    case .stopped: return .secondaryLabelColor   // off / dim
-    case .loading: return .labelColor            // waiting → white (animated)
-    case .running: return .systemGreen           // healthy → green-ish white
-    case .error:   return .systemOrange          // recoverable trouble → amber
-    }
   }
 
   /// Layer-animation key for the transitional-dot pulse. A constant so
@@ -759,8 +791,15 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     switch status {
     case .starting:
       Diag.helper.event("engine.start")
-    case let .running(port, profileID):
-      Diag.helper.event("engine.ready", [("port", String(port)), ("profile", profileID)])
+    case let .running(snapshot):
+      Diag.helper.event("engine.ready", [
+        ("port", String(snapshot.port)),
+        ("profile", snapshot.profileID),
+        ("model", snapshot.servedModelID),
+        ("maxOutputTokens", String(snapshot.maxOutputTokens)),
+        ("generation", String(snapshot.generation)),
+        ("daemonBindHost", snapshot.daemonBindHost?.rawValue ?? "unknown"),
+      ])
     case let .failed(code, _):
       Diag.helper.event("engine.fail", [("code", code.rawValue)])
     case .stopped:
@@ -771,7 +810,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   /// Subscribe the menu bar to supervisor state transitions. The
-  /// observer fires on `PieSupervisor`'s stateQueue (an arbitrary
+  /// observer fires on `PieEngineHost`'s stateQueue (an arbitrary
   /// background queue); each transition hops onto main before
   /// touching AppKit. Degraded mode wins over the supervisor's
   /// state — the degraded status item is already on screen and must
@@ -943,16 +982,19 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       pieHome: { try Self.engineRuntimeHome() },
       // Honor the operator's RAM-guardrail fraction (persisted by the
       // Settings → Models dial as guardrail.json) at the launch-time size
-      // guard, instead of the hardcoded default. Re-evaluated per resolve
-      // so a dial change takes effect on the next launch with no Helper
-      // restart; falls back to the default fraction when unset/unreadable.
-      memoryPolicy: {
-        let fraction = (try? PieDirs.applicationSupport())
-          .map { GuardrailSettings.loadFraction(root: $0) } ?? GuardrailSettings.defaultFraction
-        return ModelMemoryGuardrail.Policy.recommended(
-          physicalMemoryBytes: SystemMemory.physicalBytes(),
-          fraction: fraction
-        )
+      // guard, instead of the hardcoded default. `livePolicy` re-reads the
+      // fraction per resolve so a dial change takes effect on the next
+      // launch with no Helper restart; it's the same derivation the
+      // ProfileEditor picker badge uses, so the gate and the badge agree.
+      // `livePolicy` logs + falls back to the default on a present-but-bad
+      // guardrail.json so a corrupt file signals without bricking launch.
+      memoryPolicy: { ModelMemoryGuardrail.livePolicy() },
+      // Local API exposure is security-sensitive and must cross the
+      // App↔Helper process boundary. Read the file-backed shared preference
+      // from the real PieDirs root rather than this helper process's
+      // UserDefaults domain.
+      daemonBindMode: {
+        EngineHTTPBindMode.persistedLocalAPIBindMode()
       }
     )
     let closure = resolver.asClosure
@@ -998,7 +1040,9 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       return nil
     }
     Log.helper.info("smoke seam: PIE_SMOKE_FAKE_ENGINE_BIN=\(fakeBin, privacy: .public)")
-    return { profileID in
+    // Smoke resolver ignores the explicit model override — it only swaps
+    // the engine binary for the fake smoke engine.
+    return { profileID, _ in
       // Use the same path-resolution closures as the production
       // resolver for the wasm/manifest/pieHome bits; the smoke
       // contract only swaps the engine binary.
@@ -1089,20 +1133,20 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
   #endif
 
-  /// Boot-time engine auto-start ( follow-up). Mirrors the menu-bar
-  /// Resume path but fires once at launch so a configured profile yields
-  /// a running engine without user interaction — the App's poll-only
-  /// model-load flow then finds a ready engine instead of deferring on
-  /// `engineNotReady`. Skipped in test mode (tests own engine lifecycle).
-  /// `HelperResumeAction.run` is internally nil/`.noActiveProfile`-safe,
-  /// so a degraded boot or unselected profile is a logged no-op.
+  /// Boot-time model-load hook. This is now a disabled/no-op hook: helper
+  /// boot publishes XPC/menu state and leaves the engine stopped while the app
+  /// polls status separately. Starts happen through explicit lifecycle requests
+  /// (`startEngine(profileID:)`) from the launch prompt/user confirmation,
+  /// Restart, Local API, or post-download recovery paths. Skipped in test mode
+  /// because tests own engine lifecycle.
   private func autoResumeEngineOnBoot() {
     // #4: the engine is NO LONGER auto-started on boot. Pre-#4 this
     // resumed the active profile automatically, which (a) loaded a
     // multi-GB model the user may not want this session and (b) made a
     // model-load failure on launch read as an unprompted error. The App
-    // now ALWAYS asks ("Start <model>?") on launch and starts the engine
-    // only on explicit user confirm via the `startEngine` XPC selector.
+    // now starts via explicit lifecycle requests: the launch prompt/user
+    // confirmation, Restart, Local API, or post-download recovery paths call
+    // the `startEngine` XPC selector.
     //
     // Scope: this disables the BOOT model-load only. The engine-CRASH
     // auto-relaunch ladder is a separate mechanism (the `relauncher`
@@ -1110,7 +1154,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // the liveness monitor on `.failed(.engineGone)` per
     // `RelaunchPolicy`) and is deliberately UNCHANGED — a crashed engine
     // still recovers automatically without a prompt.
-    Log.helper.info("autoResumeEngineOnBoot: boot auto-start disabled (#4) — engine stays stopped; the App prompts the user to start the active profile’s model on launch")
+    Log.helper.info("autoResumeEngineOnBoot: boot auto-start disabled (#4) — engine stays stopped until an explicit app/user start request")
   }
 
   @objc func togglePauseResume(_ sender: NSMenuItem) {
@@ -1133,7 +1177,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
         return
       }
       Log.helper.info("togglePauseResume: pause requested")
-      engineHost.stop()
+      engineHost.stop(reason: "menu.pause")
     case .resume:
       // In-process Resume ( follow-up): no XPC round-trip — the
       // menu-bar action runs inside the helper, so we hand the
@@ -1196,16 +1240,16 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     if let button = item.button {
       let img = NSImage(systemSymbolName: "exclamationmark.triangle.fill",
-                        accessibilityDescription: "RatioThink startup error")
+                        accessibilityDescription: "Rational startup error")
       img?.isTemplate = false
       button.image = img
     }
     let menu = NSMenu()
-    menu.addItem(NSMenuItem(title: "RatioThink cannot start — click for details",
+    menu.addItem(NSMenuItem(title: "Rational cannot start — click for details",
                             action: #selector(showStartupError),
                             keyEquivalent: ""))
     menu.addItem(.separator())
-    menu.addItem(NSMenuItem(title: "Quit RatioThink", action: #selector(quitPie), keyEquivalent: "q"))
+    menu.addItem(NSMenuItem(title: "Quit Rational", action: #selector(quitPie), keyEquivalent: "q"))
     item.menu = menu
     self.statusItem = item
     Diag.helper.event("statusitem.create", [("kind", "degraded")])
@@ -1216,40 +1260,43 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   @objc func openSettings() {
-    // RatioThink.app now ships a Settings scene and the `ratiothink://` URL
+    // Rational.app now ships a Settings scene and the `ratiothink://` URL
     // scheme, so deliver `ratiothink://settings` to route straight to
     // Settings instead of just foregrounding the app and leaving the user
     // to press ⌘,. Delivering the URL *to the resolved parent bundle*
     // (rather than a bare `NSWorkspace.open(url)`, which LaunchServices
-    // could route to any registered RatioThink.app) preserves the existing
+    // could route to any registered Rational.app) preserves the existing
     // "launch MY install" guarantee and reuses the same launch-failure
     // alert path.
     openPieApp(delivering: [SettingsDeepLink.settingsURL])
   }
 
-  /// Resolve the parent `RatioThink.app` bundle that ships this helper.
+  /// Resolve the parent `Rational.app` bundle that ships this helper.
   /// The helper bundle lives at
-  ///   `<RatioThink.app>/Contents/Library/LoginItems/RatioThinkHelper.app`
+  ///   `<Rational.app>/Contents/Library/LoginItems/RationalHelper.app`
   /// so the parent is four `deletingLastPathComponent()`s up from
-  /// the helper bundle URL. Falls back to `/Applications/RatioThink.app`
+  /// the helper bundle URL. Falls back to `/Applications/Rational.app`
   /// when the structure does not match (e.g. helper launched
   /// standalone from a build artifact path that has been moved).
   /// Maximum ancestor levels `resolvedPieAppURL` walks looking for
   /// a `.app` parent before declaring the helper standalone
   /// (review v4 F33). Today's canonical structure is four
-  /// (`<RatioThink>.app/Contents/Library/LoginItems/RatioThinkHelper.app`); the
+  /// (`<Rational>.app/Contents/Library/LoginItems/RationalHelper.app`); the
   /// bound covers two extra levels for a future embed layout
   /// change (e.g. versioned LoginItems subdir) so a structural
   /// drift surfaces as a moved-app `.error`, not a silent cross-
   /// launch.
   private static let pieAppAncestorMaxDepth = 6
 
-  private func resolvedPieAppURL() -> URL {
+  // `internal` (not `private`) so the #440 delivery unit test can assert the
+  // deep link is delivered to exactly this resolved bundle. Still file-scoped
+  // to the helper module; exposed only under `@testable import`.
+  func resolvedPieAppURL() -> URL {
     let helperBundle = Bundle.main.bundleURL
     // Review v4 F33: walk ancestors up to a bounded depth looking
     // for ANY `*.app`. The v3 fixed 4-up walk landed in the wrong
     // directory under any future embed-layout change and silently
-    // cross-launched /Applications/RatioThink.app. The walk now finds the
+    // cross-launched /Applications/Rational.app. The walk now finds the
     // first `.app` ancestor regardless of depth, and only declares
     // "true standalone" when none of the first
     // `pieAppAncestorMaxDepth` ancestors is a `.app`.
@@ -1264,7 +1311,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       if candidate.path == "/" { break }
     }
 
-    let fallback = URL(fileURLWithPath: "/Applications/RatioThink.app")
+    let fallback = URL(fileURLWithPath: "/Applications/Rational.app")
     let fallbackExists = FileManager.default.fileExists(atPath: fallback.path)
 
     if let ancestor = firstAppAncestor {
@@ -1277,9 +1324,9 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       // `.error` — the fallback is a different installation,
       // IPC-version-mismatch likely.
       if !fallbackExists {
-        Log.helper.fault("resolvedPieAppURL: parent .app gone AND /Applications/RatioThink.app absent — click will fail (ancestor=\(ancestor.path, privacy: .public))")
+        Log.helper.fault("resolvedPieAppURL: parent .app gone AND /Applications/Rational.app absent — click will fail (ancestor=\(ancestor.path, privacy: .public))")
       } else {
-        Log.helper.error("resolvedPieAppURL: parent .app moved or deleted (ancestor=\(ancestor.path, privacy: .public)); falling back to /Applications/RatioThink.app (possible IPC schema mismatch)")
+        Log.helper.error("resolvedPieAppURL: parent .app moved or deleted (ancestor=\(ancestor.path, privacy: .public)); falling back to /Applications/Rational.app (possible IPC schema mismatch)")
       }
       return fallback
     }
@@ -1289,31 +1336,37 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // outside a .app, test bench, etc.). The fallback is the only
     // sane guess.
     if !fallbackExists {
-      Log.helper.fault("resolvedPieAppURL: helper not inside an .app ancestor (within \(Self.pieAppAncestorMaxDepth, privacy: .public) levels) AND /Applications/RatioThink.app absent — click will fail (helperBundle=\(helperBundle.path, privacy: .public))")
+      Log.helper.fault("resolvedPieAppURL: helper not inside an .app ancestor (within \(Self.pieAppAncestorMaxDepth, privacy: .public) levels) AND /Applications/Rational.app absent — click will fail (helperBundle=\(helperBundle.path, privacy: .public))")
     } else {
-      Log.helper.info("resolvedPieAppURL: helper not inside an .app ancestor (within \(Self.pieAppAncestorMaxDepth, privacy: .public) levels); falling back to /Applications/RatioThink.app (helperBundle=\(helperBundle.path, privacy: .public))")
+      Log.helper.info("resolvedPieAppURL: helper not inside an .app ancestor (within \(Self.pieAppAncestorMaxDepth, privacy: .public) levels); falling back to /Applications/Rational.app (helperBundle=\(helperBundle.path, privacy: .public))")
     }
     return fallback
   }
 
-  /// Launch / foreground the resolved parent RatioThink.app. When `urls` is
+  /// Launch / foreground the resolved parent Rational.app. When `urls` is
   /// non-empty they are delivered to that specific bundle (e.g.
   /// `ratiothink://settings`), so the app routes the deep link AND the
-  /// launch still targets MY install rather than whichever RatioThink.app
+  /// launch still targets MY install rather than whichever Rational.app
   /// LaunchServices would pick for a bare scheme open. Both paths share the
   /// same launch-failure alert (review v2 F16 / v3 F25).
   private func openPieApp(delivering urls: [URL] = []) {
     let url = resolvedPieAppURL()
     Log.helper.info("openPieApp: \(url.path, privacy: .public) urls=\(urls.map(\.absoluteString).joined(separator: ","), privacy: .public)")
+    // Test seam: capture the delivered URLs + resolved bundle instead of
+    // actually launching an app (#440). Nil in production.
+    if let workspaceOpenOverride {
+      workspaceOpenOverride(urls, url)
+      return
+    }
     let cfg = NSWorkspace.OpenConfiguration()
     cfg.activates = true
     let completion: (NSRunningApplication?, Error?) -> Void = { [weak self] app, err in
       if let err {
         Log.helper.error("openPieApp failed: \(String(describing: err), privacy: .public)")
         // Review v2 F16: a logged-only failure left the menu click
-        // visually silent — clicking "Show RatioThink" / "Settings…" did
+        // visually silent — clicking "Show Rational" / "Settings…" did
         // nothing, no beep, no banner, no dock activity. The helper
-        // is the user's only surface when RatioThink.app cannot launch, so
+        // is the user's only surface when Rational.app cannot launch, so
         // surface the failure via NSAlert + NSSound.beep so the
         // click registers as something the user can act on.
         DispatchQueue.main.async {
@@ -1324,8 +1377,8 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
           // contract — the launch-failure alert is deferred until
           // that sheet completes instead of dropped.
           self?.presentHighPriorityAlert(
-            title: "Couldn't launch RatioThink.app",
-            informativeText: "Tried to launch RatioThink at \(url.path)\n\(err.localizedDescription)\n\nReinstall RatioThink from the DMG or check that RatioThink.app is in /Applications.",
+            title: "Couldn't launch Rational.app",
+            informativeText: "Tried to launch Rational at \(url.path)\n\(err.localizedDescription)\n\nReinstall Rational from the DMG or check that Rational.app is in /Applications.",
             revealRoot: FileManager.default.fileExists(atPath: url.path) ? url : nil
           )
         }
@@ -1345,11 +1398,11 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       NSWorkspace.shared.open(try PieDirs.logs())
     } catch let error as PieDirsError {
       Log.helper.error("openLogs: \(String(describing: error), privacy: .public)")
-      presentPieDirsAlert(title: "Cannot open RatioThink logs",
+      presentPieDirsAlert(title: "Cannot open Rational logs",
                           error: error)
     } catch {
       Log.helper.error("openLogs: \(String(describing: error), privacy: .public)")
-      presentAlert(title: "Cannot open RatioThink logs",
+      presentAlert(title: "Cannot open Rational logs",
                    informativeText: String(describing: error),
                    revealRoot: nil)
     }
@@ -1357,12 +1410,67 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
 
   @objc func showStartupError() {
     guard let reason = degradedReason else { return }
-    presentPieDirsAlert(title: "RatioThink cannot start",
+    presentPieDirsAlert(title: "Rational cannot start",
                         error: reason)
   }
 
+  /// #448: self-terminate hook handed to the exported XPC object. The
+  /// `quitHelper` selector fires this AFTER the engine is reaped, so the
+  /// Helper exits cleanly (exit 0) and launchd's
+  /// `KeepAlive { SuccessfulExit: false }` does NOT relaunch it. Hops to main
+  /// because `NSApp.terminate` is main-thread-only; the selector runs on an
+  /// arbitrary XPC / engine-host queue.
+  private static let terminateSelf: @Sendable () -> Void = {
+    DispatchQueue.main.async { NSApp.terminate(nil) }
+  }
+
+  /// True when an instance of the main RatioThink.app is running. The
+  /// menu-bar "Quit Rational" then delegates the coordinated full-product
+  /// teardown to the App (the single quit coordinator) so the Helper isn't
+  /// quit-then-respawned on-demand.
+  private static var isAppRunning: Bool {
+    !NSRunningApplication.runningApplications(withBundleIdentifier: "com.ratiothink.app").isEmpty
+  }
+
+  /// "Quit Rational" (#448): tears down the WHOLE product, not just the
+  /// Helper. The old `NSApp.terminate(nil)` quit only the Helper — the
+  /// still-running App then respawned it on-demand within ~1s and the engine
+  /// could orphan. Now: if the App is running it owns the quit, so hand it
+  /// `ratiothink://quit` and let `AppQuitCoordinator` drive the teardown
+  /// (stop polling → `quitHelper` → terminate App + Helper). If the App is
+  /// absent there is nothing to coordinate, so the Helper reaps its own
+  /// engine and exits.
   @objc func quitPie() {
-    NSApp.terminate(nil)
+    if Self.isAppRunning {
+      Log.helper.info("quitPie: App running — delivering ratiothink://quit for coordinated full quit")
+      openPieApp(delivering: [SettingsDeepLink.quitURL])
+    } else {
+      Log.helper.info("quitPie: App not running — local teardown (reap engine, then terminate helper)")
+      quitHelperLocally()
+    }
+  }
+
+  /// App-absent fallback for "Quit Rational": reap the engine before
+  /// exiting so the Helper never orphans `pie`. `stopAndWait` fires only
+  /// after the terminal status that `LaunchedSession.shutdown` publishes once
+  /// `pie` is gone. If that deadline expires, the Helper stays alive so it can
+  /// continue owning the session for retry or an explicit force-quit path.
+  private func quitHelperLocally() {
+    guard let engineHost else {
+      NSApp.terminate(nil)
+      return
+    }
+    HelperQuitTeardown.stopThenTerminate(
+      engineHost: engineHost,
+      initialTimeout: HelperExportedAPI.stopReplyDeadline,
+      onTerminalFailure: { result in
+        Log.helper.error("quitHelperLocally: stop/reap failed with status \(String(describing: result.lastStatus), privacy: .public); keeping helper alive for retry or explicit force quit")
+      },
+      onTimeout: { result in
+        Log.helper.error("quitHelperLocally: stop/reap timed out with status \(String(describing: result.lastStatus), privacy: .public); keeping helper alive for retry or explicit force quit")
+      },
+      terminate: { DispatchQueue.main.async { NSApp.terminate(nil) } }
+    )
   }
 
   // MARK: - alert
@@ -1535,7 +1643,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// contract cannot tolerate a silent drop (review v3 F25). If a
   /// sheet is already in flight, the alert is queued (latest-wins)
   /// and presented from the in-flight sheet's completion handler.
-  /// Used by the "Couldn't launch RatioThink.app" path so the user is
+  /// Used by the "Couldn't launch Rational.app" path so the user is
   /// guaranteed to see *some* sheet for their click, not just an
   /// ambiguous beep.
   ///

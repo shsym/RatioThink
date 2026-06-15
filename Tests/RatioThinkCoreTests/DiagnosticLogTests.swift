@@ -44,8 +44,8 @@ final class DiagnosticLogTests: XCTestCase {
   func test_redactHome_collapses_home_prefix_only() {
     let home = NSHomeDirectory()
     XCTAssertEqual(DiagnosticLog.redactHome(home + "/Library/x"), "~/Library/x")
-    XCTAssertEqual(DiagnosticLog.redactHome("/Applications/RatioThink.app"),
-                   "/Applications/RatioThink.app")
+    XCTAssertEqual(DiagnosticLog.redactHome("/Applications/Rational.app"),
+                   "/Applications/Rational.app")
   }
 
   // MARK: - thread-safety

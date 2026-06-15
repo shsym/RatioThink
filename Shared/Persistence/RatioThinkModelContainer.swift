@@ -85,26 +85,38 @@ public enum RatioThinkModelContainer {
     public var id: UUID
     public var title: String
     public var profileID: String
+    /// #460: the chat's pinned selected model (`Chat.modelID`). Optional +
+    /// omitted-when-nil so older exports (and chats that follow the profile
+    /// default) decode without it.
+    public var modelID: String?
     public var createdAt: Date
     public var updatedAt: Date
     public var pinned: Bool
+    /// #512: whether the user manually titled the chat. Optional +
+    /// omitted-when-false so older exports decode without it (nil ⇒
+    /// not user-titled).
+    public var userTitled: Bool?
     public var messages: [ExportedMessage]
 
     public init(
       id: UUID,
       title: String,
       profileID: String,
+      modelID: String? = nil,
       createdAt: Date,
       updatedAt: Date,
       pinned: Bool,
+      userTitled: Bool? = nil,
       messages: [ExportedMessage]
     ) {
       self.id = id
       self.title = title
       self.profileID = profileID
+      self.modelID = modelID
       self.createdAt = createdAt
       self.updatedAt = updatedAt
       self.pinned = pinned
+      self.userTitled = userTitled
       self.messages = messages
     }
   }
@@ -121,6 +133,10 @@ public enum RatioThinkModelContainer {
     public var tokens: Int
     public var ts: Date
     public var meta: Data?
+    /// Serialized `ToTTree` snapshot for a tree-of-thought turn (#413).
+    /// Optional + omitted-when-nil so older exports and ordinary chat
+    /// turns decode without it.
+    public var tot: Data?
 
     public init(
       id: UUID,
@@ -129,7 +145,8 @@ public enum RatioThinkModelContainer {
       reasoning: String? = nil,
       tokens: Int,
       ts: Date,
-      meta: Data?
+      meta: Data?,
+      tot: Data? = nil
     ) {
       self.id = id
       self.role = role
@@ -138,6 +155,7 @@ public enum RatioThinkModelContainer {
       self.tokens = tokens
       self.ts = ts
       self.meta = meta
+      self.tot = tot
     }
   }
 
@@ -159,9 +177,11 @@ public enum RatioThinkModelContainer {
         id: chat.id,
         title: chat.title,
         profileID: chat.profileID,
+        modelID: chat.modelID,
         createdAt: chat.createdAt,
         updatedAt: chat.updatedAt,
         pinned: chat.pinned,
+        userTitled: chat.userTitled ? true : nil,
         messages: chat.messages
           .sorted { $0.ts < $1.ts }
           .map { ExportedMessage(
@@ -171,7 +191,8 @@ public enum RatioThinkModelContainer {
             reasoning: $0.reasoning.isEmpty ? nil : $0.reasoning,
             tokens: $0.tokens,
             ts: $0.ts,
-            meta: $0.meta
+            meta: $0.meta,
+            tot: $0.tot
           ) }
       )
     }

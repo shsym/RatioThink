@@ -118,6 +118,24 @@ final class IsolatedTestCaseTests: IsolatedTestCase {
     // No assertion — success is "post-test cleanup doesn't XCTFail".
   }
 
+  func test_trackSubprocess_is_thread_safe_under_concurrent_registration() {
+    // `pidSink` fires on the async launch thread while the XCTest
+    // thread later drains the array — concurrent appends to a plain
+    // `[pid_t]` lose updates or tear a reallocation. Hammer
+    // `trackSubprocess` from many threads and assert every registration
+    // landed; without `pidLock` this either crashes or under-counts (#388).
+    //
+    // Sentinel pid -1 (non-positive) so the post-test reap loop's
+    // `where pid > 0` filter skips it — no real process is signalled.
+    let count = 2_000
+    let before = trackedSubprocessCountForTesting
+    DispatchQueue.concurrentPerform(iterations: count) { _ in
+      self.trackSubprocess(-1)
+    }
+    XCTAssertEqual(trackedSubprocessCountForTesting - before, count,
+                   "concurrent trackSubprocess lost registrations — pidLock not serializing appends")
+  }
+
   func test_boundHTTPPort_times_out_when_pie_engine_side_not_wired() async {
     // F7: until pie writes $PIE_HOME/http.port on bind, this helper
     // must time out cleanly with a descriptive IsolationError instead

@@ -17,7 +17,7 @@ cd "$ROOT"
 UID_NUM="$(id -u)"
 LABEL="com.ratiothink.app.helper"
 SERVICE="com.ratiothink.helper"
-HELPER_GLOB="LoginItems/RatioThinkHelper.app/Contents/MacOS/RatioThinkHelper"
+HELPER_GLOB="LoginItems/RationalHelper.app/Contents/MacOS/RationalHelper"
 ROUNDS="${PIE_RESPAWN_ROUNDS:-2}"
 DEADLINE_S="${PIE_RESPAWN_DEADLINE_S:-1.0}"
 # launchd throttles KeepAlive respawns (~10s min between launches), so
@@ -41,9 +41,9 @@ Set up the signed, registered build first:
        xcodebuild -project RatioThink.xcodeproj -scheme RatioThink -destination 'platform=macOS,arch=arm64' \\
          -configuration Debug CODE_SIGN_STYLE=Manual \\
          CODE_SIGN_IDENTITY=<sha1> DEVELOPMENT_TEAM=<TEAMID> PROVISIONING_PROFILE_SPECIFIER='' build
-       cp -R "<DerivedData>/Build/Products/Debug/RatioThink.app" /Applications/RatioThink.app
-  3. Launch /Applications/RatioThink.app and complete the first-launch wizard
-     ('Register RatioThinkHelper') so SMAppService.agent registers the plist.
+       cp -R "<DerivedData>/Build/Products/Debug/Rational.app" /Applications/Rational.app
+  3. Launch /Applications/Rational.app and complete the first-launch wizard
+     ('Register Rational Helper') so SMAppService.agent registers the plist.
   4. Re-run this script.
 EOF
     exit 2
@@ -93,7 +93,7 @@ echo "PASS (unclean): Helper auto-respawns (KeepAlive) within ${DEADLINE_S}s acr
 
 # Clean-quit recovery: a menu Quit (NSApp.terminate) exits 0, so KeepAlive
 # correctly does NOT relaunch it. Recovery instead comes from the running
-# App reconnecting to the on-demand MachService. Requires RatioThink.app running.
+# App reconnecting to the on-demand MachService. Requires Rational.app running.
 echo ""
 echo "=== clean-quit recovery (on-demand via App reconnect) ==="
 sleep "$THROTTLE_S"   # avoid carrying KeepAlive throttle into this check
@@ -101,8 +101,8 @@ old="$(pgrep -f "$HELPER_GLOB" | head -1 || true)"
 clean_quit_ran=0
 if [ -z "$old" ]; then
   echo "  SKIP: no Helper running to quit — clean-quit recovery NOT verified."
-elif ! pgrep -f "RatioThink.app/Contents/MacOS/RatioThink" >/dev/null 2>&1; then
-  echo "  SKIP: RatioThink.app not running — on-demand recovery needs the App to reconnect; clean-quit NOT verified."
+elif ! pgrep -f "Rational.app/Contents/MacOS/Rational" >/dev/null 2>&1; then
+  echo "  SKIP: Rational.app not running — on-demand recovery needs the App to reconnect; clean-quit NOT verified."
 else
   osascript -e 'tell application id "com.ratiothink.app.helper" to quit' >/dev/null 2>&1 || true
   start="$(date +%s.%N)"
@@ -125,6 +125,6 @@ fi
 if [ "$clean_quit_ran" -eq 1 ]; then
   echo "PASS: Helper recovers from both unclean death (KeepAlive) and clean quit (on-demand reconnect)."
 else
-  echo "PARTIAL PASS: unclean-death recovery (KeepAlive) verified; clean-quit recovery SKIPPED (prerequisites missing — run with RatioThink.app + Helper live to verify it)."
+  echo "PARTIAL PASS: unclean-death recovery (KeepAlive) verified; clean-quit recovery SKIPPED (prerequisites missing — run with Rational.app + Helper live to verify it)."
   exit 3
 fi

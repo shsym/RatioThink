@@ -1,9 +1,10 @@
 import SwiftUI
 
-/// Top-level navigation nodes in the sidebar (col 1). v1 ships two; v2 will add
-/// Routines / MCP Servers / Remote Engines as additional cases.
+/// Top-level navigation nodes in the sidebar (col 1). v1 ships three; v2 will
+/// add Routines / MCP Servers / Remote Engines as additional cases.
 enum SidebarSection: Hashable, CaseIterable, Identifiable {
   case chats
+  case search
   case apiEndpoints
 
   var id: Self { self }
@@ -11,6 +12,7 @@ enum SidebarSection: Hashable, CaseIterable, Identifiable {
   var title: String {
     switch self {
     case .chats: return "Chats"
+    case .search: return "Search"
     case .apiEndpoints: return "API Endpoints"
     }
   }
@@ -18,6 +20,7 @@ enum SidebarSection: Hashable, CaseIterable, Identifiable {
   var systemImage: String {
     switch self {
     case .chats: return "bubble.left.and.bubble.right"
+    case .search: return "magnifyingglass"
     case .apiEndpoints: return "network"
     }
   }
@@ -25,7 +28,8 @@ enum SidebarSection: Hashable, CaseIterable, Identifiable {
 
 /// Per-window UI state shared between the SwiftUI `App` (for `.commands`) and
 /// `RootView`'s `NavigationSplitView`. Lives at App level so menu items can
-/// toggle the sidebar / item-list visibility without reaching into view state.
+/// toggle sidebar / embedded chat-list visibility without reaching into view
+/// state.
 @MainActor
 final class WindowState: ObservableObject {
   @Published var columnVisibility: NavigationSplitViewVisibility = .all

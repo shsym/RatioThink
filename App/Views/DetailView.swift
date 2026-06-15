@@ -1,10 +1,11 @@
 import SwiftUI
 
-/// Col 3 — content for the selected item. v1 mounts the chat scaffold
-/// (toolbar + transcript + composer) when a chat is selected and the
-/// single live `LocalAPIView` when the API Endpoints section is selected
-/// (there is exactly one engine endpoint — #422). With no selection we
-/// fall back to the `EmptyStateView` CTAs.
+/// Detail surface for the selected left-navigation target. Mounts the chat
+/// scaffold (toolbar + transcript + composer) when a chat is selected, the
+/// conversation search panel for the Search section, and the single live
+/// `LocalAPIView` for the API Endpoints section (there is exactly one engine
+/// endpoint — #422). With no selection we fall back to the `EmptyStateView`
+/// CTAs.
 struct DetailView: View {
   let section: SidebarSection?
   let selectedItemID: UUID?
@@ -18,10 +19,13 @@ struct DetailView: View {
       // row via `@Query` keyed on `id`.
       ChatScaffoldView(chatID: id)
         .id(id)
+    case (.search, _):
+      // Sibling destination: a search panel over conversation titles +
+      // message bodies. Selecting a result routes back to the Chats section.
+      ConversationSearchView()
     case (.apiEndpoints, _):
       // One engine, one endpoint: the section maps to a single live view
-      // regardless of item selection (the item-list column is collapsed
-      // for this section in `RootView`).
+      // regardless of chat selection.
       LocalAPIView()
     case (_, nil):
       EmptyStateView()

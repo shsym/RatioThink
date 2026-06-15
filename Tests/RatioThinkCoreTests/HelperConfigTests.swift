@@ -182,7 +182,7 @@ final class HelperConfigTests: XCTestCase {
   }
 
   /// A DEBUG build — including the `xcodebuild test` runner that drives the
-  /// chat-gui E2E — honors the seam so S258/S260 can point the App at the
+  /// chat-gui E2E — honors the seam so S258 can point the App at the
   /// wrapper-booted engine.
   func test_debug_build_honors_engine_base_url_override() {
     let env = ["PIE_TEST_ENGINE_BASE_URL": "http://127.0.0.1:9999"]
@@ -199,6 +199,57 @@ final class HelperConfigTests: XCTestCase {
     HelperConfig.$isDebugBuildOverride.withValue(true) {
       XCTAssertNil(HelperConfig.testEngineBaseURLOverride(env: ["PIE_TEST_ENGINE_BASE_URL": ""]))
       XCTAssertNil(HelperConfig.testEngineBaseURLOverride(env: [:]))
+    }
+  }
+
+  // MARK: - engine base-url URL resolution (#339: malformed != silent nil)
+
+  /// A well-formed override under a DEBUG build resolves to `.valid`.
+  func test_resolve_engine_base_url_valid() {
+    let env = ["PIE_TEST_ENGINE_BASE_URL": "http://127.0.0.1:9999"]
+    HelperConfig.$isDebugBuildOverride.withValue(true) {
+      XCTAssertEqual(HelperConfig.resolveTestEngineBaseURL(env: env),
+                     .valid(URL(string: "http://127.0.0.1:9999")!))
+    }
+  }
+
+  /// A non-empty but unparseable override (embedded whitespace) resolves to
+  /// `.malformed` carrying the raw value — NOT `.notSet`. This is the #339
+  /// fix: a harness typo must be distinguishable from an absent override so
+  /// the caller can fail loudly instead of silently using the real engine.
+  func test_resolve_engine_base_url_malformed_is_loud_not_notset() {
+    let raw = "http://127.0.0.1:99 99"
+    XCTAssertNil(URL(string: raw), "precondition: this value must be unparseable")
+    let env = ["PIE_TEST_ENGINE_BASE_URL": raw]
+    HelperConfig.$isDebugBuildOverride.withValue(true) {
+      XCTAssertEqual(HelperConfig.resolveTestEngineBaseURL(env: env), .malformed(raw: raw))
+    }
+  }
+
+  /// An unbalanced-bracket override is likewise surfaced as `.malformed`.
+  func test_resolve_engine_base_url_malformed_unbalanced_bracket() {
+    let raw = "http://[::1"
+    XCTAssertNil(URL(string: raw), "precondition: this value must be unparseable")
+    let env = ["PIE_TEST_ENGINE_BASE_URL": raw]
+    HelperConfig.$isDebugBuildOverride.withValue(true) {
+      XCTAssertEqual(HelperConfig.resolveTestEngineBaseURL(env: env), .malformed(raw: raw))
+    }
+  }
+
+  /// Empty/absent env resolves to `.notSet`.
+  func test_resolve_engine_base_url_absent_is_notset() {
+    HelperConfig.$isDebugBuildOverride.withValue(true) {
+      XCTAssertEqual(HelperConfig.resolveTestEngineBaseURL(env: ["PIE_TEST_ENGINE_BASE_URL": ""]), .notSet)
+      XCTAssertEqual(HelperConfig.resolveTestEngineBaseURL(env: [:]), .notSet)
+    }
+  }
+
+  /// A Release build ignores the seam — even a malformed value resolves to
+  /// `.notSet` (the real Helper path runs), never `.malformed`.
+  func test_resolve_engine_base_url_release_ignores_even_malformed() {
+    let env = ["PIE_TEST_ENGINE_BASE_URL": "http://127.0.0.1:99 99"]
+    HelperConfig.$isDebugBuildOverride.withValue(false) {
+      XCTAssertEqual(HelperConfig.resolveTestEngineBaseURL(env: env), .notSet)
     }
   }
 

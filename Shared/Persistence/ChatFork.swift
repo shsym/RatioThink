@@ -41,10 +41,16 @@ enum ChatFork {
     }
     let prefix = ordered[...cut]
 
-    // Inherit the source chat's profile + title so the fork opens with the
-    // same identity (profile drives the model/system-prompt resolution, so
-    // the resent turn runs against the same configuration).
-    let newChat = Chat(title: chat.title, profileID: chat.profileID)
+    // Inherit the source chat's identity so the fork opens configured exactly
+    // like the original: profile (drives model/system-prompt/speculation
+    // resolution), the pinned model authority (#460 `modelID`), the title, and
+    // its user-titled flag (a copied title carries the same provenance).
+    let newChat = Chat(
+      title: chat.title,
+      profileID: chat.profileID,
+      modelID: chat.modelID,
+      userTitled: chat.userTitled
+    )
     context.insert(newChat)
     for source in prefix {
       let isEdited = source.id == message.id
@@ -57,7 +63,10 @@ enum ChatFork {
         reasoning: isEdited ? "" : source.reasoning,
         tokens: isEdited ? 0 : source.tokens,
         ts: source.ts,
-        meta: isEdited ? nil : source.meta
+        meta: isEdited ? nil : source.meta,
+        // Carry a prior assistant turn's tree-of-thought (#413) so the forked
+        // transcript renders identically; the edited user turn never has one.
+        tot: isEdited ? nil : source.tot
       )
       context.insert(copy)
       newChat.messages.append(copy)

@@ -223,85 +223,6 @@ final class HTTPEngineClientTests: XCTestCase {
     XCTAssertEqual(models[1].created, Date(timeIntervalSince1970: 1_700_000_000))
   }
 
-  // MARK: - loadModel SSE
-
-  func test_loadModel_emits_ready_then_finishes() async throws {
-    FakeSSEURLProtocol.handler = { _ in
-      .sse(chunks: [
-        "data: {\"event\":\"model_ready\"}\n\n",
-        "data: [DONE]\n\n",
-      ])
-    }
-    var events: [LoadEvent] = []
-    for try await ev in makeClient().loadModel("qwen3-0.6b") {
-      events.append(ev)
-    }
-    XCTAssertEqual(events, [.ready])
-  }
-
-  func test_loadModel_tolerates_loading_frames_before_ready() async throws {
-    // model_loading meta-frames are deferred in pie-control v1 but the
-    // demux must accept them so the engine can roll them in later
-    // without a Swift-side change.
-    FakeSSEURLProtocol.handler = { _ in
-      .sse(chunks: [
-        "data: {\"event\":\"model_loading\",\"loaded_bytes\":100,\"total_bytes\":1000}\n\n",
-        "data: {\"event\":\"model_loading\",\"loaded_bytes\":500,\"total_bytes\":1000,\"eta_s\":1.5}\n\n",
-        "data: {\"event\":\"model_ready\"}\n\n",
-        "data: [DONE]\n\n",
-      ])
-    }
-    var events: [LoadEvent] = []
-    for try await ev in makeClient().loadModel("m1") {
-      events.append(ev)
-    }
-    XCTAssertEqual(events.count, 3)
-    if case .loading(let loaded, let total, let eta) = events[0] {
-      XCTAssertEqual(loaded, 100); XCTAssertEqual(total, 1000); XCTAssertNil(eta)
-    } else { XCTFail("\(events[0])") }
-    if case .loading(let loaded, let total, let eta) = events[1] {
-      XCTAssertEqual(loaded, 500); XCTAssertEqual(total, 1000); XCTAssertEqual(eta, 1.5)
-    } else { XCTFail("\(events[1])") }
-    XCTAssertEqual(events[2], .ready)
-  }
-
-  func test_loadModel_error_metaframe_throws() async {
-    FakeSSEURLProtocol.handler = { _ in
-      .sse(chunks: [
-        #"data: {"event":"error","code":"model_not_found","message":"oops"}"# + "\n\n",
-        "data: [DONE]\n\n",
-      ])
-    }
-    do {
-      for try await _ in makeClient().loadModel("missing") {}
-      XCTFail("expected throw")
-    } catch let HTTPEngineError.stream(code, message) {
-      XCTAssertEqual(code, "model_not_found")
-      XCTAssertEqual(message, "oops")
-    } catch {
-      XCTFail("unexpected: \(error)")
-    }
-  }
-
-  func test_loadModel_pre_stream_non_2xx_surfaces_api_error() async {
-    // : a load that fails BEFORE the SSE stream opens must
-    // carry the inferlet's {error:{code,message}} envelope. Previously
-    // the streaming path called assertOK(data: nil) and dropped it.
-    FakeSSEURLProtocol.handler = { _ in
-      .json(status: 500,
-            body: #"{"error":{"code":"model_load_failed","message":"Failed to load model: oom"}}"#)
-    }
-    do {
-      for try await _ in makeClient().loadModel("big") {}
-      XCTFail("expected throw")
-    } catch let HTTPEngineError.api(status, code, message) {
-      XCTAssertEqual(status, 500)
-      XCTAssertEqual(code, "model_load_failed")
-      XCTAssertEqual(message, "Failed to load model: oom")
-    } catch {
-      XCTFail("unexpected: \(error)")
-    }
-  }
 
   // MARK: - chatCompletion SSE
 
@@ -383,6 +304,106 @@ final class HTTPEngineClientTests: XCTestCase {
       ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "x")])
     ) { events.append(ev) }
     XCTAssertEqual(events.last, .finish(reason: .other("content_filter")))
+  }
+
+  func test_chatCompletion_decodesGenerationMetricsMetaFrame() async throws {
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        #"data: {"event":"model_ready"}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"generation_metrics","output_tokens":12,"elapsed_s":0.5,"tokens_per_sec":24.0}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    var events: [ChatEvent] = []
+    for try await event in makeClient().chatCompletion(ChatRequest(model: "m", messages: [])) {
+      events.append(event)
+    }
+
+    let expected = GenerationMetrics(outputTokens: 12, elapsedSeconds: 0.5, tokensPerSecond: 24.0)
+    XCTAssertTrue(events.contains(.generationMetrics(expected)), "events=\(events)")
+  }
+
+  func test_chatCompletion_malformedGenerationMetricsAfterFinishThrows() async {
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        #"data: {"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"generation_metrics","output_tokens":12,"elapsed_s":0.5}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    var events: [ChatEvent] = []
+    do {
+      for try await event in makeClient().chatCompletion(ChatRequest(model: "m", messages: [])) {
+        events.append(event)
+      }
+      XCTFail("expected malformed generation_metrics to throw")
+    } catch {
+      XCTAssertEqual(events.last, .finish(reason: .stop))
+      XCTAssertFalse(
+        events.contains(.generationMetrics(GenerationMetrics(
+          outputTokens: 12,
+          elapsedSeconds: 0.5,
+          tokensPerSecond: 0
+        ))),
+        "malformed metrics must not be zero-filled: events=\(events)"
+      )
+      XCTAssertTrue(error is DecodingError, "expected strict frame decode error, got \(error)")
+    }
+  }
+
+  func test_chatCompletion_terminal_spec_metrics_frame_decodes_to_event() async throws {
+    // chat-apc #418/#621: a "Repeat Boost" turn closes with a terminal
+    // `spec_metrics` frame AFTER the finish chunk and before `[DONE]`. It
+    // must surface as a `.specMetrics` event (previously dropped by the
+    // demux `default`), and the accept ratio derives from the draft counts.
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        #"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"spec_metrics","enabled":true,"generated_tokens":40,"decode_steps":18,"proposed_draft_tokens":30,"accepted_draft_tokens":24,"rejected_draft_tokens":6,"avg_tokens_per_step":2.222,"decode_tokens_per_sec":85.5,"leader_len":1,"draft_len":4}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    var events: [ChatEvent] = []
+    for try await ev in makeClient().chatCompletion(
+      ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "x")])
+    ) { events.append(ev) }
+
+    // The metrics frame rides AFTER finish.
+    XCTAssertEqual(events.count, 3)
+    XCTAssertEqual(events[1], .finish(reason: .stop))
+    guard case let .specMetrics(metrics) = events[2] else {
+      return XCTFail("expected terminal .specMetrics, got \(String(describing: events.last))")
+    }
+    XCTAssertTrue(metrics.enabled)
+    XCTAssertNil(metrics.fallbackReason)
+    XCTAssertEqual(metrics.proposedDraftTokens, 30)
+    XCTAssertEqual(metrics.acceptedDraftTokens, 24)
+    XCTAssertEqual(metrics.acceptRatio, 0.8)
+    XCTAssertEqual(metrics.avgTokensPerStep, 2.222, accuracy: 1e-6)
+  }
+
+  func test_chatCompletion_inactive_spec_metrics_frame_carries_fallback_reason() async throws {
+    // Speculation requested but not engaged (non-greedy): `enabled:false`,
+    // zero proposals → `acceptRatio == nil` (not a misleading 0%).
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        #"data: {"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"spec_metrics","enabled":false,"fallback_reason":"non_greedy_sampling","generated_tokens":5,"decode_steps":5,"proposed_draft_tokens":0,"accepted_draft_tokens":0,"rejected_draft_tokens":0,"avg_tokens_per_step":1.0,"decode_tokens_per_sec":12.0,"leader_len":0,"draft_len":0}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    var metrics: SpecMetrics?
+    for try await ev in makeClient().chatCompletion(
+      ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "x")])
+    ) { if case let .specMetrics(m) = ev { metrics = m } }
+    XCTAssertEqual(metrics?.enabled, false)
+    XCTAssertEqual(metrics?.fallbackReason, "non_greedy_sampling")
+    XCTAssertNil(metrics?.acceptRatio)
   }
 
   func test_chatCompletion_inline_error_frame_surfaces_as_stream_error() async {
@@ -654,17 +675,6 @@ final class HTTPEngineClientTests: XCTestCase {
       client.session.configuration.timeoutIntervalForRequest,
       HTTPEngineClient.streamingIdleTimeout,
       "default session must lift the 60s per-request idle cap so a silent SSE load is not aborted")
-  }
-
-  func test_loadModel_request_carries_streaming_idle_timeout() async throws {
-    var captured: TimeInterval?
-    FakeSSEURLProtocol.handler = { request in
-      captured = request.timeoutInterval
-      return .sse(chunks: ["data: {\"event\":\"model_ready\"}\n\n", "data: [DONE]\n\n"])
-    }
-    for try await _ in makeClient().loadModel("m1") {}
-    XCTAssertEqual(captured, HTTPEngineClient.streamingIdleTimeout,
-                   "POST /v1/models/load must carry the lifted idle timeout, not the 60s default")
   }
 
   func test_chatCompletion_request_carries_streaming_idle_timeout() async throws {
