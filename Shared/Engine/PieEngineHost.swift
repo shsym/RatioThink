@@ -1,29 +1,22 @@
 import Foundation
 import os
 
-/// Production engine manager that replaces `PieSupervisor` on the
-/// helper boot path. Wraps `PieControlLauncher.launch`
-/// + `LaunchedSession` and projects the result onto the
-/// `EngineStatus` surface previously owned by `PieSupervisor`, so
+/// Production engine manager on the helper boot path. Wraps
+/// `PieControlLauncher.launch` + `LaunchedSession` and projects the
+/// result onto the `EngineStatus` surface, so
 /// `HelperStatusItemBinding` / `HelperStatusItemModel.make(from:)`
 /// keep working unchanged.
 ///
-/// PieSupervisor's argv (`pie --model <path> --http-listen :0
-/// --inferlet-dir <dir>`) and `HTTP_LISTEN=` handshake parser do not
-/// match the current `pie` binary, which is a multi-command CLI
-/// whose engine is `pie serve --config <toml>` with handshake
-/// `pie-server serving on <host>:<port>` + `internal token: <tok>`.
-/// PieControlLauncher already speaks that protocol; this host plugs
-/// it into the helper's selector + menu-bar wiring without
-/// rewriting PieSupervisor itself.
+/// The engine is `pie serve --config <toml>`, a multi-command CLI
+/// with handshake `pie-server serving on <host>:<port>` + `internal
+/// token: <tok>`. `PieControlLauncher` speaks that protocol; this
+/// host plugs it into the helper's selector + menu-bar wiring.
 ///
-/// Scope ceiling ( "Out of scope"): the restart ladder,
-/// slow-flap cap, and `.killRejected` boot recovery from
-/// `PieSupervisor.swift:563,890,1132+` are NOT ported here. A
-/// single-shot lifecycle closes the MVP-S1 chat-demo path; if pie
-/// crashes mid-session the host transitions to `.failed` and waits
-/// for an explicit user Resume. Porting (or re-deciding) those
-/// behaviors is a follow-up.
+/// Scope ceiling: a restart ladder, slow-flap cap, and `.killRejected`
+/// boot recovery are NOT implemented here. A single-shot lifecycle
+/// closes the MVP-S1 chat-demo path; if pie crashes mid-session the
+/// host transitions to `.failed` and waits for an explicit user
+/// Resume. Adding those behaviors is a follow-up.
 ///
 /// Concurrency model:
 ///  · `stateQueue` (serial) owns every `_state` transition. The
@@ -90,9 +83,8 @@ public final class PieEngineHost: @unchecked Sendable {
   // MARK: - Observation
 
   /// Opaque handle returned by `observe`. Drop it (or call
-  /// `cancel()`) to stop receiving status updates. Same shape as
-  /// `PieSupervisor.ObservationToken` so `HelperMain
-  /// .supervisorObservation` can hold either.
+  /// `cancel()`) to stop receiving status updates. Held by
+  /// `HelperMain.supervisorObservation`.
   public final class ObservationToken: @unchecked Sendable {
     private let onCancel: () -> Void
     private let lock = OSAllocatedUnfairLock<Bool>(initialState: false)
@@ -204,8 +196,8 @@ public final class PieEngineHost: @unchecked Sendable {
   /// `.failed` the user must manually click Resume out of. After the
   /// ladder exhausts (more than `maxAttempts` engine-gone transitions
   /// inside `window`), the host stops auto-relaunching and waits for
-  /// an explicit user action — mirrors PieSupervisor's slow-flap cap
-  /// so a chronically broken engine doesn't loop forever.
+  /// an explicit user action — a slow-flap cap so a chronically
+  /// broken engine doesn't loop forever.
   public struct RelaunchPolicy: Sendable {
     /// Max engine-gone auto-relaunches inside `window` before giving
     /// up. `<= 0` disables auto-relaunch.
@@ -411,18 +403,16 @@ public final class PieEngineHost: @unchecked Sendable {
     return try KVUsageModelStatusParser.parse(json, observedAt: now(), generation: generation)
   }
 
-  /// Diagnostic-only observer count. Mirrors `PieSupervisor
-  /// .observerCountForTesting` so the HelperStatusItem integration
-  /// tests can pin "observers cleaned up on cancel".
+  /// Diagnostic-only observer count so the HelperStatusItem
+  /// integration tests can pin "observers cleaned up on cancel".
   internal var observerCountForTesting: Int {
     observers.withLock { $0.count }
   }
 
   /// Register a handler invoked with the current status (synchronously
   /// dispatched on `stateQueue`) and on every subsequent transition.
-  /// Same contract as `PieSupervisor.observe`: handlers run on
-  /// `stateQueue`; do NOT re-enter `start` / `stop` from inside the
-  /// handler.
+  /// Handlers run on `stateQueue`; do NOT re-enter `start` / `stop`
+  /// from inside the handler.
   @discardableResult
   public func observe(_ handler: @escaping (EngineStatus, ObservationToken) -> Void) -> ObservationToken {
     let id = UUID()

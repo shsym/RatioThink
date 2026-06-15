@@ -24,68 +24,6 @@ final class LaunchSpecResolverTests: XCTestCase {
     try super.tearDownWithError()
   }
 
-  func test_resolve_known_profile_builds_launch_spec() throws {
-    let store = try makeStoreWithChatProfile()
-    defer { store.stop() }
-
-    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
-    try touchExecutable(at: binary)
-    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
-    let inferlets  = tempDir.appendingPathComponent("inferlets", isDirectory: true)
-
-    let resolver = LaunchSpecResolver(
-      profileStore: store,
-      pieBinary: { binary },
-      modelsRoot: { modelsRoot },
-      inferletsDir: { inferlets }
-    )
-
-    let result = resolver.resolve(profileID: "chat")
-    guard case .success(let spec) = result else {
-      return XCTFail("expected .success, got \(result)")
-    }
-    XCTAssertEqual(spec.binaryURL, binary)
-    XCTAssertEqual(spec.profileID, "chat")
-    XCTAssertEqual(spec.inferletDir, inferlets)
-    XCTAssertEqual(spec.inferletName, "chat-apc",
-                   "profile.inferlet must propagate verbatim to LaunchSpec.inferletName — silent drop was the bug (review v2 F7)")
-    XCTAssertEqual(spec.modelPath,
-                   modelsRoot.appendingPathComponent("llama-3.1-8b-instruct").path,
-                   "modelPath must join `modelsRoot` with `profile.model` for the downloader's on-disk layout")
-  }
-
-  func test_resolve_noDefaultProfile_returns_modelMissing_without_fallback() throws {
-    let profiles = tempDir.appendingPathComponent("profiles-no-default", isDirectory: true)
-    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
-    let toml = """
-    id = "chat"
-    name = "Chat"
-    inferlet = "chat-apc"
-    """
-    try toml.write(to: profiles.appendingPathComponent("chat.toml"),
-                   atomically: true, encoding: .utf8)
-    let active = tempDir.appendingPathComponent("active-profile-no-default", isDirectory: false)
-    let store = ProfileStore(directory: profiles, activeProfileURL: active)
-    try store.start()
-    defer { store.stop() }
-
-    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
-    try touchExecutable(at: binary)
-    let resolver = LaunchSpecResolver(
-      profileStore: store,
-      pieBinary: { binary },
-      modelsRoot: { self.tempDir.appendingPathComponent("models") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
-    )
-
-    guard case .failure(let error) = resolver.resolve(profileID: "chat") else {
-      return XCTFail("no-default profile must not resolve by choosing a hidden fallback")
-    }
-    XCTAssertEqual(error.code, .modelMissing)
-    XCTAssertTrue(error.message.contains("has no default model"),
-                  "error should route the UI to choose/download actions; got: \(error.message)")
-  }
-
   /// #459 repro 1: a no-default profile (its `model` key cleared by a model
   /// delete) must still start when the user explicitly picks a downloaded
   /// model from the toolbar / model list. The pick is threaded as
@@ -107,7 +45,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-explicit") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -152,7 +89,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-marker") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -196,7 +132,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-handshake") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -225,8 +160,7 @@ final class LaunchSpecResolverTests: XCTestCase {
     let resolver = LaunchSpecResolver(
       profileStore: store,
       pieBinary: { binary },
-      modelsRoot: { self.tempDir.appendingPathComponent("models-blank") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-blank") }
+      modelsRoot: { self.tempDir.appendingPathComponent("models-blank") }
     )
 
     guard case .failure(let err) = resolver.resolveLauncherSpec(
@@ -257,7 +191,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-override") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -271,139 +204,6 @@ final class LaunchSpecResolverTests: XCTestCase {
     let body = PieControlLauncher.renderConfigBody(modelConfig: spec.modelConfig)
     XCTAssertTrue(body.contains("hf_repo = \"\(pickedPath)\""),
                   "explicit pick must win over the profile default; got:\n\(body)")
-  }
-
-  /// Review v2 F7 + v3 F1 regression guard. The resolver mapped
-  /// `profile.model` but silently dropped `profile.inferlet` — making
-  /// every profile indistinguishable to the engine as soon as a second
-  /// inferlet shipped. Argv must carry `--inferlet <name>` so the engine
-  /// activates the profile-selected inferlet. The legacy adapter
-  /// preserves the profile schema's bare inferlet names; only the
-  /// PieControlLauncher path qualifies them against the installed
-  /// manifest before calling `launch_daemon`.
-  func test_resolve_propagates_inferlet_name_into_argv() throws {
-    let profiles = tempDir.appendingPathComponent("profiles", isDirectory: true)
-    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
-    let toml = """
-    id = "alt"
-    name = "Alt"
-    model = "llama-3.1-8b-instruct"
-    inferlet = "other-inferlet"
-    """
-    try toml.write(to: profiles.appendingPathComponent("alt.toml"),
-                   atomically: true, encoding: .utf8)
-    let activeURL = tempDir.appendingPathComponent("active-profile", isDirectory: false)
-    let store = ProfileStore(directory: profiles, activeProfileURL: activeURL)
-    try store.start()
-    defer { store.stop() }
-
-    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
-    try touchExecutable(at: binary)
-
-    let resolver = LaunchSpecResolver(
-      profileStore: store,
-      pieBinary: { binary },
-      modelsRoot: { self.tempDir.appendingPathComponent("models") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
-    )
-    guard case .success(let spec) = resolver.resolve(profileID: "alt") else {
-      return XCTFail("expected .success for profile carrying a non-default inferlet")
-    }
-    XCTAssertEqual(spec.inferletName, "other-inferlet")
-    let argv = spec.arguments()
-    guard let idx = argv.firstIndex(of: "--inferlet") else {
-      return XCTFail("argv missing --inferlet flag: \(argv)")
-    }
-    XCTAssertLessThan(idx + 1, argv.count,
-                      "--inferlet flag has no value: \(argv)")
-    XCTAssertEqual(argv[idx + 1], "other-inferlet",
-                   "argv must surface profile.inferlet verbatim")
-  }
-
-  func test_resolve_unknown_profile_returns_profile_missing() throws {
-    let store = try makeStoreWithChatProfile()
-    defer { store.stop() }
-
-    let resolver = LaunchSpecResolver(
-      profileStore: store,
-      pieBinary: { self.tempDir.appendingPathComponent("pie-fake") },
-      modelsRoot: { self.tempDir.appendingPathComponent("models") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
-    )
-
-    let result = resolver.resolve(profileID: "ghost")
-    guard case .failure(let err) = result else {
-      return XCTFail("expected .failure, got \(result)")
-    }
-    XCTAssertEqual(err.code, .profileMissing,
-                   "unknown profileID must map to .profileMissing (matches Phase 2.2 wire contract)")
-  }
-
-  func test_resolve_propagates_binary_lookup_failure_as_spawn_failed() throws {
-    let store = try makeStoreWithChatProfile()
-    defer { store.stop() }
-
-    struct StubError: Error, CustomStringConvertible {
-      var description: String { "pie binary deliberately absent" }
-    }
-    let resolver = LaunchSpecResolver(
-      profileStore: store,
-      pieBinary: { throw StubError() },
-      modelsRoot: { self.tempDir.appendingPathComponent("models") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
-    )
-    let result = resolver.resolve(profileID: "chat")
-    guard case .failure(let err) = result else {
-      return XCTFail("expected .failure, got \(result)")
-    }
-    XCTAssertEqual(err.code, .spawnFailed,
-                   "missing-binary must NOT collapse to .profileMissing (the profile is fine; the install is broken)")
-  }
-
-  /// Review v150 F8 regression guard. The downloader writes models
-  /// as `<modelsRoot>/<repo>/<file>` so profile.model legitimately
-  /// carries a multi-segment slug (e.g. HuggingFace path). A naive
-  /// single `appendingPathComponent` call percent-escapes embedded
-  /// `/` into `%2F` on recent Foundation, producing a path the
-  /// engine cannot open. The resolver MUST chain per-segment so the
-  /// final modelPath is a real filesystem path with literal slashes.
-  func test_resolve_multisegment_model_slug_preserves_slashes() throws {
-    let profiles = tempDir.appendingPathComponent("profiles", isDirectory: true)
-    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
-    let slug = "TheBloke/Llama-2-7B-Chat-GGUF/llama-2-7b.gguf"
-    let toml = """
-    id = "llama2"
-    name = "Llama 2"
-    model = "\(slug)"
-    inferlet = "chat-apc"
-    """
-    try toml.write(to: profiles.appendingPathComponent("llama2.toml"),
-                   atomically: true, encoding: .utf8)
-    let activeURL = tempDir.appendingPathComponent("active-profile", isDirectory: false)
-    let store = ProfileStore(directory: profiles, activeProfileURL: activeURL)
-    try store.start()
-    defer { store.stop() }
-
-    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
-    try touchExecutable(at: binary)
-    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
-
-    let resolver = LaunchSpecResolver(
-      profileStore: store,
-      pieBinary: { binary },
-      modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
-    )
-    guard case .success(let spec) = resolver.resolve(profileID: "llama2") else {
-      return XCTFail("expected .success for multi-segment slug")
-    }
-    XCTAssertEqual(spec.modelPath,
-                   modelsRoot.path + "/" + slug,
-                   "embedded '/' in profile.model MUST survive as literal path separators, not %2F")
-    XCTAssertFalse(spec.modelPath.contains("%2F"),
-                   "modelPath leaked %2F escape — downloader layout becomes unreachable: \(spec.modelPath)")
-    XCTAssertFalse(spec.modelPath.contains("%2f"),
-                   "modelPath leaked lowercase %2f escape: \(spec.modelPath)")
   }
 
   func test_joinModelPath_unit_handles_single_segment_and_multi_segment() {
@@ -442,7 +242,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -468,7 +267,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-external-bind") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -504,7 +302,6 @@ final class LaunchSpecResolverTests: XCTestCase {
         profileStore: store,
         pieBinary: { binary },
         modelsRoot: { modelsRoot },
-        inferletsDir: { self.tempDir.appendingPathComponent("inferlets-shared-bind") },
         pieControlResources: { resources },
         pieHome: { self.tempDir },
         subprocessEnvironment: { [:] }
@@ -544,7 +341,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -578,7 +374,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -618,7 +413,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -662,7 +456,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -708,7 +501,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -762,7 +554,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -796,7 +587,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -847,7 +637,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -882,7 +671,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -917,7 +705,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -951,7 +738,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -988,7 +774,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-small") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -1020,7 +805,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-huge-local") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -1065,7 +849,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-huge-hf") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -1110,7 +893,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-hidden-huge-hf") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -1155,7 +937,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-hidden-dangling-hf") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -1208,7 +989,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-unreadable-hf") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -1258,7 +1038,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -1298,7 +1077,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { self.tempDir.appendingPathComponent("models") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -1336,8 +1114,7 @@ final class LaunchSpecResolverTests: XCTestCase {
     let resolver = LaunchSpecResolver(
       profileStore: store,
       pieBinary: { self.tempDir.appendingPathComponent("pie-fake") },
-      modelsRoot: { self.tempDir.appendingPathComponent("models") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
+      modelsRoot: { self.tempDir.appendingPathComponent("models") }
     )
     guard case .failure(let err) = resolver.resolveLauncherSpec(profileID: "chat") else {
       return XCTFail("a split-GGUF shard model must be refused before launch")
@@ -1421,7 +1198,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { self.tempDir.appendingPathComponent("models-rt-\(suffix)", isDirectory: true) },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-rt-\(suffix)") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -1560,7 +1336,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-\(artifact)") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },

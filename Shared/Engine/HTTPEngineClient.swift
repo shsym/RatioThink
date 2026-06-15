@@ -46,7 +46,7 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
 
   /// Async resolver for the engine's loopback root. Resolved lazily
   /// per request because the pie daemon's listener port is only known
-  /// after `PieSupervisor` reports `EngineStatus.running(port:_)` over
+  /// after `PieEngineHost` reports `EngineStatus.running(port:_)` over
   /// XPC — the GUI's main scene constructs `HTTPEngineClient` before
   /// that handshake completes. Tests pass a static-URL convenience
   /// (`init(baseURL:)`) that wraps a never-throwing closure.
@@ -693,7 +693,7 @@ public enum HTTPEngineError: Error, Equatable, Sendable {
   /// failure.
   case stream(code: String, message: String)
   /// The `baseURLProvider` reported the engine has no loopback URL
-  /// yet (e.g. `PieSupervisor` is still in `.starting`). Surface this
+  /// yet (e.g. `PieEngineHost` is still in `.starting`). Surface this
   /// as a distinct case so views can render "engine not ready" rather
   /// than a generic network failure.
   case engineNotReady(detail: String)

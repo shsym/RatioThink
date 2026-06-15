@@ -2,20 +2,20 @@ import Foundation
 import os
 import TOMLKit
 
-/// Maps a `profileID` string into a `PieSupervisor.LaunchSpec` that
-/// the helper's `startEngine` selector can hand to the supervisor.
+/// Maps a `profileID` string into a `PieControlLauncher.LaunchSpec`
+/// that the helper's `startEngine` selector can hand to the launcher.
 ///
-/// Pipeline:
+/// Pipeline (`resolveLauncherSpec`):
 ///   1. Look up the matching parsed `Profile` in the injected
 ///      `ProfileStore`. A missing id (no such profile, or the entry
 ///      failed to parse) short-circuits to `.profileMissing` — the
 ///      same wire code Phase 2.2 stubbed in so the GUI's error path
 ///      does not change shape.
-///   2. Resolve filesystem paths the supervisor needs (`pie` binary,
-///      models root, inferlets dir). Each path source is injected as a
-///      throwing closure so tests can stub deterministic temp paths
-///      and a real PieDirs trap surfaces as a structured error rather
-///      than crashing the helper.
+///   2. Resolve filesystem paths the launcher needs (`pie` binary,
+///      models root, chat-apc wasm + manifest, PIE_HOME). Each path
+///      source is injected as a throwing closure so tests can stub
+///      deterministic temp paths and a real PieDirs trap surfaces as a
+///      structured error rather than crashing the helper.
 ///   3. Compose the `LaunchSpec`. `modelPath` joins `modelsRoot` with
 ///      `profile.model` — the profile stores either a bare GGUF
 ///      filename or a `<repo>/<file>` slug matching the downloader's
@@ -43,14 +43,6 @@ public struct LaunchSpecResolver {
 
   /// Returns the models root (default `PieDirs.models()`).
   public let modelsRoot: () throws -> URL
-
-  /// Returns the inferlets dir (default `PieDirs.inferlets()`).
-  /// Retained for the legacy `PieSupervisor.LaunchSpec` shape until
-  /// the supervisor itself is removed ( out-of-scope).
-  /// `PieControlLauncher` does NOT consume this — it walks the
-  /// bundle for the chat-apc wasm + manifest via
-  /// `InferletResources.pieControl`.
-  public let inferletsDir: () throws -> URL
 
   /// Returns the bundled `chat-apc` wasm + manifest used by
   /// `PieControlLauncher`'s `install_program` WS call. Default
@@ -95,7 +87,6 @@ public struct LaunchSpecResolver {
   public init(profileStore: ProfileStore,
               pieBinary: @escaping () throws -> URL,
               modelsRoot: @escaping () throws -> URL = { try PieDirs.models() },
-              inferletsDir: @escaping () throws -> URL = { try PieDirs.inferlets() },
               pieControlResources: @escaping () throws -> (wasm: URL, manifest: URL)
                 = { try InferletResources.pieControl(in: .main) },
               pieHome: @escaping () throws -> URL = { try PieDirs.applicationSupport() },
@@ -109,52 +100,12 @@ public struct LaunchSpecResolver {
     self.profileStore = profileStore
     self.pieBinary = pieBinary
     self.modelsRoot = modelsRoot
-    self.inferletsDir = inferletsDir
     self.pieControlResources = pieControlResources
     self.pieHome = pieHome
     self.subprocessEnvironment = subprocessEnvironment
     self.hfHome = hfHome
     self.memoryPolicy = memoryPolicy
     self.daemonBindMode = daemonBindMode
-  }
-
-  /// Core mapping. Pure on injected state — no Bundle / PieDirs reads
-  /// happen outside the injected closures, so unit tests run on temp
-  /// dirs without touching `~/Library/Application Support/RatioThink`.
-  public func resolve(profileID: String) -> Result<PieSupervisor.LaunchSpec, EngineError> {
-    guard let profile = lookup(profileID: profileID) else {
-      return .failure(EngineError(
-        code: .profileMissing,
-        message: "no profile with id=\(profileID) in \(profileStore.directory.path)"
-      ))
-    }
-    let binary: URL
-    let models: URL
-    let inferlets: URL
-    do {
-      binary    = try pieBinary()
-      models    = try modelsRoot()
-      inferlets = try inferletsDir()
-    } catch {
-      Self.log.error("path resolution failed for profile=\(profile.id, privacy: .public): \(String(describing: error), privacy: .public)")
-      return .failure(EngineError(
-        code: .spawnFailed,
-        message: "launch path resolution failed: \(String(describing: error))"
-      ))
-    }
-    guard let model = profile.model,
-          !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-      return .failure(Self.noDefaultModelError(profile: profile))
-    }
-    let modelPath = Self.joinModelPath(modelsRoot: models,
-                                       slug: model)
-    return .success(PieSupervisor.LaunchSpec(
-      binaryURL: binary,
-      modelPath: modelPath,
-      inferletDir: inferlets,
-      inferletName: profile.inferlet,
-      profileID: profile.id
-    ))
   }
 
   /// Type-erased adapter matching `HelperExportedAPI.LaunchSpecResolver`.
@@ -164,16 +115,9 @@ public struct LaunchSpecResolver {
     { id, explicitModel in self.resolveLauncherSpec(profileID: id, explicitModel: explicitModel) }
   }
 
-  /// Legacy adapter that still returns the stale `PieSupervisor
-  /// .LaunchSpec`. Retained so the PieSupervisor test bundle keeps
-  /// passing; no production caller should reach for this.
-  public var asLegacySupervisorClosure: (String) -> Result<PieSupervisor.LaunchSpec, EngineError> {
-    { id in self.resolve(profileID: id) }
-  }
-
   /// `PieControlLauncher`-shaped resolver. Composes the
-  /// same `Profile`-bound model path the legacy `resolve(...)` builds
-  /// with the launcher's extra inputs: bundled chat-apc wasm +
+  /// `Profile`-bound model path with the launcher's extra inputs:
+  /// bundled chat-apc wasm +
   /// manifest, sanitized subprocess env, PIE_HOME, and a unique
   /// shmem name. The launcher's `writeConfig` then emits a
   /// production TOML with `[model.driver] type = "portable"` and
@@ -679,7 +623,7 @@ extension LaunchSpecResolver {
   /// `InferletResources.candidateBundles` (Phase 5.5 ).
   ///
   /// Throws `LaunchSpecResolver.BinaryMissing` when no candidate
-  /// resolves — the supervisor would otherwise surface `Process.run()
+  /// resolves — the launcher would otherwise surface `Process.run()
   /// failed` with a confusing path; surfacing the structured error here
   /// lets the GUI render "Pie engine binary is missing — reinstall".
   public struct BinaryMissing: Error, CustomStringConvertible {

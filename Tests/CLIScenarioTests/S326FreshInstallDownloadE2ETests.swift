@@ -133,7 +133,6 @@ final class S326FreshInstallDownloadE2ETests: XCTestCase {
       profileStore: store,
       pieBinary: { pieBin },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { (wasm: wasm, manifest: manifest) },
       pieHome: { self.shortPieHome },
       subprocessEnvironment: { SpawnEnvSanitizer.sanitize(env) }

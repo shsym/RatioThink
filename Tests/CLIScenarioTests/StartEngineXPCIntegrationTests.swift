@@ -6,14 +6,13 @@ import Foundation
 ///
 /// Drives `startEngine(profileID:)` over a real `NSXPCConnection`
 /// from a same-process peer into a `HelperExportedAPI` wired to:
-///   · a live `PieSupervisor` with shrunk policy timeouts,
+///   · a `PieEngineHost` with an injected launcher seam returning a
+///     synthetic `(port, FakeSession)` tuple,
 ///   · a `LaunchSpecResolver` reading a freshly-created profile out
-///     of a per-test `ProfileStore`,
-///   · a fake `pie` shell script that prints `HTTP_LISTEN=...` and
-///     stays alive so the supervisor reaches `.running`.
+///     of a per-test `ProfileStore`.
 ///
 /// The wire path covered here is the one Phase 2.2's in-process
-/// supervisor tests deliberately skipped: encoded reply bytes flow
+/// engine-manager tests deliberately skipped: encoded reply bytes flow
 /// through `NSXPCCoder` and the per-listener exported-object lookup
 /// before the test sees the `EnginePort` payload.
 ///
@@ -41,9 +40,8 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
 
   /// Happy path: profile exists, the launcher seam returns a synthetic
   /// `(port, FakeSession)` tuple, and the XPC reply carries the bound
-  /// port back through `NSXPCCoder`.  removed PieSupervisor
-  /// from the production path; the XPC layer no longer depends on
-  /// `pie serve` spawning so the fake-script harness collapses to a
+  /// port back through `NSXPCCoder`. The XPC layer does not depend on
+  /// `pie serve` spawning, so the fake-script harness collapses to a
   /// pure Swift launcher closure.
   func test_startEngine_overXPC_returnsPort() async throws {
     let store = try makeProfileStoreWithChat()
@@ -63,7 +61,6 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { ignored },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -199,7 +196,6 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { ignored },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -260,7 +256,6 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { ignored },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -436,7 +431,6 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { ignored },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -493,7 +487,6 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { ignored },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -557,7 +550,6 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { ignored },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -624,7 +616,6 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { self.tempDir.appendingPathComponent("ignored") },
       modelsRoot: { self.tempDir.appendingPathComponent("models") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { (
         wasm: self.tempDir.appendingPathComponent("ignored.wasm"),
         manifest: self.tempDir.appendingPathComponent("ignored.toml")
@@ -793,7 +784,6 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { ignored },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -937,7 +927,6 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { ignored },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },

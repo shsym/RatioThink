@@ -42,8 +42,8 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// here because dropping the owner tears the listener down.
   private var xpcListener: HelperXPCListener?
 
-  /// Production engine manager ( — replaces the stale
-  /// `PieSupervisor` argv path with `PieControlLauncher`).
+  /// Production engine manager (`PieEngineHost`, wrapping
+  /// `PieControlLauncher`).
   /// Constructed once per healthy helper boot and threaded into
   /// `HelperExportedAPI` so `engineStatus` / `startEngine` /
   /// `stopEngine` plumb through the live subprocess. Nil under
@@ -79,7 +79,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// `[SettingsDeepLink.settingsURL]` to `resolvedPieAppURL()` — the wiring
   /// that otherwise silently degrades to a plain app-foreground on a refactor
   /// (#440). A settable property rather than a constructor-injected closure
-  /// (the idiom for `PieSupervisor.killProcessOverride`) because
+  /// (a settable test-override property) because
   /// `HelperAppDelegate` is `@main`-constructed with no init seam; `nil` in
   /// production keeps the real launch path untouched.
   var workspaceOpenOverride: ((_ urls: [URL], _ appURL: URL) -> Void)?
@@ -268,8 +268,8 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       exported = DegradedHelperAPI(reasonMessage: String(describing: reason),
                                    onQuitRequested: Self.terminateSelf)
     } else {
-      // : PieEngineHost replaces PieSupervisor on the
-      // production helper boot path. Lazily constructed (not in
+      // PieEngineHost on the production helper boot path.
+      // Lazily constructed (not in
       // init) so degraded helpers never spawn the host they cannot
       // use.
       //
@@ -623,7 +623,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     // Review v1 F3: no synthetic `.stopped` initial render here.
     // `subscribeToSupervisor` registers an observer whose
     // initial-status dispatch fires synchronously onto `stateQueue`
-    // (see `PieSupervisor.observe`), so the first paint reaches main
+    // (see `PieEngineHost.observe`), so the first paint reaches main
     // within one runloop turn — using the SUPERVISOR's actual state
     // rather than a guessed `.stopped`. A watchdog timer pins this
     // contract and logs a fault if no observer hop arrives within
@@ -810,7 +810,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   }
 
   /// Subscribe the menu bar to supervisor state transitions. The
-  /// observer fires on `PieSupervisor`'s stateQueue (an arbitrary
+  /// observer fires on `PieEngineHost`'s stateQueue (an arbitrary
   /// background queue); each transition hops onto main before
   /// touching AppKit. Degraded mode wins over the supervisor's
   /// state — the degraded status item is already on screen and must

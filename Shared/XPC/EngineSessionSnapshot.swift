@@ -66,9 +66,9 @@ public struct EngineSessionSnapshot: Codable, Equatable, Sendable {
   }
 
   /// Minimal-snapshot convenience for the few non-production construction
-  /// sites that only know `(port, profileID)`: the legacy `PieSupervisor`
-  /// projection (test-bundle-only) and the App's `PIE_TEST_ENGINE_BASE_URL`
-  /// pin / inline test stub. Fills `generation = 0`, `servedModelID = ""`
+  /// sites that only know `(port, profileID)`: the App's
+  /// `PIE_TEST_ENGINE_BASE_URL` pin / inline test stub. Fills
+  /// `generation = 0`, `servedModelID = ""`
   /// (no real model resolution happened on these paths), and the engine
   /// default pool ceiling. Production builds the full snapshot from the
   /// LaunchSpec in `PieEngineHost`.

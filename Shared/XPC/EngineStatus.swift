@@ -186,21 +186,16 @@ public enum EngineErrorCode: String, Codable, Sendable {
   /// auto-retry hint (review v3 F40).
   ///
   /// Recovery contract (review v4 F50, v5 F58/F59, v6 F69/F70):
-  /// `start()` refuses while the supervisor is in
-  /// `.failed(.killRejected, _)`. Available recovery paths today:
-  ///  · `PieSupervisor.clearKillRejected()` (in-process) — verifies
-  ///    the retained `Process` reference is no longer running via
-  ///    Foundation's wait4 bookkeeping before transitioning to
-  ///    `.stopped` (pid-reuse-safe per F59).
+  /// the in-process `clearKillRejected()` + boot-recovery that drove
+  /// this state were removed with `PieSupervisor`; `PieEngineHost`
+  /// does not produce `.killRejected` today and does not port that
+  /// recovery (see `PieEngineHost`'s scope note). The wire surface is
+  /// retained for a future re-port:
   ///  · `PieHelperXPC.clearKillRejected(reply:)` — wire-level
-  ///    selector wraps the above. The App-side GUI button that
-  ///    drives this selector is NOT yet implemented (planned for
-  ///    Phase 3+); today only programmatic XPC clients can invoke.
-  ///  · Helper relaunch — `PieSupervisor.processBootRecovery` runs
-  ///    at init, reads the persisted `engine.killrejected.json`
-  ///    manifest, sends one-shot SIGKILL to the orphan, and
-  ///    deletes the manifest. After this the helper publishes a
-  ///    clean `.stopped`.
+  ///    selector. Currently returns a `wireContractViolation`
+  ///    (`HelperExportedAPI.clearKillRejected`) because no engine
+  ///    manager implements the in-process path. No App-side GUI
+  ///    button drives it.
   ///  · `kill -9 <pid>` manually (pid is in the fault log).
   case killRejected
   /// The requested model was rejected before launch because its

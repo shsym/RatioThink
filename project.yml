@@ -128,7 +128,7 @@ targets:
     # Build the pie engine binary (Vendor/pie `pie-server` crate, bin
     # `pie`) for the current Xcode arch, stage into
     # Contents/Resources/pie-engine/pie (the path
-    # Shared/Engine/PieSupervisor.swift expects), and codesign with the
+    # LaunchSpecResolver.bundledPieBinary() expects), and codesign with the
     # engine's own entitlements.  phase 5.10.
     #
     # Must live in postCompileScripts (NOT postBuildScripts): xcodegen

@@ -563,7 +563,6 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
         profileStore: store,
         pieBinary: { e.pieBin },
         modelsRoot: { modelsRoot },
-        inferletsDir: { cellRoot.appendingPathComponent("inferlets") },
         pieControlResources: { (wasm: e.wasm, manifest: e.manifest) },
         pieHome: { cellPieHome },
         subprocessEnvironment: { SpawnEnvSanitizer.sanitize(ProcessInfo.processInfo.environment) },
@@ -1107,7 +1106,6 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { e.pieBin },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempPieHome.appendingPathComponent("inferlets") },
       pieControlResources: { (wasm: e.wasm, manifest: e.manifest) },
       // The engine binds an aux Unix-domain socket under
       // <pieHome>/standalone/<pid>/g0/aux.sock, which must fit the
@@ -1179,7 +1177,6 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { e.pieBin },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempPieHome.appendingPathComponent("inferlets") },
       pieControlResources: { (wasm: e.wasm, manifest: e.manifest) },
       pieHome: { self.shortPieHome },
       subprocessEnvironment: { SpawnEnvSanitizer.sanitize(ProcessInfo.processInfo.environment) }

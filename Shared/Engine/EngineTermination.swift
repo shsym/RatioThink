@@ -32,7 +32,7 @@ public struct EngineTermination: Equatable, Sendable {
   /// never inferred from a post-kill signal. Our own SIGINT/SIGKILL and a
   /// jetsam SIGKILL are indistinguishable in `terminationStatus`, so the
   /// initiator is the only reliable user-stop-vs-fault discriminator
-  /// (insight:40 / PieSupervisor reaper race).
+  /// (insight:40 / the engine reaper race).
   public enum Initiator: String, Sendable {
     case user      // operator pause / unload (XPC stopEngine)
     case helper    // helper process graceful termination

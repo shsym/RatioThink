@@ -42,10 +42,8 @@ private func preEncodedXPC<T: Encodable>(_ value: T, _ label: String) -> Data {
 /// introduce a TSan-quiet race.
 public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// Resolves a profile id into a `PieControlLauncher.LaunchSpec` the
-  /// `PieEngineHost` can spawn.  migrated this away from
-  /// `PieSupervisor.LaunchSpec` (whose argv + handshake parser no
-  /// longer match the `pie` binary). `LaunchSpecResolver
-  /// .asClosure` is the canonical adapter.
+  /// `PieEngineHost` can spawn. `LaunchSpecResolver.asClosure` is the
+  /// canonical adapter.
   ///
   /// Second argument is the optional per-start `explicitModel` (#459 repro
   /// 1) — the chat toolbar / model-list selection that overrides the
@@ -848,24 +846,18 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     reply(nil, Self.notImplementedErrorData)
   }
 
-  /// PR12 review v5 F58: surface the `clearKillRejected` recovery
-  /// path over XPC. Forwards to `PieSupervisor.clearKillRejected()`,
-  /// which verifies the zombie pid is reaped (via the retained
-  /// Process reference per F59) before transitioning to `.stopped`.
-  /// Replies nil on success, `EngineError(.killRejected, …)` when
-  /// the supervisor refuses (engine still alive, no zombie
-  /// tracked, not in killRejected state).
-  ///  unwired `PieSupervisor` from production; the
-  /// `.killRejected` recovery path is part of PieSupervisor's
-  /// out-of-scope restart-ladder + boot-recovery logic and has not
-  /// been ported to `PieEngineHost`. Surface a structured error
-  /// instead of silently no-oping so a GUI button that drives this
-  /// selector (none exists today) gets a real cause line.
+  /// PR12 review v5 F58: the `clearKillRejected` recovery path was
+  /// surfaced over XPC for the in-process `clearKillRejected()` /
+  /// boot-recovery that lived in the now-removed `PieSupervisor`.
+  /// `PieEngineHost` does not port that restart-ladder + boot-recovery
+  /// logic, so this selector currently returns a structured
+  /// `wireContractViolation` instead of silently no-oping — a GUI
+  /// button that drives it (none exists today) gets a real cause line.
   public func clearKillRejected(reply: @escaping (Data?) -> Void) {
     Self.log.error("clearKillRejected: not implemented under PieEngineHost — follow-up required")
     let err = EngineError(
       code: .wireContractViolation,
-      message: "clearKillRejected is not supported by PieEngineHost ( left PieSupervisor's restart/boot-recovery out of scope; track the follow-up before wiring a GUI button)"
+      message: "clearKillRejected is not supported by PieEngineHost (restart/boot-recovery left out of scope; track the follow-up before wiring a GUI button)"
     )
     do {
       reply(try XPCPayload.encode(err))
