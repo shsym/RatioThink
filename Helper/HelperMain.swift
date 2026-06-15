@@ -331,7 +331,11 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
         // likely-OOM heuristic (SIGKILL-not-by-us + last-RSS >= ceiling).
         terminationSink: PieEngineHost.productionTerminationSink,
         tailWriter: PieEngineHost.productionTailWriter,
-        guardrailBytes: ModelMemoryGuardrail.defaultPolicy.maxResolvedModelBytes
+        // #604: re-read the LIVE dial at death time (not the 0.65-pinned
+        // `defaultPolicy`) so the OOM ceiling matches the launch gate
+        // (`memoryPolicy`) and the picker badge — a raised dial would
+        // otherwise leave this breadcrumb mislabeling deaths as OOM.
+        guardrailBytes: { ModelMemoryGuardrail.livePolicy().maxResolvedModelBytes }
       )
       holder.helper = self
       self.engineHost = host

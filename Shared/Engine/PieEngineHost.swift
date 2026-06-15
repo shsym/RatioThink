@@ -268,10 +268,14 @@ public final class PieEngineHost: @unchecked Sendable {
   ///   - tailWriter: receives the bounded, redacted stderr tail on death so
   ///     it can be persisted durably. `nil` (default) writes nothing;
   ///     production wires `PieEngineHost.productionTailWriter` (engine.log).
-  ///   - guardrailBytes: the #328 resolved-artifact ceiling used for the
-  ///     likely-OOM heuristic (SIGKILL-not-by-us + last-RSS >= ceiling).
-  ///     `nil` (default) means OOM is never inferred; production passes
-  ///     `ModelMemoryGuardrail.defaultPolicy.maxResolvedModelBytes`.
+  ///   - guardrailBytes: a *provider* of the #328 resolved-artifact ceiling
+  ///     used for the likely-OOM heuristic (SIGKILL-not-by-us + last-RSS >=
+  ///     ceiling). Evaluated lazily at termination time — NOT captured at
+  ///     construction — so the breadcrumb tracks the live Settings → Models
+  ///     dial exactly as the launch gate (`memoryPolicy`) and the picker badge
+  ///     do (#604). Returning `nil` means OOM is never inferred; the default
+  ///     `{ nil }` keeps tests breadcrumb-free, and production passes
+  ///     `{ ModelMemoryGuardrail.livePolicy().maxResolvedModelBytes }`.
   ///   - launchTimeoutSlack: host-owned safety margin added to
   ///     `LaunchSpec.handshakeTimeout` before cancelling a launch that is
   ///     still `.starting`. This is scoped to the launch incarnation; once
@@ -286,7 +290,7 @@ public final class PieEngineHost: @unchecked Sendable {
     relauncher: Relauncher? = nil,
     terminationSink: (@Sendable (EngineTermination) -> Void)? = nil,
     tailWriter: (@Sendable ([String]) -> Void)? = nil,
-    guardrailBytes: Int64? = nil,
+    guardrailBytes: @Sendable @escaping () -> Int64? = { nil },
     launchTimeoutSlack: TimeInterval = PieEngineHost.defaultLaunchTimeoutSlack,
     clock: @Sendable @escaping () -> Date = { Date() },
     // Default: a real cooperative sleep that swallows cancellation, exactly
@@ -316,7 +320,7 @@ public final class PieEngineHost: @unchecked Sendable {
   private let relauncher: Relauncher?
   private let terminationSink: (@Sendable (EngineTermination) -> Void)?
   private let tailWriter: (@Sendable ([String]) -> Void)?
-  private let guardrailBytes: Int64?
+  private let guardrailBytes: @Sendable () -> Int64?
 
   /// Production breadcrumb sink: one durable, chat-free `engine.terminated`
   /// line per death in `helper.log` (via `DiagnosticLog`). Wired by
@@ -855,7 +859,7 @@ public final class PieEngineHost: @unchecked Sendable {
           error: error
         )
       Log.engine.error("PieEngineHost: launch failed: \(msg, privacy: .public)")
-      let terminationEvidence = Self.terminationForLaunchError(error, guardrailBytes: guardrailBytes)
+      let terminationEvidence = Self.terminationForLaunchError(error, guardrailBytes: guardrailBytes())
       let shutdownFailureMessage = Self.shutdownFailureMessage(from: error)
       let launchCancellationEvidence = Self.launchCancellationEvidence(from: error)
       stateQueue.async { [weak self] in
@@ -958,7 +962,7 @@ public final class PieEngineHost: @unchecked Sendable {
     func recordStop() {
       let t = EngineTermination.classify(
         reason: nil, status: nil, initiator: initiator,
-        lastRSSBytes: nil, guardrailBytes: guardrailBytes)
+        lastRSSBytes: nil, guardrailBytes: guardrailBytes())
       emitTermination(t, tail: [])
     }
     switch _state {
@@ -1102,8 +1106,10 @@ public final class PieEngineHost: @unchecked Sendable {
     livenessMonitor?.cancel()
     livenessMonitorIncarnation += 1
     let myIncarnation = livenessMonitorIncarnation
-    let guardrail = guardrailBytes
-    livenessMonitor = Task { [weak self, sleepFor, myIncarnation] in
+    // Capture the provider, not a snapshot: the OOM ceiling is read at death
+    // time so a mid-run dial change is honored (#604).
+    let guardrailProvider = guardrailBytes
+    livenessMonitor = Task { [weak self, sleepFor, myIncarnation, guardrailProvider] in
       var consecutiveGone = 0
       // Highest successful RSS sample from this child lifetime. Sample
       // immediately rather than waiting for the first `.alive` tick: early
@@ -1150,7 +1156,7 @@ public final class PieEngineHost: @unchecked Sendable {
           let termination = EngineTermination.classify(
             reason: snapshot?.reason, status: snapshot?.status,
             initiator: snapshot == nil ? .liveness : .engine,
-            lastRSSBytes: maxRSS, guardrailBytes: guardrail)
+            lastRSSBytes: maxRSS, guardrailBytes: guardrailProvider())
           self?.stateQueue.async { [weak self, myIncarnation] in
             guard let self else { return }
             // #336: bail unless this monitor is still the live one. A
