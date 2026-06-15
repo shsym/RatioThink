@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Persisted per-profile speculative-decode telemetry (#621). Each chat
 /// turn on a "Fast Think" profile ends with a terminal `spec_metrics` SSE
@@ -126,10 +127,34 @@ public final class SpecMetricsStore: ObservableObject {
   /// instant a turn reports.
   @Published private var byProfile: [String: SpecMetricsAggregate]
 
+  /// What a non-clean load did with a present-but-bad file. `nil` on a clean
+  /// load (file absent or valid).
+  public enum LoadDiagnostic: Equatable, Sendable {
+    /// The corrupt file was moved aside to `quarantine`; the store started
+    /// empty and persistence resumes against the now-free canonical path,
+    /// so the preserved bytes can't be silently overwritten.
+    case quarantined(corrupt: URL, quarantine: URL)
+    /// The corrupt file could not be moved aside, so persistence is DISABLED
+    /// for this instance rather than overwriting it — the bytes stay intact
+    /// for manual recovery.
+    case corruptPersistenceDisabled(URL)
+  }
+
+  /// Signal raised when the backing file was present but undecodable, so a
+  /// future Settings surface can tell the operator their telemetry was reset
+  /// and where the unreadable bytes were preserved. The load no longer
+  /// silently swallows corruption into an empty map (#625).
+  @Published public private(set) var loadDiagnostic: LoadDiagnostic?
+
   /// `nil` disables persistence (preview / unit tests that don't want a
   /// file). Reads/writes are best-effort: a corrupt or unwritable file
   /// degrades to in-memory only rather than bricking chat.
   private let fileURL: URL?
+  private let fileManager: FileManager
+
+  /// Set when a corrupt file could not be quarantined: `persist()` then
+  /// refuses to write so the unreadable bytes survive (no silent wipe).
+  private var persistenceDisabled: Bool
 
   /// Production store rooted at the support dir. A `PieDirs` failure (very
   /// rare — unwritable home) yields an in-memory-only store rather than
@@ -141,9 +166,13 @@ public final class SpecMetricsStore: ObservableObject {
   }
 
   /// Test/preview seam: inject the file URL (or `nil` for in-memory).
-  public init(fileURL: URL?) {
+  public init(fileURL: URL?, fileManager: FileManager = .default) {
     self.fileURL = fileURL
-    self.byProfile = Self.load(from: fileURL)
+    self.fileManager = fileManager
+    let outcome = Self.load(from: fileURL, fileManager: fileManager)
+    self.byProfile = outcome.aggregates
+    self.loadDiagnostic = outcome.diagnostic
+    self.persistenceDisabled = outcome.persistenceDisabled
   }
 
   /// The aggregate for a profile, or `nil` when it has never reported.
@@ -160,16 +189,56 @@ public final class SpecMetricsStore: ObservableObject {
 
   // MARK: - persistence
 
-  private static func load(from url: URL?) -> [String: SpecMetricsAggregate] {
-    guard let url,
-          let data = try? Data(contentsOf: url),
-          let decoded = try? JSONDecoder().decode([String: SpecMetricsAggregate].self, from: data)
-    else { return [:] }
-    return decoded
+  /// Sibling path a corrupt file is moved to (`spec-metrics.json.corrupt`).
+  static func quarantineURL(for url: URL) -> URL {
+    url.appendingPathExtension("corrupt")
+  }
+
+  private struct LoadOutcome {
+    var aggregates: [String: SpecMetricsAggregate]
+    var diagnostic: LoadDiagnostic?
+    var persistenceDisabled: Bool
+
+    static let clean = LoadOutcome(aggregates: [:], diagnostic: nil, persistenceDisabled: false)
+  }
+
+  /// Three outcomes, never collapsed into one empty map (the #625 bug): an
+  /// *absent* file is the legitimate unset state → empty + clean; a *valid*
+  /// file decodes; a *present-but-undecodable* file is quarantined so the
+  /// next `record()` can't silently destroy it, then the store starts empty.
+  private static func load(from url: URL?,
+                           fileManager: FileManager) -> LoadOutcome {
+    guard let url, fileManager.fileExists(atPath: url.path) else { return .clean }
+    if let data = try? Data(contentsOf: url),
+       let decoded = try? JSONDecoder().decode([String: SpecMetricsAggregate].self, from: data) {
+      return LoadOutcome(aggregates: decoded, diagnostic: nil, persistenceDisabled: false)
+    }
+    return quarantine(url, fileManager: fileManager)
+  }
+
+  /// Move a corrupt file aside, preserving its bytes. On success the store
+  /// resumes persistence against the now-free canonical path; if the move
+  /// fails, persistence is disabled so the bytes are never overwritten.
+  private static func quarantine(_ url: URL,
+                                 fileManager: FileManager) -> LoadOutcome {
+    let dest = quarantineURL(for: url)
+    do {
+      try? fileManager.removeItem(at: dest)   // latest corruption wins the slot
+      try fileManager.moveItem(at: url, to: dest)
+      Log.store.error("spec-metrics.json corrupt; quarantined to \(dest.lastPathComponent, privacy: .public)")
+      return LoadOutcome(aggregates: [:],
+                         diagnostic: .quarantined(corrupt: url, quarantine: dest),
+                         persistenceDisabled: false)
+    } catch {
+      Log.store.error("spec-metrics.json corrupt and unmovable; persistence disabled to preserve it")
+      return LoadOutcome(aggregates: [:],
+                         diagnostic: .corruptPersistenceDisabled(url),
+                         persistenceDisabled: true)
+    }
   }
 
   private func persist() {
-    guard let fileURL else { return }
+    guard let fileURL, !persistenceDisabled else { return }
     guard let data = try? JSONEncoder().encode(byProfile) else { return }
     try? data.write(to: fileURL, options: .atomic)
   }

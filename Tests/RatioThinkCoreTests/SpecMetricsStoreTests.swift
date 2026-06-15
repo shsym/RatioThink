@@ -116,4 +116,72 @@ final class SpecMetricsStoreTests: XCTestCase {
     XCTAssertEqual(store.aggregate(forProfileID: "p")?.lastAcceptRatio, 0.7)
     XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
   }
+
+  // MARK: - corrupt-load quarantine (#625)
+
+  /// Seed a valid multi-profile file, then ensure a clean load raises no
+  /// diagnostic and leaves the file untouched.
+  func test_valid_file_loads_without_diagnostic() {
+    let seed = SpecMetricsStore(fileURL: fileURL)
+    seed.record(drafted(10, 8), forProfileID: "a")
+    seed.record(drafted(10, 6), forProfileID: "b")
+
+    let reloaded = SpecMetricsStore(fileURL: fileURL)
+    XCTAssertNil(reloaded.loadDiagnostic)
+    XCTAssertEqual(reloaded.aggregate(forProfileID: "a")?.lastAcceptRatio, 0.8)
+    XCTAssertEqual(reloaded.aggregate(forProfileID: "b")?.lastAcceptRatio, 0.6)
+  }
+
+  /// An absent file is the legitimate unset state — empty, no diagnostic.
+  func test_absent_file_loads_clean() {
+    let store = SpecMetricsStore(fileURL: fileURL)
+    XCTAssertNil(store.loadDiagnostic)
+    XCTAssertNil(store.aggregate(forProfileID: "any"))
+  }
+
+  /// The core bug: a corrupt file must NOT load as empty and then get
+  /// silently overwritten on the next write. It is quarantined and signaled.
+  func test_corrupt_file_is_quarantined_and_signaled() throws {
+    try Data("{ this is not valid json".utf8).write(to: fileURL)
+
+    let store = SpecMetricsStore(fileURL: fileURL)
+
+    let quarantine = SpecMetricsStore.quarantineURL(for: fileURL)
+    guard case let .quarantined(corrupt, moved)? = store.loadDiagnostic else {
+      return XCTFail("expected a quarantine diagnostic, got \(String(describing: store.loadDiagnostic))")
+    }
+    XCTAssertEqual(corrupt, fileURL)
+    XCTAssertEqual(moved, quarantine)
+    XCTAssertNil(store.aggregate(forProfileID: "any"))
+    // Corrupt bytes were moved aside, not left at the canonical path.
+    XCTAssertTrue(FileManager.default.fileExists(atPath: quarantine.path))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+    try? FileManager.default.removeItem(at: quarantine)
+  }
+
+  /// Quarantine preserves the exact corrupt bytes for manual recovery.
+  func test_quarantine_preserves_corrupt_bytes() throws {
+    let corruptBytes = Data("\u{0}\u{1}garbage-not-json".utf8)
+    try corruptBytes.write(to: fileURL)
+
+    _ = SpecMetricsStore(fileURL: fileURL)
+
+    let quarantine = SpecMetricsStore.quarantineURL(for: fileURL)
+    XCTAssertEqual(try Data(contentsOf: quarantine), corruptBytes)
+    try? FileManager.default.removeItem(at: quarantine)
+  }
+
+  /// After quarantine, persistence resumes against the freed canonical path,
+  /// so this session's telemetry is saved and reloads cleanly.
+  func test_record_after_quarantine_persists_fresh_canonical() throws {
+    try Data("not json".utf8).write(to: fileURL)
+
+    let store = SpecMetricsStore(fileURL: fileURL)
+    store.record(drafted(10, 9), forProfileID: "fast-think")
+
+    let reloaded = SpecMetricsStore(fileURL: fileURL)
+    XCTAssertNil(reloaded.loadDiagnostic, "the freshly written file is valid")
+    XCTAssertEqual(reloaded.aggregate(forProfileID: "fast-think")?.lastAcceptRatio, 0.9)
+    try? FileManager.default.removeItem(at: SpecMetricsStore.quarantineURL(for: fileURL))
+  }
 }
