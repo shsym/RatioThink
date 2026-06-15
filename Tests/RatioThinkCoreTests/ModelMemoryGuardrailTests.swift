@@ -133,6 +133,19 @@ final class ModelMemoryGuardrailTests: XCTestCase {
                    "nil root → default fraction")
   }
 
+  /// A present-but-corrupt `guardrail.json` makes `loadFraction` throw;
+  /// `livePolicy` must catch + log + fall back to the default fraction so
+  /// the launch gate and picker badge never brick — it must NOT propagate
+  /// the throw. Mirrors `GuardrailSettingsTests.test_corrupt_file_throws…`
+  /// at the `livePolicy` layer (covers the catch arm directly).
+  func test_livePolicy_falls_back_on_corrupt_file() throws {
+    try Data("not json".utf8)
+      .write(to: tempDir.appendingPathComponent("guardrail.json", isDirectory: false))
+    let live = ModelMemoryGuardrail.livePolicy(root: tempDir, physicalMemoryBytes: 64 * gib)
+    XCTAssertEqual(live.ramFraction, GuardrailSettings.defaultFraction,
+                   "corrupt guardrail.json → default fraction, not a propagated throw")
+  }
+
   // MARK: - validate() over a real (sparse) file
 
   func test_validate_8gb_host_blocks_4gib_model_with_terms_in_message() throws {
