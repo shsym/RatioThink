@@ -188,10 +188,19 @@ final class SpecMetricsStoreTests: XCTestCase {
   /// A present-but-UNREADABLE file is not proven corrupt, so it must NOT be
   /// quarantined (#633) — moving bytes that might be valid would destroy real
   /// telemetry. It is left in place and persistence is disabled so the next
-  /// write can't overwrite it. A directory at the canonical path stands in
-  /// for the read failure: it "exists" but `Data(contentsOf:)` can't read it.
+  /// write can't overwrite it. A real file with read permission stripped
+  /// (mode 000) stands in for the read failure: it "exists" but
+  /// `Data(contentsOf:)` throws EACCES, while the canonical path stays
+  /// WRITABLE so a wrongly re-enabled `persist()` would visibly overwrite it.
   func test_present_but_unreadable_file_is_preserved_not_quarantined() throws {
-    try FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
+    let original = Data("{ valid-bytes-we-just-can't-read".utf8)
+    try original.write(to: fileURL)
+    try FileManager.default.setAttributes(
+      [.posixPermissions: 0o000], ofItemAtPath: fileURL.path)
+    defer {
+      try? FileManager.default.setAttributes(
+        [.posixPermissions: 0o644], ofItemAtPath: fileURL.path)
+    }
 
     let store = SpecMetricsStore(fileURL: fileURL)
     XCTAssertEqual(store.loadDiagnostic, .unreadablePersistenceDisabled(fileURL))
@@ -200,13 +209,15 @@ final class SpecMetricsStoreTests: XCTestCase {
     XCTAssertFalse(FileManager.default.fileExists(
       atPath: SpecMetricsStore.quarantineURL(for: fileURL).path))
 
-    // record() must NOT write (persistence disabled): the path stays the
-    // untouched directory rather than a file overwriting possibly-valid bytes.
+    // record() must NOT write — persistence is disabled. This discriminates:
+    // a wrongly re-enabled persist() does an atomic write that renames over
+    // the (writable-dir) canonical path, replacing these bytes with fresh
+    // JSON. Restoring read access and comparing proves no such write ran.
     store.record(drafted(10, 9), forProfileID: "p")
-    var isDir: ObjCBool = false
-    XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDir))
-    XCTAssertTrue(isDir.boolValue,
-                  "persistence is disabled; nothing should overwrite the unreadable path")
+    try FileManager.default.setAttributes(
+      [.posixPermissions: 0o644], ofItemAtPath: fileURL.path)
+    XCTAssertEqual(try Data(contentsOf: fileURL), original,
+                   "persistence is disabled; the unreadable bytes must survive untouched")
   }
 
   /// When a corrupt file can't be moved aside, persistence is DISABLED so the
