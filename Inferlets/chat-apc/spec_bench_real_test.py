@@ -59,5 +59,36 @@ class CacheCellFormatting(unittest.TestCase):
         )
 
 
+class CrossRequestReuseGuard(unittest.TestCase):
+    """#596 F4: the ordering-neutrality guard must flag a fast_think run that
+    inherited drafting state from a prior request (would warm fast_think),
+    and stay silent for the expected cold-decode statuses."""
+
+    def _rec(self, status):
+        sm = {"proposed_draft_tokens": 0, "accepted_draft_tokens": 0}
+        if status is not None:
+            sm["ngram_sidecar_status"] = status
+        return {"spec_metrics": sm}
+
+    def test_reused_status_is_violation(self):
+        for bad in ("reused", "lineage_forked"):
+            err = b._cross_request_reuse("primes", "fast_think", self._rec(bad))
+            self.assertIsNotNone(err, bad)
+            self.assertIn(bad, err)
+
+    def test_cold_statuses_are_clean(self):
+        # absent field (no thread_id -> sidecar disabled) and an explicit
+        # `fresh` both mean no cross-request state carried over.
+        for ok in (None, "fresh"):
+            self.assertIsNone(
+                b._cross_request_reuse("primes", "fast_think", self._rec(ok)), ok
+            )
+
+    def test_missing_spec_metrics_is_clean(self):
+        # a missing spec_metrics frame is a separate contract failure caught
+        # by _check_run; the reuse guard must not also trip on it.
+        self.assertIsNone(b._cross_request_reuse("primes", "baseline", {}))
+
+
 if __name__ == "__main__":
     unittest.main()

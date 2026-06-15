@@ -18,6 +18,28 @@ by the same transport loop, so the only difference is whether drafting
 engaged. No production decode behavior is changed — the metrics surface
 already exists (#418).
 
+Measurement neutrality (#596 F4): each scenario runs its baseline reps
+before its fast_think reps on ONE long-lived engine, which would warm
+fast_think if any decode-side state carried over between requests. It does
+NOT, and that is enforced, not assumed: the harness deliberately omits both
+cross-request reuse channels, so every request decodes cold.
+
+  * No `cache` directive  -> the #522 prefix-KV path is gated on an enabled
+    `cache` block (completions.rs: `req.cache.filter(|d| d.enabled())`).
+    Absent it, each request gets a fresh `Context::new` with its own KV; no
+    prior request's KV is reused.
+  * No `spec.thread_id`    -> the Cacheback n-gram sidecar is gated on a
+    non-empty `thread_id` (completions.rs `sidecar_for_request` returns
+    `(None, None)` when it is absent). Absent it, each fast_think request
+    builds a fresh, request-scoped `NgramCache` that is dropped at the end.
+
+Both invariants are ENFORCED at runtime so they cannot silently regress:
+`_stream_run` asserts the request body never carries `cache`/`thread_id`,
+and `_check_run` asserts no run reports a cross-request drafting reuse via
+the engine's `ngram_sidecar_status` wire field. With no state carried over,
+the baseline-before-fast_think ordering is provably neutral — there is no
+warming bias to interleave or randomize away.
+
 Measured per run:
 
   Latency (client, via SSE)
@@ -174,6 +196,17 @@ async def _stream_run(
         "stream": True,
         "speculation": spec,
     }
+    # #596 F4: keep both cross-request reuse channels OFF so the
+    # baseline-then-fast_think ordering stays provably neutral. A future edit
+    # that adds either would silently warm fast_think — fail loud here.
+    assert "cache" not in body, (
+        "harness must not send a `cache` directive (#522 prefix-KV reuse "
+        "would warm KV across requests, breaking ordering neutrality)"
+    )
+    assert "thread_id" not in spec, (
+        "harness must not send `speculation.thread_id` (Cacheback n-gram "
+        "sidecar reuse would warm fast_think across requests)"
+    )
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     spec_metrics: dict | None = None
@@ -281,6 +314,24 @@ _REQUIRED_SPEC_KEYS = (
 )
 
 
+def _cross_request_reuse(scenario_id: str, label: str, rec: dict) -> str | None:
+    """#596 F4: wire-level proof that this run decoded with no drafting state
+    carried over from a prior request. With no `spec.thread_id` the Cacheback
+    sidecar stays disabled, so the engine emits no `ngram_sidecar_status` (or
+    `fresh`); a `reused`/`lineage_forked` status means a prior request's
+    n-gram cache primed this one — ordering neutrality is broken. Returns an
+    error string on violation, else None."""
+    sm = rec.get("spec_metrics") or {}
+    status = sm.get("ngram_sidecar_status")
+    if status in ("reused", "lineage_forked"):
+        return (
+            f"[{scenario_id}/{label}] cross-request drafting reuse detected "
+            f"(ngram_sidecar_status={status!r}); baseline-before-fast_think "
+            f"ordering is no longer neutral — see #596 F4"
+        )
+    return None
+
+
 def _check_run(label: str, scenario_id: str, rec: dict, failures: list[str]) -> bool:
     """Contract checks common to every run. Returns True if metrics usable."""
     if rec.get("status") != 200:
@@ -329,6 +380,9 @@ def _check_run(label: str, scenario_id: str, rec: dict, failures: list[str]) -> 
             f"[{scenario_id}/{label}] draft accounting inconsistent: "
             f"accepted={accepted} rejected={rejected} proposed={proposed}"
         )
+    reuse = _cross_request_reuse(scenario_id, label, rec)
+    if reuse is not None:
+        failures.append(reuse)
     return True
 
 

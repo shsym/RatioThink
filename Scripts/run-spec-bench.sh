@@ -45,12 +45,33 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 2
 fi
 
-# Self-bootstrap: build the pie engine binary if missing. NOTE: a stale
-# binary is NOT auto-rebuilt — after a Vendor/pie pin bump run
-# `make engine-build` to refresh before trusting a measurement.
+# Self-bootstrap: build the pie engine binary if missing OR stale. A stale
+# binary silently measures the OLD engine after a Vendor/pie pin bump — the
+# same hazard the http-e2e wrapper once had (#596 F5). We stamp the engine
+# with the submodule SHA it was built from and rebuild when it drifts.
+PIE_SHA="$(git -C Vendor/pie rev-parse HEAD 2>/dev/null || echo unknown)"
+STAMP="$PIE_BIN.built-from-sha"
+build_engine() {
+  (cd Vendor/pie && PIE_PORTABLE_METAL=1 cargo build -p pie-server --release)
+  printf '%s\n' "$PIE_SHA" >"$STAMP"
+}
 if [ ! -x "$PIE_BIN" ]; then
   echo "[spec-bench] pie engine binary missing — building (make engine-build)…"
-  (cd Vendor/pie && PIE_PORTABLE_METAL=1 cargo build -p pie-server --release)
+  build_engine
+elif [ "$PIE_SHA" = "unknown" ]; then
+  echo "[spec-bench] WARNING: cannot resolve Vendor/pie SHA — cannot verify the" >&2
+  echo "            engine binary matches the pin; measuring the existing binary." >&2
+elif [ ! -f "$STAMP" ] || [ "$(cat "$STAMP")" != "$PIE_SHA" ]; then
+  echo "[spec-bench] pie engine binary is STALE vs Vendor/pie pin" >&2
+  echo "            (built-from=$( [ -f "$STAMP" ] && cat "$STAMP" || echo none) want=$PIE_SHA)" >&2
+  echo "            rebuilding so the measurement reflects the pinned engine…" >&2
+  build_engine
+fi
+# A dirty submodule can have source ahead of any commit the SHA names, so the
+# stamp cannot prove freshness — warn but do not force a rebuild every run.
+if [ -n "$(git -C Vendor/pie status --porcelain 2>/dev/null)" ]; then
+  echo "[spec-bench] NOTE: Vendor/pie has uncommitted changes — the engine binary" >&2
+  echo "            may not reflect them; run 'make engine-build' if you edited pie." >&2
 fi
 
 # Self-bootstrap: build the chat-apc wasm if missing.
