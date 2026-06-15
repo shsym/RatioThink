@@ -668,6 +668,22 @@ struct RatioThinkApp: App {
           appPreferences.resetFirstLaunchWizard()
         }
         .keyboardShortcut("r", modifiers: [.command, .control, .option])
+
+        // S511 GUI seam: a deterministic in-process window resize. XCUITest
+        // cannot resize reliably from the outside — Window ▸ Zoom no-ops when
+        // the window is maximized, a synthesized corner-drag misses the resize
+        // border, and the public Accessibility set-size API is APIDisabled for
+        // the test runner. Shrinking the key window's width here (floored at
+        // the 900pt minimum) drives the split-view relayout the geometry guard
+        // needs, and a menu click is the one resize trigger XCUITest fires
+        // reliably.
+        Button("Shrink Window (Test)") {
+          guard let window = NSApplication.shared.keyWindow
+            ?? NSApplication.shared.windows.first(where: { $0.isVisible }) else { return }
+          var frame = window.frame
+          frame.size.width = max(900, frame.size.width - 200)
+          window.setFrame(frame, display: true, animate: false)
+        }
       }
       #endif
     }

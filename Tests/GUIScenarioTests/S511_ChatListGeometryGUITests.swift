@@ -233,13 +233,22 @@ final class S511_ChatListGeometryGUITests: XCTestCase {
     }
   }
 
-  /// Second width point + a real resize pass: at the launch width the list
-  /// column already sits at its `navigationSplitViewColumnWidth` minimum
-  /// (220pt — the narrowest layout the chat list ships), then Window ▸ Zoom
-  /// re-lays the split view out at full-screen width. The zoom relayout is
-  /// the regression trigger class for #511's root cause (a re-render while
-  /// the helper-recovery overlay is up compounded the layout height), so
-  /// geometry must hold both before and after.
+  /// Second width point + a real resize pass: geometry must hold at the
+  /// launch width and again after the split view re-lays out at a different
+  /// width. The relayout is the regression trigger class for #511's root
+  /// cause (a re-render while the helper-recovery overlay is up compounded
+  /// the layout height), so geometry must hold both before and after.
+  ///
+  /// The resize is driven by the DEBUG-only "Shrink Window (Test)" menu
+  /// command, NOT Window ▸ Zoom or an external resize gesture. Zoom no-ops
+  /// when the window already fills the screen (the constrained/maximized seat,
+  /// where the old precondition failed 1920 == 1920 before any geometry was
+  /// checked); a synthesized corner-drag silently misses the few-point resize
+  /// border (observed 1200 == 1200); and the public Accessibility set-size API
+  /// is APIDisabled for the XCUITest runner. The menu command resizes the key
+  /// window in-process — the one resize trigger XCUITest fires reliably — and
+  /// is floored at the 900pt window minimum, so it always yields a real width
+  /// change that drives the split-view relayout this test guards.
   @MainActor
   func test_chat_rows_do_not_overlap_across_zoom_resize() async throws {
     let app = makeApp()
@@ -255,15 +264,18 @@ final class S511_ChatListGeometryGUITests: XCTestCase {
     assertRowGeometry(in: app, expectedRows: 3, context: "launch-width")
 
     let widthBefore = window.frame.width
-    app.menuBars.menuBarItems["Window"].click()
-    app.menuBars.menuItems["Zoom"].click()
+    // The DEBUG menu command shrinks the key window's width (floored at the
+    // 900pt minimum); from any launch width the app ships (≥ the 1200 default)
+    // this is always a real change.
+    app.menuBars.menuBarItems["Debug"].click()
+    app.menuBars.menuItems["Shrink Window (Test)"].click()
     let deadline = Date().addingTimeInterval(5)
     while window.frame.width == widthBefore && Date() < deadline {
       usleep(200_000)
     }
-    XCTAssertNotEqual(window.frame.width, widthBefore,
-                      "Window ▸ Zoom did not resize the window; cannot exercise relayout")
+    XCTAssertLessThan(window.frame.width, widthBefore,
+                      "Shrink Window (Test) did not resize the window; cannot exercise relayout")
 
-    assertRowGeometry(in: app, expectedRows: 3, context: "zoomed-width")
+    assertRowGeometry(in: app, expectedRows: 3, context: "resized-width")
   }
 }
