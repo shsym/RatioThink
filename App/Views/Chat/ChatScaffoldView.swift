@@ -351,8 +351,15 @@ struct ChatScaffoldView: View {
     // no-model gate ride it for free). Runs in THIS scaffold so the turn is
     // owned by the new chat's `sendController`.
     .task(id: chat.id) {
-      guard windowState.pendingForkResendChatID == chat.id else { return }
-      windowState.pendingForkResendChatID = nil
+      guard windowState.consumePendingForkResend(chat.id) else { return }
+      // Seed the toolbar profile from the persisted chat so the menu label
+      // is right immediately. SwiftUI does NOT guarantee `.onAppear` (which
+      // also seeds it) runs before this sibling `.task`, so a forked chat on
+      // a non-default profile (e.g. Fast Think) could otherwise show "chat"
+      // here. Send correctness no longer depends on this seed —
+      // `sendAssistantTurn` resolves speculation from `chat.profileID`
+      // directly — but the label should not flash the wrong profile.
+      viewModel.selectedProfileID = chat.profileID
       sendAssistantTurn(for: chat)
     }
     .onChange(of: viewModel.selectedProfileID) { _, new in
@@ -467,9 +474,7 @@ struct ChatScaffoldView: View {
     // Hand the resend to the new scaffold, then navigate. `DetailView`
     // remounts `ChatScaffoldView` for `newID`, whose `.task(id:)` consumes
     // the signal and sends.
-    windowState.pendingForkResendChatID = newID
-    windowState.selectedSection = .chats
-    windowState.selectedItemID = newID
+    windowState.beginForkResend(to: newID)
   }
 
   private func sendAssistantTurn(for chat: Chat) {
@@ -494,7 +499,15 @@ struct ChatScaffoldView: View {
         // (#426). For a "Fast Think" profile this makes `makeRequest`
         // attach the `speculation` field and force greedy decoding; a
         // normal profile has none, so the request is unchanged.
-        speculation: profileStore.speculation(forProfileID: viewModel.selectedProfileID)
+        //
+        // Resolve from `chat.profileID` — the persisted, authoritative
+        // profile — NOT the transient toolbar mirror `viewModel.
+        // selectedProfileID`. The two are kept in sync for normal sends
+        // (the toolbar swap writes through to `chat.profileID`), but a
+        // fork's auto-resend `.task` can race ahead of the `.onAppear`
+        // that seeds the toolbar, so reading the mirror there could lose a
+        // forked chat's non-default speculation (#624).
+        speculation: profileStore.speculation(forProfileID: chat.profileID)
       ),
       // `EngineStatusStore` conforms to `ChatRecoveryGate`; passing it
       // here lets the send pipeline classify a mid-stream

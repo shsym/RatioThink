@@ -40,6 +40,26 @@ final class WindowState: ObservableObject {
   /// the one that owns the resent chat's `ChatSendController`.
   @Published var pendingForkResendChatID: UUID? = nil
 
+  /// Route the shell to a freshly-forked chat and arm its one-shot resend
+  /// (#624). The new scaffold consumes the signal via
+  /// `consumePendingForkResend(_:)` on mount.
+  func beginForkResend(to chatID: UUID) {
+    pendingForkResendChatID = chatID
+    selectedSection = .chats
+    selectedItemID = chatID
+  }
+
+  /// Consume the fork-resend handoff for `chatID`, exactly once. Returns
+  /// `true` (and clears the flag) on the first call whose id matches the
+  /// armed chat; every later call — re-mounts, sibling scaffolds, the
+  /// source chat — returns `false`. This is what guarantees the resend
+  /// fires a single time. (#624)
+  func consumePendingForkResend(_ chatID: UUID) -> Bool {
+    guard pendingForkResendChatID == chatID else { return false }
+    pendingForkResendChatID = nil
+    return true
+  }
+
   func toggleSidebar() {
     columnVisibility = (columnVisibility == .all) ? .doubleColumn : .all
   }
