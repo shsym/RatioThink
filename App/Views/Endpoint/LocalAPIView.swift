@@ -26,6 +26,14 @@ struct LocalAPIView: View {
   @EnvironmentObject private var profileStore: ProfileStore
   @EnvironmentObject private var engineClientStore: EngineClientStore
   @EnvironmentObject private var appPreferences: AppPreferences
+  /// #616: the shared engine coordinator. All engine actuation on this surface
+  /// (start / stop, plus the bind-mode change and profile-restart sequences
+  /// composed below) routes through it, so the chat scaffold and the Local API
+  /// view never open-code two separate paths to start or stop the one engine.
+  /// The Local-API-specific orchestration (external-access bind-mode change,
+  /// profile-switch restart) stays here — it composes the coordinator's
+  /// primitives rather than duplicating them.
+  @EnvironmentObject private var engineCoordinator: ChatEngineCoordinator
 
   @State private var memory: EngineMemorySample?
   @State private var health: EngineHealth.Status?
@@ -511,7 +519,7 @@ struct LocalAPIView: View {
       engineActionError = nil
       helperBlock = nil
       do {
-        try await engineStatusStore.startEngine(profileID: profileID, daemonBindHost: bindMode)
+        try await engineCoordinator.startEngine(profileID: profileID, daemonBindHost: bindMode)
       } catch let block as HelperUnavailable {
         helperBlock = block
       } catch {
@@ -528,7 +536,7 @@ struct LocalAPIView: View {
       engineActionError = nil
       helperBlock = nil
       do {
-        try await engineStatusStore.stopEngine()
+        try await engineCoordinator.stopEngine()
       } catch let block as HelperUnavailable {
         helperBlock = block
       } catch {
@@ -566,10 +574,10 @@ struct LocalAPIView: View {
           phase: state.phase,
           profileID: profileID,
           setPreference: { try appPreferences.setLocalAPIExternalAccessEnabled($0) },
-          stopEngine: { try await engineStatusStore.stopEngine() },
+          stopEngine: { try await engineCoordinator.stopEngine() },
           startEngine: { requestedMode in
             guard let profileID, !profileID.isEmpty else { return }
-            try await engineStatusStore.startEngine(profileID: profileID, daemonBindHost: requestedMode)
+            try await engineCoordinator.startEngine(profileID: profileID, daemonBindHost: requestedMode)
           }
         )
       } catch {
@@ -583,8 +591,8 @@ struct LocalAPIView: View {
       engineActionError = nil
       defer { profileRestartInFlight = false }
       do {
-        try await engineStatusStore.stopEngine()
-        try await engineStatusStore.startEngine(
+        try await engineCoordinator.stopEngine()
+        try await engineCoordinator.startEngine(
           profileID: profileID,
           daemonBindHost: bindMode
         )

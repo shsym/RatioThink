@@ -41,6 +41,14 @@ struct ChatScaffoldView: View {
   /// #621: per-profile speculation telemetry sink. Each "Fast Think" turn's
   /// terminal `spec_metrics` is recorded here for the ProfileEditor badge.
   @EnvironmentObject private var specMetricsStore: SpecMetricsStore
+  /// #616: the app-scoped engine coordinator — owns the engine-action
+  /// primitives (start/unload/refresh), the `/v1/models` residency reconcile
+  /// (returning the result this view applies its per-chat consequences from),
+  /// the served-model list, and the once-per-launch start latch (which thus
+  /// survives this view's per-chat `.id(id)` remount). The fault-presentation
+  /// state (`engineActionError` / `helperBlock`) stays here; the coordinator
+  /// performs the engine call and re-throws.
+  @EnvironmentObject private var engineCoordinator: ChatEngineCoordinator
   /// Shown when a send is blocked because no model resolves yet. #326
   /// decides the model-availability action (Load / Download / unavailable
   /// via the live `noModelAction`); #397 layers the engine/model lifecycle
@@ -51,12 +59,9 @@ struct ChatScaffoldView: View {
   /// freezes a value the other has moved past (#400 intra-render parity;
   /// this is not filesystem-freshness — see `noModelAction`).
   @State private var showNoModelPrompt = false
-  /// What the toolbar model menu should offer. `.unknown` (→ injected
-  /// `availableModels`) only until the first reconcile; afterwards it is
-  /// the engine's real served list (`.known`, possibly empty), so a
-  /// verified empty/not-running/unreachable engine never re-surfaces
-  /// placeholder models the engine would reject ( F2).
-  @State private var engineModels: ToolbarModelList = .unknown
+  // #616: the engine's served-model list (`engineModels`) is folded by the
+  // `/v1/models` reconcile and now lives on `engineCoordinator` — an engine
+  // fact shared app-wide, not per-chat-view state.
   // #580 #5: the unverified shield in the chat menu flows through
   // `toolbarDiscoveredModels` → `ToolbarModelOptions.build` (which carries
   // each model's `isUnverified`), so no separate unverified-slug plumbing is
@@ -186,8 +191,9 @@ struct ChatScaffoldView: View {
       do {
         engineActionError = nil
         helperBlock = nil
-        try await engineStatusStore.stopEngine()
-        modelLoadCenter.markUnloaded()
+        // #616: the stop→markUnloaded sequencing lives in the coordinator; the
+        // fault routing below stays here.
+        try await engineCoordinator.unload()
       } catch let block as HelperUnavailable {
         // #496: the Helper transport itself isn't healthy — surface a helper-
         // framed inline refusal, never the engine-failure banner.
@@ -209,29 +215,18 @@ struct ChatScaffoldView: View {
     showNoModelPrompt = true
   }
 
-  /// #4: closes after the engine status FIRST settles this launch, so the
-  /// launch prompt is evaluated exactly once and a later mid-session stop
-  /// never re-pops it. Process-scoped (static) — resets every launch, so
-  /// the app ALWAYS asks once per launch.
-  @MainActor private static var didEvaluateLaunchStartPrompt = false
-
   /// #4: the engine no longer auto-starts on boot (see
   /// `HelperMain.autoResumeEngineOnBoot`). Once the status settles, if the
   /// engine is idle with a default model, proactively raise the existing
   /// no-model prompt — whose Load action starts the engine — so the user
   /// explicitly confirms the start instead of it happening silently. The
-  /// initial `.starting` placeholder is skipped so we evaluate the real
-  /// post-launch state, not the "reachability unknown" default.
+  /// once-per-launch latch now lives on the app-scoped coordinator (#616), so
+  /// it survives this view's per-chat remount. #497: ask about the model the
+  /// Load tap will BOOT (the chat's pin when present), not the bare profile
+  /// default the boot path may ignore — the same target the gate sheet names.
   private func maybePromptEngineStartOnLaunch() {
-    guard !Self.didEvaluateLaunchStartPrompt else { return }
-    if case .starting = engineStatusStore.status { return }
-    Self.didEvaluateLaunchStartPrompt = true
-    if appPreferences.localAPIAutoStartEnabled { return }
-    if LaunchEngineStartPrompt.shouldAsk(
-        status: engineStatusStore.status,
-        // #497: ask about the model the Load tap will BOOT (the chat's pin
-        // when present), not the bare profile default the boot path may
-        // ignore — the same target the gate sheet then names.
+    if engineCoordinator.shouldPromptEngineStartOnLaunch(
+        autoStartEnabled: appPreferences.localAPIAutoStartEnabled,
         target: Self.gateTarget(selectedModelID: chats.first?.modelID,
                                 profileDefaultModel: selectedProfileDefault)) {
       showNoModelPrompt = true
@@ -282,7 +277,9 @@ struct ChatScaffoldView: View {
       do {
         engineActionError = nil
         helperBlock = nil
-        try await engineStatusStore.startEngine(profileID: profileID, modelOverride: modelOverride)
+        // #616: the engine start call lives in the coordinator; the fault
+        // routing below stays here.
+        try await engineCoordinator.startEngine(profileID: profileID, modelOverride: modelOverride)
       } catch let block as HelperUnavailable {
         helperBlock = block
       } catch {
@@ -329,7 +326,7 @@ struct ChatScaffoldView: View {
   /// ids with discovered app/HF-cache files so selectable rows include
   /// installed and cached models without falling back to stale placeholders.
   private var toolbarServedModelIDs: [String] {
-    switch engineModels {
+    switch engineCoordinator.engineModels {
     case .unknown:
       // First paint/previews keep the injected list only until either the
       // engine reconcile or the filesystem scan has supplied real choices.
@@ -716,42 +713,17 @@ struct ChatScaffoldView: View {
     }
   }
 
-  /// When the engine is running, sync `residentModelID` to the id the
-  /// engine actually serves (`GET /v1/models`) — the only id its chat
-  /// endpoint accepts. No-op when the engine isn't running or a load is
-  /// already in flight.
+  /// Drive the engine-residency reconcile through the coordinator (which does
+  /// the bounded `/v1/models` fetch, folds the served list into
+  /// `engineModels`, and sets `ModelLoadCenter` residency + the #474 token
+  /// ceiling), then apply the per-chat consequences the coordinator can't —
+  /// seeding THIS chat's `Chat.modelID` selection (#460) and settling its
+  /// pending send (#516) — which touch SwiftData/`@State` this view owns.
   private func reconcileEngineResidentModel(for chat: Chat,
                                             isRetryPass: Bool = false) async {
-    // Bounded retry while the engine stays running — a single transient
-    // /v1/models failure must not strand residentModelID unset until a
-    // status flip that may never come on equal .running polls (F2).
-    // #474: capture the engine's effective max_tokens ceiling alongside the
-    // resident-model fetch. The reconciler is generic over ids; the ceiling
-    // rides the same `GET /v1/models` response (`ModelInfo.maxOutputTokens`,
-    // engine-global so the first entry's value is authoritative), stashed
-    // here on the successful fetch and applied below with residency.
-    var fetchedCeiling: Int?
-    let result = await EngineModelReconciler.reconcile(
-      isRunning: {
-        if case .running = engineStatusStore.status { return true }
-        return false
-      },
-      fetchModelIDs: {
-        let infos = try await engineStore.client.models()
-        fetchedCeiling = infos.first?.maxOutputTokens
-        return infos.map(\.id)
-      }
-    )
-    // Fold into the toolbar state. `.empty`/`.notRunning` become
-    // `.known([])` (no placeholders for a verified empty/dead engine);
-    // `.failedAfterRetries` keeps any prior known list. Placeholders show
-    // only before the first fetch (F2).
-    engineModels = ToolbarModelList.from(result, previous: engineModels)
+    let result = await engineCoordinator.reconcileResidentModel()
     switch result {
     case .models(let ids):
-      // reconcileEngineResident is internally guarded against clobbering
-      // an in-flight load.
-      modelLoadCenter.reconcileEngineResident(ids[0])
       // #460 (review F1): seed the chat's SELECTION authority (`Chat.modelID`)
       // from the served model ONLY when it matches THIS chat's profile
       // default — never the engine's single GLOBAL resident model when it
@@ -775,22 +747,15 @@ struct ChatScaffoldView: View {
       ) {
         _ = persistChatModel(toPin, on: chat)
       }
-      // #474: apply the launched ceiling unconditionally (a guardrail change
-      // or reload can hand the same model a different ceiling). The setter
-      // no-ops on an unchanged value and while a load is in flight. Orthogonal
-      // to the #460 selection seed above — model identity vs token ceiling.
-      modelLoadCenter.setResidentMaxOutputTokens(fetchedCeiling)
-    case .failedAfterRetries(let attempts):
-      // Don't silently drop: engine running but unreachable for models.
-      NSLog("ChatScaffold: /v1/models reconcile failed after \(attempts) attempts while engine .running")
-      // #516 review F8: residency-required edges hold the pending send
-      // until THIS reconcile lands — and equal `.running` polls never
-      // re-run the `.task`, so a bounded failure here would strand the
-      // promise forever. Settle instead: one backed-off retry round, and
-      // on the final failure fall back to the residency-free edge (the
-      // bounded pre-F6 behavior beats an infinite hold). The `.task`
-      // cancels this on a status flip (the sleep throws), so a real
-      // engine transition supersedes the fallback.
+    case .failedAfterRetries:
+      // The coordinator already logged the reconcile failure + left prior
+      // state. THIS view still settles its own pending send (#516 review F8):
+      // residency-required edges hold the pending until reconcile lands — and
+      // equal `.running` polls never re-run the `.task`, so a bounded failure
+      // would strand the promise forever. One backed-off retry round, then on
+      // the final failure fall back to the residency-free edge (bounded pre-F6
+      // behavior beats an infinite hold). The `.task` cancels this on a status
+      // flip (the sleep throws), so a real engine transition supersedes it.
       switch Self.reconcileFailureStep(hasPendingAutoSend: pendingSend.pending != nil,
                                        isRetryPass: isRetryPass) {
       case .none:
@@ -801,15 +766,10 @@ struct ChatScaffoldView: View {
       case .fallbackEdge:
         terminatePendingSendAfterReconcileFailure(for: chat)
       }
-    case .empty:
-      // Engine running but serving NO model — clear any stale residency so
-      // the send gate doesn't pass a model the engine no longer has (the
-      // sibling gap to the leave-`.running` invalidation). No-op while a load
-      // is in flight.
-      modelLoadCenter.engineServesNoModel()
-    case .notRunning:
-      // Engine isn't running — `EngineLifecycle` already invalidated residency
-      // on the leave-`.running` edge; nothing to do here.
+    case .empty, .notRunning:
+      // The coordinator already updated `ModelLoadCenter` residency (cleared on
+      // `.empty`; left to `EngineLifecycle`'s leave-`.running` invalidation on
+      // `.notRunning`). No per-chat consequence here.
       break
     }
   }
@@ -1467,9 +1427,7 @@ struct ChatScaffoldView: View {
   /// #397 F1: re-poll the helper after an unreachable-transport failure.
   /// The 1 Hz loop would catch up anyway; this makes Retry immediate.
   private func refreshEngineStatus() {
-    Task { @MainActor in
-      _ = try? await engineStatusStore.refresh()
-    }
+    Task { await engineCoordinator.refreshStatus() }
   }
 
 

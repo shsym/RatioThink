@@ -39,6 +39,9 @@ struct RatioThinkApp: App {
   /// no-eager-load-at-launch invariant holds.
   @StateObject private var profileStore: ProfileStore
   @StateObject private var swapCoordinator: ProfileSwapCoordinator
+  /// #616: app-scoped engine-action primitives (start/unload/refresh) + the
+  /// once-per-launch start-prompt latch the chat scaffold binds to.
+  @StateObject private var engineCoordinator: ChatEngineCoordinator
   @StateObject private var engineStatusStore: EngineStatusStore
   /// The reconciled engine-lifecycle source of truth: folds engine status +
   /// model load into one published `EngineIndicatorState` every surface
@@ -90,115 +93,17 @@ struct RatioThinkApp: App {
     let center = ModelLoadCenter()
     let prefs = AppPreferences(defaults: Self.appPreferencesDefaults())
     let testBaseURL = Self.chatTestEngineBaseURL()
-    let statusStore: EngineStatusStore
-    #if DEBUG
-    // DEBUG-only GUI-harness seam (S302): a pure-HTTP mock engine answers
-    // `/v1/...` but has NO Helper to report status over XPC, so the
-    // model-menu `/v1/models` reconcile (gated on `.running`) would
-    // otherwise empty the menu. When `PIE_TEST_PIN_ENGINE_RUNNING` is set
-    // alongside the base-URL bypass, pin `EngineStatus.running(port:)` —
-    // the one fact the absent Helper would report, and one the harness
-    // genuinely satisfies (`.running`'s downstream contract is "an inferlet
-    // serves `/v1/...` on this port"). Scoped to its OWN flag, NOT every
-    // `PIE_TEST_ENGINE_BASE_URL` launch: the lifecycle-recovery suite
-    // (S279) drives real status transitions and must keep polling.
-    // `#if DEBUG` so the flag + pin compile out of Release entirely; the
-    // S302 GUI suite runs the Debug build.
-    let pinnedRunningPort: EnginePort? = {
-      guard ProcessInfo.processInfo.environment["PIE_TEST_PIN_ENGINE_RUNNING"] == "1",
-            let rawPort = testBaseURL?.port,
-            let port = EnginePort(exactly: rawPort) else { return nil }
-      return port
-    }()
-    // #381: a SECOND helperless GUI seam, distinct from the pinned-running pin
-    // above. The no-model → Load-default follow-through needs the engine to
-    // start STOPPED so the send gate raises its Load affordance, then become
-    // `.running` the instant the user taps Load — without a real Helper or
-    // `pie serve` (the heavy, seated-session-flaky start that wedged the path).
-    // The stub reports `.stopped` until `startEngine` is called, then
-    // `.running(port)` — the one fact the absent Helper would report once the
-    // engine is up — pointed at the same mock base URL. Its own DEBUG flag so a
-    // pinned-running launch (S302/S486) is unaffected.
-    let startToRunningPort: EnginePort? = {
-      guard ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_START_TO_RUNNING"] == "1",
-            let rawPort = testBaseURL?.port,
-            let port = EnginePort(exactly: rawPort) else { return nil }
-      return port
-    }()
-    if let pinnedRunningPort {
-      let servedModelID = ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_SERVED_MODEL"] ?? ""
-      // Inject a stub XPC client (NOT HelperXPCClient): the helperless
-      // harness has no Helper, so a real stopEngine() during Unload would
-      // throw and ChatScaffoldView.unloadModel would never reach
-      // markUnloaded() — the model would stay resident. The stub reports
-      // the pinned running status and accepts stopEngine as a no-op so
-      // the Unload confirm path completes to .idle (#359 Path2).
-      statusStore = EngineStatusStore(
-        client: PinnedRunningXPCClient(port: pinnedRunningPort,
-                                       servedModelID: servedModelID),
-        initialStatus: .running(EngineSessionSnapshot(port: pinnedRunningPort,
-                                                      profileID: "chat",
-                                                      servedModelID: servedModelID,
-                                                      daemonBindHost: prefs.localAPIBindMode)),
-        initialDaemonBindMode: prefs.localAPIBindMode,
-        daemonBindModeProvider: { prefs.localAPIBindMode }
-      )
-    } else if let startToRunningPort {
-      statusStore = EngineStatusStore(
-        client: StartableStubXPCClient(port: startToRunningPort),
-        initialStatus: .stopped
-      )
-    } else {
-      statusStore = EngineStatusStore(
-        client: HelperXPCClient(),
-        initialDaemonBindMode: prefs.localAPIBindMode,
-        daemonBindModeProvider: { prefs.localAPIBindMode }
-      )
+    // #504/#616: one construction point for the status store (incl. the DEBUG
+    // PIE_TEST_PIN_ENGINE_RUNNING / PIE_TEST_ENGINE_START_TO_RUNNING harness
+    // seams). `enginePinned` gates the poll loop below; `residentSeed` is the
+    // pinned-running GUI seam's resident-model seed, applied to `center` here
+    // (kept out of the factory so the factory never reaches into ModelLoadCenter).
+    let (statusStore, enginePinned, residentSeed) =
+      Self.makeEngineStatusStore(testBaseURL: testBaseURL, preferences: prefs)
+    if let residentSeed {
+      center.reconcileEngineResident(residentSeed)
     }
-    if pinnedRunningPort != nil,
-       let pinnedResident = ProcessInfo.processInfo.environment["PIE_TEST_CHAT_MODEL_PIN"]?
-         .trimmingCharacters(in: .whitespacesAndNewlines),
-       !pinnedResident.isEmpty {
-      // The pinned-running GUI seam claims the helper has a running engine.
-      // Seed the matching resident model too so the real desired-vs-resident
-      // send preflight is satisfied; without this, the seam would be an
-      // impossible "running but no resident" state and the stricter gate would
-      // correctly block sends that these tests intend to route to their
-      // mock/stale HTTP endpoint.
-      center.reconcileEngineResident(pinnedResident)
-    }
-    #else
-    statusStore = EngineStatusStore(
-      client: HelperXPCClient(),
-      initialDaemonBindMode: prefs.localAPIBindMode,
-      daemonBindModeProvider: { prefs.localAPIBindMode }
-    )
-    #endif
-    //  wire-in completed by : `HTTPEngineClient.baseURLProvider`
-    // resolves `EngineStatusStore.requireBaseURL()` on each request.
-    // Returns `http://127.0.0.1:<port>` when the helper reports
-    // `EngineStatus.running(port:_)`, throws `engineNotReady` (with
-    // the current human-readable status detail) otherwise. The
-    // weak-store capture matches the rest of the GUI's lifetime model
-    // — `RatioThinkApp` outlives every subsystem so the closure realistically
-    // never finds `nil`, but the explicit guard keeps the failure
-    // mode an `engineNotReady` rather than a force-unwrap crash if a
-    // future refactor lets the store deinit early.
-    let engine: EngineClient
-    if let testBaseURL {
-      engine = HTTPEngineClient(baseURL: testBaseURL)
-    } else {
-      engine = HTTPEngineClient(
-        baseURLProvider: { [weak statusStore] in
-          guard let store = statusStore else {
-            throw HTTPEngineError.engineNotReady(
-              detail: "EngineStatusStore deallocated"
-            )
-          }
-          return try await MainActor.run { try store.requireBaseURL() }
-        }
-      )
-    }
+    let engine = Self.makeEngineClient(testBaseURL: testBaseURL, statusStore: statusStore)
     // Build the persistence-status surface first so the profile store's
     // start() failure has a visible channel (review F3).
     let status = PersistenceStatus()
@@ -220,6 +125,14 @@ struct RatioThinkApp: App {
     _appPreferences = StateObject(wrappedValue: prefs)
     _profileStore = StateObject(wrappedValue: store)
     _engineStatusStore = StateObject(wrappedValue: statusStore)
+    // #616: borrow the value-side `statusStore`/`center` so the chat scaffold
+    // shares one engine-action coordinator (and one launch latch surviving
+    // chat-row remounts).
+    _engineCoordinator = StateObject(wrappedValue: ChatEngineCoordinator(
+      engineStatus: statusStore,
+      modelLoad: center,
+      engineClient: engine
+    ))
     // The reconciled engine-lifecycle fold + residency invalidation. Borrows
     // the value-side `statusStore`/`center` built above; observes both and
     // republishes the single `EngineIndicatorState`.
@@ -260,40 +173,11 @@ struct RatioThinkApp: App {
     _persistenceStatus = StateObject(wrappedValue: status)
     chatContainer = RatioThinkModelContainer.openWithFallback(status: status)
 
-    // #412: App-side helper-health restart ladder. The repair runs the
-    // runtime registration reconcile; a test/automation launch gets a no-op
-    // repair so a GUI run never mutates the real machine's SMAppService
-    // background-item registration (same guard the launch reconcile uses).
-    let helperRepair: () async -> Bool
-    if HelperRegistrationReconciler.isTestLaunch(ProcessInfo.processInfo.environment) {
-      helperRepair = { false }
-    } else {
-      helperRepair = { await HelperRegistrationRepair().repairAndReportReachable() }
-    }
-    // #496 DEBUG GUI seam: pin the helper-health ladder to a fixed state so the
-    // chat-body recovery overlay's states (starting / unreachable / hidden)
-    // render deterministically without a real background helper — sibling of
-    // `PIE_TEST_PIN_ENGINE_RUNNING`. Compiled out of Release.
-    #if DEBUG
-    let pinnedHelperHealth = Self.pinnedHelperHealthForTesting()
-    #else
-    let pinnedHelperHealth: HelperHealth? = nil
-    #endif
-    let helperHealthController = HelperHealthController(
-      repair: helperRepair,
-      pinnedHealth: pinnedHelperHealth
-    )
-    // Drive the ladder from the SAME poll the status mirror runs — no second
-    // XPC surface. Set BEFORE statusStore.start() so the first ticks count.
-    statusStore.onPollOutcome = { [weak helperHealthController] succeeded in
-      helperHealthController?.ingestPollOutcome(succeeded: succeeded)
-    }
-    // #412 review F1: let the chat recovery wait bound itself by the ladder
-    // outcome (give up the moment the ladder hits .unreachable) instead of a
-    // fixed timeout chosen out of sync with the ladder cadence.
-    statusStore.helperHealthProvider = { [weak helperHealthController] in
-      helperHealthController?.health
-    }
+    // #412: App-side helper-health restart ladder, built + wired to the SAME
+    // status poll (no second XPC surface). `helperPinned` is the #496 DEBUG GUI
+    // seam pin; it joins `enginePinned` to gate the poll loop below.
+    let (helperHealthController, helperPinned) =
+      Self.makeHelperHealthController(statusStore: statusStore)
     _helperHealth = StateObject(wrappedValue: helperHealthController)
 
     // #507: chat sends are app-scoped (per-chat controllers) so streams
@@ -309,21 +193,157 @@ struct RatioThinkApp: App {
     // before tearing down, so no late on-demand poll respawns the Helper.
     AppQuitCoordinator.shared.engineStatusStore = statusStore
 
-    // Kick the XPC poll loop. Idempotent + cheap — first reply lands
-    // within ~one runloop tick when the helper is registered, longer
-    // when launchd has not yet published the mach service.
-    #if DEBUG
-    // Skipped when status is pinned for the S302 harness (no Helper to poll; a
-    // failed poll would reset the pinned `.running` → `.starting`), and for the
-    // #496 helper-health pin (a failed/successful poll would move the pinned
-    // ladder and could flip the engine off `.starting`, both of which would
-    // make the overlay state nondeterministic).
-    if pinnedRunningPort == nil && pinnedHelperHealth == nil {
+    // Kick the XPC poll loop. Idempotent + cheap — first reply lands within
+    // ~one runloop tick when the helper is registered, longer when launchd has
+    // not yet published the mach service. Skipped when the engine status is
+    // pinned for the S302 harness (no Helper to poll; a failed poll would reset
+    // the pinned `.running` → `.starting`) or the #496 helper-health is pinned
+    // (a poll would move the pinned ladder and could flip the engine off
+    // `.starting`), both of which would make the GUI seam nondeterministic.
+    if !enginePinned && !helperPinned {
       statusStore.start()
     }
-    #else
-    statusStore.start()
+  }
+
+  /// #504/#616: the single construction point for the app's `EngineStatusStore`,
+  /// including the DEBUG-only GUI-harness seams.
+  ///
+  /// `PIE_TEST_PIN_ENGINE_RUNNING` (S302): a pure-HTTP mock engine answers
+  /// `/v1/...` but has NO Helper to report status over XPC, so the model-menu
+  /// `/v1/models` reconcile (gated on `.running`) would otherwise empty the
+  /// menu. Pin `EngineStatus.running` — the one fact the absent Helper would
+  /// report. `PIE_TEST_ENGINE_START_TO_RUNNING` (#381): a second seam that
+  /// starts `.stopped` then flips to `.running` when `startEngine` is called,
+  /// for the no-model → Load-default follow-through without a real `pie serve`.
+  /// `#if DEBUG` so the flags + pins compile out of Release entirely.
+  ///
+  /// Returns the store, whether the engine status is pinned (the caller must
+  /// then NOT poll, or a failed poll would reset the pin), and the optional
+  /// `PIE_TEST_CHAT_MODEL_PIN` resident-model seed the caller applies to
+  /// `ModelLoadCenter` (kept out of this factory so it stays engine-store-only).
+  @MainActor
+  private static func makeEngineStatusStore(
+    testBaseURL: URL?,
+    preferences prefs: AppPreferences
+  ) -> (store: EngineStatusStore, enginePinned: Bool, residentSeed: String?) {
+    #if DEBUG
+    let pinnedRunningPort: EnginePort? = {
+      guard ProcessInfo.processInfo.environment["PIE_TEST_PIN_ENGINE_RUNNING"] == "1",
+            let rawPort = testBaseURL?.port,
+            let port = EnginePort(exactly: rawPort) else { return nil }
+      return port
+    }()
+    let startToRunningPort: EnginePort? = {
+      guard ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_START_TO_RUNNING"] == "1",
+            let rawPort = testBaseURL?.port,
+            let port = EnginePort(exactly: rawPort) else { return nil }
+      return port
+    }()
+    if let pinnedRunningPort {
+      let servedModelID = ProcessInfo.processInfo.environment["PIE_TEST_ENGINE_SERVED_MODEL"] ?? ""
+      // Inject a stub XPC client (NOT HelperXPCClient): the helperless harness
+      // has no Helper, so a real stopEngine() during Unload would throw and the
+      // coordinator would never reach markUnloaded() — the model would stay
+      // resident. The stub reports the pinned running status and accepts
+      // stopEngine as a no-op so the Unload confirm path completes (#359 Path2).
+      let store = EngineStatusStore(
+        client: PinnedRunningXPCClient(port: pinnedRunningPort,
+                                       servedModelID: servedModelID),
+        initialStatus: .running(EngineSessionSnapshot(port: pinnedRunningPort,
+                                                      profileID: "chat",
+                                                      servedModelID: servedModelID,
+                                                      daemonBindHost: prefs.localAPIBindMode)),
+        initialDaemonBindMode: prefs.localAPIBindMode,
+        daemonBindModeProvider: { prefs.localAPIBindMode }
+      )
+      let seed = ProcessInfo.processInfo.environment["PIE_TEST_CHAT_MODEL_PIN"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      let residentSeed = (seed?.isEmpty == false) ? seed : nil
+      return (store, enginePinned: true, residentSeed: residentSeed)
+    }
+    if let startToRunningPort {
+      let store = EngineStatusStore(
+        client: StartableStubXPCClient(port: startToRunningPort),
+        initialStatus: .stopped
+      )
+      // Not status-pinned: this seam drives real `.stopped`→`.running`
+      // transitions and must keep polling.
+      return (store, enginePinned: false, residentSeed: nil)
+    }
     #endif
+    let store = EngineStatusStore(
+      client: HelperXPCClient(),
+      initialDaemonBindMode: prefs.localAPIBindMode,
+      daemonBindModeProvider: { prefs.localAPIBindMode }
+    )
+    return (store, enginePinned: false, residentSeed: nil)
+  }
+
+  /// Build the chat engine client. `HTTPEngineClient.baseURLProvider` resolves
+  /// `EngineStatusStore.requireBaseURL()` on each request: `http://127.0.0.1:<port>`
+  /// when the helper reports `.running`, else throws `engineNotReady`. A
+  /// `testBaseURL` (DEBUG/test harness only) points the client straight at an
+  /// externally-launched engine. The weak-store capture matches the GUI's
+  /// lifetime model — `RatioThinkApp` outlives every subsystem so the closure
+  /// realistically never finds `nil`, but the explicit guard keeps the failure
+  /// mode an `engineNotReady` rather than a crash if a future refactor lets the
+  /// store deinit early.
+  @MainActor
+  private static func makeEngineClient(
+    testBaseURL: URL?,
+    statusStore: EngineStatusStore
+  ) -> EngineClient {
+    if let testBaseURL {
+      return HTTPEngineClient(baseURL: testBaseURL)
+    }
+    return HTTPEngineClient(
+      baseURLProvider: { [weak statusStore] in
+        guard let store = statusStore else {
+          throw HTTPEngineError.engineNotReady(detail: "EngineStatusStore deallocated")
+        }
+        return try await MainActor.run { try store.requireBaseURL() }
+      }
+    )
+  }
+
+  /// #412: build the App-side helper-health restart ladder and wire it to the
+  /// status poll. The repair runs the runtime registration reconcile; a
+  /// test/automation launch gets a no-op repair so a GUI run never mutates the
+  /// real machine's SMAppService background-item registration (the same guard
+  /// the launch reconcile uses). #496 DEBUG GUI seam: the ladder can be pinned
+  /// to a fixed `HelperHealth` so the chat-body recovery states render
+  /// deterministically without a real background helper. Driven by the SAME
+  /// `engineStatus()` poll as the status mirror (via `onPollOutcome`) — no
+  /// second XPC surface — and the chat recovery wait bounds itself by the
+  /// ladder outcome (review F1). Returns whether the ladder is pinned (joins
+  /// `enginePinned` to gate the poll loop).
+  @MainActor
+  private static func makeHelperHealthController(
+    statusStore: EngineStatusStore
+  ) -> (controller: HelperHealthController, helperPinned: Bool) {
+    let helperRepair: () async -> Bool
+    if HelperRegistrationReconciler.isTestLaunch(ProcessInfo.processInfo.environment) {
+      helperRepair = { false }
+    } else {
+      helperRepair = { await HelperRegistrationRepair().repairAndReportReachable() }
+    }
+    #if DEBUG
+    let pinnedHelperHealth = Self.pinnedHelperHealthForTesting()
+    #else
+    let pinnedHelperHealth: HelperHealth? = nil
+    #endif
+    let controller = HelperHealthController(
+      repair: helperRepair,
+      pinnedHealth: pinnedHelperHealth
+    )
+    // Set BEFORE statusStore.start() so the first ticks count.
+    statusStore.onPollOutcome = { [weak controller] succeeded in
+      controller?.ingestPollOutcome(succeeded: succeeded)
+    }
+    statusStore.helperHealthProvider = { [weak controller] in
+      controller?.health
+    }
+    return (controller, helperPinned: pinnedHelperHealth != nil)
   }
 
   #if DEBUG
@@ -564,6 +584,7 @@ struct RatioThinkApp: App {
         .environmentObject(appPreferences)
         .environmentObject(profileStore)
         .environmentObject(swapCoordinator)
+        .environmentObject(engineCoordinator)
         .environmentObject(engineClientStore)
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
