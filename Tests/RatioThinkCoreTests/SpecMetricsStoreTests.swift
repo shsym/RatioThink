@@ -184,4 +184,42 @@ final class SpecMetricsStoreTests: XCTestCase {
     XCTAssertEqual(reloaded.aggregate(forProfileID: "fast-think")?.lastAcceptRatio, 0.9)
     try? FileManager.default.removeItem(at: SpecMetricsStore.quarantineURL(for: fileURL))
   }
+
+  /// When a corrupt file can't be moved aside, persistence is DISABLED so the
+  /// bytes are never overwritten — the riskier half of the #625 fix: if a
+  /// later change let `persist()` run after a failed move, the silent wipe
+  /// returns. The `fileManager:` seam exists to reach this branch.
+  func test_corrupt_file_unmovable_disables_persistence_and_preserves_bytes() throws {
+    let corruptBytes = Data("{ unmovable corrupt".utf8)
+    try corruptBytes.write(to: fileURL)
+
+    let store = SpecMetricsStore(fileURL: fileURL, fileManager: MoveFailingFileManager())
+    XCTAssertEqual(store.loadDiagnostic, .corruptPersistenceDisabled(fileURL))
+    XCTAssertNil(store.aggregate(forProfileID: "any"))
+    // Move failed → bytes stay at the canonical path, nothing quarantined.
+    XCTAssertEqual(try Data(contentsOf: fileURL), corruptBytes)
+    XCTAssertFalse(FileManager.default.fileExists(
+      atPath: SpecMetricsStore.quarantineURL(for: fileURL).path))
+
+    // A record() must NOT overwrite the preserved corrupt bytes.
+    store.record(drafted(10, 9), forProfileID: "fast-think")
+    XCTAssertEqual(try Data(contentsOf: fileURL), corruptBytes,
+                   "persistence is disabled; the corrupt file must survive untouched")
+
+    // A fresh store over the same file still sees a corrupt (quarantine)
+    // outcome — proof the bytes were never destroyed.
+    let reloaded = SpecMetricsStore(fileURL: fileURL)
+    guard case .quarantined? = reloaded.loadDiagnostic else {
+      return XCTFail("expected the surviving corrupt bytes to quarantine on a clean reload")
+    }
+    try? FileManager.default.removeItem(at: SpecMetricsStore.quarantineURL(for: fileURL))
+  }
+}
+
+/// A `FileManager` whose `moveItem` always throws, to exercise the
+/// quarantine move-failure branch (persistence disabled, bytes preserved).
+private final class MoveFailingFileManager: FileManager {
+  override func moveItem(at srcURL: URL, to dstURL: URL) throws {
+    throw CocoaError(.fileWriteNoPermission)
+  }
 }
