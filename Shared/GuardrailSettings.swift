@@ -7,10 +7,37 @@ import Foundation
 /// guardrail runs in the Helper.
 ///
 /// Only `ramFraction` is user-exposed in v1; the reserve term stays a
-/// `ModelMemoryGuardrail.Policy` constant. Reads are defensive: a
-/// missing/corrupt/out-of-range file yields the default fraction so a
-/// bad write never bricks launches.
+/// `ModelMemoryGuardrail.Policy` constant. Reads distinguish three cases
+/// instead of flattening them: an *absent* file is the legitimate unset
+/// state and yields `defaultFraction`; a *present-but-unreadable or
+/// corrupt* file throws `LoadError` so the operator's lost ceiling
+/// surfaces instead of silently reverting (symmetric with `saveFraction`,
+/// which throws by design); a *present, decodable but out-of-range* value
+/// is recoverable and clamps. Callers that must not brick (the Helper
+/// launch gate) catch the throw, log it, and fall back to the default.
 public enum GuardrailSettings {
+  /// Why a load can fail loudly instead of silently reverting to
+  /// `defaultFraction`: a present-but-bad file means the operator's
+  /// persisted ceiling is being lost, and collapsing that into the
+  /// default is indistinguishable from "unset" — callers must be able to
+  /// tell them apart to surface (Settings) or log (launch gate) the loss.
+  public enum LoadError: Error, CustomStringConvertible {
+    /// File exists but couldn't be read (I/O, permissions).
+    case unreadable(URL, underlying: Error)
+    /// File exists and was read but isn't valid guardrail JSON, or holds a
+    /// non-finite fraction that no clamp can recover.
+    case corrupt(URL, underlying: Error?)
+
+    public var description: String {
+      switch self {
+      case let .unreadable(url, underlying):
+        return "guardrail.json unreadable at \(url.path): \(underlying)"
+      case let .corrupt(url, underlying):
+        return "guardrail.json corrupt at \(url.path)" + (underlying.map { ": \($0)" } ?? "")
+      }
+    }
+  }
+
   /// Default fraction when unset — the guardrail's own default (0.65).
   public static var defaultFraction: Double { ModelMemoryGuardrail.Policy.defaultRAMFraction }
   public static let minFraction: Double = 0.50
@@ -52,13 +79,30 @@ public enum GuardrailSettings {
     root.appendingPathComponent("guardrail.json", isDirectory: false)
   }
 
-  /// Persisted RAM fraction, clamped, or `defaultFraction` when unset /
-  /// unreadable / out of range.
-  public static func loadFraction(root: URL, fileManager: FileManager = .default) -> Double {
-    guard let data = try? Data(contentsOf: fileURL(root: root)),
-          let stored = try? JSONDecoder().decode(Stored.self, from: data),
-          stored.ramFraction.isFinite else {
-      return defaultFraction
+  /// Persisted RAM fraction, clamped into range.
+  ///
+  /// Returns `defaultFraction` only when the file is *absent* (the unset
+  /// state). A present-but-unreadable or corrupt file throws `LoadError`
+  /// so a lost operator ceiling surfaces rather than silently reverting to
+  /// the default. A decodable, finite-but-out-of-range value is a
+  /// recoverable stale write and clamps — not an error.
+  public static func loadFraction(root: URL, fileManager: FileManager = .default) throws -> Double {
+    let url = fileURL(root: root)
+    guard fileManager.fileExists(atPath: url.path) else { return defaultFraction }
+    let data: Data
+    do {
+      data = try Data(contentsOf: url)
+    } catch {
+      throw LoadError.unreadable(url, underlying: error)
+    }
+    let stored: Stored
+    do {
+      stored = try JSONDecoder().decode(Stored.self, from: data)
+    } catch {
+      throw LoadError.corrupt(url, underlying: error)
+    }
+    guard stored.ramFraction.isFinite else {
+      throw LoadError.corrupt(url, underlying: nil)
     }
     return clamp(stored.ramFraction)
   }

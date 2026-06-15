@@ -986,6 +986,8 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       // fraction per resolve so a dial change takes effect on the next
       // launch with no Helper restart; it's the same derivation the
       // ProfileEditor picker badge uses, so the gate and the badge agree.
+      // `livePolicy` logs + falls back to the default on a present-but-bad
+      // guardrail.json so a corrupt file signals without bricking launch.
       memoryPolicy: { ModelMemoryGuardrail.livePolicy() },
       // Local API exposure is security-sensitive and must cross the
       // App↔Helper process boundary. Read the file-backed shared preference

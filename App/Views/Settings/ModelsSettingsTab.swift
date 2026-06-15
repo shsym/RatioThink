@@ -683,6 +683,7 @@ private struct MemoryGuardrailSection: View {
   @EnvironmentObject private var guardrailRevision: GuardrailRevision
   @State private var fraction: Double = GuardrailSettings.defaultFraction
   @State private var saveError: String?
+  @State private var loadError: String?
 
   private enum FractionChoice: Hashable {
     case preset(Double)
@@ -736,6 +737,11 @@ private struct MemoryGuardrailSection: View {
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityIdentifier("GuardrailLimitPreview")
 
+      if let loadError {
+        Text(loadError).font(.callout).foregroundStyle(.red)
+          .fixedSize(horizontal: false, vertical: true)
+          .accessibilityIdentifier("GuardrailLoadError")
+      }
       if let saveError {
         Text(saveError).font(.callout).foregroundStyle(.red)
       }
@@ -774,7 +780,16 @@ private struct MemoryGuardrailSection: View {
 
   private func load() {
     guard let root = try? PieDirs.applicationSupport() else { return }
-    fraction = GuardrailSettings.loadFraction(root: root)
+    do {
+      fraction = try GuardrailSettings.loadFraction(root: root)
+      loadError = nil
+    } catch {
+      // A corrupt/unreadable file would otherwise silently revert the
+      // operator's ceiling — show the default in the dial but tell them the
+      // saved value couldn't be read so they can re-set it.
+      fraction = GuardrailSettings.defaultFraction
+      loadError = "Saved guardrail setting couldn't be read — showing the default. Adjust the dial to re-save. (\(error))"
+    }
   }
 
   private func setFraction(_ value: Double) {
