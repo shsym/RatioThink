@@ -32,7 +32,7 @@ $(LOGDIR):
 # recipes below, which run in a non-sandboxed shell after xcodebuild exits
 # (every test app already dead). Add a suite's prefix here if it stages a real
 # /tmp home. See TEST.md "GUI temp-home cleanup".
-GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-* /tmp/pie-s326dl-* /tmp/pie-s326done-* /tmp/pie-s459swap-* /tmp/pie-s512-*
+GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-* /tmp/pie-s326dl-* /tmp/pie-s326done-* /tmp/pie-s459swap-* /tmp/pie-s512-* /tmp/pie-s530-*
 
 # Canned recipe: run a focused set of RatioThinkGUITests suites via xcodebuild
 # with the seated-session warning + the standard log-capture/PIPESTATUS guard
@@ -69,7 +69,7 @@ endef
         test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-sandbox-diagnostics test-readme-harness test-e2e-http \
         test-spec-smoke test-spec-bench \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
-        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-menubar-icon-template \
+        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-gui-chat-switch test-menubar-icon-template \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-apc-bench-selftest test-e2e-harsh-load test-e2e-cache-real bench-apc-real \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
@@ -607,6 +607,9 @@ test-gui-chat-lifecycle: genproject $(LOGDIR) ## GUI area: #512 chat lifecycle �
 
 test-gui-helper-recovery: genproject $(LOGDIR) ## GUI area: #496 helper-recovery overlay — starting/unreachable/auto-dismiss + engineRunning gate (S496)
 	$(call gui_suite_run,helper-recovery,-only-testing:RatioThinkGUITests/S496_HelperRecoveryOverlayGUITests)
+
+test-gui-chat-switch: genproject $(LOGDIR) ## GUI area: #530 rapid chat-switching main-thread responsiveness guard — seeded long transcripts + stall watchdog (S530)
+	$(call gui_suite_run,chat-switch,-only-testing:RatioThinkGUITests/S530_RapidChatSwitchGUITests)
 
 # --- E2E wrappers by product area ------------------------------------------
 # Operator-gated (seated session + TCC; real engine/model or deterministic

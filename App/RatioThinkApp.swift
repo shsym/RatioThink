@@ -80,6 +80,13 @@ struct RatioThinkApp: App {
   /// records each turn's terminal `spec_metrics` here; the ProfileEditor
   /// reads it for the read-only "last run" badge.
   @StateObject private var specMetricsStore = SpecMetricsStore()
+  #if DEBUG
+  /// #530 DEBUG-only GUI seam: main-thread responsiveness probe for the
+  /// rapid-chat-switching stress guard. Constructed always but only `start()`ed
+  /// (and surfaced through a hidden accessibility element) when
+  /// `PIE_TEST_STALL_WATCHDOG=1`.
+  @StateObject private var stallWatchdog = MainThreadStallWatchdog()
+  #endif
 
   /// #587 resume trigger: re-arm the (possibly paused) engine-status poll
   /// loop when the app returns to the foreground, so the user always sees a
@@ -179,6 +186,14 @@ struct RatioThinkApp: App {
 
     _persistenceStatus = StateObject(wrappedValue: status)
     chatContainer = RatioThinkModelContainer.openWithFallback(status: status)
+
+    // #530 DEBUG-only GUI seam: seed long persisted transcripts when
+    // `PIE_TEST_SEED_TRANSCRIPTS` is set, so the rapid-chat-switching stress
+    // guard has a stable, large data set to switch between. No-op unless the
+    // env var is set AND the store is empty; compiled out of Release entirely.
+    #if DEBUG
+    TranscriptStressSeed.seedIfRequested(into: chatContainer.mainContext)
+    #endif
 
     // #412: App-side helper-health restart ladder, built + wired to the SAME
     // status poll (no second XPC surface). `helperPinned` is the #496 DEBUG GUI
@@ -582,6 +597,14 @@ struct RatioThinkApp: App {
             // Self-heal a stale Helper registration left by an app
             // update before the engine poll gives up silently.
             .task { await Self.reconcileHelperRegistrationIfNeeded() }
+          #if DEBUG
+            // #530: start the main-thread stall probe (when enabled) for the
+            // rapid-switch GUI guard; it renders nothing and reports through a
+            // probe file.
+            .overlay(alignment: .topLeading) {
+              StallWatchdogIndicator(watchdog: stallWatchdog)
+            }
+          #endif
         } else {
           FirstLaunchWizardView()
         }
