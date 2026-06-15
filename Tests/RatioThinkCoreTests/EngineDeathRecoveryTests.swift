@@ -917,6 +917,52 @@ final class EngineDeathRecoveryTests: XCTestCase {
       ".stream meta-frame")
   }
 
+  // MARK: - 12c. Positive control: a transport throw racing engine death RIDES recovery (#335)
+
+  func test_transportError_racingEngineGone_ridesRecovery_positiveControl() async throws {
+    // Twin of `test_semanticEngineError_…` and the exact race the ticket
+    // describes from the OTHER side: a transport-shaped throw (URLError) that
+    // coincides with an engine death must STILL be ridden through recovery once
+    // the forced gate refresh confirms `isEngineGone`. This pins the allow-side
+    // of the error-shape guard so the fix can't over-correct into "surface
+    // everything": only `.api`/`.stream` are excluded; transport faults — the
+    // shape a post-death request actually throws — keep retrying. Paired with
+    // the negative test, a regression in EITHER direction (retry-everything OR
+    // surface-everything) breaks exactly one of the twins.
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ProbingChatEngine(
+      firstError: URLError(.networkConnectionLost),
+      successEvents: [.delta(role: .assistant, content: "ack"), .finish(reason: .stop)]
+    )
+    let gate = ScriptedRecoveryGate(initialGone: true, willRecover: true)
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1"),
+      recoveryGate: gate
+    )
+
+    try await waitUntil("transport fault rides recovery + retries") { !controller.isInFlight }
+    let assistant = chat.messages.first { $0.role == "assistant" }
+    XCTAssertEqual(engine.callCount, 2,
+                   "a transport fault racing engine death must retry after recovery, not surface")
+    XCTAssertEqual(assistant?.content, "ack",
+                   "the retried answer must replace the live bubble, got: \(assistant?.content ?? "nil")")
+    XCTAssertEqual(gate.lastWaitTimeout, ChatRecoveryPolicy().waitForReadyTimeout,
+                   "engine-death branch must enter the recovery wait with the engine-relaunch budget")
+  }
+
   // MARK: - 13. Helper-wait ceiling is policy-derived, not a literal (#412 re-F1)
 
   func test_helperUnreachableCeiling_covers_worstCase_and_tracks_policy() {
