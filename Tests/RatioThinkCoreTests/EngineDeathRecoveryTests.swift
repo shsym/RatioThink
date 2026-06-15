@@ -862,6 +862,61 @@ final class EngineDeathRecoveryTests: XCTestCase {
                    "engine-death branch must keep the tight engine-relaunch budget")
   }
 
+  // MARK: - 12b. Engine-answered semantic faults surface, never reclassified (#335)
+
+  func test_semanticEngineError_notReclassifiedAsEngineGone_evenWhenGateReportsGone() async throws {
+    // F4 (#335): a deterministic semantic error the engine deliberately emitted
+    // — `.api` envelope or `.stream` meta-frame — proves the engine ANSWERED, so
+    // it was not gone at request time. If an INDEPENDENT engine death coincides
+    // (the forced gate refresh now reports `isEngineGone`), the old classifier
+    // keyed on engine state alone and reclassified the semantic fault as
+    // engine-gone → wasted a relaunch/retry cycle and delayed the real error.
+    // The fix keys on the error SHAPE: such faults must surface on attempt 1.
+    func runAndAssertSurfaced(_ semanticError: Error, _ label: String) async throws {
+      let container = try RatioThinkModelContainer.makeInMemory()
+      let context = ModelContext(container)
+      let chat = Chat()
+      context.insert(chat)
+      chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+      try context.save()
+
+      let engine = ProbingChatEngine(
+        firstError: semanticError,
+        successEvents: [.delta(role: .assistant, content: "ack"), .finish(reason: .stop)]
+      )
+      // Gate reports engine-gone AND would recover: the ONLY thing keeping the
+      // turn from a wrongful retry is the error-shape guard.
+      let gate = ScriptedRecoveryGate(initialGone: true, willRecover: true)
+      let controller = ChatSendController()
+
+      controller.send(
+        chat: chat,
+        context: context,
+        engine: engine,
+        modelLoadCenter: ModelLoadCenter(),
+        persistenceStatus: PersistenceStatus(),
+        options: ChatSendRequestOptions(modelID: "m1"),
+        recoveryGate: gate
+      )
+
+      try await waitUntil("controller settles for \(label)") { !controller.isInFlight }
+      let assistant = chat.messages.first { $0.role == "assistant" }
+      XCTAssertEqual(engine.callCount, 1,
+                     "\(label): an engine-answered fault must NOT trigger a recovery retry")
+      XCTAssertTrue(assistant?.content.hasPrefix("⚠️") ?? false,
+                    "\(label): the semantic error must surface on the live row, got: \(assistant?.content ?? "nil")")
+      XCTAssertNil(gate.lastWaitTimeout,
+                   "\(label): the recovery wait must never be entered for an engine-answered fault")
+    }
+
+    try await runAndAssertSurfaced(
+      HTTPEngineError.api(status: 400, code: "context_length_exceeded", message: "too long"),
+      ".api envelope")
+    try await runAndAssertSurfaced(
+      HTTPEngineError.stream(code: "internal_error", message: "decode failed"),
+      ".stream meta-frame")
+  }
+
   // MARK: - 13. Helper-wait ceiling is policy-derived, not a literal (#412 re-F1)
 
   func test_helperUnreachableCeiling_covers_worstCase_and_tracks_policy() {

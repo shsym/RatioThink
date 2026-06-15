@@ -553,9 +553,33 @@ public final class ChatSendController: ObservableObject {
     gate: ChatRecoveryGate?
   ) async -> Bool {
     if case HTTPEngineError.engineGone = error { return true }
+    // A semantic error the engine deliberately emitted — an `.api`
+    // `{code,message}` envelope (pre-stream HTTP) or a `.stream` error
+    // meta-frame (mid-stream) — proves the engine ANSWERED, so it was not
+    // gone at request time. Key the classification on the error SHAPE, not on
+    // the engine's state now: without this guard, an independent engine death
+    // that races the forced gate refresh (so it reports `isEngineGone`) would
+    // reclassify a deterministic semantic fault as engine-gone — wasting a
+    // relaunch/retry cycle and delaying the real error by one round-trip
+    // (#335). Only transport-shaped faults (URLError, `.http`,
+    // `.nonHTTPResponse`, raw stream throws) — where the engine may NOT have
+    // answered — fall through to the gate refresh.
+    if Self.engineAnswered(error) { return false }
     guard let gate else { return false }
     await gate.refreshStatus()
     return gate.isEngineGone || gate.isHelperUnreachable
+  }
+
+  /// True for the two `HTTPEngineError` shapes the engine emits only when it
+  /// answered the request: the pre-stream `.api` envelope and the mid-stream
+  /// `.stream` meta-frame. Both carry an engine-authored `code`/`message`, so
+  /// the engine was demonstrably alive at request time — these are never
+  /// engine-death faults regardless of the engine's state now (#335).
+  private static func engineAnswered(_ error: Error) -> Bool {
+    switch error {
+    case HTTPEngineError.api, HTTPEngineError.stream: return true
+    default: return false
+    }
   }
 
   /// Clamp a profile `max_tokens` DOWN to the launched engine's effective
