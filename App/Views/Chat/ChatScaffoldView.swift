@@ -1142,7 +1142,7 @@ struct ChatScaffoldView: View {
   /// Profile ids the toolbar picker offers — the SAME set the Settings
   /// editor lists (every valid `*.toml`), derived live from the store so a
   /// user can actually switch to a non-`chat` profile (e.g. the seeded
-  /// `tree-of-thought` or a `fast-think`). The previous default `["chat"]`
+  /// `tree-of-thought` or a `repeat-boost`). The previous default `["chat"]`
   /// was never wired to `ProfileStore`, so the picker only ever showed
   /// `chat`. Re-read each render: `ProfileStore` publishes nothing, but
   /// this view re-renders on the ~1 Hz engine-status publishes, so a newly

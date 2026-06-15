@@ -4,7 +4,7 @@ import XCTest
 /// end-to-end through the real GUI against a real pie engine.
 ///
 /// Proves the user-facing path that the unit/integration tier cannot:
-///   1. The seeded `fast-think` profile appears in the chat profile
+///   1. The seeded `repeat-boost` profile appears in the chat profile
 ///      switcher (`toolbar.profile`) and is selectable.
 ///   2. Selecting it and sending a prompt streams a real assistant reply
 ///      from the live engine — i.e. the selected-profile send path
@@ -101,18 +101,18 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
                   "profile switcher (toolbar.profile) missing; app tree: \(app.debugDescription)")
     profileMenu.click()
     // The switcher lists profile ids (`Button(id)`), so the seeded profile
-    // renders as its id `fast-think`.
-    let fastThinkItem = app.menuItems["fast-think"]
-    XCTAssertTrue(fastThinkItem.waitForExistence(timeout: 10),
-                  "seeded 'fast-think' profile missing from the chat profile switcher; app tree: \(app.debugDescription)")
-    XCTAssertTrue(fastThinkItem.isEnabled, "'fast-think' profile menu item was not selectable")
-    fastThinkItem.click()
+    // renders as its id `repeat-boost`.
+    let repeatBoostItem = app.menuItems["repeat-boost"]
+    XCTAssertTrue(repeatBoostItem.waitForExistence(timeout: 10),
+                  "seeded 'repeat-boost' profile missing from the chat profile switcher; app tree: \(app.debugDescription)")
+    XCTAssertTrue(repeatBoostItem.isEnabled, "'repeat-boost' profile menu item was not selectable")
+    repeatBoostItem.click()
 
     // Selection took effect: the switcher titles the active profile. The
     // label is the menuButton's own title (not a free-standing static text),
     // so assert on the element title.
-    guard waitForMenuButtonTitleContaining(profileMenu, "fast-think", timeout: 10) else {
-      XCTFail("toolbar.profile did not reflect the 'fast-think' selection (title=\(profileMenu.title)); app tree: \(app.debugDescription)")
+    guard waitForMenuButtonTitleContaining(profileMenu, "repeat-boost", timeout: 10) else {
+      XCTFail("toolbar.profile did not reflect the 'repeat-boost' selection (title=\(profileMenu.title)); app tree: \(app.debugDescription)")
       return
     }
 

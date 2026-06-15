@@ -342,22 +342,29 @@ public final class ProfileStore: ObservableObject {
   /// no-op on fresh installs.
   public static let defaultProfileID = "chat"
 
-  /// Built-in "Repeat Boost" profile id (#426). A second seeded profile that
-  /// turns on the chat-apc speculative drafter. Greedy by definition
-  /// (temperature 0) so drafting actually engages — see
-  /// `ChatSendController.makeRequest`.
-  public static let defaultFastThinkProfileID = "fast-think"
+  /// Built-in "Repeat Boost" profile id (#426; slug renamed to
+  /// `repeat-boost` in #628). A second seeded profile that turns on the
+  /// chat-apc speculative drafter. Greedy by definition (temperature 0)
+  /// so drafting actually engages — see `ChatSendController.makeRequest`.
+  public static let defaultRepeatBoostProfileID = "repeat-boost"
 
   /// Filename for the seeded Repeat Boost profile.
-  public static let defaultFastThinkFilename = "fast-think.toml"
+  public static let defaultRepeatBoostFilename = "repeat-boost.toml"
+
+  /// Legacy filename/id for the built-in speculative-decode profile,
+  /// renamed to `repeat-boost` in #628. Retained only so the one-time
+  /// `migrateFastThinkToRepeatBoost` migration can find and rename a
+  /// pre-existing on-disk copy and repoint a stale active-profile marker.
+  public static let legacyFastThinkFilename = "fast-think.toml"
+  public static let legacyFastThinkProfileID = "fast-think"
 
   /// Seed body for the Repeat Boost profile. Same model + inferlet as the
   /// default Chat profile (so selecting it is a silent same-model swap,
   /// no reload), but greedy (`temperature = 0`) with `[speculation]`
   /// enabled. `leader_len`/`draft_len` are omitted so the inferlet applies
   /// its #418 defaults (1 / 3).
-  public static let defaultFastThinkTOML: String = """
-  id = "fast-think"
+  public static let defaultRepeatBoostTOML: String = """
+  id = "repeat-boost"
   name = "Repeat Boost"
   icon = "bolt"
   model = "\(defaultChatModelID)"
@@ -617,16 +624,22 @@ public final class ProfileStore: ObservableObject {
       // already lists it. Independent of the dir-empty seed, so existing
       // installs get it too.
       self.backfillTreeOfThoughtProfile()
+      // One-time slug rename `fast-think` -> `repeat-boost` (#628). Must run
+      // BEFORE the ensure-seed below (else a fresh `repeat-boost.toml` would
+      // be seeded beside a user's legacy `fast-think.toml` = duplicate
+      // built-in) and BEFORE the marker read further down (so a marker still
+      // naming the dead `fast-think` id is repointed before it is committed).
+      let migrationError = self.migrateFastThinkToRepeatBoost()
       // Ensure the built-in Repeat Boost profile exists even on installs
       // that already seeded chat.toml (the empty-dir seed above is a no-op
       // there). Runs before `reloadLocked()` below so the initial scan
-      // picks it up. (#426)
-      let fastThinkSeedError = self.ensureBuiltinFastThinkProfile()
+      // picks it up. (#426; slug #628)
+      let repeatBoostSeedError = self.ensureBuiltinRepeatBoostProfile()
       // Same for the built-in JSON Think profile (#572). A seed failure on
-      // EITHER built-in rides the shared `_builtinSeedError` channel; keep
+      // ANY built-in rides the shared `_builtinSeedError` channel; keep
       // the first failure so the snapshot surfaces a concrete cause.
       let jsonThinkSeedError = self.ensureBuiltinJSONThinkProfile()
-      let builtinSeedError = fastThinkSeedError ?? jsonThinkSeedError
+      let builtinSeedError = migrationError ?? repeatBoostSeedError ?? jsonThinkSeedError
       let readResult = self.readActiveProfileIDFromDisk()
       self.stateLock.withLock {
         self._lastSeedError = seed.dirError
@@ -1468,23 +1481,24 @@ public final class ProfileStore: ObservableObject {
     return SeedResult(dirError: nil, markerError: markerError)
   }
 
-  /// Ensure the built-in "Repeat Boost" profile exists (#426). Unlike
-  /// `seedDefaultsIfEmpty` (gated on an empty dir), this writes
-  /// `fast-think.toml` whenever it is ABSENT — so installs that already
-  /// have a `chat.toml` (i.e. every install past first launch) still gain
-  /// Repeat Boost on the next start. Existence-gated, so a user's edits to
-  /// the file survive; deleting it re-creates it next launch, which is the
-  /// accepted contract for a built-in default (edit it, don't delete it).
-  /// Never touches the active-profile marker — the default selection stays
-  /// `chat`. Returns `.seedFailed` on a write failure; `start()` routes it
-  /// to the dedicated `_builtinSeedError` channel, which surfaces on the
-  /// snapshot's `directoryError` even when the directory already has
-  /// profiles (review v1 F1). A nil return is success-or-exists.
-  private func ensureBuiltinFastThinkProfile() -> ProfileStoreError? {
-    let target = directory.appendingPathComponent(Self.defaultFastThinkFilename)
+  /// Ensure the built-in "Repeat Boost" profile exists (#426; slug
+  /// #628). Unlike `seedDefaultsIfEmpty` (gated on an empty dir), this
+  /// writes `repeat-boost.toml` whenever it is ABSENT — so installs that
+  /// already have a `chat.toml` (i.e. every install past first launch)
+  /// still gain Repeat Boost on the next start. Existence-gated, so a
+  /// user's edits to the file survive; deleting it re-creates it next
+  /// launch, which is the accepted contract for a built-in default (edit
+  /// it, don't delete it). Never touches the active-profile marker — the
+  /// default selection stays `chat`. Returns `.seedFailed` on a write
+  /// failure; `start()` routes it to the dedicated `_builtinSeedError`
+  /// channel, which surfaces on the snapshot's `directoryError` even when
+  /// the directory already has profiles (review v1 F1). A nil return is
+  /// success-or-exists.
+  private func ensureBuiltinRepeatBoostProfile() -> ProfileStoreError? {
+    let target = directory.appendingPathComponent(Self.defaultRepeatBoostFilename)
     if FileManager.default.fileExists(atPath: target.path) { return nil }
     do {
-      try Self.defaultFastThinkTOML.write(to: target, atomically: true, encoding: .utf8)
+      try Self.defaultRepeatBoostTOML.write(to: target, atomically: true, encoding: .utf8)
       Log.store.info("seeded built-in Repeat Boost profile at \(target.path, privacy: .public)")
       return nil
     } catch {
@@ -1494,8 +1508,84 @@ public final class ProfileStore: ObservableObject {
     }
   }
 
+  /// One-time on-disk migration for the #628 slug rename
+  /// `fast-think` → `repeat-boost`.
+  ///
+  /// The built-in speculative-decode profile is existence-gated by
+  /// FILENAME (`ensureBuiltinRepeatBoostProfile`). Renaming the slug
+  /// without migrating would leave a user's existing `fast-think.toml`
+  /// in place AND seed a fresh `repeat-boost.toml` beside it — two
+  /// duplicate built-ins — while the active-profile marker kept pointing
+  /// at the now-dangling `fast-think` id. This rename-or-dedupe migration
+  /// closes both holes and is safe to run on every `start()`:
+  ///
+  ///   · Move: when `repeat-boost.toml` is ABSENT and `fast-think.toml`
+  ///     is PRESENT, rewrite only the `id` line (`fast-think` →
+  ///     `repeat-boost`) so a user's body edits survive, write the new
+  ///     file, then delete the legacy one.
+  ///   · Dedupe: when BOTH files exist (a crash between the write and the
+  ///     delete above, or a hand-recreated legacy file), the new file is
+  ///     authoritative — remove the legacy leftover so the built-in is
+  ///     not duplicated.
+  ///   · Repoint: whenever the active-profile marker still names the dead
+  ///     `fast-think` id, rewrite it to `repeat-boost`, independent of the
+  ///     file move (covers a marker left behind by a half-applied prior
+  ///     run).
+  ///
+  /// Idempotent: a second launch finds `repeat-boost.toml` present and no
+  /// legacy file, so the file branch is a no-op and the marker already
+  /// reads `repeat-boost`. Runs BEFORE `ensureBuiltinRepeatBoostProfile`
+  /// and the marker read in `start()`. Returns `.seedFailed` on a
+  /// write/move failure so it rides the shared `_builtinSeedError`
+  /// channel; nil on success-or-nothing-to-do.
+  private func migrateFastThinkToRepeatBoost() -> ProfileStoreError? {
+    let fm = FileManager.default
+    let legacy = directory.appendingPathComponent(Self.legacyFastThinkFilename)
+    let target = directory.appendingPathComponent(Self.defaultRepeatBoostFilename)
+
+    if fm.fileExists(atPath: legacy.path) {
+      do {
+        if fm.fileExists(atPath: target.path) {
+          Log.store.info("deduped leftover \(Self.legacyFastThinkFilename, privacy: .public): \(Self.defaultRepeatBoostFilename, privacy: .public) already present")
+        } else {
+          let body = try String(contentsOf: legacy, encoding: .utf8)
+          let rewritten = body.replacingOccurrences(
+            of: "id = \"\(Self.legacyFastThinkProfileID)\"",
+            with: "id = \"\(Self.defaultRepeatBoostProfileID)\"")
+          try rewritten.write(to: target, atomically: true, encoding: .utf8)
+          Log.store.info("migrated built-in \(Self.legacyFastThinkFilename, privacy: .public) -> \(Self.defaultRepeatBoostFilename, privacy: .public)")
+        }
+        try fm.removeItem(at: legacy)
+      } catch {
+        let underlying = String(describing: error)
+        Log.store.error("migrate \(Self.legacyFastThinkProfileID, privacy: .public) -> \(Self.defaultRepeatBoostProfileID, privacy: .public) failed: \(underlying, privacy: .public)")
+        return .seedFailed(path: target.path, underlying: underlying)
+      }
+    }
+
+    repointActiveMarkerFromLegacySlug()
+    return nil
+  }
+
+  /// Repoint the active-profile marker from the legacy `fast-think` id to
+  /// `repeat-boost` (#628). No-op unless the marker reads exactly the dead
+  /// id. A write failure is logged, not surfaced: the subsequent marker
+  /// read in `start()` would then commit the stale id with no matching
+  /// profile, which degrades to "no active selection" (operator re-picks)
+  /// rather than a hard failure.
+  private func repointActiveMarkerFromLegacySlug() {
+    guard case .ok(let id) = readActiveProfileIDFromDisk(),
+          id == Self.legacyFastThinkProfileID else { return }
+    do {
+      try writeActiveProfileIDToDisk(Self.defaultRepeatBoostProfileID)
+      Log.store.info("repointed active-profile marker \(Self.legacyFastThinkProfileID, privacy: .public) -> \(Self.defaultRepeatBoostProfileID, privacy: .public)")
+    } catch {
+      Log.store.error("repoint active-profile marker failed: \(String(describing: error), privacy: .public)")
+    }
+  }
+
   /// Ensure the built-in "JSON Think" profile exists (#572). Same
-  /// existence-gated contract as `ensureBuiltinFastThinkProfile`: writes
+  /// existence-gated contract as `ensureBuiltinRepeatBoostProfile`: writes
   /// `json-think.toml` whenever ABSENT, survives user edits, re-creates on
   /// delete, never touches the active-profile marker. Returns `.seedFailed`
   /// on a write failure; `start()` routes it to the shared
