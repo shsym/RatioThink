@@ -631,7 +631,8 @@ async def section_sse_stress(base: str, http: httpx.AsyncClient, rep: Report) ->
     # mask, so the concatenated content is grammar-valid JSON (a value or a
     # value-prefix under max_tokens truncation). Deterministic invariants:
     #   · SSE framing stays valid (exactly one terminal finish_reason, [DONE]),
-    #   · content deltas concatenate to something beginning with a JSON value,
+    #   · content deltas concatenate to something beginning with a JSON object
+    #     (#619 constrains json_object to an OBJECT root, not any value),
     #   · NO `<think>`/`</think>` ever appears in the content channel (reasoning
     #     rides `reasoning_content` only).
     r = await http.post(f"{base}/v1/chat/completions", json={
@@ -655,8 +656,8 @@ async def section_sse_stress(base: str, http: httpx.AsyncClient, rep: Report) ->
     rep.ok("<think>" not in content and "</think>" not in content,
            f"{P}/json: reasoning delimiter leaked into streamed content: {content!r}")
     stripped = content.lstrip()
-    rep.ok(not stripped or stripped[0] in '{["-0123456789tfn',
-           f"{P}/json: streamed content does not begin with a JSON value: {content!r}")
+    rep.ok(not stripped or stripped[0] == "{",
+           f"{P}/json: streamed content does not begin with a JSON object: {content!r}")
     rep.skip(f"{P}: server-side cancellation on client disconnect is a known gap (#200) — "
              f"disconnect does not abort in-flight generation; only survival is asserted here")
 

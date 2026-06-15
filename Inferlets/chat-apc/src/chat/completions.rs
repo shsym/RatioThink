@@ -188,39 +188,83 @@ pub struct ChatCompletionsRequest {
     /// success. See [`super::prefix_cache`].
     #[serde(default)]
     pub cache: Option<prefix_cache::CacheDirective>,
-    /// OpenAI-shape `response_format`. When `{"type":"json_object"}` the
-    /// assistant content is constrained to valid JSON via real
-    /// grammar-guided decoding (the "JSON Think" profile, #572). Absent or
-    /// `{"type":"text"}` → unconstrained, byte-identical to the prior
-    /// behavior. `json_schema` is NOT supported in v1 — see `json_mode`.
+    /// OpenAI-shape `response_format`. `{"type":"json_object"}` constrains
+    /// the answer to a JSON **object** (`{...}`); `{"type":"json_schema",
+    /// "json_schema":{"schema":{…}}}` constrains it to the caller's schema.
+    /// Both run real grammar-guided decoding (the "JSON Think" profile,
+    /// #572/#619). Absent or `{"type":"text"}` → unconstrained,
+    /// byte-identical to the prior behavior.
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
 }
 
-/// OpenAI-shape `response_format` discriminator. Only `json_object` is
-/// honored in v1; `text` is the explicit no-op; any other `type`
-/// (including `json_schema`) is parsed-but-rejected at the 400 boundary
+/// OpenAI-shape `response_format` discriminator. `json_object` and
+/// `json_schema` are honored as constrained modes; `text` is the explicit
+/// no-op; any other `type` is parsed-but-rejected at the 400 boundary
 /// (`validate_response_format`) rather than silently ignored.
 #[derive(Deserialize, Clone)]
 pub struct ResponseFormat {
     #[serde(rename = "type", default)]
     pub kind: String,
+    /// Present only for `{"type":"json_schema"}`. Carries the OpenAI
+    /// `json_schema` envelope whose `schema` member is the JSON Schema the
+    /// answer must satisfy.
+    #[serde(default)]
+    pub json_schema: Option<JsonSchemaSpec>,
+}
+
+/// OpenAI `response_format.json_schema` envelope. Only `schema` is
+/// load-bearing; the sibling `name`/`strict` members a client may also
+/// send are ignored by serde (no `deny_unknown_fields`).
+#[derive(Deserialize, Clone)]
+pub struct JsonSchemaSpec {
+    /// The JSON Schema the answer must conform to. Compiled to a grammar
+    /// via `GrammarConstraint::from_json_schema`.
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
 }
 
 impl ResponseFormat {
-    /// The one supported constrained mode: any valid JSON value.
+    /// Constrain the answer to a JSON object (`{...}`, arbitrary contents).
     pub const JSON_OBJECT: &'static str = "json_object";
+    /// Constrain the answer to a caller-supplied JSON Schema.
+    pub const JSON_SCHEMA: &'static str = "json_schema";
     /// Explicit unconstrained mode (OpenAI default). A no-op here.
     pub const TEXT: &'static str = "text";
 }
 
-/// True when the request asks for JSON-constrained output. Centralizes the
-/// `response_format.type == "json_object"` test so the validation, the
-/// speculation gate, and the two-phase decode all read one predicate.
+/// JSON Schema enforcing an object root with arbitrary contents — the
+/// grammar for `{"type":"json_object"}`. `additionalProperties:true` is
+/// explicit because the host compiler defaults to strict mode (no extra
+/// properties), which would otherwise collapse a bare `{"type":"object"}`
+/// to the empty object `{}` alone.
+const JSON_OBJECT_ROOT_SCHEMA: &str = r#"{"type":"object","additionalProperties":true}"#;
+
+/// True when the request asks for JSON-constrained output (`json_object`
+/// OR `json_schema`). Centralizes the predicate so the validation, the
+/// speculation gate, and the two-phase decode all read one test.
 fn json_mode(req: &ChatCompletionsRequest) -> bool {
-    req.response_format
-        .as_ref()
-        .is_some_and(|rf| rf.kind == ResponseFormat::JSON_OBJECT)
+    req.response_format.as_ref().is_some_and(|rf| {
+        rf.kind == ResponseFormat::JSON_OBJECT || rf.kind == ResponseFormat::JSON_SCHEMA
+    })
+}
+
+/// The JSON Schema string driving the Phase-2 grammar, or `None` when the
+/// request is not in JSON mode. `json_object` maps to the object-root
+/// schema; `json_schema` serializes the caller's `schema`. Pure — the
+/// grammar compile (which can fail on a malformed schema) happens in
+/// [`build_json_constraint`].
+fn json_constraint_schema(req: &ChatCompletionsRequest) -> Option<String> {
+    let rf = req.response_format.as_ref()?;
+    match rf.kind.as_str() {
+        ResponseFormat::JSON_OBJECT => Some(JSON_OBJECT_ROOT_SCHEMA.to_string()),
+        ResponseFormat::JSON_SCHEMA => rf
+            .json_schema
+            .as_ref()
+            .and_then(|j| j.schema.as_ref())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
 }
 
 /// Request-side speculation knobs (chat-apc extension). Dimensions
@@ -674,7 +718,7 @@ fn seed_tokens_from(model: &Model, messages: &[ChatMessage]) -> Vec<u32> {
 }
 
 // =============================================================================
-// JSON Think — two-phase constrained decode (#572)
+// JSON Think — two-phase constrained decode (#572/#619)
 // =============================================================================
 //
 // "JSON Think" runs TWO sequential generations on the SAME `Context` so a
@@ -685,7 +729,9 @@ fn seed_tokens_from(model: &Model, messages: &[ChatMessage]) -> Vec<u32> {
 //     closes (`reasoning::Event::End`) OR the first visible-content batch
 //     appears (non-thinking models never enter a `<think>` block) OR the
 //     model stops / hits the cap.
-//   · Phase 2 (answer): a `GrammarConstraint::json` is attached, so every
+//   · Phase 2 (answer): the request's JSON-mode `GrammarConstraint` is
+//     attached (an object root for `json_object`, the caller's schema for
+//     `json_schema` — see `build_json_constraint`), so every
 //     newly sampled token is masked to valid JSON. Emit content, no
 //     reasoning. Phase 1's tail (the `</think>` batch, or a single
 //     discarded answer-start token on a non-thinking model) is flushed
@@ -2582,10 +2628,10 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
         }
     };
 
-    // #572: validate `response_format` before opening any stream. Only
-    // `json_object` (constrained) and `text` (no-op) are honored; an
-    // unknown `type` (incl. `json_schema`) is rejected loudly rather than
-    // silently ignored. JSON mode + a forced `tool_choice` both constrain
+    // #572/#619: validate `response_format` before opening any stream.
+    // `json_object` and `json_schema` (constrained) and `text` (no-op) are
+    // honored; any other `type` is rejected loudly rather than silently
+    // ignored. JSON mode + a forced `tool_choice` both constrain
     // the sampler to different grammars, so they cannot combine. The
     // `role:"tool"` handling that lived here moved into `validate_messages`
     // (main now supports tool turns with ids/ordering), so it is not
@@ -3095,48 +3141,173 @@ fn validate_sampling(
     Ok(effective_max_tokens)
 }
 
-/// Validate `response_format` (#572). Returns `Err((code, message,
-/// param))` for an unsupported shape. Three outcomes:
+/// Validate `response_format` (#572/#619). Returns `Err((code, message,
+/// param))` for an unsupported shape. Outcomes:
 ///   · absent / `{"type":"text"}` → Ok (unconstrained, the default).
-///   · `{"type":"json_object"}` → Ok, UNLESS a forced `tool_choice` is
-///     also present (the two constrain the sampler to different grammars
-///     and cannot compose) → 400 `invalid_request`.
-///   · any other `type` (incl. `json_schema`) → 400
-///     `response_format_unsupported`, naming the offending value so the
-///     caller learns v1 only supports `json_object`.
+///   · `{"type":"json_object"}` → Ok (constrained to a JSON object).
+///   · `{"type":"json_schema","json_schema":{"schema":{"type":"object",…}}}`
+///     → Ok, constrained to the caller's schema. The `schema` must have an
+///     OBJECT root per the host compiler's semantics (see
+///     [`json_schema_non_object_reason`]); anything that would compile to a
+///     grammar a bare scalar satisfies → 400 `invalid_request`. This honors
+///     #619 on the json_schema path.
+///   · any constrained mode AND a forced `tool_choice` → 400
+///     `invalid_request` (the two constrain the sampler to different
+///     grammars and cannot compose).
+///   · any other `type` → 400 `response_format_unsupported`, naming the
+///     offending value.
+///
+/// The schema's grammar-compilability is checked later in
+/// [`build_json_constraint`] (it needs a host call); this stays pure.
+/// Root keywords the host schema compiler (`visit_schema`) honors BEFORE
+/// the declared `type`, each short-circuiting to a non-object grammar a
+/// bare scalar can satisfy. A root carrying any of these is NOT an object
+/// root even when it also declares `"type":"object"` (#619 review F1).
+/// Order mirrors `Vendor/pie/runtime/src/inference/structured/json_schema.rs`
+/// `visit_schema`.
+const JSON_SCHEMA_NON_OBJECT_ROOT_KEYWORDS: [&str; 6] =
+    ["$ref", "const", "enum", "anyOf", "oneOf", "allOf"];
+
+/// `None` when the host compiler would constrain this `json_schema.schema`
+/// to a JSON **object** root (#619); otherwise a 400 reason explaining why
+/// it would not. Mirrors `visit_schema`'s precedence:
+///   1. a composition/literal keyword (`$ref`/`const`/`enum`/`anyOf`/
+///      `oneOf`/`allOf`) wins over `type` → not an object root,
+///   2. `type` is the string `"object"` → object root,
+///   3. `type` is an array → a union. Accepted ONLY when every alternative
+///      is `"object"` or `"null"`. This is a DELIBERATE asymmetry (#619
+///      review v3 F1): a nullable-object union (`["object","null"]`) is
+///      honored because the caller explicitly opted into a `null` answer —
+///      the compiler emits `(object | "null")`, so a bare `null` is a
+///      permitted output here, but no other bare scalar is. A union mixing
+///      object with a non-`null` scalar (`["object","string"]`) is rejected
+///      so a bare string/number cannot slip through. (`json_object` mode is
+///      unaffected — it stays strictly object-root, never nullable.)
+///   4. `type` absent → object root only when an object-implying keyword
+///      (`properties`/`required`/`minProperties`/`maxProperties`) is present
+///      (the same inference `visit_schema` makes).
+fn json_schema_non_object_reason(schema: Option<&serde_json::Value>) -> Option<String> {
+    let Some(schema) = schema else {
+        return Some(
+            "response_format \"json_schema\" requires a json_schema.schema object".to_string(),
+        );
+    };
+    let Some(obj) = schema.as_object() else {
+        return Some(
+            "response_format \"json_schema\".schema must be a JSON object with an object root \
+             (\"type\":\"object\")"
+                .to_string(),
+        );
+    };
+    if let Some(kw) = JSON_SCHEMA_NON_OBJECT_ROOT_KEYWORDS
+        .iter()
+        .find(|k| obj.contains_key(**k))
+    {
+        return Some(format!(
+            "response_format \"json_schema\".schema root keyword \"{kw}\" overrides \
+             \"type\":\"object\" with a non-object (bare-scalar) grammar; the answer must be \
+             constrained to a JSON object"
+        ));
+    }
+    let is_object_root = match obj.get("type") {
+        Some(serde_json::Value::String(t)) => t == "object",
+        Some(serde_json::Value::Array(types)) => {
+            // #619 review v3 F1 (deliberate): a nullable-object union
+            // (`["object","null"]`) is honored — the caller explicitly opted
+            // into a `null` answer, so `null` is the ONLY non-object scalar
+            // allowed. Any other scalar alternative (e.g. `["object","string"]`)
+            // is rejected so a bare string/number cannot satisfy the grammar.
+            types.iter().any(|t| t.as_str() == Some("object"))
+                && types
+                    .iter()
+                    .all(|t| matches!(t.as_str(), Some("object") | Some("null")))
+        }
+        Some(_) => false,
+        None => ["properties", "required", "minProperties", "maxProperties"]
+            .iter()
+            .any(|k| obj.contains_key(*k)),
+    };
+    if is_object_root {
+        None
+    } else {
+        Some(
+            "response_format \"json_schema\".schema must constrain the answer to a JSON object: \
+             declare \"type\":\"object\" (or an object-implying root such as a \"properties\" map)"
+                .to_string(),
+        )
+    }
+}
+
 fn validate_response_format(
     req: &ChatCompletionsRequest,
 ) -> Result<(), (&'static str, String, &'static str)> {
     let Some(rf) = req.response_format.as_ref() else {
         return Ok(());
     };
+    // A constrained answer pins the sampler to a JSON grammar; a forced
+    // tool_choice pins it to the tool-call grammar. They are mutually
+    // exclusive — reject rather than silently letting one win.
+    let reject_forced_tool = |mode: &str| -> Result<(), (&'static str, String, &'static str)> {
+        if !matches!(forced_tool_choice(req.tool_choice.as_ref()), ForcedToolChoice::No) {
+            return Err((
+                "invalid_request",
+                format!(
+                    "response_format \"{mode}\" cannot combine with a forced tool_choice \
+                     (the two constrain decoding to different grammars); send one or the other"
+                ),
+                "response_format",
+            ));
+        }
+        Ok(())
+    };
     match rf.kind.as_str() {
         ResponseFormat::TEXT | "" => Ok(()),
-        ResponseFormat::JSON_OBJECT => {
-            // JSON mode constrains the whole answer to a JSON grammar; a
-            // forced tool_choice constrains it to the tool-call grammar.
-            // They are mutually exclusive — reject rather than silently
-            // letting one win.
-            if !matches!(forced_tool_choice(req.tool_choice.as_ref()), ForcedToolChoice::No) {
-                return Err((
-                    "invalid_request",
-                    "response_format \"json_object\" cannot combine with a forced tool_choice \
-                     (the two constrain decoding to different grammars); send one or the other"
-                        .to_string(),
-                    "response_format",
-                ));
+        ResponseFormat::JSON_OBJECT => reject_forced_tool(ResponseFormat::JSON_OBJECT),
+        ResponseFormat::JSON_SCHEMA => {
+            // #619 F1/F2: require the host compiler to route this schema's
+            // ROOT to an object grammar — a non-object root (incl. one whose
+            // `type:"object"` is overridden by a higher-precedence
+            // composition/literal keyword) compiles to a grammar a bare
+            // scalar satisfies, the exact hole #619 closes.
+            if let Some(reason) =
+                json_schema_non_object_reason(rf.json_schema.as_ref().and_then(|j| j.schema.as_ref()))
+            {
+                return Err(("invalid_request", reason, "response_format"));
             }
-            Ok(())
+            reject_forced_tool(ResponseFormat::JSON_SCHEMA)
         }
         other => Err((
             "response_format_unsupported",
             format!(
-                "response_format.type=\"{other}\" is not supported; v1 supports only \
-                 \"json_object\" (any valid JSON) and \"text\" (unconstrained)"
+                "response_format.type=\"{other}\" is not supported; supported values are \
+                 \"json_object\", \"json_schema\", and \"text\" (unconstrained)"
             ),
             "response_format",
         )),
     }
+}
+
+/// Compile the Phase-2 JSON grammar constraint for a json-mode request,
+/// or `Ok(None)` when the request is not in JSON mode (#619). Built BEFORE
+/// the SSE stream opens (mirrors [`build_forced_tool_constraint`]) so a
+/// malformed `json_schema` returns a clean `400` envelope instead of a
+/// half-open stream that errors mid-flight.
+fn build_json_constraint(
+    model: &Model,
+    req: &ChatCompletionsRequest,
+) -> Result<Option<GrammarConstraint>, (u16, &'static str, String)> {
+    let Some(schema) = json_constraint_schema(req) else {
+        return Ok(None);
+    };
+    GrammarConstraint::from_json_schema(&schema, model)
+        .map(Some)
+        .map_err(|e| {
+            (
+                400,
+                "invalid_json_schema",
+                format!("response_format json schema failed to compile into a grammar: {e}"),
+            )
+        })
 }
 
 /// Build an OpenAI-shape error JSON with a populated `param` field.
@@ -3271,6 +3442,21 @@ async fn handle_streaming(
     };
     let forced_tool = tool_constraint.is_some();
 
+    // #619: compile the JSON-mode grammar BEFORE the Emitter, for the same
+    // reason as the tool constraint — a malformed `json_schema` returns a
+    // clean 400 rather than a half-open stream. `None` for non-JSON
+    // requests (the canonical loop ignores it).
+    let mut json_constraint = match build_json_constraint(&model, &req) {
+        Ok(c) => c,
+        Err((status, code, msg)) => {
+            return res
+                .respond(with_launch_diags_header(sse::json_error(
+                    status, code, &msg,
+                )))
+                .await;
+        }
+    };
+
     // Headers committed; from here we must finish via the Emitter.
     let mut em = Emitter::start(res);
     let id = next_id();
@@ -3400,7 +3586,11 @@ async fn handle_streaming(
                     .generate(generate::resolve_sampler(temperature, top_p))
                     .max_tokens(phase2_budget)
                     .stop(&stop_tokens)
-                    .constrain(GrammarConstraint::json(&model));
+                    .constrain(
+                        json_constraint
+                            .take()
+                            .expect("json mode implies a compiled JSON constraint"),
+                    );
                 let r2 = run_json_phase(
                     gen2,
                     &mut chat_dec2,
@@ -4034,6 +4224,18 @@ async fn handle_non_streaming(
         }
     };
     let forced_tool = tool_constraint.is_some();
+    // #619: compile the JSON-mode grammar up front so a malformed
+    // `json_schema` returns a clean 400 (mirrors handle_streaming).
+    let mut json_constraint = match build_json_constraint(&model, &req) {
+        Ok(c) => c,
+        Err((status, code, msg)) => {
+            return res
+                .respond(with_launch_diags_header(sse::json_error(
+                    status, code, &msg,
+                )))
+                .await;
+        }
+    };
     let stop_tokens = chat::stop_tokens(&model);
     // #418: plain vs speculative decode (see handle_streaming for the
     // greedy + forced-tool gate rationale).
@@ -4085,7 +4287,11 @@ async fn handle_non_streaming(
                     .generate(generate::resolve_sampler(temperature, top_p))
                     .max_tokens(phase2_budget)
                     .stop(&stop_tokens)
-                    .constrain(GrammarConstraint::json(&model));
+                    .constrain(
+                        json_constraint
+                            .take()
+                            .expect("json mode implies a compiled JSON constraint"),
+                    );
                 let r2 = run_json_phase(
                     gen2,
                     &mut chat_dec2,
@@ -6090,10 +6296,18 @@ mod tests {
     }
 
     #[test]
-    fn json_mode_detected_only_for_json_object() {
+    fn json_mode_detected_for_object_and_schema() {
         let r = req_with_response_format(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
                 "response_format":{"type":"json_object"}}"#,
+        );
+        assert!(json_mode(&r));
+
+        // #619: json_schema is also a constrained mode.
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema",
+                "json_schema":{"schema":{"type":"object"}}}}"#,
         );
         assert!(json_mode(&r));
 
@@ -6108,6 +6322,53 @@ mod tests {
         );
         assert!(!json_mode(&r), "absent response_format is not JSON mode");
         assert!(r.response_format.is_none());
+    }
+
+    #[test]
+    fn json_constraint_schema_maps_each_mode() {
+        // #619: json_object → object-root schema, never a bare scalar.
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"}}"#,
+        );
+        assert_eq!(
+            json_constraint_schema(&r).as_deref(),
+            Some(JSON_OBJECT_ROOT_SCHEMA)
+        );
+
+        // json_schema → the caller's schema, serialized.
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema",
+                "json_schema":{"name":"answer",
+                "schema":{"type":"object","properties":{"answer":{"type":"string"}}}}}}"#,
+        );
+        let schema = json_constraint_schema(&r).expect("json_schema yields a schema");
+        let parsed: serde_json::Value = serde_json::from_str(&schema).unwrap();
+        assert_eq!(parsed["type"], "object");
+        assert_eq!(parsed["properties"]["answer"]["type"], "string");
+
+        // text / absent → no constraint schema.
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"text"}}"#,
+        );
+        assert!(json_constraint_schema(&r).is_none());
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert!(json_constraint_schema(&r).is_none());
+    }
+
+    #[test]
+    fn json_object_root_schema_forbids_bare_scalar() {
+        // #619 contract: the object-root schema is a JSON object whose
+        // type is "object" with additionalProperties allowed — so a bare
+        // scalar (the bug) cannot satisfy the compiled grammar, while
+        // arbitrary object contents still can.
+        let v: serde_json::Value = serde_json::from_str(JSON_OBJECT_ROOT_SCHEMA).unwrap();
+        assert_eq!(v["type"], "object");
+        assert_eq!(v["additionalProperties"], true);
     }
 
     #[test]
@@ -6129,26 +6390,131 @@ mod tests {
                 "response_format":{"type":"json_object"}}"#,
         );
         assert!(validate_response_format(&r).is_ok());
+        // #619: json_schema with a schema -> ok
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema",
+                "json_schema":{"schema":{"type":"object"}}}}"#,
+        );
+        assert!(validate_response_format(&r).is_ok());
     }
 
     #[test]
-    fn validate_response_format_rejects_json_schema_and_unknown() {
-        let r = req_with_response_format(
+    fn validate_response_format_rejects_json_schema_without_object_root() {
+        // #619 F1: json_schema is accepted only when schema is a JSON object
+        // with "type":"object". Anything that does NOT pin an object root
+        // would compile to an accept-everything grammar (a bare scalar
+        // satisfies it) — the exact hole #619 closes — so it is a 400
+        // invalid_request.
+        let reject = |body: &str| {
+            let r = req_with_response_format(body);
+            let (code, _msg, param) = validate_response_format(&r).unwrap_err();
+            assert_eq!(code, "invalid_request", "body={body}");
+            assert_eq!(param, "response_format", "body={body}");
+        };
+
+        // missing schema member entirely
+        reject(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
                 "response_format":{"type":"json_schema"}}"#,
         );
-        let (code, _msg, param) = validate_response_format(&r).unwrap_err();
-        assert_eq!(code, "response_format_unsupported");
-        assert_eq!(param, "response_format");
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"name":"x"}}}"#,
+        );
+        // empty object schema -> non-constraining (visit_any), no object root
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{}}}}"#,
+        );
+        // null schema
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":null}}}"#,
+        );
+        // schema with keywords but no object root (type defaults to any)
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"description":"x"}}}}"#,
+        );
+        // scalar / array roots
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"string"}}}}"#,
+        );
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"array"}}}}"#,
+        );
 
+        // #619 review F1: composition/literal keywords win over type:object
+        // in the host compiler, so they reopen the bare-scalar hole and must
+        // be rejected even alongside "type":"object".
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","enum":["a","b"]}}}}"#,
+        );
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","oneOf":[{"type":"string"}]}}}}"#,
+        );
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","anyOf":[{"type":"number"}]}}}}"#,
+        );
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","const":"hi"}}}}"#,
+        );
+        reject(
+            r##"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","$ref":"#/$defs/x"}}}}"##,
+        );
+        // #619 review v3 F1: a union mixing object with a non-`null` scalar
+        // admits a bare string -> rejected (the ["object","null"] accept
+        // below is the deliberate exception).
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":["object","string"]}}}}"#,
+        );
+
+        // object root -> accepted
+        let accept = |body: &str| {
+            let r = req_with_response_format(body);
+            assert!(validate_response_format(&r).is_ok(), "body={body}");
+        };
+        accept(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema",
+                "json_schema":{"schema":{"type":"object",
+                "properties":{"answer":{"type":"string"}}}}}}"#,
+        );
+        // #619 review F2: array type containing object (nullable object) and
+        // a typeless schema inferred as object from `properties` both route
+        // to an object grammar in the compiler, so both are accepted.
+        // review v3 F1 (deliberate): ["object","null"] is honored because the
+        // caller explicitly opted into a `null` answer — null is the ONLY
+        // non-object scalar permitted; ["object","string"] above stays
+        // rejected, and json_object mode is never nullable.
+        accept(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":["object","null"]}}}}"#,
+        );
+        accept(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"properties":{"answer":{"type":"string"}}}}}}"#,
+        );
+    }
+
+    #[test]
+    fn validate_response_format_rejects_unknown_type() {
         let r = req_with_response_format(
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
                 "response_format":{"type":"banana"}}"#,
         );
-        assert_eq!(
-            validate_response_format(&r).unwrap_err().0,
-            "response_format_unsupported"
-        );
+        let (code, _msg, param) = validate_response_format(&r).unwrap_err();
+        assert_eq!(code, "response_format_unsupported");
+        assert_eq!(param, "response_format");
     }
 
     #[test]
@@ -6179,6 +6545,16 @@ mod tests {
                 "tool_choice":"auto"}"#,
         );
         assert!(validate_response_format(&r).is_ok());
+
+        // #619: json_schema + forced tool_choice -> rejected the same way
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema",
+                "json_schema":{"schema":{"type":"object"}}},
+                "tool_choice":"required",
+                "tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}"#,
+        );
+        assert_eq!(validate_response_format(&r).unwrap_err().0, "invalid_request");
     }
 
     // ─── two-phase JSON decode contract (#572 F1/F2/F3) ──────────

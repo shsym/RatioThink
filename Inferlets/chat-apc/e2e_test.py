@@ -1004,11 +1004,12 @@ async def main() -> int:
                                     f"param tag {err!r} (expected speculation.{sub})"
                                 )
 
-                    # #572 JSON Think: response_format validation + engagement.
+                    # #572/#619 JSON Think: response_format validation + engagement.
                     import json as _json572
-                    # (a) Unknown response_format.type (incl. json_schema) → 400
+                    # (a) Unknown response_format.type → 400
                     #     response_format_unsupported with param "response_format".
-                    for bad_type in ("json_schema", "banana"):
+                    #     (#619 wired json_schema, so it is NO LONGER unsupported.)
+                    for bad_type in ("banana",):
                         r = await http.post(
                             f"{base}/v1/chat/completions",
                             json={
@@ -1028,6 +1029,66 @@ async def main() -> int:
                             if err.get("code") != "response_format_unsupported":
                                 failures.append(
                                     f"response_format={bad_type} code {err!r} (want response_format_unsupported)"
+                                )
+
+                    # (a2) #619: json_schema WITHOUT a schema member → 400
+                    #      invalid_request (nothing to constrain to).
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                            "response_format": {"type": "json_schema"},
+                        },
+                    )
+                    print(f"[harness] POST chat(json_schema no-schema) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(
+                            f"json_schema-without-schema status {r.status_code} (want 400)"
+                        )
+                    else:
+                        err = (r.json().get("error", {}) if r.headers.get("content-type", "").startswith("application/json") else {})
+                        if err.get("code") != "invalid_request":
+                            failures.append(
+                                f"json_schema-without-schema code {err!r} (want invalid_request)"
+                            )
+
+                    # (a3) #619 review F1: a schema whose root carries a
+                    #      composition/literal keyword the compiler honors
+                    #      ahead of `type` (enum/oneOf/const/$ref/…) would
+                    #      compile to a bare-scalar grammar even with
+                    #      "type":"object". These must 400 invalid_request
+                    #      BEFORE any generation — proving a bare scalar can
+                    #      never be produced under json_schema this way.
+                    for bad_schema in (
+                        {"type": "object", "enum": ["a", "b"]},
+                        {"type": "object", "oneOf": [{"type": "string"}]},
+                        {"type": "object", "const": "hi"},
+                        {"type": ["object", "string"]},
+                        {"type": "string"},
+                        {},
+                    ):
+                        r = await http.post(
+                            f"{base}/v1/chat/completions",
+                            json={
+                                "model": model_id,
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "stream": False,
+                                "response_format": {"type": "json_schema",
+                                                    "json_schema": {"schema": bad_schema}},
+                            },
+                        )
+                        print(f"[harness] POST chat(json_schema non-object {bad_schema}) -> {r.status_code}")
+                        if r.status_code != 400:
+                            failures.append(
+                                f"json_schema non-object-root {bad_schema} status {r.status_code} (want 400)"
+                            )
+                        else:
+                            err = (r.json().get("error", {}) if r.headers.get("content-type", "").startswith("application/json") else {})
+                            if err.get("code") != "invalid_request":
+                                failures.append(
+                                    f"json_schema non-object-root {bad_schema} code {err!r} (want invalid_request)"
                                 )
 
                     # (b) json_object + forced tool_choice → 400 invalid_request
@@ -1088,16 +1149,74 @@ async def main() -> int:
                         # char must begin a JSON value (`{ [ " - digit t f n`).
                         # A non-JSON (unconstrained) decode would emit arbitrary
                         # leading text.
+                        # #619: json_object is now constrained to an OBJECT
+                        # root, not any JSON value — the first non-ws char
+                        # must be `{` (a bare scalar like `8849` is the bug
+                        # this ticket kills).
                         stripped = content.lstrip()
-                        if stripped and stripped[0] not in '{["-0123456789tfn':
+                        if stripped and stripped[0] != "{":
                             failures.append(
-                                f"json content does not begin with a JSON value: {content!r}"
+                                f"json_object content does not begin with an object: {content!r}"
                             )
                         if finish == "stop":
                             try:
-                                _json572.loads(content)
+                                parsed = _json572.loads(content)
                             except _json572.JSONDecodeError as e:
                                 failures.append(f"json_object natural-stop content not valid JSON: {content!r} ({e})")
+                            else:
+                                if not isinstance(parsed, dict):
+                                    failures.append(
+                                        f"json_object natural-stop content is not a JSON object: {content!r}"
+                                    )
+
+                    # (d) #619: json_schema engagement → 200, content
+                    #     constrained to the caller's schema (object root with
+                    #     a required `answer` string under the dummy's
+                    #     within-mask sampling).
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "give me json"}],
+                            "stream": False,
+                            "max_tokens": 64,
+                            "response_format": {
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": "answer",
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {"answer": {"type": "string"}},
+                                        "required": ["answer"],
+                                    },
+                                },
+                            },
+                        },
+                    )
+                    print(f"[harness] POST chat(json_schema) -> {r.status_code}")
+                    if r.status_code != 200:
+                        failures.append(f"json_schema status {r.status_code} (want 200)")
+                    else:
+                        bjs = r.json()
+                        choice = (bjs.get("choices") or [{}])[0]
+                        content = (choice.get("message", {}) or {}).get("content", "") or ""
+                        finish = choice.get("finish_reason")
+                        print(f"[harness]   json_schema content={content!r} finish={finish}", flush=True)
+                        stripped = content.lstrip()
+                        if stripped and stripped[0] != "{":
+                            failures.append(
+                                f"json_schema content does not begin with an object: {content!r}"
+                            )
+                        if finish == "stop":
+                            try:
+                                parsed = _json572.loads(content)
+                            except _json572.JSONDecodeError as e:
+                                failures.append(f"json_schema natural-stop content not valid JSON: {content!r} ({e})")
+                            else:
+                                if not (isinstance(parsed, dict) and "answer" in parsed):
+                                    failures.append(
+                                        f"json_schema natural-stop content does not match schema: {content!r}"
+                                    )
 
                     # Malformed JSON body → 400.
                     r = await http.post(

@@ -1,12 +1,15 @@
-"""Real-model JSON Think smoke for chat-apc (#572).
+"""Real-model JSON Think smoke for chat-apc (#572/#619).
 
 Unlike `e2e_test.py` (dummy driver — random-within-mask sampling can only
 prove grammar ENGAGEMENT, not parse-validity of a complete value), this
 boots `pie serve` with the production **portable Metal** driver against a
-real cached model, sends a `response_format: {"type":"json_object"}`
-request, and proves the FAITHFUL end-to-end contract:
+real cached model, sends `response_format` requests, and proves the
+FAITHFUL end-to-end contract:
 
-  * the visible `content` is a COMPLETE, parseable JSON value,
+  * `json_object` content is a COMPLETE, parseable JSON OBJECT (#619 — not
+    a bare scalar),
+  * `json_schema` content is an object carrying the schema's required keys
+    (#619 — the canonical "answer in JSON" bare-number repro),
   * a thinking model's reasoning lands in `reasoning_content`, never in
     `content` (no `<think>`/`</think>` leak),
   * the same holds on the streaming path.
@@ -76,21 +79,20 @@ PROMPT = (
 )
 
 
-_JSON_START = set('{["-0123456789tfn')
-
-
 def _check_json_content(label: str, content: str, reasoning: str, failures: list[str],
-                        require_parse: bool = True) -> None:
+                        require_parse: bool = True, require_keys: tuple[str, ...] = ()) -> None:
     print(f"[smoke] {label}: content={content!r}")
     print(f"[smoke] {label}: reasoning_len={len(reasoning)}")
     if "<think>" in content or "</think>" in content:
         failures.append(f"{label}: reasoning delimiter leaked into content: {content!r}")
     stripped = content.lstrip()
     if not stripped:
-        failures.append(f"{label}: empty content (expected a JSON value)")
+        failures.append(f"{label}: empty content (expected a JSON object)")
         return
-    if stripped[0] not in _JSON_START:
-        failures.append(f"{label}: content does not begin with a JSON value: {content!r}")
+    # #619: json_object/json_schema both constrain the answer to an OBJECT
+    # root — a bare scalar (the bug) can no longer begin the content.
+    if stripped[0] != "{":
+        failures.append(f"{label}: content does not begin with a JSON object: {content!r}")
     if not require_parse:
         return
     try:
@@ -98,6 +100,13 @@ def _check_json_content(label: str, content: str, reasoning: str, failures: list
         print(f"[smoke] {label}: parsed JSON OK -> {parsed!r}")
     except json.JSONDecodeError as e:
         failures.append(f"{label}: content is not valid JSON: {content!r} ({e})")
+        return
+    if not isinstance(parsed, dict):
+        failures.append(f"{label}: content is not a JSON object: {content!r}")
+        return
+    for key in require_keys:
+        if key not in parsed:
+            failures.append(f"{label}: object missing required key {key!r}: {content!r}")
 
 
 async def main() -> int:
@@ -197,6 +206,40 @@ async def main() -> int:
                         _check_json_content(
                             "tiny-budget", m.get("content") or "", m.get("reasoning_content") or "",
                             failures, require_parse=False)
+
+                    # #619: the canonical bare-scalar repro. A weak model
+                    # asked "which mountain is highest? answer in json
+                    # {\"answer\":...}" used to emit a bare number (8849).
+                    # With json_schema wired, the grammar forces an object
+                    # carrying the required `answer` key.
+                    r = await http_c.post(f"{base}/v1/chat/completions", json={
+                        "model": MODEL,
+                        "messages": [{"role": "user",
+                                      "content": "Which mountain is the highest on Earth? "
+                                                 "Answer in JSON like {\"answer\": \"...\"}."}],
+                        "max_tokens": 512,
+                        "response_format": {
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "answer",
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"answer": {"type": "string"}},
+                                    "required": ["answer"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "stream": False,
+                    })
+                    print(f"[smoke] json_schema non-stream -> {r.status_code}")
+                    if r.status_code != 200:
+                        failures.append(f"json_schema status {r.status_code}: {r.text[:300]!r}")
+                    else:
+                        m = json.loads(r.text)["choices"][0]["message"]
+                        _check_json_content(
+                            "json_schema", m.get("content") or "", m.get("reasoning_content") or "",
+                            failures, require_keys=("answer",))
             finally:
                 drain.cancel()
         finally:
