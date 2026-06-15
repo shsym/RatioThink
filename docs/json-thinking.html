@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JSON Think — reason, then constrained JSON · Rational</title>
+<link rel="icon" type="image/png" sizes="256x256" href="assets/pie-icon.png">
+<link rel="shortcut icon" href="favicon.ico">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png">
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171a23; --panel-2:#1d2130; --line:#2a2f40;
+    --ink:#e7e9ef; --ink-dim:#9aa1b4; --ink-faint:#6b7186;
+    --app:#5cc8ff; --helper:#c79cff; --engine:#ffcf6b; --inferlet:#6be59a;
+    --edge:#5b6479; --hot:#ff7a59;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    -webkit-font-smoothing:antialiased;line-height:1.55}
+  a{color:var(--app)}
+  .wrap{max-width:880px;margin:0 auto;padding:28px 22px 72px}
+
+  nav.top{display:flex;gap:16px;align-items:center;font-size:13px;color:var(--ink-dim);
+    margin-bottom:22px}
+  nav.top a{color:var(--ink-dim);text-decoration:none}
+  nav.top a:hover{color:var(--ink)}
+  nav.top .here{color:var(--ink);font-weight:600}
+
+  header h1{font-size:26px;margin:0 0 6px;letter-spacing:-.01em}
+  header p.sub{margin:0;color:var(--ink-dim);font-size:15px;max-width:64ch}
+  .ver{display:inline-block;margin-left:8px;font:600 11px/1 var(--mono);
+    color:var(--inferlet);background:#13261c;border:1px solid #1f4030;
+    border-radius:6px;padding:4px 7px;vertical-align:middle}
+
+  h2{font-size:18px;margin:38px 0 10px;letter-spacing:-.01em}
+  h3{font-size:14px;margin:22px 0 8px;color:var(--ink-dim);font-weight:600}
+  p{margin:10px 0;color:var(--ink);max-width:70ch}
+  p.dim{color:var(--ink-dim)}
+  code{font-family:var(--mono);font-size:.9em;background:var(--panel-2);
+    border:1px solid var(--line);border-radius:5px;padding:1px 5px}
+
+  /* two-phase flow */
+  .phases{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:16px 0}
+  @media(max-width:680px){.phases{grid-template-columns:1fr}}
+  .phase{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .phase .tag{font:600 11px/1 var(--mono);letter-spacing:.04em;text-transform:uppercase}
+  .phase.p1 .tag{color:var(--helper)}
+  .phase.p2 .tag{color:var(--inferlet)}
+  .phase h4{margin:8px 0 6px;font-size:14px}
+  .phase p{font-size:13px;color:var(--ink-dim);margin:6px 0;max-width:none}
+
+  pre{background:#0b0d13;border:1px solid var(--line);border-radius:12px;
+    padding:16px 18px;overflow:auto;margin:12px 0}
+  pre code{background:none;border:0;padding:0;font-size:12.5px;line-height:1.6;color:var(--ink)}
+  .cmt{color:var(--ink-faint)}
+  .k{color:var(--app)}      /* json keys */
+  .s{color:var(--inferlet)} /* strings */
+  .n{color:var(--engine)}   /* numbers / literals */
+
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13px}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--ink-dim);font-weight:600;font-size:12px;letter-spacing:.02em}
+  td code{font-size:12px}
+
+  .note{border-left:3px solid var(--hot);background:#1a141280;border-radius:0 10px 10px 0;
+    padding:12px 16px;margin:16px 0}
+  .note b{color:var(--hot)}
+  .note p{margin:6px 0;font-size:13.5px;color:var(--ink)}
+
+  footer{margin-top:48px;padding-top:18px;border-top:1px solid var(--line);
+    color:var(--ink-faint);font-size:12.5px}
+  footer code{font-size:11.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <nav class="top" aria-label="Docs">
+    <a href="landing.html">← Rational</a>
+    <a href="architecture.html">Architecture</a>
+    <span class="here">JSON Think</span>
+  </nav>
+
+  <header>
+    <h1>JSON Think<span class="ver">v0.1.5</span></h1>
+    <p class="sub">Reason first, then emit a single valid JSON value. The model thinks in plain
+       text, and only the answer is forced through a JSON grammar — so you get structured output
+       without throwing away the reasoning step.</p>
+  </header>
+
+  <h2>How it works</h2>
+  <p>A grammar binds the sampler from the very first token and can't detach mid-stream. Since the
+     default model thinks in <code>&lt;think&gt;…&lt;/think&gt;</code>, constraining the whole
+     generation to JSON would forbid reasoning. So a JSON request runs <strong>two sequential
+     generations on one engine context</strong>, sharing the request's <code>max_tokens</code>
+     budget:</p>
+
+  <div class="phases">
+    <div class="phase p1">
+      <div class="tag">Phase 1 · reason</div>
+      <h4>Unconstrained thinking</h4>
+      <p>The model reasons freely. These tokens ride <code>reasoning_content</code>, never
+         <code>content</code>. The phase stops at <code>&lt;/think&gt;</code>, the first visible
+         answer token, EOS, or the budget cap.</p>
+    </div>
+    <div class="phase p2">
+      <div class="tag">Phase 2 · constrain</div>
+      <h4>Grammar-guided JSON</h4>
+      <p>A second generation on the same context attaches a JSON grammar and emits the answer as
+         <code>content</code> — guaranteed to parse. The reasoning carry-over is masked, so the
+         model never re-opens a <code>&lt;think&gt;</code> block.</p>
+    </div>
+  </div>
+
+  <p class="dim">In the app this is the built-in <b>JSON Think</b> profile. Over the HTTP API it's
+     the OpenAI-shape <code>response_format</code> field — no special client required.</p>
+
+  <h2>Request</h2>
+  <p>The endpoint is the engine's loopback port (see the <a href="landing.html">Local API</a> view
+     in the app for the live base URL and served model id). The request <code>model</code> must
+     equal the served id from <code>GET /v1/models</code>. No auth header — the engine is
+     loopback-only and unauthenticated.</p>
+
+  <h3>Any JSON object — <code>{"type":"json_object"}</code></h3>
+  <pre><code><span class="cmt"># BASE = http://127.0.0.1:&lt;ephemeral-port&gt;   model = served id from GET /v1/models</span>
+curl "$BASE/v1/chat/completions" \
+  -H <span class="cmt">'Content-Type: application/json'</span> \
+  -d '{
+    <span class="k">"model"</span>: <span class="s">"&lt;served-model-id&gt;"</span>,
+    <span class="k">"messages"</span>: [{<span class="k">"role"</span>: <span class="s">"user"</span>,
+                  <span class="k">"content"</span>: <span class="s">"Return the first three primes. Use the key \"primes\"."</span>}],
+    <span class="k">"max_tokens"</span>: <span class="n">512</span>,
+    <span class="k">"response_format"</span>: {<span class="k">"type"</span>: <span class="s">"json_object"</span>}
+  }'</code></pre>
+
+  <h3>A specific shape — <code>{"type":"json_schema"}</code></h3>
+  <p class="dim">Constrains the answer to your JSON Schema. The schema's root must be an object
+     (or a nullable-object union). A scalar/enum/composition root is rejected with
+     <code>400</code> so a bare value can't slip through.</p>
+  <pre><code>    <span class="k">"response_format"</span>: {
+      <span class="k">"type"</span>: <span class="s">"json_schema"</span>,
+      <span class="k">"json_schema"</span>: {
+        <span class="k">"name"</span>: <span class="s">"answer"</span>,
+        <span class="k">"schema"</span>: {
+          <span class="k">"type"</span>: <span class="s">"object"</span>,
+          <span class="k">"properties"</span>: {<span class="k">"answer"</span>: {<span class="k">"type"</span>: <span class="s">"string"</span>}},
+          <span class="k">"required"</span>: [<span class="s">"answer"</span>],
+          <span class="k">"additionalProperties"</span>: <span class="n">false</span>
+        }
+      }
+    }</code></pre>
+
+  <h2>Response</h2>
+  <p>The reasoning lands in <code>reasoning_content</code>; the answer in <code>content</code> is a
+     complete, parseable JSON value with no <code>&lt;think&gt;</code> leak.</p>
+
+  <h3>Non-streaming (<code>"stream": false</code>)</h3>
+  <pre><code>{
+  <span class="k">"choices"</span>: [{
+    <span class="k">"index"</span>: <span class="n">0</span>,
+    <span class="k">"message"</span>: {
+      <span class="k">"role"</span>: <span class="s">"assistant"</span>,
+      <span class="k">"reasoning_content"</span>: <span class="s">"The first three prime numbers are 2, 3, 5…"</span>,
+      <span class="k">"content"</span>: <span class="s">"{\"primes\": [2, 3, 5]}"</span>
+    },
+    <span class="k">"finish_reason"</span>: <span class="s">"stop"</span>
+  }],
+  <span class="k">"usage"</span>: { <span class="cmt">/* prompt + both phases */</span> }
+}</code></pre>
+
+  <h3>Streaming (<code>"stream": true</code>)</h3>
+  <p class="dim">Reasoning deltas arrive on <code>delta.reasoning_content</code>; the JSON answer
+     streams as <code>delta.content</code>. Concatenate the content deltas to rebuild the value.</p>
+  <pre><code>data: {<span class="k">"choices"</span>:[{<span class="k">"delta"</span>:{<span class="k">"reasoning_content"</span>:<span class="s">"The first three primes…"</span>}}]}
+data: {<span class="k">"choices"</span>:[{<span class="k">"delta"</span>:{<span class="k">"content"</span>:<span class="s">"{\"primes\": "</span>}}]}
+data: {<span class="k">"choices"</span>:[{<span class="k">"delta"</span>:{<span class="k">"content"</span>:<span class="s">"[2, 3, 5]}"</span>}}]}
+data: [DONE]</code></pre>
+
+  <div class="note">
+    <p><b>Tiny-budget caveat.</b> The two phases share one <code>max_tokens</code> budget. If the
+       budget is too small, a thinking model can spend it all reasoning and reach Phase 2 with no
+       room to emit the answer.</p>
+    <p>Rather than returning a deceptive <code>200</code> with an empty (invalid) body, the engine
+       fails the request with an error envelope carrying <code>json_empty_output</code>. The fix is
+       to raise <code>max_tokens</code> (Phase 2 is guaranteed a small floor, but reasoning-heavy
+       prompts still need headroom). Reproduce it with something like
+       <code>"max_tokens": 16</code>.</p>
+  </div>
+
+  <h2>Rejected requests (<code>400</code>)</h2>
+  <table>
+    <thead><tr><th>Request</th><th>Why it's rejected</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>A JSON mode plus a forced <code>tool_choice</code></td>
+        <td>Each pins the sampler to a different grammar; they can't compose. Send one or the other.</td>
+      </tr>
+      <tr>
+        <td><code>json_schema</code> with a non-object root<br>(<code>enum</code>, <code>const</code>,
+            <code>anyOf</code>, a scalar <code>type</code>, …)</td>
+        <td>Would compile to a grammar a bare scalar satisfies. The answer must be a JSON object,
+            so declare <code>"type":"object"</code>.</td>
+      </tr>
+      <tr>
+        <td>Any other <code>response_format.type</code></td>
+        <td><code>response_format_unsupported</code> — v1 honors <code>json_object</code>,
+            <code>json_schema</code>, and <code>text</code> (the unconstrained default).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>In the app</h2>
+  <p>Pick the <b>JSON Think</b> profile in the toolbar and send a prompt — same model as Chat, so
+     switching to it is an instant, no-reload swap. The grammar (not the system prompt) is what
+     guarantees valid JSON.</p>
+
+  <footer>
+    Self-contained — no server, no network. Source of truth:
+    <code>Inferlets/chat-apc/src/chat/completions.rs</code> (wire contract) and
+    <code>Shared/ProfileStore.swift</code> (the JSON Think profile).
+  </footer>
+
+</div>
+</body>
+</html>
