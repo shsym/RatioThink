@@ -1,4 +1,6 @@
 import XCTest
+import SwiftData
+import SwiftUI
 @testable import RatioThink
 
 @available(macOS 14, *)
@@ -86,6 +88,65 @@ final class TranscriptSnapshotTests: XCTestCase {
 
     XCTAssertEqual(counter.makeIteratorCalls, 1)
     XCTAssertEqual(counter.projectionCalls, rows.count)
+  }
+
+  // MARK: - #530 N-sorts discriminator (exact count, not timing)
+
+  /// The render-projection seam sorts the transcript exactly ONCE per call —
+  /// the #521 single-sort invariant, counted (`TranscriptSortProbe`) rather than
+  /// timed. A regression that re-sorts inside the projection trips this.
+  func test_render_projection_sorts_transcript_exactly_once() {
+    let messages = (0..<50).map { i in
+      Message(role: "user", content: "m\(i)", ts: Date(timeIntervalSince1970: TimeInterval(50 - i)))
+    }
+    TranscriptSortProbe.reset()
+    let snapshot = TranscriptView.projectedSnapshot(messages)
+    XCTAssertEqual(TranscriptSortProbe.sortPasses, 1,
+                   "projectedSnapshot must perform exactly one transcript sort pass; got \(TranscriptSortProbe.sortPasses)")
+    // #521's other half — render value rows, not @Model — is a type-level
+    // guarantee of the seam: the projection yields `ChatMessageItem` values, so a
+    // `ForEach` over `snapshot.items` can never iterate `@Model Message` rows.
+    XCTAssertEqual(snapshot.items.count, messages.count)
+    XCTAssert(type(of: snapshot.items) == [ChatMessageItem].self)
+  }
+
+  /// THE discriminator for acceptance #1: RENDERING `TranscriptView` once must
+  /// build the transcript projection exactly ONCE. The pre-#521 pattern
+  /// re-derived a re-sorting `sortedMessages` for the empty-check, the `ForEach`
+  /// data source, the retry set and the scroll key — several sort passes per
+  /// render. The fix binds one snapshot the whole body reuses.
+  ///
+  /// The view is hosted and laid out (not merely `.body`-accessed) because the
+  /// pre-#521 re-derivations live inside the lazy view-builder closures, which a
+  /// bare `.body` read never evaluates — so this drives the real render path and
+  /// the count is robust to whether the retry/edit hooks are wired.
+  @MainActor
+  func test_transcript_view_render_projects_transcript_exactly_once() throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = container.mainContext
+    let chat = Chat(title: "probe")
+    context.insert(chat)
+    for i in 0..<50 {
+      chat.messages.append(
+        Message(role: i.isMultiple(of: 2) ? "user" : "assistant",
+                content: "m\(i)",
+                ts: Date(timeIntervalSince1970: TimeInterval(i)))
+      )
+    }
+
+    TranscriptSortProbe.reset()
+    // Wire the retry/edit hooks so the retry-anchor projection is live too, then
+    // force one real layout pass so the lazy ForEach/scroll-key/empty-check
+    // closures actually evaluate.
+    let view = TranscriptView(chat: chat, onRetryTurn: { _ in }, onEditUserTurn: { _, _ in })
+    let host = NSHostingView(rootView: view)
+    host.frame = NSRect(x: 0, y: 0, width: 480, height: 640)
+    host.layoutSubtreeIfNeeded()
+
+    XCTAssertEqual(TranscriptSortProbe.sortPasses, 1,
+                   "rendering TranscriptView must build the transcript projection exactly once; got "
+                     + "\(TranscriptSortProbe.sortPasses) sort passes — the pre-#521 re-sort-per-access "
+                     + "churn (or an equivalent N-sorts pattern) is back")
   }
 
   // #634 (GH #163): a chat switch rebuilds the scaffold and fires

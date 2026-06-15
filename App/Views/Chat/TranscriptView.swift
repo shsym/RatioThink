@@ -27,8 +27,17 @@ struct TranscriptView: View {
   /// so an edit can't race the active turn.
   var onEditUserTurn: ((UUID, String) -> Void)? = nil
 
+  /// #521/#530: THE render-path projection seam. The body builds the transcript
+  /// snapshot exactly once per evaluation by calling this; the unit test renders
+  /// the view and asserts a single sort pass (`TranscriptSortProbe`), so the
+  /// pre-#521 "re-sort `chat.messages` N times per body" churn is caught as an
+  /// exact count, not a flaky timing.
+  static func projectedSnapshot(_ messages: [Message]) -> TranscriptSnapshot {
+    TranscriptSnapshot(messages: messages)
+  }
+
   var body: some View {
-    let snapshot = TranscriptSnapshot(messages: chat.messages)
+    let snapshot = Self.projectedSnapshot(chat.messages)
     // #513 review v1 F2: retry-anchor validity in ONE pass over the
     // already-sorted snapshot rows — a per-row `ChatRetryPlan.plan` call
     // re-sorted the transcript for every row (O(n² log n) on the render
