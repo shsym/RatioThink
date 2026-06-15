@@ -79,6 +79,12 @@ public enum ModelMemoryGuardrail {
                                    fraction: Double = defaultRAMFraction,
                                    reserveBytes: Int64 = defaultReserveBytes) -> Policy {
       guard let physical = physicalMemoryBytes, physical > 0 else {
+        // Genuine failure, not the unset state: host RAM was unreadable (or
+        // non-positive), so the RAM-aware ceiling can't be derived and we fall
+        // back to the fixed legacy ceiling. Leave a breadcrumb — silently
+        // enforcing a stale 8 GiB cap on an unknown host is the kind of mute
+        // degradation an operator can't otherwise diagnose (#333).
+        Log.store.warning("guardrail: physical RAM unknown (reported \(physicalMemoryBytes ?? -1, privacy: .public)); using fixed \(unknownRAMFallbackBytes, privacy: .public)-byte fallback ceiling")
         return Policy(maxResolvedModelBytes: unknownRAMFallbackBytes)
       }
       let usable = max(0, physical - reserveBytes)
@@ -130,6 +136,15 @@ public enum ModelMemoryGuardrail {
     root: URL? = try? PieDirs.applicationSupport(),
     physicalMemoryBytes: Int64? = SystemMemory.physicalBytes()
   ) -> Policy {
+    if root == nil {
+      // Genuine failure, not the unset state: the support root itself couldn't
+      // be resolved (the default arg's `try?` swallowed the throw), so we can't
+      // even look for the operator's persisted fraction and fall back to the
+      // default at this authoritative load-time gate. Distinct from a resolved
+      // root with no `guardrail.json` (the legitimate unset case, which stays
+      // silent). Breadcrumb so the lost dial isn't a mute degradation (#333).
+      Log.store.warning("guardrail: application-support root unavailable; using default fraction \(GuardrailSettings.defaultFraction, privacy: .public) (operator dial not read)")
+    }
     let fraction: Double
     do {
       fraction = try root.map { try GuardrailSettings.loadFraction(root: $0) }
