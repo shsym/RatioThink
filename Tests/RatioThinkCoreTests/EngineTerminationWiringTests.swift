@@ -64,17 +64,22 @@ final class EngineTerminationWiringTests: XCTestCase {
   }
 
   // #604: the OOM ceiling is a provider read at DEATH time, not a value
-  // snapshotted at construction. A dial change after the host is built (here:
-  // lowering the ceiling below the engine's RSS) must flip the verdict to OOM.
-  // If the ceiling were captured eagerly at construction (the bug), the
-  // initial above-RSS ceiling would classify this SIGKILL as `.killed`.
+  // snapshotted at construction OR at monitor start. The dial is lowered below
+  // the engine's RSS AFTER `start()` returns and the liveness monitor is
+  // already ticking, so the verdict flipping to `.oom` proves the live
+  // provider is consulted at the moment of death — guarding against both an
+  // eager-at-construction capture and a future eager-snapshot-at-start
+  // regression. With the original initial ceiling (above RSS) this SIGKILL
+  // would classify as `.killed`.
   func test_guardrailProvider_isReadAtDeathTime_notConstruction() async throws {
     let captured = OSAllocatedUnfairLock<EngineTermination?>(initialState: nil)
     let got = expectation(description: "termination captured")
+    // ExitingSession is alive on tick 1 and dies on tick 2, so the dial change
+    // below lands while the monitor is genuinely running mid-lifetime.
     let session = ExitingSession(snapshot: (.uncaughtSignal, SIGKILL),
                                  tail: [], rss: 9_000_000_000)
-    // Construction-time ceiling sits ABOVE the 9 GB RSS ⇒ would be `.killed`
-    // if the provider were evaluated now.
+    // Both construction- and start-time ceilings sit ABOVE the 9 GB RSS ⇒
+    // would be `.killed` if the provider were evaluated at either moment.
     let ceiling = OSAllocatedUnfairLock<Int64>(initialState: 100_000_000_000)
     let host = PieEngineHost(
       launcher: { _ in (port: EnginePort(61013), session: session) },
@@ -82,9 +87,10 @@ final class EngineTerminationWiringTests: XCTestCase {
       relaunchPolicy: PieEngineHost.RelaunchPolicy(maxAttempts: 0),
       terminationSink: { t in captured.withLock { $0 = t }; got.fulfill() },
       guardrailBytes: { ceiling.withLock { $0 } })
-    // Operator lowers the dial AFTER the host exists, BELOW the RSS.
-    ceiling.withLock { $0 = 8_000_000_000 }
     _ = host.start(makeSpec())
+    // Operator lowers the dial mid-run, AFTER the monitor is ticking, BELOW
+    // the RSS — no Helper restart.
+    ceiling.withLock { $0 = 8_000_000_000 }
     await fulfillment(of: [got], timeout: 3)
     host.stop()
 

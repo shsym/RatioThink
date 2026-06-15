@@ -960,9 +960,16 @@ public final class PieEngineHost: @unchecked Sendable {
     // the `.failed(.engineGone)` arm was already recorded by the liveness
     // monitor, and the no-op arms have nothing to stop.
     func recordStop() {
+      // recordStop runs under `stateQueue.sync` via `stop(reason:)` (XPC
+      // Unload / user Pause / quit), so do NOT call the live `guardrailBytes`
+      // provider here: `livePolicy()` does a blocking `Data(contentsOf:)` read
+      // that would land on the serial queue and the synchronous caller. The
+      // value is also dead — `lastRSSBytes` is nil and `classify` only infers
+      // `.oom` with a non-nil RSS, so the ceiling can never change this
+      // verdict. The two RSS-bearing sites still read the live ceiling.
       let t = EngineTermination.classify(
         reason: nil, status: nil, initiator: initiator,
-        lastRSSBytes: nil, guardrailBytes: guardrailBytes())
+        lastRSSBytes: nil, guardrailBytes: nil)
       emitTermination(t, tail: [])
     }
     switch _state {
