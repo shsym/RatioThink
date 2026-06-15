@@ -103,4 +103,23 @@ final class ComposerTextViewGeometryTests: XCTestCase {
     XCTAssertGreaterThanOrEqual(tv.frame.height, usedHeight,
                                 "corrected view must grow to contain the full descender+underline line")
   }
+
+  /// #635 (GH #159): when the app window is not key, AppKit treats the first
+  /// click as an activating ("first mouse") event. By default
+  /// `NSView.acceptsFirstMouse(for:)` returns false, so that click only keys
+  /// the window — it is never delivered to the text view, leaving the caret
+  /// unseated until a SECOND click. An editable composer must accept the first
+  /// mouse so a single click both activates the window AND seats the caret.
+  ///
+  /// Negative control: a stock `NSTextView` rejects the first mouse — proving
+  /// the assertion fails for the unfixed behavior and the guard is falsifiable.
+  func test_submitTextView_acceptsFirstMouse_soSingleClickFocuses() throws {
+    let stock = NSTextView(frame: .zero)
+    XCTAssertFalse(stock.acceptsFirstMouse(for: nil),
+                   "premise: a stock NSTextView rejects the first mouse — the second-click bug")
+
+    let custom = SubmitNSTextView(frame: .zero, textContainer: nil)
+    XCTAssertTrue(custom.acceptsFirstMouse(for: nil),
+                  "composer text view must accept the first mouse so a single click in a non-key window seats the caret (#635)")
+  }
 }

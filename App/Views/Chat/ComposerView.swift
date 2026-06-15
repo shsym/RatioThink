@@ -467,6 +467,13 @@ func applyResizableTextViewGeometry(to textView: NSTextView) {
 final class SubmitNSTextView: NSTextView {
   var onSubmit: (() -> Void)?
 
+  // #635 (GH #159): accept the activating ("first mouse") click. When the
+  // window is not key, AppKit otherwise consumes the first click solely to
+  // key the window and never delivers it to the view — so the caret only
+  // seats on the SECOND click. Returning true delivers that click as a real
+  // `mouseDown:`, so a single click both keys the window and seats the caret.
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
   override func keyDown(with event: NSEvent) {
     // Submit ONLY on bare Return / numpad Enter — any modifier
     // (Shift / Option / Command / Control) falls through to
