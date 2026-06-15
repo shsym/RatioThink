@@ -155,6 +155,49 @@ final class SelectableMarkdownTextTests: XCTestCase {
     }
   }
 
+  // MARK: nested mixed-list markers
+
+  /// A bulleted sublist nested inside an ordered list must keep its bullet
+  /// marker — the inner list's type, not an ordered ancestor's, decides the
+  /// marker. Regression for #641: the bullet items rendered as "1." because
+  /// the marker was derived from "any ordered list in the ancestry" rather
+  /// than the innermost enclosing list.
+  func test_build_nestedBulletInOrderedListKeepsBulletMarker() {
+    let source = """
+      1. first ordered
+      2. second ordered
+         - bullet a
+         - bullet b
+      3. third ordered
+      """
+    let plain = MarkdownAttributedString.build(source, foreground: .labelColor).string
+
+    // The bullet items carry "•", never a decimal marker.
+    XCTAssertTrue(plain.contains("•\tbullet a"), "bullet a lost its bullet marker in: \(plain)")
+    XCTAssertTrue(plain.contains("•\tbullet b"), "bullet b lost its bullet marker in: \(plain)")
+    XCTAssertFalse(plain.contains("1.\tbullet a"), "bullet a wrongly rendered as ordered in: \(plain)")
+
+    // The outer ordered items keep their decimal markers and numbering.
+    for marker in ["1.\tfirst ordered", "2.\tsecond ordered", "3.\tthird ordered"] {
+      XCTAssertTrue(plain.contains(marker), "missing ordered item \(marker) in: \(plain)")
+    }
+  }
+
+  /// The symmetric case: an ordered sublist nested inside a bulleted list must
+  /// render decimal markers, not the bullet of its unordered ancestor.
+  func test_build_nestedOrderedInBulletListKeepsDecimalMarker() {
+    let source = """
+      - outer bullet
+        1. inner one
+        2. inner two
+      """
+    let plain = MarkdownAttributedString.build(source, foreground: .labelColor).string
+
+    XCTAssertTrue(plain.contains("•\touter bullet"), "outer bullet lost its marker in: \(plain)")
+    XCTAssertTrue(plain.contains("1.\tinner one"), "inner one lost its decimal marker in: \(plain)")
+    XCTAssertTrue(plain.contains("2.\tinner two"), "inner two lost its decimal marker in: \(plain)")
+  }
+
   func test_build_doesNotCrashOnDegenerateInput() {
     // Empty, whitespace, control chars, and deeply nested markup must all
     // render *something* without crashing — the fallback path (or partial

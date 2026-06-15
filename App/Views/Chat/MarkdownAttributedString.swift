@@ -221,7 +221,16 @@ enum MarkdownAttributedString {
         if case .unorderedList = $0.kind { return true }
         return false
       }.count
-      let ordered = components.contains { if case .orderedList = $0.kind { return true }; return false }
+      // The marker type comes from the list that DIRECTLY encloses this item,
+      // not from any ordered list further up the ancestry. Foundation orders
+      // `components` innermost-first, so the first list component is the
+      // immediate parent — a bulleted sublist inside an ordered list then keeps
+      // its bullet instead of inheriting the ancestor's decimal marker.
+      let ordered = components.first { component in
+        if case .orderedList = component.kind { return true }
+        if case .unorderedList = component.kind { return true }
+        return false
+      }.map { if case .orderedList = $0.kind { return true }; return false } ?? false
       let marker = ordered ? "\(ordinal).\t" : "•\t"
       return .listItem(marker: marker, depth: max(1, depth))
     }
