@@ -402,18 +402,30 @@ enum NotKeyError: Error, CustomStringConvertible {
   var description: String { "element never became hittable — app appears stuck not-key" }
 }
 
-/// Number of transcript elements whose label or value contains `needle`.
+/// Number of TRANSCRIPT elements whose label or value contains `needle`.
 ///
 /// Each chat message BODY now renders into one selectable `NSTextView` (#636 —
 /// the cross-paragraph-selection fix), which AppKit exposes to XCUITest as a
 /// `.textView` carrying the whole message as its `value` — NOT as the per-block
-/// `.staticText` runs MarkdownUI produced. Notices, system rows, and chrome stay
-/// SwiftUI `Text` (`.staticText`). A message-content wait that queries only
-/// `.staticText` therefore silently misses the message body; search both element
-/// types. Counting stays correct: one `.textView` per message body, so a
-/// `>= N` wait still counts N distinct messages.
+/// `.staticText` runs MarkdownUI produced. Notices and system rows inside the
+/// transcript stay SwiftUI `Text` (`.staticText`). A message-content wait that
+/// queries only `.staticText` therefore silently misses the message body; search
+/// both element types.
+///
+/// The query is scoped to the transcript scroll (`transcript.list`), NOT the
+/// whole app: the chat-list sidebar auto-titles to the first user message
+/// (`chats.row.title`, #512) and the composer holds the live draft — both carry
+/// the message text but are NOT transcript bubbles. An app-wide count would add
+/// the sidebar title to every match, so an exact `== N` assertion (e.g. "the
+/// pending send fired exactly once", S381) over-counts by the auto-titled row.
+/// Counting stays correct: one `.textView` per message body, so a `>= N` wait
+/// still counts N distinct messages. Falls back to an app-wide search only when
+/// the transcript scroll is not yet present, so a poll that runs before the
+/// first layout still makes progress.
 func transcriptTextMatchCount(_ needle: String, in app: XCUIApplication) -> Int {
   let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@", needle, needle)
-  return app.descendants(matching: .textView).matching(predicate).count
-       + app.descendants(matching: .staticText).matching(predicate).count
+  let transcript = app.scrollViews["transcript.list"]
+  let scope: XCUIElement = transcript.exists ? transcript : app
+  return scope.descendants(matching: .textView).matching(predicate).count
+       + scope.descendants(matching: .staticText).matching(predicate).count
 }

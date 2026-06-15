@@ -605,8 +605,8 @@ test-gui-chat-geometry: genproject $(LOGDIR) ## GUI area: #511 chat-list row geo
 test-gui-chat-lifecycle: genproject $(LOGDIR) ## GUI area: #512 chat lifecycle — empty-draft prune + auto-title (S512)
 	$(call gui_suite_run,chat-lifecycle,-only-testing:RatioThinkGUITests/S512_ChatLifecycleGUITests)
 
-test-gui-helper-recovery: genproject $(LOGDIR) ## GUI area: #496 helper-recovery overlay — starting/unreachable/auto-dismiss + engineRunning gate (S496)
-	$(call gui_suite_run,helper-recovery,-only-testing:RatioThinkGUITests/S496_HelperRecoveryOverlayGUITests)
+test-gui-helper-recovery: genproject $(LOGDIR) ## GUI area: #496 helper unreachable — window stays interactive, no recovery overlay (S496)
+	$(call gui_suite_run,helper-recovery,-only-testing:RatioThinkGUITests/S496_HelperOverlayRemovedGUITests)
 
 # --- E2E wrappers by product area ------------------------------------------
 # Operator-gated (seated session + TCC; real engine/model or deterministic

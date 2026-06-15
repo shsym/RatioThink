@@ -139,42 +139,44 @@ final class S381_NoModelLoadDefaultGUITests: XCTestCase {
     }
     XCTAssertFalse(cancel.exists, "launch gate did not dismiss on Cancel")
 
-    // Type the message and try to send — the gate must BLOCK the send
-    // (nothing resolves a model) and re-raise with Load, arming #516's
-    // pending auto-send for this exact draft.
+    // Type the message and try to send. The engine is stopped and no model
+    // resolves, so the send MUST block — it can never persist as a normal send
+    // (`shouldAllowSend` is false). `handleBlockedSend` arms #516's pending
+    // auto-send for this exact draft and raises the no-model gate.
     let pendingMessage = "auto-send me once the model loads"
     typeComposerText(pendingMessage, in: app)
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5))
     send.click()
 
+    // Drive Load when it is visible (the user-tap path, with the dropped-click
+    // defense). The gate is TRANSIENT: since #528 the blocked send's preflight
+    // (`synchronizeEngineForPendingSend`) converges the stopped engine onto the
+    // target itself, so against the instant stub the gate can auto-dismiss the
+    // moment the model reconciles — sometimes before a poll observes Load.
+    // Don't require catching it: the engine resolves either way, and the
+    // auto-send contract is proven below (the reply renders with no further
+    // composer interaction, and the send could only have reached the engine
+    // through the blocked-send → pending-auto-send path).
     let load = app.buttons["noModel.load"]
-    XCTAssertTrue(load.waitForExistence(timeout: 15),
-                  "blocked send did not raise the no-model gate; app tree: \(app.debugDescription)")
-
-    // Drive Load until the gate dismisses (same dropped-click defense as
-    // the test above).
     let deadline = Date().addingTimeInterval(40)
-    var clicks = 0
     while Date() < deadline {
       if !load.exists { break }
-      if load.isHittable {
-        load.click()
-        clicks += 1
-      }
+      if load.isHittable { load.click() }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(2))
     }
-    XCTAssertFalse(load.exists,
-                   "Load did not resolve the model (gate still up after \(clicks) click(s)); app tree: \(app.debugDescription)")
 
     // The promise: the reply streams in WITHOUT any further composer
     // interaction — no typing, no send click.
     XCTAssertTrue(waitForStaticTextContaining(loadedReply, in: app, timeout: 30),
                   "pending message did not auto-send after Load: reply '\(loadedReply)' never rendered; app tree: \(app.debugDescription)")
 
-    // Once and only once: exactly one user bubble carries the message. The
-    // bubble is one selectable NSTextView now (#636, `.textView`) — one element
-    // per message body — so the exact `== 1` count holds.
+    // Once and only once: exactly one TRANSCRIPT bubble carries the message.
+    // The bubble is one selectable NSTextView now (#636, `.textView`) — one
+    // element per message body. `transcriptTextMatchCount` is scoped to the
+    // transcript (`transcript.list`), so the chat's auto-titled sidebar row
+    // (#512 derives the title from this same first message) is NOT counted —
+    // an app-wide count would report 2 for a single, correct send.
     let userBubbleCount = transcriptTextMatchCount(pendingMessage, in: app)
     XCTAssertEqual(userBubbleCount, 1,
                    "pending message must send exactly once, found \(userBubbleCount); app tree: \(app.debugDescription)")

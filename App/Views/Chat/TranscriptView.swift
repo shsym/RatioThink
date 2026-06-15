@@ -60,6 +60,13 @@ struct TranscriptView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
       }
+      // Scopes message-body queries to the transcript. The chat-list sidebar
+      // (`chats.row.title`) auto-titles to the first user message (#512), and
+      // the composer holds the live draft — both carry message text and live
+      // OUTSIDE this scroll. A GUI count that means "how many message bubbles
+      // carry this text" must search here, not app-wide (Helpers.swift
+      // `transcriptTextMatchCount`).
+      .accessibilityIdentifier("transcript.list")
       // Content growth within the open chat (streaming tokens, a new
       // turn) scrolls smoothly to follow the latest bubble.
       .onChange(of: snapshot.scrollKey) { _, _ in
