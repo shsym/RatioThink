@@ -271,6 +271,16 @@ def _classify(fast: dict) -> str:
     return "engaged"
 
 
+# spec_metrics keys this harness reads. A renamed engine field must fail
+# loudly here, not silently default to a real-looking zero.
+_REQUIRED_SPEC_KEYS = (
+    "generated_tokens",
+    "proposed_draft_tokens",
+    "accepted_draft_tokens",
+    "rejected_draft_tokens",
+)
+
+
 def _check_run(label: str, scenario_id: str, rec: dict, failures: list[str]) -> bool:
     """Contract checks common to every run. Returns True if metrics usable."""
     if rec.get("status") != 200:
@@ -279,13 +289,41 @@ def _check_run(label: str, scenario_id: str, rec: dict, failures: list[str]) -> 
             f"body={rec.get('error_body')!r}"
         )
         return False
+    # A mid-stream `event:error` rides on an HTTP 200 SSE body, so the engine's
+    # real code/message would otherwise be discarded and the run would fail as a
+    # generic 'spec_metrics missing'. Surface it first.
+    err = rec.get("error_frame")
+    if err:
+        failures.append(
+            f"[{scenario_id}/{label}] engine error frame: "
+            f"code={err.get('code')!r} message={err.get('message')!r}"
+        )
+        return False
     sm = rec.get("spec_metrics")
     if sm is None:
         failures.append(f"[{scenario_id}/{label}] spec_metrics missing")
         return False
-    proposed = sm.get("proposed_draft_tokens", 0)
-    accepted = sm.get("accepted_draft_tokens", 0)
-    rejected = sm.get("rejected_draft_tokens", 0)
+    missing = [k for k in _REQUIRED_SPEC_KEYS if k not in sm]
+    if missing:
+        failures.append(
+            f"[{scenario_id}/{label}] spec_metrics missing keys: {missing}"
+        )
+        return False
+    # Guard an empty decode (immediate EOS, MAX_TOKENS misconfig, renamed
+    # content field): equivalence on two empty strings would otherwise report
+    # held and pass.
+    generated = sm["generated_tokens"]
+    if not generated or not (rec.get("content") or rec.get("reasoning")):
+        failures.append(
+            f"[{scenario_id}/{label}] empty decode: "
+            f"generated_tokens={generated!r} "
+            f"content_len={len(rec.get('content') or '')} "
+            f"reasoning_len={len(rec.get('reasoning') or '')}"
+        )
+        return False
+    proposed = sm["proposed_draft_tokens"]
+    accepted = sm["accepted_draft_tokens"]
+    rejected = sm["rejected_draft_tokens"]
     if accepted + rejected != proposed:
         failures.append(
             f"[{scenario_id}/{label}] draft accounting inconsistent: "
