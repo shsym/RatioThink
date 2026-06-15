@@ -60,10 +60,16 @@ struct TranscriptView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
       }
+      // Content growth within the open chat (streaming tokens, a new
+      // turn) scrolls smoothly to follow the latest bubble.
       .onChange(of: snapshot.scrollKey) { _, _ in
-        scrollToBottom(proxy)
+        scrollToBottom(proxy, animated: true)
       }
-      .onAppear { scrollToBottom(proxy) }
+      // #634: first layout of this chat (incl. a chat switch, which
+      // rebuilds the scaffold via DetailView's `.id(id)`) jumps straight
+      // to the bottom. Animating here replayed a scroll up from y=0 on
+      // every switch — the reported redundant-scroll effect (GH #163).
+      .onAppear { scrollToBottom(proxy, animated: false) }
     }
   }
 
@@ -85,10 +91,17 @@ struct TranscriptView: View {
     return { newText in onEditUserTurn(id, newText) }
   }
 
-  private func scrollToBottom(_ proxy: ScrollViewProxy) {
-    withAnimation(.easeOut(duration: 0.15)) {
+  private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
+    withAnimation(Self.scrollAnimation(animated: animated)) {
       proxy.scrollTo(Self.bottomSentinel, anchor: .bottom)
     }
+  }
+
+  /// #634: in-session content growth animates the scroll; first layout /
+  /// chat switch passes `nil` so `withAnimation` is a no-op and the
+  /// transcript snaps to the bottom with no visible scroll from y=0.
+  static func scrollAnimation(animated: Bool) -> Animation? {
+    animated ? .easeOut(duration: 0.15) : nil
   }
 
   private var emptyStatePlaceholder: some View {

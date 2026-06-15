@@ -87,4 +87,13 @@ final class TranscriptSnapshotTests: XCTestCase {
     XCTAssertEqual(counter.makeIteratorCalls, 1)
     XCTAssertEqual(counter.projectionCalls, rows.count)
   }
+
+  // #634 (GH #163): a chat switch rebuilds the scaffold and fires
+  // TranscriptView.onAppear, which must jump to the bottom WITHOUT
+  // animation — animating there replayed a scroll up from y=0 on every
+  // switch. In-session content growth still animates.
+  func test_scroll_animation_is_nil_on_appear_and_present_on_content_change() {
+    XCTAssertNil(TranscriptView.scrollAnimation(animated: false))
+    XCTAssertNotNil(TranscriptView.scrollAnimation(animated: true))
+  }
 }
