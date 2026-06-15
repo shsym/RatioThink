@@ -1488,6 +1488,65 @@ fn content_visible(reason_idle: bool, was_in_reasoning: bool) -> bool {
     reason_idle && !was_in_reasoning
 }
 
+/// Closing reasoning delimiter. The reasoning/content channels are demuxed per
+/// batch, but the `</think>` boundary can fall MID-batch: under speculative
+/// decode a single generation step is a multi-token burst, so the closing
+/// delimiter and the first answer tokens can arrive together. On that step the
+/// reasoning decoder fires `End` (so [`content_visible`] is false) while the
+/// chat decoder lumps the whole step into ONE delta
+/// `…reasoning</think>answer-head`. The per-batch gate would then suppress the
+/// entire delta and silently DROP the answer that rode the same batch as the
+/// close (#600). The reasoning half of the same straddle is recovered separately
+/// via the `End(s)` residual (#466); this is the complementary content half.
+const THINK_CLOSE: &str = "</think>";
+
+/// Recover the visible answer that followed `</think>` inside the chat delta of
+/// the batch where the reasoning block closed. Returns `None` when the delta is
+/// the bare delimiter (plain decode — the answer arrives on the NEXT batch and
+/// streams normally) or when the model's close delimiter is not `THINK_CLOSE`
+/// (no regression: the prior behavior dropped the whole delta anyway). Splits on
+/// the FIRST `</think>` — the reasoning tail before it cannot contain the close
+/// delimiter, so an answer that itself mentions the tag stays intact. Leading
+/// newlines are trimmed to mirror the chat template's `content.lstrip('\n')`.
+fn answer_after_close(chat_delta: &str) -> Option<&str> {
+    chat_delta
+        .split_once(THINK_CLOSE)
+        .map(|(_, answer)| answer.trim_start_matches('\n'))
+        .filter(|answer| !answer.is_empty())
+}
+
+/// The visible-content slice to emit for a chat-decoder `Delta` on this batch,
+/// given the reasoning-gate state. `""` means suppress. This is the single
+/// demux decision shared by the streaming and non-streaming loops (and exercised
+/// directly by the unit tests), so both paths treat the `</think>` straddle
+/// identically:
+///
+/// * `forced_tool` → always suppressed: the whole generation IS the tool call,
+///   which rides only the terminal `tool_calls` delta.
+/// * batch landed entirely outside reasoning ([`content_visible`]) → the full
+///   delta is visible content.
+/// * the reasoning block closed ON this batch (`reason_ended`) → recover the
+///   answer-head that shared the close batch ([`answer_after_close`]); the
+///   reasoning tail + delimiter ahead of it stay suppressed.
+/// * otherwise (inside the block, or the opening delimiter) → suppressed.
+fn visible_content<'a>(
+    chat_delta: &'a str,
+    reason_idle: bool,
+    was_in_reasoning: bool,
+    reason_ended: bool,
+    forced_tool: bool,
+) -> &'a str {
+    if forced_tool {
+        ""
+    } else if content_visible(reason_idle, was_in_reasoning) {
+        chat_delta
+    } else if reason_ended {
+        answer_after_close(chat_delta).unwrap_or("")
+    } else {
+        ""
+    }
+}
+
 // =============================================================================
 // Launch-diagnostics registry (N1/N2 — OnceLock immutable snapshot)
 // =============================================================================
@@ -3547,6 +3606,10 @@ async fn handle_streaming(
         // must be gated on the batch's channel, not the post-flip state.
         let was_in_reasoning = in_reasoning;
         let mut reason_idle = false;
+        // #600: true when the reasoning block closes ON this batch, so the chat
+        // delta below can recover the answer-head that rode the `</think>` close
+        // (speculative straddle) instead of dropping it.
+        let mut reason_ended = false;
         match reason_dec.feed(&out.tokens) {
             Ok(inferlet::reasoning::Event::Start) => {
                 in_reasoning = true;
@@ -3572,6 +3635,7 @@ async fn handle_streaming(
             }
             Ok(inferlet::reasoning::Event::End(s)) => {
                 in_reasoning = false;
+                reason_ended = true;
                 // #466: a multi-token speculative batch can carry the
                 // reasoning text AND the closing boundary in one feed, so
                 // the decoder reports it only via `End(s)` with no prior
@@ -3642,42 +3706,40 @@ async fn handle_streaming(
         }
 
         match decoder.feed(&out.tokens) {
-            // When a forced `tool_choice` constrains output to the
-            // tool-call grammar, the ENTIRE generation IS the call
-            // (`root` has no free-text alternative), so suppress the
-            // visible content channel — the call rides only the terminal
-            // `tool_calls` delta (OpenAI emits content:null alongside
-            // tool_calls). Composes with the reasoning content gate; the
-            // suppressed deltas fall through to the no-op arm below.
-            Ok(chat::Event::Delta(s))
-                if content_visible(reason_idle, was_in_reasoning) && !forced_tool =>
-            {
-                // #522: mirror the visible text the App persists, so the
-                // save gate can compare it against the generated tokens.
-                full_text.push_str(&s);
-                sidecar_assistant_content.push_str(&s);
-                let chunk = ChatCompletionChunk {
-                    id: &id,
-                    object: "chat.completion.chunk",
-                    created,
-                    model: &req.model,
-                    choices: vec![ChunkChoice {
-                        index: 0,
-                        delta: ChunkDelta {
-                            content: Some(&s),
-                            ..Default::default()
-                        },
-                        finish_reason: None,
-                    }],
-                };
-                // Non-terminal delta frame: disconnect = silently
-                // abandon (no client to push to); serialize-bug =
-                // emit inline error frame + [DONE] before bailing,
-                // so any client still attached gets a signal.
-                try_emit!(em, &chunk, "content_delta");
-            }
-            Ok(chat::Event::Delta(_)) => {
-                // Suppressed: this batch is reasoning-channel material —
+            // Demux the chat delta through `visible_content`: the full delta
+            // when the batch is outside reasoning; the recovered answer-head
+            // when `</think>` closed on this (speculative) batch (#600); ""
+            // when suppressed (inside reasoning, the delimiter, or a forced
+            // tool call — `forced_tool` makes the whole generation the call,
+            // which rides only the terminal `tool_calls` delta).
+            Ok(chat::Event::Delta(s)) => {
+                let visible = visible_content(&s, reason_idle, was_in_reasoning, reason_ended, forced_tool);
+                if !visible.is_empty() {
+                    // #522: mirror the visible text the App persists, so the
+                    // save gate can compare it against the generated tokens.
+                    full_text.push_str(visible);
+                    sidecar_assistant_content.push_str(visible);
+                    let chunk = ChatCompletionChunk {
+                        id: &id,
+                        object: "chat.completion.chunk",
+                        created,
+                        model: &req.model,
+                        choices: vec![ChunkChoice {
+                            index: 0,
+                            delta: ChunkDelta {
+                                content: Some(visible),
+                                ..Default::default()
+                            },
+                            finish_reason: None,
+                        }],
+                    };
+                    // Non-terminal delta frame: disconnect = silently
+                    // abandon (no client to push to); serialize-bug =
+                    // emit inline error frame + [DONE] before bailing,
+                    // so any client still attached gets a signal.
+                    try_emit!(em, &chunk, "content_delta");
+                }
+                // Otherwise suppressed: this batch is reasoning-channel material —
                 // either inside a `<think>` block, or the opening/closing
                 // delimiter itself. The chat decoder is model-generic and
                 // surfaces the delimiter text (`<think>` / `</think>`) as a
@@ -4248,6 +4310,10 @@ async fn handle_non_streaming(
         // streaming gate so stream + non-stream produce identical content.
         let was_in_reasoning = in_reasoning;
         let mut reason_idle = false;
+        // #600: true when the reasoning block closes ON this batch (mirrors the
+        // streaming branch), so the chat delta below recovers the answer-head
+        // that rode the `</think>` close batch instead of dropping it.
+        let mut reason_ended = false;
         match reason_dec.feed(&out.tokens) {
             Ok(inferlet::reasoning::Event::Start) => in_reasoning = true,
             Ok(inferlet::reasoning::Event::Delta(s)) => {
@@ -4266,6 +4332,7 @@ async fn handle_non_streaming(
             // the streaming branch applies the identical suffix rule).
             Ok(inferlet::reasoning::Event::End(s)) => {
                 in_reasoning = false;
+                reason_ended = true;
                 if s.starts_with(reasoning_text.as_str()) {
                     reasoning_text = s;
                 }
@@ -4308,14 +4375,16 @@ async fn handle_non_streaming(
         }
 
         match decoder.feed(&out.tokens) {
-            // Forced tool_choice suppresses visible content (see
-            // handle_streaming) — the call surfaces only via tool_calls.
-            Ok(chat::Event::Delta(s))
-                if content_visible(reason_idle, was_in_reasoning) && !forced_tool =>
-            {
-                full_text.push_str(&s)
+            // Demux through the shared `visible_content` (see handle_streaming):
+            // full delta when outside reasoning; recovered answer-head when
+            // `</think>` closed on this speculative batch (#600); "" when
+            // suppressed (inside reasoning, the delimiter, or a forced tool call
+            // whose content rides only the terminal tool_calls delta).
+            Ok(chat::Event::Delta(s)) => {
+                let visible =
+                    visible_content(&s, reason_idle, was_in_reasoning, reason_ended, forced_tool);
+                full_text.push_str(visible);
             }
-            Ok(chat::Event::Delta(_)) => {}
             // F1: trust the delta-stitched `full_text` that respects the
             // reasoning channel (`content_visible`). The chat decoder runs
             // alongside (not downstream of) the reasoning decoder, so
@@ -5114,11 +5183,13 @@ mod tests {
         Content(&'static str), // reasoning Idle (outside); chat surfaces visible content
     }
 
-    /// Replays the generation loop's reasoning/content demux exactly as
+    /// Replays the generation loop's reasoning/content demux as
     /// `handle_streaming` / `handle_non_streaming` do: capture
-    /// `was_in_reasoning`, feed reasoning (updating `in_reasoning` +
-    /// `reason_idle`), then gate the chat delta on `content_visible`.
-    /// Returns `(visible_content, reasoning)`.
+    /// `was_in_reasoning`, feed reasoning (updating `in_reasoning` /
+    /// `reason_idle` / `reason_ended` + the `End(s)` reasoning recovery), then
+    /// route the chat delta through the SAME production `visible_content` the
+    /// real loops call — so this exercises the real demux decision, not a
+    /// reimplementation. Returns `(visible_content, reasoning)`.
     fn demux(steps: &[Step]) -> (String, String) {
         let mut content = String::new();
         let mut reasoning = String::new();
@@ -5126,6 +5197,7 @@ mod tests {
         for step in steps {
             let was_in_reasoning = in_reasoning;
             let mut reason_idle = false;
+            let mut reason_ended = false;
             let chat_text = match step {
                 Step::ThinkStart(t) => {
                     in_reasoning = true;
@@ -5138,6 +5210,7 @@ mod tests {
                 }
                 Step::ThinkEnd(end_s, close) => {
                     in_reasoning = false;
+                    reason_ended = true;
                     // Mirror the production End arm: recover reasoning text
                     // that arrived in the SAME batch as the boundary by
                     // appending only the un-streamed suffix; fall back to
@@ -5152,9 +5225,16 @@ mod tests {
                     *t
                 }
             };
-            if content_visible(reason_idle, was_in_reasoning) {
-                content.push_str(chat_text);
-            }
+            // Route through the real production demux unit (no `forced_tool` in
+            // these scenarios). The `</think>` straddle recovery (#600) lives in
+            // `visible_content`, so this harness fails if that recovery breaks.
+            content.push_str(visible_content(
+                chat_text,
+                reason_idle,
+                was_in_reasoning,
+                reason_ended,
+                false,
+            ));
         }
         (content, reasoning)
     }
@@ -5232,6 +5312,111 @@ mod tests {
             Step::Content("answer"),
         ]);
         assert_eq!(reasoning, "the user said hi");
+    }
+
+    #[test]
+    fn answer_in_same_batch_as_close_is_not_dropped() {
+        // #600: the content sibling of `reasoning_in_same_batch_as_close...`.
+        // Under speculative decode the `</think>` close and the first answer
+        // tokens land in ONE batch, so the chat decoder surfaces a combined
+        // `</think>answer-head` on the close step. `content_visible` is false
+        // there (End ≠ Idle), so without recovery the answer is dropped and the
+        // turn persists empty content.
+        let (content, reasoning) = demux(&[
+            Step::ThinkStart("<think>"),
+            Step::Reason("user wants the capital of France"),
+            // Whole tail of the turn rides one speculative burst.
+            Step::ThinkEnd(
+                "user wants the capital of France",
+                "</think>\n\nThe capital of France is **Paris**.",
+            ),
+        ]);
+        assert_eq!(
+            content, "The capital of France is **Paris**.",
+            "answer-head riding the close batch must reach visible content"
+        );
+        assert_eq!(reasoning, "user wants the capital of France");
+        assert!(
+            !content.contains("</think>"),
+            "closing delimiter leaked: {content:?}"
+        );
+    }
+
+    #[test]
+    fn straddle_answer_head_then_streams_rest() {
+        // The close batch carries the answer-head; later batches stream the
+        // rest as ordinary visible content. Both concatenate into the reply.
+        let (content, _r) = demux(&[
+            Step::ThinkStart("<think>"),
+            Step::Reason("thinking"),
+            Step::ThinkEnd("thinking", "</think>Paris"),
+            Step::Content(" is the capital."),
+        ]);
+        assert_eq!(content, "Paris is the capital.");
+    }
+
+    #[test]
+    fn plain_decode_close_batch_emits_no_content() {
+        // Plain (non-speculative) decode: `</think>` is its own batch and the
+        // answer arrives on the next. The bare-delimiter close must suppress
+        // (no leak) and recover nothing — the answer streams via the next
+        // batch, so there is no double-emit.
+        let (content, _r) = demux(&[
+            Step::ThinkStart("<think>"),
+            Step::Reason("thinking"),
+            Step::ThinkEnd("thinking", "</think>"),
+            Step::Content("Paris"),
+        ]);
+        assert_eq!(content, "Paris");
+    }
+
+    #[test]
+    fn answer_after_close_extracts_post_delimiter_text() {
+        assert_eq!(answer_after_close("</think>Paris"), Some("Paris"));
+        assert_eq!(
+            answer_after_close("reasoning tail</think>\n\nParis"),
+            Some("Paris")
+        );
+        // Bare delimiter (plain decode close batch) → nothing to recover.
+        assert_eq!(answer_after_close("</think>"), None);
+        assert_eq!(answer_after_close("</think>\n\n"), None);
+        // No close delimiter → None (not a close-batch shape).
+        assert_eq!(answer_after_close("just content"), None);
+        // Split on the FIRST close, so an answer mentioning the tag stays whole.
+        assert_eq!(
+            answer_after_close("</think>see </think> below"),
+            Some("see </think> below")
+        );
+    }
+
+    #[test]
+    fn visible_content_demuxes_every_batch_shape() {
+        // This is the exact decision the real `handle_streaming` /
+        // `handle_non_streaming` loops run per chat Delta.
+        // Outside reasoning (reason Idle) → whole delta is content.
+        assert_eq!(visible_content("answer", true, false, false, false), "answer");
+        // Inside reasoning (Start/Delta batch) → suppressed.
+        assert_eq!(visible_content("reasoning", false, false, false, false), "");
+        // No-visible-text reasoning token (Idle while inside) → suppressed.
+        assert_eq!(visible_content("", true, true, false, false), "");
+        // Close batch, plain decode (bare delimiter) → nothing recovered.
+        assert_eq!(visible_content("</think>", false, true, true, false), "");
+        // #600 straddle: `</think>` + answer-head in ONE batch → recover answer.
+        assert_eq!(
+            visible_content("</think>\n\nParis", false, true, true, false),
+            "Paris"
+        );
+        // Straddle with a reasoning tail ahead of the close → still just answer.
+        assert_eq!(
+            visible_content("tail</think>Paris", false, true, true, false),
+            "Paris"
+        );
+        // forced_tool suppresses on EVERY shape (content rides tool_calls only).
+        assert_eq!(visible_content("answer", true, false, false, true), "");
+        assert_eq!(
+            visible_content("</think>Paris", false, true, true, true),
+            ""
+        );
     }
 
     #[test]
