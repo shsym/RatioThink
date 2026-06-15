@@ -135,6 +135,36 @@ final class SelectableMarkdownTextTests: XCTestCase {
     XCTAssertEqual(SelectableMarkdownText.contentHeight(forAttributed: attributed, containerWidth: 0), 0)
   }
 
+  // MARK: parse-failure fallback
+
+  func test_plainTextFallback_rendersSourceAsPlainSelectableText() {
+    let source = "raw **bold** and `code` and [x](https://e.com) verbatim"
+    let attributed = MarkdownAttributedString.plainText(source, foreground: .labelColor)
+
+    // The whole source is present verbatim as ONE plain run — no markdown was
+    // applied (no link, no code background), foreground honored, body font.
+    XCTAssertEqual(attributed.string, source)
+    let attrs = attributed.attributes(at: 0, effectiveRange: nil)
+    XCTAssertEqual(attrs[.foregroundColor] as? NSColor, .labelColor)
+    XCTAssertEqual(attrs[.font] as? NSFont, NSFont.preferredFont(forTextStyle: .body))
+    attributed.enumerateAttribute(.link, in: NSRange(location: 0, length: attributed.length)) { value, _, _ in
+      XCTAssertNil(value, "fallback must not synthesize links")
+    }
+    attributed.enumerateAttribute(.backgroundColor, in: NSRange(location: 0, length: attributed.length)) { value, _, _ in
+      XCTAssertNil(value, "fallback must not apply code backgrounds")
+    }
+  }
+
+  func test_build_doesNotCrashOnDegenerateInput() {
+    // Empty, whitespace, control chars, and deeply nested markup must all
+    // render *something* without crashing — the fallback path (or partial
+    // parse) keeps the bubble honest rather than blank.
+    for source in ["", "   ", "\u{0}\u{1}\u{7}", String(repeating: "> ", count: 200) + "deep"] {
+      let attributed = MarkdownAttributedString.build(source, foreground: .labelColor)
+      XCTAssertNotNil(attributed)
+    }
+  }
+
   // MARK: helpers
 
   private func allLinks(in attributed: NSAttributedString) -> [URL] {

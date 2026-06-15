@@ -1,5 +1,8 @@
 import AppKit
 import Foundation
+import os
+
+private let markdownAttributedLog = Logger(subsystem: "com.ratiothink.app", category: "markdown")
 
 /// Renders GitHub-flavored Markdown into a SINGLE `NSAttributedString` whose
 /// visual styling tracks the previous MarkdownUI output closely (#158 / #636).
@@ -38,12 +41,14 @@ enum MarkdownAttributedString {
         )
       )
     } catch {
-      // Unparseable Markdown still renders as plain selectable text rather
-      // than vanishing — honest degradation, never a blank bubble.
-      return NSAttributedString(string: markdown, attributes: [
-        .font: baseFont,
-        .foregroundColor: foreground,
-      ])
+      // `.returnPartiallyParsedIfPossible` means Foundation returns partial
+      // results for ordinary malformed Markdown and only THROWS on genuinely
+      // unrecoverable input — so reaching here is a real parse failure worth
+      // telemetry, not a routine event. Render the source as plain selectable
+      // text (honest degradation, never a blank bubble), but log the dropped
+      // error so a class of bubbles regressing to raw `**bold**` is visible.
+      markdownAttributedLog.error("markdown parse failed, rendering plain text: \(error, privacy: .public)")
+      return plainText(markdown, baseFont: baseFont, foreground: foreground)
     }
 
     let blocks = groupIntoBlocks(parsed)
@@ -53,6 +58,19 @@ enum MarkdownAttributedString {
       result.append(render(block: block, baseFont: baseFont, foreground: foreground))
     }
     return result
+  }
+
+  /// The parse-failure fallback: the raw source as plain, selectable body text
+  /// in the bubble's foreground color — no link/code/markdown attributes.
+  /// Internal so the degradation contract is unit-tested directly (forcing a
+  /// real parser throw is unreliable).
+  static func plainText(_ markdown: String,
+                        baseFont: NSFont = .preferredFont(forTextStyle: .body),
+                        foreground: NSColor) -> NSAttributedString {
+    NSAttributedString(string: markdown, attributes: [
+      .font: baseFont,
+      .foregroundColor: foreground,
+    ])
   }
 
   // MARK: - block model
