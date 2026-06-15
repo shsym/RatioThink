@@ -185,6 +185,30 @@ final class SpecMetricsStoreTests: XCTestCase {
     try? FileManager.default.removeItem(at: SpecMetricsStore.quarantineURL(for: fileURL))
   }
 
+  /// A present-but-UNREADABLE file is not proven corrupt, so it must NOT be
+  /// quarantined (#633) — moving bytes that might be valid would destroy real
+  /// telemetry. It is left in place and persistence is disabled so the next
+  /// write can't overwrite it. A directory at the canonical path stands in
+  /// for the read failure: it "exists" but `Data(contentsOf:)` can't read it.
+  func test_present_but_unreadable_file_is_preserved_not_quarantined() throws {
+    try FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
+
+    let store = SpecMetricsStore(fileURL: fileURL)
+    XCTAssertEqual(store.loadDiagnostic, .unreadablePersistenceDisabled(fileURL))
+    XCTAssertNil(store.aggregate(forProfileID: "any"))
+    // Read failure is NOT corruption — nothing is moved aside.
+    XCTAssertFalse(FileManager.default.fileExists(
+      atPath: SpecMetricsStore.quarantineURL(for: fileURL).path))
+
+    // record() must NOT write (persistence disabled): the path stays the
+    // untouched directory rather than a file overwriting possibly-valid bytes.
+    store.record(drafted(10, 9), forProfileID: "p")
+    var isDir: ObjCBool = false
+    XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDir))
+    XCTAssertTrue(isDir.boolValue,
+                  "persistence is disabled; nothing should overwrite the unreadable path")
+  }
+
   /// When a corrupt file can't be moved aside, persistence is DISABLED so the
   /// bytes are never overwritten — the riskier half of the #625 fix: if a
   /// later change let `persist()` run after a failed move, the silent wipe
@@ -214,6 +238,24 @@ final class SpecMetricsStoreTests: XCTestCase {
     }
     try? FileManager.default.removeItem(at: SpecMetricsStore.quarantineURL(for: fileURL))
   }
+
+  /// TOCTOU: the file passes `fileExists` but is gone by the time the read
+  /// runs (deleted between the check and the load). That is a read failure,
+  /// not corruption (#633) — degrade to in-memory, quarantine nothing, and
+  /// create nothing, so a later run retries cleanly.
+  func test_source_gone_after_fileExists_degrades_without_quarantine() {
+    // The path holds no file; a FileManager that claims it exists forces the
+    // read to run and throw, standing in for the delete-after-check race.
+    let store = SpecMetricsStore(fileURL: fileURL, fileManager: ClaimsExistsFileManager())
+
+    XCTAssertEqual(store.loadDiagnostic, .unreadablePersistenceDisabled(fileURL))
+    XCTAssertNil(store.aggregate(forProfileID: "any"))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path),
+                   "a vanished source must not be recreated")
+    XCTAssertFalse(FileManager.default.fileExists(
+      atPath: SpecMetricsStore.quarantineURL(for: fileURL).path),
+                   "a read failure must never quarantine")
+  }
 }
 
 /// A `FileManager` whose `moveItem` always throws, to exercise the
@@ -222,4 +264,12 @@ private final class MoveFailingFileManager: FileManager {
   override func moveItem(at srcURL: URL, to dstURL: URL) throws {
     throw CocoaError(.fileWriteNoPermission)
   }
+}
+
+/// A `FileManager` that always reports a path exists, to drive the
+/// read-after-`fileExists`-but-source-gone branch (#633): the existence
+/// check passes, then `Data(contentsOf:)` (which doesn't consult the
+/// injected manager) throws because no file is actually there.
+private final class ClaimsExistsFileManager: FileManager {
+  override func fileExists(atPath path: String) -> Bool { true }
 }

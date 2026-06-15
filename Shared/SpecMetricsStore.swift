@@ -138,12 +138,18 @@ public final class SpecMetricsStore: ObservableObject {
     /// for this instance rather than overwriting it — the bytes stay intact
     /// for manual recovery.
     case corruptPersistenceDisabled(URL)
+    /// The file was present but could not be *read* (a transient IO or
+    /// permission failure), so its bytes are NOT proven corrupt. It is left
+    /// untouched — never quarantined — and persistence is DISABLED so the
+    /// next `record()` can't overwrite possibly-valid telemetry (#633).
+    case unreadablePersistenceDisabled(URL)
   }
 
-  /// Signal raised when the backing file was present but undecodable, so a
-  /// future Settings surface can tell the operator their telemetry was reset
-  /// and where the unreadable bytes were preserved. The load no longer
-  /// silently swallows corruption into an empty map (#625).
+  /// Signal raised when the backing file was present but could not be loaded
+  /// — either undecodable (#625) or unreadable (#633) — so a future Settings
+  /// surface can tell the operator their telemetry was reset and where the
+  /// preserved bytes live. The load no longer silently swallows a bad file
+  /// into an empty map.
   @Published public private(set) var loadDiagnostic: LoadDiagnostic?
 
   /// `nil` disables persistence (preview / unit tests that don't want a
@@ -202,18 +208,32 @@ public final class SpecMetricsStore: ObservableObject {
     static let clean = LoadOutcome(aggregates: [:], diagnostic: nil, persistenceDisabled: false)
   }
 
-  /// Three outcomes, never collapsed into one empty map (the #625 bug): an
+  /// Four outcomes, never collapsed into one empty map (the #625 bug): an
   /// *absent* file is the legitimate unset state → empty + clean; a *valid*
-  /// file decodes; a *present-but-undecodable* file is quarantined so the
-  /// next `record()` can't silently destroy it, then the store starts empty.
+  /// file decodes; a present-but-*unreadable* file is left untouched with
+  /// persistence disabled (a read failure does NOT prove the bytes corrupt,
+  /// so moving them would risk destroying valid telemetry — #633); only a
+  /// read-OK-but-*undecodable* file is quarantined so the next `record()`
+  /// can't silently destroy it, then the store starts empty.
   private static func load(from url: URL?,
                            fileManager: FileManager) -> LoadOutcome {
     guard let url, fileManager.fileExists(atPath: url.path) else { return .clean }
-    if let data = try? Data(contentsOf: url),
-       let decoded = try? JSONDecoder().decode([String: SpecMetricsAggregate].self, from: data) {
-      return LoadOutcome(aggregates: decoded, diagnostic: nil, persistenceDisabled: false)
+    let data: Data
+    do {
+      data = try Data(contentsOf: url)
+    } catch {
+      // Present but unreadable — unproven corrupt. Don't quarantine; just
+      // disable persistence so a possibly-valid file is never overwritten.
+      Log.store.error("spec-metrics.json present but unreadable; persistence disabled to preserve it")
+      return LoadOutcome(aggregates: [:],
+                         diagnostic: .unreadablePersistenceDisabled(url),
+                         persistenceDisabled: true)
     }
-    return quarantine(url, fileManager: fileManager)
+    guard let decoded = try? JSONDecoder()
+      .decode([String: SpecMetricsAggregate].self, from: data) else {
+      return quarantine(url, fileManager: fileManager)   // read OK, bytes bad
+    }
+    return LoadOutcome(aggregates: decoded, diagnostic: nil, persistenceDisabled: false)
   }
 
   /// Move a corrupt file aside, preserving its bytes. On success the store
