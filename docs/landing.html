@@ -200,9 +200,7 @@
   footer a{color:var(--ink-soft)}
   footer .credit{margin-top:7px;font-size:11.5px}
 
-  /* ---------- JSON Think scene (reuses the shared mock window + .tsearch think disclosure) ---------- */
-  .jline{font-family:var(--mono);font-size:11.5px;line-height:1.6;color:var(--ink-soft);
-    white-space:pre-wrap;word-break:break-word;min-height:1.2em}
+  /* ---------- JSON Think scene (mono answer bubble for the grammar-constrained pass) ---------- */
   .bubble.json{font-family:var(--mono);font-size:12.5px;background:var(--win-bg);
     border:1px solid var(--border-strong);color:var(--ink)}
   .bubble.json .k{color:var(--accent-dark)}
@@ -274,6 +272,9 @@
           <div class="mrow" id="menuChat">
             Chat<span class="check">✓</span>
           </div>
+          <div class="mrow" id="menuJson">
+            JSON Think<span class="check">✓</span>
+          </div>
         </div>
       </div>
 
@@ -312,8 +313,8 @@
       </div>
       <div class="card">
         <div class="ct"><h3>JSON Think</h3></div>
-        <p>Need structured output? JSON Think lets the model reason in plain text, then forces the
-           answer through a JSON grammar — so it's guaranteed to parse.</p>
+        <p>Need structured output? Ask a chat model for JSON and it tends to wrap or ramble.
+           JSON Think constrains decoding to a JSON grammar — so the answer is always parseable.</p>
       </div>
     </div>
   </section>
@@ -381,13 +382,14 @@
       bursts: [3, 3]   // the repeated 3-word opening is accepted in one burst, then the line's own words
     },
     json: {
-      // JSON Think: phase 1 reasons in plain text (rides reasoning_content), then
-      // phase 2 decodes under a JSON grammar so `content` always parses. `answer`
-      // carries the same key/string highlight spans the bubble renders.
+      // JSON Think contrasts the SAME extraction prompt two ways: a normal Chat
+      // reply (free-form prose you can't reliably parse) vs JSON-constrained
+      // decoding (a grammar guarantees a parseable object). `answer` carries the
+      // key/string/number highlight spans the mono bubble renders.
       profile: 'JSON Think',
-      prompt: 'Which mountain is the highest on Earth? Reply as JSON.',
-      reason: 'Mount Everest is the highest at 8,849 m. The schema asks for an "answer" string, so the name goes there.',
-      answer: '{<span class="k">"answer"</span>: <span class="s">"Mount Everest"</span>}'
+      prompt: 'Extract the product name and price as JSON: "The Aeron chair is $1,395."',
+      chatAnswer: 'Sure! The product is the Aeron chair and it costs $1,395. Want me to format that as JSON or pull anything else?',
+      answer: '{<span class="k">"name"</span>: <span class="s">"Aeron chair"</span>, <span class="k">"price"</span>: <span class="n">1395</span>}'
     }
   };
 
@@ -402,6 +404,7 @@
   var menuTot    = document.getElementById('menuTot');
   var menuFast   = document.getElementById('menuFast');
   var menuChat   = document.getElementById('menuChat');
+  var menuJson   = document.getElementById('menuJson');
   var captionEl  = document.getElementById('caption');
   var dotEls     = Array.prototype.slice.call(document.querySelectorAll('#dots .dot'));
 
@@ -440,6 +443,7 @@
     menuTot.classList.toggle('sel', which==='tot');
     menuFast.classList.toggle('sel', which==='fast');
     menuChat.classList.toggle('sel', which==='chat');
+    menuJson.classList.toggle('sel', which==='json');
   }
 
   function userRow(text){
@@ -652,8 +656,8 @@
     transcript.appendChild(a);
   }
 
-  // ============== Scene 2: JSON Think — reason, then grammar-constrained JSON ==============
-  // Types pre-highlighted JSON one tag/text fragment at a time so the .k/.s spans
+  // ============== Scene 2: JSON Think — free-form chat vs grammar-constrained JSON ==============
+  // Types pre-highlighted JSON one tag/text fragment at a time so the .k/.s/.n spans
   // stay intact while the answer streams in.
   async function streamJsonInto(node, htmlStr, myGen){
     node.classList.add('caret');
@@ -664,53 +668,51 @@
   }
   async function sceneJsonThink(myGen){
     var d = SCENARIO.json;
-    setProfile(d.profile, 'json');     // pill → JSON Think (no menu row; the menu stays closed here)
-    setCaption('JSON Think — reason in plain text, then a JSON grammar forces a parseable answer.');
-    await sleep(800, myGen);
+    // First pass: the everyday Chat profile — a free-form reply you can't reliably parse.
+    setProfile('Chat', 'chat');
+    setCaption('Ask a chat model for JSON and you get prose — wrapped, chatty, not reliably parseable.');
+    await sleep(650, myGen);
     await typeComposer(d.prompt, myGen);
     userRow(d.prompt); resetComposer();
-    await sleep(300, myGen);
+    await sleep(260, myGen);
+    var a1 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
+    transcript.appendChild(a1);
+    await streamWords(a1.querySelector('.bubble'), d.chatAnswer, 40, myGen);
+    await sleep(900, myGen);
 
-    // Phase 1: reasoning streams into a foldable Thinking disclosure (reasoning_content).
-    var col = el(
-      '<div class="row assistant"><div class="acol">'+
-        '<div class="tsearch" id="jts">'+
-          '<div class="tshead">Thinking '+
-            '<span class="bounds">&lt;think&gt;</span> '+
-            '<span class="status searching" id="jstatus">reasoning…</span> '+
-            '<span class="tchev">▾</span></div>'+
-          '<div class="tsbody"><div class="jline" id="jline"></div></div>'+
-        '</div>'+
-      '</div></div>');
-    transcript.appendChild(col);
-    setCaption('Phase 1 — the model reasons in plain text (this rides reasoning_content).');
-    await streamWords(document.getElementById('jline'), d.reason, 58, myGen);
-    var st = document.getElementById('jstatus');
-    st.classList.remove('searching'); st.textContent = '</think>';
-    await sleep(700, myGen);
+    // Switch profiles: open the menu, pick JSON Think.
+    setCaption('Switch to JSON Think — same model, decoding constrained to a JSON grammar.');
+    menu.classList.add('show'); await sleep(680, myGen);
+    setProfile('JSON Think', 'json'); await sleep(520, myGen);
+    menu.classList.remove('show');
+    await sleep(360, myGen);
 
-    // Phase 2: fold the reasoning; a JSON grammar fills the answer so it always parses.
-    document.getElementById('jts').classList.add('collapsed');
-    setCaption('Phase 2 — a JSON grammar constrains the answer, so it always parses (content).');
+    // Second pass: the SAME prompt, now a grammar-constrained answer that always parses.
+    userRow(d.prompt);
+    await sleep(220, myGen);
+    var a2 = el('<div class="row assistant"><div class="acol"></div></div>');
+    transcript.appendChild(a2);
     var ans = el('<div class="bubble json"></div>');
-    col.querySelector('.acol').appendChild(ans);
+    a2.querySelector('.acol').appendChild(ans);
+    setCaption('Same prompt — now the answer is a clean JSON object, guaranteed to parse.');
     await streamJsonInto(ans, d.answer, myGen);
-    await sleep(1200, myGen);
+    await sleep(1400, myGen);
 
-    // The #646 tiny-budget caveat, as a single caption beat.
-    setCaption('Set max_tokens too low and reasoning eats the whole budget — you get a json_empty_output error, never an empty 200.');
+    // The #646 tiny-budget caveat — one short footnote beat (no animated reasoning).
+    setCaption('Caveat: set max_tokens too low and the model runs out before the answer — you get a json_empty_output error, never an empty 200.');
     await sleep(2400, myGen);
   }
   function stillJson(){
     clear(); setProfile(SCENARIO.json.profile, 'json');
+    // Static frame shows BOTH cases: the loose chat reply and the clean JSON.
     userRow(SCENARIO.json.prompt);
-    var col = el('<div class="row assistant"><div class="acol">'+
-      '<div class="tsearch collapsed"><div class="tshead">Thinking '+
-        '<span class="bounds">&lt;think&gt;</span> <span class="status">&lt;/think&gt;</span> '+
-        '<span class="tchev">▾</span></div>'+
-        '<div class="tsbody"><div class="jline">'+SCENARIO.json.reason+'</div></div></div>'+
+    var a1 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
+    a1.querySelector('.bubble').textContent = SCENARIO.json.chatAnswer;
+    transcript.appendChild(a1);
+    userRow(SCENARIO.json.prompt);
+    var a2 = el('<div class="row assistant"><div class="acol">'+
       '<div class="bubble json">'+SCENARIO.json.answer+'</div></div></div>');
-    transcript.appendChild(col);
+    transcript.appendChild(a2);
   }
 
   var SCENES = [
@@ -719,7 +721,7 @@
     { run: sceneFastThink, still: stillFast,
       pausedCaption: 'Animation paused (reduced motion). Repeat Boost gives the same answer, much faster.' },
     { run: sceneJsonThink, still: stillJson,
-      pausedCaption: 'Animation paused (reduced motion). JSON Think reasons, then a grammar forces a parseable JSON answer.' }
+      pausedCaption: 'Animation paused (reduced motion). Chat returns free-form prose; JSON Think returns a clean JSON object that always parses.' }
   ];
 
   // Error fallback: a clean, honest static frame (the lead Tree of Thought scene).
