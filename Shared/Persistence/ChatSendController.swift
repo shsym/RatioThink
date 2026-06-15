@@ -36,7 +36,8 @@ public final class ChatSendController: ObservableObject {
     options: ChatSendRequestOptions,
     recoveryGate: ChatRecoveryGate? = nil,
     recoveryPolicy: ChatRecoveryPolicy = .default,
-    contextUsageTracker: ContextUsageTracker? = nil
+    contextUsageTracker: ContextUsageTracker? = nil,
+    onSpecMetrics: (@MainActor (SpecMetrics) -> Void)? = nil
   ) {
     cancel()
     generation &+= 1
@@ -159,6 +160,11 @@ public final class ChatSendController: ObservableObject {
                   persistenceStatus: persistenceStatus
                 )
               }
+            case let .specMetrics(metrics):
+              // Terminal speculation report (#621). Arrives after `.finish`;
+              // hand it to the recorder (which persists the per-profile
+              // aggregate) without touching the transcript writer.
+              onSpecMetrics?(metrics)
             case let .finish(reason):
               writer?.finish(meta: Self.finishMeta(for: reason, generationMetrics: generationMetrics))
               didFinish = true

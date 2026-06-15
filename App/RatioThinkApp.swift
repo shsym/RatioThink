@@ -73,6 +73,10 @@ struct RatioThinkApp: App {
   // Cross-tab tick so the Profiles-tab ProfileEditor recomputes its
   // picker over-limit badges when the Models-tab guardrail dial writes (#334).
   @StateObject private var guardrailRevision = GuardrailRevision()
+  /// #621: per-profile speculative-decode telemetry. The chat send loop
+  /// records each turn's terminal `spec_metrics` here; the ProfileEditor
+  /// reads it for the read-only "last run" badge.
+  @StateObject private var specMetricsStore = SpecMetricsStore()
 
   @MainActor
   init() {
@@ -570,6 +574,7 @@ struct RatioThinkApp: App {
         .environmentObject(modelLibrary)
         .environmentObject(updateAvailability)
         .environmentObject(settingsNavigation)
+        .environmentObject(specMetricsStore)
         // #420: route the menu-bar Helper's `ratiothink://settings` deep
         // link straight to the Settings scene (not just app-foreground).
         .handlesSettingsDeepLink(settingsNavigation: settingsNavigation)
@@ -646,6 +651,7 @@ struct RatioThinkApp: App {
         .environmentObject(persistenceStatus)
         .environmentObject(engineStatusStore)
         .environmentObject(guardrailRevision)
+        .environmentObject(specMetricsStore)
     }
   }
 }

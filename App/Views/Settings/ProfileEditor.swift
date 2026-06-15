@@ -18,6 +18,10 @@ struct ProfileEditor: View {
   /// against the just-saved ceiling instead of letting them go stale
   /// until this view reappears (#334).
   @EnvironmentObject private var guardrailRevision: GuardrailRevision
+  /// #621: read-only speculative-decode telemetry for the "last run" badge.
+  /// The editor never WRITES this (it's runtime telemetry, not config) — it
+  /// only observes the per-profile aggregate the chat send loop records.
+  @EnvironmentObject private var specMetricsStore: SpecMetricsStore
   /// Discovered model options (app-managed + HF cache), each carrying
   /// size + over-limit / unsupported state for the model-size guardrail.
   @State private var modelOptions: [ProfileModelOptions.Option] = []
@@ -57,6 +61,9 @@ struct ProfileEditor: View {
           headerRow(profile: profile)
           coreSection(profile: profile)
           editableDefaultsSection(profile: profile)
+          if profile.speculation != nil {
+            speculationSection(profile: profile)
+          }
           warningsSection
         } else if let error = entry.error {
           unparsableSection(error)
@@ -312,6 +319,32 @@ struct ProfileEditor: View {
       }
       Slider(value: value, in: range)
         .accessibilityIdentifier(accessibilityID)
+    }
+  }
+
+  /// Read-only speculative-decode diagnostics for a "Fast Think" profile
+  /// (`[speculation]` present). Surfaces the most recent run's accept ratio
+  /// + throughput from `SpecMetricsStore`. This is a DIAGNOSTICS badge, not
+  /// an editable field: the editor edits config, while accept ratio is
+  /// runtime telemetry the chat send loop records (#621).
+  private func speculationSection(profile: Profile) -> some View {
+    let aggregate = specMetricsStore.aggregate(forProfileID: profile.id)
+    return VStack(alignment: .leading, spacing: 6) {
+      SettingsSectionHeader(title: "Speculation")
+      SettingsLabeledRow(label: "Last run") {
+        Text(aggregate?.lastRunSummary ?? "No runs yet")
+          .foregroundStyle(.secondary)
+          .textSelection(.enabled)
+          .accessibilityIdentifier("ProfileEditorSpecLastRun")
+      }
+      if let average = aggregate?.averageSummary {
+        SettingsLabeledRow(label: "Average") {
+          Text(average)
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+            .accessibilityIdentifier("ProfileEditorSpecAverage")
+        }
+      }
     }
   }
 

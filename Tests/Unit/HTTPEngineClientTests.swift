@@ -355,6 +355,57 @@ final class HTTPEngineClientTests: XCTestCase {
     }
   }
 
+  func test_chatCompletion_terminal_spec_metrics_frame_decodes_to_event() async throws {
+    // chat-apc #418/#621: a "Fast Think" turn closes with a terminal
+    // `spec_metrics` frame AFTER the finish chunk and before `[DONE]`. It
+    // must surface as a `.specMetrics` event (previously dropped by the
+    // demux `default`), and the accept ratio derives from the draft counts.
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        #"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"spec_metrics","enabled":true,"generated_tokens":40,"decode_steps":18,"proposed_draft_tokens":30,"accepted_draft_tokens":24,"rejected_draft_tokens":6,"avg_tokens_per_step":2.222,"decode_tokens_per_sec":85.5,"leader_len":1,"draft_len":4}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    var events: [ChatEvent] = []
+    for try await ev in makeClient().chatCompletion(
+      ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "x")])
+    ) { events.append(ev) }
+
+    // The metrics frame rides AFTER finish.
+    XCTAssertEqual(events.count, 3)
+    XCTAssertEqual(events[1], .finish(reason: .stop))
+    guard case let .specMetrics(metrics) = events[2] else {
+      return XCTFail("expected terminal .specMetrics, got \(String(describing: events.last))")
+    }
+    XCTAssertTrue(metrics.enabled)
+    XCTAssertNil(metrics.fallbackReason)
+    XCTAssertEqual(metrics.proposedDraftTokens, 30)
+    XCTAssertEqual(metrics.acceptedDraftTokens, 24)
+    XCTAssertEqual(metrics.acceptRatio, 0.8)
+    XCTAssertEqual(metrics.avgTokensPerStep, 2.222, accuracy: 1e-6)
+  }
+
+  func test_chatCompletion_inactive_spec_metrics_frame_carries_fallback_reason() async throws {
+    // Speculation requested but not engaged (non-greedy): `enabled:false`,
+    // zero proposals → `acceptRatio == nil` (not a misleading 0%).
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        #"data: {"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"spec_metrics","enabled":false,"fallback_reason":"non_greedy_sampling","generated_tokens":5,"decode_steps":5,"proposed_draft_tokens":0,"accepted_draft_tokens":0,"rejected_draft_tokens":0,"avg_tokens_per_step":1.0,"decode_tokens_per_sec":12.0,"leader_len":0,"draft_len":0}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    var metrics: SpecMetrics?
+    for try await ev in makeClient().chatCompletion(
+      ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "x")])
+    ) { if case let .specMetrics(m) = ev { metrics = m } }
+    XCTAssertEqual(metrics?.enabled, false)
+    XCTAssertEqual(metrics?.fallbackReason, "non_greedy_sampling")
+    XCTAssertNil(metrics?.acceptRatio)
+  }
+
   func test_chatCompletion_inline_error_frame_surfaces_as_stream_error() async {
     FakeSSEURLProtocol.handler = { _ in
       .sse(chunks: [

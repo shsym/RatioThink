@@ -548,6 +548,64 @@ internal enum JSONValue: Codable, Equatable, Sendable {
 ///   sees `finish_reason != nil`. Streams end with exactly one
 ///   `.finish` followed by completion.
 ///
+/// Speculative-decode metrics carried by the terminal `spec_metrics` SSE
+/// frame (chat-apc #418, schema `SpecMetricsReport`). Emitted only when the
+/// request opted into the speculation surface, so a normal chat stream
+/// never carries one. `enabled` is `false` (with a `fallbackReason`) when
+/// drafting was requested but didn't engage (e.g. `non_greedy_sampling`).
+///
+/// The frame arrives AFTER the terminal `.finish` chunk and before
+/// `[DONE]`, so a consumer keyed on `.finish` still sees it before the
+/// stream completes.
+public struct SpecMetrics: Equatable, Sendable {
+  public let enabled: Bool
+  public let fallbackReason: String?
+  public let generatedTokens: Int
+  public let decodeSteps: Int
+  public let proposedDraftTokens: Int
+  public let acceptedDraftTokens: Int
+  public let rejectedDraftTokens: Int
+  public let avgTokensPerStep: Double
+  public let decodeTokensPerSec: Double
+  public let leaderLen: Int
+  public let draftLen: Int
+
+  public init(
+    enabled: Bool,
+    fallbackReason: String? = nil,
+    generatedTokens: Int,
+    decodeSteps: Int,
+    proposedDraftTokens: Int,
+    acceptedDraftTokens: Int,
+    rejectedDraftTokens: Int,
+    avgTokensPerStep: Double,
+    decodeTokensPerSec: Double,
+    leaderLen: Int,
+    draftLen: Int
+  ) {
+    self.enabled = enabled
+    self.fallbackReason = fallbackReason
+    self.generatedTokens = generatedTokens
+    self.decodeSteps = decodeSteps
+    self.proposedDraftTokens = proposedDraftTokens
+    self.acceptedDraftTokens = acceptedDraftTokens
+    self.rejectedDraftTokens = rejectedDraftTokens
+    self.avgTokensPerStep = avgTokensPerStep
+    self.decodeTokensPerSec = decodeTokensPerSec
+    self.leaderLen = leaderLen
+    self.draftLen = draftLen
+  }
+
+  /// Fraction of proposed draft tokens the verifier accepted (`0…1`), or
+  /// `nil` when nothing was proposed — drafting requested but inactive, so
+  /// there's no ratio to report (avoids a `0/0` that reads as "0% accept").
+  public var acceptRatio: Double? {
+    proposedDraftTokens > 0
+      ? Double(acceptedDraftTokens) / Double(proposedDraftTokens)
+      : nil
+  }
+}
+
 /// `FinishReason` is closed for v1; unknown reasons coming over the
 /// wire decode into `.other(String)` so a future engine extension
 /// doesn't crash the GUI.
@@ -557,6 +615,8 @@ public enum ChatEvent: Equatable, Sendable {
   case delta(role: ChatMessage.Role?, content: String)
   case reasoningDelta(String)
   case generationMetrics(GenerationMetrics)
+  /// Terminal speculative-decode metrics. See `SpecMetrics`.
+  case specMetrics(SpecMetrics)
   case finish(reason: FinishReason)
 
   public enum FinishReason: Equatable, Sendable {

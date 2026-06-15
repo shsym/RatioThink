@@ -955,6 +955,43 @@ final class ChatSendControllerTests: XCTestCase {
     XCTAssertNil(body["speculation"], "JSON Think body must not carry speculation")
   }
 
+  func test_send_routes_terminal_spec_metrics_to_recorder() async throws {
+    // #621: the terminal `.specMetrics` event (delivered after `.finish`)
+    // must reach the `onSpecMetrics` sink without disturbing the transcript.
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let metrics = SpecMetrics(
+      enabled: true, generatedTokens: 20, decodeSteps: 9,
+      proposedDraftTokens: 12, acceptedDraftTokens: 9, rejectedDraftTokens: 3,
+      avgTokensPerStep: 2.2, decodeTokensPerSec: 70, leaderLen: 1, draftLen: 4)
+    let engine = ImmediateChatEngine(events: [
+      .delta(role: .assistant, content: "ok"),
+      .finish(reason: .stop),
+      .specMetrics(metrics),
+    ])
+    let controller = ChatSendController()
+    var recorded: [SpecMetrics] = []
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"),
+      onSpecMetrics: { recorded.append($0) }
+    )
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+
+    XCTAssertEqual(recorded, [metrics])
+    let assistant = try XCTUnwrap(chat.messages.first { $0.role == ChatMessage.Role.assistant.rawValue })
+    XCTAssertEqual(assistant.content, "ok", "metrics frame must not bleed into the transcript")
+  }
+
   private func waitUntil(
     _ description: String,
     timeout: TimeInterval = 1,

@@ -212,6 +212,12 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
               case "generation_metrics":
                 let meta = try decoder.decode(GenerationMetricsFrame.self, from: frame.dataBytes)
                 continuation.yield(.generationMetrics(meta.metrics))
+              case "spec_metrics":
+                // Terminal speculation report (#418/#621). Arrives after
+                // the `.finish` chunk and before `[DONE]`. Strict decode so
+                // a wire-schema drift surfaces instead of vanishing.
+                let metrics = try decoder.decode(SpecMetricsFrame.self, from: frame.dataBytes)
+                continuation.yield(.specMetrics(metrics.toModel()))
               default:
                 continue
               }
@@ -621,6 +627,40 @@ private struct ChunkDelta: Decodable {
   /// (which carry no `content`); decoded so the GUI can surface it on a
   /// separate channel instead of dropping it.
   let reasoning_content: String?
+}
+
+/// Terminal `spec_metrics` SSE frame (chat-apc #418, `SpecMetricsReport`
+/// flattened under `{"event":"spec_metrics", …}`). Snake-case wire keys
+/// map straight to `SpecMetrics`. Decoded strictly: a schema drift surfaces
+/// as a thrown stream error rather than a silently-dropped metric.
+private struct SpecMetricsFrame: Decodable {
+  let enabled: Bool
+  let fallback_reason: String?
+  let generated_tokens: Int
+  let decode_steps: Int
+  let proposed_draft_tokens: Int
+  let accepted_draft_tokens: Int
+  let rejected_draft_tokens: Int
+  let avg_tokens_per_step: Double
+  let decode_tokens_per_sec: Double
+  let leader_len: Int
+  let draft_len: Int
+
+  func toModel() -> SpecMetrics {
+    SpecMetrics(
+      enabled: enabled,
+      fallbackReason: fallback_reason,
+      generatedTokens: generated_tokens,
+      decodeSteps: decode_steps,
+      proposedDraftTokens: proposed_draft_tokens,
+      acceptedDraftTokens: accepted_draft_tokens,
+      rejectedDraftTokens: rejected_draft_tokens,
+      avgTokensPerStep: avg_tokens_per_step,
+      decodeTokensPerSec: decode_tokens_per_sec,
+      leaderLen: leader_len,
+      draftLen: draft_len
+    )
+  }
 }
 
 // MARK: - Errors

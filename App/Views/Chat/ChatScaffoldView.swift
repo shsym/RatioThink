@@ -38,6 +38,9 @@ struct ChatScaffoldView: View {
   /// popover so they derive the resident/offline distinction from the single
   /// published `indicator`.
   @EnvironmentObject private var engineLifecycle: EngineLifecycle
+  /// #621: per-profile speculation telemetry sink. Each "Fast Think" turn's
+  /// terminal `spec_metrics` is recorded here for the ProfileEditor badge.
+  @EnvironmentObject private var specMetricsStore: SpecMetricsStore
   /// Shown when a send is blocked because no model resolves yet. #326
   /// decides the model-availability action (Load / Download / unavailable
   /// via the live `noModelAction`); #397 layers the engine/model lifecycle
@@ -952,6 +955,9 @@ struct ChatScaffoldView: View {
       return
     }
 
+    // Capture the profile at send time: a profile swap mid-stream must not
+    // misattribute this turn's terminal `spec_metrics` to the new profile.
+    let metricsProfileID = viewModel.selectedProfileID
     sendController.send(
       chat: chat,
       context: modelContext,
@@ -968,7 +974,10 @@ struct ChatScaffoldView: View {
       // `HTTPEngineError.engineGone` (or a transport throw racing the
       // helper's auto-relaunch) and ride the same chat turn through the
       // recovery without the user re-clicking Send.
-      recoveryGate: engineStatusStore
+      recoveryGate: engineStatusStore,
+      // #621: persist the terminal speculation report against the profile
+      // that issued the turn, so the ProfileEditor badge reflects real runs.
+      onSpecMetrics: { specMetricsStore.record($0, forProfileID: metricsProfileID) }
     )
   }
 
