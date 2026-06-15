@@ -356,7 +356,7 @@ final class HTTPEngineClientTests: XCTestCase {
   }
 
   func test_chatCompletion_terminal_spec_metrics_frame_decodes_to_event() async throws {
-    // chat-apc #418/#621: a "Fast Think" turn closes with a terminal
+    // chat-apc #418/#621: a "Repeat Boost" turn closes with a terminal
     // `spec_metrics` frame AFTER the finish chunk and before `[DONE]`. It
     // must surface as a `.specMetrics` event (previously dropped by the
     // demux `default`), and the accept ratio derives from the draft counts.

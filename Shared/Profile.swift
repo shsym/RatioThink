@@ -36,13 +36,13 @@ public struct Sampling: Equatable {
 }
 
 public struct Profile {
-  /// Per-profile speculative-decoding ("Fast Think") settings — the
+  /// Per-profile speculative-decoding ("Repeat Boost") settings — the
   /// domain mirror of the wire `ChatSpeculation` (#426). `nil` knobs fall
   /// back to the chat-apc inferlet's #418 defaults (leader 1 / draft 3).
   /// Drafting only engages when `enabled` AND the request is greedy
   /// (temperature 0); the send path (`ChatSendController.makeRequest`)
   /// enforces that coupling, so an enabled-speculation profile is always
-  /// a greedy "Fast Think" profile.
+  /// a greedy "Repeat Boost" profile.
   public struct Speculation: Equatable, Sendable {
     public var enabled: Bool
     public var leaderLen: Int?

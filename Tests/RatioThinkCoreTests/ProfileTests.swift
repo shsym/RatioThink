@@ -236,7 +236,7 @@ final class ProfileTests: XCTestCase {
     XCTAssertTrue(dumped.contains("agent"))
   }
 
-  // MARK: - [speculation] (#426 Fast Think)
+  // MARK: - [speculation] (#426 Repeat Boost)
 
   func test_parses_speculation_section_enabled_only() throws {
     let toml = """

@@ -69,5 +69,5 @@ docs/plans/
 __pycache__/
 *.pyc
 
-# Generated Fast Think / speculative-decoding bench artifact (Scripts/run-spec-bench.sh)
+# Generated Repeat Boost / speculative-decoding bench artifact (Scripts/run-spec-bench.sh)
 spec_bench_*.json

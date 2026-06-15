@@ -260,7 +260,7 @@
             Tree of Thought<span class="check">✓</span>
           </div>
           <div class="mrow" id="menuFast">
-            Fast Think<span class="check">✓</span>
+            Repeat Boost<span class="check">✓</span>
           </div>
           <div class="mrow" id="menuChat">
             Chat<span class="check">✓</span>
@@ -279,7 +279,7 @@
     <div class="caption" id="caption"></div>
     <div class="dots" id="dots" role="group" aria-label="Choose a demo">
       <button type="button" class="dot" data-scene="0" aria-label="Show the Tree of Thought demo"></button>
-      <button type="button" class="dot" data-scene="1" aria-label="Show the Fast Think demo"></button>
+      <button type="button" class="dot" data-scene="1" aria-label="Show the Repeat Boost demo"></button>
     </div>
     <p class="demo-note">A simplified illustration of how it works.</p>
   </div>
@@ -296,9 +296,9 @@
            surfaces the best one — and you watch it weigh the options in a live, foldable tree.</p>
       </div>
       <div class="card">
-        <div class="ct"><h3>Fast Think</h3></div>
-        <p>Tired of waiting on long answers? Fast Think gives you the same reply with far less waiting —
-           a speculative drafter races ahead so the text lands in bursts.</p>
+        <div class="ct"><h3>Repeat Boost</h3></div>
+        <p>Generating code, JSON, or anything repetitive? Repeat Boost returns the same reply with
+           less waiting — a speculative drafter reuses the parts that repeat, so the text lands in bursts.</p>
       </div>
     </div>
   </section>
@@ -358,9 +358,12 @@
       answer: 'Go with an evening garden theme for ~12 on a free Saturday — lock the guest list and the date first, then venue and food fall into place.'
     },
     fast: {
-      prompt: 'Summarize the water cycle in one sentence.',
-      answer: 'Water evaporates from the sea, condenses into clouds, falls as rain or snow, and flows back downhill to the sea.',
-      bursts: [3, 2, 4, 2, 3]   // variable multi-token bursts = the speculative-acceptance signature
+      // A prompt whose output repeats by construction — every line replays the
+      // same opening phrase. That repetition is exactly what the n-gram drafter
+      // accepts in bulk, so it is the honest showcase for Repeat Boost.
+      prompt: 'Write a poem where every line begins with "Quiet falling snow".',
+      answer: 'Quiet falling snow blankets the road, Quiet falling snow softens the light, Quiet falling snow hushes the town, Quiet falling snow drifts into dawn.',
+      bursts: [3, 3]   // the repeated 3-word opening is accepted in one burst, then the line's own words
     }
   };
 
@@ -558,7 +561,7 @@
     await sleep(2200, myGen);
   }
 
-  // ============== Scene 1: Fast Think — speculative decoding, same prompt twice ==============
+  // ============== Scene 1: Repeat Boost — speculative decoding, same prompt twice ==============
   async function sceneFastThink(myGen){
     var d = SCENARIO.fast;
     // First pass: the normal Chat profile, token by token.
@@ -574,10 +577,10 @@
     addGenerationPerformance(a1, '19 tok/s');
     await sleep(900, myGen);
 
-    // Switch profiles: open the menu, pick Fast Think.
-    setCaption('Switch to Fast Think — same model, far less waiting.');
+    // Switch profiles: open the menu, pick Repeat Boost.
+    setCaption('Switch to Repeat Boost — same model, far less waiting.');
     menu.classList.add('show'); await sleep(680, myGen);
-    setProfile('Fast Think', 'fast'); await sleep(520, myGen);
+    setProfile('Repeat Boost', 'fast'); await sleep(520, myGen);
     menu.classList.remove('show');
     await sleep(360, myGen);
 
@@ -586,7 +589,7 @@
     await sleep(220, myGen);
     var a2 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
     transcript.appendChild(a2);
-    setCaption('Same answer, much less waiting — the text lands in quick bursts.');
+    setCaption('Same answer — the repeated opening lands in quick bursts.');
     await streamBursts(a2.querySelector('.bubble'), d.answer, d.bursts, 150, myGen); // chunky + quicker
     addGenerationPerformance(a2, '25 tok/s');
     await sleep(2200, myGen);
@@ -617,7 +620,7 @@
     transcript.appendChild(col);
   }
   function stillFast(){
-    clear(); setProfile('Fast Think', 'fast');
+    clear(); setProfile('Repeat Boost', 'fast');
     userRow(SCENARIO.fast.prompt);
     var a = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
     a.querySelector('.bubble').textContent = SCENARIO.fast.answer;
@@ -629,13 +632,13 @@
     { run: sceneTreeOfThought, still: stillTot,
       pausedCaption: 'Animation paused (reduced motion). Tree of Thought explores the options and picks the best.' },
     { run: sceneFastThink, still: stillFast,
-      pausedCaption: 'Animation paused (reduced motion). Fast Think gives the same answer, much faster.' }
+      pausedCaption: 'Animation paused (reduced motion). Repeat Boost gives the same answer, much faster.' }
   ];
 
   // Error fallback: a clean, honest static frame (the lead Tree of Thought scene).
   function renderStaticFallback(){
     stillTot();
-    setCaption('Tree of Thought and Fast Think — two ways this model can think.');
+    setCaption('Tree of Thought and Repeat Boost — two ways this model can think.');
     setActiveDot(0);
   }
 

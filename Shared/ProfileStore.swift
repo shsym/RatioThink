@@ -108,7 +108,7 @@ public enum ProfileStoreError: Error, CustomStringConvertible, Equatable {
 ///   2. `.seedFailed` — first-launch chat seed write failed AND the
 ///      directory is still empty. Cleared as soon as a scan finds at
 ///      least one `*.toml` (user / external process repaired it).
-///   3. `.seedFailed` — the existence-gated built-in (Fast Think) seed
+///   3. `.seedFailed` — the existence-gated built-in (Repeat Boost) seed
 ///      write failed (review v1 F1). Surfaces regardless of whether the
 ///      directory has other profiles, since the built-in is seeded into
 ///      populated installs; not cleared by a non-empty scan.
@@ -342,23 +342,23 @@ public final class ProfileStore: ObservableObject {
   /// no-op on fresh installs.
   public static let defaultProfileID = "chat"
 
-  /// Built-in "Fast Think" profile id (#426). A second seeded profile that
+  /// Built-in "Repeat Boost" profile id (#426). A second seeded profile that
   /// turns on the chat-apc speculative drafter. Greedy by definition
   /// (temperature 0) so drafting actually engages — see
   /// `ChatSendController.makeRequest`.
   public static let defaultFastThinkProfileID = "fast-think"
 
-  /// Filename for the seeded Fast Think profile.
+  /// Filename for the seeded Repeat Boost profile.
   public static let defaultFastThinkFilename = "fast-think.toml"
 
-  /// Seed body for the Fast Think profile. Same model + inferlet as the
+  /// Seed body for the Repeat Boost profile. Same model + inferlet as the
   /// default Chat profile (so selecting it is a silent same-model swap,
   /// no reload), but greedy (`temperature = 0`) with `[speculation]`
   /// enabled. `leader_len`/`draft_len` are omitted so the inferlet applies
   /// its #418 defaults (1 / 3).
   public static let defaultFastThinkTOML: String = """
   id = "fast-think"
-  name = "Fast Think"
+  name = "Repeat Boost"
   icon = "bolt"
   model = "\(defaultChatModelID)"
   inferlet = "chat-apc"
@@ -421,7 +421,7 @@ public final class ProfileStore: ObservableObject {
   private var _entries: [ProfileLoadResult] = []
   private var _lastSeedError: ProfileStoreError?
   private var _lastScanError: ProfileStoreError?
-  /// Write failure from the existence-gated built-in (Fast Think) seed
+  /// Write failure from the existence-gated built-in (Repeat Boost) seed
   /// (review v1 F1). Distinct from `_lastSeedError` (the empty-dir chat
   /// seed): the built-in is seeded into installs that ALREADY have
   /// profiles, so its failure must surface even when `_entries` is
@@ -617,7 +617,7 @@ public final class ProfileStore: ObservableObject {
       // already lists it. Independent of the dir-empty seed, so existing
       // installs get it too.
       self.backfillTreeOfThoughtProfile()
-      // Ensure the built-in Fast Think profile exists even on installs
+      // Ensure the built-in Repeat Boost profile exists even on installs
       // that already seeded chat.toml (the empty-dir seed above is a no-op
       // there). Runs before `reloadLocked()` below so the initial scan
       // picks it up. (#426)
@@ -630,7 +630,7 @@ public final class ProfileStore: ObservableObject {
       let readResult = self.readActiveProfileIDFromDisk()
       self.stateLock.withLock {
         self._lastSeedError = seed.dirError
-        // The built-in (Fast Think) seed error rides its own channel: it
+        // The built-in (Repeat Boost) seed error rides its own channel: it
         // is seeded into populated dirs, so it must surface even when
         // `_entries` is non-empty (review v1 F1) — `_lastSeedError` is
         // gated on an empty dir and cleared by the next non-empty scan.
@@ -925,7 +925,7 @@ public final class ProfileStore: ObservableObject {
     }
   }
 
-  /// The speculative-decoding ("Fast Think") settings a profile carries,
+  /// The speculative-decoding ("Repeat Boost") settings a profile carries,
   /// or `nil` when the profile has no `[speculation]` section / does not
   /// exist / failed to parse. `ChatScaffoldView.sendAssistantTurn` reads
   /// this for the chat's selected profile and threads it into the request
@@ -1468,11 +1468,11 @@ public final class ProfileStore: ObservableObject {
     return SeedResult(dirError: nil, markerError: markerError)
   }
 
-  /// Ensure the built-in "Fast Think" profile exists (#426). Unlike
+  /// Ensure the built-in "Repeat Boost" profile exists (#426). Unlike
   /// `seedDefaultsIfEmpty` (gated on an empty dir), this writes
   /// `fast-think.toml` whenever it is ABSENT — so installs that already
   /// have a `chat.toml` (i.e. every install past first launch) still gain
-  /// Fast Think on the next start. Existence-gated, so a user's edits to
+  /// Repeat Boost on the next start. Existence-gated, so a user's edits to
   /// the file survive; deleting it re-creates it next launch, which is the
   /// accepted contract for a built-in default (edit it, don't delete it).
   /// Never touches the active-profile marker — the default selection stays
@@ -1485,11 +1485,11 @@ public final class ProfileStore: ObservableObject {
     if FileManager.default.fileExists(atPath: target.path) { return nil }
     do {
       try Self.defaultFastThinkTOML.write(to: target, atomically: true, encoding: .utf8)
-      Log.store.info("seeded built-in Fast Think profile at \(target.path, privacy: .public)")
+      Log.store.info("seeded built-in Repeat Boost profile at \(target.path, privacy: .public)")
       return nil
     } catch {
       let underlying = String(describing: error)
-      Log.store.error("seed Fast Think profile failed: \(underlying, privacy: .public)")
+      Log.store.error("seed Repeat Boost profile failed: \(underlying, privacy: .public)")
       return .seedFailed(path: target.path, underlying: underlying)
     }
   }
@@ -1851,7 +1851,7 @@ public final class ProfileStore: ObservableObject {
   /// Caller must hold `stateLock`. Scan errors take priority over
   /// seed errors (scan reflects the most recent FS interaction); the
   /// empty-dir chat seed error only surfaces while the directory is
-  /// still empty. The built-in (Fast Think) seed error surfaces
+  /// still empty. The built-in (Repeat Boost) seed error surfaces
   /// regardless of `_entries.isEmpty` — its whole purpose is populated
   /// installs (review v1 F1) — at lowest priority, since a scan failure
   /// or a failed empty-dir chat seed is the more actionable signal.

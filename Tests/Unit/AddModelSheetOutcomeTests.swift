@@ -70,13 +70,13 @@ final class AddModelSheetOutcomeTests: XCTestCase {
       row: row,
       affectedProfiles: [
         ProfileModelReference(id: "chat", name: "Chat"),
-        ProfileModelReference(id: "fast-think", name: "Fast Think"),
+        ProfileModelReference(id: "fast-think", name: "Repeat Boost"),
       ]
     )
 
     XCTAssertTrue(message.contains("2 profiles use this model as its default"),
                   "message must show the affected count; got: \(message)")
-    XCTAssertTrue(message.contains("Chat, Fast Think"),
+    XCTAssertTrue(message.contains("Chat, Repeat Boost"),
                   "message must name affected profiles; got: \(message)")
     XCTAssertTrue(message.contains("profile defaults will be cleared"),
                   "message must make the destructive profile cleanup explicit; got: \(message)")
@@ -98,7 +98,7 @@ final class AddModelSheetOutcomeTests: XCTestCase {
     let shared = "deleted-model.gguf"
     for (filename, id, name) in [
       ("chat.toml", "chat", "Chat"),
-      ("fast.toml", "fast", "Fast Think"),
+      ("fast.toml", "fast", "Repeat Boost"),
     ] {
       let body = """
       id = "\(id)"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Fast Think (speculative decoding) correctness smoke + measurement (#510,
+# Repeat Boost (speculative decoding) correctness smoke + measurement (#510,
 # absorbs #430).
 #
 # Runs the chat-apc speculative-decode suites against pie's **portable

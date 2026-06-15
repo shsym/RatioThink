@@ -728,7 +728,7 @@ final class ChatSendControllerTests: XCTestCase {
       .first
   }
 
-  // MARK: - speculation injection (#426 Fast Think)
+  // MARK: - speculation injection (#426 Repeat Boost)
 
   /// Drive `send` and return the single `ChatRequest` the engine saw.
   private func capturedRequest(
@@ -887,7 +887,7 @@ final class ChatSendControllerTests: XCTestCase {
     XCTAssertEqual(req.sampling.temperature, 0.7)
   }
 
-  /// End-to-end golden tie: the seeded built-in "Fast Think" profile must
+  /// End-to-end golden tie: the seeded built-in "Repeat Boost" profile must
   /// produce exactly the inferlet-facing body that engages the #418
   /// drafter — `speculation.enabled == true` AND a greedy top-level
   /// `temperature == 0`. Drives the real request builder with the seeded
@@ -895,8 +895,12 @@ final class ChatSendControllerTests: XCTestCase {
   /// the chokepoint forces greedy regardless. (#426)
   func test_seeded_fast_think_profile_yields_drafting_body() async throws {
     let profile = try Profile.parse(toml: ProfileStore.defaultFastThinkTOML)
+    XCTAssertEqual(profile.name, "Repeat Boost",
+                   "seeded built-in profile's user-facing display name must be 'Repeat Boost' (#627)")
+    XCTAssertEqual(profile.id, ProfileStore.defaultFastThinkProfileID,
+                   "the on-disk slug must stay 'fast-think' so existing profiles keep working (#627)")
     XCTAssertEqual(profile.speculation, Profile.Speculation(enabled: true),
-                   "seeded Fast Think profile must enable speculation")
+                   "seeded Repeat Boost profile must enable speculation")
 
     let req = try await capturedRequest(
       speculation: profile.speculation,
@@ -907,7 +911,7 @@ final class ChatSendControllerTests: XCTestCase {
     let spec = try XCTUnwrap(body["speculation"] as? [String: Any])
     XCTAssertEqual(spec["enabled"] as? Bool, true)
     XCTAssertEqual(body["temperature"] as? Double, 0,
-                   "Fast Think body must be greedy (temp 0) so the drafter engages")
+                   "Repeat Boost body must be greedy (temp 0) so the drafter engages")
   }
 
   // MARK: - response_format injection (#572 JSON Think)

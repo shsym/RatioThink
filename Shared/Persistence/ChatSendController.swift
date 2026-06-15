@@ -609,7 +609,7 @@ public final class ChatSendController: ObservableObject {
   private static func makeRequest(chat: Chat, options: ChatSendRequestOptions) -> ChatRequest {
     let turns = transcriptTurns(chat: chat, options: options)
     // Authoritative speculation coupling (#426). An enabled-speculation
-    // profile is a greedy "Fast Think" profile: the chat-apc drafter only
+    // profile is a greedy "Repeat Boost" profile: the chat-apc drafter only
     // engages when the request is greedy (temperature 0, #418), so force it
     // here regardless of the toolbar's sampling. A profile with no
     // `[speculation]` section, or one explicitly disabled, attaches no field

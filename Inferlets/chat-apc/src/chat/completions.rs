@@ -3534,7 +3534,7 @@ async fn handle_streaming(
 
     // #572: JSON Think runs the dedicated two-phase constrained path and
     // returns its own terminal frames. The single-loop path below is left
-    // byte-identical for every non-JSON request (normal / Fast Think /
+    // byte-identical for every non-JSON request (normal / Repeat Boost /
     // ToT / tool_choice). JSON mode is mutually exclusive with a forced
     // tool_choice (400-rejected upstream), so `tool_constraint` is None
     // here and the tool surface is irrelevant.

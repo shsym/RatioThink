@@ -8,7 +8,7 @@ source "$ROOT/Scripts/e2e-prep.sh"
 TAG="chat gui e2e"
 # Serve the seeded GGUF the App's default "chat" profile resolves, under its
 # slug — so `/v1/models` reports the slug and the chat menu renders its leaf
-# (`Qwen3-0.6B-Q8_0.gguf`). S258 (send) and S426 (Fast Think profile select +
+# (`Qwen3-0.6B-Q8_0.gguf`). S258 (send) and S426 (Repeat Boost profile select +
 # real reply, which also asserts the seeded model surfaces in the chat menu)
 # both consume it.
 SLUG="Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"

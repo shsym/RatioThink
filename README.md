@@ -30,10 +30,14 @@ a prompt box. Rational adds **profiles** — named *thinking modes* you switch i
 one click, each a saved preset bundling a model, sampling, a system prompt, and a
 chat workflow.
 
-- **Fast Think — speculative decoding by switching a profile.** Runs the same
-  model greedily with a speculative drafter — fewer waits, identical output — on
-  the bundled Apple-Silicon engine. No flags, no separate model: just pick it.
-  It currently implements [Cacheback algorithm](https://www.yecl.org/publications/ma2025emnlp.pdf).
+- **Repeat Boost — speculative decoding by switching a profile.** Runs the same
+  model greedily with a speculative drafter: the output is identical, but a
+  *repetitive* answer — code, JSON, structured edits — lands with less waiting.
+  The win scales with how much the output repeats, so it shines on a prompt
+  whose output repeats by construction, e.g. *"Write a poem where every line
+  begins with the words 'Quiet falling snow'."* No flags, no separate model:
+  just pick it. It currently implements the
+  [Cacheback algorithm](https://www.yecl.org/publications/ma2025emnlp.pdf).
 - **Tree of Thought — a search tree, in one click.** The Tree of Thought profile
   turns one question into a scored search: the engine branches, scores each branch
   1–10, and keeps the best beam — shown live in a foldable tree, then the chosen
@@ -147,7 +151,7 @@ RatioThink/
 ## Documentation
 
 - [`docs/landing.html`](docs/landing.html) — an animated walkthrough of Rational's
-  thinking modes (profiles, the live Tree of Thought search, and Fast Think
+  thinking modes (profiles, the live Tree of Thought search, and Repeat Boost
   speculative decoding). Open it in a browser.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the app, helper, pie engine, and
   `chat-apc` inferlet fit together (plus an interactive [`architecture.html`](docs/architecture.html)).

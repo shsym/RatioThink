@@ -1,7 +1,7 @@
 import Foundation
 
 /// Persisted per-profile speculative-decode telemetry (#621). Each chat
-/// turn on a "Fast Think" profile ends with a terminal `spec_metrics` SSE
+/// turn on a "Repeat Boost" profile ends with a terminal `spec_metrics` SSE
 /// frame (chat-apc #418); `ChatSendController` hands the decoded
 /// `SpecMetrics` here so the ProfileEditor can surface a read-only "last
 /// run" badge without re-running inference.

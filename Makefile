@@ -464,7 +464,7 @@ bench-apc-real: $(LOGDIR) ## BENCHMARK: real-engine APC cold/miss vs warm/hit ch
 	  [ -f "$${OUT%.json}.md" ] && echo "summary: $${OUT%.json}.md"; \
 	  exit $$status
 
-test-spec-smoke: $(LOGDIR) ## Fast Think real-model correctness smoke (opt-in, portable Metal, needs uv + real Qwen3-0.6B weights). Short-window greedy spec==plain (64 tok; #592) + ≥1 accepted draft + forced-tool gate.
+test-spec-smoke: $(LOGDIR) ## Repeat Boost real-model correctness smoke (opt-in, portable Metal, needs uv + real Qwen3-0.6B weights). Short-window greedy spec==plain (64 tok; #592) + ≥1 accepted draft + forced-tool gate.
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-spec-smoke.log; \
 	  SMOKE_ONLY=1 Scripts/run-spec-bench.sh 2>&1 | tee $$LOG | tail -40; \
@@ -472,7 +472,7 @@ test-spec-smoke: $(LOGDIR) ## Fast Think real-model correctness smoke (opt-in, p
 	  echo "log: $$LOG"; \
 	  exit $$status
 
-test-spec-bench: $(LOGDIR) ## Fast Think vs baseline measurement harness (opt-in, portable Metal, needs uv + real weights). Latency + draft-acceptance metrics → JSON artifact. Knobs: MODEL, MAX_TOKENS, REPS, BENCH_OUT.
+test-spec-bench: $(LOGDIR) ## Repeat Boost vs baseline measurement harness (opt-in, portable Metal, needs uv + real weights). Latency + draft-acceptance metrics → JSON artifact. Knobs: MODEL, MAX_TOKENS, REPS, BENCH_OUT.
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-spec-bench.log; \
 	  Scripts/run-spec-bench.sh 2>&1 | tee $$LOG | tail -60; \

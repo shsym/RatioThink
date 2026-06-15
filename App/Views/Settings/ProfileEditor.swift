@@ -97,7 +97,21 @@ struct ProfileEditor: View {
       if let icon = profile.icon, !icon.isEmpty {
         Image(systemName: icon).foregroundStyle(.secondary)
       }
-      Text(profile.name).font(.title3).bold()
+      VStack(alignment: .leading, spacing: 2) {
+        Text(profile.name).font(.title3).bold()
+        // Honest framing for the speculative-drafting ("Repeat Boost")
+        // profile: n-gram cacheback only wins when the output repeats,
+        // so promise a modest speedup on repetitive content rather than
+        // a blanket "faster". Tied to the mechanism (speculation enabled),
+        // not the profile name, so a user's own greedy+speculation
+        // profile gets the same honest subtitle.
+        if profile.speculation?.enabled == true {
+          Text("Modest speedup on repetitive output (code, JSON, edits).")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier("ProfileEditorRepeatBoostSubtitle")
+        }
+      }
       Spacer()
       Text(profile.id).monospaced().foregroundStyle(.tertiary)
     }
@@ -322,7 +336,7 @@ struct ProfileEditor: View {
     }
   }
 
-  /// Read-only speculative-decode diagnostics for a "Fast Think" profile
+  /// Read-only speculative-decode diagnostics for a "Repeat Boost" profile
   /// (`[speculation]` present). Surfaces the most recent run's accept ratio
   /// + throughput from `SpecMetricsStore`. This is a DIAGNOSTICS badge, not
   /// an editable field: the editor edits config, while accept ratio is

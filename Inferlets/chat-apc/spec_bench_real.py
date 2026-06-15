@@ -1,6 +1,6 @@
-"""Real-model Fast Think (speculative decoding) measurement harness (#510).
+"""Real-model Repeat Boost (speculative decoding) measurement harness (#510).
 
-Where `spec_smoke_real.py` PROVES Fast Think is *correct* (greedy
+Where `spec_smoke_real.py` PROVES Repeat Boost is *correct* (greedy
 token-equivalence + at least one accepted draft), this harness *quantifies*
 whether it helps and why. It boots `pie serve` with the production
 **portable Metal** driver against a real cached model and, for each
@@ -583,7 +583,7 @@ def _cache_cell(spc: dict, key: str) -> str:
 
 def _print_summary(artifact: dict) -> None:
     print("\n" + "=" * 72)
-    print(f"Fast Think measurement — {artifact['model']} ({artifact['driver']})")
+    print(f"Repeat Boost measurement — {artifact['model']} ({artifact['driver']})")
     print(f"max_tokens={artifact['decode_settings']['max_tokens']} "
           f"reps={artifact['decode_settings']['reps']}")
     print("=" * 72)

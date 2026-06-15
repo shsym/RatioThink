@@ -429,7 +429,7 @@ final class LocalAPIStateTests: XCTestCase {
     """)
     let fast = try Profile.parse(toml: """
     id = "fast-think"
-    name = "Fast Think"
+    name = "Repeat Boost"
     model = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
     inferlet = "chat-apc"
     """)
@@ -453,7 +453,7 @@ final class LocalAPIStateTests: XCTestCase {
     )
 
     XCTAssertEqual(options.map(\.id), ["chat", "fast-think"])
-    XCTAssertEqual(options.map(\.title), ["Chat", "Fast Think"])
+    XCTAssertEqual(options.map(\.title), ["Chat", "Repeat Boost"])
     XCTAssertEqual(options.map(\.modelDisplayName), ["Qwen3-0.6B-Q8_0.gguf", "Qwen3-0.6B-Q8_0.gguf"])
     XCTAssertEqual(options.map(\.isRuntimeProfile), [false, true])
   }

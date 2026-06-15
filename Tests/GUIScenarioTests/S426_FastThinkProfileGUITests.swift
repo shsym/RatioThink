@@ -1,6 +1,6 @@
 import XCTest
 
-/// S426 — the seeded "Fast Think" speculative-decoding profile works
+/// S426 — the seeded "Repeat Boost" speculative-decoding profile works
 /// end-to-end through the real GUI against a real pie engine.
 ///
 /// Proves the user-facing path that the unit/integration tier cannot:
@@ -50,7 +50,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
       "\(Self.configPath) must define PIE_TEST_GUI_HOME")
     let model = config["PIE_TEST_CHAT_MODEL_PIN"] ?? "Qwen/Qwen3-0.6B"
 
-    // The seeded Fast Think profile uses the SAME default model as Chat, so
+    // The seeded Repeat Boost profile uses the SAME default model as Chat, so
     // selecting it is a same-model swap. Pinning `.running` (S302 seam) lets
     // the `/v1/models` reconcile resolve `residentModelID` to the served slug,
     // making the swap silent (no confirm popover) — exactly how it behaves
@@ -82,7 +82,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     // Qwen leaf can be present from the profile-default option before
     // `/v1/models` reconciliation. The toolbar accessibility value only becomes
     // the unannotated concrete served slug once resident reconciliation has
-    // landed, which is what makes the Fast Think profile swap silent.
+    // landed, which is what makes the Repeat Boost profile swap silent.
     XCTAssertTrue(waitForResidentModelValue(modelMenu, model, timeout: 15),
                   "toolbar.model never reflected reconciled resident model \(model); title=\(modelMenu.title), value=\(String(describing: modelMenu.value)); app tree: \(app.debugDescription)")
 
@@ -95,7 +95,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
                   "seeded Qwen3 GGUF missing from chat model menu (reconcile did not land); app tree: \(app.debugDescription)")
     app.typeKey(.escape, modifierFlags: [])
 
-    // 1) Fast Think appears in the profile switcher and is selectable.
+    // 1) Repeat Boost appears in the profile switcher and is selectable.
     let profileMenu = app.menuButtons["toolbar.profile"]
     XCTAssertTrue(profileMenu.waitForExistence(timeout: 10),
                   "profile switcher (toolbar.profile) missing; app tree: \(app.debugDescription)")
@@ -116,7 +116,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
       return
     }
 
-    // 2) Send a prompt under Fast Think and assert a real reply streams back.
+    // 2) Send a prompt under Repeat Boost and assert a real reply streams back.
     let composer = app.descendants(matching: .any)
       .matching(identifier: "composer.text")
       .firstMatch
@@ -134,7 +134,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     send.click()
 
     guard waitForAssistantEchoInAssistantBubble(visibleAssistantEcho, in: app, timeout: 120) else {
-      XCTFail("assistant reply did not stream back under Fast Think; app tree: \(app.debugDescription)")
+      XCTFail("assistant reply did not stream back under Repeat Boost; app tree: \(app.debugDescription)")
       return
     }
   }
@@ -150,7 +150,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
     app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = model
     // Pin `.running` so the model reconcile resolves the resident model and
-    // the same-model Fast Think swap is silent (S302 DEBUG seam; the GUI
+    // the same-model Repeat Boost swap is silent (S302 DEBUG seam; the GUI
     // suite runs the Debug build).
     app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
@@ -258,7 +258,7 @@ final class S426_FastThinkProfileGUITests: XCTestCase {
   private static func loadConfig() throws -> [String: String] {
     let url = URL(fileURLWithPath: configPath)
     guard FileManager.default.fileExists(atPath: url.path) else {
-      throw XCTSkip("Fast Think GUI E2E config missing at \(configPath); run Scripts/run-chat-gui-e2e.sh")
+      throw XCTSkip("Repeat Boost GUI E2E config missing at \(configPath); run Scripts/run-chat-gui-e2e.sh")
     }
     let text = try String(contentsOf: url, encoding: .utf8)
     return text
