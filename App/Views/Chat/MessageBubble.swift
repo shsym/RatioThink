@@ -22,15 +22,28 @@ import os
 /// the network until an explicit policy lands. Review v1 F3.
 struct MessageBubble: View {
   let message: ChatMessageItem
+  /// Edit-and-resend hook (#624). Non-nil only for an editable prior user
+  /// turn (the transcript passes `nil` while a turn is streaming and for
+  /// assistant/system rows), which is what gates the Edit affordance. The
+  /// closure receives the new text and forks the conversation from here.
+  var onEdit: ((String) -> Void)? = nil
+
+  @State private var isEditing = false
+  @State private var editText = ""
 
   var body: some View {
     switch message.role {
     case .user:
       HStack {
         Spacer(minLength: 60)
-        bubble(background: Color.accentColor,
-               foreground: .white,
-               alignment: .trailing)
+        if isEditing {
+          editor
+        } else {
+          bubble(background: Color.accentColor,
+                 foreground: .white,
+                 alignment: .trailing)
+            .modifier(EditAffordance(enabled: onEdit != nil, begin: beginEditing))
+        }
       }
     case .assistant:
       HStack {
@@ -72,6 +85,46 @@ struct MessageBubble: View {
     }
   }
 
+  // MARK: - inline edit (#624)
+
+  private func beginEditing() {
+    editText = message.content
+    isEditing = true
+  }
+
+  private func commitEdit() {
+    let trimmed = editText.trimmingCharacters(in: .whitespacesAndNewlines)
+    isEditing = false
+    guard !trimmed.isEmpty else { return }
+    onEdit?(trimmed)
+  }
+
+  /// Inline editor that replaces the user bubble while editing. Saving
+  /// forks the conversation from this turn and re-runs it; Cancel restores
+  /// the bubble untouched. Right-aligned to match the user bubble.
+  private var editor: some View {
+    VStack(alignment: .trailing, spacing: 6) {
+      TextEditor(text: $editText)
+        .font(.body)
+        .frame(minHeight: 60, maxHeight: 200)
+        .padding(6)
+        .background(
+          RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .strokeBorder(Color.accentColor.opacity(0.6))
+        )
+        .accessibilityIdentifier("message.edit.field")
+      HStack(spacing: 8) {
+        Button("Cancel") { isEditing = false }
+          .accessibilityIdentifier("message.edit.cancel")
+        Button("Save & Resend") { commitEdit() }
+          .keyboardShortcut(.return, modifiers: .command)
+          .buttonStyle(.borderedProminent)
+          .accessibilityIdentifier("message.edit.save")
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .trailing)
+  }
+
   private func bubble(background: Color, foreground: Color, alignment: HorizontalAlignment) -> some View {
     Markdown(message.content)
       .markdownTextStyle(\.text) { ForegroundColor(foreground) }
@@ -86,6 +139,31 @@ struct MessageBubble: View {
       .padding(.vertical, 8)
       .background(background, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
       .frame(maxWidth: .infinity, alignment: alignment == .trailing ? .trailing : .leading)
+  }
+}
+
+// MARK: - edit affordance (#624)
+
+/// Adds a right-click "Edit" item to an editable user bubble. A no-op
+/// passthrough when `enabled` is false (assistant/system rows, or while a
+/// turn is streaming) so those bubbles get no menu.
+private struct EditAffordance: ViewModifier {
+  let enabled: Bool
+  let begin: () -> Void
+
+  func body(content: Content) -> some View {
+    if enabled {
+      content.contextMenu {
+        Button {
+          begin()
+        } label: {
+          Label("Edit", systemImage: "pencil")
+        }
+        .accessibilityIdentifier("message.user.edit")
+      }
+    } else {
+      content
+    }
   }
 }
 

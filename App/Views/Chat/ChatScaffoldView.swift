@@ -31,6 +31,9 @@ struct ChatScaffoldView: View {
   /// popover so they derive the resident/offline distinction from the single
   /// published `indicator`.
   @EnvironmentObject private var engineLifecycle: EngineLifecycle
+  /// App-scoped navigation state — set on an edit→fork (#624) to route the
+  /// shell to the new chat and hand it the one-shot resend signal.
+  @EnvironmentObject private var windowState: WindowState
   /// Shown when a send is blocked because no model resolves yet. #326
   /// decides the model-availability action (Load / Download / unavailable
   /// via the live `noModelAction`); #397 layers the engine/model lifecycle
@@ -267,8 +270,14 @@ struct ChatScaffoldView: View {
           onDismiss: MissingModelRecovery.engineFailureDismissable(
             engineStatus: engineStatusStore.status) ? { engineActionError = nil } : nil)
       }
-      TranscriptView(chat: chat)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      TranscriptView(
+        chat: chat,
+        isSending: sendController.isInFlight,
+        onEditAndResend: { message, newText in
+          forkAndResend(from: message, in: chat, newContent: newText)
+        }
+      )
+      .frame(maxWidth: .infinity, maxHeight: .infinity)
       ComposerView(
         chat: chat,
         viewModel: viewModel,
@@ -334,6 +343,17 @@ struct ChatScaffoldView: View {
       // this view appeared (no .onChange fires) — evaluate the launch ask
       // here too; the once-flag keeps it from double-prompting.
       maybePromptEngineStartOnLaunch()
+    }
+    // #624: a fork-and-resend navigates here (a freshly-mounted scaffold,
+    // keyed `.id(chatID)` by `DetailView`). Consume the one-shot handoff
+    // once per mount and kick off the resent assistant turn through the
+    // SAME `sendAssistantTurn` path a normal send uses (recovery-gate and
+    // no-model gate ride it for free). Runs in THIS scaffold so the turn is
+    // owned by the new chat's `sendController`.
+    .task(id: chat.id) {
+      guard windowState.pendingForkResendChatID == chat.id else { return }
+      windowState.pendingForkResendChatID = nil
+      sendAssistantTurn(for: chat)
     }
     .onChange(of: viewModel.selectedProfileID) { _, new in
       // Mirror toolbar swaps back into the persistent chat — the
@@ -423,6 +443,33 @@ struct ChatScaffoldView: View {
       // on the leave-`.running` edge; nothing to do here.
       break
     }
+  }
+
+  /// Edit a prior user turn and re-run the conversation from there (#624).
+  /// Non-destructive FORK: copy `chat` up to and including `message` (with
+  /// `newContent` substituted) into a new chat, navigate to it, and let the
+  /// freshly-mounted scaffold fire the resend via the `pendingForkResend`
+  /// handoff. The source chat is left fully intact.
+  private func forkAndResend(from message: Message, in chat: Chat, newContent: String) {
+    // Defensive: the affordance is already hidden mid-stream, but never
+    // fork while this chat's turn is in flight.
+    guard !sendController.isInFlight else { return }
+    let trimmed = newContent.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    guard let newID = ChatFork.fork(
+      chat: chat,
+      at: message,
+      newContent: trimmed,
+      in: modelContext,
+      persistenceStatus: persistenceStatus,
+      contextLabel: "ChatScaffoldView.forkAndResend"
+    ) else { return }
+    // Hand the resend to the new scaffold, then navigate. `DetailView`
+    // remounts `ChatScaffoldView` for `newID`, whose `.task(id:)` consumes
+    // the signal and sends.
+    windowState.pendingForkResendChatID = newID
+    windowState.selectedSection = .chats
+    windowState.selectedItemID = newID
   }
 
   private func sendAssistantTurn(for chat: Chat) {

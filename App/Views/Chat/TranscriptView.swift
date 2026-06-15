@@ -16,6 +16,13 @@ import SwiftUI
 /// changed."
 struct TranscriptView: View {
   let chat: Chat
+  /// True while a turn is streaming — suppresses the edit affordance so a
+  /// prior user turn can't be forked mid-stream (#624).
+  var isSending: Bool = false
+  /// Edit-and-resend hook (#624): fork the conversation from `message`
+  /// (a user turn) with new text. Holds the persisted `Message` the
+  /// renderer's value projection can't carry up on its own.
+  var onEditAndResend: (Message, String) -> Void = { _, _ in }
 
   var body: some View {
     ScrollViewReader { proxy in
@@ -25,8 +32,14 @@ struct TranscriptView: View {
             emptyStatePlaceholder
           }
           ForEach(sortedMessages) { msg in
-            MessageBubble(message: ChatMessageItem(msg))
-              .id(msg.id)
+            MessageBubble(
+              message: ChatMessageItem(msg),
+              // Editable only for a user turn, and never mid-stream.
+              onEdit: (!isSending && msg.role == ChatMessage.Role.user.rawValue)
+                ? { newText in onEditAndResend(msg, newText) }
+                : nil
+            )
+            .id(msg.id)
           }
           // Sentinel row so `scrollTo(.bottomSentinel)` lands at the
           // true visual bottom regardless of last-bubble height.

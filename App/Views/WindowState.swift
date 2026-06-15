@@ -32,6 +32,13 @@ final class WindowState: ObservableObject {
   @Published var isItemListHidden: Bool = false
   @Published var selectedSection: SidebarSection? = .chats
   @Published var selectedItemID: UUID? = nil
+  /// One-shot handoff for the edit→fork flow (#624). Set to the new
+  /// forked chat's id alongside `selectedItemID`; the freshly-mounted
+  /// `ChatScaffoldView` for that id consumes it once to kick off the
+  /// resent assistant turn, then clears it. Lives here (not on the fork
+  /// primitive) because the send must run in the NEW scaffold instance —
+  /// the one that owns the resent chat's `ChatSendController`.
+  @Published var pendingForkResendChatID: UUID? = nil
 
   func toggleSidebar() {
     columnVisibility = (columnVisibility == .all) ? .doubleColumn : .all
