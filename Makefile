@@ -57,6 +57,7 @@ define gui_suite_run
     $(2) \
     test 2>&1 | tee $$LOG | tail -30; \
   status=$${PIPESTATUS[0]}; \
+  if [ $$status -ne 0 ]; then Scripts/gui-testmanagerd-hint.sh "$$LOG"; fi; \
   rm -rf $(GUI_TMP_HOMES) 2>/dev/null || true; \
   echo "log: $$LOG"; \
   if [ "$$status" -ne 0 ]; then sandbox_diag_report_from_log "test-gui-$(1)" "$$LOG"; fi; \
@@ -493,6 +494,7 @@ test-gui-script: ## Fast preflight regressions for GUI/E2E wrapper scripts
 	Scripts/test-run-copy-gui-e2e.sh
 	Scripts/test-run-first-launch-package-e2e.sh
 	Scripts/test-run-first-launch-package-model-download-e2e.sh
+	Scripts/test-gui-testmanagerd-hint.sh
 
 test-gui-history: genproject ## Deterministic  GUI history/resume E2E — needs seated session
 	Scripts/run-resume-gui-history-e2e.sh
@@ -567,6 +569,7 @@ test-gui: genproject $(LOGDIR) ## GUI scenarios — full RatioThinkGUITests matr
 	    -parallel-testing-enabled NO \
 	    test 2>&1 | tee $$LOG | tail -30; \
 	  status=$${PIPESTATUS[0]}; \
+	  if [ $$status -ne 0 ]; then Scripts/gui-testmanagerd-hint.sh "$$LOG"; fi; \
 	  rm -rf $(GUI_TMP_HOMES) 2>/dev/null || true; \
 	  echo "log: $$LOG"; \
 	  if [ "$$status" -ne 0 ]; then sandbox_diag_report_from_log "test-gui" "$$LOG"; fi; \

@@ -398,6 +398,11 @@ large local GGUF unless the small-model path is proven or precisely blocked.
     `Qwen3-0.6B-Q8_0.gguf` at `test-models/` or set `PIE_TEST_MODEL` to the
     fixture path. That S4 path is a GGUF fixture path and is separate from the
     small HF cache path below.
+  - If a `make test-gui*` run dies at runner-init with `Failed to initialize
+    for UI testing: Timed out while enabling automation mode`, that is a wedged
+    `testmanagerd`, not a code/test failure. The GUI wrappers detect it and
+    print the fix: `sudo killall testmanagerd` (it auto-respawns), then re-run.
+    `caffeinate` and lone re-runs do not clear the wedge.
 
 ## Small-model real generation command
 

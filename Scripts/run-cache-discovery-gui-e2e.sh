@@ -111,5 +111,6 @@ xcodebuild -project RatioThink.xcodeproj \
   -only-testing:RatioThinkGUITests/S514_AddModelDuplicateGUITests/test_add_model_marks_installed_and_hf_cache_curated_rows \
   ENABLE_CODE_COVERAGE=NO 2>&1 | tee "$LOG"
 status=${PIPESTATUS[0]}
+[ "$status" -ne 0 ] && Scripts/gui-testmanagerd-hint.sh "$LOG"
 echo "cache-discovery gui e2e: xcodebuild exit=$status; log: $LOG"
 exit $status
