@@ -192,10 +192,14 @@ struct ModelLoadIndicator: View {
     }
   }
 
-  /// Tooltip text per state. The quiet dots carry their detail here
-  /// (especially `.starting`, whose amber dot has no inline text).
-  static func helpText(for state: EngineIndicatorState) -> String {
-    switch state {
+  /// Helper-aware tooltip (#412): when the background helper is not healthy
+  /// the ring is the story, so its message wins over the (stale/unknown)
+  /// engine detail. A healthy helper falls through to the per-state engine
+  /// tooltip — the quiet dots (especially `.starting`, whose amber dot has
+  /// no inline text) carry their detail here.
+  static func helpText(helper: HelperHealth, engine: EngineIndicatorState) -> String {
+    if let helperText = helperStatusText(helper) { return helperText }
+    switch engine {
     case .offline:
       return "Engine stopped"
     case let .starting(detail):
@@ -208,14 +212,6 @@ struct ModelLoadIndicator: View {
     case let .error(error):
       return "\(error.title): \(error.message)"
     }
-  }
-
-  /// Helper-aware tooltip (#412): when the background helper is not healthy
-  /// the ring is the story, so its message wins over the (stale/unknown)
-  /// engine detail. A healthy helper falls through to the engine tooltip.
-  static func helpText(helper: HelperHealth, engine: EngineIndicatorState) -> String {
-    if let helperText = helperStatusText(helper) { return helperText }
-    return helpText(for: engine)
   }
 
   /// Short message for a non-healthy background helper, or nil when healthy.
@@ -233,9 +229,11 @@ struct ModelLoadIndicator: View {
     }
   }
 
-  /// VoiceOver label per state.
-  static func accessibilityLabelText(for state: EngineIndicatorState) -> String {
-    switch state {
+  /// Helper-aware VoiceOver label (#412): helper trouble wins over the engine
+  /// label, mirroring the tooltip; otherwise it reads the per-state label.
+  static func accessibilityLabelText(helper: HelperHealth, engine: EngineIndicatorState) -> String {
+    if let helperText = helperStatusText(helper) { return helperText }
+    switch engine {
     case .offline:
       return "Engine stopped"
     case .starting:
@@ -248,13 +246,6 @@ struct ModelLoadIndicator: View {
     case let .error(error):
       return "\(error.title). \(error.message)"
     }
-  }
-
-  /// Helper-aware VoiceOver label (#412): helper trouble wins over the engine
-  /// label, mirroring the tooltip.
-  static func accessibilityLabelText(helper: HelperHealth, engine: EngineIndicatorState) -> String {
-    if let helperText = helperStatusText(helper) { return helperText }
-    return accessibilityLabelText(for: engine)
   }
 }
 

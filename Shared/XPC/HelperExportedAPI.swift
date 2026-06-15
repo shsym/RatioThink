@@ -1,10 +1,23 @@
 import Foundation
 import os
 
+/// Encodes a wire payload once at init time, centralizing the
+/// `do/encode/catch → preconditionFailure` pattern every pre-encoded XPC
+/// blob in this file shares. A Codable drift fails the encode loudly (the
+/// test bundle catches it) instead of letting a placeholder encode itself
+/// fail at reply time. `label` names the payload in the abort message.
+private func preEncodedXPC<T: Encodable>(_ value: T, _ label: String) -> Data {
+  do {
+    return try XPCPayload.encode(value)
+  } catch {
+    preconditionFailure("preEncodedXPC: failed to pre-encode \(label): \(error)")
+  }
+}
+
 /// Helper-side `PieHelperXPC` implementation.
 ///
 /// Phase 2.1 surface area is intentionally tiny: only `engineStatus`
-/// returns real data (`.stopped` until `PieSupervisor` is wired in
+/// returns real data (`.stopped` until `PieEngineHost` is wired in
 /// Phase 2.2). Every other selector returns
 /// `EngineError(.wireContractViolation, "Phase 2.2+ not yet
 /// implemented")` so a stray call from a future GUI build surfaces as
@@ -48,31 +61,22 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// time). `preconditionFailure` if even the static encode fails
   /// because that's a Codable drift the test bundle would catch.
   ///
-  /// Used as the fallback when no `PieSupervisor` is wired (early
-  /// Phase 2.2 bring-up + degraded init paths). Once a supervisor is
+  /// Used as the fallback when no `PieEngineHost` is wired (early
+  /// Phase 2.2 bring-up + degraded init paths). Once a host is
   /// present, `engineStatus` encodes the live state on demand.
-  private static let stoppedReplyData: Data = {
-    do {
-      return try XPCPayload.encode(EngineStatus.stopped)
-    } catch {
-      preconditionFailure("HelperExportedAPI: failed to pre-encode .stopped reply: \(error)")
-    }
-  }()
+  private static let stoppedReplyData: Data =
+    preEncodedXPC(EngineStatus.stopped, "EngineStatus.stopped reply")
 
   /// Single greppable choke point for the "not yet implemented" reply
   /// payload. Hand-encoded once at init so a future Codable drift
   /// can't make a placeholder encode itself fail.
-  private static let notImplementedErrorData: Data = {
-    let err = EngineError(
+  private static let notImplementedErrorData: Data = preEncodedXPC(
+    EngineError(
       code: .wireContractViolation,
       message: "RatioThinkHelper Phase 2.1 stub: selector not yet implemented (wire up in Phase 2.2+)"
-    )
-    do {
-      return try XPCPayload.encode(err)
-    } catch {
-      preconditionFailure("HelperExportedAPI: failed to pre-encode notImplemented error: \(error)")
-    }
-  }()
+    ),
+    "notImplemented error"
+  )
 
   /// Pre-encoded empty `[String]` reply for `listProfiles`. The wire
   /// contract types that slot as `Data` decodable to `[String]` —
@@ -80,13 +84,8 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// the GUI side, indistinguishable from wire corruption (review
   /// v2 F5). Encoded at type init so the catch path is provably
   /// dead.
-  private static let emptyProfilesData: Data = {
-    do {
-      return try XPCPayload.encode([String]())
-    } catch {
-      preconditionFailure("HelperExportedAPI: failed to pre-encode empty profiles list: \(error)")
-    }
-  }()
+  private static let emptyProfilesData: Data =
+    preEncodedXPC([String](), "empty profiles list")
 
   /// Pre-encoded `EngineStatus.failed(.wireContractViolation, …)`
   /// reply for the engineStatus encode-failure path (PR12 review v1
@@ -94,27 +93,17 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// indistinguishable from a real stopped engine; the GUI menu-bar
   /// dot rendered green-but-no-engine. This blob lets the dot render
   /// red with a structured cause.
-  private static let wireViolationStatusData: Data = {
-    do {
-      return try XPCPayload.encode(
-        EngineStatus.failed(
-          code: .wireContractViolation,
-          message: "engineStatus encode failed; see helper log"
-        )
-      )
-    } catch {
-      preconditionFailure("HelperExportedAPI: failed to pre-encode wireContractViolation status: \(error)")
-    }
-  }()
+  private static let wireViolationStatusData: Data = preEncodedXPC(
+    EngineStatus.failed(
+      code: .wireContractViolation,
+      message: "engineStatus encode failed; see helper log"
+    ),
+    "wireContractViolation status"
+  )
 
   private static let log = Logger(subsystem: "com.ratiothink.app.helper", category: "xpc.exported")
-  private static let identityData: Data = {
-    do {
-      return try XPCPayload.encode(HelperIdentity.current())
-    } catch {
-      preconditionFailure("HelperExportedAPI: failed to pre-encode HelperIdentity: \(error)")
-    }
-  }()
+  private static let identityData: Data =
+    preEncodedXPC(HelperIdentity.current(), "HelperIdentity")
 
   /// Production engine manager. Optional so the same
   /// class still vends a usable `.stopped` reply during early
@@ -179,21 +168,6 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     self.launchSpecResolver = launchSpecResolver
     self.downloader = ModelDownloader()
     self.onQuitRequested = onQuitRequested
-    #if DEBUG
-    self.replyTimeoutOverride = nil
-    #endif
-    super.init()
-  }
-
-  /// Testing seam (review v15 F1 et al.): inject a pre-configured
-  /// downloader (URLProtocol stub session, fake modelsRoot). Not
-  /// surfaced to the public init because production code has no
-  /// business swapping the downloader after the helper boots.
-  init(downloader: ModelDownloader) {
-    self.engineHost = nil
-    self.launchSpecResolver = nil
-    self.downloader = downloader
-    self.onQuitRequested = nil
     #if DEBUG
     self.replyTimeoutOverride = nil
     #endif
@@ -991,28 +965,12 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   public init(reasonMessage: String, onQuitRequested: (@Sendable () -> Void)? = nil) {
     self.reasonMessage = reasonMessage
     self.onQuitRequested = onQuitRequested
-    let err = EngineError(code: .degraded, message: reasonMessage)
-    do {
-      self.degradedErrorData = try XPCPayload.encode(err)
-    } catch {
-      preconditionFailure("DegradedHelperAPI: failed to encode EngineError(.degraded): \(error)")
-    }
-    let status = EngineStatus.failed(code: .degraded, message: reasonMessage)
-    do {
-      self.degradedStatusData = try XPCPayload.encode(status)
-    } catch {
-      preconditionFailure("DegradedHelperAPI: failed to encode EngineStatus.failed(.degraded): \(error)")
-    }
-    do {
-      self.emptyProfilesData = try XPCPayload.encode([String]())
-    } catch {
-      preconditionFailure("DegradedHelperAPI: failed to encode empty profiles list: \(error)")
-    }
-    do {
-      self.identityData = try XPCPayload.encode(HelperIdentity.current())
-    } catch {
-      preconditionFailure("DegradedHelperAPI: failed to encode HelperIdentity: \(error)")
-    }
+    self.degradedErrorData = preEncodedXPC(
+      EngineError(code: .degraded, message: reasonMessage), "EngineError(.degraded)")
+    self.degradedStatusData = preEncodedXPC(
+      EngineStatus.failed(code: .degraded, message: reasonMessage), "EngineStatus.failed(.degraded)")
+    self.emptyProfilesData = preEncodedXPC([String](), "empty profiles list")
+    self.identityData = preEncodedXPC(HelperIdentity.current(), "HelperIdentity")
     super.init()
   }
 

@@ -12,7 +12,7 @@ import Foundation
 /// `Port` ambiguous everywhere `import Foundation` is in scope.
 public typealias EnginePort = UInt16
 
-/// Engine lifecycle state observed by `PieSupervisor`. Single source of
+/// Engine lifecycle state observed by `PieEngineHost`. Single source of
 /// truth for menu-bar dot color and chat startup gating. The `running`
 /// case carries the full `EngineSessionSnapshot` (#476) — port, active
 /// profile id, served model id, effective `max_tokens` ceiling, the launch

@@ -1432,7 +1432,7 @@ public final class ProfileStore: ObservableObject {
       includingPropertiesForKeys: nil,
       options: [.skipsHiddenFiles]
     )) ?? []
-    let tomls = existing.filter { $0.pathExtension == "toml" }
+    let tomls = existing.filter(Self.isProfileTOML)
     guard tomls.isEmpty else { return SeedResult(dirError: nil, markerError: nil) }
 
     let target = directory.appendingPathComponent(Self.defaultChatFilename)
@@ -1866,14 +1866,20 @@ public final class ProfileStore: ObservableObject {
     Self.scan(directory: directory)
   }
 
+  /// Canonical profile-file predicate: a literal lowercase `toml` path
+  /// extension, matching what the FS-watcher keys on. Single source so the
+  /// seed scan and the public `scan` can never drift on the rule (review v2
+  /// F9: the Profiles tab once used `pathExtension.lowercased() == "toml"`
+  /// while the scans used the literal match).
+  static func isProfileTOML(_ url: URL) -> Bool {
+    url.pathExtension == "toml"
+  }
+
   /// Public re-entrant scan. Read-only consumers (Settings → Profiles
   /// tab, ad-hoc tools) call this directly instead of duplicating the
   /// `contentsOfDirectory` + `Profile.parse` + warning-aggregation
   /// logic — and so they don't drift on the extension-match rule
-  /// (review v2 F9: tab previously used `pathExtension.lowercased()
-  /// == "toml"` while this scan uses literal `== "toml"`; canonical
-  /// rule is now the literal lowercase match below, matching what
-  /// the FS-watcher actually keys on).
+  /// (`isProfileTOML`, review v2 F9).
   public static func scan(
     directory: URL,
     fileManager: FileManager = .default
@@ -1891,7 +1897,7 @@ public final class ProfileStore: ObservableObject {
       return ([], .scanFailed(path: directory.path, underlying: underlying))
     }
     let tomls = files
-      .filter { $0.pathExtension == "toml" }
+      .filter(Self.isProfileTOML)
       .sorted { $0.lastPathComponent < $1.lastPathComponent }
 
     let parsed = tomls.map { url -> ProfileLoadResult in
@@ -1926,13 +1932,5 @@ public final class ProfileStore: ObservableObject {
       }
     }
     return (parsed, nil)
-  }
-}
-
-private extension NSLock {
-  func withLock<T>(_ body: () throws -> T) rethrows -> T {
-    lock()
-    defer { unlock() }
-    return try body()
   }
 }
