@@ -14,11 +14,11 @@ import XCTest
 ///
 /// Engine-free + deterministic, with NO runner filesystem writes (the
 /// sandboxed XCUITest runner cannot write `/tmp`): the non-sandboxed app
-/// auto-seeds the `chat` + `fast-think` profiles (both default to the same
+/// auto-seeds the `chat` + `repeat-boost` profiles (both default to the same
 /// seeded model Y), and `PIE_TEST_CHAT_MODEL_PIN` (DEBUG seam) pins a
 /// DIFFERENT model X as the fresh chat's `Chat.modelID`. Switching
-/// `chat → fast-think` is therefore a cross-model swap (chat selection X ≠
-/// fast-think default Y). In default mode it switches silently and keeps X; in
+/// `chat → repeat-boost` is therefore a cross-model swap (chat selection X ≠
+/// repeat-boost default Y). In default mode it switches silently and keeps X; in
 /// compatibility mode it raises the popover — no real engine, no network, no
 /// Helper.
 ///
@@ -27,13 +27,13 @@ import XCTest
 /// unit-proven in ProfileSwapWiringTests / ProfileSwapCoordinatorTests):
 ///   1. all three buttons render (Cancel / Keep Current Model / Switch);
 ///   2. CANCEL       → abandon: profile stays `chat`;
-///   3. KEEP CURRENT → profile becomes `fast-think` but the chat's pinned
+///   3. KEEP CURRENT → profile becomes `repeat-boost` but the chat's pinned
 ///                     model X is kept (toolbar.model still reflects X — no
-///                     reload, no adoption of fast-think's default);
-///   4. SWITCH       → profile becomes `fast-think`.
+///                     reload, no adoption of repeat-boost's default);
+///   4. SWITCH       → profile becomes `repeat-boost`.
 final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   /// A slug deliberately DIFFERENT from the seeded profile default so the
-  /// chat→fast-think swap is cross-model and raises the popover. Pinned as
+  /// chat→repeat-boost swap is cross-model and raises the popover. Pinned as
   /// the fresh chat's `Chat.modelID` (the #460 selection authority).
   private let pinnedSlug = "ghost-pinned.gguf"
 
@@ -45,7 +45,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   func test_all_three_buttons_present_on_cross_model_swap() throws {
     let app = launchPinnedX(followProfileDefault: true)
     defer { app.terminate() }
-    _ = openSwapPopoverSwitchingToFastThink(in: app, requiringButton: "Switch")
+    _ = openSwapPopoverSwitchingToRepeatBoost(in: app, requiringButton: "Switch")
 
     // The popover's container `.accessibilityIdentifier("profileSwap.popover")`
     // masks the inner button ids on macOS (same SwiftUI quirk S302 documents),
@@ -62,13 +62,13 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   func test_cancel_abandons_and_stays_on_the_old_profile() throws {
     let app = launchPinnedX(followProfileDefault: true)
     defer { app.terminate() }
-    let profileMenu = openSwapPopoverSwitchingToFastThink(in: app, requiringButton: "Cancel")
+    let profileMenu = openSwapPopoverSwitchingToRepeatBoost(in: app, requiringButton: "Cancel")
 
     XCTAssertTrue(clickPopoverButton("Cancel", in: app), "Cancel button missing")
 
     XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "chat", timeout: 10),
                   "Cancel must abandon the swap and stay on the old profile; title=\(profileMenu.title)")
-    XCTAssertFalse(profileMenu.title.localizedCaseInsensitiveContains("fast-think"),
+    XCTAssertFalse(profileMenu.title.localizedCaseInsensitiveContains("repeat-boost"),
                    "Cancel must never switch the profile; title=\(profileMenu.title)")
   }
 
@@ -76,17 +76,17 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   func test_keep_current_switches_profile_but_keeps_pinned_model() throws {
     let app = launchPinnedX(followProfileDefault: true)
     defer { app.terminate() }
-    let profileMenu = openSwapPopoverSwitchingToFastThink(in: app, requiringButton: "Keep Current Model")
+    let profileMenu = openSwapPopoverSwitchingToRepeatBoost(in: app, requiringButton: "Keep Current Model")
 
     // Query by visible label — the container id masks the inner button id
     // (S302-documented SwiftUI quirk).
     XCTAssertTrue(clickPopoverButton("Keep Current Model", in: app),
                   "Keep Current Model button missing; app tree: \(app.debugDescription)")
 
-    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "fast-think", timeout: 10),
-                  "Keep Current must still commit the profile switch to fast-think; title=\(profileMenu.title)")
+    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "repeat-boost", timeout: 10),
+                  "Keep Current must still commit the profile switch to repeat-boost; title=\(profileMenu.title)")
     // The chat's pinned model X is kept as `Chat.modelID` — toolbar.model must
-    // still reflect X, never the fast-think profile's default.
+    // still reflect X, never the repeat-boost profile's default.
     let modelMenu = app.menuButtons["toolbar.model"]
     XCTAssertTrue(waitForElementValueContaining(modelMenu, "ghost-pinned", timeout: 10),
                   "Keep Current must keep the chat's pinned model X (Chat.modelID); toolbar.model value=\(String(describing: modelMenu.value))")
@@ -96,14 +96,14 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   func test_switch_commits_the_profile_switch() throws {
     let app = launchPinnedX(followProfileDefault: true)
     defer { app.terminate() }
-    let profileMenu = openSwapPopoverSwitchingToFastThink(in: app, requiringButton: "Switch")
+    let profileMenu = openSwapPopoverSwitchingToRepeatBoost(in: app, requiringButton: "Switch")
 
     // Query by visible label — the container id masks the inner button id
     // (S302-documented SwiftUI quirk).
     XCTAssertTrue(clickPopoverButton("Switch", in: app), "Switch button missing")
 
-    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "fast-think", timeout: 10),
-                  "Switch must commit the profile switch to fast-think; title=\(profileMenu.title)")
+    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "repeat-boost", timeout: 10),
+                  "Switch must commit the profile switch to repeat-boost; title=\(profileMenu.title)")
   }
 
   /// #582: the swap popover must survive the window resigning key. The old
@@ -119,7 +119,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   func test_popover_survives_window_resigning_key() throws {
     let app = launchPinnedX(followProfileDefault: true)
     defer { app.terminate() }
-    _ = openSwapPopoverSwitchingToFastThink(in: app, requiringButton: "Switch")
+    _ = openSwapPopoverSwitchingToRepeatBoost(in: app, requiringButton: "Switch")
 
     let popover = app.descendants(matching: .any)
       .matching(identifier: "profileSwap.popover").firstMatch
@@ -159,7 +159,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
     XCTAssertTrue(clickPopoverButton("Switch", in: app),
                   "Switch button missing on the survived popover")
     let profileMenu = app.menuButtons["toolbar.profile"]
-    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "fast-think", timeout: 10),
+    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "repeat-boost", timeout: 10),
                   "the survived popover's Switch must still commit the profile switch; title=\(profileMenu.title)")
   }
 
@@ -168,13 +168,13 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
     let app = launchPinnedX(followProfileDefault: false)
     defer { app.terminate() }
 
-    let profileMenu = selectFastThink(in: app)
+    let profileMenu = selectRepeatBoost(in: app)
     let popover = app.descendants(matching: .any)
       .matching(identifier: "profileSwap.popover").firstMatch
 
     XCTAssertFalse(popover.waitForExistence(timeout: 2),
                    "default explicit-model mode should not ask to swap to the destination profile default")
-    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "fast-think", timeout: 10),
+    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "repeat-boost", timeout: 10),
                   "default explicit-model mode still commits the profile switch; title=\(profileMenu.title)")
     let modelMenu = app.menuButtons["toolbar.model"]
     XCTAssertTrue(waitForElementValueContaining(modelMenu, "ghost-pinned", timeout: 10),
@@ -186,7 +186,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
   /// Launch engine-free with a /tmp PIE_HOME the NON-sandboxed app seeds
   /// itself (the runner writes nothing), and pin model X as the fresh chat's
   /// `Chat.modelID` via the DEBUG `PIE_TEST_CHAT_MODEL_PIN` seam. The seeded
-  /// `chat`/`fast-think` profiles both default to model Y ≠ X, so swapping is
+  /// `chat`/`repeat-boost` profiles both default to model Y ≠ X, so swapping is
   /// cross-model on the chat's SELECTION (single-source #460), not residency.
   @MainActor
   private func launchPinnedX(followProfileDefault: Bool) -> XCUIApplication {
@@ -203,7 +203,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
     app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = pinnedSlug
     // Avoid native macOS Menu automation flake while exercising the same
     // ContentToolbar.selectProfile path as the production profile menu.
-    app.launchEnvironment["PIE_TEST_AUTO_PICK_PROFILE"] = "fast-think"
+    app.launchEnvironment["PIE_TEST_AUTO_PICK_PROFILE"] = "repeat-boost"
     // Engine-free: a stray developer Helper must not let reconcile run; the
     // swap keys on the chat's pin regardless, but keep the harness hermetic.
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
@@ -223,24 +223,24 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
     return app
   }
 
-  /// Wait for the DEBUG-only auto-pick seam to select `fast-think`, then
+  /// Wait for the DEBUG-only auto-pick seam to select `repeat-boost`, then
   /// return the toolbar.profile menu button. This intentionally avoids native
   /// macOS Menu automation; the seam calls ContentToolbar.selectProfile,
   /// which is the same product path reached by the production menu.
   @MainActor
-  private func selectFastThink(in app: XCUIApplication) -> XCUIElement {
+  private func selectRepeatBoost(in app: XCUIApplication) -> XCUIElement {
     let profileMenu = app.menuButtons["toolbar.profile"]
     XCTAssertTrue(profileMenu.waitForExistence(timeout: 10),
                   "profile switcher (toolbar.profile) missing; app tree: \(app.debugDescription)")
-    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "fast-think", timeout: 45),
-                  "DEBUG auto-pick seam did not select fast-think; title=\(profileMenu.title); app tree=\(app.debugDescription)")
+    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "repeat-boost", timeout: 45),
+                  "DEBUG auto-pick seam did not select repeat-boost; title=\(profileMenu.title); app tree=\(app.debugDescription)")
     return profileMenu
   }
 
-  /// Wait for the DEBUG-only auto-pick seam to select `fast-think` and raise
+  /// Wait for the DEBUG-only auto-pick seam to select `repeat-boost` and raise
   /// the compatibility popover. Asserts the requested outcome button presents.
   @MainActor
-  private func openSwapPopoverSwitchingToFastThink(
+  private func openSwapPopoverSwitchingToRepeatBoost(
     in app: XCUIApplication,
     requiringButton buttonLabel: String
   ) -> XCUIElement {

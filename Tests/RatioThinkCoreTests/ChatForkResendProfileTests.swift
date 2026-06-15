@@ -2,9 +2,9 @@ import XCTest
 import SwiftData
 @testable import RatioThinkCore
 
-/// #624 Issue 1 regression guard: a fork of a non-default-profile chat (e.g.
-/// "Fast Think") must re-run against THAT profile's speculation, not the
-/// default "chat" profile.
+/// #624 Issue 1 regression guard: a fork of a non-default-profile chat (one
+/// carrying speculation, like a Repeat Boost profile) must re-run against THAT
+/// profile's speculation, not the default "chat" profile.
 ///
 /// `ChatScaffoldView.sendAssistantTurn` resolves speculation from
 /// `chat.profileID` (the persisted, authoritative profile) precisely so the
@@ -17,7 +17,7 @@ import SwiftData
 @MainActor
 final class ChatForkResendProfileTests: XCTestCase {
   /// A profile dir with a plain "chat" profile (no speculation) and a
-  /// "fast-think" profile carrying an enabled `[speculation]` section.
+  /// "turbo-spec" profile carrying an enabled `[speculation]` section.
   private func withProfileStore(_ body: (ProfileStore) async throws -> Void) async throws {
     let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
       .appendingPathComponent("pie-fork-spec-\(UUID().uuidString)", isDirectory: true)
@@ -32,9 +32,13 @@ final class ChatForkResendProfileTests: XCTestCase {
     inferlet = "chat-apc"
     """.write(to: dir.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
 
+    // A non-default profile carrying speculation. Deliberately NOT the
+    // "fast-think" slug — `ProfileStore.migrateFastThinkToRepeatBoost` (#628)
+    // renames that id on load, which would make `speculation(forProfileID:)`
+    // miss it. Any neutral custom id exercises the same fork→profile path.
     try """
-    id = "fast-think"
-    name = "Fast Think"
+    id = "turbo-spec"
+    name = "Turbo"
     model = "model-A.gguf"
     inferlet = "chat-apc"
 
@@ -42,7 +46,7 @@ final class ChatForkResendProfileTests: XCTestCase {
     enabled = true
     leader_len = 2
     draft_len = 5
-    """.write(to: dir.appendingPathComponent("fast-think.toml"), atomically: true, encoding: .utf8)
+    """.write(to: dir.appendingPathComponent("turbo-spec.toml"), atomically: true, encoding: .utf8)
 
     let store = ProfileStore(directory: dir)
     try store.start()
@@ -59,7 +63,7 @@ final class ChatForkResendProfileTests: XCTestCase {
 
       let container = try RatioThinkModelContainer.makeInMemory()
       let context = ModelContext(container)
-      let chat = Chat(title: "Original", profileID: "fast-think")
+      let chat = Chat(title: "Original", profileID: "turbo-spec")
       context.insert(chat)
       let userTurn = Message(role: "user", content: "hi",
                              ts: Date(timeIntervalSinceReferenceDate: 1))
@@ -75,7 +79,7 @@ final class ChatForkResendProfileTests: XCTestCase {
         FetchDescriptor<Chat>(predicate: #Predicate { $0.id == newID })
       ).first)
       // The fork must carry the source's non-default profile.
-      XCTAssertEqual(forked.profileID, "fast-think")
+      XCTAssertEqual(forked.profileID, "turbo-spec")
 
       // Mirror sendAssistantTurn's resolution: speculation from chat.profileID.
       let spec = store.speculation(forProfileID: forked.profileID)
@@ -100,7 +104,7 @@ final class ChatForkResendProfileTests: XCTestCase {
                                    "resent request must carry the forked profile's speculation")
       XCTAssertTrue(wireSpec.enabled)
       // Enabled speculation forces greedy decoding (#426) regardless of the
-      // toolbar sampling — proof the Fast-Think coupling survived the fork.
+      // toolbar sampling — proof the speculation coupling survived the fork.
       XCTAssertEqual(request.sampling.temperature, 0)
     }
   }
@@ -123,9 +127,6 @@ private final class CapturingChatEngine: EngineClient, @unchecked Sendable {
   private(set) var requests: [ChatRequest] = []
   func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
   func models() async throws -> [ModelInfo] { [] }
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    AsyncThrowingStream { $0.finish() }
-  }
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     requests.append(req)
     return AsyncThrowingStream { continuation in
