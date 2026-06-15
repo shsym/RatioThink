@@ -53,6 +53,19 @@ SRCROOT="${SRCROOT:-$REPO_ROOT}"
 
 if [[ -z "$ARCH" ]]; then
   # Xcode build-phase mode. $ARCHS is space-separated.
+  #
+  # Deterministic unit tier opt-out: the app-hosted xcodebuild bundles
+  # (RatioThinkTests via `make test-app-unit` / `test-xcode-chat-scaffold`)
+  # are headless and never launch the engine, but this phase still cargo-
+  # builds + restages + codesigns the engine into Rational.app. On a stale
+  # signed app that re-stage fails "Operation not permitted" (insight:483),
+  # and the multi-minute cargo build dwarfs the unit run. Set
+  # PIE_SKIP_ENGINE_BUILD=1 to no-op the phase. Scoped to build-phase mode
+  # only — the CLI/DMG path (--arch) must always produce the engine.
+  if [[ -n "${PIE_SKIP_ENGINE_BUILD:-}" && "${PIE_SKIP_ENGINE_BUILD}" != "0" ]]; then
+    echo "build-pie-engine.sh: PIE_SKIP_ENGINE_BUILD set — skipping engine build"
+    exit 0
+  fi
   # v1 explicitly ships arch-specific DMGs ( §5); universal-
   # binary support is deferred. A multi-arch invocation would stage
   # each arch to the same Resources/pie-engine/pie path and silently

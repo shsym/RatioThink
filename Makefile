@@ -105,7 +105,7 @@ test-xcode-chat-scaffold: genproject $(LOGDIR) ## Run Xcode-only ChatScaffold un
 	    -configuration Debug \
 	    -parallel-testing-enabled NO \
 	    -only-testing:RatioThinkTests/ChatScaffoldModelSelectionTests \
-	    ENABLE_CODE_COVERAGE=NO \
+	    ENABLE_CODE_COVERAGE=NO PIE_SKIP_ENGINE_BUILD=1 \
 	    test 2>&1 | tee $$LOG | tail -40; \
 	  status=$${PIPESTATUS[0]}; \
 	  echo "log: $$LOG"; \
@@ -133,7 +133,7 @@ test-app-unit: genproject $(LOGDIR) ## App-tier unit bundle (xcodebuild RatioThi
 	    -configuration Debug \
 	    -parallel-testing-enabled NO \
 	    -only-testing:RatioThinkTests \
-	    ENABLE_CODE_COVERAGE=NO \
+	    ENABLE_CODE_COVERAGE=NO PIE_SKIP_ENGINE_BUILD=1 \
 	    test 2>&1 | tee $$LOG | tail -40; \
 	  status=$${PIPESTATUS[0]}; \
 	  echo "log: $$LOG"; \
