@@ -290,7 +290,7 @@ pub async fn emit_final_delta(em: &mut Emitter, text: &str) -> Result<(), EmitEr
 }
 
 /// Emit one search level: a `node_complete` for every node generated on
-/// the level (ok, generation-error, fork/refine-flush error-leaf — all of
+/// the level (ok, generation-error, fork error-leaf — all of
 /// them, so the UI sees the full breadth that was attempted), then the
 /// `level_pruned` beam selection. Called by [`super::search::run`] with
 /// the slice of nodes freshly appended this level and the surviving ids.

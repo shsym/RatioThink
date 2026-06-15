@@ -1053,8 +1053,8 @@ pub async fn run(
 
     for level in 1..=params.depth {
         // Index into `flat` of this level's first node. Every node appended
-        // below — refine-flush error leaves, fork error leaves, and the
-        // materialized candidates — lands in `flat[level_start..]`, the
+        // below — fork error leaves and the materialized candidates —
+        // lands in `flat[level_start..]`, the
         // exact slice the streaming sink replays as `node_complete` frames.
         let level_start = flat.len();
 
@@ -1068,7 +1068,7 @@ pub async fn run(
         // refine framing the shared flush used to provide.
 
         // Fork every child. A fork failure has no context to carry → record
-        // it as an inline error leaf (shared with the refine-flush path); a
+        // it as an inline error leaf; a
         // successful fork's context is expanded (generate + score)
         // concurrently below.
         let mut metas: Vec<(String, String, usize)> = Vec::new(); // (id, parent_id, branch_index)
@@ -1247,7 +1247,7 @@ fn choose_synthesis_context<C>(synth_base: Option<C>, _branch_context: Option<C>
 
 /// Materialize one level's **successfully forked** branches into tree
 /// nodes + scored candidates + the beam, with no engine context so it is
-/// unit-tested natively. Fork and refine-flush failures never reach here —
+/// unit-tested natively. Fork failures never reach here —
 /// [`run`] records those as [`error_leaf`] nodes directly, since they have
 /// no content to score or context to expand. A successful branch becomes
 /// an `ok`/`error` leaf; an `ok` leaf may still carry a `score_error` when

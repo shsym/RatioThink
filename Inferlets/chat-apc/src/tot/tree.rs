@@ -9,11 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Lifecycle status of a tree node. Serializes to the snake_case wire
-/// strings `"root" | "ok" | "error"` — byte-identical to the prior
-/// `&'static str` representation — so this is a pure internal tightening,
-/// not a wire change. Modeling it as an enum makes illegal status values
-/// unrepresentable and lets the orchestration branch on a variant instead
-/// of string-comparing.
+/// strings `"root" | "ok" | "error" | "incomplete"` (the first three are
+/// byte-identical to the original `&'static str` representation;
+/// `"incomplete"` was added with the variant in #434). Modeling it as an
+/// enum makes illegal status values unrepresentable and lets the
+/// orchestration branch on a variant instead of string-comparing.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeStatus {
@@ -33,7 +33,8 @@ pub enum NodeStatus {
 
 /// One node in the generated thought tree.
 ///
-/// * `status` is a [`NodeStatus`] (`"root" | "ok" | "error"` on the wire).
+/// * `status` is a [`NodeStatus`] (`"root" | "ok" | "error" | "incomplete"`
+///   on the wire).
 /// * `score` is the value-evaluator rating (1–10), or `null` when the
 ///   scorer returned no usable integer or failed outright.
 /// * `error` carries a per-node *generation* diagnostic on partial failure
@@ -537,7 +538,7 @@ mod tests {
 
     #[test]
     fn error_leaf_is_wire_visible_and_beam_excludable() {
-        let n = error_leaf("p1", 2, 1, "refine flush failed: boom".to_string());
+        let n = error_leaf("p1", 2, 1, "fork failed: boom".to_string());
         assert_eq!(n.parent_id.as_deref(), Some("p1"));
         assert_eq!(n.depth, 2);
         assert_eq!(n.branch_index, Some(1));
@@ -545,12 +546,12 @@ mod tests {
         // Empty content + no score keep it out of the beam.
         assert!(n.content.is_empty());
         assert_eq!(n.score, None);
-        // The diagnostic is serialized (not omitted) so a failed refine is
+        // The diagnostic is serialized (not omitted) so a failed fork is
         // visible in the response instead of a silent re-roll downgrade.
         let v = serde_json::to_value(&n).unwrap();
         assert_eq!(
             v.get("error").and_then(|e| e.as_str()),
-            Some("refine flush failed: boom"),
+            Some("fork failed: boom"),
         );
     }
 

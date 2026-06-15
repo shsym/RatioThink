@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::SpecConfig;
 use super::cache::NgramCache;
 
 /// Request-thread local identity for a persisted Cacheback table.
@@ -222,7 +223,15 @@ impl SidecarStore {
             }
         }
 
-        let cache = Arc::new(Mutex::new(NgramCache::new(key.leader_len, 1 << 16, 8)));
+        // Caps mirror `SpecConfig::default()` (the key carries only
+        // leader_len/draft_len, not caps); reference the single source so
+        // the two can't drift.
+        let caps = SpecConfig::default();
+        let cache = Arc::new(Mutex::new(NgramCache::new(
+            key.leader_len,
+            caps.leader_cap,
+            caps.follower_cap,
+        )));
         self.entries.insert(
             key,
             SidecarEntry {

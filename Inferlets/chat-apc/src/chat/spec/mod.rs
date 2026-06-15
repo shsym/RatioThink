@@ -79,9 +79,13 @@ pub struct SpecMetrics {
     pub accepted: usize,
     /// Draft tokens the verifier rejected (`proposed - accepted`).
     pub rejected: usize,
-    /// Decode steps (forward passes / accept calls).
+    /// Decode steps (forward passes / accept calls). Drafter-internal
+    /// accounting cross-checked in tests; the wire report's `decode_steps`
+    /// comes from the transport's own per-forward-pass counter.
     pub steps: usize,
-    /// Tokens committed (free picks + accepted drafts).
+    /// Tokens committed (free picks + accepted drafts). Drafter-internal
+    /// accounting cross-checked in tests; the wire report's
+    /// `generated_tokens` comes from the transport's own counter.
     pub generated: usize,
     /// `NgramCache::get` lookups in `draft()` that returned a follower.
     pub cache_hits: usize,

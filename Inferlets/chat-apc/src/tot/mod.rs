@@ -36,7 +36,7 @@
 //!
 //! A structured tree. Each node carries a stable `id`, `parent_id`,
 //! `depth`, `branch_index`, `content`, `score` (1–10 or `null`),
-//! `status` (`"root" | "ok" | "error"`), an optional per-node `error`
+//! `status` (`"root" | "ok" | "error" | "incomplete"`), an optional per-node `error`
 //! (generation-failure diagnostic), an optional per-node `score_error`
 //! (value-evaluator infra failure — see the scoring caveat), and nested
 //! `children`. The envelope adds `selected_node_id` + `final_answer` (the

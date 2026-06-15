@@ -3,9 +3,10 @@
 //! Isolates the one axis that differs between decode modes — how the
 //! [`Generator`] is constructed — behind [`DecodeStrategy`], so the SSE
 //! and JSON transport loops in [`super::completions`] stay generic over
-//! plain vs speculative decode. A future tree-of-thought mode plugs in
-//! as another strategy (or a `/v1/inferlet` dispatch arm) without
-//! touching the transport loops.
+//! plain vs speculative decode. Tree-of-thought is a sibling mode that
+//! ships as a `/v1/inferlet` dispatch arm ([`super::dispatch`] →
+//! [`crate::tot`]) rather than a `DecodeStrategy`, so it bypasses these
+//! transport loops entirely.
 //!
 //! - [`DecodeStrategy::Plain`] — the default token-by-token decode.
 //! - [`DecodeStrategy::Speculative`] — attaches a [`CachebackDrafter`]

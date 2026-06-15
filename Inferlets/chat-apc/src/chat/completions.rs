@@ -457,7 +457,7 @@ struct ChatCompletion<'a> {
     /// LAUNCH_DIAGS registry on this request. Otherwise these would
     /// live only in `eprintln!` and be dropped in the pie-mac
     /// production deployment (see `crate::sse::emit_done_logged`
-    /// doc + ). Skipped from serialization when empty.
+    /// doc). Skipped from serialization when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     warnings: Option<Vec<NonStreamWarning<'a>>>,
     /// chat-apc extension: speculative-decode metrics. Present only when
@@ -1601,7 +1601,7 @@ fn visible_content<'a>(
 /// detection (id_seed entropy fallback, now_unix_secs clock-skew,
 /// monotonic-clock stub/coarse) that would otherwise live only in
 /// `eprintln!` and be dropped in the pie-mac production deployment
-/// (see `crate::sse::emit_done_logged` doc + ).
+/// (see `crate::sse::emit_done_logged` doc).
 ///
 /// N1/N2 design: computed exactly once at first request entry via
 /// `compute_launch_diags()`, then frozen in `LAUNCH_DIAGS: OnceLock`

@@ -1,4 +1,4 @@
-//! APC (Adaptive Personality/Capability) decoder wrappers.
+//! Reasoning + tool-use streaming-decoder wrappers for the chat loop.
 //!
 //! [`super::completions`] runs both decoders alongside `chat::Decoder`
 //! on every generation loop iteration: reasoning fires
@@ -19,14 +19,14 @@ use inferlet::Result;
 use inferlet::model::Model;
 
 // =============================================================================
-// Tool-use stub — wraps `inferlet::tools::Decoder`.
+// Tool-use decoder — wraps `inferlet::tools::Decoder`.
 // =============================================================================
 
 /// Streaming detector for tool-call events inside generated text.
 ///
-/// V1 stub: instantiated but not yet fed by the chat loop. Once the
-/// chat handler emits OpenAI-shape `tool_calls` deltas, this is the
-/// decoder it will run alongside `chat::Decoder`.
+/// The chat loop feeds this alongside `chat::Decoder` every iteration; a
+/// complete `Event::Call` terminates the loop and becomes the OpenAI
+/// `tool_calls` delta on the terminal chunk (see [`super::completions`]).
 pub struct ToolUseDecoder {
     inner: inferlet::tools::Decoder,
 }
@@ -49,14 +49,13 @@ impl ToolUseDecoder {
 }
 
 // =============================================================================
-// Reasoning stub — wraps `inferlet::reasoning::Decoder`.
+// Reasoning decoder — wraps `inferlet::reasoning::Decoder`.
 // =============================================================================
 
 /// Streaming detector for thinking-block events (`<think>...`).
 ///
-/// V1 stub: instantiated but not yet fed by the chat loop. Once the
-/// chat handler emits OpenAI-shape `reasoning` deltas, this is the
-/// decoder that surfaces them.
+/// The chat loop feeds this every iteration; its events surface as
+/// OpenAI-shape `reasoning_content` deltas (see [`super::completions`]).
 pub struct ReasoningDecoder {
     inner: inferlet::reasoning::Decoder,
 }

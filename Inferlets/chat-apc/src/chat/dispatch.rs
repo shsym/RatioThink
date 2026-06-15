@@ -12,16 +12,17 @@
 //! }
 //! ```
 //!
-//! **V1 narrow:** the only `inferlet` name accepted is `"chat-apc"`,
-//! which routes into [`crate::chat::handle_parsed`]. The dispatch
-//! body is rebuilt into a `ChatCompletionsRequest` by merging
-//! `messages` (top-level chat sugar) with optional sampling fields
-//! from `input` (the inferlet-specific payload). Unknown names →
+//! **V1 narrow:** two `inferlet` names are accepted — `"chat-apc"`,
+//! which routes into [`crate::chat::handle_parsed`], and
+//! `"tree-of-thought"`, which routes into [`crate::tot::dispatch`]. The
+//! chat-apc dispatch body is rebuilt into a `ChatCompletionsRequest` by
+//! merging `messages` (top-level chat sugar) with optional sampling
+//! fields from `input` (the inferlet-specific payload). Unknown names →
 //! 404 `inferlet_not_found`.
 //!
 //! True dynamic dispatch (load arbitrary wasm by name from
 //! `--inferlet-dir`) requires pie-side host changes and is tracked
-//! in 's follow-up. The endpoint exists in v1 so the Swift
+//! as a follow-up. The endpoint exists in v1 so the Swift
 //! `EngineClient.dispatchInferlet` surface has somewhere to land —
 //! adding more names later is a pure-inferlet edit.
 
