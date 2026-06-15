@@ -13,6 +13,7 @@
     --ink:#e7e9ef; --ink-dim:#9aa1b4; --ink-faint:#6b7186;
     --app:#5cc8ff; --helper:#c79cff; --engine:#ffcf6b; --inferlet:#6be59a;
     --edge:#5b6479; --hot:#ff7a59;
+    --think-bg:#13161f;
     --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
     --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   }
@@ -41,8 +42,81 @@
   code{font-family:var(--mono);font-size:.9em;background:var(--panel-2);
     border:1px solid var(--line);border-radius:5px;padding:1px 5px}
 
-  /* two-phase flow */
-  .phases{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:16px 0}
+  /* ===================== animated two-phase stage ===================== */
+  .stage{margin:18px 0 6px}
+  .demo{background:radial-gradient(120% 90% at 50% -20%,#1a1e2b 0%,var(--panel) 62%);
+    border:1px solid var(--line);border-radius:16px;padding:0;overflow:hidden}
+  .demo .bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    padding:12px 16px;border-bottom:1px solid var(--line);background:#141823}
+  .pill{display:inline-flex;align-items:center;gap:6px;font:600 12px/1 var(--sans);
+    color:var(--ink-dim);background:var(--panel-2);border:1px solid var(--line);
+    border-radius:999px;padding:6px 11px}
+  .pill .icon{font-family:var(--mono);color:var(--inferlet);font-weight:700}
+  /* phase tracker */
+  .track{display:flex;align-items:center;gap:8px;margin-left:auto}
+  .step{display:inline-flex;align-items:center;gap:7px;font:600 11.5px/1 var(--sans);
+    color:var(--ink-faint);background:transparent;border:1px solid var(--line);
+    border-radius:999px;padding:6px 10px;transition:color .25s,border-color .25s,background .25s}
+  .step .dot{width:7px;height:7px;border-radius:999px;background:var(--ink-faint);
+    transition:background .25s,box-shadow .25s}
+  .step.p1.on{color:var(--helper);border-color:#3a2f55;background:#1b1530}
+  .step.p1.on .dot{background:var(--helper);box-shadow:0 0 8px var(--helper)}
+  .step.p2.on{color:var(--inferlet);border-color:#1f4030;background:#13261c}
+  .step.p2.on .dot{background:var(--inferlet);box-shadow:0 0 8px var(--inferlet)}
+  .step.done{color:var(--ink-dim)}
+  .arrow{color:var(--ink-faint);font-size:12px}
+
+  .demo .body{padding:16px 18px;min-height:236px}
+  .prompt{font-size:13px;color:var(--ink-dim);margin:0 0 12px}
+  .prompt b{color:var(--ink);font-weight:600}
+
+  /* phase 1 — reasoning think block */
+  .think{background:var(--think-bg);border:1px solid var(--line);border-radius:11px;
+    padding:11px 13px;margin:0 0 12px;transition:opacity .3s,max-height .35s ease;overflow:hidden}
+  .think .thead{display:inline-flex;align-items:center;gap:6px;font:600 11.5px/1 var(--sans);
+    color:var(--helper)}
+  .think .thead .lbl{color:var(--ink-dim);font-weight:500}
+  .think .thead .status{color:var(--ink-faint);font-weight:500}
+  .think .thead .status.live{animation:breathe 1.2s ease-in-out infinite}
+  @keyframes breathe{50%{opacity:.4}}
+  .think .ttext{margin-top:8px;font-family:var(--mono);font-size:12px;line-height:1.65;
+    color:var(--ink-dim);min-height:1.2em;white-space:pre-wrap;word-break:break-word}
+  .think.folded{max-height:34px;opacity:.72}
+  .think.folded .ttext{display:none}
+
+  /* phase 2 — grammar-constrained json output */
+  .out{background:#0b0d13;border:1px solid var(--line);border-radius:11px;padding:0;overflow:hidden}
+  .out .ohead{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);
+    font:600 11px/1 var(--sans);color:var(--ink-faint);letter-spacing:.03em;text-transform:uppercase}
+  .out .grammar{margin-left:auto;display:inline-flex;align-items:center;gap:6px;
+    font:600 10.5px/1 var(--mono);text-transform:none;letter-spacing:0;
+    color:var(--inferlet);background:#13261c;border:1px solid #1f4030;border-radius:6px;padding:4px 7px;
+    opacity:.45;transition:opacity .25s}
+  .out.active .grammar{opacity:1}
+  .out .ojson{padding:12px 14px;font-family:var(--mono);font-size:12.5px;line-height:1.7;
+    color:var(--ink);min-height:2.2em;white-space:pre-wrap;word-break:break-word}
+  .ojson .k{color:var(--app)} .ojson .s{color:var(--inferlet)} .ojson .n{color:var(--engine)}
+
+  /* caret: ink while reasoning, accent (constrained) during the json pass */
+  .caret::after,.gcaret::after{content:'';display:inline-block;width:7px;height:1.05em;
+    vertical-align:-2px;margin-left:1px;background:currentColor;opacity:.65;
+    animation:blink 1s steps(1) infinite}
+  .gcaret::after{background:var(--inferlet);opacity:.85}
+  @keyframes blink{50%{opacity:0}}
+
+  /* dots — real focusable scene nav, outside the aria-hidden stage */
+  .dots{display:flex;gap:9px;justify-content:center;align-items:center;margin:16px 0 0}
+  .dots .dot{appearance:none;-webkit-appearance:none;border:0;margin:0;padding:0;cursor:pointer;
+    width:9px;height:9px;border-radius:999px;background:var(--line);transition:background .2s,width .2s}
+  .dots .dot:hover{background:var(--edge)}
+  .dots .dot.on{background:var(--inferlet);width:22px}
+  .dots .dot:focus-visible{outline:2px solid var(--inferlet);outline-offset:3px}
+  .caption{margin:12px auto 0;max-width:680px;text-align:center;font-size:13px;color:var(--ink-dim);
+    min-height:20px}
+  .demo-note{margin:8px auto 0;text-align:center;font-size:12px;color:var(--ink-faint)}
+
+  /* two-phase legend cards */
+  .phases{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:22px 0}
   @media(max-width:680px){.phases{grid-template-columns:1fr}}
   .phase{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
   .phase .tag{font:600 11px/1 var(--mono);letter-spacing:.04em;text-transform:uppercase}
@@ -72,6 +146,12 @@
   footer{margin-top:48px;padding-top:18px;border-top:1px solid var(--line);
     color:var(--ink-faint);font-size:12.5px}
   footer code{font-size:11.5px}
+
+  /* honor reduced motion: JS renders the final static frame; kill residual animation */
+  @media (prefers-reduced-motion:reduce){
+    .caret::after,.gcaret::after,.think .thead .status.live{animation:none}
+    *{transition:none !important}
+  }
 </style>
 </head>
 <body>
@@ -95,7 +175,40 @@
      default model thinks in <code>&lt;think&gt;…&lt;/think&gt;</code>, constraining the whole
      generation to JSON would forbid reasoning. So a JSON request runs <strong>two sequential
      generations on one engine context</strong>, sharing the request's <code>max_tokens</code>
-     budget:</p>
+     budget — watch it below.</p>
+
+  <!-- ===================== animated stage (decorative; static reference is the code blocks) ===================== -->
+  <div class="stage">
+    <div class="demo" id="demo" aria-hidden="true">
+      <div class="bar">
+        <span class="pill"><span class="icon">{ }</span><span id="profileName">JSON Think</span></span>
+        <div class="track">
+          <span class="step p1" id="stepP1"><span class="dot"></span>Phase 1 · reason</span>
+          <span class="arrow">→</span>
+          <span class="step p2" id="stepP2"><span class="dot"></span>Phase 2 · constrain</span>
+        </div>
+      </div>
+      <div class="body">
+        <p class="prompt"><b id="promptText">&nbsp;</b></p>
+        <div class="think" id="think">
+          <div class="thead">Thinking <span class="lbl" id="thinkMode">&lt;think&gt;</span>
+            <span class="status" id="thinkStatus">&nbsp;</span></div>
+          <div class="ttext" id="thinkText"></div>
+        </div>
+        <div class="out" id="out">
+          <div class="ohead">Answer <span class="grammar" id="grammarChip">grammar: object</span></div>
+          <div class="ojson" id="jsonText"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="dots" id="dots" role="group" aria-label="Choose a demo">
+      <button type="button" class="dot" data-scene="0" aria-label="Show the json_object demo"></button>
+      <button type="button" class="dot" data-scene="1" aria-label="Show the json_schema demo"></button>
+    </div>
+    <p class="caption" id="caption"></p>
+    <p class="demo-note">A simplified illustration of the two-phase decode.</p>
+  </div>
 
   <div class="phases">
     <div class="phase p1">
@@ -223,5 +336,187 @@ data: [DONE]</code></pre>
   </footer>
 
 </div>
+
+<script>
+(function(){
+  "use strict";
+
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // ===================================================================
+  // SCENE DATA — the two concrete request modes the page documents.
+  // `json` is rendered with the same key/string/number highlight classes
+  // as the static code blocks, so the animation and the reference agree.
+  // ===================================================================
+  var SCENES = [
+    {
+      profile: 'JSON Think',
+      mode: 'json_object',
+      grammar: 'grammar: object',
+      prompt: 'Return the first three primes. Use the key "primes".',
+      reason: 'The first three prime numbers are 2, 3, 5. The user asked for the key "primes" as an array.',
+      json: '{<span class="k">"primes"</span>: [<span class="n">2</span>, <span class="n">3</span>, <span class="n">5</span>]}',
+      caption: 'json_object — reason in plain text, then any valid JSON object.'
+    },
+    {
+      profile: 'JSON Think',
+      mode: 'json_schema',
+      grammar: 'grammar: { answer: string }',
+      prompt: 'Which mountain is the highest on Earth?',
+      reason: 'Mount Everest is the highest at 8,849 m. The schema requires an "answer" string.',
+      json: '{<span class="k">"answer"</span>: <span class="s">"Mount Everest"</span>}',
+      caption: 'json_schema — the same flow, but the object must satisfy your schema.'
+    }
+  ];
+
+  var AUTO_ADVANCE_MS = 2600;
+
+  var demo       = document.getElementById('demo');
+  var profileEl  = document.getElementById('profileName');
+  var promptEl   = document.getElementById('promptText');
+  var stepP1     = document.getElementById('stepP1');
+  var stepP2     = document.getElementById('stepP2');
+  var thinkEl    = document.getElementById('think');
+  var thinkMode  = document.getElementById('thinkMode');
+  var thinkStat  = document.getElementById('thinkStatus');
+  var thinkText  = document.getElementById('thinkText');
+  var outEl      = document.getElementById('out');
+  var grammarChip= document.getElementById('grammarChip');
+  var jsonText   = document.getElementById('jsonText');
+  var captionEl  = document.getElementById('caption');
+  var dotEls     = Array.prototype.slice.call(document.querySelectorAll('#dots .dot'));
+
+  // ---- cooperative cancellation: a dot click bumps `gen`, so the in-flight
+  // scene's next sleep rejects CANCELLED and stops cleanly. ----
+  var gen = 0, advanceTimer = null;
+  var CANCELLED = { cancelled: true };
+
+  function sleep(ms, myGen){
+    return new Promise(function(resolve, reject){
+      setTimeout(function(){
+        if (myGen !== undefined && myGen !== gen) reject(CANCELLED);
+        else resolve();
+      }, reduce ? 0 : ms);
+    });
+  }
+
+  function setActiveDot(i){
+    dotEls.forEach(function(d, k){
+      d.classList.toggle('on', k===i);
+      if (k===i) d.setAttribute('aria-current', 'true'); else d.removeAttribute('aria-current');
+    });
+  }
+  function setCaption(t){ captionEl.textContent = t; }
+
+  // reset the stage chrome to a scene's starting frame
+  function dress(s){
+    profileEl.textContent = s.profile;
+    promptEl.textContent  = s.prompt;
+    grammarChip.textContent = s.grammar;
+    thinkMode.textContent = '<think>';
+    thinkStat.textContent = '';
+    thinkStat.classList.remove('live');
+    thinkText.textContent = '';
+    thinkText.classList.remove('caret');
+    thinkEl.classList.remove('folded');
+    jsonText.innerHTML = '';
+    jsonText.classList.remove('gcaret');
+    outEl.classList.remove('active');
+    stepP1.classList.remove('on','done');
+    stepP2.classList.remove('on','done');
+  }
+
+  function words(str){ return str.split(' '); }
+
+  // ---- animated path ----
+  async function streamReason(s, myGen){
+    stepP1.classList.add('on');
+    thinkStat.textContent = 'reasoning…';
+    thinkStat.classList.add('live');
+    thinkText.classList.add('caret');
+    var w = words(s.reason);
+    for (var i=0;i<w.length;i++){
+      thinkText.textContent += (i?' ':'') + w[i];
+      await sleep(70, myGen);
+    }
+    thinkText.classList.remove('caret');
+    thinkStat.classList.remove('live');
+    thinkMode.textContent = '</think>';
+    thinkStat.textContent = 'done';
+    await sleep(360, myGen);
+    stepP1.classList.remove('on');
+    stepP1.classList.add('done');
+    thinkEl.classList.add('folded');   // fold the reasoning, hand off to phase 2
+  }
+
+  async function streamJson(s, myGen){
+    stepP2.classList.add('on');
+    outEl.classList.add('active');
+    jsonText.classList.add('gcaret');
+    // Type the (already highlighted) JSON one token-fragment at a time. Splitting
+    // on tag/punctuation boundaries keeps the highlight spans intact mid-stream.
+    var frags = s.json.match(/<span[^>]*>.*?<\/span>|[^<]+/g) || [s.json];
+    var acc = '';
+    for (var i=0;i<frags.length;i++){
+      acc += frags[i];
+      jsonText.innerHTML = acc;
+      jsonText.classList.add('gcaret');
+      await sleep(150, myGen);
+    }
+    jsonText.classList.remove('gcaret');
+    stepP2.classList.remove('on');
+    stepP2.classList.add('done');
+  }
+
+  async function run(i, myGen){
+    var s = SCENES[i];
+    dress(s);
+    await sleep(420, myGen);
+    await streamReason(s, myGen);
+    await sleep(220, myGen);
+    await streamJson(s, myGen);
+    setCaption(s.caption);
+  }
+
+  // ---- static final frame (reduced motion + error fallback) ----
+  function still(i){
+    var s = SCENES[i];
+    dress(s);
+    stepP1.classList.add('done');
+    stepP2.classList.add('done');
+    thinkMode.textContent = '</think>';
+    thinkStat.textContent = 'done';
+    thinkText.textContent = s.reason;
+    thinkEl.classList.add('folded');
+    outEl.classList.add('active');
+    jsonText.innerHTML = s.json;
+    setCaption('Animation paused (reduced motion). ' + s.caption);
+  }
+
+  async function play(i){
+    gen++; var myGen = gen;
+    if (advanceTimer){ clearTimeout(advanceTimer); advanceTimer = null; }
+    setActiveDot(i);
+    if (reduce){ still(i); return; }      // no animation: render the static frame
+    try {
+      await run(i, myGen);
+    } catch (e) {
+      if (e === CANCELLED) return;        // superseded by a newer scene
+      console.error(e); still(i); return; // a real error degrades to static
+    }
+    if (myGen !== gen) return;            // superseded during the final frame
+    advanceTimer = setTimeout(function(){ kick((i+1) % SCENES.length); }, AUTO_ADVANCE_MS);
+  }
+  function kick(i){ play(i).catch(function(e){ if (e !== CANCELLED){ console.error(e); still(i); } }); }
+
+  dotEls.forEach(function(d){
+    d.addEventListener('click', function(){ kick(parseInt(d.getAttribute('data-scene'), 10) || 0); });
+  });
+
+  function start(){ kick(0); }
+  if (document.readyState === 'complete') start();
+  else window.addEventListener('load', start);
+})();
+</script>
 </body>
 </html>
