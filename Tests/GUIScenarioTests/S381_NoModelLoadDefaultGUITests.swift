@@ -172,12 +172,12 @@ final class S381_NoModelLoadDefaultGUITests: XCTestCase {
     XCTAssertTrue(waitForStaticTextContaining(loadedReply, in: app, timeout: 30),
                   "pending message did not auto-send after Load: reply '\(loadedReply)' never rendered; app tree: \(app.debugDescription)")
 
-    // Once and only once: exactly one user bubble carries the message.
-    let userBubbles = app.descendants(matching: .staticText)
-      .matching(NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
-                            pendingMessage, pendingMessage))
-    XCTAssertEqual(userBubbles.count, 1,
-                   "pending message must send exactly once, found \(userBubbles.count); app tree: \(app.debugDescription)")
+    // Once and only once: exactly one user bubble carries the message. The
+    // bubble is one selectable NSTextView now (#636, `.textView`) — one element
+    // per message body — so the exact `== 1` count holds.
+    let userBubbleCount = transcriptTextMatchCount(pendingMessage, in: app)
+    XCTAssertEqual(userBubbleCount, 1,
+                   "pending message must send exactly once, found \(userBubbleCount); app tree: \(app.debugDescription)")
   }
 
   // MARK: - helpers
@@ -195,9 +195,10 @@ final class S381_NoModelLoadDefaultGUITests: XCTestCase {
                                            in app: XCUIApplication,
                                            timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
-    let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@", needle, needle)
     while Date() < deadline {
-      if app.descendants(matching: .staticText).matching(predicate).count >= 1 { return true }
+      // A message body is one selectable NSTextView now (#636, `.textView`),
+      // not per-block `.staticText`; `transcriptTextMatchCount` searches both.
+      if transcriptTextMatchCount(needle, in: app) >= 1 { return true }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25))
     }
     return false

@@ -401,3 +401,19 @@ enum NotKeyError: Error, CustomStringConvertible {
   case notHittable
   var description: String { "element never became hittable — app appears stuck not-key" }
 }
+
+/// Number of transcript elements whose label or value contains `needle`.
+///
+/// Each chat message BODY now renders into one selectable `NSTextView` (#636 —
+/// the cross-paragraph-selection fix), which AppKit exposes to XCUITest as a
+/// `.textView` carrying the whole message as its `value` — NOT as the per-block
+/// `.staticText` runs MarkdownUI produced. Notices, system rows, and chrome stay
+/// SwiftUI `Text` (`.staticText`). A message-content wait that queries only
+/// `.staticText` therefore silently misses the message body; search both element
+/// types. Counting stays correct: one `.textView` per message body, so a
+/// `>= N` wait still counts N distinct messages.
+func transcriptTextMatchCount(_ needle: String, in app: XCUIApplication) -> Int {
+  let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@", needle, needle)
+  return app.descendants(matching: .textView).matching(predicate).count
+       + app.descendants(matching: .staticText).matching(predicate).count
+}

@@ -215,17 +215,17 @@ final class S7_FirstLaunchWizardPackagedModelDownloadGUITests: XCTestCase {
 
   // MARK: - Helpers
 
-  /// Wait for any rendered static text whose label OR value contains `needle`
-  /// (MarkdownUI exposes assistant runs via `value`). Narrow `.staticText`
-  /// query — `descendants(.any)` can SIGBUS on a degraded session.
+  /// Wait for a rendered message whose label OR value contains `needle`. A
+  /// message body is one selectable NSTextView now (#636, `.textView`) carrying
+  /// the full string as its value, not the per-block `.staticText` MarkdownUI
+  /// produced; `transcriptTextMatchCount` searches both narrow types (not the
+  /// `descendants(.any)` that can SIGBUS on a degraded session).
   private func waitForStaticTextContaining(_ needle: String,
                                            in app: XCUIApplication,
                                            timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
-    let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
-                                needle, needle)
     while Date() < deadline {
-      if app.descendants(matching: .staticText).matching(predicate).count >= 1 {
+      if transcriptTextMatchCount(needle, in: app) >= 1 {
         return true
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))

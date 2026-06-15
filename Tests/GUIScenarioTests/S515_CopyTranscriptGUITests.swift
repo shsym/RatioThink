@@ -125,7 +125,112 @@ final class S515_CopyTranscriptGUITests: XCTestCase {
                    "Copy Answer must copy the verbatim multi-section Markdown source")
   }
 
+  /// #636 / GH #158 acceptance: a single mouse drag across paragraph
+  /// boundaries selects continuous text, and Copy yields the multi-paragraph
+  /// span. MarkdownUI's per-block `Text` rendering made this structurally
+  /// impossible (#515); the message now renders into one selectable
+  /// `NSTextView`, so one drag spans intro → list → code → tail.
+  @MainActor
+  func test_drag_selection_spans_paragraphs() async throws {
+    let config = try Self.loadConfig()
+    let baseURL = try XCTUnwrap(config["PIE_TEST_ENGINE_BASE_URL"],
+                                "\(Self.configPath) must define PIE_TEST_ENGINE_BASE_URL")
+    let pieHome = try XCTUnwrap(config["PIE_TEST_GUI_HOME"],
+                                "\(Self.configPath) must define PIE_TEST_GUI_HOME")
+    let model = config["PIE_TEST_CHAT_MODEL_PIN"] ?? "gui-stream-deterministic"
+
+    let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
+    app.launchArguments.append(contentsOf: [
+      "-NSQuitAlwaysKeepsWindows", "NO",
+      "-ApplePersistenceIgnoreState", "YES",
+    ])
+    app.launchEnvironment["PIE_HOME"] = pieHome
+    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = model
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
+    app.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "healthy"
+    configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
+    app.launch()
+    defer { app.terminate() }
+
+    var foreground = false
+    for _ in 0..<10 {
+      app.activate()
+      if app.wait(for: .runningForeground, timeout: 2) { foreground = true; break }
+    }
+    XCTAssert(foreground, "Rational.app did not reach runningForeground")
+    let window = app.windows.firstMatch
+    XCTAssertTrue(window.waitForExistence(timeout: 10),
+                  "main window missing; app tree: \(app.debugDescription)")
+    let windowMenu = app.menuBarItems["Window"]
+    if windowMenu.waitForExistence(timeout: 3) {
+      windowMenu.click()
+      let zoom = app.menuItems["Zoom"]
+      if zoom.waitForExistence(timeout: 2) { zoom.click() } else { app.typeKey(.escape, modifierFlags: []) }
+    }
+
+    openFreshChat(in: app)
+    typeComposerText("render the multi-section answer", in: app)
+    app.typeKey(.return, modifierFlags: [])
+
+    // The fenced code + tail land last; once the tail canary shows, the whole
+    // multi-block answer (intro → list → code → tail) is rendered.
+    XCTAssertTrue(waitForStaticTextContaining("copy515-tail", in: app, timeout: 30),
+                  "assistant multi-section answer did not render; app tree: \(app.debugDescription)")
+
+    // The rendered message is one selectable element now (one NSTextView), so
+    // its accessibility value carries the full multi-paragraph string. Drag
+    // from its top edge to its bottom edge to select across every paragraph.
+    let bubble = bubbleElementContaining("copy515-tail", in: app)
+    XCTAssertTrue(bubble.exists, "assistant bubble text element missing; app tree: \(app.debugDescription)")
+
+    // Poison the pasteboard so only a real cross-paragraph copy can satisfy
+    // the assertion.
+    let sentinel = "S636-SELECTION-SENTINEL"
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(sentinel, forType: .string)
+
+    var copied: String? = sentinel
+    for attempt in 0..<3 where copied == sentinel || copied == nil {
+      app.activate()
+      _ = app.wait(for: .runningForeground, timeout: 2)
+      let start = bubble.coordinate(withNormalizedOffset: CGVector(dx: 0.04, dy: 0.06))
+      let end = bubble.coordinate(withNormalizedOffset: CGVector(dx: 0.96, dy: 0.94))
+      start.press(forDuration: 0.2, thenDragTo: end)
+      app.typeKey("c", modifierFlags: .command)
+      copied = waitForPasteboardChange(from: sentinel, timeout: 5)
+      NSLog("S636 attempt %d: bubble frame %@, pasteboard changed: %@",
+            attempt, String(describing: bubble.frame), copied != sentinel ? "yes" : "no")
+    }
+
+    let selection = try XCTUnwrap(copied, "drag-copy produced no pasteboard string")
+    XCTAssertNotEqual(selection, sentinel, "drag selection did not copy anything")
+    // The proof of #158: ONE drag captured text from the FIRST paragraph and
+    // the LAST paragraph — a span MarkdownUI's per-block selection could not
+    // produce. The middle marker confirms the in-between blocks are included.
+    XCTAssertTrue(selection.contains("copy515-intro"),
+                  "selection missing the first paragraph; got: \(selection)")
+    XCTAssertTrue(selection.contains("copy515-tail"),
+                  "selection missing the last paragraph — drag did not span paragraphs; got: \(selection)")
+    XCTAssertTrue(selection.contains("copy515-item"),
+                  "selection missing the middle list block; got: \(selection)")
+  }
+
   // MARK: - helpers
+
+  /// The single selectable element whose accessibility value carries the whole
+  /// rendered message (the assistant bubble's `NSTextView`). Falls back across
+  /// element types since AppKit may surface the text view as a `textView` or a
+  /// `staticText` depending on the run.
+  @MainActor
+  private func bubbleElementContaining(_ needle: String, in app: XCUIApplication) -> XCUIElement {
+    let predicate = NSPredicate(format: "value CONTAINS[c] %@ OR label CONTAINS[c] %@", needle, needle)
+    for type in [XCUIElement.ElementType.textView, .staticText, .any] {
+      let match = app.descendants(matching: type).matching(predicate).firstMatch
+      if match.exists { return match }
+    }
+    return app.descendants(matching: .any).matching(predicate).firstMatch
+  }
 
   private func waitForPasteboardChange(from sentinel: String, timeout: TimeInterval) -> String? {
     let deadline = Date().addingTimeInterval(timeout)
@@ -142,10 +247,12 @@ final class S515_CopyTranscriptGUITests: XCTestCase {
                                            in app: XCUIApplication,
                                            timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
-    let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
-                                needle, needle)
     while Date() < deadline {
-      if app.descendants(matching: .staticText).matching(predicate).count >= 1 { return true }
+      // The rendered message is now one selectable `NSTextView` (#636), exposed
+      // as a `.textView` carrying the full string as its value — not the
+      // per-block `.staticText` MarkdownUI produced. `transcriptTextMatchCount`
+      // searches both so the render gate works for the new shape.
+      if transcriptTextMatchCount(needle, in: app) >= 1 { return true }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25))
     }
     return false

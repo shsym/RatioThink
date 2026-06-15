@@ -295,9 +295,12 @@ final class S507_StreamContinuityGUITests: XCTestCase {
                                                    count: Int,
                                                    timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
-    let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@", needle, needle)
     while Date() < deadline {
-      if app.descendants(matching: .staticText).matching(predicate).count >= count { return true }
+      // Each message body is one selectable NSTextView now (#636), exposed as a
+      // `.textView` — not per-block `.staticText`. `transcriptTextMatchCount`
+      // searches both, one element per message body, so the `>= count`
+      // semantics (the reply present in N chats) still hold.
+      if transcriptTextMatchCount(needle, in: app) >= count { return true }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25))
     }
     return false

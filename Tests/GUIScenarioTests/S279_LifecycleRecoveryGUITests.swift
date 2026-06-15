@@ -98,13 +98,11 @@ final class S279_LifecycleRecoveryGUITests: XCTestCase {
     timeout: TimeInterval
   ) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
-    let predicates = needles.map {
-      NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@", $0, $0)
-    }
     while Date() < deadline {
-      if predicates.contains(where: { predicate in
-        app.descendants(matching: .staticText).matching(predicate).count > 0
-      }) {
+      // Message bodies render as one selectable NSTextView each now (#636,
+      // `.textView`) rather than per-block `.staticText`;
+      // `transcriptTextMatchCount` searches both.
+      if needles.contains(where: { transcriptTextMatchCount($0, in: app) > 0 }) {
         return true
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))
