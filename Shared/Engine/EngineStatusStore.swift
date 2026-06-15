@@ -413,6 +413,12 @@ public final class EngineStatusStore: ObservableObject {
   /// default-model-change restart that boots the freshly-saved profile
   /// default (set-as-default, post-download).
   public func restartEngine(profileID: String, modelOverride: String? = nil) async throws {
+    // #587 resume trigger: a restart rebuilds the engine, so a paused loop
+    // (stopped/idle) must re-arm or the published status stays frozen while a
+    // live engine is running. Idempotent — a no-op on the `.running` restart
+    // path (ActiveModelServeExecutor) — and re-armed BEFORE the XPC call so the
+    // rebuild's `.starting` → `.running`/`.failed` transition is surfaced.
+    start()
     try requireHelperAvailable()
     do {
       try await client.restartEngine(profileID: profileID, modelOverride: modelOverride)

@@ -1073,6 +1073,31 @@ final class EngineStatusStoreTests: XCTestCase {
     store.stop()
   }
 
+  /// A restart is a resume trigger too (#587 review F1): `restartEngine`
+  /// rebuilds the engine, so a paused loop must re-arm or the published status
+  /// stays frozen at `.stopped`/old `.failed` while a live engine runs.
+  /// Sibling of `test_startEngine_rearms_paused_loop`.
+  func test_restartEngine_rearms_paused_loop() async throws {
+    let client = StubXPCClient()
+    client.setNext(.stopped)
+    let store = EngineStatusStore(client: client, pollInterval: 0.01, steadyPollInterval: 0.01)
+    store.start()
+    try await waitUntil("paused on .stopped") { store.status == .stopped }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    let callsAtPause = client.calls
+
+    client.setNext(.running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
+    try await store.restartEngine(profileID: "chat")
+    try await waitUntil("loop polling resumed and saw .running") {
+      guard client.calls > callsAtPause else { return false }
+      if case .running = store.status { return true }
+      return false
+    }
+    XCTAssertGreaterThan(client.calls, callsAtPause,
+                         "restartEngine must re-arm a paused loop")
+    store.stop()
+  }
+
   private func waitUntil(
     _ description: String,
     timeout: TimeInterval = 1.0,
