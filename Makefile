@@ -652,7 +652,7 @@ test-e2e-matrix: ## E2E area: FULL real-engine matrix — 9 curated models × {c
 bench-tot: ## Benchmark: ToT batched-vs-sequential strategies on real portable Metal — wall-clock + tok/s (#458)
 	Scripts/run-tot-bench.sh
 
-test-e2e-full: ## E2E area (NIGHTLY tier): 3-layer real-model proof — GUI download → engine boot → chat persist (S204). Heaviest GUI E2E (large instruct GGUF); run nightly/on-demand, not on the per-change hot path — the send+persist mechanics are already covered by test-e2e-chat (S258) and the download chain by S326FreshInstallDownloadE2ETests.
+test-e2e-full: ## E2E area (operator-gated): 3-layer real-model proof — GUI download → engine boot → chat persist (S204). Heaviest GUI E2E (large instruct GGUF); run on-demand, not on the per-change hot path — the send+persist mechanics are already covered by test-e2e-chat (S258) and the download chain by S326FreshInstallDownloadE2ETests.
 	Scripts/run-full-e2e.sh
 
 test-e2e-package: ## E2E area: packaged first-launch → model download → chat uses persisted default (S7 packaged model-download, #379)
