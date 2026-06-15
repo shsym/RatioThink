@@ -963,41 +963,95 @@ final class EngineDeathRecoveryTests: XCTestCase {
                    "engine-death branch must enter the recovery wait with the engine-relaunch budget")
   }
 
-  // MARK: - 13. Helper-wait ceiling is policy-derived, not a literal (#412 re-F1)
+  // MARK: - 13. Helper-wait ceiling covers the REAL ladder's measured worst case (#412 re-F1 / #416)
 
-  func test_helperUnreachableCeiling_covers_worstCase_and_tracks_policy() {
+  /// De-tautologized (#416). The prior version re-derived the SAME closed form
+  /// the `helperUnreachableCeiling` impl uses (`ceiling == worstCase + margin`),
+  /// so `ceiling >= worstCase` was vacuously true and blind to a formula that
+  /// drifts from the ladder's ACTUAL behavior. This instead DRIVES the real
+  /// `HelperHealthController` ladder to `.unreachable` under a fake clock and
+  /// MEASURES the elapsed worst case, then asserts the derived ceiling covers
+  /// it. The measurement is independent of the formula, so a structural ladder
+  /// change a hand-copied formula would miss (an extra probe per attempt, a
+  /// different reducer cadence) now fails this test. The clock advances 1s per
+  /// poll (the 1 Hz `EngineStatusStore` cadence) and `2 × probeBudget` per
+  /// reconcile (the App-side `HelperRegistrationRepair` worst case); every poll
+  /// and every reconcile fails so the ladder walks its full length. No real
+  /// sleeping — the clock is virtual, so the test is flake-free.
+  func test_helperUnreachableCeiling_covers_measuredWorstCase_of_real_ladder() async {
     let probe = HelperReconcileProbeBudget.seconds
 
-    // (a) The default helper-wait timeout MUST be the derived ceiling — not a
-    // hand-picked literal — and that ceiling MUST cover the ladder's worst-case
-    // time-to-.unreachable, modeled here INDEPENDENTLY of the ceiling formula
-    // (1 Hz cadence; each repair attempt probes reachability ~twice). If the
-    // wait could expire before the ladder escalates, `helperRecoveryGaveUp`
-    // never fires and the raw error surfaces — F1 reborn.
-    let p = HelperHealthPolicy()
-    let worstCaseToUnreachable =
-      TimeInterval(p.transientThreshold)
-      + TimeInterval(p.maxRepairAttempts) * (TimeInterval(p.repairGap) + 2 * probe)
-    let ceiling = ChatRecoveryPolicy.helperUnreachableCeiling(for: p, probeBudget: probe)
-    XCTAssertGreaterThanOrEqual(ceiling, worstCaseToUnreachable,
-      "derived ceiling must cover the ladder's worst-case time-to-.unreachable")
-    XCTAssertEqual(ChatRecoveryPolicy().helperUnreachableWaitTimeout, ceiling,
+    // Coverage must hold across the policy space, not just at the default —
+    // otherwise a formula that happens to fit the default but undercounts a
+    // retuned ladder would still pass. Each case drives the real ladder.
+    let policies: [HelperHealthPolicy] = [
+      HelperHealthPolicy(),                                            // shipping default
+      HelperHealthPolicy(transientThreshold: 3, maxRepairAttempts: 1, repairGap: 1),
+      HelperHealthPolicy(transientThreshold: 20, maxRepairAttempts: 4, repairGap: 7),
+      HelperHealthPolicy(maxRepairAttempts: 0),                        // auto-repair disabled
+    ]
+    for p in policies {
+      let measured = await measureWorstCaseToUnreachable(policy: p, probe: probe)
+      let ceiling = ChatRecoveryPolicy.helperUnreachableCeiling(for: p, probeBudget: probe)
+      XCTAssertGreaterThanOrEqual(ceiling, measured,
+        "derived ceiling \(ceiling)s must cover the real ladder's measured worst case \(measured)s for \(p)")
+    }
+
+    // The shipping default MUST BE the derived ceiling — not a hand-picked literal.
+    XCTAssertEqual(
+      ChatRecoveryPolicy().helperUnreachableWaitTimeout,
+      ChatRecoveryPolicy.helperUnreachableCeiling(for: HelperHealthPolicy(), probeBudget: probe),
       "the shipping default must BE the derived ceiling, not a hand-picked literal")
 
     // (b) The ceiling tracks the policy: bumping ANY ladder knob (or slowing
     // the reconcile probe) raises it, so a future retune cannot silently push
     // recovery past a stale ceiling and re-introduce F1.
+    let p = HelperHealthPolicy()
+    let base = ChatRecoveryPolicy.helperUnreachableCeiling(for: p, probeBudget: probe)
     func ceil(_ policy: HelperHealthPolicy, _ pb: TimeInterval = probe) -> TimeInterval {
       ChatRecoveryPolicy.helperUnreachableCeiling(for: policy, probeBudget: pb)
     }
-    XCTAssertGreaterThan(ceil(HelperHealthPolicy(transientThreshold: p.transientThreshold + 6)), ceiling,
+    XCTAssertGreaterThan(ceil(HelperHealthPolicy(transientThreshold: p.transientThreshold + 6)), base,
       "larger transientThreshold must raise the ceiling")
-    XCTAssertGreaterThan(ceil(HelperHealthPolicy(maxRepairAttempts: p.maxRepairAttempts + 1)), ceiling,
+    XCTAssertGreaterThan(ceil(HelperHealthPolicy(maxRepairAttempts: p.maxRepairAttempts + 1)), base,
       "more repair attempts must raise the ceiling")
-    XCTAssertGreaterThan(ceil(HelperHealthPolicy(repairGap: p.repairGap + 5)), ceiling,
+    XCTAssertGreaterThan(ceil(HelperHealthPolicy(repairGap: p.repairGap + 5)), base,
       "larger repairGap must raise the ceiling")
-    XCTAssertGreaterThan(ceil(p, probe + 5), ceiling,
+    XCTAssertGreaterThan(ceil(p, probe + 5), base,
       "a slower reconcile probe must raise the ceiling")
+  }
+
+  /// Drives the real `HelperHealthController` ladder to `.unreachable` with
+  /// every poll and every reconcile failing, advancing a fake clock 1s per poll
+  /// and `2 × probe` per reconcile, and returns the measured elapsed time. The
+  /// number of polls and reconciles is whatever the real reducer + controller
+  /// actually take, which is exactly what makes the coverage assertion
+  /// independent of the ceiling formula.
+  private func measureWorstCaseToUnreachable(policy: HelperHealthPolicy,
+                                             probe: TimeInterval) async -> TimeInterval {
+    let clock = FakeClock()
+    let controller = HelperHealthController(policy: policy, repair: {
+      clock.advance(2 * probe)   // a reconcile costs its worst-case probe budget…
+      return false               // …and never restores reachability
+    })
+    var polls = 0
+    while controller.health != .unreachable {
+      clock.advance(1)                          // 1 Hz poll cadence
+      controller.ingestPollOutcome(succeeded: false)
+      await controller.awaitRepairForTesting()  // serialize any reconcile this poll started
+      polls += 1
+      precondition(polls < 10_000, "ladder must terminate at .unreachable")
+    }
+    return clock.seconds
+  }
+
+  /// Virtual clock for `measureWorstCaseToUnreachable`. Accessed only on the
+  /// MainActor (the test, the controller, and its reconcile Task all run there),
+  /// so it needs no locking.
+  @MainActor
+  private final class FakeClock {
+    private(set) var seconds: TimeInterval = 0
+    func advance(_ dt: TimeInterval) { seconds += max(0, dt) }
   }
 
   // MARK: - helpers

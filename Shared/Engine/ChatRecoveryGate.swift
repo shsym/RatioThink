@@ -88,12 +88,17 @@ extension EngineStatusStore: ChatRecoveryGate {
 
   public func waitUntilRunning(timeout: TimeInterval) async -> Bool {
     if case .running = status { return true }
-    let deadline = Date().addingTimeInterval(timeout)
+    // Route the deadline AND the inter-poll sleep through the store's
+    // injected clock seam (`now` / `sleepFor`), so a unit test drives this
+    // wait on a virtual clock with zero real wall-clock budget instead of an
+    // elapsed-time assertion that flakes under scheduler load. Production
+    // defaults to `Date()` + `Task.sleep`, so behaviour is unchanged.
+    let deadline = now().addingTimeInterval(timeout)
     // Poll the published status rather than installing a fresh
     // Combine sink — keeps the wait inside the XPC cadence we
     // already own and avoids an out-of-band observation surface
     // the store doesn't currently expose.
-    while Date() < deadline {
+    while now() < deadline {
       if Task.isCancelled { return false }
       if case .running = status { return true }
       // F1: the App's helper-restart ladder definitively gave up
@@ -102,9 +107,9 @@ extension EngineStatusStore: ChatRecoveryGate {
       // escalation banner already explains it. The engine-gone path has no
       // helper-health source, so this never fires there.
       if helperRecoveryGaveUp { return false }
-      let remaining = deadline.timeIntervalSinceNow
+      let remaining = deadline.timeIntervalSince(now())
       let step = max(0.05, min(0.2, remaining))
-      try? await Task.sleep(nanoseconds: UInt64(step * 1_000_000_000))
+      await sleepFor(step)
     }
     if case .running = status { return true }
     return false
