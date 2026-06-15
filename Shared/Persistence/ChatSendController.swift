@@ -539,15 +539,20 @@ public final class ChatSendController: ObservableObject {
   ///  · `HTTPEngineError.engineGone` thrown synchronously by
   ///    `baseURLProvider` when the cached status is already
   ///    `.failed(.engineGone)` — the post-poll engine-death case.
-  ///  · A streaming throw (URLError, `.http`, `.stream`, …) that races ahead
-  ///    of the 1Hz poll: force a fresh helper poll and re-check. The retried
-  ///    classification covers BOTH (a) the engine died with a live helper
-  ///    (`isEngineGone`), and (b) the HELPER itself died mid-stream
-  ///    (`isHelperUnreachable`) — the App's helper-restart ladder will bring
-  ///    it back, so the turn waits for `.running` and retries instead of
-  ///    surfacing a raw transport error (#393/#412). A non-death fault leaves
-  ///    a reachable helper reporting a non-gone state, so neither flag trips
-  ///    and the error surfaces normally.
+  ///  · An engine-ANSWERED fault (`HTTPEngineError.api` / `.stream`) surfaces
+  ///    immediately via `engineAnswered` BEFORE the poll: the engine emitted a
+  ///    deliberate `{code,message}` envelope or error meta-frame, so it was not
+  ///    gone at request time and must never be reclassified as engine-gone by a
+  ///    coincident, independent death the refresh happens to observe (#335).
+  ///  · A transport-shaped throw (URLError, `.http`, `.nonHTTPResponse`, raw
+  ///    exceptions from the SSE reader, …) that races ahead of the 1Hz poll:
+  ///    force a fresh helper poll and re-check. The retried classification
+  ///    covers BOTH (a) the engine died with a live helper (`isEngineGone`),
+  ///    and (b) the HELPER itself died mid-stream (`isHelperUnreachable`) — the
+  ///    App's helper-restart ladder will bring it back, so the turn waits for
+  ///    `.running` and retries instead of surfacing a raw transport error
+  ///    (#393/#412). A non-death fault leaves a reachable helper reporting a
+  ///    non-gone state, so neither flag trips and the error surfaces normally.
   private static func classifyRecoverable(
     error: Error,
     gate: ChatRecoveryGate?
