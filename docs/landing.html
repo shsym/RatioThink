@@ -200,15 +200,86 @@
   footer a{color:var(--ink-soft)}
   footer .credit{margin-top:7px;font-size:11.5px}
 
+  /* ---------- JSON Think section ---------- */
+  .jt{margin:108px auto 0;max-width:760px}
+  .jt h2{font-family:var(--serif);font-size:25px;text-align:center;margin:0 0 8px;font-weight:600}
+  .jt .lede{text-align:center;font-size:14px;color:var(--ink-muted);max-width:62ch;margin:0 auto 22px}
+  .jt-stage{max-width:600px;margin:0 auto}
+  .jt-panel{background:var(--win-bg);border:1px solid var(--border-strong);border-radius:14px;
+    overflow:hidden;box-shadow:0 14px 40px rgba(44,39,34,.12)}
+  .jt-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px 13px;
+    background:var(--win-chrome);border-bottom:1px solid var(--win-line)}
+  .jt-track{display:flex;align-items:center;gap:7px;margin-left:auto}
+  .jt-step{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;
+    color:var(--ink-muted);background:var(--bg);border:1px solid var(--border-strong);
+    border-radius:999px;padding:5px 9px;transition:color .25s,border-color .25s,background .25s}
+  .jt-step i.d{width:6px;height:6px;border-radius:50%;background:var(--ink-muted);
+    transition:background .25s,box-shadow .25s}
+  .jt-step.p1.on{color:var(--accent-dark);border-color:var(--accent);background:rgba(var(--accent-rgb),.08)}
+  .jt-step.p1.on i.d{background:var(--accent);box-shadow:0 0 7px rgba(var(--accent-rgb),.7)}
+  .jt-step.p2.on{color:var(--kept);border-color:#a7bd5e;background:rgba(90,107,37,.09)}
+  .jt-step.p2.on i.d{background:var(--kept);box-shadow:0 0 7px rgba(90,107,37,.6)}
+  .jt-step.done{color:var(--ink-soft)}
+  .jt-arrow{color:var(--ink-muted);font-size:12px}
+  .jt-body{padding:14px 15px;min-height:228px;background:var(--win-bg)}
+  .jt-body .row{margin-bottom:11px}
+  .jt-think{background:var(--think-bg);border:1px solid var(--border);border-radius:11px;
+    padding:10px 12px;margin-bottom:11px;overflow:hidden;
+    transition:opacity .3s,max-height .35s ease;max-height:200px}
+  .jt-thead{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;
+    color:var(--accent-dark)}
+  .jt-thead #jtMode{color:var(--ink-muted);font-family:var(--mono);font-weight:500}
+  .jt-thead .jt-status{color:var(--ink-muted);font-weight:500}
+  .jt-thead .jt-status.live{animation:breathe 1.2s ease-in-out infinite}
+  .jt-ttext{margin-top:7px;font-family:var(--mono);font-size:12px;line-height:1.6;
+    color:var(--ink-soft);min-height:1.2em;white-space:pre-wrap;word-break:break-word}
+  .jt-think.folded{max-height:30px;opacity:.7}
+  .jt-think.folded .jt-ttext{display:none}
+  .jt-out{background:var(--bg);border:1px solid var(--border);border-radius:11px;overflow:hidden}
+  .jt-ohead{display:flex;align-items:center;gap:8px;padding:7px 11px;border-bottom:1px solid var(--border);
+    font-size:10.5px;font-weight:600;color:var(--ink-muted);letter-spacing:.04em;text-transform:uppercase}
+  .jt-grammar{margin-left:auto;font-family:var(--mono);font-size:10px;font-weight:600;
+    letter-spacing:0;text-transform:none;color:var(--kept);background:rgba(90,107,37,.1);
+    border:1px solid #c4d18a;border-radius:6px;padding:3px 6px;opacity:.45;transition:opacity .25s}
+  .jt-out.active .jt-grammar{opacity:1}
+  .jt-json{padding:11px 13px;font-family:var(--mono);font-size:12.5px;line-height:1.7;
+    color:var(--ink);min-height:2.1em;white-space:pre-wrap;word-break:break-word}
+  .jt-json .k{color:var(--accent-dark)} .jt-json .s{color:var(--kept)} .jt-json .n{color:var(--star)}
+  /* gcaret = constrained pass (green); caret = reasoning (ink) */
+  .jt-ttext.caret::after,.jt-json.gcaret::after{content:'';display:inline-block;width:7px;
+    height:1.05em;vertical-align:-2px;margin-left:1px;background:currentColor;opacity:.6;
+    animation:blink 1s steps(1) infinite}
+  .jt-json.gcaret::after{background:var(--kept);opacity:.85}
+  /* compact developer disclosure */
+  .jt-dev{max-width:600px;margin:18px auto 0;border:1px solid var(--border);border-radius:12px;
+    background:var(--bg);padding:0 14px}
+  .jt-dev summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--ink-soft);
+    padding:12px 2px;list-style:none}
+  .jt-dev summary::-webkit-details-marker{display:none}
+  .jt-dev summary::before{content:'▸ ';color:var(--ink-muted)}
+  .jt-dev[open] summary::before{content:'▾ '}
+  .jt-dev h4{font-size:11.5px;color:var(--ink-muted);margin:14px 0 5px;font-weight:600;
+    letter-spacing:.02em}
+  .jt-dev pre{background:var(--sunken);border:1px solid var(--border);border-radius:9px;
+    padding:11px 13px;overflow:auto;margin:0 0 6px}
+  .jt-dev pre code{font-family:var(--mono);font-size:11.5px;line-height:1.6;color:var(--ink)}
+  .jt-dev .cmt{color:var(--ink-muted)} .jt-dev .k{color:var(--accent-dark)}
+  .jt-dev .s{color:var(--kept)} .jt-dev .n{color:var(--star)}
+  .jt-dev p.caveat{font-size:12.5px;color:var(--ink-soft);margin:10px 0 14px}
+  .jt-dev p.caveat code{font-family:var(--mono);font-size:11.5px;background:var(--sunken);
+    border:1px solid var(--border);border-radius:5px;padding:1px 5px}
+
   @media (max-width:680px){
     .grid{grid-template-columns:1fr}
     header.hero h1{font-size:32px}
     header.hero p.tag{font-size:18px}
     .top-nav{justify-content:center;margin-bottom:12px}
+    .jt-track{width:100%;margin-left:0;justify-content:flex-start}
   }
   /* honor reduced motion: JS renders static frames; kill residual animation */
   @media (prefers-reduced-motion:reduce){
-    .caret::after,.burst::after,.tshead .status.searching,.tnode.win-pop,.tnode.win-pop .beam{animation:none}
+    .caret::after,.burst::after,.tshead .status.searching,.tnode.win-pop,.tnode.win-pop .beam,
+    .jt-ttext.caret::after,.jt-json.gcaret::after,.jt-thead .jt-status.live{animation:none}
     *{transition:none !important}
   }
 </style>
@@ -304,9 +375,85 @@
         <div class="ct"><h3>JSON Think</h3></div>
         <p>Need structured output? JSON Think lets the model reason in plain text, then forces the
            answer through a JSON grammar — so it's guaranteed to parse.
-           <a href="json-thinking.html">See the worked example →</a></p>
+           <a href="#json-think">See it in action ↓</a></p>
       </div>
     </div>
+  </section>
+
+  <!-- ===================== JSON Think ===================== -->
+  <section class="jt" id="json-think">
+    <h2>Structured output, guaranteed to parse</h2>
+    <p class="lede">JSON Think reasons in plain text, then forces the answer through a JSON grammar —
+       so it always parses. Two generations on one context: think first, then constrain.</p>
+
+    <div class="jt-stage">
+      <!-- The animated panel is decorative; aria-hidden is scoped to it ONLY so the
+           interactive scene dots below stay reachable by keyboard / assistive tech. -->
+      <div class="jt-panel" id="jtPanel" aria-hidden="true">
+        <div class="jt-bar">
+          <span class="pill active"><span class="lab">Profile:</span>&nbsp;JSON Think</span>
+          <div class="jt-track">
+            <span class="jt-step p1" id="jtP1"><i class="d"></i>Phase 1 · reason</span>
+            <span class="jt-arrow">→</span>
+            <span class="jt-step p2" id="jtP2"><i class="d"></i>Phase 2 · constrain</span>
+          </div>
+        </div>
+        <div class="jt-body">
+          <div class="row user"><div class="bubble user" id="jtPrompt">&nbsp;</div></div>
+          <div class="jt-think" id="jtThink">
+            <div class="jt-thead">Thinking <span id="jtMode">&lt;think&gt;</span>
+              <span class="jt-status" id="jtStatus">&nbsp;</span></div>
+            <div class="jt-ttext" id="jtReason"></div>
+          </div>
+          <div class="jt-out" id="jtOut">
+            <div class="jt-ohead">Answer <span class="jt-grammar" id="jtGrammar">grammar: object</span></div>
+            <div class="jt-json" id="jtJson"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="dots" id="jtDots" role="group" aria-label="Choose a JSON Think demo">
+        <button type="button" class="dot" data-scene="0" aria-label="Show the json_object demo"></button>
+        <button type="button" class="dot" data-scene="1" aria-label="Show the json_schema demo"></button>
+      </div>
+      <p class="caption" id="jtCaption"></p>
+    </div>
+
+    <!-- compact worked example kept on-page for developers (#646) -->
+    <details class="jt-dev">
+      <summary>For developers — call it over the local HTTP API</summary>
+
+      <h4>Request — any JSON object (<code>json_object</code>)</h4>
+      <pre><code><span class="cmt"># BASE = http://127.0.0.1:&lt;port&gt;   model = served id from GET /v1/models</span>
+curl "$BASE/v1/chat/completions" -H <span class="cmt">'Content-Type: application/json'</span> -d '{
+  <span class="k">"model"</span>: <span class="s">"&lt;served-model-id&gt;"</span>,
+  <span class="k">"messages"</span>: [{<span class="k">"role"</span>: <span class="s">"user"</span>, <span class="k">"content"</span>: <span class="s">"Return the first three primes. Use the key \"primes\"."</span>}],
+  <span class="k">"max_tokens"</span>: <span class="n">512</span>,
+  <span class="k">"response_format"</span>: {<span class="k">"type"</span>: <span class="s">"json_object"</span>}
+}'</code></pre>
+
+      <h4>Request — a specific shape (<code>json_schema</code>, object root required)</h4>
+      <pre><code>  <span class="k">"response_format"</span>: {
+    <span class="k">"type"</span>: <span class="s">"json_schema"</span>,
+    <span class="k">"json_schema"</span>: {<span class="k">"name"</span>: <span class="s">"answer"</span>, <span class="k">"schema"</span>: {
+      <span class="k">"type"</span>: <span class="s">"object"</span>,
+      <span class="k">"properties"</span>: {<span class="k">"answer"</span>: {<span class="k">"type"</span>: <span class="s">"string"</span>}},
+      <span class="k">"required"</span>: [<span class="s">"answer"</span>], <span class="k">"additionalProperties"</span>: <span class="n">false</span>
+    }}
+  }</code></pre>
+
+      <h4>Response — reasoning split from the parseable answer</h4>
+      <pre><code>{<span class="k">"choices"</span>: [{<span class="k">"message"</span>: {
+  <span class="k">"role"</span>: <span class="s">"assistant"</span>,
+  <span class="k">"reasoning_content"</span>: <span class="s">"The first three primes are 2, 3, 5…"</span>,
+  <span class="k">"content"</span>: <span class="s">"{\"primes\": [2, 3, 5]}"</span>
+}, <span class="k">"finish_reason"</span>: <span class="s">"stop"</span>}]}</code></pre>
+
+      <p class="caveat"><b>Tiny-budget caveat:</b> both phases share one <code>max_tokens</code> budget.
+        Set it too low and reasoning can eat it all, leaving no room for the answer — the engine then
+        fails the request with <code>json_empty_output</code> rather than returning a deceptive empty
+        <code>200</code>. Raise <code>max_tokens</code> to fix it.</p>
+    </details>
   </section>
 
   <footer>
@@ -671,6 +818,152 @@
   }
   // Always attach a .catch so a click-triggered rejection is never unhandled.
   function kick(i){ play(i).catch(function(e){ if (e !== CANCELLED){ console.error(e); renderStaticFallback(); } }); }
+
+  dotEls.forEach(function(d){
+    d.addEventListener('click', function(){ kick(parseInt(d.getAttribute('data-scene'), 10) || 0); });
+  });
+
+  function start(){ kick(0); }
+  if (document.readyState === 'complete') start();
+  else window.addEventListener('load', start);
+})();
+</script>
+
+<!-- JSON Think two-phase animation. Self-contained and isolated from the scene
+     reel above: its own generation token, dots, and reduced-motion fallback. -->
+<script>
+(function(){
+  "use strict";
+
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // The two concrete request modes the section documents. `json` carries the
+  // same key/string/number highlight classes as the developer code blocks, so
+  // the animation and the static reference agree.
+  var SCENES = [
+    { mode:'json_object', grammar:'grammar: object',
+      prompt:'Return the first three primes. Use the key "primes".',
+      reason:'The first three prime numbers are 2, 3, 5. The user wants them under the key "primes" as an array.',
+      json:'{<span class="k">"primes"</span>: [<span class="n">2</span>, <span class="n">3</span>, <span class="n">5</span>]}',
+      caption:'json_object — reason in plain text, then emit any valid JSON object.' },
+    { mode:'json_schema', grammar:'grammar: { answer: string }',
+      prompt:'Which mountain is the highest on Earth?',
+      reason:'Mount Everest is the highest at 8,849 m. The schema requires an "answer" string.',
+      json:'{<span class="k">"answer"</span>: <span class="s">"Mount Everest"</span>}',
+      caption:'json_schema — the same flow, but the object must satisfy your schema.' }
+  ];
+  var AUTO_ADVANCE_MS = 2600;
+
+  var panel    = document.getElementById('jtPanel');
+  if (!panel) return;
+  var promptEl = document.getElementById('jtPrompt');
+  var stepP1   = document.getElementById('jtP1');
+  var stepP2   = document.getElementById('jtP2');
+  var thinkEl  = document.getElementById('jtThink');
+  var modeEl   = document.getElementById('jtMode');
+  var statusEl = document.getElementById('jtStatus');
+  var reasonEl = document.getElementById('jtReason');
+  var outEl    = document.getElementById('jtOut');
+  var grammarEl= document.getElementById('jtGrammar');
+  var jsonEl   = document.getElementById('jtJson');
+  var captionEl= document.getElementById('jtCaption');
+  var dotEls   = Array.prototype.slice.call(document.querySelectorAll('#jtDots .dot'));
+
+  var gen = 0, advanceTimer = null;
+  var CANCELLED = { cancelled:true };
+
+  function sleep(ms, myGen){
+    return new Promise(function(resolve, reject){
+      setTimeout(function(){
+        if (myGen !== undefined && myGen !== gen) reject(CANCELLED);
+        else resolve();
+      }, reduce ? 0 : ms);
+    });
+  }
+  function setActiveDot(i){
+    dotEls.forEach(function(d, k){
+      d.classList.toggle('on', k===i);
+      if (k===i) d.setAttribute('aria-current', 'true'); else d.removeAttribute('aria-current');
+    });
+  }
+  function dress(s){
+    promptEl.textContent = s.prompt;
+    grammarEl.textContent = s.grammar;
+    modeEl.textContent = '<think>';
+    statusEl.textContent = ''; statusEl.classList.remove('live');
+    reasonEl.textContent = ''; reasonEl.classList.remove('caret');
+    thinkEl.classList.remove('folded');
+    jsonEl.innerHTML = ''; jsonEl.classList.remove('gcaret');
+    outEl.classList.remove('active');
+    stepP1.classList.remove('on','done');
+    stepP2.classList.remove('on','done');
+  }
+  function words(str){ return str.split(' '); }
+
+  async function streamReason(s, myGen){
+    stepP1.classList.add('on');
+    statusEl.textContent = 'reasoning…'; statusEl.classList.add('live');
+    reasonEl.classList.add('caret');
+    var w = words(s.reason);
+    for (var i=0;i<w.length;i++){ reasonEl.textContent += (i?' ':'') + w[i]; await sleep(68, myGen); }
+    reasonEl.classList.remove('caret');
+    statusEl.classList.remove('live');
+    modeEl.textContent = '</think>'; statusEl.textContent = 'done';
+    await sleep(340, myGen);
+    stepP1.classList.remove('on'); stepP1.classList.add('done');
+    thinkEl.classList.add('folded');         // fold reasoning, hand off to phase 2
+  }
+  async function streamJson(s, myGen){
+    stepP2.classList.add('on');
+    outEl.classList.add('active');
+    jsonEl.classList.add('gcaret');
+    // Type the highlighted JSON one fragment at a time, splitting on tag/text
+    // boundaries so highlight spans stay intact mid-stream.
+    var frags = s.json.match(/<span[^>]*>.*?<\/span>|[^<]+/g) || [s.json];
+    var acc = '';
+    for (var i=0;i<frags.length;i++){
+      acc += frags[i];
+      jsonEl.innerHTML = acc;
+      jsonEl.classList.add('gcaret');
+      await sleep(150, myGen);
+    }
+    jsonEl.classList.remove('gcaret');
+    stepP2.classList.remove('on'); stepP2.classList.add('done');
+  }
+  async function run(i, myGen){
+    var s = SCENES[i];
+    dress(s);
+    await sleep(420, myGen);
+    await streamReason(s, myGen);
+    await sleep(200, myGen);
+    await streamJson(s, myGen);
+    captionEl.textContent = s.caption;
+  }
+  function still(i){
+    var s = SCENES[i];
+    dress(s);
+    stepP1.classList.add('done'); stepP2.classList.add('done');
+    modeEl.textContent = '</think>'; statusEl.textContent = 'done';
+    reasonEl.textContent = s.reason;
+    thinkEl.classList.add('folded');
+    outEl.classList.add('active');
+    jsonEl.innerHTML = s.json;
+    captionEl.textContent = 'Animation paused (reduced motion). ' + s.caption;
+  }
+  async function play(i){
+    gen++; var myGen = gen;
+    if (advanceTimer){ clearTimeout(advanceTimer); advanceTimer = null; }
+    setActiveDot(i);
+    if (reduce){ still(i); return; }
+    try { await run(i, myGen); }
+    catch (e) {
+      if (e === CANCELLED) return;
+      console.error(e); still(i); return;
+    }
+    if (myGen !== gen) return;
+    advanceTimer = setTimeout(function(){ kick((i+1) % SCENES.length); }, AUTO_ADVANCE_MS);
+  }
+  function kick(i){ play(i).catch(function(e){ if (e !== CANCELLED){ console.error(e); still(i); } }); }
 
   dotEls.forEach(function(d){
     d.addEventListener('click', function(){ kick(parseInt(d.getAttribute('data-scene'), 10) || 0); });
