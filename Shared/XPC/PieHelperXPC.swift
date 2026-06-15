@@ -178,16 +178,6 @@ public protocol PieHelperXPC {
   func tailLog(stream: String,
                reply: @escaping (_ handle: FileHandle?, _ errorData: Data?) -> Void)
 
-  /// Recovery selector for the `.failed(.killRejected, …)` state
-  /// (PR12 review v5 F58). Intended to verify the zombie engine
-  /// process is actually gone before transitioning back to
-  /// `.stopped`. The in-process implementation was removed with
-  /// `PieSupervisor`; under `PieEngineHost` this selector currently
-  /// replies with a `wireContractViolation` (see
-  /// `HelperExportedAPI.clearKillRejected`). Reply is nil on success;
-  /// non-nil `EngineError` carries the reason a clear was refused.
-  func clearKillRejected(reply: @escaping (_ errorData: Data?) -> Void)
-
   /// Full-product quit (#448): stop the running engine, WAIT for it to
   /// reach a terminal state so `pie` is reaped (no orphan process), then
   /// terminate the Helper itself with a clean exit (so launchd's

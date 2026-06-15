@@ -223,8 +223,6 @@ private final class FixedStatusExportedObject: NSObject, PieHelperXPC, @unchecke
     )
   }
 
-  func clearKillRejected(reply: @escaping (Data?) -> Void) { reply(nil) }
-
   func quitHelper(reply: @escaping (Data?) -> Void) { reply(nil) }
 }
 
@@ -269,8 +267,6 @@ private final class NeverReplyStatusExportedObject: NSObject, PieHelperXPC, @unc
 
   func tailLog(stream: String,
                reply: @escaping (FileHandle?, Data?) -> Void) {}
-
-  func clearKillRejected(reply: @escaping (Data?) -> Void) {}
 
   // Wedged: intentionally never replies, like the selectors above.
   func quitHelper(reply: @escaping (Data?) -> Void) {}

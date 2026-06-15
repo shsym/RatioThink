@@ -185,18 +185,17 @@ public enum EngineErrorCode: String, Codable, Sendable {
   /// required — pie still alive" affordance instead of an
   /// auto-retry hint (review v3 F40).
   ///
-  /// Recovery contract (review v4 F50, v5 F58/F59, v6 F69/F70):
-  /// the in-process `clearKillRejected()` + boot-recovery that drove
-  /// this state were removed with `PieSupervisor`; `PieEngineHost`
-  /// does not produce `.killRejected` today and does not port that
-  /// recovery (see `PieEngineHost`'s scope note). The wire surface is
-  /// retained for a future re-port:
-  ///  · `PieHelperXPC.clearKillRejected(reply:)` — wire-level
-  ///    selector. Currently returns a `wireContractViolation`
-  ///    (`HelperExportedAPI.clearKillRejected`) because no engine
-  ///    manager implements the in-process path. No App-side GUI
-  ///    button drives it.
-  ///  · `kill -9 <pid>` manually (pid is in the fault log).
+  /// Produced by `PieEngineHost` when a SIGINT→SIGKILL shutdown cannot
+  /// confirm the `pie` process was reaped — `stateAfterShutdown` and the
+  /// launch-error shutdown path (#448 structured quit).
+  ///
+  /// Recovery contract (review v4 F50, v5 F58/F59, v6 F69/F70): the
+  /// in-process `clearKillRejected()` boot-recovery that cleared this
+  /// state was removed with `PieSupervisor` and is NOT ported here (see
+  /// `PieEngineHost`'s scope note). The orphan recovery selector was
+  /// retired in #630 — no engine manager implemented it and no GUI
+  /// button drove it. Today recovery is manual: `kill -9 <pid>` (pid is
+  /// in the fault log) or quit and reopen the app.
   case killRejected
   /// The requested model was rejected before launch because its
   /// resolved local artifact size is above Rational.app's v1 memory safety

@@ -846,27 +846,6 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     reply(nil, Self.notImplementedErrorData)
   }
 
-  /// PR12 review v5 F58: the `clearKillRejected` recovery path was
-  /// surfaced over XPC for the in-process `clearKillRejected()` /
-  /// boot-recovery that lived in the now-removed `PieSupervisor`.
-  /// `PieEngineHost` does not port that restart-ladder + boot-recovery
-  /// logic, so this selector currently returns a structured
-  /// `wireContractViolation` instead of silently no-oping — a GUI
-  /// button that drives it (none exists today) gets a real cause line.
-  public func clearKillRejected(reply: @escaping (Data?) -> Void) {
-    Self.log.error("clearKillRejected: not implemented under PieEngineHost — follow-up required")
-    let err = EngineError(
-      code: .wireContractViolation,
-      message: "clearKillRejected is not supported by PieEngineHost (restart/boot-recovery left out of scope; track the follow-up before wiring a GUI button)"
-    )
-    do {
-      reply(try XPCPayload.encode(err))
-    } catch {
-      Self.log.fault("clearKillRejected encode failed: \(String(describing: error), privacy: .public)")
-      reply(PieHelperXPCWire.fallbackReplyEncodeFailureData)
-    }
-  }
-
   // MARK: - quitHelper (#448)
 
   /// Full-product quit. Stops the engine and WAITS for it to reach a
@@ -1041,14 +1020,6 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
   public func tailLog(stream: String,
                       reply: @escaping (FileHandle?, Data?) -> Void) {
     reply(nil, degradedErrorData)
-  }
-
-  /// PR12 review v5 F58: degraded helpers cannot recover — they
-  /// never owned an engine. Refuse with the standard degraded error
-  /// so the GUI keeps presenting the degraded-mode affordance
-  /// instead of optimistically retrying.
-  public func clearKillRejected(reply: @escaping (Data?) -> Void) {
-    reply(degradedErrorData)
   }
 
   /// #448: a degraded Helper owns no engine, so there is nothing to reap —

@@ -4,9 +4,9 @@ import os
 
 /// XPC-side wiring between `HelperExportedAPI` and `PieEngineHost`
 /// ( — replaces the prior `PieSupervisor`-backed coverage).
-/// Drives the live selectors (engineStatus, startEngine, stopEngine,
-/// clearKillRejected) with a fake `LauncherCall` so the test harness
-/// does not need a real `pie` subprocess.
+/// Drives the live selectors (engineStatus, startEngine, stopEngine)
+/// with a fake `LauncherCall` so the test harness does not need a real
+/// `pie` subprocess.
 ///
 /// Behaviors not ported from the supervisor-era suite:
 ///  · `killRejected` / `stop-deadline` propagation — PieEngineHost
@@ -611,26 +611,6 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
     wait(for: [detachExp], timeout: 1)
     XCTAssertLessThanOrEqual(host.observerCountForTesting, baseline,
                              "stopEngine fallback path leaked observer (review v2 F28)")
-  }
-
-  // MARK: - clearKillRejected: stub under PieEngineHost
-
-  func test_clearKillRejected_returnsWireContractViolation() throws {
-    //  left PieSupervisor's restart/boot-recovery out of
-    // scope; clearKillRejected has no implementation under
-    // PieEngineHost, so the selector must surface the structured
-    // not-implemented error rather than silently no-op.
-    let api = HelperExportedAPI()
-    let exp = expectation(description: "clearKillRejected reply")
-    var captured: Data?
-    api.clearKillRejected { errorData in
-      captured = errorData
-      exp.fulfill()
-    }
-    wait(for: [exp], timeout: 1)
-    let data = try XCTUnwrap(captured)
-    let err = try XPCPayload.decode(EngineError.self, from: data)
-    XCTAssertEqual(err.code, .wireContractViolation)
   }
 
   // MARK: - helpers
