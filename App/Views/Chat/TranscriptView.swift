@@ -83,6 +83,10 @@ struct TranscriptView: View {
       // carry this text" must search here, not app-wide (Helpers.swift
       // `transcriptTextMatchCount`).
       .accessibilityIdentifier("transcript.list")
+      // #669: drop the macOS 26 top-edge scroll-edge blur here so the toolbar
+      // model picker / menus opening over the transcript's top strip render on a
+      // clean backdrop instead of a doubly-blurred one. No-op below macOS 26.
+      .hidingTopScrollEdgeBlur()
       // Content growth within the open chat (streaming tokens, a new
       // turn) scrolls smoothly to follow the latest bubble.
       .onChange(of: snapshot.scrollKey) { _, _ in
