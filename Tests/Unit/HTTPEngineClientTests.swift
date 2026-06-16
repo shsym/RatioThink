@@ -674,6 +674,67 @@ final class HTTPEngineClientTests: XCTestCase {
     XCTAssertEqual(calls.value, 2, "expected exactly one retry after the connection-lost failure")
   }
 
+  /// The retry is scoped to `URLError.networkConnectionLost` ONLY. A
+  /// non-2xx HTTP response surfaces as `HTTPEngineError` (not a
+  /// `URLError`), so it must NOT be retried — re-sending a request the
+  /// server actively rejected is wrong. Asserts a single attempt.
+  /// Mutation guard: broadening the retry `catch` to a bare `catch {}`
+  /// makes this retry the 503 and the attempt count jumps to 2 → fails.
+  func test_dispatchInferlet_non2xx_is_not_retried() async {
+    let calls = CallCounter()
+    FakeSSEURLProtocol.handler = { _ in
+      calls.increment()
+      return .text(status: 503, body: "in-flight-crash", headers: ["Retry-After": "1"])
+    }
+    let req = InferletRequest(
+      inferlet: "chat-apc",
+      input: Data(#"{"messages":[{"role":"user","content":"hi"}]}"#.utf8)
+    )
+    do {
+      for try await _ in makeClient().dispatchInferlet(req) {}
+      XCTFail("expected the 503 to surface as an error")
+    } catch is HTTPEngineError {
+      // expected — non-2xx maps to HTTPEngineError, not URLError
+    } catch {
+      XCTFail("expected HTTPEngineError, got \(type(of: error)): \(error)")
+    }
+    XCTAssertEqual(calls.value, 1, "a non-2xx response must not be retried")
+  }
+
+  /// Only a CONNECT-time connection-lost retries. A `networkConnectionLost`
+  /// raised AFTER the 200 response head has been accepted (so `openStream`
+  /// has already returned and the consumer is iterating frames) is a
+  /// mid-stream drop — re-running a partially consumed stream could
+  /// duplicate side effects, so it must surface to the caller, not retry.
+  ///
+  /// Determinism: the stub emits the 200 head FIRST, which is what resolves
+  /// `URLSession.bytes(for:)`; the failure is delivered afterward, so it can
+  /// only land mid-iteration — never at connect. `calls.value == 1` is
+  /// therefore exact (a retry would re-invoke the handler → 2). Whether the
+  /// single buffered frame surfaces before the failure is an incidental
+  /// URLSession race, so the frame payload is intentionally not asserted.
+  func test_dispatchInferlet_midstream_connection_lost_is_not_retried() async {
+    let calls = CallCounter()
+    FakeSSEURLProtocol.handler = { _ in
+      calls.increment()
+      return .sseThenFailure(chunks: ["data: {\"frame\":1}\n\n"],
+                             code: .networkConnectionLost)
+    }
+    let req = InferletRequest(
+      inferlet: "chat-apc",
+      input: Data(#"{"messages":[{"role":"user","content":"hi"}]}"#.utf8)
+    )
+    do {
+      for try await _ in makeClient().dispatchInferlet(req) {}
+      XCTFail("expected the mid-stream connection-lost to surface")
+    } catch let error as URLError {
+      XCTAssertEqual(error.code, .networkConnectionLost)
+    } catch {
+      XCTFail("unexpected error type: \(error)")
+    }
+    XCTAssertEqual(calls.value, 1, "a mid-stream drop must not be retried")
+  }
+
   // MARK: - Request body shape
 
   func test_chatCompletion_request_body_is_openai_flat() async throws {
@@ -841,6 +902,11 @@ final class FakeSSEURLProtocol: URLProtocol {
     /// keep-alive reuse surfacing as `URLError(code)` from
     /// `URLSession.bytes(for:)`, before any byte arrives.
     case failure(URLError.Code)
+    /// Open a 200 SSE stream, emit `chunks`, then fail the task with
+    /// `URLError(code)` AFTER streaming has begun — models a mid-stream
+    /// connection drop (which must NOT be retried; only connect-time
+    /// failures retry).
+    case sseThenFailure(chunks: [String], code: URLError.Code)
   }
 
   private static let lock = NSLock()
@@ -921,6 +987,27 @@ final class FakeSSEURLProtocol: URLProtocol {
 
     case .failure(let code):
       client?.urlProtocol(self, didFailWithError: URLError(code))
+
+    case .sseThenFailure(let chunks, let code):
+      let response = HTTPURLResponse(
+        url: request.url!,
+        statusCode: 200,
+        httpVersion: "HTTP/1.1",
+        headerFields: ["Content-Type": "text/event-stream"]
+      )!
+      client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+      let client = self.client
+      let proto = self
+      Task {
+        for chunk in chunks {
+          if proto.cancelled { break }
+          client?.urlProtocol(proto, didLoad: Data(chunk.utf8))
+        }
+        // Fail the in-flight task AFTER the stream opened and delivered
+        // bytes — the consumer is past `openStream`/`bytes(for:)` and
+        // iterating frames, so the retry path can no longer fire.
+        client?.urlProtocol(proto, didFailWithError: URLError(code))
+      }
     }
   }
 
