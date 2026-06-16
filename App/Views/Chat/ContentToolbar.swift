@@ -470,6 +470,25 @@ struct ContentToolbar: View {
           }
         }
         Spacer(minLength: 8)
+        // #678: the unverified signal is surfaced as an INDEPENDENT trailing
+        // badge, NOT folded into the single leading glyph — a row that is both
+        // current (checkmark) and unverified would otherwise drop the shield
+        // under the checkmark, so a just-downloaded, now-current unverified
+        // model looked identical to a verified one. Always rendered when
+        // unverified, regardless of current/blocked, and a11y-visible (the
+        // leading marker is `accessibilityHidden`, so VoiceOver had no
+        // unverified signal at all).
+        if option.isUnverified {
+          Image(systemName: "exclamationmark.shield.fill")
+            .imageScale(.small)
+            .foregroundStyle(.orange)
+            .help("Installed without a verified sha256 (no X-Linked-Etag advertised — e.g. a resumed download). Integrity was not checked.")
+            // Pure visual cue: hidden from accessibility so the row's
+            // `.accessibilityValue("Unverified")` is the SINGLE VoiceOver
+            // signal (no double announcement), matching the hidden leading
+            // marker above.
+            .accessibilityHidden(true)
+        }
       }
       // Shallow indent (~7pt): the leading bullet, not depth, carries the
       // sub-item meaning under the name header.
@@ -492,20 +511,40 @@ struct ContentToolbar: View {
     }
     .help(option.unavailableReason.map { "\(option.slug) — \($0)" } ?? option.slug)
     .accessibilityIdentifier("ModelRow-\(option.slug)")
+    // #678: expose the unverified state on the row VALUE too — the trailing
+    // icon alone is fragile to query and a row a11y value is the robust signal
+    // for both VoiceOver and automation.
+    .accessibilityValue(option.isUnverified ? "Unverified" : "")
+  }
+
+  /// The single leading glyph a row resolves to. Pure + `internal` so the
+  /// precedence is unit-testable without a view host (`ContentToolbarModelRowMarkerTests`).
+  enum LeadingMarker: Equatable { case current, blocked, bullet }
+
+  /// Leading-marker precedence for a quant row: current (checkmark) wins over
+  /// blocked (triangle), else a bullet dot. The column holds ONE glyph, so the
+  /// unverified state is deliberately NOT in this precedence — it would be
+  /// dropped whenever a row is also current/blocked (#678). Unverified is
+  /// surfaced independently by the trailing badge (`option.isUnverified`) +
+  /// the row a11y value, so it survives any leading glyph.
+  static func leadingMarker(_ option: ToolbarModelOptions.Option) -> LeadingMarker {
+    if option.isCurrent { return .current }
+    if option.unavailableReason != nil { return .blocked }
+    return .bullet
   }
 
   /// Leading marker for a quant row. Status wins (current → checkmark, blocked
-  /// → triangle, unverified → shield); otherwise a small bullet dot so the
-  /// variant reads as a sub-item of its name header without deep indentation.
+  /// → triangle); otherwise a small bullet dot so the variant reads as a
+  /// sub-item of its name header without deep indentation. The unverified shield
+  /// is a trailing badge (#678), not a leading glyph.
   @ViewBuilder
   private func rowLeadingMarker(_ option: ToolbarModelOptions.Option) -> some View {
-    if option.isCurrent {
+    switch Self.leadingMarker(option) {
+    case .current:
       Image(systemName: "checkmark").imageScale(.small).foregroundStyle(.primary)
-    } else if option.unavailableReason != nil {
+    case .blocked:
       Image(systemName: "exclamationmark.triangle").imageScale(.small).foregroundStyle(.orange)
-    } else if option.isUnverified {
-      Image(systemName: "exclamationmark.shield").imageScale(.small).foregroundStyle(.orange)
-    } else {
+    case .bullet:
       Circle().fill(Color.secondary).frame(width: 4, height: 4)
     }
   }

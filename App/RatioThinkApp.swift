@@ -193,6 +193,11 @@ struct RatioThinkApp: App {
     // env var is set AND the store is empty; compiled out of Release entirely.
     #if DEBUG
     TranscriptStressSeed.seedIfRequested(into: chatContainer.mainContext)
+    // #678 DEBUG-only GUI seam: stage an unverified model fixture under
+    // PIE_HOME/models when `PIE_TEST_SEED_UNVERIFIED_MODEL` is set, so the
+    // chat-dropdown unverified-mark guard has a real `.unverified` row to
+    // assert (the sandboxed XCUITest runner cannot write the file itself).
+    TestModelSeed.seedIfRequested()
     #endif
 
     // #412: App-side helper-health restart ladder, built + wired to the SAME
