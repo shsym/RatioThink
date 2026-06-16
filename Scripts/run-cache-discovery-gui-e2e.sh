@@ -48,16 +48,8 @@ APP_MODEL_DIR="$PIE_HOME/models/Qwen/Qwen3-0.6B-GGUF"
 cleanup() { rm -f "$CONFIG_FILE"; rm -rf "$RUN_ROOT"; }
 trap cleanup EXIT
 
-if ! pgrep -x Dock >/dev/null 2>&1; then
-  echo "cache-discovery gui e2e: no seated GUI session (Dock not running) — sit at console / Screen Sharing." >&2
-  exit 2
-fi
-if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "cache-discovery gui e2e: Rational.app + XCTest-runner Automation/Accessibility permissions required." >&2
-  echo "cache-discovery gui e2e: grant them in System Settings → Privacy & Security, then rerun:" >&2
-  echo "cache-discovery gui e2e:   PIE_TEST_TCC_GRANTED=1 Scripts/run-cache-discovery-gui-e2e.sh" >&2
-  exit 2
-fi
+e2e_require_seated_gui "cache-discovery gui e2e" || exit 2
+e2e_require_tcc "cache-discovery gui e2e" || exit 2
 
 # Stage both fixtures. File CONTENT is irrelevant to discovery — only
 # presence + the resolver's config/tokenizer/weight completeness gate.

@@ -28,6 +28,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
 TAG="first-launch package model-download e2e"
 
@@ -73,16 +74,8 @@ cleanup() {
 trap 'cleanup "$?"' EXIT
 
 require_seated_gui() {
-  if ! pgrep -x Dock >/dev/null 2>&1; then
-    echo "$TAG: no seated GUI session detected (Dock not running)" >&2
-    exit 2
-  fi
-  if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-    echo "$TAG: Rational.app Automation/Accessibility permissions required." >&2
-    echo "$TAG: grant the XCTest runner + Rational.app Automation + Accessibility in System Settings, then rerun:" >&2
-    echo "$TAG: PIE_TEST_TCC_GRANTED=1 Scripts/run-first-launch-package-model-download-e2e.sh" >&2
-    exit 2
-  fi
+  e2e_require_seated_gui "$TAG" || exit 2
+  e2e_require_tcc "$TAG" || exit 2
 }
 
 require_seated_gui

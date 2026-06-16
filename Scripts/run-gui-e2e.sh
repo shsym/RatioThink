@@ -28,16 +28,8 @@ CONFIG_FILE="/tmp/pie-real-model-e2e.env"
 cleanup() { rm -f "$CONFIG_FILE"; }
 trap cleanup EXIT
 
-if ! pgrep -x Dock >/dev/null 2>&1; then
-  echo "gui e2e: no seated GUI session (Dock not running) — sit at console / Screen Sharing." >&2
-  exit 2
-fi
-if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "gui e2e: Rational.app + XCTest-runner Automation/Accessibility permissions required." >&2
-  echo "gui e2e: grant them in System Settings → Privacy & Security, then rerun:" >&2
-  echo "gui e2e:   PIE_TEST_TCC_GRANTED=1 Scripts/run-gui-e2e.sh" >&2
-  exit 2
-fi
+e2e_require_seated_gui "gui e2e" || exit 2
+e2e_require_tcc "gui e2e" || exit 2
 if ! curl -sSf -o /dev/null --max-time 20 -r 0-0 "https://huggingface.co/$REPO/resolve/main/$FILE?download=true"; then
   echo "gui e2e: cannot reach Hugging Face for $REPO/$FILE — network required." >&2
   exit 2

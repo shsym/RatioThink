@@ -22,6 +22,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
 MODEL_ID="${PIE_TEST_ACQUIRE_MODEL_ID:-qwen2.5-0.5b-instruct-q4_k_m}"
 REPO="${PIE_TEST_ACQUIRE_REPO:-Qwen/Qwen2.5-0.5B-Instruct-GGUF}"
@@ -47,14 +48,8 @@ cleanup() {
 trap cleanup EXIT
 
 # ---- Gates -----------------------------------------------------------
-if ! pgrep -x Dock >/dev/null 2>&1; then
-  echo "full e2e: no seated GUI session (Dock not running)." >&2
-  exit 2
-fi
-if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "full e2e: grant Automation/Accessibility, then rerun with PIE_TEST_TCC_GRANTED=1." >&2
-  exit 2
-fi
+e2e_require_seated_gui "full e2e" || exit 2
+e2e_require_tcc "full e2e" || exit 2
 if [ ! -x "$PIE_BIN" ]; then
   echo "full e2e: pie engine missing at $PIE_BIN — run: make engine-build" >&2
   exit 2

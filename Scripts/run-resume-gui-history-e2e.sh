@@ -31,16 +31,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! pgrep -x Dock >/dev/null 2>&1; then
-  echo "resume gui history e2e: no seated GUI session detected (Dock not running)" >&2
-  exit 2
-fi
-if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "resume gui history e2e: Rational.app Automation/Accessibility permissions required." >&2
-  echo "resume gui history e2e: grant Xcode/XCTest runner and Rational.app Automation + Accessibility in System Settings, then rerun:" >&2
-  echo "resume gui history e2e: PIE_TEST_TCC_GRANTED=1 Scripts/run-resume-gui-history-e2e.sh" >&2
-  exit 2
-fi
+e2e_require_seated_gui "resume gui history e2e" || exit 2
+e2e_require_tcc "resume gui history e2e" || exit 2
 
 mkdir -p "$GUI_HOME" "$RUN_ROOT"
 rm -f "$URL_FILE" "$REQUEST_LOG" "$CONFIG_FILE"

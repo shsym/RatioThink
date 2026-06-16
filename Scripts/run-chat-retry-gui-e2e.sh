@@ -30,16 +30,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! pgrep -x Dock >/dev/null 2>&1; then
-  echo "chat-retry gui e2e: no seated GUI session detected (Dock not running)" >&2
-  exit 2
-fi
-if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "chat-retry gui e2e: Rational.app Automation/Accessibility permissions required." >&2
-  echo "chat-retry gui e2e: grant the XCTest runner and Rational.app Automation + Accessibility in System Settings, then rerun:" >&2
-  echo "chat-retry gui e2e: PIE_TEST_TCC_GRANTED=1 Scripts/run-chat-retry-gui-e2e.sh" >&2
-  exit 2
-fi
+e2e_require_seated_gui "chat-retry gui e2e" || exit 2
+e2e_require_tcc "chat-retry gui e2e" || exit 2
 
 mkdir -p "$GUI_HOME" "$RUN_ROOT"
 rm -f "$URL_FILE" "$CONFIG_FILE"

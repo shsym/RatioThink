@@ -11,6 +11,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p204-unv-$$}"
 GUI_HOME="$RUN_ROOT/g"
@@ -22,15 +23,8 @@ CONFIG_FILE="/tmp/pie-unverified-badge.env"
 cleanup() { rm -f "$CONFIG_FILE"; }
 trap cleanup EXIT
 
-if ! pgrep -x Dock >/dev/null 2>&1; then
-  echo "unverified-badge: no seated GUI session (Dock not running)." >&2
-  exit 2
-fi
-if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "unverified-badge: grant Automation + Accessibility to the test runner in System Settings," >&2
-  echo "unverified-badge: then rerun →  PIE_TEST_TCC_GRANTED=1 Scripts/run-unverified-badge-e2e.sh" >&2
-  exit 2
-fi
+e2e_require_seated_gui "unverified-badge" || exit 2
+e2e_require_tcc "unverified-badge" || exit 2
 
 # Stage the fixtures from the shell (unsandboxed) — a real /tmp path,
 # never NSTemporaryDirectory() (XCUITest temp-dir trap).

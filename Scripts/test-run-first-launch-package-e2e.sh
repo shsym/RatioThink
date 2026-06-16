@@ -66,7 +66,7 @@ FAKE_XCODEBUILD
     printf '%s\n' "$output" >&2
     exit 1
   fi
-  require_contains "$output" "Rational.app Automation/Accessibility permissions required"
+  require_contains "$output" "Automation/Accessibility permission required"
   require_contains "$output" "PIE_TEST_TCC_GRANTED=1"
   if [[ "$output" == *"generating Xcode project"* || "$output" == *"packaging Release app"* ]]; then
     echo "FAIL: default E2E must check TCC before package/build work" >&2

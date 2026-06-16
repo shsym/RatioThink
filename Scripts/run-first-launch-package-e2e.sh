@@ -8,6 +8,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
 CONFIG_FILE="/tmp/pie-first-launch-package-e2e.env"
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p175-first-launch-$$}"
@@ -43,16 +44,8 @@ USAGE
 }
 
 require_gui_preflight() {
-  if ! pgrep -x Dock >/dev/null 2>&1; then
-    echo "first-launch package e2e: no seated GUI session detected (Dock not running)" >&2
-    exit 2
-  fi
-  if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-    echo "first-launch package e2e: Rational.app Automation/Accessibility permissions required." >&2
-    echo "first-launch package e2e: grant Xcode/XCTest runner and Rational.app Automation + Accessibility in System Settings, then rerun:" >&2
-    echo "first-launch package e2e: PIE_TEST_TCC_GRANTED=1 Scripts/run-first-launch-package-e2e.sh" >&2
-    exit 2
-  fi
+  e2e_require_seated_gui "first-launch package e2e" || exit 2
+  e2e_require_tcc "first-launch package e2e" || exit 2
 }
 
 write_artifact_env() {
