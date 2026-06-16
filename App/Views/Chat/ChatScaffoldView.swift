@@ -94,11 +94,6 @@ struct ChatScaffoldView: View {
   /// profile switch, navigation away, or a stale resolution. The
   /// transitions live in `PendingSendState` so they are unit-tested.
   @State private var pendingSend = PendingSendState()
-  /// #673: armed for the duration of a profile-swap-triggered engine relaunch
-  /// (stop+start onto the new served model) so a second swap mid-relaunch is
-  /// rejected by the gate before the async cycle is observable on the poll
-  /// channel — mirrors `LocalAPIView.profileRestartInFlight`.
-  @State private var profileSwapRestartInFlight = false
   /// A blocked send may need to restart the single engine onto a different
   /// model, but doing that while another chat is streaming would interrupt
   /// that stream. Defer the automatic sync until the app-wide stream set is
@@ -306,43 +301,35 @@ struct ChatScaffoldView: View {
 
   /// #673: after a chat-toolbar profile swap is persisted, relaunch the engine
   /// onto the new profile's served model when (and only when) the engine is
-  /// already running a DIFFERENT model. Routes the decision through the shared
-  /// `LocalAPIProfileSwitchGate` (via `profileSwapEngineOutcome`) so the chat
-  /// swap and the Local API panel cannot disagree on what counts as a
-  /// model-changing switch.
+  /// already running a DIFFERENT model. The model-change decision routes
+  /// through the shared `LocalAPIProfileSwitchGate` (via
+  /// `profileSwapEngineOutcome`) so the chat swap and the Local API panel agree
+  /// on what counts as a model-changing switch. The relaunch itself routes
+  /// through the SAME stream-aware, target-bound engine-mutation path as the
+  /// pinned-mismatch relaunch and the explicit Load button
+  /// (`engineMutationDecision` → `loadDefaultModel` /
+  /// `deferEngineLoadUntilStreamsIdle`): a profile swap is not a permission to
+  /// interrupt an unrelated chat's in-flight stream, so a chat streaming
+  /// elsewhere defers the relaunch (and a stale target is dropped) before the
+  /// shared, app-scoped engine is touched.
   private func reloadEngineIfProfileSwapChangesModel(to newProfileID: String) {
+    var ignored = false  // F4: the swap path owns no persistent in-flight flag
     let outcome = Self.profileSwapEngineOutcome(
       newProfileID: newProfileID,
       chatModelID: chats.first?.modelID,
       newProfileDefaultModel: profileStore.model(forProfileID: newProfileID),
       status: engineStatusStore.status,
-      restartInFlight: &profileSwapRestartInFlight)
+      restartInFlight: &ignored)
     guard outcome == .restart else { return }
-    restartEngineForProfileSwap(profileID: newProfileID)
-  }
-
-  /// Stop+start the engine onto the model the swapped-in profile boots. v1 pie
-  /// binds the model at `pie serve` boot, so a model change is a full restart
-  /// (the same shape as `LocalAPIView.restartEngine`). The boot model mirrors
-  /// `startEngineForSelectedProfile`: an explicit per-chat pin
-  /// (`chats.first?.modelID`) beats the profile default (#459/#460). The
-  /// in-flight guard is cleared once the async cycle settles so a later swap
-  /// is actionable again; faults route to the same banners as a manual start.
-  private func restartEngineForProfileSwap(profileID: String) {
-    let modelOverride = chats.first?.modelID
-    Task { @MainActor in
-      defer { profileSwapRestartInFlight = false }
-      do {
-        engineActionError = nil
-        helperBlock = nil
-        try await engineCoordinator.stopEngine()
-        try await engineCoordinator.startEngine(profileID: profileID,
-                                                modelOverride: modelOverride)
-      } catch let block as HelperUnavailable {
-        helperBlock = block
-      } catch {
-        engineActionError = Self.engineErrorMessage(error, verb: "switch")
-      }
+    // `.restart` implies a running engine and a non-nil resolved target
+    // (the gate returns `.selectOnly` for a nil model — F2), so this unwrap
+    // succeeds; it also re-reads the target through the single resolver.
+    guard let chat = chats.first, let target = gateTarget(for: chat)?.modelID else { return }
+    switch Self.profileSwapRelaunchDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) {
+    case .runNow:
+      loadDefaultModel(target, for: chat)
+    case .deferUntilIdle:
+      deferEngineLoadUntilStreamsIdle(target, for: chat)
     }
   }
 
@@ -1375,6 +1362,12 @@ struct ChatScaffoldView: View {
     let selectedModelID = ModelTarget.resolve(
       selectedModelID: chatModelID,
       profileDefault: newProfileDefaultModel)?.modelID
+    // F2: a swap to a profile with no resolvable model (nil pin + nil default)
+    // is not a model change — never tear down a running engine for it. The
+    // gate's same-model short-circuit can't fire on a nil id, so guard here
+    // (leaving `LocalAPIView`'s contract untouched) rather than letting it
+    // fall through to `.restart` onto a model-less boot pie would reject.
+    guard selectedModelID != nil else { return .selectOnly }
     let runtimeProfileID: String?
     let runtimeModelID: String?
     if case .running(let snapshot) = status {
@@ -1475,6 +1468,13 @@ struct ChatScaffoldView: View {
   }
 
   static func pinnedMismatchRelaunchDecision(inFlightChatIDs: Set<UUID>) -> EngineMutationDecision {
+    engineMutationDecision(inFlightChatIDs: inFlightChatIDs)
+  }
+
+  /// #673: a chat-toolbar profile swap that changes the served model relaunches
+  /// the single, app-scoped engine — the same stream-defer invariant as the
+  /// pinned-mismatch relaunch (F1). A chat streaming elsewhere defers it.
+  static func profileSwapRelaunchDecision(inFlightChatIDs: Set<UUID>) -> EngineMutationDecision {
     engineMutationDecision(inFlightChatIDs: inFlightChatIDs)
   }
 
