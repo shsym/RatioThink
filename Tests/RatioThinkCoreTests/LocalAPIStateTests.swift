@@ -165,15 +165,39 @@ final class LocalAPIStateTests: XCTestCase {
                    "engine runs with [auth] enabled=false — no bearer header")
   }
 
+  // #654: the streaming toggle drives the example's `stream` field — the engine
+  // serves both modes, so the snippet must show how to request each.
+  func test_curl_snippet_reflects_streaming_toggle() {
+    let streaming = LocalAPICurl.chatCompletions(
+      baseURL: "http://127.0.0.1:8123", model: "m", streaming: true)
+    XCTAssertTrue(streaming.contains("\"stream\": true"))
+
+    let nonStreaming = LocalAPICurl.chatCompletions(
+      baseURL: "http://127.0.0.1:8123", model: "m", streaming: false)
+    XCTAssertTrue(nonStreaming.contains("\"stream\": false"),
+                  "stream:false must produce a non-streaming example (single JSON body)")
+    XCTAssertFalse(nonStreaming.contains("\"stream\": true"))
+  }
+
   // MARK: - routes
 
   func test_clientFacing_routes_match_chat_apc_contract() {
-    let ids = LocalAPIRoute.clientFacing.map(\.id)
+    let ids = LocalAPIRoute.clientFacing().map(\.id)
     XCTAssertEqual(ids, [
       "POST /v1/chat/completions",
       "GET /v1/models",
       "GET /healthz",
     ])
+  }
+
+  // #654: the chat-completions route summary reflects the streaming choice so
+  // the endpoints list and the curl example agree on the mode.
+  func test_chat_completions_route_summary_reflects_streaming_toggle() {
+    let streaming = LocalAPIRoute.clientFacing(streaming: true).first { $0.path == "/v1/chat/completions" }
+    XCTAssertEqual(streaming?.summary, "Chat completions (SSE streaming)")
+
+    let nonStreaming = LocalAPIRoute.clientFacing(streaming: false).first { $0.path == "/v1/chat/completions" }
+    XCTAssertEqual(nonStreaming?.summary, "Chat completions (single JSON response)")
   }
 
   // MARK: - posture drift guard (binds UI claims to the real launch config)
@@ -397,27 +421,108 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertTrue(startCalls.isEmpty)
   }
 
-  func test_profile_switch_gate_rejects_second_selection_while_restart_in_flight() {
-    let state = LocalAPIState.make(status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat")),
-                                   hasActiveProfile: true)
+  /// #654 ROOT-CAUSE LOCK: switching between two profiles that serve the SAME
+  /// model must NOT relaunch the engine. The pre-#654 gate relaunched on any
+  /// profile-id change — the observed "switching profiles restarts the engine"
+  /// defect. This fails (returns `.restart`) against that old behavior.
+  func test_same_model_profile_switch_does_not_relaunch_the_engine() {
+    let state = runningState(profileID: "chat", servedModel: modelY)
     var restartInFlight = false
 
-    XCTAssertTrue(LocalAPIProfileSwitchGate.acceptSelection(
-      selectedProfileID: "beta",
+    let outcome = LocalAPIProfileSwitchGate.decide(
+      selectedProfileID: "repeat-boost",
+      selectedModelID: modelY,          // same model as the running engine
       runtimeProfileID: "chat",
+      runtimeModelID: modelY,
       state: state,
       restartInFlight: &restartInFlight
-    ))
+    )
+
+    XCTAssertEqual(outcome, .selectOnly,
+                   "a same-model profile switch is a marker-only change — the engine binds only the model at boot, so it must stay up")
+    XCTAssertFalse(restartInFlight,
+                   "no relaunch fires, so the in-flight guard must NOT be armed")
+  }
+
+  /// A switch to a profile that serves a DIFFERENT model is a genuine engine
+  /// lifecycle event (v1 pie binds the model at boot, no runtime swap).
+  func test_different_model_profile_switch_relaunches_the_engine() {
+    let state = runningState(profileID: "chat", servedModel: modelY)
+    var restartInFlight = false
+
+    let outcome = LocalAPIProfileSwitchGate.decide(
+      selectedProfileID: "big",
+      selectedModelID: modelX,          // different model
+      runtimeProfileID: "chat",
+      runtimeModelID: modelY,
+      state: state,
+      restartInFlight: &restartInFlight
+    )
+
+    XCTAssertEqual(outcome, .restart)
+    XCTAssertTrue(restartInFlight,
+                  "a model-changing switch must synchronously arm the in-flight guard before the async stop/start")
+  }
+
+  /// Re-selecting the already-running profile, or selecting while the engine is
+  /// not running, is a marker-only change with no engine action.
+  func test_reselecting_running_profile_or_idle_engine_takes_no_engine_action() {
+    let running = runningState(profileID: "chat", servedModel: modelY)
+    var inFlight = false
+    XCTAssertEqual(
+      LocalAPIProfileSwitchGate.decide(
+        selectedProfileID: "chat", selectedModelID: modelY,
+        runtimeProfileID: "chat", runtimeModelID: modelY,
+        state: running, restartInFlight: &inFlight),
+      .selectOnly)
+    XCTAssertFalse(inFlight)
+
+    let stopped = LocalAPIState.make(status: .stopped, hasActiveProfile: true)
+    XCTAssertEqual(
+      LocalAPIProfileSwitchGate.decide(
+        selectedProfileID: "repeat-boost", selectedModelID: modelY,
+        runtimeProfileID: nil, runtimeModelID: nil,
+        state: stopped, restartInFlight: &inFlight),
+      .selectOnly,
+      "nothing is running, so there is nothing to relaunch")
+  }
+
+  func test_profile_switch_gate_rejects_second_selection_while_restart_in_flight() {
+    let state = runningState(profileID: "chat", servedModel: modelY)
+    var restartInFlight = false
+
+    XCTAssertEqual(LocalAPIProfileSwitchGate.decide(
+      selectedProfileID: "big",
+      selectedModelID: modelX,
+      runtimeProfileID: "chat",
+      runtimeModelID: modelY,
+      state: state,
+      restartInFlight: &restartInFlight
+    ), .restart)
     XCTAssertTrue(restartInFlight,
                   "the first profile switch must synchronously mark a restart in flight before spawning async stop/start")
 
-    XCTAssertFalse(LocalAPIProfileSwitchGate.acceptSelection(
-      selectedProfileID: "gamma",
+    XCTAssertEqual(LocalAPIProfileSwitchGate.decide(
+      selectedProfileID: "bigger",
+      selectedModelID: "Qwen/another.gguf",
       runtimeProfileID: "chat",
+      runtimeModelID: modelY,
       state: state,
       restartInFlight: &restartInFlight
-    ))
+    ), .reject,
+    "a second switch while a restart is in flight must be rejected")
     XCTAssertTrue(restartInFlight)
+  }
+
+  // MARK: - #654 helpers
+
+  private let modelX = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+  private let modelY = "Qwen/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q8_0.gguf"
+
+  private func runningState(profileID: String, servedModel: String) -> LocalAPIState {
+    LocalAPIState.make(
+      status: .running(EngineSessionSnapshot(port: 8123, profileID: profileID, servedModelID: servedModel)),
+      hasActiveProfile: true)
   }
 
   func test_profile_options_ignore_invalid_entries_and_mark_runtime_profile() throws {

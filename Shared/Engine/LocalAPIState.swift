@@ -258,23 +258,68 @@ public enum LocalAPIBindModeChange {
   }
 }
 
-/// Synchronous guard for runtime profile switches from the Local API surface.
-/// It exists so the view can reject a second selection immediately, before
+/// Synchronous decision for runtime profile switches from the Local API
+/// surface. It exists so the view can resolve a selection immediately, before
 /// SwiftUI observes `.stopping`/`.starting` from the poll channel.
+///
+/// #654: a profile switch only needs an engine RELAUNCH when it changes the
+/// SERVED MODEL. v1 pie binds just the model at `pie serve` boot
+/// (`LaunchSpecResolver.LaunchSpec` carries the model, not sampling /
+/// speculation / constraint / tree-of-thought — those are per-request fields in
+/// the `/v1/chat/completions` body). So switching to a DIFFERENT profile that
+/// serves the SAME model is a marker-only change: the engine stays up and the
+/// new profile's parameters apply per request. Only a model change is a
+/// lifecycle event. The pre-#654 gate relaunched on any profile-id change,
+/// which is the observed "switching profiles restarts the engine" defect.
 public enum LocalAPIProfileSwitchGate {
-  public static func acceptSelection(
+  /// What the view should do for a requested selection.
+  public enum Outcome: Equatable {
+    /// Not actionable right now (empty id, selection disabled, or a restart is
+    /// already in flight) — ignore the selection.
+    case reject
+    /// Accept the selection and persist the active-profile marker, but take NO
+    /// engine action: either nothing is running, the running profile was
+    /// re-selected, or the new profile serves the model already loaded.
+    case selectOnly
+    /// Accept the selection AND relaunch the engine bound to the new model.
+    case restart
+  }
+
+  /// Decide the outcome of selecting `selectedProfileID`.
+  ///
+  /// - Parameters:
+  ///   - selectedModelID: the model the newly selected profile serves.
+  ///   - runtimeProfileID: the profile the running engine booted with (`nil`
+  ///     when not running).
+  ///   - runtimeModelID: the model the running engine actually serves
+  ///     (`EngineSessionSnapshot.servedModelID`); compared against
+  ///     `selectedModelID` to detect a same-model switch.
+  ///   - restartInFlight: flipped to `true` only when the outcome is `.restart`,
+  ///     so the view can synchronously reject a second switch before the async
+  ///     stop/start cycle is observable on the poll channel.
+  public static func decide(
     selectedProfileID: String,
+    selectedModelID: String?,
     runtimeProfileID: String?,
+    runtimeModelID: String?,
     state: LocalAPIState,
     restartInFlight: inout Bool
-  ) -> Bool {
-    guard !selectedProfileID.isEmpty else { return false }
-    guard state.profileSelectionEnabled, !restartInFlight else { return false }
+  ) -> Outcome {
+    guard !selectedProfileID.isEmpty else { return .reject }
+    guard state.profileSelectionEnabled, !restartInFlight else { return .reject }
+    // Not running, or re-selecting the running profile: marker-only, no engine
+    // action.
     guard let runtimeProfileID, runtimeProfileID != selectedProfileID else {
-      return true
+      return .selectOnly
+    }
+    // Running a DIFFERENT profile that serves the SAME model: the engine binds
+    // only the model at boot, so there is nothing to relaunch — the new
+    // profile's params apply per request.
+    if let selectedModelID, let runtimeModelID, selectedModelID == runtimeModelID {
+      return .selectOnly
     }
     restartInFlight = true
-    return true
+    return .restart
   }
 }
 
@@ -299,11 +344,25 @@ public struct LocalAPIRoute: Equatable, Identifiable {
   /// isn't part of the standard client surface a user would call. (#469:
   /// there is no `/v1/models/load` — the served model is fixed at engine boot
   /// and read from `GET /v1/models`.)
-  public static let clientFacing: [LocalAPIRoute] = [
-    LocalAPIRoute(method: "POST", path: "/v1/chat/completions", summary: "Chat completions (SSE streaming)"),
-    LocalAPIRoute(method: "GET", path: "/v1/models", summary: "List served models"),
-    LocalAPIRoute(method: "GET", path: "/healthz", summary: "Health check"),
-  ]
+  ///
+  /// #654: the chat-completions summary reflects the panel's streaming toggle —
+  /// `chat-apc` serves BOTH `stream: true` (SSE) and `stream: false` (single
+  /// JSON body), branching on the request's `stream` field
+  /// (`handle_streaming` / `handle_non_streaming`).
+  public static func clientFacing(streaming: Bool = true) -> [LocalAPIRoute] {
+    [
+      LocalAPIRoute(method: "POST", path: "/v1/chat/completions",
+                    summary: chatCompletionsSummary(streaming: streaming)),
+      LocalAPIRoute(method: "GET", path: "/v1/models", summary: "List served models"),
+      LocalAPIRoute(method: "GET", path: "/healthz", summary: "Health check"),
+    ]
+  }
+
+  /// Human summary for the chat-completions route, reflecting the streaming
+  /// choice the user toggled in the panel.
+  public static func chatCompletionsSummary(streaming: Bool) -> String {
+    streaming ? "Chat completions (SSE streaming)" : "Chat completions (single JSON response)"
+  }
 }
 
 /// Read-only security posture of the engine's HTTP server. Each fact is
@@ -389,14 +448,14 @@ public enum LocalAPICurl {
   /// `/v1/models` (which the request `model` field MUST equal — `chat-apc`
   /// rejects a mismatch with `model_not_found`). No `Authorization` header:
   /// the engine runs with `[auth] enabled = false`.
-  public static func chatCompletions(baseURL: String, model: String) -> String {
+  public static func chatCompletions(baseURL: String, model: String, streaming: Bool = true) -> String {
     """
     curl \(baseURL)/v1/chat/completions \\
       -H 'Content-Type: application/json' \\
       -d '{
         "model": "\(model)",
         "messages": [{"role": "user", "content": "Hello"}],
-        "stream": true
+        "stream": \(streaming)
       }'
     """
   }

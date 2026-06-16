@@ -40,6 +40,11 @@ struct LocalAPIView: View {
   @State private var confirmStop = false
   @State private var selectedProfileID: String?
   @State private var profileRestartInFlight = false
+  /// #654: drives the example/route surface only — `stream: true` (SSE) vs
+  /// `stream: false` (single JSON body). The engine serves both; this toggle
+  /// shapes the curl snippet and the chat-completions route summary so a user
+  /// can see how to request each mode. It does NOT change engine launch state.
+  @State private var streamingEnabled = true
   /// Last engine start/stop failure, surfaced near the status card. The
   /// engine's poll channel does NOT cover resolver-stage start rejections
   /// (`.profileMissing`/`.invalidInput`/`.spawnFailed`/`.modelMissing`):
@@ -70,6 +75,16 @@ struct LocalAPIView: View {
 
   private var runtimeProfileID: String? {
     if case .running(let snapshot) = engineStatusStore.status { return snapshot.profileID }
+    return nil
+  }
+
+  /// The model the running engine actually serves (#654). Used to decide
+  /// whether a profile switch needs an engine relaunch — a same-model switch
+  /// does not. `nil` when not running or the snapshot carries no served model.
+  private var runtimeServedModelID: String? {
+    if case .running(let snapshot) = engineStatusStore.status {
+      return snapshot.servedModelID.isEmpty ? nil : snapshot.servedModelID
+    }
     return nil
   }
 
@@ -328,7 +343,7 @@ struct LocalAPIView: View {
   private var endpointsSection: some View {
     VStack(alignment: .leading, spacing: 6) {
       sectionHeader("Endpoints")
-      ForEach(LocalAPIRoute.clientFacing) { route in
+      ForEach(LocalAPIRoute.clientFacing(streaming: streamingEnabled)) { route in
         HStack(spacing: 8) {
           Text(route.method)
             .font(.caption.monospaced().weight(.semibold))
@@ -348,7 +363,7 @@ struct LocalAPIView: View {
   }
 
   private func curlSection(baseURL: String, model: String) -> some View {
-    let snippet = LocalAPICurl.chatCompletions(baseURL: baseURL, model: model)
+    let snippet = LocalAPICurl.chatCompletions(baseURL: baseURL, model: model, streaming: streamingEnabled)
     return VStack(alignment: .leading, spacing: 4) {
       HStack {
         sectionHeader("curl example")
@@ -360,6 +375,19 @@ struct LocalAPIView: View {
         }
         .controlSize(.small)
       }
+      Toggle(isOn: $streamingEnabled) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Streaming responses")
+          Text(streamingEnabled
+               ? "stream: true — tokens arrive as Server-Sent Events."
+               : "stream: false — one complete JSON response per request.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      .toggleStyle(.switch)
+      .accessibilityIdentifier("LocalAPIStreamingToggle")
       Text(snippet)
         .font(.system(.body, design: .monospaced))
         .textSelection(.enabled)
@@ -546,12 +574,19 @@ struct LocalAPIView: View {
   }
 
   private func selectProfile(_ profileID: String) {
-    guard LocalAPIProfileSwitchGate.acceptSelection(
+    // #654: only a switch that changes the SERVED MODEL relaunches the engine.
+    // A same-model switch (e.g. Chat → Repeat Boost, both Qwen3-0.6B) keeps the
+    // engine up — the new profile's sampling / speculation / constraint /
+    // tree-of-thought params apply per request, not at boot.
+    let outcome = LocalAPIProfileSwitchGate.decide(
       selectedProfileID: profileID,
+      selectedModelID: profileOptions.first { $0.id == profileID }?.modelID,
       runtimeProfileID: runtimeProfileID,
+      runtimeModelID: runtimeServedModelID,
       state: state,
       restartInFlight: &profileRestartInFlight
-    ) else { return }
+    )
+    guard outcome != .reject else { return }
     selectedProfileID = profileID
     do {
       try profileStore.setActiveProfileID(profileID)
@@ -560,8 +595,9 @@ struct LocalAPIView: View {
       engineActionError = "Couldn't select profile: \(error)"
       return
     }
-    guard runtimeProfileID != nil, runtimeProfileID != profileID else { return }
-    restartEngine(profileID: profileID)
+    if outcome == .restart {
+      restartEngine(profileID: profileID)
+    }
   }
 
   private func setExternalAccess(_ enabled: Bool) {
