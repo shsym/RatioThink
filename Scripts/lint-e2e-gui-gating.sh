@@ -88,21 +88,43 @@ if [ ${#wrappers[@]} -eq 0 ]; then
   exit 0
 fi
 
-# Code-only view of a wrapper: strip both whole-line `#` comments AND trailing
-# ` #…` comments (a comment after code is preceded by whitespace), so a doc line
-# OR a trailing note that merely names PIE_TEST_TCC_GRANTED / `pgrep Dock` is not
-# mistaken for a hand-rolled gate. A real gate is live shell — a var EXPANSION or
-# a `pgrep` call — which carries no leading `#` and no ` #` before it, so it
-# survives both strips untouched.
+# Code-only view of a wrapper: strip `#` comments — whole-line AND trailing —
+# so a doc line OR a trailing note that merely names PIE_TEST_TCC_GRANTED /
+# `pgrep Dock` is not mistaken for a hand-rolled gate. The strip is QUOTE-AWARE:
+# it walks each line tracking single/double-quote state and cuts only at a `#`
+# that is (a) OUTSIDE quotes and (b) at a comment boundary (line start, or
+# preceded by whitespace). A `#` inside a quoted string is kept verbatim.
 #
-# A `sed` parse always succeeds on a readable file; any non-zero exit is a READ
-# error (unreadable wrapper, chmod 000, vanished mid-scan). The old `|| true`
-# swallowed that into an empty result, so an unreadable GUI wrapper was silently
-# treated as gate-free and skipped. Propagate the failure (return rc) so the
-# caller fails loudly instead of false-greening.
+# A blind `sed 's/[[:space:]]+#.*//'` cut is wrong here: it would truncate at the
+# first whitespace-preceded `#` regardless of quoting, so a line like
+#   [ "$x" = "a # b" ] && [ "$PIE_TEST_TCC_GRANTED" = 1 ]
+# loses its gate-var expansion (the NEGATIVE rule false-greens a hand-rolled
+# gate), and `log "step #3" && e2e_require_tcc "fix"` loses a real gate CALL (the
+# POSITIVE rule false-fails) — net-new instances of the exact bug this guard
+# exists to catch.
+#
+# awk succeeds on any readable file; a non-zero exit is a READ error (unreadable
+# wrapper, chmod 000, vanished mid-scan). The old `|| true` swallowed that into
+# an empty result, so an unreadable GUI wrapper was silently treated as gate-free
+# and skipped. Propagate the failure (return rc) so the caller fails loudly.
 code_lines() {
   local out rc
-  out=$(sed -E 's/[[:space:]]+#.*$//; /^[[:space:]]*#/d' "$1") && rc=0 || rc=$?
+  out=$(awk -v SQ="'" -v DQ='"' '
+    {
+      s=0; d=0; res="";
+      for (i=1; i<=length($0); i++) {
+        c=substr($0,i,1);
+        if (c==SQ && d==0)      { s=1-s }
+        else if (c==DQ && s==0) { d=1-d }
+        else if (c=="#" && s==0 && d==0) {
+          p=(i==1)?"":substr($0,i-1,1);
+          if (i==1 || p==" " || p=="\t") break;
+        }
+        res=res c;
+      }
+      print res;
+    }
+  ' "$1") && rc=0 || rc=$?
   if [ "$rc" -ne 0 ]; then return "$rc"; fi
   printf '%s\n' "$out"
 }

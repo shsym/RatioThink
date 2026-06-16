@@ -224,6 +224,23 @@ write_wrapper "run-chat-gui-e2e.sh" "$GUI_SOURCE" "$GUI_SEATED" "$GUI_TCC" \
   'pgrep -x Dock >/dev/null || exit 2  # inline seated check, should be flagged' "$GUI_DRIVE"
 run "inline gate with trailing comment still flagged" FAIL
 
+# 17a. F1: the comment strip is QUOTE-AWARE. A hand-rolled gate whose line carries
+#      a quoted `#` BEFORE the gate expansion must still be flagged — a blind
+#      ` #…` cut would truncate at the quoted `#`, drop $PIE_TEST_TCC_GRANTED, and
+#      false-green the negative rule.
+reset_fixture
+write_wrapper "run-chat-gui-e2e.sh" "$GUI_SOURCE" "$GUI_SEATED" "$GUI_TCC" \
+  '[ "$mode" = "x # y" ] && [ "$PIE_TEST_TCC_GRANTED" = "1" ] || exit 2' "$GUI_DRIVE"
+run "hand-rolled gate behind quoted # still flagged (negative rule)" FAIL
+
+# 17b. F1 twin: a COMPLIANT wrapper whose gate CALL follows a quoted `#` on the
+#      same line must not false-fail — a blind cut would drop the `&& e2e_require_tcc`
+#      call and trip the positive rule.
+reset_fixture
+write_wrapper "run-chat-gui-e2e.sh" "$GUI_SOURCE" "$GUI_SEATED" \
+  'echo "step #3 done" && e2e_require_tcc "fix"' "$GUI_DRIVE"
+run "compliant gate call behind quoted # not false-failed" PASS
+
 # 18. FC3: a GUI wrapper that NAMES both gates only inside an echo string, never
 #     calling them, must FAIL — the call-anchored positive rule rejects the
 #     mention. The old unanchored token match false-greened it → expect FAIL.
