@@ -86,7 +86,11 @@ echo "tot-e2e: pie engine = $PIE_BIN"
 echo "tot-e2e: building chat-engine-harness"
 swift build --product chat-engine-harness >/dev/null
 
-# --- drive a real depth>1 ToT search through the app path -------------
+# --- drive real depth>1 ToT searches through the app path -------------
+# PIE_TEST_TOT_DEPTHS drives one search per depth on a single engine boot
+# (default "2,3"): the depth=2 case pins the final level, the depth=3 case
+# additionally pins a true intermediate depth>1 level, so the "every level
+# reasons under thinking:true" invariant (#649) is proven depth-parametrically.
 mkdir -p "$ROOT/logs"
 LOG="$ROOT/logs/test-$(date +%Y%m%d-%H%M%S)-tot-e2e.log"
 echo "tot-e2e: driving ToT app path (log: $LOG)"
@@ -96,10 +100,11 @@ PIE_TEST_HARNESS_MODEL_SLUG="$SLUG" \
 PIE_TEST_HARNESS_MODELS_ROOT="$MODELS_ROOT" \
 PIE_TEST_TOT_BREADTH="${PIE_TEST_TOT_BREADTH:-3}" \
 PIE_TEST_TOT_DEPTH="${PIE_TEST_TOT_DEPTH:-2}" \
+PIE_TEST_TOT_DEPTHS="${PIE_TEST_TOT_DEPTHS:-2,3}" \
 PIE_TEST_TOT_BEAM="${PIE_TEST_TOT_BEAM:-2}" \
 PIE_TEST_TOT_MAXTOK="${PIE_TEST_TOT_MAXTOK:-256}" \
 PIE_TEST_TOT_QUESTION="${PIE_TEST_TOT_QUESTION:-What is the best way to learn a new programming language?}" \
-  timeout "${PIE_TEST_TOT_TIMEOUT:-180}" .build/debug/chat-engine-harness 2>&1 | tee "$LOG"
+  timeout "${PIE_TEST_TOT_TIMEOUT:-300}" .build/debug/chat-engine-harness 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
 echo "tot-e2e: harness rc=$rc (0=tree_complete reached, 1=no terminal, 124=stall/timeout)"

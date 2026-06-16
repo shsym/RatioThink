@@ -89,9 +89,23 @@ enum EngineHarness {
       // missed. Exits non-zero if the stream stalls / ends without a
       // terminal.
       if let question = env["PIE_TEST_TOT_QUESTION"], !question.isEmpty {
-        let ok = try await runTreeOfThought(question: question, baseURL: baseURL, env: env)
+        // Depth-parametric coverage (#649 follow-up): prove the "every level
+        // reasons under thinking:true" invariant at more than one depth on a
+        // single engine boot. `PIE_TEST_TOT_DEPTHS` is a comma list (e.g.
+        // "2,3"); each depth drives its own ToT search on the same engine, so
+        // the deeper case exercises a true intermediate depth>1 level (level 2
+        // is no longer the final level). Falls back to the single
+        // `PIE_TEST_TOT_DEPTH` run when unset (back-compat).
+        let depths = parsedDepths(env: env)
+        var allOk = true
+        for d in depths {
+          if depths.count > 1 { print("chat-engine-harness: ── ToT depth case depth=\(d) ──") }
+          let ok = try await runTreeOfThought(
+            question: question, baseURL: baseURL, env: env, depthOverride: d)
+          allOk = allOk && ok
+        }
         _ = await session.shutdown(reason: "harness.tot_complete")
-        exit(ok ? 0 : 1)
+        exit(allOk ? 0 : 1)
       }
       try baseURL.absoluteString.write(to: urlFile, atomically: true, encoding: .utf8)
       print("chat-engine-harness: wrote \(urlFile.path)")
@@ -177,10 +191,10 @@ enum EngineHarness {
   /// per-event timing + the terminal. Returns true iff a `tree_complete`
   /// arrived (the live tree would reach a final answer in the UI).
   private static func runTreeOfThought(
-    question: String, baseURL: URL, env: [String: String]
+    question: String, baseURL: URL, env: [String: String], depthOverride: Int? = nil
   ) async throws -> Bool {
     let breadth = intEnv("PIE_TEST_TOT_BREADTH", 3, env: env)
-    let depth = intEnv("PIE_TEST_TOT_DEPTH", 2, env: env)
+    let depth = depthOverride ?? intEnv("PIE_TEST_TOT_DEPTH", 2, env: env)
     let beam = intEnv("PIE_TEST_TOT_BEAM", 2, env: env)
     let maxTok = intEnv("PIE_TEST_TOT_MAXTOK", 256, env: env)
     let input: [String: Any] = [
@@ -283,6 +297,22 @@ enum EngineHarness {
       if let sel = tree.selectedNode, sel.reasoning.isEmpty {
         failures.append("selected node carries no reasoning (expected thinking on)")
       }
+      // #649 follow-up: prove the invariant DEPTH-PARAMETRICALLY — every
+      // depth>1 level (the intermediate depth>1 levels AND the final level)
+      // must carry reasoning, not only the selected final node. The depth=2
+      // run pins the final level; the deeper run additionally pins a true
+      // intermediate depth>1 level (e.g. level 2 when depth=3). A level with
+      // ok nodes but no reasoning on any of them means that level fell back to
+      // the old final-depth /no_think behavior.
+      if depth >= 2 {
+        for level in 2...depth {
+          let okAtLevel = okNodes.filter { $0.depth == level }
+          if !okAtLevel.isEmpty, !okAtLevel.contains(where: { !$0.reasoning.isEmpty }) {
+            failures.append(
+              "no ok node at depth \(level) carries reasoning — that level is not reasoning under thinking:true")
+          }
+        }
+      }
     }
 
     if failures.isEmpty {
@@ -365,6 +395,19 @@ enum EngineHarness {
 
   private static func intEnv(_ key: String, _ fallback: Int, env: [String: String]) -> Int {
     env[key].flatMap { Int($0) } ?? fallback
+  }
+
+  /// The depths to drive (#649 follow-up). `PIE_TEST_TOT_DEPTHS` is a comma
+  /// list of positive ints; invalid/empty entries are dropped. Falls back to
+  /// the single `PIE_TEST_TOT_DEPTH` run so existing callers are unchanged.
+  private static func parsedDepths(env: [String: String]) -> [Int] {
+    if let raw = env["PIE_TEST_TOT_DEPTHS"], !raw.isEmpty {
+      let parsed = raw.split(separator: ",").compactMap {
+        Int($0.trimmingCharacters(in: .whitespaces))
+      }.filter { $0 >= 1 }
+      if !parsed.isEmpty { return parsed }
+    }
+    return [intEnv("PIE_TEST_TOT_DEPTH", 2, env: env)]
   }
 
   private static func doubleEnv(_ key: String, _ fallback: TimeInterval, env: [String: String]) -> TimeInterval {
