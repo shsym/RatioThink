@@ -231,7 +231,7 @@ struct ChatScaffoldView: View {
   /// once-per-launch latch now lives on the app-scoped coordinator (#616), so
   /// it survives this view's per-chat remount. #497: ask about the model the
   /// Load tap will BOOT (the chat's pin when present), not the bare profile
-  /// default the boot path may ignore — the same target the gate sheet names.
+  /// default the boot path may ignore — the same target the gate names.
   private func maybePromptEngineStartOnLaunch() {
     if engineCoordinator.shouldPromptEngineStartOnLaunch(
         autoStartEnabled: appPreferences.localAPIAutoStartEnabled,
@@ -258,7 +258,7 @@ struct ChatScaffoldView: View {
     // touching xattrs. The mutating `PieDirs.models()` does `createDirectory` +
     // `setResourceValues(isExcludedFromBackup)` on every call, so calling it
     // here would emit main-thread filesystem WRITES on every render while the
-    // no-model sheet is open. `modelsURL()` is pure path composition, and
+    // no-model gate is open. `modelsURL()` is pure path composition, and
     // `isModelResolvable` performs existence reads only; the download/staging
     // writers still call the mutating `models()`.
     LaunchSpecResolver.isModelResolvable(
@@ -447,11 +447,11 @@ struct ChatScaffoldView: View {
         // #326 Path 2: surface a swallowed failed(modelMissing) engine
         // state with an inline download + auto-start, instead of leaving
         // the user to discover it by failing a send.
-        // #446: suppress the banner ONLY when the send-gate sheet is presented
+        // #446: suppress the banner ONLY when the send-gate is presented
         // AND is itself showing the same inline download (action `.download`),
         // so the user never sees two download prompts for one model. Review F1:
-        // gate on the sheet's REAL download condition, not bare presentation —
-        // in the present-but-invalid staged-model edge the sheet shows Open
+        // gate on the gate's REAL download condition, not bare presentation —
+        // in the present-but-invalid staged-model edge the gate shows Open
         // Settings (action `.load`), which does NOT duplicate the banner, so the
         // banner (the only one-click download there) must stay visible.
         if let bannerTarget = MissingModelRecovery.bannerTarget(
@@ -526,6 +526,22 @@ struct ChatScaffoldView: View {
             : { messageID, newText in forkAndResend(messageID: messageID, newContent: newText, in: chat) }
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // #669: the no-model gate is a NON-modal overlay scoped to the
+        // transcript region — NOT a window-modal `.sheet`. A `.sheet` does
+        // not cover the top toolbar, but its modal session swallows every
+        // click to the rest of the window, the toolbar model picker
+        // included, so a user whose engine failed to start was trapped: the
+        // only fix (switch to a working model) sat in a toolbar the modal
+        // had just made inert. Overlaying only the transcript leaves the
+        // ContentToolbar (above) and the menu bar fully operable, so the
+        // picker stays a recovery path. The card is bounded
+        // (`.frame(width:360)`), so unlike the #496-deleted full-bleed
+        // overlay it cannot explode the layout.
+        .overlay {
+          if showNoModelPrompt {
+            noModelGate(for: chat)
+          }
+        }
         ComposerView(
           chat: chat,
           viewModel: viewModel,
@@ -549,49 +565,6 @@ struct ChatScaffoldView: View {
       }
     }
     .background(Color(nsColor: .windowBackgroundColor))
-    .sheet(isPresented: $showNoModelPrompt) {
-      NoModelLoadedPrompt(
-        // #397: the lifecycle state gives the prompt its "starting /
-        // loading…" framing while the engine/model comes up.
-        gateState: chatStartState(for: chat),
-        // #326: the model-availability action (Load / Download /
-        // unavailable) captured when the send was blocked.
-        action: noModelAction(for: chat),
-        onLoad: { model in
-          // #397: ensure the engine is running FIRST, then load — the
-          // pre-#397 `loadDirect` no-opped on a stopped engine. The sheet
-          // stays open, reflects busy→ready, and auto-dismisses below.
-          // The common load path defers while any chat is streaming so this
-          // prompt button can't restart the single engine out from under a
-          // sibling chat.
-          loadDefaultModel(model, for: chat)
-        },
-        onDownloaded: {
-          // Model is now on disk — boot the engine on this chat's
-          // profile so it loads (#326 auto-start). The status poll +
-          // model-load indicator surface the rest; the composer
-          // unblocks once the engine serves the model.
-          startEngineForSelectedProfile()
-          showNoModelPrompt = false
-        },
-        // #397 F1: retryable engine failure → re-start the engine.
-        onRetryEngineStart: { startEngineForSelectedProfile() },
-        // #397 F1: helper unreachable → force an immediate status re-poll.
-        onRefresh: { refreshEngineStatus() },
-        onCancel: {
-          // #516: a dismissed gate drops the pending send — the draft stays
-          // in the composer, but nothing auto-fires later.
-          pendingSend.disarm()
-          cancelDeferredEngineSync()
-          showNoModelPrompt = false
-        },
-        engineStatus: engineStatusStore.status,
-        // #516: only promise "…to send your message" when a blocked send is
-        // actually armed to fire (the launch-time prompt raises this same
-        // sheet with an empty composer — there, the copy must not lie).
-        willAutoSend: pendingSend.pending != nil
-      )
-    }
     .sheet(item: $pinnedModelMismatch) { mismatch in
       PinnedModelMismatchPrompt(
         mismatch: mismatch,
@@ -659,7 +632,7 @@ struct ChatScaffoldView: View {
     }
     // #397: auto-dismiss the gate once a model resolves (engine came up
     // and reconciled, or a load completed) so the user lands back at the
-    // composer with their draft intact — no stale "starting…" sheet.
+    // composer with their draft intact — no stale "starting…" gate.
     // These two are the post-reconcile edges — residency (or the re-seeded
     // selection) IS the new fact being observed, so no residency pre-check.
     .onChange(of: modelLoadCenter.residentModelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
@@ -1083,7 +1056,7 @@ struct ChatScaffoldView: View {
                                                 residentModelID: resident)
     case .noResolvableModel:
       // #516: capture the blocked send so it can auto-submit once the gate's
-      // load target resolves — the promise the no-model sheet's copy makes
+      // load target resolves — the promise the no-model gate's copy makes
       // ("…to send your message"). The #527 mismatch prompt deliberately does
       // not arm auto-send: choosing relaunch or resident is an explicit model
       // identity decision, not permission to send the draft afterwards.
@@ -1259,6 +1232,68 @@ struct ChatScaffoldView: View {
       ids.append(viewModel.selectedProfileID)
     }
     return ids.sorted()
+  }
+
+  /// #669: the no-model gate, a non-modal floating card over a dimmed
+  /// transcript backdrop. The scrim focuses attention and absorbs stray
+  /// transcript taps, but it is scoped to the transcript overlay — the
+  /// toolbar and menu bar stay live, so the model picker remains a recovery
+  /// path while the gate is up.
+  @ViewBuilder private func noModelGate(for chat: Chat) -> some View {
+    ZStack {
+      Rectangle()
+        .fill(.black.opacity(0.18))
+      noModelPrompt(for: chat)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .shadow(radius: 20)
+    }
+  }
+
+  /// The gate's content. Its lifecycle/availability inputs and every action
+  /// callback are unchanged from the prior `.sheet` presentation — only the
+  /// host (window-modal sheet → non-modal overlay) differs.
+  private func noModelPrompt(for chat: Chat) -> some View {
+    NoModelLoadedPrompt(
+      // #397: the lifecycle state gives the prompt its "starting /
+      // loading…" framing while the engine/model comes up.
+      gateState: chatStartState(for: chat),
+      // #326: the model-availability action (Load / Download /
+      // unavailable) captured when the send was blocked.
+      action: noModelAction(for: chat),
+      onLoad: { model in
+        // #397: ensure the engine is running FIRST, then load — the
+        // pre-#397 `loadDirect` no-opped on a stopped engine. The gate
+        // stays open, reflects busy→ready, and auto-dismisses below.
+        // The common load path defers while any chat is streaming so this
+        // prompt button can't restart the single engine out from under a
+        // sibling chat.
+        loadDefaultModel(model, for: chat)
+      },
+      onDownloaded: {
+        // Model is now on disk — boot the engine on this chat's
+        // profile so it loads (#326 auto-start). The status poll +
+        // model-load indicator surface the rest; the composer
+        // unblocks once the engine serves the model.
+        startEngineForSelectedProfile()
+        showNoModelPrompt = false
+      },
+      // #397 F1: retryable engine failure → re-start the engine.
+      onRetryEngineStart: { startEngineForSelectedProfile() },
+      // #397 F1: helper unreachable → force an immediate status re-poll.
+      onRefresh: { refreshEngineStatus() },
+      onCancel: {
+        // #516: a dismissed gate drops the pending send — the draft stays
+        // in the composer, but nothing auto-fires later.
+        pendingSend.disarm()
+        cancelDeferredEngineSync()
+        showNoModelPrompt = false
+      },
+      engineStatus: engineStatusStore.status,
+      // #516: only promise "…to send your message" when a blocked send is
+      // actually armed to fire (the launch-time prompt raises this same
+      // gate with an empty composer — there, the copy must not lie).
+      willAutoSend: pendingSend.pending != nil
+    )
   }
 
   /// #397: the live engine/model lifecycle state driving the gate's
