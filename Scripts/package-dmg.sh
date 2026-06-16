@@ -64,8 +64,11 @@ mkdir -p "$OUT_DIR"
 
 # Per-arch build dir keeps arm64 and x86_64 artifacts isolated so a
 # universal lipo merge (future work) can pick them up without
-# re-running xcodebuild.
-BUILD_DIR="$REPO_ROOT/build/xcode-$ARCH"
+# re-running xcodebuild. PACKAGE_DMG_BUILD_ROOT relocates the staging
+# tree off the repo's real build/ — used by the staging regression test
+# so it never wipes a developer's actual staged builds.
+BUILD_ROOT="${PACKAGE_DMG_BUILD_ROOT:-$REPO_ROOT/build}"
+BUILD_DIR="$BUILD_ROOT/xcode-$ARCH"
 SYM_ROOT="$BUILD_DIR/sym"
 OBJ_ROOT="$BUILD_DIR/obj"
 DERIVED="$BUILD_DIR/derived"
@@ -151,16 +154,16 @@ fi
 # Start from a clean staging dir. $SYM_ROOT (= CONFIGURATION_BUILD_DIR) is a
 # persistent per-arch dir reused across packaging runs, so a prior run's
 # RatioThink.app — including the pie engine staged into its Resources — survives
-# here. The engine build phase is `basedOnDependencyAnalysis: false` and
-# normally re-stages every build, but the #643 PIE_SKIP_ENGINE_BUILD opt-out can
-# no-op it (it is gated on CONFIGURATION!=Release, and this script accepts
-# --configuration Debug). A skipped phase over a surviving stale bundle would
-# ship an OLD engine that still passes every downstream guard below (present,
-# single-arch, signed, entitled). Wiping $SYM_ROOT makes those guards
-# load-bearing: if this build does not freshly stage an engine, RatioThink.app
-# has none and the "pie engine missing from bundle" check fails loudly instead.
-# Only the current arch's dir is removed, so a sibling arch build staged for a
-# future universal lipo merge (see BUILD_DIR comment above) is untouched.
+# here. The engine build phase re-stages on every build, but any phase that is
+# skipped, no-op'd, or left half-done (an interrupted/crashed prior build,
+# manual tampering, or a future opt-out env var) would leave that stale .app in
+# place. A stale-but-valid engine still passes every downstream guard below
+# (present, single-arch, signed, entitled) — they would all validate the OLD
+# binary and ship it. Wiping $SYM_ROOT makes those guards load-bearing: if this
+# build does not freshly stage an engine, RatioThink.app has none and the "pie
+# engine missing from bundle" check fails loudly instead. Only the current
+# arch's dir is removed, so a sibling arch build staged for a future universal
+# lipo merge (see BUILD_DIR comment above) is untouched.
 rm -rf "$SYM_ROOT"
 
 echo "package-dmg.sh: xcodebuild RatioThink (arch=$ARCH, configuration=$CONFIG)"
