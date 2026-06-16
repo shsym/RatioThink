@@ -97,7 +97,21 @@ enum MenuBarBrandIcon {
     // cutback, so a small radius is plenty — larger reads as a blob.
     let cornerRadius = edge * 0.085
     let inset = stroke / 2 + edge * 0.05
-    let r = rect.insetBy(dx: inset, dy: inset)
+    let bbox = rect.insetBy(dx: inset, dy: inset)
+
+    // A down-pointing triangle's area centroid sits `bbox.height / 6`
+    // (≈ edge * 0.13) ABOVE the bounding-box center — its mass clusters under
+    // the wide top edge — so filling the symmetric inset leaves the mark
+    // riding ~14% high in the canvas. Drop the whole triangle to pull
+    // the centroid back toward center. The nudge is capped below the full
+    // `/6` because the OUTLINE state strokes past the path apex: a larger
+    // shift lets its rounded apex touch the bottom edge once the icon
+    // rasterizes at the native 18 px size (and 36 px @2x). edge*0.10 keeps
+    // every state clear of the bottom edge at all backing scales while still
+    // cutting the centroid offset to ~+5% (from +14%). Everything positioned
+    // relative to the triangle (vertices + the centered knockouts) derives
+    // from `r`, so the shift stays in one place.
+    let r = bbox.offsetBy(dx: 0, dy: -edge * 0.10)
 
     // Down-pointing triangle: two top corners + a bottom-center apex.
     // Non-flipped coordinates (origin bottom-left), so maxY is the top.

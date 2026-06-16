@@ -41,6 +41,7 @@ APPICON_SET = ROOT / "Resources" / "Assets.xcassets" / "AppIcon.appiconset"
 DEFAULT_ORIGINAL = APPICON_SOURCE / "rational-icon-original-1254.png"
 HIGHRES = APPICON_SOURCE / "rational-icon-highres.png"
 
+ORIGINAL_SIZE = (1254, 1254)  # the pristine operator-provided original is square
 CANVAS = 1024          # master canvas edge
 PLATE = 824            # plate edge on the master (macOS icon-grid margin)
 KEY_TOLERANCE = 10     # backdrop is "near black": max(R,G,B) <= tolerance
@@ -94,11 +95,23 @@ def key_backdrop_to_alpha(im: Image.Image) -> Image.Image:
 
 def crop_to_alpha_bbox(im: Image.Image) -> Image.Image:
     bbox = im.getchannel("A").getbbox()
-    return im.crop(bbox) if bbox else im
+    if bbox is None:
+        raise ValueError(
+            "keyed plate has an empty alpha bounding box: the backdrop key "
+            "consumed the entire image. The original artwork is likely not the "
+            "expected navy plate on a near-black backdrop."
+        )
+    return im.crop(bbox)
 
 
 def build_master(original: Path) -> Image.Image:
-    plate = crop_to_alpha_bbox(key_backdrop_to_alpha(Image.open(original)))
+    source = Image.open(original)
+    if source.size != ORIGINAL_SIZE:
+        raise ValueError(
+            f"original artwork must be {ORIGINAL_SIZE[0]}x{ORIGINAL_SIZE[1]}, "
+            f"got {source.size[0]}x{source.size[1]}: {original}"
+        )
+    plate = crop_to_alpha_bbox(key_backdrop_to_alpha(source))
     plate = plate.resize((PLATE, PLATE), Image.LANCZOS)
     canvas = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
     offset = (CANVAS - PLATE) // 2

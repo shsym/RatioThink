@@ -13,6 +13,7 @@ import XCTest
 ///
 /// Narrow type queries only — `descendants(matching: .any)` can SIGBUS on a
 /// degraded session (GUI-test convention).
+// gui-suite: full-matrix-only: no product-area focused target; runs in the full `make test-gui` matrix.
 final class S218_CancelAffordancesGUITests: XCTestCase {
   override func setUp() async throws { try guardSeatedGUI() }
 

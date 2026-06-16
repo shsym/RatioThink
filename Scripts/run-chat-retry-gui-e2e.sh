@@ -9,6 +9,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
 MODEL="gui-stream-deterministic"
 REPLY_STEM="Deterministic reply"
@@ -98,8 +99,10 @@ Scripts/genproject.sh
 
 echo "chat-retry gui e2e: engine=$BASE_URL gui PIE_HOME=$GUI_HOME"
 echo "chat-retry gui e2e: running XCUITest"
+XCODE_LOG="$RUN_ROOT/xcodebuild.log"
 set +e
-xcodebuild -project RatioThink.xcodeproj \
+e2e_run_gui_xcodebuild "$XCODE_LOG" \
+  -project RatioThink.xcodeproj \
   -scheme RatioThinkGUITests \
   -destination 'platform=macOS,arch=arm64' \
   -parallel-testing-enabled NO \

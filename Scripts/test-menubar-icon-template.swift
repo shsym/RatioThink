@@ -18,7 +18,7 @@ struct RegionStats {
 
 struct TriangleHoleStats {
   let centerAlpha: Double
-  let mirroredCenterAlpha: Double
+  let lowerBodyAlpha: Double
   let sideRingAlpha: Double
   let apexAlpha: Double
 }
@@ -56,6 +56,17 @@ struct MenuBarIconTemplateTest {
         failures.append("\(state.name) alpha mask is empty: coverage=\(raster.alphaCoverage)")
       }
 
+      // The down-triangle's mass must sit vertically centered in the
+      // canvas. Before the centroid shift the ink rode ~14% high; assert the
+      // alpha-weighted centroid is within 7% of the image center (the fix
+      // lands it at ~3%). A regression in either direction — drifting back up
+      // or over-shooting and clipping the apex low — trips this.
+      let offset = verticalCentroidOffsetFraction(largeImage, pixels: 96)
+      if abs(offset) > 0.07 {
+        failures.append(String(format: "%@ ink centroid must be vertically centered: offset=%+.1f%% (limit ±7%%)",
+                               state.name, offset * 100))
+      }
+
       if state.name == "running" {
         let largeCenter = centerKnockoutStats(largeImage, pixels: 96, radius: 7)
         if largeCenter.averageAlpha >= 0.35 || largeCenter.transparentPixels < 50 {
@@ -67,8 +78,8 @@ struct MenuBarIconTemplateTest {
         if largeTriangle.centerAlpha >= 0.15 {
           failures.append("running triangle hole center must be transparent at preview size: alpha=\(largeTriangle.centerAlpha)")
         }
-        if largeTriangle.mirroredCenterAlpha <= 0.60 {
-          failures.append("running triangle hole must not accept mirrored preview center: alpha=\(largeTriangle.mirroredCenterAlpha)")
+        if largeTriangle.lowerBodyAlpha <= 0.60 {
+          failures.append("running hole must point DOWN — solid body below the hole apex at preview size: alpha=\(largeTriangle.lowerBodyAlpha)")
         }
         if largeTriangle.sideRingAlpha <= 0.60 {
           failures.append("running hollow must be triangular, not circular, at preview size: side ring alpha=\(largeTriangle.sideRingAlpha)")
@@ -87,8 +98,8 @@ struct MenuBarIconTemplateTest {
         if nativeTriangle.centerAlpha >= 0.35 {
           failures.append("running triangle hole center must be transparent at native size: alpha=\(nativeTriangle.centerAlpha)")
         }
-        if nativeTriangle.mirroredCenterAlpha <= 0.60 {
-          failures.append("running triangle hole must not accept mirrored native center: alpha=\(nativeTriangle.mirroredCenterAlpha)")
+        if nativeTriangle.lowerBodyAlpha <= 0.60 {
+          failures.append("running hole must point DOWN — solid body below the hole apex at native size: alpha=\(nativeTriangle.lowerBodyAlpha)")
         }
         if nativeTriangle.sideRingAlpha <= 0.35 {
           failures.append("running hollow must stay triangular, not circular, at native size: side ring alpha=\(nativeTriangle.sideRingAlpha)")
@@ -139,6 +150,25 @@ struct MenuBarIconTemplateTest {
     print("menu-bar icon template contract passed (\(states.count) states; \(summary))")
   }
 
+  /// Alpha-weighted vertical centroid offset from the image center, as a
+  /// fraction of the edge. Positive = centroid sits ABOVE center (the
+  /// off-center failure mode), negative = below.
+  private static func verticalCentroidOffsetFraction(_ image: NSImage, pixels: Int) -> Double {
+    let rep = bitmapRep(for: image, pixels: pixels)
+    var sumA = 0.0, sumRow = 0.0
+    for y in 0..<pixels {
+      for x in 0..<pixels {
+        guard let color = rep.colorAt(x: x, y: y) else { continue }
+        let a = Double(color.alphaComponent)
+        if a > 0.01 { sumA += a; sumRow += a * Double(y) }
+      }
+    }
+    guard sumA > 0 else { return 0 }
+    let centerRow = Double(pixels) / 2.0
+    // colorAt rows count from the TOP, so a small row index = high on screen.
+    return (centerRow - sumRow / sumA) / Double(pixels)
+  }
+
   private static func rasterize(_ image: NSImage, pixels: Int) -> RasterStats {
     let rep = bitmapRep(for: image, pixels: pixels)
     var litPixels = 0
@@ -167,14 +197,19 @@ struct MenuBarIconTemplateTest {
     let rep = bitmapRep(for: image, pixels: pixels)
     let metrics = drawingMetrics(pixels: pixels)
     let edge = Double(pixels)
+    let inset = edge * 0.10                 // stroke/2 + edge*0.05, mirrors draw()
+    let innerHeight = edge - 2 * inset
 
     let sideDx = max(2, Int((edge * 0.105).rounded()))
-    let apexDy = max(3, Int((edge * 0.16).rounded()))
+    // The knockout is a down-triangle scaled 0.36 about the centroid, so its
+    // own apex sits 0.24*innerHeight below the centroid. Sample halfway to it
+    // so the probe stays inside the hole at both render sizes.
+    let apexDy = max(2, Int((innerHeight * 0.12).rounded()))
     return triangleHoleStats(rep: rep,
                              pixels: pixels,
                              cx: metrics.cx,
                              centroidY: metrics.centroidY,
-                             mirroredCentroidY: metrics.mirroredCentroidY,
+                             lowerBodyY: metrics.lowerBodyY,
                              sideDx: sideDx,
                              apexDy: apexDy)
   }
@@ -183,7 +218,7 @@ struct MenuBarIconTemplateTest {
                                         pixels: Int,
                                         cx: Int,
                                         centroidY: Int,
-                                        mirroredCentroidY: Int,
+                                        lowerBodyY: Int,
                                         sideDx: Int,
                                         apexDy: Int) -> TriangleHoleStats {
     let sideAlphas = [
@@ -192,21 +227,31 @@ struct MenuBarIconTemplateTest {
     ]
     return TriangleHoleStats(
       centerAlpha: alpha(atDrawingX: cx, drawingY: centroidY, rep: rep, pixels: pixels),
-      mirroredCenterAlpha: alpha(atDrawingX: cx, drawingY: mirroredCentroidY, rep: rep, pixels: pixels),
+      lowerBodyAlpha: alpha(atDrawingX: cx, drawingY: lowerBodyY, rep: rep, pixels: pixels),
       sideRingAlpha: sideAlphas.reduce(0, +) / Double(sideAlphas.count),
       apexAlpha: alpha(atDrawingX: cx, drawingY: centroidY - apexDy, rep: rep, pixels: pixels)
     )
   }
 
-  private static func drawingMetrics(pixels: Int) -> (cx: Int, centroidY: Int, mirroredCentroidY: Int) {
+  // MenuBarBrandIcon drops the whole triangle by edge * 0.10 so its area
+  // centroid moves back toward the image center. Mirror that shift
+  // here so the knockout samplers track the actual centroid instead of where
+  // it used to sit; keep it in lockstep with the production constant in draw().
+  static let centroidShiftFraction = 0.10
+
+  private static func drawingMetrics(pixels: Int) -> (cx: Int, centroidY: Int, lowerBodyY: Int) {
     let edge = Double(pixels)
     let stroke = edge * 0.10
     let inset = stroke / 2 + edge * 0.05
     let innerHeight = edge - 2 * inset
     let cx = Int((edge / 2).rounded())
-    let centroidY = Int(((edge - inset) - innerHeight / 3).rounded())
-    let mirroredCentroidY = Int((inset + innerHeight / 3).rounded())
-    return (cx, centroidY, mirroredCentroidY)
+    let centroidYDouble = (edge - inset) - innerHeight / 3 - edge * centroidShiftFraction
+    let centroidY = Int(centroidYDouble.rounded())
+    // A row below the hole's apex (which sits 0.24*innerHeight under the
+    // centroid): solid for a DOWN-pointing triangle, hollow for an inverted
+    // one — so it guards the mark's orientation now that the hole is centered.
+    let lowerBodyY = Int((centroidYDouble - innerHeight * 0.34).rounded())
+    return (cx, centroidY, lowerBodyY)
   }
 
   private static func errorBadgeKnockoutStats(_ image: NSImage, pixels: Int, radius: Int) -> RegionStats {
@@ -216,7 +261,7 @@ struct MenuBarIconTemplateTest {
     let inset = stroke / 2 + edge * 0.05
     let innerHeight = edge - 2 * inset
     let cx = Int((edge / 2).rounded())
-    let centroidY = (edge - inset) - innerHeight / 3
+    let centroidY = (edge - inset) - innerHeight / 3 - edge * centroidShiftFraction  // centroid shift
     // Sample the exclamation bar, above the triangle centroid. Its dot is
     // intentionally smaller, so the bar gives the most stable mask signal.
     let barY = Int((centroidY + innerHeight * 0.10).rounded())

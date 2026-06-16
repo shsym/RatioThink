@@ -8,6 +8,7 @@ import XCTest
 /// so it needs no Helper or running engine. Captures a screenshot of the real
 /// native sliders + tick scale (the one thing the offscreen `ImageRenderer`
 /// snapshot can't show) for eyeballing.
+// gui-suite: full-matrix-only: no product-area focused target; runs in the full `make test-gui` matrix.
 final class S421_SamplingPopoverGUITests: XCTestCase {
   private var tempHomes: [String] = []
 

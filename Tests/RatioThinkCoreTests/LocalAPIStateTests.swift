@@ -560,6 +560,81 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertEqual(options.map(\.id), ["chat", "fast-think"])
     XCTAssertEqual(options.map(\.title), ["Chat", "Repeat Boost"])
     XCTAssertEqual(options.map(\.modelDisplayName), ["Qwen3-0.6B-Q8_0.gguf", "Qwen3-0.6B-Q8_0.gguf"])
-    XCTAssertEqual(options.map(\.isRuntimeProfile), [false, true])
+    // No served model passed → only the booted profile is "served live". This
+    // also pins the boot-id arm that keeps the badge for a legacy snapshot
+    // whose servedModelID is empty.
+    XCTAssertEqual(options.map(\.isServedLive), [false, true])
+  }
+
+  /// #663: after a SAME-MODEL switch the engine stays up bound to the same
+  /// model (#654 `.selectOnly`), so a sibling profile that serves the running
+  /// model is "served live" even though it is NOT the profile the engine
+  /// booted with — the "Running" badge must follow the served MODEL, not the
+  /// boot profile id. Mutation guard: drop the model-match arm in
+  /// `LocalAPIProfileOption.make` and `chat` flips to `false` here.
+  func test_same_model_sibling_is_served_live_after_select_only_switch() throws {
+    let chat = try Profile.parse(toml: """
+    id = "chat"
+    name = "Chat"
+    model = "\(modelX)"
+    inferlet = "chat-apc"
+    """)
+    let fast = try Profile.parse(toml: """
+    id = "fast-think"
+    name = "Repeat Boost"
+    model = "\(modelX)"
+    inferlet = "chat-apc"
+    """)
+
+    // Engine booted on `fast-think` and serves modelX; the user switched to
+    // `chat` (same model), a marker-only `.selectOnly` change.
+    let options = LocalAPIProfileOption.make(
+      entries: [
+        ProfileLoadResult(url: URL(fileURLWithPath: "/profiles/chat.toml"),
+                          profile: chat, error: nil, warnings: []),
+        ProfileLoadResult(url: URL(fileURLWithPath: "/profiles/fast-think.toml"),
+                          profile: fast, error: nil, warnings: []),
+      ],
+      runtimeProfileID: "fast-think",
+      runtimeServedModelID: modelX
+    )
+
+    XCTAssertEqual(options.map(\.id), ["chat", "fast-think"])
+    XCTAssertEqual(options.map(\.isServedLive), [true, true],
+                   "both same-model profiles must read as served live: the engine serves modelX")
+  }
+
+  /// A profile that serves a DIFFERENT model than the running engine is not
+  /// served live — selecting it would relaunch (`.restart`), so the badge must
+  /// stay off until the engine actually rebinds.
+  func test_different_model_profile_is_not_served_live() throws {
+    let chat = try Profile.parse(toml: """
+    id = "chat"
+    name = "Chat"
+    model = "\(modelX)"
+    inferlet = "chat-apc"
+    """)
+    let big = try Profile.parse(toml: """
+    id = "big"
+    name = "Big"
+    model = "\(modelY)"
+    inferlet = "chat-apc"
+    """)
+
+    // Engine booted on `chat` and serves modelX; `big` serves modelY.
+    let options = LocalAPIProfileOption.make(
+      entries: [
+        ProfileLoadResult(url: URL(fileURLWithPath: "/profiles/chat.toml"),
+                          profile: chat, error: nil, warnings: []),
+        ProfileLoadResult(url: URL(fileURLWithPath: "/profiles/big.toml"),
+                          profile: big, error: nil, warnings: []),
+      ],
+      runtimeProfileID: "chat",
+      runtimeServedModelID: modelX
+    )
+
+    XCTAssertEqual(options.map(\.id), ["chat", "big"])
+    XCTAssertEqual(options.map(\.isServedLive), [true, false],
+                   "a profile serving a different model than the engine must not read as served live")
   }
 }

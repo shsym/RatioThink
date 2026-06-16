@@ -66,7 +66,7 @@ endef
 
 .PHONY: help genproject build build-static build-tests clean lint verify-tot-docs ci-pr check-vendor-pin local-pre-merge local-gui-gate local-e2e-gate release-gate \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-package-dmg-staging test-collect-diagnostics test-landing-page \
-        test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
+        test-ci-v2-static-gate test-lint-gui-only-testing test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-sandbox-diagnostics test-readme-harness test-e2e-http \
         test-spec-smoke test-spec-bench test-spec-matrix-selftest bench-spec-matrix bench-datasets-prep bench-datasets-verify \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
@@ -97,7 +97,7 @@ build-static: genproject ## Compile/type-check Rational app + helper without bui
 check-vendor-pin: ## Fail-closed guard: Vendor/pie gitlink must be reachable from its .gitmodules tracking branch (catches pin/branch drift)
 	Scripts/check-vendor-pie-pin.sh
 
-ci-pr: lint check-vendor-pin test-ci-v2-static-gate verify-app-icon-assets test-app-icon-assets test-menubar-icon-template test-landing-page build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
+ci-pr: lint check-vendor-pin test-ci-v2-static-gate test-lint-gui-only-testing verify-app-icon-assets test-app-icon-assets test-menubar-icon-template test-landing-page build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
 
 local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary test-harsh-load-selftest test-matrix-aggregator ## Mandatory local pre-merge parity for runtime/heavy checks kept out of the lightweight manual workflow
 
@@ -513,6 +513,7 @@ test-gui-script: ## Fast preflight regressions for GUI/E2E wrapper scripts
 	Scripts/test-run-first-launch-package-e2e.sh
 	Scripts/test-run-first-launch-package-model-download-e2e.sh
 	Scripts/test-gui-testmanagerd-hint.sh
+	Scripts/test-gui-testmanagerd-wiring.sh
 
 test-gui-history: genproject ## Deterministic  GUI history/resume E2E — needs seated session
 	Scripts/run-resume-gui-history-e2e.sh
@@ -536,8 +537,12 @@ test-gui-load-default: genproject ## #381 deterministic GUI no-model → Load-de
 test-gui-first-launch-package: ## Package-backed  first-launch E2E — needs seated session
 	Scripts/run-first-launch-package-e2e.sh
 
-lint: verify-tot-docs ## Static checks for helper-side-effect and ToT docs/example invariants
+lint: verify-tot-docs ## Static checks for helper-side-effect, GUITests -only-testing wiring (#666), and ToT docs/example invariants
 	@Scripts/lint-helper-side-effects.sh
+	@Scripts/lint-gui-only-testing.sh
+
+test-lint-gui-only-testing: ## Mutation-proven self-test for the GUITests -only-testing guard (#666)
+	@Scripts/test-lint-gui-only-testing.sh
 
 verify-tot-docs: ## Verify Tree-of-Thought docs/example beam-search semantics
 	python3 Scripts/verify-tot-docs.py
@@ -634,6 +639,9 @@ test-gui-helper-recovery: genproject $(LOGDIR) ## GUI area: #496 helper unreacha
 
 test-gui-chat-switch: genproject $(LOGDIR) ## GUI area: #530 rapid chat-switching main-thread responsiveness guard — seeded long transcripts + stall watchdog (S530)
 	$(call gui_suite_run,chat-switch,-only-testing:RatioThinkGUITests/S530_RapidChatSwitchGUITests)
+
+test-gui-local-api: genproject $(LOGDIR) ## GUI area: #654/#663 Local API panel — seeded profile tabs + streaming toggle, same-model switch keeps engine and per-profile 'Running' badge (S654)
+	$(call gui_suite_run,local-api,-only-testing:RatioThinkGUITests/S654_LocalAPIPanelGUITests)
 
 # --- E2E wrappers by product area ------------------------------------------
 # Operator-gated (seated session + TCC; real engine/model or deterministic

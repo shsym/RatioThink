@@ -24,6 +24,7 @@ import XCTest
 /// `chat → repeat-boost` switch is a same-model switch. The non-sandboxed app
 /// auto-seeds the chat / repeat-boost / json-think / tree-of-thought profiles
 /// into the isolated `PIE_HOME`.
+// gui-suite: full-matrix-only: no product-area focused target; runs in the full `make test-gui` matrix.
 final class S654_LocalAPIPanelGUITests: XCTestCase {
   private var tempHomes: [String] = []
 
@@ -103,7 +104,50 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
                    "a same-model switch must not stop the engine (no 'Off')")
   }
 
+  /// #663: the per-profile "Running" badge (next to the selected profile's
+  /// model, id `LocalAPISelectedProfile`) must stay meaningful after a
+  /// same-model switch. The header status label is a sibling that also reads
+  /// "Running", so this scopes the assertion to the selected-profile row —
+  /// before #663 the badge was gated on the boot profile id and vanished when
+  /// the user switched to a same-model sibling.
+  @MainActor
+  func test_same_model_switch_keeps_per_profile_running_badge() throws {
+    let app = launchPinnedRunning()
+    defer { app.terminate() }
+    _ = openLocalAPIPanel(in: app)
+
+    // Boot profile shows the badge to begin with.
+    XCTAssertTrue(selectedProfileRowShowsRunning(in: app, timeout: 10),
+                  "the booted profile must show its 'Running' badge; app tree: \(app.debugDescription)")
+
+    // Switch to a same-model sibling (chat → repeat-boost). The badge must
+    // follow the served model, not the boot profile id.
+    let repeatBoost = profileSegment("Repeat Boost", in: app)
+    XCTAssertTrue(repeatBoost.waitForExistence(timeout: 10),
+                  "Repeat Boost tab missing; app tree: \(app.debugDescription)")
+    repeatBoost.click()
+
+    XCTAssertTrue(selectedProfileRowShowsRunning(in: app, timeout: 5),
+                  "after a same-model switch the selected profile must still show 'Running'; app tree: \(app.debugDescription)")
+  }
+
   // MARK: - helpers
+
+  /// Whether the selected-profile row's green "Running" badge is present.
+  ///
+  /// SwiftUI exposes the row (id `LocalAPISelectedProfile`) as a single
+  /// StaticText whose accessibility VALUE becomes "Running" when the badge
+  /// renders, so this matches on `identifier == LocalAPISelectedProfile AND
+  /// value CONTAINS "Running"` — scoping by identifier excludes the sibling
+  /// header status label (`LocalAPIStatus`, which also reads "Running"), and
+  /// waiting on the value handles the async snapshot/selection update.
+  @MainActor
+  private func selectedProfileRowShowsRunning(in app: XCUIApplication, timeout: TimeInterval) -> Bool {
+    let badge = app.descendants(matching: .any).matching(
+      NSPredicate(format: "identifier == %@ AND value CONTAINS %@",
+                  "LocalAPISelectedProfile", "Running")).firstMatch
+    return badge.waitForExistence(timeout: timeout)
+  }
 
   @MainActor
   private func launchPinnedRunning() -> XCUIApplication {

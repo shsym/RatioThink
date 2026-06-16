@@ -420,21 +420,39 @@ public struct LocalAPIProfileOption: Equatable, Identifiable {
   public let title: String
   public let modelID: String
   public let modelDisplayName: String
-  public let isRuntimeProfile: Bool
+
+  /// Whether selecting this profile means the engine is serving it live right
+  /// now — the basis of the "Running" badge.
+  ///
+  /// #663: this is model-aware, not profile-id-aware. The pre-#663 rule was a
+  /// strict `profile.id == runtimeProfileID` (the profile the engine BOOTED
+  /// with). But #654 made a same-model profile switch a marker-only change
+  /// (`LocalAPIProfileSwitchGate.decide` → `.selectOnly`): the engine stays up
+  /// bound to the same model and the new profile's params apply per request
+  /// (insight:513). Under the old rule the badge vanished after such a switch
+  /// even though the engine was serving the selected profile's model live. So
+  /// a profile is "served live" when it booted the engine OR when it serves
+  /// the model the running engine actually serves. The boot-id arm keeps the
+  /// badge for a legacy snapshot whose `servedModelID` is empty (`nil` here).
+  public let isServedLive: Bool
 
   public static func make(entries: [ProfileLoadResult],
-                          runtimeProfileID: String?) -> [LocalAPIProfileOption] {
+                          runtimeProfileID: String?,
+                          runtimeServedModelID: String? = nil) -> [LocalAPIProfileOption] {
     entries.compactMap { entry -> LocalAPIProfileOption? in
       // A profile with no default model (#459) can't serve the Local API, so
       // it has no endpoint to explore — skip it rather than list an empty row.
       guard entry.error == nil, let profile = entry.profile,
             let model = profile.model, !model.isEmpty else { return nil }
+      let bootedThisProfile = profile.id == runtimeProfileID
+      let servesRunningModel =
+        (runtimeServedModelID.map { !$0.isEmpty && $0 == model }) ?? false
       return LocalAPIProfileOption(
         id: profile.id,
         title: profile.name,
         modelID: model,
         modelDisplayName: ModelDisplayName.leaf(model),
-        isRuntimeProfile: profile.id == runtimeProfileID
+        isServedLive: bootedThisProfile || servesRunningModel
       )
     }
   }

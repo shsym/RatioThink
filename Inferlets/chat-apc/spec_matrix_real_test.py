@@ -248,5 +248,64 @@ class CellUsabilityGate(unittest.TestCase):
         self.assertEqual(eq["drift_spec"], 0)
 
 
+class BaselineNondeterminismGate(unittest.TestCase):
+    """The determinism control (a second plain run, `p2`, on prompt 0) compares
+    `p1` byte-for-byte against `p2` to prove the baseline is deterministic. That
+    re-run must clear the SAME `_check_run` verdict the other runs do — gating it
+    on a weaker `status == 200` lets a degraded-but-200 `p2` (empty decode,
+    mid-stream error frame, inconsistent accounting) ride through: it differs
+    from a healthy `p1`, so the harness FALSELY flags the baseline as
+    non-deterministic and aborts the row, masking the real fault (a degraded
+    re-run). Completes the degraded-but-200 hardening begun on p1/n1 (#664 F1).
+    Driven against the real `_bench_dataset` with a stubbed `_stream_run`."""
+
+    def _run_bench(self, p2_run):
+        # idx-0 plain is called twice: p1 (healthy) then p2 (the supplied run).
+        # ngram is healthy. One record is enough — p2 exists only for idx 0.
+        plain_calls = {"n": 0}
+
+        async def fake_stream_run(http_c, base, prompt, think, spec):
+            if not spec.get("enabled"):  # plain
+                plain_calls["n"] += 1
+                return _healthy_run() if plain_calls["n"] == 1 else p2_run()
+            return _healthy_run()  # ngram
+
+        records = [{"prompt": "p0", "think": False}]
+        failures: list[str] = []
+        with mock.patch.object(m, "_stream_run", fake_stream_run):
+            row = asyncio.run(
+                m._bench_dataset(None, "http://stub", "ds", records, 1, failures)
+            )
+        return row, failures
+
+    def test_degraded_p2_rerun_not_a_false_baseline_nondeterminism(self):
+        # p2 is a degraded-but-200 empty decode; p1 is healthy "ok". On the
+        # buggy `status == 200` gate, `_out(p1) != _out(p2)` flags a false
+        # non-determinism. Gating p2 on `_check_run` skips the doomed compare.
+        row, failures = self._run_bench(_degraded_but_200_run)
+        eq = row["greedy_equivalence"]
+        self.assertEqual(eq["baseline_nondeterministic_prompts"], 0)
+        self.assertFalse(
+            any("NON-DETERMINISTIC" in f for f in failures),
+            f"degraded p2 must not be reported as non-determinism: {failures!r}",
+        )
+        # The degraded re-run is surfaced as the contract failure it actually is.
+        self.assertTrue(
+            any("empty decode" in f for f in failures),
+            f"expected p2's empty-decode failure, got {failures!r}",
+        )
+        # The healthy p1-vs-n1 byte compare still proceeds and holds.
+        self.assertEqual(eq["held"], 1)
+
+    def test_healthy_p2_still_proves_determinism(self):
+        # Positive control: a healthy, byte-identical p2 keeps the row valid and
+        # raises no failures — the gate must not over-suppress.
+        row, failures = self._run_bench(_healthy_run)
+        eq = row["greedy_equivalence"]
+        self.assertEqual(eq["baseline_nondeterministic_prompts"], 0)
+        self.assertEqual(eq["held"], 1)
+        self.assertEqual(failures, [])
+
+
 if __name__ == "__main__":
     unittest.main()

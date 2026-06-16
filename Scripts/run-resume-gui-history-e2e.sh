@@ -11,6 +11,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
 MODEL="${PIE_TEST_CHAT_MODEL_PIN:-resume-deterministic}"
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p275-history-$$}"
@@ -87,13 +88,19 @@ echo "resume gui history e2e: request log=$REQUEST_LOG"
 echo "resume gui history e2e: retained run root: $RUN_ROOT"
 echo "resume gui history e2e: running XCUITest"
 
-xcodebuild -project RatioThink.xcodeproj \
+XCODE_LOG="$RUN_ROOT/xcodebuild.log"
+set +e
+e2e_run_gui_xcodebuild "$XCODE_LOG" \
+  -project RatioThink.xcodeproj \
   -scheme RatioThinkGUITests \
   -destination 'platform=macOS,arch=arm64' \
   -parallel-testing-enabled NO \
   test \
   -only-testing:RatioThinkGUITests/S275_MultiTurnResumeGUITests/test_multi_turn_history_survives_relaunch_and_is_sent_to_engine \
   ENABLE_CODE_COVERAGE=NO
+status=$?
+set -e
+[ "$status" -ne 0 ] && exit "$status"
 
 python3 - "$GUI_HOME/chats.sqlite" <<'PY'
 import sqlite3

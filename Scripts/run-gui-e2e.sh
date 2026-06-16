@@ -15,6 +15,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
 MODEL_ID="${PIE_TEST_ACQUIRE_MODEL_ID:-qwen2.5-0.5b-instruct-q4_k_m}"
 REPO="${PIE_TEST_ACQUIRE_REPO:-Qwen/Qwen2.5-0.5B-Instruct-GGUF}"
@@ -57,13 +58,19 @@ echo "gui e2e: generating Xcode project"
 Scripts/genproject.sh
 
 echo "gui e2e: running XCUITest (real download, up to ${DOWNLOAD_TIMEOUT}s)"
-xcodebuild -project RatioThink.xcodeproj \
+XCODE_LOG="$RUN_ROOT/xcodebuild.log"
+set +e
+e2e_run_gui_xcodebuild "$XCODE_LOG" \
+  -project RatioThink.xcodeproj \
   -scheme RatioThinkGUITests \
   -destination 'platform=macOS,arch=arm64' \
   -parallel-testing-enabled NO \
   test \
   -only-testing:RatioThinkGUITests/S204_ModelAcquisitionGUITests/test_settings_curated_download_verifies_and_completes \
   ENABLE_CODE_COVERAGE=NO
+status=$?
+set -e
+[ "$status" -ne 0 ] && exit "$status"
 
 # Independent on-disk re-verification: placed bytes' sha256 == HF
 # X-Linked-Etag (LFS content hash on the resolve 302, ).

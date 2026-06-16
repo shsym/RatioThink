@@ -49,6 +49,37 @@ e2e_require_chat_apc() {
   fi
 }
 
+# --- uniform xcodebuild log capture + testmanagerd-wedge post-mortem --------
+#
+# Every GUI/E2E wrapper launches a focused RatioThinkGUITests suite under
+# xcodebuild. When that run dies at runner-init with "Timed out while enabling
+# automation mode", the build and tests compiled fine — it's a wedged
+# `testmanagerd`, not a code regression (insight:489). This helper gives every
+# wrapper ONE way to (1) stream xcodebuild output live AND capture it to <log>,
+# (2) recover its REAL exit status (PIPESTATUS[0], never tee's), and (3) on
+# failure scan the captured log for that wedge and print the bounce remedy
+# (Scripts/gui-testmanagerd-hint.sh — always exits 0, advisory only). The
+# caller keeps its own post-run assertions (skip/pass-line greps, DB checks,
+# sha256, termination classification) and decides what to do with the status.
+#
+#   set +e
+#   e2e_run_gui_xcodebuild "$XCODE_LOG" \
+#     -project RatioThink.xcodeproj -scheme RatioThinkGUITests \
+#     -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO \
+#     test -only-testing:... ENABLE_CODE_COVERAGE=NO
+#   status=$?
+#   set -e
+e2e_run_gui_xcodebuild() {
+  local log="$1"; shift
+  local rc
+  xcodebuild "$@" 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  # Resolve the detector relative to THIS lib, not the caller's cwd, so it
+  # works no matter where the wrapper is invoked from.
+  [ "$rc" -ne 0 ] && "$(dirname "${BASH_SOURCE[0]}")/gui-testmanagerd-hint.sh" "$log"
+  return "$rc"
+}
+
 # --- prerequisites that auto-prep can satisfy ---
 
 # Echo a runnable pie binary path on stdout; logs to stderr. Resolves an
