@@ -222,9 +222,13 @@ public struct LaunchSpecResolver {
         // Real `pie serve` cold boot loads the model weights before the READY
         // handshake; align the boot budget with the size-aware request/shmem
         // timeout so a slow large-model start is not killed by the 30s default
-        // handshake ceiling (#459 evidence, #687 size scaling). All three stay
-        // in lock-step off `requestTimeoutSeconds`.
-        handshakeTimeout: TimeInterval(requestTimeoutSeconds),
+        // handshake ceiling (#459 evidence, #687 size scaling). The BOOT lease
+        // is clamped to the ceiling (`bootHandshakeTimeoutSeconds`) so it stays
+        // strictly below the static XPC reply deadline even when an operator
+        // override pushes the request/shmem value above the ceiling.
+        handshakeTimeout: TimeInterval(
+          PieControlLauncher.bootHandshakeTimeoutSeconds(
+            requestTimeoutSeconds: requestTimeoutSeconds)),
         requestTimeoutSeconds: requestTimeoutSeconds,
         profileID: profile.id,
         daemonBindHost: daemonBindMode(),

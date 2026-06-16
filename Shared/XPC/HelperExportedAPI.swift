@@ -307,9 +307,11 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// `PieEngineHost.launchTimeoutSlack`) so this fallback never reports a
   /// premature `handshakeTimeout` for an engine that is still legitimately
   /// cold-booting a large model (#459). The production resolver sets the boot
-  /// handshake to `PieControlLauncher.coldStartHandshakeTimeout` (120s); 15s
-  /// of headroom covers the host slack + WS `installProgram`/`launchDaemon`
-  /// rounds. The host surfaces a real `.failed` (or `.running`) via the
+  /// handshake to a per-model lease (#687: floor 120s … `PieControlLauncher
+  /// .coldStartHandshakeTimeout` = the 600s ceiling, always clamped to it); the
+  /// 15s of headroom on top of that ceiling covers the host slack + WS
+  /// `installProgram`/`launchDaemon` rounds, so this deadline (615s) stays above
+  /// the largest boot lease. The host surfaces a real `.failed` (or `.running`) via the
   /// observer long before this fires; tests inject a short
   /// `replyTimeoutOverride`. Public so the App-side restart wait derives
   /// from it (#459 review F2).

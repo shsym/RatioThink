@@ -484,6 +484,31 @@ final class PieControlLauncherConfigTests: XCTestCase {
       "override even beats the ceiling — it is unclamped on purpose")
   }
 
+  func test_resolvedTimeout_envOverride_canExceedSizeCeiling() {
+    // The escape hatch is deliberately allowed past the 600s size ceiling so
+    // an operator can rescue a pathologically-slow boot.
+    XCTAssertGreaterThan(700, PieControlLauncher.requestTimeoutCeilingSeconds)
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: nil, environment: ["PIE_SHMEM_TIMEOUT_S": "700"]), 700)
+  }
+
+  func test_resolvedTimeout_envOverride_clampsHugeFiniteValueWithoutTrapping() {
+    // Finite-but-huge values (> Int.max) must clamp to the 24h bound, NOT trap
+    // `Int(secs)` and crash the privileged helper at launch.
+    for huge in ["1e30", "99999999999999999999", "1e400"] {  // 1e400 → +inf, rejected
+      let got = PieControlLauncher.resolvedRequestTimeoutSeconds(
+        modelWeightBytes: nil, environment: ["PIE_SHMEM_TIMEOUT_S": huge])
+      // 1e30 / the 20-digit literal clamp to the 24h max; 1e400 overflows to
+      // +inf (non-finite) and falls back to the floor.
+      XCTAssertTrue(got == PieControlLauncher.requestTimeoutOverrideMaxSeconds
+                    || got == PieControlLauncher.requestTimeoutFloorSeconds,
+                    "override \(huge) must yield a finite clamped Int, got \(got)")
+    }
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: nil, environment: ["PIE_SHMEM_TIMEOUT_S": "1e30"]),
+      PieControlLauncher.requestTimeoutOverrideMaxSeconds)
+  }
+
   func test_resolvedTimeout_envOverride_rejectsGarbageAndFallsBackToSize() {
     // Non-numeric, non-finite, and non-positive overrides are ignored so a
     // stray/empty value can't silently disable the size-aware default.
@@ -492,6 +517,26 @@ final class PieControlLauncherConfigTests: XCTestCase {
         modelWeightBytes: 8 * Self.gib, environment: ["PIE_SHMEM_TIMEOUT_S": bad]), 240,
         "invalid override \(bad.debugDescription) must fall back to the size-aware default")
     }
+  }
+
+  func test_bootHandshake_staysBelowXPCDeadline_forAnyOverrideMagnitude() {
+    // F2: the request/shmem value may exceed the 600s ceiling (escape hatch),
+    // but the BOOT lease must not — the static startReplyDeadline is sized to
+    // the ceiling, so a lease above it would let the XPC fallback kill a
+    // still-booting engine. The clamp must hold for any override magnitude.
+    let ceiling = PieControlLauncher.requestTimeoutCeilingSeconds
+    for req in [120, 240, ceiling, 700, 900,
+                PieControlLauncher.requestTimeoutOverrideMaxSeconds] {
+      let lease = PieControlLauncher.bootHandshakeTimeoutSeconds(requestTimeoutSeconds: req)
+      XCTAssertLessThanOrEqual(lease, ceiling,
+                               "boot lease for request=\(req) must never exceed the ceiling")
+      XCTAssertLessThan(TimeInterval(lease) + PieEngineHost.defaultLaunchTimeoutSlack,
+                        HelperExportedAPI.startReplyDeadline,
+                        "boot lease for request=\(req) must stay strictly below the static XPC reply deadline")
+    }
+    // Sub-ceiling values pass through unchanged (no clamp side effect).
+    XCTAssertEqual(PieControlLauncher.bootHandshakeTimeoutSeconds(requestTimeoutSeconds: 240), 240)
+    XCTAssertEqual(PieControlLauncher.bootHandshakeTimeoutSeconds(requestTimeoutSeconds: 900), ceiling)
   }
 
   func test_renderedTimeout_lockstep_acrossConfigAndEnv() {

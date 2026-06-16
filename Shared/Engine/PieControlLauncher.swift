@@ -97,6 +97,15 @@ public enum PieControlLauncher {
   /// wins over the size-aware default so an operator can always override.
   static let shmemTimeoutEnvKey = "PIE_SHMEM_TIMEOUT_S"
 
+  /// Upper bound (24h) applied to the `PIE_SHMEM_TIMEOUT_S` override BEFORE the
+  /// `Double → Int` conversion. The override is deliberately allowed to exceed
+  /// the size-aware ceiling (it is the escape hatch), but a finite-but-huge
+  /// value (e.g. `"1e30"`) would trap `Int(secs)` past `Int.max` — and since
+  /// the var is operator-controlled in the privileged helper, that is a hard
+  /// crash at every launch, not a degraded timeout. 24h is far above any
+  /// legitimate cold boot while staying safely inside `Int`.
+  static let requestTimeoutOverrideMaxSeconds = 86_400
+
   /// Resolve the engine request/prefill timeout (seconds) for a launch.
   ///
   /// Precedence:
@@ -113,7 +122,10 @@ public enum PieControlLauncher {
                                             environment: [String: String]) -> Int {
     if let raw = environment[shmemTimeoutEnvKey],
        let secs = Double(raw), secs.isFinite, secs > 0 {
-      return max(1, Int(secs.rounded()))
+      // Bound before converting: `Int(secs)` traps for finite values above
+      // Int.max ("1e30"), which would crash the privileged helper at launch.
+      let bounded = min(secs.rounded(), Double(requestTimeoutOverrideMaxSeconds))
+      return max(1, Int(bounded))
     }
     guard let bytes = modelWeightBytes, bytes > 0 else {
       return requestTimeoutFloorSeconds
@@ -124,6 +136,20 @@ public enum PieControlLauncher {
       + Int((headroomGiB * Double(requestTimeoutSecondsPerGiB)).rounded())
     return min(requestTimeoutCeilingSeconds,
                max(requestTimeoutFloorSeconds, scaled))
+  }
+
+  /// The cold-boot handshake lease for a launch — the request/prefill timeout
+  /// clamped to the ceiling. The request/shmem-facing value
+  /// (`request_timeout_secs`, child `PIE_SHMEM_TIMEOUT_S`) may stay ABOVE the
+  /// ceiling when an operator overrides it (the escape hatch governs the
+  /// per-request forward/generation budget), but the BOOT lease must not: the
+  /// static XPC reply deadlines (`startReplyDeadline = coldStartHandshakeTimeout
+  /// + 15`) are sized to the ceiling, so a lease above it would let the XPC
+  /// fallback fire mid-boot and kill a still-booting engine — the exact failure
+  /// the deadline ordering is meant to prevent. Clamping here keeps the boot
+  /// lease strictly below `startReplyDeadline` for ANY override magnitude.
+  static func bootHandshakeTimeoutSeconds(requestTimeoutSeconds: Int) -> Int {
+    min(requestTimeoutSeconds, requestTimeoutCeilingSeconds)
   }
 
   /// Regex that extracts the control-plane `host:port` from the engine's READY
@@ -143,13 +169,16 @@ public enum PieControlLauncher {
   /// can exceed the 30s `.dummy` default — the user saw `tree-of-thought`
   /// killed at exactly 30s while the request/shmem timeouts were already 120s.
   /// The production resolver now hands `LaunchSpec.handshakeTimeout` a
-  /// *per-model* budget (`resolvedRequestTimeoutSeconds`, floor 120s …
-  /// ceiling 600s); this constant is the CEILING of that range. The static
-  /// XPC reply deadlines (`HelperExportedAPI.startReplyDeadline`,
-  /// `AppXPCClient.restartReplyTimeout`) derive from it, so they sit strictly
-  /// above the *largest* possible per-model lease and never report a premature
-  /// failure for a still-booting large model. `PieEngineHost` adds its small
-  /// `launchTimeoutSlack` on top to form the process-lifetime lease.
+  /// *per-model* boot lease (`bootHandshakeTimeoutSeconds`, floor 120s …
+  /// ceiling 600s); this constant is the CEILING of that range. The boot lease
+  /// is always clamped to it — even when an operator override pushes the
+  /// request/shmem timeout higher, only that per-request value rises, never the
+  /// boot lease. So the static XPC reply deadlines (`HelperExportedAPI
+  /// .startReplyDeadline`, `AppXPCClient.restartReplyTimeout`) derive from this
+  /// constant and sit strictly above the *largest* possible per-model lease,
+  /// never reporting a premature failure for a still-booting large model.
+  /// `PieEngineHost` adds its small `launchTimeoutSlack` on top to form the
+  /// process-lifetime lease.
   public static let coldStartHandshakeTimeout: TimeInterval = TimeInterval(requestTimeoutCeilingSeconds)
 
   // MARK: - errors
@@ -285,11 +314,14 @@ public enum PieControlLauncher {
     /// `name@version` recorded in the manifest.
     public var inferletNameAtVersion: String
     public var handshakeTimeout: TimeInterval
-    /// Engine request/prefill timeout (seconds) for this launch — the single
-    /// value that drives `request_timeout_secs` in the rendered TOML and the
-    /// injected child `PIE_SHMEM_TIMEOUT_S`, kept in lock-step with
-    /// `handshakeTimeout`. Defaults to the floor; the production resolver sets
-    /// the size-aware value via `resolvedRequestTimeoutSeconds`.
+    /// Engine request/prefill timeout (seconds) for this launch — the value
+    /// that drives `request_timeout_secs` in the rendered TOML and the injected
+    /// child `PIE_SHMEM_TIMEOUT_S`. Defaults to the floor; the production
+    /// resolver sets the size-aware value via `resolvedRequestTimeoutSeconds`.
+    /// NOTE: `handshakeTimeout` (the boot lease) tracks this but is clamped to
+    /// the ceiling via `bootHandshakeTimeoutSeconds` — an operator override may
+    /// raise the per-request value above the ceiling without raising the boot
+    /// lease above the static XPC deadline.
     public var requestTimeoutSeconds: Int
     /// Optional callback that receives the spawned pid the moment
     /// `Process.run()` returns. `IsolatedTestCase` passes
