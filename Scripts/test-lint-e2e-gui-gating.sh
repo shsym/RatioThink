@@ -68,6 +68,25 @@ GUI_TCC='e2e_require_tcc "fix"'
 # scans Scripts/*.sh and does not self-exclude this file.
 GUI_DRIVE='echo "drives the RatioThinkGUITests scheme via xcodebuild"'
 
+# A GUI wrapper whose code body is far larger than a pipe buffer (~64KB), with
+# the GUI signature near the top and a gate (tcc) deliberately omitted. Under the
+# old `echo "$code" | grep -q` the early GUI match SIGPIPEs the echo mid-write
+# and pipefail flips the GUI detection to false, so the missing-gate check is
+# skipped and the wrapper false-greens. The here-string fix must still flag it.
+write_large_gui_wrapper_missing_tcc() {
+  local name="$1"
+  {
+    echo '#!/bin/bash'
+    echo 'set -euo pipefail'
+    echo 'ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"'
+    echo "$GUI_SOURCE"
+    echo "$GUI_SEATED"
+    echo "$GUI_DRIVE"   # RatioThinkGUITests signature near the top
+    # ~240KB of non-comment filler (survives the comment strip) after the match.
+    awk 'BEGIN{for(i=0;i<6000;i++) printf ": filler %06d aaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", i}'
+  } > "$SCRIPTS_DIR/$name"
+}
+
 run() {
   local label="$1" expect="$2"; shift 2
   local output rc result
@@ -158,5 +177,90 @@ reset_fixture
 write_prep "no-phrase"
 write_wrapper "run-http-e2e.sh" 'echo headless'
 run "e2e-prep tcc lost rename-agnostic phrase" FAIL
+
+# 13. FC1: a GUI wrapper larger than a pipe buffer, missing the tcc gate. The
+#     here-string fix must still detect it as GUI and flag the missing gate;
+#     the old echo|grep SIGPIPEs and false-greens → expect FAIL.
+reset_fixture
+write_large_gui_wrapper_missing_tcc "run-chat-gui-e2e.sh"
+run "large GUI wrapper missing tcc still flagged (no SIGPIPE false-green)" FAIL
+
+# 14. FC1 twin: the same large wrapper WITH all three gates present → PASS,
+#     proving the here-string path doesn't spuriously fail big wrappers.
+reset_fixture
+{
+  echo '#!/bin/bash'; echo 'set -euo pipefail'
+  echo 'ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"'
+  echo "$GUI_SOURCE"; echo "$GUI_SEATED"; echo "$GUI_TCC"; echo "$GUI_DRIVE"
+  awk 'BEGIN{for(i=0;i<6000;i++) printf ": filler %06d aaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", i}'
+} > "$SCRIPTS_DIR/run-chat-gui-e2e.sh"
+run "large GUI wrapper with all gates passes" PASS
+
+# 15. FC2: an unreadable GUI wrapper must fail loudly, not be silently skipped as
+#     gate-free (the old `|| true` swallowed grep rc>=2). Skipped under root,
+#     which can read a chmod-000 file.
+if [ "$(id -u)" -ne 0 ]; then
+  reset_fixture
+  write_wrapper "run-chat-gui-e2e.sh" "$GUI_SOURCE" "$GUI_SEATED" "$GUI_TCC" "$GUI_DRIVE"
+  chmod 000 "$SCRIPTS_DIR/run-chat-gui-e2e.sh"
+  run "unreadable GUI wrapper fails loudly" FAIL
+  chmod 644 "$SCRIPTS_DIR/run-chat-gui-e2e.sh"
+else
+  echo "ok   [unreadable GUI wrapper] SKIP (running as root reads any file)"
+fi
+
+# 16. FC2: a TRAILING comment that merely names $PIE_TEST_TCC_GRANTED on a code
+#     line must be stripped, not mistaken for a hand-rolled gate → PASS. Old
+#     whole-line-only strip left the trailing mention and false-tripped → FAIL.
+reset_fixture
+write_wrapper "run-chat-gui-e2e.sh" "$GUI_SOURCE" "$GUI_SEATED" "$GUI_TCC" "$GUI_DRIVE" \
+  'echo hi  # historically gated on $PIE_TEST_TCC_GRANTED before e2e-prep.sh'
+run "trailing-comment mention of gate var ignored" PASS
+
+# 17. FC2 twin: a REAL inline gate followed by a trailing comment is still
+#     flagged — the comment strip removes the note but leaves `pgrep -x Dock`.
+reset_fixture
+write_wrapper "run-chat-gui-e2e.sh" "$GUI_SOURCE" "$GUI_SEATED" "$GUI_TCC" \
+  'pgrep -x Dock >/dev/null || exit 2  # inline seated check, should be flagged' "$GUI_DRIVE"
+run "inline gate with trailing comment still flagged" FAIL
+
+# 18. FC3: a GUI wrapper that NAMES both gates only inside an echo string, never
+#     calling them, must FAIL — the call-anchored positive rule rejects the
+#     mention. The old unanchored token match false-greened it → expect FAIL.
+reset_fixture
+# Both gate tokens are followed by whitespace inside the string, so an UNanchored
+# token match would false-green; only the command-position anchor rejects them.
+write_wrapper "run-chat-gui-e2e.sh" "$GUI_SOURCE" \
+  'echo "would call e2e_require_seated_gui then e2e_require_tcc here"' "$GUI_DRIVE"
+run "gates named only inside a string, never called" FAIL
+
+# 19. FC4: an out-of-glob script (not run-*e2e.sh, not allow-listed) that both
+#     names the GUI suite and drives e2e_run_gui_xcodebuild → FAIL.
+reset_fixture
+write_wrapper "run-chat-gui-e2e.sh" "$GUI_SOURCE" "$GUI_SEATED" "$GUI_TCC" "$GUI_DRIVE"
+write_wrapper "gui-screenshot.sh" 'e2e_run_gui_xcodebuild "$LOG" test'
+run "out-of-glob GUI driver flagged" FAIL
+
+# 20. FC4 twin: an out-of-glob script that only MENTIONS the suite without
+#     launching xcodebuild is not a driver → PASS (no false positive on helpers,
+#     linters, self-tests that merely reference the token).
+reset_fixture
+write_wrapper "run-chat-gui-e2e.sh" "$GUI_SOURCE" "$GUI_SEATED" "$GUI_TCC" "$GUI_DRIVE"
+write_wrapper "gui-notes.sh" 'echo "see the RatioThinkGUITests scheme docs"'
+run "out-of-glob mention without xcodebuild not flagged" PASS
+
+# 21. FC4: e2e-prep.sh DEFINES the shared e2e_run_gui_xcodebuild helper (a
+#     command-position xcodebuild) — a GUI driver by signature, but the canonical
+#     allow-listed non-wrapper → PASS. Proves the allow-list is load-bearing:
+#     dropping it would flag the very helper every wrapper sources.
+reset_fixture
+{
+  echo '#!/bin/bash'
+  echo 'e2e_require_seated_gui() { pgrep -x Dock >/dev/null 2>&1 || return 2; }'
+  echo 'e2e_require_tcc() { [ "${PIE_TEST_TCC_GRANTED:-}" = "1" ] || { echo "Automation/Accessibility permission required" >&2; return 2; }; }'
+  echo 'e2e_run_gui_xcodebuild() { local log="$1"; shift; xcodebuild "$@" 2>&1 | tee "$log"; }'
+} > "$SCRIPTS_DIR/e2e-prep.sh"
+write_wrapper "run-chat-gui-e2e.sh" "$GUI_SOURCE" "$GUI_SEATED" "$GUI_TCC" "$GUI_DRIVE"
+run "allow-listed e2e-prep driver not flagged" PASS
 
 echo "lint-e2e-gui-gating self-test: all scenarios pass"
