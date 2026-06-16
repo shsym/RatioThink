@@ -15,6 +15,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
 MODEL="gui-stream-deterministic"
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p636-select-$$}"
@@ -108,14 +109,15 @@ echo "select gui e2e: running XCUITest"
 TEST_NAME="test_drag_selection_spans_paragraphs"
 XCODE_LOG="$RUN_ROOT/xcodebuild.log"
 set +e
-xcodebuild -project RatioThink.xcodeproj \
+e2e_run_gui_xcodebuild "$XCODE_LOG" \
+  -project RatioThink.xcodeproj \
   -scheme RatioThinkGUITests \
   -destination 'platform=macOS,arch=arm64' \
   -parallel-testing-enabled NO \
   test \
   -only-testing:"RatioThinkGUITests/S515_CopyTranscriptGUITests/$TEST_NAME" \
-  ENABLE_CODE_COVERAGE=NO 2>&1 | tee "$XCODE_LOG"
-status=${PIPESTATUS[0]}
+  ENABLE_CODE_COVERAGE=NO
+status=$?
 set -e
 if [ "$status" -ne 0 ]; then
   echo "select gui e2e: FAIL (xcodebuild exit $status)" >&2

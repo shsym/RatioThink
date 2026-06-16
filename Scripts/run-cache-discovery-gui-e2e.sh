@@ -19,6 +19,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p-cache-discovery-gui-$$}"
 HF_HOME="$RUN_ROOT/hf"
@@ -99,7 +100,8 @@ Scripts/genproject.sh
 LOG="${PIE_TEST_LOG:-test-$(date +%Y%m%d-%H%M%S)-cache-discovery-gui.log}"
 echo "cache-discovery gui e2e: running XCUITest (log: $LOG)"
 set +e
-xcodebuild -project RatioThink.xcodeproj \
+e2e_run_gui_xcodebuild "$LOG" \
+  -project RatioThink.xcodeproj \
   -scheme RatioThinkGUITests \
   -destination 'platform=macOS,arch=arm64' \
   -parallel-testing-enabled NO \
@@ -109,8 +111,7 @@ xcodebuild -project RatioThink.xcodeproj \
   -only-testing:RatioThinkGUITests/S365_CachedModelDiscoveryGUITests/test_split_gguf_cache_model_shows_unsupported_reason_in_picker \
   -only-testing:RatioThinkGUITests/S365_CachedModelDiscoveryGUITests/test_hf_cache_model_shows_source_suffix_in_picker \
   -only-testing:RatioThinkGUITests/S514_AddModelDuplicateGUITests/test_add_model_marks_installed_and_hf_cache_curated_rows \
-  ENABLE_CODE_COVERAGE=NO 2>&1 | tee "$LOG"
-status=${PIPESTATUS[0]}
-[ "$status" -ne 0 ] && Scripts/gui-testmanagerd-hint.sh "$LOG"
+  ENABLE_CODE_COVERAGE=NO
+status=$?
 echo "cache-discovery gui e2e: xcodebuild exit=$status; log: $LOG"
 exit $status

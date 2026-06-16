@@ -117,8 +117,10 @@ echo "chat gui e2e: config=$CONFIG_FILE"
 echo "chat gui e2e: retained run root: $RUN_ROOT"
 echo "chat gui e2e: running XCUITest"
 
+XCODE_LOG="$RUN_ROOT/xcodebuild.log"
 set +e
-xcodebuild -project RatioThink.xcodeproj \
+e2e_run_gui_xcodebuild "$XCODE_LOG" \
+  -project RatioThink.xcodeproj \
   -scheme RatioThinkGUITests \
   -destination 'platform=macOS,arch=arm64' \
   -parallel-testing-enabled NO \

@@ -10,6 +10,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
 MODEL="gui-stream-deterministic"
 HOLD_TOKEN="PARTIAL-HOLD-507"
@@ -120,13 +121,19 @@ EOF
 run_test() {
   local method="$1"
   echo "stream-cancel gui e2e: running XCUITest $method"
-  xcodebuild -project RatioThink.xcodeproj \
+  local status
+  set +e
+  e2e_run_gui_xcodebuild "$RUN_ROOT/xcodebuild-$method.log" \
+    -project RatioThink.xcodeproj \
     -scheme RatioThinkGUITests \
     -destination 'platform=macOS,arch=arm64' \
     -parallel-testing-enabled NO \
     test \
     "-only-testing:RatioThinkGUITests/S507_StreamContinuityGUITests/$method" \
     ENABLE_CODE_COVERAGE=NO
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] && exit "$status"
 }
 
 start_harness 2 "$RUN_ROOT/g1"

@@ -9,6 +9,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
 # Must equal ProfileStore.defaultChatModelID (the seeded `chat` profile default).
 SLUG="Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
@@ -86,7 +87,10 @@ Scripts/genproject.sh
 
 echo "load-default gui e2e: engine=$BASE_URL gui PIE_HOME=$GUI_HOME model=$SLUG"
 echo "load-default gui e2e: running XCUITest"
-xcodebuild -project RatioThink.xcodeproj \
+XCODE_LOG="$RUN_ROOT/xcodebuild.log"
+set +e
+e2e_run_gui_xcodebuild "$XCODE_LOG" \
+  -project RatioThink.xcodeproj \
   -scheme RatioThinkGUITests \
   -destination 'platform=macOS,arch=arm64' \
   -parallel-testing-enabled NO \
@@ -94,5 +98,8 @@ xcodebuild -project RatioThink.xcodeproj \
   -only-testing:RatioThinkGUITests/S381_NoModelLoadDefaultGUITests/test_no_model_gate_load_default_resolves_and_send_succeeds \
   -only-testing:RatioThinkGUITests/S381_NoModelLoadDefaultGUITests/test_516_blocked_send_auto_submits_after_load \
   ENABLE_CODE_COVERAGE=NO
+status=$?
+set -e
+[ "$status" -ne 0 ] && exit "$status"
 
 echo "load-default gui e2e: PASS"

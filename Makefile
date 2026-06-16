@@ -513,6 +513,7 @@ test-gui-script: ## Fast preflight regressions for GUI/E2E wrapper scripts
 	Scripts/test-run-first-launch-package-e2e.sh
 	Scripts/test-run-first-launch-package-model-download-e2e.sh
 	Scripts/test-gui-testmanagerd-hint.sh
+	Scripts/test-gui-testmanagerd-wiring.sh
 
 test-gui-history: genproject ## Deterministic  GUI history/resume E2E — needs seated session
 	Scripts/run-resume-gui-history-e2e.sh
