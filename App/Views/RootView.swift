@@ -173,7 +173,13 @@ struct RootView: View {
     let profileID = profileStore.activeProfileID
     Task { @MainActor in
       guard let profileID, !profileID.isEmpty else { return }
-      try? await engineStatusStore.startEngine(profileID: profileID)
+      // #668: preserve the running session's served model across the restart;
+      // the durable active-model marker carries it when the engine has faulted.
+      let modelOverride = EngineRestartTarget.bootModel(
+        currentSnapshot: engineStatusStore.currentSnapshot,
+        lastServedModelID: profileStore.activeModelID)
+      try? await engineStatusStore.startEngine(profileID: profileID,
+                                               modelOverride: modelOverride)
     }
   }
 

@@ -543,7 +543,15 @@ struct RatioThinkApp: App {
         return
       }
       do {
-        try await engineStatusStore.startEngine(profileID: profileID)
+        // #668: preserve the running session's served model across the restart
+        // so a non-default pick (per-chat selection, Local API switch) is not
+        // silently reverted to profile.model. The snapshot is the live identity
+        // while running; the durable marker covers a post-fault restart.
+        let modelOverride = EngineRestartTarget.bootModel(
+          currentSnapshot: engineStatusStore.currentSnapshot,
+          lastServedModelID: profileStore.activeModelID)
+        try await engineStatusStore.startEngine(profileID: profileID,
+                                                modelOverride: modelOverride)
       } catch {
         NSLog("Restart Engine: startEngine(\(profileID)) failed: \(error)")
       }
