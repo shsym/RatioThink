@@ -149,6 +149,10 @@ mutate_source_png() {
   append_png_text_chunk "$1/Resources/AppIcon/rational-icon-highres.png"
 }
 
+mutate_original_png() {
+  append_png_text_chunk "$1/Resources/AppIcon/rational-icon-original-1254.png"
+}
+
 mutate_generated_png() {
   append_png_text_chunk "$1/Resources/Assets.xcassets/AppIcon.appiconset/app-icon-256.png"
 }
@@ -207,6 +211,7 @@ expect_clean_success "clean-without-generated-project"
 expect_clean_failure "partial-generated-project-dir" mutate_partial_generated_project_dir
 expect_success "baseline"
 expect_failure "source-png-drift" mutate_source_png
+expect_failure "original-png-drift" mutate_original_png
 expect_failure "generated-png-drift" mutate_generated_png
 expect_failure "wrong-plist-icon-name" mutate_plist_icon_name
 expect_failure "missing-asset-source-entry" mutate_remove_asset_source
