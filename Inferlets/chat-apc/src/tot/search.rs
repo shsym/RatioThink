@@ -201,6 +201,46 @@ const SCORE_MAX_TOKENS: usize = 160;
 const SYNTHESIS_TEMPERATURE: f32 = 0.3;
 const SYNTHESIS_TOP_P: f32 = 0.9;
 
+// ── Decoupled propose temperature (#693a) ─────────────────────────────
+//
+// #683 confirmed per-fork sampler seeds are INDEPENDENT, so residual sibling
+// collapse is DISTRIBUTION-driven, not seed-driven. The #693 measurement campaign
+// then found that on the PRODUCTION model (Qwen3-8B) the severe collapse #683
+// saw on the 0.6B is largely absent — gsm8k convergence is mostly INTRINSIC
+// (one correct numeric answer → siblings agree, which is healthy) — and that a
+// greedy-anchor first branch is COUNTERPRODUCTIVE on a peaked small-model
+// distribution: it guarantees the mode is one sibling, which collapsed
+// explorers then duplicate (a 0.6B gsm8k prompt went from L1 divergence 0.357
+// to 0.000 — a full three-way collapse — once branch 0 was forced greedy). A
+// cross-sibling logit penalty has no host API (the WIT `sampler` variant
+// exposes no presence/frequency-penalty or bias field) and is deferred to an
+// engine change.
+//
+// What DOES survive the evidence is the narrow, safe part of "decouple the
+// propose temperature from the global temp knob": the candidate-generation
+// temperature is sourced from the chat profile's `sampling.temperature`
+// (#523 Part B), so a profile tuned LOW for deterministic chat would silently
+// collapse a tree-of-thought search to near-greedy siblings. Flooring the
+// propose temperature at the measured-healthy diversity value decouples ToT
+// exploration from that knob without adding a mode-duplicating greedy anchor.
+
+/// Floor for the tree-of-thought propose (candidate-generation) temperature
+/// (#693a). The branch temperature is the inherited generation temperature
+/// raised to at least this value, so a low chat-profile `sampling.temperature`
+/// can no longer collapse the search to near-greedy siblings. 0.7 is the
+/// measured-healthy diversity temperature (see `schema::DEFAULT_TEMPERATURE`,
+/// whose rationale records zero byte-identical sibling pairs at 0.7). At or
+/// above the default this is a no-op, so the common case is unchanged.
+const PROPOSE_TEMP_FLOOR: f32 = 0.7;
+
+/// The propose temperature for branch generation: the search's generation
+/// temperature floored at [`PROPOSE_TEMP_FLOOR`] (#693a). Decouples ToT
+/// exploration from a low inherited chat-profile temperature. Pure →
+/// unit-tested.
+fn propose_temperature(gen_temp: f32) -> f32 {
+    gen_temp.max(PROPOSE_TEMP_FLOOR)
+}
+
 /// Reasoning budget for the bounded branch retry after a thinking attempt
 /// starves before answer content. The retry appends `/no_think`, so this is
 /// not a second full-thinking budget; it only allows a template that emits an
@@ -1763,7 +1803,9 @@ async fn generate_branch(
         model,
         stops: chat::stop_tokens(model),
         sink,
-        temperature: params.temperature,
+        // #693a: floor the propose temperature so a low inherited chat-profile
+        // temperature can't collapse the search to near-greedy siblings.
+        temperature: propose_temperature(params.temperature),
         top_p: params.top_p,
     };
     generate_branch_with(ctx, params, node_id, level, branch_index, &mut driver).await
@@ -2833,6 +2875,39 @@ mod tests {
             synth < gen_default,
             "synthesis must stay below the generation default"
         );
+    }
+
+    // ── Decoupled propose temperature (#693a) ──
+
+    #[test]
+    fn propose_temp_floors_a_low_inherited_temp() {
+        // A chat profile tuned low for deterministic chat must NOT collapse the
+        // tree-of-thought search: the propose temperature is raised to the
+        // diversity floor regardless of how low the inherited temp is.
+        assert!((propose_temperature(0.0) - PROPOSE_TEMP_FLOOR).abs() < 1e-6);
+        assert!((propose_temperature(0.2) - PROPOSE_TEMP_FLOOR).abs() < 1e-6);
+        assert!((propose_temperature(PROPOSE_TEMP_FLOOR - 0.01) - PROPOSE_TEMP_FLOOR).abs() < 1e-6);
+    }
+
+    #[test]
+    fn propose_temp_is_a_noop_at_or_above_the_floor() {
+        // At or above the diversity floor — including the default — the floor
+        // changes nothing, so the common case is untouched.
+        assert!(
+            (propose_temperature(super::super::schema::DEFAULT_TEMPERATURE)
+                - super::super::schema::DEFAULT_TEMPERATURE)
+                .abs()
+                < 1e-6
+        );
+        assert!((propose_temperature(0.7) - 0.7).abs() < 1e-6);
+        assert!((propose_temperature(1.3) - 1.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn propose_temp_floor_matches_the_measured_diversity_default() {
+        // The floor is the measured-healthy diversity temperature, so flooring
+        // a degenerate-low temp lands exactly on the search's own default.
+        assert!((PROPOSE_TEMP_FLOOR - super::super::schema::DEFAULT_TEMPERATURE).abs() < 1e-6);
     }
 
     // ── ScoreOutcome (F4): the three classes the old Option<u8> merged ──
