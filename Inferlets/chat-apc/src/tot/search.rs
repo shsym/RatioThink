@@ -130,16 +130,22 @@ fn branch_directive(
             "Answer the user in one concise sentence. Make it a complete answer, correct, and add one useful detail supported by this chat. For math, use only computed values from the problem. Do not invent people, labels, or statistics. Do not restate earlier sentences. Write only the answer. No heading. Option {n} of {breadth}: {focus}"
         )
     };
-    // Final-depth nodes are answer candidates, not exploratory notes. Use
-    // the no-think path there so small thinking models do not spend the
-    // whole budget in hidden reasoning before a direct answer; keep thinking
-    // for intermediate increments because Qwen3-0.6B otherwise echoes the
-    // user-turn instruction as visible content.
+    // Every level — including the final answer candidates — thinks when the
+    // search runs with `thinking:true` (#649). The selected answer is always a
+    // final-depth node, so suppressing reasoning there left the chosen response
+    // with no thought trace at all, defeating the point of a thinking ToT
+    // search. The original starvation worry (a small model spending its whole
+    // budget in hidden reasoning before answering) is now covered downstream:
+    // a final node that reasons but starves before answering is caught by the
+    // reasoning-starvation retry (`should_retry_reasoning_starved` →
+    // `merge_no_think_retry`), which produces a bounded `/no_think` answer while
+    // preserving the first attempt's reasoning. So the final node keeps both a
+    // reasoning trace and a clean answer.
     with_thinking(&body, branch_uses_thinking(level, max_depth, thinking))
 }
 
-fn branch_uses_thinking(level: usize, max_depth: usize, thinking: bool) -> bool {
-    thinking && level < max_depth
+fn branch_uses_thinking(_level: usize, _max_depth: usize, thinking: bool) -> bool {
+    thinking
 }
 
 /// Value-evaluator prompts (independent per-node scoring). The scorer is a
@@ -2276,7 +2282,9 @@ mod tests {
         assert!(d.contains("clearly different wording"), "{d}");
         assert!(d.contains("Do not use labels"), "{d}");
         assert!(d.contains("$18 instead of 18"), "{d}");
-        assert!(d.contains("/no_think"), "{d}");
+        // #649: a thinking search reasons at the final level too, so the
+        // final directive must NOT force `/no_think` here.
+        assert!(!d.contains("/no_think"), "{d}");
         assert!(!d.contains("original user prompt"), "{d}");
         assert!(!d.contains("tree search"), "{d}");
     }
@@ -2284,11 +2292,12 @@ mod tests {
     #[test]
     fn branch_directive_honors_thinking_knob() {
         // thinking:false suppresses per-node reasoning via the /no_think
-        // marker (reused from `with_thinking`); thinking:true keeps
-        // intermediate reasoning but final nodes still answer directly.
+        // marker (reused from `with_thinking`) at every level; thinking:true
+        // keeps reasoning at every level, final nodes included (#649).
         assert!(branch_directive(1, 3, 0, 3, false).contains("/no_think"));
+        assert!(branch_directive(3, 3, 0, 3, false).contains("/no_think"));
         assert!(!branch_directive(1, 3, 0, 3, true).contains("/no_think"));
-        assert!(branch_directive(3, 3, 0, 3, true).contains("/no_think"));
+        assert!(!branch_directive(3, 3, 0, 3, true).contains("/no_think"));
     }
 
     // ── score_prompt (#555): intermediate progress vs final answer quality ──
@@ -2327,11 +2336,18 @@ mod tests {
     }
 
     #[test]
-    fn branch_thinking_policy_keeps_intermediate_thinking_but_not_final() {
+    fn branch_thinking_policy_thinks_at_every_level_including_final() {
+        // #649: a thinking search reasons at every level, INCLUDING the
+        // final-depth answer candidates — the selected node is always a
+        // final-depth node, so suppressing reasoning there left the chosen
+        // answer with no thought trace. The reasoning-starvation retry, not a
+        // blanket final-depth `/no_think`, is what guarantees the answer.
         assert!(branch_uses_thinking(1, 3, true));
         assert!(branch_uses_thinking(2, 3, true));
-        assert!(!branch_uses_thinking(3, 3, true));
+        assert!(branch_uses_thinking(3, 3, true));
+        // `thinking:false` still suppresses reasoning at every level.
         assert!(!branch_uses_thinking(1, 3, false));
+        assert!(!branch_uses_thinking(3, 3, false));
     }
 
     #[test]
@@ -2945,8 +2961,9 @@ mod tests {
         assert_eq!(driver.calls.len(), 2);
         assert_eq!(driver.calls[0].ctx_id, "first");
         assert!(
-            driver.calls[0].no_think_cue,
-            "final-depth first attempt should use the structural no-think prefill"
+            !driver.calls[0].no_think_cue,
+            "thinking search reasons on the first attempt at every level (#649); \
+             the no-think prefill belongs to the starvation retry, not the first try"
         );
         assert_eq!(
             driver.calls[0].reasoning_budget,
