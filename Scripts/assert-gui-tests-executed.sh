@@ -34,7 +34,7 @@ fi
 # the sole question is whether N is non-zero. A dangling/empty filter yields
 # either no such line or "Executed 0 tests", so an [1-9]-leading count is the
 # tell that real tests ran.
-if grep -Eq 'Executed [1-9][0-9]* tests, with 0 failures' "$log"; then
+if grep -Eq 'Executed [1-9][0-9]* tests?, with 0 failures' "$log"; then
   exit 0
 fi
 

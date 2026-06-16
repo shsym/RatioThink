@@ -77,4 +77,14 @@ Test Suite 'S286_NoModelSendGateGUITests' passed
 EOF
 run "seated, mixed bundles, some executed" PASS 1
 
+# 6. Seated + exactly one test executed → PASS. xcodebuild emits the SINGULAR
+#    "Executed 1 test, with 0 failures" for a one-test bundle/total; a plural-only
+#    regex would false-FAIL this legit run (review F1). Mirrors the sibling guards'
+#    `tests?` pattern at Makefile:321,377.
+cat > "$LOG" <<'EOF'
+Test Suite 'S279_LifecycleRecoveryGUITests' passed
+	 Executed 1 test, with 0 failures (0 unexpected) in 1.0 (1.1) seconds
+EOF
+run "seated, single test executed" PASS 1
+
 echo "assert-gui-tests-executed self-test: all scenarios pass"
