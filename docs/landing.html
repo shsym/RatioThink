@@ -659,16 +659,21 @@
 
   // ============== Scene 2: JSON Think — free-form chat vs grammar-constrained JSON ==============
   // Types pre-highlighted JSON one tag/text fragment at a time so the .k/.s/.n spans
-  // stay intact while the answer streams in.
-  async function streamJsonInto(node, htmlStr, myGen){
+  // stay intact while the answer streams in. `per` is the per-fragment delay —
+  // each span/text fragment is roughly token-sized, so passing the same value the
+  // chat pass uses for streamWords makes both passes read at one generation speed.
+  async function streamJsonInto(node, htmlStr, per, myGen){
     node.classList.add('caret');
     var frags = htmlStr.match(/<span[^>]*>.*?<\/span>|[^<]+/g) || [htmlStr];
     var acc = '';
-    for (var i=0;i<frags.length;i++){ acc += frags[i]; node.innerHTML = acc; await sleep(150, myGen); }
+    for (var i=0;i<frags.length;i++){ acc += frags[i]; node.innerHTML = acc; await sleep(per, myGen); }
     node.classList.remove('caret');
   }
   async function sceneJsonThink(myGen){
     var d = SCENARIO.json;
+    // Same model, ~same token rate: lock both passes to one per-token cadence so
+    // the constrained JSON streams as fast as the chat prose (not a slow crawl).
+    var TOK_MS = 40;
     // First pass: the everyday Chat profile — a free-form reply you can't reliably parse.
     setProfile('Chat', 'chat');
     setCaption('The everyday Chat profile answers correctly — but buries the JSON in reasoning prose you\'d have to scrape out.');
@@ -678,7 +683,7 @@
     await sleep(260, myGen);
     var a1 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
     transcript.appendChild(a1);
-    await streamWords(a1.querySelector('.bubble'), d.chatAnswer, 40, myGen);
+    await streamWords(a1.querySelector('.bubble'), d.chatAnswer, TOK_MS, myGen);
     await sleep(900, myGen);
 
     // Switch profiles: open the menu, pick JSON Think.
@@ -696,7 +701,7 @@
     var ans = el('<div class="bubble json"></div>');
     a2.querySelector('.acol').appendChild(ans);
     setCaption('Same prompt — JSON Think returns one clean JSON object, no prose, parseable every time.');
-    await streamJsonInto(ans, d.answer, myGen);
+    await streamJsonInto(ans, d.answer, TOK_MS, myGen);
     await sleep(1400, myGen);
 
     // The #646 tiny-budget caveat — one short footnote beat (no animated reasoning).
