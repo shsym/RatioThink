@@ -148,6 +148,21 @@ if [[ -n "${DEVELOPMENT_TEAM:-}" ]]; then
   SIGN_ARGS+=("DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM")
 fi
 
+# Start from a clean staging dir. $SYM_ROOT (= CONFIGURATION_BUILD_DIR) is a
+# persistent per-arch dir reused across packaging runs, so a prior run's
+# RatioThink.app — including the pie engine staged into its Resources — survives
+# here. The engine build phase is `basedOnDependencyAnalysis: false` and
+# normally re-stages every build, but the #643 PIE_SKIP_ENGINE_BUILD opt-out can
+# no-op it (it is gated on CONFIGURATION!=Release, and this script accepts
+# --configuration Debug). A skipped phase over a surviving stale bundle would
+# ship an OLD engine that still passes every downstream guard below (present,
+# single-arch, signed, entitled). Wiping $SYM_ROOT makes those guards
+# load-bearing: if this build does not freshly stage an engine, RatioThink.app
+# has none and the "pie engine missing from bundle" check fails loudly instead.
+# Only the current arch's dir is removed, so a sibling arch build staged for a
+# future universal lipo merge (see BUILD_DIR comment above) is untouched.
+rm -rf "$SYM_ROOT"
+
 echo "package-dmg.sh: xcodebuild RatioThink (arch=$ARCH, configuration=$CONFIG)"
 xcodebuild \
   -project RatioThink.xcodeproj \

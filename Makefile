@@ -65,7 +65,7 @@ define gui_suite_run
 endef
 
 .PHONY: help genproject build build-static build-tests clean lint verify-tot-docs ci-pr check-vendor-pin local-pre-merge local-gui-gate local-e2e-gate release-gate \
-        verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics test-landing-page \
+        verify-app-icon-assets test-app-icon-assets test-dmg-layout test-package-dmg-staging test-collect-diagnostics test-landing-page \
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-sandbox-diagnostics test-readme-harness test-e2e-http \
         test-spec-smoke test-spec-bench test-spec-matrix-selftest bench-spec-matrix bench-datasets-prep bench-datasets-verify \
@@ -105,7 +105,7 @@ local-gui-gate: test-gui-script test-gui ## Mandatory local GUI parity gate for 
 
 local-e2e-gate: test-e2e-engine test-e2e-models test-e2e-chat test-e2e-tot test-e2e-budget-sweep test-e2e-full test-gui-history test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui-first-launch-package test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured ## Operator-gated integration/E2E parity; requires documented models, engine, signing, TCC, or live services
 
-release-gate: local-pre-merge test-curated-hf test-dmg-layout ## Release readiness gate; additionally run release-preflight with ARTIFACT=<built .app|.dmg> after packaging/notarization
+release-gate: local-pre-merge test-curated-hf test-dmg-layout test-package-dmg-staging ## Release readiness gate; additionally run release-preflight with ARTIFACT=<built .app|.dmg> after packaging/notarization
 
 install-app: ## Signed install into /Applications, verified end-to-end (Helper+engine+chat). Override DEVELOPMENT_TEAM / CODE_SIGN_IDENTITY per machine.
 	Scripts/install-app.sh
@@ -550,6 +550,9 @@ test-app-icon-assets: ## Regression-test the app-icon verifier failure modes
 
 test-dmg-layout: ## Regression-test the DMG drag-install layout verifier (hdiutil + codesign, no xcodebuild)
 	Scripts/test-verify-dmg-layout.sh
+
+test-package-dmg-staging: ## Regression-test package-dmg.sh stale-staging clean (stubbed xcodebuild, no build)
+	Scripts/test-package-dmg-staging.sh
 
 test-collect-diagnostics: $(LOGDIR) ## Real-script self-test for Scripts/collect-diagnostics.sh (CI-safe via override env)
 	@set +e +o pipefail; \
