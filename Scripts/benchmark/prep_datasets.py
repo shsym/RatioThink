@@ -25,9 +25,9 @@ locked dataset and fails loudly on any drift.
 
 Usage::
 
-    uv run --with "datasets>=2.18" python Scripts/benchmark/datasets.py emit <key>
-    uv run --with "datasets>=2.18" python Scripts/benchmark/datasets.py emit-all
-    uv run --with "datasets>=2.18" python Scripts/benchmark/datasets.py verify
+    uv run --with "datasets>=2.18" python Scripts/benchmark/prep_datasets.py emit <key>
+    uv run --with "datasets>=2.18" python Scripts/benchmark/prep_datasets.py emit-all
+    uv run --with "datasets>=2.18" python Scripts/benchmark/prep_datasets.py verify
 """
 from __future__ import annotations
 
@@ -344,7 +344,7 @@ def _main(argv: list[str]) -> int:
     cmd = argv[1]
     if cmd == "emit":
         if len(argv) != 3:
-            raise SystemExit("usage: datasets.py emit <key>")
+            raise SystemExit("usage: prep_datasets.py emit <key>")
         emit(argv[2])
         return 0
     if cmd == "emit-all":

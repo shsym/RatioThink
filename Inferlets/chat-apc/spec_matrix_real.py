@@ -354,6 +354,7 @@ async def _bench_dataset(http_c, base, key, records, total, failures) -> dict:
     pt, nt = plain_cell["engine_tok_per_s"], ngram_cell["engine_tok_per_s"]
     speedup = (nt / pt) if (pt and nt) else None
     measured = len(records)
+    equiv_valid = equiv_hold + equiv_drift  # prompts actually compared (both 200)
     return {
         "dataset": key,
         "category": records[0].get("category") if records else None,
@@ -364,7 +365,11 @@ async def _bench_dataset(http_c, base, key, records, total, failures) -> dict:
         "greedy_equivalence": {
             "held": equiv_hold, "drift_spec": equiv_drift,
             "invalid": equiv_invalid, "baseline_nondeterministic_prompts": baseline_nondet_prompts,
-            "rate": (equiv_hold / measured) if measured else None,
+            # Rate is over the COMPARED population (held + drift), not `measured`:
+            # an `invalid` (non-200) prompt was skipped before any byte compare, so
+            # including it in the denominator would silently deflate the byte-identity
+            # contract. invalid stays reported separately for disclosure.
+            "rate": (equiv_hold / equiv_valid) if equiv_valid else None,
         },
         "advisory_speedup_engine_tok_per_s": speedup,
         "cells": {"plain": plain_cell, "ngram": ngram_cell},
