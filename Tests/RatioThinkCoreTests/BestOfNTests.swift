@@ -129,4 +129,62 @@ final class BestOfNTests: XCTestCase {
     // Unpicked = the other two snapshots, dropped next round.
     XCTAssertEqual(decoded.unpickedSnapshotNames(excluding: "n1"), ["s0", "s2"])
   }
+
+  // MARK: Lifecycle release request wire (stop/commit + abandon trigger)
+
+  /// The App-side terminal cleanup fires a `best-of-n` dispatch carrying the
+  /// snapshot names under `release`, with NO messages and `stream:false` — the
+  /// server then deletes them and frees their KV pages. This proves the commit/
+  /// abandon trigger builds the correct release request (the engine-side delete
+  /// + accounting is proven by the Rust `release_all` tests and the real smoke).
+  @MainActor
+  func test_releaseBestOfNSnapshots_dispatches_release_request_with_names_no_messages() async throws {
+    let engine = ReleaseCapturingEngine()
+    let controller = ChatSendController()
+    controller.releaseBestOfNSnapshots(
+      engine: engine, modelID: "qwen", snapshotNames: ["bon/r/1/0", "bon/r/1/1"])
+
+    // The release fires on a detached MainActor Task; wait for the dispatch.
+    let deadline = Date().addingTimeInterval(2)
+    while Date() < deadline, engine.lastRequest == nil {
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    let req = try XCTUnwrap(engine.lastRequest, "release must dispatch a request")
+    XCTAssertEqual(req.inferlet, "best-of-n")
+    XCTAssertFalse(req.stream, "a release runs no generation — not a stream")
+    XCTAssertNil(req.messages, "a release carries no messages")
+    let input = try JSONDecoder().decode(ReleaseWire.self, from: req.input)
+    XCTAssertEqual(input.model, "qwen")
+    XCTAssertEqual(input.release, ["bon/r/1/0", "bon/r/1/1"])
+  }
+
+  /// An empty release set must NOT dispatch anything (no wasted request).
+  @MainActor
+  func test_releaseBestOfNSnapshots_empty_is_a_noop() async throws {
+    let engine = ReleaseCapturingEngine()
+    ChatSendController().releaseBestOfNSnapshots(engine: engine, modelID: "qwen", snapshotNames: [])
+    try await Task.sleep(nanoseconds: 50_000_000)
+    XCTAssertNil(engine.lastRequest, "an empty release must not hit the engine")
+  }
+
+  private struct ReleaseWire: Decodable {
+    let model: String
+    let release: [String]
+  }
+}
+
+/// Minimal `EngineClient` that records the last dispatched `InferletRequest` so
+/// a test can assert the release wire. Replies with an empty stream.
+private final class ReleaseCapturingEngine: EngineClient, @unchecked Sendable {
+  private(set) var lastRequest: InferletRequest?
+
+  func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
+  func models() async throws -> [ModelInfo] { [] }
+  func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
+    AsyncThrowingStream { $0.finish() }
+  }
+  func dispatchInferlet(_ req: InferletRequest) -> AsyncThrowingStream<Data, Error> {
+    lastRequest = req
+    return AsyncThrowingStream { $0.finish() }
+  }
 }

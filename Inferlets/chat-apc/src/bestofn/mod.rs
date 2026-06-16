@@ -52,10 +52,35 @@ use crate::tot::branch::{
 };
 
 mod divergence;
+mod release;
 mod schema;
 mod stream;
 
 use schema::BestOfNParams;
+
+/// Resolve the requested model (or the first registered) and load it. Shared by
+/// the generation path and the lifecycle-release path. `Err((status, code,
+/// message))` is an OpenAI-shape error the caller turns into a JSON envelope.
+fn resolve_model(model: Option<&str>) -> Result<(Model, String), (u16, &'static str, String)> {
+    let model_id = match model {
+        Some(m) if !m.trim().is_empty() => m.to_string(),
+        _ => inferlet::runtime::models().into_iter().next().ok_or((
+            500,
+            "no_model_registered",
+            "Engine has no models registered; check pie config.".to_string(),
+        ))?,
+    };
+    if !inferlet::runtime::models().iter().any(|m| m == &model_id) {
+        return Err((
+            404,
+            "model_not_found",
+            format!("Model '{model_id}' not registered with this engine"),
+        ));
+    }
+    let model = Model::load(&model_id)
+        .map_err(|e| (500, "model_load_failed", format!("Failed to load model: {e}")))?;
+    Ok((model, model_id))
+}
 
 /// Monotonic id source for round + candidate identifiers. Best-of-n uses a
 /// `bon-` prefix so its ids never collide with tree-of-thought's `tot-n*`.
@@ -108,6 +133,22 @@ pub async fn dispatch(
         },
         None => schema::BestOfNInput::default(),
     };
+
+    // Lifecycle release: a terminal-cleanup request carries `release` (snapshot
+    // names to drop) and NO messages. Handle it before any message/generation
+    // contract — it frees the round's KV pages and acks the accounting. Fired
+    // by the app on stop/commit and on abandon (the no-next-round terminals);
+    // think-more frees its prior round through the resume path instead.
+    if let Some(names) = input.release.as_ref().filter(|n| !n.is_empty()) {
+        let names = names.clone();
+        let (model, _model_id) = match resolve_model(input.model.as_deref()) {
+            Ok(m) => m,
+            Err((status, code, msg)) => {
+                return res.respond(sse::json_error(status, code, &msg)).await;
+            }
+        };
+        return release::dispatch_release(&model, &names, res).await;
+    }
 
     let is_resume = input.resume_from.is_some();
 
@@ -185,41 +226,10 @@ pub async fn dispatch(
         }
     }
 
-    let model_id = match input.model {
-        Some(m) if !m.trim().is_empty() => m,
-        _ => match inferlet::runtime::models().into_iter().next() {
-            Some(m) => m,
-            None => {
-                return res
-                    .respond(sse::json_error(
-                        500,
-                        "no_model_registered",
-                        "Engine has no models registered; check pie config.",
-                    ))
-                    .await;
-            }
-        },
-    };
-    if !inferlet::runtime::models().iter().any(|m| m == &model_id) {
-        return res
-            .respond(sse::json_error(
-                404,
-                "model_not_found",
-                &format!("Model '{model_id}' not registered with this engine"),
-            ))
-            .await;
-    }
-
-    let model = match inferlet::model::Model::load(&model_id) {
+    let (model, model_id) = match resolve_model(input.model.as_deref()) {
         Ok(m) => m,
-        Err(e) => {
-            return res
-                .respond(sse::json_error(
-                    500,
-                    "model_load_failed",
-                    &format!("Failed to load model: {e}"),
-                ))
-                .await;
+        Err((status, code, msg)) => {
+            return res.respond(sse::json_error(status, code, &msg)).await;
         }
     };
 

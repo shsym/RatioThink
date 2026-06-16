@@ -975,7 +975,35 @@ struct ChatScaffoldView: View {
       // normal user/assistant turn).
       message.content = text
       try? modelContext.save()
+      // Terminal cleanup (#690): the chosen reply's text is now persisted, so
+      // the round's candidate KV snapshots are dead weight — release them all
+      // (think-more would have freed them via resume; stop has no next round).
+      releaseBestOfNSnapshots(round.candidates.map(\.snapshotName), in: chat)
     }
+  }
+
+  /// Best-effort release of a set of Best-of-N candidate KV snapshots (#690
+  /// terminal cleanup). No-op when the engine is not ready or the set is empty.
+  private func releaseBestOfNSnapshots(_ names: [String], in chat: Chat) {
+    guard !names.isEmpty, case .ready(let modelID) = sendGateDecision(for: chat) else { return }
+    sendCoordinator.controller(for: chatID).releaseBestOfNSnapshots(
+      engine: engineStore.client, modelID: modelID, snapshotNames: names)
+  }
+
+  /// Abandon cleanup (#690): when the user starts a NEW turn instead of
+  /// picking/think-more, every uncommitted Best-of-N round in the chat is
+  /// orphaned — its candidate snapshots will never be picked or stopped. Free
+  /// them. A round is uncommitted when its message has no committed content but
+  /// carries a decoded pick set; releasing already-freed names is a harmless
+  /// no-op (the server reports them absent), so this is safe to run each turn.
+  private func releaseAbandonedBestOfNRounds(in chat: Chat) {
+    let names: [String] = chat.messages.flatMap { message -> [String] in
+      guard message.content.isEmpty, let data = message.bestOfN,
+            let round = try? JSONDecoder().decode(BestOfNRound.self, from: data)
+      else { return [] }
+      return round.candidates.map(\.snapshotName)
+    }
+    releaseBestOfNSnapshots(names, in: chat)
   }
 
   /// Send a Best-of-N think-more round expanding from the user's pick. Mirrors
@@ -1022,6 +1050,11 @@ struct ChatScaffoldView: View {
       presentNoModelPrompt()
       return
     }
+    // Abandon cleanup (#690): starting a new turn orphans any uncommitted
+    // Best-of-N round in this chat — free its candidate snapshots now so a long
+    // session cannot accumulate unpicked KV. Runs before this turn is added, so
+    // it only targets prior rounds.
+    releaseAbandonedBestOfNRounds(in: chat)
     let options = ChatSendRequestOptions(
       modelID: modelID,
       sampling: Self.resolvedSampling(

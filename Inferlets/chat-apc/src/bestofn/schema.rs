@@ -48,6 +48,17 @@ pub struct BestOfNInput {
     pub unpicked: Option<Vec<String>>,
     /// Current depth: round 1 = 1; think-more increments.
     pub level: Option<usize>,
+
+    // ── Lifecycle release (terminal cleanup) ────────────────────────────
+    /// Snapshot names to release (delete) without generating. Set by the app
+    /// on a terminal outcome that has NO further round — stop/commit (the
+    /// chosen reply's text is persisted, so its KV snapshot is no longer
+    /// needed) or abandon (the user moved on without picking). A release
+    /// request carries no `messages` and produces no candidates: it just frees
+    /// the round's KV pages so a long session cannot accumulate orphaned
+    /// snapshots. Think-more frees its prior round through the resume path
+    /// instead, so this is only for the no-next-round terminals.
+    pub release: Option<Vec<String>>,
 }
 
 /// Validated, defaulted best-of-n parameters for one round.

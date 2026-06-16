@@ -890,6 +890,42 @@ public final class ChatSendController: ObservableObject {
     return InferletRequest(inferlet: "best-of-n", input: data, messages: nil, stream: true)
   }
 
+  /// Release (delete) a Best-of-N round's candidate KV snapshots — terminal
+  /// cleanup (#690). Fired on stop/commit (the chosen reply's text is now
+  /// persisted, so its snapshot is dead weight) and on abandon (a round the
+  /// user left without picking). Best-effort and fire-and-forget: the request
+  /// runs no generation, just frees the round's KV pages, and a failure only
+  /// wastes pages until engine teardown — never block the UI on it. Think-more
+  /// frees its prior round through the resume path instead, so this is for the
+  /// no-next-round terminals only.
+  public func releaseBestOfNSnapshots(
+    engine: EngineClient,
+    modelID: String,
+    snapshotNames: [String]
+  ) {
+    guard !snapshotNames.isEmpty,
+          let request = Self.makeBestOfNReleaseRequest(modelID: modelID, names: snapshotNames)
+    else { return }
+    Task { @MainActor in
+      do {
+        // Drain the small JSON ack to completion so the request is delivered.
+        for try await _ in engine.dispatchInferlet(request) {}
+      } catch {
+        let detail = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+        Log.engine.error(
+          "ChatSendController: best-of-n snapshot release failed: \(detail, privacy: .public)")
+      }
+    }
+  }
+
+  /// Build the `/v1/inferlet` body for a Best-of-N snapshot-release request
+  /// (#690): a `release` list, no messages, no generation.
+  private static func makeBestOfNReleaseRequest(modelID: String, names: [String]) -> InferletRequest? {
+    guard let data = try? JSONEncoder().encode(BestOfNReleaseInput(model: modelID, release: names))
+    else { return nil }
+    return InferletRequest(inferlet: "best-of-n", input: data, messages: nil, stream: false)
+  }
+
   /// Canonical wire string for a finish reason. Shared by `finishMeta`
   /// (persisted JSON) and the `chat.stream_end`/`chat.truncated` breadcrumb so
   /// the two never drift.
@@ -1067,6 +1103,14 @@ private struct BestOfNRequestInput: Encodable {
     case resumeFrom = "resume_from"
     case pickedText = "picked_text"
   }
+}
+
+/// `/v1/inferlet` body for a Best-of-N snapshot-release request (#690): names
+/// to drop, no messages — the server runs no generation and acks the freed
+/// count.
+private struct BestOfNReleaseInput: Encodable {
+  let model: String
+  let release: [String]
 }
 
 /// Failure constructing a tree-of-thought send.

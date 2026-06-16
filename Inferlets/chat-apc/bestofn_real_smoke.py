@@ -243,6 +243,18 @@ def think_more_payload(*, resume_from: str, picked_text: str, unpicked: list[str
     }
 
 
+async def release_snapshots(http: httpx.AsyncClient, base: str, names: list[str]) -> dict:
+    """POST a Best-of-N lifecycle release (no generation) and return the
+    accounting ack {requested, released, absent}."""
+    r = await http.post(
+        f"{base}/v1/inferlet",
+        json={"inferlet": "best-of-n", "stream": False, "input": {"release": names}},
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"release failed {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
 def report_round(tag: str, r: RoundResult) -> None:
     print(f"\n===== {tag} =====")
     print(f"  node_starts={len(r.node_starts)} distinct_delta_ids={r.distinct_delta_ids()} "
@@ -379,6 +391,35 @@ async def main() -> int:
                             report_round("round-3 (think-more, REPREFILL fallback)", r3)
                             check_round("round-3-reprefill", r3, expect_level=3, failures=failures,
                                         require_cobatch=False)  # fallback path: assert it still produces N divergent candidates
+
+                            # ── Lifecycle release (stop/commit + abandon) ──
+                            # Round 3 has no further round, so its candidate
+                            # snapshots are exactly what stop/commit (or abandon)
+                            # must free. Release them, then RE-release the same
+                            # names: the first frees all (released=N), the second
+                            # finds them all gone (absent=N) — the accounting
+                            # proof that the snapshots, and their KV pages, were
+                            # actually returned (the runtime delete frees the
+                            # pages and errors on a missing snapshot). The
+                            # mechanism is identical for stop/commit and abandon;
+                            # only the App-side trigger differs.
+                            if r3.candidates:
+                                r3_snaps = [c["snapshot_name"] for c in r3.candidates]
+                                n3 = len(r3_snaps)
+                                ack1 = await release_snapshots(http, base, r3_snaps)
+                                ack2 = await release_snapshots(http, base, r3_snaps)
+                                print("\n===== lifecycle release (stop/commit + abandon) =====")
+                                print(f"  release:    {ack1}")
+                                print(f"  re-release: {ack2}  (all absent ⇒ snapshots + pages freed)")
+                                if not (ack1.get("released") == n3 and ack1.get("absent") == 0):
+                                    failures.append(
+                                        f"release: freed {ack1.get('released')}/{n3} (absent "
+                                        f"{ack1.get('absent')}); stop/commit must free every snapshot")
+                                if not (ack2.get("released") == 0 and ack2.get("absent") == n3):
+                                    failures.append(
+                                        f"re-release: {ack2.get('released')} freed / {ack2.get('absent')} "
+                                        f"absent; expected all absent — snapshots were not actually "
+                                        f"deleted (KV page leak)")
             finally:
                 drain.cancel()
                 with __import__("contextlib").suppress(asyncio.CancelledError, Exception):
@@ -403,7 +444,8 @@ async def main() -> int:
         return 1
     print("RESULT: PASS")
     print("  (a) co-batch parallel decode  (b) real divergence  "
-          "(c) warm resume + reprefill fallback  (d) daemon survived")
+          "(c) warm resume + reprefill fallback  (d) daemon survived  "
+          "(e) stop/commit+abandon release frees snapshots (re-release all absent)")
     return 0
 
 
