@@ -7,9 +7,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pie-app-icon-verifier-tests.XXXXXX")"
 
-# Pin the regeneration toolchain so reproducibility is checked against the same
-# Pillow the committed assets were produced with (byte-identical at 12.2.0).
-PILLOW_PIN="pillow==12.*"
+# Pin the regeneration toolchain exactly to the Pillow the committed assets were
+# produced with (byte-identical at 12.2.0). Bump deliberately alongside a
+# manifest re-lock; a floating 12.* would red CI on any future Lanczos/PNG
+# encoding change even when the artwork and generator are unchanged.
+PILLOW_PIN="pillow==12.2.0"
 
 cleanup() {
   rm -rf "$WORK_ROOT"
@@ -150,23 +152,13 @@ expect_failure() {
   fi
 }
 
-expect_reproducible_highres() {
+expect_reproducible_manifest() {
   local name="$1"
   local fixture
   fixture="$(prepare_clean_fixture "$name")"
 
   command -v uv >/dev/null 2>&1 || {
     echo "FAIL: uv is required to regenerate the app icon under a pinned Pillow" >&2
-    exit 1
-  }
-
-  local expected_sha
-  expected_sha="$(
-    awk '$2 == "Resources/AppIcon/rational-icon-highres.png" { print $1 }' \
-      "$fixture/Resources/AppIcon/manifest.sha256"
-  )"
-  [[ -n "$expected_sha" ]] || {
-    echo "FAIL: manifest.sha256 has no rational-icon-highres.png entry for $name" >&2
     exit 1
   }
 
@@ -179,12 +171,18 @@ expect_reproducible_highres() {
     exit 1
   fi
 
-  local actual_sha
-  actual_sha="$(shasum -a 256 "$fixture/Resources/AppIcon/rational-icon-highres.png" | awk '{print $1}')"
-  [[ "$actual_sha" == "$expected_sha" ]] || {
-    echo "FAIL: regenerated rational-icon-highres.png SHA-256 $actual_sha != manifest $expected_sha for $name" >&2
+  # Assert every regenerated artifact (highres + all appiconset downscales)
+  # matches the committed manifest, not just the highres master, so a
+  # downscale-path regression (wrong SIZES entry, changed resize filter) is
+  # caught too.
+  if ! (
+    cd "$fixture"
+    shasum -a 256 -c Resources/AppIcon/manifest.sha256
+  ) >"$fixture/regen-verify.log" 2>&1; then
+    cat "$fixture/regen-verify.log" >&2
+    echo "FAIL: regenerated app icon bytes do not match manifest.sha256 for $name" >&2
     exit 1
-  }
+  fi
 }
 
 mutate_source_png() {
@@ -249,7 +247,7 @@ mutate_partial_generated_project_dir() {
   mkdir -p "$1/RatioThink.xcodeproj"
 }
 
-expect_reproducible_highres "regenerate-highres-matches-manifest"
+expect_reproducible_manifest "regenerate-matches-manifest"
 expect_clean_success "clean-without-generated-project"
 expect_clean_failure "partial-generated-project-dir" mutate_partial_generated_project_dir
 expect_success "baseline"
