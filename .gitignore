@@ -71,3 +71,8 @@ __pycache__/
 
 # Generated Repeat Boost / speculative-decoding bench artifact (Scripts/run-spec-bench.sh)
 spec_bench_*.json
+
+# Spec-decode benefit matrix (#652): emitted dataset prompt sets are regenerated
+# from the pinned revision in datasets.lock — only the lock is committed.
+Scripts/benchmark/data/
+spec_matrix_*.json

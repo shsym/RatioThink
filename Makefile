@@ -67,7 +67,7 @@ endef
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-collect-diagnostics test-landing-page \
         test-ci-v2-static-gate test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-sandbox-diagnostics test-readme-harness test-e2e-http \
-        test-spec-smoke test-spec-bench \
+        test-spec-smoke test-spec-bench test-spec-matrix-selftest bench-spec-matrix bench-datasets-prep bench-datasets-verify \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-gui-chat-switch test-menubar-icon-template \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
@@ -476,6 +476,24 @@ test-spec-bench: $(LOGDIR) ## Repeat Boost vs baseline measurement harness (opt-
 	@set +e +o pipefail; \
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-spec-bench.log; \
 	  Scripts/run-spec-bench.sh 2>&1 | tee $$LOG | tail -60; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  exit $$status
+
+test-spec-matrix-selftest: ## Engine-free unit guard for the spec-decode MATRIX harness helpers (#652): histogram-sum, greedy-equivalence, /no_think switch, excluded columns. Deterministic, CI-safe.
+	uv run --project Vendor/pie/client/python --with httpx \
+	  python Inferlets/chat-apc/spec_matrix_real_test.py
+
+bench-datasets-prep: ## Materialize every PUBLIC pinned dataset row of the spec-decode matrix (#652) → Scripts/benchmark/datasets.lock. Needs uv + network. data/ is gitignored.
+	Scripts/benchmark/prep_all.sh
+
+bench-datasets-verify: ## Reproducibility guard (#652 no-cherrypick): re-emit every locked dataset and fail on any count/hash drift. Needs uv + network; NOT CI.
+	uv run --quiet --with "datasets>=2.18" python Scripts/benchmark/prep_datasets.py verify
+
+bench-spec-matrix: $(LOGDIR) ## Spec-decode benefit MATRIX: method × workload over PUBLIC pinned datasets (#652, extends #510). Opt-in, portable Metal, needs uv + real 7-14B weights. Knobs: MODEL, MAX_TOKENS, MAX_PROMPTS, DATASETS, MATRIX_OUT.
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-spec-matrix.log; \
+	  Scripts/run-spec-matrix.sh 2>&1 | tee $$LOG | tail -80; \
 	  status=$${PIPESTATUS[0]}; \
 	  echo "log: $$LOG"; \
 	  exit $$status
