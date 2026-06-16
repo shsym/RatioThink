@@ -431,6 +431,14 @@ test-tot-real-smoke: test-tot-real-smoke-unit $(LOGDIR) ## Real-model Tree-of-Th
 	  echo "log: $$LOG"; \
 	  exit $$status
 
+test-bestofn-real-smoke: $(LOGDIR) ## Real-model Best-of-N round-trip smoke: generate N → pick → think-more (warm resume + re-prefill fallback); asserts parallel-decode co-batch, real divergence, KV resume across the request boundary, daemon survival (portable Metal + staged Qwen3-0.6B GGUF; gated, NOT CI)
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-bestofn-real-smoke.log; \
+	  Scripts/run-bestofn-real-smoke.sh 2>&1 | tee $$LOG | tail -70; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  exit $$status
+
 test-harsh-load-selftest: ## Engine-free guard for the harsh-load generation assertion (#467 F1): an all-400-normalizing corpus must report FAIL, not a hollow PASS. Deterministic, CI-safe.
 	uv run --project Vendor/pie/client/python --with httpx \
 	  python Inferlets/chat-apc/harsh_load_real.py --self-test

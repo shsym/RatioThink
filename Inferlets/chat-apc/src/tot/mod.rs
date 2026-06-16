@@ -100,6 +100,7 @@
 //!   `max_tokens` status granularity; per-node partial content on error;
 //!   streaming (#413).
 
+pub(crate) mod branch;
 mod diversity;
 mod schema;
 mod search;

@@ -66,6 +66,17 @@ public final class Message {
   /// older export decodes without it. The `= nil` declaration-site
   /// default mirrors `reasoning`'s migratability fix.
   public var tot: Data? = nil
+  /// Serialized `BestOfNRound` metadata for a Best-of-N interactive round
+  /// (#690): the round `level`, the pickable candidates (id + snapshot name),
+  /// and the user's chosen candidate id once picked. The N candidates
+  /// themselves render from the shared `tot` `ToTTree` snapshot; this column
+  /// adds the selection state the tree model deliberately does not hold. Nil
+  /// for ordinary chat and tree-of-thought turns.
+  ///
+  /// Optional (nullable column) + `= nil` declaration-site default so
+  /// SwiftData lightweight migration adds it to a pre-existing `chats.sqlite`,
+  /// mirroring `tot`/`reasoning`.
+  public var bestOfN: Data? = nil
 
   public init(
     id: UUID = UUID(),
@@ -76,7 +87,8 @@ public final class Message {
     tokens: Int = 0,
     ts: Date = Date(),
     meta: Data? = nil,
-    tot: Data? = nil
+    tot: Data? = nil,
+    bestOfN: Data? = nil
   ) {
     self.id = id
     self.chat = chat
@@ -87,6 +99,7 @@ public final class Message {
     self.ts = ts
     self.meta = meta
     self.tot = tot
+    self.bestOfN = bestOfN
   }
 }
 

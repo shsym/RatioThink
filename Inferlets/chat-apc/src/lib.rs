@@ -32,6 +32,7 @@
 //! Sampler/chat-templating/Generator. Keeping everything WASM-side
 //! means no pie-side commits on `pie.app/v1-base` for the v1 cut.
 
+mod bestofn;
 mod chat;
 mod control;
 mod sse;

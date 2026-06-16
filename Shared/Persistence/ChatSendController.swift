@@ -438,6 +438,10 @@ public final class ChatSendController: ObservableObject {
             // (incl. per-token node_delta fill, #413 phase B); disk persistence
             // stays throttled to level boundaries + the terminal.
             break
+          case .awaitingSelection:
+            // Best-of-N terminal (#690) — never emitted on the tree-of-thought
+            // path; handled by `sendBestOfN`.
+            break
           }
         }
         // Stream ended cleanly. If no terminal frame arrived, the engine
@@ -726,6 +730,166 @@ public final class ChatSendController: ObservableObject {
     return InferletRequest(inferlet: "tree-of-thought", input: data, messages: nil, stream: true)
   }
 
+  /// Resume payload for a Best-of-N think-more round (#690): the picked
+  /// candidate's snapshot + text, the unpicked siblings to drop, and the new
+  /// level the round generates at.
+  public struct BestOfNResume: Equatable, Sendable {
+    public let pickedName: String
+    public let pickedText: String
+    public let unpicked: [String]
+    public let level: Int
+    public init(pickedName: String, pickedText: String, unpicked: [String], level: Int) {
+      self.pickedName = pickedName
+      self.pickedText = pickedText
+      self.unpicked = unpicked
+      self.level = level
+    }
+  }
+
+  /// Stream one Best-of-N round (#690): generate N candidates, render them in
+  /// the reused tree view, and persist the `awaiting_selection` terminal as the
+  /// round's pick set — WITHOUT auto-selecting an answer (the user picks). The
+  /// candidates fold into the same `ToTTree` (`assistant.tot`) the tree-of-
+  /// thought path uses; the pickable set + level land on `assistant.bestOfN`.
+  /// `resume` is nil for round 1, set for a think-more round.
+  public func sendBestOfN(
+    chat: Chat,
+    context: ModelContext,
+    engine: EngineClient,
+    config: BestOfNProfileConfig,
+    persistenceStatus: PersistenceStatus,
+    options: ChatSendRequestOptions,
+    resume: BestOfNResume? = nil
+  ) {
+    cancel()
+    generation &+= 1
+    let myGeneration = generation
+    guard let request = Self.makeBestOfNRequest(
+      chat: chat, config: config, options: options, resume: resume)
+    else {
+      persistenceStatus.report(
+        ToTSendError.requestEncodingFailed, context: "ChatSendController.makeBestOfNRequest")
+      return
+    }
+    isInFlight = true
+    Diag.app.event("chat.send.bestofn", [("model", options.modelID)])
+
+    task = Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer {
+        if self.generation == myGeneration {
+          self.activeWriter = nil
+          self.activeAssistant = nil
+          self.activeContext = nil
+          self.activePersistenceStatus = nil
+          self.task = nil
+          self.isInFlight = false
+        }
+      }
+      guard self.generation == myGeneration, !Task.isCancelled else { return }
+
+      let assistant = Message(role: ChatMessage.Role.assistant.rawValue, content: "", ts: Date())
+      context.insert(assistant)
+      chat.messages.append(assistant)
+      chat.updatedAt = assistant.ts
+      do {
+        try context.save()
+      } catch {
+        chat.messages.removeAll { $0.id == assistant.id }
+        context.delete(assistant)
+        persistenceStatus.report(error, context: "ChatSendController.insertAssistant(bestofn)")
+        return
+      }
+      self.activeAssistant = assistant
+      self.activeContext = context
+      self.activePersistenceStatus = persistenceStatus
+
+      var tree = ToTTree()
+      var reachedTerminal = false
+      let encoder = JSONEncoder()
+      var lastLiveEncode = Date.distantPast
+      do {
+        for try await event in toTEventStream(from: engine.dispatchInferlet(request)) {
+          guard self.generation == myGeneration, !Task.isCancelled else { return }
+          tree.apply(event)
+          let isDelta: Bool = { if case .nodeDelta = event { return true } else { return false } }()
+          let now = Date()
+          if !isDelta || now.timeIntervalSince(lastLiveEncode) >= Self.totLiveEncodeInterval {
+            lastLiveEncode = now
+            assistant.tot = try? encoder.encode(tree)
+          }
+          switch event {
+          case let .awaitingSelection(level, candidates):
+            reachedTerminal = true
+            assistant.tot = try? encoder.encode(tree)
+            // The round's pick set — no choice yet; the user selects in the UI.
+            let round = BestOfNRound(level: level, candidates: candidates, chosenID: nil)
+            assistant.bestOfN = try? encoder.encode(round)
+            Self.persistTree(context, status: persistenceStatus)
+            self.activeAssistant = nil
+            self.activeContext = nil
+            self.activePersistenceStatus = nil
+          case .levelPruned:
+            Self.persistTree(context, status: persistenceStatus)
+          case .treeStart, .nodeStart, .nodeDelta, .nodeComplete,
+               .treeComplete, .finalDelta, .generationMetrics:
+            // Best-of-N never auto-selects (no treeComplete/finalDelta) and
+            // emits no metrics; the live re-encode above drives the tree.
+            break
+          }
+        }
+        if self.generation == myGeneration, !Task.isCancelled {
+          if !reachedTerminal {
+            tree.fail(Self.totIncompleteMessage)
+            assistant.tot = try? encoder.encode(tree)
+            assistant.content = "⚠️ \(Self.totIncompleteMessage)"
+            Diag.app.event("chat.fail.bestofn", [("reason", "no_terminal")])
+          }
+          Self.persistTree(context, status: persistenceStatus)
+        }
+      } catch is CancellationError {
+        return
+      } catch {
+        guard self.generation == myGeneration, !Task.isCancelled else { return }
+        let problem = EngineProblem(requestError: error, requestedModelID: options.modelID)
+        tree.fail(problem.technicalDetail ?? problem.message)
+        assistant.tot = try? encoder.encode(tree)
+        assistant.content = "⚠️ \(problem.message)"
+        if let detail = problem.technicalDetail {
+          Log.engine.error("ChatSendController: best-of-n send failed: \(detail, privacy: .public)")
+        }
+        Diag.app.event("chat.fail.bestofn", [("error", String(describing: type(of: error)))])
+        Self.persistTree(context, status: persistenceStatus)
+      }
+    }
+  }
+
+  /// Build the `/v1/inferlet` dispatch body for a Best-of-N round (#690). For a
+  /// think-more round `resume` carries the picked snapshot + text, the unpicked
+  /// siblings to drop, and the new level; its fields are omitted (round 1) when
+  /// nil.
+  private static func makeBestOfNRequest(
+    chat: Chat,
+    config: BestOfNProfileConfig,
+    options: ChatSendRequestOptions,
+    resume: BestOfNResume?
+  ) -> InferletRequest? {
+    let input = BestOfNRequestInput(
+      model: options.modelID,
+      messages: transcriptTurns(chat: chat, options: options),
+      n: config.n,
+      maxTokensPerCandidate: config.maxTokensPerCandidate,
+      temperature: options.sampling.temperature,
+      topP: options.sampling.topP,
+      resumeFrom: resume?.pickedName,
+      pickedText: resume?.pickedText,
+      unpicked: resume?.unpicked,
+      level: resume?.level
+    )
+    guard let data = try? JSONEncoder().encode(input) else { return nil }
+    return InferletRequest(inferlet: "best-of-n", input: data, messages: nil, stream: true)
+  }
+
   /// Canonical wire string for a finish reason. Shared by `finishMeta`
   /// (persisted JSON) and the `chat.stream_end`/`chat.truncated` breadcrumb so
   /// the two never drift.
@@ -878,6 +1042,30 @@ private struct ToTRequestInput: Encodable {
     case beamWidth = "beam_width"
     case maxTokensPerNode = "max_tokens_per_node"
     case topP = "top_p"
+  }
+}
+
+/// `/v1/inferlet` dispatch body for a Best-of-N round (#690). Round-1 leaves
+/// the resume fields nil → the synthesized `Encodable` omits them
+/// (`encodeIfPresent`), so the server reads it as a fresh round.
+private struct BestOfNRequestInput: Encodable {
+  let model: String
+  let messages: [ChatMessage]
+  let n: Int
+  let maxTokensPerCandidate: Int
+  let temperature: Double
+  let topP: Double
+  let resumeFrom: String?
+  let pickedText: String?
+  let unpicked: [String]?
+  let level: Int?
+
+  private enum CodingKeys: String, CodingKey {
+    case model, messages, n, temperature, level, unpicked
+    case maxTokensPerCandidate = "max_tokens_per_candidate"
+    case topP = "top_p"
+    case resumeFrom = "resume_from"
+    case pickedText = "picked_text"
   }
 }
 

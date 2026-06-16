@@ -122,6 +122,29 @@ public struct ToTNode: Decodable, Equatable, Sendable, Identifiable {
   }
 }
 
+/// One pickable candidate in a Best-of-N `awaiting_selection` terminal (#690):
+/// its node id (matches the streamed `ToTNode.id`), pane order, and the
+/// snapshot name the client posts back when the user picks it for a
+/// think-more round. `Codable` so a round's pick set round-trips through the
+/// persisted `Message.bestOfN` metadata.
+public struct ToTSelectionCandidate: Equatable, Sendable, Codable, Identifiable {
+  public let id: String
+  public let branchIndex: Int
+  public let snapshotName: String
+
+  public init(id: String, branchIndex: Int, snapshotName: String) {
+    self.id = id
+    self.branchIndex = branchIndex
+    self.snapshotName = snapshotName
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case branchIndex = "branch_index"
+    case snapshotName = "snapshot_name"
+  }
+}
+
 // MARK: - Events
 
 /// One decoded tree-of-thought stream frame. The `error` frame is NOT a
@@ -159,6 +182,11 @@ public enum ToTEvent: Equatable, Sendable {
   /// (reasoning, branch answers, scorer generations, and synthesis), never
   /// prompt/input tokens.
   case generationMetrics(GenerationMetrics)
+  /// Best-of-N terminal (#690): the round generated these pickable candidates
+  /// and is waiting for the **user** to choose one — there is no auto-selected
+  /// final answer. Carries the round `level` and the saved candidates the user
+  /// may pick (and think-more from). The tree-of-thought path never emits this.
+  case awaitingSelection(level: Int, candidates: [ToTSelectionCandidate])
 }
 
 /// Which channel a streamed `nodeDelta` chunk fills (#413).
@@ -258,6 +286,14 @@ public func decodeToTFrame(_ data: Data) throws -> ToTEvent? {
     // absence from the optionals is indistinguishable from explicit
     // null, which is the honest "no ok leaf" outcome either way.
     return .treeComplete(selectedNodeID: raw.selectedNodeID, finalAnswer: raw.finalAnswer)
+  case "awaiting_selection":
+    // #690 Best-of-N terminal: the user picks. `candidates` may be empty only
+    // on a degenerate stream (the server emits the `error` frame for a round
+    // with no pickable candidate), so an absent list decodes to `[]`.
+    guard let level = raw.level else {
+      throw ToTStreamError.malformedFrame(payload: String(decoding: data, as: UTF8.self))
+    }
+    return .awaitingSelection(level: level, candidates: raw.candidates ?? [])
   case "error":
     throw ToTStreamError.stream(code: raw.code ?? "unknown_error", message: raw.message ?? "")
   default:
@@ -310,6 +346,8 @@ struct RawToTFrame: Decodable {
   let branchIndex: Int?
   let kind: String?
   let text: String?
+  // Best-of-N `awaiting_selection` terminal (#690).
+  let candidates: [ToTSelectionCandidate]?
 
   private enum CodingKeys: String, CodingKey {
     case event
@@ -329,6 +367,7 @@ struct RawToTFrame: Decodable {
     case branchIndex = "branch_index"
     case kind
     case text
+    case candidates
   }
 }
 

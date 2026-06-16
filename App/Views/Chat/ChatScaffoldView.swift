@@ -523,7 +523,13 @@ struct ChatScaffoldView: View {
           // edit can't race the active turn.
           onEditUserTurn: sendCoordinator.isInFlight(chatID)
             ? nil
-            : { messageID, newText in forkAndResend(messageID: messageID, newContent: newText, in: chat) }
+            : { messageID, newText in forkAndResend(messageID: messageID, newContent: newText, in: chat) },
+          // #690: Best-of-N pick / think-more / stop, withheld while streaming
+          // (same as retry/edit), and live only for the latest uncommitted round.
+          onBestOfN: sendCoordinator.isInFlight(chatID)
+            ? nil
+            : { messageID, action in handleBestOfN(messageID: messageID, action: action, in: chat) },
+          bestOfNLiveID: sendCoordinator.isInFlight(chatID) ? nil : liveBestOfNRoundID(in: chat)
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // #669: the no-model gate is a NON-modal overlay scoped to the
@@ -914,6 +920,91 @@ struct ChatScaffoldView: View {
     windowState.beginForkResend(to: newID)
   }
 
+  // MARK: - Best-of-N interaction (#690)
+
+  /// The latest uncommitted Best-of-N round (a round message with pick metadata
+  /// but no committed answer yet) — the one row that shows the live controls.
+  private func liveBestOfNRoundID(in chat: Chat) -> UUID? {
+    chat.messages
+      .sorted(by: Message.transcriptPrecedes)
+      .last { $0.bestOfN != nil && $0.content.isEmpty }?
+      .id
+  }
+
+  /// The chosen candidate's answer text, read from the round's persisted
+  /// `ToTTree` snapshot by node id.
+  private func bestOfNCandidateText(message: Message, nodeID: String) -> String? {
+    guard let totData = message.tot,
+          let tree = try? JSONDecoder().decode(ToTTree.self, from: totData) else { return nil }
+    return tree.nodes.first { $0.id == nodeID }?.content
+  }
+
+  /// Apply a Best-of-N pick / think-more / stop (#690).
+  ///  - `.pick` records the chosen candidate on the round (collapse + highlight).
+  ///  - `.thinkMore` starts the next round expanding from the pick (warm-resume
+  ///    from its snapshot, falling back to re-prefill server-side on a miss).
+  ///  - `.stop` commits the chosen candidate as the round's final answer.
+  private func handleBestOfN(messageID: UUID, action: BestOfNAction, in chat: Chat) {
+    guard let message = chat.messages.first(where: { $0.id == messageID }),
+          let roundData = message.bestOfN,
+          var round = try? JSONDecoder().decode(BestOfNRound.self, from: roundData) else { return }
+
+    switch action {
+    case let .pick(id):
+      round.chosenID = id
+      message.bestOfN = try? JSONEncoder().encode(round)
+      try? modelContext.save()
+
+    case .thinkMore:
+      guard let chosen = round.chosen,
+            let pickedText = bestOfNCandidateText(message: message, nodeID: chosen.id)
+      else { return }
+      let resume = ChatSendController.BestOfNResume(
+        pickedName: chosen.snapshotName,
+        pickedText: pickedText,
+        unpicked: round.unpickedSnapshotNames(excluding: chosen.id),
+        level: round.level + 1)
+      sendBestOfNRound(for: chat, resume: resume)
+
+    case .stop:
+      guard let chosen = round.chosen,
+            let text = bestOfNCandidateText(message: message, nodeID: chosen.id)
+      else { return }
+      // Commit the chosen candidate as the round's final answer (not editable
+      // in v1 — a follow-up could make the committed reply editable like a
+      // normal user/assistant turn).
+      message.content = text
+      try? modelContext.save()
+    }
+  }
+
+  /// Send a Best-of-N think-more round expanding from the user's pick. Mirrors
+  /// the round-1 route in `sendAssistantTurn` but threads the `resume` payload.
+  private func sendBestOfNRound(for chat: Chat, resume: ChatSendController.BestOfNResume) {
+    guard case .ready(let modelID) = sendGateDecision(for: chat) else { return }
+    guard let bonProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
+          let bonConfig = bonProfile.bestOfN else { return }
+    let options = ChatSendRequestOptions(
+      modelID: modelID,
+      sampling: bonProfile.bestOfNRequestSampling,
+      systemPromptOverride: Self.resolvedSystemPrompt(
+        profileDefault: profileStore.systemPrompt(forProfileID: viewModel.selectedProfileID),
+        transientOverride: viewModel.systemPromptOverride),
+      profileID: viewModel.selectedProfileID,
+      speculation: nil,
+      maxOutputTokensCeiling: modelLoadCenter.residentMaxOutputTokens,
+      kvUsageSnapshot: engineStatusStore.kvUsageSnapshot(for: modelID),
+      responseFormat: nil)
+    sendCoordinator.controller(for: chatID).sendBestOfN(
+      chat: chat,
+      context: modelContext,
+      engine: engineStore.client,
+      config: bonConfig,
+      persistenceStatus: persistenceStatus,
+      options: options,
+      resume: resume)
+  }
+
   private func sendAssistantTurn(for chat: Chat) {
     // Defensive: ComposerView only invokes this after `shouldAllowSend`
     // passed, but never ask the engine to load a model the user did not
@@ -982,6 +1073,22 @@ struct ChatScaffoldView: View {
         // #523 Part B: source the ToT candidate-generation temperature from
         // the profile, not the toolbar default.
         options: options.withSampling(totProfile.toTRequestSampling)
+      )
+      return
+    }
+
+    // #690: a `mode = "best-of-n"` profile routes the turn to the Best-of-N
+    // dispatch — round 1 generates N candidates the user picks among. Like ToT,
+    // the launched inferlet stays chat-apc; this is a per-request dispatch mode.
+    if let bonProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
+       let bonConfig = bonProfile.bestOfN {
+      sendController.sendBestOfN(
+        chat: chat,
+        context: modelContext,
+        engine: engineStore.client,
+        config: bonConfig,
+        persistenceStatus: persistenceStatus,
+        options: options.withSampling(bonProfile.bestOfNRequestSampling)
       )
       return
     }

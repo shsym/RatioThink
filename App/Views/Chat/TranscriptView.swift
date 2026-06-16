@@ -26,6 +26,15 @@ struct TranscriptView: View {
   /// edit affordance — the scaffold passes nil while a stream is in flight,
   /// so an edit can't race the active turn.
   var onEditUserTurn: ((UUID, String) -> Void)? = nil
+  /// #690: invoked with a Best-of-N round message + the user's action (pick /
+  /// think-more / stop). Nil hides the affordance; the scaffold passes it only
+  /// when no stream is in flight, and only the latest uncommitted round gets a
+  /// live callback (see `bestOfNLiveID`).
+  var onBestOfN: ((UUID, BestOfNAction) -> Void)? = nil
+  /// The id of the one Best-of-N round that is currently interactive (the last
+  /// uncommitted round, set by the scaffold while idle). Only that row shows the
+  /// pick + think-more/stop controls; older rounds render read-only.
+  var bestOfNLiveID: UUID? = nil
 
   /// #521/#530: THE render-path projection seam. The body builds the transcript
   /// snapshot exactly once per evaluation by calling this; the unit test renders
@@ -64,7 +73,8 @@ struct TranscriptView: View {
             MessageBubble(message: item,
                           onRetry: retryAction(for: item, retryableIDs: retryableIDs),
                           onEdit: editAction(for: item),
-                          maxBubbleWidth: maxBubble)
+                          maxBubbleWidth: maxBubble,
+                          onBestOfN: bestOfNAction(for: item))
               .id(item.id)
           }
           // Sentinel row so `scrollTo(.bottomSentinel)` lands at the
@@ -113,6 +123,16 @@ struct TranscriptView: View {
     guard let onEditUserTurn, item.role == .user else { return nil }
     let id = item.id
     return { newText in onEditUserTurn(id, newText) }
+  }
+
+  /// #690: the Best-of-N interaction closure for a row, or nil for non-round
+  /// rows, while a stream is in flight (`onBestOfN == nil`), and for any round
+  /// other than the live one — so only the latest uncommitted round is
+  /// interactive.
+  private func bestOfNAction(for item: ChatMessageItem) -> ((BestOfNAction) -> Void)? {
+    guard let onBestOfN, item.bestOfN != nil, item.id == bestOfNLiveID else { return nil }
+    let id = item.id
+    return { action in onBestOfN(id, action) }
   }
 
   private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
