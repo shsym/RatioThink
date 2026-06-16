@@ -430,6 +430,85 @@ final class PieControlLauncherConfigTests: XCTestCase {
                   "real pie must report the portable driver compiled in; got:\n\(stdout)")
   }
 
+  // MARK: - #687 size-aware engine timeout
+
+  private static let gib: Int64 = 1_073_741_824
+
+  func test_resolvedTimeout_smallModel_keepsFloor() {
+    // nil/unmeasurable, zero, and any weight at/below the 4 GiB base all stay
+    // at the 120s floor — small models keep today's behavior exactly.
+    let floor = PieControlLauncher.requestTimeoutFloorSeconds
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: nil, environment: [:]), floor)
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 0, environment: [:]), floor)
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 2 * Self.gib, environment: [:]), floor)
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 4 * Self.gib, environment: [:]), floor,
+      "exactly the base size adds zero headroom")
+  }
+
+  func test_resolvedTimeout_largeModel_scalesUp() {
+    // floor 120 + 30s per GiB above the 4 GiB base.
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 8 * Self.gib, environment: [:]), 240,   // 120 + 30*4
+      "an 8 GiB model scales above the floor")
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 12 * Self.gib, environment: [:]), 360)  // 120 + 30*8
+  }
+
+  func test_resolvedTimeout_respectsCeiling() {
+    // 24 GiB would compute 720s; the 600s cap clamps it. A 70B-class GGUF
+    // stays at the ceiling rather than running away.
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 24 * Self.gib, environment: [:]),
+      PieControlLauncher.requestTimeoutCeilingSeconds)
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 100 * Self.gib, environment: [:]),
+      PieControlLauncher.requestTimeoutCeilingSeconds)
+  }
+
+  func test_resolvedTimeout_envOverrideWins() {
+    // An explicit PIE_SHMEM_TIMEOUT_S beats BOTH the floor (small model) and
+    // the size-aware default (large model) — the operator escape hatch.
+    let env = ["PIE_SHMEM_TIMEOUT_S": "300"]
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: nil, environment: env), 300,
+      "override beats the floor for a small/unmeasurable model")
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 8 * Self.gib, environment: env), 300,
+      "override beats the size-aware 240s default")
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 100 * Self.gib, environment: env), 300,
+      "override even beats the ceiling — it is unclamped on purpose")
+  }
+
+  func test_resolvedTimeout_envOverride_rejectsGarbageAndFallsBackToSize() {
+    // Non-numeric, non-finite, and non-positive overrides are ignored so a
+    // stray/empty value can't silently disable the size-aware default.
+    for bad in ["abc", "", "0", "-5", "nan", "inf"] {
+      XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+        modelWeightBytes: 8 * Self.gib, environment: ["PIE_SHMEM_TIMEOUT_S": bad]), 240,
+        "invalid override \(bad.debugDescription) must fall back to the size-aware default")
+    }
+  }
+
+  func test_renderedTimeout_lockstep_acrossConfigAndEnv() {
+    // The single resolved value drives BOTH the TOML scheduler timeout and the
+    // injected child PIE_SHMEM_TIMEOUT_S, so they can never drift.
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      requestTimeoutSeconds: 360)
+    XCTAssertTrue(body.contains("request_timeout_secs = 360"), "got:\n\(body)")
+    let env = PieControlLauncher.renderSubprocessEnvironment(
+      base: [:],
+      pieHome: URL(fileURLWithPath: "/tmp/h", isDirectory: true),
+      shmemName: "/pie-test",
+      requestTimeoutSeconds: 360)
+    XCTAssertEqual(env["PIE_SHMEM_TIMEOUT_S"], "360")
+  }
+
   // MARK: - helpers
 
   private func makeSpec(binary: URL,

@@ -196,13 +196,21 @@ public struct LaunchSpecResolver {
       // `runtime::max-output-tokens`. Down-only: `nil` (omit) when the
       // metadata can't be read or the host sustains the full default.
       let modelURL = URL(fileURLWithPath: modelRef, isDirectory: false)
+      let weightBytes = ModelMemoryGuardrail.resolvedBytes(resolvedModelURL: modelURL)
       let defaultTokenLimit: Int? = ModelArchMetadata.read(resolvedModelURL: modelURL)
         .flatMap { metadata in
-          ModelMemoryGuardrail.resolvedBytes(resolvedModelURL: modelURL).flatMap { weightBytes in
+          weightBytes.flatMap { bytes in
             KVCacheBudget.outputTokenCeiling(
-              policy: memoryPolicy(), weightBytes: weightBytes, metadata: metadata)
+              policy: memoryPolicy(), weightBytes: bytes, metadata: metadata)
           }
         }
+      // Size-aware engine timeout (#687): larger GGUFs need a longer cold
+      // Metal prefill budget than the 120s floor. An explicit
+      // PIE_SHMEM_TIMEOUT_S in the helper environment (read pre-sanitize)
+      // overrides the computed default — see `resolvedRequestTimeoutSeconds`.
+      let requestTimeoutSeconds = PieControlLauncher.resolvedRequestTimeoutSeconds(
+        modelWeightBytes: weightBytes,
+        environment: ProcessInfo.processInfo.environment)
       let spec = try PieControlLauncher.LaunchSpec(
         pieBinary: binary,
         wasmURL: resources.wasm,
@@ -212,10 +220,12 @@ public struct LaunchSpecResolver {
         shmemName: shmem,
         inferletNameAtVersion: inferletNameAtVersion,
         // Real `pie serve` cold boot loads the model weights before the READY
-        // handshake; align the boot budget with the 120s request/shmem
-        // timeouts so a slow large-model start is not killed by the 30s
-        // default handshake ceiling (#459 evidence).
-        handshakeTimeout: PieControlLauncher.coldStartHandshakeTimeout,
+        // handshake; align the boot budget with the size-aware request/shmem
+        // timeout so a slow large-model start is not killed by the 30s default
+        // handshake ceiling (#459 evidence, #687 size scaling). All three stay
+        // in lock-step off `requestTimeoutSeconds`.
+        handshakeTimeout: TimeInterval(requestTimeoutSeconds),
+        requestTimeoutSeconds: requestTimeoutSeconds,
         profileID: profile.id,
         daemonBindHost: daemonBindMode(),
         modelConfig: .portableResolved(servedModelID: model, modelRef: modelRef),

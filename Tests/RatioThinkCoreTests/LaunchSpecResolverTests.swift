@@ -142,10 +142,17 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileID: ProfileStore.defaultProfileID) else {
       return XCTFail("seeded default must resolve")
     }
-    XCTAssertEqual(spec.handshakeTimeout, PieControlLauncher.coldStartHandshakeTimeout,
-                   "resolver must align the boot handshake with the 120s cold-start budget, not the 30s default")
-    XCTAssertGreaterThanOrEqual(spec.handshakeTimeout, 120,
-                                "cold-start budget must cover a slow large-model boot")
+    // #687: the boot handshake is now the SIZE-AWARE per-model timeout, in
+    // lock-step with request_timeout_secs / PIE_SHMEM_TIMEOUT_S. This tiny
+    // staged fixture (a few bytes) sits at/below the 4 GiB base, so it gets
+    // the 120s floor — not the 30s default, and not the 600s ceiling.
+    XCTAssertEqual(spec.handshakeTimeout,
+                   TimeInterval(PieControlLauncher.requestTimeoutFloorSeconds),
+                   "a small model's boot handshake must be the 120s floor")
+    XCTAssertEqual(spec.handshakeTimeout, TimeInterval(spec.requestTimeoutSeconds),
+                   "handshake budget must stay in lock-step with the request/shmem timeout")
+    XCTAssertLessThanOrEqual(spec.handshakeTimeout, PieControlLauncher.coldStartHandshakeTimeout,
+                             "per-model handshake never exceeds the cold-start ceiling the XPC deadlines clear")
   }
 
   /// A blank/whitespace `explicitModel` is treated as "no override" so a
