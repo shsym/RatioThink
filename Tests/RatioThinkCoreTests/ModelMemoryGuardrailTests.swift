@@ -244,6 +244,78 @@ final class ModelMemoryGuardrailTests: XCTestCase {
                    "0-ceiling must read as too-small-host, not model-too-big; got \(err.message)")
   }
 
+  // MARK: - validatePair() — #660 draft+target sum
+
+  func test_validatePair_sums_weights_blocking_pair_that_each_fits() throws {
+    // The core #660 safety: a 6 GiB draft + 6 GiB target each pass a 10 GiB
+    // ceiling, but their 12 GiB SUM must be blocked. A per-model check would
+    // wave this through.
+    let target = tempDir.appendingPathComponent("target.gguf")
+    let draft = tempDir.appendingPathComponent("draft.gguf")
+    try makeSparseFile(at: target, sizeBytes: 6 * gib)
+    try makeSparseFile(at: draft, sizeBytes: 6 * gib)
+    let policy = ModelMemoryGuardrail.Policy(maxResolvedModelBytes: 10 * gib)
+
+    // Each individually fits.
+    XCTAssertNoThrow(try assertSuccess(
+      ModelMemoryGuardrail.validate(resolvedModelURL: target, modelID: "t", policy: policy)))
+    XCTAssertNoThrow(try assertSuccess(
+      ModelMemoryGuardrail.validate(resolvedModelURL: draft, modelID: "d", policy: policy)))
+
+    // The pair does not.
+    let result = ModelMemoryGuardrail.validatePair(
+      targetResolvedURL: target, targetModelID: "Qwen/Qwen3-8B",
+      draftResolvedURL: draft, draftModelID: "Qwen/Qwen3-0.6B",
+      policy: policy)
+    guard case .failure(let err) = result else {
+      return XCTFail("12 GiB combined over a 10 GiB ceiling must fail; got \(result)")
+    }
+    XCTAssertEqual(err.code, .memoryRisk)
+    XCTAssertTrue(err.message.contains("combined draft+target"), err.message)
+    XCTAssertTrue(err.message.contains("Qwen/Qwen3-8B"), "names both models; got \(err.message)")
+    XCTAssertTrue(err.message.contains("Qwen/Qwen3-0.6B"), "names both models; got \(err.message)")
+    XCTAssertTrue(err.message.contains("exceeds limit"), err.message)
+  }
+
+  func test_validatePair_succeeds_when_sum_under_ceiling() throws {
+    let target = tempDir.appendingPathComponent("t2.gguf")
+    let draft = tempDir.appendingPathComponent("d2.gguf")
+    try makeSparseFile(at: target, sizeBytes: 5 * gib)
+    try makeSparseFile(at: draft, sizeBytes: 1 * gib)
+    let policy = ModelMemoryGuardrail.Policy(maxResolvedModelBytes: 10 * gib)
+    let result = ModelMemoryGuardrail.validatePair(
+      targetResolvedURL: target, targetModelID: "t",
+      draftResolvedURL: draft, draftModelID: "d",
+      policy: policy)
+    guard case .success = result else {
+      return XCTFail("6 GiB combined under a 10 GiB ceiling must pass; got \(result)")
+    }
+  }
+
+  func test_validatePair_reports_missing_draft_path() throws {
+    let target = tempDir.appendingPathComponent("t3.gguf")
+    try makeSparseFile(at: target, sizeBytes: 1 * gib)
+    let missingDraft = tempDir.appendingPathComponent("does-not-exist.gguf")
+    let policy = ModelMemoryGuardrail.Policy(maxResolvedModelBytes: 10 * gib)
+    let result = ModelMemoryGuardrail.validatePair(
+      targetResolvedURL: target, targetModelID: "t",
+      draftResolvedURL: missingDraft, draftModelID: "draft-id",
+      policy: policy)
+    guard case .failure(let err) = result else {
+      return XCTFail("a missing draft artifact must fail safe; got \(result)")
+    }
+    XCTAssertEqual(err.code, .memoryRisk)
+    XCTAssertTrue(err.message.contains("draft-id"),
+                  "the size-probe failure must name the offending model; got \(err.message)")
+  }
+
+  private func assertSuccess(_ result: Result<Void, EngineError>) throws {
+    guard case .success = result else {
+      throw NSError(domain: "test", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "expected success, got \(result)"])
+    }
+  }
+
   // MARK: - fixtures
 
   private func makeSparseFile(at url: URL, sizeBytes: Int64) throws {

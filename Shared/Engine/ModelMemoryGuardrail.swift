@@ -239,6 +239,75 @@ public enum ModelMemoryGuardrail {
     return .success(())
   }
 
+  /// Validate a draft+target model PAIR (#660 "Supercharged Thinking")
+  /// before both reach `PieControlLauncher.LaunchSpec`. The two weight sets
+  /// are resident in the same engine and, on Apple-Silicon unified memory,
+  /// draw on one shared budget — so the guardrail must check their SUM, not
+  /// each in isolation. A per-model check would wave through a pair whose
+  /// members each fit but whose total OOMs the host (e.g. a 0.6B draft +
+  /// 8B target that jointly exceeds a 16 GB ceiling). On failure returns the
+  /// same actionable `EngineError(.memoryRisk, ...)` as `validate`, naming
+  /// both models and the combined footprint.
+  public static func validatePair(
+    targetResolvedURL: URL,
+    targetModelID: String,
+    draftResolvedURL: URL,
+    draftModelID: String,
+    policy: Policy = defaultPolicy,
+    fileManager: FileManager = .default
+  ) -> Result<Void, EngineError> {
+    func sizeOrFailure(_ url: URL, _ id: String) -> Result<SizeSummary, EngineError> {
+      do {
+        return .success(try summarize(resolvedModelURL: url, fileManager: fileManager))
+      } catch {
+        return .failure(memoryRiskError(
+          modelID: id,
+          path: url.path,
+          detail: "cannot determine model size safely (\(error.localizedDescription))"
+        ))
+      }
+    }
+
+    let targetSummary: SizeSummary
+    switch sizeOrFailure(targetResolvedURL, targetModelID) {
+    case .success(let s): targetSummary = s
+    case .failure(let e): return .failure(e)
+    }
+    let draftSummary: SizeSummary
+    switch sizeOrFailure(draftResolvedURL, draftModelID) {
+    case .success(let s): draftSummary = s
+    case .failure(let e): return .failure(e)
+    }
+
+    let combined = targetSummary.totalBytes + draftSummary.totalBytes
+    guard combined <= policy.maxResolvedModelBytes else {
+      let detail: String
+      if policy.maxResolvedModelBytes == 0,
+         let physical = policy.physicalMemoryBytes,
+         let reserve = policy.reserveBytes {
+        // Too-small host — render as a host condition, not "exceeds 0 B"
+        // (mirrors `validate`).
+        detail = "this Mac's memory \(InstalledModels.formattedSize(physical)) is below the minimum"
+          + " to run any model after reserving \(InstalledModels.formattedSize(reserve)) for the system"
+      } else {
+        var over = "combined draft+target size \(InstalledModels.formattedSize(combined))"
+          + " (\(targetModelID) \(InstalledModels.formattedSize(targetSummary.totalBytes))"
+          + " + \(draftModelID) \(InstalledModels.formattedSize(draftSummary.totalBytes)))"
+          + " exceeds limit \(InstalledModels.formattedSize(policy.maxResolvedModelBytes))"
+        if let derivation = policy.derivationSummary {
+          over += " (\(derivation))"
+        }
+        detail = over
+      }
+      return .failure(memoryRiskError(
+        modelID: "\(targetModelID) + \(draftModelID)",
+        path: targetResolvedURL.path,
+        detail: detail
+      ))
+    }
+    return .success(())
+  }
+
   /// Total resolved artifact size in bytes (the weight footprint), or
   /// `nil` if it can't be measured. Reuses the same traversal as
   /// `validate`; used by `KVCacheBudget` to size the KV token ceiling.

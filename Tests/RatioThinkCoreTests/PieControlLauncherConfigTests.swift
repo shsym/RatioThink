@@ -148,6 +148,79 @@ final class PieControlLauncherConfigTests: XCTestCase {
     XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
   }
 
+  // MARK: - #660 draft+target pair emission
+
+  func test_draftModelConfig_nil_emits_single_model_body_unchanged() {
+    // Regression: the draft param defaults to nil, so every existing
+    // single-model launch must emit exactly one [[model]] block.
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "target", modelRef: "/m/target.gguf")
+    )
+    XCTAssertEqual(occurrences(of: "[[model]]", in: body), 1,
+                   "nil draft must keep a single [[model]] block; got:\n\(body)")
+    XCTAssertFalse(body.contains("device = [\"cpu\"]"),
+                   "no draft → no cpu draft block; got:\n\(body)")
+  }
+
+  func test_draftModelConfig_emits_second_model_block_with_disjoint_cpu_device() {
+    // The pair: target on Metal, draft on CPU. pie's config validation
+    // bails when two [[model]] blocks share a device string, so the draft
+    // must be disjoint — the default "cpu" is honestly disjoint from "metal".
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "Qwen/Qwen3-8B", modelRef: "/m/target.gguf"),
+      draftModelConfig: .init(servedModelID: "Qwen/Qwen3-0.6B", modelRef: "/m/draft.gguf")
+    )
+    XCTAssertEqual(occurrences(of: "[[model]]", in: body), 2,
+                   "draft+target must emit two [[model]] blocks; got:\n\(body)")
+    XCTAssertEqual(occurrences(of: "[model.scheduler]", in: body), 2,
+                   "pie requires a per-model scheduler table, so two blocks → two schedulers; got:\n\(body)")
+    XCTAssertEqual(occurrences(of: "[model.driver]", in: body), 2,
+                   "each model carries its own driver; got:\n\(body)")
+    XCTAssertTrue(body.contains("name = \"Qwen/Qwen3-8B\""), "got:\n\(body)")
+    XCTAssertTrue(body.contains("name = \"Qwen/Qwen3-0.6B\""), "got:\n\(body)")
+    XCTAssertTrue(body.contains("hf_repo = \"/m/draft.gguf\""), "got:\n\(body)")
+    XCTAssertTrue(body.contains("device = [\"metal\"]"), "target stays on Metal; got:\n\(body)")
+    XCTAssertTrue(body.contains("device = [\"cpu\"]"), "draft defaults to the disjoint CPU device; got:\n\(body)")
+    // The target's block must precede the draft's (the first [[model]] is
+    // pie's implicit default for inferlets that don't pin a model).
+    let targetIdx = body.range(of: "name = \"Qwen/Qwen3-8B\"")!.lowerBound
+    let draftIdx = body.range(of: "name = \"Qwen/Qwen3-0.6B\"")!.lowerBound
+    XCTAssertLessThan(targetIdx, draftIdx, "target [[model]] must come first; got:\n\(body)")
+  }
+
+  func test_draftModelConfig_honors_custom_gpu_device_string() {
+    // A distinct non-"cpu" string co-resides both models on the GPU: the
+    // portable driver maps anything ≠ "cpu" to ggml_backend_init_best().
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "target", modelRef: "/m/t.gguf"),
+      draftModelConfig: .init(servedModelID: "draft", modelRef: "/m/d.gguf", device: "gpu")
+    )
+    XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("device = [\"gpu\"]"), "custom draft device must be honored; got:\n\(body)")
+    XCTAssertFalse(body.contains("device = [\"cpu\"]"), "explicit gpu device must override the cpu default; got:\n\(body)")
+  }
+
+  func test_draftModelConfig_pairs_with_metal_target() {
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .metal(modelID: "Qwen/Qwen3-8B"),
+      draftModelConfig: .init(servedModelID: "Qwen/Qwen3-0.6B", modelRef: "/m/draft.gguf")
+    )
+    XCTAssertEqual(occurrences(of: "[[model]]", in: body), 2, "got:\n\(body)")
+    XCTAssertTrue(body.contains("name = \"Qwen/Qwen3-8B\""), "got:\n\(body)")
+    XCTAssertTrue(body.contains("name = \"Qwen/Qwen3-0.6B\""), "got:\n\(body)")
+  }
+
+  private func occurrences(of needle: String, in haystack: String) -> Int {
+    guard !needle.isEmpty else { return 0 }
+    var count = 0
+    var idx = haystack.startIndex
+    while let r = haystack.range(of: needle, range: idx..<haystack.endIndex) {
+      count += 1
+      idx = r.upperBound
+    }
+    return count
+  }
+
   func test_portableResolved_serves_under_profile_slug_with_distinct_hf_repo_path() {
     // The crux of the id-unification fix ( follow-up): the engine's
     // served `name` is the profile slug the App carries everywhere, while

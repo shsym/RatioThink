@@ -217,6 +217,40 @@ public enum PieControlLauncher {
     }
   }
 
+  /// A second resident model written as an additional `[[model]]` block so
+  /// the engine loads a draft+target PAIR for model-based speculative
+  /// decoding (#660 "Supercharged Thinking"). pie's `Config.models` is a
+  /// `Vec`; `bootstrap` spawns one backend worker + shmem region per entry,
+  /// so the launcher just emits a second `[[model]]`/`[model.scheduler]`/
+  /// `[model.driver]` group after the target's.
+  ///
+  /// `device` MUST be disjoint from the target's `"metal"`: pie's config
+  /// validation bails when two `[[model]]` blocks claim the same device
+  /// string (`server/src/config.rs` "disjoint device check"). The default
+  /// `"cpu"` is honestly disjoint and, on Apple-Silicon unified memory,
+  /// places draft compute on the CPU while the target verifies on the GPU —
+  /// both weight sets still draw on the one unified-memory budget that
+  /// `ModelMemoryGuardrail` sums. Any non-`"cpu"` string resolves to the
+  /// best GPU via the portable driver's `ggml_backend_init_best()`
+  /// (`driver/portable/src/model.cpp`), so a distinct GPU label co-resides
+  /// both models on Metal when measured to be faster.
+  public struct DraftModelSpec: Sendable, Equatable {
+    /// The id the engine advertises for the draft on `/v1/models` and the
+    /// inferlet loads via `Model::load`. Must differ from the target's id
+    /// (pie rejects duplicate `[[model]].name`).
+    public var servedModelID: String
+    /// Resolved on-disk path / HF repo for the draft's `hf_repo`.
+    public var modelRef: String
+    /// Driver device string — must differ from the target's `"metal"`.
+    public var device: String
+
+    public init(servedModelID: String, modelRef: String, device: String = "cpu") {
+      self.servedModelID = servedModelID
+      self.modelRef = modelRef
+      self.device = device
+    }
+  }
+
   public struct LaunchSpec: Sendable {
     public static let defaultDaemonBindHost: EngineHTTPBindMode = .loopback
 
@@ -279,6 +313,12 @@ public enum PieControlLauncher {
     /// pool — see #489 on wiring the guardrail to this knob).
     public var maxNumKvPages: Int?
 
+    /// Optional second resident model (the speculative-decoding draft, #660).
+    /// `nil` for every single-model launch. When set, `writeConfig` emits a
+    /// second `[[model]]` group and the engine loads both; the chat-apc
+    /// inferlet drives model-based drafting against it.
+    public var draftModelConfig: DraftModelSpec?
+
     public init(pieBinary: URL,
                 wasmURL: URL,
                 manifestURL: URL,
@@ -292,7 +332,8 @@ public enum PieControlLauncher {
                 daemonBindHost: EngineHTTPBindMode = Self.defaultDaemonBindHost,
                 modelConfig: ModelConfig,
                 defaultTokenLimit: Int? = nil,
-                maxNumKvPages: Int? = nil) throws {
+                maxNumKvPages: Int? = nil,
+                draftModelConfig: DraftModelSpec? = nil) throws {
       try PieControlLauncher.validateDriverSupport(
         pieBinary: pieBinary,
         subprocessEnvironment: subprocessEnvironment,
@@ -314,6 +355,7 @@ public enum PieControlLauncher {
       self.modelConfig = modelConfig
       self.defaultTokenLimit = defaultTokenLimit
       self.maxNumKvPages = maxNumKvPages
+      self.draftModelConfig = draftModelConfig
     }
   }
 
@@ -610,7 +652,8 @@ public enum PieControlLauncher {
     let httpPort = try reserveFreePort()
     let configURL = try writeConfig(
       modelConfig: spec.modelConfig, defaultTokenLimit: spec.defaultTokenLimit,
-      maxNumKvPages: spec.maxNumKvPages, in: spec.pieHome
+      maxNumKvPages: spec.maxNumKvPages, draftModelConfig: spec.draftModelConfig,
+      in: spec.pieHome
     )
 
     let env = renderSubprocessEnvironment(
@@ -829,10 +872,11 @@ public enum PieControlLauncher {
   static func writeConfig(modelConfig: ModelConfig,
                           defaultTokenLimit: Int? = nil,
                           maxNumKvPages: Int? = nil,
+                          draftModelConfig: DraftModelSpec? = nil,
                           in pieHome: URL) throws -> URL {
     let configURL = pieHome.appendingPathComponent("config.toml")
     let body = renderConfigBody(modelConfig: modelConfig, defaultTokenLimit: defaultTokenLimit,
-                                maxNumKvPages: maxNumKvPages)
+                                maxNumKvPages: maxNumKvPages, draftModelConfig: draftModelConfig)
     do {
       try FileManager.default.createDirectory(at: pieHome, withIntermediateDirectories: true)
       try body.write(to: configURL, atomically: true, encoding: .utf8)
@@ -846,7 +890,8 @@ public enum PieControlLauncher {
   /// tests can pin the emitted body without writing to disk.
   static func renderConfigBody(modelConfig: ModelConfig,
                                defaultTokenLimit: Int? = nil,
-                               maxNumKvPages: Int? = nil) -> String {
+                               maxNumKvPages: Int? = nil,
+                               draftModelConfig: DraftModelSpec? = nil) -> String {
     let preamble = """
     [server]
     host = "127.0.0.1"
@@ -878,6 +923,7 @@ public enum PieControlLauncher {
     restore_pause_at_utilization = 0.85\(limitLine)
 
     """
+    let base: String
     switch modelConfig {
     case .dummy:
       let model = """
@@ -895,6 +941,8 @@ public enum PieControlLauncher {
       vocab_size = 32000
       arch_name = "test"
       """
+      // The dummy driver is single-model only (S0 isolation tests); a draft
+      // pair is never written for it.
       return preamble + model + scheduler + driver
     case let .portable(modelSlug, modelsRoot):
       // Join modelsRoot + slug the same way LaunchSpecResolver does so
@@ -905,13 +953,13 @@ public enum PieControlLauncher {
       let modelPath = LaunchSpecResolver.joinModelPath(
         modelsRoot: modelsRoot, slug: modelSlug
       )
-      return renderPortableModel(
-        servedID: modelSlug, modelRef: modelPath, preamble: preamble,
+      base = preamble + portableModelBlock(
+        servedID: modelSlug, modelRef: modelPath, device: "metal",
         scheduler: scheduler, maxNumKvPages: maxNumKvPages
       )
     case let .portableResolved(servedModelID, modelRef):
-      return renderPortableModel(
-        servedID: servedModelID, modelRef: modelRef, preamble: preamble,
+      base = preamble + portableModelBlock(
+        servedID: servedModelID, modelRef: modelRef, device: "metal",
         scheduler: scheduler, maxNumKvPages: maxNumKvPages
       )
     case let .metal(modelID):
@@ -924,19 +972,48 @@ public enum PieControlLauncher {
       // engine fails loud at boot when the Metal backend wasn't
       // compiled in. `hf_repo` defers snapshot resolution to pie's
       // HF resolver against `~/.cache/huggingface/hub`.
-      let model = """
-      [[model]]
-      name = \(tomlString(modelID))
-      hf_repo = \(tomlString(modelID))
-      """
-      let driver = """
-
-      [model.driver]
-      type = "portable"
-      device = ["metal"]
-      """
-      return preamble + model + scheduler + driver + driverOptionsTOML(maxNumKvPages: maxNumKvPages)
+      base = preamble + portableModelBlock(
+        servedID: modelID, modelRef: modelID, device: "metal",
+        scheduler: scheduler, maxNumKvPages: maxNumKvPages
+      )
     }
+
+    // #660: append the draft model as a second `[[model]]` group so the
+    // engine loads the draft+target pair. Its `[model.driver].device` is
+    // disjoint from the target's `"metal"` (pie rejects a shared device);
+    // the draft keeps the engine-default KV pool (no `max_num_kv_pages`)
+    // since it only generates short draft chains.
+    guard let draft = draftModelConfig else { return base }
+    let draftBlock = portableModelBlock(
+      servedID: draft.servedModelID, modelRef: draft.modelRef,
+      device: draft.device, scheduler: scheduler, maxNumKvPages: nil
+    )
+    return base + "\n\n" + draftBlock
+  }
+
+  /// One `[[model]]` array element for the portable driver: the model
+  /// header, its own `[model.scheduler]`, and `[model.driver]` (+ options).
+  /// Emitting the scheduler per-block is required — pie's `ModelConfig`
+  /// carries a mandatory per-model `scheduler` field (`server/src/config.rs`),
+  /// so a second `[[model]]` needs its own copy. Carries no preamble so it
+  /// can be concatenated after the target's block for draft+target pairs.
+  private static func portableModelBlock(servedID: String,
+                                         modelRef: String,
+                                         device: String,
+                                         scheduler: String,
+                                         maxNumKvPages: Int?) -> String {
+    let model = """
+    [[model]]
+    name = \(tomlString(servedID))
+    hf_repo = \(tomlString(modelRef))
+    """
+    let driver = """
+
+    [model.driver]
+    type = "portable"
+    device = [\(tomlString(device))]
+    """
+    return model + scheduler + driver + driverOptionsTOML(maxNumKvPages: maxNumKvPages)
   }
 
   /// `[model.driver.options]` projection for the portable/metal driver.
@@ -968,25 +1045,6 @@ public enum PieControlLauncher {
     env["PIE_SHMEM_NAME"] = shmemName
     env["PIE_SHMEM_TIMEOUT_S"] = String(requestTimeoutSeconds)
     return env
-  }
-
-  private static func renderPortableModel(servedID: String,
-                                          modelRef: String,
-                                          preamble: String,
-                                          scheduler: String,
-                                          maxNumKvPages: Int? = nil) -> String {
-    let model = """
-    [[model]]
-    name = \(tomlString(servedID))
-    hf_repo = \(tomlString(modelRef))
-    """
-    let driver = """
-
-    [model.driver]
-    type = "portable"
-    device = ["metal"]
-    """
-    return preamble + model + scheduler + driver + driverOptionsTOML(maxNumKvPages: maxNumKvPages)
   }
 
   /// Minimal TOML basic-string escape: wrap in `"..."` and backslash-
