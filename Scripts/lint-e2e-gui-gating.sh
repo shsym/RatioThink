@@ -143,7 +143,17 @@ GUI_WRAPPER_RE='RatioThinkGUITests|e2e_run_gui_xcodebuild'
 # positive rule matches the gate/source tokens through this anchor so a wrapper
 # that merely NAMES both gates inside a string (e.g. `echo "needs
 # e2e_require_tcc"`) without ever calling them no longer satisfies the rule.
-CMD_ANCHOR='(^[[:space:]]*|[;&|][[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*)'
+#
+# A command can also open with a shell test keyword and/or a `!` negation —
+# `if ! e2e_require_seated_gui "tag"; then …` — which still places the gate at
+# command position. The optional keyword/negation tail (CMD_KW) accepts that form
+# so an if/!-guarded gate call is recognised; without it the positive rule would
+# false-fail a wrapper that is in fact correctly gated (#692). The tail sits AFTER
+# the line-start/separator base, so it does NOT reopen the mention hole the anchor
+# closed: a gate token inside `echo "…"` or a `[ "$x" = "…" ]` test string has no
+# leading command boundary before its in-string keyword/token, so it still fails.
+CMD_KW='((if|elif|while|until|then|do|else)[[:space:]]+)?(![[:space:]]+)?'
+CMD_ANCHOR="(^[[:space:]]*|[;&|][[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*)${CMD_KW}"
 SOURCE_CALL_RE="${CMD_ANCHOR}(source|\.)[[:space:]]+[^#]*Scripts/e2e-prep\.sh"
 SEATED_CALL_RE="${CMD_ANCHOR}e2e_require_seated_gui([[:space:]]|;|\$)"
 TCC_CALL_RE="${CMD_ANCHOR}e2e_require_tcc([[:space:]]|;|\$)"
