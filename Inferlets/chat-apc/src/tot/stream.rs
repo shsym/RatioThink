@@ -44,9 +44,14 @@
 //! reasoning + score + status) and is authoritative — a client live-fills
 //! from the deltas, then reconciles to `node_complete` (which also lets the
 //! non-streaming path, that emits no deltas, produce a byte-identical final
-//! tree). Generation is sequential per level, so a node's `node_start` +
-//! deltas + `node_complete` never interleave with another node's; the id on
-//! every frame keeps routing robust regardless.
+//! tree). Since #650 a level's siblings generate **concurrently** on the
+//! streaming path too (so the engine co-batches their forward passes — the
+//! #465 win now reaches the UI), so one node's `node_start` + deltas may
+//! interleave with another's on the wire. The `id` on every frame is what
+//! keeps routing robust: a client creates a provisional node on each
+//! `node_start` and appends each `node_delta` to the node its `id` names,
+//! regardless of arrival order (see [`BranchSink`]). Within a single node the
+//! frames stay ordered (its own branch future writes them sequentially).
 //!
 //! Invariant (carried over from #407): every event identifies the node(s)
 //! it concerns by stable id, and the stream ends with exactly one terminal
@@ -72,9 +77,80 @@
 //! This mirrors `chat-apc`'s `handle_streaming`: never a misleading
 //! `tree_start` followed by an error frame for a request that never began.
 
+use futures::lock::Mutex;
 use serde::Serialize;
 
 use crate::sse::{EmitError, Emitter};
+
+/// A node-delta sink shared across **concurrent** branch futures (#650).
+///
+/// Before #650 the streaming search forced sequential generation: a single
+/// `&mut Emitter` cannot be borrowed by N in-flight branch futures, so per-node
+/// `node_delta` chunks had no exclusive writer. That left the streaming/UI path
+/// without the #465 co-batch speedup *and* without a concurrent-decode
+/// animation — branches filled level-by-level, one at a time.
+///
+/// The wire already routes every frame by node id (`node_start` / `node_delta`
+/// carry `id`), so interleaving sibling deltas is wire-safe; the only obstacle
+/// was the exclusive borrow. `BranchSink` lifts it by sharing the emitter behind
+/// an async [`Mutex`]: a branch acquires the lock only for the brief frame write
+/// between decode steps, **never across a forward pass**, so the per-device
+/// scheduler still coalesces the siblings' forward passes (the #465 win) while
+/// their `node_delta` frames interleave on the one SSE stream, each routed by id.
+///
+/// An async `Mutex` (not `RefCell`) is mandatory: the wasm guest is a single
+/// cooperative execution stack, and the frame write `.await`s — a `RefCell`
+/// borrow held across that await would panic the instant another branch is
+/// polled and tries to emit. The async mutex instead suspends the contending
+/// branch's `lock().await` until the writer releases, with no forward-pass
+/// dependency either way (no deadlock).
+///
+/// `Copy`, so the one handle is handed to every branch future for free. The
+/// inner `&mut Emitter` and the outer `&Mutex` carry distinct lifetimes because
+/// `&mut` is invariant — unifying them would reject the borrow built from a
+/// local `Mutex` wrapping a longer-lived emitter reference.
+#[derive(Clone, Copy)]
+pub struct BranchSink<'a, 'e> {
+    emitter: &'a Mutex<&'e mut Emitter>,
+}
+
+impl<'a, 'e> BranchSink<'a, 'e> {
+    /// Wrap a shared, mutex-guarded emitter into a Copy branch handle.
+    pub fn new(emitter: &'a Mutex<&'e mut Emitter>) -> Self {
+        Self { emitter }
+    }
+
+    /// Emit this branch's opening `node_start` (acquires the lock only for the
+    /// write). A branch emits its own `node_start` before its first delta, so
+    /// the provisional node exists client-side regardless of cross-branch order.
+    pub async fn node_start(
+        &self,
+        id: &str,
+        parent_id: &str,
+        depth: usize,
+        branch_index: usize,
+    ) -> Result<(), EmitError> {
+        let mut em = self.emitter.lock().await;
+        emit_node_start(&mut **em, id, parent_id, depth, branch_index).await
+    }
+
+    /// Emit one streamed `node_delta` chunk for `id` on `kind`'s channel.
+    pub async fn node_delta(
+        &self,
+        id: &str,
+        kind: &'static str,
+        text: &str,
+    ) -> Result<(), EmitError> {
+        let mut em = self.emitter.lock().await;
+        emit_node_delta(&mut **em, id, kind, text).await
+    }
+
+    /// Emit one streamed `final_delta` chunk of the synthesized answer.
+    pub async fn final_delta(&self, text: &str) -> Result<(), EmitError> {
+        let mut em = self.emitter.lock().await;
+        emit_final_delta(&mut **em, text).await
+    }
+}
 
 use super::schema::TotParams;
 use super::tree::{GenerationMetrics, Node, NodeStatus};

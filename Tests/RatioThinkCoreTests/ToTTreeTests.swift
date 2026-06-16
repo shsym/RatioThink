@@ -219,4 +219,41 @@ final class ToTTreeTests: XCTestCase {
     t.apply(.nodeDelta(id: "ghost", channel: .answer, text: "x"))
     XCTAssertTrue(t.nodes.isEmpty)
   }
+
+  // ── #650: concurrent sibling decode — deltas multiplexed by branch id ──
+
+  /// Before #650 the streaming search generated branches sequentially, so a
+  /// node's start + deltas + complete never interleaved with a sibling's. Now
+  /// siblings decode in flight and their `node_delta` frames interleave on the
+  /// one SSE stream, each tagged by node id. This proves the consumer routes
+  /// interleaved frames to the right node purely by id — the UI guarantee that
+  /// lets concurrent branches animate filling at once.
+  func test_interleaved_sibling_deltas_route_by_id() {
+    var t = ToTTree()
+    t.apply(.treeStart(id: "tot-1", model: "qwen", breadth: 2, depth: 1, beamWidth: 1))
+    // Both siblings announce before either streams (concurrent start), and the
+    // second sibling's node_start lands AFTER the first sibling's first delta —
+    // an ordering the old sequential path never produced.
+    t.apply(.nodeStart(id: "tot-n1", parentID: "root", depth: 1, branchIndex: 0))
+    t.apply(.nodeDelta(id: "tot-n1", channel: .reasoning, text: "A1 "))
+    t.apply(.nodeStart(id: "tot-n2", parentID: "root", depth: 1, branchIndex: 1))
+    // Interleave the two branches' deltas chunk-by-chunk.
+    t.apply(.nodeDelta(id: "tot-n2", channel: .reasoning, text: "B1 "))
+    t.apply(.nodeDelta(id: "tot-n1", channel: .answer, text: "Ans-A "))
+    t.apply(.nodeDelta(id: "tot-n2", channel: .answer, text: "Ans-B "))
+    t.apply(.nodeDelta(id: "tot-n1", channel: .reasoning, text: "A2"))
+    t.apply(.nodeDelta(id: "tot-n2", channel: .answer, text: "Ans-B2"))
+
+    // Each node accumulated ONLY its own channel chunks, in per-node order,
+    // with zero cross-talk between the interleaved siblings.
+    let n1 = t.nodes.first { $0.id == "tot-n1" }
+    let n2 = t.nodes.first { $0.id == "tot-n2" }
+    XCTAssertEqual(n1?.reasoning, "A1 A2")
+    XCTAssertEqual(n1?.content, "Ans-A ")
+    XCTAssertEqual(n2?.reasoning, "B1 ")
+    XCTAssertEqual(n2?.content, "Ans-B Ans-B2")
+    XCTAssertEqual(t.nodes.count, 2, "interleaved deltas never duplicate a node")
+    // Display order stays (branchIndex, id) regardless of frame arrival order.
+    XCTAssertEqual(t.rootChildren.map(\.id), ["tot-n1", "tot-n2"])
+  }
 }

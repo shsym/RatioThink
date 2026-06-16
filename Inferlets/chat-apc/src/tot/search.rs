@@ -53,15 +53,21 @@
 //! it is computed. Re-run `make bench-tot` to re-check as the KV budget or
 //! production model size changes.
 //!
-//! ### Streaming constraint (#413)
+//! ### Streaming now co-batches too (#413 → #650)
 //!
-//! On the streaming path generation is forced **sequential** regardless of
-//! `exec`: a single SSE [`Emitter`] cannot be shared across concurrent
-//! branch futures, so per-node `node_delta` chunks would have no exclusive
-//! writer. Scoring never streams, so it still phases + batches there — a
-//! streamed search keeps #413's one-node-at-a-time live fill while its
-//! per-level scoring runs as a coalesced batch. Both paths emit a
-//! byte-identical final tree.
+//! #413 originally forced the streaming path **sequential** regardless of
+//! `exec`, because a single SSE [`Emitter`] cannot be `&mut`-borrowed by N
+//! concurrent branch futures — so the UI path missed the #465 co-batch win and
+//! showed branches filling one at a time. #650 lifts that: the emitter is shared
+//! behind an async mutex ([`stream::BranchSink`]), so a branch locks it only for
+//! a frame write between decode steps, never across a forward pass. The siblings
+//! decode in flight exactly as the non-streaming path — the scheduler coalesces
+//! their forward passes — while their `node_delta` frames interleave on the one
+//! stream, each routed by node id (the wire already tags every frame). So the
+//! streaming path now inherits the speedup AND animates concurrent branch decode,
+//! and `exec` governs generation concurrency identically on both paths
+//! (`CoupledSequential` still serializes when a low-residency escape hatch is
+//! wanted). Both paths still emit a byte-identical final tree.
 //!
 //! The WIT-backed engine calls (`Context`/`generate`/`fork`) live in
 //! [`run`], [`resolve_level`], [`generate_branch`], [`expand`], and
@@ -73,6 +79,7 @@
 //! `cargo test --lib`.
 
 use futures::future::join_all;
+use futures::lock::Mutex;
 use inferlet::Context;
 use inferlet::model::Model;
 use inferlet::sample::Sampler;
@@ -83,7 +90,7 @@ use std::pin::Pin;
 use crate::sse::Emitter;
 
 use super::schema::TotParams;
-use super::stream;
+use super::stream::{self, BranchSink};
 use super::tree::{
     Candidate, Node, NodeStatus, assemble, best_leaf, error_leaf, new_node_id, parse_score,
     select_beam_diverse,
@@ -778,7 +785,7 @@ async fn generate_demuxed(
     reasoning_budget: usize,
     answer_budget: usize,
     stops: &[u32],
-    mut emitter: Option<&mut Emitter>,
+    emitter: Option<BranchSink<'_, '_>>,
     sink: DeltaSink<'_>,
 ) -> Demux {
     let mut reason_dec = reasoning::Decoder::new(model);
@@ -822,8 +829,8 @@ async fn generate_demuxed(
                 reasoning.push_str(&s);
                 // #413 token stream: live-fill this node's reasoning channel.
                 // The `Final` synthesis sink surfaces only the answer.
-                if let (Some(em), DeltaSink::Node(id)) = (emitter.as_deref_mut(), sink) {
-                    let _ = stream::emit_node_delta(em, id, stream::DELTA_REASONING, &s).await;
+                if let (Some(em), DeltaSink::Node(id)) = (emitter, sink) {
+                    let _ = em.node_delta(id, stream::DELTA_REASONING, &s).await;
                 }
             }
             Ok(reasoning::Event::End(_)) => {
@@ -838,12 +845,10 @@ async fn generate_demuxed(
                 answer.push_str(&s);
                 // #413 token stream: live-fill the answer channel — a tree
                 // node's `node_delta` or, for synthesis, `final_delta` (#523).
-                if let Some(em) = emitter.as_deref_mut() {
+                if let Some(em) = emitter {
                     let _ = match sink {
-                        DeltaSink::Node(id) => {
-                            stream::emit_node_delta(em, id, stream::DELTA_ANSWER, &s).await
-                        }
-                        DeltaSink::Final => stream::emit_final_delta(em, &s).await,
+                        DeltaSink::Node(id) => em.node_delta(id, stream::DELTA_ANSWER, &s).await,
+                        DeltaSink::Final => em.final_delta(&s).await,
                     };
                 }
             }
@@ -1006,9 +1011,12 @@ pub struct SearchOutcome {
 ///
 /// When `emitter` is `Some`, the search streams (#413): each node emits a
 /// `node_start`, then its reasoning + answer stream live as `node_delta`
-/// chunks while it generates ([`generate_demuxed`]), then the level's nodes
-/// are emitted as `node_complete` frames (full node + score) followed by the
-/// `level_pruned` beam selection — the single source of search orchestration
+/// chunks while it generates ([`generate_demuxed`]). Since #650 a level's
+/// siblings generate concurrently here too, so their `node_delta` frames
+/// interleave on the one stream (each routed by id via [`BranchSink`]); once
+/// the level fully resolves its nodes are emitted as `node_complete` frames
+/// (full node + score) followed by the `level_pruned` beam selection — the
+/// single source of search orchestration
 /// drives both the non-streaming response and the streamed one, so they can
 /// never diverge (the non-stream path simply passes `None` and emits no
 /// deltas, ending at a byte-identical tree). Emit errors are deliberately
@@ -1397,43 +1405,47 @@ fn finalize(flat: Vec<Node>, last_level: &[Candidate], final_answer_depth: usize
 /// Two axes (see the module docs): generation concurrent (batched by the
 /// engine scheduler via `join_all`) vs sequential, and scoring phased (a
 /// barrier, then all `Answered` nodes scored in one concurrent batch) vs
-/// coupled (each branch generates then scores in one future). Generation is
-/// forced sequential whenever an [`Emitter`] is present — the single SSE
-/// writer can't be shared across concurrent branch futures (#413). Scoring
-/// never touches the emitter, so it is always concurrent (batched), even on
-/// the streaming path.
+/// coupled (each branch generates then scores in one future). Since #650
+/// generation concurrency is governed by `exec` ALONE on both paths — the
+/// streaming emitter is shared across concurrent branch futures behind an async
+/// mutex ([`BranchSink`]), so it no longer forces sequential generation. Each
+/// branch emits its own `node_start` (inside [`generate_branch`]) before its
+/// deltas, so the per-node frames route by id regardless of interleave. Scoring
+/// never touches the emitter, so it is always concurrent (batched).
 async fn resolve_level(
     metas: &[(String, String, usize)],
     ctxs: Vec<Context>,
     params: &TotParams,
     model: &Model,
-    mut emitter: Option<&mut Emitter>,
+    emitter: Option<&mut Emitter>,
     level: usize,
 ) -> Vec<(Context, NodeOutcome)> {
-    // Streaming forces sequential generation regardless of `exec`.
-    let concurrent_gen = params.exec.concurrent_gen() && emitter.is_none();
+    let concurrent_gen = params.exec.concurrent_gen();
+
+    // Share the SSE emitter across concurrent branch futures (#650): a single
+    // `&mut Emitter` can't be borrowed N ways, so wrap it in an async `Mutex`
+    // and hand every branch a Copy [`BranchSink`] handle. The lock is held only
+    // for a frame write between decode steps — never across a forward pass — so
+    // siblings still co-batch (#465) while their `node_delta` frames interleave,
+    // each routed by node id. `None` on the non-stream path (no frames at all).
+    let shared = emitter.map(Mutex::new);
+    let sink = shared.as_ref().map(BranchSink::new);
 
     if params.exec.phased_score() {
         // Phase 1 — generate every branch (no scoring yet).
         let gens: Vec<(Context, Demux)> = if concurrent_gen {
-            // Non-stream only (emitter is None here): all siblings decode in
-            // flight at once, so the scheduler batches their forward passes.
+            // All siblings decode in flight at once, so the scheduler batches
+            // their forward passes; `sink` (Copy) interleaves their deltas.
             join_all(
                 ctxs.into_iter()
                     .zip(metas.iter())
-                    .map(|(c, m)| generate_branch(c, model, params, None, &m.0, level, m.2)),
+                    .map(|(c, m)| generate_branch(c, model, params, sink, &m.0, &m.1, level, m.2)),
             )
             .await
         } else {
             let mut out = Vec::with_capacity(ctxs.len());
             for (c, m) in ctxs.into_iter().zip(metas.iter()) {
-                if let Some(em) = emitter.as_deref_mut() {
-                    let _ = stream::emit_node_start(em, &m.0, &m.1, level, m.2).await;
-                }
-                out.push(
-                    generate_branch(c, model, params, emitter.as_deref_mut(), &m.0, level, m.2)
-                        .await,
-                );
+                out.push(generate_branch(c, model, params, sink, &m.0, &m.1, level, m.2).await);
             }
             out
         };
@@ -1465,16 +1477,13 @@ async fn resolve_level(
             join_all(
                 ctxs.into_iter()
                     .zip(metas.iter())
-                    .map(|(c, m)| expand(c, model, params, None, &m.0, level, m.2)),
+                    .map(|(c, m)| expand(c, model, params, sink, &m.0, &m.1, level, m.2)),
             )
             .await
         } else {
             let mut out = Vec::with_capacity(ctxs.len());
             for (c, m) in ctxs.into_iter().zip(metas.iter()) {
-                if let Some(em) = emitter.as_deref_mut() {
-                    let _ = stream::emit_node_start(em, &m.0, &m.1, level, m.2).await;
-                }
-                out.push(expand(c, model, params, emitter.as_deref_mut(), &m.0, level, m.2).await);
+                out.push(expand(c, model, params, sink, &m.0, &m.1, level, m.2).await);
             }
             out
         }
@@ -1580,24 +1589,35 @@ where
     (ctx, demux)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn generate_branch(
     ctx: Context,
     model: &Model,
     params: &TotParams,
-    emitter: Option<&mut Emitter>,
+    sink: Option<BranchSink<'_, '_>>,
     node_id: &str,
+    parent_id: &str,
     level: usize,
     branch_index: usize,
 ) -> (Context, Demux) {
-    struct InferletBranchDriver<'a, 'e> {
+    // #413/#650 token stream: announce this node's tree position before its
+    // deltas, so a client creates the provisional node and routes the node's
+    // `node_delta`s to it. Each branch emits its OWN `node_start` (here, not in
+    // the sequential level loop) so a concurrently-generating sibling's frames
+    // can interleave on the shared stream without losing a node's home.
+    if let Some(s) = sink {
+        let _ = s.node_start(node_id, parent_id, level, branch_index).await;
+    }
+
+    struct InferletBranchDriver<'a, 's, 'e> {
         model: &'a Model,
         stops: Vec<u32>,
-        emitter: Option<&'e mut Emitter>,
+        sink: Option<BranchSink<'s, 'e>>,
         temperature: f32,
         top_p: f32,
     }
 
-    impl BranchDriver<Context> for InferletBranchDriver<'_, '_> {
+    impl BranchDriver<Context> for InferletBranchDriver<'_, '_, '_> {
         fn fork_retry_base(&mut self, ctx: &Context) -> Result<Context, String> {
             ctx.fork().map_err(|e| e.to_string())
         }
@@ -1626,7 +1646,9 @@ async fn generate_branch(
             };
             let model = self.model;
             let stops = &self.stops;
-            let emitter = self.emitter.as_deref_mut();
+            // `BranchSink` is Copy, so the shared handle is reused across the
+            // initial generation and any bounded no-think retry for this node.
+            let sink = self.sink;
             Box::pin(async move {
                 generate_demuxed(
                     ctx,
@@ -1635,7 +1657,7 @@ async fn generate_branch(
                     request.reasoning_budget,
                     request.answer_budget,
                     stops,
-                    emitter,
+                    sink,
                     DeltaSink::Node(request.sink_node_id),
                 )
                 .await
@@ -1646,7 +1668,7 @@ async fn generate_branch(
     let mut driver = InferletBranchDriver {
         model,
         stops: chat::stop_tokens(model),
-        emitter,
+        sink,
         temperature: params.temperature,
         top_p: params.top_p,
     };
@@ -1718,17 +1740,19 @@ fn classify(demux: Demux, score: Option<ScoreResult>) -> NodeOutcome {
 /// Generate then value-score one forked context in a single future (coupled
 /// scoring). The context is moved back out paired with a Context-free
 /// [`NodeOutcome`]. Only an `Answered` node is scored.
+#[allow(clippy::too_many_arguments)]
 async fn expand(
     ctx: Context,
     model: &Model,
     params: &TotParams,
-    emitter: Option<&mut Emitter>,
+    sink: Option<BranchSink<'_, '_>>,
     node_id: &str,
+    parent_id: &str,
     level: usize,
     branch_index: usize,
 ) -> (Context, NodeOutcome) {
     let (ctx, demux) =
-        generate_branch(ctx, model, params, emitter, node_id, level, branch_index).await;
+        generate_branch(ctx, model, params, sink, node_id, parent_id, level, branch_index).await;
     let score = if matches!(demux.kind, DemuxKind::Answered) {
         Some(score_node(&ctx, model, level == params.depth).await)
     } else {
@@ -1851,6 +1875,12 @@ async fn synthesize(
     base.user(&directive);
     cue_generation(&mut base, model, true);
     let stops = chat::stop_tokens(model);
+    // Synthesis runs alone after the search (no sibling concurrency), but
+    // `generate_demuxed` speaks the shared-sink protocol, so wrap the single
+    // emitter the same way — an uncontended mutex is free, and it keeps one
+    // delta API across the branch and synthesis paths (#650).
+    let shared = emitter.map(Mutex::new);
+    let sink = shared.as_ref().map(BranchSink::new);
     let demux = generate_demuxed(
         &mut base,
         model,
@@ -1861,7 +1891,7 @@ async fn synthesize(
         reasoning_budget,
         answer_budget,
         &stops,
-        emitter,
+        sink,
         DeltaSink::Final,
     )
     .await;

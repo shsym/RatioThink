@@ -141,9 +141,12 @@ public struct ToTTree: Equatable, Sendable, Codable {
       }
 
     case let .nodeDelta(id, channel, text):
-      // Append the streamed chunk to the live node's reasoning or answer.
-      // Out-of-order (no node yet) is dropped — sequential generation always
-      // sends nodeStart first, and nodeComplete backfills regardless.
+      // Append the streamed chunk to the live node's reasoning or answer,
+      // routed purely by id. Since #650 sibling branches decode concurrently,
+      // so different nodes' deltas interleave on the stream — but a node's own
+      // start always precedes its own deltas (its branch emits them in order),
+      // so a delta with no node yet (dropped here) only ever means a truly
+      // malformed stream; nodeComplete backfills the authoritative node anyway.
       guard let idx = nodes.firstIndex(where: { $0.id == id }) else { return }
       switch channel {
       case .reasoning: nodes[idx].reasoning += text
