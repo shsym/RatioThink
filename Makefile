@@ -69,7 +69,7 @@ define gui_suite_run
 endef
 
 .PHONY: help genproject build build-static build-tests clean lint verify-tot-docs ci-pr check-vendor-pin local-pre-merge local-gui-gate local-e2e-gate release-gate \
-        verify-app-icon-assets test-app-icon-assets test-dmg-layout test-package-dmg-staging test-collect-diagnostics test-landing-page \
+        verify-app-icon-assets test-app-icon-assets verify-docs-icons test-docs-icons test-dmg-layout test-package-dmg-staging test-collect-diagnostics test-landing-page \
         test-ci-v2-static-gate test-lint-gui-only-testing test-assert-gui-tests-executed test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-sandbox-diagnostics test-readme-harness test-e2e-http \
         test-spec-smoke test-spec-bench test-spec-matrix-selftest bench-spec-matrix bench-datasets-prep bench-datasets-verify \
@@ -101,7 +101,7 @@ build-static: genproject ## Compile/type-check Rational app + helper without bui
 check-vendor-pin: ## Fail-closed guard: Vendor/pie gitlink must be reachable from its .gitmodules tracking branch (catches pin/branch drift)
 	Scripts/check-vendor-pie-pin.sh
 
-ci-pr: lint check-vendor-pin test-ci-v2-static-gate test-lint-gui-only-testing test-assert-gui-tests-executed verify-app-icon-assets test-app-icon-assets test-menubar-icon-template test-landing-page build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
+ci-pr: lint check-vendor-pin test-ci-v2-static-gate test-lint-gui-only-testing test-assert-gui-tests-executed verify-app-icon-assets test-app-icon-assets verify-docs-icons test-docs-icons test-menubar-icon-template test-landing-page build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
 
 local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary test-harsh-load-selftest test-matrix-aggregator ## Mandatory local pre-merge parity for runtime/heavy checks kept out of the lightweight manual workflow
 
@@ -559,6 +559,12 @@ verify-app-icon-assets: ## Verify committed app-icon source, generated PNGs, and
 
 test-app-icon-assets: ## Regression-test the app-icon verifier failure modes
 	Scripts/test-verify-app-icon-assets.sh
+
+verify-docs-icons: ## Verify committed docs/landing web icons match Scripts/docs-icons.sha256
+	Scripts/verify-docs-icons.sh
+
+test-docs-icons: ## Reproducibility + failure-mode tests for the docs web-icon guard
+	Scripts/test-verify-docs-icons.sh
 
 test-dmg-layout: ## Regression-test the DMG drag-install layout verifier (hdiutil + codesign, no xcodebuild)
 	Scripts/test-verify-dmg-layout.sh

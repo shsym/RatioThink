@@ -39,11 +39,17 @@ ASSETS = DOCS / "assets"
 PLATE_FRACTION = 0.93           # plate edge as a fraction of the icon canvas
 WHITE = (255, 255, 255)
 FAVICON_SIZES = (16, 32, 48)
+MASTER_SIZE = (1024, 1024)      # app-icon master canvas (macOS icon grid)
 
 
 def load_plate() -> Image.Image:
     """Crop the app-icon master down to the styled plate (drop the grid margin)."""
     master = Image.open(MASTER).convert("RGBA")
+    if master.size != MASTER_SIZE:
+        raise ValueError(
+            f"app-icon master {MASTER} is {master.size}, expected {MASTER_SIZE}; "
+            "the web icons derive from the 1024x1024 node-graph plate."
+        )
     bbox = master.getchannel("A").getbbox()
     if bbox is None:
         raise ValueError(
