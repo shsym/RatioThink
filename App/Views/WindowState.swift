@@ -65,7 +65,10 @@ final class WindowState: ObservableObject {
   }
 
   func toggleSidebar() {
-    columnVisibility = (columnVisibility == .all) ? .doubleColumn : .all
+    // Two-column split view: the sidebar is hidden by collapsing to the detail
+    // column only (`.detailOnly`). `.doubleColumn` would keep both columns
+    // visible here, so it must not be used to hide the sidebar (#677).
+    columnVisibility = (columnVisibility == .all) ? .detailOnly : .all
   }
 
   func toggleItemList() {

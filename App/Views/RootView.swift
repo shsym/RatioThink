@@ -3,9 +3,10 @@ import SwiftData
 import ServiceManagement
 
 /// Simplified chat shell: primary navigation plus the chat list live in the
-/// left column, while the middle split-view column stays collapsed. Sidebar
-/// visibility remains wired through `WindowState`. New chats start from the
-/// titlebar new-chat button (the app-name branding was removed from that spot).
+/// left column of a two-column split view; the detail column hosts every
+/// section's main view. Sidebar visibility remains wired through `WindowState`.
+/// New chats start from the titlebar new-chat button (the app-name branding was
+/// removed from that spot).
 struct RootView: View {
   @EnvironmentObject private var windowState: WindowState
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
@@ -73,19 +74,18 @@ struct RootView: View {
           onIgnore: { updateAvailability.ignorePending(into: appPreferences) }
         )
       }
+      // Two-column shell: the chat list lives in the left navigation panel and
+      // the search panel + API Endpoints view fill the detail column, so every
+      // section is a direct left-nav → detail route. A two-column split view
+      // (rather than a 3-column one with a zero-width content column) avoids the
+      // stray separator hairline a collapsed middle column would draw right of
+      // the sidebar (#677).
       NavigationSplitView(columnVisibility: $windowState.columnVisibility) {
         SidebarView(
           selection: $windowState.selectedSection,
           selectedItemID: $windowState.selectedItemID,
           isItemListHidden: windowState.isItemListHidden
         )
-      } content: {
-        // The chat list lives in the left navigation panel; the search panel
-        // and API Endpoints view fill the detail column. Keep the split view's
-        // content column collapsed so every section is a direct left-nav →
-        // detail route.
-        Color.clear
-          .navigationSplitViewColumnWidth(min: 0, ideal: 0, max: 0)
       } detail: {
         DetailView(
           section: windowState.selectedSection,
