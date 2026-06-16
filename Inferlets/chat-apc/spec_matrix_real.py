@@ -303,6 +303,13 @@ async def _bench_dataset(http_c, base, key, records, total, failures) -> dict:
         # — reuse its verdict instead of re-deriving a weaker one.
         p1["_check_ok"] = b._check_run("plain", f"{key}[{idx}]", p1, failures)
         n1["_check_ok"] = b._check_run("ngram", f"{key}[{idx}]", n1, failures)
+        # The determinism control re-run rides the same contract gate: a
+        # degraded-but-200 p2 (empty decode, mid-stream error frame, inconsistent
+        # accounting) differs from a healthy p1, so a status==200-only gate would
+        # FALSELY flag the baseline as non-deterministic instead of surfacing the
+        # degraded re-run. Run it through _check_run too (#672, completes #664 F1).
+        if p2 is not None:
+            p2["_check_ok"] = b._check_run("plain", f"{key}[{idx}]-p2", p2, failures)
         plain_runs.append(p1)
         ngram_runs.append(n1)
 
@@ -315,7 +322,7 @@ async def _bench_dataset(http_c, base, key, records, total, failures) -> dict:
         if not p1.get("_check_ok") or not n1.get("_check_ok"):
             equiv_invalid += 1
             continue
-        if idx == 0 and p2 is not None and p2.get("status") == 200:
+        if idx == 0 and p2 is not None and p2.get("_check_ok"):
             if _out(p1) != _out(p2):
                 baseline_nondet_prompts += 1
                 failures.append(
