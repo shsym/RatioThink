@@ -118,10 +118,11 @@ that wrapper, not bare `xcodebuild`.
 | `S515_CopyTranscriptGUITests` | chat/transcript | bubble context-menu "Copy Answer" puts the **canonical multi-section Markdown source** on `NSPasteboard` (MarkdownUI fragments block drag-select) (#515) | app+fake-engine (deterministic stream harness) | `test-gui-copy` (`run-copy-gui-e2e.sh`) |
 | `S520_MultiPartContentGUITests` | chat send/persist | external OpenAI-client multi-part `content[]` succeeds non-stream + stream on the shared engine; malformed part → 400 (never dropped); GUI chat still streams after (#115) | **app+real-engine (real Qwen3-0.6B)** | `test-e2e-chat` (`run-chat-gui-e2e.sh`) |
 | `S527_PinnedResidentMismatchGUITests` | model load/status | an explicit per-chat pin must not send into a running engine serving a **different** resident model; the mismatch guard fires before the user turn is persisted (#527) | mock (pinned-running + dead loopback) | full `test-gui` |
+| `S530_RapidChatSwitchGUITests` | chat/transcript | rapid chat-switching keeps the main thread responsive — seeded long transcripts + a stall watchdog catch a UI hang across fast switches under streaming (#530) | mock (seeded transcripts via `PIE_TEST_SEED_TRANSCRIPTS`; isolated `/tmp` `PIE_HOME`) | `test-gui-chat-switch` |
 | `S572_JSONThinkProfileGUITests` | chat send/persist | seeded "JSON Think" profile is selectable in the switcher + send streams a **JSON** reply (`response_format` attached) against a real engine (#572) | **app+real-engine (real Qwen3-0.6B)** | `test-e2e-chat` (`run-chat-gui-e2e.sh`) |
-| `S577_LeftPanelGUITests` | settings/shell | chat list persists as a bottom sidebar region across view selections; a row chosen from any view switches the main view back to that chat (#577) | mock (isolated `/tmp` `PIE_HOME`) | `test-gui-left-panel` |
+| `S586_SidebarSearchGUITests` | settings/shell | the sidebar **Search** section opens a detail-column panel over chat titles + bodies; a no-match query shows the empty-results state, and find-and-open switches the main view to the chosen chat (#586, supersedes the #577 left-panel suite) | mock (isolated `/tmp` `PIE_HOME`) | `test-gui-sidebar-search` |
 
-> Reconciled against `Tests/GUIScenarioTests/` on 2026-06-13 — every suite on
+> Reconciled against `Tests/GUIScenarioTests/` on 2026-06-15 — every suite on
 > disk is listed above. The
 > first-launch **packaged model-download → persisted-default chat** suite
 > (`S7_FirstLaunchWizardPackagedModelDownloadGUITests`, #379) exists and closes
@@ -157,7 +158,7 @@ exact fix command when a human gate is unmet.
 | package / install | `make test-gui-first-launch-package` (S7 packaged `.app` wizard/persist); `make test-e2e-package` (S7 packaged model-download → persisted-default chat, #379) | — |
 | helper / engine startup | `make test-gui-helper` (S4); `make test-smoke` (S3 subprocess); `make test-e2e-engine` (real launch) | `test-gui` / `test-ssh` |
 | large curated model real-engine proof | `make test-e2e-large-model` (manual/local; representative Qwen3 14B single-file GGUF, override with `PIE_TEST_E2E_REPO`/`PIE_TEST_E2E_FILE`) | — |
-| engine-free chat surfaces | `make test-gui-chat` (S279/S285/S286/S446/S459/S486/S496/S511/S512/S577); split-out focused targets `make test-gui-chat-geometry` (S511), `make test-gui-chat-lifecycle` (S512), `make test-gui-left-panel` (S577) | `test-gui` |
+| engine-free chat surfaces | `make test-gui-chat` (S279/S285/S286/S446/S459/S486/S496/S511/S512/S586); split-out focused targets `make test-gui-chat-geometry` (S511), `make test-gui-chat-lifecycle` (S512), `make test-gui-sidebar-search` (S586), `make test-gui-chat-switch` (S530 rapid-switch responsiveness) | `test-gui` |
 | copy transcript | `make test-gui-copy` (S515, via `run-copy-gui-e2e.sh`, deterministic stream harness) | — |
 | model discovery / download | `make test-e2e-models` (S204 acquisition + unverified badge + live HF acquire); `Scripts/run-cache-discovery-gui-e2e.sh` (S365 HF-cache → Settings row + S514 duplicate-block); `make test-gui-chat` (S446/S459/S486 model-menu/profile-swap surfaces) | — |
 | model load / status | engine-restart surface (#469: the `/v1/models/load` load-indicator UI was removed — a model switch is an engine restart). Unit: `EngineIndicatorStateTests` / `ChatStartGateTests` / `ModelLoadIndicatorLabelTests` / `ModelLoadPopoverConfirmTests`; restart-serves-X proven by `RealEngineLaunchE2ETests.test_realEngine_servesExplicitPick_andResumeHonorsMarker` (`test-e2e-engine`) | — |
