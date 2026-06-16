@@ -671,7 +671,7 @@ struct RatioThinkApp: App {
       // half-baked surface.
       CommandGroup(replacing: .newItem) {}
       CommandGroup(after: .sidebar) {
-        Button(windowState.columnVisibility == .all ? "Hide Sidebar" : "Show Sidebar") {
+        Button(windowState.columnVisibility == .detailOnly ? "Show Sidebar" : "Hide Sidebar") {
           windowState.toggleSidebar()
         }
         .keyboardShortcut("s", modifiers: [.command, .option])
