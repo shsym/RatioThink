@@ -590,6 +590,90 @@ final class HTTPEngineClientTests: XCTestCase {
     XCTAssertEqual(frames, [#"{"frame":1}"#, #"{"frame":2}"#])
   }
 
+  // MARK: - Connection-lost retry (stale keep-alive reuse)
+
+  /// `URLSession` pools HTTP/1.1 keep-alive connections; a reused one the
+  /// engine has closed fails the request with
+  /// `URLError.networkConnectionLost` BEFORE any byte arrives. URLSession
+  /// auto-retries idempotent GETs but not POSTs, so the streaming dispatch
+  /// must retry once itself. First attempt fails at connect; the retry on
+  /// a fresh connection succeeds and the full stream is delivered.
+  func test_dispatchInferlet_retries_once_on_connection_lost_then_succeeds() async throws {
+    let calls = CallCounter()
+    FakeSSEURLProtocol.handler = { _ in
+      calls.increment() == 1
+        ? .failure(.networkConnectionLost)
+        : .sse(chunks: [
+            "data: {\"frame\":1}\n\n",
+            "data: {\"frame\":2}\n\n",
+            "data: [DONE]\n\n",
+          ])
+    }
+    let req = InferletRequest(
+      inferlet: "chat-apc",
+      input: Data(#"{"messages":[{"role":"user","content":"hi"}]}"#.utf8)
+    )
+    var frames: [String] = []
+    for try await frame in makeClient().dispatchInferlet(req) {
+      frames.append(String(decoding: frame, as: UTF8.self))
+    }
+    XCTAssertEqual(frames, [#"{"frame":1}"#, #"{"frame":2}"#])
+    XCTAssertEqual(calls.value, 2, "expected exactly one retry after the connection-lost failure")
+  }
+
+  /// The retry is bounded to ONE: a connection-lost on both attempts must
+  /// surface the error to the caller, not loop. Guards against turning a
+  /// transient remedy into an infinite retry.
+  func test_dispatchInferlet_connection_lost_twice_propagates_after_one_retry() async {
+    let calls = CallCounter()
+    FakeSSEURLProtocol.handler = { _ in
+      calls.increment()
+      return .failure(.networkConnectionLost)
+    }
+    let req = InferletRequest(
+      inferlet: "chat-apc",
+      input: Data(#"{"messages":[{"role":"user","content":"hi"}]}"#.utf8)
+    )
+    do {
+      for try await _ in makeClient().dispatchInferlet(req) {}
+      XCTFail("expected the connection-lost error to propagate")
+    } catch let error as URLError {
+      XCTAssertEqual(error.code, .networkConnectionLost)
+    } catch {
+      XCTFail("unexpected error type: \(error)")
+    }
+    XCTAssertEqual(calls.value, 2, "expected exactly two attempts (initial + one retry)")
+  }
+
+  /// The same retry covers the production chat path — `chatCompletion`
+  /// and `dispatchInferlet` share the connect helper, so a user's chat
+  /// send survives a stale pooled connection instead of failing.
+  func test_chatCompletion_retries_once_on_connection_lost_then_succeeds() async throws {
+    let calls = CallCounter()
+    FakeSSEURLProtocol.handler = { _ in
+      calls.increment() == 1
+        ? .failure(.networkConnectionLost)
+        : .sse(chunks: [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+          ])
+    }
+    let req = ChatRequest(model: "m", messages: [], stream: true)
+    var content = ""
+    var sawFinish = false
+    for try await ev in makeClient().chatCompletion(req) {
+      switch ev {
+      case let .delta(_, c): content += c
+      case .finish: sawFinish = true
+      default: break
+      }
+    }
+    XCTAssertEqual(content, "hi")
+    XCTAssertTrue(sawFinish)
+    XCTAssertEqual(calls.value, 2, "expected exactly one retry after the connection-lost failure")
+  }
+
   // MARK: - Request body shape
 
   func test_chatCompletion_request_body_is_openai_flat() async throws {
@@ -753,6 +837,10 @@ final class FakeSSEURLProtocol: URLProtocol {
     /// SSE stream. Chunks land via repeated `didLoad:` calls so
     /// `URLSession.bytes(for:)` surfaces them incrementally.
     case sse(chunks: [String], chunkDelayNanos: UInt64 = 0)
+    /// Transport-level failure (no HTTP response) — models a stale
+    /// keep-alive reuse surfacing as `URLError(code)` from
+    /// `URLSession.bytes(for:)`, before any byte arrives.
+    case failure(URLError.Code)
   }
 
   private static let lock = NSLock()
@@ -830,11 +918,37 @@ final class FakeSSEURLProtocol: URLProtocol {
         }
         client?.urlProtocolDidFinishLoading(proto)
       }
+
+    case .failure(let code):
+      client?.urlProtocol(self, didFailWithError: URLError(code))
     }
   }
 
   override func stopLoading() {
     cancelled = true
+  }
+}
+
+// MARK: - Call counter helper
+
+/// Thread-safe attempt counter for handlers that must vary their
+/// response by attempt number (e.g. fail the first connect, succeed the
+/// retry). `URLProtocol.handler` is invoked once per intercepted request.
+private final class CallCounter: @unchecked Sendable {
+  private let lock = NSLock()
+  private var count = 0
+
+  /// Increment and return the new (1-based) count.
+  @discardableResult
+  func increment() -> Int {
+    lock.lock(); defer { lock.unlock() }
+    count += 1
+    return count
+  }
+
+  var value: Int {
+    lock.lock(); defer { lock.unlock() }
+    return count
   }
 }
 
