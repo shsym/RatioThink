@@ -94,6 +94,11 @@ struct ChatScaffoldView: View {
   /// profile switch, navigation away, or a stale resolution. The
   /// transitions live in `PendingSendState` so they are unit-tested.
   @State private var pendingSend = PendingSendState()
+  /// #673: armed for the duration of a profile-swap-triggered engine relaunch
+  /// (stop+start onto the new served model) so a second swap mid-relaunch is
+  /// rejected by the gate before the async cycle is observable on the poll
+  /// channel — mirrors `LocalAPIView.profileRestartInFlight`.
+  @State private var profileSwapRestartInFlight = false
   /// A blocked send may need to restart the single engine onto a different
   /// model, but doing that while another chat is streaming would interrupt
   /// that stream. Defer the automatic sync until the app-wide stream set is
@@ -295,6 +300,48 @@ struct ChatScaffoldView: View {
         helperBlock = block
       } catch {
         engineActionError = Self.engineErrorMessage(error, verb: "start")
+      }
+    }
+  }
+
+  /// #673: after a chat-toolbar profile swap is persisted, relaunch the engine
+  /// onto the new profile's served model when (and only when) the engine is
+  /// already running a DIFFERENT model. Routes the decision through the shared
+  /// `LocalAPIProfileSwitchGate` (via `profileSwapEngineOutcome`) so the chat
+  /// swap and the Local API panel cannot disagree on what counts as a
+  /// model-changing switch.
+  private func reloadEngineIfProfileSwapChangesModel(to newProfileID: String) {
+    let outcome = Self.profileSwapEngineOutcome(
+      newProfileID: newProfileID,
+      chatModelID: chats.first?.modelID,
+      newProfileDefaultModel: profileStore.model(forProfileID: newProfileID),
+      status: engineStatusStore.status,
+      restartInFlight: &profileSwapRestartInFlight)
+    guard outcome == .restart else { return }
+    restartEngineForProfileSwap(profileID: newProfileID)
+  }
+
+  /// Stop+start the engine onto the model the swapped-in profile boots. v1 pie
+  /// binds the model at `pie serve` boot, so a model change is a full restart
+  /// (the same shape as `LocalAPIView.restartEngine`). The boot model mirrors
+  /// `startEngineForSelectedProfile`: an explicit per-chat pin
+  /// (`chats.first?.modelID`) beats the profile default (#459/#460). The
+  /// in-flight guard is cleared once the async cycle settles so a later swap
+  /// is actionable again; faults route to the same banners as a manual start.
+  private func restartEngineForProfileSwap(profileID: String) {
+    let modelOverride = chats.first?.modelID
+    Task { @MainActor in
+      defer { profileSwapRestartInFlight = false }
+      do {
+        engineActionError = nil
+        helperBlock = nil
+        try await engineCoordinator.stopEngine()
+        try await engineCoordinator.startEngine(profileID: profileID,
+                                                modelOverride: modelOverride)
+      } catch let block as HelperUnavailable {
+        helperBlock = block
+      } catch {
+        engineActionError = Self.engineErrorMessage(error, verb: "switch")
       }
     }
   }
@@ -698,12 +745,18 @@ struct ChatScaffoldView: View {
         // per-chat selection — so persist the swap to the marker too.
         // Otherwise a swap while the engine is stopped leaves the marker on
         // the old profile and a later menu-icon start launches the OLD
-        // model. Stage-only: this updates the start TARGET, it does not
-        // auto-start the engine. `setActiveProfileID` logs internally on a
-        // write failure (the marker simply stays on the prior profile), so
-        // the `try?` does not silently drop the signal.
+        // model. While stopped this is stage-only: it updates the start
+        // TARGET, it does not auto-start the engine (#3). `setActiveProfileID`
+        // logs internally on a write failure (the marker simply stays on the
+        // prior profile), so the `try?` does not silently drop the signal.
         try? profileStore.setActiveProfileID(new)
         clearTransientOverridesForSelectedProfile()
+        // #673: when the engine is already running and the newly selected
+        // profile boots a DIFFERENT served model, relaunch onto it now — the
+        // user shouldn't have to send a chat or restart manually to pick up
+        // the new model. A same-model swap, a stopped engine, or a switch
+        // mid-transition takes no engine action (gate → selectOnly/reject).
+        reloadEngineIfProfileSwapChangesModel(to: new)
       } catch {
         chat.profileID = previous
         // Also revert the toolbar selection so the menu label
@@ -1300,6 +1353,44 @@ struct ChatScaffoldView: View {
   private func gateTarget(for chat: Chat) -> ModelTarget? {
     Self.gateTarget(selectedModelID: chat.modelID,
                     profileDefaultModel: selectedProfileDefault)
+  }
+
+  /// #673: decide whether a chat-toolbar profile swap must reload the engine.
+  /// Reuses the model-aware `LocalAPIProfileSwitchGate` (from #654) so the
+  /// chat swap and the Local API panel share ONE relaunch policy. The model
+  /// the new profile would boot is the chat's pin-over-default resolution
+  /// (`ModelTarget.resolve`) — exactly what `startEngineForSelectedProfile`
+  /// boots (`chats.first?.modelID`, else the profile default). A running
+  /// engine serving a DIFFERENT model → `.restart`; same model, stopped, or
+  /// mid-transition → `.selectOnly`/`.reject`, so #3's marker-only-while-
+  /// stopped contract and the same-model no-relaunch invariant both hold.
+  /// Pure + static so the matrix is unit-tested without a view host.
+  static func profileSwapEngineOutcome(
+    newProfileID: String,
+    chatModelID: String?,
+    newProfileDefaultModel: String?,
+    status: EngineStatus,
+    restartInFlight: inout Bool
+  ) -> LocalAPIProfileSwitchGate.Outcome {
+    let selectedModelID = ModelTarget.resolve(
+      selectedModelID: chatModelID,
+      profileDefault: newProfileDefaultModel)?.modelID
+    let runtimeProfileID: String?
+    let runtimeModelID: String?
+    if case .running(let snapshot) = status {
+      runtimeProfileID = snapshot.profileID
+      runtimeModelID = snapshot.servedModelID.isEmpty ? nil : snapshot.servedModelID
+    } else {
+      runtimeProfileID = nil
+      runtimeModelID = nil
+    }
+    return LocalAPIProfileSwitchGate.decide(
+      selectedProfileID: newProfileID,
+      selectedModelID: selectedModelID,
+      runtimeProfileID: runtimeProfileID,
+      runtimeModelID: runtimeModelID,
+      state: LocalAPIState.make(status: status, hasActiveProfile: true),
+      restartInFlight: &restartInFlight)
   }
 
   /// "Load default" action. Honors the no-eager-load invariant — only
