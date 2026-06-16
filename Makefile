@@ -70,7 +70,7 @@ endef
         test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-sandbox-diagnostics test-readme-harness test-e2e-http \
         test-spec-smoke test-spec-bench test-spec-matrix-selftest bench-spec-matrix bench-datasets-prep bench-datasets-verify \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
-        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-gui-chat-switch test-menubar-icon-template \
+        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-gui-chat-switch test-gui-menu test-gui-engine-status test-gui-model-download test-menubar-icon-template \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-apc-bench-selftest test-e2e-harsh-load test-e2e-cache-real bench-apc-real \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
@@ -604,8 +604,8 @@ test-gui: genproject $(LOGDIR) ## GUI scenarios — full RatioThinkGUITests matr
 # --- Focused GUI suites by product area (xcodebuild -only-testing) ----------
 # Engine-free / mock GUI suites; need a seated session + TCC. Run the area you
 # touched for fast, attributable signal instead of the whole `test-gui` matrix.
-test-gui-shell: genproject $(LOGDIR) ## GUI area: app window shell + Settings 4 tabs (S5)
-	$(call gui_suite_run,shell,-only-testing:RatioThinkGUITests/S5_AppWindowShellGUITests)
+test-gui-shell: genproject $(LOGDIR) ## GUI area: app window shell + Settings 4 tabs + ratiothink://settings deep link (S5/S420)
+	$(call gui_suite_run,shell,-only-testing:RatioThinkGUITests/S5_AppWindowShellGUITests -only-testing:RatioThinkGUITests/S420_SettingsDeepLinkGUITests)
 
 test-gui-first-launch: genproject $(LOGDIR) ## GUI area: first-launch wizard, fast/mock (S7)
 	$(call gui_suite_run,first-launch,-only-testing:RatioThinkGUITests/S7_FirstLaunchWizardGUITests)
@@ -622,8 +622,8 @@ render-menubar-icon: ## Render the #424 branded menu-bar icon (4 states x light/
 	@/tmp/render-menubar-icon
 	@open /tmp/menubar-icon-preview.png 2>/dev/null || true
 
-test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — recovery, zero-state, send-gate, composer auto-grow, profile-swap keep-current, model-menu no-resident confirm, helper-overlay removal, chat-list geometry, chat lifecycle prune/auto-title, sidebar search (S279/S285/S286/S446/S459/S486/S496/S511/S512/S586)
-	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests -only-testing:RatioThinkGUITests/S459_ProfileSwapKeepCurrentGUITests -only-testing:RatioThinkGUITests/S486_ModelMenuNoResidentConfirmGUITests -only-testing:RatioThinkGUITests/S496_HelperOverlayRemovedGUITests -only-testing:RatioThinkGUITests/S511_ChatListGeometryGUITests -only-testing:RatioThinkGUITests/S512_ChatLifecycleGUITests -only-testing:RatioThinkGUITests/S586_SidebarSearchGUITests)
+test-gui-chat: genproject $(LOGDIR) ## GUI area: engine-free chat surfaces — recovery, zero-state, send-gate, fresh-install download gate, sampling popover, pinned/resident mismatch confirm, composer auto-grow, profile-swap keep-current, model-menu no-resident confirm, helper-overlay removal, chat-list geometry, chat lifecycle prune/auto-title, sidebar search (S279/S285/S286/S326/S421/S446/S459/S486/S496/S511/S512/S527/S586)
+	$(call gui_suite_run,chat,-only-testing:RatioThinkGUITests/S279_LifecycleRecoveryGUITests -only-testing:RatioThinkGUITests/S285_ZeroStateGUITests -only-testing:RatioThinkGUITests/S286_NoModelSendGateGUITests -only-testing:RatioThinkGUITests/S326_FreshInstallModelDownloadGUITests -only-testing:RatioThinkGUITests/S421_SamplingPopoverGUITests -only-testing:RatioThinkGUITests/S446_ComposerAutoGrowGUITests -only-testing:RatioThinkGUITests/S459_ProfileSwapKeepCurrentGUITests -only-testing:RatioThinkGUITests/S486_ModelMenuNoResidentConfirmGUITests -only-testing:RatioThinkGUITests/S496_HelperOverlayRemovedGUITests -only-testing:RatioThinkGUITests/S511_ChatListGeometryGUITests -only-testing:RatioThinkGUITests/S512_ChatLifecycleGUITests -only-testing:RatioThinkGUITests/S527_PinnedResidentMismatchGUITests -only-testing:RatioThinkGUITests/S586_SidebarSearchGUITests)
 
 test-gui-sidebar-search: genproject $(LOGDIR) ## GUI area: #586 sidebar Search — Search section opens a detail-column panel over chat titles + bodies; find-and-open switches the main view (S586)
 	$(call gui_suite_run,sidebar-search,-only-testing:RatioThinkGUITests/S586_SidebarSearchGUITests)
@@ -642,6 +642,15 @@ test-gui-chat-switch: genproject $(LOGDIR) ## GUI area: #530 rapid chat-switchin
 
 test-gui-local-api: genproject $(LOGDIR) ## GUI area: #654/#663 Local API panel — seeded profile tabs + streaming toggle, same-model switch keeps engine and per-profile 'Running' badge (S654)
 	$(call gui_suite_run,local-api,-only-testing:RatioThinkGUITests/S654_LocalAPIPanelGUITests)
+
+test-gui-menu: genproject $(LOGDIR) ## GUI area: #411 App menu — "Check for Updates…" present, orphaned New Chat/New Window commands removed (S411)
+	$(call gui_suite_run,menu,-only-testing:RatioThinkGUITests/S411_AppMenuUpdateGUITests)
+
+test-gui-engine-status: genproject $(LOGDIR) ## GUI area: toolbar engine-status pip — popover survives 1 Hz poll ticks; memory-row + error-banner best-effort (S327)
+	$(call gui_suite_run,engine-status,-only-testing:RatioThinkGUITests/S327_EngineStatusIndicatorGUITests)
+
+test-gui-model-download: genproject $(LOGDIR) ## GUI area: #218 model-download cancel — inline Keep/Discard confirm via the fake downloader (S218)
+	$(call gui_suite_run,model-download,-only-testing:RatioThinkGUITests/S218_CancelAffordancesGUITests)
 
 # --- E2E wrappers by product area ------------------------------------------
 # Operator-gated (seated session + TCC; real engine/model or deterministic

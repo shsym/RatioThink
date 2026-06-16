@@ -19,7 +19,6 @@ import XCTest
 /// so inner controls are queried by visible label / a narrow id. Uses
 /// narrow type queries only — `descendants(matching: .any)` can SIGBUS on
 /// a degraded session (GUI-test convention).
-// gui-suite: full-matrix-only: no product-area focused target; runs in the full `make test-gui` matrix.
 final class S327_EngineStatusIndicatorGUITests: XCTestCase {
 
   override func setUp() async throws { try guardSeatedGUI() }

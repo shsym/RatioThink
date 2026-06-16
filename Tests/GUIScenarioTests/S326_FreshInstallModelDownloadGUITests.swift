@@ -6,7 +6,6 @@ import XCTest
 /// absent. Engine-free: the gate + the download CTA fire before any
 /// engine contact, and the download itself is the fake downloader, so
 /// this runs without a real engine or network.
-// gui-suite: full-matrix-only: no product-area focused target; runs in the full `make test-gui` matrix.
 final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
   override func setUp() async throws {
     try guardSeatedGUI()

@@ -4,7 +4,6 @@ import XCTest
 /// engine that is already known to serve a different resident model. The guard
 /// fires before the user message is persisted and asks the user how to resolve
 /// the model identity mismatch.
-// gui-suite: full-matrix-only: no product-area focused target; runs in the full `make test-gui` matrix.
 final class S527_PinnedResidentMismatchGUITests: XCTestCase {
   private var tempHomes: [String] = []
 

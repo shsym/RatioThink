@@ -24,7 +24,6 @@ import XCTest
 /// `chat → repeat-boost` switch is a same-model switch. The non-sandboxed app
 /// auto-seeds the chat / repeat-boost / json-think / tree-of-thought profiles
 /// into the isolated `PIE_HOME`.
-// gui-suite: full-matrix-only: no product-area focused target; runs in the full `make test-gui` matrix.
 final class S654_LocalAPIPanelGUITests: XCTestCase {
   private var tempHomes: [String] = []
 
