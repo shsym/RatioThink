@@ -1286,6 +1286,40 @@ fn choose_synthesis_context<C>(synth_base: Option<C>, _branch_context: Option<C>
 /// slot (#523). Node ids are
 /// caller-assigned (paired with the engine contexts), so the returned
 /// `keep` ids map straight back to surviving [`Frontier`] entries.
+/// #683 instrumentation: log per-parent sibling-divergence for one level's
+/// answered nodes. Pure measurement — no return, no behavior change. Groups
+/// `ok` nodes by `parent_id` (order-preserving, linear; group size ≤ breadth)
+/// and emits one `[chat-apc] tot diversity:` line per group via the
+/// [`super::diversity::level_divergence`] summary.
+fn log_level_divergence(level: usize, nodes: &[Node]) {
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    for n in nodes {
+        if n.status != NodeStatus::Ok {
+            continue;
+        }
+        let parent = n.parent_id.as_deref().unwrap_or("(root)");
+        match groups.iter_mut().find(|(p, _)| *p == parent) {
+            Some((_, texts)) => texts.push(n.content.as_str()),
+            None => groups.push((parent, vec![n.content.as_str()])),
+        }
+    }
+    let fmt = |o: Option<f32>| o.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}"));
+    for (parent, texts) in groups {
+        let d = super::diversity::level_divergence(&texts);
+        eprintln!(
+            "[chat-apc] tot diversity: level={level} parent={parent} answered={} \
+             mean_sim={} max_sim={} identical_pairs={} distinct_prefixes={}/{} \
+             (lower sim = more diverse)",
+            d.n,
+            fmt(d.mean_similarity),
+            fmt(d.max_similarity),
+            d.identical_pairs,
+            d.distinct_prefixes,
+            d.n,
+        );
+    }
+}
+
 fn materialize_level(level: usize, branches: Vec<Branch>, beam_width: usize) -> LevelMaterialized {
     let mut nodes: Vec<Node> = Vec::with_capacity(branches.len());
     let mut candidates: Vec<Candidate> = Vec::with_capacity(branches.len());
@@ -1322,6 +1356,17 @@ fn materialize_level(level: usize, branches: Vec<Branch>, beam_width: usize) -> 
             children: Vec::new(),
         });
     }
+
+    // #683 measurement (no behavior change): summarize how much each parent's
+    // `breadth` answered siblings actually diverge, and log one line per
+    // parent group. Grouping by parent keeps the metric honest at depth > 1,
+    // where a level holds several beam survivors' fork-sets — lumping them
+    // would conflate within-fork diversity with cross-parent difference.
+    // Selection below is unchanged; this is pure observation, so every real
+    // ToT run (gsm8k/humaneval and production) leaves a per-level divergence
+    // trail in the logs. Group size is tiny (≤ breadth · beam_width) so the
+    // linear-probe grouping is cheap.
+    log_level_divergence(level, &nodes);
 
     let keep = select_beam_diverse(&candidates, beam_width, super::diversity::DUP_THRESHOLD);
     LevelMaterialized {

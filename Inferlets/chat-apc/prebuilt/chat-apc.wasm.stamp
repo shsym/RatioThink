@@ -47,6 +47,6 @@
 #     Scripts/stamp-chat-apc.sh verify-inputs    # post-build, inputs only
 
 vendor_pie_sha = "dbc71826d45d358c7583807c455cf42bc9a19fcf"
-src_sha256     = "d71d4a69851c29f1d68f27e9f8198405ae8d5b77c66fed0eb826d8651cfd4d1e"
-wasm_sha256    = "24de36ccc2fe00245af74101918d6228fc12b0086a4bcff15deb438e33b03172"
-wasm_size      = 1174478
+src_sha256     = "772d6a0b05b1bba58788fd0e96cd93678d605c88df73bff57dab393882537c46"
+wasm_sha256    = "8eac03d5f99e1e569f9e6cd7e3a6608bc357c0b81a49bffa47af4da5355b51d5"
+wasm_size      = 1178530
