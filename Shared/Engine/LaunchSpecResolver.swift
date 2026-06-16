@@ -185,12 +185,14 @@ public struct LaunchSpecResolver {
     case .success(let resolved): modelRef = resolved
     case .failure(let err):      return .failure(err)
     }
-    // Refuse a quantized HF/MLX safetensors snapshot before spawning the
-    // engine. The catalog marks such rows unlaunchable so the picker
-    // can't select them, but a stale or hand-authored profile could name
-    // one — fail fast with the exact dtype reason instead of the cryptic
-    // engine rc=-1 (mirrors the split-GGUF fast-fail above).
-    if let reason = HFCacheCatalog.quantizedSafetensorsReason(forModelDirectory: modelRef) {
+    // Refuse a quantized HF/MLX safetensors model before spawning the
+    // engine — whether `resolveModelRef` resolved to a snapshot directory
+    // or a single `.safetensors` file. The catalog marks such rows
+    // unlaunchable so the picker can't select them, but a stale or hand-
+    // authored profile could name one — fail fast with the exact dtype
+    // reason instead of the cryptic engine rc=-1 (mirrors the split-GGUF
+    // fast-fail above).
+    if let reason = HFCacheCatalog.quantizedSafetensorsReason(forResolvedModelPath: modelRef) {
       return .failure(EngineError(
         code: .invalidInput,
         message: "\(reason) (model=\(profile.model))"

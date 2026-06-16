@@ -141,9 +141,10 @@ public enum HFCacheCatalog {
   }
 
   /// safetensors dtypes the portable v1 driver can load. Mirrors
-  /// `st_to_ggml_dtype` in `Vendor/pie/driver/portable/src/safetensors.cpp`,
-  /// which throws on anything else; quantized HF/MLX repos pack weights
-  /// as `U32`, so their header carries dtypes outside this set.
+  /// `st_to_ggml_dtype` in `Vendor/pie/driver/portable/src/model.cpp`
+  /// (~lines 61-72), which throws on anything else; quantized HF/MLX
+  /// repos pack weights as `U32`, so their header carries dtypes outside
+  /// this set.
   private static let launchableSafetensorsDtypes: Set<String> = ["F32", "F16", "BF16"]
 
   /// First weight dtype in any `.safetensors` header that the portable
@@ -162,21 +163,31 @@ public enum HFCacheCatalog {
     return nil
   }
 
-  /// Refuse a model directory whose `.safetensors` weights are a
+  /// Refuse a resolved model path whose `.safetensors` weights are a
   /// quantized HF/MLX format the portable v1 driver cannot load, naming
-  /// the offending dtype. Returns nil for a launchable snapshot, a
-  /// non-directory path (single-file GGUF), or an unreadable header. The
-  /// launch path calls this so a stale/hand-authored profile pointing at
-  /// such a repo fails fast with a clear reason instead of the cryptic
-  /// engine rc=-1 — the same fast-fail shape as `isSplitShardFilename`.
-  static func quantizedSafetensorsReason(forModelDirectory path: String,
+  /// the offending dtype. Handles both shapes `resolveModelRef` produces:
+  /// a snapshot DIRECTORY (2-segment slug → every `.safetensors` weight
+  /// is probed) and a single `.safetensors` FILE (3-segment slug
+  /// `org/name/file.safetensors` → that file is probed). Returns nil for
+  /// a launchable snapshot, a single-file GGUF/other path, or an
+  /// unreadable header. The launch path calls this so a stale/hand-
+  /// authored profile pointing at such a repo fails fast with a clear
+  /// reason instead of the cryptic engine rc=-1 — the same fast-fail
+  /// shape as `isSplitShardFilename`.
+  static func quantizedSafetensorsReason(forResolvedModelPath path: String,
                                          fileManager: FileManager = .default) -> String? {
     let url = URL(fileURLWithPath: path)
     var isDirectory: ObjCBool = false
-    guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory),
-          isDirectory.boolValue else { return nil }
-    let weights = weightArtifacts(in: url, fileManager: fileManager)
-    return firstUnlaunchableSafetensorsDtype(among: weights)
+    guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory) else { return nil }
+    if isDirectory.boolValue {
+      let weights = weightArtifacts(in: url, fileManager: fileManager)
+      return firstUnlaunchableSafetensorsDtype(among: weights)
+        .map(quantizedSafetensorsReason(dtype:))
+    }
+    // Single-file path: probe it directly. Only `.safetensors` is gated —
+    // a `.gguf` or other single file falls through to its own loader.
+    guard path.lowercased().hasSuffix(".safetensors") else { return nil }
+    return unlaunchableDtypeInSafetensorsHeader(at: url)
       .map(quantizedSafetensorsReason(dtype:))
   }
 
@@ -198,7 +209,10 @@ public enum HFCacheCatalog {
     // Guard a corrupt/garbage length: a real header is small JSON, so an
     // absurd value (e.g. raw weight bytes misread as a length) is not a
     // header to parse — fall through to nil rather than allocating it.
-    guard headerLength > 0, headerLength <= 64 * 1024 * 1024 else { return nil }
+    // Cap matches the driver's MAX_HEADER_SIZE (128 MiB,
+    // `Vendor/pie/driver/portable/src/safetensors.cpp:23`) so no header
+    // the driver would parse is silently treated as launchable.
+    guard headerLength > 0, headerLength <= 128 * 1024 * 1024 else { return nil }
     guard let jsonData = try? handle.read(upToCount: Int(headerLength)),
           jsonData.count == Int(headerLength),
           let object = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]

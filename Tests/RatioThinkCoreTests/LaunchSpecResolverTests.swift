@@ -434,6 +434,83 @@ final class LaunchSpecResolverTests: XCTestCase {
                   "HF cache fallback must pass the resolved local snapshot dir to pie; got:\n\(body)")
   }
 
+  // The catalog gates quantized rows out of the picker, but a stale or
+  // hand-authored profile can still name one — the resolver must fast-
+  // fail before spawning the engine, for BOTH resolved shapes.
+  func test_resolveLauncherSpec_rejects_quantized_hf_safetensors_directory() throws {
+    let store = try makeStoreWithModel("mlx-community/Qwen3-0.6B-4bit")
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    let hfHome = tempDir.appendingPathComponent("hf-home", isDirectory: true)
+    let snapshot = try writeHFCacheSnapshot(
+      hfHome: hfHome,
+      repo: "mlx-community/Qwen3-0.6B-4bit",
+      files: ["config.json": "{}", "tokenizer.json": "{}"]
+    )
+    try writeSafetensorsFile(at: snapshot.appendingPathComponent("model.safetensors"),
+                             dtypes: ["U32"])
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { hfHome }
+    )
+
+    switch resolver.resolveLauncherSpec(profileID: "chat") {
+    case .success:
+      XCTFail("a quantized U32 safetensors snapshot dir must fast-fail before engine spawn")
+    case .failure(let err):
+      XCTAssertEqual(err.code, .invalidInput, "got: \(err.code)")
+      XCTAssertTrue(err.message.contains("U32"), "reason must name the dtype; got: \(err.message)")
+    }
+  }
+
+  func test_resolveLauncherSpec_rejects_quantized_hf_safetensors_single_file() throws {
+    // A 3-segment slug `org/name/file.safetensors` resolves to a single
+    // FILE, not a directory — the F1 case the directory-only gate missed.
+    let store = try makeStoreWithModel("mlx-community/Qwen3-0.6B-4bit/model.safetensors")
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    let hfHome = tempDir.appendingPathComponent("hf-home", isDirectory: true)
+    let snapshot = try writeHFCacheSnapshot(
+      hfHome: hfHome,
+      repo: "mlx-community/Qwen3-0.6B-4bit",
+      files: ["config.json": "{}", "tokenizer.json": "{}"]
+    )
+    try writeSafetensorsFile(at: snapshot.appendingPathComponent("model.safetensors"),
+                             dtypes: ["U32"])
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { hfHome }
+    )
+
+    switch resolver.resolveLauncherSpec(profileID: "chat") {
+    case .success:
+      XCTFail("a quantized single-file safetensors path must fast-fail before engine spawn")
+    case .failure(let err):
+      XCTAssertEqual(err.code, .invalidInput, "got: \(err.code)")
+      XCTAssertTrue(err.message.contains("U32"), "reason must name the dtype; got: \(err.message)")
+    }
+  }
+
   func test_resolveLauncherSpec_hf_gguf_symlink_fallback_preserves_snapshot_path() throws {
     let store = try makeStoreWithModel("Qwen/Qwen3-0.6B-GGUF/model.gguf")
     defer { store.stop() }
@@ -1444,6 +1521,24 @@ final class LaunchSpecResolverTests: XCTestCase {
     let handle = try FileHandle(forWritingTo: url)
     try handle.truncate(atOffset: UInt64(sizeBytes))
     try handle.close()
+  }
+
+  /// Write a minimal valid `.safetensors` (8-byte LE header length + JSON
+  /// dtype map) so the launch-path probe reads a real header.
+  @discardableResult
+  private func writeSafetensorsFile(at url: URL, dtypes: [String]) throws -> URL {
+    var header: [String: Any] = [:]
+    for (i, dtype) in dtypes.enumerated() {
+      header["t\(i)"] = ["dtype": dtype, "shape": [1], "data_offsets": [0, 0]]
+    }
+    let headerData = try JSONSerialization.data(withJSONObject: header)
+    var length = UInt64(headerData.count).littleEndian
+    var data = Data(bytes: &length, count: 8)
+    data.append(headerData)
+    try FileManager.default.createDirectory(
+      at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try data.write(to: url)
+    return url
   }
 
   @discardableResult
