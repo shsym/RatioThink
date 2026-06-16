@@ -375,14 +375,21 @@ def _check_run(label: str, scenario_id: str, rec: dict, failures: list[str]) -> 
     proposed = sm["proposed_draft_tokens"]
     accepted = sm["accepted_draft_tokens"]
     rejected = sm["rejected_draft_tokens"]
+    # Fail closed: this verdict is load-bearing for the matrix cell() aggregates
+    # (#658/#664). Inconsistent accounting poisons acceptance_alpha
+    # (= accepted/proposed) and cross-request reuse breaks the ordering-neutral
+    # tok/s comparison — both make the run's metrics unusable, so exclude it
+    # rather than appending a failure and feeding the totals anyway.
     if accepted + rejected != proposed:
         failures.append(
             f"[{scenario_id}/{label}] draft accounting inconsistent: "
             f"accepted={accepted} rejected={rejected} proposed={proposed}"
         )
+        return False
     reuse = _cross_request_reuse(scenario_id, label, rec)
     if reuse is not None:
         failures.append(reuse)
+        return False
     return True
 
 

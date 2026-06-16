@@ -306,7 +306,13 @@ async def _bench_dataset(http_c, base, key, records, total, failures) -> dict:
         plain_runs.append(p1)
         ngram_runs.append(n1)
 
-        if p1.get("status") != 200 or n1.get("status") != 200:
+        # Gate the byte-identity comparison on the SAME _check_run verdict that
+        # cell() aggregates on (#664 F1), not a weaker status==200 — a
+        # degraded-but-200 run (empty decode, mid-stream error frame,
+        # inconsistent accounting) would otherwise be compared: two empty
+        # decodes would count a false equiv_hold, and a healthy-vs-degraded pair
+        # a false equiv_drift. Excluded prompts route to equiv_invalid.
+        if not p1.get("_check_ok") or not n1.get("_check_ok"):
             equiv_invalid += 1
             continue
         if idx == 0 and p2 is not None and p2.get("status") == 200:

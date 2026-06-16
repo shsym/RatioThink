@@ -90,5 +90,55 @@ class CrossRequestReuseGuard(unittest.TestCase):
         self.assertIsNone(b._cross_request_reuse("primes", "baseline", {}))
 
 
+def _healthy_rec() -> dict:
+    """A run that passes every _check_run check: 200, no error frame, all
+    required spec keys, a non-empty decode, consistent accounting (4 == 2 + 2),
+    no cross-request reuse."""
+    return {
+        "status": 200,
+        "content": "ok",
+        "reasoning": "",
+        "error_frame": None,
+        "spec_metrics": {
+            "generated_tokens": 10,
+            "proposed_draft_tokens": 4,
+            "accepted_draft_tokens": 2,
+            "rejected_draft_tokens": 2,
+        },
+    }
+
+
+class CheckRunFailClosed(unittest.TestCase):
+    """#664 F2: an accounting-inconsistent or reuse-contaminated run rides a 200
+    with present spec_metrics, but its totals are unusable. Since the verdict is
+    load-bearing for the matrix cell() aggregates, _check_run must return False
+    (fail closed), not append-and-fall-through to True."""
+
+    def test_healthy_run_is_usable(self):
+        # positive control: the well-formed run still passes.
+        failures: list[str] = []
+        self.assertTrue(b._check_run("ngram", "s", _healthy_rec(), failures))
+        self.assertEqual(failures, [])
+
+    def test_inconsistent_accounting_run_is_unusable(self):
+        # proposed=4 but accepted+rejected=4+2=6 — alpha would be poisoned.
+        rec = _healthy_rec()
+        rec["spec_metrics"]["accepted_draft_tokens"] = 4
+        rec["spec_metrics"]["rejected_draft_tokens"] = 2
+        failures: list[str] = []
+        self.assertFalse(b._check_run("ngram", "s", rec, failures))
+        self.assertTrue(
+            any("accounting inconsistent" in f for f in failures), failures
+        )
+
+    def test_cross_request_reuse_run_is_unusable(self):
+        # a reused n-gram cache breaks ordering neutrality — exclude it too.
+        rec = _healthy_rec()
+        rec["spec_metrics"]["ngram_sidecar_status"] = "reused"
+        failures: list[str] = []
+        self.assertFalse(b._check_run("ngram", "s", rec, failures))
+        self.assertTrue(any("reuse detected" in f for f in failures), failures)
+
+
 if __name__ == "__main__":
     unittest.main()

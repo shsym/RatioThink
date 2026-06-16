@@ -120,6 +120,33 @@ def _degraded_but_200_run() -> dict:
     }
 
 
+def _inconsistent_accounting_run() -> dict:
+    """A run that rides an HTTP 200 with a non-empty decode and every required
+    spec key present, but whose draft accounting is inconsistent
+    (proposed=4, accepted=4, rejected=2 → 4 + 2 != 4). `_check_run` must fail it
+    closed (#664 F2): acceptance_alpha = accepted/proposed is meaningless when
+    the totals don't reconcile, so it must never reach the aggregates."""
+    return {
+        "status": 200,
+        "content": "ok",
+        "reasoning": "",
+        "error_frame": None,
+        "wall_tok_per_s": 9999.0,
+        "ttft_s": 0.0,
+        "tpot_ms": 0.0,
+        "spec_metrics": {
+            "enabled": True,
+            "generated_tokens": 10,
+            "proposed_draft_tokens": 4,
+            "accepted_draft_tokens": 4,
+            "rejected_draft_tokens": 2,
+            "decode_tokens_per_sec": 9999.0,
+            "avg_tokens_per_step": 50.0,
+            "accepted_prefix_len_histogram": [999, 999],
+        },
+    }
+
+
 class CellUsabilityGate(unittest.TestCase):
     """The `_bench_dataset`/`cell()` usability state machine must aggregate only
     over runs that passed `_check_run`. A degraded-but-200 run (200, spec_metrics
@@ -128,12 +155,12 @@ class CellUsabilityGate(unittest.TestCase):
     Driven end-to-end against the real `_bench_dataset` with a stubbed
     `_stream_run` — no engine, no model, no network."""
 
-    def _run_bench(self, records):
+    def _run_bench(self, records, bad_run=_degraded_but_200_run):
         async def fake_stream_run(http_c, base, prompt, think, spec):
             # ngram (speculation enabled) on the "bad" prompt returns the
-            # degraded-but-200 run; every other run is healthy.
+            # supplied bad run; every other run is healthy.
             if prompt == "bad" and spec.get("enabled"):
-                return _degraded_but_200_run()
+                return bad_run()
             return _healthy_run()
 
         failures: list[str] = []
@@ -174,6 +201,51 @@ class CellUsabilityGate(unittest.TestCase):
             any("empty decode" in f for f in failures),
             f"expected an empty-decode failure, got {failures!r}",
         )
+
+    def test_degraded_ngram_not_counted_in_greedy_equivalence(self):
+        # #664 F1: record 1 is healthy on plain, degraded-but-200 on ngram. The
+        # byte compare must be gated on the _check_ok verdict, so the prompt is
+        # routed to `invalid` (excluded) — NOT scored as equiv_drift (healthy
+        # "ok" != empty), and certainly not as a false equiv_hold.
+        records = [
+            {"prompt": "good", "think": False, "category": "c"},
+            {"prompt": "bad", "think": False},
+        ]
+        row, _ = self._run_bench(records)
+        eq = row["greedy_equivalence"]
+        self.assertEqual(eq["held"], 1)       # only the healthy record 0
+        self.assertEqual(eq["drift_spec"], 0)  # degraded run NOT a false drift
+        self.assertEqual(eq["invalid"], 1)     # degraded run excluded here
+        # rate is over compared (held+drift) only — the excluded prompt must
+        # not deflate it.
+        self.assertEqual(eq["rate"], 1.0)
+
+    def test_inconsistent_accounting_run_excluded_and_recorded(self):
+        # #664 F2: an accounting-inconsistent (4 != 4 + 2) ngram run rides a 200
+        # with a non-empty decode, so only the _check_run accounting gate stops
+        # it. It must be excluded from the ngram aggregates and surfaced as a
+        # failure for disclosure.
+        records = [
+            {"prompt": "good", "think": False, "category": "c"},
+            {"prompt": "bad", "think": False},
+        ]
+        row, failures = self._run_bench(
+            records, bad_run=_inconsistent_accounting_run
+        )
+        ngram = row["cells"]["ngram"]
+        # Only the healthy ngram run reaches the aggregates.
+        self.assertEqual(ngram["runs_ok"], 1)
+        # alpha = 2/4 from the healthy run alone — NOT (2+4)/(4+4)=0.75.
+        self.assertEqual(ngram["acceptance_alpha"], 0.5)
+        self.assertEqual(ngram["engine_tok_per_s"], 100.0)  # NOT 9999
+        self.assertEqual(ngram["accepted_prefix_len_histogram"], [1, 1])
+        self.assertTrue(
+            any("accounting inconsistent" in f for f in failures), failures
+        )
+        # And the excluded prompt routes to equiv invalid, not drift/hold.
+        eq = row["greedy_equivalence"]
+        self.assertEqual(eq["invalid"], 1)
+        self.assertEqual(eq["drift_spec"], 0)
 
 
 if __name__ == "__main__":
