@@ -44,9 +44,10 @@ define gui_suite_run
   LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-gui-$(1).log; \
   . Scripts/lib/sandbox-diagnostics.sh; \
   sandbox_diag_require_xcodebuild_caches "test-gui-$(1)" || exit 2; \
+  seated=0; \
   if ! pgrep -x Dock >/dev/null 2>&1; then \
     echo "warning: no seated GUI session — GUI tests will XCTSkip."; \
-  fi; \
+  else seated=1; fi; \
   Scripts/purge-app-window-frames.sh || echo "warning: window-frame purge failed — saved NSWindow Frame keys may poison GUI runs"; \
   if [ -n "$$PIE_TEST_TCC_GRANTED" ]; then export TEST_RUNNER_PIE_TEST_TCC_GRANTED="$$PIE_TEST_TCC_GRANTED"; fi; \
   if [ -n "$$PIE_TEST_MODEL" ]; then export TEST_RUNNER_PIE_TEST_MODEL="$$PIE_TEST_MODEL"; fi; \
@@ -61,12 +62,15 @@ define gui_suite_run
   rm -rf $(GUI_TMP_HOMES) 2>/dev/null || true; \
   echo "log: $$LOG"; \
   if [ "$$status" -ne 0 ]; then sandbox_diag_report_from_log "test-gui-$(1)" "$$LOG"; fi; \
+  if [ "$$status" -eq 0 ]; then \
+    Scripts/assert-gui-tests-executed.sh "$(1)" "$$LOG" "$$seated" || status=$$?; \
+  fi; \
   exit $$status
 endef
 
 .PHONY: help genproject build build-static build-tests clean lint verify-tot-docs ci-pr check-vendor-pin local-pre-merge local-gui-gate local-e2e-gate release-gate \
         verify-app-icon-assets test-app-icon-assets test-dmg-layout test-package-dmg-staging test-collect-diagnostics test-landing-page \
-        test-ci-v2-static-gate test-lint-gui-only-testing test-xcode-chat-scaffold test-app-unit test-xcode-helper \
+        test-ci-v2-static-gate test-lint-gui-only-testing test-assert-gui-tests-executed test-xcode-chat-scaffold test-app-unit test-xcode-helper \
         test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-sandbox-diagnostics test-readme-harness test-e2e-http \
         test-spec-smoke test-spec-bench test-spec-matrix-selftest bench-spec-matrix bench-datasets-prep bench-datasets-verify \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
@@ -97,7 +101,7 @@ build-static: genproject ## Compile/type-check Rational app + helper without bui
 check-vendor-pin: ## Fail-closed guard: Vendor/pie gitlink must be reachable from its .gitmodules tracking branch (catches pin/branch drift)
 	Scripts/check-vendor-pie-pin.sh
 
-ci-pr: lint check-vendor-pin test-ci-v2-static-gate test-lint-gui-only-testing verify-app-icon-assets test-app-icon-assets test-menubar-icon-template test-landing-page build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
+ci-pr: lint check-vendor-pin test-ci-v2-static-gate test-lint-gui-only-testing test-assert-gui-tests-executed verify-app-icon-assets test-app-icon-assets test-menubar-icon-template test-landing-page build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
 
 local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary test-harsh-load-selftest test-matrix-aggregator ## Mandatory local pre-merge parity for runtime/heavy checks kept out of the lightweight manual workflow
 
@@ -543,6 +547,9 @@ lint: verify-tot-docs ## Static checks for helper-side-effect, GUITests -only-te
 
 test-lint-gui-only-testing: ## Mutation-proven self-test for the GUITests -only-testing guard (#666)
 	@Scripts/test-lint-gui-only-testing.sh
+
+test-assert-gui-tests-executed: ## Mutation-proven self-test for the gui_suite_run zero-tests-executed backstop (#680)
+	@Scripts/test-assert-gui-tests-executed.sh
 
 verify-tot-docs: ## Verify Tree-of-Thought docs/example beam-search semantics
 	python3 Scripts/verify-tot-docs.py
