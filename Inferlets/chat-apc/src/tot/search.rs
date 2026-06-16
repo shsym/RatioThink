@@ -1037,6 +1037,17 @@ pub async fn run(
     // been dropped by an earlier-level F7 fallback). `None` if the fork
     // fails → synthesis is skipped and the best-leaf content stands.
     let synth_base: Option<Context> = root_ctx.fork().ok();
+    // Single-shot degradation signal (#661 F1): the value scorer grounds on a
+    // fork of this same root. If the fork failed, every node is scored against
+    // its own answered branch context instead — the verbose-trace-primed path
+    // this fix exists to avoid, so final-level scores may go non-discriminative.
+    // Logged once here (where the degradation begins) rather than per node;
+    // synthesis is skipped too (see the post-search diagnostic).
+    if synth_base.is_none() {
+        eprintln!(
+            "[chat-apc] tot: conversation-root fork failed — value scoring falls back to branch contexts (degraded, may be non-discriminative at final depth) and synthesis is skipped"
+        );
+    }
 
     let mut flat: Vec<Node> = vec![Node::root()];
     let mut frontier: Vec<Frontier> = vec![Frontier {
@@ -1072,12 +1083,21 @@ pub async fn run(
         // concurrently below.
         let mut metas: Vec<(String, String, usize)> = Vec::new(); // (id, parent_id, branch_index)
         let mut ctxs: Vec<Context> = Vec::new();
+        // Reasoning-free ancestor clean-answer chain (root→parent) per child,
+        // aligned with `ctxs`/`metas` (#661 F2). An INTERMEDIATE node is scored
+        // against this path so the prompt's "repeats an earlier step" rule stays
+        // anchored; the FINAL level and the degraded fallback ignore it. Built
+        // once per frontier parent from `flat`'s clean `content`, cloned per
+        // sibling.
+        let mut child_paths: Vec<Vec<String>> = Vec::new();
         for f in frontier.iter() {
+            let parent_path = clean_answer_path(&flat, &f.node_id);
             for b in 0..params.breadth {
                 match f.ctx.fork() {
                     Ok(child) => {
                         metas.push((new_node_id(), f.node_id.clone(), b));
                         ctxs.push(child);
+                        child_paths.push(parent_path.clone());
                     }
                     Err(e) => flat.push(error_leaf(
                         &f.node_id,
@@ -1100,6 +1120,7 @@ pub async fn run(
         let results: Vec<(Context, NodeOutcome)> = resolve_level(
             &metas,
             ctxs,
+            &child_paths,
             params,
             model,
             emitter.as_deref_mut(),
@@ -1423,6 +1444,7 @@ fn finalize(flat: Vec<Node>, last_level: &[Candidate], final_answer_depth: usize
 async fn resolve_level(
     metas: &[(String, String, usize)],
     ctxs: Vec<Context>,
+    child_paths: &[Vec<String>],
     params: &TotParams,
     model: &Model,
     emitter: Option<&mut Emitter>,
@@ -1463,23 +1485,28 @@ async fn resolve_level(
         // (#458): the short greedy scoring generations decode in flight at
         // once so the engine coalesces them, instead of one score forward
         // pass at a time. `Incomplete`/`Error` nodes have no answer to rate.
-        let scores: Vec<Option<ScoreResult>> =
-            join_all(gens.iter().map(|(ctx, demux)| async move {
-                if matches!(demux.kind, DemuxKind::Answered) {
-                    Some(
-                        score_node(
-                            score_base.unwrap_or(ctx),
-                            &demux.answer,
-                            model,
-                            level == params.depth,
+        let scores: Vec<Option<ScoreResult>> = join_all(
+            gens.iter()
+                .zip(child_paths.iter())
+                .map(|((ctx, demux), path)| async move {
+                    if matches!(demux.kind, DemuxKind::Answered) {
+                        Some(
+                            score_answered(
+                                score_base,
+                                ctx,
+                                path,
+                                &demux.answer,
+                                model,
+                                level == params.depth,
+                            )
+                            .await,
                         )
-                        .await,
-                    )
-                } else {
-                    None
-                }
-            }))
-            .await;
+                    } else {
+                        None
+                    }
+                }),
+        )
+        .await;
 
         gens.into_iter()
             .zip(scores)
@@ -1491,14 +1518,21 @@ async fn resolve_level(
         // concurrency (the pre-#458 shape; benchmark baseline / overlap
         // variant).
         if concurrent_gen {
-            join_all(ctxs.into_iter().zip(metas.iter()).map(|(c, m)| {
-                expand(c, model, params, sink, score_base, &m.0, &m.1, level, m.2)
-            }))
+            join_all(
+                ctxs.into_iter()
+                    .zip(metas.iter())
+                    .zip(child_paths.iter())
+                    .map(|((c, m), path)| {
+                        expand(c, model, params, sink, score_base, path, &m.0, &m.1, level, m.2)
+                    }),
+            )
             .await
         } else {
             let mut out = Vec::with_capacity(ctxs.len());
-            for (c, m) in ctxs.into_iter().zip(metas.iter()) {
-                out.push(expand(c, model, params, sink, score_base, &m.0, &m.1, level, m.2).await);
+            for ((c, m), path) in ctxs.into_iter().zip(metas.iter()).zip(child_paths.iter()) {
+                out.push(
+                    expand(c, model, params, sink, score_base, path, &m.0, &m.1, level, m.2).await,
+                );
             }
             out
         }
@@ -1754,11 +1788,10 @@ fn classify(demux: Demux, score: Option<ScoreResult>) -> NodeOutcome {
 
 /// Generate then value-score one forked context in a single future (coupled
 /// scoring). The context is moved back out paired with a Context-free
-/// [`NodeOutcome`]. Only an `Answered` node is scored, and it is scored in a
-/// reasoning-free fork of `score_base` (the conversation root), NOT the branch
-/// context — see [`score_node`] (#661). `score_base` is `None` only when the
-/// root fork failed at search start (synthesis is skipped too); the scorer then
-/// degrades to the branch context so a node still gets a value.
+/// [`NodeOutcome`]. Only an `Answered` node is scored; the scoring context is
+/// chosen by [`score_answered`] — a reasoning-free fork of `score_base` (the
+/// conversation root) with `path` replayed for an intermediate node (#661), or
+/// the branch context as a degraded fallback when the root fork failed.
 #[allow(clippy::too_many_arguments)]
 async fn expand(
     ctx: Context,
@@ -1766,6 +1799,7 @@ async fn expand(
     params: &TotParams,
     sink: Option<BranchSink<'_, '_>>,
     score_base: Option<&Context>,
+    path: &[String],
     node_id: &str,
     parent_id: &str,
     level: usize,
@@ -1775,8 +1809,10 @@ async fn expand(
         generate_branch(ctx, model, params, sink, node_id, parent_id, level, branch_index).await;
     let score = if matches!(demux.kind, DemuxKind::Answered) {
         Some(
-            score_node(
-                score_base.unwrap_or(&ctx),
+            score_answered(
+                score_base,
+                &ctx,
+                path,
                 &demux.answer,
                 model,
                 level == params.depth,
@@ -1789,8 +1825,76 @@ async fn expand(
     (ctx, classify(demux, score))
 }
 
-/// Value evaluator: rate the candidate `answer` in a REASONING-FREE context
-/// and run a VERIFICATION rating (#555/#661).
+/// Minimal continuation cue inserted between consecutive replayed steps so the
+/// reasoning-free path context stays a valid alternating user/assistant
+/// conversation (#661 F2). The original branch context separated each step with
+/// a verbose per-branch `branch_directive`; the scorer only needs the steps
+/// themselves visible to anchor "repeats an earlier step", so this stand-in is
+/// deliberately terse and reasoning-free.
+const PATH_REPLAY_CUE: &str = "Continue toward the answer.";
+
+/// Root→`node_id` chain of clean answers (the reasoning-free `content`), oldest
+/// first, for an intermediate node's value-scoring path (#661 F2). The
+/// synthetic root and any empty (`Error`/`Incomplete`) node contribute nothing.
+/// `content` is already demuxed (#437) but [`strip_think_delimiters`] is applied
+/// as the same model-agnostic safety net the answer pipeline uses, so a leaked
+/// `<think>` tag can never re-enter the scorer's context. Pure → unit-tested.
+fn clean_answer_path(flat: &[Node], node_id: &str) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut cursor = Some(node_id.to_string());
+    while let Some(id) = cursor {
+        let Some(node) = flat.iter().find(|n| n.id == id) else {
+            break;
+        };
+        if !node.content.is_empty() {
+            chain.push(strip_think_delimiters(&node.content));
+        }
+        cursor = node.parent_id.clone();
+    }
+    chain.reverse();
+    chain
+}
+
+/// Decide what the value scorer replays into its forked context.
+///
+/// With a clean conversation-root fork (`has_clean_base`) the candidate answer
+/// is replayed as the latest assistant reply (#661); for an INTERMEDIATE node
+/// the reasoning-free chain of ancestor answers is replayed first so the
+/// `INTERMEDIATE_SCORE_PROMPT`'s "repeats an earlier step" rule stays anchored
+/// (#661 F2). The FINAL level is judged purely on `(question, answer)`, so it
+/// replays no path. Without a clean root (the root fork failed at search start),
+/// the scorer falls back to the answered BRANCH context — which already holds
+/// the full path + answer in its KV — so it replays NOTHING; replaying would
+/// append a duplicate assistant turn and malform the chat sequence (#661 F1).
+/// Pure → unit-tested.
+fn score_replay_plan(has_clean_base: bool, is_final_level: bool) -> (bool, bool) {
+    if has_clean_base {
+        (!is_final_level, true) // (replay_path, replay_answer)
+    } else {
+        (false, false)
+    }
+}
+
+/// Pick the scoring context + replay inputs for one answered node, then score.
+/// Centralizes the #661 F1/F2 decision (see [`score_replay_plan`]) so the
+/// coupled ([`expand`]) and phased ([`resolve_level`]) paths stay identical.
+async fn score_answered(
+    score_base: Option<&Context>,
+    branch_ctx: &Context,
+    path: &[String],
+    answer: &str,
+    model: &Model,
+    is_final_level: bool,
+) -> ScoreResult {
+    let (replay_path, replay_answer) = score_replay_plan(score_base.is_some(), is_final_level);
+    let base = score_base.unwrap_or(branch_ctx);
+    let path: &[String] = if replay_path { path } else { &[] };
+    let answer = replay_answer.then_some(answer);
+    score_node(base, path, answer, model, is_final_level).await
+}
+
+/// Value evaluator: rate the candidate answer in a REASONING-FREE context and
+/// run a VERIFICATION rating (#555/#661).
 ///
 /// `base` is a fork of the original conversation root (the reasoning-free,
 /// control-turn-free `synth_base` the final synthesis also grounds on), NOT the
@@ -1800,12 +1904,27 @@ async fn expand(
 /// the candidate's own rationalization and let the verbose prior trace push the
 /// worked check past `SCORE_MAX_TOKENS` before a `SCORE:` line, returning
 /// `Unparseable`/`nil` and collapsing final-level beam selection to
-/// deterministic-first (#661, insight:509). Scoring `(question, clean answer)`
-/// in a fresh context makes the value head independent — it sees only what the
-/// beam sees (the clean answer, never the thought trace — #437) — and keeps the
-/// budget ample, so final-level scoring stays discriminative. The candidate is
-/// replayed as a single `assistant` turn so the prompt's "the latest assistant
-/// reply" stays literally true.
+/// deterministic-first (#661, insight:509). Scoring against a fresh context
+/// makes the value head independent — it sees only what the beam sees (clean
+/// answers, never the thought trace — #437) — and keeps the budget ample, so
+/// final-level scoring stays discriminative.
+///
+/// Replays a valid alternating conversation: each `path` step (the reasoning-
+/// free chain of ancestor answers, INTERMEDIATE only — #661 F2) then the
+/// candidate `answer` as the latest assistant reply, separated by
+/// [`PATH_REPLAY_CUE`] so consecutive replies stay distinct user/assistant
+/// turns. `path` is empty for the FINAL level — judged purely on
+/// `(question, answer)` — and the candidate is `None` only on the degraded
+/// branch-context fallback (where the answer is already in `base`'s KV), so
+/// nothing is replayed and no duplicate assistant turn can form (#661 F1).
+///
+/// TRADE-OFF (intermediate, #661 F2): the path is the chain of clean ancestor
+/// answers, NOT the verbose branch context. The `<think>` traces that caused
+/// the bias/budget blowup are gone, and "repeats an earlier step" is anchored
+/// on the same clean answers the beam ranks; but the model's original hidden
+/// reasoning for those steps is not shown to the scorer (by design — that is
+/// the bug this fixes). Intermediate beam pruning is measured before/after in
+/// the PR to confirm no regression.
 ///
 /// The scorer re-solves the question and recomputes the arithmetic/logic as
 /// visible text, then ends with a `SCORE: N` verdict line. It runs `/no_think`
@@ -1819,7 +1938,8 @@ async fn expand(
 /// unparseable score — see [`ScoreOutcome`].
 async fn score_node(
     base: &Context,
-    answer: &str,
+    path: &[String],
+    answer: Option<&str>,
     model: &Model,
     is_final_level: bool,
 ) -> ScoreResult {
@@ -1832,7 +1952,18 @@ async fn score_node(
             };
         }
     };
-    sctx.assistant(answer);
+    // Replay the reasoning-free conversation: prior steps (intermediate) then
+    // the candidate as the latest assistant reply, alternating with a cue so
+    // consecutive replies stay valid turns. An empty chain (degraded fallback)
+    // adds nothing and the branch context is scored as-is.
+    let mut replayed = 0usize;
+    for step in path.iter().map(String::as_str).chain(answer) {
+        if replayed > 0 {
+            sctx.user(PATH_REPLAY_CUE);
+        }
+        sctx.assistant(step);
+        replayed += 1;
+    }
     sctx.user(&with_thinking(score_prompt(is_final_level), false));
     cue_generation(&mut sctx, model, true);
     let stops = chat::stop_tokens(model);
@@ -3455,6 +3586,68 @@ mod tests {
         let out = finalize(flat, &last, 1);
         assert!(out.selected_node_id.is_none());
         assert!(out.final_answer.is_none());
+    }
+
+    // ── #661 F2: reasoning-free intermediate scoring path ──────────────────
+    fn pathed_node(id: &str, parent: &str, depth: usize, content: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            parent_id: Some(parent.to_string()),
+            depth,
+            branch_index: Some(0),
+            content: content.to_string(),
+            reasoning: String::new(),
+            score: None,
+            status: NodeStatus::Ok,
+            error: None,
+            score_error: None,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn clean_answer_path_walks_root_to_node_oldest_first() {
+        let flat = vec![
+            Node::root(),
+            pathed_node("a", "root", 1, "step one"),
+            pathed_node("b", "a", 2, "step two"),
+            pathed_node("c", "b", 3, "step three"),
+        ];
+        // Path to the level-2 parent "b" = its ancestors' clean answers, root→b.
+        assert_eq!(clean_answer_path(&flat, "b"), vec!["step one", "step two"]);
+        // The synthetic root has no content → a level-1 node sees no prior step.
+        assert_eq!(clean_answer_path(&flat, "root"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn clean_answer_path_skips_empty_nodes_and_strips_think() {
+        let flat = vec![
+            Node::root(),
+            pathed_node("a", "root", 1, ""), // Error/Incomplete: no answer
+            pathed_node("b", "a", 2, "<think>\n\nclean tail"), // leaked tag stripped
+        ];
+        assert_eq!(clean_answer_path(&flat, "b"), vec!["clean tail"]);
+    }
+
+    #[test]
+    fn score_replay_plan_clean_base_final_replays_answer_only() {
+        // Final level judged on (question, answer): replay the answer, no path.
+        assert_eq!(score_replay_plan(true, true), (false, true));
+    }
+
+    #[test]
+    fn score_replay_plan_clean_base_intermediate_replays_path_and_answer() {
+        // Intermediate node anchors "repeats an earlier step": replay both.
+        assert_eq!(score_replay_plan(true, false), (true, true));
+    }
+
+    #[test]
+    fn score_replay_plan_degraded_fallback_replays_nothing() {
+        // #661 F1: no clean root → the answered branch ctx is scored as-is,
+        // replaying neither path nor answer, so no duplicate assistant turn
+        // can form on the context that already ends with the answered turn.
+        assert_eq!(score_replay_plan(false, false), (false, false));
+        assert_eq!(score_replay_plan(false, true), (false, false));
     }
 
     #[test]
