@@ -1097,8 +1097,16 @@ pub async fn run(
         // streaming). `results` is
         // in `metas` order regardless (join_all and the sequential loop both
         // preserve it), so the tree shape is identical across strategies.
-        let results: Vec<(Context, NodeOutcome)> =
-            resolve_level(&metas, ctxs, params, model, emitter.as_deref_mut(), level).await;
+        let results: Vec<(Context, NodeOutcome)> = resolve_level(
+            &metas,
+            ctxs,
+            params,
+            model,
+            emitter.as_deref_mut(),
+            synth_base.as_ref(),
+            level,
+        )
+        .await;
 
         // Pair each expansion with its meta: keep the moved-back context as
         // a potential survivor, and hand the Context-free outcome to the
@@ -1418,6 +1426,7 @@ async fn resolve_level(
     params: &TotParams,
     model: &Model,
     emitter: Option<&mut Emitter>,
+    score_base: Option<&Context>,
     level: usize,
 ) -> Vec<(Context, NodeOutcome)> {
     let concurrent_gen = params.exec.concurrent_gen();
@@ -1457,7 +1466,15 @@ async fn resolve_level(
         let scores: Vec<Option<ScoreResult>> =
             join_all(gens.iter().map(|(ctx, demux)| async move {
                 if matches!(demux.kind, DemuxKind::Answered) {
-                    Some(score_node(ctx, model, level == params.depth).await)
+                    Some(
+                        score_node(
+                            score_base.unwrap_or(ctx),
+                            &demux.answer,
+                            model,
+                            level == params.depth,
+                        )
+                        .await,
+                    )
                 } else {
                     None
                 }
@@ -1474,16 +1491,14 @@ async fn resolve_level(
         // concurrency (the pre-#458 shape; benchmark baseline / overlap
         // variant).
         if concurrent_gen {
-            join_all(
-                ctxs.into_iter()
-                    .zip(metas.iter())
-                    .map(|(c, m)| expand(c, model, params, sink, &m.0, &m.1, level, m.2)),
-            )
+            join_all(ctxs.into_iter().zip(metas.iter()).map(|(c, m)| {
+                expand(c, model, params, sink, score_base, &m.0, &m.1, level, m.2)
+            }))
             .await
         } else {
             let mut out = Vec::with_capacity(ctxs.len());
             for (c, m) in ctxs.into_iter().zip(metas.iter()) {
-                out.push(expand(c, model, params, sink, &m.0, &m.1, level, m.2).await);
+                out.push(expand(c, model, params, sink, score_base, &m.0, &m.1, level, m.2).await);
             }
             out
         }
@@ -1739,13 +1754,18 @@ fn classify(demux: Demux, score: Option<ScoreResult>) -> NodeOutcome {
 
 /// Generate then value-score one forked context in a single future (coupled
 /// scoring). The context is moved back out paired with a Context-free
-/// [`NodeOutcome`]. Only an `Answered` node is scored.
+/// [`NodeOutcome`]. Only an `Answered` node is scored, and it is scored in a
+/// reasoning-free fork of `score_base` (the conversation root), NOT the branch
+/// context — see [`score_node`] (#661). `score_base` is `None` only when the
+/// root fork failed at search start (synthesis is skipped too); the scorer then
+/// degrades to the branch context so a node still gets a value.
 #[allow(clippy::too_many_arguments)]
 async fn expand(
     ctx: Context,
     model: &Model,
     params: &TotParams,
     sink: Option<BranchSink<'_, '_>>,
+    score_base: Option<&Context>,
     node_id: &str,
     parent_id: &str,
     level: usize,
@@ -1754,16 +1774,41 @@ async fn expand(
     let (ctx, demux) =
         generate_branch(ctx, model, params, sink, node_id, parent_id, level, branch_index).await;
     let score = if matches!(demux.kind, DemuxKind::Answered) {
-        Some(score_node(&ctx, model, level == params.depth).await)
+        Some(
+            score_node(
+                score_base.unwrap_or(&ctx),
+                &demux.answer,
+                model,
+                level == params.depth,
+            )
+            .await,
+        )
     } else {
         None
     };
     (ctx, classify(demux, score))
 }
 
-/// Value evaluator: fork the answered context and run a VERIFICATION rating
-/// (#555). The scorer re-solves the question and recomputes the arithmetic/logic
-/// as visible text, then ends with a `SCORE: N` verdict line. It runs `/no_think`
+/// Value evaluator: rate the candidate `answer` in a REASONING-FREE context
+/// and run a VERIFICATION rating (#555/#661).
+///
+/// `base` is a fork of the original conversation root (the reasoning-free,
+/// control-turn-free `synth_base` the final synthesis also grounds on), NOT the
+/// answered branch context. Once final-depth nodes reason (#649) the branch
+/// context carries a long `<think>` block (plus every ancestor's reasoning and
+/// the ToT option/directive control turns); forking it primed the scorer with
+/// the candidate's own rationalization and let the verbose prior trace push the
+/// worked check past `SCORE_MAX_TOKENS` before a `SCORE:` line, returning
+/// `Unparseable`/`nil` and collapsing final-level beam selection to
+/// deterministic-first (#661, insight:509). Scoring `(question, clean answer)`
+/// in a fresh context makes the value head independent — it sees only what the
+/// beam sees (the clean answer, never the thought trace — #437) — and keeps the
+/// budget ample, so final-level scoring stays discriminative. The candidate is
+/// replayed as a single `assistant` turn so the prompt's "the latest assistant
+/// reply" stays literally true.
+///
+/// The scorer re-solves the question and recomputes the arithmetic/logic as
+/// visible text, then ends with a `SCORE: N` verdict line. It runs `/no_think`
 /// (NOT the node `thinking` knob) so the recomputation is plain visible text
 /// rather than a hidden block that could blow the budget. Unlike node generation
 /// this does NOT demux: it reads the raw text and lets [`parse_score`] anchor on
@@ -1772,8 +1817,13 @@ async fn expand(
 /// case the content-channel gate would drop. The three outcomes stay distinct
 /// so an infra failure (fork/generate) is not mistaken for a benign
 /// unparseable score — see [`ScoreOutcome`].
-async fn score_node(ctx: &Context, model: &Model, is_final_level: bool) -> ScoreResult {
-    let mut sctx = match ctx.fork() {
+async fn score_node(
+    base: &Context,
+    answer: &str,
+    model: &Model,
+    is_final_level: bool,
+) -> ScoreResult {
+    let mut sctx = match base.fork() {
         Ok(c) => c,
         Err(e) => {
             return ScoreResult {
@@ -1782,6 +1832,7 @@ async fn score_node(ctx: &Context, model: &Model, is_final_level: bool) -> Score
             };
         }
     };
+    sctx.assistant(answer);
     sctx.user(&with_thinking(score_prompt(is_final_level), false));
     cue_generation(&mut sctx, model, true);
     let stops = chat::stop_tokens(model);
