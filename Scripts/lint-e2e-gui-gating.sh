@@ -95,6 +95,13 @@ fi
 # that is (a) OUTSIDE quotes and (b) at a comment boundary (line start, or
 # preceded by whitespace). A `#` inside a quoted string is kept verbatim.
 #
+# The same walk also NEUTRALISES a `;`/`&`/`|` that sits INSIDE a quoted string
+# (replacing it with a space): such a char is string data, not a command
+# separator, so CMD_ANCHOR must not treat it as a command boundary. Without this
+# a gate token named inside `echo "…; e2e_require_tcc"` (or, with CMD_KW,
+# `echo "…; then e2e_require_tcc"`) would anchor off the in-string separator and
+# be mis-counted as a real CALL — the exact false-green this guard exists to stop.
+#
 # A blind `sed 's/[[:space:]]+#.*//'` cut is wrong here: it would truncate at the
 # first whitespace-preceded `#` regardless of quoting, so a line like
 #   [ "$x" = "a # b" ] && [ "$PIE_TEST_TCC_GRANTED" = 1 ]
@@ -119,6 +126,9 @@ code_lines() {
         else if (c=="#" && s==0 && d==0) {
           p=(i==1)?"":substr($0,i-1,1);
           if (i==1 || p==" " || p=="\t") break;
+        }
+        else if ((c==";" || c=="&" || c=="|") && (s==1 || d==1)) {
+          res=res " "; continue;   # in-quote separator → not a command boundary
         }
         res=res c;
       }
@@ -149,9 +159,10 @@ GUI_WRAPPER_RE='RatioThinkGUITests|e2e_run_gui_xcodebuild'
 # command position. The optional keyword/negation tail (CMD_KW) accepts that form
 # so an if/!-guarded gate call is recognised; without it the positive rule would
 # false-fail a wrapper that is in fact correctly gated (#692). The tail sits AFTER
-# the line-start/separator base, so it does NOT reopen the mention hole the anchor
-# closed: a gate token inside `echo "…"` or a `[ "$x" = "…" ]` test string has no
-# leading command boundary before its in-string keyword/token, so it still fails.
+# the line-start/separator base, so a gate token inside a string is still rejected:
+# code_lines() neutralises in-quote `;`/`&`/`|` separators (and strips `#`), so an
+# in-string mention — bare `echo "…; e2e_require_tcc"` OR keyword-bridged
+# `echo "…; then e2e_require_tcc"` — has no command boundary left to anchor off.
 CMD_KW='((if|elif|while|until|then|do|else)[[:space:]]+)?(![[:space:]]+)?'
 CMD_ANCHOR="(^[[:space:]]*|[;&|][[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*)${CMD_KW}"
 SOURCE_CALL_RE="${CMD_ANCHOR}(source|\.)[[:space:]]+[^#]*Scripts/e2e-prep\.sh"

@@ -316,4 +316,32 @@ write_wrapper "run-chat-gui-e2e.sh" "$GUI_SOURCE" \
   "$GUI_DRIVE"
 run "if/!-form gate tokens inside a test-bracket string still fail (FC3)" FAIL
 
+# 24. #692 F1: a GUI wrapper that sources prep + drives the suite but NEVER calls
+#     either gate — both names appear only inside a string that carries an
+#     in-string `;` separator immediately before a keyword
+#     (`echo "…; then e2e_require_seated_gui; then e2e_require_tcc…"`). code_lines()
+#     strips `#` but the base CMD_ANCHOR otherwise matches an in-string `;`, and the
+#     CMD_KW keyword tail would bridge that separator to the token — mis-counting a
+#     string mention as a real CALL. The separator-neutralising code_lines() must
+#     reject it → FAIL. This is the in-string twin of scenario 22 (same tokens,
+#     same `then` keyword): the only difference is command-position vs inside a
+#     string, so it is the mutation proof that the anchor keys on position. Reverting
+#     the in-quote separator neutralisation false-greens this fixture (rc=0).
+reset_fixture
+write_wrapper "run-chat-gui-e2e.sh" "$GUI_SOURCE" \
+  'echo "would run; then e2e_require_seated_gui; then e2e_require_tcc to gate"' \
+  "$GUI_DRIVE"
+run "separator+keyword in-string gate mention still fails (F1)" FAIL
+
+# 25. #692 F1 (pre-existing bare-`;` hole, now closed): the same string mention
+#     WITHOUT a bridging keyword — gate names sit right after an in-string `;`
+#     (`echo "…;e2e_require_seated_gui …;e2e_require_tcc…"`). The base anchor alone
+#     (no CMD_KW) already matched this in-string separator before #692; the
+#     separator-neutralising code_lines() closes it too → FAIL.
+reset_fixture
+write_wrapper "run-chat-gui-e2e.sh" "$GUI_SOURCE" \
+  'echo "first run;e2e_require_seated_gui then;e2e_require_tcc done"' \
+  "$GUI_DRIVE"
+run "bare-; in-string gate mention still fails (pre-existing hole closed)" FAIL
+
 echo "lint-e2e-gui-gating self-test: all scenarios pass"
