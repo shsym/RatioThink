@@ -78,9 +78,11 @@ pub const DEFAULT_THINKING: bool = true;
 /// optional execution hint, not a wire contract. The variants exist to
 /// benchmark the two axes on one warm engine (`tot_bench.py`).
 ///
-/// On the **streaming** path generation is always sequential regardless of
-/// this knob (a single SSE emitter cannot be shared across concurrent branch
-/// futures, so node deltas would have no exclusive writer).
+/// Since #650 this knob governs the **streaming** path too: the SSE emitter is
+/// shared across the concurrent branch futures behind an async mutex
+/// (`stream::BranchSink`), so siblings co-batch while their id-tagged node
+/// deltas interleave on the one stream — `CoupledConcurrent` is no longer
+/// forced down to sequential when streaming.
 ///
 /// ## Why the default is `CoupledConcurrent` (#465, RE-MEASURED)
 ///
@@ -147,8 +149,10 @@ pub enum ExecStrategy {
 }
 
 impl ExecStrategy {
-    /// Whether sibling generation runs concurrently (engine-batched). The
-    /// streaming path forces this false regardless (see [`ExecStrategy`]).
+    /// Whether sibling generation runs concurrently (engine-batched). Since
+    /// #650 this governs the streaming path too — the SSE emitter is shared
+    /// across the concurrent branch futures (see [`ExecStrategy`]), so it is no
+    /// longer forced false when streaming.
     pub fn concurrent_gen(self) -> bool {
         matches!(self, Self::PhasedConcurrent | Self::CoupledConcurrent)
     }
