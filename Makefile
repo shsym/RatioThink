@@ -635,6 +635,9 @@ test-gui-helper-recovery: genproject $(LOGDIR) ## GUI area: #496 helper unreacha
 test-gui-chat-switch: genproject $(LOGDIR) ## GUI area: #530 rapid chat-switching main-thread responsiveness guard — seeded long transcripts + stall watchdog (S530)
 	$(call gui_suite_run,chat-switch,-only-testing:RatioThinkGUITests/S530_RapidChatSwitchGUITests)
 
+test-gui-local-api: genproject $(LOGDIR) ## GUI area: #654/#663 Local API panel — seeded profile tabs + streaming toggle, same-model switch keeps engine and per-profile 'Running' badge (S654)
+	$(call gui_suite_run,local-api,-only-testing:RatioThinkGUITests/S654_LocalAPIPanelGUITests)
+
 # --- E2E wrappers by product area ------------------------------------------
 # Operator-gated (seated session + TCC; real engine/model or deterministic
 # harness). Each wrapper fails loud with an exact fix command when a human

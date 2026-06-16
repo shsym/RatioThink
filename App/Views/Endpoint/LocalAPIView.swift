@@ -89,7 +89,10 @@ struct LocalAPIView: View {
   }
 
   private var profileOptions: [LocalAPIProfileOption] {
-    LocalAPIProfileOption.make(entries: profileStore.entries, runtimeProfileID: runtimeProfileID)
+    LocalAPIProfileOption.make(
+      entries: profileStore.entries,
+      runtimeProfileID: runtimeProfileID,
+      runtimeServedModelID: runtimeServedModelID)
   }
 
   private var selectedOrActiveProfileID: String? {
@@ -316,7 +319,7 @@ struct LocalAPIView: View {
             Text(selected.modelDisplayName)
               .font(.system(.body, design: .monospaced))
               .lineLimit(1)
-            if selected.isRuntimeProfile {
+            if selected.isServedLive {
               Text("Running")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.green)
