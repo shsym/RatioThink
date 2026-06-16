@@ -295,8 +295,14 @@ async def _bench_dataset(http_c, base, key, records, total, failures) -> dict:
         p2 = await _stream_run(http_c, base, prompt, think, PROFILES["plain"]) if idx == 0 else None
         n1 = await _stream_run(http_c, base, prompt, think, PROFILES["ngram"])
 
-        b._check_run("plain", f"{key}[{idx}]", p1, failures)
-        b._check_run("ngram", f"{key}[{idx}]", n1, failures)
+        # Stash each run's contract verdict so cell() aggregates only over
+        # HEALTHY runs. A degraded run can still ride a 200 (a mid-stream
+        # `event:error` SSE frame, an empty decode, renamed/missing spec keys),
+        # so gating the cell on `status==200 and spec_metrics` would fold its
+        # zeros into alpha/tok-s/histograms. `_check_run` already made that call
+        # — reuse its verdict instead of re-deriving a weaker one.
+        p1["_check_ok"] = b._check_run("plain", f"{key}[{idx}]", p1, failures)
+        n1["_check_ok"] = b._check_run("ngram", f"{key}[{idx}]", n1, failures)
         plain_runs.append(p1)
         ngram_runs.append(n1)
 
@@ -325,7 +331,10 @@ async def _bench_dataset(http_c, base, key, records, total, failures) -> dict:
             )
 
     def cell(runs: list[dict], label: str) -> dict:
-        ok = [r for r in runs if r.get("status") == 200 and r.get("spec_metrics")]
+        # `_check_ok` is the `_check_run` verdict (set in the loop above): True
+        # only for runs that passed every contract check, so a degraded-but-200
+        # run never reaches the aggregates. It implies a non-None spec_metrics.
+        ok = [r for r in runs if r.get("_check_ok")]
         sms = [r["spec_metrics"] for r in ok]
         proposed = sum(s.get("proposed_draft_tokens", 0) for s in sms)
         accepted = sum(s.get("accepted_draft_tokens", 0) for s in sms)
