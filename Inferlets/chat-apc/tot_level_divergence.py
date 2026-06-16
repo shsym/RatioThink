@@ -92,24 +92,6 @@ def _group_metrics(answers: list[str]) -> dict | None:
     }
 
 
-def _sibling_groups(node: dict) -> list[list[str]]:
-    """Walk the tree; for every parent, collect its ok children's answers as
-    one sibling group, recursing into all children. A group = the `breadth`
-    forks of one parent."""
-    groups: list[list[str]] = []
-    children = node.get("children") or []
-    ok_answers = [
-        (c.get("content") or "").strip()
-        for c in children
-        if c.get("status") == "ok"
-    ]
-    if ok_answers:
-        groups.append(ok_answers)
-    for c in children:
-        groups.extend(_sibling_groups(c))
-    return groups
-
-
 def _groups_by_level(root: dict) -> dict[int, list[list[str]]]:
     """Map child-depth → list of sibling groups at that level. A group's level
     is its members' depth (parent.depth + 1)."""
