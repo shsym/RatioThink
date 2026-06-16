@@ -162,10 +162,12 @@ final class PieControlLauncherConfigTests: XCTestCase {
                    "no draft → no cpu draft block; got:\n\(body)")
   }
 
-  func test_draftModelConfig_emits_second_model_block_with_disjoint_cpu_device() {
-    // The pair: target on Metal, draft on CPU. pie's config validation
-    // bails when two [[model]] blocks share a device string, so the draft
-    // must be disjoint — the default "cpu" is honestly disjoint from "metal".
+  func test_draftModelConfig_emits_second_model_block_with_disjoint_gpu_device() {
+    // The curated pair: target on Metal, draft co-resident on the GPU. pie's
+    // config validation bails when two [[model]] blocks share a device
+    // string, so the draft must be disjoint — the default "gpu" is distinct
+    // from "metal" yet both bind the same Metal GPU via the portable driver's
+    // ggml_backend_init_best() (proven on a real paired boot).
     let body = PieControlLauncher.renderConfigBody(
       modelConfig: .portableResolved(servedModelID: "Qwen/Qwen3-8B", modelRef: "/m/target.gguf"),
       draftModelConfig: .init(servedModelID: "Qwen/Qwen3-0.6B", modelRef: "/m/draft.gguf")
@@ -180,7 +182,8 @@ final class PieControlLauncherConfigTests: XCTestCase {
     XCTAssertTrue(body.contains("name = \"Qwen/Qwen3-0.6B\""), "got:\n\(body)")
     XCTAssertTrue(body.contains("hf_repo = \"/m/draft.gguf\""), "got:\n\(body)")
     XCTAssertTrue(body.contains("device = [\"metal\"]"), "target stays on Metal; got:\n\(body)")
-    XCTAssertTrue(body.contains("device = [\"cpu\"]"), "draft defaults to the disjoint CPU device; got:\n\(body)")
+    XCTAssertTrue(body.contains("device = [\"gpu\"]"), "draft defaults to the disjoint GPU device; got:\n\(body)")
+    XCTAssertFalse(body.contains("device = [\"cpu\"]"), "the curated default keeps the draft on the GPU, not CPU; got:\n\(body)")
     // The target's block must precede the draft's (the first [[model]] is
     // pie's implicit default for inferlets that don't pin a model).
     let targetIdx = body.range(of: "name = \"Qwen/Qwen3-8B\"")!.lowerBound
@@ -188,16 +191,16 @@ final class PieControlLauncherConfigTests: XCTestCase {
     XCTAssertLessThan(targetIdx, draftIdx, "target [[model]] must come first; got:\n\(body)")
   }
 
-  func test_draftModelConfig_honors_custom_gpu_device_string() {
-    // A distinct non-"cpu" string co-resides both models on the GPU: the
-    // portable driver maps anything ≠ "cpu" to ggml_backend_init_best().
+  func test_draftModelConfig_honors_custom_cpu_device_override() {
+    // The default is "gpu"; an explicit "cpu" override runs the draft
+    // off-GPU (still disjoint from the target's "metal").
     let body = PieControlLauncher.renderConfigBody(
       modelConfig: .portableResolved(servedModelID: "target", modelRef: "/m/t.gguf"),
-      draftModelConfig: .init(servedModelID: "draft", modelRef: "/m/d.gguf", device: "gpu")
+      draftModelConfig: .init(servedModelID: "draft", modelRef: "/m/d.gguf", device: "cpu")
     )
     XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
-    XCTAssertTrue(body.contains("device = [\"gpu\"]"), "custom draft device must be honored; got:\n\(body)")
-    XCTAssertFalse(body.contains("device = [\"cpu\"]"), "explicit gpu device must override the cpu default; got:\n\(body)")
+    XCTAssertTrue(body.contains("device = [\"cpu\"]"), "explicit cpu override must be honored; got:\n\(body)")
+    XCTAssertFalse(body.contains("device = [\"gpu\"]"), "an explicit cpu override must replace the gpu default; got:\n\(body)")
   }
 
   func test_draftModelConfig_pairs_with_metal_target() {

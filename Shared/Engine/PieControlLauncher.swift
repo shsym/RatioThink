@@ -226,14 +226,16 @@ public enum PieControlLauncher {
   ///
   /// `device` MUST be disjoint from the target's `"metal"`: pie's config
   /// validation bails when two `[[model]]` blocks claim the same device
-  /// string (`server/src/config.rs` "disjoint device check"). The default
-  /// `"cpu"` is honestly disjoint and, on Apple-Silicon unified memory,
-  /// places draft compute on the CPU while the target verifies on the GPU —
-  /// both weight sets still draw on the one unified-memory budget that
-  /// `ModelMemoryGuardrail` sums. Any non-`"cpu"` string resolves to the
-  /// best GPU via the portable driver's `ggml_backend_init_best()`
-  /// (`driver/portable/src/model.cpp`), so a distinct GPU label co-resides
-  /// both models on Metal when measured to be faster.
+  /// string (`server/src/config.rs` "disjoint device check" — the strings
+  /// are compared for overlap, not whitelisted to a fixed device set, so any
+  /// distinct label is accepted). The default `"gpu"` co-resides BOTH models
+  /// on the Metal GPU in one engine (the curated design): the portable
+  /// driver routes every non-`"cpu"` string to `ggml_backend_init_best()`
+  /// (`driver/portable/src/model.cpp`), so `"gpu"` and `"metal"` both bind
+  /// the same Apple-Silicon GPU — verified on a real Qwen3-4B + Qwen3-0.6B
+  /// paired boot (both `backend=Apple M4 Pro`). Pass `"cpu"` instead to run
+  /// the draft off-GPU; either way both weight sets draw on the one
+  /// unified-memory budget that `ModelMemoryGuardrail` sums.
   public struct DraftModelSpec: Sendable, Equatable {
     /// The id the engine advertises for the draft on `/v1/models` and the
     /// inferlet loads via `Model::load`. Must differ from the target's id
@@ -242,9 +244,10 @@ public enum PieControlLauncher {
     /// Resolved on-disk path / HF repo for the draft's `hf_repo`.
     public var modelRef: String
     /// Driver device string — must differ from the target's `"metal"`.
+    /// Defaults to `"gpu"` (co-resident on Metal); use `"cpu"` for off-GPU.
     public var device: String
 
-    public init(servedModelID: String, modelRef: String, device: String = "cpu") {
+    public init(servedModelID: String, modelRef: String, device: String = "gpu") {
       self.servedModelID = servedModelID
       self.modelRef = modelRef
       self.device = device
