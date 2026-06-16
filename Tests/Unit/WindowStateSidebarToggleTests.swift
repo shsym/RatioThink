@@ -45,23 +45,21 @@ final class WindowStateSidebarToggleTests: XCTestCase {
                    "Hide after a native-control show must actually hide, not no-op")
   }
 
-  /// Mirror of the menu-label expression at `RatioThinkApp.swift:674`. Kept in
-  /// lockstep with production: the command labels the sidebar action by the same
-  /// single-hidden-state predicate the toggle uses.
-  private func sidebarMenuLabel(for visibility: NavigationSplitViewVisibility) -> String {
-    visibility == .detailOnly ? "Show Sidebar" : "Hide Sidebar"
-  }
-
-  /// The menu label must read "Show Sidebar" exactly when the sidebar is hidden
-  /// and "Hide Sidebar" for every visible state — `.all`, `.doubleColumn`, and
-  /// `.automatic` alike — so it never mis-reads after the native control leaves
-  /// the binding at `.doubleColumn`.
-  func test_menu_label_matches_actual_visibility() {
+  /// The menu command at `RatioThinkApp.swift` renders `WindowState`'s own
+  /// `sidebarToggleTitle`, so assert on that production property directly — not a
+  /// re-implemented mirror. It must read "Show Sidebar" exactly when the sidebar
+  /// is hidden (`.detailOnly`) and "Hide Sidebar" for every visible state —
+  /// `.all`, `.doubleColumn`, and `.automatic` alike — so it never mis-reads
+  /// after the native control leaves the binding at `.doubleColumn`. Reverting
+  /// the production predicate to `== .all` flips the label for `.doubleColumn`
+  /// and `.automatic`, failing this test (#685).
+  func test_sidebarToggleTitle_matches_actual_visibility() {
+    let state = WindowState()
     for visibility in Self.allVisibilities {
-      let sidebarHidden = (visibility == .detailOnly)
-      let expected = sidebarHidden ? "Show Sidebar" : "Hide Sidebar"
-      XCTAssertEqual(sidebarMenuLabel(for: visibility), expected,
-                     "menu label must match actual visibility for \(visibility)")
+      state.columnVisibility = visibility
+      let expected = (visibility == .detailOnly) ? "Show Sidebar" : "Hide Sidebar"
+      XCTAssertEqual(state.sidebarToggleTitle, expected,
+                     "sidebarToggleTitle must match actual visibility for \(visibility)")
     }
   }
 }

@@ -64,15 +64,29 @@ final class WindowState: ObservableObject {
     return true
   }
 
+  /// The single source of truth for "is the sidebar hidden?" in this two-column
+  /// split view. The sidebar is hidden only when collapsed to the detail column
+  /// (`.detailOnly`); every other visibility — `.all`, `.doubleColumn`,
+  /// `.automatic` — shows it. The system-injected sidebar-toggle control writes
+  /// `.doubleColumn` (not `.all`) back through this binding when it shows the
+  /// sidebar in a 2-column view, so the predicate keys on the single hidden
+  /// state, not on one visible value (#677).
+  var isSidebarHidden: Bool {
+    columnVisibility == .detailOnly
+  }
+
+  /// Menu-command label for the sidebar toggle, driven by `columnVisibility`.
+  /// Production (`RatioThinkApp` `.sidebar` command group) and the regression
+  /// test both render this one property, so the label and the toggle can never
+  /// drift apart (#685).
+  var sidebarToggleTitle: String {
+    isSidebarHidden ? "Show Sidebar" : "Hide Sidebar"
+  }
+
   func toggleSidebar() {
-    // Two-column split view: the sidebar is hidden by collapsing to the detail
-    // column only (`.detailOnly`). Every other visibility — `.all`,
-    // `.doubleColumn`, `.automatic` — shows the sidebar, so key the predicate on
-    // the single hidden state. The system-injected sidebar-toggle control writes
-    // `.doubleColumn` (not `.all`) back through this binding when it shows the
-    // sidebar in a 2-column view; keying on `== .all` would miss that and make
-    // the next Hide a no-op (#677).
-    columnVisibility = (columnVisibility == .detailOnly) ? .all : .detailOnly
+    // Keying on `== .all` would miss `.doubleColumn`/`.automatic` and make the
+    // next Hide a no-op, so toggle off the single hidden state (#677).
+    columnVisibility = isSidebarHidden ? .all : .detailOnly
   }
 
   func toggleItemList() {
