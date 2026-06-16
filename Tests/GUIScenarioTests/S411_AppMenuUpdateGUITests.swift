@@ -12,6 +12,7 @@ import XCTest
 ///
 /// No engine or model is needed: the menu shell renders from the completed
 /// first-launch state alone. Skips without a seated GUI session.
+// gui-suite: full-matrix-only: no product-area focused target; runs in the full `make test-gui` matrix.
 final class S411_AppMenuUpdateGUITests: XCTestCase {
   override func setUp() async throws {
     try guardSeatedGUI()

@@ -15,6 +15,7 @@ import XCTest
 /// `NSWorkspace.open([url], withApplicationAt: <the running app's bundle>)` —
 /// so it exercises the real LaunchServices delivery path into the app under
 /// test, then asserts a NEW Settings window appears and is frontmost.
+// gui-suite: full-matrix-only: no product-area focused target; runs in the full `make test-gui` matrix.
 final class S420_SettingsDeepLinkGUITests: XCTestCase {
   /// The wire contract the Helper produces. Hard-coded (not imported from
   /// `SettingsDeepLink`) because a UI-test target does not link the app module;

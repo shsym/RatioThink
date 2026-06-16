@@ -174,7 +174,33 @@ focused targets are `-only-testing` slices of it. A few suites have **no**
 focused target and run only in the full matrix: `S326` (fresh-install
 download), `S327` (engine-status pip), `S218`
 (download cancel confirm), `S411` (app menu update), `S421` (sampling
-popover), `S420` (settings deep link), `S527` (pinned-resident mismatch).
+popover), `S420` (settings deep link), `S527` (pinned-resident mismatch),
+`S654` (Local API panel). Each declares itself full-matrix-only with the
+in-file annotation below.
+
+#### Guard: `-only-testing` wiring vs suites on disk (#666)
+
+`make lint` runs `Scripts/lint-gui-only-testing.sh`, which keeps the focused
+wiring and the suites on disk in sync and closes the #645 trap (a renamed suite
+leaves a dangling `-only-testing:RatioThinkGUITests/<Old>` ref that `xcodebuild`
+runs as **0 tests, reported green**). It enforces two invariants:
+
+1. **No dangling ref** — every `-only-testing:RatioThinkGUITests/<Suite>` in the
+   Makefile/`Scripts/*.sh` resolves to a real `class <Suite>: XCTestCase`.
+2. **No orphan** — every suite on disk is either referenced from the focused
+   path **or** explicitly declared full-matrix-only with an in-file annotation
+   directly above its class (the reason after the final colon is required):
+
+   ```swift
+   // gui-suite: full-matrix-only: <one-line reason>
+   final class S###_FooGUITests: XCTestCase { … }
+   ```
+
+So a suite with no focused target must say so at its declaration; a rename that
+drops a suite from every focused target without the annotation fails lint
+instead of silently losing its day-to-day coverage. The guard runs in `make
+lint` (hence `make ci-pr`), and its failure modes are mutation-proven by
+`make test-lint-gui-only-testing` (also in `ci-pr`).
 
 ### Manual / visual tools (not `make` targets)
 
