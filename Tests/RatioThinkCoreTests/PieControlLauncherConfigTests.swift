@@ -485,8 +485,13 @@ final class PieControlLauncherConfigTests: XCTestCase {
   }
 
   func test_resolvedTimeout_envOverride_canExceedSizeCeiling() {
-    // The escape hatch is deliberately allowed past the 600s size ceiling so
-    // an operator can rescue a pathologically-slow boot.
+    // The escape hatch is deliberately allowed past the 600s size ceiling, but
+    // it raises ONLY the per-request/shmem budget (`request_timeout_secs`,
+    // child `PIE_SHMEM_TIMEOUT_S`). The cold-BOOT lease stays clamped at the
+    // ceiling via `bootHandshakeTimeoutSeconds` (see
+    // test_bootHandshake_staysBelowXPCDeadline_forAnyOverrideMagnitude), so an override above 600
+    // does NOT extend the pre-READY weight-load window — it only lengthens the
+    // per-request forward/generation budget once the engine is serving.
     XCTAssertGreaterThan(700, PieControlLauncher.requestTimeoutCeilingSeconds)
     XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
       modelWeightBytes: nil, environment: ["PIE_SHMEM_TIMEOUT_S": "700"]), 700)
@@ -516,6 +521,28 @@ final class PieControlLauncherConfigTests: XCTestCase {
       XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
         modelWeightBytes: 8 * Self.gib, environment: ["PIE_SHMEM_TIMEOUT_S": bad]), 240,
         "invalid override \(bad.debugDescription) must fall back to the size-aware default")
+    }
+  }
+
+  func test_rejectedTimeoutOverride_namesPresentButInvalidValueOnly() {
+    // #698 F3: the classifier the launch site uses to warn on a silently
+    // dropped override. Must mirror `resolvedRequestTimeoutSeconds`'s accept
+    // predicate EXACTLY so the warning fires iff the value was actually ignored.
+    // Present-but-invalid → returns the raw value verbatim (for the log).
+    for bad in ["abc", "", "0", "-5", "nan", "inf"] {
+      XCTAssertEqual(
+        PieControlLauncher.rejectedTimeoutOverride(environment: ["PIE_SHMEM_TIMEOUT_S": bad]),
+        bad,
+        "invalid override \(bad.debugDescription) must be reported as rejected")
+    }
+    // Absent → nil (nothing to warn about).
+    XCTAssertNil(PieControlLauncher.rejectedTimeoutOverride(environment: [:]))
+    // Valid (incl. the huge-but-finite escape-hatch values the resolver clamps
+    // rather than rejects) → nil: the override was honored, not dropped.
+    for good in ["120", "300", "700", "1e30", "99999999999999999999"] {
+      XCTAssertNil(
+        PieControlLauncher.rejectedTimeoutOverride(environment: ["PIE_SHMEM_TIMEOUT_S": good]),
+        "valid override \(good.debugDescription) must not be reported as rejected")
     }
   }
 

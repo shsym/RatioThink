@@ -208,9 +208,34 @@ public struct LaunchSpecResolver {
       // Metal prefill budget than the 120s floor. An explicit
       // PIE_SHMEM_TIMEOUT_S in the helper environment (read pre-sanitize)
       // overrides the computed default — see `resolvedRequestTimeoutSeconds`.
+      let hostEnv = ProcessInfo.processInfo.environment
       let requestTimeoutSeconds = PieControlLauncher.resolvedRequestTimeoutSeconds(
         modelWeightBytes: weightBytes,
-        environment: ProcessInfo.processInfo.environment)
+        environment: hostEnv)
+      // (#698 F3) A present-but-invalid PIE_SHMEM_TIMEOUT_S is silently dropped
+      // by the resolver, which falls back to the size-aware default. A typo'd
+      // override would otherwise leave no trace — name the rejected raw value
+      // and the budget actually applied so the operator can spot the mistake.
+      if let rejected = PieControlLauncher.rejectedTimeoutOverride(environment: hostEnv) {
+        DiagnosticLog.helper.event("engine.timeout.override-rejected", [
+          ("raw", rejected),
+          ("applied_request_timeout_secs", String(requestTimeoutSeconds)),
+        ])
+      }
+      // (#698 F5) The model resolved AND passed ModelMemoryGuardrail.validate
+      // above — validate fails CLOSED on an unmeasurable artifact — so reaching
+      // here with nil weight bytes means the file became unreadable AFTER
+      // validation (a TOCTOU race: deleted/relocated mid-launch), not a normal
+      // small model. Both nil and measured-small otherwise collapse to the 120s
+      // floor; distinguish them so an operator sees the budget was sized blind
+      // and can extend it via PIE_SHMEM_TIMEOUT_S if the model is in fact large.
+      if weightBytes == nil {
+        DiagnosticLog.helper.event("engine.timeout.weight-bytes-unmeasurable", [
+          ("model", model),
+          ("path", DiagnosticLog.redactHome(modelRef)),
+          ("applied_request_timeout_secs", String(requestTimeoutSeconds)),
+        ])
+      }
       let spec = try PieControlLauncher.LaunchSpec(
         pieBinary: binary,
         wasmURL: resources.wasm,

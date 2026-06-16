@@ -120,8 +120,7 @@ public enum PieControlLauncher {
   /// `LaunchSpec.handshakeTimeout` cold-boot lease) so they never drift.
   static func resolvedRequestTimeoutSeconds(modelWeightBytes: Int64?,
                                             environment: [String: String]) -> Int {
-    if let raw = environment[shmemTimeoutEnvKey],
-       let secs = Double(raw), secs.isFinite, secs > 0 {
+    if let secs = validTimeoutOverride(environment) {
       // Bound before converting: `Int(secs)` traps for finite values above
       // Int.max ("1e30"), which would crash the privileged helper at launch.
       let bounded = min(secs.rounded(), Double(requestTimeoutOverrideMaxSeconds))
@@ -136,6 +135,29 @@ public enum PieControlLauncher {
       + Int((headroomGiB * Double(requestTimeoutSecondsPerGiB)).rounded())
     return min(requestTimeoutCeilingSeconds,
                max(requestTimeoutFloorSeconds, scaled))
+  }
+
+  /// Parse `PIE_SHMEM_TIMEOUT_S` into a positive, finite seconds value, or
+  /// `nil` when the var is absent or fails the validity guard (non-numeric,
+  /// empty, `<= 0`, NaN, infinite). Single source of the accept predicate so
+  /// `resolvedRequestTimeoutSeconds` (which consumes the value) and
+  /// `rejectedTimeoutOverride` (which reports a silent rejection) can never
+  /// disagree about what counts as a valid override.
+  private static func validTimeoutOverride(_ environment: [String: String]) -> Double? {
+    guard let raw = environment[shmemTimeoutEnvKey],
+          let secs = Double(raw), secs.isFinite, secs > 0 else { return nil }
+    return secs
+  }
+
+  /// The raw `PIE_SHMEM_TIMEOUT_S` value when it is *present but invalid* —
+  /// the case `resolvedRequestTimeoutSeconds` silently discards before
+  /// falling back to the size-aware default — else `nil` (absent or valid).
+  /// A typo'd override (`"12O"`, `"abc"`, `"0"`) otherwise gives the operator
+  /// zero signal that it was ignored; the launch site logs this raw value
+  /// alongside the budget actually applied (#698 F3).
+  static func rejectedTimeoutOverride(environment: [String: String]) -> String? {
+    guard let raw = environment[shmemTimeoutEnvKey] else { return nil }
+    return validTimeoutOverride(environment) == nil ? raw : nil
   }
 
   /// The cold-boot handshake lease for a launch — the request/prefill timeout
@@ -740,6 +762,11 @@ public enum PieControlLauncher {
       ("pieHome", DiagnosticLog.redactHome(spec.pieHome.path)),
       ("request_timeout_secs", String(spec.requestTimeoutSeconds)),
       ("PIE_SHMEM_TIMEOUT_S", env["PIE_SHMEM_TIMEOUT_S"] ?? "?"),
+      // Clamped cold-boot lease (`bootHandshakeTimeoutSeconds`): the pre-READY
+      // weight-load window, capped at the 600s ceiling even when an operator
+      // override pushes the per-request budget above it (#698 F6). Logged next
+      // to the request/shmem timeout so the two values are diff-able in one line.
+      ("handshake_timeout_secs", String(Int(spec.handshakeTimeout))),
       ("shmem", spec.shmemName),
     ])
 
