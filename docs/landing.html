@@ -101,7 +101,7 @@
   .menu .mrow.sel .check{opacity:1}
 
   /* transcript */
-  .transcript{min-height:320px;max-height:320px;overflow:hidden;padding:16px 16px 6px;
+  .transcript{min-height:400px;max-height:400px;overflow:hidden;padding:16px 16px 6px;
     background:var(--win-bg);display:flex;flex-direction:column;gap:10px}
   .row{display:flex;max-width:100%}
   .row.user{justify-content:flex-end}
@@ -688,9 +688,9 @@
     menu.classList.remove('show');
     await sleep(360, myGen);
 
-    // Second pass: the SAME prompt, now a grammar-constrained answer that always parses.
-    // (No repeated prompt bubble here — the prose reply is tall, and the fixed-height
-    // transcript must keep the bare JSON answer in view as the contrast payoff.)
+    // Second pass: the SAME prompt re-asked, now a grammar-constrained answer that always parses.
+    userRow(d.prompt);
+    await sleep(220, myGen);
     var a2 = el('<div class="row assistant"><div class="acol"></div></div>');
     transcript.appendChild(a2);
     var ans = el('<div class="bubble json"></div>');
@@ -705,13 +705,13 @@
   }
   function stillJson(){
     clear(); setProfile(SCENARIO.json.profile, 'json');
-    // Static frame shows BOTH final states: the prose-wrapped chat reply and the
-    // bare JSON object. One prompt bubble only — the tall prose plus a repeated
-    // prompt would push the JSON answer out of the fixed-height transcript.
+    // Static frame mirrors the animated end state: prompt → prose-wrapped chat
+    // reply → prompt re-asked → bare JSON object.
     userRow(SCENARIO.json.prompt);
     var a1 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
     a1.querySelector('.bubble').textContent = SCENARIO.json.chatAnswer;
     transcript.appendChild(a1);
+    userRow(SCENARIO.json.prompt);
     var a2 = el('<div class="row assistant"><div class="acol">'+
       '<div class="bubble json">'+SCENARIO.json.answer+'</div></div></div>');
     transcript.appendChild(a2);
