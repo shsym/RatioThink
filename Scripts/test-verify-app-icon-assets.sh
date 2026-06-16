@@ -7,6 +7,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pie-app-icon-verifier-tests.XXXXXX")"
 
+# Pin the regeneration toolchain so reproducibility is checked against the same
+# Pillow the committed assets were produced with (byte-identical at 12.2.0).
+PILLOW_PIN="pillow==12.*"
+
 cleanup() {
   rm -rf "$WORK_ROOT"
 }
@@ -23,6 +27,7 @@ copy_fixture() {
   cp -R "$ROOT/Resources/Assets.xcassets" "$fixture/Resources/"
   cp "$ROOT/Scripts/genproject.sh" "$fixture/Scripts/"
   cp "$ROOT/Scripts/verify-app-icon-assets.sh" "$fixture/Scripts/"
+  cp "$ROOT/Scripts/generate-app-icon.py" "$fixture/Scripts/"
 
   # XcodeGen validates source paths when generating the project. Copy the small
   # source roots named by project.yml so the generated-project contract is
@@ -145,6 +150,43 @@ expect_failure() {
   fi
 }
 
+expect_reproducible_highres() {
+  local name="$1"
+  local fixture
+  fixture="$(prepare_clean_fixture "$name")"
+
+  command -v uv >/dev/null 2>&1 || {
+    echo "FAIL: uv is required to regenerate the app icon under a pinned Pillow" >&2
+    exit 1
+  }
+
+  local expected_sha
+  expected_sha="$(
+    awk '$2 == "Resources/AppIcon/rational-icon-highres.png" { print $1 }' \
+      "$fixture/Resources/AppIcon/manifest.sha256"
+  )"
+  [[ -n "$expected_sha" ]] || {
+    echo "FAIL: manifest.sha256 has no rational-icon-highres.png entry for $name" >&2
+    exit 1
+  }
+
+  if ! (
+    cd "$fixture"
+    uv run --no-project --with "$PILLOW_PIN" python3 Scripts/generate-app-icon.py
+  ) >"$fixture/regen.log" 2>&1; then
+    cat "$fixture/regen.log" >&2
+    echo "FAIL: generate-app-icon.py failed during reproducibility check for $name" >&2
+    exit 1
+  fi
+
+  local actual_sha
+  actual_sha="$(shasum -a 256 "$fixture/Resources/AppIcon/rational-icon-highres.png" | awk '{print $1}')"
+  [[ "$actual_sha" == "$expected_sha" ]] || {
+    echo "FAIL: regenerated rational-icon-highres.png SHA-256 $actual_sha != manifest $expected_sha for $name" >&2
+    exit 1
+  }
+}
+
 mutate_source_png() {
   append_png_text_chunk "$1/Resources/AppIcon/rational-icon-highres.png"
 }
@@ -207,6 +249,7 @@ mutate_partial_generated_project_dir() {
   mkdir -p "$1/RatioThink.xcodeproj"
 }
 
+expect_reproducible_highres "regenerate-highres-matches-manifest"
 expect_clean_success "clean-without-generated-project"
 expect_clean_failure "partial-generated-project-dir" mutate_partial_generated_project_dir
 expect_success "baseline"
