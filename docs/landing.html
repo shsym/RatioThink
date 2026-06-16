@@ -383,13 +383,14 @@
     },
     json: {
       // JSON Think contrasts the SAME extraction prompt two ways: a normal Chat
-      // reply (free-form prose you can't reliably parse) vs JSON-constrained
-      // decoding (a grammar guarantees a parseable object). `answer` carries the
-      // key/string/number highlight spans the mono bubble renders.
+      // reply that returns CORRECT JSON but buried in reasoning prose (you can't
+      // json.loads the whole reply) vs JSON-constrained decoding that returns a
+      // bare parseable object. `chatAnswer` keeps newlines (the bubble is
+      // white-space:pre-wrap); `answer` carries the .k/.s/.n highlight spans.
       profile: 'JSON Think',
-      prompt: 'Extract the product name and price as JSON: "The Aeron chair is $1,395."',
-      chatAnswer: 'Sure! The product is the Aeron chair and it costs $1,395. Want me to format that as JSON or pull anything else?',
-      answer: '{<span class="k">"name"</span>: <span class="s">"Aeron chair"</span>, <span class="k">"price"</span>: <span class="n">1395</span>}'
+      prompt: 'Extract the person\'s name, age, and city from: "Maya, 31, lives in Lisbon." Return JSON, and explain your reasoning.',
+      chatAnswer: 'Sure! Breaking it down — the name is Maya, the age is 31, and the city is Lisbon. As JSON:\n{\n  "name": "Maya",\n  "age": 31,\n  "city": "Lisbon"\n}\nThat\'s the three fields as key–value pairs.',
+      answer: '{<span class="k">"name"</span>: <span class="s">"Maya"</span>, <span class="k">"age"</span>: <span class="n">31</span>, <span class="k">"city"</span>: <span class="s">"Lisbon"</span>}'
     }
   };
 
@@ -670,7 +671,7 @@
     var d = SCENARIO.json;
     // First pass: the everyday Chat profile — a free-form reply you can't reliably parse.
     setProfile('Chat', 'chat');
-    setCaption('Ask a chat model for JSON and you get prose — wrapped, chatty, not reliably parseable.');
+    setCaption('The everyday Chat profile answers correctly — but buries the JSON in reasoning prose you\'d have to scrape out.');
     await sleep(650, myGen);
     await typeComposer(d.prompt, myGen);
     userRow(d.prompt); resetComposer();
@@ -688,13 +689,13 @@
     await sleep(360, myGen);
 
     // Second pass: the SAME prompt, now a grammar-constrained answer that always parses.
-    userRow(d.prompt);
-    await sleep(220, myGen);
+    // (No repeated prompt bubble here — the prose reply is tall, and the fixed-height
+    // transcript must keep the bare JSON answer in view as the contrast payoff.)
     var a2 = el('<div class="row assistant"><div class="acol"></div></div>');
     transcript.appendChild(a2);
     var ans = el('<div class="bubble json"></div>');
     a2.querySelector('.acol').appendChild(ans);
-    setCaption('Same prompt — now the answer is a clean JSON object, guaranteed to parse.');
+    setCaption('Same prompt — JSON Think returns one clean JSON object, no prose, parseable every time.');
     await streamJsonInto(ans, d.answer, myGen);
     await sleep(1400, myGen);
 
@@ -704,12 +705,13 @@
   }
   function stillJson(){
     clear(); setProfile(SCENARIO.json.profile, 'json');
-    // Static frame shows BOTH cases: the loose chat reply and the clean JSON.
+    // Static frame shows BOTH final states: the prose-wrapped chat reply and the
+    // bare JSON object. One prompt bubble only — the tall prose plus a repeated
+    // prompt would push the JSON answer out of the fixed-height transcript.
     userRow(SCENARIO.json.prompt);
     var a1 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
     a1.querySelector('.bubble').textContent = SCENARIO.json.chatAnswer;
     transcript.appendChild(a1);
-    userRow(SCENARIO.json.prompt);
     var a2 = el('<div class="row assistant"><div class="acol">'+
       '<div class="bubble json">'+SCENARIO.json.answer+'</div></div></div>');
     transcript.appendChild(a2);
@@ -721,7 +723,7 @@
     { run: sceneFastThink, still: stillFast,
       pausedCaption: 'Animation paused (reduced motion). Repeat Boost gives the same answer, much faster.' },
     { run: sceneJsonThink, still: stillJson,
-      pausedCaption: 'Animation paused (reduced motion). Chat returns free-form prose; JSON Think returns a clean JSON object that always parses.' }
+      pausedCaption: 'Animation paused (reduced motion). Chat buries the JSON in reasoning prose; JSON Think returns one bare, parseable object.' }
   ];
 
   // Error fallback: a clean, honest static frame (the lead Tree of Thought scene).
