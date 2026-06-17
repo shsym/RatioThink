@@ -73,11 +73,14 @@ final class BestOfNTests: XCTestCase {
     mode = "best-of-n"
     n = 4
     max_tokens_per_candidate = 320
+    thinking = false
     """
     let profile = try Profile.parse(toml: toml)
     let config = try XCTUnwrap(profile.bestOfN)
     XCTAssertEqual(config.n, 4)
     XCTAssertEqual(config.maxTokensPerCandidate, 320)
+    // An explicit `thinking = false` is honored over the ON default (#708).
+    XCTAssertFalse(config.thinking)
     // Sampling is sourced from the profile (drives candidate-generation temp).
     XCTAssertEqual(profile.bestOfNRequestSampling.temperature, 0.7)
   }
@@ -107,6 +110,7 @@ final class BestOfNTests: XCTestCase {
     let config = try XCTUnwrap(Profile.parse(toml: toml).bestOfN)
     XCTAssertEqual(config.n, 3)  // #708: default N is 3
     XCTAssertEqual(config.maxTokensPerCandidate, 256)
+    XCTAssertTrue(config.thinking)  // #708: thinking defaults ON
   }
 
   // MARK: BestOfNRound metadata

@@ -11,8 +11,16 @@ import TOMLKit
 /// `temperature` / `top_p` are NOT here — the dispatch sources them from the
 /// profile's `sampling` directly (`Profile.bestOfNRequestSampling`), so a
 /// profile's configured temperature drives candidate generation rather than
-/// the unseeded toolbar default. `thinking` is OFF for this profile (the
-/// seed omits it; the server defaults it false, #679).
+/// the unseeded toolbar default.
+///
+/// `thinking` is ON by default (#708): each candidate emits a tagged `<think>`
+/// block that `generate_demuxed` routes onto the reasoning channel, so the row
+/// renders a real `ReasoningDisclosure` (brain icon + folded "Thinking") and
+/// the answer stays clean. With it OFF the model honors `/no_think` only
+/// loosely and leaks chain-of-thought prose — untagged, so undemuxable — into
+/// the answer text. Enabling it rides the thinking-ON path that carried the
+/// #679 forward-pass starvation crash; that is gated by the SDK collect_* break
+/// + KV RAII drop-frees present in the pinned engine (verified before enabling).
 ///
 /// Default `n` is 3 (#708): three candidates read clearly side-by-side without
 /// crowding the transcript, while the engine still caps N at 5 (`MAX_N`). The
@@ -21,10 +29,12 @@ import TOMLKit
 public struct BestOfNProfileConfig: Equatable, Sendable {
   public var n: Int
   public var maxTokensPerCandidate: Int
+  public var thinking: Bool
 
-  public init(n: Int = 3, maxTokensPerCandidate: Int = 256) {
+  public init(n: Int = 3, maxTokensPerCandidate: Int = 256, thinking: Bool = true) {
     self.n = n
     self.maxTokensPerCandidate = maxTokensPerCandidate
+    self.thinking = thinking
   }
 }
 
@@ -52,7 +62,8 @@ public extension Profile {
     return BestOfNProfileConfig(
       n: intArg("n", default: defaults.n),
       maxTokensPerCandidate: intArg(
-        "max_tokens_per_candidate", default: defaults.maxTokensPerCandidate)
+        "max_tokens_per_candidate", default: defaults.maxTokensPerCandidate),
+      thinking: inferletArgs["thinking"]?.tomlValue.bool ?? defaults.thinking
     )
   }
 
