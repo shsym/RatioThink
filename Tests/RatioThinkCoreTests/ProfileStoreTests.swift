@@ -2547,6 +2547,37 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  /// #709: a valid user file carrying an EXAMPLE built-in id (e.g.
+  /// `tree-of-thought`) must NOT be silently dropped when that example is
+  /// excluded from the base set (`seedsExampleProfiles=false`). The override
+  /// key was the full static base-id set, so the file was marked a winning
+  /// override that no base entry consumed, and the append-the-losers pass
+  /// skipped winners — so it vanished. Keying on the ids actually present in
+  /// `base` surfaces it as a normal user entry instead.
+  func test_example_id_user_file_surfaced_when_example_excluded_from_base() throws {
+    try withTempProfilesDir { dir in
+      let totFile = """
+      id = "tree-of-thought"
+      name = "My ToT"
+      model = "user.gguf"
+      inferlet = "chat-apc"
+      """
+      try totFile.write(to: dir.appendingPathComponent(ProfileStore.treeOfThoughtFilename),
+                        atomically: true, encoding: .utf8)
+      // seedsExampleProfiles=false excludes tree-of-thought from the base set.
+      let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
+      try store.start()
+      defer { store.stop() }
+
+      let tot = try XCTUnwrap(
+        store.entries.first { $0.profile?.id == "tree-of-thought" },
+        "a user file with an example id must be surfaced even when the example base is excluded")
+      XCTAssertEqual(tot.profile?.name, "My ToT")
+      XCTAssertEqual(tot.url.lastPathComponent, ProfileStore.treeOfThoughtFilename,
+                     "the surfaced user file keeps its own path")
+    }
+  }
+
   /// #706 F3: `BaseBuiltin.name` is hand-carried alongside the TOML so the
   /// revert notice can label a built-in without re-parsing. Guard the desync:
   /// a future TOML `name` edit that forgets the struct must fail here.

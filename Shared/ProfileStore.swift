@@ -507,9 +507,6 @@ public final class ProfileStore: ObservableObject {
     }
   }
 
-  /// Set of base ids — the override-collision key for `mergeEffective`.
-  public static let baseBuiltinIDs: Set<String> = Set(baseBuiltins.map(\.id))
-
   /// Parse the base built-ins into `ProfileLoadResult`s anchored at
   /// `directory`. The synthetic `url` (`<directory>/<filename>`) is where an
   /// override WOULD be written, so `setModel` / editor writes land at the
@@ -551,9 +548,18 @@ public final class ProfileStore: ObservableObject {
     // filename-sorted, so the earliest filename wins a duplicate-id
     // collision). Track the WINNING index so the losing duplicate-base-id
     // files are surfaced as noise rather than silently dropped (#706 F2).
+    //
+    // Key on the ids ACTUALLY PRESENT in `base` this merge, NOT the full
+    // static `baseBuiltinIDs`. When an example built-in is excluded
+    // (`seedsExampleProfiles=false`), its id is absent from `base`, so a valid
+    // user file carrying that id is not an override: no base entry consumes it,
+    // and the append-the-losers pass below skips winners — keying on the static
+    // set would mark it a winner and silently drop it (#709). The present-ids
+    // key surfaces it as a normal user entry instead.
+    let basePresentIDs = Set(base.compactMap { $0.profile?.id })
     var overrideIndexByID: [String: Int] = [:]
     for (i, u) in user.enumerated() {
-      guard let id = u.profile?.id, baseBuiltinIDs.contains(id) else { continue }
+      guard let id = u.profile?.id, basePresentIDs.contains(id) else { continue }
       if overrideIndexByID[id] == nil { overrideIndexByID[id] = i }
     }
     let winning = Set(overrideIndexByID.values)
