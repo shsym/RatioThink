@@ -37,8 +37,7 @@ public final class ChatSendController: ObservableObject {
     recoveryGate: ChatRecoveryGate? = nil,
     recoveryPolicy: ChatRecoveryPolicy = .default,
     contextUsageTracker: ContextUsageTracker? = nil,
-    onSpecMetrics: (@MainActor (SpecMetrics) -> Void)? = nil,
-    onUsage: (@MainActor (ContextUsage) -> Void)? = nil
+    onSpecMetrics: (@MainActor (SpecMetrics) -> Void)? = nil
   ) {
     cancel()
     generation &+= 1
@@ -179,12 +178,20 @@ public final class ChatSendController: ObservableObject {
             case let .usage(used, window):
               // #711: the usage frame trails `.finish`. It carries the
               // conversation's engine-true occupancy (committed + working +
-              // buffered tokens), NOT this turn's token count — so it stays
-              // session-scoped via `onUsage`/`contextUsage` and is NOT
-              // written to `Message.tokens`, whose per-message meaning the
-              // writer owns. Leaving it unwritten keeps that field one
-              // consistent thing regardless of write path.
-              onUsage?(ContextUsage(usedTokens: used, windowTokens: window))
+              // buffered tokens), NOT this turn's token count — so it lands
+              // on the ContextUsageTracker (the single source for the meter +
+              // memory estimate) and is NOT written to `Message.tokens`, whose
+              // per-message meaning the writer owns. Keyed on this request's
+              // identity, so a frame from a superseded turn can't clobber a
+              // newer one.
+              if let usage = self.activeUsageIdentity, usage.requestID == usageRequestID {
+                usage.tracker.markUsage(
+                  chatID: usage.chatID,
+                  modelID: usage.modelID,
+                  requestID: usage.requestID,
+                  usage: ContextUsage(usedTokens: used, windowTokens: window)
+                )
+              }
             }
           }
           // Stream completed cleanly — no retry.

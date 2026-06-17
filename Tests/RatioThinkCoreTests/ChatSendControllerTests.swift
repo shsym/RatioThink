@@ -296,12 +296,13 @@ final class ChatSendControllerTests: XCTestCase {
   }
 
   /// #711: the `.usage` frame carries the conversation's cumulative
-  /// engine-true occupancy, NOT this turn's token count. It must publish
-  /// through `onUsage` for the live meter but must NOT be written into
-  /// `Message.tokens` — that field keeps one consistent per-message
-  /// meaning regardless of write path (here: untouched at its default 0,
-  /// since the engine reports no per-message token count for this turn).
-  func test_usage_frame_publishes_occupancy_but_does_not_write_message_tokens() async throws {
+  /// engine-true occupancy, NOT this turn's token count. It must land on
+  /// the `ContextUsageTracker` (the single source the meter + memory
+  /// estimate read) but must NOT be written into `Message.tokens` — that
+  /// field keeps one consistent per-message meaning regardless of write
+  /// path (here: untouched at its default 0, since the engine reports no
+  /// per-message token count for this turn).
+  func test_usage_frame_records_occupancy_on_tracker_but_does_not_write_message_tokens() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)
     let chat = Chat()
@@ -317,8 +318,8 @@ final class ChatSendControllerTests: XCTestCase {
       // plausible single-turn completion count, plus the window.
       .usage(used: 4242, window: 8192),
     ])
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
     let controller = ChatSendController()
-    var published: ContextUsage?
 
     controller.send(
       chat: chat,
@@ -327,7 +328,7 @@ final class ChatSendControllerTests: XCTestCase {
       modelLoadCenter: ModelLoadCenter(),
       persistenceStatus: PersistenceStatus(),
       options: ChatSendRequestOptions(modelID: "m"),
-      onUsage: { published = $0 }
+      contextUsageTracker: tracker
     )
 
     try await waitUntil("stream finishes") { !controller.isInFlight }
@@ -336,8 +337,15 @@ final class ChatSendControllerTests: XCTestCase {
     // Occupancy must NOT leak into the per-message token field.
     XCTAssertEqual(assistant.tokens, 0,
                    "Message.tokens must stay per-message; cumulative occupancy must not be written here")
-    // But it must reach the live meter.
-    XCTAssertEqual(published, ContextUsage(usedTokens: 4242, windowTokens: 8192))
+    // The frame populates the tracked request's record — the engine-true
+    // value, survived the `.finish` that follows it.
+    let usage = ContextUsage(usedTokens: 4242, windowTokens: 8192)
+    XCTAssertEqual(tracker.records.first?.usage, usage)
+    XCTAssertEqual(tracker.records.first?.residency, .requestLocalDestroyed,
+                   "usage lands before the finish defer; the record still ends destroyed")
+    // Both reader seams resolve it: the chat meter and the model-global window.
+    XCTAssertEqual(tracker.latestUsage(chatID: chat.id), usage)
+    XCTAssertEqual(tracker.latestWindow, 8192)
   }
 
   func test_new_send_cancels_stale_stream_so_late_events_do_not_clobber_new_turn() async throws {

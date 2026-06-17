@@ -699,10 +699,10 @@ private struct MemoryGuardrailSection: View {
   @State private var fraction: Double = GuardrailSettings.defaultFraction
   @State private var saveError: String?
   @State private var loadError: String?
-  /// #711: engine-true context window of the loaded model, surfaced as
-  /// "expected max context". Republished from chat `usage` frames; `nil`
-  /// until a turn has run this session.
-  @EnvironmentObject private var engineContextWindow: EngineContextWindow
+  /// #711: single source for the engine-true context window of the loaded
+  /// model, surfaced as "expected max context". Each turn's `usage` frame
+  /// records it; `nil` until a turn has run this session.
+  @EnvironmentObject private var contextUsageTracker: ContextUsageTracker
 
   private enum FractionChoice: Hashable {
     case preset(Double)
@@ -809,7 +809,7 @@ private struct MemoryGuardrailSection: View {
   /// turn has reported usage this session. Distinct from the size ceiling
   /// above — this is how many context tokens the model can actually hold.
   private var contextWindowPreview: String {
-    guard let tokens = engineContextWindow.tokens, tokens > 0 else {
+    guard let tokens = contextUsageTracker.latestWindow, tokens > 0 else {
       return "Expected max context: send a message to measure the loaded model's window."
     }
     return "Expected max context ≈ \(tokens.formatted()) tokens (loaded model)."

@@ -29,8 +29,9 @@ struct ChatScaffoldView: View {
   @EnvironmentObject private var engineStore: EngineClientStore
   @EnvironmentObject private var modelLoadCenter: ModelLoadCenter
   @EnvironmentObject private var engineStatusStore: EngineStatusStore
-  /// #711: engine-true context window store, fed by each turn's usage frame.
-  @EnvironmentObject private var engineContextWindow: EngineContextWindow
+  /// #711: single source for the context meter + memory estimate, fed by
+  /// each turn's usage frame (per request).
+  @EnvironmentObject private var contextUsageTracker: ContextUsageTracker
   /// #412: background-helper health, forwarded to the toolbar pip's outer ring.
   @EnvironmentObject private var helperHealth: HelperHealthController
   @EnvironmentObject private var profileStore: ProfileStore
@@ -416,6 +417,10 @@ struct ChatScaffoldView: View {
         // options (each carries its parsed `ModelNameParts` + `isUnverified`).
         modelOptions: toolbarModelOptions,
         currentModelSummary: toolbarCurrentModelSummary,
+        // #711: engine-true occupancy meter for this chat's latest turn,
+        // read from the single-source tracker (republished when a turn's
+        // usage frame lands).
+        contextUsage: contextUsageTracker.latestUsage(chatID: chat.id),
         // #460: the chat's persisted selection authority + the active
         // profile's default. The commits write the SwiftData authority
         // (`Chat.modelID` / `Chat.profileID`); policy lives in the
@@ -1153,15 +1158,12 @@ struct ChatScaffoldView: View {
       // helper's auto-relaunch) and ride the same chat turn through the
       // recovery without the user re-clicking Send.
       recoveryGate: engineStatusStore,
+      // #711: the turn's `usage` frame lands on the tracker (the single
+      // source the top-bar meter + memory-settings estimate read back).
+      contextUsageTracker: contextUsageTracker,
       // #621: persist the terminal speculation report against the profile
       // that issued the turn, so the ProfileEditor badge reflects real runs.
-      onSpecMetrics: { specMetricsStore.record($0, forProfileID: metricsProfileID) },
-      // #711: publish the engine-true context meter for this conversation
-      // (top-bar bar) and the model-global window (memory-settings screen).
-      onUsage: { usage in
-        viewModel.contextUsage = usage
-        engineContextWindow.record(usage.windowTokens)
-      }
+      onSpecMetrics: { specMetricsStore.record($0, forProfileID: metricsProfileID) }
     )
   }
 

@@ -30,6 +30,11 @@ struct ContentToolbar: View {
   /// #459's collapsed model-menu summary (concrete leaf + optional
   /// annotation). `ChatScaffoldView` derives it from `Chat.modelID`.
   let currentModelSummary: ToolbarModelOptions.CurrentSummary?
+  /// #711: engine-true occupancy for this chat's latest turn, read from
+  /// `ContextUsageTracker` (the single source). `nil` ⇒ the meter is
+  /// hidden (no turn has reported usage yet; snapshot/preview call sites
+  /// omit it so their reference PNGs are unchanged).
+  let contextUsage: ContextUsage?
   /// #460: the chat's persisted selected model (`Chat.modelID`) — the single
   /// selection authority. Resolves the swap-policy "from model" and the
   /// model-menu clear-vs-load decision; `nil` ⇒ the chat follows the active
@@ -113,6 +118,7 @@ struct ContentToolbar: View {
     availableProfiles: [String] = ["chat"],
     modelOptions: [ToolbarModelOptions.Option] = [],
     currentModelSummary: ToolbarModelOptions.CurrentSummary? = nil,
+    contextUsage: ContextUsage? = nil,
     selectedModelID: String? = nil,
     profileDefaultModel: String? = nil,
     commitSwap: @escaping ProfileSwapCoordinator.SwapCommit = { _, _ in true },
@@ -132,6 +138,7 @@ struct ContentToolbar: View {
     self.availableProfiles = availableProfiles
     self.modelOptions = modelOptions
     self.currentModelSummary = currentModelSummary
+    self.contextUsage = contextUsage
     self.selectedModelID = selectedModelID
     self.profileDefaultModel = profileDefaultModel
     self.commitSwap = commitSwap
@@ -707,10 +714,10 @@ struct ContentToolbar: View {
   }
 
   /// #711: context-occupancy meter. Hidden until the active conversation
-  /// reports usage (snapshot/preview call sites pass a VM with no
-  /// `contextUsage`, so their reference PNGs are unchanged).
+  /// reports usage (snapshot/preview call sites omit `contextUsage`, so
+  /// their reference PNGs are unchanged).
   @ViewBuilder private var contextMeter: some View {
-    if let usage = viewModel.contextUsage {
+    if let usage = contextUsage {
       ContextMeterView(usage: usage)
     }
   }

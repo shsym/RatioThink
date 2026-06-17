@@ -84,4 +84,55 @@ final class ContextUsageTrackerTests: XCTestCase {
 
     XCTAssertEqual(Set(tracker.records.map(\.modelID)), ["a", "b"])
   }
+
+  func test_markUsage_populatesRecordAndBothReaderSeams() {
+    let chatID = UUID()
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    tracker.markRequestStarted(chatID: chatID, modelID: "m", requestID: "r1")
+
+    let usage = ContextUsage(usedTokens: 1200, windowTokens: 4096)
+    tracker.markUsage(chatID: chatID, modelID: "m", requestID: "r1", usage: usage)
+
+    XCTAssertEqual(tracker.records.first?.usage, usage)
+    // The reader seams: the per-chat meter value and the model-global window.
+    XCTAssertEqual(tracker.latestUsage(chatID: chatID), usage)
+    XCTAssertEqual(tracker.latestWindow, 4096)
+    // Usage alone must not flip residency — the finish defer owns that.
+    XCTAssertEqual(tracker.records.first?.residency, .requestLocalActive)
+  }
+
+  func test_markUsage_forUnknownRequestIsIgnored() {
+    let chatID = UUID()
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    tracker.markRequestStarted(chatID: chatID, modelID: "m", requestID: "r1")
+
+    tracker.markUsage(chatID: chatID, modelID: "m", requestID: "stale",
+                      usage: ContextUsage(usedTokens: 9, windowTokens: 9))
+
+    XCTAssertNil(tracker.records.first?.usage,
+                 "a usage frame for a superseded/unknown request must not write onto a live record")
+    XCTAssertNil(tracker.latestUsage(chatID: chatID))
+    XCTAssertNil(tracker.latestWindow)
+  }
+
+  func test_latestUsage_and_latestWindow_followMostRecentReportingRecord() {
+    var tick: TimeInterval = 1
+    let chatID = UUID()
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: tick) })
+
+    tracker.markRequestStarted(chatID: chatID, modelID: "m", requestID: "r1")
+    tracker.markUsage(chatID: chatID, modelID: "m", requestID: "r1",
+                      usage: ContextUsage(usedTokens: 100, windowTokens: 4096))
+    tick = 5
+    tracker.markRequestStarted(chatID: chatID, modelID: "m", requestID: "r2")
+    tracker.markUsage(chatID: chatID, modelID: "m", requestID: "r2",
+                      usage: ContextUsage(usedTokens: 300, windowTokens: 4096))
+
+    // Newest reporting record wins for the chat meter.
+    XCTAssertEqual(tracker.latestUsage(chatID: chatID),
+                   ContextUsage(usedTokens: 300, windowTokens: 4096))
+    XCTAssertEqual(tracker.latestWindow, 4096)
+    // A different chat has no usage of its own.
+    XCTAssertNil(tracker.latestUsage(chatID: UUID()))
+  }
 }

@@ -659,7 +659,10 @@ public struct GenerationMetrics: Codable, Equatable, Sendable {
 /// is the engine-true occupancy after the latest turn; `windowTokens` is
 /// the effective KV-budget context window (`nil` when the engine could
 /// not report a budget — e.g. the context isn't resident yet).
-public struct ContextUsage: Equatable, Sendable {
+///
+/// `Codable` so it can ride on a `ContextUsageRecord` (the tracker's
+/// per-request occupancy record).
+public struct ContextUsage: Codable, Equatable, Sendable {
   public var usedTokens: Int
   public var windowTokens: Int?
 

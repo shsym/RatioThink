@@ -23,29 +23,6 @@ public enum ContextResidency: String, Codable, Equatable, Sendable {
   case destroyed
 }
 
-public struct ContextPageUsage: Codable, Equatable, Sendable {
-  public let tokensPerPage: UInt32
-  public let committedPages: UInt32
-  public let workingPages: UInt32
-  public let workingTokens: UInt32
-  public let checkpoint: String
-  public let observedAt: Date
-
-  public init(tokensPerPage: UInt32,
-              committedPages: UInt32,
-              workingPages: UInt32,
-              workingTokens: UInt32,
-              checkpoint: String,
-              observedAt: Date) {
-    self.tokensPerPage = tokensPerPage
-    self.committedPages = committedPages
-    self.workingPages = workingPages
-    self.workingTokens = workingTokens
-    self.checkpoint = checkpoint
-    self.observedAt = observedAt
-  }
-}
-
 public struct ContextUsageRecord: Codable, Equatable, Identifiable, Sendable {
   public let id: ContextUsageID
   public var chatID: UUID { id.chatID }
@@ -53,13 +30,17 @@ public struct ContextUsageRecord: Codable, Equatable, Identifiable, Sendable {
   public var requestID: String? { id.requestID }
   public var lastUsedAt: Date
   public var residency: ContextResidency
-  public var usage: ContextPageUsage?
+  /// Engine-true occupancy reported by the turn's `usage` frame
+  /// (#711): `usedTokens` + the effective KV-budget `windowTokens`. `nil`
+  /// until the frame arrives (it trails the stream's `.finish`); the
+  /// tracker never estimates a value the engine did not report.
+  public var usage: ContextUsage?
 
   public init(id: ContextUsageID,
               requestID: String?,
               lastUsedAt: Date,
               residency: ContextResidency,
-              usage: ContextPageUsage?) {
+              usage: ContextUsage?) {
     assert(requestID == nil || requestID == id.requestID, "ContextUsageRecord.requestID must match id.requestID")
     self.id = id
     self.lastUsedAt = lastUsedAt
@@ -98,6 +79,32 @@ public final class ContextUsageTracker: ObservableObject {
     record.residency = .requestLocalDestroyed
     byID[id] = record
     publish()
+  }
+
+  /// Record the engine-true occupancy a turn's `usage` frame reported
+  /// (#711). Keyed on the SAME request id `markRequestStarted` used, so a
+  /// frame for a superseded request can't overwrite a newer one; an
+  /// unknown id is ignored (mirrors `markRequestFinished`).
+  public func markUsage(chatID: UUID, modelID: String, requestID: String, usage: ContextUsage) {
+    let id = ContextUsageID(chatID: chatID, modelID: modelID, requestID: requestID)
+    guard var record = byID[id] else { return }
+    record.lastUsedAt = now()
+    record.usage = usage
+    byID[id] = record
+    publish()
+  }
+
+  /// Engine-true usage of this chat's most recent request that reported a
+  /// `usage` frame, or `nil` until one has. Drives the top-bar meter.
+  public func latestUsage(chatID: UUID) -> ContextUsage? {
+    records.first { $0.chatID == chatID && $0.usage != nil }?.usage
+  }
+
+  /// Engine-true context window (tokens) of the most recently used model.
+  /// Model-global (`budget_pages × tokens_per_page`), so the memory screen
+  /// reads it to show the expected max context without standing up a chat.
+  public var latestWindow: Int? {
+    records.lazy.compactMap { $0.usage?.windowTokens }.first
   }
 
   private func publish() {
