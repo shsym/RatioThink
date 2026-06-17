@@ -130,15 +130,21 @@ public struct ProfileStoreSnapshot {
   /// reload races against a concurrent FS event that could mutate
   /// the property between the two observations.
   public let activeProfileID: String?
+  /// Non-fatal #702 notices: built-in overrides that failed to parse and were
+  /// reverted to the app default (broken file saved as `.bak`). Empty in the
+  /// common case. The UI surfaces these so a silent revert is operator-visible.
+  public let builtinRevertNotices: [ProfileStore.BuiltinRevertNotice]
 
   public init(entries: [ProfileLoadResult],
               directoryError: ProfileStoreError?,
               activeProfileError: ProfileStoreError? = nil,
-              activeProfileID: String? = nil) {
-    self.entries            = entries
-    self.directoryError     = directoryError
-    self.activeProfileError = activeProfileError
-    self.activeProfileID    = activeProfileID
+              activeProfileID: String? = nil,
+              builtinRevertNotices: [ProfileStore.BuiltinRevertNotice] = []) {
+    self.entries              = entries
+    self.directoryError       = directoryError
+    self.activeProfileError   = activeProfileError
+    self.activeProfileID      = activeProfileID
+    self.builtinRevertNotices = builtinRevertNotices
   }
 }
 
@@ -301,7 +307,8 @@ public final class ProfileStore: ObservableObject {
 
   """
 
-  /// Filename written by `seedDefaultsIfEmpty()` on first launch.
+  /// Canonical on-disk filename for the `chat` base built-in (an override
+  /// file or a pre-#702 seeded copy lives here).
   public static let defaultChatFilename = "chat.toml"
 
   /// Example tree-of-thought profile (#413) seeded alongside `chat.toml`
@@ -336,11 +343,15 @@ public final class ProfileStore: ObservableObject {
 
   """
 
-  /// Filename of the seeded example Best-of-N profile (#690).
+  /// Canonical on-disk filename for the `best-of-n` example built-in (#690).
   public static let bestOfNFilename = "best-of-n.toml"
 
+  /// Profile id encoded in `bestOfNTOML`. An example built-in (#702 base
+  /// layer), gated alongside `tree-of-thought` by `seedsExampleProfiles`.
+  public static let bestOfNProfileID = "best-of-n"
+
   /// Example Best-of-N interactive profile (#690): generates N candidates the
-  /// user picks among (think-more vs stop). Non-default — seeded as an example
+  /// user picks among (think-more vs stop). Non-default — an example built-in
   /// like tree-of-thought, never auto-selected. `thinking` is omitted (the
   /// server defaults it off, #679).
   public static let bestOfNTOML: String = """
@@ -440,6 +451,137 @@ public final class ProfileStore: ObservableObject {
 
   """
 
+  /// Profile id encoded in `treeOfThoughtTOML`.
+  public static let treeOfThoughtProfileID = "tree-of-thought"
+
+  // MARK: - base layer (#702)
+
+  /// One immutable, in-code built-in profile. The base layer loads these
+  /// DIRECTLY into the effective set; they are NEVER written to the writable
+  /// profiles directory, so a user delete, a stale install, or a corrupt
+  /// on-disk copy can no longer strand a built-in (#702). A user file whose
+  /// id matches a base id OVERRIDES it (see `mergeEffective`); the base
+  /// always remains available when no valid override exists.
+  public struct BaseBuiltin {
+    public let id: String
+    /// User-facing display name (the `name` key in `toml`). Carried here so a
+    /// revert notice can say "Repeat Boost couldn't be read…" without
+    /// re-parsing the constant.
+    public let name: String
+    public let filename: String
+    public let toml: String
+  }
+
+  /// The built-ins, in display order. `tree-of-thought` (#413) and
+  /// `best-of-n` (#690) are EXAMPLE profiles gated by `seedsExampleProfiles`
+  /// (so hermetic tests can exclude them via
+  /// `baseEntries(directory:includeExample:)`); the other three are always
+  /// part of the base set.
+  public static let baseBuiltins: [BaseBuiltin] = [
+    BaseBuiltin(id: defaultProfileID,            name: "Chat",            filename: defaultChatFilename,        toml: defaultChatTOML),
+    BaseBuiltin(id: defaultRepeatBoostProfileID, name: "Repeat Boost",    filename: defaultRepeatBoostFilename, toml: defaultRepeatBoostTOML),
+    BaseBuiltin(id: treeOfThoughtProfileID,      name: "Tree of Thought", filename: treeOfThoughtFilename,      toml: treeOfThoughtTOML),
+    BaseBuiltin(id: defaultJSONThinkProfileID,   name: "JSON Think",      filename: defaultJSONThinkFilename,   toml: defaultJSONThinkTOML),
+    BaseBuiltin(id: bestOfNProfileID,            name: "Best of N",       filename: bestOfNFilename,            toml: bestOfNTOML),
+  ]
+
+  /// Ids of the EXAMPLE built-ins — excluded from the base set when
+  /// `seedsExampleProfiles` is false (hermetic scan/lifecycle tests).
+  public static let exampleBuiltinIDs: Set<String> = [treeOfThoughtProfileID, bestOfNProfileID]
+
+  /// Non-fatal notice (#702): a user's customization of a built-in failed to
+  /// parse, so the migration moved the broken file aside (`bakFilename`) and
+  /// the in-code app default now applies for `profileID`. Surfaced on the
+  /// snapshot so the UI can tell the operator their override reverted —
+  /// otherwise the revert is silent (log-only) and a broken customization
+  /// looks identical to "the default was always like this".
+  public struct BuiltinRevertNotice: Equatable, Sendable {
+    public let profileID: String
+    public let profileName: String
+    public let bakFilename: String
+
+    public init(profileID: String, profileName: String, bakFilename: String) {
+      self.profileID = profileID
+      self.profileName = profileName
+      self.bakFilename = bakFilename
+    }
+  }
+
+  /// Set of base ids — the override-collision key for `mergeEffective`.
+  public static let baseBuiltinIDs: Set<String> = Set(baseBuiltins.map(\.id))
+
+  /// Parse the base built-ins into `ProfileLoadResult`s anchored at
+  /// `directory`. The synthetic `url` (`<directory>/<filename>`) is where an
+  /// override WOULD be written, so `setModel` / editor writes land at the
+  /// right path even for a base profile that has no user file yet. The
+  /// constants are known-valid; a parse failure here is a programmer error
+  /// surfaced as an error entry (never silently dropped).
+  /// `includeExample` mirrors the instance `seedsExampleProfiles` flag.
+  static func baseEntries(directory: URL, includeExample: Bool = true) -> [ProfileLoadResult] {
+    let builtins = includeExample
+      ? baseBuiltins
+      : baseBuiltins.filter { !exampleBuiltinIDs.contains($0.id) }
+    return builtins.map { builtin in
+      let url = directory.appendingPathComponent(builtin.filename, isDirectory: false)
+      do {
+        let profile = try Profile.parse(toml: builtin.toml)
+        return ProfileLoadResult(url: url, profile: profile, error: nil,
+                                 warnings: profile.sectionWarnings())
+      } catch let err as ProfileError {
+        Log.store.error("base built-in \(builtin.id, privacy: .public) failed to parse (programmer error): \(err.description, privacy: .public)")
+        return ProfileLoadResult(url: url, profile: nil, error: err, warnings: [])
+      } catch {
+        return ProfileLoadResult(url: url, profile: nil,
+                                 error: .parseFailure(String(describing: error)), warnings: [])
+      }
+    }
+  }
+
+  /// Effective profile set = base UNION valid-user-by-id, user wins on id
+  /// collision (#702). A VALID user entry whose id equals a base id REPLACES
+  /// that base entry in place; the base entry remains otherwise. Every
+  /// remaining user entry — non-base valid ids AND parse-failed entries (no
+  /// id) — is appended so the toolbar / Settings can surface broken user
+  /// files as additive noise without ever shadowing or removing a base.
+  /// Sorted by filename for deterministic ordering.
+  static func mergeEffective(base: [ProfileLoadResult],
+                             user: [ProfileLoadResult]) -> [ProfileLoadResult] {
+    // First valid user override per base id (user is filename-sorted, so the
+    // earliest filename wins a duplicate-id collision).
+    var overrides: [String: ProfileLoadResult] = [:]
+    for u in user {
+      guard let id = u.profile?.id, baseBuiltinIDs.contains(id) else { continue }
+      if overrides[id] == nil { overrides[id] = u }
+    }
+    var merged: [ProfileLoadResult] = base.map { b in
+      if let id = b.profile?.id, let ovr = overrides[id] { return ovr }
+      return b
+    }
+    // Append every user entry that did not override a base: non-base valid
+    // ids, plus all parse-failed entries (surfaced as noise).
+    for u in user {
+      if let id = u.profile?.id, baseBuiltinIDs.contains(id) { continue }
+      merged.append(u)
+    }
+    return merged.sorted { $0.url.lastPathComponent < $1.url.lastPathComponent }
+  }
+
+  /// `scan` + base merge — the single source for the effective profile set.
+  /// The store's reload path, the Settings Profiles tab, and the Local API
+  /// view all route through this so the base layer is present everywhere the
+  /// raw `scan` was used (#702). Base built-ins are returned even when the
+  /// directory scan fails (unreadable dir still yields the four built-ins).
+  static func effectiveScan(directory: URL,
+                            includeExample: Bool = true,
+                            fileManager: FileManager = .default)
+    -> ([ProfileLoadResult], ProfileStoreError?) {
+    let (user, scanErr) = scan(directory: directory, fileManager: fileManager)
+    let merged = mergeEffective(
+      base: baseEntries(directory: directory, includeExample: includeExample),
+      user: user)
+    return (merged, scanErr)
+  }
+
   private let queue: DispatchQueue
   /// Per-instance specific key so any method can detect whether the
   /// current thread is already running on THIS store's `queue`
@@ -463,6 +605,11 @@ public final class ProfileStore: ObservableObject {
   /// the empty-dir seed error is. Self-clears on the next `start()` whose
   /// seed succeeds (set fresh every start), and on `stop()`.
   private var _builtinSeedError: ProfileStoreError?
+  /// Successful built-in reverts (#702): an unparseable override was moved to
+  /// `.bak` and the app default re-applied. Non-fatal — surfaced alongside,
+  /// not via, `_builtinSeedError` (which is a failure channel). Set fresh on
+  /// every `start()`, cleared on `stop()`.
+  private var _builtinRevertNotices: [BuiltinRevertNotice] = []
   private var _activeProfileID: String?
   private var _activeProfileError: ProfileStoreError?
   /// Listener fan-out invariant (review v6 F7).
@@ -645,39 +792,44 @@ public final class ProfileStore: ObservableObject {
     // three authoritative paths); reloadLocked itself rescans the
     // directory but does NOT touch the marker.
     queue.sync {
-      let seed = self.seedDefaultsIfEmpty()
-      // #413: backfill the example tree-of-thought profile if absent —
-      // runs BEFORE the `reloadLocked()` scan below so the first snapshot
-      // already lists it. Independent of the dir-empty seed, so existing
-      // installs get it too.
-      self.backfillTreeOfThoughtProfile()
-      // #690: backfill the example Best-of-N profile the same way (write-if-
-      // absent, gated on `seedsExampleProfiles`, non-default).
-      self.backfillBestOfNProfile()
-      // One-time slug rename `fast-think` -> `repeat-boost` (#628). Must run
-      // BEFORE the ensure-seed below (else a fresh `repeat-boost.toml` would
-      // be seeded beside a user's legacy `fast-think.toml` = duplicate
-      // built-in) and BEFORE the marker read further down (so a marker still
-      // naming the dead `fast-think` id is repointed before it is committed).
+      // #702: built-ins are an immutable in-code BASE layer (loaded by
+      // `effectiveScan` during `reloadLocked` below) — nothing is seeded
+      // into the writable dir. This subsumes the #413 tree-of-thought and
+      // #690 best-of-n example backfills (both are now base built-ins).
+      // Two one-time reconciliations heal installs that seeded built-in
+      // files before #702:
+      //
+      //  1. Legacy slug rename `fast-think` -> `repeat-boost` (#628): renames
+      //     a user's legacy file + repoints a stale marker. Runs FIRST so the
+      //     resulting `repeat-boost.toml` is handled by the dedup pass below
+      //     and the marker is repointed before it is read.
       let migrationError = self.migrateFastThinkToRepeatBoost()
-      // Ensure the built-in Repeat Boost profile exists even on installs
-      // that already seeded chat.toml (the empty-dir seed above is a no-op
-      // there). Runs before `reloadLocked()` below so the initial scan
-      // picks it up. (#426; slug #628)
-      let repeatBoostSeedError = self.ensureBuiltinRepeatBoostProfile()
-      // Same for the built-in JSON Think profile (#572). A seed failure on
-      // ANY built-in rides the shared `_builtinSeedError` channel; keep
-      // the first failure so the snapshot surfaces a concrete cause.
-      let jsonThinkSeedError = self.ensureBuiltinJSONThinkProfile()
-      let builtinSeedError = migrationError ?? repeatBoostSeedError ?? jsonThinkSeedError
+      //  2. Dedup/backup any seeded built-in files still on disk: byte-equal
+      //     to base -> delete (redundant); parses & differs -> keep as an
+      //     override; unparseable -> move to `<name>.toml.bak` so the stale
+      //     file stops shadowing the base. A move failure rides the shared
+      //     `_builtinSeedError` channel.
+      let (builtinBackupError, revertNotices) = self.migrateSeededBuiltins()
+      let builtinSeedError = migrationError ?? builtinBackupError
+      // Seed the active-profile marker -> chat on a FRESH install (no user
+      // `*.toml` files yet) so the first menu-bar Resume resolves into a real
+      // start. Gated on emptiness so a populated install with no marker keeps
+      // its clean "no selection yet" state instead of being force-selected
+      // onto chat. Idempotent (O_EXCL): an existing marker always wins. The
+      // base `chat` profile is always present, so the seeded id can never
+      // dangle, and a dangling marker on a populated install now falls back
+      // to chat at the resolver rather than stranding (#702).
+      let markerError = self.isUserProfilesDirEmpty()
+        ? self.seedActiveProfileMarker()
+        : nil
       let readResult = self.readActiveProfileIDFromDisk()
       self.stateLock.withLock {
-        self._lastSeedError = seed.dirError
-        // The built-in (Repeat Boost) seed error rides its own channel: it
-        // is seeded into populated dirs, so it must surface even when
-        // `_entries` is non-empty (review v1 F1) — `_lastSeedError` is
-        // gated on an empty dir and cleared by the next non-empty scan.
+        self._lastSeedError = nil
+        // A built-in dedup/backup failure rides its own channel so it
+        // surfaces even when `_entries` is non-empty (review v1 F1).
         self._builtinSeedError = builtinSeedError
+        // Non-fatal #702 reverts: successful .bak moves of broken overrides.
+        self._builtinRevertNotices = revertNotices
         self.commitActiveReadResultLocked(readResult, source: .start)
         //  review v1 F2: a marker-seed failure must NOT
         // be silent. The override below fills `_activeProfileError`
@@ -691,7 +843,7 @@ public final class ProfileStore: ObservableObject {
         // marker readback), keep the read error and log the
         // displacement. Last-writer-wins without logging would
         // silently drop a concurrent fault from the snapshot.
-        if let markerErr = seed.markerError {
+        if let markerErr = markerError {
           if let prior = self._activeProfileError {
             Log.store.error("start: keeping read error; seed-marker error suppressed (prior=\(String(describing: prior), privacy: .public), markerErr=\(String(describing: markerErr), privacy: .public))")
           } else {
@@ -772,6 +924,7 @@ public final class ProfileStore: ObservableObject {
     _lastSeedError = nil
     _lastScanError = nil
     _builtinSeedError = nil
+    _builtinRevertNotices = []
     _activeProfileID = nil
     _activeProfileError = nil
     _pendingPostRecursionFanOut = false
@@ -806,6 +959,14 @@ public final class ProfileStore: ObservableObject {
   /// `clearActiveProfileID` write replaces or removes the file.
   public var lastActiveProfileError: ProfileStoreError? {
     stateLock.withLock { _activeProfileError }
+  }
+
+  /// Non-fatal #702 revert notices captured at the last `start()`: built-in
+  /// overrides that failed to parse and were reverted to the app default.
+  /// Same value as `snapshot.builtinRevertNotices`. The Profiles settings UI
+  /// reads this so a silent revert becomes operator-visible.
+  public var lastBuiltinRevertNotices: [BuiltinRevertNotice] {
+    stateLock.withLock { _builtinRevertNotices }
   }
 
   /// Register a listener fired on every reload (initial scan + each
@@ -1419,152 +1580,96 @@ public final class ProfileStore: ObservableObject {
 
   // MARK: - seeding
 
-  /// Pair of errors produced by `seedDefaultsIfEmpty`. Split because
-  /// the chat.toml seed and the active-profile marker seed land on
-  /// different snapshot channels: `dirError` → `_lastSeedError` /
-  /// snapshot `directoryError`, `markerError` → `_activeProfileError` /
-  /// snapshot `activeProfileError`. Conflating them would either
-  /// suppress chat.toml success (if both routed to `_lastSeedError`)
-  /// or — worse — leave the marker-write failure silent and re-create
-  /// the exact "no operator-visible error, Resume is a no-op" state
-  ///  exists to eliminate (review v1 F2).
-  private struct SeedResult {
-    let dirError: ProfileStoreError?
-    let markerError: ProfileStoreError?
-  }
-
-  /// Writes `chat.toml` containing `defaultChatTOML` when the
-  /// profiles directory has no `*.toml` files, AND seeds the
-  /// active-profile marker when it is absent. Idempotent: re-running
-  /// against a populated directory is a no-op for the chat.toml seed,
-  /// and the marker seed uses exclusive-create semantics so a
-  /// concurrent process's marker always wins (review v1 F3).
-  /// #413: ensure the example tree-of-thought profile exists so the live
-  /// tree-search feature is reachable (the user just switches to it).
+  /// One-time on-disk reconciliation (#702) for installs that seeded
+  /// built-in files before the base layer became immutable + in-code.
+  /// Keyed on the canonical built-in FILENAMES — a parse-failed file has no
+  /// id, so id-keying is impossible. For each built-in file on disk:
   ///
-  /// Unlike `seedDefaultsIfEmpty` (which writes only when the profiles dir
-  /// is TRULY EMPTY = fresh install), this WRITE-IF-ABSENT backfill runs on
-  /// every `start()`, so an EXISTING install — whose dir already holds
-  /// `chat.toml` from before #413, making the seed a no-op — gets the
-  /// profile too. It never clobbers a user-edited copy (writes only when
-  /// the file is missing). Best-effort: a failure must NOT fail `start()`
-  /// (the user can still chat). The Settings editor only DISPLAYS
-  /// `inferlet_args`, so seeding the file is the only way a user gets a ToT
-  /// profile without hand-writing TOML.
+  ///   · byte-equal to the base constant -> DELETE. The base layer already
+  ///     provides it; the on-disk copy is redundant and editable-in-place,
+  ///     the exact fragility #702 removes.
+  ///   · parses & differs -> KEEP as a user override (a real customization,
+  ///     e.g. a pinned model). `mergeEffective` overlays it on the base.
+  ///   · fails to parse -> MOVE to `<name>.toml.bak` so the stale broken file
+  ///     stops being scanned (`.bak` is not `isProfileTOML`) and the base
+  ///     applies. A SUCCESSFUL move emits a non-fatal `BuiltinRevertNotice`
+  ///     (the operator's override silently reverted to the app default — they
+  ///     need to know); a move FAILURE rides the `_builtinSeedError` channel.
   ///
-  /// Runs on `queue` (called from `start()` inside `queue.sync`). Does not
-  /// touch the active-profile marker — `chat` stays the default; ToT is
-  /// opt-in via the picker.
-  private func backfillTreeOfThoughtProfile() {
-    guard seedsExampleProfiles else { return }
-    let target = directory.appendingPathComponent(Self.treeOfThoughtFilename)
-    guard !FileManager.default.fileExists(atPath: target.path) else { return }
-    do {
-      try Self.treeOfThoughtTOML.write(to: target, atomically: true, encoding: .utf8)
-      Log.store.info("backfilled tree-of-thought profile at \(target.path, privacy: .public)")
-    } catch {
-      Log.store.error(
-        "backfill tree-of-thought profile failed (non-fatal): \(String(describing: error), privacy: .public)"
-      )
+  /// Idempotent: a second launch finds only overrides (kept) or nothing.
+  /// Runs on `queue` (called from `start()` inside `queue.sync`). Returns the
+  /// first move/delete error (if any) plus every successful revert notice.
+  private func migrateSeededBuiltins()
+    -> (error: ProfileStoreError?, reverts: [BuiltinRevertNotice]) {
+    let fm = FileManager.default
+    var firstError: ProfileStoreError?
+    var reverts: [BuiltinRevertNotice] = []
+    for builtin in Self.baseBuiltins {
+      let url = directory.appendingPathComponent(builtin.filename, isDirectory: false)
+      guard fm.fileExists(atPath: url.path) else { continue }
+
+      let body: String
+      do {
+        body = try String(contentsOf: url, encoding: .utf8)
+      } catch {
+        Log.store.error("migrateSeededBuiltins: read \(builtin.filename, privacy: .public) failed (left in place): \(String(describing: error), privacy: .public)")
+        continue
+      }
+
+      if body == builtin.toml {
+        do {
+          try fm.removeItem(at: url)
+          Log.store.info("migrateSeededBuiltins: removed redundant seeded built-in \(builtin.filename, privacy: .public); base layer provides it")
+        } catch {
+          let underlying = String(describing: error)
+          Log.store.error("migrateSeededBuiltins: delete redundant \(builtin.filename, privacy: .public) failed: \(underlying, privacy: .public)")
+          if firstError == nil { firstError = .seedFailed(path: url.path, underlying: underlying) }
+        }
+        continue
+      }
+
+      // Differs from base — keep iff it parses (a real override); otherwise
+      // move it aside so it stops shadowing the base.
+      if (try? Profile.parse(toml: body)) != nil { continue }
+
+      let bak = directory.appendingPathComponent(builtin.filename + ".bak", isDirectory: false)
+      do {
+        if fm.fileExists(atPath: bak.path) { try fm.removeItem(at: bak) }
+        try fm.moveItem(at: url, to: bak)
+        Log.store.error("migrateSeededBuiltins: stale unparseable built-in \(builtin.filename, privacy: .public) moved to \(bak.lastPathComponent, privacy: .public); base layer applies")
+        reverts.append(BuiltinRevertNotice(profileID: builtin.id,
+                                           profileName: builtin.name,
+                                           bakFilename: bak.lastPathComponent))
+      } catch {
+        let underlying = String(describing: error)
+        Log.store.error("migrateSeededBuiltins: back up unparseable \(builtin.filename, privacy: .public) failed: \(underlying, privacy: .public)")
+        if firstError == nil { firstError = .seedFailed(path: url.path, underlying: underlying) }
+      }
     }
+    return (firstError, reverts)
   }
 
-  /// Write-if-absent backfill of the example Best-of-N profile (#690). Mirrors
-  /// `backfillTreeOfThoughtProfile`: gated on `seedsExampleProfiles`, runs on
-  /// existing installs too, non-fatal on failure.
-  private func backfillBestOfNProfile() {
-    guard seedsExampleProfiles else { return }
-    let target = directory.appendingPathComponent(Self.bestOfNFilename)
-    guard !FileManager.default.fileExists(atPath: target.path) else { return }
-    do {
-      try Self.bestOfNTOML.write(to: target, atomically: true, encoding: .utf8)
-      Log.store.info("backfilled best-of-n profile at \(target.path, privacy: .public)")
-    } catch {
-      Log.store.error(
-        "backfill best-of-n profile failed (non-fatal): \(String(describing: error), privacy: .public)"
-      )
-    }
-  }
-
-  private func seedDefaultsIfEmpty() -> SeedResult {
+  /// True when the writable profiles directory holds no `*.toml` files — a
+  /// fresh install. Used only to gate the one-time active-profile marker
+  /// seed (#702); the base built-ins are in-code and need no on-disk seed.
+  private func isUserProfilesDirEmpty() -> Bool {
     let existing = (try? FileManager.default.contentsOfDirectory(
       at: directory,
       includingPropertiesForKeys: nil,
       options: [.skipsHiddenFiles]
     )) ?? []
-    let tomls = existing.filter(Self.isProfileTOML)
-    guard tomls.isEmpty else { return SeedResult(dirError: nil, markerError: nil) }
-
-    let target = directory.appendingPathComponent(Self.defaultChatFilename)
-    do {
-      try Self.defaultChatTOML.write(to: target, atomically: true, encoding: .utf8)
-      Log.store.info("seeded default profile at \(target.path, privacy: .public)")
-    } catch {
-      let underlying = String(describing: error)
-      Log.store.error("seed default profile failed: \(underlying, privacy: .public)")
-      // Skip marker seed when chat.toml itself failed — the marker
-      // would point at an id with no parsed entry, which is a worse
-      // state than "absent" (HelperResumeAction would surface
-      // `.resolverFailed(.profileMissing)` instead of the actionable
-      // seed-failed banner).
-      return SeedResult(
-        dirError: .seedFailed(path: target.path, underlying: underlying),
-        markerError: nil
-      )
-    }
-
-    // #413: the example tree-of-thought profile is NOT written here. It is
-    // backfilled by `backfillTreeOfThoughtProfile()` (write-if-absent on
-    // every start), so EXISTING installs — whose profiles dir is non-empty,
-    // making this seed a no-op — get it too, not just fresh installs.
-
-    // : pair the chat.toml seed with an active-profile
-    // marker so the first-run menu-bar Resume click resolves into a
-    // real start instead of `.noActiveProfile`. A pre-existing marker
-    // is the operator's prior selection (rare on a freshly-seeded
-    // dir, but possible if tomls were manually removed, OR if a
-    // sibling Pie process raced our seed) and must win.
-    let markerError = seedActiveProfileMarker()
-    return SeedResult(dirError: nil, markerError: markerError)
-  }
-
-  /// Ensure the built-in "Repeat Boost" profile exists (#426; slug
-  /// #628). Unlike `seedDefaultsIfEmpty` (gated on an empty dir), this
-  /// writes `repeat-boost.toml` whenever it is ABSENT — so installs that
-  /// already have a `chat.toml` (i.e. every install past first launch)
-  /// still gain Repeat Boost on the next start. Existence-gated, so a
-  /// user's edits to the file survive; deleting it re-creates it next
-  /// launch, which is the accepted contract for a built-in default (edit
-  /// it, don't delete it). Never touches the active-profile marker — the
-  /// default selection stays `chat`. Returns `.seedFailed` on a write
-  /// failure; `start()` routes it to the dedicated `_builtinSeedError`
-  /// channel, which surfaces on the snapshot's `directoryError` even when
-  /// the directory already has profiles (review v1 F1). A nil return is
-  /// success-or-exists.
-  private func ensureBuiltinRepeatBoostProfile() -> ProfileStoreError? {
-    let target = directory.appendingPathComponent(Self.defaultRepeatBoostFilename)
-    if FileManager.default.fileExists(atPath: target.path) { return nil }
-    do {
-      try Self.defaultRepeatBoostTOML.write(to: target, atomically: true, encoding: .utf8)
-      Log.store.info("seeded built-in Repeat Boost profile at \(target.path, privacy: .public)")
-      return nil
-    } catch {
-      let underlying = String(describing: error)
-      Log.store.error("seed Repeat Boost profile failed: \(underlying, privacy: .public)")
-      return .seedFailed(path: target.path, underlying: underlying)
-    }
+    return existing.filter(Self.isProfileTOML).isEmpty
   }
 
   /// One-time on-disk migration for the #628 slug rename
   /// `fast-think` → `repeat-boost`.
   ///
-  /// The built-in speculative-decode profile is existence-gated by
-  /// FILENAME (`ensureBuiltinRepeatBoostProfile`). Renaming the slug
-  /// without migrating would leave a user's existing `fast-think.toml`
-  /// in place AND seed a fresh `repeat-boost.toml` beside it — two
-  /// duplicate built-ins — while the active-profile marker kept pointing
-  /// at the now-dangling `fast-think` id. This rename-or-dedupe migration
-  /// closes both holes and is safe to run on every `start()`:
+  /// The built-in speculative-decode profile's slug changed. A user's
+  /// existing `fast-think.toml` (id `fast-think`) is not a base id, so
+  /// without migrating it would appear as a stray user profile while the
+  /// active-profile marker kept pointing at the now-dangling `fast-think`
+  /// id. This rename-or-dedupe migration closes both holes and is safe to
+  /// run on every `start()`:
   ///
   ///   · Move: when `repeat-boost.toml` is ABSENT and `fast-think.toml`
   ///     is PRESENT, rewrite only the `id` line (`fast-think` →
@@ -1579,12 +1684,12 @@ public final class ProfileStore: ObservableObject {
   ///     file move (covers a marker left behind by a half-applied prior
   ///     run).
   ///
-  /// Idempotent: a second launch finds `repeat-boost.toml` present and no
-  /// legacy file, so the file branch is a no-op and the marker already
-  /// reads `repeat-boost`. Runs BEFORE `ensureBuiltinRepeatBoostProfile`
-  /// and the marker read in `start()`. Returns `.seedFailed` on a
-  /// write/move failure so it rides the shared `_builtinSeedError`
-  /// channel; nil on success-or-nothing-to-do.
+  /// Idempotent: a second launch finds no legacy file, so the file branch is
+  /// a no-op and the marker already reads `repeat-boost`. Runs BEFORE
+  /// `migrateSeededBuiltins` (which then dedups the resulting
+  /// `repeat-boost.toml`) and the marker read in `start()`. Returns
+  /// `.seedFailed` on a write/move failure so it rides the shared
+  /// `_builtinSeedError` channel; nil on success-or-nothing-to-do.
   private func migrateFastThinkToRepeatBoost() -> ProfileStoreError? {
     let fm = FileManager.default
     let legacy = directory.appendingPathComponent(Self.legacyFastThinkFilename)
@@ -1628,26 +1733,6 @@ public final class ProfileStore: ObservableObject {
       Log.store.info("repointed active-profile marker \(Self.legacyFastThinkProfileID, privacy: .public) -> \(Self.defaultRepeatBoostProfileID, privacy: .public)")
     } catch {
       Log.store.error("repoint active-profile marker failed: \(String(describing: error), privacy: .public)")
-    }
-  }
-
-  /// Ensure the built-in "JSON Think" profile exists (#572). Same
-  /// existence-gated contract as `ensureBuiltinRepeatBoostProfile`: writes
-  /// `json-think.toml` whenever ABSENT, survives user edits, re-creates on
-  /// delete, never touches the active-profile marker. Returns `.seedFailed`
-  /// on a write failure; `start()` routes it to the shared
-  /// `_builtinSeedError` channel. A nil return is success-or-exists.
-  private func ensureBuiltinJSONThinkProfile() -> ProfileStoreError? {
-    let target = directory.appendingPathComponent(Self.defaultJSONThinkFilename)
-    if FileManager.default.fileExists(atPath: target.path) { return nil }
-    do {
-      try Self.defaultJSONThinkTOML.write(to: target, atomically: true, encoding: .utf8)
-      Log.store.info("seeded built-in JSON Think profile at \(target.path, privacy: .public)")
-      return nil
-    } catch {
-      let underlying = String(describing: error)
-      Log.store.error("seed JSON Think profile failed: \(underlying, privacy: .public)")
-      return .seedFailed(path: target.path, underlying: underlying)
     }
   }
 
@@ -1981,7 +2066,8 @@ public final class ProfileStore: ObservableObject {
       entries: _entries,
       directoryError: resolvedDirectoryErrorLocked(),
       activeProfileError: _activeProfileError,
-      activeProfileID: visibleID
+      activeProfileID: visibleID,
+      builtinRevertNotices: _builtinRevertNotices
     )
   }
 
@@ -2000,7 +2086,7 @@ public final class ProfileStore: ObservableObject {
   }
 
   private func scanDirectory() -> ([ProfileLoadResult], ProfileStoreError?) {
-    Self.scan(directory: directory)
+    Self.effectiveScan(directory: directory, includeExample: seedsExampleProfiles)
   }
 
   /// Canonical profile-file predicate: a literal lowercase `toml` path

@@ -136,10 +136,21 @@ public struct LaunchSpecResolver {
   /// write). `nil`/blank falls back to the profile's persisted default.
   public func resolveLauncherSpec(profileID: String,
                                   explicitModel: String? = nil) -> Result<PieControlLauncher.LaunchSpec, EngineError> {
-    guard let profile = lookup(profileID: profileID) else {
+    // #702: a dangling active-profile marker (id points at a deleted /
+    // unparseable profile) must NOT strand engine start. The base `chat`
+    // built-in is always present in the effective set, so fall back to it
+    // instead of hard-rejecting. Only when even the base is unreachable
+    // (a corrupt build) do we surface `.profileMissing`.
+    let profile: Profile
+    if let direct = lookup(profileID: profileID) {
+      profile = direct
+    } else if let base = lookup(profileID: ProfileStore.defaultProfileID) {
+      Self.log.error("resolveLauncherSpec: profile id=\(profileID, privacy: .public) not found; falling back to base \(ProfileStore.defaultProfileID, privacy: .public)")
+      profile = base
+    } else {
       return .failure(EngineError(
         code: .profileMissing,
-        message: "no profile with id=\(profileID) in \(profileStore.directory.path)"
+        message: "no profile with id=\(profileID) and no base \(ProfileStore.defaultProfileID) in \(profileStore.directory.path)"
       ))
     }
     // Refuse a split-GGUF shard (`…-NNNNN-of-MMMMM.gguf`) before any

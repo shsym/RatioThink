@@ -17,20 +17,20 @@ final class ProfileStoreTests: XCTestCase {
 
   // MARK: - seeding
 
-  func test_seeds_default_chat_toml_on_first_launch() throws {
+  /// #702: the `chat` built-in is an immutable in-code BASE profile. It must
+  /// be present in `entries` on an empty dir WITHOUT being written to disk —
+  /// so a user delete / stale install can never strand it.
+  func test_base_chat_present_without_writing_a_file_on_first_launch() throws {
     try withTempProfilesDir { dir in
       let store = ProfileStore(directory: dir)
       try store.start()
       defer { store.stop() }
 
-      let seeded = dir.appendingPathComponent(ProfileStore.defaultChatFilename)
-      XCTAssertTrue(FileManager.default.fileExists(atPath: seeded.path),
-                    "first launch should write chat.toml into an empty profiles dir")
+      let onDisk = dir.appendingPathComponent(ProfileStore.defaultChatFilename)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: onDisk.path),
+                     "#702: base built-ins are in-code; nothing is seeded into the writable dir")
 
-      let body = try String(contentsOf: seeded, encoding: .utf8)
-      XCTAssertEqual(body, ProfileStore.defaultChatTOML)
-
-      let entry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "chat.toml" })
+      let entry = try XCTUnwrap(store.entries.first { $0.profile?.id == "chat" })
       XCTAssertNotNil(entry.profile)
       XCTAssertNil(entry.error)
       XCTAssertEqual(entry.profile?.id, "chat")
@@ -38,26 +38,27 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
-  /// #413: first launch also seeds an example tree-of-thought profile so
-  /// the live tree-search feature is reachable by switching to it. chat
-  /// stays the active default; the ToT profile is a valid ToT profile.
-  func test_seeds_tree_of_thought_profile_on_first_launch() throws {
+  /// #413 / #702: the example tree-of-thought profile is a BASE built-in,
+  /// present in `entries` on a fresh install without being written to disk.
+  /// chat stays the active default; the ToT profile is a valid ToT profile.
+  func test_base_tree_of_thought_present_on_first_launch() throws {
     try withTempProfilesDir { dir in
       let active = dir.deletingLastPathComponent().appendingPathComponent("active-profile")
       let store = ProfileStore(directory: dir, activeProfileURL: active)
       try store.start()
       defer { store.stop() }
 
-      let seeded = dir.appendingPathComponent(ProfileStore.treeOfThoughtFilename)
-      XCTAssertTrue(FileManager.default.fileExists(atPath: seeded.path),
-                    "first launch should seed tree-of-thought.toml")
+      let onDisk = dir.appendingPathComponent(ProfileStore.treeOfThoughtFilename)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: onDisk.path),
+                     "#702: the ToT built-in is in-code; nothing is seeded into the writable dir")
 
-      let entry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "tree-of-thought.toml" })
+      let entry = try XCTUnwrap(store.entries.first { $0.profile?.id == "tree-of-thought" })
       let profile = try XCTUnwrap(entry.profile)
       XCTAssertEqual(profile.id, "tree-of-thought")
       XCTAssertEqual(profile.inferlet, "chat-apc", "ToT is a dispatch mode; the launched inferlet stays chat-apc")
       XCTAssertEqual(profile.treeOfThought, ToTProfileConfig(breadth: 3, depth: 2, beamWidth: 2, maxTokensPerNode: 256))
-      // chat remains the active default; ToT is opt-in via profile switch.
+      // chat remains the active default (marker seeded on this fresh install);
+      // ToT is opt-in via profile switch.
       XCTAssertEqual(store.activeProfileID, "chat")
     }
   }
@@ -118,12 +119,12 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
-  /// #413 (operator ITEM 2A): an EXISTING install — profiles dir already
-  /// holds `chat.toml` from before #413, so the empty-dir seed is a no-op —
-  /// must STILL get the tree-of-thought profile, via the write-if-absent
-  /// backfill on `start()`. (Reproduces the operator's "ToT profile appears
-  /// nowhere" on an upgraded install.)
-  func test_backfills_tree_of_thought_profile_into_existing_install() throws {
+  /// #413 / #702: an EXISTING install whose dir holds a byte-equal seeded
+  /// `chat.toml` from before #702 must STILL surface the ToT profile (base
+  /// layer) — and the redundant seeded chat.toml is removed by the migration
+  /// while the base chat stays present. (Reproduces the operator's "ToT
+  /// profile appears nowhere" on an upgraded install.)
+  func test_base_tree_of_thought_present_in_existing_install() throws {
     try withTempProfilesDir { dir in
       try ProfileStore.defaultChatTOML.write(
         to: dir.appendingPathComponent(ProfileStore.defaultChatFilename),
@@ -135,13 +136,15 @@ final class ProfileStoreTests: XCTestCase {
       try store.start()
       defer { store.stop() }
 
-      let totURL = dir.appendingPathComponent(ProfileStore.treeOfThoughtFilename)
-      XCTAssertTrue(FileManager.default.fileExists(atPath: totURL.path),
-                    "existing install (non-empty dir) must still get tree-of-thought.toml backfilled")
-      let entry = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "tree-of-thought.toml" })
-      XCTAssertEqual(entry.profile?.id, "tree-of-thought")
-      XCTAssertNotNil(entry.profile?.treeOfThought)
-      XCTAssertEqual(store.activeProfileID, "chat", "backfill must not change the active profile")
+      // The byte-equal seeded copy is redundant (base provides it) -> removed.
+      XCTAssertFalse(FileManager.default.fileExists(
+        atPath: dir.appendingPathComponent(ProfileStore.defaultChatFilename).path),
+        "#702: a byte-equal seeded built-in is removed; base layer provides it")
+      // ToT + chat both come from the base layer.
+      let tot = try XCTUnwrap(store.entries.first { $0.profile?.id == "tree-of-thought" })
+      XCTAssertNotNil(tot.profile?.treeOfThought)
+      XCTAssertNotNil(store.entries.first { $0.profile?.id == "chat" }?.profile)
+      XCTAssertEqual(store.activeProfileID, "chat", "migration must not change the active profile")
     }
   }
 
@@ -378,10 +381,11 @@ final class ProfileStoreTests: XCTestCase {
       defer { store.stop() }
 
       let names = store.entries.map { $0.url.lastPathComponent }
-      // repeat-boost.toml (#426; slug #628) and json-think.toml (#572) are
-      // auto-seeded into every install (ensure-exists), so they appear in
-      // the scan alongside the authored profiles, sorted.
-      XCTAssertEqual(names, ["alpha.toml", "json-think.toml", "repeat-boost.toml", "zeta.toml"],
+      // #702: the base layer (chat, repeat-boost, json-think) is always
+      // present and merged in by filename; tree-of-thought is the example,
+      // excluded here by seedsExampleProfiles=false. They appear alongside the
+      // authored profiles, sorted.
+      XCTAssertEqual(names, ["alpha.toml", "chat.toml", "json-think.toml", "repeat-boost.toml", "zeta.toml"],
                      "entries must be sorted by filename for stable UI ordering")
     }
   }
@@ -620,11 +624,17 @@ final class ProfileStoreTests: XCTestCase {
   /// F3: when the seed write fails (read-only profiles dir), the
   /// snapshot must expose `directoryError == .seedFailed` so the UI
   /// can render the real cause instead of an empty-state placeholder.
-  func test_seed_failure_surfaces_to_listeners_via_snapshot() throws {
+  /// #702: a stale unparseable seeded built-in that the migration cannot back
+  /// up (read-only dir blocks the move) must surface `.seedFailed` on the
+  /// snapshot — while the base built-ins stay present (entries non-empty).
+  func test_builtin_backup_failure_surfaces_to_listeners_via_snapshot() throws {
     try withTempProfilesDir { dir in
-      // Drop write permission on the profiles dir BEFORE start so
-      // the seed write fails but the dir itself still opens
-      // O_EVTONLY and the scan still succeeds (returns []).
+      // A present-but-unparseable built-in file (missing required fields).
+      try "id = \"chat\"\n".write(
+        to: dir.appendingPathComponent(ProfileStore.defaultChatFilename),
+        atomically: true, encoding: .utf8)
+      // Read-only dir: the file still loads (r-x is readable), but the
+      // migration's move-to-.bak fails -> its error must reach the snapshot.
       try setPermissions(dir, mode: 0o500)
       defer { try? setPermissions(dir, mode: 0o755) }  // let cleanup proceed
 
@@ -636,8 +646,8 @@ final class ProfileStoreTests: XCTestCase {
         listenerLock.lock()
         defer { listenerLock.unlock() }
         if !fired, case .seedFailed = snap.directoryError {
-          XCTAssertTrue(snap.entries.isEmpty,
-                        "seed-failure snapshot should report an empty entries list")
+          XCTAssertFalse(snap.entries.isEmpty,
+                         "#702: base built-ins remain present even when a backup fails")
           fired = true
           expect.fulfill()
         }
@@ -1594,8 +1604,11 @@ final class ProfileStoreTests: XCTestCase {
       let inEntries = store.entries
         .map { $0.url.lastPathComponent }
         .sorted()
-      XCTAssertEqual(onDisk, inEntries,
-                     "v9 F3: short-circuit must rescan + commit _entries so recursive createProfile writes are not silently orphaned. onDisk=\(onDisk) entries=\(inEntries)")
+      // #702: entries also carry the always-present base layer, so on-disk
+      // files must be a SUBSET of entries (not equal). The point of the
+      // assertion is that no recursive write is orphaned.
+      XCTAssertTrue(Set(onDisk).isSubset(of: Set(inEntries)),
+                    "v9 F3: short-circuit must rescan + commit _entries so recursive createProfile writes are not silently orphaned. onDisk=\(onDisk) entries=\(inEntries)")
     }
   }
 
@@ -2247,15 +2260,15 @@ final class ProfileStoreTests: XCTestCase {
 
   // MARK: - built-in Repeat Boost seed (#426; slug #628)
 
-  func test_seeds_repeat_boost_profile_on_fresh_install() throws {
+  func test_base_repeat_boost_present_on_fresh_install() throws {
     try withTempProfilesDir { dir in
       let store = ProfileStore(directory: dir)
       try store.start()
       defer { store.stop() }
 
-      let seeded = dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename)
-      XCTAssertTrue(FileManager.default.fileExists(atPath: seeded.path),
-                    "fresh install should seed repeat-boost.toml")
+      let onDisk = dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: onDisk.path),
+                     "#702: the Repeat Boost built-in is in-code; nothing is seeded to disk")
       let entry = try XCTUnwrap(store.entries.first {
         $0.profile?.id == ProfileStore.defaultRepeatBoostProfileID
       })
@@ -2266,19 +2279,191 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
-  func test_seeds_repeat_boost_into_existing_install_with_only_chat() throws {
+  func test_base_repeat_boost_present_in_existing_install_with_only_chat() throws {
     try withTempProfilesDir { dir in
-      // Pre-existing chat.toml (existing install): the empty-dir seed is a
-      // no-op, so Repeat Boost must arrive via the ensure-exists path.
+      // Pre-existing byte-equal chat.toml (existing install). Repeat Boost is
+      // a base built-in, present in `entries` regardless of on-disk files.
       try ProfileStore.defaultChatTOML.write(
         to: dir.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
       let store = ProfileStore(directory: dir)
       try store.start()
       defer { store.stop() }
 
-      XCTAssertTrue(FileManager.default.fileExists(
-        atPath: dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename).path),
-        "existing install must gain Repeat Boost via ensure-exists")
+      XCTAssertNotNil(store.entries.first {
+        $0.profile?.id == ProfileStore.defaultRepeatBoostProfileID
+      }?.profile, "existing install must surface the Repeat Boost base built-in")
+    }
+  }
+
+  // MARK: - #702 base/user two-layer
+
+  /// The base layer yields all four built-ins even when the directory scan
+  /// fails (dir unreadable) — base entries are in-code, not scanned.
+  func test_base_layer_present_when_directory_scan_fails() throws {
+    let missing = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("pie-does-not-exist-\(UUID().uuidString)", isDirectory: true)
+    let (entries, scanErr) = ProfileStore.effectiveScan(directory: missing)
+    XCTAssertNotNil(scanErr, "scanning a missing dir must report a scan error")
+    let ids = Set(entries.compactMap { $0.profile?.id })
+    XCTAssertEqual(ids, ["chat", "repeat-boost", "tree-of-thought", "json-think", "best-of-n"],
+                   "all base built-ins must be present even when the scan fails")
+  }
+
+  /// #690/#702: the Best-of-N example is a base built-in — present in entries
+  /// on a fresh install without a seeded file, gated by seedsExampleProfiles
+  /// alongside tree-of-thought (excluded from hermetic scans).
+  func test_base_best_of_n_example_present_and_gated() throws {
+    try withTempProfilesDir { dir in
+      // Production default (includeExample=true): present, no file on disk.
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("best-of-n.toml").path),
+                     "#702: the Best-of-N built-in is in-code; nothing is seeded to disk")
+      let entry = try XCTUnwrap(store.entries.first { $0.profile?.id == "best-of-n" })
+      XCTAssertEqual(entry.profile?.name, "Best of N")
+      XCTAssertNil(entry.error)
+    }
+    // Hermetic scan (includeExample=false): excluded like tree-of-thought.
+    try withTempProfilesDir { dir in
+      let (entries, _) = ProfileStore.effectiveScan(directory: dir, includeExample: false)
+      let ids = Set(entries.compactMap { $0.profile?.id })
+      XCTAssertFalse(ids.contains("best-of-n"), "examples excluded when includeExample=false")
+      XCTAssertFalse(ids.contains("tree-of-thought"))
+      XCTAssertTrue(ids.isSuperset(of: ["chat", "repeat-boost", "json-think"]))
+    }
+  }
+
+  /// A valid user file whose id == a base id OVERRIDES the base built-in;
+  /// the override wins and no duplicate base entry remains.
+  func test_user_file_overrides_base_built_in_by_id() throws {
+    try withTempProfilesDir { dir in
+      // Customize the chat built-in by pinning a model — a real override.
+      let override = """
+      id = "chat"
+      name = "My Chat"
+      model = "Org/Repo/pinned.gguf"
+      inferlet = "chat-apc"
+      """
+      try override.write(to: dir.appendingPathComponent("chat.toml"),
+                         atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let chats = store.entries.filter { $0.profile?.id == "chat" }
+      XCTAssertEqual(chats.count, 1, "override must replace the base, not duplicate it")
+      XCTAssertEqual(chats.first?.profile?.name, "My Chat")
+      XCTAssertEqual(chats.first?.profile?.model, "Org/Repo/pinned.gguf",
+                     "the user override (pinned model) must win over the base default")
+    }
+  }
+
+  /// A parse-failed user file (non-base id) is IGNORED + surfaced as a noise
+  /// entry — it never removes or shadows a base built-in.
+  func test_invalid_user_file_is_surfaced_without_shadowing_base() throws {
+    try withTempProfilesDir { dir in
+      try "this is not = valid = toml [[[".write(
+        to: dir.appendingPathComponent("broken.toml"), atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      // Base built-ins intact.
+      let ids = Set(store.entries.compactMap { $0.profile?.id })
+      XCTAssertTrue(ids.isSuperset(of: ["chat", "repeat-boost", "json-think"]),
+                    "a broken user file must not remove any base built-in")
+      // The broken file is surfaced (present as an error entry), not dropped.
+      let broken = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "broken.toml" })
+      XCTAssertNil(broken.profile)
+      XCTAssertNotNil(broken.error, "the broken user file must be surfaced, not silently dropped")
+    }
+  }
+
+  /// Migration: a stale UNPARSEABLE built-in file is moved aside to `.bak`
+  /// (so it stops shadowing the base), and the base built-in still applies.
+  func test_migration_backs_up_stale_unparseable_builtin() throws {
+    try withTempProfilesDir { dir in
+      // An old-version chat.toml missing required fields (id only).
+      try "id = \"chat\"\n".write(
+        to: dir.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let fm = FileManager.default
+      XCTAssertFalse(fm.fileExists(atPath: dir.appendingPathComponent("chat.toml").path),
+                     "stale unparseable built-in must be moved aside")
+      XCTAssertTrue(fm.fileExists(atPath: dir.appendingPathComponent("chat.toml.bak").path),
+                    "the stale file must be preserved as <name>.toml.bak")
+      // Base chat still applies, cleanly.
+      let chat = try XCTUnwrap(store.entries.first { $0.profile?.id == "chat" })
+      XCTAssertNotNil(chat.profile)
+      XCTAssertNil(chat.error)
+    }
+  }
+
+  /// Migration: a byte-equal seeded built-in is deleted as redundant (the
+  /// base provides it); a customized valid one is kept as an override.
+  func test_migration_deletes_redundant_keeps_customized() throws {
+    try withTempProfilesDir { dir in
+      // Redundant: byte-equal to the base.
+      try ProfileStore.defaultChatTOML.write(
+        to: dir.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
+      // Customized + valid: differs from base, parses.
+      let customJSON = ProfileStore.defaultJSONThinkTOML
+        .replacingOccurrences(of: "JSON Think", with: "My JSON")
+      try customJSON.write(
+        to: dir.appendingPathComponent("json-think.toml"), atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let fm = FileManager.default
+      XCTAssertFalse(fm.fileExists(atPath: dir.appendingPathComponent("chat.toml").path),
+                     "byte-equal seeded built-in must be deleted as redundant")
+      XCTAssertTrue(fm.fileExists(atPath: dir.appendingPathComponent("json-think.toml").path),
+                    "a customized valid built-in must be kept as an override")
+      XCTAssertEqual(store.entries.first { $0.profile?.id == "json-think" }?.profile?.name,
+                     "My JSON", "the kept override must win over the base")
+    }
+  }
+
+  /// #702: a broken customization of a built-in (override fails to parse) is
+  /// moved to `.bak` and the app default re-applies — and that SUCCESSFUL
+  /// revert must surface a non-fatal notice so the operator is not silently
+  /// reverted. Verify the picker/base default holds after the revert.
+  func test_broken_builtin_override_revert_surfaces_notice_and_applies_base() throws {
+    try withTempProfilesDir { dir in
+      // A user pinned a model onto Repeat Boost, then the file got corrupted
+      // (missing required fields) — unparseable.
+      try "id = \"repeat-boost\"\nname = \"My Repeat\"\n".write(
+        to: dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename),
+        atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      // Revert notice surfaced (both the accessor and the snapshot channel).
+      let notices = store.lastBuiltinRevertNotices
+      XCTAssertEqual(notices, store.snapshot.builtinRevertNotices)
+      let notice = try XCTUnwrap(notices.first { $0.profileID == "repeat-boost" })
+      XCTAssertEqual(notice.profileName, "Repeat Boost")
+      XCTAssertEqual(notice.bakFilename, "repeat-boost.toml.bak")
+
+      // The broken file was moved aside; no move FAILURE, so directoryError is
+      // clean (the revert is non-fatal, not a _builtinSeedError).
+      let fm = FileManager.default
+      XCTAssertTrue(fm.fileExists(atPath: dir.appendingPathComponent("repeat-boost.toml.bak").path))
+      XCTAssertNil(store.lastDirectoryError, "a successful revert must not surface as a directory error")
+
+      // The base default applies for the built-in slot (picker shows the app
+      // default, not the broken override).
+      let entry = try XCTUnwrap(store.entries.first { $0.profile?.id == "repeat-boost" })
+      XCTAssertNil(entry.error)
+      XCTAssertEqual(entry.profile?.name, "Repeat Boost",
+                     "after a revert the base default (not the broken override) must apply")
     }
   }
 
@@ -2317,17 +2502,17 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
-  func test_repeat_boost_seed_failure_surfaces_via_snapshot_directoryError() throws {
+  /// #702: a stale unparseable `repeat-boost.toml` that the migration cannot
+  /// back up (read-only dir) must surface `.seedFailed` pointing at
+  /// repeat-boost.toml — even though the base built-ins remain present.
+  func test_repeat_boost_backup_failure_surfaces_via_snapshot_directoryError() throws {
     try withTempProfilesDir { dir in
-      // A parseable chat.toml is present, so `_entries` is non-empty after
-      // start — the empty-dir chat-seed error channel (`_lastSeedError`,
-      // gated on an empty dir AND cleared by a non-empty scan) cannot carry
-      // a failure. This is exactly the case the built-in seed exists for
-      // (review v1 F1), and where the prior code swallowed the error.
-      try ProfileStore.defaultChatTOML.write(
-        to: dir.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
-      // Read-only dir: chat.toml still loads (r-x is readable), but the
-      // Repeat Boost write fails → its error must reach the snapshot.
+      // A present-but-unparseable repeat-boost.toml (missing required fields).
+      try "id = \"repeat-boost\"\n".write(
+        to: dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename),
+        atomically: true, encoding: .utf8)
+      // Read-only dir: the file still loads (r-x is readable), but the
+      // migration's move-to-.bak fails → its error must reach the snapshot.
       try setPermissions(dir, mode: 0o500)
       defer { try? setPermissions(dir, mode: 0o755) }
 
@@ -2335,16 +2520,16 @@ final class ProfileStoreTests: XCTestCase {
       try store.start()
       defer { store.stop() }
 
-      XCTAssertFalse(store.entries.isEmpty,
-                     "chat.toml must still load from a read-only (but readable) dir")
-      XCTAssertFalse(FileManager.default.fileExists(
-        atPath: dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename).path),
-        "precondition: the Repeat Boost write must have failed under the read-only dir")
+      XCTAssertNotNil(store.entries.first { $0.profile?.id == "chat" }?.profile,
+                      "base built-ins must remain present under a read-only dir")
       guard case .seedFailed(let path, _)? = store.snapshot.directoryError else {
-        return XCTFail("Repeat Boost seed failure must surface on snapshot.directoryError even with chat.toml present; got \(String(describing: store.snapshot.directoryError))")
+        return XCTFail("Repeat Boost backup failure must surface on snapshot.directoryError; got \(String(describing: store.snapshot.directoryError))")
       }
       XCTAssertTrue(path.hasSuffix(ProfileStore.defaultRepeatBoostFilename),
                     "directoryError must point at repeat-boost.toml, got \(path)")
+      // A move FAILURE is NOT a successful revert — no revert notice fires.
+      XCTAssertTrue(store.lastBuiltinRevertNotices.isEmpty,
+                    "a failed .bak move must ride _builtinSeedError, not the revert-notice channel")
     }
   }
 

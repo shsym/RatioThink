@@ -603,10 +603,13 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     }
   }
 
-  /// Unknown profile id over the wire surfaces `.profileMissing` on
-  /// the error slot — proves the resolver's failure shape survives
-  /// `XPCPayload` encode/decode through the listener.
-  func test_startEngine_overXPC_unknownProfile_returnsProfileMissing() async throws {
+  /// #702: an unknown / dangling profile id over the wire must NOT
+  /// hard-reject with `.profileMissing` — the resolver falls back to the
+  /// always-present `chat` base built-in. Here the injected paths are bogus,
+  /// so the fallback chat fails at a LATER stage (binary / model / spawn),
+  /// proving the dangling id no longer strands AND that the resolver's error
+  /// shape still survives `XPCPayload` encode/decode through the listener.
+  func test_startEngine_overXPC_unknownProfile_fallsBackToChatBase() async throws {
     let store = try makeProfileStoreWithChat()
     defer { store.stop() }
     let host = makeEngineHost(port: 24601)
@@ -640,9 +643,10 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
 
     do {
       _ = try await callStartEngine(api: api, profileID: "ghost", timeout: 3)
-      XCTFail("expected .profileMissing for unknown profile id")
+      XCTFail("fallback chat must still fail to boot under bogus injected paths")
     } catch XPCError.engine(let err) {
-      XCTAssertEqual(err.code, .profileMissing)
+      XCTAssertNotEqual(err.code, .profileMissing,
+                        "#702: an unknown profile id must fall back to the chat base, not hard-reject with .profileMissing")
     }
   }
 
