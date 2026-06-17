@@ -181,10 +181,13 @@ private struct ToTNodeRow: View {
   /// every candidate stays full-strength and re-pickable until think-more/use-
   /// this (#708 click-to-reselect).
   private var isDimmed: Bool { hasChoice && !isChosen && !isInteractive }
-  /// True when tapping the row PICKS this candidate (#708 native tap-to-select
-  /// + click-to-reselect): any pickable candidate on the live round, even after
-  /// a choice (tapping a different row re-picks). Read-only rows toggle expand.
-  private var isPickAction: Bool { isInteractive && isPickable }
+  /// True when tapping the WHOLE card PICKS this candidate (#708 native
+  /// tap-to-select + click-to-reselect): a pickable candidate on the live round
+  /// that is NOT the current choice. The chosen card is excluded so its answer
+  /// text becomes drag-selectable (you committed to reading it); re-selection is
+  /// tapping a DIFFERENT, still-pickable card. Read-only rows are never pick
+  /// targets (text always selectable, tap toggles expand).
+  private var isPickAction: Bool { isInteractive && isPickable && !isChosen }
   /// Help text for the row's single tap action — pick vs expand/collapse.
   private var rowActionHelp: String {
     if isPickAction { return "Pick this answer" }
@@ -215,74 +218,31 @@ private struct ToTNodeRow: View {
       // subtree. For a chosen Best-of-N candidate this carries the accent
       // highlight. A Best-of-N candidate's reasoning is deliberately NOT in
       // here; it renders below, outside the accent fill (#708 C).
-      VStack(alignment: .leading, spacing: 4) {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-          // The whole row is ONE tappable surface (#708 native tap-to-select):
-          //  · a pickable Best-of-N candidate on the live round → tapping PICKS
-          //    (or re-picks) it (no per-option "Select" button — the option
-          //    itself is the control, the way a list selection reads natively).
-          //  · everything else (a read-only candidate, or a tree-of-thought
-          //    node) → tapping toggles the branch's expand/collapse.
-          // A single Button means no nested-button accessibility trap, so the
-          // row's own identity is the pick/expand target.
-          Button {
-            if isPickAction {
-              selection?.onPick(node.id)
-            } else {
-              userExpanded = !isExpanded
-            }
-          } label: {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-              if isBestOfN {
-                optionGlyph
-              } else {
-                beamGlyph
-                scoreBadge
-              }
-              Text(headline)
-                .font(.caption.monospaced())
-                .foregroundStyle(headlineTint)
-                .lineLimit(isBestOfN && !isDimmed ? 3 : 1)
-                .strikethrough(isPruned, color: .secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-              // No expand chevron while the row is a pick target — a live
-              // candidate is always shown expanded and the only affordance is
-              // "tap to pick / re-pick". Read-only history rows get the chevron
-              // back (tap to inspect).
-              if hasDetail, !isPickAction {
-                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                  .font(.caption2)
-                  .foregroundStyle(.tertiary)
-              }
-            }
-            .contentShape(Rectangle())
+      //
+      // #708 click-to-select: a live pickable candidate makes the WHOLE card
+      // (header AND answer body) one pick Button, and its answer text is NOT
+      // selectable — so a tap anywhere on the card picks rather than starting a
+      // text drag. Once chosen / in read-only history the card is no longer a
+      // pick target: the header toggles expand and the answer text becomes
+      // drag-selectable (resolves the pick-vs-copy conflict).
+      Group {
+        if isPickAction {
+          Button { selection?.onPick(node.id) } label: {
+            cardStack(answerSelectable: false, headerTogglesExpand: false)
+              // The WHOLE card rectangle is the hit area (#708) — without this
+              // only the opaque glyph/text glyphs are tappable, so a click on a
+              // gap (or the answer text) between them is dropped and the pick
+              // (or re-pick) silently no-ops. `.contentShape` makes the full
+              // card, including the answer body, the pick target.
+              .contentShape(Rectangle())
           }
           .buttonStyle(.plain)
           .frame(maxWidth: .infinity, alignment: .leading)
           .help(rowActionHelp)
           .modifier(OptionalAccessibilityIdentifier(
             id: isBestOfN ? "bestofn.option.\(node.branchIndex ?? 0)" : nil))
-        }
-
-        if isExpanded {
-          // Tree-of-thought keeps its reasoning inline above the answer (#329/
-          // #413, unchanged). A Best-of-N candidate's reasoning is moved out of
-          // this card (rendered below) so the chosen accent fill never washes it.
-          if !isBestOfN, !node.reasoning.isEmpty {
-            ReasoningDisclosure(
-              reasoning: node.reasoning,
-              answerStarted: hasAnswer,
-              labelFont: .caption2,
-              bodyFont: .caption2.monospaced()
-            )
-            .padding(.leading, 4)
-          }
-          detail
-            .padding(.leading, 4)
-          ForEach(children) { child in
-            ToTNodeRow(tree: tree, node: child)
-              .padding(.leading, 14)
-          }
+        } else {
+          cardStack(answerSelectable: true, headerTogglesExpand: true)
         }
       }
       // Chosen candidate: accent-tinted card + accent border. Unpicked-after-
@@ -314,15 +274,18 @@ private struct ToTNodeRow: View {
       // #708 C — thinking presentation: a Best-of-N candidate's reasoning uses
       // the SAME boxed brain-icon disclosure tree-of-thought uses, but rendered
       // BELOW the answer card on the plain surface (never under the chosen
-      // accent fill), so the de-emphasized `.secondary` thinking stays clearly
-      // distinct from the `.primary` answer. Absent entirely when there is no
-      // reasoning (thinking is OFF for best-of-n by default, #679) — no empty box.
+      // accent fill) and pushed to `.tertiary` (`deEmphasized`) so the thinking
+      // is unmistakably subordinate to the `.primary` answer — `.secondary` read
+      // too close to the answer on a chosen card. It also folds by default once
+      // an answer exists (`answerStarted: hasAnswer`). Absent entirely when there
+      // is no reasoning — no empty box.
       if isBestOfN, isExpanded, !node.reasoning.isEmpty {
         ReasoningDisclosure(
           reasoning: node.reasoning,
           answerStarted: hasAnswer,
           labelFont: .caption2,
-          bodyFont: .caption2.monospaced()
+          bodyFont: .caption2.monospaced(),
+          deEmphasized: true
         )
         .padding(.leading, 8)
       }
@@ -397,15 +360,17 @@ private struct ToTNodeRow: View {
   }
 
   /// The node's answer, or an honest note for a non-`ok` node — never
-  /// rendered tag-soup.
-  @ViewBuilder private var detail: some View {
+  /// rendered tag-soup. `selectable` is false while the whole card is a pick
+  /// target (#708), so a tap on the answer body picks instead of starting a
+  /// text drag; true once the card is no longer pickable (drag-to-copy).
+  @ViewBuilder private func detail(selectable: Bool) -> some View {
     switch node.status {
     case .error:
       Text(node.error ?? "generation failed")
         .font(.caption2)
         .foregroundStyle(.red)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .textSelection(.enabled)
+        .textSelectable(selectable)
     case .incomplete:
       Text(node.error ?? "Incomplete — the node reasoned but produced no answer.")
         .font(.caption2)
@@ -419,7 +384,75 @@ private struct ToTNodeRow: View {
           .foregroundStyle(isPruned ? .tertiary : .primary)
           .strikethrough(isPruned, color: .secondary)
           .frame(maxWidth: .infinity, alignment: .leading)
-          .textSelection(.enabled)
+          .textSelectable(selectable)
+      }
+    }
+  }
+
+  /// The card's header line — option/beam glyph + headline + (when this is not a
+  /// pick target) an expand chevron. Plain content; the enclosing `cardStack`
+  /// decides whether it sits inside a pick Button or an expand-toggle Button.
+  @ViewBuilder private var headerRow: some View {
+    HStack(alignment: .firstTextBaseline, spacing: 6) {
+      if isBestOfN {
+        optionGlyph
+      } else {
+        beamGlyph
+        scoreBadge
+      }
+      Text(headline)
+        .font(.caption.monospaced())
+        .foregroundStyle(headlineTint)
+        .lineLimit(isBestOfN && !isDimmed ? 3 : 1)
+        .strikethrough(isPruned, color: .secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+      // No chevron while the card is a pick target — a live pickable candidate
+      // is always shown expanded and the only affordance is "tap to pick".
+      if hasDetail, !isPickAction {
+        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+          .font(.caption2)
+          .foregroundStyle(.tertiary)
+      }
+    }
+    .contentShape(Rectangle())
+  }
+
+  /// The answer card's content: header + (when expanded) the answer detail and
+  /// child subtree. When `headerTogglesExpand` the header is its own toggle
+  /// Button (carrying the `bestofn.option.<i>` id for the seated test);
+  /// otherwise the header is plain content inside the enclosing pick Button.
+  @ViewBuilder private func cardStack(answerSelectable: Bool, headerTogglesExpand: Bool) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      if headerTogglesExpand {
+        Button { userExpanded = !isExpanded } label: { headerRow }
+          .buttonStyle(.plain)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .help(rowActionHelp)
+          .modifier(OptionalAccessibilityIdentifier(
+            id: isBestOfN ? "bestofn.option.\(node.branchIndex ?? 0)" : nil))
+      } else {
+        headerRow
+      }
+
+      if isExpanded {
+        // Tree-of-thought keeps its reasoning inline above the answer (#329/
+        // #413, unchanged). A Best-of-N candidate's reasoning is moved out of
+        // this card (rendered below) so the chosen accent fill never washes it.
+        if !isBestOfN, !node.reasoning.isEmpty {
+          ReasoningDisclosure(
+            reasoning: node.reasoning,
+            answerStarted: hasAnswer,
+            labelFont: .caption2,
+            bodyFont: .caption2.monospaced()
+          )
+          .padding(.leading, 4)
+        }
+        detail(selectable: answerSelectable)
+          .padding(.leading, 4)
+        ForEach(children) { child in
+          ToTNodeRow(tree: tree, node: child)
+            .padding(.leading, 14)
+        }
       }
     }
   }
@@ -495,6 +528,15 @@ private struct ToTNodeRow: View {
       if hasAnswer { return answer }
       return node.reasoning.isEmpty ? "…" : "thinking…"
     }
+  }
+}
+
+private extension View {
+  /// Enables or disables text selection — `.textSelection(.enabled)` and
+  /// `.textSelection(.disabled)` have different result types, so a ternary
+  /// cannot pick between them; this branches at the modifier level instead.
+  @ViewBuilder func textSelectable(_ enabled: Bool) -> some View {
+    if enabled { textSelection(.enabled) } else { textSelection(.disabled) }
   }
 }
 

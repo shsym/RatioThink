@@ -36,6 +36,39 @@ final class BestOfNHighlightSnapshotTests: XCTestCase {
     try render(scheme: .dark, name: "bestofn-readonly-dark", interactive: false)
   }
 
+  // #708 C probe — a chosen answer (`.primary`) above the candidate's reasoning
+  // disclosure forced EXPANDED with `deEmphasized: true` (`.tertiary`). Static
+  // snapshots render only the folded default; this exercises the expanded state
+  // the operator saw, to confirm thinking is unmistakably dimmer than the answer.
+  func test_probe_expanded_reasoning_is_subordinate() throws {
+    let probe = VStack(alignment: .leading, spacing: 4) {
+      VStack(alignment: .leading, spacing: 4) {
+        HStack(spacing: 6) {
+          Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor)
+          Text("Assign one owner per action item before anyone leaves.")
+            .font(.caption.monospaced()).foregroundStyle(.primary)
+        }
+        Text("Assign one owner per action item before anyone leaves.")
+          .font(.caption.monospaced()).foregroundStyle(.primary)
+      }
+      .padding(8)
+      .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.12)))
+      .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1))
+      ReasoningDisclosure(
+        reasoning: "They want low-effort but memorable; an owner makes it stick, and a single name avoids diffusion of responsibility.",
+        answerStarted: false, labelFont: .caption2, bodyFont: .caption2.monospaced(),
+        deEmphasized: true)
+        .padding(.leading, 8)
+    }
+    .padding().frame(width: 420)
+    .environment(\.colorScheme, .dark).background(Color.black)
+    let img = try XCTUnwrap(ImageRenderer(content: probe).nsImage)
+    let png = try XCTUnwrap(Self.png(from: img))
+    let url = outDir.appendingPathComponent("bestofn-thinking-tertiary.png")
+    try png.write(to: url)
+    print("BESTOFN-SNAPSHOT bestofn-thinking-tertiary: \(url.path)")
+  }
+
   private func render(scheme: ColorScheme, name: String, interactive: Bool = true) throws {
     // The harness defaults to `chosenID = "n1"`, so n1 renders chosen
     // (accent-highlighted). n1 carries a reasoning trace (#708 C) so the

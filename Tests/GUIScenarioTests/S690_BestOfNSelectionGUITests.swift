@@ -84,9 +84,9 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
       XCTAssertTrue(stateMarker(idx, "pickable").waitForExistence(timeout: 15),
                     "[\(appearance)] candidate \(idx) did not render as pickable; app tree: \(app.debugDescription)")
     }
-    // #708 native tap-to-select: each candidate row is itself the pick target
-    // (no per-option "Select" button); the row exposes a `bestofn.option.<i>`
-    // identifier and tapping it picks.
+    // #708 native tap-to-select: each candidate is itself the pick target (no
+    // per-option "Select" button); the WHOLE card — header AND answer body —
+    // exposes a `bestofn.option.<i>` identifier and tapping anywhere on it picks.
     func optionRow(_ idx: Int) -> XCUIElement {
       app.descendants(matching: .any)
         .matching(identifier: "bestofn.option.\(idx)").firstMatch
@@ -103,9 +103,11 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
     XCTAssertFalse(app.buttons["bestofn.useThis"].exists,
                    "[\(appearance)] 'Use this' must not appear before a choice")
 
-    // Pick candidate 1 by tapping its option row.
+    // #708 click-to-select: pick candidate 1 by tapping its ANSWER BODY (the
+    // lower region of the card), not the headline — the whole card is the pick
+    // target, so a tap on the answer text must select rather than do nothing.
     let chosenIdx = 1
-    optionRow(chosenIdx).click()
+    optionRow(chosenIdx).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.85)).tap()
 
     // The chosen row flips to `chosen` (highlighted). #708 click-to-reselect:
     // the OTHER candidates stay `pickable` (NOT dimmed/`unpicked`) so the user

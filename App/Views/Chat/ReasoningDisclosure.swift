@@ -22,7 +22,14 @@ struct ReasoningDisclosure: View {
   var icon: String = "brain"
   var labelFont: Font = .caption
   var bodyFont: Font = .caption.monospaced()
+  /// Push the label + body one step further back — `.tertiary` instead of
+  /// `.secondary` — so the reasoning reads as unmistakably subordinate to the
+  /// answer (#708 C: a chosen Best-of-N answer is `.primary`, and `.secondary`
+  /// was still too close to it). Tree-of-thought keeps the default `.secondary`.
+  var deEmphasized: Bool = false
   @State private var userExpanded: Bool?
+
+  private var tint: HierarchicalShapeStyle { deEmphasized ? .tertiary : .secondary }
 
   private var isExpanded: Bool { userExpanded ?? !answerStarted }
 
@@ -38,7 +45,7 @@ struct ReasoningDisclosure: View {
           Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
         }
         .font(labelFont)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(tint)
         .contentShape(Rectangle())
       }
       .buttonStyle(.plain)
@@ -47,7 +54,7 @@ struct ReasoningDisclosure: View {
       if isExpanded {
         Text(reasoning)
           .font(bodyFont)
-          .foregroundStyle(.secondary)
+          .foregroundStyle(tint)
           .textSelection(.enabled)
           .frame(maxWidth: .infinity, alignment: .leading)
           .padding(.horizontal, 10)
