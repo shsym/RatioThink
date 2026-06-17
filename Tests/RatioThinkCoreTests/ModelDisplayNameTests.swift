@@ -207,6 +207,7 @@ final class ModelNamePartsTests: XCTestCase {
     XCTAssertEqual(ModelNameParts.bitWidthFamily("IQ4_XS"), 4)
     XCTAssertEqual(ModelNameParts.bitWidthFamily("BF16"), 16)
     XCTAssertEqual(ModelNameParts.bitWidthFamily("F32"), 32)
+    XCTAssertEqual(ModelNameParts.bitWidthFamily("F16"), 16)
     XCTAssertEqual(ModelNameParts.bitWidthFamily("4bit"), 4)
     XCTAssertEqual(ModelNameParts.bitWidthFamily("8bit"), 8)
     XCTAssertEqual(ModelNameParts.bitWidthFamily("int4"), 4)
@@ -214,6 +215,26 @@ final class ModelNamePartsTests: XCTestCase {
     XCTAssertEqual(ModelNameParts.bitWidthFamily("mxfp4"), 4)
     XCTAssertNil(ModelNameParts.bitWidthFamily("1B"), "param count is not a quant")
     XCTAssertNil(ModelNameParts.bitWidthFamily("Instruct"))
+    // F4: a bare `f<n>` like F5 (the F5-TTS family) is a NAME fragment, not a
+    // float quant; only the real GGUF float widths f16/f32 count.
+    XCTAssertNil(ModelNameParts.bitWidthFamily("F5"), "F5 (F5-TTS) is not a quant")
+    XCTAssertNil(ModelNameParts.bitWidthFamily("f1"))
+    XCTAssertNil(ModelNameParts.bitWidthFamily("f8"))
+  }
+
+  // F4: a leading name fragment (`F5`) must not shadow the real trailing quant
+  // claim, and a bare `f<n>` must not register as a float quant. `F5-TTS-8bit`
+  // over a Q8_0 header is HONEST (trailing 8bit agrees) — no warning.
+  func test_quantMismatch_leading_name_fragment_does_not_cry_wolf() {
+    XCTAssertFalse(ModelNameParts.parse("F5-TTS-8bit.gguf").quantMismatch(fileQuant: "Q8_0"),
+                   "trailing 8bit agrees with Q8_0; leading F5 must not shadow it")
+    XCTAssertFalse(ModelNameParts.parse("F5-TTS.gguf").quantMismatch(fileQuant: "Q8_0"),
+                   "F5-TTS advertises no quant claim → no mismatch")
+    XCTAssertNil(ModelNameParts.parse("F5-TTS-8bit.gguf").mismatchWarning(fileQuant: "Q8_0"),
+                 "no bogus warning on an honest F5-TTS name")
+    // The real trailing claim still wins when it genuinely disagrees.
+    XCTAssertTrue(ModelNameParts.parse("F5-TTS-4bit.gguf").quantMismatch(fileQuant: "Q8_0"),
+                  "trailing 4bit over a Q8_0 file is a real mismatch")
   }
 
   func test_mismatchWarning_single_source_fires_for_noncanonical_name() {

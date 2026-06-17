@@ -197,9 +197,14 @@ public struct ModelNameParts: Equatable, Sendable {
   /// the trailing-`Q` parser does not recognize these, so they are found by
   /// scanning the stem's `-`-segments. Canonical `Q…` tokens are excluded
   /// (handled by `quant`). Nil when no such token is present.
+  ///
+  /// Scanned in REVERSE so the LAST quant-shaped segment wins, mirroring the
+  /// canonical `quant` parser's trailing-token discipline (`parse` uses
+  /// `segments.last`). Otherwise a leading name fragment like `F5` in
+  /// `F5-TTS-8bit` would shadow the real trailing `8bit` claim (PR #293 F4).
   private var nonCanonicalBitToken: String? {
     let (stem, _) = Self.splitFormat(raw)
-    for segment in stem.split(separator: "-", omittingEmptySubsequences: true).map(String.init)
+    for segment in stem.split(separator: "-", omittingEmptySubsequences: true).map(String.init).reversed()
     where !Self.isQuantToken(segment) {
       if Self.bitWidthFamily(segment) != nil { return segment }
     }
@@ -210,11 +215,17 @@ public struct ModelNameParts: Equatable, Sendable {
   /// `Q8_0`/`8bit`/`int8` → 8, `Q4_K_M`/`IQ4_XS`/`4bit` → 4,
   /// `BF16`/`fp16`/`f16` → 16, `F32` → 32. Nil for anything not quant-shaped,
   /// so an unrelated name segment never registers as a quant claim.
+  ///
+  /// The lone-`f` float form is restricted to the only real GGUF float widths
+  /// (`f16`/`f32`); a bare `f<n>` like `F5` (the F5-TTS family) is NOT a quant
+  /// and must return nil (PR #293 F4). Prefixed forms (`fp`/`bf`/`mxfp`/
+  /// `nvfp`) keep arbitrary digits.
   static func bitWidthFamily(_ raw: String) -> Int? {
     let s = raw.lowercased()
     if let n = captureFirstInt(s, "^([0-9]+)bit$") { return n }          // 4bit, 8bit
     if let n = captureFirstInt(s, "^u?int([0-9]+)$") { return n }        // int4, uint8
-    if let n = captureFirstInt(s, "^(?:bf|mx?fp|nv?fp|fp|f)([0-9]+)$") { return n }  // f16, fp16, bf16, mxfp4
+    if let n = captureFirstInt(s, "^(?:bf|mx?fp|nv?fp|fp)([0-9]+)$") { return n }  // fp16, bf16, mxfp4, nvfp4
+    if let n = captureFirstInt(s, "^f(16|32)$") { return n }             // f16, f32 only — NOT f5/f1
     if let n = captureFirstInt(s, "^[it]?q([0-9]+)") { return n }        // Q8_0, Q4_K_M, IQ4_XS, TQ1_0
     return nil
   }
