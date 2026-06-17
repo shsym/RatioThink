@@ -555,7 +555,9 @@ struct ContentToolbar: View {
   /// "safetensors" kind label rather than repeating the base name (the bug
   /// this fixes). GGUF / app-managed rows keep their existing leaf fallback.
   private func modelVariantLabel(_ option: ToolbarModelOptions.Option) -> String {
-    if let quant = option.parts.quant { return quant }
+    // Prefer the authoritative GGUF header quant over the filename guess
+    // (#667), so a mislabeled file shows its real quant.
+    if let quant = option.effectiveQuant { return quant }
     if let precision = option.precision { return precision }
     if option.parts.format == nil, option.source == .huggingFaceCache {
       return "safetensors"
@@ -563,12 +565,14 @@ struct ContentToolbar: View {
     return option.parts.quantOrLeaf
   }
 
-  /// Secondary detail line under a quant row: HF-cache source suffix, the
+  /// Secondary detail line under a quant row: a name/file quant-mismatch
+  /// warning (#667) first, then the HF-cache source suffix, the
   /// profile-default annotation, and any unavailable reason — the quant itself
   /// is the row's primary label, so it is not repeated here. Nil when there is
   /// nothing to show, so the row collapses to a single quant line.
   private func modelRowDetailText(_ option: ToolbarModelOptions.Option) -> String? {
     var parts: [String] = []
+    if let warning = option.quantMismatchWarning { parts.append("⚠ \(warning)") }
     if let tag = option.sourceTag { parts.append(tag) }
     if option.isProfileDefault { parts.append("profile default") }
     if let reason = option.unavailableReason { parts.append(reason) }

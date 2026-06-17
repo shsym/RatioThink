@@ -141,4 +141,48 @@ final class ModelNamePartsTests: XCTestCase {
     let hyphen = ModelNameParts.parse("Model-A-Q4_K_M.gguf")
     XCTAssertNotEqual(underscore.identity, hyphen.identity, "underscore vs hyphen are distinct files")
   }
+
+  // MARK: authoritative quant + name/file mismatch (#667)
+
+  func test_effectiveQuant_prefers_header_over_filename() {
+    // The header is authoritative: a `…4bit`-named file that is actually
+    // Q8_0 inside must display the real quant, not the filename's claim.
+    let parts = ModelNameParts.parse("Qwen3-0.6B-4bit.gguf")
+    XCTAssertEqual(parts.effectiveQuant(fileQuant: "Q8_0"), "Q8_0")
+  }
+
+  func test_effectiveQuant_falls_back_to_filename_when_header_absent() {
+    // An older GGUF without general.file_type keeps the prior behavior:
+    // the filename quant is the only honest signal available.
+    let parts = ModelNameParts.parse("Qwen3-0.6B-Q8_0.gguf")
+    XCTAssertEqual(parts.effectiveQuant(fileQuant: nil), "Q8_0")
+  }
+
+  func test_effectiveQuant_nil_when_neither_source_has_one() {
+    let parts = ModelNameParts.parse("Qwen/Qwen3-0.6B")  // safetensors dir-slug
+    XCTAssertNil(parts.effectiveQuant(fileQuant: nil))
+  }
+
+  func test_quantMismatch_true_when_header_disagrees_with_filename() {
+    // A filename that carries a quant token contradicting the header is the
+    // real mismatch case the dropdown/inventory must flag.
+    let lying = ModelNameParts.parse("Qwen3-0.6B-Q4_K_M.gguf")
+    XCTAssertTrue(lying.quantMismatch(fileQuant: "Q8_0"),
+                  "filename says Q4_K_M but the file is Q8_0 → mismatch")
+  }
+
+  func test_quantMismatch_false_when_they_agree_or_one_side_missing() {
+    let agree = ModelNameParts.parse("Qwen3-0.6B-Q8_0.gguf")
+    XCTAssertFalse(agree.quantMismatch(fileQuant: "q8_0"), "case-insensitive agreement is not a mismatch")
+    XCTAssertFalse(agree.quantMismatch(fileQuant: nil), "no header quant → cannot mismatch")
+    let noFilenameQuant = ModelNameParts.parse("Qwen3-0.6B-4bit.gguf")
+    XCTAssertFalse(noFilenameQuant.quantMismatch(fileQuant: "Q8_0"),
+                   "filename carries no recognized quant token → nothing to contradict")
+  }
+
+  func test_quantMismatchNote_names_both_quants() {
+    let note = ModelNameParts.quantMismatchNote(fileQuant: "Q8_0", nameQuant: "Q4_K_M")
+    XCTAssertTrue(note.contains("Q8_0"), "names the real file quant")
+    XCTAssertTrue(note.contains("Q4_K_M"), "names the filename's claimed quant")
+  }
 }

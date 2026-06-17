@@ -84,6 +84,33 @@ public struct InstalledModel: Equatable, Identifiable, Sendable {
   /// `Qwen3-0.6B → bf16`, not the base name repeated.
   public let precision: String?
 
+  /// Authoritative weight quant read from the GGUF header `general.file_type`
+  /// (#667) — e.g. `Q8_0`, `Q4_K_M`. This lives INSIDE the file, so it is
+  /// trustworthy where the filename is not: a renamed/mislabeled file
+  /// (`…4bit` over a Q8_0 file) still reports its real quant here. `nil` for
+  /// a non-GGUF row, a header without the key, or an unreadable file — the
+  /// UI then falls back to the filename-parsed quant. Surfaces in the chat
+  /// dropdown and the Settings inventory as the variant label, and drives
+  /// the name/file mismatch warning.
+  public let fileQuant: String?
+
+  /// The quant to DISPLAY for this row: the authoritative header quant when
+  /// known, else the filename-parsed token, else nil. Single source for both
+  /// the dropdown variant label and the inventory's quant column.
+  public var effectiveQuant: String? {
+    ModelNameParts.parse(filename).effectiveQuant(fileQuant: fileQuant)
+  }
+
+  /// Non-nil when the filename's quant token contradicts the real file quant
+  /// (#667) — a human-readable warning naming both. `nil` when they agree or
+  /// either is unknown. The UI surfaces it so a mislabeled model is caught.
+  public var quantMismatchWarning: String? {
+    let parts = ModelNameParts.parse(filename)
+    guard let fileQuant, parts.quantMismatch(fileQuant: fileQuant),
+          let nameQuant = parts.quant else { return nil }
+    return ModelNameParts.quantMismatchNote(fileQuant: fileQuant, nameQuant: nameQuant)
+  }
+
   /// Whether this row maps to a curated artifact that RatioThink has
   /// engine-validated. App-managed imports are user-owned and do not need
   /// cache-origin warnings; HF-cache rows outside this list are still
@@ -109,7 +136,8 @@ public struct InstalledModel: Equatable, Identifiable, Sendable {
               metadataUnreadable: Bool = false,
               source: CachedModelSource = .appManaged,
               unsupportedReason: String? = nil,
-              precision: String? = nil) {
+              precision: String? = nil,
+              fileQuant: String? = nil) {
     self.filename = filename
     self.url = url
     self.sizeBytes = sizeBytes
@@ -120,6 +148,7 @@ public struct InstalledModel: Equatable, Identifiable, Sendable {
     self.source = source
     self.unsupportedReason = unsupportedReason
     self.precision = precision
+    self.fileQuant = fileQuant
   }
 }
 
@@ -254,6 +283,12 @@ public enum InstalledModels {
         // `ModelMemoryGuardrail`'s skip-true-dirs guard (same logic AND
         // same fail-loud read).
         if values.isDirectory == true { continue }
+        // Read the authoritative quant from the GGUF header (#667). Skipped
+        // for an in-progress download (.partial) where the header may be
+        // incomplete; a header without the key / unreadable bytes returns
+        // nil and the UI falls back to the filename quant.
+        let fileQuant = isPartial ? nil
+          : GGUFMetadata.quant(fileURL: url.resolvingSymlinksInPath())
         rows.append(InstalledModel(
           filename: relativePath,
           url: url,
@@ -261,7 +296,8 @@ public enum InstalledModels {
           modifiedAt: values.contentModificationDate ?? Date(timeIntervalSince1970: 0),
           isPartial: isPartial,
           isUnverified: isUnverified,
-          metadataUnreadable: false))
+          metadataUnreadable: false,
+          fileQuant: fileQuant))
       } catch {
         // Surface metadata-read failures as a flagged row rather than
         // collapsing to `0 B, 1970` (review v2 F4). The UI hides the

@@ -271,6 +271,11 @@ public enum HFCacheCatalog {
       // A group built from the shard branch (representative leaf matches
       // the split pattern) is unlaunchable; an unsharded singleton is not.
       let unsupported = shardComponents(ofRelativePath: representative.relativePath) != nil
+      // Authoritative quant from the GGUF header (#667). The representative
+      // is a valid GGUF (the first shard for a split set), so its
+      // `general.file_type` is the real quant even when the row is collapsed
+      // as unlaunchable; the UI labels it honestly regardless.
+      let fileQuant = GGUFMetadata.quant(fileURL: representative.url.resolvingSymlinksInPath())
       return InstalledModel(
         filename: "\(repo)/\(representative.relativePath)",
         url: representative.url,
@@ -280,7 +285,8 @@ public enum HFCacheCatalog {
         isUnverified: false,
         metadataUnreadable: false,
         source: .huggingFaceCache,
-        unsupportedReason: unsupported ? Self.shardedUnsupportedReason : nil
+        unsupportedReason: unsupported ? Self.shardedUnsupportedReason : nil,
+        fileQuant: fileQuant
       )
     }
   }

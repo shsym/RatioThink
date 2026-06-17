@@ -132,19 +132,24 @@ enum GGUFMetadata {
   private static let maxMetadataBytes = 16 * 1024 * 1024
   private static let maxKVCount = 1_000_000
 
-  static func read(fileURL: URL) -> ModelArchMetadata? {
+  /// All string- and integer-valued metadata keys, parsed from the header
+  /// KV block (float/bool/array values are skipped, not decoded). Returns
+  /// nil on a bad magic / oversized header / malformed value, so a
+  /// truncated or hostile file fails closed. Shared by every per-key reader
+  /// so the KV walk lives in exactly one place.
+  static func parseMetadataKV(fileURL: URL)
+    -> (strings: [String: String], ints: [String: Int64])? {
     guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return nil }
     defer { try? handle.close() }
     var cursor = Cursor(handle: handle, budget: maxMetadataBytes)
 
     guard let magic = cursor.read(4), magic == Data([0x47, 0x47, 0x55, 0x46]), // "GGUF"
-          let _version = cursor.readU32(),
+          cursor.readU32() != nil,            // version (unused)
           cursor.readU64() != nil,            // tensor_count (unused)
           let kvCount = cursor.readU64(),
           kvCount <= UInt64(maxKVCount) else {
       return nil
     }
-    _ = _version
 
     var strings: [String: String] = [:]
     var ints: [String: Int64] = [:]
@@ -165,6 +170,69 @@ enum GGUFMetadata {
       case .array:   guard cursor.skipArray() else { return nil }
       }
     }
+    return (strings, ints)
+  }
+
+  /// Authoritative weight quant from `general.file_type` — the `llama_ftype`
+  /// enum llama.cpp's converter/quantizer writes into the file (`Q8_0`,
+  /// `Q4_K_M`, `BF16`, …). Unlike the filename, this lives INSIDE the file,
+  /// so it catches a mislabeled name (#667: a `…4bit` name over a Q8_0
+  /// file). Arch-independent (read even for gemma3/4, which the dim reader
+  /// refuses). Returns nil when the key is absent, the file is unreadable,
+  /// or the ftype is one we don't map — never a guessed label.
+  static func quant(fileURL: URL) -> String? {
+    guard let kv = parseMetadataKV(fileURL: fileURL),
+          let ftype = kv.ints["general.file_type"] else { return nil }
+    return ggufFtypeQuant(ftype)
+  }
+
+  /// `llama_ftype` enum → short quant label, mirroring llama.cpp's
+  /// `include/llama.h` exactly (verified upstream). Removed/unallocated
+  /// values and `LLAMA_FTYPE_GUESSED` (1024) map to nil so an unknown
+  /// ftype shows no label rather than a fabricated one.
+  static func ggufFtypeQuant(_ ftype: Int64) -> String? {
+    switch ftype {
+    case 0: return "F32"
+    case 1: return "F16"
+    case 2: return "Q4_0"
+    case 3: return "Q4_1"
+    case 7: return "Q8_0"
+    case 8: return "Q5_0"
+    case 9: return "Q5_1"
+    case 10: return "Q2_K"
+    case 11: return "Q3_K_S"
+    case 12: return "Q3_K_M"
+    case 13: return "Q3_K_L"
+    case 14: return "Q4_K_S"
+    case 15: return "Q4_K_M"
+    case 16: return "Q5_K_S"
+    case 17: return "Q5_K_M"
+    case 18: return "Q6_K"
+    case 19: return "IQ2_XXS"
+    case 20: return "IQ2_XS"
+    case 21: return "Q2_K_S"
+    case 22: return "IQ3_XS"
+    case 23: return "IQ3_XXS"
+    case 24: return "IQ1_S"
+    case 25: return "IQ4_NL"
+    case 26: return "IQ3_S"
+    case 27: return "IQ3_M"
+    case 28: return "IQ2_S"
+    case 29: return "IQ2_M"
+    case 30: return "IQ4_XS"
+    case 31: return "IQ1_M"
+    case 32: return "BF16"
+    case 36: return "TQ1_0"
+    case 37: return "TQ2_0"
+    case 38: return "MXFP4"
+    case 39: return "NVFP4"
+    case 40: return "Q1_0"
+    default: return nil
+    }
+  }
+
+  static func read(fileURL: URL) -> ModelArchMetadata? {
+    guard let (strings, ints) = parseMetadataKV(fileURL: fileURL) else { return nil }
 
     guard let arch = strings["general.architecture"], !arch.isEmpty,
           !ModelArchMetadata.requiresPerLayerKVAccounting(arch) else { return nil }

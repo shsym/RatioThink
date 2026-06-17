@@ -96,6 +96,78 @@ final class ModelMetadataTests: XCTestCase {
     XCTAssertNil(ModelArchMetadata.read(resolvedModelURL: url))
   }
 
+  // MARK: GGUF general.file_type → authoritative weight quant (#667)
+
+  func test_gguf_quant_reads_file_type_q8_0() throws {
+    // LLAMA_FTYPE_MOSTLY_Q8_0 = 7. The authoritative quant comes from the
+    // header, not the filename — this is what catches a mislabeled name.
+    let url = try writeGGUF(kvs: [
+      kvStr("general.architecture", "qwen3"),
+      kvU32("general.file_type", 7),
+    ])
+    defer { try? FileManager.default.removeItem(at: url) }
+    XCTAssertEqual(GGUFMetadata.quant(fileURL: url), "Q8_0")
+  }
+
+  func test_gguf_quant_reads_file_type_q4_k_m() throws {
+    let url = try writeGGUF(kvs: [
+      kvStr("general.architecture", "llama"),
+      kvU32("general.file_type", 15),  // LLAMA_FTYPE_MOSTLY_Q4_K_M
+    ])
+    defer { try? FileManager.default.removeItem(at: url) }
+    XCTAssertEqual(GGUFMetadata.quant(fileURL: url), "Q4_K_M")
+  }
+
+  func test_gguf_quant_independent_of_per_layer_arch_gate() throws {
+    // `ModelArchMetadata.read` fails closed for gemma3/4 (per-layer KV),
+    // but the quant is arch-independent: a Gemma GGUF must still surface
+    // its real quant so the dropdown/inventory label is honest.
+    let url = try writeGGUF(kvs: [
+      kvStr("general.architecture", "gemma3_text"),
+      kvU32("general.file_type", 18),  // LLAMA_FTYPE_MOSTLY_Q6_K
+    ])
+    defer { try? FileManager.default.removeItem(at: url) }
+    XCTAssertNil(ModelArchMetadata.read(resolvedModelURL: url),
+                 "arch-dim reader still fails closed for gemma3")
+    XCTAssertEqual(GGUFMetadata.quant(fileURL: url), "Q6_K",
+                   "quant is read regardless of the per-layer arch gate")
+  }
+
+  func test_gguf_quant_absent_file_type_returns_nil() throws {
+    let url = try writeGGUF(kvs: [
+      kvStr("general.architecture", "qwen3"),
+      kvU32("qwen3.block_count", 12),
+    ])
+    defer { try? FileManager.default.removeItem(at: url) }
+    XCTAssertNil(GGUFMetadata.quant(fileURL: url),
+                 "no general.file_type → nil, never a guessed label")
+  }
+
+  func test_gguf_quant_bad_magic_returns_nil() throws {
+    let url = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("bad-\(UUID().uuidString.prefix(8)).gguf")
+    try Data("NOPExxxxxxxx".utf8).write(to: url)
+    defer { try? FileManager.default.removeItem(at: url) }
+    XCTAssertNil(GGUFMetadata.quant(fileURL: url))
+  }
+
+  func test_ggufFtypeQuant_known_values() {
+    XCTAssertEqual(GGUFMetadata.ggufFtypeQuant(0), "F32")
+    XCTAssertEqual(GGUFMetadata.ggufFtypeQuant(1), "F16")
+    XCTAssertEqual(GGUFMetadata.ggufFtypeQuant(7), "Q8_0")
+    XCTAssertEqual(GGUFMetadata.ggufFtypeQuant(15), "Q4_K_M")
+    XCTAssertEqual(GGUFMetadata.ggufFtypeQuant(18), "Q6_K")
+    XCTAssertEqual(GGUFMetadata.ggufFtypeQuant(32), "BF16")
+  }
+
+  func test_ggufFtypeQuant_unknown_returns_nil() {
+    // LLAMA_FTYPE_GUESSED (1024) and removed/unallocated ftypes carry no
+    // honest label, so the reader returns nil rather than inventing one.
+    XCTAssertNil(GGUFMetadata.ggufFtypeQuant(1024))
+    XCTAssertNil(GGUFMetadata.ggufFtypeQuant(5))   // removed Q4_2
+    XCTAssertNil(GGUFMetadata.ggufFtypeQuant(9999))
+  }
+
   // MARK: HF config.json
 
   func test_hf_config_reads_dims() throws {

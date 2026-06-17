@@ -536,8 +536,9 @@ private struct InstalledModelsTable: View {
               }
               // #580: within a base-name section the row's primary text is
               // the quant tag (the distinguishing part), falling back to the
-              // full leaf when there is no clean quant.
-              Text(ModelNameParts.parse(row.filename).quantOrLeaf)
+              // full leaf when there is no clean quant. #667: prefer the
+              // authoritative GGUF header quant over the filename guess.
+              Text(row.effectiveQuant ?? ModelNameParts.parse(row.filename).quantOrLeaf)
                 .lineLimit(1).truncationMode(.middle)
               if row.source == .huggingFaceCache {
                 // Cached HF models are read-only here (the app does not
@@ -562,6 +563,20 @@ private struct InstalledModelsTable: View {
                   .background(Capsule().fill(Color.orange.opacity(0.15)))
                   .help(warning)
                   .accessibilityIdentifier("InstalledRow-SupportWarning-\(row.id)")
+              }
+              if let mismatch = row.quantMismatchWarning {
+                // #667: the filename's quant token contradicts the real GGUF
+                // header quant. Flag it so a mislabeled file is not trusted on
+                // its name alone (the displayed quant above is the real one).
+                Label("Name mismatch", systemImage: "exclamationmark.octagon.fill")
+                  .labelStyle(.titleAndIcon)
+                  .font(.caption2)
+                  .foregroundStyle(.orange)
+                  .padding(.horizontal, 5)
+                  .padding(.vertical, 1)
+                  .background(Capsule().fill(Color.orange.opacity(0.15)))
+                  .help(mismatch)
+                  .accessibilityIdentifier("InstalledRow-QuantMismatch-\(row.id)")
               }
             }
           }

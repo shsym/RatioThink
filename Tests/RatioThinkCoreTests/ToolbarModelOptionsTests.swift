@@ -5,14 +5,16 @@ final class ToolbarModelOptionsTests: XCTestCase {
   private func appModel(_ slug: String,
                         sizeBytes: Int64 = 100,
                         isPartial: Bool = false,
-                        unsupportedReason: String? = nil) -> InstalledModel {
+                        unsupportedReason: String? = nil,
+                        fileQuant: String? = nil) -> InstalledModel {
     InstalledModel(filename: slug,
                    url: URL(fileURLWithPath: "/models/\(slug)"),
                    sizeBytes: sizeBytes,
                    modifiedAt: Date(timeIntervalSince1970: 0),
                    isPartial: isPartial,
                    source: .appManaged,
-                   unsupportedReason: unsupportedReason)
+                   unsupportedReason: unsupportedReason,
+                   fileQuant: fileQuant)
   }
 
   private func hfModel(_ slug: String,
@@ -50,6 +52,37 @@ final class ToolbarModelOptionsTests: XCTestCase {
     XCTAssertEqual(options.first { $0.slug == "served/Resident.gguf" }?.isCurrent, true)
     XCTAssertEqual(options.first { $0.slug == "defaults/ProfileDefault.gguf" }?.isProfileDefault, true)
     XCTAssertEqual(options.first { $0.slug == "HF/Beta.safetensors" }?.displayName, "Beta.safetensors")
+  }
+
+  // #667: the authoritative GGUF header quant flows from the discovered model
+  // onto the option, is preferred over the filename token, and a contradiction
+  // surfaces as a mismatch warning.
+  func test_build_carries_authoritative_quant_and_flags_mismatch() {
+    let options = ToolbarModelOptions.build(
+      discoveredModels: [appModel("App/Model-Q4_K_M.gguf", fileQuant: "Q8_0")],
+      servedModelIDs: [],
+      profileDefaultModelID: nil,
+      modelOverride: nil,
+      residentModelID: nil)
+    let opt = try! XCTUnwrap(options.first { $0.slug == "App/Model-Q4_K_M.gguf" })
+    XCTAssertEqual(opt.fileQuant, "Q8_0")
+    XCTAssertEqual(opt.effectiveQuant, "Q8_0", "header quant preferred over the Q4_K_M filename token")
+    XCTAssertNotNil(opt.quantMismatchWarning, "filename says Q4_K_M but the file is Q8_0")
+  }
+
+  func test_build_synthesized_row_has_no_file_quant() {
+    // A served/default slug with no discovered model carries no header quant;
+    // the option falls back to the filename token with no mismatch warning.
+    let options = ToolbarModelOptions.build(
+      discoveredModels: [],
+      servedModelIDs: ["served/Model-Q8_0.gguf"],
+      profileDefaultModelID: nil,
+      modelOverride: nil,
+      residentModelID: nil)
+    let opt = try! XCTUnwrap(options.first)
+    XCTAssertNil(opt.fileQuant)
+    XCTAssertEqual(opt.effectiveQuant, "Q8_0")
+    XCTAssertNil(opt.quantMismatchWarning)
   }
 
   // Disambiguation suffix: an HF-cache row is marked so an app-vs-cache pair

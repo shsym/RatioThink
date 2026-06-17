@@ -245,7 +245,69 @@ final class InstalledModelsTests: XCTestCase {
     XCTAssertEqual(InstalledModels.formattedSize(twoAndAHalfGB), "2.5 GB")
   }
 
+  // MARK: - authoritative GGUF quant (#667)
+
+  func test_scan_reads_authoritative_quant_and_flags_name_mismatch() throws {
+    try withTempDir { dir in
+      // Filename claims Q4_K_M, but the header `general.file_type` is Q8_0
+      // (LLAMA_FTYPE_MOSTLY_Q8_0 = 7) — the exact mislabel #667 is about.
+      try writeGGUFFile("Model-Q4_K_M.gguf", fileType: 7, in: dir)
+      let rows = try InstalledModels.scan(dir)
+      XCTAssertEqual(rows.count, 1)
+      XCTAssertEqual(rows[0].fileQuant, "Q8_0", "quant read from the header, not the filename")
+      XCTAssertEqual(rows[0].effectiveQuant, "Q8_0", "display prefers the authoritative quant")
+      XCTAssertNotNil(rows[0].quantMismatchWarning,
+                      "filename says Q4_K_M but the file is Q8_0 → flagged")
+    }
+  }
+
+  func test_scan_honest_filename_has_quant_but_no_mismatch() throws {
+    try withTempDir { dir in
+      try writeGGUFFile("Model-Q8_0.gguf", fileType: 7, in: dir)  // both say Q8_0
+      let rows = try InstalledModels.scan(dir)
+      XCTAssertEqual(rows[0].fileQuant, "Q8_0")
+      XCTAssertNil(rows[0].quantMismatchWarning, "name and file agree → no warning")
+    }
+  }
+
+  func test_scan_skips_quant_read_for_partial_download() throws {
+    try withTempDir { dir in
+      try writeGGUFFile("Model-Q8_0.gguf", fileType: 7, in: dir)
+      try writeFile("Model-Q8_0.gguf.partial", bytes: 10, in: dir)
+      let rows = try InstalledModels.scan(dir)
+      XCTAssertEqual(rows.count, 1)
+      XCTAssertTrue(rows[0].isPartial)
+      XCTAssertNil(rows[0].fileQuant,
+                   "an in-progress download's header may be incomplete; quant read is skipped")
+    }
+  }
+
+  func test_scan_unrecognized_header_leaves_filename_quant() throws {
+    try withTempDir { dir in
+      // Garbage bytes → bad GGUF magic → no header quant; the filename quant
+      // (Q8_0) remains the displayed value, preserving pre-#667 behavior.
+      try writeFile("Model-Q8_0.gguf", bytes: 64, in: dir)
+      let rows = try InstalledModels.scan(dir)
+      XCTAssertNil(rows[0].fileQuant)
+      XCTAssertEqual(rows[0].effectiveQuant, "Q8_0", "falls back to the filename quant")
+      XCTAssertNil(rows[0].quantMismatchWarning)
+    }
+  }
+
   // MARK: - helpers
+
+  /// Write a minimal valid GGUF carrying a single `general.file_type` KV
+  /// (UINT32) so the scanner's header probe has something authoritative to
+  /// read. Mirrors the llama.cpp gguf.h little-endian layout.
+  private func writeGGUFFile(_ name: String, fileType: UInt32, in dir: URL) throws {
+    func u32(_ v: UInt32) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
+    func u64(_ v: UInt64) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
+    func gstr(_ s: String) -> Data { let b = Data(s.utf8); return u64(UInt64(b.count)) + b }
+    let kv = gstr("general.file_type") + u32(4 /* UINT32 */) + u32(fileType)
+    var body = Data("GGUF".utf8) + u32(3) /*version*/ + u64(0) /*tensor_count*/ + u64(1) /*kv count*/
+    body += kv
+    try body.write(to: dir.appendingPathComponent(name), options: .atomic)
+  }
 
   private func withTempDir(_ body: (URL) throws -> Void) throws {
     let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)

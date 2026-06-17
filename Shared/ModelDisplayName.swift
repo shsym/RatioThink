@@ -135,6 +135,37 @@ public struct ModelNameParts: Equatable, Sendable {
     token.range(of: quantPattern, options: [.regularExpression, .caseInsensitive]) != nil
   }
 
+  // MARK: authoritative GGUF quant (#667)
+  //
+  // `quant` above is parsed from the FILENAME — a heuristic that a renamed
+  // or mislabeled file can defeat (`…4bit` over a Q8_0 file). The GGUF
+  // header's `general.file_type` is authoritative; callers read it
+  // (`GGUFMetadata.quant`) at scan time and pass it here. These pure helpers
+  // are the single place every surface (chat dropdown, Settings inventory)
+  // decides what quant to show and whether the name is lying.
+
+  /// The quant to display: the authoritative header quant when known, else
+  /// the filename-parsed token, else nil (a safetensors dir-slug or an
+  /// exotic name with neither).
+  public func effectiveQuant(fileQuant: String?) -> String? {
+    fileQuant ?? quant
+  }
+
+  /// True only when BOTH the header quant and a filename quant token are
+  /// known AND they disagree — the case worth warning about. A missing
+  /// header quant (older GGUF) or a filename with no recognized quant token
+  /// is not a contradiction, just an absence.
+  public func quantMismatch(fileQuant: String?) -> Bool {
+    guard let fileQuant, let quant else { return false }
+    return fileQuant.uppercased() != quant.uppercased()
+  }
+
+  /// Human-readable warning for a name/file quant disagreement, naming both
+  /// the real (header) quant and the filename's claim.
+  public static func quantMismatchNote(fileQuant: String, nameQuant: String) -> String {
+    "File is \(fileQuant); the name says \(nameQuant)"
+  }
+
   /// Replace `-`/`_` separators with spaces and collapse runs, so a
   /// `Llama-3.2-1B-Instruct` stem reads `Llama 3.2 1B Instruct`. Casing is
   /// left untouched — title-casing would corrupt names like `Qwen3`.

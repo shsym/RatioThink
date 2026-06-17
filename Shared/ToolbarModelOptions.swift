@@ -29,9 +29,26 @@ public enum ToolbarModelOptions {
     /// variant label when there is no GGUF quant, so the row reads `bf16`
     /// instead of repeating the base name. `nil` for GGUF rows + undetermined.
     public let precision: String?
+    /// Authoritative GGUF quant read from the file header `general.file_type`
+    /// (#667), or nil for a non-GGUF / synthesized / unreadable row. Preferred
+    /// over the filename-parsed `parts.quant` so a mislabeled file shows its
+    /// real quant.
+    public let fileQuant: String?
 
     public var id: String { slug }
     public var isSelectable: Bool { unavailableReason == nil }
+
+    /// The GGUF quant to display: the authoritative header quant when known,
+    /// else the filename-parsed token. `nil` for a safetensors/dir row.
+    public var effectiveQuant: String? { parts.effectiveQuant(fileQuant: fileQuant) }
+
+    /// Non-nil when the filename's quant token contradicts the real file
+    /// quant (#667) — a warning naming both, surfaced on the row.
+    public var quantMismatchWarning: String? {
+      guard let fileQuant, parts.quantMismatch(fileQuant: fileQuant),
+            let nameQuant = parts.quant else { return nil }
+      return ModelNameParts.quantMismatchNote(fileQuant: fileQuant, nameQuant: nameQuant)
+    }
     /// Disambiguating source suffix for the row text. After the full-slug
     /// dedup (review v2 F2) a family can list an app-managed copy AND an
     /// HF-cache copy of the same quant (distinct slugs, same visible tag) —
@@ -48,7 +65,8 @@ public enum ToolbarModelOptions {
                 isProfileDefault: Bool,
                 unavailableReason: String? = nil,
                 isUnverified: Bool = false,
-                precision: String? = nil) {
+                precision: String? = nil,
+                fileQuant: String? = nil) {
       self.slug = slug
       self.displayName = displayName
       self.source = source
@@ -58,6 +76,7 @@ public enum ToolbarModelOptions {
       self.isUnverified = isUnverified
       self.parts = ModelNameParts.parse(slug)
       self.precision = precision
+      self.fileQuant = fileQuant
     }
   }
 
@@ -157,7 +176,8 @@ public enum ToolbarModelOptions {
                     isProfileDefault: slug == profileDefault,
                     unavailableReason: unavailableReason(for: model),
                     isUnverified: model?.isUnverified ?? false,
-                    precision: model?.precision)
+                    precision: model?.precision,
+                    fileQuant: model?.fileQuant)
     }
   }
 
