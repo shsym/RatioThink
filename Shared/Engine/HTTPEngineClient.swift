@@ -163,6 +163,23 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
     } catch {
       return AsyncThrowingStream { $0.finish(throwing: error) }
     }
+    // Transport decision (#703): `/v1/inferlet` CONTROL calls (`stream: false`,
+    // e.g. Best-of-N snapshot release) get a UNARY buffered response, not SSE.
+    // The inferlet returns a plain `application/json` ack, and the pie host
+    // proxies the guest's `wasi:http` response verbatim, so a `stream: false`
+    // request already comes back as one complete unary body. Routing it
+    // through the SSE frame reader would strip it (only `data:`-prefixed lines
+    // survive) and the caller would see zero frames — so read the body whole
+    // and hand it back as the stream's single frame. Generative calls
+    // (`stream: true`) keep the SSE path. The `req.stream` flag already rides
+    // the wire as the caller's intent, so this is the one switch for ALL
+    // future control ops.
+    if !req.stream {
+      return dispatchUnary(buildRequest: {
+        try await self.makeRequest("/v1/inferlet", method: "POST", body: body,
+                                   timeout: self.unaryTimeout)
+      })
+    }
     return dispatchStream(buildRequest: {
       try await self.makeRequest("/v1/inferlet", method: "POST", body: body,
                                  timeout: Self.streamingIdleTimeout)
@@ -277,6 +294,44 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
             try Task.checkCancellation()
             continuation.yield(frame.dataBytes)
           }
+          continuation.finish()
+        } catch {
+          continuation.finish(throwing: error)
+        }
+      }
+      continuation.onTermination = { _ in task.cancel() }
+    }
+  }
+
+  /// Unary `/v1/inferlet` dispatch (#703): buffer the full `application/json`
+  /// body and yield it as the stream's single frame, so a control inferlet's
+  /// non-SSE ack survives the `AsyncThrowingStream<Data, Error>` contract that
+  /// `dispatchInferlet` shares with the streaming path. Callers consume both
+  /// transports identically — one or many `Data` frames.
+  ///
+  /// Mirrors `openStream`'s single connection-lost retry: a `POST` reusing a
+  /// stale pooled keep-alive connection fails with `networkConnectionLost`
+  /// (-1005) before any byte arrives, and URLSession does not auto-retry POSTs.
+  /// The retry is side-effect-safe here because the failure is at connect (no
+  /// body was read) and a release is idempotent (re-deleting reports `absent`).
+  private func dispatchUnary(
+    buildRequest: @escaping @Sendable () async throws -> URLRequest
+  ) -> AsyncThrowingStream<Data, Error> {
+    let session = self.session
+    return AsyncThrowingStream { continuation in
+      let task = Task {
+        do {
+          func attempt() async throws -> (Data, URLResponse) {
+            try await session.data(for: try await buildRequest())
+          }
+          let (data, response): (Data, URLResponse)
+          do {
+            (data, response) = try await attempt()
+          } catch let error as URLError where error.code == .networkConnectionLost {
+            (data, response) = try await attempt()
+          }
+          try Self.assertOK(response, data: data)
+          continuation.yield(data)
           continuation.finish()
         } catch {
           continuation.finish(throwing: error)

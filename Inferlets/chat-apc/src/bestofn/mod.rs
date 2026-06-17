@@ -459,8 +459,22 @@ async fn run_round(
                 stream::NO_CANDIDATES_MESSAGE,
             ))
             .await;
-    } else {
-        let _ = stream::emit_awaiting_selection(&mut em, params.level, &picks).await;
+    } else if let Err(sse::EmitError::Disconnected) =
+        stream::emit_awaiting_selection(&mut em, params.level, &picks).await
+    {
+        // #703 F5: the client dropped before receiving the pick list, so it can
+        // never pick (or app-release) these candidates — the app's abandon
+        // sweep keys on a materialized round, which a never-delivered terminal
+        // lacks. Free the just-saved snapshots now rather than leak them until
+        // engine teardown. Bounded to this one round's `n` candidate snapshots,
+        // freed through the same path the app-driven release uses.
+        let names: Vec<String> = picks.iter().map(|p| p.snapshot_name.clone()).collect();
+        let report = release::release_snapshots(model, &names);
+        eprintln!(
+            "[chat-apc] best-of-n: client disconnected before awaiting_selection; \
+             freed {}/{} orphaned candidate snapshots (request {request_id})",
+            report.released, report.requested
+        );
     }
     sse::emit_done_logged(&mut em, "bon_terminal").await;
     em.finish()
@@ -528,16 +542,32 @@ fn error_node(id: &str, branch_index: usize, level: usize, reasoning: String, er
 /// shared base, append the answer as a sealed template assistant turn, flush,
 /// and save under `name`. Returns whether the snapshot was persisted (a
 /// best-effort failure leaves the candidate non-pickable, not the round dead).
+///
+/// A failure at any of fork/flush/save logs the underlying engine error to
+/// stderr before collapsing to `false` (#703 F6): the caller turns `false`
+/// into a fixed "could not be saved" node that loses the cause, so a SYSTEMIC
+/// snapshot-store problem (e.g. page-store exhaustion) is invisible without
+/// this breadcrumb. The error rides the inferlet stderr-event channel.
 async fn save_candidate_snapshot(base_ctx: &Context, answer: &str, name: &str) -> bool {
     let mut snap = match base_ctx.fork() {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(e) => {
+            eprintln!("[chat-apc] best-of-n: fork for snapshot {name} failed: {e}");
+            return false;
+        }
     };
     snap.assistant(answer);
-    if snap.flush().await.is_err() {
+    if let Err(e) = snap.flush().await {
+        eprintln!("[chat-apc] best-of-n: flush for snapshot {name} failed: {e}");
         return false;
     }
-    snap.save(name).is_ok()
+    match snap.save(name) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[chat-apc] best-of-n: save of snapshot {name} failed: {e}");
+            false
+        }
+    }
 }
 
 /// Engine operations a think-more round needs, abstracted so the

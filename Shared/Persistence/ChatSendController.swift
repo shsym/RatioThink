@@ -911,13 +911,22 @@ public final class ChatSendController: ObservableObject {
     else { return }
     Task { @MainActor in
       do {
-        // Drain the response so the request completes. The server frees the KV
-        // pages on its side; HTTP failures throw here (`assertOK`) and are
-        // logged. Release-ack observability (short-release accounting) is a
-        // deferred follow-up — `dispatch_release` returns an unframed JSON ack
-        // that the SSE frame reader strips, so there is nothing to inspect on
-        // this path today.
-        for try await _ in engine.dispatchInferlet(request) {}
+        // Drain the unary release ack and check the accounting (#703 F4). The
+        // request sets `stream: false`, so `dispatchInferlet` takes the unary
+        // control transport and yields the server's `application/json`
+        // ReleaseReport as a single frame (the old SSE path stripped it). HTTP
+        // failures throw here (`assertOK`) and are logged below; a short
+        // release — fewer freed than requested — is surfaced so a release that
+        // freed nothing no longer reports silent success.
+        var ack: BestOfNReleaseAck?
+        for try await frame in engine.dispatchInferlet(request) {
+          if let decoded = try? JSONDecoder().decode(BestOfNReleaseAck.self, from: frame) {
+            ack = decoded
+          }
+        }
+        if let ack, let message = Self.shortReleaseLog(ack) {
+          Log.engine.notice("ChatSendController: \(message, privacy: .public)")
+        }
       } catch {
         let detail = (error as? LocalizedError)?.errorDescription ?? "\(error)"
         Log.engine.error(
@@ -933,6 +942,19 @@ public final class ChatSendController: ObservableObject {
     guard let data = try? JSONEncoder().encode(BestOfNReleaseInput(model: modelID, release: names))
     else { return nil }
     return InferletRequest(inferlet: "best-of-n", input: data, messages: nil, stream: false)
+  }
+
+  /// #703 F4: the human-readable short-release line, or nil when the engine
+  /// freed every requested snapshot. A short release (`released < requested`)
+  /// is benign for a re-release (some names already evicted), but a FULL miss
+  /// (`released == 0`) signals the release reached the wrong engine or the
+  /// round's snapshots were already gone. Pure so the accounting decision is
+  /// unit-tested without a live engine. `nonisolated` — pure over its argument,
+  /// touches no actor state.
+  nonisolated static func shortReleaseLog(_ ack: BestOfNReleaseAck) -> String? {
+    guard ack.released < ack.requested else { return nil }
+    return "best-of-n release freed \(ack.released)/\(ack.requested) snapshots "
+      + "(\(ack.absent) already absent)"
   }
 
   /// Canonical wire string for a finish reason. Shared by `finishMeta`
@@ -1130,6 +1152,18 @@ private struct BestOfNReleaseInput: Encodable {
   }
 
   private enum CodingKeys: String, CodingKey { case model, release }
+}
+
+/// The unary `application/json` ack `bestofn::release::dispatch_release` returns
+/// (#703): the snapshot-release accounting. `released + absent == requested`
+/// always; `released < requested` means some names were already gone (a
+/// re-release or an earlier eviction). Decoded from the single frame the unary
+/// control transport yields so a release that freed nothing no longer reports
+/// silent success.
+struct BestOfNReleaseAck: Decodable, Equatable {
+  let requested: Int
+  let released: Int
+  let absent: Int
 }
 
 /// Failure constructing a tree-of-thought send.

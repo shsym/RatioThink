@@ -590,6 +590,51 @@ final class HTTPEngineClientTests: XCTestCase {
     XCTAssertEqual(frames, [#"{"frame":1}"#, #"{"frame":2}"#])
   }
 
+  /// #703 transport decision: a `stream: false` CONTROL dispatch takes the
+  /// UNARY path — the inferlet's plain `application/json` ack (no `data:`
+  /// framing) is buffered whole and yielded as the stream's single frame. The
+  /// old SSE-only path would strip it (no `data:` lines) and surface zero
+  /// frames, hiding the release accounting.
+  func test_dispatchInferlet_unary_control_yields_unframed_json_body() async throws {
+    FakeSSEURLProtocol.handler = { _ in
+      .json(
+        status: 200,
+        body: #"{"object":"best_of_n.release","requested":3,"released":2,"absent":1}"#)
+    }
+    let req = InferletRequest(
+      inferlet: "best-of-n",
+      input: Data(#"{"release":["a","b","c"]}"#.utf8),
+      messages: nil,
+      stream: false)
+    var frames: [Data] = []
+    for try await frame in makeClient().dispatchInferlet(req) {
+      frames.append(frame)
+    }
+    XCTAssertEqual(frames.count, 1, "unary control returns exactly one buffered frame")
+    let ack = try JSONDecoder().decode(BestOfNReleaseAck.self, from: try XCTUnwrap(frames.first))
+    XCTAssertEqual(ack, BestOfNReleaseAck(requested: 3, released: 2, absent: 1))
+  }
+
+  /// The unary control path surfaces a non-2xx as an error (via `assertOK`)
+  /// rather than yielding a frame — the release must not silently "succeed" on
+  /// an HTTP failure.
+  func test_dispatchInferlet_unary_control_non_2xx_throws() async {
+    FakeSSEURLProtocol.handler = { _ in
+      .json(status: 500, body: #"{"error":{"code":"boom","message":"nope"}}"#)
+    }
+    let req = InferletRequest(
+      inferlet: "best-of-n",
+      input: Data(#"{"release":["a"]}"#.utf8),
+      messages: nil,
+      stream: false)
+    do {
+      for try await _ in makeClient().dispatchInferlet(req) {}
+      XCTFail("expected a non-2xx unary control response to throw")
+    } catch {
+      // expected
+    }
+  }
+
   // MARK: - Connection-lost retry (stale keep-alive reuse)
 
   /// `URLSession` pools HTTP/1.1 keep-alive connections; a reused one the

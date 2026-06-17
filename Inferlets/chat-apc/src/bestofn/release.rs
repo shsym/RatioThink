@@ -80,6 +80,19 @@ impl ReleaseOps for InferletReleaseOps<'_> {
     }
 }
 
+/// Free a set of named snapshots over the live engine `Context` and report the
+/// accounting. Shares the [`InferletReleaseOps`] + [`release_all`] path with
+/// [`dispatch_release`] so the app-driven terminal release and the engine-side
+/// disconnect cleanup (#703 F5) delete through one code path. Used by
+/// [`run_round`](super::run_round) when the terminal `awaiting_selection` emit
+/// fails: the client never received the pick list, so the round's just-saved
+/// candidate snapshots can never be picked or app-released — free them now
+/// rather than leak them until engine teardown.
+pub(crate) fn release_snapshots(model: &Model, names: &[String]) -> ReleaseReport {
+    let mut ops = InferletReleaseOps { model };
+    release_all(&mut ops, names)
+}
+
 #[derive(Serialize)]
 struct ReleaseAck {
     object: &'static str,
@@ -183,5 +196,30 @@ mod tests {
         assert_eq!(report, ReleaseReport { requested: 3, released: 2, absent: 1 });
         assert_eq!(ops.deleted, names(&["a", "b", "c"]), "every name attempted");
         assert!(ops.present.is_empty(), "no present snapshot left behind");
+    }
+
+    /// #703 F5 contract: the disconnect cleanup frees EXACTLY the saved picks'
+    /// snapshot names. Locks the mapping `run_round` uses (each `Pick`'s
+    /// `snapshot_name` is handed to `release_snapshots`) onto the same
+    /// `release_all` path, so an orphaned round leaves nothing behind. The
+    /// live-`Context` wrapper [`release_snapshots`] is exercised end-to-end by
+    /// the real-engine e2e; here we prove the name set + accounting.
+    #[test]
+    fn disconnect_cleanup_frees_exactly_the_saved_pick_snapshots() {
+        use super::super::stream::Pick;
+        let picks = vec![
+            Pick { id: "n0".to_string(), branch_index: 0, snapshot_name: "bon/r/1/0".to_string() },
+            Pick { id: "n1".to_string(), branch_index: 1, snapshot_name: "bon/r/1/1".to_string() },
+        ];
+        // Exactly the expression `run_round` uses on the disconnect branch.
+        let to_free: Vec<String> = picks.iter().map(|p| p.snapshot_name.clone()).collect();
+        let mut ops = MockOps {
+            present: to_free.iter().cloned().collect(),
+            deleted: Vec::new(),
+        };
+        let report = release_all(&mut ops, &to_free);
+        assert_eq!(report, ReleaseReport { requested: 2, released: 2, absent: 0 });
+        assert_eq!(ops.deleted, to_free, "every saved pick snapshot attempted");
+        assert!(ops.present.is_empty(), "no orphaned snapshot survives the disconnect cleanup");
     }
 }
