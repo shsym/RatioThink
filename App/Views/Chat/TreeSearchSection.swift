@@ -404,12 +404,26 @@ private struct ToTNodeRow: View {
         beamGlyph
         scoreBadge
       }
-      Text(headline)
-        .font(.caption.monospaced())
-        .foregroundStyle(headlineTint)
-        .lineLimit(isBestOfN && !isDimmed ? 3 : 1)
-        .strikethrough(isPruned, color: .secondary)
-        .frame(maxWidth: .infinity, alignment: .leading)
+      // The headline is the node's answer (`headline` returns `answer` when one
+      // exists). A tree-of-thought node shows it `lineLimit 1` as a title above
+      // its full-answer detail. A Best-of-N candidate, expanded by default,
+      // renders its full answer in `detail()` below — so repeating the answer
+      // here would show it TWICE on the card. Suppress the headline text for an
+      // expanded Best-of-N candidate (detail owns the answer); keep it as the
+      // preview when the candidate is FOLDED (read-only history), where detail
+      // is hidden and the header is the only place the answer can show.
+      if !(isBestOfN && isExpanded) {
+        Text(headline)
+          .font(.caption.monospaced())
+          .foregroundStyle(headlineTint)
+          .lineLimit(isBestOfN && !isDimmed ? 3 : 1)
+          .strikethrough(isPruned, color: .secondary)
+          .frame(maxWidth: .infinity, alignment: .leading)
+      } else {
+        // Keep the header full-width so the glyph stays left-aligned and the
+        // whole card rectangle remains the pick/expand hit target.
+        Spacer(minLength: 0)
+      }
       // No chevron while the card is a pick target — a live pickable candidate
       // is always shown expanded and the only affordance is "tap to pick".
       if hasDetail, !isPickAction {
