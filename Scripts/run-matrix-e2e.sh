@@ -68,6 +68,7 @@ MATRIX_MODELS=(
   "bartowski/Llama-3.2-3B-Instruct-GGUF|Llama-3.2-3B-Instruct-Q4_K_M.gguf|2020000000|0|1"
   "bartowski/Qwen2.5-7B-Instruct-GGUF|Qwen2.5-7B-Instruct-Q4_K_M.gguf|4683074240|0|1"
   "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF|Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf|4920000000|0|1"
+  "unsloth/gemma-4-12b-it-GGUF|gemma-4-12b-it-Q4_K_M.gguf|7121860000|0|1"
   "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF|Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf|8988111072|0|1"
   "Qwen/Qwen3-14B-GGUF|Qwen3-14B-Q4_K_M.gguf|9001752960|1|1"
   "unsloth/Qwen3.6-27B-GGUF|Qwen3.6-27B-Q4_K_M.gguf|16817244384|1|1"

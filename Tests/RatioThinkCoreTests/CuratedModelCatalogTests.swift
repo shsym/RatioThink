@@ -168,6 +168,24 @@ final class CuratedModelCatalogTests: XCTestCase {
     }
   }
 
+  /// Gemma 4 dense text GGUF (#705). The engine runs it as PieArch::Gemma4
+  /// (gemma4 GGUF load taught to the portable driver in this change set);
+  /// the curated row pins the verified single-file coordinates + size and
+  /// the manual/local posture. The vision/audio mmproj is a separate file
+  /// pie does not load, so the dense text build is single-file.
+  func test_gemma4_entry_pins_single_file_coordinates() {
+    let m = CuratedModelCatalog.model(withID: "gemma-4-12b-it-q4_k_m")
+    XCTAssertNotNil(m, "the Gemma 4 curated entry must exist")
+    XCTAssertEqual(m?.huggingFaceRepo, "unsloth/gemma-4-12b-it-GGUF")
+    XCTAssertEqual(m?.huggingFaceFile, "gemma-4-12b-it-Q4_K_M.gguf")
+    XCTAssertEqual(m?.approximateSizeBytes, 7_121_860_000)
+    XCTAssertEqual(m?.installIntent, .manualOnly)
+    XCTAssertFalse(HFCacheCatalog.isSplitShardFilename(m?.huggingFaceFile ?? ""),
+                   "the Gemma 4 entry must be a monolithic single-file GGUF")
+    XCTAssertFalse(m?.pieSupportNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true,
+                   "the Gemma 4 entry must document Pie support constraints")
+  }
+
   /// #425 regression pin: Qwen2.5 7B Q4_K_M must come from bartowski's
   /// single-file repo, NOT the official `Qwen/Qwen2.5-7B-Instruct-GGUF`,
   /// which publishes that quant ONLY as `…-q4_k_m-00001-of-00002.gguf`

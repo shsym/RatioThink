@@ -359,5 +359,28 @@ public enum CuratedModelCatalog {
       pieSupportNotes: "Single-file Qwen3.6 MoE GGUF (general.architecture=qwen35moe → PieArch::Qwen3_5; routed + shared experts); manual/local real-engine E2E only.",
       installIntent: .manualOnly
     ),
+    // Gemma 4 — Google's gemma4 arch, run by the portable Metal engine as
+    // PieArch::Gemma4 (alternating sliding/full attention, per-layer dual
+    // head_dim + kv-head count, proportional RoPE on full layers,
+    // SentencePiece tokenizer). The single-file dense TEXT build was
+    // real-loaded through the portable driver (boot + chat completion:
+    // "The capital of France is" → "Paris"; gold → "Au") before pinning.
+    // The vision/audio projector (mmproj-*.gguf) is a separate file pie
+    // does not load; the dense text GGUF is single-file. Manual/local
+    // posture (~6.6 GiB).
+    CuratedModel(
+      id: "gemma-4-12b-it-q4_k_m",
+      displayName: "Gemma 4 12B",
+      publisher: "Google",
+      parameterCountBillions: 12.0,
+      quantization: "Q4_K_M",
+      approximateSizeBytes: 7_121_860_000,
+      huggingFaceRepo: "unsloth/gemma-4-12b-it-GGUF",
+      huggingFaceFile: "gemma-4-12b-it-Q4_K_M.gguf",
+      summary: "Google's Gemma 4 dense chat model — strong general quality on roomy Macs.",
+      recommendedSystemMemoryBytes: 32 * 1024 * 1024 * 1024,
+      pieSupportNotes: "Single-file Gemma 4 text GGUF (general.architecture=gemma4 → PieArch::Gemma4); manual/local real-engine E2E only.",
+      installIntent: .manualOnly
+    ),
   ]
 }
