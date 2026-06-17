@@ -945,11 +945,6 @@ public final class ChatSendController: ObservableObject {
     return InferletRequest(inferlet: "best-of-n", input: data, messages: nil, stream: false)
   }
 
-  /// #703 F4: the human-readable short-release line, or nil when the engine
-  /// freed every requested snapshot. A short release (`released < requested`)
-  /// is benign for a re-release (some names already evicted), but a FULL miss
-  /// (`released == 0`) signals the release reached the wrong engine or the
-  /// round's snapshots were already gone. Pure so the accounting decision is
   /// Decode the unary release ack from the dispatched frames (#703 F4/F1).
   /// Returns nil ONLY when no frame arrived; a frame whose body is not a
   /// decodable `ReleaseReport` THROWS the `DecodingError` rather than collapsing
@@ -964,6 +959,11 @@ public final class ChatSendController: ObservableObject {
     return ack
   }
 
+  /// #703 F4: the human-readable short-release line, or nil when the engine
+  /// freed every requested snapshot. A short release (`released < requested`)
+  /// is benign for a re-release (some names already evicted), but a FULL miss
+  /// (`released == 0`) signals the release reached the wrong engine or the
+  /// round's snapshots were already gone. Pure so the accounting decision is
   /// unit-tested without a live engine. `nonisolated` — pure over its argument,
   /// touches no actor state.
   nonisolated static func shortReleaseLog(_ ack: BestOfNReleaseAck) -> String? {
