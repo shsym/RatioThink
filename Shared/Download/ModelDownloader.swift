@@ -188,7 +188,14 @@ public enum DownloadError: Error, Equatable, Sendable {
   /// sidecar write/fsync itself failed — in that case a retry will
   /// restart from byte 0 (review v2 F5). The GUI uses this to decide
   /// whether to warn the user before offering "Retry".
-  case transportFailed(message: String, resumeAvailable: Bool)
+  /// `urlErrorCode` carries the underlying `URLError.Code.rawValue`
+  /// (e.g. `NSURLErrorTimedOut`) when the failure originated from a
+  /// `URLSession` transport error, so `userFacingMessage` can render a
+  /// specific "timed out" / "check your connection" caption instead of
+  /// a generic one (#720). `nil` for synthesized transport failures
+  /// with no `URLError` origin (e.g. the missing-finish-callback
+  /// reclaim path).
+  case transportFailed(message: String, resumeAvailable: Bool, urlErrorCode: Int?)
   case sha256Mismatch(expected: String, actual: String)
   /// `cause` carries the underlying NSError's `domain`/`code` plus
   /// POSIX errno (when extractable) so the GUI / log scraper can
@@ -207,6 +214,53 @@ public enum DownloadError: Error, Equatable, Sendable {
   /// transient. Review v16 F2.
   case invalidArguments(message: String)
   case httpStatus(code: Int)
+}
+
+extension DownloadError {
+  /// Single source of clean, user-facing copy for a download failure
+  /// (#720). The raw `DownloadError` (with its NSError dumps, paths,
+  /// and digests) stays in the logs via `String(describing:)`; this is
+  /// what the GUI shows in the download row / action-error slot.
+  ///
+  /// Mirrors the code-aware framing `LocalAPIState.failureReason` uses
+  /// for engine failures: honest about the category, actionable where a
+  /// retry helps, and never leaking the underlying transport string.
+  public var userFacingMessage: String {
+    switch self {
+    case .transportFailed(_, _, let urlErrorCode):
+      switch urlErrorCode {
+      case NSURLErrorTimedOut:
+        return "Download timed out — check your connection and try again."
+      case NSURLErrorNotConnectedToInternet,
+           NSURLErrorNetworkConnectionLost,
+           NSURLErrorCannotFindHost,
+           NSURLErrorCannotConnectToHost,
+           NSURLErrorDNSLookupFailed:
+        return "Can’t reach the server — check your internet connection and try again."
+      default:
+        return "Download failed because of a network problem. Try again."
+      }
+    case .httpStatus(let code):
+      if code == 404 {
+        return "That file wasn’t found on the server (HTTP 404)."
+      }
+      return "The server returned an error (HTTP \(code)). Try again later."
+    case .sha256Mismatch:
+      return "The download didn’t pass its integrity check. Try downloading it again."
+    case .writeFailed:
+      return "Couldn’t save the download — check available disk space and permissions."
+    case .modelsRootUnavailable:
+      return "Couldn’t access the models folder. Check disk space and permissions."
+    case .invalidArguments:
+      return "That download request was invalid."
+    case .alreadyInFlight(_, let file):
+      return "“\(file)” is already downloading."
+    case .unknownHandle:
+      return "This download is no longer active."
+    case .cancelled:
+      return "Download cancelled."
+    }
+  }
 }
 
 /// Manages background HF GGUF downloads on behalf of the Helper.
@@ -1383,7 +1437,8 @@ extension ModelDownloader: URLSessionDownloadDelegate {
         log.fault("didCompleteWithError(nil) with handle \(handleID.uuidString, privacy: .public) — URLSession skipped didFinishDownloadingTo; reclaiming")
         finishFailed(handleID,
                      .transportFailed(message: "download completed without finish callback",
-                                      resumeAvailable: false))
+                                      resumeAvailable: false,
+                                      urlErrorCode: nil))
       }
       return
     }
@@ -1462,9 +1517,15 @@ extension ModelDownloader: URLSessionDownloadDelegate {
         }
       }
     }
+    // Carry the URL error code so `userFacingMessage` can render a
+    // specific "timed out" / "check your connection" caption (#720).
+    // Only meaningful for `NSURLErrorDomain` failures; other domains
+    // fall through to the generic network copy.
+    let urlErrorCode = nsErr.domain == NSURLErrorDomain ? nsErr.code : nil
     finishFailed(handleID,
                  .transportFailed(message: String(describing: error!),
-                                  resumeAvailable: resumeAvailable))
+                                  resumeAvailable: resumeAvailable,
+                                  urlErrorCode: urlErrorCode))
   }
 
   /// Replace the failed (orphan-resume) task with a fresh
@@ -1818,7 +1879,11 @@ extension ModelDownloader: URLSessionDownloadDelegate {
   }
 
   private func finishFailed(_ handleID: UUID, _ reason: DownloadError) {
+    // #720: the wire payload (and therefore the GUI caption) carries the
+    // clean, user-facing message; the raw structured error stays in the
+    // logs only via the `.error` line below.
     let reasonString = String(describing: reason)
+    let userMessage = reason.userFacingMessage
     if let final = mutateAndPublish(handleID, { active in
       active.lastProgress = DownloadProgress(handleID: handleID,
                                              phase: .failed,
@@ -1826,7 +1891,7 @@ extension ModelDownloader: URLSessionDownloadDelegate {
                                              bytesExpected: active.totalBytes,
                                              etaSeconds: nil,
                                              verification: .notApplicable,
-                                             failureReason: reasonString)
+                                             failureReason: userMessage)
     }) {
       log.error("failed handle=\(handleID.uuidString, privacy: .public) reason=\(reasonString, privacy: .public)")
       finishAll(final)

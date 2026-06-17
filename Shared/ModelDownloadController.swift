@@ -87,8 +87,10 @@ public final class ModelDownloadController: ObservableObject {
     let result = downloader.start(repo: repo, file: file)
     switch result {
     case .failure(let err):
+      // #720: surface clean, user-facing copy in the action-error slot;
+      // the raw structured error stays in the logs / diagnostics only.
       let msg = String(describing: err)
-      lastError = "start(repo: \(repo), file: \(file)) failed: \(msg)"
+      lastError = err.userFacingMessage
       Self.log.error("ModelDownloadController enqueue failed: \(msg, privacy: .public)")
       Diag.app.event("download.fail", [("phase", "start"), ("file", file),
                                        ("reason", DiagnosticLog.redactHome(msg))])

@@ -799,7 +799,8 @@ final class ModelDownloaderTests: XCTestCase {
   func test_transport_failure_engineerror_does_not_encode_resume_token() {
     let mapped = HelperExportedAPI.engineError(
       forDownload: .transportFailed(message: "ECONNRESET",
-                                    resumeAvailable: true))
+                                    resumeAvailable: true,
+                                    urlErrorCode: nil))
     XCTAssertFalse(mapped.message.contains("resume="),
                    "F1: wire surface must not encode the resume token until a real consumer lands")
   }
@@ -1642,6 +1643,62 @@ final class ModelDownloaderTests: XCTestCase {
       .appendingPathComponent("pie-dl-test-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
+  }
+
+  // MARK: - #720: user-facing failure copy (raw error stays in logs)
+
+  /// A connection timeout must surface friendly, actionable copy — NOT
+  /// the raw `Error Domain=NSURLErrorDomain Code=-1001 …` NSError dump.
+  func test_userFacingMessage_timeout_is_friendly_and_actionable() {
+    let msg = DownloadError.transportFailed(
+      message: "Error Domain=NSURLErrorDomain Code=-1001 \"The request timed out.\"",
+      resumeAvailable: false,
+      urlErrorCode: NSURLErrorTimedOut).userFacingMessage
+    XCTAssertTrue(msg.lowercased().contains("timed out"), "must name the timeout: \(msg)")
+    XCTAssertFalse(msg.contains("NSURLErrorDomain"), "must not leak the raw NSError: \(msg)")
+    XCTAssertFalse(msg.contains("-1001"), "must not leak the raw code: \(msg)")
+  }
+
+  /// Offline / unreachable-host transport errors map to a connection-
+  /// check message rather than the raw transport string.
+  func test_userFacingMessage_offline_points_at_connection() {
+    for code in [NSURLErrorNotConnectedToInternet,
+                 NSURLErrorNetworkConnectionLost,
+                 NSURLErrorCannotFindHost,
+                 NSURLErrorCannotConnectToHost,
+                 NSURLErrorDNSLookupFailed] {
+      let msg = DownloadError.transportFailed(message: "raw \(code)",
+                                              resumeAvailable: false,
+                                              urlErrorCode: code).userFacingMessage
+      XCTAssertTrue(msg.lowercased().contains("connection"),
+                    "code \(code) must mention the connection: \(msg)")
+      XCTAssertFalse(msg.contains("raw \(code)"), "must not leak the raw string: \(msg)")
+    }
+  }
+
+  /// A transport error with no/unknown URL code still gets friendly
+  /// copy, never the raw producer string.
+  func test_userFacingMessage_generic_transport_is_friendly() {
+    let msg = DownloadError.transportFailed(message: "ECONNRESET",
+                                            resumeAvailable: false,
+                                            urlErrorCode: nil).userFacingMessage
+    XCTAssertFalse(msg.contains("ECONNRESET"), "must not leak the raw string: \(msg)")
+    XCTAssertFalse(msg.isEmpty)
+  }
+
+  /// Non-transport failures are gated too: each maps to a distinct,
+  /// raw-free, human caption.
+  func test_userFacingMessage_other_cases_are_gated() {
+    XCTAssertFalse(DownloadError.sha256Mismatch(expected: "abc", actual: "def")
+      .userFacingMessage.contains("abc"))
+    XCTAssertFalse(DownloadError.writeFailed(message: "rename ENOSPC", cause: nil)
+      .userFacingMessage.contains("ENOSPC"))
+    XCTAssertTrue(DownloadError.httpStatus(code: 404)
+      .userFacingMessage.contains("404"))
+    XCTAssertFalse(DownloadError.modelsRootUnavailable(message: "/secret/path")
+      .userFacingMessage.contains("/secret/path"))
+    XCTAssertFalse(DownloadError.invalidArguments(message: "../escape")
+      .userFacingMessage.contains("../escape"))
   }
 }
 

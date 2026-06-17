@@ -512,7 +512,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     case .alreadyInFlight(let repo, let file):
       return EngineError(code: .alreadyRunning,
                          message: "download already in flight for \(repo)/\(file)")
-    case .transportFailed(let message, _):
+    case .transportFailed(let message, _, _):
       // `resumeAvailable` is *intentionally* not surfaced on the
       // wire at Phase 2.5 (review v3 F1 — there is no GUI consumer
       // yet, and the v2 string-smuggling approach was undefended
