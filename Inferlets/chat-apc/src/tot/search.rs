@@ -201,44 +201,105 @@ const SCORE_MAX_TOKENS: usize = 160;
 const SYNTHESIS_TEMPERATURE: f32 = 0.3;
 const SYNTHESIS_TOP_P: f32 = 0.9;
 
-// ── Decoupled propose temperature (#693a) ─────────────────────────────
+// ── Diverse decoding (#693) ───────────────────────────────────────────
 //
 // #683 confirmed per-fork sampler seeds are INDEPENDENT, so residual sibling
-// collapse is DISTRIBUTION-driven, not seed-driven. The #693 measurement campaign
-// then found that on the PRODUCTION model (Qwen3-8B) the severe collapse #683
-// saw on the 0.6B is largely absent — gsm8k convergence is mostly INTRINSIC
-// (one correct numeric answer → siblings agree, which is healthy) — and that a
-// greedy-anchor first branch is COUNTERPRODUCTIVE on a peaked small-model
-// distribution: it guarantees the mode is one sibling, which collapsed
-// explorers then duplicate (a 0.6B gsm8k prompt went from L1 divergence 0.357
-// to 0.000 — a full three-way collapse — once branch 0 was forced greedy). A
-// cross-sibling logit penalty has no host API (the WIT `sampler` variant
-// exposes no presence/frequency-penalty or bias field) and is deferred to an
-// engine change.
+// collapse is DISTRIBUTION-driven, not seed-driven. #693 attacks it with three
+// composed levers (all measured with the gated divergence harness):
 //
-// What DOES survive the evidence is the narrow, safe part of "decouple the
-// propose temperature from the global temp knob": the candidate-generation
-// temperature is sourced from the chat profile's `sampling.temperature`
-// (#523 Part B), so a profile tuned LOW for deterministic chat would silently
-// collapse a tree-of-thought search to near-greedy siblings. Flooring the
-// propose temperature at the measured-healthy diversity value decouples ToT
-// exploration from that knob without adding a mode-duplicating greedy anchor.
+//   (a) DECOUPLED PROPOSE TEMPERATURE — the candidate-generation temperature is
+//       sourced from the chat profile's `sampling.temperature` (#523 Part B),
+//       so a profile tuned LOW for deterministic chat silently collapses a
+//       tree-of-thought search to near-greedy siblings. The propose temperature
+//       is floored at the measured-healthy diversity value
+//       ([`PROPOSE_TEMP_FLOOR`]) so ToT exploration is decoupled from that knob.
+//       No-op at or above the default, so the common case is unchanged.
+//
+//   (b) GREEDY-ANCHOR FIRST BRANCH + EXPLORER TEMPERATURE LADDER — branch 0 of a
+//       sibling group decodes greedily ([`Sampler::Argmax`]) so the model's
+//       deterministic mode is present in the tree exactly once; the explorer
+//       siblings (branches `1..breadth`) sample across an ASCENDING temperature
+//       band that starts ABOVE the floor, so they spread across the
+//       distribution instead of duplicating the anchored mode. A naked greedy
+//       anchor (explorers at the same temperature) regressed diversity on a
+//       peaked 0.6B (a gsm8k group collapsed to L1 divergence 0.000); the
+//       ladder is what keeps the explorers distinct from the anchor.
+//
+//   (c) CROSS-SIBLING LOGIT PENALTY — see [`super::schema::TotParams`]
+//       `sibling_penalty`. When enabled the group generates sequentially and
+//       each explorer down-biases the tokens earlier siblings already emitted
+//       (via the engine `logit-bias` forward-pass primitive added for #693),
+//       so siblings actively discourage each other's token choices. Off by
+//       default because the sequential dependency forgoes the #465/#650
+//       sibling co-batching; the harness enables it to measure the three
+//       levers together.
 
 /// Floor for the tree-of-thought propose (candidate-generation) temperature
-/// (#693a). The branch temperature is the inherited generation temperature
-/// raised to at least this value, so a low chat-profile `sampling.temperature`
-/// can no longer collapse the search to near-greedy siblings. 0.7 is the
-/// measured-healthy diversity temperature (see `schema::DEFAULT_TEMPERATURE`,
-/// whose rationale records zero byte-identical sibling pairs at 0.7). At or
-/// above the default this is a no-op, so the common case is unchanged.
+/// (#693a). 0.7 is the measured-healthy diversity temperature (see
+/// `schema::DEFAULT_TEMPERATURE`, whose rationale records zero byte-identical
+/// sibling pairs at 0.7).
 const PROPOSE_TEMP_FLOOR: f32 = 0.7;
 
-/// The propose temperature for branch generation: the search's generation
-/// temperature floored at [`PROPOSE_TEMP_FLOOR`] (#693a). Decouples ToT
-/// exploration from a low inherited chat-profile temperature. Pure →
+/// Smallest temperature gap between the greedy anchor and the COOLEST explorer
+/// sibling (#693b). The explorer ladder starts at `floor + step` rather than at
+/// the floor, so even the coolest explorer samples hotter than the anchored
+/// mode and is unlikely to reproduce it.
+const PROPOSE_TEMP_STEP: f32 = 0.2;
+
+/// Width of the explorer temperature band above its start (#693b). The hottest
+/// explorer samples at `floor + step + span`, so a sibling group spans a real
+/// temperature range instead of sampling every explorer at one value.
+const PROPOSE_TEMP_SPAN: f32 = 0.3;
+
+/// Hard cap on any explorer temperature (#693b). Guards the quality cliff
+/// measured in the diversity probe (a 1.3 cell produced the sweep's only branch
+/// failure; see `schema::DEFAULT_TEMPERATURE`).
+const PROPOSE_TEMP_MAX: f32 = 1.3;
+
+/// The propose temperature band floor for branch generation: the search's
+/// generation temperature floored at [`PROPOSE_TEMP_FLOOR`] (#693a). Decouples
+/// ToT exploration from a low inherited chat-profile temperature. Pure →
 /// unit-tested.
 fn propose_temperature(gen_temp: f32) -> f32 {
     gen_temp.max(PROPOSE_TEMP_FLOOR)
+}
+
+/// Per-branch sampler for diverse decoding (#693a+b). Maps a sibling's
+/// `branch_index` within a group of `breadth` siblings to its sampler:
+///
+/// - branch 0 (when `breadth >= 2`) is the GREEDY ANCHOR — [`Sampler::Argmax`]
+///   — so the deterministic mode is present in the tree exactly once.
+/// - the explorers (branches `1..breadth`) sample with `TopP` at temperatures
+///   spread linearly across `[base + step, base + step + span]` (capped at
+///   [`PROPOSE_TEMP_MAX`]), where `base = propose_temperature(gen_temp)`. The
+///   band starts above `base` so explorers stay distinct from the anchor.
+/// - a degenerate `breadth == 1` search keeps a single SAMPLED branch (no
+///   anchor) at the floored base temperature, so a one-wide tree still explores.
+///
+/// Pure → unit-tested. `gen_temp` is the search's generation temperature
+/// (`TotParams.temperature`); `top_p` is passed through to the explorers.
+fn branch_sampler(branch_index: usize, breadth: usize, gen_temp: f32, top_p: f32) -> Sampler {
+    if branch_index == 0 && breadth >= 2 {
+        return Sampler::Argmax;
+    }
+    let base = propose_temperature(gen_temp);
+    let lo = (base + PROPOSE_TEMP_STEP).min(PROPOSE_TEMP_MAX);
+    let hi = (lo + PROPOSE_TEMP_SPAN).min(PROPOSE_TEMP_MAX).max(lo);
+    // Explorer rank among the sampled siblings. With an anchor (breadth >= 2)
+    // the explorers are branches 1..breadth, so rank = branch_index - 1 over
+    // `breadth - 1` explorers; without one (breadth == 1) the sole branch is
+    // rank 0 of 1, sampling at the floored base.
+    let (rank, explorers) = if breadth >= 2 {
+        (branch_index.saturating_sub(1), breadth - 1)
+    } else {
+        return Sampler::TopP { temperature: base, p: top_p };
+    };
+    let temperature = if explorers <= 1 {
+        lo
+    } else {
+        lo + (hi - lo) * (rank.min(explorers - 1) as f32) / ((explorers - 1) as f32)
+    };
+    Sampler::TopP { temperature, p: top_p }
 }
 
 /// Reasoning budget for the bounded branch retry after a thinking attempt
@@ -827,6 +888,7 @@ async fn generate_demuxed(
     stops: &[u32],
     emitter: Option<BranchSink<'_, '_>>,
     sink: DeltaSink<'_>,
+    logit_bias: &[(u32, f32)],
 ) -> Demux {
     let mut reason_dec = reasoning::Decoder::new(model);
     let mut chat_dec = chat::Decoder::new(model);
@@ -834,6 +896,11 @@ async fn generate_demuxed(
         .generate(sampler)
         .max_tokens(reasoning_budget + answer_budget)
         .stop(stops);
+    // #693c: cross-sibling token penalty — discourage tokens earlier siblings
+    // already emitted. Empty (the default) leaves generation unbiased.
+    if !logit_bias.is_empty() {
+        generator = generator.logit_bias(logit_bias);
+    }
 
     let mut reasoning = String::new();
     let mut answer = String::new();
@@ -1547,6 +1614,19 @@ async fn resolve_level(
     let shared = emitter.map(Mutex::new);
     let sink = shared.as_ref().map(BranchSink::new);
 
+    // #693c cross-sibling logit penalty. When enabled, a sibling group must
+    // generate SEQUENTIALLY so each explorer can down-bias the tokens earlier
+    // siblings already emitted — forgoing the #465/#650 co-batching, which is
+    // why this is off by default. Branches are grouped by parent so the
+    // penalty only accumulates within one parent's `breadth` children; results
+    // are returned in `metas` order regardless.
+    if params.sibling_penalty > 0.0 {
+        return resolve_level_penalized(
+            metas, ctxs, child_paths, params, model, sink, score_base, level,
+        )
+        .await;
+    }
+
     if params.exec.phased_score() {
         // Phase 1 — generate every branch (no scoring yet).
         let gens: Vec<(Context, Demux)> = if concurrent_gen {
@@ -1555,13 +1635,17 @@ async fn resolve_level(
             join_all(
                 ctxs.into_iter()
                     .zip(metas.iter())
-                    .map(|(c, m)| generate_branch(c, model, params, sink, &m.0, &m.1, level, m.2)),
+                    .map(|(c, m)| {
+                        generate_branch(c, model, params, sink, &m.0, &m.1, level, m.2, &[])
+                    }),
             )
             .await
         } else {
             let mut out = Vec::with_capacity(ctxs.len());
             for (c, m) in ctxs.into_iter().zip(metas.iter()) {
-                out.push(generate_branch(c, model, params, sink, &m.0, &m.1, level, m.2).await);
+                out.push(
+                    generate_branch(c, model, params, sink, &m.0, &m.1, level, m.2, &[]).await,
+                );
             }
             out
         };
@@ -1608,7 +1692,9 @@ async fn resolve_level(
                     .zip(metas.iter())
                     .zip(child_paths.iter())
                     .map(|((c, m), path)| {
-                        expand(c, model, params, sink, score_base, path, &m.0, &m.1, level, m.2)
+                        expand(
+                            c, model, params, sink, score_base, path, &m.0, &m.1, level, m.2, &[],
+                        )
                     }),
             )
             .await
@@ -1616,12 +1702,106 @@ async fn resolve_level(
             let mut out = Vec::with_capacity(ctxs.len());
             for ((c, m), path) in ctxs.into_iter().zip(metas.iter()).zip(child_paths.iter()) {
                 out.push(
-                    expand(c, model, params, sink, score_base, path, &m.0, &m.1, level, m.2).await,
+                    expand(
+                        c, model, params, sink, score_base, path, &m.0, &m.1, level, m.2, &[],
+                    )
+                    .await,
                 );
             }
             out
         }
     }
+}
+
+/// Cap on the number of distinct tokens carried in a cross-sibling penalty
+/// (#693c). Branch answers are short, but this bounds the bias list so a
+/// pathological group can't grow it without limit.
+const SIBLING_PENALTY_MAX_TOKENS: usize = 512;
+
+/// Build the cross-sibling penalty bias (#693c) from the tokens earlier
+/// siblings emitted: each distinct token id maps to `-penalty`. Pure →
+/// unit-tested.
+fn sibling_penalty_bias(tokens: &[u32], penalty: f32) -> Vec<(u32, f32)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for &t in tokens {
+        if out.len() >= SIBLING_PENALTY_MAX_TOKENS {
+            break;
+        }
+        if seen.insert(t) {
+            out.push((t, -penalty));
+        }
+    }
+    out
+}
+
+/// Cross-sibling-penalty level resolver (#693c). Generates each parent's
+/// sibling group SEQUENTIALLY in branch order; after each sibling answers, its
+/// answer tokens are accumulated into a per-group penalty set that down-biases
+/// those tokens for every later sibling, so siblings actively diverge from one
+/// another's token choices. Returns `(Context, NodeOutcome)` in `metas` order.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_level_penalized(
+    metas: &[(String, String, usize)],
+    ctxs: Vec<Context>,
+    child_paths: &[Vec<String>],
+    params: &TotParams,
+    model: &Model,
+    sink: Option<BranchSink<'_, '_>>,
+    score_base: Option<&Context>,
+    level: usize,
+) -> Vec<(Context, NodeOutcome)> {
+    // Order the per-parent groups by first appearance, then walk each group's
+    // members in `branch_index` order so the greedy anchor (index 0) runs
+    // first and seeds the penalty for the explorers.
+    let mut group_order: Vec<&str> = Vec::new();
+    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (i, m) in metas.iter().enumerate() {
+        let parent = m.1.as_str();
+        match groups.iter_mut().find(|(p, _)| *p == parent) {
+            Some((_, members)) => members.push(i),
+            None => {
+                group_order.push(parent);
+                groups.push((parent, vec![i]));
+            }
+        }
+    }
+    for (_, members) in groups.iter_mut() {
+        members.sort_by_key(|&i| metas[i].2);
+    }
+    let _ = group_order;
+
+    // Slot each context by its original index so results return in `metas`
+    // order even though generation is grouped.
+    let mut slots: Vec<Option<Context>> = ctxs.into_iter().map(Some).collect();
+    let mut results: Vec<Option<(Context, NodeOutcome)>> = (0..metas.len()).map(|_| None).collect();
+
+    for (_, members) in groups {
+        let mut penalty_tokens: Vec<u32> = Vec::new();
+        for i in members {
+            let m = &metas[i];
+            let path = &child_paths[i];
+            let ctx = slots[i].take().expect("each context consumed once");
+            let bias = sibling_penalty_bias(&penalty_tokens, params.sibling_penalty);
+            let (ctx, outcome) = expand(
+                ctx, model, params, sink, score_base, path, &m.0, &m.1, level, m.2, &bias,
+            )
+            .await;
+            // Accumulate this sibling's answer tokens so later siblings in the
+            // group are biased away from them. Re-tokenizing the clean answer
+            // is a faithful proxy for the emitted answer tokens and avoids
+            // threading raw decode ids through the demux.
+            if outcome.status == NodeStatus::Ok && !outcome.content.is_empty() {
+                penalty_tokens.extend(model.tokenizer().encode(&outcome.content));
+            }
+            results[i] = Some((ctx, outcome));
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|r| r.expect("every branch resolved"))
+        .collect()
 }
 
 /// Generate one forked branch's assistant turn — cue, then a demuxed
@@ -1733,6 +1913,7 @@ async fn generate_branch(
     parent_id: &str,
     level: usize,
     branch_index: usize,
+    sibling_bias: &[(u32, f32)],
 ) -> (Context, Demux) {
     // #413/#650 token stream: announce this node's tree position before its
     // deltas, so a client creates the provisional node and routes the node's
@@ -1747,8 +1928,12 @@ async fn generate_branch(
         model: &'a Model,
         stops: Vec<u32>,
         sink: Option<BranchSink<'s, 'e>>,
-        temperature: f32,
-        top_p: f32,
+        /// Per-branch sampler (#693b): greedy anchor for branch 0, a
+        /// temperature-laddered `TopP` for the explorers.
+        sampler: Sampler,
+        /// Per-branch cross-sibling token penalty (#693c): `(token, -penalty)`
+        /// pairs against tokens earlier siblings emitted. Empty = no penalty.
+        logit_bias: Vec<(u32, f32)>,
     }
 
     impl BranchDriver<Context> for InferletBranchDriver<'_, '_, '_> {
@@ -1774,15 +1959,13 @@ async fn generate_branch(
             request: BranchGenerateRequest<'a>,
         ) -> DemuxFuture<'a> {
             let _directive = request.directive;
-            let sampler = Sampler::TopP {
-                temperature: self.temperature,
-                p: self.top_p,
-            };
+            let sampler = self.sampler.clone();
             let model = self.model;
             let stops = &self.stops;
             // `BranchSink` is Copy, so the shared handle is reused across the
             // initial generation and any bounded no-think retry for this node.
             let sink = self.sink;
+            let logit_bias = &self.logit_bias;
             Box::pin(async move {
                 generate_demuxed(
                     ctx,
@@ -1793,6 +1976,7 @@ async fn generate_branch(
                     stops,
                     sink,
                     DeltaSink::Node(request.sink_node_id),
+                    logit_bias,
                 )
                 .await
             })
@@ -1803,10 +1987,13 @@ async fn generate_branch(
         model,
         stops: chat::stop_tokens(model),
         sink,
-        // #693a: floor the propose temperature so a low inherited chat-profile
-        // temperature can't collapse the search to near-greedy siblings.
-        temperature: propose_temperature(params.temperature),
-        top_p: params.top_p,
+        // #693a+b: greedy anchor on branch 0, explorer temperature ladder on
+        // the rest, floored so a low inherited chat-profile temperature can't
+        // collapse the search.
+        sampler: branch_sampler(branch_index, params.breadth, params.temperature, params.top_p),
+        // #693c: cross-sibling token penalty supplied by the caller (empty
+        // unless `sibling_penalty` is enabled and earlier siblings have run).
+        logit_bias: sibling_bias.to_vec(),
     };
     generate_branch_with(ctx, params, node_id, level, branch_index, &mut driver).await
 }
@@ -1880,6 +2067,7 @@ fn classify(demux: Demux, score: Option<ScoreResult>) -> NodeOutcome {
 /// conversation root) with `path` replayed for an intermediate node (#661), or
 /// the branch context as a degraded fallback when the root fork failed.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn expand(
     ctx: Context,
     model: &Model,
@@ -1891,9 +2079,12 @@ async fn expand(
     parent_id: &str,
     level: usize,
     branch_index: usize,
+    sibling_bias: &[(u32, f32)],
 ) -> (Context, NodeOutcome) {
-    let (ctx, demux) =
-        generate_branch(ctx, model, params, sink, node_id, parent_id, level, branch_index).await;
+    let (ctx, demux) = generate_branch(
+        ctx, model, params, sink, node_id, parent_id, level, branch_index, sibling_bias,
+    )
+    .await;
     let score = if matches!(demux.kind, DemuxKind::Answered) {
         Some(
             score_answered(
@@ -2162,6 +2353,7 @@ async fn synthesize(
         &stops,
         sink,
         DeltaSink::Final,
+        &[],
     )
     .await;
     resolve_synthesis_demux(demux)
@@ -2910,6 +3102,30 @@ mod tests {
         assert!((PROPOSE_TEMP_FLOOR - super::super::schema::DEFAULT_TEMPERATURE).abs() < 1e-6);
     }
 
+    // ── Cross-sibling penalty (#693c) ──
+
+    #[test]
+    fn sibling_penalty_bias_dedups_and_signs_negative() {
+        // Each distinct earlier-sibling token maps to a single negative bias.
+        let bias = sibling_penalty_bias(&[5, 5, 9, 5, 9, 12], 1.5);
+        assert_eq!(bias.len(), 3, "duplicate tokens collapse to one entry");
+        assert!(bias.iter().all(|&(_, v)| (v + 1.5).abs() < 1e-6), "penalty is -magnitude");
+        let toks: Vec<u32> = bias.iter().map(|&(t, _)| t).collect();
+        assert_eq!(toks, vec![5, 9, 12], "first-seen order preserved");
+    }
+
+    #[test]
+    fn sibling_penalty_bias_empty_when_no_prior_tokens() {
+        assert!(sibling_penalty_bias(&[], 2.0).is_empty());
+    }
+
+    #[test]
+    fn sibling_penalty_bias_is_capped() {
+        let many: Vec<u32> = (0..(SIBLING_PENALTY_MAX_TOKENS as u32 + 50)).collect();
+        let bias = sibling_penalty_bias(&many, 1.0);
+        assert_eq!(bias.len(), SIBLING_PENALTY_MAX_TOKENS, "bias list is bounded");
+    }
+
     // ── ScoreOutcome (F4): the three classes the old Option<u8> merged ──
 
     #[test]
@@ -3258,6 +3474,7 @@ mod tests {
             top_p: 0.9,
             thinking: true,
             exec: super::super::schema::ExecStrategy::CoupledSequential,
+            sibling_penalty: 0.0,
         }
     }
 

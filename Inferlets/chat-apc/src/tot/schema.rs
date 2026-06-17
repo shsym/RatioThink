@@ -55,6 +55,16 @@ pub const DEFAULT_MAX_REASONING_TOKENS: usize = 2048;
 /// stacked on top there is even less reason to raise it.
 pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 pub const DEFAULT_TOP_P: f32 = 0.95;
+/// Cross-sibling logit penalty (#693c): the magnitude subtracted from the
+/// next-token logit of any token an earlier sibling in the same group already
+/// emitted. `0.0` (the default) disables it — siblings then co-batch (#465/#650)
+/// as usual; a positive value forces SEQUENTIAL within-group generation so each
+/// explorer can see and discourage its predecessors' tokens.
+pub const DEFAULT_SIBLING_PENALTY: f32 = 0.0;
+/// Upper bound on the cross-sibling penalty. A penalty is an additive logit
+/// shift; values past a few units already hard-suppress a token, so the cap is
+/// generous but finite.
+pub const MAX_SIBLING_PENALTY: f32 = 20.0;
 /// Reasoning is the POINT of a tree-of-thought search, so thinking is ON by
 /// default (#413). Set `thinking:false` to append `/no_think` and run nodes
 /// as concise non-reasoning candidates.
@@ -183,6 +193,8 @@ pub struct TotInput {
     /// Sibling execution strategy (#458). Optional execution hint; defaults
     /// to the production [`ExecStrategy`]. Does not change the returned tree.
     pub exec: Option<ExecStrategy>,
+    /// Cross-sibling logit penalty (#693c). `0.0` (default) disables it.
+    pub sibling_penalty: Option<f32>,
 }
 
 /// Validated, defaulted search parameters.
@@ -209,6 +221,11 @@ pub struct TotParams {
     /// Sibling execution strategy (#458) — how branches are generated/scored.
     /// Production default; never changes the returned tree.
     pub exec: ExecStrategy,
+    /// Cross-sibling logit penalty magnitude (#693c). `0.0` disables it (the
+    /// default, preserving sibling co-batching); a positive value forces
+    /// sequential within-group generation so each explorer down-biases the
+    /// tokens earlier siblings emitted.
+    pub sibling_penalty: f32,
 }
 
 /// Total candidate nodes generated across all levels:
@@ -236,6 +253,7 @@ pub fn resolve(input: &TotInput) -> Result<TotParams, (&'static str, String)> {
     let top_p = input.top_p.unwrap_or(DEFAULT_TOP_P);
     let thinking = input.thinking.unwrap_or(DEFAULT_THINKING);
     let exec = input.exec.unwrap_or_default();
+    let sibling_penalty = input.sibling_penalty.unwrap_or(DEFAULT_SIBLING_PENALTY);
     // #465 gate: production builds (feature off) support the two *coupled*
     // strategies — `coupled_concurrent` (the re-measured default) and
     // `coupled_sequential` (the low-residency escape hatch) — and REJECT the
@@ -288,6 +306,12 @@ pub fn resolve(input: &TotInput) -> Result<TotParams, (&'static str, String)> {
     if !(top_p.is_finite() && top_p > 0.0 && top_p <= 1.0) {
         return Err(("top_p", "top_p must be in (0.0, 1.0]".to_string()));
     }
+    if !(sibling_penalty.is_finite() && (0.0..=MAX_SIBLING_PENALTY).contains(&sibling_penalty)) {
+        return Err((
+            "sibling_penalty",
+            format!("sibling_penalty must be in [0.0, {MAX_SIBLING_PENALTY}]"),
+        ));
+    }
 
     let total = total_candidates(breadth, depth, beam_width);
     if total > MAX_NODES {
@@ -310,6 +334,7 @@ pub fn resolve(input: &TotInput) -> Result<TotParams, (&'static str, String)> {
         top_p,
         thinking,
         exec,
+        sibling_penalty,
     })
 }
 

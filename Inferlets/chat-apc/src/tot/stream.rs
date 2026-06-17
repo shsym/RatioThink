@@ -635,6 +635,7 @@ mod tests {
             top_p: 0.95,
             thinking: true,
             exec: crate::tot::schema::ExecStrategy::default(),
+            sibling_penalty: 0.0,
         };
         let v = serde_json::to_value(TreeStartFrame {
             event: "tree_start",

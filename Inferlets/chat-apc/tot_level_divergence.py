@@ -126,6 +126,9 @@ async def main() -> int:
     temp = float(os.environ.get("PIE_TEST_TOT_TEMP", "0.7"))
     maxtok = int(os.environ.get("PIE_TEST_TOT_MAXTOK", "96"))
     maxreason = int(os.environ.get("PIE_TEST_TOT_MAXREASON", "1024"))
+    # #693c cross-sibling logit penalty (0 = off). When > 0 the group generates
+    # sequentially so each explorer down-biases earlier siblings' tokens.
+    sibling_penalty = float(os.environ.get("PIE_TEST_TOT_SIBLING_PENALTY", "0"))
 
     # (dataset, level) -> list of per-group metric dicts.
     agg: dict[tuple[str, int], list[dict]] = {}
@@ -134,7 +137,8 @@ async def main() -> int:
     async with real_engine(slug, model_path) as base:
         print(f"[tot-lvl] engine ready at {base}; datasets={datasets} "
               f"breadth={breadth} depth={depth} beam={beam} temp={temp} "
-              f"maxtok={maxtok} maxreason={maxreason} max_prompts={MAX_PROMPTS}")
+              f"maxtok={maxtok} maxreason={maxreason} "
+              f"sibling_penalty={sibling_penalty} max_prompts={MAX_PROMPTS}")
         async with httpx.AsyncClient(timeout=900) as http:
             for ds in datasets:
                 records = _load_prompts(ds)
@@ -157,6 +161,7 @@ async def main() -> int:
                                 "temperature": temp,
                                 "top_p": 0.95,
                                 "thinking": True,
+                                "sibling_penalty": sibling_penalty,
                             },
                         },
                     )
