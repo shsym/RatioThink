@@ -167,6 +167,65 @@ final class BestOfNTests: XCTestCase {
     XCTAssertNil(engine.lastRequest, "an empty release must not hit the engine")
   }
 
+  /// The delete path has no gate to supply a model id, so it releases with a
+  /// nil model — the request must OMIT `model` entirely so the engine resolves
+  /// its served (first registered) model.
+  @MainActor
+  func test_releaseBestOfNSnapshots_nil_model_omits_model_field() async throws {
+    let engine = ReleaseCapturingEngine()
+    ChatSendController().releaseBestOfNSnapshots(engine: engine, modelID: nil, snapshotNames: ["s0"])
+    let deadline = Date().addingTimeInterval(2)
+    while Date() < deadline, engine.lastRequest == nil {
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    let req = try XCTUnwrap(engine.lastRequest, "release must dispatch a request")
+    let obj = try JSONSerialization.jsonObject(with: req.input) as? [String: Any]
+    XCTAssertNil(obj?["model"], "a nil model must be omitted so the engine resolves its served model")
+    XCTAssertEqual(obj?["release"] as? [String], ["s0"])
+  }
+
+  // MARK: Terminal-cleanup predicate (the set delete / profile-swap / abandon release)
+
+  /// `uncommittedCandidateSnapshotNames` is the single source for "what to
+  /// release" on every no-next-round terminal (chat delete F1, profile swap F2,
+  /// abandon). It must collect the candidate snapshots of UNCOMMITTED rounds
+  /// (empty content + a decodable round) and skip committed rounds (the reply
+  /// was kept) and plain messages.
+  func test_uncommitted_candidate_snapshot_names_collects_only_uncommitted_rounds() {
+    func roundData(_ snaps: [String]) -> Data {
+      let cands = snaps.enumerated().map {
+        ToTSelectionCandidate(id: "n\($0.offset)", branchIndex: $0.offset, snapshotName: $0.element)
+      }
+      return try! JSONEncoder().encode(BestOfNRound(level: 1, candidates: cands, chosenID: nil))
+    }
+    let uncommitted = Message(role: "assistant", content: "", bestOfN: roundData(["s0", "s1"]))
+    // Committed: the user chose "Use this", so content is set — its snapshot was
+    // already released on commit; it must NOT be collected again here.
+    let committed = Message(role: "assistant", content: "the kept reply", bestOfN: roundData(["s2"]))
+    let plain = Message(role: "assistant", content: "")  // no round at all
+    let user = Message(role: "user", content: "prompt")
+
+    let names = BestOfNRound.uncommittedCandidateSnapshotNames(
+      in: [user, uncommitted, committed, plain])
+    XCTAssertEqual(names, ["s0", "s1"])
+  }
+
+  /// Two uncommitted rounds in one chat (e.g. a think-more chain abandoned
+  /// mid-way) release ALL their candidate snapshots.
+  func test_uncommitted_candidate_snapshot_names_spans_multiple_rounds() {
+    func roundData(_ snaps: [String]) -> Data {
+      let cands = snaps.enumerated().map {
+        ToTSelectionCandidate(id: "n\($0.offset)", branchIndex: $0.offset, snapshotName: $0.element)
+      }
+      return try! JSONEncoder().encode(BestOfNRound(level: 1, candidates: cands, chosenID: nil))
+    }
+    let r1 = Message(role: "assistant", content: "", bestOfN: roundData(["a0", "a1"]))
+    let r2 = Message(role: "assistant", content: "", bestOfN: roundData(["b0", "b1"]))
+    XCTAssertEqual(
+      BestOfNRound.uncommittedCandidateSnapshotNames(in: [r1, r2]),
+      ["a0", "a1", "b0", "b1"])
+  }
+
   private struct ReleaseWire: Decodable {
     let model: String
     let release: [String]

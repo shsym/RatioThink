@@ -34,4 +34,19 @@ public struct BestOfNRound: Equatable, Sendable, Codable {
   public func unpickedSnapshotNames(excluding id: String) -> [String] {
     candidates.filter { $0.id != id }.map(\.snapshotName)
   }
+
+  /// Candidate snapshot names of every UNCOMMITTED Best-of-N round among
+  /// `messages` — a round whose message has no committed content but carries a
+  /// decodable pick set. These are the snapshots a no-next-round terminal
+  /// (abandon, profile swap, chat delete) must release so they don't orphan on
+  /// the engine. The single source of the "what to release" predicate (#690).
+  public static func uncommittedCandidateSnapshotNames(in messages: [Message]) -> [String] {
+    messages.flatMap { message -> [String] in
+      guard message.content.isEmpty,
+            let data = message.bestOfN,
+            let round = try? JSONDecoder().decode(BestOfNRound.self, from: data)
+      else { return [] }
+      return round.candidates.map(\.snapshotName)
+    }
+  }
 }

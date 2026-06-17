@@ -606,7 +606,18 @@ impl ResumeOps for InferletResumeOps<'_> {
     }
 
     fn open(&mut self, name: &str) -> Option<Context> {
-        Context::open(self.model, name).ok()
+        match Context::open(self.model, name) {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                // A miss is normally benign LRU eviction, but the same `None`
+                // also hides a genuine engine fault or a never-persisting
+                // snapshot regression — which would make every think-more round
+                // silently re-prefill and leave the warm-resume path dead.
+                // Log so the two are distinguishable; the fallback is unchanged.
+                eprintln!("[chat-apc] best-of-n: snapshot open miss for {name}: {e}; re-prefilling");
+                None
+            }
+        }
     }
 
     fn reprefill(

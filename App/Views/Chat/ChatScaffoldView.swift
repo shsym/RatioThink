@@ -705,6 +705,12 @@ struct ChatScaffoldView: View {
       chat.profileID = new
       do {
         try modelContext.save()
+        // F2 (#690): swapping a chat AWAY from Best-of-N orphans any
+        // uncommitted round it holds — the abandon sweep otherwise only runs on
+        // the next `sendAssistantTurn`, which may never come for this chat. The
+        // predicate scans by message state, not profile, so it still finds the
+        // round after `profileID` has flipped. Release its snapshots now.
+        releaseAbandonedBestOfNRounds(in: chat)
         // #3: a profile swap chooses which profile is active. The menu-bar
         // (menu-icon) engine start reads the GLOBAL active-profile marker
         // (HelperResumeAction → ProfileStore.activeProfileID), NOT this
@@ -997,12 +1003,7 @@ struct ChatScaffoldView: View {
   /// carries a decoded pick set; releasing already-freed names is a harmless
   /// no-op (the server reports them absent), so this is safe to run each turn.
   private func releaseAbandonedBestOfNRounds(in chat: Chat) {
-    let names: [String] = chat.messages.flatMap { message -> [String] in
-      guard message.content.isEmpty, let data = message.bestOfN,
-            let round = try? JSONDecoder().decode(BestOfNRound.self, from: data)
-      else { return [] }
-      return round.candidates.map(\.snapshotName)
-    }
+    let names = BestOfNRound.uncommittedCandidateSnapshotNames(in: chat.messages)
     releaseBestOfNSnapshots(names, in: chat)
   }
 

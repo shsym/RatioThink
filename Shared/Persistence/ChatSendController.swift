@@ -898,9 +898,12 @@ public final class ChatSendController: ObservableObject {
   /// wastes pages until engine teardown — never block the UI on it. Think-more
   /// frees its prior round through the resume path instead, so this is for the
   /// no-next-round terminals only.
+  /// `modelID` is the engine's served model; pass `nil` (e.g. from the chat-list
+  /// delete path, which has no gate) to let the engine resolve its first
+  /// registered model — it serves exactly one, so that is the same model.
   public func releaseBestOfNSnapshots(
     engine: EngineClient,
-    modelID: String,
+    modelID: String?,
     snapshotNames: [String]
   ) {
     guard !snapshotNames.isEmpty,
@@ -908,8 +911,15 @@ public final class ChatSendController: ObservableObject {
     else { return }
     Task { @MainActor in
       do {
-        // Drain the small JSON ack to completion so the request is delivered.
-        for try await _ in engine.dispatchInferlet(request) {}
+        // Accumulate the small JSON ack so the release ACCOUNTING is inspected,
+        // not blindly drained: `dispatch_release` returns a `{requested,
+        // released, absent}` ack on success but an OpenAI-shape error body (NOT
+        // an SSE error frame) when the model fails to resolve — both arrive as
+        // the response body, so a release that freed nothing would otherwise
+        // look identical to a clean one.
+        var body = Data()
+        for try await chunk in engine.dispatchInferlet(request) { body.append(chunk) }
+        Self.logReleaseOutcome(body: body)
       } catch {
         let detail = (error as? LocalizedError)?.errorDescription ?? "\(error)"
         Log.engine.error(
@@ -918,9 +928,30 @@ public final class ChatSendController: ObservableObject {
     }
   }
 
+  /// Inspect a release response body: a valid ack that freed fewer than it
+  /// requested is surfaced (informational — a re-release of already-freed names
+  /// is benign), and a body that is NOT an ack (the error envelope returned when
+  /// the model could not be resolved) is logged as a real failure, since no
+  /// pages were freed at all.
+  private static func logReleaseOutcome(body: Data) {
+    if let ack = try? JSONDecoder().decode(BestOfNReleaseAck.self, from: body) {
+      if ack.released < ack.requested {
+        Log.engine.info(
+          "ChatSendController: best-of-n release freed \(ack.released, privacy: .public)/\(ack.requested, privacy: .public) snapshots (absent \(ack.absent, privacy: .public))")
+      }
+      return
+    }
+    let text = String(decoding: body, as: UTF8.self)
+    if !text.isEmpty {
+      Log.engine.error(
+        "ChatSendController: best-of-n release did not ack — no pages freed (model unresolved / engine restarted?): \(text.prefix(200), privacy: .public)")
+    }
+  }
+
   /// Build the `/v1/inferlet` body for a Best-of-N snapshot-release request
-  /// (#690): a `release` list, no messages, no generation.
-  private static func makeBestOfNReleaseRequest(modelID: String, names: [String]) -> InferletRequest? {
+  /// (#690): a `release` list, no messages, no generation. `modelID` is omitted
+  /// when nil so the engine resolves its served model.
+  private static func makeBestOfNReleaseRequest(modelID: String?, names: [String]) -> InferletRequest? {
     guard let data = try? JSONEncoder().encode(BestOfNReleaseInput(model: modelID, release: names))
     else { return nil }
     return InferletRequest(inferlet: "best-of-n", input: data, messages: nil, stream: false)
@@ -1109,8 +1140,25 @@ private struct BestOfNRequestInput: Encodable {
 /// to drop, no messages — the server runs no generation and acks the freed
 /// count.
 private struct BestOfNReleaseInput: Encodable {
-  let model: String
+  /// Omitted when nil (`encodeIfPresent`) so the engine resolves its served
+  /// model — the delete path has no gate to supply a model id.
+  let model: String?
   let release: [String]
+
+  func encode(to encoder: Encoder) throws {
+    var c = encoder.container(keyedBy: CodingKeys.self)
+    try c.encodeIfPresent(model, forKey: .model)
+    try c.encode(release, forKey: .release)
+  }
+
+  private enum CodingKeys: String, CodingKey { case model, release }
+}
+
+/// The `{requested, released, absent}` accounting `dispatch_release` acks (#690).
+private struct BestOfNReleaseAck: Decodable {
+  let requested: Int
+  let released: Int
+  let absent: Int
 }
 
 /// Failure constructing a tree-of-thought send.

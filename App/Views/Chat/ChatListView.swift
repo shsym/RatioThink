@@ -14,6 +14,10 @@ struct ChatListView: View {
   /// #507: per-chat in-flight state — streaming rows show a right-aligned
   /// spinner, and deleting a chat first cancels + drops its send pipeline.
   @EnvironmentObject private var sendCoordinator: ChatSendCoordinator
+  /// #690: deleting a chat must release any uncommitted Best-of-N round's
+  /// candidate KV snapshots before the cascade drops the rows (the engine keeps
+  /// the KV otherwise).
+  @EnvironmentObject private var engineStore: EngineClientStore
   /// Sort by `updatedAt` desc at the query layer; pinned-first ordering happens
   /// client-side in `sortedChats` because `Bool` doesn't conform to
   /// `Comparable` and SwiftData rejects `SortDescriptor(\.pinned)` at compile
@@ -256,6 +260,16 @@ struct ChatListView: View {
 
   private func delete(_ chat: Chat) {
     let wasSelected = (selectedItemID == chat.id)
+    // #690: a chat deleted while it holds an uncommitted Best-of-N round
+    // orphans that round's candidate KV snapshots — the cascade drops the
+    // message rows but the engine keeps the saved KV until teardown. Release
+    // them first (best-effort; model resolved engine-side). Collected before
+    // `forget`/`delete` mutate the graph; the fire-and-forget release task is
+    // independent of this chat's controller, so dropping it next is safe.
+    sendCoordinator.controller(for: chat.id).releaseBestOfNSnapshots(
+      engine: engineStore.client,
+      modelID: nil,
+      snapshotNames: BestOfNRound.uncommittedCandidateSnapshotNames(in: chat.messages))
     // #507: stop any in-flight stream FIRST and drop its controller — the
     // stream writer must never write onto a Message row the cascade is
     // about to delete.
