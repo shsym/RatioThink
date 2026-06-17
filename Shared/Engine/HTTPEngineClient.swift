@@ -179,9 +179,7 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
     return AsyncThrowingStream { continuation in
       let task = Task {
         do {
-          let request = try await buildRequest()
-          let (bytes, response) = try await session.bytes(for: request)
-          try await Self.assertOK(response, bytes: bytes)
+          let bytes = try await Self.openStream(session: session, buildRequest: buildRequest)
           var emittedFinish = false
           for try await frame in HTTPEngineClient.sseFrames(from: bytes) {
             if frame.isDone { break }
@@ -273,9 +271,7 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
     return AsyncThrowingStream { continuation in
       let task = Task {
         do {
-          let request = try await buildRequest()
-          let (bytes, response) = try await session.bytes(for: request)
-          try await Self.assertOK(response, bytes: bytes)
+          let bytes = try await Self.openStream(session: session, buildRequest: buildRequest)
           for try await frame in HTTPEngineClient.sseFrames(from: bytes) {
             if frame.isDone { break }
             try Task.checkCancellation()
@@ -287,6 +283,42 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
         }
       }
       continuation.onTermination = { _ in task.cancel() }
+    }
+  }
+
+  /// Open a streaming response, retrying ONCE on a connection-lost error
+  /// raised at connect time (before any SSE byte arrives).
+  ///
+  /// `URLSession` pools HTTP/1.1 keep-alive connections on the shared
+  /// `defaultSession`. When the engine has closed an idle pooled
+  /// connection between requests, a reused request fails with
+  /// `URLError.networkConnectionLost` (-1005). URLSession transparently
+  /// retries this on a fresh connection for idempotent GETs, but NOT for
+  /// POSTs — so our streaming POSTs (`/v1/inferlet`,
+  /// `/v1/chat/completions`) would otherwise surface a spurious failure
+  /// to the caller (a failed chat send; a trapped E2E harness). Because
+  /// the failure happens before `bytes` yields any frame, a single
+  /// fresh-connection retry is side-effect-safe: nothing was emitted, and
+  /// rebuilding the request reopens the connection.
+  ///
+  /// A *mid-stream* drop is deliberately NOT retried here — it surfaces to
+  /// the caller, because re-running a partially-consumed stream could
+  /// duplicate side effects. (The engine does not drop mid-stream; the
+  /// only observed real-world -1005 is stale keep-alive reuse at connect.)
+  private static func openStream(
+    session: URLSession,
+    buildRequest: @escaping @Sendable () async throws -> URLRequest
+  ) async throws -> URLSession.AsyncBytes {
+    func attempt() async throws -> URLSession.AsyncBytes {
+      let request = try await buildRequest()
+      let (bytes, response) = try await session.bytes(for: request)
+      try await assertOK(response, bytes: bytes)
+      return bytes
+    }
+    do {
+      return try await attempt()
+    } catch let error as URLError where error.code == .networkConnectionLost {
+      return try await attempt()
     }
   }
 

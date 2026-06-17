@@ -4,7 +4,22 @@ import RatioThinkCore
 
 @main
 enum EngineHarness {
-  static func main() async throws {
+  /// Catch any escaping error and exit non-zero with a diagnostic instead
+  /// of letting the Swift top-level runner trap (SIGTRAP, rc=133). A
+  /// transient transport failure (e.g. `URLError.networkConnectionLost`
+  /// from a stale keep-alive reuse) must read as a clean test failure, not
+  /// a crash that masks the result.
+  static func main() async {
+    do {
+      try await run()
+    } catch {
+      FileHandle.standardError.write(
+        Data("chat-engine-harness: fatal: \(error)\n".utf8))
+      exit(70) // EX_SOFTWARE
+    }
+  }
+
+  static func run() async throws {
     let env = ProcessInfo.processInfo.environment
     let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
     // The model the engine serves is the SAME id the app pins as the chat's

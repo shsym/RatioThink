@@ -322,4 +322,150 @@ final class HFCacheCatalogTests: XCTestCase {
     }
     return snapshot
   }
+
+  /// Build a minimal valid `.safetensors` file: 8-byte little-endian
+  /// header length + JSON header with one tensor per dtype. Only the
+  /// header is meaningful to the catalog probe (it never reads weights).
+  @discardableResult
+  private func writeSafetensors(at url: URL,
+                               dtypes: [String],
+                               includeMetadata: Bool = false) throws -> URL {
+    var header: [String: Any] = [:]
+    if includeMetadata { header["__metadata__"] = ["format": "pt"] }
+    for (i, dtype) in dtypes.enumerated() {
+      header["t\(i)"] = ["dtype": dtype, "shape": [1], "data_offsets": [0, 0]]
+    }
+    let headerData = try JSONSerialization.data(withJSONObject: header)
+    var length = UInt64(headerData.count).littleEndian
+    var data = Data(bytes: &length, count: 8)
+    data.append(headerData)
+    try FileManager.default.createDirectory(
+      at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try data.write(to: url)
+    return url
+  }
+
+  // MARK: - quantized safetensors dtype gating
+
+  func test_safetensors_header_probe_flags_quantized_u32() throws {
+    let url = tempDir.appendingPathComponent("model.safetensors")
+    try writeSafetensors(at: url, dtypes: ["U32"])
+    XCTAssertEqual(HFCacheCatalog.unlaunchableDtypeInSafetensorsHeader(at: url), "U32")
+  }
+
+  func test_safetensors_header_probe_passes_f32_f16_bf16() throws {
+    let url = tempDir.appendingPathComponent("model.safetensors")
+    try writeSafetensors(at: url, dtypes: ["BF16", "F32", "F16"])
+    XCTAssertNil(HFCacheCatalog.unlaunchableDtypeInSafetensorsHeader(at: url))
+  }
+
+  func test_safetensors_header_probe_flags_first_unsupported_in_mixed() throws {
+    // The driver throws on the first unsupported tensor it loads, so a
+    // repo mixing BF16 with a U32-packed weight is still unlaunchable.
+    let url = tempDir.appendingPathComponent("model.safetensors")
+    try writeSafetensors(at: url, dtypes: ["BF16", "U32"])
+    XCTAssertEqual(HFCacheCatalog.unlaunchableDtypeInSafetensorsHeader(at: url), "U32")
+  }
+
+  func test_safetensors_header_probe_ignores_metadata_key() throws {
+    // The reserved `__metadata__` key is not a tensor; it must not trip
+    // the probe on an otherwise-launchable bf16 repo.
+    let url = tempDir.appendingPathComponent("model.safetensors")
+    try writeSafetensors(at: url, dtypes: ["BF16"], includeMetadata: true)
+    XCTAssertNil(HFCacheCatalog.unlaunchableDtypeInSafetensorsHeader(at: url))
+  }
+
+  func test_safetensors_header_probe_returns_nil_on_garbage() throws {
+    // A non-safetensors / corrupt file (no valid length+JSON header) must
+    // not false-gate — it falls through to the engine's own error.
+    let url = tempDir.appendingPathComponent("model.safetensors")
+    try Data("this is not a safetensors header".utf8).write(to: url)
+    XCTAssertNil(HFCacheCatalog.unlaunchableDtypeInSafetensorsHeader(at: url))
+  }
+
+  func test_scan_marks_quantized_safetensors_repo_unlaunchable() throws {
+    let hfHome = tempDir.appendingPathComponent("hf", isDirectory: true)
+    let snapshot = try writeHFCacheSnapshot(
+      hfHome: hfHome, repo: "mlx-community/Qwen3-0.6B-4bit", files: [
+        "config.json": "{}",
+        "tokenizer.json": "{}",
+      ])
+    try writeSafetensors(at: snapshot.appendingPathComponent("model.safetensors"),
+                         dtypes: ["U32"])
+    let rows = HFCacheCatalog.scan(hfHome: hfHome)
+    let row = try XCTUnwrap(rows.first { $0.filename == "mlx-community/Qwen3-0.6B-4bit" },
+                            "the quantized repo must still LIST (show-but-disable)")
+    let reason = try XCTUnwrap(row.unsupportedReason,
+                               "a U32-packed safetensors repo must be gated unlaunchable")
+    XCTAssertTrue(reason.contains("U32"), "reason must name the rejected dtype: \(reason)")
+  }
+
+  func test_scan_keeps_bf16_safetensors_repo_launchable() throws {
+    let hfHome = tempDir.appendingPathComponent("hf", isDirectory: true)
+    let snapshot = try writeHFCacheSnapshot(
+      hfHome: hfHome, repo: "Qwen/Qwen3-0.6B", files: [
+        "config.json": "{}",
+        "tokenizer.json": "{}",
+      ])
+    try writeSafetensors(at: snapshot.appendingPathComponent("model.safetensors"),
+                         dtypes: ["BF16"])
+    let rows = HFCacheCatalog.scan(hfHome: hfHome)
+    let row = try XCTUnwrap(rows.first { $0.filename == "Qwen/Qwen3-0.6B" })
+    XCTAssertNil(row.unsupportedReason, "a bf16 repo must stay launchable")
+  }
+
+  func test_scan_marks_repo_unlaunchable_when_only_a_later_shard_is_quantized() throws {
+    // The all-shards scan is load-bearing: a repo may ship a BF16 first
+    // shard and a U32-packed later shard. Stopping after the first shard
+    // would miss it — assert the row is still gated and names U32.
+    let hfHome = tempDir.appendingPathComponent("hf", isDirectory: true)
+    let snapshot = try writeHFCacheSnapshot(
+      hfHome: hfHome, repo: "mlx-community/Big-4bit", files: [
+        "config.json": "{}",
+        "tokenizer.json": "{}",
+        "model.safetensors.index.json": "{}",
+      ])
+    try writeSafetensors(at: snapshot.appendingPathComponent("model-00001-of-00002.safetensors"),
+                         dtypes: ["BF16"])
+    try writeSafetensors(at: snapshot.appendingPathComponent("model-00002-of-00002.safetensors"),
+                         dtypes: ["U32"])
+    let rows = HFCacheCatalog.scan(hfHome: hfHome)
+    let row = try XCTUnwrap(rows.first { $0.filename == "mlx-community/Big-4bit" })
+    let reason = try XCTUnwrap(row.unsupportedReason,
+                               "a quantized later shard must still gate the repo")
+    XCTAssertTrue(reason.contains("U32"), "reason must name the rejected dtype: \(reason)")
+  }
+
+  func test_quantizedSafetensorsReason_forResolvedPath_flags_quantized_dir() throws {
+    let dir = tempDir.appendingPathComponent("snap", isDirectory: true)
+    try writeSafetensors(at: dir.appendingPathComponent("model.safetensors"),
+                         dtypes: ["U32"])
+    let reason = try XCTUnwrap(
+      HFCacheCatalog.quantizedSafetensorsReason(forResolvedModelPath: dir.path))
+    XCTAssertTrue(reason.contains("U32"))
+  }
+
+  func test_quantizedSafetensorsReason_forResolvedPath_flags_quantized_singlefile() throws {
+    // A 3-segment slug `org/name/file.safetensors` resolves to a single
+    // FILE, not a directory; the gate must probe it directly (F1).
+    let file = tempDir.appendingPathComponent("model.safetensors")
+    try writeSafetensors(at: file, dtypes: ["U32"])
+    let reason = try XCTUnwrap(
+      HFCacheCatalog.quantizedSafetensorsReason(forResolvedModelPath: file.path))
+    XCTAssertTrue(reason.contains("U32"))
+  }
+
+  func test_quantizedSafetensorsReason_forResolvedPath_nil_for_launchable() throws {
+    let dir = tempDir.appendingPathComponent("snap", isDirectory: true)
+    let bf16File = dir.appendingPathComponent("model.safetensors")
+    try writeSafetensors(at: bf16File, dtypes: ["BF16"])
+    XCTAssertNil(HFCacheCatalog.quantizedSafetensorsReason(forResolvedModelPath: dir.path),
+                 "a bf16 snapshot dir must not fast-fail the launch path")
+    XCTAssertNil(HFCacheCatalog.quantizedSafetensorsReason(forResolvedModelPath: bf16File.path),
+                 "a bf16 single file must not fast-fail the launch path")
+    // A single-file non-safetensors path (e.g. a .gguf) is never gated here.
+    let gguf = dir.appendingPathComponent("model-Q4_K_M.gguf")
+    try Data("ggufbytes".utf8).write(to: gguf)
+    XCTAssertNil(HFCacheCatalog.quantizedSafetensorsReason(forResolvedModelPath: gguf.path))
+  }
 }

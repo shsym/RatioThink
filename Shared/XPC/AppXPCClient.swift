@@ -218,9 +218,11 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
   // Restart = the helper's SERIAL stop phase + a full cold-boot start phase
   // (HelperExportedAPI.restartEngine). Derive the App wait from those helper
   // deadlines so it always dominates the serial budget and cannot drift when
-  // either deadline changes (#459 review F2): a hand-picked margin
-  // (coldStart + 30 = 150s) was 2s SHORT of the worst case
-  // (stopReplyDeadline 17 + startReplyDeadline 135 = 152s), violating the
+  // either deadline changes (#459 review F2): a hand-picked margin was 2s
+  // SHORT of the worst case, so the wait is DERIVED from the helper deadlines
+  // instead. After #687 raised coldStartHandshakeTimeout to the 600s ceiling
+  // the worst case is stopReplyDeadline 17 + startReplyDeadline 615 = 632s; the
+  // derivation tracks it automatically. This upholds the
   // PR's own "App reply deadline sits strictly above the engine lease"
   // invariant. `EngineStatusStore.restartEngine` also treats `.replyTimeout`
   // as "in flight" so an even slower boot degrades to the status poll rather

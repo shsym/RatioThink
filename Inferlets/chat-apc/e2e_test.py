@@ -87,26 +87,34 @@ admission_oversubscription_factor = 8.0
 restore_pause_at_utilization = 0.85
 # The per-request max_tokens ceiling chat-apc reads back
 # (runtime::max-output-tokens — #438) follows default_token_limit when
-# set, ELSE the raw KV capacity. Set it to a value that is neither the KV
-# capacity (32 * 512 = 16384) nor the old hardcoded 8192, so the
-# over-limit assertion in main() proves default_token_limit takes
-# precedence end to end.
-default_token_limit = 5000
+# set, ELSE the raw KV capacity. Set it below the dummy driver's derived
+# KV capacity (4096; see the driver options note below) and distinct from
+# the old hardcoded 8192, so the over-limit assertion in main() proves
+# default_token_limit takes precedence end to end.
+default_token_limit = 3000
 
 [model.driver]
 type = "dummy"
 device = ["cpu"]
 
 [model.driver.options]
-vocab_size = 32000
+# Must match the bound tokenizer's vocabulary (Qwen/Qwen3-0.6B → 151936).
+# The grammar matcher masks logits over the real tokenizer vocab, so a
+# dummy vocab smaller than the tokenizer leaves the constrained tokens
+# (e.g. the JSON `{` openers, which are high token ids) outside the
+# dummy's logit range — the mask then admits zero in-range tokens and
+# constrained decode (json_object / json_schema / forced-tool) collapses.
+vocab_size = 151936
 arch_name = "test"
-kv_page_size = 32
-max_num_kv_pages = 512
+# The dummy driver derives its own KV page count internally (256 pages of
+# KV_PAGE_SIZE = 16 tokens by default → 4096-token capacity) and accepts
+# no page-sizing options. The retired kv_page_size / max_num_kv_pages
+# knobs are no longer part of its config surface.
 """
 
 # The ceiling chat-apc must report = the configured default_token_limit
-# above (NOT the 16384 KV capacity, NOT the old 8192 constant).
-EXPECTED_MAX_OUTPUT_TOKENS = 5000
+# above (NOT the 4096 KV capacity, NOT the old 8192 constant).
+EXPECTED_MAX_OUTPUT_TOKENS = 3000
 
 # Files contributing to the inferlet "source hash" re-exported for
 # legacy callers; authoritative copy lives in `_stamp.SRC_HASH_PATHS`.
