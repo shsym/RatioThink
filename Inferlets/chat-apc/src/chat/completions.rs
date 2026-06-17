@@ -5153,7 +5153,21 @@ pub(crate) fn build_prompt_tokens(
                     msg.content_str().unwrap_or(""),
                 ));
             }
-            "user" => out.extend(chat::user(model, msg.content_str().unwrap_or(""))),
+            // The first message of a fresh prompt must open the sequence with
+            // the model's BOS (e.g. gemma's `<bos>`, llama3's
+            // `<|begin_of_text|>`): `first_user` prepends it, plain `user` does
+            // not. A preceding `system` turn already emits BOS, so branch on
+            // whether anything has been buffered yet. Omitting BOS is benign
+            // for BOS-agnostic templates (qwen/ChatML) but degenerates
+            // BOS-sensitive ones (gemma4: no BOS → looping / channel salad).
+            "user" => {
+                let content = msg.content_str().unwrap_or("");
+                if out.is_empty() {
+                    out.extend(chat::first_user(model, content));
+                } else {
+                    out.extend(chat::user(model, content));
+                }
+            }
             // #468: reject any other role here rather than demoting it to
             // `user`. This is the root-cause guard — every caller goes
             // through `fill_context` / `build_prompt_tokens`, so the
