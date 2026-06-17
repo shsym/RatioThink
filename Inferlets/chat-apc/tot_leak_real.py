@@ -49,30 +49,26 @@ import e2e_test as h  # boot/teardown helpers + PIE_BIN/WASM_PATH/MANIFEST_PATH
 MODEL = os.environ.get("MODEL", "Qwen/Qwen3-0.6B")
 
 # ── Tunables ─────────────────────────────────────────────────────────────
-# Tight KV budget: 64 pages × 32 tok = 2048 token slots, no CPU swap pool.
-# Small enough that a per-request fork leak exhausts it within a couple of
-# requests, large enough that the fixed working set (a handful of live
-# contexts capped at `MAX_TOKENS_PER_NODE`) fits comfortably.
-MAX_NUM_KV_PAGES = int(os.environ.get("TOT_LEAK_KV_PAGES", "64"))
+# `total_pages` × 32 tok = KV token slots, no CPU swap pool. Sized so the
+# fixed engine's live working set fits comfortably while still exercising
+# genuine KV pressure under thinking-ON generation.
+MAX_NUM_KV_PAGES = int(os.environ.get("TOT_LEAK_KV_PAGES", "256"))
 CPU_PAGES = int(os.environ.get("TOT_LEAK_CPU_PAGES", "0"))
-# A HEAVY single tree: every frontier node forks `breadth` children AND a
-# second fork per node for value-scoring, so one request alone forks dozens
-# of contexts. Without eager freeing they all pile up WITHIN the request —
-# beam losers, spent parents, and score forks never reclaimed until the
-# request ends — and the KV pool is exhausted mid-search (or the deferred
-# fork allocator deadlocks). With the fix each is freed the moment it is
-# dropped, so the live footprint stays bounded to the active beam.
-# 4 + (3-1)*2*4 = 20 leaf nodes; ~20 score forks + parents.
+# The #679 repro config: a thinking-ON tree-of-thought request that forks
+# `breadth` children plus a per-node value-scoring fork. Depth=1 matches the
+# ticket ("NOT a depth>1 issue"): the crash is the per-generation starvation
+# spin, not deep-tree fan-out. Without the fixes the daemon wedges within
+# 1-2 requests (forward-pass starvation hang on KV eviction; / a fork-alloc
+# deadlock on the leak path); with them every request returns a clean tree.
 BREADTH, DEPTH, BEAM = (
     int(os.environ.get("TOT_LEAK_BREADTH", "4")),
-    int(os.environ.get("TOT_LEAK_DEPTH", "3")),
-    int(os.environ.get("TOT_LEAK_BEAM", "2")),
+    int(os.environ.get("TOT_LEAK_DEPTH", "1")),
+    int(os.environ.get("TOT_LEAK_BEAM", "1")),
 )
 # Long enough that each node's reasoning (Qwen3 thinks by default) occupies
-# several KV pages of UNIQUE content.
-MAX_TOKENS_PER_NODE = int(os.environ.get("TOT_LEAK_MAX_TOK", "64"))
-# A few back-to-back heavy requests; the intra-request leak should bite on
-# the first heavy tree, and any cross-request residue compounds.
+# several KV pages of UNIQUE content (so the request pressures the pool).
+MAX_TOKENS_PER_NODE = int(os.environ.get("TOT_LEAK_MAX_TOK", "256"))
+# A few back-to-back requests — the ticket crashes "after 1-2 requests".
 NUM_REQUESTS = int(os.environ.get("TOT_LEAK_REQUESTS", "3"))
 
 CONFIG_TOML = f"""
@@ -106,7 +102,7 @@ type = "portable"
 device = ["metal"]
 
 [model.driver.options]
-max_num_kv_pages = {MAX_NUM_KV_PAGES}
+total_pages = {MAX_NUM_KV_PAGES}
 cpu_pages = {CPU_PAGES}
 """
 
