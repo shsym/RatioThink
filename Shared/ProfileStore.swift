@@ -293,6 +293,7 @@ public final class ProfileStore: ObservableObject {
   public static let defaultChatHFRepoID = "Qwen/Qwen3-0.6B-GGUF"
 
   public static let defaultChatTOML: String = """
+  builtin-origin = "chat"
   id = "chat"
   name = "Chat"
   icon = "bubble.left.and.bubble.right"
@@ -322,6 +323,7 @@ public final class ProfileStore: ObservableObject {
   /// a ToT profile without hand-editing TOML.
   public static let treeOfThoughtFilename = "tree-of-thought.toml"
   public static let treeOfThoughtTOML: String = """
+  builtin-origin = "tree-of-thought"
   id = "tree-of-thought"
   name = "Tree of Thought"
   icon = "point.3.connected.trianglepath.dotted"
@@ -355,6 +357,7 @@ public final class ProfileStore: ObservableObject {
   /// like tree-of-thought, never auto-selected. `thinking` is omitted (the
   /// server defaults it off, #679).
   public static let bestOfNTOML: String = """
+  builtin-origin = "best-of-n"
   id = "best-of-n"
   name = "Best of N"
   icon = "square.grid.2x2"
@@ -402,6 +405,7 @@ public final class ProfileStore: ObservableObject {
   /// enabled. `leader_len`/`draft_len` are omitted so the inferlet applies
   /// its #418 defaults (1 / 3).
   public static let defaultRepeatBoostTOML: String = """
+  builtin-origin = "repeat-boost"
   id = "repeat-boost"
   name = "Repeat Boost"
   icon = "bolt"
@@ -434,6 +438,7 @@ public final class ProfileStore: ObservableObject {
   /// guarantee is the `[constraint]` grammar, not the prompt. Sampling is
   /// left at the chat default (JSON mode does not require greedy decode).
   public static let defaultJSONThinkTOML: String = """
+  builtin-origin = "json-think"
   id = "json-think"
   name = "JSON Think"
   icon = "curlybraces"
@@ -499,8 +504,12 @@ public final class ProfileStore: ObservableObject {
   /// not trigger the hide.
   public static let shippedBuiltinIDs: Set<String> = Set(baseBuiltins.map { $0.id })
 
-  /// Top-level TOML key stamped onto a built-in's on-disk file to record its
-  /// provenance (`Profile.builtinOrigin`). See #718.
+  /// Top-level TOML key recording a built-in's provenance
+  /// (`Profile.builtinOrigin`). Stamped into every base constant above, so an
+  /// override WRITTEN from a base built-in (`setModel` / editor -> `dump`)
+  /// carries it automatically — the marker is then an id-independent lineage
+  /// signal on disk. A user-authored profile created from scratch has no such
+  /// key. See #718.
   public static let builtinOriginKey = "builtin-origin"
 
   /// Every built-in FILENAME ever shipped, mapped to its provenance id. A

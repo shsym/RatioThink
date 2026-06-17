@@ -2701,6 +2701,39 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  /// Every base constant must carry a `builtin-origin` marker equal to its id,
+  /// so an override written from it lands the provenance on disk. Drift guard:
+  /// a new built-in added without the marker would be invisible to the strict
+  /// policy until retired — fail here instead.
+  func test_every_base_builtin_constant_is_marked_with_its_origin() throws {
+    for builtin in ProfileStore.baseBuiltins {
+      let parsed = try Profile.parse(toml: builtin.toml)
+      XCTAssertEqual(parsed.builtinOrigin, builtin.id,
+                     "base constant \(builtin.id) must stamp builtin-origin = \(builtin.id)")
+    }
+  }
+
+  /// Customizing a base built-in (`setModel`) must persist the
+  /// `builtin-origin` marker to disk — the source of the provenance that lets
+  /// a LATER version recognize this file as a retired built-in even after the
+  /// user renamed nothing but the model. Without the marker in the base
+  /// constants this override would be indistinguishable from a user file.
+  func test_setModel_on_base_builtin_persists_builtin_origin_marker() throws {
+    try withTempProfilesDir { dir in
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      try store.setModel("Org/Repo/pinned.gguf", forProfileID: "json-think")
+
+      let onDisk = try Profile.parse(toml: String(
+        contentsOf: dir.appendingPathComponent("json-think.toml"), encoding: .utf8))
+      XCTAssertEqual(onDisk.builtinOrigin, "json-think",
+                     "an override written from a base built-in must carry its builtin-origin")
+      XCTAssertEqual(onDisk.model, "Org/Repo/pinned.gguf", "the customization must persist too")
+    }
+  }
+
   /// #706 F3: `BaseBuiltin.name` is hand-carried alongside the TOML so the
   /// revert notice can label a built-in without re-parsing. Guard the desync:
   /// a future TOML `name` edit that forgets the struct must fail here.
