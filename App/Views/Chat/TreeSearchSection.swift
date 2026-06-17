@@ -185,41 +185,51 @@ private struct ToTNodeRow: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 4) {
-      Button {
-        userExpanded = !isExpanded
-      } label: {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-          if isBestOfN {
-            optionGlyph
-          } else {
-            beamGlyph
-            scoreBadge
+      HStack(alignment: .firstTextBaseline, spacing: 6) {
+        // Expand/collapse toggle. Holds only the glyph + headline + chevron —
+        // the Select affordance is a SIBLING (below), never nested inside this
+        // Button: a Button inside a Button both fires the toggle on a Select tap
+        // AND hides Select from the accessibility tree (it gets absorbed into
+        // the outer element), so Select must stand on its own.
+        Button {
+          userExpanded = !isExpanded
+        } label: {
+          HStack(alignment: .firstTextBaseline, spacing: 6) {
+            if isBestOfN {
+              optionGlyph
+            } else {
+              beamGlyph
+              scoreBadge
+            }
+            Text(headline)
+              .font(.caption.monospaced())
+              .foregroundStyle(headlineTint)
+              .lineLimit(isBestOfN && !isDimmed ? 3 : 1)
+              .strikethrough(isPruned, color: .secondary)
+              .frame(maxWidth: .infinity, alignment: .leading)
+            if hasDetail {
+              Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            }
           }
-          Text(headline)
-            .font(.caption.monospaced())
-            .foregroundStyle(headlineTint)
-            .lineLimit(isBestOfN && !isDimmed ? 3 : 1)
-            .strikethrough(isPruned, color: .secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-          // The Select affordance — only before a choice is made, only for a
-          // pickable (engine-saved) candidate. `borderedProminent` paints in
-          // the system accent (adaptive).
-          if let selection, isPickable, !hasChoice {
-            Button("Select") { selection.onPick(node.id) }
-              .buttonStyle(.borderedProminent)
-              .controlSize(.small)
-              .accessibilityIdentifier("bestofn.select.\(node.branchIndex ?? 0)")
-          }
-          if hasDetail {
-            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-              .font(.caption2)
-              .foregroundStyle(.tertiary)
-          }
+          .contentShape(Rectangle())
         }
-        .contentShape(Rectangle())
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .help(isExpanded ? "Collapse this branch" : "Expand this branch")
+
+        // The Select affordance — only before a choice is made, only for a
+        // pickable (engine-saved) candidate. `borderedProminent` paints in the
+        // system accent (adaptive). Sibling of the toggle so it is its own tap
+        // target + its own accessibility element.
+        if let selection, isPickable, !hasChoice {
+          Button("Select") { selection.onPick(node.id) }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .accessibilityIdentifier("bestofn.select.\(node.branchIndex ?? 0)")
+        }
       }
-      .buttonStyle(.plain)
-      .help(isExpanded ? "Collapse this branch" : "Expand this branch")
 
       if isExpanded {
         // The node's reasoning — shown, never stripped, folded behind the
@@ -260,6 +270,41 @@ private struct ToTNodeRow: View {
     }
     .opacity(isDimmed ? 0.5 : 1.0)
     .animation(.easeInOut(duration: 0.18), value: hasChoice)
+    // Stable identity + a semantic state value for the Best-of-N selection GUI
+    // test (#690): the chosen-vs-unpicked EMPHASIS is built from adaptive color
+    // (asserted for light/dark by the ImageRenderer snapshot test), which
+    // XCUITest cannot read — so the row also exposes its state as an
+    // accessibility value the seated test can assert (`chosen` highlighted,
+    // `unpicked` collapsed/dimmed, `pickable` before a choice). Empty on a
+    // tree-of-thought node, which is not a Best-of-N candidate.
+    // Selection-state probe for the seated GUI test (#690). A dedicated,
+    // non-interactive marker in an OVERLAY (zero layout impact) encodes the
+    // row's state INTO its accessibility identifier (`bestofn.candidate.<i>.
+    // pickable` → `.chosen` / `.unpicked`) — the assertable proxy for the
+    // adaptive-color emphasis XCUITest cannot see. State is in the identifier,
+    // not a value, because XCUITest reliably matches identifiers but does not
+    // surface `accessibilityValue` on a trait-less element. Kept OUT of the
+    // row's interactive subtree so it neither combines with nor hides the
+    // Select button (its own sibling element). Only on a candidate row.
+    .overlay(alignment: .topLeading) {
+      if isBestOfN {
+        Color.clear
+          .frame(width: 1, height: 1)
+          .accessibilityElement()
+          .accessibilityIdentifier("bestofn.candidate.\(node.branchIndex ?? 0).\(bestOfNRowState)")
+      }
+    }
+  }
+
+  /// Best-of-N selection state as a stable string for the seated GUI test —
+  /// the assertable proxy for the adaptive-color emphasis. Empty for a
+  /// tree-of-thought node (not a candidate).
+  private var bestOfNRowState: String {
+    guard isBestOfN else { return "" }
+    if isChosen { return "chosen" }
+    if isDimmed { return "unpicked" }
+    if isPickable { return "pickable" }
+    return "unavailable"
   }
 
   /// Glyph for a Best-of-N candidate: an accent check once chosen, else a

@@ -74,7 +74,7 @@ endef
         test-unit test-scenario test-smoke test-tot-real-smoke-unit test-tot-real-smoke test-curated-hf test-install-guards test-sandbox-diagnostics test-readme-harness test-e2e-http \
         test-spec-smoke test-spec-bench test-spec-matrix-selftest bench-spec-matrix bench-datasets-prep bench-datasets-verify \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
-        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-gui-chat-switch test-gui-menu test-gui-engine-status test-gui-model-download test-menubar-icon-template \
+        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-gui-chat-switch test-gui-bestofn test-gui-menu test-gui-engine-status test-gui-model-download test-menubar-icon-template \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-apc-bench-selftest test-e2e-harsh-load test-e2e-cache-real bench-apc-real \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
@@ -664,6 +664,9 @@ test-gui-helper-recovery: genproject $(LOGDIR) ## GUI area: #496 helper unreacha
 
 test-gui-chat-switch: genproject $(LOGDIR) ## GUI area: #530 rapid chat-switching main-thread responsiveness guard — seeded long transcripts + stall watchdog (S530)
 	$(call gui_suite_run,chat-switch,-only-testing:RatioThinkGUITests/S530_RapidChatSwitchGUITests)
+
+test-gui-bestofn: genproject $(LOGDIR) ## GUI area: #690 Best-of-N interactive selection — seeded round renders N candidates, pick collapses unpicked + highlights chosen + reveals commit affordances, light + dark (S690)
+	$(call gui_suite_run,bestofn,-only-testing:RatioThinkGUITests/S690_BestOfNSelectionGUITests)
 
 test-gui-local-api: genproject $(LOGDIR) ## GUI area: #654/#663 Local API panel — seeded profile tabs + streaming toggle, same-model switch keeps engine and per-profile 'Running' badge (S654)
 	$(call gui_suite_run,local-api,-only-testing:RatioThinkGUITests/S654_LocalAPIPanelGUITests)
