@@ -80,6 +80,11 @@ struct RatioThinkApp: App {
   /// records each turn's terminal `spec_metrics` here; the ProfileEditor
   /// reads it for the read-only "last run" badge.
   @StateObject private var specMetricsStore = SpecMetricsStore()
+  /// #711: engine-true context window (tokens) of the loaded model,
+  /// republished from chat `usage` frames. App-scoped so the Settings
+  /// scene's memory screen reads it without a chat. Inline default — no
+  /// init wiring (mirrors `updateAvailability`).
+  @StateObject private var contextWindow = EngineContextWindow()
   #if DEBUG
   /// #530 DEBUG-only GUI seam: main-thread responsiveness probe for the
   /// rapid-chat-switching stress guard. Constructed always but only `start()`ed
@@ -644,6 +649,7 @@ struct RatioThinkApp: App {
         .environmentObject(updateAvailability)
         .environmentObject(settingsNavigation)
         .environmentObject(specMetricsStore)
+        .environmentObject(contextWindow)
         // #420: route the menu-bar Helper's `ratiothink://settings` deep
         // link straight to the Settings scene (not just app-foreground).
         .handlesSettingsDeepLink(settingsNavigation: settingsNavigation)
@@ -743,6 +749,7 @@ struct RatioThinkApp: App {
         .environmentObject(engineStatusStore)
         .environmentObject(guardrailRevision)
         .environmentObject(specMetricsStore)
+        .environmentObject(contextWindow)
     }
   }
 }

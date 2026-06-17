@@ -554,6 +554,21 @@ def assert_sse_framing(payloads: list[str], rep: Report, ctx: str) -> None:
         if obj.get("object") == "chat.completion.chunk":
             rep.fail(f"{ctx}: content chunk after terminal: {d[:80]!r}")
 
+    # #711: exactly one engine-true `usage` meter frame, after the terminal
+    # chunk. The dummy driver reports a real KV-page budget, so the frame
+    # carries a positive `context_window` (budget_pages × tokens_per_page).
+    usage_idxs = [
+        i for i, d in enumerate(payloads)
+        if d != "[DONE]" and json.loads(d).get("event") == "usage"
+    ]
+    if rep.ok(len(usage_idxs) == 1, f"{ctx}: usage-frame count {len(usage_idxs)} (want 1)"):
+        u = json.loads(payloads[usage_idxs[0]])
+        rep.ok(usage_idxs[0] > term_i, f"{ctx}: usage frame must follow the terminal chunk")
+        rep.ok(isinstance(u.get("total_tokens"), int) and u["total_tokens"] >= 0,
+               f"{ctx}: usage.total_tokens {u.get('total_tokens')!r}")
+        rep.ok(isinstance(u.get("context_window"), int) and u["context_window"] > 0,
+               f"{ctx}: usage.context_window {u.get('context_window')!r} (want >0 on dummy driver)")
+
 
 async def section_sse_stress(base: str, http: httpx.AsyncClient, rep: Report) -> None:
     P = "scope2/sse"

@@ -3758,6 +3758,20 @@ async fn handle_streaming(
                 eprintln!("[chat-apc] json usage-chunk serialize bug: {e}");
             }
         }
+        // #711: engine-true context meter on the JSON-constrained path too,
+        // mirroring the plain stream exit. Always emitted (the app's meter
+        // reads this, independent of the OpenAI `include_usage` opt-in above).
+        {
+            let window = ctx.max_tokens();
+            let frame = sse::SseUsage::new(
+                prompt_tokens as u32,
+                completion_tokens as u32,
+                (window > 0).then_some(window),
+            );
+            if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
+                eprintln!("[chat-apc] json usage meta-frame serialize bug: {e}");
+            }
+        }
         sse::emit_done_logged(&mut em, "json_stream_exit").await;
         return em.finish();
     }
@@ -4077,6 +4091,19 @@ async fn handle_streaming(
         (outcome, error_diag)
     };
 
+    // #711: engine-true context accounting for the terminal `usage` frame.
+    // `stream` borrows `&mut ctx`, so capture the completion count and drop
+    // it before reading the context's page state. Occupancy is `seq_len +
+    // buffer` (committed + working + buffered tokens) — engine-true, and
+    // preferred over re-counting the re-sent transcript. `max_tokens` is
+    // the effective KV-page-budget window; 0 when the budget is unknown.
+    let usage_completion = stream.tokens_generated() as u32;
+    drop(stream);
+    let usage_window = ctx.max_tokens();
+    let usage_used = ctx.seq_len() + ctx.buffer().len() as u32;
+    let usage_prompt = usage_used.saturating_sub(usage_completion);
+    let usage_window = (usage_window > 0).then_some(usage_window);
+
     // Terminal chunk first so OpenAI clients see a `finish_reason`
     // in the canonical envelope (F8). When the loop exited via
     // ToolCalls, the buffered call lands here on the same frame —
@@ -4234,6 +4261,14 @@ async fn handle_streaming(
         }
         if let Err(EmitError::Serialize(e)) = em.emit_json(&diag).await {
             eprintln!("[chat-apc] cache diag serialize bug: {e}");
+        }
+    }
+    // #711: engine-true token meter for the conversation context. Always
+    // emitted (cheap) so the GUI renders used/window on every turn.
+    {
+        let frame = sse::SseUsage::new(usage_prompt, usage_completion, usage_window);
+        if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
+            eprintln!("[chat-apc] usage meta-frame serialize bug: {e}");
         }
     }
     sse::emit_done_logged(&mut em, "stream_exit").await;

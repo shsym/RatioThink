@@ -29,6 +29,8 @@ struct ChatScaffoldView: View {
   @EnvironmentObject private var engineStore: EngineClientStore
   @EnvironmentObject private var modelLoadCenter: ModelLoadCenter
   @EnvironmentObject private var engineStatusStore: EngineStatusStore
+  /// #711: engine-true context window store, fed by each turn's usage frame.
+  @EnvironmentObject private var engineContextWindow: EngineContextWindow
   /// #412: background-helper health, forwarded to the toolbar pip's outer ring.
   @EnvironmentObject private var helperHealth: HelperHealthController
   @EnvironmentObject private var profileStore: ProfileStore
@@ -1153,7 +1155,13 @@ struct ChatScaffoldView: View {
       recoveryGate: engineStatusStore,
       // #621: persist the terminal speculation report against the profile
       // that issued the turn, so the ProfileEditor badge reflects real runs.
-      onSpecMetrics: { specMetricsStore.record($0, forProfileID: metricsProfileID) }
+      onSpecMetrics: { specMetricsStore.record($0, forProfileID: metricsProfileID) },
+      // #711: publish the engine-true context meter for this conversation
+      // (top-bar bar) and the model-global window (memory-settings screen).
+      onUsage: { usage in
+        viewModel.contextUsage = usage
+        engineContextWindow.record(usage.windowTokens)
+      }
     )
   }
 

@@ -236,6 +236,16 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
                 // a wire-schema drift surfaces instead of vanishing.
                 let metrics = try decoder.decode(SpecMetricsFrame.self, from: frame.dataBytes)
                 continuation.yield(.specMetrics(metrics.toModel()))
+              case "usage":
+                // #711: engine-true context meter. `total_tokens` is the
+                // occupancy; `context_window` (when present) is the KV-budget
+                // window. Strict decode mirrors the other meta-frames so a
+                // schema drift surfaces rather than silently dropping the meter.
+                let meta = try decoder.decode(MetaFrame.self, from: frame.dataBytes)
+                continuation.yield(.usage(
+                  used: meta.total_tokens ?? 0,
+                  window: meta.context_window
+                ))
               default:
                 continue
               }
@@ -655,6 +665,15 @@ private struct MetaFrame: Decodable {
   let loaded_bytes: UInt64?
   let total_bytes: UInt64?
   let eta_s: Double?
+  /// #711 `event:"usage"` fields. `total_tokens` is the engine-true
+  /// context occupancy after the turn; `context_window` is the effective
+  /// KV-budget window in tokens (absent when the engine could not report
+  /// a budget). `prompt_tokens`/`completion_tokens` are decoded for
+  /// completeness but the meter only needs `total_tokens`/`context_window`.
+  let prompt_tokens: Int?
+  let completion_tokens: Int?
+  let total_tokens: Int?
+  let context_window: Int?
 }
 
 /// Strict `generation_metrics` SSE contract. Unlike best-effort generic

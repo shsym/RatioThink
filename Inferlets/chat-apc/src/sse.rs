@@ -196,6 +196,40 @@ impl<'a> SseError<'a> {
     }
 }
 
+/// `data: {"event":"usage","prompt_tokens":P,"completion_tokens":C,
+/// "total_tokens":T,"context_window":W}` — engine-true token accounting
+/// for the conversation context (#711). Emitted once, between the terminal
+/// chunk and `[DONE]`, so the GUI's context meter can render used/window.
+///
+/// `total_tokens` (== the engine-true context occupancy: committed +
+/// working + buffered tokens) is the numerator; `context_window` is the
+/// effective KV budget in tokens (`budget_pages × tokens_per_page`) and is
+/// the denominator. `context_window` is omitted when the budget is unknown
+/// (context not yet resident), so the app falls back rather than dividing
+/// by zero. A distinct `event:"usage"` keeps the demux off the OpenAI
+/// content-chunk path — generic clients ignore the frame.
+#[derive(Serialize)]
+pub struct SseUsage {
+    pub event: &'static str,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+}
+
+impl SseUsage {
+    pub fn new(prompt_tokens: u32, completion_tokens: u32, context_window: Option<u32>) -> Self {
+        Self {
+            event: "usage",
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            context_window,
+        }
+    }
+}
+
 /// The `[DONE]` terminator OpenAI's SSE chat-completions schema ends
 /// every stream with. Clients pin on this exact byte sequence.
 pub async fn emit_done(em: &mut Emitter) -> Result<(), EmitError> {

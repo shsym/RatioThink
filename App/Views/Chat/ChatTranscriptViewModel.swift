@@ -18,6 +18,10 @@ final class ChatTranscriptViewModel: ObservableObject {
   @Published var selectedProfileID: String
   @Published var samplingOverride: ChatSampling?
   @Published var systemPromptOverride: String?
+  /// #711: live context-token meter for THIS conversation — engine-true
+  /// occupancy + window from the latest turn's `usage` frame. Drives the
+  /// top-bar meter; `nil` until the first turn of this session completes.
+  @Published var contextUsage: ContextUsage?
 
   /// Default model surface in the model pull-down until Phase 6 wires
   /// the engine `/v1/models` listing in. Static so previews and tests

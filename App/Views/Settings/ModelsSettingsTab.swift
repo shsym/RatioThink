@@ -699,6 +699,10 @@ private struct MemoryGuardrailSection: View {
   @State private var fraction: Double = GuardrailSettings.defaultFraction
   @State private var saveError: String?
   @State private var loadError: String?
+  /// #711: engine-true context window of the loaded model, surfaced as
+  /// "expected max context". Republished from chat `usage` frames; `nil`
+  /// until a turn has run this session.
+  @EnvironmentObject private var engineContextWindow: EngineContextWindow
 
   private enum FractionChoice: Hashable {
     case preset(Double)
@@ -757,6 +761,13 @@ private struct MemoryGuardrailSection: View {
           .fixedSize(horizontal: false, vertical: true)
           .accessibilityIdentifier("GuardrailLoadError")
       }
+
+      Text(contextWindowPreview)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityIdentifier("ContextWindowPreview")
+
       if let saveError {
         Text(saveError).font(.callout).foregroundStyle(.red)
       }
@@ -791,6 +802,17 @@ private struct MemoryGuardrailSection: View {
       line += "  (\(derivation))"
     }
     return line
+  }
+
+  /// #711: the engine-true context window of the loaded model
+  /// (`budget_pages × tokens_per_page`), or a measure-it hint until a chat
+  /// turn has reported usage this session. Distinct from the size ceiling
+  /// above — this is how many context tokens the model can actually hold.
+  private var contextWindowPreview: String {
+    guard let tokens = engineContextWindow.tokens, tokens > 0 else {
+      return "Expected max context: send a message to measure the loaded model's window."
+    }
+    return "Expected max context ≈ \(tokens.formatted()) tokens (loaded model)."
   }
 
   private func load() {

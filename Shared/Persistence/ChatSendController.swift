@@ -37,7 +37,8 @@ public final class ChatSendController: ObservableObject {
     recoveryGate: ChatRecoveryGate? = nil,
     recoveryPolicy: ChatRecoveryPolicy = .default,
     contextUsageTracker: ContextUsageTracker? = nil,
-    onSpecMetrics: (@MainActor (SpecMetrics) -> Void)? = nil
+    onSpecMetrics: (@MainActor (SpecMetrics) -> Void)? = nil,
+    onUsage: (@MainActor (ContextUsage) -> Void)? = nil
   ) {
     cancel()
     generation &+= 1
@@ -175,6 +176,15 @@ public final class ChatSendController: ObservableObject {
               self.activeAssistant = nil
               self.activeContext = nil
               self.activePersistenceStatus = nil
+            case let .usage(used, window):
+              // #711: the usage frame trails `.finish`. It carries the
+              // conversation's engine-true occupancy (committed + working +
+              // buffered tokens), NOT this turn's token count — so it stays
+              // session-scoped via `onUsage`/`contextUsage` and is NOT
+              // written to `Message.tokens`, whose per-message meaning the
+              // writer owns. Leaving it unwritten keeps that field one
+              // consistent thing regardless of write path.
+              onUsage?(ContextUsage(usedTokens: used, windowTokens: window))
             }
           }
           // Stream completed cleanly — no retry.

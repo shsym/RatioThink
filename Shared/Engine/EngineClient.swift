@@ -618,6 +618,15 @@ public enum ChatEvent: Equatable, Sendable {
   /// Terminal speculative-decode metrics. See `SpecMetrics`.
   case specMetrics(SpecMetrics)
   case finish(reason: FinishReason)
+  /// Engine-true context-token accounting (#711). `used` is the
+  /// conversation's occupancy after this turn (committed + working +
+  /// buffered tokens, == prompt + completion); `window` is the effective
+  /// KV-budget context window in tokens (`budget_pages × tokens_per_page`),
+  /// `nil` when the engine could not report a budget. Emitted once per
+  /// turn, just before the stream completes, off the OpenAI content path
+  /// (a distinct `event:"usage"` meta-frame), so it never perturbs the
+  /// `.delta` / `.finish` contract.
+  case usage(used: Int, window: Int?)
 
   public enum FinishReason: Equatable, Sendable {
     case stop
@@ -642,6 +651,29 @@ public struct GenerationMetrics: Codable, Equatable, Sendable {
     case outputTokens = "output_tokens"
     case elapsedSeconds = "elapsed_s"
     case tokensPerSecond = "tokens_per_sec"
+  }
+}
+
+/// Snapshot of how full a conversation's context is (#711) — the value
+/// behind the top-bar meter and the memory-screen estimate. `usedTokens`
+/// is the engine-true occupancy after the latest turn; `windowTokens` is
+/// the effective KV-budget context window (`nil` when the engine could
+/// not report a budget — e.g. the context isn't resident yet).
+public struct ContextUsage: Equatable, Sendable {
+  public var usedTokens: Int
+  public var windowTokens: Int?
+
+  public init(usedTokens: Int, windowTokens: Int?) {
+    self.usedTokens = usedTokens
+    self.windowTokens = windowTokens
+  }
+
+  /// 0…1 fill for the progress bar, or `nil` when the window is unknown
+  /// or non-positive so the caller renders an indeterminate state rather
+  /// than dividing by zero.
+  public var fraction: Double? {
+    guard let window = windowTokens, window > 0 else { return nil }
+    return min(1, max(0, Double(usedTokens) / Double(window)))
   }
 }
 

@@ -181,7 +181,7 @@ public enum S3_EngineSubprocess {
           reasoning += text
         case let .finish(reason):
           finishReason = reason
-        case .generationMetrics, .modelLoading, .modelReady, .specMetrics:
+        case .generationMetrics, .modelLoading, .modelReady, .specMetrics, .usage:
           continue
         }
       }

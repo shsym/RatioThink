@@ -253,6 +253,53 @@ final class HTTPEngineClientTests: XCTestCase {
     ])
   }
 
+  func test_chatCompletion_demuxes_usage_meta_frame() async throws {
+    // #711: the engine-true context meter rides a trailing `event:"usage"`
+    // meta-frame between the terminal chunk and `[DONE]`. It must demux to
+    // a `.usage` event (off the `.delta`/`.finish` content path) carrying
+    // the occupancy + window.
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        "data: {\"event\":\"model_ready\"}\n\n",
+        #"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"usage","prompt_tokens":40,"completion_tokens":8,"total_tokens":48,"context_window":4096}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    let req = ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "hi")])
+    var events: [ChatEvent] = []
+    for try await ev in makeClient().chatCompletion(req) {
+      events.append(ev)
+    }
+    XCTAssertEqual(events, [
+      .modelReady,
+      .delta(role: .assistant, content: "hi"),
+      .finish(reason: .stop),
+      .usage(used: 48, window: 4096),
+    ])
+  }
+
+  func test_chatCompletion_usage_frame_without_window_yields_nil_window() async throws {
+    // The engine omits `context_window` when it could not measure the KV
+    // budget; the meter must surface `window: nil` (indeterminate) rather
+    // than defaulting to a wrong denominator.
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        "data: {\"event\":\"model_ready\"}\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"usage","prompt_tokens":10,"completion_tokens":2,"total_tokens":12}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    let req = ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "hi")])
+    var events: [ChatEvent] = []
+    for try await ev in makeClient().chatCompletion(req) {
+      events.append(ev)
+    }
+    XCTAssertEqual(events.last, .usage(used: 12, window: nil))
+  }
+
   func test_chatCompletion_routes_reasoning_content_to_its_own_channel() async throws {
     // chat-apc wire order for a Qwen thinking turn: model_ready,
     // role chunk, reasoning_content deltas, then visible content, finish.
