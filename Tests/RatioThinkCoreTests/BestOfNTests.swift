@@ -1,4 +1,5 @@
 import XCTest
+import SwiftData
 
 @testable import RatioThinkCore
 
@@ -239,6 +240,116 @@ final class BestOfNTests: XCTestCase {
     let model: String
     let release: [String]
   }
+
+  // MARK: selection-flash regression (#708) — option presentation from frame 1
+
+  /// The selection-flash bug: a Best-of-N turn streams its candidates into
+  /// `assistant.tot` but only set `assistant.bestOfN` at `awaiting_selection`,
+  /// AFTER generation. While `bestOfN` was nil the round rendered through the
+  /// tree-of-thought branch, where a `kept` beam node draws a GREEN checkmark —
+  /// which flipped to a hollow Best-of-N option glyph the instant
+  /// `awaiting_selection` set `bestOfN` (the green-then-unselected flash).
+  ///
+  /// Root-cause guard: the turn must carry `bestOfN` (option presentation) from
+  /// the FIRST frame, with no chosen candidate, all the way through the
+  /// `node_complete` / `level_pruned` window (where the ToT branch would have
+  /// drawn the green `kept` checkmarks) — never only at `awaiting_selection`.
+  /// Static snapshot tests render the final state only and missed this; this
+  /// drives the streaming transition.
+  @MainActor
+  func test_round_renders_as_bestOfN_throughout_generation_never_kept_beam() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ManualInferletEngine()
+    let controller = ChatSendController()
+    controller.sendBestOfN(
+      chat: chat,
+      context: context,
+      engine: engine,
+      config: BestOfNProfileConfig(n: 3),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"))
+
+    func assistant() -> Message? { chat.messages.first { $0.role == "assistant" } }
+    func round() -> BestOfNRound? {
+      assistant()?.bestOfN.flatMap { try? JSONDecoder().decode(BestOfNRound.self, from: $0) }
+    }
+    func nodeCount() -> Int {
+      (assistant()?.tot.flatMap { try? JSONDecoder().decode(ToTTree.self, from: $0) })?.nodes.count ?? 0
+    }
+
+    // The assistant turn is created at round start.
+    try await waitUntil("assistant turn inserted") { assistant() != nil }
+
+    // INVARIANT 1 — before any candidate streams, the turn is ALREADY a
+    // Best-of-N round (option presentation), with no choice. Pre-fix this is
+    // nil, so MessageBubble would take the ToT (green-beam) branch.
+    let early = try XCTUnwrap(round(), "turn must carry bestOfN from round start, not only at awaiting_selection")
+    XCTAssertTrue(early.candidates.isEmpty, "no pickable candidates before awaiting_selection")
+    XCTAssertNil(early.chosenID, "nothing chosen before the user picks")
+
+    // Stream the candidates and the `level_pruned` that marks them `kept` — the
+    // exact window the ToT branch would render as green checkmarks.
+    engine.emit(#"{"event":"tree_start","id":"bon","model":"m","breadth":3,"depth":1,"beam_width":3}"#)
+    engine.emit(#"{"event":"node_complete","node":{"id":"n0","parent_id":"root","depth":1,"branch_index":0,"content":"A","status":"ok"}}"#)
+    engine.emit(#"{"event":"node_complete","node":{"id":"n1","parent_id":"root","depth":1,"branch_index":1,"content":"B","status":"ok"}}"#)
+    engine.emit(#"{"event":"level_pruned","level":1,"kept":["n0","n1"]}"#)
+    try await waitUntil("candidates streamed") { nodeCount() >= 2 }
+
+    // INVARIANT 2 — mid-generation (post `level_pruned`, pre `awaiting_selection`)
+    // the turn is STILL Best-of-N with no chosen candidate. The view therefore
+    // shows neutral option glyphs — never a green kept/chosen indicator.
+    let mid = try XCTUnwrap(round(), "turn must stay in Best-of-N mode during generation")
+    XCTAssertNil(mid.chosenID, "no candidate may be chosen before the user picks")
+
+    // Finalize → candidates become pickable.
+    engine.emit(#"{"event":"awaiting_selection","level":1,"candidates":[{"id":"n0","branch_index":0,"snapshot_name":"s0"},{"id":"n1","branch_index":1,"snapshot_name":"s1"}]}"#)
+    engine.finish()
+    try await waitUntil("round resolved") { !controller.isInFlight }
+
+    let final = try XCTUnwrap(round())
+    XCTAssertEqual(final.candidates.map(\.id), ["n0", "n1"], "awaiting_selection populates the pick set")
+    XCTAssertNil(final.chosenID, "still no choice until the user picks")
+  }
+
+  /// Polls `condition` on the main actor until true or the timeout elapses.
+  @MainActor
+  private func waitUntil(
+    _ description: String, timeout: TimeInterval = 3,
+    _ condition: () -> Bool
+  ) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if condition() { return }
+      try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    XCTFail("timed out waiting for: \(description)")
+  }
+}
+
+/// `EngineClient` whose Best-of-N dispatch stream is driven frame-by-frame from
+/// the test, so a test can inspect controller/message state at any point of the
+/// generation → `awaiting_selection` transition (#708 flash regression).
+private final class ManualInferletEngine: EngineClient, @unchecked Sendable {
+  private var continuation: AsyncThrowingStream<Data, Error>.Continuation?
+
+  func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
+  func models() async throws -> [ModelInfo] { [] }
+  func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
+    AsyncThrowingStream { $0.finish() }
+  }
+  func dispatchInferlet(_ req: InferletRequest) -> AsyncThrowingStream<Data, Error> {
+    AsyncThrowingStream { self.continuation = $0 }
+  }
+
+  /// Yield one raw JSON event frame (the wire shape `toTEventStream` parses).
+  func emit(_ json: String) { continuation?.yield(Data(json.utf8)) }
+  func finish() { continuation?.finish() }
 }
 
 /// Minimal `EngineClient` that records the last dispatched `InferletRequest` so

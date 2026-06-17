@@ -290,11 +290,13 @@ private struct ToTNodeRow: View {
       // `Color.accentColor` / opacity, which adapt across light + dark — never
       // a hardcoded lightness (#690).
       //
-      // #708 selection-flash fix: every Best-of-N candidate reserves the SAME
-      // 8pt inset (not `isChosen ? 8 : 0`), so picking only fades the accent
-      // card/border in — it never changes a row's geometry. The old chosen-only
-      // padding grew the picked row on selection and shoved its siblings under
-      // the implicit `hasChoice` animation, which read as a flash.
+      // #708 layout stability: every Best-of-N candidate reserves the SAME 8pt
+      // inset (not `isChosen ? 8 : 0`), so the accent card only fades in/out as
+      // the choice moves between candidates (click-to-reselect) — the rows never
+      // change geometry or shove their siblings. (The green-checkmark selection
+      // FLASH itself was a separate bug — candidates rendering as tree-of-thought
+      // `kept` beam nodes before `bestOfN` was set — fixed at the source in
+      // `ChatSendController.sendBestOfN`.)
       .padding(isBestOfN ? 8 : (isChosen ? 8 : 0))
       .background {
         if isChosen {
