@@ -145,6 +145,29 @@ final class CuratedModelCatalogTests: XCTestCase {
     }
   }
 
+  /// Both Qwen3.6 builds (hybrid qwen35 / qwen35moe arch) must stay pinned
+  /// to their verified single-file coordinates and the manual-large tier.
+  /// Each was real-loaded through the portable driver (boot + completion)
+  /// before pinning; reds if repointed at a shard or a non-existent quant.
+  func test_qwen36_entries_pin_single_file_coordinates() {
+    let dense = CuratedModelCatalog.model(withID: "qwen3.6-27b-q4_k_m")
+    XCTAssertEqual(dense?.huggingFaceRepo, "unsloth/Qwen3.6-27B-GGUF")
+    XCTAssertEqual(dense?.huggingFaceFile, "Qwen3.6-27B-Q4_K_M.gguf")
+    XCTAssertEqual(dense?.approximateSizeBytes, 16_817_244_384)
+    XCTAssertEqual(dense?.installIntent, .manualOnly)
+
+    let moe = CuratedModelCatalog.model(withID: "qwen3.6-35b-a3b-ud-q4_k_m")
+    XCTAssertEqual(moe?.huggingFaceRepo, "unsloth/Qwen3.6-35B-A3B-GGUF")
+    XCTAssertEqual(moe?.huggingFaceFile, "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
+    XCTAssertEqual(moe?.approximateSizeBytes, 22_134_528_992)
+    XCTAssertEqual(moe?.installIntent, .manualOnly)
+
+    for m in [dense, moe] {
+      XCTAssertFalse(HFCacheCatalog.isSplitShardFilename(m?.huggingFaceFile ?? ""),
+                     "Qwen3.6 entries must be monolithic single-file GGUFs")
+    }
+  }
+
   /// #425 regression pin: Qwen2.5 7B Q4_K_M must come from bartowski's
   /// single-file repo, NOT the official `Qwen/Qwen2.5-7B-Instruct-GGUF`,
   /// which publishes that quant ONLY as `…-q4_k_m-00001-of-00002.gguf`

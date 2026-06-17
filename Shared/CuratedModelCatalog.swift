@@ -324,5 +324,40 @@ public enum CuratedModelCatalog {
       pieSupportNotes: "Single-file Qwen3 GGUF; thinking-model behavior may use reasoning_content; manual/local real-engine E2E only.",
       installIntent: .manualOnly
     ),
+    // Qwen3.6 family — the hybrid gated-delta-rule + GQA arch the portable
+    // Metal engine runs as PieArch::Qwen3_5. Both builds declare a
+    // general.architecture (qwen35 / qwen35moe) that the engine maps to
+    // Qwen3_5, and both were real-loaded through the portable driver
+    // (boot + a chat completion) before pinning. unsloth ships verified
+    // MONOLITHIC single-file quants; only each repo's BF16 build is split
+    // into shards pie cannot assemble. Manual/local posture (~16-21 GiB).
+    CuratedModel(
+      id: "qwen3.6-27b-q4_k_m",
+      displayName: "Qwen3.6 27B",
+      publisher: "Alibaba",
+      parameterCountBillions: 27.0,
+      quantization: "Q4_K_M",
+      approximateSizeBytes: 16_817_244_384,
+      huggingFaceRepo: "unsloth/Qwen3.6-27B-GGUF",
+      huggingFaceFile: "Qwen3.6-27B-Q4_K_M.gguf",
+      summary: "Hybrid-attention Qwen3.6 dense for top-quality chat on roomy Macs.",
+      recommendedSystemMemoryBytes: 32 * 1024 * 1024 * 1024,
+      pieSupportNotes: "Single-file Qwen3.6 GGUF (general.architecture=qwen35 → PieArch::Qwen3_5); manual/local real-engine E2E only.",
+      installIntent: .manualOnly
+    ),
+    CuratedModel(
+      id: "qwen3.6-35b-a3b-ud-q4_k_m",
+      displayName: "Qwen3.6 35B-A3B (MoE)",
+      publisher: "Alibaba",
+      parameterCountBillions: 35.0,
+      quantization: "UD-Q4_K_M",
+      approximateSizeBytes: 22_134_528_992,
+      huggingFaceRepo: "unsloth/Qwen3.6-35B-A3B-GGUF",
+      huggingFaceFile: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+      summary: "Largest curated model. Sparse MoE (~3B active) — snappy, high-quality chat on 48 GB+ Macs.",
+      recommendedSystemMemoryBytes: 48 * 1024 * 1024 * 1024,
+      pieSupportNotes: "Single-file Qwen3.6 MoE GGUF (general.architecture=qwen35moe → PieArch::Qwen3_5; routed + shared experts); manual/local real-engine E2E only.",
+      installIntent: .manualOnly
+    ),
   ]
 }
