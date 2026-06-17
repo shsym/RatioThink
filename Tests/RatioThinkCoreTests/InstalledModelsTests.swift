@@ -270,6 +270,27 @@ final class InstalledModelsTests: XCTestCase {
     }
   }
 
+  // F1: the ticket's literal case — a `…4bit` NAME (non-canonical, ignored by
+  // the Q-token parser) over a Q8_0 file must still raise the warning.
+  func test_scan_flags_noncanonical_bitwidth_name_mismatch() throws {
+    try withTempDir { dir in
+      try writeGGUFFile("Qwen3-0.6B-4bit.gguf", fileType: 7, in: dir)  // header Q8_0
+      let rows = try InstalledModels.scan(dir)
+      XCTAssertEqual(rows[0].fileQuant, "Q8_0")
+      XCTAssertEqual(rows[0].effectiveQuant, "Q8_0", "display shows the real quant")
+      XCTAssertNotNil(rows[0].quantMismatchWarning,
+                      "name '4bit' over a Q8_0 file → warning fires")
+    }
+  }
+
+  func test_scan_noncanonical_bitwidth_name_that_agrees_has_no_warning() throws {
+    try withTempDir { dir in
+      try writeGGUFFile("Qwen3-0.6B-8bit.gguf", fileType: 7, in: dir)  // header Q8_0
+      let rows = try InstalledModels.scan(dir)
+      XCTAssertNil(rows[0].quantMismatchWarning, "name '8bit' matches Q8_0's family → no warning")
+    }
+  }
+
   func test_scan_skips_quant_read_for_partial_download() throws {
     try withTempDir { dir in
       try writeGGUFFile("Model-Q8_0.gguf", fileType: 7, in: dir)

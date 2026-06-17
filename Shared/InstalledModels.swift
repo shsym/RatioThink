@@ -101,14 +101,11 @@ public struct InstalledModel: Equatable, Identifiable, Sendable {
     ModelNameParts.parse(filename).effectiveQuant(fileQuant: fileQuant)
   }
 
-  /// Non-nil when the filename's quant token contradicts the real file quant
+  /// Non-nil when the filename's quant claim contradicts the real file quant
   /// (#667) — a human-readable warning naming both. `nil` when they agree or
   /// either is unknown. The UI surfaces it so a mislabeled model is caught.
   public var quantMismatchWarning: String? {
-    let parts = ModelNameParts.parse(filename)
-    guard let fileQuant, parts.quantMismatch(fileQuant: fileQuant),
-          let nameQuant = parts.quant else { return nil }
-    return ModelNameParts.quantMismatchNote(fileQuant: fileQuant, nameQuant: nameQuant)
+    ModelNameParts.parse(filename).mismatchWarning(fileQuant: fileQuant)
   }
 
   /// Whether this row maps to a curated artifact that RatioThink has

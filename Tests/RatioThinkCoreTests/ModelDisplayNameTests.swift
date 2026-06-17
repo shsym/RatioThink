@@ -175,9 +175,54 @@ final class ModelNamePartsTests: XCTestCase {
     let agree = ModelNameParts.parse("Qwen3-0.6B-Q8_0.gguf")
     XCTAssertFalse(agree.quantMismatch(fileQuant: "q8_0"), "case-insensitive agreement is not a mismatch")
     XCTAssertFalse(agree.quantMismatch(fileQuant: nil), "no header quant → cannot mismatch")
-    let noFilenameQuant = ModelNameParts.parse("Qwen3-0.6B-4bit.gguf")
-    XCTAssertFalse(noFilenameQuant.quantMismatch(fileQuant: "Q8_0"),
-                   "filename carries no recognized quant token → nothing to contradict")
+    let noQuantAtAll = ModelNameParts.parse("Qwen/Qwen3-0.6B")  // safetensors dir-slug
+    XCTAssertFalse(noQuantAtAll.quantMismatch(fileQuant: "Q8_0"),
+                   "name advertises no quant claim → nothing to contradict")
+    let billions = ModelNameParts.parse("Llama-3.2-1B.gguf")  // `1B` is params, not a quant
+    XCTAssertFalse(billions.quantMismatch(fileQuant: "Q8_0"),
+                   "a parameter-count segment is not a quant claim")
+  }
+
+  // F1: the ticket's own observed case — a non-canonical bit-width name token
+  // (4bit/8bit/int4/fp16) the loose Q-parser ignores — must still be compared
+  // against the header by bit-width FAMILY so the warning actually fires.
+  func test_quantMismatch_noncanonical_bitwidth_token_vs_header() {
+    XCTAssertTrue(ModelNameParts.parse("Qwen3-0.6B-4bit.gguf").quantMismatch(fileQuant: "Q8_0"),
+                  "name '4bit' over a Q8_0 file → mismatch (4 ≠ 8)")
+    XCTAssertTrue(ModelNameParts.parse("Model-int4.gguf").quantMismatch(fileQuant: "Q8_0"),
+                  "name 'int4' over Q8_0 → mismatch")
+    XCTAssertFalse(ModelNameParts.parse("Model-8bit.gguf").quantMismatch(fileQuant: "Q8_0"),
+                   "name '8bit' matches Q8_0's 8-bit family → no mismatch")
+    XCTAssertFalse(ModelNameParts.parse("Model-4bit.gguf").quantMismatch(fileQuant: "Q4_K_M"),
+                   "name '4bit' matches any Q4_* family → no mismatch")
+    XCTAssertFalse(ModelNameParts.parse("Model-4bit.gguf").quantMismatch(fileQuant: "IQ4_XS"),
+                   "name '4bit' matches IQ4_* family → no mismatch")
+    XCTAssertFalse(ModelNameParts.parse("Model-fp16.gguf").quantMismatch(fileQuant: "F16"),
+                   "name 'fp16' matches an F16 header → no mismatch")
+  }
+
+  func test_bitWidthFamily_maps_canonical_and_noncanonical_tokens() {
+    XCTAssertEqual(ModelNameParts.bitWidthFamily("Q8_0"), 8)
+    XCTAssertEqual(ModelNameParts.bitWidthFamily("Q4_K_M"), 4)
+    XCTAssertEqual(ModelNameParts.bitWidthFamily("IQ4_XS"), 4)
+    XCTAssertEqual(ModelNameParts.bitWidthFamily("BF16"), 16)
+    XCTAssertEqual(ModelNameParts.bitWidthFamily("F32"), 32)
+    XCTAssertEqual(ModelNameParts.bitWidthFamily("4bit"), 4)
+    XCTAssertEqual(ModelNameParts.bitWidthFamily("8bit"), 8)
+    XCTAssertEqual(ModelNameParts.bitWidthFamily("int4"), 4)
+    XCTAssertEqual(ModelNameParts.bitWidthFamily("fp16"), 16)
+    XCTAssertEqual(ModelNameParts.bitWidthFamily("mxfp4"), 4)
+    XCTAssertNil(ModelNameParts.bitWidthFamily("1B"), "param count is not a quant")
+    XCTAssertNil(ModelNameParts.bitWidthFamily("Instruct"))
+  }
+
+  func test_mismatchWarning_single_source_fires_for_noncanonical_name() {
+    let parts = ModelNameParts.parse("Qwen3-0.6B-4bit.gguf")
+    let note = try! XCTUnwrap(parts.mismatchWarning(fileQuant: "Q8_0"))
+    XCTAssertTrue(note.contains("Q8_0"), "names the real file quant")
+    XCTAssertTrue(note.contains("4bit"), "names the filename's bit-width claim")
+    XCTAssertNil(ModelNameParts.parse("Qwen3-0.6B-Q8_0.gguf").mismatchWarning(fileQuant: "Q8_0"),
+                 "agreement → no warning")
   }
 
   func test_quantMismatchNote_names_both_quants() {

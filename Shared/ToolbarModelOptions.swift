@@ -42,12 +42,10 @@ public enum ToolbarModelOptions {
     /// else the filename-parsed token. `nil` for a safetensors/dir row.
     public var effectiveQuant: String? { parts.effectiveQuant(fileQuant: fileQuant) }
 
-    /// Non-nil when the filename's quant token contradicts the real file
+    /// Non-nil when the filename's quant claim contradicts the real file
     /// quant (#667) — a warning naming both, surfaced on the row.
     public var quantMismatchWarning: String? {
-      guard let fileQuant, parts.quantMismatch(fileQuant: fileQuant),
-            let nameQuant = parts.quant else { return nil }
-      return ModelNameParts.quantMismatchNote(fileQuant: fileQuant, nameQuant: nameQuant)
+      parts.mismatchWarning(fileQuant: fileQuant)
     }
     /// Disambiguating source suffix for the row text. After the full-slug
     /// dedup (review v2 F2) a family can list an app-managed copy AND an
