@@ -540,30 +540,82 @@ public final class ProfileStore: ObservableObject {
   /// Effective profile set = base UNION valid-user-by-id, user wins on id
   /// collision (#702). A VALID user entry whose id equals a base id REPLACES
   /// that base entry in place; the base entry remains otherwise. Every
-  /// remaining user entry — non-base valid ids AND parse-failed entries (no
-  /// id) — is appended so the toolbar / Settings can surface broken user
-  /// files as additive noise without ever shadowing or removing a base.
-  /// Sorted by filename for deterministic ordering.
+  /// remaining user entry — non-base valid ids, parse-failed entries (no id),
+  /// AND losing duplicate-base-id files — is appended so the toolbar /
+  /// Settings can surface broken or duplicated user files as additive noise
+  /// without ever shadowing or removing a base. Sorted by filename for
+  /// deterministic ordering.
   static func mergeEffective(base: [ProfileLoadResult],
                              user: [ProfileLoadResult]) -> [ProfileLoadResult] {
-    // First valid user override per base id (user is filename-sorted, so the
-    // earliest filename wins a duplicate-id collision).
-    var overrides: [String: ProfileLoadResult] = [:]
-    for u in user {
+    // First valid user file per base id wins the override (user is
+    // filename-sorted, so the earliest filename wins a duplicate-id
+    // collision). Track the WINNING index so the losing duplicate-base-id
+    // files are surfaced as noise rather than silently dropped (#706 F2).
+    var overrideIndexByID: [String: Int] = [:]
+    for (i, u) in user.enumerated() {
       guard let id = u.profile?.id, baseBuiltinIDs.contains(id) else { continue }
-      if overrides[id] == nil { overrides[id] = u }
+      if overrideIndexByID[id] == nil { overrideIndexByID[id] = i }
     }
-    var merged: [ProfileLoadResult] = base.map { b in
-      if let id = b.profile?.id, let ovr = overrides[id] { return ovr }
-      return b
+    let winning = Set(overrideIndexByID.values)
+
+    // Filenames occupied by real user files on disk. A base built-in cannot
+    // safely claim any of these as its synthetic write-path unless it IS that
+    // file's override. Seed `taken` with every base canonical filename too so
+    // a relocation never lands on another built-in's slot.
+    let userFilenames = Set(user.map { $0.url.lastPathComponent })
+    var taken = userFilenames.union(base.map { $0.url.lastPathComponent })
+
+    var merged: [ProfileLoadResult] = []
+    for b in base {
+      if let id = b.profile?.id, let idx = overrideIndexByID[id] {
+        merged.append(user[idx])                 // a real override file
+      } else if userFilenames.contains(b.url.lastPathComponent) {
+        // #706 F1: an unrelated user file (different id) squats this base
+        // built-in's synthetic filename — a legacy/hand-edited file whose
+        // filename diverges from its id. Leaving the base at that url makes
+        // the two share a url (duplicate SwiftUI ForEach id / selection tag)
+        // and lets a base write (setModel / editor) resolve the shared
+        // lastPathComponent and clobber the user file (silent data loss).
+        // Relocate the base's synthetic write-path to a free filename; the
+        // user file keeps its path.
+        let free = freeBaseFilename(b.url.lastPathComponent, avoiding: taken)
+        taken.insert(free)
+        let relocated = b.url.deletingLastPathComponent()
+          .appendingPathComponent(free, isDirectory: false)
+        merged.append(ProfileLoadResult(url: relocated, profile: b.profile,
+                                        error: b.error, warnings: b.warnings))
+      } else {
+        merged.append(b)
+      }
     }
-    // Append every user entry that did not override a base: non-base valid
-    // ids, plus all parse-failed entries (surfaced as noise).
-    for u in user {
-      if let id = u.profile?.id, baseBuiltinIDs.contains(id) { continue }
-      merged.append(u)
-    }
+    // Append every user entry that did not win an override: non-base valid
+    // ids, parse-failed entries (no id), AND losing duplicate-base-id files
+    // (#706 F2 — a duplicated built-in stays visible, never silently dropped).
+    for (i, u) in user.enumerated() where !winning.contains(i) { merged.append(u) }
+
     return merged.sorted { $0.url.lastPathComponent < $1.url.lastPathComponent }
+  }
+
+  /// A deterministic, collision-free filename for a base built-in whose
+  /// canonical filename is squatted by an unrelated user file (#706 F1).
+  /// Inserts a `.base` marker before the extension (`chat.toml` ->
+  /// `chat.base.toml`), then numeric suffixes (`chat.base-2.toml`, …) until a
+  /// name absent from `taken` is found.
+  private static func freeBaseFilename(_ filename: String,
+                                       avoiding taken: Set<String>) -> String {
+    let url = URL(fileURLWithPath: filename)
+    let ext = url.pathExtension
+    let stem = url.deletingPathExtension().lastPathComponent
+    func make(_ marker: String) -> String {
+      ext.isEmpty ? "\(stem)\(marker)" : "\(stem)\(marker).\(ext)"
+    }
+    var candidate = make(".base")
+    var n = 2
+    while taken.contains(candidate) {
+      candidate = make(".base-\(n)")
+      n += 1
+    }
+    return candidate
   }
 
   /// `scan` + base merge — the single source for the effective profile set.

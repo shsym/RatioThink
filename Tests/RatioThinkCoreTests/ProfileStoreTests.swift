@@ -2467,6 +2467,97 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  /// #706 F1: a legacy/hand-edited user file whose FILENAME equals a base
+  /// built-in's canonical filename but whose ID diverges (`chat.toml` with a
+  /// non-`chat` id) must NOT collide with the base entry: no two entries may
+  /// share a url (duplicate SwiftUI id / selection tag), and a base write
+  /// (`setModel chat`) must NOT clobber the unrelated user file.
+  func test_user_file_squatting_base_filename_with_other_id_does_not_collide_or_clobber() throws {
+    try withTempProfilesDir { dir in
+      // A valid profile living at chat.toml but identified as `other-id` — it
+      // is NOT an override of the Chat built-in (different id).
+      let squatter = """
+      id = "other-id"
+      name = "Unrelated"
+      model = "user-model.gguf"
+      inferlet = "chat-apc"
+      """
+      let squatURL = dir.appendingPathComponent("chat.toml")
+      try squatter.write(to: squatURL, atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      // No duplicate urls in the effective set (would break ForEach(id:\.url)).
+      let urls = store.entries.map { $0.url }
+      XCTAssertEqual(Set(urls).count, urls.count, "no two effective entries may share a url")
+
+      // The base Chat built-in is still present and relocated off chat.toml.
+      let chat = try XCTUnwrap(store.entries.first { $0.profile?.id == "chat" })
+      XCTAssertNotEqual(chat.url.lastPathComponent, "chat.toml",
+                        "the base built-in must relocate off the squatted filename")
+      // The unrelated user profile keeps its own entry at chat.toml.
+      let other = try XCTUnwrap(store.entries.first { $0.profile?.id == "other-id" })
+      XCTAssertEqual(other.url.lastPathComponent, "chat.toml")
+
+      // A base write resolves the relocated path, leaving the user file intact.
+      try store.setModel("base-model.gguf", forProfileID: "chat")
+      XCTAssertEqual(try String(contentsOf: squatURL, encoding: .utf8), squatter,
+                     "setModel on the base must not overwrite the unrelated user file")
+      XCTAssertEqual(store.model(forProfileID: "other-id"), "user-model.gguf",
+                     "the unrelated user profile must survive the base write")
+    }
+  }
+
+  /// #706 F2: two valid user files sharing the same base id — only the
+  /// filename-sorted first overrides the base; the loser must be surfaced as
+  /// an additive noise entry, never silently dropped.
+  func test_duplicate_base_id_loser_is_surfaced_not_dropped() throws {
+    try withTempProfilesDir { dir in
+      let winner = """
+      id = "chat"
+      name = "Winner Chat"
+      model = "winner.gguf"
+      inferlet = "chat-apc"
+      """
+      let loser = """
+      id = "chat"
+      name = "Loser Chat"
+      model = "loser.gguf"
+      inferlet = "chat-apc"
+      """
+      // "a-chat.toml" sorts before "z-chat.toml", so a-chat wins the override.
+      try winner.write(to: dir.appendingPathComponent("a-chat.toml"),
+                       atomically: true, encoding: .utf8)
+      try loser.write(to: dir.appendingPathComponent("z-chat.toml"),
+                      atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      // The override (winner) replaces the base Chat slot.
+      let chatByFile = store.entries.filter { $0.url.lastPathComponent == "a-chat.toml" }
+      XCTAssertEqual(chatByFile.first?.profile?.name, "Winner Chat",
+                     "the filename-sorted first valid file must win the override")
+      // The loser is still present (surfaced as noise), not dropped.
+      let loserEntry = try XCTUnwrap(
+        store.entries.first { $0.url.lastPathComponent == "z-chat.toml" },
+        "the losing duplicate-base-id file must be surfaced, not silently dropped")
+      XCTAssertEqual(loserEntry.profile?.name, "Loser Chat")
+    }
+  }
+
+  /// #706 F3: `BaseBuiltin.name` is hand-carried alongside the TOML so the
+  /// revert notice can label a built-in without re-parsing. Guard the desync:
+  /// a future TOML `name` edit that forgets the struct must fail here.
+  func test_base_builtin_name_matches_parsed_toml_name() throws {
+    for builtin in ProfileStore.baseBuiltins {
+      let parsed = try Profile.parse(toml: builtin.toml)
+      XCTAssertEqual(builtin.name, parsed.name,
+                     "BaseBuiltin.name for \(builtin.id) must match its TOML name key")
+    }
+  }
+
   func test_repeat_boost_seed_does_not_overwrite_existing_edited_copy() throws {
     try withTempProfilesDir { dir in
       let edited = """
