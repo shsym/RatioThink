@@ -713,7 +713,7 @@ fn salvage_no_think_answer(reasoning: &str) -> Option<String> {
 
 /// How [`generate_demuxed`] resolved one assistant-turn generation.
 #[derive(Clone)]
-enum DemuxKind {
+pub(crate) enum DemuxKind {
     /// A non-empty answer was produced (after any reasoning).
     Answered,
     /// Reasoning ran but no usable answer followed — truncated mid-thought
@@ -744,11 +744,15 @@ enum DemuxIncompleteReason {
 }
 
 /// One generation, demuxed into its reasoning trace and its answer.
+///
+/// `reasoning`/`answer`/`kind` are `pub(crate)` so the shared
+/// [`branch`](super::branch) surface lets the Best-of-N module read a
+/// candidate's outcome (#690); the budget bookkeeping stays private.
 #[derive(Clone)]
-struct Demux {
-    reasoning: String,
-    answer: String,
-    kind: DemuxKind,
+pub(crate) struct Demux {
+    pub(crate) reasoning: String,
+    pub(crate) answer: String,
+    pub(crate) kind: DemuxKind,
     incomplete_reason: Option<DemuxIncompleteReason>,
     /// All model-generated decode tokens consumed by this generation,
     /// including reasoning delimiters/hidden thinking and visible answer
@@ -1515,13 +1519,13 @@ async fn resolve_level(
             join_all(
                 ctxs.into_iter()
                     .zip(metas.iter())
-                    .map(|(c, m)| generate_branch(c, model, params, sink, &m.0, &m.1, level, m.2)),
+                    .map(|(c, m)| generate_tot_branch(c, model, params, sink, &m.0, &m.1, level, m.2)),
             )
             .await
         } else {
             let mut out = Vec::with_capacity(ctxs.len());
             for (c, m) in ctxs.into_iter().zip(metas.iter()) {
-                out.push(generate_branch(c, model, params, sink, &m.0, &m.1, level, m.2).await);
+                out.push(generate_tot_branch(c, model, params, sink, &m.0, &m.1, level, m.2).await);
             }
             out
         };
@@ -1596,7 +1600,8 @@ async fn generate_branch_with<C, Driver>(
     params: &TotParams,
     node_id: &str,
     level: usize,
-    branch_index: usize,
+    first_directive: &str,
+    retry_directive: &str,
     driver: &mut Driver,
 ) -> (C, Demux)
 where
@@ -1604,23 +1609,17 @@ where
 {
     let mut branch_base = Some(driver.fork_retry_base(&ctx));
 
-    // Append this branch's per-branch directive (#523), then open the
-    // assistant turn. The forked context shares a fully-flushed, cue-free
-    // prefix; the directive steers this sibling toward a distinct strategy
-    // (its text also makes the first forward pass carry real new tokens
-    // rather than spin).
-    let first_directive = branch_directive(
-        level,
-        params.depth,
-        branch_index,
-        params.breadth,
-        params.thinking,
-    );
-    driver.push_user(&mut ctx, &first_directive);
-    driver.cue(
-        &mut ctx,
-        !branch_uses_thinking(level, params.depth, params.thinking),
-    );
+    // Append this branch's caller-supplied per-branch directive, then open the
+    // assistant turn. This primitive is divergence-AGNOSTIC: the directive
+    // (how this sibling is steered to diverge from the others) is computed by
+    // the caller — tree-of-thought's per-branch diversity set (#523/#555) for a
+    // beam search, Best-of-N's own sibling-stance set (#690) for interactive
+    // candidates — so neither module's divergence strategy is baked into the
+    // shared generation path. The directive text also makes the first forward
+    // pass carry real new tokens rather than spin. Cue's no-think is keyed
+    // directly off `thinking` (the directive carries its own `/no_think`).
+    driver.push_user(&mut ctx, first_directive);
+    driver.cue(&mut ctx, !params.thinking);
     let reasoning_budget =
         branch_reasoning_budget(level, params.depth, params.max_reasoning_tokens);
     let answer_budget = branch_answer_budget(level, params.depth, params.max_tokens_per_node);
@@ -1628,7 +1627,7 @@ where
         .generate(
             &mut ctx,
             BranchGenerateRequest {
-                directive: &first_directive,
+                directive: first_directive,
                 reasoning_budget,
                 answer_budget,
                 sink_node_id: node_id,
@@ -1641,7 +1640,7 @@ where
 
     if let Some(sanitized) = maybe_sanitize_intermediate(
         &mut branch_base,
-        &first_directive,
+        first_directive,
         level,
         params.depth,
         driver,
@@ -1654,15 +1653,13 @@ where
     if should_retry_reasoning_starved(params.thinking, &demux) {
         match retry_base {
             Some(Ok(mut retry_ctx)) => {
-                let retry_directive =
-                    retry_branch_directive(level, params.depth, branch_index, params.breadth);
-                driver.push_user(&mut retry_ctx, &retry_directive);
+                driver.push_user(&mut retry_ctx, retry_directive);
                 driver.cue(&mut retry_ctx, true);
                 let retry = driver
                     .generate(
                         &mut retry_ctx,
                         BranchGenerateRequest {
-                            directive: &retry_directive,
+                            directive: retry_directive,
                             reasoning_budget: NO_THINK_RETRY_REASONING_TOKENS,
                             answer_budget,
                             sink_node_id: node_id,
@@ -1683,8 +1680,20 @@ where
     (ctx, demux)
 }
 
+/// Generate one forked candidate's assistant turn end-to-end: announce its
+/// `node_start`, fork a retry base, append the **caller-supplied** per-branch
+/// directive, cue, run the demuxed reason/answer generation, and apply the
+/// bounded no-think starvation retry. This is the divergence-AGNOSTIC
+/// generation primitive: `first_directive` / `retry_directive` ARE the
+/// per-sibling divergence steering, computed by the caller — tree-of-thought
+/// passes its diversity set via [`generate_tot_branch`]; Best-of-N (#690)
+/// passes its own sibling-stance directives — so no module's divergence
+/// strategy is hardcoded here. The concrete [`BranchDriver`] over the real
+/// engine `Context` is built inline, so this is the single self-contained
+/// entry point both callers use to produce one streamed candidate.
+/// `pub(crate)` for the shared [`branch`](super::branch) surface.
 #[allow(clippy::too_many_arguments)]
-async fn generate_branch(
+pub(crate) async fn generate_branch(
     ctx: Context,
     model: &Model,
     params: &TotParams,
@@ -1693,6 +1702,8 @@ async fn generate_branch(
     parent_id: &str,
     level: usize,
     branch_index: usize,
+    first_directive: &str,
+    retry_directive: &str,
 ) -> (Context, Demux) {
     // #413/#650 token stream: announce this node's tree position before its
     // deltas, so a client creates the provisional node and routes the node's
@@ -1766,7 +1777,53 @@ async fn generate_branch(
         temperature: params.temperature,
         top_p: params.top_p,
     };
-    generate_branch_with(ctx, params, node_id, level, branch_index, &mut driver).await
+    generate_branch_with(
+        ctx,
+        params,
+        node_id,
+        level,
+        first_directive,
+        retry_directive,
+        &mut driver,
+    )
+    .await
+}
+
+/// Tree-of-thought's per-branch generation: compute the ToT per-branch
+/// directive (#523/#555 diversity set + path advancement) and its starvation
+/// retry directive, then run the shared, divergence-agnostic
+/// [`generate_branch`]. This is the ONLY place the ToT diversity directives
+/// enter generation; Best-of-N supplies its own (#690) and calls
+/// [`generate_branch`] directly, so the ToT diversity set never reaches the
+/// Best-of-N path.
+#[allow(clippy::too_many_arguments)]
+async fn generate_tot_branch(
+    ctx: Context,
+    model: &Model,
+    params: &TotParams,
+    sink: Option<BranchSink<'_, '_>>,
+    node_id: &str,
+    parent_id: &str,
+    level: usize,
+    branch_index: usize,
+) -> (Context, Demux) {
+    let first_directive =
+        branch_directive(level, params.depth, branch_index, params.breadth, params.thinking);
+    let retry_directive =
+        retry_branch_directive(level, params.depth, branch_index, params.breadth);
+    generate_branch(
+        ctx,
+        model,
+        params,
+        sink,
+        node_id,
+        parent_id,
+        level,
+        branch_index,
+        &first_directive,
+        &retry_directive,
+    )
+    .await
 }
 
 /// Turn a branch's [`Demux`] (+ its scorer outcome, when it answered) into a
@@ -1851,7 +1908,8 @@ async fn expand(
     branch_index: usize,
 ) -> (Context, NodeOutcome) {
     let (ctx, demux) =
-        generate_branch(ctx, model, params, sink, node_id, parent_id, level, branch_index).await;
+        generate_tot_branch(ctx, model, params, sink, node_id, parent_id, level, branch_index)
+            .await;
     let score = if matches!(demux.kind, DemuxKind::Answered) {
         Some(
             score_answered(
@@ -3205,7 +3263,8 @@ mod tests {
             &params,
             "tot-n1",
             1,
-            2,
+            &branch_directive(1, params.depth, 2, params.breadth, params.thinking),
+            &retry_branch_directive(1, params.depth, 2, params.breadth),
             &mut driver,
         ));
 
@@ -3267,7 +3326,8 @@ mod tests {
             &params,
             "tot-n2",
             1,
-            0,
+            &branch_directive(1, params.depth, 0, params.breadth, params.thinking),
+            &retry_branch_directive(1, params.depth, 0, params.breadth),
             &mut driver,
         ));
 
@@ -3307,7 +3367,8 @@ mod tests {
             &params,
             "tot-n3",
             1,
-            1,
+            &branch_directive(1, params.depth, 1, params.breadth, params.thinking),
+            &retry_branch_directive(1, params.depth, 1, params.breadth),
             &mut driver,
         ));
 

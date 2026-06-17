@@ -343,6 +343,37 @@ public final class ProfileStore: ObservableObject {
 
   """
 
+  /// Canonical on-disk filename for the `best-of-n` example built-in (#690).
+  public static let bestOfNFilename = "best-of-n.toml"
+
+  /// Profile id encoded in `bestOfNTOML`. An example built-in (#702 base
+  /// layer), gated alongside `tree-of-thought` by `seedsExampleProfiles`.
+  public static let bestOfNProfileID = "best-of-n"
+
+  /// Example Best-of-N interactive profile (#690): generates N candidates the
+  /// user picks among (think-more vs stop). Non-default — an example built-in
+  /// like tree-of-thought, never auto-selected. `thinking` is omitted (the
+  /// server defaults it off, #679).
+  public static let bestOfNTOML: String = """
+  id = "best-of-n"
+  name = "Best of N"
+  icon = "square.grid.2x2"
+  model = "\(defaultChatModelID)"
+  inferlet = "chat-apc"
+  system_prompt = "You are a helpful assistant."
+
+  [sampling]
+  temperature = 0.7
+  top_p = 0.9
+  max_tokens = 2048
+
+  [inferlet_args]
+  mode = "best-of-n"
+  n = 5
+  max_tokens_per_candidate = 256
+
+  """
+
   /// Profile id encoded in `defaultChatTOML`. Also the value written
   /// to the `activeProfileURL` marker on first launch:
   /// without seeding the marker the menu-bar Resume click is a silent
@@ -441,16 +472,22 @@ public final class ProfileStore: ObservableObject {
     public let toml: String
   }
 
-  /// The four built-ins, in display order. `tree-of-thought` is the example
-  /// profile gated by `seedsExampleProfiles` (so hermetic tests can exclude
-  /// it via `baseEntries(directory:includeExample:)`); the other three are
-  /// always part of the base set.
+  /// The built-ins, in display order. `tree-of-thought` (#413) and
+  /// `best-of-n` (#690) are EXAMPLE profiles gated by `seedsExampleProfiles`
+  /// (so hermetic tests can exclude them via
+  /// `baseEntries(directory:includeExample:)`); the other three are always
+  /// part of the base set.
   public static let baseBuiltins: [BaseBuiltin] = [
     BaseBuiltin(id: defaultProfileID,            name: "Chat",            filename: defaultChatFilename,        toml: defaultChatTOML),
     BaseBuiltin(id: defaultRepeatBoostProfileID, name: "Repeat Boost",    filename: defaultRepeatBoostFilename, toml: defaultRepeatBoostTOML),
     BaseBuiltin(id: treeOfThoughtProfileID,      name: "Tree of Thought", filename: treeOfThoughtFilename,      toml: treeOfThoughtTOML),
     BaseBuiltin(id: defaultJSONThinkProfileID,   name: "JSON Think",      filename: defaultJSONThinkFilename,   toml: defaultJSONThinkTOML),
+    BaseBuiltin(id: bestOfNProfileID,            name: "Best of N",       filename: bestOfNFilename,            toml: bestOfNTOML),
   ]
+
+  /// Ids of the EXAMPLE built-ins — excluded from the base set when
+  /// `seedsExampleProfiles` is false (hermetic scan/lifecycle tests).
+  public static let exampleBuiltinIDs: Set<String> = [treeOfThoughtProfileID, bestOfNProfileID]
 
   /// Non-fatal notice (#702): a user's customization of a built-in failed to
   /// parse, so the migration moved the broken file aside (`bakFilename`) and
@@ -483,7 +520,7 @@ public final class ProfileStore: ObservableObject {
   static func baseEntries(directory: URL, includeExample: Bool = true) -> [ProfileLoadResult] {
     let builtins = includeExample
       ? baseBuiltins
-      : baseBuiltins.filter { $0.id != treeOfThoughtProfileID }
+      : baseBuiltins.filter { !exampleBuiltinIDs.contains($0.id) }
     return builtins.map { builtin in
       let url = directory.appendingPathComponent(builtin.filename, isDirectory: false)
       do {
@@ -757,8 +794,10 @@ public final class ProfileStore: ObservableObject {
     queue.sync {
       // #702: built-ins are an immutable in-code BASE layer (loaded by
       // `effectiveScan` during `reloadLocked` below) — nothing is seeded
-      // into the writable dir. Two one-time reconciliations heal installs
-      // that seeded built-in files before #702:
+      // into the writable dir. This subsumes the #413 tree-of-thought and
+      // #690 best-of-n example backfills (both are now base built-ins).
+      // Two one-time reconciliations heal installs that seeded built-in
+      // files before #702:
       //
       //  1. Legacy slug rename `fast-think` -> `repeat-boost` (#628): renames
       //     a user's legacy file + repoints a stale marker. Runs FIRST so the

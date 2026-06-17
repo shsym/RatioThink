@@ -2305,8 +2305,33 @@ final class ProfileStoreTests: XCTestCase {
     let (entries, scanErr) = ProfileStore.effectiveScan(directory: missing)
     XCTAssertNotNil(scanErr, "scanning a missing dir must report a scan error")
     let ids = Set(entries.compactMap { $0.profile?.id })
-    XCTAssertEqual(ids, ["chat", "repeat-boost", "tree-of-thought", "json-think"],
-                   "all four base built-ins must be present even when the scan fails")
+    XCTAssertEqual(ids, ["chat", "repeat-boost", "tree-of-thought", "json-think", "best-of-n"],
+                   "all base built-ins must be present even when the scan fails")
+  }
+
+  /// #690/#702: the Best-of-N example is a base built-in — present in entries
+  /// on a fresh install without a seeded file, gated by seedsExampleProfiles
+  /// alongside tree-of-thought (excluded from hermetic scans).
+  func test_base_best_of_n_example_present_and_gated() throws {
+    try withTempProfilesDir { dir in
+      // Production default (includeExample=true): present, no file on disk.
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("best-of-n.toml").path),
+                     "#702: the Best-of-N built-in is in-code; nothing is seeded to disk")
+      let entry = try XCTUnwrap(store.entries.first { $0.profile?.id == "best-of-n" })
+      XCTAssertEqual(entry.profile?.name, "Best of N")
+      XCTAssertNil(entry.error)
+    }
+    // Hermetic scan (includeExample=false): excluded like tree-of-thought.
+    try withTempProfilesDir { dir in
+      let (entries, _) = ProfileStore.effectiveScan(directory: dir, includeExample: false)
+      let ids = Set(entries.compactMap { $0.profile?.id })
+      XCTAssertFalse(ids.contains("best-of-n"), "examples excluded when includeExample=false")
+      XCTAssertFalse(ids.contains("tree-of-thought"))
+      XCTAssertTrue(ids.isSuperset(of: ["chat", "repeat-boost", "json-think"]))
+    }
   }
 
   /// A valid user file whose id == a base id OVERRIDES the base built-in;
