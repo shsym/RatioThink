@@ -5,19 +5,24 @@ import TOMLKit
 ///
 /// Like `ToTProfileConfig`, the server (`bestofn/schema.rs`) is the single
 /// source of bounds truth — it re-validates and rejects out-of-range values —
-/// so the client passes these through as-is. Defaults mirror the engine's
-/// (`n 5 / max_tokens_per_candidate 256`).
+/// so the client passes these through as-is. The client default `n` is 3
+/// (#708); `max_tokens_per_candidate` defaults to 256 (matching the engine).
 ///
 /// `temperature` / `top_p` are NOT here — the dispatch sources them from the
 /// profile's `sampling` directly (`Profile.bestOfNRequestSampling`), so a
 /// profile's configured temperature drives candidate generation rather than
 /// the unseeded toolbar default. `thinking` is OFF for this profile (the
 /// seed omits it; the server defaults it false, #679).
+///
+/// Default `n` is 3 (#708): three candidates read clearly side-by-side without
+/// crowding the transcript, while the engine still caps N at 5 (`MAX_N`). The
+/// app always sends a resolved `n` on the wire, so the engine's own `DEFAULT_N`
+/// (5) is only a fallback for callers that omit it and is never hit here.
 public struct BestOfNProfileConfig: Equatable, Sendable {
   public var n: Int
   public var maxTokensPerCandidate: Int
 
-  public init(n: Int = 5, maxTokensPerCandidate: Int = 256) {
+  public init(n: Int = 3, maxTokensPerCandidate: Int = 256) {
     self.n = n
     self.maxTokensPerCandidate = maxTokensPerCandidate
   }

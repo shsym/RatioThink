@@ -104,7 +104,7 @@ final class BestOfNTests: XCTestCase {
     mode = "best-of-n"
     """
     let config = try XCTUnwrap(Profile.parse(toml: toml).bestOfN)
-    XCTAssertEqual(config.n, 5)
+    XCTAssertEqual(config.n, 3)  // #708: default N is 3
     XCTAssertEqual(config.maxTokensPerCandidate, 256)
   }
 
@@ -128,6 +128,12 @@ final class BestOfNTests: XCTestCase {
     XCTAssertEqual(decoded.chosen?.snapshotName, "s1")
     // Unpicked = the other two snapshots, dropped next round.
     XCTAssertEqual(decoded.unpickedSnapshotNames(excluding: "n1"), ["s0", "s2"])
+
+    // #708 go-back: clearing the pick returns the round to the choose-one
+    // state — `handleBestOfN(.goBack)` just nils `chosenID`.
+    round.chosenID = nil
+    XCTAssertFalse(round.hasChoice)
+    XCTAssertNil(round.chosen)
   }
 
   // MARK: Lifecycle release request wire (stop/commit + abandon trigger)

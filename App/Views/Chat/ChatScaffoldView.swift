@@ -945,8 +945,9 @@ struct ChatScaffoldView: View {
     return tree.nodes.first { $0.id == nodeID }?.content
   }
 
-  /// Apply a Best-of-N pick / think-more / stop (#690).
+  /// Apply a Best-of-N pick / go-back / think-more / stop (#690, #708).
   ///  - `.pick` records the chosen candidate on the round (collapse + highlight).
+  ///  - `.goBack` clears the pick, re-opening the choose-one state (#708).
   ///  - `.thinkMore` starts the next round expanding from the pick (warm-resume
   ///    from its snapshot, falling back to re-prefill server-side on a miss).
   ///  - `.stop` commits the chosen candidate as the round's final answer.
@@ -958,6 +959,14 @@ struct ChatScaffoldView: View {
     switch action {
     case let .pick(id):
       round.chosenID = id
+      message.bestOfN = try? JSONEncoder().encode(round)
+      try? modelContext.save()
+
+    case .goBack:
+      // #708: clear the pick, returning the round to the choose-one state. The
+      // candidate KV snapshots are untouched (nothing was committed or resumed),
+      // so the user can pick a different option.
+      round.chosenID = nil
       message.bestOfN = try? JSONEncoder().encode(round)
       try? modelContext.save()
 

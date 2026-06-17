@@ -164,6 +164,15 @@ private struct ToTNodeRow: View {
   private var hasChoice: Bool { selection?.hasChoice ?? false }
   /// An unpicked candidate after the user has chosen: collapse + dim it.
   private var isDimmed: Bool { hasChoice && !isChosen }
+  /// True when tapping the row PICKS this candidate (#708 native tap-to-select):
+  /// a pickable Best-of-N option before any choice is made. Otherwise the row
+  /// tap toggles expand/collapse.
+  private var isPickAction: Bool { isPickable && !hasChoice }
+  /// Help text for the row's single tap action — pick vs expand/collapse.
+  private var rowActionHelp: String {
+    if isPickAction { return "Pick this answer" }
+    return isExpanded ? "Collapse this branch" : "Expand this branch"
+  }
   private var children: [ToTTree.Node] { tree.children(of: node.id) }
   private var answer: String {
     node.content.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -186,13 +195,20 @@ private struct ToTNodeRow: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 4) {
       HStack(alignment: .firstTextBaseline, spacing: 6) {
-        // Expand/collapse toggle. Holds only the glyph + headline + chevron —
-        // the Select affordance is a SIBLING (below), never nested inside this
-        // Button: a Button inside a Button both fires the toggle on a Select tap
-        // AND hides Select from the accessibility tree (it gets absorbed into
-        // the outer element), so Select must stand on its own.
+        // The whole row is ONE tappable surface (#708 native tap-to-select):
+        //  · a pickable Best-of-N candidate before a choice → tapping PICKS it
+        //    (the per-option "Select" button is gone — the option itself is the
+        //    control, the way a list selection reads natively).
+        //  · everything else (a chosen/dimmed candidate, or a tree-of-thought
+        //    node) → tapping toggles the branch's expand/collapse.
+        // A single Button means no nested-button accessibility trap, so the
+        // row's own identity is the pick/expand target.
         Button {
-          userExpanded = !isExpanded
+          if isPickAction {
+            selection?.onPick(node.id)
+          } else {
+            userExpanded = !isExpanded
+          }
         } label: {
           HStack(alignment: .firstTextBaseline, spacing: 6) {
             if isBestOfN {
@@ -207,7 +223,10 @@ private struct ToTNodeRow: View {
               .lineLimit(isBestOfN && !isDimmed ? 3 : 1)
               .strikethrough(isPruned, color: .secondary)
               .frame(maxWidth: .infinity, alignment: .leading)
-            if hasDetail {
+            // No expand chevron while the row is a pick target — the candidate
+            // is already shown expanded pre-choice, so the only affordance is
+            // "tap to pick"; the chevron returns once a choice is made (inspect).
+            if hasDetail, !isPickAction {
               Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
@@ -217,18 +236,9 @@ private struct ToTNodeRow: View {
         }
         .buttonStyle(.plain)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .help(isExpanded ? "Collapse this branch" : "Expand this branch")
-
-        // The Select affordance — only before a choice is made, only for a
-        // pickable (engine-saved) candidate. `borderedProminent` paints in the
-        // system accent (adaptive). Sibling of the toggle so it is its own tap
-        // target + its own accessibility element.
-        if let selection, isPickable, !hasChoice {
-          Button("Select") { selection.onPick(node.id) }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-            .accessibilityIdentifier("bestofn.select.\(node.branchIndex ?? 0)")
-        }
+        .help(rowActionHelp)
+        .modifier(OptionalAccessibilityIdentifier(
+          id: isBestOfN ? "bestofn.option.\(node.branchIndex ?? 0)" : nil))
       }
 
       if isExpanded {
@@ -255,7 +265,13 @@ private struct ToTNodeRow: View {
     // Chosen candidate: accent-tinted card + accent border. Unpicked-after-
     // choice: alpha dim. Both use semantic `Color.accentColor` / opacity, which
     // adapt across light + dark — never a hardcoded lightness (#690).
-    .padding(isChosen ? 8 : 0)
+    //
+    // #708 selection-flash fix: every candidate row reserves the SAME 8pt inset
+    // (not `isChosen ? 8 : 0`), so picking only fades the accent card/border in
+    // and dims the others — it never changes a row's geometry. The old
+    // chosen-only padding grew the picked row on selection and shoved its
+    // siblings under the implicit `hasChoice` animation, which read as a flash.
+    .padding(isBestOfN ? 8 : (isChosen ? 8 : 0))
     .background {
       if isChosen {
         RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -285,7 +301,8 @@ private struct ToTNodeRow: View {
     // not a value, because XCUITest reliably matches identifiers but does not
     // surface `accessibilityValue` on a trait-less element. Kept OUT of the
     // row's interactive subtree so it neither combines with nor hides the
-    // Select button (its own sibling element). Only on a candidate row.
+    // tappable option row (`bestofn.option.<i>`, the pick/expand target since
+    // #708 dropped the per-option Select button). Only on a candidate row.
     .overlay(alignment: .topLeading) {
       if isBestOfN {
         Color.clear
@@ -429,6 +446,19 @@ private struct ToTNodeRow: View {
     default:
       if hasAnswer { return answer }
       return node.reasoning.isEmpty ? "…" : "thinking…"
+    }
+  }
+}
+
+/// Applies an `accessibilityIdentifier` only when one is provided, leaving a
+/// tree-of-thought node's row untouched (it carries no Best-of-N identity).
+private struct OptionalAccessibilityIdentifier: ViewModifier {
+  let id: String?
+  func body(content: Content) -> some View {
+    if let id {
+      content.accessibilityIdentifier(id)
+    } else {
+      content
     }
   }
 }

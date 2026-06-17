@@ -82,21 +82,28 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
       XCTAssertTrue(stateMarker(idx, "pickable").waitForExistence(timeout: 15),
                     "[\(appearance)] candidate \(idx) did not render as pickable; app tree: \(app.debugDescription)")
     }
-    // Every candidate offers a Select control before a choice.
-    for idx in 0..<n {
-      let select = app.descendants(matching: .any)
-        .matching(identifier: "bestofn.select.\(idx)").firstMatch
-      XCTAssertTrue(select.waitForExistence(timeout: 5),
-                    "[\(appearance)] candidate \(idx) Select control missing before a choice; app tree: \(app.debugDescription)")
+    // #708 native tap-to-select: each candidate row is itself the pick target
+    // (no per-option "Select" button); the row exposes a `bestofn.option.<i>`
+    // identifier and tapping it picks.
+    func optionRow(_ idx: Int) -> XCUIElement {
+      app.descendants(matching: .any)
+        .matching(identifier: "bestofn.option.\(idx)").firstMatch
     }
+    for idx in 0..<n {
+      XCTAssertTrue(optionRow(idx).waitForExistence(timeout: 5),
+                    "[\(appearance)] candidate \(idx) option row missing before a choice; app tree: \(app.debugDescription)")
+    }
+    // The dropped Select buttons must be gone everywhere.
+    XCTAssertFalse(app.descendants(matching: .any)
+      .matching(identifier: "bestofn.select.0").firstMatch.exists,
+      "[\(appearance)] per-option Select buttons must be dropped (#708)")
     // No commit affordances until a candidate is chosen.
     XCTAssertFalse(app.buttons["bestofn.useThis"].exists,
                    "[\(appearance)] 'Use this' must not appear before a choice")
 
-    // Pick candidate 1.
+    // Pick candidate 1 by tapping its option row.
     let chosenIdx = 1
-    app.descendants(matching: .any)
-      .matching(identifier: "bestofn.select.\(chosenIdx)").firstMatch.click()
+    optionRow(chosenIdx).click()
 
     // The chosen row flips to `chosen` (highlighted); every other row collapses
     // to `unpicked`.
@@ -110,16 +117,25 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
                      "[\(appearance)] unpicked candidate \(idx) must no longer be 'pickable'")
     }
 
-    // The Select controls are gone (no re-pick), and the commit affordances —
-    // Think more / Use this — appear under the chosen candidate.
-    for idx in 0..<n {
-      XCTAssertFalse(app.descendants(matching: .any)
-        .matching(identifier: "bestofn.select.\(idx)").firstMatch.exists,
-        "[\(appearance)] Select control \(idx) must disappear after a choice")
-    }
+    // The commit affordances — Go back / Think more / Use this — appear under
+    // the chosen candidate.
     XCTAssertTrue(app.buttons["bestofn.thinkMore"].waitForExistence(timeout: 5),
                   "[\(appearance)] 'Think more' affordance must appear after a choice")
     XCTAssertTrue(app.buttons["bestofn.useThis"].exists,
                   "[\(appearance)] 'Use this' affordance must appear after a choice")
+    XCTAssertTrue(app.buttons["bestofn.goBack"].exists,
+                  "[\(appearance)] 'Go back' affordance must appear after a choice (#708)")
+
+    // #708 go-back: clicking it clears the pick — every candidate returns to
+    // `pickable` and the commit affordances disappear.
+    app.buttons["bestofn.goBack"].click()
+    for idx in 0..<n {
+      XCTAssertTrue(stateMarker(idx, "pickable").waitForExistence(timeout: 5),
+                    "[\(appearance)] candidate \(idx) must be 'pickable' again after Go back; app tree: \(app.debugDescription)")
+    }
+    XCTAssertFalse(app.buttons["bestofn.useThis"].exists,
+                   "[\(appearance)] 'Use this' must disappear after Go back")
+    XCTAssertFalse(stateMarker(chosenIdx, "chosen").exists,
+                   "[\(appearance)] no row may remain 'chosen' after Go back")
   }
 }

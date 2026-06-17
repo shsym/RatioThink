@@ -25,9 +25,12 @@ import os
 /// network (`NSAttributedString(markdown:)` does not load remote bytes; the
 /// builder renders a text placeholder). Review v1 F3.
 /// A user interaction with a Best-of-N round (#690): pick a candidate, then
-/// either expand from it (think-more) or commit it (stop).
+/// either expand from it (think-more) or commit it (stop). `goBack` (#708)
+/// clears the pick, returning the round to the choose-one state so a different
+/// candidate can be picked.
 enum BestOfNAction: Equatable {
   case pick(String)
+  case goBack
   case thinkMore
   case stop
 }
@@ -184,11 +187,20 @@ struct MessageBubble: View {
     }
   }
 
-  /// Think-more / Use-this controls under a chosen Best-of-N candidate (#690).
-  /// "Think more" starts the next round expanding from the pick; "Use this"
-  /// commits the chosen candidate as the final answer (not editable in v1).
+  /// Go-back / Think-more / Use-this controls under a chosen Best-of-N
+  /// candidate (#690, #708). "Go back" clears the pick so a different candidate
+  /// can be chosen; "Think more" starts the next round expanding from the pick;
+  /// "Use this" commits the chosen candidate as the final answer (not editable
+  /// in v1).
   private var bestOfNControls: some View {
     HStack(spacing: 8) {
+      Button { onBestOfN?(.goBack) } label: {
+        Label("Go back", systemImage: "arrow.uturn.backward")
+      }
+      .buttonStyle(.bordered)
+      .controlSize(.small)
+      .accessibilityIdentifier("bestofn.goBack")
+      .help("Clear this pick and choose a different option")
       Button { onBestOfN?(.thinkMore) } label: {
         Label("Think more", systemImage: "arrow.down.circle")
       }

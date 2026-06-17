@@ -369,7 +369,7 @@ public final class ProfileStore: ObservableObject {
 
   [inferlet_args]
   mode = "best-of-n"
-  n = 5
+  n = 3
   max_tokens_per_candidate = 256
 
   """
