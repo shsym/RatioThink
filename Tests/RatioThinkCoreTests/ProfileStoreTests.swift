@@ -2578,6 +2578,129 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  // MARK: - strict built-in policy: hide retired built-ins (#718)
+
+  /// The headline #718 acceptance, end-to-end: a CUSTOMIZED built-in that a
+  /// newer version RETIRED (its file carries a `builtin-origin` marker whose
+  /// origin is no longer shipped) must vanish from the picker and be preserved
+  /// as `.bak` — while a genuine USER-AUTHORED profile (no marker, non-base
+  /// id) stays visible. Mutation-proof: drop the `mergeEffective` hide and the
+  /// retired built-in re-appears; drop the migration and the file is not
+  /// backed up.
+  func test_strict_policy_hides_retired_builtin_keeps_user_authored() throws {
+    try withTempProfilesDir { dir in
+      // A built-in retired in a newer version: marker names a dead origin, and
+      // the user had customized it (pinned a model).
+      let retired = """
+      \(ProfileStore.builtinOriginKey) = "retired-thinker"
+      id = "retired-thinker"
+      name = "My Retired Thinker"
+      model = "Org/Repo/pinned.gguf"
+      inferlet = "chat-apc"
+      """
+      let retiredURL = dir.appendingPathComponent("retired-thinker.toml")
+      try retired.write(to: retiredURL, atomically: true, encoding: .utf8)
+
+      // A genuine user-authored profile: no marker, non-base id.
+      let mine = """
+      id = "my-own-thing"
+      name = "My Own Thing"
+      model = "Org/Repo/mine.gguf"
+      inferlet = "chat-apc"
+      """
+      try mine.write(to: dir.appendingPathComponent("my-own-thing.toml"),
+                     atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let fm = FileManager.default
+      // Retired built-in: absent from the effective set, file moved aside.
+      XCTAssertNil(store.entries.first { $0.profile?.id == "retired-thinker" },
+                   "a customized RETIRED built-in must not appear in the picker")
+      XCTAssertFalse(fm.fileExists(atPath: retiredURL.path),
+                     "the retired built-in file must be moved aside")
+      XCTAssertTrue(fm.fileExists(atPath: retiredURL.path + ".bak"),
+                    "the retired built-in must be preserved as .bak, not destroyed")
+      // User-authored profile: untouched and still shown.
+      let mineEntry = try XCTUnwrap(
+        store.entries.first { $0.profile?.id == "my-own-thing" },
+        "a user-authored profile (no marker) must stay visible")
+      XCTAssertEqual(mineEntry.profile?.name, "My Own Thing")
+      // Base built-ins intact.
+      XCTAssertNotNil(store.entries.first { $0.profile?.id == "chat" }?.profile,
+                      "the strict policy must not touch base built-ins")
+    }
+  }
+
+  /// The required marked-vs-unmarked distinction, exercised on the pure
+  /// `mergeEffective` discriminator (no disk): a non-winning user entry whose
+  /// `builtin-origin` is no longer shipped is HIDDEN; an unmarked user entry
+  /// with the same non-base id is APPENDED. Mutation-proof: without the
+  /// `builtinOrigin`/`shippedBuiltinIDs` guard both would surface identically.
+  func test_mergeEffective_hides_marked_retired_keeps_unmarked_user() throws {
+    let dir = URL(fileURLWithPath: "/tmp/profiles")
+    let base = ProfileStore.baseEntries(directory: dir)
+
+    func entry(_ filename: String, _ toml: String) throws -> ProfileLoadResult {
+      ProfileLoadResult(url: dir.appendingPathComponent(filename),
+                        profile: try Profile.parse(toml: toml), error: nil, warnings: [])
+    }
+    // Same non-base id "ghost" — the ONLY difference is the marker.
+    let marked = try entry("ghost.toml", """
+      \(ProfileStore.builtinOriginKey) = "ghost"
+      id = "ghost"
+      name = "Marked Ghost"
+      inferlet = "chat-apc"
+      """)
+    let unmarked = try entry("keeper.toml", """
+      id = "keeper"
+      name = "User Keeper"
+      inferlet = "chat-apc"
+      """)
+
+    let merged = ProfileStore.mergeEffective(base: base, user: [marked, unmarked])
+    let ids = Set(merged.compactMap { $0.profile?.id })
+    XCTAssertFalse(ids.contains("ghost"),
+                   "a marked retired built-in (origin not shipped) must be hidden")
+    XCTAssertTrue(ids.contains("keeper"),
+                  "an unmarked user-authored profile must be kept (#709/#706 invariant)")
+  }
+
+  /// A marker whose origin IS still shipped is NOT a retirement — the file
+  /// stays visible. Guards against the hide firing on a live built-in id.
+  func test_mergeEffective_keeps_marked_file_when_origin_still_shipped() throws {
+    let dir = URL(fileURLWithPath: "/tmp/profiles")
+    let base = ProfileStore.baseEntries(directory: dir)
+    // A marked file whose origin is the live `chat` id but a divergent own id
+    // (a hand-edited copy). origin shipped -> must survive as a user entry.
+    let marked = ProfileLoadResult(
+      url: dir.appendingPathComponent("copy-of-chat.toml"),
+      profile: try Profile.parse(toml: """
+      \(ProfileStore.builtinOriginKey) = "chat"
+      id = "copy-of-chat"
+      name = "Copy of Chat"
+      inferlet = "chat-apc"
+      """), error: nil, warnings: [])
+
+    let merged = ProfileStore.mergeEffective(base: base, user: [marked])
+    XCTAssertTrue(merged.contains { $0.profile?.id == "copy-of-chat" },
+                  "a marker pointing at a still-shipped built-in is not a retirement")
+  }
+
+  /// Back-compat recognizer: every CURRENT built-in filename must be in the
+  /// historical map (mapped to its own id) so that when one is later RETIRED
+  /// from `baseBuiltins`, an already-installed (pre-marker) copy is still
+  /// recognized by filename and hidden. Guards against a future built-in being
+  /// added to `baseBuiltins` but forgotten in `historicalBuiltinFilenames`.
+  func test_historical_filenames_cover_every_shipped_builtin() {
+    for builtin in ProfileStore.baseBuiltins {
+      XCTAssertEqual(ProfileStore.historicalBuiltinFilenames[builtin.filename], builtin.id,
+                     "historicalBuiltinFilenames must map \(builtin.filename) -> \(builtin.id)")
+    }
+  }
+
   /// #706 F3: `BaseBuiltin.name` is hand-carried alongside the TOML so the
   /// revert notice can label a built-in without re-parsing. Guard the desync:
   /// a future TOML `name` edit that forgets the struct must fail here.

@@ -251,6 +251,17 @@ public struct Profile {
     return table.convert()
   }
 
+  /// Provenance marker (#718): the base-id of the shipped built-in this file
+  /// descends from, read from the top-level `builtin-origin` TOML key
+  /// (preserved verbatim in `rawTable`, so it round-trips through `dump`).
+  /// `nil` for a user-authored profile that carries no marker. `ProfileStore`
+  /// uses it to tell a CUSTOMIZED-but-RETIRED built-in (origin no longer in
+  /// the shipped set -> hide) apart from a genuine user profile (no marker ->
+  /// always shown), a distinction id alone cannot make.
+  public var builtinOrigin: String? {
+    rawTable["builtin-origin"]?.string
+  }
+
   /// Forward-compat v2 section names. Presence is optional; when
   /// present, ProfileStore surfaces type-shape mismatches as warnings
   /// rather than rejecting the whole profile (per plan §2.4: "loaded

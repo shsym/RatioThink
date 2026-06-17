@@ -489,6 +489,37 @@ public final class ProfileStore: ObservableObject {
   /// `seedsExampleProfiles` is false (hermetic scan/lifecycle tests).
   public static let exampleBuiltinIDs: Set<String> = [treeOfThoughtProfileID, bestOfNProfileID]
 
+  /// Every built-in id the CURRENT version ships, regardless of the
+  /// `seedsExampleProfiles` flag (examples included). This is the "shipped
+  /// base set" of the strict built-in policy (#718): a file carrying a
+  /// `builtin-origin` marker whose origin is absent here is a built-in that a
+  /// newer version RETIRED, and is hidden. Distinct from `mergeEffective`'s
+  /// per-merge `basePresentIDs` (which drops examples when excluded, #709):
+  /// example exclusion is a test-only base trim, NOT a retirement, so it must
+  /// not trigger the hide.
+  public static let shippedBuiltinIDs: Set<String> = Set(baseBuiltins.map { $0.id })
+
+  /// Top-level TOML key stamped onto a built-in's on-disk file to record its
+  /// provenance (`Profile.builtinOrigin`). See #718.
+  public static let builtinOriginKey = "builtin-origin"
+
+  /// Every built-in FILENAME ever shipped, mapped to its provenance id. A
+  /// superset of the current `baseBuiltins` filenames: when a built-in is
+  /// RETIRED from `baseBuiltins`, leave its filename here so an
+  /// already-installed (pre-marker) copy is still recognized as a dead
+  /// built-in — `migrateBuiltinProvenance` recognizes it by filename, stamps
+  /// the marker, and moves it aside (#718). `fast-think.toml` is included for
+  /// the rare case the #628 rename migration could not move it; its origin is
+  /// the live `repeat-boost` id so it is treated as a current built-in.
+  public static let historicalBuiltinFilenames: [String: String] = [
+    defaultChatFilename:        defaultProfileID,
+    defaultRepeatBoostFilename: defaultRepeatBoostProfileID,
+    treeOfThoughtFilename:      treeOfThoughtProfileID,
+    defaultJSONThinkFilename:   defaultJSONThinkProfileID,
+    bestOfNFilename:            bestOfNProfileID,
+    legacyFastThinkFilename:    defaultRepeatBoostProfileID,
+  ]
+
   /// Non-fatal notice (#702): a user's customization of a built-in failed to
   /// parse, so the migration moved the broken file aside (`bakFilename`) and
   /// the in-code app default now applies for `profileID`. Surfaced on the
@@ -597,7 +628,20 @@ public final class ProfileStore: ObservableObject {
     // Append every user entry that did not win an override: non-base valid
     // ids, parse-failed entries (no id), AND losing duplicate-base-id files
     // (#706 F2 — a duplicated built-in stays visible, never silently dropped).
-    for (i, u) in user.enumerated() where !winning.contains(i) { merged.append(u) }
+    //
+    // EXCEPT a stale RETIRED built-in (#718): a file carrying a
+    // `builtin-origin` marker whose origin is no longer in the shipped set is
+    // a built-in a newer version dropped. Hide it — do NOT surface it as a
+    // user profile (its on-disk copy is moved aside by
+    // `migrateBuiltinProvenance`). An UNMARKED file (no `builtin-origin`) is
+    // user-authored and always appended, preserving the #709/#706 invariant
+    // that genuine user profiles with non-base ids are never dropped.
+    for (i, u) in user.enumerated() where !winning.contains(i) {
+      if let origin = u.profile?.builtinOrigin, !shippedBuiltinIDs.contains(origin) {
+        continue
+      }
+      merged.append(u)
+    }
 
     return merged.sorted { $0.url.lastPathComponent < $1.url.lastPathComponent }
   }
@@ -868,7 +912,13 @@ public final class ProfileStore: ObservableObject {
       //     file stops shadowing the base. A move failure rides the shared
       //     `_builtinSeedError` channel.
       let (builtinBackupError, revertNotices) = self.migrateSeededBuiltins()
-      let builtinSeedError = migrationError ?? builtinBackupError
+      //  3. Strict built-in provenance (#718): back-stamp a `builtin-origin`
+      //     marker onto recognized built-in overrides and move aside any
+      //     built-in a newer version RETIRED (origin no longer shipped) so a
+      //     customized dead built-in stops appearing in the picker. Runs after
+      //     the dedup pass so it only stamps real overrides.
+      let provenanceError = self.migrateBuiltinProvenance()
+      let builtinSeedError = migrationError ?? builtinBackupError ?? provenanceError
       // Seed the active-profile marker -> chat on a FRESH install (no user
       // `*.toml` files yet) so the first menu-bar Resume resolves into a real
       // start. Gated on emptiness so a populated install with no marker keeps
@@ -1705,6 +1755,67 @@ public final class ProfileStore: ObservableObject {
       }
     }
     return (firstError, reverts)
+  }
+
+  /// Strict built-in policy reconciliation (#718). Runs at `start()` AFTER
+  /// `migrateSeededBuiltins` (which has already deleted byte-equal stock
+  /// copies of the CURRENT built-ins, so only real overrides and unrecognized
+  /// files remain). For every on-disk `*.toml`, resolve its built-in
+  /// provenance and hide it if the built-in it descends from is RETIRED:
+  ///
+  ///   · Provenance = the `builtin-origin` marker if present, else — for a
+  ///     file at a historical built-in FILENAME — the mapped origin id IFF
+  ///     the file's own id matches that built-in (a genuine pre-marker
+  ///     override, not a #706 filename squatter) or it cannot be parsed (a
+  ///     broken built-in at a known filename). A file with NEITHER a marker
+  ///     nor a recognized built-in filename is USER-AUTHORED and left
+  ///     untouched — the #709/#706 invariant that genuine user profiles are
+  ///     never removed.
+  ///   · provenance id no longer in the SHIPPED set -> a built-in a newer
+  ///     version RETIRED: MOVE to `<name>.toml.bak` so it stops being scanned
+  ///     (and `mergeEffective` hides any marked copy that slips through).
+  ///     Preserved, not destroyed (#718 acceptance).
+  ///
+  /// The historical filename map is what catches an ALREADY-INSTALLED stale
+  /// built-in (no version ships the marker yet); the marker is the
+  /// id-independent discriminator going forward. Idempotent: a shipped or
+  /// user-authored file is left in place. Returns the first move failure
+  /// (rides the shared `_builtinSeedError` channel); a failure on one file
+  /// never blocks the rest.
+  private func migrateBuiltinProvenance() -> ProfileStoreError? {
+    let fm = FileManager.default
+    let urls = ((try? fm.contentsOfDirectory(
+      at: directory, includingPropertiesForKeys: nil,
+      options: [.skipsHiddenFiles])) ?? []).filter(Self.isProfileTOML)
+    var firstError: ProfileStoreError?
+    for url in urls {
+      let filename = url.lastPathComponent
+      guard let body = try? String(contentsOf: url, encoding: .utf8) else { continue }
+      let profile = try? Profile.parse(toml: body)
+
+      let origin: String?
+      if let marker = profile?.builtinOrigin {
+        origin = marker
+      } else if let filenameOrigin = Self.historicalBuiltinFilenames[filename],
+                profile == nil || profile?.id == filenameOrigin {
+        origin = filenameOrigin
+      } else {
+        origin = nil
+      }
+      guard let origin, !Self.shippedBuiltinIDs.contains(origin) else { continue }
+
+      let bak = directory.appendingPathComponent(filename + ".bak", isDirectory: false)
+      do {
+        if fm.fileExists(atPath: bak.path) { try fm.removeItem(at: bak) }
+        try fm.moveItem(at: url, to: bak)
+        Log.store.info("migrateBuiltinProvenance: retired built-in \(filename, privacy: .public) (origin \(origin, privacy: .public) no longer shipped) moved to \(bak.lastPathComponent, privacy: .public)")
+      } catch {
+        let underlying = String(describing: error)
+        Log.store.error("migrateBuiltinProvenance: back up retired \(filename, privacy: .public) failed: \(underlying, privacy: .public)")
+        if firstError == nil { firstError = .seedFailed(path: url.path, underlying: underlying) }
+      }
+    }
+    return firstError
   }
 
   /// True when the writable profiles directory holds no `*.toml` files — a
