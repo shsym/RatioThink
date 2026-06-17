@@ -122,14 +122,28 @@ def _ok_leaves(body: dict) -> list[dict]:
     return [n for n in out if n.get("status") == "ok"]
 
 
-def _fork_failures(body: dict) -> list[str]:
-    """Collect node error strings that indicate KV exhaustion."""
+def _node_failures(body: dict) -> list[str]:
+    """Collect every node that died — structurally, not by message text.
+
+    A KV-eviction / forward-pass starvation under the leak surfaces three
+    ways in the tree (`src/tot/tree.rs`): a node with status=="error" (its
+    generation or pre-gen fork failed), a non-null `error` diagnostic, or a
+    non-null `score_error` (the *value-scoring* fork collapsed while the
+    node itself stayed "ok"). Matching on substrings like "fork failed"
+    missed the decode-failure wording AND the whole scorer-fork half of the
+    surface; flag the structure so wording drift can't false-green it.
+    """
     errs: list[str] = []
 
     def walk(n: dict) -> None:
-        e = n.get("error")
-        if isinstance(e, str) and ("fork failed" in e or "flush failed" in e):
-            errs.append(e)
+        nid = n.get("id")
+        if nid != "root":
+            if n.get("status") == "error":
+                errs.append(f"{nid}: status=error ({n.get('error')!r})")
+            elif isinstance(n.get("error"), str):
+                errs.append(f"{nid}: error={n['error']!r}")
+            if isinstance(n.get("score_error"), str):
+                errs.append(f"{nid}: score_error={n['score_error']!r}")
         for c in n.get("children") or []:
             walk(c)
 
@@ -218,15 +232,24 @@ async def main() -> int:
                             break
                         body = json.loads(r.text)
                         oks = _ok_leaves(body)
-                        ff = _fork_failures(body)
+                        ff = _node_failures(body)
                         sel = body.get("selected_node_id")
-                        print(f"[tot-leak] req {i}/{NUM_REQUESTS}: ok_leaves={len(oks)} "
-                              f"fork_failures={len(ff)} selected={sel!r}")
+                        print(f"[tot-leak] req {i}/{NUM_REQUESTS}: ok_leaves={len(oks)}/{BREADTH} "
+                              f"node_failures={len(ff)} selected={sel!r}")
                         if ff:
-                            failures.append(f"request {i}: {len(ff)} KV-exhaustion node errors: {ff[:2]!r}")
+                            failures.append(f"request {i}: {len(ff)} starved/errored nodes: {ff[:3]!r}")
                             break
-                        if not oks or sel is None:
-                            failures.append(f"request {i}: no ok leaf / no selection (tree starved): {body!r}")
+                        if sel is None:
+                            failures.append(f"request {i}: no selection (tree starved): {body!r}")
+                            break
+                        # Surviving-branch floor: at DEPTH=1 every one of the
+                        # BREADTH children must come back ok. A thinned tree
+                        # (e.g. 1/4 survived under KV pressure) is the
+                        # partial-starvation face of #679 — fail it, don't
+                        # pass on a single lucky leaf.
+                        if DEPTH == 1 and len(oks) != BREADTH:
+                            failures.append(f"request {i}: only {len(oks)}/{BREADTH} branches survived "
+                                            f"(thinned tree — partial starvation): {body!r}")
                             break
                         ok_count += 1
 
@@ -245,6 +268,10 @@ async def main() -> int:
                 drain.cancel()
         finally:
             h._terminate_subprocess(proc, "engine")
+            # SIGKILL / wedge paths (the exact scenario this test provokes)
+            # skip the engine's Drop, leaking the POSIX shm region. Unlink
+            # it to match e2e_test.py's cleanup (engine appends `_g0`).
+            h._shm_unlink_quiet(f"/tot_leak_{os.getpid()}_g0")
 
     if failures:
         print("\n[tot-leak] FAILURES:")
