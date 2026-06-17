@@ -378,6 +378,8 @@ fn merge_no_think_retry(first: Demux, retry: Demux) -> Demux {
         kind: retry.kind,
         incomplete_reason: retry.incomplete_reason,
         generated_tokens,
+        // The merged answer is the retry's, so its emitted answer ids are too.
+        answer_token_ids: retry.answer_token_ids,
     }
 }
 
@@ -409,6 +411,7 @@ fn retry_fork_failed(first: Demux, err: String) -> Demux {
         kind: DemuxKind::Aborted(format!("no-think retry fork failed: {err}")),
         incomplete_reason: None,
         generated_tokens: first.generated_tokens,
+        answer_token_ids: Vec::new(),
     }
 }
 
@@ -855,6 +858,9 @@ struct Demux {
     /// including reasoning delimiters/hidden thinking and visible answer
     /// tokens. Prompt/input tokens are never counted here (#542).
     generated_tokens: usize,
+    /// Raw emitted answer-phase token ids (#693c), for the cross-sibling
+    /// penalty. Empty unless this generation entered the answer phase.
+    answer_token_ids: Vec<u32>,
 }
 
 /// Where [`generate_demuxed`]'s streamed deltas go. `Node` tags a tree
@@ -898,6 +904,12 @@ async fn generate_demuxed(
         .stop(stops);
     // #693c: cross-sibling token penalty — discourage tokens earlier siblings
     // already emitted. Empty (the default) leaves generation unbiased.
+    // LIMITATION: the bias is attached to the single generator that spans both
+    // the reasoning and answer phases (`reasoning_budget + answer_budget`), so
+    // it is also in force during this branch's `<think>` block — the penalty
+    // built from siblings' answer tokens nudges this branch's hidden reasoning
+    // too, not only its answer. Accepted for now; phase-gating the bias to the
+    // answer phase is a deferred follow-up (#693 F3).
     if !logit_bias.is_empty() {
         generator = generator.logit_bias(logit_bias);
     }
@@ -910,6 +922,11 @@ async fn generate_demuxed(
     let mut answer_tokens = 0usize;
     let mut generated_tokens = 0usize;
     let mut incomplete_reason = None;
+    // Raw emitted answer-phase token ids (#693c): the actual ids this branch
+    // produced once reasoning closed. Accumulated for the cross-sibling penalty
+    // so later siblings down-bias exactly what earlier siblings emitted — not a
+    // detokenize→re-encode approximation of the trimmed answer.
+    let mut answer_token_ids: Vec<u32> = Vec::new();
 
     let kind = loop {
         let step = match generator.next() {
@@ -975,6 +992,7 @@ async fn generate_demuxed(
             reasoning_done || (!in_reasoning && !was_in_reasoning && !answer.is_empty());
         if answering {
             answer_tokens += out.tokens.len();
+            answer_token_ids.extend_from_slice(&out.tokens);
             if answer_tokens >= answer_budget {
                 if answer_budget <= 4 {
                     incomplete_reason = Some(DemuxIncompleteReason::AnswerBudgetExhausted);
@@ -1012,6 +1030,7 @@ async fn generate_demuxed(
         kind,
         incomplete_reason,
         generated_tokens,
+        answer_token_ids,
     }
 }
 
@@ -1067,6 +1086,10 @@ struct NodeOutcome {
     /// Total generated tokens spent for this branch: node generation plus
     /// scorer generation when the node answered. Input/prompt tokens excluded.
     generated_tokens: usize,
+    /// Raw emitted answer-phase token ids (#693c), carried from the `Demux`
+    /// for the cross-sibling penalty. Non-empty only for an `Ok` node that
+    /// entered the answer phase. NOT serialized to the wire `Node`.
+    answer_token_ids: Vec<u32>,
 }
 
 /// One forked branch ready to materialize: its caller-assigned id + tree
@@ -1751,25 +1774,21 @@ async fn resolve_level_penalized(
     score_base: Option<&Context>,
     level: usize,
 ) -> Vec<(Context, NodeOutcome)> {
-    // Order the per-parent groups by first appearance, then walk each group's
-    // members in `branch_index` order so the greedy anchor (index 0) runs
-    // first and seeds the penalty for the explorers.
-    let mut group_order: Vec<&str> = Vec::new();
+    // Group branch indices by parent (first-appearance order is preserved by
+    // `groups`), then walk each group's members in `branch_index` order so the
+    // greedy anchor (index 0) runs first and seeds the penalty for the
+    // explorers.
     let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
     for (i, m) in metas.iter().enumerate() {
         let parent = m.1.as_str();
         match groups.iter_mut().find(|(p, _)| *p == parent) {
             Some((_, members)) => members.push(i),
-            None => {
-                group_order.push(parent);
-                groups.push((parent, vec![i]));
-            }
+            None => groups.push((parent, vec![i])),
         }
     }
     for (_, members) in groups.iter_mut() {
         members.sort_by_key(|&i| metas[i].2);
     }
-    let _ = group_order;
 
     // Slot each context by its original index so results return in `metas`
     // order even though generation is grouped.
@@ -1787,12 +1806,13 @@ async fn resolve_level_penalized(
                 ctx, model, params, sink, score_base, path, &m.0, &m.1, level, m.2, &bias,
             )
             .await;
-            // Accumulate this sibling's answer tokens so later siblings in the
-            // group are biased away from them. Re-tokenizing the clean answer
-            // is a faithful proxy for the emitted answer tokens and avoids
-            // threading raw decode ids through the demux.
-            if outcome.status == NodeStatus::Ok && !outcome.content.is_empty() {
-                penalty_tokens.extend(model.tokenizer().encode(&outcome.content));
+            // Accumulate the RAW answer-phase token ids this sibling emitted
+            // (carried out of the demux via `NodeOutcome.answer_token_ids`), so
+            // later siblings in the group are biased away from exactly what was
+            // produced — not a detokenize→re-encode approximation of the
+            // trimmed answer, which BPE boundary/normalization need not recover.
+            if outcome.status == NodeStatus::Ok {
+                penalty_tokens.extend_from_slice(&outcome.answer_token_ids);
             }
             results[i] = Some((ctx, outcome));
         }
@@ -2016,6 +2036,7 @@ fn classify(demux: Demux, score: Option<ScoreResult>) -> NodeOutcome {
                 "no answer: the model echoed the instruction instead of answering".to_string(),
             ),
             generated_tokens: demux.generated_tokens,
+            answer_token_ids: Vec::new(),
         },
         DemuxKind::Answered => {
             // An `Answered` node is always scored (phased: scored in phase 2;
@@ -2037,6 +2058,7 @@ fn classify(demux: Demux, score: Option<ScoreResult>) -> NodeOutcome {
                 score_error,
                 error: None,
                 generated_tokens,
+                answer_token_ids: demux.answer_token_ids,
             }
         }
         DemuxKind::Incomplete => NodeOutcome {
@@ -2047,6 +2069,7 @@ fn classify(demux: Demux, score: Option<ScoreResult>) -> NodeOutcome {
             score_error: None,
             error: Some(incomplete_error_message(demux.incomplete_reason)),
             generated_tokens: demux.generated_tokens,
+            answer_token_ids: Vec::new(),
         },
         DemuxKind::Aborted(e) => NodeOutcome {
             status: NodeStatus::Error,
@@ -2056,6 +2079,7 @@ fn classify(demux: Demux, score: Option<ScoreResult>) -> NodeOutcome {
             score_error: None,
             error: Some(e),
             generated_tokens: demux.generated_tokens,
+            answer_token_ids: Vec::new(),
         },
     }
 }
@@ -2394,6 +2418,7 @@ mod tests {
             score_error: None,
             error: None,
             generated_tokens: 0,
+            answer_token_ids: Vec::new(),
         }
     }
 
@@ -2406,6 +2431,7 @@ mod tests {
             score_error: Some(err.to_string()),
             error: None,
             generated_tokens: 0,
+            answer_token_ids: Vec::new(),
         }
     }
 
@@ -2418,6 +2444,7 @@ mod tests {
             score_error: None,
             error: Some(msg.to_string()),
             generated_tokens: 0,
+            answer_token_ids: Vec::new(),
         }
     }
 
@@ -2430,6 +2457,7 @@ mod tests {
             score_error: None,
             error: Some("no answer".to_string()),
             generated_tokens: 0,
+            answer_token_ids: Vec::new(),
         }
     }
 
@@ -3102,6 +3130,66 @@ mod tests {
         assert!((PROPOSE_TEMP_FLOOR - super::super::schema::DEFAULT_TEMPERATURE).abs() < 1e-6);
     }
 
+    // ── Greedy anchor + explorer temperature ladder (#693b) ──
+
+    /// Extract the temperature of a `TopP` sampler, panicking on any other
+    /// variant (the test asserts the variant separately).
+    fn topp_temp(s: &Sampler) -> f32 {
+        match s {
+            Sampler::TopP { temperature, .. } => *temperature,
+            other => panic!("expected TopP, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branch_sampler_anchors_and_ladders() {
+        use super::super::schema::MAX_BREADTH;
+        let top_p = 0.95;
+        let gen_temp = 0.7; // default; base = floor = 0.7, so lo = 0.9, hi = 1.2.
+
+        // breadth == 1: no room for an anchor, so the sole branch SAMPLES at the
+        // floored base (not greedy) — a one-wide tree still explores.
+        let one = branch_sampler(0, 1, gen_temp, top_p);
+        assert!(!one.is_argmax(), "breadth-1 branch must sample, not anchor");
+        assert!((topp_temp(&one) - PROPOSE_TEMP_FLOOR).abs() < 1e-6);
+
+        // breadth >= 2: branch 0 is always the greedy anchor.
+        for breadth in 2..=MAX_BREADTH {
+            assert!(
+                branch_sampler(0, breadth, gen_temp, top_p).is_argmax(),
+                "branch 0 must be the greedy anchor at breadth {breadth}"
+            );
+        }
+
+        // breadth == 2: the single explorer lands at the band floor `lo`.
+        let lo = PROPOSE_TEMP_FLOOR + PROPOSE_TEMP_STEP;
+        assert!((topp_temp(&branch_sampler(1, 2, gen_temp, top_p)) - lo).abs() < 1e-6);
+
+        // breadth == N: explorers (branch 1..N) sample at strictly ascending
+        // temperatures spanning [lo, hi], with top_p passed through.
+        let hi = (lo + PROPOSE_TEMP_SPAN).min(PROPOSE_TEMP_MAX);
+        let temps: Vec<f32> =
+            (1..5).map(|i| topp_temp(&branch_sampler(i, 5, gen_temp, top_p))).collect();
+        assert!((temps[0] - lo).abs() < 1e-6, "coolest explorer is the band floor");
+        assert!((*temps.last().unwrap() - hi).abs() < 1e-6, "hottest explorer is the band top");
+        for w in temps.windows(2) {
+            assert!(w[1] > w[0], "explorer ladder must strictly ascend, got {temps:?}");
+        }
+        assert!(temps.iter().all(|&t| (lo..=hi).contains(&t)), "ladder stays within [lo, hi]");
+        match branch_sampler(1, 5, gen_temp, top_p) {
+            Sampler::TopP { p, .. } => assert!((p - top_p).abs() < 1e-6, "top_p passed through"),
+            other => panic!("expected TopP, got {other:?}"),
+        }
+
+        // A generation temperature above the cap floors the whole band at the
+        // cap, so no explorer exceeds PROPOSE_TEMP_MAX; branch 0 still anchors.
+        assert!(branch_sampler(0, 5, 1.9, top_p).is_argmax());
+        for i in 1..5 {
+            let t = topp_temp(&branch_sampler(i, 5, 1.9, top_p));
+            assert!(t <= PROPOSE_TEMP_MAX + 1e-6, "explorer {i} exceeds cap: {t}");
+        }
+    }
+
     // ── Cross-sibling penalty (#693c) ──
 
     #[test]
@@ -3159,6 +3247,7 @@ mod tests {
             kind,
             incomplete_reason: None,
             generated_tokens,
+            answer_token_ids: Vec::new(),
         }
     }
 
@@ -3173,6 +3262,7 @@ mod tests {
             kind: DemuxKind::Incomplete,
             incomplete_reason: Some(reason),
             generated_tokens,
+            answer_token_ids: Vec::new(),
         }
     }
 
