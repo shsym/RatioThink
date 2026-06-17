@@ -84,12 +84,16 @@ pub async fn handle(req: Request<IncomingBody>, res: Responder) -> Finished {
         "tree-of-thought" => {
             crate::tot::dispatch(dispatch.input, dispatch.messages, dispatch.stream, res).await
         }
+        "best-of-n" => {
+            crate::bestofn::dispatch(dispatch.input, dispatch.messages, dispatch.stream, res).await
+        }
         other => res
             .respond(sse::json_error(
                 404,
                 "inferlet_not_found",
                 &format!(
-                    "Inferlet '{other}' not available. V1 supports 'chat-apc' and 'tree-of-thought'."
+                    "Inferlet '{other}' not available. V1 supports 'chat-apc', 'tree-of-thought', \
+                     and 'best-of-n'."
                 ),
             ))
             .await,

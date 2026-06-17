@@ -198,6 +198,11 @@ struct RatioThinkApp: App {
     // chat-dropdown unverified-mark guard has a real `.unverified` row to
     // assert (the sandboxed XCUITest runner cannot write the file itself).
     TestModelSeed.seedIfRequested()
+    // #690 DEBUG-only GUI seam: seed one persisted, uncommitted Best-of-N round
+    // when `PIE_TEST_SEED_BESTOFN` is set, so the interactive-selection guard
+    // can drive pick → collapse → highlight without a live engine (a sandboxed
+    // XCUITest cannot spawn pie).
+    BestOfNRoundSeed.seedIfRequested(into: chatContainer.mainContext)
     #endif
 
     // #412: App-side helper-health restart ladder, built + wired to the SAME

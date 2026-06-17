@@ -24,6 +24,11 @@ struct ChatMessageItem: Identifiable, Equatable {
   /// the "Thinking" section. Nil for ordinary chat turns (and when a
   /// persisted snapshot fails to decode, treated as no tree).
   var tot: ToTTree?
+  /// Decoded Best-of-N round selection metadata (#690) when this assistant
+  /// turn is an interactive round — the pickable candidates + the user's
+  /// choice. The candidates render from `tot`; this drives the select / collapse
+  /// / highlight affordance. Nil for ordinary chat and tree-of-thought turns.
+  var bestOfN: BestOfNRound?
   /// Engine `finish_reason` for a completed turn (`"stop"`, `"length"`,
   /// `"cancelled"`, …), or `nil` while the turn is still streaming. Lets
   /// `MessageBubble` surface a truncated-before-answer turn instead of a
@@ -40,6 +45,7 @@ struct ChatMessageItem: Identifiable, Equatable {
     content: String,
     reasoning: String = "",
     tot: ToTTree? = nil,
+    bestOfN: BestOfNRound? = nil,
     finishReason: String? = nil,
     generationPerformance: GenerationMetrics? = nil
   ) {
@@ -48,6 +54,7 @@ struct ChatMessageItem: Identifiable, Equatable {
     self.content = content
     self.reasoning = reasoning
     self.tot = tot
+    self.bestOfN = bestOfN
     self.finishReason = finishReason
     self.generationPerformance = generationPerformance
   }
@@ -96,9 +103,11 @@ extension ChatMessageItem {
     // Tolerant decode: a snapshot written by a newer/older schema that no
     // longer decodes is treated as "no tree" rather than failing the row.
     let tot = message.tot.flatMap { try? JSONDecoder().decode(ToTTree.self, from: $0) }
+    let bestOfN = message.bestOfN.flatMap { try? JSONDecoder().decode(BestOfNRound.self, from: $0) }
     self.init(
       id: message.id, role: role, content: message.content,
-      reasoning: message.reasoning, tot: tot, finishReason: message.finishReason,
+      reasoning: message.reasoning, tot: tot, bestOfN: bestOfN,
+      finishReason: message.finishReason,
       generationPerformance: message.generationPerformance)
   }
 }

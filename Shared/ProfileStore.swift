@@ -336,6 +336,33 @@ public final class ProfileStore: ObservableObject {
 
   """
 
+  /// Filename of the seeded example Best-of-N profile (#690).
+  public static let bestOfNFilename = "best-of-n.toml"
+
+  /// Example Best-of-N interactive profile (#690): generates N candidates the
+  /// user picks among (think-more vs stop). Non-default — seeded as an example
+  /// like tree-of-thought, never auto-selected. `thinking` is omitted (the
+  /// server defaults it off, #679).
+  public static let bestOfNTOML: String = """
+  id = "best-of-n"
+  name = "Best of N"
+  icon = "square.grid.2x2"
+  model = "\(defaultChatModelID)"
+  inferlet = "chat-apc"
+  system_prompt = "You are a helpful assistant."
+
+  [sampling]
+  temperature = 0.7
+  top_p = 0.9
+  max_tokens = 2048
+
+  [inferlet_args]
+  mode = "best-of-n"
+  n = 5
+  max_tokens_per_candidate = 256
+
+  """
+
   /// Profile id encoded in `defaultChatTOML`. Also the value written
   /// to the `activeProfileURL` marker on first launch:
   /// without seeding the marker the menu-bar Resume click is a silent
@@ -624,6 +651,9 @@ public final class ProfileStore: ObservableObject {
       // already lists it. Independent of the dir-empty seed, so existing
       // installs get it too.
       self.backfillTreeOfThoughtProfile()
+      // #690: backfill the example Best-of-N profile the same way (write-if-
+      // absent, gated on `seedsExampleProfiles`, non-default).
+      self.backfillBestOfNProfile()
       // One-time slug rename `fast-think` -> `repeat-boost` (#628). Must run
       // BEFORE the ensure-seed below (else a fresh `repeat-boost.toml` would
       // be seeded beside a user's legacy `fast-think.toml` = duplicate
@@ -1435,6 +1465,23 @@ public final class ProfileStore: ObservableObject {
     } catch {
       Log.store.error(
         "backfill tree-of-thought profile failed (non-fatal): \(String(describing: error), privacy: .public)"
+      )
+    }
+  }
+
+  /// Write-if-absent backfill of the example Best-of-N profile (#690). Mirrors
+  /// `backfillTreeOfThoughtProfile`: gated on `seedsExampleProfiles`, runs on
+  /// existing installs too, non-fatal on failure.
+  private func backfillBestOfNProfile() {
+    guard seedsExampleProfiles else { return }
+    let target = directory.appendingPathComponent(Self.bestOfNFilename)
+    guard !FileManager.default.fileExists(atPath: target.path) else { return }
+    do {
+      try Self.bestOfNTOML.write(to: target, atomically: true, encoding: .utf8)
+      Log.store.info("backfilled best-of-n profile at \(target.path, privacy: .public)")
+    } catch {
+      Log.store.error(
+        "backfill best-of-n profile failed (non-fatal): \(String(describing: error), privacy: .public)"
       )
     }
   }

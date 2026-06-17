@@ -185,6 +185,13 @@ public struct ToTTree: Equatable, Sendable, Codable {
     case .generationMetrics:
       // Metrics live on Message.meta, not inside the persisted tree snapshot.
       break
+
+    case .awaitingSelection:
+      // Best-of-N (#690): the round finished generating; the user now picks.
+      // The pickable set + level live on `Message.bestOfN` (captured by the
+      // send controller), not in this shared tree snapshot — here we only mark
+      // the search done so the streaming UI settles out of `.searching`.
+      self.status = .complete
     }
   }
 

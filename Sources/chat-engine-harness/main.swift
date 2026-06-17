@@ -257,6 +257,10 @@ enum EngineHarness {
       case let .generationMetrics(metrics):
         print(String(format: "  +%6.1fs generation_metrics total_tokens=%d tok_s=%.1f",
                      dt, metrics.outputTokens, metrics.tokensPerSecond))
+      case let .awaitingSelection(level, candidates):
+        // #690 Best-of-N terminal — this harness drives tree-of-thought, which
+        // never emits it; print for completeness if a best-of-n stream is fed.
+        print(String(format: "  +%6.1fs awaiting_selection level=\(level) candidates=\(candidates.count)", dt))
       }
     }
     let total = Date().timeIntervalSince(t0)

@@ -24,6 +24,14 @@ import os
 /// view re-checks at click time. Markdown images never fetch from the
 /// network (`NSAttributedString(markdown:)` does not load remote bytes; the
 /// builder renders a text placeholder). Review v1 F3.
+/// A user interaction with a Best-of-N round (#690): pick a candidate, then
+/// either expand from it (think-more) or commit it (stop).
+enum BestOfNAction: Equatable {
+  case pick(String)
+  case thinkMore
+  case stop
+}
+
 struct MessageBubble: View {
   let message: ChatMessageItem
   /// #513: retry-from-this-turn affordance, assistant rows only. Nil hides
@@ -42,6 +50,12 @@ struct MessageBubble: View {
   /// sensibly. The text surface gets this minus the bubble's horizontal
   /// padding.
   var maxBubbleWidth: CGFloat = 480
+  /// Best-of-N (#690) interaction sink, set only for the latest, not-yet-
+  /// committed interactive round (`TranscriptView` passes nil for ToT/chat
+  /// turns, reloaded history, and superseded rounds — which hides the pick +
+  /// think-more/stop controls there). `.pick` records the choice; `.thinkMore`
+  /// starts the next round; `.stop` commits the chosen candidate.
+  var onBestOfN: ((BestOfNAction) -> Void)? = nil
 
   @State private var isEditing = false
   @State private var editText = ""
@@ -82,9 +96,27 @@ struct MessageBubble: View {
       HStack {
         VStack(alignment: .leading, spacing: 6) {
           // #413: a tree-of-thought turn renders its live search above the
-          // answer, the structured sibling of the reasoning section.
+          // answer, the structured sibling of the reasoning section. #690: a
+          // Best-of-N round reuses the same tree view with the selection
+          // affordance + think-more/stop controls layered on.
           if let tot = message.tot {
-            TreeSearchSection(tree: tot, answerStarted: !message.content.isEmpty)
+            if let round = message.bestOfN {
+              TreeSearchSection(
+                tree: tot,
+                answerStarted: !message.content.isEmpty,
+                selection: BestOfNSelectionContext(
+                  pickableIDs: Set(round.candidates.map(\.id)),
+                  chosenID: round.chosenID,
+                  onPick: { id in onBestOfN?(.pick(id)) }))
+              // Think-more / Stop appear once a candidate is chosen and before
+              // the round commits an answer — and only when this is the live
+              // round (`onBestOfN` non-nil; the transcript hides it otherwise).
+              if round.hasChoice, message.content.isEmpty, onBestOfN != nil {
+                bestOfNControls
+              }
+            } else {
+              TreeSearchSection(tree: tot, answerStarted: !message.content.isEmpty)
+            }
           }
           if !message.reasoning.isEmpty {
             ReasoningDisclosure(
@@ -150,6 +182,27 @@ struct MessageBubble: View {
         Spacer()
       }
     }
+  }
+
+  /// Think-more / Use-this controls under a chosen Best-of-N candidate (#690).
+  /// "Think more" starts the next round expanding from the pick; "Use this"
+  /// commits the chosen candidate as the final answer (not editable in v1).
+  private var bestOfNControls: some View {
+    HStack(spacing: 8) {
+      Button { onBestOfN?(.thinkMore) } label: {
+        Label("Think more", systemImage: "arrow.down.circle")
+      }
+      .buttonStyle(.bordered)
+      .controlSize(.small)
+      .accessibilityIdentifier("bestofn.thinkMore")
+      Button { onBestOfN?(.stop) } label: {
+        Label("Use this", systemImage: "checkmark.circle")
+      }
+      .buttonStyle(.borderedProminent)
+      .controlSize(.small)
+      .accessibilityIdentifier("bestofn.useThis")
+    }
+    .font(.caption)
   }
 
   // MARK: - inline edit (#624)
