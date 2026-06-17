@@ -921,11 +921,13 @@ public final class ProfileStore: ObservableObject {
       //     file stops shadowing the base. A move failure rides the shared
       //     `_builtinSeedError` channel.
       let (builtinBackupError, revertNotices) = self.migrateSeededBuiltins()
-      //  3. Strict built-in provenance (#718): back-stamp a `builtin-origin`
-      //     marker onto recognized built-in overrides and move aside any
-      //     built-in a newer version RETIRED (origin no longer shipped) so a
-      //     customized dead built-in stops appearing in the picker. Runs after
-      //     the dedup pass so it only stamps real overrides.
+      //  3. Strict built-in policy (#718): recognize a built-in a newer
+      //     version RETIRED (by its `builtin-origin` marker or historical
+      //     filename) and move it aside so a customized dead built-in stops
+      //     appearing in the picker. It does NOT write the marker — that is
+      //     seeded via the base TOML constants and rides the override dump.
+      //     Runs after the dedup pass so `migrateSeededBuiltins` has already
+      //     cleared byte-equal current stock copies first.
       let provenanceError = self.migrateBuiltinProvenance()
       let builtinSeedError = migrationError ?? builtinBackupError ?? provenanceError
       // Seed the active-profile marker -> chat on a FRESH install (no user
