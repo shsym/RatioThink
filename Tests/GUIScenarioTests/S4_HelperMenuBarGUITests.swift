@@ -23,8 +23,8 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     // needs no weight and must run on a model-less checkout (gated only by
     // guardSeatedGUI). Helper boot now leaves the engine stopped; explicit
     // Resume/start requests are the paths that move it to `starting…` /
-    // `Pause Engine`. Pre-write a profile so `seedDefaultsIfEmpty` skips (a
-    // .toml already exists) and no `<PIE_HOME>/active-profile` marker is
+    // `Pause Engine`. Pre-write a profile so the fresh-install marker seed
+    // skips (a .toml already exists) and no `<PIE_HOME>/active-profile` marker is
     // written. Only the file's existence matters for this shell test, so it is
     // a minimal placeholder, NOT a copy of the seed format. PIE_HOME lives
     // under the runner-writable NSTemporaryDirectory container (the sandboxed
@@ -93,10 +93,10 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     app.typeKey(.escape, modifierFlags: [])
   }
 
-  ///  end-to-end (enable-only): a fresh `PIE_HOME` triggers
-  /// `ProfileStore.seedDefaultsIfEmpty`, which now also writes the
-  /// active-profile marker. The menu-bar `Resume Engine` item must
-  /// become enabled — proving the seeded marker landed and the
+  ///  end-to-end (enable-only): a fresh `PIE_HOME` seeds the
+  /// active-profile marker -> chat (#702: built-ins are the in-code base
+  /// layer; only the marker is written). The menu-bar `Resume Engine` item
+  /// must become enabled — proving the seeded marker landed and the
   /// resolver / status binding wired through.
   ///
   ///  (landed): `togglePauseResume` now drives
@@ -223,7 +223,7 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     XCTAssertGreaterThan(statusItems.count, 0, "no status items registered")
 
     // 5. Open the menu and wait for "Resume Engine" to become enabled.
-    //    seedDefaultsIfEmpty runs synchronously inside ProfileStore.start(),
+    //    the marker seed runs synchronously inside ProfileStore.start(),
     //    but the `.stopped → enabled` publish hop, resolver wiring,
     //    and HelperStatusItemBinding's main-thread apply all take a
     //    tick to settle. 8s leaves margin.
@@ -241,7 +241,7 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
                                     handler: nil)
     let enabledOutcome = XCTWaiter().wait(for: [enabledExpect], timeout: 8)
     XCTAssertEqual(enabledOutcome, .completed,
-                   "Resume Engine never became enabled — seedDefaultsIfEmpty or LaunchSpecResolver wiring failed (PIE_HOME=\(tempDir.path))")
+                   "Resume Engine never became enabled — marker seed or LaunchSpecResolver wiring failed (PIE_HOME=\(tempDir.path))")
 
     // 6. Dismiss without clicking Resume. The end-to-end click+boot
     //    assertion lives in the sibling test below; this test's
