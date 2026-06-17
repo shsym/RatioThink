@@ -739,11 +739,17 @@ public final class ProfileStore: ObservableObject {
       //     `_builtinSeedError` channel.
       let builtinBackupError = self.migrateSeededBuiltins()
       let builtinSeedError = migrationError ?? builtinBackupError
-      // Seed the active-profile marker -> chat on first run so the menu-bar
-      // Resume resolves into a real start. Idempotent (O_EXCL): an existing
-      // marker is the operator's prior selection and always wins. The base
-      // `chat` profile is always present, so the seeded id can never dangle.
-      let markerError = self.seedActiveProfileMarker()
+      // Seed the active-profile marker -> chat on a FRESH install (no user
+      // `*.toml` files yet) so the first menu-bar Resume resolves into a real
+      // start. Gated on emptiness so a populated install with no marker keeps
+      // its clean "no selection yet" state instead of being force-selected
+      // onto chat. Idempotent (O_EXCL): an existing marker always wins. The
+      // base `chat` profile is always present, so the seeded id can never
+      // dangle, and a dangling marker on a populated install now falls back
+      // to chat at the resolver rather than stranding (#702).
+      let markerError = self.isUserProfilesDirEmpty()
+        ? self.seedActiveProfileMarker()
+        : nil
       let readResult = self.readActiveProfileIDFromDisk()
       self.stateLock.withLock {
         self._lastSeedError = nil
@@ -1508,6 +1514,18 @@ public final class ProfileStore: ObservableObject {
   ///
   /// Idempotent: a second launch finds only overrides (kept) or nothing.
   /// Runs on `queue` (called from `start()` inside `queue.sync`).
+  /// True when the writable profiles directory holds no `*.toml` files — a
+  /// fresh install. Used only to gate the one-time active-profile marker
+  /// seed (#702); the base built-ins are in-code and need no on-disk seed.
+  private func isUserProfilesDirEmpty() -> Bool {
+    let existing = (try? FileManager.default.contentsOfDirectory(
+      at: directory,
+      includingPropertiesForKeys: nil,
+      options: [.skipsHiddenFiles]
+    )) ?? []
+    return existing.filter(Self.isProfileTOML).isEmpty
+  }
+
   private func migrateSeededBuiltins() -> ProfileStoreError? {
     let fm = FileManager.default
     var firstError: ProfileStoreError?

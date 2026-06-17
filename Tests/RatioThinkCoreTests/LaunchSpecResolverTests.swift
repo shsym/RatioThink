@@ -397,6 +397,42 @@ final class LaunchSpecResolverTests: XCTestCase {
                    "pie server config accepts model.hf_repo; production config must not emit stale hf_path")
   }
 
+  /// #702: a dangling active-profile id (marker points at a deleted /
+  /// unparseable profile) must NOT strand engine start. The resolver falls
+  /// back to the always-present `chat` base built-in and boots it, instead of
+  /// hard-rejecting with `.profileMissing`.
+  func test_resolveLauncherSpec_dangling_profile_id_falls_back_to_chat_base() throws {
+    let store = try makeSeededDefaultStore()
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake-ghost", isDirectory: false)
+    try touchExecutable(at: binary)
+    let modelsRoot = tempDir.appendingPathComponent("models-ghost", isDirectory: true)
+    let stagedDefault = URL(fileURLWithPath: LaunchSpecResolver.joinModelPath(
+      modelsRoot: modelsRoot, slug: ProfileStore.defaultChatModelID))
+    try FileManager.default.createDirectory(at: stagedDefault.deletingLastPathComponent(),
+                                            withIntermediateDirectories: true)
+    try Data("gguf".utf8).write(to: stagedDefault)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { self.tempDir.appendingPathComponent("hf-home-ghost", isDirectory: true) }
+    )
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(profileID: "ghost-deleted-profile") else {
+      return XCTFail("#702: a dangling profile id must fall back to the chat base, not hard-reject")
+    }
+    let body = PieControlLauncher.renderConfigBody(modelConfig: spec.modelConfig)
+    XCTAssertTrue(body.contains("hf_repo = \"\(stagedDefault.path)\""),
+                  "fallback must boot the chat base default model; got:\n\(body)")
+  }
+
   func test_resolveLauncherSpec_falls_back_to_hf_cache_for_seeded_default() throws {
     let store = try makeSeededDefaultStore()
     defer { store.stop() }
