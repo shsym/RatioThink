@@ -911,40 +911,18 @@ public final class ChatSendController: ObservableObject {
     else { return }
     Task { @MainActor in
       do {
-        // Accumulate the small JSON ack so the release ACCOUNTING is inspected,
-        // not blindly drained: `dispatch_release` returns a `{requested,
-        // released, absent}` ack on success but an OpenAI-shape error body (NOT
-        // an SSE error frame) when the model fails to resolve — both arrive as
-        // the response body, so a release that freed nothing would otherwise
-        // look identical to a clean one.
-        var body = Data()
-        for try await chunk in engine.dispatchInferlet(request) { body.append(chunk) }
-        Self.logReleaseOutcome(body: body)
+        // Drain the response so the request completes. The server frees the KV
+        // pages on its side; HTTP failures throw here (`assertOK`) and are
+        // logged. Release-ack observability (short-release accounting) is a
+        // deferred follow-up — `dispatch_release` returns an unframed JSON ack
+        // that the SSE frame reader strips, so there is nothing to inspect on
+        // this path today.
+        for try await _ in engine.dispatchInferlet(request) {}
       } catch {
         let detail = (error as? LocalizedError)?.errorDescription ?? "\(error)"
         Log.engine.error(
           "ChatSendController: best-of-n snapshot release failed: \(detail, privacy: .public)")
       }
-    }
-  }
-
-  /// Inspect a release response body: a valid ack that freed fewer than it
-  /// requested is surfaced (informational — a re-release of already-freed names
-  /// is benign), and a body that is NOT an ack (the error envelope returned when
-  /// the model could not be resolved) is logged as a real failure, since no
-  /// pages were freed at all.
-  private static func logReleaseOutcome(body: Data) {
-    if let ack = try? JSONDecoder().decode(BestOfNReleaseAck.self, from: body) {
-      if ack.released < ack.requested {
-        Log.engine.info(
-          "ChatSendController: best-of-n release freed \(ack.released, privacy: .public)/\(ack.requested, privacy: .public) snapshots (absent \(ack.absent, privacy: .public))")
-      }
-      return
-    }
-    let text = String(decoding: body, as: UTF8.self)
-    if !text.isEmpty {
-      Log.engine.error(
-        "ChatSendController: best-of-n release did not ack — no pages freed (model unresolved / engine restarted?): \(text.prefix(200), privacy: .public)")
     }
   }
 
@@ -1152,13 +1130,6 @@ private struct BestOfNReleaseInput: Encodable {
   }
 
   private enum CodingKeys: String, CodingKey { case model, release }
-}
-
-/// The `{requested, released, absent}` accounting `dispatch_release` acks (#690).
-private struct BestOfNReleaseAck: Decodable {
-  let requested: Int
-  let released: Int
-  let absent: Int
 }
 
 /// Failure constructing a tree-of-thought send.
