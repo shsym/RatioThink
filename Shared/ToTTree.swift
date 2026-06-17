@@ -43,6 +43,21 @@ public struct ToTTree: Equatable, Sendable, Codable {
     case failed(String)
   }
 
+  /// Live presentation phase of a node as the stream folds in (#413). Distinct
+  /// from the wire `ToTNodeStatus` (the authoritative ok/error/incomplete on
+  /// `nodeComplete`): this tracks where the node is in the generate → score →
+  /// finalize lifecycle so the row can show "Scoring…" during the value-scorer
+  /// gap. A persisted (finished) tree decodes every node as `.complete`.
+  public enum LivePhase: String, Equatable, Sendable, Codable {
+    /// Streaming its content (after `nodeStart`, during `nodeDelta`).
+    case generating
+    /// Content done; the value scorer is generating (after `nodeScoring`,
+    /// before `nodeComplete`).
+    case scoring
+    /// Reconciled by `nodeComplete` — authoritative score/status landed.
+    case complete
+  }
+
   /// One node in the live tree: the wire node plus its beam state.
   public struct Node: Equatable, Sendable, Identifiable, Codable {
     public let id: String
@@ -59,8 +74,11 @@ public struct ToTTree: Equatable, Sendable, Codable {
     public var error: String?
     public var scoreError: String?
     public var beam: BeamState
+    /// Live generate → score → finalize phase (#413). Not a wire field; set by
+    /// `apply` from the `nodeStart`/`nodeScoring`/`nodeComplete` events.
+    public var livePhase: LivePhase
 
-    init(_ n: ToTNode, beam: BeamState = .pending) {
+    init(_ n: ToTNode, beam: BeamState = .pending, livePhase: LivePhase = .complete) {
       self.id = n.id
       self.parentID = n.parentID
       self.depth = n.depth
@@ -72,11 +90,12 @@ public struct ToTTree: Equatable, Sendable, Codable {
       self.error = n.error
       self.scoreError = n.scoreError
       self.beam = beam
+      self.livePhase = livePhase
     }
 
     enum CodingKeys: String, CodingKey {
       case id, parentID, depth, branchIndex, content, reasoning
-      case score, status, error, scoreError, beam
+      case score, status, error, scoreError, beam, livePhase
     }
 
     // Custom decode so a ToTTree persisted before `reasoning` existed still
@@ -96,6 +115,10 @@ public struct ToTTree: Equatable, Sendable, Codable {
       self.error = try c.decodeIfPresent(String.self, forKey: .error)
       self.scoreError = try c.decodeIfPresent(String.self, forKey: .scoreError)
       self.beam = try c.decode(BeamState.self, forKey: .beam)
+      // A tree persisted before livePhase existed is a FINISHED search, so its
+      // nodes are all `.complete` — default accordingly instead of failing the
+      // whole tree decode (the renderer treats a decode failure as no tree).
+      self.livePhase = try c.decodeIfPresent(LivePhase.self, forKey: .livePhase) ?? .complete
     }
   }
 
@@ -137,7 +160,7 @@ public struct ToTTree: Equatable, Sendable, Codable {
         let provisional = ToTNode(
           id: id, parentID: parentID, depth: depth, branchIndex: branchIndex,
           content: "", reasoning: "", score: nil, status: .ok)
-        nodes.append(Node(provisional))
+        nodes.append(Node(provisional, livePhase: .generating))
       }
 
     case let .nodeDelta(id, channel, text):
@@ -152,6 +175,15 @@ public struct ToTTree: Equatable, Sendable, Codable {
       case .reasoning: nodes[idx].reasoning += text
       case .answer: nodes[idx].content += text
       }
+
+    case let .nodeScoring(id):
+      // Content finished; the value scorer is now generating. Flip the live
+      // node to `.scoring` so the row shows a transient "Scoring…" indicator
+      // until `nodeComplete` reconciles the authoritative score. A scoring
+      // frame for an unknown id (truly malformed) is ignored — nodeComplete
+      // backfills the node regardless.
+      guard let idx = nodes.firstIndex(where: { $0.id == id }) else { return }
+      nodes[idx].livePhase = .scoring
 
     case let .nodeComplete(wire):
       let node = Node(wire)

@@ -382,26 +382,40 @@ private struct ToTNodeRow: View {
     }
   }
 
-  /// Score capsule: the 1–10 value, "err" for a failed node, "…" for an
-  /// incomplete (reasoned-but-unanswered) node, "—" when the scorer returned
-  /// nothing parseable.
+  /// Score capsule: a live "Scoring…" indicator while the value scorer runs
+  /// (content done, score not yet landed — the gap can be several seconds),
+  /// then the 1–10 value, "err" for a failed node, "…" for an incomplete
+  /// (reasoned-but-unanswered) node, "—" when the scorer returned nothing
+  /// parseable.
   @ViewBuilder private var scoreBadge: some View {
-    let (text, tint): (String, Color) = {
-      switch node.status {
-      case .error: return ("err", .red)
-      case .incomplete: return ("…", .orange)
-      default:
-        if let s = node.score { return ("\(s)", .accentColor) }
-        return ("—", .secondary)
+    if node.livePhase == .scoring {
+      HStack(spacing: 3) {
+        ProgressView().controlSize(.mini)
+        Text("Scoring…").font(.caption2)
       }
-    }()
-    Text(text)
-      .font(.caption2.monospacedDigit())
-      .foregroundStyle(tint)
-      .frame(minWidth: 20)
+      .foregroundStyle(.secondary)
       .padding(.horizontal, 4)
       .padding(.vertical, 1)
-      .background(tint.opacity(0.12), in: Capsule())
+      .background(Color.secondary.opacity(0.12), in: Capsule())
+      .help("Generating this node's value score")
+    } else {
+      let (text, tint): (String, Color) = {
+        switch node.status {
+        case .error: return ("err", .red)
+        case .incomplete: return ("…", .orange)
+        default:
+          if let s = node.score { return ("\(s)", .accentColor) }
+          return ("—", .secondary)
+        }
+      }()
+      Text(text)
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(tint)
+        .frame(minWidth: 20)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 1)
+        .background(tint.opacity(0.12), in: Capsule())
+    }
   }
 
   /// One-line header preview: the answer's first line, a status word for an

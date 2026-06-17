@@ -145,6 +145,13 @@ impl<'a, 'e> BranchSink<'a, 'e> {
         emit_node_delta(&mut **em, id, kind, text).await
     }
 
+    /// Emit this branch's `node_scoring` marker (content done, scoring now).
+    /// Acquires the lock only for the write, like the other branch frames.
+    pub async fn node_scoring(&self, id: &str) -> Result<(), EmitError> {
+        let mut em = self.emitter.lock().await;
+        emit_node_scoring(&mut **em, id).await
+    }
+
     /// Emit one streamed `final_delta` chunk of the synthesized answer.
     pub async fn final_delta(&self, text: &str) -> Result<(), EmitError> {
         let mut em = self.emitter.lock().await;
@@ -239,6 +246,18 @@ struct NodeDeltaFrame<'a> {
     text: &'a str,
 }
 
+/// `node_scoring` — announces that a node finished generating its content and
+/// is now being value-scored, BEFORE the (sometimes multi-second) scorer
+/// generation that precedes its terminal `node_complete`. Lets a client show a
+/// transient "Scoring…" indicator on the node row instead of a content-done node
+/// that silently sits unscored. Additive: a client that doesn't know the event
+/// ignores it and still reconciles on `node_complete`.
+#[derive(Serialize)]
+struct NodeScoringFrame<'a> {
+    event: &'static str,
+    id: &'a str,
+}
+
 /// `node_delta` channel tags (#413). The demux routes a chunk to exactly one.
 pub const DELTA_REASONING: &str = "reasoning";
 pub const DELTA_ANSWER: &str = "answer";
@@ -322,6 +341,16 @@ pub async fn emit_node_start(
         parent_id,
         depth,
         branch_index,
+    })
+    .await
+}
+
+/// Emit `node_scoring` for a node whose content is done and whose value score
+/// is now being generated (between its last `node_delta` and `node_complete`).
+pub async fn emit_node_scoring(em: &mut Emitter, id: &str) -> Result<(), EmitError> {
+    em.emit_json(&NodeScoringFrame {
+        event: "node_scoring",
+        id,
     })
     .await
 }

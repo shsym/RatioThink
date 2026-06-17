@@ -256,4 +256,34 @@ final class ToTTreeTests: XCTestCase {
     // Display order stays (branchIndex, id) regardless of frame arrival order.
     XCTAssertEqual(t.rootChildren.map(\.id), ["tot-n1", "tot-n2"])
   }
+
+  // MARK: - live phase (#413 scoring indicator)
+
+  func test_live_phase_generating_then_scoring_then_complete() {
+    var t = ToTTree()
+    t.apply(.nodeStart(id: "tot-n1", parentID: "root", depth: 1, branchIndex: 0))
+    XCTAssertEqual(t.nodes.first?.livePhase, .generating, "provisional node is generating")
+    t.apply(.nodeDelta(id: "tot-n1", channel: .answer, text: "4"))
+    XCTAssertEqual(t.nodes.first?.livePhase, .generating, "still generating while content streams")
+    t.apply(.nodeScoring(id: "tot-n1"))
+    XCTAssertEqual(t.nodes.first?.livePhase, .scoring, "node_scoring flips to scoring")
+    XCTAssertEqual(t.nodes.first?.content, "4", "scoring does not disturb the streamed content")
+    t.apply(.nodeComplete(node("tot-n1", parent: "root", depth: 1, branch: 0, content: "4", score: 8)))
+    XCTAssertEqual(t.nodes.first?.livePhase, .complete, "node_complete reconciles to complete")
+    XCTAssertEqual(t.nodes.first?.score, 8)
+  }
+
+  func test_node_scoring_for_unknown_id_is_ignored() {
+    var t = ToTTree()
+    t.apply(.nodeScoring(id: "ghost"))
+    XCTAssertTrue(t.nodes.isEmpty, "a scoring frame for an unknown node is a no-op")
+  }
+
+  func test_node_complete_only_path_defaults_live_phase_complete() {
+    // The non-stream path emits only node_complete (no node_start/node_scoring);
+    // such a node is authoritative and renders as complete, not generating.
+    var t = ToTTree()
+    t.apply(.nodeComplete(node("tot-n1", parent: "root", depth: 1, branch: 0, score: 7)))
+    XCTAssertEqual(t.nodes.first?.livePhase, .complete)
+  }
 }
