@@ -2405,6 +2405,43 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  /// #702: a broken customization of a built-in (override fails to parse) is
+  /// moved to `.bak` and the app default re-applies — and that SUCCESSFUL
+  /// revert must surface a non-fatal notice so the operator is not silently
+  /// reverted. Verify the picker/base default holds after the revert.
+  func test_broken_builtin_override_revert_surfaces_notice_and_applies_base() throws {
+    try withTempProfilesDir { dir in
+      // A user pinned a model onto Repeat Boost, then the file got corrupted
+      // (missing required fields) — unparseable.
+      try "id = \"repeat-boost\"\nname = \"My Repeat\"\n".write(
+        to: dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename),
+        atomically: true, encoding: .utf8)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      // Revert notice surfaced (both the accessor and the snapshot channel).
+      let notices = store.lastBuiltinRevertNotices
+      XCTAssertEqual(notices, store.snapshot.builtinRevertNotices)
+      let notice = try XCTUnwrap(notices.first { $0.profileID == "repeat-boost" })
+      XCTAssertEqual(notice.profileName, "Repeat Boost")
+      XCTAssertEqual(notice.bakFilename, "repeat-boost.toml.bak")
+
+      // The broken file was moved aside; no move FAILURE, so directoryError is
+      // clean (the revert is non-fatal, not a _builtinSeedError).
+      let fm = FileManager.default
+      XCTAssertTrue(fm.fileExists(atPath: dir.appendingPathComponent("repeat-boost.toml.bak").path))
+      XCTAssertNil(store.lastDirectoryError, "a successful revert must not surface as a directory error")
+
+      // The base default applies for the built-in slot (picker shows the app
+      // default, not the broken override).
+      let entry = try XCTUnwrap(store.entries.first { $0.profile?.id == "repeat-boost" })
+      XCTAssertNil(entry.error)
+      XCTAssertEqual(entry.profile?.name, "Repeat Boost",
+                     "after a revert the base default (not the broken override) must apply")
+    }
+  }
+
   func test_repeat_boost_seed_does_not_overwrite_existing_edited_copy() throws {
     try withTempProfilesDir { dir in
       let edited = """
@@ -2465,6 +2502,9 @@ final class ProfileStoreTests: XCTestCase {
       }
       XCTAssertTrue(path.hasSuffix(ProfileStore.defaultRepeatBoostFilename),
                     "directoryError must point at repeat-boost.toml, got \(path)")
+      // A move FAILURE is NOT a successful revert — no revert notice fires.
+      XCTAssertTrue(store.lastBuiltinRevertNotices.isEmpty,
+                    "a failed .bak move must ride _builtinSeedError, not the revert-notice channel")
     }
   }
 

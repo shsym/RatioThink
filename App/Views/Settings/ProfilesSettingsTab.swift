@@ -6,6 +6,7 @@ import AppKit
 /// system prompt, and user-facing sampling defaults without exposing the
 /// empty Advanced/inferlet-args inspection surface.
 struct ProfilesSettingsTab: View {
+  @EnvironmentObject private var profileStore: ProfileStore
   @State private var entries: [ProfileLoadResult] = []
   @State private var directoryError: String?
   @State private var selectionURL: URL?
@@ -42,6 +43,19 @@ struct ProfilesSettingsTab: View {
         Text(directoryError)
           .foregroundStyle(.red)
           .padding(12)
+      }
+
+      // #702: a broken customization of a built-in was reverted to the app
+      // default on launch (the broken file saved as `.bak`). Non-fatal, so it
+      // renders as an informational notice rather than the red error block.
+      ForEach(profileStore.lastBuiltinRevertNotices, id: \.profileID) { notice in
+        Label(
+          "\(notice.profileName) couldn’t be read — reverted to the app default; your file was saved as \(notice.bakFilename).",
+          systemImage: "exclamationmark.triangle"
+        )
+        .foregroundStyle(.orange)
+        .padding(.horizontal, 12)
+        .fixedSize(horizontal: false, vertical: true)
       }
 
       if entries.isEmpty && directoryError == nil {

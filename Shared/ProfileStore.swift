@@ -130,15 +130,21 @@ public struct ProfileStoreSnapshot {
   /// reload races against a concurrent FS event that could mutate
   /// the property between the two observations.
   public let activeProfileID: String?
+  /// Non-fatal #702 notices: built-in overrides that failed to parse and were
+  /// reverted to the app default (broken file saved as `.bak`). Empty in the
+  /// common case. The UI surfaces these so a silent revert is operator-visible.
+  public let builtinRevertNotices: [ProfileStore.BuiltinRevertNotice]
 
   public init(entries: [ProfileLoadResult],
               directoryError: ProfileStoreError?,
               activeProfileError: ProfileStoreError? = nil,
-              activeProfileID: String? = nil) {
-    self.entries            = entries
-    self.directoryError     = directoryError
-    self.activeProfileError = activeProfileError
-    self.activeProfileID    = activeProfileID
+              activeProfileID: String? = nil,
+              builtinRevertNotices: [ProfileStore.BuiltinRevertNotice] = []) {
+    self.entries              = entries
+    self.directoryError       = directoryError
+    self.activeProfileError   = activeProfileError
+    self.activeProfileID      = activeProfileID
+    self.builtinRevertNotices = builtinRevertNotices
   }
 }
 
@@ -427,6 +433,10 @@ public final class ProfileStore: ObservableObject {
   /// always remains available when no valid override exists.
   public struct BaseBuiltin {
     public let id: String
+    /// User-facing display name (the `name` key in `toml`). Carried here so a
+    /// revert notice can say "Repeat Boost couldn't be read…" without
+    /// re-parsing the constant.
+    public let name: String
     public let filename: String
     public let toml: String
   }
@@ -436,11 +446,29 @@ public final class ProfileStore: ObservableObject {
   /// it via `baseEntries(directory:includeExample:)`); the other three are
   /// always part of the base set.
   public static let baseBuiltins: [BaseBuiltin] = [
-    BaseBuiltin(id: defaultProfileID,            filename: defaultChatFilename,        toml: defaultChatTOML),
-    BaseBuiltin(id: defaultRepeatBoostProfileID, filename: defaultRepeatBoostFilename, toml: defaultRepeatBoostTOML),
-    BaseBuiltin(id: treeOfThoughtProfileID,      filename: treeOfThoughtFilename,      toml: treeOfThoughtTOML),
-    BaseBuiltin(id: defaultJSONThinkProfileID,   filename: defaultJSONThinkFilename,   toml: defaultJSONThinkTOML),
+    BaseBuiltin(id: defaultProfileID,            name: "Chat",            filename: defaultChatFilename,        toml: defaultChatTOML),
+    BaseBuiltin(id: defaultRepeatBoostProfileID, name: "Repeat Boost",    filename: defaultRepeatBoostFilename, toml: defaultRepeatBoostTOML),
+    BaseBuiltin(id: treeOfThoughtProfileID,      name: "Tree of Thought", filename: treeOfThoughtFilename,      toml: treeOfThoughtTOML),
+    BaseBuiltin(id: defaultJSONThinkProfileID,   name: "JSON Think",      filename: defaultJSONThinkFilename,   toml: defaultJSONThinkTOML),
   ]
+
+  /// Non-fatal notice (#702): a user's customization of a built-in failed to
+  /// parse, so the migration moved the broken file aside (`bakFilename`) and
+  /// the in-code app default now applies for `profileID`. Surfaced on the
+  /// snapshot so the UI can tell the operator their override reverted —
+  /// otherwise the revert is silent (log-only) and a broken customization
+  /// looks identical to "the default was always like this".
+  public struct BuiltinRevertNotice: Equatable, Sendable {
+    public let profileID: String
+    public let profileName: String
+    public let bakFilename: String
+
+    public init(profileID: String, profileName: String, bakFilename: String) {
+      self.profileID = profileID
+      self.profileName = profileName
+      self.bakFilename = bakFilename
+    }
+  }
 
   /// Set of base ids — the override-collision key for `mergeEffective`.
   public static let baseBuiltinIDs: Set<String> = Set(baseBuiltins.map(\.id))
@@ -540,6 +568,11 @@ public final class ProfileStore: ObservableObject {
   /// the empty-dir seed error is. Self-clears on the next `start()` whose
   /// seed succeeds (set fresh every start), and on `stop()`.
   private var _builtinSeedError: ProfileStoreError?
+  /// Successful built-in reverts (#702): an unparseable override was moved to
+  /// `.bak` and the app default re-applied. Non-fatal — surfaced alongside,
+  /// not via, `_builtinSeedError` (which is a failure channel). Set fresh on
+  /// every `start()`, cleared on `stop()`.
+  private var _builtinRevertNotices: [BuiltinRevertNotice] = []
   private var _activeProfileID: String?
   private var _activeProfileError: ProfileStoreError?
   /// Listener fan-out invariant (review v6 F7).
@@ -737,7 +770,7 @@ public final class ProfileStore: ObservableObject {
       //     override; unparseable -> move to `<name>.toml.bak` so the stale
       //     file stops shadowing the base. A move failure rides the shared
       //     `_builtinSeedError` channel.
-      let builtinBackupError = self.migrateSeededBuiltins()
+      let (builtinBackupError, revertNotices) = self.migrateSeededBuiltins()
       let builtinSeedError = migrationError ?? builtinBackupError
       // Seed the active-profile marker -> chat on a FRESH install (no user
       // `*.toml` files yet) so the first menu-bar Resume resolves into a real
@@ -756,6 +789,8 @@ public final class ProfileStore: ObservableObject {
         // A built-in dedup/backup failure rides its own channel so it
         // surfaces even when `_entries` is non-empty (review v1 F1).
         self._builtinSeedError = builtinSeedError
+        // Non-fatal #702 reverts: successful .bak moves of broken overrides.
+        self._builtinRevertNotices = revertNotices
         self.commitActiveReadResultLocked(readResult, source: .start)
         //  review v1 F2: a marker-seed failure must NOT
         // be silent. The override below fills `_activeProfileError`
@@ -850,6 +885,7 @@ public final class ProfileStore: ObservableObject {
     _lastSeedError = nil
     _lastScanError = nil
     _builtinSeedError = nil
+    _builtinRevertNotices = []
     _activeProfileID = nil
     _activeProfileError = nil
     _pendingPostRecursionFanOut = false
@@ -884,6 +920,14 @@ public final class ProfileStore: ObservableObject {
   /// `clearActiveProfileID` write replaces or removes the file.
   public var lastActiveProfileError: ProfileStoreError? {
     stateLock.withLock { _activeProfileError }
+  }
+
+  /// Non-fatal #702 revert notices captured at the last `start()`: built-in
+  /// overrides that failed to parse and were reverted to the app default.
+  /// Same value as `snapshot.builtinRevertNotices`. The Profiles settings UI
+  /// reads this so a silent revert becomes operator-visible.
+  public var lastBuiltinRevertNotices: [BuiltinRevertNotice] {
+    stateLock.withLock { _builtinRevertNotices }
   }
 
   /// Register a listener fired on every reload (initial scan + each
@@ -1509,26 +1553,18 @@ public final class ProfileStore: ObservableObject {
   ///     e.g. a pinned model). `mergeEffective` overlays it on the base.
   ///   · fails to parse -> MOVE to `<name>.toml.bak` so the stale broken file
   ///     stops being scanned (`.bak` is not `isProfileTOML`) and the base
-  ///     applies. The move is surfaced via log; a move FAILURE rides the
-  ///     shared `_builtinSeedError` channel so it is operator-visible.
+  ///     applies. A SUCCESSFUL move emits a non-fatal `BuiltinRevertNotice`
+  ///     (the operator's override silently reverted to the app default — they
+  ///     need to know); a move FAILURE rides the `_builtinSeedError` channel.
   ///
   /// Idempotent: a second launch finds only overrides (kept) or nothing.
-  /// Runs on `queue` (called from `start()` inside `queue.sync`).
-  /// True when the writable profiles directory holds no `*.toml` files — a
-  /// fresh install. Used only to gate the one-time active-profile marker
-  /// seed (#702); the base built-ins are in-code and need no on-disk seed.
-  private func isUserProfilesDirEmpty() -> Bool {
-    let existing = (try? FileManager.default.contentsOfDirectory(
-      at: directory,
-      includingPropertiesForKeys: nil,
-      options: [.skipsHiddenFiles]
-    )) ?? []
-    return existing.filter(Self.isProfileTOML).isEmpty
-  }
-
-  private func migrateSeededBuiltins() -> ProfileStoreError? {
+  /// Runs on `queue` (called from `start()` inside `queue.sync`). Returns the
+  /// first move/delete error (if any) plus every successful revert notice.
+  private func migrateSeededBuiltins()
+    -> (error: ProfileStoreError?, reverts: [BuiltinRevertNotice]) {
     let fm = FileManager.default
     var firstError: ProfileStoreError?
+    var reverts: [BuiltinRevertNotice] = []
     for builtin in Self.baseBuiltins {
       let url = directory.appendingPathComponent(builtin.filename, isDirectory: false)
       guard fm.fileExists(atPath: url.path) else { continue }
@@ -1562,13 +1598,28 @@ public final class ProfileStore: ObservableObject {
         if fm.fileExists(atPath: bak.path) { try fm.removeItem(at: bak) }
         try fm.moveItem(at: url, to: bak)
         Log.store.error("migrateSeededBuiltins: stale unparseable built-in \(builtin.filename, privacy: .public) moved to \(bak.lastPathComponent, privacy: .public); base layer applies")
+        reverts.append(BuiltinRevertNotice(profileID: builtin.id,
+                                           profileName: builtin.name,
+                                           bakFilename: bak.lastPathComponent))
       } catch {
         let underlying = String(describing: error)
         Log.store.error("migrateSeededBuiltins: back up unparseable \(builtin.filename, privacy: .public) failed: \(underlying, privacy: .public)")
         if firstError == nil { firstError = .seedFailed(path: url.path, underlying: underlying) }
       }
     }
-    return firstError
+    return (firstError, reverts)
+  }
+
+  /// True when the writable profiles directory holds no `*.toml` files — a
+  /// fresh install. Used only to gate the one-time active-profile marker
+  /// seed (#702); the base built-ins are in-code and need no on-disk seed.
+  private func isUserProfilesDirEmpty() -> Bool {
+    let existing = (try? FileManager.default.contentsOfDirectory(
+      at: directory,
+      includingPropertiesForKeys: nil,
+      options: [.skipsHiddenFiles]
+    )) ?? []
+    return existing.filter(Self.isProfileTOML).isEmpty
   }
 
   /// One-time on-disk migration for the #628 slug rename
@@ -1976,7 +2027,8 @@ public final class ProfileStore: ObservableObject {
       entries: _entries,
       directoryError: resolvedDirectoryErrorLocked(),
       activeProfileError: _activeProfileError,
-      activeProfileID: visibleID
+      activeProfileID: visibleID,
+      builtinRevertNotices: _builtinRevertNotices
     )
   }
 
