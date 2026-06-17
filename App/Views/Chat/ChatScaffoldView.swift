@@ -16,7 +16,12 @@ struct ChatScaffoldView: View {
   @Query private var chats: [Chat]
   @Environment(\.modelContext) private var modelContext
   @StateObject private var viewModel: ChatTranscriptViewModel
-  @StateObject private var sendController = ChatSendController()
+  /// #507: send pipelines are app-scoped (one controller per chat, owned by
+  /// the coordinator) so an in-flight stream survives this view's teardown
+  /// when the user switches chats. This view only borrows its chat's
+  /// controller; it never cancels on disappear.
+  @EnvironmentObject private var sendCoordinator: ChatSendCoordinator
+  private let chatID: UUID
   let availableProfiles: [String]
   let availableModels: [String]
   @EnvironmentObject private var swapCoordinator: ProfileSwapCoordinator
@@ -27,10 +32,30 @@ struct ChatScaffoldView: View {
   /// #412: background-helper health, forwarded to the toolbar pip's outer ring.
   @EnvironmentObject private var helperHealth: HelperHealthController
   @EnvironmentObject private var profileStore: ProfileStore
+  @EnvironmentObject private var appPreferences: AppPreferences
+  @EnvironmentObject private var downloadController: ModelDownloadController
+  /// The one live source of truth for locally installed/cached models, shared
+  /// with the Models settings table. Drives the toolbar dropdown so a delete
+  /// reflects immediately (no private rescan that a delete never invalidates).
+  @EnvironmentObject private var library: ModelLibraryStore
   /// The reconciled engine-lifecycle fold, forwarded to the toolbar pip +
   /// popover so they derive the resident/offline distinction from the single
   /// published `indicator`.
   @EnvironmentObject private var engineLifecycle: EngineLifecycle
+  /// #621: per-profile speculation telemetry sink. Each "Repeat Boost" turn's
+  /// terminal `spec_metrics` is recorded here for the ProfileEditor badge.
+  @EnvironmentObject private var specMetricsStore: SpecMetricsStore
+  /// #616: the app-scoped engine coordinator — owns the engine-action
+  /// primitives (start/unload/refresh), the `/v1/models` residency reconcile
+  /// (returning the result this view applies its per-chat consequences from),
+  /// the served-model list, and the once-per-launch start latch (which thus
+  /// survives this view's per-chat `.id(id)` remount). The fault-presentation
+  /// state (`engineActionError` / `helperBlock`) stays here; the coordinator
+  /// performs the engine call and re-throws.
+  @EnvironmentObject private var engineCoordinator: ChatEngineCoordinator
+  /// App-scoped navigation state — set on an edit→fork (#624) to route the
+  /// shell to the new chat and hand it the one-shot resend signal.
+  @EnvironmentObject private var windowState: WindowState
   /// Shown when a send is blocked because no model resolves yet. #326
   /// decides the model-availability action (Load / Download / unavailable
   /// via the live `noModelAction`); #397 layers the engine/model lifecycle
@@ -41,18 +66,93 @@ struct ChatScaffoldView: View {
   /// freezes a value the other has moved past (#400 intra-render parity;
   /// this is not filesystem-freshness — see `noModelAction`).
   @State private var showNoModelPrompt = false
-  /// What the toolbar model menu should offer. `.unknown` (→ injected
-  /// `availableModels`) only until the first reconcile; afterwards it is
-  /// the engine's real served list (`.known`, possibly empty), so a
-  /// verified empty/not-running/unreachable engine never re-surfaces
-  /// placeholder models the engine would reject ( F2).
-  @State private var engineModels: ToolbarModelList = .unknown
+  // #616: the engine's served-model list (`engineModels`) is folded by the
+  // `/v1/models` reconcile and now lives on `engineCoordinator` — an engine
+  // fact shared app-wide, not per-chat-view state.
+  // The toolbar model menu reads its installed/cached files from the shared
+  // `ModelLibraryStore` (the ONE source of truth the Models settings table and
+  // duplicate guard also use), NOT a private rescan. A delete in Settings
+  // republishes `library.installed`, so the dropdown drops the removed model
+  // live — fixing the stale-after-delete bug a download-completion-only rescan
+  // caused. #580 #5's unverified shield rides each `InstalledModel.isUnverified`
+  // through `ToolbarModelOptions.build`, so no separate plumbing is needed.
   /// PR#15 F2/F3: a thrown engine start/stop error (transport failure, a
   /// stop that left the engine running) that the status poll won't
   /// reflect. Surfaced via the in-chat engine-failure banner — NOT the
   /// persistence "Couldn't save" banner. Cleared when the engine status
   /// changes to a non-failed state.
   @State private var engineActionError: String?
+  /// #496: an engine action (Load / start / Unload) refused because the
+  /// background Helper isn't healthy. Surfaced as an inline, helper-framed
+  /// `HelperUnavailableNotice` — never the engine-failure banner, which would
+  /// re-attribute a Helper state to the engine.
+  @State private var helperBlock: HelperUnavailable?
+  /// #516: the send the gate is holding plus its fire signal. Armed when a
+  /// send is blocked (with the blocked draft + the gate's load target),
+  /// settled on every model-resolution edge (fired exactly once through the
+  /// composer's normal submit path), and disarmed on cancel, manual send,
+  /// profile switch, navigation away, or a stale resolution. The
+  /// transitions live in `PendingSendState` so they are unit-tested.
+  @State private var pendingSend = PendingSendState()
+  /// A blocked send may need to restart the single engine onto a different
+  /// model, but doing that while another chat is streaming would interrupt
+  /// that stream. Defer the automatic sync until the app-wide stream set is
+  /// idle; explicit user actions (Stop / Load) remain separate choices.
+  @State private var deferredEngineSyncTask: Task<Void, Never>?
+  @State private var deferredEngineMutation: DeferredEngineMutation?
+  @State private var deferredEngineMutationGeneration: Int = 0
+
+  /// #527: when an explicit per-chat model pin differs from the engine's
+  /// known resident model, a send would deterministically fail with
+  /// model_not_found. Block before persisting the user message and ask which
+  /// model identity should win.
+  @State private var pinnedModelMismatch: PinnedModelMismatch?
+
+  struct PinnedModelMismatch: Equatable, Identifiable {
+    let pinnedModelID: String
+    let residentModelID: String
+
+    var id: String { pinnedModelID + "\u{1f}" + residentModelID }
+  }
+
+  enum SendGateDecision: Equatable {
+    case ready(modelID: String)
+    case noResolvableModel
+    case pinnedModelMismatch(pinnedModelID: String, residentModelID: String)
+
+    var allowsSend: Bool {
+      if case .ready = self { return true }
+      return false
+    }
+  }
+  /// #513: the assistant message id awaiting the destructive-retry
+  /// confirmation. Non-nil presents the alert; Cancel clears it without
+  /// touching history.
+  @State private var pendingRetryMessageID: UUID?
+  /// #513 review v2 F1: the stale-retry notice, on its OWN channel — it
+  /// must NOT ride `engineActionError`, whose banner hides action errors
+  /// behind `statusDetail` while the engine is `.failed` and whose value
+  /// is cleared on the next engine-status flip. This is a transcript
+  /// condition; its visibility and lifetime are independent of engine
+  /// state (explicit Dismiss, or the auto-clear on the rendered row).
+  ///
+  /// Identity-bearing (review v3 F1): the message is a single static
+  /// string, so a bare `String?` state makes every re-raise a same-value
+  /// write — `.task(id:)` would never restart and a second stale click
+  /// near the end of the window would get almost no banner time. Each
+  /// raise mints a fresh `id`, so the auto-clear timer restarts per raise
+  /// by construction.
+  struct RetryNoticeState: Equatable {
+    let id: UUID
+    let message: String
+
+    init(message: String) {
+      self.id = UUID()
+      self.message = message
+    }
+  }
+
+  @State private var staleRetryNotice: RetryNoticeState?
 
   init(
     chatID: UUID,
@@ -64,6 +164,7 @@ struct ChatScaffoldView: View {
     let id = chatID
     _chats = Query(filter: #Predicate<Chat> { $0.id == id })
     _viewModel = StateObject(wrappedValue: ChatTranscriptViewModel())
+    self.chatID = id
     self.availableProfiles = availableProfiles
     self.availableModels = availableModels
   }
@@ -97,8 +198,14 @@ struct ChatScaffoldView: View {
     Task { @MainActor in
       do {
         engineActionError = nil
-        try await engineStatusStore.stopEngine()
-        modelLoadCenter.markUnloaded()
+        helperBlock = nil
+        // #616: the stop→markUnloaded sequencing lives in the coordinator; the
+        // fault routing below stays here.
+        try await engineCoordinator.unload()
+      } catch let block as HelperUnavailable {
+        // #496: the Helper transport itself isn't healthy — surface a helper-
+        // framed inline refusal, never the engine-failure banner.
+        helperBlock = block
       } catch {
         // PR#15 F3: an engine STOP failure is an engine fault, not a
         // persistence/durability failure — route it to the engine-failure
@@ -116,51 +223,48 @@ struct ChatScaffoldView: View {
     showNoModelPrompt = true
   }
 
-  /// #4: closes after the engine status FIRST settles this launch, so the
-  /// launch prompt is evaluated exactly once and a later mid-session stop
-  /// never re-pops it. Process-scoped (static) — resets every launch, so
-  /// the app ALWAYS asks once per launch.
-  @MainActor private static var didEvaluateLaunchStartPrompt = false
-
   /// #4: the engine no longer auto-starts on boot (see
   /// `HelperMain.autoResumeEngineOnBoot`). Once the status settles, if the
   /// engine is idle with a default model, proactively raise the existing
   /// no-model prompt — whose Load action starts the engine — so the user
   /// explicitly confirms the start instead of it happening silently. The
-  /// initial `.starting` placeholder is skipped so we evaluate the real
-  /// post-launch state, not the "reachability unknown" default.
+  /// once-per-launch latch now lives on the app-scoped coordinator (#616), so
+  /// it survives this view's per-chat remount. #497: ask about the model the
+  /// Load tap will BOOT (the chat's pin when present), not the bare profile
+  /// default the boot path may ignore — the same target the gate names.
   private func maybePromptEngineStartOnLaunch() {
-    guard !Self.didEvaluateLaunchStartPrompt else { return }
-    if case .starting = engineStatusStore.status { return }
-    Self.didEvaluateLaunchStartPrompt = true
-    if LaunchEngineStartPrompt.shouldAsk(
-        status: engineStatusStore.status,
-        profileDefault: selectedProfileDefault) {
+    if engineCoordinator.shouldPromptEngineStartOnLaunch(
+        autoStartEnabled: appPreferences.localAPIAutoStartEnabled,
+        target: Self.gateTarget(selectedModelID: chats.first?.modelID,
+                                profileDefaultModel: selectedProfileDefault)) {
       showNoModelPrompt = true
     }
   }
 
-  /// True when the slug's app-staged model file exists — the engine's
-  /// primary model source. A miss means the prompt offers Download
-  /// instead of Load.
+  /// True when `slug` resolves to a loadable model — the engine's primary
+  /// app-staged models dir OR, failing that, the HuggingFace cache. A miss
+  /// means the prompt offers Download instead of Load.
   ///
-  /// Intentionally checks ONLY the app-staged path, not the HF cache
-  /// (the resolver's secondary fallback). A model present only in
-  /// `~/.cache/huggingface` is offered a Download here, which simply
-  /// stages a second copy into the app models dir before it resolves —
-  /// benign redundancy, not a wrong result. Mirroring the resolver's
-  /// two-stage check would couple this UI gate to resolver internals.
+  /// Delegates to `LaunchSpecResolver.isModelResolvable`, which mirrors the
+  /// launcher's own two-stage resolution. Checking ONLY the app-staged path
+  /// (the prior behavior) misreported a genuinely-loadable HF-cached model —
+  /// e.g. a safetensors snapshot the dropdown lists as selectable — as
+  /// "isn't available", because the launcher resolves it from the cache but
+  /// this gate could not see it. Sharing one predicate keeps the gate and the
+  /// launcher from disagreeing about what is loadable.
   static func isModelInstalled(_ slug: String) -> Bool {
-    // Read-only existence check that runs on the render path (the live
-    // `noModelAction` / the download CTA): resolve the models dir path
-    // WITHOUT creating it or touching xattrs. The mutating `PieDirs
-    // .models()` does `createDirectory` + `setResourceValues
-    // (isExcludedFromBackup)` on every call, so calling it here would emit
-    // main-thread filesystem WRITES on every render while the no-model
-    // sheet is open. `modelsURL()` is pure path composition; the
-    // download/staging writers still call the mutating `models()`.
-    let path = LaunchSpecResolver.joinModelPath(modelsRoot: PieDirs.modelsURL(), slug: slug)
-    return FileManager.default.fileExists(atPath: path)
+    // Read-only check that runs on the render path (the live `noModelAction` /
+    // the download CTA): resolve the models dir path WITHOUT creating it or
+    // touching xattrs. The mutating `PieDirs.models()` does `createDirectory` +
+    // `setResourceValues(isExcludedFromBackup)` on every call, so calling it
+    // here would emit main-thread filesystem WRITES on every render while the
+    // no-model gate is open. `modelsURL()` is pure path composition, and
+    // `isModelResolvable` performs existence reads only; the download/staging
+    // writers still call the mutating `models()`.
+    LaunchSpecResolver.isModelResolvable(
+      slug: slug,
+      modelsRoot: PieDirs.modelsURL(),
+      hfHome: LaunchSpecResolver.defaultHFHome())
   }
 
   /// Kick the helper to (re)start the engine on this chat's profile —
@@ -170,147 +274,340 @@ struct ChatScaffoldView: View {
   /// `engineActionError` (PR#15 F3) — never the persistence banner.
   private func startEngineForSelectedProfile() {
     let profileID = viewModel.selectedProfileID
+    // Honor an explicit per-chat model pick as the boot model (#459 repro 1).
+    // v1 pie loads the model at `pie serve` boot from the profile, so a
+    // selection that only lives in App state would never reach the engine — a
+    // no-default profile would fail with `has no default model` despite the
+    // user having chosen one. Thread the selection in the start call so the
+    // helper boots it without depending on the profile default (race-free
+    // against the helper's own profile store). A nil/blank selection falls
+    // back to the profile default. #460: the selection is `Chat.modelID` (the
+    // single authority), read from this view's single chat.
+    let modelOverride = chats.first?.modelID
     Task { @MainActor in
       do {
         engineActionError = nil
-        try await engineStatusStore.startEngine(profileID: profileID)
+        helperBlock = nil
+        // #616: the engine start call lives in the coordinator; the fault
+        // routing below stays here.
+        try await engineCoordinator.startEngine(profileID: profileID, modelOverride: modelOverride)
+      } catch let block as HelperUnavailable {
+        helperBlock = block
       } catch {
         engineActionError = Self.engineErrorMessage(error, verb: "start")
       }
     }
   }
 
+  /// #673: after a chat-toolbar profile swap is persisted, relaunch the engine
+  /// onto the new profile's served model when (and only when) the engine is
+  /// already running a DIFFERENT model. The model-change decision routes
+  /// through the shared `LocalAPIProfileSwitchGate` (via
+  /// `profileSwapEngineOutcome`) so the chat swap and the Local API panel agree
+  /// on what counts as a model-changing switch. The relaunch itself routes
+  /// through the SAME stream-aware, target-bound engine-mutation path as the
+  /// pinned-mismatch relaunch and the explicit Load button
+  /// (`engineMutationDecision` → `loadDefaultModel` /
+  /// `deferEngineLoadUntilStreamsIdle`): a profile swap is not a permission to
+  /// interrupt an unrelated chat's in-flight stream, so a chat streaming
+  /// elsewhere defers the relaunch (and a stale target is dropped) before the
+  /// shared, app-scoped engine is touched.
+  private func reloadEngineIfProfileSwapChangesModel(to newProfileID: String) {
+    var ignored = false  // F4: the swap path owns no persistent in-flight flag
+    let outcome = Self.profileSwapEngineOutcome(
+      newProfileID: newProfileID,
+      chatModelID: chats.first?.modelID,
+      newProfileDefaultModel: profileStore.model(forProfileID: newProfileID),
+      status: engineStatusStore.status,
+      restartInFlight: &ignored)
+    guard outcome == .restart else { return }
+    // `.restart` implies a running engine and a non-nil resolved target
+    // (the gate returns `.selectOnly` for a nil model — F2), so this unwrap
+    // succeeds; it also re-reads the target through the single resolver.
+    guard let chat = chats.first, let target = gateTarget(for: chat)?.modelID else { return }
+    switch Self.profileSwapRelaunchDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) {
+    case .runNow:
+      loadDefaultModel(target, for: chat)
+    case .deferUntilIdle:
+      deferEngineLoadUntilStreamsIdle(target, for: chat)
+    }
+  }
+
   /// Human, fault-domain-correct message for an engine start/stop error.
+  /// #477: `EngineError.message` is a raw diagnostic — show the shared
+  /// taxonomy's curated line instead and log the raw text here, so the
+  /// in-chat banner never carries launcher/resolver internals.
   static func engineErrorMessage(_ error: Error, verb: String) -> String {
     if let e = error as? EngineError {
-      return "Couldn't \(verb) the engine: \(e.message)"
+      let problem = EngineProblem(statusCode: e.code, rawMessage: e.message)
+      if let detail = problem.technicalDetail {
+        Log.engine.error("ChatScaffoldView: \(verb) engine failed: \(detail, privacy: .public)")
+      }
+      return "Couldn't \(verb) the engine. \(problem.message)"
     }
-    return "Couldn't \(verb) the engine: \(error)"
+    Log.engine.error("ChatScaffoldView: \(verb) engine failed: \(String(describing: error), privacy: .public)")
+    // #562: the bind-mode rollback failure is a curated `LocalizedError` whose
+    // message is a deliberate, user-facing security warning (the external-access
+    // preference may still be set). Surface its localized copy rather than the
+    // generic line; all other opaque errors stay generic (no raw struct dump).
+    if error is LocalAPIBindModeRollbackError {
+      return "Couldn't \(verb) the engine: \(error.localizedDescription)"
+    }
+    return "Couldn't \(verb) the engine."
   }
 
-  /// Message for the in-chat engine-failure banner (PR#15 F2/F3), or nil
-  /// when it should stay hidden. modelMissing is owned by the download
-  /// banner; other `.failed` codes show the live status detail; a thrown
-  /// action error shows when the status itself isn't `.failed`.
-  private var engineFailureMessage: String? {
-    // PR#15 v2 F1: only suppress modelMissing when the download banner
-    // will actually own it (a single-file-GGUF slug). A non-downloadable
-    // modelMissing has no download banner, so it must fall through to the
-    // engine-failure banner rather than be menu-bar-dot-only.
-    let slug = selectedProfileDefault
-    let hasDownloadTarget = MissingModelRecovery.bannerTarget(
+  /// Message for the chat-local engine-action banner, or nil when it
+  /// should stay hidden. Live `.failed` status is owned by RootView's
+  /// unified status banner (and modelMissing-with-download is owned by
+  /// `ModelMissingBanner` below), so the local banner is reserved for a
+  /// thrown start/stop action error while status itself is not `.failed`.
+  private var engineActionFailureMessage: String? {
+    MissingModelRecovery.engineActionFailureBannerMessage(
       engineStatus: engineStatusStore.status,
-      profileDefaultModel: slug) != nil
-    return MissingModelRecovery.engineFailureBannerMessage(
-      engineStatus: engineStatusStore.status,
-      actionError: engineActionError,
-      statusDetail: engineStatusStore.statusDetail,
-      hasDownloadTarget: hasDownloadTarget)
+      actionError: engineActionError)
   }
 
-  /// Profile ids offered by the toolbar switcher. Derived live from
-  /// `profileStore` (the source of truth — includes the seeded "Fast
-  /// Think" profile, #426) so every defined profile is selectable in
-  /// chat. `ProfileStore` publishes no `@Published` state, but it seeds +
-  /// scans synchronously in `start()` at app launch (before any chat
-  /// mounts), so `entries` is populated by first render; the body re-reads
-  /// it on each render. Falls back to the injected `availableProfiles`
-  /// only when the store has no parsed entries (previews / tests).
-  private var selectableProfileIDs: [String] {
-    let ids = profileStore.entries.compactMap { $0.profile?.id }
-    return ids.isEmpty ? availableProfiles : ids
+  /// Model ids offered by the toolbar switcher. Merges the engine's served
+  /// ids with discovered app/HF-cache files so selectable rows include
+  /// installed and cached models without falling back to stale placeholders.
+  private var toolbarServedModelIDs: [String] {
+    switch engineCoordinator.engineModels {
+    case .unknown:
+      // First paint/previews keep the injected list only until either the
+      // engine reconcile or the filesystem scan has supplied real choices.
+      return library.freshness == .scanned ? [] : availableModels
+    case .known(let ids):
+      return ids
+    }
+  }
+
+  /// #460: the chat's current model SELECTION drives the menu's "current"
+  /// row + collapsed summary — `Chat.modelID` (the authority), NOT engine
+  /// residency. Residency is not a selection source under the single
+  /// authority, so it is NOT fed into `currentSummary`/`build`'s
+  /// `residentModelID` (the served model still appears as a pickable row via
+  /// `toolbarServedModelIDs`). `chats.first` is this view's single chat.
+  private var toolbarCurrentModelSummary: ToolbarModelOptions.CurrentSummary? {
+    ToolbarModelOptions.currentSummary(
+      modelOverride: chats.first?.modelID,
+      residentModelID: nil,
+      profileDefaultModelID: selectedProfileDefault)
+  }
+
+  private var toolbarModelOptions: [ToolbarModelOptions.Option] {
+    ToolbarModelOptions.build(
+      discoveredModels: library.installed,
+      servedModelIDs: toolbarServedModelIDs,
+      profileDefaultModelID: selectedProfileDefault,
+      modelOverride: chats.first?.modelID,
+      residentModelID: nil)
   }
 
   private func scaffold(for chat: Chat) -> some View {
     VStack(spacing: 0) {
       ContentToolbar(
         viewModel: viewModel,
-        availableProfiles: selectableProfileIDs,
-        // Reflect the models the engine ACTUALLY serves (from
-        // `/v1/models`) rather than the static placeholder list — pie
-        // serves only its single registered model and rejects a
-        // `/v1/models/load` for anything else with `model_not_found`, so
-        // offering unavailable names guarantees a failed "Switch model"
-        // ( follow-up). Falls back to the injected list only until
-        // the first reconcile lands (previews/tests/first paint).
-        availableModels: engineModels.resolved(fallback: availableModels),
+        availableProfiles: pickerProfileIDs,
+        // #459's richer model menu (option list + collapsed summary), built
+        // from `Chat.modelID` (the #460 authority). #580 grouping + quant tag
+        // + unverified shield render inside `ContentToolbar` from these
+        // options (each carries its parsed `ModelNameParts` + `isUnverified`).
+        modelOptions: toolbarModelOptions,
+        currentModelSummary: toolbarCurrentModelSummary,
+        // #460: the chat's persisted selection authority + the active
+        // profile's default. The commits write the SwiftData authority
+        // (`Chat.modelID` / `Chat.profileID`); policy lives in the
+        // coordinator, persistence here.
+        selectedModelID: chat.modelID,
+        profileDefaultModel: selectedProfileDefault,
+        commitSwap: { profileID, pinModel in
+          commitSwap(profileID: profileID, pinModel: pinModel, chat: chat)
+        },
+        commitModel: { modelID in persistChatModel(modelID, on: chat) },
+        onUseProfileDefault: { _ = persistChatModel(nil, on: chat) },
+        followProfileDefaultModel: appPreferences.followProfileDefaultModel,
         swapCoordinator: swapCoordinator,
         modelLoadCenter: modelLoadCenter,
         engineStatus: engineStatusStore,
         helperHealth: helperHealth,
         engineLifecycle: engineLifecycle,
+        profileSampling: { selectedProfileSamplingDefault },
         onUnload: unloadModel,
         onStartEngine: startEngineForSelectedProfile
       )
       Divider().opacity(0.0001) // structural breather; no visible line per §5
-      // #326 Path 2: surface a swallowed failed(modelMissing) engine
-      // state with an inline download + auto-start, instead of leaving
-      // the user to discover it by failing a send.
-      if let bannerTarget = MissingModelRecovery.bannerTarget(
-        engineStatus: engineStatusStore.status,
-        profileDefaultModel: selectedProfileDefault
-      ) {
-        ModelMissingBanner(
-          target: bannerTarget,
-          onDownloaded: { startEngineForSelectedProfile() },
-          engineStatus: engineStatusStore.status
-        )
-      } else if let message = engineFailureMessage {
-        // PR#15 F2/F3: surface a non-modelMissing engine failure (or a
-        // thrown start/stop error) in-chat — the user just acted; it must
-        // not be menu-bar-dot-only or hidden under "Couldn't save". v2 F2:
-        // only offer Dismiss for a dismissable (thrown action-error)
-        // message; a live `.failed` status self-clears on recovery, so its
-        // Dismiss would be a no-op and is hidden.
-        EngineFailureBanner(
-          message: message,
-          onDismiss: MissingModelRecovery.engineFailureDismissable(
-            engineStatus: engineStatusStore.status) ? { engineActionError = nil } : nil)
+      // #496: while the background Helper is the live fault, the window-level
+      // `UnifiedStatusBanner` already attributes it correctly (the helper axis
+      // outranks the engine axis). Suppress the in-chat ENGINE banners so a dead
+      // Helper is never ALSO re-framed here as an engine fault (the ~30-poll
+      // synthesized `.failed(.engineGone)`) — the mis-attribution the deleted
+      // full-bleed overlay used to prevent, now carried by the banner/
+      // attribution path (`StatusBannerReducer.helperOwnsBanner`).
+      if !helperOwnsStatusBanner {
+        // #326 Path 2: surface a swallowed failed(modelMissing) engine
+        // state with an inline download + auto-start, instead of leaving
+        // the user to discover it by failing a send.
+        // #446: suppress the banner ONLY when the send-gate is presented
+        // AND is itself showing the same inline download (action `.download`),
+        // so the user never sees two download prompts for one model. Review F1:
+        // gate on the gate's REAL download condition, not bare presentation —
+        // in the present-but-invalid staged-model edge the gate shows Open
+        // Settings (action `.load`), which does NOT duplicate the banner, so the
+        // banner (the only one-click download there) must stay visible.
+        if let bannerTarget = MissingModelRecovery.bannerTarget(
+          engineStatus: engineStatusStore.status,
+          // #477/#497: keyed on the GATE target's model (pick ?? default) like
+          // the suppression axis below and the boot path — the banner must
+          // never offer a download for a default the Load tap wouldn't boot.
+          profileDefaultModel: gateTarget(for: chat)?.modelID,
+          sendGatePresented: showNoModelPrompt && noModelAction(for: chat).isDownload
+        ) {
+          ModelMissingBanner(
+            target: bannerTarget,
+            onDownloaded: { startEngineForSelectedProfile() },
+            engineStatus: engineStatusStore.status
+          )
+        } else if let message = engineActionFailureMessage {
+          // Surface distinct thrown start/stop action errors in-chat — they
+          // may not appear in the live status poll and must not be hidden
+          // under "Couldn't save". Live `.failed` status is rendered once by
+          // the app-level unified status banner so it does not duplicate
+          // inside the chat surface.
+          EngineFailureBanner(
+            message: message,
+            onDismiss: MissingModelRecovery.engineFailureDismissable(
+              engineStatus: engineStatusStore.status) ? { engineActionError = nil } : nil)
+        }
       }
-      TranscriptView(chat: chat)
+
+      // #496: an engine action refused because the Helper isn't healthy — an
+      // inline, helper-framed acknowledgment near the action. The authoritative
+      // helper status lives in the window-level `UnifiedStatusBanner` above.
+      if let helperBlock {
+        HelperUnavailableNotice(reason: helperBlock, onDismiss: { self.helperBlock = nil })
+      }
+      // #513 review v2 F1: stale-retry notice on its own channel and
+      // surface — engine-status changes can neither shadow nor clear it.
+      // `.task(id:)` keyed on the per-raise `id` gives it a bounded
+      // lifetime: every raise (including re-raising the same message)
+      // restarts the auto-clear, and Dismiss clears it immediately.
+      if let notice = staleRetryNotice {
+        StaleRetryNotice(message: notice.message, onDismiss: { staleRetryNotice = nil })
+          .task(id: notice.id) {
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            // The sleep's cancellation error is swallowed by `try?`, so
+            // re-check before clearing: a cancelled timer (row replaced or
+            // removed) must not wipe a newer notice.
+            guard !Task.isCancelled else { return }
+            if staleRetryNotice?.id == notice.id { staleRetryNotice = nil }
+          }
+      }
+      // #496: the chat body is the transcript + composer. It is NEVER covered by
+      // a full-bleed helper overlay — that earlier overlay's `maxHeight:.infinity`
+      // exploded the window layout and made the WHOLE window non-interactive. A
+      // dead/starting Helper now reads on the bounded window banner (+ the inline
+      // notice above for a refused action), keeping the sidebar/history/Settings
+      // live.
+      VStack(spacing: 0) {
+        TranscriptView(
+          chat: chat,
+          // #513: retry waits for the active stream — while this chat is
+          // in flight the controls are hidden entirely (nil), so a retry
+          // can never race the stream writer or cancel an unrelated
+          // chat's stream.
+          onRetryTurn: sendCoordinator.isInFlight(chatID)
+            ? nil
+            : { messageID in requestRetry(for: chat, messageID: messageID) },
+          // #624: edit a prior user turn → non-destructive fork-and-resend.
+          // Withheld (nil) while this chat is streaming, same as retry, so an
+          // edit can't race the active turn.
+          onEditUserTurn: sendCoordinator.isInFlight(chatID)
+            ? nil
+            : { messageID, newText in forkAndResend(messageID: messageID, newContent: newText, in: chat) },
+          // #690: Best-of-N pick / think-more / stop, withheld while streaming
+          // (same as retry/edit), and live only for the latest uncommitted round.
+          onBestOfN: sendCoordinator.isInFlight(chatID)
+            ? nil
+            : { messageID, action in handleBestOfN(messageID: messageID, action: action, in: chat) },
+          bestOfNLiveID: sendCoordinator.isInFlight(chatID) ? nil : liveBestOfNRoundID(in: chat)
+        )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-      ComposerView(
-        chat: chat,
-        viewModel: viewModel,
-        isSending: sendController.isInFlight,
-        shouldAllowSend: { currentModelID() != nil },
-        onSendBlocked: { presentNoModelPrompt() },
-        onUserMessageSaved: { _ in sendAssistantTurn(for: chat) }
-      )
+        // #669: the no-model gate is a NON-modal overlay scoped to the
+        // transcript region — NOT a window-modal `.sheet`. A `.sheet` does
+        // not cover the top toolbar, but its modal session swallows every
+        // click to the rest of the window, the toolbar model picker
+        // included, so a user whose engine failed to start was trapped: the
+        // only fix (switch to a working model) sat in a toolbar the modal
+        // had just made inert. Overlaying only the transcript leaves the
+        // ContentToolbar (above) and the menu bar fully operable, so the
+        // picker stays a recovery path. The card is bounded
+        // (`.frame(width:360)`), so unlike the #496-deleted full-bleed
+        // overlay it cannot explode the layout.
+        .overlay {
+          if showNoModelPrompt {
+            noModelGate(for: chat)
+          }
+        }
+        ComposerView(
+          chat: chat,
+          viewModel: viewModel,
+          isSending: sendCoordinator.isInFlight(chatID),
+          shouldAllowSend: { sendGateDecision(for: chat).allowsSend },
+          onSendBlocked: { draft in
+            handleBlockedSend(draft: draft, for: chat)
+          },
+          onUserMessageSaved: { _ in
+            // A send committed (manual or fired auto-send) — any armed
+            // pending send is now satisfied or superseded. #516.
+            pendingSend.disarm()
+            cancelDeferredEngineSync()
+            sendAssistantTurn(for: chat)
+          },
+          // #507: the composer's stop button — the user-reachable cancel
+          // for this chat's in-flight turn (review v1 F1).
+          onStop: { sendCoordinator.cancel(chatID: chatID) },
+          autoSubmit: pendingSend.autoSubmit
+        )
+      }
     }
     .background(Color(nsColor: .windowBackgroundColor))
-    .sheet(isPresented: $showNoModelPrompt) {
-      NoModelLoadedPrompt(
-        // #397: the lifecycle state gives the prompt its "starting /
-        // loading…" framing while the engine/model comes up.
-        gateState: chatStartState,
-        // #326: the model-availability action (Load / Download /
-        // unavailable) captured when the send was blocked.
-        action: noModelAction,
-        onLoad: { model in
-          // #397: ensure the engine is running FIRST, then load — the
-          // pre-#397 `loadDirect` no-opped on a stopped engine. The sheet
-          // stays open, reflects busy→ready, and auto-dismisses below.
-          loadDefaultModel(model)
+    .sheet(item: $pinnedModelMismatch) { mismatch in
+      PinnedModelMismatchPrompt(
+        mismatch: mismatch,
+        onRelaunchPinned: {
+          relaunchPinnedMismatch(mismatch, for: chat)
         },
-        onDownloaded: {
-          // Model is now on disk — boot the engine on this chat's
-          // profile so it loads (#326 auto-start). The status poll +
-          // model-load indicator surface the rest; the composer
-          // unblocks once the engine serves the model.
-          startEngineForSelectedProfile()
-          showNoModelPrompt = false
+        onUseResident: {
+          if persistChatModel(mismatch.residentModelID, on: chat) {
+            pinnedModelMismatch = nil
+          }
         },
-        // #397 F1: retryable engine failure → re-start the engine.
-        onRetryEngineStart: { startEngineForSelectedProfile() },
-        // #397 F1: failed model load → re-run it via the ensure-engine
-        // -then-load path (restarts the engine if it has since stopped).
-        onRetryLoad: { model in loadDefaultModel(model) },
-        // #397 F1: helper unreachable → force an immediate status re-poll.
-        onRefresh: { refreshEngineStatus() },
-        onCancel: { showNoModelPrompt = false },
-        engineStatus: engineStatusStore.status
+        onCancel: {
+          pinnedModelMismatch = nil
+        }
       )
+    }
+    // #513: destructive-retry confirmation. Required whenever the plan
+    // erases more than the stale assistant itself: later conversation, or
+    // adjacent assistant rows that must be removed so the retained prefix
+    // ends at a user turn. Canceling leaves history untouched — nothing is
+    // mutated until Retry.
+    .alert(
+      "Retry from here?",
+      isPresented: Binding(
+        get: { pendingRetryMessageID != nil },
+        set: { if !$0 { pendingRetryMessageID = nil } }
+      )
+    ) {
+      Button("Retry", role: .destructive) {
+        if let messageID = pendingRetryMessageID {
+          executeRetry(for: chat, messageID: messageID)
+        }
+        pendingRetryMessageID = nil
+      }
+      Button("Cancel", role: .cancel) { pendingRetryMessageID = nil }
+    } message: {
+      Text("This will erase the affected responses back to the previous user message, plus any later conversation, and generate a new response.")
     }
     .onChange(of: engineStatusStore.status) { _, new in
       // PR#15 F3: a thrown start/stop error is transient — once the poll
@@ -320,20 +617,75 @@ struct ChatScaffoldView: View {
       // #4: the engine no longer auto-starts on boot — once status settles
       // (.starting → .stopped), proactively ask to start the model.
       maybePromptEngineStartOnLaunch()
+      // #516 review F1: `currentModelID` gates on THIS status being
+      // `.running`, but the residency feed (`EngineLifecycle` →
+      // `ModelLoadCenter`) observes the engine independently and can land
+      // FIRST — its `residentModelID` edge then evaluates to `.hold` and
+      // the change-guarded setters emit no later edge. The status flip is
+      // that missing edge; `resolutionEdge` is idempotent, so the extra
+      // call is safe in every other ordering.
+      // Review F6: at the `.running` flip the selection authority is still
+      // pre-reconcile (the `.task` reconcile runs after) — require
+      // reconciled residency so this edge can't fire a stale pin into an
+      // engine serving a different model.
+      resolutionEdge(for: chat, requiresResidency: true)
+    }
+    // #496: auto-dismiss the inline helper-refusal once the Helper recovers to
+    // a state where the op would be allowed again, so a stale "helper is
+    // starting" notice can't outlive the condition it described.
+    .onChange(of: helperHealth.health) { _, h in
+      if HelperOpGate.evaluate(h) == nil { helperBlock = nil }
     }
     // #397: auto-dismiss the gate once a model resolves (engine came up
     // and reconciled, or a load completed) so the user lands back at the
-    // composer with their draft intact — no stale "starting…" sheet.
-    .onChange(of: modelLoadCenter.residentModelID) { _, _ in dismissPromptIfResolved() }
-    .onChange(of: viewModel.modelOverride) { _, _ in dismissPromptIfResolved() }
+    // composer with their draft intact — no stale "starting…" gate.
+    // These two are the post-reconcile edges — residency (or the re-seeded
+    // selection) IS the new fact being observed, so no residency pre-check.
+    .onChange(of: modelLoadCenter.residentModelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
+    .onChange(of: chat.modelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
+    // #413's helper-health generation gate is wired at app scope from
+    // `ChatSendCoordinator.onAnyInFlightChange` (#507) — streams outlive this
+    // view now, so a per-view forward would release the gate on navigate-away
+    // while the stream is still saturating the MainActor. THIS chat's
+    // in-flight edge is still observed here for #516:
+    .onChange(of: sendCoordinator.isInFlight(chatID)) { _, inFlight in
+      // #516 review F2: a fire delivered while a send is in flight would be
+      // swallowed by `submit()`'s `!isSending` guard — so `verdict` holds
+      // while in flight, and THIS edge (in-flight clearing) re-evaluates
+      // and delivers the deferred fire.
+      // Residency-checked (F6): a deferred fire must not consume the
+      // pending against a relaunched-but-unreconciled engine either; if
+      // residency is still nil this holds and the residency edge delivers.
+      if !inFlight { resolutionEdge(for: chat, requiresResidency: true) }
+    }
     .onAppear {
       // Seed the toolbar from the persisted profile so the menu
       // label matches what the chat was created with.
       viewModel.selectedProfileID = chat.profileID
+      clearTransientOverridesForSelectedProfile()
       // #4: covers the case where the engine status already settled before
       // this view appeared (no .onChange fires) — evaluate the launch ask
       // here too; the once-flag keeps it from double-prompting.
       maybePromptEngineStartOnLaunch()
+    }
+    // #624: a fork-and-resend navigates here (a freshly-mounted scaffold,
+    // keyed `.id(chatID)` by `DetailView`). Consume the one-shot handoff
+    // once per mount and kick off the resent assistant turn through the
+    // SAME `sendAssistantTurn` path a normal send uses (recovery-gate and
+    // no-model gate ride it for free). Runs in THIS scaffold so the turn is
+    // owned by the new chat's app-scoped controller.
+    .task(id: chat.id) {
+      guard windowState.consumePendingForkResend(chat.id) else { return }
+      // Seed the toolbar profile from the persisted chat BEFORE the resend.
+      // `sendAssistantTurn` resolves every profile-derived field (sampling,
+      // system prompt, speculation, response format) from
+      // `viewModel.selectedProfileID`, and SwiftUI does NOT guarantee
+      // `.onAppear` (which also seeds it) runs before this sibling `.task`.
+      // Without this, a forked chat on a non-default profile (e.g. Fast
+      // Think) could resolve against the default "chat" profile and silently
+      // lose its speculation. Seeding here makes the resend race-free.
+      viewModel.selectedProfileID = chat.profileID
+      sendAssistantTurn(for: chat)
     }
     .onChange(of: viewModel.selectedProfileID) { _, new in
       // Mirror toolbar swaps back into the persistent chat — the
@@ -345,21 +697,38 @@ struct ChatScaffoldView: View {
       // the sidebar. Save explicitly so a quick relaunch lands the
       // new profile durably.
       guard chat.profileID != new else { return }
+      // #516: a profile switch makes the gate's promised load target stale —
+      // drop the pending send rather than auto-firing under a new profile.
+      pendingSend.disarm()
+      cancelDeferredEngineSync()
       let previous = chat.profileID
       chat.profileID = new
       do {
         try modelContext.save()
+        // F2 (#690): swapping a chat AWAY from Best-of-N orphans any
+        // uncommitted round it holds — the abandon sweep otherwise only runs on
+        // the next `sendAssistantTurn`, which may never come for this chat. The
+        // predicate scans by message state, not profile, so it still finds the
+        // round after `profileID` has flipped. Release its snapshots now.
+        releaseAbandonedBestOfNRounds(in: chat)
         // #3: a profile swap chooses which profile is active. The menu-bar
         // (menu-icon) engine start reads the GLOBAL active-profile marker
         // (HelperResumeAction → ProfileStore.activeProfileID), NOT this
         // per-chat selection — so persist the swap to the marker too.
         // Otherwise a swap while the engine is stopped leaves the marker on
         // the old profile and a later menu-icon start launches the OLD
-        // model. Stage-only: this updates the start TARGET, it does not
-        // auto-start the engine. `setActiveProfileID` logs internally on a
-        // write failure (the marker simply stays on the prior profile), so
-        // the `try?` does not silently drop the signal.
+        // model. While stopped this is stage-only: it updates the start
+        // TARGET, it does not auto-start the engine (#3). `setActiveProfileID`
+        // logs internally on a write failure (the marker simply stays on the
+        // prior profile), so the `try?` does not silently drop the signal.
         try? profileStore.setActiveProfileID(new)
+        clearTransientOverridesForSelectedProfile()
+        // #673: when the engine is already running and the newly selected
+        // profile boots a DIFFERENT served model, relaunch onto it now — the
+        // user shouldn't have to send a chat or restart manually to pick up
+        // the new model. A same-model swap, a stopped engine, or a switch
+        // mid-transition takes no engine action (gate → selectOnly/reject).
+        reloadEngineIfProfileSwapChangesModel(to: new)
       } catch {
         chat.profileID = previous
         // Also revert the toolbar selection so the menu label
@@ -372,107 +741,559 @@ struct ChatScaffoldView: View {
         persistenceStatus.report(error, context: "ChatScaffoldView.profileSwap")
       }
     }
+    // #507: NO `.onDisappear` stream cancel — switching chats must not kill
+    // the stream. Cancellation is explicit only: the composer's stop button
+    // (`cancel(chatID:)`) or chat deletion (`forget`); a new send in the
+    // same chat still supersedes inside `ChatSendController.send`.
     .onDisappear {
-      sendController.cancel()
+      // #516: navigating away abandons the pending flow — no stale
+      // auto-send when the user later returns or switches chats.
+      pendingSend.disarm()
+      cancelDeferredEngineSync()
     }
-    // Reflect a model the engine already has resident (e.g. the Helper
-    // auto-resumed the active profile at boot) so the composer doesn't
-    // block every send behind the no-model prompt despite a ready engine
-    // ( follow-up). Re-runs whenever the engine status flips.
+    // Ensure the shared library has scanned at least once for the chat scene
+    // (the Models settings tab is the only OTHER scan trigger, and the user may
+    // never open it). After the first scan the store self-refreshes on download
+    // completion (its `$active` sink) and on a Settings delete, and republishes
+    // `library.installed` — so the dropdown stays live without a private rescan.
+    .task {
+      if library.freshness == .notScanned { await library.refresh() }
+    }
+    // Reflect a model the engine already has resident (e.g. after the launch
+    // prompt/user-confirm path, explicit Restart, Local API start,
+    // post-download startEngine, or crash auto-relaunch) so the composer
+    // doesn't block every send behind the no-model prompt despite a ready
+    // engine ( follow-up). Re-runs whenever the engine status flips.
     .task(id: engineStatusStore.status) {
-      await reconcileEngineResidentModel()
+      await reconcileEngineResidentModel(for: chat)
     }
   }
 
-  /// When the engine is running, sync `residentModelID` to the id the
-  /// engine actually serves (`GET /v1/models`) — the only id its chat
-  /// endpoint accepts. No-op when the engine isn't running or a load is
-  /// already in flight.
-  private func reconcileEngineResidentModel() async {
-    // Bounded retry while the engine stays running — a single transient
-    // /v1/models failure must not strand residentModelID unset until a
-    // status flip that may never come on equal .running polls (F2).
-    let result = await EngineModelReconciler.reconcile(
-      isRunning: {
-        if case .running = engineStatusStore.status { return true }
-        return false
-      },
-      fetchModelIDs: { try await engineStore.client.models().map(\.id) }
-    )
-    // Fold into the toolbar state. `.empty`/`.notRunning` become
-    // `.known([])` (no placeholders for a verified empty/dead engine);
-    // `.failedAfterRetries` keeps any prior known list. Placeholders show
-    // only before the first fetch (F2).
-    engineModels = ToolbarModelList.from(result, previous: engineModels)
+
+  /// Drive the engine-residency reconcile through the coordinator (which does
+  /// the bounded `/v1/models` fetch, folds the served list into
+  /// `engineModels`, and sets `ModelLoadCenter` residency + the #474 token
+  /// ceiling), then apply the per-chat consequences the coordinator can't —
+  /// seeding THIS chat's `Chat.modelID` selection (#460) and settling its
+  /// pending send (#516) — which touch SwiftData/`@State` this view owns.
+  private func reconcileEngineResidentModel(for chat: Chat,
+                                            isRetryPass: Bool = false) async {
+    let result = await engineCoordinator.reconcileResidentModel()
     switch result {
     case .models(let ids):
-      // reconcileEngineResident is internally guarded against clobbering
-      // an in-flight load.
-      modelLoadCenter.reconcileEngineResident(ids[0])
-    case .failedAfterRetries(let attempts):
-      // Don't silently drop: engine running but unreachable for models.
-      NSLog("ChatScaffold: /v1/models reconcile failed after \(attempts) attempts while engine .running")
-    case .empty:
-      // Engine running but serving NO model — clear any stale residency so
-      // the send gate doesn't pass a model the engine no longer has (the
-      // sibling gap to the leave-`.running` invalidation). No-op while a load
-      // is in flight.
-      modelLoadCenter.engineServesNoModel()
-    case .notRunning:
-      // Engine isn't running — `EngineLifecycle` already invalidated residency
-      // on the leave-`.running` edge; nothing to do here.
+      // #460 (review F1): seed the chat's SELECTION authority (`Chat.modelID`)
+      // from the served model ONLY when it matches THIS chat's profile
+      // default — never the engine's single GLOBAL resident model when it
+      // differs. The engine serves one global model; `ids[0]` is that, not
+      // necessarily this chat's selection, and navigating between chats does
+      // NOT reload the engine to the new chat's profile (the active-profile
+      // write is stage-only). Adopting `ids[0]` unconditionally would durably
+      // pin an unpinned chat to the wrong model. When the served model is not
+      // this chat's default, leave `modelID` nil (follow the profile default).
+      // `seededModelID` is the pure decision; seed-only (never overwrites a
+      // pick) and no-op while a load is in flight.
+      if let toPin = Self.seededModelID(
+        currentPin: chat.modelID,
+        servedID: ids[0],
+        profileDefault: selectedProfileDefault,
+        // #469: the residency-only ModelLoadCenter has no in-flight-load state
+        // (`/v1/models/load` is gone; the served model is bound at engine boot).
+        // This block runs on a successful `/v1/models` reconcile — the engine is
+        // serving, never mid-load — so the seed guard is never "in flight" here.
+        isLoading: false
+      ) {
+        _ = persistChatModel(toPin, on: chat)
+      }
+    case .failedAfterRetries:
+      // The coordinator already logged the reconcile failure + left prior
+      // state. THIS view still settles its own pending send (#516 review F8):
+      // residency-required edges hold the pending until reconcile lands — and
+      // equal `.running` polls never re-run the `.task`, so a bounded failure
+      // would strand the promise forever. One backed-off retry round, then on
+      // the final failure fall back to the residency-free edge (bounded pre-F6
+      // behavior beats an infinite hold). The `.task` cancels this on a status
+      // flip (the sleep throws), so a real engine transition supersedes it.
+      switch Self.reconcileFailureStep(hasPendingAutoSend: pendingSend.pending != nil,
+                                       isRetryPass: isRetryPass) {
+      case .none:
+        break
+      case .retry:
+        guard (try? await Task.sleep(nanoseconds: 2_000_000_000)) != nil else { break }
+        await reconcileEngineResidentModel(for: chat, isRetryPass: true)
+      case .fallbackEdge:
+        terminatePendingSendAfterReconcileFailure(for: chat)
+      }
+    case .empty, .notRunning:
+      // The coordinator already updated `ModelLoadCenter` residency (cleared on
+      // `.empty`; left to `EngineLifecycle`'s leave-`.running` invalidation on
+      // `.notRunning`). No per-chat consequence here.
       break
     }
+  }
+
+  /// #513 entry point from a transcript row's Retry control. Routes
+  /// through the destructive confirmation only when the plan says more
+  /// than the stale assistant itself would be erased; a simple latest-turn
+  /// retry executes directly.
+  /// The model gate runs FIRST so a blocked retry raises the no-model or
+  /// pinned/resident mismatch prompt without having mutated any history.
+  private func requestRetry(for chat: Chat, messageID: UUID) {
+    guard !sendCoordinator.isInFlight(chatID) else { return }
+    switch sendGateDecision(for: chat) {
+    case .ready:
+      break
+    case .pinnedModelMismatch(let pinned, let resident):
+      pendingSend.disarm()
+      pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
+                                                residentModelID: resident)
+      return
+    case .noResolvableModel:
+      presentNoModelPrompt()
+      return
+    }
+    guard let plan = ChatRetryPlan.plan(messages: chat.messages, retryPointID: messageID) else {
+      // Review v1 F1 (lower-stakes sibling): the rendered control was
+      // stale — say so instead of a dead click.
+      staleRetryNotice = RetryNoticeState(message: Self.staleRetryNoticeCopy)
+      return
+    }
+    if plan.requiresConfirmation {
+      pendingRetryMessageID = messageID
+    } else {
+      executeRetry(for: chat, messageID: messageID)
+    }
+  }
+
+  /// Review v1 F1: a user who consented to a destructive retry (or clicked
+  /// a rendered Retry control) must never get a silent no-op when the
+  /// transcript changed underneath. Review v2 F1: rendered by the
+  /// dedicated `StaleRetryNotice` row off `staleRetryNotice` state —
+  /// never the engine-failure banner, whose `.failed`-status shadowing
+  /// and status-flip clearing could drop this unread.
+  static let staleRetryNoticeCopy =
+    "Retry no longer applies — the conversation changed or a response is in progress."
+
+  /// #513: truncate back to the last user before the retry point, then
+  /// resend from the retained prefix via the normal send path (same
+  /// model/profile resolution, same
+  /// ToT dispatch, same per-chat controller — so an unrelated chat's
+  /// stream is never touched). `ChatRetryPlan.apply` re-validates against
+  /// the live transcript and truncates atomically; review v1 F1: every
+  /// blocked branch surfaces — `.noLongerApplies` raises the stale-retry
+  /// notice, `.saveFailed` was already reported via the persistence
+  /// banner (and must not resend — the engine never sees a prefix the
+  /// store does not hold).
+  private func executeRetry(for chat: Chat, messageID: UUID) {
+    switch ChatRetryPlan.apply(
+      retryPointID: messageID,
+      chat: chat,
+      isInFlight: sendCoordinator.isInFlight(chatID),
+      context: modelContext,
+      persistenceStatus: persistenceStatus
+    ) {
+    case .send:
+      sendAssistantTurn(for: chat)
+    case .noLongerApplies:
+      staleRetryNotice = RetryNoticeState(message: Self.staleRetryNoticeCopy)
+    case .saveFailed:
+      break
+    }
+  }
+
+  /// Edit a prior user turn and re-run the conversation from there (#624).
+  /// Non-destructive FORK: copy `chat` up to and including the edited message
+  /// (with `newContent` substituted) into a new chat, navigate to it, and let
+  /// the freshly-mounted scaffold fire the resend via the `pendingForkResend`
+  /// handoff. The source chat is left fully intact.
+  private func forkAndResend(messageID: UUID, newContent: String, in chat: Chat) {
+    // Defensive: the affordance is already hidden mid-stream (the scaffold
+    // passes a nil hook then), but never fork while this chat is in flight.
+    guard !sendCoordinator.isInFlight(chatID) else { return }
+    let trimmed = newContent.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    guard let message = chat.messages.first(where: { $0.id == messageID }) else { return }
+    guard let newID = ChatFork.fork(
+      chat: chat,
+      at: message,
+      newContent: trimmed,
+      in: modelContext,
+      persistenceStatus: persistenceStatus,
+      contextLabel: "ChatScaffoldView.forkAndResend"
+    ) else { return }
+    // Hand the resend to the new scaffold, then navigate. `DetailView`
+    // remounts `ChatScaffoldView` for `newID`, whose `.task(id:)` consumes
+    // the signal and sends.
+    windowState.beginForkResend(to: newID)
+  }
+
+  // MARK: - Best-of-N interaction (#690)
+
+  /// The latest uncommitted Best-of-N round (a round message with pick metadata
+  /// but no committed answer yet) — the one row that shows the live controls.
+  private func liveBestOfNRoundID(in chat: Chat) -> UUID? {
+    chat.messages
+      .sorted(by: Message.transcriptPrecedes)
+      .last { $0.bestOfN != nil && $0.content.isEmpty }?
+      .id
+  }
+
+  /// The chosen candidate's answer text, read from the round's persisted
+  /// `ToTTree` snapshot by node id.
+  private func bestOfNCandidateText(message: Message, nodeID: String) -> String? {
+    guard let totData = message.tot,
+          let tree = try? JSONDecoder().decode(ToTTree.self, from: totData) else { return nil }
+    return tree.nodes.first { $0.id == nodeID }?.content
+  }
+
+  /// Apply a Best-of-N pick / think-more / stop (#690).
+  ///  - `.pick` records the chosen candidate on the round (collapse + highlight).
+  ///  - `.thinkMore` starts the next round expanding from the pick (warm-resume
+  ///    from its snapshot, falling back to re-prefill server-side on a miss).
+  ///  - `.stop` commits the chosen candidate as the round's final answer.
+  private func handleBestOfN(messageID: UUID, action: BestOfNAction, in chat: Chat) {
+    guard let message = chat.messages.first(where: { $0.id == messageID }),
+          let roundData = message.bestOfN,
+          var round = try? JSONDecoder().decode(BestOfNRound.self, from: roundData) else { return }
+
+    switch action {
+    case let .pick(id):
+      round.chosenID = id
+      message.bestOfN = try? JSONEncoder().encode(round)
+      try? modelContext.save()
+
+    case .thinkMore:
+      guard let chosen = round.chosen,
+            let pickedText = bestOfNCandidateText(message: message, nodeID: chosen.id)
+      else { return }
+      let resume = ChatSendController.BestOfNResume(
+        pickedName: chosen.snapshotName,
+        pickedText: pickedText,
+        unpicked: round.unpickedSnapshotNames(excluding: chosen.id),
+        level: round.level + 1)
+      sendBestOfNRound(for: chat, resume: resume)
+
+    case .stop:
+      guard let chosen = round.chosen,
+            let text = bestOfNCandidateText(message: message, nodeID: chosen.id)
+      else { return }
+      // Commit the chosen candidate as the round's final answer (not editable
+      // in v1 — a follow-up could make the committed reply editable like a
+      // normal user/assistant turn).
+      message.content = text
+      try? modelContext.save()
+      // Terminal cleanup (#690): the chosen reply's text is now persisted, so
+      // the round's candidate KV snapshots are dead weight — release them all
+      // (think-more would have freed them via resume; stop has no next round).
+      releaseBestOfNSnapshots(round.candidates.map(\.snapshotName), in: chat)
+    }
+  }
+
+  /// Best-effort release of a set of Best-of-N candidate KV snapshots (#690
+  /// terminal cleanup). No-op when the engine is not ready or the set is empty.
+  private func releaseBestOfNSnapshots(_ names: [String], in chat: Chat) {
+    guard !names.isEmpty, case .ready(let modelID) = sendGateDecision(for: chat) else { return }
+    sendCoordinator.controller(for: chatID).releaseBestOfNSnapshots(
+      engine: engineStore.client, modelID: modelID, snapshotNames: names)
+  }
+
+  /// Abandon cleanup (#690): when the user starts a NEW turn instead of
+  /// picking/think-more, every uncommitted Best-of-N round in the chat is
+  /// orphaned — its candidate snapshots will never be picked or stopped. Free
+  /// them. A round is uncommitted when its message has no committed content but
+  /// carries a decoded pick set; releasing already-freed names is a harmless
+  /// no-op (the server reports them absent), so this is safe to run each turn.
+  private func releaseAbandonedBestOfNRounds(in chat: Chat) {
+    let names = BestOfNRound.uncommittedCandidateSnapshotNames(in: chat.messages)
+    releaseBestOfNSnapshots(names, in: chat)
+  }
+
+  /// Send a Best-of-N think-more round expanding from the user's pick. Mirrors
+  /// the round-1 route in `sendAssistantTurn` but threads the `resume` payload.
+  private func sendBestOfNRound(for chat: Chat, resume: ChatSendController.BestOfNResume) {
+    guard case .ready(let modelID) = sendGateDecision(for: chat) else { return }
+    guard let bonProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
+          let bonConfig = bonProfile.bestOfN else { return }
+    let options = ChatSendRequestOptions(
+      modelID: modelID,
+      sampling: bonProfile.bestOfNRequestSampling,
+      systemPromptOverride: Self.resolvedSystemPrompt(
+        profileDefault: profileStore.systemPrompt(forProfileID: viewModel.selectedProfileID),
+        transientOverride: viewModel.systemPromptOverride),
+      profileID: viewModel.selectedProfileID,
+      speculation: nil,
+      maxOutputTokensCeiling: modelLoadCenter.residentMaxOutputTokens,
+      kvUsageSnapshot: engineStatusStore.kvUsageSnapshot(for: modelID),
+      responseFormat: nil)
+    sendCoordinator.controller(for: chatID).sendBestOfN(
+      chat: chat,
+      context: modelContext,
+      engine: engineStore.client,
+      config: bonConfig,
+      persistenceStatus: persistenceStatus,
+      options: options,
+      resume: resume)
   }
 
   private func sendAssistantTurn(for chat: Chat) {
     // Defensive: ComposerView only invokes this after `shouldAllowSend`
     // passed, but never ask the engine to load a model the user did not
-    // choose ( invariant).
-    guard let modelID = currentModelID() else {
+    // choose, and never send a pinned model into a known different resident
+    // engine (#527).
+    let modelID: String
+    switch sendGateDecision(for: chat) {
+    case .ready(let readyModelID):
+      modelID = readyModelID
+    case .pinnedModelMismatch(let pinned, let resident):
+      pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
+                                                residentModelID: resident)
+      return
+    case .noResolvableModel:
       presentNoModelPrompt()
       return
     }
+    // Abandon cleanup (#690): starting a new turn orphans any uncommitted
+    // Best-of-N round in this chat — free its candidate snapshots now so a long
+    // session cannot accumulate unpicked KV. Runs before this turn is added, so
+    // it only targets prior rounds.
+    releaseAbandonedBestOfNRounds(in: chat)
+    let options = ChatSendRequestOptions(
+      modelID: modelID,
+      sampling: Self.resolvedSampling(
+        profileDefault: profileStore.sampling(forProfileID: viewModel.selectedProfileID),
+        transientOverride: viewModel.samplingOverride),
+      systemPromptOverride: Self.resolvedSystemPrompt(
+        profileDefault: profileStore.systemPrompt(forProfileID: viewModel.selectedProfileID),
+        transientOverride: viewModel.systemPromptOverride),
+      profileID: viewModel.selectedProfileID,
+      // #426: thread the selected profile's Repeat Boost (speculative-decoding)
+      // settings into the request — a Repeat Boost profile attaches speculation
+      // + forces greedy; a normal or tree-of-thought profile carries none.
+      // Built once here so both the ToT dispatch and the normal send get it.
+      speculation: profileStore.speculation(forProfileID: viewModel.selectedProfileID),
+      // #474: the launched engine's effective max_tokens ceiling, learned
+      // from GET /v1/models during resident-model reconcile. `makeRequest`
+      // clamps the profile's max_tokens down to this so a memory-squeezed
+      // launch never trips the engine's clean 400.
+      maxOutputTokensCeiling: modelLoadCenter.residentMaxOutputTokens,
+      // #524: seed chat-apc's APC snapshot-retention policy from the latest
+      // authoritative pie `model_status` KV counters. Nil/unknown means the
+      // inferlet must retain rather than guess.
+      kvUsageSnapshot: engineStatusStore.kvUsageSnapshot(for: modelID),
+      // #572: thread the selected profile's output-constraint mode. A "JSON
+      // Think" profile attaches `response_format: json_object` so chat-apc runs
+      // JSON-grammar-constrained decoding; other profiles carry none. Built
+      // here so both the ToT dispatch and the normal send get it. Ordered last
+      // to match the `ChatSendRequestOptions` init parameter order.
+      responseFormat: profileStore.responseFormat(forProfileID: viewModel.selectedProfileID)
+    )
+
+    // #413: when the active profile declares `mode = "tree-of-thought"`,
+    // route the turn to the ToT dispatch (streamed tree search rendered
+    // inline) instead of a chat completion. The launched inferlet is
+    // still chat-apc — ToT is a per-request dispatch mode.
+    // #507: the chat's app-scoped controller — the send outlives this view.
+    let sendController = sendCoordinator.controller(for: chatID)
+
+    // #523 Part B binds the whole profile so the ToT dispatch can source its
+    // candidate-generation temperature from it (`toTRequestSampling` below).
+    if let totProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
+       let totConfig = totProfile.treeOfThought {
+      sendController.sendTreeOfThought(
+        chat: chat,
+        context: modelContext,
+        engine: engineStore.client,
+        config: totConfig,
+        persistenceStatus: persistenceStatus,
+        // #523 Part B: source the ToT candidate-generation temperature from
+        // the profile, not the toolbar default.
+        options: options.withSampling(totProfile.toTRequestSampling)
+      )
+      return
+    }
+
+    // #690: a `mode = "best-of-n"` profile routes the turn to the Best-of-N
+    // dispatch — round 1 generates N candidates the user picks among. Like ToT,
+    // the launched inferlet stays chat-apc; this is a per-request dispatch mode.
+    if let bonProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
+       let bonConfig = bonProfile.bestOfN {
+      sendController.sendBestOfN(
+        chat: chat,
+        context: modelContext,
+        engine: engineStore.client,
+        config: bonConfig,
+        persistenceStatus: persistenceStatus,
+        options: options.withSampling(bonProfile.bestOfNRequestSampling)
+      )
+      return
+    }
+
+    // Capture the profile at send time: a profile swap mid-stream must not
+    // misattribute this turn's terminal `spec_metrics` to the new profile.
+    let metricsProfileID = viewModel.selectedProfileID
     sendController.send(
       chat: chat,
       context: modelContext,
       engine: engineStore.client,
       modelLoadCenter: modelLoadCenter,
       persistenceStatus: persistenceStatus,
-      options: ChatSendRequestOptions(
-        modelID: modelID,
-        sampling: viewModel.sampling,
-        systemPromptOverride: viewModel.systemPromptOverride,
-        // Inject the selected profile's speculative-decoding settings
-        // (#426). For a "Fast Think" profile this makes `makeRequest`
-        // attach the `speculation` field and force greedy decoding; a
-        // normal profile has none, so the request is unchanged.
-        speculation: profileStore.speculation(forProfileID: viewModel.selectedProfileID)
-      ),
+      // Reuses the `options` built above (now carrying #426 speculation +
+      // #572 response_format and the selected profile id for Cacheback
+      // sidecar scoping), so the normal send and the ToT dispatch share one
+      // options value. The forked-resend profile race (#624) is fixed at the
+      // source: the resend `.task` seeds `viewModel.selectedProfileID =
+      // chat.profileID` before calling this, so every profile-derived field
+      // here (sampling, system prompt, speculation, response format) resolves
+      // against the forked chat's real profile.
+      options: options,
       // `EngineStatusStore` conforms to `ChatRecoveryGate`; passing it
       // here lets the send pipeline classify a mid-stream
       // `HTTPEngineError.engineGone` (or a transport throw racing the
       // helper's auto-relaunch) and ride the same chat turn through the
       // recovery without the user re-clicking Send.
-      recoveryGate: engineStatusStore
+      recoveryGate: engineStatusStore,
+      // #621: persist the terminal speculation report against the profile
+      // that issued the turn, so the ProfileEditor badge reflects real runs.
+      onSpecMetrics: { specMetricsStore.record($0, forProfileID: metricsProfileID) }
     )
   }
 
-  private func currentModelID() -> String? {
-    // A resident model only counts when the engine is actually `.running`.
-    // `EngineLifecycle` clears `residentModelID` on the leave-`.running` edge,
-    // but this guard also covers the brief window before that lands — so a
-    // stopped engine yields `needsDefaultLoad`/`noDefault` (an honest "Load
-    // X?" prompt) instead of a send that passes the gate then fails at HTTP.
+  /// #460: resolve the model a send should target from the SINGLE selection
+  /// authority — the chat's pinned `modelID`, or the active profile's
+  /// default when unpinned. The engine must actually be `.running` for the
+  /// selection to count (a stopped engine yields a "Load X?" prompt rather
+  /// than a send that passes the gate then fails at HTTP); `EngineLifecycle`
+  /// clears residency on the leave-`.running` edge; this preflight then
+  /// requires the helper-observed resident model to match the app's target
+  /// before returning a request model id. A mismatch blocks the send and
+  /// synchronizes the engine instead of leaking `model_not_found`.
+  private func currentModelID(for chat: Chat) -> String? {
     let engineRunning: Bool = {
       if case .running = engineStatusStore.status { return true }
       return false
     }()
     return Self.requestModelID(
-      modelOverride: viewModel.modelOverride,
-      residentModelID: engineRunning ? modelLoadCenter.residentModelID : nil,
-      testModelID: ProcessInfo.processInfo.environment["PIE_TEST_CHAT_MODEL"]
+      selectedModelID: engineRunning ? chat.modelID : nil,
+      profileDefaultModel: engineRunning ? selectedProfileDefault : nil,
+      residentModelID: modelLoadCenter.residentModelID
     )
+  }
+
+  private func sendGateDecision(for chat: Chat) -> SendGateDecision {
+    Self.sendGateDecision(
+      engineStatus: engineStatusStore.status,
+      selectedModelID: chat.modelID,
+      profileDefaultModel: selectedProfileDefault,
+      residentModelID: modelLoadCenter.residentModelID)
+  }
+
+  private func handleBlockedSend(draft: String, for chat: Chat) {
+    switch sendGateDecision(for: chat) {
+    case .ready:
+      return
+    case .pinnedModelMismatch(let pinned, let resident):
+      pendingSend.disarm()
+      cancelDeferredEngineSync()
+      pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
+                                                residentModelID: resident)
+    case .noResolvableModel:
+      // #516: capture the blocked send so it can auto-submit once the gate's
+      // load target resolves — the promise the no-model gate's copy makes
+      // ("…to send your message"). The #527 mismatch prompt deliberately does
+      // not arm auto-send: choosing relaunch or resident is an explicit model
+      // identity decision, not permission to send the draft afterwards.
+      pendingSend.arm(chatID: chat.id,
+                      targetModelID: gateTarget(for: chat)?.modelID,
+                      messageText: draft)
+      synchronizeEngineForPendingSend(chat)
+      presentNoModelPrompt()
+    }
+  }
+
+  private func relaunchPinnedMismatch(_ mismatch: PinnedModelMismatch, for chat: Chat) {
+    pinnedModelMismatch = nil
+    // The mismatch prompt is a blocked-send surface, not a permission to
+    // interrupt unrelated chats. Route its Relaunch action through the same
+    // stream-aware, target-bound engine-mutation path as the no-model prompt's
+    // explicit Load button, so a running chat elsewhere defers the restart and
+    // a stale prompt target is dropped before it can mutate the shared engine.
+    guard gateTarget(for: chat)?.modelID == mismatch.pinnedModelID else { return }
+    switch Self.pinnedMismatchRelaunchDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) {
+    case .runNow:
+      loadDefaultModel(mismatch.pinnedModelID, for: chat)
+    case .deferUntilIdle:
+      deferEngineLoadUntilStreamsIdle(mismatch.pinnedModelID, for: chat)
+    }
+  }
+
+  /// #460: durably set (or clear) the chat's selected model — the single
+  /// selection authority. `nil` clears the pin so the chat follows the
+  /// active profile's default again. Does NOT bump `updatedAt` (a config
+  /// edit, like a profile swap — it must not float the chat ahead of
+  /// more-recently-talked chats in the recency-sorted sidebar). Returns
+  /// `true` when the value is durably set (including the no-op case);
+  /// `false` when the save failed. Review F2: on failure use
+  /// `modelContext.rollback()` (like `ChatListView.delete`) so ALL pending
+  /// edits are discarded rather than only field-restoring `modelID` and
+  /// leaving a second pending write to flush later.
+  @discardableResult
+  private func persistChatModel(_ modelID: String?, on chat: Chat) -> Bool {
+    guard chat.modelID != modelID else { return true }
+    chat.modelID = modelID
+    do {
+      try modelContext.save()
+      cancelStaleDeferredEngineMutation(afterTargetChangeFor: chat, newTargetModelID: modelID)
+      return true
+    } catch {
+      modelContext.rollback()
+      persistenceStatus.report(error, context: "ChatScaffoldView.modelSelect")
+      return false
+    }
+  }
+
+  /// #460: persist a profile swap on this chat. The model pin is written
+  /// FIRST and the profile is switched ONLY if it succeeded (review F2 —
+  /// a failed pin must not leave the chat with a switched profile + a
+  /// loaded new model while `modelID` reverts). Returns `false` on a pin
+  /// failure so `ProfileSwapCoordinator.confirm` skips the load; the swap is
+  /// then fully aborted (profile unchanged, no load). A silent / no-default
+  /// swap passes `pinModel == nil` so the chat's current model is PRESERVED.
+  /// The profile change routes through `viewModel.selectedProfileID`, whose
+  /// `.onChange` owns the durable profile write (+ active-profile marker +
+  /// rollback). The preserve-vs-switch policy was already decided in
+  /// `ProfileSwapCoordinator`; this only performs the persistence.
+  private func commitSwap(profileID: String, pinModel: String?, chat: Chat) -> Bool {
+    if let pinModel, !persistChatModel(pinModel, on: chat) {
+      return false  // pin save failed → do NOT switch the profile or load
+    }
+    viewModel.selectedProfileID = profileID
+    return true
+  }
+
+  /// #460 (review F1): pure decision for the residency seed. Adopt the
+  /// served model as this chat's pin ONLY when the chat is unpinned, not
+  /// loading, and the served model is exactly this chat's profile default —
+  /// so the seed never durably pins an unpinned chat to the engine's GLOBAL
+  /// resident model when that differs from the chat's own default. Returns
+  /// the id to pin, or `nil` to leave `modelID` untouched (follow the
+  /// profile default). Static + pure so the matrix is unit-testable without
+  /// a view host.
+  ///
+  /// NOT routed through `ModelTarget.resolve`: this is a seed *guard*
+  /// (unpinned AND served == this chat's default), not a pin-over-default
+  /// pick. `ModelTarget.resolve` models pick → default → nil; folding this
+  /// in would change behavior (it would adopt the pin or a non-default
+  /// served id, the exact F1 defect this guard exists to prevent).
+  static func seededModelID(
+    currentPin: String?,
+    servedID: String?,
+    profileDefault: String?,
+    isLoading: Bool
+  ) -> String? {
+    guard !isLoading else { return nil }          // load in flight → no-op
+    guard currentPin == nil else { return nil }   // already pinned → never overwrite
+    guard let servedID, !servedID.isEmpty else { return nil }
+    guard servedID == profileDefault else { return nil }  // served != this chat's default → don't seed
+    return servedID
   }
 
   /// The active chat profile's default model slug — the ONE definition of
@@ -486,19 +1307,156 @@ struct ChatScaffoldView: View {
     profileStore.model(forProfileID: viewModel.selectedProfileID)
   }
 
+  private var selectedProfileSamplingDefault: ChatSampling {
+    Self.chatSampling(from: profileStore.sampling(forProfileID: viewModel.selectedProfileID))
+  }
+
+  private func clearTransientOverridesForSelectedProfile() {
+    Self.clearTransientOverridesForProfileSwitch(to: viewModel)
+  }
+
+  /// Profile switches reset per-chat toolbar overrides. Profile defaults are
+  /// not copied into cached view-model state; `sendAssistantTurn` resolves them
+  /// from `ProfileStore` at send time so Settings saves affect open chats.
+  static func clearTransientOverridesForProfileSwitch(to viewModel: ChatTranscriptViewModel) {
+    viewModel.samplingOverride = nil
+    viewModel.systemPromptOverride = nil
+  }
+
+  static func resolvedSampling(profileDefault: Sampling?,
+                               transientOverride: ChatSampling?) -> ChatSampling {
+    transientOverride ?? chatSampling(from: profileDefault)
+  }
+
+  static func chatSampling(from sampling: Sampling?) -> ChatSampling {
+    let defaults = sampling ?? Sampling()
+    return ChatSampling(
+      temperature: defaults.temperature,
+      topP: defaults.topP,
+      maxTokens: defaults.maxTokens)
+  }
+
+  static func resolvedSystemPrompt(profileDefault: String?,
+                                   transientOverride: String?) -> String? {
+    let override = transientOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let override, !override.isEmpty { return override }
+    let profile = profileDefault?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return (profile?.isEmpty == false) ? profile : nil
+  }
+
+  /// #496: whether the background-Helper transport axis OWNS the window-level
+  /// status banner right now (it is being repaired or is unreachable, so
+  /// `StatusBannerReducer` surfaces a HELPER banner that outranks the engine
+  /// axis). While it does, the chat body suppresses its in-chat ENGINE banners
+  /// so a dead Helper is attributed to the Helper (one window banner) and never
+  /// re-framed as an engine fault here. Single source of truth with the banner
+  /// itself, so the two surfaces can never disagree.
+  private var helperOwnsStatusBanner: Bool {
+    StatusBannerReducer.helperOwnsBanner(helperHealth.health)
+  }
+
+  /// Profile ids the toolbar picker offers — the SAME set the Settings
+  /// editor lists (every valid `*.toml`), derived live from the store so a
+  /// user can actually switch to a non-`chat` profile (e.g. the seeded
+  /// `tree-of-thought` or a `repeat-boost`). The previous default `["chat"]`
+  /// was never wired to `ProfileStore`, so the picker only ever showed
+  /// `chat`. Re-read each render: `ProfileStore` publishes nothing, but
+  /// this view re-renders on the ~1 Hz engine-status publishes, so a newly
+  /// seeded/edited profile appears without an app restart. Falls back to
+  /// the injected `availableProfiles` (previews/tests) when the store has
+  /// no valid entries yet. The selected id is kept present so the picker
+  /// always offers the active profile even mid-scan.
+  private var pickerProfileIDs: [String] {
+    var ids = profileStore.entries.compactMap { $0.profile?.id }
+    if ids.isEmpty { ids = availableProfiles }
+    if !ids.contains(viewModel.selectedProfileID) {
+      ids.append(viewModel.selectedProfileID)
+    }
+    return ids.sorted()
+  }
+
+  /// #669: the no-model gate, a non-modal floating card over a dimmed
+  /// transcript backdrop. The scrim focuses attention and absorbs stray
+  /// transcript taps, but it is scoped to the transcript overlay — the
+  /// toolbar and menu bar stay live, so the model picker remains a recovery
+  /// path while the gate is up.
+  @ViewBuilder private func noModelGate(for chat: Chat) -> some View {
+    ZStack {
+      Rectangle()
+        .fill(.black.opacity(0.18))
+      noModelPrompt(for: chat)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .shadow(radius: 20)
+    }
+  }
+
+  /// The gate's content. Its lifecycle/availability inputs and every action
+  /// callback are unchanged from the prior `.sheet` presentation — only the
+  /// host (window-modal sheet → non-modal overlay) differs.
+  private func noModelPrompt(for chat: Chat) -> some View {
+    NoModelLoadedPrompt(
+      // #397: the lifecycle state gives the prompt its "starting /
+      // loading…" framing while the engine/model comes up.
+      gateState: chatStartState(for: chat),
+      // #326: the model-availability action (Load / Download /
+      // unavailable) captured when the send was blocked.
+      action: noModelAction(for: chat),
+      onLoad: { model in
+        // #397: ensure the engine is running FIRST, then load — the
+        // pre-#397 `loadDirect` no-opped on a stopped engine. The gate
+        // stays open, reflects busy→ready, and auto-dismisses below.
+        // The common load path defers while any chat is streaming so this
+        // prompt button can't restart the single engine out from under a
+        // sibling chat.
+        loadDefaultModel(model, for: chat)
+      },
+      onDownloaded: {
+        // Model is now on disk — boot the engine on this chat's
+        // profile so it loads (#326 auto-start). The status poll +
+        // model-load indicator surface the rest; the composer
+        // unblocks once the engine serves the model.
+        startEngineForSelectedProfile()
+        showNoModelPrompt = false
+      },
+      // #397 F1: retryable engine failure → re-start the engine.
+      onRetryEngineStart: { startEngineForSelectedProfile() },
+      // #397 F1: helper unreachable → force an immediate status re-poll.
+      onRefresh: { refreshEngineStatus() },
+      onCancel: {
+        // #516: a dismissed gate drops the pending send — the draft stays
+        // in the composer, but nothing auto-fires later.
+        pendingSend.disarm()
+        cancelDeferredEngineSync()
+        showNoModelPrompt = false
+      },
+      engineStatus: engineStatusStore.status,
+      // #516: only promise "…to send your message" when a blocked send is
+      // actually armed to fire (the launch-time prompt raises this same
+      // gate with an empty composer — there, the copy must not lie).
+      willAutoSend: pendingSend.pending != nil
+    )
+  }
+
   /// #397: the live engine/model lifecycle state driving the gate's
   /// "starting / loading…" framing. Folds engine status + helper
   /// reachability + model-load state + the active profile's default into
   /// one explicit state. The model-availability action (Load / Download /
   /// unavailable) stays #326's `MissingModelRecovery`; this only decides
   /// the lifecycle framing (chiefly: is the engine/model still busy?).
-  private var chatStartState: ChatStartGate.State {
+  private func chatStartState(for chat: Chat) -> ChatStartGate.State {
     ChatStartGate.evaluate(
       engineStatus: engineStatusStore.status,
       helperError: engineStatusStore.lastError,
-      load: modelLoadCenter.state,
-      resolvedModelID: currentModelID(),
-      profileDefault: selectedProfileDefault,
+      // #460: the chat's model is per-chat now (`currentModelID(for:)`); #469:
+      // `ChatStartGate.evaluate` no longer takes a `load:` state — the load
+      // state machine is gone (ModelLoadCenter is residency-only).
+      resolvedModelID: currentModelID(for: chat),
+      residentModelID: modelLoadCenter.residentModelID,
+      // The gate names the model the Load tap will BOOT — the chat's pick
+      // when present, not the profile default the boot path would ignore
+      // (#459 repro 1 vs #460's engine-running nil). #497: the full
+      // `ModelTarget` (id + source) so the prompt frames a pin honestly.
+      target: gateTarget(for: chat),
       profileError: profileStore.lastActiveProfileError?.description
     )
   }
@@ -517,8 +1475,8 @@ struct ChatScaffoldView: View {
   /// the shared `ModelDownloadController` and then dismisses on
   /// completion.) The decision itself stays #326's pure
   /// `MissingModelRecovery.promptAction`.
-  private var noModelAction: MissingModelRecovery.PromptAction {
-    Self.availabilityAction(profileDefault: selectedProfileDefault,
+  private func noModelAction(for chat: Chat) -> MissingModelRecovery.PromptAction {
+    Self.availabilityAction(gateModel: gateTarget(for: chat)?.modelID,
                             isModelInstalled: Self.isModelInstalled)
   }
 
@@ -527,8 +1485,10 @@ struct ChatScaffoldView: View {
   /// a view host (and so no stored/memoized copy can hide here): it
   /// re-reads `isModelInstalled` on every call, which is what keeps the
   /// availability axis live per render. `isModelInstalled` is injected so a
-  /// test can drive it; production passes `Self.isModelInstalled`.
-  static func availabilityAction(profileDefault slug: String?,
+  /// test can drive it; production passes `Self.isModelInstalled`. Keys on
+  /// the GATE model (chat pick ?? profile default, `gateTarget`) so the
+  /// install check probes the model the Load/Download will actually use.
+  static func availabilityAction(gateModel slug: String?,
                                  isModelInstalled: (String) -> Bool)
     -> MissingModelRecovery.PromptAction {
     MissingModelRecovery.promptAction(
@@ -536,17 +1496,94 @@ struct ChatScaffoldView: View {
       isInstalled: slug.map(isModelInstalled) ?? false)
   }
 
+  /// The model identity the send GATE describes — mirrors the boot path's
+  /// precedence (`startEngineForSelectedProfile` boots
+  /// `chats.first?.modelID`, falling back to the profile default), so the
+  /// prompt's chip, download CTA, Load action, missing-model banner, and
+  /// launch ask all name the model the tap will actually boot (#459 repro
+  /// 1). #497: returns the full `ModelTarget` (id + provenance) so copy
+  /// can frame a pinned selection honestly. Distinct from
+  /// `currentModelID(for:)`, which deliberately nils the pick while the
+  /// engine isn't `.running` (#460 send-resolution semantics) and so can't
+  /// feed the gate's model-identity axis. Pure + static for SPM-free
+  /// unit-testing of the precedence.
+  static func gateTarget(selectedModelID: String?,
+                         profileDefaultModel: String?) -> ModelTarget? {
+    ModelTarget.resolve(selectedModelID: selectedModelID,
+                        profileDefault: profileDefaultModel)
+  }
+
+  private func gateTarget(for chat: Chat) -> ModelTarget? {
+    Self.gateTarget(selectedModelID: chat.modelID,
+                    profileDefaultModel: selectedProfileDefault)
+  }
+
+  /// #673: decide whether a chat-toolbar profile swap must reload the engine.
+  /// Reuses the model-aware `LocalAPIProfileSwitchGate` (from #654) so the
+  /// chat swap and the Local API panel share ONE relaunch policy. The model
+  /// the new profile would boot is the chat's pin-over-default resolution
+  /// (`ModelTarget.resolve`) — exactly what `startEngineForSelectedProfile`
+  /// boots (`chats.first?.modelID`, else the profile default). A running
+  /// engine serving a DIFFERENT model → `.restart`; same model, stopped, or
+  /// mid-transition → `.selectOnly`/`.reject`, so #3's marker-only-while-
+  /// stopped contract and the same-model no-relaunch invariant both hold.
+  /// Pure + static so the matrix is unit-tested without a view host.
+  static func profileSwapEngineOutcome(
+    newProfileID: String,
+    chatModelID: String?,
+    newProfileDefaultModel: String?,
+    status: EngineStatus,
+    restartInFlight: inout Bool
+  ) -> LocalAPIProfileSwitchGate.Outcome {
+    let selectedModelID = ModelTarget.resolve(
+      selectedModelID: chatModelID,
+      profileDefault: newProfileDefaultModel)?.modelID
+    // F2: a swap to a profile with no resolvable model (nil pin + nil default)
+    // is not a model change — never tear down a running engine for it. The
+    // gate's same-model short-circuit can't fire on a nil id, so guard here
+    // (leaving `LocalAPIView`'s contract untouched) rather than letting it
+    // fall through to `.restart` onto a model-less boot pie would reject.
+    guard selectedModelID != nil else { return .selectOnly }
+    let runtimeProfileID: String?
+    let runtimeModelID: String?
+    if case .running(let snapshot) = status {
+      runtimeProfileID = snapshot.profileID
+      runtimeModelID = snapshot.servedModelID.isEmpty ? nil : snapshot.servedModelID
+    } else {
+      runtimeProfileID = nil
+      runtimeModelID = nil
+    }
+    return LocalAPIProfileSwitchGate.decide(
+      selectedProfileID: newProfileID,
+      selectedModelID: selectedModelID,
+      runtimeProfileID: runtimeProfileID,
+      runtimeModelID: runtimeModelID,
+      state: LocalAPIState.make(status: status, hasActiveProfile: true),
+      restartInFlight: &restartInFlight)
+  }
+
   /// "Load default" action. Honors the no-eager-load invariant — only
   /// runs because the user tapped Load. #397: ensures the engine is
   /// running FIRST (the App's only engine-start path), since a load
   /// against a stopped engine would otherwise just defer on
   /// `engineNotReady`. The sheet stays open and reflects busy→ready, then
-  /// auto-dismisses via `dismissPromptIfResolved`.
-  private func loadDefaultModel(_ model: String) {
+  /// auto-dismisses via `resolutionEdge` (probe-gated — review v3 F9).
+  private func loadDefaultModel(_ model: String, for chat: Chat? = nil) {
+    switch Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) {
+    case .runNow:
+      break
+    case .deferUntilIdle:
+      if let chat {
+        deferEngineLoadUntilStreamsIdle(model, for: chat)
+      }
+      return
+    }
     switch engineStatusStore.status {
     case .running:
-      // Engine up — load the model directly (`/v1/models/load`).
-      swapCoordinator.loadDirect(modelID: model)
+      // Engine up — make it serve this model. #469: a model that differs from
+      // the resident one rebuilds the engine onto it (a live `/v1/models/load`
+      // can't swap the boot model); the already-resident case short-circuits.
+      swapCoordinator.loadDirect(modelID: model, profileID: viewModel.selectedProfileID)
     case .stopped:
       // Bring the engine up bound to this chat's profile; v1 pie loads
       // the profile's model at boot, and `reconcileEngineResidentModel`
@@ -563,41 +1600,384 @@ struct ChatScaffoldView: View {
     }
   }
 
+  /// #528 send preflight: if a user presses Send while the app's target and
+  /// helper resident model disagree, immediately converge the engine onto the
+  /// intended target instead of letting the request reach chat completions and
+  /// fail as `model_not_found`. `PendingAutoSend` still owns the actual submit
+  /// and fires only after residency confirms this target.
+  private func synchronizeEngineForPendingSend(_ chat: Chat) {
+    guard let target = gateTarget(for: chat) else { return }
+    guard pendingSend.pending?.chatID == chat.id else { return }
+    guard currentModelID(for: chat) == nil else { return }
+    guard case .load = Self.availabilityAction(gateModel: target.modelID,
+                                               isModelInstalled: Self.isModelInstalled) else {
+      return
+    }
+    guard Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) == .runNow else {
+      deferEngineSyncUntilStreamsIdle(for: chat)
+      return
+    }
+    if case .running = engineStatusStore.status,
+       modelLoadCenter.residentModelID == nil {
+      Task { @MainActor in
+        await reconcileEngineResidentModel(for: chat)
+        if currentModelID(for: chat) == nil {
+          loadDefaultModel(target.modelID, for: chat)
+        }
+      }
+      return
+    }
+    loadDefaultModel(target.modelID, for: chat)
+  }
+
+  static func shouldDeferEngineSyncForStreams(_ inFlightChatIDs: Set<UUID>) -> Bool {
+    !inFlightChatIDs.isEmpty
+  }
+
+  enum EngineMutationDecision: Equatable {
+    case runNow
+    case deferUntilIdle
+  }
+
+  static func engineMutationDecision(inFlightChatIDs: Set<UUID>) -> EngineMutationDecision {
+    shouldDeferEngineSyncForStreams(inFlightChatIDs) ? .deferUntilIdle : .runNow
+  }
+
+  static func pinnedMismatchRelaunchDecision(inFlightChatIDs: Set<UUID>) -> EngineMutationDecision {
+    engineMutationDecision(inFlightChatIDs: inFlightChatIDs)
+  }
+
+  /// #673: a chat-toolbar profile swap that changes the served model relaunches
+  /// the single, app-scoped engine — the same stream-defer invariant as the
+  /// pinned-mismatch relaunch (F1). A chat streaming elsewhere defers it.
+  static func profileSwapRelaunchDecision(inFlightChatIDs: Set<UUID>) -> EngineMutationDecision {
+    engineMutationDecision(inFlightChatIDs: inFlightChatIDs)
+  }
+
+  private func deferEngineSyncUntilStreamsIdle(for chat: Chat) {
+    guard deferredEngineSyncTask == nil else { return }
+    deferredEngineSyncTask = Task { @MainActor in
+      defer { deferredEngineSyncTask = nil }
+      while Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) == .deferUntilIdle {
+        do {
+          try await Task.sleep(nanoseconds: 250_000_000)
+        } catch {
+          return
+        }
+      }
+      synchronizeEngineForPendingSend(chat)
+    }
+  }
+
+  struct DeferredEngineMutation: Equatable {
+    let chatID: UUID
+    let targetModelID: String
+    let generation: Int
+
+    static func explicitLoad(chatID: UUID,
+                             targetModelID: String,
+                             generation: Int) -> DeferredEngineMutation {
+      DeferredEngineMutation(chatID: chatID, targetModelID: targetModelID, generation: generation)
+    }
+  }
+
+  enum DeferredEngineMutationResolution: Equatable {
+    case drop
+    case run(modelID: String)
+  }
+
+  static func deferredEngineMutationResolution(
+    queued: DeferredEngineMutation,
+    currentChatID: UUID,
+    currentTargetModelID: String?
+  ) -> DeferredEngineMutationResolution {
+    guard queued.chatID == currentChatID else { return .drop }
+    guard let currentTargetModelID, !currentTargetModelID.isEmpty else { return .drop }
+    guard currentTargetModelID == queued.targetModelID else { return .drop }
+    return .run(modelID: queued.targetModelID)
+  }
+
+  static func replacingDeferredEngineMutation(
+    current: DeferredEngineMutation?,
+    replacement: DeferredEngineMutation
+  ) -> DeferredEngineMutation {
+    replacement
+  }
+
+  private func deferEngineLoadUntilStreamsIdle(_ model: String, for chat: Chat) {
+    deferredEngineMutationGeneration += 1
+    let queued = DeferredEngineMutation.explicitLoad(
+      chatID: chat.id,
+      targetModelID: model,
+      generation: deferredEngineMutationGeneration)
+    deferredEngineMutation = Self.replacingDeferredEngineMutation(
+      current: deferredEngineMutation,
+      replacement: queued)
+    deferredEngineSyncTask?.cancel()
+    deferredEngineSyncTask = Task { @MainActor in
+      defer { deferredEngineSyncTask = nil }
+      while Self.engineMutationDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) == .deferUntilIdle {
+        do {
+          try await Task.sleep(nanoseconds: 250_000_000)
+        } catch {
+          return
+        }
+      }
+      guard deferredEngineMutation == queued else { return }
+      deferredEngineMutation = nil
+      switch Self.deferredEngineMutationResolution(
+        queued: queued,
+        currentChatID: chat.id,
+        currentTargetModelID: gateTarget(for: chat)?.modelID
+      ) {
+      case .drop:
+        break
+      case .run(let modelID):
+        loadDefaultModel(modelID, for: chat)
+      }
+    }
+  }
+
+  private func cancelDeferredEngineSync() {
+    deferredEngineSyncTask?.cancel()
+    deferredEngineSyncTask = nil
+    deferredEngineMutation = nil
+  }
+
+  private func cancelStaleDeferredEngineMutation(afterTargetChangeFor chat: Chat,
+                                                 newTargetModelID: String?) {
+    guard let queued = deferredEngineMutation, queued.chatID == chat.id else { return }
+    let currentTarget = Self.gateTarget(selectedModelID: newTargetModelID,
+                                        profileDefaultModel: selectedProfileDefault)?.modelID
+    guard currentTarget != queued.targetModelID else { return }
+    cancelDeferredEngineSync()
+  }
+
   /// #397 F1: re-poll the helper after an unreachable-transport failure.
   /// The 1 Hz loop would catch up anyway; this makes Retry immediate.
   private func refreshEngineStatus() {
-    Task { @MainActor in
-      _ = try? await engineStatusStore.refresh()
-    }
+    Task { await engineCoordinator.refreshStatus() }
   }
 
-  /// #397: close the gate once a model resolves so the user lands back at
-  /// the composer with their draft intact.
-  private func dismissPromptIfResolved() {
-    if showNoModelPrompt, currentModelID() != nil {
+
+  /// #516 review F8: the bounded reconcile-failure policy. Without a
+  /// pending send there is nothing to settle (the pre-existing NSLog
+  /// behavior stands — surfacing the failure in the gate UI is the
+  /// deferred FC1). With one armed: first pass earns a backed-off retry;
+  /// the final failure explicitly terminates the pending flow instead of
+  /// holding forever on equal `.running` polls that will not re-run reconcile.
+  enum ReconcileFailureStep: Equatable {
+    case none, retry, fallbackEdge
+  }
+
+  static func reconcileFailureStep(hasPendingAutoSend: Bool,
+                                   isRetryPass: Bool) -> ReconcileFailureStep {
+    guard hasPendingAutoSend else { return .none }
+    return isRetryPass ? .fallbackEdge : .retry
+  }
+
+  /// #516 review F6: what a resolution edge may treat as resolved. On the
+  /// STATUS edge (`requiresResidency: true`) the selection authority is
+  /// still pre-reconcile — `chat.modelID`/profile default can name model A
+  /// while the engine just came up serving model B (helper auto-relaunch
+  /// boots the active-profile marker's model) — so until
+  /// `residentModelID` is reconciled nothing counts as resolved; the
+  /// post-reconcile residency/`chat.modelID` edges then deliver the real
+  /// fire-or-disarm. Pure + static so the ordering matrix is unit-tested.
+  static func resolutionProbe(resolvedModelID: String?,
+                              residentModelID: String?,
+                              requiresResidency: Bool) -> String? {
+    guard let resolvedModelID, !resolvedModelID.isEmpty else { return nil }
+    if let residentModelID {
+      guard residentModelID == resolvedModelID else { return nil }
+    } else if requiresResidency {
+      return nil
+    }
+    return resolvedModelID
+  }
+
+  enum PendingSettlementResolution: Equatable {
+    case hold
+    case disarm
+    case model(String)
+  }
+
+  static func pendingSettlementResolution(currentTargetModelID: String?,
+                                          pendingTargetModelID: String?,
+                                          residentModelID: String?) -> PendingSettlementResolution {
+    guard let pendingTargetModelID, !pendingTargetModelID.isEmpty else { return .hold }
+    guard let currentTargetModelID, !currentTargetModelID.isEmpty else { return .disarm }
+    guard currentTargetModelID == pendingTargetModelID else { return .disarm }
+    guard let residentModelID, !residentModelID.isEmpty else { return .hold }
+    return .model(residentModelID)
+  }
+
+  private func terminatePendingSendAfterReconcileFailure(for chat: Chat) {
+    pendingSend.terminate(chatID: chat.id)
+  }
+
+  /// #516: a model-resolution edge (residency reconciled, or the chat's
+  /// selection re-seeded to the served model). Closes the gate (#397) and
+  /// settles any armed pending send: fire it through the composer when the
+  /// INTENDED model resolved, drop it when a different one did (the user
+  /// switched model/profile mid-load), keep holding otherwise.
+  ///
+  /// `requiresResidency` — true ONLY for the engine-status edge, which can
+  /// arrive before `reconcileEngineResidentModel` re-seeds the selection
+  /// authority (review F6, see `resolutionProbe`). No default: every new
+  /// edge must decide explicitly.
+  private func resolutionEdge(for chat: Chat, requiresResidency: Bool) {
+    let resolved = Self.resolutionProbe(
+      resolvedModelID: currentModelID(for: chat),
+      residentModelID: modelLoadCenter.residentModelID,
+      requiresResidency: requiresResidency)
+    let pendingResolution = Self.pendingSettlementResolution(
+      currentTargetModelID: gateTarget(for: chat)?.modelID,
+      pendingTargetModelID: pendingSend.pending?.targetModelID,
+      residentModelID: modelLoadCenter.residentModelID)
+    // #397: close the gate once a model resolves so the user lands back at
+    // the composer with their draft intact. Review v3 F9: dismissal stays
+    // keyed on the send-safe probe — on a residency-required edge the sheet
+    // must not flash the dismiss-success signal while pending settlement is
+    // still waiting for resident evidence.
+    if showNoModelPrompt, resolved != nil {
       showNoModelPrompt = false
     }
+    // Settle the pending: fire-once (cleared before the signal so
+    // re-entrant edges can never double-send), disarm on stale, else hold.
+    // The transition bookkeeping lives in `PendingSendState` (tested).
+    switch pendingResolution {
+    case .hold:
+      pendingSend.settle(chatID: chat.id,
+                         resolvedModelID: nil,
+                         isSending: sendCoordinator.isInFlight(chatID))
+    case .disarm:
+      pendingSend.disarm()
+    case .model(let modelID):
+      pendingSend.settle(chatID: chat.id,
+                         resolvedModelID: modelID,
+                         isSending: sendCoordinator.isInFlight(chatID))
+    }
   }
 
-  /// Resolve the model a send should target. : no hidden fallback —
-  /// when the user has set no per-chat override and nothing is resident,
-  /// this returns nil and the caller blocks the send behind the
-  /// no-model confirm rather than asking the engine to load something
-  /// the user never chose.
+  /// Resolve the model a send may target only when the chat's SELECTION
+  /// authority (#460) and the helper-observed resident engine state agree.
+  /// The app target is still the explicit pin (`selectedModelID` =
+  /// `Chat.modelID`) else the active profile's default; residency is the
+  /// separate engine fact that proves the running helper can serve it. Nil
+  /// means the caller blocks the send and synchronizes the engine first.
+  ///
+  /// Pin-over-default precedence routes through the one derivation
+  /// (`ModelTarget.resolve`) so the send path can never disagree with the
+  /// gate/launch path about which model the chat means. GUI tests reach this
+  /// path the same way a user does — a pinned `Chat.modelID` and a running
+  /// engine — never a parallel send-model override (#504 retired the
+  /// `PIE_TEST_CHAT_MODEL` bypass).
   static func requestModelID(
-    modelOverride: String?,
-    residentModelID: String?,
-    testModelID: String? = nil
+    selectedModelID: String?,
+    profileDefaultModel: String?,
+    residentModelID: String?
   ) -> String? {
-    if let testModel = testModelID, !testModel.isEmpty {
-      return testModel
+    EngineRequestSync(
+      target: ModelTarget.resolve(selectedModelID: selectedModelID,
+                                  profileDefault: profileDefaultModel),
+      resident: EngineResidentState(modelID: residentModelID)
+    ).resolvedModelID
+  }
+
+  /// #527: final send gate for model identity. The selection authority remains
+  /// `Chat.modelID` (or profile default when unpinned), but a known resident
+  /// engine model is an execution precondition: an explicit per-chat pin that
+  /// differs from `residentModelID` is guaranteed to be rejected by the engine,
+  /// so block and ask instead of surfacing a bare model_not_found after send.
+  ///
+  /// Explicit pins get the user-facing mismatch prompt. Unpinned
+  /// profile-default-vs-resident gaps fall through to `.noResolvableModel`,
+  /// where the request/resident sync path can converge the engine before send.
+  static func sendGateDecision(
+    engineStatus: EngineStatus,
+    selectedModelID: String?,
+    profileDefaultModel: String?,
+    residentModelID: String?
+  ) -> SendGateDecision {
+    guard case .running = engineStatus else { return .noResolvableModel }
+    guard ModelTarget.resolve(selectedModelID: selectedModelID,
+                              profileDefault: profileDefaultModel) != nil else {
+      return .noResolvableModel
     }
-    if let modelOverride, !modelOverride.isEmpty {
-      return modelOverride
+
+    let selected = selectedModelID?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let resident = residentModelID?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let selected, !selected.isEmpty,
+       let resident, !resident.isEmpty,
+       selected != resident {
+      return .pinnedModelMismatch(pinnedModelID: selected,
+                                  residentModelID: resident)
     }
-    if let residentModelID, !residentModelID.isEmpty {
-      return residentModelID
+    guard let resolved = requestModelID(selectedModelID: selectedModelID,
+                                        profileDefaultModel: profileDefaultModel,
+                                        residentModelID: residentModelID) else {
+      return .noResolvableModel
     }
-    return nil
+    return .ready(modelID: resolved)
+  }
+}
+
+struct PinnedModelMismatchPrompt: View {
+  let mismatch: ChatScaffoldView.PinnedModelMismatch
+  let onRelaunchPinned: () -> Void
+  let onUseResident: () -> Void
+  let onCancel: () -> Void
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 14) {
+      HStack(spacing: 8) {
+        Image(systemName: "exclamationmark.triangle")
+          .foregroundStyle(.orange)
+        Text("Switch model before sending?")
+          .font(.headline)
+      }
+      Text("This chat is pinned to a different model than the engine is currently serving. Choose which model should be used before sending.")
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+      Divider()
+      modelRow(label: "Pinned chat model", modelID: mismatch.pinnedModelID)
+      modelRow(label: "Resident engine model", modelID: mismatch.residentModelID)
+      HStack {
+        Button("Cancel", role: .cancel) { onCancel() }
+          .keyboardShortcut(.cancelAction)
+        Spacer()
+        Button("Use \(Self.leaf(mismatch.residentModelID)) for this chat") {
+          onUseResident()
+        }
+        .accessibilityIdentifier("pinnedModelMismatch.useResident")
+        Button("Relaunch engine with \(Self.leaf(mismatch.pinnedModelID))") {
+          onRelaunchPinned()
+        }
+        .keyboardShortcut(.defaultAction)
+        .accessibilityIdentifier("pinnedModelMismatch.relaunchPinned")
+      }
+    }
+    .padding(18)
+    .frame(width: 420)
+    .accessibilityIdentifier("pinnedModelMismatch.prompt")
+  }
+
+  private func modelRow(label: String, modelID: String) -> some View {
+    VStack(alignment: .leading, spacing: 2) {
+      Text(label)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+      Text(modelID)
+        .font(.body.weight(.medium))
+        .lineLimit(2)
+        .truncationMode(.middle)
+        .textSelection(.enabled)
+    }
+  }
+
+  private static func leaf(_ modelID: String) -> String {
+    ModelDisplayName.leaf(modelID)
   }
 }

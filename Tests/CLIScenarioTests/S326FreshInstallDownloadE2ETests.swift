@@ -133,7 +133,6 @@ final class S326FreshInstallDownloadE2ETests: XCTestCase {
       profileStore: store,
       pieBinary: { pieBin },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { (wasm: wasm, manifest: manifest) },
       pieHome: { self.shortPieHome },
       subprocessEnvironment: { SpawnEnvSanitizer.sanitize(env) }
@@ -149,7 +148,9 @@ final class S326FreshInstallDownloadE2ETests: XCTestCase {
     let statusStore = EngineStatusStore(client: client)
     // Kick the start exactly as ChatScaffoldView does after a download.
     // EngineStatusStore.startEngine swallows the reply-timeout (the helper
-    // only replies after the launch handshake) and a real .alreadyRunning.
+    // only replies after the launch handshake). Same-profile idempotency is
+    // handled inside HelperExportedAPI/PieEngineHost.startOrAttach; any
+    // .alreadyRunning that reaches the app is an incompatible-start conflict.
     try await statusStore.startEngine(profileID: "chat")
 
     // Poll engineStatus over the real XPC wire until .running (model load +
@@ -158,8 +159,8 @@ final class S326FreshInstallDownloadE2ETests: XCTestCase {
     let runningDeadline = Date().addingTimeInterval(120)
     while Date() < runningDeadline {
       let status = try await statusStore.refresh()
-      if case .running(let p, _) = status {
-        port = Int(p)
+      if case .running(let snap) = status {
+        port = Int(snap.port)
         break
       }
       if case .failed(let code, let message) = status {

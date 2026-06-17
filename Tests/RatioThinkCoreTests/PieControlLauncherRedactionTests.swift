@@ -24,6 +24,16 @@ final class PieControlLauncherRedactionTests: XCTestCase {
     XCTAssertEqual(LaunchedSession.redactToken(in: raw), raw)
   }
 
+  func test_controlAddressParsesLegacyServingMarker() {
+    let raw = "pie-server serving on 127.0.0.1:59165 (1 model(s))"
+    XCTAssertEqual(LaunchedSession.controlAddress(from: raw), "127.0.0.1:59165")
+  }
+
+  func test_controlAddressParsesUpstreamServerReadyWebSocketMarker() {
+    let raw = "✓ Server ready at ws://127.0.0.1:63431"
+    XCTAssertEqual(LaunchedSession.controlAddress(from: raw), "127.0.0.1:63431")
+  }
+
   func test_redactsEachTokenWhenMultiplePerLine() {
     let raw = "internal token: AAA followed by internal token: BBB"
     let redacted = LaunchedSession.redactToken(in: raw)

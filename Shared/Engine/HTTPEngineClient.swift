@@ -18,7 +18,6 @@ import Foundation
 ///   then OpenAI `chat.completion.chunk` frames, terminating with
 ///   `data: [DONE]`. `model_loading` meta-frames are tolerated but
 ///   absent in v1 (pie loads at boot).
-/// * `POST /v1/models/load` → SSE: `{"event":"model_ready"}` + `[DONE]`.
 /// * `POST /v1/inferlet` → routes through chat-completions for the
 ///   only registered name (`chat-apc`); dispatch surfaces the raw
 ///   SSE `data:` bytes per frame to the consumer.
@@ -47,7 +46,7 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
 
   /// Async resolver for the engine's loopback root. Resolved lazily
   /// per request because the pie daemon's listener port is only known
-  /// after `PieSupervisor` reports `EngineStatus.running(port:_)` over
+  /// after `PieEngineHost` reports `EngineStatus.running(port:_)` over
   /// XPC — the GUI's main scene constructs `HTTPEngineClient` before
   /// that handshake completes. Tests pass a static-URL convenience
   /// (`init(baseURL:)`) that wraps a never-throwing closure.
@@ -144,19 +143,6 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
 
   // MARK: - EngineClient: streaming
 
-  public func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    let body: Data
-    do {
-      body = try encoder.encode(LoadRequestBody(model: id))
-    } catch {
-      return AsyncThrowingStream { $0.finish(throwing: error) }
-    }
-    return loadStream(buildRequest: {
-      try await self.makeRequest("/v1/models/load", method: "POST", body: body,
-                                 timeout: Self.streamingIdleTimeout)
-    })
-  }
-
   public func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     let body: Data
     do {
@@ -177,6 +163,26 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
     } catch {
       return AsyncThrowingStream { $0.finish(throwing: error) }
     }
+    // Transport decision (#703): `/v1/inferlet` CONTROL calls (`stream: false`,
+    // e.g. Best-of-N snapshot release) get a UNARY buffered response, not SSE.
+    // The inferlet returns a plain `application/json` ack, and the pie host
+    // proxies the guest's `wasi:http` response verbatim, so a `stream: false`
+    // request already comes back as one complete unary body. Routing it
+    // through the SSE frame reader would strip it (only `data:`-prefixed lines
+    // survive) and the caller would see zero frames — so read the body whole
+    // and hand it back as the stream's single frame. Generative calls
+    // (`stream: true`) keep the SSE path. The `req.stream` flag already rides
+    // the wire as the caller's intent, so this is the transport switch for
+    // control ops — but note (review F3) the unary path's single connect-loss
+    // retry below is sound ONLY for IDEMPOTENT control ops (today: release,
+    // where re-deleting reports `absent`). A future NON-idempotent control op
+    // must opt out of that retry before routing here, or it could double-execute.
+    if !req.stream {
+      return dispatchUnary(buildRequest: {
+        try await self.makeRequest("/v1/inferlet", method: "POST", body: body,
+                                   timeout: self.unaryTimeout)
+      })
+    }
     return dispatchStream(buildRequest: {
       try await self.makeRequest("/v1/inferlet", method: "POST", body: body,
                                  timeout: Self.streamingIdleTimeout)
@@ -184,49 +190,6 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
   }
 
   // MARK: - Stream implementations
-
-  private func loadStream(
-    buildRequest: @escaping @Sendable () async throws -> URLRequest
-  ) -> AsyncThrowingStream<LoadEvent, Error> {
-    let session = self.session
-    let decoder = self.decoder
-    return AsyncThrowingStream { continuation in
-      let task = Task {
-        do {
-          let request = try await buildRequest()
-          let (bytes, response) = try await session.bytes(for: request)
-          try await Self.assertOK(response, bytes: bytes)
-          for try await frame in HTTPEngineClient.sseFrames(from: bytes) {
-            if frame.isDone { break }
-            try Task.checkCancellation()
-            let meta = try decoder.decode(MetaFrame.self, from: frame.dataBytes)
-            switch meta.event {
-            case "model_ready":
-              continuation.yield(.ready)
-            case "model_loading":
-              continuation.yield(.loading(
-                loadedBytes: meta.loaded_bytes ?? 0,
-                totalBytes: meta.total_bytes ?? 0,
-                etaSeconds: meta.eta_s
-              ))
-            case "error":
-              throw HTTPEngineError.stream(
-                code: meta.code ?? "unknown_error",
-                message: meta.message ?? "")
-            default:
-              // Tolerate unknown meta-events: a future engine extension
-              // shouldn't kill the load stream.
-              continue
-            }
-          }
-          continuation.finish()
-        } catch {
-          continuation.finish(throwing: error)
-        }
-      }
-      continuation.onTermination = { _ in task.cancel() }
-    }
-  }
 
   private func chatStream(
     buildRequest: @escaping @Sendable () async throws -> URLRequest
@@ -236,9 +199,7 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
     return AsyncThrowingStream { continuation in
       let task = Task {
         do {
-          let request = try await buildRequest()
-          let (bytes, response) = try await session.bytes(for: request)
-          try await Self.assertOK(response, bytes: bytes)
+          let bytes = try await Self.openStream(session: session, buildRequest: buildRequest)
           var emittedFinish = false
           for try await frame in HTTPEngineClient.sseFrames(from: bytes) {
             if frame.isDone { break }
@@ -266,6 +227,15 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
                 throw HTTPEngineError.stream(
                   code: meta.code ?? "unknown_error",
                   message: meta.message ?? "")
+              case "generation_metrics":
+                let meta = try decoder.decode(GenerationMetricsFrame.self, from: frame.dataBytes)
+                continuation.yield(.generationMetrics(meta.metrics))
+              case "spec_metrics":
+                // Terminal speculation report (#418/#621). Arrives after
+                // the `.finish` chunk and before `[DONE]`. Strict decode so
+                // a wire-schema drift surfaces instead of vanishing.
+                let metrics = try decoder.decode(SpecMetricsFrame.self, from: frame.dataBytes)
+                continuation.yield(.specMetrics(metrics.toModel()))
               default:
                 continue
               }
@@ -321,9 +291,7 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
     return AsyncThrowingStream { continuation in
       let task = Task {
         do {
-          let request = try await buildRequest()
-          let (bytes, response) = try await session.bytes(for: request)
-          try await Self.assertOK(response, bytes: bytes)
+          let bytes = try await Self.openStream(session: session, buildRequest: buildRequest)
           for try await frame in HTTPEngineClient.sseFrames(from: bytes) {
             if frame.isDone { break }
             try Task.checkCancellation()
@@ -335,6 +303,83 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
         }
       }
       continuation.onTermination = { _ in task.cancel() }
+    }
+  }
+
+  /// Unary `/v1/inferlet` dispatch (#703): buffer the full `application/json`
+  /// body and yield it as the stream's single frame, so a control inferlet's
+  /// non-SSE ack survives the `AsyncThrowingStream<Data, Error>` contract that
+  /// `dispatchInferlet` shares with the streaming path. Callers consume both
+  /// transports identically — one or many `Data` frames.
+  ///
+  /// Mirrors `openStream`'s single connection-lost retry: a `POST` reusing a
+  /// stale pooled keep-alive connection fails with `networkConnectionLost`
+  /// (-1005) and URLSession does not auto-retry POSTs. The retry is sound ONLY
+  /// for an IDEMPOTENT control op (review F3): `networkConnectionLost` can fire
+  /// AFTER the server already acted, not only at connect, so a non-idempotent
+  /// op could double-execute. Today's sole caller (release) is idempotent —
+  /// re-deleting reports `absent` — so the replay is harmless. A future
+  /// non-idempotent control op must opt out of this retry before routing here.
+  private func dispatchUnary(
+    buildRequest: @escaping @Sendable () async throws -> URLRequest
+  ) -> AsyncThrowingStream<Data, Error> {
+    let session = self.session
+    return AsyncThrowingStream { continuation in
+      let task = Task {
+        do {
+          func attempt() async throws -> (Data, URLResponse) {
+            try await session.data(for: try await buildRequest())
+          }
+          let (data, response): (Data, URLResponse)
+          do {
+            (data, response) = try await attempt()
+          } catch let error as URLError where error.code == .networkConnectionLost {
+            (data, response) = try await attempt()
+          }
+          try Self.assertOK(response, data: data)
+          continuation.yield(data)
+          continuation.finish()
+        } catch {
+          continuation.finish(throwing: error)
+        }
+      }
+      continuation.onTermination = { _ in task.cancel() }
+    }
+  }
+
+  /// Open a streaming response, retrying ONCE on a connection-lost error
+  /// raised at connect time (before any SSE byte arrives).
+  ///
+  /// `URLSession` pools HTTP/1.1 keep-alive connections on the shared
+  /// `defaultSession`. When the engine has closed an idle pooled
+  /// connection between requests, a reused request fails with
+  /// `URLError.networkConnectionLost` (-1005). URLSession transparently
+  /// retries this on a fresh connection for idempotent GETs, but NOT for
+  /// POSTs — so our streaming POSTs (`/v1/inferlet`,
+  /// `/v1/chat/completions`) would otherwise surface a spurious failure
+  /// to the caller (a failed chat send; a trapped E2E harness). Because
+  /// the failure happens before `bytes` yields any frame, a single
+  /// fresh-connection retry is side-effect-safe: nothing was emitted, and
+  /// rebuilding the request reopens the connection.
+  ///
+  /// A *mid-stream* drop is deliberately NOT retried here — it surfaces to
+  /// the caller, because re-running a partially-consumed stream could
+  /// duplicate side effects. (The engine does not drop mid-stream; the
+  /// only observed real-world -1005 is stale keep-alive reuse at connect.)
+  private static func openStream(
+    session: URLSession,
+    buildRequest: @escaping @Sendable () async throws -> URLRequest
+  ) async throws -> URLSession.AsyncBytes {
+    func attempt() async throws -> URLSession.AsyncBytes {
+      let request = try await buildRequest()
+      let (bytes, response) = try await session.bytes(for: request)
+      try await assertOK(response, bytes: bytes)
+      return bytes
+    }
+    do {
+      return try await attempt()
+    } catch let error as URLError where error.code == .networkConnectionLost {
+      return try await attempt()
     }
   }
 
@@ -586,13 +631,6 @@ private struct ModelListResponse: Decodable {
   let data: [ModelInfo]
 }
 
-/// Body of `POST /v1/models/load`. Single-field carrier so the
-/// `encoder.encode(LoadRequestBody)` call produces `{"model":"…"}`
-/// without a positional-arg `[String: String]` literal.
-private struct LoadRequestBody: Encodable {
-  let model: String
-}
-
 /// OpenAI-shape error envelope: `{"error":{"type","code","message","param"}}`.
 /// The chat-apc inferlet emits this on every 4xx/5xx HTTP body
 /// (`Inferlets/chat-apc/src/sse.rs::json_error`). Only `code`/`message`
@@ -619,6 +657,48 @@ private struct MetaFrame: Decodable {
   let eta_s: Double?
 }
 
+/// Strict `generation_metrics` SSE contract. Unlike best-effort generic
+/// meta frames, malformed performance data must fail at the stream
+/// boundary; otherwise protocol drift becomes indistinguishable from a
+/// historical row that intentionally lacks metrics.
+private struct GenerationMetricsFrame: Decodable {
+  let outputTokens: Int
+  let elapsedSeconds: Double
+  let tokensPerSecond: Double
+
+  var metrics: GenerationMetrics {
+    GenerationMetrics(
+      outputTokens: outputTokens,
+      elapsedSeconds: elapsedSeconds,
+      tokensPerSecond: tokensPerSecond
+    )
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case outputTokens = "output_tokens"
+    case elapsedSeconds = "elapsed_s"
+    case tokensPerSecond = "tokens_per_sec"
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    outputTokens = try container.decode(Int.self, forKey: .outputTokens)
+    elapsedSeconds = try container.decode(Double.self, forKey: .elapsedSeconds)
+    tokensPerSecond = try container.decode(Double.self, forKey: .tokensPerSecond)
+
+    guard outputTokens > 0,
+          elapsedSeconds > 0,
+          elapsedSeconds.isFinite,
+          tokensPerSecond > 0,
+          tokensPerSecond.isFinite else {
+      throw DecodingError.dataCorrupted(.init(
+        codingPath: decoder.codingPath,
+        debugDescription: "generation_metrics values must be finite and positive"
+      ))
+    }
+  }
+}
+
 /// `chat.completion.chunk` body per OpenAI's streaming schema. Only
 /// fields the GUI actually consumes are decoded; `id` / `object` /
 /// `created` / `model` are dropped at the JSON layer since `Decodable`
@@ -640,6 +720,40 @@ private struct ChunkDelta: Decodable {
   /// (which carry no `content`); decoded so the GUI can surface it on a
   /// separate channel instead of dropping it.
   let reasoning_content: String?
+}
+
+/// Terminal `spec_metrics` SSE frame (chat-apc #418, `SpecMetricsReport`
+/// flattened under `{"event":"spec_metrics", …}`). Snake-case wire keys
+/// map straight to `SpecMetrics`. Decoded strictly: a schema drift surfaces
+/// as a thrown stream error rather than a silently-dropped metric.
+private struct SpecMetricsFrame: Decodable {
+  let enabled: Bool
+  let fallback_reason: String?
+  let generated_tokens: Int
+  let decode_steps: Int
+  let proposed_draft_tokens: Int
+  let accepted_draft_tokens: Int
+  let rejected_draft_tokens: Int
+  let avg_tokens_per_step: Double
+  let decode_tokens_per_sec: Double
+  let leader_len: Int
+  let draft_len: Int
+
+  func toModel() -> SpecMetrics {
+    SpecMetrics(
+      enabled: enabled,
+      fallbackReason: fallback_reason,
+      generatedTokens: generated_tokens,
+      decodeSteps: decode_steps,
+      proposedDraftTokens: proposed_draft_tokens,
+      acceptedDraftTokens: accepted_draft_tokens,
+      rejectedDraftTokens: rejected_draft_tokens,
+      avgTokensPerStep: avg_tokens_per_step,
+      decodeTokensPerSec: decode_tokens_per_sec,
+      leaderLen: leader_len,
+      draftLen: draft_len
+    )
+  }
 }
 
 // MARK: - Errors
@@ -672,7 +786,7 @@ public enum HTTPEngineError: Error, Equatable, Sendable {
   /// failure.
   case stream(code: String, message: String)
   /// The `baseURLProvider` reported the engine has no loopback URL
-  /// yet (e.g. `PieSupervisor` is still in `.starting`). Surface this
+  /// yet (e.g. `PieEngineHost` is still in `.starting`). Surface this
   /// as a distinct case so views can render "engine not ready" rather
   /// than a generic network failure.
   case engineNotReady(detail: String)
@@ -722,8 +836,8 @@ extension HTTPEngineError: LocalizedError, CustomStringConvertible {
 
 extension HTTPEngineError {
   /// #2: the engine answered but rejected the request because it does not
-  /// serve the requested model — pie's `/v1/chat/completions` (or
-  /// `/v1/models/load`) returns `model_not_found`, on the pre-stream
+  /// serve the requested model — pie's `/v1/chat/completions` returns
+  /// `model_not_found`, on the pre-stream
   /// `.api` envelope or the mid-stream `.stream` meta-frame. The single
   /// signal the plain "Model X isn’t installed — …" copy keys on, so a
   /// chatting user sees one actionable line instead of the raw

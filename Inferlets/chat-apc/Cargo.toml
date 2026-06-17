@@ -2,10 +2,22 @@
 name = "chat-apc"
 version = "0.1.0"
 edition = "2024"
-description = "Chat-API + control-plane inferlet (HTTP): /healthz, /v1/models, /v1/chat/completions, /v1/inferlet, /v1/models/load"
+description = "Chat-API + control-plane inferlet (HTTP): /healthz, /v1/models, /v1/chat/completions, /v1/inferlet"
 
 [lib]
 crate-type = ["cdylib"]
+
+[features]
+# #458 — gate the non-default tree-of-thought execution strategies
+# (concurrent generation / phased scoring) behind a build flag. They are a
+# benchmark/debug apparatus measured as no-win, so production builds (default,
+# feature OFF) accept only the default `coupled_sequential` on the public
+# `/v1/inferlet` input and REJECT any non-default `exec`. The benchmark and
+# real-engine strategy e2e build with `--features exec-strategies` to drive
+# every variant. The feature changes ONLY the input-acceptance gate in
+# `tot::schema::resolve`; the execution code paths are identical, so a feature
+# build's `coupled_sequential` is byte-identical to production.
+exec-strategies = []
 
 [dependencies]
 wstd = "0.5.6"
@@ -15,6 +27,7 @@ wstd = "0.5.6"
 inferlet = { path = "../../Vendor/pie/sdk/rust/inferlet" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 # Concurrent per-level branch generation in the tree-of-thought mode
 # (`futures::future::join_all`), mirroring Vendor/pie's tree-of-thought
 # example. Already present transitively in Cargo.lock.

@@ -19,8 +19,8 @@ settings:
     # GENERATE_INFOPLIST_FILE=YES synthesizes CFBundleShortVersionString /
     # CFBundleVersion from these build settings; without them the version
     # keys in each target's info.properties are dropped from the built bundle.
-    MARKETING_VERSION: "0.1.1"
-    CURRENT_PROJECT_VERSION: "2"
+    MARKETING_VERSION: "0.1.5"
+    CURRENT_PROJECT_VERSION: "6"
     ENABLE_HARDENED_RUNTIME: NO
     DEAD_CODE_STRIPPING: YES
   configs:
@@ -113,7 +113,7 @@ targets:
     # "resource added that did not exist at signing". The App's Help → Collect
     # Diagnostics… menu runs this exact copy, and a user can run it standalone
     # when the app won't launch:
-    #   /Applications/RatioThink.app/Contents/Resources/collect-diagnostics.sh
+    #   /Applications/Rational.app/Contents/Resources/collect-diagnostics.sh
       - name: Bundle collect-diagnostics script
         script: |
           set -euo pipefail
@@ -128,7 +128,7 @@ targets:
     # Build the pie engine binary (Vendor/pie `pie-server` crate, bin
     # `pie`) for the current Xcode arch, stage into
     # Contents/Resources/pie-engine/pie (the path
-    # Shared/Engine/PieSupervisor.swift expects), and codesign with the
+    # LaunchSpecResolver.bundledPieBinary() expects), and codesign with the
     # engine's own entitlements.  phase 5.10.
     #
     # Must live in postCompileScripts (NOT postBuildScripts): xcodegen
@@ -171,11 +171,11 @@ targets:
         LSMinimumSystemVersion: "14.0"
         CFBundleIdentifier: com.ratiothink.app
         CFBundleIconFile: AppIcon
-        CFBundleName: RatioThink
-        CFBundleDisplayName: RatioThink
-        CFBundleShortVersionString: "0.1.1"
-        CFBundleVersion: "2"
-        NSHumanReadableCopyright: "© 2026 RatioThink"
+        CFBundleName: Rational
+        CFBundleDisplayName: Rational
+        CFBundleShortVersionString: "0.1.5"
+        CFBundleVersion: "6"
+        NSHumanReadableCopyright: "© 2026 Rational"
         NSSupportsAutomaticTermination: false
         NSSupportsSuddenTermination: false
         # `ratiothink://` deep-link scheme. The menu-bar Helper opens
@@ -188,6 +188,16 @@ targets:
               - ratiothink
     settings:
       base:
+        # Shipped product is `Rational.app` (#445 rebrand). The Xcode
+        # target/scheme/project name stays `RatioThink` (the build
+        # "package" identity kept for compatibility), so PRODUCT_NAME is
+        # what renames the bundle + its executable to `Rational`.
+        PRODUCT_NAME: Rational
+        # PRODUCT_NAME also drives PRODUCT_MODULE_NAME by default, which would
+        # rename the Swift module to `Rational` and break the 28 `@testable
+        # import RatioThink` test consumers. Pin the module to the kept package
+        # name so the rename stays product-name-only.
+        PRODUCT_MODULE_NAME: RatioThink
         PRODUCT_BUNDLE_IDENTIFIER: com.ratiothink.app
         INFOPLIST_FILE: App/Info.plist
         CODE_SIGN_ENTITLEMENTS: App/RatioThink.entitlements
@@ -206,7 +216,7 @@ targets:
     platform: macOS
     sources:
       - path: Helper
-        # Staged into RatioThink.app/Contents/Library/LaunchAgents/ by the RatioThink
+        # Staged into Rational.app/Contents/Library/LaunchAgents/ by the RatioThink
         # target's postCompileScript; not a RatioThinkHelper resource.
         excludes:
           - com.ratiothink.app.helper.plist
@@ -218,12 +228,20 @@ targets:
       properties:
         LSUIElement: YES
         CFBundleIdentifier: com.ratiothink.app.helper
-        CFBundleName: RatioThinkHelper
-        CFBundleDisplayName: RatioThinkHelper
-        CFBundleShortVersionString: "0.1.1"
-        CFBundleVersion: "2"
+        CFBundleName: RationalHelper
+        CFBundleDisplayName: Rational Helper
+        CFBundleShortVersionString: "0.1.5"
+        CFBundleVersion: "6"
     settings:
       base:
+        # Shipped helper bundle is `RationalHelper.app` (#445). Target name
+        # `RatioThinkHelper` (build package) kept; PRODUCT_NAME renames the
+        # embedded bundle + executable — the launchd plist BundleProgram
+        # path (Helper/com.ratiothink.app.helper.plist) tracks this name.
+        PRODUCT_NAME: RationalHelper
+        # Keep the Swift module name (= build package), independent of the
+        # renamed product, mirroring the app target.
+        PRODUCT_MODULE_NAME: RatioThinkHelper
         PRODUCT_BUNDLE_IDENTIFIER: com.ratiothink.app.helper
         INFOPLIST_FILE: Helper/Info.plist
         CODE_SIGN_ENTITLEMENTS: Helper/RatioThinkHelper.entitlements
@@ -238,6 +256,14 @@ targets:
       - package: TOMLKit
       - package: MarkdownUI
         product: MarkdownUI
+    settings:
+      base:
+        # The RatioThink target ships Rational.app (PRODUCT_NAME, #445), but
+        # xcodegen derives TEST_HOST from the host target NAME, yielding the
+        # now-nonexistent RatioThink.app. A dead TEST_HOST makes Xcode drop this
+        # bundle from the RatioThink scheme's test action ("isn't a member of the
+        # scheme"). Point it at the real product so the unit tests host + run.
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Rational.app/Contents/MacOS/Rational"
 
   RatioThinkGUITests:
     type: bundle.ui-testing
@@ -250,3 +276,43 @@ targets:
     settings:
       base:
         TEST_TARGET_NAME: RatioThink
+
+  # #440: Helper-executable unit tests. The App-hosted RatioThinkTests cannot
+  # cover HelperAppDelegate — a unit bundle can't ALSO link RatioThinkHelper
+  # without duplicating every Shared symbol — so the Helper gets its own
+  # host-app unit-test bundle, mirroring how RatioThinkTests hosts RatioThink.
+  # The RatioThinkHelper host's applicationDidFinishLaunching early-returns when
+  # PIE_TEST_HELPER_NO_BOOT=1 (set on the scheme below), so the test host runs
+  # none of the real boot (status item / login-item registration / XPC bind)
+  # and mutates no machine state.
+  RatioThinkHelperTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/HelperUnit
+    dependencies:
+      - target: RatioThinkHelper
+      - package: TOMLKit
+    settings:
+      base:
+        # The helper target ships RationalHelper.app (PRODUCT_NAME) while its
+        # build/module identity remains RatioThinkHelper. Pin the host binary
+        # to the real product path for the same reason RatioThinkTests pins
+        # Rational.app above.
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/RationalHelper.app/Contents/MacOS/RationalHelper"
+
+schemes:
+  # Explicit scheme so the test action sets PIE_TEST_HELPER_NO_BOOT=1 in the
+  # RatioThinkHelper host process from launch (XCTest's own configuration env is
+  # injected too late for the helper's applicationDidFinishLaunching). Without
+  # it the host's real boot binds the com.ratiothink.helper mach service and
+  # hard-traps in verifyStartupInvariants under the ad-hoc-signed test host.
+  RatioThinkHelperTests:
+    build:
+      targets:
+        RatioThinkHelperTests: [test]
+    test:
+      environmentVariables:
+        PIE_TEST_HELPER_NO_BOOT: "1"
+      targets:
+        - RatioThinkHelperTests

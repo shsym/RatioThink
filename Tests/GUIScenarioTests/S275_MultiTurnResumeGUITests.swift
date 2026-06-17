@@ -1,7 +1,7 @@
 import XCTest
 
 ///  deterministic history/resume proof:
-/// RatioThink.app → ComposerView → HTTPEngineClient → deterministic HTTP harness,
+/// Rational.app → ComposerView → HTTPEngineClient → deterministic HTTP harness,
 /// with every chat request body recorded so the test can assert the
 /// exact ordered message history sent on turns 2 and 3.
 final class S275_MultiTurnResumeGUITests: XCTestCase {
@@ -24,7 +24,7 @@ final class S275_MultiTurnResumeGUITests: XCTestCase {
       config["PIE_TEST_REQUEST_LOG"],
       "\(Self.configPath) must define PIE_TEST_REQUEST_LOG"
     )
-    let model = config["PIE_TEST_CHAT_MODEL"] ?? "resume-deterministic"
+    let model = config["PIE_TEST_CHAT_MODEL_PIN"] ?? "resume-deterministic"
 
     let user1 = "Remember this code word: cerulean-275"
     let assistant1 = "I will remember cerulean-275."
@@ -38,7 +38,7 @@ final class S275_MultiTurnResumeGUITests: XCTestCase {
     defer { app.terminate() }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     try createChatAndSend(user1, in: app)
@@ -64,9 +64,9 @@ final class S275_MultiTurnResumeGUITests: XCTestCase {
     defer { relaunched.terminate() }
 
     XCTAssert(relaunched.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not relaunch")
+              "Rational.app did not relaunch")
     relaunched.activate()
-    try selectPersistedChat(in: relaunched)
+    selectPersistedChat(titled: user1, in: relaunched)
 
     try sendPrompt(user3, in: relaunched)
     XCTAssertTrue(waitForStaticTextContaining("Again: cerulean-275.", in: relaunched, timeout: 15),
@@ -89,7 +89,11 @@ final class S275_MultiTurnResumeGUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = model
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = model
+    // #504: pin the engine `.running` so the real send-gate passes (the
+    // `PIE_TEST_CHAT_MODEL` bypass is gone); the actual send still hits
+    // `PIE_TEST_ENGINE_BASE_URL`, whose port the pin is derived from.
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
   }
 
@@ -117,26 +121,17 @@ final class S275_MultiTurnResumeGUITests: XCTestCase {
     send.click()
   }
 
-  private func selectPersistedChat(in app: XCUIApplication) throws {
-    let chatTitle = app.staticTexts["New Chat"].firstMatch
-    XCTAssertTrue(chatTitle.waitForExistence(timeout: 10),
-                  "persisted chat row 'New Chat' missing after relaunch; app tree: \(app.debugDescription)")
-    chatTitle.click()
-  }
-
   private func waitForStaticTextContaining(
     _ needle: String,
     in app: XCUIApplication,
     timeout: TimeInterval
   ) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
-    let predicate = NSPredicate(
-      format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
-      needle,
-      needle
-    )
     while Date() < deadline {
-      if app.descendants(matching: .staticText).matching(predicate).count >= 1 {
+      // Message bodies render as one selectable NSTextView each now (#636,
+      // `.textView`) rather than per-block `.staticText`;
+      // `transcriptTextMatchCount` searches both.
+      if transcriptTextMatchCount(needle, in: app) >= 1 {
         return true
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25))

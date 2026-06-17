@@ -2,11 +2,11 @@ import SwiftUI
 import AppKit
 
 /// *Settings → Profiles* — list of `<PIE_HOME>/profiles/*.toml` with a
-/// read-only per-profile editor. Phase 3.8 ships display + the
-/// "Show advanced" toggle that reveals the inferlet picker and raw
-/// `inferlet_args`. Write-back lives in a follow-up so this
-/// pane can land without touching `ProfileStore`'s FS-watcher path.
+/// per-profile editor. The detail pane lets users edit the default model,
+/// system prompt, and user-facing sampling defaults without exposing the
+/// empty Advanced/inferlet-args inspection surface.
 struct ProfilesSettingsTab: View {
+  @EnvironmentObject private var profileStore: ProfileStore
   @State private var entries: [ProfileLoadResult] = []
   @State private var directoryError: String?
   @State private var selectionURL: URL?
@@ -43,6 +43,19 @@ struct ProfilesSettingsTab: View {
         Text(directoryError)
           .foregroundStyle(.red)
           .padding(12)
+      }
+
+      // #702: a broken customization of a built-in was reverted to the app
+      // default on launch (the broken file saved as `.bak`). Non-fatal, so it
+      // renders as an informational notice rather than the red error block.
+      ForEach(profileStore.lastBuiltinRevertNotices, id: \.profileID) { notice in
+        Label(
+          "\(notice.profileName) couldn’t be read — reverted to the app default; your file was saved as \(notice.bakFilename).",
+          systemImage: "exclamationmark.triangle"
+        )
+        .foregroundStyle(.orange)
+        .padding(.horizontal, 12)
+        .fixedSize(horizontal: false, vertical: true)
       }
 
       if entries.isEmpty && directoryError == nil {
@@ -93,13 +106,12 @@ struct ProfilesSettingsTab: View {
   private func refresh() async {
     do {
       let dir = try PieDirs.profiles()
-      // Use the shared `ProfileStore.scan` rather than re-implementing
-      // the TOML enumeration here (review v2 F9). The duplicate scan
-      // previously matched `*.toml` case-insensitively while the
-      // canonical store matches the literal lowercase extension; a
-      // `*.TOML` file would have rendered in one path and not the
-      // other.
-      let (loaded, scanErr) = ProfileStore.scan(directory: dir)
+      // Use the shared `ProfileStore.effectiveScan` rather than
+      // re-implementing the TOML enumeration here (review v2 F9). #702:
+      // `effectiveScan` overlays the immutable in-code base layer on the
+      // user files, so the four built-ins always render here even when no
+      // file exists on disk for them.
+      let (loaded, scanErr) = ProfileStore.effectiveScan(directory: dir)
       entries = loaded
       directoryError = scanErr.map(String.init(describing:))
       if selectionURL == nil { selectionURL = entries.first?.url }

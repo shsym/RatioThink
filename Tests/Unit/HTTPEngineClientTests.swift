@@ -223,85 +223,6 @@ final class HTTPEngineClientTests: XCTestCase {
     XCTAssertEqual(models[1].created, Date(timeIntervalSince1970: 1_700_000_000))
   }
 
-  // MARK: - loadModel SSE
-
-  func test_loadModel_emits_ready_then_finishes() async throws {
-    FakeSSEURLProtocol.handler = { _ in
-      .sse(chunks: [
-        "data: {\"event\":\"model_ready\"}\n\n",
-        "data: [DONE]\n\n",
-      ])
-    }
-    var events: [LoadEvent] = []
-    for try await ev in makeClient().loadModel("qwen3-0.6b") {
-      events.append(ev)
-    }
-    XCTAssertEqual(events, [.ready])
-  }
-
-  func test_loadModel_tolerates_loading_frames_before_ready() async throws {
-    // model_loading meta-frames are deferred in pie-control v1 but the
-    // demux must accept them so the engine can roll them in later
-    // without a Swift-side change.
-    FakeSSEURLProtocol.handler = { _ in
-      .sse(chunks: [
-        "data: {\"event\":\"model_loading\",\"loaded_bytes\":100,\"total_bytes\":1000}\n\n",
-        "data: {\"event\":\"model_loading\",\"loaded_bytes\":500,\"total_bytes\":1000,\"eta_s\":1.5}\n\n",
-        "data: {\"event\":\"model_ready\"}\n\n",
-        "data: [DONE]\n\n",
-      ])
-    }
-    var events: [LoadEvent] = []
-    for try await ev in makeClient().loadModel("m1") {
-      events.append(ev)
-    }
-    XCTAssertEqual(events.count, 3)
-    if case .loading(let loaded, let total, let eta) = events[0] {
-      XCTAssertEqual(loaded, 100); XCTAssertEqual(total, 1000); XCTAssertNil(eta)
-    } else { XCTFail("\(events[0])") }
-    if case .loading(let loaded, let total, let eta) = events[1] {
-      XCTAssertEqual(loaded, 500); XCTAssertEqual(total, 1000); XCTAssertEqual(eta, 1.5)
-    } else { XCTFail("\(events[1])") }
-    XCTAssertEqual(events[2], .ready)
-  }
-
-  func test_loadModel_error_metaframe_throws() async {
-    FakeSSEURLProtocol.handler = { _ in
-      .sse(chunks: [
-        #"data: {"event":"error","code":"model_not_found","message":"oops"}"# + "\n\n",
-        "data: [DONE]\n\n",
-      ])
-    }
-    do {
-      for try await _ in makeClient().loadModel("missing") {}
-      XCTFail("expected throw")
-    } catch let HTTPEngineError.stream(code, message) {
-      XCTAssertEqual(code, "model_not_found")
-      XCTAssertEqual(message, "oops")
-    } catch {
-      XCTFail("unexpected: \(error)")
-    }
-  }
-
-  func test_loadModel_pre_stream_non_2xx_surfaces_api_error() async {
-    // : a load that fails BEFORE the SSE stream opens must
-    // carry the inferlet's {error:{code,message}} envelope. Previously
-    // the streaming path called assertOK(data: nil) and dropped it.
-    FakeSSEURLProtocol.handler = { _ in
-      .json(status: 500,
-            body: #"{"error":{"code":"model_load_failed","message":"Failed to load model: oom"}}"#)
-    }
-    do {
-      for try await _ in makeClient().loadModel("big") {}
-      XCTFail("expected throw")
-    } catch let HTTPEngineError.api(status, code, message) {
-      XCTAssertEqual(status, 500)
-      XCTAssertEqual(code, "model_load_failed")
-      XCTAssertEqual(message, "Failed to load model: oom")
-    } catch {
-      XCTFail("unexpected: \(error)")
-    }
-  }
 
   // MARK: - chatCompletion SSE
 
@@ -383,6 +304,106 @@ final class HTTPEngineClientTests: XCTestCase {
       ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "x")])
     ) { events.append(ev) }
     XCTAssertEqual(events.last, .finish(reason: .other("content_filter")))
+  }
+
+  func test_chatCompletion_decodesGenerationMetricsMetaFrame() async throws {
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        #"data: {"event":"model_ready"}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"generation_metrics","output_tokens":12,"elapsed_s":0.5,"tokens_per_sec":24.0}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    var events: [ChatEvent] = []
+    for try await event in makeClient().chatCompletion(ChatRequest(model: "m", messages: [])) {
+      events.append(event)
+    }
+
+    let expected = GenerationMetrics(outputTokens: 12, elapsedSeconds: 0.5, tokensPerSecond: 24.0)
+    XCTAssertTrue(events.contains(.generationMetrics(expected)), "events=\(events)")
+  }
+
+  func test_chatCompletion_malformedGenerationMetricsAfterFinishThrows() async {
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        #"data: {"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"generation_metrics","output_tokens":12,"elapsed_s":0.5}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    var events: [ChatEvent] = []
+    do {
+      for try await event in makeClient().chatCompletion(ChatRequest(model: "m", messages: [])) {
+        events.append(event)
+      }
+      XCTFail("expected malformed generation_metrics to throw")
+    } catch {
+      XCTAssertEqual(events.last, .finish(reason: .stop))
+      XCTAssertFalse(
+        events.contains(.generationMetrics(GenerationMetrics(
+          outputTokens: 12,
+          elapsedSeconds: 0.5,
+          tokensPerSecond: 0
+        ))),
+        "malformed metrics must not be zero-filled: events=\(events)"
+      )
+      XCTAssertTrue(error is DecodingError, "expected strict frame decode error, got \(error)")
+    }
+  }
+
+  func test_chatCompletion_terminal_spec_metrics_frame_decodes_to_event() async throws {
+    // chat-apc #418/#621: a "Repeat Boost" turn closes with a terminal
+    // `spec_metrics` frame AFTER the finish chunk and before `[DONE]`. It
+    // must surface as a `.specMetrics` event (previously dropped by the
+    // demux `default`), and the accept ratio derives from the draft counts.
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        #"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}"# + "\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"spec_metrics","enabled":true,"generated_tokens":40,"decode_steps":18,"proposed_draft_tokens":30,"accepted_draft_tokens":24,"rejected_draft_tokens":6,"avg_tokens_per_step":2.222,"decode_tokens_per_sec":85.5,"leader_len":1,"draft_len":4}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    var events: [ChatEvent] = []
+    for try await ev in makeClient().chatCompletion(
+      ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "x")])
+    ) { events.append(ev) }
+
+    // The metrics frame rides AFTER finish.
+    XCTAssertEqual(events.count, 3)
+    XCTAssertEqual(events[1], .finish(reason: .stop))
+    guard case let .specMetrics(metrics) = events[2] else {
+      return XCTFail("expected terminal .specMetrics, got \(String(describing: events.last))")
+    }
+    XCTAssertTrue(metrics.enabled)
+    XCTAssertNil(metrics.fallbackReason)
+    XCTAssertEqual(metrics.proposedDraftTokens, 30)
+    XCTAssertEqual(metrics.acceptedDraftTokens, 24)
+    XCTAssertEqual(metrics.acceptRatio, 0.8)
+    XCTAssertEqual(metrics.avgTokensPerStep, 2.222, accuracy: 1e-6)
+  }
+
+  func test_chatCompletion_inactive_spec_metrics_frame_carries_fallback_reason() async throws {
+    // Speculation requested but not engaged (non-greedy): `enabled:false`,
+    // zero proposals → `acceptRatio == nil` (not a misleading 0%).
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        #"data: {"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"spec_metrics","enabled":false,"fallback_reason":"non_greedy_sampling","generated_tokens":5,"decode_steps":5,"proposed_draft_tokens":0,"accepted_draft_tokens":0,"rejected_draft_tokens":0,"avg_tokens_per_step":1.0,"decode_tokens_per_sec":12.0,"leader_len":0,"draft_len":0}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    var metrics: SpecMetrics?
+    for try await ev in makeClient().chatCompletion(
+      ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "x")])
+    ) { if case let .specMetrics(m) = ev { metrics = m } }
+    XCTAssertEqual(metrics?.enabled, false)
+    XCTAssertEqual(metrics?.fallbackReason, "non_greedy_sampling")
+    XCTAssertNil(metrics?.acceptRatio)
   }
 
   func test_chatCompletion_inline_error_frame_surfaces_as_stream_error() async {
@@ -569,6 +590,196 @@ final class HTTPEngineClientTests: XCTestCase {
     XCTAssertEqual(frames, [#"{"frame":1}"#, #"{"frame":2}"#])
   }
 
+  /// #703 transport decision: a `stream: false` CONTROL dispatch takes the
+  /// UNARY path — the inferlet's plain `application/json` ack (no `data:`
+  /// framing) is buffered whole and yielded as the stream's single frame. The
+  /// old SSE-only path would strip it (no `data:` lines) and surface zero
+  /// frames, hiding the release accounting.
+  func test_dispatchInferlet_unary_control_yields_unframed_json_body() async throws {
+    FakeSSEURLProtocol.handler = { _ in
+      .json(
+        status: 200,
+        body: #"{"object":"best_of_n.release","requested":3,"released":2,"absent":1}"#)
+    }
+    let req = InferletRequest(
+      inferlet: "best-of-n",
+      input: Data(#"{"release":["a","b","c"]}"#.utf8),
+      messages: nil,
+      stream: false)
+    var frames: [Data] = []
+    for try await frame in makeClient().dispatchInferlet(req) {
+      frames.append(frame)
+    }
+    XCTAssertEqual(frames.count, 1, "unary control returns exactly one buffered frame")
+    let ack = try JSONDecoder().decode(BestOfNReleaseAck.self, from: try XCTUnwrap(frames.first))
+    XCTAssertEqual(ack, BestOfNReleaseAck(requested: 3, released: 2, absent: 1))
+  }
+
+  /// The unary control path surfaces a non-2xx as an error (via `assertOK`)
+  /// rather than yielding a frame — the release must not silently "succeed" on
+  /// an HTTP failure.
+  func test_dispatchInferlet_unary_control_non_2xx_throws() async {
+    FakeSSEURLProtocol.handler = { _ in
+      .json(status: 500, body: #"{"error":{"code":"boom","message":"nope"}}"#)
+    }
+    let req = InferletRequest(
+      inferlet: "best-of-n",
+      input: Data(#"{"release":["a"]}"#.utf8),
+      messages: nil,
+      stream: false)
+    do {
+      for try await _ in makeClient().dispatchInferlet(req) {}
+      XCTFail("expected a non-2xx unary control response to throw")
+    } catch {
+      // expected
+    }
+  }
+
+  // MARK: - Connection-lost retry (stale keep-alive reuse)
+
+  /// `URLSession` pools HTTP/1.1 keep-alive connections; a reused one the
+  /// engine has closed fails the request with
+  /// `URLError.networkConnectionLost` BEFORE any byte arrives. URLSession
+  /// auto-retries idempotent GETs but not POSTs, so the streaming dispatch
+  /// must retry once itself. First attempt fails at connect; the retry on
+  /// a fresh connection succeeds and the full stream is delivered.
+  func test_dispatchInferlet_retries_once_on_connection_lost_then_succeeds() async throws {
+    let calls = CallCounter()
+    FakeSSEURLProtocol.handler = { _ in
+      calls.increment() == 1
+        ? .failure(.networkConnectionLost)
+        : .sse(chunks: [
+            "data: {\"frame\":1}\n\n",
+            "data: {\"frame\":2}\n\n",
+            "data: [DONE]\n\n",
+          ])
+    }
+    let req = InferletRequest(
+      inferlet: "chat-apc",
+      input: Data(#"{"messages":[{"role":"user","content":"hi"}]}"#.utf8)
+    )
+    var frames: [String] = []
+    for try await frame in makeClient().dispatchInferlet(req) {
+      frames.append(String(decoding: frame, as: UTF8.self))
+    }
+    XCTAssertEqual(frames, [#"{"frame":1}"#, #"{"frame":2}"#])
+    XCTAssertEqual(calls.value, 2, "expected exactly one retry after the connection-lost failure")
+  }
+
+  /// The retry is bounded to ONE: a connection-lost on both attempts must
+  /// surface the error to the caller, not loop. Guards against turning a
+  /// transient remedy into an infinite retry.
+  func test_dispatchInferlet_connection_lost_twice_propagates_after_one_retry() async {
+    let calls = CallCounter()
+    FakeSSEURLProtocol.handler = { _ in
+      calls.increment()
+      return .failure(.networkConnectionLost)
+    }
+    let req = InferletRequest(
+      inferlet: "chat-apc",
+      input: Data(#"{"messages":[{"role":"user","content":"hi"}]}"#.utf8)
+    )
+    do {
+      for try await _ in makeClient().dispatchInferlet(req) {}
+      XCTFail("expected the connection-lost error to propagate")
+    } catch let error as URLError {
+      XCTAssertEqual(error.code, .networkConnectionLost)
+    } catch {
+      XCTFail("unexpected error type: \(error)")
+    }
+    XCTAssertEqual(calls.value, 2, "expected exactly two attempts (initial + one retry)")
+  }
+
+  /// The same retry covers the production chat path — `chatCompletion`
+  /// and `dispatchInferlet` share the connect helper, so a user's chat
+  /// send survives a stale pooled connection instead of failing.
+  func test_chatCompletion_retries_once_on_connection_lost_then_succeeds() async throws {
+    let calls = CallCounter()
+    FakeSSEURLProtocol.handler = { _ in
+      calls.increment() == 1
+        ? .failure(.networkConnectionLost)
+        : .sse(chunks: [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+          ])
+    }
+    let req = ChatRequest(model: "m", messages: [], stream: true)
+    var content = ""
+    var sawFinish = false
+    for try await ev in makeClient().chatCompletion(req) {
+      switch ev {
+      case let .delta(_, c): content += c
+      case .finish: sawFinish = true
+      default: break
+      }
+    }
+    XCTAssertEqual(content, "hi")
+    XCTAssertTrue(sawFinish)
+    XCTAssertEqual(calls.value, 2, "expected exactly one retry after the connection-lost failure")
+  }
+
+  /// The retry is scoped to `URLError.networkConnectionLost` ONLY. A
+  /// non-2xx HTTP response surfaces as `HTTPEngineError` (not a
+  /// `URLError`), so it must NOT be retried — re-sending a request the
+  /// server actively rejected is wrong. Asserts a single attempt.
+  /// Mutation guard: broadening the retry `catch` to a bare `catch {}`
+  /// makes this retry the 503 and the attempt count jumps to 2 → fails.
+  func test_dispatchInferlet_non2xx_is_not_retried() async {
+    let calls = CallCounter()
+    FakeSSEURLProtocol.handler = { _ in
+      calls.increment()
+      return .text(status: 503, body: "in-flight-crash", headers: ["Retry-After": "1"])
+    }
+    let req = InferletRequest(
+      inferlet: "chat-apc",
+      input: Data(#"{"messages":[{"role":"user","content":"hi"}]}"#.utf8)
+    )
+    do {
+      for try await _ in makeClient().dispatchInferlet(req) {}
+      XCTFail("expected the 503 to surface as an error")
+    } catch is HTTPEngineError {
+      // expected — non-2xx maps to HTTPEngineError, not URLError
+    } catch {
+      XCTFail("expected HTTPEngineError, got \(type(of: error)): \(error)")
+    }
+    XCTAssertEqual(calls.value, 1, "a non-2xx response must not be retried")
+  }
+
+  /// Only a CONNECT-time connection-lost retries. A `networkConnectionLost`
+  /// raised AFTER the 200 response head has been accepted (so `openStream`
+  /// has already returned and the consumer is iterating frames) is a
+  /// mid-stream drop — re-running a partially consumed stream could
+  /// duplicate side effects, so it must surface to the caller, not retry.
+  ///
+  /// Determinism: the stub emits the 200 head FIRST, which is what resolves
+  /// `URLSession.bytes(for:)`; the failure is delivered afterward, so it can
+  /// only land mid-iteration — never at connect. `calls.value == 1` is
+  /// therefore exact (a retry would re-invoke the handler → 2). Whether the
+  /// single buffered frame surfaces before the failure is an incidental
+  /// URLSession race, so the frame payload is intentionally not asserted.
+  func test_dispatchInferlet_midstream_connection_lost_is_not_retried() async {
+    let calls = CallCounter()
+    FakeSSEURLProtocol.handler = { _ in
+      calls.increment()
+      return .sseThenFailure(chunks: ["data: {\"frame\":1}\n\n"],
+                             code: .networkConnectionLost)
+    }
+    let req = InferletRequest(
+      inferlet: "chat-apc",
+      input: Data(#"{"messages":[{"role":"user","content":"hi"}]}"#.utf8)
+    )
+    do {
+      for try await _ in makeClient().dispatchInferlet(req) {}
+      XCTFail("expected the mid-stream connection-lost to surface")
+    } catch let error as URLError {
+      XCTAssertEqual(error.code, .networkConnectionLost)
+    } catch {
+      XCTFail("unexpected error type: \(error)")
+    }
+    XCTAssertEqual(calls.value, 1, "a mid-stream drop must not be retried")
+  }
+
   // MARK: - Request body shape
 
   func test_chatCompletion_request_body_is_openai_flat() async throws {
@@ -656,17 +867,6 @@ final class HTTPEngineClientTests: XCTestCase {
       "default session must lift the 60s per-request idle cap so a silent SSE load is not aborted")
   }
 
-  func test_loadModel_request_carries_streaming_idle_timeout() async throws {
-    var captured: TimeInterval?
-    FakeSSEURLProtocol.handler = { request in
-      captured = request.timeoutInterval
-      return .sse(chunks: ["data: {\"event\":\"model_ready\"}\n\n", "data: [DONE]\n\n"])
-    }
-    for try await _ in makeClient().loadModel("m1") {}
-    XCTAssertEqual(captured, HTTPEngineClient.streamingIdleTimeout,
-                   "POST /v1/models/load must carry the lifted idle timeout, not the 60s default")
-  }
-
   func test_chatCompletion_request_carries_streaming_idle_timeout() async throws {
     var captured: TimeInterval?
     FakeSSEURLProtocol.handler = { request in
@@ -743,6 +943,15 @@ final class FakeSSEURLProtocol: URLProtocol {
     /// SSE stream. Chunks land via repeated `didLoad:` calls so
     /// `URLSession.bytes(for:)` surfaces them incrementally.
     case sse(chunks: [String], chunkDelayNanos: UInt64 = 0)
+    /// Transport-level failure (no HTTP response) — models a stale
+    /// keep-alive reuse surfacing as `URLError(code)` from
+    /// `URLSession.bytes(for:)`, before any byte arrives.
+    case failure(URLError.Code)
+    /// Open a 200 SSE stream, emit `chunks`, then fail the task with
+    /// `URLError(code)` AFTER streaming has begun — models a mid-stream
+    /// connection drop (which must NOT be retried; only connect-time
+    /// failures retry).
+    case sseThenFailure(chunks: [String], code: URLError.Code)
   }
 
   private static let lock = NSLock()
@@ -820,11 +1029,58 @@ final class FakeSSEURLProtocol: URLProtocol {
         }
         client?.urlProtocolDidFinishLoading(proto)
       }
+
+    case .failure(let code):
+      client?.urlProtocol(self, didFailWithError: URLError(code))
+
+    case .sseThenFailure(let chunks, let code):
+      let response = HTTPURLResponse(
+        url: request.url!,
+        statusCode: 200,
+        httpVersion: "HTTP/1.1",
+        headerFields: ["Content-Type": "text/event-stream"]
+      )!
+      client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+      let client = self.client
+      let proto = self
+      Task {
+        for chunk in chunks {
+          if proto.cancelled { break }
+          client?.urlProtocol(proto, didLoad: Data(chunk.utf8))
+        }
+        // Fail the in-flight task AFTER the stream opened and delivered
+        // bytes — the consumer is past `openStream`/`bytes(for:)` and
+        // iterating frames, so the retry path can no longer fire.
+        client?.urlProtocol(proto, didFailWithError: URLError(code))
+      }
     }
   }
 
   override func stopLoading() {
     cancelled = true
+  }
+}
+
+// MARK: - Call counter helper
+
+/// Thread-safe attempt counter for handlers that must vary their
+/// response by attempt number (e.g. fail the first connect, succeed the
+/// retry). `URLProtocol.handler` is invoked once per intercepted request.
+private final class CallCounter: @unchecked Sendable {
+  private let lock = NSLock()
+  private var count = 0
+
+  /// Increment and return the new (1-based) count.
+  @discardableResult
+  func increment() -> Int {
+    lock.lock(); defer { lock.unlock() }
+    count += 1
+    return count
+  }
+
+  var value: Int {
+    lock.lock(); defer { lock.unlock() }
+    return count
   }
 }
 

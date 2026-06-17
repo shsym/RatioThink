@@ -3,7 +3,7 @@ import Foundation
 /// Where a discovered model lives, which decides what the app may do
 /// with it.
 public enum CachedModelSource: String, Equatable, Sendable {
-  /// Staged in RatioThink's app-managed models directory
+  /// Staged in Rational's app-managed models directory
   /// (`PieDirs.models()`) — imported or downloaded through the app, and
   /// deletable from it.
   case appManaged
@@ -76,6 +76,30 @@ public struct InstalledModel: Equatable, Identifiable, Sendable {
   /// split-file support. `nil` = launchable.
   public let unsupportedReason: String?
 
+  /// Weight precision for a directory-loaded (safetensors/.bin) model, derived
+  /// from real metadata (config.json `torch_dtype`, else the safetensors header
+  /// dtype) — e.g. `bf16`, `f16`, `f32`. `nil` for GGUF rows (the quant in the
+  /// filename is the precision) and when no precision could be read. The model
+  /// dropdown shows it as the variant label so a safetensors row reads
+  /// `Qwen3-0.6B → bf16`, not the base name repeated.
+  public let precision: String?
+
+  /// Whether this row maps to a curated artifact that RatioThink has
+  /// engine-validated. App-managed imports are user-owned and do not need
+  /// cache-origin warnings; HF-cache rows outside this list are still
+  /// selectable, but the UI marks them advisory/unverified.
+  public var isCuratedEngineSupported: Bool {
+    CuratedModelCatalog.isCuratedModelSlug(filename)
+  }
+
+  /// Advisory warning for arbitrary HF-cache discoveries. This is
+  /// deliberately separate from `unsupportedReason`: it must not disable
+  /// selection, because a non-curated GGUF may still load successfully.
+  public var supportWarning: String? {
+    guard source == .huggingFaceCache, !isCuratedEngineSupported else { return nil }
+    return "Unverified — may not be supported"
+  }
+
   public init(filename: String,
               url: URL,
               sizeBytes: Int64,
@@ -84,7 +108,8 @@ public struct InstalledModel: Equatable, Identifiable, Sendable {
               isUnverified: Bool = false,
               metadataUnreadable: Bool = false,
               source: CachedModelSource = .appManaged,
-              unsupportedReason: String? = nil) {
+              unsupportedReason: String? = nil,
+              precision: String? = nil) {
     self.filename = filename
     self.url = url
     self.sizeBytes = sizeBytes
@@ -94,6 +119,7 @@ public struct InstalledModel: Equatable, Identifiable, Sendable {
     self.metadataUnreadable = metadataUnreadable
     self.source = source
     self.unsupportedReason = unsupportedReason
+    self.precision = precision
   }
 }
 

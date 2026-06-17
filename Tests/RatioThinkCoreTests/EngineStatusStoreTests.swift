@@ -19,7 +19,13 @@ final class EngineStatusStoreTests: XCTestCase {
   final class StubXPCClient: AppXPCClient, @unchecked Sendable {
     private let lock = NSLock()
     private var queue: [Result<EngineStatus, Error>] = []
+    private var kvUsageQueue: [Result<[KVUsageSnapshot], Error>] = []
     private(set) var calls = 0
+    private(set) var kvUsageCalls = 0
+
+    func helperProtocolVersion() async throws -> Int {
+      HelperProtocolCompatibility.currentVersion
+    }
 
     func setNext(_ result: Result<EngineStatus, Error>) {
       lock.withLock { queue.append(result) }
@@ -44,6 +50,21 @@ final class EngineStatusStoreTests: XCTestCase {
       return try result.get()
     }
 
+    func setNextKVUsage(_ result: Result<[KVUsageSnapshot], Error>) {
+      lock.withLock { kvUsageQueue.append(result) }
+    }
+
+    func kvUsageSnapshots() async throws -> [KVUsageSnapshot] {
+      let result: Result<[KVUsageSnapshot], Error> = lock.withLock {
+        kvUsageCalls += 1
+        if kvUsageQueue.isEmpty {
+          return .success([])
+        }
+        return kvUsageQueue.removeFirst()
+      }
+      return try result.get()
+    }
+
     //  Unload: capture stopEngine calls + let tests inject a result.
     private(set) var stopCalls = 0
     private var stopResult: Result<Void, Error> = .success(())
@@ -61,15 +82,50 @@ final class EngineStatusStoreTests: XCTestCase {
     // #326: capture startEngine calls + let tests inject a result.
     private(set) var startCalls = 0
     private(set) var lastStartProfileID: String?
+    private(set) var lastStartBindMode: EngineHTTPBindMode?
+    // #459: capture the explicit per-start model override threaded through.
+    private(set) var lastStartModelOverride: String?
     private var startResult: Result<Void, Error> = .success(())
     func setStartResult(_ result: Result<Void, Error>) {
       lock.withLock { startResult = result }
     }
-    func startEngine(profileID: String) async throws {
+    func startEngine(profileID: String, modelOverride: String?) async throws {
       let result: Result<Void, Error> = lock.withLock {
         startCalls += 1
         lastStartProfileID = profileID
+        lastStartModelOverride = modelOverride
         return startResult
+      }
+      try result.get()
+    }
+
+    func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws {
+      let result: Result<Void, Error> = lock.withLock {
+        startCalls += 1
+        lastStartProfileID = profileID
+        lastStartBindMode = daemonBindHost
+        return startResult
+      }
+      try result.get()
+    }
+
+    // Active-profile default-model changes need restart semantics that
+    // differ from the generic "kick start" path above. Model reload must
+    // not be decided from EngineStatusStore's cached mirror or swallow
+    // `.alreadyRunning`.
+    private(set) var restartCalls = 0
+    private(set) var lastRestartProfileID: String?
+    private(set) var lastRestartModelOverride: String?
+    private var restartResult: Result<Void, Error> = .success(())
+    func setRestartResult(_ result: Result<Void, Error>) {
+      lock.withLock { restartResult = result }
+    }
+    func restartEngine(profileID: String, modelOverride: String?) async throws {
+      let result: Result<Void, Error> = lock.withLock {
+        restartCalls += 1
+        lastRestartProfileID = profileID
+        lastRestartModelOverride = modelOverride
+        return restartResult
       }
       try result.get()
     }
@@ -96,6 +152,32 @@ final class EngineStatusStoreTests: XCTestCase {
     }
   }
 
+  private final class MutableBindMode: @unchecked Sendable {
+    var value: EngineHTTPBindMode
+
+    init(_ value: EngineHTTPBindMode) {
+      self.value = value
+    }
+  }
+
+  /// Virtual clock backing the `now` / `sleepFor` seams so the recovery-wait
+  /// tests run on advanceable time with zero real wall-clock budget. Thread-
+  /// safe because the injected closures are `@Sendable`.
+  private final class VirtualClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seconds: TimeInterval = 0
+    /// Total virtual time advanced via `sleepFor` — the "budget burned".
+    var elapsed: TimeInterval { lock.lock(); defer { lock.unlock() }; return seconds }
+    func nowDate() -> Date {
+      lock.lock(); defer { lock.unlock() }
+      return Date(timeIntervalSinceReferenceDate: seconds)
+    }
+    func advance(_ dt: TimeInterval) {
+      lock.lock(); defer { lock.unlock() }
+      seconds += max(0, dt)
+    }
+  }
+
   // MARK: - startEngine (#326 fresh-install recovery)
 
   func test_startEngine_forwards_profileID_to_client() async throws {
@@ -105,6 +187,158 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(client.startCalls, 1,
                    "startEngine must forward to the helper XPC client")
     XCTAssertEqual(client.lastStartProfileID, "chat")
+    XCTAssertEqual(client.lastStartBindMode, .loopback)
+    XCTAssertNil(client.lastStartModelOverride,
+                 "no override given → nil so the helper boots the profile default")
+  }
+
+  /// #459 repro 1: the explicit toolbar / model-list pick must reach the
+  /// helper as `modelOverride` so a no-default profile boots the chosen
+  /// model instead of failing with `has no default model`.
+  func test_startEngine_forwards_explicit_modelOverride() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client)
+    try await store.startEngine(profileID: "tree-of-thought",
+                                modelOverride: "Org/New-GGUF/new.gguf")
+    XCTAssertEqual(client.lastStartProfileID, "tree-of-thought")
+    XCTAssertEqual(client.lastStartModelOverride, "Org/New-GGUF/new.gguf",
+                   "the explicit pick must be threaded through to the helper start call")
+  }
+
+  func test_startEngine_without_explicit_bind_uses_shared_bind_mode_provider() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      daemonBindModeProvider: { .external }
+    )
+
+    try await store.startEngine(profileID: "chat")
+
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(client.lastStartProfileID, "chat")
+    XCTAssertEqual(client.lastStartBindMode, .external,
+                   "every production caller of startEngine(profileID:) must inherit the shared Local API bind preference")
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+  }
+
+  func test_startEngine_explicit_external_bind_is_required_and_recorded() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client)
+
+    try await store.startEngine(profileID: "chat", daemonBindHost: .external)
+
+    XCTAssertEqual(client.lastStartBindMode, .external)
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+  }
+
+  /// A running snapshot WITHOUT `daemonBindHost` (older helper) must not be
+  /// read as confirmed loopback: with the current preference external, the
+  /// fail-safe keeps reporting external so the 0.0.0.0 exposure warning stays.
+  private func legacyRunningStatus(port: EnginePort, profileID: String = "chat") throws -> EngineStatus {
+    let json = #"{"kind":"running","snapshot":{"generation":0,"port":\#(port),"profileID":"\#(profileID)","servedModelID":"","maxOutputTokens":4096}}"#
+    return try XPCPayload.decode(EngineStatus.self, from: Data(json.utf8))
+  }
+
+  func test_legacy_running_status_with_external_preference_does_not_hide_exposure() throws {
+    let legacyStatus = try legacyRunningStatus(port: 8123)
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialDaemonBindMode: .external,
+      daemonBindModeProvider: { .external }
+    )
+
+    store._applyPollForTesting(next: legacyStatus, error: nil)
+
+    if case .running(let snap) = store.status { XCTAssertEqual(snap.port, 8123) }
+    else { XCTFail("expected running, got \(store.status)") }
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+    XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8123")
+  }
+
+  func test_legacy_running_after_stop_prefers_current_external_preference_over_stale_confirmed_loopback() throws {
+    let legacyStatus = try legacyRunningStatus(port: 8124)
+    let desiredBindMode = MutableBindMode(.loopback)
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialDaemonBindMode: .loopback,
+      daemonBindModeProvider: { desiredBindMode.value }
+    )
+
+    store._applyPollForTesting(
+      next: .running(EngineSessionSnapshot(port: 8123, profileID: "chat", daemonBindHost: .loopback)),
+      error: nil
+    )
+    XCTAssertEqual(store.runtimeDaemonBindMode, .loopback)
+
+    store._applyPollForTesting(next: .stopped, error: nil)
+    desiredBindMode.value = .external
+    store._applyPollForTesting(next: legacyStatus, error: nil)
+
+    if case .running(let snap) = store.status { XCTAssertEqual(snap.port, 8124) }
+    else { XCTFail("expected running, got \(store.status)") }
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+    XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8124")
+  }
+
+  func test_engineGone_clears_confirmed_bind_mode_so_legacy_relaunch_over_reports_exposure() throws {
+    // Symmetry to the v10 success-path clear: a confirmed posture must not
+    // outlive its running generation. Sustained transport loss synthesizes
+    // `.engineGone` (the generation ended) — if the confirmed flag survives,
+    // a later legacy running payload (no daemonBindHost) reuses the stale
+    // confirmed `.loopback` and hides the 0.0.0.0 exposure warning for an
+    // externally bound, unauthenticated endpoint.
+    let legacyStatus = try legacyRunningStatus(port: 8125)
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialDaemonBindMode: .loopback,
+      daemonBindModeProvider: { .loopback },
+      tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3)
+    )
+
+    store._applyPollForTesting(
+      next: .running(EngineSessionSnapshot(port: 8123, profileID: "chat", daemonBindHost: .loopback)),
+      error: nil
+    )
+    XCTAssertEqual(store.runtimeDaemonBindMode, .loopback)
+
+    for _ in 0..<3 {
+      store._applyPollForTesting(next: nil, error: "NSXPCConnectionInvalid")
+    }
+    guard case .failed(.engineGone, _) = store.status else {
+      return XCTFail("sustained transport loss must escalate to .engineGone; got \(store.status)")
+    }
+
+    // Legacy relaunch without daemonBindHost while desired stays loopback:
+    // with the confirmed flag cleared, fail-safe over-reports as external.
+    store._applyPollForTesting(next: legacyStatus, error: nil)
+
+    if case .running(let snap) = store.status { XCTAssertEqual(snap.port, 8125) }
+    else { XCTFail("expected running, got \(store.status)") }
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external,
+                   "engineGone must clear confirmed bind mode so a legacy relaunch cannot claim stale loopback safety")
+    XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8125")
+  }
+
+  func test_running_status_poll_updates_runtime_daemon_bind_mode_from_helper() {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(client: client, initialDaemonBindMode: .loopback)
+
+    store._applyPollForTesting(
+      next: .running(EngineSessionSnapshot(port: 8123, profileID: "chat", daemonBindHost: .external)),
+      error: nil
+    )
+
+    if case .running(let snap) = store.status {
+      XCTAssertEqual(snap.port, 8123)
+      XCTAssertEqual(snap.daemonBindHost, .external)
+    } else {
+      XCTFail("expected running, got \(store.status)")
+    }
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+    XCTAssertEqual(store.localAPIBaseURL?.absoluteString, "http://0.0.0.0:8123")
   }
 
   func test_startEngine_propagates_real_failure() async {
@@ -136,18 +370,45 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(client.startCalls, 1)
   }
 
-  /// A concurrent start finds the engine already starting/running and is
-  /// rejected `.alreadyRunning`. For a "kick the start" caller that is
-  /// the desired end state — #326's two recovery surfaces can both fire
-  /// `startEngine` on the same completed download, and the second must
-  /// NOT surface a user-facing error. Idempotent: swallow it.
-  func test_startEngine_swallows_alreadyRunning_as_idempotent() async throws {
+  /// Same-profile idempotent attach is owned by the helper's
+  /// `startOrAttach` boundary. If `.alreadyRunning` reaches the app, it is
+  /// an incompatible start (different profile, stopping, etc.) and must
+  /// surface to the caller instead of pretending the requested profile
+  /// started.
+  func test_startEngine_propagates_alreadyRunning_conflict() async {
     let client = StubXPCClient()
     client.setStartResult(.failure(
       EngineError(code: .alreadyRunning, message: "engine already starting")))
     let store = EngineStatusStore(client: client)
-    try await store.startEngine(profileID: "chat")  // must NOT throw
+    do {
+      try await store.startEngine(profileID: "chat")
+      XCTFail("alreadyRunning from helper startEngine must surface as an incompatible start")
+    } catch let e as EngineError {
+      XCTAssertEqual(e.code, .alreadyRunning)
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
     XCTAssertEqual(client.startCalls, 1)
+  }
+
+  func test_startEngine_propagates_alreadyRunning_when_current_status_is_different_profile() async {
+    let client = StubXPCClient()
+    client.setStartResult(.failure(
+      EngineError(code: .alreadyRunning, message: "tree-of-thought already running")))
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(EngineSessionSnapshot(port: 8123, profileID: "tree-of-thought"))
+    )
+    do {
+      try await store.startEngine(profileID: "chat")
+      XCTFail("a different-profile alreadyRunning conflict must throw")
+    } catch let e as EngineError {
+      XCTAssertEqual(e.code, .alreadyRunning)
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 8123, profileID: "tree-of-thought")))
   }
 
   /// #422 F1: a resolver-stage start rejection re-throws AND does NOT move
@@ -184,7 +445,7 @@ final class EngineStatusStoreTests: XCTestCase {
     client.setStopResult(.failure(
       EngineError(code: .killRejected, message: "pid still alive")))
     let store = EngineStatusStore(
-      client: client, initialStatus: .running(port: 8123, profileID: "chat"))
+      client: client, initialStatus: .running(EngineSessionSnapshot(port: 8123, profileID: "chat")))
     do {
       try await store.stopEngine()
       XCTFail("a rejected stop must re-throw so the toggle can surface it")
@@ -193,8 +454,139 @@ final class EngineStatusStoreTests: XCTestCase {
     } catch {
       XCTFail("unexpected: \(error)")
     }
-    XCTAssertEqual(store.status, .running(port: 8123, profileID: "chat"),
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 8123, profileID: "chat")),
                    "a rejected stop must NOT change status — toggle stays on, so the view must explain why")
+  }
+
+  // MARK: - restartEngine (active profile default changed)
+
+  func test_restartEngine_forwardsToAuthoritativeClientRestart() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(EngineSessionSnapshot(port: 51234, profileID: "chat"))
+    )
+
+    try await store.restartEngine(profileID: "chat")
+
+    XCTAssertEqual(client.restartCalls, 1,
+                   "active-profile model changes need the helper's authoritative restart contract")
+    XCTAssertEqual(client.lastRestartProfileID, "chat")
+    XCTAssertEqual(client.stopCalls, 0,
+                   "app must not locally compose stop+start from a cached 1Hz status mirror")
+    XCTAssertEqual(client.startCalls, 0,
+                   "generic start swallows alreadyRunning; restart must not reuse that idempotent path")
+  }
+
+  func test_restartEngine_forwardsExplicitModelOverride() async throws {
+    // #469: a running-engine model switch threads the explicit pick through
+    // the restart so the rebuilt engine boots the chosen model.
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(EngineSessionSnapshot(port: 51234, profileID: "chat"))
+    )
+
+    try await store.restartEngine(profileID: "chat", modelOverride: "Org/New-GGUF/new.gguf")
+
+    XCTAssertEqual(client.restartCalls, 1)
+    XCTAssertEqual(client.lastRestartModelOverride, "Org/New-GGUF/new.gguf",
+                   "restartEngine must forward the explicit model override to the helper")
+  }
+
+  func test_restartEngine_defaultsToNilOverride() async throws {
+    // The convenience restart (set-as-default / post-download) boots the
+    // profile default — no override.
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(EngineSessionSnapshot(port: 51234, profileID: "chat"))
+    )
+
+    try await store.restartEngine(profileID: "chat")
+
+    XCTAssertNil(client.lastRestartModelOverride,
+                 "the no-override restart convenience boots the profile default")
+  }
+
+  func test_restartEngine_slowButSuccessfulStopDoesNotTripAppSideStopTimeout() async throws {
+    let client = StubXPCClient()
+    client.setStopResult(.failure(
+      AppXPCClientError.replyTimeout(selector: "stopEngine", timeout: 2.0)
+    ))
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(EngineSessionSnapshot(port: 51234, profileID: "chat"))
+    )
+
+    try await store.restartEngine(profileID: "chat")
+
+    XCTAssertEqual(client.stopCalls, 0,
+                   "a normal slow helper stop must be owned by the restart selector's longer deadline, not app-side stopEngine's short timeout")
+    XCTAssertEqual(client.startCalls, 0)
+    XCTAssertEqual(client.restartCalls, 1)
+  }
+
+  func test_restartEngine_staleStoppedCacheAlreadyRunningDoesNotSilentlySucceed() async {
+    let client = StubXPCClient()
+    let staleRunning = EngineError(code: .alreadyRunning,
+                                   message: "helper is already running despite stale app cache")
+    client.setStartResult(.failure(staleRunning))
+    client.setRestartResult(.failure(staleRunning))
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .stopped
+    )
+
+    do {
+      try await store.restartEngine(profileID: "chat")
+      XCTFail("restart must not report success when stale cached .stopped hides a live helper engine")
+    } catch let e as EngineError {
+      XCTAssertEqual(e.code, .alreadyRunning)
+      XCTAssertEqual(client.restartCalls, 1,
+                     "the helper-side restart selector owns real helper state")
+      XCTAssertEqual(client.startCalls, 0,
+                     "generic start would swallow .alreadyRunning and silently skip the rebuild")
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
+  }
+
+  /// #459 repro 2: a rebuild whose cold boot outlasts the App reply window
+  /// is in flight, not a failed reload. `restartEngine` must swallow
+  /// `.replyTimeout` so a slow large-model reload is never reported to the
+  /// caller (ProfileEditor) as a reload failure; the status poll surfaces the
+  /// real outcome.
+  func test_restartEngine_swallows_reply_timeout_as_in_flight() async throws {
+    let client = StubXPCClient()
+    client.setRestartResult(.failure(
+      AppXPCClientError.replyTimeout(selector: "restartEngine", timeout: 85.0)))
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(EngineSessionSnapshot(port: 51234, profileID: "chat"))
+    )
+    try await store.restartEngine(profileID: "chat")  // must NOT throw
+    XCTAssertEqual(client.restartCalls, 1)
+  }
+
+  /// A real helper `EngineError` (resolver rejected, modelMissing, …) still
+  /// propagates so ProfileEditor can surface the reason in its banner.
+  func test_restartEngine_propagates_real_failure() async {
+    let client = StubXPCClient()
+    client.setRestartResult(.failure(
+      EngineError(code: .modelMissing, message: "still missing")))
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .running(EngineSessionSnapshot(port: 51234, profileID: "chat"))
+    )
+    do {
+      try await store.restartEngine(profileID: "chat")
+      XCTFail("a real restart failure must throw so the UI can surface the reason")
+    } catch let e as EngineError {
+      XCTAssertEqual(e.code, .modelMissing)
+    } catch {
+      XCTFail("unexpected: \(error)")
+    }
   }
 
   // MARK: - initial state
@@ -216,12 +608,12 @@ final class EngineStatusStoreTests: XCTestCase {
 
   func test_refresh_publishes_running_and_exposes_baseURL() async throws {
     let client = StubXPCClient()
-    client.setNext(.running(port: 51234, profileID: "chat"))
+    client.setNext(.running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
     let store = EngineStatusStore(client: client)
 
     let status = try await store.refresh()
-    XCTAssertEqual(status, .running(port: 51234, profileID: "chat"))
-    XCTAssertEqual(store.status, .running(port: 51234, profileID: "chat"))
+    XCTAssertEqual(status, .running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
     XCTAssertEqual(store.baseURL, URL(string: "http://127.0.0.1:51234"))
     XCTAssertNil(store.lastError)
     XCTAssertEqual(store.pollCount, 1)
@@ -241,7 +633,7 @@ final class EngineStatusStoreTests: XCTestCase {
 
   func test_requireBaseURL_returns_url_when_running() async throws {
     let client = StubXPCClient()
-    client.setNext(.running(port: 8080, profileID: "chat"))
+    client.setNext(.running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
     let store = EngineStatusStore(client: client)
     _ = try await store.refresh()
     let url = try store.requireBaseURL()
@@ -260,9 +652,9 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertNil(store.baseURL)
     XCTAssertEqual(store.statusDetail, "Engine starting…")
 
-    client.setNext(.running(port: 49152, profileID: "chat"))
+    client.setNext(.running(EngineSessionSnapshot(port: 49152, profileID: "chat")))
     let s2 = try await store.refresh()
-    XCTAssertEqual(s2, .running(port: 49152, profileID: "chat"))
+    XCTAssertEqual(s2, .running(EngineSessionSnapshot(port: 49152, profileID: "chat")))
     XCTAssertEqual(store.baseURL, URL(string: "http://127.0.0.1:49152"))
 
     client.setNext(.stopped)
@@ -302,7 +694,7 @@ final class EngineStatusStoreTests: XCTestCase {
   /// failures, with no `lastError` churn.
   func test_transient_transport_loss_holds_last_running_status() async throws {
     let client = StubXPCClient()
-    client.setNext(.running(port: 51234, profileID: "chat"))
+    client.setNext(.running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
     let store = EngineStatusStore(client: client, tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3))
 
     _ = try await store.refresh()
@@ -312,7 +704,7 @@ final class EngineStatusStoreTests: XCTestCase {
     store._applyPollForTesting(next: nil, error: "NSXPCConnectionInterrupted")
     store._applyPollForTesting(next: nil, error: "NSXPCConnectionInterrupted")
 
-    XCTAssertEqual(store.status, .running(port: 51234, profileID: "chat"),
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 51234, profileID: "chat")),
                    "a sub-threshold transport blip must hold the last status, not flap")
     XCTAssertEqual(store.baseURL, URL(string: "http://127.0.0.1:51234"))
     XCTAssertNil(store.lastError,
@@ -325,7 +717,7 @@ final class EngineStatusStoreTests: XCTestCase {
   /// error with a Retry/Restart affordance. baseURL is cleared.
   func test_sustained_transport_loss_escalates_to_engineGone() async throws {
     let client = StubXPCClient()
-    client.setNext(.running(port: 51234, profileID: "chat"))
+    client.setNext(.running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
     let store = EngineStatusStore(client: client, tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3))
     _ = try await store.refresh()
 
@@ -347,22 +739,50 @@ final class EngineStatusStoreTests: XCTestCase {
     }
   }
 
+  /// #477 review F8: the store SYNTHESIZED this engineGone — there is no
+  /// evidence the engine process exited, so `statusDetail` must say
+  /// "can't reach", not the taxonomy's process-exited line; and the
+  /// diagnostic channel (`requireBaseURL`'s detail) keeps the raw cause.
+  func test_synthesized_engineGone_detail_is_honest_and_diagnostic_keeps_raw() async throws {
+    let client = StubXPCClient()
+    client.setNext(.running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
+    let store = EngineStatusStore(client: client, tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3))
+    _ = try await store.refresh()
+    for _ in 0..<3 {
+      store._applyPollForTesting(next: nil, error: "NSXPCConnectionInvalid")
+    }
+    XCTAssertEqual(store.statusDetail,
+                   "Can’t reach the engine — it stopped responding. Restart the engine to reconnect.")
+    XCTAssertThrowsError(try store.requireBaseURL()) { error in
+      guard case let HTTPEngineError.engineGone(detail) = error else {
+        return XCTFail("expected .engineGone, got \(error)")
+      }
+      XCTAssertTrue(detail.contains("NSXPCConnectionInvalid"),
+                    "diagnostic channel must keep the raw cause; got \(detail)")
+    }
+    // A helper-REPORTED engineGone goes back to the taxonomy line.
+    client.setNext(.failed(code: .engineGone, message: "liveness: pid 4 gone"))
+    _ = try await store.refresh()
+    XCTAssertEqual(store.statusDetail,
+                   "The engine process exited. Restart the engine to continue.")
+  }
+
   /// The escalation is "deaths without recovery": one successful poll
   /// resets the counter, so an intermittent helper never escalates.
   func test_successful_poll_resets_transport_failure_counter() async throws {
     let client = StubXPCClient()
     let store = EngineStatusStore(client: client, tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 3))
 
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
     store._applyPollForTesting(next: nil, error: "blip")
     store._applyPollForTesting(next: nil, error: "blip")
     // Recovery resets the counter…
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
     // …so two more blips still do NOT escalate.
     store._applyPollForTesting(next: nil, error: "blip")
     store._applyPollForTesting(next: nil, error: "blip")
 
-    XCTAssertEqual(store.status, .running(port: 8080, profileID: "chat"),
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
                    "a successful poll must reset the failure counter so an intermittent helper never escalates")
   }
 
@@ -377,7 +797,7 @@ final class EngineStatusStoreTests: XCTestCase {
     // Initial status is `.starting` → stamped at init.
     XCTAssertEqual(store.startingSince, fixed)
 
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
     XCTAssertNil(store.startingSince, "running clears startingSince")
 
     store._applyPollForTesting(next: .starting, error: nil)
@@ -395,12 +815,49 @@ final class EngineStatusStoreTests: XCTestCase {
     // initialStatus `.running` ⇒ wasEverRunning, so a post-run `.spawnFailed`
     // surfaces at once. (The #2 first-load hold defers a transient failure
     // ONLY during the very first load — covered by its own tests.)
-    let store = EngineStatusStore(client: client, initialStatus: .running(port: 8080, profileID: "chat"))
+    let store = EngineStatusStore(client: client, initialStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
     _ = try await store.refresh()
     XCTAssertEqual(store.status, .failed(code: .spawnFailed, message: "fork ENOENT"))
-    XCTAssertTrue(store.statusDetail.contains("spawnFailed"),
-                  "got \(store.statusDetail)")
-    XCTAssertTrue(store.statusDetail.contains("fork ENOENT"))
+    // #477: the detail line is the taxonomy's curated copy; the raw
+    // launcher diagnostic never reaches it.
+    XCTAssertEqual(store.statusDetail, "The engine failed to start. Try restarting it.")
+    XCTAssertFalse(store.statusDetail.contains("fork ENOENT"))
+  }
+
+  func test_kvUsageSnapshot_clears_after_running_usage_refresh_failure() async throws {
+    struct KVFailure: Error {}
+
+    let client = StubXPCClient()
+    let running = EngineStatus.running(EngineSessionSnapshot(port: 8080, profileID: "chat"))
+    client.setNext(running)
+    client.setNextKVUsage(.success([
+      KVUsageSnapshot(
+        modelID: "m",
+        pagesUsed: 90,
+        pagesTotal: 100,
+        observedAt: Date(timeIntervalSince1970: 1),
+        generation: 1,
+        source: .pieModelStatus
+      )
+    ]))
+    let store = EngineStatusStore(client: client, pollInterval: 10)
+    store.start()
+
+    try await waitUntil("initial KV usage refresh") { client.kvUsageCalls >= 1 }
+    store.stop()
+    XCTAssertNotNil(store.kvUsageSnapshot(for: "m"))
+
+    client.setNext(running)
+    client.setNextKVUsage(.failure(KVFailure()))
+    store.start()
+    defer { store.stop() }
+
+    try await waitUntil("second KV usage refresh") { client.kvUsageCalls >= 2 }
+
+    XCTAssertNil(
+      store.kvUsageSnapshot(for: "m"),
+      "failed KV refresh during a running poll must not leave stale counters available for cache.retention"
+    )
   }
 
   func test_memoryRisk_failed_status_surfaces_actionable_copy() async throws {
@@ -417,10 +874,12 @@ final class EngineStatusStoreTests: XCTestCase {
       code: .memoryRisk,
       message: "memory risk: model is 9.0 GB; choose a smaller model"
     ))
-    XCTAssertTrue(store.statusDetail.contains("Memory risk"),
-                  "got \(store.statusDetail)")
-    XCTAssertTrue(store.statusDetail.contains("choose a smaller model"),
-                  "got \(store.statusDetail)")
+    // #477: curated, actionable copy — the guardrail's diagnostic prose
+    // (sizes, paths) stays in logs / technicalDetail.
+    XCTAssertEqual(store.statusDetail,
+                   "This model exceeds this Mac’s safe memory limit. Pick a smaller model.")
+    XCTAssertFalse(store.statusDetail.contains("9.0 GB"),
+                   "got \(store.statusDetail)")
   }
 
   // MARK: - #412 review F1: recovery wait bounded by the ladder outcome
@@ -429,37 +888,41 @@ final class EngineStatusStoreTests: XCTestCase {
     // When the App's helper-restart ladder reports `.unreachable` (gave up),
     // the recovery wait must return false IMMEDIATELY rather than burn the
     // full (helper-sized) budget — so the chat turn surfaces in lockstep with
-    // the escalation banner instead of spinning for tens of seconds.
-    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting)
+    // the escalation banner instead of spinning for tens of seconds. Driven on
+    // a virtual clock: the early-exit must fire before a single inter-poll
+    // sleep advances it, so the measured budget burned is zero (no real wait).
+    let clock = VirtualClock()
+    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting,
+                                  now: { clock.nowDate() }, sleepFor: { clock.advance($0) })
     store.helperHealthProvider = { .unreachable }
-    let start = Date()
     let recovered = await store.waitUntilRunning(timeout: 10)
-    let elapsed = Date().timeIntervalSince(start)
     XCTAssertFalse(recovered, "a ladder that gave up must not report recovery")
-    XCTAssertLessThan(elapsed, 1.0, "must early-exit on .unreachable, not wait the full 10s budget")
+    XCTAssertEqual(clock.elapsed, 0, "must early-exit on .unreachable, not burn any of the 10s budget")
   }
 
   func test_waitUntilRunning_keepsWaiting_while_ladder_still_repairing() async {
     // While the ladder is still working (not terminal), the wait honors its
-    // budget — it must NOT bail early on a non-terminal helper state.
-    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting)
+    // budget — it must NOT bail early on a non-terminal helper state. Driven on
+    // a virtual clock so the full budget is "spent" with zero real wall time.
+    let clock = VirtualClock()
+    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting,
+                                  now: { clock.nowDate() }, sleepFor: { clock.advance($0) })
     store.helperHealthProvider = { .repairing(attempt: 1) }
-    let start = Date()
     let recovered = await store.waitUntilRunning(timeout: 0.3)
-    let elapsed = Date().timeIntervalSince(start)
     XCTAssertFalse(recovered)
-    XCTAssertGreaterThanOrEqual(elapsed, 0.25, "a still-repairing ladder must not trip the give-up early-exit")
+    XCTAssertGreaterThanOrEqual(clock.elapsed, 0.3,
+                                "a still-repairing ladder must not trip the give-up early-exit")
   }
 
   func test_waitUntilRunning_noProvider_waits_full_budget() async {
     // Backward compat: with no helper-health source (engine-gone path / tests)
     // `helperRecoveryGaveUp` is false and the wait runs to its timeout.
-    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting)
-    let start = Date()
+    let clock = VirtualClock()
+    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting,
+                                  now: { clock.nowDate() }, sleepFor: { clock.advance($0) })
     let recovered = await store.waitUntilRunning(timeout: 0.3)
-    let elapsed = Date().timeIntervalSince(start)
     XCTAssertFalse(recovered)
-    XCTAssertGreaterThanOrEqual(elapsed, 0.25, "no give-up signal → honor the timeout")
+    XCTAssertGreaterThanOrEqual(clock.elapsed, 0.3, "no give-up signal → honor the timeout")
   }
 
   // MARK: - #2 first-load transient-failure hold
@@ -473,8 +936,8 @@ final class EngineStatusStoreTests: XCTestCase {
     store._applyPollForTesting(next: .failed(code: .spawnFailed, message: "engine exited early"), error: nil)
     store._applyPollForTesting(next: .failed(code: .spawnFailed, message: "engine exited early"), error: nil)
     XCTAssertEqual(store.status, .starting, "a transient first-load .spawnFailed must read as Starting…, not error")
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
-    XCTAssertEqual(store.status, .running(port: 8080, profileID: "chat"))
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
     XCTAssertTrue(store.wasEverRunning)
   }
 
@@ -495,7 +958,7 @@ final class EngineStatusStoreTests: XCTestCase {
   func test_hold_does_not_apply_once_engine_has_run() {
     let store = EngineStatusStore(client: StubXPCClient(),
       tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 5, firstLoadFailureGracePolls: 3))
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
     XCTAssertTrue(store.wasEverRunning)
     store._applyPollForTesting(next: .failed(code: .spawnFailed, message: "died"), error: nil)
     guard case .failed(.spawnFailed, _) = store.status else {
@@ -507,13 +970,154 @@ final class EngineStatusStoreTests: XCTestCase {
   /// consecutive `.failed(.engineGone)`, resets on any other status.
   func test_engineGonePolls_counts_consecutive_engineGone_and_resets() {
     let store = EngineStatusStore(client: StubXPCClient())
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
     XCTAssertEqual(store.engineGonePolls, 0)
     store._applyPollForTesting(next: .failed(code: .engineGone, message: "exit 1"), error: nil)
     store._applyPollForTesting(next: .failed(code: .engineGone, message: "exit 1"), error: nil)
     XCTAssertEqual(store.engineGonePolls, 2)
-    store._applyPollForTesting(next: .running(port: 8080, profileID: "chat"), error: nil)
+    store._applyPollForTesting(next: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")), error: nil)
     XCTAssertEqual(store.engineGonePolls, 0)
+  }
+
+  // MARK: - #587 adaptive poll cadence
+
+  /// Cadence selection is a pure function of the resolved state — asserted
+  /// by the chosen tier, never by elapsed wall-clock (avoids real sleeps).
+  func test_cadence_running_is_steady() {
+    let store = EngineStatusStore(client: StubXPCClient(),
+                                  initialStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
+    XCTAssertEqual(store.currentCadence(), .steady)
+  }
+
+  func test_cadence_starting_and_stopping_are_transition() {
+    let starting = EngineStatusStore(client: StubXPCClient(), initialStatus: .starting)
+    XCTAssertEqual(starting.currentCadence(), .transition)
+    let stopping = EngineStatusStore(client: StubXPCClient(), initialStatus: .stopping)
+    XCTAssertEqual(stopping.currentCadence(), .transition)
+  }
+
+  func test_cadence_stopped_is_paused() {
+    let store = EngineStatusStore(client: StubXPCClient(), initialStatus: .stopped)
+    XCTAssertEqual(store.currentCadence(), .paused,
+                   "a stopped engine expects no session — the loop must pause so App Nap can engage")
+  }
+
+  func test_cadence_persistent_failure_is_paused() {
+    // memoryRisk is terminal until the user acts; polling cannot change it.
+    let store = EngineStatusStore(client: StubXPCClient(),
+                                  initialStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
+    store._applyPollForTesting(next: .failed(code: .memoryRisk, message: "model too large"), error: nil)
+    XCTAssertEqual(store.currentCadence(), .paused)
+  }
+
+  func test_cadence_engineGone_recovery_is_transition() {
+    let store = EngineStatusStore(client: StubXPCClient(),
+                                  initialStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
+    store._applyPollForTesting(next: .failed(code: .engineGone, message: "exit 1"), error: nil)
+    XCTAssertEqual(store.engineGonePolls, 1)
+    XCTAssertEqual(store.currentCadence(), .transition,
+                   "an engine-death recovery episode must stay on the fast tier")
+  }
+
+  func test_cadence_transport_blip_holds_fast_even_while_running() {
+    // A sub-threshold transport blip holds the last `.running` status, but the
+    // loss is in progress — poll fast to catch the recovery, don't drop to steady.
+    let store = EngineStatusStore(client: StubXPCClient(),
+                                  initialStatus: .running(EngineSessionSnapshot(port: 8080, profileID: "chat")),
+                                  tierPolicy: StatusTierPolicy(tier1Polls: 2, tier2Polls: 5))
+    store._applyPollForTesting(next: nil, error: "NSXPCConnectionInterrupted")
+    XCTAssertEqual(store.status, .running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
+    XCTAssertEqual(store.currentCadence(), .transition,
+                   "a transport blip in progress must keep the fast cadence")
+  }
+
+  func test_sleepInterval_maps_tier_to_configured_interval() {
+    let store = EngineStatusStore(client: StubXPCClient(),
+                                  pollInterval: 1.0, steadyPollInterval: 10.0)
+    XCTAssertEqual(store.sleepInterval(for: .transition), 1.0)
+    XCTAssertEqual(store.sleepInterval(for: .steady), 10.0)
+    XCTAssertEqual(store.sleepInterval(for: .paused), .infinity)
+  }
+
+  /// The live loop must SUSPEND once a poll resolves to a no-session state —
+  /// exactly one poll lands and no further wakeups follow. With a 10 ms fast
+  /// interval an un-paused loop would poll ~10× in 120 ms; pinning `calls == 1`
+  /// proves the suspend without asserting on elapsed time.
+  func test_loop_pauses_after_stopped_poll() async throws {
+    let client = StubXPCClient()
+    client.setNext(.stopped)
+    let store = EngineStatusStore(client: client, pollInterval: 0.01, steadyPollInterval: 0.01)
+    store.start()
+    try await waitUntil("first poll applies .stopped") { store.status == .stopped }
+    try await Task.sleep(nanoseconds: 120_000_000)
+    XCTAssertEqual(client.calls, 1,
+                   "loop must pause after a .stopped poll — no further wakeups")
+  }
+
+  /// Resume: `start()` re-arms a loop that paused itself (idempotency makes
+  /// it the single resume primitive for every wake trigger).
+  func test_start_rearms_paused_loop() async throws {
+    let client = StubXPCClient()
+    client.setNext(.stopped)
+    let store = EngineStatusStore(client: client, pollInterval: 0.01, steadyPollInterval: 0.01)
+    store.start()
+    try await waitUntil("paused on .stopped") { store.status == .stopped }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    let callsAtPause = client.calls
+
+    client.setNext(.running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
+    store.start()  // resume
+    try await waitUntil("loop re-armed and saw .running") {
+      if case .running = store.status { return true }
+      return false
+    }
+    XCTAssertGreaterThan(client.calls, callsAtPause,
+                         "start() must re-arm a paused loop")
+    store.stop()
+  }
+
+  /// A start request is a resume trigger: `startEngine` re-arms a paused loop
+  /// (before the XPC call) so the start's transition is surfaced.
+  func test_startEngine_rearms_paused_loop() async throws {
+    let client = StubXPCClient()
+    client.setNext(.stopped)
+    let store = EngineStatusStore(client: client, pollInterval: 0.01, steadyPollInterval: 0.01)
+    store.start()
+    try await waitUntil("paused on .stopped") { store.status == .stopped }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    let callsAtPause = client.calls
+
+    client.setNext(.starting)
+    try await store.startEngine(profileID: "chat")
+    try await waitUntil("loop polling resumed") { client.calls > callsAtPause }
+    XCTAssertGreaterThan(client.calls, callsAtPause,
+                         "startEngine must re-arm a paused loop")
+    store.stop()
+  }
+
+  /// A restart is a resume trigger too (#587 review F1): `restartEngine`
+  /// rebuilds the engine, so a paused loop must re-arm or the published status
+  /// stays frozen at `.stopped`/old `.failed` while a live engine runs.
+  /// Sibling of `test_startEngine_rearms_paused_loop`.
+  func test_restartEngine_rearms_paused_loop() async throws {
+    let client = StubXPCClient()
+    client.setNext(.stopped)
+    let store = EngineStatusStore(client: client, pollInterval: 0.01, steadyPollInterval: 0.01)
+    store.start()
+    try await waitUntil("paused on .stopped") { store.status == .stopped }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    let callsAtPause = client.calls
+
+    client.setNext(.running(EngineSessionSnapshot(port: 8080, profileID: "chat")))
+    try await store.restartEngine(profileID: "chat")
+    try await waitUntil("loop polling resumed and saw .running") {
+      guard client.calls > callsAtPause else { return false }
+      if case .running = store.status { return true }
+      return false
+    }
+    XCTAssertGreaterThan(client.calls, callsAtPause,
+                         "restartEngine must re-arm a paused loop")
+    store.stop()
   }
 
   private func waitUntil(

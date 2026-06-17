@@ -1,5 +1,5 @@
 #!/bin/bash
-#  follow-up — REAL Helper-hosted engine E2E.
+# Real Helper-hosted engine E2E.
 #
 # Exercises the production engine-launch path with NO mock and NO
 # PIE_TEST_ENGINE_BASE_URL bypass: real LaunchSpecResolver → real
@@ -44,14 +44,30 @@ REPO="${PIE_TEST_E2E_REPO:-Qwen/Qwen2.5-0.5B-Instruct-GGUF}"
 FILE="${PIE_TEST_E2E_FILE:-qwen2.5-0.5b-instruct-q4_k_m.gguf}"
 MODELS_DIR="${PIE_TEST_E2E_MODELS_DIR:-/tmp/pie-e2e-models}"
 MODEL_PATH="$MODELS_DIR/$FILE"
+MIN_MODEL_BYTES="${PIE_TEST_E2E_MIN_BYTES:-300000000}"
+
+case "$MIN_MODEL_BYTES" in
+  ''|*[!0-9]*)
+    echo "e2e: PIE_TEST_E2E_MIN_BYTES must be a positive integer, got '$MIN_MODEL_BYTES'" >&2
+    exit 2
+    ;;
+esac
+if [ "$MIN_MODEL_BYTES" -le 0 ]; then
+  echo "e2e: PIE_TEST_E2E_MIN_BYTES must be > 0, got '$MIN_MODEL_BYTES'" >&2
+  exit 2
+fi
+
+file_size_bytes() {
+  stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0
+}
 
 # --- pie engine binary: prefer a release build, fall back to bundled --
 PIE_BIN="${PIE_BIN:-}"
 if [ -z "$PIE_BIN" ]; then
   if [ -x "$ROOT/Vendor/pie/target/release/pie" ]; then
     PIE_BIN="$ROOT/Vendor/pie/target/release/pie"
-  elif [ -x "/Applications/RatioThink.app/Contents/Resources/pie-engine/pie" ]; then
-    PIE_BIN="/Applications/RatioThink.app/Contents/Resources/pie-engine/pie"
+  elif [ -x "/Applications/Rational.app/Contents/Resources/pie-engine/pie" ]; then
+    PIE_BIN="/Applications/Rational.app/Contents/Resources/pie-engine/pie"
     # Loud fallback: no repo build exists, so this run exercises the
     # INSTALLED app's engine binary, not the current worktree. Make the
     # substitution visible so a stale /Applications build can't silently
@@ -78,27 +94,49 @@ fi
 
 # --- stage the model (download once) ----------------------------------
 mkdir -p "$MODELS_DIR"
-if [ ! -f "$MODEL_PATH" ] || [ "$(stat -f%z "$MODEL_PATH" 2>/dev/null || echo 0)" -lt 300000000 ]; then
+if [ ! -f "$MODEL_PATH" ] || [ "$(file_size_bytes "$MODEL_PATH")" -lt "$MIN_MODEL_BYTES" ]; then
+  if [ -f "$MODEL_PATH" ]; then
+    existing_size="$(file_size_bytes "$MODEL_PATH")"
+    echo "e2e: existing staged model too small ($existing_size bytes; need >= $MIN_MODEL_BYTES): $MODEL_PATH" >&2
+  fi
   if ! curl -sSf -o /dev/null --max-time 20 -r 0-0 "https://huggingface.co/$REPO/resolve/main/$FILE?download=true"; then
     echo "e2e: cannot reach Hugging Face for $REPO/$FILE — network required to stage the model." >&2
     exit 2
   fi
+  tmp="$MODEL_PATH.tmp.$$"
+  rm -f "$tmp"
   echo "e2e: downloading $REPO/$FILE → $MODEL_PATH"
-  curl -sSL -o "$MODEL_PATH" "https://huggingface.co/$REPO/resolve/main/$FILE?download=true"
+  if ! curl -fSL -o "$tmp" "https://huggingface.co/$REPO/resolve/main/$FILE?download=true"; then
+    rm -f "$tmp"
+    echo "e2e: download failed for $REPO/$FILE" >&2
+    exit 2
+  fi
+  downloaded_size="$(file_size_bytes "$tmp")"
+  if [ "$downloaded_size" -lt "$MIN_MODEL_BYTES" ]; then
+    rm -f "$tmp"
+    echo "e2e: downloaded model too small ($downloaded_size bytes; need >= $MIN_MODEL_BYTES) for $REPO/$FILE" >&2
+    exit 2
+  fi
+  mv -f "$tmp" "$MODEL_PATH"
 fi
 echo "e2e: model staged at $MODEL_PATH ($(du -h "$MODEL_PATH" | awk '{print $1}'))"
 echo "e2e: pie engine = $PIE_BIN"
 
 # --- run the gated real-engine test -----------------------------------
+# `--filter` defaults to the whole class. The matrix driver
+# (Scripts/run-matrix-e2e.sh) overrides it to a single method so one boot
+# per model runs exactly the profile-matrix cell, not the happy-path +
+# reasoning tests too.
+FILTER="${PIE_TEST_E2E_FILTER:-RealEngineLaunchE2ETests}"
 mkdir -p "$ROOT/logs"
 LOG="$ROOT/logs/test-$(date +%Y%m%d-%H%M%S)-engine-e2e.log"
-echo "e2e: running RealEngineLaunchE2ETests (log: $LOG)"
+echo "e2e: running $FILTER (log: $LOG)"
 set +e
 PIE_TEST_REAL_PIE_BIN="$PIE_BIN" \
 PIE_TEST_REAL_MODEL_PATH="$MODEL_PATH" \
 PIE_TEST_REAL_CHATAPC_WASM="$WASM" \
 PIE_TEST_REAL_CHATAPC_MANIFEST="$MANIFEST" \
-  swift test --filter RealEngineLaunchE2ETests 2>&1 | tee "$LOG"
+  swift test --filter "$FILTER" 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
 echo "e2e: swift test rc=$rc"

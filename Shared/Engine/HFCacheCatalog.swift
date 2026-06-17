@@ -107,6 +107,15 @@ public enum HFCacheCatalog {
     let hasNonGGUFWeight = weights.contains { !$0.isGGUF }
     if hasNonGGUFWeight || ggufs.isEmpty {
       let metrics = snapshotMetrics(snapshot, fileManager: fileManager)
+      // Mark a quantized HF/MLX safetensors snapshot unlaunchable: pie's
+      // portable v1 loads only F32/F16/BF16 safetensors, so a U32-packed
+      // 4/8-bit repo boots and then dies with `unsupported safetensors
+      // dtype … U32`. Probing the actual header dtype matches the exact
+      // field the driver rejects on, so a working bf16/f16/f32 repo is
+      // never falsely gated. The row still lists (the user sees the
+      // cached model) but selection is disabled, mirroring split-GGUF.
+      let unsupportedReason = firstUnlaunchableSafetensorsDtype(among: weights)
+        .map(Self.quantizedSafetensorsReason(dtype:))
       rows.append(InstalledModel(
         filename: repo,
         url: snapshot,
@@ -115,10 +124,105 @@ public enum HFCacheCatalog {
         isPartial: false,
         isUnverified: false,
         metadataUnreadable: false,
-        source: .huggingFaceCache
+        source: .huggingFaceCache,
+        unsupportedReason: unsupportedReason,
+        precision: dirModelPrecision(snapshot: snapshot,
+                                     weights: weights,
+                                     fileManager: fileManager)
       ))
     }
     return rows
+  }
+
+  /// Human-readable reason a quantized safetensors row is unlaunchable,
+  /// naming the exact dtype the portable driver rejected.
+  static func quantizedSafetensorsReason(dtype: String) -> String {
+    "Quantized HF/MLX safetensors (\(dtype)): engine v1 loads F32/F16/BF16 — use a GGUF quant"
+  }
+
+  /// safetensors dtypes the portable v1 driver can load. Mirrors
+  /// `st_to_ggml_dtype` in `Vendor/pie/driver/portable/src/model.cpp`
+  /// (~lines 61-72), which throws on anything else; quantized HF/MLX
+  /// repos pack weights as `U32`, so their header carries dtypes outside
+  /// this set.
+  private static let launchableSafetensorsDtypes: Set<String> = ["F32", "F16", "BF16"]
+
+  /// First weight dtype in any `.safetensors` header that the portable
+  /// driver cannot load, or nil when every tensor is F32/F16/BF16. An
+  /// unreadable/corrupt header returns nil (no false gate): presence was
+  /// already proven, so an unparseable header falls through to the
+  /// engine's own error rather than hiding the model from the picker.
+  private static func firstUnlaunchableSafetensorsDtype(
+    among weights: [WeightArtifact]) -> String? {
+    for weight in weights
+    where !weight.isGGUF && weight.relativePath.lowercased().hasSuffix(".safetensors") {
+      if let dtype = unlaunchableDtypeInSafetensorsHeader(at: weight.url) {
+        return dtype
+      }
+    }
+    return nil
+  }
+
+  /// Refuse a resolved model path whose `.safetensors` weights are a
+  /// quantized HF/MLX format the portable v1 driver cannot load, naming
+  /// the offending dtype. Handles both shapes `resolveModelRef` produces:
+  /// a snapshot DIRECTORY (2-segment slug → every `.safetensors` weight
+  /// is probed) and a single `.safetensors` FILE (3-segment slug
+  /// `org/name/file.safetensors` → that file is probed). Returns nil for
+  /// a launchable snapshot, a single-file GGUF/other path, or an
+  /// unreadable header. The launch path calls this so a stale/hand-
+  /// authored profile pointing at such a repo fails fast with a clear
+  /// reason instead of the cryptic engine rc=-1 — the same fast-fail
+  /// shape as `isSplitShardFilename`.
+  static func quantizedSafetensorsReason(forResolvedModelPath path: String,
+                                         fileManager: FileManager = .default) -> String? {
+    let url = URL(fileURLWithPath: path)
+    var isDirectory: ObjCBool = false
+    guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory) else { return nil }
+    if isDirectory.boolValue {
+      let weights = weightArtifacts(in: url, fileManager: fileManager)
+      return firstUnlaunchableSafetensorsDtype(among: weights)
+        .map(quantizedSafetensorsReason(dtype:))
+    }
+    // Single-file path: probe it directly. Only `.safetensors` is gated —
+    // a `.gguf` or other single file falls through to its own loader.
+    guard path.lowercased().hasSuffix(".safetensors") else { return nil }
+    return unlaunchableDtypeInSafetensorsHeader(at: url)
+      .map(quantizedSafetensorsReason(dtype:))
+  }
+
+  /// Read a `.safetensors` header and return the first tensor dtype the
+  /// portable driver would reject, or nil if all are launchable / the
+  /// header is unreadable. Format: little-endian `u64` header length,
+  /// then that many bytes of JSON mapping each tensor name to
+  /// `{ "dtype": …, "shape": …, "data_offsets": … }`; the reserved
+  /// `__metadata__` key is not a tensor. Only the header is read.
+  static func unlaunchableDtypeInSafetensorsHeader(at url: URL) -> String? {
+    let resolved = url.resolvingSymlinksInPath()
+    guard let handle = try? FileHandle(forReadingFrom: resolved) else { return nil }
+    defer { try? handle.close() }
+    guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8 else {
+      return nil
+    }
+    let headerLength = UInt64(littleEndian:
+      lengthData.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) })
+    // Guard a corrupt/garbage length: a real header is small JSON, so an
+    // absurd value (e.g. raw weight bytes misread as a length) is not a
+    // header to parse — fall through to nil rather than allocating it.
+    // Cap matches the driver's MAX_HEADER_SIZE (128 MiB,
+    // `Vendor/pie/driver/portable/src/safetensors.cpp:23`) so no header
+    // the driver would parse is silently treated as launchable.
+    guard headerLength > 0, headerLength <= 128 * 1024 * 1024 else { return nil }
+    guard let jsonData = try? handle.read(upToCount: Int(headerLength)),
+          jsonData.count == Int(headerLength),
+          let object = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
+    else { return nil }
+    for (name, value) in object where name != "__metadata__" {
+      guard let tensor = value as? [String: Any],
+            let dtype = tensor["dtype"] as? String else { continue }
+      if !launchableSafetensorsDtypes.contains(dtype) { return dtype }
+    }
+    return nil
   }
 
   /// Build the GGUF rows for a repo, collapsing split shard sets.
@@ -269,6 +373,90 @@ public enum HFCacheCatalog {
       ))
     }
     return out
+  }
+
+  /// Best-effort weight precision for a directory-loaded model, from REAL
+  /// metadata only (never fabricated):
+  ///   1. `config.json` `torch_dtype` (the HF-canonical field), else
+  ///   2. the dtype of the first tensor in the first `.safetensors` header.
+  /// Returns a short tag (`bf16`/`f16`/`f32`/…), or `nil` when neither source
+  /// yields one — the caller then shows a neutral label, not a guess.
+  private static func dirModelPrecision(snapshot: URL,
+                                        weights: [WeightArtifact],
+                                        fileManager: FileManager) -> String? {
+    if let dtype = torchDtypeFromConfig(snapshot, fileManager: fileManager),
+       let tag = Self.precisionTag(fromTorchDtype: dtype) {
+      return tag
+    }
+    if let st = weights.first(where: { $0.relativePath.lowercased().hasSuffix(".safetensors") }),
+       let dtype = safetensorsHeaderDtype(st.url),
+       let tag = Self.precisionTag(fromSafetensorsDtype: dtype) {
+      return tag
+    }
+    return nil
+  }
+
+  private static func torchDtypeFromConfig(_ snapshot: URL,
+                                           fileManager: FileManager) -> String? {
+    let cfg = snapshot.appendingPathComponent("config.json").resolvingSymlinksInPath()
+    guard let data = try? Data(contentsOf: cfg),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    if let dtype = obj["torch_dtype"] as? String { return dtype }
+    // Multimodal configs sometimes nest the dtype under a text sub-config.
+    if let text = obj["text_config"] as? [String: Any],
+       let dtype = text["torch_dtype"] as? String { return dtype }
+    return nil
+  }
+
+  /// Dtype of the first real tensor in a `.safetensors` header. Layout: an
+  /// 8-byte little-endian header length, then that many bytes of JSON whose
+  /// tensor entries each carry a `dtype` (`BF16`/`F16`/`F32`/…). `__metadata__`
+  /// is skipped. Reads only the header, never the (multi-GB) weights.
+  private static func safetensorsHeaderDtype(_ url: URL) -> String? {
+    let resolved = url.resolvingSymlinksInPath()
+    guard let handle = try? FileHandle(forReadingFrom: resolved) else { return nil }
+    defer { try? handle.close() }
+    guard let lenData = try? handle.read(upToCount: 8), lenData.count == 8 else { return nil }
+    var headerLen: UInt64 = 0
+    for (i, b) in lenData.enumerated() { headerLen |= UInt64(b) << (8 * i) }
+    guard headerLen > 0, headerLen < 50_000_000 else { return nil }
+    guard let json = try? handle.read(upToCount: Int(headerLen)),
+          let obj = try? JSONSerialization.jsonObject(with: json) as? [String: Any]
+    else { return nil }
+    for (key, value) in obj where key != "__metadata__" {
+      if let tensor = value as? [String: Any], let dtype = tensor["dtype"] as? String {
+        return dtype
+      }
+    }
+    return nil
+  }
+
+  /// HF `torch_dtype` string → short tag. `nil` for unrecognized values so an
+  /// unknown precision is shown as a neutral label, never invented.
+  static func precisionTag(fromTorchDtype dtype: String) -> String? {
+    switch dtype.lowercased() {
+    case "bfloat16", "bf16": return "bf16"
+    case "float16", "fp16", "half": return "f16"
+    case "float32", "fp32", "float": return "f32"
+    case "float64", "fp64", "double": return "f64"
+    case "int8", "qint8": return "int8"
+    case "uint8": return "uint8"
+    default: return nil
+    }
+  }
+
+  /// safetensors header dtype token → short tag. `nil` for unrecognized.
+  static func precisionTag(fromSafetensorsDtype dtype: String) -> String? {
+    switch dtype.uppercased() {
+    case "BF16": return "bf16"
+    case "F16": return "f16"
+    case "F32": return "f32"
+    case "F64": return "f64"
+    case "I8": return "int8"
+    case "U8": return "uint8"
+    default: return nil
+    }
   }
 
   /// `models--Qwen--Qwen3-0.6B` → `Qwen/Qwen3-0.6B`. Returns `nil` for

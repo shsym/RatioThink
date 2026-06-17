@@ -1,29 +1,22 @@
 import Foundation
 import os
 
-/// Production engine manager that replaces `PieSupervisor` on the
-/// helper boot path. Wraps `PieControlLauncher.launch`
-/// + `LaunchedSession` and projects the result onto the
-/// `EngineStatus` surface previously owned by `PieSupervisor`, so
+/// Production engine manager on the helper boot path. Wraps
+/// `PieControlLauncher.launch` + `LaunchedSession` and projects the
+/// result onto the `EngineStatus` surface, so
 /// `HelperStatusItemBinding` / `HelperStatusItemModel.make(from:)`
 /// keep working unchanged.
 ///
-/// PieSupervisor's argv (`pie --model <path> --http-listen :0
-/// --inferlet-dir <dir>`) and `HTTP_LISTEN=` handshake parser do not
-/// match the current `pie` binary, which is a multi-command CLI
-/// whose engine is `pie serve --config <toml>` with handshake
-/// `pie-server serving on <host>:<port>` + `internal token: <tok>`.
-/// PieControlLauncher already speaks that protocol; this host plugs
-/// it into the helper's selector + menu-bar wiring without
-/// rewriting PieSupervisor itself.
+/// The engine is `pie serve --config <toml>`, a multi-command CLI
+/// with handshake `pie-server serving on <host>:<port>` + `internal
+/// token: <tok>`. `PieControlLauncher` speaks that protocol; this
+/// host plugs it into the helper's selector + menu-bar wiring.
 ///
-/// Scope ceiling ( "Out of scope"): the restart ladder,
-/// slow-flap cap, and `.killRejected` boot recovery from
-/// `PieSupervisor.swift:563,890,1132+` are NOT ported here. A
-/// single-shot lifecycle closes the MVP-S1 chat-demo path; if pie
-/// crashes mid-session the host transitions to `.failed` and waits
-/// for an explicit user Resume. Porting (or re-deciding) those
-/// behaviors is a follow-up.
+/// Scope ceiling: a restart ladder, slow-flap cap, and `.killRejected`
+/// boot recovery are NOT implemented here. A single-shot lifecycle
+/// closes the MVP-S1 chat-demo path; if pie crashes mid-session the
+/// host transitions to `.failed` and waits for an explicit user
+/// Resume. Adding those behaviors is a follow-up.
 ///
 /// Concurrency model:
 ///  · `stateQueue` (serial) owns every `_state` transition. The
@@ -42,6 +35,41 @@ public enum EngineLiveness: Equatable, Sendable {
   case gone(reason: String)
 }
 
+public struct EngineShutdownResult: Equatable, Sendable {
+  public let reaped: Bool
+  public let message: String
+
+  public static let reaped = EngineShutdownResult(reaped: true, message: "")
+
+  public static func unreaped(_ message: String) -> EngineShutdownResult {
+    EngineShutdownResult(reaped: false, message: message)
+  }
+
+  public init(reaped: Bool, message: String = "") {
+    self.reaped = reaped
+    self.message = message
+  }
+}
+
+public struct StopAndWaitResult: Equatable, Sendable {
+  public enum Completion: Equatable, Sendable {
+    case terminalReaped
+    case terminalFailed
+    case timedOut
+  }
+
+  public let completion: Completion
+  public let lastStatus: EngineStatus
+
+  public var reachedTerminal: Bool { completion == .terminalReaped }
+  public var failedBeforeReap: Bool { completion == .terminalFailed }
+
+  public init(completion: Completion, lastStatus: EngineStatus) {
+    self.completion = completion
+    self.lastStatus = lastStatus
+  }
+}
+
 public final class PieEngineHost: @unchecked Sendable {
 
   // MARK: - LaunchSpec
@@ -55,9 +83,8 @@ public final class PieEngineHost: @unchecked Sendable {
   // MARK: - Observation
 
   /// Opaque handle returned by `observe`. Drop it (or call
-  /// `cancel()`) to stop receiving status updates. Same shape as
-  /// `PieSupervisor.ObservationToken` so `HelperMain
-  /// .supervisorObservation` can hold either.
+  /// `cancel()`) to stop receiving status updates. Held by
+  /// `HelperMain.supervisorObservation`.
   public final class ObservationToken: @unchecked Sendable {
     private let onCancel: () -> Void
     private let lock = OSAllocatedUnfairLock<Bool>(initialState: false)
@@ -76,20 +103,45 @@ public final class PieEngineHost: @unchecked Sendable {
 
   private enum State {
     case stopped
-    case starting(profileID: String, launchTask: Task<Void, Never>)
-    case running(port: EnginePort, profileID: String, session: any EngineSession)
-    case stopping(session: (any EngineSession)?)
+    case starting(profileID: String, launchID: UInt64, launchTask: Task<Void, Never>)
+    case running(snapshot: EngineSessionSnapshot, session: any EngineSession)
+    case stopping(session: (any EngineSession)?, launchID: UInt64?)
     case failed(EngineErrorCode, String)
 
     var publicStatus: EngineStatus {
       switch self {
-      case .stopped:                                return .stopped
-      case .starting:                               return .starting
-      case .running(let port, let profileID, _):    return .running(port: port, profileID: profileID)
-      case .stopping:                               return .stopping
-      case .failed(let code, let message):          return .failed(code: code, message: message)
+      case .stopped:                       return .stopped
+      case .starting:                      return .starting
+      case .running(let snapshot, _):      return .running(snapshot)
+      case .stopping:                      return .stopping
+      case .failed(let code, let message): return .failed(code: code, message: message)
       }
     }
+  }
+
+  /// Build the authoritative `EngineSessionSnapshot` (#476) for a session that
+  /// just reached `.running`, from the actual `LaunchSpec` the host launched
+  /// plus the OS-assigned port and the launch generation. `servedModelID` is
+  /// the engine's advertised `/v1/models` id; `maxOutputTokens` is the
+  /// effective per-request ceiling pie enforces, derived from the two KV knobs
+  /// the helper owns (see `KVCacheBudget.effectiveOutputCeiling`) — so the App
+  /// gets the served model + ceiling atomically on the `.running` edge with no
+  /// `/v1/models` round-trip.
+  private static func sessionSnapshot(port: EnginePort,
+                                      launchID: UInt64,
+                                      spec: LaunchSpec) -> EngineSessionSnapshot {
+    EngineSessionSnapshot(
+      generation: launchID,
+      port: port,
+      profileID: spec.profileID,
+      servedModelID: spec.modelConfig.servedModelID,
+      maxOutputTokens: KVCacheBudget.effectiveOutputCeiling(
+        defaultTokenLimit: spec.defaultTokenLimit,
+        maxNumKvPages: spec.maxNumKvPages),
+      // #562: carry the launched listener mode so the App's exposure-warning
+      // path reads a confirmed bind host off the running snapshot instead of
+      // inferring it from preferences.
+      daemonBindHost: spec.daemonBindHost)
   }
 
   // MARK: - Launcher seam
@@ -111,14 +163,29 @@ public final class PieEngineHost: @unchecked Sendable {
   /// `checkLiveness()` default returns `.alive` so existing fakes that
   /// only care about shutdown need no change.
   public protocol EngineSession: Sendable {
-    func shutdown() async
+    func shutdown() async -> EngineShutdownResult
+    func shutdown(reason: String) async -> EngineShutdownResult
     func checkLiveness() async -> EngineLiveness
+    func diagnosticProcessID() async -> pid_t?
+    func modelStatusJSON() async throws -> String?
     /// Resident memory of the live engine process in bytes, or nil when
     /// unavailable. Default nil (see extension) so test fakes that
     /// only model shutdown/liveness need no change; the production
     /// `LaunchedSession` overrides with a `proc_pid_rusage` sample of the
     /// pie pid.
     func residentMemoryBytes() async -> UInt64?
+    /// Highest successful RSS sample observed during the child lifetime.
+    /// Unlike `residentMemoryBytes()`, this may remain available after a
+    /// fast exit/SIGKILL, when the dead process can no longer be sampled.
+    func observedResidentMemoryBytes() async -> UInt64?
+    /// Process-exit snapshot for the #447 termination classifier, or nil
+    /// while the process is still alive (a control-plane hang → the host
+    /// classifies `.livenessFailure`). Default nil so test fakes that only
+    /// model shutdown/liveness need no change.
+    func terminationSnapshot() async -> (reason: Process.TerminationReason, status: Int32)?
+    /// Bounded, token-redacted tail of the engine's stdout/stderr for
+    /// durable failure capture (#447). Default empty.
+    func diagnosticTail() async -> [String]
   }
 
   // MARK: - RelaunchPolicy
@@ -129,8 +196,8 @@ public final class PieEngineHost: @unchecked Sendable {
   /// `.failed` the user must manually click Resume out of. After the
   /// ladder exhausts (more than `maxAttempts` engine-gone transitions
   /// inside `window`), the host stops auto-relaunching and waits for
-  /// an explicit user action — mirrors PieSupervisor's slow-flap cap
-  /// so a chronically broken engine doesn't loop forever.
+  /// an explicit user action — a slow-flap cap so a chronically
+  /// broken engine doesn't loop forever.
   public struct RelaunchPolicy: Sendable {
     /// Max engine-gone auto-relaunches inside `window` before giving
     /// up. `<= 0` disables auto-relaunch.
@@ -186,12 +253,37 @@ public final class PieEngineHost: @unchecked Sendable {
   ///     auto-relaunch even if `relaunchPolicy.maxAttempts > 0`, so
   ///     existing call sites (tests, degraded boot) keep the prior
   ///     "stay .failed until user-Resume" behavior.
+  ///   - terminationSink: receives one `EngineTermination` per engine
+  ///     death (#447). `nil` (default) emits nothing so existing tests
+  ///     never pollute the real `helper.log`; production (HelperMain) wires
+  ///     `PieEngineHost.productionTerminationSink`, tests inject a capture.
+  ///   - tailWriter: receives the bounded, redacted stderr tail on death so
+  ///     it can be persisted durably. `nil` (default) writes nothing;
+  ///     production wires `PieEngineHost.productionTailWriter` (engine.log).
+  ///   - guardrailBytes: a *provider* of the #328 resolved-artifact ceiling
+  ///     used for the likely-OOM heuristic (SIGKILL-not-by-us + last-RSS >=
+  ///     ceiling). Evaluated lazily at termination time — NOT captured at
+  ///     construction — so the breadcrumb tracks the live Settings → Models
+  ///     dial exactly as the launch gate (`memoryPolicy`) and the picker badge
+  ///     do (#604). Returning `nil` means OOM is never inferred; the default
+  ///     `{ nil }` keeps tests breadcrumb-free, and production passes
+  ///     `{ ModelMemoryGuardrail.livePolicy().maxResolvedModelBytes }`.
+  ///   - launchTimeoutSlack: host-owned safety margin added to
+  ///     `LaunchSpec.handshakeTimeout` before cancelling a launch that is
+  ///     still `.starting`. This is scoped to the launch incarnation; once
+  ///     the host reaches `.running`, the timer is cancelled / inert. The
+  ///     XPC reply timeout is deliberately separate and never owns process
+  ///     lifetime.
   public init(
     launcher: LauncherCall? = nil,
     livenessInterval: TimeInterval = 5,
     livenessFailureThreshold: Int = 2,
     relaunchPolicy: RelaunchPolicy = RelaunchPolicy(),
     relauncher: Relauncher? = nil,
+    terminationSink: (@Sendable (EngineTermination) -> Void)? = nil,
+    tailWriter: (@Sendable ([String]) -> Void)? = nil,
+    guardrailBytes: @Sendable @escaping () -> Int64? = { nil },
+    launchTimeoutSlack: TimeInterval = PieEngineHost.defaultLaunchTimeoutSlack,
     clock: @Sendable @escaping () -> Date = { Date() },
     // Default: a real cooperative sleep that swallows cancellation, exactly
     // matching the inline `try? await Task.sleep` the three timers used
@@ -205,6 +297,10 @@ public final class PieEngineHost: @unchecked Sendable {
     self.livenessFailureThreshold = max(1, livenessFailureThreshold)
     self.relaunchPolicy = relaunchPolicy
     self.relauncher = relauncher
+    self.terminationSink = terminationSink
+    self.tailWriter = tailWriter
+    self.guardrailBytes = guardrailBytes
+    self.launchTimeoutSlack = max(0, launchTimeoutSlack)
     self.clock = clock
     self.sleepFor = sleepFor
   }
@@ -214,6 +310,34 @@ public final class PieEngineHost: @unchecked Sendable {
   private let livenessFailureThreshold: Int
   private let relaunchPolicy: RelaunchPolicy
   private let relauncher: Relauncher?
+  private let terminationSink: (@Sendable (EngineTermination) -> Void)?
+  private let tailWriter: (@Sendable ([String]) -> Void)?
+  private let guardrailBytes: @Sendable () -> Int64?
+
+  /// Production breadcrumb sink: one durable, chat-free `engine.terminated`
+  /// line per death in `helper.log` (via `DiagnosticLog`). Wired by
+  /// HelperMain so tests stay free of real-dir writes.
+  public static let productionTerminationSink: @Sendable (EngineTermination) -> Void = {
+    Diag.helper.event("engine.terminated", $0.diagnosticFields)
+  }
+
+  /// Production tail writer: tee the bounded, redacted engine stderr tail to
+  /// `engine.log` so the failure output survives in the diagnostics bundle.
+  /// Offloaded to its own serial queue (mirroring `DiagnosticLog.event`) so a
+  /// death-time file write never blocks `stateQueue` — important precisely in
+  /// the OOM/memory-pressure case, where the disk may be stalled. Production
+  /// resolves the dir from `$PIE_HOME` (env, thread-safe), so running off the
+  /// caller thread is safe; tests inject a capturing writer instead.
+  public static let productionTailWriter: @Sendable ([String]) -> Void = { lines in
+    tailWriteQueue.async { EngineLogTail.append(lines) }
+  }
+  private static let tailWriteQueue = DispatchQueue(label: "com.ratiothink.engine.logtail")
+  /// Default host-owned safety margin added to `LaunchSpec.handshakeTimeout`
+  /// to form the launch lease. Public + named so the cross-layer timeout
+  /// ladder (engine lease < helper reply deadline < App restart wait) can be
+  /// asserted from one source (#459 review F2).
+  public static let defaultLaunchTimeoutSlack: TimeInterval = 2
+  private let launchTimeoutSlack: TimeInterval
 
   /// Wall-clock source for the slow-flap window math, injectable so a
   /// test can advance time deterministically instead of sleeping —
@@ -256,25 +380,39 @@ public final class PieEngineHost: @unchecked Sendable {
   /// open), never per frame.
   public func residentMemoryBytes() async -> UInt64? {
     let session: (any EngineSession)? = stateQueue.sync {
-      if case let .running(_, _, session) = _state { return session }
+      if case let .running(_, session) = _state { return session }
       return nil
     }
     guard let session else { return nil }
     return await session.residentMemoryBytes()
   }
 
-  /// Diagnostic-only observer count. Mirrors `PieSupervisor
-  /// .observerCountForTesting` so the HelperStatusItem integration
-  /// tests can pin "observers cleaned up on cancel".
+  public func kvUsageSnapshots(now: @Sendable () -> Date = { Date() }) async throws -> [KVUsageSnapshot] {
+    let session: (any EngineSession)? = stateQueue.sync {
+      guard case .running(_, let session) = self._state else { return nil }
+      return session
+    }
+    guard let session else { return [] }
+    guard let json = try await session.modelStatusJSON() else {
+      throw KVUsageRefreshError.modelStatusUnavailable(reason: "running engine did not provide model_status")
+    }
+    let generation = kvUsageGeneration.withLock { value -> UInt64 in
+      value &+= 1
+      return value
+    }
+    return try KVUsageModelStatusParser.parse(json, observedAt: now(), generation: generation)
+  }
+
+  /// Diagnostic-only observer count so the HelperStatusItem
+  /// integration tests can pin "observers cleaned up on cancel".
   internal var observerCountForTesting: Int {
     observers.withLock { $0.count }
   }
 
   /// Register a handler invoked with the current status (synchronously
   /// dispatched on `stateQueue`) and on every subsequent transition.
-  /// Same contract as `PieSupervisor.observe`: handlers run on
-  /// `stateQueue`; do NOT re-enter `start` / `stop` from inside the
-  /// handler.
+  /// Handlers run on `stateQueue`; do NOT re-enter `start` / `stop`
+  /// from inside the handler.
   @discardableResult
   public func observe(_ handler: @escaping (EngineStatus, ObservationToken) -> Void) -> ObservationToken {
     let id = UUID()
@@ -310,13 +448,118 @@ public final class PieEngineHost: @unchecked Sendable {
     }
   }
 
+  /// Start the engine, or attach to the existing same-profile
+  /// `.starting`/`.running` incarnation. This is deliberately narrower than
+  /// `start(_:)`: XPC `startEngine` is idempotent for repeated same-profile
+  /// requests, but explicit caller intents such as menu Resume still use
+  /// `start(_:)` so duplicate user/system starts surface `.alreadyRunning`.
+  @discardableResult
+  public func startOrAttach(_ spec: LaunchSpec) -> Result<Void, EngineError> {
+    stateQueue.sync {
+      switch _state {
+      case .stopped, .failed:
+        return doStart(spec)
+      case .starting(let profileID, _, _) where profileID == spec.profileID:
+        DiagnosticLog.helper.event("engine.start.request", [
+          ("profile", spec.profileID),
+          ("state", "starting"),
+          ("action", "attach_existing"),
+        ])
+        return .success(())
+      case .running(let snapshot, _) where snapshot.profileID == spec.profileID:
+        DiagnosticLog.helper.event("engine.start.request", [
+          ("profile", spec.profileID),
+          ("state", "running"),
+          ("action", "already_running_same_profile"),
+        ])
+        return .success(())
+      case .starting, .running, .stopping:
+        return .failure(EngineError(
+          code: .alreadyRunning,
+          message: "PieEngineHost already \(_state)"
+        ))
+      }
+    }
+  }
+
   /// Stop the engine. Sends SIGINT (via `LaunchedSession.shutdown`)
   /// with `LaunchedSession`'s 10s grace, then SIGKILL. Cancels an
   /// in-flight launch task. Idempotent — repeated calls while
   /// `.stopped` / `.failed` / `.stopping` are no-ops.
-  public func stop() {
+  ///
+  /// `initiator` (#447) records WHO requested the stop so the durable
+  /// breadcrumb can tell an operator pause (`.user`, the default for the
+  /// XPC `stopEngine` selector) from a helper process shutting the engine
+  /// down on its way out (`.helper`, passed by `applicationWillTerminate`).
+  public func stop(initiator: EngineTermination.Initiator = .user) {
+    stop(reason: "unspecified", initiator: initiator)
+  }
+
+  /// Stop the engine with a durable non-content diagnostic reason. Callers that
+  /// represent explicit user/system intent should use this overload so
+  /// helper.log can separate user Pause, XPC Unload, app/helper termination,
+  /// and timeout fallback from organic engine death.
+  public func stop(reason: String, initiator: EngineTermination.Initiator = .user) {
     stateQueue.sync {
-      stopLocked()
+      stopLocked(reason: reason, initiator: initiator)
+    }
+  }
+
+  /// #448 quit primitive: `stop()` the engine and invoke `completion`
+  /// exactly once with a result that distinguishes a real terminal state
+  /// (`.stopped`) from shutdown failure and the timeout fallback. `.stopped`
+  /// is published only AFTER `LaunchedSession.shutdown` (SIGINT → grace →
+  /// SIGKILL) confirms the `pie` process was reaped; unreaped shutdowns are
+  /// surfaced as `.failed(.killRejected, ...)` and return
+  /// `failedBeforeReap == true`, so callers that promise a no-orphan
+  /// structured quit must require `result.reachedTerminal == true` before
+  /// reporting success. The bounded fallback keeps callers observable when the
+  /// engine wedges instead of silently conflating timeout with reap.
+  /// `completion` fires on `stateQueue` (terminal path) or a global queue
+  /// (timeout).
+  public func stopAndWait(timeout: TimeInterval, completion: @escaping @Sendable (StopAndWaitResult) -> Void) {
+    let done = OSAllocatedUnfairLock<Bool>(initialState: false)
+    let tokenBox = OSAllocatedUnfairLock<ObservationToken?>(initialState: nil)
+    func cancelObserver() {
+      tokenBox.withLock { (box: inout ObservationToken?) in
+        box?.cancel()
+        box = nil
+      }
+    }
+    func finish(_ result: StopAndWaitResult) {
+      let already = done.withLock { (d: inout Bool) -> Bool in
+        defer { d = true }
+        return d
+      }
+      cancelObserver()
+      if already { return }
+      completion(result)
+    }
+    // observe() dispatches the CURRENT status synchronously on stateQueue, so
+    // an already-terminal host fires `finish()` immediately.
+    let token = observe { status, _ in
+      switch status {
+      case .stopped, .failed:
+        let completion: StopAndWaitResult.Completion
+        if case .failed(.killRejected, _) = status {
+          completion = .terminalFailed
+        } else {
+          completion = .terminalReaped
+        }
+        finish(StopAndWaitResult(completion: completion, lastStatus: status))
+      case .starting, .running, .stopping: return
+      }
+    }
+    tokenBox.withLock { $0 = token }
+    if done.withLock({ $0 }) { cancelObserver() }
+    stop()
+    if timeout > 0 {
+      DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout) { [weak self] in
+        finish(StopAndWaitResult(completion: .timedOut, lastStatus: self?.status ?? .failed(
+          code: .unknown,
+          message: "PieEngineHost deallocated before stopAndWait timeout sampled status"
+        )))
+      }
     }
   }
 
@@ -342,11 +585,29 @@ public final class PieEngineHost: @unchecked Sendable {
     didSet { publish(_state.publicStatus) }
   }
   private let statusLock = OSAllocatedUnfairLock<EngineStatus>(initialState: .stopped)
+  private let kvUsageGeneration = OSAllocatedUnfairLock<UInt64>(initialState: 0)
   private let observers = OSAllocatedUnfairLock<[UUID: (EngineStatus) -> Void]>(initialState: [:])
 
   /// Post-launch liveness probe loop ( G1). Owned by `stateQueue`:
   /// started when entering `.running`, cancelled when leaving it.
   private var livenessMonitor: Task<Void, Never>?
+
+  /// #336 — incarnation token for `livenessMonitor`. Bumped on every
+  /// `startLivenessMonitor`; each monitor Task captures its value and
+  /// the gone-block compares it on `stateQueue` before flipping state.
+  /// Cancelling a monitor Task cannot recall a `stateQueue.async`
+  /// gone-block it already enqueued, and the post-probe
+  /// `Task.isCancelled` check leaves a window — the gone path then
+  /// awaits `terminationSnapshot`/RSS/`diagnosticTail` before the hop —
+  /// in which a `stop→start` (or auto-relaunch) can bring up a FRESH
+  /// engine. The stale verdict would then land while the host is
+  /// `.running` on a new incarnation and wrongly flip it to
+  /// `.failed(.engineGone)`. The `guard case .running` check cannot
+  /// catch this — a new running incarnation also matches `.running`.
+  /// The token does: only the monitor whose incarnation still matches
+  /// owns the verdict. Same shape as `healthyUptimeIncarnation` (R3).
+  /// Owned by `stateQueue`.
+  private var livenessMonitorIncarnation: Int = 0
 
   /// Pending auto-relaunch task scheduled after `.failed(.engineGone)`.
   /// Owned by `stateQueue`; cancelled on user `start()`/`stop()` so a
@@ -373,6 +634,43 @@ public final class PieEngineHost: @unchecked Sendable {
   /// fix in the relaunch task (R1). Owned by `stateQueue`.
   private var healthyUptimeIncarnation: Int = 0
 
+  /// Host-owned launch timeout. This is the process-lifetime lease for a
+  /// not-yet-running engine; XPC reply fallbacks must never call `stop()`.
+  /// Owned by `stateQueue` and guarded by `launchIncarnation` so a stale timer
+  /// can only cancel the same still-starting launch it was armed for.
+  private var launchTimeoutTask: Task<Void, Never>?
+  private var mostRecentLaunchTimeoutTaskForTesting: Task<Void, Never>?
+  private var launchIncarnation: UInt64 = 0
+
+  private enum LaunchCancellationReason {
+    case handshakeTimeout(profileID: String, timeout: TimeInterval)
+
+    var shutdownReason: String {
+      switch self {
+      case .handshakeTimeout: return "engine.launchTimeout"
+      }
+    }
+
+    var failureMessage: String {
+      switch self {
+      case let .handshakeTimeout(profileID, timeout):
+        return "engine launch timed out after \(String(format: "%.1f", timeout))s while starting profile \(profileID)"
+      }
+    }
+
+    var termination: EngineTermination {
+      switch self {
+      case .handshakeTimeout:
+        return EngineTermination(cause: .handshakeTimeout, initiator: .launch)
+      }
+    }
+  }
+
+  /// Launch cancellations whose terminal state must wait for launcher-owned
+  /// cleanup/reap. Keyed by launch incarnation so stale completions cannot
+  /// settle a newer start/stop.
+  private var pendingLaunchCancellations: [UInt64: LaunchCancellationReason] = [:]
+
   private func setState(_ next: State) { _state = next }
 
   private func publish(_ status: EngineStatus) {
@@ -391,48 +689,123 @@ public final class PieEngineHost: @unchecked Sendable {
     autoRelaunchTask?.cancel()
     autoRelaunchTask = nil
     let profileID = spec.profileID
+    launchIncarnation &+= 1
+    let launchID = launchIncarnation
     let task = Task { [weak self] in
       guard let self else { return }
-      await self.runLaunch(spec: spec)
+      await self.runLaunch(spec: spec, launchID: launchID)
     }
-    setState(.starting(profileID: profileID, launchTask: task))
+    setState(.starting(profileID: profileID, launchID: launchID, launchTask: task))
+    armLaunchTimeout(profileID: profileID, launchID: launchID, timeout: spec.handshakeTimeout + launchTimeoutSlack)
     return .success(())
+  }
+
+  private func armLaunchTimeout(profileID: String,
+                                launchID: UInt64,
+                                timeout: TimeInterval) {
+    let sleepFor = self.sleepFor
+    launchTimeoutTask?.cancel()
+    let task = Task { [weak self, timeout, launchID, profileID, sleepFor] in
+      await sleepFor(timeout)
+      if Task.isCancelled { return }
+      guard let self else { return }
+      self.stateQueue.async { [weak self] in
+        guard let self else { return }
+        guard case .starting(let currentProfileID, let currentLaunchID, let currentTask) = self._state else {
+          DiagnosticLog.helper.event("engine.launch_timeout", [
+            ("profile", profileID),
+            ("launch_id", String(launchID)),
+            ("state", String(describing: self._state)),
+            ("action", "stale_noop_not_starting"),
+          ])
+          return
+        }
+        guard currentLaunchID == launchID else {
+          DiagnosticLog.helper.event("engine.launch_timeout", [
+            ("profile", profileID),
+            ("launch_id", String(launchID)),
+            ("current_launch_id", String(currentLaunchID)),
+            ("state", String(describing: self._state)),
+            ("action", "stale_noop_new_launch"),
+          ])
+          return
+        }
+        DiagnosticLog.helper.event("engine.shutdown.request", [
+          ("reason", "engine.launchTimeout"),
+          ("profile", currentProfileID),
+          ("launch_id", String(currentLaunchID)),
+          ("state", "starting"),
+          ("action", "cancel_starting"),
+          ("timeout", String(format: "%.1f", timeout)),
+        ])
+        self.launchTimeoutTask = nil
+        self.pendingLaunchCancellations[currentLaunchID] = .handshakeTimeout(
+          profileID: currentProfileID,
+          timeout: timeout)
+        currentTask.cancel()
+        self.setState(.stopping(session: nil, launchID: currentLaunchID))
+      }
+    }
+    launchTimeoutTask = task
+    mostRecentLaunchTimeoutTaskForTesting = task
   }
 
   /// Body of the launch task. Lives outside `doStart` so it can hop
   /// back onto `stateQueue` for every transition.
-  private func runLaunch(spec: LaunchSpec) async {
+  private func runLaunch(spec: LaunchSpec, launchID: UInt64) async {
     do {
       let (port, session) = try await launcher(spec)
       stateQueue.async { [weak self] in
         guard let self else { return }
         switch self._state {
-        case .starting:
-          self.setState(.running(port: port, profileID: spec.profileID, session: session))
+        case .starting(let currentProfileID, let currentLaunchID, _)
+          where currentProfileID == spec.profileID && currentLaunchID == launchID:
+          self.launchTimeoutTask?.cancel()
+          self.launchTimeoutTask = nil
+          self.setState(.running(
+            snapshot: Self.sessionSnapshot(port: port, launchID: launchID, spec: spec),
+            session: session))
           self.startLivenessMonitor(session: session)
           self.armHealthyUptimeTimer()
-        case .stopping:
-          // stop() arrived after launch finished but before we hopped
-          // back. Honour the cancellation by shutting the
-          // freshly-launched session down.
+        case .stopping(_, let stoppingLaunchID) where stoppingLaunchID == launchID:
+          // stop() arrived after launch finished but before we hopped back,
+          // or the host-owned launch timeout moved the launch into
+          // `.stopping` while waiting for cleanup. Honour the cancellation by
+          // shutting the freshly-launched session down.
           //
           // Review v1 F4: capture self weakly here. `session.shutdown`
           // can take up to ~15s; without [weak self] this inner Task
           // keeps the host alive long past any caller's release.
           Log.engine.info("PieEngineHost: launch completed during .stopping — shutting freshly-spawned session down")
           Task { [weak self, session] in
-            await session.shutdown()
+            let reason = self?.stateQueue.sync { [weak self] in
+              guard let self else { return nil }
+              return self.pendingLaunchCancellations[launchID]?.shutdownReason
+            } ?? "host.launch_completed_during_stopping"
+            let shutdownResult = await session.shutdown(reason: reason)
+            let tail = await session.diagnosticTail()
             self?.stateQueue.async {
               guard let self else { return }
-              if case .stopping = self._state {
-                self.setState(.stopped)
+              if case .stopping(_, let currentLaunchID) = self._state,
+                 currentLaunchID == launchID {
+                if let cancellation = self.pendingLaunchCancellations.removeValue(forKey: launchID) {
+                  self.finishLaunchCancellation(
+                    cancellation,
+                    shutdownResult: shutdownResult,
+                    tail: tail)
+                } else {
+                  self.setState(Self.stateAfterShutdown(shutdownResult))
+                }
               }
             }
           }
         default:
-          // Unexpected state (.stopped / .failed / .running) — discard.
-          Log.engine.error("PieEngineHost: launch completed in unexpected state \(String(describing: self._state), privacy: .public); shutting session down")
-          Task { [session] in await session.shutdown() }
+          // Stale completion from an older launch incarnation (or an
+          // otherwise unexpected state) must not publish `.running` over a
+          // newer `.starting` retry. Discard only the session this launch
+          // returned.
+          Log.engine.error("PieEngineHost: launch completed in unexpected/stale state \(String(describing: self._state), privacy: .public) launchID=\(launchID, privacy: .public); shutting session down")
+          Task { [session] in _ = await session.shutdown(reason: "host.launch_completed_stale_or_unexpected_state") }
         }
       }
     } catch is CancellationError {
@@ -442,41 +815,160 @@ public final class PieEngineHost: @unchecked Sendable {
       stateQueue.async { [weak self] in
         guard let self else { return }
         switch self._state {
-        case .starting, .stopping:
+        case .starting(let currentProfileID, let currentLaunchID, _)
+          where currentProfileID == spec.profileID && currentLaunchID == launchID:
+          self.launchTimeoutTask?.cancel()
+          self.launchTimeoutTask = nil
+          self.pendingLaunchCancellations.removeValue(forKey: launchID)
           self.setState(.stopped)
+        case .stopping(_, let stoppingLaunchID) where stoppingLaunchID == launchID:
+          self.launchTimeoutTask?.cancel()
+          self.launchTimeoutTask = nil
+          if let cancellation = self.pendingLaunchCancellations.removeValue(forKey: launchID) {
+            self.finishLaunchCancellation(cancellation, shutdownResult: .reaped, tail: [])
+          } else {
+            self.setState(.stopped)
+          }
         default:
           // Review v1 F3: the success arm logs + shuts the session
           // down in this terminal-state branch; mirror the diagnostic
           // here so a future refactor that lets `.starting` be left
           // by some other path doesn't silently swallow the cancel.
-          Log.engine.fault("PieEngineHost: launch cancelled in unexpected state \(String(describing: self._state), privacy: .public); dropping")
+          Log.engine.fault("PieEngineHost: launch cancelled in unexpected/stale state \(String(describing: self._state), privacy: .public) launchID=\(launchID, privacy: .public); dropping")
           return
         }
       }
     } catch {
       let msg = "\(error)"
+      let classification = EngineLoadFailureClassifier.classify(error)
+      let code: EngineErrorCode = classification == nil ? .spawnFailed : .modelUnsupported
+      let statusMessage = classification == nil
+        ? msg
+        : EngineLoadFailureClassifier.userFacingLoadFailureMessage(
+          modelID: Self.modelID(from: spec),
+          error: error
+        )
       Log.engine.error("PieEngineHost: launch failed: \(msg, privacy: .public)")
+      let terminationEvidence = Self.terminationForLaunchError(error, guardrailBytes: guardrailBytes())
+      let shutdownFailureMessage = Self.shutdownFailureMessage(from: error)
+      let launchCancellationEvidence = Self.launchCancellationEvidence(from: error)
       stateQueue.async { [weak self] in
         guard let self else { return }
         // Don't clobber a user-initiated stop with a launch error —
         // the cancellation winner already published .stopped.
         switch self._state {
-        case .starting:
-          self.setState(.failed(.spawnFailed, msg))
-        case .stopping:
-          self.setState(.stopped)
+        case .starting(let currentProfileID, let currentLaunchID, _)
+          where currentProfileID == spec.profileID && currentLaunchID == launchID:
+          self.launchTimeoutTask?.cancel()
+          self.launchTimeoutTask = nil
+          self.pendingLaunchCancellations.removeValue(forKey: launchID)
+          if let shutdownFailureMessage {
+            self.setState(.failed(.killRejected, shutdownFailureMessage))
+          } else {
+            self.setState(.failed(code, statusMessage))
+          }
+          if let (termination, tail) = terminationEvidence {
+            self.emitTermination(termination, tail: tail)
+          }
+        case .stopping(_, let stoppingLaunchID) where stoppingLaunchID == launchID:
+          self.launchTimeoutTask?.cancel()
+          self.launchTimeoutTask = nil
+          let cancellation = self.pendingLaunchCancellations.removeValue(forKey: launchID)
+          if let cancellation, let launchCancellationEvidence {
+            self.finishLaunchCancellation(
+              cancellation,
+              shutdownResult: launchCancellationEvidence.shutdownResult,
+              tail: launchCancellationEvidence.tail)
+          } else if let cancellation, let (_, tail) = terminationEvidence {
+            self.finishLaunchCancellation(cancellation, shutdownResult: .reaped, tail: tail)
+          } else if let launchCancellationEvidence {
+            self.setState(Self.stateAfterShutdown(launchCancellationEvidence.shutdownResult))
+          } else if let shutdownFailureMessage {
+            self.setState(.failed(.killRejected, shutdownFailureMessage))
+          } else if let cancellation {
+            self.finishLaunchCancellation(cancellation, shutdownResult: .reaped, tail: [])
+          } else {
+            self.setState(.stopped)
+          }
         default:
           // Review v1 F3: mirror the success-default's diagnostic.
-          Log.engine.fault("PieEngineHost: launch error in unexpected state \(String(describing: self._state), privacy: .public): \(msg, privacy: .public); dropping")
+          Log.engine.fault("PieEngineHost: launch error in unexpected/stale state \(String(describing: self._state), privacy: .public) launchID=\(launchID, privacy: .public): \(msg, privacy: .public); dropping")
           return
         }
       }
     }
   }
 
-  private func stopLocked() {
+  private static func modelID(from spec: LaunchSpec) -> String {
+    switch spec.modelConfig {
+    case .dummy:
+      return spec.profileID
+    case let .portable(modelSlug, _):
+      return modelSlug
+    case let .portableResolved(servedModelID, _):
+      return servedModelID
+    case let .metal(modelID):
+      return modelID
+    }
+  }
+
+  private static func shutdownFailureMessage(from error: Error) -> String? {
+    guard case let PieControlLauncher.LaunchError.shutdownFailed(_, shutdownFailure) = error else {
+      return nil
+    }
+    return shutdownFailure.isEmpty
+      ? "pie shutdown failed before the process was confirmed reaped"
+      : shutdownFailure
+  }
+
+  private static func launchCancellationEvidence(
+    from error: Error
+  ) -> (shutdownResult: EngineShutdownResult, tail: [String])? {
+    guard case let PieControlLauncher.LaunchError.launchCancelledAfterCleanup(
+      shutdownResult,
+      lastLines
+    ) = error else {
+      return nil
+    }
+    return (shutdownResult, lastLines)
+  }
+
+  private func finishLaunchCancellation(_ reason: LaunchCancellationReason,
+                                        shutdownResult: EngineShutdownResult,
+                                        tail: [String]) {
+    guard shutdownResult.reaped else {
+      setState(Self.stateAfterShutdown(shutdownResult))
+      return
+    }
+    setState(.failed(.handshakeTimeout, reason.failureMessage))
+    emitTermination(reason.termination, tail: tail)
+  }
+
+  private func stopLocked(reason: String, initiator: EngineTermination.Initiator) {
+    // One chat-free stop breadcrumb recording WHO ended a live/launching
+    // engine (#447). Only the `.starting`/`.running` arms below reach this —
+    // the `.failed(.engineGone)` arm was already recorded by the liveness
+    // monitor, and the no-op arms have nothing to stop.
+    func recordStop() {
+      // recordStop runs under `stateQueue.sync` via `stop(reason:)` (XPC
+      // Unload / user Pause / quit), so do NOT call the live `guardrailBytes`
+      // provider here: `livePolicy()` does a blocking `Data(contentsOf:)` read
+      // that would land on the serial queue and the synchronous caller. The
+      // value is also dead — `lastRSSBytes` is nil and `classify` only infers
+      // `.oom` with a non-nil RSS, so the ceiling can never change this
+      // verdict. The two RSS-bearing sites still read the live ceiling.
+      let t = EngineTermination.classify(
+        reason: nil, status: nil, initiator: initiator,
+        lastRSSBytes: nil, guardrailBytes: nil)
+      emitTermination(t, tail: [])
+    }
     switch _state {
     case .stopped, .stopping:
+      DiagnosticLog.helper.event("engine.shutdown.request", [
+        ("reason", reason),
+        ("state", String(describing: _state)),
+        ("action", "noop"),
+      ])
       return
     case .failed(.engineGone, _):
       // Review v2 R1: a user Pause on `.failed(.engineGone)` is an
@@ -495,6 +987,11 @@ public final class PieEngineHost: @unchecked Sendable {
       // and HelperMain's deferred main-async block re-checks
       // `engineHost.status` to close the post-sync race window.
       Log.engine.info("PieEngineHost: stop() on .failed(.engineGone) — transitioning to .stopped (user Pause)")
+      DiagnosticLog.helper.event("engine.shutdown.request", [
+        ("reason", reason),
+        ("state", String(describing: _state)),
+        ("action", "clear_failed_engineGone"),
+      ])
       autoRelaunchTask?.cancel()
       autoRelaunchTask = nil
       healthyUptimeTask?.cancel()
@@ -515,36 +1012,77 @@ public final class PieEngineHost: @unchecked Sendable {
       // `start()` accepts `.failed` as restartable, so the next
       // user Resume drives `doStart` directly.
       Log.engine.info("PieEngineHost: stop() no-op: already .failed(\(code.rawValue, privacy: .public))")
+      DiagnosticLog.helper.event("engine.shutdown.request", [
+        ("reason", reason),
+        ("state", String(describing: _state)),
+        ("action", "noop_failed"),
+        ("code", code.rawValue),
+      ])
       return
-    case .starting(_, let launchTask):
+    case .starting(_, let launchID, let launchTask):
       // Cancel the launch task. PieControlLauncher.launch propagates
       // `CancellationError` on the next await point; its catch paths
       // shut the (possibly-spawned) session down. The launch task's
       // own state hop will publish `.stopped`.
       Log.engine.info("PieEngineHost: stop() cancelling in-flight launch")
+      DiagnosticLog.helper.event("engine.shutdown.request", [
+        ("reason", reason),
+        ("state", String(describing: _state)),
+        ("action", "cancel_starting"),
+      ])
       launchTask.cancel()
+      launchTimeoutTask?.cancel()
+      launchTimeoutTask = nil
       healthyUptimeTask?.cancel()
       healthyUptimeTask = nil
-      setState(.stopping(session: nil))
-    case .running(_, _, let session):
+      recordStop()
+      setState(.stopping(session: nil, launchID: launchID))
+    case .running(let snapshot, let session):
+      let launchID = snapshot.generation
       Log.engine.info("PieEngineHost: stop() shutting running session down (pid path)")
+      recordStop()
+      DiagnosticLog.helper.event("engine.shutdown.request", [
+        ("reason", reason),
+        ("state", "running"),
+        ("action", "shutdown_session"),
+      ])
+      Task { [session, reason] in
+        let pid = await session.diagnosticProcessID()
+        DiagnosticLog.helper.event("engine.shutdown.request", [
+          ("reason", reason),
+          ("state", "running"),
+          ("action", "shutdown_session"),
+          ("pid", pid.map(String.init) ?? "?"),
+        ])
+      }
       livenessMonitor?.cancel()
       livenessMonitor = nil
       autoRelaunchTask?.cancel()
       autoRelaunchTask = nil
       healthyUptimeTask?.cancel()
       healthyUptimeTask = nil
-      setState(.stopping(session: session))
-      Task { [weak self, session] in
-        await session.shutdown()
+      setState(.stopping(session: session, launchID: launchID))
+      Task { [weak self, session, reason] in
+        let shutdownResult = await session.shutdown(reason: reason)
         self?.stateQueue.async {
           guard let self else { return }
-          if case .stopping = self._state {
-            self.setState(.stopped)
+          if case .stopping(_, let currentLaunchID) = self._state,
+             currentLaunchID == launchID {
+            self.setState(Self.stateAfterShutdown(shutdownResult))
           }
         }
       }
     }
+  }
+
+  private static func stateAfterShutdown(_ result: EngineShutdownResult) -> State {
+    if result.reaped { return .stopped }
+    return .failed(
+      .killRejected,
+      result.message.isEmpty
+        ? "pie shutdown did not confirm the process was reaped"
+        : result.message
+    )
   }
 
   /// Start the post-launch liveness probe loop ( G1). Runs off
@@ -563,34 +1101,133 @@ public final class PieEngineHost: @unchecked Sendable {
     let sleepFor = self.sleepFor
     guard interval > 0 else { return }
     livenessMonitor?.cancel()
-    livenessMonitor = Task { [weak self, sleepFor] in
+    livenessMonitorIncarnation += 1
+    let myIncarnation = livenessMonitorIncarnation
+    // Capture the provider, not a snapshot: the OOM ceiling is read at death
+    // time so a mid-run dial change is honored (#604).
+    let guardrailProvider = guardrailBytes
+    livenessMonitor = Task { [weak self, sleepFor, myIncarnation, guardrailProvider] in
       var consecutiveGone = 0
+      // Highest successful RSS sample from this child lifetime. Sample
+      // immediately rather than waiting for the first `.alive` tick: early
+      // model-load SIGKILL/OOM happens before a slow liveness interval can
+      // observe a healthy process.
+      var maxRSS = await session.residentMemoryBytes()
       while !Task.isCancelled {
         await sleepFor(interval)
         if Task.isCancelled { return }
         guard self != nil else { return }
+        let started = Date()
         let liveness = await session.checkLiveness()
+        let elapsed = Date().timeIntervalSince(started)
         if Task.isCancelled { return }
         switch liveness {
         case .alive:
           consecutiveGone = 0
+          maxRSS = Self.maxRSS(maxRSS, await session.residentMemoryBytes())
+          maxRSS = Self.maxRSS(maxRSS, await session.observedResidentMemoryBytes())
         case .gone(let reason):
           consecutiveGone += 1
+          let pid = await session.diagnosticProcessID()
+          // #413 diag: a `.gone` verdict from the control-plane ping while the
+          // engine is BUSY (not dead) would falsely restart it mid-search and
+          // close the in-flight ToT SSE. Persist every miss + its reason so the
+          // operator's run shows whether (and why) the monitor fired.
+          DiagnosticLog.helper.event("engine.liveness", [
+            ("verdict", "gone"),
+            ("pid", pid.map(String.init) ?? "?"),
+            ("elapsed", String(format: "%.2f", elapsed)),
+            ("consecutive", String(consecutiveGone)),
+            ("threshold", String(threshold)),
+            ("reason", reason),
+          ])
           guard consecutiveGone >= threshold else { continue }
-          self?.stateQueue.async { [weak self] in
+          // Gather the authoritative exit evidence in the async context
+          // BEFORE hopping to stateQueue (these are actor-isolated awaits).
+          // snapshot == nil ⇒ the process is still alive but the control
+          // plane is unreachable ⇒ a liveness failure, not a self-death.
+          let snapshot = await session.terminationSnapshot()
+          maxRSS = Self.maxRSS(maxRSS, await session.residentMemoryBytes())
+          maxRSS = Self.maxRSS(maxRSS, await session.observedResidentMemoryBytes())
+          let tail = await session.diagnosticTail()
+          let termination = EngineTermination.classify(
+            reason: snapshot?.reason, status: snapshot?.status,
+            initiator: snapshot == nil ? .liveness : .engine,
+            lastRSSBytes: maxRSS, guardrailBytes: guardrailProvider())
+          self?.stateQueue.async { [weak self, myIncarnation] in
             guard let self else { return }
+            // #336: bail unless this monitor is still the live one. A
+            // superseded monitor (stop→start, or auto-relaunch) whose
+            // gone-block raced onto `stateQueue` after a fresh engine
+            // re-entered `.running` would otherwise poison the new
+            // incarnation — the `guard case .running` below cannot
+            // distinguish "this engine" from "a later engine".
+            guard self.livenessMonitorIncarnation == myIncarnation else { return }
             guard case .running = self._state else { return }
-            Log.engine.error("PieEngineHost: liveness monitor declared engine gone: \(reason, privacy: .public)")
+            Log.engine.error("PieEngineHost: liveness monitor declared engine gone (cause=\(termination.cause.rawValue, privacy: .public)): \(reason, privacy: .public)")
+            DiagnosticLog.helper.event("engine.gone", [
+              ("pid", pid.map(String.init) ?? "?"),
+              ("reason", reason),
+              ("consecutive", String(consecutiveGone)),
+            ])
             self.livenessMonitor = nil
             self.healthyUptimeTask?.cancel()
             self.healthyUptimeTask = nil
             self.setState(.failed(.engineGone, reason))
+            self.emitTermination(termination, tail: tail)
             self.scheduleAutoRelaunchIfAllowed(reason: reason)
           }
           return
         }
       }
     }
+  }
+
+  /// Fan the captured #447 death evidence out to the durable sinks: one
+  /// chat-free breadcrumb + the bounded redacted stderr tail. Both are
+  /// no-ops when unwired (tests / non-production hosts). Caller is on
+  /// `stateQueue`; the sinks are best-effort and never throw.
+  private func emitTermination(_ termination: EngineTermination, tail: [String]) {
+    terminationSink?(termination)
+    if !tail.isEmpty { tailWriter?(tail) }
+  }
+
+  /// Map only engine-death launch-task failures to termination evidence. A
+  /// pre-handshake self-death (`engineExitedEarly`) classifies by the real
+  /// `(reason, status)` — so a launch-time segfault is still a segfault —
+  /// while a handshake timeout is OUR kill of an alive-but-silent engine
+  /// (`cause = .handshakeTimeout`), never read as a crash. Setup failures
+  /// (missing binary/config/driver/path/client setup) are not engine deaths
+  /// and intentionally return nil.
+  private static func terminationForLaunchError(
+    _ error: Error, guardrailBytes: Int64?) -> (EngineTermination, [String])? {
+    guard let le = error as? PieControlLauncher.LaunchError else {
+      return nil
+    }
+    switch le {
+    case let .engineExitedEarly(code, reason, stderrTail, rssBytes):
+      let t = EngineTermination.classify(
+        reason: reason, status: code, initiator: .launch,
+        lastRSSBytes: rssBytes, guardrailBytes: guardrailBytes)
+      return (t, splitTail(stderrTail))
+    case let .handshakeTimeout(_, lastLines):
+      return (EngineTermination(cause: .handshakeTimeout, initiator: .launch), lastLines)
+    default:
+      return nil
+    }
+  }
+
+  private static func maxRSS(_ lhs: UInt64?, _ rhs: UInt64?) -> UInt64? {
+    switch (lhs, rhs) {
+    case let (l?, r?): return max(l, r)
+    case let (l?, nil): return l
+    case let (nil, r?): return r
+    case (nil, nil): return nil
+    }
+  }
+
+  private static func splitTail(_ joined: String) -> [String] {
+    joined.isEmpty ? [] : joined.components(separatedBy: "\n")
   }
 
   /// Review v1 F2 — arm a timer that clears
@@ -665,6 +1302,14 @@ public final class PieEngineHost: @unchecked Sendable {
     let backoff = schedule[min(attemptIndex, schedule.count - 1)]
 
     Log.engine.notice("PieEngineHost: scheduling auto-relaunch attempt \(attemptIndex + 1, privacy: .public)/\(self.relaunchPolicy.maxAttempts, privacy: .public) in \(backoff, privacy: .public)s (reason=\(reason, privacy: .public))")
+    // #413 diag: a relaunch kills + respawns the engine — if this fires during
+    // a ToT search the in-flight SSE closes with no terminal. Persist it so the
+    // operator's run lines this up against the chat.fail.tot timestamp.
+    DiagnosticLog.helper.event("engine.relaunch", [
+      ("attempt", String(attemptIndex + 1)),
+      ("backoff", String(format: "%.1f", backoff)),
+      ("reason", reason),
+    ])
 
     let sleepFor = self.sleepFor
     autoRelaunchTask?.cancel()
@@ -704,6 +1349,15 @@ public final class PieEngineHost: @unchecked Sendable {
 
   // MARK: - Test seams
 
+  internal var launchTimeoutTaskForTesting: Task<Void, Never>? {
+    stateQueue.sync { mostRecentLaunchTimeoutTaskForTesting }
+  }
+
+  internal func waitForLaunchTimeoutTaskAndDrainForTesting(_ task: Task<Void, Never>?) async {
+    await task?.value
+    stateQueue.sync {}
+  }
+
   /// Diagnostic-only attempt count for tests. Mirrors the rolling
   /// window the policy uses (entries older than `window` are pruned
   /// on access). Owned by `stateQueue`.
@@ -719,11 +1373,26 @@ public final class PieEngineHost: @unchecked Sendable {
 // MARK: - EngineSession liveness default
 
 public extension PieEngineHost.EngineSession {
+  /// Default: reason-aware shutdown collapses to the legacy shutdown for fakes.
+  func shutdown(reason: String) async -> EngineShutdownResult { await shutdown() }
   /// Default: assume alive. Sessions that can observe engine death
   /// (the production `LaunchedSession`) override this; test fakes that
   /// only model shutdown inherit it so they never trip the monitor.
   func checkLiveness() async -> EngineLiveness { .alive }
+  /// Default: no process identity. Production sessions override this so
+  /// lifecycle diagnostics can correlate liveness misses, exits, and relaunches.
+  func diagnosticProcessID() async -> pid_t? { nil }
+  /// Default: no control-plane model status available.
+  func modelStatusJSON() async throws -> String? { nil }
   /// Default: memory unavailable. Only the production `LaunchedSession`
   /// samples real RSS; test fakes inherit nil.
   func residentMemoryBytes() async -> UInt64? { nil }
+  /// Default: no lifetime RSS sample has been recorded.
+  func observedResidentMemoryBytes() async -> UInt64? { nil }
+  /// Default: no exit snapshot. The production `LaunchedSession` overrides
+  /// with the real `(terminationReason, terminationStatus)` (#447).
+  func terminationSnapshot() async -> (reason: Process.TerminationReason, status: Int32)? { nil }
+  /// Default: no tail. The production `LaunchedSession` overrides with its
+  /// bounded, token-redacted recent lines (#447).
+  func diagnosticTail() async -> [String] { [] }
 }

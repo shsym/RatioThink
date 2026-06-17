@@ -40,13 +40,15 @@
 //! max-tokens cap, returning a single OpenAI-shape `chat.completion`
 //! JSON 200.
 
-use std::sync::OnceLock;
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use inferlet::chat;
 use inferlet::Context;
 use inferlet::GrammarConstraint;
+use inferlet::chat;
 use inferlet::inference::SlotOutput;
 use inferlet::model::Model;
 use inferlet::runtime;
@@ -57,6 +59,8 @@ use wstd::http::{IntoBody, Request, Response};
 
 use super::apc::{ReasoningDecoder, ToolUseDecoder};
 use super::generate::{self, DecodeStrategy};
+use super::prefix_cache::{self, CacheDiag, ReusePlan};
+use super::spec::sidecar::{encode_sidecar_blob, Lineage, SidecarKey, SidecarStatus, SidecarStore};
 use super::spec::{SpecConfig, SpecMetrics};
 use crate::sse::{self, EmitError, Emitter, SseError};
 
@@ -97,10 +101,7 @@ macro_rules! try_emit {
                 // stderr is discarded on the daemon path, see ).
                 // Disconnected is silent — peer is gone and there's
                 // nothing useful left to do.
-                match $em
-                    .emit_json(&SseError::new("serialize_bug", &msg))
-                    .await
-                {
+                match $em.emit_json(&SseError::new("serialize_bug", &msg)).await {
                     Ok(()) => {}
                     Err(EmitError::Disconnected) => {}
                     Err(EmitError::Serialize(e2)) => {
@@ -132,10 +133,13 @@ const DEFAULT_MAX_TOKENS: usize = 1024;
 const MAX_TEMPERATURE: f32 = 2.0;
 /// Inclusive upper bound on `top_p` (the canonical nucleus cap).
 const MAX_TOP_P: f32 = 1.0;
-/// Inclusive upper bound on `max_tokens`. Picked to cap worst-case
-/// per-request scheduler residency; well above any sensible chat
-/// reply length.
-const MAX_MAX_TOKENS: usize = 8192;
+/// Fallback ceiling on `max_tokens`, used only when the engine reports
+/// no capacity (`runtime::max-output-tokens()` == 0 — e.g. no model
+/// registered yet). In normal operation the live engine value — its
+/// launch-time KV-cache capacity, which is memory-aware — is used
+/// instead (see `max_output_ceiling`). 8192 is a conservative cap well
+/// above any sensible chat reply length.
+const MAX_OUTPUT_TOKENS_FALLBACK: usize = 8192;
 
 /// Inclusive bounds on the #418 speculation knobs. Out-of-range values
 /// are rejected at the 400 boundary (see `validate_sampling`), mirroring
@@ -145,6 +149,7 @@ const MIN_LEADER_LEN: usize = 1;
 const MAX_LEADER_LEN: usize = 8;
 const MIN_DRAFT_LEN: usize = 1;
 const MAX_DRAFT_LEN: usize = 16;
+const CACHEBACK_SIDECAR_TTL: Duration = Duration::from_secs(30 * 60);
 
 // =============================================================================
 // Request schema
@@ -159,6 +164,12 @@ pub struct ChatCompletionsRequest {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_tokens: Option<usize>,
+    /// OpenAI's newer alias for `max_tokens` (the only field current
+    /// OpenAI/Codex-style clients send). Used as a fallback when
+    /// `max_tokens` is absent so those clients don't silently fall back
+    /// to `DEFAULT_MAX_TOKENS`.
+    #[serde(default)]
+    pub max_completion_tokens: Option<usize>,
     /// OpenAI-shape tool list. Each entry is `{type:"function",
     /// function:{name, description?, parameters}}`. Forwarded through
     /// the chat template via `inferlet::tools::equip_prefix`.
@@ -176,6 +187,103 @@ pub struct ChatCompletionsRequest {
     /// when `enabled` + greedy (`temperature == 0`), drafting engages.
     #[serde(default)]
     pub speculation: Option<SpecRequest>,
+    /// #522 cross-request KV prefix-cache directive. Absent → reuse
+    /// disabled (byte-identical to the pre-#522 full-rebuild path).
+    /// Present + `policy:"auto"` + non-empty `key` → the inferlet opens a
+    /// matching prefix snapshot on a hit and saves the new boundary on
+    /// success. See [`super::prefix_cache`].
+    #[serde(default)]
+    pub cache: Option<prefix_cache::CacheDirective>,
+    /// OpenAI-shape `response_format`. `{"type":"json_object"}` constrains
+    /// the answer to a JSON **object** (`{...}`); `{"type":"json_schema",
+    /// "json_schema":{"schema":{…}}}` constrains it to the caller's schema.
+    /// Both run real grammar-guided decoding (the "JSON Think" profile,
+    /// #572/#619). Absent or `{"type":"text"}` → unconstrained,
+    /// byte-identical to the prior behavior.
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+    /// OpenAI `stream_options` — only `include_usage` is inspected. When
+    /// set on a streaming request, a final `chat.completion.chunk` with
+    /// empty `choices` and a populated `usage` block is emitted just
+    /// before `[DONE]`, mirroring the OpenAI/vLLM convention. Ignored on
+    /// non-streaming requests (those always carry `usage`).
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+}
+
+#[derive(Deserialize, Clone, Default)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
+/// OpenAI-shape `response_format` discriminator. `json_object` and
+/// `json_schema` are honored as constrained modes; `text` is the explicit
+/// no-op; any other `type` is parsed-but-rejected at the 400 boundary
+/// (`validate_response_format`) rather than silently ignored.
+#[derive(Deserialize, Clone)]
+pub struct ResponseFormat {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    /// Present only for `{"type":"json_schema"}`. Carries the OpenAI
+    /// `json_schema` envelope whose `schema` member is the JSON Schema the
+    /// answer must satisfy.
+    #[serde(default)]
+    pub json_schema: Option<JsonSchemaSpec>,
+}
+
+/// OpenAI `response_format.json_schema` envelope. Only `schema` is
+/// load-bearing; the sibling `name`/`strict` members a client may also
+/// send are ignored by serde (no `deny_unknown_fields`).
+#[derive(Deserialize, Clone)]
+pub struct JsonSchemaSpec {
+    /// The JSON Schema the answer must conform to. Compiled to a grammar
+    /// via `GrammarConstraint::from_json_schema`.
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
+}
+
+impl ResponseFormat {
+    /// Constrain the answer to a JSON object (`{...}`, arbitrary contents).
+    pub const JSON_OBJECT: &'static str = "json_object";
+    /// Constrain the answer to a caller-supplied JSON Schema.
+    pub const JSON_SCHEMA: &'static str = "json_schema";
+    /// Explicit unconstrained mode (OpenAI default). A no-op here.
+    pub const TEXT: &'static str = "text";
+}
+
+/// JSON Schema enforcing an object root with arbitrary contents — the
+/// grammar for `{"type":"json_object"}`. `additionalProperties:true` is
+/// explicit because the host compiler defaults to strict mode (no extra
+/// properties), which would otherwise collapse a bare `{"type":"object"}`
+/// to the empty object `{}` alone.
+const JSON_OBJECT_ROOT_SCHEMA: &str = r#"{"type":"object","additionalProperties":true}"#;
+
+/// True when the request asks for JSON-constrained output (`json_object`
+/// OR `json_schema`). Centralizes the predicate so the validation, the
+/// speculation gate, and the two-phase decode all read one test.
+fn json_mode(req: &ChatCompletionsRequest) -> bool {
+    req.response_format.as_ref().is_some_and(|rf| {
+        rf.kind == ResponseFormat::JSON_OBJECT || rf.kind == ResponseFormat::JSON_SCHEMA
+    })
+}
+
+/// The JSON Schema string driving the Phase-2 grammar, or `None` when the
+/// request is not in JSON mode. `json_object` maps to the object-root
+/// schema; `json_schema` serializes the caller's `schema`. Pure — the
+/// grammar compile (which can fail on a malformed schema) happens in
+/// [`build_json_constraint`].
+fn json_constraint_schema(req: &ChatCompletionsRequest) -> Option<String> {
+    let rf = req.response_format.as_ref()?;
+    match rf.kind.as_str() {
+        ResponseFormat::JSON_OBJECT => Some(JSON_OBJECT_ROOT_SCHEMA.to_string()),
+        ResponseFormat::JSON_SCHEMA => rf
+            .json_schema
+            .as_ref()
+            .and_then(|j| j.schema.as_ref())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
 }
 
 /// Request-side speculation knobs (chat-apc extension). Dimensions
@@ -187,6 +295,13 @@ pub struct SpecRequest {
     pub enabled: bool,
     pub leader_len: Option<usize>,
     pub draft_len: Option<usize>,
+    /// Optional request-thread identity for per-chat Cacheback n-gram
+    /// persistence. Absent keeps the preexisting per-request behavior.
+    pub thread_id: Option<String>,
+    /// Optional profile identity; included in the sidecar key so a
+    /// profile switch with the same model does not reuse incompatible
+    /// learned followers.
+    pub profile_id: Option<String>,
 }
 
 impl SpecRequest {
@@ -211,8 +326,62 @@ impl SpecRequest {
 #[derive(Deserialize, Serialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default, deserialize_with = "deserialize_message_content")]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub tool_call_id: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tool_calls: Option<serde_json::Value>,
 }
+
+impl ChatMessage {
+    pub(crate) fn content_str(&self) -> Option<&str> {
+        self.content.as_deref()
+    }
+
+    pub(crate) fn has_tool_calls(&self) -> bool {
+        tool_calls_array(self).is_some_and(|calls| !calls.is_empty())
+    }
+}
+
+/// OpenAI content-part shape (`{"type":"text","text":"..."}`); other part
+/// types (image_url, etc.) are accepted but contribute no text.
+#[derive(Deserialize)]
+struct ContentPart {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// `messages[].content` accepts either the simple string form or the
+/// multi-part array form (`[{"type":"text","text":"..."}, ...]`) that many
+/// OpenAI-compatible clients send (e.g. for retries/multi-modal turns).
+/// The array form is flattened into a single string by concatenating each
+/// part's `text` field, so every downstream consumer keeps treating
+/// `content` as a plain `String`.
+fn deserialize_message_content<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Content {
+        Null,
+        Text(String),
+        Parts(Vec<ContentPart>),
+    }
+
+    match Content::deserialize(deserializer)? {
+        Content::Null => Ok(None),
+        Content::Text(s) => Ok(Some(s)),
+        Content::Parts(parts) => Ok(Some(parts
+            .into_iter()
+            .filter_map(|p| p.text)
+            .collect::<Vec<_>>()
+            .join(""))),
+    }
+}
+
+pub type RequestToolCall = serde_json::Value;
 
 /// OpenAI tool entry. Only `function`-type tools are recognized; the
 /// `type` discriminator is parsed but other variants are ignored at
@@ -243,6 +412,44 @@ struct ChatCompletionChunk<'a> {
     created: i64,
     model: &'a str,
     choices: Vec<ChunkChoice<'a>>,
+    /// Populated only on the final usage-summary chunk emitted when the
+    /// request set `stream_options.include_usage: true` (see [`Usage`]).
+    /// Every other chunk (role/content/reasoning/tool-call deltas, the
+    /// `finish_reason` chunk) leaves this `None` so the wire shape is
+    /// unchanged for clients that don't ask for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
+}
+
+/// OpenAI-shape token accounting, attached to every non-streaming
+/// response and to the optional final streaming chunk
+/// (`stream_options.include_usage: true`).
+#[derive(Serialize, Clone)]
+struct Usage {
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    total_tokens: usize,
+    /// #522 prefix-cache hit accounting, surfaced the same way OpenAI's
+    /// own prompt-caching does. `cached_tokens` is the portion of
+    /// `prompt_tokens` reused from a KV snapshot (0 when the cache
+    /// directive is absent, disabled, or missed).
+    prompt_tokens_details: PromptTokensDetails,
+}
+
+#[derive(Serialize, Clone)]
+struct PromptTokensDetails {
+    cached_tokens: usize,
+}
+
+impl Usage {
+    fn build(prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: PromptTokensDetails { cached_tokens },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -307,7 +514,7 @@ struct ChatCompletion<'a> {
     /// LAUNCH_DIAGS registry on this request. Otherwise these would
     /// live only in `eprintln!` and be dropped in the pie-mac
     /// production deployment (see `crate::sse::emit_done_logged`
-    /// doc + ). Skipped from serialization when empty.
+    /// doc). Skipped from serialization when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     warnings: Option<Vec<NonStreamWarning<'a>>>,
     /// chat-apc extension: speculative-decode metrics. Present only when
@@ -316,6 +523,10 @@ struct ChatCompletion<'a> {
     /// `fallback_reason` when speculation was requested but inactive.
     #[serde(skip_serializing_if = "Option::is_none")]
     spec_metrics: Option<SpecMetricsReport>,
+    /// OpenAI `usage` block — always present on non-streaming responses
+    /// (including partial/error bodies with `finish_reason:"error"`),
+    /// matching stock OpenAI-compatible servers.
+    usage: Usage,
 }
 
 // =============================================================================
@@ -344,6 +555,79 @@ struct SpecMetricsReport {
     decode_tokens_per_sec: f64,
     leader_len: usize,
     draft_len: usize,
+    /// n-gram cache effectiveness (#591): `draft()` lookups that hit a
+    /// follower vs returned empty (cold leader / chain ran dry), the
+    /// derived hit rate, and the end-of-turn cache size. Distinguishes
+    /// "drafter rarely proposes (cold cache)" from "proposes but rejected".
+    cache_hits: usize,
+    cache_misses: usize,
+    cache_hit_rate: f64,
+    cache_size: usize,
+    /// Accepted-prefix length distribution behind `avg_tokens_per_step`
+    /// (#591): index `k` = decode steps that committed exactly `k` accepted
+    /// draft tokens (index 0 = free pick only — cold or fully-rejected step).
+    accepted_prefix_len_histogram: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ngram_sidecar_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ngram_sidecar_leaders: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ngram_sidecars_expired: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidecarMetricStatus {
+    Fresh,
+    Reused,
+    DecodeFailed,
+    LineageForked,
+}
+
+impl SidecarMetricStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            SidecarMetricStatus::Fresh => "fresh",
+            SidecarMetricStatus::Reused => "reused",
+            SidecarMetricStatus::DecodeFailed => "decode_failed",
+            SidecarMetricStatus::LineageForked => "lineage_forked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SidecarMetrics {
+    status: SidecarMetricStatus,
+    ngram_leaders: usize,
+    expired: usize,
+}
+
+struct SidecarLease {
+    key: SidecarKey,
+    lineage: Lineage,
+    cache: Arc<Mutex<super::spec::cache::NgramCache>>,
+}
+
+#[derive(Serialize)]
+struct GenerationMetricsSse {
+    event: &'static str,
+    output_tokens: usize,
+    elapsed_s: f64,
+    tokens_per_sec: f64,
+}
+
+impl GenerationMetricsSse {
+    fn build(output_tokens: usize, elapsed: Duration) -> Option<Self> {
+        let elapsed_s = elapsed.as_secs_f64();
+        if output_tokens == 0 || elapsed_s <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            event: "generation_metrics",
+            output_tokens,
+            elapsed_s,
+            tokens_per_sec: output_tokens as f64 / elapsed_s,
+        })
+    }
 }
 
 impl SpecMetricsReport {
@@ -355,8 +639,10 @@ impl SpecMetricsReport {
         generated_tokens: usize,
         decode_steps: usize,
         elapsed: Duration,
+        sidecar: Option<SidecarMetrics>,
     ) -> Self {
         let secs = elapsed.as_secs_f64();
+        let cache_lookups = spec.cache_hits + spec.cache_misses;
         Self {
             enabled,
             fallback_reason,
@@ -377,6 +663,18 @@ impl SpecMetricsReport {
             },
             leader_len: dims.0,
             draft_len: dims.1,
+            cache_hits: spec.cache_hits,
+            cache_misses: spec.cache_misses,
+            cache_hit_rate: if cache_lookups > 0 {
+                spec.cache_hits as f64 / cache_lookups as f64
+            } else {
+                0.0
+            },
+            cache_size: spec.cache_size,
+            accepted_prefix_len_histogram: spec.accepted_prefix_hist,
+            ngram_sidecar_status: sidecar.map(|s| s.status.as_str()),
+            ngram_sidecar_leaders: sidecar.map(|s| s.ngram_leaders),
+            ngram_sidecars_expired: sidecar.map(|s| s.expired),
         }
     }
 
@@ -388,7 +686,9 @@ impl SpecMetricsReport {
         eprintln!(
             "SPEC_STATS enabled={} fallback={} generated_tokens={} decode_steps={} \
              proposed={} accepted={} rejected={} avg_tokens_per_step={:.3} \
-             decode_tokens_per_sec={:.2}",
+             decode_tokens_per_sec={:.2} cache_hits={} cache_misses={} \
+             cache_hit_rate={:.3} cache_size={} prefix_hist={:?} \
+             sidecar={} sidecar_leaders={} sidecars_expired={}",
             self.enabled,
             self.fallback_reason.unwrap_or("none"),
             self.generated_tokens,
@@ -398,6 +698,14 @@ impl SpecMetricsReport {
             self.rejected_draft_tokens,
             self.avg_tokens_per_step,
             self.decode_tokens_per_sec,
+            self.cache_hits,
+            self.cache_misses,
+            self.cache_hit_rate,
+            self.cache_size,
+            self.accepted_prefix_len_histogram,
+            self.ngram_sidecar_status.unwrap_or("none"),
+            self.ngram_sidecar_leaders.unwrap_or(0),
+            self.ngram_sidecars_expired.unwrap_or(0),
         );
     }
 }
@@ -422,13 +730,24 @@ struct SpecMetricsSse<'a> {
 /// verify must not run against a grammar-constrained sampler. Forced-tool
 /// is checked before the greedy gate so a forced+greedy request reports
 /// `tool_choice_forced`, not speculative.
+///
+/// `json_mode` gates speculation OFF for the same reason (#572): the JSON
+/// phase runs a grammar-constrained sampler, which the drafter's verify
+/// must not run against. Checked first (alongside forced-tool) so a
+/// JSON+greedy request reports `json_constrained`, not speculative.
+/// JSON mode and forced tool_choice are mutually exclusive (rejected at
+/// the 400 boundary), so their order relative to each other is moot.
 fn plan_strategy(
     spec: Option<&SpecRequest>,
     greedy: bool,
     forced_tool: bool,
+    json_mode: bool,
 ) -> (DecodeStrategy, Option<&'static str>, bool, (usize, usize)) {
     match spec {
         None => (DecodeStrategy::Plain, None, false, (0, 0)),
+        Some(s) if s.enabled && json_mode => {
+            (DecodeStrategy::Plain, Some("json_constrained"), true, (0, 0))
+        }
         Some(s) if s.enabled && forced_tool => {
             (DecodeStrategy::Plain, Some("tool_choice_forced"), true, (0, 0))
         }
@@ -437,9 +756,12 @@ fn plan_strategy(
             let dims = (cfg.leader_len, cfg.draft_len);
             (DecodeStrategy::Speculative(cfg), None, true, dims)
         }
-        Some(s) if s.enabled => {
-            (DecodeStrategy::Plain, Some("non_greedy_sampling"), true, (0, 0))
-        }
+        Some(s) if s.enabled => (
+            DecodeStrategy::Plain,
+            Some("non_greedy_sampling"),
+            true,
+            (0, 0),
+        ),
         Some(_) => (DecodeStrategy::Plain, Some("disabled"), true, (0, 0)),
     }
 }
@@ -450,10 +772,494 @@ fn plan_strategy(
 fn seed_tokens_from(model: &Model, messages: &[ChatMessage]) -> Vec<u32> {
     let joined = messages
         .iter()
-        .map(|m| m.content.as_str())
+        .map(|m| m.content_str().unwrap_or(""))
         .collect::<Vec<_>>()
         .join("\n");
     model.tokenizer().encode(&joined)
+}
+
+// =============================================================================
+// JSON Think — two-phase constrained decode (#572/#619)
+// =============================================================================
+//
+// "JSON Think" runs TWO sequential generations on the SAME `Context` so a
+// thinking model can reason freely and still answer in grammar-valid JSON:
+//
+//   · Phase 1 (reasoning): unconstrained. Emit `reasoning_content`,
+//     SUPPRESS visible content. Stop the instant the reasoning block
+//     closes (`reasoning::Event::End`) OR the first visible-content batch
+//     appears (non-thinking models never enter a `<think>` block) OR the
+//     model stops / hits the cap.
+//   · Phase 2 (answer): the request's JSON-mode `GrammarConstraint` is
+//     attached (an object root for `json_object`, the caller's schema for
+//     `json_schema` — see `build_json_constraint`), so every
+//     newly sampled token is masked to valid JSON. Emit content, no
+//     reasoning. Phase 1's tail (the `</think>` batch, or a single
+//     discarded answer-start token on a non-thinking model) is flushed
+//     into Phase 2's first forward pass as plain context — it conditions
+//     the answer but is never emitted and is not subject to the grammar,
+//     so Phase 2's output is pure JSON.
+//
+// No second `fill_context`/`cue()` runs between the phases, so the
+// assistant turn stays open and the model never re-opens `<think>`. The
+// helper is sink-parameterized so the streaming and non-streaming handlers
+// share ONE decode loop, called once per phase.
+//
+// Budget (#572 F2): the request's `max_tokens` is a single ceiling SHARED
+// across both phases, not a per-phase grant. Phase 1 runs against the full
+// ceiling; Phase 2 receives `json_phase2_budget(max_tokens, phase1_generated)`
+// — the remainder, floored at `JSON_PHASE2_MIN_TOKENS` so a thinking model
+// that burns the whole budget before `</think>` can still emit a value. This
+// keeps a JSON request's total generated tokens (hence cost/latency/KV) bound
+// by what the caller asked for instead of silently doubling it.
+
+/// Where a JSON-phase decode loop sends its decoded text.
+enum JsonSink<'a> {
+    /// Streaming: each delta becomes an SSE `chat.completion.chunk`.
+    Stream {
+        em: &'a mut Emitter,
+        id: &'a str,
+        created: i64,
+        model: &'a str,
+    },
+    /// Non-streaming: deltas accumulate into the final `ChatCompletion`.
+    Buffer {
+        content: &'a mut String,
+        reasoning: &'a mut String,
+    },
+}
+
+impl JsonSink<'_> {
+    async fn reasoning_delta(&mut self, text: &str) -> Result<(), EmitError> {
+        match self {
+            JsonSink::Stream { em, id, created, model } => {
+                let chunk = ChatCompletionChunk {
+                    id,
+                    object: "chat.completion.chunk",
+                    created: *created,
+                    model,
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            reasoning_content: Some(text),
+                            ..Default::default()
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                };
+                em.emit_json(&chunk).await
+            }
+            JsonSink::Buffer { reasoning, .. } => {
+                reasoning.push_str(text);
+                Ok(())
+            }
+        }
+    }
+
+    async fn content_delta(&mut self, text: &str) -> Result<(), EmitError> {
+        match self {
+            JsonSink::Stream { em, id, created, model } => {
+                let chunk = ChatCompletionChunk {
+                    id,
+                    object: "chat.completion.chunk",
+                    created: *created,
+                    model,
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            content: Some(text),
+                            ..Default::default()
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                };
+                em.emit_json(&chunk).await
+            }
+            JsonSink::Buffer { content, .. } => {
+                content.push_str(text);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Per-phase knobs for [`run_json_phase`].
+struct JsonPhaseOpts {
+    /// Forward reasoning text to the sink (Phase 1 only). Drives the
+    /// reasoning demux.
+    emit_reasoning: bool,
+    /// Forward visible content to the sink (Phase 2 only).
+    emit_content: bool,
+    /// Phase-1 semantics: stop the moment the reasoning block closes OR the
+    /// first visible-content batch appears (so a non-thinking model yields
+    /// to the constrained phase immediately). Drives the reasoning demux.
+    stop_after_reasoning: bool,
+    /// Phase-2 semantics: emit EVERY decoded chat delta as content without
+    /// the `content_visible` reasoning gate. Phase 2 runs under a JSON
+    /// grammar that cannot emit a `<think>` block, so its output is
+    /// definitionally the answer — there is nothing to suppress. This is
+    /// load-bearing: when Phase 1 ends mid-`<think>` (a thinking model that
+    /// exhausts its budget before `</think>`), the reasoning gate would
+    /// otherwise stay latched and silently swallow the entire JSON answer.
+    raw_content: bool,
+    /// Hard cap on tokens generated in **this phase**. The two phases SHARE
+    /// the request's `max_tokens` ceiling (#572 F2): Phase 1 runs against the
+    /// full ceiling and Phase 2 receives [`json_phase2_budget`] of what Phase
+    /// 1 left (floored at [`JSON_PHASE2_MIN_TOKENS`]), so a JSON request never
+    /// silently spends ~2× the caller's cost/latency/KV bound.
+    max_tokens: usize,
+}
+
+/// Result of one JSON-phase decode loop.
+struct JsonPhaseResult {
+    outcome: Outcome,
+    error_diag: Option<(&'static str, String)>,
+    /// The streaming peer closed mid-phase; the caller should finalize the
+    /// SSE response without emitting further frames.
+    disconnected: bool,
+    /// Tokens generated in this phase (`Generator::tokens_generated`). Read
+    /// once at phase exit so the caller can share the request's `max_tokens`
+    /// budget across both phases (#572 F2) rather than handing each phase an
+    /// independent full budget.
+    tokens_generated: usize,
+    /// Whether this phase emitted at least one visible-content delta. Phase 2
+    /// uses this to detect a contractually-empty JSON answer (#572 F3): a
+    /// `json_object` request that ends Natural/MaxTokens with no content is a
+    /// failure (the empty string is not valid JSON), not a 200 success.
+    produced_content: bool,
+}
+
+/// Drive one generation phase to completion, demuxing reasoning vs visible
+/// content exactly like the canonical loop (`content_visible`) and routing
+/// each through `sink`. `stream` is consumed (dropped on return) so the
+/// caller can build the next phase's generator on the same `Context`.
+/// `in_reasoning` carries the reasoning-block gate across phases.
+async fn run_json_phase(
+    mut stream: inferlet::Generator<'_>,
+    chat_dec: &mut chat::Decoder,
+    reason_dec: &mut ReasoningDecoder,
+    sink: &mut JsonSink<'_>,
+    in_reasoning: &mut bool,
+    opts: JsonPhaseOpts,
+) -> JsonPhaseResult {
+    // Each loop branch breaks the `'phase` loop with its terminal triple;
+    // `tokens_generated` / `produced_content` are read once after the loop so
+    // every exit path reports them uniformly (the generator outlives the loop).
+    let mut produced_content = false;
+    let (outcome, error_diag, disconnected): (Outcome, Option<(&'static str, String)>, bool) =
+        'phase: loop {
+            macro_rules! emit_or_bail {
+                ($call:expr) => {
+                    match $call.await {
+                        Ok(()) => {}
+                        Err(EmitError::Disconnected) => break 'phase (Outcome::Aborted, None, true),
+                        Err(EmitError::Serialize(e)) => {
+                            // Same static chunk schema as the proven canonical
+                            // path, so this is unreachable in practice; log to
+                            // pie-server's capture and end the phase rather than
+                            // shipping corruption.
+                            eprintln!("[chat-apc] json-phase chunk serialize bug: {e}");
+                            break 'phase (
+                                Outcome::Aborted,
+                                Some(("serialize_bug", e.to_string())),
+                                false,
+                            );
+                        }
+                    }
+                };
+            }
+
+            let step = match stream.next() {
+                Ok(None) => {
+                    let outcome = if stream.tokens_generated() >= opts.max_tokens {
+                        Outcome::MaxTokens
+                    } else {
+                        Outcome::Natural
+                    };
+                    break 'phase (outcome, None, false);
+                }
+                Ok(Some(s)) => s,
+                Err(e) => {
+                    // #470/#485 F1: classify the forward error so an
+                    // over-capacity KV-acquire timeout (the `server_busy:`
+                    // sentinel) surfaces as the retryable `server_busy` code
+                    // exactly like the canonical loops — not a flat
+                    // `forward_pass_failed`.
+                    let m = e.to_string();
+                    break 'phase (Outcome::Aborted, Some((classify_forward_error(&m), m)), false);
+                }
+            };
+            let out = match step.execute().await {
+                Ok(o) => o,
+                Err(e) => {
+                    let m = e.to_string();
+                    break 'phase (Outcome::Aborted, Some((classify_forward_error(&m), m)), false);
+                }
+            };
+            if forward_pass_starved(&out.raw().slots) {
+                break 'phase (
+                    Outcome::Aborted,
+                    Some((STARVED_CODE, STARVED_MESSAGE.to_string())),
+                    false,
+                );
+            }
+
+            // Reasoning demux — only the reasoning phase needs it (to emit
+            // reasoning and to detect the </think> / first-visible stop). Phase
+            // 2 skips it entirely: it emits raw JSON content (see below), and
+            // feeding the host reasoning decoder there would mis-latch on the
+            // leftover mid-`<think>` state from a budget-truncated Phase 1.
+            let mut visible = true;
+            if opts.emit_reasoning || opts.stop_after_reasoning {
+                let was_in_reasoning = *in_reasoning;
+                let mut reason_idle = false;
+                let mut reasoning_ended = false;
+                match reason_dec.feed(&out.tokens) {
+                    Ok(inferlet::reasoning::Event::Start) => *in_reasoning = true,
+                    Ok(inferlet::reasoning::Event::Delta(s)) => {
+                        *in_reasoning = true;
+                        if opts.emit_reasoning {
+                            emit_or_bail!(sink.reasoning_delta(&s));
+                        }
+                    }
+                    Ok(inferlet::reasoning::Event::End(_)) => {
+                        *in_reasoning = false;
+                        reasoning_ended = true;
+                    }
+                    Ok(inferlet::reasoning::Event::Idle) => reason_idle = true,
+                    Err(e) => {
+                        break 'phase (
+                            Outcome::Aborted,
+                            Some(("reasoning_decode_failed", e.to_string())),
+                            false,
+                        );
+                    }
+                }
+                visible = content_visible(reason_idle, was_in_reasoning);
+
+                // Phase 1 stops as soon as reasoning ends OR the first visible
+                // batch appears (covers thinking AND non-thinking models). The
+                // visible batch is intentionally NOT emitted here (emit_content
+                // is false in Phase 1); its tokens are already staged in the
+                // context buffer and flow into Phase 2 as plain conditioning
+                // context.
+                if opts.stop_after_reasoning && (reasoning_ended || visible) {
+                    break 'phase (Outcome::Natural, None, false);
+                }
+            }
+
+            match chat_dec.feed(&out.tokens) {
+                Ok(chat::Event::Delta(s)) if opts.emit_content && (opts.raw_content || visible) => {
+                    produced_content = true;
+                    emit_or_bail!(sink.content_delta(&s));
+                }
+                Ok(chat::Event::Delta(_)) => {}
+                Ok(chat::Event::Done(_)) => break 'phase (Outcome::Natural, None, false),
+                Ok(chat::Event::Interrupt(id)) => {
+                    break 'phase (
+                        Outcome::Aborted,
+                        Some((
+                            "chat_template_interrupt",
+                            format!("control token {id} from chat template"),
+                        )),
+                        false,
+                    );
+                }
+                Ok(chat::Event::Idle) => continue,
+                Err(e) => {
+                    break 'phase (Outcome::Aborted, Some(("decode_failed", e.to_string())), false);
+                }
+            }
+        };
+
+    JsonPhaseResult {
+        outcome,
+        error_diag,
+        disconnected,
+        tokens_generated: stream.tokens_generated(),
+        produced_content,
+    }
+}
+
+/// Distinct code/HTTP status for a JSON Phase-2 that ended cleanly
+/// (`Natural`/`MaxTokens`) yet emitted zero content (#572 F3). For a
+/// `json_object` request the empty string is not valid JSON, so this is a
+/// contract failure — analogous to the canonical `tool_call_not_produced`
+/// reclassification — not a deceptive `200 / finish_reason:"stop" / ""`.
+const JSON_EMPTY_OUTPUT_CODE: &str = "json_empty_output";
+const JSON_EMPTY_OUTPUT_MESSAGE: &str =
+    "JSON-constrained generation produced no content; the model emitted no answer tokens \
+     under the JSON grammar (raise max_tokens or verify the model supports constrained decoding)";
+
+/// Minimum token budget handed to Phase 2 after Phase 1's generation is
+/// debited from the request ceiling (#572 F2). The floor guarantees a
+/// thinking model that exhausts the whole budget before `</think>` still has
+/// room to emit a complete JSON value rather than being starved to zero.
+const JSON_PHASE2_MIN_TOKENS: usize = 64;
+
+/// #572 F2: share the request's `max_tokens` ceiling across the two phases.
+/// Phase 1 (reasoning) runs against the full ceiling; Phase 2 (answer) gets
+/// what Phase 1 left, floored at [`JSON_PHASE2_MIN_TOKENS`] so the constrained
+/// answer is never budgeted to zero. Without this each phase received an
+/// independent full budget, silently doubling the caller's cost/latency/KV
+/// bound for a JSON request.
+fn json_phase2_budget(max_tokens: usize, phase1_generated: usize) -> usize {
+    max_tokens.saturating_sub(phase1_generated).max(JSON_PHASE2_MIN_TOKENS)
+}
+
+/// #572 F3: finalize a JSON Phase-2 result, reclassifying a clean-but-empty
+/// answer as an explicit `json_empty_output` error. Returns the terminal
+/// `(outcome, error_diag, disconnected)` triple the handlers emit. A phase
+/// that already errored, disconnected, or produced content passes through
+/// unchanged.
+fn json_phase2_finalize(r2: JsonPhaseResult) -> (Outcome, Option<(&'static str, String)>, bool) {
+    if r2.error_diag.is_none()
+        && !r2.produced_content
+        && matches!(r2.outcome, Outcome::Natural | Outcome::MaxTokens)
+    {
+        return (
+            Outcome::Aborted,
+            Some((JSON_EMPTY_OUTPUT_CODE, JSON_EMPTY_OUTPUT_MESSAGE.to_string())),
+            r2.disconnected,
+        );
+    }
+    (r2.outcome, r2.error_diag, r2.disconnected)
+}
+
+/// HTTP status for a JSON-mode pure-failure (no partial body): an
+/// over-capacity `server_busy` is a retryable 503, everything else a 500 —
+/// mirrors the canonical non-streaming branch (#470/#485 F1).
+fn json_pure_failure_status(code: &str) -> u16 {
+    if code == SERVER_BUSY_CODE {
+        503
+    } else {
+        500
+    }
+}
+
+fn cacheback_sidecars() -> &'static Mutex<SidecarStore> {
+    static STORE: OnceLock<Mutex<SidecarStore>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(SidecarStore::new(CACHEBACK_SIDECAR_TTL)))
+}
+
+fn tools_digest(tools: Option<&[ToolSchema]>) -> u64 {
+    let envelopes = tools.map(|t| tool_envelopes(t, None)).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    envelopes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn lineage_from(messages: &[ChatMessage]) -> Lineage {
+    let turns = messages
+        .iter()
+        .map(|m| (m.role.as_str(), m.content_str().unwrap_or("")))
+        .collect::<Vec<_>>();
+    Lineage::from_turns(&turns)
+}
+
+fn sidecar_for_request(
+    model: &str,
+    tools: Option<&[ToolSchema]>,
+    messages: &[ChatMessage],
+    spec: Option<&SpecRequest>,
+    cfg: &SpecConfig,
+) -> (Option<SidecarLease>, Option<SidecarMetrics>) {
+    let Some(spec) = spec.filter(|s| s.enabled) else {
+        return (None, None);
+    };
+    let Some(thread_id) = spec
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return (None, None);
+    };
+    let key = SidecarKey::new(
+        thread_id,
+        model,
+        spec.profile_id.as_deref(),
+        tools_digest(tools),
+        cfg.leader_len,
+        cfg.draft_len,
+    );
+    let lineage = lineage_from(messages);
+    let persisted = match inferlet::blob_store::open_blob(&key.blob_name()) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("[chat-apc] cacheback sidecar open failed: {e}");
+            None
+        }
+    };
+    let checkout = cacheback_sidecars()
+        .lock()
+        .unwrap()
+        .checkout_with_persisted(
+            monotonic_nanos_since_anchor() / 1_000_000,
+            key.clone(),
+            lineage.clone(),
+            persisted,
+        );
+    let status = match checkout.status {
+        SidecarStatus::Fresh => SidecarMetricStatus::Fresh,
+        SidecarStatus::Reused => SidecarMetricStatus::Reused,
+        SidecarStatus::DecodeFailed => SidecarMetricStatus::DecodeFailed,
+        SidecarStatus::LineageForked => SidecarMetricStatus::LineageForked,
+    };
+    if let Some(diagnostic) = &checkout.diagnostic {
+        eprintln!(
+            "[chat-apc] cacheback sidecar non-reuse status={}: {diagnostic}",
+            status.as_str()
+        );
+    }
+    if checkout.delete_persisted {
+        if let Err(e) = inferlet::blob_store::delete_blob(&key.blob_name()) {
+            eprintln!("[chat-apc] cacheback sidecar delete failed: {e}");
+        }
+    }
+    let cache = checkout.cache;
+    (
+        Some(SidecarLease {
+            key,
+            lineage,
+            cache,
+        }),
+        Some(SidecarMetrics {
+            status,
+            ngram_leaders: checkout.ngram_leaders,
+            expired: checkout.expired,
+        }),
+    )
+}
+
+fn persist_sidecar(lease: Option<&SidecarLease>, terminal_turn: Option<(&str, &str)>) {
+    let Some(lease) = lease else {
+        return;
+    };
+    let Some((role, content)) = terminal_turn else {
+        return;
+    };
+    let Ok(cache) = lease.cache.lock() else {
+        eprintln!("[chat-apc] cacheback sidecar cache lock poisoned; skipping save");
+        return;
+    };
+    let persisted_lineage = lease.lineage.with_turn(role, content);
+    let bytes = match encode_sidecar_blob(&persisted_lineage, &cache) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("[chat-apc] cacheback sidecar encode failed: {e}");
+            return;
+        }
+    };
+    let ttl_ms = CACHEBACK_SIDECAR_TTL
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    if let Err(e) = inferlet::blob_store::save_blob(&lease.key.blob_name(), &bytes, ttl_ms) {
+        eprintln!("[chat-apc] cacheback sidecar save failed: {e}");
+    }
 }
 
 #[derive(Serialize)]
@@ -720,9 +1526,44 @@ fn forward_pass_starved(slots: &[SlotOutput]) -> bool {
 /// branch on the starvation case distinctly from a generic
 /// `forward_pass_failed`.
 const STARVED_CODE: &str = "forward_pass_starved";
-const STARVED_MESSAGE: &str =
-    "engine produced no tokens for a decode step (device failure, per-batch \
+const STARVED_MESSAGE: &str = "engine produced no tokens for a decode step (device failure, per-batch \
      timeout, or KV eviction); generation cannot continue";
+
+// =============================================================================
+// Over-capacity / backpressure classification (#470)
+// =============================================================================
+
+/// Stable sentinel the pie runtime prefixes onto a KV-page **acquisition
+/// timeout** (`runtime::context::reserve_working_pages`). When concurrent
+/// requests exceed the engine's KV slot count, a reservation defers on the
+/// scheduler's alloc/restore queues with no timer of its own; the host now
+/// bounds that wait and fails the call with this prefix. The chat-apc
+/// handler matches it to surface backpressure as `server_busy` + HTTP 503
+/// instead of a generic `forward_pass_failed` 500 — so an over-capacity
+/// client gets an explicit, retryable signal rather than a hung connection.
+///
+/// The trailing colon is load-bearing: `GenStep::execute` errors are an
+/// opaque free-text channel that also carries verbatim device/driver text,
+/// so a bare `server_busy` substring could appear in an unrelated fatal
+/// error and get mislabeled retryable. The host's contract is the
+/// colon-suffixed prefix (`"server_busy: …"`); bind to exactly that. (The
+/// real fix is a structured WIT error code — tracked as a follow-up.)
+const SERVER_BUSY_SENTINEL: &str = "server_busy:";
+
+/// Distinct terminal/error code for the over-capacity case.
+const SERVER_BUSY_CODE: &str = "server_busy";
+
+/// Classify a `Generator::next` / `GenStep::execute` error string into a
+/// stable terminal code. An over-capacity acquisition timeout (carrying the
+/// [`SERVER_BUSY_SENTINEL`]) maps to [`SERVER_BUSY_CODE`]; everything else
+/// is a generic `forward_pass_failed`.
+fn classify_forward_error(msg: &str) -> &'static str {
+    if msg.contains(SERVER_BUSY_SENTINEL) {
+        SERVER_BUSY_CODE
+    } else {
+        "forward_pass_failed"
+    }
+}
 
 // =============================================================================
 // Reasoning/content channel demux
@@ -756,6 +1597,65 @@ fn content_visible(reason_idle: bool, was_in_reasoning: bool) -> bool {
     reason_idle && !was_in_reasoning
 }
 
+/// Closing reasoning delimiter. The reasoning/content channels are demuxed per
+/// batch, but the `</think>` boundary can fall MID-batch: under speculative
+/// decode a single generation step is a multi-token burst, so the closing
+/// delimiter and the first answer tokens can arrive together. On that step the
+/// reasoning decoder fires `End` (so [`content_visible`] is false) while the
+/// chat decoder lumps the whole step into ONE delta
+/// `…reasoning</think>answer-head`. The per-batch gate would then suppress the
+/// entire delta and silently DROP the answer that rode the same batch as the
+/// close (#600). The reasoning half of the same straddle is recovered separately
+/// via the `End(s)` residual (#466); this is the complementary content half.
+const THINK_CLOSE: &str = "</think>";
+
+/// Recover the visible answer that followed `</think>` inside the chat delta of
+/// the batch where the reasoning block closed. Returns `None` when the delta is
+/// the bare delimiter (plain decode — the answer arrives on the NEXT batch and
+/// streams normally) or when the model's close delimiter is not `THINK_CLOSE`
+/// (no regression: the prior behavior dropped the whole delta anyway). Splits on
+/// the FIRST `</think>` — the reasoning tail before it cannot contain the close
+/// delimiter, so an answer that itself mentions the tag stays intact. Leading
+/// newlines are trimmed to mirror the chat template's `content.lstrip('\n')`.
+fn answer_after_close(chat_delta: &str) -> Option<&str> {
+    chat_delta
+        .split_once(THINK_CLOSE)
+        .map(|(_, answer)| answer.trim_start_matches('\n'))
+        .filter(|answer| !answer.is_empty())
+}
+
+/// The visible-content slice to emit for a chat-decoder `Delta` on this batch,
+/// given the reasoning-gate state. `""` means suppress. This is the single
+/// demux decision shared by the streaming and non-streaming loops (and exercised
+/// directly by the unit tests), so both paths treat the `</think>` straddle
+/// identically:
+///
+/// * `forced_tool` → always suppressed: the whole generation IS the tool call,
+///   which rides only the terminal `tool_calls` delta.
+/// * batch landed entirely outside reasoning ([`content_visible`]) → the full
+///   delta is visible content.
+/// * the reasoning block closed ON this batch (`reason_ended`) → recover the
+///   answer-head that shared the close batch ([`answer_after_close`]); the
+///   reasoning tail + delimiter ahead of it stay suppressed.
+/// * otherwise (inside the block, or the opening delimiter) → suppressed.
+fn visible_content<'a>(
+    chat_delta: &'a str,
+    reason_idle: bool,
+    was_in_reasoning: bool,
+    reason_ended: bool,
+    forced_tool: bool,
+) -> &'a str {
+    if forced_tool {
+        ""
+    } else if content_visible(reason_idle, was_in_reasoning) {
+        chat_delta
+    } else if reason_ended {
+        answer_after_close(chat_delta).unwrap_or("")
+    } else {
+        ""
+    }
+}
+
 // =============================================================================
 // Launch-diagnostics registry (N1/N2 — OnceLock immutable snapshot)
 // =============================================================================
@@ -764,7 +1664,7 @@ fn content_visible(reason_idle: bool, was_in_reasoning: bool) -> bool {
 /// detection (id_seed entropy fallback, now_unix_secs clock-skew,
 /// monotonic-clock stub/coarse) that would otherwise live only in
 /// `eprintln!` and be dropped in the pie-mac production deployment
-/// (see `crate::sse::emit_done_logged` doc + ).
+/// (see `crate::sse::emit_done_logged` doc).
 ///
 /// N1/N2 design: computed exactly once at first request entry via
 /// `compute_launch_diags()`, then frozen in `LAUNCH_DIAGS: OnceLock`
@@ -866,7 +1766,10 @@ fn compute_launch_diags() -> Vec<LaunchDiag> {
              for this and all subsequent requests (one-shot)"
         );
         eprintln!("[chat-apc] {msg}");
-        diags.push(LaunchDiag { code: CODE_CLOCK_SKEW, message: msg });
+        diags.push(LaunchDiag {
+            code: CODE_CLOCK_SKEW,
+            message: msg,
+        });
     }
     init_seed_into(&mut diags);
     diags
@@ -1159,12 +2062,7 @@ fn build_launch_diags_payload(diags: &[LaunchDiag]) -> String {
         // conclude no budget drops occurred — when in truth no
         // budget check ran at all.
         Err(_) => {
-            return fallback_serialize_failed_payload(
-                Some(diags.len()),
-                None,
-                None,
-                None,
-            );
+            return fallback_serialize_failed_payload(Some(diags.len()), None, None, None);
         }
     };
     // Q3: partition dropped entries by REASON so operators can tell
@@ -1431,9 +2329,7 @@ fn with_launch_diags_header<B>(mut resp: Response<B>) -> Response<B> {
                      X-ChatAPC-Launch-Diags-Error sentinel. One-shot log."
                 );
             }
-            if let Ok(sentinel) =
-                wstd::http::HeaderValue::from_str("encoding_failed")
-            {
+            if let Ok(sentinel) = wstd::http::HeaderValue::from_str("encoding_failed") {
                 resp.headers_mut()
                     .insert("X-ChatAPC-Launch-Diags-Error", sentinel);
             }
@@ -1490,9 +2386,7 @@ fn init_seed_into(diags: &mut Vec<LaunchDiag>) {
     if SEED.load(Ordering::Relaxed) != 0 {
         return;
     }
-    let candidate = match std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-    {
+    let candidate = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_nanos() as u64,
         Err(e) => {
             // Mix wasi entropy + the SEED static's address. The
@@ -1570,8 +2464,7 @@ fn init_seed_into(diags: &mut Vec<LaunchDiag>) {
                     }
                 }
                 const BUILD_NONCE: u64 = 0x6368_6174_6170_6300; // "chatapc\0"
-                let mixed = skew_nanos
-                    .rotate_left(17)
+                let mixed = skew_nanos.rotate_left(17)
                     ^ addr.rotate_left(13)
                     ^ mono_nanos.rotate_left(31)
                     ^ BUILD_NONCE;
@@ -1584,7 +2477,10 @@ fn init_seed_into(diags: &mut Vec<LaunchDiag>) {
                      wasi:random host configuration."
                 );
                 eprintln!("[chat-apc] {msg}");
-                diags.push(LaunchDiag { code: CODE_ENTROPY_DEGRADED, message: msg });
+                diags.push(LaunchDiag {
+                    code: CODE_ENTROPY_DEGRADED,
+                    message: msg,
+                });
                 mixed
             } else {
                 let entropy = u64::from_le_bytes(buf);
@@ -1769,81 +2665,55 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
             )))
             .await;
     }
-    // G4: use `trim().is_empty()` for parity with the model check
-    // above. `content:"\n"` / `content:"   "` / zero-width-space
-    // strings would otherwise slip through and feed `ctx.user("   ")`,
-    // degenerating the prompt — the asymmetric `is_empty()` check
-    // partially fixed F8 but left the whitespace path silently broken.
-    if let Some((i, _)) = request
-        .messages
-        .iter()
-        .enumerate()
-        .find(|(_, m)| m.content.trim().is_empty())
-    {
-        let body = serde_json::json!({
-            "error": {
-                "type": "invalid_request_error",
-                "code": "invalid_request",
-                "message": "message content must be a non-empty, non-whitespace string",
-                "param": format!("messages[{i}].content"),
-            }
-        });
-        let response = Response::builder()
-            .status(400)
-            .header("Content-Type", "application/json")
-            .body(body.to_string().into_body())
-            .unwrap();
-        return res.respond(with_launch_diags_header(response)).await;
-    }
-
-    if let Err((field, msg)) = validate_sampling(&request) {
+    if let Err(err) = validate_messages(&request.messages) {
         return res
             .respond(with_launch_diags_header(json_error_param(
                 400,
-                "invalid_request",
-                &msg,
-                field,
+                err.code,
+                &err.message,
+                &err.param,
             )))
             .await;
     }
 
-    // F4: reject `role:"tool"` until the chat template grows a real
-    // tool slot. Silent demotion to `user` (the prior `_` arm in
-    // `fill_context`) makes multi-turn tool-call round-trips quietly
-    // wrong — better to fail loud than ship half-wired tool support.
-    if let Some((i, m)) = request
-        .messages
-        .iter()
-        .enumerate()
-        .find(|(_, m)| m.role == "tool")
-    {
-        let body = serde_json::json!({
-            "error": {
-                "type": "invalid_request_error",
-                "code": "tool_role_unsupported",
-                "message": format!(
-                    "messages[{i}].role=\"tool\" is not yet supported (chat template has no tool slot); \
-                     post the tool result as a user turn or wait for the SDK tool-answer surface to land"
-                ),
-                "param": format!("messages[{i}].role"),
-            }
-        });
-        let _ = m;
-        let response = Response::builder()
-            .status(400)
-            .header("Content-Type", "application/json")
-            .body(body.to_string().into_body())
-            .unwrap();
-        return res.respond(with_launch_diags_header(response)).await;
+    let max_output_ceiling = max_output_ceiling();
+    let effective_max_tokens = match validate_sampling(&request, max_output_ceiling) {
+        Ok(max_tokens) => max_tokens,
+        Err((field, msg)) => {
+            return res
+                .respond(with_launch_diags_header(json_error_param(
+                    400,
+                    "invalid_request",
+                    &msg,
+                    field,
+                )))
+                .await;
+        }
+    };
+
+    // #572/#619: validate `response_format` before opening any stream.
+    // `json_object` and `json_schema` (constrained) and `text` (no-op) are
+    // honored; any other `type` is rejected loudly rather than silently
+    // ignored. JSON mode + a forced `tool_choice` both constrain
+    // the sampler to different grammars, so they cannot combine. The
+    // `role:"tool"` handling that lived here moved into `validate_messages`
+    // (main now supports tool turns with ids/ordering), so it is not
+    // re-checked inline.
+    if let Err((code, msg, param)) = validate_response_format(&request) {
+        return res
+            .respond(with_launch_diags_header(json_error_param(
+                400, code, &msg, param,
+            )))
+            .await;
     }
 
     let registered = runtime::models();
-    if !registered.iter().any(|m| m == &request.model) {
+    if let Some(err) = model_registration_error(&request.model, &registered) {
         return res
             .respond(with_launch_diags_header(sse::json_error(
-                404,
-                "model_not_found",
-                &format!("Model '{}' not registered with this engine", request.model),
+                err.status,
+                err.code,
+                &err.message,
             )))
             .await;
     }
@@ -1854,20 +2724,435 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
     // and non-stream `warnings` field and `X-ChatAPC-Launch-Diags`
     // header all source from the same place.
     if request.stream {
-        handle_streaming(request, res).await
+        handle_streaming(request, res, effective_max_tokens).await
     } else {
-        handle_non_streaming(request, res).await
+        handle_non_streaming(request, res, effective_max_tokens).await
     }
+}
+
+struct ModelRegistrationError {
+    status: u16,
+    code: &'static str,
+    message: String,
+}
+
+fn model_registration_error(
+    requested: &str,
+    registered: &[String],
+) -> Option<ModelRegistrationError> {
+    if registered.iter().any(|m| m == requested) {
+        return None;
+    }
+    if registered.is_empty() {
+        return Some(ModelRegistrationError {
+            status: 404,
+            code: "model_not_found",
+            message: format!("Model '{requested}' not registered with this engine"),
+        });
+    }
+    Some(ModelRegistrationError {
+        status: 409,
+        code: "target_mismatch",
+        message: format!(
+            "Requested model '{requested}' does not match this engine's resident model '{}'; retry after synchronizing the engine target or use the model from /v1/models",
+            registered[0]
+        ),
+    })
 }
 
 // =============================================================================
 // Validation (F7)
 // =============================================================================
 
-/// Validate sampling parameters. Returns `Err((field, message))`
-/// where `field` names the offending JSON key (passed to the
-/// OpenAI-shape error envelope's `param`).
-fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, String)> {
+/// Roles the chat/template replay path supports. Unknown roles remain an
+/// OpenAI-compatibility error (#468).
+const SUPPORTED_ROLES: [&str; 4] = ["system", "user", "assistant", "tool"];
+
+/// Single source of truth for the role policy. `None` = fillable;
+/// `Some(code)` = rejected with that 400 envelope `code`. Unknown roles —
+/// typo, `developer`, `function`, … — are `unsupported_role`. Used by both
+/// `validate_messages` (the early request gate) and `build_prompt_tokens`
+/// (the callee guard), so the two can't drift.
+fn role_error_code(role: &str) -> Option<&'static str> {
+    if SUPPORTED_ROLES.contains(&role) {
+        None
+    } else {
+        Some("unsupported_role")
+    }
+}
+
+/// Build the 400-envelope message for a rejected role at index `i`.
+fn role_error_message(i: usize, role: &str, code: &str) -> String {
+    let _ = code;
+    format!(
+        "messages[{i}].role={role:?} is not a supported role (expected one of: system, user, assistant, tool)"
+    )
+}
+
+/// Error `code`s emitted by the role policy (vs. internal failures like
+/// `tool_equip_failed`). A `fill_context` `Err` carrying one of these is
+/// a client error (400); anything else is an internal 500. Callers that
+/// surface `fill_context` failures (e.g. `tot::dispatch`) use this to
+/// pick the status.
+pub(crate) fn is_role_error_code(code: &str) -> bool {
+    matches!(code, "unsupported_role" | "tool_role_unsupported")
+}
+
+/// Validate message roles against the supported set. Returns the
+/// offending message index plus the 400 envelope `code`/`message`.
+///
+/// This is the early request gate ([`handle_parsed`]); [`fill_context`]
+/// guards the same policy at the callee so any non-completions caller
+/// (e.g. the tree-of-thought dispatch path) also rejects rather than
+/// silently demoting an unknown role to `user`.
+#[cfg(test)]
+fn validate_roles(messages: &[ChatMessage]) -> Result<(), (usize, &'static str, String)> {
+    for (i, m) in messages.iter().enumerate() {
+        if let Some(code) = role_error_code(&m.role) {
+            return Err((i, code, role_error_message(i, &m.role, code)));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MessageValidationError {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+    pub(crate) param: String,
+}
+
+impl MessageValidationError {
+    pub(crate) fn new(
+        code: &'static str,
+        message: impl Into<String>,
+        param: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            param: param.into(),
+        }
+    }
+}
+
+pub(crate) fn validate_messages(messages: &[ChatMessage]) -> Result<(), MessageValidationError> {
+    let mut seen_tool_call_ids = HashSet::<String>::new();
+    let mut known_tool_names = HashMap::<String, String>::new();
+    let mut pending_tool_call_ids = VecDeque::<String>::new();
+
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.role != "assistant" && msg.tool_calls.is_some() {
+            return Err(MessageValidationError::new(
+                "malformed_tool_calls",
+                "tool_calls are only valid on assistant messages",
+                format!("messages[{i}].tool_calls"),
+            ));
+        }
+        if msg.role != "tool" && msg.tool_call_id.is_some() {
+            return Err(MessageValidationError::new(
+                "malformed_tool_calls",
+                "tool_call_id is only valid on tool messages",
+                format!("messages[{i}].tool_call_id"),
+            ));
+        }
+
+        match msg.role.as_str() {
+            "system" | "user" => {
+                if !pending_tool_call_ids.is_empty() {
+                    return Err(MessageValidationError::new(
+                        "invalid_tool_order",
+                        "tool result messages must immediately follow the assistant tool_calls they answer",
+                        format!("messages[{i}].role"),
+                    ));
+                }
+                validate_text_content(msg, i, false)?;
+            }
+            "assistant" => {
+                if !pending_tool_call_ids.is_empty() {
+                    return Err(MessageValidationError::new(
+                        "invalid_tool_order",
+                        "tool result messages must immediately follow the assistant tool_calls they answer",
+                        format!("messages[{i}].role"),
+                    ));
+                }
+                let calls = validate_tool_calls_container(msg, i)?;
+                validate_text_content(msg, i, calls.is_some_and(|calls| !calls.is_empty()))?;
+                if let Some(calls) = calls {
+                    for (j, call) in calls.iter().enumerate() {
+                        validate_tool_call(call, i, j)?;
+                        let id = tool_call_id(call).expect("validated tool call id");
+                        let name = tool_call_function_name(call)
+                            .expect("validated tool call function name");
+                        if !seen_tool_call_ids.insert(id.to_string()) {
+                            return Err(MessageValidationError::new(
+                                "duplicate_tool_call_id",
+                                format!("tool_call_id '{id}' appears more than once"),
+                                format!("messages[{i}].tool_calls[{j}].id"),
+                            ));
+                        }
+                        known_tool_names.insert(id.to_string(), name.to_string());
+                        pending_tool_call_ids.push_back(id.to_string());
+                    }
+                }
+            }
+            "tool" => {
+                validate_text_content(msg, i, false)?;
+                let tool_call_id = validate_tool_call_id(msg, i)?;
+                if !known_tool_names.contains_key(tool_call_id) {
+                    return Err(MessageValidationError::new(
+                        "unknown_tool_call_id",
+                        format!("tool_call_id '{tool_call_id}' does not match a preceding assistant tool_call"),
+                        format!("messages[{i}].tool_call_id"),
+                    ));
+                }
+                match pending_tool_call_ids.front() {
+                    Some(expected) if expected == tool_call_id => {
+                        pending_tool_call_ids.pop_front();
+                    }
+                    Some(expected) => {
+                        return Err(MessageValidationError::new(
+                            "invalid_tool_order",
+                            format!(
+                                "tool_call_id '{tool_call_id}' answered out of order; expected '{expected}'"
+                            ),
+                            format!("messages[{i}].tool_call_id"),
+                        ));
+                    }
+                    None => {
+                        return Err(MessageValidationError::new(
+                            "invalid_tool_order",
+                            format!("tool_call_id '{tool_call_id}' was already answered or is not pending"),
+                            format!("messages[{i}].tool_call_id"),
+                        ));
+                    }
+                }
+            }
+            other => {
+                if !pending_tool_call_ids.is_empty() {
+                    return Err(MessageValidationError::new(
+                        "invalid_tool_order",
+                        "tool result messages must immediately follow the assistant tool_calls they answer",
+                        format!("messages[{i}].role"),
+                    ));
+                }
+                validate_text_content(msg, i, false)?;
+                let code = role_error_code(other).unwrap_or("unsupported_role");
+                return Err(MessageValidationError::new(
+                    code,
+                    role_error_message(i, other, code),
+                    format!("messages[{i}].role"),
+                ));
+            }
+        }
+    }
+
+    if let Some(id) = pending_tool_call_ids.iter().next() {
+        return Err(MessageValidationError::new(
+            "missing_tool_result",
+            format!("assistant tool_call '{id}' is missing a matching tool result message"),
+            "messages",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_text_content(
+    msg: &ChatMessage,
+    i: usize,
+    allow_empty_or_null: bool,
+) -> Result<(), MessageValidationError> {
+    match msg.content.as_deref() {
+        Some(content) => {
+            if content.trim().is_empty() && !allow_empty_or_null {
+                return Err(MessageValidationError::new(
+                    "invalid_request",
+                    "message content must be a non-empty, non-whitespace string",
+                    format!("messages[{i}].content"),
+                ));
+            }
+        }
+        None if allow_empty_or_null => {}
+        None => {
+            return Err(MessageValidationError::new(
+                "invalid_request",
+                "message content must be a non-empty string",
+                format!("messages[{i}].content"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn tool_calls_array(msg: &ChatMessage) -> Option<&[RequestToolCall]> {
+    msg.tool_calls.as_ref()?.as_array().map(Vec::as_slice)
+}
+
+fn validate_tool_calls_container(
+    msg: &ChatMessage,
+    i: usize,
+) -> Result<Option<&[RequestToolCall]>, MessageValidationError> {
+    let Some(value) = msg.tool_calls.as_ref() else {
+        return Ok(None);
+    };
+    let Some(calls) = value.as_array() else {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls must be a list of objects",
+            format!("messages[{i}].tool_calls"),
+        ));
+    };
+    if calls.iter().any(|call| !call.is_object()) {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls must be a list of objects",
+            format!("messages[{i}].tool_calls"),
+        ));
+    }
+    Ok(Some(calls))
+}
+
+fn validate_tool_call_id(msg: &ChatMessage, i: usize) -> Result<&str, MessageValidationError> {
+    let Some(value) = msg.tool_call_id.as_ref() else {
+        return Err(MessageValidationError::new(
+            "missing_tool_call_id",
+            "tool messages must include tool_call_id",
+            format!("messages[{i}].tool_call_id"),
+        ));
+    };
+    let Some(tool_call_id) = value.as_str() else {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "tool_call_id must be a string",
+            format!("messages[{i}].tool_call_id"),
+        ));
+    };
+    if tool_call_id.trim().is_empty() {
+        return Err(MessageValidationError::new(
+            "missing_tool_call_id",
+            "tool messages must include a non-empty tool_call_id",
+            format!("messages[{i}].tool_call_id"),
+        ));
+    }
+    Ok(tool_call_id)
+}
+
+fn tool_call_id(call: &RequestToolCall) -> Option<&str> {
+    call.as_object()?.get("id")?.as_str()
+}
+
+fn tool_call_kind(call: &RequestToolCall) -> Option<&str> {
+    call.as_object()?.get("type")?.as_str()
+}
+
+fn tool_call_function_object(
+    call: &RequestToolCall,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    call.as_object()?.get("function")?.as_object()
+}
+
+fn tool_call_function_name(call: &RequestToolCall) -> Option<&str> {
+    tool_call_function_object(call)?.get("name")?.as_str()
+}
+
+fn tool_call_function_arguments(call: &RequestToolCall) -> Option<&serde_json::Value> {
+    tool_call_function_object(call)?.get("arguments")
+}
+
+fn validate_tool_call(
+    call: &RequestToolCall,
+    i: usize,
+    j: usize,
+) -> Result<(), MessageValidationError> {
+    let Some(id) = tool_call_id(call) else {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls must include a non-empty id",
+            format!("messages[{i}].tool_calls[{j}].id"),
+        ));
+    };
+    if id.trim().is_empty() {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls must include a non-empty id",
+            format!("messages[{i}].tool_calls[{j}].id"),
+        ));
+    }
+    if tool_call_kind(call) != Some("function") {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls must include type=\"function\"",
+            format!("messages[{i}].tool_calls[{j}].type"),
+        ));
+    }
+    if tool_call_function_object(call).is_none() {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls must include function",
+            format!("messages[{i}].tool_calls[{j}].function"),
+        ));
+    }
+    let Some(name) = tool_call_function_name(call) else {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls must include a non-empty function.name",
+            format!("messages[{i}].tool_calls[{j}].function.name"),
+        ));
+    };
+    if name.trim().is_empty() {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls must include a non-empty function.name",
+            format!("messages[{i}].tool_calls[{j}].function.name"),
+        ));
+    }
+    let Some(arguments) = tool_call_function_arguments(call) else {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls[].function.arguments must be a string",
+            format!("messages[{i}].tool_calls[{j}].function.arguments"),
+        ));
+    };
+    if !arguments.is_string() {
+        return Err(MessageValidationError::new(
+            "malformed_tool_calls",
+            "assistant tool_calls[].function.arguments must be a string",
+            format!("messages[{i}].tool_calls[{j}].function.arguments"),
+        ));
+    }
+    Ok(())
+}
+
+/// Per-request `max_tokens` ceiling, read live from the engine. This is
+/// `runtime::max-output-tokens()` — the runtime-reported output-token
+/// ceiling: configured scheduler `default_token_limit` capped by raw KV
+/// capacity when set, otherwise raw KV capacity. Falls back to
+/// `MAX_OUTPUT_TOKENS_FALLBACK` when the engine reports 0 (no model
+/// registered / ceiling unknown).
+fn max_output_ceiling() -> usize {
+    match runtime::max_output_tokens() as usize {
+        0 => MAX_OUTPUT_TOKENS_FALLBACK,
+        n => n,
+    }
+}
+
+/// `max_output_ceiling` is the inclusive upper bound on `max_tokens`,
+/// supplied by the caller from `runtime::max-output-tokens` so validation
+/// follows the runtime-reported ceiling (configured `default_token_limit`
+/// capped by KV capacity, or raw KV capacity when unset) instead of a
+/// hardcoded constant. Kept as a parameter — rather than reading the host
+/// import in here — so this stays a pure function the unit tests can drive
+/// without an engine host.
+/// Returns the effective generation `max_tokens` budget. For omitted
+/// `max_tokens`, the default is clamped down to the runtime ceiling so the
+/// common default request path cannot exceed a memory-aware engine limit.
+/// Returns `Err((field, message))` where `field` names the offending JSON key
+/// (passed to the OpenAI-shape error envelope's `param`).
+fn validate_sampling(
+    req: &ChatCompletionsRequest,
+    max_output_ceiling: usize,
+) -> Result<usize, (&'static str, String)> {
     if let Some(t) = req.temperature {
         if !(t.is_finite() && (0.0..=MAX_TEMPERATURE).contains(&t)) {
             return Err((
@@ -1881,14 +3166,16 @@ fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, 
             return Err(("top_p", format!("top_p must be in (0.0, {MAX_TOP_P}]")));
         }
     }
-    if let Some(n) = req.max_tokens {
-        if n == 0 || n > MAX_MAX_TOKENS {
+    let effective_max_tokens = match req.max_tokens.or(req.max_completion_tokens) {
+        Some(n) if n == 0 || n > max_output_ceiling => {
             return Err((
                 "max_tokens",
-                format!("max_tokens must be in [1, {MAX_MAX_TOKENS}]"),
+                format!("max_tokens must be in [1, {max_output_ceiling}]"),
             ));
         }
-    }
+        Some(n) => n,
+        None => DEFAULT_MAX_TOKENS.min(max_output_ceiling),
+    };
     // #418: range-check the speculation knobs at the 400 boundary so an
     // out-of-range value is rejected with a `param`, mirroring
     // `max_tokens` — rather than silently coerced by `to_config`'s
@@ -1899,7 +3186,9 @@ fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, 
             if !(MIN_LEADER_LEN..=MAX_LEADER_LEN).contains(&n) {
                 return Err((
                     "speculation.leader_len",
-                    format!("speculation.leader_len must be in [{MIN_LEADER_LEN}, {MAX_LEADER_LEN}]"),
+                    format!(
+                        "speculation.leader_len must be in [{MIN_LEADER_LEN}, {MAX_LEADER_LEN}]"
+                    ),
                 ));
             }
         }
@@ -1912,7 +3201,176 @@ fn validate_sampling(req: &ChatCompletionsRequest) -> Result<(), (&'static str, 
             }
         }
     }
-    Ok(())
+    Ok(effective_max_tokens)
+}
+
+/// Validate `response_format` (#572/#619). Returns `Err((code, message,
+/// param))` for an unsupported shape. Outcomes:
+///   · absent / `{"type":"text"}` → Ok (unconstrained, the default).
+///   · `{"type":"json_object"}` → Ok (constrained to a JSON object).
+///   · `{"type":"json_schema","json_schema":{"schema":{"type":"object",…}}}`
+///     → Ok, constrained to the caller's schema. The `schema` must have an
+///     OBJECT root per the host compiler's semantics (see
+///     [`json_schema_non_object_reason`]); anything that would compile to a
+///     grammar a bare scalar satisfies → 400 `invalid_request`. This honors
+///     #619 on the json_schema path.
+///   · any constrained mode AND a forced `tool_choice` → 400
+///     `invalid_request` (the two constrain the sampler to different
+///     grammars and cannot compose).
+///   · any other `type` → 400 `response_format_unsupported`, naming the
+///     offending value.
+///
+/// The schema's grammar-compilability is checked later in
+/// [`build_json_constraint`] (it needs a host call); this stays pure.
+/// Root keywords the host schema compiler (`visit_schema`) honors BEFORE
+/// the declared `type`, each short-circuiting to a non-object grammar a
+/// bare scalar can satisfy. A root carrying any of these is NOT an object
+/// root even when it also declares `"type":"object"` (#619 review F1).
+/// Order mirrors `Vendor/pie/runtime/src/inference/structured/json_schema.rs`
+/// `visit_schema`.
+const JSON_SCHEMA_NON_OBJECT_ROOT_KEYWORDS: [&str; 6] =
+    ["$ref", "const", "enum", "anyOf", "oneOf", "allOf"];
+
+/// `None` when the host compiler would constrain this `json_schema.schema`
+/// to a JSON **object** root (#619); otherwise a 400 reason explaining why
+/// it would not. Mirrors `visit_schema`'s precedence:
+///   1. a composition/literal keyword (`$ref`/`const`/`enum`/`anyOf`/
+///      `oneOf`/`allOf`) wins over `type` → not an object root,
+///   2. `type` is the string `"object"` → object root,
+///   3. `type` is an array → a union. Accepted ONLY when every alternative
+///      is `"object"` or `"null"`. This is a DELIBERATE asymmetry (#619
+///      review v3 F1): a nullable-object union (`["object","null"]`) is
+///      honored because the caller explicitly opted into a `null` answer —
+///      the compiler emits `(object | "null")`, so a bare `null` is a
+///      permitted output here, but no other bare scalar is. A union mixing
+///      object with a non-`null` scalar (`["object","string"]`) is rejected
+///      so a bare string/number cannot slip through. (`json_object` mode is
+///      unaffected — it stays strictly object-root, never nullable.)
+///   4. `type` absent → object root only when an object-implying keyword
+///      (`properties`/`required`/`minProperties`/`maxProperties`) is present
+///      (the same inference `visit_schema` makes).
+fn json_schema_non_object_reason(schema: Option<&serde_json::Value>) -> Option<String> {
+    let Some(schema) = schema else {
+        return Some(
+            "response_format \"json_schema\" requires a json_schema.schema object".to_string(),
+        );
+    };
+    let Some(obj) = schema.as_object() else {
+        return Some(
+            "response_format \"json_schema\".schema must be a JSON object with an object root \
+             (\"type\":\"object\")"
+                .to_string(),
+        );
+    };
+    if let Some(kw) = JSON_SCHEMA_NON_OBJECT_ROOT_KEYWORDS
+        .iter()
+        .find(|k| obj.contains_key(**k))
+    {
+        return Some(format!(
+            "response_format \"json_schema\".schema root keyword \"{kw}\" overrides \
+             \"type\":\"object\" with a non-object (bare-scalar) grammar; the answer must be \
+             constrained to a JSON object"
+        ));
+    }
+    let is_object_root = match obj.get("type") {
+        Some(serde_json::Value::String(t)) => t == "object",
+        Some(serde_json::Value::Array(types)) => {
+            // #619 review v3 F1 (deliberate): a nullable-object union
+            // (`["object","null"]`) is honored — the caller explicitly opted
+            // into a `null` answer, so `null` is the ONLY non-object scalar
+            // allowed. Any other scalar alternative (e.g. `["object","string"]`)
+            // is rejected so a bare string/number cannot satisfy the grammar.
+            types.iter().any(|t| t.as_str() == Some("object"))
+                && types
+                    .iter()
+                    .all(|t| matches!(t.as_str(), Some("object") | Some("null")))
+        }
+        Some(_) => false,
+        None => ["properties", "required", "minProperties", "maxProperties"]
+            .iter()
+            .any(|k| obj.contains_key(*k)),
+    };
+    if is_object_root {
+        None
+    } else {
+        Some(
+            "response_format \"json_schema\".schema must constrain the answer to a JSON object: \
+             declare \"type\":\"object\" (or an object-implying root such as a \"properties\" map)"
+                .to_string(),
+        )
+    }
+}
+
+fn validate_response_format(
+    req: &ChatCompletionsRequest,
+) -> Result<(), (&'static str, String, &'static str)> {
+    let Some(rf) = req.response_format.as_ref() else {
+        return Ok(());
+    };
+    // A constrained answer pins the sampler to a JSON grammar; a forced
+    // tool_choice pins it to the tool-call grammar. They are mutually
+    // exclusive — reject rather than silently letting one win.
+    let reject_forced_tool = |mode: &str| -> Result<(), (&'static str, String, &'static str)> {
+        if !matches!(forced_tool_choice(req.tool_choice.as_ref()), ForcedToolChoice::No) {
+            return Err((
+                "invalid_request",
+                format!(
+                    "response_format \"{mode}\" cannot combine with a forced tool_choice \
+                     (the two constrain decoding to different grammars); send one or the other"
+                ),
+                "response_format",
+            ));
+        }
+        Ok(())
+    };
+    match rf.kind.as_str() {
+        ResponseFormat::TEXT | "" => Ok(()),
+        ResponseFormat::JSON_OBJECT => reject_forced_tool(ResponseFormat::JSON_OBJECT),
+        ResponseFormat::JSON_SCHEMA => {
+            // #619 F1/F2: require the host compiler to route this schema's
+            // ROOT to an object grammar — a non-object root (incl. one whose
+            // `type:"object"` is overridden by a higher-precedence
+            // composition/literal keyword) compiles to a grammar a bare
+            // scalar satisfies, the exact hole #619 closes.
+            if let Some(reason) =
+                json_schema_non_object_reason(rf.json_schema.as_ref().and_then(|j| j.schema.as_ref()))
+            {
+                return Err(("invalid_request", reason, "response_format"));
+            }
+            reject_forced_tool(ResponseFormat::JSON_SCHEMA)
+        }
+        other => Err((
+            "response_format_unsupported",
+            format!(
+                "response_format.type=\"{other}\" is not supported; supported values are \
+                 \"json_object\", \"json_schema\", and \"text\" (unconstrained)"
+            ),
+            "response_format",
+        )),
+    }
+}
+
+/// Compile the Phase-2 JSON grammar constraint for a json-mode request,
+/// or `Ok(None)` when the request is not in JSON mode (#619). Built BEFORE
+/// the SSE stream opens (mirrors [`build_forced_tool_constraint`]) so a
+/// malformed `json_schema` returns a clean `400` envelope instead of a
+/// half-open stream that errors mid-flight.
+fn build_json_constraint(
+    model: &Model,
+    req: &ChatCompletionsRequest,
+) -> Result<Option<GrammarConstraint>, (u16, &'static str, String)> {
+    let Some(schema) = json_constraint_schema(req) else {
+        return Ok(None);
+    };
+    GrammarConstraint::from_json_schema(&schema, model)
+        .map(Some)
+        .map_err(|e| {
+            (
+                400,
+                "invalid_json_schema",
+                format!("response_format json schema failed to compile into a grammar: {e}"),
+            )
+        })
 }
 
 /// Build an OpenAI-shape error JSON with a populated `param` field.
@@ -1920,7 +3378,7 @@ pub(crate) fn json_error_param(
     status: u16,
     code: &str,
     message: &str,
-    param: &'static str,
+    param: &str,
 ) -> Response<wstd::http::body::BoundedBody<Vec<u8>>> {
     let body = serde_json::json!({
         "error": {
@@ -1941,10 +3399,13 @@ pub(crate) fn json_error_param(
 // Streaming branch
 // =============================================================================
 
-async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finished {
+async fn handle_streaming(
+    req: ChatCompletionsRequest,
+    res: Responder,
+    max_tokens: usize,
+) -> Finished {
     let temperature = req.temperature.unwrap_or(DEFAULT_TEMPERATURE);
     let top_p = req.top_p.unwrap_or(DEFAULT_TOP_P);
-    let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
     // F9: load the model BEFORE opening the SSE response so a load
     // failure returns a clean 5xx JSON envelope rather than a
@@ -1964,23 +3425,76 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
                 .await;
         }
     };
-    let mut ctx = match Context::new(&model) {
-        Ok(c) => c,
-        Err(e) => {
-            return res
-                .respond(with_launch_diags_header(sse::json_error(
-                    500,
-                    "context_create_failed",
-                    &format!("Failed to create context: {e}"),
-                )))
-                .await;
-        }
-    };
-    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true) {
+    if let Err(err) = validate_tool_replay_for_model(&req.messages, &model) {
         return res
-            .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+            .respond(with_launch_diags_header(json_error_param(
+                400,
+                err.code,
+                &err.message,
+                &err.param,
+            )))
             .await;
     }
+    // #522: cross-request KV prefix cache. Engaged only for an enabled
+    // `cache` directive; absent/disabled/bypass falls through to the
+    // legacy full-rebuild path below (byte-identical to pre-#522).
+    let cache_plan: Option<ReusePlan> = match req.cache.clone() {
+        Some(d) if d.enabled() => {
+            match prefix_cache::plan(&model, &req.model, &req.messages, req.tools.as_deref(), d) {
+                Ok(p) => Some(p),
+                Err((code, msg)) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                        .await;
+                }
+            }
+        }
+        _ => None,
+    };
+    let _cache_guard = cache_plan.as_ref().map(|plan| prefix_cache::protect(&model, plan));
+    let (mut ctx, mut cache_diag): (Context, Option<CacheDiag>) = match &cache_plan {
+        Some(plan) => match prefix_cache::acquire(&model, plan) {
+            Ok((ctx, diag)) => (ctx, Some(diag)),
+            Err((code, msg)) => {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+        },
+        None => {
+            let mut ctx = match Context::new(&model) {
+                Ok(c) => c,
+                Err(e) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(
+                            500,
+                            "context_create_failed",
+                            &format!("Failed to create context: {e}"),
+                        )))
+                        .await;
+                }
+            };
+            if let Err((code, msg)) =
+                fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true)
+            {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+            (ctx, None)
+        }
+    };
+    // Usage accounting (OpenAI `usage` block): `ctx.seq_len()` only counts
+    // committed/working tokens already flushed to the KV cache, NOT the
+    // buffered prompt tokens `fill_context`/cache-acquire just queued —
+    // those are flushed lazily by `forward()`/`generate()`. Add
+    // `ctx.buffer().len()` to get the full prompt length covering both
+    // the legacy full-rebuild path and the #522 reuse path (reused prefix
+    // + appended suffix). `cached_tokens` mirrors `CacheDiag::base_boundary`,
+    // which is already documented as "0 on a miss" — correct with or
+    // without an active cache plan.
+    let prompt_tokens = ctx.seq_len() as usize + ctx.buffer().len();
+    let cached_tokens = cache_diag.as_ref().map_or(0, |d| d.base_boundary);
 
     // `tool_choice: "required" | {function}` constrains generation to the
     // model's native tool-call grammar (OpenAI tool_choice enforcement).
@@ -1994,11 +3508,28 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
         Ok(c) => c,
         Err((status, code, msg)) => {
             return res
-                .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
+                .respond(with_launch_diags_header(sse::json_error(
+                    status, code, &msg,
+                )))
                 .await;
         }
     };
     let forced_tool = tool_constraint.is_some();
+
+    // #619: compile the JSON-mode grammar BEFORE the Emitter, for the same
+    // reason as the tool constraint — a malformed `json_schema` returns a
+    // clean 400 rather than a half-open stream. `None` for non-JSON
+    // requests (the canonical loop ignores it).
+    let mut json_constraint = match build_json_constraint(&model, &req) {
+        Ok(c) => c,
+        Err((status, code, msg)) => {
+            return res
+                .respond(with_launch_diags_header(sse::json_error(
+                    status, code, &msg,
+                )))
+                .await;
+        }
+    };
 
     // Headers committed; from here we must finish via the Emitter.
     let mut em = Emitter::start(res);
@@ -2060,6 +3591,7 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             },
             finish_reason: None,
         }],
+        usage: None,
     };
     try_emit!(em, &role_chunk, "role_chunk");
 
@@ -2071,9 +3603,176 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
     // grammar-constrained sampler. Otherwise plain decode, with
     // `fallback_reason` reporting why (no silent no-op).
     let greedy = temperature <= 0.0;
+    let json_constrained = json_mode(&req);
     let (strategy, fallback_reason, want_metrics, dims) =
-        plan_strategy(req.speculation.as_ref(), greedy, forced_tool);
+        plan_strategy(req.speculation.as_ref(), greedy, forced_tool, json_constrained);
+
+    // #572: JSON Think runs the dedicated two-phase constrained path and
+    // returns its own terminal frames. The single-loop path below is left
+    // byte-identical for every non-JSON request (normal / Repeat Boost /
+    // ToT / tool_choice). JSON mode is mutually exclusive with a forced
+    // tool_choice (400-rejected upstream), so `tool_constraint` is None
+    // here and the tool surface is irrelevant.
+    if json_constrained {
+        let mut in_reasoning = false;
+        let mut reason_dec = ReasoningDecoder::new(&model);
+        let (outcome, error_diag, disconnected, completion_tokens) = {
+            let mut sink = JsonSink::Stream {
+                em: &mut em,
+                id: &id,
+                created,
+                model: &req.model,
+            };
+            // Phase 1: capture reasoning, suppress content, stop when the
+            // thinking block closes (or the first content batch on a
+            // non-thinking model).
+            let mut chat_dec1 = chat::Decoder::new(&model);
+            let gen1 = ctx
+                .generate(generate::resolve_sampler(temperature, top_p))
+                .max_tokens(max_tokens)
+                .stop(&stop_tokens);
+            let r1 = run_json_phase(
+                gen1,
+                &mut chat_dec1,
+                &mut reason_dec,
+                &mut sink,
+                &mut in_reasoning,
+                JsonPhaseOpts {
+                    emit_reasoning: true,
+                    emit_content: false,
+                    stop_after_reasoning: true,
+                    raw_content: false,
+                    max_tokens,
+                },
+            )
+            .await;
+            if r1.disconnected {
+                (Outcome::Aborted, None, true, r1.tokens_generated)
+            } else if let Some(diag) = r1.error_diag {
+                (Outcome::Aborted, Some(diag), false, r1.tokens_generated)
+            } else {
+                // Phase 2: JSON-grammar-constrained answer. The fresh chat
+                // decoder + fresh generator continue the open assistant
+                // turn; Phase 1's tail is flushed into this generator's
+                // first forward pass as context (never re-emitted).
+                let phase2_budget = json_phase2_budget(max_tokens, r1.tokens_generated);
+                let mut chat_dec2 = chat::Decoder::new(&model);
+                let gen2 = ctx
+                    .generate(generate::resolve_sampler(temperature, top_p))
+                    .max_tokens(phase2_budget)
+                    .stop(&stop_tokens)
+                    .constrain(
+                        json_constraint
+                            .take()
+                            .expect("json mode implies a compiled JSON constraint"),
+                    );
+                let r2 = run_json_phase(
+                    gen2,
+                    &mut chat_dec2,
+                    &mut reason_dec,
+                    &mut sink,
+                    &mut in_reasoning,
+                    JsonPhaseOpts {
+                        emit_reasoning: false,
+                        emit_content: true,
+                        stop_after_reasoning: false,
+                        raw_content: true,
+                        max_tokens: phase2_budget,
+                    },
+                )
+                .await;
+                // F3: a clean-but-empty JSON answer is a contract failure.
+                // Capture both phases' generated counts before `r2` is moved
+                // into the finalizer — the usage block needs the full
+                // completion total (mirrors `handle_non_streaming`).
+                let r1_tokens = r1.tokens_generated;
+                let r2_tokens = r2.tokens_generated;
+                let (outcome, error_diag, disconnected) = json_phase2_finalize(r2);
+                (outcome, error_diag, disconnected, r1_tokens + r2_tokens)
+            }
+        };
+        if disconnected {
+            return em.finish();
+        }
+        let final_chunk = ChatCompletionChunk {
+            id: &id,
+            object: "chat.completion.chunk",
+            created,
+            model: &req.model,
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta::default(),
+                finish_reason: Some(outcome.finish_reason()),
+            }],
+            usage: None,
+        };
+        if let Err(EmitError::Serialize(e)) = em.emit_json(&final_chunk).await {
+            eprintln!("[chat-apc] json final-chunk serialize bug: {e}");
+        }
+        if let Some((code, message)) = &error_diag {
+            if let Err(EmitError::Serialize(e)) =
+                em.emit_json(&SseError::new(code, message)).await
+            {
+                eprintln!("[chat-apc] json error-meta serialize bug: {e}");
+            }
+        }
+        // Only when the caller ALSO sent a speculation block (uncommon for
+        // a JSON profile) do we surface why drafting didn't engage —
+        // `json_constrained`. A normal JSON Think request is byte-clean.
+        if want_metrics {
+            let report = SpecMetricsReport::build(
+                false,
+                fallback_reason,
+                dims,
+                SpecMetrics::default(),
+                0,
+                0,
+                Duration::ZERO,
+                // JSON Think runs Plain/json_constrained with speculation
+                // gated off, so there is no Cacheback sidecar to report.
+                None,
+            );
+            report.log_spec_stats();
+            let frame = SpecMetricsSse {
+                event: "spec_metrics",
+                report: &report,
+            };
+            if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
+                eprintln!("[chat-apc] json spec_metrics serialize bug: {e}");
+            }
+        }
+        // OpenAI `stream_options.include_usage: true` — the JSON Think path
+        // returns its own terminal frames above, so the shared usage-chunk
+        // emit below is unreachable here; mirror it so structured-output
+        // streaming honors the opt-in too (completion = phase1 + phase2).
+        if req.stream_options.as_ref().is_some_and(|o| o.include_usage) {
+            let usage_chunk = ChatCompletionChunk {
+                id: &id,
+                object: "chat.completion.chunk",
+                created,
+                model: &req.model,
+                choices: Vec::new(),
+                usage: Some(Usage::build(prompt_tokens, completion_tokens, cached_tokens)),
+            };
+            if let Err(EmitError::Serialize(e)) = em.emit_json(&usage_chunk).await {
+                eprintln!("[chat-apc] json usage-chunk serialize bug: {e}");
+            }
+        }
+        sse::emit_done_logged(&mut em, "json_stream_exit").await;
+        return em.finish();
+    }
+
     let spec_enabled = matches!(strategy, DecodeStrategy::Speculative(_));
+    let (sidecar_lease, sidecar_metrics) = match &strategy {
+        DecodeStrategy::Speculative(cfg) => sidecar_for_request(
+            &req.model,
+            req.tools.as_deref(),
+            &req.messages,
+            req.speculation.as_ref(),
+            cfg,
+        ),
+        DecodeStrategy::Plain => (None, None),
+    };
     let sampler = generate::resolve_sampler(temperature, top_p);
     let seed_tokens = if spec_enabled {
         seed_tokens_from(&model, &req.messages)
@@ -2083,7 +3782,15 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
     let generate::GenSession {
         generator: mut stream,
         metrics: spec_metrics_handle,
-    } = generate::start(&mut ctx, sampler, max_tokens, &stop_tokens, strategy, &seed_tokens);
+    } = generate::start(
+        &mut ctx,
+        sampler,
+        max_tokens,
+        &stop_tokens,
+        strategy,
+        &seed_tokens,
+        sidecar_lease.as_ref().map(|lease| Arc::clone(&lease.cache)),
+    );
     // tool_choice enforcement (from main): constrain to the tool-call
     // grammar when a call is forced. Speculation is gated off in that
     // case (`forced_tool` above), so this only ever applies to the plain
@@ -2111,7 +3818,17 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
     // plain content with no client-visible signal.
     let mut tool_disabled_diag: Option<ToolDisabledDiag> = None;
     let mut pending_tool: Option<PendingToolCall> = None;
+    let mut sidecar_assistant_content = String::new();
     let mut in_reasoning = false;
+    // #466: reasoning text already streamed as `reasoning_content` deltas.
+    // On a reasoning `End(s)` we emit only the un-streamed suffix so text
+    // that arrived in the SAME multi-token batch as the closing boundary
+    // (one `End` event, no prior `Delta`) is not dropped.
+    let mut reasoning_streamed = String::new();
+    // #522: visible assistant text, captured so the prefix cache can save
+    // the canonical next-turn boundary. Only used when `cache_plan` is
+    // engaged.
+    let mut full_text = String::new();
 
     // F1/F2/F3/F5: explicit-match loop with an `Outcome` set at the
     // exit point. `Generator::next` Err, decoder Err, and chat-
@@ -2136,11 +3853,17 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
                 break (reason, None);
             }
             Ok(Some(s)) => s,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         let out = match step.execute().await {
             Ok(o) => o,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         // #439: a decode step that returns no sampled token means the
         // forward-pass layer starved — pie swallows a device failure / batch
@@ -2151,7 +3874,10 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
         // `missing_finish_reason` fallback), and so the loop never issues the
         // empty-input forward pass that hangs the Metal driver.
         if forward_pass_starved(&out.raw().slots) {
-            break (Outcome::Aborted, Some((STARVED_CODE, STARVED_MESSAGE.to_string())));
+            break (
+                Outcome::Aborted,
+                Some((STARVED_CODE, STARVED_MESSAGE.to_string())),
+            );
         }
         // #418: per-step decode accounting (one forward pass; `out.tokens`
         // is a burst of 1 free pick + accepted drafts under speculation).
@@ -2169,12 +3895,17 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
         // must be gated on the batch's channel, not the post-flip state.
         let was_in_reasoning = in_reasoning;
         let mut reason_idle = false;
+        // #600: true when the reasoning block closes ON this batch, so the chat
+        // delta below can recover the answer-head that rode the `</think>` close
+        // (speculative straddle) instead of dropping it.
+        let mut reason_ended = false;
         match reason_dec.feed(&out.tokens) {
             Ok(inferlet::reasoning::Event::Start) => {
                 in_reasoning = true;
             }
             Ok(inferlet::reasoning::Event::Delta(s)) => {
                 in_reasoning = true;
+                reasoning_streamed.push_str(&s);
                 let chunk = ChatCompletionChunk {
                     id: &id,
                     object: "chat.completion.chunk",
@@ -2188,16 +3919,50 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
                         },
                         finish_reason: None,
                     }],
+                    usage: None,
                 };
                 try_emit!(em, &chunk, "reasoning_delta");
             }
-            Ok(inferlet::reasoning::Event::End(_)) => {
+            Ok(inferlet::reasoning::Event::End(s)) => {
                 in_reasoning = false;
+                reason_ended = true;
+                // #466: a multi-token speculative batch can carry the
+                // reasoning text AND the closing boundary in one feed, so
+                // the decoder reports it only via `End(s)` with no prior
+                // `Delta`. Emit the un-streamed suffix so that text is not
+                // dropped; if `End(s)` disagrees with the streamed deltas
+                // (detok re-segmentation) trust the deltas (F5 parity).
+                if let Some(residual) = s.strip_prefix(reasoning_streamed.as_str()) {
+                    if !residual.is_empty() {
+                        let chunk = ChatCompletionChunk {
+                            id: &id,
+                            object: "chat.completion.chunk",
+                            created,
+                            model: &req.model,
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    reasoning_content: Some(residual),
+                                    ..Default::default()
+                                },
+                                finish_reason: None,
+                            }],
+                            usage: None,
+                        };
+                        reasoning_streamed.push_str(residual);
+                        try_emit!(em, &chunk, "reasoning_delta");
+                    }
+                }
             }
             Ok(inferlet::reasoning::Event::Idle) => {
                 reason_idle = true;
             }
-            Err(e) => break (Outcome::Aborted, Some(("reasoning_decode_failed", e.to_string()))),
+            Err(e) => {
+                break (
+                    Outcome::Aborted,
+                    Some(("reasoning_decode_failed", e.to_string())),
+                );
+            }
         }
 
         // Tool-use side: a completed `Call(name, args)` terminates
@@ -2232,36 +3997,41 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
         }
 
         match decoder.feed(&out.tokens) {
-            // When a forced `tool_choice` constrains output to the
-            // tool-call grammar, the ENTIRE generation IS the call
-            // (`root` has no free-text alternative), so suppress the
-            // visible content channel — the call rides only the terminal
-            // `tool_calls` delta (OpenAI emits content:null alongside
-            // tool_calls). Composes with the reasoning content gate; the
-            // suppressed deltas fall through to the no-op arm below.
-            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) && !forced_tool => {
-                let chunk = ChatCompletionChunk {
-                    id: &id,
-                    object: "chat.completion.chunk",
-                    created,
-                    model: &req.model,
-                    choices: vec![ChunkChoice {
-                        index: 0,
-                        delta: ChunkDelta {
-                            content: Some(&s),
-                            ..Default::default()
-                        },
-                        finish_reason: None,
-                    }],
-                };
-                // Non-terminal delta frame: disconnect = silently
-                // abandon (no client to push to); serialize-bug =
-                // emit inline error frame + [DONE] before bailing,
-                // so any client still attached gets a signal.
-                try_emit!(em, &chunk, "content_delta");
-            }
-            Ok(chat::Event::Delta(_)) => {
-                // Suppressed: this batch is reasoning-channel material —
+            // Demux the chat delta through `visible_content`: the full delta
+            // when the batch is outside reasoning; the recovered answer-head
+            // when `</think>` closed on this (speculative) batch (#600); ""
+            // when suppressed (inside reasoning, the delimiter, or a forced
+            // tool call — `forced_tool` makes the whole generation the call,
+            // which rides only the terminal `tool_calls` delta).
+            Ok(chat::Event::Delta(s)) => {
+                let visible = visible_content(&s, reason_idle, was_in_reasoning, reason_ended, forced_tool);
+                if !visible.is_empty() {
+                    // #522: mirror the visible text the App persists, so the
+                    // save gate can compare it against the generated tokens.
+                    full_text.push_str(visible);
+                    sidecar_assistant_content.push_str(visible);
+                    let chunk = ChatCompletionChunk {
+                        id: &id,
+                        object: "chat.completion.chunk",
+                        created,
+                        model: &req.model,
+                        choices: vec![ChunkChoice {
+                            index: 0,
+                            delta: ChunkDelta {
+                                content: Some(visible),
+                                ..Default::default()
+                            },
+                            finish_reason: None,
+                        }],
+                        usage: None,
+                    };
+                    // Non-terminal delta frame: disconnect = silently
+                    // abandon (no client to push to); serialize-bug =
+                    // emit inline error frame + [DONE] before bailing,
+                    // so any client still attached gets a signal.
+                    try_emit!(em, &chunk, "content_delta");
+                }
+                // Otherwise suppressed: this batch is reasoning-channel material —
                 // either inside a `<think>` block, or the opening/closing
                 // delimiter itself. The chat decoder is model-generic and
                 // surfaces the delimiter text (`<think>` / `</think>`) as a
@@ -2272,7 +4042,10 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             Ok(chat::Event::Interrupt(id)) => {
                 break (
                     Outcome::Aborted,
-                    Some(("chat_template_interrupt", format!("control token {id} from chat template")))
+                    Some((
+                        "chat_template_interrupt",
+                        format!("control token {id} from chat template"),
+                    )),
                 );
             }
             Ok(chat::Event::Idle) => continue,
@@ -2336,6 +4109,7 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             delta: final_delta,
             finish_reason: Some(outcome.finish_reason()),
         }],
+        usage: None,
     };
     // Each emit returns `Result<(), EmitError>`. We surface Serialize
     // bugs to stderr (pie-server's log capture picks them up — better
@@ -2345,6 +4119,24 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
     // our hand-checked schemas, so logging it is host-visible signal.
     if let Err(EmitError::Serialize(e)) = em.emit_json(&final_chunk).await {
         eprintln!("[chat-apc] final-chunk serialize bug: {e}");
+    }
+    // OpenAI `stream_options.include_usage: true` — emit one extra
+    // `chat.completion.chunk` with empty `choices` and a populated
+    // `usage` block immediately after the finish_reason chunk, matching
+    // the vLLM/OpenAI convention. Absent the opt-in, streams stay
+    // byte-identical to before this feature.
+    if req.stream_options.as_ref().is_some_and(|o| o.include_usage) {
+        let usage_chunk = ChatCompletionChunk {
+            id: &id,
+            object: "chat.completion.chunk",
+            created,
+            model: &req.model,
+            choices: Vec::new(),
+            usage: Some(Usage::build(prompt_tokens, spec_generated, cached_tokens)),
+        };
+        if let Err(EmitError::Serialize(e)) = em.emit_json(&usage_chunk).await {
+            eprintln!("[chat-apc] usage-chunk serialize bug: {e}");
+        }
     }
     // G2: emit a `tool_decode_disabled` warning meta-frame BEFORE
     // the diagnostic-error frame, so a client parsing the SSE log
@@ -2358,8 +4150,8 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
         let (distinct, overflow) = diag.dedup_counts();
         // N3: ship raw counts as structured fields so consumers don't
         // string-parse the rendered "(capped, total >= N)" tail.
-        let frame = SseError::new("tool_decode_disabled", &rendered)
-            .with_dedup_counts(distinct, overflow);
+        let frame =
+            SseError::new("tool_decode_disabled", &rendered).with_dedup_counts(distinct, overflow);
         match em.emit_json(&frame).await {
             Ok(()) => {}
             // H4: the warning meta-frame sits BETWEEN the terminal
@@ -2387,11 +4179,30 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             eprintln!("[chat-apc] error-meta serialize bug: {e}");
         }
     }
+    // Terminal generation-throughput frame for UI/benchmark consumers.
+    // The counter is engine-side generated output tokens (including
+    // reasoning tokens); the timer is decode-loop elapsed, so this is
+    // throughput, not prefill latency / TTFT. Failed/tool-call partials do
+    // not emit a metric until a reliable display policy exists.
+    if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
+        if let Some(frame) = GenerationMetricsSse::build(spec_generated, spec_start.elapsed()) {
+            if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
+                eprintln!("[chat-apc] generation_metrics serialize bug: {e}");
+            }
+        }
+    }
+    let sidecar_terminal_turn = match (outcome, error_diag.is_none()) {
+        (Outcome::Natural | Outcome::MaxTokens, true) => {
+            Some(("assistant", sidecar_assistant_content.as_str()))
+        }
+        _ => None,
+    };
+    persist_sidecar(sidecar_lease.as_ref(), sidecar_terminal_turn);
     // #418: terminal spec_metrics frame (only when the caller opted into
     // the speculation surface, so normal streams are byte-identical).
     if want_metrics {
         let spec = spec_metrics_handle
-            .map(|h| *h.lock().unwrap())
+            .map(|h| h.lock().unwrap().clone())
             .unwrap_or_default();
         let report = SpecMetricsReport::build(
             spec_enabled,
@@ -2401,6 +4212,7 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             spec_generated,
             spec_steps,
             spec_start.elapsed(),
+            sidecar_metrics,
         );
         report.log_spec_stats();
         let frame = SpecMetricsSse {
@@ -2411,6 +4223,19 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
             eprintln!("[chat-apc] spec_metrics serialize bug: {e}");
         }
     }
+    // #522: save the next reusable boundary on a clean completion and emit
+    // the cache diagnostics frame. Saving is gated on a real assistant turn
+    // (Natural/MaxTokens) — a cancelled/aborted/tool-call turn must not
+    // advance the stable boundary. `finalize` builds the boundary in its
+    // own context, so the generator's borrow of `ctx` is irrelevant here.
+    if let (Some(plan), Some(mut diag)) = (cache_plan.as_ref(), cache_diag.take()) {
+        if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
+            prefix_cache::finalize(plan, &full_text, &model, &mut diag).await;
+        }
+        if let Err(EmitError::Serialize(e)) = em.emit_json(&diag).await {
+            eprintln!("[chat-apc] cache diag serialize bug: {e}");
+        }
+    }
     sse::emit_done_logged(&mut em, "stream_exit").await;
     em.finish()
 }
@@ -2419,10 +4244,13 @@ async fn handle_streaming(req: ChatCompletionsRequest, res: Responder) -> Finish
 // Non-streaming branch (F4 — finish_reason driven by actual termination)
 // =============================================================================
 
-async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Finished {
+async fn handle_non_streaming(
+    req: ChatCompletionsRequest,
+    res: Responder,
+    max_tokens: usize,
+) -> Finished {
     let temperature = req.temperature.unwrap_or(DEFAULT_TEMPERATURE);
     let top_p = req.top_p.unwrap_or(DEFAULT_TOP_P);
-    let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
     // N1: pre-loop 500 paths attach the immutable launch-diags
     // snapshot via the response header. No drain/restore needed —
@@ -2439,23 +4267,68 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
                 .await;
         }
     };
-    let mut ctx = match Context::new(&model) {
-        Ok(c) => c,
-        Err(e) => {
-            return res
-                .respond(with_launch_diags_header(sse::json_error(
-                    500,
-                    "context_create_failed",
-                    &format!("Failed to create context: {e}"),
-                )))
-                .await;
-        }
-    };
-    if let Err((code, msg)) = fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true) {
+    if let Err(err) = validate_tool_replay_for_model(&req.messages, &model) {
         return res
-            .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+            .respond(with_launch_diags_header(json_error_param(
+                400,
+                err.code,
+                &err.message,
+                &err.param,
+            )))
             .await;
     }
+    // #522: cross-request KV prefix cache (see handle_streaming). Legacy
+    // callers (no enabled `cache` directive) take the unchanged rebuild
+    // path below.
+    let cache_plan: Option<ReusePlan> = match req.cache.clone() {
+        Some(d) if d.enabled() => {
+            match prefix_cache::plan(&model, &req.model, &req.messages, req.tools.as_deref(), d) {
+                Ok(p) => Some(p),
+                Err((code, msg)) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                        .await;
+                }
+            }
+        }
+        _ => None,
+    };
+    let _cache_guard = cache_plan.as_ref().map(|plan| prefix_cache::protect(&model, plan));
+    let (mut ctx, mut cache_diag): (Context, Option<CacheDiag>) = match &cache_plan {
+        Some(plan) => match prefix_cache::acquire(&model, plan) {
+            Ok((ctx, diag)) => (ctx, Some(diag)),
+            Err((code, msg)) => {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+        },
+        None => {
+            let mut ctx = match Context::new(&model) {
+                Ok(c) => c,
+                Err(e) => {
+                    return res
+                        .respond(with_launch_diags_header(sse::json_error(
+                            500,
+                            "context_create_failed",
+                            &format!("Failed to create context: {e}"),
+                        )))
+                        .await;
+                }
+            };
+            if let Err((code, msg)) =
+                fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true)
+            {
+                return res
+                    .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+                    .await;
+            }
+            (ctx, None)
+        }
+    };
+    // Usage accounting (see handle_streaming for the rationale).
+    let prompt_tokens = ctx.seq_len() as usize + ctx.buffer().len();
+    let cached_tokens = cache_diag.as_ref().map_or(0, |d| d.base_boundary);
 
     // tool_choice enforcement (mirrors handle_streaming): constrain to the
     // model's native tool-call grammar when a call is forced; an
@@ -2468,18 +4341,209 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         Ok(c) => c,
         Err((status, code, msg)) => {
             return res
-                .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
+                .respond(with_launch_diags_header(sse::json_error(
+                    status, code, &msg,
+                )))
                 .await;
         }
     };
     let forced_tool = tool_constraint.is_some();
+    // #619: compile the JSON-mode grammar up front so a malformed
+    // `json_schema` returns a clean 400 (mirrors handle_streaming).
+    let mut json_constraint = match build_json_constraint(&model, &req) {
+        Ok(c) => c,
+        Err((status, code, msg)) => {
+            return res
+                .respond(with_launch_diags_header(sse::json_error(
+                    status, code, &msg,
+                )))
+                .await;
+        }
+    };
     let stop_tokens = chat::stop_tokens(&model);
     // #418: plain vs speculative decode (see handle_streaming for the
     // greedy + forced-tool gate rationale).
     let greedy = temperature <= 0.0;
+    let json_constrained = json_mode(&req);
     let (strategy, fallback_reason, want_metrics, dims) =
-        plan_strategy(req.speculation.as_ref(), greedy, forced_tool);
+        plan_strategy(req.speculation.as_ref(), greedy, forced_tool, json_constrained);
+
+    // #572: JSON Think two-phase constrained path (mirrors handle_streaming).
+    // The canonical loop below is untouched for every non-JSON request.
+    if json_constrained {
+        let mut full_text = String::new();
+        let mut reasoning_text = String::new();
+        let mut in_reasoning = false;
+        let mut reason_dec = ReasoningDecoder::new(&model);
+        let (outcome, error_diag, completion_tokens): (Outcome, Option<(&str, String)>, usize) = {
+            let mut sink = JsonSink::Buffer {
+                content: &mut full_text,
+                reasoning: &mut reasoning_text,
+            };
+            // Phase 1: reasoning only, suppress content.
+            let mut chat_dec1 = chat::Decoder::new(&model);
+            let gen1 = ctx
+                .generate(generate::resolve_sampler(temperature, top_p))
+                .max_tokens(max_tokens)
+                .stop(&stop_tokens);
+            let r1 = run_json_phase(
+                gen1,
+                &mut chat_dec1,
+                &mut reason_dec,
+                &mut sink,
+                &mut in_reasoning,
+                JsonPhaseOpts {
+                    emit_reasoning: true,
+                    emit_content: false,
+                    stop_after_reasoning: true,
+                    raw_content: false,
+                    max_tokens,
+                },
+            )
+            .await;
+            if let Some(diag) = r1.error_diag {
+                (Outcome::Aborted, Some(diag), r1.tokens_generated)
+            } else {
+                // Phase 2: JSON-grammar-constrained answer.
+                let phase2_budget = json_phase2_budget(max_tokens, r1.tokens_generated);
+                let mut chat_dec2 = chat::Decoder::new(&model);
+                let gen2 = ctx
+                    .generate(generate::resolve_sampler(temperature, top_p))
+                    .max_tokens(phase2_budget)
+                    .stop(&stop_tokens)
+                    .constrain(
+                        json_constraint
+                            .take()
+                            .expect("json mode implies a compiled JSON constraint"),
+                    );
+                let r2 = run_json_phase(
+                    gen2,
+                    &mut chat_dec2,
+                    &mut reason_dec,
+                    &mut sink,
+                    &mut in_reasoning,
+                    JsonPhaseOpts {
+                        emit_reasoning: false,
+                        emit_content: true,
+                        stop_after_reasoning: false,
+                        raw_content: true,
+                        max_tokens: phase2_budget,
+                    },
+                )
+                .await;
+                // F3: a clean-but-empty JSON answer is a contract failure
+                // (Buffer sink never disconnects, so the flag is unused here).
+                let r1_tokens = r1.tokens_generated;
+                let r2_tokens = r2.tokens_generated;
+                let (outcome, error_diag, _) = json_phase2_finalize(r2);
+                (outcome, error_diag, r1_tokens + r2_tokens)
+            }
+        };
+
+        // Pure failure (no content AND no reasoning produced) → 500, or a
+        // retryable 503 for over-capacity `server_busy` (#470/#485 F1) — same
+        // as the canonical no-tokens-produced branch.
+        let has_partial = !full_text.is_empty() || !reasoning_text.is_empty();
+        if error_diag.is_some() && !has_partial {
+            let (code, msg) = error_diag.unwrap();
+            let status = json_pure_failure_status(code);
+            return res
+                .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
+                .await;
+        }
+
+        let id = next_id();
+        let reasoning_opt = if reasoning_text.is_empty() {
+            None
+        } else {
+            Some(reasoning_text.as_str())
+        };
+        let error_block = error_diag.as_ref().map(|(code, msg)| PartialError {
+            kind: "server_error",
+            code,
+            message: msg.as_str(),
+            param: None,
+            distinct_modes: None,
+            overflow_modes: None,
+        });
+        let diag_snapshot = launch_diags();
+        let warnings_vec: Option<Vec<NonStreamWarning>> = if diag_snapshot.is_empty() {
+            None
+        } else {
+            Some(
+                diag_snapshot
+                    .iter()
+                    .map(|d| NonStreamWarning { code: d.code, message: d.message.as_str() })
+                    .collect(),
+            )
+        };
+        // Surface why drafting didn't engage only when the caller also
+        // sent a speculation block (`json_constrained`); a plain JSON
+        // request is byte-clean.
+        let spec_metrics = if want_metrics {
+            let report = SpecMetricsReport::build(
+                false,
+                fallback_reason,
+                dims,
+                SpecMetrics::default(),
+                0,
+                0,
+                Duration::ZERO,
+                // JSON Think runs Plain/json_constrained with speculation
+                // gated off, so there is no Cacheback sidecar to report.
+                None,
+            );
+            report.log_spec_stats();
+            Some(report)
+        } else {
+            None
+        };
+        let body = ChatCompletion {
+            id: &id,
+            object: "chat.completion",
+            created: now_unix_secs(),
+            model: &req.model,
+            choices: vec![NonStreamChoice {
+                index: 0,
+                message: NonStreamMessage {
+                    role: "assistant",
+                    content: &full_text,
+                    reasoning_content: reasoning_opt,
+                    tool_calls: None,
+                },
+                finish_reason: outcome.finish_reason(),
+            }],
+            error: error_block,
+            warnings: warnings_vec,
+            spec_metrics,
+            usage: Usage::build(prompt_tokens, completion_tokens, cached_tokens),
+        };
+        let json = serde_json::to_string(&body).expect("ChatCompletion must serialize");
+        let (status, partial_kind) = match &error_diag {
+            Some(_) => (502u16, Some("fatal")),
+            None => (200u16, None),
+        };
+        let mut builder = Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json");
+        if let Some(kind) = partial_kind {
+            builder = builder.header("X-ChatAPC-Partial-Error", kind);
+        }
+        let response = builder.body(json.into_body()).unwrap();
+        return res.respond(with_launch_diags_header(response)).await;
+    }
+
     let spec_enabled = matches!(strategy, DecodeStrategy::Speculative(_));
+    let (sidecar_lease, sidecar_metrics) = match &strategy {
+        DecodeStrategy::Speculative(cfg) => sidecar_for_request(
+            &req.model,
+            req.tools.as_deref(),
+            &req.messages,
+            req.speculation.as_ref(),
+            cfg,
+        ),
+        DecodeStrategy::Plain => (None, None),
+    };
     let sampler = generate::resolve_sampler(temperature, top_p);
     let seed_tokens = if spec_enabled {
         seed_tokens_from(&model, &req.messages)
@@ -2489,7 +4553,15 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
     let generate::GenSession {
         generator: mut stream,
         metrics: spec_metrics_handle,
-    } = generate::start(&mut ctx, sampler, max_tokens, &stop_tokens, strategy, &seed_tokens);
+    } = generate::start(
+        &mut ctx,
+        sampler,
+        max_tokens,
+        &stop_tokens,
+        strategy,
+        &seed_tokens,
+        sidecar_lease.as_ref().map(|lease| Arc::clone(&lease.cache)),
+    );
     // tool_choice enforcement (from main); spec is gated off when forced,
     // so this only applies to the plain generator.
     if let Some(c) = tool_constraint {
@@ -2535,11 +4607,17 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
                 break (reason, None);
             }
             Ok(Some(s)) => s,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         let out = match step.execute().await {
             Ok(o) => o,
-            Err(e) => break (Outcome::Aborted, Some(("forward_pass_failed", e.to_string()))),
+            Err(e) => {
+                let m = e.to_string();
+                break (Outcome::Aborted, Some((classify_forward_error(&m), m)));
+            }
         };
         // #439: a decode step that returns no sampled token means the
         // forward-pass layer starved — pie swallows a device failure / batch
@@ -2550,7 +4628,10 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         // `missing_finish_reason` fallback), and so the loop never issues the
         // empty-input forward pass that hangs the Metal driver.
         if forward_pass_starved(&out.raw().slots) {
-            break (Outcome::Aborted, Some((STARVED_CODE, STARVED_MESSAGE.to_string())));
+            break (
+                Outcome::Aborted,
+                Some((STARVED_CODE, STARVED_MESSAGE.to_string())),
+            );
         }
         // #418: per-step decode accounting (one forward pass; `out.tokens`
         // is a burst of 1 free pick + accepted drafts under speculation).
@@ -2562,27 +4643,42 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         // streaming gate so stream + non-stream produce identical content.
         let was_in_reasoning = in_reasoning;
         let mut reason_idle = false;
+        // #600: true when the reasoning block closes ON this batch (mirrors the
+        // streaming branch), so the chat delta below recovers the answer-head
+        // that rode the `</think>` close batch instead of dropping it.
+        let mut reason_ended = false;
         match reason_dec.feed(&out.tokens) {
             Ok(inferlet::reasoning::Event::Start) => in_reasoning = true,
             Ok(inferlet::reasoning::Event::Delta(s)) => {
                 in_reasoning = true;
                 reasoning_text.push_str(&s);
             }
-            // F5: discard the End payload to stay byte-identical with
-            // the streaming branch (which also ignores it). The
-            // delta-stitched `reasoning_text` is the single source of
-            // truth across stream + non-stream; trusting `End(s)` on
-            // one branch and not the other made the same prompt
-            // produce divergent `reasoning_content` on `stream:true`
-            // vs `stream:false` whenever the decoder's End payload
-            // disagreed with the accumulated deltas.
-            Ok(inferlet::reasoning::Event::End(_)) => {
+            // #466: recover reasoning text that arrived in the SAME
+            // multi-token batch as the closing boundary. A warmed
+            // speculative cache can make the engine accept the reasoning
+            // token(s) and `</think>` together, so the decoder reports
+            // them only via `End(s)` with no prior `Delta` and the
+            // delta-stitched `reasoning_text` would miss them. Append only
+            // the un-streamed suffix. If `End(s)` disagrees with the
+            // accumulated deltas (detok re-segmentation) trust the deltas,
+            // which keeps stream + non-stream byte-identical (F5 parity:
+            // the streaming branch applies the identical suffix rule).
+            Ok(inferlet::reasoning::Event::End(s)) => {
                 in_reasoning = false;
+                reason_ended = true;
+                if s.starts_with(reasoning_text.as_str()) {
+                    reasoning_text = s;
+                }
             }
             Ok(inferlet::reasoning::Event::Idle) => {
                 reason_idle = true;
             }
-            Err(e) => break (Outcome::Aborted, Some(("reasoning_decode_failed", e.to_string()))),
+            Err(e) => {
+                break (
+                    Outcome::Aborted,
+                    Some(("reasoning_decode_failed", e.to_string())),
+                );
+            }
         }
 
         if tool_dec_active {
@@ -2612,12 +4708,16 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         }
 
         match decoder.feed(&out.tokens) {
-            // Forced tool_choice suppresses visible content (see
-            // handle_streaming) — the call surfaces only via tool_calls.
-            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) && !forced_tool => {
-                full_text.push_str(&s)
+            // Demux through the shared `visible_content` (see handle_streaming):
+            // full delta when outside reasoning; recovered answer-head when
+            // `</think>` closed on this speculative batch (#600); "" when
+            // suppressed (inside reasoning, the delimiter, or a forced tool call
+            // whose content rides only the terminal tool_calls delta).
+            Ok(chat::Event::Delta(s)) => {
+                let visible =
+                    visible_content(&s, reason_idle, was_in_reasoning, reason_ended, forced_tool);
+                full_text.push_str(visible);
             }
-            Ok(chat::Event::Delta(_)) => {}
             // F1: trust the delta-stitched `full_text` that respects the
             // reasoning channel (`content_visible`). The chat decoder runs
             // alongside (not downstream of) the reasoning decoder, so
@@ -2670,11 +4770,17 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
     let has_partial = !full_text.is_empty() || pending_tool.is_some() || !reasoning_text.is_empty();
     if error_diag.is_some() && !has_partial {
         let (code, msg) = error_diag.unwrap();
-        // N1: pure-failure 500 attaches launch diags via header —
+        // #470: over-capacity backpressure is a retryable 503, not a 500.
+        // The reservation timed out before any token was produced (the
+        // common over-subscription case lands here, with no partial body),
+        // so the client should back off and retry rather than treat it as a
+        // hard server fault. Every other abort stays a 500.
+        let status = if code == SERVER_BUSY_CODE { 503 } else { 500 };
+        // N1: pure-failure 5xx attaches launch diags via header —
         // the snapshot is immutable, so the next request gets the
         // same diags regardless.
         return res
-            .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
+            .respond(with_launch_diags_header(sse::json_error(status, code, &msg)))
             .await;
     }
 
@@ -2740,15 +4846,23 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         Some(
             diag_snapshot
                 .iter()
-                .map(|d| NonStreamWarning { code: d.code, message: d.message.as_str() })
+                .map(|d| NonStreamWarning {
+                    code: d.code,
+                    message: d.message.as_str(),
+                })
                 .collect(),
         )
     };
+    let sidecar_terminal_turn = match (outcome, error_diag.is_none()) {
+        (Outcome::Natural | Outcome::MaxTokens, true) => Some(("assistant", full_text.as_str())),
+        _ => None,
+    };
+    persist_sidecar(sidecar_lease.as_ref(), sidecar_terminal_turn);
     // #418: speculation metrics, only when the caller opted into the
     // surface (so normal responses are byte-identical).
     let spec_metrics = if want_metrics {
         let spec = spec_metrics_handle
-            .map(|h| *h.lock().unwrap())
+            .map(|h| h.lock().unwrap().clone())
             .unwrap_or_default();
         let report = SpecMetricsReport::build(
             spec_enabled,
@@ -2758,9 +4872,24 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
             spec_generated,
             spec_steps,
             spec_start.elapsed(),
+            sidecar_metrics,
         );
         report.log_spec_stats();
         Some(report)
+    } else {
+        None
+    };
+    // #522: save the next reusable boundary (gated on a real assistant
+    // turn — never on a cancelled/aborted/tool-call turn) and stash the
+    // cache diagnostics for the `X-ChatAPC-Cache` response header.
+    // `finalize` builds the boundary in its own context.
+    let cache_header: Option<String> = if let (Some(plan), Some(mut diag)) =
+        (cache_plan.as_ref(), cache_diag.take())
+    {
+        if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
+            prefix_cache::finalize(plan, &full_text, &model, &mut diag).await;
+        }
+        Some(serde_json::to_string(&diag).expect("CacheDiag must serialize"))
     } else {
         None
     };
@@ -2782,6 +4911,7 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
         error: error_block,
         warnings: warnings_vec,
         spec_metrics,
+        usage: Usage::build(prompt_tokens, spec_generated, cached_tokens),
     };
     // `ChatCompletion` is a closed schema of plain scalars + an
     // assistant message string. None of the fields can fail to
@@ -2811,6 +4941,9 @@ async fn handle_non_streaming(req: ChatCompletionsRequest, res: Responder) -> Fi
     if let Some(kind) = partial_kind {
         builder = builder.header("X-ChatAPC-Partial-Error", kind);
     }
+    if let Some(h) = &cache_header {
+        builder = builder.header("X-ChatAPC-Cache", h.as_str());
+    }
     let response = builder.body(json.into_body()).unwrap();
     res.respond(with_launch_diags_header(response)).await
 }
@@ -2837,7 +4970,9 @@ enum ForcedToolChoice {
 /// (parsed-but-ignored) rather than erroring — matches the lenient
 /// `#[serde(default)]` posture on the field.
 fn forced_tool_choice(tc: Option<&serde_json::Value>) -> ForcedToolChoice {
-    let Some(v) = tc else { return ForcedToolChoice::No };
+    let Some(v) = tc else {
+        return ForcedToolChoice::No;
+    };
     if let Some(s) = v.as_str() {
         return if s == "required" {
             ForcedToolChoice::Any
@@ -2907,9 +5042,9 @@ fn build_forced_tool_constraint(
             400,
             "invalid_request",
             match &only {
-                Some(n) => format!(
-                    "tool_choice names function '{n}' but it is not present in tools[]"
-                ),
+                Some(n) => {
+                    format!("tool_choice names function '{n}' but it is not present in tools[]")
+                }
                 None => "tool_choice is \"required\" but tools[] is empty".to_string(),
             },
         ));
@@ -2936,9 +5071,12 @@ fn build_forced_tool_constraint(
 /// before any chat turn so the schemas land in the system slot the
 /// chat template expects.
 ///
-/// Roles outside the OpenAI canonical set are demoted to `user` so
-/// future SDK extensions (e.g. `tool`) don't crash the handler — a
-/// pessimistic but loss-of-information-preserving choice.
+/// Enforces the role policy at the callee (#468): an unknown role returns
+/// `Err((code, message))` rather than being silently demoted to `user`.
+/// Both user-reachable callers — `handle_parsed` (which also gates early
+/// via `validate_roles`) and the tree-of-thought `tot::dispatch` — go
+/// through here, so no caller can forget the check. The `code` is a role
+/// policy code ([`is_role_error_code`]); callers map it to a 400.
 pub(crate) fn fill_context(
     ctx: &mut Context,
     model: &Model,
@@ -2946,6 +5084,24 @@ pub(crate) fn fill_context(
     tools: Option<&[ToolSchema]>,
     cue: bool,
 ) -> Result<(), (&'static str, String)> {
+    let tokens = build_prompt_tokens(model, messages, tools, cue)?;
+    ctx.append(&tokens);
+    Ok(())
+}
+
+/// Tokenize the same prompt [`fill_context`] would build, returning the raw
+/// token sequence instead of mutating a context. The cross-request prefix
+/// cache ([`super::prefix_cache`]) needs the exact token ids to
+/// content-address snapshots; routing both `fill_context` and the cache
+/// through this one function keeps the prefill bytes identical, which is
+/// the invariant the snapshot keys depend on.
+pub(crate) fn build_prompt_tokens(
+    model: &Model,
+    messages: &[ChatMessage],
+    tools: Option<&[ToolSchema]>,
+    cue: bool,
+) -> Result<Vec<u32>, (&'static str, String)> {
+    let mut out = Vec::new();
     if let Some(tools) = tools {
         // The SDK's `equip_prefix` expects `{name, description,
         // parameters}` per entry; the OpenAI `type:"function"` wrapper is
@@ -2956,22 +5112,56 @@ pub(crate) fn fill_context(
         if !envelopes.is_empty() {
             let prefix = inferlet::tools::equip_prefix(model, &envelopes)
                 .map_err(|e| ("tool_equip_failed", format!("equip_prefix: {e}")))?;
-            ctx.append(&prefix);
+            out.extend_from_slice(&prefix);
         }
     }
-    for msg in messages {
+    let mut tool_names_by_id = HashMap::<String, String>::new();
+    for (i, msg) in messages.iter().enumerate() {
         match msg.role.as_str() {
-            "system" => {
-                ctx.system(&msg.content);
-            }
+            "system" => out.extend(chat::system(model, msg.content_str().unwrap_or(""))),
             "assistant" => {
-                ctx.assistant(&msg.content);
+                let content = assistant_replay_content(msg);
+                out.extend(chat::assistant(model, &content));
+                if let Some(calls) = tool_calls_array(msg) {
+                    for call in calls {
+                        let id = tool_call_id(call).expect("validated tool call id");
+                        let name = tool_call_function_name(call)
+                            .expect("validated tool call function name");
+                        tool_names_by_id.insert(id.to_string(), name.to_string());
+                    }
+                }
             }
-            // `user`, `tool`, anything else → user. The chat template
-            // doesn't have a `tool` slot in v1; surfacing the content
-            // as a user message is closer-to-correct than dropping it.
-            _ => {
-                ctx.user(&msg.content);
+            "tool" => {
+                let tool_call_id = msg
+                    .tool_call_id
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ("invalid_tool_history", "tool message missing tool_call_id".to_string())
+                    })?;
+                let name = tool_names_by_id.get(tool_call_id).ok_or_else(|| {
+                    (
+                        "invalid_tool_history",
+                        format!(
+                            "tool_call_id '{tool_call_id}' has no matching assistant tool_call"
+                        ),
+                    )
+                })?;
+                out.extend(inferlet::tools::answer_prefix(
+                    model,
+                    name,
+                    msg.content_str().unwrap_or(""),
+                ));
+            }
+            "user" => out.extend(chat::user(model, msg.content_str().unwrap_or(""))),
+            // #468: reject any other role here rather than demoting it to
+            // `user`. This is the root-cause guard — every caller goes
+            // through `fill_context` / `build_prompt_tokens`, so the
+            // tree-of-thought and prefix-cache paths can't bypass the
+            // policy.
+            other => {
+                let code = role_error_code(other).unwrap_or("unsupported_role");
+                return Err((code, role_error_message(i, other, code)));
             }
         }
     }
@@ -2981,9 +5171,115 @@ pub(crate) fn fill_context(
     // context still has tokens to process — an empty forward pass spins
     // the generator), so it is opt-out here.
     if cue {
-        ctx.cue();
+        out.extend(chat::cue(model));
+    }
+    Ok(out)
+}
+
+
+fn assistant_replay_content(msg: &ChatMessage) -> String {
+    let content = msg.content_str().unwrap_or("");
+    match tool_calls_array(msg) {
+        Some(calls) if !calls.is_empty() => {
+            let rendered = render_assistant_tool_calls(calls);
+            if content.is_empty() {
+                rendered
+            } else {
+                format!("{content}\n{rendered}")
+            }
+        }
+        _ => content.to_string(),
+    }
+}
+
+fn render_assistant_tool_calls(calls: &[RequestToolCall]) -> String {
+    calls
+        .iter()
+        .map(render_assistant_tool_call)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_assistant_tool_call(call: &RequestToolCall) -> String {
+    let name = tool_call_function_name(call).expect("validated tool call function name");
+    let raw_arguments = tool_call_function_arguments(call)
+        .and_then(serde_json::Value::as_str)
+        .expect("validated tool call arguments");
+    let arguments = serde_json::from_str::<serde_json::Value>(raw_arguments)
+        .unwrap_or_else(|_| serde_json::Value::String(raw_arguments.to_string()));
+    format!(
+        "<tool_call>\n{}\n</tool_call>",
+        serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        })
+    )
+}
+
+fn validate_tool_replay_with<F>(
+    messages: &[ChatMessage],
+    parse_rendered: F,
+) -> Result<(), MessageValidationError>
+where
+    F: Fn(&str) -> Option<(String, String)>,
+{
+    for (i, msg) in messages.iter().enumerate() {
+        let Some(calls) = tool_calls_array(msg) else {
+            continue;
+        };
+        for call in calls {
+            let rendered = render_assistant_tool_call(call);
+            let Some((parsed_name, parsed_args)) = parse_rendered(&rendered) else {
+                return Err(MessageValidationError::new(
+                    "tool_call_replay_unsupported",
+                    "assistant tool_calls cannot be replayed with this model's native tool-call parser",
+                    format!("messages[{i}].tool_calls"),
+                ));
+            };
+            let expected_name = tool_call_function_name(call)
+                .expect("validated tool call function name");
+            let expected_args = tool_call_function_arguments(call)
+                .and_then(serde_json::Value::as_str)
+                .expect("validated tool call arguments");
+            if parsed_name != expected_name || !same_json_arguments(&parsed_args, expected_args) {
+                return Err(MessageValidationError::new(
+                    "tool_call_replay_unsupported",
+                    "assistant tool_calls do not round-trip through this model's native tool-call parser",
+                    format!("messages[{i}].tool_calls"),
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+fn validate_tool_replay_for_model(
+    messages: &[ChatMessage],
+    model: &Model,
+) -> Result<(), MessageValidationError> {
+    validate_tool_replay_with(messages, |rendered| parse_rendered_tool_call(model, rendered))
+}
+
+fn same_json_arguments(left: &str, right: &str) -> bool {
+    match (
+        serde_json::from_str::<serde_json::Value>(left),
+        serde_json::from_str::<serde_json::Value>(right),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => left == right,
+    }
+}
+
+fn parse_rendered_tool_call(model: &Model, rendered: &str) -> Option<(String, String)> {
+    let tokens = model.tokenizer().encode(rendered);
+    let mut decoder = inferlet::tools::Decoder::new(model);
+    for token in tokens {
+        match decoder.feed(&[token]).ok()? {
+            inferlet::tools::Event::Call(name, arguments) => return Some((name, arguments)),
+            inferlet::tools::Event::Start => {}
+        }
+    }
+    None
 }
 
 /// One detected tool call buffered for emit on the terminal chunk.
@@ -3018,6 +5314,119 @@ fn next_tool_call_id() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn generation_metrics_frame_field_names_and_boundaries_are_stable() {
+        assert!(GenerationMetricsSse::build(0, Duration::from_millis(500)).is_none());
+        assert!(GenerationMetricsSse::build(3, Duration::ZERO).is_none());
+
+        let frame = GenerationMetricsSse::build(21, Duration::from_millis(500))
+            .expect("positive token count and elapsed time should emit metrics");
+        let json = serde_json::to_value(frame).expect("generation metrics serialize");
+
+        assert_eq!(json["event"].as_str(), Some("generation_metrics"));
+        assert_eq!(json["output_tokens"].as_u64(), Some(21));
+        assert_eq!(json["elapsed_s"].as_f64(), Some(0.5));
+        assert_eq!(json["tokens_per_sec"].as_f64(), Some(42.0));
+    }
+
+    #[test]
+    fn model_registration_error_reports_target_mismatch_for_wrong_resident_model() {
+        let err = model_registration_error("selected", &["resident".to_string()])
+            .expect("wrong model should produce a preflight error");
+
+        assert_eq!(err.status, 409);
+        assert_eq!(err.code, "target_mismatch");
+        assert!(err.message.contains("selected"));
+        assert!(err.message.contains("resident"));
+        assert!(err.message.contains("/v1/models"));
+    }
+
+    #[test]
+    fn model_registration_error_allows_the_resident_model() {
+        assert!(model_registration_error("resident", &["resident".to_string()]).is_none());
+    }
+
+    // ─── Multi-part message content (#115) ─────────────────
+
+    fn parse_message(json: &str) -> Result<ChatMessage, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn content_plain_string_unchanged() {
+        let m = parse_message(r#"{"role":"user","content":"hello"}"#).unwrap();
+        assert_eq!(m.content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn content_single_text_part_flattens() {
+        let m = parse_message(r#"{"role":"user","content":[{"type":"text","text":"hello"}]}"#)
+            .unwrap();
+        assert_eq!(m.content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn content_multiple_text_parts_concatenate_in_order() {
+        let m = parse_message(
+            r#"{"role":"user","content":[
+                {"type":"text","text":"a"},
+                {"type":"text","text":"b"},
+                {"type":"text","text":"c"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn content_empty_array_yields_empty_string() {
+        // Flattens to "" — downstream the blank-content 400 gate in
+        // `handle_parsed` rejects it, same as `content:""`.
+        let m = parse_message(r#"{"role":"user","content":[]}"#).unwrap();
+        assert_eq!(m.content.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn content_non_text_parts_contribute_nothing() {
+        // image_url and other part types are accepted but textless.
+        let m = parse_message(
+            r#"{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"http://x/y.png"}},
+                {"type":"text","text":"caption"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content.as_deref(), Some("caption"));
+    }
+
+    #[test]
+    fn content_part_with_null_text_is_skipped() {
+        let m = parse_message(
+            r#"{"role":"user","content":[{"type":"text","text":null},{"type":"text","text":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn content_rejects_non_string_non_array() {
+        assert!(parse_message(r#"{"role":"user","content":42}"#).is_err());
+        assert!(parse_message(r#"{"role":"user","content":{"text":"x"}}"#).is_err());
+        let m = parse_message(r#"{"role":"user","content":null}"#).unwrap();
+        assert_eq!(m.content, None);
+    }
+
+    #[test]
+    fn content_rejects_array_with_non_object_part() {
+        // One malformed part poisons the whole array → 400 at the
+        // request boundary, never a silently dropped part.
+        assert!(parse_message(r#"{"role":"user","content":["bare string"]}"#).is_err());
+        assert!(
+            parse_message(r#"{"role":"user","content":[{"type":"text","text":"ok"}, 7]}"#)
+                .is_err()
+        );
+    }
+
     // ─── Forward-pass starvation guard (#439) ─────────────
 
     #[test]
@@ -3031,14 +5440,20 @@ mod tests {
     #[test]
     fn not_starved_when_a_token_was_sampled() {
         assert!(!forward_pass_starved(&[SlotOutput::Token(5)]));
-        assert!(!forward_pass_starved(&[SlotOutput::Token(5), SlotOutput::Token(6)]));
+        assert!(!forward_pass_starved(&[
+            SlotOutput::Token(5),
+            SlotOutput::Token(6)
+        ]));
     }
 
     #[test]
     fn not_starved_when_token_leads_non_token_slots() {
         // A decode step with the auto-sampler at slot 0 plus probe slots:
         // the leading Token means the engine produced a pick.
-        assert!(!forward_pass_starved(&[SlotOutput::Token(5), SlotOutput::Entropy(0.5)]));
+        assert!(!forward_pass_starved(&[
+            SlotOutput::Token(5),
+            SlotOutput::Entropy(0.5)
+        ]));
     }
 
     #[test]
@@ -3049,23 +5464,66 @@ mod tests {
         assert!(forward_pass_starved(&[SlotOutput::Entropy(0.5)]));
     }
 
+    // ─── Over-capacity backpressure classification (#470) ──
+
+    #[test]
+    fn server_busy_sentinel_classifies_as_server_busy() {
+        // The host wraps the acquisition-timeout message; the SDK then
+        // prefixes its own context ("GenStep::execute reserve: ..."). The
+        // sentinel survives both wraps as a substring.
+        let host = "server_busy: KV page acquisition timed out after 120s; \
+                    engine is over capacity";
+        let sdk_wrapped = format!("GenStep::execute reserve: {host}");
+        assert_eq!(classify_forward_error(host), SERVER_BUSY_CODE);
+        assert_eq!(classify_forward_error(&sdk_wrapped), SERVER_BUSY_CODE);
+    }
+
+    #[test]
+    fn generic_forward_error_classifies_as_forward_pass_failed() {
+        assert_eq!(
+            classify_forward_error("device RPC returned an error"),
+            "forward_pass_failed"
+        );
+        assert_eq!(classify_forward_error(""), "forward_pass_failed");
+    }
+
+    #[test]
+    fn bare_server_busy_token_in_device_error_is_not_backpressure() {
+        // The host's contract is the colon-suffixed `server_busy:` prefix.
+        // A verbatim device/driver error that merely contains the bare token
+        // `server_busy` (no colon) must stay a fatal `forward_pass_failed`,
+        // not get mislabeled as retryable backpressure (a 503 a client would
+        // retry forever against a genuinely dead engine).
+        let device_err =
+            "GenStep::execute forward: driver reported server_busy flag set on dead queue";
+        assert_eq!(classify_forward_error(device_err), "forward_pass_failed");
+    }
+
     // ─── Reasoning/content channel demux ──────────────────
 
     /// Reasoning-decoder event kind for one generation step, paired with
     /// the chat decoder's text for the same token batch. Models what the
     /// host decoders return without the wasm host.
     enum Step {
-        ThinkStart(&'static str),  // reasoning Start; chat surfaces the `<think>` text
-        Reason(&'static str),      // reasoning Delta; chat surfaces the same text
-        ThinkEnd(&'static str),    // reasoning End/Complete; chat surfaces the `</think>` text
-        Content(&'static str),     // reasoning Idle (outside); chat surfaces visible content
+        ThinkStart(&'static str), // reasoning Start; chat surfaces the `<think>` text
+        Reason(&'static str),     // reasoning Delta; chat surfaces the same text
+        // reasoning End/Complete. `.0` is the decoder's FULL accumulated
+        // reasoning text for the block (what `End(s)` carries); `.1` is the
+        // chat `</think>` delimiter surfaced on the suppressed chat channel.
+        // A multi-token speculative batch that contains reasoning text AND
+        // the boundary arrives as a single `End(s)` with no prior `Delta`,
+        // so `.0` can be longer than the streamed `Reason` deltas.
+        ThinkEnd(&'static str, &'static str),
+        Content(&'static str), // reasoning Idle (outside); chat surfaces visible content
     }
 
-    /// Replays the generation loop's reasoning/content demux exactly as
+    /// Replays the generation loop's reasoning/content demux as
     /// `handle_streaming` / `handle_non_streaming` do: capture
-    /// `was_in_reasoning`, feed reasoning (updating `in_reasoning` +
-    /// `reason_idle`), then gate the chat delta on `content_visible`.
-    /// Returns `(visible_content, reasoning)`.
+    /// `was_in_reasoning`, feed reasoning (updating `in_reasoning` /
+    /// `reason_idle` / `reason_ended` + the `End(s)` reasoning recovery), then
+    /// route the chat delta through the SAME production `visible_content` the
+    /// real loops call — so this exercises the real demux decision, not a
+    /// reimplementation. Returns `(visible_content, reasoning)`.
     fn demux(steps: &[Step]) -> (String, String) {
         let mut content = String::new();
         let mut reasoning = String::new();
@@ -3073,6 +5531,7 @@ mod tests {
         for step in steps {
             let was_in_reasoning = in_reasoning;
             let mut reason_idle = false;
+            let mut reason_ended = false;
             let chat_text = match step {
                 Step::ThinkStart(t) => {
                     in_reasoning = true;
@@ -3083,18 +5542,33 @@ mod tests {
                     reasoning.push_str(t);
                     *t
                 }
-                Step::ThinkEnd(t) => {
+                Step::ThinkEnd(end_s, close) => {
                     in_reasoning = false;
-                    *t
+                    reason_ended = true;
+                    // Mirror the production End arm: recover reasoning text
+                    // that arrived in the SAME batch as the boundary by
+                    // appending only the un-streamed suffix; fall back to
+                    // trusting the streamed deltas if `End(s)` disagrees.
+                    if let Some(residual) = end_s.strip_prefix(reasoning.as_str()) {
+                        reasoning.push_str(residual);
+                    }
+                    *close
                 }
                 Step::Content(t) => {
                     reason_idle = true;
                     *t
                 }
             };
-            if content_visible(reason_idle, was_in_reasoning) {
-                content.push_str(chat_text);
-            }
+            // Route through the real production demux unit (no `forced_tool` in
+            // these scenarios). The `</think>` straddle recovery (#600) lives in
+            // `visible_content`, so this harness fails if that recovery breaks.
+            content.push_str(visible_content(
+                chat_text,
+                reason_idle,
+                was_in_reasoning,
+                reason_ended,
+                false,
+            ));
         }
         (content, reasoning)
     }
@@ -3102,17 +5576,181 @@ mod tests {
     #[test]
     fn think_delimiters_never_leak_into_visible_content() {
         // A canonical Qwen reasoning turn: <think> reasoning </think> answer.
+        // End(s) carries the full accumulated reasoning, already streamed
+        // via the Reason delta, so the End residual is empty.
         let (content, reasoning) = demux(&[
             Step::ThinkStart("<think>"),
             Step::Reason("the user said hi"),
-            Step::ThinkEnd("</think>"),
+            Step::ThinkEnd("the user said hi", "</think>"),
             Step::Content("Hello!"),
         ]);
         assert_eq!(content, "Hello!", "only the answer reaches visible content");
         assert_eq!(reasoning, "the user said hi");
         // The specific symptom: the CLOSING tag must not leak.
-        assert!(!content.contains("</think>"), "closing delimiter leaked: {content:?}");
-        assert!(!content.contains("<think>"), "opening delimiter leaked: {content:?}");
+        assert!(
+            !content.contains("</think>"),
+            "closing delimiter leaked: {content:?}"
+        );
+        assert!(
+            !content.contains("<think>"),
+            "opening delimiter leaked: {content:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_in_same_batch_as_close_is_not_dropped() {
+        // Speculative regression (#466): a warmed n-gram cache can make the
+        // engine accept the reasoning token(s) AND the closing boundary in a
+        // single multi-token batch. The reasoning decoder then fires only
+        // `End(s)` (one event per feed) with no prior `Delta`, so trusting
+        // the streamed deltas alone drops the reasoning text. The empty
+        // `/no_think` block (`<think>\n\n</think>`) is the minimal trigger.
+        let (content, reasoning) = demux(&[
+            Step::ThinkStart("<think>"),
+            // No Reason delta: the `\n\n` and the close arrive together, so
+            // the decoder reports the reasoning only inside End(s).
+            Step::ThinkEnd("\n\n", "</think>"),
+            Step::Content("\n\nred blue green"),
+        ]);
+        assert_eq!(
+            reasoning, "\n\n",
+            "same-batch reasoning text must survive the close boundary"
+        );
+        assert_eq!(content, "\n\nred blue green");
+    }
+
+    #[test]
+    fn partial_streamed_reasoning_recovers_only_the_unstreamed_suffix() {
+        // The last reasoning token shares the batch with the close: part of
+        // the reasoning streamed via Delta, the rest rides End(s). Only the
+        // un-streamed suffix is appended — no duplication of the streamed
+        // prefix, and the dropped tail is recovered.
+        let (_content, reasoning) = demux(&[
+            Step::ThinkStart("<think>"),
+            Step::Reason("the user "),
+            Step::ThinkEnd("the user said hi", "</think>"),
+            Step::Content("answer"),
+        ]);
+        assert_eq!(reasoning, "the user said hi");
+    }
+
+    #[test]
+    fn end_payload_disagreeing_with_streamed_deltas_is_discarded() {
+        // F5 invariant: if End(s) is NOT a clean superset of the streamed
+        // deltas (detokenization re-segmentation), trust the deltas so
+        // stream and non-stream stay byte-identical.
+        let (_content, reasoning) = demux(&[
+            Step::ThinkStart("<think>"),
+            Step::Reason("the user said hi"),
+            Step::ThinkEnd("DIFFERENT accumulated text", "</think>"),
+            Step::Content("answer"),
+        ]);
+        assert_eq!(reasoning, "the user said hi");
+    }
+
+    #[test]
+    fn answer_in_same_batch_as_close_is_not_dropped() {
+        // #600: the content sibling of `reasoning_in_same_batch_as_close...`.
+        // Under speculative decode the `</think>` close and the first answer
+        // tokens land in ONE batch, so the chat decoder surfaces a combined
+        // `</think>answer-head` on the close step. `content_visible` is false
+        // there (End ≠ Idle), so without recovery the answer is dropped and the
+        // turn persists empty content.
+        let (content, reasoning) = demux(&[
+            Step::ThinkStart("<think>"),
+            Step::Reason("user wants the capital of France"),
+            // Whole tail of the turn rides one speculative burst.
+            Step::ThinkEnd(
+                "user wants the capital of France",
+                "</think>\n\nThe capital of France is **Paris**.",
+            ),
+        ]);
+        assert_eq!(
+            content, "The capital of France is **Paris**.",
+            "answer-head riding the close batch must reach visible content"
+        );
+        assert_eq!(reasoning, "user wants the capital of France");
+        assert!(
+            !content.contains("</think>"),
+            "closing delimiter leaked: {content:?}"
+        );
+    }
+
+    #[test]
+    fn straddle_answer_head_then_streams_rest() {
+        // The close batch carries the answer-head; later batches stream the
+        // rest as ordinary visible content. Both concatenate into the reply.
+        let (content, _r) = demux(&[
+            Step::ThinkStart("<think>"),
+            Step::Reason("thinking"),
+            Step::ThinkEnd("thinking", "</think>Paris"),
+            Step::Content(" is the capital."),
+        ]);
+        assert_eq!(content, "Paris is the capital.");
+    }
+
+    #[test]
+    fn plain_decode_close_batch_emits_no_content() {
+        // Plain (non-speculative) decode: `</think>` is its own batch and the
+        // answer arrives on the next. The bare-delimiter close must suppress
+        // (no leak) and recover nothing — the answer streams via the next
+        // batch, so there is no double-emit.
+        let (content, _r) = demux(&[
+            Step::ThinkStart("<think>"),
+            Step::Reason("thinking"),
+            Step::ThinkEnd("thinking", "</think>"),
+            Step::Content("Paris"),
+        ]);
+        assert_eq!(content, "Paris");
+    }
+
+    #[test]
+    fn answer_after_close_extracts_post_delimiter_text() {
+        assert_eq!(answer_after_close("</think>Paris"), Some("Paris"));
+        assert_eq!(
+            answer_after_close("reasoning tail</think>\n\nParis"),
+            Some("Paris")
+        );
+        // Bare delimiter (plain decode close batch) → nothing to recover.
+        assert_eq!(answer_after_close("</think>"), None);
+        assert_eq!(answer_after_close("</think>\n\n"), None);
+        // No close delimiter → None (not a close-batch shape).
+        assert_eq!(answer_after_close("just content"), None);
+        // Split on the FIRST close, so an answer mentioning the tag stays whole.
+        assert_eq!(
+            answer_after_close("</think>see </think> below"),
+            Some("see </think> below")
+        );
+    }
+
+    #[test]
+    fn visible_content_demuxes_every_batch_shape() {
+        // This is the exact decision the real `handle_streaming` /
+        // `handle_non_streaming` loops run per chat Delta.
+        // Outside reasoning (reason Idle) → whole delta is content.
+        assert_eq!(visible_content("answer", true, false, false, false), "answer");
+        // Inside reasoning (Start/Delta batch) → suppressed.
+        assert_eq!(visible_content("reasoning", false, false, false, false), "");
+        // No-visible-text reasoning token (Idle while inside) → suppressed.
+        assert_eq!(visible_content("", true, true, false, false), "");
+        // Close batch, plain decode (bare delimiter) → nothing recovered.
+        assert_eq!(visible_content("</think>", false, true, true, false), "");
+        // #600 straddle: `</think>` + answer-head in ONE batch → recover answer.
+        assert_eq!(
+            visible_content("</think>\n\nParis", false, true, true, false),
+            "Paris"
+        );
+        // Straddle with a reasoning tail ahead of the close → still just answer.
+        assert_eq!(
+            visible_content("tail</think>Paris", false, true, true, false),
+            "Paris"
+        );
+        // forced_tool suppresses on EVERY shape (content rides tool_calls only).
+        assert_eq!(visible_content("answer", true, false, false, true), "");
+        assert_eq!(
+            visible_content("</think>Paris", false, true, true, true),
+            ""
+        );
     }
 
     #[test]
@@ -3131,10 +5769,7 @@ mod tests {
     fn non_thinking_model_passes_all_content() {
         // NoopReasoningDecoder always reports Idle and never flips the
         // gate — every batch is visible content.
-        let (content, reasoning) = demux(&[
-            Step::Content("Plain "),
-            Step::Content("answer."),
-        ]);
+        let (content, reasoning) = demux(&[Step::Content("Plain "), Step::Content("answer.")]);
         assert_eq!(content, "Plain answer.");
         assert!(reasoning.is_empty());
     }
@@ -3154,12 +5789,423 @@ mod tests {
     }
 
     #[test]
-    fn absent_speculation_is_none() {
+    fn speculation_parses_optional_sidecar_identity() {
         let r: ChatCompletionsRequest = serde_json::from_str(
-            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "temperature":0,
+                "speculation":{"enabled":true,
+                               "thread_id":"chat-1",
+                               "profile_id":"fast-think"}}"#,
         )
         .unwrap();
+        let s = r.speculation.expect("speculation present");
+        assert_eq!(s.thread_id.as_deref(), Some("chat-1"));
+        assert_eq!(s.profile_id.as_deref(), Some("fast-think"));
+    }
+
+    #[test]
+    fn spec_metrics_reports_sidecar_reuse_state() {
+        let report = SpecMetricsReport::build(
+            true,
+            None,
+            (1, 3),
+            SpecMetrics {
+                proposed: 6,
+                accepted: 4,
+                rejected: 2,
+                steps: 2,
+                generated: 6,
+                cache_hits: 0,
+                cache_misses: 0,
+                cache_size: 0,
+                accepted_prefix_hist: Vec::new(),
+            },
+            6,
+            2,
+            Duration::from_secs(1),
+            Some(SidecarMetrics {
+                status: SidecarMetricStatus::Reused,
+                ngram_leaders: 42,
+                expired: 1,
+            }),
+        );
+        let json = serde_json::to_value(&report).expect("metrics serialize");
+        assert_eq!(json["ngram_sidecar_status"], "reused");
+        assert_eq!(json["ngram_sidecar_leaders"], 42);
+        assert_eq!(json["ngram_sidecars_expired"], 1);
+    }
+
+    #[test]
+    fn spec_metrics_reports_sidecar_non_reuse_reasons() {
+        for (status, expected) in [
+            (SidecarMetricStatus::DecodeFailed, "decode_failed"),
+            (SidecarMetricStatus::LineageForked, "lineage_forked"),
+        ] {
+            let report = SpecMetricsReport::build(
+                true,
+                None,
+                (1, 3),
+                SpecMetrics::default(),
+                0,
+                0,
+                Duration::from_secs(1),
+                Some(SidecarMetrics {
+                    status,
+                    ngram_leaders: 0,
+                    expired: 0,
+                }),
+            );
+            let json = serde_json::to_value(&report).expect("metrics serialize");
+            assert_eq!(json["ngram_sidecar_status"], expected);
+        }
+    }
+
+    #[test]
+    fn absent_speculation_is_none() {
+        let r: ChatCompletionsRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+                .unwrap();
         assert!(r.speculation.is_none());
+    }
+
+    #[test]
+    fn openai_assistant_tool_call_history_accepts_null_content() {
+        let r: ChatCompletionsRequest = serde_json::from_str(
+            r#"{
+                "model":"m",
+                "messages":[
+                    {"role":"user","content":"What is 2+2?"},
+                    {
+                        "role":"assistant",
+                        "content":null,
+                        "tool_calls":[{
+                            "id":"call_calc",
+                            "type":"function",
+                            "function":{"name":"calculator","arguments":"{\"expr\":\"2+2\"}"}
+                        }]
+                    },
+                    {"role":"tool","tool_call_id":"call_calc","content":"4"}
+                ]
+            }"#,
+        )
+        .expect("OpenAI SDK tool-call continuation history should parse");
+        assert_eq!(r.messages.len(), 3);
+    }
+
+    fn parsed_messages(json: &str) -> Vec<ChatMessage> {
+        serde_json::from_str::<ChatCompletionsRequest>(json)
+            .expect("request should deserialize")
+            .messages
+    }
+
+    #[test]
+    fn openai_tool_result_sequence_validates_linkage() {
+        let messages = parsed_messages(
+            r#"{
+                "model":"m",
+                "messages":[
+                    {"role":"user","content":"What is 2+2?"},
+                    {
+                        "role":"assistant",
+                        "content":"",
+                        "tool_calls":[{
+                            "id":"call_calc",
+                            "type":"function",
+                            "function":{"name":"calculator","arguments":"{\"expr\":\"2+2\"}"}
+                        }]
+                    },
+                    {"role":"tool","tool_call_id":"call_calc","content":"4"}
+                ]
+            }"#,
+        );
+
+        validate_messages(&messages).expect("assistant tool_calls followed by matching tool result should validate");
+    }
+
+    #[test]
+    fn tool_message_without_matching_assistant_call_is_rejected_with_param() {
+        let messages = parsed_messages(
+            r#"{
+                "model":"m",
+                "messages":[
+                    {"role":"user","content":"What is 2+2?"},
+                    {"role":"tool","tool_call_id":"call_missing","content":"4"}
+                ]
+            }"#,
+        );
+
+        let err = validate_messages(&messages).expect_err("orphan tool result should fail");
+        assert_eq!(err.code, "unknown_tool_call_id");
+        assert_eq!(err.param, "messages[1].tool_call_id");
+    }
+
+    #[test]
+    fn duplicate_assistant_tool_call_ids_are_rejected_with_param() {
+        let messages = parsed_messages(
+            r#"{
+                "model":"m",
+                "messages":[
+                    {"role":"user","content":"call twice"},
+                    {
+                        "role":"assistant",
+                        "content":null,
+                        "tool_calls":[
+                            {"id":"call_dup","type":"function","function":{"name":"a","arguments":"{}"}},
+                            {"id":"call_dup","type":"function","function":{"name":"b","arguments":"{}"}}
+                        ]
+                    }
+                ]
+            }"#,
+        );
+
+        let err = validate_messages(&messages).expect_err("duplicate ids should fail");
+        assert_eq!(err.code, "duplicate_tool_call_id");
+        assert_eq!(err.param, "messages[1].tool_calls[1].id");
+    }
+
+    #[test]
+    fn malformed_tool_continuation_sequences_report_specific_params() {
+        let cases = [
+            (
+                r#"{"model":"m","messages":[
+                    {"role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","type":"function","function":{"name":"calculator","arguments":"{}"}}
+                    ]},
+                    {"role":"tool","content":"4"}
+                ]}"#,
+                "missing_tool_call_id",
+                "messages[1].tool_call_id",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"type":"function","function":{"name":"calculator","arguments":"{}"}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].id",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","function":{"name":"calculator","arguments":"{}"}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].type",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","type":"function"}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].function",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","type":"function","function":{"arguments":"{}"}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].function.name",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","type":"function","function":{"name":"calculator"}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].function.arguments",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","type":"function","function":{"name":"calculator","arguments":{}}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].function.arguments",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":123,"type":"function","function":{"name":"calculator","arguments":"{}"}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].id",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","type":7,"function":{"name":"calculator","arguments":"{}"}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].type",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","type":"function","function":[]}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].function",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","type":"function","function":{"name":{},"arguments":"{}"}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls[0].function.name",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"user","content":"hi","tool_call_id":"call_x"
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_call_id",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":"hi","tool_call_id":"call_x"
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_call_id",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"future","content":"hi","tool_calls":[
+                        {"id":"call_x","type":"function","function":{"name":"calculator","arguments":"{}"}}
+                    ]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"user","content":"hi","tool_call_id":123
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_call_id",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":{}
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[null]
+                }]}"#,
+                "malformed_tool_calls",
+                "messages[0].tool_calls",
+            ),
+            (
+                r#"{"model":"m","messages":[
+                    {"role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","type":"function","function":{"name":"calculator","arguments":"{}"}}
+                    ]},
+                    {"role":"user","content":"interrupt"},
+                    {"role":"tool","tool_call_id":"call_x","content":"4"}
+                ]}"#,
+                "invalid_tool_order",
+                "messages[1].role",
+            ),
+            (
+                r#"{"model":"m","messages":[{
+                    "role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_x","type":"function","function":{"name":"calculator","arguments":"{}"}}
+                    ]
+                }]}"#,
+                "missing_tool_result",
+                "messages",
+            ),
+        ];
+
+        for (json, code, param) in cases {
+            let messages = parsed_messages(json);
+            let err = validate_messages(&messages).expect_err(json);
+            assert_eq!(err.code, code, "{json}");
+            assert_eq!(err.param, param, "{json}");
+        }
+    }
+
+    #[test]
+    fn tool_results_must_follow_assistant_declared_order() {
+        let messages = parsed_messages(
+            r#"{
+                "model":"m",
+                "messages":[
+                    {"role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_a","type":"function","function":{"name":"calculator","arguments":"{\"expr\":\"2+2\"}"}},
+                        {"id":"call_b","type":"function","function":{"name":"calculator","arguments":"{\"expr\":\"3+3\"}"}}
+                    ]},
+                    {"role":"tool","tool_call_id":"call_b","content":"6"},
+                    {"role":"tool","tool_call_id":"call_a","content":"4"}
+                ]
+            }"#,
+        );
+
+        let err = validate_messages(&messages).expect_err("out-of-order tool results should fail");
+        assert_eq!(err.code, "invalid_tool_order");
+        assert_eq!(err.param, "messages[1].tool_call_id");
+    }
+
+    #[test]
+    fn assistant_tool_replay_requires_native_parser_confirmation() {
+        let messages = parsed_messages(
+            r#"{
+                "model":"m",
+                "messages":[{
+                    "role":"assistant",
+                    "content":null,
+                    "tool_calls":[{
+                        "id":"call_calc",
+                        "type":"function",
+                        "function":{"name":"calculator","arguments":"{\"expr\":\"2+2\"}"}
+                    }]
+                }]
+            }"#,
+        );
+
+        let err = validate_tool_replay_with(&messages, |_rendered| None)
+            .expect_err("unsupported native replay should fail closed");
+        assert_eq!(err.code, "tool_call_replay_unsupported");
+        assert_eq!(err.param, "messages[0].tool_calls");
+    }
+
+    #[test]
+    fn assistant_tool_calls_replay_as_native_tool_call_payload() {
+        let messages = parsed_messages(
+            r#"{
+                "model":"m",
+                "messages":[{
+                    "role":"assistant",
+                    "content":null,
+                    "tool_calls":[{
+                        "id":"call_calc",
+                        "type":"function",
+                        "function":{"name":"calculator","arguments":"{\"expr\":\"2+2\"}"}
+                    }]
+                }]
+            }"#,
+        );
+        let rendered = render_assistant_tool_calls(tool_calls_array(&messages[0]).unwrap());
+
+        assert!(rendered.contains("<tool_call>"), "{rendered}");
+        assert!(rendered.contains("</tool_call>"), "{rendered}");
+        assert!(rendered.contains("\"name\":\"calculator\""), "{rendered}");
+        assert!(rendered.contains("\"arguments\":{\"expr\":\"2+2\"}"), "{rendered}");
     }
 
     #[test]
@@ -3173,7 +6219,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            validate_sampling(&req).unwrap_err().0,
+            validate_sampling(&req, MAX_OUTPUT_TOKENS_FALLBACK).unwrap_err().0,
             "speculation.leader_len"
         );
 
@@ -3184,7 +6230,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            validate_sampling(&req).unwrap_err().0,
+            validate_sampling(&req, MAX_OUTPUT_TOKENS_FALLBACK).unwrap_err().0,
             "speculation.draft_len"
         );
 
@@ -3195,39 +6241,611 @@ mod tests {
                 "temperature":0,"speculation":{"enabled":true,"leader_len":2,"draft_len":4}}"#,
         )
         .unwrap();
-        assert!(validate_sampling(&req).is_ok());
+        assert!(validate_sampling(&req, MAX_OUTPUT_TOKENS_FALLBACK).is_ok());
         let cfg = req.speculation.unwrap().to_config();
         assert_eq!((cfg.leader_len, cfg.draft_len), (2, 4));
     }
 
+    fn test_msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: Some(content.into()),
+            tool_call_id: None,
+            tool_calls: None,
+        }
+    }
+
+    #[test]
+    fn validate_roles_accepts_supported_set() {
+        let msgs = vec![
+            test_msg("system", "s"),
+            test_msg("user", "u"),
+            test_msg("assistant", "a"),
+            test_msg("user", "u2"),
+        ];
+        assert!(validate_roles(&msgs).is_ok());
+    }
+
+    #[test]
+    fn validate_roles_accepts_tool_role_for_valid_continuations() {
+        let msgs = vec![test_msg("tool", "t")];
+        assert!(validate_roles(&msgs).is_ok());
+    }
+
+    #[test]
+    fn validate_roles_rejects_unknown_role() {
+        // #468: a typo'd / unsupported role is a 400, not a silent
+        // demotion to `user` that generates a mis-templated completion.
+        for role in ["banana", "developer", "function", "User", ""] {
+            let msgs = vec![test_msg(role, "c")];
+            let (i, code, msg) = validate_roles(&msgs).unwrap_err();
+            assert_eq!(i, 0, "role={role:?}");
+            assert_eq!(code, "unsupported_role", "role={role:?}");
+            assert!(msg.contains("messages[0].role"), "role={role:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn is_role_error_code_splits_client_from_internal() {
+        // Role-policy codes are client errors (400); internal failures
+        // (e.g. tool_equip_failed) are not — the tot::dispatch status
+        // split (400 vs 500) keys on this.
+        assert!(is_role_error_code("unsupported_role"));
+        assert!(is_role_error_code("tool_role_unsupported"));
+        assert!(!is_role_error_code("tool_equip_failed"));
+    }
+
+    #[test]
+    fn validate_roles_reports_first_offending_index() {
+        let msgs = vec![
+            test_msg("user", "u"),
+            test_msg("assistant", "a"),
+            test_msg("banana", "b"),
+        ];
+        let (i, _code, _msg) = validate_roles(&msgs).unwrap_err();
+        assert_eq!(i, 2);
+    }
+
+    #[test]
+    fn max_tokens_ceiling_is_dynamic() {
+        // The `max_tokens` ceiling is the engine value passed in, not a
+        // hardcoded constant: a request at the ceiling passes, one above
+        // is rejected, 0 is always rejected, and a larger engine capacity
+        // lifts the ceiling. Drives the pure `validate_sampling` directly
+        // with an explicit ceiling (no engine host needed).
+        let mk = |mt: usize| -> ChatCompletionsRequest {
+            serde_json::from_str(&format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"max_tokens":{mt}}}"#
+            ))
+            .unwrap()
+        };
+        assert!(validate_sampling(&mk(4096), 4096).is_ok());
+        assert_eq!(
+            validate_sampling(&mk(4097), 4096).unwrap_err().0,
+            "max_tokens"
+        );
+        // A larger engine KV capacity lifts the ceiling: 40000 now passes
+        // where the old hardcoded 8192 would have rejected it.
+        assert!(validate_sampling(&mk(40000), 65536).is_ok());
+        // Zero is invalid regardless of ceiling.
+        assert_eq!(
+            validate_sampling(&mk(0), 65536).unwrap_err().0,
+            "max_tokens"
+        );
+        // The 400 message reflects the dynamic ceiling, not a constant.
+        let (_, msg) = validate_sampling(&mk(99999), 8192).unwrap_err();
+        assert!(msg.contains("[1, 8192]"), "got: {msg}");
+    }
+
+    #[test]
+    fn omitted_max_tokens_uses_dynamic_ceiling_when_below_default() {
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(validate_sampling(&req, 512).unwrap(), 512);
+        assert_eq!(
+            validate_sampling(&req, DEFAULT_MAX_TOKENS + 1).unwrap(),
+            DEFAULT_MAX_TOKENS
+        );
+    }
+
+    #[test]
+    fn max_completion_tokens_is_max_tokens_fallback() {
+        // OpenAI/Codex-style clients send `max_completion_tokens` and omit
+        // `max_tokens`. The effective budget must come from the alias
+        // rather than silently collapsing to DEFAULT_MAX_TOKENS.
+        let req: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "max_completion_tokens":2048}"#,
+        )
+        .unwrap();
+        assert_eq!(validate_sampling(&req, 8192).unwrap(), 2048);
+        // Still range-checked against the runtime ceiling like `max_tokens`.
+        assert_eq!(validate_sampling(&req, 1024).unwrap_err().0, "max_tokens");
+
+        // When both are present, `max_tokens` wins (the alias is only a
+        // fallback for its absence).
+        let both: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "max_tokens":256,"max_completion_tokens":2048}"#,
+        )
+        .unwrap();
+        assert_eq!(validate_sampling(&both, 8192).unwrap(), 256);
+    }
+
+    #[test]
+    fn usage_block_shape_and_totals() {
+        // `total_tokens` is the sum of prompt + completion, and
+        // `cached_tokens` nests under `prompt_tokens_details` exactly like
+        // OpenAI's prompt-caching shape.
+        let usage = Usage::build(100, 40, 30);
+        assert_eq!(usage.total_tokens, 140);
+        let v = serde_json::to_value(&usage).unwrap();
+        assert_eq!(v["prompt_tokens"], 100);
+        assert_eq!(v["completion_tokens"], 40);
+        assert_eq!(v["total_tokens"], 140);
+        assert_eq!(v["prompt_tokens_details"]["cached_tokens"], 30);
+    }
+
+    #[test]
+    fn stream_options_include_usage_parses_and_defaults_off() {
+        // Opt-in flag round-trips; absence of `stream_options` leaves the
+        // stream byte-identical (no usage chunk emitted).
+        let on: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "stream":true,"stream_options":{"include_usage":true}}"#,
+        )
+        .unwrap();
+        assert!(on.stream_options.as_ref().is_some_and(|o| o.include_usage));
+
+        let off: ChatCompletionsRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .unwrap();
+        assert!(off.stream_options.is_none());
+    }
+
     #[test]
     fn plan_strategy_gates_on_greedy_and_enabled() {
-        // requested + greedy + no forced tool -> speculative, no fallback
-        let s = SpecRequest { enabled: true, leader_len: None, draft_len: None };
-        let (st, fb, want, _) = plan_strategy(Some(&s), true, false);
+        // requested + greedy + no forced tool + no json -> speculative, no fallback
+        let s = SpecRequest {
+            enabled: true,
+            leader_len: None,
+            draft_len: None,
+            thread_id: None,
+            profile_id: None,
+        };
+        let (st, fb, want, _) = plan_strategy(Some(&s), true, false, false);
         assert!(matches!(st, DecodeStrategy::Speculative(_)));
         assert!(fb.is_none());
         assert!(want);
         // requested + non-greedy -> plain, fallback reason
-        let (st, fb, want, _) = plan_strategy(Some(&s), false, false);
+        let (st, fb, want, _) = plan_strategy(Some(&s), false, false, false);
         assert!(matches!(st, DecodeStrategy::Plain));
         assert_eq!(fb, Some("non_greedy_sampling"));
         assert!(want);
         // requested + greedy BUT a tool call is forced -> plain, gated off
         // with a distinct reason (checked before the greedy gate).
-        let (st, fb, want, _) = plan_strategy(Some(&s), true, true);
+        let (st, fb, want, _) = plan_strategy(Some(&s), true, true, false);
         assert!(matches!(st, DecodeStrategy::Plain));
         assert_eq!(fb, Some("tool_choice_forced"));
         assert!(want);
         // enabled:false -> plain, disabled
-        let off = SpecRequest { enabled: false, leader_len: None, draft_len: None };
-        let (_, fb, want, _) = plan_strategy(Some(&off), true, false);
+        let off = SpecRequest {
+            enabled: false,
+            leader_len: None,
+            draft_len: None,
+            thread_id: None,
+            profile_id: None,
+        };
+        let (_, fb, want, _) = plan_strategy(Some(&off), true, false, false);
         assert_eq!(fb, Some("disabled"));
         assert!(want);
         // absent -> plain, no metrics surface
-        let (_, fb, want, _) = plan_strategy(None, true, false);
+        let (_, fb, want, _) = plan_strategy(None, true, false, false);
         assert!(fb.is_none());
         assert!(!want);
+    }
+
+    #[test]
+    fn plan_strategy_json_mode_gates_speculation_off() {
+        // #572: JSON mode runs a grammar-constrained sampler, so the
+        // drafter must not engage even when requested + greedy. The
+        // fallback reason names the JSON gate, distinct from the
+        // tool-choice gate, and is checked first.
+        let s = SpecRequest {
+            enabled: true,
+            leader_len: None,
+            draft_len: None,
+            thread_id: None,
+            profile_id: None,
+        };
+        let (st, fb, want, _) = plan_strategy(Some(&s), true, false, true);
+        assert!(matches!(st, DecodeStrategy::Plain));
+        assert_eq!(fb, Some("json_constrained"));
+        assert!(want, "a requested-but-inactive run still surfaces metrics");
+        // json_mode wins the precedence even if forced_tool were somehow
+        // also set (they are 400-rejected upstream, but the gate is
+        // defensive): the reported reason is `json_constrained`.
+        let (_, fb, _, _) = plan_strategy(Some(&s), true, true, true);
+        assert_eq!(fb, Some("json_constrained"));
+    }
+
+    // ─── response_format (#572) ───────────────────────────────
+
+    fn req_with_response_format(body: &str) -> ChatCompletionsRequest {
+        serde_json::from_str(body).expect("valid request JSON")
+    }
+
+    #[test]
+    fn json_mode_detected_for_object_and_schema() {
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"}}"#,
+        );
+        assert!(json_mode(&r));
+
+        // #619: json_schema is also a constrained mode.
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema",
+                "json_schema":{"schema":{"type":"object"}}}}"#,
+        );
+        assert!(json_mode(&r));
+
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"text"}}"#,
+        );
+        assert!(!json_mode(&r));
+
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert!(!json_mode(&r), "absent response_format is not JSON mode");
+        assert!(r.response_format.is_none());
+    }
+
+    #[test]
+    fn json_constraint_schema_maps_each_mode() {
+        // #619: json_object → object-root schema, never a bare scalar.
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"}}"#,
+        );
+        assert_eq!(
+            json_constraint_schema(&r).as_deref(),
+            Some(JSON_OBJECT_ROOT_SCHEMA)
+        );
+
+        // json_schema → the caller's schema, serialized.
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema",
+                "json_schema":{"name":"answer",
+                "schema":{"type":"object","properties":{"answer":{"type":"string"}}}}}}"#,
+        );
+        let schema = json_constraint_schema(&r).expect("json_schema yields a schema");
+        let parsed: serde_json::Value = serde_json::from_str(&schema).unwrap();
+        assert_eq!(parsed["type"], "object");
+        assert_eq!(parsed["properties"]["answer"]["type"], "string");
+
+        // text / absent → no constraint schema.
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"text"}}"#,
+        );
+        assert!(json_constraint_schema(&r).is_none());
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert!(json_constraint_schema(&r).is_none());
+    }
+
+    #[test]
+    fn json_object_root_schema_forbids_bare_scalar() {
+        // #619 contract: the object-root schema is a JSON object whose
+        // type is "object" with additionalProperties allowed — so a bare
+        // scalar (the bug) cannot satisfy the compiled grammar, while
+        // arbitrary object contents still can.
+        let v: serde_json::Value = serde_json::from_str(JSON_OBJECT_ROOT_SCHEMA).unwrap();
+        assert_eq!(v["type"], "object");
+        assert_eq!(v["additionalProperties"], true);
+    }
+
+    #[test]
+    fn validate_response_format_accepts_supported_and_default() {
+        // absent -> ok
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert!(validate_response_format(&r).is_ok());
+        // text -> ok (explicit no-op)
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"text"}}"#,
+        );
+        assert!(validate_response_format(&r).is_ok());
+        // json_object -> ok
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"}}"#,
+        );
+        assert!(validate_response_format(&r).is_ok());
+        // #619: json_schema with a schema -> ok
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema",
+                "json_schema":{"schema":{"type":"object"}}}}"#,
+        );
+        assert!(validate_response_format(&r).is_ok());
+    }
+
+    #[test]
+    fn validate_response_format_rejects_json_schema_without_object_root() {
+        // #619 F1: json_schema is accepted only when schema is a JSON object
+        // with "type":"object". Anything that does NOT pin an object root
+        // would compile to an accept-everything grammar (a bare scalar
+        // satisfies it) — the exact hole #619 closes — so it is a 400
+        // invalid_request.
+        let reject = |body: &str| {
+            let r = req_with_response_format(body);
+            let (code, _msg, param) = validate_response_format(&r).unwrap_err();
+            assert_eq!(code, "invalid_request", "body={body}");
+            assert_eq!(param, "response_format", "body={body}");
+        };
+
+        // missing schema member entirely
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema"}}"#,
+        );
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"name":"x"}}}"#,
+        );
+        // empty object schema -> non-constraining (visit_any), no object root
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{}}}}"#,
+        );
+        // null schema
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":null}}}"#,
+        );
+        // schema with keywords but no object root (type defaults to any)
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"description":"x"}}}}"#,
+        );
+        // scalar / array roots
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"string"}}}}"#,
+        );
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"array"}}}}"#,
+        );
+
+        // #619 review F1: composition/literal keywords win over type:object
+        // in the host compiler, so they reopen the bare-scalar hole and must
+        // be rejected even alongside "type":"object".
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","enum":["a","b"]}}}}"#,
+        );
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","oneOf":[{"type":"string"}]}}}}"#,
+        );
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","anyOf":[{"type":"number"}]}}}}"#,
+        );
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","const":"hi"}}}}"#,
+        );
+        reject(
+            r##"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","$ref":"#/$defs/x"}}}}"##,
+        );
+        // #619 review v3 F1: a union mixing object with a non-`null` scalar
+        // admits a bare string -> rejected (the ["object","null"] accept
+        // below is the deliberate exception).
+        reject(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":["object","string"]}}}}"#,
+        );
+
+        // object root -> accepted
+        let accept = |body: &str| {
+            let r = req_with_response_format(body);
+            assert!(validate_response_format(&r).is_ok(), "body={body}");
+        };
+        accept(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema",
+                "json_schema":{"schema":{"type":"object",
+                "properties":{"answer":{"type":"string"}}}}}}"#,
+        );
+        // #619 review F2: array type containing object (nullable object) and
+        // a typeless schema inferred as object from `properties` both route
+        // to an object grammar in the compiler, so both are accepted.
+        // review v3 F1 (deliberate): ["object","null"] is honored because the
+        // caller explicitly opted into a `null` answer — null is the ONLY
+        // non-object scalar permitted; ["object","string"] above stays
+        // rejected, and json_object mode is never nullable.
+        accept(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"type":["object","null"]}}}}"#,
+        );
+        accept(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema","json_schema":{"schema":{"properties":{"answer":{"type":"string"}}}}}}"#,
+        );
+    }
+
+    #[test]
+    fn validate_response_format_rejects_unknown_type() {
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"banana"}}"#,
+        );
+        let (code, _msg, param) = validate_response_format(&r).unwrap_err();
+        assert_eq!(code, "response_format_unsupported");
+        assert_eq!(param, "response_format");
+    }
+
+    #[test]
+    fn validate_response_format_rejects_json_plus_forced_tool() {
+        // json_object + tool_choice:"required" -> 400 invalid_request
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"},
+                "tool_choice":"required",
+                "tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}"#,
+        );
+        let (code, _msg, param) = validate_response_format(&r).unwrap_err();
+        assert_eq!(code, "invalid_request");
+        assert_eq!(param, "response_format");
+
+        // json_object + tool_choice:{named} -> rejected too
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"},
+                "tool_choice":{"type":"function","function":{"name":"f"}}}"#,
+        );
+        assert_eq!(validate_response_format(&r).unwrap_err().0, "invalid_request");
+
+        // json_object + tool_choice:"auto" -> NOT forced, so allowed
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"},
+                "tool_choice":"auto"}"#,
+        );
+        assert!(validate_response_format(&r).is_ok());
+
+        // #619: json_schema + forced tool_choice -> rejected the same way
+        let r = req_with_response_format(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_schema",
+                "json_schema":{"schema":{"type":"object"}}},
+                "tool_choice":"required",
+                "tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}"#,
+        );
+        assert_eq!(validate_response_format(&r).unwrap_err().0, "invalid_request");
+    }
+
+    // ─── two-phase JSON decode contract (#572 F1/F2/F3) ──────────
+    //
+    // The full `run_json_phase` loop needs a live `inferlet::Generator` +
+    // chat/reasoning decoders bound to a real model, so it stays covered by
+    // the dummy/HTTP e2e and the opt-in real-model smoke (incl. the
+    // tiny-budget mid-`<think>` regression). The pure decision points it
+    // feeds — forward-error classification, the empty-output guard, the
+    // shared-budget split, and the pure-failure status — are isolated here so
+    // each contract is asserted deterministically without an engine.
+
+    fn json_phase_result(
+        outcome: Outcome,
+        error_diag: Option<(&'static str, String)>,
+        produced_content: bool,
+    ) -> JsonPhaseResult {
+        JsonPhaseResult {
+            outcome,
+            error_diag,
+            disconnected: false,
+            tokens_generated: 0,
+            produced_content,
+        }
+    }
+
+    #[test]
+    fn json_forward_error_classifies_server_busy_vs_generic() {
+        // F1: the same sentinel the canonical loop honors must drive the JSON
+        // path's terminal code (run_json_phase calls this on both the
+        // `next()` and `execute()` error arms).
+        assert_eq!(
+            classify_forward_error("server_busy: KV page acquisition timed out after 120s"),
+            SERVER_BUSY_CODE
+        );
+        assert_eq!(
+            classify_forward_error("GenStep::execute forward: device queue fault"),
+            "forward_pass_failed"
+        );
+    }
+
+    #[test]
+    fn json_pure_failure_status_maps_server_busy_to_503() {
+        // F1: over-capacity backpressure is retryable (503); every other
+        // pure failure is a hard 500 — mirrors the canonical branch.
+        assert_eq!(json_pure_failure_status(SERVER_BUSY_CODE), 503);
+        assert_eq!(json_pure_failure_status("forward_pass_failed"), 500);
+        assert_eq!(json_pure_failure_status("decode_failed"), 500);
+    }
+
+    #[test]
+    fn json_aborted_outcome_finishes_as_error() {
+        // F4: an aborted phase must surface finish_reason "error" (the
+        // streaming final-chunk + non-stream choice both read this).
+        assert_eq!(Outcome::Aborted.finish_reason(), "error");
+        assert_eq!(Outcome::Natural.finish_reason(), "stop");
+        assert_eq!(Outcome::MaxTokens.finish_reason(), "length");
+    }
+
+    #[test]
+    fn json_phase2_budget_shares_ceiling_and_floors() {
+        // F2: Phase 2 gets the remainder of the shared ceiling…
+        assert_eq!(json_phase2_budget(2048, 100), 1948);
+        // …and total stays within the request bound when Phase 1 is cheap.
+        assert!(100 + json_phase2_budget(2048, 100) <= 2048);
+        // …but a Phase 1 that burned (nearly) everything still leaves a floor
+        // so the constrained answer is never budgeted to zero.
+        assert_eq!(json_phase2_budget(2048, 2048), JSON_PHASE2_MIN_TOKENS);
+        assert_eq!(json_phase2_budget(16, 16), JSON_PHASE2_MIN_TOKENS);
+        assert_eq!(json_phase2_budget(10, 9999), JSON_PHASE2_MIN_TOKENS);
+    }
+
+    #[test]
+    fn json_phase2_finalize_flags_empty_output_as_error() {
+        // F3: a clean phase that emitted no content is a contract failure for
+        // json_object — reclassified as an explicit error, not a 200/"".
+        for outcome in [Outcome::Natural, Outcome::MaxTokens] {
+            let (o, diag, _) = json_phase2_finalize(json_phase_result(outcome, None, false));
+            assert_eq!(o, Outcome::Aborted);
+            assert_eq!(diag.unwrap().0, JSON_EMPTY_OUTPUT_CODE);
+        }
+    }
+
+    #[test]
+    fn json_phase2_finalize_passes_through_content_and_errors() {
+        // Produced content → success passes through untouched.
+        let (o, diag, _) =
+            json_phase2_finalize(json_phase_result(Outcome::Natural, None, true));
+        assert_eq!(o, Outcome::Natural);
+        assert!(diag.is_none());
+
+        // An existing error is preserved (never masked by the empty guard).
+        let (o, diag, _) = json_phase2_finalize(json_phase_result(
+            Outcome::Aborted,
+            Some(("forward_pass_failed", "boom".into())),
+            false,
+        ));
+        assert_eq!(o, Outcome::Aborted);
+        assert_eq!(diag.unwrap().0, "forward_pass_failed");
+
+        // A server_busy abort survives finalize so the 503 mapping still fires.
+        let (_, diag, _) = json_phase2_finalize(json_phase_result(
+            Outcome::Aborted,
+            Some((SERVER_BUSY_CODE, "busy".into())),
+            false,
+        ));
+        assert_eq!(json_pure_failure_status(diag.unwrap().0), 503);
     }
 
     #[test]
@@ -3493,7 +7111,10 @@ mod tests {
             "_schema_version must be JSON string, got {:?}",
             frame["_schema_version"]
         );
-        assert_eq!(frame["_schema_version"].as_str().unwrap(), HEARTBEAT_SCHEMA_VERSION);
+        assert_eq!(
+            frame["_schema_version"].as_str().unwrap(),
+            HEARTBEAT_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -3561,21 +7182,29 @@ mod tests {
         // the number as authoritative (per the W1 stability policy
         // "absent *_measured ≡ measured:true").
         let all = fallback_serialize_failed_payload(Some(1), Some(2), Some(3), Some(4));
-        let frame_all = serde_json::from_str::<serde_json::Value>(&all).unwrap()
-            .as_array().unwrap()[0].clone();
+        let frame_all = serde_json::from_str::<serde_json::Value>(&all)
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .clone();
         assert_eq!(frame_all["entries_lost_total_authoritative"], true);
 
         let partial = fallback_serialize_failed_payload(Some(5), None, None, None);
-        let frame_partial = serde_json::from_str::<serde_json::Value>(&partial).unwrap()
-            .as_array().unwrap()[0].clone();
+        let frame_partial = serde_json::from_str::<serde_json::Value>(&partial)
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .clone();
         assert_eq!(frame_partial["entries_lost_total_authoritative"], false);
 
         // One unmeasured slot is enough to flip the flag — even
         // if the other three are measured.
-        let three_measured =
-            fallback_serialize_failed_payload(Some(1), Some(2), Some(3), None);
-        let frame_three = serde_json::from_str::<serde_json::Value>(&three_measured).unwrap()
-            .as_array().unwrap()[0].clone();
+        let three_measured = fallback_serialize_failed_payload(Some(1), Some(2), Some(3), None);
+        let frame_three = serde_json::from_str::<serde_json::Value>(&three_measured)
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .clone();
         assert_eq!(frame_three["entries_lost_total_authoritative"], false);
     }
 
@@ -3585,8 +7214,11 @@ mod tests {
         // accidental int/string conversion fires here instead of
         // silently breaking dashboards.
         let s = fallback_serialize_failed_payload(Some(0), Some(0), Some(0), Some(0));
-        let frame = serde_json::from_str::<serde_json::Value>(&s).unwrap()
-            .as_array().unwrap()[0].clone();
+        let frame = serde_json::from_str::<serde_json::Value>(&s)
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .clone();
         assert!(
             frame["entries_lost_total_authoritative"].is_boolean(),
             "entries_lost_total_authoritative must be JSON boolean, got {:?}",
@@ -3605,8 +7237,7 @@ mod tests {
         // `f64::NAN` interpolation, etc.) fires this assertion
         // before consumers notice. Schema-version stability
         // depends on it.
-        let unmeasured =
-            fallback_serialize_failed_payload(Some(7), None, None, None);
+        let unmeasured = fallback_serialize_failed_payload(Some(7), None, None, None);
         let frame = serde_json::from_str::<serde_json::Value>(&unmeasured)
             .unwrap()
             .as_array()
@@ -3679,8 +7310,7 @@ mod tests {
         // extend the `expected` set in this test in the SAME commit.
         // The two-side update is the policy gate.
         use std::collections::BTreeSet;
-        let observed: BTreeSet<&'static str> =
-            STABLE_LAUNCH_DIAG_CODES.iter().copied().collect();
+        let observed: BTreeSet<&'static str> = STABLE_LAUNCH_DIAG_CODES.iter().copied().collect();
         let expected: BTreeSet<&'static str> = [
             "clock_skew",
             "clock_skew_fallback_entropy",
@@ -3748,11 +7378,8 @@ mod tests {
             "arr[0] is not the heartbeat (code={:?})",
             arr[0]["code"]
         );
-        let entry = arr[1]
-            .as_object()
-            .expect("arr[1] must be a JSON object");
-        let observed: BTreeSet<&str> =
-            entry.keys().map(String::as_str).collect();
+        let entry = arr[1].as_object().expect("arr[1] must be a JSON object");
+        let observed: BTreeSet<&str> = entry.keys().map(String::as_str).collect();
         let expected: BTreeSet<&str> = ["code", "message"].into_iter().collect();
         assert_eq!(
             observed, expected,
@@ -3841,20 +7468,16 @@ mod tests {
         // the test calls the extracted helper directly — same pattern
         // as the W2 fallback wire-type pins above.
         use std::collections::BTreeSet;
-        let frame =
-            serialize_fail_sentinel(&[("monotonic_clock_stubbed", "stub".to_string())]);
+        let frame = serialize_fail_sentinel(&[("monotonic_clock_stubbed", "stub".to_string())]);
         let observed: BTreeSet<&str> = frame
             .as_object()
             .expect("sentinel must be a JSON object")
             .keys()
             .map(String::as_str)
             .collect();
-        let expected: BTreeSet<&str> = [
-            "_serialize_failed",
-            "_serialize_failed_codes",
-        ]
-        .into_iter()
-        .collect();
+        let expected: BTreeSet<&str> = ["_serialize_failed", "_serialize_failed_codes"]
+            .into_iter()
+            .collect();
         assert_eq!(
             observed, expected,
             "serialize-fail sentinel field-name drift — see the schema contract \
@@ -3896,15 +7519,10 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        let expected: BTreeSet<&str> = [
-            "code",
-            "_schema_version",
-            "scope",
-            "launched_at",
-            "message",
-        ]
-        .into_iter()
-        .collect();
+        let expected: BTreeSet<&str> =
+            ["code", "_schema_version", "scope", "launched_at", "message"]
+                .into_iter()
+                .collect();
         assert_eq!(
             observed, expected,
             "heartbeat field-name drift — see  MUST4. \

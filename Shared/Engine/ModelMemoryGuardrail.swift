@@ -79,6 +79,12 @@ public enum ModelMemoryGuardrail {
                                    fraction: Double = defaultRAMFraction,
                                    reserveBytes: Int64 = defaultReserveBytes) -> Policy {
       guard let physical = physicalMemoryBytes, physical > 0 else {
+        // Genuine failure, not the unset state: host RAM was unreadable (or
+        // non-positive), so the RAM-aware ceiling can't be derived and we fall
+        // back to the fixed legacy ceiling. Leave a breadcrumb — silently
+        // enforcing a stale 8 GiB cap on an unknown host is the kind of mute
+        // degradation an operator can't otherwise diagnose (#333).
+        Log.store.warning("guardrail: physical RAM unknown (reported \(physicalMemoryBytes ?? -1, privacy: .public)); using fixed \(unknownRAMFallbackBytes, privacy: .public)-byte fallback ceiling")
         return Policy(maxResolvedModelBytes: unknownRAMFallbackBytes)
       }
       let usable = max(0, physical - reserveBytes)
@@ -109,6 +115,71 @@ public enum ModelMemoryGuardrail {
   /// `memoryPolicy` seam) so their fixtures never depend on real RAM.
   public static let defaultPolicy = Policy.recommended(
     physicalMemoryBytes: SystemMemory.physicalBytes())
+
+  /// Production policy honoring the operator's *Settings → Models* dial
+  /// fraction (persisted as `guardrail.json`). Reads the fraction FRESH
+  /// each call — unlike `defaultPolicy` (a `static let` pinned to the 0.65
+  /// default) — so a dial change applies with no restart. This is the
+  /// single derivation the Helper's launch-time guard and the
+  /// ProfileEditor picker badge both call, so the displayed "exceeds …"
+  /// ceiling and the enforced gate can never disagree (#334).
+  ///
+  /// An absent `guardrail.json` is the legitimate unset state → default
+  /// fraction, no signal. A present-but-unreadable/corrupt file must not
+  /// brick either surface, so it also falls back to the default — but logs
+  /// the lost operator ceiling rather than reverting silently (the
+  /// operator-visible signal lives in the Settings dial, which reads
+  /// `loadFraction` directly). A *support-root resolution failure*
+  /// (`rootMkdirFailed`) is an environmental fault, not an unset dial, so
+  /// the default-arg resolver logs it too instead of laundering it
+  /// to a silent `nil` via `try?`. `root` and `physicalMemoryBytes` are
+  /// injectable so tests pin a fixed RAM + fraction instead of depending on
+  /// the host; an explicitly-injected `nil` root stays silent (it is a
+  /// caller choice, not a resolution failure).
+  public static func livePolicy(
+    root: URL? = resolvedSupportRootOrLogged(),
+    physicalMemoryBytes: Int64? = SystemMemory.physicalBytes()
+  ) -> Policy {
+    if root == nil {
+      // Genuine failure, not the unset state: the support root itself couldn't
+      // be resolved (the default arg's `try?` swallowed the throw), so we can't
+      // even look for the operator's persisted fraction and fall back to the
+      // default at this authoritative load-time gate. Distinct from a resolved
+      // root with no `guardrail.json` (the legitimate unset case, which stays
+      // silent). Breadcrumb so the lost dial isn't a mute degradation (#333).
+      Log.store.warning("guardrail: application-support root unavailable; using default fraction \(GuardrailSettings.defaultFraction, privacy: .public) (operator dial not read)")
+    }
+    let fraction: Double
+    do {
+      fraction = try root.map { try GuardrailSettings.loadFraction(root: $0) }
+        ?? GuardrailSettings.defaultFraction
+    } catch {
+      Log.store.error("guardrail.json present but unreadable/corrupt; using default fraction \(GuardrailSettings.defaultFraction, privacy: .public): \(String(describing: error), privacy: .public)")
+      fraction = GuardrailSettings.defaultFraction
+    }
+    return Policy.recommended(physicalMemoryBytes: physicalMemoryBytes, fraction: fraction)
+  }
+
+  /// Resolve the support root for the live guardrail read, logging a
+  /// root mkdir/resolution failure before falling back to `nil` (→ default
+  /// fraction). Replaces the bare `try? PieDirs.applicationSupport()`
+  /// default arg, which laundered a real environmental fault into the same
+  /// silent path as a legitimately-unset dial. The Helper also
+  /// logs this at boot via `eagerProbePieDirs`; this routes the
+  /// guardrail-specific read — shared by the Helper launch guard and the
+  /// App's ProfileEditor/Models dial — through the same `Log.store` channel
+  /// as the corrupt-file catch above. `public` only because it is the
+  /// default-argument resolver for `livePolicy` (Swift requires a public
+  /// function's default-arg expression to reference public symbols); not
+  /// intended as a general-purpose API.
+  public static func resolvedSupportRootOrLogged() -> URL? {
+    do {
+      return try PieDirs.applicationSupport()
+    } catch {
+      Log.store.error("guardrail support root unavailable; using default fraction \(GuardrailSettings.defaultFraction, privacy: .public): \(String(describing: error), privacy: .public)")
+      return nil
+    }
+  }
 
   private struct SizeSummary {
     var totalBytes: Int64
@@ -166,6 +237,14 @@ public enum ModelMemoryGuardrail {
       ))
     }
     return .success(())
+  }
+
+  /// Total resolved artifact size in bytes (the weight footprint), or
+  /// `nil` if it can't be measured. Reuses the same traversal as
+  /// `validate`; used by `KVCacheBudget` to size the KV token ceiling.
+  public static func resolvedBytes(resolvedModelURL: URL,
+                                   fileManager: FileManager = .default) -> Int64? {
+    (try? summarize(resolvedModelURL: resolvedModelURL, fileManager: fileManager))?.totalBytes
   }
 
   private static func summarize(resolvedModelURL: URL,

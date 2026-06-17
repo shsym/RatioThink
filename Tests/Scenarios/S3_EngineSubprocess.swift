@@ -14,12 +14,10 @@ import RatioThinkCore
 ///                                    after a successful launch is a
 ///                                    chat-apc / driver registration
 ///                                    regression, not a skip).
-///   3. `POST /v1/models/load`      — cold-load weights via the
-///                                    portable driver under a 90s
-///                                    timeout (review v1 F14 — a hung
-///                                    stream used to wedge the whole
-///                                    test under XCTest's 300s
-///                                    allowance).
+///   3. `GET  /v1/models`           — confirms the engine advertises the
+///                                    boot model under a 90s timeout
+///                                    (#469: pie binds the served model at
+///                                    boot; there is no `/v1/models/load`).
 ///   4. `POST /v1/chat/completions` — drain the SSE stream and assert
 ///                                    at least one `.delta` arrived
 ///                                    AND the accumulated tokens look
@@ -53,10 +51,10 @@ public enum S3_EngineSubprocess {
     do {
       try await runSteps(r, port: port, session: session)
       try await r.step("session shutdown clean") {
-        await session.shutdown()
+        _ = await session.shutdown()
       }
     } catch {
-      await session.shutdown()
+      _ = await session.shutdown()
       throw error
     }
   }
@@ -95,19 +93,14 @@ public enum S3_EngineSubprocess {
     // for traceability via an inline log line.
     let chatModel = try await Self.resolveChatModel(r: r, client: client)
 
-    try await r.step("load \(chatModel) (≤90s)") {
-      try await S3_EngineSubprocess.withTimeout(seconds: 90, label: "loadModel(\(chatModel))") {
-        var sawReady = false
-        for try await event in client.loadModel(chatModel) {
-          switch event {
-          case .loading:
-            continue
-          case .ready:
-            sawReady = true
-          }
-        }
-        try r.require(sawReady,
-                      "loadModel(\(chatModel)) stream ended without a .ready event")
+    try await r.step("engine serves \(chatModel) (boot model; ≤90s)") {
+      // #469: v1 pie binds the served model at `pie serve` boot, so there is
+      // no `/v1/models/load` to drive — confirm the engine advertises the
+      // boot model on `GET /v1/models` (the only id its chat endpoint accepts).
+      try await S3_EngineSubprocess.withTimeout(seconds: 90, label: "models(\(chatModel))") {
+        let served = try await client.models().map(\.id)
+        try r.require(served.contains(chatModel),
+                      "engine did not advertise the boot model \(chatModel); served=\(served)")
       }
     }
 
@@ -130,11 +123,13 @@ public enum S3_EngineSubprocess {
         // Qwen3-0.6B ignores `/no_think` in the user prompt, so the
         // only knob is generated-token headroom.
         //
-        // 8192 is chat-apc's `MAX_MAX_TOKENS` ceiling — the largest
-        // value the inferlet will accept without 400ing the
-        // request. With Qwen3-0.6B Metal this leaves enough room
-        // for the thinking chain on trivial prompts (~3–6k tokens
-        // observed) plus a short visible answer (~10 tokens)
+        // 8192 is a generous generated-token budget, comfortably under
+        // chat-apc's per-request ceiling. That ceiling is no longer a
+        // hardcoded 8192 — since #438 it follows the engine's launch-time
+        // KV-cache capacity via `runtime::max-output-tokens` (≥ 32768 by
+        // default), so 8192 is always accepted. With Qwen3-0.6B Metal this
+        // leaves enough room for the thinking chain on trivial prompts
+        // (~3–6k tokens observed) plus a short visible answer (~10 tokens)
         // before the model emits `<|im_end|>` for a clean `.stop`.
         //
         // If a future Qwen3 build runs longer reasoning chains and
@@ -186,7 +181,7 @@ public enum S3_EngineSubprocess {
           reasoning += text
         case let .finish(reason):
           finishReason = reason
-        case .modelLoading, .modelReady:
+        case .generationMetrics, .modelLoading, .modelReady, .specMetrics:
           continue
         }
       }

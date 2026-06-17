@@ -11,8 +11,12 @@
 //!   * `POST   /v1/chat/completions` -> `chat::completions`
 //!   * `POST   /v1/inferlet`         -> `chat::dispatch`
 //!         (`inferlet:"chat-apc"` | `inferlet:"tree-of-thought"`)
-//!   * `POST   /v1/models/load`      -> `control::load` (SSE: model_ready)
-//!   * `DELETE /v1/models/load`      -> `control::load` (204 no-op)
+//!
+//! #469: there is NO `/v1/models/load`. pie binds the served model at
+//! `pie serve` boot, so the served model is fixed by the boot config and
+//! readable from `GET /v1/models`; switching it is an engine relaunch, not a
+//! runtime load. The dead pre-warm endpoint (and the App-side load progress /
+//! Cancel UI) were removed.
 //!
 //! Module split:
 //!   * `control/` — touches only `inferlet::runtime` + `pie:core/model`.
@@ -28,6 +32,7 @@
 //! Sampler/chat-templating/Generator. Keeping everything WASM-side
 //! means no pie-side commits on `pie.app/v1-base` for the v1 cut.
 
+mod bestofn;
 mod chat;
 mod control;
 mod sse;
@@ -47,8 +52,6 @@ async fn main(req: Request<IncomingBody>, res: Responder) -> Finished {
         (Method::GET, "/v1/models") => control::models::handle(res).await,
         (Method::POST, "/v1/chat/completions") => chat::completions::handle(req, res).await,
         (Method::POST, "/v1/inferlet") => chat::dispatch::handle(req, res).await,
-        (Method::POST, "/v1/models/load") => control::load::handle_post(req, res).await,
-        (Method::DELETE, "/v1/models/load") => control::load::handle_delete(res).await,
         _ => not_found(res, &method, &path).await,
     }
 }

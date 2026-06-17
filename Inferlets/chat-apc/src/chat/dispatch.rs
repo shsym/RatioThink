@@ -12,16 +12,17 @@
 //! }
 //! ```
 //!
-//! **V1 narrow:** the only `inferlet` name accepted is `"chat-apc"`,
-//! which routes into [`crate::chat::handle_parsed`]. The dispatch
-//! body is rebuilt into a `ChatCompletionsRequest` by merging
-//! `messages` (top-level chat sugar) with optional sampling fields
-//! from `input` (the inferlet-specific payload). Unknown names →
+//! **V1 narrow:** two `inferlet` names are accepted — `"chat-apc"`,
+//! which routes into [`crate::chat::handle_parsed`], and
+//! `"tree-of-thought"`, which routes into [`crate::tot::dispatch`]. The
+//! chat-apc dispatch body is rebuilt into a `ChatCompletionsRequest` by
+//! merging `messages` (top-level chat sugar) with optional sampling
+//! fields from `input` (the inferlet-specific payload). Unknown names →
 //! 404 `inferlet_not_found`.
 //!
 //! True dynamic dispatch (load arbitrary wasm by name from
 //! `--inferlet-dir`) requires pie-side host changes and is tracked
-//! in 's follow-up. The endpoint exists in v1 so the Swift
+//! as a follow-up. The endpoint exists in v1 so the Swift
 //! `EngineClient.dispatchInferlet` surface has somewhere to land —
 //! adding more names later is a pure-inferlet edit.
 
@@ -54,6 +55,9 @@ struct ChatApcInput {
     tools: Option<Vec<ToolSchema>>,
     tool_choice: Option<serde_json::Value>,
     speculation: Option<SpecRequest>,
+    /// #522 cross-request KV prefix-cache directive (see
+    /// [`super::prefix_cache`]). Optional on the dispatch surface too.
+    cache: Option<super::prefix_cache::CacheDirective>,
 }
 
 pub async fn handle(req: Request<IncomingBody>, res: Responder) -> Finished {
@@ -80,12 +84,16 @@ pub async fn handle(req: Request<IncomingBody>, res: Responder) -> Finished {
         "tree-of-thought" => {
             crate::tot::dispatch(dispatch.input, dispatch.messages, dispatch.stream, res).await
         }
+        "best-of-n" => {
+            crate::bestofn::dispatch(dispatch.input, dispatch.messages, dispatch.stream, res).await
+        }
         other => res
             .respond(sse::json_error(
                 404,
                 "inferlet_not_found",
                 &format!(
-                    "Inferlet '{other}' not available. V1 supports 'chat-apc' and 'tree-of-thought'."
+                    "Inferlet '{other}' not available. V1 supports 'chat-apc', 'tree-of-thought', \
+                     and 'best-of-n'."
                 ),
             ))
             .await,
@@ -164,9 +172,16 @@ async fn dispatch_chat_apc(dispatch: InferletDispatch, res: Responder) -> Finish
         temperature: input.temperature,
         top_p: input.top_p,
         max_tokens: input.max_tokens,
+        max_completion_tokens: None,
         tools: input.tools,
         tool_choice: input.tool_choice,
         speculation: input.speculation,
+        cache: input.cache,
+        // Tree-of-thought drives its own constrained scoring grammar and
+        // never asks for JSON-mode answer decoding (#572) — keep this
+        // dispatch path unconstrained so ToT is unaffected.
+        response_format: None,
+        stream_options: None,
     };
     completions::handle_parsed(request, res).await
 }

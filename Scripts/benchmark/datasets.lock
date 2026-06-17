@@ -1,0 +1,104 @@
+{
+  "_about": "Pinned PUBLIC datasets for the spec-decode benefit matrix (#652). Regenerate with Scripts/benchmark/prep_<key>.sh. content_sha256 is the no-cherrypick proof: re-emission of the pinned revision must reproduce count + hash.",
+  "datasets": {
+    "cnndm": {
+      "bound": "full",
+      "bound_rationale": "Full 11490-article 3.0.0 test split emitted. No published smaller standard subset exists, so the FULL split is the prompt set; runtime coverage is bounded+disclosed by the harness MAX_PROMPTS cap, not by a prep-time pick.",
+      "category": "summarize",
+      "citation": "Hermann et al. (2015) / See et al. (2017). CNN/DailyMail 3.0.0.",
+      "config": "3.0.0",
+      "content_sha256": "74a75c4281a920c050160f70bcb22f4e7f91ecd413c460372dc2ae8a0e772775",
+      "count": 11490,
+      "hf_repo": "abisee/cnn_dailymail",
+      "license": "apache-2.0",
+      "revision": "96df5e686bee6baa90b8bee7c28b81fa3fa6223d",
+      "splits": [
+        "test"
+      ],
+      "think": false
+    },
+    "gsm8k": {
+      "bound": "full",
+      "bound_rationale": "Full canonical 1319-problem test split; Qwen3 thinking ON.",
+      "category": "reasoning",
+      "citation": "Cobbe et al., Training Verifiers to Solve Math Word Problems (2021).",
+      "config": "main",
+      "content_sha256": "43fd47bc6c309f7a0de146ea6373e5961ef7fc7d8aea8d88528aea57e3be51d9",
+      "count": 1319,
+      "hf_repo": "openai/gsm8k",
+      "license": "mit",
+      "revision": "740312add88f781978c0658806c59bc2815b9866",
+      "splits": [
+        "test"
+      ],
+      "think": true
+    },
+    "humaneval": {
+      "bound": "full",
+      "bound_rationale": "Full canonical 164-problem test split.",
+      "category": "code",
+      "citation": "Chen et al., Evaluating LLMs Trained on Code (2021). 164 problems.",
+      "config": null,
+      "content_sha256": "e867b22d4ac30a91c87d2a981faee8fe67dbce6cacc23ba465c8233a5c9fcf4d",
+      "count": 164,
+      "hf_repo": "openai/openai_humaneval",
+      "license": "mit",
+      "revision": "7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544",
+      "splits": [
+        "test"
+      ],
+      "think": false
+    },
+    "jsonschema": {
+      "bound": "full",
+      "bound_rationale": "Full `default`-config test split.",
+      "category": "structured",
+      "citation": "Geng et al., JSONSchemaBench (2025). default config, test split.",
+      "config": "default",
+      "content_sha256": "fd49ef94cff65817e1f15d2256366d941bc5e56db2389a183090542bbee95410",
+      "count": 2867,
+      "hf_repo": "epfl-dlab/JSONSchemaBench",
+      "license": "mit",
+      "revision": "5bd0f4640badc6f3f02df796421d21cb0ca0b141",
+      "splits": [
+        "test"
+      ],
+      "think": false
+    },
+    "mbpp": {
+      "bound": "full",
+      "bound_rationale": "All four `full`-config splits concatenated in task_id order = 974, the whole MBPP dataset (the ticket's count). No subsetting.",
+      "category": "code",
+      "citation": "Austin et al., Program Synthesis with Large Language Models (2021).",
+      "config": "full",
+      "content_sha256": "ecb0c3fbac411277f69c5d3c9c34cc7248e4ac0a03f8488270424981573dad6c",
+      "count": 974,
+      "hf_repo": "google-research-datasets/mbpp",
+      "license": "cc-by-4.0",
+      "revision": "4bb6404fdc6cacfda99d4ac4205087b89d32030c",
+      "splits": [
+        "train",
+        "test",
+        "validation",
+        "prompt"
+      ],
+      "think": false
+    },
+    "mtbench": {
+      "bound": "full",
+      "bound_rationale": "Full 80-question set; turn-1 user prompt per question.",
+      "category": "chat",
+      "citation": "Zheng et al., MT-Bench / LMSYS (NeurIPS 2023). 80 questions.",
+      "config": null,
+      "content_sha256": "29a6faea6c3b916d48aa277e16389db1d4a9477939ed8df97a8db587e95495ed",
+      "count": 80,
+      "hf_repo": "HuggingFaceH4/mt_bench_prompts",
+      "license": "apache-2.0",
+      "revision": "e3a795c5e9a82ee40611c416b8a7786c73198991",
+      "splits": [
+        "train"
+      ],
+      "think": false
+    }
+  }
+}

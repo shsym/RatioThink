@@ -36,4 +36,102 @@ final class ChatMessageItemNoticeTests: XCTestCase {
     let m = Message(role: "assistant", content: "Hello!", meta: meta("stop"))
     XCTAssertEqual(ChatMessageItem(m).notice, .none)
   }
+
+  func test_item_lifts_generation_performance_from_message_meta() {
+    let meta = try! JSONSerialization.data(withJSONObject: [
+      "finish_reason": "stop",
+      "generation_performance": [
+        "output_tokens": 21,
+        "elapsed_s": 0.5,
+        "tokens_per_sec": 42.0,
+      ],
+    ])
+    let item = ChatMessageItem(Message(role: "assistant", content: "Hello!", meta: meta))
+
+    XCTAssertEqual(item.generationPerformanceText, "42 tok/s")
+  }
+
+  func test_item_labels_tot_generation_performance_as_total_throughput() {
+    let item = ChatMessageItem(
+      role: .assistant,
+      content: "4",
+      tot: completedToTTree(),
+      finishReason: "stop",
+      generationPerformance: GenerationMetrics(
+        outputTokens: 84,
+        elapsedSeconds: 2.0,
+        tokensPerSecond: 42.0
+      )
+    )
+
+    XCTAssertEqual(item.generationPerformanceText, "ToT total 42 tok/s")
+  }
+
+  func test_item_hides_tot_generation_performance_until_tree_completes() {
+    let item = ChatMessageItem(
+      role: .assistant,
+      content: "⚠️ failed",
+      tot: failedToTTree(),
+      finishReason: nil,
+      generationPerformance: GenerationMetrics(
+        outputTokens: 84,
+        elapsedSeconds: 2.0,
+        tokensPerSecond: 42.0
+      )
+    )
+
+    XCTAssertNil(item.generationPerformanceText)
+  }
+
+  func test_item_hides_generation_performance_for_missing_cancelled_or_invalid_metrics() {
+    XCTAssertNil(ChatMessageItem(Message(role: "assistant", content: "old")).generationPerformanceText)
+
+    let cancelled = try! JSONSerialization.data(withJSONObject: [
+      "finish_reason": "cancelled",
+      "generation_performance": ["output_tokens": 21, "elapsed_s": 0.5, "tokens_per_sec": 42.0],
+    ])
+    XCTAssertNil(ChatMessageItem(Message(role: "assistant", content: "partial", meta: cancelled)).generationPerformanceText)
+
+    let invalid = try! JSONSerialization.data(withJSONObject: [
+      "finish_reason": "stop",
+      "generation_performance": ["output_tokens": 0, "elapsed_s": 0.5, "tokens_per_sec": 0.0],
+    ])
+    XCTAssertNil(ChatMessageItem(Message(role: "assistant", content: "bad", meta: invalid)).generationPerformanceText)
+
+    let nonFiniteElapsed = ChatMessageItem(
+      role: .assistant,
+      content: "bad",
+      finishReason: "stop",
+      generationPerformance: GenerationMetrics(
+        outputTokens: 21,
+        elapsedSeconds: .infinity,
+        tokensPerSecond: 42.0
+      )
+    )
+    XCTAssertNil(nonFiniteElapsed.generationPerformanceText)
+  }
+
+  private func completedToTTree() -> ToTTree {
+    var tree = ToTTree()
+    tree.apply(.treeStart(id: "tot-1", model: "qwen", breadth: 1, depth: 1, beamWidth: 1))
+    tree.apply(.nodeComplete(ToTNode(
+      id: "tot-n1",
+      parentID: "root",
+      depth: 1,
+      branchIndex: 0,
+      content: "4",
+      score: 9,
+      status: .ok
+    )))
+    tree.apply(.levelPruned(level: 1, kept: ["tot-n1"]))
+    tree.apply(.treeComplete(selectedNodeID: "tot-n1", finalAnswer: "4"))
+    return tree
+  }
+
+  private func failedToTTree() -> ToTTree {
+    var tree = ToTTree()
+    tree.apply(.treeStart(id: "tot-1", model: "qwen", breadth: 1, depth: 1, beamWidth: 1))
+    tree.fail("no answer")
+    return tree
+  }
 }

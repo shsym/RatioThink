@@ -3,7 +3,7 @@ import XCTest
 /// Feature B lifecycle recovery, GUI-facing scenario.
 ///
 /// The existing GUI scenario runner has a stable stale-engine seam:
-/// `PIE_TEST_ENGINE_BASE_URL` lets XCUITest launch RatioThink.app with the
+/// `PIE_TEST_ENGINE_BASE_URL` lets XCUITest launch Rational.app with the
 /// chat HTTP client pointed at an explicit loopback URL. Full real-stack
 /// helper/RatioThink crash injection is not available in the current GUI
 /// framework without broad runner refactors, so this scenario covers the
@@ -35,7 +35,7 @@ final class S279_LifecycleRecoveryGUITests: XCTestCase {
     defer { app.terminate() }
 
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
 
     try createChatAndSend("Trigger stale engine recovery", in: app)
@@ -49,13 +49,7 @@ final class S279_LifecycleRecoveryGUITests: XCTestCase {
       return
     }
 
-    let composer = app.descendants(matching: .any)
-      .matching(identifier: "composer.text")
-      .firstMatch
-    XCTAssertTrue(composer.waitForExistence(timeout: 5),
-                  "composer.text missing after stale engine error; app tree: \(app.debugDescription)")
-    composer.click()
-    composer.typeText("Retry after lifecycle recovery")
+    typeComposerText("Retry after lifecycle recovery", in: app)
 
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5),
@@ -73,23 +67,23 @@ final class S279_LifecycleRecoveryGUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = staleBaseURL
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = "stale-engine-scenario"
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = "stale-engine-scenario"
+    // #504: the send-gate bypass override is gone, so pin the engine `.running`
+    // to PASS the gate for real — but the base URL points at a DEAD port
+    // (127.0.0.1:9), so the send still fails at the socket. The asserted
+    // user-visible outcome (a recoverable connection error + the composer
+    // re-enables) is unchanged; only the injected fault shifts from "engine
+    // never came up" to "engine reports running but is unreachable" — a faithful
+    // stale-engine-config fault.
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
   }
 
+  @MainActor
   private func createChatAndSend(_ prompt: String, in app: XCUIApplication) throws {
-    let newChat = app.buttons["chats.newButton"]
-    XCTAssertTrue(newChat.waitForExistence(timeout: 10),
-                  "New Chat button missing; app tree: \(app.debugDescription)")
-    newChat.click()
+    openFreshChat(in: app)
 
-    let composer = app.descendants(matching: .any)
-      .matching(identifier: "composer.text")
-      .firstMatch
-    XCTAssertTrue(composer.waitForExistence(timeout: 10),
-                  "composer.text missing after creating chat; app tree: \(app.debugDescription)")
-    composer.click()
-    composer.typeText(prompt)
+    typeComposerText(prompt, in: app)
 
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5),
@@ -104,13 +98,11 @@ final class S279_LifecycleRecoveryGUITests: XCTestCase {
     timeout: TimeInterval
   ) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
-    let predicates = needles.map {
-      NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@", $0, $0)
-    }
     while Date() < deadline {
-      if predicates.contains(where: { predicate in
-        app.descendants(matching: .staticText).matching(predicate).count > 0
-      }) {
+      // Message bodies render as one selectable NSTextView each now (#636,
+      // `.textView`) rather than per-block `.staticText`;
+      // `transcriptTextMatchCount` searches both.
+      if needles.contains(where: { transcriptTextMatchCount($0, in: app) > 0 }) {
         return true
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))

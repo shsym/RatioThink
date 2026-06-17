@@ -1,10 +1,19 @@
 #!/bin/bash
+#
+# Resume-history GUI E2E (S275). Drives the App against a deterministic local
+# HTTP harness (resume-history-harness.py) serving canned replies, then verifies
+# multi-turn chat history survives an app relaunch and is re-sent to the engine.
+#
+# Usage: PIE_TEST_TCC_GRANTED=1 Scripts/run-resume-gui-history-e2e.sh
+#   (seated GUI session required)
+# Key env: PIE_TEST_RUN_ROOT (retained run dir), PIE_TEST_CHAT_MODEL_PIN.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
-MODEL="${PIE_TEST_CHAT_MODEL:-resume-deterministic}"
+MODEL="${PIE_TEST_CHAT_MODEL_PIN:-resume-deterministic}"
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p275-history-$$}"
 GUI_HOME="$RUN_ROOT/g"
 URL_FILE="$RUN_ROOT/harness.url"
@@ -22,16 +31,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! pgrep -x Dock >/dev/null 2>&1; then
-  echo "resume gui history e2e: no seated GUI session detected (Dock not running)" >&2
-  exit 2
-fi
-if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "resume gui history e2e: RatioThink.app Automation/Accessibility permissions required." >&2
-  echo "resume gui history e2e: grant Xcode/XCTest runner and RatioThink.app Automation + Accessibility in System Settings, then rerun:" >&2
-  echo "resume gui history e2e: PIE_TEST_TCC_GRANTED=1 Scripts/run-resume-gui-history-e2e.sh" >&2
-  exit 2
-fi
+e2e_require_seated_gui "resume gui history e2e" || exit 2
+e2e_require_tcc "resume gui history e2e" || exit 2
 
 mkdir -p "$GUI_HOME" "$RUN_ROOT"
 rm -f "$URL_FILE" "$REQUEST_LOG" "$CONFIG_FILE"
@@ -65,7 +66,7 @@ BASE_URL="$(cat "$URL_FILE")"
 cat >"$CONFIG_FILE" <<EOF
 PIE_TEST_ENGINE_BASE_URL=$BASE_URL
 PIE_TEST_GUI_HOME=$GUI_HOME
-PIE_TEST_CHAT_MODEL=$MODEL
+PIE_TEST_CHAT_MODEL_PIN=$MODEL
 PIE_TEST_REQUEST_LOG=$REQUEST_LOG
 EOF
 
@@ -79,13 +80,19 @@ echo "resume gui history e2e: request log=$REQUEST_LOG"
 echo "resume gui history e2e: retained run root: $RUN_ROOT"
 echo "resume gui history e2e: running XCUITest"
 
-xcodebuild -project RatioThink.xcodeproj \
+XCODE_LOG="$RUN_ROOT/xcodebuild.log"
+set +e
+e2e_run_gui_xcodebuild "$XCODE_LOG" \
+  -project RatioThink.xcodeproj \
   -scheme RatioThinkGUITests \
   -destination 'platform=macOS,arch=arm64' \
   -parallel-testing-enabled NO \
   test \
   -only-testing:RatioThinkGUITests/S275_MultiTurnResumeGUITests/test_multi_turn_history_survives_relaunch_and_is_sent_to_engine \
   ENABLE_CODE_COVERAGE=NO
+status=$?
+set -e
+[ "$status" -ne 0 ] && exit "$status"
 
 python3 - "$GUI_HOME/chats.sqlite" <<'PY'
 import sqlite3

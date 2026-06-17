@@ -2,20 +2,20 @@ import Foundation
 import os
 import TOMLKit
 
-/// Maps a `profileID` string into a `PieSupervisor.LaunchSpec` that
-/// the helper's `startEngine` selector can hand to the supervisor.
+/// Maps a `profileID` string into a `PieControlLauncher.LaunchSpec`
+/// that the helper's `startEngine` selector can hand to the launcher.
 ///
-/// Pipeline:
+/// Pipeline (`resolveLauncherSpec`):
 ///   1. Look up the matching parsed `Profile` in the injected
 ///      `ProfileStore`. A missing id (no such profile, or the entry
 ///      failed to parse) short-circuits to `.profileMissing` — the
 ///      same wire code Phase 2.2 stubbed in so the GUI's error path
 ///      does not change shape.
-///   2. Resolve filesystem paths the supervisor needs (`pie` binary,
-///      models root, inferlets dir). Each path source is injected as a
-///      throwing closure so tests can stub deterministic temp paths
-///      and a real PieDirs trap surfaces as a structured error rather
-///      than crashing the helper.
+///   2. Resolve filesystem paths the launcher needs (`pie` binary,
+///      models root, chat-apc wasm + manifest, PIE_HOME). Each path
+///      source is injected as a throwing closure so tests can stub
+///      deterministic temp paths and a real PieDirs trap surfaces as a
+///      structured error rather than crashing the helper.
 ///   3. Compose the `LaunchSpec`. `modelPath` joins `modelsRoot` with
 ///      `profile.model` — the profile stores either a bare GGUF
 ///      filename or a `<repo>/<file>` slug matching the downloader's
@@ -38,24 +38,16 @@ public struct LaunchSpecResolver {
   /// Returns the bundled `pie` engine executable. Throws when the
   /// binary is missing — surfaced over XPC as `.spawnFailed` rather
   /// than `.profileMissing` so the GUI distinguishes "user picked an
-  /// invalid profile" from "RatioThink.app is broken".
+  /// invalid profile" from "Rational.app is broken".
   public let pieBinary: () throws -> URL
 
   /// Returns the models root (default `PieDirs.models()`).
   public let modelsRoot: () throws -> URL
 
-  /// Returns the inferlets dir (default `PieDirs.inferlets()`).
-  /// Retained for the legacy `PieSupervisor.LaunchSpec` shape until
-  /// the supervisor itself is removed ( out-of-scope).
-  /// `PieControlLauncher` does NOT consume this — it walks the
-  /// bundle for the chat-apc wasm + manifest via
-  /// `InferletResources.pieControl`.
-  public let inferletsDir: () throws -> URL
-
   /// Returns the bundled `chat-apc` wasm + manifest used by
   /// `PieControlLauncher`'s `install_program` WS call. Default
   /// delegates to `InferletResources.pieControl(in: .main)` so the
-  /// helper resolves them from `RatioThink.app/Contents/Resources/Inferlets`
+  /// helper resolves them from `Rational.app/Contents/Resources/Inferlets`
   /// without having to know the bundle layout. Tests inject a stub
   /// returning temp-dir paths.
   public let pieControlResources: () throws -> (wasm: URL, manifest: URL)
@@ -73,7 +65,7 @@ public struct LaunchSpecResolver {
   public let subprocessEnvironment: () -> [String: String]
 
   /// HuggingFace cache root (`HF_HOME`, not `HF_HOME/hub`) used as a
-  /// read-only fallback after RatioThink's app-managed models directory.
+  /// read-only fallback after Rational's app-managed models directory.
   public let hfHome: () -> URL
 
   /// Resolved-model memory ceiling handed to `ModelMemoryGuardrail`.
@@ -82,13 +74,19 @@ public struct LaunchSpecResolver {
   /// host's real memory.
   public let memoryPolicy: () -> ModelMemoryGuardrail.Policy
 
+  /// Desired OpenAI-compatible daemon bind mode for helper-owned starts.
+  /// XPC-driven app starts can still override the resolved spec explicitly,
+  /// but menu-bar Resume and auto-relaunch call `engineHost.start(spec)`
+  /// directly, so the shared resolver must stamp the persisted preference
+  /// before the spec reaches the host.
+  public let daemonBindMode: () -> EngineHTTPBindMode
+
   private static let log = Logger(subsystem: "com.ratiothink.app.helper",
                                   category: "launchspec.resolver")
 
   public init(profileStore: ProfileStore,
               pieBinary: @escaping () throws -> URL,
               modelsRoot: @escaping () throws -> URL = { try PieDirs.models() },
-              inferletsDir: @escaping () throws -> URL = { try PieDirs.inferlets() },
               pieControlResources: @escaping () throws -> (wasm: URL, manifest: URL)
                 = { try InferletResources.pieControl(in: .main) },
               pieHome: @escaping () throws -> URL = { try PieDirs.applicationSupport() },
@@ -96,79 +94,63 @@ public struct LaunchSpecResolver {
                 = { SpawnEnvSanitizer.sanitize(ProcessInfo.processInfo.environment) },
               hfHome: @escaping () -> URL = { LaunchSpecResolver.defaultHFHome() },
               memoryPolicy: @escaping () -> ModelMemoryGuardrail.Policy
-                = { ModelMemoryGuardrail.defaultPolicy }) {
+                = { ModelMemoryGuardrail.defaultPolicy },
+              daemonBindMode: @escaping () -> EngineHTTPBindMode
+                = { EngineHTTPBindMode.persistedLocalAPIBindMode() }) {
     self.profileStore = profileStore
     self.pieBinary = pieBinary
     self.modelsRoot = modelsRoot
-    self.inferletsDir = inferletsDir
     self.pieControlResources = pieControlResources
     self.pieHome = pieHome
     self.subprocessEnvironment = subprocessEnvironment
     self.hfHome = hfHome
     self.memoryPolicy = memoryPolicy
-  }
-
-  /// Core mapping. Pure on injected state — no Bundle / PieDirs reads
-  /// happen outside the injected closures, so unit tests run on temp
-  /// dirs without touching `~/Library/Application Support/RatioThink`.
-  public func resolve(profileID: String) -> Result<PieSupervisor.LaunchSpec, EngineError> {
-    guard let profile = lookup(profileID: profileID) else {
-      return .failure(EngineError(
-        code: .profileMissing,
-        message: "no profile with id=\(profileID) in \(profileStore.directory.path)"
-      ))
-    }
-    let binary: URL
-    let models: URL
-    let inferlets: URL
-    do {
-      binary    = try pieBinary()
-      models    = try modelsRoot()
-      inferlets = try inferletsDir()
-    } catch {
-      Self.log.error("path resolution failed for profile=\(profile.id, privacy: .public): \(String(describing: error), privacy: .public)")
-      return .failure(EngineError(
-        code: .spawnFailed,
-        message: "launch path resolution failed: \(String(describing: error))"
-      ))
-    }
-    let modelPath = Self.joinModelPath(modelsRoot: models,
-                                       slug: profile.model)
-    return .success(PieSupervisor.LaunchSpec(
-      binaryURL: binary,
-      modelPath: modelPath,
-      inferletDir: inferlets,
-      inferletName: profile.inferlet,
-      profileID: profile.id
-    ))
+    self.daemonBindMode = daemonBindMode
   }
 
   /// Type-erased adapter matching `HelperExportedAPI.LaunchSpecResolver`.
   /// Captures `self` so the helper can hold the closure for the
   /// lifetime of the XPC listener.
   public var asClosure: HelperExportedAPI.LaunchSpecResolver {
-    { id in self.resolveLauncherSpec(profileID: id) }
-  }
-
-  /// Legacy adapter that still returns the stale `PieSupervisor
-  /// .LaunchSpec`. Retained so the PieSupervisor test bundle keeps
-  /// passing; no production caller should reach for this.
-  public var asLegacySupervisorClosure: (String) -> Result<PieSupervisor.LaunchSpec, EngineError> {
-    { id in self.resolve(profileID: id) }
+    { id, explicitModel in self.resolveLauncherSpec(profileID: id, explicitModel: explicitModel) }
   }
 
   /// `PieControlLauncher`-shaped resolver. Composes the
-  /// same `Profile`-bound model path the legacy `resolve(...)` builds
-  /// with the launcher's extra inputs: bundled chat-apc wasm +
+  /// `Profile`-bound model path with the launcher's extra inputs:
+  /// bundled chat-apc wasm +
   /// manifest, sanitized subprocess env, PIE_HOME, and a unique
   /// shmem name. The launcher's `writeConfig` then emits a
   /// production TOML with `[model.driver] type = "portable"` and
   /// `hf_path` pointed at the on-disk model the operator selected.
-  public func resolveLauncherSpec(profileID: String) -> Result<PieControlLauncher.LaunchSpec, EngineError> {
-    guard let profile = lookup(profileID: profileID) else {
+  ///
+  /// `explicitModel` is the user's per-start model selection (the chat
+  /// toolbar / model-list pick, `viewModel.modelOverride`). When present it
+  /// is the boot model, overriding `profile.model` — #459 repro 1: a
+  /// no-default profile is started by an explicit pick the helper must honor
+  /// even though the profile carries no default. v1 pie loads the model at
+  /// `pie serve` boot from this spec, so the engine has to be told which
+  /// model to serve here; an override that only lived in App state would
+  /// never reach the boot config. Threading it in the same XPC call as the
+  /// profile id keeps it race-free against the helper's own FS-watched
+  /// `ProfileStore` (which may not yet have observed an App-side default
+  /// write). `nil`/blank falls back to the profile's persisted default.
+  public func resolveLauncherSpec(profileID: String,
+                                  explicitModel: String? = nil) -> Result<PieControlLauncher.LaunchSpec, EngineError> {
+    // #702: a dangling active-profile marker (id points at a deleted /
+    // unparseable profile) must NOT strand engine start. The base `chat`
+    // built-in is always present in the effective set, so fall back to it
+    // instead of hard-rejecting. Only when even the base is unreachable
+    // (a corrupt build) do we surface `.profileMissing`.
+    let profile: Profile
+    if let direct = lookup(profileID: profileID) {
+      profile = direct
+    } else if let base = lookup(profileID: ProfileStore.defaultProfileID) {
+      Self.log.error("resolveLauncherSpec: profile id=\(profileID, privacy: .public) not found; falling back to base \(ProfileStore.defaultProfileID, privacy: .public)")
+      profile = base
+    } else {
       return .failure(EngineError(
         code: .profileMissing,
-        message: "no profile with id=\(profileID) in \(profileStore.directory.path)"
+        message: "no profile with id=\(profileID) and no base \(ProfileStore.defaultProfileID) in \(profileStore.directory.path)"
       ))
     }
     // Refuse a split-GGUF shard (`…-NNNNN-of-MMMMM.gguf`) before any
@@ -176,11 +158,15 @@ public struct LaunchSpecResolver {
     // can't select them, but a stale or hand-authored profile could still
     // name one — fail fast with a clear reason instead of handing the
     // engine a shard it cannot load.
-    let modelLeaf = profile.model.split(separator: "/").last.map(String.init) ?? profile.model
+    guard let model = Self.effectiveModel(explicitModel: explicitModel,
+                                          profileModel: profile.model) else {
+      return .failure(Self.noDefaultModelError(profile: profile))
+    }
+    let modelLeaf = model.split(separator: "/").last.map(String.init) ?? model
     if HFCacheCatalog.isSplitShardFilename(modelLeaf) {
       return .failure(EngineError(
         code: .invalidInput,
-        message: "\(HFCacheCatalog.shardedUnsupportedReason) (model=\(profile.model))"
+        message: "\(HFCacheCatalog.shardedUnsupportedReason) (model=\(model))"
       ))
     }
     let binary: URL
@@ -206,13 +192,74 @@ public struct LaunchSpecResolver {
     case .failure(let err):  return .failure(err)
     }
     let modelRef: String
-    switch resolveModelRef(profile: profile, modelsRoot: models) {
+    switch resolveModelRef(model: model, profile: profile, modelsRoot: models) {
     case .success(let resolved): modelRef = resolved
     case .failure(let err):      return .failure(err)
+    }
+    // Refuse a quantized HF/MLX safetensors model before spawning the
+    // engine — whether `resolveModelRef` resolved to a snapshot directory
+    // or a single `.safetensors` file. The catalog marks such rows
+    // unlaunchable so the picker can't select them, but a stale or hand-
+    // authored profile could name one — fail fast with the exact dtype
+    // reason instead of the cryptic engine rc=-1 (mirrors the split-GGUF
+    // fast-fail above).
+    if let reason = HFCacheCatalog.quantizedSafetensorsReason(forResolvedModelPath: modelRef) {
+      return .failure(EngineError(
+        code: .invalidInput,
+        message: "\(reason) (model=\(profile.model))"
+      ))
     }
     let shmem = Self.uniqueShmemName()
     let env = subprocessEnvironment()
     do {
+      // Memory-aware per-request output ceiling (#438): from the resolved
+      // model's arch dims + weight size, compute how many F16 KV tokens
+      // fit in the RAM budget after weights + a conservative overhead,
+      // clamped to the context window and the engine default pool. Written
+      // as `default_token_limit`, which chat-apc reads back via
+      // `runtime::max-output-tokens`. Down-only: `nil` (omit) when the
+      // metadata can't be read or the host sustains the full default.
+      let modelURL = URL(fileURLWithPath: modelRef, isDirectory: false)
+      let weightBytes = ModelMemoryGuardrail.resolvedBytes(resolvedModelURL: modelURL)
+      let defaultTokenLimit: Int? = ModelArchMetadata.read(resolvedModelURL: modelURL)
+        .flatMap { metadata in
+          weightBytes.flatMap { bytes in
+            KVCacheBudget.outputTokenCeiling(
+              policy: memoryPolicy(), weightBytes: bytes, metadata: metadata)
+          }
+        }
+      // Size-aware engine timeout (#687): larger GGUFs need a longer cold
+      // Metal prefill budget than the 120s floor. An explicit
+      // PIE_SHMEM_TIMEOUT_S in the helper environment (read pre-sanitize)
+      // overrides the computed default — see `resolvedRequestTimeoutSeconds`.
+      let hostEnv = ProcessInfo.processInfo.environment
+      let requestTimeoutSeconds = PieControlLauncher.resolvedRequestTimeoutSeconds(
+        modelWeightBytes: weightBytes,
+        environment: hostEnv)
+      // (#698 F3) A present-but-invalid PIE_SHMEM_TIMEOUT_S is silently dropped
+      // by the resolver, which falls back to the size-aware default. A typo'd
+      // override would otherwise leave no trace — name the rejected raw value
+      // and the budget actually applied so the operator can spot the mistake.
+      if let rejected = PieControlLauncher.rejectedTimeoutOverride(environment: hostEnv) {
+        DiagnosticLog.helper.event("engine.timeout.override-rejected", [
+          ("raw", rejected),
+          ("applied_request_timeout_secs", String(requestTimeoutSeconds)),
+        ])
+      }
+      // (#698 F5) The model resolved AND passed ModelMemoryGuardrail.validate
+      // above — validate fails CLOSED on an unmeasurable artifact — so reaching
+      // here with nil weight bytes means the file became unreadable AFTER
+      // validation (a TOCTOU race: deleted/relocated mid-launch), not a normal
+      // small model. Both nil and measured-small otherwise collapse to the 120s
+      // floor; distinguish them so an operator sees the budget was sized blind
+      // and can extend it via PIE_SHMEM_TIMEOUT_S if the model is in fact large.
+      if weightBytes == nil {
+        DiagnosticLog.helper.event("engine.timeout.weight-bytes-unmeasurable", [
+          ("model", model),
+          ("path", DiagnosticLog.redactHome(modelRef)),
+          ("applied_request_timeout_secs", String(requestTimeoutSeconds)),
+        ])
+      }
       let spec = try PieControlLauncher.LaunchSpec(
         pieBinary: binary,
         wasmURL: resources.wasm,
@@ -221,9 +268,31 @@ public struct LaunchSpecResolver {
         pieHome: home,
         shmemName: shmem,
         inferletNameAtVersion: inferletNameAtVersion,
+        // Real `pie serve` cold boot loads the model weights before the READY
+        // handshake; align the boot budget with the size-aware request/shmem
+        // timeout so a slow large-model start is not killed by the 30s default
+        // handshake ceiling (#459 evidence, #687 size scaling). The BOOT lease
+        // is clamped to the ceiling (`bootHandshakeTimeoutSeconds`) so it stays
+        // strictly below the static XPC reply deadline even when an operator
+        // override pushes the request/shmem value above the ceiling.
+        handshakeTimeout: TimeInterval(
+          PieControlLauncher.bootHandshakeTimeoutSeconds(
+            requestTimeoutSeconds: requestTimeoutSeconds)),
+        requestTimeoutSeconds: requestTimeoutSeconds,
         profileID: profile.id,
-        modelConfig: .portableResolved(servedModelID: profile.model, modelRef: modelRef)
+        daemonBindHost: daemonBindMode(),
+        modelConfig: .portableResolved(servedModelID: model, modelRef: modelRef),
+        defaultTokenLimit: defaultTokenLimit
       )
+      // #469: record the resolved boot model in the durable active-model
+      // marker. This is the single launch-resolution choke point every path
+      // funnels through (App `startEngine`/`restartEngine` XPC + menu-bar
+      // Resume + crash auto-relaunch), so the marker always reflects the
+      // model the engine was last asked to serve — letting a later Resume on
+      // a stopped engine honor the user's last pick instead of reverting to
+      // the profile default. Best-effort (`try?`): a marker write failure
+      // logs inside `setActiveModelID` but must never fail the launch.
+      try? profileStore.setActiveModelID(model)
       return .success(spec)
     } catch {
       Self.log.error("launcher spec construction failed for profile=\(profile.id, privacy: .public): \(String(describing: error), privacy: .public)")
@@ -234,73 +303,69 @@ public struct LaunchSpecResolver {
     }
   }
 
-  private func resolveModelRef(profile: Profile,
+  /// `model` is the already-resolved boot slug (`explicitModel ?? profile
+  /// .model`) — see `resolveLauncherSpec`. `profile` is kept only for the
+  /// error/diagnostic context.
+  private func resolveModelRef(model: String,
+                               profile: Profile,
                                modelsRoot: URL,
                                fileManager: FileManager = .default) -> Result<String, EngineError> {
-    let localPath = Self.joinModelPath(modelsRoot: modelsRoot, slug: profile.model)
-    switch Self.validateAppStagedModel(at: localPath, fileManager: fileManager) {
-    case .success(true):
-      switch ModelMemoryGuardrail.validate(
-        resolvedModelURL: URL(fileURLWithPath: localPath, isDirectory: false),
-        modelID: profile.model,
+    // Shared two-stage resolution; this method adds ONLY the memory guardrail
+    // and the `modelMissing` diagnostic on top. `localPath` / `hfIdentity` /
+    // `hfCacheRoot` are recomputed here purely to carry into the error builder
+    // (the resolution itself lives in `resolveModelArtifact`).
+    let localPath = Self.joinModelPath(modelsRoot: modelsRoot, slug: model)
+    let hfIdentity = Self.hfIdentity(forModelSlug: model)
+    let hfCacheRoot = hfHome()
+    switch Self.resolveModelArtifact(slug: model, modelsRoot: modelsRoot,
+                                     hfHome: hfCacheRoot, fileManager: fileManager) {
+    case .appStaged(let path):
+      if case .failure(let err) = ModelMemoryGuardrail.validate(
+        resolvedModelURL: URL(fileURLWithPath: path, isDirectory: false),
+        modelID: model,
         policy: memoryPolicy(),
         fileManager: fileManager
       ) {
-      case .success:
-        break
-      case .failure(let err):
         return .failure(err)
       }
-      return .success(localPath)
-    case .success(false):
-      break
-    case .failure(let problem):
+      return .success(path)
+    case .hfCache(let cached):
+      if case .failure(let err) = ModelMemoryGuardrail.validate(
+        resolvedModelURL: cached,
+        modelID: model,
+        policy: memoryPolicy(),
+        fileManager: fileManager
+      ) {
+        return .failure(err)
+      }
+      return .success(cached.path)
+    case .notResolvable(.appStagedInvalid(let reason)):
       return .failure(Self.modelMissingError(
         profile: profile,
+        model: model,
         appPath: localPath,
-        appPathProblem: problem.reason,
-        hfIdentity: Self.hfIdentity(forModelSlug: profile.model),
-        hfHome: hfHome()
+        appPathProblem: reason,
+        hfIdentity: hfIdentity,
+        hfHome: hfCacheRoot
+      ))
+    case .notResolvable(.hfInvalid(let problem)):
+      return .failure(Self.modelMissingError(
+        profile: profile,
+        model: model,
+        appPath: localPath,
+        hfIdentity: hfIdentity,
+        hfHome: hfCacheRoot,
+        hfProblem: problem
+      ))
+    case .notResolvable(.absent):
+      return .failure(Self.modelMissingError(
+        profile: profile,
+        model: model,
+        appPath: localPath,
+        hfIdentity: hfIdentity,
+        hfHome: hfCacheRoot
       ))
     }
-
-    let hfIdentity = Self.hfIdentity(forModelSlug: profile.model)
-    let hfCacheRoot = hfHome()
-    if let hfIdentity {
-      switch HFCacheResolver(hfHome: hfCacheRoot, fileManager: fileManager)
-        .resolve(repo: hfIdentity.repo, file: hfIdentity.file) {
-      case .hit(let cached):
-        switch ModelMemoryGuardrail.validate(
-          resolvedModelURL: cached,
-          modelID: profile.model,
-          policy: memoryPolicy(),
-          fileManager: fileManager
-        ) {
-        case .success:
-          break
-        case .failure(let err):
-          return .failure(err)
-        }
-        return .success(cached.path)
-      case .miss:
-        break
-      case .invalid(let problem):
-        return .failure(Self.modelMissingError(
-          profile: profile,
-          appPath: localPath,
-          hfIdentity: hfIdentity,
-          hfHome: hfCacheRoot,
-          hfProblem: problem
-        ))
-      }
-    }
-
-    return .failure(Self.modelMissingError(
-      profile: profile,
-      appPath: localPath,
-      hfIdentity: hfIdentity,
-      hfHome: hfCacheRoot
-    ))
   }
 
   private struct AppStagedModelProblem: Error {
@@ -317,12 +382,31 @@ public struct LaunchSpecResolver {
       return .failure(AppStagedModelProblem(reason: "is a directory, expected a model file"))
     }
     do {
+      // `attributesOfItem` has lstat semantics (no symlink follow), so a
+      // staged symlink reports `.typeSymbolicLink`. The outer
+      // `fileExists(isDirectory:)` above DID follow the link and already
+      // confirmed the target exists and is not a directory — so a symlink
+      // reaching here points at a regular model file.
       let attrs = try fileManager.attributesOfItem(atPath: path)
-      if let type = attrs[.type] as? FileAttributeType,
-         type != .typeRegular {
-        return .failure(AppStagedModelProblem(
-          reason: "is \(type.rawValue), expected a regular model file"
-        ))
+      if let type = attrs[.type] as? FileAttributeType {
+        switch type {
+        case .typeRegular:
+          break  // a plainly-staged GGUF
+        case .typeSymbolicLink:
+          // Accept a staged symlink-to-regular (e.g. `stage-test-model.sh`
+          // links the HF cache, or a user `ln -s`'d a GGUF). Return the
+          // SYMLINK path (the caller's `localPath`) unchanged: pie follows
+          // it and the `.gguf` suffix is preserved, whereas the resolved
+          // blob would be an extension-less path pie rejects. Previously
+          // this hard-failed → `modelMissing`, which ALSO skipped the
+          // HF-cache fallback even when the cache held the model (the
+          // operator's real blocker). Pre-existing, not #413.
+          break
+        default:
+          return .failure(AppStagedModelProblem(
+            reason: "is \(type.rawValue), expected a regular model file"
+          ))
+        }
       }
     } catch {
       return .failure(AppStagedModelProblem(
@@ -341,14 +425,119 @@ public struct LaunchSpecResolver {
     return .success(true)
   }
 
+  /// The outcome of locating a model slug's on-disk artifact, WITHOUT the
+  /// memory-guardrail check — the single source of truth for the launcher's
+  /// two-stage resolution. `resolveModelRef` layers the guardrail + `ModelRef`
+  /// on top of it; `isModelResolvable` reduces it to a Bool. Sharing this
+  /// result is what stops the launcher and the send-gate from drifting apart.
+  private enum ModelArtifactResolution {
+    /// Found in Rational's app-staged models dir at `path` (a regular file or
+    /// a symlink to one).
+    case appStaged(path: String)
+    /// Found in the HuggingFace cache at `url` (a file or a snapshot dir).
+    case hfCache(url: URL)
+    /// Not loadable from either source; carries why so the launcher can build
+    /// the matching `modelMissing` diagnostic.
+    case notResolvable(NotResolvable)
+
+    enum NotResolvable {
+      /// An artifact EXISTS at the expected app-staged path but is invalid
+      /// (a directory, a broken/wrong-type file). The launch stops here and
+      /// does NOT fall through to the HF cache.
+      case appStagedInvalid(reason: String)
+      /// The HF cache holds the repo but the snapshot is incomplete/corrupt.
+      case hfInvalid(HFCacheResolver.CacheProblem)
+      /// Present in neither source — an app-staged miss plus an HF miss (or no
+      /// HF identity could be derived from the slug).
+      case absent
+    }
+  }
+
+  /// The launcher's two-stage existence resolution, shared verbatim by
+  /// `resolveModelRef` and `isModelResolvable`. App-staged path first; a
+  /// present-but-INVALID staged artifact stops here with no HF fallthrough
+  /// (exactly as a real launch fails), while an app-staged MISS falls through
+  /// to the HF cache. Existence only — no `ModelMemoryGuardrail`, no directory
+  /// creation, no xattr writes — so it is safe on the SwiftUI render path.
+  /// `hfHome == nil` skips the HF stage.
+  private static func resolveModelArtifact(slug: String,
+                                           modelsRoot: URL,
+                                           hfHome: URL?,
+                                           fileManager: FileManager) -> ModelArtifactResolution {
+    let localPath = joinModelPath(modelsRoot: modelsRoot, slug: slug)
+    switch validateAppStagedModel(at: localPath, fileManager: fileManager) {
+    case .success(true):
+      return .appStaged(path: localPath)
+    case .failure(let problem):
+      return .notResolvable(.appStagedInvalid(reason: problem.reason))
+    case .success(false):
+      break  // not app-staged → try the HF cache
+    }
+    guard let hfHome, let identity = hfIdentity(forModelSlug: slug) else {
+      return .notResolvable(.absent)
+    }
+    switch HFCacheResolver(hfHome: hfHome, fileManager: fileManager)
+      .resolve(repo: identity.repo, file: identity.file) {
+    case .hit(let cached):
+      return .hfCache(url: cached)
+    case .miss:
+      return .notResolvable(.absent)
+    case .invalid(let problem):
+      return .notResolvable(.hfInvalid(problem))
+    }
+  }
+
+  /// Read-only check of whether `slug` resolves to an on-disk model artifact
+  /// through the launcher's own two-stage resolution (`resolveModelArtifact`):
+  /// the app-staged models dir, else the HuggingFace cache. Consumes the SAME
+  /// resolution core as `resolveModelRef`, MINUS the `ModelMemoryGuardrail`
+  /// step — a present-but-too-large model is a load-time `.memoryRisk`, not a
+  /// missing one, so existence is the right question for an availability gate.
+  /// Performs no directory creation and no xattr writes, so it is safe to call
+  /// on the SwiftUI render path.
+  ///
+  /// The send-gate (`ChatScaffoldView.isModelInstalled`) consults this so a
+  /// genuinely-loadable HF-cached model (e.g. a safetensors snapshot) is
+  /// offered Load instead of being misreported "isn't available".
+  public static func isModelResolvable(slug: String,
+                                       modelsRoot: URL,
+                                       hfHome: URL?,
+                                       fileManager: FileManager = .default) -> Bool {
+    switch resolveModelArtifact(slug: slug, modelsRoot: modelsRoot,
+                                hfHome: hfHome, fileManager: fileManager) {
+    case .appStaged, .hfCache:
+      return true
+    case .notResolvable:
+      return false
+    }
+  }
+
+  /// Effective boot model: the user's explicit per-start selection when
+  /// present (blank/whitespace ignored), otherwise the profile's persisted
+  /// default. `nil` means neither is set → `noDefaultModelError`. Returns the
+  /// chosen value verbatim (not trimmed) so the on-disk slug path is
+  /// preserved exactly as the picker/profile recorded it.
+  static func effectiveModel(explicitModel: String?, profileModel: String?) -> String? {
+    if let e = explicitModel,
+       !e.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      return e
+    }
+    if let p = profileModel,
+       !p.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      return p
+    }
+    return nil
+  }
+
   private static func modelMissingError(profile: Profile,
+                                        model: String,
                                         appPath: String,
                                         appPathProblem: String? = nil,
                                         hfIdentity: (repo: String, file: String?)?,
                                         hfHome: URL,
                                         hfProblem: HFCacheResolver.CacheProblem? = nil) -> EngineError {
     var parts = [
-      "model missing for profile \(profile.id.debugDescription): \(profile.model.debugDescription)",
+      "model missing for profile \(profile.id.debugDescription): \(model.debugDescription)",
       "checked app-staged path \(appPath)",
     ]
     if let appPathProblem {
@@ -365,6 +554,13 @@ public struct LaunchSpecResolver {
       parts.append("recovery: import/stage a GGUF at \(appPath)")
     }
     return EngineError(code: .modelMissing, message: parts.joined(separator: "; "))
+  }
+
+  private static func noDefaultModelError(profile: Profile) -> EngineError {
+    EngineError(
+      code: .modelMissing,
+      message: "profile \(profile.id.debugDescription) has no default model; choose or download a model before starting"
+    )
   }
 
   private static func downloadCommand(for identity: (repo: String, file: String?)) -> String {
@@ -560,13 +756,13 @@ public struct LaunchSpecResolver {
 }
 
 extension LaunchSpecResolver {
-  /// Production binary lookup: `<RatioThink.app>/Contents/Resources/pie-engine/pie`.
-  /// Walks parent `.app` bundles so the embedded `RatioThinkHelper.app` finds
-  /// the engine shipped with its containing `RatioThink.app`. Mirrors
+  /// Production binary lookup: `<Rational.app>/Contents/Resources/pie-engine/pie`.
+  /// Walks parent `.app` bundles so the embedded `RationalHelper.app` finds
+  /// the engine shipped with its containing `Rational.app`. Mirrors
   /// `InferletResources.candidateBundles` (Phase 5.5 ).
   ///
   /// Throws `LaunchSpecResolver.BinaryMissing` when no candidate
-  /// resolves — the supervisor would otherwise surface `Process.run()
+  /// resolves — the launcher would otherwise surface `Process.run()
   /// failed` with a confusing path; surfacing the structured error here
   /// lets the GUI render "Pie engine binary is missing — reinstall".
   public struct BinaryMissing: Error, CustomStringConvertible {
@@ -593,18 +789,18 @@ extension LaunchSpecResolver {
 
   /// Maximum ancestor levels the bundle walk inspects looking for a
   /// parent `.app`. Canonical embed layout is
-  /// `RatioThink.app/Contents/Library/LoginItems/RatioThinkHelper.app` — four
+  /// `Rational.app/Contents/Library/LoginItems/RationalHelper.app` — four
   /// `deletingLastPathComponent()` hops from the helper bundle to
-  /// reach `RatioThink.app`. The prior `0..<3` bound stopped at
-  /// `RatioThink.app/Contents` and silently fell through to the
+  /// reach `Rational.app`. The prior `0..<3` bound stopped at
+  /// `Rational.app/Contents` and silently fell through to the
   /// helper-bundle-only candidate, so the engine binary lookup never
-  /// considered the containing `RatioThink.app` (review v150 F6).
+  /// considered the containing `Rational.app` (review v150 F6).
   ///
   /// Matches `HelperAppDelegate.pieAppAncestorMaxDepth = 6` (two
   /// extra levels of headroom for a future versioned LoginItems
   /// subdir).
   static let bundleWalkMaxDepth = 6
-  private static let xcodeSiblingAppName = "RatioThink.app"
+  private static let xcodeSiblingAppName = "Rational.app"
 
   /// Same walk as `InferletResources.candidateBundles` — kept private
   /// here so the binary lookup does not depend on the inferlet bundling
@@ -626,8 +822,8 @@ extension LaunchSpecResolver {
     var url = bundle.bundleURL
     for _ in 0..<bundleWalkMaxDepth {
       // Xcode UI tests launch the RatioThinkHelper target as a standalone
-      // sibling of RatioThink.app, while production launches the helper from
-      // RatioThink.app/Contents/Library/LoginItems. Check the sibling app as
+      // sibling of Rational.app, while production launches the helper from
+      // Rational.app/Contents/Library/LoginItems. Check the sibling app as
       // well as ancestor apps so both layouts resolve the single
       // app-bundled pie engine.
       appendBundle(at: url.deletingLastPathComponent()

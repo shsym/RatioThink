@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build an arch-specific RatioThink.app and wrap it in RatioThink-<arch>.dmg.
+# Build an arch-specific Rational.app and wrap it in Rational-<arch>.dmg.
 #
-# v1 ships separate `RatioThink-arm64.dmg` and `RatioThink-x86_64.dmg`
+# v1 ships separate `Rational-arm64.dmg` and `Rational-x86_64.dmg`
 # instead of a universal binary. Universal-binary packaging is deferred
 #
 # Usage:
@@ -9,7 +9,7 @@
 #                          [--out <dir>] [--configuration <Debug|Release>]
 #                          [--notarize]
 #
-# Output: <out>/RatioThink-<arch>.dmg  (default <out> = build/dmg/)
+# Output: <out>/Rational-<arch>.dmg  (default <out> = build/dmg/)
 #
 # With --notarize the app is signed with a Developer ID Application identity
 # (auto-detected, or --identity / DEVELOPER_ID_IDENTITY), then the app AND the
@@ -64,8 +64,11 @@ mkdir -p "$OUT_DIR"
 
 # Per-arch build dir keeps arm64 and x86_64 artifacts isolated so a
 # universal lipo merge (future work) can pick them up without
-# re-running xcodebuild.
-BUILD_DIR="$REPO_ROOT/build/xcode-$ARCH"
+# re-running xcodebuild. PACKAGE_DMG_BUILD_ROOT relocates the staging
+# tree off the repo's real build/ — used by the staging regression test
+# so it never wipes a developer's actual staged builds.
+BUILD_ROOT="${PACKAGE_DMG_BUILD_ROOT:-$REPO_ROOT/build}"
+BUILD_DIR="$BUILD_ROOT/xcode-$ARCH"
 SYM_ROOT="$BUILD_DIR/sym"
 OBJ_ROOT="$BUILD_DIR/obj"
 DERIVED="$BUILD_DIR/derived"
@@ -148,6 +151,21 @@ if [[ -n "${DEVELOPMENT_TEAM:-}" ]]; then
   SIGN_ARGS+=("DEVELOPMENT_TEAM=$DEVELOPMENT_TEAM")
 fi
 
+# Start from a clean staging dir. $SYM_ROOT (= CONFIGURATION_BUILD_DIR) is a
+# persistent per-arch dir reused across packaging runs, so a prior run's
+# RatioThink.app — including the pie engine staged into its Resources — survives
+# here. The engine build phase re-stages on every build, but any phase that is
+# skipped, no-op'd, or left half-done (an interrupted/crashed prior build,
+# manual tampering, or a future opt-out env var) would leave that stale .app in
+# place. A stale-but-valid engine still passes every downstream guard below
+# (present, single-arch, signed, entitled) — they would all validate the OLD
+# binary and ship it. Wiping $SYM_ROOT makes those guards load-bearing: if this
+# build does not freshly stage an engine, RatioThink.app has none and the "pie
+# engine missing from bundle" check fails loudly instead. Only the current
+# arch's dir is removed, so a sibling arch build staged for a future universal
+# lipo merge (see BUILD_DIR comment above) is untouched.
+rm -rf "$SYM_ROOT"
+
 echo "package-dmg.sh: xcodebuild RatioThink (arch=$ARCH, configuration=$CONFIG)"
 xcodebuild \
   -project RatioThink.xcodeproj \
@@ -161,9 +179,9 @@ xcodebuild \
   ${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"} \
   build
 
-APP_PATH="$SYM_ROOT/RatioThink.app"
+APP_PATH="$SYM_ROOT/Rational.app"
 if [[ ! -d "$APP_PATH" ]]; then
-  echo "package-dmg.sh: build succeeded but RatioThink.app not found at $APP_PATH" >&2
+  echo "package-dmg.sh: build succeeded but Rational.app not found at $APP_PATH" >&2
   exit 70
 fi
 
@@ -192,7 +210,7 @@ fi
 # resigned cleanly inside a valid bundle" and "engine present in a
 # bundle whose CodeResources seal is broken" — notarization rejects
 # both, but only the strict --verify catches the broken-seal case
-# (review v2 F2). --deep walks nested binaries (RatioThinkHelper, the
+# (review v2 F2). --deep walks nested binaries (RationalHelper, the
 # engine, frameworks); --strict enforces sealed-resource integrity.
 if ! codesign --verify --strict --deep --verbose=2 "$APP_PATH"; then
   echo "package-dmg.sh: bundle signature verification failed for $APP_PATH" >&2
@@ -224,7 +242,7 @@ for key in com.apple.security.cs.allow-jit \
 done
 
 # Notarize + staple the APP before it goes into the dmg, so a user who drags
-# RatioThink.app out of the image gets a stapled bundle that passes Gatekeeper
+# Rational.app out of the image gets a stapled bundle that passes Gatekeeper
 # offline (not just the dmg). notarize.sh refuses a non-Developer ID artifact
 # and fails loudly if creds are missing.
 if [[ "$NOTARIZE" -eq 1 ]]; then
@@ -232,10 +250,10 @@ if [[ "$NOTARIZE" -eq 1 ]]; then
   "$SCRIPT_DIR/notarize.sh" "$APP_PATH"
 fi
 
-DMG_PATH="$OUT_DIR/RatioThink-$ARCH.dmg"
+DMG_PATH="$OUT_DIR/Rational-$ARCH.dmg"
 rm -f "$DMG_PATH"
 
-# Build the styled drag-install DMG window (ticket #354): RatioThink.app on the
+# Build the styled drag-install DMG window (ticket #354): Rational.app on the
 # left, an `Applications` symlink target on the right, and a background showing
 # an arrow app -> Applications. make-styled-dmg.sh stages into a writable image,
 # writes the window layout to the volume `.DS_Store` directly (no Finder/

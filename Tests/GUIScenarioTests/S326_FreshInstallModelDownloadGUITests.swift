@@ -23,6 +23,10 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
       "-ApplePersistenceIgnoreState", "YES",
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
+    // Keep this engine-free: if a real Helper is already running on the
+    // developer machine, reconciliation must not discover its resident model
+    // and bypass the fresh-install missing-model gate this scenario proves.
+    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
     // Fake the downloader so the CTA can be driven without a network /
     // real Hugging Face fetch. The seeded chat profile's model is not
     // staged in this fresh PIE_HOME, so the gate offers Download.
@@ -34,44 +38,48 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
     XCTAssert(app.wait(for: .runningForeground, timeout: 10))
     app.activate()
 
-    let newChat = app.buttons["chats.newButton"]
-    XCTAssertTrue(newChat.waitForExistence(timeout: 10), "New Chat button missing")
-    newChat.click()
+    // Open a chat and enter text via the shared focus-robust helpers
+    // (`openFreshChat` re-activates + rescans; `typeComposerText` anchors
+    // the click on the window and pastes) so a not-key full-suite launch
+    // can't time out event synthesis and cascade into a spurious "download
+    // absent" failure (#559). The remaining raw button clicks go through
+    // `app.readyForInput` for the same reason.
+    openFreshChat(in: app)
 
-    let composer = app.descendants(matching: .any)
-      .matching(identifier: "composer.text")
-      .firstMatch
-    XCTAssertTrue(composer.waitForExistence(timeout: 10), "composer.text missing")
-    composer.click()
-    composer.typeText("Hello with no model on disk")
+    typeComposerText("Hello with no model on disk", in: app)
 
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5))
-    send.click()
+    XCTAssertTrue(send.isEnabled, "composer.send disabled after typing prompt; app tree: \(app.debugDescription)")
+    try app.readyForInput(send).click()
 
     // Send is blocked behind the no-model gate — never a silent load.
-    // #397: assert the gate via its state-independent Cancel affordance,
+    // #397: assert the gate via its state-independent prompt container,
     // not the pinned "No model loaded" headline (now state-dependent —
     // e.g. "Starting the engine…" while the engine boots, where #397 F2
-    // keeps the download CTA below visible). The real #326 contract — the
-    // inline Download CTA — is asserted next and is what this case proves.
-    XCTAssertTrue(app.buttons["noModel.cancel"].waitForExistence(timeout: 5),
+    // keeps the download CTA below visible). On macOS, the parent prompt
+    // identifier can subsume child button identifiers in busy states. The
+    // real #326 contract — the inline Download CTA — is asserted next.
+    XCTAssertTrue(noModelPrompt(in: app).waitForExistence(timeout: 5),
                   "send with nothing resolvable must raise the no-model gate")
 
     // #326: the model is NOT on disk, so the gate offers Download — the
     // inline recovery — and NOT the plain Load (which would dead-end).
-    let download = app.buttons["missingModel.download"]
+    let download = missingModelDownloadButton(in: app)
     XCTAssertTrue(download.waitForExistence(timeout: 5),
                   "fresh install with no staged model must offer inline Download")
     XCTAssertFalse(app.buttons["noModel.load"].exists,
                    "Load must not be offered when the model is not on disk")
 
     // Tapping Download enqueues into the shared controller and switches
-    // the CTA to its in-flight row (the fake downloader yields
-    // .downloading), surfacing a Cancel affordance.
-    download.click()
-    XCTAssertTrue(app.buttons["missingModel.cancel"].waitForExistence(timeout: 5),
-                  "tapping Download must show the in-flight progress row")
+    // the CTA away from the Download affordance to its in-flight row (the
+    // fake downloader yields .downloading). In the no-model sheet's busy
+    // states macOS can collapse child accessibility identifiers into the
+    // parent prompt, so assert the stable transition: the Download button
+    // disappears rather than pinning the row's nested Cancel identifier.
+    try app.readyForInput(download).click()
+    XCTAssertTrue(download.waitForNonExistence(timeout: 5),
+                  "tapping Download must replace the Download affordance with the in-flight progress row; app tree: \(app.debugDescription)")
   }
 
   /// A completed download must fire the CTA's one-shot `onDownloaded`
@@ -87,6 +95,7 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
       "-ApplePersistenceIgnoreState", "YES",
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
+    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
     app.launchEnvironment["PIE_TEST_FAKE_DOWNLOADS"] = "1"
     // Drive the fake stream to a terminal `.completed` so the CTA's
     // completion latch fires.
@@ -98,30 +107,24 @@ final class S326_FreshInstallModelDownloadGUITests: XCTestCase {
     XCTAssert(app.wait(for: .runningForeground, timeout: 10))
     app.activate()
 
-    let newChat = app.buttons["chats.newButton"]
-    XCTAssertTrue(newChat.waitForExistence(timeout: 10), "New Chat button missing")
-    newChat.click()
+    openFreshChat(in: app)
 
-    let composer = app.descendants(matching: .any)
-      .matching(identifier: "composer.text")
-      .firstMatch
-    XCTAssertTrue(composer.waitForExistence(timeout: 10), "composer.text missing")
-    composer.click()
-    composer.typeText("Download then start")
+    typeComposerText("Download then start", in: app)
 
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5))
-    send.click()
+    XCTAssertTrue(send.isEnabled, "composer.send disabled after typing prompt; app tree: \(app.debugDescription)")
+    try app.readyForInput(send).click()
 
-    XCTAssertTrue(app.buttons["noModel.cancel"].waitForExistence(timeout: 5))
-    let download = app.buttons["missingModel.download"]
+    XCTAssertTrue(noModelPrompt(in: app).waitForExistence(timeout: 5))
+    let download = missingModelDownloadButton(in: app)
     XCTAssertTrue(download.waitForExistence(timeout: 5))
-    download.click()
+    try app.readyForInput(download).click()
 
     // The fake stream completes → onDownloaded fires once → the prompt
     // dismisses (and the engine start is kicked). Assert the gate's
-    // state-independent Cancel disappears, not the pinned headline (#397).
-    XCTAssertTrue(app.buttons["noModel.cancel"].waitForNonExistence(timeout: 10),
+    // state-independent prompt container disappears, not the pinned headline (#397).
+    XCTAssertTrue(noModelPrompt(in: app).waitForNonExistence(timeout: 10),
                   "a completed download must fire onDownloaded and dismiss the no-model prompt")
   }
 }

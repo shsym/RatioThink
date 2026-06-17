@@ -7,6 +7,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pie-app-icon-verifier-tests.XXXXXX")"
 
+# Pin the regeneration toolchain exactly to the Pillow the committed assets were
+# produced with (byte-identical at 12.2.0). Bump deliberately alongside a
+# manifest re-lock; a floating 12.* would red CI on any future Lanczos/PNG
+# encoding change even when the artwork and generator are unchanged.
+PILLOW_PIN="pillow==12.2.0"
+
 cleanup() {
   rm -rf "$WORK_ROOT"
 }
@@ -23,6 +29,7 @@ copy_fixture() {
   cp -R "$ROOT/Resources/Assets.xcassets" "$fixture/Resources/"
   cp "$ROOT/Scripts/genproject.sh" "$fixture/Scripts/"
   cp "$ROOT/Scripts/verify-app-icon-assets.sh" "$fixture/Scripts/"
+  cp "$ROOT/Scripts/generate-app-icon.py" "$fixture/Scripts/"
 
   # XcodeGen validates source paths when generating the project. Copy the small
   # source roots named by project.yml so the generated-project contract is
@@ -145,8 +152,45 @@ expect_failure() {
   fi
 }
 
+expect_reproducible_manifest() {
+  local name="$1"
+  local fixture
+  fixture="$(prepare_clean_fixture "$name")"
+
+  command -v uv >/dev/null 2>&1 || {
+    echo "FAIL: uv is required to regenerate the app icon under a pinned Pillow" >&2
+    exit 1
+  }
+
+  if ! (
+    cd "$fixture"
+    uv run --no-project --with "$PILLOW_PIN" python3 Scripts/generate-app-icon.py
+  ) >"$fixture/regen.log" 2>&1; then
+    cat "$fixture/regen.log" >&2
+    echo "FAIL: generate-app-icon.py failed during reproducibility check for $name" >&2
+    exit 1
+  fi
+
+  # Assert every regenerated artifact (highres + all appiconset downscales)
+  # matches the committed manifest, not just the highres master, so a
+  # downscale-path regression (wrong SIZES entry, changed resize filter) is
+  # caught too.
+  if ! (
+    cd "$fixture"
+    shasum -a 256 -c Resources/AppIcon/manifest.sha256
+  ) >"$fixture/regen-verify.log" 2>&1; then
+    cat "$fixture/regen-verify.log" >&2
+    echo "FAIL: regenerated app icon bytes do not match manifest.sha256 for $name" >&2
+    exit 1
+  fi
+}
+
 mutate_source_png() {
-  append_png_text_chunk "$1/Resources/AppIcon/pie-icon-highres.png"
+  append_png_text_chunk "$1/Resources/AppIcon/rational-icon-highres.png"
+}
+
+mutate_original_png() {
+  append_png_text_chunk "$1/Resources/AppIcon/rational-icon-original-1254.png"
 }
 
 mutate_generated_png() {
@@ -203,10 +247,12 @@ mutate_partial_generated_project_dir() {
   mkdir -p "$1/RatioThink.xcodeproj"
 }
 
+expect_reproducible_manifest "regenerate-matches-manifest"
 expect_clean_success "clean-without-generated-project"
 expect_clean_failure "partial-generated-project-dir" mutate_partial_generated_project_dir
 expect_success "baseline"
 expect_failure "source-png-drift" mutate_source_png
+expect_failure "original-png-drift" mutate_original_png
 expect_failure "generated-png-drift" mutate_generated_png
 expect_failure "wrong-plist-icon-name" mutate_plist_icon_name
 expect_failure "missing-asset-source-entry" mutate_remove_asset_source

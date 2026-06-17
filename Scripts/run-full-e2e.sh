@@ -3,7 +3,7 @@
 #   Settings acquisition → chat-apc → chat send/persist.
 #
 # Verifies THREE layers against one acquired model:
-#   Phase A: RatioThink.app downloads a curated GGUF through Settings → Models
+#   Phase A: Rational.app downloads a curated GGUF through Settings → Models
 #            (the real ModelDownloader, ) into GUI_HOME/models.
 #   Engine:  boot pie + chat-apc serving THAT downloaded GGUF via the
 #            portable driver (.portable(modelSlug, modelsRoot)).
@@ -11,7 +11,7 @@
 #            HTTPEngineClient → /v1/chat/completions path the app uses
 #            and asserts the engine reply contains "Paris" (engine
 #            contract, decoupled from the GUI; UI<->API parity seed).
-#   Layer 2 — GUI: RatioThink.app sends the prompt; the on-screen assistant
+#   Layer 2 — GUI: Rational.app sends the prompt; the on-screen assistant
 #            answer is verified (S204_ChatSendGUITests).
 #   Layer 3 — persistence: the assistant answer is verified in the
 #            SwiftData store after relaunch (sqlite "Paris" check).
@@ -22,6 +22,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
 MODEL_ID="${PIE_TEST_ACQUIRE_MODEL_ID:-qwen2.5-0.5b-instruct-q4_k_m}"
 REPO="${PIE_TEST_ACQUIRE_REPO:-Qwen/Qwen2.5-0.5B-Instruct-GGUF}"
@@ -47,14 +48,8 @@ cleanup() {
 trap cleanup EXIT
 
 # ---- Gates -----------------------------------------------------------
-if ! pgrep -x Dock >/dev/null 2>&1; then
-  echo "full e2e: no seated GUI session (Dock not running)." >&2
-  exit 2
-fi
-if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-  echo "full e2e: grant Automation/Accessibility, then rerun with PIE_TEST_TCC_GRANTED=1." >&2
-  exit 2
-fi
+e2e_require_seated_gui "full e2e" || exit 2
+e2e_require_tcc "full e2e" || exit 2
 if [ ! -x "$PIE_BIN" ]; then
   echo "full e2e: pie engine missing at $PIE_BIN — run: make engine-build" >&2
   exit 2
@@ -96,7 +91,7 @@ if [ ! -f "$PLACED" ]; then
   exit 1
 fi
 
-# Independent on-disk integrity re-verify ( F4): match the narrower
+# Independent on-disk integrity re-verify: match the narrower
 # sibling scripts (run-gui-e2e.sh, run-real-model-
 # acquisition.sh) so the FULL chain has the same integrity coverage —
 # the placed bytes' sha256 must equal HF's X-Linked-Etag (the LFS
@@ -165,7 +160,7 @@ xcrun swift run api-probe
 cat >"$CHAT_CONFIG" <<EOF
 PIE_TEST_ENGINE_BASE_URL=$BASE_URL
 PIE_TEST_GUI_HOME=$GUI_HOME
-PIE_TEST_CHAT_MODEL=$REPO/$FILE
+PIE_TEST_CHAT_MODEL_PIN=$REPO/$FILE
 EOF
 
 echo "full e2e: PHASE B — chat send/persist against the acquired model"

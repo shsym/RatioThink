@@ -5,7 +5,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SOURCE="$ROOT/Resources/AppIcon/pie-icon-highres.png"
+SOURCE="$ROOT/Resources/AppIcon/rational-icon-highres.png"
+ORIGINAL="$ROOT/Resources/AppIcon/rational-icon-original-1254.png"
 ATTRIBUTION="$ROOT/Resources/AppIcon/README.md"
 HASH_MANIFEST="$ROOT/Resources/AppIcon/manifest.sha256"
 APPICON_DIR="$ROOT/Resources/Assets.xcassets/AppIcon.appiconset"
@@ -37,14 +38,15 @@ png_dimensions() {
 }
 
 require_file "$SOURCE"
+require_file "$ORIGINAL"
 require_file "$ATTRIBUTION"
 require_file "$HASH_MANIFEST"
 require_file "$CONTENTS"
 require_file "$PROJECT"
 require_file "$APP_PLIST"
 
-grep -F "https://github.com/pie-project/pie-desktop/blob/main/assets/pie-icon-highres.png" "$ATTRIBUTION" >/dev/null ||
-  fail "Resources/AppIcon/README.md must attribute the upstream icon URL"
+grep -F "operator-provided Rational artwork" "$ATTRIBUTION" >/dev/null ||
+  fail "Resources/AppIcon/README.md must record the Rational artwork provenance"
 
 expected_source_sha="$(
   python3 - "$ATTRIBUTION" <<'PY'
@@ -61,7 +63,24 @@ PY
 )" || fail "Resources/AppIcon/README.md must record the source SHA-256"
 actual_source_sha="$(shasum -a 256 "$SOURCE" | awk '{print $1}')"
 [[ "$actual_source_sha" == "$expected_source_sha" ]] ||
-  fail "Resources/AppIcon/pie-icon-highres.png SHA-256 mismatch: expected $expected_source_sha, got $actual_source_sha"
+  fail "Resources/AppIcon/rational-icon-highres.png SHA-256 mismatch: expected $expected_source_sha, got $actual_source_sha"
+
+expected_original_sha="$(
+  python3 - "$ATTRIBUTION" <<'PY'
+import pathlib
+import re
+import sys
+
+readme = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r"Original artwork SHA-256:\s*`([0-9a-f]{64})`", readme)
+if not match:
+    raise SystemExit("missing Original artwork SHA-256 in Resources/AppIcon/README.md")
+print(match.group(1))
+PY
+)" || fail "Resources/AppIcon/README.md must record the original artwork SHA-256"
+actual_original_sha="$(shasum -a 256 "$ORIGINAL" | awk '{print $1}')"
+[[ "$actual_original_sha" == "$expected_original_sha" ]] ||
+  fail "Resources/AppIcon/rational-icon-original-1254.png SHA-256 mismatch: expected $expected_original_sha, got $actual_original_sha"
 
 (
   cd "$ROOT"
@@ -70,6 +89,9 @@ actual_source_sha="$(shasum -a 256 "$SOURCE" | awk '{print $1}')"
 
 [[ "$(png_dimensions "$SOURCE")" == "1024x1024" ]] ||
   fail "source icon must be a 1024x1024 PNG"
+
+[[ "$(png_dimensions "$ORIGINAL")" == "1254x1254" ]] ||
+  fail "original provenance icon must be a 1254x1254 PNG"
 
 python3 - "$CONTENTS" <<'PY'
 import json

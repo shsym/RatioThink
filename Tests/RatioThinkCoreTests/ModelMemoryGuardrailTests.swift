@@ -90,6 +90,84 @@ final class ModelMemoryGuardrailTests: XCTestCase {
                    ModelMemoryGuardrail.Policy.unknownRAMFallbackBytes)
   }
 
+  // MARK: - livePolicy() — honors the operator's dial fraction (#334)
+
+  /// `livePolicy` must read the persisted dial fraction, NOT the 0.65
+  /// `defaultPolicy` default. This is the derivation the ProfileEditor
+  /// picker badge and the Helper launch gate share, so a non-default dial
+  /// can't make the badge disagree with what actually loads.
+  func test_livePolicy_honors_persisted_fraction() throws {
+    let chosen = 0.80
+    XCTAssertNotEqual(chosen, ModelMemoryGuardrail.Policy.defaultRAMFraction,
+                      "test fraction must differ from the default to prove the wiring")
+    try GuardrailSettings.saveFraction(chosen, root: tempDir)
+
+    let live = ModelMemoryGuardrail.livePolicy(root: tempDir, physicalMemoryBytes: 64 * gib)
+    XCTAssertEqual(live.ramFraction, chosen,
+                   "livePolicy must honor the persisted dial fraction")
+    XCTAssertEqual(live.maxResolvedModelBytes,
+                   Int64((Double(58 * gib) * chosen).rounded()),
+                   "ceiling must use the dial fraction, (64-6)*0.80")
+  }
+
+  /// The exact bug #334 guards: at a non-default dial the live policy's
+  /// ceiling must NOT equal the stale `defaultPolicy` ceiling — otherwise
+  /// the picker badge (which used `defaultPolicy`) silently disagreed with
+  /// the gate.
+  func test_livePolicy_diverges_from_defaultPolicy_at_non_default_fraction() throws {
+    try GuardrailSettings.saveFraction(0.95, root: tempDir)
+    let live = ModelMemoryGuardrail.livePolicy(root: tempDir, physicalMemoryBytes: 64 * gib)
+    let stale = ModelMemoryGuardrail.Policy.recommended(physicalMemoryBytes: 64 * gib)  // 0.65
+    XCTAssertNotEqual(live.maxResolvedModelBytes, stale.maxResolvedModelBytes,
+                      "a raised dial must lift the live ceiling above the 0.65 default")
+    XCTAssertGreaterThan(live.maxResolvedModelBytes, stale.maxResolvedModelBytes)
+  }
+
+  /// Unset / unreadable root falls back to the default fraction (never crashes).
+  func test_livePolicy_falls_back_to_default_fraction_when_unset() {
+    let live = ModelMemoryGuardrail.livePolicy(root: tempDir, physicalMemoryBytes: 64 * gib)
+    XCTAssertEqual(live.ramFraction, GuardrailSettings.defaultFraction,
+                   "no guardrail.json → default fraction")
+    let liveNilRoot = ModelMemoryGuardrail.livePolicy(root: nil, physicalMemoryBytes: 64 * gib)
+    XCTAssertEqual(liveNilRoot.ramFraction, GuardrailSettings.defaultFraction,
+                   "nil root → default fraction")
+  }
+
+  /// A present-but-corrupt `guardrail.json` makes `loadFraction` throw;
+  /// `livePolicy` must catch + log + fall back to the default fraction so
+  /// the launch gate and picker badge never brick — it must NOT propagate
+  /// the throw. Mirrors `GuardrailSettingsTests.test_corrupt_file_throws…`
+  /// at the `livePolicy` layer (covers the catch arm directly).
+  func test_livePolicy_falls_back_on_corrupt_file() throws {
+    try Data("not json".utf8)
+      .write(to: tempDir.appendingPathComponent("guardrail.json", isDirectory: false))
+    let live = ModelMemoryGuardrail.livePolicy(root: tempDir, physicalMemoryBytes: 64 * gib)
+    XCTAssertEqual(live.ramFraction, GuardrailSettings.defaultFraction,
+                   "corrupt guardrail.json → default fraction, not a propagated throw")
+  }
+
+  /// A support-root *resolution* failure (rootMkdirFailed) is an
+  /// environmental fault, not an unset dial. `resolvedSupportRootOrLogged`
+  /// — the default-arg resolver for `livePolicy` — must log it and return
+  /// nil (→ default fraction) rather than launder it to a silent nil via a
+  /// bare `try?`. The nil return is the testable seam; a writable root
+  /// resolves to a real URL (positive control so the failure assertion
+  /// isn't vacuous).
+  func test_resolvedSupportRootOrLogged_returns_nil_on_root_failure() {
+    let unwritable = URL(fileURLWithPath: "/System/Library/pie-test-cannot-create")
+    PieDirs.$homeOverride.withValue(unwritable) {
+      XCTAssertNil(ModelMemoryGuardrail.resolvedSupportRootOrLogged(),
+                   "a support-root resolution failure must resolve to nil (logged fallback)")
+    }
+
+    // Positive control so the failure assertion isn't vacuous: a writable
+    // root resolves to a real URL. `tempDir` is created writable in setUp.
+    PieDirs.$homeOverride.withValue(tempDir) {
+      XCTAssertNotNil(ModelMemoryGuardrail.resolvedSupportRootOrLogged(),
+                      "a resolvable root must return a URL, not nil")
+    }
+  }
+
   // MARK: - validate() over a real (sparse) file
 
   func test_validate_8gb_host_blocks_4gib_model_with_terms_in_message() throws {

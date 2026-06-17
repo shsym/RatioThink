@@ -1,4 +1,8 @@
 #!/bin/bash
+#
+# Fast, non-GUI preflight regressions for run-resume-gui-history-e2e.sh. Drives
+# the REAL wrapper to assert its TCC preflight runs before the deterministic
+# harness starts, without a seated session. Runs in `make test-gui-script`.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -52,7 +56,7 @@ FAKE_PGREP
     printf '%s\n' "$output" >&2
     exit 1
   fi
-  require_contains "$output" "RatioThink.app Automation/Accessibility permissions required"
+  require_contains "$output" "Automation/Accessibility permission required"
   require_contains "$output" "PIE_TEST_TCC_GRANTED=1"
   if [[ "$output" == *"starting deterministic HTTP harness"* ]]; then
     echo "FAIL: TCC preflight must happen before starting the deterministic harness" >&2

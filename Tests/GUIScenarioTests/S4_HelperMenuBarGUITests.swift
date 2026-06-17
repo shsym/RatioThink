@@ -3,8 +3,8 @@ import XCTest
 
 /// S4 — RatioThinkHelper menu bar shell.
 ///
-/// GUI-only. Asserts against FINAL design strings (`Show RatioThink`, `Engine:
-/// stopped`, `Settings…`, `Open Logs…`, `Quit RatioThink`) so the test stays
+/// GUI-only. Asserts against FINAL design strings (`Show Rational`, `Engine:
+/// stopped`, `Settings…`, `Open Logs…`, `Quit Rational`) so the test stays
 /// honest about whether real impl has landed. Skips if no seated session.
 final class S4_HelperMenuBarGUITests: XCTestCase {
   override func setUp() async throws {
@@ -21,15 +21,12 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     // `HelperStatusItemModel` renders the status shell from the `.stopped`
     // status alone and never consults the model, so this menu-shell smoke
     // needs no weight and must run on a model-less checkout (gated only by
-    // guardSeatedGUI). The helper auto-resumes the ACTIVE profile at boot
-    // (HelperMain.autoResumeEngineOnBoot), so a freshly-seeded PIE_HOME —
-    // whose seed also writes the active-profile marker — would boot to
-    // `starting…`/`Pause Engine`. Pre-write a profile so `seedDefaultsIfEmpty`
-    // skips (a .toml already exists) and NO `<PIE_HOME>/active-profile` marker
-    // is written → `activeProfileID` is nil → autoResume no-ops
-    // (`.noActiveProfile`) → the engine stays `.stopped`. Only the file's
-    // existence matters (the helper never resolves it — no active profile), so
-    // it is a minimal placeholder, NOT a copy of the seed format. PIE_HOME lives
+    // guardSeatedGUI). Helper boot now leaves the engine stopped; explicit
+    // Resume/start requests are the paths that move it to `starting…` /
+    // `Pause Engine`. Pre-write a profile so the fresh-install marker seed
+    // skips (a .toml already exists) and no `<PIE_HOME>/active-profile` marker is
+    // written. Only the file's existence matters for this shell test, so it is
+    // a minimal placeholder, NOT a copy of the seed format. PIE_HOME lives
     // under the runner-writable NSTemporaryDirectory container (the sandboxed
     // runner cannot create dirs under /tmp).
     let fm = FileManager.default
@@ -80,12 +77,12 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     // helper boot, which `HelperStatusItemModel` maps to the
     // disabled "Resume Engine" item. Phase 2.4 wires
     // ProfileStore so the item actually enables.
-    for expected in ["Show RatioThink", "Engine: stopped", "Resume Engine",
-                     "Settings…", "Open Logs…", "Quit RatioThink"] {
+    for expected in ["Show Rational", "Engine: stopped", "Resume Engine",
+                     "Settings…", "Open Logs…", "Quit Rational"] {
       XCTAssertTrue(titles.contains(expected),
                     "menu missing '\(expected)'; got: \(titles)")
     }
-    // Idle-shell determinism: no active profile ⇒ autoResume no-ops, so the
+    // Idle-shell determinism: helper boot leaves the engine stopped, so the
     // running/starting affordances must be ABSENT — proving the `.stopped`
     // shell renders without any staged model.
     for absent in ["Pause Engine", "Engine: starting…"] {
@@ -96,10 +93,10 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     app.typeKey(.escape, modifierFlags: [])
   }
 
-  ///  end-to-end (enable-only): a fresh `PIE_HOME` triggers
-  /// `ProfileStore.seedDefaultsIfEmpty`, which now also writes the
-  /// active-profile marker. The menu-bar `Resume Engine` item must
-  /// become enabled — proving the seeded marker landed and the
+  ///  end-to-end (enable-only): a fresh `PIE_HOME` seeds the
+  /// active-profile marker -> chat (#702: built-ins are the in-code base
+  /// layer; only the marker is written). The menu-bar `Resume Engine` item
+  /// must become enabled — proving the seeded marker landed and the
   /// resolver / status binding wired through.
   ///
   ///  (landed): `togglePauseResume` now drives
@@ -111,7 +108,7 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
   /// Its real pre-requisites are:
   ///   · TCC permissions granted (covered by the existing skip),
   ///   · the bundled pie binary at
-  ///     `<RatioThink.app>/Contents/Resources/pie-engine/pie` (Scripts/
+  ///     `<Rational.app>/Contents/Resources/pie-engine/pie` (Scripts/
   ///     build-pie-engine.sh stages this during xcodebuild; the
   ///     portable Metal driver is compiled in — verify with
   ///     `pie doctor` → "portable compiled in"),
@@ -128,8 +125,8 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
   ///     fixture (`test-models/`) or `PIE_TEST_MODEL` env override.
   ///     `LaunchSpecResolver` joins `<PIE_HOME>/models` with
   ///     `profile.model` to build the model path.
-  ///   - `inferlets` — symlinked at `<RatioThink.app>/Contents/Resources/Inferlets`
-  ///     resolved via the test bundle's sibling RatioThink.app (test target
+  ///   - `inferlets` — symlinked at `<Rational.app>/Contents/Resources/Inferlets`
+  ///     resolved via the test bundle's sibling Rational.app (test target
   ///     depends on `RatioThink`, so xcodebuild stages it next to the runner),
   ///     so the engine's inferlet-dir walk finds the bundled
   ///     `chat-apc` artifacts.
@@ -188,22 +185,22 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
       withDestinationURL: modelSource
     )
 
-    // 3. Locate RatioThink.app via the test bundle's sibling, not LaunchServices.
+    // 3. Locate Rational.app via the test bundle's sibling, not LaunchServices.
     //    `project.yml` declares `RatioThinkGUITests.dependencies = [target: RatioThink,
-    //    target: RatioThinkHelper]` so xcodebuild stages RatioThink.app at
-    //    `<BUILT_PRODUCTS_DIR>/RatioThink.app` next to the runner. Walking up
+    //    target: RatioThinkHelper]` so xcodebuild stages Rational.app at
+    //    `<BUILT_PRODUCTS_DIR>/Rational.app` next to the runner. Walking up
     //    from `Bundle(for:)` finds it deterministically — LaunchServices
     //    lookup can fail for many reasons (stale LSDB entry, sandboxed
     //    runner) that produce a misleading skip (review v1 F1).
     let pieAppURL = try XCTUnwrap(
-      Self.locateSiblingApp(named: "RatioThink.app", from: type(of: self)),
-      "RatioThink.app not found next to test bundle — verify project.yml `RatioThinkGUITests.dependencies` includes `target: RatioThink`"
+      Self.locateSiblingApp(named: "Rational.app", from: type(of: self)),
+      "Rational.app not found next to test bundle — verify project.yml `RatioThinkGUITests.dependencies` includes `target: RatioThink`"
     )
     let inferletSource = pieAppURL
       .appendingPathComponent("Contents/Resources/Inferlets", isDirectory: true)
     XCTAssertTrue(
       fm.fileExists(atPath: inferletSource.path),
-      "bundled inferlets dir missing at \(inferletSource.path) — re-run `make build-inferlets` and re-build RatioThink.app"
+      "bundled inferlets dir missing at \(inferletSource.path) — re-run `make build-inferlets` and re-build Rational.app"
     )
     try fm.createSymbolicLink(
       at: tempDir.appendingPathComponent("inferlets"),
@@ -226,7 +223,7 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     XCTAssertGreaterThan(statusItems.count, 0, "no status items registered")
 
     // 5. Open the menu and wait for "Resume Engine" to become enabled.
-    //    seedDefaultsIfEmpty runs synchronously inside ProfileStore.start(),
+    //    the marker seed runs synchronously inside ProfileStore.start(),
     //    but the `.stopped → enabled` publish hop, resolver wiring,
     //    and HelperStatusItemBinding's main-thread apply all take a
     //    tick to settle. 8s leaves margin.
@@ -244,7 +241,7 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
                                     handler: nil)
     let enabledOutcome = XCTWaiter().wait(for: [enabledExpect], timeout: 8)
     XCTAssertEqual(enabledOutcome, .completed,
-                   "Resume Engine never became enabled — seedDefaultsIfEmpty or LaunchSpecResolver wiring failed (PIE_HOME=\(tempDir.path))")
+                   "Resume Engine never became enabled — marker seed or LaunchSpecResolver wiring failed (PIE_HOME=\(tempDir.path))")
 
     // 6. Dismiss without clicking Resume. The end-to-end click+boot
     //    assertion lives in the sibling test below; this test's
@@ -283,20 +280,20 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     )
 
     let pieAppURL = try XCTUnwrap(
-      Self.locateSiblingApp(named: "RatioThink.app", from: type(of: self)),
-      "RatioThink.app not found next to test bundle — verify project.yml `RatioThinkGUITests.dependencies` includes `target: RatioThink`"
+      Self.locateSiblingApp(named: "Rational.app", from: type(of: self)),
+      "Rational.app not found next to test bundle — verify project.yml `RatioThinkGUITests.dependencies` includes `target: RatioThink`"
     )
     let stagedPieBinary = pieAppURL
       .appendingPathComponent("Contents/Resources/pie-engine/pie", isDirectory: false)
     try XCTSkipUnless(
       fm.isExecutableFile(atPath: stagedPieBinary.path),
-      "bundled pie engine missing at \(stagedPieBinary.path) — rebuild RatioThink.app (Scripts/build-pie-engine.sh)"
+      "bundled pie engine missing at \(stagedPieBinary.path) — rebuild Rational.app (Scripts/build-pie-engine.sh)"
     )
     let inferletSource = pieAppURL
       .appendingPathComponent("Contents/Resources/Inferlets", isDirectory: true)
     XCTAssertTrue(
       fm.fileExists(atPath: inferletSource.path),
-      "bundled inferlets dir missing at \(inferletSource.path) — re-run `make build-inferlets` and re-build RatioThink.app"
+      "bundled inferlets dir missing at \(inferletSource.path) — re-run `make build-inferlets` and re-build Rational.app"
     )
     try fm.createSymbolicLink(
       at: tempDir.appendingPathComponent("inferlets"),
@@ -349,7 +346,9 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     XCTAssertNotNil(failureTitle,
                     "oversized model rejection should surface memoryRisk status/copy in the menu; got \(titles)")
     if let failureTitle {
-      XCTAssertTrue(failureTitle.contains("choose a smaller model"),
+      // #477: the menu renders the curated EngineProblem line, not the
+      // raw guardrail prose.
+      XCTAssertTrue(failureTitle.contains("Pick a smaller model"),
                     "memoryRisk menu copy should include recovery guidance; got \(failureTitle)")
     }
     XCTAssertFalse(titles.contains(where: { $0 == "Engine: starting…" || $0 == "Pause Engine" }),
@@ -364,7 +363,7 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
   /// Pre-reqs (all skip-with-clear-reason if missing):
   ///   · `PIE_TEST_TCC_GRANTED=1` (Accessibility / Automation),
   ///   · pie binary bundled at
-  ///     `<RatioThink.app>/Contents/Resources/pie-engine/pie` (built by
+  ///     `<Rational.app>/Contents/Resources/pie-engine/pie` (built by
   ///     the `Build pie engine binary` post-compile phase — see
   ///     project.yml; portable Metal driver is compiled in),
   ///   · `Qwen3-0.6B-Q8_0.gguf` at `PIE_TEST_MODEL` or repo-root
@@ -412,25 +411,25 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     // validateAppStagedModel, which rejects non-regular files.
     try Self.stageSeededModelRegularFile(from: modelSource, in: modelsDir)
 
-    // 3. Locate RatioThink.app via the test bundle's sibling, then verify
+    // 3. Locate Rational.app via the test bundle's sibling, then verify
     //    the staged pie binary exists. If it's missing, the
     //    post-compile build phase didn't run — skip with a clear
     //    pointer so the operator knows to rebuild.
     let pieAppURL = try XCTUnwrap(
-      Self.locateSiblingApp(named: "RatioThink.app", from: type(of: self)),
-      "RatioThink.app not found next to test bundle — verify project.yml `RatioThinkGUITests.dependencies` includes `target: RatioThink`"
+      Self.locateSiblingApp(named: "Rational.app", from: type(of: self)),
+      "Rational.app not found next to test bundle — verify project.yml `RatioThinkGUITests.dependencies` includes `target: RatioThink`"
     )
     let stagedPieBinary = pieAppURL
       .appendingPathComponent("Contents/Resources/pie-engine/pie", isDirectory: false)
     try XCTSkipUnless(
       fm.isExecutableFile(atPath: stagedPieBinary.path),
-      "bundled pie engine missing at \(stagedPieBinary.path) — rebuild RatioThink.app (Scripts/build-pie-engine.sh)"
+      "bundled pie engine missing at \(stagedPieBinary.path) — rebuild Rational.app (Scripts/build-pie-engine.sh)"
     )
     let inferletSource = pieAppURL
       .appendingPathComponent("Contents/Resources/Inferlets", isDirectory: true)
     XCTAssertTrue(
       fm.fileExists(atPath: inferletSource.path),
-      "bundled inferlets dir missing at \(inferletSource.path) — re-run `make build-inferlets` and re-build RatioThink.app"
+      "bundled inferlets dir missing at \(inferletSource.path) — re-run `make build-inferlets` and re-build Rational.app"
     )
     try fm.createSymbolicLink(
       at: tempDir.appendingPathComponent("inferlets"),
@@ -440,10 +439,8 @@ final class S4_HelperMenuBarGUITests: XCTestCase {
     // 4. Launch helper bound to the isolated PIE_HOME.
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app.helper")
     app.launchEnvironment["PIE_HOME"] = tempDir.path
-    // Suppress boot auto-resume so the engine starts ONLY via the explicit
-    // Resume click this test exercises — otherwise the async auto-start
-    // pre-empts it (menu already shows "Pause Engine", no Resume to click).
-    app.launchEnvironment["PIE_TEST_NO_AUTO_RESUME"] = "1"
+    // Helper boot leaves the engine stopped, so this test exercises the
+    // explicit Resume click as the only start trigger.
     app.launchEnvironment["PIE_ALLOW_UNSIGNED_CALLERS"] = "1"
     app.launch()
     defer { app.terminate() }

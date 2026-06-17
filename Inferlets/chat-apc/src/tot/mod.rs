@@ -36,7 +36,7 @@
 //!
 //! A structured tree. Each node carries a stable `id`, `parent_id`,
 //! `depth`, `branch_index`, `content`, `score` (1–10 or `null`),
-//! `status` (`"root" | "ok" | "error"`), an optional per-node `error`
+//! `status` (`"root" | "ok" | "error" | "incomplete"`), an optional per-node `error`
 //! (generation-failure diagnostic), an optional per-node `score_error`
 //! (value-evaluator infra failure — see the scoring caveat), and nested
 //! `children`. The envelope adds `selected_node_id` + `final_answer` (the
@@ -49,33 +49,47 @@
 //! represented on the node (`status:"error"` + `error`) while the rest
 //! of the tree still returns.
 //!
-//! ## Scope (v1)
+//! ## Streaming (`stream:true`, #413)
 //!
-//! Non-streaming only — `stream:true` is rejected with 400. The live
-//! tree-search UI + a ToT streaming wire format are tracked separately
-//! (ticket #413). The `tree-of-thought` dispatch *name* is the stable
-//! wire seam: a future move to a dynamically-loaded or separate inferlet
-//! requires no client change.
+//! `stream:true` returns an SSE stream that surfaces the search live —
+//! `tree_start`, then per level a `node_complete` for every generated node
+//! followed by a `level_pruned` beam selection, then ONE terminal:
+//! `tree_complete` when a final answer was produced, or `error` when the
+//! search could not produce one (F1 — either no selected leaf or a retained
+//! inspection node with no synthesized final answer; see
+//! [`stream::terminal_error`]). Non-streaming is symmetric: a search with a
+//! final answer returns the 200 `TreeResponse`; a terminal failure returns the
+//! same JSON `error` envelope. The wire format + frame schema live in
+//! [`stream`]; the same [`search::run`] orchestration drives both the
+//! streamed and non-streamed responses (it just takes an optional
+//! [`Emitter`]), so the two can never diverge. Pre-stream failures
+//! (validation, model resolution, context build) still return the JSON
+//! 4xx/5xx envelope — the SSE response is opened only once the root
+//! context is built and flushed, so a doomed request never emits a
+//! misleading `tree_start`. The `tree-of-thought` dispatch *name* is the
+//! stable wire seam: a future move to a dynamically-loaded or separate
+//! inferlet requires no client change.
 //!
-//! ## Scoring caveat (v1)
+//! ## Diversity + scoring (#523)
 //!
-//! The value evaluator asks the model for a single 1–10 integer and
-//! parses the first in-range integer it emits. **Reasoning models**
-//! (e.g. Qwen3, which wraps output in `<think>…</think>`) tend to
-//! restate the problem before answering, so the first integer is often
-//! out of range and the score parses to `null`. A `null` score ranks
-//! lowest, so the beam falls back to deterministic (input-order)
-//! selection — the search still runs and returns a well-formed tree,
-//! but pruning is not quality-driven. Real score-driven pruning needs a
-//! non-reasoning model, a `/no_think`-style directive, or reasoning-tag
-//! stripping + a larger score budget (future work).
+//! Sibling branches do not rely on sampling temperature alone: each fork
+//! gets a distinct per-branch directive (a named, mutually-exclusive
+//! strategy that differs by primary objective/tradeoff; critique-then-
+//! refine at deeper levels — see `search::branch_directive`), and beam
+//! selection demotes a paraphrase of an already-kept sibling so a distinct
+//! branch takes the slot (`tree::select_beam_diverse`). The value evaluator
+//! scores for task relevance, correctness, specificity, and usefulness —
+//! not fluency or brevity — so a polished generic acknowledgment can no
+//! longer outrank a candidate that actually addresses the request.
 //!
-//! This benign `null` (the model emitted no in-range integer) is
-//! distinct from a scorer-*infrastructure* failure (the value-evaluator
-//! fork or generation itself failed): the latter surfaces as a per-node
-//! `score_error`, so an infra collapse that silently degrades the beam to
-//! input-order pruning is observable rather than indistinguishable from
-//! an ordinary `null`.
+//! The scorer is a `/no_think` value head reading the clean (demuxed)
+//! answer; it parses the first in-range 1–10 integer. A `null` score (the
+//! model emitted no in-range integer) ranks lowest and falls back to
+//! input-order, and is distinct from a scorer-*infrastructure* failure
+//! (the value-evaluator fork or generation itself failed), which surfaces
+//! as a per-node `score_error` so an infra collapse is observable rather
+//! than indistinguishable from a benign `null`. Real-model evidence:
+//! `Scripts/run-tot-real-smoke.sh` (gated, NOT CI).
 //!
 //! ## Future
 //!
@@ -86,14 +100,50 @@
 //!   `max_tokens` status granularity; per-node partial content on error;
 //!   streaming (#413).
 
+pub(crate) mod branch;
+mod diversity;
 mod schema;
 mod search;
+mod stream;
 mod tree;
 
 use crate::chat::completions::{self, ChatMessage};
-use crate::sse;
+use crate::sse::{self, Emitter};
+use std::time::Instant;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Response};
+
+fn validate_tot_messages(
+    messages: &[ChatMessage],
+) -> Result<(), completions::MessageValidationError> {
+    completions::validate_messages(messages)?;
+
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.has_tool_calls() {
+            return Err(completions::MessageValidationError::new(
+                "tool_continuation_unsupported",
+                "tree-of-thought does not support assistant tool_call continuation history",
+                format!("messages[{i}].tool_calls"),
+            ));
+        }
+        if msg.role == "tool" {
+            return Err(completions::MessageValidationError::new(
+                "tool_continuation_unsupported",
+                "tree-of-thought does not support role=\"tool\" messages",
+                format!("messages[{i}].role"),
+            ));
+        }
+        if msg.tool_call_id.is_some() {
+            return Err(completions::MessageValidationError::new(
+                "tool_continuation_unsupported",
+                "tree-of-thought does not support tool_call_id continuation fields",
+                format!("messages[{i}].tool_call_id"),
+            ));
+        }
+    }
+
+    Ok(())
+}
 
 /// Handle a `inferlet:"tree-of-thought"` dispatch. `input` is the
 /// inferlet-specific payload; `messages` is the optional top-level
@@ -104,18 +154,6 @@ pub async fn dispatch(
     stream: bool,
     res: Responder,
 ) -> Finished {
-    // v1 has no streaming. Reject explicitly rather than silently
-    // ignoring the flag (Swift's dispatchInferlet defaults stream:true).
-    if stream {
-        return res
-            .respond(sse::json_error(
-                400,
-                "invalid_request",
-                "tree-of-thought has no streaming in v1; set stream:false",
-            ))
-            .await;
-    }
-
     let input: schema::TotInput = match input {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
@@ -134,7 +172,7 @@ pub async fn dispatch(
 
     // `input.messages` wins over top-level chat-sugar (mirrors
     // dispatch_chat_apc).
-    let messages = match (input.messages.clone(), messages) {
+    let mut messages = match (input.messages.clone(), messages) {
         (Some(m), _) => m,
         (None, Some(m)) => m,
         (None, None) => {
@@ -158,11 +196,20 @@ pub async fn dispatch(
             ))
             .await;
     }
-    if let Some((i, _)) = messages
-        .iter()
-        .enumerate()
-        .find(|(_, m)| m.content.trim().is_empty())
-    {
+    if let Err(err) = validate_tot_messages(&messages) {
+        return res
+            .respond(completions::json_error_param(
+                400,
+                err.code,
+                &err.message,
+                &err.param,
+            ))
+            .await;
+    }
+    if let Some((i, _)) = messages.iter().enumerate().find(|(_, m)| {
+        m.content_str()
+            .is_none_or(|content| content.trim().is_empty())
+    }) {
         return res
             .respond(sse::json_error(
                 400,
@@ -176,10 +223,30 @@ pub async fn dispatch(
         Ok(p) => p,
         Err((field, msg)) => {
             return res
-                .respond(completions::json_error_param(400, "invalid_request", &msg, field))
+                .respond(completions::json_error_param(
+                    400,
+                    "invalid_request",
+                    &msg,
+                    field,
+                ))
                 .await;
         }
     };
+
+    // #413/#437: tree-of-thought THINKS by default — the `<think>` reasoning
+    // is the point of the search, demuxed apart from the answer per node (see
+    // `search::generate_demuxed`). Only when the caller disables it
+    // (`thinking:false`) do we append the `/no_think` directive to the last
+    // user turn (Qwen3 keys thinking off it); deeper levels + the scorer carry
+    // it via `with_thinking(REFINE_INSTRUCTION/SCORE_PROMPT)`. The directive is
+    // an inert token on a non-reasoning model.
+    if !params.thinking {
+        if let Some(last) = messages.iter_mut().rev().find(|m| m.role == "user") {
+            if let Some(content) = last.content.as_mut() {
+                content.push_str(" /no_think");
+            }
+        }
+    }
 
     // Resolve the model (default to the engine's single registered model).
     let model_id = match input.model {
@@ -237,9 +304,18 @@ pub async fn dispatch(
     // cue:false — the assistant turn is opened per branch in `search`
     // (each fork re-cues), so the shared prefix stays cue-free and KV
     // pages are shared across branches.
-    if let Err((code, msg)) = completions::fill_context(&mut root_ctx, &model, &messages, None, false)
+    if let Err((code, msg)) =
+        completions::fill_context(&mut root_ctx, &model, &messages, None, false)
     {
-        return res.respond(sse::json_error(500, code, &msg)).await;
+        // #468: an unknown role is a client error (400, same envelope as
+        // the completions path); other fill_context failures (e.g.
+        // tool_equip_failed) stay 500.
+        let status = if completions::is_role_error_code(code) {
+            400
+        } else {
+            500
+        };
+        return res.respond(sse::json_error(status, code, &msg)).await;
     }
     if let Err(e) = root_ctx.flush().await {
         return res
@@ -251,10 +327,33 @@ pub async fn dispatch(
             .await;
     }
 
-    let outcome = search::run(root_ctx, &params).await;
+    // Generated once so the streaming `tree_start` id and the non-streaming
+    // envelope id come from the same source.
+    let tree_id = tree::new_tree_id();
+
+    // #413: the root context is now built + flushed, so a `stream:true`
+    // request can safely commit SSE headers — every failure that warranted
+    // a JSON 4xx/5xx envelope has already returned above.
+    if stream {
+        return dispatch_streaming(root_ctx, &params, &model, &tree_id, &model_id, res).await;
+    }
+
+    let started = Instant::now();
+    let outcome = search::run(root_ctx, &params, &model, None).await;
+
+    // F1/review v4: terminal success requires an actual final answer, not
+    // merely a selected inspection node. A retained intermediate candidate
+    // after a later full failure can be useful for tree inspection, but if
+    // synthesis did not produce a final answer, do not publish a 200
+    // success-shaped tree with `final_answer:null`.
+    if let Some((code, message)) =
+        stream::terminal_error(&outcome.selected_node_id, &outcome.final_answer)
+    {
+        return res.respond(sse::json_error(500, code, message)).await;
+    }
 
     let response_body = tree::TreeResponse {
-        id: tree::new_tree_id(),
+        id: tree_id,
         object: "tree_of_thought",
         model: model_id,
         breadth: params.breadth,
@@ -263,6 +362,11 @@ pub async fn dispatch(
         root: outcome.root,
         selected_node_id: outcome.selected_node_id,
         final_answer: outcome.final_answer,
+        synthesized: outcome.synthesized,
+        generation_metrics: tree::GenerationMetrics::build(
+            outcome.total_generated_tokens,
+            started.elapsed(),
+        ),
     };
     let body = match serde_json::to_string(&response_body) {
         Ok(s) => s,
@@ -282,4 +386,116 @@ pub async fn dispatch(
         .body(body.into_body())
         .unwrap();
     res.respond(response).await
+}
+
+/// SSE streaming variant (#413). `Emitter::start` commits the response
+/// headers, so from here every exit path finishes through the emitter —
+/// all pre-stream failures (validation, model resolution, context build)
+/// were already returned as JSON envelopes by [`dispatch`] before this is
+/// reached, exactly like `chat-apc`'s `handle_streaming`.
+///
+/// Frame order: `tree_start` → (`node_complete`* `level_pruned`)\* per
+/// level (emitted inside [`search::run`]) → one terminal `tree_complete`
+/// (a final answer was produced) OR `error` (F1: no final answer)
+/// → `[DONE]`. The streamed `node_complete` frames carry the (error) tree
+/// regardless, so an `error` terminal still leaves the client a renderable
+/// tree plus a surfaced failure. A client that disconnects before the
+/// first frame ends the stream immediately; mid-stream disconnects are
+/// swallowed by `run` and the terminal emits below (the search still
+/// completes, just unobserved).
+async fn dispatch_streaming(
+    root_ctx: inferlet::Context,
+    params: &schema::TotParams,
+    model: &inferlet::model::Model,
+    tree_id: &str,
+    model_id: &str,
+    res: Responder,
+) -> Finished {
+    let mut em = Emitter::start(res);
+    if stream::emit_tree_start(&mut em, tree_id, model_id, params)
+        .await
+        .is_err()
+    {
+        return em.finish();
+    }
+    let started = Instant::now();
+    let outcome = search::run(root_ctx, params, model, Some(&mut em)).await;
+    if let Some((code, message)) =
+        stream::terminal_error(&outcome.selected_node_id, &outcome.final_answer)
+    {
+        // F1/review v4: terminal failure — emit the documented terminal
+        // `error` frame (the client's catch marks the turn failed) instead
+        // of a success-shaped `tree_complete` without a final answer.
+        let _ = em.emit_json(&sse::SseError::new(code, message)).await;
+    } else {
+        if let Some(metrics) =
+            tree::GenerationMetrics::build(outcome.total_generated_tokens, started.elapsed())
+        {
+            if stream::emit_generation_metrics(&mut em, &metrics)
+                .await
+                .is_ok()
+            {
+                let _ = stream::emit_tree_complete(
+                    &mut em,
+                    outcome.selected_node_id.as_deref(),
+                    outcome.final_answer.as_deref(),
+                    outcome.synthesized,
+                )
+                .await;
+            }
+        } else {
+            let _ = em
+                .emit_json(&sse::SseError::new(
+                    stream::METRICS_UNAVAILABLE_CODE,
+                    stream::METRICS_UNAVAILABLE_MESSAGE,
+                ))
+                .await;
+        }
+    }
+    sse::emit_done_logged(&mut em, "tot_terminal").await;
+    em.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn messages(json: &str) -> Vec<ChatMessage> {
+        serde_json::from_str(json).expect("messages should deserialize")
+    }
+
+    #[test]
+    fn tot_rejects_malformed_tool_continuations_before_context_fill() {
+        let malformed = messages(
+            r#"[{
+                "role":"assistant",
+                "content":null,
+                "tool_calls":[{
+                    "id":123,
+                    "type":"function",
+                    "function":{"name":"calculator","arguments":"{}"}
+                }]
+            }]"#,
+        );
+        let err = validate_tot_messages(&malformed)
+            .expect_err("malformed assistant tool_calls should fail before fill_context");
+        assert_eq!(err.code, "malformed_tool_calls");
+        assert_eq!(err.param, "messages[0].tool_calls[0].id");
+
+        let non_assistant = messages(
+            r#"[{
+                "role":"user",
+                "content":"hi",
+                "tool_calls":[{
+                    "id":"call_x",
+                    "type":"function",
+                    "function":{"name":"calculator","arguments":"{}"}
+                }]
+            }]"#,
+        );
+        let err = validate_tot_messages(&non_assistant)
+            .expect_err("tool_calls on non-assistant roles should fail before fill_context");
+        assert_eq!(err.code, "malformed_tool_calls");
+        assert_eq!(err.param, "messages[0].tool_calls");
+    }
 }

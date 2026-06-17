@@ -1,7 +1,7 @@
 #!/bin/bash
-# Unit regression for Scripts/lib/proc-acceptance.sh ( F1).
+# Unit regression for Scripts/lib/proc-acceptance.sh.
 #
-# Verification must reject any pie/RatioThinkHelper not PROVEN to be from this
+# Verification must reject any pie/RationalHelper not PROVEN to be from this
 # launch: a stale image whose argv still shows the (replaced) bundle path,
 # AND — crucially — a respawn in the SAME wall-clock second as the
 # acceptance epoch (whole-second `etimes` would otherwise compute it as
@@ -13,20 +13,20 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/proc-acceptance.sh
 . "$ROOT/Scripts/lib/proc-acceptance.sh"
 
-APP="/Applications/RatioThink.app"
+APP="/Applications/Rational.app"
 EPOCH=1000000
 NOW=$EPOCH        # mutable; the date stub reads it
 
 date() { echo "$NOW"; }
-# ps -o args= -p <pid>  /  ps -o etimes= -p <pid>
+# ps -o args= -p <pid>  /  ps -o etimes= -p <pid> / ps -o pid=,comm=,etimes= -p <pid>
 #   1xx: new-bundle path;  200: foreign path
 ps() {
   local field="$2" pid="$4"
   case "$field" in
     args=)
       case "$pid" in
-        100|101|102|103) echo "/Applications/RatioThink.app/Contents/Resources/pie-engine/pie serve --config x" ;;
-        200)             echo "/Applications/Other.app/Contents/MacOS/Other" ;;
+        100|101|102|103) echo "/Applications/Rational.app/Contents/Resources/pie-engine/pie serve --config x" ;;
+        200|300)         echo "/Applications/Other.app/Contents/MacOS/Other" ;;
         *)               return 1 ;;
       esac ;;
     etimes=)
@@ -35,9 +35,23 @@ ps() {
         101) echo "5" ;;   # with NOW=EPOCH+5 -> start = EPOCH     (same-second boundary)
         103) echo "4" ;;   # with NOW=EPOCH+5 -> start = EPOCH+1   (after barrier)
         102) echo "0" ;;   # used in the NOW=EPOCH scenario -> start = EPOCH
-        200) echo "0" ;;
+        200|300) echo "0" ;;
         *)   return 1 ;;
       esac ;;
+    pid=,comm=,etimes=)
+      case "$pid" in
+        100|101|102|103) echo "$pid RationalHelper 4" ;;
+        200)             echo "$pid pie 0" ;;
+        300)             echo "$pid RatioThinkHelper 0" ;;
+        *)               return 1 ;;
+      esac ;;
+  esac
+}
+pgrep() {
+  case "$2" in
+    pie)              echo "200" ;;
+    RationalHelper)   echo "103" ;;
+    RatioThinkHelper) echo "300" ;;
   esac
 }
 
@@ -57,4 +71,19 @@ reject 200 "foreign bundle path"
 NOW=$EPOCH
 reject 102 "etimes=0 respawn in the same second as the acceptance epoch"
 
-if [ "$fails" -eq 0 ]; then echo "PASS: proc-acceptance (5/5)"; exit 0; else echo "FAIL: $fails check(s)"; exit 1; fi
+NOW=$((EPOCH + 5))
+stale="$(stale_procs "$APP" "$EPOCH")"
+case "$stale" in
+  *"200 pie"* ) echo "ok:  stale_procs reports foreign pie" ;;
+  *) echo "FAIL: stale_procs did not report foreign pie ($stale)"; fails=$((fails+1)) ;;
+esac
+case "$stale" in
+  *"300 RatioThinkHelper"* ) echo "ok:  stale_procs reports legacy RatioThinkHelper during rename migration" ;;
+  *) echo "FAIL: stale_procs did not report legacy RatioThinkHelper ($stale)"; fails=$((fails+1)) ;;
+esac
+case "$stale" in
+  *"103 RationalHelper"* ) echo "FAIL: stale_procs reported new RationalHelper ($stale)"; fails=$((fails+1)) ;;
+  *) echo "ok:  stale_procs ignores accepted new RationalHelper" ;;
+esac
+
+if [ "$fails" -eq 0 ]; then echo "PASS: proc-acceptance"; exit 0; else echo "FAIL: $fails check(s)"; exit 1; fi

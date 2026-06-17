@@ -22,7 +22,39 @@ import SwiftUI
 struct ContentToolbar: View {
   @ObservedObject var viewModel: ChatTranscriptViewModel
   let availableProfiles: [String]
-  let availableModels: [String]
+  /// #459's option list for the model menu (checkmark on current,
+  /// profile-default annotation, unavailable reasons, "Manage Models…").
+  /// Built by `ChatScaffoldView` from `Chat.modelID` (the #460 authority) +
+  /// the served/discovered models.
+  let modelOptions: [ToolbarModelOptions.Option]
+  /// #459's collapsed model-menu summary (concrete leaf + optional
+  /// annotation). `ChatScaffoldView` derives it from `Chat.modelID`.
+  let currentModelSummary: ToolbarModelOptions.CurrentSummary?
+  /// #460: the chat's persisted selected model (`Chat.modelID`) — the single
+  /// selection authority. Resolves the swap-policy "from model" and the
+  /// model-menu clear-vs-load decision; `nil` ⇒ the chat follows the active
+  /// profile's default. NOT engine residency (residency is not a selection
+  /// source under the single authority).
+  let selectedModelID: String?
+  /// #460: the active profile's default model — resolves the effective
+  /// "from model" (`selectedModelID ?? profileDefaultModel`) the swap policy
+  /// compares against.
+  let profileDefaultModel: String?
+  /// #460: persists a confirmed profile swap (profile + optional pinned
+  /// model) — wired by `ChatScaffoldView`, which owns the SwiftData write.
+  /// Returns `false` when the model-pin save failed (review F2) so the
+  /// coordinator skips the load and the profile is left unswitched.
+  let commitSwap: ProfileSwapCoordinator.SwapCommit
+  /// #460: persists a per-chat model selection — wired by `ChatScaffoldView`.
+  /// Returns `false` on a save failure so the coordinator skips the load.
+  let commitModel: (String) -> Bool
+  /// #460: clears the per-chat model pin so the chat follows the profile
+  /// default again — wired by `ChatScaffoldView`.
+  let onUseProfileDefault: () -> Void
+  /// Compatibility preference. Default false means a concrete model row acts
+  /// as an explicit pin across later profile changes; true restores the older
+  /// follow-profile-default prompt behavior.
+  let followProfileDefaultModel: Bool
   /// Swap coordinator. Required — review v1 F9: defaulting this to a
   /// preview-only `previewDefault()` let a forgotten injection at any
   /// call site silently fall through to an orphan coordinator the
@@ -52,35 +84,66 @@ struct ContentToolbar: View {
   /// like the others so snapshot/preview sites stay pip-less; the pip renders
   /// only when it (with center/engineStatus/helperHealth) is wired.
   let engineLifecycle: EngineLifecycle?
+  /// Current selected-profile sampling defaults. Read through a closure so
+  /// Settings saves affect newly opened params popovers even though
+  /// `ProfileStore` does not publish SwiftUI updates.
+  let profileSampling: () -> ChatSampling
   /// Forwarded to the indicator's running/ready popover Unload action.
   let onUnload: () -> Void
   /// Forwarded to the indicator's offline (engine-stopped) popover "Start
   /// engine" action.
   let onStartEngine: () -> Void
 
+  @Environment(\.openSettings) private var openSettings
+  @EnvironmentObject private var settingsNavigation: SettingsNavigation
+
   @State private var showParamsPopover = false
   @State private var showSystemPopover = false
+  /// Drives the model dropdown. The picker is a custom `.popover` (not a native
+  /// `Menu`) so each row can render the model NAME as the primary element and
+  /// the quant as a secondary, dimmer, smaller detail — AppKit's NSMenu fixes
+  /// the row font and only dims *disabled* items, so the requested name-primary
+  /// / quant-secondary hierarchy is not expressible in a native menu.
+  @State private var showModelMenu = false
+  /// Hovered model row slug, for the native-menu-style row highlight.
+  @State private var hoveredModelSlug: String?
 
   init(
     viewModel: ChatTranscriptViewModel,
     availableProfiles: [String] = ["chat"],
-    availableModels: [String] = ChatTranscriptViewModel.placeholderModels,
+    modelOptions: [ToolbarModelOptions.Option] = [],
+    currentModelSummary: ToolbarModelOptions.CurrentSummary? = nil,
+    selectedModelID: String? = nil,
+    profileDefaultModel: String? = nil,
+    commitSwap: @escaping ProfileSwapCoordinator.SwapCommit = { _, _ in true },
+    commitModel: @escaping (String) -> Bool = { _ in true },
+    onUseProfileDefault: @escaping () -> Void = {},
+    followProfileDefaultModel: Bool = false,
     swapCoordinator: ProfileSwapCoordinator,
     modelLoadCenter: ModelLoadCenter?,
     engineStatus: EngineStatusStore?,
     helperHealth: HelperHealthController?,
     engineLifecycle: EngineLifecycle?,
+    profileSampling: @escaping () -> ChatSampling = { ChatSampling() },
     onUnload: @escaping () -> Void,
     onStartEngine: @escaping () -> Void = {}
   ) {
     self.viewModel = viewModel
     self.availableProfiles = availableProfiles
-    self.availableModels = availableModels
+    self.modelOptions = modelOptions
+    self.currentModelSummary = currentModelSummary
+    self.selectedModelID = selectedModelID
+    self.profileDefaultModel = profileDefaultModel
+    self.commitSwap = commitSwap
+    self.commitModel = commitModel
+    self.onUseProfileDefault = onUseProfileDefault
+    self.followProfileDefaultModel = followProfileDefaultModel
     self.swapCoordinator = swapCoordinator
     self.modelLoadCenter = modelLoadCenter
     self.engineStatus = engineStatus
     self.helperHealth = helperHealth
     self.engineLifecycle = engineLifecycle
+    self.profileSampling = profileSampling
     self.onUnload = onUnload
     self.onStartEngine = onStartEngine
   }
@@ -100,6 +163,18 @@ struct ContentToolbar: View {
           .help(writeError)
           .accessibilityIdentifier("toolbar.setDefaultError")
           .accessibilityLabel(writeError)
+      }
+
+      if let serveError = swapCoordinator.serveModelError {
+        // #469: surface a model pick that failed to (re)launch the engine
+        // (a resolver reject the status poll won't reflect) so a silently
+        // dropped pick is never invisible. Mirrors `defaultModelWriteError`.
+        Label(serveError, systemImage: "exclamationmark.triangle.fill")
+          .labelStyle(.iconOnly)
+          .foregroundStyle(.red)
+          .help(serveError)
+          .accessibilityIdentifier("toolbar.serveModelError")
+          .accessibilityLabel(serveError)
       }
 
       Spacer(minLength: 12)
@@ -127,6 +202,11 @@ struct ContentToolbar: View {
     .padding(.horizontal, 16)
     .padding(.vertical, 8)
     .background(Color(nsColor: .windowBackgroundColor))
+#if DEBUG
+    .task(id: testAutoProfilePickTaskID) {
+      await runTestAutoProfilePickIfNeeded()
+    }
+#endif
     .accessibilityElement(children: .contain)
     .accessibilityIdentifier("content.toolbar")
   }
@@ -147,75 +227,478 @@ struct ContentToolbar: View {
     .menuStyle(.borderlessButton)
     .fixedSize()
     .accessibilityIdentifier("toolbar.profile")
-    // Anchor for Phase 3.6 confirmation popover. The popover content
-    // closure captures the token at present time (review v2 F4) and
-    // hands it back through `confirm(token:)` / `cancel(token:)` so a
-    // stale callback from a superseded swap is token-mismatched and
-    // dropped.
-    .popover(isPresented: swapPopoverBinding, arrowEdge: .bottom) {
-      if let pending = swapCoordinator.pending {
-        let capturedToken = pending.id
-        ProfileSwapPopover(
-          pending: pending,
-          estimatedTotalBytes: nil,
-          estimatedEtaSeconds: nil,
-          onConfirm: { setAsDefault in swapCoordinator.confirm(token: capturedToken, setAsDefault: setAsDefault) },
-          onCancel:  { swapCoordinator.cancel(token: capturedToken) }
-        )
-      }
-    }
+    // Anchor for the Phase 3.6 confirmation popover. #582: a coordinator-owned
+    // `.applicationDefined` NSPopover (`ProfileSwapPopoverHost`) replaces the
+    // transient SwiftUI `.popover`, which AppKit auto-closed on resign-key —
+    // silently dropping a pending swap when the user Cmd-Tabbed / clicked
+    // another app. The host captures the pending token at present time (review
+    // v2 F4) and hands it back through `confirm(token:)` / `cancel(token:)` /
+    // `keepCurrentModel(token:)`, so a stale callback from a superseded swap is
+    // token-mismatched and dropped.
+    .background(
+      ProfileSwapPopoverHost(
+        pending: swapCoordinator.pending,
+        onConfirm: { token, setAsDefault in
+          swapCoordinator.confirm(token: token, setAsDefault: setAsDefault)
+        },
+        onCancel: { token in swapCoordinator.cancel(token: token) },
+        onKeepCurrent: { token in swapCoordinator.keepCurrentModel(token: token) }
+      )
+    )
+  }
+
+#if DEBUG
+  private static var testAutoPickProfileID: String? {
+    guard let id = ProcessInfo.processInfo.environment["PIE_TEST_AUTO_PICK_PROFILE"],
+          !id.isEmpty
+    else { return nil }
+    return id
+  }
+
+  private var testAutoProfilePickTaskID: String {
+    // #582: the production swap popover is now a coordinator-owned
+    // `.applicationDefined` NSPopover that survives the window resigning key,
+    // so the seam no longer tracks pending-presence to re-raise a popover that
+    // a focus blip killed. #579 added that re-raise because the old transient
+    // `.popover` died on resign-key under a contended seated session — but that
+    // re-raise also MASKED the real production gap. With the gap fixed at the
+    // source, the auto-pick fires exactly once per stable pendable state, and
+    // S459's resign-key-survival case asserts the production NSPopover itself.
+    //
+    // #581 — CONSTRAINT (do not re-key this on `swapCoordinator.pending`):
+    // keying on pending-presence is what made #579's seam incompatible with a
+    // Cancel-outcome assertion. `cancel(token:)` / `dismissCurrentPending()`
+    // clear `pending` WITHOUT mutating `selectedProfileID` (only `commitSwap`
+    // sets it), so a pending-keyed taskID flips back to its pendable value the
+    // instant a deliberate Cancel clears the popover — re-raising the swap once
+    // and bouncing the popover back into a test that asserted it stayed
+    // dismissed. Keying on the stable `(profile, model)` selection instead
+    // means a Cancel leaves the axis untouched (no re-fire), a Confirm trips
+    // the `selectedProfileID != target` guard (no re-fire), so every outcome —
+    // Confirm, Keep-Current, AND Cancel — is safe to assert. A future
+    // cancel-driving GUI scenario relies on this; do not reintroduce pending.
+    [
+      Self.testAutoPickProfileID ?? "",
+      viewModel.selectedProfileID,
+      selectedModelID ?? "",
+    ].joined(separator: "|")
+  }
+
+  @MainActor
+  private func runTestAutoProfilePickIfNeeded() async {
+    guard let target = Self.testAutoPickProfileID,
+          selectedModelID != nil,
+          viewModel.selectedProfileID != target,
+          swapCoordinator.pending == nil
+    else { return }
+
+    // Settle briefly so a still-resolving model selection doesn't race the
+    // pick. NO one-shot latch: the latch-before-await was the solo flake —
+    // `.task(id:)` cancels this task whenever the id changes (e.g.
+    // `selectedModelID` resolves nil→X during the sleep), so a latch set here
+    // permanently skipped the cancelled `selectProfile` and the popover never
+    // appeared. Re-checking after the await fires exactly once per stable
+    // pendable state instead.
+    try? await Task.sleep(nanoseconds: 300_000_000)
+    guard !Task.isCancelled,
+          viewModel.selectedProfileID != target,
+          swapCoordinator.pending == nil
+    else { return }
+    selectProfile(target)
+  }
+#endif
+
+  /// #460: the chat's effective current model — the explicit pin
+  /// (`selectedModelID`) or, when unpinned, the active profile's default.
+  /// This is the single value the swap policy treats as "the current
+  /// model", so it stays correct whether the model is loaded or loading.
+  private var effectiveModelID: String? {
+    Self.effectiveModelID(selectedModelID: selectedModelID,
+                          profileDefaultModel: profileDefaultModel)
+  }
+
+  /// Pure pin-over-default derivation, routed through the one resolver
+  /// (`ModelTarget.resolve`) so the swap policy's "current model" can never
+  /// disagree with the gate/send/label derivation. Static so the precedence
+  /// is unit-tested without a view host (mirrors `modelLabel`).
+  static func effectiveModelID(selectedModelID: String?,
+                               profileDefaultModel: String?) -> String? {
+    ModelTarget.resolve(selectedModelID: selectedModelID,
+                        profileDefault: profileDefaultModel)?.modelID
+  }
+
+  static func shouldPreserveExplicitModelSelection(selectedModelID: String?,
+                                                   followProfileDefaultModel: Bool) -> Bool {
+    guard !followProfileDefaultModel else { return false }
+    let trimmed = selectedModelID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return !trimmed.isEmpty
   }
 
   private var modelMenu: some View {
-    Menu {
-      Button("Use profile default") { viewModel.modelOverride = nil }
-      Divider()
-      ForEach(availableModels, id: \.self) { id in
-        // Stored id is the resolvable `<repo>/<file>` slug; show the
-        // friendly leaf.
-        Button(ModelDisplayName.leaf(id)) {
-          // : route through the confirm gate. Picking a model that
-          // differs from the resident model publishes a swap confirm
-          // (with "Set as default for this profile"); picking the
-          // already-resident model just sets the override, no load.
-          swapCoordinator.requestModelOverride(
-            modelID: id,
-            activeProfileID: viewModel.selectedProfileID
-          ) { viewModel.modelOverride = $0 }
-        }
-      }
+    Button {
+      showModelMenu.toggle()
     } label: {
       HStack(spacing: 4) {
         Image(systemName: "shippingbox")
-        Text("Model: \(viewModel.modelOverride.map(ModelDisplayName.leaf) ?? "Profile default")")
+        // #462: bound the title so a long model name truncates rather than
+        // pushing the toolbar past the window edge. No `.fixedSize()` — it
+        // would pin the label non-compressible and re-break layout. The full
+        // id stays inspectable via `.help(modelMenuHelp)` + accessibility value
+        // below. #460: `modelMenuTitle` reads `currentModelSummary`, which
+        // `ChatScaffoldView` builds from `Chat.modelID` (the authority).
+        Text("Model: \(modelMenuTitle)")
+          .boundedModelName()
       }
     }
-    .menuStyle(.borderlessButton)
-    .fixedSize()
+    .buttonStyle(.plain)
+    .help(modelMenuHelp)
     .accessibilityIdentifier("toolbar.model")
+    .accessibilityLabel("Model")
+    .accessibilityValue(modelMenuAccessibilityValue)
+    .popover(isPresented: $showModelMenu, arrowEdge: .bottom) {
+      modelDropdownContent
+    }
+  }
+
+  /// Custom dropdown content (a `.popover`, NOT a native `Menu`) so each row can
+  /// render the model NAME as the primary element (`.primary`, body) and the
+  /// quant as a secondary, dimmer, smaller detail (`.secondary`, caption) — the
+  /// hierarchy a native NSMenu can't express (it fixes the row font and only
+  /// dims disabled rows). Behavior is unchanged: `selectModel` still routes to
+  /// `Chat.modelID`, and each row keeps `ModelRow-<slug>` so automation
+  /// (S486/S260) targets a concrete model.
+  ///
+  /// `prefer: \.isCurrent` keeps the persisted/served row on an identity tie
+  /// (app-managed bare slug vs served full-path copy) so the checkmark row's
+  /// slug matches `selectedModelID`. The grouped pipeline is truncation-guarded
+  /// by `ModelIdentityGroupingTests`; the `ScrollView` keeps a long list on
+  /// screen.
+  private var modelDropdownContent: some View {
+    let groups = ModelIdentityGrouping.grouped(
+      ModelIdentityGrouping.deduped(modelOptions, slug: \.slug, prefer: { $0.isCurrent }),
+      slug: \.slug)
+    return ScrollView {
+      VStack(alignment: .leading, spacing: 1) {
+        ForEach(Array(groups.enumerated()), id: \.offset) { index, group in
+          // Subtle separation between model groups so categories are
+          // distinguishable (a hairline + a little breathing room), skipped
+          // before the first group.
+          if index > 0 {
+            Divider()
+              .padding(.horizontal, 10)
+              .padding(.top, 5)
+              .padding(.bottom, 1)
+          }
+          // #580 grouping: the base model NAME is the PROMINENT section header
+          // (primary, `.headline` — bold/larger), with its quant variants as
+          // visually subordinate rows beneath. A header is not a Button (not a
+          // load target); the rows carry `ModelRow-<slug>` + selection.
+          // Header == quant rows in SIZE (`.subheadline`); differentiated only
+          // by weight (semibold) and color (primary vs the rows' secondary).
+          Text(group.base)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.primary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 2)
+            .accessibilityAddTraits(.isHeader)
+          ForEach(group.items) { option in
+            modelRow(option)
+          }
+        }
+        Divider().padding(.horizontal, 10).padding(.vertical, 4)
+        Button {
+          showModelMenu = false
+          openModelsSettings()
+        } label: {
+          Label("Manage Models…", systemImage: "gearshape")
+            .font(.subheadline)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .help("Open Settings → Models")
+        .accessibilityIdentifier("toolbar.model.manageModels")
+      }
+      // Extra breathing room above the first model section.
+      .padding(.top, 16)
+      .padding(.bottom, 6)
+    }
+    // Native macOS feel: system vibrancy material behind the rows + the
+    // popover's own standard shape/corner radius/shadow (no bespoke surface).
+    .scrollContentBackground(.hidden)
+    // A long model list is bounded by `maxHeight` and stays reachable by
+    // scrolling, with the scroller visible so the overflow is discoverable.
+    .scrollIndicators(.visible)
+    .frame(minWidth: 280, maxHeight: 440)
+    .background(.regularMaterial)
+  }
+
+  /// One quant-variant row beneath its base-name header: the quant tag is the
+  /// row's selectable label; KV-cache/source/profile-default/unavailable details
+  /// are a secondary gray, smaller line. Indented under the header so the
+  /// grouping reads visually. A fixed-width leading glyph column keeps the quant
+  /// labels aligned whether or not a row carries a checkmark/warning/shield.
+  @ViewBuilder
+  private func modelRow(_ option: ToolbarModelOptions.Option) -> some View {
+    let isHovered = hoveredModelSlug == option.slug && option.isSelectable
+    Button {
+      selectModel(option)
+      showModelMenu = false
+    } label: {
+      HStack(spacing: 6) {
+        rowLeadingMarker(option)
+          .frame(width: 12, alignment: .center)
+          .accessibilityHidden(true)
+        VStack(alignment: .leading, spacing: 0) {
+          // Variant label is the row's selectable distinguisher — subordinate
+          // to the name header: smaller AND lighter (`.subheadline`, `.secondary`).
+          Text(modelVariantLabel(option))
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+          if let detail = modelRowDetailText(option) {
+            Text(detail)
+              .font(.caption2)
+              .foregroundStyle(.tertiary)
+              .lineLimit(1)
+          }
+        }
+        Spacer(minLength: 8)
+        // #678: the unverified signal is surfaced as an INDEPENDENT trailing
+        // badge, NOT folded into the single leading glyph — a row that is both
+        // current (checkmark) and unverified would otherwise drop the shield
+        // under the checkmark, so a just-downloaded, now-current unverified
+        // model looked identical to a verified one. Always rendered when
+        // unverified, regardless of current/blocked, and a11y-visible (the
+        // leading marker is `accessibilityHidden`, so VoiceOver had no
+        // unverified signal at all).
+        if option.isUnverified {
+          Image(systemName: "exclamationmark.shield.fill")
+            .imageScale(.small)
+            .foregroundStyle(.orange)
+            .help("Installed without a verified sha256 (no X-Linked-Etag advertised — e.g. a resumed download). Integrity was not checked.")
+            // Pure visual cue: hidden from accessibility so the row's
+            // `.accessibilityValue("Unverified")` is the SINGLE VoiceOver
+            // signal (no double announcement), matching the hidden leading
+            // marker above.
+            .accessibilityHidden(true)
+        }
+      }
+      // Shallow indent (~7pt): the leading bullet, not depth, carries the
+      // sub-item meaning under the name header.
+      .padding(.leading, 7)
+      .padding(.trailing, 8)
+      .padding(.vertical, 3)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(
+        RoundedRectangle(cornerRadius: 5)
+          .fill(isHovered ? Color.primary.opacity(0.09) : .clear)
+      )
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .padding(.horizontal, 5)
+    .disabled(!option.isSelectable)
+    .onHover { hovering in
+      hoveredModelSlug = hovering ? option.slug
+        : (hoveredModelSlug == option.slug ? nil : hoveredModelSlug)
+    }
+    .help(option.unavailableReason.map { "\(option.slug) — \($0)" } ?? option.slug)
+    .accessibilityIdentifier("ModelRow-\(option.slug)")
+    // #678: expose the unverified state on the row VALUE too — the trailing
+    // icon alone is fragile to query and a row a11y value is the robust signal
+    // for both VoiceOver and automation.
+    .accessibilityValue(option.isUnverified ? "Unverified" : "")
+  }
+
+  /// The single leading glyph a row resolves to. Pure + `internal` so the
+  /// precedence is unit-testable without a view host (`ContentToolbarModelRowMarkerTests`).
+  enum LeadingMarker: Equatable { case current, blocked, bullet }
+
+  /// Leading-marker precedence for a quant row: current (checkmark) wins over
+  /// blocked (triangle), else a bullet dot. The column holds ONE glyph, so the
+  /// unverified state is deliberately NOT in this precedence — it would be
+  /// dropped whenever a row is also current/blocked (#678). Unverified is
+  /// surfaced independently by the trailing badge (`option.isUnverified`) +
+  /// the row a11y value, so it survives any leading glyph.
+  static func leadingMarker(_ option: ToolbarModelOptions.Option) -> LeadingMarker {
+    if option.isCurrent { return .current }
+    if option.unavailableReason != nil { return .blocked }
+    return .bullet
+  }
+
+  /// Leading marker for a quant row. Status wins (current → checkmark, blocked
+  /// → triangle); otherwise a small bullet dot so the variant reads as a
+  /// sub-item of its name header without deep indentation. The unverified shield
+  /// is a trailing badge (#678), not a leading glyph.
+  @ViewBuilder
+  private func rowLeadingMarker(_ option: ToolbarModelOptions.Option) -> some View {
+    switch Self.leadingMarker(option) {
+    case .current:
+      Image(systemName: "checkmark").imageScale(.small).foregroundStyle(.primary)
+    case .blocked:
+      Image(systemName: "exclamationmark.triangle").imageScale(.small).foregroundStyle(.orange)
+    case .bullet:
+      Circle().fill(Color.secondary).frame(width: 4, height: 4)
+    }
+  }
+
+  /// Variant label under a name header: the GGUF quant, else the derived
+  /// weight precision for a safetensors/HF-cached model (`bf16`/`f16`/`f32`),
+  /// else — only for such a model with no derivable precision — a neutral
+  /// "safetensors" kind label rather than repeating the base name (the bug
+  /// this fixes). GGUF / app-managed rows keep their existing leaf fallback.
+  private func modelVariantLabel(_ option: ToolbarModelOptions.Option) -> String {
+    if let quant = option.parts.quant { return quant }
+    if let precision = option.precision { return precision }
+    if option.parts.format == nil, option.source == .huggingFaceCache {
+      return "safetensors"
+    }
+    return option.parts.quantOrLeaf
+  }
+
+  /// Secondary detail line under a quant row: HF-cache source suffix, the
+  /// profile-default annotation, and any unavailable reason — the quant itself
+  /// is the row's primary label, so it is not repeated here. Nil when there is
+  /// nothing to show, so the row collapses to a single quant line.
+  private func modelRowDetailText(_ option: ToolbarModelOptions.Option) -> String? {
+    var parts: [String] = []
+    if let tag = option.sourceTag { parts.append(tag) }
+    if option.isProfileDefault { parts.append("profile default") }
+    if let reason = option.unavailableReason { parts.append(reason) }
+    let text = parts.joined(separator: " · ")
+    return text.isEmpty ? nil : text
+  }
+
+  private var modelMenuTitle: String {
+    guard let currentModelSummary else { return "Choose model" }
+    if currentModelSummary.annotation != nil {
+      return "\(currentModelSummary.displayName) (Default)"
+    }
+    return currentModelSummary.displayName
+  }
+
+  private var modelMenuHelp: String {
+    guard let currentModelSummary else { return "Choose a model" }
+    if let annotation = currentModelSummary.annotation {
+      return "\(annotation): \(currentModelSummary.slug)"
+    }
+    return currentModelSummary.slug
+  }
+
+  private var modelMenuAccessibilityValue: String {
+    guard let currentModelSummary else { return "No model selected" }
+    if let annotation = currentModelSummary.annotation {
+      return "\(currentModelSummary.slug), \(annotation)"
+    }
+    return currentModelSummary.slug
+  }
+
+  /// Pure label derivation (#460) — `internal` (not `private`) so the
+  /// label-stability contract is unit-tested without a view host: the same
+  /// inputs always yield the same friendly leaf, so a preserved selection
+  /// renders an unchanged label across a profile switch / new chat. The
+  /// collapsed toolbar label itself now renders the richer #459
+  /// `modelMenuTitle` (built from `currentModelSummary`); this pure helper
+  /// pins the leaf-derivation contract that the summary relies on.
+  static func modelLabel(selectedModelID: String?, profileDefaultModel: String?) -> String {
+    // Pin-over-default precedence via the one resolver, so the collapsed
+    // label names the same model the gate/send paths resolve. The nil tail
+    // (nothing pinned or defaulted) keeps the generic "Profile default" text.
+    if let target = ModelTarget.resolve(selectedModelID: selectedModelID,
+                                        profileDefault: profileDefaultModel) {
+      // Leaf — consistent with the live collapsed label (#459
+      // `currentModelSummary` / `modelMenuTitle`, also leaf-derived). #580's
+      // structured base+quant rendering applies to the DROPDOWN ROWS, not this
+      // collapsed-title contract.
+      return ModelDisplayName.leaf(target.modelID)
+    }
+    return "Profile default"
   }
 
   // MARK: - swap helpers
 
   private func selectProfile(_ id: String) {
+    // #460: compare against the chat's CURRENT model (`effectiveModelID`),
+    // not engine residency. `commitSwap` persists the profile and — only on
+    // a confirm-and-switch — the new pinned model; a silent swap preserves
+    // the current model (`pinModel == nil`).
+    // #459 "Keep Current Model" needs no `setOverride` under the single
+    // authority: the coordinator builds the keep-current action from this
+    // same `commitSwap`, pinning the CURRENT model (`fromModel`) instead of
+    // the new default — both write `Chat.modelID`.
     swapCoordinator.requestSwap(
       toProfileID: id,
-      commit: { committed in viewModel.selectedProfileID = committed }
+      fromModel: effectiveModelID,
+      preserveExplicitModelSelection: Self.shouldPreserveExplicitModelSelection(
+        selectedModelID: selectedModelID,
+        followProfileDefaultModel: followProfileDefaultModel),
+      commit: commitSwap
     )
   }
 
-  /// `Binding<Bool>` derived from the coordinator's optional pending
-  /// swap. Setting `false` (popover dismissal — click-outside, Esc)
-  /// routes through `dismissCurrentPending()` which clears whatever
-  /// pending exists at that instant. The button callbacks above use
-  /// the token-checked `cancel(token:)` / `confirm(token:)` paths.
-  private var swapPopoverBinding: Binding<Bool> {
-    Binding(
-      get: { swapCoordinator.pending != nil },
-      set: { isPresented in
-        if !isPresented { swapCoordinator.dismissCurrentPending() }
+  private func selectModel(_ option: ToolbarModelOptions.Option) {
+    Self.performModelSelection(
+      option,
+      selectedModelID: selectedModelID,
+      profileDefaultModel: profileDefaultModel,
+      activeProfileID: viewModel.selectedProfileID,
+      swapCoordinator: swapCoordinator,
+      commitModel: commitModel,
+      onUseProfileDefault: onUseProfileDefault)
+  }
+
+  static func performModelSelection(
+    _ option: ToolbarModelOptions.Option,
+    selectedModelID: String?,
+    profileDefaultModel: String?,
+    activeProfileID: String,
+    swapCoordinator: ProfileSwapCoordinator,
+    commitModel: @escaping (String) -> Bool,
+    onUseProfileDefault: @escaping () -> Void
+  ) {
+    // #460/#527 review v1 F1: model-override decisions compare the picked row
+    // against the chat's EFFECTIVE current selection (explicit pin, else
+    // profile default), not just the raw pin. An unpinned chat following
+    // default A that picks B must raise/execute the override path instead of
+    // silently pinning B while the engine remains on A. Nil is reserved for
+    // the genuinely no-resolvable-model case, where there is no model to
+    // replace and the normal start gate will serve the new pin later.
+    let fromModel = effectiveModelID(selectedModelID: selectedModelID,
+                                     profileDefaultModel: profileDefaultModel)
+    switch ToolbarModelOptions.selectionAction(for: option,
+                                               residentModelID: selectedModelID) {
+    case .unavailable:
+      return
+    case let .requestModel(modelID, overrideAfterConfirmation):
+      // Confirm gate against the effective current model; on confirm, persist
+      // the result onto `Chat.modelID`. All selectable concrete rows pass
+      // their slug as `overrideAfterConfirmation`; choosing the
+      // profile-default row is still an explicit model pick, not a request to
+      // follow defaults.
+      swapCoordinator.requestModelOverride(
+        modelID: modelID,
+        activeProfileID: activeProfileID,
+        fromModel: fromModel
+      ) { _ in
+        if let overrideAfterConfirmation {
+          return commitModel(overrideAfterConfirmation)
+        }
+        onUseProfileDefault()
+        return true
       }
-    )
+    }
+  }
+
+  private func openModelsSettings() {
+    settingsNavigation.open(.models)
+    openSettings()
   }
 
   private var paramsButton: some View {
@@ -227,9 +710,27 @@ struct ContentToolbar: View {
     .buttonStyle(.plain)
     .help("Sampling parameters")
     .popover(isPresented: $showParamsPopover, arrowEdge: .top) {
-      ParamsPopover(sampling: $viewModel.sampling)
+      let sourceSampling = profileSampling()
+      ParamsPopover(sampling: viewModel.samplingOverride ?? sourceSampling) { committed in
+        viewModel.samplingOverride = Self.samplingOverrideAfterParamsCommit(
+          currentOverride: viewModel.samplingOverride,
+          sourceSampling: sourceSampling,
+          committed: committed)
+      }
     }
     .accessibilityIdentifier("toolbar.params")
+  }
+
+  static func samplingOverrideAfterParamsCommit(currentOverride: ChatSampling?,
+                                                sourceSampling: ChatSampling,
+                                                committed: ChatSampling) -> ChatSampling? {
+    if committed == sourceSampling {
+      return nil
+    }
+    if committed == currentOverride {
+      return currentOverride
+    }
+    return committed
   }
 
   private var attachButton: some View {
@@ -268,7 +769,8 @@ struct ContentToolbar: View {
 /// ticks and the removed Max-tokens row — can be rendered to a PNG via
 /// `ImageRenderer` in a snapshot test (`SamplingAndIndicatorSnapshotTests`).
 struct ParamsPopover: View {
-  @Binding var sampling: ChatSampling
+  let sampling: ChatSampling
+  let onCommit: (ChatSampling) -> Void
   @State private var temperature: Double
   @State private var topP: Double
   /// Latches once `commit()` runs so the dismissal flush on
@@ -284,10 +786,12 @@ struct ParamsPopover: View {
   /// dismissal. Review v4 F1.
   @State private var didCommit = false
 
-  init(sampling: Binding<ChatSampling>) {
-    self._sampling = sampling
-    _temperature = State(initialValue: sampling.wrappedValue.temperature)
-    _topP = State(initialValue: sampling.wrappedValue.topP)
+  init(sampling: ChatSampling,
+       onCommit: @escaping (ChatSampling) -> Void = { _ in }) {
+    self.sampling = sampling
+    self.onCommit = onCommit
+    _temperature = State(initialValue: sampling.temperature)
+    _topP = State(initialValue: sampling.topP)
   }
 
   var body: some View {
@@ -313,11 +817,14 @@ struct ParamsPopover: View {
     .frame(width: 280)
     // Any post-Apply slider edit re-arms the dismissal flush so an
     // Apply-then-edit-then-Esc sequence does not silently drop the
-    // second edit. Review v4 F1. `commit()` writes to `sampling` only
-    // (not the local @State values), so these `onChange` handlers are
-    // not retriggered by `commit()` itself — no feedback loop.
+    // second edit. Review v4 F1. `commit()` sends the buffered value through
+    // `onCommit` only (not back into the local @State values), so these
+    // `onChange` handlers are not retriggered by `commit()` itself — no
+    // feedback loop. Whether that buffered value is an actual override is
+    // decided by comparing it to the source profile sampling at the toolbar
+    // boundary, not by whether any transient slider event occurred.
     .onChange(of: temperature) { _, _ in didCommit = false }
-    .onChange(of: topP)        { _, _ in didCommit = false }
+    .onChange(of: topP) { _, _ in didCommit = false }
     // macOS popover dismissal (click-outside, Esc) is treated as
     // accept — flush the local buffer so silent edit loss is not a
     // thing. Review v1 F4. Latch prevents double-commit when Apply
@@ -357,11 +864,11 @@ struct ParamsPopover: View {
     // engine-launch concern (#438), not a per-chat knob. Preserve the
     // existing max_tokens (profile default) so dropping the control never
     // silently resets it.
-    sampling = ChatSampling(
+    onCommit(ChatSampling(
       temperature: temperature,
       topP: topP,
       maxTokens: sampling.maxTokens
-    )
+    ))
     didCommit = true
   }
 }

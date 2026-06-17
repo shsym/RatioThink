@@ -5,9 +5,9 @@ import XCTest
 ///
 /// The app is pointed at `Scripts/readme-screenshot-harness.py` (a mock pie
 /// engine, no real engine / no model download) via `PIE_TEST_ENGINE_BASE_URL`,
-/// and `PIE_TEST_CHAT_MODEL` satisfies the composer send-gate
-/// (`ChatScaffoldView.currentModelID()`), so a sent prompt streams a canned
-/// assistant reply. Models tab is populated by dummy `.gguf` files the wrapper
+/// and the composer send-gate is satisfied for real — `PIE_TEST_CHAT_MODEL_PIN`
+/// pins `Chat.modelID` and `PIE_TEST_PIN_ENGINE_RUNNING` reports the engine
+/// `.running` — so a sent prompt streams a canned assistant reply. Models tab is populated by dummy `.gguf` files the wrapper
 /// drops in `$PIE_HOME/models`. Each test attaches one window screenshot
 /// (`.keepAlways`); `Scripts/capture-readme-screenshots.sh` exports them from
 /// the `.xcresult` into `docs/assets/`.
@@ -29,7 +29,7 @@ final class ReadmeScreenshotsGUITests: XCTestCase {
     defer { app.terminate() }
     Self.activate(app)
 
-    try createChatAndSend("What makes RatioThink different from a cloud chatbot?", in: app)
+    try createChatAndSend("What makes Rational different from a cloud chatbot?", in: app)
     XCTAssertTrue(
       waitForStaticTextContaining("OpenAI-compatible", in: app, timeout: 30),
       "canned assistant reply did not render; app: \(app.debugDescription)"
@@ -90,6 +90,95 @@ final class ReadmeScreenshotsGUITests: XCTestCase {
     attach(settings.screenshot(), name: "models")
   }
 
+  /// Opens the chat-toolbar model dropdown and screenshots the whole screen
+  /// (the popover is its own window, so a main-window-only grab would miss it).
+  /// The wrapper seeds dummy `.gguf` files, so the dropdown lists real grouped
+  /// rows — name primary, quant secondary.
+  @MainActor
+  func test_capture_model_dropdown() async throws {
+    let cfg = try Self.loadConfig()
+    let app = Self.makeApp(cfg)
+    app.launch()
+    defer { app.terminate() }
+    Self.activate(app)
+
+    let newChat = app.buttons["chats.newButton"]
+    XCTAssertTrue(newChat.waitForExistence(timeout: 10),
+                  "New Chat button missing; app: \(app.debugDescription)")
+    newChat.click()
+
+    let modelControl = app.descendants(matching: .any)
+      .matching(identifier: "toolbar.model").firstMatch
+    XCTAssertTrue(modelControl.waitForExistence(timeout: 10),
+                  "toolbar.model missing; app: \(app.debugDescription)")
+    modelControl.click()
+
+    // Wait for at least one model row in the open dropdown (seeded .gguf files).
+    let anyRow = app.descendants(matching: .any)
+      .matching(NSPredicate(format: "identifier BEGINSWITH %@", "ModelRow-")).firstMatch
+    XCTAssertTrue(anyRow.waitForExistence(timeout: 10),
+                  "no ModelRow in dropdown; app: \(app.debugDescription)")
+    Self.settle()
+    attach(XCUIScreen.main.screenshot(), name: "model-dropdown")
+  }
+
+  /// Structure check for the custom model-dropdown popover: it opens from the
+  /// toolbar and lists the seeded models as grouped, identifiable rows.
+  ///
+  /// The interactive half — selecting a row switches the active model +
+  /// dismisses the popover, and an unavailable (split-shard / in-progress
+  /// `.partial`) row is not selectable — is intentionally NOT asserted here.
+  /// It cannot run deterministically under the README mock harness:
+  ///
+  ///   1. The screenshot wrapper seeds only complete `.gguf` files. It never
+  ///      stages a split-shard pair or a `.partial` download, so no
+  ///      "unavailable" row exists to assert non-selectability against.
+  ///   2. The app frequently launches not-key under XCUITest (the documented
+  ///      multi-launch focus flake): the whole AX tree comes up `Disabled`, so
+  ///      clicks never dispatch and `isEnabled` reads false. Existence queries
+  ///      still resolve, but any tap-and-verify assertion is flaky by nature.
+  ///
+  /// Shipping those assertions would mean a flaky red, so they are skipped
+  /// rather than weakened. The selection→switch→dismiss path is covered by the
+  /// app-scoped send/selection unit tests; this GUI test guards only what the
+  /// mock harness can prove deterministically. Follow-up: extend the wrapper to
+  /// seed an unavailable row + a key-window launch seam, then restore the
+  /// interaction assertions here.
+  @MainActor
+  func test_model_dropdown_selection() async throws {
+    let cfg = try Self.loadConfig()
+    let app = Self.makeApp(cfg)
+    app.launch()
+    defer { app.terminate() }
+    Self.activate(app)
+
+    let newChat = app.buttons["chats.newButton"]
+    XCTAssertTrue(newChat.waitForExistence(timeout: 10), "New Chat button missing")
+    newChat.click()
+
+    let modelControl = app.descendants(matching: .any)
+      .matching(identifier: "toolbar.model").firstMatch
+    XCTAssertTrue(modelControl.waitForExistence(timeout: 10), "toolbar.model missing")
+    modelControl.click()
+
+    // Deterministic: the popover opens and lists the seeded models as grouped
+    // rows (existence resolves even when the app launches not-key/Disabled).
+    let anyRow = app.descendants(matching: .any)
+      .matching(NSPredicate(format: "identifier BEGINSWITH %@", "ModelRow-")).firstMatch
+    XCTAssertTrue(anyRow.waitForExistence(timeout: 10),
+                  "no ModelRow in dropdown; app: \(app.debugDescription)")
+    let mistral = app.descendants(matching: .any)
+      .matching(NSPredicate(format:
+        "identifier BEGINSWITH %@ AND identifier CONTAINS[c] %@", "ModelRow-", "Mistral"))
+      .firstMatch
+    XCTAssertTrue(mistral.waitForExistence(timeout: 5),
+                  "seeded Mistral row missing; app: \(app.debugDescription)")
+
+    throw XCTSkip("Interaction assertions (select→switch→dismiss, unavailable " +
+                  "row non-selectable) are not deterministic under the README " +
+                  "mock harness — see the doc comment above.")
+  }
+
   // MARK: - Steps
 
   private func createChatAndSend(_ prompt: String, in app: XCUIApplication) throws {
@@ -107,7 +196,7 @@ final class ReadmeScreenshotsGUITests: XCTestCase {
 
     let send = app.buttons["composer.send"]
     XCTAssertTrue(send.waitForExistence(timeout: 5), "composer.send missing")
-    XCTAssertTrue(send.isEnabled, "composer.send disabled (PIE_TEST_CHAT_MODEL not honored?)")
+    XCTAssertTrue(send.isEnabled, "composer.send disabled (model pin / running-engine seam not honored?)")
     send.click()
   }
 
@@ -130,7 +219,10 @@ final class ReadmeScreenshotsGUITests: XCTestCase {
     if let baseURL = cfg["PIE_TEST_ENGINE_BASE_URL"] {
       app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = baseURL
     }
-    app.launchEnvironment["PIE_TEST_CHAT_MODEL"] = cfg["PIE_TEST_CHAT_MODEL"] ?? "Qwen3-8B-Instruct"
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = cfg["PIE_TEST_CHAT_MODEL_PIN"] ?? "Qwen3-8B-Instruct"
+    // #504: pin the engine `.running` so the composer send-gate is enabled for
+    // real (the `PIE_TEST_CHAT_MODEL` bypass is gone).
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     configureCompletedFirstLaunch(
       app, suiteName: stablePreferenceSuiteName(cfg["PIE_TEST_GUI_HOME"] ?? "readme"))
     return app
@@ -138,7 +230,7 @@ final class ReadmeScreenshotsGUITests: XCTestCase {
 
   private static func activate(_ app: XCUIApplication) {
     XCTAssert(app.wait(for: .runningForeground, timeout: 15),
-              "RatioThink.app did not reach runningForeground")
+              "Rational.app did not reach runningForeground")
     app.activate()
   }
 
@@ -160,10 +252,11 @@ final class ReadmeScreenshotsGUITests: XCTestCase {
                                            in app: XCUIApplication,
                                            timeout: TimeInterval) -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
-    let predicate = NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
-                                needle, needle)
     while Date() < deadline {
-      if app.descendants(matching: .staticText).matching(predicate).count >= 1 {
+      // Message bodies render as one selectable NSTextView each now (#636,
+      // `.textView`) rather than per-block `.staticText`;
+      // `transcriptTextMatchCount` searches both.
+      if transcriptTextMatchCount(needle, in: app) >= 1 {
         return true
       }
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.5))

@@ -17,7 +17,7 @@
 use serde::Serialize;
 use wstd::http::body::{BodyForthcoming, IncomingBody, OutgoingBody};
 use wstd::http::server::{Finished, Responder};
-use wstd::http::{IntoBody, Response, StatusCode};
+use wstd::http::{IntoBody, Response};
 use wstd::io::AsyncWrite;
 
 /// Cap on request-body bytes the chat handler will buffer. 1 MiB is
@@ -31,11 +31,6 @@ pub const CHAT_MAX_BODY: usize = 1 << 20; // 1 MiB
 /// the `input` payload is inferlet-defined and may carry larger
 /// state-replay blobs.
 pub const DISPATCH_MAX_BODY: usize = 1 << 18; // 256 KiB
-
-/// Cap on `/v1/models/load` bodies. The endpoint takes a single
-/// `{"model": "..."}` envelope; 4 KiB tolerates absurdly long model
-/// ids without inviting abuse.
-pub const LOAD_MAX_BODY: usize = 1 << 12; // 4 KiB
 
 // =============================================================================
 // EmitError (F10)
@@ -128,8 +123,8 @@ impl Emitter {
 // "eta_s":…}` is part of the wire schema but not emitted in v1 —
 // pie loads models at engine boot, so the inferlet has no in-process
 // progress source. The frame returns when pie surfaces a load-progress
-// WIT import (tracked in 's follow-up); until then handlers skip
-// directly to `ModelReady`. Re-add `ModelLoading` here when that lands.
+// WIT import (a follow-up); until then handlers skip directly to
+// `ModelReady`. Re-add `ModelLoading` here when that lands.
 
 /// `data: {"event":"model_ready"}` — terminal meta-frame; transitions
 /// the GUI's loading indicator to "ready" and (for chat-completions)
@@ -145,14 +140,6 @@ impl ModelReady {
             event: "model_ready",
         }
     }
-}
-
-/// Convenience: emit a single `model_ready` and flush. Used by both
-/// the chat-completion meta-frame prefix and the `/v1/models/load`
-/// endpoint, which currently share the same degenerate semantics
-/// (model already registered at engine boot → ready immediately).
-pub async fn emit_model_ready(em: &mut Emitter) -> Result<(), EmitError> {
-    em.emit_json(&ModelReady::new()).await
 }
 
 /// JSON-shape warning frame used inside SSE streams for non-fatal
@@ -181,9 +168,9 @@ pub struct SseError<'a> {
     pub event: &'static str,
     pub code: &'a str,
     pub message: &'a str,
-    /// See `SseWarning::distinct_modes`. Same N3 motivation: surface
-    /// raw counts as structured fields when the diag carries dedup-
-    /// capped state, so log shippers / dashboards don't parse the
+    /// Set via [`SseError::with_dedup_counts`]. Same N3 motivation:
+    /// surface raw counts as structured fields when the diag carries
+    /// dedup-capped state, so log shippers / dashboards don't parse the
     /// message string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distinct_modes: Option<usize>,
@@ -221,7 +208,7 @@ pub async fn emit_done(em: &mut Emitter) -> Result<(), EmitError> {
 /// OpenAI/JS SDK iterator pinned on `[DONE]` hangs until socket
 /// timeout with zero host signal.
 ///
-/// ## Embedder contract for diagnostic visibility (G6 / H5, )
+/// ## Embedder contract for diagnostic visibility (G6 / H5)
 ///
 /// Every `eprintln!` in this crate — here, `now_unix_secs` (clock
 /// skew), `id_seed` (entropy fallback), the F7 body-read site, the
@@ -229,7 +216,7 @@ pub async fn emit_done(em: &mut Emitter) -> Result<(), EmitError> {
 /// dropped-on-disconnect site, and the F6 serialize-recover
 /// sites — emits to wasm `stderr` via `wasi:cli/stderr`.
 ///
-/// **Verified embedder reality (, vs Vendor/pie @ b4601f5):** the
+/// **Verified embedder reality (vs Vendor/pie @ b4601f5):** the
 /// daemon request path does NOT route component stderr to operators.
 /// `runtime/src/daemon.rs::handle_request` instantiates each
 /// per-request component with `capture_outputs = false`
@@ -244,7 +231,8 @@ pub async fn emit_done(em: &mut Emitter) -> Result<(), EmitError> {
 /// deployment. The earlier "subscribe to `ProcessEvent::Stderr` in
 /// PieControlLauncher" plan is INFEASIBLE for daemons: there are no
 /// such events to subscribe to. Fixing this at the source (route
-/// daemon stderr to pie-server's own log) is tracked in .
+/// daemon stderr to pie-server's own log) is tracked as a pie-side
+/// follow-up.
 ///
 /// ## In-band path is the production contract (I5)
 ///
@@ -267,17 +255,18 @@ pub async fn emit_done(em: &mut Emitter) -> Result<(), EmitError> {
 ///
 /// The F7 `read_body` transport `io::ErrorKind` rides in-band only on
 /// the CLI / `pie run` / streaming-guest path — `body_error_response`
-/// interpolates it into the 400 envelope (`transport_error_message`).
+/// maps it to a stable `error.code` in the 400 envelope
+/// (`transport_error_code`).
 /// This 400 is UNREACHABLE on the pie-mac daemon path: pie's daemon
 /// host pre-collects the whole request body
 /// (`Vendor/pie/runtime/src/daemon.rs:207`, `BodyExt::collect`) BEFORE
 /// instantiating the guest, so a real transport-read failure surfaces
 /// as pie's host-level error at `daemon.rs:209`, never reaching
 /// `read_body` -> `BodyError::Transport`. Daemon-side visibility of
-/// such failures is the pie-side  work.
+/// such failures is the pie-side follow-up work.
 ///
 /// Residual stderr-ONLY sites — structurally undeliverable in-band,
-/// so dev-only by nature (NOT blocked on ):
+/// so dev-only by nature (not blocked on the pie-side follow-up):
 /// - `emit_done_logged` Serialize failures (post-stream; the SSE
 ///   channel is already closed). NOTE: post-stream *IO* write failures
 ///   do NOT reach stderr either — `From<io::Error>` (above) collapses
@@ -289,7 +278,7 @@ pub async fn emit_done(em: &mut Emitter) -> Result<(), EmitError> {
 /// - The H4 `tool_decode_disabled` meta-frame Disconnected branch
 ///   (peer is gone by definition).
 ///
-///  (pie-side daemon stderr surfacing) would make even these
+/// The pie-side daemon-stderr surfacing would make even these
 /// dev-only sites operator-visible without any chat-apc change, and
 /// fix the same gap for every other inferlet.
 pub async fn emit_done_logged(em: &mut Emitter, site: &str) {
@@ -306,7 +295,8 @@ pub async fn emit_done_logged(em: &mut Emitter, site: &str) {
 
 /// Build a single JSON response with an OpenAI-shape `error` envelope.
 /// Status codes follow OpenAI conventions: 400 invalid_request,
-/// 404 model_not_found, 413 payload_too_large, 500 server_error.
+/// 404 model_not_found, 409 target_mismatch, 413 payload_too_large,
+/// 500 server_error.
 pub fn json_error(
     status: u16,
     code: &str,
@@ -317,6 +307,7 @@ pub fn json_error(
             "type": match status {
                 400 => "invalid_request_error",
                 404 => "not_found_error",
+                409 => "conflict_error",
                 413 => "payload_too_large_error",
                 _ => "server_error",
             },
@@ -341,17 +332,17 @@ pub fn json_error(
 /// `Transport` carries the underlying `io::ErrorKind` so operators
 /// debugging slowloris vs TLS reset vs mid-body abort can tell them
 /// apart — collapsing all transport failures into a single opaque
-/// variant made root cause untraceable. : the kind is
-/// interpolated into the in-band 400 envelope (`body_error_response`
-/// → `transport_error_message`) on the streaming-guest path. On the
+/// variant made root cause untraceable. The kind maps to a
+/// stable `error.code` in the in-band 400 envelope (`body_error_response`
+/// → `transport_error_code`) on the streaming-guest path. On the
 /// pie-mac daemon path this arm is unreachable — pie collects the
-/// body host-side before the guest runs (see `transport_error_message`
+/// body host-side before the guest runs (see `transport_error_code`
 /// doc), so the failure is pie's host-level error, not this 400.
 #[derive(Debug)]
 pub enum BodyError {
-    /// Transport died mid-read. Map to 400. The `ErrorKind` is
-    /// surfaced in the 400 message so callers can distinguish e.g.
-    /// `BrokenPipe` from `TimedOut`.
+    /// Transport died mid-read. Map to 400. The `ErrorKind` becomes a
+    /// stable `error.code` (e.g. `transport_broken_pipe` vs
+    /// `transport_timed_out`) so callers can branch on the mode.
     Transport(std::io::ErrorKind),
     /// Body exceeded the caller's `max_bytes` cap. Map to 413.
     TooLarge,
@@ -385,14 +376,14 @@ pub async fn read_body(
                 let kind = e.kind();
                 // F7: log the full error to stderr for dev/CLI triage
                 // (`pie run` only — discarded for daemons, see
-                // emit_done_logged doc + ). The discriminating
+                // emit_done_logged doc). The discriminating
                 // `io::ErrorKind` rides in-band in the 400 envelope via
                 // `body_error_response` on the streaming-guest path. On
                 // the daemon path this arm is unreachable: pie collects
                 // the body host-side before instantiating the guest
                 // (`Vendor/pie/runtime/src/daemon.rs:207`), so a
                 // transport failure becomes pie's host-level error, not
-                // this 400 ( covers daemon-side visibility).
+                // this 400 (daemon-side visibility is a pie-side follow-up).
                 eprintln!("[chat-apc] body read failed: kind={kind:?} err={e}");
                 return Err(BodyError::Transport(kind));
             }
@@ -406,7 +397,7 @@ pub async fn read_body(
 pub fn body_error_response(err: BodyError) -> Response<wstd::http::body::BoundedBody<Vec<u8>>> {
     match err {
         BodyError::Transport(kind) => {
-            json_error(400, "invalid_request", &transport_error_message(kind))
+            json_error(400, transport_error_code(kind), &transport_error_message(kind))
         }
         BodyError::TooLarge => {
             json_error(413, "payload_too_large", "Request body exceeds the endpoint cap")
@@ -414,37 +405,40 @@ pub fn body_error_response(err: BodyError) -> Response<wstd::http::body::Bounded
     }
 }
 
-/// Render the client-facing 400 message for a transport read failure.
+/// Map a transport read failure to a stable, machine-branchable
+/// `error.code`.
 ///
-/// : the discriminating `io::ErrorKind` used to be stderr-only.
-/// It now rides in-band so "slowloris vs TLS reset vs mid-body abort"
-/// stays debuggable from the response alone — on the streaming-guest
-/// path (`pie run` / a guest that reads its own body). This does NOT
-/// reach the pie-mac daemon path: pie pre-collects the request body
-/// host-side (`Vendor/pie/runtime/src/daemon.rs:207`) before the guest
-/// runs, so a transport failure there is pie's host-level error, not
-/// this 400 ( covers daemon-side visibility). `ErrorKind`'s
-/// `Debug` form is a fixed enum label (e.g. `ConnectionReset`,
-/// `UnexpectedEof`) — it names the client's own connection state,
-/// carries no server internals, and is stable enough for SDK
-/// consumers to branch on.
-fn transport_error_message(kind: std::io::ErrorKind) -> String {
-    format!("Failed to read request body (transport error: {kind:?})")
+/// SDK consumers that need to discriminate transport modes
+/// ("slowloris vs TLS reset vs mid-body abort") branch on this code,
+/// NOT on free-text in `message`. `std::io::ErrorKind` is
+/// `#[non_exhaustive]` and its `Debug` labels carry no stability
+/// guarantee, so we pin the kinds we care about to fixed snake_case
+/// codes and collapse everything else to `transport_error`.
+///
+/// This only fires on the streaming-guest path (`pie run` / a
+/// guest that reads its own body). It does NOT reach the pie-mac
+/// daemon path: pie pre-collects the request body host-side
+/// (`Vendor/pie/runtime/src/daemon.rs:207`) before the guest runs, so
+/// a transport failure there is pie's host-level error, not this 400.
+fn transport_error_code(kind: std::io::ErrorKind) -> &'static str {
+    use std::io::ErrorKind;
+    match kind {
+        ErrorKind::ConnectionReset => "transport_connection_reset",
+        ErrorKind::UnexpectedEof => "transport_unexpected_eof",
+        ErrorKind::TimedOut => "transport_timed_out",
+        ErrorKind::BrokenPipe => "transport_broken_pipe",
+        _ => "transport_error",
+    }
 }
 
-// =============================================================================
-// 204 No Content helper
-// =============================================================================
-
-/// Build a 204 response with no body. Used by `DELETE /v1/models/load`
-/// (idempotent no-op until a real cancel hook lands).
-pub async fn respond_no_content(res: Responder) -> Finished {
-    let response = Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .body(BodyForthcoming)
-        .unwrap();
-    let body = res.start_response(response);
-    Finished::finish(body, Ok(()), None)
+/// Render the client-facing 400 message for a transport read failure.
+///
+/// Human-readable only: it names the `io::ErrorKind` to keep
+/// "slowloris vs TLS reset vs mid-body abort" debuggable from the
+/// response alone. SDKs must NOT branch on this free text — the
+/// stable discriminator is `error.code` (see `transport_error_code`).
+fn transport_error_message(kind: std::io::ErrorKind) -> String {
+    format!("Failed to read request body (transport error: {kind:?})")
 }
 
 #[cfg(test)]
@@ -453,11 +447,34 @@ mod tests {
     use std::io::ErrorKind;
 
     #[test]
+    fn transport_error_code_is_stable_and_machine_branchable() {
+        // SDKs discriminate transport modes on `error.code`, NOT on
+        // free-text in `message`. Pin each known kind to its stable
+        // snake_case code so a future refactor can't silently drift the
+        // wire contract.
+        for (kind, code) in [
+            (ErrorKind::ConnectionReset, "transport_connection_reset"),
+            (ErrorKind::UnexpectedEof, "transport_unexpected_eof"),
+            (ErrorKind::TimedOut, "transport_timed_out"),
+            (ErrorKind::BrokenPipe, "transport_broken_pipe"),
+        ] {
+            assert_eq!(transport_error_code(kind), code);
+        }
+    }
+
+    #[test]
+    fn transport_error_code_collapses_unknown_kinds() {
+        // io::ErrorKind is #[non_exhaustive]; kinds we don't pin fall
+        // back to the generic `transport_error` rather than leaking an
+        // unstable Debug label into the wire contract.
+        assert_eq!(transport_error_code(ErrorKind::NotConnected), "transport_error");
+        assert_eq!(transport_error_code(ErrorKind::Other), "transport_error");
+    }
+
+    #[test]
     fn transport_error_message_carries_the_kind() {
-        // : the io::ErrorKind must survive in-band so the daemon
-        // path (where wasm stderr is discarded) can still distinguish
-        // transport failure modes. Assert each kind's label rides the
-        // 400 message verbatim.
+        // The human-readable message still names the kind for triage,
+        // but it is NOT the branch surface — that's `error.code` above.
         for kind in [
             ErrorKind::ConnectionReset,
             ErrorKind::UnexpectedEof,

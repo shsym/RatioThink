@@ -1,8 +1,14 @@
 #!/bin/bash
+#
+# First-launch package E2E. Builds/packages a Release Rational.app artifact,
+# then launches it by file URL under XCUITest from fresh isolated state to
+# verify first-run behavior, and exports a human-testable signed zip. See the
+# usage() block below for the full invocation and environment contract.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/Scripts/e2e-prep.sh"
 
 CONFIG_FILE="/tmp/pie-first-launch-package-e2e.env"
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p175-first-launch-$$}"
@@ -22,7 +28,7 @@ usage() {
 usage: Scripts/run-first-launch-package-e2e.sh [--init-only|--scenario-only <artifact.env>]
 
 Default runs both phases:
-  1. Build/package a Release RatioThink.app artifact and write <run-root>/artifact.env.
+  1. Build/package a Release Rational.app artifact and write <run-root>/artifact.env.
   2. Launch that artifact by file URL in XCUITest from fresh isolated state.
 
 Environment:
@@ -38,16 +44,8 @@ USAGE
 }
 
 require_gui_preflight() {
-  if ! pgrep -x Dock >/dev/null 2>&1; then
-    echo "first-launch package e2e: no seated GUI session detected (Dock not running)" >&2
-    exit 2
-  fi
-  if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-    echo "first-launch package e2e: RatioThink.app Automation/Accessibility permissions required." >&2
-    echo "first-launch package e2e: grant Xcode/XCTest runner and RatioThink.app Automation + Accessibility in System Settings, then rerun:" >&2
-    echo "first-launch package e2e: PIE_TEST_TCC_GRANTED=1 Scripts/run-first-launch-package-e2e.sh" >&2
-    exit 2
-  fi
+  e2e_require_seated_gui "first-launch package e2e" || exit 2
+  e2e_require_tcc "first-launch package e2e" || exit 2
 }
 
 write_artifact_env() {
@@ -79,8 +77,8 @@ run_init_phase() {
   echo "first-launch package e2e: packaging Release app for $ARCH_VALUE"
   "$PACKAGE_DMG_BIN" --arch "$ARCH_VALUE" --configuration Release --out "$PACKAGE_OUT"
 
-  local app_path="$ROOT/build/xcode-$ARCH_VALUE/sym/RatioThink.app"
-  local dmg_path="$PACKAGE_OUT/RatioThink-$ARCH_VALUE.dmg"
+  local app_path="$ROOT/build/xcode-$ARCH_VALUE/sym/Rational.app"
+  local dmg_path="$PACKAGE_OUT/Rational-$ARCH_VALUE.dmg"
   if [ ! -d "$app_path" ]; then
     echo "first-launch package e2e: packaged app missing at $app_path" >&2
     exit 1
@@ -222,11 +220,11 @@ export_human_testable_app_artifact() {
   run_dir="$runs_dir/$run_id"
   latest_dir="$HUMAN_ARTIFACT_ROOT/latest"
   latest_tmp="$HUMAN_ARTIFACT_ROOT/latest.tmp.$$"
-  zip_path="$run_dir/RatioThink.app.zip"
-  checksum_path="$run_dir/RatioThink.app.zip.sha256"
+  zip_path="$run_dir/Rational.app.zip"
+  checksum_path="$run_dir/Rational.app.zip.sha256"
   manifest_path="$run_dir/manifest.json"
-  latest_zip_path="$latest_dir/RatioThink.app.zip"
-  latest_checksum_path="$latest_dir/RatioThink.app.zip.sha256"
+  latest_zip_path="$latest_dir/Rational.app.zip"
+  latest_checksum_path="$latest_dir/Rational.app.zip.sha256"
   latest_manifest_path="$latest_dir/manifest.json"
   latest_pointer_path="$HUMAN_ARTIFACT_ROOT/latest.json"
   latest_pointer_tmp="$HUMAN_ARTIFACT_ROOT/latest.json.tmp.$$"
@@ -236,7 +234,7 @@ export_human_testable_app_artifact() {
 
   echo "first-launch package e2e: exporting verified human-testable app artifact"
   ditto -c -k --sequesterRsrc --keepParent "$PIE_TEST_APP_PATH" "$zip_path"
-  (cd "$run_dir" && shasum -a 256 RatioThink.app.zip >"$(basename "$checksum_path")")
+  (cd "$run_dir" && shasum -a 256 Rational.app.zip >"$(basename "$checksum_path")")
 
   local sha256 size_bytes app_size_kb generated_at git_commit git_branch git_dirty git_dirty_py bundle_id
   sha256="$(awk '{print $1}' "$checksum_path")"
@@ -275,7 +273,7 @@ manifest = {
     "generated_at": "$generated_at",
     "run_id": "$run_id",
     "app": {
-        "name": "RatioThink.app",
+        "name": "Rational.app",
         "bundle_id": "$bundle_id",
         "source_path": "$PIE_TEST_APP_PATH",
         "arch": "${PIE_TEST_ARCH:-$ARCH_VALUE}",
@@ -328,9 +326,9 @@ with open(latest_pointer_path, "w", encoding="utf-8") as fh:
     fh.write("\\n")
 PY
 
-  cp "$zip_path" "$latest_tmp/RatioThink.app.zip"
+  cp "$zip_path" "$latest_tmp/Rational.app.zip"
   cp "$manifest_path" "$latest_tmp/manifest.json"
-  (cd "$latest_tmp" && shasum -a 256 RatioThink.app.zip >RatioThink.app.zip.sha256)
+  (cd "$latest_tmp" && shasum -a 256 Rational.app.zip >Rational.app.zip.sha256)
   rm -rf "$latest_dir"
   mv "$latest_tmp" "$latest_dir"
   mv "$latest_pointer_tmp" "$latest_pointer_path"
@@ -340,7 +338,7 @@ PY
   echo "first-launch package e2e: exported human-testable app artifact=$latest_zip_path"
   echo "first-launch package e2e: exported human-testable manifest=$latest_manifest_path"
   echo "first-launch package e2e: exported human-testable checksum=$latest_checksum_path"
-  echo "first-launch package e2e: hc download command: hc controller download-link --path $latest_zip_path --name RatioThink-first-launch-latest-${PIE_TEST_ARCH:-$ARCH_VALUE}.app.zip"
+  echo "first-launch package e2e: human-testable download path: $latest_zip_path"
 }
 
 prune_human_artifact_runs() {

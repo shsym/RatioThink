@@ -145,6 +145,47 @@ final class CuratedModelCatalogTests: XCTestCase {
     }
   }
 
+  /// Both Qwen3.6 builds (hybrid qwen35 / qwen35moe arch) must stay pinned
+  /// to their verified single-file coordinates and the manual-large tier.
+  /// Each was real-loaded through the portable driver (boot + completion)
+  /// before pinning; reds if repointed at a shard or a non-existent quant.
+  func test_qwen36_entries_pin_single_file_coordinates() {
+    let dense = CuratedModelCatalog.model(withID: "qwen3.6-27b-q4_k_m")
+    XCTAssertEqual(dense?.huggingFaceRepo, "unsloth/Qwen3.6-27B-GGUF")
+    XCTAssertEqual(dense?.huggingFaceFile, "Qwen3.6-27B-Q4_K_M.gguf")
+    XCTAssertEqual(dense?.approximateSizeBytes, 16_817_244_384)
+    XCTAssertEqual(dense?.installIntent, .manualOnly)
+
+    let moe = CuratedModelCatalog.model(withID: "qwen3.6-35b-a3b-ud-q4_k_m")
+    XCTAssertEqual(moe?.huggingFaceRepo, "unsloth/Qwen3.6-35B-A3B-GGUF")
+    XCTAssertEqual(moe?.huggingFaceFile, "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf")
+    XCTAssertEqual(moe?.approximateSizeBytes, 22_134_528_992)
+    XCTAssertEqual(moe?.installIntent, .manualOnly)
+
+    for m in [dense, moe] {
+      XCTAssertFalse(HFCacheCatalog.isSplitShardFilename(m?.huggingFaceFile ?? ""),
+                     "Qwen3.6 entries must be monolithic single-file GGUFs")
+    }
+  }
+
+  /// Gemma 4 dense text GGUF (#705). The engine runs it as PieArch::Gemma4
+  /// (gemma4 GGUF load taught to the portable driver in this change set);
+  /// the curated row pins the verified single-file coordinates + size and
+  /// the manual/local posture. The vision/audio mmproj is a separate file
+  /// pie does not load, so the dense text build is single-file.
+  func test_gemma4_entry_pins_single_file_coordinates() {
+    let m = CuratedModelCatalog.model(withID: "gemma-4-12b-it-q4_k_m")
+    XCTAssertNotNil(m, "the Gemma 4 curated entry must exist")
+    XCTAssertEqual(m?.huggingFaceRepo, "unsloth/gemma-4-12b-it-GGUF")
+    XCTAssertEqual(m?.huggingFaceFile, "gemma-4-12b-it-Q4_K_M.gguf")
+    XCTAssertEqual(m?.approximateSizeBytes, 7_121_860_000)
+    XCTAssertEqual(m?.installIntent, .manualOnly)
+    XCTAssertFalse(HFCacheCatalog.isSplitShardFilename(m?.huggingFaceFile ?? ""),
+                   "the Gemma 4 entry must be a monolithic single-file GGUF")
+    XCTAssertFalse(m?.pieSupportNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true,
+                   "the Gemma 4 entry must document Pie support constraints")
+  }
+
   /// #425 regression pin: Qwen2.5 7B Q4_K_M must come from bartowski's
   /// single-file repo, NOT the official `Qwen/Qwen2.5-7B-Instruct-GGUF`,
   /// which publishes that quant ONLY as `…-q4_k_m-00001-of-00002.gguf`
@@ -161,4 +202,87 @@ final class CuratedModelCatalogTests: XCTestCase {
     XCTAssertNotEqual(entry?.huggingFaceRepo, "Qwen/Qwen2.5-7B-Instruct-GGUF",
                       "the Qwen official repo ships this quant only as split shards — do not revert")
   }
+
+  /// Larger Pie-runnable options must be explicit about their
+  /// operator posture. They are real single-file GGUF downloads in the
+  /// curated UI, but they are NOT starter/default models and their real
+  /// engine proof stays manual/local because each artifact is ~9 GB.
+  func test_large_manual_models_are_present_with_memory_and_support_metadata() {
+    let qwen3 = CuratedModelCatalog.model(withID: "qwen3-14b-q4_k_m")
+    let coder = CuratedModelCatalog.model(withID: "qwen2.5-coder-14b-instruct-q4_k_m")
+
+    XCTAssertEqual(qwen3?.huggingFaceRepo, "Qwen/Qwen3-14B-GGUF")
+    XCTAssertEqual(qwen3?.huggingFaceFile, "Qwen3-14B-Q4_K_M.gguf")
+    XCTAssertEqual(qwen3?.approximateSizeBytes, 9_001_752_960)
+
+    XCTAssertEqual(coder?.huggingFaceRepo, "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF")
+    XCTAssertEqual(coder?.huggingFaceFile, "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf")
+    XCTAssertEqual(coder?.approximateSizeBytes, 8_988_111_072)
+
+    for id in ["qwen3-14b-q4_k_m", "qwen2.5-coder-14b-instruct-q4_k_m"] {
+      let model = CuratedModelCatalog.model(withID: id)
+      XCTAssertEqual(model?.installIntent, .manualOnly,
+                     "\(id) must stay manual-only: no default seeding or PR-CI large download")
+      XCTAssertGreaterThan(model?.recommendedSystemMemoryBytes ?? 0,
+                           24 * 1024 * 1024 * 1024,
+                           "\(id) must record the expected host-memory footprint")
+      XCTAssertFalse(model?.pieSupportNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true,
+                     "\(id) must document Pie support constraints")
+    }
+  }
+
+  func test_large_e2e_representative_is_a_manual_large_catalog_model() {
+    let model = CuratedModelCatalog.model(withID: CuratedModelCatalog.largeE2ERepresentativeModelID)
+    XCTAssertNotNil(model, "large E2E representative must resolve to a catalog model")
+    XCTAssertEqual(model?.installIntent, .manualOnly)
+    XCTAssertGreaterThanOrEqual(model?.parameterCountBillions ?? 0, 14.0)
+    XCTAssertGreaterThan(model?.approximateSizeBytes ?? 0, 8_000_000_000)
+  }
+
+  /// The PR-time live-HF audit is intentionally path-gated so unrelated
+  /// PRs do not hit the network. Keep that gate broad enough for future
+  /// catalog splits: if `CuratedModelCatalog.all` starts aggregating
+  /// another source file under the `Shared/Curated*Catalog*.swift`
+  /// convention, a PR that edits only that new source must still run the
+  /// live audit before merge. This test parses the workflow as text so
+  /// the CI contract drifts loudly when the path filter is narrowed.
+  func test_curated_catalog_audit_path_filter_covers_future_catalog_sources() throws {
+    let workflow = try readRepoFile(".github/workflows/curated-catalog-audit.yml")
+
+    XCTAssertTrue(
+      workflow.contains("- 'Shared/Curated*Catalog*.swift'"),
+      "curated-catalog-audit.yml must use a Shared/Curated*Catalog*.swift glob, "
+      + "not only the current exact source file, so future catalog source splits "
+      + "still trigger the PR-time live-HF audit")
+    XCTAssertTrue(
+      workflow.contains("- 'Tests/RatioThinkCoreTests/CuratedModelCatalog*.swift'"),
+      "curated-catalog-audit.yml must keep curated catalog test changes on the same "
+      + "PR-time live-HF audit path")
+  }
+}
+
+private func readRepoFile(_ relativePath: String,
+                          file: StaticString = #filePath,
+                          line: UInt = #line) throws -> String {
+  let root = try repoRoot(file: file, line: line)
+  let url = root.appendingPathComponent(relativePath)
+  return try String(contentsOf: url, encoding: .utf8)
+}
+
+private func repoRoot(file: StaticString = #filePath,
+                      line: UInt = #line) throws -> URL {
+  var url = URL(fileURLWithPath: "\(file)", isDirectory: false)
+    .deletingLastPathComponent()
+  let fileManager = FileManager.default
+
+  while url.path != "/" {
+    if fileManager.fileExists(atPath: url.appendingPathComponent("Package.swift").path),
+       fileManager.fileExists(atPath: url.appendingPathComponent(".github/workflows/curated-catalog-audit.yml").path) {
+      return url
+    }
+    url.deleteLastPathComponent()
+  }
+
+  XCTFail("could not locate repository root from \(file)", file: file, line: line)
+  throw CocoaError(.fileNoSuchFile)
 }

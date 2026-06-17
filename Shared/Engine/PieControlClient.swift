@@ -142,7 +142,10 @@ public actor PieControlClient {
     if !response.ok { throw ClientError.serverRejected(message: response.result) }
   }
 
-  public func launchDaemon(inferlet: String, port: UInt32, input: [String: Any] = [:]) async throws {
+  public func launchDaemon(inferlet: String,
+                           port: UInt32,
+                           host: String = EngineHTTPBindMode.loopback.daemonHost,
+                           input: [String: Any] = [:]) async throws {
     let inputJSON: String
     if input.isEmpty {
       inputJSON = "{}"
@@ -152,6 +155,7 @@ public actor PieControlClient {
     }
     try await sendAndAwait(type: "launch_daemon", extra: [
       ("port", .uint(UInt64(port))),
+      ("host", .string(host)),
       ("inferlet", .string(inferlet)),
       ("input", .string(inputJSON)),
     ])
@@ -183,6 +187,22 @@ public actor PieControlClient {
     try await sendAndAwait(type: "ping", extra: [])
   }
 
+  /// Generic pie control-plane query. The wire subject is handled by
+  /// pie itself (not by the chat-apc HTTP inferlet) and the response
+  /// payload is returned as the raw `result` string from the server.
+  ///
+  /// `subject == "model_status"` is the existing pie runtime endpoint
+  /// that reports model-scoped counters including `*.kv_pages_used`
+  /// and `*.kv_pages_total`; callers can JSON-decode that string into
+  /// a typed snapshot at the App/XPC boundary.
+  public func query(subject: String, record: String = "") async throws -> String {
+    let response = try await sendAndReceive(type: "query", extra: [
+      ("subject", .string(subject)),
+      ("record", .string(record)),
+    ])
+    return response.result
+  }
+
   // MARK: - framing
 
   /// Decoded server response. `internal` (not `fileprivate`) so the
@@ -194,16 +214,16 @@ public actor PieControlClient {
   }
 
   private func sendAndAwait(type: String, extra: [(String, MessagePack.Value)]) async throws {
+    _ = try await sendAndReceive(type: type, extra: extra)
+  }
+
+  private func sendAndReceive(type: String, extra: [(String, MessagePack.Value)]) async throws -> Response {
     let corrID = nextCorrID()
     let response = try await withResponseContinuation(corrID: corrID) {
-      var fields: [(String, MessagePack.Value)] = [
-        ("type", .string(type)),
-        ("corr_id", .uint(UInt64(corrID))),
-      ]
-      fields.append(contentsOf: extra)
-      try await self.sendMap(fields)
+      try await self.sendFrame(Self.encodeRequestFrame(type: type, corrID: corrID, extra: extra))
     }
     if !response.ok { throw ClientError.serverRejected(message: response.result) }
+    return response
   }
 
   /// Registers a Response continuation under `corrID`, runs `send`,
@@ -241,11 +261,28 @@ public actor PieControlClient {
     return corrCounter
   }
 
-  private func sendMap(_ fields: [(String, MessagePack.Value)]) async throws {
-    guard let task else { throw ClientError.notConnected }
+  static func encodeRequestFrame(
+    type: String,
+    corrID: UInt32,
+    extra: [(String, MessagePack.Value)]
+  ) -> Data {
+    var fields: [(String, MessagePack.Value)] = [
+      ("type", .string(type)),
+      ("corr_id", .uint(UInt64(corrID))),
+    ]
+    fields.append(contentsOf: extra)
     let kvs: [(MessagePack.Value, MessagePack.Value)] = fields.map { (.string($0.0), $0.1) }
-    let data = MessagePack.encode(.map(kvs))
+    return MessagePack.encode(.map(kvs))
+  }
+
+  private func sendFrame(_ data: Data) async throws {
+    guard let task else { throw ClientError.notConnected }
     try await task.send(.data(data))
+  }
+
+  private func sendMap(_ fields: [(String, MessagePack.Value)]) async throws {
+    let kvs: [(MessagePack.Value, MessagePack.Value)] = fields.map { (.string($0.0), $0.1) }
+    try await sendFrame(MessagePack.encode(.map(kvs)))
   }
 
   // MARK: - listener

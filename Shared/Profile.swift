@@ -15,6 +15,14 @@ public enum ProfileError: Error, Equatable, CustomStringConvertible {
   }
 }
 
+/// Output-constraint mode for a profile (#572). Maps to the OpenAI
+/// `response_format` wire field. v1 supports only `jsonObject` — real
+/// JSON-grammar-constrained decoding, the "JSON Think" profile. Parsed
+/// from the profile's `[constraint] response_format = "json_object"`.
+public enum ResponseFormat: String, Equatable, Sendable {
+  case jsonObject = "json_object"
+}
+
 public struct Sampling: Equatable {
   public var temperature: Double = 0.7
   public var topP: Double = 0.9
@@ -28,13 +36,13 @@ public struct Sampling: Equatable {
 }
 
 public struct Profile {
-  /// Per-profile speculative-decoding ("Fast Think") settings — the
+  /// Per-profile speculative-decoding ("Repeat Boost") settings — the
   /// domain mirror of the wire `ChatSpeculation` (#426). `nil` knobs fall
   /// back to the chat-apc inferlet's #418 defaults (leader 1 / draft 3).
   /// Drafting only engages when `enabled` AND the request is greedy
   /// (temperature 0); the send path (`ChatSendController.makeRequest`)
   /// enforces that coupling, so an enabled-speculation profile is always
-  /// a greedy "Fast Think" profile.
+  /// a greedy "Repeat Boost" profile.
   public struct Speculation: Equatable, Sendable {
     public var enabled: Bool
     public var leaderLen: Int?
@@ -50,7 +58,10 @@ public struct Profile {
   public var id: String
   public var name: String
   public var icon: String?
-  public var model: String
+  /// Default model slug for this profile. `nil` is an explicit
+  /// no-default state: the UI should prompt the operator to choose or
+  /// download a model instead of inventing a fallback.
+  public var model: String?
   public var inferlet: String
   public var systemPrompt: String?
   public var sampling: Sampling
@@ -58,6 +69,11 @@ public struct Profile {
   /// Speculative-decoding settings from the `[speculation]` section;
   /// `nil` when the profile has no such section.
   public var speculation: Speculation?
+  /// Output-constraint mode from the `[constraint]` section (#572);
+  /// `nil` when absent. `.jsonObject` makes the send path attach the
+  /// OpenAI `response_format: {type:"json_object"}` wire field so
+  /// chat-apc runs JSON-grammar-constrained decoding ("JSON Think").
+  public var responseFormat: ResponseFormat?
 
   // Preserve unknown v2 sections (mcp_servers, routine, remote, agent) verbatim.
   private var rawTable: TOMLTable
@@ -66,12 +82,13 @@ public struct Profile {
     id: String,
     name: String,
     icon: String? = nil,
-    model: String,
+    model: String?,
     inferlet: String,
     systemPrompt: String? = nil,
     sampling: Sampling = Sampling(),
     inferletArgs: [String: TOMLValueConvertible] = [:],
     speculation: Speculation? = nil,
+    responseFormat: ResponseFormat? = nil,
     rawTable: TOMLTable = TOMLTable()
   ) {
     self.id = id
@@ -83,6 +100,7 @@ public struct Profile {
     self.sampling = sampling
     self.inferletArgs = inferletArgs
     self.speculation = speculation
+    self.responseFormat = responseFormat
     self.rawTable = rawTable
   }
 
@@ -103,7 +121,8 @@ public struct Profile {
 
     let id       = try requireString("id")
     let name     = try requireString("name")
-    let model    = try requireString("model")
+    let rawModel = table["model"]?.string?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let model    = rawModel?.isEmpty == false ? rawModel : nil
     let inferlet = try requireString("inferlet")
 
     let icon = table["icon"]?.string
@@ -132,6 +151,16 @@ public struct Profile {
       )
     }
 
+    // `[constraint] response_format = "json_object"` (#572). An unknown
+    // value parses to `nil` (unconstrained) rather than failing the whole
+    // profile — forward-compat with future modes, mirroring the lenient
+    // posture on v2 sections.
+    var responseFormat: ResponseFormat? = nil
+    if let c = table["constraint"]?.table,
+       let raw = c["response_format"]?.string {
+      responseFormat = ResponseFormat(rawValue: raw)
+    }
+
     return Profile(
       id: id, name: name, icon: icon,
       model: model, inferlet: inferlet,
@@ -139,6 +168,7 @@ public struct Profile {
       sampling: sampling,
       inferletArgs: args,
       speculation: speculation,
+      responseFormat: responseFormat,
       rawTable: table
     )
   }
@@ -187,10 +217,12 @@ public struct Profile {
     table.remove(at: "system_prompt")
     table.remove(at: "inferlet_args")
     table.remove(at: "speculation")
+    table.remove(at: "constraint")
+    table.remove(at: "model")
     table["id"]       = TOMLValue(stringLiteral: id)
     table["name"]     = TOMLValue(stringLiteral: name)
-    table["model"]    = TOMLValue(stringLiteral: model)
     table["inferlet"] = TOMLValue(stringLiteral: inferlet)
+    if let model, !model.isEmpty { table["model"] = TOMLValue(stringLiteral: model) }
     if let icon { table["icon"] = TOMLValue(stringLiteral: icon) }
     if let systemPrompt { table["system_prompt"] = TOMLValue(stringLiteral: systemPrompt) }
     let samplingTable = TOMLTable([
@@ -209,6 +241,12 @@ public struct Profile {
       if let l = speculation.leaderLen { specTable["leader_len"] = TOMLValue(integerLiteral: l) }
       if let d = speculation.draftLen  { specTable["draft_len"]  = TOMLValue(integerLiteral: d) }
       table["speculation"] = TOMLValue(specTable)
+    }
+    if let responseFormat {
+      let constraintTable = TOMLTable([
+        "response_format": TOMLValue(stringLiteral: responseFormat.rawValue),
+      ])
+      table["constraint"] = TOMLValue(constraintTable)
     }
     return table.convert()
   }

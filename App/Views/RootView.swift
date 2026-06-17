@@ -1,11 +1,24 @@
 import SwiftUI
+import SwiftData
+import ServiceManagement
 
-/// Three-column shell per design §5 (Notes-style information disclosure).
-/// Sidebar + item-list are independently collapsible via menu commands wired
-/// in `RatioThinkApp` against `WindowState`.
+/// Simplified chat shell: primary navigation plus the chat list live in the
+/// left column of a two-column split view; the detail column hosts every
+/// section's main view. Sidebar visibility remains wired through `WindowState`.
+/// New chats start from the titlebar new-chat button (the app-name branding was
+/// removed from that spot).
 struct RootView: View {
   @EnvironmentObject private var windowState: WindowState
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
+  /// #512: empty-chat pruning needs the store — runs on selection change
+  /// (prune the chat the user just left) and once at launch (reconcile
+  /// shells left behind by quit or by pre-prune builds). Also backs the
+  /// titlebar new-chat affordance.
+  @Environment(\.modelContext) private var modelContext
+  /// #460: the titlebar new-chat inherits the active profile + concrete model
+  /// from the chat the user is currently in, so a new chat keeps the same
+  /// context instead of resetting to the bare default.
+  @Query(sort: \Chat.updatedAt, order: .reverse) private var chats: [Chat]
   /// Engine lifecycle + in-flight load, folded into the unified
   /// indicator state that gates the engine-error banner. Both are
   /// injected at app scope (`RatioThinkApp`).
@@ -20,6 +33,8 @@ struct RootView: View {
   @EnvironmentObject private var appPreferences: AppPreferences
   @EnvironmentObject private var updateAvailability: UpdateAvailabilityModel
   @Environment(\.openURL) private var openURL
+  @State private var didEvaluateLocalAPIAutoStart = false
+  @State private var localAPIAutoStartError: String?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -38,8 +53,15 @@ struct RootView: View {
           policy: engineStatusStore.tierPolicy
         ),
         onRestartHelper: { helperHealth.restartHelperManually() },
-        onRestartEngine: { restartEngineFromBanner() }
+        onRestartEngine: { restartEngineFromBanner() },
+        onOpenLoginItems: { SMAppService.openSystemSettingsLoginItems() },
+        onCollectDiagnostics: { Task { await DiagnosticsCollector.collectAndReveal() } }
       )
+      if let localAPIAutoStartError {
+        LocalAPIAutoStartErrorBanner(message: localAPIAutoStartError) {
+          self.localAPIAutoStartError = nil
+        }
+      }
       // #411: low-urgency, non-modal update prompt. Only present for a newer,
       // non-ignored release found by the once-per-launch check.
       if let pending = updateAvailability.pending {
@@ -52,21 +74,18 @@ struct RootView: View {
           onIgnore: { updateAvailability.ignorePending(into: appPreferences) }
         )
       }
+      // Two-column shell: the chat list lives in the left navigation panel and
+      // the search panel + API Endpoints view fill the detail column, so every
+      // section is a direct left-nav → detail route. A two-column split view
+      // (rather than a 3-column one with a zero-width content column) avoids the
+      // stray separator hairline a collapsed middle column would draw right of
+      // the sidebar (#677).
       NavigationSplitView(columnVisibility: $windowState.columnVisibility) {
-        SidebarView(selection: $windowState.selectedSection)
-      } content: {
-        if windowState.isItemListHidden || windowState.selectedSection == .apiEndpoints {
-          // Collapse col 2 to zero width when toggled off via View > Hide
-          // List, or for the API Endpoints section, which has no item list —
-          // its single `LocalAPIView` fills the detail column (#422).
-          Color.clear
-            .navigationSplitViewColumnWidth(min: 0, ideal: 0, max: 0)
-        } else {
-          ItemListView(
-            section: windowState.selectedSection,
-            selectedItemID: $windowState.selectedItemID
-          )
-        }
+        SidebarView(
+          selection: $windowState.selectedSection,
+          selectedItemID: $windowState.selectedItemID,
+          isItemListHidden: windowState.isItemListHidden
+        )
       } detail: {
         DetailView(
           section: windowState.selectedSection,
@@ -74,9 +93,65 @@ struct RootView: View {
         )
         .navigationSplitViewColumnWidth(min: 480, ideal: 720)
       }
-      .navigationTitle("RatioThink")
+      // Branding removed from the titlebar (was `.navigationTitle("Rational")`);
+      // an emphasized new-chat button occupies that spot. Empty title keeps the
+      // titlebar clear rather than showing the product name as a label.
+      .navigationTitle("")
+      .toolbar {
+        ToolbarItem(placement: .navigation) {
+          Button(action: createChat) {
+            Image(systemName: "square.and.pencil")
+          }
+          .help("New Chat")
+          .accessibilityIdentifier("chats.newButton")
+        }
+      }
     }
     .task { await runLaunchUpdateCheck() }
+    .onAppear { maybeAutoStartLocalAPIOnLaunch() }
+    .onChange(of: engineStatusStore.status) { _, new in
+      if case .running = new {
+        localAPIAutoStartError = nil
+      }
+      maybeAutoStartLocalAPIOnLaunch()
+    }
+    // #512: leaving an empty "New Chat" shell deletes it. Hooked on the
+    // selection (not view teardown) so it covers chat-switch, new-chat
+    // creation, and deselect alike — and only ever prunes the chat the
+    // user LEFT, never the selected one, so selection stays untouched.
+    .onChange(of: windowState.selectedItemID) { previous, current in
+      guard let previous, previous != current else { return }
+      ChatLifecycle.pruneIfEmpty(
+        chatID: previous, in: modelContext, persistenceStatus: persistenceStatus)
+    }
+    // #512: launch-time reconcile for persisted empty shells (quit with an
+    // empty chat selected, or user data from builds before pruning).
+    // Selection starts nil at launch, so `excluding` is belt-and-braces.
+    .task {
+      ChatLifecycle.pruneAllEmptyChats(
+        in: modelContext,
+        excluding: windowState.selectedItemID,
+        persistenceStatus: persistenceStatus)
+    }
+  }
+
+  /// Titlebar new-chat affordance (occupies the spot the app name used to
+  /// render). Creates a chat, switches to the Chats section, and selects it so
+  /// the new conversation opens regardless of which section was active. Routes
+  /// through the same `ChatCreation` seam as the list/empty-state buttons so the
+  /// save + #460 profile/model inheritance stay in one place.
+  private func createChat() {
+    let source = windowState.selectedItemID.flatMap { id in chats.first { $0.id == id } }
+    if let id = ChatCreation.create(
+      in: modelContext,
+      persistenceStatus: persistenceStatus,
+      contextLabel: "RootView.newChat",
+      profileID: source?.profileID ?? "chat",
+      modelID: source?.modelID
+    ) {
+      windowState.selectedSection = .chats
+      windowState.selectedItemID = id
+    }
   }
 
   /// #411: run the once-per-launch update check. Skipped on test/automation
@@ -98,8 +173,81 @@ struct RootView: View {
     let profileID = profileStore.activeProfileID
     Task { @MainActor in
       guard let profileID, !profileID.isEmpty else { return }
-      try? await engineStatusStore.startEngine(profileID: profileID)
+      // #668: preserve the running session's served model across the restart;
+      // the durable active-model marker carries it when the engine has faulted.
+      let modelOverride = EngineRestartTarget.bootModel(
+        currentSnapshot: engineStatusStore.currentSnapshot,
+        lastServedModelID: profileStore.activeModelID)
+      try? await engineStatusStore.startEngine(profileID: profileID,
+                                               modelOverride: modelOverride)
     }
+  }
+
+  /// Honor the Local API startup preference once per window lifetime after
+  /// the helper's initial placeholder status settles. Default-off preserves
+  /// the no-surprise model-load contract; when enabled, this starts the same
+  /// shared engine that in-app chat and the Local API page use.
+  private func maybeAutoStartLocalAPIOnLaunch() {
+    guard !didEvaluateLocalAPIAutoStart else { return }
+    if case .starting = engineStatusStore.status { return }
+    didEvaluateLocalAPIAutoStart = true
+
+    guard LocalAPIAutoStartPolicy.shouldStartOnLaunch(
+      enabled: appPreferences.localAPIAutoStartEnabled,
+      status: engineStatusStore.status,
+      activeProfileID: profileStore.activeProfileID
+    ), let profileID = profileStore.activeProfileID else {
+      return
+    }
+
+    Task { @MainActor in
+      let result = await LocalAPIAutoStartLauncher.run(
+        enabled: appPreferences.localAPIAutoStartEnabled,
+        status: engineStatusStore.status,
+        activeProfileID: profileID,
+        startEngine: { try await engineStatusStore.startEngine(profileID: $0) },
+        errorMessage: { ChatScaffoldView.engineErrorMessage($0, verb: "start") }
+      )
+      switch result {
+      case .skipped, .started:
+        localAPIAutoStartError = nil
+      case .failed(let message):
+        localAPIAutoStartError = message
+      }
+    }
+  }
+}
+
+private struct LocalAPIAutoStartErrorBanner: View {
+  let message: String
+  let onDismiss: () -> Void
+
+  var body: some View {
+    HStack(alignment: .top, spacing: 8) {
+      Image(systemName: "exclamationmark.triangle.fill")
+        .foregroundStyle(.orange)
+        .accessibilityHidden(true)
+      VStack(alignment: .leading, spacing: 2) {
+        Text("Local API didn't start")
+          .font(.callout)
+          .fontWeight(.medium)
+        Text(message)
+          .font(.caption)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      Spacer(minLength: 8)
+      Button(action: onDismiss) {
+        Image(systemName: "xmark")
+          .imageScale(.small)
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel("Dismiss")
+    }
+    .padding(.horizontal, 12)
+    .padding(.vertical, 8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(Color.orange.opacity(0.12))
+    .accessibilityIdentifier("LocalAPIAutoStartError")
   }
 }
 

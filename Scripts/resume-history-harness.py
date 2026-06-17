@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
+# Deterministic local HTTP chat harness for the resume-history GUI E2E.
+# Serves canned OpenAI-style chat completions and logs each request, so the
+# App's multi-turn history can be exercised without a real engine or model
+# download.
 import argparse
 import json
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+
+class LocalThreadingHTTPServer(ThreadingHTTPServer):
+    """Bind loopback test servers without reverse-DNS/FQDN lookup."""
+
+    def server_bind(self):
+        self.socket.bind(self.server_address)
+        self.server_address = self.socket.getsockname()
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
 
 
 RESPONSES = [
@@ -54,11 +69,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
-        if self.path == "/v1/models/load":
-            self.send_sse([
-                {"event": "model_ready"},
-            ])
-        elif self.path == "/v1/chat/completions":
+        # #469: no /v1/models/load — pie binds the model at boot.
+        if self.path == "/v1/chat/completions":
             response = self.server.state.record_chat(body)
             self.send_sse([
                 {
@@ -129,7 +141,7 @@ def main() -> int:
     request_log.parent.mkdir(parents=True, exist_ok=True)
     request_log.write_text("", encoding="utf-8")
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = LocalThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.state = State(request_log)
     host, port = server.server_address
     port_file.write_text(f"http://{host}:{port}", encoding="utf-8")

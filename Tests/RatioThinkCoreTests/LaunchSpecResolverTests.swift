@@ -24,167 +24,193 @@ final class LaunchSpecResolverTests: XCTestCase {
     try super.tearDownWithError()
   }
 
-  func test_resolve_known_profile_builds_launch_spec() throws {
-    let store = try makeStoreWithChatProfile()
+  /// #459 repro 1: a no-default profile (its `model` key cleared by a model
+  /// delete) must still start when the user explicitly picks a downloaded
+  /// model from the toolbar / model list. The pick is threaded as
+  /// `explicitModel` and becomes the boot model — without it the resolve
+  /// fails with `has no default model` even though a valid model is on disk.
+  func test_resolveLauncherSpec_explicitModel_satisfies_noDefault_profile() throws {
+    let store = try makeNoDefaultStore(inferlet: "chat-apc")
     defer { store.stop() }
 
-    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
+    let binary = tempDir.appendingPathComponent("pie-fake-explicit", isDirectory: false)
     try touchExecutable(at: binary)
-    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
-    let inferlets  = tempDir.appendingPathComponent("inferlets", isDirectory: true)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models-explicit", isDirectory: true)
+    let pickedSlug = "Org/New-Model-GGUF/new.gguf"
+    try stageModel(named: pickedSlug, in: modelsRoot)
+    let stagedPath = LaunchSpecResolver.joinModelPath(modelsRoot: modelsRoot, slug: pickedSlug)
 
     let resolver = LaunchSpecResolver(
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { inferlets }
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { self.tempDir.appendingPathComponent("hf-home-explicit", isDirectory: true) }
     )
 
-    let result = resolver.resolve(profileID: "chat")
-    guard case .success(let spec) = result else {
-      return XCTFail("expected .success, got \(result)")
+    // No-default control: bare resolve (no override) still refuses, so the
+    // #452 explicit-no-default contract is intact.
+    guard case .failure(let bare) = resolver.resolveLauncherSpec(profileID: "chat") else {
+      return XCTFail("no-default profile must still refuse a bare start")
     }
-    XCTAssertEqual(spec.binaryURL, binary)
-    XCTAssertEqual(spec.profileID, "chat")
-    XCTAssertEqual(spec.inferletDir, inferlets)
-    XCTAssertEqual(spec.inferletName, "chat-apc",
-                   "profile.inferlet must propagate verbatim to LaunchSpec.inferletName — silent drop was the bug (review v2 F7)")
-    XCTAssertEqual(spec.modelPath,
-                   modelsRoot.appendingPathComponent("llama-3.1-8b-instruct").path,
-                   "modelPath must join `modelsRoot` with `profile.model` for the downloader's on-disk layout")
+    XCTAssertEqual(bare.code, .modelMissing)
+
+    // With the explicit pick threaded, the start resolves to that model.
+    guard case .success(let spec) = resolver.resolveLauncherSpec(
+      profileID: "chat", explicitModel: pickedSlug) else {
+      return XCTFail("explicit model pick must satisfy a no-default profile's engine start")
+    }
+    let body = PieControlLauncher.renderConfigBody(modelConfig: spec.modelConfig)
+    XCTAssertTrue(body.contains("hf_repo = \"\(stagedPath)\""),
+                  "the explicit pick must be the boot model passed to pie; got:\n\(body)")
+    XCTAssertEqual(spec.inferletNameAtVersion, "chat-apc@0.1.0",
+                   "profile inferlet must still drive the launch even when the model is an explicit override")
   }
 
-  /// Review v2 F7 + v3 F1 regression guard. The resolver mapped
-  /// `profile.model` but silently dropped `profile.inferlet` — making
-  /// every profile indistinguishable to the engine as soon as a second
-  /// inferlet shipped. Argv must carry `--inferlet <name>` so the engine
-  /// activates the profile-selected inferlet. The legacy adapter
-  /// preserves the profile schema's bare inferlet names; only the
-  /// PieControlLauncher path qualifies them against the installed
-  /// manifest before calling `launch_daemon`.
-  func test_resolve_propagates_inferlet_name_into_argv() throws {
-    let profiles = tempDir.appendingPathComponent("profiles", isDirectory: true)
-    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
-    let toml = """
-    id = "alt"
-    name = "Alt"
-    model = "llama-3.1-8b-instruct"
-    inferlet = "other-inferlet"
-    """
-    try toml.write(to: profiles.appendingPathComponent("alt.toml"),
-                   atomically: true, encoding: .utf8)
-    let activeURL = tempDir.appendingPathComponent("active-profile", isDirectory: false)
-    let store = ProfileStore(directory: profiles, activeProfileURL: activeURL)
-    try store.start()
+  func test_resolveLauncherSpec_records_resolvedModel_in_activeModelMarker() throws {
+    // #469: every successful launch resolve writes the resolved boot model to
+    // the durable active-model marker so a later menu-bar Resume honors it.
+    // A FAILED resolve must NOT touch the marker.
+    let store = try makeNoDefaultStore(inferlet: "chat-apc")
     defer { store.stop() }
+    XCTAssertNil(store.activeModelID, "sanity: no marker before any launch")
 
-    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
+    let binary = tempDir.appendingPathComponent("pie-fake-marker", isDirectory: false)
     try touchExecutable(at: binary)
-
-    let resolver = LaunchSpecResolver(
-      profileStore: store,
-      pieBinary: { binary },
-      modelsRoot: { self.tempDir.appendingPathComponent("models") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
-    )
-    guard case .success(let spec) = resolver.resolve(profileID: "alt") else {
-      return XCTFail("expected .success for profile carrying a non-default inferlet")
-    }
-    XCTAssertEqual(spec.inferletName, "other-inferlet")
-    let argv = spec.arguments()
-    guard let idx = argv.firstIndex(of: "--inferlet") else {
-      return XCTFail("argv missing --inferlet flag: \(argv)")
-    }
-    XCTAssertLessThan(idx + 1, argv.count,
-                      "--inferlet flag has no value: \(argv)")
-    XCTAssertEqual(argv[idx + 1], "other-inferlet",
-                   "argv must surface profile.inferlet verbatim")
-  }
-
-  func test_resolve_unknown_profile_returns_profile_missing() throws {
-    let store = try makeStoreWithChatProfile()
-    defer { store.stop() }
-
-    let resolver = LaunchSpecResolver(
-      profileStore: store,
-      pieBinary: { self.tempDir.appendingPathComponent("pie-fake") },
-      modelsRoot: { self.tempDir.appendingPathComponent("models") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
-    )
-
-    let result = resolver.resolve(profileID: "ghost")
-    guard case .failure(let err) = result else {
-      return XCTFail("expected .failure, got \(result)")
-    }
-    XCTAssertEqual(err.code, .profileMissing,
-                   "unknown profileID must map to .profileMissing (matches Phase 2.2 wire contract)")
-  }
-
-  func test_resolve_propagates_binary_lookup_failure_as_spawn_failed() throws {
-    let store = try makeStoreWithChatProfile()
-    defer { store.stop() }
-
-    struct StubError: Error, CustomStringConvertible {
-      var description: String { "pie binary deliberately absent" }
-    }
-    let resolver = LaunchSpecResolver(
-      profileStore: store,
-      pieBinary: { throw StubError() },
-      modelsRoot: { self.tempDir.appendingPathComponent("models") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
-    )
-    let result = resolver.resolve(profileID: "chat")
-    guard case .failure(let err) = result else {
-      return XCTFail("expected .failure, got \(result)")
-    }
-    XCTAssertEqual(err.code, .spawnFailed,
-                   "missing-binary must NOT collapse to .profileMissing (the profile is fine; the install is broken)")
-  }
-
-  /// Review v150 F8 regression guard. The downloader writes models
-  /// as `<modelsRoot>/<repo>/<file>` so profile.model legitimately
-  /// carries a multi-segment slug (e.g. HuggingFace path). A naive
-  /// single `appendingPathComponent` call percent-escapes embedded
-  /// `/` into `%2F` on recent Foundation, producing a path the
-  /// engine cannot open. The resolver MUST chain per-segment so the
-  /// final modelPath is a real filesystem path with literal slashes.
-  func test_resolve_multisegment_model_slug_preserves_slashes() throws {
-    let profiles = tempDir.appendingPathComponent("profiles", isDirectory: true)
-    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
-    let slug = "TheBloke/Llama-2-7B-Chat-GGUF/llama-2-7b.gguf"
-    let toml = """
-    id = "llama2"
-    name = "Llama 2"
-    model = "\(slug)"
-    inferlet = "chat-apc"
-    """
-    try toml.write(to: profiles.appendingPathComponent("llama2.toml"),
-                   atomically: true, encoding: .utf8)
-    let activeURL = tempDir.appendingPathComponent("active-profile", isDirectory: false)
-    let store = ProfileStore(directory: profiles, activeProfileURL: activeURL)
-    try store.start()
-    defer { store.stop() }
-
-    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
-    try touchExecutable(at: binary)
-    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models-marker", isDirectory: true)
+    let pickedSlug = "Org/Marker-GGUF/marker.gguf"
+    try stageModel(named: pickedSlug, in: modelsRoot)
 
     let resolver = LaunchSpecResolver(
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { self.tempDir.appendingPathComponent("hf-home-marker", isDirectory: true) }
     )
-    guard case .success(let spec) = resolver.resolve(profileID: "llama2") else {
-      return XCTFail("expected .success for multi-segment slug")
+
+    // A failed resolve (no-default, no override) must not write the marker.
+    guard case .failure = resolver.resolveLauncherSpec(profileID: "chat") else {
+      return XCTFail("no-default profile must refuse a bare start")
     }
-    XCTAssertEqual(spec.modelPath,
-                   modelsRoot.path + "/" + slug,
-                   "embedded '/' in profile.model MUST survive as literal path separators, not %2F")
-    XCTAssertFalse(spec.modelPath.contains("%2F"),
-                   "modelPath leaked %2F escape — downloader layout becomes unreachable: \(spec.modelPath)")
-    XCTAssertFalse(spec.modelPath.contains("%2f"),
-                   "modelPath leaked lowercase %2f escape: \(spec.modelPath)")
+    XCTAssertNil(store.activeModelID, "a failed resolve must not write the active-model marker")
+
+    // A successful resolve records the resolved boot model.
+    guard case .success = resolver.resolveLauncherSpec(
+      profileID: "chat", explicitModel: pickedSlug) else {
+      return XCTFail("explicit pick must resolve")
+    }
+    XCTAssertEqual(store.activeModelID, pickedSlug,
+                   "a successful launch resolve must record the resolved model in the active-model marker")
+  }
+
+  /// #459 timeout coherence: the production resolver must hand the engine a
+  /// cold-start boot budget aligned with the 120s request/shmem timeouts, not
+  /// the 30s test default — otherwise a slow large-model boot is killed by an
+  /// out-of-band handshake ceiling.
+  func test_resolveLauncherSpec_uses_coldStart_handshake_budget() throws {
+    let store = try makeSeededDefaultStore()
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake-handshake", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models-handshake", isDirectory: true)
+    let staged = URL(fileURLWithPath: LaunchSpecResolver.joinModelPath(
+      modelsRoot: modelsRoot, slug: ProfileStore.defaultChatModelID))
+    try FileManager.default.createDirectory(at: staged.deletingLastPathComponent(),
+                                            withIntermediateDirectories: true)
+    try Data("gguf".utf8).write(to: staged)
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { self.tempDir.appendingPathComponent("hf-home-handshake", isDirectory: true) }
+    )
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(
+      profileID: ProfileStore.defaultProfileID) else {
+      return XCTFail("seeded default must resolve")
+    }
+    // #687: the boot handshake is now the SIZE-AWARE per-model timeout, in
+    // lock-step with request_timeout_secs / PIE_SHMEM_TIMEOUT_S. This tiny
+    // staged fixture (a few bytes) sits at/below the 4 GiB base, so it gets
+    // the 120s floor — not the 30s default, and not the 600s ceiling.
+    XCTAssertEqual(spec.handshakeTimeout,
+                   TimeInterval(PieControlLauncher.requestTimeoutFloorSeconds),
+                   "a small model's boot handshake must be the 120s floor")
+    XCTAssertEqual(spec.handshakeTimeout, TimeInterval(spec.requestTimeoutSeconds),
+                   "handshake budget must stay in lock-step with the request/shmem timeout")
+    XCTAssertLessThanOrEqual(spec.handshakeTimeout, PieControlLauncher.coldStartHandshakeTimeout,
+                             "per-model handshake never exceeds the cold-start ceiling the XPC deadlines clear")
+  }
+
+  /// A blank/whitespace `explicitModel` is treated as "no override" so a
+  /// genuinely no-default profile still surfaces the choose/download path
+  /// rather than booting an empty slug.
+  func test_resolveLauncherSpec_blank_explicitModel_falls_through_to_noDefault() throws {
+    let store = try makeNoDefaultStore(inferlet: "chat-apc")
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake-blank", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { self.tempDir.appendingPathComponent("models-blank") }
+    )
+
+    guard case .failure(let err) = resolver.resolveLauncherSpec(
+      profileID: "chat", explicitModel: "   ") else {
+      return XCTFail("blank explicit model must not be treated as a real boot model")
+    }
+    XCTAssertEqual(err.code, .modelMissing)
+    XCTAssertTrue(err.message.contains("has no default model"), "got: \(err.message)")
+  }
+
+  /// When the profile DOES carry a default, an explicit pick overrides it
+  /// for this boot (single-model v1 engine: the model you start is the one
+  /// the engine serves). The profile default is unchanged on disk.
+  func test_resolveLauncherSpec_explicitModel_overrides_profile_default() throws {
+    let store = try makeStoreWithModel("Org/Default-GGUF/default.gguf")
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake-override", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models-override", isDirectory: true)
+    try stageModel(named: "Org/Default-GGUF/default.gguf", in: modelsRoot)
+    let pickedSlug = "Org/Picked-GGUF/picked.gguf"
+    try stageModel(named: pickedSlug, in: modelsRoot)
+    let pickedPath = LaunchSpecResolver.joinModelPath(modelsRoot: modelsRoot, slug: pickedSlug)
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { self.tempDir.appendingPathComponent("hf-home-override", isDirectory: true) }
+    )
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(
+      profileID: "chat", explicitModel: pickedSlug) else {
+      return XCTFail("explicit pick must override the profile default for this boot")
+    }
+    let body = PieControlLauncher.renderConfigBody(modelConfig: spec.modelConfig)
+    XCTAssertTrue(body.contains("hf_repo = \"\(pickedPath)\""),
+                  "explicit pick must win over the profile default; got:\n\(body)")
   }
 
   func test_joinModelPath_unit_handles_single_segment_and_multi_segment() {
@@ -215,7 +241,7 @@ final class LaunchSpecResolverTests: XCTestCase {
     // : asClosure now returns PieControlLauncher.LaunchSpec
     // and requires wasm/manifest + pieHome injection. Stub them with
     // tempDir-anchored paths so the test does not depend on a
-    // bundled RatioThink.app sibling.
+    // bundled Rational.app sibling.
     let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
     let modelsRoot = tempDir.appendingPathComponent("models-closure", isDirectory: true)
     try stageModel(named: "llama-3.1-8b-instruct", in: modelsRoot)
@@ -223,18 +249,78 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
     )
 
     let closure: HelperExportedAPI.LaunchSpecResolver = resolver.asClosure
-    if case .success(let spec) = closure("chat") {
+    if case .success(let spec) = closure("chat", nil) {
       XCTAssertEqual(spec.profileID, "chat")
     } else {
       XCTFail("closure adapter must round-trip the same result as resolve()")
     }
+  }
+
+  func test_resolveLauncherSpec_applies_external_bind_mode_for_helper_resume() throws {
+    let store = try makeStoreWithChatProfile()
+    defer { store.stop() }
+    let binary = tempDir.appendingPathComponent("pie-fake-external-bind", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models-external-bind", isDirectory: true)
+    try stageModel(named: "llama-3.1-8b-instruct", in: modelsRoot)
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      daemonBindMode: { .external }
+    )
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(profileID: "chat") else {
+      return XCTFail("expected helper resolver to produce a launch spec")
+    }
+    XCTAssertEqual(spec.daemonBindHost, .external,
+                   "helper-owned Resume/auto-relaunch starts must inherit the persisted Local API bind mode before engineHost.start(spec)")
+  }
+
+  func test_default_helper_bind_mode_reads_shared_app_persisted_preference() throws {
+    let store = try makeStoreWithChatProfile()
+    defer { store.stop() }
+    let binary = tempDir.appendingPathComponent("pie-fake-shared-bind", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models-shared-bind", isDirectory: true)
+    try stageModel(named: "llama-3.1-8b-instruct", in: modelsRoot)
+    let appSharedRoot = tempDir.appendingPathComponent("shared-app-root", isDirectory: true)
+    try FileManager.default.createDirectory(at: appSharedRoot, withIntermediateDirectories: true)
+    try LocalAPIExposurePreference.saveEnabled(true, root: appSharedRoot)
+
+    let helperSuite = "com.ratiothink.helper.false.\(UUID().uuidString)"
+    let helperDefaults = UserDefaults(suiteName: helperSuite)!
+    defer { helperDefaults.removePersistentDomain(forName: helperSuite) }
+    helperDefaults.set(false, forKey: EngineHTTPBindMode.localAPIExternalAccessEnabledPreferenceKey)
+
+    let result = PieDirs.$homeOverride.withValue(appSharedRoot) {
+      let resolver = LaunchSpecResolver(
+        profileStore: store,
+        pieBinary: { binary },
+        modelsRoot: { modelsRoot },
+        pieControlResources: { resources },
+        pieHome: { self.tempDir },
+        subprocessEnvironment: { [:] }
+      )
+      return resolver.resolveLauncherSpec(profileID: "chat")
+    }
+
+    guard case .success(let spec) = result else {
+      return XCTFail("expected helper resolver to produce a launch spec")
+    }
+    XCTAssertEqual(spec.daemonBindHost, .external,
+                   "helper resolver must read the app/helper shared file-backed preference, not the helper process defaults domain")
   }
 
   /// Review v1 F1: first-run seeded profiles still use the public
@@ -262,14 +348,13 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
     )
 
     let closure: HelperExportedAPI.LaunchSpecResolver = resolver.asClosure
-    guard case .success(let spec) = closure(ProfileStore.defaultProfileID) else {
+    guard case .success(let spec) = closure(ProfileStore.defaultProfileID, nil) else {
       return XCTFail("seeded default profile must resolve successfully through asClosure")
     }
     XCTAssertEqual(spec.inferletNameAtVersion, "chat-apc@0.1.0")
@@ -296,7 +381,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -311,6 +395,42 @@ final class LaunchSpecResolverTests: XCTestCase {
                   "app-staged default must win and be passed to pie as a local hf_repo path; got:\n\(body)")
     XCTAssertFalse(body.contains("hf_path"),
                    "pie server config accepts model.hf_repo; production config must not emit stale hf_path")
+  }
+
+  /// #702: a dangling active-profile id (marker points at a deleted /
+  /// unparseable profile) must NOT strand engine start. The resolver falls
+  /// back to the always-present `chat` base built-in and boots it, instead of
+  /// hard-rejecting with `.profileMissing`.
+  func test_resolveLauncherSpec_dangling_profile_id_falls_back_to_chat_base() throws {
+    let store = try makeSeededDefaultStore()
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake-ghost", isDirectory: false)
+    try touchExecutable(at: binary)
+    let modelsRoot = tempDir.appendingPathComponent("models-ghost", isDirectory: true)
+    let stagedDefault = URL(fileURLWithPath: LaunchSpecResolver.joinModelPath(
+      modelsRoot: modelsRoot, slug: ProfileStore.defaultChatModelID))
+    try FileManager.default.createDirectory(at: stagedDefault.deletingLastPathComponent(),
+                                            withIntermediateDirectories: true)
+    try Data("gguf".utf8).write(to: stagedDefault)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { self.tempDir.appendingPathComponent("hf-home-ghost", isDirectory: true) }
+    )
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(profileID: "ghost-deleted-profile") else {
+      return XCTFail("#702: a dangling profile id must fall back to the chat base, not hard-reject")
+    }
+    let body = PieControlLauncher.renderConfigBody(modelConfig: spec.modelConfig)
+    XCTAssertTrue(body.contains("hf_repo = \"\(stagedDefault.path)\""),
+                  "fallback must boot the chat base default model; got:\n\(body)")
   }
 
   func test_resolveLauncherSpec_falls_back_to_hf_cache_for_seeded_default() throws {
@@ -336,7 +456,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -349,6 +468,83 @@ final class LaunchSpecResolverTests: XCTestCase {
     let body = PieControlLauncher.renderConfigBody(modelConfig: spec.modelConfig)
     XCTAssertTrue(body.contains("hf_repo = \"\(snapshot.path)\""),
                   "HF cache fallback must pass the resolved local snapshot dir to pie; got:\n\(body)")
+  }
+
+  // The catalog gates quantized rows out of the picker, but a stale or
+  // hand-authored profile can still name one — the resolver must fast-
+  // fail before spawning the engine, for BOTH resolved shapes.
+  func test_resolveLauncherSpec_rejects_quantized_hf_safetensors_directory() throws {
+    let store = try makeStoreWithModel("mlx-community/Qwen3-0.6B-4bit")
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    let hfHome = tempDir.appendingPathComponent("hf-home", isDirectory: true)
+    let snapshot = try writeHFCacheSnapshot(
+      hfHome: hfHome,
+      repo: "mlx-community/Qwen3-0.6B-4bit",
+      files: ["config.json": "{}", "tokenizer.json": "{}"]
+    )
+    try writeSafetensorsFile(at: snapshot.appendingPathComponent("model.safetensors"),
+                             dtypes: ["U32"])
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { hfHome }
+    )
+
+    switch resolver.resolveLauncherSpec(profileID: "chat") {
+    case .success:
+      XCTFail("a quantized U32 safetensors snapshot dir must fast-fail before engine spawn")
+    case .failure(let err):
+      XCTAssertEqual(err.code, .invalidInput, "got: \(err.code)")
+      XCTAssertTrue(err.message.contains("U32"), "reason must name the dtype; got: \(err.message)")
+    }
+  }
+
+  func test_resolveLauncherSpec_rejects_quantized_hf_safetensors_single_file() throws {
+    // A 3-segment slug `org/name/file.safetensors` resolves to a single
+    // FILE, not a directory — the F1 case the directory-only gate missed.
+    let store = try makeStoreWithModel("mlx-community/Qwen3-0.6B-4bit/model.safetensors")
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    let hfHome = tempDir.appendingPathComponent("hf-home", isDirectory: true)
+    let snapshot = try writeHFCacheSnapshot(
+      hfHome: hfHome,
+      repo: "mlx-community/Qwen3-0.6B-4bit",
+      files: ["config.json": "{}", "tokenizer.json": "{}"]
+    )
+    try writeSafetensorsFile(at: snapshot.appendingPathComponent("model.safetensors"),
+                             dtypes: ["U32"])
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { hfHome }
+    )
+
+    switch resolver.resolveLauncherSpec(profileID: "chat") {
+    case .success:
+      XCTFail("a quantized single-file safetensors path must fast-fail before engine spawn")
+    case .failure(let err):
+      XCTAssertEqual(err.code, .invalidInput, "got: \(err.code)")
+      XCTAssertTrue(err.message.contains("U32"), "reason must name the dtype; got: \(err.message)")
+    }
   }
 
   func test_resolveLauncherSpec_hf_gguf_symlink_fallback_preserves_snapshot_path() throws {
@@ -380,7 +576,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -395,6 +590,102 @@ final class LaunchSpecResolverTests: XCTestCase {
                   "pie requires the .gguf snapshot path, not the extensionless blob target; got:\n\(body)")
     XCTAssertFalse(body.contains("/blobs/abcdef"),
                    "HF fallback must not resolve symlinks into extensionless blobs; got:\n\(body)")
+  }
+
+  func test_resolveLauncherSpec_app_staged_symlink_to_regular_gguf_resolves() throws {
+    // ITEM 1 / pre-#413: a staged model that is a SYMLINK to a regular GGUF
+    // (e.g. `stage-test-model.sh` links the HF cache, or a user `ln -s`'d a
+    // weight) must RESOLVE to the symlink path — not hard-fail with
+    // `modelMissing`, which ALSO skipped the HF-cache fallback even when the
+    // cache held the model (the operator's real blocker). pie follows the
+    // symlink and the `.gguf` suffix is preserved.
+    let slug = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    let store = try makeStoreWithModel(slug)
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+
+    // A real regular GGUF outside modelsRoot, linked into the staged path.
+    let target = tempDir.appendingPathComponent("real-weights.gguf", isDirectory: false)
+    try Data("gguf".utf8).write(to: target)
+    let staged = slug.split(separator: "/").map(String.init)
+      .reduce(modelsRoot) { $0.appendingPathComponent($1, isDirectory: false) }
+    try FileManager.default.createDirectory(
+      at: staged.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(atPath: staged.path, withDestinationPath: target.path)
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      // Empty HF home: proves the staged symlink resolves on its own, not
+      // via the cache fallback.
+      hfHome: { self.tempDir.appendingPathComponent("hf-home-empty") }
+    )
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(profileID: "chat") else {
+      return XCTFail("a staged symlink-to-regular GGUF must resolve, not fail modelMissing")
+    }
+    let body = PieControlLauncher.renderConfigBody(modelConfig: spec.modelConfig)
+    XCTAssertTrue(body.contains("hf_repo = \"\(staged.path)\""),
+                  "must pass the staged SYMLINK path (pie follows it; .gguf suffix preserved), not the resolved target; got:\n\(body)")
+    XCTAssertFalse(body.contains(target.path),
+                   "must not pass the resolved target path; got:\n\(body)")
+  }
+
+  func test_resolveLauncherSpec_dangling_app_staged_symlink_falls_through_to_hf_cache() throws {
+    // A DANGLING staged symlink (target gone) is treated as "not staged" and
+    // falls through to the HF-cache GGUF (3-seg slug → first-class file hit),
+    // rather than hard-failing.
+    let slug = "Qwen/Qwen3-0.6B-GGUF/model.gguf"
+    let store = try makeStoreWithModel(slug)
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    let hfHome = tempDir.appendingPathComponent("hf-home", isDirectory: true)
+
+    // HF cache holds the GGUF (snapshot entry → blob).
+    let snapshot = try writeHFCacheSnapshot(hfHome: hfHome, repo: "Qwen/Qwen3-0.6B-GGUF", files: [:])
+    let repoDir = snapshot.deletingLastPathComponent().deletingLastPathComponent()
+    let blobs = repoDir.appendingPathComponent("blobs", isDirectory: true)
+    try FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
+    let blob = blobs.appendingPathComponent("abcdef", isDirectory: false)
+    try Data("gguf".utf8).write(to: blob)
+    let snapshotEntry = snapshot.appendingPathComponent("model.gguf", isDirectory: false)
+    try FileManager.default.createSymbolicLink(atPath: snapshotEntry.path, withDestinationPath: "../../blobs/abcdef")
+
+    // Staged path is a DANGLING symlink (target never created).
+    let staged = slug.split(separator: "/").map(String.init)
+      .reduce(modelsRoot) { $0.appendingPathComponent($1, isDirectory: false) }
+    try FileManager.default.createDirectory(
+      at: staged.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(atPath: staged.path, withDestinationPath: "/nonexistent/gone.gguf")
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { hfHome }
+    )
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(profileID: "chat") else {
+      return XCTFail("a dangling staged symlink must fall through to the HF-cache GGUF, not fail")
+    }
+    let body = PieControlLauncher.renderConfigBody(modelConfig: spec.modelConfig)
+    XCTAssertTrue(body.contains("hf_repo = \"\(snapshotEntry.path)\""),
+                  "dangling staged symlink must fall through to the HF-cache .gguf snapshot path; got:\n\(body)")
   }
 
   func test_resolveLauncherSpec_rejects_incomplete_default_hf_cache() throws {
@@ -416,7 +707,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -467,7 +757,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -502,7 +791,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -537,7 +825,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -571,7 +858,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -608,7 +894,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-small") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -640,7 +925,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-huge-local") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -685,7 +969,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-huge-hf") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -730,7 +1013,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-hidden-huge-hf") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -775,7 +1057,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-hidden-dangling-hf") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -828,7 +1109,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-unreadable-hf") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -878,7 +1158,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -918,7 +1197,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { self.tempDir.appendingPathComponent("models") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -956,8 +1234,7 @@ final class LaunchSpecResolverTests: XCTestCase {
     let resolver = LaunchSpecResolver(
       profileStore: store,
       pieBinary: { self.tempDir.appendingPathComponent("pie-fake") },
-      modelsRoot: { self.tempDir.appendingPathComponent("models") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") }
+      modelsRoot: { self.tempDir.appendingPathComponent("models") }
     )
     guard case .failure(let err) = resolver.resolveLauncherSpec(profileID: "chat") else {
       return XCTFail("a split-GGUF shard model must be refused before launch")
@@ -1041,7 +1318,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { self.tempDir.appendingPathComponent("models-rt-\(suffix)", isDirectory: true) },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-rt-\(suffix)") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -1123,6 +1399,25 @@ final class LaunchSpecResolverTests: XCTestCase {
     return store
   }
 
+  /// A profile whose `model` key is omitted — the explicit no-default state
+  /// (#452) a model delete leaves behind. Mirrors `makeStoreWithModel` but
+  /// without the `model =` line.
+  private func makeNoDefaultStore(inferlet: String) throws -> ProfileStore {
+    let profiles = tempDir.appendingPathComponent("profiles-no-default-store", isDirectory: true)
+    try FileManager.default.createDirectory(at: profiles, withIntermediateDirectories: true)
+    let toml = """
+    id = "chat"
+    name = "Chat"
+    inferlet = "\(inferlet)"
+    """
+    try toml.write(to: profiles.appendingPathComponent("chat.toml"),
+                   atomically: true, encoding: .utf8)
+    let active = tempDir.appendingPathComponent("active-profile-no-default-store", isDirectory: false)
+    let store = ProfileStore(directory: profiles, activeProfileURL: active)
+    try store.start()
+    return store
+  }
+
   private func makeSeededDefaultStore() throws -> ProfileStore {
     let profiles = tempDir.appendingPathComponent("profiles-default", isDirectory: true)
     let active = tempDir.appendingPathComponent("active-profile-default", isDirectory: false)
@@ -1161,7 +1456,6 @@ final class LaunchSpecResolverTests: XCTestCase {
       profileStore: store,
       pieBinary: { binary },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets-\(artifact)") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -1211,11 +1505,76 @@ final class LaunchSpecResolverTests: XCTestCase {
     return url
   }
 
+  // MARK: - isModelResolvable (send-gate availability mirrors the launcher)
+
+  /// The release blocker: an HF-cached safetensors model (slug = bare repo id,
+  /// no file segment → a snapshot DIRECTORY) is genuinely loadable — the
+  /// launcher resolves it from the cache — so the send-gate must report it
+  /// resolvable, not "isn't available". Before the fix the gate only checked
+  /// the app-staged path and returned false for this exact case.
+  func test_isModelResolvable_true_for_HFCached_safetensors_directory() throws {
+    let modelsRoot = tempDir.appendingPathComponent("models-empty", isDirectory: true)
+    let hfHome = tempDir.appendingPathComponent("hf-home-st", isDirectory: true)
+    // A complete snapshot (config + tokenizer + safetensors weight) — what a
+    // real `huggingface_hub` download of a safetensors model leaves on disk.
+    try writeHFCacheSnapshot(
+      hfHome: hfHome,
+      repo: "Qwen/Qwen3-0.6B",
+      files: [
+        "config.json": "{\"torch_dtype\": \"bfloat16\"}",
+        "tokenizer.json": "{}",
+        "model.safetensors": "weights",
+      ])
+    XCTAssertTrue(
+      LaunchSpecResolver.isModelResolvable(
+        slug: "Qwen/Qwen3-0.6B", modelsRoot: modelsRoot, hfHome: hfHome),
+      "an HF-cached safetensors snapshot must be reported resolvable (it is loadable)")
+  }
+
+  /// Symmetry with the launcher's primary source: a plainly app-staged file
+  /// resolves without consulting the cache.
+  func test_isModelResolvable_true_for_appStaged_file() throws {
+    let modelsRoot = tempDir.appendingPathComponent("models-staged", isDirectory: true)
+    try stageModel(named: "Org/Local-GGUF/local.gguf", in: modelsRoot)
+    XCTAssertTrue(
+      LaunchSpecResolver.isModelResolvable(
+        slug: "Org/Local-GGUF/local.gguf",
+        modelsRoot: modelsRoot,
+        hfHome: tempDir.appendingPathComponent("hf-home-staged", isDirectory: true)))
+  }
+
+  /// A slug present in neither source is genuinely unavailable.
+  func test_isModelResolvable_false_when_absent_from_both_sources() throws {
+    let modelsRoot = tempDir.appendingPathComponent("models-none", isDirectory: true)
+    let hfHome = tempDir.appendingPathComponent("hf-home-none", isDirectory: true)
+    XCTAssertFalse(
+      LaunchSpecResolver.isModelResolvable(
+        slug: "Ghost/Not-Real", modelsRoot: modelsRoot, hfHome: hfHome))
+  }
+
   private func makeSparseFile(at url: URL, sizeBytes: Int64) throws {
     _ = FileManager.default.createFile(atPath: url.path, contents: nil)
     let handle = try FileHandle(forWritingTo: url)
     try handle.truncate(atOffset: UInt64(sizeBytes))
     try handle.close()
+  }
+
+  /// Write a minimal valid `.safetensors` (8-byte LE header length + JSON
+  /// dtype map) so the launch-path probe reads a real header.
+  @discardableResult
+  private func writeSafetensorsFile(at url: URL, dtypes: [String]) throws -> URL {
+    var header: [String: Any] = [:]
+    for (i, dtype) in dtypes.enumerated() {
+      header["t\(i)"] = ["dtype": dtype, "shape": [1], "data_offsets": [0, 0]]
+    }
+    let headerData = try JSONSerialization.data(withJSONObject: header)
+    var length = UInt64(headerData.count).littleEndian
+    var data = Data(bytes: &length, count: 8)
+    data.append(headerData)
+    try FileManager.default.createDirectory(
+      at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try data.write(to: url)
+    return url
   }
 
   @discardableResult

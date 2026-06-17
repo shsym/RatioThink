@@ -39,6 +39,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from dataclasses import dataclass
 
 import httpx
 from pie_client import PieClient
@@ -84,15 +85,36 @@ request_timeout_secs = 60
 default_endowment_pages = 4
 admission_oversubscription_factor = 8.0
 restore_pause_at_utilization = 0.85
+# The per-request max_tokens ceiling chat-apc reads back
+# (runtime::max-output-tokens — #438) follows default_token_limit when
+# set, ELSE the raw KV capacity. Set it below the dummy driver's derived
+# KV capacity (4096; see the driver options note below) and distinct from
+# the old hardcoded 8192, so the over-limit assertion in main() proves
+# default_token_limit takes precedence end to end.
+default_token_limit = 3000
 
 [model.driver]
 type = "dummy"
 device = ["cpu"]
 
 [model.driver.options]
-vocab_size = 32000
+# Must match the bound tokenizer's vocabulary (Qwen/Qwen3-0.6B → 151936).
+# The grammar matcher masks logits over the real tokenizer vocab, so a
+# dummy vocab smaller than the tokenizer leaves the constrained tokens
+# (e.g. the JSON `{` openers, which are high token ids) outside the
+# dummy's logit range — the mask then admits zero in-range tokens and
+# constrained decode (json_object / json_schema / forced-tool) collapses.
+vocab_size = 151936
 arch_name = "test"
+# The dummy driver derives its own KV page count internally (256 pages of
+# KV_PAGE_SIZE = 16 tokens by default → 4096-token capacity) and accepts
+# no page-sizing options. The retired kv_page_size / max_num_kv_pages
+# knobs are no longer part of its config surface.
 """
+
+# The ceiling chat-apc must report = the configured default_token_limit
+# above (NOT the 4096 KV capacity, NOT the old 8192 constant).
+EXPECTED_MAX_OUTPUT_TOKENS = 3000
 
 # Files contributing to the inferlet "source hash" re-exported for
 # legacy callers; authoritative copy lives in `_stamp.SRC_HASH_PATHS`.
@@ -166,15 +188,41 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-async def _parse_handshake(proc: subprocess.Popen, timeout: float) -> tuple[str, str]:
-    """Read pie stdout until we have `pie-server serving on <host>:<port>` + `internal token: <tok>`."""
-    url_re = re.compile(r"pie-server serving on ([^\s]+:[0-9]+)")
-    tok_re = re.compile(r"internal token: ([^\s]+)")
+@dataclass
+class HandshakeState:
     url: str | None = None
     token: str | None = None
+
+
+def _parse_control_address(line: str) -> str | None:
+    """Extract the pie control-plane host:port from supported ready banners."""
+    for pattern in (
+        r"pie-server serving on ([^\s]+:[0-9]+)",
+        r"Server ready at wss?://([^/\s]+)",
+    ):
+        match = re.search(pattern, line)
+        if match:
+            return match.group(1)
+    return None
+
+
+_TOKEN_RE = re.compile(r"internal token: ([^\s]+)")
+
+
+def _parse_handshake_line(state: HandshakeState, line: str) -> None:
+    if state.url is None:
+        state.url = _parse_control_address(line)
+    if state.token is None:
+        if m := _TOKEN_RE.search(line):
+            state.token = m.group(1)
+
+
+async def _parse_handshake(proc: subprocess.Popen, timeout: float) -> tuple[str, str]:
+    """Read pie stdout until we have a supported ready banner + `internal token: <tok>`."""
+    state = HandshakeState()
     deadline = time.monotonic() + timeout
     loop = asyncio.get_event_loop()
-    while time.monotonic() < deadline and (url is None or token is None):
+    while time.monotonic() < deadline and (state.url is None or state.token is None):
         if proc.poll() is not None:
             raise RuntimeError(f"pie exited early (code={proc.returncode})")
         line = await loop.run_in_executor(None, proc.stdout.readline)
@@ -183,18 +231,10 @@ async def _parse_handshake(proc: subprocess.Popen, timeout: float) -> tuple[str,
             continue
         sys.stdout.write(f"[pie] {line}")
         sys.stdout.flush()
-        if url is None:
-            m = url_re.search(line)
-            if m:
-                url = m.group(1)
-        if token is None:
-            m = tok_re.search(line)
-            if m:
-                token = m.group(1)
-    if url is None or token is None:
-        raise RuntimeError(f"timeout parsing pie handshake (url={url!r} token={token!r})")
-    return url, token
-
+        _parse_handshake_line(state, line)
+    if state.url is None or state.token is None:
+        raise RuntimeError(f"timeout parsing pie handshake (url={state.url!r} token={state.token!r})")
+    return state.url, state.token
 
 async def _drain_stdout(proc: subprocess.Popen) -> None:
     """Keep reading pie's stdout in background so the pipe buffer doesn't fill."""
@@ -446,6 +486,12 @@ async def main() -> int:
                             failures.append(f"/v1/models[0].owned_by {first!r}")
                         if not isinstance(first.get("id"), str) or not first.get("id"):
                             failures.append(f"/v1/models[0].id {first!r}")
+                        # #474: every entry carries the effective per-request
+                        # max_tokens ceiling (engine-global min) so the App
+                        # can clamp its profile value to the launched engine.
+                        mot = first.get("max_output_tokens")
+                        if not isinstance(mot, int) or isinstance(mot, bool) or mot <= 0:
+                            failures.append(f"/v1/models[0].max_output_tokens {first!r}")
 
                     # 404
                     r = await http.get(f"{base}/nonexistent")
@@ -463,44 +509,26 @@ async def main() -> int:
                     # harness.
                     model_id = first.get("id") if data else "default"
 
-                    # POST /v1/models/load — pre-warm OK path.
+                    # #469: /v1/models/load is REMOVED. pie binds the served
+                    # model at boot; the served model is `GET /v1/models` and
+                    # switching it is an engine relaunch, not a runtime load.
+                    # Guard the removal: the route must now be an unknown path.
+                    _ = model_id  # kept for the chat-completion checks below
                     r = await http.post(
                         f"{base}/v1/models/load",
-                        json={"model": model_id},
+                        json={"model": "anything"},
                     )
-                    print(f"[harness] POST /v1/models/load(model={model_id!r}) -> {r.status_code}")
-                    if r.status_code != 200:
-                        failures.append(f"/v1/models/load status {r.status_code}")
-                    if r.headers.get("content-type", "").split(";", 1)[0] != "text/event-stream":
-                        failures.append(
-                            f"/v1/models/load content-type {r.headers.get('content-type')!r}"
-                        )
-                    # Body should contain one model_ready meta-frame +
-                    # the [DONE] sentinel. We assert exact ordering so
-                    # GUI consumers can rely on it.
-                    text = r.text
-                    if 'data: {"event":"model_ready"}' not in text:
-                        failures.append(f"/v1/models/load missing model_ready frame: {text!r}")
-                    if "data: [DONE]" not in text:
-                        failures.append(f"/v1/models/load missing [DONE] sentinel: {text!r}")
-
-                    # POST /v1/models/load — unknown model → 404.
-                    r = await http.post(
-                        f"{base}/v1/models/load",
-                        json={"model": "does-not-exist"},
-                    )
-                    print(f"[harness] POST /v1/models/load(model='does-not-exist') -> {r.status_code}")
+                    print(f"[harness] POST /v1/models/load (removed) -> {r.status_code}")
                     if r.status_code != 404:
-                        failures.append(f"/v1/models/load unknown status {r.status_code}")
-
-                    # DELETE /v1/models/load — 204 no-op.
+                        failures.append(f"/v1/models/load should be removed (404), got {r.status_code}")
                     r = await http.delete(f"{base}/v1/models/load")
-                    print(f"[harness] DELETE /v1/models/load -> {r.status_code}")
-                    if r.status_code != 204:
-                        failures.append(f"/v1/models/load DELETE status {r.status_code}")
+                    print(f"[harness] DELETE /v1/models/load (removed) -> {r.status_code}")
+                    if r.status_code != 404:
+                        failures.append(f"DELETE /v1/models/load should be removed (404), got {r.status_code}")
 
-                    # POST /v1/chat/completions — unknown model → 404
-                    # (validation path, no forward pass triggered).
+                    # POST /v1/chat/completions — wrong model for the
+                    # resident engine → 409 target_mismatch (validation path,
+                    # no forward pass triggered).
                     r = await http.post(
                         f"{base}/v1/chat/completions",
                         json={
@@ -510,8 +538,10 @@ async def main() -> int:
                         },
                     )
                     print(f"[harness] POST /v1/chat/completions(bad model) -> {r.status_code}")
-                    if r.status_code != 404:
+                    if r.status_code != 409:
                         failures.append(f"/v1/chat/completions unknown model status {r.status_code}")
+                    elif r.json().get("error", {}).get("code") != "target_mismatch":
+                        failures.append("/v1/chat/completions bad model did not return target_mismatch")
 
                     # POST /v1/chat/completions — empty messages → 400.
                     r = await http.post(
@@ -533,8 +563,8 @@ async def main() -> int:
                     if r.status_code != 404:
                         failures.append(f"/v1/inferlet unknown status {r.status_code}")
 
-                    # POST /v1/inferlet — chat-apc with unknown model
-                    # in `input` → 404 from the chat layer.
+                    # POST /v1/inferlet — chat-apc with wrong model
+                    # in `input` → 409 target_mismatch from the chat layer.
                     r = await http.post(
                         f"{base}/v1/inferlet",
                         json={
@@ -545,10 +575,12 @@ async def main() -> int:
                         },
                     )
                     print(f"[harness] POST /v1/inferlet(chat-apc + bad model) -> {r.status_code}")
-                    if r.status_code != 404:
+                    if r.status_code != 409:
                         failures.append(
                             f"/v1/inferlet chat-apc bad model status {r.status_code}"
                         )
+                    elif r.json().get("error", {}).get("code") != "target_mismatch":
+                        failures.append("/v1/inferlet chat-apc bad model did not return target_mismatch")
 
                     # ── tree-of-thought (#407) ───────────────────────
                     # The `tree-of-thought` dispatch name is accepted
@@ -557,18 +589,56 @@ async def main() -> int:
                     # need a working forward pass. The full-search shape
                     # check below is best-effort against the dummy driver.
 
-                    # stream:true → 400 (no streaming in v1).
+                    # stream:true + invalid params → still a JSON 400
+                    # envelope, NOT a half-open SSE stream. #413: pre-stream
+                    # validation runs BEFORE Emitter::start, so a doomed
+                    # request never opens a stream it can only error inside.
                     r = await http.post(
                         f"{base}/v1/inferlet",
                         json={
                             "inferlet": "tree-of-thought",
                             "stream": True,
-                            "input": {"messages": [{"role": "user", "content": "hi"}]},
+                            "input": {
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "breadth": 0,
+                            },
                         },
                     )
-                    print(f"[harness] POST /v1/inferlet(tot stream=true) -> {r.status_code}")
+                    print(f"[harness] POST /v1/inferlet(tot stream + breadth=0) -> {r.status_code}")
                     if r.status_code != 400:
-                        failures.append(f"tot stream:true status {r.status_code} (want 400)")
+                        failures.append(f"tot stream breadth=0 status {r.status_code} (want 400)")
+                    if r.headers.get("content-type", "").split(";", 1)[0] == "text/event-stream":
+                        failures.append(
+                            "tot stream breadth=0 opened an SSE stream (want a JSON 400 envelope)"
+                        )
+
+                    # #458: a non-default `exec` is REJECTED on a production
+                    # (default-feature) build with a `param`-tagged 400 — the
+                    # no-win strategy variants are gated behind
+                    # `--features exec-strategies` (benchmark/e2e only), and a
+                    # production client may not select a slower path. Never a
+                    # silent coerce to the default.
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": False,
+                            "input": {
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "exec": "phased_concurrent",
+                            },
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot exec=phased_concurrent) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(f"tot non-default exec status {r.status_code} (want 400)")
+                    else:
+                        try:
+                            param = r.json().get("error", {}).get("param")
+                        except Exception:
+                            param = None
+                        if param != "exec":
+                            failures.append(f"tot non-default exec param {param!r} (want 'exec')")
 
                     # Out-of-range breadth → 400 with `param` tag.
                     r = await http.post(
@@ -672,6 +742,8 @@ async def main() -> int:
                             failures.append(f"tot root shape {root!r}")
                         if (body.get("breadth"), body.get("depth"), body.get("beam_width")) != (bd, dp, bw):
                             failures.append(f"tot echoed params {body!r}")
+                        if not isinstance(body.get("synthesized"), bool):
+                            failures.append(f"tot synthesized flag {body.get('synthesized')!r} (want bool)")
 
                         def _walk(n):
                             out = [n]
@@ -713,6 +785,124 @@ async def main() -> int:
                     else:
                         failures.append(f"tot search status {r.status_code} (want 200 or 500)")
 
+                    # ── tree-of-thought STREAMING (#413) ─────────────
+                    # stream:true streams the same search as SSE: a
+                    # `tree_start`, then per level a `node_complete` per
+                    # node followed by a `level_pruned` beam, then exactly
+                    # one terminal `tree_complete` and `[DONE]`. As with
+                    # the non-stream search the dummy driver may fail the
+                    # pre-stream flush (→ JSON 500, recorded SKIPPED); the
+                    # frame-ORDER invariant is asserted only when the
+                    # stream actually opens (200 text/event-stream).
+                    sbd, sdp, sbw = 2, 2, 1
+                    r = await http.post(
+                        f"{base}/v1/inferlet",
+                        json={
+                            "inferlet": "tree-of-thought",
+                            "stream": True,
+                            "input": {
+                                "messages": [{"role": "user", "content": "What is 2+2?"}],
+                                "breadth": sbd,
+                                "depth": sdp,
+                                "beam_width": sbw,
+                                "max_tokens_per_node": 16,
+                            },
+                        },
+                    )
+                    print(f"[harness] POST /v1/inferlet(tot STREAM {sbd}x{sdp}/beam{sbw}) -> {r.status_code}")
+                    if r.status_code == 200:
+                        ctype = r.headers.get("content-type", "").split(";", 1)[0]
+                        if ctype != "text/event-stream":
+                            failures.append(f"tot stream content-type {ctype!r} (want text/event-stream)")
+
+                        # Parse `data: <payload>` SSE frames into ordered
+                        # (event, json) pairs; `[DONE]` is the sentinel.
+                        import json as _json
+                        events, saw_done = [], False
+                        for line in r.text.splitlines():
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[len("data:"):].strip()
+                            if payload == "[DONE]":
+                                saw_done = True
+                                continue
+                            if saw_done:
+                                failures.append("tot stream emitted a frame AFTER [DONE]")
+                            try:
+                                events.append(_json.loads(payload))
+                            except Exception as exc:
+                                failures.append(f"tot stream frame not JSON: {payload!r} ({exc})")
+
+                        if not saw_done:
+                            failures.append(f"tot stream missing [DONE] sentinel: {r.text!r}")
+
+                        kinds = [e.get("event") for e in events]
+                        # Opens with exactly one tree_start carrying the bounds.
+                        if not kinds or kinds[0] != "tree_start":
+                            failures.append(f"tot stream first frame {kinds[:1]} (want ['tree_start'])")
+                        else:
+                            ts = events[0]
+                            if (ts.get("breadth"), ts.get("depth"), ts.get("beam_width")) != (sbd, sdp, sbw):
+                                failures.append(f"tot stream tree_start bounds {ts!r}")
+                            if not isinstance(ts.get("id"), str) or not ts.get("id"):
+                                failures.append(f"tot stream tree_start id {ts.get('id')!r}")
+
+                        # #407 invariant pt.1: every node_complete identifies
+                        # its node by a stable id, and the node is flat
+                        # (assembled client-side from parent_id — no children).
+                        node_ids = set()
+                        for e in events:
+                            if e.get("event") != "node_complete":
+                                continue
+                            node = e.get("node") or {}
+                            nid = node.get("id")
+                            if not isinstance(nid, str) or not nid:
+                                failures.append(f"tot stream node_complete missing node.id: {e!r}")
+                            else:
+                                node_ids.add(nid)
+                            if "children" in node:
+                                failures.append(f"tot stream node_complete carries children: {e!r}")
+                            missing = [k for k in ("id", "parent_id", "depth", "branch_index", "content", "score", "status") if k not in node]
+                            if missing:
+                                failures.append(f"tot stream node_complete missing {missing}: {e!r}")
+
+                        # level_pruned keeps only ids we actually streamed.
+                        for e in events:
+                            if e.get("event") != "level_pruned":
+                                continue
+                            kept = e.get("kept")
+                            if not isinstance(kept, list):
+                                failures.append(f"tot stream level_pruned kept {kept!r}")
+                                continue
+                            for kid in kept:
+                                if kid not in node_ids:
+                                    failures.append(f"tot stream level_pruned kept id {kid!r} never streamed")
+
+                        # #407 invariant pt.2: exactly one terminal frame
+                        # (tree_complete on success | error), and it is the
+                        # LAST data frame (nothing streams after it).
+                        terminals = [i for i, k in enumerate(kinds) if k in ("tree_complete", "error")]
+                        if len(terminals) != 1:
+                            failures.append(f"tot stream terminal frames {[kinds[i] for i in terminals]} (want exactly one)")
+                        elif terminals[0] != len(kinds) - 1:
+                            failures.append(f"tot stream frame(s) after terminal: {kinds[terminals[0]:]!r}")
+                        else:
+                            term = events[terminals[0]]
+                            if term.get("event") == "tree_complete":
+                                sel = term.get("selected_node_id")
+                                if sel is not None and sel not in node_ids:
+                                    failures.append(f"tot stream selected_node_id {sel!r} not streamed")
+                                if "final_answer" not in term:
+                                    failures.append(f"tot stream tree_complete missing final_answer: {term!r}")
+                    elif r.status_code == 500:
+                        skipped.append(
+                            "tree-of-thought STREAM: dummy driver could not flush/generate "
+                            "(pre-stream 500); SSE frame order asserted only under a "
+                            "forward-pass-capable driver (live-engine coverage)"
+                        )
+                    else:
+                        failures.append(f"tot stream status {r.status_code} (want 200 or 500)")
+
                     # Review v2 follow-ups (F6/F7/F16): param bounds,
                     # malformed JSON, oversized body, streaming frame
                     # order, /v1/inferlet messages-precedence.
@@ -749,6 +939,44 @@ async def main() -> int:
                                     f"/v1/chat/completions {field}={value!r} param tag {err!r}"
                                 )
 
+                    # #438: the max_tokens ceiling must FOLLOW the engine's
+                    # configured default_token_limit (runtime::max-output-tokens),
+                    # taking precedence over the raw KV capacity and never the
+                    # old hardcoded 8192. The 400 message must name
+                    # EXPECTED_MAX_OUTPUT_TOKENS (5000), NOT the 16384 capacity
+                    # and NOT 8192 — proving the value flowed engine -> inferlet
+                    # end to end via default_token_limit.
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                            "max_tokens": 1_000_000,
+                        },
+                    )
+                    ceiling_msg = ""
+                    try:
+                        ceiling_msg = r.json().get("error", {}).get("message", "")
+                    except Exception:
+                        ceiling_msg = r.text
+                    print(f"[harness] max_tokens ceiling 400 message -> {ceiling_msg!r}")
+                    if str(EXPECTED_MAX_OUTPUT_TOKENS) not in ceiling_msg:
+                        failures.append(
+                            "max_tokens ceiling must follow default_token_limit "
+                            f"{EXPECTED_MAX_OUTPUT_TOKENS}; 400 message was {ceiling_msg!r}"
+                        )
+                    if "16384" in ceiling_msg:
+                        failures.append(
+                            "default_token_limit must take precedence over KV "
+                            f"capacity 16384; 400 message was {ceiling_msg!r}"
+                        )
+                    if "8192" in ceiling_msg:
+                        failures.append(
+                            "max_tokens ceiling regressed to the hardcoded 8192; "
+                            f"message was {ceiling_msg!r}"
+                        )
+
                     # #418 (review F1): out-of-range speculation knobs are
                     # rejected at the 400 boundary with a nested `param`,
                     # parallel to the max_tokens over-range case above —
@@ -783,6 +1011,220 @@ async def main() -> int:
                                     f"/v1/chat/completions speculation.{sub}={value} "
                                     f"param tag {err!r} (expected speculation.{sub})"
                                 )
+
+                    # #572/#619 JSON Think: response_format validation + engagement.
+                    import json as _json572
+                    # (a) Unknown response_format.type → 400
+                    #     response_format_unsupported with param "response_format".
+                    #     (#619 wired json_schema, so it is NO LONGER unsupported.)
+                    for bad_type in ("banana",):
+                        r = await http.post(
+                            f"{base}/v1/chat/completions",
+                            json={
+                                "model": model_id,
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "stream": False,
+                                "response_format": {"type": bad_type},
+                            },
+                        )
+                        print(f"[harness] POST chat(response_format={bad_type}) -> {r.status_code}")
+                        if r.status_code != 400:
+                            failures.append(
+                                f"/v1/chat/completions response_format={bad_type} status {r.status_code} (want 400)"
+                            )
+                        else:
+                            err = (r.json().get("error", {}) if r.headers.get("content-type", "").startswith("application/json") else {})
+                            if err.get("code") != "response_format_unsupported":
+                                failures.append(
+                                    f"response_format={bad_type} code {err!r} (want response_format_unsupported)"
+                                )
+
+                    # (a2) #619: json_schema WITHOUT a schema member → 400
+                    #      invalid_request (nothing to constrain to).
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                            "response_format": {"type": "json_schema"},
+                        },
+                    )
+                    print(f"[harness] POST chat(json_schema no-schema) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(
+                            f"json_schema-without-schema status {r.status_code} (want 400)"
+                        )
+                    else:
+                        err = (r.json().get("error", {}) if r.headers.get("content-type", "").startswith("application/json") else {})
+                        if err.get("code") != "invalid_request":
+                            failures.append(
+                                f"json_schema-without-schema code {err!r} (want invalid_request)"
+                            )
+
+                    # (a3) #619 review F1: a schema whose root carries a
+                    #      composition/literal keyword the compiler honors
+                    #      ahead of `type` (enum/oneOf/const/$ref/…) would
+                    #      compile to a bare-scalar grammar even with
+                    #      "type":"object". These must 400 invalid_request
+                    #      BEFORE any generation — proving a bare scalar can
+                    #      never be produced under json_schema this way.
+                    for bad_schema in (
+                        {"type": "object", "enum": ["a", "b"]},
+                        {"type": "object", "oneOf": [{"type": "string"}]},
+                        {"type": "object", "const": "hi"},
+                        {"type": ["object", "string"]},
+                        {"type": "string"},
+                        {},
+                    ):
+                        r = await http.post(
+                            f"{base}/v1/chat/completions",
+                            json={
+                                "model": model_id,
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "stream": False,
+                                "response_format": {"type": "json_schema",
+                                                    "json_schema": {"schema": bad_schema}},
+                            },
+                        )
+                        print(f"[harness] POST chat(json_schema non-object {bad_schema}) -> {r.status_code}")
+                        if r.status_code != 400:
+                            failures.append(
+                                f"json_schema non-object-root {bad_schema} status {r.status_code} (want 400)"
+                            )
+                        else:
+                            err = (r.json().get("error", {}) if r.headers.get("content-type", "").startswith("application/json") else {})
+                            if err.get("code") != "invalid_request":
+                                failures.append(
+                                    f"json_schema non-object-root {bad_schema} code {err!r} (want invalid_request)"
+                                )
+
+                    # (b) json_object + forced tool_choice → 400 invalid_request
+                    #     (the two grammars are mutually exclusive).
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                            "response_format": {"type": "json_object"},
+                            "tool_choice": "required",
+                            "tools": [{"type": "function",
+                                       "function": {"name": "f", "parameters": {"type": "object"}}}],
+                        },
+                    )
+                    print(f"[harness] POST chat(json_object + tool_choice) -> {r.status_code}")
+                    if r.status_code != 400:
+                        failures.append(
+                            f"/v1/chat/completions json+tool status {r.status_code} (want 400)"
+                        )
+
+                    # (c) json_object non-stream → 200, JSON-constrained content.
+                    #     The dummy samples randomly WITHIN the grammar mask, so
+                    #     the answer is grammar-valid JSON tokens but may truncate
+                    #     at max_tokens. Deterministic invariants on the dummy:
+                    #       · no `spec_metrics` (no speculation requested),
+                    #       · NO `<think>`/`</think>` leaks into content,
+                    #       · a natural stop ("stop") yields a COMPLETE, parseable
+                    #         JSON value. Full parse-validity under truncation is
+                    #         proven by the real-engine smoke (spec_smoke_real-style).
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "give me json"}],
+                            "stream": False,
+                            "max_tokens": 64,
+                            "response_format": {"type": "json_object"},
+                        },
+                    )
+                    print(f"[harness] POST chat(json_object) -> {r.status_code}")
+                    if r.status_code != 200:
+                        failures.append(f"json_object status {r.status_code} (want 200)")
+                    else:
+                        b572 = r.json()
+                        if b572.get("spec_metrics") is not None:
+                            failures.append(f"json_object carried spec_metrics: {b572.get('spec_metrics')!r}")
+                        choice = (b572.get("choices") or [{}])[0]
+                        msg = choice.get("message", {})
+                        content = msg.get("content", "") or ""
+                        finish = choice.get("finish_reason")
+                        print(f"[harness]   json content={content!r} finish={finish}", flush=True)
+                        if "<think>" in content or "</think>" in content:
+                            failures.append(f"reasoning delimiter leaked into json content: {content!r}")
+                        # Grammar-engagement proof, deterministic even under the
+                        # dummy's random-within-mask sampling: the FIRST non-ws
+                        # char must begin a JSON value (`{ [ " - digit t f n`).
+                        # A non-JSON (unconstrained) decode would emit arbitrary
+                        # leading text.
+                        # #619: json_object is now constrained to an OBJECT
+                        # root, not any JSON value — the first non-ws char
+                        # must be `{` (a bare scalar like `8849` is the bug
+                        # this ticket kills).
+                        stripped = content.lstrip()
+                        if stripped and stripped[0] != "{":
+                            failures.append(
+                                f"json_object content does not begin with an object: {content!r}"
+                            )
+                        if finish == "stop":
+                            try:
+                                parsed = _json572.loads(content)
+                            except _json572.JSONDecodeError as e:
+                                failures.append(f"json_object natural-stop content not valid JSON: {content!r} ({e})")
+                            else:
+                                if not isinstance(parsed, dict):
+                                    failures.append(
+                                        f"json_object natural-stop content is not a JSON object: {content!r}"
+                                    )
+
+                    # (d) #619: json_schema engagement → 200, content
+                    #     constrained to the caller's schema (object root with
+                    #     a required `answer` string under the dummy's
+                    #     within-mask sampling).
+                    r = await http.post(
+                        f"{base}/v1/chat/completions",
+                        json={
+                            "model": model_id,
+                            "messages": [{"role": "user", "content": "give me json"}],
+                            "stream": False,
+                            "max_tokens": 64,
+                            "response_format": {
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": "answer",
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {"answer": {"type": "string"}},
+                                        "required": ["answer"],
+                                    },
+                                },
+                            },
+                        },
+                    )
+                    print(f"[harness] POST chat(json_schema) -> {r.status_code}")
+                    if r.status_code != 200:
+                        failures.append(f"json_schema status {r.status_code} (want 200)")
+                    else:
+                        bjs = r.json()
+                        choice = (bjs.get("choices") or [{}])[0]
+                        content = (choice.get("message", {}) or {}).get("content", "") or ""
+                        finish = choice.get("finish_reason")
+                        print(f"[harness]   json_schema content={content!r} finish={finish}", flush=True)
+                        stripped = content.lstrip()
+                        if stripped and stripped[0] != "{":
+                            failures.append(
+                                f"json_schema content does not begin with an object: {content!r}"
+                            )
+                        if finish == "stop":
+                            try:
+                                parsed = _json572.loads(content)
+                            except _json572.JSONDecodeError as e:
+                                failures.append(f"json_schema natural-stop content not valid JSON: {content!r} ({e})")
+                            else:
+                                if not (isinstance(parsed, dict) and "answer" in parsed):
+                                    failures.append(
+                                        f"json_schema natural-stop content does not match schema: {content!r}"
+                                    )
 
                     # Malformed JSON body → 400.
                     r = await http.post(

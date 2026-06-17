@@ -17,7 +17,7 @@ import Foundation
 ///   on `ChatRequest` that flattens `ChatSampling` onto the top
 ///   level, and on `InferletRequest` that embeds `input` as an
 ///   inline JSON sub-tree rather than a base64 blob.
-/// - **Streaming events** (`LoadEvent`, `ChatEvent`) are
+/// - **Streaming events** (`ChatEvent`) are
 ///   decoder-output types, NOT direct Codable mirrors of the wire.
 ///   Their on-the-wire counterparts are OpenAI-style SSE frames
 ///   (`data: {...}\n\n`) parsed by a separate frame decoder in
@@ -40,8 +40,8 @@ import Foundation
 /// Response shape of GET /healthz (design doc §HTTP API):
 /// `{"status":"ok","model":"<id>","uptime_s":…}`. `loadedModel` is
 /// optional because the engine starts up with no model resident — the
-/// healthz handler reports `"model": null` until the first
-/// `loadModel`/inferlet activation. Modeling that as `String?` keeps
+/// healthz handler reports `"model": null` until the engine boots with a
+/// model registered. Modeling that as `String?` keeps
 /// the GUI from string-matching `"none"`/`""` sentinels.
 public struct EngineHealth: Codable, Equatable, Sendable {
   public enum Status: String, Codable, Sendable {
@@ -86,17 +86,27 @@ public struct ModelInfo: Codable, Equatable, Sendable, Identifiable {
   /// authoritatively quote. The chat UI sorts by `id` for now;
   /// `created` returns when pie surfaces a registration timestamp.
   public let created: Date?
+  /// The effective per-request `max_tokens` ceiling the launched engine
+  /// will accept for this model (#474): chat-apc reports the runtime's
+  /// `max-output-tokens` — the memory-aware scheduler `default_token_limit`
+  /// (#438) capped by raw KV capacity. The App clamps its profile
+  /// `max_tokens` down to this before sending so a memory-squeezed launch
+  /// never trips the engine's clean 400. Optional so a pre-#474 engine
+  /// (no field) decodes to `nil` = "ceiling unknown, do not clamp".
+  public let maxOutputTokens: Int?
 
-  public init(id: String, ownedBy: String, created: Date? = nil) {
+  public init(id: String, ownedBy: String, created: Date? = nil, maxOutputTokens: Int? = nil) {
     self.id = id
     self.ownedBy = ownedBy
     self.created = created
+    self.maxOutputTokens = maxOutputTokens
   }
 
   private enum CodingKeys: String, CodingKey {
     case id
     case ownedBy = "owned_by"
     case created
+    case maxOutputTokens = "max_output_tokens"
   }
 }
 
@@ -163,17 +173,34 @@ public struct ChatSpeculation: Codable, Equatable, Sendable {
   public let enabled: Bool
   public let leaderLen: Int?
   public let draftLen: Int?
+  /// Stable chat/request-thread id used by chat-apc to keep Cacheback
+  /// n-gram state local to one conversation.
+  public let threadID: String?
+  /// Selected profile id. Included in the inferlet sidecar key so a
+  /// profile switch forks the learned n-gram table even when the model id
+  /// is unchanged.
+  public let profileID: String?
 
-  public init(enabled: Bool, leaderLen: Int? = nil, draftLen: Int? = nil) {
+  public init(
+    enabled: Bool,
+    leaderLen: Int? = nil,
+    draftLen: Int? = nil,
+    threadID: String? = nil,
+    profileID: String? = nil
+  ) {
     self.enabled = enabled
     self.leaderLen = leaderLen
     self.draftLen = draftLen
+    self.threadID = threadID
+    self.profileID = profileID
   }
 
   private enum CodingKeys: String, CodingKey {
     case enabled
     case leaderLen = "leader_len"
     case draftLen = "draft_len"
+    case threadID = "thread_id"
+    case profileID = "profile_id"
   }
 
   public func encode(to encoder: Encoder) throws {
@@ -181,6 +208,8 @@ public struct ChatSpeculation: Codable, Equatable, Sendable {
     try c.encode(enabled, forKey: .enabled)
     try c.encodeIfPresent(leaderLen, forKey: .leaderLen)
     try c.encodeIfPresent(draftLen, forKey: .draftLen)
+    try c.encodeIfPresent(threadID, forKey: .threadID)
+    try c.encodeIfPresent(profileID, forKey: .profileID)
   }
 
   public init(from decoder: Decoder) throws {
@@ -188,7 +217,96 @@ public struct ChatSpeculation: Codable, Equatable, Sendable {
     self.enabled = try c.decode(Bool.self, forKey: .enabled)
     self.leaderLen = try c.decodeIfPresent(Int.self, forKey: .leaderLen)
     self.draftLen = try c.decodeIfPresent(Int.self, forKey: .draftLen)
+    self.threadID = try c.decodeIfPresent(String.self, forKey: .threadID)
+    self.profileID = try c.decodeIfPresent(String.self, forKey: .profileID)
   }
+}
+
+/// #522 cross-request KV prefix-cache directive. Rides as a nested
+/// `"cache": {…}` object matching the inferlet's `CacheDirective` schema.
+/// Carries the local thread key (the chat id), the expected turn boundary,
+/// a compatibility/version marker the App bumps to force misses on schema
+/// or template drift, and the reuse policy. The inferlet content-addresses
+/// snapshots, so this directive scopes/attributes them per chat and gates
+/// reuse — it does not, by itself, make any unsafe reuse possible.
+public struct ChatCacheDirective: Codable, Equatable, Sendable {
+  /// Schema/template compatibility marker. Bump to invalidate every
+  /// snapshot the App previously caused to be saved.
+  public static let compatVersion = "1"
+
+  public let key: String
+  public let turn: Int
+  public let compat: String
+  public let policy: String
+  /// Optional #524 retention budget. Values must come from #517's
+  /// authoritative pie `model_status` counters; nil means "do not ask the
+  /// inferlet to evict on this request" rather than estimating.
+  public let retention: ChatCacheRetentionDirective?
+
+  public init(key: String,
+              turn: Int,
+              compat: String = ChatCacheDirective.compatVersion,
+              policy: String = "auto",
+              retention: ChatCacheRetentionDirective? = nil) {
+    self.key = key
+    self.turn = turn
+    self.compat = compat
+    self.policy = policy
+    self.retention = retention
+  }
+}
+
+/// #524 APC retention budget passed through the chat-apc `cache.retention`
+/// object. The App only constructs this from runtime/inferlet-backed
+/// `KVUsageSnapshot` data; the inferlet treats absent/invalid accounting as
+/// a safe no-eviction diagnostic.
+public struct ChatCacheRetentionDirective: Codable, Equatable, Sendable {
+  public let kvPagesUsed: Int
+  public let kvPagesTotal: Int
+  public let softPercent: Int
+  public let evictPercent: Int
+  public let hardPercent: Int
+
+  public init(kvPagesUsed: Int,
+              kvPagesTotal: Int,
+              softPercent: Int = 70,
+              evictPercent: Int = 80,
+              hardPercent: Int = 95) {
+    self.kvPagesUsed = kvPagesUsed
+    self.kvPagesTotal = kvPagesTotal
+    self.softPercent = softPercent
+    self.evictPercent = evictPercent
+    self.hardPercent = hardPercent
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case kvPagesUsed = "kv_pages_used"
+    case kvPagesTotal = "kv_pages_total"
+    case softPercent = "soft_percent"
+    case evictPercent = "evict_percent"
+    case hardPercent = "hard_percent"
+  }
+}
+
+/// Wire shape of the OpenAI `response_format` field (#572). Rides as a
+/// nested `"response_format": {"type": "json_object"}` object, matching
+/// chat-apc's `ResponseFormat` schema. The request omits the whole object
+/// when there is no constraint (byte-identical normal decode);
+/// `ChatSendController.makeRequest` attaches it only for a profile whose
+/// `[constraint]` requests JSON. v1 only encodes `json_object`.
+public struct ChatResponseFormat: Codable, Equatable, Sendable {
+  public let kind: String
+
+  public init(kind: String = "json_object") {
+    self.kind = kind
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case kind = "type"
+  }
+
+  /// The single supported constrained mode.
+  public static let jsonObject = ChatResponseFormat(kind: "json_object")
 }
 
 /// Body of POST /v1/chat/completions. `stream` is required on the wire
@@ -213,17 +331,27 @@ public struct ChatRequest: Codable, Equatable, Sendable {
   /// Optional chat-apc speculation extension. `nil` → no `speculation`
   /// key on the wire (normal decode). Nested-encoded (not flattened).
   public let speculation: ChatSpeculation?
+  /// #522 prefix-cache directive. `nil` → no `cache` key on the wire
+  /// (reuse disabled, byte-identical to pre-#522). Nested-encoded.
+  public let cache: ChatCacheDirective?
+  /// Optional OpenAI `response_format` (#572). `nil` → no key on the wire
+  /// (unconstrained). `.jsonObject` → JSON-grammar-constrained decoding.
+  public let responseFormat: ChatResponseFormat?
 
   public init(model: String,
               messages: [ChatMessage],
               sampling: ChatSampling = ChatSampling(),
               stream: Bool = true,
-              speculation: ChatSpeculation? = nil) {
+              speculation: ChatSpeculation? = nil,
+              cache: ChatCacheDirective? = nil,
+              responseFormat: ChatResponseFormat? = nil) {
     self.model = model
     self.messages = messages
     self.sampling = sampling
     self.stream = stream
     self.speculation = speculation
+    self.cache = cache
+    self.responseFormat = responseFormat
   }
 
   /// Flat wire keys for sampling. No `sampling` envelope — OpenAI's
@@ -239,6 +367,8 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     case topP = "top_p"
     case maxTokens = "max_tokens"
     case speculation
+    case cache
+    case responseFormat = "response_format"
   }
 
   public func encode(to encoder: Encoder) throws {
@@ -250,6 +380,8 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     try c.encode(sampling.topP, forKey: .topP)
     try c.encode(sampling.maxTokens, forKey: .maxTokens)
     try c.encodeIfPresent(speculation, forKey: .speculation)
+    try c.encodeIfPresent(cache, forKey: .cache)
+    try c.encodeIfPresent(responseFormat, forKey: .responseFormat)
   }
 
   public init(from decoder: Decoder) throws {
@@ -263,6 +395,8 @@ public struct ChatRequest: Codable, Equatable, Sendable {
       maxTokens: try c.decode(Int.self, forKey: .maxTokens)
     )
     self.speculation = try c.decodeIfPresent(ChatSpeculation.self, forKey: .speculation)
+    self.cache = try c.decodeIfPresent(ChatCacheDirective.self, forKey: .cache)
+    self.responseFormat = try c.decodeIfPresent(ChatResponseFormat.self, forKey: .responseFormat)
   }
 }
 
@@ -396,22 +530,13 @@ internal enum JSONValue: Codable, Equatable, Sendable {
 
 // MARK: - Events
 
-/// One frame of /v1/models/load (or the SSE meta-frame prefix on a chat
-/// stream). `loading` carries the byte counters the design doc pins on
-/// the meta-frame schema; `etaSeconds` is optional because the engine
-/// only reports it once it has a transfer-rate sample. Closed enum so a
-/// `switch` in the loading-indicator view is exhaustive.
-public enum LoadEvent: Equatable, Sendable {
-  case loading(loadedBytes: UInt64, totalBytes: UInt64, etaSeconds: Double?)
-  case ready
-}
-
 /// One SSE frame from POST /v1/chat/completions. Maps 1:1 to the wire
 /// schema:
 /// - `.modelLoading` / `.modelReady` are the meta-frame prefix (design
-///   doc §SSE meta-frame schema). The GUI feeds them straight into
-///   `ModelLoadCenter` — same observable a bare `loadModel` call drives,
-///   so the loading indicator's source-of-truth doesn't bifurcate.
+///   doc §SSE meta-frame schema). v1 pie binds its model at boot, so
+///   `.modelLoading` never arrives in practice; `.modelReady` confirms the
+///   engine is serving the model for this turn and is fed to
+///   `ModelLoadCenter.reconcileEngineResident` (#469).
 /// - `.delta` is OpenAI's `choices[0].delta`. `role` only appears on
 ///   the first delta of a turn; subsequent deltas carry content alone.
 /// - `.reasoningDelta` is OpenAI's `choices[0].delta.reasoning_content`
@@ -423,6 +548,64 @@ public enum LoadEvent: Equatable, Sendable {
 ///   sees `finish_reason != nil`. Streams end with exactly one
 ///   `.finish` followed by completion.
 ///
+/// Speculative-decode metrics carried by the terminal `spec_metrics` SSE
+/// frame (chat-apc #418, schema `SpecMetricsReport`). Emitted only when the
+/// request opted into the speculation surface, so a normal chat stream
+/// never carries one. `enabled` is `false` (with a `fallbackReason`) when
+/// drafting was requested but didn't engage (e.g. `non_greedy_sampling`).
+///
+/// The frame arrives AFTER the terminal `.finish` chunk and before
+/// `[DONE]`, so a consumer keyed on `.finish` still sees it before the
+/// stream completes.
+public struct SpecMetrics: Equatable, Sendable {
+  public let enabled: Bool
+  public let fallbackReason: String?
+  public let generatedTokens: Int
+  public let decodeSteps: Int
+  public let proposedDraftTokens: Int
+  public let acceptedDraftTokens: Int
+  public let rejectedDraftTokens: Int
+  public let avgTokensPerStep: Double
+  public let decodeTokensPerSec: Double
+  public let leaderLen: Int
+  public let draftLen: Int
+
+  public init(
+    enabled: Bool,
+    fallbackReason: String? = nil,
+    generatedTokens: Int,
+    decodeSteps: Int,
+    proposedDraftTokens: Int,
+    acceptedDraftTokens: Int,
+    rejectedDraftTokens: Int,
+    avgTokensPerStep: Double,
+    decodeTokensPerSec: Double,
+    leaderLen: Int,
+    draftLen: Int
+  ) {
+    self.enabled = enabled
+    self.fallbackReason = fallbackReason
+    self.generatedTokens = generatedTokens
+    self.decodeSteps = decodeSteps
+    self.proposedDraftTokens = proposedDraftTokens
+    self.acceptedDraftTokens = acceptedDraftTokens
+    self.rejectedDraftTokens = rejectedDraftTokens
+    self.avgTokensPerStep = avgTokensPerStep
+    self.decodeTokensPerSec = decodeTokensPerSec
+    self.leaderLen = leaderLen
+    self.draftLen = draftLen
+  }
+
+  /// Fraction of proposed draft tokens the verifier accepted (`0…1`), or
+  /// `nil` when nothing was proposed — drafting requested but inactive, so
+  /// there's no ratio to report (avoids a `0/0` that reads as "0% accept").
+  public var acceptRatio: Double? {
+    proposedDraftTokens > 0
+      ? Double(acceptedDraftTokens) / Double(proposedDraftTokens)
+      : nil
+  }
+}
+
 /// `FinishReason` is closed for v1; unknown reasons coming over the
 /// wire decode into `.other(String)` so a future engine extension
 /// doesn't crash the GUI.
@@ -431,6 +614,9 @@ public enum ChatEvent: Equatable, Sendable {
   case modelReady
   case delta(role: ChatMessage.Role?, content: String)
   case reasoningDelta(String)
+  case generationMetrics(GenerationMetrics)
+  /// Terminal speculative-decode metrics. See `SpecMetrics`.
+  case specMetrics(SpecMetrics)
   case finish(reason: FinishReason)
 
   public enum FinishReason: Equatable, Sendable {
@@ -438,6 +624,24 @@ public enum ChatEvent: Equatable, Sendable {
     case length
     case cancelled
     case other(String)
+  }
+}
+
+public struct GenerationMetrics: Codable, Equatable, Sendable {
+  public let outputTokens: Int
+  public let elapsedSeconds: Double
+  public let tokensPerSecond: Double
+
+  public init(outputTokens: Int, elapsedSeconds: Double, tokensPerSecond: Double) {
+    self.outputTokens = outputTokens
+    self.elapsedSeconds = elapsedSeconds
+    self.tokensPerSecond = tokensPerSecond
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case outputTokens = "output_tokens"
+    case elapsedSeconds = "elapsed_s"
+    case tokensPerSecond = "tokens_per_sec"
   }
 }
 
@@ -462,7 +666,6 @@ public enum ChatEvent: Equatable, Sendable {
 public protocol EngineClient: Sendable {
   func health() async throws -> EngineHealth
   func models() async throws -> [ModelInfo]
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error>
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error>
   func dispatchInferlet(_ req: InferletRequest) -> AsyncThrowingStream<Data, Error>
 }

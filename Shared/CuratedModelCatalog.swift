@@ -1,5 +1,26 @@
 import Foundation
 
+/// Operator posture for a curated model. The value is UI-facing metadata:
+/// it does not change the downloader mechanics, but it makes clear which
+/// model is the seeded/recommended starter vs heavyweight models that
+/// should be downloaded and real-E2E'd only by an explicit local action.
+public enum CuratedModelInstallIntent: String, Equatable, Sendable {
+  case defaultRecommended
+  case curated
+  case manualOnly
+
+  public var badgeText: String? {
+    switch self {
+    case .defaultRecommended:
+      return "Recommended"
+    case .curated:
+      return nil
+    case .manualOnly:
+      return "Manual"
+    }
+  }
+}
+
 /// Hand-curated catalog of GGUF models surfaced in *Settings → Models →
 /// Add Model → Curated* so first-run users have a one-click path
 /// instead of needing to know HF repo coordinates. Each entry maps
@@ -9,6 +30,12 @@ import Foundation
 /// per family the engine has been smoke-tested with. Entries are
 /// data-only — adding/removing models is a pure source change and
 /// requires no migration since the catalog is not persisted.
+///
+/// Source convention: any future file that contributes entries to
+/// `CuratedModelCatalog.all` must live under
+/// `Shared/Curated*Catalog*.swift` so the PR-time live-HF audit in
+/// `.github/workflows/curated-catalog-audit.yml` still runs when a PR
+/// changes only that split source.
 public struct CuratedModel: Equatable, Identifiable, Sendable {
   /// Stable identifier for SwiftUI list diffing. Mirrors the `model`
   /// field a Profile would carry once installed, so the same string
@@ -22,6 +49,16 @@ public struct CuratedModel: Equatable, Identifiable, Sendable {
   public let huggingFaceRepo: String
   public let huggingFaceFile: String
   public let summary: String
+  /// Recommended total system RAM for a comfortable launch, when the
+  /// model is large enough that the artifact size alone understates the
+  /// operator impact. `nil` for starter/small rows where the catalog size
+  /// is sufficient guidance.
+  public let recommendedSystemMemoryBytes: Int64?
+  /// Notes about Pie support constraints: e.g. single-file GGUF, known
+  /// architecture family, or manual/local E2E posture. Empty only for
+  /// legacy small curated rows where no extra constraint is needed.
+  public let pieSupportNotes: String
+  public let installIntent: CuratedModelInstallIntent
 
   public init(id: String,
               displayName: String,
@@ -31,7 +68,10 @@ public struct CuratedModel: Equatable, Identifiable, Sendable {
               approximateSizeBytes: Int64,
               huggingFaceRepo: String,
               huggingFaceFile: String,
-              summary: String) {
+              summary: String,
+              recommendedSystemMemoryBytes: Int64? = nil,
+              pieSupportNotes: String = "",
+              installIntent: CuratedModelInstallIntent = .curated) {
     self.id = id
     self.displayName = displayName
     self.publisher = publisher
@@ -41,6 +81,9 @@ public struct CuratedModel: Equatable, Identifiable, Sendable {
     self.huggingFaceRepo = huggingFaceRepo
     self.huggingFaceFile = huggingFaceFile
     self.summary = summary
+    self.recommendedSystemMemoryBytes = recommendedSystemMemoryBytes
+    self.pieSupportNotes = pieSupportNotes
+    self.installIntent = installIntent
   }
 }
 
@@ -127,6 +170,15 @@ public enum CuratedModelCatalog {
     all.first { $0.id == id }
   }
 
+  /// True when `slug` is one of the engine-validated, curated GGUF
+  /// artifacts RatioThink offers through Add Model. HF-cache discovery can
+  /// surface arbitrary local repos; callers use this predicate to distinguish
+  /// "known supported" cache hits from "discovered but unverified" ones
+  /// without blocking the latter.
+  public static func isCuratedModelSlug(_ slug: String) -> Bool {
+    all.contains { "\($0.huggingFaceRepo)/\($0.huggingFaceFile)" == slug }
+  }
+
   /// Id of the recommended starter model surfaced with a "Recommended"
   /// badge in *Settings → Models → Add Model → Curated*. :
   /// small, modern, engine-detectable. Its `<huggingFaceRepo>/<huggingFaceFile>`
@@ -137,6 +189,11 @@ public enum CuratedModelCatalog {
   /// default resolves to. `CuratedModelCatalogTests` pins that
   /// resolution invariant.
   public static let recommendedModelID = "qwen3-0.6b-q8_0"
+
+  /// Representative heavyweight entry for the explicit/manual real-engine
+  /// E2E wrapper. This must stay a curated, live-HF-verified, single-file
+  /// GGUF model but must NOT become the seeded default or PR-CI path.
+  public static let largeE2ERepresentativeModelID = "qwen3-14b-q4_k_m"
 
   private static let baseEntries: [CuratedModel] = [
     //  starter tier — small, modern, engine-detectable GGUF
@@ -162,7 +219,8 @@ public enum CuratedModelCatalog {
       approximateSizeBytes: 639_446_688,
       huggingFaceRepo: "Qwen/Qwen3-0.6B-GGUF",
       huggingFaceFile: "Qwen3-0.6B-Q8_0.gguf",
-      summary: "Recommended starter — same model RatioThink seeds as the default chat profile."
+      summary: "Recommended starter — same model Rational seeds as the default chat profile.",
+      installIntent: .defaultRecommended
     ),
     CuratedModel(
       id: "llama-3.2-1b-instruct-q4_k_m",
@@ -197,17 +255,12 @@ public enum CuratedModelCatalog {
       huggingFaceFile: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
       summary: "Solid daily-driver chat at low VRAM."
     ),
-    CuratedModel(
-      id: "phi-3.5-mini-instruct-q4_k_m",
-      displayName: "Phi-3.5 Mini Instruct",
-      publisher: "Microsoft",
-      parameterCountBillions: 3.8,
-      quantization: "Q4_K_M",
-      approximateSizeBytes: 2_390_000_000,
-      huggingFaceRepo: "bartowski/Phi-3.5-mini-instruct-GGUF",
-      huggingFaceFile: "Phi-3.5-mini-instruct-Q4_K_M.gguf",
-      summary: "Reasoning-leaning Phi family build."
-    ),
+    // NB: no Phi here. Phi-3/Phi-3.5 GGUFs fuse Q/K/V into one `qkv_proj`
+    // tensor and Phi-2 declares arch `phi2`; the pie portable Metal loader
+    // supports neither (it expects separate q/k/v in a Llama/Qwen layout), so
+    // every Phi variant aborts at model load. Removed from the curated set
+    // rather than shipped as a launch-failing entry. Engine-side fused-QKV
+    // support is tracked upstream in pie-project/pie #402.
     // Qwen2.5 7B Q4_K_M comes from bartowski's repo, NOT the official
     // `Qwen/Qwen2.5-7B-Instruct-GGUF` — Qwen publishes this quant ONLY as
     // split shards (`…-q4_k_m-00001-of-00002.gguf` + `-00002-…`), which
@@ -235,6 +288,99 @@ public enum CuratedModelCatalog {
       huggingFaceRepo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
       huggingFaceFile: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
       summary: "Llama 3.1 mid-size; long-form quality bump over 3B."
+    ),
+    // Large/manual tier. Coordinates and exact blob sizes were
+    // verified against the live Hugging Face tree API on 2026-06-07.
+    // Keep them single-file GGUFs so ModelDownloader and pie's one-file
+    // loader can consume them; do not move these into default seeding or
+    // PR CI because each download is ~9 GB and real inference is operator-
+    // gated. The manual real-engine wrapper documents/proves the path:
+    //   make test-e2e-large-model
+    CuratedModel(
+      id: "qwen2.5-coder-14b-instruct-q4_k_m",
+      displayName: "Qwen2.5 Coder 14B Instruct",
+      publisher: "Alibaba",
+      parameterCountBillions: 14.7,
+      quantization: "Q4_K_M",
+      approximateSizeBytes: 8_988_111_072,
+      huggingFaceRepo: "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF",
+      huggingFaceFile: "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+      summary: "Large coding-focused Qwen for explicit local use on roomy Macs.",
+      recommendedSystemMemoryBytes: 32 * 1024 * 1024 * 1024,
+      pieSupportNotes: "Single-file Qwen2 GGUF; manual/local real-engine E2E only, not PR CI.",
+      installIntent: .manualOnly
+    ),
+    CuratedModel(
+      id: "qwen3-14b-q4_k_m",
+      displayName: "Qwen3 14B",
+      publisher: "Alibaba",
+      parameterCountBillions: 14.0,
+      quantization: "Q4_K_M",
+      approximateSizeBytes: 9_001_752_960,
+      huggingFaceRepo: "Qwen/Qwen3-14B-GGUF",
+      huggingFaceFile: "Qwen3-14B-Q4_K_M.gguf",
+      summary: "Large Qwen thinking model for explicit local quality checks.",
+      recommendedSystemMemoryBytes: 32 * 1024 * 1024 * 1024,
+      pieSupportNotes: "Single-file Qwen3 GGUF; thinking-model behavior may use reasoning_content; manual/local real-engine E2E only.",
+      installIntent: .manualOnly
+    ),
+    // Qwen3.6 family — the hybrid gated-delta-rule + GQA arch the portable
+    // Metal engine runs as PieArch::Qwen3_5. Both builds declare a
+    // general.architecture (qwen35 / qwen35moe) that the engine maps to
+    // Qwen3_5, and both were real-loaded through the portable driver
+    // (boot + a chat completion) before pinning. unsloth ships verified
+    // MONOLITHIC single-file quants; only each repo's BF16 build is split
+    // into shards pie cannot assemble. Manual/local posture (~16-21 GiB).
+    CuratedModel(
+      id: "qwen3.6-27b-q4_k_m",
+      displayName: "Qwen3.6 27B",
+      publisher: "Alibaba",
+      parameterCountBillions: 27.0,
+      quantization: "Q4_K_M",
+      approximateSizeBytes: 16_817_244_384,
+      huggingFaceRepo: "unsloth/Qwen3.6-27B-GGUF",
+      huggingFaceFile: "Qwen3.6-27B-Q4_K_M.gguf",
+      summary: "Hybrid-attention Qwen3.6 dense for top-quality chat on roomy Macs.",
+      recommendedSystemMemoryBytes: 32 * 1024 * 1024 * 1024,
+      pieSupportNotes: "Single-file Qwen3.6 GGUF (general.architecture=qwen35 → PieArch::Qwen3_5); manual/local real-engine E2E only.",
+      installIntent: .manualOnly
+    ),
+    CuratedModel(
+      id: "qwen3.6-35b-a3b-ud-q4_k_m",
+      displayName: "Qwen3.6 35B-A3B (MoE)",
+      publisher: "Alibaba",
+      parameterCountBillions: 35.0,
+      quantization: "UD-Q4_K_M",
+      approximateSizeBytes: 22_134_528_992,
+      huggingFaceRepo: "unsloth/Qwen3.6-35B-A3B-GGUF",
+      huggingFaceFile: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+      summary: "Largest curated model. Sparse MoE (~3B active) — snappy, high-quality chat on 48 GB+ Macs.",
+      recommendedSystemMemoryBytes: 48 * 1024 * 1024 * 1024,
+      pieSupportNotes: "Single-file Qwen3.6 MoE GGUF (general.architecture=qwen35moe → PieArch::Qwen3_5; routed + shared experts); manual/local real-engine E2E only.",
+      installIntent: .manualOnly
+    ),
+    // Gemma 4 — Google's gemma4 arch, run by the portable Metal engine as
+    // PieArch::Gemma4 (alternating sliding/full attention, per-layer dual
+    // head_dim + kv-head count, proportional RoPE on full layers,
+    // SentencePiece tokenizer). The single-file dense TEXT build was
+    // real-loaded through the portable driver (boot + chat completion:
+    // "The capital of France is" → "Paris"; gold → "Au") before pinning.
+    // The vision/audio projector (mmproj-*.gguf) is a separate file pie
+    // does not load; the dense text GGUF is single-file. Manual/local
+    // posture (~6.6 GiB).
+    CuratedModel(
+      id: "gemma-4-12b-it-q4_k_m",
+      displayName: "Gemma 4 12B",
+      publisher: "Google",
+      parameterCountBillions: 12.0,
+      quantization: "Q4_K_M",
+      approximateSizeBytes: 7_121_860_000,
+      huggingFaceRepo: "unsloth/gemma-4-12b-it-GGUF",
+      huggingFaceFile: "gemma-4-12b-it-Q4_K_M.gguf",
+      summary: "Google's Gemma 4 dense chat model — strong general quality on roomy Macs.",
+      recommendedSystemMemoryBytes: 32 * 1024 * 1024 * 1024,
+      pieSupportNotes: "Single-file Gemma 4 text GGUF (general.architecture=gemma4 → PieArch::Gemma4); manual/local real-engine E2E only.",
+      installIntent: .manualOnly
     ),
   ]
 }

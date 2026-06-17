@@ -86,17 +86,18 @@ final class ProfileTests: XCTestCase {
     }
   }
 
-  func test_throws_missing_field_when_model_omitted() {
-    XCTAssertThrowsError(try Profile.parse(toml: """
+  func test_model_omitted_is_explicit_no_default_state() throws {
+    let profile = try Profile.parse(toml: """
     id = "x"
     name = "X"
     inferlet = "chat-apc"
-    """)) { err in
-      guard case ProfileError.missingField(let f) = err else {
-        return XCTFail("expected .missingField, got \(err)")
-      }
-      XCTAssertEqual(f, "model")
-    }
+    """)
+
+    XCTAssertNil(profile.model,
+                 "missing model is an explicit no-default state, not a parse failure")
+    let dumped = try profile.dump()
+    XCTAssertFalse(dumped.contains("model ="),
+                   "round-trip must preserve no-default by omitting the model key")
   }
 
   func test_throws_parse_failure_on_invalid_toml() {
@@ -235,7 +236,7 @@ final class ProfileTests: XCTestCase {
     XCTAssertTrue(dumped.contains("agent"))
   }
 
-  // MARK: - [speculation] (#426 Fast Think)
+  // MARK: - [speculation] (#426 Repeat Boost)
 
   func test_parses_speculation_section_enabled_only() throws {
     let toml = """
@@ -298,5 +299,66 @@ final class ProfileTests: XCTestCase {
     """)
     p.speculation = nil
     XCTAssertNil(try Profile.parse(toml: try p.dump()).speculation)
+  }
+
+  // MARK: - [constraint] (#572 JSON Think)
+
+  func test_parses_constraint_json_object() throws {
+    let p = try Profile.parse(toml: """
+    id = "json-think"
+    name = "JSON Think"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [constraint]
+    response_format = "json_object"
+    """)
+    XCTAssertEqual(p.responseFormat, .jsonObject)
+  }
+
+  func test_absent_constraint_section_is_nil() throws {
+    let toml = """
+    id = "x"
+    name = "X"
+    model = "m"
+    inferlet = "chat-apc"
+    """
+    XCTAssertNil(try Profile.parse(toml: toml).responseFormat)
+  }
+
+  func test_unknown_response_format_parses_to_nil_not_error() throws {
+    // Forward-compat: an unrecognized value is unconstrained, not a hard
+    // parse failure (mirrors the lenient v2-section posture).
+    let p = try Profile.parse(toml: """
+    id = "x"
+    name = "X"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [constraint]
+    response_format = "json_schema"
+    """)
+    XCTAssertNil(p.responseFormat)
+  }
+
+  func test_dump_round_trips_constraint() throws {
+    let p = Profile(id: "x", name: "X", model: "m", inferlet: "chat-apc",
+                    responseFormat: .jsonObject)
+    let reparsed = try Profile.parse(toml: try p.dump())
+    XCTAssertEqual(reparsed.responseFormat, .jsonObject)
+  }
+
+  func test_dump_drops_constraint_when_cleared_to_nil() throws {
+    var p = try Profile.parse(toml: """
+    id = "x"
+    name = "X"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [constraint]
+    response_format = "json_object"
+    """)
+    p.responseFormat = nil
+    XCTAssertNil(try Profile.parse(toml: try p.dump()).responseFormat)
   }
 }

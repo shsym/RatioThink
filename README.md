@@ -1,34 +1,53 @@
 <div align="center">
 
-<img src="Resources/AppIcon/pie-icon-highres.png" alt="RatioThink" width="120" />
+<img src="Resources/AppIcon/rational-icon-highres.png" alt="Rational" width="120" />
 
-# RatioThink
+# Rational
 
 **Private, local AI chat for macOS — powered by various thinking modes.**
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black)
-![Version](https://img.shields.io/badge/version-v0.1.1-blue)
+![Version](https://img.shields.io/badge/version-v0.1.5-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 
 </div>
 
-RatioThink is a native macOS app that runs open-weight language models entirely on your Mac.
+Rational is a native macOS app that runs open-weight language models entirely on your Mac.
 Powered by a bundled [Pie](https://github.com/pie-project/pie) inference engine, it supercharges
 local models using specialized _thinking profiles_.
 
 ## Early release
 
-v0.1.1 is an early release, focusing on core functionality and bug fixes.
+This an early release, focusing on core functionality and bug fixes.
 Since many components are still a work in progress, your feedback is incredibly valuable.
 Feel free to report any issues you find!
 
+## Why Rational
+
+**Local models, with thinking modes.** Ollama and LM Studio hand you a model and
+a prompt box. Rational adds **thinking modes**, named _profiles_, you switch in
+one click, each a saved preset bundling a model, sampling, a system prompt, and a
+chat workflow.
+
+- **Repeat Boost — speculative decoding.** Runs the same
+  model greedily with a speculative drafter: the output is identical, but a
+  *repetitive* answer — code, JSON, structured edits — lands with less waiting.
+  It currently implements the
+  [Cacheback algorithm](https://www.yecl.org/publications/ma2025emnlp.pdf).
+- **Tree of Thought — a search tree, in one click.** The Tree of Thought profile
+  turns one question into a scored search: the engine branches, scores each branch
+  1–10, and keeps the best beam — shown live in a foldable tree, then the chosen
+  answer.
+
+▶ **[See the animated walkthrough](https://shsym.github.io/RatioThink/landing)**
+
 ## Install
 
-1. Download `RatioThink-arm64.dmg` (Apple Silicon) from
+1. Download `Rational-arm64.dmg` (Apple Silicon) from
    [Releases](https://github.com/shsym/RatioThink/releases) and open it.
-2. In the window that opens, drag **RatioThink.app** onto the **Applications** shortcut.
-3. Open **RatioThink** from Applications and follow the first-launch wizard to download a
+2. In the window that opens, drag **Rational.app** onto the **Applications** shortcut.
+3. Open **Rational** from Applications and follow the first-launch wizard to download a
    starter model.
 
 ## Build from source
@@ -39,7 +58,7 @@ Feel free to report any issues you find!
 ```bash
 git clone --recurse-submodules https://github.com/shsym/RatioThink.git
 cd RatioThink
-make build          # generates RatioThink.xcodeproj, then builds RatioThink.app + helper
+make build          # generates RatioThink.xcodeproj, then builds Rational.app + helper
 ```
 
 The repo uses git submodules (the Pie engine, plus `ds_store` + `mac_alias` under
@@ -70,7 +89,7 @@ requires the notarized release flow below.
 > use only, clear the quarantine flag — notarized release downloads never need
 > this:
 > ```bash
-> xattr -dr com.apple.quarantine /Applications/RatioThink.app
+> xattr -dr com.apple.quarantine /Applications/Rational.app
 > ```
 
 ## Troubleshooting / Collect diagnostics
@@ -83,12 +102,12 @@ If the app misbehaves, you can collect a diagnostics bundle to send to the devel
 **From Terminal** (works even when the app or helper won't launch):
 
 ```bash
-/Applications/RatioThink.app/Contents/Resources/collect-diagnostics.sh
+/Applications/Rational.app/Contents/Resources/collect-diagnostics.sh
 ```
 
 This prints a short verdict (e.g. *quarantine present*, *helper never
 launched*, *Gatekeeper rejected*, *engine failed*) and writes
-`~/Desktop/RatioThink-diagnostics-<timestamp>.zip`. Attach that `.zip` to your
+`~/Desktop/Rational-diagnostics-<timestamp>.zip`. Attach that `.zip` to your
 report.
 
 The bundle contains app/helper versions, codesign + Gatekeeper + quarantine
@@ -102,30 +121,18 @@ metadata only. Flags: `--window <dur>` (Unified Logging look-back, default
 
 ## Known issues
 
-A few known issues in the v0.1.1 release, with workarounds:
+A few known issues in the v0.1.5 release, with workarounds:
 
-- **The "Qwen2.5 7B Instruct" model in the list won't load.** Hugging Face publishes that
-  quant as split files the bundled engine can't assemble yet, so downloading it leaves a
-  model that fails to load. Pick a different model for now —
-  [a fix is in progress](https://github.com/shsym/RatioThink/pull/41).
-- **Cancelling a model download can be unstable.** While a model is downloading the
-  progress can lag, and cancelling may not stop it as cleanly as expected — a partial
-  download can be left behind. If one remains, remove it from the Models list;
-  [a fix is in progress](https://github.com/shsym/RatioThink/pull/43).
-- **The "Starting the engine…" prompt can rarely get stuck.** In an uncommon sequence — a
-  model load waiting on the engine, then a model-list refresh failing — the prompt can stay
-  on "Starting the engine…". Click **Cancel** and try again.
-- **A failed engine start can show a misleading reason.** If the engine crashes the instant
-  it launches, the failure can be reported as a timeout rather than a clear "couldn't start"
-  — the engine-error indicator still appears either way.
-  [Fixed in a later build](https://github.com/shsym/RatioThink/pull/36).
+- **Some first-install chat polish is still pending.** If the initial prompt or composer layout
+  looks odd, resize the window or start a new chat; the follow-up polish is tracked in
+  [PR #59](https://github.com/shsym/RatioThink/pull/59).
 
 ## Repo layout
 
 ```
 RatioThink/
-├── App/            # Main SwiftUI app target (RatioThink.app)
-├── Helper/         # SMAppService menu-bar helper (RatioThinkHelper.app)
+├── App/            # Main SwiftUI app target (Rational.app)
+├── Helper/         # SMAppService menu-bar helper (RationalHelper.app)
 ├── Shared/         # Cross-target Swift library (RatioThinkCore: engine client, XPC, models, persistence)
 ├── Inferlets/      # chat-apc inferlet (Rust → wasm) + prebuilt artifact
 ├── Resources/      # App icon + asset catalog
@@ -137,6 +144,9 @@ RatioThink/
 
 ## Documentation
 
+- [`docs/landing.html`](docs/landing.html) — an animated walkthrough of Rational's
+  thinking modes (profiles, the live Tree of Thought search, and Repeat Boost
+  speculative decoding). Open it in a browser.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the app, helper, pie engine, and
   `chat-apc` inferlet fit together (plus an interactive [`architecture.html`](docs/architecture.html)).
 - [`TEST.md`](TEST.md) — test catalog and pre-PR gate: what to run for each change type.

@@ -28,6 +28,30 @@ final class ProfileModelOptionsTests: XCTestCase {
                    source: .huggingFaceCache)
   }
 
+  func test_hf_cache_curated_rows_do_not_get_advisory_warning() {
+    let slug = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    let options = ProfileModelOptions.build(models: [hfModel(slug, sizeBytes: 100)],
+                                            current: "",
+                                            limitBytes: nil)
+
+    XCTAssertEqual(options.first?.isCuratedEngineSupported, true)
+    XCTAssertNil(options.first?.supportWarning,
+                 "curated engine-validated cache hits should not be labeled unverified")
+  }
+
+  func test_non_curated_hf_cache_rows_get_advisory_warning_but_stay_launchable() {
+    let slug = "somebody/Experimental-GGUF/experimental-q4_k_m.gguf"
+    let options = ProfileModelOptions.build(models: [hfModel(slug, sizeBytes: 100)],
+                                            current: "",
+                                            limitBytes: nil)
+
+    let option = options.first
+    XCTAssertEqual(option?.isCuratedEngineSupported, false)
+    XCTAssertEqual(option?.supportWarning, "Unverified — may not be supported")
+    XCTAssertNil(option?.unsupportedReason,
+                 "advisory support warnings must not reuse unsupportedReason, because that disables selection")
+  }
+
   func test_current_model_is_included_even_when_not_installed() {
     let options = ProfileModelOptions.build(models: [appModel("b.gguf")],
                                             current: "a.gguf",
@@ -60,6 +84,84 @@ final class ProfileModelOptionsTests: XCTestCase {
     XCTAssertEqual(dup?.source, .appManaged)
     XCTAssertEqual(dup?.sizeBytes, 100)
     XCTAssertEqual(dup?.isOverLimit, false, "app entry (100 B) wins, so not over the 1 GiB limit")
+  }
+
+  // Dedup is by IDENTITY = the full resolvable slug (review v2 F2). An
+  // app-managed download and an HF-cache copy of the SAME `<repo>/<file>`
+  // slug → one row, app-managed wins.
+  func test_dedup_collapses_app_and_hf_copies_of_the_same_slug() {
+    let slug = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    let options = ProfileModelOptions.build(
+      models: [appModel(slug, sizeBytes: 100), hfModel(slug, sizeBytes: 999)],
+      current: "",
+      limitBytes: nil)
+    XCTAssertEqual(options.count, 1, "the two copies share one resolvable slug")
+    XCTAssertEqual(options.first?.source, .appManaged, "app-managed copy wins")
+    XCTAssertEqual(options.first?.sizeBytes, 100)
+  }
+
+  // F2 regression: an app-bare copy and a repo-qualified copy that share a
+  // leaf are distinct files — both stay visible (main's full-filename dedup).
+  func test_dedup_keeps_bare_and_repo_qualified_same_leaf_distinct() {
+    let options = ProfileModelOptions.build(
+      models: [appModel("Qwen3-0.6B-Q8_0.gguf", sizeBytes: 100),
+               hfModel("Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf", sizeBytes: 999)],
+      current: "",
+      limitBytes: nil)
+    XCTAssertEqual(options.count, 2, "bare vs repo-qualified are distinct files")
+  }
+
+  // Distinct quants are distinct loadable models — never collapsed.
+  func test_dedup_keeps_distinct_quants_separate() {
+    let options = ProfileModelOptions.build(
+      models: [appModel("Llama-3.2-1B-Instruct-Q4_K_M.gguf"),
+               appModel("Llama-3.2-1B-Instruct-Q8_0.gguf")],
+      current: "",
+      limitBytes: nil)
+    XCTAssertEqual(options.count, 2)
+  }
+
+  // F3: when the profile's current slug shares its identity with a discovered
+  // row (an app-managed download + HF-cache copy of the same slug, current ==
+  // that slug), the surviving app row is marked current — NOT a synthesized
+  // duplicate falsely flagged "Not downloaded".
+  func test_current_matching_a_discovered_identity_marks_the_survivor_not_a_duplicate() {
+    let slug = "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+    let options = ProfileModelOptions.build(
+      models: [appModel(slug, sizeBytes: 100), hfModel(slug, sizeBytes: 999)],
+      current: slug,
+      limitBytes: nil)
+    XCTAssertEqual(options.count, 1, "no synthesized duplicate for an already-discovered identity")
+    XCTAssertEqual(options.first?.source, .appManaged, "app-managed survivor wins")
+    XCTAssertEqual(options.first?.isCurrent, true, "the survivor carries the checkmark")
+    XCTAssertNil(options.first?.unsupportedReason, "an installed current model is never 'Not downloaded'")
+  }
+
+  // #590: after the full-slug dedup a family can list an app-managed copy AND
+  // an HF-cache copy of the same quant (distinct slugs, same visible tag). The
+  // picker marks the HF-cache row so the two differ in the menu, mirroring the
+  // chat dropdown (ToolbarModelOptions.Option.sourceTag) for app-vs-cache parity.
+  func test_source_tag_marks_hf_cache_rows_only() {
+    let options = ProfileModelOptions.build(
+      models: [appModel("App/Model-Q4_K_M.gguf"),
+               hfModel("HF/Repo-GGUF/Model-Q4_K_M.gguf", sizeBytes: 100)],
+      current: "Synth/NotDiscovered.gguf",
+      limitBytes: nil)
+    XCTAssertNil(options.first { $0.slug == "App/Model-Q4_K_M.gguf" }?.sourceTag,
+                 "app-managed rows are unmarked (the default)")
+    XCTAssertEqual(options.first { $0.slug == "HF/Repo-GGUF/Model-Q4_K_M.gguf" }?.sourceTag,
+                   "hf cache")
+    XCTAssertNil(options.first { $0.slug == "Synth/NotDiscovered.gguf" }?.sourceTag,
+                 "a synthesized current row has no source → no suffix")
+  }
+
+  func test_option_carries_parsed_parts() {
+    let options = ProfileModelOptions.build(
+      models: [appModel("Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf")],
+      current: "",
+      limitBytes: nil)
+    XCTAssertEqual(options.first?.parts.base, "Qwen3 0.6B")
+    XCTAssertEqual(options.first?.parts.quant, "Q8_0")
   }
 
   func test_over_limit_flag_uses_size_and_ceiling() {

@@ -19,24 +19,68 @@ struct ChatMessageItem: Identifiable, Equatable {
   /// separate from `content`. Empty when the turn has no
   /// reasoning.
   var reasoning: String
+  /// Decoded tree-of-thought search for a ToT turn (#413), rendered in a
+  /// collapsible live tree-search section — the structured analogue of
+  /// the "Thinking" section. Nil for ordinary chat turns (and when a
+  /// persisted snapshot fails to decode, treated as no tree).
+  var tot: ToTTree?
+  /// Decoded Best-of-N round selection metadata (#690) when this assistant
+  /// turn is an interactive round — the pickable candidates + the user's
+  /// choice. The candidates render from `tot`; this drives the select / collapse
+  /// / highlight affordance. Nil for ordinary chat and tree-of-thought turns.
+  var bestOfN: BestOfNRound?
   /// Engine `finish_reason` for a completed turn (`"stop"`, `"length"`,
   /// `"cancelled"`, …), or `nil` while the turn is still streaming. Lets
   /// `MessageBubble` surface a truncated-before-answer turn instead of a
   /// silent blank. (#434)
   var finishReason: String?
+  /// Engine-reported generation throughput for a completed assistant turn.
+  /// Nil for historical rows and turns whose metric policy is intentionally
+  /// hidden (cancelled/failed/invalid metrics).
+  var generationPerformance: GenerationMetrics?
 
-  init(id: UUID = UUID(), role: ChatMessage.Role, content: String, reasoning: String = "", finishReason: String? = nil) {
+  init(
+    id: UUID = UUID(),
+    role: ChatMessage.Role,
+    content: String,
+    reasoning: String = "",
+    tot: ToTTree? = nil,
+    bestOfN: BestOfNRound? = nil,
+    finishReason: String? = nil,
+    generationPerformance: GenerationMetrics? = nil
+  ) {
     self.id = id
     self.role = role
     self.content = content
     self.reasoning = reasoning
+    self.tot = tot
+    self.bestOfN = bestOfN
     self.finishReason = finishReason
+    self.generationPerformance = generationPerformance
   }
 
   /// Honest terminal state for the turn — drives the truncation notice so
   /// a reply that ran out of budget while thinking never renders blank.
   var notice: TurnNotice {
     TurnNotice.classify(content: content, reasoning: reasoning, finishReason: finishReason)
+  }
+
+  var generationPerformanceText: String? {
+    guard role == .assistant,
+          finishReason != "cancelled",
+          let generationPerformance,
+          generationPerformance.outputTokens > 0,
+          generationPerformance.elapsedSeconds > 0,
+          generationPerformance.elapsedSeconds.isFinite,
+          generationPerformance.tokensPerSecond > 0,
+          generationPerformance.tokensPerSecond.isFinite else { return nil }
+    if let tot, tot.status != .complete { return nil }
+    let rounded = Int(generationPerformance.tokensPerSecond.rounded())
+    guard rounded > 0 else { return nil }
+    if tot != nil {
+      return "ToT total \(rounded) tok/s"
+    }
+    return "\(rounded) tok/s"
   }
 }
 
@@ -56,6 +100,14 @@ extension ChatMessageItem {
       chatMessageItemLog.warning("unknown role string, coercing to .system: \(message.role, privacy: .public)")
       role = .system
     }
-    self.init(id: message.id, role: role, content: message.content, reasoning: message.reasoning, finishReason: message.finishReason)
+    // Tolerant decode: a snapshot written by a newer/older schema that no
+    // longer decodes is treated as "no tree" rather than failing the row.
+    let tot = message.tot.flatMap { try? JSONDecoder().decode(ToTTree.self, from: $0) }
+    let bestOfN = message.bestOfN.flatMap { try? JSONDecoder().decode(BestOfNRound.self, from: $0) }
+    self.init(
+      id: message.id, role: role, content: message.content,
+      reasoning: message.reasoning, tot: tot, bestOfN: bestOfN,
+      finishReason: message.finishReason,
+      generationPerformance: message.generationPerformance)
   }
 }

@@ -1,22 +1,25 @@
 import AppKit
 
-/// Renders the RatioThink brand mark — a rounded, downward-pointing
+/// Renders the Rational brand mark — a rounded, downward-pointing
 /// triangle (the app-icon glyph, see `Resources/AppIcon/`) — as a
 /// menu-bar status image (#424).
 ///
-/// Status is carried by three appearance-independent channels so the
-/// icon never reads as a generic status *dot* and never relies on color
-/// alone (#396 invariant):
-///   · `filled`     — solid mark (engine present: running/error) vs a
+/// Status is carried by native menu-bar glyph treatment rather than a
+/// colored LED/status-dot language:
+///   · `filled`     — filled mark (engine present: running/error) vs a
 ///                    thick rounded OUTLINE (idle/working: stopped/loading).
-///   · `errorBadge` — an exclamation knocked OUT of the solid mark, so
+///                    The healthy running fill keeps a concentric
+///                    rounded-triangle hollow so it never reads as a fully
+///                    filled blob at menu-bar size.
+///   · `errorBadge` — an exclamation knocked OUT of the filled mark, so
 ///                    `.error` reads as the universal warning sign and
 ///                    is distinguishable from `.running` without color.
-///   · `color`      — the #412 LED tint, applied by the caller. The
-///                    image is NON-template (like the prior SF-Symbol dot)
-///                    so the green/amber/white language survives; the tint
-///                    colors passed in are dynamic system colors, so the
-///                    mark still adapts to light/dark.
+///
+/// The live status-item image is a TEMPLATE image. macOS supplies the
+/// foreground color for the current menu-bar appearance, so `.running`
+/// remains the same native monochrome glyph family as `.stopped` and
+/// `.loading`; fill/motion/badge carry state, and the menu remains the
+/// detailed status surface.
 ///
 /// Deliberately self-contained (only AppKit/CoreGraphics, no Helper
 /// state) so the EXACT same drawing code can be compiled by
@@ -31,22 +34,47 @@ enum MenuBarBrandIcon {
   /// Build the status-button image for one `Dot` rendering.
   ///
   /// - Parameters:
-  ///   - filled: solid mark vs rounded outline.
-  ///   - errorBadge: knock an exclamation out of the (solid) mark.
-  ///   - color: the LED tint to draw the mark in.
+  ///   - filled: filled mark vs rounded outline. A filled non-error mark is
+  ///     rendered as a hollow-centered running state.
+  ///   - errorBadge: knock an exclamation out of the filled mark.
   ///   - pointSize: square edge in points. ~18 matches the macOS menu-bar
   ///     icon area; the image is resolution-independent (the drawing
   ///     handler re-runs per backing scale).
   static func image(filled: Bool,
                     errorBadge: Bool,
-                    color: NSColor,
                     pointSize: CGFloat = 18) -> NSImage {
+    let img = image(filled: filled,
+                    errorBadge: errorBadge,
+                    color: .black,
+                    pointSize: pointSize)
+    img.isTemplate = true
+    return img
+  }
+
+  /// Build a non-template preview image with an explicit color. This is
+  /// intentionally kept out of `HelperMain`: production status items use
+  /// `image(filled:errorBadge:pointSize:)` so macOS owns the menu-bar
+  /// foreground color. The render harness uses this to simulate light/dark
+  /// template tinting in a PNG grid without an `NSStatusBarButton`.
+  static func previewImage(filled: Bool,
+                           errorBadge: Bool,
+                           color: NSColor,
+                           pointSize: CGFloat = 18) -> NSImage {
+    image(filled: filled,
+          errorBadge: errorBadge,
+          color: color,
+          pointSize: pointSize)
+  }
+
+  private static func image(filled: Bool,
+                            errorBadge: Bool,
+                            color: NSColor,
+                            pointSize: CGFloat) -> NSImage {
     let img = NSImage(size: NSSize(width: pointSize, height: pointSize),
                       flipped: false) { rect in
       draw(in: rect, filled: filled, errorBadge: errorBadge, color: color)
       return true
     }
-    // Colored, not a system template — the #412 tint IS the signal.
     img.isTemplate = false
     return img
   }
@@ -63,13 +91,27 @@ enum MenuBarBrandIcon {
     // the stroke (plus a hair) so the thick outline never clips at the
     // image edge.
     let edge = min(rect.width, rect.height)
-    let stroke = edge * 0.16
+    let stroke = edge * 0.10
     // Gentle corner rounding that keeps the edges long + straight (the
     // brand mark). The apex's narrow ~53° angle amplifies the tangent
     // cutback, so a small radius is plenty — larger reads as a blob.
     let cornerRadius = edge * 0.085
     let inset = stroke / 2 + edge * 0.05
-    let r = rect.insetBy(dx: inset, dy: inset)
+    let bbox = rect.insetBy(dx: inset, dy: inset)
+
+    // A down-pointing triangle's area centroid sits `bbox.height / 6`
+    // (≈ edge * 0.13) ABOVE the bounding-box center — its mass clusters under
+    // the wide top edge — so filling the symmetric inset leaves the mark
+    // riding ~14% high in the canvas. Drop the whole triangle to pull
+    // the centroid back toward center. The nudge is capped below the full
+    // `/6` because the OUTLINE state strokes past the path apex: a larger
+    // shift lets its rounded apex touch the bottom edge once the icon
+    // rasterizes at the native 18 px size (and 36 px @2x). edge*0.10 keeps
+    // every state clear of the bottom edge at all backing scales while still
+    // cutting the centroid offset to ~+5% (from +14%). Everything positioned
+    // relative to the triangle (vertices + the centered knockouts) derives
+    // from `r`, so the shift stays in one place.
+    let r = bbox.offsetBy(dx: 0, dy: -edge * 0.10)
 
     // Down-pointing triangle: two top corners + a bottom-center apex.
     // Non-flipped coordinates (origin bottom-left), so maxY is the top.
@@ -81,9 +123,12 @@ enum MenuBarBrandIcon {
     color.setFill()
     color.setStroke()
     if filled {
-      // The rounded path's own corners give the solid silhouette its
+      // The rounded path's own corners give the filled silhouette its
       // brand curvature — no extra stroke needed.
       triangle.fill()
+      if !errorBadge {
+        knockOutCenter(in: r, cornerRadius: cornerRadius)
+      }
       if errorBadge {
         knockOutExclamation(in: r)
       }
@@ -113,7 +158,35 @@ enum MenuBarBrandIcon {
     return path
   }
 
-  /// Carve an exclamation mark out of the solid triangle using
+  /// Carve a concentric rounded-triangle center out of the healthy filled
+  /// mark. The inner triangle is a scaled version of the same outer
+  /// silhouette around the visual centroid, so `.running` stays branded at
+  /// native menu-bar size instead of mixing in a circular counter-shape. Error
+  /// uses the exclamation knockout instead, so the two filled states stay
+  /// distinct without color.
+  private static func knockOutCenter(in r: NSRect, cornerRadius: CGFloat) {
+    let center = NSPoint(x: r.midX, y: r.maxY - r.height / 3) // centroid of a down triangle
+    let scale: CGFloat = 0.36
+
+    func scaled(_ p: NSPoint) -> NSPoint {
+      NSPoint(x: center.x + (p.x - center.x) * scale,
+              y: center.y + (p.y - center.y) * scale)
+    }
+
+    let topLeft = scaled(NSPoint(x: r.minX, y: r.maxY))
+    let topRight = scaled(NSPoint(x: r.maxX, y: r.maxY))
+    let apex = scaled(NSPoint(x: r.midX, y: r.minY))
+    let hole = roundedTriangle(topLeft, topRight, apex, radius: cornerRadius * scale)
+
+    guard let ctx = NSGraphicsContext.current else { return }
+    ctx.saveGraphicsState()
+    ctx.compositingOperation = .destinationOut
+    NSColor.black.setFill()
+    hole.fill()
+    ctx.restoreGraphicsState()
+  }
+
+  /// Carve an exclamation mark out of the filled triangle using
   /// `.destinationOut` compositing, so the menu-bar background shows
   /// through the "!" regardless of the bar's color. Centered on the
   /// triangle's visual centroid (one third down from the top edge for a

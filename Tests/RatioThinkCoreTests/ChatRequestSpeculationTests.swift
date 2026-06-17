@@ -35,11 +35,36 @@ final class ChatRequestSpeculationTests: XCTestCase {
     XCTAssertEqual(spec["draft_len"] as? Int, 5)
   }
 
+  func test_encode_includes_sidecar_identity_when_set() throws {
+    let req = ChatRequest(
+      model: "m",
+      messages: [],
+      speculation: ChatSpeculation(
+        enabled: true,
+        leaderLen: 2,
+        draftLen: 5,
+        threadID: "chat-123",
+        profileID: "fast-think"))
+    let spec = try XCTUnwrap(try encodedKeys(req)["speculation"] as? [String: Any])
+    XCTAssertEqual(spec["thread_id"] as? String, "chat-123")
+    XCTAssertEqual(spec["profile_id"] as? String, "fast-think")
+  }
+
   func test_round_trips_speculation() throws {
     let req = ChatRequest(model: "m", messages: [],
-                          speculation: ChatSpeculation(enabled: true, leaderLen: 1, draftLen: 3))
+                          speculation: ChatSpeculation(
+                            enabled: true,
+                            leaderLen: 1,
+                            draftLen: 3,
+                            threadID: "chat-123",
+                            profileID: "fast-think"))
     let back = try JSONDecoder().decode(ChatRequest.self, from: try JSONEncoder().encode(req))
-    XCTAssertEqual(back.speculation, ChatSpeculation(enabled: true, leaderLen: 1, draftLen: 3))
+    XCTAssertEqual(back.speculation, ChatSpeculation(
+      enabled: true,
+      leaderLen: 1,
+      draftLen: 3,
+      threadID: "chat-123",
+      profileID: "fast-think"))
   }
 
   func test_round_trips_absent_speculation_as_nil() throws {

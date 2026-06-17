@@ -11,6 +11,27 @@ import XCTest
 /// (which depends on the same emission shape).
 final class PieControlLauncherConfigTests: XCTestCase {
 
+  func test_configTimeout_matchesPieTemplateDefaultForSlowToTRequests() {
+    let body = PieControlLauncher.renderConfigBody(modelConfig: .dummy)
+    XCTAssertTrue(body.contains("request_timeout_secs = 120"),
+                  "app launcher config must not lower pie's template/default 120s request timeout; slow ToT node/scorer passes can otherwise close SSE without a terminal frame")
+    XCTAssertFalse(body.contains("request_timeout_secs = 60"),
+                   "60s was too low for packaged-app ToT runs on slower hardware/profiles")
+  }
+
+  func test_subprocessEnvironment_liftsShmemTimeoutToMatchSchedulerTimeout() {
+    let env = PieControlLauncher.renderSubprocessEnvironment(
+      base: ["PIE_SHMEM_TIMEOUT_S": "1", "KEEP": "yes"],
+      pieHome: URL(fileURLWithPath: "/tmp/pie-home", isDirectory: true),
+      shmemName: "/pie-test"
+    )
+    XCTAssertEqual(env["PIE_HOME"], "/tmp/pie-home")
+    XCTAssertEqual(env["PIE_SHMEM_NAME"], "/pie-test")
+    XCTAssertEqual(env["PIE_SHMEM_TIMEOUT_S"], "120",
+                   "the real fire_batch/shmem path reads PIE_SHMEM_TIMEOUT_S, not scheduler.request_timeout_secs directly")
+    XCTAssertEqual(env["KEEP"], "yes")
+  }
+
   func test_dummy_body_emits_dummy_driver_with_qwen3_fixture() {
     let body = PieControlLauncher.renderConfigBody(modelConfig: .dummy)
     XCTAssertTrue(body.contains("type = \"dummy\""),
@@ -19,6 +40,24 @@ final class PieControlLauncherConfigTests: XCTestCase {
                   "dummy config must keep the existing Qwen fixture so S0 tests stay stable")
     XCTAssertTrue(body.contains("name = \"default\""),
                   "model name must remain \"default\" — chat-apc resolves against this name")
+  }
+
+  func test_servedModelID_mirrors_model_name_per_config() {
+    // #476: the snapshot's servedModelID must equal the engine's advertised
+    // `[[model]].name` — the chat-completion `model` field the App sends.
+    XCTAssertEqual(PieControlLauncher.ModelConfig.dummy.servedModelID, "default")
+    XCTAssertEqual(
+      PieControlLauncher.ModelConfig.portable(
+        modelSlug: "org/repo/file.gguf",
+        modelsRoot: URL(fileURLWithPath: "/tmp/models", isDirectory: true)).servedModelID,
+      "org/repo/file.gguf")
+    XCTAssertEqual(
+      PieControlLauncher.ModelConfig.portableResolved(
+        servedModelID: "org/repo/file.gguf", modelRef: "/tmp/models/org/repo/file.gguf").servedModelID,
+      "org/repo/file.gguf")
+    XCTAssertEqual(
+      PieControlLauncher.ModelConfig.metal(modelID: "Qwen/Qwen3-0.6B").servedModelID,
+      "Qwen/Qwen3-0.6B")
   }
 
   func test_portable_body_emits_portable_driver_with_resolved_hf_repo_path() {
@@ -39,6 +78,74 @@ final class PieControlLauncherConfigTests: XCTestCase {
                    "pie serve config no longer accepts top-level hf_path; it resolves model.hf_repo")
     XCTAssertFalse(body.contains("type = \"dummy\""),
                    "portable config must not emit the dummy-driver block")
+  }
+
+  func test_portable_body_omits_default_token_limit_when_nil() {
+    // #438: with no memory-aware ceiling, the scheduler block must NOT
+    // carry default_token_limit — the engine keeps its default (no clamp),
+    // preserving pre-#438 behavior on hosts that sustain the full pool.
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      defaultTokenLimit: nil
+    )
+    XCTAssertFalse(body.contains("default_token_limit"),
+                   "nil defaultTokenLimit must not write the override; got:\n\(body)")
+    XCTAssertFalse(body.contains("[model.driver.options]"),
+                   "the pool-resize path is gone — no driver-options block; got:\n\(body)")
+  }
+
+  func test_portable_body_emits_default_token_limit_when_set() {
+    // #438: the memory-aware ceiling rides [model.scheduler].default_token_limit.
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      defaultTokenLimit: 5000
+    )
+    // Exact key = value line, under the scheduler section, not driver options.
+    XCTAssertTrue(body.contains("default_token_limit = 5000"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("[model.scheduler]"), "got:\n\(body)")
+    XCTAssertFalse(body.contains("max_num_kv_pages"),
+                   "the old pool-resize knob must not be emitted; got:\n\(body)")
+    XCTAssertTrue(body.contains("type = \"portable\""))
+  }
+
+  func test_metal_body_emits_default_token_limit_when_set() {
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .metal(modelID: "Qwen/Qwen3-0.6B"),
+      defaultTokenLimit: 4096
+    )
+    XCTAssertTrue(body.contains("default_token_limit = 4096"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
+  }
+
+  func test_portable_body_emits_max_num_kv_pages_when_set() {
+    // #475: the engine KV-pool override rides [model.driver.options].
+    // max_num_kv_pages — the knob the memory-budget sweep turns to lower the
+    // raw KV capacity (and so the effective ceiling) directly. Omitted when
+    // nil (guarded by `..._omits_default_token_limit_when_nil`).
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      defaultTokenLimit: nil,
+      maxNumKvPages: 256
+    )
+    XCTAssertTrue(body.contains("[model.driver.options]"),
+                  "a set maxNumKvPages must emit the driver-options block; got:\n\(body)")
+    XCTAssertTrue(body.contains("max_num_kv_pages = 256"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("type = \"portable\""), "got:\n\(body)")
+    // The override is independent of the scheduler ceiling.
+    XCTAssertFalse(body.contains("default_token_limit"), "got:\n\(body)")
+  }
+
+  func test_metal_body_emits_max_num_kv_pages_when_set() {
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .metal(modelID: "Qwen/Qwen3-0.6B"),
+      defaultTokenLimit: 4096,
+      maxNumKvPages: 512
+    )
+    XCTAssertTrue(body.contains("[model.driver.options]"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("max_num_kv_pages = 512"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("default_token_limit = 4096"),
+                  "both knobs coexist — scheduler cap + driver pool; got:\n\(body)")
+    XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
   }
 
   func test_portableResolved_serves_under_profile_slug_with_distinct_hf_repo_path() {
@@ -88,6 +195,26 @@ final class PieControlLauncherConfigTests: XCTestCase {
     )
     XCTAssertTrue(body.contains(#"hf_repo = "/tmp/weird\"name.gguf""#),
                   "embedded quotes must be backslash-escaped; got:\n\(body)")
+  }
+
+  func test_launchSpec_defaults_daemon_bind_host_to_loopback() throws {
+    let binary = try writeDriverListProbe(portable: true)
+    let spec = try makeSpec(binary: binary, modelConfig: .dummy)
+
+    XCTAssertEqual(spec.daemonBindHost, .loopback)
+    XCTAssertEqual(spec.daemonBindHost.daemonHost, "127.0.0.1")
+  }
+
+  func test_launchSpec_accepts_external_daemon_bind_host() throws {
+    let binary = try writeDriverListProbe(portable: true)
+    let spec = try makeSpec(
+      binary: binary,
+      modelConfig: .dummy,
+      daemonBindHost: .external
+    )
+
+    XCTAssertEqual(spec.daemonBindHost, .external)
+    XCTAssertEqual(spec.daemonBindHost.daemonHost, "0.0.0.0")
   }
 
   func test_writeConfig_writes_file_under_pieHome() throws {
@@ -251,10 +378,10 @@ final class PieControlLauncherConfigTests: XCTestCase {
   func test_realPie_driverList_subcommand_exists_and_reports_portable() throws {
     let candidates = [
       ProcessInfo.processInfo.environment["PIE_TEST_REAL_PIE_BIN"],
-      "/Applications/RatioThink.app/Contents/Resources/pie-engine/pie",
+      "/Applications/Rational.app/Contents/Resources/pie-engine/pie",
     ].compactMap { $0 }
     guard let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-      throw XCTSkip("no real pie binary (set PIE_TEST_REAL_PIE_BIN or install RatioThink.app)")
+      throw XCTSkip("no real pie binary (set PIE_TEST_REAL_PIE_BIN or install Rational.app)")
     }
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: path)
@@ -303,11 +430,163 @@ final class PieControlLauncherConfigTests: XCTestCase {
                   "real pie must report the portable driver compiled in; got:\n\(stdout)")
   }
 
+  // MARK: - #687 size-aware engine timeout
+
+  private static let gib: Int64 = 1_073_741_824
+
+  func test_resolvedTimeout_smallModel_keepsFloor() {
+    // nil/unmeasurable, zero, and any weight at/below the 4 GiB base all stay
+    // at the 120s floor — small models keep today's behavior exactly.
+    let floor = PieControlLauncher.requestTimeoutFloorSeconds
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: nil, environment: [:]), floor)
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 0, environment: [:]), floor)
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 2 * Self.gib, environment: [:]), floor)
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 4 * Self.gib, environment: [:]), floor,
+      "exactly the base size adds zero headroom")
+  }
+
+  func test_resolvedTimeout_largeModel_scalesUp() {
+    // floor 120 + 30s per GiB above the 4 GiB base.
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 8 * Self.gib, environment: [:]), 240,   // 120 + 30*4
+      "an 8 GiB model scales above the floor")
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 12 * Self.gib, environment: [:]), 360)  // 120 + 30*8
+  }
+
+  func test_resolvedTimeout_respectsCeiling() {
+    // 24 GiB would compute 720s; the 600s cap clamps it. A 70B-class GGUF
+    // stays at the ceiling rather than running away.
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 24 * Self.gib, environment: [:]),
+      PieControlLauncher.requestTimeoutCeilingSeconds)
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 100 * Self.gib, environment: [:]),
+      PieControlLauncher.requestTimeoutCeilingSeconds)
+  }
+
+  func test_resolvedTimeout_envOverrideWins() {
+    // An explicit PIE_SHMEM_TIMEOUT_S beats BOTH the floor (small model) and
+    // the size-aware default (large model) — the operator escape hatch.
+    let env = ["PIE_SHMEM_TIMEOUT_S": "300"]
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: nil, environment: env), 300,
+      "override beats the floor for a small/unmeasurable model")
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 8 * Self.gib, environment: env), 300,
+      "override beats the size-aware 240s default")
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: 100 * Self.gib, environment: env), 300,
+      "override even beats the ceiling — it is unclamped on purpose")
+  }
+
+  func test_resolvedTimeout_envOverride_canExceedSizeCeiling() {
+    // The escape hatch is deliberately allowed past the 600s size ceiling, but
+    // it raises ONLY the per-request/shmem budget (`request_timeout_secs`,
+    // child `PIE_SHMEM_TIMEOUT_S`). The cold-BOOT lease stays clamped at the
+    // ceiling via `bootHandshakeTimeoutSeconds` (see
+    // test_bootHandshake_staysBelowXPCDeadline_forAnyOverrideMagnitude), so an override above 600
+    // does NOT extend the pre-READY weight-load window — it only lengthens the
+    // per-request forward/generation budget once the engine is serving.
+    XCTAssertGreaterThan(700, PieControlLauncher.requestTimeoutCeilingSeconds)
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: nil, environment: ["PIE_SHMEM_TIMEOUT_S": "700"]), 700)
+  }
+
+  func test_resolvedTimeout_envOverride_clampsHugeFiniteValueWithoutTrapping() {
+    // Finite-but-huge values (> Int.max) must clamp to the 24h bound, NOT trap
+    // `Int(secs)` and crash the privileged helper at launch.
+    for huge in ["1e30", "99999999999999999999", "1e400"] {  // 1e400 → +inf, rejected
+      let got = PieControlLauncher.resolvedRequestTimeoutSeconds(
+        modelWeightBytes: nil, environment: ["PIE_SHMEM_TIMEOUT_S": huge])
+      // 1e30 / the 20-digit literal clamp to the 24h max; 1e400 overflows to
+      // +inf (non-finite) and falls back to the floor.
+      XCTAssertTrue(got == PieControlLauncher.requestTimeoutOverrideMaxSeconds
+                    || got == PieControlLauncher.requestTimeoutFloorSeconds,
+                    "override \(huge) must yield a finite clamped Int, got \(got)")
+    }
+    XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+      modelWeightBytes: nil, environment: ["PIE_SHMEM_TIMEOUT_S": "1e30"]),
+      PieControlLauncher.requestTimeoutOverrideMaxSeconds)
+  }
+
+  func test_resolvedTimeout_envOverride_rejectsGarbageAndFallsBackToSize() {
+    // Non-numeric, non-finite, and non-positive overrides are ignored so a
+    // stray/empty value can't silently disable the size-aware default.
+    for bad in ["abc", "", "0", "-5", "nan", "inf"] {
+      XCTAssertEqual(PieControlLauncher.resolvedRequestTimeoutSeconds(
+        modelWeightBytes: 8 * Self.gib, environment: ["PIE_SHMEM_TIMEOUT_S": bad]), 240,
+        "invalid override \(bad.debugDescription) must fall back to the size-aware default")
+    }
+  }
+
+  func test_rejectedTimeoutOverride_namesPresentButInvalidValueOnly() {
+    // #698 F3: the classifier the launch site uses to warn on a silently
+    // dropped override. Must mirror `resolvedRequestTimeoutSeconds`'s accept
+    // predicate EXACTLY so the warning fires iff the value was actually ignored.
+    // Present-but-invalid → returns the raw value verbatim (for the log).
+    for bad in ["abc", "", "0", "-5", "nan", "inf"] {
+      XCTAssertEqual(
+        PieControlLauncher.rejectedTimeoutOverride(environment: ["PIE_SHMEM_TIMEOUT_S": bad]),
+        bad,
+        "invalid override \(bad.debugDescription) must be reported as rejected")
+    }
+    // Absent → nil (nothing to warn about).
+    XCTAssertNil(PieControlLauncher.rejectedTimeoutOverride(environment: [:]))
+    // Valid (incl. the huge-but-finite escape-hatch values the resolver clamps
+    // rather than rejects) → nil: the override was honored, not dropped.
+    for good in ["120", "300", "700", "1e30", "99999999999999999999"] {
+      XCTAssertNil(
+        PieControlLauncher.rejectedTimeoutOverride(environment: ["PIE_SHMEM_TIMEOUT_S": good]),
+        "valid override \(good.debugDescription) must not be reported as rejected")
+    }
+  }
+
+  func test_bootHandshake_staysBelowXPCDeadline_forAnyOverrideMagnitude() {
+    // F2: the request/shmem value may exceed the 600s ceiling (escape hatch),
+    // but the BOOT lease must not — the static startReplyDeadline is sized to
+    // the ceiling, so a lease above it would let the XPC fallback kill a
+    // still-booting engine. The clamp must hold for any override magnitude.
+    let ceiling = PieControlLauncher.requestTimeoutCeilingSeconds
+    for req in [120, 240, ceiling, 700, 900,
+                PieControlLauncher.requestTimeoutOverrideMaxSeconds] {
+      let lease = PieControlLauncher.bootHandshakeTimeoutSeconds(requestTimeoutSeconds: req)
+      XCTAssertLessThanOrEqual(lease, ceiling,
+                               "boot lease for request=\(req) must never exceed the ceiling")
+      XCTAssertLessThan(TimeInterval(lease) + PieEngineHost.defaultLaunchTimeoutSlack,
+                        HelperExportedAPI.startReplyDeadline,
+                        "boot lease for request=\(req) must stay strictly below the static XPC reply deadline")
+    }
+    // Sub-ceiling values pass through unchanged (no clamp side effect).
+    XCTAssertEqual(PieControlLauncher.bootHandshakeTimeoutSeconds(requestTimeoutSeconds: 240), 240)
+    XCTAssertEqual(PieControlLauncher.bootHandshakeTimeoutSeconds(requestTimeoutSeconds: 900), ceiling)
+  }
+
+  func test_renderedTimeout_lockstep_acrossConfigAndEnv() {
+    // The single resolved value drives BOTH the TOML scheduler timeout and the
+    // injected child PIE_SHMEM_TIMEOUT_S, so they can never drift.
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: .portableResolved(servedModelID: "m", modelRef: "/tmp/m.gguf"),
+      requestTimeoutSeconds: 360)
+    XCTAssertTrue(body.contains("request_timeout_secs = 360"), "got:\n\(body)")
+    let env = PieControlLauncher.renderSubprocessEnvironment(
+      base: [:],
+      pieHome: URL(fileURLWithPath: "/tmp/h", isDirectory: true),
+      shmemName: "/pie-test",
+      requestTimeoutSeconds: 360)
+    XCTAssertEqual(env["PIE_SHMEM_TIMEOUT_S"], "360")
+  }
+
   // MARK: - helpers
 
   private func makeSpec(binary: URL,
                         subprocessEnvironment: [String: String] = [:],
-                        modelConfig: PieControlLauncher.ModelConfig) throws -> PieControlLauncher.LaunchSpec {
+                        modelConfig: PieControlLauncher.ModelConfig,
+                        daemonBindHost: EngineHTTPBindMode = .loopback) throws -> PieControlLauncher.LaunchSpec {
     let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
       .appendingPathComponent("pie-launchspec-\(UUID().uuidString.prefix(8))",
                               isDirectory: true)
@@ -318,6 +597,7 @@ final class PieControlLauncherConfigTests: XCTestCase {
       subprocessEnvironment: subprocessEnvironment,
       pieHome: tmp.appendingPathComponent("home"),
       shmemName: "/pie_test_\(UUID().uuidString.prefix(8))",
+      daemonBindHost: daemonBindHost,
       modelConfig: modelConfig
     )
   }

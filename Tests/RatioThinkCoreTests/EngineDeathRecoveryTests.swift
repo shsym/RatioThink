@@ -373,7 +373,7 @@ final class EngineDeathRecoveryTests: XCTestCase {
     // across the auto + user-Resume paths.
     let canonicalSpec = makeSpec(profileID: "chat")
     let resolverInvocations = OSAllocatedUnfairLock<[String]>(initialState: [])
-    let resolver: HelperExportedAPI.LaunchSpecResolver = { id in
+    let resolver: HelperExportedAPI.LaunchSpecResolver = { id, _ in
       resolverInvocations.withLock { $0.append(id) }
       return .success(canonicalSpec)
     }
@@ -589,8 +589,10 @@ final class EngineDeathRecoveryTests: XCTestCase {
     XCTAssertNotNil(assistant, "the assistant row must remain (it was never cancelled/deleted)")
     XCTAssertTrue(assistant?.content.hasPrefix("⚠️") ?? false,
                   "failed recovery must surface the engine-gone marker, got: \(assistant?.content ?? "nil")")
-    XCTAssertTrue(assistant?.content.contains("Engine stopped unexpectedly") ?? false,
-                  "the surfaced error must be the engine-gone description")
+    // #477: the bubble shows the taxonomy's engine-gone copy, not the raw
+    // HTTPEngineError description.
+    XCTAssertTrue(assistant?.content.contains("The engine stopped while answering") ?? false,
+                  "the surfaced error must be the engine-gone copy, got: \(assistant?.content ?? "nil")")
   }
 
   // MARK: - 9. No recovery gate wired → engineGone surfaces, no hang
@@ -698,6 +700,85 @@ final class EngineDeathRecoveryTests: XCTestCase {
                    "F1: no engine-gone warning may surface in the live transcript")
   }
 
+  // MARK: - 10b. Superseded send during the recovery wait is not a failure (#337)
+
+  func test_supersededSendDuringRecoveryWait_doesNotMarkFailure() async throws {
+    // F7 (#337): attempt 1 throws engineGone and parks in waitUntilRunning,
+    // then a FRESHER send() supersedes it (the user re-sends). The internal
+    // cancel() bumps generation and deletes the empty assistant row; when the
+    // parked wait returns false (cancellation), the post-await generation guard
+    // must return cleanly — NOT call markAssistant. A recovery-wait cancellation
+    // must behave like the stream-side CancellationError arm: no warning bubble.
+    // Distinct from test #10, which exercises a bare cancel(); here the
+    // supersede also starts a second, winning turn whose answer must be the
+    // only thing left in the transcript.
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let entered = OSAllocatedUnfairLock<Bool>(initialState: false)
+    let gate = ParkingRecoveryGate(onEntered: { entered.withLock { $0 = true } })
+    // First send throws engineGone (-> parks in recovery wait); the second
+    // send is the engine's 2nd call and streams a clean answer.
+    let engine = ProbingChatEngine(
+      firstError: HTTPEngineError.engineGone(detail: "synthetic engine death"),
+      successEvents: [.delta(role: .assistant, content: "fresher reply"), .finish(reason: .stop)]
+    )
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1"),
+      recoveryGate: gate,
+      recoveryPolicy: ChatRecoveryPolicy(maxAttempts: 2, waitForReadyTimeout: 30)
+    )
+
+    // Park reached: attempt 1 threw, classified engine-gone, now waiting.
+    try await waitUntil("recovery wait entered") { entered.withLock { $0 } }
+    // Capture the FIRST turn's row reference: markAssistant would mutate this
+    // exact object, so asserting against it (not via chat.messages, which the
+    // supersede's delete already pruned) is what gives the regression teeth.
+    let supersededRow = try XCTUnwrap(chat.messages.first { $0.role == "assistant" },
+                                      "first turn's assistant row must exist while parked")
+    XCTAssertTrue(supersededRow.content.isEmpty, "row is empty before supersede (no content streamed)")
+
+    // A fresher send() supersedes the parked turn: cancel() bumps generation
+    // and deletes the empty row, then a new task issues the winning turn.
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1"),
+      recoveryGate: gate,
+      recoveryPolicy: ChatRecoveryPolicy(maxAttempts: 2, waitForReadyTimeout: 30)
+    )
+
+    try await waitUntil("fresher turn completes") { !controller.isInFlight }
+
+    // Core F7 assertion: the superseded turn must NOT gain a ⚠️ marker. If the
+    // post-await guard were missing, the stale task's markAssistant would write
+    // the engine-gone warning onto this (deleted) row.
+    XCTAssertFalse(supersededRow.content.contains("⚠️"),
+                   "F7: a superseded send must not be marked as a failure, got: \(supersededRow.content)")
+    XCTAssertFalse(chat.messages.contains { $0.content.contains("⚠️") },
+                   "F7: no failure warning may surface for a cancelled recovery wait")
+    // The fresher turn won and is the only assistant content in the transcript.
+    let assistants = chat.messages.filter { $0.role == "assistant" }
+    XCTAssertEqual(assistants.count, 1, "exactly one assistant row survives (the fresher turn)")
+    XCTAssertEqual(assistants.first?.content, "fresher reply",
+                   "the fresher turn's answer must be the surviving content")
+    XCTAssertEqual(engine.callCount, 2, "one parked first send + one winning second send")
+  }
+
   // MARK: - 11. Mid-stream HELPER death is recoverable (#393/#412)
 
   func test_helperUnreachable_midStream_waitsAndRetries() async throws {
@@ -781,41 +862,196 @@ final class EngineDeathRecoveryTests: XCTestCase {
                    "engine-death branch must keep the tight engine-relaunch budget")
   }
 
-  // MARK: - 13. Helper-wait ceiling is policy-derived, not a literal (#412 re-F1)
+  // MARK: - 12b. Engine-answered semantic faults surface, never reclassified (#335)
 
-  func test_helperUnreachableCeiling_covers_worstCase_and_tracks_policy() {
+  func test_semanticEngineError_notReclassifiedAsEngineGone_evenWhenGateReportsGone() async throws {
+    // F4 (#335): a deterministic semantic error the engine deliberately emitted
+    // — `.api` envelope or `.stream` meta-frame — proves the engine ANSWERED, so
+    // it was not gone at request time. If an INDEPENDENT engine death coincides
+    // (the forced gate refresh now reports `isEngineGone`), the old classifier
+    // keyed on engine state alone and reclassified the semantic fault as
+    // engine-gone → wasted a relaunch/retry cycle and delayed the real error.
+    // The fix keys on the error SHAPE: such faults must surface on attempt 1.
+    func runAndAssertSurfaced(_ semanticError: Error, _ label: String) async throws {
+      let container = try RatioThinkModelContainer.makeInMemory()
+      let context = ModelContext(container)
+      let chat = Chat()
+      context.insert(chat)
+      chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+      try context.save()
+
+      let engine = ProbingChatEngine(
+        firstError: semanticError,
+        successEvents: [.delta(role: .assistant, content: "ack"), .finish(reason: .stop)]
+      )
+      // Gate reports engine-gone AND would recover: the ONLY thing keeping the
+      // turn from a wrongful retry is the error-shape guard.
+      let gate = ScriptedRecoveryGate(initialGone: true, willRecover: true)
+      let controller = ChatSendController()
+
+      controller.send(
+        chat: chat,
+        context: context,
+        engine: engine,
+        modelLoadCenter: ModelLoadCenter(),
+        persistenceStatus: PersistenceStatus(),
+        options: ChatSendRequestOptions(modelID: "m1"),
+        recoveryGate: gate
+      )
+
+      try await waitUntil("controller settles for \(label)") { !controller.isInFlight }
+      let assistant = chat.messages.first { $0.role == "assistant" }
+      XCTAssertEqual(engine.callCount, 1,
+                     "\(label): an engine-answered fault must NOT trigger a recovery retry")
+      XCTAssertTrue(assistant?.content.hasPrefix("⚠️") ?? false,
+                    "\(label): the semantic error must surface on the live row, got: \(assistant?.content ?? "nil")")
+      XCTAssertNil(gate.lastWaitTimeout,
+                   "\(label): the recovery wait must never be entered for an engine-answered fault")
+    }
+
+    try await runAndAssertSurfaced(
+      HTTPEngineError.api(status: 400, code: "context_length_exceeded", message: "too long"),
+      ".api envelope")
+    try await runAndAssertSurfaced(
+      HTTPEngineError.stream(code: "internal_error", message: "decode failed"),
+      ".stream meta-frame")
+  }
+
+  // MARK: - 12c. Positive control: a transport throw racing engine death RIDES recovery (#335)
+
+  func test_transportError_racingEngineGone_ridesRecovery_positiveControl() async throws {
+    // Twin of `test_semanticEngineError_…` and the exact race the ticket
+    // describes from the OTHER side: a transport-shaped throw (URLError) that
+    // coincides with an engine death must STILL be ridden through recovery once
+    // the forced gate refresh confirms `isEngineGone`. This pins the allow-side
+    // of the error-shape guard so the fix can't over-correct into "surface
+    // everything": only `.api`/`.stream` are excluded; transport faults — the
+    // shape a post-death request actually throws — keep retrying. Paired with
+    // the negative test, a regression in EITHER direction (retry-everything OR
+    // surface-everything) breaks exactly one of the twins.
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "ping", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ProbingChatEngine(
+      firstError: URLError(.networkConnectionLost),
+      successEvents: [.delta(role: .assistant, content: "ack"), .finish(reason: .stop)]
+    )
+    let gate = ScriptedRecoveryGate(initialGone: true, willRecover: true)
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1"),
+      recoveryGate: gate
+    )
+
+    try await waitUntil("transport fault rides recovery + retries") { !controller.isInFlight }
+    let assistant = chat.messages.first { $0.role == "assistant" }
+    XCTAssertEqual(engine.callCount, 2,
+                   "a transport fault racing engine death must retry after recovery, not surface")
+    XCTAssertEqual(assistant?.content, "ack",
+                   "the retried answer must replace the live bubble, got: \(assistant?.content ?? "nil")")
+    XCTAssertEqual(gate.lastWaitTimeout, ChatRecoveryPolicy().waitForReadyTimeout,
+                   "engine-death branch must enter the recovery wait with the engine-relaunch budget")
+  }
+
+  // MARK: - 13. Helper-wait ceiling covers the REAL ladder's measured worst case (#412 re-F1 / #416)
+
+  /// De-tautologized (#416). The prior version re-derived the SAME closed form
+  /// the `helperUnreachableCeiling` impl uses (`ceiling == worstCase + margin`),
+  /// so `ceiling >= worstCase` was vacuously true and blind to a formula that
+  /// drifts from the ladder's ACTUAL behavior. This instead DRIVES the real
+  /// `HelperHealthController` ladder to `.unreachable` under a fake clock and
+  /// MEASURES the elapsed worst case, then asserts the derived ceiling covers
+  /// it. The measurement is independent of the formula, so a structural ladder
+  /// change a hand-copied formula would miss (an extra probe per attempt, a
+  /// different reducer cadence) now fails this test. The clock advances 1s per
+  /// poll (the 1 Hz `EngineStatusStore` cadence) and `2 × probeBudget` per
+  /// reconcile (the App-side `HelperRegistrationRepair` worst case); every poll
+  /// and every reconcile fails so the ladder walks its full length. No real
+  /// sleeping — the clock is virtual, so the test is flake-free.
+  func test_helperUnreachableCeiling_covers_measuredWorstCase_of_real_ladder() async {
     let probe = HelperReconcileProbeBudget.seconds
 
-    // (a) The default helper-wait timeout MUST be the derived ceiling — not a
-    // hand-picked literal — and that ceiling MUST cover the ladder's worst-case
-    // time-to-.unreachable, modeled here INDEPENDENTLY of the ceiling formula
-    // (1 Hz cadence; each repair attempt probes reachability ~twice). If the
-    // wait could expire before the ladder escalates, `helperRecoveryGaveUp`
-    // never fires and the raw error surfaces — F1 reborn.
-    let p = HelperHealthPolicy()
-    let worstCaseToUnreachable =
-      TimeInterval(p.transientThreshold)
-      + TimeInterval(p.maxRepairAttempts) * (TimeInterval(p.repairGap) + 2 * probe)
-    let ceiling = ChatRecoveryPolicy.helperUnreachableCeiling(for: p, probeBudget: probe)
-    XCTAssertGreaterThanOrEqual(ceiling, worstCaseToUnreachable,
-      "derived ceiling must cover the ladder's worst-case time-to-.unreachable")
-    XCTAssertEqual(ChatRecoveryPolicy().helperUnreachableWaitTimeout, ceiling,
+    // Coverage must hold across the policy space, not just at the default —
+    // otherwise a formula that happens to fit the default but undercounts a
+    // retuned ladder would still pass. Each case drives the real ladder.
+    let policies: [HelperHealthPolicy] = [
+      HelperHealthPolicy(),                                            // shipping default
+      HelperHealthPolicy(transientThreshold: 3, maxRepairAttempts: 1, repairGap: 1),
+      HelperHealthPolicy(transientThreshold: 20, maxRepairAttempts: 4, repairGap: 7),
+      HelperHealthPolicy(maxRepairAttempts: 0),                        // auto-repair disabled
+    ]
+    for p in policies {
+      let measured = await measureWorstCaseToUnreachable(policy: p, probe: probe)
+      let ceiling = ChatRecoveryPolicy.helperUnreachableCeiling(for: p, probeBudget: probe)
+      XCTAssertGreaterThanOrEqual(ceiling, measured,
+        "derived ceiling \(ceiling)s must cover the real ladder's measured worst case \(measured)s for \(p)")
+    }
+
+    // The shipping default MUST BE the derived ceiling — not a hand-picked literal.
+    XCTAssertEqual(
+      ChatRecoveryPolicy().helperUnreachableWaitTimeout,
+      ChatRecoveryPolicy.helperUnreachableCeiling(for: HelperHealthPolicy(), probeBudget: probe),
       "the shipping default must BE the derived ceiling, not a hand-picked literal")
 
     // (b) The ceiling tracks the policy: bumping ANY ladder knob (or slowing
     // the reconcile probe) raises it, so a future retune cannot silently push
     // recovery past a stale ceiling and re-introduce F1.
+    let p = HelperHealthPolicy()
+    let base = ChatRecoveryPolicy.helperUnreachableCeiling(for: p, probeBudget: probe)
     func ceil(_ policy: HelperHealthPolicy, _ pb: TimeInterval = probe) -> TimeInterval {
       ChatRecoveryPolicy.helperUnreachableCeiling(for: policy, probeBudget: pb)
     }
-    XCTAssertGreaterThan(ceil(HelperHealthPolicy(transientThreshold: p.transientThreshold + 6)), ceiling,
+    XCTAssertGreaterThan(ceil(HelperHealthPolicy(transientThreshold: p.transientThreshold + 6)), base,
       "larger transientThreshold must raise the ceiling")
-    XCTAssertGreaterThan(ceil(HelperHealthPolicy(maxRepairAttempts: p.maxRepairAttempts + 1)), ceiling,
+    XCTAssertGreaterThan(ceil(HelperHealthPolicy(maxRepairAttempts: p.maxRepairAttempts + 1)), base,
       "more repair attempts must raise the ceiling")
-    XCTAssertGreaterThan(ceil(HelperHealthPolicy(repairGap: p.repairGap + 5)), ceiling,
+    XCTAssertGreaterThan(ceil(HelperHealthPolicy(repairGap: p.repairGap + 5)), base,
       "larger repairGap must raise the ceiling")
-    XCTAssertGreaterThan(ceil(p, probe + 5), ceiling,
+    XCTAssertGreaterThan(ceil(p, probe + 5), base,
       "a slower reconcile probe must raise the ceiling")
+  }
+
+  /// Drives the real `HelperHealthController` ladder to `.unreachable` with
+  /// every poll and every reconcile failing, advancing a fake clock 1s per poll
+  /// and `2 × probe` per reconcile, and returns the measured elapsed time. The
+  /// number of polls and reconciles is whatever the real reducer + controller
+  /// actually take, which is exactly what makes the coverage assertion
+  /// independent of the ceiling formula.
+  private func measureWorstCaseToUnreachable(policy: HelperHealthPolicy,
+                                             probe: TimeInterval) async -> TimeInterval {
+    let clock = FakeClock()
+    let controller = HelperHealthController(policy: policy, repair: {
+      clock.advance(2 * probe)   // a reconcile costs its worst-case probe budget…
+      return false               // …and never restores reachability
+    })
+    var polls = 0
+    while controller.health != .unreachable {
+      clock.advance(1)                          // 1 Hz poll cadence
+      controller.ingestPollOutcome(succeeded: false)
+      await controller.awaitRepairForTesting()  // serialize any reconcile this poll started
+      polls += 1
+      precondition(polls < 10_000, "ladder must terminate at .unreachable")
+    }
+    return clock.seconds
+  }
+
+  /// Virtual clock for `measureWorstCaseToUnreachable`. Accessed only on the
+  /// MainActor (the test, the controller, and its reconcile Task all run there),
+  /// so it needs no locking.
+  @MainActor
+  private final class FakeClock {
+    private(set) var seconds: TimeInterval = 0
+    func advance(_ dt: TimeInterval) { seconds += max(0, dt) }
   }
 
   // MARK: - helpers
@@ -848,7 +1084,7 @@ final class EngineDeathRecoveryTests: XCTestCase {
 
 @available(macOS 14, *)
 private final class HealthySession: PieEngineHost.EngineSession, @unchecked Sendable {
-  func shutdown() async {}
+  func shutdown() async -> EngineShutdownResult { .reaped }
   func checkLiveness() async -> EngineLiveness { .alive }
 }
 
@@ -856,7 +1092,7 @@ private final class HealthySession: PieEngineHost.EngineSession, @unchecked Send
 private final class OneShotDeathSession: PieEngineHost.EngineSession, @unchecked Sendable {
   private let lock = NSLock()
   private var fired = false
-  func shutdown() async {}
+  func shutdown() async -> EngineShutdownResult { .reaped }
   func checkLiveness() async -> EngineLiveness {
     lock.lock(); defer { lock.unlock() }
     if !fired { fired = true; return .gone(reason: "synthetic crash") }
@@ -905,9 +1141,6 @@ private final class ProbingChatEngine: EngineClient, @unchecked Sendable {
 
   func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
   func models() async throws -> [ModelInfo] { [] }
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    AsyncThrowingStream { $0.finish() }
-  }
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     callCount += 1
     let isFirst = (callCount == 1)
@@ -949,9 +1182,6 @@ private final class ReasoningRetryEngine: EngineClient, @unchecked Sendable {
 
   func health() async throws -> EngineHealth { EngineHealth(status: .ok) }
   func models() async throws -> [ModelInfo] { [] }
-  func loadModel(_ id: String) -> AsyncThrowingStream<LoadEvent, Error> {
-    AsyncThrowingStream { $0.finish() }
-  }
   func chatCompletion(_ req: ChatRequest) -> AsyncThrowingStream<ChatEvent, Error> {
     callCount += 1
     let isFirst = (callCount == 1)

@@ -8,7 +8,9 @@
 #   e2e_require_tcc        "myscenario"
 #   e2e_require_chat_apc   "$ROOT" "myscenario"
 #   PIE_BIN="$(e2e_ensure_pie "$ROOT" "myscenario")"
-#   e2e_ensure_hf_model "$MODEL" "$HF_HOME_DIR" "myscenario"
+#
+# (GGUF GUI-test fixtures are staged via Scripts/stage-test-model.sh, not a
+# helper here — see that script's self-bootstrap-or-guide contract.)
 #
 # Each `ensure_*` either satisfies the prerequisite (building / downloading
 # when cheap+safe) or prints the exact command to fix it and returns
@@ -29,7 +31,7 @@ e2e_require_seated_gui() {
 e2e_require_tcc() {
   local tag="$1"
   if [ "${PIE_TEST_TCC_GRANTED:-}" != "1" ]; then
-    echo "$tag: RatioThink.app + XCTest-runner Automation/Accessibility permission required (cannot be auto-granted)." >&2
+    echo "$tag: Rational.app + XCTest-runner Automation/Accessibility permission required (cannot be auto-granted)." >&2
     echo "$tag: 1) System Settings → Privacy & Security → Accessibility AND Automation → enable Xcode + the test runner." >&2
     echo "$tag:    Open it with: open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'" >&2
     echo "$tag: 2) Re-run with PIE_TEST_TCC_GRANTED=1 prefixed." >&2
@@ -45,6 +47,37 @@ e2e_require_chat_apc() {
     echo "$tag: restore it with: git -C \"$root\" checkout -- Inferlets/chat-apc/" >&2
     return 2
   fi
+}
+
+# --- uniform xcodebuild log capture + testmanagerd-wedge post-mortem --------
+#
+# Every GUI/E2E wrapper launches a focused RatioThinkGUITests suite under
+# xcodebuild. When that run dies at runner-init with "Timed out while enabling
+# automation mode", the build and tests compiled fine — it's a wedged
+# `testmanagerd`, not a code regression (insight:489). This helper gives every
+# wrapper ONE way to (1) stream xcodebuild output live AND capture it to <log>,
+# (2) recover its REAL exit status (PIPESTATUS[0], never tee's), and (3) on
+# failure scan the captured log for that wedge and print the bounce remedy
+# (Scripts/gui-testmanagerd-hint.sh — always exits 0, advisory only). The
+# caller keeps its own post-run assertions (skip/pass-line greps, DB checks,
+# sha256, termination classification) and decides what to do with the status.
+#
+#   set +e
+#   e2e_run_gui_xcodebuild "$XCODE_LOG" \
+#     -project RatioThink.xcodeproj -scheme RatioThinkGUITests \
+#     -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO \
+#     test -only-testing:... ENABLE_CODE_COVERAGE=NO
+#   status=$?
+#   set -e
+e2e_run_gui_xcodebuild() {
+  local log="$1"; shift
+  local rc
+  xcodebuild "$@" 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  # Resolve the detector relative to THIS lib, not the caller's cwd, so it
+  # works no matter where the wrapper is invoked from.
+  [ "$rc" -ne 0 ] && "$(dirname "${BASH_SOURCE[0]}")/gui-testmanagerd-hint.sh" "$log"
+  return "$rc"
 }
 
 # --- prerequisites that auto-prep can satisfy ---
@@ -86,61 +119,95 @@ e2e_ensure_pie() {
   return 1
 }
 
-# True only when the HF hub cache at $dir holds a fully-resolved model WEIGHT
-# file. The hub dir, refs/, and the small metadata blobs (config.json,
-# tokenizer*, .gitattributes) all resolve independently of the large weight
-# blob, so an interrupted/aborted download (Ctrl-C, network drop, disk-full)
-# commonly lands metadata-present but weights-missing — and a stray
-# snapshots/.DS_Store would satisfy any "≥1 file" check. Requiring a resolved
-# *weight* artifact rejects those partial states. `-L` follows symlinks, so a
-# dangling weight symlink (blob absent) does NOT match.
+# --- crash-reporter suppression + termination-source classification --------
 #
-# Assumes weights carry a known extension (.safetensors / .gguf / .bin); true
-# for the pinned Qwen/Qwen3-0.6B (.safetensors). Revisit this list if the
-# helper must stay format-agnostic for exotic weight formats.
-_e2e_hf_model_cached() {
-  local dir="$1"
-  [ -d "$dir/snapshots" ] || return 1
-  [ -n "$(find -L "$dir/snapshots" -type f \( -name '*.safetensors' -o -name '*.gguf' -o -name '*.bin' \) 2>/dev/null | head -n1)" ]
+# These run in the unsandboxed wrapper, so unlike the XCTRunner (app-sandbox=
+# true — can't read DiagnosticReports or exec pgrep) they can see crash reports
+# and the live process tree. That makes the wrapper the right boundary to
+# classify why Rational.app disappeared during a GUI/E2E run (#545; cf. insight
+# #263 "classify GUI failures by harness boundary"). The shipped product is
+# `Rational`/`RationalHelper` (#445 rebrand); the names below mirror the crash-
+# report set Scripts/collect-diagnostics.sh greps (incl. the RatioThink compat
+# window).
+
+# Mark the current wall-clock as the run-start reference for
+# `e2e_classify_app_termination` (crash reports older than this belong to a
+# previous run and are ignored). Echoes the epoch; callers capture it.
+e2e_run_start_epoch() { date +%s; }
+
+# Suppress the macOS "Rational quit unexpectedly" CrashReporter modal for an
+# unattended run. A genuine app crash mid-test would otherwise pop a window
+# that wedges a headless/seated CI box forever (#545 / #549). Crash reports are
+# still written (so classification below still works) — only the blocking
+# dialog is muted. The prior DialogType is saved and restored by
+# `e2e_restore_crash_reporter` so we never leave the session permanently muted.
+e2e_silence_crash_reporter() {
+  local tag="${1:-e2e}"
+  E2E_CRASHREPORTER_PRIOR="$(defaults read com.apple.CrashReporter DialogType 2>/dev/null || echo __unset__)"
+  defaults write com.apple.CrashReporter DialogType none >/dev/null 2>&1 || true
+  echo "$tag: CrashReporter dialog muted for this run (prior DialogType: $E2E_CRASHREPORTER_PRIOR)" >&2
 }
 
-# Ensure the HF model is in the local cache; download it if missing.
-e2e_ensure_hf_model() {
-  local model="$1" hf_home="$2" tag="$3"
-  local dir="$hf_home/hub/models--${model//\//--}"
-  if _e2e_hf_model_cached "$dir"; then
-    return 0
-  fi
-  if [ "${PIE_E2E_AUTOPREP:-1}" != "1" ]; then
-    echo "$tag: model '$model' not cached and autoprep disabled. Download: hf download $model" >&2
-    return 1
-  fi
-  echo "$tag: model '$model' not cached — downloading to $hf_home (one-time, ~GBs)…" >&2
-  if command -v hf >/dev/null 2>&1; then
-    if ! HF_HOME="$hf_home" hf download "$model" >&2; then
-      echo "$tag: 'hf download $model' failed (see output above). Retry: HF_HOME=$hf_home hf download $model" >&2
-      return 1
-    fi
-  elif command -v huggingface-cli >/dev/null 2>&1; then
-    if ! HF_HOME="$hf_home" huggingface-cli download "$model" >&2; then
-      echo "$tag: 'huggingface-cli download $model' failed (see output above). Retry: HF_HOME=$hf_home huggingface-cli download $model" >&2
-      return 1
-    fi
-  elif python3 -c 'import huggingface_hub' >/dev/null 2>&1; then
-    if ! HF_HOME="$hf_home" python3 -c \
-        "from huggingface_hub import snapshot_download; snapshot_download('$model')" >&2; then
-      echo "$tag: huggingface_hub snapshot_download('$model') failed (see output above)." >&2
-      return 1
-    fi
+# Restore the DialogType captured by e2e_silence_crash_reporter. Idempotent;
+# safe to call from a wrapper's cleanup/trap even if silence was never called.
+e2e_restore_crash_reporter() {
+  [ -n "${E2E_CRASHREPORTER_PRIOR:-}" ] || return 0
+  if [ "$E2E_CRASHREPORTER_PRIOR" = "__unset__" ]; then
+    defaults delete com.apple.CrashReporter DialogType >/dev/null 2>&1 || true
   else
-    echo "$tag: no Hugging Face downloader found." >&2
-    echo "$tag: install one — 'pip install huggingface_hub' (or 'uv pip install huggingface_hub') — then rerun." >&2
-    return 1
+    defaults write com.apple.CrashReporter DialogType "$E2E_CRASHREPORTER_PRIOR" >/dev/null 2>&1 || true
   fi
-  if _e2e_hf_model_cached "$dir"; then
-    return 0
-  fi
-  echo "$tag: download reported success but the cache looks incomplete: $dir" >&2
-  echo "$tag: expected a populated snapshots/ tree (resolved blobs). Re-run: HF_HOME=$hf_home hf download $model" >&2
-  return 1
+  E2E_CRASHREPORTER_PRIOR=""
 }
+
+# Classify why Rational.app / RationalHelper / the pie engine terminated, so a
+# GUI/E2E failure reports the SOURCE instead of only "app gone". Pure
+# diagnostic — always returns 0, only prints to stderr. Distinguishes:
+#   · genuine crash      — a fresh .ips for Rational/Helper/pie since run start
+#   · stray collision    — a Rational/Helper instance still alive (seated app,
+#                          concurrent worker session) that the run didn't own
+#   · clean teardown     — no fresh crash report, no stray instance
+# For a full redacted bundle (Gatekeeper, launchd, Unified Log, app.log) point
+# at Scripts/collect-diagnostics.sh — this stays lightweight and inline.
+#
+#   e2e_classify_app_termination <tag> <run_start_epoch>
+e2e_classify_app_termination() {
+  local tag="$1" since="${2:-0}"
+  local crash_dir="${RATIOTHINK_DIAG_CRASH_DIR:-$HOME/Library/Logs/DiagnosticReports}"
+  echo "$tag: --- termination classification (since epoch $since) ---" >&2
+
+  local found_crash=0 r mtime
+  if [ -d "$crash_dir" ]; then
+    while IFS= read -r r; do
+      [ -n "$r" ] || continue
+      mtime="$(stat -f '%m' "$r" 2>/dev/null || echo 0)"
+      if [ "$mtime" -ge "$since" ]; then
+        echo "$tag:   CRASH: $(basename "$r") (genuine process crash — see $r)" >&2
+        found_crash=1
+      fi
+    done <<EOF
+$(find "$crash_dir" -type f \( -name 'Rational-*' -o -name 'RationalHelper-*' \
+   -o -name 'RatioThink-*' -o -name 'RatioThinkHelper-*' -o -name 'pie-[0-9]*' \) 2>/dev/null)
+EOF
+  fi
+  [ "$found_crash" -eq 0 ] && \
+    echo "$tag:   no fresh Rational/Helper/pie crash report since run start — not a process crash" >&2
+
+  # `|| true` is load-bearing: macOS /bin/bash is 3.2, where `var="$(pipeline)"`
+  # aborts the whole script under `set -e` + `set -o pipefail` (the wrapper sets
+  # both) when the pipeline's rc is non-zero — and `pgrep` exits 1 on NO match,
+  # which is the common "no stray instance" case. Without the guard the
+  # classifier dies mid-verdict exactly when it has the most to report (#545).
+  local app_pids helper_pids engine_pids
+  app_pids="$(pgrep -x Rational 2>/dev/null | tr '\n' ' ' || true)"
+  helper_pids="$(pgrep -x RationalHelper 2>/dev/null | tr '\n' ' ' || true)"
+  engine_pids="$(pgrep -f 'pie .*serve' 2>/dev/null | tr '\n' ' ' || true)"
+  echo "$tag:   live Rational: ${app_pids:-none}  Helper: ${helper_pids:-none}  pie-serve: ${engine_pids:-none}" >&2
+  [ -n "$app_pids" ] && \
+    echo "$tag:   NOTE: a Rational instance is still alive — possible stray/seated collision (not this run's intentional terminate)" >&2
+
+  echo "$tag:   deep bundle: Scripts/collect-diagnostics.sh --window 10m" >&2
+  echo "$tag: --------------------------------------------------------" >&2
+  return 0
+}
+

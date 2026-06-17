@@ -4,14 +4,13 @@ import XCTest
 @MainActor
 final class ChatScaffoldModelSelectionTests: XCTestCase {
   func test_nothing_resolvable_returns_nil_so_send_is_blocked() {
-    // : no hidden "default" sentinel. With no test override, no
-    // per-chat override, and nothing resident, resolution yields nil —
-    // the caller must block the send and show the no-model confirm
-    // rather than silently asking the engine to load something.
+    // : no hidden fallback. With no pinned model and no profile default,
+    // resolution yields nil — the caller blocks the send and shows the
+    // no-model confirm rather than silently loading something.
     let selected = ChatScaffoldView.requestModelID(
-      modelOverride: nil,
-      residentModelID: nil,
-      testModelID: nil
+      selectedModelID: nil,
+      profileDefaultModel: nil,
+      residentModelID: nil
     )
     XCTAssertNil(selected)
   }
@@ -20,38 +19,958 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     let seededProfile = try Profile.parse(toml: ProfileStore.defaultChatTOML)
 
     XCTAssertTrue(
-      ChatTranscriptViewModel.placeholderModels.contains(seededProfile.model),
+      ChatTranscriptViewModel.placeholderModels.contains(try XCTUnwrap(seededProfile.model)),
       "placeholderModels must include the seeded default profile model so the first-launch model picker matches chat.toml"
     )
   }
 
-  func test_explicit_model_override_and_resident_model_take_precedence_over_profile_default() {
-    XCTAssertEqual(
+  // MARK: - #528 request/resident synchronization
+
+  func test_request_model_requires_matching_resident_engine_model() {
+    XCTAssertNil(
       ChatScaffoldView.requestModelID(
-        modelOverride: "explicit-model",
-        residentModelID: "resident-model",
-        testModelID: nil
+        selectedModelID: "pinned-model",
+        profileDefaultModel: "profile-default",
+        residentModelID: "profile-default"
       ),
-      "explicit-model"
+      "a pinned-model request must not be constructed while the engine still serves the profile default"
     )
     XCTAssertEqual(
       ChatScaffoldView.requestModelID(
-        modelOverride: nil,
-        residentModelID: "resident-model",
-        testModelID: nil
+        selectedModelID: "pinned-model",
+        profileDefaultModel: "profile-default",
+        residentModelID: "pinned-model"
       ),
-      "resident-model"
+      "pinned-model"
     )
   }
 
-  func test_chat_gui_override_still_points_at_small_model_harness() {
+  // MARK: - #563 send-time sampling/profile-default resolution
+
+  func test_profile_switch_clears_transient_toolbar_overrides_without_caching_profile_sampling() {
+    let viewModel = ChatTranscriptViewModel(
+      selectedProfileID: "creative",
+      samplingOverride: ChatSampling(temperature: 0.7, topP: 0.9, maxTokens: 4096),
+      systemPromptOverride: "temporary override"
+    )
+
+    ChatScaffoldView.clearTransientOverridesForProfileSwitch(to: viewModel)
+
+    XCTAssertNil(viewModel.samplingOverride,
+                 "profile switches should clear the transient toolbar sampling override")
+    XCTAssertNil(viewModel.systemPromptOverride,
+                 "profile switches should clear the transient toolbar prompt override; send resolves the profile prompt separately")
+  }
+
+  func test_resolvedSystemPrompt_uses_transient_override_then_profile_default() {
+    XCTAssertEqual(
+      ChatScaffoldView.resolvedSystemPrompt(profileDefault: "Profile prompt", transientOverride: "Toolbar prompt"),
+      "Toolbar prompt"
+    )
+    XCTAssertEqual(
+      ChatScaffoldView.resolvedSystemPrompt(profileDefault: "Profile prompt", transientOverride: nil),
+      "Profile prompt"
+    )
+    XCTAssertEqual(
+      ChatScaffoldView.resolvedSystemPrompt(profileDefault: "Profile prompt", transientOverride: ""),
+      "Profile prompt",
+      "blank toolbar text means use the selected profile's system prompt"
+    )
+    XCTAssertNil(ChatScaffoldView.resolvedSystemPrompt(profileDefault: "", transientOverride: nil))
+  }
+
+  func test_resolvedSampling_uses_latest_profile_defaults_for_open_chat_without_toolbar_override() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(
+        into: dir,
+        id: "chat",
+        temperature: 0.4,
+        topP: 0.75,
+        maxTokens: 1536)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      let viewModel = ChatTranscriptViewModel(selectedProfileID: "chat")
+
+      try store.setEditableDefaults(
+        systemPrompt: "prompt",
+        temperature: 0.2,
+        topP: 0.95,
+        forProfileID: "chat")
+
+      XCTAssertEqual(
+        ChatScaffoldView.resolvedSampling(
+          profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+          transientOverride: viewModel.samplingOverride),
+        ChatSampling(temperature: 0.2, topP: 0.95, maxTokens: 1536),
+        "an already-open chat with no toolbar override must pick up Settings-saved sampling defaults on its next send")
+    }
+  }
+
+  func test_resolvedSampling_keeps_toolbar_override_over_later_profile_default_edits() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(
+        into: dir,
+        id: "chat",
+        temperature: 0.4,
+        topP: 0.75,
+        maxTokens: 1536)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      let viewModel = ChatTranscriptViewModel(selectedProfileID: "chat")
+      viewModel.samplingOverride = ChatSampling(temperature: 1.3, topP: 0.55, maxTokens: 1536)
+
+      try store.setEditableDefaults(
+        systemPrompt: "prompt",
+        temperature: 0.2,
+        topP: 0.95,
+        forProfileID: "chat")
+
+      XCTAssertEqual(
+        ChatScaffoldView.resolvedSampling(
+          profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+          transientOverride: viewModel.samplingOverride),
+        ChatSampling(temperature: 1.3, topP: 0.55, maxTokens: 1536),
+        "a real toolbar override must remain transiently authoritative until cleared")
+    }
+  }
+
+  func test_noop_params_popover_close_preserves_profile_sampling_source_for_open_chat() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(
+        into: dir,
+        id: "chat",
+        temperature: 0.4,
+        topP: 0.75,
+        maxTokens: 1536)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      let viewModel = ChatTranscriptViewModel(selectedProfileID: "chat")
+      let displayedSampling = ChatScaffoldView.resolvedSampling(
+        profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+        transientOverride: viewModel.samplingOverride)
+
+      viewModel.samplingOverride = ContentToolbar.samplingOverrideAfterParamsCommit(
+        currentOverride: viewModel.samplingOverride,
+        sourceSampling: displayedSampling,
+        committed: displayedSampling)
+
+      XCTAssertNil(
+        viewModel.samplingOverride,
+        "opening and closing the params popover without slider edits must not create a stale explicit override")
+
+      try store.setEditableDefaults(
+        systemPrompt: "prompt",
+        temperature: 0.2,
+        topP: 0.95,
+        forProfileID: "chat")
+
+      XCTAssertEqual(
+        ChatScaffoldView.resolvedSampling(
+          profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+          transientOverride: viewModel.samplingOverride),
+        ChatSampling(temperature: 0.2, topP: 0.95, maxTokens: 1536),
+        "after a no-op params inspection, the next send should still use the latest Settings-saved profile defaults")
+    }
+  }
+
+  func test_netZero_params_edits_preserve_profile_sampling_source_for_open_chat() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(
+        into: dir,
+        id: "chat",
+        temperature: 0.4,
+        topP: 0.75,
+        maxTokens: 1536)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      let viewModel = ChatTranscriptViewModel(selectedProfileID: "chat")
+      let displayedSampling = ChatScaffoldView.resolvedSampling(
+        profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+        transientOverride: viewModel.samplingOverride)
+
+      viewModel.samplingOverride = ContentToolbar.samplingOverrideAfterParamsCommit(
+        currentOverride: viewModel.samplingOverride,
+        sourceSampling: displayedSampling,
+        committed: displayedSampling)
+
+      XCTAssertNil(
+        viewModel.samplingOverride,
+        "dragging params sliders away and back to the displayed profile defaults must not create a stale explicit override")
+
+      try store.setEditableDefaults(
+        systemPrompt: "prompt",
+        temperature: 0.2,
+        topP: 0.95,
+        forProfileID: "chat")
+
+      XCTAssertEqual(
+        ChatScaffoldView.resolvedSampling(
+          profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+          transientOverride: viewModel.samplingOverride),
+        ChatSampling(temperature: 0.2, topP: 0.95, maxTokens: 1536),
+        "after a net-zero params edit, the next send should still use the latest Settings-saved profile defaults")
+    }
+  }
+
+  func test_dirty_params_popover_commit_creates_override_that_wins_over_later_profile_edits() throws {
+    try withTempProfilesDir { dir in
+      try writeProfile(
+        into: dir,
+        id: "chat",
+        temperature: 0.4,
+        topP: 0.75,
+        maxTokens: 1536)
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+      let viewModel = ChatTranscriptViewModel(selectedProfileID: "chat")
+      let sourceSampling = ChatScaffoldView.resolvedSampling(
+        profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+        transientOverride: nil)
+      let editedSampling = ChatSampling(temperature: 1.3, topP: 0.55, maxTokens: 1536)
+
+      viewModel.samplingOverride = ContentToolbar.samplingOverrideAfterParamsCommit(
+        currentOverride: viewModel.samplingOverride,
+        sourceSampling: sourceSampling,
+        committed: editedSampling)
+
+      try store.setEditableDefaults(
+        systemPrompt: "prompt",
+        temperature: 0.2,
+        topP: 0.95,
+        forProfileID: "chat")
+
+      XCTAssertEqual(
+        ChatScaffoldView.resolvedSampling(
+          profileDefault: store.sampling(forProfileID: viewModel.selectedProfileID),
+          transientOverride: viewModel.samplingOverride),
+        editedSampling,
+        "a dirty params popover commit is an explicit toolbar override until cleared")
+    }
+  }
+
+  // MARK: - #460 single-source selection resolution
+
+  func test_pinned_model_takes_precedence_over_profile_default() {
     XCTAssertEqual(
       ChatScaffoldView.requestModelID(
-        modelOverride: nil,
-        residentModelID: nil,
-        testModelID: "Qwen/Qwen3-0.6B"
+        selectedModelID: "pinned-model",
+        profileDefaultModel: "profile-default",
+        residentModelID: "pinned-model"
       ),
-      "Qwen/Qwen3-0.6B"
+      "pinned-model"
     )
+  }
+
+  func test_engine_error_message_uses_localized_rollback_warning() {
+    struct StartError: Error {}
+    struct RollbackError: Error {}
+    let error = LocalAPIBindModeRollbackError(
+      startError: StartError(),
+      rollbackError: RollbackError()
+    )
+
+    let message = ChatScaffoldView.engineErrorMessage(error, verb: "switch")
+
+    XCTAssertTrue(message.contains("Couldn't switch the engine:"))
+    XCTAssertTrue(message.contains("external-access preference could not be restored"))
+    XCTAssertTrue(message.contains("helper-visible preference may still allow external binding"))
+    XCTAssertFalse(message.contains("LocalAPIBindModeRollbackError("),
+                   "user-facing action errors must show the localized rollback warning, not a Swift struct dump")
+  }
+
+  func test_unpinned_chat_falls_back_to_profile_default() {
+    // The single source of truth resolves an UNPINNED chat to the active
+    // profile's default — never engine residency.
+    XCTAssertEqual(
+      ChatScaffoldView.requestModelID(
+        selectedModelID: nil,
+        profileDefaultModel: "profile-default",
+        residentModelID: "profile-default"
+      ),
+      "profile-default"
+    )
+  }
+
+  // MARK: - #673 chat-toolbar profile swap auto-reloads on a model change
+
+  /// Engine running on a DIFFERENT served model than the newly selected
+  /// profile would boot → the swap must relaunch the engine onto the new
+  /// model (no send required), and arm the in-flight guard.
+  func test_swap_to_different_served_model_while_running_restarts_engine() {
+    var inFlight = false
+    let outcome = ChatScaffoldView.profileSwapEngineOutcome(
+      newProfileID: "creative",
+      chatModelID: nil,
+      newProfileDefaultModel: "model-B",
+      status: .running(EngineSessionSnapshot(port: 8123,
+                                             profileID: "chat",
+                                             servedModelID: "model-A")),
+      restartInFlight: &inFlight)
+
+    XCTAssertEqual(outcome, .restart)
+    XCTAssertTrue(inFlight, "a model-changing swap must arm the restart-in-flight guard")
+  }
+
+  /// Engine running, the newly selected profile serves the SAME model → no
+  /// relaunch (mirrors #654 `selectOnly`; pie binds only the model at boot).
+  func test_swap_to_same_served_model_while_running_does_not_restart() {
+    var inFlight = false
+    let outcome = ChatScaffoldView.profileSwapEngineOutcome(
+      newProfileID: "creative",
+      chatModelID: nil,
+      newProfileDefaultModel: "model-A",
+      status: .running(EngineSessionSnapshot(port: 8123,
+                                             profileID: "chat",
+                                             servedModelID: "model-A")),
+      restartInFlight: &inFlight)
+
+    XCTAssertEqual(outcome, .selectOnly)
+    XCTAssertFalse(inFlight, "a same-model swap must not arm a restart")
+  }
+
+  /// A per-chat pinned model beats the new profile's default when deciding the
+  /// boot model — the same pin-over-default resolution the start path uses. A
+  /// pin equal to the resident model → no relaunch even if the profile default
+  /// differs.
+  func test_swap_uses_chat_pin_over_profile_default_for_model_comparison() {
+    var inFlight = false
+    let outcome = ChatScaffoldView.profileSwapEngineOutcome(
+      newProfileID: "creative",
+      chatModelID: "model-A",
+      newProfileDefaultModel: "model-B",
+      status: .running(EngineSessionSnapshot(port: 8123,
+                                             profileID: "chat",
+                                             servedModelID: "model-A")),
+      restartInFlight: &inFlight)
+
+    XCTAssertEqual(outcome, .selectOnly,
+                   "the chat's pin (model-A) matches the resident model, so the profile's model-B default must not trigger a relaunch")
+    XCTAssertFalse(inFlight)
+  }
+
+  /// #3: a swap while the engine is STOPPED must not boot the engine — the
+  /// marker-only path stays (`selectOnly`, no restart).
+  func test_swap_while_stopped_is_marker_only_no_engine_start() {
+    var inFlight = false
+    let outcome = ChatScaffoldView.profileSwapEngineOutcome(
+      newProfileID: "creative",
+      chatModelID: nil,
+      newProfileDefaultModel: "model-B",
+      status: .stopped,
+      restartInFlight: &inFlight)
+
+    XCTAssertEqual(outcome, .selectOnly)
+    XCTAssertFalse(inFlight, "a stopped-engine swap must not arm a restart")
+  }
+
+  /// A swap mid-transition (engine `.starting`) is rejected so an in-flight
+  /// launch is not torn down by a second relaunch.
+  func test_swap_while_starting_is_rejected() {
+    var inFlight = false
+    let outcome = ChatScaffoldView.profileSwapEngineOutcome(
+      newProfileID: "creative",
+      chatModelID: nil,
+      newProfileDefaultModel: "model-B",
+      status: .starting,
+      restartInFlight: &inFlight)
+
+    XCTAssertEqual(outcome, .reject)
+    XCTAssertFalse(inFlight)
+  }
+
+  /// F2: a swap to a profile with NO resolvable model (nil pin + nil default)
+  /// is not a model change — it must never tear down a running engine. The
+  /// gate short-circuits to `.selectOnly` before delegating, so the previously
+  /// working engine is left serving its current model.
+  func test_swap_to_profile_with_no_resolvable_model_does_not_restart() {
+    var inFlight = false
+    let outcome = ChatScaffoldView.profileSwapEngineOutcome(
+      newProfileID: "creative",
+      chatModelID: nil,
+      newProfileDefaultModel: nil,
+      status: .running(EngineSessionSnapshot(port: 8123,
+                                             profileID: "chat",
+                                             servedModelID: "model-A")),
+      restartInFlight: &inFlight)
+
+    XCTAssertEqual(outcome, .selectOnly,
+                   "a nil-model swap is not a model change; a running engine must not be torn down")
+    XCTAssertFalse(inFlight)
+  }
+
+  /// F1: a model-changing swap relaunches the single, app-scoped engine, so it
+  /// must honor the same stream-defer invariant as the pinned-mismatch
+  /// relaunch and the explicit Load button — defer while another chat streams,
+  /// run immediately once the app-wide stream set is idle.
+  func test_swap_relaunch_uses_stream_guard_before_restart() {
+    let chatB = UUID()
+    XCTAssertEqual(
+      ChatScaffoldView.profileSwapRelaunchDecision(inFlightChatIDs: [chatB]),
+      .deferUntilIdle,
+      "a model-changing profile swap must not restart the single engine while another chat streams")
+    XCTAssertEqual(
+      ChatScaffoldView.profileSwapRelaunchDecision(inFlightChatIDs: []),
+      .runNow)
+  }
+
+  // MARK: - AC4: model label is stable / derives from the selection authority
+
+  func test_label_shows_pinned_model_leaf() {
+    XCTAssertEqual(
+      ContentToolbar.modelLabel(selectedModelID: "org/Repo/Big-Model-Q8.gguf",
+                                profileDefaultModel: "org/Other/Other.gguf"),
+      ModelDisplayName.leaf("org/Repo/Big-Model-Q8.gguf"),
+      "a pinned model must render its own leaf, independent of the profile default"
+    )
+  }
+
+  func test_label_falls_back_to_profile_default_leaf_when_unpinned() {
+    XCTAssertEqual(
+      ContentToolbar.modelLabel(selectedModelID: nil,
+                                profileDefaultModel: "org/Other/Other.gguf"),
+      ModelDisplayName.leaf("org/Other/Other.gguf")
+    )
+  }
+
+  func test_label_is_profile_default_text_only_when_no_model_at_all() {
+    XCTAssertEqual(
+      ContentToolbar.modelLabel(selectedModelID: nil, profileDefaultModel: nil),
+      "Profile default"
+    )
+  }
+
+  /// AC4 stability: a no-default profile switch PRESERVES the pinned model
+  /// (the coordinator's silent path leaves `Chat.modelID` untouched — proven
+  /// in ProfileSwapCoordinatorTests), so the label is identical before and
+  /// after the switch even though the new profile has no default of its own.
+  func test_label_is_stable_across_a_no_default_profile_switch() {
+    let pinned = "org/Repo/Pinned.gguf"
+    let before = ContentToolbar.modelLabel(selectedModelID: pinned,
+                                           profileDefaultModel: "org/A/Default-A.gguf")
+    // After switching to a profile with no default, the pinned model is
+    // preserved and the profile default is now nil.
+    let after = ContentToolbar.modelLabel(selectedModelID: pinned,
+                                          profileDefaultModel: nil)
+    XCTAssertEqual(before, after, "the model label must not reset on a no-default profile switch")
+  }
+
+  // MARK: - review F1: residency seed adopts the served model ONLY when it is
+  // this chat's profile default — never the engine's global resident model.
+
+  func test_seed_adopts_served_model_when_it_is_the_profile_default() {
+    XCTAssertEqual(
+      ChatScaffoldView.seededModelID(
+        currentPin: nil, servedID: "org/A/Default.gguf",
+        profileDefault: "org/A/Default.gguf", isLoading: false),
+      "org/A/Default.gguf",
+      "unpinned + served == profile default → seed it"
+    )
+  }
+
+  func test_seed_does_not_adopt_a_served_model_that_differs_from_profile_default() {
+    // The engine serves a global model that is NOT this chat's default
+    // (e.g. another chat loaded it). Seeding it would durably pin the wrong
+    // model and freeze it there — the exact defect F1 flags.
+    XCTAssertNil(
+      ChatScaffoldView.seededModelID(
+        currentPin: nil, servedID: "org/Other/Resident.gguf",
+        profileDefault: "org/A/Default.gguf", isLoading: false),
+      "unpinned + served != profile default → do NOT seed (follow the profile default)"
+    )
+  }
+
+  func test_seed_never_overwrites_an_explicit_pin() {
+    XCTAssertNil(
+      ChatScaffoldView.seededModelID(
+        currentPin: "org/Pinned/Pick.gguf", servedID: "org/Pinned/Pick.gguf",
+        profileDefault: "org/Pinned/Pick.gguf", isLoading: false),
+      "already pinned → never overwrite, even when everything agrees"
+    )
+  }
+
+  func test_seed_is_a_noop_while_a_load_is_in_flight() {
+    XCTAssertNil(
+      ChatScaffoldView.seededModelID(
+        currentPin: nil, servedID: "org/A/Default.gguf",
+        profileDefault: "org/A/Default.gguf", isLoading: true),
+      "loading → no-op (the load's target is the user's choice, not yet served)"
+    )
+  }
+
+  func test_seed_is_a_noop_when_nothing_is_served() {
+    XCTAssertNil(
+      ChatScaffoldView.seededModelID(
+        currentPin: nil, servedID: nil,
+        profileDefault: "org/A/Default.gguf", isLoading: false))
+  }
+
+  // MARK: - #501 centralization: the pin-over-default sites delegate to the
+  // single resolver (`ModelTarget.resolve`) with identical results. The
+  // precedence itself is owned and exhaustively tested by `ModelTargetTests`
+  // (SPM); these guard that each folded call site stays a thin pass-through.
+
+  /// The pin/default matrix the resolver covers — pin beats default; blank/nil
+  /// counts as absent; nothing resolvable is `nil`.
+  private static let pinDefaultMatrix: [(pin: String?, def: String?)] = [
+    ("pinned-model", "profile-default"),  // pin wins
+    (nil, "profile-default"),             // unpinned → default
+    ("pinned-model", nil),                // pinned, no default
+    (nil, nil),                           // nothing → nil
+  ]
+
+  func test_requestModelID_equals_ModelTarget_resolve() {
+    // `requestModelID` IS the resolver's pick → default → nil — no parallel
+    // send-model override (#504 retired `PIE_TEST_CHAT_MODEL`).
+    for c in Self.pinDefaultMatrix {
+      XCTAssertEqual(
+        ChatScaffoldView.requestModelID(
+          selectedModelID: c.pin,
+          profileDefaultModel: c.def,
+          residentModelID: ModelTarget.resolve(
+            selectedModelID: c.pin,
+            profileDefault: c.def)?.modelID),
+        ModelTarget.resolve(selectedModelID: c.pin, profileDefault: c.def)?.modelID,
+        "requestModelID must equal ModelTarget.resolve for pin=\(String(describing: c.pin)) default=\(String(describing: c.def))"
+      )
+    }
+  }
+
+  func test_effectiveModelID_equals_ModelTarget_resolve() {
+    // The swap policy's "current model" is the same pin-over-default pick.
+    for c in Self.pinDefaultMatrix {
+      XCTAssertEqual(
+        ContentToolbar.effectiveModelID(
+          selectedModelID: c.pin, profileDefaultModel: c.def),
+        ModelTarget.resolve(selectedModelID: c.pin, profileDefault: c.def)?.modelID,
+        "effectiveModelID must equal ModelTarget.resolve for pin=\(String(describing: c.pin)) default=\(String(describing: c.def))"
+      )
+    }
+  }
+
+  func test_effectiveModelID_pins_over_default_and_nils_when_empty() {
+    XCTAssertEqual(
+      ContentToolbar.effectiveModelID(selectedModelID: "pinned-model",
+                                      profileDefaultModel: "profile-default"),
+      "pinned-model")
+    XCTAssertEqual(
+      ContentToolbar.effectiveModelID(selectedModelID: nil,
+                                      profileDefaultModel: "profile-default"),
+      "profile-default")
+    XCTAssertNil(
+      ContentToolbar.effectiveModelID(selectedModelID: nil, profileDefaultModel: nil))
+  }
+
+  func test_profile_swap_preserves_explicit_pin_by_default() {
+    XCTAssertTrue(
+      ContentToolbar.shouldPreserveExplicitModelSelection(
+        selectedModelID: "pinned-model",
+        followProfileDefaultModel: false),
+      "a concrete model selection should suppress later profile-default swap prompts by default")
+  }
+
+  func test_profile_swap_does_not_preserve_unpinned_app_run_state() {
+    XCTAssertFalse(
+      ContentToolbar.shouldPreserveExplicitModelSelection(
+        selectedModelID: nil,
+        followProfileDefaultModel: false),
+      "a fresh app-run/chat with no explicit concrete row selected should keep follow-default behavior")
+  }
+
+  func test_follow_profile_default_toggle_reenables_compatibility_prompting() {
+    XCTAssertFalse(
+      ContentToolbar.shouldPreserveExplicitModelSelection(
+        selectedModelID: "pinned-model",
+        followProfileDefaultModel: true),
+      "the compatibility toggle should let profile changes ask/suggest the destination default again")
+  }
+
+  // MARK: - Review v1 F1: toolbar concrete picks compare against effective model
+
+  func test_toolbar_model_pick_from_unpinned_profile_default_raises_and_loads_override() async {
+    let center = ModelLoadCenter(initialResident: "profile-default-A")
+    let coord = ProfileSwapCoordinator(
+      center: center,
+      modelForProfile: { _ in nil },
+      serveModel: { modelID, _ in center.reconcileEngineResident(modelID) }
+    )
+    let option = ToolbarModelOptions.Option(
+      slug: "picked-model-B",
+      displayName: "picked-model-B",
+      source: nil,
+      isCurrent: false,
+      isProfileDefault: false
+    )
+    var committed: String?
+
+    ContentToolbar.performModelSelection(
+      option,
+      selectedModelID: nil,
+      profileDefaultModel: "profile-default-A",
+      activeProfileID: "chat",
+      swapCoordinator: coord,
+      commitModel: { committed = $0; return true },
+      onUseProfileDefault: {}
+    )
+
+    XCTAssertNil(committed, "cross-model pick must wait for explicit confirmation")
+    guard let token = coord.pending?.id else {
+      return XCTFail("unpinned default A -> pick B must raise the override confirm instead of silently pinning")
+    }
+    coord.confirm(token: token, setAsDefault: false)
+    await waitUntil(timeout: 2.0) { center.residentModelID == "picked-model-B" }
+    XCTAssertEqual(committed, "picked-model-B")
+    XCTAssertEqual(center.residentModelID, "picked-model-B",
+                   "confirming the toolbar pick must execute the override serve path")
+  }
+
+  func test_toolbar_model_pick_with_no_resolvable_model_stays_silent_and_does_not_load() {
+    let center = ModelLoadCenter()
+    let coord = ProfileSwapCoordinator(
+      center: center,
+      modelForProfile: { _ in nil },
+      serveModel: { modelID, _ in center.reconcileEngineResident(modelID) }
+    )
+    let option = ToolbarModelOptions.Option(
+      slug: "picked-model",
+      displayName: "picked-model",
+      source: nil,
+      isCurrent: false,
+      isProfileDefault: false
+    )
+    var committed: String?
+
+    ContentToolbar.performModelSelection(
+      option,
+      selectedModelID: nil,
+      profileDefaultModel: nil,
+      activeProfileID: "chat",
+      swapCoordinator: coord,
+      commitModel: { committed = $0; return true },
+      onUseProfileDefault: {}
+    )
+
+    XCTAssertEqual(committed, "picked-model",
+                   "with no effective current model, the intentional silent branch still just pins the pick")
+    XCTAssertNil(coord.pending)
+    XCTAssertNil(center.residentModelID,
+                 "no-resolvable-model picks must not serve until the normal start gate runs")
+  }
+
+  // MARK: - #527 send-time explicit pin vs resident engine mismatch
+
+  func test_send_gate_blocks_explicit_pin_that_differs_from_resident_model() throws {
+    let decision = ChatScaffoldView.sendGateDecision(
+      engineStatus: .running(EngineSessionSnapshot(
+        port: try XCTUnwrap(EnginePort(exactly: 48484)),
+        profileID: "chat",
+        servedModelID: "resident-model")),
+      selectedModelID: "pinned-model",
+      profileDefaultModel: "profile-default",
+      residentModelID: "resident-model"
+    )
+
+    XCTAssertEqual(
+      decision,
+      .pinnedModelMismatch(pinnedModelID: "pinned-model",
+                           residentModelID: "resident-model"),
+      "an explicit Chat.modelID pin must not send into an engine serving a different model")
+  }
+
+  func test_send_gate_allows_explicit_pin_when_it_matches_resident_model() throws {
+    let decision = ChatScaffoldView.sendGateDecision(
+      engineStatus: .running(EngineSessionSnapshot(
+        port: try XCTUnwrap(EnginePort(exactly: 48484)),
+        profileID: "chat",
+        servedModelID: "pinned-model")),
+      selectedModelID: "pinned-model",
+      profileDefaultModel: "profile-default",
+      residentModelID: "pinned-model"
+    )
+
+    XCTAssertEqual(decision, .ready(modelID: "pinned-model"))
+  }
+
+  func test_send_gate_blocks_unpinned_profile_default_until_resident_matches() throws {
+    let decision = ChatScaffoldView.sendGateDecision(
+      engineStatus: .running(EngineSessionSnapshot(
+        port: try XCTUnwrap(EnginePort(exactly: 48484)),
+        profileID: "chat",
+        servedModelID: "resident-model")),
+      selectedModelID: nil,
+      profileDefaultModel: "profile-default",
+      residentModelID: "resident-model"
+    )
+
+    XCTAssertEqual(
+      decision,
+      .noResolvableModel,
+      "the #527 prompt stays scoped to explicit per-chat pins, but #528 still blocks profile-default sends until the resident engine matches")
+  }
+
+
+  // MARK: - #516 review F6: status edge must not fire before residency reconcile
+
+  /// The full ordering the review names: arm with target A; the `.running`
+  /// status flip arrives while the chat pin still says A but residency is
+  /// unreconciled (the engine may be serving B) → HOLD. Then the reconcile
+  /// lands: residency B (relaunch booted a different model) → DISARM;
+  /// residency A → FIRE. `resolutionProbe` is the status-edge gate and
+  /// `PendingAutoSend.verdict` the decision — composed here exactly as
+  /// `resolutionEdge` composes them.
+  func test_516_status_edge_holds_until_residency_reconciles_then_settles() {
+    let chatID = UUID()
+    let pending = PendingAutoSend.arm(
+      chatID: chatID, targetModelID: "org/A", messageText: "hello")!
+
+    // Status edge: pin resolves to A, but residency not reconciled yet —
+    // the probe must report nothing resolved, so the verdict holds.
+    let preReconcile = ChatScaffoldView.resolutionProbe(
+      resolvedModelID: "org/A", residentModelID: nil, requiresResidency: true)
+    XCTAssertNil(preReconcile, "status edge must treat an unreconciled engine as unresolved")
+    XCTAssertEqual(pending.verdict(chatID: chatID, resolvedModelID: preReconcile, isSending: false),
+                   .hold)
+
+    // Reconcile lands on B (relaunch booted the active-profile marker's
+    // model): the selection authority re-seeds to B → stale pending drops.
+    XCTAssertEqual(pending.verdict(chatID: chatID, resolvedModelID: "org/B", isSending: false),
+                   .disarm)
+
+    // Reconcile lands on A: the residency edge passes A through (no
+    // residency pre-check on post-reconcile edges) → the pending fires.
+    let postReconcile = ChatScaffoldView.resolutionProbe(
+      resolvedModelID: "org/A", residentModelID: "org/A", requiresResidency: false)
+    XCTAssertEqual(pending.verdict(chatID: chatID, resolvedModelID: postReconcile, isSending: false),
+                   .fire)
+  }
+
+  // MARK: - #516 review F8: bounded reconcile failure must settle, never strand
+
+  /// The liveness contract: with a pending send armed, a reconcile that
+  /// exhausts its bounded retries earns ONE backed-off retry round, and the
+  /// final failure falls back to the residency-free resolution edge — the
+  /// pending settles (fires or disarms via the pre-F6 evidence) instead of
+  /// holding forever against equal `.running` polls that never re-run the
+  /// reconcile task. Without a pending there is nothing to settle.
+  func test_516_reconcile_failure_settles_an_armed_pending_send() {
+    XCTAssertEqual(
+      ChatScaffoldView.reconcileFailureStep(hasPendingAutoSend: true, isRetryPass: false),
+      .retry, "first bounded failure while armed → one backed-off retry round")
+    XCTAssertEqual(
+      ChatScaffoldView.reconcileFailureStep(hasPendingAutoSend: true, isRetryPass: true),
+      .fallbackEdge, "final failure while armed → residency-free edge so the pending settles")
+    XCTAssertEqual(
+      ChatScaffoldView.reconcileFailureStep(hasPendingAutoSend: false, isRetryPass: false),
+      .none, "no pending → nothing to settle (NSLog-only behavior stands)")
+    XCTAssertEqual(
+      ChatScaffoldView.reconcileFailureStep(hasPendingAutoSend: false, isRetryPass: true),
+      .none)
+
+    // The final fallback no longer invents a send-safe model from the chat's
+    // selection authority. With no resident evidence after bounded reconcile
+    // failure, the pending flow explicitly terminates instead of silently
+    // holding forever.
+    let chatID = UUID()
+    var state = PendingSendState()
+    state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
+    XCTAssertNotNil(state.pending)
+    XCTAssertEqual(
+      ChatScaffoldView.pendingSettlementResolution(
+        currentTargetModelID: "org/A", pendingTargetModelID: "org/A", residentModelID: nil),
+      .hold)
+    state.terminate(chatID: chatID)
+    XCTAssertNil(state.pending)
+    XCTAssertNil(state.autoSubmit)
+  }
+
+  func test_528_pending_settlement_disarms_on_different_resident_even_when_send_model_is_nil() {
+    let chatID = UUID()
+    var state = PendingSendState()
+    state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
+
+    let sendSafe = ChatScaffoldView.resolutionProbe(
+      resolvedModelID: nil, residentModelID: "org/B", requiresResidency: false)
+    XCTAssertNil(sendSafe, "production currentModelID is nil when target A and resident B differ")
+
+    XCTAssertEqual(
+      ChatScaffoldView.pendingSettlementResolution(
+        currentTargetModelID: "org/A", pendingTargetModelID: "org/A", residentModelID: "org/B"),
+      .model("org/B"),
+      "resident B is stale-context evidence for the pending send")
+
+    state.settle(chatID: chatID, resolvedModelID: "org/B", isSending: false)
+    XCTAssertNil(state.pending, "different resident must disarm instead of holding forever")
+    XCTAssertNil(state.autoSubmit)
+  }
+
+  func test_528_pending_settlement_disarms_when_current_target_changes_from_pending_target() {
+    let chatID = UUID()
+    var state = PendingSendState()
+    state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
+
+    switch ChatScaffoldView.pendingSettlementResolution(
+      currentTargetModelID: "org/B",
+      pendingTargetModelID: "org/A",
+      residentModelID: "org/A"
+    ) {
+    case .disarm:
+      state.disarm()
+    case .model(let modelID):
+      state.settle(chatID: chatID, resolvedModelID: modelID, isSending: false)
+    case .hold:
+      state.settle(chatID: chatID, resolvedModelID: nil, isSending: false)
+    }
+
+    XCTAssertNil(state.autoSubmit, "a resident old target must not auto-fire after the chat target changes")
+    XCTAssertNil(state.pending, "changed current target makes the armed pending send stale")
+  }
+
+  func test_528_pending_settlement_fires_only_on_exact_target_resident_match() {
+    let chatID = UUID()
+    var state = PendingSendState()
+    state.arm(chatID: chatID, targetModelID: "org/A", messageText: "hi")
+
+    XCTAssertEqual(
+      ChatScaffoldView.pendingSettlementResolution(
+        currentTargetModelID: "org/A", pendingTargetModelID: "org/A", residentModelID: "org/A"),
+      .model("org/A"))
+    state.settle(chatID: chatID, resolvedModelID: "org/A", isSending: false)
+
+    XCTAssertNil(state.pending)
+    XCTAssertEqual(state.autoSubmit, ComposerAutoSubmit(tick: 1, expectedText: "hi"))
+  }
+
+  func test_528_engine_sync_defers_until_all_chats_are_idle() {
+    let chatB = UUID()
+    XCTAssertTrue(
+      ChatScaffoldView.shouldDeferEngineSyncForStreams([chatB]),
+      "automatic model sync must not restart the single engine while another chat streams")
+    XCTAssertFalse(
+      ChatScaffoldView.shouldDeferEngineSyncForStreams([]),
+      "once the app-wide stream set is idle the deferred sync may run")
+  }
+
+  func test_528_explicit_prompt_load_uses_same_stream_guard_as_automatic_sync() {
+    let chatB = UUID()
+    XCTAssertEqual(
+      ChatScaffoldView.engineMutationDecision(inFlightChatIDs: [chatB]),
+      .deferUntilIdle,
+      "the prompt Load action and automatic sync must both avoid restarting the single engine while another chat streams")
+    XCTAssertEqual(
+      ChatScaffoldView.engineMutationDecision(inFlightChatIDs: []),
+      .runNow)
+  }
+
+  func test_528_pinned_mismatch_relaunch_uses_stream_guard_before_restart() {
+    let chatB = UUID()
+    XCTAssertEqual(
+      ChatScaffoldView.pinnedMismatchRelaunchDecision(inFlightChatIDs: [chatB]),
+      .deferUntilIdle,
+      "relaunching a pinned mismatch must not restart the single engine while another chat streams")
+    XCTAssertEqual(
+      ChatScaffoldView.pinnedMismatchRelaunchDecision(inFlightChatIDs: []),
+      .runNow)
+  }
+
+  func test_528_deferred_explicit_load_drops_when_current_target_changed_before_idle() {
+    let chatID = UUID()
+    let queued = ChatScaffoldView.DeferredEngineMutation.explicitLoad(
+      chatID: chatID,
+      targetModelID: "org/A",
+      generation: 1)
+
+    XCTAssertEqual(
+      ChatScaffoldView.deferredEngineMutationResolution(
+        queued: queued,
+        currentChatID: chatID,
+        currentTargetModelID: "org/C"),
+      .drop,
+      "a queued Load for A must not restart the engine after the chat target moves to C")
+  }
+
+  func test_528_deferred_explicit_load_is_latest_wins_for_same_chat() {
+    let chatID = UUID()
+    let queuedA = ChatScaffoldView.DeferredEngineMutation.explicitLoad(
+      chatID: chatID,
+      targetModelID: "org/A",
+      generation: 1)
+    let queuedC = ChatScaffoldView.DeferredEngineMutation.explicitLoad(
+      chatID: chatID,
+      targetModelID: "org/C",
+      generation: 2)
+
+    XCTAssertEqual(
+      ChatScaffoldView.replacingDeferredEngineMutation(current: queuedA, replacement: queuedC),
+      queuedC,
+      "pressing Load for C while A is queued must replace A instead of being ignored")
+    XCTAssertEqual(
+      ChatScaffoldView.deferredEngineMutationResolution(
+        queued: queuedC,
+        currentChatID: chatID,
+        currentTargetModelID: "org/C"),
+      .run(modelID: "org/C"))
+  }
+
+  // MARK: - #516 review F9: sheet dismissal keys on the probe, not raw resolution
+
+  /// On a residency-required edge that evaluates to hold, the probe is nil —
+  /// and the sheet dismissal is keyed on that SAME probe result, so the gate
+  /// stays up (no false success signal) while the fire is held. Once
+  /// residency reconciles, the probe passes resolution through and the
+  /// sheet may dismiss with the verdict settled on the same evidence.
+  func test_516_sheet_stays_up_while_a_residency_required_edge_holds() {
+    XCTAssertNil(
+      ChatScaffoldView.resolutionProbe(
+        resolvedModelID: "org/A", residentModelID: nil, requiresResidency: true),
+      "held edge → probe nil → the probe-keyed dismissal leaves the sheet up")
+    XCTAssertEqual(
+      ChatScaffoldView.resolutionProbe(
+        resolvedModelID: "org/A", residentModelID: "org/A", requiresResidency: true),
+      "org/A",
+      "reconciled → probe passes resolution → dismissal and verdict settle on the same evidence")
+  }
+
+  private func waitUntil(
+    timeout: TimeInterval,
+    condition: () -> Bool
+  ) async {
+    let deadline = Date().addingTimeInterval(timeout)
+    while !condition(), Date() < deadline {
+      try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+  }
+
+  private func withTempProfilesDir(_ body: (URL) throws -> Void) throws {
+    let dir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("rt-chat-scaffold-profile-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try body(dir)
+  }
+
+  private func writeProfile(into dir: URL,
+                            id: String,
+                            temperature: Double,
+                            topP: Double,
+                            maxTokens: Int) throws {
+    let body = """
+    id = "\(id)"
+    name = "Chat"
+    model = "model.gguf"
+    inferlet = "chat-apc"
+    system_prompt = "Old prompt"
+
+    [sampling]
+    temperature = \(temperature)
+    top_p = \(topP)
+    max_tokens = \(maxTokens)
+    """
+    try body.write(to: dir.appendingPathComponent("\(id).toml"),
+                   atomically: true,
+                   encoding: .utf8)
   }
 }

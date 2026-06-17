@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rational — Local models, with thinking profiles</title>
+<link rel="icon" type="image/png" sizes="256x256" href="assets/pie-icon.png">
+<link rel="shortcut icon" href="favicon.ico">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png">
+<style>
+  /* ---- palette: mirrors the Pie site (Vendor/pie/website/src/css/theme.css) ---- */
+  :root{
+    --accent:#c96442; --accent-dark:#8f442d; --accent-lift:#d97757;
+    --accent-rgb:201,100,66;
+    --bg:#ffffff; --cream:#fbf8ec; --sunken:#f7f2e1; --border:#ebe4ce; --border-strong:#d4c9ad;
+    --ink:#2c2722; --ink-muted:#8a7c6a; --ink-soft:#6b5e4d;
+    --on-accent:#ffffff;
+    /* mock app window */
+    --win-chrome:#f4f1e8; --win-bg:#ffffff; --win-line:#e7e1cf;
+    --bubble-user:var(--accent); --bubble-assistant:#efece2; --think-bg:#f1ede0;
+    /* tree-search beam states (mirror TreeSearchSection glyph tints) */
+    --kept:#5a6b25; --pruned:#a89b85; --star:#c8901f;
+    /* type */
+    --serif:'IBM Plex Serif','Charter','Iowan Old Style','Palatino',Georgia,serif;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Arial,system-ui,sans-serif;
+    --mono:'JetBrains Mono','SFMono-Regular','Menlo','Consolas','Liberation Mono',monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--cream);color:var(--ink);font-family:var(--sans);
+    -webkit-font-smoothing:antialiased;line-height:1.55}
+  a{color:var(--accent-dark);text-underline-offset:2px}
+  a:hover{color:var(--accent)}
+  .wrap{max-width:920px;margin:0 auto;padding:40px 22px 64px}
+
+  /* ---------- top nav ---------- */
+  .top-nav{display:flex;justify-content:flex-end;align-items:center;margin:0 0 8px}
+  .nav-github{display:inline-flex;align-items:center;gap:7px;color:var(--ink-soft);
+    font-size:13px;font-weight:600;text-decoration:none;padding:6px 0}
+  .nav-github:hover{color:var(--accent-dark);text-decoration:underline}
+  .nav-github:focus-visible{outline:2px solid var(--accent);outline-offset:4px;border-radius:7px}
+
+  /* ---------- hero ---------- */
+  header.hero{text-align:center;padding:14px 0 24px}
+  header.hero img.icon{width:88px;height:88px;
+    filter:drop-shadow(0 6px 26px rgba(var(--accent-rgb),.22));}
+  header.hero h1{font-family:var(--serif);font-weight:600;font-size:40px;letter-spacing:-.015em;
+    margin:16px 0 6px}
+  header.hero p.tag{font-family:var(--serif);font-size:21px;color:var(--ink);margin:0 0 6px}
+  header.hero p.sub{font-size:15px;color:var(--ink-muted);max-width:58ch;margin:6px auto 0}
+  header.hero p.sub b{color:var(--ink);font-weight:600}
+  header.hero p.meta{font-size:12.5px;color:var(--ink-muted);margin-top:14px;letter-spacing:.02em}
+  header.hero p.meta b{color:var(--accent-dark);font-weight:600}
+
+  /* ---------- download CTA ---------- */
+  .cta{margin:24px auto 0;display:flex;flex-direction:column;align-items:center;gap:9px}
+  .cta-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:center}
+  .btn-download{display:inline-flex;align-items:center;gap:8px;background:var(--accent);
+    color:var(--on-accent);font-weight:600;font-size:14.5px;padding:11px 20px;border-radius:11px;
+    text-decoration:none;box-shadow:0 4px 16px rgba(var(--accent-rgb),.28);
+    transition:background .15s ease,transform .08s ease}
+  .btn-download:hover{background:var(--accent-dark);color:var(--on-accent)}
+  .btn-download:active{transform:translateY(1px)}
+  .btn-download:focus-visible{outline:2px solid var(--accent-dark);outline-offset:3px}
+  .cta .ver{font-size:12.5px;color:var(--ink-muted);font-weight:600;font-variant-numeric:tabular-nums}
+  .cta .ver:empty{display:none}
+  .cta .all-releases{font-size:12.5px;color:var(--ink-muted);text-decoration:none}
+  .cta .all-releases:hover{color:var(--accent-dark);text-decoration:underline}
+
+  /* ---------- mock app window ---------- */
+  .stage{margin:96px auto 8px;max-width:680px}
+  .window{background:var(--win-bg);border:1px solid var(--border-strong);border-radius:14px;
+    overflow:hidden;box-shadow:0 18px 50px rgba(44,39,34,.14);position:relative}
+  .titlebar{display:flex;align-items:center;gap:8px;padding:9px 13px;background:var(--win-chrome);
+    border-bottom:1px solid var(--win-line)}
+  .lights{display:flex;gap:7px}
+  .lights i{width:11px;height:11px;border-radius:50%;display:block}
+  .lights .r{background:#ec6a5e}.lights .y{background:#f4bf4f}.lights .g{background:#61c554}
+  .titlebar .wtitle{flex:1;text-align:center;font-size:12.5px;color:var(--ink-muted);
+    font-weight:500;margin-right:46px}
+
+  /* toolbar with the real controls */
+  .toolbar{display:flex;align-items:center;gap:9px;padding:8px 12px;background:var(--bg);
+    border-bottom:1px solid var(--win-line);font-size:12.5px;position:relative;flex-wrap:wrap}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border:1px solid var(--border-strong);
+    border-radius:8px;background:var(--bg);color:var(--ink);cursor:default;white-space:nowrap;
+    transition:background .15s,border-color .15s}
+  .pill.active{border-color:var(--accent);background:rgba(var(--accent-rgb),.07)}
+  .pill .lab{color:var(--ink-muted)}
+  .pill svg{flex:none}
+  .chev{opacity:.6}
+
+  /* the profile dropdown menu (animated) */
+  .menu{position:absolute;top:38px;left:12px;min-width:190px;background:var(--bg);
+    border:1px solid var(--border-strong);border-radius:9px;box-shadow:0 10px 30px rgba(44,39,34,.18);
+    padding:5px;z-index:5;opacity:0;transform:translateY(-6px) scale(.98);pointer-events:none;
+    transition:opacity .14s ease,transform .14s ease}
+  .menu.show{opacity:1;transform:translateY(0) scale(1)}
+  .menu .mrow{display:flex;align-items:center;gap:8px;padding:6px 9px;border-radius:6px;font-size:12.5px}
+  .menu .mrow.sel{background:rgba(var(--accent-rgb),.12);color:var(--accent-dark);font-weight:600}
+  .menu .mrow .check{margin-left:auto;color:var(--accent);opacity:0}
+  .menu .mrow.sel .check{opacity:1}
+
+  /* transcript */
+  .transcript{min-height:400px;max-height:400px;overflow:hidden;padding:16px 16px 6px;
+    background:var(--win-bg);display:flex;flex-direction:column;gap:10px}
+  .row{display:flex;max-width:100%}
+  .row.user{justify-content:flex-end}
+  .row.assistant{justify-content:flex-start}
+  .bubble{max-width:80%;padding:8px 12px;border-radius:14px;font-size:13.5px;line-height:1.5;
+    white-space:pre-wrap;word-wrap:break-word}
+  .bubble.user{background:var(--bubble-user);color:var(--on-accent)}
+  .bubble.assistant{background:var(--bubble-assistant);color:var(--ink)}
+  .assistant-turn{display:flex;flex-direction:column;gap:6px;align-items:flex-start;max-width:80%}
+  .assistant-turn .bubble{max-width:100%}
+  .generation-performance{font-size:11.5px;color:var(--ink-muted);line-height:1.2}
+  .acol{display:flex;flex-direction:column;gap:6px;align-items:flex-start;max-width:88%;width:88%}
+
+  /* ---- Tree search disclosure — mirrors App/Views/Chat/TreeSearchSection.swift ---- */
+  .tsearch{width:100%}
+  .tshead{display:inline-flex;align-items:center;gap:5px;color:var(--ink-soft);font-size:11.5px;
+    font-weight:600}
+  .tshead svg{flex:none;color:var(--ink-muted)}
+  .tshead .bounds{color:var(--ink-muted);opacity:.75;font-weight:500}
+  .tshead .status{color:var(--ink-muted);font-weight:500}
+  .tshead .status.searching{animation:breathe 1.2s ease-in-out infinite}
+  @keyframes breathe{50%{opacity:.4}}
+  .tshead .tchev{opacity:.6;transition:transform .15s}
+  .tsearch.collapsed .tshead .tchev{transform:rotate(-90deg)}
+  .tsbody{margin-top:6px;background:var(--think-bg);border-radius:10px;padding:9px 11px;
+    display:flex;flex-direction:column;gap:6px;overflow:hidden;
+    transition:max-height .2s ease,opacity .2s ease;max-height:280px}
+  .tsearch.collapsed .tsbody{max-height:0;opacity:0;padding-top:0;padding-bottom:0;margin-top:0}
+  .tnode{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11.5px;
+    color:var(--ink-soft);opacity:0;transform:translateY(4px);
+    transition:opacity .25s ease,transform .25s ease}
+  .tnode.in{opacity:1;transform:none}
+  .tnode.child{margin-left:16px}
+  .tnode .beam{width:13px;text-align:center;font-weight:700;flex:none}
+  .tnode .beam.kept{color:var(--kept)}
+  .tnode .beam.pruned{color:var(--pruned)}
+  .tnode .beam.star{color:var(--star)}
+  .tnode.pruned .label{text-decoration:line-through;color:var(--pruned);opacity:.7}
+  .tnode .score{min-width:19px;height:17px;padding:0 5px;border-radius:9px;
+    background:rgba(var(--accent-rgb),.14);color:var(--accent-dark);font-size:10.5px;font-weight:700;
+    display:inline-flex;align-items:center;justify-content:center;flex:none;
+    opacity:0;transition:opacity .2s}
+  .tnode.scored .score{opacity:1}
+  .tnode .label{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  /* caret while streaming (normal = ink, burst = accent so the chunky pass reads as different) */
+  .caret::after,.burst::after{content:'';display:inline-block;width:7px;height:1.05em;vertical-align:-2px;
+    margin-left:1px;background:currentColor;opacity:.65;animation:blink 1s steps(1) infinite}
+  .burst::after{background:var(--accent);opacity:.8}
+  @keyframes blink{50%{opacity:0}}
+
+  /* finale: the winning leaf is selected LAST and lands with a brief pop + glow */
+  @keyframes winpop{ 0%{transform:scale(1)} 38%{transform:scale(1.06)} 100%{transform:scale(1)} }
+  @keyframes starglow{ 0%{text-shadow:none} 45%{text-shadow:0 0 10px rgba(200,144,31,.85)} 100%{text-shadow:none} }
+  .tnode.win-pop{animation:winpop .7s ease-out; transform-origin:left center}
+  .tnode.win-pop .beam{animation:starglow .85s ease-out}
+
+  /* composer */
+  .composer{display:flex;align-items:center;gap:9px;padding:11px 13px;border-top:1px solid var(--win-line);
+    background:var(--bg)}
+  .composer .field{flex:1;border:1px solid var(--border-strong);border-radius:9px;padding:7px 11px;
+    color:var(--ink-muted);font-size:13px;min-height:34px;display:flex;align-items:center}
+  .composer .field.typed{color:var(--ink)}
+  .composer .send{width:32px;height:32px;border-radius:8px;background:var(--accent);display:flex;
+    align-items:center;justify-content:center;flex:none}
+  .composer .send svg{display:block}
+
+  /* scene caption strip under the window */
+  .caption{margin:14px auto 0;max-width:680px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    min-height:30px}
+  .caption .ctext{font-size:13px;color:var(--ink-soft)}
+
+  /* scene dots — real, focusable navigation buttons (live OUTSIDE the aria-hidden mock) */
+  .dots{display:flex;gap:9px;justify-content:center;margin:18px 0 0}
+  .dots .dot{appearance:none;-webkit-appearance:none;border:none;margin:0;padding:0;cursor:pointer;
+    width:9px;height:9px;border-radius:999px;background:var(--border-strong);
+    transition:background .2s,width .2s}
+  .dots .dot:hover{background:var(--accent-lift)}
+  .dots .dot.on{background:var(--accent);width:22px}
+  .dots .dot:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+  .demo-note{margin:12px auto 0;max-width:560px;text-align:center;font-size:12px;color:var(--ink-muted)}
+
+  /* ---------- why ---------- */
+  .why{margin:120px auto 0;max-width:760px}
+  .why h2{font-family:var(--serif);font-size:25px;text-align:center;margin:0 0 8px;font-weight:600}
+  .why .lede{text-align:center;font-size:14px;color:var(--ink-muted);max-width:62ch;margin:0 auto 22px}
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+  .card{background:var(--bg);border:1px solid var(--border);border-radius:13px;padding:16px 17px}
+  .card .ct{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .card h3{font-size:15px;margin:0;font-weight:650}
+  .card p{font-size:13px;color:var(--ink-soft);margin:0}
+
+  /* ---------- footer ---------- */
+  footer{margin:96px auto 0;max-width:760px;text-align:center;font-size:12.5px;color:var(--ink-muted);
+    border-top:1px solid var(--border);padding-top:20px}
+  footer a{color:var(--ink-soft)}
+  footer .credit{margin-top:7px;font-size:11.5px}
+
+  /* ---------- JSON Think scene (mono answer bubble for the grammar-constrained pass) ---------- */
+  .bubble.json{font-family:var(--mono);font-size:12.5px;background:var(--win-bg);
+    border:1px solid var(--border-strong);color:var(--ink)}
+  .bubble.json .k{color:var(--accent-dark)}
+  .bubble.json .s{color:var(--kept)}
+  .bubble.json .n{color:var(--star)}
+
+  @media (max-width:680px){
+    .grid{grid-template-columns:1fr}
+    header.hero h1{font-size:32px}
+    header.hero p.tag{font-size:18px}
+    .top-nav{justify-content:center;margin-bottom:12px}
+  }
+  /* honor reduced motion: JS renders static frames; kill residual animation */
+  @media (prefers-reduced-motion:reduce){
+    .caret::after,.burst::after,.tshead .status.searching,.tnode.win-pop,.tnode.win-pop .beam{animation:none}
+    *{transition:none !important}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <nav class="top-nav" aria-label="Primary">
+    <a class="nav-github" href="https://github.com/shsym/RatioThink">GitHub</a>
+  </nav>
+
+  <header class="hero">
+    <img class="icon" src="assets/pie-icon.png" alt="Rational app icon">
+    <h1>Rational</h1>
+    <p class="tag">Local models, with thinking profiles.</p>
+    <p class="sub">A native macOS app that runs open-weight models entirely on your Mac.
+      <b>Switch how it thinks in one click.</b></p>
+    <p class="meta"><b>macOS 14+</b> · <b>Apple&nbsp;Silicon</b> · 100% on-device · powered by the bundled Pie engine</p>
+    <div class="cta">
+      <div class="cta-row">
+        <a class="btn-download" href="https://github.com/shsym/RatioThink/releases/latest/download/Rational-arm64.dmg">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 13.5h11"/></svg>
+          Download for macOS (Apple Silicon)
+        </a>
+        <span class="ver" id="dlVersion" aria-live="polite"></span>
+      </div>
+      <a class="all-releases" href="https://github.com/shsym/RatioThink/releases">All releases</a>
+    </div>
+  </header>
+
+  <!-- ===================== mock app window ===================== -->
+  <div class="stage">
+    <!-- The animated mock is decorative; aria-hidden is scoped to the window ONLY so the
+         interactive scene dots below stay reachable by keyboard / assistive tech. -->
+    <div class="window" id="win" aria-hidden="true">
+      <div class="titlebar">
+        <div class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+        <div class="wtitle">Rational</div>
+      </div>
+
+      <div class="toolbar">
+        <span class="pill active" id="profilePill">
+          <span class="lab">Profile:</span><span id="profileName">Tree of Thought</span>
+          <span class="chev">▾</span>
+        </span>
+
+        <div class="menu" id="profileMenu">
+          <div class="mrow" id="menuChat">
+            Chat<span class="check">✓</span>
+          </div>
+          <div class="mrow" id="menuJson">
+            JSON Think<span class="check">✓</span>
+          </div>
+          <div class="mrow" id="menuFast">
+            Repeat Boost<span class="check">✓</span>
+          </div>
+          <div class="mrow" id="menuTot">
+            Tree of Thought<span class="check">✓</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="transcript" id="transcript"></div>
+
+      <div class="composer">
+        <div class="field" id="composer">Message Rational…</div>
+        <div class="send"><svg width="15" height="15" viewBox="0 0 16 16" fill="#fff"><path d="M8 2.5 13 13 8 10.5 3 13z"/></svg></div>
+      </div>
+    </div>
+
+    <div class="caption" id="caption"></div>
+    <div class="dots" id="dots" role="group" aria-label="Choose a demo">
+      <button type="button" class="dot" data-scene="0" aria-label="Show the Tree of Thought demo"></button>
+      <button type="button" class="dot" data-scene="1" aria-label="Show the Repeat Boost demo"></button>
+      <button type="button" class="dot" data-scene="2" aria-label="Show the JSON Think demo"></button>
+    </div>
+    <p class="demo-note">A simplified illustration of how it works.</p>
+  </div>
+
+  <!-- ===================== why ===================== -->
+  <section class="why">
+    <h2>What you can't do in Ollama or LM Studio</h2>
+    <p class="lede">One real difference: thinking <strong>profiles</strong> — the same model, different
+       reasoning styles, each optimized for what you're doing.</p>
+    <div class="grid">
+      <div class="card">
+        <div class="ct"><h3>Tree of Thought</h3></div>
+        <p>Stuck on a knotty, many-option decision? Tree of Thought explores the possibilities and
+           surfaces the best one — and you watch it weigh the options in a live, foldable tree.</p>
+      </div>
+      <div class="card">
+        <div class="ct"><h3>Repeat Boost</h3></div>
+        <p>Generating code, JSON, or anything repetitive? Repeat Boost returns the same reply with
+           less waiting — a speculative drafter reuses the parts that repeat, so the text lands in bursts.</p>
+      </div>
+      <div class="card">
+        <div class="ct"><h3>JSON Think</h3></div>
+        <p>Need structured output? Ask a chat model for JSON and it tends to wrap or ramble.
+           JSON Think constrains decoding to a JSON grammar — so the answer is always parseable.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    Apache-2.0
+    <div class="credit">Powered by the <a href="https://github.com/pie-project/pie">Pie</a> inference engine.
+      Profiles are implemented as a Pie <a href="https://pie-project.org/docs/overview/what-is-pie">inferlet</a>.</div>
+  </footer>
+
+</div>
+
+<!-- Download CTA version label. Isolated from the scene-reel script below so a
+     fetch failure can never reach (or trip) the animation's error boundary. The
+     download button works regardless of this fetch; on any failure the version
+     placeholder simply stays empty. -->
+<script>
+(function(){
+  "use strict";
+  var label = document.getElementById('dlVersion');
+  if (!label || !window.fetch) return;
+  fetch('https://api.github.com/repos/shsym/RatioThink/releases/latest',
+        { headers: { 'Accept': 'application/vnd.github+json' } })
+    .then(function(res){ return res.ok ? res.json() : null; })
+    .then(function(data){ if (data && data.tag_name) label.textContent = data.tag_name; })
+    .catch(function(){ /* offline / blocked / rate-limited — leave the version empty */ });
+})();
+</script>
+
+<script>
+(function(){
+  "use strict";
+
+  // ======================================================================
+  // SCENARIO DATA — swap these for a real prompt/output from Rational later.
+  // Each scene's prompts, node texts, and scores live here as plain data so
+  // the animation code never has to change to update the example.
+  // ======================================================================
+  var SCENARIO = {
+    tot: {
+      profile: 'Tree of Thought',
+      bounds: '· 3×2, beam 2 ·',
+      prompt: 'Plan a surprise party for a close friend.',
+      // Breadth 3 at the root; the beam keeps the top 2, and level 2 keeps
+      // the global top-2 leaf frontier. The score-7 cookout is shown as a
+      // provisional check, then demoted when the later score-8 child arrives.
+      branches: [
+        { t: 'Start with the guest list and theme', s: 8, beam: 'kept', children: [
+            { t: 'Evening garden theme, ~12 friends', s: 9, beam: 'star' },
+            { t: 'Backyard cookout, ~15 friends',     s: 7, beam: 'pruned', provisionalBeam: 'kept' } ] },
+        { t: 'Pick a date everyone can make',        s: 7, beam: 'kept', children: [
+            { t: 'A free Saturday evening', s: 8, beam: 'kept'   },
+            { t: 'A weeknight after work',  s: 5, beam: 'pruned' } ] },
+        { t: 'Book a venue first, invite later',     s: 4, beam: 'pruned', children: [] }
+      ],
+      nodeCount: 7,
+      answer: 'Go with an evening garden theme for ~12 on a free Saturday — lock the guest list and the date first, then venue and food fall into place.'
+    },
+    fast: {
+      // A prompt whose output repeats by construction — every line replays the
+      // same opening phrase. That repetition is exactly what the n-gram drafter
+      // accepts in bulk, so it is the honest showcase for Repeat Boost.
+      prompt: 'Write a poem where every line begins with "Quiet falling snow".',
+      answer: 'Quiet falling snow blankets the road, Quiet falling snow softens the light, Quiet falling snow hushes the town, Quiet falling snow drifts into dawn.',
+      bursts: [3, 3]   // the repeated 3-word opening is accepted in one burst, then the line's own words
+    },
+    json: {
+      // JSON Think contrasts the SAME extraction prompt two ways: a normal Chat
+      // reply that returns CORRECT JSON but buried in reasoning prose (you can't
+      // json.loads the whole reply) vs JSON-constrained decoding that returns a
+      // bare parseable object. `chatAnswer` keeps newlines (the bubble is
+      // white-space:pre-wrap); `answer` carries the .k/.s/.n highlight spans.
+      profile: 'JSON Think',
+      prompt: 'Extract the person\'s name, age, and city from: "Maya, 31, lives in Lisbon." Return JSON, and explain your reasoning.',
+      chatAnswer: 'Sure! Breaking it down — the name is Maya, the age is 31, and the city is Lisbon. As JSON:\n{\n  "name": "Maya",\n  "age": 31,\n  "city": "Lisbon"\n}\nThat\'s the three fields as key–value pairs.',
+      answer: '{<span class="k">"name"</span>: <span class="s">"Maya"</span>, <span class="k">"age"</span>: <span class="n">31</span>, <span class="k">"city"</span>: <span class="s">"Lisbon"</span>}'
+    }
+  };
+
+  var AUTO_ADVANCE_MS = 1100;   // pause between scenes; a manual dot-click resumes the reel from there
+
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  var transcript = document.getElementById('transcript');
+  var composer   = document.getElementById('composer');
+  var menu       = document.getElementById('profileMenu');
+  var profileName= document.getElementById('profileName');
+  var menuTot    = document.getElementById('menuTot');
+  var menuFast   = document.getElementById('menuFast');
+  var menuChat   = document.getElementById('menuChat');
+  var menuJson   = document.getElementById('menuJson');
+  var captionEl  = document.getElementById('caption');
+  var dotEls     = Array.prototype.slice.call(document.querySelectorAll('#dots .dot'));
+
+  // ---- cooperative cancellation: each scene captures a generation token; a dot
+  // click bumps `gen`, so the in-flight scene's next sleep rejects CANCELLED and
+  // stops cleanly. Only ONE scene ever writes the transcript at a time. ----
+  var gen = 0;
+  var advanceTimer = null;
+  var CANCELLED = { cancelled: true };
+
+  function sleep(ms, myGen){
+    return new Promise(function(resolve, reject){
+      setTimeout(function(){
+        if (myGen !== undefined && myGen !== gen) reject(CANCELLED);
+        else resolve();
+      }, reduce ? 0 : ms);
+    });
+  }
+
+  function clear(){ transcript.innerHTML=''; composer.textContent='Message Rational…';
+    composer.classList.remove('typed'); menu.classList.remove('show'); }
+  function el(html){ var d=document.createElement('div'); d.innerHTML=html.trim(); return d.firstChild; }
+  function resetComposer(){ composer.textContent='Message Rational…'; composer.classList.remove('typed'); }
+
+  function setCaption(text){
+    captionEl.innerHTML = '<span class="ctext">'+text+'</span>';
+  }
+  function setActiveDot(i){
+    dotEls.forEach(function(d, k){
+      d.classList.toggle('on', k===i);
+      if (k===i) d.setAttribute('aria-current', 'true'); else d.removeAttribute('aria-current');
+    });
+  }
+  function setProfile(name, which){
+    profileName.textContent = name;
+    menuTot.classList.toggle('sel', which==='tot');
+    menuFast.classList.toggle('sel', which==='fast');
+    menuChat.classList.toggle('sel', which==='chat');
+    menuJson.classList.toggle('sel', which==='json');
+  }
+
+  function userRow(text){
+    var r = el('<div class="row user"><div class="bubble user"></div></div>');
+    r.querySelector('.bubble').textContent = text; transcript.appendChild(r); return r;
+  }
+  function addGenerationPerformance(row, text){
+    row.querySelector('.assistant-turn').appendChild(
+      el('<div class="generation-performance" data-accessibility-id="message.generationPerformance">'+text+'</div>')
+    );
+  }
+  async function typeComposer(text, myGen){
+    composer.classList.add('typed'); composer.textContent='';
+    if (reduce){ composer.textContent=text; return; }
+    for (var i=0;i<text.length;i++){ composer.textContent+=text[i]; await sleep(22, myGen); }
+    await sleep(240, myGen);
+  }
+  function words(s){ return s.split(' '); }
+  // normal pass: one token (word) at a time
+  async function streamWords(node, text, per, myGen){
+    node.classList.add('caret');
+    var w = words(text);
+    for (var i=0;i<w.length;i++){ node.textContent += (i?' ':'') + w[i]; await sleep(per, myGen); }
+    node.classList.remove('caret');
+  }
+  // fast pass: variable multi-token bursts (3,2,4… land at once) = speculative acceptance
+  async function streamBursts(node, text, sizes, per, myGen){
+    node.classList.add('burst');
+    var w = words(text), i=0, b=0;
+    while (i < w.length){
+      var n = sizes[b % sizes.length];
+      node.textContent += (i?' ':'') + w.slice(i, i+n).join(' ');
+      i += n; b++;
+      await sleep(per, myGen);
+    }
+    node.classList.remove('burst');
+  }
+
+  // ---- tree-search node helpers (mirror ToTNodeRow beam glyphs + score capsule) ----
+  function beamChar(b){ return b==='star' ? '★' : b==='kept' ? '✓' : b==='pruned' ? '✕' : '◌'; }
+  function nodeHTML(cfg, child){
+    return '<div class="tnode'+(child?' child':'')+'">'+
+      '<span class="beam pending">◌</span>'+
+      '<span class="score">'+cfg.s+'</span>'+
+      '<span class="label">'+cfg.t+'</span></div>';
+  }
+  function addNode(parent, cfg, child){
+    var n = el(nodeHTML(cfg, child)); parent.appendChild(n); return n;
+  }
+  // Insert a child row directly after `anchor` (the parent row, or the previous
+  // sibling) so children render nested under their own branch.
+  function addChildAfter(anchor, cfg){
+    var n = el(nodeHTML(cfg, true)); anchor.insertAdjacentElement('afterend', n); return n;
+  }
+  function setBeam(node, beam){
+    var b = node.querySelector('.beam');
+    b.className = 'beam '+beam; b.textContent = beamChar(beam);
+    node.classList.toggle('pruned', beam==='pruned');
+  }
+
+  // ============== Scene 0 (LEAD): Tree of Thought — shipped one-click profile ==============
+  async function sceneTreeOfThought(myGen){
+    var d = SCENARIO.tot;
+    setProfile(d.profile, 'tot');
+    setCaption('Stuck on a many-option decision? Tree of Thought explores them and picks the best.');
+    await sleep(800, myGen);
+    await typeComposer(d.prompt, myGen);
+    userRow(d.prompt); resetComposer();
+    await sleep(300, myGen);
+
+    var col = el(
+      '<div class="row assistant"><div class="acol">'+
+        '<div class="tsearch" id="ts">'+
+          '<div class="tshead">Tree search '+
+            '<span class="bounds">'+d.bounds+'</span> '+
+            '<span class="status searching" id="tstatus">searching…</span> '+
+            '<span class="tchev">▾</span></div>'+
+          '<div class="tsbody" id="tsbody"></div>'+
+        '</div>'+
+      '</div></div>');
+    transcript.appendChild(col);
+    var tsbody = col.querySelector('#tsbody');
+
+    // root level — the three branches appear, score, then the beam keeps the top 2
+    var n1 = d.branches.map(function(b){ return addNode(tsbody, b, false); });
+    for (var i=0;i<n1.length;i++){ n1[i].classList.add('in'); await sleep(260, myGen); }
+    await sleep(300, myGen);
+    for (var j=0;j<n1.length;j++){ n1[j].classList.add('scored'); await sleep(180, myGen); }
+    await sleep(380, myGen);
+    for (var k=0;k<n1.length;k++){ setBeam(n1[k], d.branches[k].beam); await sleep(150, myGen); }
+    await sleep(560, myGen);
+
+    // EVERY kept branch explores its own children; the next frontier is global
+    // across the level, so a checked child can be demoted when a later child
+    // enters the top 2.
+    // The eventual winner is held as 'kept' here and only STARRED at the finale.
+    var winner = null, explored = 0, provisionalLoser = null;
+    for (var bi=0; bi<d.branches.length; bi++){
+      var br = d.branches[bi];
+      if (br.beam === 'pruned' || !br.children.length) continue;
+      if (explored > 0) await sleep(480, myGen);   // breathe BETWEEN branch expansions only
+      explored++;
+      var anchor = n1[bi];
+      var kids = br.children.map(function(c){ var node = addChildAfter(anchor, c); anchor = node; return node; });
+      for (var a=0;a<kids.length;a++){ kids[a].classList.add('in'); await sleep(240, myGen); }
+      await sleep(220, myGen);
+      for (var s=0;s<kids.length;s++){ kids[s].classList.add('scored'); await sleep(170, myGen); }
+      await sleep(300, myGen);
+      for (var c2=0;c2<kids.length;c2++){
+        var childCfg = br.children[c2];
+        var cb = childCfg.beam;
+        if (childCfg.provisionalBeam){
+          setBeam(kids[c2], childCfg.provisionalBeam);
+          provisionalLoser = kids[c2];
+        } else if (cb === 'star'){
+          winner = kids[c2]; setBeam(kids[c2], 'kept'); // hold; the star lands last
+        } else if (cb === 'kept'){
+          if (provisionalLoser){
+            setBeam(provisionalLoser, 'pruned');
+            await sleep(130, myGen);
+            provisionalLoser = null;
+          }
+          setBeam(kids[c2], 'kept');
+        } else {
+          setBeam(kids[c2], cb);
+        }
+        await sleep(150, myGen);
+      }
+    }
+
+    // FINALE — select the best leaf right after the last score lands; just a tiny beat, no dead wait.
+    await sleep(260, myGen);
+    if (winner){ setBeam(winner, 'star'); winner.classList.add('win-pop'); }
+    var tstat = document.getElementById('tstatus');
+    tstat.classList.remove('searching'); tstat.textContent = d.nodeCount + ' nodes';
+    await sleep(1700, myGen);
+
+    // chosen answer arrives; the tree search folds away
+    var ans = el('<div class="bubble assistant"></div>');
+    col.querySelector('.acol').appendChild(ans);
+    document.getElementById('ts').classList.add('collapsed');
+    await streamWords(ans, d.answer, 30, myGen);
+    await sleep(2200, myGen);
+  }
+
+  // ============== Scene 1: Repeat Boost — speculative decoding, same prompt twice ==============
+  async function sceneFastThink(myGen){
+    var d = SCENARIO.fast;
+    // First pass: the normal Chat profile, token by token.
+    setProfile('Chat', 'chat');
+    setCaption('The everyday Chat profile, answering at its normal pace.');
+    await sleep(650, myGen);
+    await typeComposer(d.prompt, myGen);
+    userRow(d.prompt); resetComposer();
+    await sleep(260, myGen);
+    var a1 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
+    transcript.appendChild(a1);
+    await streamWords(a1.querySelector('.bubble'), d.answer, 62, myGen); // slow, even cadence
+    addGenerationPerformance(a1, '19 tok/s');
+    await sleep(900, myGen);
+
+    // Switch profiles: open the menu, pick Repeat Boost.
+    setCaption('Switch to Repeat Boost — same model, far less waiting.');
+    menu.classList.add('show'); await sleep(680, myGen);
+    setProfile('Repeat Boost', 'fast'); await sleep(520, myGen);
+    menu.classList.remove('show');
+    await sleep(360, myGen);
+
+    // Second pass: the SAME prompt + SAME answer, now in chunky multi-token bursts.
+    userRow(d.prompt);
+    await sleep(220, myGen);
+    var a2 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
+    transcript.appendChild(a2);
+    setCaption('Same answer — the repeated opening lands in quick bursts.');
+    await streamBursts(a2.querySelector('.bubble'), d.answer, d.bursts, 150, myGen); // chunky + quicker
+    addGenerationPerformance(a2, '25 tok/s');
+    await sleep(2200, myGen);
+  }
+
+  // ---- static frames (reduced motion, and the error fallback) ----
+  function buildTreeFinal(){
+    var d = SCENARIO.tot;
+    var rows = '';
+    function row(c, child){
+      return '<div class="tnode'+(child?' child':'')+(c.beam==='pruned'?' pruned':'')+' scored in">'+
+        '<span class="beam '+c.beam+'">'+beamChar(c.beam)+'</span>'+
+        '<span class="score">'+c.s+'</span><span class="label">'+c.t+'</span></div>';
+    }
+    d.branches.forEach(function(b){          // each branch, with its expanded children nested beneath
+      rows += row(b, false);
+      b.children.forEach(function(c){ rows += row(c, true); });
+    });
+    return '<div class="tsearch"><div class="tshead">Tree search '+
+      '<span class="bounds">'+d.bounds+'</span> <span class="status">'+d.nodeCount+' nodes</span> '+
+      '<span class="tchev">▾</span></div><div class="tsbody">'+rows+'</div></div>';
+  }
+  function stillTot(){
+    clear(); setProfile(SCENARIO.tot.profile, 'tot');
+    userRow(SCENARIO.tot.prompt);
+    var col = el('<div class="row assistant"><div class="acol">'+buildTreeFinal()+
+      '<div class="bubble assistant">'+SCENARIO.tot.answer+'</div></div></div>');
+    transcript.appendChild(col);
+  }
+  function stillFast(){
+    clear(); setProfile('Repeat Boost', 'fast');
+    userRow(SCENARIO.fast.prompt);
+    var a = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
+    a.querySelector('.bubble').textContent = SCENARIO.fast.answer;
+    addGenerationPerformance(a, '25 tok/s');
+    transcript.appendChild(a);
+  }
+
+  // ============== Scene 2: JSON Think — free-form chat vs grammar-constrained JSON ==============
+  // Types pre-highlighted JSON one tag/text fragment at a time so the .k/.s/.n spans
+  // stay intact while the answer streams in. `per` is the per-fragment delay —
+  // each span/text fragment is roughly token-sized, so passing the same value the
+  // chat pass uses for streamWords makes both passes read at one generation speed.
+  async function streamJsonInto(node, htmlStr, per, myGen){
+    node.classList.add('caret');
+    var frags = htmlStr.match(/<span[^>]*>.*?<\/span>|[^<]+/g) || [htmlStr];
+    var acc = '';
+    for (var i=0;i<frags.length;i++){ acc += frags[i]; node.innerHTML = acc; await sleep(per, myGen); }
+    node.classList.remove('caret');
+  }
+  async function sceneJsonThink(myGen){
+    var d = SCENARIO.json;
+    // Same model, ~same token rate: lock both passes to one per-token cadence so
+    // the constrained JSON streams as fast as the chat prose (not a slow crawl).
+    var TOK_MS = 40;
+    // First pass: the everyday Chat profile — a free-form reply you can't reliably parse.
+    setProfile('Chat', 'chat');
+    setCaption('The everyday Chat profile answers correctly — but buries the JSON in reasoning prose you\'d have to scrape out.');
+    await sleep(650, myGen);
+    await typeComposer(d.prompt, myGen);
+    userRow(d.prompt); resetComposer();
+    await sleep(260, myGen);
+    var a1 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
+    transcript.appendChild(a1);
+    await streamWords(a1.querySelector('.bubble'), d.chatAnswer, TOK_MS, myGen);
+    await sleep(900, myGen);
+
+    // Switch profiles: open the menu, pick JSON Think.
+    setCaption('Switch to JSON Think — same model, decoding constrained to a JSON grammar.');
+    menu.classList.add('show'); await sleep(680, myGen);
+    setProfile('JSON Think', 'json'); await sleep(520, myGen);
+    menu.classList.remove('show');
+    await sleep(360, myGen);
+
+    // Second pass: the SAME prompt re-asked, now a grammar-constrained answer that always parses.
+    userRow(d.prompt);
+    await sleep(220, myGen);
+    var a2 = el('<div class="row assistant"><div class="acol"></div></div>');
+    transcript.appendChild(a2);
+    var ans = el('<div class="bubble json"></div>');
+    a2.querySelector('.acol').appendChild(ans);
+    setCaption('Same prompt — JSON Think returns one clean JSON object, no prose, parseable every time.');
+    await streamJsonInto(ans, d.answer, TOK_MS, myGen);
+    await sleep(1400, myGen);
+
+    // The #646 tiny-budget caveat — one short footnote beat (no animated reasoning).
+    setCaption('Caveat: set max_tokens too low and the model runs out before the answer — you get a json_empty_output error, never an empty 200.');
+    await sleep(2400, myGen);
+  }
+  function stillJson(){
+    clear(); setProfile(SCENARIO.json.profile, 'json');
+    // Static frame mirrors the animated end state: prompt → prose-wrapped chat
+    // reply → prompt re-asked → bare JSON object.
+    userRow(SCENARIO.json.prompt);
+    var a1 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
+    a1.querySelector('.bubble').textContent = SCENARIO.json.chatAnswer;
+    transcript.appendChild(a1);
+    userRow(SCENARIO.json.prompt);
+    var a2 = el('<div class="row assistant"><div class="acol">'+
+      '<div class="bubble json">'+SCENARIO.json.answer+'</div></div></div>');
+    transcript.appendChild(a2);
+  }
+
+  var SCENES = [
+    { run: sceneTreeOfThought, still: stillTot,
+      pausedCaption: 'Animation paused (reduced motion). Tree of Thought explores the options and picks the best.' },
+    { run: sceneFastThink, still: stillFast,
+      pausedCaption: 'Animation paused (reduced motion). Repeat Boost gives the same answer, much faster.' },
+    { run: sceneJsonThink, still: stillJson,
+      pausedCaption: 'Animation paused (reduced motion). Chat buries the JSON in reasoning prose; JSON Think returns one bare, parseable object.' }
+  ];
+
+  // Error fallback: a clean, honest static frame (the lead Tree of Thought scene).
+  function renderStaticFallback(){
+    stillTot();
+    setCaption('Tree of Thought and Repeat Boost — two ways this model can think.');
+    setActiveDot(0);
+  }
+
+  // Play scene `i`. Bumping `gen` cancels any in-flight scene at its next await.
+  async function play(i){
+    gen++; var myGen = gen;
+    if (advanceTimer){ clearTimeout(advanceTimer); advanceTimer = null; }
+    setActiveDot(i);
+    if (reduce){                          // no animation: render the static frame
+      SCENES[i].still();
+      setCaption(SCENES[i].pausedCaption);
+      return;
+    }
+    clear();
+    try {
+      await SCENES[i].run(myGen);
+    } catch (e) {
+      if (e === CANCELLED) return;        // superseded by a newer scene — stop silently
+      console.error(e); renderStaticFallback(); return;  // a real error degrades to static
+    }
+    if (myGen !== gen) return;            // superseded during the final frame
+    // Auto-advance: a manual click jumps here and the reel then resumes from this scene.
+    advanceTimer = setTimeout(function(){ kick((i+1) % SCENES.length); }, AUTO_ADVANCE_MS);
+  }
+  // Always attach a .catch so a click-triggered rejection is never unhandled.
+  function kick(i){ play(i).catch(function(e){ if (e !== CANCELLED){ console.error(e); renderStaticFallback(); } }); }
+
+  dotEls.forEach(function(d){
+    d.addEventListener('click', function(){ kick(parseInt(d.getAttribute('data-scene'), 10) || 0); });
+  });
+
+  function start(){ kick(0); }
+  if (document.readyState === 'complete') start();
+  else window.addEventListener('load', start);
+})();
+</script>
+</body>
+</html>

@@ -6,14 +6,13 @@ import Foundation
 ///
 /// Drives `startEngine(profileID:)` over a real `NSXPCConnection`
 /// from a same-process peer into a `HelperExportedAPI` wired to:
-///   · a live `PieSupervisor` with shrunk policy timeouts,
+///   · a `PieEngineHost` with an injected launcher seam returning a
+///     synthetic `(port, FakeSession)` tuple,
 ///   · a `LaunchSpecResolver` reading a freshly-created profile out
-///     of a per-test `ProfileStore`,
-///   · a fake `pie` shell script that prints `HTTP_LISTEN=...` and
-///     stays alive so the supervisor reaches `.running`.
+///     of a per-test `ProfileStore`.
 ///
 /// The wire path covered here is the one Phase 2.2's in-process
-/// supervisor tests deliberately skipped: encoded reply bytes flow
+/// engine-manager tests deliberately skipped: encoded reply bytes flow
 /// through `NSXPCCoder` and the per-listener exported-object lookup
 /// before the test sees the `EnginePort` payload.
 ///
@@ -41,9 +40,8 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
 
   /// Happy path: profile exists, the launcher seam returns a synthetic
   /// `(port, FakeSession)` tuple, and the XPC reply carries the bound
-  /// port back through `NSXPCCoder`.  removed PieSupervisor
-  /// from the production path; the XPC layer no longer depends on
-  /// `pie serve` spawning so the fake-script harness collapses to a
+  /// port back through `NSXPCCoder`. The XPC layer does not depend on
+  /// `pie serve` spawning, so the fake-script harness collapses to a
   /// pure Swift launcher closure.
   func test_startEngine_overXPC_returnsPort() async throws {
     let store = try makeProfileStoreWithChat()
@@ -63,7 +61,6 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { ignored },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -86,6 +83,85 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     let port = try await callStartEngine(api: api, profileID: "chat", timeout: 8)
     XCTAssertEqual(port, 24601,
                    "supervisor must return the port pie printed over HTTP_LISTEN, round-tripped through NSXPCCoder")
+  }
+
+  // MARK: - #476 session-snapshot contract
+
+  /// The `startEngine` reply carries the full `EngineSessionSnapshot` (port,
+  /// profileID, servedModelID, effective ceiling, generation), and the SAME
+  /// snapshot rides the `engineStatus` poll — one snapshot, two transports.
+  func test_startEngine_overXPC_replyAndStatusCarryIdenticalSnapshot() async throws {
+    let store = try makeProfileStoreWithChat(model: "ignored-by-fake-pie.gguf")
+    defer { store.stop() }
+    let host = makeEngineHost(port: 24611)
+    defer { host.stop() }
+    let exported = try makeExportedAPI(store: store, host: host) { modelsRoot in
+      try Data("ignored".utf8).write(
+        to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false))
+    }
+    let peer = try makeXPCPeer(exported: exported)
+    defer { peer.owner.invalidate(); peer.connection.invalidate() }
+
+    let snapshot = try await callStartEngineSnapshot(api: peer.api, profileID: "chat", timeout: 8)
+    XCTAssertEqual(snapshot.port, 24611)
+    XCTAssertEqual(snapshot.profileID, "chat")
+    XCTAssertEqual(snapshot.servedModelID, "ignored-by-fake-pie.gguf",
+                   "servedModelID must be the resolved boot model, not empty")
+    // A fake (non-GGUF) artifact yields no arch metadata → no scheduler cap →
+    // the engine's effective ceiling is the default pool capacity.
+    XCTAssertEqual(snapshot.maxOutputTokens, KVCacheBudget.defaultPoolCapacityTokens)
+    XCTAssertGreaterThan(snapshot.generation, 0, "generation must be a real launch id")
+
+    let status = try await callEngineStatus(api: peer.api, timeout: 4)
+    guard case .running(let polled) = status else {
+      return XCTFail("expected .running over the status wire, got \(status)")
+    }
+    XCTAssertEqual(polled, snapshot,
+                   "the engineStatus poll must carry the IDENTICAL snapshot the start reply returned")
+  }
+
+  /// An explicit per-start model override is reflected in the snapshot's
+  /// `servedModelID` — the App reads the served id off the snapshot, not the
+  /// profile default (#459 repro 1 / #476).
+  func test_startEngine_explicitOverride_snapshotReportsOverriddenModel() async throws {
+    let store = try makeProfileStoreWithChat(model: "profile-default.gguf")
+    defer { store.stop() }
+    let host = makeEngineHost(port: 24612)
+    defer { host.stop() }
+    let exported = try makeExportedAPI(store: store, host: host) { modelsRoot in
+      try Data("a".utf8).write(to: modelsRoot.appendingPathComponent("profile-default.gguf", isDirectory: false))
+      try Data("b".utf8).write(to: modelsRoot.appendingPathComponent("explicit-override.gguf", isDirectory: false))
+    }
+    let peer = try makeXPCPeer(exported: exported)
+    defer { peer.owner.invalidate(); peer.connection.invalidate() }
+
+    let snapshot = try await callStartEngineSnapshot(
+      api: peer.api, profileID: "chat", modelOverride: "explicit-override.gguf", timeout: 8)
+    XCTAssertEqual(snapshot.servedModelID, "explicit-override.gguf",
+                   "an explicit override must be the served model, overriding the profile default")
+  }
+
+  /// A restart bumps the launch generation, so a snapshot the App composed
+  /// against the prior session is detectably stale (#476 stale-state id).
+  func test_restartEngine_overXPC_bumpsGenerationMakingPriorSnapshotStale() async throws {
+    let store = try makeProfileStoreWithChat(model: "ignored-by-fake-pie.gguf")
+    defer { store.stop() }
+    let host = makeEngineHost(port: 24613)
+    defer { host.stop() }
+    let exported = try makeExportedAPI(store: store, host: host) { modelsRoot in
+      try Data("ignored".utf8).write(
+        to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false))
+    }
+    let peer = try makeXPCPeer(exported: exported)
+    defer { peer.owner.invalidate(); peer.connection.invalidate() }
+
+    let first = try await callStartEngineSnapshot(api: peer.api, profileID: "chat", timeout: 8)
+    let second = try await callStartEngineSnapshot(
+      api: peer.api, profileID: "chat", restart: true, timeout: 8)
+    XCTAssertGreaterThan(second.generation, first.generation,
+                         "a restart must mint a new launch generation")
+    XCTAssertFalse(second.isSameSession(as: first),
+                   "the prior snapshot must be detectably stale after a restart")
   }
 
   ///  G1: a mid-session engine death must surface as a coded
@@ -120,7 +196,6 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { ignored },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] }
@@ -155,6 +230,362 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     XCTAssertFalse(message.isEmpty, "engine-gone status must carry a cause over the wire")
   }
 
+  /// #448 regression: a HEALTHY engine that reaches `.running` must NOT be
+  /// stopped by the `startEngine` reply-timeout fallback after the deadline
+  /// elapses. Pre-fix, the fallback called `engineHost.stop()`
+  /// unconditionally, killing a running engine exactly `startReplyDeadline`s
+  /// (60s in prod) after every App-driven start — the "engine dies ~1 min
+  /// after going idle" report. Here the deadline is shrunk to 0.3s via the
+  /// DEBUG `replyTimeoutOverride` seam; the engine must still be `.running`
+  /// after the timer would have fired.
+  func test_startEngine_healthyEngineSurvivesReplyDeadline() async throws {
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+
+    let host = makeEngineHost(port: 24650)
+    defer { host.stop() }
+
+    let ignored = try writeCapabilityProbe(portable: true, metal: true)
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+    try Data("ignored".utf8).write(
+      to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false)
+    )
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { ignored },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] }
+    )
+    // Shrink ONLY the start deadline so the fallback timer fires ~0.3s after
+    // start; the engine reaches `.running` near-instantly via FakeSession.
+    let exported = HelperExportedAPI(engineHost: host,
+                                     launchSpecResolver: resolver.asClosure,
+                                     replyTimeoutOverride: (start: 0.3, stop: 17))
+
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+    let connection = NSXPCConnection(listenerEndpoint: listenerOwner.endpoint)
+    connection.remoteObjectInterface = PieHelperXPCInterface.make()
+    connection.resume()
+    defer { connection.invalidate() }
+    let api = try XCTUnwrap(connection.remoteObjectProxyWithErrorHandler { err in
+      XCTFail("XPC proxy error: \(err)")
+    } as? PieHelperXPC, "remote proxy must conform to PieHelperXPC")
+
+    let port = try await callStartEngine(api: api, profileID: "chat", timeout: 8)
+    XCTAssertEqual(port, 24650)
+
+    // Wait well past the 0.3s start deadline (when the buggy fallback would
+    // have stopped the engine).
+    try await Task.sleep(nanoseconds: 900_000_000)
+
+    let status = try await callEngineStatus(api: api, timeout: 4)
+    guard case .running = status else {
+      return XCTFail("healthy engine was stopped by the reply-timeout fallback after the deadline (got \(status)) — #448 idle-death regression")
+    }
+  }
+
+  // MARK: - #461: App-initiated start as reliable as helper/menu Resume
+
+  /// #461 core: the App route (`HelperXPCClient.startEngine` over a real
+  /// `NSXPCConnection`) must wait out a slow cold start and return the real
+  /// `.running` outcome, exactly as the in-process menu Resume does. The
+  /// derived `defaultStartReplyTimeout` dominates the helper's start reply
+  /// deadline; here both are scaled down deterministically (helper start
+  /// budget 4s via `replyTimeoutOverride`, App budget 3s) and the launcher
+  /// takes 0.5s — comfortably above the 2s the pure-start path used pre-#461.
+  func test_appRoute_startEngine_waitsOutSlowColdStart() async throws {
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+    let host = makeSlowEngineHost(port: 24700, delay: 0.5)
+    defer { host.stop() }
+
+    let exported = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: try makeChatResolver(store: store).asClosure,
+      replyTimeoutOverride: (start: 4, stop: 17)
+    )
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+
+    let client = HelperXPCClient(
+      endpoint: .listenerEndpoint(listenerOwner.endpoint),
+      startReplyTimeout: 3.0
+    )
+
+    // Must NOT throw: the App start budget (3s) sits above the launcher's 0.5s
+    // cold start, so the selector delivers the real terminal result. Pre-#461
+    // the 2s generic `replyTimeout` would not even be exercised here, but the
+    // production default (135s+slack) is what guarantees a real large-model
+    // boot is awaited rather than timed out at 2s.
+    try await client.startEngine(profileID: "chat", modelOverride: nil)
+    guard case .running(let snap) = host.status else {
+      return XCTFail("App route must converge on .running; got \(host.status)")
+    }
+    XCTAssertEqual(snap.port, 24700,
+                   "App route must converge on the same .running port the host reached")
+    XCTAssertEqual(snap.profileID, "chat")
+  }
+
+  /// #461 acceptance 2: an App reply timeout (the App giving up early) must
+  /// NOT stop a still-starting engine — launch lifetime is host-owned. Models
+  /// the pre-#461 too-short budget by shrinking the App wait BELOW the
+  /// launcher delay; the App `startEngine` throws `.replyTimeout`, but the
+  /// engine must still reach `.running` on the host's own lease.
+  func test_appRoute_startReplyTimeout_doesNotStopStillStartingEngine() async throws {
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+    let host = makeSlowEngineHost(port: 24701, delay: 0.6)
+    defer { host.stop() }
+
+    let exported = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: try makeChatResolver(store: store).asClosure,
+      replyTimeoutOverride: (start: 4, stop: 17)
+    )
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+
+    // App budget 0.2s < 0.6s launcher delay → the App gives up before the
+    // engine finishes booting.
+    let client = HelperXPCClient(
+      endpoint: .listenerEndpoint(listenerOwner.endpoint),
+      startReplyTimeout: 0.2
+    )
+
+    do {
+      try await client.startEngine(profileID: "chat", modelOverride: nil)
+      XCTFail("App start budget below the launch delay must surface .replyTimeout")
+    } catch let error as AppXPCClientError {
+      guard case .replyTimeout = error else {
+        return XCTFail("expected .replyTimeout, got \(error)")
+      }
+    }
+
+    // The App gave up, but the host-owned launch must still complete: the
+    // reply timeout is NOT a lifetime lease and must never stop the engine.
+    try await pollHostUntilRunning(host, port: 24701, deadline: 3)
+  }
+
+  /// #461 acceptance 3: the App route and the menu/helper "Resume Engine"
+  /// route converge on the same final engine state for the same profile/model.
+  /// Same `ProfileStore` (activeProfile "chat") + same resolver feed both an
+  /// App-route start (over NSXPC) and a menu-route start
+  /// (`HelperResumeAction.run`, the in-process selector the status-bar Resume
+  /// click takes); both reach `.running(port, "chat")`.
+  func test_appRoute_and_menuResume_convergeOnSameRunningState() async throws {
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+    let resolver = try makeChatResolver(store: store)
+
+    // App route over the real NSXPC wire.
+    let appHost = makeSlowEngineHost(port: 24702, delay: 0.3)
+    defer { appHost.stop() }
+    let exported = HelperExportedAPI(engineHost: appHost,
+                                     launchSpecResolver: resolver.asClosure,
+                                     replyTimeoutOverride: (start: 4, stop: 17))
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+    let client = HelperXPCClient(endpoint: .listenerEndpoint(listenerOwner.endpoint),
+                                 startReplyTimeout: 3.0)
+    try await client.startEngine(profileID: "chat", modelOverride: nil)
+
+    // Menu/helper Resume route, in-process, same inputs.
+    let menuHost = makeSlowEngineHost(port: 24702, delay: 0.3)
+    defer { menuHost.stop() }
+    let outcome = HelperResumeAction.run(engineHost: menuHost,
+                                         profileStore: store,
+                                         resolver: resolver.asClosure)
+    XCTAssertEqual(outcome, .started(profileID: "chat"),
+                   "menu Resume must resolve the active profile and start it")
+    try await pollHostUntilRunning(menuHost, port: 24702, deadline: 3)
+
+    XCTAssertEqual(appHost.status, menuHost.status,
+                   "App-initiated start and menu Resume must converge on the same final engine state for the same profile/model")
+  }
+
+  /// #448 quitHelper over the real NSXPC wire: a running engine is stopped
+  /// (reaped) and the helper-self-terminate hook fires, with a nil (accepted)
+  /// reply. Proves the full-product quit reaches `pie` through the Helper —
+  /// the App calls exactly this selector as the final step of a coordinated
+  /// quit, which is what guarantees "no orphan pie".
+  func test_quitHelper_overXPC_stopsEngineAndFiresTermination() async throws {
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+
+    let host = makeEngineHost(port: 24660)
+    defer { host.stop() }
+
+    let ignored = try writeCapabilityProbe(portable: true, metal: true)
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+    try Data("ignored".utf8).write(
+      to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false)
+    )
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { ignored },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] }
+    )
+    let terminated = expectation(description: "onQuitRequested (helper self-terminate) fired")
+    let exported = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: resolver.asClosure,
+      onQuitRequested: { terminated.fulfill() }
+    )
+
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+    let connection = NSXPCConnection(listenerEndpoint: listenerOwner.endpoint)
+    connection.remoteObjectInterface = PieHelperXPCInterface.make()
+    connection.resume()
+    defer { connection.invalidate() }
+    let api = try XCTUnwrap(connection.remoteObjectProxyWithErrorHandler { err in
+      XCTFail("XPC proxy error: \(err)")
+    } as? PieHelperXPC, "remote proxy must conform to PieHelperXPC")
+
+    let port = try await callStartEngine(api: api, profileID: "chat", timeout: 8)
+    XCTAssertEqual(port, 24660)
+
+    try await callQuitHelper(api: api, timeout: 8)
+    await fulfillment(of: [terminated], timeout: 5)
+    XCTAssertEqual(host.status, .stopped, "quitHelper must reap the engine before terminating")
+  }
+
+  func test_quitHelper_overXPC_timeoutReturnsEngineErrorAndDoesNotTerminateHelper() async throws {
+    final class HangingShutdownSession: PieEngineHost.EngineSession, @unchecked Sendable {
+      func shutdown() async -> EngineShutdownResult {
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
+        return .unreaped("test session did not reap")
+      }
+    }
+
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+
+    let host = PieEngineHost(launcher: { _ in
+      (port: EnginePort(24661), session: HangingShutdownSession())
+    })
+    defer { host.stop() }
+
+    let ignored = try writeCapabilityProbe(portable: true, metal: true)
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+    try Data("ignored".utf8).write(
+      to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false)
+    )
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { ignored },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] }
+    )
+    let terminated = expectation(description: "onQuitRequested must not fire while pie may still be alive")
+    terminated.isInverted = true
+    let exported = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: resolver.asClosure,
+      replyTimeoutOverride: (start: 8, stop: 0.05),
+      onQuitRequested: { terminated.fulfill() }
+    )
+
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+    let connection = NSXPCConnection(listenerEndpoint: listenerOwner.endpoint)
+    connection.remoteObjectInterface = PieHelperXPCInterface.make()
+    connection.resume()
+    defer { connection.invalidate() }
+    let api = try XCTUnwrap(connection.remoteObjectProxyWithErrorHandler { err in
+      XCTFail("XPC proxy error: \(err)")
+    } as? PieHelperXPC, "remote proxy must conform to PieHelperXPC")
+
+    let port = try await callStartEngine(api: api, profileID: "chat", timeout: 8)
+    XCTAssertEqual(port, 24661)
+
+    do {
+      try await callQuitHelper(api: api, timeout: 2)
+      XCTFail("quitHelper timeout must not be reported as nil success")
+    } catch XPCError.engine(let err) {
+      XCTAssertEqual(err.code, .handshakeTimeout)
+      XCTAssertTrue(err.message.contains("quitHelper"))
+      XCTAssertTrue(err.message.contains("0.05"))
+    }
+    await fulfillment(of: [terminated], timeout: 0.5)
+  }
+
+  func test_quitHelper_overXPC_unreapedShutdownReturnsKillRejectedInsteadOfNilSuccess() async throws {
+    final class UnreapedShutdownSession: PieEngineHost.EngineSession, @unchecked Sendable {
+      func shutdown() async -> EngineShutdownResult {
+        .unreaped("SIGKILL + 5s waitpid window did not reap pid 4242")
+      }
+    }
+
+    let store = try makeProfileStoreWithChat()
+    defer { store.stop() }
+
+    let host = PieEngineHost(launcher: { _ in
+      (port: EnginePort(24662), session: UnreapedShutdownSession())
+    })
+    defer { host.stop() }
+
+    let ignored = try writeCapabilityProbe(portable: true, metal: true)
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+    try Data("ignored".utf8).write(
+      to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false)
+    )
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { ignored },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] }
+    )
+    let terminated = expectation(description: "onQuitRequested must not fire after failed reap")
+    terminated.isInverted = true
+    let exported = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: resolver.asClosure,
+      replyTimeoutOverride: (start: 8, stop: 2),
+      onQuitRequested: { terminated.fulfill() }
+    )
+
+    let listenerOwner = HelperXPCListener.startAnonymous(exportedObject: exported)
+    defer { listenerOwner.invalidate() }
+    let connection = NSXPCConnection(listenerEndpoint: listenerOwner.endpoint)
+    connection.remoteObjectInterface = PieHelperXPCInterface.make()
+    connection.resume()
+    defer { connection.invalidate() }
+    let api = try XCTUnwrap(connection.remoteObjectProxyWithErrorHandler { err in
+      XCTFail("XPC proxy error: \(err)")
+    } as? PieHelperXPC, "remote proxy must conform to PieHelperXPC")
+
+    let port = try await callStartEngine(api: api, profileID: "chat", timeout: 8)
+    XCTAssertEqual(port, 24662)
+
+    do {
+      try await callQuitHelper(api: api, timeout: 2)
+      XCTFail("quitHelper unreaped shutdown must not be reported as nil success")
+    } catch XPCError.engine(let err) {
+      XCTAssertEqual(err.code, .killRejected)
+      XCTAssertTrue(err.message.contains("did not reap pid 4242"))
+    }
+    await fulfillment(of: [terminated], timeout: 0.5)
+  }
+
   /// Session whose `checkLiveness()` replays a scripted sequence, then
   /// repeats the final element — models a mid-session engine death for
   /// the XPC engine-gone integration test.
@@ -163,7 +594,7 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     private let script: [EngineLiveness]
     private var idx = 0
     init(_ script: [EngineLiveness]) { self.script = script }
-    func shutdown() async {}
+    func shutdown() async -> EngineShutdownResult { .reaped }
     func checkLiveness() async -> EngineLiveness {
       lock.lock(); defer { lock.unlock() }
       let v = script[min(idx, script.count - 1)]
@@ -172,10 +603,13 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     }
   }
 
-  /// Unknown profile id over the wire surfaces `.profileMissing` on
-  /// the error slot — proves the resolver's failure shape survives
-  /// `XPCPayload` encode/decode through the listener.
-  func test_startEngine_overXPC_unknownProfile_returnsProfileMissing() async throws {
+  /// #702: an unknown / dangling profile id over the wire must NOT
+  /// hard-reject with `.profileMissing` — the resolver falls back to the
+  /// always-present `chat` base built-in. Here the injected paths are bogus,
+  /// so the fallback chat fails at a LATER stage (binary / model / spawn),
+  /// proving the dangling id no longer strands AND that the resolver's error
+  /// shape still survives `XPCPayload` encode/decode through the listener.
+  func test_startEngine_overXPC_unknownProfile_fallsBackToChatBase() async throws {
     let store = try makeProfileStoreWithChat()
     defer { store.stop() }
     let host = makeEngineHost(port: 24601)
@@ -185,7 +619,6 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { self.tempDir.appendingPathComponent("ignored") },
       modelsRoot: { self.tempDir.appendingPathComponent("models") },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { (
         wasm: self.tempDir.appendingPathComponent("ignored.wasm"),
         manifest: self.tempDir.appendingPathComponent("ignored.toml")
@@ -210,9 +643,10 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
 
     do {
       _ = try await callStartEngine(api: api, profileID: "ghost", timeout: 3)
-      XCTFail("expected .profileMissing for unknown profile id")
+      XCTFail("fallback chat must still fail to boot under bogus injected paths")
     } catch XPCError.engine(let err) {
-      XCTAssertEqual(err.code, .profileMissing)
+      XCTAssertNotEqual(err.code, .profileMissing,
+                        "#702: an unknown profile id must fall back to the chat base, not hard-reject with .profileMissing")
     }
   }
 
@@ -354,7 +788,6 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       profileStore: store,
       pieBinary: { ignored },
       modelsRoot: { modelsRoot },
-      inferletsDir: { self.tempDir.appendingPathComponent("inferlets") },
       pieControlResources: { resources },
       pieHome: { self.tempDir },
       subprocessEnvironment: { [:] },
@@ -473,11 +906,68 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
     })
   }
 
+  /// `PieEngineHost` whose launcher sleeps `delay` before returning the
+  /// session — a deterministic stand-in for a slow cold large-model boot
+  /// (#461). The host stays `.starting` for `delay`, then reaches `.running`.
+  private func makeSlowEngineHost(port: EnginePort, delay: TimeInterval) -> PieEngineHost {
+    PieEngineHost(launcher: { _ in
+      try? await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
+      return (port: port, session: FakeSession())
+    })
+  }
+
+  /// Resolver over the freshly-created "chat" profile with a staged
+  /// fake-pie model + inferlet resources. Shared by the App route and the
+  /// menu Resume route so #461's convergence test feeds both identical inputs.
+  private func makeChatResolver(store: ProfileStore) throws -> LaunchSpecResolver {
+    let ignored = try writeCapabilityProbe(portable: true, metal: true)
+    let modelsRoot = tempDir.appendingPathComponent("models", isDirectory: true)
+    try FileManager.default.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+    try Data("ignored".utf8).write(
+      to: modelsRoot.appendingPathComponent("ignored-by-fake-pie.gguf", isDirectory: false)
+    )
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    return LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { ignored },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      // Pin the daemon bind mode: the default reads the machine-global
+      // `persistedLocalAPIBindMode()` file, which other tests in the same
+      // process mutate. The snapshot now carries `daemonBindHost`, so an
+      // unpinned read would make route-convergence assertions flaky.
+      daemonBindMode: { .loopback }
+    )
+  }
+
+  /// Poll `host.status` until it is `.running` on `port` for profile "chat",
+  /// or `deadline` elapses. Matches on the snapshot's identity (port +
+  /// profileID), not full snapshot equality — the host-produced snapshot also
+  /// carries a live generation + served-model id the caller doesn't pin.
+  /// Bounded so a regression can't hang the suite.
+  private func pollHostUntilRunning(_ host: PieEngineHost,
+                                    port: EnginePort,
+                                    deadline seconds: TimeInterval) async throws {
+    func runningOnPort(_ status: EngineStatus) -> Bool {
+      if case .running(let snap) = status { return snap.port == port && snap.profileID == "chat" }
+      return false
+    }
+    let deadline = Date().addingTimeInterval(seconds)
+    while Date() < deadline {
+      if runningOnPort(host.status) { return }
+      try await Task.sleep(nanoseconds: 30_000_000)
+    }
+    XCTAssertTrue(runningOnPort(host.status),
+                  "engine never reached .running(port: \(port), profileID: chat) within \(seconds)s (got \(host.status))")
+  }
+
   /// Trivial `EngineSession` that records nothing; the XPC tests
   /// only need the host to reach `.running` and accept `.stop()`
   /// later. `PieEngineHostTests` covers shutdown invocation.
   private final class FakeSession: PieEngineHost.EngineSession, @unchecked Sendable {
-    func shutdown() async {}
+    func shutdown() async -> EngineShutdownResult { .reaped }
   }
 
   /// Async bridge over `startEngine(profileID:reply:)`. Throws
@@ -497,7 +987,7 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
       }
       timer.resume()
 
-      api.startEngine(profileID: profileID) { successData, errorData in
+      api.startEngine(profileID: profileID, modelOverride: nil) { successData, errorData in
         timer.cancel()
         guard resumed.markIfPending() else { return }
         do {
@@ -505,9 +995,80 @@ final class StartEngineXPCIntegrationTests: IsolatedTestCase {
             successData: successData, errorData: errorData
           )
           switch result {
-          case .success(let port): cont.resume(returning: port)
-          case .failure(let err):  cont.resume(throwing: XPCError.engine(err))
+          case .success(let snapshot): cont.resume(returning: snapshot.port)
+          case .failure(let err):      cont.resume(throwing: XPCError.engine(err))
           }
+        } catch {
+          cont.resume(throwing: XPCError.wireShape(underlying: error))
+        }
+      }
+    }
+  }
+
+  /// Async bridge that returns the FULL `EngineSessionSnapshot` from a
+  /// `startEngine` / `restartEngine` reply (#476) — lets the snapshot-contract
+  /// tests assert servedModelID / maxOutputTokens / generation, not just the
+  /// port. `restart == true` exercises the strict rebuild selector.
+  private func callStartEngineSnapshot(api: PieHelperXPC,
+                                       profileID: String,
+                                       modelOverride: String? = nil,
+                                       restart: Bool = false,
+                                       timeout: TimeInterval) async throws -> EngineSessionSnapshot {
+    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<EngineSessionSnapshot, Error>) in
+      let resumed = ResumedOnceFlag()
+      let timer = DispatchSource.makeTimerSource(queue: .global())
+      timer.schedule(deadline: .now() + timeout)
+      timer.setEventHandler {
+        if resumed.markIfPending() {
+          cont.resume(throwing: XPCError.replyTimeout(timeout: timeout))
+        }
+      }
+      timer.resume()
+
+      let handler: (Data?, Data?) -> Void = { successData, errorData in
+        timer.cancel()
+        guard resumed.markIfPending() else { return }
+        do {
+          let result = try PieHelperXPCWire.decodeStartEngineReply(
+            successData: successData, errorData: errorData
+          )
+          switch result {
+          case .success(let snapshot): cont.resume(returning: snapshot)
+          case .failure(let err):      cont.resume(throwing: XPCError.engine(err))
+          }
+        } catch {
+          cont.resume(throwing: XPCError.wireShape(underlying: error))
+        }
+      }
+      if restart {
+        api.restartEngine(profileID: profileID, modelOverride: modelOverride, reply: handler)
+      } else {
+        api.startEngine(profileID: profileID, modelOverride: modelOverride, reply: handler)
+      }
+    }
+  }
+
+  /// Async bridge over `quitHelper(reply:)`. Resolves on a nil (accepted)
+  /// reply, throws `XPCError.engine` on a non-nil error payload.
+  private func callQuitHelper(api: PieHelperXPC,
+                              timeout: TimeInterval) async throws {
+    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+      let resumed = ResumedOnceFlag()
+      let timer = DispatchSource.makeTimerSource(queue: .global())
+      timer.schedule(deadline: .now() + timeout)
+      timer.setEventHandler {
+        if resumed.markIfPending() {
+          cont.resume(throwing: XPCError.replyTimeout(timeout: timeout))
+        }
+      }
+      timer.resume()
+      api.quitHelper { errorData in
+        timer.cancel()
+        guard resumed.markIfPending() else { return }
+        guard let errorData else { cont.resume(returning: ()); return }
+        do {
+          let err = try XPCPayload.decode(EngineError.self, from: errorData)
+          cont.resume(throwing: XPCError.engine(err))
         } catch {
           cont.resume(throwing: XPCError.wireShape(underlying: error))
         }

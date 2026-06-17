@@ -49,9 +49,9 @@ final class EngineStatusStoreIntegrationTests: IsolatedTestCase {
 
     // Helper transitions to running; the store's next refresh picks
     // it up via the same connection.
-    exported.setStatus(.running(port: 51234, profileID: "chat"))
+    exported.setStatus(.running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
     let next = try await store.refresh()
-    XCTAssertEqual(next, .running(port: 51234, profileID: "chat"))
+    XCTAssertEqual(next, .running(EngineSessionSnapshot(port: 51234, profileID: "chat")))
     let baseURLAfter = await MainActor.run { store.baseURL }
     XCTAssertEqual(baseURLAfter, URL(string: "http://127.0.0.1:51234"))
   }
@@ -64,7 +64,7 @@ final class EngineStatusStoreIntegrationTests: IsolatedTestCase {
   func test_helperXPCClient_decodes_running_status() async throws {
     let listenerOwner = HelperXPCListener.startAnonymous(
       exportedObject: FixedStatusExportedObject(
-        initial: .running(port: 65535, profileID: "default")
+        initial: .running(EngineSessionSnapshot(port: 65535, profileID: "default"))
       )
     )
     defer { listenerOwner.invalidate() }
@@ -73,7 +73,7 @@ final class EngineStatusStoreIntegrationTests: IsolatedTestCase {
       endpoint: .listenerEndpoint(listenerOwner.endpoint)
     )
     let status = try await client.engineStatus()
-    XCTAssertEqual(status, .running(port: 65535, profileID: "default"))
+    XCTAssertEqual(status, .running(EngineSessionSnapshot(port: 65535, profileID: "default")))
   }
 
   func test_helperXPCClient_engineStatus_timesOut_when_helper_never_replies() async throws {
@@ -121,11 +121,11 @@ final class EngineStatusStoreIntegrationTests: IsolatedTestCase {
     }
 
     listenerOwner.setExportedObject(FixedStatusExportedObject(
-      initial: .running(port: 51235, profileID: "chat")
+      initial: .running(EngineSessionSnapshot(port: 51235, profileID: "chat"))
     ))
 
     let recovered = try await client.engineStatus()
-    XCTAssertEqual(recovered, .running(port: 51235, profileID: "chat"))
+    XCTAssertEqual(recovered, .running(EngineSessionSnapshot(port: 51235, profileID: "chat")))
   }
 }
 
@@ -153,11 +153,29 @@ private final class FixedStatusExportedObject: NSObject, PieHelperXPC, @unchecke
     }
   }
 
+  func helperProtocolVersion(reply: @escaping (Data) -> Void) {
+    reply((try? XPCPayload.encode(HelperProtocolCompatibility.currentVersion))
+          ?? PieHelperXPCWire.fallbackReplyEncodeFailureData)
+  }
+
   func engineMemory(reply: @escaping (Data) -> Void) {
     reply((try? XPCPayload.encode(Optional<EngineMemorySample>.none)) ?? Data("null".utf8))
   }
 
+  func kvUsage(reply: @escaping (Data?, Data?) -> Void) {
+    PieHelperXPCWire.replyKVUsage(.success([]), via: reply)
+  }
+
   func startEngine(profileID: String,
+                   modelOverride: String?,
+                   reply: @escaping (Data?, Data?) -> Void) {
+    startEngine(profileID: profileID,
+                daemonBindHost: EngineHTTPBindMode.loopback.daemonHost,
+                reply: reply)
+  }
+
+  func startEngine(profileID: String,
+                   daemonBindHost: String,
                    reply: @escaping (Data?, Data?) -> Void) {
     PieHelperXPCWire.replyStartEngine(
       .failure(EngineError(code: .wireContractViolation,
@@ -166,18 +184,17 @@ private final class FixedStatusExportedObject: NSObject, PieHelperXPC, @unchecke
     )
   }
 
-  func stopEngine(reply: @escaping (Data?) -> Void) { reply(nil) }
-
-  func loadModel(modelID: String,
-                 reply: @escaping (Data?, Data?) -> Void) {
-    PieHelperXPCWire.replyLoadModel(
+  func restartEngine(profileID: String,
+                     modelOverride: String?,
+                     reply: @escaping (Data?, Data?) -> Void) {
+    PieHelperXPCWire.replyStartEngine(
       .failure(EngineError(code: .wireContractViolation,
                            message: "FixedStatusExportedObject is read-only")),
       via: reply
     )
   }
 
-  func cancelLoad(handle: Data, reply: @escaping (Data?) -> Void) { reply(nil) }
+  func stopEngine(reply: @escaping (Data?) -> Void) { reply(nil) }
 
   func downloadModel(repo: String, file: String,
                      reply: @escaping (Data?, Data?) -> Void) {
@@ -206,10 +223,14 @@ private final class FixedStatusExportedObject: NSObject, PieHelperXPC, @unchecke
     )
   }
 
-  func clearKillRejected(reply: @escaping (Data?) -> Void) { reply(nil) }
+  func quitHelper(reply: @escaping (Data?) -> Void) { reply(nil) }
 }
 
 private final class NeverReplyStatusExportedObject: NSObject, PieHelperXPC, @unchecked Sendable {
+  func helperProtocolVersion(reply: @escaping (Data) -> Void) {
+    // Wedged: intentionally never replies, like engineStatus below.
+  }
+
   func engineStatus(reply: @escaping (Data) -> Void) {
     // Intentionally do not call reply. This simulates a helper that accepted
     // the XPC message but wedged before producing a response.
@@ -219,15 +240,21 @@ private final class NeverReplyStatusExportedObject: NSObject, PieHelperXPC, @unc
     // Wedged: intentionally never replies, like engineStatus above.
   }
 
+  func kvUsage(reply: @escaping (Data?, Data?) -> Void) {}
+
   func startEngine(profileID: String,
+                   modelOverride: String?,
                    reply: @escaping (Data?, Data?) -> Void) {}
 
+  func startEngine(profileID: String,
+                   daemonBindHost: String,
+                   reply: @escaping (Data?, Data?) -> Void) {}
+
+  func restartEngine(profileID: String,
+                     modelOverride: String?,
+                     reply: @escaping (Data?, Data?) -> Void) {}
+
   func stopEngine(reply: @escaping (Data?) -> Void) {}
-
-  func loadModel(modelID: String,
-                 reply: @escaping (Data?, Data?) -> Void) {}
-
-  func cancelLoad(handle: Data, reply: @escaping (Data?) -> Void) {}
 
   func downloadModel(repo: String, file: String,
                      reply: @escaping (Data?, Data?) -> Void) {}
@@ -241,5 +268,6 @@ private final class NeverReplyStatusExportedObject: NSObject, PieHelperXPC, @unc
   func tailLog(stream: String,
                reply: @escaping (FileHandle?, Data?) -> Void) {}
 
-  func clearKillRejected(reply: @escaping (Data?) -> Void) {}
+  // Wedged: intentionally never replies, like the selectors above.
+  func quitHelper(reply: @escaping (Data?) -> Void) {}
 }
