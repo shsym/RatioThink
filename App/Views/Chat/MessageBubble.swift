@@ -24,13 +24,12 @@ import os
 /// view re-checks at click time. Markdown images never fetch from the
 /// network (`NSAttributedString(markdown:)` does not load remote bytes; the
 /// builder renders a text placeholder). Review v1 F3.
-/// A user interaction with a Best-of-N round (#690): pick a candidate, then
-/// either expand from it (think-more) or commit it (stop). `goBack` (#708)
-/// clears the pick, returning the round to the choose-one state so a different
-/// candidate can be picked.
+/// A user interaction with a Best-of-N round (#690): pick (or re-pick) a
+/// candidate, then either expand from it (think-more) or commit it (stop).
+/// Re-selection is just another `.pick` with a different id (#708) — every
+/// candidate snapshot stays alive until think-more / stop.
 enum BestOfNAction: Equatable {
   case pick(String)
-  case goBack
   case thinkMore
   case stop
 }
@@ -99,22 +98,29 @@ struct MessageBubble: View {
       HStack {
         VStack(alignment: .leading, spacing: 6) {
           // #413: a tree-of-thought turn renders its live search above the
-          // answer, the structured sibling of the reasoning section. #690: a
-          // Best-of-N round reuses the same tree view with the selection
-          // affordance + think-more/stop controls layered on.
+          // answer, the structured sibling of the reasoning section. #690/#708:
+          // a Best-of-N round reuses the same tree view with a selection
+          // context layered on — interactive only for the LIVE round.
           if let tot = message.tot {
             if let round = message.bestOfN {
+              // The round is interactive only when the transcript wired
+              // `onBestOfN` for it (the live, uncommitted round). Historical and
+              // finalized rounds render read-only: the chosen candidate stays
+              // highlighted, but no pick affordance, no "pick one" state, and no
+              // think-more / use-this controls (#708 read-only history).
+              let isLive = onBestOfN != nil
               TreeSearchSection(
                 tree: tot,
                 answerStarted: !message.content.isEmpty,
                 selection: BestOfNSelectionContext(
-                  pickableIDs: Set(round.candidates.map(\.id)),
+                  pickableIDs: isLive ? Set(round.candidates.map(\.id)) : [],
                   chosenID: round.chosenID,
+                  isInteractive: isLive,
                   onPick: { id in onBestOfN?(.pick(id)) }))
-              // Think-more / Stop appear once a candidate is chosen and before
-              // the round commits an answer — and only when this is the live
-              // round (`onBestOfN` non-nil; the transcript hides it otherwise).
-              if round.hasChoice, message.content.isEmpty, onBestOfN != nil {
+              // Think-more / Use-this appear once a candidate is chosen, before
+              // the round commits an answer, on the live round only. Re-picking
+              // a different candidate keeps the controls (the choice persists).
+              if round.hasChoice, message.content.isEmpty, isLive {
                 bestOfNControls
               }
             } else {
@@ -187,20 +193,14 @@ struct MessageBubble: View {
     }
   }
 
-  /// Go-back / Think-more / Use-this controls under a chosen Best-of-N
-  /// candidate (#690, #708). "Go back" clears the pick so a different candidate
-  /// can be chosen; "Think more" starts the next round expanding from the pick;
-  /// "Use this" commits the chosen candidate as the final answer (not editable
-  /// in v1).
+  /// Think-more / Use-this controls under a chosen Best-of-N candidate (#690).
+  /// "Think more" starts the next round expanding from the pick; "Use this"
+  /// commits the chosen candidate as the final answer (not editable in v1). To
+  /// change the pick, tap a different candidate row directly — re-selection is
+  /// free since every candidate snapshot is alive until think-more / use-this
+  /// (#708 click-to-reselect, replacing the short-lived Go back button).
   private var bestOfNControls: some View {
     HStack(spacing: 8) {
-      Button { onBestOfN?(.goBack) } label: {
-        Label("Go back", systemImage: "arrow.uturn.backward")
-      }
-      .buttonStyle(.bordered)
-      .controlSize(.small)
-      .accessibilityIdentifier("bestofn.goBack")
-      .help("Clear this pick and choose a different option")
       Button { onBestOfN?(.thinkMore) } label: {
         Label("Think more", systemImage: "arrow.down.circle")
       }

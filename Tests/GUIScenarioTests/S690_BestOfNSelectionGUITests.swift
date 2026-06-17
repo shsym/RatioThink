@@ -3,9 +3,11 @@ import XCTest
 /// S690 — Best-of-N interactive selection (seated GUI).
 ///
 /// Drives the real app through one Best-of-N round and asserts the interactive
-/// behavior the headless tests can't: the round renders its N candidates inline,
-/// the user SELECTS one, the unpicked siblings COLLAPSE, and the chosen one is
-/// emphasized while the think-more / use-this commit affordances appear.
+/// behavior the headless tests can't (#690/#708): the round renders its N
+/// candidates inline as tap-to-select options, the user PICKS one (highlighted)
+/// while siblings stay re-pickable, RE-PICKS a different one, then commits with
+/// "Use this" — after which the round renders READ-ONLY (chosen still
+/// highlighted, no pick affordance).
 ///
 /// Engine-free + deterministic: `PIE_TEST_SEED_BESTOFN` seeds one persisted,
 /// uncommitted Best-of-N round (`BestOfNRoundSeed`) — a sandboxed XCUITest can't
@@ -16,8 +18,8 @@ import XCTest
 /// alpha, which reads correctly in light and dark — that color correctness is
 /// asserted headlessly by `BestOfNHighlightSnapshotTests` (XCUITest cannot read
 /// pixel color). Here each candidate row instead exposes its selection state as
-/// an accessibility VALUE (`pickable` → `chosen` / `unpicked`), so the seated
-/// test asserts the state transition the emphasis encodes. The run is repeated
+/// an accessibility identifier (`bestofn.candidate.<i>.<state>`), so the seated
+/// test asserts the state transitions the emphasis encodes. The run is repeated
 /// under the light and dark appearance launch args; the structural assertions
 /// hold in both (and the run proves the flow works seated regardless of whether
 /// AppKit honors the appearance override).
@@ -29,12 +31,12 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
   }
 
   @MainActor
-  func test_select_collapses_unpicked_and_highlights_chosen_light() throws {
+  func test_pick_reselect_commit_and_readonly_history_light() throws {
     try runSelectionFlow(appearance: "Light")
   }
 
   @MainActor
-  func test_select_collapses_unpicked_and_highlights_chosen_dark() throws {
+  func test_pick_reselect_commit_and_readonly_history_dark() throws {
     try runSelectionFlow(appearance: "Dark")
   }
 
@@ -105,37 +107,74 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
     let chosenIdx = 1
     optionRow(chosenIdx).click()
 
-    // The chosen row flips to `chosen` (highlighted); every other row collapses
-    // to `unpicked`.
+    // The chosen row flips to `chosen` (highlighted). #708 click-to-reselect:
+    // the OTHER candidates stay `pickable` (NOT dimmed/`unpicked`) so the user
+    // can freely re-pick a different one — the live round never locks in.
     XCTAssertTrue(stateMarker(chosenIdx, "chosen").waitForExistence(timeout: 10),
                   "[\(appearance)] picked candidate \(chosenIdx) must become 'chosen' (highlighted); "
                     + "app tree: \(app.debugDescription)")
     for idx in 0..<n where idx != chosenIdx {
-      XCTAssertTrue(stateMarker(idx, "unpicked").waitForExistence(timeout: 5),
-                    "[\(appearance)] unpicked candidate \(idx) must collapse to 'unpicked'; app tree: \(app.debugDescription)")
-      XCTAssertFalse(stateMarker(idx, "pickable").exists,
-                     "[\(appearance)] unpicked candidate \(idx) must no longer be 'pickable'")
+      XCTAssertTrue(stateMarker(idx, "pickable").waitForExistence(timeout: 5),
+                    "[\(appearance)] sibling candidate \(idx) must stay 'pickable' for re-selection; app tree: \(app.debugDescription)")
     }
 
-    // The commit affordances — Go back / Think more / Use this — appear under
-    // the chosen candidate.
+    // The commit affordances — Think more / Use this — appear once a candidate
+    // is chosen. The short-lived 'Go back' button is gone (#708): re-selection
+    // is by tapping another candidate, not a dedicated control.
     XCTAssertTrue(app.buttons["bestofn.thinkMore"].waitForExistence(timeout: 5),
                   "[\(appearance)] 'Think more' affordance must appear after a choice")
     XCTAssertTrue(app.buttons["bestofn.useThis"].exists,
                   "[\(appearance)] 'Use this' affordance must appear after a choice")
-    XCTAssertTrue(app.buttons["bestofn.goBack"].exists,
-                  "[\(appearance)] 'Go back' affordance must appear after a choice (#708)")
+    XCTAssertFalse(app.buttons["bestofn.goBack"].exists,
+                   "[\(appearance)] 'Go back' must be gone — re-pick by tapping a candidate (#708)")
 
-    // #708 go-back: clicking it clears the pick — every candidate returns to
-    // `pickable` and the commit affordances disappear.
-    app.buttons["bestofn.goBack"].click()
+    // #708 click-to-reselect: tap a DIFFERENT candidate → the choice moves to it,
+    // the previously-chosen returns to `pickable`, and the controls persist.
+    let reselectIdx = 2
+    optionRow(reselectIdx).click()
+    XCTAssertTrue(stateMarker(reselectIdx, "chosen").waitForExistence(timeout: 10),
+                  "[\(appearance)] re-picked candidate \(reselectIdx) must become 'chosen'; app tree: \(app.debugDescription)")
+    XCTAssertTrue(stateMarker(chosenIdx, "pickable").waitForExistence(timeout: 5),
+                  "[\(appearance)] previously-chosen candidate \(chosenIdx) must return to 'pickable' after re-select")
+    XCTAssertTrue(app.buttons["bestofn.useThis"].exists,
+                  "[\(appearance)] commit affordances persist across a re-selection")
+
+    // #708 read-only history: commit the round with 'Use this'. The round
+    // finalizes — the interactive controls disappear and (re-expanding the
+    // now-folded disclosure) the candidates render read-only: the chosen one is
+    // still highlighted, none are `pickable`, and tapping one no longer picks.
+    app.buttons["bestofn.useThis"].click()
+    XCTAssertTrue(waitForDisappearance(app.buttons["bestofn.useThis"], timeout: 10),
+                  "[\(appearance)] 'Use this' must disappear once the round is committed")
+    XCTAssertFalse(app.buttons["bestofn.thinkMore"].exists,
+                   "[\(appearance)] 'Think more' must disappear once the round is committed")
+
+    // Re-expand the finalized round (it auto-folds after committing) and assert
+    // the read-only presentation.
+    let disclosure = app.descendants(matching: .any)
+      .matching(identifier: "bestofn.disclosure").firstMatch
+    if disclosure.waitForExistence(timeout: 5) { disclosure.click() }
+    XCTAssertTrue(stateMarker(reselectIdx, "chosen").waitForExistence(timeout: 5),
+                  "[\(appearance)] the committed choice \(reselectIdx) must stay highlighted in read-only history; app tree: \(app.debugDescription)")
     for idx in 0..<n {
-      XCTAssertTrue(stateMarker(idx, "pickable").waitForExistence(timeout: 5),
-                    "[\(appearance)] candidate \(idx) must be 'pickable' again after Go back; app tree: \(app.debugDescription)")
+      XCTAssertFalse(stateMarker(idx, "pickable").exists,
+                     "[\(appearance)] read-only history candidate \(idx) must not be 'pickable'")
     }
+    // Tapping a read-only option toggles expand only — it must not re-pick or
+    // resurrect the commit controls.
+    optionRow(0).click()
     XCTAssertFalse(app.buttons["bestofn.useThis"].exists,
-                   "[\(appearance)] 'Use this' must disappear after Go back")
-    XCTAssertFalse(stateMarker(chosenIdx, "chosen").exists,
-                   "[\(appearance)] no row may remain 'chosen' after Go back")
+                   "[\(appearance)] tapping a read-only candidate must not re-open the round")
+  }
+
+  /// Poll until an element no longer exists (XCUITest has no built-in
+  /// wait-for-absence).
+  private func waitForDisappearance(_ element: XCUIElement, timeout: TimeInterval) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if !element.exists { return true }
+      usleep(200_000)
+    }
+    return !element.exists
   }
 }

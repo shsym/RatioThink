@@ -30,10 +30,17 @@ final class BestOfNHighlightSnapshotTests: XCTestCase {
     try render(scheme: .dark, name: "bestofn-highlight-dark")
   }
 
-  private func render(scheme: ColorScheme, name: String) throws {
+  // #708: read-only history render — chosen highlighted, others dimmed, no
+  // pick affordance. Eyeball that the chosen card + dim still read in both.
+  func test_render_readonly_dark() throws {
+    try render(scheme: .dark, name: "bestofn-readonly-dark", interactive: false)
+  }
+
+  private func render(scheme: ColorScheme, name: String, interactive: Bool = true) throws {
     // The harness defaults to `chosenID = "n1"`, so n1 renders chosen
-    // (accent-highlighted) and n0/n2 dimmed.
-    let view = BestOfNHighlightPreviewHarness()
+    // (accent-highlighted). n1 carries a reasoning trace (#708 C) so the
+    // thinking-vs-answer contrast inside the chosen card is visible.
+    let view = BestOfNHighlightPreviewHarness(interactive: interactive)
       .environment(\.colorScheme, scheme)
       .background(scheme == .dark ? Color.black : Color.white)
     let renderer = ImageRenderer(content: view)

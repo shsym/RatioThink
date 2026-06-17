@@ -129,11 +129,14 @@ final class BestOfNTests: XCTestCase {
     // Unpicked = the other two snapshots, dropped next round.
     XCTAssertEqual(decoded.unpickedSnapshotNames(excluding: "n1"), ["s0", "s2"])
 
-    // #708 go-back: clearing the pick returns the round to the choose-one
-    // state — `handleBestOfN(.goBack)` just nils `chosenID`.
-    round.chosenID = nil
-    XCTAssertFalse(round.hasChoice)
-    XCTAssertNil(round.chosen)
+    // #708 click-to-reselect: re-picking is just overwriting `chosenID` with a
+    // different candidate id (`handleBestOfN(.pick)` is idempotent on re-tap).
+    // All snapshots stay alive, so the new choice resolves cleanly and the
+    // unpicked set tracks the new pick.
+    round.chosenID = "n2"
+    XCTAssertTrue(round.hasChoice)
+    XCTAssertEqual(round.chosen?.snapshotName, "s2")
+    XCTAssertEqual(round.unpickedSnapshotNames(excluding: "n2"), ["s0", "s1"])
   }
 
   // MARK: Lifecycle release request wire (stop/commit + abandon trigger)
