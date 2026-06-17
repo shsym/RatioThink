@@ -92,13 +92,12 @@ struct ProfilesSettingsTab: View {
   private func refresh() async {
     do {
       let dir = try PieDirs.profiles()
-      // Use the shared `ProfileStore.scan` rather than re-implementing
-      // the TOML enumeration here (review v2 F9). The duplicate scan
-      // previously matched `*.toml` case-insensitively while the
-      // canonical store matches the literal lowercase extension; a
-      // `*.TOML` file would have rendered in one path and not the
-      // other.
-      let (loaded, scanErr) = ProfileStore.scan(directory: dir)
+      // Use the shared `ProfileStore.effectiveScan` rather than
+      // re-implementing the TOML enumeration here (review v2 F9). #702:
+      // `effectiveScan` overlays the immutable in-code base layer on the
+      // user files, so the four built-ins always render here even when no
+      // file exists on disk for them.
+      let (loaded, scanErr) = ProfileStore.effectiveScan(directory: dir)
       entries = loaded
       directoryError = scanErr.map(String.init(describing:))
       if selectionURL == nil { selectionURL = entries.first?.url }
