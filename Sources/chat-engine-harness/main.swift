@@ -243,6 +243,8 @@ enum EngineHarness {
         case .reasoning: reasoningDeltas += 1
         case .answer: answerDeltas += 1
         }
+      case let .nodeScoring(id):
+        print(String(format: "  +%6.1fs node_scoring \(id)", dt))
       case .finalDelta:
         // #523 Part A: synthesized final-answer chunks — folded into the
         // tree's finalAnswer by `tree.apply`; nothing extra to print here.

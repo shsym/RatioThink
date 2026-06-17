@@ -2168,6 +2168,17 @@ async fn expand(
     )
     .await;
     let score = if matches!(demux.kind, DemuxKind::Answered) {
+        // Content is done; the value scorer now generates (often multiple
+        // seconds, esp. at the final depth). Announce `node_scoring` so the UI
+        // shows a transient "Scoring…" indicator instead of a silent unscored
+        // node, before the terminal `node_complete` reconciles the real score.
+        // `expand` is the only scoring site reachable in production builds —
+        // the coupled (default + sequential) and sibling-penalty resolvers all
+        // route through here; the phased batched scorer is benchmark-only
+        // (rejected unless `--features exec-strategies`).
+        if let Some(s) = sink {
+            let _ = s.node_scoring(node_id).await;
+        }
         Some(
             score_answered(
                 score_base,

@@ -433,10 +433,11 @@ public final class ChatSendController: ObservableObject {
             assistant.content += text
           case .levelPruned:
             Self.persistTree(context, status: persistenceStatus)
-          case .treeStart, .nodeStart, .nodeDelta, .nodeComplete:
+          case .treeStart, .nodeStart, .nodeDelta, .nodeScoring, .nodeComplete:
             // In-memory tot re-encode above already drives the live tree
-            // (incl. per-token node_delta fill, #413 phase B); disk persistence
-            // stays throttled to level boundaries + the terminal.
+            // (incl. per-token node_delta fill, #413 phase B, and the
+            // `nodeScoring` live-phase flip); disk persistence stays throttled
+            // to level boundaries + the terminal.
             break
           case .awaitingSelection:
             // Best-of-N terminal (#690) — never emitted on the tree-of-thought
@@ -831,10 +832,11 @@ public final class ChatSendController: ObservableObject {
             self.activePersistenceStatus = nil
           case .levelPruned:
             Self.persistTree(context, status: persistenceStatus)
-          case .treeStart, .nodeStart, .nodeDelta, .nodeComplete,
+          case .treeStart, .nodeStart, .nodeDelta, .nodeScoring, .nodeComplete,
                .treeComplete, .finalDelta, .generationMetrics:
             // Best-of-N never auto-selects (no treeComplete/finalDelta) and
-            // emits no metrics; the live re-encode above drives the tree.
+            // emits no metrics; the live re-encode above drives the tree
+            // (incl. the `nodeScoring` live-phase flip).
             break
           }
         }

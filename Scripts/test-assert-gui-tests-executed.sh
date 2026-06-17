@@ -87,4 +87,34 @@ Test Suite 'S279_LifecycleRecoveryGUITests' passed
 EOF
 run "seated, single test executed" PASS 1
 
+# 7. Seated + tests executed but some XCTSkipped → PASS (#707). A seated run
+#    with an unmet runtime gate (e.g. PIE_TEST_TCC_GRANTED unset, partial Helper
+#    TCC) XCTSkips its tests; xcodebuild then emits an INTERPOLATED clause
+#    "with N tests skipped and 0 failures". The classes still matched and ran
+#    (Executed N>=1), so this is a green run, not the dangling-filter bug. A
+#    regex that demands "tests, with 0 failures" adjacency false-FAILs it.
+cat > "$LOG" <<'EOF'
+Test Suite 'S4_HelperMenuBarGUITests' passed
+	 Executed 3 tests, with 3 tests skipped and 0 failures (0 unexpected) in 0.1 (0.2) seconds
+EOF
+run "seated, all tests skipped (unmet gate)" PASS 1
+
+# 8. Seated + single test skipped → PASS. The skipped-count clause is also
+#    SINGULAR for one ("with 1 test skipped"); the `tests?` must apply there too.
+cat > "$LOG" <<'EOF'
+Test Suite 'S279_LifecycleRecoveryGUITests' passed
+	 Executed 1 test, with 1 test skipped and 0 failures (0 unexpected) in 1.0 (1.1) seconds
+EOF
+run "seated, single test skipped" PASS 1
+
+# 9. Mutation twin of #7: seated + zero tests with a skipped clause → FAIL.
+#    Proves tolerating the skip clause did NOT loosen the [1-9] zero-tests guard:
+#    a dangling filter that matched nothing still trips even if a "0 tests
+#    skipped" clause is present. One input away from #7 (the leading count).
+cat > "$LOG" <<'EOF'
+Test Suite 'Selected tests' passed
+	 Executed 0 tests, with 0 tests skipped and 0 failures (0 unexpected) in 0.0 (0.0) seconds
+EOF
+run "seated, zero tests with skip clause" FAIL 1
+
 echo "assert-gui-tests-executed self-test: all scenarios pass"

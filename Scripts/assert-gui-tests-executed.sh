@@ -30,11 +30,17 @@ fi
 
 # xcodebuild's per-bundle/total summary line reads
 #   "Executed N tests, with 0 failures (0 unexpected) in ..."
-# We only reach this backstop after a status==0 run, so failures are already 0;
-# the sole question is whether N is non-zero. A dangling/empty filter yields
-# either no such line or "Executed 0 tests", so an [1-9]-leading count is the
-# tell that real tests ran.
-if grep -Eq 'Executed [1-9][0-9]* tests?, with 0 failures' "$log"; then
+# and, when some tests XCTSkip, interpolates a skipped-count clause
+#   "Executed N tests, with M tests skipped and 0 failures (0 unexpected) in ..."
+# A seated run with an unmet runtime gate (PIE_TEST_TCC_GRANTED unset, partial
+# Helper TCC) legitimately skips its tests yet still EXECUTED them — the classes
+# matched, so N>=1. We only reach this backstop after a status==0 run, so
+# failures are already 0; the sole question is whether N is non-zero. A
+# dangling/empty filter yields either no such line or "Executed 0 tests", so an
+# [1-9]-leading count is the tell that real tests ran. The optional skipped
+# clause (singular "1 test"/plural "N tests") must be tolerated so a fully
+# skipped-but-matched run does not false-fail (#707).
+if grep -Eq 'Executed [1-9][0-9]* tests?, with ([0-9]+ tests? skipped and )?0 failures' "$log"; then
   exit 0
 fi
 

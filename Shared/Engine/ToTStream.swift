@@ -161,6 +161,11 @@ public enum ToTEvent: Equatable, Sendable {
   /// A streamed text chunk for a node, tagged by id + channel (reasoning
   /// while inside `<think>`, then the answer). Appended live to the node.
   case nodeDelta(id: String, channel: ToTDeltaChannel, text: String)
+  /// A node finished generating its content and is now being value-scored
+  /// (#413): the gap before `nodeComplete` can be several seconds, so the UI
+  /// shows a transient "Scoring…" indicator. Additive — a node that never
+  /// receives this still reconciles on `nodeComplete`.
+  case nodeScoring(id: String)
   /// One fully-resolved node (generated + scored, or errored) — the per-node
   /// terminal + authoritative final (the non-stream path emits only these).
   case nodeComplete(ToTNode)
@@ -259,6 +264,11 @@ public func decodeToTFrame(_ data: Data) throws -> ToTEvent? {
     // not fatal — mirrors the unknown-event default below.
     guard let channel = ToTDeltaChannel(rawValue: kind) else { return nil }
     return .nodeDelta(id: id, channel: channel, text: text)
+  case "node_scoring":
+    guard let id = raw.id else {
+      throw ToTStreamError.malformedFrame(payload: String(decoding: data, as: UTF8.self))
+    }
+    return .nodeScoring(id: id)
   case "node_complete":
     guard let node = raw.node else {
       throw ToTStreamError.malformedFrame(payload: String(decoding: data, as: UTF8.self))

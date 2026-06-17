@@ -97,6 +97,22 @@ final class ToTStreamTests: XCTestCase {
     XCTAssertEqual(branchIndex, 1)
   }
 
+  func test_decodes_node_scoring() throws {
+    let e = try decodeToTFrame(frame(#"{"event":"node_scoring","id":"tot-n4"}"#))
+    guard case let .nodeScoring(id) = e else {
+      return XCTFail("want nodeScoring, got \(String(describing: e))")
+    }
+    XCTAssertEqual(id, "tot-n4")
+  }
+
+  func test_node_scoring_missing_id_is_malformed() {
+    XCTAssertThrowsError(try decodeToTFrame(frame(#"{"event":"node_scoring"}"#))) { err in
+      guard case ToTStreamError.malformedFrame = err else {
+        return XCTFail("want malformedFrame, got \(err)")
+      }
+    }
+  }
+
   func test_decodes_node_delta_reasoning_then_answer() throws {
     let r = try decodeToTFrame(frame(
       #"{"event":"node_delta","id":"tot-n4","kind":"reasoning","text":"weigh A"}"#
