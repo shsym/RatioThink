@@ -37,6 +37,17 @@ enum BestOfNRoundSeed {
     "Take a day trip to a town one train ride away and wander with no fixed plan.",
   ]
 
+  /// Canned per-candidate `<think>` traces. With Best-of-N now generating
+  /// thinking ON (#708), a live round demuxes each candidate's reasoning onto
+  /// the reasoning channel (`ToTNode.reasoning`), so the seed carries one too —
+  /// the seeded round then renders the same folded "Thinking" disclosure the
+  /// live round does, and the GUI test can assert it (and a clean answer).
+  static let candidateReasonings = [
+    "Low effort, restorative, and pairs movement with downtime — a safe default.",
+    "More ambitious; turns the afternoon into a shared event, higher payoff if they want effort.",
+    "Maximizes novelty by changing the setting entirely; best when they want an adventure.",
+  ]
+
   /// Insert the seeded round when requested and the store is empty. `N` is read
   /// from the env value but clamped to the canned-text count.
   @MainActor
@@ -88,7 +99,8 @@ enum BestOfNRoundSeed {
       let id = "bon-n\(idx)"
       tree.apply(.nodeComplete(ToTNode(
         id: id, parentID: "root", depth: 1, branchIndex: idx,
-        content: candidateTexts[idx], score: nil, status: .ok)))
+        content: candidateTexts[idx], reasoning: candidateReasonings[idx],
+        score: nil, status: .ok)))
       candidates.append(ToTSelectionCandidate(
         id: id, branchIndex: idx, snapshotName: "bon/seed/1/\(idx)"))
       kept.append(id)

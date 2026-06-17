@@ -95,6 +95,22 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
       XCTAssertTrue(optionRow(idx).waitForExistence(timeout: 5),
                     "[\(appearance)] candidate \(idx) option row missing before a choice; app tree: \(app.debugDescription)")
     }
+    // #708 thinking ON: each candidate now generates reasoning, which the demux
+    // routes onto the reasoning channel, so every candidate row renders the
+    // folded "Thinking" disclosure beside its clean answer. Assert the
+    // disclosure exists for each candidate and the answer text is present and
+    // carries no `<think>` markup (the reasoning is demuxed out, not inline).
+    func thinkingDisclosure(_ idx: Int) -> XCUIElement {
+      app.descendants(matching: .any)
+        .matching(identifier: "bestofn.candidate.\(idx).thinking").firstMatch
+    }
+    for idx in 0..<n {
+      XCTAssertTrue(thinkingDisclosure(idx).waitForExistence(timeout: 10),
+                    "[\(appearance)] candidate \(idx) must render its reasoning 'Thinking' disclosure (#708 thinking ON); app tree: \(app.debugDescription)")
+    }
+    XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "<think>")).firstMatch.exists,
+                   "[\(appearance)] no candidate answer may show raw <think> markup — reasoning is demuxed onto its own channel")
+
     // The dropped Select buttons must be gone everywhere.
     XCTAssertFalse(app.descendants(matching: .any)
       .matching(identifier: "bestofn.select.0").firstMatch.exists,

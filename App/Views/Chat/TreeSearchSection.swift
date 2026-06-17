@@ -288,6 +288,10 @@ private struct ToTNodeRow: View {
           deEmphasized: true
         )
         .padding(.leading, 8)
+        // Stable handle for the seated GUI test (#708): with thinking ON each
+        // candidate carries reasoning, so this folded "Thinking" disclosure
+        // renders next to the clean answer.
+        .accessibilityIdentifier("bestofn.candidate.\(node.branchIndex ?? 0).thinking")
       }
     }
     .opacity(isDimmed ? 0.5 : 1.0)
