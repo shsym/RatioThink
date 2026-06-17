@@ -198,14 +198,18 @@ mod tests {
         assert!(ops.present.is_empty(), "no present snapshot left behind");
     }
 
-    /// #703 F5 contract: the disconnect cleanup frees EXACTLY the saved picks'
-    /// snapshot names. Locks the mapping `run_round` uses (each `Pick`'s
-    /// `snapshot_name` is handed to `release_snapshots`) onto the same
-    /// `release_all` path, so an orphaned round leaves nothing behind. The
-    /// live-`Context` wrapper [`release_snapshots`] is exercised end-to-end by
-    /// the real-engine e2e; here we prove the name set + accounting.
+    /// #703 F5 contract (widened by review F2): the emit-failure cleanup frees
+    /// EXACTLY the saved picks' snapshot names. `run_round` runs this on ANY
+    /// `emit_awaiting_selection` error — both `EmitError::Disconnected` and
+    /// `EmitError::Serialize` — because the orphan condition is identical
+    /// (the client never received the pick list either way); the freed name set
+    /// is therefore variant-independent, which is exactly what this locks. The
+    /// mapping (each `Pick`'s `snapshot_name` handed to `release_snapshots`)
+    /// rides the same `release_all` path, so an orphaned round leaves nothing
+    /// behind. The live-`Context` wrapper [`release_snapshots`] is exercised
+    /// end-to-end by the real-engine e2e; here we prove the name set + accounting.
     #[test]
-    fn disconnect_cleanup_frees_exactly_the_saved_pick_snapshots() {
+    fn emit_failure_cleanup_frees_exactly_the_saved_pick_snapshots() {
         use super::super::stream::Pick;
         let picks = vec![
             Pick { id: "n0".to_string(), branch_index: 0, snapshot_name: "bon/r/1/0".to_string() },

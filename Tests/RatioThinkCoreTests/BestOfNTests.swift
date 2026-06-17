@@ -261,6 +261,32 @@ final class BestOfNTests: XCTestCase {
     XCTAssertEqual(ack, BestOfNReleaseAck(requested: 3, released: 1, absent: 2))
   }
 
+  /// #703 F1: a 2xx frame whose body is NOT a decodable ReleaseReport (proxy
+  /// mangling, a 200-wrapped error envelope, truncation, schema drift) must
+  /// THROW, not read as a silent clean release. `decodeReleaseAck` is the seam
+  /// `releaseBestOfNSnapshots` routes through; a throw there reaches the
+  /// logging `catch` instead of exiting clean with no ack.
+  func test_decodeReleaseAck_throws_on_undecodable_2xx_frame() {
+    let garbage = Data(#"{"unexpected":"shape"}"#.utf8)
+    XCTAssertThrowsError(try ChatSendController.decodeReleaseAck(frames: [garbage]))
+  }
+
+  /// No frame arrived (e.g. an empty drain) is the ONLY nil case — distinct
+  /// from an undecodable body, so the absence of an ack is not conflated with a
+  /// decode failure.
+  func test_decodeReleaseAck_nil_when_no_frame_arrived() throws {
+    XCTAssertNil(try ChatSendController.decodeReleaseAck(frames: []))
+  }
+
+  /// A well-formed frame decodes through the same seam.
+  func test_decodeReleaseAck_decodes_well_formed_frame() throws {
+    let frame = Data(
+      #"{"object":"best_of_n.release","requested":2,"released":2,"absent":0}"#.utf8)
+    XCTAssertEqual(
+      try ChatSendController.decodeReleaseAck(frames: [frame]),
+      BestOfNReleaseAck(requested: 2, released: 2, absent: 0))
+  }
+
   // MARK: Think-more chain frees each prior round exactly once
 
   /// A think-more hop frees its prior round COMPLETELY and EXACTLY once: the

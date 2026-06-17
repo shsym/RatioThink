@@ -918,13 +918,14 @@ public final class ChatSendController: ObservableObject {
         // failures throw here (`assertOK`) and are logged below; a short
         // release — fewer freed than requested — is surfaced so a release that
         // freed nothing no longer reports silent success.
-        var ack: BestOfNReleaseAck?
-        for try await frame in engine.dispatchInferlet(request) {
-          if let decoded = try? JSONDecoder().decode(BestOfNReleaseAck.self, from: frame) {
-            ack = decoded
-          }
-        }
-        if let ack, let message = Self.shortReleaseLog(ack) {
+        var frames: [Data] = []
+        for try await frame in engine.dispatchInferlet(request) { frames.append(frame) }
+        // Decode with `try` (review F1): a 2xx body that is NOT a decodable
+        // ReleaseReport (proxy mangling, a 200-wrapped error envelope,
+        // truncation, schema drift) must NOT read as a silent clean release —
+        // the `DecodingError` propagates to the `catch` below and is logged.
+        if let ack = try Self.decodeReleaseAck(frames: frames),
+           let message = Self.shortReleaseLog(ack) {
           Log.engine.notice("ChatSendController: \(message, privacy: .public)")
         }
       } catch {
@@ -949,6 +950,20 @@ public final class ChatSendController: ObservableObject {
   /// is benign for a re-release (some names already evicted), but a FULL miss
   /// (`released == 0`) signals the release reached the wrong engine or the
   /// round's snapshots were already gone. Pure so the accounting decision is
+  /// Decode the unary release ack from the dispatched frames (#703 F4/F1).
+  /// Returns nil ONLY when no frame arrived; a frame whose body is not a
+  /// decodable `ReleaseReport` THROWS the `DecodingError` rather than collapsing
+  /// to a silent success — `releaseBestOfNSnapshots` lets it reach the logging
+  /// `catch`. `nonisolated` + pure so the decode-failure contract is
+  /// unit-tested without a live engine.
+  nonisolated static func decodeReleaseAck(frames: [Data]) throws -> BestOfNReleaseAck? {
+    var ack: BestOfNReleaseAck?
+    for frame in frames {
+      ack = try JSONDecoder().decode(BestOfNReleaseAck.self, from: frame)
+    }
+    return ack
+  }
+
   /// unit-tested without a live engine. `nonisolated` — pure over its argument,
   /// touches no actor state.
   nonisolated static func shortReleaseLog(_ ack: BestOfNReleaseAck) -> String? {

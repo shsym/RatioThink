@@ -172,8 +172,11 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
     // survive) and the caller would see zero frames — so read the body whole
     // and hand it back as the stream's single frame. Generative calls
     // (`stream: true`) keep the SSE path. The `req.stream` flag already rides
-    // the wire as the caller's intent, so this is the one switch for ALL
-    // future control ops.
+    // the wire as the caller's intent, so this is the transport switch for
+    // control ops — but note (review F3) the unary path's single connect-loss
+    // retry below is sound ONLY for IDEMPOTENT control ops (today: release,
+    // where re-deleting reports `absent`). A future NON-idempotent control op
+    // must opt out of that retry before routing here, or it could double-execute.
     if !req.stream {
       return dispatchUnary(buildRequest: {
         try await self.makeRequest("/v1/inferlet", method: "POST", body: body,
@@ -311,9 +314,12 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
   ///
   /// Mirrors `openStream`'s single connection-lost retry: a `POST` reusing a
   /// stale pooled keep-alive connection fails with `networkConnectionLost`
-  /// (-1005) before any byte arrives, and URLSession does not auto-retry POSTs.
-  /// The retry is side-effect-safe here because the failure is at connect (no
-  /// body was read) and a release is idempotent (re-deleting reports `absent`).
+  /// (-1005) and URLSession does not auto-retry POSTs. The retry is sound ONLY
+  /// for an IDEMPOTENT control op (review F3): `networkConnectionLost` can fire
+  /// AFTER the server already acted, not only at connect, so a non-idempotent
+  /// op could double-execute. Today's sole caller (release) is idempotent —
+  /// re-deleting reports `absent` — so the replay is harmless. A future
+  /// non-idempotent control op must opt out of this retry before routing here.
   private func dispatchUnary(
     buildRequest: @escaping @Sendable () async throws -> URLRequest
   ) -> AsyncThrowingStream<Data, Error> {

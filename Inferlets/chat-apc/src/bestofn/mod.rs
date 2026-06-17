@@ -459,19 +459,23 @@ async fn run_round(
                 stream::NO_CANDIDATES_MESSAGE,
             ))
             .await;
-    } else if let Err(sse::EmitError::Disconnected) =
+    } else if let Err(e) =
         stream::emit_awaiting_selection(&mut em, params.level, &picks).await
     {
-        // #703 F5: the client dropped before receiving the pick list, so it can
-        // never pick (or app-release) these candidates — the app's abandon
-        // sweep keys on a materialized round, which a never-delivered terminal
-        // lacks. Free the just-saved snapshots now rather than leak them until
-        // engine teardown. Bounded to this one round's `n` candidate snapshots,
-        // freed through the same path the app-driven release uses.
+        // #703 F5 (widened, review F2): delivery of the pick list failed. The
+        // orphan condition is identical for BOTH `EmitError` variants —
+        // `Disconnected` (client dropped) and `Serialize` (a host-visible
+        // programmer error) — the client never received the list either way, so
+        // these just-saved candidates can never be picked or app-released (the
+        // app's abandon sweep keys on a materialized round a never-delivered
+        // terminal lacks). Free them now rather than leak them until engine
+        // teardown, regardless of cause; bounded to this round's `n` snapshots,
+        // freed through the same path the app-driven release uses. `e` is
+        // logged so a `Serialize` cause is captured, not silently dropped.
         let names: Vec<String> = picks.iter().map(|p| p.snapshot_name.clone()).collect();
         let report = release::release_snapshots(model, &names);
         eprintln!(
-            "[chat-apc] best-of-n: client disconnected before awaiting_selection; \
+            "[chat-apc] best-of-n: awaiting_selection delivery failed ({e:?}); \
              freed {}/{} orphaned candidate snapshots (request {request_id})",
             report.released, report.requested
         );
