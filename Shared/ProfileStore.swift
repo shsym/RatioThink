@@ -929,7 +929,22 @@ public final class ProfileStore: ObservableObject {
       //     Runs after the dedup pass so `migrateSeededBuiltins` has already
       //     cleared byte-equal current stock copies first.
       let provenanceError = self.migrateBuiltinProvenance()
-      let builtinSeedError = migrationError ?? builtinBackupError ?? provenanceError
+      // #718 F3a: three independent migration error domains share one
+      // `_builtinSeedError` slot. The old priority `??` reported
+      // `provenanceError` ONLY when both earlier migrations succeeded, so a
+      // retired-built-in move failure could be swallowed behind an unrelated
+      // earlier error. Log every failure independently (none silent), and
+      // surface `provenanceError` FIRST so a strict-policy move failure always
+      // reaches the snapshot's `directoryError`.
+      let migrationFailures: [(String, ProfileStoreError)] =
+        [("fast-think rename", migrationError),
+         ("seeded-builtin dedup", builtinBackupError),
+         ("retired-builtin provenance", provenanceError)]
+        .compactMap { name, err in err.map { (name, $0) } }
+      if migrationFailures.count > 1 {
+        Log.store.error("start: \(migrationFailures.count) profile migrations failed (\(migrationFailures.map(\.0).joined(separator: ", "), privacy: .public)); surfacing provenance-first")
+      }
+      let builtinSeedError = provenanceError ?? builtinBackupError ?? migrationError
       // Seed the active-profile marker -> chat on a FRESH install (no user
       // `*.toml` files yet) so the first menu-bar Resume resolves into a real
       // start. Gated on emptiness so a populated install with no marker keeps
@@ -1777,22 +1792,26 @@ public final class ProfileStore: ObservableObject {
   ///   · Provenance = the `builtin-origin` marker if present, else — for a
   ///     file at a historical built-in FILENAME — the mapped origin id IFF
   ///     the file's own id matches that built-in (a genuine pre-marker
-  ///     override, not a #706 filename squatter) or it cannot be parsed (a
-  ///     broken built-in at a known filename). A file with NEITHER a marker
-  ///     nor a recognized built-in filename is USER-AUTHORED and left
-  ///     untouched — the #709/#706 invariant that genuine user profiles are
-  ///     never removed.
+  ///     override, not a #706 filename squatter) or it cannot be parsed OR
+  ///     READ (a broken/unreadable built-in at a known filename, #718 F4). A
+  ///     file with NEITHER a marker nor a recognized built-in filename is
+  ///     USER-AUTHORED and left untouched — the #709/#706 invariant that
+  ///     genuine user profiles are never removed.
   ///   · provenance id no longer in the SHIPPED set -> a built-in a newer
-  ///     version RETIRED: MOVE to `<name>.toml.bak` so it stops being scanned
-  ///     (and `mergeEffective` hides any marked copy that slips through).
-  ///     Preserved, not destroyed (#718 acceptance).
+  ///     version RETIRED: MOVE to a non-colliding `<name>.toml.bak` so it
+  ///     stops being scanned (and `mergeEffective` hides any marked copy that
+  ///     slips through). Preserved, not destroyed (#718 acceptance) — an
+  ///     existing backup the system wrote is NEVER overwritten (#718 F2).
   ///
   /// The historical filename map is what catches an ALREADY-INSTALLED stale
   /// built-in (no version ships the marker yet); the marker is the
   /// id-independent discriminator going forward. Idempotent: a shipped or
   /// user-authored file is left in place. Returns the first move failure
-  /// (rides the shared `_builtinSeedError` channel); a failure on one file
-  /// never blocks the rest.
+  /// (rides the shared `_builtinSeedError` channel; the caller surfaces it
+  /// with priority, #718 F3); a failure on one file never blocks the rest. A
+  /// move FAILURE leaves the file on disk where `mergeEffective` still hides
+  /// the marked copy — intentional: the built-in is correctly gone from the
+  /// picker AND the failure is loud via `directoryError`, not silent.
   private func migrateBuiltinProvenance() -> ProfileStoreError? {
     let fm = FileManager.default
     let urls = ((try? fm.contentsOfDirectory(
@@ -1801,8 +1820,15 @@ public final class ProfileStore: ObservableObject {
     var firstError: ProfileStoreError?
     for url in urls {
       let filename = url.lastPathComponent
-      guard let body = try? String(contentsOf: url, encoding: .utf8) else { continue }
-      let profile = try? Profile.parse(toml: body)
+      // #718 F4: an unreadable file is NOT silently skipped — log it (mirroring
+      // migrateSeededBuiltins) and fall through with profile==nil so the
+      // filename recognizer can still move aside a retired built-in sitting at
+      // a known filename (the broken-built-in case the design handles).
+      let body = try? String(contentsOf: url, encoding: .utf8)
+      if body == nil {
+        Log.store.error("migrateBuiltinProvenance: read \(filename, privacy: .public) failed; falling back to filename recognition")
+      }
+      let profile = body.flatMap { try? Profile.parse(toml: $0) }
 
       let origin: String?
       if let marker = profile?.builtinOrigin {
@@ -1815,9 +1841,9 @@ public final class ProfileStore: ObservableObject {
       }
       guard let origin, !Self.shippedBuiltinIDs.contains(origin) else { continue }
 
-      let bak = directory.appendingPathComponent(filename + ".bak", isDirectory: false)
+      // #718 F2: move to a non-colliding `.bak`; never destroy a prior backup.
+      let bak = nonCollidingBackupURL(for: url)
       do {
-        if fm.fileExists(atPath: bak.path) { try fm.removeItem(at: bak) }
         try fm.moveItem(at: url, to: bak)
         Log.store.info("migrateBuiltinProvenance: retired built-in \(filename, privacy: .public) (origin \(origin, privacy: .public) no longer shipped) moved to \(bak.lastPathComponent, privacy: .public)")
       } catch {
@@ -1827,6 +1853,22 @@ public final class ProfileStore: ObservableObject {
       }
     }
     return firstError
+  }
+
+  /// A `<name>.toml.bak` URL that does NOT overwrite an existing backup the
+  /// system already wrote (#718 F2): `chat.toml.bak`, then `chat.toml.bak-2`,
+  /// `chat.toml.bak-3`, … Mirrors `freeBaseFilename`'s numeric-suffix scheme so
+  /// a prior retired-built-in backup is preserved, never destroyed.
+  private func nonCollidingBackupURL(for url: URL) -> URL {
+    let dir = url.deletingLastPathComponent()
+    let base = url.lastPathComponent + ".bak"
+    var candidate = dir.appendingPathComponent(base, isDirectory: false)
+    var n = 2
+    while FileManager.default.fileExists(atPath: candidate.path) {
+      candidate = dir.appendingPathComponent("\(base)-\(n)", isDirectory: false)
+      n += 1
+    }
+    return candidate
   }
 
   /// True when the writable profiles directory holds no `*.toml` files — a

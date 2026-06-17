@@ -2734,6 +2734,104 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
+  /// #718 F2: a pre-existing `<name>.toml.bak` (a backup the system wrote on a
+  /// prior run) must NOT be destroyed when another retired built-in is moved
+  /// aside — the new backup takes a non-colliding `.bak-2` name. "Preserved,
+  /// not destroyed" applies to earlier backups too.
+  func test_retired_builtin_backup_does_not_clobber_existing_bak() throws {
+    try withTempProfilesDir { dir in
+      let toml = """
+      builtin-origin = "retired-x"
+      id = "retired-x"
+      name = "Retired X"
+      inferlet = "chat-apc"
+      """
+      try toml.write(to: dir.appendingPathComponent("retired-x.toml"),
+                     atomically: true, encoding: .utf8)
+      // A backup the system wrote on a previous run.
+      let priorBak = dir.appendingPathComponent("retired-x.toml.bak")
+      try "PRIOR BACKUP — must survive".write(to: priorBak, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let fm = FileManager.default
+      XCTAssertEqual(try String(contentsOf: priorBak, encoding: .utf8),
+                     "PRIOR BACKUP — must survive",
+                     "an existing .bak must not be overwritten by a later retired-built-in move")
+      XCTAssertTrue(fm.fileExists(atPath: dir.appendingPathComponent("retired-x.toml.bak-2").path),
+                    "the new backup must take a non-colliding .bak-2 name")
+      XCTAssertFalse(fm.fileExists(atPath: dir.appendingPathComponent("retired-x.toml").path),
+                     "the retired built-in must be moved aside")
+    }
+  }
+
+  /// #718 F3: when an earlier migration ALSO fails, a retired-built-in move
+  /// failure must still reach `_builtinSeedError` (priority surface), not be
+  /// swallowed by the old `??` chain. Read-only dir fails both an unparseable
+  /// current built-in's backup AND the retired built-in's move; the snapshot
+  /// must point at the retired file, proving provenance is not swallowed.
+  func test_provenance_move_failure_surfaces_even_when_earlier_migration_failed() throws {
+    try withTempProfilesDir { dir in
+      // Earlier domain: an unparseable current built-in → migrateSeededBuiltins
+      // backup fails under read-only.
+      try "id = \"repeat-boost\"\n".write(
+        to: dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename),
+        atomically: true, encoding: .utf8)
+      // Provenance domain: a marked retired built-in → its move fails too.
+      try """
+      builtin-origin = "retired-x"
+      id = "retired-x"
+      name = "Retired X"
+      inferlet = "chat-apc"
+      """.write(to: dir.appendingPathComponent("retired-x.toml"),
+                atomically: true, encoding: .utf8)
+      try setPermissions(dir, mode: 0o500)
+      defer { try? setPermissions(dir, mode: 0o755) }
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      guard case .seedFailed(let path, _)? = store.snapshot.directoryError else {
+        return XCTFail("a provenance move failure must surface on directoryError; got \(String(describing: store.snapshot.directoryError))")
+      }
+      XCTAssertTrue(path.hasSuffix("retired-x.toml"),
+                    "provenance error must win the channel even when an earlier migration also failed; got \(path)")
+    }
+  }
+
+  /// #718 F4: an UNREADABLE file is not silently skipped — provenance falls
+  /// through to the filename recognizer. A shipped built-in at a known
+  /// filename (here `chat.toml`, unreadable) is recognized as shipped and left
+  /// in place (NOT moved aside). Proves the read-failure path reaches
+  /// recognition instead of `continue`-ing past it. (The retired-move-aside on
+  /// read failure shares the move block exercised by F2/F3; a non-shipped
+  /// historical filename cannot exist until a built-in is actually retired.)
+  func test_unreadable_shipped_builtin_is_recognized_and_left_in_place() throws {
+    try withTempProfilesDir { dir in
+      let chat = dir.appendingPathComponent("chat.toml")
+      try "id = \"chat\"\nname = \"Chat\"\ninferlet = \"chat-apc\"\n".write(
+        to: chat, atomically: true, encoding: .utf8)
+      try setPermissions(chat, mode: 0o000)
+      defer { try? setPermissions(chat, mode: 0o644) }
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      let fm = FileManager.default
+      XCTAssertTrue(fm.fileExists(atPath: chat.path),
+                    "an unreadable SHIPPED built-in must be left in place, not moved aside")
+      XCTAssertFalse(fm.fileExists(atPath: dir.appendingPathComponent("chat.toml.bak").path),
+                     "a shipped built-in must not be backed up by the retirement migration")
+      // The base chat is always present regardless of the unreadable file.
+      XCTAssertNotNil(store.entries.first { $0.profile?.id == "chat" }?.profile,
+                      "the base chat built-in remains available")
+    }
+  }
+
   /// #706 F3: `BaseBuiltin.name` is hand-carried alongside the TOML so the
   /// revert notice can label a built-in without re-parsing. Guard the desync:
   /// a future TOML `name` edit that forgets the struct must fail here.
