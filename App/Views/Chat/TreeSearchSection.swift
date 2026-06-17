@@ -213,51 +213,48 @@ private struct ToTNodeRow: View {
   }
 
   var body: some View {
+    // Best-of-N candidates render FLAT (#708): the answer is always visible,
+    // there is no card-level expand/collapse and no headline/title — only the
+    // per-candidate Thinking section folds (its own disclosure). Tree-of-thought
+    // keeps its foldable header + title via `cardStack`.
+    if isBestOfN {
+      bestOfNCandidate
+    } else {
+      cardStack(answerSelectable: true, headerTogglesExpand: true)
+    }
+  }
+
+  /// A flat Best-of-N candidate: option glyph + the always-visible answer, with
+  /// the chosen one accent-highlighted and the Thinking disclosure below. No
+  /// card fold, no title — the only foldable part is the reasoning section.
+  @ViewBuilder private var bestOfNCandidate: some View {
     VStack(alignment: .leading, spacing: 4) {
-      // The answer card — header + (when expanded) the answer detail + child
-      // subtree. For a chosen Best-of-N candidate this carries the accent
-      // highlight. A Best-of-N candidate's reasoning is deliberately NOT in
-      // here; it renders below, outside the accent fill (#708 C).
-      //
-      // #708 click-to-select: a live pickable candidate makes the WHOLE card
-      // (header AND answer body) one pick Button, and its answer text is NOT
-      // selectable — so a tap anywhere on the card picks rather than starting a
-      // text drag. Once chosen / in read-only history the card is no longer a
-      // pick target: the header toggles expand and the answer text becomes
-      // drag-selectable (resolves the pick-vs-copy conflict).
+      // The answer card. A live pickable candidate makes the WHOLE card one
+      // pick Button (its answer text is NOT selectable so a tap picks rather
+      // than starting a text drag); the chosen card and read-only-history rows
+      // are not pick targets, so their answer text is drag-selectable.
       Group {
         if isPickAction {
           Button { selection?.onPick(node.id) } label: {
-            cardStack(answerSelectable: false, headerTogglesExpand: false)
-              // The WHOLE card rectangle is the hit area (#708) — without this
-              // only the opaque glyph/text glyphs are tappable, so a click on a
-              // gap (or the answer text) between them is dropped and the pick
-              // (or re-pick) silently no-ops. `.contentShape` makes the full
-              // card, including the answer body, the pick target.
+            flatCard(answerSelectable: false)
+              // The whole card rectangle is the hit area (#708) — without this
+              // a tap on a gap or the answer text is dropped and the pick
+              // silently no-ops.
               .contentShape(Rectangle())
           }
           .buttonStyle(.plain)
           .frame(maxWidth: .infinity, alignment: .leading)
-          .help(rowActionHelp)
-          .modifier(OptionalAccessibilityIdentifier(
-            id: isBestOfN ? "bestofn.option.\(node.branchIndex ?? 0)" : nil))
+          .help("Pick this answer")
+          .accessibilityIdentifier("bestofn.option.\(node.branchIndex ?? 0)")
         } else {
-          cardStack(answerSelectable: true, headerTogglesExpand: true)
+          flatCard(answerSelectable: true)
+            .accessibilityIdentifier("bestofn.option.\(node.branchIndex ?? 0)")
         }
       }
-      // Chosen candidate: accent-tinted card + accent border. Unpicked-after-
-      // choice (read-only history only): alpha dim. Both use semantic
-      // `Color.accentColor` / opacity, which adapt across light + dark — never
-      // a hardcoded lightness (#690).
-      //
-      // #708 layout stability: every Best-of-N candidate reserves the SAME 8pt
-      // inset (not `isChosen ? 8 : 0`), so the accent card only fades in/out as
-      // the choice moves between candidates (click-to-reselect) — the rows never
-      // change geometry or shove their siblings. (The green-checkmark selection
-      // FLASH itself was a separate bug — candidates rendering as tree-of-thought
-      // `kept` beam nodes before `bestOfN` was set — fixed at the source in
-      // `ChatSendController.sendBestOfN`.)
-      .padding(isBestOfN ? 8 : (isChosen ? 8 : 0))
+      // Chosen candidate: accent-tinted card + border (adaptive semantic color,
+      // reads in light + dark). Every candidate reserves the SAME 8pt inset so
+      // the accent only fades in/out as the choice moves — rows never shift.
+      .padding(8)
       .background {
         if isChosen {
           RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -271,15 +268,12 @@ private struct ToTNodeRow: View {
         }
       }
 
-      // #708 C — thinking presentation: a Best-of-N candidate's reasoning uses
-      // the SAME boxed brain-icon disclosure tree-of-thought uses, but rendered
-      // BELOW the answer card on the plain surface (never under the chosen
-      // accent fill) and pushed to `.tertiary` (`deEmphasized`) so the thinking
-      // is unmistakably subordinate to the `.primary` answer — `.secondary` read
-      // too close to the answer on a chosen card. It also folds by default once
-      // an answer exists (`answerStarted: hasAnswer`). Absent entirely when there
-      // is no reasoning — no empty box.
-      if isBestOfN, isExpanded, !node.reasoning.isEmpty {
+      // #708 C — the candidate's reasoning renders below the answer card on the
+      // plain surface (never under the chosen accent fill), pushed to `.tertiary`
+      // (`deEmphasized`) so it reads as subordinate to the `.primary` answer.
+      // This disclosure is now the ONLY foldable part of a candidate; it folds
+      // by default once an answer exists. Absent when there is no reasoning.
+      if !node.reasoning.isEmpty {
         ReasoningDisclosure(
           reasoning: node.reasoning,
           answerStarted: hasAnswer,
@@ -288,39 +282,35 @@ private struct ToTNodeRow: View {
           deEmphasized: true
         )
         .padding(.leading, 8)
-        // Stable handle for the seated GUI test (#708): with thinking ON each
-        // candidate carries reasoning, so this folded "Thinking" disclosure
-        // renders next to the clean answer.
+        // Stable handle for the seated GUI test (#708).
         .accessibilityIdentifier("bestofn.candidate.\(node.branchIndex ?? 0).thinking")
       }
     }
     .opacity(isDimmed ? 0.5 : 1.0)
     .animation(.easeInOut(duration: 0.18), value: hasChoice)
-    // Stable identity + a semantic state value for the Best-of-N selection GUI
-    // test (#690): the chosen-vs-unpicked EMPHASIS is built from adaptive color
-    // (asserted for light/dark by the ImageRenderer snapshot test), which
-    // XCUITest cannot read — so the row also exposes its state as an
-    // accessibility value the seated test can assert (`chosen` highlighted,
-    // `unpicked` dimmed in read-only history, `pickable`/re-pickable on the
-    // live round). Empty on a tree-of-thought node, not a Best-of-N candidate.
-    // Selection-state probe for the seated GUI test (#690). A dedicated,
-    // non-interactive marker in an OVERLAY (zero layout impact) encodes the
-    // row's state INTO its accessibility identifier (`bestofn.candidate.<i>.
-    // pickable` → `.chosen` / `.unpicked`) — the assertable proxy for the
-    // adaptive-color emphasis XCUITest cannot see. State is in the identifier,
-    // not a value, because XCUITest reliably matches identifiers but does not
-    // surface `accessibilityValue` on a trait-less element. Kept OUT of the
-    // row's interactive subtree so it neither combines with nor hides the
-    // tappable option row (`bestofn.option.<i>`, the pick/expand target since
-    // #708 dropped the per-option Select button). Only on a candidate row.
+    // Selection-state probe for the seated GUI test (#690): a non-interactive
+    // 1pt overlay marker encodes the row's state into its accessibility
+    // identifier (`bestofn.candidate.<i>.pickable` → `.chosen` / `.unpicked`),
+    // the assertable proxy for the adaptive-color emphasis XCUITest cannot read.
+    // Kept OUT of the interactive subtree so it neither combines with nor hides
+    // the tappable option row.
     .overlay(alignment: .topLeading) {
-      if isBestOfN {
-        Color.clear
-          .frame(width: 1, height: 1)
-          .accessibilityElement()
-          .accessibilityIdentifier("bestofn.candidate.\(node.branchIndex ?? 0).\(bestOfNRowState)")
-      }
+      Color.clear
+        .frame(width: 1, height: 1)
+        .accessibilityElement()
+        .accessibilityIdentifier("bestofn.candidate.\(node.branchIndex ?? 0).\(bestOfNRowState)")
     }
+  }
+
+  /// The flat candidate card body: option glyph + the answer, always visible
+  /// (no fold, no title). `answerSelectable` is false while the whole card is a
+  /// pick target so a tap picks instead of starting a text drag.
+  @ViewBuilder private func flatCard(answerSelectable: Bool) -> some View {
+    HStack(alignment: .top, spacing: 6) {
+      optionGlyph
+      detail(selectable: answerSelectable)
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
   }
 
   /// Best-of-N selection state as a stable string for the seated GUI test —
@@ -404,26 +394,14 @@ private struct ToTNodeRow: View {
         beamGlyph
         scoreBadge
       }
-      // The headline is the node's answer (`headline` returns `answer` when one
-      // exists). A tree-of-thought node shows it `lineLimit 1` as a title above
-      // its full-answer detail. A Best-of-N candidate, expanded by default,
-      // renders its full answer in `detail()` below — so repeating the answer
-      // here would show it TWICE on the card. Suppress the headline text for an
-      // expanded Best-of-N candidate (detail owns the answer); keep it as the
-      // preview when the candidate is FOLDED (read-only history), where detail
-      // is hidden and the header is the only place the answer can show.
-      if !(isBestOfN && isExpanded) {
-        Text(headline)
-          .font(.caption.monospaced())
-          .foregroundStyle(headlineTint)
-          .lineLimit(isBestOfN && !isDimmed ? 3 : 1)
-          .strikethrough(isPruned, color: .secondary)
-          .frame(maxWidth: .infinity, alignment: .leading)
-      } else {
-        // Keep the header full-width so the glyph stays left-aligned and the
-        // whole card rectangle remains the pick/expand hit target.
-        Spacer(minLength: 0)
-      }
+      // The node's answer as a one-line title above its full-answer detail.
+      // (Tree-of-thought only — Best-of-N candidates render flat with no title.)
+      Text(headline)
+        .font(.caption.monospaced())
+        .foregroundStyle(headlineTint)
+        .lineLimit(1)
+        .strikethrough(isPruned, color: .secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
       // No chevron while the card is a pick target — a live pickable candidate
       // is always shown expanded and the only affordance is "tap to pick".
       if hasDetail, !isPickAction {

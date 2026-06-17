@@ -111,19 +111,18 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
     XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "<think>")).firstMatch.exists,
                    "[\(appearance)] no candidate answer may show raw <think> markup — reasoning is demuxed onto its own channel")
 
-    // #708 regression: a candidate's answer must render EXACTLY ONCE per card.
-    // A prior layout showed it twice — the header repeated `node.content` as a
-    // preview while `detail()` rendered the full answer below (visible on an
-    // expanded candidate with a short answer). A live pickable candidate is one
-    // Button, so its child Texts are flattened into the Button's accessibility
-    // label; a duplicate would make the answer appear twice in that one label.
-    // Assert the first candidate's answer (BestOfNRoundSeed.candidateTexts[0])
-    // occurs exactly once in its option row's label.
+    // #708 flat layout: a candidate has NO headline/title — its answer is shown
+    // once, flat in the body. (A prior layout repeated `node.content` as a
+    // header preview above the full-answer detail, showing it twice.) A live
+    // pickable candidate is one Button, so its child Texts flatten into the
+    // Button's accessibility label; a re-introduced headline would make the
+    // answer appear twice in that one label. Assert the first candidate's answer
+    // (BestOfNRoundSeed.candidateTexts[0]) occurs exactly once in its row label.
     let firstAnswer = "Go for a long walk in a nearby park and bring a book to read on a bench."
     let optionLabel = optionRow(0).label
     let answerOccurrences = optionLabel.components(separatedBy: firstAnswer).count - 1
     XCTAssertEqual(answerOccurrences, 1,
-                   "[\(appearance)] candidate answer must appear exactly once per card (no duplicate header+body); found \(answerOccurrences) in option label: \(optionLabel)")
+                   "[\(appearance)] flat candidate answer must appear exactly once (no headline/title duplicating the body); found \(answerOccurrences) in option label: \(optionLabel)")
 
     // The dropped Select buttons must be gone everywhere.
     XCTAssertFalse(app.descendants(matching: .any)
