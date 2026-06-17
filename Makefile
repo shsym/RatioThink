@@ -75,7 +75,7 @@ endef
         test-spec-smoke test-spec-bench test-spec-matrix-selftest bench-spec-matrix bench-datasets-prep bench-datasets-verify \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-gui-chat-switch test-gui-menu test-gui-engine-status test-gui-model-download test-menubar-icon-template \
-        test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured \
+        test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-tot-leak test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-apc-bench-selftest test-e2e-harsh-load test-e2e-cache-real bench-apc-real \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
@@ -721,6 +721,15 @@ test-e2e-full: ## E2E area (operator-gated): 3-layer real-model proof — GUI do
 
 test-e2e-package: ## E2E area: packaged first-launch → model download → chat uses persisted default (S7 packaged model-download, #379)
 	Scripts/run-first-launch-package-model-download-e2e.sh
+
+test-tot-leak: engine-build $(LOGDIR) ## E2E regression for the ToT KV-pressure crash (#679): heavy tree-of-thought under a tight KV budget; unfixed engine deadlocks, fixed completes (real portable-Metal engine + Qwen3-0.6B)
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-tot-leak.log; \
+	  MODEL=$${MODEL:-Qwen/Qwen3-0.6B} uv run --with ./Vendor/pie/client/python \
+	    python Inferlets/chat-apc/tot_leak_real.py 2>&1 | tee $$LOG | tail -25; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  exit $$status
 
 test-helper-respawn: ## Acceptance: live launchd Helper auto-respawn (needs signed/registered install)
 	Scripts/verify-helper-respawn.sh

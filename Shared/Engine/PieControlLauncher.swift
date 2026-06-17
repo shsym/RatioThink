@@ -68,13 +68,111 @@ private final class LaunchCancellationSignal: @unchecked Sendable {
 /// avoids the Python harness's `_drain_stdout` background task +
 /// `_send_signal_safe` dance.
 public enum PieControlLauncher {
-  /// Keep the app launcher aligned with pie's template/default scheduler
-  /// timeout. Tree-of-thought can run long, and on slower hardware a single
-  /// node/scorer forward-pass may exceed the old app-local 60s cap, closing
-  /// the SSE before a terminal tree frame. The shmem fire_batch path also
-  /// reads `PIE_SHMEM_TIMEOUT_S`, so launch() mirrors this value into the
-  /// child environment instead of relying on TOML alone.
-  static let requestTimeoutSeconds = 120
+  /// Floor for the engine request/prefill timeout — small models keep this.
+  /// Tree-of-thought can run long, and on slower hardware a single node/scorer
+  /// forward-pass may exceed the old app-local 60s cap, closing the SSE before
+  /// a terminal tree frame. 120s is pie's template/default; never go below it.
+  /// Public so it can default the `LaunchSpec.requestTimeoutSeconds` init arg.
+  public static let requestTimeoutFloorSeconds = 120
+
+  /// Hard ceiling for the size-aware scale-up. A genuinely-huge model on slow
+  /// Metal that still hasn't finished cold prefill past this point is a
+  /// different problem than a timeout; 600s (10 min) is the sane upper bound.
+  static let requestTimeoutCeilingSeconds = 600
+
+  /// Model weight footprint (GiB) at/below which the floor applies unchanged.
+  /// Covers the common 7–8B Q4 GGUFs (~4–5 GiB) that already cold-boot well
+  /// within 120s; headroom is only added for weights ABOVE this size.
+  static let requestTimeoutBaseGiB = 4.0
+
+  /// Extra cold-prefill headroom, in seconds, per GiB of model weights above
+  /// `requestTimeoutBaseGiB`. Larger Qwen3/Llama3 GGUFs spend proportionally
+  /// longer loading weights + JIT-compiling Metal kernels before the first
+  /// forward completes.
+  static let requestTimeoutSecondsPerGiB = 30
+
+  /// The engine's shmem hard-timeout escape-hatch env var. NOTE: the real pie
+  /// name is `PIE_SHMEM_TIMEOUT_S` (`runtime/src/shmem_ipc.rs`), NOT
+  /// `PIE_SHMEM_HARD_TIMEOUT_S`. An explicit value in the helper environment
+  /// wins over the size-aware default so an operator can always override.
+  static let shmemTimeoutEnvKey = "PIE_SHMEM_TIMEOUT_S"
+
+  /// Upper bound (24h) applied to the `PIE_SHMEM_TIMEOUT_S` override BEFORE the
+  /// `Double → Int` conversion. The override is deliberately allowed to exceed
+  /// the size-aware ceiling (it is the escape hatch), but a finite-but-huge
+  /// value (e.g. `"1e30"`) would trap `Int(secs)` past `Int.max` — and since
+  /// the var is operator-controlled in the privileged helper, that is a hard
+  /// crash at every launch, not a degraded timeout. 24h is far above any
+  /// legitimate cold boot while staying safely inside `Int`.
+  static let requestTimeoutOverrideMaxSeconds = 86_400
+
+  /// Resolve the engine request/prefill timeout (seconds) for a launch.
+  ///
+  /// Precedence:
+  ///   1. An explicit, valid `PIE_SHMEM_TIMEOUT_S` in `environment` wins
+  ///      unclamped (the escape hatch) — floored at 1s for sanity.
+  ///   2. Otherwise scale from the resolved model's weight bytes:
+  ///      `floor + perGiB × max(0, weightGiB − baseGiB)`, clamped to
+  ///      `[floor, ceiling]`. `nil`/zero bytes (unmeasurable) → floor.
+  ///
+  /// One value feeds all three lock-step sinks (`request_timeout_secs` in the
+  /// rendered TOML, the injected child `PIE_SHMEM_TIMEOUT_S`, and the
+  /// `LaunchSpec.handshakeTimeout` cold-boot lease) so they never drift.
+  static func resolvedRequestTimeoutSeconds(modelWeightBytes: Int64?,
+                                            environment: [String: String]) -> Int {
+    if let secs = validTimeoutOverride(environment) {
+      // Bound before converting: `Int(secs)` traps for finite values above
+      // Int.max ("1e30"), which would crash the privileged helper at launch.
+      let bounded = min(secs.rounded(), Double(requestTimeoutOverrideMaxSeconds))
+      return max(1, Int(bounded))
+    }
+    guard let bytes = modelWeightBytes, bytes > 0 else {
+      return requestTimeoutFloorSeconds
+    }
+    let gib = Double(bytes) / 1_073_741_824.0
+    let headroomGiB = max(0, gib - requestTimeoutBaseGiB)
+    let scaled = requestTimeoutFloorSeconds
+      + Int((headroomGiB * Double(requestTimeoutSecondsPerGiB)).rounded())
+    return min(requestTimeoutCeilingSeconds,
+               max(requestTimeoutFloorSeconds, scaled))
+  }
+
+  /// Parse `PIE_SHMEM_TIMEOUT_S` into a positive, finite seconds value, or
+  /// `nil` when the var is absent or fails the validity guard (non-numeric,
+  /// empty, `<= 0`, NaN, infinite). Single source of the accept predicate so
+  /// `resolvedRequestTimeoutSeconds` (which consumes the value) and
+  /// `rejectedTimeoutOverride` (which reports a silent rejection) can never
+  /// disagree about what counts as a valid override.
+  private static func validTimeoutOverride(_ environment: [String: String]) -> Double? {
+    guard let raw = environment[shmemTimeoutEnvKey],
+          let secs = Double(raw), secs.isFinite, secs > 0 else { return nil }
+    return secs
+  }
+
+  /// The raw `PIE_SHMEM_TIMEOUT_S` value when it is *present but invalid* —
+  /// the case `resolvedRequestTimeoutSeconds` silently discards before
+  /// falling back to the size-aware default — else `nil` (absent or valid).
+  /// A typo'd override (`"12O"`, `"abc"`, `"0"`) otherwise gives the operator
+  /// zero signal that it was ignored; the launch site logs this raw value
+  /// alongside the budget actually applied (#698 F3).
+  static func rejectedTimeoutOverride(environment: [String: String]) -> String? {
+    guard let raw = environment[shmemTimeoutEnvKey] else { return nil }
+    return validTimeoutOverride(environment) == nil ? raw : nil
+  }
+
+  /// The cold-boot handshake lease for a launch — the request/prefill timeout
+  /// clamped to the ceiling. The request/shmem-facing value
+  /// (`request_timeout_secs`, child `PIE_SHMEM_TIMEOUT_S`) may stay ABOVE the
+  /// ceiling when an operator overrides it (the escape hatch governs the
+  /// per-request forward/generation budget), but the BOOT lease must not: the
+  /// static XPC reply deadlines (`startReplyDeadline = coldStartHandshakeTimeout
+  /// + 15`) are sized to the ceiling, so a lease above it would let the XPC
+  /// fallback fire mid-boot and kill a still-booting engine — the exact failure
+  /// the deadline ordering is meant to prevent. Clamping here keeps the boot
+  /// lease strictly below `startReplyDeadline` for ANY override magnitude.
+  static func bootHandshakeTimeoutSeconds(requestTimeoutSeconds: Int) -> Int {
+    min(requestTimeoutSeconds, requestTimeoutCeilingSeconds)
+  }
 
   /// Regex that extracts the control-plane `host:port` from the engine's READY
   /// banner. Current pie (`server/src/serve.rs`) prints
@@ -87,20 +185,23 @@ public enum PieControlLauncher {
   /// runs, so without that test a banner-drift typo would ship green.
   static let readyBannerAddressPattern = #"(?:pie-server serving on |Server ready at ws://)([^\s]+:\d+)"#
 
-  /// Cold-start handshake budget the production resolver hands to
-  /// `LaunchSpec.handshakeTimeout` (#459). The default `handshakeTimeout`
-  /// (30s) is sized for the `.dummy` test launcher; a real `pie serve` cold
-  /// boot also loads the model weights into the device before printing its
-  /// READY handshake, which on slower hardware / larger models can exceed
-  /// 30s — the user saw `tree-of-thought` killed at exactly 30s while the
-  /// request/shmem timeouts were already 120s. Align the boot handshake with
-  /// the same 120s budget so a legitimately-slow cold start is not killed by
-  /// an out-of-band 30s ceiling. `PieEngineHost` adds its small
-  /// `launchTimeoutSlack` on top to form the process-lifetime lease, and the
-  /// XPC reply deadlines (`HelperExportedAPI.startReplyDeadline`,
-  /// `AppXPCClient.restartReplyTimeout`) sit strictly above that lease so no
-  /// outer layer reports a premature failure for a still-booting engine.
-  public static let coldStartHandshakeTimeout: TimeInterval = TimeInterval(requestTimeoutSeconds)
+  /// Upper bound on the cold-start handshake lease across ALL models. A real
+  /// `pie serve` cold boot loads the model weights into the device before
+  /// printing its READY handshake, which on slower hardware / larger models
+  /// can exceed the 30s `.dummy` default — the user saw `tree-of-thought`
+  /// killed at exactly 30s while the request/shmem timeouts were already 120s.
+  /// The production resolver now hands `LaunchSpec.handshakeTimeout` a
+  /// *per-model* boot lease (`bootHandshakeTimeoutSeconds`, floor 120s …
+  /// ceiling 600s); this constant is the CEILING of that range. The boot lease
+  /// is always clamped to it — even when an operator override pushes the
+  /// request/shmem timeout higher, only that per-request value rises, never the
+  /// boot lease. So the static XPC reply deadlines (`HelperExportedAPI
+  /// .startReplyDeadline`, `AppXPCClient.restartReplyTimeout`) derive from this
+  /// constant and sit strictly above the *largest* possible per-model lease,
+  /// never reporting a premature failure for a still-booting large model.
+  /// `PieEngineHost` adds its small `launchTimeoutSlack` on top to form the
+  /// process-lifetime lease.
+  public static let coldStartHandshakeTimeout: TimeInterval = TimeInterval(requestTimeoutCeilingSeconds)
 
   // MARK: - errors
 
@@ -235,6 +336,15 @@ public enum PieControlLauncher {
     /// `name@version` recorded in the manifest.
     public var inferletNameAtVersion: String
     public var handshakeTimeout: TimeInterval
+    /// Engine request/prefill timeout (seconds) for this launch — the value
+    /// that drives `request_timeout_secs` in the rendered TOML and the injected
+    /// child `PIE_SHMEM_TIMEOUT_S`. Defaults to the floor; the production
+    /// resolver sets the size-aware value via `resolvedRequestTimeoutSeconds`.
+    /// NOTE: `handshakeTimeout` (the boot lease) tracks this but is clamped to
+    /// the ceiling via `bootHandshakeTimeoutSeconds` — an operator override may
+    /// raise the per-request value above the ceiling without raising the boot
+    /// lease above the static XPC deadline.
+    public var requestTimeoutSeconds: Int
     /// Optional callback that receives the spawned pid the moment
     /// `Process.run()` returns. `IsolatedTestCase` passes
     /// `trackSubprocess(_:)` here so tearDown can reap stragglers.
@@ -287,6 +397,7 @@ public enum PieControlLauncher {
                 shmemName: String,
                 inferletNameAtVersion: String = "chat-apc@0.1.0",
                 handshakeTimeout: TimeInterval = 30,
+                requestTimeoutSeconds: Int = PieControlLauncher.requestTimeoutFloorSeconds,
                 pidSink: (@Sendable (pid_t) -> Void)? = nil,
                 profileID: String = "isolated",
                 daemonBindHost: EngineHTTPBindMode = Self.defaultDaemonBindHost,
@@ -308,6 +419,7 @@ public enum PieControlLauncher {
       self.shmemName = shmemName
       self.inferletNameAtVersion = inferletNameAtVersion
       self.handshakeTimeout = handshakeTimeout
+      self.requestTimeoutSeconds = requestTimeoutSeconds
       self.pidSink = pidSink
       self.profileID = profileID
       self.daemonBindHost = daemonBindHost
@@ -610,13 +722,15 @@ public enum PieControlLauncher {
     let httpPort = try reserveFreePort()
     let configURL = try writeConfig(
       modelConfig: spec.modelConfig, defaultTokenLimit: spec.defaultTokenLimit,
-      maxNumKvPages: spec.maxNumKvPages, in: spec.pieHome
+      maxNumKvPages: spec.maxNumKvPages,
+      requestTimeoutSeconds: spec.requestTimeoutSeconds, in: spec.pieHome
     )
 
     let env = renderSubprocessEnvironment(
       base: spec.subprocessEnvironment,
       pieHome: spec.pieHome,
-      shmemName: spec.shmemName
+      shmemName: spec.shmemName,
+      requestTimeoutSeconds: spec.requestTimeoutSeconds
     )
 
     let proc = Process()
@@ -646,8 +760,13 @@ public enum PieControlLauncher {
       ("binary", DiagnosticLog.redactHome(spec.pieBinary.path)),
       ("config", DiagnosticLog.redactHome(configURL.path)),
       ("pieHome", DiagnosticLog.redactHome(spec.pieHome.path)),
-      ("request_timeout_secs", String(requestTimeoutSeconds)),
+      ("request_timeout_secs", String(spec.requestTimeoutSeconds)),
       ("PIE_SHMEM_TIMEOUT_S", env["PIE_SHMEM_TIMEOUT_S"] ?? "?"),
+      // Clamped cold-boot lease (`bootHandshakeTimeoutSeconds`): the pre-READY
+      // weight-load window, capped at the 600s ceiling even when an operator
+      // override pushes the per-request budget above it (#698 F6). Logged next
+      // to the request/shmem timeout so the two values are diff-able in one line.
+      ("handshake_timeout_secs", String(Int(spec.handshakeTimeout))),
       ("shmem", spec.shmemName),
     ])
 
@@ -829,10 +948,12 @@ public enum PieControlLauncher {
   static func writeConfig(modelConfig: ModelConfig,
                           defaultTokenLimit: Int? = nil,
                           maxNumKvPages: Int? = nil,
+                          requestTimeoutSeconds: Int = requestTimeoutFloorSeconds,
                           in pieHome: URL) throws -> URL {
     let configURL = pieHome.appendingPathComponent("config.toml")
     let body = renderConfigBody(modelConfig: modelConfig, defaultTokenLimit: defaultTokenLimit,
-                                maxNumKvPages: maxNumKvPages)
+                                maxNumKvPages: maxNumKvPages,
+                                requestTimeoutSeconds: requestTimeoutSeconds)
     do {
       try FileManager.default.createDirectory(at: pieHome, withIntermediateDirectories: true)
       try body.write(to: configURL, atomically: true, encoding: .utf8)
@@ -846,7 +967,8 @@ public enum PieControlLauncher {
   /// tests can pin the emitted body without writing to disk.
   static func renderConfigBody(modelConfig: ModelConfig,
                                defaultTokenLimit: Int? = nil,
-                               maxNumKvPages: Int? = nil) -> String {
+                               maxNumKvPages: Int? = nil,
+                               requestTimeoutSeconds: Int = requestTimeoutFloorSeconds) -> String {
     let preamble = """
     [server]
     host = "127.0.0.1"
@@ -961,7 +1083,8 @@ public enum PieControlLauncher {
   static func renderSubprocessEnvironment(
     base: [String: String],
     pieHome: URL,
-    shmemName: String
+    shmemName: String,
+    requestTimeoutSeconds: Int = requestTimeoutFloorSeconds
   ) -> [String: String] {
     var env = base
     env["PIE_HOME"] = pieHome.path

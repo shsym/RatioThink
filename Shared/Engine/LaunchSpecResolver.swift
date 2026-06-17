@@ -185,6 +185,19 @@ public struct LaunchSpecResolver {
     case .success(let resolved): modelRef = resolved
     case .failure(let err):      return .failure(err)
     }
+    // Refuse a quantized HF/MLX safetensors model before spawning the
+    // engine — whether `resolveModelRef` resolved to a snapshot directory
+    // or a single `.safetensors` file. The catalog marks such rows
+    // unlaunchable so the picker can't select them, but a stale or hand-
+    // authored profile could name one — fail fast with the exact dtype
+    // reason instead of the cryptic engine rc=-1 (mirrors the split-GGUF
+    // fast-fail above).
+    if let reason = HFCacheCatalog.quantizedSafetensorsReason(forResolvedModelPath: modelRef) {
+      return .failure(EngineError(
+        code: .invalidInput,
+        message: "\(reason) (model=\(profile.model))"
+      ))
+    }
     let shmem = Self.uniqueShmemName()
     let env = subprocessEnvironment()
     do {
@@ -196,13 +209,46 @@ public struct LaunchSpecResolver {
       // `runtime::max-output-tokens`. Down-only: `nil` (omit) when the
       // metadata can't be read or the host sustains the full default.
       let modelURL = URL(fileURLWithPath: modelRef, isDirectory: false)
+      let weightBytes = ModelMemoryGuardrail.resolvedBytes(resolvedModelURL: modelURL)
       let defaultTokenLimit: Int? = ModelArchMetadata.read(resolvedModelURL: modelURL)
         .flatMap { metadata in
-          ModelMemoryGuardrail.resolvedBytes(resolvedModelURL: modelURL).flatMap { weightBytes in
+          weightBytes.flatMap { bytes in
             KVCacheBudget.outputTokenCeiling(
-              policy: memoryPolicy(), weightBytes: weightBytes, metadata: metadata)
+              policy: memoryPolicy(), weightBytes: bytes, metadata: metadata)
           }
         }
+      // Size-aware engine timeout (#687): larger GGUFs need a longer cold
+      // Metal prefill budget than the 120s floor. An explicit
+      // PIE_SHMEM_TIMEOUT_S in the helper environment (read pre-sanitize)
+      // overrides the computed default — see `resolvedRequestTimeoutSeconds`.
+      let hostEnv = ProcessInfo.processInfo.environment
+      let requestTimeoutSeconds = PieControlLauncher.resolvedRequestTimeoutSeconds(
+        modelWeightBytes: weightBytes,
+        environment: hostEnv)
+      // (#698 F3) A present-but-invalid PIE_SHMEM_TIMEOUT_S is silently dropped
+      // by the resolver, which falls back to the size-aware default. A typo'd
+      // override would otherwise leave no trace — name the rejected raw value
+      // and the budget actually applied so the operator can spot the mistake.
+      if let rejected = PieControlLauncher.rejectedTimeoutOverride(environment: hostEnv) {
+        DiagnosticLog.helper.event("engine.timeout.override-rejected", [
+          ("raw", rejected),
+          ("applied_request_timeout_secs", String(requestTimeoutSeconds)),
+        ])
+      }
+      // (#698 F5) The model resolved AND passed ModelMemoryGuardrail.validate
+      // above — validate fails CLOSED on an unmeasurable artifact — so reaching
+      // here with nil weight bytes means the file became unreadable AFTER
+      // validation (a TOCTOU race: deleted/relocated mid-launch), not a normal
+      // small model. Both nil and measured-small otherwise collapse to the 120s
+      // floor; distinguish them so an operator sees the budget was sized blind
+      // and can extend it via PIE_SHMEM_TIMEOUT_S if the model is in fact large.
+      if weightBytes == nil {
+        DiagnosticLog.helper.event("engine.timeout.weight-bytes-unmeasurable", [
+          ("model", model),
+          ("path", DiagnosticLog.redactHome(modelRef)),
+          ("applied_request_timeout_secs", String(requestTimeoutSeconds)),
+        ])
+      }
       let spec = try PieControlLauncher.LaunchSpec(
         pieBinary: binary,
         wasmURL: resources.wasm,
@@ -212,10 +258,16 @@ public struct LaunchSpecResolver {
         shmemName: shmem,
         inferletNameAtVersion: inferletNameAtVersion,
         // Real `pie serve` cold boot loads the model weights before the READY
-        // handshake; align the boot budget with the 120s request/shmem
-        // timeouts so a slow large-model start is not killed by the 30s
-        // default handshake ceiling (#459 evidence).
-        handshakeTimeout: PieControlLauncher.coldStartHandshakeTimeout,
+        // handshake; align the boot budget with the size-aware request/shmem
+        // timeout so a slow large-model start is not killed by the 30s default
+        // handshake ceiling (#459 evidence, #687 size scaling). The BOOT lease
+        // is clamped to the ceiling (`bootHandshakeTimeoutSeconds`) so it stays
+        // strictly below the static XPC reply deadline even when an operator
+        // override pushes the request/shmem value above the ceiling.
+        handshakeTimeout: TimeInterval(
+          PieControlLauncher.bootHandshakeTimeoutSeconds(
+            requestTimeoutSeconds: requestTimeoutSeconds)),
+        requestTimeoutSeconds: requestTimeoutSeconds,
         profileID: profile.id,
         daemonBindHost: daemonBindMode(),
         modelConfig: .portableResolved(servedModelID: model, modelRef: modelRef),
