@@ -107,8 +107,8 @@ cpu_pages = {CPU_PAGES}
 """
 
 
-def _ok_leaves(body: dict) -> list[dict]:
-    """Flatten the tree and return the ok (non-error) leaf nodes."""
+def _leaves(body: dict) -> list[dict]:
+    """Flatten the tree and return its non-root leaf nodes."""
     out: list[dict] = []
 
     def walk(n: dict) -> None:
@@ -119,29 +119,47 @@ def _ok_leaves(body: dict) -> list[dict]:
             walk(c)
 
     walk(body.get("root") or {})
-    return [n for n in out if n.get("status") == "ok"]
+    return out
+
+
+def _ok_leaves(body: dict) -> list[dict]:
+    """Leaves that produced a scorable answer (`status=="ok"`)."""
+    return [n for n in _leaves(body) if n.get("status") == "ok"]
+
+
+def _survived_leaves(body: dict) -> list[dict]:
+    """Leaves that did NOT hard-fail: an `ok` answer or a benign budget-
+    truncated `incomplete` (`src/tot/tree.rs:26-31`). A branch that reasoned
+    but ran out of answer budget is not a leaked-page victim — only Aborted
+    (`status=="error"`) / scorer-collapse branches are."""
+    return [n for n in _leaves(body) if n.get("status") in ("ok", "incomplete")]
 
 
 def _node_failures(body: dict) -> list[str]:
     """Collect every node that died — structurally, not by message text.
 
-    A KV-eviction / forward-pass starvation under the leak surfaces three
-    ways in the tree (`src/tot/tree.rs`): a node with status=="error" (its
-    generation or pre-gen fork failed), a non-null `error` diagnostic, or a
-    non-null `score_error` (the *value-scoring* fork collapsed while the
-    node itself stayed "ok"). Matching on substrings like "fork failed"
-    missed the decode-failure wording AND the whole scorer-fork half of the
-    surface; flag the structure so wording drift can't false-green it.
+    A KV-eviction / forward-pass starvation under the leak surfaces two
+    ways in the tree (`src/tot/search.rs::classify`): an Aborted node with
+    status=="error" (its generation or pre-gen fork failed, always carrying
+    `error`), or a non-null `score_error` (the *value-scoring* fork collapsed
+    while the node itself stayed "ok"). Matching on substrings like "fork
+    failed" missed the decode-failure wording AND the whole scorer-fork half
+    of the surface; flag the structure so wording drift can't false-green it.
+
+    `status=="incomplete"` is deliberately NOT a failure: an Incomplete node
+    (budget-truncated `<think>`, or a prompt-echo answer) ALSO carries a
+    non-null `error`, but it's a benign token-budget outcome — and this
+    harness drives long thinking traces on purpose, so Incomplete leaves are
+    expected on a healthy engine. Only flag a non-"ok"/"incomplete" status's
+    `error` (a future hard-failure variant), never the incomplete one.
     """
     errs: list[str] = []
 
     def walk(n: dict) -> None:
         nid = n.get("id")
         if nid != "root":
-            if n.get("status") == "error":
-                errs.append(f"{nid}: status=error ({n.get('error')!r})")
-            elif isinstance(n.get("error"), str):
-                errs.append(f"{nid}: error={n['error']!r}")
+            if n.get("status") not in ("ok", "incomplete") and isinstance(n.get("error"), str):
+                errs.append(f"{nid}: status={n.get('status')!r} error={n['error']!r}")
             if isinstance(n.get("score_error"), str):
                 errs.append(f"{nid}: score_error={n['score_error']!r}")
         for c in n.get("children") or []:
@@ -232,10 +250,11 @@ async def main() -> int:
                             break
                         body = json.loads(r.text)
                         oks = _ok_leaves(body)
+                        survived = _survived_leaves(body)
                         ff = _node_failures(body)
                         sel = body.get("selected_node_id")
-                        print(f"[tot-leak] req {i}/{NUM_REQUESTS}: ok_leaves={len(oks)}/{BREADTH} "
-                              f"node_failures={len(ff)} selected={sel!r}")
+                        print(f"[tot-leak] req {i}/{NUM_REQUESTS}: ok_leaves={len(oks)} "
+                              f"survived={len(survived)}/{BREADTH} node_failures={len(ff)} selected={sel!r}")
                         if ff:
                             failures.append(f"request {i}: {len(ff)} starved/errored nodes: {ff[:3]!r}")
                             break
@@ -243,12 +262,13 @@ async def main() -> int:
                             failures.append(f"request {i}: no selection (tree starved): {body!r}")
                             break
                         # Surviving-branch floor: at DEPTH=1 every one of the
-                        # BREADTH children must come back ok. A thinned tree
-                        # (e.g. 1/4 survived under KV pressure) is the
-                        # partial-starvation face of #679 — fail it, don't
-                        # pass on a single lucky leaf.
-                        if DEPTH == 1 and len(oks) != BREADTH:
-                            failures.append(f"request {i}: only {len(oks)}/{BREADTH} branches survived "
+                        # BREADTH children must come back without a HARD
+                        # failure (ok or benign budget-truncated incomplete).
+                        # A thinned tree (e.g. 1/4 materialized under KV
+                        # pressure) is the partial-starvation face of #679 —
+                        # fail it, don't pass on a single lucky leaf.
+                        if DEPTH == 1 and len(survived) != BREADTH:
+                            failures.append(f"request {i}: only {len(survived)}/{BREADTH} branches survived "
                                             f"(thinned tree — partial starvation): {body!r}")
                             break
                         ok_count += 1
