@@ -172,8 +172,9 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
 
     // #708 read-only history: commit the round with 'Use this'. The round
     // finalizes — the interactive controls disappear and (re-expanding the
-    // now-folded disclosure) the candidates render read-only: the chosen one is
-    // still highlighted, none are `pickable`, and tapping one no longer picks.
+    // now-folded disclosure) it collapses to JUST the chosen candidate: the
+    // unpicked rows are gone entirely, so locked history reads as a single
+    // answer, not a candidate list.
     app.buttons["bestofn.useThis"].click()
     XCTAssertTrue(waitForDisappearance(app.buttons["bestofn.useThis"], timeout: 10),
                   "[\(appearance)] 'Use this' must disappear once the round is committed")
@@ -187,25 +188,37 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
     if disclosure.waitForExistence(timeout: 5) { disclosure.click() }
     XCTAssertTrue(stateMarker(reselectIdx, "chosen").waitForExistence(timeout: 5),
                   "[\(appearance)] the committed choice \(reselectIdx) must stay highlighted in read-only history; app tree: \(app.debugDescription)")
-    for idx in 0..<n {
-      XCTAssertFalse(stateMarker(idx, "pickable").exists,
-                     "[\(appearance)] read-only history candidate \(idx) must not be 'pickable'")
+    // #708 collapse-to-chosen: the unpicked candidates are HIDDEN entirely in a
+    // finalized round — their option rows and state markers are absent.
+    for idx in 0..<n where idx != reselectIdx {
+      XCTAssertFalse(optionRow(idx).exists,
+                     "[\(appearance)] unpicked candidate \(idx) must be hidden in finalized history; app tree: \(app.debugDescription)")
+      for state in ["pickable", "chosen", "unpicked", "unavailable"] {
+        XCTAssertFalse(stateMarker(idx, state).exists,
+                       "[\(appearance)] unpicked candidate \(idx) must not render any row (state '\(state)') in finalized history")
+      }
     }
-    // #708: a committed round renders its answer ONLY as the highlighted chosen
-    // candidate — NOT also as a plain content bubble. The committed text equals
-    // the reselected candidate's answer (BestOfNRoundSeed.candidateTexts[2]); the
-    // candidate exposes it as a StaticText's `value` (its `label` is the "Selected"
-    // state). Count every element rendering that exact text (as value OR label):
-    // exactly ONE (the chosen candidate). A duplicate content bubble would make
-    // it two — reverting the MessageBubble content-bubble suppression fails this.
+    // The unpicked candidate ANSWERS are absent from the locked round.
+    for unpickedAnswer in [
+      "Go for a long walk in a nearby park and bring a book to read on a bench.",
+      "Cook something ambitious you have never tried, then invite a friend to share it.",
+    ] {
+      XCTAssertEqual(app.descendants(matching: .any)
+        .matching(NSPredicate(format: "value == %@ OR label == %@", unpickedAnswer, unpickedAnswer)).count, 0,
+        "[\(appearance)] unpicked answer must not render in finalized history: \(unpickedAnswer)")
+    }
+    // The chosen answer renders EXACTLY ONCE — as the chosen candidate (it
+    // exposes the text as a StaticText `value`; `label` is the "Selected"
+    // state) — and NOT also as a plain content bubble. A duplicate content
+    // bubble would make it two; reverting the MessageBubble suppression fails.
     let committedAnswer = "Take a day trip to a town one train ride away and wander with no fixed plan."
     let answerRenders = app.descendants(matching: .any)
       .matching(NSPredicate(format: "value == %@ OR label == %@", committedAnswer, committedAnswer)).count
     XCTAssertEqual(answerRenders, 1,
                    "[\(appearance)] committed answer must render exactly once (chosen candidate only, no content-bubble duplicate); found \(answerRenders)")
-    // Tapping a read-only option toggles expand only — it must not re-pick or
-    // resurrect the commit controls.
-    optionRow(0).click()
+    // Tapping the chosen read-only candidate must not re-pick or resurrect the
+    // commit controls.
+    optionRow(reselectIdx).click()
     XCTAssertFalse(app.buttons["bestofn.useThis"].exists,
                    "[\(appearance)] tapping a read-only candidate must not re-open the round")
   }

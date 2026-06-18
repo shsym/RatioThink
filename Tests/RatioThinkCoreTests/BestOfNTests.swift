@@ -300,6 +300,31 @@ final class BestOfNTests: XCTestCase {
     XCTAssertNil(BestOfNRound.liveRoundID(in: [Message(role: "assistant", content: "plain")]))
   }
 
+  // MARK: collapse-to-chosen in finalized history (#708)
+
+  /// The LIVE (interactive) round renders every candidate, pickable.
+  func test_visibleCandidateIDs_live_round_shows_all() {
+    XCTAssertEqual(
+      BestOfNRound.visibleCandidateIDs(["a", "b", "c"], isInteractive: true, chosenID: "b"),
+      ["a", "b", "c"])
+  }
+
+  /// A FINALIZED read-only round WITH a choice collapses to the chosen candidate
+  /// alone — locked history reads as a single answer, not a candidate list.
+  func test_visibleCandidateIDs_finalized_with_choice_shows_only_chosen() {
+    XCTAssertEqual(
+      BestOfNRound.visibleCandidateIDs(["a", "b", "c"], isInteractive: false, chosenID: "b"),
+      ["b"])
+  }
+
+  /// A finalized round with NO choice (pure abandon) keeps every candidate —
+  /// show what happened, don't blank it.
+  func test_visibleCandidateIDs_abandoned_round_shows_all() {
+    XCTAssertEqual(
+      BestOfNRound.visibleCandidateIDs(["a", "b", "c"], isInteractive: false, chosenID: nil),
+      ["a", "b", "c"])
+  }
+
   // MARK: selection-flash regression (#708) — option presentation from frame 1
 
   /// The selection-flash bug: a Best-of-N turn streams its candidates into
