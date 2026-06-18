@@ -789,7 +789,8 @@ struct ContentToolbar: View {
 /// Compact context-occupancy bar — ~3 SF-symbol-widths wide, sits between
 /// the trailing spacer and the params button. Fill = used/window; the
 /// colour escalates green → amber → red as the conversation fills toward
-/// the engine-true context window. `internal` (not `private`) so the pure
+/// the engine-true context window. Tapping it opens a detail popover with
+/// the real numbers (#711 follow-up). `internal` (not `private`) so the pure
 /// colour/label logic is unit-testable (`ContextMeterViewTests`) and the
 /// bar can be rendered to a PNG in a snapshot test.
 struct ContextMeterView: View {
@@ -799,7 +800,9 @@ struct ContextMeterView: View {
   private let trackWidth: CGFloat = 44
   private let trackHeight: CGFloat = 6
 
-  var body: some View {
+  @State private var showDetail = false
+
+  private var bar: some View {
     ZStack(alignment: .leading) {
       Capsule().fill(Color.secondary.opacity(0.2))
       if let fraction = usage.fraction {
@@ -809,11 +812,19 @@ struct ContextMeterView: View {
       }
     }
     .frame(width: trackWidth, height: trackHeight)
-    .help(Self.label(for: usage))
-    .accessibilityElement()
-    .accessibilityIdentifier("toolbar.contextMeter")
-    .accessibilityLabel("Context usage")
-    .accessibilityValue(Self.label(for: usage))
+  }
+
+  var body: some View {
+    Button { showDetail.toggle() } label: { bar }
+      .buttonStyle(.plain)
+      .help(Self.label(for: usage))
+      .accessibilityIdentifier("toolbar.contextMeter")
+      .accessibilityLabel("Context usage")
+      .accessibilityValue(Self.label(for: usage))
+      .accessibilityHint("Shows context and memory details")
+      .popover(isPresented: $showDetail, arrowEdge: .top) {
+        ContextMeterDetail(usage: usage)
+      }
   }
 
   /// Green under 75 %, amber 75–90 %, red above — a coarse "how close to
@@ -836,6 +847,85 @@ struct ContextMeterView: View {
       return "Context: \(used) / \(window.formatted()) tokens (\(pct)%)"
     }
     return "Context: \(used) tokens (window unknown)"
+  }
+}
+
+/// Detail popover for the context meter (#711 follow-up): the real context
+/// numbers (used / window tokens + a context-pressure percent) and the RAM
+/// guardrail in GB (the model-size ceiling vs system RAM). Matches the
+/// toolbar's existing popover style. `internal` so the pure formatting is
+/// unit-testable (`ContextMeterDetailTests`).
+struct ContextMeterDetail: View {
+  let usage: ContextUsage
+
+  /// The memory guardrail line, computed once on appear — `livePolicy()` does
+  /// a blocking dial read, so it must not run per-render.
+  @State private var memory: String = ContextMeterDetail.loadingMemoryLine
+
+  static let loadingMemoryLine = "Reading system memory…"
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      VStack(alignment: .leading, spacing: 4) {
+        Text("Context")
+          .font(.caption).foregroundStyle(.secondary)
+        Text(Self.tokensLine(for: usage))
+          .font(.callout).monospacedDigit()
+          .accessibilityIdentifier("contextMeter.tokens")
+        if let pct = Self.pressurePercent(for: usage), let fraction = usage.fraction {
+          HStack(spacing: 6) {
+            Circle().fill(ContextMeterView.fillColor(fraction)).frame(width: 8, height: 8)
+            Text("\(pct)% of context window")
+              .font(.callout)
+          }
+          .accessibilityElement(children: .ignore)
+          .accessibilityIdentifier("contextMeter.pressure")
+          .accessibilityLabel("Context pressure \(pct) percent")
+        }
+      }
+
+      Divider()
+
+      VStack(alignment: .leading, spacing: 4) {
+        Text("Memory")
+          .font(.caption).foregroundStyle(.secondary)
+        Text(memory)
+          .font(.callout)
+          .fixedSize(horizontal: false, vertical: true)
+          .accessibilityIdentifier("contextMeter.memory")
+      }
+    }
+    .padding(16)
+    .frame(width: 260)
+    .onAppear { memory = Self.memoryLine(policy: ModelMemoryGuardrail.livePolicy()) }
+  }
+
+  /// `used / window tokens`, or `used tokens (window unknown)` before the
+  /// window is known (zero-state or a pre-follow-up engine).
+  static func tokensLine(for usage: ContextUsage) -> String {
+    let used = usage.usedTokens.formatted()
+    if let window = usage.windowTokens, window > 0 {
+      return "\(used) / \(window.formatted()) tokens"
+    }
+    return "\(used) tokens (window unknown)"
+  }
+
+  /// Context pressure as a whole percent of the window (`used / window`), or
+  /// `nil` when the window is unknown.
+  static func pressurePercent(for usage: ContextUsage) -> Int? {
+    guard let fraction = usage.fraction else { return nil }
+    return Int((fraction * 100).rounded())
+  }
+
+  /// RAM guardrail headroom in GB: the model-size ceiling vs system RAM. Pure
+  /// over the policy so the formatting is unit-testable without reading the
+  /// dial.
+  static func memoryLine(policy: ModelMemoryGuardrail.Policy) -> String {
+    let model = InstalledModels.formattedSize(policy.maxResolvedModelBytes)
+    if let ram = policy.physicalMemoryBytes, ram > 0 {
+      return "Up to \(model) model · \(InstalledModels.formattedSize(ram)) system RAM"
+    }
+    return "Up to \(model) model (system RAM unknown)"
   }
 }
 
