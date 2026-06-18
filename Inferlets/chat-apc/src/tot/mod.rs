@@ -418,6 +418,13 @@ async fn dispatch_streaming(
     {
         return em.finish();
     }
+    // #711 follow-up: the persistent conversation context fill = the base
+    // context's occupancy (the transcript the round forks from); the
+    // candidate answers live in forks, not the base. Capture it before
+    // `run` consumes `root_ctx`. `context_window` is omitted — the app holds
+    // the engine-true budget from its model-load seed (a bare context can't
+    // read the per-driver budget until a forward caches the driver).
+    let base_used = root_ctx.seq_len() + root_ctx.buffer().len() as u32;
     let started = Instant::now();
     let outcome = search::run(root_ctx, params, model, Some(&mut em)).await;
     if let Some((code, message)) =
@@ -452,6 +459,17 @@ async fn dispatch_streaming(
                 .await;
         }
     }
+    // #711 follow-up: report occupancy through the shared usage seam so the
+    // context meter populates after a tree-of-thought turn (window from the
+    // app's model-load seed). `completion_tokens` = this round's generation.
+    sse::emit_usage_logged(
+        &mut em,
+        base_used,
+        outcome.total_generated_tokens as u32,
+        None,
+        "tot_usage",
+    )
+    .await;
     sse::emit_done_logged(&mut em, "tot_terminal").await;
     em.finish()
 }

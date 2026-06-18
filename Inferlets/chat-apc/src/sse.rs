@@ -230,6 +230,30 @@ impl SseUsage {
     }
 }
 
+/// Emit the single `event:"usage"` meta-frame on a generation terminal —
+/// the ONE seam every path reports occupancy through (the two standard
+/// stream exits plus the ToT/BoN round terminals), so adding a generating
+/// path is wiring, not a copied emit block (#711 follow-up). `context_window`
+/// is `None` for paths whose budget the app already holds from the
+/// model-load seed. Peer-disconnect is silent (expected EOF); a serialize
+/// bug is logged (mirrors `emit_done_logged`).
+pub async fn emit_usage_logged(
+    em: &mut Emitter,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    context_window: Option<u32>,
+    site: &str,
+) {
+    let frame = SseUsage::new(prompt_tokens, completion_tokens, context_window);
+    match em.emit_json(&frame).await {
+        Ok(()) => {}
+        Err(EmitError::Disconnected) => {}
+        Err(EmitError::Serialize(e)) => {
+            eprintln!("[chat-apc] usage meta-frame at {site} serialize bug: {e}")
+        }
+    }
+}
+
 /// The `[DONE]` terminator OpenAI's SSE chat-completions schema ends
 /// every stream with. Clients pin on this exact byte sequence.
 pub async fn emit_done(em: &mut Emitter) -> Result<(), EmitError> {

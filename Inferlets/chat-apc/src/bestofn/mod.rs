@@ -480,6 +480,14 @@ async fn run_round(
             report.released, report.requested
         );
     }
+    // #711 follow-up: report occupancy through the shared usage seam so the
+    // context meter populates after a Best-of-N round. The persistent context
+    // fill is the base's occupancy (the transcript the candidates fork from);
+    // the candidate answers live in snapshots, not the base, and only one is
+    // committed when the user picks next turn. `context_window` is omitted —
+    // the app holds the engine-true budget from its model-load seed.
+    let base_used = base_ctx.seq_len() + base_ctx.buffer().len() as u32;
+    sse::emit_usage_logged(&mut em, base_used, 0, None, "bon_usage").await;
     sse::emit_done_logged(&mut em, "bon_terminal").await;
     em.finish()
 }

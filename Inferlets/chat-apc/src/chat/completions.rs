@@ -3760,17 +3760,18 @@ async fn handle_streaming(
         }
         // #711: engine-true context meter on the JSON-constrained path too,
         // mirroring the plain stream exit. Always emitted (the app's meter
-        // reads this, independent of the OpenAI `include_usage` opt-in above).
+        // reads this, independent of the OpenAI `include_usage` opt-in above)
+        // through the shared usage seam.
         {
             let window = ctx.max_tokens();
-            let frame = sse::SseUsage::new(
+            sse::emit_usage_logged(
+                &mut em,
                 prompt_tokens as u32,
                 completion_tokens as u32,
                 (window > 0).then_some(window),
-            );
-            if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
-                eprintln!("[chat-apc] json usage meta-frame serialize bug: {e}");
-            }
+                "json_stream_exit",
+            )
+            .await;
         }
         sse::emit_done_logged(&mut em, "json_stream_exit").await;
         return em.finish();
@@ -4264,13 +4265,9 @@ async fn handle_streaming(
         }
     }
     // #711: engine-true token meter for the conversation context. Always
-    // emitted (cheap) so the GUI renders used/window on every turn.
-    {
-        let frame = sse::SseUsage::new(usage_prompt, usage_completion, usage_window);
-        if let Err(EmitError::Serialize(e)) = em.emit_json(&frame).await {
-            eprintln!("[chat-apc] usage meta-frame serialize bug: {e}");
-        }
-    }
+    // emitted (cheap) so the GUI renders used/window on every turn, through
+    // the shared usage seam.
+    sse::emit_usage_logged(&mut em, usage_prompt, usage_completion, usage_window, "stream_exit").await;
     sse::emit_done_logged(&mut em, "stream_exit").await;
     em.finish()
 }

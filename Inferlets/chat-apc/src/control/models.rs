@@ -1,6 +1,8 @@
 //! `GET /v1/models` — OpenAI-shape model list, driven by
 //! `inferlet::runtime::models()`.
 
+use inferlet::model::Model;
+use inferlet::Context;
 use serde::Serialize;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Response};
@@ -19,6 +21,29 @@ struct ModelObject {
     /// would reject with a clean 400. Engine-global (the minimum across
     /// registered models), so every entry carries the same value.
     max_output_tokens: u32,
+    /// chat-apc extension (#711 follow-up): KV tokens-per-page for this
+    /// model — a model-indexed engine constant, set at model spawn and
+    /// readable from a bare context with NO forward pass (page size does
+    /// not depend on a driver, unlike `budget-page-count`). The App
+    /// multiplies it by the model's `kv_pages_total` (from its live
+    /// `model_status` poll) to show the engine-true context window the
+    /// instant a model loads — `0 / window` before the first turn, without
+    /// waiting for a turn's `usage` frame. `0` when unreadable (the App
+    /// then treats the window as unknown).
+    tokens_per_page: u32,
+}
+
+/// KV tokens-per-page for `model_id`, read from a fresh bare context. This
+/// is a control-only metadata read: `Context::new` allocates no KV pages and
+/// runs no forward pass, and `page_size` resolves from the model-indexed page
+/// size cached at model spawn. `0` if the model can't be loaded/opened, which
+/// the App reads as "window unknown".
+fn tokens_per_page(model_id: &str) -> u32 {
+    Model::load(model_id)
+        .ok()
+        .and_then(|model| Context::new(&model).ok())
+        .map(|ctx| ctx.page_size())
+        .unwrap_or(0)
 }
 
 #[derive(Serialize)]
@@ -34,11 +59,15 @@ pub async fn handle(res: Responder) -> Finished {
     let max_output_tokens = inferlet::runtime::max_output_tokens();
     let data: Vec<ModelObject> = inferlet::runtime::models()
         .into_iter()
-        .map(|id| ModelObject {
-            id,
-            object: "model",
-            owned_by: "pie",
-            max_output_tokens,
+        .map(|id| {
+            let tokens_per_page = tokens_per_page(&id);
+            ModelObject {
+                id,
+                object: "model",
+                owned_by: "pie",
+                max_output_tokens,
+                tokens_per_page,
+            }
         })
         .collect();
     let list = ModelList {
