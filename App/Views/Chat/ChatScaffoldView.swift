@@ -928,13 +928,12 @@ struct ChatScaffoldView: View {
 
   // MARK: - Best-of-N interaction (#690)
 
-  /// The latest uncommitted Best-of-N round (a round message with pick metadata
-  /// but no committed answer yet) — the one row that shows the live controls.
+  /// The live Best-of-N round — the trailing, still-uncommitted round that shows
+  /// the interactive controls. Single source of the liveness rule lives on
+  /// `BestOfNRound` (so it is unit-testable); see its doc for why "trailing"
+  /// rather than "last content-empty" (#708 pick-then-abandon hole).
   private func liveBestOfNRoundID(in chat: Chat) -> UUID? {
-    chat.messages
-      .sorted(by: Message.transcriptPrecedes)
-      .last { $0.bestOfN != nil && $0.content.isEmpty }?
-      .id
+    BestOfNRound.liveRoundID(in: chat.messages)
   }
 
   /// The chosen candidate's answer text, read from the round's persisted
@@ -949,9 +948,12 @@ struct ChatScaffoldView: View {
   ///  - `.pick` records (or re-records) the chosen candidate on the round —
   ///    highlight it; re-picking a different id just overwrites the choice
   ///    (#708, all candidate snapshots stay alive until think-more / stop).
-  ///  - `.thinkMore` starts the next round expanding from the pick (warm-resume
-  ///    from its snapshot, falling back to re-prefill server-side on a miss).
+  ///  - `.thinkMore` commits the chosen candidate as this round's final answer
+  ///    (locking it into read-only history, same as `.stop`) AND spawns the next
+  ///    round expanding from the pick (warm-resume from its snapshot, falling
+  ///    back to re-prefill server-side on a miss). Commit-and-continue.
   ///  - `.stop` commits the chosen candidate as the round's final answer.
+  ///    Commit-and-stop. The only difference from think-more is the next round.
   private func handleBestOfN(messageID: UUID, action: BestOfNAction, in chat: Chat) {
     guard let message = chat.messages.first(where: { $0.id == messageID }),
           let roundData = message.bestOfN,
@@ -975,7 +977,17 @@ struct ChatScaffoldView: View {
         pickedText: pickedText,
         unpicked: round.unpickedSnapshotNames(excluding: chosen.id),
         level: round.level + 1)
+      // Dispatch the next round FIRST, while THIS round is still content-empty:
+      // `makeBestOfNRequest` builds the resume transcript synchronously here, and
+      // `excludesFromRequestHistory` drops empty-content assistant turns — so the
+      // picked answer stays out of the resume `messages`. (The inferlet re-fills
+      // the base from `messages` + `picked_text` on a snapshot miss; committing
+      // the picked answer into `messages` would double it.) Then commit the
+      // picked text as this round's final answer so it locks into read-only
+      // history exactly like `.stop` and drops out of live-candidacy.
       sendBestOfNRound(for: chat, resume: resume)
+      message.content = pickedText
+      try? modelContext.save()
 
     case .stop:
       guard let chosen = round.chosen,

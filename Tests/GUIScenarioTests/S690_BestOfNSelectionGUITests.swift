@@ -191,6 +191,18 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
       XCTAssertFalse(stateMarker(idx, "pickable").exists,
                      "[\(appearance)] read-only history candidate \(idx) must not be 'pickable'")
     }
+    // #708: a committed round renders its answer ONLY as the highlighted chosen
+    // candidate — NOT also as a plain content bubble. The committed text equals
+    // the reselected candidate's answer (BestOfNRoundSeed.candidateTexts[2]); the
+    // candidate exposes it as a StaticText's `value` (its `label` is the "Selected"
+    // state). Count every element rendering that exact text (as value OR label):
+    // exactly ONE (the chosen candidate). A duplicate content bubble would make
+    // it two — reverting the MessageBubble content-bubble suppression fails this.
+    let committedAnswer = "Take a day trip to a town one train ride away and wander with no fixed plan."
+    let answerRenders = app.descendants(matching: .any)
+      .matching(NSPredicate(format: "value == %@ OR label == %@", committedAnswer, committedAnswer)).count
+    XCTAssertEqual(answerRenders, 1,
+                   "[\(appearance)] committed answer must render exactly once (chosen candidate only, no content-bubble duplicate); found \(answerRenders)")
     // Tapping a read-only option toggles expand only — it must not re-pick or
     // resurrect the commit controls.
     optionRow(0).click()

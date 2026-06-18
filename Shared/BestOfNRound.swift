@@ -35,6 +35,22 @@ public struct BestOfNRound: Equatable, Sendable, Codable {
     candidates.filter { $0.id != id }.map(\.snapshotName)
   }
 
+  /// The id of the LIVE Best-of-N round in a chat — the one row that shows the
+  /// interactive controls (pick / think-more / use-this). A round is live ONLY
+  /// while it is the TRAILING turn (nothing committed after it) AND still
+  /// awaiting a final answer (`content` empty). This is the single source of the
+  /// liveness rule (#708): a round the user picked-then-abandoned (moved on with
+  /// a new turn) is no longer trailing, and a committed round (think-more /
+  /// use-this set `content`) is no longer empty — both fall out of
+  /// live-candidacy and render as read-only history. Keying on "trailing" rather
+  /// than "the last content-empty round" is what closes the pick-then-abandon
+  /// hole, where an empty-but-superseded round used to stay falsely live.
+  public static func liveRoundID(in messages: [Message]) -> UUID? {
+    guard let last = messages.sorted(by: Message.transcriptPrecedes).last,
+          last.bestOfN != nil, last.content.isEmpty else { return nil }
+    return last.id
+  }
+
   /// Candidate snapshot names of every UNCOMMITTED Best-of-N round among
   /// `messages` — a round whose message has no committed content but carries a
   /// decodable pick set. These are the snapshots a no-next-round terminal

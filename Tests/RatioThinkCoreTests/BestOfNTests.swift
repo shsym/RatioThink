@@ -245,6 +245,61 @@ final class BestOfNTests: XCTestCase {
     let release: [String]
   }
 
+  // MARK: liveness rule (#708) — only the trailing, uncommitted round is live
+
+  private func bonRoundData(_ snaps: [String], chosen: String? = nil) -> Data {
+    let cands = snaps.enumerated().map {
+      ToTSelectionCandidate(id: "n\($0.offset)", branchIndex: $0.offset, snapshotName: $0.element)
+    }
+    return try! JSONEncoder().encode(BestOfNRound(level: 1, candidates: cands, chosenID: chosen))
+  }
+
+  /// The trailing, content-empty Best-of-N round is the one live row.
+  func test_liveRoundID_is_the_trailing_uncommitted_round() {
+    let base = Date(timeIntervalSince1970: 1_700_000_000)
+    let user = Message(role: "user", content: "q", ts: base)
+    let round = Message(role: "assistant", content: "", ts: base.addingTimeInterval(1),
+                        bestOfN: bonRoundData(["s0", "s1"]))
+    XCTAssertEqual(BestOfNRound.liveRoundID(in: [user, round]), round.id)
+  }
+
+  /// A committed round (think-more / use-this set `content`) is NOT live — it
+  /// locks into read-only history even while it is still the trailing turn.
+  func test_liveRoundID_nil_when_round_committed() {
+    let base = Date(timeIntervalSince1970: 1_700_000_000)
+    let round = Message(role: "assistant", content: "the kept reply", ts: base,
+                        bestOfN: bonRoundData(["s0"], chosen: "n0"))
+    XCTAssertNil(BestOfNRound.liveRoundID(in: [round]))
+  }
+
+  /// The pick-then-abandon hole: an empty round the user moved past with a NEW
+  /// turn is no longer trailing, so it must NOT stay falsely live (the bug the
+  /// old "last content-empty round" rule had).
+  func test_liveRoundID_nil_for_picked_then_abandoned_round() {
+    let base = Date(timeIntervalSince1970: 1_700_000_000)
+    let round = Message(role: "assistant", content: "", ts: base.addingTimeInterval(1),
+                        bestOfN: bonRoundData(["s0"], chosen: "n0"))
+    let newTurn = Message(role: "user", content: "another question",
+                          ts: base.addingTimeInterval(2))
+    XCTAssertNil(BestOfNRound.liveRoundID(in: [round, newTurn]))
+  }
+
+  /// Think-more commits the prior round (content set) and appends a new empty
+  /// trailing round → liveness moves to the new round, never the committed one.
+  func test_liveRoundID_moves_to_the_new_round_after_think_more() {
+    let base = Date(timeIntervalSince1970: 1_700_000_000)
+    let committed = Message(role: "assistant", content: "round 1 pick",
+                            ts: base.addingTimeInterval(1), bestOfN: bonRoundData(["a0"], chosen: "n0"))
+    let next = Message(role: "assistant", content: "", ts: base.addingTimeInterval(2),
+                       bestOfN: bonRoundData(["b0", "b1"]))
+    XCTAssertEqual(BestOfNRound.liveRoundID(in: [committed, next]), next.id)
+  }
+
+  /// No Best-of-N round at all → no live row.
+  func test_liveRoundID_nil_without_any_bestOfN_round() {
+    XCTAssertNil(BestOfNRound.liveRoundID(in: [Message(role: "assistant", content: "plain")]))
+  }
+
   // MARK: selection-flash regression (#708) — option presentation from frame 1
 
   /// The selection-flash bug: a Best-of-N turn streams its candidates into
