@@ -10,6 +10,24 @@ final class ToTStreamTests: XCTestCase {
 
   // MARK: - decodeToTFrame
 
+  func test_decodes_usage_frame_used_and_omitted_window() throws {
+    // #711 follow-up: the shared occupancy frame on the ToT/BoN terminal.
+    // `total_tokens` → used; the engine omits `context_window` here (the app
+    // seeds it), so it decodes to nil.
+    let e = try decodeToTFrame(frame(
+      #"{"event":"usage","prompt_tokens":1500,"completion_tokens":0,"total_tokens":1500}"#
+    ))
+    XCTAssertEqual(e, .usage(used: 1500, window: nil))
+  }
+
+  func test_decodes_usage_frame_with_context_window() throws {
+    // A window IS honored if a path ever sends it (the standard chat path does).
+    let e = try decodeToTFrame(frame(
+      #"{"event":"usage","prompt_tokens":1000,"completion_tokens":200,"total_tokens":1200,"context_window":8192}"#
+    ))
+    XCTAssertEqual(e, .usage(used: 1200, window: 8192))
+  }
+
   func test_decodes_tree_start_with_bounds() throws {
     let e = try decodeToTFrame(frame(
       #"{"event":"tree_start","id":"tot-1","model":"qwen","breadth":3,"depth":2,"beam_width":2}"#

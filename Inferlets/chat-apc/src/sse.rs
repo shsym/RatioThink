@@ -505,6 +505,24 @@ mod tests {
     use std::io::ErrorKind;
 
     #[test]
+    fn sse_usage_totals_and_omits_unknown_window() {
+        // The shared usage frame (#711): total = prompt + completion, and an
+        // unknown window is omitted so the app falls back to its seed rather
+        // than reading a 0 denominator.
+        let with_window = SseUsage::new(1000, 200, Some(8192));
+        assert_eq!(with_window.total_tokens, 1200);
+        let json = serde_json::to_string(&with_window).unwrap();
+        assert!(json.contains(r#""event":"usage""#), "{json}");
+        assert!(json.contains(r#""context_window":8192"#), "{json}");
+
+        // ToT/BoN paths omit the window — it must not serialize at all.
+        let no_window = SseUsage::new(1500, 0, None);
+        assert_eq!(no_window.total_tokens, 1500);
+        let json = serde_json::to_string(&no_window).unwrap();
+        assert!(!json.contains("context_window"), "window must be omitted: {json}");
+    }
+
+    #[test]
     fn transport_error_code_is_stable_and_machine_branchable() {
         // SDKs discriminate transport modes on `error.code`, NOT on
         // free-text in `message`. Pin each known kind to its stable

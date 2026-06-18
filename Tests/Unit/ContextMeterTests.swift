@@ -64,4 +64,44 @@ final class ContextMeterTests: XCTestCase {
     XCTAssertTrue(label.contains("window unknown"), label)
     XCTAssertFalse(label.contains("/"), "no denominator when window is unknown: \(label)")
   }
+
+  // MARK: - ContextMeterDetail (popover formatting, #711 follow-up)
+
+  func test_detail_tokensLine_shows_used_over_window() {
+    let line = ContextMeterDetail.tokensLine(for: ContextUsage(usedTokens: 4242, windowTokens: 8192))
+    XCTAssertTrue(line.contains("/"), line)
+    XCTAssertTrue(line.contains("tokens"), line)
+  }
+
+  func test_detail_tokensLine_marks_unknown_window() {
+    let line = ContextMeterDetail.tokensLine(for: ContextUsage(usedTokens: 0, windowTokens: nil))
+    XCTAssertTrue(line.contains("window unknown"), line)
+    XCTAssertFalse(line.contains("/"), line)
+  }
+
+  func test_detail_pressurePercent_rounds_fraction() {
+    XCTAssertEqual(ContextMeterDetail.pressurePercent(for: ContextUsage(usedTokens: 50, windowTokens: 100)), 50)
+    XCTAssertEqual(ContextMeterDetail.pressurePercent(for: ContextUsage(usedTokens: 1, windowTokens: 3)), 33)
+  }
+
+  func test_detail_pressurePercent_nil_when_window_unknown() {
+    XCTAssertNil(ContextMeterDetail.pressurePercent(for: ContextUsage(usedTokens: 5, windowTokens: nil)))
+  }
+
+  func test_detail_memoryLine_shows_model_ceiling_and_system_ram() {
+    let policy = ModelMemoryGuardrail.Policy(
+      maxResolvedModelBytes: 38 * 1_000_000_000,
+      physicalMemoryBytes: 64 * 1_000_000_000)
+    let line = ContextMeterDetail.memoryLine(policy: policy)
+    XCTAssertTrue(line.contains("model"), line)
+    XCTAssertTrue(line.contains("system RAM"), line)
+  }
+
+  func test_detail_memoryLine_marks_unknown_system_ram() {
+    let policy = ModelMemoryGuardrail.Policy(
+      maxResolvedModelBytes: 8 * 1_000_000_000,
+      physicalMemoryBytes: nil)
+    let line = ContextMeterDetail.memoryLine(policy: policy)
+    XCTAssertTrue(line.contains("system RAM unknown"), line)
+  }
 }

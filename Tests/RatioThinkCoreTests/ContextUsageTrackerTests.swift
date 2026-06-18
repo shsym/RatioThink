@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import RatioThinkCore
 
@@ -113,6 +114,88 @@ final class ContextUsageTrackerTests: XCTestCase {
                  "a usage frame for a superseded/unknown request must not write onto a live record")
     XCTAssertNil(tracker.latestUsage(chatID: chatID))
     XCTAssertNil(tracker.latestWindow)
+  }
+
+  // MARK: - model-load zero-state (#711 follow-up)
+
+  func test_seedFromModelLoad_computesEngineTrueWindowAndShowsZeroState() {
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let chatID = UUID()
+
+    // No turn yet: window = kv_pages_total × tokens_per_page, used = 0.
+    tracker.seedFromModelLoad(modelID: "m", pagesTotal: 256, tokensPerPage: 32)
+
+    XCTAssertEqual(tracker.loadedModelID, "m")
+    XCTAssertEqual(tracker.loadedWindow, 8192)
+    XCTAssertEqual(tracker.latestWindow, 8192, "settings reads the seeded window with no turn")
+    XCTAssertEqual(tracker.meterUsage(chatID: chatID), ContextUsage(usedTokens: 0, windowTokens: 8192))
+  }
+
+  func test_seedFromModelLoad_residentButUnreadablePagesShowsZeroWithUnknownWindow() {
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let chatID = UUID()
+
+    // A model is resident but its KV-page total hasn't been polled yet.
+    tracker.seedFromModelLoad(modelID: "m", pagesTotal: nil, tokensPerPage: 32)
+
+    XCTAssertEqual(tracker.loadedModelID, "m")
+    XCTAssertNil(tracker.loadedWindow)
+    // Meter is visible (model loaded) but indeterminate — NOT hidden.
+    XCTAssertEqual(tracker.meterUsage(chatID: chatID), ContextUsage(usedTokens: 0, windowTokens: nil))
+  }
+
+  func test_seedFromModelLoad_noResidentModelHidesMeter() {
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    tracker.seedFromModelLoad(modelID: "m", pagesTotal: 256, tokensPerPage: 32)
+
+    tracker.seedFromModelLoad(modelID: nil, pagesTotal: nil, tokensPerPage: nil)
+
+    XCTAssertNil(tracker.loadedModelID)
+    XCTAssertNil(tracker.loadedWindow)
+    XCTAssertNil(tracker.meterUsage(chatID: UUID()), "no resident model → meter hidden")
+  }
+
+  func test_seedLoadedModel_sameModelUnchangedWindowDoesNotChurn() {
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    tracker.seedFromModelLoad(modelID: "m", pagesTotal: 256, tokensPerPage: 32)
+    var ticks = 0
+    let c = tracker.objectWillChange.sink { _ in ticks += 1 }
+    defer { c.cancel() }
+
+    // Re-seed the SAME model + window repeatedly (mirrors the KV poll firing).
+    tracker.seedFromModelLoad(modelID: "m", pagesTotal: 256, tokensPerPage: 32)
+    tracker.seedFromModelLoad(modelID: "m", pagesTotal: 256, tokensPerPage: 32)
+
+    XCTAssertEqual(ticks, 0, "an unchanged window must not republish on every poll tick")
+  }
+
+  func test_liveTurnUsageOverridesZeroState() {
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let chatID = UUID()
+    tracker.seedFromModelLoad(modelID: "m", pagesTotal: 256, tokensPerPage: 32)
+
+    tracker.markRequestStarted(chatID: chatID, modelID: "m", requestID: "r1")
+    tracker.markUsage(chatID: chatID, modelID: "m", requestID: "r1",
+                      usage: ContextUsage(usedTokens: 1000, windowTokens: 8192))
+
+    XCTAssertEqual(tracker.meterUsage(chatID: chatID),
+                   ContextUsage(usedTokens: 1000, windowTokens: 8192),
+                   "a real turn's usage replaces the 0/window zero-state")
+  }
+
+  func test_markUsage_fillsMissingWindowFromSeed() {
+    // The ToT/Best-of-N paths omit the window in the frame; the tracker fills
+    // it from the model-load seed so the fraction still renders.
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let chatID = UUID()
+    tracker.seedFromModelLoad(modelID: "m", pagesTotal: 256, tokensPerPage: 32)
+
+    tracker.markRequestStarted(chatID: chatID, modelID: "m", requestID: "r1")
+    tracker.markUsage(chatID: chatID, modelID: "m", requestID: "r1",
+                      usage: ContextUsage(usedTokens: 1500, windowTokens: nil))
+
+    XCTAssertEqual(tracker.latestUsage(chatID: chatID),
+                   ContextUsage(usedTokens: 1500, windowTokens: 8192))
   }
 
   func test_latestUsage_and_latestWindow_followMostRecentReportingRecord() {

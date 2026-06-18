@@ -879,14 +879,27 @@ async def main() -> int:
                                     failures.append(f"tot stream level_pruned kept id {kid!r} never streamed")
 
                         # #407 invariant pt.2: exactly one terminal frame
-                        # (tree_complete on success | error), and it is the
-                        # LAST data frame (nothing streams after it).
+                        # (tree_complete on success | error). #711 follow-up: a
+                        # single `usage` meta-frame may TRAIL it (before [DONE])
+                        # so the app's context meter populates after a ToT turn;
+                        # nothing else may stream after the terminal.
                         terminals = [i for i, k in enumerate(kinds) if k in ("tree_complete", "error")]
                         if len(terminals) != 1:
                             failures.append(f"tot stream terminal frames {[kinds[i] for i in terminals]} (want exactly one)")
-                        elif terminals[0] != len(kinds) - 1:
-                            failures.append(f"tot stream frame(s) after terminal: {kinds[terminals[0]:]!r}")
                         else:
+                            trailing = kinds[terminals[0] + 1:]
+                            if [k for k in trailing if k != "usage"]:
+                                failures.append(f"tot stream frame(s) after terminal: {kinds[terminals[0]:]!r}")
+                            if trailing.count("usage") != 1:
+                                failures.append(f"tot stream usage-frame count {trailing.count('usage')} (want 1 after terminal)")
+                            else:
+                                u = events[terminals[0] + 1 + trailing.index("usage")]
+                                if not isinstance(u.get("total_tokens"), int) or u["total_tokens"] < 0:
+                                    failures.append(f"tot stream usage.total_tokens {u.get('total_tokens')!r}")
+                                # The engine omits context_window on this path —
+                                # the app fills it from the model-load seed.
+                                if "context_window" in u:
+                                    failures.append(f"tot stream usage carries context_window {u!r} (want omitted)")
                             term = events[terminals[0]]
                             if term.get("event") == "tree_complete":
                                 sel = term.get("selected_node_id")
