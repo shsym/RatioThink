@@ -986,31 +986,62 @@ struct ChatScaffoldView: View {
       // picked text as this round's final answer so it locks into read-only
       // history exactly like `.stop` and drops out of live-candidacy.
       sendBestOfNRound(for: chat, resume: resume)
-      message.content = pickedText
-      // Surface (don't swallow) this save: the liveness rule keys on
-      // `content.isEmpty`, so a silently-failed save would persist the committed
-      // round with empty content and a store re-read would treat it as still
-      // live — reopening the pick-then-abandon hole this commit closes.
-      do {
-        try modelContext.save()
-      } catch {
-        persistenceStatus.report(error, context: "ChatScaffoldView.handleBestOfN.thinkMore")
-      }
+      _ = Self.commitBestOfNAnswer(pickedText, on: message, save: saveContext, report: reportSave)
 
     case .stop:
       guard let chosen = round.chosen,
             let text = bestOfNCandidateText(message: message, nodeID: chosen.id)
       else { return }
       // Commit the chosen candidate as the round's final answer (not editable
-      // in v1 — a follow-up could make the committed reply editable like a
-      // normal user/assistant turn).
-      message.content = text
-      try? modelContext.save()
-      // Terminal cleanup (#690): the chosen reply's text is now persisted, so
-      // the round's candidate KV snapshots are dead weight — release them all
-      // (think-more would have freed them via resume; stop has no next round).
-      releaseBestOfNSnapshots(round.candidates.map(\.snapshotName), in: chat)
+      // in v1), then release the candidate KV snapshots ONLY once the commit is
+      // durable — discarding recovery state before the answer is persisted could
+      // lose the selected answer on a reload after a failed save (#690).
+      let snapshots = round.candidates.map(\.snapshotName)
+      Self.performBestOfNStop(
+        text: text, on: message, save: saveContext, report: reportSave,
+        releaseSnapshots: { self.releaseBestOfNSnapshots(snapshots, in: chat) })
     }
+  }
+
+  /// The current model-context save, as a throwing closure (DI seam for tests).
+  private func saveContext() throws { try modelContext.save() }
+  /// Report a Best-of-N commit save failure to the shared status surface.
+  private func reportSave(_ error: Error) {
+    persistenceStatus.report(error, context: "ChatScaffoldView.handleBestOfN.commit")
+  }
+
+  /// Commit a Best-of-N round's chosen answer to `message.content` and persist.
+  /// Returns whether the save succeeded — callers must not discard recovery
+  /// state (snapshot release) until it does. The save is surfaced via `report`,
+  /// not swallowed: the liveness rule keys on `content.isEmpty`, so a
+  /// silently-failed save would persist the committed round empty and a store
+  /// re-read would treat it as still live (reopening the pick-then-abandon hole).
+  /// Shared by `.thinkMore` and `.stop` so the two commit paths cannot diverge;
+  /// `save`/`report` are injected so the failure path is unit-testable.
+  @discardableResult
+  static func commitBestOfNAnswer(
+    _ text: String, on message: Message,
+    save: () throws -> Void, report: (Error) -> Void
+  ) -> Bool {
+    message.content = text
+    do {
+      try save()
+      return true
+    } catch {
+      report(error)
+      return false
+    }
+  }
+
+  /// Commit a `.stop` (Use this) round, then release its candidate snapshots
+  /// ONLY if the commit was durable. Keeps the release strictly gated on a
+  /// successful save so a rejected commit never discards the recovery state.
+  static func performBestOfNStop(
+    text: String, on message: Message,
+    save: () throws -> Void, report: (Error) -> Void, releaseSnapshots: () -> Void
+  ) {
+    guard commitBestOfNAnswer(text, on: message, save: save, report: report) else { return }
+    releaseSnapshots()
   }
 
   /// Best-effort release of a set of Best-of-N candidate KV snapshots (#690
