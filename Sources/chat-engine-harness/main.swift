@@ -263,6 +263,9 @@ enum EngineHarness {
         // #690 Best-of-N terminal — this harness drives tree-of-thought, which
         // never emits it; print for completeness if a best-of-n stream is fed.
         print(String(format: "  +%6.1fs awaiting_selection level=\(level) candidates=\(candidates.count)", dt))
+      case let .usage(used, window):
+        // #711 follow-up: occupancy meta-frame on the ToT/BoN terminal.
+        print(String(format: "  +%6.1fs usage used=\(used) window=\(window.map(String.init) ?? "nil")", dt))
       }
     }
     let total = Date().timeIntervalSince(t0)

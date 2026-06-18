@@ -224,6 +224,11 @@ public struct ToTTree: Equatable, Sendable, Codable {
       // send controller), not in this shared tree snapshot — here we only mark
       // the search done so the streaming UI settles out of `.searching`.
       self.status = .complete
+
+    case .usage:
+      // #711 follow-up: occupancy meta-frame for the context meter; the send
+      // controller routes it to the usage tracker, not into the tree snapshot.
+      break
     }
   }
 

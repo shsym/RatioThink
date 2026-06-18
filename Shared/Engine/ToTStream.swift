@@ -192,6 +192,12 @@ public enum ToTEvent: Equatable, Sendable {
   /// final answer. Carries the round `level` and the saved candidates the user
   /// may pick (and think-more from). The tree-of-thought path never emits this.
   case awaitingSelection(level: Int, candidates: [ToTSelectionCandidate])
+  /// Engine-true context occupancy for a completed ToT/Best-of-N round
+  /// (#711 follow-up). `used` is the persistent context fill (the base
+  /// transcript the round forks from). `window` is omitted by the engine on
+  /// these paths (the app holds the budget from its model-load seed), so it
+  /// is usually `nil` here — the consumer fills it from the tracker's seed.
+  case usage(used: Int, window: Int?)
 }
 
 /// Which channel a streamed `nodeDelta` chunk fills (#413).
@@ -304,6 +310,10 @@ public func decodeToTFrame(_ data: Data) throws -> ToTEvent? {
       throw ToTStreamError.malformedFrame(payload: String(decoding: data, as: UTF8.self))
     }
     return .awaitingSelection(level: level, candidates: raw.candidates ?? [])
+  case "usage":
+    // #711 follow-up: occupancy meta-frame, shared with the chat path. `used`
+    // = total_tokens; `window` is usually absent here (the app seeds it).
+    return .usage(used: raw.totalTokens ?? 0, window: raw.contextWindow)
   case "error":
     throw ToTStreamError.stream(code: raw.code ?? "unknown_error", message: raw.message ?? "")
   default:
@@ -358,6 +368,9 @@ struct RawToTFrame: Decodable {
   let text: String?
   // Best-of-N `awaiting_selection` terminal (#690).
   let candidates: [ToTSelectionCandidate]?
+  // Shared `usage` occupancy meta-frame (#711 follow-up).
+  let totalTokens: Int?
+  let contextWindow: Int?
 
   private enum CodingKeys: String, CodingKey {
     case event
@@ -378,6 +391,8 @@ struct RawToTFrame: Decodable {
     case kind
     case text
     case candidates
+    case totalTokens = "total_tokens"
+    case contextWindow = "context_window"
   }
 }
 

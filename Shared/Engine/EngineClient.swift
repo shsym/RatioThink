@@ -94,12 +94,21 @@ public struct ModelInfo: Codable, Equatable, Sendable, Identifiable {
   /// never trips the engine's clean 400. Optional so a pre-#474 engine
   /// (no field) decodes to `nil` = "ceiling unknown, do not clamp".
   public let maxOutputTokens: Int?
+  /// KV tokens-per-page for this model (#711 follow-up): a model-indexed
+  /// engine constant readable at model-load with no turn. The app multiplies
+  /// it by the model's `kv_pages_total` (from its live `model_status` poll)
+  /// to show the engine-true context window the instant a model loads.
+  /// Optional / `nil` (or 0) when a pre-follow-up engine omits it → "window
+  /// unknown until the first turn's `usage` frame".
+  public let tokensPerPage: Int?
 
-  public init(id: String, ownedBy: String, created: Date? = nil, maxOutputTokens: Int? = nil) {
+  public init(id: String, ownedBy: String, created: Date? = nil,
+              maxOutputTokens: Int? = nil, tokensPerPage: Int? = nil) {
     self.id = id
     self.ownedBy = ownedBy
     self.created = created
     self.maxOutputTokens = maxOutputTokens
+    self.tokensPerPage = tokensPerPage
   }
 
   private enum CodingKeys: String, CodingKey {
@@ -107,6 +116,7 @@ public struct ModelInfo: Codable, Equatable, Sendable, Identifiable {
     case ownedBy = "owned_by"
     case created
     case maxOutputTokens = "max_output_tokens"
+    case tokensPerPage = "tokens_per_page"
   }
 }
 

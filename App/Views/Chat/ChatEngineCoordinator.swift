@@ -112,6 +112,7 @@ final class ChatEngineCoordinator: ObservableObject {
     // /v1/models failure must not strand residency unset until a status flip
     // that may never come on equal .running polls (F2).
     var fetchedCeiling: Int?
+    var fetchedTokensPerPage: Int?
     let result = await EngineModelReconciler.reconcile(
       isRunning: {
         if case .running = self.engineStatus.status { return true }
@@ -122,6 +123,9 @@ final class ChatEngineCoordinator: ObservableObject {
         // #474: the engine's effective max_tokens ceiling is engine-global, so
         // the first entry's value is authoritative; it rides the same fetch.
         fetchedCeiling = infos.first?.maxOutputTokens
+        // #711 follow-up: KV tokens-per-page rides the same fetch; the context
+        // meter seeds the engine-true window from it × the model's KV pages.
+        fetchedTokensPerPage = infos.first?.tokensPerPage
         return infos.map(\.id)
       }
     )
@@ -139,6 +143,9 @@ final class ChatEngineCoordinator: ObservableObject {
       // or reload can hand the same model a different ceiling). The setter
       // no-ops on an unchanged value and while a load is in flight.
       modelLoad.setResidentMaxOutputTokens(fetchedCeiling)
+      // #711 follow-up: record the resident model's KV page size so the meter
+      // can seed the engine-true window at load.
+      modelLoad.setResidentTokensPerPage(fetchedTokensPerPage)
     case .empty:
       // Engine running but serving NO model — clear any stale residency so the
       // send gate doesn't pass a model the engine no longer has. No-op while a

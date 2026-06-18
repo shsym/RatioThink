@@ -33,6 +33,13 @@ public final class ModelLoadCenter: ObservableObject {
   /// wherever residency clears so a stale ceiling never outlives its engine.
   @Published public private(set) var residentMaxOutputTokens: Int?
 
+  /// KV tokens-per-page for the resident model (#711 follow-up), learned from
+  /// `GET /v1/models` (`ModelInfo.tokensPerPage`). `nil` = unknown (pre-
+  /// follow-up engine, no model, or never reconciled). The context-meter seed
+  /// multiplies it by the model's `kv_pages_total` to show the engine-true
+  /// window at model-load. Cleared wherever residency clears.
+  @Published public private(set) var residentTokensPerPage: Int?
+
   private static let log = Logger(subsystem: "com.ratiothink.app", category: "model-load")
 
   public init(initialResident: String? = nil) {
@@ -63,6 +70,15 @@ public final class ModelLoadCenter: ObservableObject {
     Self.log.info("engine-resident ceiling: maxOutputTokens=\(ceiling ?? -1, privacy: .public)")
   }
 
+  /// Record the resident model's KV tokens-per-page from `GET /v1/models`
+  /// (#711 follow-up). Set on every successful reconcile (like the ceiling) so
+  /// a reload under the same id refreshes it.
+  public func setResidentTokensPerPage(_ tokensPerPage: Int?) {
+    guard residentTokensPerPage != tokensPerPage else { return }
+    residentTokensPerPage = tokensPerPage
+    Self.log.info("engine-resident page size: tokensPerPage=\(tokensPerPage ?? -1, privacy: .public)")
+  }
+
   /// The engine left `.running` (stopped, failed, or stopping). Its resident
   /// model's RAM is freed by the stop, so app-side residency must not outlive
   /// it: clear `residentModelID` and the resident ceiling. Idempotent (a no-op
@@ -70,9 +86,11 @@ public final class ModelLoadCenter: ObservableObject {
   /// Invoked by `EngineLifecycle` on the `EngineStatus` transition out of
   /// `.running`.
   public func engineLeftRunning() {
-    guard residentModelID != nil || residentMaxOutputTokens != nil else { return }
+    guard residentModelID != nil || residentMaxOutputTokens != nil
+            || residentTokensPerPage != nil else { return }
     residentModelID = nil
     residentMaxOutputTokens = nil
+    residentTokensPerPage = nil
     Self.log.info("engine left running — resident cleared")
   }
 
@@ -84,6 +102,7 @@ public final class ModelLoadCenter: ObservableObject {
   public func engineServesNoModel() {
     if residentModelID != nil { residentModelID = nil }
     if residentMaxOutputTokens != nil { residentMaxOutputTokens = nil }
+    if residentTokensPerPage != nil { residentTokensPerPage = nil }
   }
 
   /// Explicit Unload. Clears the resident model (and ceiling). Paired by the
@@ -91,12 +110,14 @@ public final class ModelLoadCenter: ObservableObject {
   /// this only resets the app-side source of truth. The next send re-enters
   /// the no-model confirm gate.
   public func markUnloaded() {
-    guard residentModelID != nil || residentMaxOutputTokens != nil else {
+    guard residentModelID != nil || residentMaxOutputTokens != nil
+            || residentTokensPerPage != nil else {
       Self.log.info("model unloaded — already idle")
       return
     }
     residentModelID = nil
     residentMaxOutputTokens = nil
+    residentTokensPerPage = nil
     Self.log.info("model unloaded — resident cleared")
   }
 }

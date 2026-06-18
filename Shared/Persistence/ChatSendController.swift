@@ -27,6 +27,55 @@ public final class ChatSendController: ObservableObject {
 
   public init() {}
 
+  // MARK: - usage tracking seam (#711)
+  //
+  // One lifecycle, shared by every generating path (standard `send`, ToT,
+  // Best-of-N): start a request identity, record the engine-true occupancy
+  // from the path's `usage` frame, finish on teardown. Adding a path is
+  // wiring these three calls, not duplicating the tracker plumbing.
+
+  /// Begin tracking a generation request. `nil` tracker ⇒ a fresh request id
+  /// with no identity recorded (the path runs untracked). Returns the request
+  /// id the path threads back into `recordUsage` / `finishUsageTracking`.
+  private func beginUsageTracking(
+    _ tracker: ContextUsageTracker?,
+    chat: Chat,
+    modelID: String
+  ) -> String {
+    let requestID = UUID().uuidString
+    tracker?.markRequestStarted(chatID: chat.id, modelID: modelID, requestID: requestID)
+    self.activeUsageIdentity = tracker.map {
+      (tracker: $0, chatID: chat.id, modelID: modelID, requestID: requestID)
+    }
+    return requestID
+  }
+
+  /// Record the engine-true occupancy a `usage` frame reported. Keyed on the
+  /// active request identity, so a frame from a superseded turn is ignored.
+  /// `window` is `nil` on the ToT/Best-of-N paths — the tracker fills it from
+  /// the model-load seed.
+  private func recordUsage(used: Int, window: Int?, requestID: String) {
+    guard let usage = self.activeUsageIdentity, usage.requestID == requestID else { return }
+    usage.tracker.markUsage(
+      chatID: usage.chatID,
+      modelID: usage.modelID,
+      requestID: usage.requestID,
+      usage: ContextUsage(usedTokens: used, windowTokens: window)
+    )
+  }
+
+  /// Finish tracking on teardown (mirrors `markRequestStarted`). No-op when a
+  /// newer request has already superseded this identity.
+  private func finishUsageTracking(requestID: String) {
+    guard let usage = self.activeUsageIdentity, usage.requestID == requestID else { return }
+    usage.tracker.markRequestFinished(
+      chatID: usage.chatID,
+      modelID: usage.modelID,
+      requestID: usage.requestID
+    )
+    self.activeUsageIdentity = nil
+  }
+
   public func send(
     chat: Chat,
     context: ModelContext,
@@ -43,15 +92,7 @@ public final class ChatSendController: ObservableObject {
     generation &+= 1
     let myGeneration = generation
     let request = Self.makeRequest(chat: chat, options: options)
-    let usageRequestID = UUID().uuidString
-    contextUsageTracker?.markRequestStarted(
-      chatID: chat.id,
-      modelID: options.modelID,
-      requestID: usageRequestID
-    )
-    self.activeUsageIdentity = contextUsageTracker.map {
-      (tracker: $0, chatID: chat.id, modelID: options.modelID, requestID: usageRequestID)
-    }
+    let usageRequestID = beginUsageTracking(contextUsageTracker, chat: chat, modelID: options.modelID)
     isInFlight = true
     Diag.app.event("chat.send", [("model", options.modelID)])
 
@@ -59,17 +100,8 @@ public final class ChatSendController: ObservableObject {
       guard let self else { return }
       var writer: MessageStreamWriter?
       defer {
-        if self.generation == myGeneration,
-           let usage = self.activeUsageIdentity,
-           usage.requestID == usageRequestID {
-          usage.tracker.markRequestFinished(
-            chatID: usage.chatID,
-            modelID: usage.modelID,
-            requestID: usage.requestID
-          )
-          self.activeUsageIdentity = nil
-        }
         if self.generation == myGeneration {
+          self.finishUsageTracking(requestID: usageRequestID)
           self.activeWriter = nil
           self.activeAssistant = nil
           self.activeContext = nil
@@ -178,20 +210,12 @@ public final class ChatSendController: ObservableObject {
             case let .usage(used, window):
               // #711: the usage frame trails `.finish`. It carries the
               // conversation's engine-true occupancy (committed + working +
-              // buffered tokens), NOT this turn's token count — so it lands
-              // on the ContextUsageTracker (the single source for the meter +
+              // buffered tokens), NOT this turn's token count — so it lands on
+              // the ContextUsageTracker (the single source for the meter +
               // memory estimate) and is NOT written to `Message.tokens`, whose
-              // per-message meaning the writer owns. Keyed on this request's
-              // identity, so a frame from a superseded turn can't clobber a
-              // newer one.
-              if let usage = self.activeUsageIdentity, usage.requestID == usageRequestID {
-                usage.tracker.markUsage(
-                  chatID: usage.chatID,
-                  modelID: usage.modelID,
-                  requestID: usage.requestID,
-                  usage: ContextUsage(usedTokens: used, windowTokens: window)
-                )
-              }
+              // per-message meaning the writer owns. Routed through the shared
+              // usage seam, keyed on this request's identity.
+              self.recordUsage(used: used, window: window, requestID: usageRequestID)
             }
           }
           // Stream completed cleanly — no retry.
@@ -309,7 +333,8 @@ public final class ChatSendController: ObservableObject {
     engine: EngineClient,
     config: ToTProfileConfig,
     persistenceStatus: PersistenceStatus,
-    options: ChatSendRequestOptions
+    options: ChatSendRequestOptions,
+    contextUsageTracker: ContextUsageTracker? = nil
   ) {
     cancel()
     generation &+= 1
@@ -321,6 +346,7 @@ public final class ChatSendController: ObservableObject {
       )
       return
     }
+    let usageRequestID = beginUsageTracking(contextUsageTracker, chat: chat, modelID: options.modelID)
     isInFlight = true
     Diag.app.event("chat.send.tot", [("model", options.modelID)])
 
@@ -328,6 +354,7 @@ public final class ChatSendController: ObservableObject {
       guard let self else { return }
       defer {
         if self.generation == myGeneration {
+          self.finishUsageTracking(requestID: usageRequestID)
           self.activeWriter = nil
           self.activeAssistant = nil
           self.activeContext = nil
@@ -460,6 +487,10 @@ public final class ChatSendController: ObservableObject {
             // Best-of-N terminal (#690) — never emitted on the tree-of-thought
             // path; handled by `sendBestOfN`.
             break
+          case let .usage(used, window):
+            // #711 follow-up: engine-true occupancy for the round, through the
+            // shared usage seam so the meter populates after a ToT turn.
+            self.recordUsage(used: used, window: window, requestID: usageRequestID)
           }
         }
         // Stream ended cleanly. If no terminal frame arrived, the engine
@@ -777,7 +808,8 @@ public final class ChatSendController: ObservableObject {
     config: BestOfNProfileConfig,
     persistenceStatus: PersistenceStatus,
     options: ChatSendRequestOptions,
-    resume: BestOfNResume? = nil
+    resume: BestOfNResume? = nil,
+    contextUsageTracker: ContextUsageTracker? = nil
   ) {
     cancel()
     generation &+= 1
@@ -789,6 +821,7 @@ public final class ChatSendController: ObservableObject {
         ToTSendError.requestEncodingFailed, context: "ChatSendController.makeBestOfNRequest")
       return
     }
+    let usageRequestID = beginUsageTracking(contextUsageTracker, chat: chat, modelID: options.modelID)
     isInFlight = true
     Diag.app.event("chat.send.bestofn", [("model", options.modelID)])
 
@@ -796,6 +829,7 @@ public final class ChatSendController: ObservableObject {
       guard let self else { return }
       defer {
         if self.generation == myGeneration {
+          self.finishUsageTracking(requestID: usageRequestID)
           self.activeWriter = nil
           self.activeAssistant = nil
           self.activeContext = nil
@@ -855,6 +889,10 @@ public final class ChatSendController: ObservableObject {
             // emits no metrics; the live re-encode above drives the tree
             // (incl. the `nodeScoring` live-phase flip).
             break
+          case let .usage(used, window):
+            // #711 follow-up: engine-true occupancy for the round, through the
+            // shared usage seam so the meter populates after a Best-of-N round.
+            self.recordUsage(used: used, window: window, requestID: usageRequestID)
           }
         }
         if self.generation == myGeneration, !Task.isCancelled {

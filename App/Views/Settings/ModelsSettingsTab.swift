@@ -805,14 +805,19 @@ private struct MemoryGuardrailSection: View {
   }
 
   /// #711: the engine-true context window of the loaded model
-  /// (`budget_pages × tokens_per_page`), or a measure-it hint until a chat
-  /// turn has reported usage this session. Distinct from the size ceiling
-  /// above — this is how many context tokens the model can actually hold.
+  /// (`budget_pages × tokens_per_page`). Seeded at model-load from the engine's
+  /// control surfaces (no turn needed), so the real number shows the instant a
+  /// model is resident. Distinct from the size ceiling above — this is how many
+  /// context tokens the model can actually hold.
   private var contextWindowPreview: String {
-    guard let tokens = contextUsageTracker.latestWindow, tokens > 0 else {
-      return "Expected max context: send a message to measure the loaded model's window."
+    if let tokens = contextUsageTracker.latestWindow, tokens > 0 {
+      return "Expected max context ≈ \(tokens.formatted()) tokens (loaded model)."
     }
-    return "Expected max context ≈ \(tokens.formatted()) tokens (loaded model)."
+    if contextUsageTracker.loadedModelID != nil {
+      // A model is resident but its KV-page total hasn't been read yet.
+      return "Expected max context: reading the loaded model's window…"
+    }
+    return "Expected max context: load a model to see its window."
   }
 
   private func load() {

@@ -417,10 +417,12 @@ struct ChatScaffoldView: View {
         // options (each carries its parsed `ModelNameParts` + `isUnverified`).
         modelOptions: toolbarModelOptions,
         currentModelSummary: toolbarCurrentModelSummary,
-        // #711: engine-true occupancy meter for this chat's latest turn,
-        // read from the single-source tracker (republished when a turn's
-        // usage frame lands).
-        contextUsage: contextUsageTracker.latestUsage(chatID: chat.id),
+        // #711: engine-true occupancy meter for this chat, read from the
+        // single-source tracker. `meterUsage` shows the model-load zero-state
+        // (`0 / window`) before the first turn and the latest turn's usage
+        // after (#711 follow-up), so the meter appears the instant a model
+        // loads.
+        contextUsage: contextUsageTracker.meterUsage(chatID: chat.id),
         // #460: the chat's persisted selection authority + the active
         // profile's default. The commits write the SwiftData authority
         // (`Chat.modelID` / `Chat.profileID`); policy lives in the
@@ -650,6 +652,13 @@ struct ChatScaffoldView: View {
     // selection) IS the new fact being observed, so no residency pre-check.
     .onChange(of: modelLoadCenter.residentModelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
     .onChange(of: chat.modelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
+    // #711 follow-up: keep the context-meter zero-state seeded with the
+    // resident model's engine-true window the instant a model loads (or its
+    // KV-page total first lands), so the meter shows `0 / window` before any
+    // turn instead of appearing only post-turn.
+    .onChange(of: modelLoadCenter.residentModelID) { _, _ in seedContextWindow() }
+    .onChange(of: modelLoadCenter.residentTokensPerPage) { _, _ in seedContextWindow() }
+    .onChange(of: engineStatusStore.latestKVUsageSnapshots) { _, _ in seedContextWindow() }
     // #413's helper-health generation gate is wired at app scope from
     // `ChatSendCoordinator.onAnyInFlightChange` (#507) — streams outlive this
     // view now, so a per-view forward would release the gate on navigate-away
@@ -674,6 +683,10 @@ struct ChatScaffoldView: View {
       // this view appeared (no .onChange fires) — evaluate the launch ask
       // here too; the once-flag keeps it from double-prompting.
       maybePromptEngineStartOnLaunch()
+      // #711 follow-up: seed the meter from whatever model is already resident
+      // when this view appears (no .onChange fires for state that settled
+      // before mount).
+      seedContextWindow()
     }
     // #624: a fork-and-resend navigates here (a freshly-mounted scaffold,
     // keyed `.id(chatID)` by `DetailView`). Consume the one-shot handoff
@@ -1016,6 +1029,24 @@ struct ChatScaffoldView: View {
 
   /// Send a Best-of-N think-more round expanding from the user's pick. Mirrors
   /// the round-1 route in `sendAssistantTurn` but threads the `resume` payload.
+  /// #711 follow-up: seed the context-meter zero-state from the resident
+  /// model's engine-true KV budget — `kv_pages_total` (live `model_status`
+  /// poll) × `tokens_per_page` (model-load `/v1/models`). Both are control-only
+  /// (no turn), so the meter shows `0 / window` the instant a model loads. A
+  /// resident model with the page total not yet polled seeds `0 / unknown`
+  /// (visible); no resident model clears the seed (meter hides).
+  private func seedContextWindow() {
+    let modelID = modelLoadCenter.residentModelID
+    let pagesTotal = modelID
+      .flatMap { engineStatusStore.kvUsageSnapshot(for: $0)?.pagesTotal }
+      .flatMap { Int(exactly: $0) }
+    contextUsageTracker.seedFromModelLoad(
+      modelID: modelID,
+      pagesTotal: pagesTotal,
+      tokensPerPage: modelLoadCenter.residentTokensPerPage
+    )
+  }
+
   private func sendBestOfNRound(for chat: Chat, resume: ChatSendController.BestOfNResume) {
     guard case .ready(let modelID) = sendGateDecision(for: chat) else { return }
     guard let bonProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
@@ -1038,7 +1069,9 @@ struct ChatScaffoldView: View {
       config: bonConfig,
       persistenceStatus: persistenceStatus,
       options: options,
-      resume: resume)
+      resume: resume,
+      // #711 follow-up: think-more rounds feed the same usage tracker.
+      contextUsageTracker: contextUsageTracker)
   }
 
   private func sendAssistantTurn(for chat: Chat) {
@@ -1113,7 +1146,9 @@ struct ChatScaffoldView: View {
         persistenceStatus: persistenceStatus,
         // #523 Part B: source the ToT candidate-generation temperature from
         // the profile, not the toolbar default.
-        options: options.withSampling(totProfile.toTRequestSampling)
+        options: options.withSampling(totProfile.toTRequestSampling),
+        // #711 follow-up: ToT feeds the SAME usage tracker as a plain turn.
+        contextUsageTracker: contextUsageTracker
       )
       return
     }
@@ -1129,7 +1164,9 @@ struct ChatScaffoldView: View {
         engine: engineStore.client,
         config: bonConfig,
         persistenceStatus: persistenceStatus,
-        options: options.withSampling(bonProfile.bestOfNRequestSampling)
+        options: options.withSampling(bonProfile.bestOfNRequestSampling),
+        // #711 follow-up: Best-of-N feeds the SAME usage tracker as a plain turn.
+        contextUsageTracker: contextUsageTracker
       )
       return
     }
