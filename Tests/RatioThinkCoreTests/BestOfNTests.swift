@@ -300,31 +300,6 @@ final class BestOfNTests: XCTestCase {
     XCTAssertNil(BestOfNRound.liveRoundID(in: [Message(role: "assistant", content: "plain")]))
   }
 
-  // MARK: collapse-to-chosen in finalized history (#708)
-
-  /// The LIVE (interactive) round renders every candidate, pickable.
-  func test_visibleCandidateIDs_live_round_shows_all() {
-    XCTAssertEqual(
-      BestOfNRound.visibleCandidateIDs(["a", "b", "c"], isInteractive: true, chosenID: "b"),
-      ["a", "b", "c"])
-  }
-
-  /// A FINALIZED read-only round WITH a choice collapses to the chosen candidate
-  /// alone — locked history reads as a single answer, not a candidate list.
-  func test_visibleCandidateIDs_finalized_with_choice_shows_only_chosen() {
-    XCTAssertEqual(
-      BestOfNRound.visibleCandidateIDs(["a", "b", "c"], isInteractive: false, chosenID: "b"),
-      ["b"])
-  }
-
-  /// A finalized round with NO choice (pure abandon) keeps every candidate —
-  /// show what happened, don't blank it.
-  func test_visibleCandidateIDs_abandoned_round_shows_all() {
-    XCTAssertEqual(
-      BestOfNRound.visibleCandidateIDs(["a", "b", "c"], isInteractive: false, chosenID: nil),
-      ["a", "b", "c"])
-  }
-
   // MARK: selection-flash regression (#708) — option presentation from frame 1
 
   /// The selection-flash bug: a Best-of-N turn streams its candidates into
@@ -402,13 +377,11 @@ final class BestOfNTests: XCTestCase {
   }
 
   /// #708 F1 regression: a Best-of-N turn that FAILS before `awaiting_selection`
-  /// (stream ends with no terminal) must surface its ⚠️ error text exactly once,
-  /// not be swallowed. MessageBubble suppresses the content bubble for a round
-  /// only while `bestOfN != nil`; the failure branch must CLEAR the frame-1
-  /// `bestOfN` flag so the ⚠️ falls back to the plain bubble (and so the failed,
-  /// non-empty row is not treated as live).
+  /// (stream ends with no terminal) must surface its ⚠️ error text — not be
+  /// swallowed. The committed answer / error now renders as the plain content
+  /// bubble (no bestOfN suppression), so the ⚠️ surfaces from `message.content`.
   @MainActor
-  func test_failed_round_clears_bestOfN_and_surfaces_error() async throws {
+  func test_failed_round_surfaces_error() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)
     let chat = Chat()
@@ -438,9 +411,7 @@ final class BestOfNTests: XCTestCase {
 
     let a = try XCTUnwrap(assistant())
     XCTAssertTrue(a.content.hasPrefix("⚠️"),
-                  "a failed Best-of-N round must surface its ⚠️ error text; content=\(a.content)")
-    XCTAssertNil(a.bestOfN,
-                 "a failed round must clear bestOfN so MessageBubble renders the ⚠️ bubble (not a suppressed/bare round)")
+                  "a failed Best-of-N round must surface its ⚠️ error text as content; content=\(a.content)")
   }
 
   /// Polls `condition` on the main actor until true or the timeout elapses.

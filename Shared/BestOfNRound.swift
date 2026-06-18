@@ -35,20 +35,6 @@ public struct BestOfNRound: Equatable, Sendable, Codable {
     candidates.filter { $0.id != id }.map(\.snapshotName)
   }
 
-  /// The candidate ids to RENDER for a round, given the candidates in tree
-  /// order, whether the round is interactive (live), and the chosen id.
-  ///  - LIVE (interactive): every candidate — all N pickable / re-pickable.
-  ///  - FINALIZED read-only WITH a choice: only the chosen candidate, so locked
-  ///    history reads as a single answer, not a candidate list (#708).
-  ///  - FINALIZED read-only with NO choice (pure abandon, the user never
-  ///    picked): every candidate — show what happened, don't blank it.
-  public static func visibleCandidateIDs(
-    _ allIDs: [String], isInteractive: Bool, chosenID: String?
-  ) -> [String] {
-    guard !isInteractive, let chosenID else { return allIDs }
-    return allIDs.filter { $0 == chosenID }
-  }
-
   /// The id of the LIVE Best-of-N round in a chat — the one row that shows the
   /// interactive controls (pick / think-more / use-this). A round is live ONLY
   /// while it is the TRAILING turn (nothing committed after it) AND still

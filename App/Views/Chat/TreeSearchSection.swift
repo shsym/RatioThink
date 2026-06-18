@@ -55,20 +55,6 @@ struct TreeSearchSection: View {
 
   private var isExpanded: Bool { userExpanded ?? !answerStarted }
 
-  /// The candidate rows to render. A tree-of-thought tree shows every node; a
-  /// Best-of-N round shows all candidates while LIVE, but a FINALIZED read-only
-  /// round with a choice collapses to the chosen candidate alone (#708) — locked
-  /// history reads as a single answer, not a candidate list. An abandoned round
-  /// (read-only, no choice) still shows them all.
-  private var visibleCandidates: [ToTTree.Node] {
-    guard let selection else { return tree.rootChildren }
-    let visible = Set(BestOfNRound.visibleCandidateIDs(
-      tree.rootChildren.map(\.id),
-      isInteractive: selection.isInteractive,
-      chosenID: selection.chosenID))
-    return tree.rootChildren.filter { visible.contains($0.id) }
-  }
-
   /// True only while the search is actively streaming levels.
   private var isSearching: Bool {
     if case .searching = tree.status { return true }
@@ -115,7 +101,7 @@ struct TreeSearchSection: View {
 
       if isExpanded {
         VStack(alignment: .leading, spacing: 4) {
-          ForEach(visibleCandidates) { node in
+          ForEach(tree.rootChildren) { node in
             ToTNodeRow(tree: tree, node: node, selection: selection)
           }
         }

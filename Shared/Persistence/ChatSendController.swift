@@ -857,13 +857,6 @@ public final class ChatSendController: ObservableObject {
             tree.fail(Self.totIncompleteMessage)
             assistant.tot = try? encoder.encode(tree)
             assistant.content = "⚠️ \(Self.totIncompleteMessage)"
-            // Clear the frame-1 Best-of-N flag: the round never reached
-            // awaiting_selection, so there is no pick set. Leaving it non-nil
-            // would make MessageBubble suppress the ⚠️ content bubble (its
-            // committed-round suppression keys on bestOfN != nil) and render a
-            // bare option header instead — the failure must surface as the plain
-            // error bubble.
-            assistant.bestOfN = nil
             Diag.app.event("chat.fail.bestofn", [("reason", "no_terminal")])
           }
           Self.persistTree(context, status: persistenceStatus)
@@ -876,9 +869,6 @@ public final class ChatSendController: ObservableObject {
         tree.fail(problem.technicalDetail ?? problem.message)
         assistant.tot = try? encoder.encode(tree)
         assistant.content = "⚠️ \(problem.message)"
-        // Clear the frame-1 Best-of-N flag on failure (see no_terminal branch)
-        // so the ⚠️ surfaces as the plain bubble, not a suppressed/bare round.
-        assistant.bestOfN = nil
         if let detail = problem.technicalDetail {
           Log.engine.error("ChatSendController: best-of-n send failed: \(detail, privacy: .public)")
         }

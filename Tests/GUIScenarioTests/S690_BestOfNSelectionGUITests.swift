@@ -170,57 +170,44 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
     XCTAssertTrue(app.buttons["bestofn.useThis"].exists,
                   "[\(appearance)] commit affordances persist across a re-selection")
 
-    // #708 read-only history: commit the round with 'Use this'. The round
-    // finalizes — the interactive controls disappear and (re-expanding the
-    // now-folded disclosure) it collapses to JUST the chosen candidate: the
-    // unpicked rows are gone entirely, so locked history reads as a single
-    // answer, not a candidate list.
+    // #708 finalized round: committing with 'Use this' shows the chosen answer
+    // as a normal content bubble, the interactive controls disappear, and the N
+    // options stay available behind a DEFAULT-FOLDED Options disclosure.
     app.buttons["bestofn.useThis"].click()
     XCTAssertTrue(waitForDisappearance(app.buttons["bestofn.useThis"], timeout: 10),
                   "[\(appearance)] 'Use this' must disappear once the round is committed")
     XCTAssertFalse(app.buttons["bestofn.thinkMore"].exists,
                    "[\(appearance)] 'Think more' must disappear once the round is committed")
 
-    // Re-expand the finalized round (it auto-folds after committing) and assert
-    // the read-only presentation.
+    // The selected answer is visible as the committed bubble.
+    let committedAnswer = "Take a day trip to a town one train ride away and wander with no fixed plan."
+    let answerVisible = app.descendants(matching: .any)
+      .matching(NSPredicate(format: "value == %@ OR label == %@", committedAnswer, committedAnswer)).firstMatch
+    XCTAssertTrue(answerVisible.waitForExistence(timeout: 10),
+                  "[\(appearance)] the selected answer must be visible as the committed bubble; app tree: \(app.debugDescription)")
+
+    // The Options disclosure remains, DEFAULT-FOLDED — the candidate rows are
+    // not rendered until the user expands it on-demand.
     let disclosure = app.descendants(matching: .any)
       .matching(identifier: "bestofn.disclosure").firstMatch
-    if disclosure.waitForExistence(timeout: 5) { disclosure.click() }
+    XCTAssertTrue(disclosure.waitForExistence(timeout: 5),
+                  "[\(appearance)] the Options disclosure must remain available on a finalized round")
+    XCTAssertFalse(optionRow(reselectIdx).exists,
+                   "[\(appearance)] the Options disclosure must be folded by default once the answer commits; app tree: \(app.debugDescription)")
+
+    // Expanding it reveals ALL N candidates, the chosen one highlighted and the
+    // rest read-only (not pickable).
+    disclosure.click()
     XCTAssertTrue(stateMarker(reselectIdx, "chosen").waitForExistence(timeout: 5),
-                  "[\(appearance)] the committed choice \(reselectIdx) must stay highlighted in read-only history; app tree: \(app.debugDescription)")
-    // #708 collapse-to-chosen: the unpicked candidates are HIDDEN entirely in a
-    // finalized round — their option rows and state markers are absent.
-    for idx in 0..<n where idx != reselectIdx {
-      XCTAssertFalse(optionRow(idx).exists,
-                     "[\(appearance)] unpicked candidate \(idx) must be hidden in finalized history; app tree: \(app.debugDescription)")
-      for state in ["pickable", "chosen", "unpicked", "unavailable"] {
-        XCTAssertFalse(stateMarker(idx, state).exists,
-                       "[\(appearance)] unpicked candidate \(idx) must not render any row (state '\(state)') in finalized history")
-      }
+                  "[\(appearance)] the committed choice \(reselectIdx) must be highlighted when the options are expanded; app tree: \(app.debugDescription)")
+    for idx in 0..<n {
+      XCTAssertTrue(optionRow(idx).waitForExistence(timeout: 5),
+                    "[\(appearance)] all \(n) candidates must stay available behind the Options disclosure; candidate \(idx) missing; app tree: \(app.debugDescription)")
+      XCTAssertFalse(stateMarker(idx, "pickable").exists,
+                     "[\(appearance)] finalized candidate \(idx) must not be pickable")
     }
-    // The unpicked candidate ANSWERS are absent from the locked round.
-    for unpickedAnswer in [
-      "Go for a long walk in a nearby park and bring a book to read on a bench.",
-      "Cook something ambitious you have never tried, then invite a friend to share it.",
-    ] {
-      XCTAssertEqual(app.descendants(matching: .any)
-        .matching(NSPredicate(format: "value == %@ OR label == %@", unpickedAnswer, unpickedAnswer)).count, 0,
-        "[\(appearance)] unpicked answer must not render in finalized history: \(unpickedAnswer)")
-    }
-    // The chosen answer renders EXACTLY ONCE — as the chosen candidate (it
-    // exposes the text as a StaticText `value`; `label` is the "Selected"
-    // state) — and NOT also as a plain content bubble. A duplicate content
-    // bubble would make it two; reverting the MessageBubble suppression fails.
-    let committedAnswer = "Take a day trip to a town one train ride away and wander with no fixed plan."
-    let answerRenders = app.descendants(matching: .any)
-      .matching(NSPredicate(format: "value == %@ OR label == %@", committedAnswer, committedAnswer)).count
-    XCTAssertEqual(answerRenders, 1,
-                   "[\(appearance)] committed answer must render exactly once (chosen candidate only, no content-bubble duplicate); found \(answerRenders)")
-    // Tapping the chosen read-only candidate must not re-pick or resurrect the
-    // commit controls.
-    optionRow(reselectIdx).click()
     XCTAssertFalse(app.buttons["bestofn.useThis"].exists,
-                   "[\(appearance)] tapping a read-only candidate must not re-open the round")
+                   "[\(appearance)] expanding finalized options must not resurrect the commit controls")
   }
 
   /// Poll until an element no longer exists (XCUITest has no built-in

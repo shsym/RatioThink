@@ -139,12 +139,11 @@ struct MessageBubble: View {
           // already showing, and not when the turn FINISHED with no answer
           // (#434: the notice below explains that instead of a silent blank).
           //
-          // #708: a committed Best-of-N round (think-more / use-this set
-          // `content`) renders its answer AS the highlighted chosen candidate in
-          // the flat read-only `TreeSearchSection` above — so suppress the plain
-          // content bubble here, or the committed answer would render twice (the
-          // chosen flat candidate + this bubble).
-          if (!message.content.isEmpty && message.bestOfN == nil)
+          // #708: a committed Best-of-N round surfaces its chosen answer here as
+          // a normal content bubble (the picked text lives in `message.content`);
+          // the N candidates stay available on-demand behind the default-folded
+          // Options disclosure above.
+          if !message.content.isEmpty
             || (message.reasoning.isEmpty && message.tot == nil && message.finishReason == nil) {
             bubble(background: Color.secondary.opacity(0.15),
                    foreground: .primary)
