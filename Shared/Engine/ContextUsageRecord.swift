@@ -87,8 +87,11 @@ public final class ContextUsageTracker: ObservableObject {
   }
 
   /// Clear the zero-state when no model is resident (engine left `.running`).
-  /// The meter then hides until a model loads again.
+  /// The meter then hides until a model loads again. Guarded against a no-op
+  /// republish: the seed re-evaluates on every KV poll (~1 Hz), so an
+  /// already-clear state must not churn observers each tick.
   public func clearLoadedModel() {
+    guard loadedModelID != nil || loadedWindow != nil else { return }
     loadedModelID = nil
     loadedWindow = nil
   }

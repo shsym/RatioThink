@@ -169,6 +169,20 @@ final class ContextUsageTrackerTests: XCTestCase {
     XCTAssertEqual(ticks, 0, "an unchanged window must not republish on every poll tick")
   }
 
+  func test_clearLoadedModel_fromAlreadyClearDoesNotChurn() {
+    // The seed re-evaluates on every KV poll; an already-clear state (no model)
+    // must not republish observers each tick.
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    var ticks = 0
+    let c = tracker.objectWillChange.sink { _ in ticks += 1 }
+    defer { c.cancel() }
+
+    tracker.seedFromModelLoad(modelID: nil, pagesTotal: nil, tokensPerPage: nil)
+    tracker.seedFromModelLoad(modelID: nil, pagesTotal: nil, tokensPerPage: nil)
+
+    XCTAssertEqual(ticks, 0, "clearing an already-clear zero-state must not churn")
+  }
+
   func test_liveTurnUsageOverridesZeroState() {
     let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
     let chatID = UUID()
