@@ -459,16 +459,14 @@ async fn dispatch_streaming(
                 .await;
         }
     }
-    // #711 follow-up: report occupancy through the shared usage seam so the
-    // context meter populates after a tree-of-thought turn (window from the
-    // app's model-load seed). `completion_tokens` = this round's generation.
-    sse::emit_usage_logged(
-        &mut em,
-        base_used,
-        outcome.total_generated_tokens as u32,
-        None,
-        "tot_usage",
-    )
+    // #711 follow-up: report RETAINED conversation occupancy through the
+    // shared usage seam so the context meter populates after a tree-of-thought
+    // turn (window from the app's model-load seed). Only `base_used` (the
+    // transcript the round forks from) is retained — `total_generated_tokens`
+    // counts branch / scorer / synthesis work in DISCARDED contexts, so adding
+    // it would overcount speculative search as future context budget (F4).
+    // Mirrors Best-of-N, which emits its base occupancy with no generation.
+    sse::emit_usage_logged(&mut em, base_used, 0, None, "tot_usage")
     .await;
     sse::emit_done_logged(&mut em, "tot_terminal").await;
     em.finish()

@@ -28,6 +28,18 @@ final class ToTStreamTests: XCTestCase {
     XCTAssertEqual(e, .usage(used: 1200, window: 8192))
   }
 
+  func test_usage_frame_missing_total_tokens_throws_malformed() {
+    // F2: total_tokens is required (matching the other ToT frames); a usage
+    // frame without it is schema drift, not a silent zero-occupancy update.
+    XCTAssertThrowsError(try decodeToTFrame(frame(
+      #"{"event":"usage","prompt_tokens":1500,"completion_tokens":0}"#
+    ))) { error in
+      guard case ToTStreamError.malformedFrame = error else {
+        return XCTFail("want malformedFrame, got \(error)")
+      }
+    }
+  }
+
   func test_decodes_tree_start_with_bounds() throws {
     let e = try decodeToTFrame(frame(
       #"{"event":"tree_start","id":"tot-1","model":"qwen","breadth":3,"depth":2,"beam_width":2}"#

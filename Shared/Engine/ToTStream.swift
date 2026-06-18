@@ -312,8 +312,14 @@ public func decodeToTFrame(_ data: Data) throws -> ToTEvent? {
     return .awaitingSelection(level: level, candidates: raw.candidates ?? [])
   case "usage":
     // #711 follow-up: occupancy meta-frame, shared with the chat path. `used`
-    // = total_tokens; `window` is usually absent here (the app seeds it).
-    return .usage(used: raw.totalTokens ?? 0, window: raw.contextWindow)
+    // = total_tokens, which is REQUIRED — a usage frame without it is schema
+    // drift (throw `malformedFrame`, matching the other required ToT frames)
+    // rather than a silent zero-occupancy meter. `window` is usually absent
+    // here (the app seeds it from model-load), so it stays optional.
+    guard let used = raw.totalTokens else {
+      throw ToTStreamError.malformedFrame(payload: String(decoding: data, as: UTF8.self))
+    }
+    return .usage(used: used, window: raw.contextWindow)
   case "error":
     throw ToTStreamError.stream(code: raw.code ?? "unknown_error", message: raw.message ?? "")
   default:

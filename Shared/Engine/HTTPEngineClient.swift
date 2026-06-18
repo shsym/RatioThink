@@ -237,15 +237,17 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
                 let metrics = try decoder.decode(SpecMetricsFrame.self, from: frame.dataBytes)
                 continuation.yield(.specMetrics(metrics.toModel()))
               case "usage":
-                // #711: engine-true context meter. `total_tokens` is the
-                // occupancy; `context_window` (when present) is the KV-budget
-                // window. Strict decode mirrors the other meta-frames so a
-                // schema drift surfaces rather than silently dropping the meter.
-                let meta = try decoder.decode(MetaFrame.self, from: frame.dataBytes)
-                continuation.yield(.usage(
-                  used: meta.total_tokens ?? 0,
-                  window: meta.context_window
-                ))
+                // #711: engine-true context meter. `total_tokens` (the
+                // occupancy) is REQUIRED — a usage frame without it is schema
+                // drift, so the strict decode throws and propagates rather than
+                // yielding `.usage(used: 0)`, which would report an empty
+                // context after a turn. The throw lands after `.finish` (the
+                // answer is already persisted), so the controller's post-finish
+                // path keeps the turn and the meter holds its prior value.
+                // `context_window` stays optional — an unknown window is a
+                // valid state (the app seeds it).
+                let usage = try decoder.decode(UsageFrame.self, from: frame.dataBytes)
+                continuation.yield(.usage(used: usage.total_tokens, window: usage.context_window))
               default:
                 continue
               }
@@ -665,14 +667,18 @@ private struct MetaFrame: Decodable {
   let loaded_bytes: UInt64?
   let total_bytes: UInt64?
   let eta_s: Double?
-  /// #711 `event:"usage"` fields. `total_tokens` is the engine-true
-  /// context occupancy after the turn; `context_window` is the effective
-  /// KV-budget window in tokens (absent when the engine could not report
-  /// a budget). `prompt_tokens`/`completion_tokens` are decoded for
-  /// completeness but the meter only needs `total_tokens`/`context_window`.
+}
+
+/// Strict `event:"usage"` contract (#711). `total_tokens` (the engine-true
+/// context occupancy after the turn) is REQUIRED, so a frame missing it fails
+/// the decode rather than collapsing to a zero-occupancy meter. `context_window`
+/// is optional — an unknown KV budget is a valid state the app seeds from
+/// model-load. `prompt_tokens`/`completion_tokens` are accepted for wire
+/// completeness; the meter reads only `total_tokens`/`context_window`.
+private struct UsageFrame: Decodable {
   let prompt_tokens: Int?
   let completion_tokens: Int?
-  let total_tokens: Int?
+  let total_tokens: Int
   let context_window: Int?
 }
 

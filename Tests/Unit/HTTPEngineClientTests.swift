@@ -300,6 +300,32 @@ final class HTTPEngineClientTests: XCTestCase {
     XCTAssertEqual(events.last, .usage(used: 12, window: nil))
   }
 
+  func test_chatCompletion_usage_frame_missing_total_tokens_throws_not_zero() async throws {
+    // F1: `total_tokens` is REQUIRED. A usage frame without it is schema drift,
+    // so the strict decode throws (and the turn keeps its prior meter value)
+    // rather than yielding `.usage(used: 0)`, which would report an empty
+    // context after the turn.
+    FakeSSEURLProtocol.handler = { _ in
+      .sse(chunks: [
+        "data: {\"event\":\"model_ready\"}\n\n",
+        #"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"# + "\n\n",
+        #"data: {"event":"usage","prompt_tokens":10,"completion_tokens":2,"context_window":4096}"# + "\n\n",
+        "data: [DONE]\n\n",
+      ])
+    }
+    let req = ChatRequest(model: "m1", messages: [ChatMessage(role: .user, content: "hi")])
+    var events: [ChatEvent] = []
+    do {
+      for try await ev in makeClient().chatCompletion(req) { events.append(ev) }
+      XCTFail("expected a malformed-usage decode error, got \(events)")
+    } catch {
+      // expected — the missing `total_tokens` fails the strict decode.
+    }
+    XCTAssertFalse(
+      events.contains { if case .usage = $0 { return true } else { return false } },
+      "a usage frame missing total_tokens must not yield a .usage event")
+  }
+
   func test_chatCompletion_routes_reasoning_content_to_its_own_channel() async throws {
     // chat-apc wire order for a Qwen thinking turn: model_ready,
     // role chunk, reasoning_content deltas, then visible content, finish.

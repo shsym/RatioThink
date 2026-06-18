@@ -89,6 +89,8 @@ final class ContextUsageTrackerTests: XCTestCase {
   func test_markUsage_populatesRecordAndBothReaderSeams() {
     let chatID = UUID()
     let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    // `latestWindow` is scoped to the loaded model (F3), so mark "m" resident.
+    tracker.seedFromModelLoad(modelID: "m", pagesTotal: nil, tokensPerPage: nil)
     tracker.markRequestStarted(chatID: chatID, modelID: "m", requestID: "r1")
 
     let usage = ContextUsage(usedTokens: 1200, windowTokens: 4096)
@@ -197,6 +199,29 @@ final class ContextUsageTrackerTests: XCTestCase {
                    "a real turn's usage replaces the 0/window zero-state")
   }
 
+  func test_meterUsage_and_latestWindow_resetOnModelSwitch_ignoringPriorModel() {
+    // F3: after switching loaded models, the new model's zero-state is
+    // authoritative — the prior model's usage/window must not leak through.
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let chatID = UUID()
+
+    // Model A loads and runs a turn.
+    tracker.seedFromModelLoad(modelID: "A", pagesTotal: 100, tokensPerPage: 32)  // window 3200
+    tracker.markRequestStarted(chatID: chatID, modelID: "A", requestID: "ra")
+    tracker.markUsage(chatID: chatID, modelID: "A", requestID: "ra",
+                      usage: ContextUsage(usedTokens: 1000, windowTokens: 3200))
+    XCTAssertEqual(tracker.meterUsage(chatID: chatID), ContextUsage(usedTokens: 1000, windowTokens: 3200))
+    XCTAssertEqual(tracker.latestWindow, 3200)
+
+    // Switch to model B with a different window — no turn on B yet.
+    tracker.seedFromModelLoad(modelID: "B", pagesTotal: 256, tokensPerPage: 32)  // window 8192
+    XCTAssertEqual(tracker.meterUsage(chatID: chatID),
+                   ContextUsage(usedTokens: 0, windowTokens: 8192),
+                   "the new model's 0/window holds — not model A's stale usage")
+    XCTAssertEqual(tracker.latestWindow, 8192,
+                   "window resets to model B, not A's historical 3200")
+  }
+
   func test_markUsage_fillsMissingWindowFromSeed() {
     // The ToT/Best-of-N paths omit the window in the frame; the tracker fills
     // it from the model-load seed so the fraction still renders.
@@ -216,6 +241,8 @@ final class ContextUsageTrackerTests: XCTestCase {
     var tick: TimeInterval = 1
     let chatID = UUID()
     let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: tick) })
+    // `latestWindow` is scoped to the loaded model (F3), so mark "m" resident.
+    tracker.seedFromModelLoad(modelID: "m", pagesTotal: nil, tokensPerPage: nil)
 
     tracker.markRequestStarted(chatID: chatID, modelID: "m", requestID: "r1")
     tracker.markUsage(chatID: chatID, modelID: "m", requestID: "r1",

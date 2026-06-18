@@ -153,14 +153,19 @@ public final class ContextUsageTracker: ObservableObject {
     publish()
   }
 
-  /// What the top-bar meter shows for `chatID`: the chat's latest engine-true
-  /// usage, or — before any turn — the model-load zero-state (`0 / window`)
-  /// once a model is resident. `nil` only when no model is loaded (the meter
-  /// hides). A resident model whose window is not yet readable shows
-  /// `0 / unknown` (visible, indeterminate) rather than hiding (#711 follow-up).
+  /// What the top-bar meter shows for `chatID`: the CURRENT loaded model's
+  /// latest engine-true usage, or — before that model has reported a turn —
+  /// the model-load zero-state (`0 / window`). `nil` only when no model is
+  /// loaded (the meter hides). A resident model whose window is not yet
+  /// readable shows `0 / unknown` (visible, indeterminate) rather than hiding.
+  ///
+  /// The loaded-model gate is authoritative: after a model switch, a prior
+  /// model's (or this chat's) stale usage must NOT leak through — the new
+  /// model's `0 / window` zero-state holds until that model reports a turn
+  /// (#711 follow-up F3).
   public func meterUsage(chatID: UUID) -> ContextUsage? {
-    if let live = latestUsage(chatID: chatID) { return live }
-    guard loadedModelID != nil else { return nil }
+    guard let model = loadedModelID else { return nil }
+    if let live = latestUsage(chatID: chatID, modelID: model) { return live }
     return ContextUsage(usedTokens: 0, windowTokens: loadedWindow)
   }
 
@@ -170,12 +175,25 @@ public final class ContextUsageTracker: ObservableObject {
     records.first { $0.chatID == chatID && $0.usage != nil }?.usage
   }
 
+  /// As `latestUsage(chatID:)` but scoped to a specific model — so the meter
+  /// can ignore a prior model's records after a switch (#711 follow-up F3).
+  public func latestUsage(chatID: UUID, modelID: String) -> ContextUsage? {
+    records.first { $0.chatID == chatID && $0.modelID == modelID && $0.usage != nil }?.usage
+  }
+
   /// Engine-true context window (tokens) of the loaded model. Prefers the
-  /// most recent turn's measured window, falling back to the model-load seed
-  /// so the memory screen shows the real number the instant a model loads —
-  /// without standing up a chat or waiting for a turn (#711 follow-up).
+  /// loaded model's most recent measured window, falling back to the
+  /// model-load seed — so the memory screen shows the real number the instant
+  /// a model loads, and a model switch resets to the new model's window rather
+  /// than surfacing the prior model's historical window (#711 follow-up F3).
   public var latestWindow: Int? {
-    records.lazy.compactMap { $0.usage?.windowTokens }.first ?? loadedWindow
+    if let model = loadedModelID,
+       let measured = records.lazy
+         .first(where: { $0.modelID == model && $0.usage?.windowTokens != nil })?
+         .usage?.windowTokens {
+      return measured
+    }
+    return loadedWindow
   }
 
   private func publish() {

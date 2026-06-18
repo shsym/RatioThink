@@ -36,14 +36,31 @@ struct ModelObject {
 /// KV tokens-per-page for `model_id`, read from a fresh bare context. This
 /// is a control-only metadata read: `Context::new` allocates no KV pages and
 /// runs no forward pass, and `page_size` resolves from the model-indexed page
-/// size cached at model spawn. `0` if the model can't be loaded/opened, which
-/// the App reads as "window unknown".
+/// size cached at model spawn.
+///
+/// A load/open failure degrades to `0` for the client (the App reads `0` as
+/// "window unknown" and falls back to the post-turn `usage` frame), but the
+/// failure is NOT swallowed silently: it is logged to the chat-apc stderr seam
+/// with the `model_id` so a broken page-size read on an advertised runtime
+/// model is observable (F5) instead of hiding behind a valid `/v1/models`
+/// response. (Per the `emit_done_logged` doc, this stderr is operator-visible
+/// under `pie run` / CLI; daemon-stderr surfacing is the standing pie-side
+/// follow-up shared by every chat-apc diagnostic.)
 fn tokens_per_page(model_id: &str) -> u32 {
-    Model::load(model_id)
-        .ok()
-        .and_then(|model| Context::new(&model).ok())
-        .map(|ctx| ctx.page_size())
-        .unwrap_or(0)
+    let model = match Model::load(model_id) {
+        Ok(model) => model,
+        Err(e) => {
+            eprintln!("[chat-apc] tokens_per_page: Model::load({model_id}) failed: {e}");
+            return 0;
+        }
+    };
+    match Context::new(&model) {
+        Ok(ctx) => ctx.page_size(),
+        Err(e) => {
+            eprintln!("[chat-apc] tokens_per_page: Context::new for {model_id} failed: {e}");
+            0
+        }
+    }
 }
 
 #[derive(Serialize)]

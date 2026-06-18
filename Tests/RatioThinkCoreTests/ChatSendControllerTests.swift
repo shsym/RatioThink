@@ -319,6 +319,8 @@ final class ChatSendControllerTests: XCTestCase {
       .usage(used: 4242, window: 8192),
     ])
     let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    // A model is resident whenever a turn runs; `latestWindow` is scoped to it (F3).
+    tracker.seedFromModelLoad(modelID: "m", pagesTotal: nil, tokensPerPage: nil)
     let controller = ChatSendController()
 
     controller.send(
