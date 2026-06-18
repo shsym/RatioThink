@@ -401,6 +401,48 @@ final class BestOfNTests: XCTestCase {
     XCTAssertNil(final.chosenID, "still no choice until the user picks")
   }
 
+  /// #708 F1 regression: a Best-of-N turn that FAILS before `awaiting_selection`
+  /// (stream ends with no terminal) must surface its ⚠️ error text exactly once,
+  /// not be swallowed. MessageBubble suppresses the content bubble for a round
+  /// only while `bestOfN != nil`; the failure branch must CLEAR the frame-1
+  /// `bestOfN` flag so the ⚠️ falls back to the plain bubble (and so the failed,
+  /// non-empty row is not treated as live).
+  @MainActor
+  func test_failed_round_clears_bestOfN_and_surfaces_error() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ManualInferletEngine()
+    let controller = ChatSendController()
+    controller.sendBestOfN(
+      chat: chat,
+      context: context,
+      engine: engine,
+      config: BestOfNProfileConfig(n: 3),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"))
+
+    func assistant() -> Message? { chat.messages.first { $0.role == "assistant" } }
+    try await waitUntil("assistant turn inserted") { assistant() != nil }
+
+    // Stream a couple candidates, then END the stream with NO awaiting_selection
+    // → the no_terminal failure branch.
+    engine.emit(#"{"event":"tree_start","id":"bon","model":"m","breadth":3,"depth":1,"beam_width":3}"#)
+    engine.emit(#"{"event":"node_complete","node":{"id":"n0","parent_id":"root","depth":1,"branch_index":0,"content":"A","status":"ok"}}"#)
+    engine.finish()
+    try await waitUntil("round failed") { !controller.isInFlight }
+
+    let a = try XCTUnwrap(assistant())
+    XCTAssertTrue(a.content.hasPrefix("⚠️"),
+                  "a failed Best-of-N round must surface its ⚠️ error text; content=\(a.content)")
+    XCTAssertNil(a.bestOfN,
+                 "a failed round must clear bestOfN so MessageBubble renders the ⚠️ bubble (not a suppressed/bare round)")
+  }
+
   /// Polls `condition` on the main actor until true or the timeout elapses.
   @MainActor
   private func waitUntil(

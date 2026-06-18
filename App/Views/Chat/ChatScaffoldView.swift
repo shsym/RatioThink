@@ -987,7 +987,15 @@ struct ChatScaffoldView: View {
       // history exactly like `.stop` and drops out of live-candidacy.
       sendBestOfNRound(for: chat, resume: resume)
       message.content = pickedText
-      try? modelContext.save()
+      // Surface (don't swallow) this save: the liveness rule keys on
+      // `content.isEmpty`, so a silently-failed save would persist the committed
+      // round with empty content and a store re-read would treat it as still
+      // live — reopening the pick-then-abandon hole this commit closes.
+      do {
+        try modelContext.save()
+      } catch {
+        persistenceStatus.report(error, context: "ChatScaffoldView.handleBestOfN.thinkMore")
+      }
 
     case .stop:
       guard let chosen = round.chosen,
