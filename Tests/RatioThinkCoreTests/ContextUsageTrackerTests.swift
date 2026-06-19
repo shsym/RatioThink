@@ -237,6 +237,35 @@ final class ContextUsageTrackerTests: XCTestCase {
                    ContextUsage(usedTokens: 1500, windowTokens: 8192))
   }
 
+  func test_markUsage_missingWindowAfterModelSwitchDoesNotInheritNewModelWindow() {
+    // ToT/Best-of-N usage frames can trail terminal success. If model A's
+    // delayed frame arrives after the operator switched to model B, the
+    // omitted window must not be filled from B's current global seed.
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let chatID = UUID()
+
+    tracker.seedFromModelLoad(modelID: "A", pagesTotal: 100, tokensPerPage: 32)  // 3200
+    tracker.markRequestStarted(chatID: chatID, modelID: "A", requestID: "ra")
+
+    tracker.seedFromModelLoad(modelID: "B", pagesTotal: 256, tokensPerPage: 32)  // 8192
+    tracker.markUsage(chatID: chatID, modelID: "A", requestID: "ra",
+                      usage: ContextUsage(usedTokens: 1500, windowTokens: nil))
+
+    let aRecord = tracker.records.first { $0.modelID == "A" && $0.requestID == "ra" }
+    XCTAssertEqual(aRecord?.usage, ContextUsage(usedTokens: 1500, windowTokens: nil),
+                   "delayed model-A usage must not store model B's denominator")
+    XCTAssertEqual(tracker.meterUsage(chatID: chatID),
+                   ContextUsage(usedTokens: 0, windowTokens: 8192),
+                   "while B is loaded, B's zero-state holds")
+
+    tracker.seedFromModelLoad(modelID: "A", pagesTotal: 100, tokensPerPage: 32)
+    XCTAssertEqual(tracker.meterUsage(chatID: chatID),
+                   ContextUsage(usedTokens: 1500, windowTokens: nil),
+                   "switching back to A must not resurface B's 8192-token window")
+    XCTAssertEqual(tracker.latestWindow, 3200,
+                   "settings window follows the current A seed, not B's stale denominator")
+  }
+
   func test_latestUsage_and_latestWindow_followMostRecentReportingRecord() {
     var tick: TimeInterval = 1
     let chatID = UUID()

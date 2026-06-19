@@ -145,9 +145,11 @@ public final class ContextUsageTracker: ObservableObject {
     record.lastUsedAt = now()
     // The standard chat path reports the engine-true window in the frame; the
     // ToT/Best-of-N paths omit it (the app holds the budget from the
-    // model-load seed). Fall back to the seeded window so every record's
-    // fraction renders regardless of which path produced it.
-    let window = usage.windowTokens ?? loadedWindow
+    // model-load seed). Only fall back to the seeded window while it still
+    // belongs to THIS request's model — a delayed usage frame from model A
+    // after switching to model B must not persist B's denominator on A.
+    let fallbackWindow = loadedModelID == modelID ? loadedWindow : nil
+    let window = usage.windowTokens ?? fallbackWindow
     record.usage = ContextUsage(usedTokens: usage.usedTokens, windowTokens: window)
     byID[id] = record
     publish()
