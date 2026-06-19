@@ -516,6 +516,18 @@ public final class ChatSendController: ObservableObject {
         return  // cancel() owns the row (recordCancelledAssistant)
       } catch {
         guard self.generation == myGeneration, !Task.isCancelled else { return }
+        if reachedTerminal {
+          // #711 review F1: ToT usage/metadata trails the terminal frame.
+          // Keep strict frame decoding, but once the answer has completed,
+          // malformed trailing protocol drift is diagnostic-only; do not
+          // overwrite the already-complete row/tree with a failure.
+          Log.engine.error(
+            "ChatSendController: ignoring malformed ToT metadata after terminal: \(String(describing: error), privacy: .public)"
+          )
+          Diag.app.event("chat.drift.tot", [("error", String(describing: type(of: error)))])
+          Self.persistTree(context, status: persistenceStatus)
+          return
+        }
         // #477: the bubble gets the normalized taxonomy line; the tree
         // disclosure (a technical surface) keeps the raw diagnostic.
         let problem = EngineProblem(requestError: error, requestedModelID: options.modelID)
@@ -908,6 +920,17 @@ public final class ChatSendController: ObservableObject {
         return
       } catch {
         guard self.generation == myGeneration, !Task.isCancelled else { return }
+        if reachedTerminal {
+          // #711 review F1: Best-of-N awaits user selection before its trailing
+          // usage/metadata. Malformed post-terminal drift must not clear the
+          // candidate set or mark the completed round failed.
+          Log.engine.error(
+            "ChatSendController: ignoring malformed best-of-n metadata after terminal: \(String(describing: error), privacy: .public)"
+          )
+          Diag.app.event("chat.drift.bestofn", [("error", String(describing: type(of: error)))])
+          Self.persistTree(context, status: persistenceStatus)
+          return
+        }
         let problem = EngineProblem(requestError: error, requestedModelID: options.modelID)
         tree.fail(problem.technicalDetail ?? problem.message)
         assistant.tot = try? encoder.encode(tree)

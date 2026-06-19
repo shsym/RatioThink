@@ -102,6 +102,50 @@ final class ToTChatSendTests: XCTestCase {
     XCTAssertEqual(assistant.tokens, 84)
   }
 
+  func test_completed_tot_ignores_malformed_trailing_usage_without_overwriting_success() async throws {
+    // #711 review F1: ToT emits usage after its terminal frame. The decoder
+    // stays strict, but malformed trailing metadata is protocol drift after
+    // the answer is already complete; it must not turn the completed row into
+    // a failure or record a bogus occupancy update.
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "What is 2+2?",
+                                 ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ToTFrameEngine(frames: [
+      #"{"event":"tree_start","id":"tot-1","model":"qwen","breadth":1,"depth":1,"beam_width":1}"#,
+      #"{"event":"node_complete","node":{"id":"tot-n1","parent_id":"root","depth":1,"branch_index":0,"content":"4","score":9,"status":"ok"}}"#,
+      #"{"event":"level_pruned","level":1,"kept":["tot-n1"]}"#,
+      #"{"event":"generation_metrics","output_tokens":84,"elapsed_s":2.0,"tokens_per_sec":42.0}"#,
+      #"{"event":"tree_complete","selected_node_id":"tot-n1","final_answer":"4"}"#,
+      #"{"event":"usage","prompt_tokens":1500,"completion_tokens":0}"#,
+    ])
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let controller = ChatSendController()
+    controller.sendTreeOfThought(
+      chat: chat,
+      context: context,
+      engine: engine,
+      config: ToTProfileConfig(breadth: 1, depth: 1, beamWidth: 1),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "qwen"),
+      contextUsageTracker: tracker
+    )
+    try await waitUntil("tot stream with malformed trailing usage finishes") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(chat.messages.first { $0.role == "assistant" })
+    XCTAssertEqual(assistant.content, "4")
+    let tree = try JSONDecoder().decode(ToTTree.self, from: try XCTUnwrap(assistant.tot))
+    XCTAssertEqual(tree.status, .complete)
+    XCTAssertEqual(tree.selectedNodeID, "tot-n1")
+    XCTAssertEqual(tree.finalAnswer, "4")
+    XCTAssertNil(tracker.records.first?.usage,
+                 "malformed trailing usage must not record an occupancy update")
+  }
+
   func test_tree_complete_without_generation_metrics_marks_assistant_failed() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)
@@ -177,6 +221,50 @@ final class ToTChatSendTests: XCTestCase {
     XCTAssertEqual(tree.nodes.count, 3)
     XCTAssertEqual(tree.nodes.first { $0.id == "tot-n1" }?.beam, .kept)
     XCTAssertEqual(tree.nodes.first { $0.id == "tot-n3" }?.beam, .pruned)
+  }
+
+  func test_completed_bestOfN_ignores_malformed_trailing_usage_without_clearing_selection() async throws {
+    // #711 review F1: Best-of-N's terminal is awaiting_selection. A malformed
+    // trailing usage frame after it must be diagnostic-only; the pickable round
+    // and completed tree remain intact and no usage update is recorded.
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "pick one",
+                                 ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ToTFrameEngine(frames: [
+      #"{"event":"tree_start","id":"bon-1","model":"qwen","breadth":2,"depth":1,"beam_width":2}"#,
+      #"{"event":"node_complete","node":{"id":"bon-n0","parent_id":"root","depth":1,"branch_index":0,"content":"A","score":9,"status":"ok"}}"#,
+      #"{"event":"node_complete","node":{"id":"bon-n1","parent_id":"root","depth":1,"branch_index":1,"content":"B","score":8,"status":"ok"}}"#,
+      #"{"event":"awaiting_selection","level":1,"candidates":[{"id":"bon-n0","branch_index":0,"snapshot_name":"s0"},{"id":"bon-n1","branch_index":1,"snapshot_name":"s1"}]}"#,
+      #"{"event":"usage","prompt_tokens":1500,"completion_tokens":0}"#,
+    ])
+    let tracker = ContextUsageTracker(now: { Date(timeIntervalSince1970: 1) })
+    let controller = ChatSendController()
+    controller.sendBestOfN(
+      chat: chat,
+      context: context,
+      engine: engine,
+      config: BestOfNProfileConfig(n: 2, maxTokensPerCandidate: 64),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "qwen"),
+      contextUsageTracker: tracker
+    )
+    try await waitUntil("best-of-n stream with malformed trailing usage finishes") { !controller.isInFlight }
+
+    let assistant = try XCTUnwrap(chat.messages.first { $0.role == "assistant" })
+    XCTAssertEqual(assistant.content, "", "awaiting selection should not be replaced with a failure banner")
+    let tree = try JSONDecoder().decode(ToTTree.self, from: try XCTUnwrap(assistant.tot))
+    XCTAssertEqual(tree.status, .complete)
+    let round = try JSONDecoder().decode(BestOfNRound.self, from: try XCTUnwrap(assistant.bestOfN))
+    XCTAssertEqual(round.level, 1)
+    XCTAssertEqual(round.candidates.map(\.id), ["bon-n0", "bon-n1"])
+    XCTAssertNil(round.chosenID)
+    XCTAssertNil(tracker.records.first?.usage,
+                 "malformed trailing usage must not record an occupancy update")
   }
 
   func test_token_deltas_accumulate_into_preserved_tree_despite_throttled_encode() async throws {
