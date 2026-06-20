@@ -124,6 +124,13 @@ struct MessageBubble: View {
               // highlighted, but no pick affordance, no "pick one" state, and no
               // think-more / use-this controls (#708 read-only history).
               let isLive = onBestOfN != nil
+              // #736 Bug C: the think-more guidance that spawned THIS round,
+              // carried in the durable round model so it survives the transition
+              // and is shown on the round it produced (live or historical).
+              if let guidance = round.inboundComment,
+                 !guidance.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                BestOfNGuidanceHeader(text: guidance)
+              }
               TreeSearchSection(
                 tree: tot,
                 answerStarted: !message.content.isEmpty,
@@ -451,5 +458,27 @@ enum SafeLinkOpenURLAction {
       return .discarded
     }
     return .systemAction(url)
+  }
+}
+
+/// #736 Bug C — read-only header showing the think-more guidance the user typed
+/// on the previous round that produced THIS round. Reads `BestOfNRound.inboundComment`
+/// (durable, persisted), so the guidance survives the think-more transition and a
+/// reload — replacing the prior transient `@State` that vanished on commit.
+struct BestOfNGuidanceHeader: View {
+  let text: String
+
+  var body: some View {
+    HStack(alignment: .firstTextBaseline, spacing: 6) {
+      Image(systemName: "text.quote")
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+      Text("Guidance for this round: \(text)")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+      Spacer(minLength: 0)
+    }
+    .accessibilityIdentifier("bestofn.inboundComment")
   }
 }

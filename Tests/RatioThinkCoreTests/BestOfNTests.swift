@@ -288,6 +288,85 @@ final class BestOfNTests: XCTestCase {
     XCTAssertEqual(input.level, 2)
   }
 
+  // MARK: think-more guidance persists in DURABLE round state (Bug C)
+
+  /// Bug C real-flow gate. The wire test above asserts the comment reaches the
+  /// REQUEST payload — but the bug was that the comment vanished from the UI,
+  /// because it lived only in transient `@State` (cleared on commit) and
+  /// `BestOfNRound` had no field for it. This drives the real send→persist path
+  /// and asserts the comment is carried into the NEXT round's DURABLE model (the
+  /// state `MessageBubble` redisplays), on BOTH the pre-candidate placeholder
+  /// and the resolved `awaiting_selection` round — so it survives the transition
+  /// by construction, not via view state. A wire/payload assert would miss this.
+  @MainActor
+  func test_thinkMore_comment_persists_in_next_round_durable_state() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "Plan a launch",
+                                 ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ManualInferletEngine()
+    let controller = ChatSendController()
+    let guidance = "Emphasize launch risks and mitigations."
+    controller.sendBestOfN(
+      chat: chat, context: context, engine: engine,
+      config: BestOfNProfileConfig(n: 3),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"),
+      resume: ChatSendController.BestOfNResume(
+        pickedName: "bon/r0/1/1", pickedText: "Use a phased launch.",
+        selectedComment: guidance, unpicked: ["bon/r0/1/0"], level: 2))
+
+    func nextRound() -> BestOfNRound? {
+      chat.messages.first { $0.role == "assistant" }?.bestOfN
+        .flatMap { try? JSONDecoder().decode(BestOfNRound.self, from: $0) }
+    }
+    try await waitUntil("next round created") { nextRound() != nil }
+
+    // Pre-candidate placeholder ALREADY carries the guidance in durable state.
+    XCTAssertEqual(try XCTUnwrap(nextRound()).inboundComment, guidance,
+                   "think-more guidance must persist in the next round's durable model")
+
+    // The resolved awaiting_selection round (where the UI shows candidates +
+    // the guidance header) still carries it.
+    engine.emit(#"{"event":"awaiting_selection","level":2,"candidates":[{"id":"n0","branch_index":0,"snapshot_name":"s0"}]}"#)
+    engine.finish()
+    try await waitUntil("round resolved") { !controller.isInFlight }
+    XCTAssertEqual(try XCTUnwrap(nextRound()).inboundComment, guidance,
+                   "the resolved round still carries the guidance for redisplay")
+  }
+
+  /// A FIRST round (no resume) carries NO inbound guidance — the redisplay
+  /// header appears only on rounds a think-more produced.
+  @MainActor
+  func test_firstRound_has_no_inbound_comment() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "hi",
+                                 ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+    let engine = ManualInferletEngine()
+    let controller = ChatSendController()
+    controller.sendBestOfN(
+      chat: chat, context: context, engine: engine,
+      config: BestOfNProfileConfig(n: 3), persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m"))
+    func round() -> BestOfNRound? {
+      chat.messages.first { $0.role == "assistant" }?.bestOfN
+        .flatMap { try? JSONDecoder().decode(BestOfNRound.self, from: $0) }
+    }
+    try await waitUntil("round created") { round() != nil }
+    // Assert while the round still exists, BEFORE cancel() tears down the
+    // in-flight (never-finishing) round for cleanup.
+    XCTAssertNil(try XCTUnwrap(round()).inboundComment, "a first round has no inbound guidance")
+    controller.cancel()
+  }
+
   // MARK: Release-ack observability (#703 F4)
 
   /// A release that freed every requested snapshot is silent — no short-release

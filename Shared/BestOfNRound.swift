@@ -13,11 +13,20 @@ public struct BestOfNRound: Equatable, Sendable, Codable {
   /// The picked candidate's node id, or nil while the round is still awaiting
   /// a choice.
   public var chosenID: String?
+  /// The think-more guidance the user typed on the PREVIOUS round that spawned
+  /// this one (#736 Bug C). Persisted on the round so it survives the think-more
+  /// transition by construction — the prior design held it only in transient
+  /// `@State` that was cleared on commit, so it vanished from the UI. nil for a
+  /// first round (no preceding guidance). Optional ⇒ existing persisted rounds
+  /// decode with `inboundComment == nil`.
+  public var inboundComment: String?
 
-  public init(level: Int, candidates: [ToTSelectionCandidate], chosenID: String? = nil) {
+  public init(level: Int, candidates: [ToTSelectionCandidate], chosenID: String? = nil,
+              inboundComment: String? = nil) {
     self.level = level
     self.candidates = candidates
     self.chosenID = chosenID
+    self.inboundComment = inboundComment
   }
 
   /// The chosen candidate, if the user has picked one.

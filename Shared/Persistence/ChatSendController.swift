@@ -854,7 +854,11 @@ public final class ChatSendController: ObservableObject {
       // green-checkmark-then-unselected flash). The `awaiting_selection` handler
       // below swaps in the real pick set; until then the candidates show neutral,
       // not-yet-pickable option glyphs with no chosen/kept indicator.
-      assistant.bestOfN = try? encoder.encode(BestOfNRound(level: 0, candidates: [], chosenID: nil))
+      assistant.bestOfN = try? encoder.encode(BestOfNRound(
+        level: 0, candidates: [], chosenID: nil,
+        // #736 Bug C: carry the prior round's think-more guidance into this
+        // round's DURABLE state so it survives the transition and redisplays.
+        inboundComment: resume?.selectedComment))
       do {
         for try await event in toTEventStream(from: engine.dispatchInferlet(request)) {
           guard self.generation == myGeneration, !Task.isCancelled else { return }
@@ -870,7 +874,8 @@ public final class ChatSendController: ObservableObject {
             reachedTerminal = true
             assistant.tot = try? encoder.encode(tree)
             // The round's pick set — no choice yet; the user selects in the UI.
-            let round = BestOfNRound(level: level, candidates: candidates, chosenID: nil)
+            let round = BestOfNRound(level: level, candidates: candidates, chosenID: nil,
+                                     inboundComment: resume?.selectedComment)
             assistant.bestOfN = try? encoder.encode(round)
             Self.persistTree(context, status: persistenceStatus)
             self.activeAssistant = nil
