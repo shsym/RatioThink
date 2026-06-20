@@ -864,6 +864,16 @@ public final class PieEngineHost: @unchecked Sendable {
           self.pendingLaunchCancellations.removeValue(forKey: launchID)
           if let shutdownFailureMessage {
             self.setState(.failed(.killRejected, shutdownFailureMessage))
+          } else if code == .spawnFailed {
+            // #736: a TRANSIENT launch failure (spawn / handshake timeout /
+            // early exit / port) auto-retries with backoff instead of going
+            // terminal on the first transient, so the engine comes up without
+            // the user clicking Load repeatedly. The fatal arms never retry:
+            // `.killRejected` (above) and `.modelUnsupported` (the `else`
+            // below, where `EngineLoadFailureClassifier` matched a real
+            // bad-model signature).
+            self.setState(.failed(.spawnFailed, statusMessage))
+            self.scheduleLaunchRetryIfAllowed(spec: spec, reason: "launch_transient")
           } else {
             self.setState(.failed(code, statusMessage))
           }
@@ -1344,6 +1354,65 @@ public final class PieEngineHost: @unchecked Sendable {
       }
       Log.engine.info("PieEngineHost: auto-relaunch backoff elapsed; invoking relauncher")
       relauncher()
+    }
+  }
+
+  /// #736 — launch-failure sibling of `scheduleAutoRelaunchIfAllowed`. A
+  /// TRANSIENT launch failure (`runLaunch`'s `.spawnFailed` arm: spawn /
+  /// handshake timeout / early exit / port — NOT a fatal `.modelUnsupported`
+  /// or `.killRejected`) auto-retries with backoff so the engine comes up
+  /// without the user clicking Load repeatedly. Shares the SAME bounded ladder
+  /// as the engine-gone path (`relaunchPolicy` + `autoRelaunchAttempts` +
+  /// `autoRelaunchTask`), so total instability is capped once and a sustained
+  /// healthy `.running` clears the attempts via `armHealthyUptimeTimer`.
+  ///
+  /// Caller must be on `stateQueue`, having just published
+  /// `.failed(.spawnFailed, …)`. Retries the EXACT `spec` (preserving a
+  /// model-override pick) via `start(_:)` off-queue, exactly as the engine-gone
+  /// path re-enters `start(_:)` through its `relauncher`.
+  private func scheduleLaunchRetryIfAllowed(spec: LaunchSpec, reason: String) {
+    guard relaunchPolicy.maxAttempts > 0 else { return }
+
+    let now = clock()
+    autoRelaunchAttempts.removeAll { now.timeIntervalSince($0) > relaunchPolicy.window }
+    guard autoRelaunchAttempts.count < relaunchPolicy.maxAttempts else {
+      Log.engine.error("PieEngineHost: launch-retry ladder exhausted (\(self.autoRelaunchAttempts.count, privacy: .public)/\(self.relaunchPolicy.maxAttempts, privacy: .public) inside \(self.relaunchPolicy.window, privacy: .public)s); leaving .failed(.spawnFailed) until a sustained healthy .running re-arms the cap")
+      return
+    }
+    let attemptIndex = autoRelaunchAttempts.count
+    autoRelaunchAttempts.append(now)
+    let schedule = relaunchPolicy.backoffSchedule
+    let backoff = schedule[min(attemptIndex, schedule.count - 1)]
+
+    Log.engine.notice("PieEngineHost: scheduling launch-retry attempt \(attemptIndex + 1, privacy: .public)/\(self.relaunchPolicy.maxAttempts, privacy: .public) in \(backoff, privacy: .public)s (reason=\(reason, privacy: .public))")
+    DiagnosticLog.helper.event("engine.launch_retry", [
+      ("attempt", String(attemptIndex + 1)),
+      ("backoff", String(format: "%.1f", backoff)),
+      ("reason", reason),
+    ])
+
+    let sleepFor = self.sleepFor
+    autoRelaunchTask?.cancel()
+    autoRelaunchTask = Task { [weak self, spec, backoff, sleepFor] in
+      await sleepFor(backoff)
+      if Task.isCancelled { return }
+      guard let self else { return }
+      // Mirror the engine-gone commit guard (review v2 R1): the load-bearing
+      // signal is the engine STATE, not the cancellation token. A user Pause or
+      // an explicit start during the backoff moves the host off
+      // `.failed(.spawnFailed)`, so a state mismatch means "superseded" — abort.
+      let okToCommit = self.stateQueue.sync { () -> Bool in
+        self.autoRelaunchTask = nil
+        if Task.isCancelled { return false }
+        if case .failed(.spawnFailed, _) = self._state { return true }
+        return false
+      }
+      guard okToCommit else {
+        Log.engine.info("PieEngineHost: launch-retry backoff completed but cancelled or state moved off .failed(.spawnFailed); skipping")
+        return
+      }
+      Log.engine.info("PieEngineHost: launch-retry backoff elapsed; re-launching spec")
+      _ = self.start(spec)
     }
   }
 

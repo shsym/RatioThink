@@ -33,4 +33,28 @@ final class PieControlLauncherHandshakeRegexTests: XCTestCase {
     // A line carrying neither banner must not yield a spurious address.
     XCTAssertNil(try capturedAddress(in: "internal token: deadbeef"))
   }
+
+  // MARK: - #736 daemon-port parser
+
+  /// pie binds the inferlet daemon to an OS-assigned port (the launcher passes
+  /// 0 to dodge the reserve-bind-close-reuse race) and logs `Daemon serving
+  /// HTTP on http://<host>:<port>/`. `awaitDaemonPort` learns the port from
+  /// that line, so a banner-format drift must be caught here — not only on a
+  /// real engine.
+  func test_daemonPort_parsesServingBanner() {
+    XCTAssertEqual(
+      PieControlLauncher.daemonPort(from: "Daemon serving HTTP on http://127.0.0.1:54321/"),
+      54321)
+    // Tolerate a leading timestamp/level prefix from the tracing layer.
+    XCTAssertEqual(
+      PieControlLauncher.daemonPort(from: "2026-06-20 INFO daemon: Daemon serving HTTP on http://127.0.0.1:7/"),
+      7)
+  }
+
+  func test_daemonPort_ignoresUnrelatedLines() {
+    XCTAssertNil(PieControlLauncher.daemonPort(from: "✓ Server ready at ws://127.0.0.1:8080"))
+    XCTAssertNil(PieControlLauncher.daemonPort(from: "internal token: deadbeef"))
+    // No port in the authority → no match (never a spurious 0).
+    XCTAssertNil(PieControlLauncher.daemonPort(from: "Daemon serving HTTP on http://127.0.0.1/"))
+  }
 }

@@ -58,10 +58,24 @@ struct MessageBubble: View {
   /// think-more/stop controls there). `.pick` records the choice; `.thinkMore`
   /// starts the next round; `.stop` commits the chosen candidate.
   var onBestOfN: ((BestOfNAction) -> Void)? = nil
+  /// #736: the Best-of-N think-more guidance draft, hoisted to a stable
+  /// ancestor (`ChatScaffoldView`) and keyed by message id. The draft MUST NOT
+  /// live in this row's `@State`: the bubble renders inside a `LazyVStack`
+  /// whose rows SwiftUI can tear down and rebuild on relayout (a sibling round
+  /// committing, a 1 Hz status poll), discarding row `@State` mid-typing — so
+  /// the typed comment vanished before the user clicked "Think more". When nil
+  /// (previews / non-live rows) the local `@State` fallback below is used.
+  var bestOfNCommentDraft: Binding<String>? = nil
 
   @State private var isEditing = false
   @State private var editText = ""
-  @State private var bestOfNComment = ""
+  @State private var localBestOfNComment = ""
+
+  /// The active comment binding: the hoisted ancestor draft when provided,
+  /// else the local fallback (previews/tests).
+  private var bestOfNComment: Binding<String> {
+    bestOfNCommentDraft ?? $localBestOfNComment
+  }
 
   var body: some View {
     switch message.role {
@@ -207,7 +221,7 @@ struct MessageBubble: View {
   /// (#708 click-to-reselect, replacing the short-lived Go back button).
   private var bestOfNControls: some View {
     VStack(alignment: .leading, spacing: 6) {
-      TextField("Optional guidance for the next round", text: $bestOfNComment, axis: .vertical)
+      TextField("Optional guidance for the next round", text: bestOfNComment, axis: .vertical)
         .textFieldStyle(.roundedBorder)
         .font(.caption)
         .lineLimit(1...3)
@@ -232,7 +246,7 @@ struct MessageBubble: View {
 
   /// Empty/whitespace guidance preserves the exact #690 think-more wire.
   private var normalizedBestOfNComment: String? {
-    let trimmed = bestOfNComment.trimmingCharacters(in: .whitespacesAndNewlines)
+    let trimmed = bestOfNComment.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
     return trimmed.isEmpty ? nil : trimmed
   }
 

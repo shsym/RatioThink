@@ -85,6 +85,12 @@ struct ChatScaffoldView: View {
   /// persistence "Couldn't save" banner. Cleared when the engine status
   /// changes to a non-failed state.
   @State private var engineActionError: String?
+  /// #736: Best-of-N think-more guidance drafts, keyed by round message id.
+  /// Owned here (a `.id(chatID)`-stable scaffold, outside the transcript's
+  /// LazyVStack) so a typed comment survives the row teardown that was
+  /// discarding the bubble's local `@State` before "Think more" fired. Cleared
+  /// when the round commits (`handleBestOfN` think-more / use-this).
+  @State private var bestOfNCommentDrafts: [UUID: String] = [:]
   /// #496: an engine action (Load / start / Unload) refused because the
   /// background Helper isn't healthy. Surfaced as an inline, helper-framed
   /// `HelperUnavailableNotice` — never the engine-failure banner, which would
@@ -536,7 +542,11 @@ struct ChatScaffoldView: View {
           onBestOfN: sendCoordinator.isInFlight(chatID)
             ? nil
             : { messageID, action in handleBestOfN(messageID: messageID, action: action, in: chat) },
-          bestOfNLiveID: sendCoordinator.isInFlight(chatID) ? nil : liveBestOfNRoundID(in: chat)
+          bestOfNLiveID: sendCoordinator.isInFlight(chatID) ? nil : liveBestOfNRoundID(in: chat),
+          // #736: hoist the think-more guidance drafts here (stable scaffold
+          // state) so a typed comment survives the LazyVStack row rebuilds that
+          // were discarding the bubble's local @State mid-typing.
+          bestOfNCommentDrafts: $bestOfNCommentDrafts
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // #669: the no-model gate is a NON-modal overlay scoped to the
@@ -995,6 +1005,9 @@ struct ChatScaffoldView: View {
       // history exactly like `.stop` and drops out of live-candidacy.
       sendBestOfNRound(for: chat, resume: resume)
       _ = Self.commitBestOfNAnswer(pickedText, on: message, save: saveContext, report: reportSave)
+      // #736: the guidance draft has been consumed into the resume; drop it so
+      // it can't leak into a future round on this (now-committed) message id.
+      bestOfNCommentDrafts[messageID] = nil
 
     case .stop:
       guard let chosen = round.chosen,
@@ -1008,6 +1021,8 @@ struct ChatScaffoldView: View {
       Self.performBestOfNStop(
         text: text, on: message, save: saveContext, report: reportSave,
         releaseSnapshots: { self.releaseBestOfNSnapshots(snapshots, in: chat) })
+      // #736: round committed (no next round) — drop any guidance draft.
+      bestOfNCommentDrafts[messageID] = nil
     }
   }
 

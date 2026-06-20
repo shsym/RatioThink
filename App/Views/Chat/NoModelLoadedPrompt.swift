@@ -264,6 +264,14 @@ struct NoModelLoadedPrompt: View {
 
   // MARK: - body
 
+  /// #736: latched the instant the user taps Load, so the button disables and
+  /// reads "Starting…" immediately — before the async engine-start round-trip
+  /// flips `gateState` to `.busy(.startingEngine)`. This closes the click→
+  /// `.starting` lag window where the operator could stack ~10 Load taps, and
+  /// gives the in-flight feedback the dead countdown lacked. Reset on the next
+  /// `gateState` transition (the plan-driven spinner/retry then takes over).
+  @State private var startRequested = false
+
   var body: some View {
     let plan = Self.plan(state: gateState, action: action, willAutoSend: willAutoSend)
     return VStack(alignment: .leading, spacing: 14) {
@@ -277,6 +285,12 @@ struct NoModelLoadedPrompt: View {
     }
     .padding(20)
     .frame(width: 360)
+    .onChange(of: gateState) { _, _ in
+      // Any lifecycle transition (→ busy / failed / ready / …) means the start
+      // request has been observed; hand feedback back to the plan-driven UI and
+      // re-enable Load only if the gate genuinely returns to `.needsLoad`.
+      startRequested = false
+    }
     // NOTE: do NOT put an `.accessibilityIdentifier` on this container — on
     // current SwiftUI it propagates down and OVERRIDES the child controls'
     // own identifiers (the Cancel/Load/Retry buttons and the embedded
@@ -351,10 +365,25 @@ struct NoModelLoadedPrompt: View {
       EmptyView()
     case .load:
       if case let .load(model) = action {
-        Button("Load") { onLoad(model) }
-          .buttonStyle(.borderedProminent)
-          .keyboardShortcut(.defaultAction)
-          .accessibilityIdentifier("noModel.load")
+        Button {
+          // #736: latch first so a second tap is a no-op (disabled) before the
+          // async start flips the gate — repeated taps can't stack bringups.
+          startRequested = true
+          onLoad(model)
+        } label: {
+          if startRequested {
+            HStack(spacing: 6) {
+              ProgressView().controlSize(.small)
+              Text("Starting…")
+            }
+          } else {
+            Text("Load")
+          }
+        }
+        .buttonStyle(.borderedProminent)
+        .keyboardShortcut(.defaultAction)
+        .disabled(startRequested)
+        .accessibilityIdentifier("noModel.load")
       }
     case .retryEngine:
       Button("Retry") { onRetryEngineStart() }

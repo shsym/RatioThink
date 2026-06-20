@@ -1054,6 +1054,57 @@ final class EngineDeathRecoveryTests: XCTestCase {
     func advance(_ dt: TimeInterval) { seconds += max(0, dt) }
   }
 
+  // MARK: - #736 launch-level retry (transient launch failure)
+
+  /// A TRANSIENT launch failure (handshake timeout) must auto-retry with
+  /// backoff and bring the host to `.running` WITHOUT a second explicit start —
+  /// so the engine comes up without the user clicking Load repeatedly.
+  func test_transientLaunchFailure_autoRetries_to_running() async throws {
+    let launchCount = OSAllocatedUnfairLock<Int>(initialState: 0)
+    let launcher: PieEngineHost.LauncherCall = { _ in
+      let n = launchCount.withLock { c -> Int in c += 1; return c }
+      if n == 1 {
+        throw PieControlLauncher.LaunchError.handshakeTimeout(elapsed: 1, lastLines: [])
+      }
+      return (port: EnginePort(60201), session: HealthySession())
+    }
+    let policy = PieEngineHost.RelaunchPolicy(maxAttempts: 2, window: 5, backoffSchedule: [0.02])
+    let host = PieEngineHost(
+      launcher: launcher,
+      livenessInterval: 5,
+      livenessFailureThreshold: 2,
+      relaunchPolicy: policy)
+    _ = host.start(makeSpec())
+    try await waitUntil("host reaches .running after a transient-launch auto-retry") {
+      if case .running = host.status { return true }
+      return false
+    }
+    XCTAssertEqual(launchCount.withLock { $0 }, 2, "exactly one retry, no user click")
+    host.stop()
+  }
+
+  /// A FATAL launch failure (a bad/unsupported model — classified
+  /// `.modelUnsupported`) must NOT retry: it surfaces immediately so the user
+  /// can choose a different model, and the launcher is invoked exactly once.
+  func test_fatalLaunchFailure_doesNotRetry() async throws {
+    let launchCount = OSAllocatedUnfairLock<Int>(initialState: 0)
+    let launcher: PieEngineHost.LauncherCall = { _ in
+      _ = launchCount.withLock { c -> Int in c += 1; return c }
+      throw PieControlLauncher.LaunchError.engineExitedEarly(
+        code: 1, reason: .exit, stderrTail: "unsupported gguf magic", rssBytes: nil)
+    }
+    let policy = PieEngineHost.RelaunchPolicy(maxAttempts: 2, window: 5, backoffSchedule: [0.02])
+    let host = PieEngineHost(launcher: launcher, relaunchPolicy: policy)
+    _ = host.start(makeSpec())
+    try await waitUntil("host reaches .failed(.modelUnsupported)") {
+      if case .failed(.modelUnsupported, _) = host.status { return true }
+      return false
+    }
+    // Give any (incorrect) retry a beat to fire, then assert it didn't.
+    try await Task.sleep(nanoseconds: 150_000_000)
+    XCTAssertEqual(launchCount.withLock { $0 }, 1, "fatal launch failure must not retry")
+  }
+
   // MARK: - helpers
 
   private func makeSpec(profileID: String = "chat") -> PieControlLauncher.LaunchSpec {

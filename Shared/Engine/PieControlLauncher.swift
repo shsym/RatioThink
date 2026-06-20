@@ -203,11 +203,17 @@ public enum PieControlLauncher {
   /// process-lifetime lease.
   public static let coldStartHandshakeTimeout: TimeInterval = TimeInterval(requestTimeoutCeilingSeconds)
 
+  /// #736 — how long to wait for pie's inferlet daemon to report its
+  /// OS-assigned HTTP port after `launch_daemon`. The daemon binds immediately
+  /// (the model is already resident from `pie serve` boot — no weight load
+  /// here), so this is a short transport lease, not a cold-boot lease. On
+  /// expiry `awaitDaemonPort` throws a transient `.clientError`, so the
+  /// `PieEngineHost` launch-retry ladder re-attempts rather than going terminal.
+  public static let daemonBindTimeout: TimeInterval = 30
+
   // MARK: - errors
 
   public enum LaunchError: Error, CustomStringConvertible {
-    case freePortBindFailed(errno: Int32)
-    case freePortGetSockNameFailed(errno: Int32)
     case pieBinaryMissing(path: String)
     case spawnFailed(underlying: String)
     case engineExitedEarly(code: Int32?, reason: Process.TerminationReason, stderrTail: String, rssBytes: UInt64? = nil)
@@ -226,8 +232,6 @@ public enum PieControlLauncher {
 
     public var description: String {
       switch self {
-      case let .freePortBindFailed(e): return "PieControlLauncher: bind(127.0.0.1:0) failed errno=\(e)"
-      case let .freePortGetSockNameFailed(e): return "PieControlLauncher: getsockname failed errno=\(e)"
       case let .pieBinaryMissing(path): return "PieControlLauncher: pie binary missing at \(path)"
       case let .spawnFailed(u): return "PieControlLauncher: spawn failed: \(u)"
       case let .engineExitedEarly(code, reason, tail, _):
@@ -719,7 +723,6 @@ public enum PieControlLauncher {
        let budgetError = auxSocketBudgetError(pieHome: spec.pieHome) {
       throw budgetError
     }
-    let httpPort = try reserveFreePort()
     let configURL = try writeConfig(
       modelConfig: spec.modelConfig, defaultTokenLimit: spec.defaultTokenLimit,
       maxNumKvPages: spec.maxNumKvPages,
@@ -814,17 +817,26 @@ public enum PieControlLauncher {
     // reconnects on demand.
     await session.recordControlWSURL(wsURL)
     let client = PieControlClient(url: wsURL)
+    let httpPort: UInt16
     do {
       try await client.connect()
       try await client.authByToken(handshake.token)
       try await client.installProgram(wasmURL: spec.wasmURL,
                                       manifestURL: spec.manifestURL,
                                       forceOverwrite: true)
+      // #736: pass port 0 so pie's inferlet daemon binds an OS-assigned free
+      // port at bind time, then learn the actual port from pie's own "Daemon
+      // serving HTTP on …" log line. This eliminates the old
+      // reserve-bind-close-reuse TOCTOU in `reserveFreePort()`: an App-chosen
+      // port could be stolen in the window between our `close()` and pie's
+      // later `bind()`. With the OS choosing at bind time the port cannot be
+      // stolen, and nobody but pie knows it until it is already bound.
       try await client.launchDaemon(
         inferlet: spec.inferletNameAtVersion,
-        port: UInt32(httpPort),
+        port: 0,
         host: spec.daemonBindHost.daemonHost
       )
+      httpPort = try await session.awaitDaemonPort(timeout: PieControlLauncher.daemonBindTimeout)
       await client.close()
     } catch is CancellationError {
       _ = await session.residentMemoryBytes()
@@ -887,40 +899,23 @@ public enum PieControlLauncher {
     }.value
   }
 
-  // MARK: - free port
+  // MARK: - daemon port
 
-  /// Bind 127.0.0.1:0, read the OS-assigned port, close the socket.
-  /// Matches the Python `_free_port()` helper. There is a race
-  /// between close + pie's later bind, but pie always picks a fresh
-  /// port via `--http-listen :0` on its own — this free port is for
-  /// the inferlet daemon, which the engine binds *after* the WS
-  /// install completes. By that point the kernel has had the port
-  /// in TIME_WAIT-free state long enough that reuse is reliable on
-  /// loopback. Same race window as the Python reference.
-  private static func reserveFreePort() throws -> UInt16 {
-    let fd = socket(AF_INET, SOCK_STREAM, 0)
-    if fd < 0 { throw LaunchError.freePortBindFailed(errno: errno) }
-    defer { close(fd) }
-    var addr = sockaddr_in()
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = 0
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    let bindRC = withUnsafePointer(to: &addr) { ptr -> Int32 in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-        bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-      }
-    }
-    if bindRC != 0 { throw LaunchError.freePortBindFailed(errno: errno) }
-    var out = sockaddr_in()
-    var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-    let gsnRC = withUnsafeMutablePointer(to: &out) { ptr -> Int32 in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-        getsockname(fd, sa, &len)
-      }
-    }
-    if gsnRC != 0 { throw LaunchError.freePortGetSockNameFailed(errno: errno) }
-    return UInt16(bigEndian: out.sin_port)
+  /// #736 — parse pie's inferlet-daemon "serving" log line to learn the
+  /// OS-assigned HTTP port. pie logs `Daemon serving HTTP on
+  /// http://127.0.0.1:<port>/` right after it binds (runtime `daemon.rs`
+  /// `serve`). Pure so the wire-format contract is unit-tested without a live
+  /// engine. Returns nil for any other line.
+  static func daemonPort(from line: String) -> UInt16? {
+    guard let regex = try? NSRegularExpression(
+      pattern: #"Daemon serving HTTP on https?://[^/\s]+:(\d+)/"#) else { return nil }
+    let range = NSRange(line.startIndex..., in: line)
+    guard let match = regex.firstMatch(in: line, range: range),
+          match.numberOfRanges >= 2,
+          let capture = Range(match.range(at: 1), in: line),
+          let port = UInt16(line[capture])
+    else { return nil }
+    return port
   }
 
   // MARK: - config + port file
@@ -1551,6 +1546,45 @@ public actor LaunchedSession {
     }, onCancel: {
       cancellationSignal.cancel()
     })
+  }
+
+  /// #736 — after `launch_daemon` with port 0, wait for pie to report the
+  /// OS-assigned inferlet-daemon HTTP port via its "Daemon serving HTTP on
+  /// http://…/" log line (parsed by `PieControlLauncher.daemonPort(from:)`).
+  /// `replayRecent: true` covers the line already having been emitted before
+  /// we subscribe (the daemon binds immediately after `launch_daemon`). On
+  /// timeout or a closed stdout this throws a transient `.clientError`, so the
+  /// `PieEngineHost` launch-retry ladder re-attempts rather than going terminal.
+  func awaitDaemonPort(timeout: TimeInterval) async throws -> UInt16 {
+    let started = Date()
+    let lines = outputTail.subscribe(replayRecent: true)
+    startOutputTailer()
+    return try await withThrowingTaskGroup(of: UInt16.self) { group in
+      group.addTask {
+        for await line in lines {
+          if let port = PieControlLauncher.daemonPort(from: line) {
+            return port
+          }
+        }
+        // stdout EOF before the daemon reported a port — the engine likely
+        // died; surface as transient so the host retries.
+        throw PieControlLauncher.LaunchError.clientError(
+          underlying: "pie closed stdout before reporting a daemon HTTP port")
+      }
+      group.addTask { [weak self] in
+        try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+        let tail = (await self?.recentLines()) ?? []
+        throw PieControlLauncher.LaunchError.clientError(
+          underlying: "pie did not report a daemon HTTP port within "
+            + "\(Int(Date().timeIntervalSince(started)))s; last lines: \(tail.joined(separator: " | "))")
+      }
+      defer { group.cancelAll() }
+      guard let first = try await group.next() else {
+        throw PieControlLauncher.LaunchError.clientError(
+          underlying: "daemon-port wait produced no result")
+      }
+      return first
+    }
   }
 
   private func recentLines() -> [String] { outputTail.recentLines() }

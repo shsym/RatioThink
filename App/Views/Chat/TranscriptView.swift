@@ -35,6 +35,11 @@ struct TranscriptView: View {
   /// uncommitted round, set by the scaffold while idle). Only that row shows the
   /// pick + think-more/stop controls; older rounds render read-only.
   var bestOfNLiveID: UUID? = nil
+  /// #736: Best-of-N think-more guidance drafts, keyed by round message id and
+  /// owned by the stable scaffold so a typed comment survives the LazyVStack
+  /// row teardown that was wiping the bubble's local `@State`. Default
+  /// `.constant([:])` keeps previews/tests on the per-row fallback.
+  var bestOfNCommentDrafts: Binding<[UUID: String]> = .constant([:])
 
   /// #521/#530: THE render-path projection seam. The body builds the transcript
   /// snapshot exactly once per evaluation by calling this; the unit test renders
@@ -74,7 +79,12 @@ struct TranscriptView: View {
                           onRetry: retryAction(for: item, retryableIDs: retryableIDs),
                           onEdit: editAction(for: item),
                           maxBubbleWidth: maxBubble,
-                          onBestOfN: bestOfNAction(for: item))
+                          onBestOfN: bestOfNAction(for: item),
+                          bestOfNCommentDraft: bestOfNAction(for: item) == nil
+                            ? nil
+                            : Binding(
+                                get: { bestOfNCommentDrafts.wrappedValue[item.id] ?? "" },
+                                set: { bestOfNCommentDrafts.wrappedValue[item.id] = $0 }))
               .id(item.id)
           }
           // Sentinel row so `scrollTo(.bottomSentinel)` lands at the
