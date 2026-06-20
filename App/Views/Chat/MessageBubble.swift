@@ -479,6 +479,12 @@ struct BestOfNGuidanceHeader: View {
         .fixedSize(horizontal: false, vertical: true)
       Spacer(minLength: 0)
     }
+    // Expose ONE addressable a11y element with a KNOWN label: SwiftUI otherwise
+    // hoists a leaf identifier onto a generated container whose `.label` reads
+    // empty in XCUITest. `children: .ignore` + an explicit label make the
+    // carried guidance deterministically readable (and queryable by id).
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel("Guidance for this round: \(text)")
     .accessibilityIdentifier("bestofn.inboundComment")
   }
 }

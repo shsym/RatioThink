@@ -84,6 +84,18 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
       XCTAssertTrue(stateMarker(idx, "pickable").waitForExistence(timeout: 15),
                     "[\(appearance)] candidate \(idx) did not render as pickable; app tree: \(app.debugDescription)")
     }
+    // Bug C redisplay (the gate the wire tests missed): the seeded round carries
+    // inbound think-more guidance in its DURABLE model, so the running UI must
+    // render the read-only guidance header from it — proving the comment
+    // survives + redisplays in the actual UI, not just the request payload.
+    // The header is one a11y element (identifier + explicit label) carrying the
+    // guidance text — the user-visible redisplay proof.
+    let guidanceHeader = app.descendants(matching: .any)
+      .matching(identifier: "bestofn.inboundComment").firstMatch
+    XCTAssertTrue(guidanceHeader.waitForExistence(timeout: 10),
+                  "[\(appearance)] inbound guidance header must redisplay from durable round state; app tree: \(app.debugDescription)")
+    XCTAssertTrue(guidanceHeader.label.contains("add a risks section"),
+                  "[\(appearance)] the carried think-more guidance must be shown; got '\(guidanceHeader.label)'")
     // #708 native tap-to-select: each candidate is itself the pick target (no
     // per-option "Select" button); the WHOLE card — header AND answer body —
     // exposes a `bestofn.option.<i>` identifier and tapping anywhere on it picks.

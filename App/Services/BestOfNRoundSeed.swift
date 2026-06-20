@@ -108,7 +108,15 @@ enum BestOfNRoundSeed {
     tree.apply(.levelPruned(level: 1, kept: kept))
     tree.apply(.awaitingSelection(level: 1, candidates: candidates))
 
-    let round = BestOfNRound(level: 1, candidates: candidates, chosenID: nil)
+    // Bug C: seed the inbound think-more guidance so the seated GUI test can
+    // assert the read-only redisplay header renders from DURABLE round state
+    // (the redisplay half of the fix, proven in the running UI).
+    let round = BestOfNRound(level: 1, candidates: candidates, chosenID: nil,
+                             inboundComment: seededInboundComment)
     return (try? JSONEncoder().encode(tree), try? JSONEncoder().encode(round))
   }
+
+  /// The think-more guidance baked into the seeded round so S690 can assert the
+  /// `bestofn.inboundComment` redisplay header (Bug C).
+  static let seededInboundComment = "Tighten the tone; add a risks section."
 }
