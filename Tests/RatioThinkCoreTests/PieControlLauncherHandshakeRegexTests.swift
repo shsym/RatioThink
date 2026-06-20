@@ -57,4 +57,49 @@ final class PieControlLauncherHandshakeRegexTests: XCTestCase {
     // No port in the authority → no match (never a spurious 0).
     XCTAssertNil(PieControlLauncher.daemonPort(from: "Daemon serving HTTP on http://127.0.0.1/"))
   }
+
+  // MARK: - #736 build-9: read the port from pie.log (the real sink), not stdout
+
+  /// pie writes the "Daemon serving" line via `tracing::info!` → it lands ONLY
+  /// in `<pieHome>/logs/pie.log.<date>`, never on captured stdout (build-8's
+  /// bug). `scanDaemonPort` must read that file, and — because the rolling
+  /// daily file is shared across same-day launches — it must IGNORE a stale
+  /// line written before the pre-launch cursor and return THIS launch's port.
+  func test_scanDaemonPort_readsPieLog_skippingStaleLineBeforeCursor() throws {
+    let fm = FileManager.default
+    let pieHome = fm.temporaryDirectory.appendingPathComponent("pielog-\(UUID().uuidString)")
+    let logs = pieHome.appendingPathComponent("logs")
+    try fm.createDirectory(at: logs, withIntermediateDirectories: true)
+    let logFile = logs.appendingPathComponent("pie.log.2026-06-20")
+
+    // A previous same-day launch left a stale serving line with an OLD port.
+    let stale = "2026-06-20T14:00:00 INFO daemon: Daemon serving HTTP on http://127.0.0.1:11111/\n"
+    try stale.data(using: .utf8)!.write(to: logFile)
+
+    // Snapshot the cursor BEFORE this launch's daemon binds.
+    let cursor = PieControlLauncher.daemonLogCursor(pieHome: pieHome)
+
+    // Before this launch logs anything new, the post-cursor scan finds nothing
+    // (must NOT return the stale 11111).
+    XCTAssertNil(PieControlLauncher.scanDaemonPort(pieHome: pieHome, baseline: cursor),
+                 "stale pre-cursor port must be ignored")
+
+    // This launch binds and logs its real port.
+    let fresh = "2026-06-20T14:17:36 INFO daemon: Daemon serving HTTP on http://127.0.0.1:22222/\n"
+    let handle = try FileHandle(forWritingTo: logFile)
+    handle.seekToEndOfFile()
+    handle.write(fresh.data(using: .utf8)!)
+    try handle.close()
+
+    XCTAssertEqual(PieControlLauncher.scanDaemonPort(pieHome: pieHome, baseline: cursor), 22222,
+                   "must learn THIS launch's bound port from pie.log")
+    try? fm.removeItem(at: pieHome)
+  }
+
+  /// No logs dir / no pie.log yet → nil (caller keeps polling), never a throw.
+  func test_scanDaemonPort_absentLog_returnsNil() {
+    let pieHome = FileManager.default.temporaryDirectory.appendingPathComponent("pielog-none-\(UUID().uuidString)")
+    XCTAssertNil(PieControlLauncher.scanDaemonPort(pieHome: pieHome, baseline: .zero))
+    XCTAssertNil(PieControlLauncher.newestDaemonLog(pieHome: pieHome))
+  }
 }

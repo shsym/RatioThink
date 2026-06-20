@@ -831,12 +831,20 @@ public enum PieControlLauncher {
       // port could be stolen in the window between our `close()` and pie's
       // later `bind()`. With the OS choosing at bind time the port cannot be
       // stolen, and nobody but pie knows it until it is already bound.
+      //
+      // build-9 fix: that line is `tracing::info!` → it lands ONLY in
+      // <pieHome>/logs/pie.log, NEVER on the captured stdout (build-8 watched
+      // stdout and hung 30s every launch). Snapshot the log cursor BEFORE
+      // launch_daemon so the post-launch scan can't pick up a stale port from
+      // an earlier same-day launch sharing the rolling daily file.
+      let logCursor = PieControlLauncher.daemonLogCursor(pieHome: spec.pieHome)
       try await client.launchDaemon(
         inferlet: spec.inferletNameAtVersion,
         port: 0,
         host: spec.daemonBindHost.daemonHost
       )
-      httpPort = try await session.awaitDaemonPort(timeout: PieControlLauncher.daemonBindTimeout)
+      httpPort = try await session.awaitDaemonPort(
+        baseline: logCursor, timeout: PieControlLauncher.daemonBindTimeout)
       await client.close()
     } catch is CancellationError {
       _ = await session.residentMemoryBytes()
@@ -916,6 +924,74 @@ public enum PieControlLauncher {
           let port = UInt16(line[capture])
     else { return nil }
     return port
+  }
+
+  // MARK: - daemon log source-of-truth (#736 build-9 fix)
+
+  // The "Daemon serving HTTP on …" line is a `tracing::info!`
+  // (Vendor/pie/runtime/src/daemon.rs), and `pie serve` ALWAYS sets
+  // `log_dir = <pie_home>/logs` (server/src/bootstrap_translate.rs) — which
+  // makes init_tracing route ALL tracing to a rolling file and DISABLE the
+  // stdout layer (`stdout_layer = if log_dir.is_none()`). So the line never
+  // reaches the engine's captured stdout/stderr (build-8's bug: it watched
+  // stdout and timed out forever). The pie.log file is therefore the SINGLE
+  // source of truth — we read it, not stdout. (The handshake markers we read
+  // off stdout are `eprintln!`, a different, always-captured path.) Because the
+  // line is logged AFTER the daemon binds, learning the port from it also
+  // proves the daemon is already listening — closing the pre-#736 "connect
+  // before bind" race for free.
+
+  /// A position in the pie.log rolling-file stream, captured BEFORE
+  /// `launch_daemon` so the scan ignores a stale "Daemon serving" line left by
+  /// an earlier launch that shares the same daily file.
+  public struct DaemonLogCursor: Sendable, Equatable {
+    let file: URL?
+    let offset: UInt64
+    public static let zero = DaemonLogCursor(file: nil, offset: 0)
+  }
+
+  private static func daemonLogDir(pieHome: URL) -> URL {
+    pieHome.appendingPathComponent("logs")
+  }
+
+  /// Newest `pie.log*` in `<pieHome>/logs` (tracing_appender writes
+  /// `pie.log.YYYY-MM-DD`, rolling daily), by modification time.
+  static func newestDaemonLog(pieHome: URL) -> URL? {
+    let dir = daemonLogDir(pieHome: pieHome)
+    guard let entries = try? FileManager.default.contentsOfDirectory(
+      at: dir, includingPropertiesForKeys: [.contentModificationDateKey], options: [])
+    else { return nil }
+    return entries
+      .filter { $0.lastPathComponent.hasPrefix("pie.log") }
+      .max { a, b in
+        let am = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+        let bm = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+        return am < bm
+      }
+  }
+
+  /// Snapshot the end of the current newest pie.log so the post-launch scan
+  /// only considers bytes written from now on (this launch's daemon line).
+  static func daemonLogCursor(pieHome: URL) -> DaemonLogCursor {
+    guard let file = newestDaemonLog(pieHome: pieHome) else { return .zero }
+    let size = ((try? FileManager.default.attributesOfItem(atPath: file.path))?[.size] as? NSNumber)?.uint64Value ?? 0
+    return DaemonLogCursor(file: file, offset: size)
+  }
+
+  /// Scan the newest pie.log for THIS launch's daemon port, reading only bytes
+  /// after `baseline` (same file) or the whole file (a newer/rolled file). The
+  /// first match past the baseline is this launch's bound port. Returns nil
+  /// until the line has been written (caller polls).
+  public static func scanDaemonPort(pieHome: URL, baseline: DaemonLogCursor) -> UInt16? {
+    guard let file = newestDaemonLog(pieHome: pieHome),
+          let data = try? Data(contentsOf: file) else { return nil }
+    let start: Int = (file == baseline.file) ? min(Int(baseline.offset), data.count) : 0
+    let slice = data.subdata(in: start..<data.count)
+    guard let text = String(data: slice, encoding: .utf8) else { return nil }
+    for line in text.split(whereSeparator: \.isNewline) {
+      if let port = daemonPort(from: String(line)) { return port }
+    }
+    return nil
   }
 
   // MARK: - config + port file
@@ -1555,36 +1631,39 @@ public actor LaunchedSession {
   /// we subscribe (the daemon binds immediately after `launch_daemon`). On
   /// timeout or a closed stdout this throws a transient `.clientError`, so the
   /// `PieEngineHost` launch-retry ladder re-attempts rather than going terminal.
-  func awaitDaemonPort(timeout: TimeInterval) async throws -> UInt16 {
+  /// #736 build-9 — learn the daemon's OS-assigned HTTP port by polling pie's
+  /// rolling log file (the ONLY sink that carries the "Daemon serving" line;
+  /// see the notes on `PieControlLauncher.scanDaemonPort`). `baseline` is the
+  /// log cursor captured before `launch_daemon`, so a stale line from an
+  /// earlier same-day launch is ignored. Reading existing file content each
+  /// poll covers the race where pie wrote the line before this watcher
+  /// attached; polling covers the line arriving after. Fails fast (transient
+  /// `engineExitedEarly`) if the engine process exits before the line appears,
+  /// else throws a transient timeout — both let the host launch-retry ladder
+  /// re-attempt.
+  func awaitDaemonPort(baseline: PieControlLauncher.DaemonLogCursor,
+                       timeout: TimeInterval) async throws -> UInt16 {
     let started = Date()
-    let lines = outputTail.subscribe(replayRecent: true)
-    startOutputTailer()
-    return try await withThrowingTaskGroup(of: UInt16.self) { group in
-      group.addTask {
-        for await line in lines {
-          if let port = PieControlLauncher.daemonPort(from: line) {
-            return port
-          }
-        }
-        // stdout EOF before the daemon reported a port — the engine likely
-        // died; surface as transient so the host retries.
-        throw PieControlLauncher.LaunchError.clientError(
-          underlying: "pie closed stdout before reporting a daemon HTTP port")
+    let deadline = started.addingTimeInterval(timeout)
+    while Date() < deadline {
+      try Task.checkCancellation()
+      if let port = PieControlLauncher.scanDaemonPort(pieHome: pieHome, baseline: baseline) {
+        return port
       }
-      group.addTask { [weak self] in
-        try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-        let tail = (await self?.recentLines()) ?? []
-        throw PieControlLauncher.LaunchError.clientError(
-          underlying: "pie did not report a daemon HTTP port within "
-            + "\(Int(Date().timeIntervalSince(started)))s; last lines: \(tail.joined(separator: " | "))")
+      if await confirmedExit() {
+        throw PieControlLauncher.LaunchError.engineExitedEarly(
+          code: terminationStatusIfExited(),
+          reason: terminationReasonIfExited() ?? .exit,
+          stderrTail: recentLines().joined(separator: "\n"),
+          rssBytes: await observedResidentMemoryBytes())
       }
-      defer { group.cancelAll() }
-      guard let first = try await group.next() else {
-        throw PieControlLauncher.LaunchError.clientError(
-          underlying: "daemon-port wait produced no result")
-      }
-      return first
+      try await Task.sleep(nanoseconds: 100_000_000)
     }
+    let tail = recentLines()
+    throw PieControlLauncher.LaunchError.clientError(
+      underlying: "pie did not log a daemon HTTP port within "
+        + "\(Int(Date().timeIntervalSince(started)))s "
+        + "(<pieHome>/logs/pie.log); last stdout: \(tail.joined(separator: " | "))")
   }
 
   private func recentLines() -> [String] { outputTail.recentLines() }

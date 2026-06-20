@@ -48,6 +48,17 @@ final class S0_TestIsolationTests: IsolatedTestCase {
     // reap loop is safe.
     defer { Task { _ = await session.shutdown() } }
 
+    // #736 build-9 regression gate: the launcher learns the OS-assigned daemon
+    // port by reading pie's rolling log file (the ONLY sink for the "Daemon
+    // serving HTTP on <port>" tracing line — build-8 watched stdout, where the
+    // line never appears, and hung 30s every launch → launch.client_error).
+    // Assert the returned port equals the port pie actually logged in
+    // <pieHome>/logs/pie.log, so a sink/format drift fails HERE, on a real
+    // launch, not on the operator's machine.
+    let loggedPort = PieControlLauncher.scanDaemonPort(pieHome: tempPieHome, baseline: .zero)
+    XCTAssertEqual(loggedPort, bound,
+                   "launcher returned port \(bound) but pie.log logged \(String(describing: loggedPort)) — daemon-port learning is reading the wrong source")
+
     let pollPort = try await boundHTTPPort(timeout: 5)
     XCTAssertEqual(Int(bound), pollPort,
                    "launcher returned port \(bound) but http.port resolved to \(pollPort) — the launcher's port-file write contract is broken")
