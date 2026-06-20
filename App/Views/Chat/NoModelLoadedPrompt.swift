@@ -291,6 +291,16 @@ struct NoModelLoadedPrompt: View {
       // re-enable Load only if the gate genuinely returns to `.needsLoad`.
       startRequested = false
     }
+    .task(id: startRequested) {
+      // Safety auto-release: if a Load tap never moves `gateState` (a dropped
+      // start), re-enable the button after a bounded delay so the user can
+      // retry. A real start flips the gate first, and `onChange` clears the
+      // latch (cancelling this) well before the timeout — so during a genuine
+      // in-flight start the button is already hidden by the plan, not this.
+      guard startRequested else { return }
+      try? await Task.sleep(nanoseconds: 3_000_000_000)
+      if !Task.isCancelled { startRequested = false }
+    }
     // NOTE: do NOT put an `.accessibilityIdentifier` on this container — on
     // current SwiftUI it propagates down and OVERRIDES the child controls'
     // own identifiers (the Cancel/Load/Retry buttons and the embedded
