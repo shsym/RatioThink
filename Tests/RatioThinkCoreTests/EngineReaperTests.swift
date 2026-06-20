@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import Darwin
 @testable import RatioThinkCore
 
 /// regression — OS-enforced single-owner engine teardown. The invariant is
@@ -89,6 +90,61 @@ final class EngineReaperTests: XCTestCase {
   func test_reapStale_noRecord_returnsNil() throws {
     try withTempHome {
       XCTAssertNil(EngineReaper.reapStaleOwnedProcess(isAlive: { _ in true }))
+    }
+  }
+
+  // MARK: - live (real process) backstop proof
+
+  /// Spawn a REAL long-lived child, record it as the owned engine, then prove
+  /// the reap-before-spawn backstop actually KILLS it via the production
+  /// `kill`/`proc_pidpath` path (no injected probes). This is the end-to-end
+  /// "an orphan from a dead Helper is reaped on the next launch" guarantee.
+  func test_reapStale_killsRealOrphanedProcess() throws {
+    try withTempHome {
+      let proc = Process()
+      proc.executableURL = URL(fileURLWithPath: "/bin/sleep")
+      proc.arguments = ["30"]
+      try proc.run()
+      let pid = proc.processIdentifier
+      defer { if proc.isRunning { kill(pid, SIGKILL) } }  // safety net
+
+      // Record it exactly as the launcher would (own group + real path).
+      _ = setpgid(pid, pid)
+      EngineReaper.own(pid: pid, pgid: pid, binaryPath: "/bin/sleep")
+      XCTAssertTrue(EngineReaper.processIsAlive(pid))
+
+      // Production probes — real identity gate against /bin/sleep.
+      let reaped = EngineReaper.reapStaleOwnedProcess(expectedBinaryPath: "/bin/sleep")
+      XCTAssertEqual(reaped, pid)
+
+      // The child must actually die.
+      var alive = true
+      for _ in 0..<100 where alive {
+        if !EngineReaper.processIsAlive(pid) { alive = false; break }
+        usleep(20_000)
+      }
+      proc.waitUntilExit()  // reap the zombie so the assertion is clean
+      XCTAssertFalse(EngineReaper.processIsAlive(pid), "real orphan must be reaped")
+    }
+  }
+
+  /// The identity gate must SPARE a real process whose path differs from the
+  /// recorded engine binary (pid reuse): record `/bin/sleep`'s live pid under a
+  /// bogus binary path, and confirm the backstop does NOT kill it.
+  func test_reapStale_sparesRealProcess_onIdentityMismatch() throws {
+    try withTempHome {
+      let proc = Process()
+      proc.executableURL = URL(fileURLWithPath: "/bin/sleep")
+      proc.arguments = ["30"]
+      try proc.run()
+      let pid = proc.processIdentifier
+      defer { kill(pid, SIGKILL); proc.waitUntilExit() }
+
+      EngineReaper.own(pid: pid, pgid: 0, binaryPath: "/Apps/Rational.app/pie")
+      // The live pid maps to /bin/sleep, not the recorded pie binary → spared.
+      let reaped = EngineReaper.reapStaleOwnedProcess(expectedBinaryPath: "/Apps/Rational.app/pie")
+      XCTAssertNil(reaped)
+      XCTAssertTrue(EngineReaper.processIsAlive(pid), "a non-matching live pid must be spared")
     }
   }
 }
