@@ -20,7 +20,7 @@ settings:
     # CFBundleVersion from these build settings; without them the version
     # keys in each target's info.properties are dropped from the built bundle.
     MARKETING_VERSION: "0.1.6"
-    CURRENT_PROJECT_VERSION: "7"
+    CURRENT_PROJECT_VERSION: "8"
     ENABLE_HARDENED_RUNTIME: NO
     DEAD_CODE_STRIPPING: YES
   configs:
@@ -174,7 +174,7 @@ targets:
         CFBundleName: Rational
         CFBundleDisplayName: Rational
         CFBundleShortVersionString: "0.1.6"
-        CFBundleVersion: "7"
+        CFBundleVersion: "8"
         NSHumanReadableCopyright: "© 2026 Rational"
         NSSupportsAutomaticTermination: false
         NSSupportsSuddenTermination: false
@@ -231,7 +231,7 @@ targets:
         CFBundleName: RationalHelper
         CFBundleDisplayName: Rational Helper
         CFBundleShortVersionString: "0.1.6"
-        CFBundleVersion: "7"
+        CFBundleVersion: "8"
     settings:
       base:
         # Shipped helper bundle is `RationalHelper.app` (#445). Target name
