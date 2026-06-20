@@ -134,6 +134,19 @@ public final class EngineStatusStore: ObservableObject {
   /// fixed 1 Hz loop so macOS App Nap can engage (#587).
   private let steadyPollInterval: TimeInterval
   private var task: Task<Void, Never>?
+  /// how long a start/restart convergence keeps polling through the
+  /// `.stopped → .starting → .running` transition before handing back to the
+  /// liveness loop. Dominates the helper's worst-case cold-boot start lease
+  /// (mirrors `HelperXPCClient.defaultStartReplyTimeout`) so a slow large-model
+  /// boot still converges rather than the wait expiring early.
+  static let startConvergenceBudget: TimeInterval =
+    HelperExportedAPI.startReplyDeadline + HelperExportedAPI.replyTimeoutSlack
+  /// the lifecycle-intent convergence task. A start/restart request OWNS
+  /// driving the published `status` to its terminal outcome, INDEPENDENT of the
+  /// background `task` cadence loop (which may pause on an idle `.stopped`).
+  /// Correctness of an app-initiated start must never depend on the perf-tuned
+  /// cadence, so convergence runs on its own task that never pauses mid-start.
+  private var convergenceTask: Task<Void, Never>?
   private nonisolated static let log = Logger(subsystem: "com.ratiothink.app", category: "engine-status")
 
   /// Wall-clock source, injectable so a test can stamp `startingSince`
@@ -324,6 +337,54 @@ public final class EngineStatusStore: ObservableObject {
     }
   }
 
+  /// lifecycle-intent convergence. A start/restart request OWNS driving
+  /// the published `status` to its terminal outcome (`.running` or a surfaced
+  /// `.failed`), polling on its OWN task that — unlike the background cadence
+  /// loop — never pauses on the pre-start `.stopped` it must poll THROUGH.
+  ///
+  /// This is the design fix for the class "an app-initiated start is missed
+  /// because the cadence loop paused": cadence stays a pure liveness/perf
+  /// optimization, and correctness of the start is owned by the intent, not by
+  /// the loop's timing. It feeds every poll through `apply` (so the #2 transient
+  /// hold + the helper-health ladder still see each tick) and, on a terminal
+  /// state or the start lease `deadline`, hands off to the liveness loop via the
+  /// idempotent `start()`. Re-entrant: a newer start cancels the prior wait.
+  func beginStartConvergence(deadline: Date) {
+    convergenceTask?.cancel()
+    // Not nilled on completion: a completed Task handle is harmless, and a
+    // `defer` reset would race a re-entrant start that already replaced it.
+    // `stop()` and the next `beginStartConvergence` both cancel+replace.
+    convergenceTask = Task { [weak self] in
+      while !Task.isCancelled {
+        guard let self, self.now() < deadline else { break }
+        if let next = try? await self.client.engineStatus() {
+          if Task.isCancelled { return }
+          self.apply(next: next, error: nil)
+          switch self.status {
+          case .running:
+            // Engine up — arm the liveness loop and stop converging.
+            self.start()
+            return
+          case .failed:
+            // A SURFACED failure is terminal (apply() already applied the #2
+            // first-load grace, so a held-transient failure still reads as
+            // `.starting` here and keeps converging). Hand off to liveness.
+            self.start()
+            return
+          case .starting, .stopping, .stopped:
+            break  // keep polling through the start transition
+          }
+        }
+        await self.sleepFor(self.pollInterval)
+      }
+      // Deadline: hand the published status back to the background liveness
+      // loop (which pauses again if still idle). On CANCELLATION (stop() or a
+      // re-entrant start) skip the hand-off — stop() must not be re-armed, and
+      // a re-entrant start owns its own loop.
+      if !Task.isCancelled { self?.start() }
+    }
+  }
+
   /// Suspend the poll loop from inside its own task: drop the `task`
   /// reference so a later `start()` (resume trigger) re-arms it. The
   /// caller `return`s immediately after, ending the task.
@@ -338,6 +399,10 @@ public final class EngineStatusStore: ObservableObject {
   public func stop() {
     task?.cancel()
     task = nil
+    // also cancel any in-flight start convergence so a late poll cannot
+    // respawn the on-demand helper after a quit teardown (#448 invariant).
+    convergenceTask?.cancel()
+    convergenceTask = nil
   }
 
   /// Force one immediate poll. Returns the resolved status (or throws
@@ -434,12 +499,12 @@ public final class EngineStatusStore: ObservableObject {
   /// default-model-change restart that boots the freshly-saved profile
   /// default (set-as-default, post-download).
   public func restartEngine(profileID: String, modelOverride: String? = nil) async throws {
-    // #587 resume trigger: a restart rebuilds the engine, so a paused loop
-    // (stopped/idle) must re-arm or the published status stays frozen while a
-    // live engine is running. Idempotent — a no-op on the `.running` restart
-    // path (ActiveModelServeExecutor) — and re-armed BEFORE the XPC call so the
-    // rebuild's `.starting` → `.running`/`.failed` transition is surfaced.
-    start()
+    // convergence: a restart rebuilds the engine; the intent OWNS driving
+    // `status` to the rebuild's terminal outcome independent of the cadence
+    // loop (see startEngine). Begin BEFORE the XPC call so the rebuild's
+    // `.starting → .running`/`.failed` transition is surfaced even if the
+    // background loop had paused on the pre-restart state.
+    beginStartConvergence(deadline: now().addingTimeInterval(Self.startConvergenceBudget))
     try requireHelperAvailable()
     do {
       try await client.restartEngine(profileID: profileID, modelOverride: modelOverride)
@@ -553,12 +618,13 @@ public final class EngineStatusStore: ObservableObject {
   public func startEngine(profileID: String,
                           modelOverride: String? = nil,
                           daemonBindHost: EngineHTTPBindMode? = nil) async throws {
-    // #587 resume trigger: a start request means an engine session is now
-    // expected, so re-arm the poll loop if it paused while stopped/idle.
-    // Idempotent — a no-op when the loop is already running. Re-arm BEFORE
-    // the XPC call so the `.starting` → `.running`/`.failed` transition the
-    // start produces is surfaced even if the loop was paused.
-    start()
+    // convergence: a start request OWNS driving `status` to its terminal
+    // outcome, independent of the cadence loop. The prior `start()` re-arm
+    // raced the helper committing `.starting`: a re-armed poll that read the
+    // pre-start `.stopped` re-paused the loop permanently, so the app never
+    // observed `.running`. Convergence polls THROUGH that transition on its own
+    // task. Begin BEFORE the XPC call so `.starting` shows promptly.
+    beginStartConvergence(deadline: now().addingTimeInterval(Self.startConvergenceBudget))
     try requireHelperAvailable()
     let requestedBindMode = daemonBindHost ?? daemonBindModeProvider()
     do {

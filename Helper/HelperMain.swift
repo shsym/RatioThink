@@ -116,6 +116,14 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       ("executable", DiagnosticLog.redactHome(Bundle.main.executableURL?.path ?? "?")),
     ])
     eagerProbePieDirs()
+    // arm OS-enforced engine teardown BEFORE the XPC listener can accept
+    // a start. install() wires atexit + fatal-signal reaping (so a crash/exit
+    // takes the engine with it); the backstop sweep finishes reaping any engine
+    // a prior Helper incarnation orphaned via SIGKILL (durable engine.pid).
+    EngineReaper.install()
+    if let reaped = EngineReaper.reapStaleOwnedProcess() {
+      Diag.helper.event("engine.reap_stale", [("pid", String(reaped)), ("at", "helper.launch")])
+    }
     setupStatusItemIfNeeded()
     registerLoginItemIfNeeded()
     startXPCListener()
