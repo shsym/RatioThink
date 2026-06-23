@@ -570,7 +570,8 @@ public enum LocalAPICurl {
     ]
 
     if let profile {
-      fields.append("\"temperature\": \(jsonNumber(profile.sampling.temperature))")
+      let displayedTemperature = (profile.speculation?.enabled == true) ? 0 : profile.sampling.temperature
+      fields.append("\"temperature\": \(jsonNumber(displayedTemperature))")
       fields.append("\"top_p\": \(jsonNumber(profile.sampling.topP))")
       fields.append("\"max_tokens\": \(profile.sampling.maxTokens)")
 

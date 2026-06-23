@@ -223,6 +223,44 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertFalse(jsonCurl.contains("\"speculation\""))
   }
 
+  func test_curl_snippet_for_speculation_profiles_shows_forced_greedy_temperature() throws {
+    let customSpeculation = try Profile.parse(toml: """
+    id = "custom-spec"
+    name = "Custom Speculation"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [sampling]
+    temperature = 0.7
+    top_p = 0.8
+    max_tokens = 512
+
+    [speculation]
+    enabled = true
+    leader_len = 3
+    draft_len = 5
+    """)
+
+    let curl = LocalAPICurl.chatCompletions(
+      baseURL: "http://127.0.0.1:8123",
+      model: "m",
+      streaming: true,
+      profile: customSpeculation)
+
+    XCTAssertTrue(
+      curl.contains("\"temperature\": 0"),
+      "Speculation examples must mirror the app send path's forced greedy sampling; curl=\(curl)"
+    )
+    XCTAssertFalse(curl.contains("\"temperature\": 0.7"))
+    XCTAssertTrue(curl.contains("\"top_p\": 0.8"))
+    XCTAssertTrue(curl.contains("\"max_tokens\": 512"))
+    XCTAssertTrue(curl.contains("\"speculation\""))
+    XCTAssertTrue(curl.contains("\"enabled\": true"))
+    XCTAssertTrue(curl.contains("\"profile_id\": \"custom-spec\""))
+    XCTAssertTrue(curl.contains("\"leader_len\": 3"))
+    XCTAssertTrue(curl.contains("\"draft_len\": 5"))
+  }
+
   func test_profile_entrypoint_uses_inferlet_for_tree_of_thought_and_best_of_n() throws {
     let treeOfThought = try Profile.parse(toml: """
     id = "tree-of-thought"
