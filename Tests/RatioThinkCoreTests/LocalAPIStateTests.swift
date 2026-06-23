@@ -223,6 +223,116 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertFalse(jsonCurl.contains("\"speculation\""))
   }
 
+  func test_profile_entrypoint_uses_inferlet_for_tree_of_thought_and_best_of_n() throws {
+    let treeOfThought = try Profile.parse(toml: """
+    id = "tree-of-thought"
+    name = "Tree of Thought"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [sampling]
+    temperature = 0.7
+    top_p = 0.9
+    max_tokens = 2048
+
+    [inferlet_args]
+    mode = "tree-of-thought"
+    breadth = 3
+    depth = 2
+    beam_width = 2
+    max_tokens_per_node = 256
+    """)
+    let totRoutes = LocalAPIRoute.clientFacing(streaming: true, profile: treeOfThought)
+    XCTAssertEqual(totRoutes.first?.path, "/v1/inferlet")
+    XCTAssertEqual(totRoutes.first?.summary, "Tree of Thought inferlet dispatch (SSE streaming)")
+
+    let totCurl = LocalAPICurl.request(baseURL: "http://127.0.0.1:8123",
+                                       model: "m",
+                                       streaming: true,
+                                       profile: treeOfThought)
+    XCTAssertTrue(totCurl.contains("http://127.0.0.1:8123/v1/inferlet"))
+    XCTAssertTrue(totCurl.contains("\"inferlet\": \"tree-of-thought\""))
+    XCTAssertTrue(totCurl.contains("\"stream\": true"))
+    XCTAssertTrue(totCurl.contains("\"input\""))
+    XCTAssertTrue(totCurl.contains("\"breadth\": 3"))
+    XCTAssertTrue(totCurl.contains("\"depth\": 2"))
+    XCTAssertTrue(totCurl.contains("\"beam_width\": 2"))
+    XCTAssertTrue(totCurl.contains("\"max_tokens_per_node\": 256"))
+    XCTAssertTrue(totCurl.contains("\"temperature\": 0.7"))
+    XCTAssertTrue(totCurl.contains("\"top_p\": 0.9"))
+    XCTAssertFalse(totCurl.contains("/v1/chat/completions"))
+
+    let bestOfN = try Profile.parse(toml: """
+    id = "best-of-n"
+    name = "Best of N"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [sampling]
+    temperature = 0.8
+    top_p = 0.95
+    max_tokens = 2048
+
+    [inferlet_args]
+    mode = "best-of-n"
+    n = 3
+    max_tokens_per_candidate = 256
+    thinking = true
+    """)
+    let bonRoutes = LocalAPIRoute.clientFacing(streaming: false, profile: bestOfN)
+    XCTAssertEqual(bonRoutes.first?.path, "/v1/inferlet")
+    XCTAssertEqual(bonRoutes.first?.summary, "Best of N inferlet dispatch (single JSON response)")
+
+    let bonCurl = LocalAPICurl.request(baseURL: "http://127.0.0.1:8123",
+                                       model: "m",
+                                       streaming: false,
+                                       profile: bestOfN)
+    XCTAssertTrue(bonCurl.contains("http://127.0.0.1:8123/v1/inferlet"))
+    XCTAssertTrue(bonCurl.contains("\"inferlet\": \"best-of-n\""))
+    XCTAssertTrue(bonCurl.contains("\"stream\": false"))
+    XCTAssertTrue(bonCurl.contains("\"n\": 3"))
+    XCTAssertTrue(bonCurl.contains("\"max_tokens_per_candidate\": 256"))
+    XCTAssertTrue(bonCurl.contains("\"thinking\": true"))
+    XCTAssertTrue(bonCurl.contains("\"temperature\": 0.8"))
+    XCTAssertTrue(bonCurl.contains("\"top_p\": 0.95"))
+    XCTAssertFalse(bonCurl.contains("/v1/chat/completions"))
+  }
+
+  func test_profile_entrypoint_uses_text_completion_shape_for_text_completion_profiles() throws {
+    let textCompletion = try Profile.parse(toml: """
+    id = "plain-text"
+    name = "Plain Text"
+    model = "m"
+    inferlet = "text-completion"
+    system_prompt = "Complete the user's text."
+
+    [sampling]
+    temperature = 0.6
+    top_p = 0.95
+    max_tokens = 256
+    """)
+
+    let routes = LocalAPIRoute.clientFacing(streaming: false, profile: textCompletion)
+    XCTAssertEqual(routes.first?.path, "/v1/inferlet")
+    XCTAssertEqual(routes.first?.summary, "Text completion inferlet dispatch (single JSON response)")
+
+    let curl = LocalAPICurl.request(baseURL: "http://127.0.0.1:8123",
+                                   model: "m",
+                                   streaming: false,
+                                   profile: textCompletion)
+    XCTAssertTrue(curl.contains("http://127.0.0.1:8123/v1/inferlet"))
+    XCTAssertTrue(curl.contains("\"inferlet\": \"text-completion\""))
+    XCTAssertTrue(curl.contains("\"stream\": false"))
+    XCTAssertTrue(curl.contains("\"input\""))
+    XCTAssertTrue(curl.contains("\"prompt\": \"Hello\""))
+    XCTAssertTrue(curl.contains("\"max_tokens\": 256"))
+    XCTAssertTrue(curl.contains("\"system\": \"Complete the user's text.\""))
+    XCTAssertTrue(curl.contains("\"temperature\": 0.6"))
+    XCTAssertTrue(curl.contains("\"top_p\": 0.95"))
+    XCTAssertFalse(curl.contains("\"messages\""))
+    XCTAssertFalse(curl.contains("/v1/chat/completions"))
+  }
+
   // #654: the streaming toggle drives the example's `stream` field — the engine
   // serves both modes, so the snippet must show how to request each.
   func test_curl_snippet_reflects_streaming_toggle() {
