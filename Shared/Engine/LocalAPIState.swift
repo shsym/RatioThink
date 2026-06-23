@@ -466,15 +466,80 @@ public enum LocalAPICurl {
   /// `/v1/models` (which the request `model` field MUST equal — `chat-apc`
   /// rejects a mismatch with `model_not_found`). No `Authorization` header:
   /// the engine runs with `[auth] enabled = false`.
-  public static func chatCompletions(baseURL: String, model: String, streaming: Bool = true) -> String {
-    """
+  ///
+  /// When a Local API profile tab is selected, the endpoint stays unified
+  /// (`/v1/chat/completions`) and the profile-specific behavior lives in the
+  /// request body: sampling fields, optional speculative decoding, and optional
+  /// OpenAI `response_format`. Keeping this projection here prevents the UI
+  /// from showing a generic Chat request while tabs such as Repeat Boost or
+  /// JSON Think are selected.
+  public static func chatCompletions(
+    baseURL: String,
+    model: String,
+    streaming: Bool = true,
+    profile: Profile? = nil
+  ) -> String {
+    let body = chatCompletionsBody(model: model, streaming: streaming, profile: profile)
+    return """
     curl \(baseURL)/v1/chat/completions \\
       -H 'Content-Type: application/json' \\
-      -d '{
-        "model": "\(model)",
-        "messages": [{"role": "user", "content": "Hello"}],
-        "stream": \(streaming)
-      }'
+      -d '\(body)'
     """
+  }
+
+  private static func chatCompletionsBody(model: String, streaming: Bool, profile: Profile?) -> String {
+    var fields: [String] = [
+      "\"model\": \(jsonString(model))",
+      "\"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}]",
+      "\"stream\": \(streaming)",
+    ]
+
+    if let profile {
+      fields.append("\"temperature\": \(jsonNumber(profile.sampling.temperature))")
+      fields.append("\"top_p\": \(jsonNumber(profile.sampling.topP))")
+      fields.append("\"max_tokens\": \(profile.sampling.maxTokens)")
+
+      if let speculation = profile.speculation, speculation.enabled {
+        var specFields = [
+          "\"enabled\": true",
+          "\"profile_id\": \(jsonString(profile.id))",
+        ]
+        if let leaderLen = speculation.leaderLen {
+          specFields.append("\"leader_len\": \(leaderLen)")
+        }
+        if let draftLen = speculation.draftLen {
+          specFields.append("\"draft_len\": \(draftLen)")
+        }
+        fields.append("\"speculation\": {\n\(indent(specFields, by: 4))\n  }")
+      }
+
+      if profile.responseFormat == .jsonObject {
+        fields.append("\"response_format\": {\n    \"type\": \"json_object\"\n  }")
+      }
+    }
+
+    return "{\n\(indent(fields, by: 2))\n}"
+  }
+
+  private static func indent(_ fields: [String], by spaces: Int) -> String {
+    let padding = String(repeating: " ", count: spaces)
+    return fields.enumerated().map { index, field in
+      let comma = index == fields.count - 1 ? "" : ","
+      return padding + field + comma
+    }.joined(separator: "\n")
+  }
+
+  private static func jsonNumber(_ value: Double) -> String {
+    value.rounded(.towardZero) == value ? String(Int(value)) : String(value)
+  }
+
+  private static func jsonString(_ value: String) -> String {
+    let escaped = value
+      .replacingOccurrences(of: "\\", with: "\\\\")
+      .replacingOccurrences(of: "\"", with: "\\\"")
+      .replacingOccurrences(of: "\n", with: "\\n")
+      .replacingOccurrences(of: "\r", with: "\\r")
+      .replacingOccurrences(of: "\t", with: "\\t")
+    return "\"\(escaped)\""
   }
 }

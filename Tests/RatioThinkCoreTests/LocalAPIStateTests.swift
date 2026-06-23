@@ -165,6 +165,64 @@ final class LocalAPIStateTests: XCTestCase {
                    "engine runs with [auth] enabled=false — no bearer header")
   }
 
+  func test_curl_snippet_reflects_selected_profile_request_shape() throws {
+    let repeatBoost = try Profile.parse(toml: """
+    id = "repeat-boost"
+    name = "Repeat Boost"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [sampling]
+    temperature = 0.0
+    top_p = 0.9
+    max_tokens = 2048
+
+    [speculation]
+    enabled = true
+    leader_len = 2
+    draft_len = 4
+    """)
+    let repeatCurl = LocalAPICurl.chatCompletions(
+      baseURL: "http://127.0.0.1:8123",
+      model: "m",
+      streaming: true,
+      profile: repeatBoost)
+
+    XCTAssertTrue(
+      repeatCurl.contains("\"temperature\": 0"),
+      "Repeat Boost examples must show the greedy sampling that makes speculation engage; curl=\(repeatCurl)"
+    )
+    XCTAssertTrue(repeatCurl.contains("\"top_p\": 0.9"))
+    XCTAssertTrue(repeatCurl.contains("\"max_tokens\": 2048"))
+    XCTAssertTrue(repeatCurl.contains("\"speculation\""),
+                  "enabled [speculation] must be visible in the copyable request body")
+    XCTAssertTrue(repeatCurl.contains("\"enabled\": true"))
+    XCTAssertTrue(repeatCurl.contains("\"leader_len\": 2"))
+    XCTAssertTrue(repeatCurl.contains("\"draft_len\": 4"))
+    XCTAssertTrue(repeatCurl.contains("\"profile_id\": \"repeat-boost\""))
+
+    let jsonThink = try Profile.parse(toml: """
+    id = "json-think"
+    name = "JSON Think"
+    model = "m"
+    inferlet = "chat-apc"
+
+    [constraint]
+    response_format = "json_object"
+    """)
+    let jsonCurl = LocalAPICurl.chatCompletions(
+      baseURL: "http://127.0.0.1:8123",
+      model: "m",
+      streaming: false,
+      profile: jsonThink)
+
+    XCTAssertTrue(jsonCurl.contains("\"response_format\""),
+                  "JSON Think examples must include the OpenAI response_format knob")
+    XCTAssertTrue(jsonCurl.contains("\"type\": \"json_object\""))
+    XCTAssertTrue(jsonCurl.contains("\"stream\": false"))
+    XCTAssertFalse(jsonCurl.contains("\"speculation\""))
+  }
+
   // #654: the streaming toggle drives the example's `stream` field — the engine
   // serves both modes, so the snippet must show how to request each.
   func test_curl_snippet_reflects_streaming_toggle() {
