@@ -273,9 +273,9 @@ struct LocalAPIView: View {
         )
       }
 
-      endpointsSection
+      endpointsSection(profile: selectedProfile)
       if let model = state.servedModelID {
-        curlSection(baseURL: baseURL, model: model)
+        curlSection(baseURL: baseURL, model: model, profile: selectedProfile)
       }
     }
   }
@@ -336,6 +336,11 @@ struct LocalAPIView: View {
     return profileOptions.first { $0.id == selectedOrActiveProfileID }
   }
 
+  private var selectedProfile: Profile? {
+    guard let selectedOrActiveProfileID else { return nil }
+    return profileStore.entries.compactMap(\.profile).first { $0.id == selectedOrActiveProfileID }
+  }
+
   private var profileSelectionBinding: Binding<String> {
     Binding(
       get: { selectedOrActiveProfileID ?? "" },
@@ -343,10 +348,10 @@ struct LocalAPIView: View {
     )
   }
 
-  private var endpointsSection: some View {
+  private func endpointsSection(profile: Profile?) -> some View {
     VStack(alignment: .leading, spacing: 6) {
       sectionHeader("Endpoints")
-      ForEach(LocalAPIRoute.clientFacing(streaming: streamingEnabled)) { route in
+      ForEach(LocalAPIRoute.clientFacing(streaming: streamingEnabled, profile: profile)) { route in
         HStack(spacing: 8) {
           Text(route.method)
             .font(.caption.monospaced().weight(.semibold))
@@ -365,8 +370,12 @@ struct LocalAPIView: View {
     .accessibilityIdentifier("LocalAPIEndpoints")
   }
 
-  private func curlSection(baseURL: String, model: String) -> some View {
-    let snippet = LocalAPICurl.chatCompletions(baseURL: baseURL, model: model, streaming: streamingEnabled)
+  private func curlSection(baseURL: String, model: String, profile: Profile?) -> some View {
+    let snippet = LocalAPICurl.request(
+      baseURL: baseURL,
+      model: model,
+      streaming: streamingEnabled,
+      profile: profile)
     return VStack(alignment: .leading, spacing: 4) {
       HStack {
         sectionHeader("curl example")

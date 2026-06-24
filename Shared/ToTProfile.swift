@@ -42,7 +42,7 @@ public extension Profile {
   /// `mode = "tree-of-thought"`. The launched `inferlet` stays `chat-apc`
   /// (the wasm `LaunchSpecResolver` validates against the installed
   /// component); tree-of-thought is a **dispatch mode** selected per
-  /// request over `/v1/inferlet`, not a separate wasm — so the signal
+  /// request through `/v1/chat/completions`, not a separate wasm — so the signal
   /// rides in `inferlet_args`, not the `inferlet` field. Switching to a
   /// ToT profile therefore needs no new wasm and (model permitting) no
   /// engine relaunch; only the chat send path routes differently.

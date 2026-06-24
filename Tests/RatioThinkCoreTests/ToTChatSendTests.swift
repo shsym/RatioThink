@@ -3,7 +3,7 @@ import SwiftData
 @testable import RatioThinkCore
 
 /// Integration tests for the tree-of-thought send path (#413):
-/// `ChatSendController.sendTreeOfThought` consumes the `/v1/inferlet` SSE
+/// `ChatSendController.sendTreeOfThought` consumes the advanced-profile SSE
 /// tree stream, folds it into a persisted `ToTTree` snapshot on the
 /// assistant row, and sets the final answer as the row's content.
 @available(macOS 14, *)

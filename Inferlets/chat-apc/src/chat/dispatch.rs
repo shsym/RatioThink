@@ -1,4 +1,4 @@
-//! `POST /v1/inferlet` — extended inferlet-dispatch endpoint.
+//! `POST /v1/inferlet` — internal/raw inferlet-dispatch endpoint.
 //!
 //! Body schema (per design doc §7):
 //!
@@ -12,13 +12,13 @@
 //! }
 //! ```
 //!
-//! **V1 narrow:** two `inferlet` names are accepted — `"chat-apc"`,
-//! which routes into [`crate::chat::handle_parsed`], and
-//! `"tree-of-thought"`, which routes into [`crate::tot::dispatch`]. The
-//! chat-apc dispatch body is rebuilt into a `ChatCompletionsRequest` by
-//! merging `messages` (top-level chat sugar) with optional sampling
-//! fields from `input` (the inferlet-specific payload). Unknown names →
-//! 404 `inferlet_not_found`.
+//! **V1 narrow:** retained for internal/control/raw callers. Normal
+//! app/profile sends for `"tree-of-thought"` and `"best-of-n"` should use
+//! `/v1/chat/completions`, which routes to the same dispatch arms. This raw
+//! endpoint still accepts `"chat-apc"`, `"tree-of-thought"`, and `"best-of-n"`;
+//! the chat-apc arm rebuilds a `ChatCompletionsRequest` by merging `messages`
+//! (top-level chat sugar) with optional sampling fields from `input` (the
+//! inferlet-specific payload). Unknown names → 404 `inferlet_not_found`.
 //!
 //! True dynamic dispatch (load arbitrary wasm by name from
 //! `--inferlet-dir`) requires pie-side host changes and is tracked
@@ -166,6 +166,8 @@ async fn dispatch_chat_apc(dispatch: InferletDispatch, res: Responder) -> Finish
     };
 
     let request = ChatCompletionsRequest {
+        inferlet: None,
+        input: None,
         model,
         messages,
         stream: dispatch.stream,

@@ -1,6 +1,8 @@
 //! `tree-of-thought` mode of the chat-apc inferlet. **EXPERIMENTAL.**
 //!
-//! Dispatched via `POST /v1/inferlet` with `inferlet:"tree-of-thought"`.
+//! Normal app/profile sends dispatch via `POST /v1/chat/completions` with
+//! `inferlet:"tree-of-thought"`; `/v1/inferlet` is retained only as the
+//! internal/raw dispatch surface.
 //! Runs a bounded Tree-of-Thought BFS beam search (Yao et al. 2023,
 //! "Tree of Thoughts", NeurIPS): from the conversation root, generate
 //! `breadth` candidate continuations per frontier node, score each 1–10

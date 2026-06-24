@@ -14,13 +14,18 @@ import Foundation
 ///   `EngineHealth` makes those optional).
 /// * `GET /v1/models` → `{"object":"list","data":[{"id","object","owned_by"}]}`
 ///   (no `created` yet — `ModelInfo.created` is optional).
-/// * `POST /v1/chat/completions` → SSE generation (meta-frame
-///   `{"event":"model_ready"}`, then OpenAI `chat.completion.chunk` frames,
-///   terminating with `data: [DONE]`) and non-stream Best-of-N release
-///   control acks. `model_loading` meta-frames are tolerated but absent in v1
-///   (pie loads at boot).
-/// * `POST /v1/inferlet` → legacy/raw streaming inferlet dispatch; dispatch
-///   surfaces the raw SSE `data:` bytes per frame to the consumer.
+/// * `POST /v1/chat/completions` → SSE: meta-frame `{"event":"model_ready"}`
+///   then OpenAI `chat.completion.chunk` frames, terminating with
+///   `data: [DONE]`. `model_loading` meta-frames are tolerated but
+///   absent in v1 (pie loads at boot).
+/// * `POST /v1/chat/completions` also accepts RatioThink's advanced-profile
+///   dispatch envelope (`inferlet` + `input`) for generative ToT/Best-of-N
+///   sends and for non-stream Best-of-N snapshot release control acks; dispatch
+///   surfaces the raw SSE `data:` bytes per frame to the consumer for streaming
+///   sends.
+/// * `POST /v1/inferlet` remains only for legacy/internal dispatches that are
+///   not unified chat-completions routes; non-release non-stream dispatches stay
+///   here, and streaming chat-apc dispatch stays here.
 ///
 /// Error model ( — one code space across channels): an HTTP
 /// non-2xx whose body is an OpenAI-shape `{"error":{code,message}}`
@@ -185,8 +190,11 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
                                    timeout: self.unaryTimeout)
       })
     }
+    let path = (req.inferlet == "tree-of-thought" || req.inferlet == "best-of-n")
+      ? "/v1/chat/completions"
+      : "/v1/inferlet"
     return dispatchStream(buildRequest: {
-      try await self.makeRequest("/v1/inferlet", method: "POST", body: body,
+      try await self.makeRequest(path, method: "POST", body: body,
                                  timeout: Self.streamingIdleTimeout)
     })
   }

@@ -339,30 +339,84 @@ public struct LocalAPIRoute: Equatable, Identifiable {
     self.summary = summary
   }
 
-  /// The routes `chat-apc` serves that are useful to an OpenAI-compatible
-  /// client. `/v1/inferlet` (raw dispatch) is intentionally omitted — it
-  /// isn't part of the standard client surface a user would call. (#469:
-  /// there is no `/v1/models/load` — the served model is fixed at engine boot
-  /// and read from `GET /v1/models`.)
+  /// The routes useful for the currently selected Local API profile. The
+  /// primary POST route is profile-shaped: normal chat profiles use
+  /// `/v1/chat/completions`, while today's app-level dispatch modes
+  /// (Tree-of-Thought / Best-of-N, plus explicit text-completion inferlets)
+  /// use `/v1/inferlet` because that is what they actually call before #775
+  /// unifies dispatch. (#469: there is no `/v1/models/load` — the served model
+  /// is fixed at engine boot and read from `GET /v1/models`.)
   ///
   /// #654: the chat-completions summary reflects the panel's streaming toggle —
   /// `chat-apc` serves BOTH `stream: true` (SSE) and `stream: false` (single
   /// JSON body), branching on the request's `stream` field
   /// (`handle_streaming` / `handle_non_streaming`).
-  public static func clientFacing(streaming: Bool = true) -> [LocalAPIRoute] {
+  public static func clientFacing(streaming: Bool = true, profile: Profile? = nil) -> [LocalAPIRoute] {
     [
-      LocalAPIRoute(method: "POST", path: "/v1/chat/completions",
-                    summary: chatCompletionsSummary(streaming: streaming)),
+      primaryPostRoute(streaming: streaming, profile: profile),
       LocalAPIRoute(method: "GET", path: "/v1/models", summary: "List served models"),
       LocalAPIRoute(method: "GET", path: "/healthz", summary: "Health check"),
     ]
   }
 
+  public static func primaryPostRoute(streaming: Bool, profile: Profile?) -> LocalAPIRoute {
+    switch LocalAPIProfileDispatch.make(profile: profile) {
+    case .chatCompletions:
+      return LocalAPIRoute(method: "POST", path: "/v1/chat/completions",
+                           summary: chatCompletionsSummary(streaming: streaming))
+    case .inferlet(let inferlet, _):
+      return LocalAPIRoute(method: "POST", path: "/v1/inferlet",
+                           summary: "\(inferletTitle(inferlet)) inferlet dispatch (\(streamSummary(streaming)))")
+    }
+  }
+
   /// Human summary for the chat-completions route, reflecting the streaming
   /// choice the user toggled in the panel.
   public static func chatCompletionsSummary(streaming: Bool) -> String {
-    streaming ? "Chat completions (SSE streaming)" : "Chat completions (single JSON response)"
+    "Chat completions (\(streamSummary(streaming)))"
   }
+
+  private static func streamSummary(_ streaming: Bool) -> String {
+    streaming ? "SSE streaming" : "single JSON response"
+  }
+
+  private static func inferletTitle(_ inferlet: String) -> String {
+    switch inferlet {
+    case "tree-of-thought": return "Tree of Thought"
+    case "best-of-n": return "Best of N"
+    case "text-completion": return "Text completion"
+    default: return inferlet
+    }
+  }
+}
+
+private enum LocalAPIProfileDispatch: Equatable {
+  case chatCompletions
+  case inferlet(name: String, input: LocalAPIInferletInput)
+
+  static func make(profile: Profile?) -> LocalAPIProfileDispatch {
+    guard let profile else { return .chatCompletions }
+    if let config = profile.treeOfThought {
+      return .inferlet(name: "tree-of-thought", input: .treeOfThought(config))
+    }
+    if let config = profile.bestOfN {
+      return .inferlet(name: "best-of-n", input: .bestOfN(config))
+    }
+    if bareInferletName(profile.inferlet) == "text-completion" {
+      return .inferlet(name: "text-completion", input: .textCompletion)
+    }
+    return .chatCompletions
+  }
+
+  private static func bareInferletName(_ inferlet: String) -> String {
+    inferlet.split(separator: "@", maxSplits: 1).first.map(String.init) ?? inferlet
+  }
+}
+
+private enum LocalAPIInferletInput: Equatable {
+  case treeOfThought(ToTProfileConfig)
+  case bestOfN(BestOfNProfileConfig)
+  case textCompletion
 }
 
 /// Read-only security posture of the engine's HTTP server. Each fact is
@@ -466,15 +520,163 @@ public enum LocalAPICurl {
   /// `/v1/models` (which the request `model` field MUST equal — `chat-apc`
   /// rejects a mismatch with `model_not_found`). No `Authorization` header:
   /// the engine runs with `[auth] enabled = false`.
-  public static func chatCompletions(baseURL: String, model: String, streaming: Bool = true) -> String {
+  ///
+  /// When a Local API profile tab is selected, the endpoint stays unified
+  /// (`/v1/chat/completions`) and the profile-specific behavior lives in the
+  /// request body: sampling fields, optional speculative decoding, and optional
+  /// OpenAI `response_format`. Keeping this projection here prevents the UI
+  /// from showing a generic Chat request while tabs such as Repeat Boost or
+  /// JSON Think are selected.
+  public static func chatCompletions(
+    baseURL: String,
+    model: String,
+    streaming: Bool = true,
+    profile: Profile? = nil
+  ) -> String {
+    let body = chatCompletionsBody(model: model, streaming: streaming, profile: profile)
+    return post(baseURL: baseURL, path: "/v1/chat/completions", body: body)
+  }
+
+  public static func request(
+    baseURL: String,
+    model: String,
+    streaming: Bool = true,
+    profile: Profile? = nil
+  ) -> String {
+    switch LocalAPIProfileDispatch.make(profile: profile) {
+    case .chatCompletions:
+      return chatCompletions(baseURL: baseURL, model: model, streaming: streaming, profile: profile)
+    case .inferlet(let inferlet, let input):
+      return post(
+        baseURL: baseURL,
+        path: "/v1/inferlet",
+        body: inferletBody(inferlet: inferlet, model: model, streaming: streaming, profile: profile, input: input))
+    }
+  }
+
+  private static func post(baseURL: String, path: String, body: String) -> String {
     """
-    curl \(baseURL)/v1/chat/completions \\
+    curl \(baseURL)\(path) \\
       -H 'Content-Type: application/json' \\
-      -d '{
-        "model": "\(model)",
-        "messages": [{"role": "user", "content": "Hello"}],
-        "stream": \(streaming)
-      }'
+      -d '\(body)'
     """
+  }
+
+  private static func chatCompletionsBody(model: String, streaming: Bool, profile: Profile?) -> String {
+    var fields: [String] = [
+      "\"model\": \(jsonString(model))",
+      "\"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}]",
+      "\"stream\": \(streaming)",
+    ]
+
+    if let profile {
+      let displayedTemperature = (profile.speculation?.enabled == true) ? 0 : profile.sampling.temperature
+      fields.append("\"temperature\": \(jsonNumber(displayedTemperature))")
+      fields.append("\"top_p\": \(jsonNumber(profile.sampling.topP))")
+      fields.append("\"max_tokens\": \(profile.sampling.maxTokens)")
+
+      if let speculation = profile.speculation, speculation.enabled {
+        var specFields = [
+          "\"enabled\": true",
+          "\"profile_id\": \(jsonString(profile.id))",
+        ]
+        if let leaderLen = speculation.leaderLen {
+          specFields.append("\"leader_len\": \(leaderLen)")
+        }
+        if let draftLen = speculation.draftLen {
+          specFields.append("\"draft_len\": \(draftLen)")
+        }
+        fields.append("\"speculation\": {\n\(indent(specFields, by: 4))\n  }")
+      }
+
+      if profile.responseFormat == .jsonObject {
+        fields.append("\"response_format\": {\n    \"type\": \"json_object\"\n  }")
+      }
+    }
+
+    return "{\n\(indent(fields, by: 2))\n}"
+  }
+
+  private static func inferletBody(
+    inferlet: String,
+    model: String,
+    streaming: Bool,
+    profile: Profile?,
+    input: LocalAPIInferletInput
+  ) -> String {
+    let inputFields: [String]
+    switch input {
+    case .treeOfThought(let config):
+      inputFields = transcriptInputFields(model: model, profile: profile) + [
+        "\"breadth\": \(config.breadth)",
+        "\"depth\": \(config.depth)",
+        "\"beam_width\": \(config.beamWidth)",
+        "\"max_tokens_per_node\": \(config.maxTokensPerNode)",
+        "\"temperature\": \(jsonNumber(profile?.sampling.temperature ?? ChatSampling().temperature))",
+        "\"top_p\": \(jsonNumber(profile?.sampling.topP ?? ChatSampling().topP))",
+      ]
+    case .bestOfN(let config):
+      inputFields = transcriptInputFields(model: model, profile: profile) + [
+        "\"n\": \(config.n)",
+        "\"max_tokens_per_candidate\": \(config.maxTokensPerCandidate)",
+        "\"thinking\": \(config.thinking)",
+        "\"temperature\": \(jsonNumber(profile?.sampling.temperature ?? ChatSampling().temperature))",
+        "\"top_p\": \(jsonNumber(profile?.sampling.topP ?? ChatSampling().topP))",
+      ]
+    case .textCompletion:
+      let systemPrompt = profile?.systemPrompt ?? "You are a helpful assistant."
+      inputFields = [
+        "\"prompt\": \"Hello\"",
+        "\"max_tokens\": \(profile?.sampling.maxTokens ?? ChatSampling().maxTokens)",
+        "\"system\": \(jsonString(systemPrompt))",
+        "\"temperature\": \(jsonNumber(profile?.sampling.temperature ?? ChatSampling().temperature))",
+        "\"top_p\": \(jsonNumber(profile?.sampling.topP ?? ChatSampling().topP))",
+      ]
+    }
+
+    let fields = [
+      "\"inferlet\": \(jsonString(inferlet))",
+      "\"stream\": \(streaming)",
+      "\"input\": {\n\(indent(inputFields, by: 4))\n  }",
+    ]
+    return "{\n\(indent(fields, by: 2))\n}"
+  }
+
+  private static func transcriptInputFields(model: String, profile: Profile?) -> [String] {
+    [
+      "\"model\": \(jsonString(model))",
+      "\"messages\": \(messagesJSON(systemPrompt: profile?.systemPrompt))",
+    ]
+  }
+
+  private static func messagesJSON(systemPrompt: String?) -> String {
+    var messages: [String] = []
+    if let systemPrompt, !systemPrompt.isEmpty {
+      messages.append("{\"role\": \"system\", \"content\": \(jsonString(systemPrompt))}")
+    }
+    messages.append("{\"role\": \"user\", \"content\": \"Hello\"}")
+    return "[\(messages.joined(separator: ", "))]"
+  }
+
+  private static func indent(_ fields: [String], by spaces: Int) -> String {
+    let padding = String(repeating: " ", count: spaces)
+    return fields.enumerated().map { index, field in
+      let comma = index == fields.count - 1 ? "" : ","
+      return padding + field + comma
+    }.joined(separator: "\n")
+  }
+
+  private static func jsonNumber(_ value: Double) -> String {
+    value.rounded(.towardZero) == value ? String(Int(value)) : String(value)
+  }
+
+  private static func jsonString(_ value: String) -> String {
+    let escaped = value
+      .replacingOccurrences(of: "\\", with: "\\\\")
+      .replacingOccurrences(of: "\"", with: "\\\"")
+      .replacingOccurrences(of: "\n", with: "\\n")
+      .replacingOccurrences(of: "\r", with: "\\r")
+      .replacingOccurrences(of: "\t", with: "\\t")
+    return "\"\(escaped)\""
   }
 }

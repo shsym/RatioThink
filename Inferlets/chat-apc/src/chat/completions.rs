@@ -157,7 +157,20 @@ const CACHEBACK_SIDECAR_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Deserialize)]
 pub struct ChatCompletionsRequest {
+    /// chat-apc extension for profile-backed advanced modes. When present,
+    /// `/v1/chat/completions` acts as the public envelope and routes internally
+    /// to the named advanced chat-apc dispatch mode (`tree-of-thought` or
+    /// `best-of-n`) instead of requiring clients to POST `/v1/inferlet`.
+    #[serde(default)]
+    pub inferlet: Option<String>,
+    /// Opaque dispatch payload for `inferlet`. Normal OpenAI chat requests omit
+    /// this; advanced profile modes carry their existing mode-specific input
+    /// unchanged inside the chat-completions request body.
+    #[serde(default)]
+    pub input: Option<serde_json::Value>,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: bool,
@@ -2627,9 +2640,9 @@ pub async fn handle(req: Request<IncomingBody>, res: Responder) -> Finished {
     handle_parsed(request, res).await
 }
 
-/// Handle a request whose body was parsed upstream — used by
-/// `/v1/inferlet` dispatch so the messages-sugar surface can route
-/// here without re-serializing.
+/// Handle a request whose body was parsed upstream — used by normal
+/// `/v1/chat/completions` requests and by the retained raw `/v1/inferlet`
+/// chat-apc arm without re-serializing.
 pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> Finished {
     // N1/M1: force the OnceLock initialization at the very top, ABOVE
     // all validation. A health-probe shape like `curl -d 'broken'
@@ -2639,6 +2652,34 @@ pub async fn handle_parsed(request: ChatCompletionsRequest, res: Responder) -> F
     // see launch-scope state even on a launch whose only request is
     // malformed. Idempotent past the first call (OnceLock fast path).
     let _ = launch_diags();
+
+    if let Some(inferlet) = request.inferlet.as_deref() {
+        let messages = if request.messages.is_empty() {
+            None
+        } else {
+            Some(request.messages)
+        };
+        return match inferlet {
+            "tree-of-thought" => {
+                crate::tot::dispatch(request.input, messages, request.stream, res).await
+            }
+            "best-of-n" => {
+                crate::bestofn::dispatch(request.input, messages, request.stream, res).await
+            }
+            other => {
+                res.respond(with_launch_diags_header(sse::json_error(
+                    404,
+                    "inferlet_not_found",
+                    &format!(
+                        "Inferlet '{other}' not available on /v1/chat/completions. \
+                         Advanced profile dispatch supports 'tree-of-thought' and \
+                         'best-of-n'; use a normal chat-completions body for chat-apc."
+                    ),
+                )))
+                .await
+            }
+        };
+    }
 
     // F8: reject empty model + blank content at the 400 boundary.
     // Otherwise `""` flows into `runtime::models().contains(&"")` and
@@ -5850,6 +5891,30 @@ mod tests {
         let s = r.speculation.expect("speculation present");
         assert_eq!(s.thread_id.as_deref(), Some("chat-1"));
         assert_eq!(s.profile_id.as_deref(), Some("fast-think"));
+    }
+
+    #[test]
+    fn chat_completions_accepts_advanced_dispatch_envelope() {
+        let r: ChatCompletionsRequest = serde_json::from_str(
+            r#"{
+                "inferlet":"tree-of-thought",
+                "stream":true,
+                "input":{
+                    "model":"m",
+                    "messages":[{"role":"user","content":"hi"}],
+                    "breadth":2,
+                    "depth":1,
+                    "beam_width":1,
+                    "max_tokens_per_node":16
+                }
+            }"#,
+        )
+        .expect("advanced profile dispatch should parse on /v1/chat/completions");
+        assert_eq!(r.inferlet.as_deref(), Some("tree-of-thought"));
+        assert!(r.stream);
+        assert!(r.input.is_some());
+        assert!(r.model.is_empty(), "dispatch envelope need not duplicate input.model");
+        assert!(r.messages.is_empty(), "dispatch envelope carries messages inside input");
     }
 
     #[test]

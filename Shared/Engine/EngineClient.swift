@@ -400,10 +400,12 @@ public struct ChatRequest: Codable, Equatable, Sendable {
   }
 }
 
-/// Dispatch-shaped inferlet body. Streaming requests still post to
-/// `/v1/inferlet`; non-stream Best-of-N release posts the same body to
-/// `/v1/chat/completions` so release uses the unified chat-apc route. The
-/// design doc requires `input` to land on the
+/// Body of an inferlet dispatch envelope. Generative profile-backed dispatches
+/// (Tree of Thought / Best of N) are sent via POST /v1/chat/completions; retained
+/// internal/control dispatches still use POST /v1/inferlet except non-stream
+/// Best-of-N snapshot release, which posts the same dispatch-shaped body to
+/// `/v1/chat/completions` for the unified release route. The design doc requires
+/// `input` to land on the
 /// wire as an **inline JSON sub-tree** (`"input": {...}`), not a
 /// base64 string — but the dispatcher can't know inferlet-specific
 /// schemas, so we accept opaque `Data` and require it to be valid

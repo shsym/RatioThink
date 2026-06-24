@@ -9,8 +9,9 @@
 //!   * `GET    /healthz`             -> `control::health`
 //!   * `GET    /v1/models`           -> `control::models`
 //!   * `POST   /v1/chat/completions` -> `chat::completions`
+//!         (OpenAI chat plus advanced-profile envelopes for `tree-of-thought` / `best-of-n`)
 //!   * `POST   /v1/inferlet`         -> `chat::dispatch`
-//!         (`inferlet:"chat-apc"` | `inferlet:"tree-of-thought"`)
+//!         (internal/raw/control dispatch; normal profile sends should not use it)
 //!
 //! #469: there is NO `/v1/models/load`. pie binds the served model at
 //! `pie serve` boot, so the served model is fixed by the boot config and
