@@ -19,8 +19,8 @@ settings:
     # GENERATE_INFOPLIST_FILE=YES synthesizes CFBundleShortVersionString /
     # CFBundleVersion from these build settings; without them the version
     # keys in each target's info.properties are dropped from the built bundle.
-    MARKETING_VERSION: "0.1.6"
-    CURRENT_PROJECT_VERSION: "11"
+    MARKETING_VERSION: "0.1.7"
+    CURRENT_PROJECT_VERSION: "12"
     ENABLE_HARDENED_RUNTIME: NO
     DEAD_CODE_STRIPPING: YES
   configs:

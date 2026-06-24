@@ -10,7 +10,7 @@
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 
-### [Download Rational v0.1.6](https://github.com/shsym/RatioThink/releases/download/v0.1.6/Rational-arm64.dmg)
+### [Download Rational v0.1.7](https://github.com/shsym/RatioThink/releases/download/v0.1.7/Rational-arm64.dmg)
 
 </div>
 
