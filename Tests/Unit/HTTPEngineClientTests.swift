@@ -874,7 +874,7 @@ final class HTTPEngineClientTests: XCTestCase {
     XCTAssertEqual(input["model"] as? String, "m")
   }
 
-  func test_dispatchInferlet_unary_control_remains_on_internalInferletRoute() async throws {
+  func test_dispatchInferlet_bestOfN_release_control_posts_to_chatCompletions() async throws {
     let captured = RequestCapture()
     FakeSSEURLProtocol.handler = { req in
       captured.set(req)
@@ -888,7 +888,7 @@ final class HTTPEngineClientTests: XCTestCase {
     var frames: [Data] = []
     for try await frame in makeClient().dispatchInferlet(req) { frames.append(frame) }
     XCTAssertEqual(frames.count, 1)
-    XCTAssertEqual(try XCTUnwrap(captured.request).url?.path, "/v1/inferlet")
+    XCTAssertEqual(try XCTUnwrap(captured.request).url?.path, "/v1/chat/completions")
   }
 
   // MARK: - SSE parser (line-level)
