@@ -25,7 +25,8 @@ import Foundation
 ///   sends.
 /// * `POST /v1/inferlet` remains only for legacy/internal dispatches that are
 ///   not unified chat-completions routes; non-release non-stream dispatches stay
-///   here, and streaming chat-apc dispatch stays here.
+///   here, and streaming inferlets other than tree-of-thought/best-of-n stay
+///   on the raw inferlet SSE path.
 ///
 /// Error model ( — one code space across channels): an HTTP
 /// non-2xx whose body is an OpenAI-shape `{"error":{code,message}}`
@@ -177,12 +178,12 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
     // dispatch-shaped JSON body there and keep the UNARY buffered response path.
     // The inferlet returns a plain `application/json` ack; routing that ack
     // through the SSE frame reader would strip it (only `data:`-prefixed lines
-    // survive) and the caller would see zero frames. Generative calls
-    // (`stream: true`) keep the raw inferlet SSE path. The unary path's
-    // single connect-loss retry remains sound only for IDEMPOTENT control ops
-    // (today: release, where re-deleting reports `absent`); future
-    // non-idempotent control ops must opt out before routing here, or they
-    // could double-execute.
+    // survive) and the caller would see zero frames. Streaming ToT/Best-of-N
+    // dispatches use `/v1/chat/completions`; other streaming inferlets keep
+    // the raw `/v1/inferlet` SSE path. The unary path's single connect-loss
+    // retry remains sound only for IDEMPOTENT control ops (today: release,
+    // where re-deleting reports `absent`); future non-idempotent control ops
+    // must opt out before routing here, or they could double-execute.
     if !req.stream {
       let path = Self.isBestOfNRelease(req) ? "/v1/chat/completions" : "/v1/inferlet"
       return dispatchUnary(buildRequest: {
