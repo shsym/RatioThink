@@ -334,9 +334,10 @@ async def section_protocol_stress(base: str, http: httpx.AsyncClient, rep: Repor
         ok = r.status_code == 400 and r.json().get("error", {}).get("code") == "unsupported_role"
         rep.ok(ok, f"{P}: role={bad_role} -> {r.status_code} {r.text[:120]!r} (want 400 unsupported_role)")
 
-    # #468: the tree-of-thought dispatch path (POST /v1/inferlet) shares
-    # `fill_context`, so the same unknown-role rejection must hold there —
-    # NOT a 500, and not a silently mis-templated tree.
+    # #468: the retained internal/raw tree-of-thought dispatch path
+    # (POST /v1/inferlet) shares `fill_context`, so the same unknown-role
+    # rejection must hold there — NOT a 500, and not a silently
+    # mis-templated tree.
     for bad_role in ("banana", "developer"):
         r = await http.post(f"{base}/v1/inferlet", json={
             "inferlet": "tree-of-thought", "stream": False,

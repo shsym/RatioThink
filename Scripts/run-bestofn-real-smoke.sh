@@ -4,7 +4,7 @@
 #
 # Boots `pie serve` with the portable Metal driver over the staged
 # Qwen3-0.6B-Q8_0 GGUF and drives the interactive Best-of-N profile across
-# multiple /v1/inferlet requests (generate N → pick → think-more, plus the
+# multiple /v1/chat/completions advanced-profile requests (generate N → pick → think-more, plus the
 # open-miss → re-prefill fallback). Asserts parallel-decode co-batch, real
 # candidate divergence, KV resume across the request boundary (warm + cold),
 # and daemon survival across the multi-round sequence.

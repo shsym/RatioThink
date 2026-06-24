@@ -57,7 +57,7 @@ async def main() -> int:
               f"(b{bd}·d{dp}·m{bw}, exec=phased_concurrent)")
         async with httpx.AsyncClient(timeout=300) as http:
             r = await http.post(
-                f"{base}/v1/inferlet",
+                f"{base}/v1/chat/completions",
                 json={
                     "inferlet": "tree-of-thought",
                     "stream": False,
@@ -78,7 +78,7 @@ async def main() -> int:
                     },
                 },
             )
-            print(f"[tot-real] POST /v1/inferlet -> {r.status_code}")
+            print(f"[tot-real] POST /v1/chat/completions -> {r.status_code}")
             if r.status_code != 200:
                 # A total failure (every branch failed) returns 500 — that is
                 # NOT acceptable for a healthy real engine on this prompt.

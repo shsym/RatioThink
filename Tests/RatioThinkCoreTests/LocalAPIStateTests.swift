@@ -281,7 +281,7 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertFalse(curl.contains("inf"), curl)
   }
 
-  func test_profile_entrypoint_uses_inferlet_for_tree_of_thought_and_best_of_n() throws {
+  func test_profile_entrypoint_uses_chat_completions_envelope_for_tree_of_thought_and_best_of_n() throws {
     let treeOfThought = try Profile.parse(toml: """
     id = "tree-of-thought"
     name = "Tree of Thought"
@@ -301,14 +301,14 @@ final class LocalAPIStateTests: XCTestCase {
     max_tokens_per_node = 256
     """)
     let totRoutes = LocalAPIRoute.clientFacing(streaming: true, profile: treeOfThought)
-    XCTAssertEqual(totRoutes.first?.path, "/v1/inferlet")
-    XCTAssertEqual(totRoutes.first?.summary, "Tree of Thought inferlet dispatch (SSE streaming)")
+    XCTAssertEqual(totRoutes.first?.path, "/v1/chat/completions")
+    XCTAssertEqual(totRoutes.first?.summary, "Chat completions (SSE streaming)")
 
     let totCurl = LocalAPICurl.request(baseURL: "http://127.0.0.1:8123",
                                        model: "m",
                                        streaming: true,
                                        profile: treeOfThought)
-    XCTAssertTrue(totCurl.contains("http://127.0.0.1:8123/v1/inferlet"))
+    XCTAssertTrue(totCurl.contains("http://127.0.0.1:8123/v1/chat/completions"))
     XCTAssertTrue(totCurl.contains("\"inferlet\": \"tree-of-thought\""))
     XCTAssertTrue(totCurl.contains("\"stream\": true"))
     XCTAssertTrue(totCurl.contains("\"input\""))
@@ -318,7 +318,7 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertTrue(totCurl.contains("\"max_tokens_per_node\": 256"))
     XCTAssertTrue(totCurl.contains("\"temperature\": 0.7"))
     XCTAssertTrue(totCurl.contains("\"top_p\": 0.9"))
-    XCTAssertFalse(totCurl.contains("/v1/chat/completions"))
+    XCTAssertFalse(totCurl.contains("/v1/inferlet"))
 
     let bestOfN = try Profile.parse(toml: """
     id = "best-of-n"
@@ -338,14 +338,14 @@ final class LocalAPIStateTests: XCTestCase {
     thinking = true
     """)
     let bonRoutes = LocalAPIRoute.clientFacing(streaming: false, profile: bestOfN)
-    XCTAssertEqual(bonRoutes.first?.path, "/v1/inferlet")
-    XCTAssertEqual(bonRoutes.first?.summary, "Best of N inferlet dispatch (single JSON response)")
+    XCTAssertEqual(bonRoutes.first?.path, "/v1/chat/completions")
+    XCTAssertEqual(bonRoutes.first?.summary, "Chat completions (single JSON response)")
 
     let bonCurl = LocalAPICurl.request(baseURL: "http://127.0.0.1:8123",
                                        model: "m",
                                        streaming: false,
                                        profile: bestOfN)
-    XCTAssertTrue(bonCurl.contains("http://127.0.0.1:8123/v1/inferlet"))
+    XCTAssertTrue(bonCurl.contains("http://127.0.0.1:8123/v1/chat/completions"))
     XCTAssertTrue(bonCurl.contains("\"inferlet\": \"best-of-n\""))
     XCTAssertTrue(bonCurl.contains("\"stream\": false"))
     XCTAssertTrue(bonCurl.contains("\"n\": 3"))
@@ -353,7 +353,7 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertTrue(bonCurl.contains("\"thinking\": true"))
     XCTAssertTrue(bonCurl.contains("\"temperature\": 0.8"))
     XCTAssertTrue(bonCurl.contains("\"top_p\": 0.95"))
-    XCTAssertFalse(bonCurl.contains("/v1/chat/completions"))
+    XCTAssertFalse(bonCurl.contains("/v1/inferlet"))
   }
 
   func test_profile_entrypoint_uses_text_completion_shape_for_text_completion_profiles() throws {

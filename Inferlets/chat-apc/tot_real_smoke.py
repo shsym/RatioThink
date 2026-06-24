@@ -228,7 +228,7 @@ def validate_planning_evidences(
 
 async def run_tot(http: httpx.AsyncClient, base: str, prompt: str, *, breadth, depth, beam_width):
     r = await http.post(
-        f"{base}/v1/inferlet",
+        f"{base}/v1/chat/completions",
         json={
             "inferlet": "tree-of-thought",
             "stream": False,

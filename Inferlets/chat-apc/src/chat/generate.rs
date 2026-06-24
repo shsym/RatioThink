@@ -4,9 +4,10 @@
 //! [`Generator`] is constructed — behind [`DecodeStrategy`], so the SSE
 //! and JSON transport loops in [`super::completions`] stay generic over
 //! plain vs speculative decode. Tree-of-thought is a sibling mode that
-//! ships as an advanced-profile dispatch arm behind `/v1/chat/completions` (and the retained internal `/v1/inferlet` raw path) ([`super::dispatch`] →
-//! [`crate::tot`]) rather than a `DecodeStrategy`, so it bypasses these
-//! transport loops entirely.
+//! ships as an advanced-profile dispatch arm behind `/v1/chat/completions`
+//! (and the retained internal `/v1/inferlet` raw path)
+//! ([`super::dispatch`] → [`crate::tot`]) rather than a `DecodeStrategy`,
+//! so it bypasses these transport loops entirely.
 //!
 //! - [`DecodeStrategy::Plain`] — the default token-by-token decode.
 //! - [`DecodeStrategy::Speculative`] — attaches a [`CachebackDrafter`]

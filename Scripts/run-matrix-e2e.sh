@@ -5,7 +5,7 @@
 # PieControlLauncher → real `pie serve` → HTTP) once per curated model and
 # fires every profile request shape against that single booted engine:
 #   · chat            → POST /v1/chat/completions
-#   · tree-of-thought → POST /v1/inferlet {inferlet:"tree-of-thought"}
+#   · tree-of-thought → POST /v1/chat/completions {inferlet:"tree-of-thought", input:{…}}
 #   · fast-think      → POST /v1/chat/completions + a `speculation` field
 #   · ceiling         → the #475 token-ceiling contract: read the engine's
 #                       memory-aware `max_output_tokens` N off /v1/models,

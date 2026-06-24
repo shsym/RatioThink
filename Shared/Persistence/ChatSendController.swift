@@ -991,9 +991,10 @@ public final class ChatSendController: ObservableObject {
     }
   }
 
-  /// Build the `/v1/inferlet` body for a Best-of-N snapshot-release request
-  /// (#690): a `release` list, no messages, no generation. `modelID` is omitted
-  /// when nil so the engine resolves its served model.
+  /// Build the chat-completions dispatch envelope for a Best-of-N
+  /// snapshot-release request (#690): a `release` list, no messages, no
+  /// generation. `modelID` is omitted when nil so the engine resolves its
+  /// served model.
   private static func makeBestOfNReleaseRequest(modelID: String?, names: [String]) -> InferletRequest? {
     guard let data = try? JSONEncoder().encode(BestOfNReleaseInput(model: modelID, release: names))
     else { return nil }
@@ -1209,9 +1210,9 @@ private struct BestOfNRequestInput: Encodable {
   }
 }
 
-/// `/v1/inferlet` body for a Best-of-N snapshot-release request (#690): names
-/// to drop, no messages — the server runs no generation and acks the freed
-/// count.
+/// Chat-completions dispatch-envelope body for a Best-of-N snapshot-release
+/// request (#690): names to drop, no messages — the server runs no generation
+/// and acks the freed count.
 private struct BestOfNReleaseInput: Encodable {
   /// Omitted when nil (`encodeIfPresent`) so the engine resolves its served
   /// model — the delete path has no gate to supply a model id.

@@ -3,9 +3,9 @@
 
 Boots `pie serve` with the portable Metal driver over the staged
 Qwen3-0.6B-Q8_0 GGUF, installs chat-apc.wasm, and drives the interactive
-Best-of-N profile end-to-end across multiple `/v1/inferlet` requests — the
-round model where the engine generates N candidates, the user picks one, and a
-think-more round resumes from that pick.
+Best-of-N profile end-to-end across multiple `/v1/chat/completions`
+advanced-profile requests — the round model where the engine generates N
+candidates, the user picks one, and a think-more round resumes from that pick.
 
 Best-of-N always streams (the N-pane UI consumes per-candidate deltas), so the
 driver consumes the SSE event stream — which is also where the parallel-decode
@@ -24,8 +24,8 @@ evidence lives. It asserts, against a real model:
           nonexistent snapshot falls back to re-prefilling the base from
           `messages` + `picked_text` and still produces N candidates.
   (d) DAEMON SURVIVAL: the engine survives the whole multi-round sequence of
-      `/v1/inferlet` requests (thinking OFF, so it never rides the ToT
-      thinking-ON crash path).
+      `/v1/chat/completions` advanced-profile requests (thinking OFF, so it
+      never rides the ToT thinking-ON crash path).
 
 Usage:
     Scripts/run-bestofn-real-smoke.sh
@@ -189,7 +189,7 @@ async def run_round(http: httpx.AsyncClient, base: str, payload: dict) -> RoundR
     result = RoundResult()
     async with http.stream(
         "POST",
-        f"{base}/v1/inferlet",
+        f"{base}/v1/chat/completions",
         json=payload,
         headers={"accept": "text/event-stream"},
     ) as resp:
@@ -247,7 +247,7 @@ async def release_snapshots(http: httpx.AsyncClient, base: str, names: list[str]
     """POST a Best-of-N lifecycle release (no generation) and return the
     accounting ack {requested, released, absent}."""
     r = await http.post(
-        f"{base}/v1/inferlet",
+        f"{base}/v1/chat/completions",
         json={"inferlet": "best-of-n", "stream": False, "input": {"release": names}},
     )
     if r.status_code != 200:

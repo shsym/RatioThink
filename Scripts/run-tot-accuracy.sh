@@ -8,7 +8,7 @@
 # Inferlets/chat-apc/tot_accuracy_real.py, which — for every GRADED dataset
 # prepared by Scripts/benchmark/prep_*.sh (GSM8K, HumanEval, MBPP, JSONSchema) —
 # decodes a single greedy CoT chain and a ToT(width=k, depth=1) search through
-# the SAME /v1/inferlet endpoint, grades both answers with the dataset's
+# the SAME /v1/chat/completions advanced-profile envelope, grades both answers with the dataset's
 # deterministic grader (Inferlets/chat-apc/grade.py), and writes an
 # accuracy/token artifact + rendered matrix.
 #

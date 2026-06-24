@@ -340,12 +340,12 @@ public struct LocalAPIRoute: Equatable, Identifiable {
   }
 
   /// The routes useful for the currently selected Local API profile. The
-  /// primary POST route is profile-shaped: normal chat profiles use
-  /// `/v1/chat/completions`, while today's app-level dispatch modes
-  /// (Tree-of-Thought / Best-of-N, plus explicit text-completion inferlets)
-  /// use `/v1/inferlet` because that is what they actually call before #775
-  /// unifies dispatch. (#469: there is no `/v1/models/load` — the served model
-  /// is fixed at engine boot and read from `GET /v1/models`.)
+  /// primary POST route is profile-shaped: normal chat and advanced chat-apc
+  /// profiles use `/v1/chat/completions`; retained raw inferlet examples are
+  /// shown only for profiles whose public shape still is not chat-completions
+  /// compatible (currently explicit text-completion inferlets). (#469: there
+  /// is no `/v1/models/load` — the served model is fixed at engine boot and
+  /// read from `GET /v1/models`.)
   ///
   /// #654: the chat-completions summary reflects the panel's streaming toggle —
   /// `chat-apc` serves BOTH `stream: true` (SSE) and `stream: false` (single
@@ -361,7 +361,7 @@ public struct LocalAPIRoute: Equatable, Identifiable {
 
   public static func primaryPostRoute(streaming: Bool, profile: Profile?) -> LocalAPIRoute {
     switch LocalAPIProfileDispatch.make(profile: profile) {
-    case .chatCompletions:
+    case .chatCompletions, .advancedChatCompletions:
       return LocalAPIRoute(method: "POST", path: "/v1/chat/completions",
                            summary: chatCompletionsSummary(streaming: streaming))
     case .inferlet(let inferlet, _):
@@ -392,15 +392,16 @@ public struct LocalAPIRoute: Equatable, Identifiable {
 
 private enum LocalAPIProfileDispatch: Equatable {
   case chatCompletions
+  case advancedChatCompletions(name: String, input: LocalAPIInferletInput)
   case inferlet(name: String, input: LocalAPIInferletInput)
 
   static func make(profile: Profile?) -> LocalAPIProfileDispatch {
     guard let profile else { return .chatCompletions }
     if let config = profile.treeOfThought {
-      return .inferlet(name: "tree-of-thought", input: .treeOfThought(config))
+      return .advancedChatCompletions(name: "tree-of-thought", input: .treeOfThought(config))
     }
     if let config = profile.bestOfN {
-      return .inferlet(name: "best-of-n", input: .bestOfN(config))
+      return .advancedChatCompletions(name: "best-of-n", input: .bestOfN(config))
     }
     if bareInferletName(profile.inferlet) == "text-completion" {
       return .inferlet(name: "text-completion", input: .textCompletion)
@@ -546,6 +547,16 @@ public enum LocalAPICurl {
     switch LocalAPIProfileDispatch.make(profile: profile) {
     case .chatCompletions:
       return chatCompletions(baseURL: baseURL, model: model, streaming: streaming, profile: profile)
+    case .advancedChatCompletions(let inferlet, let input):
+      return post(
+        baseURL: baseURL,
+        path: "/v1/chat/completions",
+        body: inferletBody(
+          inferlet: inferlet,
+          model: model,
+          streaming: streaming,
+          profile: profile,
+          input: input))
     case .inferlet(let inferlet, let input):
       return post(
         baseURL: baseURL,

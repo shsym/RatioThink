@@ -171,7 +171,8 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
 
   /// One cell of the (model × profile) real-engine compatibility matrix
   /// (#473). Routing is per-REQUEST, not per-launch-profile (chat →
-  /// /v1/chat/completions, tree-of-thought → /v1/inferlet, fast-think →
+  /// /v1/chat/completions, tree-of-thought → /v1/chat/completions
+  /// advanced-profile envelope, fast-think →
   /// chat-completions + a `speculation` field, ceiling → the #475
   /// token-ceiling contract over /v1/models + a boundary pair), so a single
   /// booted model proves every profile shape against it: this boots ONCE and
@@ -843,10 +844,11 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     XCTAssertFalse(Self.isDegenerateOutput("ping pong ping pong ping pong"))
   }
 
-  /// tree-of-thought cell: dispatch the real `/v1/inferlet` ToT search
-  /// through the typed client + `toTEventStream` (the exact App path) and
-  /// require the stream to reach a `tree_complete` terminal with a chosen
-  /// answer, having materialized at least one node at depth ≥ 2 — the
+  /// tree-of-thought cell: dispatch the real `/v1/chat/completions`
+  /// advanced-profile ToT search through the typed client + `toTEventStream`
+  /// (the exact App path) and require the stream to reach a `tree_complete`
+  /// terminal with a chosen answer, having materialized at least one node at
+  /// depth ≥ 2 — the
   /// depth>1 search is what spans the inter-level idle gap (#413). Default
   /// `coupled_sequential` exec, so the production prebuilt wasm serves it
   /// (the #458 phased_concurrent strategies are a separate feature build).
