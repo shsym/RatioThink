@@ -62,6 +62,32 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertEqual(EngineHTTPBindMode.external.baseURLHost, "0.0.0.0")
   }
 
+
+  func test_power_toggle_lifecycle_sequence_is_derived_from_status() {
+    let starting = LocalAPIState.make(status: .starting, hasActiveProfile: true)
+    XCTAssertTrue(starting.toggleOn, "tap-on should render ON immediately while launch is pending")
+    XCTAssertFalse(starting.toggleEnabled, "tap-on should be disabled during pending start")
+    XCTAssertEqual(starting.statusLabel, "Starting…")
+
+    let running = LocalAPIState.make(
+      status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat", servedModelID: "m")),
+      hasActiveProfile: true)
+    XCTAssertTrue(running.toggleOn)
+    XCTAssertTrue(running.toggleEnabled)
+    XCTAssertEqual(running.statusLabel, "Running")
+
+    let failed = LocalAPIState.make(status: .failed(code: .spawnFailed, message: "boom"),
+                                    hasActiveProfile: true)
+    XCTAssertFalse(failed.toggleOn, "failed launch must roll the switch back OFF")
+    XCTAssertTrue(failed.toggleEnabled, "recoverable launch failure should leave retry available")
+    XCTAssertEqual(failed.statusLabel, "Engine failed")
+
+    let stopping = LocalAPIState.make(status: .stopping, hasActiveProfile: true)
+    XCTAssertFalse(stopping.toggleOn, "tap-off should render OFF immediately while stop is pending")
+    XCTAssertFalse(stopping.toggleEnabled, "tap-off should be disabled during pending stop")
+    XCTAssertEqual(stopping.statusLabel, "Stopping…")
+  }
+
   func test_stopped_without_profile_is_disabled_with_guidance() {
     let s = LocalAPIState.make(status: .stopped, hasActiveProfile: false)
     XCTAssertFalse(s.toggleEnabled, "nothing to serve → can't turn on")

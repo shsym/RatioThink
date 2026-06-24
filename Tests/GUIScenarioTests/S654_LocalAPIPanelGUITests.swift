@@ -147,6 +147,57 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
     }
   }
 
+  @MainActor
+  func test_example_profile_switch_does_not_change_served_profile_control() throws {
+    let app = launchPinnedRunning()
+    defer { app.terminate() }
+    _ = openLocalAPIPanel(in: app)
+
+    XCTAssertTrue(app.staticTexts["chat"].waitForExistence(timeout: 10),
+                  "configuration Profile row should start on the active chat profile; app tree: \(app.debugDescription)")
+    let repeatBoost = profileSegment("Repeat Boost", in: app)
+    XCTAssertTrue(repeatBoost.waitForExistence(timeout: 10),
+                  "Repeat Boost profile tab missing; app tree: \(app.debugDescription)")
+    repeatBoost.click()
+
+    let curl = app.descendants(matching: .any).matching(identifier: "LocalAPICurl").firstMatch
+    let repeatBoostProfileID = NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@",
+                                           "\"profile_id\": \"repeat-boost\"",
+                                           "\"profile_id\": \"repeat-boost\"")
+    expectation(for: repeatBoostProfileID, evaluatedWith: curl)
+    waitForExpectations(timeout: 5) { error in
+      XCTAssertNil(error, "example profile switch must still rewrite the curl body; curl=\(self.curlText(curl).debugDescription)")
+    }
+
+    XCTAssertTrue(app.staticTexts["chat"].exists,
+                  "example profile selection must not change the real configured/served profile row")
+    XCTAssertFalse(app.staticTexts["repeat-boost"].exists,
+                   "example profile selection must not persist as the real Local API Profile setting")
+    XCTAssertFalse(app.staticTexts["Starting…"].exists,
+                   "example profile selection must not relaunch the engine")
+    XCTAssertFalse(app.staticTexts["Off"].exists,
+                   "example profile selection must not stop the engine")
+  }
+
+  @MainActor
+  func test_engine_off_keeps_example_profile_endpoints_and_curl_visible() throws {
+    let app = launchStopped()
+    defer { app.terminate() }
+    _ = openLocalAPIPanel(in: app)
+
+    XCTAssertTrue(app.staticTexts["Off"].waitForExistence(timeout: 10),
+                  "test fixture should open with the Local API off; app tree: \(app.debugDescription)")
+    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "LocalAPIProfileTabs").firstMatch.waitForExistence(timeout: 10),
+                  "profile selector must remain visible while the engine is off; app tree: \(app.debugDescription)")
+    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "LocalAPIEndpoints").firstMatch.waitForExistence(timeout: 5),
+                  "endpoints list must remain visible while the engine is off; app tree: \(app.debugDescription)")
+    let curl = app.descendants(matching: .any).matching(identifier: "LocalAPICurl").firstMatch
+    XCTAssertTrue(curl.waitForExistence(timeout: 5),
+                  "curl example must remain visible while the engine is off; app tree: \(app.debugDescription)")
+    XCTAssertTrue(curlText(curl).contains("http://127.0.0.1:<port>"),
+                  "off-state curl must use a clear placeholder base URL; curl=\(curlText(curl).debugDescription)")
+  }
+
   // MARK: - helpers
 
   @MainActor
@@ -182,6 +233,26 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
     app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     app.launchEnvironment["PIE_TEST_ENGINE_SERVED_MODEL"] = servedModel
+    configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
+    app.launch()
+    XCTAssert(app.wait(for: .runningForeground, timeout: 10),
+              "Rational.app did not reach runningForeground")
+    app.activate()
+    return app
+  }
+
+  @MainActor
+  private func launchStopped() -> XCUIApplication {
+    let pieHome = "/tmp/pie-s654-off-" + UUID().uuidString
+    tempHomes.append(pieHome)
+    let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
+    app.launchArguments.append(contentsOf: [
+      "-NSQuitAlwaysKeepsWindows", "NO",
+      "-ApplePersistenceIgnoreState", "YES",
+    ])
+    app.launchEnvironment["PIE_HOME"] = pieHome
+    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
+    app.launchEnvironment["PIE_TEST_ENGINE_START_TO_RUNNING"] = "1"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     app.launch()
     XCTAssert(app.wait(for: .runningForeground, timeout: 10),

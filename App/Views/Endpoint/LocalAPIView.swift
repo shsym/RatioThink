@@ -38,7 +38,7 @@ struct LocalAPIView: View {
   @State private var memory: EngineMemorySample?
   @State private var health: EngineHealth.Status?
   @State private var confirmStop = false
-  @State private var selectedProfileID: String?
+  @State private var exampleProfileID: String?
   @State private var profileRestartInFlight = false
   /// #654: drives the example/route surface only — `stream: true` (SSE) vs
   /// `stream: false` (single JSON body). The engine serves both; this toggle
@@ -68,9 +68,7 @@ struct LocalAPIView: View {
   private var bindMode: EngineHTTPBindMode {
     state.isServing ? engineStatusStore.runtimeDaemonBindMode : appPreferences.localAPIBindMode
   }
-  private var profileSelectionEnabled: Bool {
-    state.profileSelectionEnabled && !profileRestartInFlight
-  }
+  private var profileSelectionEnabled: Bool { state.profileSelectionEnabled }
   private var posture: EngineHTTPPosture { EngineHTTPPosture.make(bindMode: bindMode) }
 
   private var runtimeProfileID: String? {
@@ -95,8 +93,12 @@ struct LocalAPIView: View {
       runtimeServedModelID: runtimeServedModelID)
   }
 
-  private var selectedOrActiveProfileID: String? {
-    selectedProfileID ?? runtimeProfileID ?? profileStore.activeProfileID ?? profileOptions.first?.id
+  private var startProfileID: String? {
+    profileStore.activeProfileID ?? runtimeProfileID ?? profileOptions.first?.id
+  }
+
+  private var selectedExampleProfileID: String? {
+    exampleProfileID ?? runtimeProfileID ?? profileStore.activeProfileID ?? profileOptions.first?.id
   }
 
   var body: some View {
@@ -110,9 +112,7 @@ struct LocalAPIView: View {
         if let helperBlock {
           HelperUnavailableNotice(reason: helperBlock, onDismiss: { self.helperBlock = nil })
         }
-        if state.isServing {
-          servingDetails
-        }
+        apiDetails
         configurationSection
         securitySection
       }
@@ -128,14 +128,16 @@ struct LocalAPIView: View {
       if serving { engineActionError = nil; helperBlock = nil }
     }
     .onChange(of: engineStatusStore.status) { _, newStatus in
-      if case .running(let snapshot) = newStatus {
-        selectedProfileID = snapshot.profileID
-      } else if selectedProfileID == nil {
-        selectedProfileID = profileStore.activeProfileID ?? profileOptions.first?.id
+      if exampleProfileID == nil {
+        if case .running(let snapshot) = newStatus {
+          exampleProfileID = snapshot.profileID
+        } else {
+          exampleProfileID = profileStore.activeProfileID ?? profileOptions.first?.id
+        }
       }
     }
     .onAppear {
-      selectedProfileID = selectedOrActiveProfileID
+      exampleProfileID = selectedExampleProfileID
     }
     .confirmationDialog(
       "Turn off the local API?",
@@ -240,10 +242,10 @@ struct LocalAPIView: View {
     }
   }
 
-  // MARK: - serving details (only while running)
+  // MARK: - API details
 
   @ViewBuilder
-  private var servingDetails: some View {
+  private var apiDetails: some View {
     if let baseURL = visibleBaseURL {
       labeledCopyRow(
         title: "Base URL",
@@ -271,11 +273,11 @@ struct LocalAPIView: View {
           identifier: "LocalAPIHealth"
         )
       }
+    }
 
-      endpointsSection(profile: selectedProfile)
-      if let model = state.servedModelID {
-        curlSection(baseURL: baseURL, model: model, profile: selectedProfile)
-      }
+    endpointsSection(profile: selectedProfile)
+    if let model = exampleModelID {
+      curlSection(baseURL: exampleBaseURL, model: model, profile: selectedProfile)
     }
   }
 
@@ -294,14 +296,22 @@ struct LocalAPIView: View {
   }
 
   private var selectedProfile: Profile? {
-    guard let selectedOrActiveProfileID else { return nil }
-    return profileStore.entries.compactMap(\.profile).first { $0.id == selectedOrActiveProfileID }
+    guard let selectedExampleProfileID else { return nil }
+    return profileStore.entries.compactMap(\.profile).first { $0.id == selectedExampleProfileID }
   }
 
-  private var profileSelectionBinding: Binding<String> {
+  private var exampleModelID: String? {
+    state.servedModelID ?? selectedProfile?.model ?? profileStore.activeProfile?.model
+  }
+
+  private var exampleBaseURL: String {
+    visibleBaseURL ?? "http://127.0.0.1:<port>"
+  }
+
+  private var exampleProfileSelectionBinding: Binding<String> {
     Binding(
-      get: { selectedOrActiveProfileID ?? "" },
-      set: { selectProfile($0) }
+      get: { selectedExampleProfileID ?? "" },
+      set: { exampleProfileID = $0 }
     )
   }
 
@@ -372,7 +382,7 @@ struct LocalAPIView: View {
       HStack(alignment: .firstTextBaseline, spacing: 12) {
         Text("Profile")
           .foregroundStyle(.secondary)
-        Picker("Profile", selection: profileSelectionBinding) {
+        Picker("Profile", selection: exampleProfileSelectionBinding) {
           ForEach(profileOptions) { option in
             Text(option.title).tag(option.id)
           }
@@ -552,7 +562,7 @@ struct LocalAPIView: View {
   /// `.alreadyRunning` that reaches the app is an incompatible-start
   /// conflict and surfaces to the caller.
   private func start() {
-    guard let profileID = selectedOrActiveProfileID, !profileID.isEmpty else { return }
+    guard let profileID = startProfileID, !profileID.isEmpty else { return }
     Task { @MainActor in
       engineActionError = nil
       helperBlock = nil
@@ -597,7 +607,6 @@ struct LocalAPIView: View {
       restartInFlight: &profileRestartInFlight
     )
     guard outcome != .reject else { return }
-    selectedProfileID = profileID
     do {
       try profileStore.setActiveProfileID(profileID)
     } catch {
@@ -611,7 +620,7 @@ struct LocalAPIView: View {
   }
 
   private func setExternalAccess(_ enabled: Bool) {
-    let profileID = runtimeProfileID ?? selectedOrActiveProfileID
+    let profileID = runtimeProfileID ?? startProfileID
     Task { @MainActor in
       engineActionError = nil
       do {
