@@ -272,7 +272,6 @@ struct LocalAPIView: View {
         )
       }
 
-      exampleProfileSection
       endpointsSection(profile: selectedProfile)
       if let model = state.servedModelID {
         curlSection(baseURL: baseURL, model: model, profile: selectedProfile)
@@ -291,35 +290,6 @@ struct LocalAPIView: View {
       return "Loopback only. The port is assigned fresh each time the engine starts."
     case .external:
       return "External access is enabled. From another device, replace 0.0.0.0 with this Mac’s LAN IP address."
-    }
-  }
-
-  private var exampleProfileSection: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      sectionHeader("Examples")
-      Text("Choose which profile shapes the endpoint list and curl body. The local API still serves only the model shown above.")
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .fixedSize(horizontal: false, vertical: true)
-      if profileOptions.isEmpty {
-        Text("No valid profiles are available yet.")
-          .font(.callout)
-          .foregroundStyle(.secondary)
-      } else {
-        VStack(alignment: .leading, spacing: 4) {
-          Text("Example profile")
-            .font(.callout.weight(.semibold))
-          Picker("Example profile", selection: profileSelectionBinding) {
-            ForEach(profileOptions) { option in
-              Text(option.title).tag(option.id)
-            }
-          }
-          .pickerStyle(.segmented)
-          .disabled(!profileSelectionEnabled)
-          .accessibilityLabel("Example profile")
-          .accessibilityIdentifier("LocalAPIProfileTabs")
-        }
-      }
     }
   }
 
@@ -374,6 +344,7 @@ struct LocalAPIView: View {
         }
         .controlSize(.small)
       }
+      profileSelectorRow
       trailingSwitchRow(
         title: "Streaming responses",
         caption: streamingEnabled
@@ -388,6 +359,30 @@ struct LocalAPIView: View {
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
         .accessibilityIdentifier("LocalAPICurl")
+    }
+  }
+
+  @ViewBuilder
+  private var profileSelectorRow: some View {
+    if profileOptions.isEmpty {
+      Text("No valid profiles are available yet.")
+        .font(.callout)
+        .foregroundStyle(.secondary)
+    } else {
+      HStack(alignment: .firstTextBaseline, spacing: 12) {
+        Text("Profile")
+          .foregroundStyle(.secondary)
+        Picker("Profile", selection: profileSelectionBinding) {
+          ForEach(profileOptions) { option in
+            Text(option.title).tag(option.id)
+          }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .disabled(!profileSelectionEnabled)
+        .accessibilityLabel("Profile")
+        .accessibilityIdentifier("LocalAPIProfileTabs")
+      }
     }
   }
 

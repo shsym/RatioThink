@@ -47,17 +47,17 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
     defer { app.terminate() }
     let panel = openLocalAPIPanel(in: app)
 
-    // #2: the seeded profiles are selectable as example shapers, not as a
-    // standalone served-engine selector.
-    XCTAssertTrue(app.staticTexts["Example profile"].waitForExistence(timeout: 10),
-                  "the profile selector must be labeled as example shaping; app tree: \(app.debugDescription)")
+    // #2: the seeded profiles are selectable from the curl example context,
+    // without implying a separate served-engine profile status.
     let tabs = app.descendants(matching: .any).matching(identifier: "LocalAPIProfileTabs").firstMatch
     XCTAssertTrue(tabs.waitForExistence(timeout: 10),
-                  "Local API example profile tabs missing; app tree: \(app.debugDescription)")
+                  "Local API profile picker missing from the curl example; app tree: \(app.debugDescription)")
     XCTAssertFalse(app.descendants(matching: .any).matching(identifier: "LocalAPISelectedProfile").firstMatch.exists,
                    "the Local API pane must not show a redundant profile-level Model/Running row")
+    XCTAssertFalse(app.staticTexts["Example profile"].exists,
+                   "the profile picker must use the bare 'Profile' label, not 'Example profile'")
     XCTAssertTrue(profileSegment("Chat", in: app).waitForExistence(timeout: 5),
-                  "the plain 'Chat' profile must be a selectable example profile; app tree: \(app.debugDescription)")
+                  "the plain 'Chat' profile must be selectable in the curl example; app tree: \(app.debugDescription)")
     XCTAssertTrue(profileSegment("Repeat Boost", in: app).exists,
                   "seeded profiles must all be listed for examples; 'Repeat Boost' missing; app tree: \(app.debugDescription)")
 
@@ -74,6 +74,7 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
                   "streaming on/off toggle missing in the Local API panel; app tree: \(app.debugDescription)")
     XCTAssertEqual(toggle.label, "Streaming responses",
                    "hidden-label trailing switch must keep a VoiceOver-readable label")
+    assertProfilePickerIsInsideCurlSection(in: app, tabs: tabs, streamingToggle: toggle)
     toggle.click()
 
     let nonStreaming = NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@",
@@ -116,10 +117,18 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
     defer { app.terminate() }
     _ = openLocalAPIPanel(in: app)
 
-    XCTAssertTrue(app.staticTexts["Example profile"].waitForExistence(timeout: 10),
-                  "profile selection should be scoped to API examples; app tree: \(app.debugDescription)")
+    XCTAssertFalse(app.staticTexts["Example profile"].exists,
+                   "profile selection should use the bare 'Profile' label in the curl example")
     XCTAssertFalse(app.descendants(matching: .any).matching(identifier: "LocalAPISelectedProfile").firstMatch.exists,
-                   "demoted example profile selection must not render a profile-level Model/Running status row")
+                   "demoted profile selection must not render a profile-level Model/Running status row")
+    let tabs = app.descendants(matching: .any).matching(identifier: "LocalAPIProfileTabs").firstMatch
+    XCTAssertTrue(tabs.waitForExistence(timeout: 10),
+                  "profile picker missing from the curl example; app tree: \(app.debugDescription)")
+    let toggle = app.descendants(matching: .any).matching(identifier: "LocalAPIStreamingToggle").firstMatch
+    XCTAssertTrue(toggle.waitForExistence(timeout: 5),
+                  "streaming toggle missing from the curl example; app tree: \(app.debugDescription)")
+    assertProfilePickerIsInsideCurlSection(in: app, tabs: tabs, streamingToggle: toggle)
+
     let curl = app.descendants(matching: .any).matching(identifier: "LocalAPICurl").firstMatch
     XCTAssertTrue(curl.waitForExistence(timeout: 10),
                   "curl example missing while serving; app tree: \(app.debugDescription)")
@@ -139,6 +148,26 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
   }
 
   // MARK: - helpers
+
+  @MainActor
+  private func assertProfilePickerIsInsideCurlSection(
+    in app: XCUIApplication,
+    tabs: XCUIElement,
+    streamingToggle: XCUIElement,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    let curlHeader = app.staticTexts["curl example"].firstMatch
+    XCTAssertTrue(curlHeader.waitForExistence(timeout: 5),
+                  "curl example header missing; app tree: \(app.debugDescription)",
+                  file: file, line: line)
+    XCTAssertGreaterThan(tabs.frame.minY, curlHeader.frame.minY,
+                         "profile picker should sit below the curl example header",
+                         file: file, line: line)
+    XCTAssertLessThan(tabs.frame.minY, streamingToggle.frame.minY,
+                      "profile picker should sit above the streaming toggle inside curl example",
+                      file: file, line: line)
+  }
 
   @MainActor
   private func launchPinnedRunning() -> XCUIApplication {
