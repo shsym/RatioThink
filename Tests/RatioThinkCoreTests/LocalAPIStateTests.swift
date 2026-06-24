@@ -261,6 +261,26 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertTrue(curl.contains("\"draft_len\": 5"))
   }
 
+  func test_curl_snippet_replaces_non_finite_profile_numbers_with_defaults() {
+    let corruptProfile = Profile(
+      id: "corrupt",
+      name: "Corrupt",
+      model: "m",
+      inferlet: "chat-apc",
+      sampling: Sampling(temperature: .nan, topP: .infinity, maxTokens: 512))
+
+    let curl = LocalAPICurl.request(
+      baseURL: "http://127.0.0.1:8123",
+      model: "m",
+      streaming: true,
+      profile: corruptProfile)
+
+    XCTAssertTrue(curl.contains("\"temperature\": 0.7"), curl)
+    XCTAssertTrue(curl.contains("\"top_p\": 0.9"), curl)
+    XCTAssertFalse(curl.contains("nan"), curl)
+    XCTAssertFalse(curl.contains("inf"), curl)
+  }
+
   func test_profile_entrypoint_uses_inferlet_for_tree_of_thought_and_best_of_n() throws {
     let treeOfThought = try Profile.parse(toml: """
     id = "tree-of-thought"

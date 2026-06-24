@@ -571,8 +571,8 @@ public enum LocalAPICurl {
 
     if let profile {
       let displayedTemperature = (profile.speculation?.enabled == true) ? 0 : profile.sampling.temperature
-      fields.append("\"temperature\": \(jsonNumber(displayedTemperature))")
-      fields.append("\"top_p\": \(jsonNumber(profile.sampling.topP))")
+      fields.append("\"temperature\": \(jsonNumber(displayedTemperature, fallback: ChatSampling().temperature))")
+      fields.append("\"top_p\": \(jsonNumber(profile.sampling.topP, fallback: ChatSampling().topP))")
       fields.append("\"max_tokens\": \(profile.sampling.maxTokens)")
 
       if let speculation = profile.speculation, speculation.enabled {
@@ -612,16 +612,16 @@ public enum LocalAPICurl {
         "\"depth\": \(config.depth)",
         "\"beam_width\": \(config.beamWidth)",
         "\"max_tokens_per_node\": \(config.maxTokensPerNode)",
-        "\"temperature\": \(jsonNumber(profile?.sampling.temperature ?? ChatSampling().temperature))",
-        "\"top_p\": \(jsonNumber(profile?.sampling.topP ?? ChatSampling().topP))",
+        "\"temperature\": \(jsonNumber(profile?.sampling.temperature ?? ChatSampling().temperature, fallback: ChatSampling().temperature))",
+        "\"top_p\": \(jsonNumber(profile?.sampling.topP ?? ChatSampling().topP, fallback: ChatSampling().topP))",
       ]
     case .bestOfN(let config):
       inputFields = transcriptInputFields(model: model, profile: profile) + [
         "\"n\": \(config.n)",
         "\"max_tokens_per_candidate\": \(config.maxTokensPerCandidate)",
         "\"thinking\": \(config.thinking)",
-        "\"temperature\": \(jsonNumber(profile?.sampling.temperature ?? ChatSampling().temperature))",
-        "\"top_p\": \(jsonNumber(profile?.sampling.topP ?? ChatSampling().topP))",
+        "\"temperature\": \(jsonNumber(profile?.sampling.temperature ?? ChatSampling().temperature, fallback: ChatSampling().temperature))",
+        "\"top_p\": \(jsonNumber(profile?.sampling.topP ?? ChatSampling().topP, fallback: ChatSampling().topP))",
       ]
     case .textCompletion:
       let systemPrompt = profile?.systemPrompt ?? "You are a helpful assistant."
@@ -629,8 +629,8 @@ public enum LocalAPICurl {
         "\"prompt\": \"Hello\"",
         "\"max_tokens\": \(profile?.sampling.maxTokens ?? ChatSampling().maxTokens)",
         "\"system\": \(jsonString(systemPrompt))",
-        "\"temperature\": \(jsonNumber(profile?.sampling.temperature ?? ChatSampling().temperature))",
-        "\"top_p\": \(jsonNumber(profile?.sampling.topP ?? ChatSampling().topP))",
+        "\"temperature\": \(jsonNumber(profile?.sampling.temperature ?? ChatSampling().temperature, fallback: ChatSampling().temperature))",
+        "\"top_p\": \(jsonNumber(profile?.sampling.topP ?? ChatSampling().topP, fallback: ChatSampling().topP))",
       ]
     }
 
@@ -666,8 +666,14 @@ public enum LocalAPICurl {
     }.joined(separator: "\n")
   }
 
-  private static func jsonNumber(_ value: Double) -> String {
-    value.rounded(.towardZero) == value ? String(Int(value)) : String(value)
+  private static func jsonNumber(_ value: Double, fallback: Double) -> String {
+    let finiteValue = value.isFinite ? value : fallback
+    let safeValue = finiteValue.isFinite ? finiteValue : 0
+    if safeValue.rounded(.towardZero) == safeValue,
+       let intValue = Int(exactly: safeValue) {
+      return String(intValue)
+    }
+    return String(safeValue)
   }
 
   private static func jsonString(_ value: String) -> String {
