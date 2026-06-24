@@ -18,9 +18,12 @@ import Foundation
 ///   then OpenAI `chat.completion.chunk` frames, terminating with
 ///   `data: [DONE]`. `model_loading` meta-frames are tolerated but
 ///   absent in v1 (pie loads at boot).
-/// * `POST /v1/inferlet` → routes through chat-completions for the
-///   only registered name (`chat-apc`); dispatch surfaces the raw
-///   SSE `data:` bytes per frame to the consumer.
+/// * `POST /v1/chat/completions` also accepts RatioThink's advanced-profile
+///   dispatch envelope (`inferlet` + `input`) for generative ToT/Best-of-N
+///   sends; dispatch surfaces the raw SSE `data:` bytes per frame to the
+///   consumer.
+/// * `POST /v1/inferlet` remains only for internal/control dispatches that are
+///   not user-facing chat sends (today: non-stream Best-of-N snapshot release).
 ///
 /// Error model ( — one code space across channels): an HTTP
 /// non-2xx whose body is an OpenAI-shape `{"error":{code,message}}`
@@ -183,8 +186,11 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
                                    timeout: self.unaryTimeout)
       })
     }
+    let path = (req.inferlet == "tree-of-thought" || req.inferlet == "best-of-n")
+      ? "/v1/chat/completions"
+      : "/v1/inferlet"
     return dispatchStream(buildRequest: {
-      try await self.makeRequest("/v1/inferlet", method: "POST", body: body,
+      try await self.makeRequest(path, method: "POST", body: body,
                                  timeout: Self.streamingIdleTimeout)
     })
   }

@@ -627,8 +627,8 @@ final class HTTPEngineClientTests: XCTestCase {
       ])
     }
     let req = InferletRequest(
-      inferlet: "chat-apc",
-      input: Data(#"{"messages":[{"role":"user","content":"hi"}]}"#.utf8)
+      inferlet: "tree-of-thought",
+      input: Data(#"{"model":"m","messages":[{"role":"user","content":"hi"}],"breadth":1,"depth":1,"beam_width":1,"max_tokens_per_node":16}"#.utf8)
     )
     var frames: [String] = []
     for try await frame in makeClient().dispatchInferlet(req) {
@@ -702,8 +702,8 @@ final class HTTPEngineClientTests: XCTestCase {
           ])
     }
     let req = InferletRequest(
-      inferlet: "chat-apc",
-      input: Data(#"{"messages":[{"role":"user","content":"hi"}]}"#.utf8)
+      inferlet: "tree-of-thought",
+      input: Data(#"{"model":"m","messages":[{"role":"user","content":"hi"}],"breadth":1,"depth":1,"beam_width":1,"max_tokens_per_node":16}"#.utf8)
     )
     var frames: [String] = []
     for try await frame in makeClient().dispatchInferlet(req) {
@@ -851,6 +851,46 @@ final class HTTPEngineClientTests: XCTestCase {
     XCTAssertEqual(top["max_tokens"] as? Int, 32)
   }
 
+  func test_dispatchInferlet_streaming_generation_posts_to_chatCompletions() async throws {
+    let captured = RequestCapture()
+    FakeSSEURLProtocol.handler = { req in
+      captured.set(req)
+      return .sse(chunks: ["data: {\"event\":\"tree_start\",\"id\":\"t\",\"model\":\"m\",\"breadth\":1,\"depth\":1,\"beam_width\":1}\n\n", "data: [DONE]\n\n"])
+    }
+    let req = InferletRequest(
+      inferlet: "tree-of-thought",
+      input: Data(#"{"model":"m","messages":[{"role":"user","content":"hi"}],"breadth":1,"depth":1,"beam_width":1,"max_tokens_per_node":16}"#.utf8),
+      stream: true
+    )
+    for try await _ in makeClient().dispatchInferlet(req) {}
+    let request = try XCTUnwrap(captured.request)
+    XCTAssertEqual(request.httpMethod, "POST")
+    XCTAssertEqual(request.url?.path, "/v1/chat/completions")
+    let bodyData = try XCTUnwrap(captured.body())
+    let top = try XCTUnwrap(JSONSerialization.jsonObject(with: bodyData) as? [String: Any])
+    XCTAssertEqual(top["inferlet"] as? String, "tree-of-thought")
+    XCTAssertEqual(top["stream"] as? Bool, true)
+    let input = try XCTUnwrap(top["input"] as? [String: Any])
+    XCTAssertEqual(input["model"] as? String, "m")
+  }
+
+  func test_dispatchInferlet_unary_control_remains_on_internalInferletRoute() async throws {
+    let captured = RequestCapture()
+    FakeSSEURLProtocol.handler = { req in
+      captured.set(req)
+      return .json(status: 200, body: #"{"requested":1,"released":1,"absent":0}"#)
+    }
+    let req = InferletRequest(
+      inferlet: "best-of-n",
+      input: Data(#"{"release":["bon/r0/1/0"]}"#.utf8),
+      stream: false
+    )
+    var frames: [Data] = []
+    for try await frame in makeClient().dispatchInferlet(req) { frames.append(frame) }
+    XCTAssertEqual(frames.count, 1)
+    XCTAssertEqual(try XCTUnwrap(captured.request).url?.path, "/v1/inferlet")
+  }
+
   // MARK: - SSE parser (line-level)
 
   func test_sse_parser_joins_multiline_data_fields() async throws {
@@ -946,18 +986,20 @@ final class HTTPEngineClientTests: XCTestCase {
   /// reintroduces the 60 s idle cap for inferlet streams (the more-
   /// restrictive request leg would default back to 60 s).
   func test_dispatchInferlet_request_carries_streaming_idle_timeout() async throws {
-    var captured: TimeInterval?
+    var captured: URLRequest?
     FakeSSEURLProtocol.handler = { request in
-      captured = request.timeoutInterval
+      captured = request
       return .sse(chunks: ["data: {\"event\":\"model_ready\"}\n\n", "data: [DONE]\n\n"])
     }
     let req = InferletRequest(
-      inferlet: "chat-apc",
-      input: Data(#"{"messages":[{"role":"user","content":"hi"}]}"#.utf8)
+      inferlet: "tree-of-thought",
+      input: Data(#"{"model":"m","messages":[{"role":"user","content":"hi"}],"breadth":1,"depth":1,"beam_width":1,"max_tokens_per_node":16}"#.utf8)
     )
     for try await _ in makeClient().dispatchInferlet(req) {}
-    XCTAssertEqual(captured, HTTPEngineClient.streamingIdleTimeout,
-                   "POST /v1/inferlet must carry the lifted idle timeout, not the 60s default")
+    XCTAssertEqual(captured?.timeoutInterval, HTTPEngineClient.streamingIdleTimeout,
+                   "streaming inferlet dispatch must carry the lifted idle timeout, not the 60s default")
+    XCTAssertEqual(captured?.url?.path, "/v1/chat/completions",
+                   "generative profile dispatch must use the public chat-completions route")
   }
 
   /// Review F1: the default `URLSession` is a process-lifetime singleton
@@ -1142,6 +1184,11 @@ private final class RequestCapture: @unchecked Sendable {
 
   func set(_ req: URLRequest) {
     lock.lock(); _request = req; lock.unlock()
+  }
+
+  var request: URLRequest? {
+    lock.lock(); defer { lock.unlock() }
+    return _request
   }
 
   /// `URLSession` strips the `httpBody` on URLRequest passed to

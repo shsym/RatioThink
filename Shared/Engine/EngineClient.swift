@@ -400,8 +400,10 @@ public struct ChatRequest: Codable, Equatable, Sendable {
   }
 }
 
-/// Body of POST /v1/inferlet — the escape hatch for any inferlet
-/// beyond `chat-apc`. The design doc requires `input` to land on the
+/// Body of an inferlet dispatch envelope. Generative profile-backed dispatches
+/// (Tree of Thought / Best of N) are sent via POST /v1/chat/completions; retained
+/// internal/control dispatches (for example Best-of-N snapshot release) still use
+/// POST /v1/inferlet. The design doc requires `input` to land on the
 /// wire as an **inline JSON sub-tree** (`"input": {...}`), not a
 /// base64 string — but the dispatcher can't know inferlet-specific
 /// schemas, so we accept opaque `Data` and require it to be valid

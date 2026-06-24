@@ -42,7 +42,7 @@ public extension Profile {
   /// `inferlet_args.mode` value that turns a profile into a Best-of-N
   /// interactive profile. Shares `dispatchModeArgKey` ("mode") with
   /// tree-of-thought; the launched `inferlet` stays `chat-apc` — Best-of-N is
-  /// a dispatch mode selected per request over `/v1/inferlet`, not a separate
+  /// a dispatch mode selected per request through `/v1/chat/completions`, not a separate
   /// wasm — so switching to it needs no new component and (model permitting)
   /// no engine relaunch.
   static let bestOfNModeValue = "best-of-n"

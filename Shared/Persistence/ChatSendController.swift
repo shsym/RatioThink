@@ -295,7 +295,7 @@ public final class ChatSendController: ObservableObject {
 
   /// Send the current turn as a **tree-of-thought** search (#413). Shares
   /// the controller's generation/cancel/`isInFlight` scaffolding with
-  /// `send` but consumes the `/v1/inferlet` SSE tree stream instead of a
+  /// `send` but consumes the advanced-profile SSE tree stream instead of a
   /// chat completion: each event folds into a `ToTTree`, snapshotted onto
   /// the assistant row's `tot` for the live tree-search view, and the
   /// `tree_complete` final answer becomes the row's `content`.
@@ -730,7 +730,7 @@ public final class ChatSendController: ObservableObject {
     return ChatCacheRetentionDirective(kvPagesUsed: used, kvPagesTotal: total)
   }
 
-  /// Build the `/v1/inferlet` dispatch body for a tree-of-thought turn.
+  /// Build the advanced-profile dispatch body for a tree-of-thought turn.
   /// The ToT `input` carries the transcript + the bounded search params
   /// (server re-validates them); `temperature`/`top_p` come from the same
   /// sampling the chat path uses. Returns nil only if the body can't be
@@ -917,7 +917,7 @@ public final class ChatSendController: ObservableObject {
     }
   }
 
-  /// Build the `/v1/inferlet` dispatch body for a Best-of-N round (#690). For a
+  /// Build the advanced-profile dispatch body for a Best-of-N round (#690). For a
   /// think-more round `resume` carries the picked snapshot + text, the unpicked
   /// siblings to drop, and the new level; its fields are omitted (round 1) when
   /// nil.
@@ -1161,7 +1161,7 @@ public final class ChatSendController: ObservableObject {
   }
 }
 
-/// JSON body for the tree-of-thought `/v1/inferlet` dispatch `input`.
+/// JSON body for the tree-of-thought advanced-profile dispatch `input`.
 /// snake_case keys mirror the engine's `TotInput` schema; `temperature` /
 /// `top_p` come from the shared sampling, the rest from the ToT profile.
 private struct ToTRequestInput: Encodable {
@@ -1182,7 +1182,7 @@ private struct ToTRequestInput: Encodable {
   }
 }
 
-/// `/v1/inferlet` dispatch body for a Best-of-N round (#690). Round-1 leaves
+/// Advanced-profile dispatch body for a Best-of-N round (#690). Round-1 leaves
 /// the resume fields nil → the synthesized `Encodable` omits them
 /// (`encodeIfPresent`), so the server reads it as a fresh round.
 private struct BestOfNRequestInput: Encodable {
@@ -1241,7 +1241,7 @@ struct BestOfNReleaseAck: Decodable, Equatable {
 
 /// Failure constructing a tree-of-thought send.
 public enum ToTSendError: Error, Equatable, Sendable {
-  /// The `/v1/inferlet` dispatch body could not be JSON-encoded.
+  /// The advanced-profile dispatch body could not be JSON-encoded.
   case requestEncodingFailed
 }
 

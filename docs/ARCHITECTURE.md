@@ -107,8 +107,8 @@ OpenAI-compatible HTTP surface (`HTTPEngineClient`):
 |----------|-------|
 | `GET /healthz` | `{"status":"ok"}` liveness. |
 | `GET /v1/models` | `{"object":"list","data":[{id,object,owned_by}]}`. |
-| `POST /v1/chat/completions` | **SSE** stream: a `{"event":"model_ready"}` meta-frame, then OpenAI `chat.completion.chunk` deltas, ending in `data: [DONE]`. |
-| `POST /v1/inferlet` | Raw inferlet dispatch (v1 routes only `chat-apc`). |
+| `POST /v1/chat/completions` | **SSE** stream for normal Chat/Repeat Boost/JSON Think, plus advanced-profile dispatch envelopes for Tree of Thought and Best of N. Normal chat emits OpenAI chunks; advanced profiles emit their existing tree/Best-of-N SSE frames. |
+| `POST /v1/inferlet` | Internal/raw/control dispatch only (for example non-stream Best-of-N snapshot release); not the public/user-facing profile-send route. |
 
 Streaming is consumed with `URLSession.bytes(for:)`, so cancelling the consumer
 cancels the network task. Tokens land in the UI via `ChatSendController` →
@@ -124,8 +124,8 @@ its HTTP listener and routes each request to it (`Inferlets/chat-apc/src/lib.rs`
 |---------------|---------|------|
 | `GET /healthz` | `control::health` | Liveness. |
 | `GET /v1/models` | `control::models` | List the model registered at boot. |
-| `POST /v1/chat/completions` | `chat::completions` | Generate; stream OpenAI SSE chunks. |
-| `POST /v1/inferlet` | `chat::dispatch` | Raw dispatch (v1: chat-apc only). |
+| `POST /v1/chat/completions` | `chat::completions` | Generate normal chat or route advanced-profile envelopes (`inferlet` + `input`) to ToT/Best-of-N internals. |
+| `POST /v1/inferlet` | `chat::dispatch` | Internal/raw/control dispatch retained for non-public operations. |
 
 "APC" is **A**daptive **P**ersonality/**C**apability: the chat loop runs decoder
 wrappers (`chat/apc.rs`) alongside the base decoder. The reasoning decoder emits

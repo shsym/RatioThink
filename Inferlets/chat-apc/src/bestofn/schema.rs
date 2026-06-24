@@ -21,7 +21,7 @@ const MAX_MAX_REASONING_TOKENS: usize = 4096;
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const DEFAULT_TOP_P: f32 = 0.95;
 
-/// Raw best-of-n request payload (`input` of a `/v1/inferlet` dispatch).
+/// Raw best-of-n request payload (`input` of the chat-completions advanced-profile dispatch envelope; also used by the retained internal `/v1/inferlet` control/raw path).
 #[derive(Clone, Deserialize, Default)]
 pub struct BestOfNInput {
     pub model: Option<String>,
