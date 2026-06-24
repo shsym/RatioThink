@@ -47,14 +47,19 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
     defer { app.terminate() }
     let panel = openLocalAPIPanel(in: app)
 
-    // #2: the seeded plain "Chat" profile (and the others) are selectable tabs.
+    // #2: the seeded profiles are selectable as example shapers, not as a
+    // standalone served-engine selector.
+    XCTAssertTrue(app.staticTexts["Example profile"].waitForExistence(timeout: 10),
+                  "the profile selector must be labeled as example shaping; app tree: \(app.debugDescription)")
     let tabs = app.descendants(matching: .any).matching(identifier: "LocalAPIProfileTabs").firstMatch
     XCTAssertTrue(tabs.waitForExistence(timeout: 10),
-                  "Local API profile tabs missing; app tree: \(app.debugDescription)")
+                  "Local API example profile tabs missing; app tree: \(app.debugDescription)")
+    XCTAssertFalse(app.descendants(matching: .any).matching(identifier: "LocalAPISelectedProfile").firstMatch.exists,
+                   "the Local API pane must not show a redundant profile-level Model/Running row")
     XCTAssertTrue(profileSegment("Chat", in: app).waitForExistence(timeout: 5),
-                  "the plain 'Chat' profile must be a selectable tab in the Local API panel; app tree: \(app.debugDescription)")
+                  "the plain 'Chat' profile must be a selectable example profile; app tree: \(app.debugDescription)")
     XCTAssertTrue(profileSegment("Repeat Boost", in: app).exists,
-                  "seeded profiles must all be listed; 'Repeat Boost' missing; app tree: \(app.debugDescription)")
+                  "seeded profiles must all be listed for examples; 'Repeat Boost' missing; app tree: \(app.debugDescription)")
 
     // #3: the curl example defaults to streaming, and the toggle flips it to a
     // single (non-streaming) JSON request.
@@ -67,6 +72,8 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
     let toggle = app.descendants(matching: .any).matching(identifier: "LocalAPIStreamingToggle").firstMatch
     XCTAssertTrue(toggle.waitForExistence(timeout: 5),
                   "streaming on/off toggle missing in the Local API panel; app tree: \(app.debugDescription)")
+    XCTAssertEqual(toggle.label, "Streaming responses",
+                   "hidden-label trailing switch must keep a VoiceOver-readable label")
     toggle.click()
 
     let nonStreaming = NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@",
@@ -103,50 +110,35 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
                    "a same-model switch must not stop the engine (no 'Off')")
   }
 
-  /// #663: the per-profile "Running" badge (next to the selected profile's
-  /// model, id `LocalAPISelectedProfile`) must stay meaningful after a
-  /// same-model switch. The header status label is a sibling that also reads
-  /// "Running", so this scopes the assertion to the selected-profile row —
-  /// before #663 the badge was gated on the boot profile id and vanished when
-  /// the user switched to a same-model sibling.
   @MainActor
-  func test_same_model_switch_keeps_per_profile_running_badge() throws {
+  func test_example_profile_switch_shapes_curl_without_profile_status_row() throws {
     let app = launchPinnedRunning()
     defer { app.terminate() }
     _ = openLocalAPIPanel(in: app)
 
-    // Boot profile shows the badge to begin with.
-    XCTAssertTrue(selectedProfileRowShowsRunning(in: app, timeout: 10),
-                  "the booted profile must show its 'Running' badge; app tree: \(app.debugDescription)")
+    XCTAssertTrue(app.staticTexts["Example profile"].waitForExistence(timeout: 10),
+                  "profile selection should be scoped to API examples; app tree: \(app.debugDescription)")
+    XCTAssertFalse(app.descendants(matching: .any).matching(identifier: "LocalAPISelectedProfile").firstMatch.exists,
+                   "demoted example profile selection must not render a profile-level Model/Running status row")
+    let curl = app.descendants(matching: .any).matching(identifier: "LocalAPICurl").firstMatch
+    XCTAssertTrue(curl.waitForExistence(timeout: 10),
+                  "curl example missing while serving; app tree: \(app.debugDescription)")
 
-    // Switch to a same-model sibling (chat → repeat-boost). The badge must
-    // follow the served model, not the boot profile id.
     let repeatBoost = profileSegment("Repeat Boost", in: app)
     XCTAssertTrue(repeatBoost.waitForExistence(timeout: 10),
-                  "Repeat Boost tab missing; app tree: \(app.debugDescription)")
+                  "Repeat Boost example profile tab missing; app tree: \(app.debugDescription)")
     repeatBoost.click()
 
-    XCTAssertTrue(selectedProfileRowShowsRunning(in: app, timeout: 5),
-                  "after a same-model switch the selected profile must still show 'Running'; app tree: \(app.debugDescription)")
+    let repeatBoostProfileID = NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@",
+                                           "\"profile_id\": \"repeat-boost\"",
+                                           "\"profile_id\": \"repeat-boost\"")
+    expectation(for: repeatBoostProfileID, evaluatedWith: curl)
+    waitForExpectations(timeout: 5) { error in
+      XCTAssertNil(error, "switching example profile must rewrite the curl body; curl=\(self.curlText(curl).debugDescription)")
+    }
   }
 
   // MARK: - helpers
-
-  /// Whether the selected-profile row's green "Running" badge is present.
-  ///
-  /// SwiftUI exposes the row (id `LocalAPISelectedProfile`) as a single
-  /// StaticText whose accessibility VALUE becomes "Running" when the badge
-  /// renders, so this matches on `identifier == LocalAPISelectedProfile AND
-  /// value CONTAINS "Running"` — scoping by identifier excludes the sibling
-  /// header status label (`LocalAPIStatus`, which also reads "Running"), and
-  /// waiting on the value handles the async snapshot/selection update.
-  @MainActor
-  private func selectedProfileRowShowsRunning(in app: XCUIApplication, timeout: TimeInterval) -> Bool {
-    let badge = app.descendants(matching: .any).matching(
-      NSPredicate(format: "identifier == %@ AND value CONTAINS %@",
-                  "LocalAPISelectedProfile", "Running")).firstMatch
-    return badge.waitForExistence(timeout: timeout)
-  }
 
   @MainActor
   private func launchPinnedRunning() -> XCUIApplication {

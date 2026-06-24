@@ -107,7 +107,6 @@ struct LocalAPIView: View {
         if let engineActionError {
           actionErrorRow(engineActionError)
         }
-        profileExplorerSection
         if let helperBlock {
           HelperUnavailableNotice(reason: helperBlock, onDismiss: { self.helperBlock = nil })
         }
@@ -273,6 +272,7 @@ struct LocalAPIView: View {
         )
       }
 
+      exampleProfileSection
       endpointsSection(profile: selectedProfile)
       if let model = state.servedModelID {
         curlSection(baseURL: baseURL, model: model, profile: selectedProfile)
@@ -294,46 +294,33 @@ struct LocalAPIView: View {
     }
   }
 
-  private var profileExplorerSection: some View {
+  private var exampleProfileSection: some View {
     VStack(alignment: .leading, spacing: 8) {
-      sectionHeader("Profiles")
+      sectionHeader("Examples")
+      Text("Choose which profile shapes the endpoint list and curl body. The local API still serves only the model shown above.")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
       if profileOptions.isEmpty {
         Text("No valid profiles are available yet.")
           .font(.callout)
           .foregroundStyle(.secondary)
       } else {
-        Picker("Profile", selection: profileSelectionBinding) {
-          ForEach(profileOptions) { option in
-            Text(option.title).tag(option.id)
-          }
-        }
-        .pickerStyle(.segmented)
-        .disabled(!profileSelectionEnabled)
-        .accessibilityIdentifier("LocalAPIProfileTabs")
-
-        if let selected = selectedProfileOption {
-          HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("Model")
-              .foregroundStyle(.secondary)
-            Spacer()
-            Text(selected.modelDisplayName)
-              .font(.system(.body, design: .monospaced))
-              .lineLimit(1)
-            if selected.isServedLive {
-              Text("Running")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.green)
+        VStack(alignment: .leading, spacing: 4) {
+          Text("Example profile")
+            .font(.callout.weight(.semibold))
+          Picker("Example profile", selection: profileSelectionBinding) {
+            ForEach(profileOptions) { option in
+              Text(option.title).tag(option.id)
             }
           }
-          .accessibilityIdentifier("LocalAPISelectedProfile")
+          .pickerStyle(.segmented)
+          .disabled(!profileSelectionEnabled)
+          .accessibilityLabel("Example profile")
+          .accessibilityIdentifier("LocalAPIProfileTabs")
         }
       }
     }
-  }
-
-  private var selectedProfileOption: LocalAPIProfileOption? {
-    guard let selectedOrActiveProfileID else { return nil }
-    return profileOptions.first { $0.id == selectedOrActiveProfileID }
   }
 
   private var selectedProfile: Profile? {
@@ -387,19 +374,13 @@ struct LocalAPIView: View {
         }
         .controlSize(.small)
       }
-      Toggle(isOn: $streamingEnabled) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("Streaming responses")
-          Text(streamingEnabled
-               ? "stream: true — tokens arrive as Server-Sent Events."
-               : "stream: false — one complete JSON response per request.")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-        }
-      }
-      .toggleStyle(.switch)
-      .accessibilityIdentifier("LocalAPIStreamingToggle")
+      trailingSwitchRow(
+        title: "Streaming responses",
+        caption: streamingEnabled
+          ? "stream: true — tokens arrive as Server-Sent Events."
+          : "stream: false — one complete JSON response per request.",
+        isOn: $streamingEnabled,
+        identifier: "LocalAPIStreamingToggle")
       Text(snippet)
         .font(.system(.body, design: .monospaced))
         .textSelection(.enabled)
@@ -415,17 +396,11 @@ struct LocalAPIView: View {
   private var configurationSection: some View {
     VStack(alignment: .leading, spacing: 10) {
       sectionHeader("Configuration")
-      Toggle(isOn: autoStartBinding) {
-        VStack(alignment: .leading, spacing: 2) {
-          Text("Start Local API when RatioThink opens")
-          Text("When enabled, the engine starts after launch; API and chat both come online.")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-        }
-      }
-      .toggleStyle(.switch)
-      .accessibilityIdentifier("LocalAPIAutoStartToggle")
+      trailingSwitchRow(
+        title: "Start Local API when RatioThink opens",
+        caption: "When enabled, the engine starts after launch; API and chat both come online.",
+        isOn: autoStartBinding,
+        identifier: "LocalAPIAutoStartToggle")
 
       postureRow(title: "Profile", value: profileStore.activeProfileID ?? "Choose a profile in the chat toolbar.")
       Text("Port and authentication are fixed and can’t be configured. Use the switch at the top for on/off.")
@@ -446,10 +421,11 @@ struct LocalAPIView: View {
   private var securitySection: some View {
     VStack(alignment: .leading, spacing: 8) {
       sectionHeader("Security")
-      Toggle("Allow access from other devices", isOn: externalAccessBinding)
-        .toggleStyle(.switch)
-        .disabled(!state.externalAccessToggleEnabled)
-        .accessibilityIdentifier("LocalAPIExternalAccessToggle")
+      trailingSwitchRow(
+        title: "Allow access from other devices",
+        isOn: externalAccessBinding,
+        isDisabled: !state.externalAccessToggleEnabled,
+        identifier: "LocalAPIExternalAccessToggle")
       if let warningTitle = posture.warningTitle,
          let warningDetail = posture.warningDetail {
         HStack(alignment: .top, spacing: 8) {
@@ -485,6 +461,33 @@ struct LocalAPIView: View {
       get: { appPreferences.localAPIExternalAccessEnabled },
       set: { setExternalAccess($0) }
     )
+  }
+
+  private func trailingSwitchRow(
+    title: String,
+    caption: String? = nil,
+    isOn: Binding<Bool>,
+    isDisabled: Bool = false,
+    identifier: String
+  ) -> some View {
+    HStack(alignment: .firstTextBaseline, spacing: 12) {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(title)
+        if let caption {
+          Text(caption)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      Spacer(minLength: 16)
+      Toggle(title, isOn: isOn)
+        .toggleStyle(.switch)
+        .labelsHidden()
+        .disabled(isDisabled)
+        .accessibilityLabel(title)
+        .accessibilityIdentifier(identifier)
+    }
   }
 
   private func postureRow(title: String, value: String) -> some View {
