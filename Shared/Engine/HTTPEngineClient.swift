@@ -14,13 +14,13 @@ import Foundation
 ///   `EngineHealth` makes those optional).
 /// * `GET /v1/models` → `{"object":"list","data":[{"id","object","owned_by"}]}`
 ///   (no `created` yet — `ModelInfo.created` is optional).
-/// * `POST /v1/chat/completions` → SSE: meta-frame `{"event":"model_ready"}`
-///   then OpenAI `chat.completion.chunk` frames, terminating with
-///   `data: [DONE]`. `model_loading` meta-frames are tolerated but
-///   absent in v1 (pie loads at boot).
-/// * `POST /v1/inferlet` → routes through chat-completions for the
-///   only registered name (`chat-apc`); dispatch surfaces the raw
-///   SSE `data:` bytes per frame to the consumer.
+/// * `POST /v1/chat/completions` → SSE generation (meta-frame
+///   `{"event":"model_ready"}`, then OpenAI `chat.completion.chunk` frames,
+///   terminating with `data: [DONE]`) and non-stream Best-of-N release
+///   control acks. `model_loading` meta-frames are tolerated but absent in v1
+///   (pie loads at boot).
+/// * `POST /v1/inferlet` → legacy/raw streaming inferlet dispatch; dispatch
+///   surfaces the raw SSE `data:` bytes per frame to the consumer.
 ///
 /// Error model ( — one code space across channels): an HTTP
 /// non-2xx whose body is an OpenAI-shape `{"error":{code,message}}`
@@ -163,23 +163,25 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
     } catch {
       return AsyncThrowingStream { $0.finish(throwing: error) }
     }
-    // Transport decision (#703): `/v1/inferlet` CONTROL calls (`stream: false`,
-    // e.g. Best-of-N snapshot release) get a UNARY buffered response, not SSE.
-    // The inferlet returns a plain `application/json` ack, and the pie host
-    // proxies the guest's `wasi:http` response verbatim, so a `stream: false`
-    // request already comes back as one complete unary body. Routing it
+    // Transport decision (#797, building on #703): Best-of-N snapshot release
+    // is a non-stream control request but no longer goes through the legacy
+    // `/v1/inferlet` endpoint. Match the release payload itself (not merely
+    // `inferlet == "best-of-n" && stream == false`) so accidental non-release
+    // dispatches do not lose the legacy route's behavior. The chat-apc server
+    // shares the dispatch arm behind `/v1/chat/completions`, so route the same
+    // dispatch-shaped JSON body there and keep the UNARY buffered response path.
+    // The inferlet returns a plain `application/json` ack; routing that ack
     // through the SSE frame reader would strip it (only `data:`-prefixed lines
-    // survive) and the caller would see zero frames — so read the body whole
-    // and hand it back as the stream's single frame. Generative calls
-    // (`stream: true`) keep the SSE path. The `req.stream` flag already rides
-    // the wire as the caller's intent, so this is the transport switch for
-    // control ops — but note (review F3) the unary path's single connect-loss
-    // retry below is sound ONLY for IDEMPOTENT control ops (today: release,
-    // where re-deleting reports `absent`). A future NON-idempotent control op
-    // must opt out of that retry before routing here, or it could double-execute.
+    // survive) and the caller would see zero frames. Generative calls
+    // (`stream: true`) keep the raw inferlet SSE path. The unary path's
+    // single connect-loss retry remains sound only for IDEMPOTENT control ops
+    // (today: release, where re-deleting reports `absent`); future
+    // non-idempotent control ops must opt out before routing here, or they
+    // could double-execute.
     if !req.stream {
+      let path = Self.isBestOfNRelease(req) ? "/v1/chat/completions" : "/v1/inferlet"
       return dispatchUnary(buildRequest: {
-        try await self.makeRequest("/v1/inferlet", method: "POST", body: body,
+        try await self.makeRequest(path, method: "POST", body: body,
                                    timeout: self.unaryTimeout)
       })
     }
@@ -187,6 +189,14 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
       try await self.makeRequest("/v1/inferlet", method: "POST", body: body,
                                  timeout: Self.streamingIdleTimeout)
     })
+  }
+
+  private static func isBestOfNRelease(_ req: InferletRequest) -> Bool {
+    guard req.inferlet == "best-of-n", !req.stream,
+          let object = try? JSONSerialization.jsonObject(with: req.input) as? [String: Any],
+          let release = object["release"] as? [Any]
+    else { return false }
+    return !release.isEmpty
   }
 
   // MARK: - Stream implementations
@@ -316,8 +326,8 @@ public final class HTTPEngineClient: EngineClient, @unchecked Sendable {
     }
   }
 
-  /// Unary `/v1/inferlet` dispatch (#703): buffer the full `application/json`
-  /// body and yield it as the stream's single frame, so a control inferlet's
+  /// Unary dispatch (#703/#797): buffer the full `application/json` body and
+  /// yield it as the stream's single frame, so a control inferlet's
   /// non-SSE ack survives the `AsyncThrowingStream<Data, Error>` contract that
   /// `dispatchInferlet` shares with the streaming path. Callers consume both
   /// transports identically — one or many `Data` frames.
