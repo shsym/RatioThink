@@ -33,6 +33,45 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertEqual(s.statusLabel, "Starting…")
   }
 
+  func test_starting_while_helper_not_ready_shows_helper_preparation_status() {
+    let s = LocalAPIState.make(
+      status: .starting,
+      hasActiveProfile: true,
+      helperHealth: .reconnecting(consecutiveFailures: 1))
+
+    XCTAssertFalse(s.isServing)
+    XCTAssertNil(s.port)
+    XCTAssertTrue(s.toggleOn, "optimistic power toggle should stay ON while helper prep is part of start")
+    XCTAssertFalse(s.toggleEnabled, "helper prep is still a pending start, so the toggle remains disabled")
+    XCTAssertEqual(s.statusLabel, "Preparing the helper…")
+    XCTAssertEqual(s.detail, "Waiting for the background helper to connect before the engine launch continues.")
+  }
+
+  func test_starting_with_healthy_helper_keeps_engine_launch_status() {
+    let s = LocalAPIState.make(status: .starting, hasActiveProfile: true, helperHealth: .healthy)
+
+    XCTAssertTrue(s.toggleOn)
+    XCTAssertFalse(s.toggleEnabled)
+    XCTAssertEqual(s.statusLabel, "Starting…")
+    XCTAssertEqual(s.detail, "Available once the model finishes loading.")
+  }
+
+  func test_helper_health_only_changes_starting_copy() {
+    XCTAssertEqual(
+      LocalAPIState.make(
+        status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat", servedModelID: "m")),
+        hasActiveProfile: true,
+        helperHealth: .reconnecting(consecutiveFailures: 1)
+      ).statusLabel,
+      "Running")
+    XCTAssertEqual(
+      LocalAPIState.make(status: .stopped, hasActiveProfile: true, helperHealth: .reconnecting(consecutiveFailures: 1)).statusLabel,
+      "Off")
+    XCTAssertEqual(
+      LocalAPIState.make(status: .failed(code: .spawnFailed, message: "boom"), hasActiveProfile: true, helperHealth: .reconnecting(consecutiveFailures: 1)).statusLabel,
+      "Engine failed")
+  }
+
   func test_stopping_is_off_and_disabled() {
     let s = LocalAPIState.make(status: .stopping, hasActiveProfile: true)
     XCTAssertFalse(s.toggleOn)

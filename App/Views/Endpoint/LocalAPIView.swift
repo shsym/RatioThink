@@ -26,6 +26,7 @@ struct LocalAPIView: View {
   @EnvironmentObject private var profileStore: ProfileStore
   @EnvironmentObject private var engineClientStore: EngineClientStore
   @EnvironmentObject private var appPreferences: AppPreferences
+  @EnvironmentObject private var helperHealth: HelperHealthController
   /// #616: the shared engine coordinator. All engine actuation on this surface
   /// (start / stop, plus the bind-mode change sequence composed below) routes
   /// through it, so the chat scaffold and the Local API view never open-code two
@@ -59,7 +60,8 @@ struct LocalAPIView: View {
   private var state: LocalAPIState {
     LocalAPIState.make(
       status: engineStatusStore.status,
-      hasActiveProfile: profileStore.activeProfileID != nil
+      hasActiveProfile: profileStore.activeProfileID != nil,
+      helperHealth: helperHealth.health
     )
   }
 
