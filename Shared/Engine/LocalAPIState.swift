@@ -258,6 +258,31 @@ public enum LocalAPIBindModeChange {
   }
 }
 
+/// Small pure helper for LocalAPIView's optimistic power-switch intent.
+///
+/// The live reducer still owns the real lifecycle state. This helper only
+/// answers two UI questions: what should the binding read while an intent is
+/// pending, and when has the polled engine status reached a state that should
+/// hand control back to the reducer.
+public enum LocalAPIPowerIntent {
+  public static func displayToggleOn(pendingPowerOn: Bool?, liveToggleOn: Bool) -> Bool {
+    pendingPowerOn ?? liveToggleOn
+  }
+
+  public static func reconciledPendingPowerOn(_ pendingPowerOn: Bool?,
+                                              status: EngineStatus) -> Bool? {
+    guard let pendingPowerOn else { return nil }
+    switch status {
+    case .starting:
+      return pendingPowerOn ? pendingPowerOn : nil
+    case .stopping:
+      return pendingPowerOn ? nil : pendingPowerOn
+    case .running, .stopped, .failed:
+      return nil
+    }
+  }
+}
+
 /// Synchronous decision for runtime profile switches from the Local API
 /// surface. It exists so the view can resolve a selection immediately, before
 /// SwiftUI observes `.stopping`/`.starting` from the poll channel.

@@ -62,6 +62,34 @@ final class LocalAPIStateTests: XCTestCase {
     XCTAssertEqual(EngineHTTPBindMode.external.baseURLHost, "0.0.0.0")
   }
 
+  func test_power_intent_makes_binding_read_optimistic_value_before_status_changes() {
+    XCTAssertTrue(LocalAPIPowerIntent.displayToggleOn(pendingPowerOn: true, liveToggleOn: false),
+                  "tap-on should render ON immediately before status leaves stopped")
+    XCTAssertFalse(LocalAPIPowerIntent.displayToggleOn(pendingPowerOn: false, liveToggleOn: true),
+                   "confirmed tap-off should render OFF immediately before status leaves running")
+    XCTAssertTrue(LocalAPIPowerIntent.displayToggleOn(pendingPowerOn: nil, liveToggleOn: true),
+                  "without a pending intent the binding should reflect live state")
+  }
+
+  func test_power_intent_reconciles_on_terminal_status_and_rolls_back_failures() {
+    XCTAssertEqual(LocalAPIPowerIntent.reconciledPendingPowerOn(true, status: .starting), true,
+                   "pending start should stay optimistic while still starting")
+    XCTAssertNil(LocalAPIPowerIntent.reconciledPendingPowerOn(true, status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat"))),
+                 "running confirms tap-on and hands control back to live status")
+    XCTAssertNil(LocalAPIPowerIntent.reconciledPendingPowerOn(true, status: .stopped),
+                 "stopped contradicts tap-on and rolls back to live OFF")
+    XCTAssertNil(LocalAPIPowerIntent.reconciledPendingPowerOn(true, status: .failed(code: .spawnFailed, message: "boom")),
+                 "failed start contradicts tap-on and rolls back to live OFF")
+
+    XCTAssertEqual(LocalAPIPowerIntent.reconciledPendingPowerOn(false, status: .stopping), false,
+                   "pending stop should stay optimistic while still stopping")
+    XCTAssertNil(LocalAPIPowerIntent.reconciledPendingPowerOn(false, status: .stopped),
+                 "stopped confirms tap-off and hands control back to live status")
+    XCTAssertNil(LocalAPIPowerIntent.reconciledPendingPowerOn(false, status: .running(EngineSessionSnapshot(port: 8123, profileID: "chat"))),
+                 "running contradicts tap-off so the switch snaps back ON")
+    XCTAssertNil(LocalAPIPowerIntent.reconciledPendingPowerOn(false, status: .failed(code: .spawnFailed, message: "boom")),
+                 "failed is terminal, so no optimistic stop intent stays stuck")
+  }
 
   func test_power_toggle_lifecycle_sequence_is_derived_from_status() {
     let starting = LocalAPIState.make(status: .starting, hasActiveProfile: true)
