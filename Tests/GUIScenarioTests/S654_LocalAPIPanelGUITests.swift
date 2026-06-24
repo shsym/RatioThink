@@ -11,17 +11,13 @@ import XCTest
 ///  · #3 a streaming on/off toggle drives the curl example's `stream` field —
 ///    `chat-apc` serves both `stream: true` (SSE) and `stream: false` (one JSON
 ///    body), and the panel shows how to request each;
-///  · #1 selecting a SAME-MODEL profile keeps the panel "Running" and updates
-///    the selection — it does not knock the engine offline. (The relaunch
-///    DECISION itself is exhaustively + mutation-proven in
-///    `LocalAPIStateTests` — `LocalAPIProfileSwitchGate.decide` returns
-///    `.selectOnly` for a same-model switch. The sandboxed XCUITest runner
-///    cannot spawn a real `pie`, so a real engine relaunch / port change is not
-///    observable here; this asserts the user-visible steady state.)
+///  · #1 selecting an example profile keeps the panel "Running" and rewrites
+///    only the examples — it does not knock the engine offline or change the
+///    served profile. Served-profile switching now lives in the chat toolbar.
 ///
 /// Engine-free + deterministic: `PIE_TEST_PIN_ENGINE_RUNNING` pins a running
-/// engine whose served model equals the seeded profiles' default model, so a
-/// `chat → repeat-boost` switch is a same-model switch. The non-sandboxed app
+/// engine whose served model equals the seeded profiles' default model, so
+/// example-profile changes can be asserted without a real helper. The non-sandboxed app
 /// auto-seeds the chat / repeat-boost / json-think / tree-of-thought profiles
 /// into the isolated `PIE_HOME`.
 final class S654_LocalAPIPanelGUITests: XCTestCase {
@@ -90,13 +86,13 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
   }
 
   @MainActor
-  func test_same_model_profile_switch_keeps_the_engine_running() throws {
+  func test_example_profile_switch_keeps_the_engine_running() throws {
     let app = launchPinnedRunning()
     defer { app.terminate() }
     _ = openLocalAPIPanel(in: app)
 
-    // Switch chat → repeat-boost (both serve the pinned model): a same-model
-    // switch. The panel must stay "Running" — no teardown, no "Starting…"/"Off".
+    // Switch the example profile. The panel must stay "Running" — no served
+    // engine profile change, teardown, or "Starting…"/"Off".
     let repeatBoost = profileSegment("Repeat Boost", in: app)
     XCTAssertTrue(repeatBoost.waitForExistence(timeout: 10),
                   "Repeat Boost tab missing; app tree: \(app.debugDescription)")
@@ -104,11 +100,11 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
 
     let runningLabel = app.staticTexts["Running"].firstMatch
     XCTAssertTrue(runningLabel.waitForExistence(timeout: 5),
-                  "a same-model profile switch must keep the engine Running; app tree: \(app.debugDescription)")
+                  "an example profile switch must keep the engine Running; app tree: \(app.debugDescription)")
     XCTAssertFalse(app.staticTexts["Starting…"].exists,
-                   "a same-model switch must not relaunch the engine (no 'Starting…')")
+                   "an example profile switch must not relaunch the engine (no 'Starting…')")
     XCTAssertFalse(app.staticTexts["Off"].exists,
-                   "a same-model switch must not stop the engine (no 'Off')")
+                   "an example profile switch must not stop the engine (no 'Off')")
   }
 
   @MainActor

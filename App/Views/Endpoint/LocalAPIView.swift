@@ -27,19 +27,16 @@ struct LocalAPIView: View {
   @EnvironmentObject private var engineClientStore: EngineClientStore
   @EnvironmentObject private var appPreferences: AppPreferences
   /// #616: the shared engine coordinator. All engine actuation on this surface
-  /// (start / stop, plus the bind-mode change and profile-restart sequences
-  /// composed below) routes through it, so the chat scaffold and the Local API
-  /// view never open-code two separate paths to start or stop the one engine.
-  /// The Local-API-specific orchestration (external-access bind-mode change,
-  /// profile-switch restart) stays here — it composes the coordinator's
-  /// primitives rather than duplicating them.
+  /// (start / stop, plus the bind-mode change sequence composed below) routes
+  /// through it, so the chat scaffold and the Local API view never open-code two
+  /// separate paths to start or stop the one engine. Served-profile switching is
+  /// managed by the chat toolbar; this view's profile picker shapes examples only.
   @EnvironmentObject private var engineCoordinator: ChatEngineCoordinator
 
   @State private var memory: EngineMemorySample?
   @State private var health: EngineHealth.Status?
   @State private var confirmStop = false
   @State private var exampleProfileID: String?
-  @State private var profileRestartInFlight = false
   /// #654: drives the example/route surface only — `stream: true` (SSE) vs
   /// `stream: false` (single JSON body). The engine serves both; this toggle
   /// shapes the curl snippet and the chat-completions route summary so a user
@@ -593,32 +590,6 @@ struct LocalAPIView: View {
     }
   }
 
-  private func selectProfile(_ profileID: String) {
-    // #654: only a switch that changes the SERVED MODEL relaunches the engine.
-    // A same-model switch (e.g. Chat → Repeat Boost, both Qwen3-0.6B) keeps the
-    // engine up — the new profile's sampling / speculation / constraint /
-    // tree-of-thought params apply per request, not at boot.
-    let outcome = LocalAPIProfileSwitchGate.decide(
-      selectedProfileID: profileID,
-      selectedModelID: profileOptions.first { $0.id == profileID }?.modelID,
-      runtimeProfileID: runtimeProfileID,
-      runtimeModelID: runtimeServedModelID,
-      state: state,
-      restartInFlight: &profileRestartInFlight
-    )
-    guard outcome != .reject else { return }
-    do {
-      try profileStore.setActiveProfileID(profileID)
-    } catch {
-      profileRestartInFlight = false
-      engineActionError = "Couldn't select profile: \(error)"
-      return
-    }
-    if outcome == .restart {
-      restartEngine(profileID: profileID)
-    }
-  }
-
   private func setExternalAccess(_ enabled: Bool) {
     let profileID = runtimeProfileID ?? startProfileID
     Task { @MainActor in
@@ -634,22 +605,6 @@ struct LocalAPIView: View {
             guard let profileID, !profileID.isEmpty else { return }
             try await engineCoordinator.startEngine(profileID: profileID, daemonBindHost: requestedMode)
           }
-        )
-      } catch {
-        engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "switch")
-      }
-    }
-  }
-
-  private func restartEngine(profileID: String) {
-    Task { @MainActor in
-      engineActionError = nil
-      defer { profileRestartInFlight = false }
-      do {
-        try await engineCoordinator.stopEngine()
-        try await engineCoordinator.startEngine(
-          profileID: profileID,
-          daemonBindHost: bindMode
         )
       } catch {
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "switch")

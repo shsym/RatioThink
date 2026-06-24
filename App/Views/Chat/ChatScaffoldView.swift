@@ -312,8 +312,8 @@ struct ChatScaffoldView: View {
   /// onto the new profile's served model when (and only when) the engine is
   /// already running a DIFFERENT model. The model-change decision routes
   /// through the shared `LocalAPIProfileSwitchGate` (via
-  /// `profileSwapEngineOutcome`) so the chat swap and the Local API panel agree
-  /// on what counts as a model-changing switch. The relaunch itself routes
+  /// `profileSwapEngineOutcome`) so chat-toolbar profile swaps use the same
+  /// model-aware switch policy introduced for #654. The relaunch itself routes
   /// through the SAME stream-aware, target-bound engine-mutation path as the
   /// pinned-mismatch relaunch and the explicit Load button
   /// (`engineMutationDecision` → `loadDefaultModel` /
@@ -1602,8 +1602,8 @@ struct ChatScaffoldView: View {
   }
 
   /// #673: decide whether a chat-toolbar profile swap must reload the engine.
-  /// Reuses the model-aware `LocalAPIProfileSwitchGate` (from #654) so the
-  /// chat swap and the Local API panel share ONE relaunch policy. The model
+  /// Reuses the model-aware `LocalAPIProfileSwitchGate` (from #654) for the
+  /// chat-toolbar served-profile relaunch policy. The model
   /// the new profile would boot is the chat's pin-over-default resolution
   /// (`ModelTarget.resolve`) — exactly what `startEngineForSelectedProfile`
   /// boots (`chats.first?.modelID`, else the profile default). A running
