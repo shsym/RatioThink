@@ -714,9 +714,24 @@ public final class ChatSendController: ObservableObject {
       .compactMap { message in
         guard let role = ChatMessage.Role(rawValue: message.role) else { return nil }
         guard !Self.excludesFromRequestHistory(message, role: role) else { return nil }
-        return ChatMessage(role: role, content: message.content)
+        return ChatMessage(role: role, content: foldedContent(for: message, role: role))
       })
     return turns
+  }
+
+  private static func foldedContent(for message: Message, role: ChatMessage.Role) -> String {
+    guard role == .user,
+          let attachmentText = message.extractedAttachmentText,
+          !attachmentText.isEmpty else {
+      return message.content
+    }
+    return """
+    \(message.content)
+
+    [Attached file context]
+    \(attachmentText)
+    [/Attached file context]
+    """
   }
 
   private static func retentionDirective(from snapshot: KVUsageSnapshot?,

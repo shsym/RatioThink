@@ -47,6 +47,12 @@ public final class Message {
   /// silently drop to an empty in-memory store, making the user's chat
   /// history appear gone (the on-disk data is intact, just unopened).
   public var reasoning: String = ""
+  /// Extracted text from user-attached files for this turn. Kept out of
+  /// `content` so transcript bubbles display only the user's typed text; the
+  /// send pipeline folds it into outgoing prompt context at replay time.
+  /// Optional + declaration-site nil default makes this an additive SwiftData
+  /// lightweight migration for existing chat stores.
+  public var extractedAttachmentText: String? = nil
   /// Token count populated by the engine on finish; 0 while a
   /// streaming turn is in flight.
   public var tokens: Int
@@ -84,6 +90,7 @@ public final class Message {
     role: String,
     content: String = "",
     reasoning: String = "",
+    extractedAttachmentText: String? = nil,
     tokens: Int = 0,
     ts: Date = Date(),
     meta: Data? = nil,
@@ -95,6 +102,7 @@ public final class Message {
     self.role = role
     self.content = content
     self.reasoning = reasoning
+    self.extractedAttachmentText = extractedAttachmentText
     self.tokens = tokens
     self.ts = ts
     self.meta = meta

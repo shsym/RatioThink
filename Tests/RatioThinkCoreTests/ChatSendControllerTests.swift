@@ -60,6 +60,51 @@ final class ChatSendControllerTests: XCTestCase {
     )
   }
 
+  func test_send_folds_persisted_attachment_text_into_user_turn_only() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(
+      role: "user",
+      content: "Summarize this.",
+      extractedAttachmentText: "Attachment contents\nline two",
+      ts: Date(timeIntervalSinceReferenceDate: 1)
+    ))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [.finish(reason: .stop)])
+    let controller = ChatSendController()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m", sampling: ChatSampling())
+    )
+    try await waitUntil("stream finishes") { !controller.isInFlight }
+
+    let message = try XCTUnwrap(engine.requests.first?.messages.first)
+    XCTAssertEqual(message.role, .user)
+    XCTAssertEqual(
+      message.content,
+      """
+      Summarize this.
+
+      [Attached file context]
+      Attachment contents
+      line two
+      [/Attached file context]
+      """
+    )
+  }
+
+  func test_send_without_attachment_text_keeps_user_turn_byte_identical() async throws {
+    let req = try await capturedRequest(speculation: nil)
+    XCTAssertEqual(req.messages.first?.content, "hi")
+  }
+
   func test_send_builds_request_streams_assistant_and_routes_model_meta() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)

@@ -583,6 +583,7 @@ struct ChatScaffoldView: View {
           // #507: the composer's stop button — the user-reachable cancel
           // for this chat's in-flight turn (review v1 F1).
           onStop: { sendCoordinator.cancel(chatID: chatID) },
+          contextUsage: contextUsageTracker.latestUsage(chatID: chat.id),
           autoSubmit: pendingSend.autoSubmit
         )
       }
