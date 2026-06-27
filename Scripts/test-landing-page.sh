@@ -182,26 +182,17 @@ def validate_html(html: str) -> list[str]:
                 if toolbar_marker_present(toolbar, marker):
                     failures.append(message)
 
-    fast_cards = [
-        node
-        for node in walk(root)
-        if node.tag == "div"
-        and has_class(node, "card")
-        and contains_descendant_text(node, "h3", "Repeat Boost")
-    ]
-    if not fast_cards:
-        failures.append("missing Repeat Boost card")
-    elif any("tok/s" in text_content(card) for card in fast_cards):
-        failures.append("Repeat Boost card still contains tok/s marketing copy instead of app-style mock metrics")
+    if "Repeat Boost" in html:
+        failures.append("landing page must not mention retired Repeat Boost")
+    if "Tree of Thought (experimental)" not in html:
+        failures.append("landing page must label Tree of Thought as experimental")
 
-    if "message.generationPerformance" not in html:
-        failures.append("landing mock is missing the app-side generation performance accessibility hook")
-    if "generation-performance" not in html:
-        failures.append("landing mock is missing generation performance row styling")
-    if "19 tok/s" not in html:
-        failures.append("landing mock is missing the normal-scene generation performance row")
-    if "25 tok/s" not in html:
-        failures.append("landing mock is missing the Repeat Boost generation performance row")
+    if "message.generationPerformance" in html:
+        failures.append("landing mock should not keep Repeat Boost generation performance hooks after removing that scene")
+    if "generation-performance" in html:
+        failures.append("landing mock should not keep generation performance row styling after removing Repeat Boost")
+    if "19 tok/s" in html or "25 tok/s" in html:
+        failures.append("landing mock should not keep Repeat Boost tok/s comparison rows")
 
     return failures
 
@@ -213,8 +204,8 @@ VALID_FIXTURE = """
 <header class="hero"></header>
 <div class="toolbar"><span class="pill">Profile:</span><div class="menu"></div></div>
 <p class="demo-note">A simplified illustration of how it works.</p>
-<div class="card"><h3>Repeat Boost</h3><p>Speculative decoding makes the text land in bursts.</p></div>
-<script>var hook = "message.generationPerformance"; var cls = "generation-performance"; var normal = "19 tok/s"; var fast = "25 tok/s";</script>
+<div class="card"><h3>Tree of Thought (experimental)</h3><p>Explores options and picks the best.</p></div>
+<script>var label = "Tree of Thought (experimental)";</script>
 <footer>Apache-2.0</footer>
 </div></body></html>
 """
@@ -227,8 +218,8 @@ NEGATIVE_FIXTURES = {
         <header class="hero"></header>
         <div class="toolbar"><span class="pill">Profile:</span><div class="menu"></div></div>
         <p class="demo-note">A simplified illustration of how it works.</p>
-        <div class="card"><h3>Repeat Boost</h3><p>Speculative decoding makes the text land in bursts.</p></div>
-        <script>var hook = "message.generationPerformance"; var cls = "generation-performance"; var normal = "19 tok/s"; var fast = "25 tok/s";</script>
+        <div class="card"><h3>Tree of Thought (experimental)</h3><p>Explores options and picks the best.</p></div>
+        <script>var label = "Tree of Thought (experimental)";</script>
         <footer>Apache-2.0</footer>
         </div></body></html>
     """,
@@ -239,8 +230,8 @@ NEGATIVE_FIXTURES = {
         <header class="hero"></header>
         <div class="toolbar"><span class="pill">Profile:</span><div class="menu"></div><span>Model:</span><span>Qwen3-0.6B</span></div>
         <p class="demo-note">A simplified illustration of how it works.</p>
-        <div class="card"><h3>Repeat Boost</h3><p>Speculative decoding makes the text land in bursts.</p></div>
-        <script>var hook = "message.generationPerformance"; var cls = "generation-performance"; var normal = "19 tok/s"; var fast = "25 tok/s";</script>
+        <div class="card"><h3>Tree of Thought (experimental)</h3><p>Explores options and picks the best.</p></div>
+        <script>var label = "Tree of Thought (experimental)";</script>
         <footer>Apache-2.0</footer>
         </div></body></html>
     """,

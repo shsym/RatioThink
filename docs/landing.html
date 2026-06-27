@@ -112,7 +112,6 @@
   .bubble.assistant{background:var(--bubble-assistant);color:var(--ink)}
   .assistant-turn{display:flex;flex-direction:column;gap:6px;align-items:flex-start;max-width:80%}
   .assistant-turn .bubble{max-width:100%}
-  .generation-performance{font-size:11.5px;color:var(--ink-muted);line-height:1.2}
   .acol{display:flex;flex-direction:column;gap:6px;align-items:flex-start;max-width:88%;width:88%}
 
   /* ---- Tree search disclosure — mirrors App/Views/Chat/TreeSearchSection.swift ---- */
@@ -258,7 +257,7 @@
 
       <div class="toolbar">
         <span class="pill active" id="profilePill">
-          <span class="lab">Profile:</span><span id="profileName">Tree of Thought</span>
+          <span class="lab">Profile:</span><span id="profileName">Tree of Thought (experimental)</span>
           <span class="chev">▾</span>
         </span>
 
@@ -269,11 +268,8 @@
           <div class="mrow" id="menuJson">
             JSON Think<span class="check">✓</span>
           </div>
-          <div class="mrow" id="menuFast">
-            Repeat Boost<span class="check">✓</span>
-          </div>
           <div class="mrow" id="menuTot">
-            Tree of Thought<span class="check">✓</span>
+            Tree of Thought (experimental)<span class="check">✓</span>
           </div>
         </div>
       </div>
@@ -289,8 +285,7 @@
     <div class="caption" id="caption"></div>
     <div class="dots" id="dots" role="group" aria-label="Choose a demo">
       <button type="button" class="dot" data-scene="0" aria-label="Show the Tree of Thought demo"></button>
-      <button type="button" class="dot" data-scene="1" aria-label="Show the Repeat Boost demo"></button>
-      <button type="button" class="dot" data-scene="2" aria-label="Show the JSON Think demo"></button>
+      <button type="button" class="dot" data-scene="1" aria-label="Show the JSON Think demo"></button>
     </div>
     <p class="demo-note">A simplified illustration of how it works.</p>
   </div>
@@ -302,14 +297,9 @@
        reasoning styles, each optimized for what you're doing.</p>
     <div class="grid">
       <div class="card">
-        <div class="ct"><h3>Tree of Thought</h3></div>
+        <div class="ct"><h3>Tree of Thought (experimental)</h3></div>
         <p>Stuck on a knotty, many-option decision? Tree of Thought explores the possibilities and
            surfaces the best one — and you watch it weigh the options in a live, foldable tree.</p>
-      </div>
-      <div class="card">
-        <div class="ct"><h3>Repeat Boost</h3></div>
-        <p>Generating code, JSON, or anything repetitive? Repeat Boost returns the same reply with
-           less waiting — a speculative drafter reuses the parts that repeat, so the text lands in bursts.</p>
       </div>
       <div class="card">
         <div class="ct"><h3>JSON Think</h3></div>
@@ -355,7 +345,7 @@
   // ======================================================================
   var SCENARIO = {
     tot: {
-      profile: 'Tree of Thought',
+      profile: 'Tree of Thought (experimental)',
       bounds: '· 3×2, beam 2 ·',
       prompt: 'Plan a surprise party for a close friend.',
       // Breadth 3 at the root; the beam keeps the top 2, and level 2 keeps
@@ -372,14 +362,6 @@
       ],
       nodeCount: 7,
       answer: 'Go with an evening garden theme for ~12 on a free Saturday — lock the guest list and the date first, then venue and food fall into place.'
-    },
-    fast: {
-      // A prompt whose output repeats by construction — every line replays the
-      // same opening phrase. That repetition is exactly what the n-gram drafter
-      // accepts in bulk, so it is the honest showcase for Repeat Boost.
-      prompt: 'Write a poem where every line begins with "Quiet falling snow".',
-      answer: 'Quiet falling snow blankets the road, Quiet falling snow softens the light, Quiet falling snow hushes the town, Quiet falling snow drifts into dawn.',
-      bursts: [3, 3]   // the repeated 3-word opening is accepted in one burst, then the line's own words
     },
     json: {
       // JSON Think contrasts the SAME extraction prompt two ways: a normal Chat
@@ -403,7 +385,6 @@
   var menu       = document.getElementById('profileMenu');
   var profileName= document.getElementById('profileName');
   var menuTot    = document.getElementById('menuTot');
-  var menuFast   = document.getElementById('menuFast');
   var menuChat   = document.getElementById('menuChat');
   var menuJson   = document.getElementById('menuJson');
   var captionEl  = document.getElementById('caption');
@@ -442,7 +423,6 @@
   function setProfile(name, which){
     profileName.textContent = name;
     menuTot.classList.toggle('sel', which==='tot');
-    menuFast.classList.toggle('sel', which==='fast');
     menuChat.classList.toggle('sel', which==='chat');
     menuJson.classList.toggle('sel', which==='json');
   }
@@ -450,11 +430,6 @@
   function userRow(text){
     var r = el('<div class="row user"><div class="bubble user"></div></div>');
     r.querySelector('.bubble').textContent = text; transcript.appendChild(r); return r;
-  }
-  function addGenerationPerformance(row, text){
-    row.querySelector('.assistant-turn').appendChild(
-      el('<div class="generation-performance" data-accessibility-id="message.generationPerformance">'+text+'</div>')
-    );
   }
   async function typeComposer(text, myGen){
     composer.classList.add('typed'); composer.textContent='';
@@ -470,46 +445,11 @@
     for (var i=0;i<w.length;i++){ node.textContent += (i?' ':'') + w[i]; await sleep(per, myGen); }
     node.classList.remove('caret');
   }
-  // fast pass: variable multi-token bursts (3,2,4… land at once) = speculative acceptance
-  async function streamBursts(node, text, sizes, per, myGen){
-    node.classList.add('burst');
-    var w = words(text), i=0, b=0;
-    while (i < w.length){
-      var n = sizes[b % sizes.length];
-      node.textContent += (i?' ':'') + w.slice(i, i+n).join(' ');
-      i += n; b++;
-      await sleep(per, myGen);
-    }
-    node.classList.remove('burst');
-  }
-
-  // ---- tree-search node helpers (mirror ToTNodeRow beam glyphs + score capsule) ----
-  function beamChar(b){ return b==='star' ? '★' : b==='kept' ? '✓' : b==='pruned' ? '✕' : '◌'; }
-  function nodeHTML(cfg, child){
-    return '<div class="tnode'+(child?' child':'')+'">'+
-      '<span class="beam pending">◌</span>'+
-      '<span class="score">'+cfg.s+'</span>'+
-      '<span class="label">'+cfg.t+'</span></div>';
-  }
-  function addNode(parent, cfg, child){
-    var n = el(nodeHTML(cfg, child)); parent.appendChild(n); return n;
-  }
-  // Insert a child row directly after `anchor` (the parent row, or the previous
-  // sibling) so children render nested under their own branch.
-  function addChildAfter(anchor, cfg){
-    var n = el(nodeHTML(cfg, true)); anchor.insertAdjacentElement('afterend', n); return n;
-  }
-  function setBeam(node, beam){
-    var b = node.querySelector('.beam');
-    b.className = 'beam '+beam; b.textContent = beamChar(beam);
-    node.classList.toggle('pruned', beam==='pruned');
-  }
-
   // ============== Scene 0 (LEAD): Tree of Thought — shipped one-click profile ==============
   async function sceneTreeOfThought(myGen){
     var d = SCENARIO.tot;
     setProfile(d.profile, 'tot');
-    setCaption('Stuck on a many-option decision? Tree of Thought explores them and picks the best.');
+    setCaption('Stuck on a many-option decision? Tree of Thought (experimental) explores them and picks the best.');
     await sleep(800, myGen);
     await typeComposer(d.prompt, myGen);
     userRow(d.prompt); resetComposer();
@@ -590,40 +530,6 @@
     await sleep(2200, myGen);
   }
 
-  // ============== Scene 1: Repeat Boost — speculative decoding, same prompt twice ==============
-  async function sceneFastThink(myGen){
-    var d = SCENARIO.fast;
-    // First pass: the normal Chat profile, token by token.
-    setProfile('Chat', 'chat');
-    setCaption('The everyday Chat profile, answering at its normal pace.');
-    await sleep(650, myGen);
-    await typeComposer(d.prompt, myGen);
-    userRow(d.prompt); resetComposer();
-    await sleep(260, myGen);
-    var a1 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
-    transcript.appendChild(a1);
-    await streamWords(a1.querySelector('.bubble'), d.answer, 62, myGen); // slow, even cadence
-    addGenerationPerformance(a1, '19 tok/s');
-    await sleep(900, myGen);
-
-    // Switch profiles: open the menu, pick Repeat Boost.
-    setCaption('Switch to Repeat Boost — same model, far less waiting.');
-    menu.classList.add('show'); await sleep(680, myGen);
-    setProfile('Repeat Boost', 'fast'); await sleep(520, myGen);
-    menu.classList.remove('show');
-    await sleep(360, myGen);
-
-    // Second pass: the SAME prompt + SAME answer, now in chunky multi-token bursts.
-    userRow(d.prompt);
-    await sleep(220, myGen);
-    var a2 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
-    transcript.appendChild(a2);
-    setCaption('Same answer — the repeated opening lands in quick bursts.');
-    await streamBursts(a2.querySelector('.bubble'), d.answer, d.bursts, 150, myGen); // chunky + quicker
-    addGenerationPerformance(a2, '25 tok/s');
-    await sleep(2200, myGen);
-  }
-
   // ---- static frames (reduced motion, and the error fallback) ----
   function buildTreeFinal(){
     var d = SCENARIO.tot;
@@ -648,16 +554,7 @@
       '<div class="bubble assistant">'+SCENARIO.tot.answer+'</div></div></div>');
     transcript.appendChild(col);
   }
-  function stillFast(){
-    clear(); setProfile('Repeat Boost', 'fast');
-    userRow(SCENARIO.fast.prompt);
-    var a = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
-    a.querySelector('.bubble').textContent = SCENARIO.fast.answer;
-    addGenerationPerformance(a, '25 tok/s');
-    transcript.appendChild(a);
-  }
-
-  // ============== Scene 2: JSON Think — free-form chat vs grammar-constrained JSON ==============
+  // ============== Scene 1: JSON Think — free-form chat vs grammar-constrained JSON ==============
   // Types pre-highlighted JSON one tag/text fragment at a time so the .k/.s/.n spans
   // stay intact while the answer streams in. `per` is the per-fragment delay —
   // each span/text fragment is roughly token-sized, so passing the same value the
@@ -724,9 +621,7 @@
 
   var SCENES = [
     { run: sceneTreeOfThought, still: stillTot,
-      pausedCaption: 'Animation paused (reduced motion). Tree of Thought explores the options and picks the best.' },
-    { run: sceneFastThink, still: stillFast,
-      pausedCaption: 'Animation paused (reduced motion). Repeat Boost gives the same answer, much faster.' },
+      pausedCaption: 'Animation paused (reduced motion). Tree of Thought (experimental) explores the options and picks the best.' },
     { run: sceneJsonThink, still: stillJson,
       pausedCaption: 'Animation paused (reduced motion). Chat buries the JSON in reasoning prose; JSON Think returns one bare, parseable object.' }
   ];
@@ -734,7 +629,7 @@
   // Error fallback: a clean, honest static frame (the lead Tree of Thought scene).
   function renderStaticFallback(){
     stillTot();
-    setCaption('Tree of Thought and Repeat Boost — two ways this model can think.');
+    setCaption('Tree of Thought (experimental) explores options and picks the best.');
     setActiveDot(0);
   }
 

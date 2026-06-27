@@ -108,10 +108,10 @@ public enum ProfileStoreError: Error, CustomStringConvertible, Equatable {
 ///   2. `.seedFailed` — first-launch chat seed write failed AND the
 ///      directory is still empty. Cleared as soon as a scan finds at
 ///      least one `*.toml` (user / external process repaired it).
-///   3. `.seedFailed` — the existence-gated built-in (Repeat Boost) seed
-///      write failed (review v1 F1). Surfaces regardless of whether the
-///      directory has other profiles, since the built-in is seeded into
-///      populated installs; not cleared by a non-empty scan.
+///   3. `.seedFailed` — built-in reconciliation failed (for example,
+///      moving aside a stale/corrupt current or retired built-in). Surfaces
+///      regardless of whether the directory has other profiles, since these
+///      migrations run on populated installs; not cleared by a non-empty scan.
 ///   4. `nil` — clean.
 public struct ProfileStoreSnapshot {
   public let entries: [ProfileLoadResult]
@@ -326,7 +326,7 @@ public final class ProfileStore: ObservableObject {
   public static let treeOfThoughtTOML: String = """
   builtin-origin = "tree-of-thought"
   id = "tree-of-thought"
-  name = "Tree of Thought"
+  name = "Tree of Thought (experimental)"
   icon = "point.3.connected.trianglepath.dotted"
   model = "\(defaultChatModelID)"
   inferlet = "chat-apc"
@@ -485,12 +485,11 @@ public final class ProfileStore: ObservableObject {
   /// The built-ins, in display order. `tree-of-thought` (#413) and
   /// `best-of-n` (#690) are EXAMPLE profiles gated by `seedsExampleProfiles`
   /// (so hermetic tests can exclude them via
-  /// `baseEntries(directory:includeExample:)`); the other three are always
+  /// `baseEntries(directory:includeExample:)`); Chat and JSON Think are always
   /// part of the base set.
   public static let baseBuiltins: [BaseBuiltin] = [
     BaseBuiltin(id: defaultProfileID,            name: "Chat",            filename: defaultChatFilename,        toml: defaultChatTOML),
-    BaseBuiltin(id: defaultRepeatBoostProfileID, name: "Repeat Boost",    filename: defaultRepeatBoostFilename, toml: defaultRepeatBoostTOML),
-    BaseBuiltin(id: treeOfThoughtProfileID,      name: "Tree of Thought", filename: treeOfThoughtFilename,      toml: treeOfThoughtTOML),
+    BaseBuiltin(id: treeOfThoughtProfileID,      name: "Tree of Thought (experimental)", filename: treeOfThoughtFilename,      toml: treeOfThoughtTOML),
     BaseBuiltin(id: defaultJSONThinkProfileID,   name: "JSON Think",      filename: defaultJSONThinkFilename,   toml: defaultJSONThinkTOML),
     BaseBuiltin(id: bestOfNProfileID,            name: "Best of N",       filename: bestOfNFilename,            toml: bestOfNTOML),
   ]
@@ -713,12 +712,12 @@ public final class ProfileStore: ObservableObject {
   private var _entries: [ProfileLoadResult] = []
   private var _lastSeedError: ProfileStoreError?
   private var _lastScanError: ProfileStoreError?
-  /// Write failure from the existence-gated built-in (Repeat Boost) seed
-  /// (review v1 F1). Distinct from `_lastSeedError` (the empty-dir chat
-  /// seed): the built-in is seeded into installs that ALREADY have
-  /// profiles, so its failure must surface even when `_entries` is
-  /// non-empty — and must NOT be cleared by a successful scan the way
-  /// the empty-dir seed error is. Self-clears on the next `start()` whose
+  /// Failure from built-in reconciliation (deduping current built-ins,
+  /// retiring old built-ins, or the legacy fast-think rename). Distinct from
+  /// `_lastSeedError` (the empty-dir active-profile seed): reconciliation runs
+  /// on installs that ALREADY have profiles, so its failure must surface even
+  /// when `_entries` is non-empty — and must NOT be cleared by a successful
+  /// scan the way the empty-dir seed error is. Self-clears on the next `start()` whose
   /// seed succeeds (set fresh every start), and on `stop()`.
   private var _builtinSeedError: ProfileStoreError?
   /// Successful built-in reverts (#702): an unparseable override was moved to
@@ -1795,12 +1794,11 @@ public final class ProfileStore: ObservableObject {
   /// provenance and hide it if the built-in it descends from is RETIRED:
   ///
   ///   · Provenance = the `builtin-origin` marker if present, else — for a
-  ///     file at a historical built-in FILENAME — the mapped origin id IFF
-  ///     the file's own id matches that built-in (a genuine pre-marker
-  ///     override, not a #706 filename squatter) or it cannot be parsed OR
-  ///     READ (a broken/unreadable built-in at a known filename, #718 F4). A
-  ///     file with NEITHER a marker nor a recognized built-in filename is
-  ///     USER-AUTHORED and left untouched — the #709/#706 invariant that
+  ///     file at a historical built-in FILENAME — the mapped origin id only
+  ///     when it cannot be parsed/read (a broken/unreadable built-in at a known
+  ///     filename, #718 F4). A valid unmarked profile, even at a historical
+  ///     filename/id such as a user-authored `repeat-boost.toml`, is treated as
+  ///     USER-AUTHORED and left untouched — the #709/#706/#856 invariant that
   ///     genuine user profiles are never removed.
   ///   · provenance id no longer in the SHIPPED set -> a built-in a newer
   ///     version RETIRED: MOVE to a non-colliding `<name>.toml.bak` so it
@@ -1839,7 +1837,7 @@ public final class ProfileStore: ObservableObject {
       if let marker = profile?.builtinOrigin {
         origin = marker
       } else if let filenameOrigin = Self.historicalBuiltinFilenames[filename],
-                profile == nil || profile?.id == filenameOrigin {
+                profile == nil {
         origin = filenameOrigin
       } else {
         origin = nil
@@ -2300,11 +2298,11 @@ public final class ProfileStore: ObservableObject {
 
   /// Caller must hold `stateLock`. Scan errors take priority over
   /// seed errors (scan reflects the most recent FS interaction); the
-  /// empty-dir chat seed error only surfaces while the directory is
-  /// still empty. The built-in (Repeat Boost) seed error surfaces
-  /// regardless of `_entries.isEmpty` — its whole purpose is populated
-  /// installs (review v1 F1) — at lowest priority, since a scan failure
-  /// or a failed empty-dir chat seed is the more actionable signal.
+  /// empty-dir active-profile seed error only surfaces while the directory is
+  /// still empty. Built-in reconciliation errors surface regardless of
+  /// `_entries.isEmpty` — their whole purpose is populated installs — at lowest
+  /// priority, since a scan failure or a failed empty-dir seed is the more
+  /// actionable signal.
   private func resolvedDirectoryErrorLocked() -> ProfileStoreError? {
     if let s = _lastScanError { return s }
     if let s = _lastSeedError, _entries.isEmpty { return s }

@@ -234,7 +234,7 @@ final class S486_ModelMenuNoResidentConfirmGUITests: XCTestCase {
     return app
   }
 
-  // MARK: - polling helpers (shared idiom with S459/S426)
+  // MARK: - polling helpers (shared idiom with S459)
 
   private func waitForElementValueContaining(_ element: XCUIElement,
                                              _ needle: String,

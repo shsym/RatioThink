@@ -56,6 +56,7 @@ final class ProfileStoreTests: XCTestCase {
       let profile = try XCTUnwrap(entry.profile)
       XCTAssertEqual(profile.id, "tree-of-thought")
       XCTAssertEqual(profile.inferlet, "chat-apc", "ToT is a dispatch mode; the launched inferlet stays chat-apc")
+      XCTAssertEqual(profile.name, "Tree of Thought (experimental)")
       XCTAssertEqual(profile.treeOfThought, ToTProfileConfig(breadth: 3, depth: 2, beamWidth: 2, maxTokensPerNode: 256))
       // chat remains the active default (marker seeded on this fresh install);
       // ToT is opt-in via profile switch.
@@ -142,6 +143,7 @@ final class ProfileStoreTests: XCTestCase {
         "#702: a byte-equal seeded built-in is removed; base layer provides it")
       // ToT + chat both come from the base layer.
       let tot = try XCTUnwrap(store.entries.first { $0.profile?.id == "tree-of-thought" })
+      XCTAssertEqual(tot.profile?.name, "Tree of Thought (experimental)")
       XCTAssertNotNil(tot.profile?.treeOfThought)
       XCTAssertNotNil(store.entries.first { $0.profile?.id == "chat" }?.profile)
       XCTAssertEqual(store.activeProfileID, "chat", "migration must not change the active profile")
@@ -389,11 +391,11 @@ final class ProfileStoreTests: XCTestCase {
       defer { store.stop() }
 
       let names = store.entries.map { $0.url.lastPathComponent }
-      // #702: the base layer (chat, repeat-boost, json-think) is always
-      // present and merged in by filename; tree-of-thought is the example,
-      // excluded here by seedsExampleProfiles=false. They appear alongside the
-      // authored profiles, sorted.
-      XCTAssertEqual(names, ["alpha.toml", "chat.toml", "json-think.toml", "repeat-boost.toml", "zeta.toml"],
+      // #702/#856: the shipped base layer (chat, json-think) is always present
+      // and merged in by filename; tree-of-thought/best-of-n are examples,
+      // excluded here by seedsExampleProfiles=false. Repeat Boost is retired
+      // from the shipped base set. They appear alongside authored profiles, sorted.
+      XCTAssertEqual(names, ["alpha.toml", "chat.toml", "json-think.toml", "zeta.toml"],
                      "entries must be sorted by filename for stable UI ordering")
     }
   }
@@ -1546,8 +1548,8 @@ final class ProfileStoreTests: XCTestCase {
       // exactly the two fixtures.
       let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
       try store.start()
-      // Seed-count-agnostic: the built-in Repeat Boost profile is auto-seeded
-      // (#426) on top of the authored set, so assert "populated", not a count.
+      // Base-count-agnostic: shipped base profiles are merged on top of the
+      // authored set, so assert "populated", not a count.
       XCTAssertFalse(store.entries.isEmpty, "sanity: populated post-start")
 
       store.stop()
@@ -1682,8 +1684,8 @@ final class ProfileStoreTests: XCTestCase {
       // the one fixture (the test then drops a 2nd to schedule a reload).
       let store = ProfileStore(directory: dir, seedsExampleProfiles: false)
       try store.start()
-      // Seed-count-agnostic (#426 auto-seeds Repeat Boost on top of the
-      // authored set); this test only needs the store populated post-start.
+      // Base-count-agnostic: shipped base profiles are merged on top of the
+      // authored set; this test only needs the store populated post-start.
       XCTAssertFalse(store.entries.isEmpty, "sanity: populated post-start")
 
       // Drop a new profile to schedule a debounced reload (queue
@@ -2266,9 +2268,9 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
-  // MARK: - built-in Repeat Boost seed (#426; slug #628)
+  // MARK: - retired Repeat Boost built-in (#856; #426 engine plumbing retained)
 
-  func test_base_repeat_boost_present_on_fresh_install() throws {
+  func test_retired_repeat_boost_not_in_base_on_fresh_install() throws {
     try withTempProfilesDir { dir in
       let store = ProfileStore(directory: dir)
       try store.start()
@@ -2276,32 +2278,24 @@ final class ProfileStoreTests: XCTestCase {
 
       let onDisk = dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename)
       XCTAssertFalse(FileManager.default.fileExists(atPath: onDisk.path),
-                     "#702: the Repeat Boost built-in is in-code; nothing is seeded to disk")
-      let entry = try XCTUnwrap(store.entries.first {
+                     "retired Repeat Boost must not be seeded to disk")
+      XCTAssertNil(store.entries.first {
         $0.profile?.id == ProfileStore.defaultRepeatBoostProfileID
-      })
-      XCTAssertNil(entry.error)
-      XCTAssertEqual(entry.profile?.description,
-                     "A faster, deterministic chat profile that uses speculative decoding when available.")
-      XCTAssertEqual(entry.profile?.speculation, Profile.Speculation(enabled: true))
-      XCTAssertEqual(entry.profile?.sampling.temperature, 0,
-                     "Repeat Boost is greedy — temperature must be 0")
+      }?.profile, "retired Repeat Boost must not ship as a base built-in")
     }
   }
 
-  func test_base_repeat_boost_present_in_existing_install_with_only_chat() throws {
+  func test_retired_repeat_boost_hidden_in_existing_install_with_only_chat() throws {
     try withTempProfilesDir { dir in
-      // Pre-existing byte-equal chat.toml (existing install). Repeat Boost is
-      // a base built-in, present in `entries` regardless of on-disk files.
       try ProfileStore.defaultChatTOML.write(
         to: dir.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
       let store = ProfileStore(directory: dir)
       try store.start()
       defer { store.stop() }
 
-      XCTAssertNotNil(store.entries.first {
+      XCTAssertNil(store.entries.first {
         $0.profile?.id == ProfileStore.defaultRepeatBoostProfileID
-      }?.profile, "existing install must surface the Repeat Boost base built-in")
+      }?.profile, "existing install must not surface retired Repeat Boost without a user-authored file")
     }
   }
 
@@ -2315,8 +2309,8 @@ final class ProfileStoreTests: XCTestCase {
     let (entries, scanErr) = ProfileStore.effectiveScan(directory: missing)
     XCTAssertNotNil(scanErr, "scanning a missing dir must report a scan error")
     let ids = Set(entries.compactMap { $0.profile?.id })
-    XCTAssertEqual(ids, ["chat", "repeat-boost", "tree-of-thought", "json-think", "best-of-n"],
-                   "all base built-ins must be present even when the scan fails")
+    XCTAssertEqual(ids, ["chat", "tree-of-thought", "json-think", "best-of-n"],
+                   "all shipped base built-ins must be present even when the scan fails")
   }
 
   /// #690/#702: the Best-of-N example is a base built-in — present in entries
@@ -2340,7 +2334,8 @@ final class ProfileStoreTests: XCTestCase {
       let ids = Set(entries.compactMap { $0.profile?.id })
       XCTAssertFalse(ids.contains("best-of-n"), "examples excluded when includeExample=false")
       XCTAssertFalse(ids.contains("tree-of-thought"))
-      XCTAssertTrue(ids.isSuperset(of: ["chat", "repeat-boost", "json-think"]))
+      XCTAssertTrue(ids.isSuperset(of: ["chat", "json-think"]))
+      XCTAssertFalse(ids.contains("repeat-boost"), "Repeat Boost is retired from the shipped base set")
     }
   }
 
@@ -2381,8 +2376,9 @@ final class ProfileStoreTests: XCTestCase {
 
       // Base built-ins intact.
       let ids = Set(store.entries.compactMap { $0.profile?.id })
-      XCTAssertTrue(ids.isSuperset(of: ["chat", "repeat-boost", "json-think"]),
-                    "a broken user file must not remove any base built-in")
+      XCTAssertTrue(ids.isSuperset(of: ["chat", "json-think"]),
+                    "a broken user file must not remove any shipped base built-in")
+      XCTAssertFalse(ids.contains("repeat-boost"), "retired Repeat Boost must not return as a base built-in")
       // The broken file is surfaced (present as an error entry), not dropped.
       let broken = try XCTUnwrap(store.entries.first { $0.url.lastPathComponent == "broken.toml" })
       XCTAssertNil(broken.profile)
@@ -2446,10 +2442,10 @@ final class ProfileStoreTests: XCTestCase {
   /// reverted. Verify the picker/base default holds after the revert.
   func test_broken_builtin_override_revert_surfaces_notice_and_applies_base() throws {
     try withTempProfilesDir { dir in
-      // A user pinned a model onto Repeat Boost, then the file got corrupted
+      // A user pinned a model onto JSON Think, then the file got corrupted
       // (missing required fields) — unparseable.
-      try "id = \"repeat-boost\"\nname = \"My Repeat\"\n".write(
-        to: dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename),
+      try "id = \"json-think\"\nname = \"My JSON\"\n".write(
+        to: dir.appendingPathComponent(ProfileStore.defaultJSONThinkFilename),
         atomically: true, encoding: .utf8)
       let store = ProfileStore(directory: dir)
       try store.start()
@@ -2458,21 +2454,21 @@ final class ProfileStoreTests: XCTestCase {
       // Revert notice surfaced (both the accessor and the snapshot channel).
       let notices = store.lastBuiltinRevertNotices
       XCTAssertEqual(notices, store.snapshot.builtinRevertNotices)
-      let notice = try XCTUnwrap(notices.first { $0.profileID == "repeat-boost" })
-      XCTAssertEqual(notice.profileName, "Repeat Boost")
-      XCTAssertEqual(notice.bakFilename, "repeat-boost.toml.bak")
+      let notice = try XCTUnwrap(notices.first { $0.profileID == "json-think" })
+      XCTAssertEqual(notice.profileName, "JSON Think")
+      XCTAssertEqual(notice.bakFilename, "json-think.toml.bak")
 
       // The broken file was moved aside; no move FAILURE, so directoryError is
       // clean (the revert is non-fatal, not a _builtinSeedError).
       let fm = FileManager.default
-      XCTAssertTrue(fm.fileExists(atPath: dir.appendingPathComponent("repeat-boost.toml.bak").path))
+      XCTAssertTrue(fm.fileExists(atPath: dir.appendingPathComponent("json-think.toml.bak").path))
       XCTAssertNil(store.lastDirectoryError, "a successful revert must not surface as a directory error")
 
       // The base default applies for the built-in slot (picker shows the app
       // default, not the broken override).
-      let entry = try XCTUnwrap(store.entries.first { $0.profile?.id == "repeat-boost" })
+      let entry = try XCTUnwrap(store.entries.first { $0.profile?.id == "json-think" })
       XCTAssertNil(entry.error)
-      XCTAssertEqual(entry.profile?.name, "Repeat Boost",
+      XCTAssertEqual(entry.profile?.name, "JSON Think",
                      "after a revert the base default (not the broken override) must apply")
     }
   }
@@ -2786,8 +2782,8 @@ final class ProfileStoreTests: XCTestCase {
     try withTempProfilesDir { dir in
       // Earlier domain: an unparseable current built-in → migrateSeededBuiltins
       // backup fails under read-only.
-      try "id = \"repeat-boost\"\n".write(
-        to: dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename),
+      try "id = \"chat\"\n".write(
+        to: dir.appendingPathComponent(ProfileStore.defaultChatFilename),
         atomically: true, encoding: .utf8)
       // Provenance domain: a marked retired built-in → its move fails too.
       try """
@@ -2853,7 +2849,7 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
-  func test_repeat_boost_seed_does_not_overwrite_existing_edited_copy() throws {
+  func test_unmarked_user_authored_repeat_boost_file_survives_retirement() throws {
     try withTempProfilesDir { dir in
       let edited = """
       id = "repeat-boost"
@@ -2871,7 +2867,10 @@ final class ProfileStoreTests: XCTestCase {
       defer { store.stop() }
 
       XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), edited,
-                     "an existing repeat-boost.toml must not be clobbered by the seed")
+                     "an unmarked user-authored repeat-boost.toml must be preserved, not retired")
+      let entry = try XCTUnwrap(store.entries.first { $0.profile?.id == ProfileStore.defaultRepeatBoostProfileID })
+      XCTAssertEqual(entry.profile?.name, "My Repeat Boost")
+      XCTAssertEqual(entry.profile?.speculation, Profile.Speculation(enabled: true))
     }
   }
 

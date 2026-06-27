@@ -12,7 +12,7 @@ import XCTest
 ///      asserted at the wire level in `ChatSendControllerTests`) actually
 ///      engages grammar-constrained decoding against a real model.
 ///
-/// Like S426 this needs a real engine serving the seeded GGUF, so it is
+/// This needs a real engine serving the seeded GGUF, so it is
 /// driven by `Scripts/run-chat-gui-e2e.sh`. Absent that config it XCSkips
 /// loudly rather than passing on a stub — the engine is NEVER mocked.
 ///
@@ -37,7 +37,7 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
       "\(Self.configPath) must define PIE_TEST_GUI_HOME")
     let model = config["PIE_TEST_CHAT_MODEL"] ?? "Qwen/Qwen3-0.6B"
     // The concrete served slug the engine reconciles via /v1/models — the
-    // toolbar VALUE settles to this once residency lands (mirror S426).
+    // toolbar VALUE settles to this once residency lands (mirror the real-engine profile GUI harness).
     let servedModelID = config["PIE_TEST_CHAT_MODEL_PIN"]
       ?? "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
 
@@ -58,7 +58,7 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
     newChat.click()
 
     // Reconciliation barrier before swapping profiles (mirror the PASSING
-    // S426): the toolbar VALUE settles to the concrete served slug only after
+    // real-engine profile GUI harness): the toolbar VALUE settles to the concrete served slug only after
     // /v1/models reconciles, so this proves residency landed WITHOUT opening
     // the model menu — eliminating that menu's not-key focus race entirely
     // (#545). The same-model JSON Think swap is silent because the resident
@@ -112,7 +112,7 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
     }
   }
 
-  // MARK: - configure (mirror S426)
+  // MARK: - configure (mirror the real-engine profile GUI harness)
 
   private func configure(_ app: XCUIApplication, pieHome: String, baseURL: String, model: String) {
     app.launchArguments.append(contentsOf: [
@@ -128,7 +128,7 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
 
   // MARK: - assertions
 
-  /// Resident-model reconciliation barrier (mirror S426): the toolbar VALUE
+  /// Resident-model reconciliation barrier (mirror the real-engine profile GUI harness): the toolbar VALUE
   /// equals the concrete served slug only after `/v1/models` reconciles, with
   /// no "profile default"/"(Default)" annotation. Pure value read — no menu
   /// open, so it cannot lose a not-key focus race (#545).

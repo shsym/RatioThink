@@ -1,9 +1,9 @@
 #!/bin/bash
 #
-# Real-model chat GUI E2E (S258 composer send, S426 Repeat Boost profile).
+# Real-model chat GUI E2E (chat send, multipart, and JSON Think profile).
 # Serves the seeded Qwen3-0.6B GGUF under its profile slug via the portable
 # chat-engine-harness, points the App at it through a /tmp config file, runs the
-# two XCUITests, then asserts the engine's reply persisted to chats.sqlite.
+# focused XCUITests, then asserts the engine's reply persisted to chats.sqlite.
 #
 # Usage: Scripts/run-chat-gui-e2e.sh   (seated GUI session + TCC grant required)
 # Key env: PIE_TEST_RUN_ROOT (retained run dir), STAGE_TEST_MODEL_DEST (GGUF
@@ -17,9 +17,8 @@ source "$ROOT/Scripts/e2e-prep.sh"
 TAG="chat gui e2e"
 # Serve the seeded GGUF the App's default "chat" profile resolves, under its
 # slug — so `/v1/models` reports the slug and the chat menu renders its leaf
-# (`Qwen3-0.6B-Q8_0.gguf`). S258 (send) and S426 (Repeat Boost profile select +
-# real reply, which also asserts the seeded model surfaces in the chat menu)
-# both consume it.
+# (`Qwen3-0.6B-Q8_0.gguf`). S258 (send), S520 (multipart), and
+# S572 (JSON Think profile select + real reply) consume it.
 SLUG="Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
 RUN_ROOT="${PIE_TEST_RUN_ROOT:-/tmp/p258-$$}"
 ENGINE_HOME="$RUN_ROOT/e"
@@ -126,7 +125,6 @@ e2e_run_gui_xcodebuild "$XCODE_LOG" \
   -parallel-testing-enabled NO \
   test \
   -only-testing:RatioThinkGUITests/S258_ComposerSendGUITests/test_composer_send_streams_real_assistant_and_persists_after_relaunch \
-  -only-testing:RatioThinkGUITests/S426_FastThinkProfileGUITests/test_fast_think_profile_selectable_and_streams_real_reply \
   -only-testing:RatioThinkGUITests/S520_MultiPartContentGUITests/test_external_multipart_client_succeeds_and_gui_chat_still_streams \
   -only-testing:RatioThinkGUITests/S572_JSONThinkProfileGUITests/test_json_think_profile_selectable_and_streams_json_reply \
   ENABLE_CODE_COVERAGE=NO
@@ -154,12 +152,12 @@ fi
 # The seeded Qwen3-0.6B is a *thinking* model: within the token budget the
 # answer can land in <think> reasoning with empty final ZCONTENT, OR the
 # reasoning itself can truncate before reaching the answer. The two send
-# scenarios that asserted a visible "Paris" reply (S258/S426) are QUARANTINED in
+# scenario that asserted a visible "Paris" reply (S258) is QUARANTINED in
 # the GUI suite as a separate product/engine bug (thinking-model empty/truncated
 # final content), so this Paris check is now a NON-FATAL diagnostic — it must
 # not red-fail the seated run on the exact behavior we quarantined. Re-arm this
 # as fatal (restore the `exit 1` in the else branch) when the engine guarantees
-# non-empty final content and S258/S426 are un-quarantined.
+# non-empty final content and S258 is un-quarantined.
 #
 # An EMPTY result set (truncation) is tolerated, but a sqlite3 QUERY ERROR
 # (corrupt/unreadable DB) is fatal — capture the rc separately so the genuine
@@ -178,14 +176,14 @@ fi
 if printf '%s' "$paris_rows" | grep -F "Paris" >/dev/null; then
   echo "chat gui e2e: assistant produced Paris (content or reasoning)"
 else
-  echo "chat gui e2e: NOTE — no Paris reply persisted (thinking-model empty/truncated content; S258/S426 quarantined); non-fatal" >&2
+  echo "chat gui e2e: NOTE — no Paris reply persisted (thinking-model empty/truncated content; S258 quarantined); non-fatal" >&2
 fi
 
 # #572: the JSON Think two-phase decode is meant to always emit non-empty JSON
 # content (phase 2 after the reasoning block). On the seeded small thinking
 # model it intermittently truncates to EMPTY content (observed: ZCONTENT="" and
 # ZREASONING="" — no reply persisted) — the SAME product/engine bug the
-# quarantined S258/S426 hit, just on the JSON path. So this content gate is a
+# quarantined S258 hit, just on the JSON path. So this content gate is a
 # NON-FATAL diagnostic too: the seated run must not red-fail on the quarantined
 # bug. The hard, deterministic JSON-visible-content proof on this path is S572's
 # `waitForStaticTextBeginningWithJSON` assertion, which is NOT quarantined and
