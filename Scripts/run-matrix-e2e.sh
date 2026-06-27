@@ -60,6 +60,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # so the chat cell adds the #484 weak semantic floor (reply must echo 'pong').
 # The small 0.5–1B tier stays semantic=0 (contract-level only) so a missed
 # echo — a capability limit, not an engine-compat failure — is not a false FAIL.
+# Gemma 4 31B gets a per-cell KV/output cap below: its default Gemma4 KV pool
+# is large enough to threaten seated all-profile runs, and the proof only needs
+# a bounded 8k-token pool / 4k-token request cap to exercise every profile.
 MATRIX_MODELS=(
   "Qwen/Qwen2.5-0.5B-Instruct-GGUF|qwen2.5-0.5b-instruct-q4_k_m.gguf|491400032|0|0"
   "Qwen/Qwen3-0.6B-GGUF|Qwen3-0.6B-Q8_0.gguf|639446688|1|0"
@@ -72,6 +75,7 @@ MATRIX_MODELS=(
   "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF|Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf|8988111072|0|1"
   "Qwen/Qwen3-14B-GGUF|Qwen3-14B-Q4_K_M.gguf|9001752960|1|1"
   "unsloth/Qwen3.6-27B-GGUF|Qwen3.6-27B-Q4_K_M.gguf|16817244384|1|1"
+  "unsloth/gemma-4-31B-it-GGUF|gemma-4-31B-it-Q4_K_M.gguf|18323731456|0|1"
   "unsloth/Qwen3.6-35B-A3B-GGUF|Qwen3.6-35B-A3B-UD-Q4_K_M.gguf|22134528992|1|1"
 )
 
@@ -246,18 +250,23 @@ main() {
     # Per-cell environment for run-engine-e2e.sh. The FILTER targets only the
     # profile-matrix method so the single boot does not also run the
     # happy-path + reasoning tests.
+    profile_filter="RealEngineLaunchE2ETests/test_realEngine_profileMatrixCell"
     env_args=(
       "PIE_TEST_E2E_REPO=$repo"
       "PIE_TEST_E2E_FILE=$file"
       "PIE_TEST_E2E_MIN_BYTES=$minfloor"
       "PIE_TEST_E2E_PROFILES=$PROFILES"
-      "PIE_TEST_E2E_FILTER=RealEngineLaunchE2ETests/test_realEngine_profileMatrixCell"
+      "PIE_TEST_E2E_FILTER=$profile_filter"
     )
     if [ "$thinking" = "1" ]; then
       env_args+=("PIE_TEST_REAL_EXPECT_REASONING=1")
     fi
     if [ "$semantic" = "1" ]; then
       env_args+=("PIE_TEST_REAL_EXPECT_SEMANTIC=1")
+    fi
+    if [ "$slug" = "unsloth/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf" ]; then
+      env_args+=("PIE_TEST_E2E_MAX_KV_PAGES=256")
+      env_args+=("PIE_TEST_E2E_DEFAULT_TOKEN_LIMIT=4096")
     fi
 
     set +e

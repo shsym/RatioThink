@@ -75,6 +75,22 @@ final class MatrixModelCatalogSyncTests: XCTestCase {
     }
   }
 
+  func test_gemma4_31b_matrix_row_is_all_profile_and_kv_bounded() throws {
+    let script = try readRepoFile("Scripts/run-matrix-e2e.sh")
+    let slug = "unsloth/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"
+    XCTAssertTrue(
+      script.contains("\"unsloth/gemma-4-31B-it-GGUF|gemma-4-31B-it-Q4_K_M.gguf|18323731456|0|1\""),
+      "Gemma 4 31B must have a matrix row with thinking=0 and semantic=1")
+    XCTAssertTrue(script.contains("PIE_TEST_E2E_MAX_KV_PAGES=256"),
+                  "Gemma 4 31B all-profile matrix run must shrink the KV page pool for the seated memory budget")
+    XCTAssertTrue(script.contains("PIE_TEST_E2E_DEFAULT_TOKEN_LIMIT=4096"),
+                  "Gemma 4 31B all-profile matrix run must bound per-request output tokens")
+    XCTAssertTrue(script.contains(slug),
+                  "Gemma 4 31B matrix row must target the exact verified slug")
+    XCTAssertTrue(script.contains("PIE_TEST_E2E_PROFILES:-$ALL_PROFILES"),
+                  "matrix default must continue exercising chat/tree-of-thought/fast-think/ceiling")
+  }
+
   /// Parse the `MATRIX_MODELS=( "repo|file|minBytes|thinking" ... )` array
   /// literal out of the wrapper. Tolerant of leading whitespace and the
   /// surrounding quotes; stops at the closing paren.

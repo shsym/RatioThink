@@ -186,6 +186,28 @@ final class CuratedModelCatalogTests: XCTestCase {
                    "the Gemma 4 entry must document Pie support constraints")
   }
 
+  /// Gemma 4 31B dense text GGUF. This is the larger dense sibling of
+  /// the verified 12B row and must stay a manual, monolithic, real-engine
+  /// candidate with the exact published blob size. Its full/global-attention
+  /// layers omit `v_proj`, so the support notes must preserve that launch-path
+  /// fact instead of looking like a generic Gemma 4 entry.
+  func test_gemma4_31b_entry_pins_single_file_coordinates_and_memory() {
+    let m = CuratedModelCatalog.model(withID: "gemma-4-31b-it-q4_k_m")
+    XCTAssertNotNil(m, "the Gemma 4 31B curated entry must exist")
+    XCTAssertEqual(m?.huggingFaceRepo, "unsloth/gemma-4-31B-it-GGUF")
+    XCTAssertEqual(m?.huggingFaceFile, "gemma-4-31B-it-Q4_K_M.gguf")
+    XCTAssertEqual(m?.approximateSizeBytes, 18_323_731_456)
+    XCTAssertEqual(m?.recommendedSystemMemoryBytes, 48 * 1024 * 1024 * 1024)
+    XCTAssertEqual(m?.installIntent, .manualOnly)
+    XCTAssertFalse(HFCacheCatalog.isSplitShardFilename(m?.huggingFaceFile ?? ""),
+                   "the Gemma 4 31B entry must be a monolithic single-file GGUF")
+    let notes = m?.pieSupportNotes ?? ""
+    XCTAssertTrue(notes.contains("v_proj"),
+                  "the Gemma 4 31B notes must call out full-layer v_proj omission")
+    XCTAssertTrue(notes.contains("global kv_heads=4"),
+                  "the Gemma 4 31B notes must pin the full-layer global kv-head count")
+  }
+
   /// #425 regression pin: Qwen2.5 7B Q4_K_M must come from bartowski's
   /// single-file repo, NOT the official `Qwen/Qwen2.5-7B-Instruct-GGUF`,
   /// which publishes that quant ONLY as `…-q4_k_m-00001-of-00002.gguf`

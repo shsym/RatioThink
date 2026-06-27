@@ -382,5 +382,27 @@ public enum CuratedModelCatalog {
       pieSupportNotes: "Single-file Gemma 4 text GGUF (general.architecture=gemma4 → PieArch::Gemma4); manual/local real-engine E2E only.",
       installIntent: .manualOnly
     ),
+    // Gemma 4 31B dense — same text-only Gemma 4 path as the verified 12B
+    // sibling, but the full/global-attention layers use the large-model
+    // alternative-attention layout: no v_proj tensor on those layers and
+    // global kv_heads=4 (sliding kv_heads=16). Header-probed from the
+    // single-file GGUF before pinning. Recommended memory is computed from
+    // the app's guardrail/KV budget: 18.3 GB weights + 15% overhead + bounded
+    // KV; 36 GiB admits the weights but leaves no KV after overhead, while
+    // 48 GiB leaves ~9k tokens, so the next usable tier is 48 GiB.
+    CuratedModel(
+      id: "gemma-4-31b-it-q4_k_m",
+      displayName: "Gemma 4 31B",
+      publisher: "Google",
+      parameterCountBillions: 31.0,
+      quantization: "Q4_K_M",
+      approximateSizeBytes: 18_323_731_456,
+      huggingFaceRepo: "unsloth/gemma-4-31B-it-GGUF",
+      huggingFaceFile: "gemma-4-31B-it-Q4_K_M.gguf",
+      summary: "Google's larger Gemma 4 dense chat model — explicit local quality tier for roomy Macs.",
+      recommendedSystemMemoryBytes: 48 * 1024 * 1024 * 1024,
+      pieSupportNotes: "Single-file Gemma 4 31B text GGUF (general.architecture=gemma4 → PieArch::Gemma4); full/global-attention layers omit v_proj and use global kv_heads=4; manual/local real-engine E2E only.",
+      installIntent: .manualOnly
+    ),
   ]
 }

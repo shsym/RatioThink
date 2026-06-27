@@ -1125,6 +1125,21 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
       XCTFail("resolver rejected chat profile: \(err.code.rawValue): \(err.message)")
       throw XCTSkip("resolver failure")
     }
+    let env = ProcessInfo.processInfo.environment
+    if let rawPages = env["PIE_TEST_E2E_MAX_KV_PAGES"], !rawPages.isEmpty {
+      guard let pages = Int(rawPages), pages > 0 else {
+        XCTFail("PIE_TEST_E2E_MAX_KV_PAGES must be a positive integer, got \(rawPages.debugDescription)")
+        throw XCTSkip("invalid PIE_TEST_E2E_MAX_KV_PAGES")
+      }
+      spec.maxNumKvPages = pages
+    }
+    if let rawLimit = env["PIE_TEST_E2E_DEFAULT_TOKEN_LIMIT"], !rawLimit.isEmpty {
+      guard let limit = Int(rawLimit), limit > 0 else {
+        XCTFail("PIE_TEST_E2E_DEFAULT_TOKEN_LIMIT must be a positive integer, got \(rawLimit.debugDescription)")
+        throw XCTSkip("invalid PIE_TEST_E2E_DEFAULT_TOKEN_LIMIT")
+      }
+      spec.defaultTokenLimit = min(spec.defaultTokenLimit ?? limit, limit)
+    }
     // Register the about-to-be-spawned `pie serve` pid with the
     // IsolatedTestCase reap net so a hung engine is SIGKILL-reaped after
     // the test even if the body throws or `host.stop()` (async) hasn't
