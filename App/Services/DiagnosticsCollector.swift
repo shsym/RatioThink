@@ -100,8 +100,8 @@ enum DiagnosticsCollector {
     return URL(fileURLWithPath: path)
   }
 
-  /// Collect, then reveal the `.zip` in Finder (or present an alert on failure).
-  /// Main-actor entry point for the menu command.
+  /// Collect, then reveal the `.zip` in Finder. Callers own failure feedback so
+  /// the user sees one surface (banner/overlay), not a modal plus inline error.
   @MainActor
   @discardableResult
   static func collectAndReveal() async -> URL? {
@@ -110,11 +110,7 @@ enum DiagnosticsCollector {
       NSWorkspace.shared.activateFileViewerSelecting([zip])
       return zip
     } catch {
-      let alert = NSAlert()
-      alert.messageText = "Couldn't collect diagnostics"
-      alert.informativeText = error.localizedDescription
-      alert.alertStyle = .warning
-      alert.runModal()
+      NSLog("Couldn't collect diagnostics: \(error.localizedDescription)")
       return nil
     }
   }

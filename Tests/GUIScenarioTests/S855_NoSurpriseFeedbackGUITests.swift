@@ -56,6 +56,21 @@ final class S855_NoSurpriseFeedbackGUITests: XCTestCase {
   }
 
   @MainActor
+  func test_banner_helper_restart_failure_shows_failed_feedback_without_success() throws {
+    let app = launchHelperUnreachable(pinnedRestartResult: "fail")
+    defer { app.terminate() }
+
+    let restart = app.buttons["status.banner.forceRestart"].firstMatch
+    XCTAssertTrue(restart.waitForExistence(timeout: 10), "Force Restart missing; app: \(app.debugDescription)")
+    restart.click()
+
+    XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "status.banner.action.failed").firstMatch.waitForExistence(timeout: 5),
+                  "banner restart failure feedback missing; app: \(app.debugDescription)")
+    XCTAssertFalse(app.descendants(matching: .any).matching(identifier: "status.banner.action.succeeded").firstMatch.waitForExistence(timeout: 1),
+                   "unreachable helper restart unexpectedly showed success; app: \(app.debugDescription)")
+  }
+
+  @MainActor
   private func launchPinnedRunning() -> XCUIApplication {
     let pieHome = "/tmp/pie-s855-local-api-" + UUID().uuidString
     tempHomes.append(pieHome)
@@ -74,13 +89,16 @@ final class S855_NoSurpriseFeedbackGUITests: XCTestCase {
   }
 
   @MainActor
-  private func launchHelperUnreachable() -> XCUIApplication {
+  private func launchHelperUnreachable(pinnedRestartResult: String? = nil) -> XCUIApplication {
     let pieHome = "/tmp/pie-s855-banner-" + UUID().uuidString
     tempHomes.append(pieHome)
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
     app.launchArguments.append(contentsOf: ["-NSQuitAlwaysKeepsWindows", "NO", "-ApplePersistenceIgnoreState", "YES"])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "unreachable"
+    if let pinnedRestartResult {
+      app.launchEnvironment["PIE_TEST_PIN_HELPER_RESTART"] = pinnedRestartResult
+    }
     app.launchEnvironment["PIE_TEST_DIAGNOSTICS_FAKE_ZIP"] = "/tmp/pie-s855-diagnostics.zip"
     app.launchEnvironment["PIE_TEST_DIAGNOSTICS_DELAY_MS"] = "2500"
     app.launchEnvironment["PIE_TEST_STATUS_ACTION_DELAY_MS"] = "2500"

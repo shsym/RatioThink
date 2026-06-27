@@ -93,7 +93,7 @@ struct RatioThinkApp: App {
   /// `PIE_TEST_STALL_WATCHDOG=1`.
   @StateObject private var stallWatchdog = MainThreadStallWatchdog()
   #endif
-  @State private var commandActionFeedback: CommandActionFeedback?
+  @State private var commandActionFeedback: ActionFeedback?
 
   /// #587 resume trigger: re-arm the (possibly paused) engine-status poll
   /// loop when the app returns to the foreground, so the user always sees a
@@ -373,7 +373,8 @@ struct RatioThinkApp: App {
     #endif
     let controller = HelperHealthController(
       repair: helperRepair,
-      pinnedHealth: pinnedHelperHealth
+      pinnedHealth: pinnedHelperHealth,
+      pinnedManualRestartSucceeds: Self.pinnedHelperRestartSucceedsForTesting()
     )
     // Set BEFORE statusStore.start() so the first ticks count.
     statusStore.onPollOutcome = { [weak controller] succeeded in
@@ -398,6 +399,14 @@ struct RatioThinkApp: App {
     case "healthy":     return .healthy
     default:            return nil
     }
+  }
+
+  private static func pinnedHelperRestartSucceedsForTesting() -> Bool {
+    #if DEBUG
+    return ProcessInfo.processInfo.environment["PIE_TEST_PIN_HELPER_RESTART"] != "fail"
+    #else
+    return true
+    #endif
   }
   #endif
 
@@ -581,14 +590,7 @@ struct RatioThinkApp: App {
 
   @MainActor
   private func collectDiagnosticsFromCommand() {
-    commandActionFeedback = .running(DiagnosticsCollector.runningMessage)
-    Task {
-      if let zip = await DiagnosticsCollector.collectAndReveal() {
-        commandActionFeedback = .succeeded(DiagnosticsCollector.successMessage(zip))
-      } else {
-        commandActionFeedback = .failed("Couldn't collect diagnostics.")
-      }
-    }
+    collectDiagnosticsWithActionFeedback { commandActionFeedback = $0 }
   }
 
   /// Durable launch breadcrumb: proves the app process started, and records the
@@ -673,10 +675,17 @@ struct RatioThinkApp: App {
         .handlesSettingsDeepLink(settingsNavigation: settingsNavigation)
         .overlay(alignment: .top) {
           if let commandActionFeedback {
-            CommandActionFeedbackView(feedback: commandActionFeedback)
+            ActionFeedbackView(
+              feedback: commandActionFeedback,
+              accessibilityPrefix: "app.command.action",
+              style: .commandOverlay
+            )
               .padding(.top, 8)
               .padding(.horizontal, 12)
           }
+        }
+        .autoDismissActionFeedback(commandActionFeedback) {
+          commandActionFeedback = nil
         }
         // #587: re-arm the adaptive poll loop on foreground. `start()` is
         // idempotent, so this is free when the loop is already running and
@@ -775,49 +784,6 @@ struct RatioThinkApp: App {
         .environmentObject(guardrailRevision)
         .environmentObject(specMetricsStore)
         .environmentObject(contextUsageTracker)
-    }
-  }
-}
-
-private enum CommandActionFeedback: Equatable {
-  case running(String)
-  case succeeded(String)
-  case failed(String)
-}
-
-private struct CommandActionFeedbackView: View {
-  let feedback: CommandActionFeedback
-
-  var body: some View {
-    HStack(spacing: 8) {
-      switch feedback {
-      case .running(let message):
-        ProgressView().controlSize(.small)
-        Text(message)
-      case .succeeded(let message):
-        Image(systemName: "checkmark.circle.fill")
-          .foregroundStyle(.green)
-          .accessibilityHidden(true)
-        Text(message)
-      case .failed(let message):
-        Image(systemName: "exclamationmark.triangle.fill")
-          .foregroundStyle(.orange)
-          .accessibilityHidden(true)
-        Text(message)
-      }
-    }
-    .font(.callout)
-    .padding(.horizontal, 12)
-    .padding(.vertical, 8)
-    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-    .accessibilityIdentifier(identifier)
-  }
-
-  private var identifier: String {
-    switch feedback {
-    case .running: return "app.command.action.running"
-    case .succeeded: return "app.command.action.succeeded"
-    case .failed: return "app.command.action.failed"
     }
   }
 }

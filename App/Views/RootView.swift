@@ -35,7 +35,9 @@ struct RootView: View {
   @Environment(\.openURL) private var openURL
   @State private var didEvaluateLocalAPIAutoStart = false
   @State private var localAPIAutoStartError: String?
-  @State private var statusBannerActionFeedback: StatusBannerActionFeedback?
+  @State private var statusBannerActionFeedback: ActionFeedback?
+  @State private var awaitingHelperRestartOutcome = false
+  @State private var helperRestartFeedbackGeneration = 0
 
   var body: some View {
     VStack(spacing: 0) {
@@ -59,7 +61,11 @@ struct RootView: View {
         onCollectDiagnostics: { collectDiagnosticsFromBanner() }
       )
       if let statusBannerActionFeedback {
-        StatusBannerActionFeedbackView(feedback: statusBannerActionFeedback)
+        ActionFeedbackView(
+          feedback: statusBannerActionFeedback,
+          accessibilityPrefix: "status.banner.action",
+          style: .banner
+        )
       }
       if let localAPIAutoStartError {
         LocalAPIAutoStartErrorBanner(message: localAPIAutoStartError) {
@@ -111,6 +117,9 @@ struct RootView: View {
         }
       }
     }
+    .autoDismissActionFeedback(statusBannerActionFeedback) {
+      statusBannerActionFeedback = nil
+    }
     .task { await runLaunchUpdateCheck() }
     .onAppear { maybeAutoStartLocalAPIOnLaunch() }
     .onChange(of: engineStatusStore.status) { _, new in
@@ -118,6 +127,9 @@ struct RootView: View {
         localAPIAutoStartError = nil
       }
       maybeAutoStartLocalAPIOnLaunch()
+    }
+    .onChange(of: helperHealth.health) { _, new in
+      updateHelperRestartFeedback(for: new, generation: helperRestartFeedbackGeneration)
     }
     // #512: leaving an empty "New Chat" shell deletes it. Hooked on the
     // selection (not view teardown) so it covers chat-switch, new-chat
@@ -197,11 +209,31 @@ struct RootView: View {
   }
 
   private func restartHelperFromBanner() {
+    helperRestartFeedbackGeneration += 1
+    let generation = helperRestartFeedbackGeneration
+    awaitingHelperRestartOutcome = true
     statusBannerActionFeedback = .running("Restarting helper…")
     helperHealth.restartHelperManually()
-    Task { @MainActor in
-      try? await Task.sleep(nanoseconds: Self.statusActionFeedbackDelayNanoseconds())
-      statusBannerActionFeedback = .succeeded("Helper restart requested.")
+    updateHelperRestartFeedback(for: helperHealth.health, generation: generation)
+  }
+
+  private func updateHelperRestartFeedback(for health: HelperHealth, generation: Int) {
+    guard awaitingHelperRestartOutcome, generation == helperRestartFeedbackGeneration else { return }
+    switch health {
+    case .healthy:
+      awaitingHelperRestartOutcome = false
+      Task { @MainActor in
+        try? await Task.sleep(nanoseconds: Self.statusActionFeedbackDelayNanoseconds())
+        guard generation == helperRestartFeedbackGeneration else { return }
+        statusBannerActionFeedback = .succeeded("Helper restarted.")
+      }
+    case .unreachable:
+      awaitingHelperRestartOutcome = false
+      statusBannerActionFeedback = .failed(
+        "Helper restart failed. Re-enable it in Login Items or collect diagnostics."
+      )
+    case .reconnecting, .repairing, .repairCoolingDown:
+      statusBannerActionFeedback = .running("Restarting helper…")
     }
   }
 
@@ -216,14 +248,7 @@ struct RootView: View {
   }
 
   private func collectDiagnosticsFromBanner() {
-    statusBannerActionFeedback = .running(DiagnosticsCollector.runningMessage)
-    Task { @MainActor in
-      if let zip = await DiagnosticsCollector.collectAndReveal() {
-        statusBannerActionFeedback = .succeeded(DiagnosticsCollector.successMessage(zip))
-      } else {
-        statusBannerActionFeedback = .failed("Couldn't collect diagnostics.")
-      }
-    }
+    collectDiagnosticsWithActionFeedback { statusBannerActionFeedback = $0 }
   }
 
   /// Honor the Local API startup preference once per window lifetime after
@@ -261,45 +286,82 @@ struct RootView: View {
   }
 }
 
-private enum StatusBannerActionFeedback: Equatable {
+/// Common feedback model for app-command and status-banner actions that share
+/// the same running / terminal lifecycle.
+enum ActionFeedback: Equatable {
   case running(String)
   case succeeded(String)
   case failed(String)
+
+  var message: String {
+    switch self {
+    case .running(let message), .succeeded(let message), .failed(let message):
+      return message
+    }
+  }
+
+  var isTerminal: Bool {
+    switch self {
+    case .running: return false
+    case .succeeded, .failed: return true
+    }
+  }
+
+  func accessibilityIdentifier(prefix: String) -> String {
+    switch self {
+    case .running: return "\(prefix).running"
+    case .succeeded: return "\(prefix).succeeded"
+    case .failed: return "\(prefix).failed"
+    }
+  }
 }
 
-private struct StatusBannerActionFeedbackView: View {
-  let feedback: StatusBannerActionFeedback
+struct ActionFeedbackView: View {
+  enum Style {
+    case banner
+    case commandOverlay
+  }
+
+  let feedback: ActionFeedback
+  let accessibilityPrefix: String
+  let style: Style
 
   var body: some View {
     HStack(spacing: 8) {
       switch feedback {
-      case .running(let message):
+      case .running:
         ProgressView().controlSize(.small)
-        Text(message)
-        Spacer(minLength: 0)
-      case .succeeded(let message):
+      case .succeeded:
         Image(systemName: "checkmark.circle.fill")
           .foregroundStyle(.green)
           .accessibilityHidden(true)
-        Text(message)
-        Spacer(minLength: 0)
-      case .failed(let message):
+      case .failed:
         Image(systemName: "exclamationmark.triangle.fill")
           .foregroundStyle(.orange)
           .accessibilityHidden(true)
-        Text(message)
-        Spacer(minLength: 0)
       }
+      Text(feedback.message)
+      if style == .banner { Spacer(minLength: 0) }
     }
     .font(.callout)
     .padding(.horizontal, 12)
     .padding(.vertical, 8)
-    .frame(maxWidth: .infinity, alignment: .leading)
+    .frame(maxWidth: style == .banner ? .infinity : nil, alignment: .leading)
     .background(background)
-    .accessibilityIdentifier(identifier)
+    .accessibilityIdentifier(feedback.accessibilityIdentifier(prefix: accessibilityPrefix))
   }
 
-  private var background: Color {
+  @ViewBuilder
+  private var background: some View {
+    switch style {
+    case .commandOverlay:
+      RoundedRectangle(cornerRadius: 10).fill(.regularMaterial)
+    case .banner:
+      bannerBackground
+    }
+  }
+
+  private var bannerBackground: Color {
     switch feedback {
     case .running:
       return Color.accentColor.opacity(0.10)
@@ -309,15 +371,41 @@ private struct StatusBannerActionFeedbackView: View {
       return Color.orange.opacity(0.12)
     }
   }
+}
 
-  private var identifier: String {
-    switch feedback {
-    case .running:
-      return "status.banner.action.running"
-    case .succeeded:
-      return "status.banner.action.succeeded"
-    case .failed:
-      return "status.banner.action.failed"
+extension View {
+  func autoDismissActionFeedback(
+    _ feedback: ActionFeedback?,
+    clear: @escaping @MainActor () -> Void
+  ) -> some View {
+    task(id: feedback) {
+      guard let feedback, feedback.isTerminal else { return }
+      try? await Task.sleep(nanoseconds: ActionFeedbackLifecycle.terminalAutoDismissDelayNanoseconds())
+      if !Task.isCancelled { await clear() }
+    }
+  }
+}
+
+enum ActionFeedbackLifecycle {
+  static func terminalAutoDismissDelayNanoseconds() -> UInt64 {
+    #if DEBUG
+    if let raw = ProcessInfo.processInfo.environment["PIE_TEST_ACTION_FEEDBACK_DISMISS_MS"],
+       let milliseconds = UInt64(raw) {
+      return milliseconds * 1_000_000
+    }
+    #endif
+    return 4_000_000_000
+  }
+}
+
+@MainActor
+func collectDiagnosticsWithActionFeedback(_ setFeedback: @escaping @MainActor (ActionFeedback) -> Void) {
+  setFeedback(.running(DiagnosticsCollector.runningMessage))
+  Task { @MainActor in
+    if let zip = await DiagnosticsCollector.collectAndReveal() {
+      setFeedback(.succeeded(DiagnosticsCollector.successMessage(zip)))
+    } else {
+      setFeedback(.failed("Couldn't collect diagnostics."))
     }
   }
 }

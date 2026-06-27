@@ -31,6 +31,7 @@ public final class HelperHealthController: ObservableObject {
   /// (→ `.healthy`) so the GUI can exercise the overlay's auto-dismiss. Set
   /// ONLY from the DEBUG `PIE_TEST_PIN_HELPER_HEALTH` launch path.
   private let isPinned: Bool
+  private let pinnedManualRestartSucceeds: Bool
   /// In-flight repair. The reducer transitions to `.repairing` and THIS task
   /// owns the matching `repairFinished` event; a new repair / a recovery
   /// cancels it so attempts never overlap.
@@ -47,10 +48,12 @@ public final class HelperHealthController: ObservableObject {
 
   public init(policy: HelperHealthPolicy = HelperHealthPolicy(),
               repair: @escaping () async -> Bool,
-              pinnedHealth: HelperHealth? = nil) {
+              pinnedHealth: HelperHealth? = nil,
+              pinnedManualRestartSucceeds: Bool = true) {
     self.policy = policy
     self.repair = repair
     self.isPinned = pinnedHealth != nil
+    self.pinnedManualRestartSucceeds = pinnedManualRestartSucceeds
     if let pinnedHealth { self.health = pinnedHealth }
   }
 
@@ -114,7 +117,8 @@ public final class HelperHealthController: ObservableObject {
     // back `.healthy`, which drives the overlay's auto-dismiss. Production
     // (non-pinned) runs the real ladder via `apply(.manualRestart)`.
     if isPinned {
-      if health != .healthy { health = .healthy }
+      let next: HelperHealth = pinnedManualRestartSucceeds ? .healthy : .unreachable
+      if health != next { health = next }
       return
     }
     apply(.manualRestart)
