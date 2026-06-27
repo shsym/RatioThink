@@ -88,6 +88,23 @@
       ],
       "think": false
     },
+    "mmlu": {
+      "bound": "full",
+      "bound_rationale": "Full `all` config test split = 14042 multiple-choice questions; A/B/C/D choices are rendered and graded as 1/2/3/4 for ToT numeric-majority scoring.",
+      "category": "knowledge",
+      "citation": "Hendrycks et al., Measuring Massive Multitask Language Understanding (ICLR 2021).",
+      "config": "all",
+      "content_sha256": "fa381666be63e6e9e9627d456a3c61f5fadd9827c086c85fb232500e27d753b1",
+      "count": 14042,
+      "grader": "mcq_numeric",
+      "hf_repo": "cais/mmlu",
+      "license": "mit",
+      "revision": "c30699e8356da336a370243923dbaf21066bb9fe",
+      "splits": [
+        "test"
+      ],
+      "think": true
+    },
     "mtbench": {
       "bound": "full",
       "bound_rationale": "Full 80-question set; turn-1 user prompt per question.",

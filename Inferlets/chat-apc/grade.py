@@ -258,6 +258,15 @@ def gsm8k_numeric(output: str, reference: dict) -> GradeResult:
     return GradeResult(ok, f"got={got!r} gold={gold!r}")
 
 
+def mcq_numeric(output: str, reference: dict) -> GradeResult:
+    gold = str(reference["final_answer"]).strip()
+    got = last_number(output or "")
+    if got is None:
+        return GradeResult(None, "no numeric choice in model output")
+    ok = got.strip() == gold
+    return GradeResult(ok, f"got={got!r} gold={gold!r}")
+
+
 def humaneval_exec(output: str, reference: dict) -> GradeResult:
     if not (output or "").strip():
         return GradeResult(None, "empty model output")
@@ -317,6 +326,7 @@ def jsonschema_validate(output: str, reference: dict) -> GradeResult:
 
 GRADERS: dict[str, Callable[[str, dict], GradeResult]] = {
     "gsm8k_numeric": gsm8k_numeric,
+    "mcq_numeric": mcq_numeric,
     "humaneval_exec": humaneval_exec,
     "mbpp_exec": mbpp_exec,
     "jsonschema_validate": jsonschema_validate,

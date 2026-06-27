@@ -96,6 +96,21 @@ def _gsm8k_prompt(rec: dict) -> str:
     return rec["question"].strip()
 
 
+def _mmlu_prompt(rec: dict) -> str:
+    # MMLU is A/B/C/D in the source; render as 1/2/3/4 so shipped ToT's
+    # reasoning task can use numeric-majority leaf selection and the grader can
+    # reuse the numeric extraction convention.
+    choices = _as_list(rec["choices"])
+    numbered = "\n".join(f"{i}. {choice}" for i, choice in enumerate(choices, 1))
+    subject = str(rec.get("subject") or "general_knowledge").replace("_", " ")
+    return (
+        f"Answer this multiple-choice question about {subject}.\n\n"
+        f"Question: {rec['question'].strip()}\n\n"
+        f"Choices:\n{numbered}\n\n"
+        "Answer with only the number of the correct choice (1, 2, 3, or 4)."
+    )
+
+
 def _cnndm_prompt(rec: dict) -> str:
     # Abstractive summarization — copies spans from the source, so n-gram
     # drafting is expected to do relatively well (RAG/summarize row).
@@ -135,6 +150,15 @@ def _gsm8k_reference(rec: dict) -> dict:
         raise ValueError("gsm8k answer missing '####' final-answer marker")
     gold = answer.split("####")[-1].strip().replace(",", "").replace("$", "")
     return {"final_answer": gold}
+
+
+def _mmlu_reference(rec: dict) -> dict:
+    # Source answer is zero-based A/B/C/D. Store 1/2/3/4 for numeric ToT leaves.
+    answer = int(rec["answer"])
+    choices = _as_list(rec["choices"])
+    if answer < 0 or answer >= len(choices):
+        raise ValueError(f"mmlu answer index {answer} outside {len(choices)} choices")
+    return {"final_answer": str(answer + 1)}
 
 
 def _humaneval_reference(rec: dict) -> dict:
@@ -231,6 +255,25 @@ REGISTRY: dict[str, dict] = {
         "builder": _gsm8k_prompt,
         "grader": "gsm8k_numeric",
         "ref_builder": _gsm8k_reference,
+    },
+    "mmlu": {
+        "hf_repo": "cais/mmlu",
+        "revision": "c30699e8356da336a370243923dbaf21066bb9fe",
+        "config": "all",
+        "splits": ["test"],
+        "category": "knowledge",
+        "license": "mit",
+        "citation": "Hendrycks et al., Measuring Massive Multitask Language Understanding (ICLR 2021).",
+        "bound": "full",
+        "bound_rationale": (
+            "Full `all` config test split = 14042 multiple-choice questions; "
+            "A/B/C/D choices are rendered and graded as 1/2/3/4 for ToT numeric-majority scoring."
+        ),
+        "think": True,
+        "id_field": None,
+        "builder": _mmlu_prompt,
+        "grader": "mcq_numeric",
+        "ref_builder": _mmlu_reference,
     },
     "cnndm": {
         "hf_repo": "abisee/cnn_dailymail",
