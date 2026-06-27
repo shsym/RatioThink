@@ -583,7 +583,8 @@ struct ChatScaffoldView: View {
           // #507: the composer's stop button — the user-reachable cancel
           // for this chat's in-flight turn (review v1 F1).
           onStop: { sendCoordinator.cancel(chatID: chatID) },
-          contextUsage: contextUsageTracker.latestUsage(chatID: chat.id),
+          attachmentEngineTokenLimit: modelLoadCenter.residentMaxOutputTokens,
+          attachmentModelContextLength: attachmentModelContextLength(for: chat),
           autoSubmit: pendingSend.autoSubmit
         )
       }
@@ -1600,6 +1601,14 @@ struct ChatScaffoldView: View {
   private func gateTarget(for chat: Chat) -> ModelTarget? {
     Self.gateTarget(selectedModelID: chat.modelID,
                     profileDefaultModel: selectedProfileDefault)
+  }
+
+  private func attachmentModelContextLength(for chat: Chat) -> Int? {
+    guard let modelID = gateTarget(for: chat)?.modelID,
+          let installed = library.installed.first(where: { $0.filename == modelID }) else {
+      return nil
+    }
+    return ModelArchMetadata.read(resolvedModelURL: installed.url)?.contextLength
   }
 
   /// #673: decide whether a chat-toolbar profile swap must reload the engine.

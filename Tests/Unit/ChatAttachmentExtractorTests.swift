@@ -34,14 +34,48 @@ final class ChatAttachmentExtractorTests: XCTestCase {
     XCTAssertEqual(ChatAttachmentExtractor.combinedContext([first, second]), "aaaaaaaa\n\nbbbbbbbb")
   }
 
-  func test_overflowWarningTriggersOnlyWhenEstimatedPromptExceedsKnownWindow() {
-    let attachments = [PendingChatAttachment(filename: "long.txt", extractedText: String(repeating: "x", count: 80), iconSystemName: "doc.text")]
+  func test_contextLimitBudgetUsesHalfOfSmallerEngineAndModelLimit() {
+    XCTAssertEqual(
+      ChatAttachmentContextLimiter.budget(engineProvidedMaxTokens: 100, modelConfiguredContextLength: 1000),
+      50
+    )
+    XCTAssertEqual(
+      ChatAttachmentContextLimiter.budget(engineProvidedMaxTokens: 1000, modelConfiguredContextLength: 120),
+      60
+    )
+  }
 
-    XCTAssertNil(ComposerView.attachmentOverflowWarning(draft: "hi", attachments: attachments, contextUsage: nil))
-    XCTAssertNotNil(ComposerView.attachmentOverflowWarning(
-      draft: "hi",
+  func test_contextUnderBudgetStoresCombinedTextUnchangedWithoutAlert() {
+    let attachments = [
+      PendingChatAttachment(filename: "a.txt", extractedText: "alpha", iconSystemName: "doc.text"),
+      PendingChatAttachment(filename: "b.txt", extractedText: "beta", iconSystemName: "doc.text"),
+    ]
+
+    let result = ChatAttachmentContextLimiter.limitedContext(
       attachments: attachments,
-      contextUsage: ContextUsage(usedTokens: 90, windowTokens: 100)
-    ))
+      engineProvidedMaxTokens: 100,
+      modelConfiguredContextLength: 100
+    )
+
+    XCTAssertEqual(result.text, "alpha\n\nbeta")
+    XCTAssertNil(result.notice)
+    XCTAssertFalse(result.wasTruncated)
+  }
+
+  func test_contextOverBudgetStoresFrontTruncatedPrefixAndShowsAlert() {
+    let attachments = [
+      PendingChatAttachment(filename: "long.txt", extractedText: String(repeating: "a", count: 20), iconSystemName: "doc.text"),
+      PendingChatAttachment(filename: "tail.txt", extractedText: String(repeating: "b", count: 20), iconSystemName: "doc.text"),
+    ]
+
+    let result = ChatAttachmentContextLimiter.limitedContext(
+      attachments: attachments,
+      engineProvidedMaxTokens: 4,
+      modelConfiguredContextLength: 100
+    )
+
+    XCTAssertEqual(result.text, "aaaaaaaa")
+    XCTAssertEqual(result.notice, ChatAttachmentContextLimiter.truncationNotice)
+    XCTAssertTrue(result.wasTruncated)
   }
 }

@@ -37,7 +37,8 @@ struct ComposerView: View {
   /// `ChatSendController.cancel` keeps a non-empty partial bubble as a
   /// cancelled turn (excluded from future request history).
   let onStop: () -> Void
-  let contextUsage: ContextUsage?
+  let attachmentEngineTokenLimit: Int?
+  let attachmentModelContextLength: Int?
   /// #516: a fired pending auto-send. The composer re-runs its normal
   /// `submit()` path — same persistence, same gate, same in-flight
   /// lifecycle as a manual send — but ONLY while the live draft still
@@ -126,7 +127,8 @@ struct ComposerView: View {
     onSendBlocked: @escaping (String) -> Void = { _ in },
     onUserMessageSaved: @escaping (Message) -> Void = { _ in },
     onStop: @escaping () -> Void = {},
-    contextUsage: ContextUsage? = nil,
+    attachmentEngineTokenLimit: Int? = nil,
+    attachmentModelContextLength: Int? = nil,
     autoSubmit: ComposerAutoSubmit? = nil
   ) {
     self.chat = chat
@@ -136,7 +138,8 @@ struct ComposerView: View {
     self.onSendBlocked = onSendBlocked
     self.onUserMessageSaved = onUserMessageSaved
     self.onStop = onStop
-    self.contextUsage = contextUsage
+    self.attachmentEngineTokenLimit = attachmentEngineTokenLimit
+    self.attachmentModelContextLength = attachmentModelContextLength
     self.autoSubmit = autoSubmit
   }
 
@@ -248,13 +251,15 @@ struct ComposerView: View {
   private func submit() {
     let payload = trimmedDraft
     guard (!payload.isEmpty || !pendingAttachments.isEmpty), !isSending else { return }
-    if let warning = Self.attachmentOverflowWarning(
-      draft: payload,
+    let attachmentContext = Self.preparedAttachmentContext(
       attachments: pendingAttachments,
-      contextUsage: contextUsage
-    ) {
-      attachmentNotice = warning
-      return
+      engineProvidedMaxTokens: attachmentEngineTokenLimit,
+      modelConfiguredContextLength: attachmentModelContextLength
+    ) { message in
+      composerLog.error("\(message, privacy: .public)")
+    }
+    if let notice = attachmentContext.notice {
+      attachmentNotice = notice
     }
     // : block before persisting if no model is resolvable. Keep the
     // draft so the user can send it once they load/choose a model.
@@ -274,7 +279,7 @@ struct ComposerView: View {
     let message = Message(
       role: ChatMessage.Role.user.rawValue,
       content: payload,
-      extractedAttachmentText: ChatAttachmentExtractor.combinedContext(pendingAttachments).nilIfEmpty,
+      extractedAttachmentText: attachmentContext.text.nilIfEmpty,
       ts: Date()
     )
     let previousUpdatedAt = chat.updatedAt
@@ -294,7 +299,7 @@ struct ComposerView: View {
       try modelContext.save()
       draft = ""
       pendingAttachments = []
-      attachmentNotice = nil
+      attachmentNotice = attachmentContext.notice
       onUserMessageSaved(message)
     } catch {
       // UI / store divergence repair ( F8): peel the in-memory
@@ -353,21 +358,18 @@ struct ComposerView: View {
     attachmentNotice = notices.first
   }
 
-  static func attachmentOverflowWarning(
-    draft: String,
+  static func preparedAttachmentContext(
     attachments: [PendingChatAttachment],
-    contextUsage: ContextUsage?
-  ) -> String? {
-    guard !attachments.isEmpty,
-          let usage = contextUsage,
-          let window = usage.windowTokens,
-          window > 0 else {
-      return nil
-    }
-    let addedCharacters = draft.count + ChatAttachmentExtractor.combinedContext(attachments).count
-    let estimatedAddedTokens = max(1, Int(ceil(Double(addedCharacters) / 4.0)))
-    guard usage.usedTokens + estimatedAddedTokens > window else { return nil }
-    return "Attached files may exceed the current context window. Remove files or shorten the message before sending."
+    engineProvidedMaxTokens: Int?,
+    modelConfiguredContextLength: Int?,
+    logUnavailable: (String) -> Void = { _ in }
+  ) -> ChatAttachmentContextLimiter.Result {
+    ChatAttachmentContextLimiter.limitedContext(
+      attachments: attachments,
+      engineProvidedMaxTokens: engineProvidedMaxTokens,
+      modelConfiguredContextLength: modelConfiguredContextLength,
+      logUnavailable: logUnavailable
+    )
   }
 }
 

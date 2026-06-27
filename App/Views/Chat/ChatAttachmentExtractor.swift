@@ -69,3 +69,48 @@ enum ChatAttachmentExtractor {
     return PendingChatAttachment(filename: filename, extractedText: text, iconSystemName: "doc.richtext")
   }
 }
+
+enum ChatAttachmentContextLimiter {
+  struct Result: Equatable {
+    let text: String
+    let notice: String?
+    let wasTruncated: Bool
+  }
+
+  static let truncationNotice = "Only the front portion of the attached document(s) was added."
+
+  static func budget(engineProvidedMaxTokens: Int, modelConfiguredContextLength: Int) -> Int {
+    Int(floor(Double(min(engineProvidedMaxTokens, modelConfiguredContextLength)) * 0.5))
+  }
+
+  static func limitedContext(
+    attachments: [PendingChatAttachment],
+    engineProvidedMaxTokens: Int?,
+    modelConfiguredContextLength: Int?,
+    logUnavailable: (String) -> Void = { _ in }
+  ) -> Result {
+    let combined = ChatAttachmentExtractor.combinedContext(attachments)
+    guard !combined.isEmpty else {
+      return Result(text: "", notice: nil, wasTruncated: false)
+    }
+    guard let engineProvidedMaxTokens, engineProvidedMaxTokens > 0,
+          let modelConfiguredContextLength, modelConfiguredContextLength > 0 else {
+      logUnavailable("Attachment context budget unavailable before send; persisting full extracted attachment text.")
+      return Result(text: combined, notice: nil, wasTruncated: false)
+    }
+
+    let tokenBudget = budget(
+      engineProvidedMaxTokens: engineProvidedMaxTokens,
+      modelConfiguredContextLength: modelConfiguredContextLength
+    )
+    let maxCharacters = max(0, tokenBudget * 4)
+    guard combined.count > maxCharacters else {
+      return Result(text: combined, notice: nil, wasTruncated: false)
+    }
+    return Result(
+      text: String(combined.prefix(maxCharacters)),
+      notice: truncationNotice,
+      wasTruncated: true
+    )
+  }
+}
