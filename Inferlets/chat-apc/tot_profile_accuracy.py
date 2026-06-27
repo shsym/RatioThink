@@ -56,6 +56,14 @@ TOT_TEMPERATURE = float(os.environ.get("TOT_TEMPERATURE", "0.7"))
 OUT = os.environ.get("PROFILE_ACCURACY_OUT", "tot_profile_accuracy.json")
 
 
+class ModelBootError(Exception):
+    """Expected per-model boot/setup failure that should not abort the matrix."""
+
+    def __init__(self, original: Exception):
+        self.original = original
+        super().__init__(f"{type(original).__name__}: {original}")
+
+
 @dataclass
 class ArmResult:
     answer: str | None = None
@@ -263,8 +271,9 @@ def _empty_cell(first_error: str | None = None) -> dict:
     }
 
 
-def model_boot_error_row(model: str, exc: Exception) -> dict:
-    err = f"{type(exc).__name__}: {exc}"
+def model_boot_error_row(model: str, exc: ModelBootError) -> dict:
+    original = exc.original
+    err = f"{type(original).__name__}: {original}"
     return {
         "model": model,
         "dataset": DATASET,
@@ -284,7 +293,7 @@ async def collect_model_rows(models: list[str], run_one, write_partial=None) -> 
     for index, model in enumerate(models, 1):
         try:
             row = await run_one(index, model)
-        except Exception as exc:  # noqa: BLE001 - model-level failure is reported, not fatal.
+        except ModelBootError as exc:
             row = model_boot_error_row(model, exc)
             print(f"[profile-accuracy] model boot failed for {model}: {row['boot_error']}",
                   file=sys.stderr, flush=True)
@@ -292,6 +301,28 @@ async def collect_model_rows(models: list[str], run_one, write_partial=None) -> 
         if write_partial is not None:
             write_partial(rows)
     return rows
+
+
+def atomic_write_json(path: str | Path, payload: dict) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=str(target.parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w") as tmp:
+            json.dump(payload, tmp, indent=2)
+            tmp.write("\n")
+        os.replace(tmp_name, target)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def has_any_graded_item(artifact: dict) -> bool:
@@ -419,7 +450,7 @@ async def _run() -> dict:
     }
 
     def write_partial(rows: list[dict]) -> None:
-        Path(OUT).write_text(json.dumps(build_artifact(rows, settings), indent=2))
+        atomic_write_json(OUT, build_artifact(rows, settings))
 
     async def run_one(index: int, model: str) -> dict:
         print(f"\n[profile-accuracy] booting model={model}", flush=True)
@@ -434,29 +465,39 @@ async def _run() -> dict:
                 "PIE_HOME": str(pie_home),
                 "PIE_SHMEM_NAME": shmem_name(index),
             }
-            proc = subprocess.Popen(
-                [str(h.PIE_BIN), "serve", "--config", str(cfg), "--no-auth", "--debug"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=env,
-                bufsize=1,
-            )
             try:
-                ws_addr, token = await h._parse_handshake(proc, timeout=300)
-                print(f"[profile-accuracy] engine ws=ws://{ws_addr}", flush=True)
+                proc = subprocess.Popen(
+                    [str(h.PIE_BIN), "serve", "--config", str(cfg), "--no-auth", "--debug"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=env,
+                    bufsize=1,
+                )
+            except Exception as exc:  # noqa: BLE001 - subprocess setup is a model boot failure.
+                raise ModelBootError(exc) from exc
+            try:
+                try:
+                    ws_addr, token = await h._parse_handshake(proc, timeout=300)
+                    print(f"[profile-accuracy] engine ws=ws://{ws_addr}", flush=True)
+                except Exception as exc:  # noqa: BLE001 - handshake is a model boot failure.
+                    raise ModelBootError(exc) from exc
+
                 drain = asyncio.create_task(h._drain_stdout(proc))
                 try:
-                    client = PieClient(f"ws://{ws_addr}")
-                    await client.connect()
-                    await client.auth_by_token(token)
-                    await client.install_program(h.WASM_PATH, h.MANIFEST_PATH,
-                                                 force_overwrite=True)
-                    port = h._free_port()
-                    base_url = f"http://127.0.0.1:{port}"
-                    await client.launch_daemon("chat-apc@0.1.0", port)
-                    if not h._wait_for_port(port, timeout=30):
-                        raise RuntimeError(f"daemon never bound port {port}")
+                    try:
+                        client = PieClient(f"ws://{ws_addr}")
+                        await client.connect()
+                        await client.auth_by_token(token)
+                        await client.install_program(h.WASM_PATH, h.MANIFEST_PATH,
+                                                     force_overwrite=True)
+                        port = h._free_port()
+                        base_url = f"http://127.0.0.1:{port}"
+                        await client.launch_daemon("chat-apc@0.1.0", port)
+                        if not h._wait_for_port(port, timeout=30):
+                            raise RuntimeError(f"daemon never bound port {port}")
+                    except Exception as exc:  # noqa: BLE001 - daemon setup is a model boot failure.
+                        raise ModelBootError(exc) from exc
                     return await _run_model(base_url, model, count, grader)
                 finally:
                     drain.cancel()
@@ -500,7 +541,7 @@ async def main() -> int:
     assert h.WASM_PATH.exists(), f"missing wasm at {h.WASM_PATH}"
     h.verify_stamp()
     artifact = await _run()
-    Path(OUT).write_text(json.dumps(artifact, indent=2))
+    atomic_write_json(OUT, artifact)
     _print(artifact)
     print(f"\n[profile-accuracy] artifact -> {OUT}")
     if not has_any_graded_item(artifact):

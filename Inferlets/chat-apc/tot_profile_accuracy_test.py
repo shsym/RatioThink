@@ -15,6 +15,10 @@ from __future__ import annotations
 import json
 import unittest
 import asyncio
+import os
+import tempfile
+from pathlib import Path
+from unittest import mock
 
 import tot_profile_accuracy as h
 
@@ -193,7 +197,7 @@ class Aggregation(unittest.TestCase):
     def test_boot_failure_records_error_row_continues_and_snapshots_rows(self):
         async def run_one(index, model):
             if model == "bad":
-                raise RuntimeError("handshake timeout")
+                raise h.ModelBootError(RuntimeError("handshake timeout"))
             return h.summarize_model(
                 model,
                 [
@@ -223,6 +227,32 @@ class Aggregation(unittest.TestCase):
         self.assertEqual(rows[0]["single"]["n_graded"], 0)
         self.assertEqual(rows[1]["single"]["n_graded"], 1)
         self.assertEqual(snapshots, [["bad"], ["bad", "good"]])
+
+    def test_mid_run_failure_propagates_instead_of_becoming_boot_error(self):
+        async def run_one(index, model):
+            raise RuntimeError("grader exploded")
+
+        with self.assertRaisesRegex(RuntimeError, "grader exploded"):
+            asyncio.run(h.collect_model_rows(["model"], run_one))
+
+    def test_atomic_write_json_replaces_complete_temp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "artifact.json"
+            out.write_text('{"previous": true}')
+            replacements = []
+            real_replace = os.replace
+
+            def capturing_replace(src, dst):
+                replacements.append((Path(src), Path(dst), Path(src).read_text()))
+                real_replace(src, dst)
+
+            with mock.patch.object(h.os, "replace", side_effect=capturing_replace):
+                h.atomic_write_json(out, {"models": [{"model": "m"}]})
+
+            self.assertEqual(json.loads(out.read_text()), {"models": [{"model": "m"}]})
+            self.assertEqual(replacements[0][1], out)
+            self.assertEqual(json.loads(replacements[0][2]), {"models": [{"model": "m"}]})
+            self.assertFalse(replacements[0][0].exists())
 
     def test_shmem_name_is_unique_per_model_boot(self):
         self.assertNotEqual(h.shmem_name(1), h.shmem_name(2))
