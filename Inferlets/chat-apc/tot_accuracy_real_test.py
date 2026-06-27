@@ -156,6 +156,33 @@ class MMLUPrep(unittest.TestCase):
             self.assertEqual(real._which_datasets(), ["mmlu"])
 
 
+class ConfigToml(unittest.TestCase):
+    def test_gguf_model_slug_resolves_to_cached_file_path(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(os.environ, {"HF_HOME": tmp}, clear=False):
+            gguf = (
+                Path(tmp)
+                / "hub"
+                / "models--Qwen--Qwen3-14B-GGUF"
+                / "snapshots"
+                / "abc123"
+                / "Qwen3-14B-Q4_K_M.gguf"
+            )
+            gguf.parent.mkdir(parents=True)
+            gguf.write_text("fake gguf bytes")
+
+            cfg = real.config_toml("Qwen/Qwen3-14B-GGUF")
+
+        self.assertIn('name = "Qwen/Qwen3-14B-GGUF"', cfg)
+        self.assertIn(f'hf_repo = "{gguf}"', cfg)
+
+    def test_non_gguf_model_slug_stays_as_repo_id(self):
+        cfg = real.config_toml("Qwen/Qwen3-8B")
+
+        self.assertIn('name = "Qwen/Qwen3-8B"', cfg)
+        self.assertIn('hf_repo = "Qwen/Qwen3-8B"', cfg)
+
+
 class HumanEvalGrader(unittest.TestCase):
     REF = {
         "canonical_prompt": 'from typing import List\n\n\ndef add(a, b):\n    """add"""\n',

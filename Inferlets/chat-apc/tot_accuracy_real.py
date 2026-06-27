@@ -48,6 +48,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import os
 import subprocess
@@ -140,7 +141,32 @@ def _task_config(family: str, grader: str) -> ta.DatasetArmsConfig:
 # Dataset → task family (drives decomposition/generator/evaluator/search).
 FAMILY = {"gsm8k": "math", "humaneval": "code", "mbpp": "code", "jsonschema": "json"}
 
+
+def _hf_hub_cache() -> Path:
+    return Path(os.environ.get("HF_HUB_CACHE") or (
+        Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+    ))
+
+
+def _resolve_model_ref(model: str) -> str:
+    """Resolve GGUF slugs the same way product profiles do: Pie's portable
+    driver accepts a concrete .gguf file, not the enclosing HF snapshot dir."""
+    if not model.endswith("-GGUF") or "/" not in model:
+        return model
+    owner, name = model.split("/", 1)
+    pattern = str(
+        _hf_hub_cache()
+        / f"models--{owner}--{name}"
+        / "snapshots"
+        / "*"
+        / "*.gguf"
+    )
+    matches = sorted(glob.glob(pattern))
+    return matches[0] if matches else model
+
+
 def config_toml(model: str) -> str:
+    model_ref = _resolve_model_ref(model)
     return f"""
 [server]
 host = "127.0.0.1"
@@ -158,7 +184,7 @@ allow_network = true
 
 [[model]]
 name = "{model}"
-hf_repo = "{model}"
+hf_repo = "{model_ref}"
 
 [model.scheduler]
 batch_policy = "adaptive"

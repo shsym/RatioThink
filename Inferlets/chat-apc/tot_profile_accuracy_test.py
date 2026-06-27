@@ -182,6 +182,12 @@ class Aggregation(unittest.TestCase):
         self.assertEqual(summary["accuracy_delta_tot_minus_single"], -0.5)
         self.assertEqual(summary["mean_token_delta_tot_minus_single"], 15.5)
         self.assertEqual(summary["mean_latency_delta_s_tot_minus_single"], 1.75)
+        self.assertEqual(summary["single"]["mean_tokens_per_second"], 10.0)
+        self.assertAlmostEqual(summary["tot"]["mean_tokens_per_second"], 9.1666666667)
+        self.assertAlmostEqual(
+            summary["mean_tokens_per_second_delta_tot_minus_single"],
+            0.1666666667,
+        )
 
 
     def test_run_model_dataset_scores_existing_code_datasets_with_grade_oracle(self):

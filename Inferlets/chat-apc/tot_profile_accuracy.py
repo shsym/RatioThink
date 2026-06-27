@@ -180,6 +180,7 @@ def _cell(items: list[ItemResult], arm_name: str, grader: str) -> dict:
     n_correct = n_wrong = n_ungradable = n_error = 0
     tokens: list[int] = []
     latencies: list[float] = []
+    tokens_per_second: list[float] = []
     first_error: str | None = None
     node_error_count = 0
     for item in items:
@@ -195,6 +196,8 @@ def _cell(items: list[ItemResult], arm_name: str, grader: str) -> dict:
             continue
         tokens.append(arm.tokens)
         latencies.append(arm.latency_s)
+        if arm.latency_s > 0:
+            tokens_per_second.append(arm.tokens / arm.latency_s)
         if passed is True:
             n_correct += 1
         else:
@@ -210,6 +213,9 @@ def _cell(items: list[ItemResult], arm_name: str, grader: str) -> dict:
         "accuracy": accuracy,
         "mean_tokens": statistics.mean(tokens) if tokens else None,
         "mean_latency_s": statistics.mean(latencies) if latencies else None,
+        "mean_tokens_per_second": (
+            statistics.mean(tokens_per_second) if tokens_per_second else None
+        ),
         "first_error": first_error,
         "node_error_count": node_error_count,
     }
@@ -223,6 +229,22 @@ def _mean_paired_delta(items: list[ItemResult], attr: str) -> float | None:
         if item.single.answer is None or item.tot.answer is None:
             continue
         deltas.append(float(getattr(item.tot, attr)) - float(getattr(item.single, attr)))
+    return statistics.mean(deltas) if deltas else None
+
+
+def _mean_paired_tokens_per_second_delta(items: list[ItemResult]) -> float | None:
+    deltas: list[float] = []
+    for item in items:
+        if item.single.error or item.tot.error:
+            continue
+        if item.single.answer is None or item.tot.answer is None:
+            continue
+        if item.single.latency_s <= 0 or item.tot.latency_s <= 0:
+            continue
+        deltas.append(
+            (item.tot.tokens / item.tot.latency_s)
+            - (item.single.tokens / item.single.latency_s)
+        )
     return statistics.mean(deltas) if deltas else None
 
 
@@ -242,6 +264,9 @@ def summarize_model(model: str, items: list[ItemResult], grader: str,
         "accuracy_delta_tot_minus_single": acc_delta,
         "mean_token_delta_tot_minus_single": _mean_paired_delta(items, "tokens"),
         "mean_latency_delta_s_tot_minus_single": _mean_paired_delta(items, "latency_s"),
+        "mean_tokens_per_second_delta_tot_minus_single": (
+            _mean_paired_tokens_per_second_delta(items)
+        ),
         "items": [_item_to_json(item, grader) for item in items],
     }
 
@@ -285,6 +310,7 @@ def model_boot_error_row(model: str, exc: ModelBootError, dataset: str | None = 
         "accuracy_delta_tot_minus_single": None,
         "mean_token_delta_tot_minus_single": None,
         "mean_latency_delta_s_tot_minus_single": None,
+        "mean_tokens_per_second_delta_tot_minus_single": None,
         "items": [],
         "coverage": {"measured": 0, "total": None},
     }
@@ -536,7 +562,7 @@ def _print(artifact: dict) -> None:
     print("\n" + "=" * 96)
     print("SHIPPED ToT profile vs single-pass accuracy/cost")
     print("=" * 96)
-    print(f"{'model':28} {'dataset':12} {'single':>8} {'ToT':>8} {'Δacc':>8} {'Δtok':>9} {'Δlat(s)':>9} {'nodeErr':>8}")
+    print(f"{'model':28} {'dataset':12} {'single':>8} {'ToT':>8} {'Δacc':>8} {'Δtok':>9} {'Δlat(s)':>9} {'ToT t/s':>9} {'nodeErr':>8}")
     print("-" * 96)
     for row in artifact["models"]:
         single = row["single"]
@@ -551,6 +577,7 @@ def _print(artifact: dict) -> None:
             f"{f(row.get('accuracy_delta_tot_minus_single'), '{:+.3f}'):>8} "
             f"{f(row.get('mean_token_delta_tot_minus_single'), '{:+.1f}'):>9} "
             f"{f(row.get('mean_latency_delta_s_tot_minus_single'), '{:+.2f}'):>9} "
+            f"{f(tot.get('mean_tokens_per_second'), '{:.1f}'):>9} "
             f"{node_err:>8}"
         )
         if single.get("first_error"):
