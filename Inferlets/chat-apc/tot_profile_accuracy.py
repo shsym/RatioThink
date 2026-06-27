@@ -1,0 +1,446 @@
+"""Shipped ToT profile vs single-pass accuracy harness (#852).
+
+This is the slice-1 product-surface harness.  It deliberately does **not** run
+the academic host-side BFS twin in :mod:`tot_accuracy_real`; it reuses that
+module only for boot configuration, dataset selection/loading, tokenizer cost
+accounting, and model defaults.  The measured arms are:
+
+* ``single`` — ordinary ``/v1/chat/completions`` single pass.
+* ``tot`` — shipped ``tree-of-thought`` inferlet dispatched through
+  ``/v1/chat/completions`` via the advanced profile envelope.
+
+The matrix is resilient: transport/terminal/node failures are recorded per item
+and disclosed, ungradable/error items are held out of accuracy denominators, and
+the run continues to the next prompt/model.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Callable
+
+import httpx
+from pie_client import PieClient
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+import e2e_test as h  # noqa: E402
+import grade as g  # noqa: E402
+import tot_accuracy_real as base  # noqa: E402
+
+
+DEFAULT_MODELS = (
+    "Qwen/Qwen3-14B-GGUF",
+    "Qwen/Qwen3-8B",
+    "Qwen/Qwen3-4B",
+    "Qwen/Qwen3-0.6B",
+)
+DATASET = os.environ.get("DATASETS", "gsm8k").split(",")[0].strip() or "gsm8k"
+MAX_PROMPTS = int(os.environ.get("MAX_PROMPTS", "6"))
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "512"))
+TOT_BREADTH = int(os.environ.get("TOT_BREADTH", os.environ.get("TOT_WIDTH", "2")))
+TOT_DEPTH = int(os.environ.get("TOT_DEPTH", os.environ.get("MATH_DEPTH", "2")))
+TOT_BEAM = int(os.environ.get("TOT_BEAM", "1"))
+TOT_TASK = os.environ.get("TOT_TASK", "reasoning")
+TOT_TEMPERATURE = float(os.environ.get("TOT_TEMPERATURE", "0.7"))
+OUT = os.environ.get("PROFILE_ACCURACY_OUT", "tot_profile_accuracy.json")
+
+
+@dataclass
+class ArmResult:
+    answer: str | None = None
+    tokens: int = 0
+    latency_s: float = 0.0
+    error: str | None = None
+    token_source: str | None = None
+    node_errors: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class ItemResult:
+    dataset: str
+    index: int
+    prompt_id: str
+    reference: dict
+    single: ArmResult
+    tot: ArmResult
+
+
+def _models_from_env() -> list[str]:
+    if os.environ.get("MODELS"):
+        return [m.strip() for m in os.environ["MODELS"].split(",") if m.strip()]
+    if os.environ.get("MODEL"):
+        return [os.environ["MODEL"]]
+    return list(DEFAULT_MODELS)
+
+
+def parse_single_pass_response(payload: dict, fallback_count: Callable[[str], int]) -> ArmResult:
+    try:
+        msg = (payload.get("choices") or [{}])[0].get("message") or {}
+        answer = ((msg.get("content") or "").strip()
+                  or (msg.get("reasoning_content") or "").strip())
+    except (AttributeError, IndexError) as e:
+        return ArmResult(error=f"malformed chat response: {e}")
+    usage = payload.get("usage") or {}
+    completion_tokens = usage.get("completion_tokens")
+    if isinstance(completion_tokens, int):
+        return ArmResult(answer=answer, tokens=completion_tokens,
+                         token_source="usage.completion_tokens")
+    return ArmResult(answer=answer, tokens=fallback_count(answer or ""),
+                     token_source="tokenizer_fallback")
+
+
+def parse_tot_stream(text: str, fallback_count: Callable[[str], int] | None = None) -> ArmResult:
+    events: list[dict] = []
+    malformed: str | None = None
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            events.append(json.loads(payload))
+        except json.JSONDecodeError as e:
+            malformed = f"malformed SSE JSON: {e}"
+            break
+
+    if malformed:
+        return ArmResult(error=malformed)
+    terminal = next((e for e in reversed(events)
+                     if e.get("event") in ("tree_complete", "error")), None)
+    metrics = next((e for e in reversed(events)
+                    if e.get("event") == "generation_metrics"), {})
+    node_errors: list[dict] = []
+    for e in events:
+        if e.get("event") != "node_complete":
+            continue
+        node = e.get("node") or {}
+        if node.get("status") != "ok" or node.get("error") or node.get("score_error"):
+            node_errors.append({
+                "id": node.get("id"),
+                "depth": node.get("depth"),
+                "status": node.get("status"),
+                "error": node.get("error"),
+                "score_error": node.get("score_error"),
+            })
+
+    if not terminal:
+        return ArmResult(error="missing terminal tree_complete/error frame",
+                         node_errors=node_errors)
+    if terminal.get("event") == "error":
+        return ArmResult(error=terminal.get("message") or "terminal error",
+                         node_errors=node_errors)
+
+    answer = (terminal.get("final_answer") or "").strip()
+    tokens = metrics.get("output_tokens")
+    if isinstance(tokens, int):
+        token_source = "generation_metrics.output_tokens"
+    else:
+        tokens = (fallback_count or (lambda s: len(s.split())))(answer)
+        token_source = "tokenizer_fallback"
+    return ArmResult(answer=answer, tokens=tokens, token_source=token_source,
+                     node_errors=node_errors)
+
+
+def _score_arm(arm: ArmResult, grader: str, reference: dict) -> tuple[str, bool | None]:
+    if arm.error:
+        return "error", None
+    if arm.answer is None:
+        return "ungradable", None
+    verdict = g.grade(grader, arm.answer, reference)
+    if verdict.passed is None:
+        return "ungradable", None
+    return ("correct" if verdict.passed else "wrong"), verdict.passed
+
+
+def _cell(items: list[ItemResult], arm_name: str, grader: str) -> dict:
+    n_correct = n_wrong = n_ungradable = n_error = 0
+    tokens: list[int] = []
+    latencies: list[float] = []
+    first_error: str | None = None
+    node_error_count = 0
+    for item in items:
+        arm: ArmResult = getattr(item, arm_name)
+        node_error_count += len(arm.node_errors)
+        bucket, passed = _score_arm(arm, grader, item.reference)
+        if bucket == "error":
+            n_error += 1
+            first_error = first_error or arm.error
+            continue
+        if bucket == "ungradable":
+            n_ungradable += 1
+            continue
+        tokens.append(arm.tokens)
+        latencies.append(arm.latency_s)
+        if passed is True:
+            n_correct += 1
+        else:
+            n_wrong += 1
+    n_graded = n_correct + n_wrong
+    accuracy = (n_correct / n_graded) if n_graded else None
+    return {
+        "n_correct": n_correct,
+        "n_wrong": n_wrong,
+        "n_ungradable": n_ungradable,
+        "n_error": n_error,
+        "n_graded": n_graded,
+        "accuracy": accuracy,
+        "mean_tokens": statistics.mean(tokens) if tokens else None,
+        "mean_latency_s": statistics.mean(latencies) if latencies else None,
+        "first_error": first_error,
+        "node_error_count": node_error_count,
+    }
+
+
+def _mean_paired_delta(items: list[ItemResult], attr: str) -> float | None:
+    deltas: list[float] = []
+    for item in items:
+        if item.single.error or item.tot.error:
+            continue
+        if item.single.answer is None or item.tot.answer is None:
+            continue
+        deltas.append(float(getattr(item.tot, attr)) - float(getattr(item.single, attr)))
+    return statistics.mean(deltas) if deltas else None
+
+
+def summarize_model(model: str, items: list[ItemResult], grader: str) -> dict:
+    single = _cell(items, "single", grader)
+    tot = _cell(items, "tot", grader)
+    acc_delta = None
+    if single["accuracy"] is not None and tot["accuracy"] is not None:
+        acc_delta = tot["accuracy"] - single["accuracy"]
+    return {
+        "model": model,
+        "dataset": DATASET,
+        "single": single,
+        "tot": tot,
+        "accuracy_delta_tot_minus_single": acc_delta,
+        "mean_token_delta_tot_minus_single": _mean_paired_delta(items, "tokens"),
+        "mean_latency_delta_s_tot_minus_single": _mean_paired_delta(items, "latency_s"),
+        "items": [_item_to_json(item, grader) for item in items],
+    }
+
+
+def build_artifact(models: list[dict], settings: dict) -> dict:
+    return {
+        "framing": (
+            "Shipped tree-of-thought profile vs ordinary single-pass "
+            "/v1/chat/completions on identical GSM8K prompts. This does not run "
+            "the academic host-side BFS harness."
+        ),
+        "settings": settings,
+        "models": models,
+    }
+
+
+def _item_to_json(item: ItemResult, grader: str) -> dict:
+    single_bucket, single_passed = _score_arm(item.single, grader, item.reference)
+    tot_bucket, tot_passed = _score_arm(item.tot, grader, item.reference)
+    return {
+        "dataset": item.dataset,
+        "index": item.index,
+        "prompt_id": item.prompt_id,
+        "reference": item.reference,
+        "single": {**asdict(item.single), "grade": single_bucket, "passed": single_passed},
+        "tot": {**asdict(item.tot), "grade": tot_bucket, "passed": tot_passed},
+        "token_delta_tot_minus_single": item.tot.tokens - item.single.tokens
+        if not (item.single.error or item.tot.error) else None,
+        "latency_delta_s_tot_minus_single": item.tot.latency_s - item.single.latency_s
+        if not (item.single.error or item.tot.error) else None,
+    }
+
+
+async def _single_once(http_c: httpx.AsyncClient, base_url: str, model: str,
+                       prompt: str, count) -> ArmResult:
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "max_tokens": MAX_TOKENS,
+        "stream": False,
+    }
+    started = time.monotonic()
+    try:
+        r = await http_c.post(f"{base_url}/v1/chat/completions", json=body)
+        latency = time.monotonic() - started
+        if r.status_code != 200:
+            return ArmResult(latency_s=latency, error=f"chat/completions {r.status_code}: {r.text[:200]}")
+        parsed = parse_single_pass_response(r.json(), count)
+        parsed.latency_s = latency
+        return parsed
+    except Exception as e:  # noqa: BLE001
+        return ArmResult(latency_s=time.monotonic() - started,
+                         error=f"{type(e).__name__}: {e}")
+
+
+async def _tot_once(http_c: httpx.AsyncClient, base_url: str, model: str,
+                    prompt: str, count) -> ArmResult:
+    body = {
+        "inferlet": "tree-of-thought",
+        "stream": True,
+        "input": {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "breadth": TOT_BREADTH,
+            "depth": TOT_DEPTH,
+            "beam_width": TOT_BEAM,
+            "max_tokens_per_node": MAX_TOKENS,
+            "temperature": TOT_TEMPERATURE,
+            "task": TOT_TASK,
+        },
+    }
+    started = time.monotonic()
+    try:
+        r = await http_c.post(f"{base_url}/v1/chat/completions", json=body)
+        latency = time.monotonic() - started
+        if r.status_code != 200:
+            return ArmResult(latency_s=latency, error=f"tot dispatch {r.status_code}: {r.text[:200]}")
+        parsed = parse_tot_stream(r.text, count)
+        parsed.latency_s = latency
+        return parsed
+    except Exception as e:  # noqa: BLE001
+        return ArmResult(latency_s=time.monotonic() - started,
+                         error=f"{type(e).__name__}: {e}")
+
+
+async def _run_model(base_url: str, model: str, count, grader: str) -> dict:
+    records, total = base._load_prompts(DATASET)
+    if MAX_PROMPTS > 0:
+        records = records[:MAX_PROMPTS]
+    items: list[ItemResult] = []
+    async with httpx.AsyncClient(timeout=900) as http_c:
+        for i, rec in enumerate(records, 1):
+            prompt_id = str(rec.get("id") or f"{DATASET}:{i}")
+            single = await _single_once(http_c, base_url, model, rec["prompt"], count)
+            tot = await _tot_once(http_c, base_url, model, rec["prompt"], count)
+            item = ItemResult(DATASET, i, prompt_id, rec["reference"], single, tot)
+            items.append(item)
+            single_bucket, _ = _score_arm(single, grader, rec["reference"])
+            tot_bucket, _ = _score_arm(tot, grader, rec["reference"])
+            print(
+                f"[profile-accuracy] {model} {DATASET} {i}/{len(records)} "
+                f"single={single_bucket} tot={tot_bucket} "
+                f"tot_node_errors={len(tot.node_errors)}",
+                flush=True,
+            )
+    row = summarize_model(model, items, grader)
+    row["coverage"] = {"measured": len(records), "total": total}
+    return row
+
+
+async def _run() -> dict:
+    if DATASET != "gsm8k":
+        raise SystemExit("profile slice-1 is intentionally scoped to DATASETS=gsm8k")
+    models = _models_from_env()
+    count, unit = base._load_tokenizer()
+    grader = base._grader_for(DATASET)
+    rows: list[dict] = []
+    for model in models:
+        print(f"\n[profile-accuracy] booting model={model}", flush=True)
+        with tempfile.TemporaryDirectory(prefix="tpa-", dir="/tmp") as tmp:
+            tmp_path = Path(tmp)
+            cfg = tmp_path / "config.toml"
+            cfg.write_text(base.config_toml(model))
+            pie_home = tmp_path / "home"
+            pie_home.mkdir()
+            env = {
+                **os.environ,
+                "PIE_HOME": str(pie_home),
+                "PIE_SHMEM_NAME": f"/tot_profile_accuracy_{os.getpid()}",
+            }
+            proc = subprocess.Popen(
+                [str(h.PIE_BIN), "serve", "--config", str(cfg), "--no-auth", "--debug"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+                bufsize=1,
+            )
+            try:
+                ws_addr, token = await h._parse_handshake(proc, timeout=300)
+                print(f"[profile-accuracy] engine ws=ws://{ws_addr}", flush=True)
+                drain = asyncio.create_task(h._drain_stdout(proc))
+                try:
+                    client = PieClient(f"ws://{ws_addr}")
+                    await client.connect()
+                    await client.auth_by_token(token)
+                    await client.install_program(h.WASM_PATH, h.MANIFEST_PATH,
+                                                 force_overwrite=True)
+                    port = h._free_port()
+                    base_url = f"http://127.0.0.1:{port}"
+                    await client.launch_daemon("chat-apc@0.1.0", port)
+                    if not h._wait_for_port(port, timeout=30):
+                        raise RuntimeError(f"daemon never bound port {port}")
+                    rows.append(await _run_model(base_url, model, count, grader))
+                finally:
+                    drain.cancel()
+            finally:
+                h._terminate_subprocess(proc, "engine")
+    return build_artifact(rows, {
+        "dataset": DATASET,
+        "max_prompts": MAX_PROMPTS,
+        "max_tokens": MAX_TOKENS,
+        "models": models,
+        "token_unit": unit,
+        "tot": {
+            "breadth": TOT_BREADTH,
+            "depth": TOT_DEPTH,
+            "beam_width": TOT_BEAM,
+            "task": TOT_TASK,
+            "temperature": TOT_TEMPERATURE,
+        },
+    })
+
+
+def _print(artifact: dict) -> None:
+    print("\n" + "=" * 96)
+    print("SHIPPED ToT profile vs single-pass accuracy/cost")
+    print("=" * 96)
+    print(f"{'model':28} {'single':>8} {'ToT':>8} {'Δacc':>8} {'Δtok':>9} {'Δlat(s)':>9} {'nodeErr':>8}")
+    print("-" * 96)
+    for row in artifact["models"]:
+        single = row["single"]
+        tot = row["tot"]
+        node_err = tot.get("node_error_count", 0)
+        def f(x, fmt="{:.3f}"):
+            return fmt.format(x) if isinstance(x, (int, float)) else "--"
+        print(
+            f"{row['model'][:28]:28} "
+            f"{f(single.get('accuracy')):>8} {f(tot.get('accuracy')):>8} "
+            f"{f(row.get('accuracy_delta_tot_minus_single'), '{:+.3f}'):>8} "
+            f"{f(row.get('mean_token_delta_tot_minus_single'), '{:+.1f}'):>9} "
+            f"{f(row.get('mean_latency_delta_s_tot_minus_single'), '{:+.2f}'):>9} "
+            f"{node_err:>8}"
+        )
+        if single.get("first_error"):
+            print(f"  single first_error: {single['first_error']}")
+        if tot.get("first_error"):
+            print(f"  ToT first_error: {tot['first_error']}")
+    print("-" * 96)
+    print("Accuracy excludes ungradable/error items per arm; nodeErr discloses ToT node status/error/score_error events.")
+
+
+async def main() -> int:
+    assert h.PIE_BIN.exists(), f"missing pie binary at {h.PIE_BIN}"
+    assert h.WASM_PATH.exists(), f"missing wasm at {h.WASM_PATH}"
+    h.verify_stamp()
+    artifact = await _run()
+    Path(OUT).write_text(json.dumps(artifact, indent=2))
+    _print(artifact)
+    print(f"\n[profile-accuracy] artifact -> {OUT}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

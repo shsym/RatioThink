@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 #
-# ToT task-ACCURACY matrix runner: single-chain CoT vs ToT(width=k, depth=1)
-# over PUBLIC pinned GRADED datasets (#657, extends the #652 throughput matrix
-# with a deterministic correctness axis).
+# ToT task-ACCURACY runner.
 #
-# Boots pie's portable Metal driver against a real cached model and runs
-# Inferlets/chat-apc/tot_accuracy_real.py, which — for every GRADED dataset
-# prepared by Scripts/benchmark/prep_*.sh (GSM8K, HumanEval, MBPP, JSONSchema) —
-# decodes a single greedy CoT chain and a ToT(width=k, depth=1) search through
-# the SAME /v1/chat/completions advanced-profile envelope, grades both answers with the dataset's
-# deterministic grader (Inferlets/chat-apc/grade.py), and writes an
-# accuracy/token artifact + rendered matrix.
+# Default mode (#852, profile): run identical GSM8K prompts through the SHIPPED
+# tree-of-thought profile (advanced dispatch via inferlet:"tree-of-thought" over
+# /v1/chat/completions) and an ordinary single-pass /v1/chat/completions
+# baseline.  It emits per-item and aggregate accuracy/token/latency deltas.
+#
+# Academic mode (#657, opt-in): set TOT_ACCURACY_MODE=academic to run the
+# faithful host-side BFS harness in Inferlets/chat-apc/tot_accuracy_real.py.
 #
 # Self-bootstraps all three build inputs (pie binary, chat-apc wasm, dataset
 # prompt+reference sets). Fails loud with the exact fix command if the model
@@ -20,13 +18,15 @@
 # subprocess (see grade.py). This is why the bench is operator-gated, never CI.
 #
 # Knobs (env):
-#   MODEL        HF repo to bench (default Qwen/Qwen3-8B — a 7-14B target)
+#   TOT_ACCURACY_MODE profile|academic (default profile)
+#   MODELS       comma list for profile mode, larger-first by default
+#   MODEL        one HF repo (academic default Qwen/Qwen3-8B; profile maps to MODELS)
 #   MAX_TOKENS   max tokens per ToT node / per chain (default 512)
 #   MAX_PROMPTS  prompts measured per dataset, canonical-order prefix
-#                (default 12; 0 = the WHOLE split — the opt-in long run)
-#   TOT_WIDTH    branches k for the ToT column (default 4; [1,5])
-#   DATASETS     comma list to restrict rows (default: all graded+locked)
-#   ACCURACY_OUT JSON artifact path
+#   TOT_WIDTH    academic branches k; profile fallback for TOT_BREADTH
+#   TOT_BREADTH  profile shipped-ToT breadth (default 2)
+#   DATASETS     profile default gsm8k; academic default all graded+locked
+#   PROFILE_ACCURACY_OUT / ACCURACY_OUT JSON artifact path
 #
 # Usage: Scripts/run-tot-accuracy.sh
 set -euo pipefail
@@ -37,7 +37,20 @@ cd "$ROOT"
 PIE_BIN="Vendor/pie/target/release/pie"
 WASM="Inferlets/chat-apc/prebuilt/chat-apc.wasm"
 PYDIR="Vendor/pie/client/python"
-MODEL="${MODEL:-Qwen/Qwen3-8B}"
+TOT_ACCURACY_MODE="${TOT_ACCURACY_MODE:-profile}"
+if [ "$TOT_ACCURACY_MODE" = "profile" ]; then
+  if [ -z "${MODELS:-}" ]; then
+    if [ -n "${MODEL:-}" ]; then
+      MODELS="$MODEL"
+    else
+      MODELS="Qwen/Qwen3-14B-GGUF,Qwen/Qwen3-8B,Qwen/Qwen3-4B,Qwen/Qwen3-0.6B"
+    fi
+  fi
+  DATASETS="${DATASETS:-gsm8k}"
+else
+  MODEL="${MODEL:-Qwen/Qwen3-8B}"
+  MODELS="${MODELS:-$MODEL}"
+fi
 
 if ! command -v uv >/dev/null 2>&1; then
   echo "[tot-accuracy] FATAL: 'uv' not found on PATH." >&2
@@ -71,16 +84,18 @@ fi
 
 # Require REAL weights (will NOT download). Same guard as run-spec-matrix.sh.
 HF_CACHE="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
-MODEL_DIR="$HF_CACHE/models--${MODEL//\//--}/snapshots"
-if ! find -L "$MODEL_DIR" -type f \
-     \( -name '*.safetensors' -o -name '*.gguf' -o -name '*.bin' \) \
-     2>/dev/null | grep -q .; then
-  echo "[tot-accuracy] FATAL: no resolved weights for '$MODEL' under $HF_CACHE." >&2
-  echo "              Fetch the model:" >&2
-  echo "                uv run --with huggingface_hub python -c \\" >&2
-  echo "                  \"from huggingface_hub import snapshot_download as d; d('$MODEL')\"" >&2
-  exit 2
-fi
+for model in $(printf '%s' "$MODELS" | tr ',' ' '); do
+  MODEL_DIR="$HF_CACHE/models--${model//\//--}/snapshots"
+  if ! find -L "$MODEL_DIR" -type f \
+       \( -name '*.safetensors' -o -name '*.gguf' -o -name '*.bin' \) \
+       2>/dev/null | grep -q .; then
+    echo "[tot-accuracy] FATAL: no resolved weights for '$model' under $HF_CACHE." >&2
+    echo "              Fetch the model:" >&2
+    echo "                uv run --with huggingface_hub python -c \\" >&2
+    echo "                  \"from huggingface_hub import snapshot_download as d; d('$model')\"" >&2
+    exit 2
+  fi
+done
 
 # Self-bootstrap the graded dataset prompt+reference sets (regenerated from the
 # pinned revision; data/ is gitignored). Only the GRADED rows the harness needs.
@@ -90,7 +105,11 @@ lock = json.loads(pathlib.Path("Scripts/benchmark/datasets.lock").read_text())
 print(" ".join(k for k, v in lock.get("datasets", {}).items() if v.get("grader")))
 PY
 )"
-SEL="${DATASETS:-$GRADED}"
+if [ "$TOT_ACCURACY_MODE" = "profile" ]; then
+  SEL="$DATASETS"
+else
+  SEL="${DATASETS:-$GRADED}"
+fi
 for key in $(printf '%s' "$SEL" | tr ',' ' '); do
   if [ ! -f "Scripts/benchmark/data/$key.jsonl" ]; then
     echo "[tot-accuracy] prompt set for '$key' missing — running prep_$key.sh…"
@@ -100,11 +119,20 @@ done
 
 echo ""
 echo "=============================================================="
-echo "[tot-accuracy] running tot_accuracy_real.py  (MODEL=$MODEL)"
+echo "[tot-accuracy] mode=$TOT_ACCURACY_MODE models=$MODELS datasets=$SEL"
 echo "=============================================================="
-MODEL="$MODEL" uv run --project "$PYDIR" --with httpx --with jsonschema \
-  --with tokenizers --with huggingface_hub \
-  python Inferlets/chat-apc/tot_accuracy_real.py
+if [ "$TOT_ACCURACY_MODE" = "profile" ]; then
+  MODELS="$MODELS" DATASETS="$SEL" uv run --project "$PYDIR" --with httpx --with jsonschema \
+    --with tokenizers --with huggingface_hub \
+    python Inferlets/chat-apc/tot_profile_accuracy.py
+elif [ "$TOT_ACCURACY_MODE" = "academic" ]; then
+  MODEL="$MODEL" DATASETS="$SEL" uv run --project "$PYDIR" --with httpx --with jsonschema \
+    --with tokenizers --with huggingface_hub \
+    python Inferlets/chat-apc/tot_accuracy_real.py
+else
+  echo "[tot-accuracy] FATAL: TOT_ACCURACY_MODE must be 'profile' or 'academic' (got '$TOT_ACCURACY_MODE')." >&2
+  exit 2
+fi
 
 echo ""
 echo "[tot-accuracy] done."

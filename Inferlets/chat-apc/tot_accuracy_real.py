@@ -140,7 +140,8 @@ def _task_config(family: str, grader: str) -> ta.DatasetArmsConfig:
 # Dataset → task family (drives decomposition/generator/evaluator/search).
 FAMILY = {"gsm8k": "math", "humaneval": "code", "mbpp": "code", "jsonschema": "json"}
 
-CONFIG_TOML = f"""
+def config_toml(model: str) -> str:
+    return f"""
 [server]
 host = "127.0.0.1"
 port = 0
@@ -156,8 +157,8 @@ allow_fs = false
 allow_network = true
 
 [[model]]
-name = "{MODEL}"
-hf_repo = "{MODEL}"
+name = "{model}"
+hf_repo = "{model}"
 
 [model.scheduler]
 batch_policy = "adaptive"
@@ -170,6 +171,9 @@ restore_pause_at_utilization = 0.85
 type = "portable"
 device = ["metal"]
 """
+
+
+CONFIG_TOML = config_toml(MODEL)
 
 
 def _load_tokenizer():
