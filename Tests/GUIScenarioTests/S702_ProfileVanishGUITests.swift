@@ -1,8 +1,8 @@
 import XCTest
 
-/// #702 regression guard: a stale, OLD-VERSION built-in profile on disk must
-/// NOT vanish from the chat toolbar profile picker — the immutable base layer
-/// heals it.
+/// #702/#856 regression guard: a stale, OLD-VERSION retired built-in profile on
+/// disk must not surface in the chat toolbar profile picker; retirement moves it
+/// aside while the remaining shipped built-ins still render.
 ///
 /// The bug (pre-#702): an install predating the current `Profile` schema left a
 /// `repeat-boost.toml` carrying only `id` + `model` (no `name`, no `inferlet`).
@@ -12,18 +12,11 @@ import XCTest
 /// existence-gated seeders never healed it (they early-returned the moment the
 /// file existed, broken or not).
 ///
-/// The fix (#702): built-ins are an immutable IN-CODE base layer. On launch
-/// `migrateSeededBuiltins` moves the stale unparseable `repeat-boost.toml` aside
-/// to `repeat-boost.toml.bak`, and the base `repeat-boost` is served from the
-/// in-code constant via `effectiveScan` — so it renders in the picker
-/// regardless of the broken on-disk file.
-///
-/// This guard asserts the post-fix behavior: with the SAME broken-file fixture
-/// the operator hit, `repeat-boost` MUST now be present in the picker. It is
-/// mutation-meaningful — `repeat-boost` is present BECAUSE of the base layer,
-/// not because the broken file parsed (it cannot): neuter the base layer and
-/// this assertion fails. A sibling VALID built-in (`chat`) present is the
-/// control proving the picker renders profiles at all.
+/// The #856 retirement behavior: on launch `migrateBuiltinProvenance` recognizes
+/// the stale unparseable `repeat-boost.toml` as a retired built-in, moves it
+/// aside to `repeat-boost.toml.bak`, and does NOT serve a base `repeat-boost`
+/// entry. A sibling valid built-in (`chat`) present is the control proving the
+/// picker renders profiles at all.
 ///
 /// Engine-free, mirroring S286/S669: the picker renders from the on-disk
 /// profiles directory before any engine contact, so no model fixture is needed.
@@ -73,10 +66,8 @@ final class S702_ProfileVanishGUITests: XCTestCase {
     addTeardownBlock { try? FileManager.default.removeItem(at: pieHome) }
 
     // Seed BEFORE launch the exact fixture the operator hit: a valid built-in
-    // next to the stale, unparseable one. Post-#702, launch runs
-    // `migrateSeededBuiltins`, which moves the broken `repeat-boost.toml` aside
-    // to `repeat-boost.toml.bak` and serves the base `repeat-boost` from the
-    // in-code constant — so it MUST render in the picker.
+    // next to the stale, unparseable retired one. Post-#856, launch moves the
+    // broken `repeat-boost.toml` aside to `repeat-boost.toml.bak` and hides it.
     try Self.validChatTOML.write(
       to: profilesDir.appendingPathComponent("chat.toml"), atomically: true, encoding: .utf8)
     try Self.brokenRepeatBoostTOML.write(
@@ -113,7 +104,7 @@ final class S702_ProfileVanishGUITests: XCTestCase {
                   "valid built-in 'chat' must render in the picker (the control that " +
                   "isolates the broken profile's absence to the parse-drop); app tree: \(app.debugDescription)")
 
-    // Capture the healed state — picker open with the recovered built-in — for
+    // Capture the healed state — picker open without the retired built-in — for
     // the operator. The menu is its own window, so grab the whole screen.
     Self.settle()
     let att = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
@@ -121,16 +112,13 @@ final class S702_ProfileVanishGUITests: XCTestCase {
     att.lifetime = .keepAlways
     add(att)
 
-    // THE GUARD: the stale `repeat-boost` built-in must be PRESENT in the
-    // picker. Its on-disk file cannot parse, so it is rendered SPECIFICALLY by
-    // the #702 immutable base layer (the broken file is moved to `.bak`, the
-    // in-code constant is served). Were the base layer removed, this would fail
-    // — exactly the pre-fix vanish. Regression guard for #702.
+    // THE GUARD: the stale `repeat-boost` built-in is retired. It must be backed
+    // up/hidden, while the remaining built-ins continue to render.
     let repeatBoostItem = app.menuItems["repeat-boost"]
-    XCTAssertTrue(repeatBoostItem.exists,
-                  "#702 regression: the base layer must serve the stale built-in `repeat-boost` " +
-                  "in the toolbar picker even though its on-disk file is unparseable. If this is " +
-                  "MISSING the base-layer healing regressed. app tree: \(app.debugDescription)")
+    XCTAssertFalse(repeatBoostItem.exists,
+                   "retired Repeat Boost must not render in the toolbar picker; app tree: \(app.debugDescription)")
+    XCTAssertTrue(FileManager.default.fileExists(atPath: profilesDir.appendingPathComponent("repeat-boost.toml.bak").path),
+                  "retired unparseable repeat-boost.toml should be moved aside to .bak")
 
     // Leave the menu closed so teardown doesn't trip over a stray popover.
     app.typeKey(.escape, modifierFlags: [])

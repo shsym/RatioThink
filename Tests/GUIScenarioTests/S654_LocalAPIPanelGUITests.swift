@@ -136,13 +136,15 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
                   "JSON Think example profile tab missing; app tree: \(app.debugDescription)")
     jsonThink.click()
 
-    let jsonThinkProfileID = NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@",
-                                        "\"profile_id\": \"json-think\"",
-                                        "\"profile_id\": \"json-think\"")
-    expectation(for: jsonThinkProfileID, evaluatedWith: curl)
+    let jsonThinkResponseFormat = NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@",
+                                             "\"response_format\"",
+                                             "\"response_format\"")
+    expectation(for: jsonThinkResponseFormat, evaluatedWith: curl)
     waitForExpectations(timeout: 5) { error in
-      XCTAssertNil(error, "switching example profile must rewrite the curl body; curl=\(self.curlText(curl).debugDescription)")
+      XCTAssertNil(error, "switching example profile must rewrite the curl body for JSON mode; curl=\(self.curlText(curl).debugDescription)")
     }
+    XCTAssertTrue(curlText(curl).contains("\"type\": \"json_object\""),
+                  "JSON Think curl should request json_object response format; curl=\(curlText(curl).debugDescription)")
   }
 
   @MainActor
@@ -159,13 +161,15 @@ final class S654_LocalAPIPanelGUITests: XCTestCase {
     jsonThink.click()
 
     let curl = app.descendants(matching: .any).matching(identifier: "LocalAPICurl").firstMatch
-    let jsonThinkProfileID = NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@",
-                                        "\"profile_id\": \"json-think\"",
-                                        "\"profile_id\": \"json-think\"")
-    expectation(for: jsonThinkProfileID, evaluatedWith: curl)
+    let jsonThinkResponseFormat = NSPredicate(format: "value CONTAINS %@ OR label CONTAINS %@",
+                                             "\"response_format\"",
+                                             "\"response_format\"")
+    expectation(for: jsonThinkResponseFormat, evaluatedWith: curl)
     waitForExpectations(timeout: 5) { error in
-      XCTAssertNil(error, "example profile switch must still rewrite the curl body; curl=\(self.curlText(curl).debugDescription)")
+      XCTAssertNil(error, "example profile switch must still rewrite the curl body for JSON mode; curl=\(self.curlText(curl).debugDescription)")
     }
+    XCTAssertTrue(curlText(curl).contains("\"type\": \"json_object\""),
+                  "JSON Think curl should request json_object response format; curl=\(curlText(curl).debugDescription)")
 
     XCTAssertTrue(app.staticTexts["chat"].exists,
                   "example profile selection must not change the real configured/served profile row")

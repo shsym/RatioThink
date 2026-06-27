@@ -42,8 +42,10 @@ final class S723_ProfileDescriptionsGUITests: XCTestCase {
 
     assertDescription("A general-purpose chat profile for everyday questions and tasks.",
                       existsIn: settings)
-    assertDescription("A faster, deterministic chat profile that uses speculative decoding when available.",
-                      existsIn: settings)
+    XCTAssertFalse(settings.staticTexts["A faster, deterministic chat profile that uses speculative decoding when available."].exists,
+                   "retired Repeat Boost description must not render in seeded profile settings")
+    XCTAssertTrue(settings.staticTexts["JSON Think"].exists,
+                  "JSON Think seeded profile should remain listed")
 
     let chatDescription = settings.staticTexts["A general-purpose chat profile for everyday questions and tasks."]
     chatDescription.click()
