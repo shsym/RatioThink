@@ -785,26 +785,38 @@ fn cue_generation(ctx: &mut Context, model: &Model, no_think: bool) -> bool {
     }
     if let Some(cue) = gemma_thinking_cue_tokens(model) {
         ctx.append(&cue);
-        return true;
+        return false;
     }
     ctx.cue();
     false
 }
 
-/// Remove leaked reasoning-channel delimiters (`<think>`, `</think>`, and the
-/// near-miss variants small models emit such as `</thinks>`) from visible
-/// answer text (#555 Fix 4). The demux already routes a *recognized* think
-/// block to the reasoning channel, but the host decoder matches an exact
-/// token-id sequence — when a small model emits the same delimiter text via
-/// different token boundaries the match fails and the literal tag reaches the
-/// answer channel. A user-visible answer must never contain a template
-/// delimiter regardless of model, so this strips them unconditionally and
-/// collapses the surrounding whitespace. Pure → unit-tested.
+/// Remove leaked reasoning-channel delimiters (`<think>`, `</think>`, Gemma's
+/// `<|channel>thought` / `<channel|>`, and near-miss variants such as
+/// `</thinks>`) from visible answer text (#555 Fix 4). The demux already
+/// routes a *recognized* think block to the reasoning channel, but marker
+/// matching is token-boundary-sensitive; partial Gemma markers can otherwise
+/// make a starved branch look like it answered. A user-visible answer must
+/// never contain a template delimiter regardless of model, so this strips them
+/// unconditionally and collapses the surrounding whitespace. Pure → unit-tested.
 fn strip_think_delimiters(text: &str) -> String {
     // Length of a think delimiter (`<think>`, `</think>`, `</thinks>`, …)
     // starting at byte index `i`, or `None` if none matches there. ASCII-only
     // delimiters keep byte indexing char-boundary safe.
     fn delimiter_len(b: &[u8], i: usize) -> Option<usize> {
+        if b[i..].starts_with(b"<channel|>") {
+            return Some("<channel|>".len());
+        }
+        if b[i..].starts_with(b"<|channel>") {
+            let mut k = i + "<|channel>".len();
+            while k < b.len() && b[k].is_ascii_alphabetic() {
+                k += 1;
+            }
+            while k < b.len() && b[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            return Some(k - i);
+        }
         if b[i] != b'<' {
             return None;
         }
@@ -1068,8 +1080,13 @@ async fn generate_demuxed(
             Ok(inferlet::reasoning::Event::Idle) => reason_idle = true,
             Err(e) => break DemuxKind::Aborted(format!("reasoning decode failed: {e}")),
         }
+        let suppress_pending_reasoning_marker =
+            reason_idle && reason_dec.suppress_content_for_pending_marker();
         match chat_dec.feed(&out.tokens) {
-            Ok(chat::Event::Delta(s)) if content_visible(reason_idle, was_in_reasoning) => {
+            Ok(chat::Event::Delta(s))
+                if content_visible(reason_idle, was_in_reasoning)
+                    && !suppress_pending_reasoning_marker =>
+            {
                 answer.push_str(&s);
                 // #413 token stream: live-fill the answer channel — a tree
                 // node's `node_delta` or, for synthesis, `final_delta` (#523).
@@ -3019,6 +3036,12 @@ mod tests {
         assert_eq!(
             strip_think_delimiters("The ball costs $0.05.</think>"),
             "The ball costs $0.05."
+        );
+        assert_eq!(strip_think_delimiters("<|channel>"), "");
+        assert_eq!(strip_think_delimiters("<|channel>thought\n"), "");
+        assert_eq!(
+            strip_think_delimiters("<|channel>thought\nUse spaced practice.<channel|>"),
+            "Use spaced practice."
         );
     }
 

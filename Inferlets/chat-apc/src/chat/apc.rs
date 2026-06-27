@@ -92,6 +92,16 @@ impl ReasoningDecoder {
             .unwrap_or(ReasoningEvent::Idle))
     }
 
+    /// True when the Gemma fallback has consumed a prefix of
+    /// `<|channel>thought` but has not yet seen the complete marker. The chat
+    /// decoder may already have text for that prefix; callers must hold it out
+    /// of the visible answer until the marker either completes or fails.
+    pub fn suppress_content_for_pending_marker(&self) -> bool {
+        self.gemma
+            .as_ref()
+            .is_some_and(GemmaChannelDecoder::is_start_pending)
+    }
+
     #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.inner.reset();
@@ -110,7 +120,7 @@ pub fn gemma_thinking_cue_tokens(model: &Model) -> Option<Vec<u32>> {
     has_gemma_channel_markers(model).then(|| model.tokenizer().encode(GEMMA_THINKING_CUE))
 }
 
-const GEMMA_THINKING_CUE: &str = "<|turn>model\n<|channel>thought\n";
+const GEMMA_THINKING_CUE: &str = "<|turn>model\n";
 const GEMMA_THOUGHT_OPEN_PREFIX: &str = "<|channel>";
 const GEMMA_THOUGHT_OPEN_NAME: &str = "thought";
 const GEMMA_THOUGHT_CLOSE: &str = "<channel|>";
@@ -258,6 +268,10 @@ impl GemmaChannelDecoder {
         self.text_emitted = 0;
         self.match_pos = 0;
     }
+
+    fn is_start_pending(&self) -> bool {
+        !self.inside && self.match_pos > 0
+    }
 }
 
 fn safe_emit_end(s: &str) -> usize {
@@ -298,6 +312,20 @@ mod tests {
     }
 
     #[test]
+    fn gemma_channel_decoder_reports_pending_partial_start_marker() {
+        let mut dec = GemmaChannelDecoder::new_for_testing(
+            vec![100, 42],
+            vec![101],
+            |tokens| format!("{tokens:?}"),
+        );
+
+        assert!(matches!(dec.feed(&[100]), ReasoningEvent::Idle));
+        assert!(dec.is_start_pending(), "partial Gemma marker must suppress visible content");
+        assert!(matches!(dec.feed(&[42]), ReasoningEvent::Start));
+        assert!(!dec.is_start_pending());
+    }
+
+    #[test]
     fn gemma_channel_decoder_can_start_inside_prompt_opened_thought_channel() {
         let mut dec =
             GemmaChannelDecoder::new_inside_for_testing(vec![100, 42], vec![101], |tokens| {
@@ -319,8 +347,8 @@ mod tests {
 
     #[test]
     fn gemma_thinking_cue_opens_thought_channel_without_closing_it() {
-        assert_eq!(GEMMA_THINKING_CUE, "<|turn>model\n<|channel>thought\n");
-        assert!(GEMMA_THINKING_CUE.contains(GEMMA_THOUGHT_OPEN_PREFIX));
+        assert_eq!(GEMMA_THINKING_CUE, "<|turn>model\n");
+        assert!(!GEMMA_THINKING_CUE.contains(GEMMA_THOUGHT_OPEN_PREFIX));
         assert!(!GEMMA_THINKING_CUE.contains(GEMMA_THOUGHT_CLOSE));
     }
 }
