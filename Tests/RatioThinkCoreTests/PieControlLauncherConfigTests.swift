@@ -117,9 +117,9 @@ final class PieControlLauncherConfigTests: XCTestCase {
     XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")
   }
 
-  func test_portable_body_emits_max_num_kv_pages_when_set() {
+  func test_portable_body_emits_total_pages_when_set() {
     // #475: the engine KV-pool override rides [model.driver.options].
-    // max_num_kv_pages — the knob the memory-budget sweep turns to lower the
+    // total_pages — the pie Portable driver schema key the memory-budget sweep turns to lower the
     // raw KV capacity (and so the effective ceiling) directly. Omitted when
     // nil (guarded by `..._omits_default_token_limit_when_nil`).
     let body = PieControlLauncher.renderConfigBody(
@@ -129,20 +129,22 @@ final class PieControlLauncherConfigTests: XCTestCase {
     )
     XCTAssertTrue(body.contains("[model.driver.options]"),
                   "a set maxNumKvPages must emit the driver-options block; got:\n\(body)")
-    XCTAssertTrue(body.contains("max_num_kv_pages = 256"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("total_pages = 256"), "got:\n\(body)")
+    XCTAssertFalse(body.contains("max_num_kv_pages"), "stale pie-incompatible key must not be emitted; got:\n\(body)")
     XCTAssertTrue(body.contains("type = \"portable\""), "got:\n\(body)")
     // The override is independent of the scheduler ceiling.
     XCTAssertFalse(body.contains("default_token_limit"), "got:\n\(body)")
   }
 
-  func test_metal_body_emits_max_num_kv_pages_when_set() {
+  func test_metal_body_emits_total_pages_when_set() {
     let body = PieControlLauncher.renderConfigBody(
       modelConfig: .metal(modelID: "Qwen/Qwen3-0.6B"),
       defaultTokenLimit: 4096,
       maxNumKvPages: 512
     )
     XCTAssertTrue(body.contains("[model.driver.options]"), "got:\n\(body)")
-    XCTAssertTrue(body.contains("max_num_kv_pages = 512"), "got:\n\(body)")
+    XCTAssertTrue(body.contains("total_pages = 512"), "got:\n\(body)")
+    XCTAssertFalse(body.contains("max_num_kv_pages"), "stale pie-incompatible key must not be emitted; got:\n\(body)")
     XCTAssertTrue(body.contains("default_token_limit = 4096"),
                   "both knobs coexist — scheduler cap + driver pool; got:\n\(body)")
     XCTAssertTrue(body.contains("device = [\"metal\"]"), "got:\n\(body)")

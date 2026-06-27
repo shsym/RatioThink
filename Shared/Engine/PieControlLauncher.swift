@@ -380,7 +380,7 @@ public enum PieControlLauncher {
     public var defaultTokenLimit: Int?
 
     /// Override for the portable driver's `[model.driver.options]
-    /// .max_num_kv_pages` — the size of the KV page pool the engine
+    /// .total_pages` — the size of the KV page pool the engine
     /// allocates. `nil` omits it so the engine keeps its built-in default
     /// (1024 pages × 32 = 32768 KV tokens). Lowering it shrinks the raw KV
     /// capacity, which lowers the effective `runtime::max-output-tokens`
@@ -1153,7 +1153,7 @@ public enum PieControlLauncher {
 
   /// `[model.driver.options]` projection for the portable/metal driver.
   /// Empty unless a knob override is set — the engine otherwise keeps its
-  /// built-in driver defaults. Only `max_num_kv_pages` is overridable today
+  /// built-in driver defaults. Only `total_pages` is overridable today
   /// (the #475 memory-budget matrix drives it); appended after the driver
   /// block so it lands under the active `[model.driver]` table.
   static func driverOptionsTOML(maxNumKvPages: Int?) -> String {
@@ -1161,7 +1161,7 @@ public enum PieControlLauncher {
     return """
 
     [model.driver.options]
-    max_num_kv_pages = \(pages)
+    total_pages = \(pages)
     """
   }
 
