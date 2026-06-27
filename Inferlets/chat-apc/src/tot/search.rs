@@ -83,10 +83,11 @@ use futures::lock::Mutex;
 use inferlet::Context;
 use inferlet::model::Model;
 use inferlet::sample::Sampler;
-use inferlet::{chat, reasoning};
+use inferlet::chat;
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::chat::apc::{ReasoningDecoder, gemma_thinking_cue_tokens};
 use crate::sse::Emitter;
 
 use super::schema::{TotParams, TotTask};
@@ -758,17 +759,25 @@ trait BranchDriver<C> {
 /// too, so this probe alone cannot exclude Llama — for that model the prefill
 /// stays, and [`strip_think_delimiters`] is the model-agnostic safety net that
 /// removes any delimiter that still leaks through a token-boundary mismatch.
-fn model_uses_reasoning_template(model: &Model) -> bool {
-    let mut dec = reasoning::Decoder::new(model);
+fn model_uses_think_template(model: &Model) -> bool {
+    let mut dec = ReasoningDecoder::new(model);
     let probe = model.tokenizer().encode("<think>\n\n</think>");
-    !matches!(dec.feed(&probe), Ok(reasoning::Event::Idle))
+    !matches!(dec.feed(&probe), Ok(inferlet::reasoning::Event::Idle))
 }
 
 fn cue_generation(ctx: &mut Context, model: &Model, no_think: bool) {
-    ctx.cue();
-    if no_think && model_uses_reasoning_template(model) {
-        ctx.append(&model.tokenizer().encode(NO_THINK_PREFILL));
+    if no_think {
+        ctx.cue();
+        if model_uses_think_template(model) {
+            ctx.append(&model.tokenizer().encode(NO_THINK_PREFILL));
+        }
+        return;
     }
+    if let Some(cue) = gemma_thinking_cue_tokens(model) {
+        ctx.append(&cue);
+        return;
+    }
+    ctx.cue();
 }
 
 /// Remove leaked reasoning-channel delimiters (`<think>`, `</think>`, and the
@@ -978,7 +987,7 @@ async fn generate_demuxed(
     sink: DeltaSink<'_>,
     logit_bias: &[(u32, f32)],
 ) -> Demux {
-    let mut reason_dec = reasoning::Decoder::new(model);
+    let mut reason_dec = ReasoningDecoder::new(model);
     let mut chat_dec = chat::Decoder::new(model);
     let mut generator = ctx
         .generate(sampler)
@@ -1029,8 +1038,8 @@ async fn generate_demuxed(
         let was_in_reasoning = in_reasoning;
         let mut reason_idle = false;
         match reason_dec.feed(&out.tokens) {
-            Ok(reasoning::Event::Start) => in_reasoning = true,
-            Ok(reasoning::Event::Delta(s)) => {
+            Ok(inferlet::reasoning::Event::Start) => in_reasoning = true,
+            Ok(inferlet::reasoning::Event::Delta(s)) => {
                 in_reasoning = true;
                 reasoning.push_str(&s);
                 // #413 token stream: live-fill this node's reasoning channel.
@@ -1039,11 +1048,11 @@ async fn generate_demuxed(
                     let _ = em.node_delta(id, stream::DELTA_REASONING, &s).await;
                 }
             }
-            Ok(reasoning::Event::End(_)) => {
+            Ok(inferlet::reasoning::Event::End(_)) => {
                 in_reasoning = false;
                 reasoning_done = true;
             }
-            Ok(reasoning::Event::Idle) => reason_idle = true,
+            Ok(inferlet::reasoning::Event::Idle) => reason_idle = true,
             Err(e) => break DemuxKind::Aborted(format!("reasoning decode failed: {e}")),
         }
         match chat_dec.feed(&out.tokens) {

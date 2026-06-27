@@ -355,9 +355,9 @@ def verify(stamp_path: Path = STAMP_PATH, *, inputs_only: bool = False) -> None:
 
 def _render(values: dict[str, str]) -> str:
     body = (
-        f'vendor_pie_sha = "{values["vendor_pie_sha"]}"\n'
-        f'src_sha256     = "{values["src_sha256"]}"\n'
-        f'wasm_sha256    = "{values["wasm_sha256"]}"\n'
+        f'vendor_pie_sha = "{values["vendor_pie_sha"]}"  # pragma: allowlist secret\n'
+        f'src_sha256     = "{values["src_sha256"]}"  # pragma: allowlist secret\n'
+        f'wasm_sha256    = "{values["wasm_sha256"]}"  # pragma: allowlist secret\n'
         f'wasm_size      = {values["wasm_size"]}\n'
     )
     return STAMP_HEADER + "\n" + body
