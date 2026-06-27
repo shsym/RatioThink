@@ -732,13 +732,14 @@ struct BranchGenerateRequest<'a> {
     reasoning_budget: usize,
     answer_budget: usize,
     sink_node_id: &'a str,
+    starts_in_gemma_thought: bool,
 }
 
 trait BranchDriver<C> {
     fn fork_retry_base(&mut self, ctx: &C) -> Result<C, String>;
     fn push_user(&mut self, ctx: &mut C, directive: &str);
     fn push_assistant(&mut self, ctx: &mut C, content: &str);
-    fn cue(&mut self, ctx: &mut C, no_think: bool);
+    fn cue(&mut self, ctx: &mut C, no_think: bool) -> bool;
     fn generate<'a>(
         &'a mut self,
         ctx: &'a mut C,
@@ -765,19 +766,20 @@ fn model_uses_think_template(model: &Model) -> bool {
     !matches!(dec.feed(&probe), Ok(inferlet::reasoning::Event::Idle))
 }
 
-fn cue_generation(ctx: &mut Context, model: &Model, no_think: bool) {
+fn cue_generation(ctx: &mut Context, model: &Model, no_think: bool) -> bool {
     if no_think {
         ctx.cue();
         if model_uses_think_template(model) {
             ctx.append(&model.tokenizer().encode(NO_THINK_PREFILL));
         }
-        return;
+        return false;
     }
     if let Some(cue) = gemma_thinking_cue_tokens(model) {
         ctx.append(&cue);
-        return;
+        return true;
     }
     ctx.cue();
+    false
 }
 
 /// Remove leaked reasoning-channel delimiters (`<think>`, `</think>`, and the
@@ -986,8 +988,10 @@ async fn generate_demuxed(
     emitter: Option<BranchSink<'_, '_>>,
     sink: DeltaSink<'_>,
     logit_bias: &[(u32, f32)],
+    starts_in_gemma_thought: bool,
 ) -> Demux {
-    let mut reason_dec = ReasoningDecoder::new(model);
+    let mut reason_dec =
+        ReasoningDecoder::new_with_gemma_thought_open(model, starts_in_gemma_thought);
     let mut chat_dec = chat::Decoder::new(model);
     let mut generator = ctx
         .generate(sampler)
@@ -1007,7 +1011,7 @@ async fn generate_demuxed(
 
     let mut reasoning = String::new();
     let mut answer = String::new();
-    let mut in_reasoning = false;
+    let mut in_reasoning = starts_in_gemma_thought;
     let mut reasoning_done = false;
     let mut reasoning_tokens = 0usize;
     let mut answer_tokens = 0usize;
@@ -2089,7 +2093,7 @@ where
     // pass carry real new tokens rather than spin. Cue's no-think is keyed
     // directly off `thinking` (the directive carries its own `/no_think`).
     driver.push_user(&mut ctx, first_directive);
-    driver.cue(&mut ctx, !params.thinking);
+    let starts_in_gemma_thought = driver.cue(&mut ctx, !params.thinking);
     let reasoning_budget =
         branch_reasoning_budget(level, params.depth, params.max_reasoning_tokens);
     let answer_budget = branch_answer_budget(level, params.depth, params.max_tokens_per_node);
@@ -2101,6 +2105,7 @@ where
                 reasoning_budget,
                 answer_budget,
                 sink_node_id: node_id,
+                starts_in_gemma_thought,
             },
         )
         .await;
@@ -2124,7 +2129,7 @@ where
         match retry_base {
             Some(Ok(mut retry_ctx)) => {
                 driver.push_user(&mut retry_ctx, retry_directive);
-                driver.cue(&mut retry_ctx, true);
+                let starts_in_gemma_thought = driver.cue(&mut retry_ctx, true);
                 let retry = driver
                     .generate(
                         &mut retry_ctx,
@@ -2133,6 +2138,7 @@ where
                             reasoning_budget: NO_THINK_RETRY_REASONING_TOKENS,
                             answer_budget,
                             sink_node_id: node_id,
+                            starts_in_gemma_thought,
                         },
                     )
                     .await;
@@ -2210,8 +2216,8 @@ pub(crate) async fn generate_branch(
             ctx.assistant(content);
         }
 
-        fn cue(&mut self, ctx: &mut Context, no_think: bool) {
-            cue_generation(ctx, self.model, no_think);
+        fn cue(&mut self, ctx: &mut Context, no_think: bool) -> bool {
+            cue_generation(ctx, self.model, no_think)
         }
 
         fn generate<'a>(
@@ -2238,6 +2244,7 @@ pub(crate) async fn generate_branch(
                     sink,
                     DeltaSink::Node(request.sink_node_id),
                     logit_bias,
+                    request.starts_in_gemma_thought,
                 )
                 .await
             })
@@ -2639,7 +2646,7 @@ async fn score_node(
         replayed += 1;
     }
     sctx.user(&with_thinking(score_prompt(is_final_level), false));
-    cue_generation(&mut sctx, model, true);
+    let _ = cue_generation(&mut sctx, model, true);
     let stops = chat::stop_tokens(model);
     let mut generator = sctx
         .generate(Sampler::TopP {
@@ -2793,7 +2800,7 @@ async fn synthesize(
         false,
     );
     base.user(&directive);
-    cue_generation(&mut base, model, true);
+    let _ = cue_generation(&mut base, model, true);
     let stops = chat::stop_tokens(model);
     // Synthesis runs alone after the search (no sibling concurrency), but
     // `generate_demuxed` speaks the shared-sink protocol, so wrap the single
@@ -2814,6 +2821,7 @@ async fn synthesize(
         sink,
         DeltaSink::Final,
         &[],
+        false,
     )
     .await;
     resolve_synthesis_demux(demux)
@@ -4043,9 +4051,10 @@ mod tests {
             ctx.assistants.push(content.to_string());
         }
 
-        fn cue(&mut self, ctx: &mut FakeBranchCtx, no_think: bool) {
+        fn cue(&mut self, ctx: &mut FakeBranchCtx, no_think: bool) -> bool {
             ctx.cues += 1;
             ctx.no_think_cues.push(no_think);
+            false
         }
 
         fn generate<'a>(
