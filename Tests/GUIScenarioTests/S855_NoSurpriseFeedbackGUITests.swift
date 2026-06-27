@@ -18,7 +18,7 @@ final class S855_NoSurpriseFeedbackGUITests: XCTestCase {
     defer { app.terminate() }
     _ = openLocalAPIPanel(in: app)
 
-    let external = app.descendants(matching: .any).matching(identifier: "LocalAPIExternalAccessToggle").firstMatch
+    let external = externalAccessToggle(in: app)
     XCTAssertTrue(external.waitForExistence(timeout: 10), "external access toggle missing; app: \(app.debugDescription)")
     external.click()
 
@@ -65,6 +65,7 @@ final class S855_NoSurpriseFeedbackGUITests: XCTestCase {
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
     app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     app.launchEnvironment["PIE_TEST_ENGINE_SERVED_MODEL"] = servedModel
+    app.launchEnvironment["PIE_TEST_LOCAL_API_EXTERNAL_ACCESS_DELAY_MS"] = "2500"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     app.launch()
     XCTAssert(app.wait(for: .runningForeground, timeout: 10))
@@ -81,6 +82,8 @@ final class S855_NoSurpriseFeedbackGUITests: XCTestCase {
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "unreachable"
     app.launchEnvironment["PIE_TEST_DIAGNOSTICS_FAKE_ZIP"] = "/tmp/pie-s855-diagnostics.zip"
+    app.launchEnvironment["PIE_TEST_DIAGNOSTICS_DELAY_MS"] = "2500"
+    app.launchEnvironment["PIE_TEST_STATUS_ACTION_DELAY_MS"] = "2500"
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     app.launch()
     XCTAssert(app.wait(for: .runningForeground, timeout: 10))
@@ -92,6 +95,21 @@ final class S855_NoSurpriseFeedbackGUITests: XCTestCase {
   private func openLocalAPIPanel(in app: XCUIApplication) -> XCUIElement {
     let panel = app.descendants(matching: .any).matching(identifier: "LocalAPIView").firstMatch
     selectSidebarSection("API Endpoints", until: panel, in: app)
+    XCTAssertTrue(panel.waitForExistence(timeout: 10), "LocalAPIView missing after selecting API Endpoints; app: \(app.debugDescription)")
     return panel
+  }
+
+  @MainActor
+  private func externalAccessToggle(in app: XCUIApplication) -> XCUIElement {
+    let toggle = app.descendants(matching: .any).matching(identifier: "LocalAPIExternalAccessToggle").firstMatch
+    if toggle.waitForExistence(timeout: 2) { return toggle }
+
+    let security = app.descendants(matching: .any).matching(identifier: "LocalAPISecurity").firstMatch
+    XCTAssertTrue(security.waitForExistence(timeout: 5), "Local API security section missing before locating external access toggle; app: \(app.debugDescription)")
+    for _ in 0..<6 where !toggle.exists {
+      app.scrollViews.firstMatch.swipeUp()
+      RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+    }
+    return toggle
   }
 }

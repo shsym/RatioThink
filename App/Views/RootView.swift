@@ -200,9 +200,19 @@ struct RootView: View {
     statusBannerActionFeedback = .running("Restarting helper…")
     helperHealth.restartHelperManually()
     Task { @MainActor in
-      try? await Task.sleep(nanoseconds: 150_000_000)
+      try? await Task.sleep(nanoseconds: Self.statusActionFeedbackDelayNanoseconds())
       statusBannerActionFeedback = .succeeded("Helper restart requested.")
     }
+  }
+
+  private static func statusActionFeedbackDelayNanoseconds() -> UInt64 {
+    #if DEBUG
+    if let raw = ProcessInfo.processInfo.environment["PIE_TEST_STATUS_ACTION_DELAY_MS"],
+       let milliseconds = UInt64(raw) {
+      return milliseconds * 1_000_000
+    }
+    #endif
+    return 150_000_000
   }
 
   private func collectDiagnosticsFromBanner() {

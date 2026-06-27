@@ -462,6 +462,7 @@ struct LocalAPIView: View {
   private var securitySection: some View {
     VStack(alignment: .leading, spacing: 8) {
       sectionHeader("Security")
+        .accessibilityIdentifier("LocalAPISecurity")
       trailingSwitchRow(
         title: "Allow access from other devices",
         isOn: externalAccessBinding,
@@ -494,7 +495,6 @@ struct LocalAPIView: View {
       postureRow(title: "Authentication", value: posture.authSummary)
       postureRow(title: "CORS", value: posture.corsSummary)
     }
-    .accessibilityIdentifier("LocalAPISecurity")
   }
 
   private var externalAccessBinding: Binding<Bool> {
@@ -665,6 +665,7 @@ struct LocalAPIView: View {
       if requiresRestart {
         externalAccessRestartTarget = enabled
         externalAccessRestarting = true
+        try? await Task.sleep(nanoseconds: Self.externalAccessFeedbackDelayNanoseconds())
       }
       defer {
         if requiresRestart {
@@ -691,6 +692,16 @@ struct LocalAPIView: View {
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "switch")
       }
     }
+  }
+
+  private static func externalAccessFeedbackDelayNanoseconds() -> UInt64 {
+    #if DEBUG
+    if let raw = ProcessInfo.processInfo.environment["PIE_TEST_LOCAL_API_EXTERNAL_ACCESS_DELAY_MS"],
+       let milliseconds = UInt64(raw) {
+      return milliseconds * 1_000_000
+    }
+    #endif
+    return 0
   }
 
   static func externalAccessRestartCopy(enabled: Bool) -> ExternalAccessRestartCopy {

@@ -13,6 +13,14 @@ enum DiagnosticsCollector {
     "Diagnostics bundle created: \(zip.lastPathComponent)"
   }
 
+  #if DEBUG
+  private static func debugDelayNanoseconds(environmentKey: String, defaultMilliseconds: UInt64) -> UInt64 {
+    let raw = ProcessInfo.processInfo.environment[environmentKey]
+    let milliseconds = raw.flatMap(UInt64.init) ?? defaultMilliseconds
+    return milliseconds * 1_000_000
+  }
+  #endif
+
   enum CollectError: LocalizedError {
     case scriptMissing
     case launchFailed(String)
@@ -47,7 +55,10 @@ enum DiagnosticsCollector {
       if !FileManager.default.fileExists(atPath: url.path) {
         try Data().write(to: url)
       }
-      try? await Task.sleep(nanoseconds: 150_000_000)
+      try? await Task.sleep(nanoseconds: debugDelayNanoseconds(
+        environmentKey: "PIE_TEST_DIAGNOSTICS_DELAY_MS",
+        defaultMilliseconds: 150
+      ))
       return url
     }
     #endif
