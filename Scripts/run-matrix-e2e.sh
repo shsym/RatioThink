@@ -27,7 +27,7 @@
 #     ADVERTISED ceiling on a live boot — 32768 → 21845 → 512 — but never
 #     trips a load failure (it floors at 512; the physical KV pool is NOT
 #     resized — see the LaunchSpec.maxNumKvPages note + follow-up #489).
-#   · pie KV pool (`max_num_kv_pages`): lowers N = pages × 32 on a live boot
+#   · pie KV pool (`total_pages`): lowers N = pages × 32 on a live boot
 #     (256 → 8192); too small for the model → a captured structured
 #     engine-start failure (`spawnFailed`, exit code + stderr), not a hang.
 #
@@ -53,30 +53,33 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # KEEP IN SYNC WITH Shared/CuratedModelCatalog.swift (CuratedModelCatalog.all).
 # MatrixModelCatalogSyncTests parses this block and hard-fails on any drift
 # (a model added/removed/resized in the catalog but not here, or vice versa).
-# Fields: <hfRepo>|<hfFile>|<minBytes = approximateSizeBytes>|<thinking 0|1>|<semantic 0|1>
-# `thinking=1` (Qwen3 family) flips PIE_TEST_REAL_EXPECT_REASONING=1 so the
-# chat/fast-think cells also assert the reasoning-channel split (#329).
+# Fields: <hfRepo>|<hfFile>|<minBytes = approximateSizeBytes>|<thinking 0|1>|<semantic 0|1>|<reasonsInChat 0|1>
+# `thinking=1` flips PIE_TEST_REAL_EXPECT_REASONING=1 so explicit thinking
+# profiles assert that a reasoning channel actually appears (#329).
 # `semantic=1` (the larger tier, params > 1B) flips PIE_TEST_REAL_EXPECT_SEMANTIC=1
 # so the chat cell adds the #484 weak semantic floor (reply must echo 'pong').
+# `reasonsInChat=1` is model-specific: Qwen3-style rows assert a plain-chat
+# scratchpad; Gemma 4 rows leave chat semantic-only and verify reasoning on an
+# explicit-thinking profile instead.
 # The small 0.5–1B tier stays semantic=0 (contract-level only) so a missed
 # echo — a capability limit, not an engine-compat failure — is not a false FAIL.
 # Gemma 4 31B gets a per-cell KV/output cap below: its default Gemma4 KV pool
 # is large enough to threaten seated all-profile runs, and the proof only needs
 # a bounded 8k-token pool / 4k-token request cap to exercise every profile.
 MATRIX_MODELS=(
-  "Qwen/Qwen2.5-0.5B-Instruct-GGUF|qwen2.5-0.5b-instruct-q4_k_m.gguf|491400032|0|0"
-  "Qwen/Qwen3-0.6B-GGUF|Qwen3-0.6B-Q8_0.gguf|639446688|1|0"
-  "bartowski/Llama-3.2-1B-Instruct-GGUF|Llama-3.2-1B-Instruct-Q4_K_M.gguf|807694464|0|0"
-  "Qwen/Qwen2.5-1.5B-Instruct-GGUF|qwen2.5-1.5b-instruct-q4_k_m.gguf|1117000000|0|1"
-  "bartowski/Llama-3.2-3B-Instruct-GGUF|Llama-3.2-3B-Instruct-Q4_K_M.gguf|2020000000|0|1"
-  "bartowski/Qwen2.5-7B-Instruct-GGUF|Qwen2.5-7B-Instruct-Q4_K_M.gguf|4683074240|0|1"
-  "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF|Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf|4920000000|0|1"
-  "unsloth/gemma-4-12b-it-GGUF|gemma-4-12b-it-Q4_K_M.gguf|7121860000|0|1"
-  "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF|Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf|8988111072|0|1"
-  "Qwen/Qwen3-14B-GGUF|Qwen3-14B-Q4_K_M.gguf|9001752960|1|1"
-  "unsloth/Qwen3.6-27B-GGUF|Qwen3.6-27B-Q4_K_M.gguf|16817244384|1|1"
-  "unsloth/gemma-4-31B-it-GGUF|gemma-4-31B-it-Q4_K_M.gguf|18323731456|1|1"
-  "unsloth/Qwen3.6-35B-A3B-GGUF|Qwen3.6-35B-A3B-UD-Q4_K_M.gguf|22134528992|1|1"
+  "Qwen/Qwen2.5-0.5B-Instruct-GGUF|qwen2.5-0.5b-instruct-q4_k_m.gguf|491400032|0|0|0"
+  "Qwen/Qwen3-0.6B-GGUF|Qwen3-0.6B-Q8_0.gguf|639446688|1|0|1"
+  "bartowski/Llama-3.2-1B-Instruct-GGUF|Llama-3.2-1B-Instruct-Q4_K_M.gguf|807694464|0|0|0"
+  "Qwen/Qwen2.5-1.5B-Instruct-GGUF|qwen2.5-1.5b-instruct-q4_k_m.gguf|1117000000|0|1|0"
+  "bartowski/Llama-3.2-3B-Instruct-GGUF|Llama-3.2-3B-Instruct-Q4_K_M.gguf|2020000000|0|1|0"
+  "bartowski/Qwen2.5-7B-Instruct-GGUF|Qwen2.5-7B-Instruct-Q4_K_M.gguf|4683074240|0|1|0"
+  "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF|Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf|4920000000|0|1|0"
+  "unsloth/gemma-4-12b-it-GGUF|gemma-4-12b-it-Q4_K_M.gguf|7121860000|0|1|0"
+  "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF|Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf|8988111072|0|1|0"
+  "Qwen/Qwen3-14B-GGUF|Qwen3-14B-Q4_K_M.gguf|9001752960|1|1|1"
+  "unsloth/Qwen3.6-27B-GGUF|Qwen3.6-27B-Q4_K_M.gguf|16817244384|1|1|1"
+  "unsloth/gemma-4-31B-it-GGUF|gemma-4-31B-it-Q4_K_M.gguf|18323731456|1|1|0"
+  "unsloth/Qwen3.6-35B-A3B-GGUF|Qwen3.6-35B-A3B-UD-Q4_K_M.gguf|22134528992|1|1|1"
 )
 
 ALL_PROFILES="chat,tree-of-thought,fast-think,ceiling"
@@ -217,10 +220,10 @@ main() {
   FAIL_COUNT=0
   overall_rc=0
 
-  local entry repo file minbytes thinking semantic slug keep f minfloor cell_rc CELL_LOG
+  local entry repo file minbytes thinking semantic reasons_in_chat slug keep f minfloor cell_rc CELL_LOG
   local -a filters env_args
   for entry in "${MATRIX_MODELS[@]}"; do
-    IFS='|' read -r repo file minbytes thinking semantic <<< "$entry"
+    IFS='|' read -r repo file minbytes thinking semantic reasons_in_chat <<< "$entry"
     slug="$repo/$file"
 
     if [ -n "$MODEL_FILTER" ]; then
@@ -234,7 +237,7 @@ main() {
     fi
 
     echo ""
-    echo "==== MATRIX MODEL: $slug  (thinking=$thinking semantic=$semantic)  profiles=[$PROFILES] ===="
+    echo "==== MATRIX MODEL: $slug  (thinking=$thinking semantic=$semantic reasonsInChat=$reasons_in_chat)  profiles=[$PROFILES] ===="
     CELL_LOG="$ROOT/logs/test-$STAMP-matrix-$(printf '%s' "$file" | tr -c 'A-Za-z0-9._-' '_').log"
 
     # Partial-download tripwire floor. The catalog's approximateSizeBytes is
@@ -263,6 +266,9 @@ main() {
     fi
     if [ "$semantic" = "1" ]; then
       env_args+=("PIE_TEST_REAL_EXPECT_SEMANTIC=1")
+    fi
+    if [ "$reasons_in_chat" = "1" ]; then
+      env_args+=("PIE_TEST_REAL_EXPECT_CHAT_REASONING=1")
     fi
     if [ "$slug" = "unsloth/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf" ]; then
       env_args+=("PIE_TEST_E2E_MAX_KV_PAGES=256")

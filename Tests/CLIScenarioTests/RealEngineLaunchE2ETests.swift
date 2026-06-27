@@ -187,8 +187,9 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
   /// fast-think`) so the default `Scripts/run-engine-e2e.sh` path — which
   /// sets only `PIE_TEST_REAL_*` — skips it; `Scripts/run-matrix-e2e.sh`
   /// sets the profile list + the per-cell model coordinate and is the sole
-  /// driver. `PIE_TEST_REAL_EXPECT_REASONING=1` (set by the wrapper for the
-  /// Qwen3 thinking models) adds the reasoning-channel sub-checks.
+  /// driver. `PIE_TEST_REAL_EXPECT_REASONING=1` adds the explicit-thinking
+  /// profile reasoning-channel sub-check; `PIE_TEST_REAL_EXPECT_CHAT_REASONING=1`
+  /// is a separate model-specific plain-chat capability for Qwen3-style rows.
   func test_realEngine_profileMatrixCell() async throws {
     let env = try realEngineEnvOrSkip()
     let raw = ProcessInfo.processInfo.environment["PIE_TEST_E2E_PROFILES"]?
@@ -200,6 +201,7 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
       .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
       .filter { !$0.isEmpty }
     let expectReasoning = ProcessInfo.processInfo.environment["PIE_TEST_REAL_EXPECT_REASONING"] == "1"
+    let expectChatReasoning = ProcessInfo.processInfo.environment["PIE_TEST_REAL_EXPECT_CHAT_REASONING"] == "1"
     // Capability gate for the weak semantic floor (#484). The wrapper sets
     // this only for the larger tier (params > 1B); the small 0.5–1B models
     // stay contract-level so a missed `pong` echo — a capability limit, not
@@ -228,9 +230,11 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
         case "chat":
           try await assertChatCell(port: port, modelID: slug,
                                    expectReasoning: expectReasoning,
+                                   expectChatReasoning: expectChatReasoning,
                                    expectSemantic: expectSemantic)
         case "tree-of-thought":
-          try await assertTreeOfThoughtCell(port: port, modelID: slug)
+          try await assertTreeOfThoughtCell(port: port, modelID: slug,
+                                            expectReasoning: expectReasoning)
         case "fast-think":
           try await assertFastThinkCell(port: port, modelID: slug, expectReasoning: expectReasoning)
         case "ceiling":
@@ -262,7 +266,7 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     /// Lower `bytes` → lower derived ceiling. Never causes a load failure on
     /// its own: it floors at `KVCacheBudget.minCeilingTokens` (512).
     case guardrailBytes(Int64)
-    /// Engine-side: override `[model.driver.options].max_num_kv_pages`, the
+    /// Engine-side: override `[model.driver.options].total_pages`, the
     /// raw KV page pool (= pages × 32 tokens). Caps N directly; when set far
     /// too small for the model it makes `pie serve` fail to load — a
     /// captured, classified engine-start error, not a hang.
@@ -335,7 +339,7 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
   /// This is the memory-size half of the matrix the single `ceiling` cell
   /// could not be: it varies the budget through BOTH fault domains — the
   /// App guardrail (`KVCacheBudget` → `default_token_limit`, the #328/#438
-  /// app-config path) and the pie KV pool (`max_num_kv_pages`) — and asserts
+  /// app-config path) and the pie KV pool (`total_pages`) — and asserts
   /// N moves and the harsh-low cell trips a structured failure.
   ///
   /// Multi-boot (one `pie serve` per budget), so it is gated separately from
@@ -377,7 +381,7 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
           try await assertOverCeilingRejected(port: port, modelID: slug, ceiling: n, label: cell.name)
           print("BUDGET-CELL\t\(model)\t\(cell.name)\trunning\tN=\(n)")
           if cell.name == "large" { baselineLargeN = n }
-          // Exact-wire proof for the engine KV knob: a booted `max_num_kv_pages`
+          // Exact-wire proof for the engine KV knob: a booted `total_pages`
           // cell must report N == min(pages × 32, the default-pool/context cap).
           // This pins `LaunchSpec.maxNumKvPages → config.toml → driver →
           // runtime::max-output-tokens` end-to-end (measured 256 → 8192).
@@ -387,7 +391,7 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
             let kvPageSizeTokens = 32
             let expected = min(p * kvPageSizeTokens, cap)
             if n != expected {
-              hardFailures.append("\(cell.name): max_num_kv_pages=\(p) → expected N=\(expected) (min(\(p)×32, \(cap))), got \(n)")
+              hardFailures.append("\(cell.name): total_pages=\(p) → expected N=\(expected) (min(\(p)×32, \(cap))), got \(n)")
             }
           }
           booted.append(Booted(name: cell.name, n: n, isGuardrail: isGuardrail, kvPages: kvPages))
@@ -736,13 +740,16 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
 
   /// chat cell: a plain completion returns 200 with a non-empty answer and
   /// a terminal `finish_reason` of `stop` or `length` (#434/#439 — the
-  /// engine must always settle a turn, never starve). On a thinking model
-  /// the visible answer stays free of raw `<think>` delimiters and the
-  /// scratchpad rides `reasoning_content` (#329); a thinking model that
-  /// caps mid-reasoning legitimately yields empty `content`, so "produced
-  /// output" is satisfied by either channel.
+  /// engine must always settle a turn, never starve). For every model the
+  /// visible answer stays free of raw `<think>` delimiters; only rows with
+  /// the separate model-specific plain-chat capability assert that the
+  /// scratchpad rides `reasoning_content` (#329). A reasoning model that caps
+  /// mid-reasoning legitimately yields empty `content`, so "produced output"
+  /// is satisfied by either channel.
   private func assertChatCell(port: Int, modelID: String,
-                              expectReasoning: Bool, expectSemantic: Bool) async throws {
+                              expectReasoning: Bool,
+                              expectChatReasoning: Bool,
+                              expectSemantic: Bool) async throws {
     let json = try await postChatJSON(port: port, body: [
       "model": modelID,
       "messages": [["role": "user", "content": "Reply with the single word: pong"]],
@@ -771,11 +778,17 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     // reasoning-capable, Gemma 4 only exposes its thinking channel when the
     // prompt/template explicitly enables thinking (Google Gemma
     // model_card_4 + capabilities/thinking). Keep the universal safety check
-    // that raw delimiters never leak into visible content, but assert
-    // reasoning_content on the explicit thinking profiles instead
-    // (tree-of-thought / fast-think / ceiling), not this trivial pong turn.
+    // that raw delimiters never leak into visible content. Non-empty chat
+    // reasoning_content is asserted only by the model-specific
+    // `PIE_TEST_REAL_EXPECT_CHAT_REASONING` capability; explicit-thinking
+    // reasoning is asserted by `assertTreeOfThoughtCell` on a thinking prompt
+    // and by `assertReasoningSeparatedFromContent` in the dedicated gated test.
     try cellRequire(!(content.contains("<think>") || content.contains("</think>")),
                     "chat: raw think delimiter leaked into content: \(content.debugDescription)")
+    if expectChatReasoning {
+      try cellRequire(!reasoning.isEmpty,
+                      "chat: model-specific reasons-in-chat capability expected non-empty reasoning_content")
+    }
 
     // The answer channel: the visible content, or the reasoning scratchpad
     // when a thinking model caps before emitting any content.
@@ -855,7 +868,8 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
   /// depth>1 search is what spans the inter-level idle gap (#413). Default
   /// `coupled_sequential` exec, so the production prebuilt wasm serves it
   /// (the #458 phased_concurrent strategies are a separate feature build).
-  private func assertTreeOfThoughtCell(port: Int, modelID: String) async throws {
+  private func assertTreeOfThoughtCell(port: Int, modelID: String,
+                                       expectReasoning: Bool) async throws {
     let client = HTTPEngineClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!)
     let input: [String: Any] = [
       "model": modelID,
@@ -877,8 +891,13 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     var maxDepth = 0
     var selected: String?
     var finalAnswer: String?
+    var sawReasoningDelta = false
     for try await event in toTEventStream(from: client.dispatchInferlet(req)) {
       switch event {
+      case .nodeDelta(_, .reasoning, let text):
+        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+          sawReasoningDelta = true
+        }
       case .nodeComplete(let node):
         maxDepth = max(maxDepth, node.depth)
       case .treeComplete(let sel, let ans):
@@ -893,6 +912,11 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
     try cellRequire(maxDepth >= 2, "tot: search did not reach depth>1 (max node depth \(maxDepth))")
     try cellRequire(selected != nil || !((finalAnswer ?? "").isEmpty),
                     "tot: tree_complete carried neither a selected node nor a final answer")
+    if expectReasoning {
+      try cellRequire(sawReasoningDelta,
+                      "tot: explicit-thinking profile did not surface reasoning_content on node deltas")
+      print("TOT-REASONING\t\(modelID)\tsaw_node_delta_reasoning=true")
+    }
   }
 
   /// fast-think cell: a greedy (temperature 0) completion carrying the

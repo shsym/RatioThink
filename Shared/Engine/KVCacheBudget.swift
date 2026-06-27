@@ -26,7 +26,7 @@ public enum KVCacheBudget {
   public static let kvPageSizeTokens: Int = 32
 
   /// Engine default KV-pool page count — pie's portable-driver
-  /// `max_num_kv_pages` default (`server/src/config.rs` `= 1024`). Used as
+  /// `total_pages` default (`server/src/config.rs` `= 1024`). Used as
   /// the divisor-free fallback when a `LaunchSpec` leaves `maxNumKvPages`
   /// `nil` (the production case — the launcher does not override it).
   public static let defaultMaxNumKvPages: Int = 1024
@@ -43,7 +43,7 @@ public enum KVCacheBudget {
   /// (`Vendor/pie/runtime/src/model.rs` `output_token_ceiling_for_model`):
   ///
   ///   `effective = default_token_limit.unwrap_or(kvCap).min(kvCap)`
-  ///   `kvCap     = (max_num_kv_pages ?? defaultMaxNumKvPages) * kvPageSizeTokens`
+  ///   `kvCap     = (total_pages ?? defaultMaxNumKvPages) * kvPageSizeTokens`
   ///
   /// There is deliberately **no** `minCeilingTokens` floor here: that 512 floor
   /// lives only in `outputTokenCeiling` (the pre-launch EMIT path, which floors

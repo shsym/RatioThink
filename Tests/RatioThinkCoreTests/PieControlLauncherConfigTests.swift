@@ -103,8 +103,10 @@ final class PieControlLauncherConfigTests: XCTestCase {
     // Exact key = value line, under the scheduler section, not driver options.
     XCTAssertTrue(body.contains("default_token_limit = 5000"), "got:\n\(body)")
     XCTAssertTrue(body.contains("[model.scheduler]"), "got:\n\(body)")
-    XCTAssertFalse(body.contains("max_num_kv_pages"),
-                   "the old pool-resize knob must not be emitted; got:\n\(body)")
+    XCTAssertFalse(body.contains("[model.driver.options]"),
+                   "nil maxNumKvPages must not write the driver-options block; got:\n\(body)")
+    XCTAssertFalse(body.contains("total_pages"),
+                   "nil maxNumKvPages must not write total_pages; got:\n\(body)")
     XCTAssertTrue(body.contains("type = \"portable\""))
   }
 
