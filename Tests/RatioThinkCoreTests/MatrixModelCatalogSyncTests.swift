@@ -81,12 +81,12 @@ final class MatrixModelCatalogSyncTests: XCTestCase {
     XCTAssertTrue(
       script.contains("\"unsloth/gemma-4-31B-it-GGUF|gemma-4-31B-it-Q4_K_M.gguf|18323731456|0|1\""),
       "Gemma 4 31B must have a matrix row with thinking=0 and semantic=1")
-    XCTAssertTrue(script.contains("PIE_TEST_E2E_MAX_KV_PAGES=256"),
-                  "Gemma 4 31B all-profile matrix run must shrink the KV page pool for the seated memory budget")
-    XCTAssertTrue(script.contains("PIE_TEST_E2E_DEFAULT_TOKEN_LIMIT=4096"),
-                  "Gemma 4 31B all-profile matrix run must bound per-request output tokens")
-    XCTAssertTrue(script.contains(slug),
-                  "Gemma 4 31B matrix row must target the exact verified slug")
+    let gemmaGuard = "if [ \"$slug\" = \"\(slug)\" ]; then"
+    let guardSlice = try scriptSlice(script, from: gemmaGuard, throughNextLineEqualTo: "fi")
+    XCTAssertTrue(guardSlice.contains("PIE_TEST_E2E_MAX_KV_PAGES=256"),
+                  "Gemma 4 31B all-profile matrix run must shrink the KV page pool inside the exact slug guard")
+    XCTAssertTrue(guardSlice.contains("PIE_TEST_E2E_DEFAULT_TOKEN_LIMIT=4096"),
+                  "Gemma 4 31B all-profile matrix run must bound per-request output tokens inside the exact slug guard")
     XCTAssertTrue(script.contains("PIE_TEST_E2E_PROFILES:-$ALL_PROFILES"),
                   "matrix default must continue exercising chat/tree-of-thought/fast-think/ceiling")
   }
@@ -122,6 +122,30 @@ final class MatrixModelCatalogSyncTests: XCTestCase {
     }
     XCTAssertFalse(rows.isEmpty, "parsed zero MATRIX_MODELS rows — parser or block drifted")
     return rows
+  }
+
+  /// Return the line-bounded slice from a required start marker through the
+  /// next line whose trimmed content equals `endLine`. This is intentionally
+  /// strict: if the Gemma-specific cap guard is renamed, removed, or
+  /// reformatted away from a shell `if ...; then` / `fi` block, the anti-drift
+  /// test should fail rather than quietly searching the whole script.
+  private func scriptSlice(
+    _ script: String,
+    from startMarker: String,
+    throughNextLineEqualTo endLine: String,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) throws -> String {
+    let lines = script.components(separatedBy: .newlines)
+    guard let start = lines.firstIndex(where: { $0.contains(startMarker) }) else {
+      XCTFail("script slice start not found: \(startMarker)", file: file, line: line)
+      throw XCTSkip("script slice start not found")
+    }
+    guard let end = lines[(start + 1)...].firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == endLine }) else {
+      XCTFail("script slice end not found after: \(startMarker)", file: file, line: line)
+      throw XCTSkip("script slice end not found")
+    }
+    return lines[start...end].joined(separator: "\n")
   }
 
   private func readRepoFile(_ relativePath: String,

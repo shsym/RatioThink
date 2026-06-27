@@ -1131,7 +1131,7 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
         XCTFail("PIE_TEST_E2E_MAX_KV_PAGES must be a positive integer, got \(rawPages.debugDescription)")
         throw XCTSkip("invalid PIE_TEST_E2E_MAX_KV_PAGES")
       }
-      spec.maxNumKvPages = pages
+      spec.maxNumKvPages = min(spec.maxNumKvPages ?? pages, pages)
     }
     if let rawLimit = env["PIE_TEST_E2E_DEFAULT_TOKEN_LIMIT"], !rawLimit.isEmpty {
       guard let limit = Int(rawLimit), limit > 0 else {
