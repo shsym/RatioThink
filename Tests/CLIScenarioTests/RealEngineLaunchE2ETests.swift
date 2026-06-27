@@ -863,11 +863,11 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
   /// tree-of-thought cell: dispatch the real `/v1/chat/completions`
   /// advanced-profile ToT search through the typed client + `toTEventStream`
   /// (the exact App path) and require the stream to reach a `tree_complete`
-  /// terminal with a chosen answer, having materialized at least one node at
-  /// depth ≥ 2 — the
-  /// depth>1 search is what spans the inter-level idle gap (#413). Default
-  /// `coupled_sequential` exec, so the production prebuilt wasm serves it
-  /// (the #458 phased_concurrent strategies are a separate feature build).
+  /// terminal with a chosen answer. Most models must materialize at least one
+  /// node at depth ≥ 2 — the depth>1 search is what spans the inter-level idle
+  /// gap (#413). Gemma 4 31B is intentionally bounded app-side to a single
+  /// breadth-expanded reasoning level under the 256-page large-model matrix
+  /// pool, so its strict contract here is reasoning_content + visible answer.
   private func assertTreeOfThoughtCell(port: Int, modelID: String,
                                        expectReasoning: Bool) async throws {
     let client = HTTPEngineClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!)
@@ -909,7 +909,10 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
       }
     }
     try cellRequire(sawTreeComplete, "tot: stream never reached tree_complete")
-    try cellRequire(maxDepth >= 2, "tot: search did not reach depth>1 (max node depth \(maxDepth))")
+    let allowsSingleLevelToT = modelID.contains("gemma-4-31B-it-GGUF")
+    if !allowsSingleLevelToT {
+      try cellRequire(maxDepth >= 2, "tot: search did not reach depth>1 (max node depth \(maxDepth))")
+    }
     try cellRequire(selected != nil || !((finalAnswer ?? "").isEmpty),
                     "tot: tree_complete carried neither a selected node nor a final answer")
     if expectReasoning {
