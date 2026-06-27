@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import unittest
+import asyncio
 
 import tot_profile_accuracy as h
 
@@ -154,6 +155,78 @@ class Aggregation(unittest.TestCase):
             ["Qwen/Qwen3-14B-GGUF", "Qwen/Qwen3-0.6B"],
         )
         self.assertEqual(artifact["settings"]["dataset"], "gsm8k")
+
+    def test_default_models_start_with_cheap_model_before_heavy_models(self):
+        self.assertEqual(h.DEFAULT_MODELS[0], "Qwen/Qwen3-0.6B")
+        self.assertIn("Qwen/Qwen3-14B-GGUF", h.DEFAULT_MODELS[-1])
+
+    def test_all_ungraded_artifact_is_measurement_failure(self):
+        artifact = h.build_artifact(
+            models=[
+                {
+                    "model": "m",
+                    "single": {"n_graded": 0},
+                    "tot": {"n_graded": 0},
+                    "items": [],
+                }
+            ],
+            settings={"dataset": "gsm8k"},
+        )
+
+        self.assertFalse(h.has_any_graded_item(artifact))
+
+    def test_any_graded_cell_is_measurement_success(self):
+        artifact = h.build_artifact(
+            models=[
+                {
+                    "model": "m",
+                    "single": {"n_graded": 0},
+                    "tot": {"n_graded": 1},
+                    "items": [],
+                }
+            ],
+            settings={"dataset": "gsm8k"},
+        )
+
+        self.assertTrue(h.has_any_graded_item(artifact))
+
+    def test_boot_failure_records_error_row_continues_and_snapshots_rows(self):
+        async def run_one(index, model):
+            if model == "bad":
+                raise RuntimeError("handshake timeout")
+            return h.summarize_model(
+                model,
+                [
+                    h.ItemResult(
+                        dataset="gsm8k",
+                        index=1,
+                        prompt_id="gsm8k:1",
+                        reference={"final_answer": "18"},
+                        single=h.ArmResult(answer="#### 18", tokens=1, latency_s=0.1),
+                        tot=h.ArmResult(answer="#### 18", tokens=2, latency_s=0.2),
+                    )
+                ],
+                "gsm8k_numeric",
+            )
+
+        snapshots = []
+        rows = asyncio.run(
+            h.collect_model_rows(
+                ["bad", "good"],
+                run_one,
+                write_partial=lambda current: snapshots.append([r["model"] for r in current]),
+            )
+        )
+
+        self.assertEqual([r["model"] for r in rows], ["bad", "good"])
+        self.assertEqual(rows[0]["boot_error"], "RuntimeError: handshake timeout")
+        self.assertEqual(rows[0]["single"]["n_graded"], 0)
+        self.assertEqual(rows[1]["single"]["n_graded"], 1)
+        self.assertEqual(snapshots, [["bad"], ["bad", "good"]])
+
+    def test_shmem_name_is_unique_per_model_boot(self):
+        self.assertNotEqual(h.shmem_name(1), h.shmem_name(2))
+        self.assertTrue(h.shmem_name(2).endswith("_2"))
 
 
 if __name__ == "__main__":

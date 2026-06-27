@@ -40,10 +40,10 @@ import tot_accuracy_real as base  # noqa: E402
 
 
 DEFAULT_MODELS = (
-    "Qwen/Qwen3-14B-GGUF",
-    "Qwen/Qwen3-8B",
-    "Qwen/Qwen3-4B",
     "Qwen/Qwen3-0.6B",
+    "Qwen/Qwen3-4B",
+    "Qwen/Qwen3-8B",
+    "Qwen/Qwen3-14B-GGUF",
 )
 DATASET = os.environ.get("DATASETS", "gsm8k").split(",")[0].strip() or "gsm8k"
 MAX_PROMPTS = int(os.environ.get("MAX_PROMPTS", "6"))
@@ -82,6 +82,10 @@ def _models_from_env() -> list[str]:
     if os.environ.get("MODEL"):
         return [os.environ["MODEL"]]
     return list(DEFAULT_MODELS)
+
+
+def shmem_name(index: int) -> str:
+    return f"/tot_profile_accuracy_{os.getpid()}_{index}"
 
 
 def parse_single_pass_response(payload: dict, fallback_count: Callable[[str], int]) -> ArmResult:
@@ -244,6 +248,60 @@ def build_artifact(models: list[dict], settings: dict) -> dict:
     }
 
 
+def _empty_cell(first_error: str | None = None) -> dict:
+    return {
+        "n_correct": 0,
+        "n_wrong": 0,
+        "n_ungradable": 0,
+        "n_error": 1 if first_error else 0,
+        "n_graded": 0,
+        "accuracy": None,
+        "mean_tokens": None,
+        "mean_latency_s": None,
+        "first_error": first_error,
+        "node_error_count": 0,
+    }
+
+
+def model_boot_error_row(model: str, exc: Exception) -> dict:
+    err = f"{type(exc).__name__}: {exc}"
+    return {
+        "model": model,
+        "dataset": DATASET,
+        "boot_error": err,
+        "single": _empty_cell(err),
+        "tot": _empty_cell(err),
+        "accuracy_delta_tot_minus_single": None,
+        "mean_token_delta_tot_minus_single": None,
+        "mean_latency_delta_s_tot_minus_single": None,
+        "items": [],
+        "coverage": {"measured": 0, "total": None},
+    }
+
+
+async def collect_model_rows(models: list[str], run_one, write_partial=None) -> list[dict]:
+    rows: list[dict] = []
+    for index, model in enumerate(models, 1):
+        try:
+            row = await run_one(index, model)
+        except Exception as exc:  # noqa: BLE001 - model-level failure is reported, not fatal.
+            row = model_boot_error_row(model, exc)
+            print(f"[profile-accuracy] model boot failed for {model}: {row['boot_error']}",
+                  file=sys.stderr, flush=True)
+        rows.append(row)
+        if write_partial is not None:
+            write_partial(rows)
+    return rows
+
+
+def has_any_graded_item(artifact: dict) -> bool:
+    for row in artifact.get("models", []):
+        for arm in ("single", "tot"):
+            if (row.get(arm) or {}).get("n_graded", 0) > 0:
+                return True
+    return False
+
+
 def _item_to_json(item: ItemResult, grader: str) -> dict:
     single_bucket, single_passed = _score_arm(item.single, grader, item.reference)
     tot_bucket, tot_passed = _score_arm(item.tot, grader, item.reference)
@@ -345,8 +403,25 @@ async def _run() -> dict:
     models = _models_from_env()
     count, unit = base._load_tokenizer()
     grader = base._grader_for(DATASET)
-    rows: list[dict] = []
-    for model in models:
+    settings = {
+        "dataset": DATASET,
+        "max_prompts": MAX_PROMPTS,
+        "max_tokens": MAX_TOKENS,
+        "models": models,
+        "token_unit": unit,
+        "tot": {
+            "breadth": TOT_BREADTH,
+            "depth": TOT_DEPTH,
+            "beam_width": TOT_BEAM,
+            "task": TOT_TASK,
+            "temperature": TOT_TEMPERATURE,
+        },
+    }
+
+    def write_partial(rows: list[dict]) -> None:
+        Path(OUT).write_text(json.dumps(build_artifact(rows, settings), indent=2))
+
+    async def run_one(index: int, model: str) -> dict:
         print(f"\n[profile-accuracy] booting model={model}", flush=True)
         with tempfile.TemporaryDirectory(prefix="tpa-", dir="/tmp") as tmp:
             tmp_path = Path(tmp)
@@ -357,7 +432,7 @@ async def _run() -> dict:
             env = {
                 **os.environ,
                 "PIE_HOME": str(pie_home),
-                "PIE_SHMEM_NAME": f"/tot_profile_accuracy_{os.getpid()}",
+                "PIE_SHMEM_NAME": shmem_name(index),
             }
             proc = subprocess.Popen(
                 [str(h.PIE_BIN), "serve", "--config", str(cfg), "--no-auth", "--debug"],
@@ -382,25 +457,14 @@ async def _run() -> dict:
                     await client.launch_daemon("chat-apc@0.1.0", port)
                     if not h._wait_for_port(port, timeout=30):
                         raise RuntimeError(f"daemon never bound port {port}")
-                    rows.append(await _run_model(base_url, model, count, grader))
+                    return await _run_model(base_url, model, count, grader)
                 finally:
                     drain.cancel()
             finally:
                 h._terminate_subprocess(proc, "engine")
-    return build_artifact(rows, {
-        "dataset": DATASET,
-        "max_prompts": MAX_PROMPTS,
-        "max_tokens": MAX_TOKENS,
-        "models": models,
-        "token_unit": unit,
-        "tot": {
-            "breadth": TOT_BREADTH,
-            "depth": TOT_DEPTH,
-            "beam_width": TOT_BEAM,
-            "task": TOT_TASK,
-            "temperature": TOT_TEMPERATURE,
-        },
-    })
+
+    rows = await collect_model_rows(models, run_one, write_partial)
+    return build_artifact(rows, settings)
 
 
 def _print(artifact: dict) -> None:
@@ -439,6 +503,10 @@ async def main() -> int:
     Path(OUT).write_text(json.dumps(artifact, indent=2))
     _print(artifact)
     print(f"\n[profile-accuracy] artifact -> {OUT}")
+    if not has_any_graded_item(artifact):
+        print("[profile-accuracy] ERROR: no graded items were produced by any model/arm",
+              file=sys.stderr)
+        return 1
     return 0
 
 

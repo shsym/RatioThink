@@ -19,7 +19,7 @@
 #
 # Knobs (env):
 #   TOT_ACCURACY_MODE profile|academic (default profile)
-#   MODELS       comma list for profile mode, larger-first by default
+#   MODELS       comma list for profile mode, smallest-first by default
 #   MODEL        one HF repo (academic default Qwen/Qwen3-8B; profile maps to MODELS)
 #   MAX_TOKENS   max tokens per ToT node / per chain (default 512)
 #   MAX_PROMPTS  prompts measured per dataset, canonical-order prefix
@@ -43,7 +43,7 @@ if [ "$TOT_ACCURACY_MODE" = "profile" ]; then
     if [ -n "${MODEL:-}" ]; then
       MODELS="$MODEL"
     else
-      MODELS="Qwen/Qwen3-14B-GGUF,Qwen/Qwen3-8B,Qwen/Qwen3-4B,Qwen/Qwen3-0.6B"
+      MODELS="Qwen/Qwen3-0.6B,Qwen/Qwen3-4B,Qwen/Qwen3-8B,Qwen/Qwen3-14B-GGUF"
     fi
   fi
   DATASETS="${DATASETS:-gsm8k}"
