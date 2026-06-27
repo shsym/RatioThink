@@ -28,10 +28,12 @@ final class MatrixModelCatalogSyncTests: XCTestCase {
       Row(repo: m.huggingFaceRepo,
           file: m.huggingFaceFile,
           minBytes: m.approximateSizeBytes,
-          // Thinking models are the Qwen3 family (they emit `<think>`
-          // scratchpads). The catalog has no explicit flag, so derive it
-          // the same way the wrapper's `thinking=1` rows must: a Qwen3 repo.
-          thinking: m.huggingFaceRepo.contains("Qwen3"),
+          // Thinking rows assert reasoning-content. The catalog has no
+          // explicit flag, so derive it the same way the wrapper's
+          // `thinking=1` rows must: Qwen3 repos, plus the operator-confirmed
+          // Gemma 4 31B seated matrix cell.
+          thinking: m.huggingFaceRepo.contains("Qwen3")
+            || m.id == "gemma-4-31b-it-q4_k_m",
           // The weak semantic floor (#484) is capability-gated to the larger
           // tier; the small 0.5–1B models stay contract-level. Derive it from
           // the catalog param count the same way the wrapper's `semantic=1`
@@ -79,8 +81,8 @@ final class MatrixModelCatalogSyncTests: XCTestCase {
     let script = try readRepoFile("Scripts/run-matrix-e2e.sh")
     let slug = "unsloth/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"
     XCTAssertTrue(
-      script.contains("\"unsloth/gemma-4-31B-it-GGUF|gemma-4-31B-it-Q4_K_M.gguf|18323731456|0|1\""),
-      "Gemma 4 31B must have a matrix row with thinking=0 and semantic=1")
+      script.contains("\"unsloth/gemma-4-31B-it-GGUF|gemma-4-31B-it-Q4_K_M.gguf|18323731456|1|1\""),
+      "Gemma 4 31B must have a matrix row with thinking=1 and semantic=1")
     let gemmaGuard = "if [ \"$slug\" = \"\(slug)\" ]; then"
     let guardSlice = try scriptSlice(script, from: gemmaGuard, throughNextLineEqualTo: "fi")
     XCTAssertTrue(guardSlice.contains("PIE_TEST_E2E_MAX_KV_PAGES=256"),

@@ -75,7 +75,7 @@ MATRIX_MODELS=(
   "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF|Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf|8988111072|0|1"
   "Qwen/Qwen3-14B-GGUF|Qwen3-14B-Q4_K_M.gguf|9001752960|1|1"
   "unsloth/Qwen3.6-27B-GGUF|Qwen3.6-27B-Q4_K_M.gguf|16817244384|1|1"
-  "unsloth/gemma-4-31B-it-GGUF|gemma-4-31B-it-Q4_K_M.gguf|18323731456|0|1"
+  "unsloth/gemma-4-31B-it-GGUF|gemma-4-31B-it-Q4_K_M.gguf|18323731456|1|1"
   "unsloth/Qwen3.6-35B-A3B-GGUF|Qwen3.6-35B-A3B-UD-Q4_K_M.gguf|22134528992|1|1"
 )
 
