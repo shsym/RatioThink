@@ -767,12 +767,15 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
                     "chat: finish_reason must be stop|length, got \(finish ?? "nil")")
     try cellRequire(!(content.isEmpty && reasoning.isEmpty),
                     "chat: engine produced neither content nor reasoning")
-    if expectReasoning {
-      try cellRequire(!(content.contains("<think>") || content.contains("</think>")),
-                      "chat: raw think delimiter leaked into content: \(content.debugDescription)")
-      try cellRequire(!reasoning.isEmpty,
-                      "chat: thinking model must surface reasoning_content")
-    }
+    // Plain chat is a direct-answer profile: even when the model row is
+    // reasoning-capable, Gemma 4 only exposes its thinking channel when the
+    // prompt/template explicitly enables thinking (Google Gemma
+    // model_card_4 + capabilities/thinking). Keep the universal safety check
+    // that raw delimiters never leak into visible content, but assert
+    // reasoning_content on the explicit thinking profiles instead
+    // (tree-of-thought / fast-think / ceiling), not this trivial pong turn.
+    try cellRequire(!(content.contains("<think>") || content.contains("</think>")),
+                    "chat: raw think delimiter leaked into content: \(content.debugDescription)")
 
     // The answer channel: the visible content, or the reasoning scratchpad
     // when a thinking model caps before emitting any content.
