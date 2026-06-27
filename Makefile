@@ -32,7 +32,7 @@ $(LOGDIR):
 # recipes below, which run in a non-sandboxed shell after xcodebuild exits
 # (every test app already dead). Add a suite's prefix here if it stages a real
 # /tmp home. See TEST.md "GUI temp-home cleanup".
-GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-* /tmp/pie-s326dl-* /tmp/pie-s326done-* /tmp/pie-s459swap-* /tmp/pie-s512-* /tmp/pie-s530-* /tmp/pie-s678-*
+GUI_TMP_HOMES := /tmp/pie-s285-* /tmp/pie-s286gate-* /tmp/pie-s326dl-* /tmp/pie-s326done-* /tmp/pie-s459swap-* /tmp/pie-s512-* /tmp/pie-s530-* /tmp/pie-s678-* /tmp/pie-s855-*
 
 # Canned recipe: run a focused set of RatioThinkGUITests suites via xcodebuild
 # with the seated-session warning + the standard log-capture/PIPESTATUS guard
@@ -75,7 +75,7 @@ endef
         test-spec-smoke test-spec-bench test-spec-matrix-selftest bench-spec-matrix bench-datasets-prep bench-datasets-verify \
         test-tot-accuracy-selftest bench-tot-accuracy \
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
-        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-gui-chat-switch test-gui-bestofn test-gui-menu test-gui-engine-status test-gui-model-download test-menubar-icon-template \
+        test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-gui-chat-switch test-gui-bestofn test-gui-local-api test-gui-no-surprise test-gui-menu test-gui-engine-status test-gui-model-download test-menubar-icon-template \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-tot-leak test-helper-respawn test-helper-recovery test-quit-structured \
         test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-apc-bench-selftest test-e2e-harsh-load test-e2e-cache-real bench-apc-real \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
@@ -686,6 +686,9 @@ test-gui-bestofn: genproject $(LOGDIR) ## GUI area: #690 Best-of-N interactive s
 
 test-gui-local-api: genproject $(LOGDIR) ## GUI area: #654/#663 Local API panel — seeded profile tabs + streaming toggle, same-model switch keeps engine and per-profile 'Running' badge (S654)
 	$(call gui_suite_run,local-api,-only-testing:RatioThinkGUITests/S654_LocalAPIPanelGUITests)
+
+test-gui-no-surprise: genproject $(LOGDIR) ## GUI area: destructive/long-running action feedback identifiers (S855)
+	$(call gui_suite_run,no-surprise,-only-testing:RatioThinkGUITests/S855_NoSurpriseFeedbackGUITests)
 
 test-gui-menu: genproject $(LOGDIR) ## GUI area: #411 App menu — "Check for Updates…" present, orphaned New Chat/New Window commands removed (S411)
 	$(call gui_suite_run,menu,-only-testing:RatioThinkGUITests/S411_AppMenuUpdateGUITests)

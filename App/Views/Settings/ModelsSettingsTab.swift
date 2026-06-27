@@ -21,12 +21,17 @@ struct ModelsSettingsTab: View {
   /// (review v2 F11). Each writer clears prior values so two unrelated
   /// errors don't blend together.
   @State private var actionError: String?
+  @State private var actionNotice: String?
+  @State private var actionNoticeIdentifier: String = "ModelsActionSucceeded"
+  @State private var movingToTrashFilename: String?
 
   var body: some View {
     VStack(alignment: .leading, spacing: 16) {
       header
 
       DownloadsInFlightSection()
+
+      actionFeedback
 
       InstalledModelsTable(rows: library.installed,
                             error: library.scanError,
@@ -83,7 +88,7 @@ struct ModelsSettingsTab: View {
   private func deleteFile(_ row: InstalledModel) {
     let affected = profileStore.profilesReferencingModel(row.filename)
     let alert = NSAlert()
-    alert.messageText = "Delete \(row.displayName)?"
+    alert.messageText = "Move \(row.displayName) to Trash?"
     if affected.isEmpty {
       alert.informativeText = "The file will be moved to the Trash."
     } else {
@@ -92,20 +97,58 @@ struct ModelsSettingsTab: View {
         affectedProfiles: affected
       )
     }
-    alert.addButton(withTitle: affected.isEmpty ? "Delete" : "Delete and Clear Defaults")
+    alert.addButton(withTitle: Self.moveToTrashConfirmTitle(affectedDefaults: affected.count))
     alert.addButton(withTitle: "Cancel")
     alert.alertStyle = .warning
     guard alert.runModal() == .alertFirstButtonReturn else { return }
-    do {
-      try Self.deleteInstalledModel(row: row, profileStore: profileStore)
-      actionError = nil
-    } catch {
-      // Label the failure explicitly so the user knows it was a
-      // delete, not the latest drop import (review v2 F11).
-      actionError = "Delete '\(row.filename)' failed: \(error)"
-      return
+    actionError = nil
+    actionNotice = nil
+    actionNoticeIdentifier = "ModelsMoveToTrashSucceeded"
+    movingToTrashFilename = row.filename
+    Task { @MainActor in
+      do {
+        try Self.deleteInstalledModel(row: row, profileStore: profileStore)
+        actionNotice = Self.moveToTrashSuccessMessage(filename: row.filename)
+      } catch {
+        actionError = "Move '\(row.filename)' to Trash failed: \(error)"
+        movingToTrashFilename = nil
+        return
+      }
+      movingToTrashFilename = nil
+      await library.refresh()
     }
-    Task { await library.refresh() }
+  }
+
+  @ViewBuilder
+  private var actionFeedback: some View {
+    if let movingToTrashFilename {
+      HStack(spacing: 8) {
+        ProgressView().controlSize(.small)
+        Text(Self.moveToTrashInFlightMessage(filename: movingToTrashFilename))
+          .font(.callout)
+          .foregroundStyle(.secondary)
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .accessibilityIdentifier("ModelsMoveToTrashInProgress")
+    } else if let actionNotice {
+      Label(actionNotice, systemImage: "checkmark.circle.fill")
+        .font(.callout)
+        .foregroundStyle(.green)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier(actionNoticeIdentifier)
+    }
+  }
+
+  static func moveToTrashConfirmTitle(affectedDefaults: Int) -> String {
+    affectedDefaults == 0 ? "Move to Trash" : "Move to Trash and Clear Defaults"
+  }
+
+  static func moveToTrashInFlightMessage(filename: String) -> String {
+    "Moving '\(filename)' to Trash…"
+  }
+
+  static func moveToTrashSuccessMessage(filename: String) -> String {
+    "Moved '\(filename)' to Trash."
   }
 
   static func deleteInstalledModel(
@@ -160,6 +203,7 @@ struct ModelsSettingsTab: View {
   private func handleDrop(_ urls: [URL], _ providerErrors: [String]) {
     guard let dir = library.modelsDirectory else {
       actionError = "models directory not ready"
+      actionNotice = nil
       return
     }
     var succeeded = 0
@@ -180,6 +224,10 @@ struct ModelsSettingsTab: View {
     actionError = formatDropSummary(total: urls.count + providerErrors.count,
                                      succeeded: succeeded,
                                      failures: failures)
+    actionNotice = (actionError == nil && succeeded > 0)
+      ? LocalFilePane.importSuccessMessage(count: succeeded)
+      : nil
+    actionNoticeIdentifier = "LocalImportSucceeded"
     Task { await library.refresh() }
   }
 
@@ -195,6 +243,10 @@ struct ModelsSettingsTab: View {
     case .imported(let successes, let failures):
       actionError = Self.formatImportOutcome(successes: successes,
                                               failures: failures)
+      actionNotice = (actionError == nil && !successes.isEmpty)
+        ? LocalFilePane.importSuccessMessage(count: successes.count)
+        : nil
+      actionNoticeIdentifier = "LocalImportSucceeded"
     case .queueDownload(let repo, let file):
       // #514: duplicate prevention happens HERE, before enqueue — the
       // downloader's overwrite semantics are not the user-facing
@@ -206,6 +258,7 @@ struct ModelsSettingsTab: View {
         modelsDirectory: library.modelsDirectory) {
       case .blocked(let reason):
         actionError = reason
+        actionNotice = nil
         return
       case .proceed:
         break
@@ -216,8 +269,10 @@ struct ModelsSettingsTab: View {
       // unreachable) failure that didn't populate `lastError`.
       if downloads.enqueue(repo: repo, file: file) == nil {
         actionError = Self.enqueueFailureMessage(downloads.lastError)
+        actionNotice = nil
       } else {
         actionError = nil
+        actionNotice = nil
       }
     }
   }

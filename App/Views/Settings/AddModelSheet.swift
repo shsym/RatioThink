@@ -686,6 +686,7 @@ struct LocalFilePane: View {
   let onBatch: (_ successes: [URL], _ failures: [AddModelSheet.BatchFailure]) -> Void
 
   @State private var isTargeted: Bool = false
+  @State private var isImporting: Bool = false
 
   var body: some View {
     VStack(spacing: 12) {
@@ -703,7 +704,18 @@ struct LocalFilePane: View {
 
       Button("Choose File…") { openPanel() }
         .buttonStyle(.borderedProminent)
+        .disabled(isImporting)
         .accessibilityIdentifier("LocalImportChooseFile")
+
+      if isImporting {
+        HStack(spacing: 8) {
+          ProgressView().controlSize(.small)
+          Text("Importing model…")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+        }
+        .accessibilityIdentifier("LocalImportInProgress")
+      }
 
       if let error {
         Text(error)
@@ -731,41 +743,32 @@ struct LocalFilePane: View {
           error = "drop yielded no file URLs"
           return
         }
-        var successes: [URL] = []
-        var failures: [AddModelSheet.BatchFailure] = []
-        for providerErr in res.errors {
-          failures.append(AddModelSheet.BatchFailure(
-            filename: "<unknown>",
-            reason: "drop provider error: \(providerErr)"))
-        }
-        for url in res.urls {
-          switch attemptImport(url) {
-          case .success(let dest):
-            successes.append(dest)
-          case .failure(let reason):
-            failures.append(AddModelSheet.BatchFailure(
-              filename: url.lastPathComponent,
-              reason: reason))
+        isImporting = true
+        error = nil
+        Task { @MainActor in
+          let outcome = await importBatch(urls: res.urls, providerErrors: res.errors)
+          isImporting = false
+          let successes = outcome.successes
+          let failures = outcome.failures
+          // Surface any failures inside the pane so a user who DOES
+          // notice them before dismissal sees the same string. The
+          // sheet handler also surfaces them via `actionError` on the
+          // Models tab — that is the canonical post-dismiss display.
+          error = failures.isEmpty
+            ? nil
+            : "Imported \(successes.count) of \(successes.count + failures.count). Failed: " +
+              failures.map { "\($0.filename) (\($0.reason))" }.joined(separator: "; ")
+          // Emit when ANY URL was processed — success OR failure
+          // (review v4 F30). The prior gate `!successes.isEmpty`
+          // silently dropped all-failure drops: the parent never saw
+          // the failures because the user would dismiss via Done and
+          // `.cancelled` early-returns in `handleSheetOutcome`. The
+          // gate logic lives in `AddModelSheet.shouldEmitBatch` so
+          // the contract is pinnable in a unit test (review v5 F38).
+          if AddModelSheet.shouldEmitBatch(successes: successes,
+                                            failures: failures) {
+            onBatch(successes, failures)
           }
-        }
-        // Surface any failures inside the pane so a user who DOES
-        // notice them before dismissal sees the same string. The
-        // sheet handler also surfaces them via `actionError` on the
-        // Models tab — that is the canonical post-dismiss display.
-        error = failures.isEmpty
-          ? nil
-          : "Imported \(successes.count) of \(successes.count + failures.count). Failed: " +
-            failures.map { "\($0.filename) (\($0.reason))" }.joined(separator: "; ")
-        // Emit when ANY URL was processed — success OR failure
-        // (review v4 F30). The prior gate `!successes.isEmpty`
-        // silently dropped all-failure drops: the parent never saw
-        // the failures because the user would dismiss via Done and
-        // `.cancelled` early-returns in `handleSheetOutcome`. The
-        // gate logic lives in `AddModelSheet.shouldEmitBatch` so
-        // the contract is pinnable in a unit test (review v5 F38).
-        if AddModelSheet.shouldEmitBatch(successes: successes,
-                                          failures: failures) {
-          onBatch(successes, failures)
         }
       }
       return true
@@ -787,17 +790,27 @@ struct LocalFilePane: View {
       // booted to the parent Models tab. v4 F30 over-reached when
       // it mirrored the multi-drop emit policy here; the F30 brief
       // targeted the drop loop's all-failure path only.
-      switch attemptImport(url) {
-      case .success(let dest):
-        error = nil
-        onBatch([dest], [])
-      case .failure(let reason):
-        error = reason
-        // No onBatch — stay in pane. The Done button still emits
-        // `.cancelled`, which is the right shape: the user did not
-        // import anything.
+      isImporting = true
+      error = nil
+      Task { @MainActor in
+        let result = await attemptImport(url)
+        isImporting = false
+        switch result {
+        case .success(let dest):
+          error = nil
+          onBatch([dest], [])
+        case .failure(let reason):
+          error = reason
+          // No onBatch — stay in pane. The Done button still emits
+          // `.cancelled`, which is the right shape: the user did not
+          // import anything.
+        }
       }
     }
+  }
+
+  static func importSuccessMessage(count: Int) -> String {
+    "Imported \(count) model\(count == 1 ? "" : "s")."
   }
 
   private var ggufTypes: [UTType] {
@@ -818,15 +831,39 @@ struct LocalFilePane: View {
   /// `onDrop` aggregates many of these before calling `onBatch`
   /// exactly once (review v3 F21). Not modelled as `Result<URL,
   /// String>` because `String` is not `Error`-conforming.
-  private func attemptImport(_ source: URL) -> ImportAttempt {
+  private func attemptImport(_ source: URL) async -> ImportAttempt {
     guard let dir = modelsDirectory else {
       return .failure(reason: "models directory is not available")
     }
-    do {
-      let dest = try ModelImporter.importFile(at: source, into: dir)
-      return .success(dest)
-    } catch {
-      return .failure(reason: String(describing: error))
+    return await Task.detached(priority: .userInitiated) {
+      do {
+        let dest = try ModelImporter.importFile(at: source, into: dir)
+        return .success(dest)
+      } catch {
+        return .failure(reason: String(describing: error))
+      }
+    }.value
+  }
+
+  private func importBatch(
+    urls: [URL],
+    providerErrors: [String]
+  ) async -> (successes: [URL], failures: [AddModelSheet.BatchFailure]) {
+    var successes: [URL] = []
+    var failures: [AddModelSheet.BatchFailure] = providerErrors.map {
+      AddModelSheet.BatchFailure(filename: "<unknown>",
+                                 reason: "drop provider error: \($0)")
     }
+    for url in urls {
+      switch await attemptImport(url) {
+      case .success(let dest):
+        successes.append(dest)
+      case .failure(let reason):
+        failures.append(AddModelSheet.BatchFailure(
+          filename: url.lastPathComponent,
+          reason: reason))
+      }
+    }
+    return (successes, failures)
   }
 }

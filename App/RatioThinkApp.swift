@@ -93,6 +93,7 @@ struct RatioThinkApp: App {
   /// `PIE_TEST_STALL_WATCHDOG=1`.
   @StateObject private var stallWatchdog = MainThreadStallWatchdog()
   #endif
+  @State private var commandActionFeedback: CommandActionFeedback?
 
   /// #587 resume trigger: re-arm the (possibly paused) engine-status poll
   /// loop when the app returns to the foreground, so the user always sees a
@@ -552,10 +553,12 @@ struct RatioThinkApp: App {
   @MainActor
   private func restartEngine() {
     Task {
+      commandActionFeedback = .running("Restarting engine…")
       await Self.performHelperRegistrationReconcile()
       guard let profileID = profileStore.activeProfileID,
             !profileID.isEmpty else {
         NSLog("Restart Engine: no active profile to start")
+        commandActionFeedback = .failed("No active profile is available to restart.")
         return
       }
       do {
@@ -568,8 +571,22 @@ struct RatioThinkApp: App {
           lastServedModelID: profileStore.activeModelID)
         try await engineStatusStore.startEngine(profileID: profileID,
                                                 modelOverride: modelOverride)
+        commandActionFeedback = .succeeded("Engine restart requested.")
       } catch {
         NSLog("Restart Engine: startEngine(\(profileID)) failed: \(error)")
+        commandActionFeedback = .failed(ChatScaffoldView.engineErrorMessage(error, verb: "restart"))
+      }
+    }
+  }
+
+  @MainActor
+  private func collectDiagnosticsFromCommand() {
+    commandActionFeedback = .running(DiagnosticsCollector.runningMessage)
+    Task {
+      if let zip = await DiagnosticsCollector.collectAndReveal() {
+        commandActionFeedback = .succeeded(DiagnosticsCollector.successMessage(zip))
+      } else {
+        commandActionFeedback = .failed("Couldn't collect diagnostics.")
       }
     }
   }
@@ -654,6 +671,13 @@ struct RatioThinkApp: App {
         // #420: route the menu-bar Helper's `ratiothink://settings` deep
         // link straight to the Settings scene (not just app-foreground).
         .handlesSettingsDeepLink(settingsNavigation: settingsNavigation)
+        .overlay(alignment: .top) {
+          if let commandActionFeedback {
+            CommandActionFeedbackView(feedback: commandActionFeedback)
+              .padding(.top, 8)
+              .padding(.horizontal, 12)
+          }
+        }
         // #587: re-arm the adaptive poll loop on foreground. `start()` is
         // idempotent, so this is free when the loop is already running and
         // wakes it from a paused (stopped/idle) state to refresh status.
@@ -707,7 +731,7 @@ struct RatioThinkApp: App {
         // #358: user-reachable diagnostics. Runs the bundled
         // collect-diagnostics.sh and reveals the redacted .zip in Finder.
         Button("Collect Diagnostics…") {
-          Task { await DiagnosticsCollector.collectAndReveal() }
+          collectDiagnosticsFromCommand()
         }
       }
       #if DEBUG
@@ -751,6 +775,49 @@ struct RatioThinkApp: App {
         .environmentObject(guardrailRevision)
         .environmentObject(specMetricsStore)
         .environmentObject(contextUsageTracker)
+    }
+  }
+}
+
+private enum CommandActionFeedback: Equatable {
+  case running(String)
+  case succeeded(String)
+  case failed(String)
+}
+
+private struct CommandActionFeedbackView: View {
+  let feedback: CommandActionFeedback
+
+  var body: some View {
+    HStack(spacing: 8) {
+      switch feedback {
+      case .running(let message):
+        ProgressView().controlSize(.small)
+        Text(message)
+      case .succeeded(let message):
+        Image(systemName: "checkmark.circle.fill")
+          .foregroundStyle(.green)
+          .accessibilityHidden(true)
+        Text(message)
+      case .failed(let message):
+        Image(systemName: "exclamationmark.triangle.fill")
+          .foregroundStyle(.orange)
+          .accessibilityHidden(true)
+        Text(message)
+      }
+    }
+    .font(.callout)
+    .padding(.horizontal, 12)
+    .padding(.vertical, 8)
+    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+    .accessibilityIdentifier(identifier)
+  }
+
+  private var identifier: String {
+    switch feedback {
+    case .running: return "app.command.action.running"
+    case .succeeded: return "app.command.action.succeeded"
+    case .failed: return "app.command.action.failed"
     }
   }
 }

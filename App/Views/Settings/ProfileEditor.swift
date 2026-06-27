@@ -47,6 +47,7 @@ struct ProfileEditor: View {
   /// loading indicator while the engine restarts and surfaces any failure in
   /// a bounded banner — never as layout-breaking inline error text.
   @State private var engineReload: EngineReloadState = .idle
+  @State private var modelReloadSuccess: String?
 
   enum EngineReloadState: Equatable {
     case idle
@@ -134,6 +135,13 @@ struct ProfileEditor: View {
           .accessibilityIdentifier("ProfileEditorModelWriteError")
       }
       engineReloadStatus
+      if let modelReloadSuccess {
+        Label(modelReloadSuccess, systemImage: "checkmark.circle.fill")
+          .font(.callout)
+          .foregroundStyle(.green)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .accessibilityIdentifier("ProfileEditorEngineReloadSucceeded")
+      }
       if let modelScanError {
         Text(modelScanError)
           .font(.callout)
@@ -431,12 +439,13 @@ struct ProfileEditor: View {
     // Fresh interaction — clear any prior reload banner so a new save's
     // outcome can't read against a stale one.
     engineReload = .idle
+    modelReloadSuccess = nil
     do {
       try profileStore.setModel(model, forProfileID: profileID)
       modelWriteError = nil
       onModelChanged()
       Task { await refreshModelOptions(current: model) }
-      restartActiveEngineIfNeeded(profileID: profileID)
+      restartActiveEngineIfNeeded(profileID: profileID, modelID: model)
     } catch {
       modelWriteError = "Could not set default model: \(error)"
     }
@@ -455,13 +464,17 @@ struct ProfileEditor: View {
   /// a loading indicator while the rebuild is in flight (#459 repro 3) and a
   /// bounded banner if it fails (#459 acceptance: stable surface, no
   /// layout-breaking inline text).
-  private func restartActiveEngineIfNeeded(profileID: String) {
-    guard profileStore.activeProfileID == profileID else { return }
+  private func restartActiveEngineIfNeeded(profileID: String, modelID: String) {
+    guard profileStore.activeProfileID == profileID else {
+      modelReloadSuccess = "Default model saved."
+      return
+    }
     engineReload = .reloading
     Task { @MainActor in
       do {
         try await engineStatusStore.restartEngine(profileID: profileID)
         engineReload = .idle
+        modelReloadSuccess = Self.engineReloadSuccessMessage(modelID: modelID)
       } catch {
         engineReload = .failed(Self.engineReloadMessage(error))
       }
@@ -482,6 +495,10 @@ struct ProfileEditor: View {
     }
     Log.engine.error("ProfileEditor: engine reload failed: \(String(describing: error), privacy: .public)")
     return "The new default was saved, but the engine couldn’t reload."
+  }
+
+  static func engineReloadSuccessMessage(modelID: String) -> String {
+    "The new default was saved and the engine reloaded \(modelID.split(separator: "/").last.map(String.init) ?? modelID)."
   }
 
   /// Loading indicator (rebuild in flight) / bounded failure banner for the

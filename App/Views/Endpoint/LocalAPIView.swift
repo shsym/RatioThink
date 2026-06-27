@@ -55,6 +55,16 @@ struct LocalAPIView: View {
   /// Surfaced as a helper-framed inline notice, never the engine action-error
   /// row, so a Helper state never reads as an engine fault.
   @State private var helperBlock: HelperUnavailable?
+  @State private var pendingExternalAccessEnabled: Bool?
+  @State private var externalAccessRestarting = false
+  @State private var externalAccessRestartTarget: Bool?
+  @State private var externalAccessNotice: String?
+
+  struct ExternalAccessRestartCopy: Equatable {
+    let title: String
+    let message: String
+    let confirmTitle: String
+  }
 
   private var state: LocalAPIState {
     LocalAPIState.make(
@@ -105,6 +115,7 @@ struct LocalAPIView: View {
       VStack(alignment: .leading, spacing: 20) {
         header
         statusCard
+        externalAccessFeedbackRows
         if let engineActionError {
           actionErrorRow(engineActionError)
         }
@@ -149,6 +160,29 @@ struct LocalAPIView: View {
       Button("Cancel", role: .cancel) {}
     } message: {
       Text("This stops the engine. In-app chat stops too.")
+    }
+    .confirmationDialog(
+      Self.externalAccessRestartCopy(enabled: pendingExternalAccessEnabled ?? true).title,
+      isPresented: Binding(
+        get: { pendingExternalAccessEnabled != nil },
+        set: { if !$0 { pendingExternalAccessEnabled = nil } }
+      ),
+      titleVisibility: .visible
+    ) {
+      Button(
+        Self.externalAccessRestartCopy(enabled: pendingExternalAccessEnabled ?? true).confirmTitle,
+        role: .destructive
+      ) {
+        guard let enabled = pendingExternalAccessEnabled else { return }
+        pendingExternalAccessEnabled = nil
+        setExternalAccess(enabled)
+      }
+      .accessibilityIdentifier("LocalAPIExternalAccessConfirmRestart")
+      Button("Cancel", role: .cancel) {
+        pendingExternalAccessEnabled = nil
+      }
+    } message: {
+      Text(Self.externalAccessRestartCopy(enabled: pendingExternalAccessEnabled ?? true).message)
     }
   }
 
@@ -466,8 +500,35 @@ struct LocalAPIView: View {
   private var externalAccessBinding: Binding<Bool> {
     Binding(
       get: { appPreferences.localAPIExternalAccessEnabled },
-      set: { setExternalAccess($0) }
+      set: { enabled in
+        if state.isServing {
+          pendingExternalAccessEnabled = enabled
+        } else {
+          setExternalAccess(enabled)
+        }
+      }
     )
+  }
+
+  @ViewBuilder
+  private var externalAccessFeedbackRows: some View {
+    if externalAccessRestarting {
+      HStack(spacing: 8) {
+        ProgressView().controlSize(.small)
+        Text(Self.externalAccessRestartingMessage(enabled: externalAccessRestartTarget
+                                                  ?? appPreferences.localAPIExternalAccessEnabled))
+          .font(.callout)
+          .foregroundStyle(.secondary)
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .accessibilityIdentifier("LocalAPIExternalAccessRestarting")
+    } else if let externalAccessNotice {
+      Label(externalAccessNotice, systemImage: "checkmark.circle.fill")
+        .font(.callout)
+        .foregroundStyle(.green)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("LocalAPIExternalAccessRestartSucceeded")
+    }
   }
 
   private func trailingSwitchRow(
@@ -597,8 +658,20 @@ struct LocalAPIView: View {
 
   private func setExternalAccess(_ enabled: Bool) {
     let profileID = runtimeProfileID ?? startProfileID
+    let requiresRestart = state.isServing
     Task { @MainActor in
       engineActionError = nil
+      externalAccessNotice = nil
+      if requiresRestart {
+        externalAccessRestartTarget = enabled
+        externalAccessRestarting = true
+      }
+      defer {
+        if requiresRestart {
+          externalAccessRestarting = false
+          externalAccessRestartTarget = nil
+        }
+      }
       do {
         try await LocalAPIBindModeChange.apply(
           enabled: enabled,
@@ -611,10 +684,33 @@ struct LocalAPIView: View {
             try await engineCoordinator.startEngine(profileID: profileID, daemonBindHost: requestedMode)
           }
         )
+        if requiresRestart {
+          externalAccessNotice = Self.externalAccessRestartSuccessMessage(enabled: enabled)
+        }
       } catch {
         engineActionError = ChatScaffoldView.engineErrorMessage(error, verb: "switch")
       }
     }
+  }
+
+  static func externalAccessRestartCopy(enabled: Bool) -> ExternalAccessRestartCopy {
+    ExternalAccessRestartCopy(
+      title: enabled
+        ? "Restart engine for external access?"
+        : "Restart engine for loopback-only access?",
+      message: "Changing this while the Local API is running stops and restarts the shared engine. In-app chat pauses during the restart.",
+      confirmTitle: "Restart Engine"
+    )
+  }
+
+  static func externalAccessRestartingMessage(enabled: Bool) -> String {
+    enabled ? "Restarting engine for external access…" : "Restarting engine for loopback-only access…"
+  }
+
+  static func externalAccessRestartSuccessMessage(enabled: Bool) -> String {
+    enabled
+      ? "Engine restarted with external access enabled."
+      : "Engine restarted with loopback-only access."
   }
 
   private func copy(_ string: String) {
