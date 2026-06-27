@@ -87,7 +87,7 @@ use inferlet::chat;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::chat::apc::{ReasoningDecoder, gemma_thinking_cue_tokens};
+use crate::chat::apc::{ReasoningDecoder, gemma_thinking_cue_tokens, has_gemma_channel_markers};
 use crate::sse::Emitter;
 
 use super::schema::{TotParams, TotTask};
@@ -356,6 +356,35 @@ fn branch_reasoning_budget(_level: usize, _max_depth: usize, requested: usize) -
 
 fn branch_answer_budget(_level: usize, _max_depth: usize, requested: usize) -> usize {
     requested
+}
+
+const GEMMA_TOT_REASONING_TOKEN_CAP: usize = 192;
+
+fn gemma_tot_concurrent_generation_enabled(is_gemma: bool, requested: bool) -> bool {
+    // Gemma 4 31B needs the bounded 256-page matrix pool; decoding siblings
+    // concurrently pins extra contexts. Keep the model-specific fix in
+    // chat-apc by preserving the user-requested strategy for other models
+    // while serializing Gemma branch generation.
+    requested && !is_gemma
+}
+
+fn gemma_tot_effective_depth(is_gemma: bool, requested: usize) -> usize {
+    // The 31B matrix profile intentionally runs with a small 256-page KV pool.
+    // Gemma's depth-2 ToT fan-out pre-forks `beam_width * breadth` long child
+    // contexts before generation, which exhausts that bounded pool before any
+    // second-level visible answer can finish. Keep Gemma ToT truthful under the
+    // app-side memory envelope by using a single breadth-expanded reasoning
+    // level; the root candidates still surface reasoning_content and a visible
+    // answer, and other models keep the requested depth.
+    if is_gemma { requested.min(1) } else { requested }
+}
+
+fn cap_gemma_reasoning_budget(is_gemma: bool, requested: usize) -> usize {
+    if is_gemma {
+        requested.min(GEMMA_TOT_REASONING_TOKEN_CAP)
+    } else {
+        requested
+    }
 }
 
 /// Append the `/no_think` directive when reasoning is disabled for this
@@ -1011,6 +1040,8 @@ async fn generate_demuxed(
     logit_bias: &[(u32, f32)],
     starts_in_gemma_thought: bool,
 ) -> Demux {
+    let reasoning_budget =
+        cap_gemma_reasoning_budget(has_gemma_channel_markers(model), reasoning_budget);
     let mut reason_dec =
         ReasoningDecoder::new_with_gemma_thought_open(model, starts_in_gemma_thought);
     let mut chat_dec = chat::Decoder::new(model);
@@ -1281,6 +1312,28 @@ pub async fn run(
     model: &Model,
     mut emitter: Option<&mut Emitter>,
 ) -> SearchOutcome {
+    let is_gemma = has_gemma_channel_markers(model);
+    let effective_depth = gemma_tot_effective_depth(is_gemma, params.depth);
+    let effective_params;
+    let params = if effective_depth != params.depth {
+        effective_params = TotParams {
+            breadth: params.breadth,
+            depth: effective_depth,
+            beam_width: params.beam_width,
+            max_tokens_per_node: params.max_tokens_per_node,
+            max_reasoning_tokens: params.max_reasoning_tokens,
+            temperature: params.temperature,
+            top_p: params.top_p,
+            thinking: params.thinking,
+            exec: params.exec,
+            task: params.task,
+            sibling_penalty: params.sibling_penalty,
+        };
+        &effective_params
+    } else {
+        params
+    };
+
     // #523 Part A: preserve a fork of the original conversation (system +
     // user turns, flushed, cue-free) BEFORE the search consumes `root_ctx`.
     // The final-answer synthesis grounds on this, so it works regardless of
@@ -1890,7 +1943,10 @@ async fn resolve_level(
     score_base: Option<&Context>,
     level: usize,
 ) -> Vec<(Context, NodeOutcome)> {
-    let concurrent_gen = params.exec.concurrent_gen();
+    let concurrent_gen = gemma_tot_concurrent_generation_enabled(
+        has_gemma_channel_markers(model),
+        params.exec.concurrent_gen(),
+    );
 
     // Share the SSE emitter across concurrent branch futures (#650): a single
     // `&mut Emitter` can't be borrowed N ways, so wrap it in an async `Mutex`
@@ -3411,6 +3467,29 @@ mod tests {
         assert_eq!(branch_answer_budget(1, 3, 256), 256);
         assert_eq!(branch_answer_budget(2, 3, 48), 48);
         assert_eq!(branch_answer_budget(3, 3, 256), 256);
+    }
+
+    #[test]
+    fn gemma_reasoning_budget_is_capped_to_preserve_answer_phase() {
+        assert_eq!(cap_gemma_reasoning_budget(true, 2048), 192);
+        assert_eq!(cap_gemma_reasoning_budget(true, 128), 128);
+        assert_eq!(cap_gemma_reasoning_budget(false, 2048), 2048);
+    }
+
+    #[test]
+    fn gemma_tot_disables_concurrent_branch_generation_to_fit_bounded_kv_pool() {
+        assert!(!gemma_tot_concurrent_generation_enabled(true, true));
+        assert!(!gemma_tot_concurrent_generation_enabled(true, false));
+        assert!(gemma_tot_concurrent_generation_enabled(false, true));
+        assert!(!gemma_tot_concurrent_generation_enabled(false, false));
+    }
+
+    #[test]
+    fn gemma_tot_uses_single_reasoning_level_to_fit_bounded_kv_pool() {
+        assert_eq!(gemma_tot_effective_depth(true, 1), 1);
+        assert_eq!(gemma_tot_effective_depth(true, 2), 1);
+        assert_eq!(gemma_tot_effective_depth(true, 4), 1);
+        assert_eq!(gemma_tot_effective_depth(false, 2), 2);
     }
 
     #[test]
