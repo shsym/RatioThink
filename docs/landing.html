@@ -445,6 +445,28 @@
     for (var i=0;i<w.length;i++){ node.textContent += (i?' ':'') + w[i]; await sleep(per, myGen); }
     node.classList.remove('caret');
   }
+
+  // ---- tree-search node helpers (mirror ToTNodeRow beam glyphs + score capsule) ----
+  function beamChar(b){ return b==='star' ? '★' : b==='kept' ? '✓' : b==='pruned' ? '✕' : '◌'; }
+  function nodeHTML(cfg, child){
+    return '<div class="tnode'+(child?' child':'')+'">'+
+      '<span class="beam pending">◌</span>'+
+      '<span class="score">'+cfg.s+'</span>'+
+      '<span class="label">'+cfg.t+'</span></div>';
+  }
+  function addNode(parent, cfg, child){
+    var n = el(nodeHTML(cfg, child)); parent.appendChild(n); return n;
+  }
+  // Insert a child row directly after `anchor` (the parent row, or the previous
+  // sibling) so children render nested under their own branch.
+  function addChildAfter(anchor, cfg){
+    var n = el(nodeHTML(cfg, true)); anchor.insertAdjacentElement('afterend', n); return n;
+  }
+  function setBeam(node, beam){
+    var b = node.querySelector('.beam');
+    b.className = 'beam '+beam; b.textContent = beamChar(beam);
+    node.classList.toggle('pruned', beam==='pruned');
+  }
   // ============== Scene 0 (LEAD): Tree of Thought — shipped one-click profile ==============
   async function sceneTreeOfThought(myGen){
     var d = SCENARIO.tot;

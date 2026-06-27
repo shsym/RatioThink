@@ -521,9 +521,9 @@ public final class ProfileStore: ObservableObject {
   /// RETIRED from `baseBuiltins`, leave its filename here so an
   /// already-installed (pre-marker) copy is still recognized as a dead
   /// built-in — `migrateBuiltinProvenance` recognizes it by filename, stamps
-  /// the marker, and moves it aside (#718). `fast-think.toml` is included for
-  /// the rare case the #628 rename migration could not move it; its origin is
-  /// the live `repeat-boost` id so it is treated as a current built-in.
+  /// the marker, and moves it aside (#718). `fast-think.toml` and
+  /// `repeat-boost.toml` now resolve to the retired `repeat-boost` origin, so
+  /// a recognized leftover is backed up/hidden rather than surfaced as current.
   public static let historicalBuiltinFilenames: [String: String] = [
     defaultChatFilename:        defaultProfileID,
     defaultRepeatBoostFilename: defaultRepeatBoostProfileID,
