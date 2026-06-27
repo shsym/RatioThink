@@ -137,7 +137,7 @@ class MMLUPrep(unittest.TestCase):
         self.assertIn("1. Magma", prompt)
         self.assertIn("2. Monoid", prompt)
         self.assertIn("Answer with only the number", prompt)
-        self.assertEqual(ref, {"final_answer": "2"})
+        self.assertEqual(ref, {"final_answer": "2", "choice_count": 4})
 
     def test_mmlu_registry_is_graded_and_locked_allowlist_visible(self):
         self.assertEqual(prep.REGISTRY["mmlu"]["grader"], "mcq_numeric")
@@ -203,10 +203,20 @@ class MBPPGrader(unittest.TestCase):
 
 
 class MCQNumericGrader(unittest.TestCase):
-    REF = {"final_answer": "2"}
+    REF = {"final_answer": "2", "choice_count": 4}
 
     def test_correct_numeric_choice(self):
         self.assertTrue(g.mcq_numeric("The answer is 2.", self.REF).passed)
+
+    def test_verbose_reasoning_tail_can_still_end_in_correct_choice(self):
+        out = "I compared 4 options and eliminated choices 1 and 3. Final answer: 2"
+        self.assertTrue(g.mcq_numeric(out, self.REF).passed)
+
+    def test_out_of_range_reasoning_number_is_ungradable(self):
+        out = "I considered option 2, but there are 7 fields in the distractor."
+        result = g.mcq_numeric(out, self.REF)
+        self.assertIsNone(result.passed)
+        self.assertIn("outside", result.detail)
 
     def test_wrong_numeric_choice(self):
         self.assertIs(g.mcq_numeric("I choose 3", self.REF).passed, False)

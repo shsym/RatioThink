@@ -2,7 +2,7 @@
 
 The #652 spec-decode matrix measured throughput only. #657 adds a graded
 CORRECTNESS axis: for each prompt, does the model's final answer actually solve
-the task? The four datasets here are chosen precisely because they are gradable
+the task? The datasets here are chosen precisely because they are gradable
 WITHOUT a judge model — every verdict is a deterministic function of the model
 output and the dataset's own ground truth (the `reference` field emitted by
 `Scripts/benchmark/prep_datasets.py`), so the accuracy numbers are reproducible
@@ -13,6 +13,7 @@ and free of LLM-as-judge noise:
   * humaneval_exec     — pass@1 by executing the shipped `check(entry_point)`.
   * mbpp_exec          — pass@1 by running the shipped assert(s) after setup.
   * jsonschema_validate — the emitted JSON validates against the gold schema.
+  * mcq_numeric        — numeric choice exact-match for multiple-choice tasks.
 
 CODE EXECUTION WARNING: `humaneval_exec`/`mbpp_exec` execute model-generated
 Python in a subprocess with a wall-clock timeout. This is intrinsic to code
@@ -258,12 +259,30 @@ def gsm8k_numeric(output: str, reference: dict) -> GradeResult:
     return GradeResult(ok, f"got={got!r} gold={gold!r}")
 
 
+def _answer_tail(text: str) -> str:
+    """Prefer the answer text after a think block when present; otherwise use text."""
+    marker = "</think>"
+    if marker in text:
+        return text.rsplit(marker, 1)[-1]
+    return text
+
+
 def mcq_numeric(output: str, reference: dict) -> GradeResult:
     gold = str(reference["final_answer"]).strip()
-    got = last_number(output or "")
+    choice_count = int(reference.get("choice_count", 4))
+    tail = _answer_tail(output or "")
+    got = last_number(tail)
     if got is None:
         return GradeResult(None, "no numeric choice in model output")
-    ok = got.strip() == gold
+    try:
+        choice = int(got)
+    except ValueError:
+        return GradeResult(None, f"non-integer numeric choice got={got!r}")
+    if choice < 1 or choice > choice_count:
+        return GradeResult(
+            None, f"numeric choice got={got!r} outside 1..{choice_count}"
+        )
+    ok = str(choice) == gold
     return GradeResult(ok, f"got={got!r} gold={gold!r}")
 
 

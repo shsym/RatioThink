@@ -94,7 +94,7 @@
       "category": "knowledge",
       "citation": "Hendrycks et al., Measuring Massive Multitask Language Understanding (ICLR 2021).",
       "config": "all",
-      "content_sha256": "fa381666be63e6e9e9627d456a3c61f5fadd9827c086c85fb232500e27d753b1",
+      "content_sha256": "804fb605f9ed985b942ff59135d6f5999ac419cb65cdd9b91c342494e01c51fc",
       "count": 14042,
       "grader": "mcq_numeric",
       "hf_repo": "cais/mmlu",

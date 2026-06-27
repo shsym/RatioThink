@@ -45,6 +45,7 @@ DEFAULT_MODELS = (
     "Qwen/Qwen3-8B",
     "Qwen/Qwen3-14B-GGUF",
 )
+DEFAULT_DATASETS = ("gsm8k", "humaneval", "mbpp", "mmlu")
 MAX_PROMPTS = int(os.environ.get("MAX_PROMPTS", "6"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "512"))
 TOT_BREADTH = int(os.environ.get("TOT_BREADTH", os.environ.get("TOT_WIDTH", "2")))
@@ -289,23 +290,27 @@ def model_boot_error_row(model: str, exc: ModelBootError, dataset: str | None = 
     }
 
 
-async def collect_model_rows(models: list[str], run_one, write_partial=None) -> list[dict]:
+async def collect_model_rows(
+    models: list[str], datasets: list[str], run_one, write_partial=None
+) -> list[dict]:
     rows: list[dict] = []
     for index, model in enumerate(models, 1):
         try:
-            row = await run_one(index, model)
+            model_rows = await run_one(index, model)
         except ModelBootError as exc:
-            row = model_boot_error_row(model, exc)
-            print(f"[profile-accuracy] model boot failed for {model}: {row['boot_error']}",
-                  file=sys.stderr, flush=True)
-        rows.append(row)
+            model_rows = [model_boot_error_row(model, exc, dataset) for dataset in datasets]
+            print(f"[profile-accuracy] model boot failed for {model}: "
+                  f"{model_rows[0]['boot_error']}", file=sys.stderr, flush=True)
+        rows.extend(model_rows)
         if write_partial is not None:
             write_partial(rows)
     return rows
 
 
 def _datasets_from_env() -> list[str]:
-    return base._which_datasets()
+    if os.environ.get("DATASETS"):
+        return base._which_datasets()
+    return list(DEFAULT_DATASETS)
 
 
 async def collect_dataset_rows(model: str, datasets: list[str], run_one_dataset) -> list[dict]:
@@ -523,16 +528,7 @@ async def _run() -> dict:
             finally:
                 h._terminate_subprocess(proc, "engine")
 
-    rows: list[dict] = []
-    for index, model in enumerate(models, 1):
-        try:
-            model_rows = await run_one(index, model)
-        except ModelBootError as exc:
-            model_rows = [model_boot_error_row(model, exc, dataset) for dataset in datasets]
-            print(f"[profile-accuracy] model boot failed for {model}: "
-                  f"{model_rows[0]['boot_error']}", file=sys.stderr, flush=True)
-        rows.extend(model_rows)
-        write_partial(rows)
+    rows = await collect_model_rows(models, datasets, run_one, write_partial)
     return build_artifact(rows, settings)
 
 

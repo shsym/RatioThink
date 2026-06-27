@@ -102,8 +102,19 @@ class ResponseParsing(unittest.TestCase):
 
 
 class DatasetSelection(unittest.TestCase):
+    def test_default_datasets_exclude_jsonschema_but_include_target_generalization_set(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(h._datasets_from_env(), ["gsm8k", "humaneval", "mbpp", "mmlu"])
+
+    def test_explicit_jsonschema_remains_selectable_through_allowlist(self):
+        with mock.patch.dict(os.environ, {"DATASETS": "jsonschema"}, clear=True), \
+             mock.patch.object(h.base, "_which_datasets", return_value=["jsonschema"]) as which:
+            self.assertEqual(h._datasets_from_env(), ["jsonschema"])
+            which.assert_called_once_with()
+
     def test_datasets_from_env_preserves_comma_allowlist(self):
-        with mock.patch.object(h.base, "_which_datasets", return_value=["humaneval", "mbpp"]):
+        with mock.patch.dict(os.environ, {"DATASETS": "humaneval,mbpp"}, clear=True), \
+             mock.patch.object(h.base, "_which_datasets", return_value=["humaneval", "mbpp"]):
             self.assertEqual(h._datasets_from_env(), ["humaneval", "mbpp"])
 
     def test_collect_dataset_rows_keeps_one_row_per_dataset_in_order(self):
@@ -274,46 +285,59 @@ class Aggregation(unittest.TestCase):
 
         self.assertTrue(h.has_any_graded_item(artifact))
 
-    def test_boot_failure_records_error_row_continues_and_snapshots_rows(self):
+    def test_boot_failure_records_dataset_rows_continues_and_snapshots_rows(self):
         async def run_one(index, model):
             if model == "bad":
                 raise h.ModelBootError(RuntimeError("handshake timeout"))
-            return h.summarize_model(
-                model,
-                [
-                    h.ItemResult(
-                        dataset="gsm8k",
-                        index=1,
-                        prompt_id="gsm8k:1",
-                        reference={"final_answer": "18"},
-                        single=h.ArmResult(answer="#### 18", tokens=1, latency_s=0.1),
-                        tot=h.ArmResult(answer="#### 18", tokens=2, latency_s=0.2),
-                    )
-                ],
-                "gsm8k_numeric",
-            )
+            return [
+                h.summarize_model(
+                    model,
+                    [
+                        h.ItemResult(
+                            dataset="gsm8k",
+                            index=1,
+                            prompt_id="gsm8k:1",
+                            reference={"final_answer": "18"},
+                            single=h.ArmResult(answer="#### 18", tokens=1, latency_s=0.1),
+                            tot=h.ArmResult(answer="#### 18", tokens=2, latency_s=0.2),
+                        )
+                    ],
+                    "gsm8k_numeric",
+                )
+            ]
 
         snapshots = []
         rows = asyncio.run(
             h.collect_model_rows(
                 ["bad", "good"],
+                ["gsm8k", "mmlu"],
                 run_one,
-                write_partial=lambda current: snapshots.append([r["model"] for r in current]),
+                write_partial=lambda current: snapshots.append(
+                    [(r["model"], r["dataset"]) for r in current]
+                ),
             )
         )
 
-        self.assertEqual([r["model"] for r in rows], ["bad", "good"])
+        self.assertEqual(
+            [(r["model"], r["dataset"]) for r in rows],
+            [("bad", "gsm8k"), ("bad", "mmlu"), ("good", "gsm8k")],
+        )
         self.assertEqual(rows[0]["boot_error"], "RuntimeError: handshake timeout")
         self.assertEqual(rows[0]["single"]["n_graded"], 0)
-        self.assertEqual(rows[1]["single"]["n_graded"], 1)
-        self.assertEqual(snapshots, [["bad"], ["bad", "good"]])
+        self.assertEqual(rows[1]["dataset"], "mmlu")
+        self.assertEqual(rows[2]["single"]["n_graded"], 1)
+        self.assertEqual(
+            snapshots,
+            [[("bad", "gsm8k"), ("bad", "mmlu")],
+             [("bad", "gsm8k"), ("bad", "mmlu"), ("good", "gsm8k")]],
+        )
 
     def test_mid_run_failure_propagates_instead_of_becoming_boot_error(self):
         async def run_one(index, model):
             raise RuntimeError("grader exploded")
 
         with self.assertRaisesRegex(RuntimeError, "grader exploded"):
-            asyncio.run(h.collect_model_rows(["model"], run_one))
+            asyncio.run(h.collect_model_rows(["model"], ["gsm8k"], run_one))
 
     def test_atomic_write_json_replaces_complete_temp_file(self):
         with tempfile.TemporaryDirectory() as tmp:
