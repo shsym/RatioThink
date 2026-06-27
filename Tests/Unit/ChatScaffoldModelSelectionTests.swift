@@ -934,6 +934,50 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       "reconciled → probe passes resolution → dismissal and verdict settle on the same evidence")
   }
 
+  func test_attachment_context_length_cache_reads_once_per_residency_change() throws {
+    let urlA = URL(fileURLWithPath: "/tmp/model-A.gguf")
+    let urlB = URL(fileURLWithPath: "/tmp/model-B.gguf")
+    let installed = [
+      InstalledModel(filename: "model-A.gguf",
+                     url: urlA,
+                     sizeBytes: 1,
+                     modifiedAt: Date(),
+                     isPartial: false),
+      InstalledModel(filename: "model-B.gguf",
+                     url: urlB,
+                     sizeBytes: 1,
+                     modifiedAt: Date(),
+                     isPartial: false)
+    ]
+    var reads: [URL] = []
+    var cache = AttachmentModelContextLengthCache()
+
+    cache.reconcile(residentModelID: "model-A.gguf", installed: installed) { url in
+      reads.append(url)
+      return 4096
+    }
+    cache.reconcile(residentModelID: "model-A.gguf", installed: installed) { url in
+      reads.append(url)
+      return 8192
+    }
+    XCTAssertEqual(reads, [urlA])
+    XCTAssertEqual(cache.contextLength, 4096)
+
+    cache.reconcile(residentModelID: "model-B.gguf", installed: installed) { url in
+      reads.append(url)
+      return 2048
+    }
+    XCTAssertEqual(reads, [urlA, urlB])
+    XCTAssertEqual(cache.contextLength, 2048)
+
+    cache.reconcile(residentModelID: nil, installed: installed) { url in
+      reads.append(url)
+      return 1024
+    }
+    XCTAssertNil(cache.contextLength)
+    XCTAssertEqual(reads, [urlA, urlB])
+  }
+
   private func waitUntil(
     timeout: TimeInterval,
     condition: () -> Bool

@@ -1,6 +1,33 @@
 import SwiftUI
 import SwiftData
 
+struct AttachmentModelContextLengthCache: Equatable {
+  private(set) var residentModelID: String?
+  private(set) var resolvedURL: URL?
+  private(set) var contextLength: Int?
+
+  mutating func reconcile(residentModelID: String?,
+                          installed: [InstalledModel],
+                          readContextLength: (URL) -> Int?) {
+    guard let residentModelID else {
+      self.residentModelID = nil
+      self.resolvedURL = nil
+      self.contextLength = nil
+      return
+    }
+    guard let installed = installed.first(where: { $0.filename == residentModelID }) else {
+      self.residentModelID = residentModelID
+      self.resolvedURL = nil
+      self.contextLength = nil
+      return
+    }
+    guard self.residentModelID != residentModelID || self.resolvedURL != installed.url else { return }
+    self.residentModelID = residentModelID
+    self.resolvedURL = installed.url
+    self.contextLength = readContextLength(installed.url)
+  }
+}
+
 /// Composes the three pieces a chat detail surface needs:
 ///
 ///   ┌─ ContentToolbar (flat, no rectangle) ───────────────────────┐
@@ -162,6 +189,7 @@ struct ChatScaffoldView: View {
   }
 
   @State private var staleRetryNotice: RetryNoticeState?
+  @State private var attachmentModelContextCache = AttachmentModelContextLengthCache()
 
   init(
     chatID: UUID,
@@ -584,7 +612,7 @@ struct ChatScaffoldView: View {
           // for this chat's in-flight turn (review v1 F1).
           onStop: { sendCoordinator.cancel(chatID: chatID) },
           attachmentEngineTokenLimit: modelLoadCenter.residentMaxOutputTokens,
-          attachmentModelContextLength: attachmentModelContextLength(for: chat),
+          attachmentModelContextLength: attachmentModelContextCache.contextLength,
           autoSubmit: pendingSend.autoSubmit
         )
       }
@@ -660,8 +688,14 @@ struct ChatScaffoldView: View {
     // composer with their draft intact — no stale "starting…" gate.
     // These two are the post-reconcile edges — residency (or the re-seeded
     // selection) IS the new fact being observed, so no residency pre-check.
-    .onChange(of: modelLoadCenter.residentModelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
+    .onChange(of: modelLoadCenter.residentModelID) { _, residentModelID in
+      refreshAttachmentModelContextLength(residentModelID: residentModelID)
+      resolutionEdge(for: chat, requiresResidency: false)
+    }
     .onChange(of: chat.modelID) { _, _ in resolutionEdge(for: chat, requiresResidency: false) }
+    .onChange(of: library.installed) { _, _ in
+      refreshAttachmentModelContextLength(residentModelID: modelLoadCenter.residentModelID)
+    }
     // #413's helper-health generation gate is wired at app scope from
     // `ChatSendCoordinator.onAnyInFlightChange` (#507) — streams outlive this
     // view now, so a per-view forward would release the gate on navigate-away
@@ -682,6 +716,7 @@ struct ChatScaffoldView: View {
       // label matches what the chat was created with.
       viewModel.selectedProfileID = chat.profileID
       clearTransientOverridesForSelectedProfile()
+      refreshAttachmentModelContextLength(residentModelID: modelLoadCenter.residentModelID)
       // #4: covers the case where the engine status already settled before
       // this view appeared (no .onChange fires) — evaluate the launch ask
       // here too; the once-flag keeps it from double-prompting.
@@ -800,6 +835,7 @@ struct ChatScaffoldView: View {
     let result = await engineCoordinator.reconcileResidentModel()
     switch result {
     case .models(let ids):
+      refreshAttachmentModelContextLength(residentModelID: ids[0])
       // #460 (review F1): seed the chat's SELECTION authority (`Chat.modelID`)
       // from the served model ONLY when it matches THIS chat's profile
       // default — never the engine's single GLOBAL resident model when it
@@ -843,6 +879,7 @@ struct ChatScaffoldView: View {
         terminatePendingSendAfterReconcileFailure(for: chat)
       }
     case .empty, .notRunning:
+      refreshAttachmentModelContextLength(residentModelID: nil)
       // The coordinator already updated `ModelLoadCenter` residency (cleared on
       // `.empty`; left to `EngineLifecycle`'s leave-`.running` invalidation on
       // `.notRunning`). No per-chat consequence here.
@@ -1603,12 +1640,12 @@ struct ChatScaffoldView: View {
                     profileDefaultModel: selectedProfileDefault)
   }
 
-  private func attachmentModelContextLength(for chat: Chat) -> Int? {
-    guard let modelID = gateTarget(for: chat)?.modelID,
-          let installed = library.installed.first(where: { $0.filename == modelID }) else {
-      return nil
-    }
-    return ModelArchMetadata.read(resolvedModelURL: installed.url)?.contextLength
+  private func refreshAttachmentModelContextLength(residentModelID: String?) {
+    attachmentModelContextCache.reconcile(
+      residentModelID: residentModelID,
+      installed: library.installed,
+      readContextLength: { ModelArchMetadata.read(resolvedModelURL: $0)?.contextLength }
+    )
   }
 
   /// #673: decide whether a chat-toolbar profile swap must reload the engine.
