@@ -417,6 +417,7 @@ struct ChatScaffoldView: View {
       ContentToolbar(
         viewModel: viewModel,
         availableProfiles: pickerProfileIDs,
+        profileDisplayName: profileDisplayName(forProfileID:),
         // #459's richer model menu (option list + collapsed summary), built
         // from `Chat.modelID` (the #460 authority). #580 grouping + quant tag
         // + unverified shield render inside `ContentToolbar` from these
@@ -1455,6 +1456,10 @@ struct ChatScaffoldView: View {
       ids.append(viewModel.selectedProfileID)
     }
     return ids.sorted()
+  }
+
+  private func profileDisplayName(forProfileID id: String) -> String {
+    profileStore.profile(forProfileID: id)?.name ?? id
   }
 
   /// #669: the no-model gate, a non-modal floating card over a dimmed

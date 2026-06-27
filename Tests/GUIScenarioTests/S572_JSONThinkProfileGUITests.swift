@@ -84,8 +84,8 @@ final class S572_JSONThinkProfileGUITests: XCTestCase {
                   "'json-think' profile menu item not tappable; app tree: \(app.debugDescription)")
     jsonThinkItem.click()
 
-    guard waitForMenuButtonTitleContaining(profileMenu, "json-think", in: app, timeout: 10) else {
-      XCTFail("toolbar.profile did not reflect the 'json-think' selection (title=\(profileMenu.title)); app tree: \(app.debugDescription)")
+    guard waitForMenuButtonTitleContaining(profileMenu, "JSON Think", in: app, timeout: 10) else {
+      XCTFail("toolbar.profile did not reflect the 'JSON Think' selection (title=\(profileMenu.title)); app tree: \(app.debugDescription)")
       return
     }
 

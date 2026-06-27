@@ -22,6 +22,9 @@ import SwiftUI
 struct ContentToolbar: View {
   @ObservedObject var viewModel: ChatTranscriptViewModel
   let availableProfiles: [String]
+  /// Maps stable profile ids (selection keys) to user-facing profile names.
+  /// Selection still uses ids; this affects only visible toolbar/menu labels.
+  let profileDisplayName: (String) -> String
   /// #459's option list for the model menu (checkmark on current,
   /// profile-default annotation, unavailable reasons, "Manage Models…").
   /// Built by `ChatScaffoldView` from `Chat.modelID` (the #460 authority) +
@@ -116,6 +119,7 @@ struct ContentToolbar: View {
   init(
     viewModel: ChatTranscriptViewModel,
     availableProfiles: [String] = ["chat"],
+    profileDisplayName: @escaping (String) -> String = { $0 },
     modelOptions: [ToolbarModelOptions.Option] = [],
     currentModelSummary: ToolbarModelOptions.CurrentSummary? = nil,
     contextUsage: ContextUsage? = nil,
@@ -136,6 +140,7 @@ struct ContentToolbar: View {
   ) {
     self.viewModel = viewModel
     self.availableProfiles = availableProfiles
+    self.profileDisplayName = profileDisplayName
     self.modelOptions = modelOptions
     self.currentModelSummary = currentModelSummary
     self.contextUsage = contextUsage
@@ -224,12 +229,16 @@ struct ContentToolbar: View {
   private var profileMenu: some View {
     Menu {
       ForEach(availableProfiles, id: \.self) { id in
-        Button(id) { selectProfile(id) }
+        Button { selectProfile(id) } label: {
+          Text(profileDisplayName(id))
+        }
+        .accessibilityIdentifier(id)
+        .accessibilityLabel(profileDisplayName(id))
       }
     } label: {
       HStack(spacing: 4) {
         Image(systemName: "person.crop.circle")
-        Text("Profile: \(viewModel.selectedProfileID)")
+        Text("Profile: \(profileDisplayName(viewModel.selectedProfileID))")
       }
     }
     .menuStyle(.borderlessButton)

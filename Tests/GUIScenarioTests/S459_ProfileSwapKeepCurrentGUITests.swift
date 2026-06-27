@@ -66,9 +66,9 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
 
     XCTAssertTrue(clickPopoverButton("Cancel", in: app), "Cancel button missing")
 
-    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "chat", timeout: 10),
+    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "Chat", timeout: 10),
                   "Cancel must abandon the swap and stay on the old profile; title=\(profileMenu.title)")
-    XCTAssertFalse(profileMenu.title.localizedCaseInsensitiveContains("tree-of-thought"),
+    XCTAssertFalse(profileMenu.title.localizedCaseInsensitiveContains("Tree of Thought"),
                    "Cancel must never switch the profile; title=\(profileMenu.title)")
   }
 
@@ -83,8 +83,8 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
     XCTAssertTrue(clickPopoverButton("Keep Current Model", in: app),
                   "Keep Current Model button missing; app tree: \(app.debugDescription)")
 
-    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "tree-of-thought", timeout: 10),
-                  "Keep Current must still commit the profile switch to tree-of-thought; title=\(profileMenu.title)")
+    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "Tree of Thought (experimental)", timeout: 10),
+                  "Keep Current must still commit the profile switch to Tree of Thought (experimental); title=\(profileMenu.title)")
     // The chat's pinned model X is kept as `Chat.modelID` — toolbar.model must
     // still reflect X, never the tree-of-thought profile's default.
     let modelMenu = app.buttons["toolbar.model"]
@@ -102,8 +102,8 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
     // (S302-documented SwiftUI quirk).
     XCTAssertTrue(clickPopoverButton("Switch", in: app), "Switch button missing")
 
-    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "tree-of-thought", timeout: 10),
-                  "Switch must commit the profile switch to tree-of-thought; title=\(profileMenu.title)")
+    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "Tree of Thought (experimental)", timeout: 10),
+                  "Switch must commit the profile switch to Tree of Thought (experimental); title=\(profileMenu.title)")
   }
 
   /// #582: the swap popover must survive the window resigning key. The old
@@ -159,7 +159,7 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
     XCTAssertTrue(clickPopoverButton("Switch", in: app),
                   "Switch button missing on the survived popover")
     let profileMenu = app.menuButtons["toolbar.profile"]
-    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "tree-of-thought", timeout: 10),
+    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "Tree of Thought (experimental)", timeout: 10),
                   "the survived popover's Switch must still commit the profile switch; title=\(profileMenu.title)")
   }
 
@@ -174,8 +174,8 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
 
     XCTAssertFalse(popover.waitForExistence(timeout: 2),
                    "default explicit-model mode should not ask to swap to the destination profile default")
-    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "tree-of-thought", timeout: 10),
-                  "default explicit-model mode still commits the profile switch; title=\(profileMenu.title)")
+    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "Tree of Thought (experimental)", timeout: 10),
+                  "default explicit-model mode still commits the profile switch to Tree of Thought (experimental); title=\(profileMenu.title)")
     let modelMenu = app.buttons["toolbar.model"]
     XCTAssertTrue(waitForElementValueContaining(modelMenu, "ghost-pinned", timeout: 10),
                   "default explicit-model mode must keep the chat's pinned model X; toolbar.model value=\(String(describing: modelMenu.value))")
@@ -232,8 +232,8 @@ final class S459_ProfileSwapKeepCurrentGUITests: XCTestCase {
     let profileMenu = app.menuButtons["toolbar.profile"]
     XCTAssertTrue(profileMenu.waitForExistence(timeout: 10),
                   "profile switcher (toolbar.profile) missing; app tree: \(app.debugDescription)")
-    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "tree-of-thought", timeout: 45),
-                  "DEBUG auto-pick seam did not select tree-of-thought; title=\(profileMenu.title); app tree=\(app.debugDescription)")
+    XCTAssertTrue(waitForMenuButtonTitleContaining(profileMenu, "Tree of Thought (experimental)", timeout: 45),
+                  "DEBUG auto-pick seam did not select Tree of Thought (experimental); title=\(profileMenu.title); app tree=\(app.debugDescription)")
     return profileMenu
   }
 
