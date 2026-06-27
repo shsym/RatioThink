@@ -149,11 +149,20 @@ fn branch_directive(
     // `merge_no_think_retry`), which produces a bounded `/no_think` answer while
     // preserving the first attempt's reasoning. So the final node keeps both a
     // reasoning trace and a clean answer.
-    with_thinking(&body, branch_uses_thinking(level, max_depth, thinking))
+    let thinking = branch_uses_thinking(level, max_depth, thinking);
+    with_thinking(&with_private_thought_cue(body, thinking), thinking)
 }
 
 fn branch_uses_thinking(_level: usize, _max_depth: usize, thinking: bool) -> bool {
     thinking
+}
+
+fn with_private_thought_cue(body: String, thinking: bool) -> String {
+    if thinking {
+        format!("Use the hidden thought channel for a brief check before answering. {body}")
+    } else {
+        body
+    }
 }
 
 /// Value-evaluator prompts (independent per-node scoring). The scorer is a
@@ -3277,6 +3286,13 @@ mod tests {
         assert!(branch_directive(3, 3, 0, 3, false).contains("/no_think"));
         assert!(!branch_directive(1, 3, 0, 3, true).contains("/no_think"));
         assert!(!branch_directive(3, 3, 0, 3, true).contains("/no_think"));
+    }
+
+    #[test]
+    fn branch_directive_thinking_requests_private_thought_before_answer() {
+        let d = branch_directive(1, 3, 0, 3, true);
+        assert!(d.contains("hidden thought channel"), "{d}");
+        assert!(!branch_directive(1, 3, 0, 3, false).contains("hidden thought channel"));
     }
 
     // ── reasoning_branch_directive (#657 1b): partial-step decomposition ──
