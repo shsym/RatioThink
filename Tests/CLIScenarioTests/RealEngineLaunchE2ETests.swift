@@ -865,9 +865,9 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
   /// (the exact App path) and require the stream to reach a `tree_complete`
   /// terminal with a chosen answer. Most models must materialize at least one
   /// node at depth ≥ 2 — the depth>1 search is what spans the inter-level idle
-  /// gap (#413). Gemma 4 31B is intentionally bounded app-side to a single
-  /// breadth-expanded reasoning level under the 256-page large-model matrix
-  /// pool, so its strict contract here is reasoning_content + visible answer.
+  /// gap (#413). Gemma 4 31B adapts its ToT shape to the live KV envelope: the
+  /// 256-page matrix pool must prove the single-level fallback, while the
+  /// default production pool is expected to keep the requested depth-2 shape.
   private func assertTreeOfThoughtCell(port: Int, modelID: String,
                                        expectReasoning: Bool) async throws {
     let client = HTTPEngineClient(baseURL: URL(string: "http://127.0.0.1:\(port)")!)
@@ -909,10 +909,14 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
       }
     }
     try cellRequire(sawTreeComplete, "tot: stream never reached tree_complete")
-    let allowsSingleLevelToT =
+    let isGemma31B =
       modelID.contains("gemma-4-31B-it-GGUF") ||
       modelID.contains("gemma-4-31B-it-Q4_K_M.gguf")
-    if !allowsSingleLevelToT {
+    let boundedGemma31BMatrix =
+      isGemma31B && ProcessInfo.processInfo.environment["PIE_TEST_E2E_MAX_KV_PAGES"] == "256"
+    if boundedGemma31BMatrix {
+      try cellRequire(maxDepth == 1, "tot: 256-page Gemma 31B matrix run must adapt to depth=1 (max node depth \(maxDepth))")
+    } else {
       try cellRequire(maxDepth >= 2, "tot: search did not reach depth>1 (max node depth \(maxDepth))")
     }
     try cellRequire(selected != nil || !((finalAnswer ?? "").isEmpty),

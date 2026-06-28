@@ -81,16 +81,16 @@
 use futures::future::join_all;
 use futures::lock::Mutex;
 use inferlet::Context;
+use inferlet::chat;
 use inferlet::model::Model;
 use inferlet::sample::Sampler;
-use inferlet::chat;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::chat::apc::{ReasoningDecoder, gemma_thinking_cue_tokens, has_gemma_channel_markers};
+use crate::chat::apc::{ReasoningDecoder, gemma_thinking_cue_tokens};
 use crate::sse::Emitter;
 
-use super::schema::{TotParams, TotTask};
+use super::schema::{ExecStrategy, TotParams, TotTask};
 use super::stream::{self, BranchSink};
 use super::tree::{
     Candidate, Node, NodeStatus, assemble, best_leaf, error_leaf, new_node_id, parse_score,
@@ -319,14 +319,20 @@ fn branch_sampler(branch_index: usize, breadth: usize, gen_temp: f32, top_p: f32
     let (rank, explorers) = if breadth >= 2 {
         (branch_index.saturating_sub(1), breadth - 1)
     } else {
-        return Sampler::TopP { temperature: base, p: top_p };
+        return Sampler::TopP {
+            temperature: base,
+            p: top_p,
+        };
     };
     let temperature = if explorers <= 1 {
         lo
     } else {
         lo + (hi - lo) * (rank.min(explorers - 1) as f32) / ((explorers - 1) as f32)
     };
-    Sampler::TopP { temperature, p: top_p }
+    Sampler::TopP {
+        temperature,
+        p: top_p,
+    }
 }
 
 /// Reasoning budget for the bounded branch retry after a thinking attempt
@@ -358,40 +364,109 @@ fn branch_answer_budget(_level: usize, _max_depth: usize, requested: usize) -> u
     requested
 }
 
-const GEMMA_TOT_REASONING_TOKEN_CAP: usize = 192;
-const GEMMA_TOT_SMALL_POOL_MAX_PAGES: u32 = 256;
+const TOT_ADAPTIVE_REASONING_TOKEN_CAP: usize = 192;
+const TOT_ADAPTIVE_RESIDENCY_HEADROOM: usize = 2;
+const TOT_ADAPTIVE_CONCURRENCY_HEADROOM: usize = 3;
 
-fn gemma_tot_small_kv_pool(is_gemma: bool, budget_pages: u32) -> bool {
-    // The ToT reductions are for the app's bounded-KV deployment envelope, not
-    // for the Gemma tokenizer family. The guest can read the runtime
-    // `total_pages` budget through `Context::budget_pages()`; 0 means the host
-    // has not cached the driver yet, so do not silently shrink full-size runs.
-    is_gemma && budget_pages > 0 && budget_pages <= GEMMA_TOT_SMALL_POOL_MAX_PAGES
+#[derive(Clone)]
+struct AdaptiveTotSizing {
+    params: TotParams,
 }
 
-fn gemma_tot_concurrent_generation_enabled(small_kv_pool: bool, requested: bool) -> bool {
-    // On a small KV pool, concurrent sibling decoding pins extra contexts and
-    // can exhaust the deployment envelope. Full-size pools keep the requested
-    // strategy, including Gemma 4 12B's default 1024-page path.
-    requested && !small_kv_pool
+fn tot_kv_demand_tokens(params: &TotParams, marginal_prompt_tokens: usize) -> usize {
+    let candidate_count =
+        super::schema::total_candidates(params.breadth, params.depth, params.beam_width).max(1);
+    let per_sibling = marginal_prompt_tokens
+        .saturating_add(params.max_reasoning_tokens)
+        .saturating_add(params.max_tokens_per_node)
+        .saturating_add(SCORE_MAX_TOKENS);
+    candidate_count
+        .saturating_mul(per_sibling)
+        .saturating_mul(TOT_ADAPTIVE_RESIDENCY_HEADROOM)
 }
 
-fn gemma_tot_effective_depth(small_kv_pool: bool, requested: usize) -> usize {
-    // The 31B matrix profile intentionally runs with a small 256-page KV pool.
-    // Gemma's depth-2 ToT fan-out pre-forks `beam_width * breadth` long child
-    // contexts before generation, which exhausts that bounded pool before any
-    // second-level visible answer can finish. Under that actual app-side memory
-    // envelope, use one breadth-expanded reasoning level; larger pools keep the
-    // requested depth.
-    if small_kv_pool { requested.min(1) } else { requested }
-}
-
-fn cap_gemma_reasoning_budget(small_kv_pool: bool, requested: usize) -> usize {
-    if small_kv_pool {
-        requested.min(GEMMA_TOT_REASONING_TOKEN_CAP)
+fn tot_kv_concurrent_demand_tokens(params: &TotParams, marginal_prompt_tokens: usize) -> usize {
+    let peak_width = if params.exec.concurrent_gen() {
+        if params.depth >= 2 {
+            params.beam_width.saturating_mul(params.breadth).max(1)
+        } else {
+            params.breadth.max(1)
+        }
     } else {
-        requested
+        1
+    };
+    let per_sibling = marginal_prompt_tokens
+        .saturating_add(params.max_reasoning_tokens)
+        .saturating_add(params.max_tokens_per_node)
+        .saturating_add(SCORE_MAX_TOKENS);
+    peak_width
+        .saturating_mul(per_sibling)
+        .saturating_mul(TOT_ADAPTIVE_CONCURRENCY_HEADROOM)
+}
+
+fn tot_kv_available_tokens(budget_pages: u32, page_size_tokens: u32) -> Option<usize> {
+    let pages = usize::try_from(budget_pages).ok()?;
+    let page_size = usize::try_from(page_size_tokens).ok()?;
+    let available = pages.checked_mul(page_size)?;
+    (available > 0).then_some(available)
+}
+
+fn adaptive_tot_sizing(
+    params: &TotParams,
+    budget_pages: u32,
+    page_size_tokens: u32,
+    marginal_prompt_tokens: usize,
+) -> AdaptiveTotSizing {
+    let Some(available) = tot_kv_available_tokens(budget_pages, page_size_tokens) else {
+        return AdaptiveTotSizing {
+            params: params.clone(),
+        };
+    };
+
+    let mut sized = params.clone();
+    let fits = |p: &TotParams| {
+        tot_kv_demand_tokens(p, marginal_prompt_tokens) <= available
+            && tot_kv_concurrent_demand_tokens(p, marginal_prompt_tokens) <= available
+    };
+    if fits(&sized) {
+        return AdaptiveTotSizing { params: sized };
     }
+
+    if sized.exec.concurrent_gen() {
+        sized.exec = if sized.exec.phased_score() {
+            ExecStrategy::PhasedSequential
+        } else {
+            ExecStrategy::CoupledSequential
+        };
+        if fits(&sized) {
+            return AdaptiveTotSizing { params: sized };
+        }
+    }
+
+    if sized.max_reasoning_tokens > TOT_ADAPTIVE_REASONING_TOKEN_CAP {
+        sized.max_reasoning_tokens = sized
+            .max_reasoning_tokens
+            .min(TOT_ADAPTIVE_REASONING_TOKEN_CAP);
+        if fits(&sized) {
+            return AdaptiveTotSizing { params: sized };
+        }
+    }
+
+    while sized.depth > 1 {
+        sized.depth -= 1;
+        if fits(&sized) {
+            return AdaptiveTotSizing { params: sized };
+        }
+    }
+
+    while sized.breadth > 1 {
+        sized.breadth -= 1;
+        if fits(&sized) {
+            return AdaptiveTotSizing { params: sized };
+        }
+    }
+
+    AdaptiveTotSizing { params: sized }
 }
 
 /// Append the `/no_think` directive when reasoning is disabled for this
@@ -1044,9 +1119,6 @@ async fn generate_demuxed(
     sink: DeltaSink<'_>,
     logit_bias: &[(u32, f32)],
 ) -> Demux {
-    let small_kv_pool =
-        gemma_tot_small_kv_pool(has_gemma_channel_markers(model), ctx.budget_pages());
-    let reasoning_budget = cap_gemma_reasoning_budget(small_kv_pool, reasoning_budget);
     let mut reason_dec = ReasoningDecoder::new(model);
     let mut chat_dec = chat::Decoder::new(model);
     let mut generator = ctx
@@ -1316,28 +1388,19 @@ pub async fn run(
     model: &Model,
     mut emitter: Option<&mut Emitter>,
 ) -> SearchOutcome {
-    let small_kv_pool =
-        gemma_tot_small_kv_pool(has_gemma_channel_markers(model), root_ctx.budget_pages());
-    let effective_depth = gemma_tot_effective_depth(small_kv_pool, params.depth);
-    let effective_params;
-    let params = if effective_depth != params.depth {
-        effective_params = TotParams {
-            breadth: params.breadth,
-            depth: effective_depth,
-            beam_width: params.beam_width,
-            max_tokens_per_node: params.max_tokens_per_node,
-            max_reasoning_tokens: params.max_reasoning_tokens,
-            temperature: params.temperature,
-            top_p: params.top_p,
-            thinking: params.thinking,
-            exec: params.exec,
-            task: params.task,
-            sibling_penalty: params.sibling_penalty,
-        };
-        &effective_params
+    let page_size = root_ctx.page_size();
+    let marginal_prompt_tokens = if page_size == 0 {
+        0
     } else {
-        params
+        (root_ctx.seq_len() % page_size) as usize
     };
+    let adaptive = adaptive_tot_sizing(
+        params,
+        root_ctx.budget_pages(),
+        page_size,
+        marginal_prompt_tokens,
+    );
+    let params = &adaptive.params;
 
     // #523 Part A: preserve a fork of the original conversation (system +
     // user turns, flushed, cue-free) BEFORE the search consumes `root_ctx`.
@@ -1948,10 +2011,7 @@ async fn resolve_level(
     score_base: Option<&Context>,
     level: usize,
 ) -> Vec<(Context, NodeOutcome)> {
-    let budget_pages = ctxs.first().map(Context::budget_pages).unwrap_or(0);
-    let small_kv_pool = gemma_tot_small_kv_pool(has_gemma_channel_markers(model), budget_pages);
-    let concurrent_gen =
-        gemma_tot_concurrent_generation_enabled(small_kv_pool, params.exec.concurrent_gen());
+    let concurrent_gen = params.exec.concurrent_gen();
 
     // Share the SSE emitter across concurrent branch futures (#650): a single
     // `&mut Emitter` can't be borrowed N ways, so wrap it in an async `Mutex`
@@ -1970,7 +2030,14 @@ async fn resolve_level(
     // are returned in `metas` order regardless.
     if params.sibling_penalty > 0.0 {
         return resolve_level_penalized(
-            metas, ctxs, child_paths, params, model, sink, score_base, level,
+            metas,
+            ctxs,
+            child_paths,
+            params,
+            model,
+            sink,
+            score_base,
+            level,
         )
         .await;
     }
@@ -1980,13 +2047,9 @@ async fn resolve_level(
         let gens: Vec<(Context, Demux)> = if concurrent_gen {
             // All siblings decode in flight at once, so the scheduler batches
             // their forward passes; `sink` (Copy) interleaves their deltas.
-            join_all(
-                ctxs.into_iter()
-                    .zip(metas.iter())
-                    .map(|(c, m)| {
-                        generate_tot_branch(c, model, params, sink, &m.0, &m.1, level, m.2, &[])
-                    }),
-            )
+            join_all(ctxs.into_iter().zip(metas.iter()).map(|(c, m)| {
+                generate_tot_branch(c, model, params, sink, &m.0, &m.1, level, m.2, &[])
+            }))
             .await
         } else {
             let mut out = Vec::with_capacity(ctxs.len());
@@ -2041,7 +2104,17 @@ async fn resolve_level(
                     .zip(child_paths.iter())
                     .map(|((c, m), path)| {
                         expand(
-                            c, model, params, sink, score_base, path, &m.0, &m.1, level, m.2, &[],
+                            c,
+                            model,
+                            params,
+                            sink,
+                            score_base,
+                            path,
+                            &m.0,
+                            &m.1,
+                            level,
+                            m.2,
+                            &[],
                         )
                     }),
             )
@@ -2051,7 +2124,17 @@ async fn resolve_level(
             for ((c, m), path) in ctxs.into_iter().zip(metas.iter()).zip(child_paths.iter()) {
                 out.push(
                     expand(
-                        c, model, params, sink, score_base, path, &m.0, &m.1, level, m.2, &[],
+                        c,
+                        model,
+                        params,
+                        sink,
+                        score_base,
+                        path,
+                        &m.0,
+                        &m.1,
+                        level,
+                        m.2,
+                        &[],
                     )
                     .await,
                 );
@@ -2342,7 +2425,12 @@ pub(crate) async fn generate_branch(
         // #693a+b: greedy anchor on branch 0, explorer temperature ladder on
         // the rest, floored so a low inherited chat-profile temperature can't
         // collapse the search.
-        sampler: branch_sampler(branch_index, params.breadth, params.temperature, params.top_p),
+        sampler: branch_sampler(
+            branch_index,
+            params.breadth,
+            params.temperature,
+            params.top_p,
+        ),
         // #693c: cross-sibling token penalty supplied by the caller (empty
         // unless `sibling_penalty` is enabled and earlier siblings have run).
         logit_bias: sibling_bias.to_vec(),
@@ -2508,7 +2596,15 @@ async fn expand(
     sibling_bias: &[(u32, f32)],
 ) -> (Context, NodeOutcome) {
     let (ctx, demux) = generate_tot_branch(
-        ctx, model, params, sink, node_id, parent_id, level, branch_index, sibling_bias,
+        ctx,
+        model,
+        params,
+        sink,
+        node_id,
+        parent_id,
+        level,
+        branch_index,
+        sibling_bias,
     )
     .await;
     let score = if matches!(demux.kind, DemuxKind::Answered) {
@@ -3471,50 +3567,103 @@ mod tests {
     }
 
     #[test]
-    fn gemma_small_pool_detection_uses_runtime_kv_envelope() {
-        assert!(gemma_tot_small_kv_pool(true, 256));
-        assert!(gemma_tot_small_kv_pool(true, 128));
-        assert!(!gemma_tot_small_kv_pool(true, 0));
-        assert!(!gemma_tot_small_kv_pool(true, 1024));
-        assert!(!gemma_tot_small_kv_pool(false, 256));
-    }
+    fn adaptive_tot_sizing_levers_stop_in_order() {
+        let params = adaptive_test_params(2048);
 
-    #[test]
-    fn gemma_reasoning_budget_is_capped_only_on_small_kv_pool() {
-        assert_eq!(cap_gemma_reasoning_budget(true, 2048), 192);
-        assert_eq!(cap_gemma_reasoning_budget(true, 128), 128);
-        assert_eq!(cap_gemma_reasoning_budget(false, 2048), 2048);
-    }
+        let sized = adaptive_tot_sizing(&params, 1024, 32, 0);
 
-    #[test]
-    fn gemma_tot_disables_concurrent_branch_generation_only_on_small_kv_pool() {
-        assert!(!gemma_tot_concurrent_generation_enabled(true, true));
-        assert!(!gemma_tot_concurrent_generation_enabled(true, false));
-        assert!(gemma_tot_concurrent_generation_enabled(false, true));
-        assert!(!gemma_tot_concurrent_generation_enabled(false, false));
-    }
-
-    #[test]
-    fn gemma_tot_uses_single_reasoning_level_only_on_small_kv_pool() {
-        assert_eq!(gemma_tot_effective_depth(true, 1), 1);
-        assert_eq!(gemma_tot_effective_depth(true, 2), 1);
-        assert_eq!(gemma_tot_effective_depth(true, 4), 1);
-        assert_eq!(gemma_tot_effective_depth(false, 2), 2);
-    }
-
-    #[test]
-    fn gemma_large_pool_keeps_full_tot_depth_concurrency_and_reasoning_budget() {
-        let is_gemma = true;
-        let large_pool_pages = 1024;
-        let small = gemma_tot_small_kv_pool(is_gemma, large_pool_pages);
-
-        assert!(
-            !small,
-            "Gemma 4 12B/default large-pool path must not inherit the 31B 256-page cap"
+        assert_eq!(
+            sized.params.depth, 2,
+            "large pools should keep requested depth"
         );
-        assert_eq!(gemma_tot_effective_depth(small, 2), 2);
-        assert!(gemma_tot_concurrent_generation_enabled(small, true));
-        assert_eq!(cap_gemma_reasoning_budget(small, 2048), 2048);
+        assert_eq!(
+            sized.params.breadth, 3,
+            "large pools should keep requested breadth"
+        );
+        assert_eq!(
+            sized.params.exec,
+            super::super::schema::ExecStrategy::CoupledSequential,
+            "first lever is serializing sibling generation"
+        );
+        assert_eq!(
+            sized.params.max_reasoning_tokens, 192,
+            "second lever caps reasoning only after serialization is insufficient"
+        );
+    }
+
+    #[test]
+    fn adaptive_tot_sizing_tiny_pool_reduces_depth_after_serializing_and_capping() {
+        let params = adaptive_test_params(2048);
+
+        let sized = adaptive_tot_sizing(&params, 256, 32, 0);
+
+        assert_eq!(
+            sized.params.exec,
+            super::super::schema::ExecStrategy::CoupledSequential
+        );
+        assert_eq!(sized.params.max_reasoning_tokens, 192);
+        assert_eq!(sized.params.depth, 1);
+        assert_eq!(
+            sized.params.breadth, 3,
+            "breadth is reduced only after depth"
+        );
+    }
+
+    #[test]
+    fn adaptive_tot_sizing_large_pool_small_demand_is_unchanged() {
+        let params = adaptive_test_params(128);
+
+        let sized = adaptive_tot_sizing(&params, 1024, 32, 0);
+
+        assert_eq!(sized.params.depth, params.depth);
+        assert_eq!(sized.params.breadth, params.breadth);
+        assert_eq!(sized.params.exec, params.exec);
+        assert_eq!(
+            sized.params.max_reasoning_tokens,
+            params.max_reasoning_tokens
+        );
+    }
+
+    #[test]
+    fn adaptive_tot_sizing_pins_demand_formula_and_stop_once_fit() {
+        let mut params = adaptive_test_params(2048);
+        params.depth = 1;
+        params.breadth = 2;
+        params.beam_width = 1;
+
+        let demand = tot_kv_demand_tokens(&params, 10);
+        assert_eq!(
+            demand,
+            2 * (10 + 2048 + 256 + SCORE_MAX_TOKENS) * TOT_ADAPTIVE_RESIDENCY_HEADROOM
+        );
+
+        let sized = adaptive_tot_sizing(&params, 310, 32, 10);
+        assert_eq!(
+            sized.params.exec,
+            super::super::schema::ExecStrategy::CoupledSequential
+        );
+        assert_eq!(
+            sized.params.max_reasoning_tokens, 2048,
+            "serialization alone fits this envelope, so later levers must not fire"
+        );
+        assert_eq!(sized.params.depth, 1);
+        assert_eq!(sized.params.breadth, 2);
+    }
+
+    fn adaptive_test_params(max_reasoning_tokens: usize) -> TotParams {
+        TotParams {
+            breadth: 3,
+            depth: 2,
+            beam_width: 2,
+            max_tokens_per_node: 256,
+            max_reasoning_tokens,
+            temperature: 0.7,
+            top_p: 0.9,
+            thinking: true,
+            exec: super::super::schema::ExecStrategy::CoupledConcurrent,
+            task: super::super::schema::TotTask::Chat,
+            sibling_penalty: 0.0,
+        }
     }
 
     #[test]
@@ -3733,10 +3882,7 @@ mod tests {
     #[test]
     fn synthesis_directive_trims_whitespace_only_reasoning() {
         // Whitespace-only reasoning must not open an empty notes section.
-        let d = build_synthesis_directive(
-            "Answer.",
-            "   \n  ",
-        );
+        let d = build_synthesis_directive("Answer.", "   \n  ");
         assert!(!d.contains("Private supporting notes"));
     }
 
@@ -3831,14 +3977,27 @@ mod tests {
         // breadth == N: explorers (branch 1..N) sample at strictly ascending
         // temperatures spanning [lo, hi], with top_p passed through.
         let hi = (lo + PROPOSE_TEMP_SPAN).min(PROPOSE_TEMP_MAX);
-        let temps: Vec<f32> =
-            (1..5).map(|i| topp_temp(&branch_sampler(i, 5, gen_temp, top_p))).collect();
-        assert!((temps[0] - lo).abs() < 1e-6, "coolest explorer is the band floor");
-        assert!((*temps.last().unwrap() - hi).abs() < 1e-6, "hottest explorer is the band top");
+        let temps: Vec<f32> = (1..5)
+            .map(|i| topp_temp(&branch_sampler(i, 5, gen_temp, top_p)))
+            .collect();
+        assert!(
+            (temps[0] - lo).abs() < 1e-6,
+            "coolest explorer is the band floor"
+        );
+        assert!(
+            (*temps.last().unwrap() - hi).abs() < 1e-6,
+            "hottest explorer is the band top"
+        );
         for w in temps.windows(2) {
-            assert!(w[1] > w[0], "explorer ladder must strictly ascend, got {temps:?}");
+            assert!(
+                w[1] > w[0],
+                "explorer ladder must strictly ascend, got {temps:?}"
+            );
         }
-        assert!(temps.iter().all(|&t| (lo..=hi).contains(&t)), "ladder stays within [lo, hi]");
+        assert!(
+            temps.iter().all(|&t| (lo..=hi).contains(&t)),
+            "ladder stays within [lo, hi]"
+        );
         match branch_sampler(1, 5, gen_temp, top_p) {
             Sampler::TopP { p, .. } => assert!((p - top_p).abs() < 1e-6, "top_p passed through"),
             other => panic!("expected TopP, got {other:?}"),
@@ -3849,7 +4008,10 @@ mod tests {
         assert!(branch_sampler(0, 5, 1.9, top_p).is_argmax());
         for i in 1..5 {
             let t = topp_temp(&branch_sampler(i, 5, 1.9, top_p));
-            assert!(t <= PROPOSE_TEMP_MAX + 1e-6, "explorer {i} exceeds cap: {t}");
+            assert!(
+                t <= PROPOSE_TEMP_MAX + 1e-6,
+                "explorer {i} exceeds cap: {t}"
+            );
         }
     }
 
@@ -3860,7 +4022,10 @@ mod tests {
         // Each distinct earlier-sibling token maps to a single negative bias.
         let bias = sibling_penalty_bias(&[5, 5, 9, 5, 9, 12], 1.5);
         assert_eq!(bias.len(), 3, "duplicate tokens collapse to one entry");
-        assert!(bias.iter().all(|&(_, v)| (v + 1.5).abs() < 1e-6), "penalty is -magnitude");
+        assert!(
+            bias.iter().all(|&(_, v)| (v + 1.5).abs() < 1e-6),
+            "penalty is -magnitude"
+        );
         let toks: Vec<u32> = bias.iter().map(|&(t, _)| t).collect();
         assert_eq!(toks, vec![5, 9, 12], "first-seen order preserved");
     }
@@ -3874,7 +4039,11 @@ mod tests {
     fn sibling_penalty_bias_is_capped() {
         let many: Vec<u32> = (0..(SIBLING_PENALTY_MAX_TOKENS as u32 + 50)).collect();
         let bias = sibling_penalty_bias(&many, 1.0);
-        assert_eq!(bias.len(), SIBLING_PENALTY_MAX_TOKENS, "bias list is bounded");
+        assert_eq!(
+            bias.len(),
+            SIBLING_PENALTY_MAX_TOKENS,
+            "bias list is bounded"
+        );
     }
 
     // ── ScoreOutcome (F4): the three classes the old Option<u8> merged ──

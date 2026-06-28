@@ -239,7 +239,7 @@ pub struct TotInput {
 }
 
 /// Validated, defaulted search parameters.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TotParams {
     pub breadth: usize,
     pub depth: usize,
