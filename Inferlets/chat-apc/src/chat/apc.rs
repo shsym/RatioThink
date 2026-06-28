@@ -65,18 +65,9 @@ pub struct ReasoningDecoder {
 
 impl ReasoningDecoder {
     pub fn new(model: &Model) -> Self {
-        Self::new_with_gemma_thought_open(model, false)
-    }
-
-    /// Build a decoder for a prompt that already ended inside Gemma's
-    /// `<|channel>thought` channel. This is used by chat-apc's explicit
-    /// thinking prompts: the channel-open marker is prompt text, not generated
-    /// output, so the fallback Gemma decoder must start in reasoning state to
-    /// route the first generated token to `reasoning_content`.
-    pub fn new_with_gemma_thought_open(model: &Model, open: bool) -> Self {
         Self {
             inner: inferlet::reasoning::Decoder::new(model),
-            gemma: GemmaChannelDecoder::for_model(model, open),
+            gemma: GemmaChannelDecoder::for_model(model),
         }
     }
 
@@ -148,7 +139,7 @@ struct GemmaChannelDecoder {
 }
 
 impl GemmaChannelDecoder {
-    fn for_model(model: &Model, start_inside: bool) -> Option<Self> {
+    fn for_model(model: &Model) -> Option<Self> {
         let tokenizer = model.tokenizer();
         if !tokenizer_has_gemma_channel_markers(&tokenizer) {
             return None;
@@ -163,7 +154,6 @@ impl GemmaChannelDecoder {
         Some(Self::new_with_state(
             start_ids,
             end_ids,
-            start_inside,
             move |tokens| decode_tokenizer.decode(tokens).unwrap_or_default(),
         ))
     }
@@ -174,19 +164,18 @@ impl GemmaChannelDecoder {
         end_ids: Vec<u32>,
         detokenize: impl Fn(&[u32]) -> String + Send + 'static,
     ) -> Self {
-        Self::new_with_state(start_ids, end_ids, false, detokenize)
+        Self::new_with_state(start_ids, end_ids, detokenize)
     }
 
     fn new_with_state(
         start_ids: Vec<u32>,
         end_ids: Vec<u32>,
-        start_inside: bool,
         detokenize: impl Fn(&[u32]) -> String + Send + 'static,
     ) -> Self {
         Self {
             start_ids,
             end_ids,
-            inside: start_inside,
+            inside: false,
             token_buf: Vec::new(),
             text_emitted: 0,
             match_pos: 0,
@@ -201,15 +190,6 @@ impl GemmaChannelDecoder {
         detokenize: impl Fn(&[u32]) -> String + Send + 'static,
     ) -> Self {
         Self::new(start_ids, end_ids, detokenize)
-    }
-
-    #[cfg(test)]
-    fn new_inside_for_testing(
-        start_ids: Vec<u32>,
-        end_ids: Vec<u32>,
-        detokenize: impl Fn(&[u32]) -> String + Send + 'static,
-    ) -> Self {
-        Self::new_with_state(start_ids, end_ids, true, detokenize)
     }
 
     fn feed(&mut self, tokens: &[u32]) -> ReasoningEvent {
@@ -325,25 +305,6 @@ mod tests {
         assert!(!dec.is_start_pending());
     }
 
-    #[test]
-    fn gemma_channel_decoder_can_start_inside_prompt_opened_thought_channel() {
-        let mut dec =
-            GemmaChannelDecoder::new_inside_for_testing(vec![100, 42], vec![101], |tokens| {
-                match tokens {
-                    [7] => "reason".to_string(),
-                    other => format!("{other:?}"),
-                }
-            });
-
-        match dec.feed(&[7]) {
-            ReasoningEvent::Delta(s) => assert_eq!(s, "reason"),
-            other => panic!("expected reasoning delta from prompt-opened thought, got {other:?}"),
-        }
-        match dec.feed(&[101]) {
-            ReasoningEvent::End(s) => assert_eq!(s, "reason"),
-            other => panic!("expected reasoning end, got {other:?}"),
-        }
-    }
 
     #[test]
     fn gemma_thinking_cue_opens_thought_channel_without_closing_it() {

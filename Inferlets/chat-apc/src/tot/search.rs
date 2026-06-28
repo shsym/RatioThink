@@ -359,28 +359,35 @@ fn branch_answer_budget(_level: usize, _max_depth: usize, requested: usize) -> u
 }
 
 const GEMMA_TOT_REASONING_TOKEN_CAP: usize = 192;
+const GEMMA_TOT_SMALL_POOL_MAX_PAGES: u32 = 256;
 
-fn gemma_tot_concurrent_generation_enabled(is_gemma: bool, requested: bool) -> bool {
-    // Gemma 4 31B needs the bounded 256-page matrix pool; decoding siblings
-    // concurrently pins extra contexts. Keep the model-specific fix in
-    // chat-apc by preserving the user-requested strategy for other models
-    // while serializing Gemma branch generation.
-    requested && !is_gemma
+fn gemma_tot_small_kv_pool(is_gemma: bool, budget_pages: u32) -> bool {
+    // The ToT reductions are for the app's bounded-KV deployment envelope, not
+    // for the Gemma tokenizer family. The guest can read the runtime
+    // `total_pages` budget through `Context::budget_pages()`; 0 means the host
+    // has not cached the driver yet, so do not silently shrink full-size runs.
+    is_gemma && budget_pages > 0 && budget_pages <= GEMMA_TOT_SMALL_POOL_MAX_PAGES
 }
 
-fn gemma_tot_effective_depth(is_gemma: bool, requested: usize) -> usize {
+fn gemma_tot_concurrent_generation_enabled(small_kv_pool: bool, requested: bool) -> bool {
+    // On a small KV pool, concurrent sibling decoding pins extra contexts and
+    // can exhaust the deployment envelope. Full-size pools keep the requested
+    // strategy, including Gemma 4 12B's default 1024-page path.
+    requested && !small_kv_pool
+}
+
+fn gemma_tot_effective_depth(small_kv_pool: bool, requested: usize) -> usize {
     // The 31B matrix profile intentionally runs with a small 256-page KV pool.
     // Gemma's depth-2 ToT fan-out pre-forks `beam_width * breadth` long child
     // contexts before generation, which exhausts that bounded pool before any
-    // second-level visible answer can finish. Keep Gemma ToT truthful under the
-    // app-side memory envelope by using a single breadth-expanded reasoning
-    // level; the root candidates still surface reasoning_content and a visible
-    // answer, and other models keep the requested depth.
-    if is_gemma { requested.min(1) } else { requested }
+    // second-level visible answer can finish. Under that actual app-side memory
+    // envelope, use one breadth-expanded reasoning level; larger pools keep the
+    // requested depth.
+    if small_kv_pool { requested.min(1) } else { requested }
 }
 
-fn cap_gemma_reasoning_budget(is_gemma: bool, requested: usize) -> usize {
-    if is_gemma {
+fn cap_gemma_reasoning_budget(small_kv_pool: bool, requested: usize) -> usize {
+    if small_kv_pool {
         requested.min(GEMMA_TOT_REASONING_TOKEN_CAP)
     } else {
         requested
@@ -770,14 +777,13 @@ struct BranchGenerateRequest<'a> {
     reasoning_budget: usize,
     answer_budget: usize,
     sink_node_id: &'a str,
-    starts_in_gemma_thought: bool,
 }
 
 trait BranchDriver<C> {
     fn fork_retry_base(&mut self, ctx: &C) -> Result<C, String>;
     fn push_user(&mut self, ctx: &mut C, directive: &str);
     fn push_assistant(&mut self, ctx: &mut C, content: &str);
-    fn cue(&mut self, ctx: &mut C, no_think: bool) -> bool;
+    fn cue(&mut self, ctx: &mut C, no_think: bool);
     fn generate<'a>(
         &'a mut self,
         ctx: &'a mut C,
@@ -804,20 +810,19 @@ fn model_uses_think_template(model: &Model) -> bool {
     !matches!(dec.feed(&probe), Ok(inferlet::reasoning::Event::Idle))
 }
 
-fn cue_generation(ctx: &mut Context, model: &Model, no_think: bool) -> bool {
+fn cue_generation(ctx: &mut Context, model: &Model, no_think: bool) {
     if no_think {
         ctx.cue();
         if model_uses_think_template(model) {
             ctx.append(&model.tokenizer().encode(NO_THINK_PREFILL));
         }
-        return false;
+        return;
     }
     if let Some(cue) = gemma_thinking_cue_tokens(model) {
         ctx.append(&cue);
-        return false;
+        return;
     }
     ctx.cue();
-    false
 }
 
 /// Remove leaked reasoning-channel delimiters (`<think>`, `</think>`, Gemma's
@@ -1038,12 +1043,11 @@ async fn generate_demuxed(
     emitter: Option<BranchSink<'_, '_>>,
     sink: DeltaSink<'_>,
     logit_bias: &[(u32, f32)],
-    starts_in_gemma_thought: bool,
 ) -> Demux {
-    let reasoning_budget =
-        cap_gemma_reasoning_budget(has_gemma_channel_markers(model), reasoning_budget);
-    let mut reason_dec =
-        ReasoningDecoder::new_with_gemma_thought_open(model, starts_in_gemma_thought);
+    let small_kv_pool =
+        gemma_tot_small_kv_pool(has_gemma_channel_markers(model), ctx.budget_pages());
+    let reasoning_budget = cap_gemma_reasoning_budget(small_kv_pool, reasoning_budget);
+    let mut reason_dec = ReasoningDecoder::new(model);
     let mut chat_dec = chat::Decoder::new(model);
     let mut generator = ctx
         .generate(sampler)
@@ -1063,7 +1067,7 @@ async fn generate_demuxed(
 
     let mut reasoning = String::new();
     let mut answer = String::new();
-    let mut in_reasoning = starts_in_gemma_thought;
+    let mut in_reasoning = false;
     let mut reasoning_done = false;
     let mut reasoning_tokens = 0usize;
     let mut answer_tokens = 0usize;
@@ -1312,8 +1316,9 @@ pub async fn run(
     model: &Model,
     mut emitter: Option<&mut Emitter>,
 ) -> SearchOutcome {
-    let is_gemma = has_gemma_channel_markers(model);
-    let effective_depth = gemma_tot_effective_depth(is_gemma, params.depth);
+    let small_kv_pool =
+        gemma_tot_small_kv_pool(has_gemma_channel_markers(model), root_ctx.budget_pages());
+    let effective_depth = gemma_tot_effective_depth(small_kv_pool, params.depth);
     let effective_params;
     let params = if effective_depth != params.depth {
         effective_params = TotParams {
@@ -1943,10 +1948,10 @@ async fn resolve_level(
     score_base: Option<&Context>,
     level: usize,
 ) -> Vec<(Context, NodeOutcome)> {
-    let concurrent_gen = gemma_tot_concurrent_generation_enabled(
-        has_gemma_channel_markers(model),
-        params.exec.concurrent_gen(),
-    );
+    let budget_pages = ctxs.first().map(Context::budget_pages).unwrap_or(0);
+    let small_kv_pool = gemma_tot_small_kv_pool(has_gemma_channel_markers(model), budget_pages);
+    let concurrent_gen =
+        gemma_tot_concurrent_generation_enabled(small_kv_pool, params.exec.concurrent_gen());
 
     // Share the SSE emitter across concurrent branch futures (#650): a single
     // `&mut Emitter` can't be borrowed N ways, so wrap it in an async `Mutex`
@@ -2175,7 +2180,7 @@ where
     // pass carry real new tokens rather than spin. Cue's no-think is keyed
     // directly off `thinking` (the directive carries its own `/no_think`).
     driver.push_user(&mut ctx, first_directive);
-    let starts_in_gemma_thought = driver.cue(&mut ctx, !params.thinking);
+    driver.cue(&mut ctx, !params.thinking);
     let reasoning_budget =
         branch_reasoning_budget(level, params.depth, params.max_reasoning_tokens);
     let answer_budget = branch_answer_budget(level, params.depth, params.max_tokens_per_node);
@@ -2187,7 +2192,6 @@ where
                 reasoning_budget,
                 answer_budget,
                 sink_node_id: node_id,
-                starts_in_gemma_thought,
             },
         )
         .await;
@@ -2211,7 +2215,7 @@ where
         match retry_base {
             Some(Ok(mut retry_ctx)) => {
                 driver.push_user(&mut retry_ctx, retry_directive);
-                let starts_in_gemma_thought = driver.cue(&mut retry_ctx, true);
+                driver.cue(&mut retry_ctx, true);
                 let retry = driver
                     .generate(
                         &mut retry_ctx,
@@ -2220,7 +2224,6 @@ where
                             reasoning_budget: NO_THINK_RETRY_REASONING_TOKENS,
                             answer_budget,
                             sink_node_id: node_id,
-                            starts_in_gemma_thought,
                         },
                     )
                     .await;
@@ -2298,7 +2301,7 @@ pub(crate) async fn generate_branch(
             ctx.assistant(content);
         }
 
-        fn cue(&mut self, ctx: &mut Context, no_think: bool) -> bool {
+        fn cue(&mut self, ctx: &mut Context, no_think: bool) {
             cue_generation(ctx, self.model, no_think)
         }
 
@@ -2326,7 +2329,6 @@ pub(crate) async fn generate_branch(
                     sink,
                     DeltaSink::Node(request.sink_node_id),
                     logit_bias,
-                    request.starts_in_gemma_thought,
                 )
                 .await
             })
@@ -2903,7 +2905,6 @@ async fn synthesize(
         sink,
         DeltaSink::Final,
         &[],
-        false,
     )
     .await;
     resolve_synthesis_demux(demux)
@@ -3470,14 +3471,23 @@ mod tests {
     }
 
     #[test]
-    fn gemma_reasoning_budget_is_capped_to_preserve_answer_phase() {
+    fn gemma_small_pool_detection_uses_runtime_kv_envelope() {
+        assert!(gemma_tot_small_kv_pool(true, 256));
+        assert!(gemma_tot_small_kv_pool(true, 128));
+        assert!(!gemma_tot_small_kv_pool(true, 0));
+        assert!(!gemma_tot_small_kv_pool(true, 1024));
+        assert!(!gemma_tot_small_kv_pool(false, 256));
+    }
+
+    #[test]
+    fn gemma_reasoning_budget_is_capped_only_on_small_kv_pool() {
         assert_eq!(cap_gemma_reasoning_budget(true, 2048), 192);
         assert_eq!(cap_gemma_reasoning_budget(true, 128), 128);
         assert_eq!(cap_gemma_reasoning_budget(false, 2048), 2048);
     }
 
     #[test]
-    fn gemma_tot_disables_concurrent_branch_generation_to_fit_bounded_kv_pool() {
+    fn gemma_tot_disables_concurrent_branch_generation_only_on_small_kv_pool() {
         assert!(!gemma_tot_concurrent_generation_enabled(true, true));
         assert!(!gemma_tot_concurrent_generation_enabled(true, false));
         assert!(gemma_tot_concurrent_generation_enabled(false, true));
@@ -3485,11 +3495,26 @@ mod tests {
     }
 
     #[test]
-    fn gemma_tot_uses_single_reasoning_level_to_fit_bounded_kv_pool() {
+    fn gemma_tot_uses_single_reasoning_level_only_on_small_kv_pool() {
         assert_eq!(gemma_tot_effective_depth(true, 1), 1);
         assert_eq!(gemma_tot_effective_depth(true, 2), 1);
         assert_eq!(gemma_tot_effective_depth(true, 4), 1);
         assert_eq!(gemma_tot_effective_depth(false, 2), 2);
+    }
+
+    #[test]
+    fn gemma_large_pool_keeps_full_tot_depth_concurrency_and_reasoning_budget() {
+        let is_gemma = true;
+        let large_pool_pages = 1024;
+        let small = gemma_tot_small_kv_pool(is_gemma, large_pool_pages);
+
+        assert!(
+            !small,
+            "Gemma 4 12B/default large-pool path must not inherit the 31B 256-page cap"
+        );
+        assert_eq!(gemma_tot_effective_depth(small, 2), 2);
+        assert!(gemma_tot_concurrent_generation_enabled(small, true));
+        assert_eq!(cap_gemma_reasoning_budget(small, 2048), 2048);
     }
 
     #[test]
@@ -4169,10 +4194,9 @@ mod tests {
             ctx.assistants.push(content.to_string());
         }
 
-        fn cue(&mut self, ctx: &mut FakeBranchCtx, no_think: bool) -> bool {
+        fn cue(&mut self, ctx: &mut FakeBranchCtx, no_think: bool) {
             ctx.cues += 1;
             ctx.no_think_cues.push(no_think);
-            false
         }
 
         fn generate<'a>(
