@@ -58,9 +58,10 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
     ])
     app.launchEnvironment["PIE_HOME"] = pieHome
     app.launchEnvironment["PIE_TEST_SEED_BESTOFN"] = "\(n)"
+    app.launchEnvironment["PIE_TEST_BESTOFN_INLINE_ROUND2"] = "1"
     // Pin the engine running against a closed URL so the chat surface mounts
-    // (no "no model" gate) without a live engine — the test only picks among
-    // already-seeded candidates, it never sends a round.
+    // (no "no model" gate) without a live engine — the test uses the deterministic
+    // BestOfNRoundSeed seam for the second round instead of spawning pie.
     app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = "s690-deterministic"
     app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
@@ -84,18 +85,6 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
       XCTAssertTrue(stateMarker(idx, "pickable").waitForExistence(timeout: 15),
                     "[\(appearance)] candidate \(idx) did not render as pickable; app tree: \(app.debugDescription)")
     }
-    // Bug C redisplay (the gate the wire tests missed): the seeded round carries
-    // inbound think-more guidance in its DURABLE model, so the running UI must
-    // render the read-only guidance header from it — proving the comment
-    // survives + redisplays in the actual UI, not just the request payload.
-    // The header is one a11y element (identifier + explicit label) carrying the
-    // guidance text — the user-visible redisplay proof.
-    let guidanceHeader = app.descendants(matching: .any)
-      .matching(identifier: "bestofn.inboundComment").firstMatch
-    XCTAssertTrue(guidanceHeader.waitForExistence(timeout: 10),
-                  "[\(appearance)] inbound guidance header must redisplay from durable round state; app tree: \(app.debugDescription)")
-    XCTAssertTrue(guidanceHeader.label.contains("add a risks section"),
-                  "[\(appearance)] the carried think-more guidance must be shown; got '\(guidanceHeader.label)'")
     // #708 native tap-to-select: each candidate is itself the pick target (no
     // per-option "Select" button); the WHOLE card — header AND answer body —
     // exposes a `bestofn.option.<i>` identifier and tapping anywhere on it picks.
@@ -161,65 +150,84 @@ final class S690_BestOfNSelectionGUITests: XCTestCase {
                     "[\(appearance)] sibling candidate \(idx) must stay 'pickable' for re-selection; app tree: \(app.debugDescription)")
     }
 
-    // The commit affordances — Think more / Use this — appear once a candidate
-    // is chosen. The short-lived 'Go back' button is gone (#708): re-selection
-    // is by tapping another candidate, not a dedicated control.
-    XCTAssertTrue(app.buttons["bestofn.thinkMore"].waitForExistence(timeout: 5),
-                  "[\(appearance)] 'Think more' affordance must appear after a choice")
-    XCTAssertTrue(app.buttons["bestofn.useThis"].exists,
-                  "[\(appearance)] 'Use this' affordance must appear after a choice")
+    // The level-1 refinement affordance appears once a candidate is chosen.
+    // It replaces the old free-standing Think more / Use this pair: the approved
+    // flow is exactly pick -> type refinement -> Refine -> pick final.
+    let comment = app.descendants(matching: .any)
+      .matching(identifier: "bestofn.comment").firstMatch
+    XCTAssertTrue(comment.waitForExistence(timeout: 5),
+                  "[\(appearance)] refinement field must appear after a level-1 choice")
+    let refine = app.buttons["bestofn.refine"]
+    XCTAssertTrue(refine.waitForExistence(timeout: 5),
+                  "[\(appearance)] Refine affordance must appear after a level-1 choice")
+    XCTAssertFalse(app.buttons["bestofn.useThis"].exists,
+                   "[\(appearance)] level 1 must not offer final commit; it must refine first")
     XCTAssertFalse(app.buttons["bestofn.goBack"].exists,
                    "[\(appearance)] 'Go back' must be gone — re-pick by tapping a candidate (#708)")
 
-    // #708 click-to-reselect: tap a DIFFERENT candidate → the choice moves to it,
-    // the previously-chosen returns to `pickable`, and the controls persist.
+    // #708 click-to-reselect still works before refinement: tap a DIFFERENT
+    // candidate → the choice moves to it, the previous choice returns to pickable,
+    // and the refinement draft affordance persists.
     let reselectIdx = 2
     optionRow(reselectIdx).click()
     XCTAssertTrue(stateMarker(reselectIdx, "chosen").waitForExistence(timeout: 10),
                   "[\(appearance)] re-picked candidate \(reselectIdx) must become 'chosen'; app tree: \(app.debugDescription)")
     XCTAssertTrue(stateMarker(chosenIdx, "pickable").waitForExistence(timeout: 5),
                   "[\(appearance)] previously-chosen candidate \(chosenIdx) must return to 'pickable' after re-select")
-    XCTAssertTrue(app.buttons["bestofn.useThis"].exists,
-                  "[\(appearance)] commit affordances persist across a re-selection")
+    XCTAssertTrue(comment.exists, "[\(appearance)] refinement affordance persists across a re-selection")
 
-    // #708 finalized round: committing with 'Use this' shows the chosen answer
-    // as a normal content bubble, the interactive controls disappear, and the N
-    // options stay available behind a DEFAULT-FOLDED Options disclosure.
-    app.buttons["bestofn.useThis"].click()
-    XCTAssertTrue(waitForDisappearance(app.buttons["bestofn.useThis"], timeout: 10),
-                  "[\(appearance)] 'Use this' must disappear once the round is committed")
-    XCTAssertFalse(app.buttons["bestofn.thinkMore"].exists,
-                   "[\(appearance)] 'Think more' must disappear once the round is committed")
+    let refinement = "Make it more practical."
+    comment.click()
+    comment.typeText(refinement)
+    refine.click()
 
-    // The selected answer is visible as the committed bubble.
-    let committedAnswer = "Take a day trip to a town one train ride away and wander with no fixed plan."
+    // The refinement creates a second live round seeded by the chosen candidate
+    // and durable inbound guidance, while round 1 becomes read-only history.
+    let guidanceHeader = app.descendants(matching: .any)
+      .matching(identifier: "bestofn.inboundComment").firstMatch
+    XCTAssertTrue(guidanceHeader.waitForExistence(timeout: 10),
+                  "[\(appearance)] round 2 must redisplay the submitted refinement from durable state; app tree: \(app.debugDescription)")
+    XCTAssertTrue(guidanceHeader.label.contains(refinement),
+                  "[\(appearance)] carried refinement must be shown; got '\(guidanceHeader.label)'")
+    XCTAssertFalse(app.buttons["bestofn.refine"].exists,
+                   "[\(appearance)] round 2 is final-pick only and must not offer another refinement")
+
+    for idx in 0..<n {
+      XCTAssertTrue(stateMarker(idx, "pickable").waitForExistence(timeout: 10),
+                    "[\(appearance)] round-2 candidate \(idx) did not render as pickable; app tree: \(app.debugDescription)")
+    }
+
+    // Final-pick/FIN: tapping a level-2 candidate commits it immediately as the
+    // assistant answer. No third round and no commit button is involved.
+    let finalIdx = 0
+    optionRow(finalIdx).click()
+    XCTAssertTrue(waitForDisappearance(app.buttons["bestofn.refine"], timeout: 5),
+                  "[\(appearance)] refinement control must stay gone after final pick")
+    XCTAssertFalse(app.buttons["bestofn.useThis"].exists,
+                   "[\(appearance)] final pick must not resurrect a Use this button")
+
+    let committedAnswer = "Plan a picnic in a nearby park with a short shopping list and a backup indoor spot."
     let answerVisible = app.descendants(matching: .any)
       .matching(NSPredicate(format: "value == %@ OR label == %@", committedAnswer, committedAnswer)).firstMatch
     XCTAssertTrue(answerVisible.waitForExistence(timeout: 10),
-                  "[\(appearance)] the selected answer must be visible as the committed bubble; app tree: \(app.debugDescription)")
+                  "[\(appearance)] the final selected answer must be visible as the committed bubble; app tree: \(app.debugDescription)")
 
-    // The Options disclosure remains, DEFAULT-FOLDED — the candidate rows are
-    // not rendered until the user expands it on-demand.
     let disclosure = app.descendants(matching: .any)
       .matching(identifier: "bestofn.disclosure").firstMatch
     XCTAssertTrue(disclosure.waitForExistence(timeout: 5),
                   "[\(appearance)] the Options disclosure must remain available on a finalized round")
-    XCTAssertFalse(optionRow(reselectIdx).exists,
-                   "[\(appearance)] the Options disclosure must be folded by default once the answer commits; app tree: \(app.debugDescription)")
+    XCTAssertFalse(optionRow(finalIdx).exists,
+                   "[\(appearance)] the Options disclosure must be folded by default once the final answer commits; app tree: \(app.debugDescription)")
 
-    // Expanding it reveals ALL N candidates, the chosen one highlighted and the
-    // rest read-only (not pickable).
     disclosure.click()
-    XCTAssertTrue(stateMarker(reselectIdx, "chosen").waitForExistence(timeout: 5),
-                  "[\(appearance)] the committed choice \(reselectIdx) must be highlighted when the options are expanded; app tree: \(app.debugDescription)")
+    XCTAssertTrue(stateMarker(finalIdx, "chosen").waitForExistence(timeout: 5),
+                  "[\(appearance)] the final choice \(finalIdx) must be highlighted when options expand; app tree: \(app.debugDescription)")
     for idx in 0..<n {
       XCTAssertTrue(optionRow(idx).waitForExistence(timeout: 5),
-                    "[\(appearance)] all \(n) candidates must stay available behind the Options disclosure; candidate \(idx) missing; app tree: \(app.debugDescription)")
+                    "[\(appearance)] all \(n) final candidates must stay available behind Options; candidate \(idx) missing; app tree: \(app.debugDescription)")
       XCTAssertFalse(stateMarker(idx, "pickable").exists,
                      "[\(appearance)] finalized candidate \(idx) must not be pickable")
     }
-    XCTAssertFalse(app.buttons["bestofn.useThis"].exists,
-                   "[\(appearance)] expanding finalized options must not resurrect the commit controls")
   }
 
   /// Poll until an element no longer exists (XCUITest has no built-in

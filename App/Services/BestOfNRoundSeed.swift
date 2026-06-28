@@ -22,6 +22,7 @@ import SwiftData
 @available(macOS 14, *)
 enum BestOfNRoundSeed {
   static let envVar = "PIE_TEST_SEED_BESTOFN"
+  static let inlineSecondRoundEnvVar = "PIE_TEST_BESTOFN_INLINE_ROUND2"
 
   /// Stable title so the test can open the seeded chat by a fixed row.
   static let chatTitle = "Best of N Round"
@@ -48,6 +49,18 @@ enum BestOfNRoundSeed {
     "Maximizes novelty by changing the setting entirely; best when they want an adventure.",
   ]
 
+  static let refinedCandidateTexts = [
+    "Plan a picnic in a nearby park with a short shopping list and a backup indoor spot.",
+    "Cook a simple new recipe, invite one friend, and keep the cleanup small.",
+    "Take one train ride, pick a cafe near the station, and return before dinner.",
+  ]
+
+  static let refinedCandidateReasonings = [
+    "Keeps the chosen outdoor direction, but makes logistics concrete and low risk.",
+    "Practical and social, but it shifts away from the original outdoor choice.",
+    "Still adventurous, with clearer bounds so the afternoon does not sprawl.",
+  ]
+
   /// Insert the seeded round when requested and the store is empty. `N` is read
   /// from the env value but clamped to the canned-text count.
   @MainActor
@@ -68,7 +81,7 @@ enum BestOfNRoundSeed {
     let user = Message(role: "user", content: prompt, ts: anchor.addingTimeInterval(1))
     chat.messages.append(user)
 
-    let (totData, roundData) = buildRound(n: n)
+    let (totData, roundData) = buildRound(n: n, level: 1, inboundComment: nil)
     let assistant = Message(
       role: "assistant",
       content: "",  // empty → liveBestOfNRoundID picks this as the interactive round
@@ -90,30 +103,44 @@ enum BestOfNRoundSeed {
   /// and the round's candidate ids are the SAME strings, so `pickableIDs`
   /// lines up with the rendered nodes.
   @MainActor
-  static func buildRound(n: Int) -> (Data?, Data?) {
+  static func buildRound(n: Int, level: Int, inboundComment: String?) -> (Data?, Data?) {
+    let texts = level >= 2 ? refinedCandidateTexts : candidateTexts
+    let reasonings = level >= 2 ? refinedCandidateReasonings : candidateReasonings
     var tree = ToTTree()
-    tree.apply(.treeStart(id: "bon-seed", model: "seed", breadth: n, depth: 1, beamWidth: 1))
+    tree.apply(.treeStart(id: "bon-seed-\(level)", model: "seed", breadth: n, depth: 1, beamWidth: 1))
     var candidates: [ToTSelectionCandidate] = []
     var kept: [String] = []
     for idx in 0..<n {
-      let id = "bon-n\(idx)"
+      let id = "bon-l\(level)-n\(idx)"
       tree.apply(.nodeComplete(ToTNode(
-        id: id, parentID: "root", depth: 1, branchIndex: idx,
-        content: candidateTexts[idx], reasoning: candidateReasonings[idx],
+        id: id, parentID: "root", depth: level, branchIndex: idx,
+        content: texts[idx], reasoning: reasonings[idx],
         score: nil, status: .ok)))
       candidates.append(ToTSelectionCandidate(
-        id: id, branchIndex: idx, snapshotName: "bon/seed/1/\(idx)"))
+        id: id, branchIndex: idx, snapshotName: "bon/seed/\(level)/\(idx)"))
       kept.append(id)
     }
-    tree.apply(.levelPruned(level: 1, kept: kept))
-    tree.apply(.awaitingSelection(level: 1, candidates: candidates))
+    tree.apply(.levelPruned(level: level, kept: kept))
+    tree.apply(.awaitingSelection(level: level, candidates: candidates))
 
-    // Bug C: seed the inbound think-more guidance so the seated GUI test can
-    // assert the read-only redisplay header renders from DURABLE round state
-    // (the redisplay half of the fix, proven in the running UI).
-    let round = BestOfNRound(level: 1, candidates: candidates, chosenID: nil,
-                             inboundComment: seededInboundComment)
+    let round = BestOfNRound(level: level, candidates: candidates, chosenID: nil,
+                             inboundComment: inboundComment)
     return (try? JSONEncoder().encode(tree), try? JSONEncoder().encode(round))
+  }
+
+  static var shouldInlineSecondRoundForUITest: Bool {
+    ProcessInfo.processInfo.environment[inlineSecondRoundEnvVar] == "1"
+  }
+
+  @MainActor
+  static func appendSecondRound(after message: Message, in chat: Chat, inboundComment: String?) {
+    let n = min(3, refinedCandidateTexts.count)
+    let (totData, roundData) = buildRound(n: n, level: 2, inboundComment: inboundComment)
+    let assistant = Message(
+      role: "assistant", content: "", ts: message.ts.addingTimeInterval(1),
+      tot: totData, bestOfN: roundData)
+    chat.messages.append(assistant)
+    chat.updatedAt = assistant.ts
   }
 
   /// The think-more guidance baked into the seeded round so S690 can assert the

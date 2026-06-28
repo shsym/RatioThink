@@ -66,6 +66,11 @@ struct MessageBubble: View {
   /// the typed comment vanished before the user clicked "Think more". When nil
   /// (previews / non-live rows) the local `@State` fallback below is used.
   var bestOfNCommentDraft: Binding<String>? = nil
+  /// True for the live Best-of-N round, or when no live round exists, the latest
+  /// finalized round. Older read-only rounds still render and highlight their
+  /// chosen candidate, but use scoped accessibility identifiers so generic
+  /// Best-of-N actions target the current round instead of stale history.
+  var bestOfNUsesPrimaryAccessibilityIDs = true
 
   @State private var isEditing = false
   @State private var editText = ""
@@ -137,14 +142,12 @@ struct MessageBubble: View {
                 selection: BestOfNSelectionContext(
                   pickableIDs: isLive ? Set(round.candidates.map(\.id)) : [],
                   chosenID: round.chosenID,
+                  roundLevel: round.level,
                   isInteractive: isLive,
-                  onPick: { id in onBestOfN?(.pick(id)) }))
-              // Think-more / Use-this appear once a candidate is chosen, before
-              // the round commits an answer, on the live round only. Re-picking
-              // a different candidate keeps the controls (the choice persists).
-              if round.hasChoice, message.content.isEmpty, isLive {
-                bestOfNControls
-              }
+                  usesPrimaryAccessibilityIDs: bestOfNUsesPrimaryAccessibilityIDs,
+                  refinementDraft: round.level == 1 ? bestOfNComment : nil,
+                  onPick: { id in onBestOfN?(.pick(id)) },
+                  onRefine: { comment in onBestOfN?(.thinkMore(comment)) }))
             } else {
               TreeSearchSection(tree: tot, answerStarted: !message.content.isEmpty)
             }
@@ -218,43 +221,6 @@ struct MessageBubble: View {
         Spacer()
       }
     }
-  }
-
-  /// Think-more / Use-this controls under a chosen Best-of-N candidate (#690).
-  /// "Think more" starts the next round expanding from the pick; "Use this"
-  /// commits the chosen candidate as the final answer (not editable in v1). To
-  /// change the pick, tap a different candidate row directly — re-selection is
-  /// free since every candidate snapshot is alive until think-more / use-this
-  /// (#708 click-to-reselect, replacing the short-lived Go back button).
-  private var bestOfNControls: some View {
-    VStack(alignment: .leading, spacing: 6) {
-      TextField("Optional guidance for the next round", text: bestOfNComment, axis: .vertical)
-        .textFieldStyle(.roundedBorder)
-        .font(.caption)
-        .lineLimit(1...3)
-        .accessibilityIdentifier("bestofn.comment")
-      HStack(spacing: 8) {
-        Button { onBestOfN?(.thinkMore(normalizedBestOfNComment)) } label: {
-          Label("Think more", systemImage: "arrow.down.circle")
-        }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-        .accessibilityIdentifier("bestofn.thinkMore")
-        Button { onBestOfN?(.stop) } label: {
-          Label("Use this", systemImage: "checkmark.circle")
-        }
-        .buttonStyle(.borderedProminent)
-        .controlSize(.small)
-        .accessibilityIdentifier("bestofn.useThis")
-      }
-    }
-    .font(.caption)
-  }
-
-  /// Empty/whitespace guidance preserves the exact #690 think-more wire.
-  private var normalizedBestOfNComment: String? {
-    let trimmed = bestOfNComment.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
-    return trimmed.isEmpty ? nil : trimmed
   }
 
   // MARK: - inline edit (#624)

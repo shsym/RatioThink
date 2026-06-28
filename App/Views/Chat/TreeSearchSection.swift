@@ -14,17 +14,38 @@ struct BestOfNSelectionContext {
   var pickableIDs: Set<String>
   /// The chosen node id, or nil while awaiting a choice.
   var chosenID: String?
+  /// Best-of-N round level. The approved landing/app flow is exactly two rounds:
+  /// level 1 pick + refinement starts level 2; level 2 pick commits/FIN.
+  var roundLevel: Int = 1
   /// Interactive iff this is the LIVE round (the one `TranscriptView` wires
   /// `onBestOfN` for). Live: every candidate stays pickable so the user can
-  /// freely re-pick by tapping another (all snapshots are alive until
-  /// think-more/use-this); unpicked rows stay full-strength + readable.
+  /// freely re-pick by tapping another (all snapshots are alive until the level-1
+  /// refinement or the level-2 final pick); unpicked rows stay full-strength + readable.
   /// Read-only (false): no pickable rows, no "pick one" state — just highlight
   /// which candidate was chosen and dim the rest (#708).
   var isInteractive: Bool
+  /// Whether this round owns the primary, generic Best-of-N accessibility ids
+  /// (`bestofn.disclosure`, `bestofn.option.<i>`, `bestofn.candidate.<i>.*`).
+  /// Only the current/live-or-latest round gets those ids; older read-only
+  /// rounds keep scoped ids so XCUITest and assistive tech do not hit a stale
+  /// round when a two-round Best-of-N transcript is present.
+  var usesPrimaryAccessibilityIDs: Bool = true
+  /// Draft refinement text for the level-1 live round. Nil hides the refinement
+  /// composer (read-only rounds and the level-2 final-pick round).
+  var refinementDraft: Binding<String>? = nil
   /// Invoked with a candidate's node id when the user picks (or re-picks) it.
   var onPick: (String) -> Void
+  /// Invoked with trimmed refinement text to start round 2 from the chosen level-1
+  /// candidate through the existing Best-of-N resume(selectedComment) path.
+  var onRefine: (String) -> Void = { _ in }
 
   var hasChoice: Bool { chosenID != nil }
+  var showsRefinement: Bool { isInteractive && roundLevel == 1 && hasChoice && refinementDraft != nil }
+
+  func accessibilityID(_ primaryID: String, scopedName: String) -> String {
+    if usesPrimaryAccessibilityIDs { return primaryID }
+    return "bestofn.round.\(roundLevel).\(scopedName)"
+  }
 }
 
 /// Collapsible "Tree search" disclosure for a tree-of-thought turn (#413)
@@ -97,7 +118,8 @@ struct TreeSearchSection: View {
       .help(isExpanded ? "Hide the tree-of-thought search" : "Show the tree-of-thought search")
       // Stable handle for the seated GUI test to (re-)expand a Best-of-N round
       // — e.g. a finalized read-only round, which auto-folds once committed.
-      .modifier(OptionalAccessibilityIdentifier(id: isBestOfN ? "bestofn.disclosure" : nil))
+      .modifier(OptionalAccessibilityIdentifier(
+        id: selection?.accessibilityID("bestofn.disclosure", scopedName: "disclosure")))
 
       if isExpanded {
         VStack(alignment: .leading, spacing: 4) {
@@ -112,6 +134,9 @@ struct TreeSearchSection: View {
           Color.secondary.opacity(0.08),
           in: RoundedRectangle(cornerRadius: 10, style: .continuous)
         )
+        if let selection, selection.showsRefinement {
+          BestOfNRefinementControls(selection: selection)
+        }
       }
     }
     .frame(maxWidth: .infinity, alignment: .leading)
@@ -159,6 +184,35 @@ struct TreeSearchSection: View {
 /// per-node `ReasoningDisclosure` (#329 style) plus the answer — and, for a
 /// node that reasoned but never answered, an honest "incomplete" note over
 /// whatever partial reasoning exists rather than broken tag-soup (#434/#437).
+private struct BestOfNRefinementControls: View {
+  let selection: BestOfNSelectionContext
+
+  private var draft: Binding<String> { selection.refinementDraft ?? .constant("") }
+  private var trimmed: String { draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      TextField("Refine this direction…", text: draft, axis: .vertical)
+        .textFieldStyle(.roundedBorder)
+        .font(.caption)
+        .lineLimit(1...3)
+        .accessibilityIdentifier("bestofn.comment")
+      Button {
+        selection.onRefine(trimmed)
+      } label: {
+        Label("Refine", systemImage: "arrow.down.circle")
+      }
+      .buttonStyle(.borderedProminent)
+      .controlSize(.small)
+      .disabled(trimmed.isEmpty)
+      .accessibilityIdentifier("bestofn.refine")
+      .help("Generate a second round from the chosen answer and this refinement")
+    }
+    .font(.caption)
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
 private struct ToTNodeRow: View {
   let tree: ToTTree
   let node: ToTTree.Node
@@ -245,10 +299,10 @@ private struct ToTNodeRow: View {
           .buttonStyle(.plain)
           .frame(maxWidth: .infinity, alignment: .leading)
           .help("Pick this answer")
-          .accessibilityIdentifier("bestofn.option.\(node.branchIndex ?? 0)")
+          .accessibilityIdentifier(optionAccessibilityID)
         } else {
           flatCard(answerSelectable: true)
-            .accessibilityIdentifier("bestofn.option.\(node.branchIndex ?? 0)")
+            .accessibilityIdentifier(optionAccessibilityID)
         }
       }
       // Chosen candidate: accent-tinted card + border (adaptive semantic color,
@@ -283,7 +337,7 @@ private struct ToTNodeRow: View {
         )
         .padding(.leading, 8)
         // Stable handle for the seated GUI test (#708).
-        .accessibilityIdentifier("bestofn.candidate.\(node.branchIndex ?? 0).thinking")
+        .accessibilityIdentifier(candidateAccessibilityID("thinking"))
       }
     }
     .opacity(isDimmed ? 0.5 : 1.0)
@@ -298,8 +352,22 @@ private struct ToTNodeRow: View {
       Color.clear
         .frame(width: 1, height: 1)
         .accessibilityElement()
-        .accessibilityIdentifier("bestofn.candidate.\(node.branchIndex ?? 0).\(bestOfNRowState)")
+        .accessibilityIdentifier(candidateAccessibilityID(bestOfNRowState))
     }
+  }
+
+  private var candidateIndex: Int { node.branchIndex ?? 0 }
+  private var optionAccessibilityID: String {
+    selection?.accessibilityID(
+      "bestofn.option.\(candidateIndex)",
+      scopedName: "option.\(candidateIndex)")
+      ?? "bestofn.option.\(candidateIndex)"
+  }
+  private func candidateAccessibilityID(_ state: String) -> String {
+    selection?.accessibilityID(
+      "bestofn.candidate.\(candidateIndex).\(state)",
+      scopedName: "candidate.\(candidateIndex).\(state)")
+      ?? "bestofn.candidate.\(candidateIndex).\(state)"
   }
 
   /// The flat candidate card body: option glyph + the answer, always visible
@@ -425,7 +493,7 @@ private struct ToTNodeRow: View {
           .frame(maxWidth: .infinity, alignment: .leading)
           .help(rowActionHelp)
           .modifier(OptionalAccessibilityIdentifier(
-            id: isBestOfN ? "bestofn.option.\(node.branchIndex ?? 0)" : nil))
+            id: isBestOfN ? optionAccessibilityID : nil))
       } else {
         headerRow
       }

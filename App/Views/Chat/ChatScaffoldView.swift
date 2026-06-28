@@ -1020,10 +1020,19 @@ struct ChatScaffoldView: View {
     case let .pick(id):
       // Records or re-records the choice (#708 click-to-reselect): tapping a
       // different candidate just overwrites chosenID. No snapshot churn — every
-      // candidate stays alive until think-more / stop.
+      // candidate stays alive until the level-1 refinement or the level-2 final pick.
       round.chosenID = id
       message.bestOfN = try? JSONEncoder().encode(round)
-      try? modelContext.save()
+      if round.level >= 2 {
+        guard let text = bestOfNCandidateText(message: message, nodeID: id) else { return }
+        let snapshots = round.candidates.map(\.snapshotName)
+        Self.performBestOfNStop(
+          text: text, on: message, save: saveContext, report: reportSave,
+          releaseSnapshots: { self.releaseBestOfNSnapshots(snapshots, in: chat) })
+        bestOfNCommentDrafts[messageID] = nil
+      } else {
+        try? modelContext.save()
+      }
 
     case let .thinkMore(selectedComment):
       guard let chosen = round.chosen,
@@ -1043,7 +1052,11 @@ struct ChatScaffoldView: View {
       // the picked answer into `messages` would double it.) Then commit the
       // picked text as this round's final answer so it locks into read-only
       // history exactly like `.stop` and drops out of live-candidacy.
-      sendBestOfNRound(for: chat, resume: resume)
+      if BestOfNRoundSeed.shouldInlineSecondRoundForUITest {
+        BestOfNRoundSeed.appendSecondRound(after: message, in: chat, inboundComment: selectedComment)
+      } else {
+        sendBestOfNRound(for: chat, resume: resume)
+      }
       _ = Self.commitBestOfNAnswer(pickedText, on: message, save: saveContext, report: reportSave)
       // #736: the guidance draft has been consumed into the resume; drop it so
       // it can't leak into a future round on this (now-committed) message id.

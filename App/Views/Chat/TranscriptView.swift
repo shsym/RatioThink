@@ -52,6 +52,8 @@ struct TranscriptView: View {
 
   var body: some View {
     let snapshot = Self.projectedSnapshot(chat.messages)
+    let primaryBestOfNID = bestOfNLiveID
+      ?? snapshot.items.last(where: { $0.bestOfN != nil })?.id
     // #513 review v1 F2: retry-anchor validity in ONE pass over the
     // already-sorted snapshot rows — a per-row `ChatRetryPlan.plan` call
     // re-sorted the transcript for every row (O(n² log n) on the render
@@ -84,7 +86,8 @@ struct TranscriptView: View {
                             ? nil
                             : Binding(
                                 get: { bestOfNCommentDrafts.wrappedValue[item.id] ?? "" },
-                                set: { bestOfNCommentDrafts.wrappedValue[item.id] = $0 }))
+                                set: { bestOfNCommentDrafts.wrappedValue[item.id] = $0 }),
+                          bestOfNUsesPrimaryAccessibilityIDs: item.id == primaryBestOfNID)
               .id(item.id)
           }
           // Sentinel row so `scrollTo(.bottomSentinel)` lands at the

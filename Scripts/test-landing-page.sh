@@ -186,7 +186,6 @@ def validate_html(html: str) -> list[str]:
         failures.append("landing page must not mention retired Repeat Boost")
     if "Tree of Thought (experimental)" not in html:
         failures.append("landing page must label Tree of Thought as experimental")
-
     if "message.generationPerformance" in html:
         failures.append("landing mock should not keep Repeat Boost generation performance hooks after removing that scene")
     if "generation-performance" in html:

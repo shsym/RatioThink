@@ -205,6 +205,11 @@
   .bubble.json .k{color:var(--accent-dark)}
   .bubble.json .s{color:var(--kept)}
   .bubble.json .n{color:var(--star)}
+  .bonbox{width:100%;background:var(--think-bg);border-radius:10px;padding:9px 11px;display:flex;flex-direction:column;gap:6px}
+  .bonopt{display:flex;align-items:flex-start;gap:7px;font-family:var(--mono);font-size:11.5px;color:var(--ink-soft);opacity:0;transform:translateY(4px);transition:opacity .25s ease,transform .25s ease,padding .15s,border-color .15s,background .15s}
+  .bonopt.in{opacity:1;transform:none}.bonopt.chosen{padding:6px;border:1px solid rgba(var(--accent-rgb),.45);border-radius:8px;background:rgba(var(--accent-rgb),.10);color:var(--ink)}
+  .bonopt .pick{width:14px;flex:none;color:var(--ink-muted);font-weight:700}.bonopt.chosen .pick{color:var(--accent)}
+  .boncomment{border:1px solid var(--border-strong);border-radius:8px;background:var(--bg);padding:6px 8px;font-size:12px;color:var(--ink-soft);max-width:80%}
 
   @media (max-width:680px){
     .grid{grid-template-columns:1fr}
@@ -271,6 +276,9 @@
           <div class="mrow" id="menuTot">
             Tree of Thought (experimental)<span class="check">✓</span>
           </div>
+          <div class="mrow" id="menuBon">
+            Best of N<span class="check">✓</span>
+          </div>
         </div>
       </div>
 
@@ -286,6 +294,7 @@
     <div class="dots" id="dots" role="group" aria-label="Choose a demo">
       <button type="button" class="dot" data-scene="0" aria-label="Show the Tree of Thought demo"></button>
       <button type="button" class="dot" data-scene="1" aria-label="Show the JSON Think demo"></button>
+      <button type="button" class="dot" data-scene="2" aria-label="Show the Best of N demo"></button>
     </div>
     <p class="demo-note">A simplified illustration of how it works.</p>
   </div>
@@ -305,6 +314,11 @@
         <div class="ct"><h3>JSON Think</h3></div>
         <p>Need structured output? Ask a chat model for JSON and it tends to wrap or ramble.
            JSON Think constrains decoding to a JSON grammar — so the answer is always parseable.</p>
+      </div>
+      <div class="card">
+        <div class="ct"><h3>Best of N</h3></div>
+        <p>Want a better first draft? Best of N gives you three answers, lets you pick one,
+           then refines it once with your comment.</p>
       </div>
     </div>
   </section>
@@ -373,6 +387,14 @@
       prompt: 'Extract the person\'s name, age, and city from: "Maya, 31, lives in Lisbon." Return JSON, and explain your reasoning.',
       chatAnswer: 'Sure! Breaking it down — the name is Maya, the age is 31, and the city is Lisbon. As JSON:\n{\n  "name": "Maya",\n  "age": 31,\n  "city": "Lisbon"\n}\nThat\'s the three fields as key–value pairs.',
       answer: '{<span class="k">"name"</span>: <span class="s">"Maya"</span>, <span class="k">"age"</span>: <span class="n">31</span>, <span class="k">"city"</span>: <span class="s">"Lisbon"</span>}'
+    },
+    bon: {
+      profile: 'Best of N',
+      prompt: 'Suggest a weekend project.',
+      first: ['Build a small herb planter.', 'Make a personal budget template.', 'Organize old photos into albums.'],
+      comment: 'Make it more practical.',
+      second: ['Build a windowsill herb planter with a short shopping list.', 'Make a one-page budget template for next month.', 'Sort 30 favorite photos into one shared album.'],
+      answer: 'Build a windowsill herb planter with a short shopping list.'
     }
   };
 
@@ -387,6 +409,7 @@
   var menuTot    = document.getElementById('menuTot');
   var menuChat   = document.getElementById('menuChat');
   var menuJson   = document.getElementById('menuJson');
+  var menuBon    = document.getElementById('menuBon');
   var captionEl  = document.getElementById('caption');
   var dotEls     = Array.prototype.slice.call(document.querySelectorAll('#dots .dot'));
 
@@ -425,6 +448,7 @@
     menuTot.classList.toggle('sel', which==='tot');
     menuChat.classList.toggle('sel', which==='chat');
     menuJson.classList.toggle('sel', which==='json');
+    menuBon.classList.toggle('sel', which==='bon');
   }
 
   function userRow(text){
@@ -641,11 +665,63 @@
     transcript.appendChild(a2);
   }
 
+  // ============== Scene 2: Best of N — pick, comment, refine once ==============
+  function bonOption(text){ return el('<div class="bonopt"><span class="pick">○</span><span>'+text+'</span></div>'); }
+  async function showBonOptions(box, items, myGen){
+    var rows = items.map(function(t){ var r = bonOption(t); box.appendChild(r); return r; });
+    for (var i=0;i<rows.length;i++){ rows[i].classList.add('in'); await sleep(240, myGen); }
+    return rows;
+  }
+  function chooseBon(row){ row.classList.add('chosen'); row.querySelector('.pick').textContent='✓'; }
+  async function sceneBestOfN(myGen){
+    var d = SCENARIO.bon;
+    setProfile(d.profile, 'bon');
+    setCaption('Best of N generates three answers. Pick one, add a short comment, then pick the final answer.');
+    await sleep(650, myGen);
+    await typeComposer(d.prompt, myGen);
+    userRow(d.prompt); resetComposer();
+    await sleep(260, myGen);
+    var row = el('<div class="row assistant"><div class="acol"><div class="tsearch"><div class="tshead"><span>Options</span> <span class="status" id="bstat">generating…</span> <span class="tchev">▾</span></div><div class="bonbox" id="bon1"></div></div></div></div>');
+    transcript.appendChild(row);
+    var first = await showBonOptions(row.querySelector('#bon1'), d.first, myGen);
+    row.querySelector('#bstat').textContent = 'pick one';
+    await sleep(520, myGen);
+    chooseBon(first[0]);
+    row.querySelector('#bstat').textContent = 'chosen';
+    await sleep(450, myGen);
+    var comment = el('<div class="boncomment">'+d.comment+'</div>');
+    row.querySelector('.acol').appendChild(comment);
+    setCaption('The comment seeds round two from the answer you picked.');
+    await sleep(850, myGen);
+    var row2 = el('<div class="row assistant"><div class="acol"><div class="boncomment">'+d.comment+'</div><div class="tsearch"><div class="tshead"><span>Options</span> <span class="status" id="bstat2">generating…</span> <span class="tchev">▾</span></div><div class="bonbox" id="bon2"></div></div></div></div>');
+    transcript.appendChild(row2);
+    var second = await showBonOptions(row2.querySelector('#bon2'), d.second, myGen);
+    row2.querySelector('#bstat2').textContent = 'pick one';
+    await sleep(520, myGen);
+    chooseBon(second[0]);
+    row2.querySelector('#bstat2').textContent = 'chosen';
+    await sleep(600, myGen);
+    var ans = el('<div class="bubble assistant"></div>');
+    row2.querySelector('.acol').appendChild(ans);
+    await streamWords(ans, d.answer, 35, myGen);
+    await sleep(1700, myGen);
+  }
+  function stillBon(){
+    var d = SCENARIO.bon;
+    clear(); setProfile(d.profile, 'bon');
+    userRow(d.prompt);
+    var rows = d.second.map(function(t, i){ return '<div class="bonopt in'+(i===0?' chosen':'')+'"><span class="pick">'+(i===0?'✓':'○')+'</span><span>'+t+'</span></div>'; }).join('');
+    var col = el('<div class="row assistant"><div class="acol"><div class="boncomment">'+d.comment+'</div><div class="tsearch"><div class="tshead"><span>Options</span> <span class="status">chosen</span> <span class="tchev">▾</span></div><div class="bonbox">'+rows+'</div></div><div class="bubble assistant">'+d.answer+'</div></div></div>');
+    transcript.appendChild(col);
+  }
+
   var SCENES = [
     { run: sceneTreeOfThought, still: stillTot,
       pausedCaption: 'Animation paused (reduced motion). Tree of Thought (experimental) explores the options and picks the best.' },
     { run: sceneJsonThink, still: stillJson,
-      pausedCaption: 'Animation paused (reduced motion). Chat buries the JSON in reasoning prose; JSON Think returns one bare, parseable object.' }
+      pausedCaption: 'Animation paused (reduced motion). Chat buries the JSON in reasoning prose; JSON Think returns one bare, parseable object.' },
+    { run: sceneBestOfN, still: stillBon,
+      pausedCaption: 'Animation paused (reduced motion). Best of N lets you pick, comment, refine once, then pick the final answer.' }
   ];
 
   // Error fallback: a clean, honest static frame (the lead Tree of Thought scene).
