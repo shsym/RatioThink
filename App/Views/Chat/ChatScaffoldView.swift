@@ -112,11 +112,10 @@ struct ChatScaffoldView: View {
   /// persistence "Couldn't save" banner. Cleared when the engine status
   /// changes to a non-failed state.
   @State private var engineActionError: String?
-  /// #736: Best-of-N think-more guidance drafts, keyed by round message id.
+  /// #736: Best-of-N refinement drafts, keyed by round message id.
   /// Owned here (a `.id(chatID)`-stable scaffold, outside the transcript's
-  /// LazyVStack) so a typed comment survives the row teardown that was
-  /// discarding the bubble's local `@State` before "Think more" fired. Cleared
-  /// when the round commits (`handleBestOfN` think-more / use-this).
+  /// LazyVStack) so a typed comment survives row teardown. Cleared when the
+  /// refinement is submitted or the final pick commits.
   @State private var bestOfNCommentDrafts: [UUID: String] = [:]
   /// #496: an engine action (Load / start / Unload) refused because the
   /// background Helper isn't healthy. Surfaced as an inline, helper-framed
@@ -566,15 +565,15 @@ struct ChatScaffoldView: View {
           onEditUserTurn: sendCoordinator.isInFlight(chatID)
             ? nil
             : { messageID, newText in forkAndResend(messageID: messageID, newContent: newText, in: chat) },
-          // #690: Best-of-N pick / think-more / stop, withheld while streaming
+          // #690: Best-of-N pick/refine/final-pick, withheld while streaming
           // (same as retry/edit), and live only for the latest uncommitted round.
           onBestOfN: sendCoordinator.isInFlight(chatID)
             ? nil
             : { messageID, action in handleBestOfN(messageID: messageID, action: action, in: chat) },
           bestOfNLiveID: sendCoordinator.isInFlight(chatID) ? nil : liveBestOfNRoundID(in: chat),
-          // #736: hoist the think-more guidance drafts here (stable scaffold
-          // state) so a typed comment survives the LazyVStack row rebuilds that
-          // were discarding the bubble's local @State mid-typing.
+          // #736: hoist the refinement drafts here (stable scaffold state) so a
+          // typed comment survives LazyVStack row rebuilds that were discarding
+          // the bubble's local @State mid-typing.
           bestOfNCommentDrafts: $bestOfNCommentDrafts
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1001,16 +1000,15 @@ struct ChatScaffoldView: View {
     return tree.nodes.first { $0.id == nodeID }?.content
   }
 
-  /// Apply a Best-of-N pick / think-more / stop (#690).
-  ///  - `.pick` records (or re-records) the chosen candidate on the round —
-  ///    highlight it; re-picking a different id just overwrites the choice
-  ///    (#708, all candidate snapshots stay alive until think-more / stop).
-  ///  - `.thinkMore` commits the chosen candidate as this round's final answer
-  ///    (locking it into read-only history, same as `.stop`) AND spawns the next
-  ///    round expanding from the pick (warm-resume from its snapshot, falling
-  ///    back to re-prefill server-side on a miss). Commit-and-continue.
-  ///  - `.stop` commits the chosen candidate as the round's final answer.
-  ///    Commit-and-stop. The only difference from think-more is the next round.
+  /// Apply the two-round Best-of-N flow (#690).
+  ///  - Level-1 `.pick` records (or re-records) the chosen candidate so the
+  ///    refinement field can seed round 2; re-picking just overwrites the choice
+  ///    (#708, all candidate snapshots stay alive until refinement submit).
+  ///  - `.thinkMore` submits the level-1 refinement comment, dispatches round 2
+  ///    from the chosen candidate via `resume(selectedComment)`, then commits the
+  ///    level-1 pick into read-only history.
+  ///  - Level-2 `.pick` commits the chosen candidate as the final answer and
+  ///    releases the candidate snapshots only after the save is durable.
   private func handleBestOfN(messageID: UUID, action: BestOfNAction, in chat: Chat) {
     guard let message = chat.messages.first(where: { $0.id == messageID }),
           let roundData = message.bestOfN,
@@ -1024,7 +1022,10 @@ struct ChatScaffoldView: View {
       round.chosenID = id
       message.bestOfN = try? JSONEncoder().encode(round)
       if round.level >= 2 {
-        guard let text = bestOfNCandidateText(message: message, nodeID: id) else { return }
+        guard let text = bestOfNCandidateText(message: message, nodeID: id) else {
+          reportSave(Self.missingBestOfNCandidateTextError(nodeID: id, messageID: messageID))
+          return
+        }
         let snapshots = round.candidates.map(\.snapshotName)
         Self.performBestOfNStop(
           text: text, on: message, save: saveContext, report: reportSave,
@@ -1050,8 +1051,8 @@ struct ChatScaffoldView: View {
       // picked answer stays out of the resume `messages`. (The inferlet re-fills
       // the base from `messages` + `picked_text` on a snapshot miss; committing
       // the picked answer into `messages` would double it.) Then commit the
-      // picked text as this round's final answer so it locks into read-only
-      // history exactly like `.stop` and drops out of live-candidacy.
+      // picked text so the level-1 round locks into read-only history and drops
+      // out of live-candidacy while the level-2 round becomes interactive.
       if BestOfNRoundSeed.shouldInlineSecondRoundForUITest {
         BestOfNRoundSeed.appendSecondRound(after: message, in: chat, inboundComment: selectedComment)
       } else {
@@ -1061,29 +1062,22 @@ struct ChatScaffoldView: View {
       // #736: the guidance draft has been consumed into the resume; drop it so
       // it can't leak into a future round on this (now-committed) message id.
       bestOfNCommentDrafts[messageID] = nil
-
-    case .stop:
-      guard let chosen = round.chosen,
-            let text = bestOfNCandidateText(message: message, nodeID: chosen.id)
-      else { return }
-      // Commit the chosen candidate as the round's final answer (not editable
-      // in v1), then release the candidate KV snapshots ONLY once the commit is
-      // durable — discarding recovery state before the answer is persisted could
-      // lose the selected answer on a reload after a failed save (#690).
-      let snapshots = round.candidates.map(\.snapshotName)
-      Self.performBestOfNStop(
-        text: text, on: message, save: saveContext, report: reportSave,
-        releaseSnapshots: { self.releaseBestOfNSnapshots(snapshots, in: chat) })
-      // #736: round committed (no next round) — drop any guidance draft.
-      bestOfNCommentDrafts[messageID] = nil
     }
   }
 
   /// The current model-context save, as a throwing closure (DI seam for tests).
   private func saveContext() throws { try modelContext.save() }
-  /// Report a Best-of-N commit save failure to the shared status surface.
+  /// Report a Best-of-N commit/save failure to the shared status surface.
   private func reportSave(_ error: Error) {
     persistenceStatus.report(error, context: "ChatScaffoldView.handleBestOfN.commit")
+  }
+
+  private static func missingBestOfNCandidateTextError(nodeID: String, messageID: UUID) -> NSError {
+    NSError(
+      domain: "ChatScaffoldView.BestOfN",
+      code: 1,
+      userInfo: [NSLocalizedDescriptionKey:
+        "Best-of-N final pick could not find candidate text for node \(nodeID) on message \(messageID)."])
   }
 
   /// Commit a Best-of-N round's chosen answer to `message.content` and persist.
@@ -1092,8 +1086,9 @@ struct ChatScaffoldView: View {
   /// not swallowed: the liveness rule keys on `content.isEmpty`, so a
   /// silently-failed save would persist the committed round empty and a store
   /// re-read would treat it as still live (reopening the pick-then-abandon hole).
-  /// Shared by `.thinkMore` and `.stop` so the two commit paths cannot diverge;
-  /// `save`/`report` are injected so the failure path is unit-testable.
+  /// Shared by level-1 refinement and level-2 final pick so the commit paths
+  /// cannot diverge; `save`/`report` are injected so the failure path is
+  /// unit-testable.
   @discardableResult
   static func commitBestOfNAnswer(
     _ text: String, on message: Message,
@@ -1109,9 +1104,9 @@ struct ChatScaffoldView: View {
     }
   }
 
-  /// Commit a `.stop` (Use this) round, then release its candidate snapshots
-  /// ONLY if the commit was durable. Keeps the release strictly gated on a
-  /// successful save so a rejected commit never discards the recovery state.
+  /// Commit the level-2 final pick, then release its candidate snapshots ONLY if
+  /// the commit was durable. Keeps the release strictly gated on a successful
+  /// save so a rejected commit never discards the recovery state.
   static func performBestOfNStop(
     text: String, on message: Message,
     save: () throws -> Void, report: (Error) -> Void, releaseSnapshots: () -> Void
@@ -1129,18 +1124,19 @@ struct ChatScaffoldView: View {
   }
 
   /// Abandon cleanup (#690): when the user starts a NEW turn instead of
-  /// picking/think-more, every uncommitted Best-of-N round in the chat is
-  /// orphaned — its candidate snapshots will never be picked or stopped. Free
-  /// them. A round is uncommitted when its message has no committed content but
-  /// carries a decoded pick set; releasing already-freed names is a harmless
+  /// completing the pick/refine/final-pick flow, every uncommitted Best-of-N
+  /// round in the chat is orphaned — its candidate snapshots will never be
+  /// used. Free them. A round is uncommitted when its message has no committed
+  /// content but carries a decoded pick set; releasing already-freed names is a harmless
   /// no-op (the server reports them absent), so this is safe to run each turn.
   private func releaseAbandonedBestOfNRounds(in chat: Chat) {
     let names = BestOfNRound.uncommittedCandidateSnapshotNames(in: chat.messages)
     releaseBestOfNSnapshots(names, in: chat)
   }
 
-  /// Send a Best-of-N think-more round expanding from the user's pick. Mirrors
-  /// the round-1 route in `sendAssistantTurn` but threads the `resume` payload.
+  /// Send Best-of-N round 2 expanding from the user's level-1 pick and
+  /// refinement comment. Mirrors the round-1 route in `sendAssistantTurn` but
+  /// threads the `resume` payload.
   private func sendBestOfNRound(for chat: Chat, resume: ChatSendController.BestOfNResume) {
     guard case .ready(let modelID) = sendGateDecision(for: chat) else { return }
     guard let bonProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),

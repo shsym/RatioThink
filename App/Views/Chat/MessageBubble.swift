@@ -24,14 +24,13 @@ import os
 /// view re-checks at click time. Markdown images never fetch from the
 /// network (`NSAttributedString(markdown:)` does not load remote bytes; the
 /// builder renders a text placeholder). Review v1 F3.
-/// A user interaction with a Best-of-N round (#690): pick (or re-pick) a
-/// candidate, then either expand from it (think-more) or commit it (stop).
-/// Re-selection is just another `.pick` with a different id (#708) — every
-/// candidate snapshot stays alive until think-more / stop.
+/// A user interaction with the two-round Best-of-N flow (#690): pick (or
+/// re-pick) a candidate, optionally submit a refinement for round 2, then pick
+/// the level-2 final answer. Re-selection is just another `.pick` with a
+/// different id (#708); snapshots stay alive until refine or final pick.
 enum BestOfNAction: Equatable {
   case pick(String)
   case thinkMore(String?)
-  case stop
 }
 
 struct MessageBubble: View {
@@ -54,16 +53,15 @@ struct MessageBubble: View {
   var maxBubbleWidth: CGFloat = 480
   /// Best-of-N (#690) interaction sink, set only for the latest, not-yet-
   /// committed interactive round (`TranscriptView` passes nil for ToT/chat
-  /// turns, reloaded history, and superseded rounds — which hides the pick +
-  /// think-more/stop controls there). `.pick` records the choice; `.thinkMore`
-  /// starts the next round; `.stop` commits the chosen candidate.
+  /// turns, reloaded history, and superseded rounds). `.pick` records or
+  /// re-records the current choice; `.thinkMore` submits the level-1 refinement
+  /// comment that seeds round 2.
   var onBestOfN: ((BestOfNAction) -> Void)? = nil
-  /// #736: the Best-of-N think-more guidance draft, hoisted to a stable
-  /// ancestor (`ChatScaffoldView`) and keyed by message id. The draft MUST NOT
-  /// live in this row's `@State`: the bubble renders inside a `LazyVStack`
-  /// whose rows SwiftUI can tear down and rebuild on relayout (a sibling round
-  /// committing, a 1 Hz status poll), discarding row `@State` mid-typing — so
-  /// the typed comment vanished before the user clicked "Think more". When nil
+  /// #736: the Best-of-N refinement draft, hoisted to a stable ancestor
+  /// (`ChatScaffoldView`) and keyed by message id. The draft MUST NOT live in
+  /// this row's `@State`: the bubble renders inside a `LazyVStack` whose rows
+  /// SwiftUI can tear down and rebuild on relayout (a sibling round committing,
+  /// a 1 Hz status poll), discarding row `@State` mid-typing. When nil
   /// (previews / non-live rows) the local `@State` fallback below is used.
   var bestOfNCommentDraft: Binding<String>? = nil
   /// True for the live Best-of-N round, or when no live round exists, the latest
@@ -127,9 +125,9 @@ struct MessageBubble: View {
               // `onBestOfN` for it (the live, uncommitted round). Historical and
               // finalized rounds render read-only: the chosen candidate stays
               // highlighted, but no pick affordance, no "pick one" state, and no
-              // think-more / use-this controls (#708 read-only history).
+              // refinement controls (#708 read-only history).
               let isLive = onBestOfN != nil
-              // #736 Bug C: the think-more guidance that spawned THIS round,
+              // #736 Bug C: the refinement comment that spawned THIS round is
               // carried in the durable round model so it survives the transition
               // and is shown on the round it produced (live or historical).
               if let guidance = round.inboundComment,
@@ -427,9 +425,9 @@ enum SafeLinkOpenURLAction {
   }
 }
 
-/// #736 Bug C — read-only header showing the think-more guidance the user typed
+/// #736 Bug C — read-only header showing the refinement comment the user typed
 /// on the previous round that produced THIS round. Reads `BestOfNRound.inboundComment`
-/// (durable, persisted), so the guidance survives the think-more transition and a
+/// (durable, persisted), so the guidance survives the round transition and a
 /// reload — replacing the prior transient `@State` that vanished on commit.
 struct BestOfNGuidanceHeader: View {
   let text: String

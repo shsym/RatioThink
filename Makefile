@@ -251,7 +251,6 @@ test-release: ## Real-tool contract tests for the notarize + preflight scripts (
 
 test-landing-page: ## Published GitHub Pages landing page copy/nav regression guard
 	Scripts/test-landing-page.sh
-	Scripts/test-landing-page-browser-e2e.js
 
 test-landing-page-browser: ## Browser e2e for the standalone docs/landing.html carousel
 	Scripts/test-landing-page-browser-e2e.js

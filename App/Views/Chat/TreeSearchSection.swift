@@ -232,8 +232,8 @@ private struct ToTNodeRow: View {
   private var hasChoice: Bool { selection?.hasChoice ?? false }
   /// An unpicked candidate in a READ-ONLY (historical/finalized) round: collapse
   /// + dim it so the chosen one stands out. On the live round nothing dims —
-  /// every candidate stays full-strength and re-pickable until think-more/use-
-  /// this (#708 click-to-reselect).
+  /// every candidate stays full-strength and re-pickable until refine or final
+  /// pick (#708 click-to-reselect).
   private var isDimmed: Bool { hasChoice && !isChosen && !isInteractive }
   /// True when tapping the WHOLE card PICKS this candidate (#708 native
   /// tap-to-select + click-to-reselect): a pickable candidate on the live round

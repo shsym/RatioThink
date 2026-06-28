@@ -142,8 +142,4 @@ enum BestOfNRoundSeed {
     chat.messages.append(assistant)
     chat.updatedAt = assistant.ts
   }
-
-  /// The think-more guidance baked into the seeded round so S690 can assert the
-  /// `bestofn.inboundComment` redisplay header (Bug C).
-  static let seededInboundComment = "Tighten the tone; add a risks section."
 }
