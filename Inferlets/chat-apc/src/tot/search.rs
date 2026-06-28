@@ -368,11 +368,6 @@ const TOT_ADAPTIVE_REASONING_TOKEN_CAP: usize = 192;
 const TOT_ADAPTIVE_RESIDENCY_HEADROOM: usize = 2;
 const TOT_ADAPTIVE_CONCURRENCY_HEADROOM: usize = 3;
 
-#[derive(Clone)]
-struct AdaptiveTotSizing {
-    params: TotParams,
-}
-
 fn tot_kv_demand_tokens(params: &TotParams, marginal_prompt_tokens: usize) -> usize {
     let candidate_count =
         super::schema::total_candidates(params.breadth, params.depth, params.beam_width).max(1);
@@ -411,16 +406,22 @@ fn tot_kv_available_tokens(budget_pages: u32, page_size_tokens: u32) -> Option<u
     (available > 0).then_some(available)
 }
 
+fn compute_marginal_prompt_tokens(seq_len: u32, page_size_tokens: u32) -> usize {
+    if page_size_tokens == 0 {
+        0
+    } else {
+        (seq_len % page_size_tokens) as usize
+    }
+}
+
 fn adaptive_tot_sizing(
     params: &TotParams,
     budget_pages: u32,
     page_size_tokens: u32,
     marginal_prompt_tokens: usize,
-) -> AdaptiveTotSizing {
+) -> TotParams {
     let Some(available) = tot_kv_available_tokens(budget_pages, page_size_tokens) else {
-        return AdaptiveTotSizing {
-            params: params.clone(),
-        };
+        return params.clone();
     };
 
     let mut sized = params.clone();
@@ -429,7 +430,7 @@ fn adaptive_tot_sizing(
             && tot_kv_concurrent_demand_tokens(p, marginal_prompt_tokens) <= available
     };
     if fits(&sized) {
-        return AdaptiveTotSizing { params: sized };
+        return sized;
     }
 
     if sized.exec.concurrent_gen() {
@@ -439,7 +440,7 @@ fn adaptive_tot_sizing(
             ExecStrategy::CoupledSequential
         };
         if fits(&sized) {
-            return AdaptiveTotSizing { params: sized };
+            return sized;
         }
     }
 
@@ -454,25 +455,25 @@ fn adaptive_tot_sizing(
         // signal to continue to the next lever unless the search is already
         // single-level.
         if fits(&sized) && sized.depth <= 1 {
-            return AdaptiveTotSizing { params: sized };
+            return sized;
         }
     }
 
     while sized.depth > 1 {
         sized.depth -= 1;
         if fits(&sized) {
-            return AdaptiveTotSizing { params: sized };
+            return sized;
         }
     }
 
     while sized.breadth > 1 {
         sized.breadth -= 1;
         if fits(&sized) {
-            return AdaptiveTotSizing { params: sized };
+            return sized;
         }
     }
 
-    AdaptiveTotSizing { params: sized }
+    sized
 }
 
 /// Append the `/no_think` directive when reasoning is disabled for this
@@ -1395,18 +1396,14 @@ pub async fn run(
     mut emitter: Option<&mut Emitter>,
 ) -> SearchOutcome {
     let page_size = root_ctx.page_size();
-    let marginal_prompt_tokens = if page_size == 0 {
-        0
-    } else {
-        (root_ctx.seq_len() % page_size) as usize
-    };
-    let adaptive = adaptive_tot_sizing(
+    let marginal_prompt_tokens = compute_marginal_prompt_tokens(root_ctx.seq_len(), page_size);
+    let adaptive_params = adaptive_tot_sizing(
         params,
         root_ctx.budget_pages(),
         page_size,
         marginal_prompt_tokens,
     );
-    let params = &adaptive.params;
+    let params = &adaptive_params;
 
     // #523 Part A: preserve a fork of the original conversation (system +
     // user turns, flushed, cue-free) BEFORE the search consumes `root_ctx`.
@@ -3573,23 +3570,43 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_tot_sizing_fail_open_when_runtime_budget_unknown() {
+        let params = adaptive_test_params(2048);
+
+        let no_budget_pages = adaptive_tot_sizing(&params, 0, 32, 0);
+        let no_page_size = adaptive_tot_sizing(&params, 1024, 0, 0);
+
+        assert_tot_params_eq(&no_budget_pages, &params);
+        assert_tot_params_eq(&no_page_size, &params);
+    }
+
+    #[test]
+    fn marginal_prompt_tokens_uses_only_partial_shared_prefix_page() {
+        assert_eq!(compute_marginal_prompt_tokens(0, 32), 0);
+        assert_eq!(compute_marginal_prompt_tokens(31, 32), 31);
+        assert_eq!(compute_marginal_prompt_tokens(32, 32), 0);
+        assert_eq!(compute_marginal_prompt_tokens(97, 32), 1);
+        assert_eq!(compute_marginal_prompt_tokens(97, 0), 0);
+    }
+
+    #[test]
     fn adaptive_tot_sizing_levers_stop_in_order() {
         let params = adaptive_test_params(2048);
 
         let sized = adaptive_tot_sizing(&params, 1024, 32, 0);
 
-        assert_eq!(sized.params.depth, 1, "depth reduces after reasoning cap");
+        assert_eq!(sized.depth, 1, "depth reduces after reasoning cap");
         assert_eq!(
-            sized.params.breadth, 3,
+            sized.breadth, 3,
             "large pools should keep requested breadth"
         );
         assert_eq!(
-            sized.params.exec,
+            sized.exec,
             super::super::schema::ExecStrategy::CoupledSequential,
             "first lever is serializing sibling generation"
         );
         assert_eq!(
-            sized.params.max_reasoning_tokens, 192,
+            sized.max_reasoning_tokens, 192,
             "second lever caps reasoning only after serialization is insufficient"
         );
     }
@@ -3601,15 +3618,27 @@ mod tests {
         let sized = adaptive_tot_sizing(&params, 256, 32, 0);
 
         assert_eq!(
-            sized.params.exec,
+            sized.exec,
             super::super::schema::ExecStrategy::CoupledSequential
         );
-        assert_eq!(sized.params.max_reasoning_tokens, 192);
-        assert_eq!(sized.params.depth, 1);
+        assert_eq!(sized.max_reasoning_tokens, 192);
+        assert_eq!(sized.depth, 1);
+        assert_eq!(sized.breadth, 3, "breadth is reduced only after depth");
+    }
+
+    #[test]
+    fn adaptive_tot_sizing_reduces_breadth_only_after_depth_hits_one() {
+        let params = adaptive_test_params(2048);
+
+        let sized = adaptive_tot_sizing(&params, 80, 32, 0);
+
         assert_eq!(
-            sized.params.breadth, 3,
-            "breadth is reduced only after depth"
+            sized.exec,
+            super::super::schema::ExecStrategy::CoupledSequential
         );
+        assert_eq!(sized.max_reasoning_tokens, 192);
+        assert_eq!(sized.depth, 1, "depth is reduced before breadth");
+        assert_eq!(sized.breadth, 2, "breadth is the final lever");
     }
 
     #[test]
@@ -3618,13 +3647,10 @@ mod tests {
 
         let sized = adaptive_tot_sizing(&params, 1024, 32, 0);
 
-        assert_eq!(sized.params.depth, params.depth);
-        assert_eq!(sized.params.breadth, params.breadth);
-        assert_eq!(sized.params.exec, params.exec);
-        assert_eq!(
-            sized.params.max_reasoning_tokens,
-            params.max_reasoning_tokens
-        );
+        assert_eq!(sized.depth, params.depth);
+        assert_eq!(sized.breadth, params.breadth);
+        assert_eq!(sized.exec, params.exec);
+        assert_eq!(sized.max_reasoning_tokens, params.max_reasoning_tokens);
     }
 
     #[test]
@@ -3642,15 +3668,29 @@ mod tests {
 
         let sized = adaptive_tot_sizing(&params, 310, 32, 10);
         assert_eq!(
-            sized.params.exec,
+            sized.exec,
             super::super::schema::ExecStrategy::CoupledSequential
         );
         assert_eq!(
-            sized.params.max_reasoning_tokens, 2048,
+            sized.max_reasoning_tokens, 2048,
             "serialization alone fits this envelope, so later levers must not fire"
         );
-        assert_eq!(sized.params.depth, 1);
-        assert_eq!(sized.params.breadth, 2);
+        assert_eq!(sized.depth, 1);
+        assert_eq!(sized.breadth, 2);
+    }
+
+    fn assert_tot_params_eq(actual: &TotParams, expected: &TotParams) {
+        assert_eq!(actual.breadth, expected.breadth);
+        assert_eq!(actual.depth, expected.depth);
+        assert_eq!(actual.beam_width, expected.beam_width);
+        assert_eq!(actual.max_tokens_per_node, expected.max_tokens_per_node);
+        assert_eq!(actual.max_reasoning_tokens, expected.max_reasoning_tokens);
+        assert_eq!(actual.temperature, expected.temperature);
+        assert_eq!(actual.top_p, expected.top_p);
+        assert_eq!(actual.thinking, expected.thinking);
+        assert_eq!(actual.exec, expected.exec);
+        assert_eq!(actual.task, expected.task);
+        assert_eq!(actual.sibling_penalty, expected.sibling_penalty);
     }
 
     fn adaptive_test_params(max_reasoning_tokens: usize) -> TotParams {
