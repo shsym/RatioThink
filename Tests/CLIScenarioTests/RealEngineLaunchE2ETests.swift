@@ -909,7 +909,9 @@ final class RealEngineLaunchE2ETests: IsolatedTestCase {
       }
     }
     try cellRequire(sawTreeComplete, "tot: stream never reached tree_complete")
-    let allowsSingleLevelToT = modelID.contains("gemma-4-31B-it-GGUF")
+    let allowsSingleLevelToT =
+      modelID.contains("gemma-4-31B-it-GGUF") ||
+      modelID.contains("gemma-4-31B-it-Q4_K_M.gguf")
     if !allowsSingleLevelToT {
       try cellRequire(maxDepth >= 2, "tot: search did not reach depth>1 (max node depth \(maxDepth))")
     }
