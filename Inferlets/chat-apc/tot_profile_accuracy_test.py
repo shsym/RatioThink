@@ -100,6 +100,77 @@ class ResponseParsing(unittest.TestCase):
         self.assertEqual(parsed.node_errors[0]["status"], "error")
         self.assertEqual(parsed.node_errors[1]["score_error"], "score unavailable")
 
+    def test_best_of_n_stream_extracts_central_candidate_from_real_envelope(self):
+        # Mirrors the shipped Best-of-N stream shape from src/bestofn/mod.rs:
+        # tree_start -> node_complete candidates -> level_pruned -> awaiting_selection -> [DONE].
+        parsed = h.parse_best_of_n_stream(
+            _sse(
+                {"event": "tree_start", "request_id": "bon-1", "breadth": 3, "depth": 1, "beam_width": 1},
+                {
+                    "event": "node_complete",
+                    "node": {
+                        "id": "cand-a",
+                        "depth": 1,
+                        "status": "ok",
+                        "branch_index": 0,
+                        "content": "We calculate carefully. #### 18",
+                    },
+                },
+                {
+                    "event": "node_complete",
+                    "node": {
+                        "id": "cand-b",
+                        "depth": 1,
+                        "status": "ok",
+                        "branch_index": 1,
+                        "content": "The arithmetic gives #### 18",
+                    },
+                },
+                {
+                    "event": "node_complete",
+                    "node": {
+                        "id": "cand-c",
+                        "depth": 1,
+                        "status": "ok",
+                        "branch_index": 2,
+                        "content": "A distractor answer is #### 41",
+                    },
+                },
+                {"event": "level_pruned", "level": 1, "kept": ["cand-a", "cand-b", "cand-c"]},
+                {
+                    "event": "awaiting_selection",
+                    "level": 1,
+                    "candidates": [
+                        {"id": "cand-a", "branch_index": 0, "snapshot_name": "bon/r/1/0"},
+                        {"id": "cand-b", "branch_index": 1, "snapshot_name": "bon/r/1/1"},
+                        {"id": "cand-c", "branch_index": 2, "snapshot_name": "bon/r/1/2"},
+                    ],
+                },
+                {"event": "generation_metrics", "output_tokens": 90},
+                "[DONE]",
+            ),
+            fallback_count=lambda text: len(text.split()),
+        )
+
+        self.assertEqual(parsed.answer, "The arithmetic gives #### 18")
+        self.assertEqual(parsed.tokens, 90)
+        self.assertEqual(parsed.token_source, "generation_metrics.output_tokens")
+        self.assertIsNone(parsed.error)
+        self.assertEqual(parsed.selected_candidate_id, "cand-b")
+        self.assertEqual(parsed.release_snapshots, ["bon/r/1/0", "bon/r/1/1", "bon/r/1/2"])
+
+    def test_best_of_n_candidate_selection_is_deterministic_without_gold(self):
+        candidates = [
+            h.BestOfNCandidate("a", 0, "#### 18", "snap-a"),
+            h.BestOfNCandidate("b", 1, "answer: #### 18", "snap-b"),
+            h.BestOfNCandidate("c", 2, "#### 41", "snap-c"),
+        ]
+
+        selected = h.select_best_of_n_candidate(candidates)
+
+        self.assertEqual(selected.id, "a")
+
+
 
 class DatasetSelection(unittest.TestCase):
     def test_default_datasets_exclude_jsonschema_but_include_target_generalization_set(self):
@@ -149,6 +220,7 @@ class Aggregation(unittest.TestCase):
                 reference={"final_answer": "18"},
                 single=h.ArmResult(answer="#### 18", tokens=10, latency_s=1.0),
                 tot=h.ArmResult(answer="#### 17", tokens=25, latency_s=3.0),
+                best_of_n=h.ArmResult(answer="#### 18", tokens=30, latency_s=4.0),
             ),
             h.ItemResult(
                 dataset="gsm8k",
@@ -157,6 +229,7 @@ class Aggregation(unittest.TestCase):
                 reference={"final_answer": "9"},
                 single=h.ArmResult(answer="no number", tokens=4, latency_s=0.5),
                 tot=h.ArmResult(answer="#### 9", tokens=20, latency_s=2.0),
+                best_of_n=h.ArmResult(answer="#### 8", tokens=24, latency_s=3.0),
             ),
             h.ItemResult(
                 dataset="gsm8k",
@@ -165,6 +238,7 @@ class Aggregation(unittest.TestCase):
                 reference={"final_answer": "5"},
                 single=h.ArmResult(answer=None, tokens=0, latency_s=0.2, error="500"),
                 tot=h.ArmResult(answer=None, tokens=6, latency_s=1.2, error="terminal error"),
+                best_of_n=h.ArmResult(answer=None, tokens=7, latency_s=1.3, error="bon terminal error"),
             ),
         ]
 
@@ -179,7 +253,12 @@ class Aggregation(unittest.TestCase):
         self.assertEqual(summary["tot"]["n_wrong"], 1)
         self.assertEqual(summary["tot"]["n_error"], 1)
         self.assertEqual(summary["tot"]["accuracy"], 0.5)
+        self.assertEqual(summary["best_of_n"]["n_correct"], 1)
+        self.assertEqual(summary["best_of_n"]["n_wrong"], 1)
+        self.assertEqual(summary["best_of_n"]["n_error"], 1)
+        self.assertEqual(summary["best_of_n"]["accuracy"], 0.5)
         self.assertEqual(summary["accuracy_delta_tot_minus_single"], -0.5)
+        self.assertEqual(summary["accuracy_delta_best_of_n_minus_single"], -0.5)
         self.assertEqual(summary["mean_token_delta_tot_minus_single"], 15.5)
         self.assertEqual(summary["mean_latency_delta_s_tot_minus_single"], 1.75)
         self.assertEqual(summary["single"]["mean_tokens_per_second"], 10.0)
@@ -228,7 +307,8 @@ class Aggregation(unittest.TestCase):
 
         with mock.patch.object(h.base, "_load_prompts", side_effect=fake_load_prompts), \
              mock.patch.object(h, "_single_once", side_effect=fake_once), \
-             mock.patch.object(h, "_tot_once", side_effect=fake_once):
+             mock.patch.object(h, "_tot_once", side_effect=fake_once), \
+             mock.patch.object(h, "_best_of_n_once", side_effect=fake_once):
             rows = asyncio.run(
                 h._run_model(
                     "http://local", "model-a", ["humaneval", "mbpp"],
@@ -240,6 +320,7 @@ class Aggregation(unittest.TestCase):
         for row in rows:
             self.assertEqual(row["single"]["accuracy"], 1.0, row)
             self.assertEqual(row["tot"]["accuracy"], 1.0, row)
+            self.assertEqual(row["best_of_n"]["accuracy"], 1.0, row)
             self.assertEqual(row["coverage"], {"measured": 1, "total": 1})
 
     def test_artifact_keeps_multiple_models_in_priority_order(self):
@@ -306,6 +387,7 @@ class Aggregation(unittest.TestCase):
                             reference={"final_answer": "18"},
                             single=h.ArmResult(answer="#### 18", tokens=1, latency_s=0.1),
                             tot=h.ArmResult(answer="#### 18", tokens=2, latency_s=0.2),
+                            best_of_n=h.ArmResult(answer="#### 18", tokens=3, latency_s=0.3),
                         )
                     ],
                     "gsm8k_numeric",

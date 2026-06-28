@@ -8,6 +8,9 @@ accounting, and model defaults.  The measured arms are:
 * ``single`` — ordinary ``/v1/chat/completions`` single pass.
 * ``tot`` — shipped ``tree-of-thought`` inferlet dispatched through
   ``/v1/chat/completions`` via the advanced profile envelope.
+* ``best_of_n`` — shipped ``best-of-n`` inferlet dispatched through the same
+  advanced profile envelope, with the harness selecting one candidate by a
+  deterministic no-gold self-consistency rule.
 
 The matrix is resilient: transport/terminal/node failures are recorded per item
 and disclosed, ungradable/error items are held out of accuracy denominators, and
@@ -24,6 +27,7 @@ import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable
 
@@ -53,6 +57,10 @@ TOT_DEPTH = int(os.environ.get("TOT_DEPTH", os.environ.get("MATH_DEPTH", "2")))
 TOT_BEAM = int(os.environ.get("TOT_BEAM", "1"))
 TOT_TASK = os.environ.get("TOT_TASK", "reasoning")
 TOT_TEMPERATURE = float(os.environ.get("TOT_TEMPERATURE", "0.7"))
+BON_N = int(os.environ.get("BON_N", os.environ.get("BEST_OF_N", "3")))
+BON_TEMPERATURE = float(os.environ.get("BON_TEMPERATURE", "0.7"))
+BON_TOP_P = float(os.environ.get("BON_TOP_P", "0.95"))
+BON_THINKING = os.environ.get("BON_THINKING", "false").lower() in ("1", "true", "yes")
 OUT = os.environ.get("PROFILE_ACCURACY_OUT", "tot_profile_accuracy.json")
 
 
@@ -72,6 +80,16 @@ class ArmResult:
     error: str | None = None
     token_source: str | None = None
     node_errors: list[dict] = field(default_factory=list)
+    selected_candidate_id: str | None = None
+    release_snapshots: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class BestOfNCandidate:
+    id: str
+    branch_index: int
+    content: str
+    snapshot_name: str | None = None
 
 
 @dataclass
@@ -82,6 +100,7 @@ class ItemResult:
     reference: dict
     single: ArmResult
     tot: ArmResult
+    best_of_n: ArmResult
 
 
 def _models_from_env() -> list[str]:
@@ -165,6 +184,144 @@ def parse_tot_stream(text: str, fallback_count: Callable[[str], int] | None = No
                      node_errors=node_errors)
 
 
+def _sse_events(text: str) -> tuple[list[dict], str | None]:
+    events: list[dict] = []
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            events.append(json.loads(payload))
+        except json.JSONDecodeError as e:
+            return events, f"malformed SSE JSON: {e}"
+    return events, None
+
+
+def _final_answer_key(text: str) -> str:
+    tail = g.last_number(text)
+    return str(tail) if tail is not None else " ".join(text.lower().split())
+
+
+def select_best_of_n_candidate(candidates: list[BestOfNCandidate]) -> BestOfNCandidate:
+    """Choose a Best-of-N candidate without consulting the gold answer.
+
+    Prefer the modal extracted final answer (self-consistency).  Within that
+    bucket, choose the response most textually central to all pickable
+    candidates; length and branch index are stable tie-breakers.
+    """
+    if not candidates:
+        raise ValueError("cannot select from an empty Best-of-N candidate list")
+    buckets: dict[str, list[BestOfNCandidate]] = {}
+    for candidate in candidates:
+        buckets.setdefault(_final_answer_key(candidate.content), []).append(candidate)
+    majority = max(buckets.values(), key=lambda group: (len(group), -group[0].branch_index))
+    if len(candidates) == 1:
+        return candidates[0]
+
+    def centrality(candidate: BestOfNCandidate) -> float:
+        peers = [c for c in candidates if c.id != candidate.id]
+        if not peers:
+            return 1.0
+        return statistics.mean(
+            SequenceMatcher(None, candidate.content, peer.content).ratio()
+            for peer in peers
+        )
+
+    return max(majority, key=lambda c: (centrality(c), len(c.content), -c.branch_index))
+
+
+def parse_best_of_n_stream(
+    text: str, fallback_count: Callable[[str], int] | None = None
+) -> ArmResult:
+    events, malformed = _sse_events(text)
+    node_errors: list[dict] = []
+    contents: dict[str, str] = {}
+    branch_indexes: dict[str, int] = {}
+
+    if malformed:
+        return ArmResult(error=malformed)
+
+    for e in events:
+        if e.get("event") != "node_complete":
+            continue
+        node = e.get("node") or {}
+        node_id = str(node.get("id") or "")
+        if isinstance(node.get("branch_index"), int):
+            branch_indexes[node_id] = node["branch_index"]
+        if node.get("status") == "ok" and node.get("content"):
+            contents[node_id] = str(node.get("content") or "").strip()
+        else:
+            node_errors.append({
+                "id": node.get("id"),
+                "depth": node.get("depth"),
+                "status": node.get("status"),
+                "error": node.get("error"),
+                "score_error": node.get("score_error"),
+            })
+
+    terminal_error = next((e for e in reversed(events) if e.get("event") == "error"), None)
+    if terminal_error:
+        return ArmResult(
+            error=terminal_error.get("message") or "terminal error",
+            node_errors=node_errors,
+        )
+
+    selection = next((e for e in reversed(events)
+                      if e.get("event") == "awaiting_selection"), None)
+    if not selection:
+        return ArmResult(
+            error="missing terminal awaiting_selection frame",
+            node_errors=node_errors,
+        )
+
+    candidates: list[BestOfNCandidate] = []
+    release_snapshots: list[str] = []
+    for pick in selection.get("candidates") or []:
+        candidate_id = str(pick.get("id") or "")
+        snapshot_name = pick.get("snapshot_name")
+        if snapshot_name:
+            release_snapshots.append(str(snapshot_name))
+        if not candidate_id or candidate_id not in contents:
+            continue
+        branch_index = pick.get("branch_index")
+        if not isinstance(branch_index, int):
+            branch_index = branch_indexes.get(candidate_id, len(candidates))
+        candidates.append(BestOfNCandidate(
+            id=candidate_id,
+            branch_index=branch_index,
+            content=contents[candidate_id],
+            snapshot_name=str(snapshot_name) if snapshot_name else None,
+        ))
+
+    if not candidates:
+        return ArmResult(
+            error="awaiting_selection had no parseable candidates",
+            node_errors=node_errors,
+            release_snapshots=release_snapshots,
+        )
+
+    selected = select_best_of_n_candidate(candidates)
+    metrics = next((e for e in reversed(events)
+                    if e.get("event") == "generation_metrics"), {})
+    tokens = metrics.get("output_tokens")
+    if isinstance(tokens, int):
+        token_source = "generation_metrics.output_tokens"
+    else:
+        tokens = (fallback_count or (lambda s: len(s.split())))(selected.content)
+        token_source = "tokenizer_fallback"
+
+    return ArmResult(
+        answer=selected.content,
+        tokens=tokens,
+        token_source=token_source,
+        node_errors=node_errors,
+        selected_candidate_id=selected.id,
+        release_snapshots=release_snapshots,
+    )
+
+
 def _score_arm(arm: ArmResult, grader: str, reference: dict) -> tuple[str, bool | None]:
     if arm.error:
         return "error", None
@@ -221,28 +378,32 @@ def _cell(items: list[ItemResult], arm_name: str, grader: str) -> dict:
     }
 
 
-def _mean_paired_delta(items: list[ItemResult], attr: str) -> float | None:
+def _mean_paired_delta(items: list[ItemResult], attr: str, arm_name: str = "tot") -> float | None:
     deltas: list[float] = []
     for item in items:
-        if item.single.error or item.tot.error:
+        arm: ArmResult = getattr(item, arm_name)
+        if item.single.error or arm.error:
             continue
-        if item.single.answer is None or item.tot.answer is None:
+        if item.single.answer is None or arm.answer is None:
             continue
-        deltas.append(float(getattr(item.tot, attr)) - float(getattr(item.single, attr)))
+        deltas.append(float(getattr(arm, attr)) - float(getattr(item.single, attr)))
     return statistics.mean(deltas) if deltas else None
 
 
-def _mean_paired_tokens_per_second_delta(items: list[ItemResult]) -> float | None:
+def _mean_paired_tokens_per_second_delta(
+    items: list[ItemResult], arm_name: str = "tot"
+) -> float | None:
     deltas: list[float] = []
     for item in items:
-        if item.single.error or item.tot.error:
+        arm: ArmResult = getattr(item, arm_name)
+        if item.single.error or arm.error:
             continue
-        if item.single.answer is None or item.tot.answer is None:
+        if item.single.answer is None or arm.answer is None:
             continue
-        if item.single.latency_s <= 0 or item.tot.latency_s <= 0:
+        if item.single.latency_s <= 0 or arm.latency_s <= 0:
             continue
         deltas.append(
-            (item.tot.tokens / item.tot.latency_s)
+            (arm.tokens / arm.latency_s)
             - (item.single.tokens / item.single.latency_s)
         )
     return statistics.mean(deltas) if deltas else None
@@ -253,19 +414,33 @@ def summarize_model(model: str, items: list[ItemResult], grader: str,
     dataset = dataset or (items[0].dataset if items else None)
     single = _cell(items, "single", grader)
     tot = _cell(items, "tot", grader)
-    acc_delta = None
+    best_of_n = _cell(items, "best_of_n", grader)
+    acc_delta = bon_acc_delta = None
     if single["accuracy"] is not None and tot["accuracy"] is not None:
         acc_delta = tot["accuracy"] - single["accuracy"]
+    if single["accuracy"] is not None and best_of_n["accuracy"] is not None:
+        bon_acc_delta = best_of_n["accuracy"] - single["accuracy"]
     return {
         "model": model,
         "dataset": dataset,
         "single": single,
         "tot": tot,
+        "best_of_n": best_of_n,
         "accuracy_delta_tot_minus_single": acc_delta,
+        "accuracy_delta_best_of_n_minus_single": bon_acc_delta,
         "mean_token_delta_tot_minus_single": _mean_paired_delta(items, "tokens"),
+        "mean_token_delta_best_of_n_minus_single": (
+            _mean_paired_delta(items, "tokens", "best_of_n")
+        ),
         "mean_latency_delta_s_tot_minus_single": _mean_paired_delta(items, "latency_s"),
+        "mean_latency_delta_s_best_of_n_minus_single": (
+            _mean_paired_delta(items, "latency_s", "best_of_n")
+        ),
         "mean_tokens_per_second_delta_tot_minus_single": (
             _mean_paired_tokens_per_second_delta(items)
+        ),
+        "mean_tokens_per_second_delta_best_of_n_minus_single": (
+            _mean_paired_tokens_per_second_delta(items, "best_of_n")
         ),
         "items": [_item_to_json(item, grader) for item in items],
     }
@@ -274,9 +449,9 @@ def summarize_model(model: str, items: list[ItemResult], grader: str,
 def build_artifact(models: list[dict], settings: dict) -> dict:
     return {
         "framing": (
-            "Shipped tree-of-thought profile vs ordinary single-pass "
-            "/v1/chat/completions on identical prompts. This does not run "
-            "the academic host-side BFS harness."
+            "Shipped tree-of-thought and Best-of-N profiles vs ordinary "
+            "single-pass /v1/chat/completions on identical prompts. This does "
+            "not run the academic host-side BFS harness."
         ),
         "settings": settings,
         "models": models,
@@ -293,6 +468,7 @@ def _empty_cell(first_error: str | None = None) -> dict:
         "accuracy": None,
         "mean_tokens": None,
         "mean_latency_s": None,
+        "mean_tokens_per_second": None,
         "first_error": first_error,
         "node_error_count": 0,
     }
@@ -307,10 +483,15 @@ def model_boot_error_row(model: str, exc: ModelBootError, dataset: str | None = 
         "boot_error": err,
         "single": _empty_cell(err),
         "tot": _empty_cell(err),
+        "best_of_n": _empty_cell(err),
         "accuracy_delta_tot_minus_single": None,
+        "accuracy_delta_best_of_n_minus_single": None,
         "mean_token_delta_tot_minus_single": None,
+        "mean_token_delta_best_of_n_minus_single": None,
         "mean_latency_delta_s_tot_minus_single": None,
+        "mean_latency_delta_s_best_of_n_minus_single": None,
         "mean_tokens_per_second_delta_tot_minus_single": None,
+        "mean_tokens_per_second_delta_best_of_n_minus_single": None,
         "items": [],
         "coverage": {"measured": 0, "total": None},
     }
@@ -370,7 +551,7 @@ def atomic_write_json(path: str | Path, payload: dict) -> None:
 
 def has_any_graded_item(artifact: dict) -> bool:
     for row in artifact.get("models", []):
-        for arm in ("single", "tot"):
+        for arm in ("single", "tot", "best_of_n"):
             if (row.get(arm) or {}).get("n_graded", 0) > 0:
                 return True
     return False
@@ -379,6 +560,7 @@ def has_any_graded_item(artifact: dict) -> bool:
 def _item_to_json(item: ItemResult, grader: str) -> dict:
     single_bucket, single_passed = _score_arm(item.single, grader, item.reference)
     tot_bucket, tot_passed = _score_arm(item.tot, grader, item.reference)
+    bon_bucket, bon_passed = _score_arm(item.best_of_n, grader, item.reference)
     return {
         "dataset": item.dataset,
         "index": item.index,
@@ -386,10 +568,16 @@ def _item_to_json(item: ItemResult, grader: str) -> dict:
         "reference": item.reference,
         "single": {**asdict(item.single), "grade": single_bucket, "passed": single_passed},
         "tot": {**asdict(item.tot), "grade": tot_bucket, "passed": tot_passed},
+        "best_of_n": {**asdict(item.best_of_n), "grade": bon_bucket, "passed": bon_passed},
         "token_delta_tot_minus_single": item.tot.tokens - item.single.tokens
         if not (item.single.error or item.tot.error) else None,
+        "token_delta_best_of_n_minus_single": item.best_of_n.tokens - item.single.tokens
+        if not (item.single.error or item.best_of_n.error) else None,
         "latency_delta_s_tot_minus_single": item.tot.latency_s - item.single.latency_s
         if not (item.single.error or item.tot.error) else None,
+        "latency_delta_s_best_of_n_minus_single": (
+            item.best_of_n.latency_s - item.single.latency_s
+        ) if not (item.single.error or item.best_of_n.error) else None,
     }
 
 
@@ -446,6 +634,57 @@ async def _tot_once(http_c: httpx.AsyncClient, base_url: str, model: str,
                          error=f"{type(e).__name__}: {e}")
 
 
+async def _release_best_of_n_snapshots(
+    http_c: httpx.AsyncClient, base_url: str, names: list[str]
+) -> str | None:
+    if not names:
+        return None
+    try:
+        r = await http_c.post(
+            f"{base_url}/v1/chat/completions",
+            json={"inferlet": "best-of-n", "stream": False, "input": {"release": names}},
+        )
+        if r.status_code != 200:
+            return f"release {r.status_code}: {r.text[:200]}"
+    except Exception as e:  # noqa: BLE001 - release failure is diagnostic only.
+        return f"release {type(e).__name__}: {e}"
+    return None
+
+
+async def _best_of_n_once(http_c: httpx.AsyncClient, base_url: str, model: str,
+                          prompt: str, count) -> ArmResult:
+    body = {
+        "inferlet": "best-of-n",
+        "stream": True,
+        "input": {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "n": BON_N,
+            "max_tokens_per_candidate": MAX_TOKENS,
+            "temperature": BON_TEMPERATURE,
+            "top_p": BON_TOP_P,
+            "thinking": BON_THINKING,
+        },
+    }
+    started = time.monotonic()
+    try:
+        r = await http_c.post(f"{base_url}/v1/chat/completions", json=body)
+        latency = time.monotonic() - started
+        if r.status_code != 200:
+            return ArmResult(latency_s=latency, error=f"best-of-n dispatch {r.status_code}: {r.text[:200]}")
+        parsed = parse_best_of_n_stream(r.text, count)
+        parsed.latency_s = latency
+        release_error = await _release_best_of_n_snapshots(
+            http_c, base_url, parsed.release_snapshots
+        )
+        if release_error:
+            parsed.node_errors.append({"release_error": release_error})
+        return parsed
+    except Exception as e:  # noqa: BLE001
+        return ArmResult(latency_s=time.monotonic() - started,
+                         error=f"{type(e).__name__}: {e}")
+
+
 async def _run_model_dataset(base_url: str, model: str, dataset: str, count) -> dict:
     grader = base._grader_for(dataset)
     records, total = base._load_prompts(dataset)
@@ -457,14 +696,17 @@ async def _run_model_dataset(base_url: str, model: str, dataset: str, count) -> 
             prompt_id = str(rec.get("id") or f"{dataset}:{i}")
             single = await _single_once(http_c, base_url, model, rec["prompt"], count)
             tot = await _tot_once(http_c, base_url, model, rec["prompt"], count)
-            item = ItemResult(dataset, i, prompt_id, rec["reference"], single, tot)
+            best_of_n = await _best_of_n_once(http_c, base_url, model, rec["prompt"], count)
+            item = ItemResult(dataset, i, prompt_id, rec["reference"], single, tot, best_of_n)
             items.append(item)
             single_bucket, _ = _score_arm(single, grader, rec["reference"])
             tot_bucket, _ = _score_arm(tot, grader, rec["reference"])
+            bon_bucket, _ = _score_arm(best_of_n, grader, rec["reference"])
             print(
                 f"[profile-accuracy] {model} {dataset} {i}/{len(records)} "
-                f"single={single_bucket} tot={tot_bucket} "
-                f"tot_node_errors={len(tot.node_errors)}",
+                f"single={single_bucket} tot={tot_bucket} best_of_n={bon_bucket} "
+                f"tot_node_errors={len(tot.node_errors)} "
+                f"bon_node_errors={len(best_of_n.node_errors)}",
                 flush=True,
             )
     row = summarize_model(model, items, grader, dataset=dataset)
@@ -496,6 +738,14 @@ async def _run() -> dict:
             "beam_width": TOT_BEAM,
             "task": TOT_TASK,
             "temperature": TOT_TEMPERATURE,
+        },
+        "best_of_n": {
+            "n": BON_N,
+            "max_tokens_per_candidate": MAX_TOKENS,
+            "temperature": BON_TEMPERATURE,
+            "top_p": BON_TOP_P,
+            "thinking": BON_THINKING,
+            "selection": "modal final answer, then textual centrality, length, branch order",
         },
     }
 
@@ -559,33 +809,39 @@ async def _run() -> dict:
 
 
 def _print(artifact: dict) -> None:
-    print("\n" + "=" * 96)
-    print("SHIPPED ToT profile vs single-pass accuracy/cost")
-    print("=" * 96)
-    print(f"{'model':28} {'dataset':12} {'single':>8} {'ToT':>8} {'Δacc':>8} {'Δtok':>9} {'Δlat(s)':>9} {'ToT t/s':>9} {'nodeErr':>8}")
-    print("-" * 96)
+    print("\n" + "=" * 118)
+    print("SHIPPED ToT + Best-of-N profiles vs single-pass accuracy/cost")
+    print("=" * 118)
+    print(f"{'model':28} {'dataset':12} {'single':>8} {'ToT':>8} {'BoN':>8} {'ΔToT':>8} {'ΔBoN':>8} {'ΔtokT':>9} {'ΔtokB':>9} {'ΔlatT':>9} {'ΔlatB':>9} {'nodeErr':>8}")
+    print("-" * 118)
     for row in artifact["models"]:
         single = row["single"]
         tot = row["tot"]
-        node_err = tot.get("node_error_count", 0)
+        bon = row.get("best_of_n") or {}
+        node_err = tot.get("node_error_count", 0) + bon.get("node_error_count", 0)
         def f(x, fmt="{:.3f}"):
             return fmt.format(x) if isinstance(x, (int, float)) else "--"
         print(
             f"{row['model'][:28]:28} "
             f"{str(row.get('dataset') or '--')[:12]:12} "
             f"{f(single.get('accuracy')):>8} {f(tot.get('accuracy')):>8} "
+            f"{f(bon.get('accuracy')):>8} "
             f"{f(row.get('accuracy_delta_tot_minus_single'), '{:+.3f}'):>8} "
+            f"{f(row.get('accuracy_delta_best_of_n_minus_single'), '{:+.3f}'):>8} "
             f"{f(row.get('mean_token_delta_tot_minus_single'), '{:+.1f}'):>9} "
+            f"{f(row.get('mean_token_delta_best_of_n_minus_single'), '{:+.1f}'):>9} "
             f"{f(row.get('mean_latency_delta_s_tot_minus_single'), '{:+.2f}'):>9} "
-            f"{f(tot.get('mean_tokens_per_second'), '{:.1f}'):>9} "
+            f"{f(row.get('mean_latency_delta_s_best_of_n_minus_single'), '{:+.2f}'):>9} "
             f"{node_err:>8}"
         )
         if single.get("first_error"):
             print(f"  single first_error: {single['first_error']}")
         if tot.get("first_error"):
             print(f"  ToT first_error: {tot['first_error']}")
-    print("-" * 96)
-    print("Accuracy excludes ungradable/error items per arm; nodeErr discloses ToT node status/error/score_error events.")
+        if bon.get("first_error"):
+            print(f"  Best-of-N first_error: {bon['first_error']}")
+    print("-" * 118)
+    print("Accuracy excludes ungradable/error items per arm; nodeErr discloses ToT/Best-of-N node status/error/score_error events.")
 
 
 async def main() -> int:
