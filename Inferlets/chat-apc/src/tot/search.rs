@@ -443,11 +443,17 @@ fn adaptive_tot_sizing(
         }
     }
 
-    if sized.max_reasoning_tokens > TOT_ADAPTIVE_REASONING_TOKEN_CAP {
+    let reasoning_was_capped = sized.max_reasoning_tokens > TOT_ADAPTIVE_REASONING_TOKEN_CAP;
+    if reasoning_was_capped {
         sized.max_reasoning_tokens = sized
             .max_reasoning_tokens
             .min(TOT_ADAPTIVE_REASONING_TOKEN_CAP);
-        if fits(&sized) {
+        // A multi-level search whose per-node reasoning had to be cut this far
+        // can fit the page envelope on paper while still spending the second
+        // level inside inspection/no-final-answer nodes. Treat the cap as a
+        // signal to continue to the next lever unless the search is already
+        // single-level.
+        if fits(&sized) && sized.depth <= 1 {
             return AdaptiveTotSizing { params: sized };
         }
     }
@@ -3572,10 +3578,7 @@ mod tests {
 
         let sized = adaptive_tot_sizing(&params, 1024, 32, 0);
 
-        assert_eq!(
-            sized.params.depth, 2,
-            "large pools should keep requested depth"
-        );
+        assert_eq!(sized.params.depth, 1, "depth reduces after reasoning cap");
         assert_eq!(
             sized.params.breadth, 3,
             "large pools should keep requested breadth"
