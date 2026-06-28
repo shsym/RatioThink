@@ -62,6 +62,7 @@ BON_TEMPERATURE = float(os.environ.get("BON_TEMPERATURE", "0.7"))
 BON_TOP_P = float(os.environ.get("BON_TOP_P", "0.95"))
 BON_THINKING = os.environ.get("BON_THINKING", "false").lower() in ("1", "true", "yes")
 OUT = os.environ.get("PROFILE_ACCURACY_OUT", "tot_profile_accuracy.json")
+ARM_NAMES = ("single", "tot", "best_of_n")
 
 
 class ModelBootError(Exception):
@@ -109,6 +110,21 @@ def _models_from_env() -> list[str]:
     if os.environ.get("MODEL"):
         return [os.environ["MODEL"]]
     return list(DEFAULT_MODELS)
+
+
+def _arms_from_env() -> set[str]:
+    raw = os.environ.get("PROFILE_ACCURACY_ARMS")
+    if not raw:
+        return set(ARM_NAMES)
+    arms = {arm.strip() for arm in raw.split(",") if arm.strip()}
+    unknown = arms.difference(ARM_NAMES)
+    if unknown:
+        raise SystemExit(f"unknown PROFILE_ACCURACY_ARMS values: {sorted(unknown)}")
+    return arms
+
+
+def _skipped_arm() -> ArmResult:
+    return ArmResult(token_source="skipped")
 
 
 def shmem_name(index: int) -> str:
@@ -690,13 +706,23 @@ async def _run_model_dataset(base_url: str, model: str, dataset: str, count) -> 
     records, total = base._load_prompts(dataset)
     if MAX_PROMPTS > 0:
         records = records[:MAX_PROMPTS]
+    arms = _arms_from_env()
     items: list[ItemResult] = []
     async with httpx.AsyncClient(timeout=900) as http_c:
         for i, rec in enumerate(records, 1):
             prompt_id = str(rec.get("id") or f"{dataset}:{i}")
-            single = await _single_once(http_c, base_url, model, rec["prompt"], count)
-            tot = await _tot_once(http_c, base_url, model, rec["prompt"], count)
-            best_of_n = await _best_of_n_once(http_c, base_url, model, rec["prompt"], count)
+            single = (
+                await _single_once(http_c, base_url, model, rec["prompt"], count)
+                if "single" in arms else _skipped_arm()
+            )
+            tot = (
+                await _tot_once(http_c, base_url, model, rec["prompt"], count)
+                if "tot" in arms else _skipped_arm()
+            )
+            best_of_n = (
+                await _best_of_n_once(http_c, base_url, model, rec["prompt"], count)
+                if "best_of_n" in arms else _skipped_arm()
+            )
             item = ItemResult(dataset, i, prompt_id, rec["reference"], single, tot, best_of_n)
             items.append(item)
             single_bucket, _ = _score_arm(single, grader, rec["reference"])
@@ -731,6 +757,7 @@ async def _run() -> dict:
         "max_prompts": MAX_PROMPTS,
         "max_tokens": MAX_TOKENS,
         "models": models,
+        "arms": sorted(_arms_from_env()),
         "token_unit": unit,
         "tot": {
             "breadth": TOT_BREADTH,

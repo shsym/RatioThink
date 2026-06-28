@@ -269,6 +269,34 @@ class Aggregation(unittest.TestCase):
         )
 
 
+    def test_run_model_dataset_can_skip_excluded_arm(self):
+        records = [{
+            "id": "gsm8k:1",
+            "prompt": "What is 9+9?",
+            "reference": {"final_answer": "18"},
+        }]
+
+        async def fake_once(http_c, base_url, model, prompt, count):
+            return h.ArmResult(answer="#### 18", tokens=3, latency_s=0.01)
+
+        async def fail_tot(*args, **kwargs):
+            raise AssertionError("ToT must not run when PROFILE_ACCURACY_ARMS excludes it")
+
+        with mock.patch.dict(os.environ, {"PROFILE_ACCURACY_ARMS": "single,best_of_n"}), \
+             mock.patch.object(h.base, "_load_prompts", return_value=(records, 1)), \
+             mock.patch.object(h, "_single_once", side_effect=fake_once), \
+             mock.patch.object(h, "_tot_once", side_effect=fail_tot), \
+             mock.patch.object(h, "_best_of_n_once", side_effect=fake_once):
+            row = asyncio.run(
+                h._run_model_dataset("http://local", "model-a", "gsm8k", lambda text: 1)
+            )
+
+        self.assertEqual(row["single"]["accuracy"], 1.0)
+        self.assertEqual(row["best_of_n"]["accuracy"], 1.0)
+        self.assertEqual(row["tot"]["n_graded"], 0)
+        self.assertEqual(row["tot"]["n_ungradable"], 1)
+        self.assertEqual(row["items"][0]["tot"]["token_source"], "skipped")
+
     def test_run_model_dataset_scores_existing_code_datasets_with_grade_oracle(self):
         records_by_dataset = {
             "humaneval": [
