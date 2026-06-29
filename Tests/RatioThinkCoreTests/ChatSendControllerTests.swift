@@ -562,8 +562,10 @@ final class ChatSendControllerTests: XCTestCase {
 
     engine.yield(.delta(role: .assistant, content: "partial"), at: 0)
     // Let the send task consume the delta and buffer it in MessageStreamWriter,
-    // but do not yield a flush-boundary event or wait for the 250ms timer.
-    await Task.yield()
+    // but do not yield a flush-boundary event or wait for the 250ms timer. A
+    // single Task.yield is not a handoff guarantee under the full suite; keep
+    // this below the flush timer while making the pre-cancel consume deterministic.
+    try await Task.sleep(nanoseconds: 50_000_000)
     controller.cancel()
 
     chat.messages.append(Message(role: "user", content: "second", ts: Date(timeIntervalSinceReferenceDate: 2)))
@@ -624,8 +626,10 @@ final class ChatSendControllerTests: XCTestCase {
     engine.yield(.reasoningDelta("thinking"), at: 0)
     // Let the send task consume the reasoning delta and buffer it in
     // MessageStreamWriter, but do not yield a flush-boundary event or wait for
-    // the 250ms timer.
-    await Task.yield()
+    // the 250ms timer. A single Task.yield is not a handoff guarantee under the
+    // full suite; keep this below the flush timer while making the pre-cancel
+    // consume deterministic.
+    try await Task.sleep(nanoseconds: 50_000_000)
     controller.cancel()
 
     chat.messages.append(Message(role: "user", content: "second", ts: Date(timeIntervalSinceReferenceDate: 2)))
