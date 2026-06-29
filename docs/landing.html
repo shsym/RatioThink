@@ -691,6 +691,8 @@
     row.querySelector('#bstat').textContent = 'chosen';
     await sleep(450, myGen);
     setCaption('The comment seeds round two from the answer you picked.');
+    await typeComposer(d.comment, myGen);
+    resetComposer();
     await sleep(850, myGen);
     var row2 = el('<div class="row assistant"><div class="acol"><div class="boncomment">'+d.comment+'</div><div class="tsearch"><div class="tshead"><span>Options</span> <span class="status" id="bstat2">generating…</span> <span class="tchev">▾</span></div><div class="bonbox" id="bon2"></div></div></div></div>');
     transcript.appendChild(row2); scrollToBottom();
