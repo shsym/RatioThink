@@ -433,6 +433,7 @@
     composer.classList.remove('typed'); menu.classList.remove('show'); }
   function el(html){ var d=document.createElement('div'); d.innerHTML=html.trim(); return d.firstChild; }
   function resetComposer(){ composer.textContent='Message Rational…'; composer.classList.remove('typed'); }
+  function scrollToBottom(){ transcript.scrollTop = transcript.scrollHeight; }
 
   function setCaption(text){
     captionEl.innerHTML = '<span class="ctext">'+text+'</span>';
@@ -453,7 +454,7 @@
 
   function userRow(text){
     var r = el('<div class="row user"><div class="bubble user"></div></div>');
-    r.querySelector('.bubble').textContent = text; transcript.appendChild(r); return r;
+    r.querySelector('.bubble').textContent = text; transcript.appendChild(r); scrollToBottom(); return r;
   }
   async function typeComposer(text, myGen){
     composer.classList.add('typed'); composer.textContent='';
@@ -466,7 +467,7 @@
   async function streamWords(node, text, per, myGen){
     node.classList.add('caret');
     var w = words(text);
-    for (var i=0;i<w.length;i++){ node.textContent += (i?' ':'') + w[i]; await sleep(per, myGen); }
+    for (var i=0;i<w.length;i++){ node.textContent += (i?' ':'') + w[i]; scrollToBottom(); await sleep(per, myGen); }
     node.classList.remove('caret');
   }
 
@@ -511,7 +512,7 @@
           '<div class="tsbody" id="tsbody"></div>'+
         '</div>'+
       '</div></div>');
-    transcript.appendChild(col);
+    transcript.appendChild(col); scrollToBottom();
     var tsbody = col.querySelector('#tsbody');
 
     // root level — the three branches appear, score, then the beam keeps the top 2
@@ -598,7 +599,7 @@
     userRow(SCENARIO.tot.prompt);
     var col = el('<div class="row assistant"><div class="acol">'+buildTreeFinal()+
       '<div class="bubble assistant">'+SCENARIO.tot.answer+'</div></div></div>');
-    transcript.appendChild(col);
+    transcript.appendChild(col); scrollToBottom();
   }
   // ============== Scene 1: JSON Think — free-form chat vs grammar-constrained JSON ==============
   // Types pre-highlighted JSON one tag/text fragment at a time so the .k/.s/.n spans
@@ -625,7 +626,7 @@
     userRow(d.prompt); resetComposer();
     await sleep(260, myGen);
     var a1 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
-    transcript.appendChild(a1);
+    transcript.appendChild(a1); scrollToBottom();
     await streamWords(a1.querySelector('.bubble'), d.chatAnswer, TOK_MS, myGen);
     await sleep(900, myGen);
 
@@ -640,7 +641,7 @@
     userRow(d.prompt);
     await sleep(220, myGen);
     var a2 = el('<div class="row assistant"><div class="acol"></div></div>');
-    transcript.appendChild(a2);
+    transcript.appendChild(a2); scrollToBottom();
     var ans = el('<div class="bubble json"></div>');
     a2.querySelector('.acol').appendChild(ans);
     setCaption('Same prompt — JSON Think returns one clean JSON object, no prose, parseable every time.');
@@ -658,11 +659,11 @@
     userRow(SCENARIO.json.prompt);
     var a1 = el('<div class="row assistant"><div class="assistant-turn"><div class="bubble assistant"></div></div></div>');
     a1.querySelector('.bubble').textContent = SCENARIO.json.chatAnswer;
-    transcript.appendChild(a1);
+    transcript.appendChild(a1); scrollToBottom();
     userRow(SCENARIO.json.prompt);
     var a2 = el('<div class="row assistant"><div class="acol">'+
       '<div class="bubble json">'+SCENARIO.json.answer+'</div></div></div>');
-    transcript.appendChild(a2);
+    transcript.appendChild(a2); scrollToBottom();
   }
 
   // ============== Scene 2: Best of N — pick, comment, refine once ==============
@@ -682,19 +683,17 @@
     userRow(d.prompt); resetComposer();
     await sleep(260, myGen);
     var row = el('<div class="row assistant"><div class="acol"><div class="tsearch"><div class="tshead"><span>Options</span> <span class="status" id="bstat">generating…</span> <span class="tchev">▾</span></div><div class="bonbox" id="bon1"></div></div></div></div>');
-    transcript.appendChild(row);
+    transcript.appendChild(row); scrollToBottom();
     var first = await showBonOptions(row.querySelector('#bon1'), d.first, myGen);
     row.querySelector('#bstat').textContent = 'pick one';
     await sleep(520, myGen);
     chooseBon(first[0]);
     row.querySelector('#bstat').textContent = 'chosen';
     await sleep(450, myGen);
-    var comment = el('<div class="boncomment">'+d.comment+'</div>');
-    row.querySelector('.acol').appendChild(comment);
     setCaption('The comment seeds round two from the answer you picked.');
     await sleep(850, myGen);
     var row2 = el('<div class="row assistant"><div class="acol"><div class="boncomment">'+d.comment+'</div><div class="tsearch"><div class="tshead"><span>Options</span> <span class="status" id="bstat2">generating…</span> <span class="tchev">▾</span></div><div class="bonbox" id="bon2"></div></div></div></div>');
-    transcript.appendChild(row2);
+    transcript.appendChild(row2); scrollToBottom();
     var second = await showBonOptions(row2.querySelector('#bon2'), d.second, myGen);
     row2.querySelector('#bstat2').textContent = 'pick one';
     await sleep(520, myGen);
@@ -712,7 +711,7 @@
     userRow(d.prompt);
     var rows = d.second.map(function(t, i){ return '<div class="bonopt in'+(i===0?' chosen':'')+'"><span class="pick">'+(i===0?'✓':'○')+'</span><span>'+t+'</span></div>'; }).join('');
     var col = el('<div class="row assistant"><div class="acol"><div class="boncomment">'+d.comment+'</div><div class="tsearch"><div class="tshead"><span>Options</span> <span class="status">chosen</span> <span class="tchev">▾</span></div><div class="bonbox">'+rows+'</div></div><div class="bubble assistant">'+d.answer+'</div></div></div>');
-    transcript.appendChild(col);
+    transcript.appendChild(col); scrollToBottom();
   }
 
   var SCENES = [
