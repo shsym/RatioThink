@@ -150,6 +150,7 @@ class ResponseParsing(unittest.TestCase):
                 "[DONE]",
             ),
             fallback_count=lambda text: len(text.split()),
+            answer_key=lambda text: h._self_consistency_key("gsm8k_numeric", text),
         )
 
         self.assertEqual(parsed.answer, "The arithmetic gives #### 18")
@@ -169,6 +170,90 @@ class ResponseParsing(unittest.TestCase):
         selected = h.select_best_of_n_candidate(candidates)
 
         self.assertEqual(selected.id, "a")
+
+    def test_best_of_n_selection_can_use_dataset_aware_answer_key(self):
+        candidates = [
+            h.BestOfNCandidate("a", 0, "The date is 2024, but answer 7", "snap-a"),
+            h.BestOfNCandidate("b", 1, "final value 7", "snap-b"),
+            h.BestOfNCandidate("c", 2, "answer 9", "snap-c"),
+        ]
+
+        selected = h.select_best_of_n_candidate(
+            candidates,
+            answer_key=lambda text: "7" if "7" in text else "9",
+        )
+
+        self.assertIn(selected.id, {"a", "b"})
+
+    def test_best_of_n_fallback_tokens_sum_all_parseable_candidates(self):
+        parsed = h.parse_best_of_n_stream(
+            _sse(
+                {"event": "node_complete", "node": {"id": "a", "status": "ok", "branch_index": 0, "content": "one two"}},
+                {"event": "node_complete", "node": {"id": "b", "status": "ok", "branch_index": 1, "content": "three four five"}},
+                {"event": "awaiting_selection", "candidates": [
+                    {"id": "a", "branch_index": 0, "snapshot_name": "s/a"},
+                    {"id": "b", "branch_index": 1, "snapshot_name": "s/b"},
+                ]},
+                "[DONE]",
+            ),
+            fallback_count=lambda text: len(text.split()),
+        )
+
+        self.assertIsNone(parsed.error)
+        self.assertEqual(parsed.tokens, 5)
+        self.assertEqual(parsed.token_source, "tokenizer_fallback_all_candidates")
+        self.assertEqual(parsed.n_token_fallback, 2)
+
+    def test_best_of_n_parser_strips_and_rejects_whitespace_only_ok_nodes(self):
+        parsed = h.parse_best_of_n_stream(
+            _sse(
+                {"event": "node_complete", "node": {"id": "blank", "status": "ok", "branch_index": 0, "content": "   \n\t"}},
+                {"event": "awaiting_selection", "candidates": [
+                    {"id": "blank", "branch_index": 0, "snapshot_name": "s/blank"},
+                ]},
+                "[DONE]",
+            ),
+            fallback_count=lambda text: len(text.split()),
+        )
+
+        self.assertEqual(parsed.error, "awaiting_selection had no parseable candidates")
+        self.assertEqual(parsed.node_errors[0]["id"], "blank")
+        self.assertEqual(parsed.node_errors[0]["status"], "ok")
+
+    def test_best_of_n_parser_reports_malformed_sse_json(self):
+        parsed = h.parse_best_of_n_stream("data: {not json}\n")
+
+        self.assertIn("malformed SSE JSON", parsed.error or "")
+
+    def test_best_of_n_parser_reports_missing_terminal_selection(self):
+        parsed = h.parse_best_of_n_stream(
+            _sse({"event": "node_complete", "node": {"id": "a", "status": "ok", "content": "answer"}})
+        )
+
+        self.assertEqual(parsed.error, "missing terminal awaiting_selection frame")
+
+    def test_best_of_n_parser_reports_terminal_error_frame(self):
+        parsed = h.parse_best_of_n_stream(_sse({"event": "error", "message": "boom"}))
+
+        self.assertEqual(parsed.error, "boom")
+
+    def test_cell_discloses_token_source_and_fallback_counts(self):
+        items = [
+            h.ItemResult(
+                dataset="gsm8k",
+                index=1,
+                prompt_id="1",
+                reference={"final_answer": "1"},
+                single=h.ArmResult(answer="1", tokens=1, token_source="usage.completion_tokens"),
+                tot=h.ArmResult(answer="1", tokens=1, token_source="skipped"),
+                best_of_n=h.ArmResult(answer="1", tokens=5, token_source="tokenizer_fallback_all_candidates", n_token_fallback=3),
+            )
+        ]
+
+        summary = h.summarize_model("m", items, "gsm8k_numeric")
+
+        self.assertEqual(summary["best_of_n"]["token_sources"], {"tokenizer_fallback_all_candidates": 1})
+        self.assertEqual(summary["best_of_n"]["n_token_fallback"], 3)
 
 
 
@@ -276,7 +361,7 @@ class Aggregation(unittest.TestCase):
             "reference": {"final_answer": "18"},
         }]
 
-        async def fake_once(http_c, base_url, model, prompt, count):
+        async def fake_once(http_c, base_url, model, prompt, count, *args):
             return h.ArmResult(answer="#### 18", tokens=3, latency_s=0.01)
 
         async def fail_tot(*args, **kwargs):
@@ -326,7 +411,7 @@ class Aggregation(unittest.TestCase):
             "mbpp": "def f(a):\n    return a + 1\n",
         }
 
-        async def fake_once(http_c, base_url, model, prompt, count):
+        async def fake_once(http_c, base_url, model, prompt, count, *args):
             dataset = "humaneval" if "add_one" in prompt else "mbpp"
             return h.ArmResult(answer=answers[dataset], tokens=3, latency_s=0.01)
 

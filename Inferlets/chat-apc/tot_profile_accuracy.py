@@ -80,6 +80,7 @@ class ArmResult:
     latency_s: float = 0.0
     error: str | None = None
     token_source: str | None = None
+    n_token_fallback: int = 0
     node_errors: list[dict] = field(default_factory=list)
     selected_candidate_id: str | None = None
     release_snapshots: list[str] = field(default_factory=list)
@@ -144,7 +145,7 @@ def parse_single_pass_response(payload: dict, fallback_count: Callable[[str], in
         return ArmResult(answer=answer, tokens=completion_tokens,
                          token_source="usage.completion_tokens")
     return ArmResult(answer=answer, tokens=fallback_count(answer or ""),
-                     token_source="tokenizer_fallback")
+                     token_source="tokenizer_fallback", n_token_fallback=1)
 
 
 def parse_tot_stream(text: str, fallback_count: Callable[[str], int] | None = None) -> ArmResult:
@@ -193,11 +194,13 @@ def parse_tot_stream(text: str, fallback_count: Callable[[str], int] | None = No
     tokens = metrics.get("output_tokens")
     if isinstance(tokens, int):
         token_source = "generation_metrics.output_tokens"
+        n_token_fallback = 0
     else:
         tokens = (fallback_count or (lambda s: len(s.split())))(answer)
         token_source = "tokenizer_fallback"
+        n_token_fallback = 1
     return ArmResult(answer=answer, tokens=tokens, token_source=token_source,
-                     node_errors=node_errors)
+                     n_token_fallback=n_token_fallback, node_errors=node_errors)
 
 
 def _sse_events(text: str) -> tuple[list[dict], str | None]:
@@ -215,12 +218,31 @@ def _sse_events(text: str) -> tuple[list[dict], str | None]:
     return events, None
 
 
-def _final_answer_key(text: str) -> str:
-    tail = g.last_number(text)
-    return str(tail) if tail is not None else " ".join(text.lower().split())
+def _normalized_text_key(text: str) -> str:
+    return " ".join(text.lower().split())
 
 
-def select_best_of_n_candidate(candidates: list[BestOfNCandidate]) -> BestOfNCandidate:
+def _self_consistency_key(grader: str, text: str) -> str:
+    if grader in ("gsm8k_numeric", "mcq_numeric"):
+        tail = g.last_number(text)
+        return f"number:{tail}" if tail is not None else f"text:{_normalized_text_key(text)}"
+    if grader in ("humaneval_exec", "mbpp_exec"):
+        return f"code:{_normalized_text_key(g.extract_code(text))}"
+    if grader == "jsonschema_validate":
+        extracted = g.extract_json(text)
+        if extracted is not None:
+            try:
+                return "json:" + json.dumps(json.loads(extracted), sort_keys=True, separators=(",", ":"))
+            except json.JSONDecodeError:
+                return f"json_text:{_normalized_text_key(extracted)}"
+        return f"text:{_normalized_text_key(text)}"
+    return f"text:{_normalized_text_key(text)}"
+
+
+def select_best_of_n_candidate(
+    candidates: list[BestOfNCandidate],
+    answer_key: Callable[[str], str] | None = None,
+) -> BestOfNCandidate:
     """Choose a Best-of-N candidate without consulting the gold answer.
 
     Prefer the modal extracted final answer (self-consistency).  Within that
@@ -229,9 +251,10 @@ def select_best_of_n_candidate(candidates: list[BestOfNCandidate]) -> BestOfNCan
     """
     if not candidates:
         raise ValueError("cannot select from an empty Best-of-N candidate list")
+    key = answer_key or _normalized_text_key
     buckets: dict[str, list[BestOfNCandidate]] = {}
     for candidate in candidates:
-        buckets.setdefault(_final_answer_key(candidate.content), []).append(candidate)
+        buckets.setdefault(key(candidate.content), []).append(candidate)
     majority = max(buckets.values(), key=lambda group: (len(group), -group[0].branch_index))
     if len(candidates) == 1:
         return candidates[0]
@@ -249,7 +272,9 @@ def select_best_of_n_candidate(candidates: list[BestOfNCandidate]) -> BestOfNCan
 
 
 def parse_best_of_n_stream(
-    text: str, fallback_count: Callable[[str], int] | None = None
+    text: str,
+    fallback_count: Callable[[str], int] | None = None,
+    answer_key: Callable[[str], str] | None = None,
 ) -> ArmResult:
     events, malformed = _sse_events(text)
     node_errors: list[dict] = []
@@ -266,8 +291,9 @@ def parse_best_of_n_stream(
         node_id = str(node.get("id") or "")
         if isinstance(node.get("branch_index"), int):
             branch_indexes[node_id] = node["branch_index"]
-        if node.get("status") == "ok" and node.get("content"):
-            contents[node_id] = str(node.get("content") or "").strip()
+        content = str(node.get("content") or "").strip()
+        if node.get("status") == "ok" and content:
+            contents[node_id] = content
         else:
             node_errors.append({
                 "id": node.get("id"),
@@ -318,20 +344,24 @@ def parse_best_of_n_stream(
             release_snapshots=release_snapshots,
         )
 
-    selected = select_best_of_n_candidate(candidates)
+    selected = select_best_of_n_candidate(candidates, answer_key=answer_key)
     metrics = next((e for e in reversed(events)
                     if e.get("event") == "generation_metrics"), {})
     tokens = metrics.get("output_tokens")
     if isinstance(tokens, int):
         token_source = "generation_metrics.output_tokens"
+        n_token_fallback = 0
     else:
-        tokens = (fallback_count or (lambda s: len(s.split())))(selected.content)
-        token_source = "tokenizer_fallback"
+        counter = fallback_count or (lambda s: len(s.split()))
+        tokens = sum(counter(candidate.content) for candidate in candidates)
+        token_source = "tokenizer_fallback_all_candidates"
+        n_token_fallback = len(candidates)
 
     return ArmResult(
         answer=selected.content,
         tokens=tokens,
         token_source=token_source,
+        n_token_fallback=n_token_fallback,
         node_errors=node_errors,
         selected_candidate_id=selected.id,
         release_snapshots=release_snapshots,
@@ -356,6 +386,8 @@ def _cell(items: list[ItemResult], arm_name: str, grader: str) -> dict:
     tokens_per_second: list[float] = []
     first_error: str | None = None
     node_error_count = 0
+    token_sources: dict[str, int] = {}
+    n_token_fallback = 0
     for item in items:
         arm: ArmResult = getattr(item, arm_name)
         node_error_count += len(arm.node_errors)
@@ -367,6 +399,9 @@ def _cell(items: list[ItemResult], arm_name: str, grader: str) -> dict:
         if bucket == "ungradable":
             n_ungradable += 1
             continue
+        if arm.token_source:
+            token_sources[arm.token_source] = token_sources.get(arm.token_source, 0) + 1
+        n_token_fallback += arm.n_token_fallback
         tokens.append(arm.tokens)
         latencies.append(arm.latency_s)
         if arm.latency_s > 0:
@@ -391,6 +426,8 @@ def _cell(items: list[ItemResult], arm_name: str, grader: str) -> dict:
         ),
         "first_error": first_error,
         "node_error_count": node_error_count,
+        "token_sources": token_sources,
+        "n_token_fallback": n_token_fallback,
     }
 
 
@@ -487,6 +524,8 @@ def _empty_cell(first_error: str | None = None) -> dict:
         "mean_tokens_per_second": None,
         "first_error": first_error,
         "node_error_count": 0,
+        "token_sources": {},
+        "n_token_fallback": 0,
     }
 
 
@@ -668,7 +707,7 @@ async def _release_best_of_n_snapshots(
 
 
 async def _best_of_n_once(http_c: httpx.AsyncClient, base_url: str, model: str,
-                          prompt: str, count) -> ArmResult:
+                          prompt: str, count, grader: str) -> ArmResult:
     body = {
         "inferlet": "best-of-n",
         "stream": True,
@@ -688,7 +727,9 @@ async def _best_of_n_once(http_c: httpx.AsyncClient, base_url: str, model: str,
         latency = time.monotonic() - started
         if r.status_code != 200:
             return ArmResult(latency_s=latency, error=f"best-of-n dispatch {r.status_code}: {r.text[:200]}")
-        parsed = parse_best_of_n_stream(r.text, count)
+        parsed = parse_best_of_n_stream(
+            r.text, count, answer_key=lambda text: _self_consistency_key(grader, text)
+        )
         parsed.latency_s = latency
         release_error = await _release_best_of_n_snapshots(
             http_c, base_url, parsed.release_snapshots
@@ -720,7 +761,7 @@ async def _run_model_dataset(base_url: str, model: str, dataset: str, count) -> 
                 if "tot" in arms else _skipped_arm()
             )
             best_of_n = (
-                await _best_of_n_once(http_c, base_url, model, rec["prompt"], count)
+                await _best_of_n_once(http_c, base_url, model, rec["prompt"], count, grader)
                 if "best_of_n" in arms else _skipped_arm()
             )
             item = ItemResult(dataset, i, prompt_id, rec["reference"], single, tot, best_of_n)
@@ -772,7 +813,7 @@ async def _run() -> dict:
             "temperature": BON_TEMPERATURE,
             "top_p": BON_TOP_P,
             "thinking": BON_THINKING,
-            "selection": "modal final answer, then textual centrality, length, branch order",
+            "selection": "modal dataset-aware extracted answer, then textual centrality, length, branch order",
         },
     }
 
