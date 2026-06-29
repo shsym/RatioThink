@@ -462,6 +462,12 @@
     for (var i=0;i<text.length;i++){ composer.textContent+=text[i]; await sleep(22, myGen); }
     await sleep(240, myGen);
   }
+  async function typeInto(node, text, myGen){
+    node.textContent = '';
+    if (reduce){ node.textContent = text; scrollToBottom(); return; }
+    for (var i=0;i<text.length;i++){ node.textContent += text[i]; scrollToBottom(); await sleep(22, myGen); }
+    await sleep(240, myGen);
+  }
   function words(s){ return s.split(' '); }
   // normal pass: one token (word) at a time
   async function streamWords(node, text, per, myGen){
@@ -690,12 +696,13 @@
     chooseBon(first[0]);
     row.querySelector('#bstat').textContent = 'chosen';
     await sleep(450, myGen);
-    setCaption('The comment seeds round two from the answer you picked.');
-    await typeComposer(d.comment, myGen);
-    resetComposer();
-    await sleep(850, myGen);
-    var row2 = el('<div class="row assistant"><div class="acol"><div class="boncomment">'+d.comment+'</div><div class="tsearch"><div class="tshead"><span>Options</span> <span class="status" id="bstat2">generating…</span> <span class="tchev">▾</span></div><div class="bonbox" id="bon2"></div></div></div></div>');
+    setCaption('Add a short comment to seed round two from the answer you picked.');
+    var row2 = el('<div class="row assistant"><div class="acol"><div class="boncomment"></div></div></div>');
     transcript.appendChild(row2); scrollToBottom();
+    await typeInto(row2.querySelector('.boncomment'), d.comment, myGen);
+    await sleep(450, myGen);
+    var round2 = el('<div class="tsearch"><div class="tshead"><span>Options</span> <span class="status" id="bstat2">generating…</span> <span class="tchev">▾</span></div><div class="bonbox" id="bon2"></div></div>');
+    row2.querySelector('.acol').appendChild(round2); scrollToBottom();
     var second = await showBonOptions(row2.querySelector('#bon2'), d.second, myGen);
     row2.querySelector('#bstat2').textContent = 'pick one';
     await sleep(520, myGen);
