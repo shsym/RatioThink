@@ -49,6 +49,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e2e_test as e2e  # noqa: E402
 from pie_client import PieClient  # noqa: E402
+from tot_profile_accuracy import ArmResult, parse_best_of_n_stream  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_PATH = Path(
@@ -139,6 +140,7 @@ class RoundResult:
         self.candidates: list[dict] = []          # awaiting_selection candidates
         self.level: int | None = None
         self.error: dict | None = None
+        self.profile_arm: ArmResult | None = None
         self._seen_complete = False
 
     def feed(self, frame: dict) -> None:
@@ -187,6 +189,7 @@ class RoundResult:
 async def run_round(http: httpx.AsyncClient, base: str, payload: dict) -> RoundResult:
     """POST a Best-of-N round and consume its SSE stream into a RoundResult."""
     result = RoundResult()
+    sse_lines: list[str] = []
     async with http.stream(
         "POST",
         f"{base}/v1/chat/completions",
@@ -201,13 +204,19 @@ async def run_round(http: httpx.AsyncClient, base: str, payload: dict) -> RoundR
             if not line.startswith("data:"):
                 continue
             data = line[len("data:"):].strip()
-            if not data or data == "[DONE]":
+            if not data:
+                continue
+            sse_lines.append(f"data: {data}")
+            if data == "[DONE]":
                 continue
             try:
                 frame = json.loads(data)
             except json.JSONDecodeError:
                 continue
             result.feed(frame)
+    result.profile_arm = parse_best_of_n_stream(
+        "\n".join(sse_lines), lambda text: len(text.split())
+    )
     return result
 
 
@@ -260,6 +269,14 @@ def report_round(tag: str, r: RoundResult) -> None:
     print(f"  node_starts={len(r.node_starts)} distinct_delta_ids={r.distinct_delta_ids()} "
           f"delta_transitions={r.delta_transitions()} all_started_before_complete={r.first_complete_after_starts}")
     print(f"  level={r.level} candidates={len(r.candidates)} error={r.error}")
+    if r.profile_arm is not None:
+        print(
+            "  profile parser: "
+            f"selected={r.profile_arm.selected_candidate_id} "
+            f"tokens={r.profile_arm.tokens} "
+            f"snapshots={len(r.profile_arm.release_snapshots)} "
+            f"error={r.profile_arm.error}"
+        )
     # Per-node statuses (incl. nodes that streamed but were not pickable) — the
     # diagnostic for a no_candidates terminal: distinguishes generate failure
     # (incomplete/error) from persist failure (KV could not be saved).
@@ -286,6 +303,30 @@ def check_round(tag: str, r: RoundResult, *, expect_level: int, failures: list[s
         return
     if r.level != expect_level:
         failures.append(f"{tag}: level={r.level}, expected {expect_level}")
+    if r.profile_arm is None:
+        failures.append(f"{tag}: profile parser was not run over the real SSE stream")
+    elif r.profile_arm.error:
+        failures.append(f"{tag}: profile parser rejected real SSE: {r.profile_arm.error}")
+    else:
+        candidate_ids = {str(c.get("id")) for c in r.candidates}
+        if r.profile_arm.selected_candidate_id not in candidate_ids:
+            failures.append(
+                f"{tag}: profile parser selected {r.profile_arm.selected_candidate_id!r}, "
+                f"not one of awaiting_selection candidates {sorted(candidate_ids)!r}"
+            )
+        if not r.profile_arm.answer:
+            failures.append(f"{tag}: profile parser returned an empty selected answer")
+        if not r.profile_arm.release_snapshots:
+            failures.append(f"{tag}: profile parser did not expose candidate snapshots to release")
+        elif set(r.profile_arm.release_snapshots) != {
+            str(c.get("snapshot_name")) for c in r.candidates if c.get("snapshot_name")
+        }:
+            failures.append(
+                f"{tag}: profile parser release snapshots {r.profile_arm.release_snapshots!r} "
+                f"do not match awaiting_selection candidates {r.candidates!r}"
+            )
+        if r.profile_arm.tokens <= 0:
+            failures.append(f"{tag}: profile parser token count {r.profile_arm.tokens} <= 0")
     n_ok = sum(1 for c in r.candidates if r.statuses.get(c["id"]) == "ok")
     if n_ok < 2:
         failures.append(f"{tag}: only {n_ok} ok candidate(s); need >=2 to judge divergence")
@@ -445,7 +486,8 @@ async def main() -> int:
     print("RESULT: PASS")
     print("  (a) co-batch parallel decode  (b) real divergence  "
           "(c) warm resume + reprefill fallback  (d) daemon survived  "
-          "(e) stop/commit+abandon release frees snapshots (re-release all absent)")
+          "(e) stop/commit+abandon release frees snapshots (re-release all absent)  "
+          "(f) profile parser accepted the real Best-of-N SSE envelope")
     return 0
 
 
