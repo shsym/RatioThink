@@ -79,8 +79,16 @@ mod tests {
     #[test]
     fn awaiting_selection_lists_pickable_candidates() {
         let picks = vec![
-            Pick { id: "bon-n1".to_string(), branch_index: 0, snapshot_name: "bon/r/1/0".to_string() },
-            Pick { id: "bon-n2".to_string(), branch_index: 1, snapshot_name: "bon/r/1/1".to_string() },
+            Pick {
+                id: "bon-n1".to_string(),
+                branch_index: 0,
+                snapshot_name: "bon/r/1/0".to_string(),
+            },
+            Pick {
+                id: "bon-n2".to_string(),
+                branch_index: 1,
+                snapshot_name: "bon/r/1/1".to_string(),
+            },
         ];
         let v = serde_json::to_value(AwaitingSelectionFrame {
             event: "awaiting_selection",

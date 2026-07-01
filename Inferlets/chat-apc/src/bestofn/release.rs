@@ -20,8 +20,8 @@
 
 use serde::Serialize;
 
-use inferlet::model::Model;
 use inferlet::Context;
+use inferlet::model::Model;
 
 use crate::sse;
 use wstd::http::server::{Finished, Responder};
@@ -164,7 +164,14 @@ mod tests {
             deleted: Vec::new(),
         };
         let report = release_all(&mut ops, &names(&["a", "b", "c"]));
-        assert_eq!(report, ReleaseReport { requested: 3, released: 3, absent: 0 });
+        assert_eq!(
+            report,
+            ReleaseReport {
+                requested: 3,
+                released: 3,
+                absent: 0
+            }
+        );
         // Drop-completeness: every name attempted, none left behind.
         assert_eq!(ops.deleted, names(&["a", "b", "c"]));
         assert!(ops.present.is_empty(), "all snapshots freed");
@@ -177,11 +184,25 @@ mod tests {
             deleted: Vec::new(),
         };
         let first = release_all(&mut ops, &names(&["a", "b"]));
-        assert_eq!(first, ReleaseReport { requested: 2, released: 2, absent: 0 });
+        assert_eq!(
+            first,
+            ReleaseReport {
+                requested: 2,
+                released: 2,
+                absent: 0
+            }
+        );
         // Re-releasing the same names now finds them all gone — the accounting
         // proof that the first release actually deleted them (and freed pages).
         let second = release_all(&mut ops, &names(&["a", "b"]));
-        assert_eq!(second, ReleaseReport { requested: 2, released: 0, absent: 2 });
+        assert_eq!(
+            second,
+            ReleaseReport {
+                requested: 2,
+                released: 0,
+                absent: 2
+            }
+        );
     }
 
     #[test]
@@ -193,7 +214,14 @@ mod tests {
             deleted: Vec::new(),
         };
         let report = release_all(&mut ops, &names(&["a", "b", "c"]));
-        assert_eq!(report, ReleaseReport { requested: 3, released: 2, absent: 1 });
+        assert_eq!(
+            report,
+            ReleaseReport {
+                requested: 3,
+                released: 2,
+                absent: 1
+            }
+        );
         assert_eq!(ops.deleted, names(&["a", "b", "c"]), "every name attempted");
         assert!(ops.present.is_empty(), "no present snapshot left behind");
     }
@@ -212,8 +240,16 @@ mod tests {
     fn emit_failure_cleanup_frees_exactly_the_saved_pick_snapshots() {
         use super::super::stream::Pick;
         let picks = vec![
-            Pick { id: "n0".to_string(), branch_index: 0, snapshot_name: "bon/r/1/0".to_string() },
-            Pick { id: "n1".to_string(), branch_index: 1, snapshot_name: "bon/r/1/1".to_string() },
+            Pick {
+                id: "n0".to_string(),
+                branch_index: 0,
+                snapshot_name: "bon/r/1/0".to_string(),
+            },
+            Pick {
+                id: "n1".to_string(),
+                branch_index: 1,
+                snapshot_name: "bon/r/1/1".to_string(),
+            },
         ];
         // Exactly the expression `run_round` uses on the disconnect branch.
         let to_free: Vec<String> = picks.iter().map(|p| p.snapshot_name.clone()).collect();
@@ -222,8 +258,18 @@ mod tests {
             deleted: Vec::new(),
         };
         let report = release_all(&mut ops, &to_free);
-        assert_eq!(report, ReleaseReport { requested: 2, released: 2, absent: 0 });
+        assert_eq!(
+            report,
+            ReleaseReport {
+                requested: 2,
+                released: 2,
+                absent: 0
+            }
+        );
         assert_eq!(ops.deleted, to_free, "every saved pick snapshot attempted");
-        assert!(ops.present.is_empty(), "no orphaned snapshot survives the disconnect cleanup");
+        assert!(
+            ops.present.is_empty(),
+            "no orphaned snapshot survives the disconnect cleanup"
+        );
     }
 }

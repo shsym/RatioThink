@@ -27,9 +27,9 @@
 //! adding more names later is a pure-inferlet edit.
 
 use serde::Deserialize;
+use wstd::http::Request;
 use wstd::http::body::IncomingBody;
 use wstd::http::server::{Finished, Responder};
-use wstd::http::Request;
 
 use super::completions::{self, ChatCompletionsRequest, ChatMessage, SpecRequest, ToolSchema};
 use crate::sse;
@@ -87,8 +87,8 @@ pub async fn handle(req: Request<IncomingBody>, res: Responder) -> Finished {
         "best-of-n" => {
             crate::bestofn::dispatch(dispatch.input, dispatch.messages, dispatch.stream, res).await
         }
-        other => res
-            .respond(sse::json_error(
+        other => {
+            res.respond(sse::json_error(
                 404,
                 "inferlet_not_found",
                 &format!(
@@ -96,7 +96,8 @@ pub async fn handle(req: Request<IncomingBody>, res: Responder) -> Finished {
                      and 'best-of-n'."
                 ),
             ))
-            .await,
+            .await
+        }
     }
 }
 

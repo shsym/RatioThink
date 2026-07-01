@@ -14,8 +14,7 @@ pub async fn handle(res: Responder) -> Finished {
     // If a future field breaks that invariant we want to surface the
     // bug, not ship a 200 with a malformed body that the OpenAI-shape
     // client would treat as `undefined`.
-    let body = serde_json::to_string(&Healthz { status: "ok" })
-        .expect("Healthz must serialize");
+    let body = serde_json::to_string(&Healthz { status: "ok" }).expect("Healthz must serialize");
     let response = Response::builder()
         .header("Content-Type", "application/json")
         .body(body.into_body())

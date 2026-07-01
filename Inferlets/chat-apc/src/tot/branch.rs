@@ -24,8 +24,8 @@
 //! the shared module exposes the stable surface and the helpers stay where
 //! they are used — `search.rs` remains the owner of single-candidate
 //! generation; this module is its cross-module access point.
-pub(crate) use super::search::{generate_branch, Demux, DemuxKind};
-pub(crate) use super::stream::{emit_level, emit_tree_start, BranchSink};
+pub(crate) use super::search::{Demux, DemuxKind, generate_branch};
+pub(crate) use super::stream::{BranchSink, emit_level, emit_tree_start};
 pub(crate) use super::tree::{Node, NodeStatus};
 
 use super::schema::{ExecStrategy, TotParams, TotTask};

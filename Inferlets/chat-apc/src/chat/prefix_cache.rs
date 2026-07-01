@@ -258,13 +258,17 @@ impl Default for RetentionReason {
 fn map_host_retention_reason(reason: HostRetentionReason) -> RetentionReason {
     match reason {
         HostRetentionReason::RetainedBelowSoftLimit => RetentionReason::RetainedBelowSoftLimit,
-        HostRetentionReason::RetainedBelowEvictionLimit => RetentionReason::RetainedBelowEvictionLimit,
+        HostRetentionReason::RetainedBelowEvictionLimit => {
+            RetentionReason::RetainedBelowEvictionLimit
+        }
         HostRetentionReason::EvictedPressure => RetentionReason::EvictedPressure,
         HostRetentionReason::HardCapStillExceeded => RetentionReason::HardCapStillExceeded,
         HostRetentionReason::RetentionDeleteFailed => RetentionReason::RetentionDeleteFailed,
         HostRetentionReason::ProtectedActive => RetentionReason::ProtectedActive,
         HostRetentionReason::NoInactiveSnapshots => RetentionReason::NoInactiveSnapshots,
-        HostRetentionReason::SkippedUncertainAccounting => RetentionReason::SkippedUncertainAccounting,
+        HostRetentionReason::SkippedUncertainAccounting => {
+            RetentionReason::SkippedUncertainAccounting
+        }
     }
 }
 
@@ -596,11 +600,11 @@ impl CacheDiag {
 // =============================================================================
 
 use super::completions::{ChatMessage, ToolSchema, build_prompt_tokens};
+use inferlet::chat;
+use inferlet::model::Model;
 use inferlet::{
     Context, RetentionBudget as HostRetentionBudget, RetentionReason as HostRetentionReason,
 };
-use inferlet::chat;
-use inferlet::model::Model;
 
 /// Inferlet/template version folded into every snapshot name. A chat-apc
 /// build bump (which can change templating, tokenization wrappers, or the

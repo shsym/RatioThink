@@ -151,11 +151,9 @@ impl GemmaChannelDecoder {
             return None;
         }
         let decode_tokenizer = model.tokenizer();
-        Some(Self::new_with_state(
-            start_ids,
-            end_ids,
-            move |tokens| decode_tokenizer.decode(tokens).unwrap_or_default(),
-        ))
+        Some(Self::new_with_state(start_ids, end_ids, move |tokens| {
+            decode_tokenizer.decode(tokens).unwrap_or_default()
+        }))
     }
 
     #[cfg(test)]
@@ -293,18 +291,18 @@ mod tests {
 
     #[test]
     fn gemma_channel_decoder_reports_pending_partial_start_marker() {
-        let mut dec = GemmaChannelDecoder::new_for_testing(
-            vec![100, 42],
-            vec![101],
-            |tokens| format!("{tokens:?}"),
-        );
+        let mut dec = GemmaChannelDecoder::new_for_testing(vec![100, 42], vec![101], |tokens| {
+            format!("{tokens:?}")
+        });
 
         assert!(matches!(dec.feed(&[100]), ReasoningEvent::Idle));
-        assert!(dec.is_start_pending(), "partial Gemma marker must suppress visible content");
+        assert!(
+            dec.is_start_pending(),
+            "partial Gemma marker must suppress visible content"
+        );
         assert!(matches!(dec.feed(&[42]), ReasoningEvent::Start));
         assert!(!dec.is_start_pending());
     }
-
 
     #[test]
     fn gemma_thinking_cue_opens_thought_channel_without_closing_it() {

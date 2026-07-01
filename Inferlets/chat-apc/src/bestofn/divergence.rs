@@ -114,7 +114,11 @@ mod tests {
     fn default_round_uses_all_distinct_stances() {
         let stances_used: std::collections::HashSet<&str> =
             (0..DEFAULT_N).map(|b| STANCES[b % STANCES.len()]).collect();
-        assert_eq!(stances_used.len(), DEFAULT_N, "every default sibling is a distinct stance");
+        assert_eq!(
+            stances_used.len(),
+            DEFAULT_N,
+            "every default sibling is a distinct stance"
+        );
     }
 
     /// Best-of-N owns its thinking knob: `/no_think` is appended when thinking
@@ -146,8 +150,14 @@ mod tests {
             let d = candidate_directive(b, false);
             let r = candidate_retry_directive(b);
             for marker in tot_focus_markers {
-                assert!(!d.contains(marker), "bestofn directive leaked ToT marker {marker:?}");
-                assert!(!r.contains(marker), "bestofn retry leaked ToT marker {marker:?}");
+                assert!(
+                    !d.contains(marker),
+                    "bestofn directive leaked ToT marker {marker:?}"
+                );
+                assert!(
+                    !r.contains(marker),
+                    "bestofn retry leaked ToT marker {marker:?}"
+                );
             }
         }
     }
@@ -157,10 +167,14 @@ mod tests {
     /// a greedy round would make it inert.
     #[test]
     fn stochastic_sampling_guard_tracks_temperature() {
-        assert!(requires_stochastic_sampling(super::super::schema::resolve(
-            &super::super::schema::BestOfNInput::default()
-        ).unwrap().temperature),
-            "the default round must sample stochastically so per-fork seeds diverge candidates");
+        assert!(
+            requires_stochastic_sampling(
+                super::super::schema::resolve(&super::super::schema::BestOfNInput::default())
+                    .unwrap()
+                    .temperature
+            ),
+            "the default round must sample stochastically so per-fork seeds diverge candidates"
+        );
         assert!(requires_stochastic_sampling(0.7));
         assert!(!requires_stochastic_sampling(0.0));
     }

@@ -156,7 +156,11 @@ pub struct SseWarning<'a> {
 
 impl<'a> SseWarning<'a> {
     pub fn new(code: &'a str, message: &'a str) -> Self {
-        Self { event: "warning", code, message }
+        Self {
+            event: "warning",
+            code,
+            message,
+        }
     }
 }
 
@@ -430,12 +434,16 @@ pub async fn read_body(
 /// pre-handler error path.
 pub fn body_error_response(err: BodyError) -> Response<wstd::http::body::BoundedBody<Vec<u8>>> {
     match err {
-        BodyError::Transport(kind) => {
-            json_error(400, transport_error_code(kind), &transport_error_message(kind))
-        }
-        BodyError::TooLarge => {
-            json_error(413, "payload_too_large", "Request body exceeds the endpoint cap")
-        }
+        BodyError::Transport(kind) => json_error(
+            400,
+            transport_error_code(kind),
+            &transport_error_message(kind),
+        ),
+        BodyError::TooLarge => json_error(
+            413,
+            "payload_too_large",
+            "Request body exceeds the endpoint cap",
+        ),
     }
 }
 
@@ -501,7 +509,10 @@ mod tests {
         // io::ErrorKind is #[non_exhaustive]; kinds we don't pin fall
         // back to the generic `transport_error` rather than leaking an
         // unstable Debug label into the wire contract.
-        assert_eq!(transport_error_code(ErrorKind::NotConnected), "transport_error");
+        assert_eq!(
+            transport_error_code(ErrorKind::NotConnected),
+            "transport_error"
+        );
         assert_eq!(transport_error_code(ErrorKind::Other), "transport_error");
     }
 
