@@ -1911,8 +1911,22 @@ fn numeric_majority_leaf(candidates: &[Candidate]) -> Option<String> {
         return None;
     }
 
+    fn score_close(a: Option<u8>, b: Option<u8>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => a.abs_diff(b) <= 1,
+            _ => a == b,
+        }
+    }
+
     fn better_member(a: (usize, &Candidate), b: (usize, &Candidate)) -> bool {
-        a.1.score > b.1.score || (a.1.score == b.1.score && a.0 < b.0)
+        let a_supported = has_supported_numeric_answer(&a.1.content);
+        let b_supported = has_supported_numeric_answer(&b.1.content);
+        if a_supported != b_supported && score_close(a.1.score, b.1.score) {
+            return a_supported;
+        }
+        a.1.score > b.1.score
+            || (a.1.score == b.1.score
+                && (a_supported > b_supported || (a_supported == b_supported && a.0 < b.0)))
     }
 
     fn best_member<'a>(members: &[(usize, &'a Candidate)]) -> (usize, &'a Candidate) {
@@ -1943,11 +1957,11 @@ fn numeric_majority_leaf(candidates: &[Candidate]) -> Option<String> {
     Some(best_member(&buckets[best_bucket].members).1.id.clone())
 }
 
-/// Final numeric token in `text`, with comma separators stripped. Mirrors the
+/// Numeric tokens in `text`, with comma separators stripped. Mirrors the
 /// harness `grade.last_number` convention (`-?\d[\d,]*(?:\.\d+)?`) without a
 /// regex dependency in the wasm crate.
-fn final_numeric_token(text: &str) -> Option<String> {
-    let mut last = None;
+fn numeric_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
     let mut iter = text.char_indices().peekable();
     while let Some((start, ch)) = iter.next() {
         let starts_number = ch.is_ascii_digit()
@@ -1984,9 +1998,25 @@ fn final_numeric_token(text: &str) -> Option<String> {
                 }
             }
         }
-        last = Some(text[start..end].replace(',', ""));
+        tokens.push(text[start..end].replace(',', ""));
     }
-    last
+    tokens
+}
+
+/// Final numeric token in `text`, with comma separators stripped.
+fn final_numeric_token(text: &str) -> Option<String> {
+    numeric_tokens(text).into_iter().last()
+}
+
+fn has_supported_numeric_answer(text: &str) -> bool {
+    let tokens = numeric_tokens(text);
+    if tokens.len() < 2 {
+        return false;
+    }
+    let Some(final_token) = tokens.last() else {
+        return false;
+    };
+    text.trim() != final_token
 }
 
 /// Generate + score one level's branches per the [`ExecStrategy`](super::schema::ExecStrategy),
@@ -5125,6 +5155,26 @@ mod tests {
 
         assert_eq!(out.selected_node_id.as_deref(), Some("right_a"));
         assert_eq!(out.final_answer.as_deref(), Some("The answer is 2."));
+    }
+
+    #[test]
+    fn reasoning_final_selection_prefers_supported_numeric_answer_when_score_is_close() {
+        let supported = "Compute component-wise: 2*3 mod 5 = 1 and 3*5 mod 9 = 6. \
+                         The result is (1, 6), so the final choice is 3.";
+        let flat = vec![
+            Node::root(),
+            ok_leaf("bare_wrong", "4", Some(6)),
+            ok_leaf("supported_right", supported, Some(5)),
+        ];
+        let last = vec![
+            cand_text("bare_wrong", Some(6), "4"),
+            cand_text("supported_right", Some(5), supported),
+        ];
+
+        let out = finalize_for_task(flat, &last, 1, TotTask::Reasoning);
+
+        assert_eq!(out.selected_node_id.as_deref(), Some("supported_right"));
+        assert_eq!(out.final_answer.as_deref(), Some(supported));
     }
 
     #[test]
