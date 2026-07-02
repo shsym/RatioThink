@@ -93,6 +93,26 @@ impl ReasoningDecoder {
             .is_some_and(GemmaChannelDecoder::is_start_pending)
     }
 
+    /// Text for the trailing Gemma thought-channel marker prefix matched so far
+    /// on this batch, if any. The chat decoder may have surfaced it inside the
+    /// same delta as visible answer text; callers should withhold exactly this
+    /// suffix, not the whole delta.
+    pub fn pending_start_marker_text(&self) -> Option<String> {
+        self.gemma
+            .as_ref()
+            .and_then(GemmaChannelDecoder::pending_start_marker_text)
+    }
+
+    /// Text for a Gemma thought-channel opener that completed on this batch, if
+    /// any. This lets callers discard a previously buffered partial opener and
+    /// recover any visible text that preceded a complete marker in the same
+    /// chat delta.
+    pub fn completed_start_marker_text(&self) -> Option<String> {
+        self.gemma
+            .as_ref()
+            .and_then(GemmaChannelDecoder::completed_start_marker_text)
+    }
+
     #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.inner.reset();
@@ -135,6 +155,7 @@ struct GemmaChannelDecoder {
     token_buf: Vec<u32>,
     text_emitted: usize,
     match_pos: usize,
+    completed_start_marker_text: Option<String>,
     detokenize: Box<dyn Fn(&[u32]) -> String + Send>,
 }
 
@@ -177,6 +198,7 @@ impl GemmaChannelDecoder {
             token_buf: Vec::new(),
             text_emitted: 0,
             match_pos: 0,
+            completed_start_marker_text: None,
             detokenize: Box::new(detokenize),
         }
     }
@@ -191,11 +213,13 @@ impl GemmaChannelDecoder {
     }
 
     fn feed(&mut self, tokens: &[u32]) -> ReasoningEvent {
+        self.completed_start_marker_text = None;
         if !self.inside {
             for &t in tokens {
                 if self.match_pos < self.start_ids.len() && t == self.start_ids[self.match_pos] {
                     self.match_pos += 1;
                     if self.match_pos == self.start_ids.len() {
+                        self.completed_start_marker_text = Some((self.detokenize)(&self.start_ids));
                         self.inside = true;
                         self.match_pos = 0;
                         self.token_buf.clear();
@@ -245,10 +269,20 @@ impl GemmaChannelDecoder {
         self.token_buf.clear();
         self.text_emitted = 0;
         self.match_pos = 0;
+        self.completed_start_marker_text = None;
     }
 
     fn is_start_pending(&self) -> bool {
         !self.inside && self.match_pos > 0
+    }
+
+    fn pending_start_marker_text(&self) -> Option<String> {
+        self.is_start_pending()
+            .then(|| (self.detokenize)(&self.start_ids[..self.match_pos]))
+    }
+
+    fn completed_start_marker_text(&self) -> Option<String> {
+        self.completed_start_marker_text.clone()
     }
 }
 
@@ -290,18 +324,32 @@ mod tests {
     }
 
     #[test]
-    fn gemma_channel_decoder_reports_pending_partial_start_marker() {
-        let mut dec = GemmaChannelDecoder::new_for_testing(vec![100, 42], vec![101], |tokens| {
-            format!("{tokens:?}")
-        });
+    fn gemma_channel_decoder_reports_pending_and_completed_start_marker_text() {
+        let mut dec =
+            GemmaChannelDecoder::new_for_testing(vec![100, 42], vec![101], |tokens| match tokens {
+                [100] => "<|channel>".to_string(),
+                [100, 42] => "<|channel>thought".to_string(),
+                other => format!("{other:?}"),
+            });
 
         assert!(matches!(dec.feed(&[100]), ReasoningEvent::Idle));
         assert!(
             dec.is_start_pending(),
             "partial Gemma marker must suppress visible content"
         );
+        assert_eq!(
+            dec.pending_start_marker_text().as_deref(),
+            Some("<|channel>")
+        );
+        assert!(dec.completed_start_marker_text().is_none());
+
         assert!(matches!(dec.feed(&[42]), ReasoningEvent::Start));
         assert!(!dec.is_start_pending());
+        assert!(dec.pending_start_marker_text().is_none());
+        assert_eq!(
+            dec.completed_start_marker_text().as_deref(),
+            Some("<|channel>thought")
+        );
     }
 
     #[test]

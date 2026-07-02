@@ -47,6 +47,6 @@
 #     Scripts/stamp-chat-apc.sh verify-inputs    # post-build, inputs only
 
 vendor_pie_sha = "87e5e4c224bc607c1277c34a30d010c20735ba4c"  # pragma: allowlist secret
-src_sha256     = "afacb1996f15e47610bf8d697b9fc68f49b46c9e3bf0a498985cd0d70729e233"  # pragma: allowlist secret
-wasm_sha256    = "8cc0d9da081cdf55426b38f66c722ce9b1d7b65bb95d90917a17abab651fcb25"  # pragma: allowlist secret
-wasm_size      = 1314706
+src_sha256     = "441af51685e7142329f883348a9196862b387d1a397e42a1e87d84ae9ea233d8"  # pragma: allowlist secret
+wasm_sha256    = "08a265601460980556481138b0fdb2b0a23d9fc6c595903e91d59091bc815c49"  # pragma: allowlist secret
+wasm_size      = 1325544

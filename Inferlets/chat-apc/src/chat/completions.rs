@@ -1696,9 +1696,6 @@ fn answer_after_close(chat_delta: &str) -> Option<&str> {
 ///
 /// * `forced_tool` → always suppressed: the whole generation IS the tool call,
 ///   which rides only the terminal `tool_calls` delta.
-/// * `suppress_pending_reasoning_marker` → a partial Gemma channel marker is
-///   buffered; hold the chat-decoder prefix out of visible content until the
-///   marker either completes or fails.
 /// * batch landed entirely outside reasoning ([`content_visible`]) → the full
 ///   delta is visible content.
 /// * the reasoning block closed ON this batch (`reason_ended`) → recover the
@@ -1711,11 +1708,8 @@ fn visible_content<'a>(
     was_in_reasoning: bool,
     reason_ended: bool,
     forced_tool: bool,
-    suppress_pending_reasoning_marker: bool,
 ) -> &'a str {
     if forced_tool {
-        ""
-    } else if suppress_pending_reasoning_marker {
         ""
     } else if content_visible(reason_idle, was_in_reasoning) {
         chat_delta
@@ -1723,6 +1717,60 @@ fn visible_content<'a>(
         answer_after_close(chat_delta).unwrap_or("")
     } else {
         ""
+    }
+}
+
+#[derive(Default)]
+struct PendingReasoningMarker {
+    buffered: String,
+}
+
+impl PendingReasoningMarker {
+    fn visible_delta(
+        &mut self,
+        chat_delta: &str,
+        base_visible: &str,
+        pending_marker: Option<&str>,
+        completed_marker: Option<&str>,
+        forced_tool: bool,
+    ) -> String {
+        if forced_tool {
+            self.buffered.clear();
+            return String::new();
+        }
+
+        let mut out = String::new();
+        if !self.buffered.is_empty() {
+            if completed_marker.is_some() {
+                self.buffered.clear();
+            } else if pending_marker.is_none() {
+                out.push_str(&self.buffered);
+                self.buffered.clear();
+            }
+        }
+
+        if let Some(marker) = completed_marker {
+            if let Some((before, _)) = chat_delta.split_once(marker) {
+                out.push_str(before);
+            } else {
+                out.push_str(base_visible);
+            }
+            return out;
+        }
+
+        if let Some(marker) = pending_marker {
+            if let Some(prefix) = chat_delta.strip_suffix(marker) {
+                out.push_str(prefix);
+                self.buffered.clear();
+                self.buffered.push_str(marker);
+            } else {
+                out.push_str(base_visible);
+            }
+            return out;
+        }
+
+        out.push_str(base_visible);
+        out
     }
 }
 
@@ -3968,6 +4016,7 @@ async fn handle_streaming(
     // the canonical next-turn boundary. Only used when `cache_plan` is
     // engaged.
     let mut full_text = String::new();
+    let mut pending_reasoning_marker = PendingReasoningMarker::default();
 
     // F1/F2/F3/F5: explicit-match loop with an `Outcome` set at the
     // exit point. `Generator::next` Err, decoder Err, and chat-
@@ -4103,7 +4152,8 @@ async fn handle_streaming(
                 );
             }
         }
-        let suppress_pending_reasoning_marker = reason_dec.suppress_content_for_pending_marker();
+        let pending_marker = reason_dec.pending_start_marker_text();
+        let completed_marker = reason_dec.completed_start_marker_text();
 
         // Tool-use side: a completed `Call(name, args)` terminates
         // generation with `finish_reason: "tool_calls"`. The delta
@@ -4144,19 +4194,20 @@ async fn handle_streaming(
             // tool call — `forced_tool` makes the whole generation the call,
             // which rides only the terminal `tool_calls` delta).
             Ok(chat::Event::Delta(s)) => {
-                let visible = visible_content(
+                let base_visible =
+                    visible_content(&s, reason_idle, was_in_reasoning, reason_ended, forced_tool);
+                let visible = pending_reasoning_marker.visible_delta(
                     &s,
-                    reason_idle,
-                    was_in_reasoning,
-                    reason_ended,
+                    base_visible,
+                    pending_marker.as_deref(),
+                    completed_marker.as_deref(),
                     forced_tool,
-                    suppress_pending_reasoning_marker,
                 );
                 if !visible.is_empty() {
                     // #522: mirror the visible text the App persists, so the
                     // save gate can compare it against the generated tokens.
-                    full_text.push_str(visible);
-                    sidecar_assistant_content.push_str(visible);
+                    full_text.push_str(&visible);
+                    sidecar_assistant_content.push_str(&visible);
                     let chunk = ChatCompletionChunk {
                         id: &id,
                         object: "chat.completion.chunk",
@@ -4165,7 +4216,7 @@ async fn handle_streaming(
                         choices: vec![ChunkChoice {
                             index: 0,
                             delta: ChunkDelta {
-                                content: Some(visible),
+                                content: Some(&visible),
                                 ..Default::default()
                             },
                             finish_reason: None,
@@ -4772,6 +4823,7 @@ async fn handle_non_streaming(
     let mut reasoning_text = String::new();
     let mut pending_tool: Option<PendingToolCall> = None;
     let mut in_reasoning = false;
+    let mut pending_reasoning_marker = PendingReasoningMarker::default();
 
     // F4: drive the loop ourselves so we can record the actual
     // termination reason. `collect_text` collapsed natural stop and
@@ -4870,7 +4922,8 @@ async fn handle_non_streaming(
                 );
             }
         }
-        let suppress_pending_reasoning_marker = reason_dec.suppress_content_for_pending_marker();
+        let pending_marker = reason_dec.pending_start_marker_text();
+        let completed_marker = reason_dec.completed_start_marker_text();
 
         if tool_dec_active {
             match tool_dec.feed(&out.tokens) {
@@ -4905,15 +4958,16 @@ async fn handle_non_streaming(
             // suppressed (inside reasoning, the delimiter, or a forced tool call
             // whose content rides only the terminal tool_calls delta).
             Ok(chat::Event::Delta(s)) => {
-                let visible = visible_content(
+                let base_visible =
+                    visible_content(&s, reason_idle, was_in_reasoning, reason_ended, forced_tool);
+                let visible = pending_reasoning_marker.visible_delta(
                     &s,
-                    reason_idle,
-                    was_in_reasoning,
-                    reason_ended,
+                    base_visible,
+                    pending_marker.as_deref(),
+                    completed_marker.as_deref(),
                     forced_tool,
-                    suppress_pending_reasoning_marker,
                 );
-                full_text.push_str(visible);
+                full_text.push_str(&visible);
             }
             // F1: trust the delta-stitched `full_text` that respects the
             // reasoning channel (`content_visible`). The chat decoder runs
@@ -5813,7 +5867,6 @@ mod tests {
                 was_in_reasoning,
                 reason_ended,
                 false,
-                false,
             ));
         }
         (content, reasoning)
@@ -5975,47 +6028,101 @@ mod tests {
         // `handle_non_streaming` loops run per chat Delta.
         // Outside reasoning (reason Idle) → whole delta is content.
         assert_eq!(
-            visible_content("answer", true, false, false, false, false),
+            visible_content("answer", true, false, false, false),
             "answer"
         );
         // Inside reasoning (Start/Delta batch) → suppressed.
-        assert_eq!(
-            visible_content("reasoning", false, false, false, false, false),
-            ""
-        );
+        assert_eq!(visible_content("reasoning", false, false, false, false), "");
         // No-visible-text reasoning token (Idle while inside) → suppressed.
-        assert_eq!(visible_content("", true, true, false, false, false), "");
+        assert_eq!(visible_content("", true, true, false, false), "");
         // Close batch, plain decode (bare delimiter) → nothing recovered.
-        assert_eq!(
-            visible_content("</think>", false, true, true, false, false),
-            ""
-        );
+        assert_eq!(visible_content("</think>", false, true, true, false), "");
         // #600 straddle: `</think>` + answer-head in ONE batch → recover answer.
         assert_eq!(
-            visible_content("</think>\n\nParis", false, true, true, false, false),
+            visible_content("</think>\n\nParis", false, true, true, false),
             "Paris"
         );
         // Straddle with a reasoning tail ahead of the close → still just answer.
         assert_eq!(
-            visible_content("tail</think>Paris", false, true, true, false, false),
+            visible_content("tail</think>Paris", false, true, true, false),
             "Paris"
         );
-        // Gemma `<|channel>` can arrive one token before the rest of the thought
-        // marker. While the reasoning decoder has a pending start marker, the
-        // chat decoder's already-visible prefix must stay suppressed.
-        assert_eq!(
-            visible_content("<|channel>", true, false, false, false, true),
-            ""
-        );
         // forced_tool suppresses on EVERY shape (content rides tool_calls only).
+        assert_eq!(visible_content("answer", true, false, false, true), "");
         assert_eq!(
-            visible_content("answer", true, false, false, true, false),
+            visible_content("</think>Paris", false, true, true, true),
             ""
         );
-        assert_eq!(
-            visible_content("</think>Paris", false, true, true, true, false),
-            ""
+    }
+
+    #[test]
+    fn pending_gemma_marker_suppresses_only_trailing_marker_prefix() {
+        let mut pending = PendingReasoningMarker::default();
+        let base = visible_content("answer<|channel>", true, false, false, false);
+
+        let visible =
+            pending.visible_delta("answer<|channel>", base, Some("<|channel>"), None, false);
+
+        assert_eq!(visible, "answer");
+    }
+
+    #[test]
+    fn pending_gemma_marker_abort_flushes_buffered_prefix() {
+        let mut pending = PendingReasoningMarker::default();
+        let first = pending.visible_delta(
+            "answer<|channel>",
+            visible_content("answer<|channel>", true, false, false, false),
+            Some("<|channel>"),
+            None,
+            false,
         );
+        let second = pending.visible_delta(
+            " not-thought",
+            visible_content(" not-thought", true, false, false, false),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(first, "answer");
+        assert_eq!(second, "<|channel> not-thought");
+    }
+
+    #[test]
+    fn pending_gemma_marker_complete_discards_buffered_prefix() {
+        let mut pending = PendingReasoningMarker::default();
+        let first = pending.visible_delta(
+            "answer<|channel>",
+            visible_content("answer<|channel>", true, false, false, false),
+            Some("<|channel>"),
+            None,
+            false,
+        );
+        let second = pending.visible_delta(
+            "thought",
+            visible_content("thought", false, false, false, false),
+            None,
+            Some("<|channel>thought"),
+            false,
+        );
+
+        assert_eq!(first, "answer");
+        assert_eq!(second, "");
+    }
+
+    #[test]
+    fn completed_gemma_marker_suppresses_only_marker_suffix() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let visible = pending.visible_delta(
+            "answer<|channel>thought",
+            visible_content("answer<|channel>thought", false, false, false, false),
+            None,
+            Some("<|channel>thought"),
+            false,
+        );
+
+        assert_eq!(visible, "answer");
     }
 
     #[test]
