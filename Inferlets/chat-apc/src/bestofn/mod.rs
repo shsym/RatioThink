@@ -292,12 +292,16 @@ pub async fn dispatch(
                     .await;
             }
         };
-        // cue:false — the assistant turn is opened per branch in
+        // CueMode::None — the assistant turn is opened per branch in
         // `generate_branch`, so the shared prefix stays cue-free and its KV
         // pages are shared across the forked candidates.
-        if let Err((code, msg)) =
-            completions::fill_context(&mut root_ctx, &model, &messages, None, false)
-        {
+        if let Err((code, msg)) = completions::fill_context(
+            &mut root_ctx,
+            &model,
+            &messages,
+            None,
+            completions::CueMode::None,
+        ) {
             let status = if completions::is_role_error_code(code) {
                 400
             } else {
@@ -695,10 +699,16 @@ impl ResumeOps for InferletResumeOps<'_> {
     ) -> Result<Context, (&'static str, String)> {
         let mut ctx =
             Context::new(self.model).map_err(|e| ("context_create_failed", e.to_string()))?;
-        // cue:false — the shared prefix stays cue-free; per-branch cues happen
-        // in `generate_branch`.
-        completions::fill_context(&mut ctx, self.model, messages, None, false)
-            .map_err(|(code, msg)| (code, msg))?;
+        // CueMode::None — the shared prefix stays cue-free; per-branch cues
+        // happen in `generate_branch`.
+        completions::fill_context(
+            &mut ctx,
+            self.model,
+            messages,
+            None,
+            completions::CueMode::None,
+        )
+        .map_err(|(code, msg)| (code, msg))?;
         // Append the picked candidate as a sealed assistant turn so the
         // re-prefilled base matches the warm snapshot exactly.
         ctx.assistant(picked_text);

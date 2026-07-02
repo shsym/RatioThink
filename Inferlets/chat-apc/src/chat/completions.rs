@@ -57,7 +57,7 @@ use wstd::http::body::IncomingBody;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Request, Response};
 
-use super::apc::{ReasoningDecoder, ToolUseDecoder};
+use super::apc::{ReasoningDecoder, ToolUseDecoder, gemma_thinking_cue_tokens};
 use super::generate::{self, DecodeStrategy};
 use super::prefix_cache::{self, CacheDiag, ReusePlan};
 use super::spec::sidecar::{Lineage, SidecarKey, SidecarStatus, SidecarStore, encode_sidecar_blob};
@@ -176,6 +176,11 @@ pub struct ChatCompletionsRequest {
     pub stream: bool,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    /// chat-apc extension: request the model's native thinking channel for a
+    /// plain chat completion. Defaults to false so existing callers keep the
+    /// ordinary assistant cue exactly as before.
+    #[serde(default)]
+    pub thinking: bool,
     pub max_tokens: Option<usize>,
     /// OpenAI's newer alias for `max_tokens` (the only field current
     /// OpenAI/Codex-style clients send). Used as a fallback when
@@ -222,6 +227,23 @@ pub struct ChatCompletionsRequest {
     /// non-streaming requests (those always carry `usage`).
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+}
+
+#[derive(Copy, Clone)]
+pub(crate) enum CueMode {
+    None,
+    Generic,
+    Thinking,
+}
+
+impl ChatCompletionsRequest {
+    fn cue_mode(&self) -> CueMode {
+        if self.thinking {
+            CueMode::Thinking
+        } else {
+            CueMode::Generic
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Default)]
@@ -1674,6 +1696,9 @@ fn answer_after_close(chat_delta: &str) -> Option<&str> {
 ///
 /// * `forced_tool` → always suppressed: the whole generation IS the tool call,
 ///   which rides only the terminal `tool_calls` delta.
+/// * `suppress_pending_reasoning_marker` → a partial Gemma channel marker is
+///   buffered; hold the chat-decoder prefix out of visible content until the
+///   marker either completes or fails.
 /// * batch landed entirely outside reasoning ([`content_visible`]) → the full
 ///   delta is visible content.
 /// * the reasoning block closed ON this batch (`reason_ended`) → recover the
@@ -1686,8 +1711,11 @@ fn visible_content<'a>(
     was_in_reasoning: bool,
     reason_ended: bool,
     forced_tool: bool,
+    suppress_pending_reasoning_marker: bool,
 ) -> &'a str {
     if forced_tool {
+        ""
+    } else if suppress_pending_reasoning_marker {
         ""
     } else if content_visible(reason_idle, was_in_reasoning) {
         chat_delta
@@ -3517,7 +3545,14 @@ async fn handle_streaming(
     // legacy full-rebuild path below (byte-identical to pre-#522).
     let cache_plan: Option<ReusePlan> = match req.cache.clone() {
         Some(d) if d.enabled() => {
-            match prefix_cache::plan(&model, &req.model, &req.messages, req.tools.as_deref(), d) {
+            match prefix_cache::plan(
+                &model,
+                &req.model,
+                &req.messages,
+                req.tools.as_deref(),
+                req.cue_mode(),
+                d,
+            ) {
                 Ok(p) => Some(p),
                 Err((code, msg)) => {
                     return res
@@ -3553,9 +3588,13 @@ async fn handle_streaming(
                         .await;
                 }
             };
-            if let Err((code, msg)) =
-                fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true)
-            {
+            if let Err((code, msg)) = fill_context(
+                &mut ctx,
+                &model,
+                &req.messages,
+                req.tools.as_deref(),
+                req.cue_mode(),
+            ) {
                 return res
                     .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
                     .await;
@@ -4064,6 +4103,7 @@ async fn handle_streaming(
                 );
             }
         }
+        let suppress_pending_reasoning_marker = reason_dec.suppress_content_for_pending_marker();
 
         // Tool-use side: a completed `Call(name, args)` terminates
         // generation with `finish_reason: "tool_calls"`. The delta
@@ -4104,8 +4144,14 @@ async fn handle_streaming(
             // tool call — `forced_tool` makes the whole generation the call,
             // which rides only the terminal `tool_calls` delta).
             Ok(chat::Event::Delta(s)) => {
-                let visible =
-                    visible_content(&s, reason_idle, was_in_reasoning, reason_ended, forced_tool);
+                let visible = visible_content(
+                    &s,
+                    reason_idle,
+                    was_in_reasoning,
+                    reason_ended,
+                    forced_tool,
+                    suppress_pending_reasoning_marker,
+                );
                 if !visible.is_empty() {
                     // #522: mirror the visible text the App persists, so the
                     // save gate can compare it against the generated tokens.
@@ -4404,7 +4450,14 @@ async fn handle_non_streaming(
     // path below.
     let cache_plan: Option<ReusePlan> = match req.cache.clone() {
         Some(d) if d.enabled() => {
-            match prefix_cache::plan(&model, &req.model, &req.messages, req.tools.as_deref(), d) {
+            match prefix_cache::plan(
+                &model,
+                &req.model,
+                &req.messages,
+                req.tools.as_deref(),
+                req.cue_mode(),
+                d,
+            ) {
                 Ok(p) => Some(p),
                 Err((code, msg)) => {
                     return res
@@ -4440,9 +4493,13 @@ async fn handle_non_streaming(
                         .await;
                 }
             };
-            if let Err((code, msg)) =
-                fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true)
-            {
+            if let Err((code, msg)) = fill_context(
+                &mut ctx,
+                &model,
+                &req.messages,
+                req.tools.as_deref(),
+                req.cue_mode(),
+            ) {
                 return res
                     .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
                     .await;
@@ -4813,6 +4870,7 @@ async fn handle_non_streaming(
                 );
             }
         }
+        let suppress_pending_reasoning_marker = reason_dec.suppress_content_for_pending_marker();
 
         if tool_dec_active {
             match tool_dec.feed(&out.tokens) {
@@ -4847,8 +4905,14 @@ async fn handle_non_streaming(
             // suppressed (inside reasoning, the delimiter, or a forced tool call
             // whose content rides only the terminal tool_calls delta).
             Ok(chat::Event::Delta(s)) => {
-                let visible =
-                    visible_content(&s, reason_idle, was_in_reasoning, reason_ended, forced_tool);
+                let visible = visible_content(
+                    &s,
+                    reason_idle,
+                    was_in_reasoning,
+                    reason_ended,
+                    forced_tool,
+                    suppress_pending_reasoning_marker,
+                );
                 full_text.push_str(visible);
             }
             // F1: trust the delta-stitched `full_text` that respects the
@@ -5216,9 +5280,9 @@ pub(crate) fn fill_context(
     model: &Model,
     messages: &[ChatMessage],
     tools: Option<&[ToolSchema]>,
-    cue: bool,
+    cue_mode: CueMode,
 ) -> Result<(), (&'static str, String)> {
-    let tokens = build_prompt_tokens(model, messages, tools, cue)?;
+    let tokens = build_prompt_tokens(model, messages, tools, cue_mode)?;
     ctx.append(&tokens);
     Ok(())
 }
@@ -5233,7 +5297,7 @@ pub(crate) fn build_prompt_tokens(
     model: &Model,
     messages: &[ChatMessage],
     tools: Option<&[ToolSchema]>,
-    cue: bool,
+    cue_mode: CueMode,
 ) -> Result<Vec<u32>, (&'static str, String)> {
     let mut out = Vec::new();
     if let Some(tools) = tools {
@@ -5321,10 +5385,16 @@ pub(crate) fn build_prompt_tokens(
     // defers it to each forked branch (so a freshly forked, fully-flushed
     // context still has tokens to process — an empty forward pass spins
     // the generator), so it is opt-out here.
-    if cue {
-        out.extend(chat::cue(model));
-    }
+    out.extend(generation_cue(model, cue_mode));
     Ok(out)
+}
+
+pub(crate) fn generation_cue(model: &Model, cue_mode: CueMode) -> Vec<u32> {
+    match cue_mode {
+        CueMode::None => Vec::new(),
+        CueMode::Generic => chat::cue(model),
+        CueMode::Thinking => gemma_thinking_cue_tokens(model).unwrap_or_else(|| chat::cue(model)),
+    }
 }
 
 fn assistant_replay_content(msg: &ChatMessage) -> String {
@@ -5502,6 +5572,30 @@ mod tests {
 
     fn parse_message(json: &str) -> Result<ChatMessage, serde_json::Error> {
         serde_json::from_str(json)
+    }
+
+    fn parse_request(json: &str) -> Result<ChatCompletionsRequest, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn request_thinking_defaults_false() {
+        let req = parse_request(r#"{"model":"m","messages":[{"role":"user","content":"answer"}]}"#)
+            .unwrap();
+
+        assert!(!req.thinking);
+        assert!(matches!(req.cue_mode(), CueMode::Generic));
+    }
+
+    #[test]
+    fn request_thinking_true_selects_thinking_cue() {
+        let req = parse_request(
+            r#"{"model":"m","messages":[{"role":"user","content":"answer"}],"thinking":true}"#,
+        )
+        .unwrap();
+
+        assert!(req.thinking);
+        assert!(matches!(req.cue_mode(), CueMode::Thinking));
     }
 
     #[test]
@@ -5719,6 +5813,7 @@ mod tests {
                 was_in_reasoning,
                 reason_ended,
                 false,
+                false,
             ));
         }
         (content, reasoning)
@@ -5880,29 +5975,45 @@ mod tests {
         // `handle_non_streaming` loops run per chat Delta.
         // Outside reasoning (reason Idle) → whole delta is content.
         assert_eq!(
-            visible_content("answer", true, false, false, false),
+            visible_content("answer", true, false, false, false, false),
             "answer"
         );
         // Inside reasoning (Start/Delta batch) → suppressed.
-        assert_eq!(visible_content("reasoning", false, false, false, false), "");
+        assert_eq!(
+            visible_content("reasoning", false, false, false, false, false),
+            ""
+        );
         // No-visible-text reasoning token (Idle while inside) → suppressed.
-        assert_eq!(visible_content("", true, true, false, false), "");
+        assert_eq!(visible_content("", true, true, false, false, false), "");
         // Close batch, plain decode (bare delimiter) → nothing recovered.
-        assert_eq!(visible_content("</think>", false, true, true, false), "");
+        assert_eq!(
+            visible_content("</think>", false, true, true, false, false),
+            ""
+        );
         // #600 straddle: `</think>` + answer-head in ONE batch → recover answer.
         assert_eq!(
-            visible_content("</think>\n\nParis", false, true, true, false),
+            visible_content("</think>\n\nParis", false, true, true, false, false),
             "Paris"
         );
         // Straddle with a reasoning tail ahead of the close → still just answer.
         assert_eq!(
-            visible_content("tail</think>Paris", false, true, true, false),
+            visible_content("tail</think>Paris", false, true, true, false, false),
             "Paris"
         );
-        // forced_tool suppresses on EVERY shape (content rides tool_calls only).
-        assert_eq!(visible_content("answer", true, false, false, true), "");
+        // Gemma `<|channel>` can arrive one token before the rest of the thought
+        // marker. While the reasoning decoder has a pending start marker, the
+        // chat decoder's already-visible prefix must stay suppressed.
         assert_eq!(
-            visible_content("</think>Paris", false, true, true, true),
+            visible_content("<|channel>", true, false, false, false, true),
+            ""
+        );
+        // forced_tool suppresses on EVERY shape (content rides tool_calls only).
+        assert_eq!(
+            visible_content("answer", true, false, false, true, false),
+            ""
+        );
+        assert_eq!(
+            visible_content("</think>Paris", false, true, true, true, false),
             ""
         );
     }
