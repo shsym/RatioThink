@@ -182,6 +182,29 @@ class ConfigToml(unittest.TestCase):
         self.assertIn('name = "Qwen/Qwen3-8B"', cfg)
         self.assertIn('hf_repo = "Qwen/Qwen3-8B"', cfg)
 
+    def test_portable_driver_memory_options_are_env_configurable(self):
+        with mock.patch.dict(os.environ, {
+            "PIE_PORTABLE_TOTAL_PAGES": "256",
+            "PIE_PORTABLE_KV_PAGE_SIZE": "16",
+            "PIE_PORTABLE_KV_CACHE_DTYPE": "f16",
+        }, clear=False):
+            cfg = real.config_toml("Qwen/Qwen3-8B")
+
+        self.assertIn("[model.driver.options]", cfg)
+        self.assertIn("total_pages = 256", cfg)
+        self.assertIn("kv_page_size = 16", cfg)
+        self.assertIn('kv_cache_dtype = "f16"', cfg)
+
+    def test_portable_driver_options_are_omitted_when_unset(self):
+        with mock.patch.dict(os.environ, {
+            "PIE_PORTABLE_TOTAL_PAGES": "",
+            "PIE_PORTABLE_KV_PAGE_SIZE": "",
+            "PIE_PORTABLE_KV_CACHE_DTYPE": "",
+        }, clear=False):
+            cfg = real.config_toml("Qwen/Qwen3-8B")
+
+        self.assertNotIn("[model.driver.options]", cfg)
+
 
 class HumanEvalGrader(unittest.TestCase):
     REF = {

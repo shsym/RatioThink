@@ -17,6 +17,53 @@ class _Verdict:
 
 
 class AnalyzeTreeDumpTest(unittest.TestCase):
+    def test_analyze_record_reports_correct_in_tree_and_answer_histogram(self):
+        record = {
+            "index": 16,
+            "grader": "mcq_numeric",
+            "reference": {"final_answer": "2", "choice_count": 4},
+            "final_verdict": "fail",
+            "selected": "wrong-a",
+            "nodes": [
+                {
+                    "id": "wrong-a",
+                    "depth": 2,
+                    "parent_id": "p1",
+                    "branch_index": 0,
+                    "status": "ok",
+                    "content": "Final answer: 3",
+                    "score": 9,
+                },
+                {
+                    "id": "right-b",
+                    "depth": 2,
+                    "parent_id": "p1",
+                    "branch_index": 1,
+                    "status": "ok",
+                    "content": "Both statements are false, so answer 2.",
+                    "score": 5,
+                },
+                {
+                    "id": "thinking-only",
+                    "depth": 1,
+                    "parent_id": "root",
+                    "branch_index": 1,
+                    "status": "incomplete",
+                    "content": "",
+                    "score": None,
+                },
+            ],
+        }
+
+        summary = a.analyze_record(record)
+
+        self.assertTrue(summary["correct_in_tree"])
+        self.assertEqual(summary["n_correct_nodes"], 1)
+        self.assertFalse(summary["selected_node_ok"])
+        self.assertEqual(summary["loss_kind"], "selection_synthesis")
+        self.assertEqual(summary["answer_histogram"], {"2": 1, "3": 1})
+        self.assertEqual(summary["node_answer_grades"]["right-b"]["answer"], "2")
+
     def test_branch_variation_groups_siblings_by_parent_id(self):
         record = {
             "index": 1,

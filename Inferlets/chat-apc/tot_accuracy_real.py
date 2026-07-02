@@ -165,6 +165,32 @@ def _resolve_model_ref(model: str) -> str:
     return matches[0] if matches else model
 
 
+def _positive_int_env(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return value
+
+
+def _portable_driver_options_toml() -> str:
+    total_pages = _positive_int_env("PIE_PORTABLE_TOTAL_PAGES")
+    kv_page_size = _positive_int_env("PIE_PORTABLE_KV_PAGE_SIZE")
+    kv_cache_dtype = os.environ.get("PIE_PORTABLE_KV_CACHE_DTYPE", "").strip()
+    if total_pages is None and kv_page_size is None and not kv_cache_dtype:
+        return ""
+    lines = ["", "[model.driver.options]"]
+    if total_pages is not None:
+        lines.append(f"total_pages = {total_pages}")
+    if kv_page_size is not None:
+        lines.append(f"kv_page_size = {kv_page_size}")
+    if kv_cache_dtype:
+        lines.append(f'kv_cache_dtype = "{kv_cache_dtype}"')
+    return "\n".join(lines) + "\n"
+
+
 def config_toml(model: str) -> str:
     model_ref = _resolve_model_ref(model)
     return f"""
@@ -196,7 +222,7 @@ restore_pause_at_utilization = 0.85
 [model.driver]
 type = "portable"
 device = ["metal"]
-"""
+{_portable_driver_options_toml()}"""
 
 
 CONFIG_TOML = config_toml(MODEL)

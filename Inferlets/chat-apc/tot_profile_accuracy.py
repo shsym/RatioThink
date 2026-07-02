@@ -32,13 +32,18 @@ from pathlib import Path
 from typing import Callable
 
 import httpx
-from pie_client import PieClient
 
 _HERE = Path(__file__).resolve().parent
+_ROOT = _HERE.parents[1]
+_VENDORED_PIE_CLIENT = _ROOT / "Vendor" / "pie" / "client" / "python" / "src"
+if str(_VENDORED_PIE_CLIENT) not in sys.path:
+    sys.path.insert(0, str(_VENDORED_PIE_CLIENT))
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+from pie_client import PieClient  # noqa: E402
 import e2e_test as h  # noqa: E402
+import analyze_tree_dump as tree_analysis  # noqa: E402
 import grade as g  # noqa: E402
 import tot_accuracy_real as base  # noqa: E402
 
@@ -52,16 +57,24 @@ DEFAULT_MODELS = (
 DEFAULT_DATASETS = ("gsm8k", "humaneval", "mbpp", "mmlu")
 MAX_PROMPTS = int(os.environ.get("MAX_PROMPTS", "6"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "512"))
-TOT_BREADTH = int(os.environ.get("TOT_BREADTH", os.environ.get("TOT_WIDTH", "2")))
+PROMPT_INDEXES = os.environ.get("PROMPT_INDEXES", "")
+SINGLE_TEMPERATURE = float(os.environ.get("SINGLE_TEMPERATURE", "0.0"))
+SINGLE_THINKING = os.environ.get("SINGLE_THINKING", "false").lower() in ("1", "true", "yes")
+TOT_BREADTH = int(os.environ.get("TOT_BREADTH", os.environ.get("TOT_WIDTH", "3")))
 TOT_DEPTH = int(os.environ.get("TOT_DEPTH", os.environ.get("MATH_DEPTH", "2")))
-TOT_BEAM = int(os.environ.get("TOT_BEAM", "1"))
+TOT_BEAM = int(os.environ.get("TOT_BEAM", "2"))
 TOT_TASK = os.environ.get("TOT_TASK", "reasoning")
 TOT_TEMPERATURE = float(os.environ.get("TOT_TEMPERATURE", "0.7"))
+TOT_SIBLING_PENALTY = float(os.environ.get("TOT_SIBLING_PENALTY", "0.0"))
+TOT_PROMPT_FRAMING = os.environ.get("TOT_PROMPT_FRAMING", "baseline")
+TOT_SWEEP = os.environ.get("TOT_SWEEP", "0") == "1"
+PROFILE_ARMS = os.environ.get("PROFILE_ARMS", "both").strip().lower()
 BON_N = int(os.environ.get("BON_N", os.environ.get("BEST_OF_N", "3")))
 BON_TEMPERATURE = float(os.environ.get("BON_TEMPERATURE", "0.7"))
 BON_TOP_P = float(os.environ.get("BON_TOP_P", "0.95"))
 BON_THINKING = os.environ.get("BON_THINKING", "false").lower() in ("1", "true", "yes")
 OUT = os.environ.get("PROFILE_ACCURACY_OUT", "tot_profile_accuracy.json")
+RAW_TOT_DIR = os.environ.get("PROFILE_ACCURACY_RAW_TOT_DIR", "")
 ARM_NAMES = ("single", "tot", "best_of_n")
 
 
@@ -82,8 +95,24 @@ class ArmResult:
     token_source: str | None = None
     n_token_fallback: int = 0
     node_errors: list[dict] = field(default_factory=list)
+    any_correct_branch: bool | None = None
+    correct_branch_count: int = 0
+    answer_histogram: dict[str, int] = field(default_factory=dict)
+    coverage_loss_kind: str | None = None
+    node_count: int = 0
     selected_candidate_id: str | None = None
     release_snapshots: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TotSweepArm:
+    name: str
+    breadth: int
+    depth: int
+    beam_width: int
+    temperature: float
+    sibling_penalty: float
+    prompt_framing: str
 
 
 @dataclass(frozen=True)
@@ -102,7 +131,8 @@ class ItemResult:
     reference: dict
     single: ArmResult
     tot: ArmResult
-    best_of_n: ArmResult
+    best_of_n: ArmResult = field(default_factory=ArmResult)
+    tot_sweep: dict[str, ArmResult] = field(default_factory=dict)
 
 
 def _models_from_env() -> list[str]:
@@ -148,7 +178,21 @@ def parse_single_pass_response(payload: dict, fallback_count: Callable[[str], in
                      token_source="tokenizer_fallback", n_token_fallback=1)
 
 
-def parse_tot_stream(text: str, fallback_count: Callable[[str], int] | None = None) -> ArmResult:
+def _final_verdict(grader: str, answer: str, reference: dict) -> str:
+    verdict = g.grade(grader, answer, reference)
+    if verdict.passed is True:
+        return "pass"
+    if verdict.passed is False:
+        return "fail"
+    return "ungradable"
+
+
+def parse_tot_stream(
+    text: str,
+    fallback_count: Callable[[str], int] | None = None,
+    grader: str | None = None,
+    reference: dict | None = None,
+) -> ArmResult:
     events: list[dict] = []
     malformed: str | None = None
     for line in text.splitlines():
@@ -170,10 +214,12 @@ def parse_tot_stream(text: str, fallback_count: Callable[[str], int] | None = No
     metrics = next((e for e in reversed(events)
                     if e.get("event") == "generation_metrics"), {})
     node_errors: list[dict] = []
+    nodes: list[dict] = []
     for e in events:
         if e.get("event") != "node_complete":
             continue
         node = e.get("node") or {}
+        nodes.append(node)
         if node.get("status") != "ok" or node.get("error") or node.get("score_error"):
             node_errors.append({
                 "id": node.get("id"),
@@ -199,8 +245,100 @@ def parse_tot_stream(text: str, fallback_count: Callable[[str], int] | None = No
         tokens = (fallback_count or (lambda s: len(s.split())))(answer)
         token_source = "tokenizer_fallback"
         n_token_fallback = 1
-    return ArmResult(answer=answer, tokens=tokens, token_source=token_source,
-                     n_token_fallback=n_token_fallback, node_errors=node_errors)
+    branch_summary = None
+    if grader is not None and reference is not None:
+        branch_summary = tree_analysis.analyze_record({
+            "grader": grader,
+            "reference": reference,
+            "selected": terminal.get("selected_node_id"),
+            "final_verdict": _final_verdict(grader, answer, reference),
+            "nodes": nodes,
+        })
+    return ArmResult(
+        answer=answer,
+        tokens=tokens,
+        token_source=token_source,
+        n_token_fallback=n_token_fallback,
+        node_errors=node_errors,
+        any_correct_branch=(
+            branch_summary["correct_in_tree"] if branch_summary is not None else None
+        ),
+        correct_branch_count=(
+            branch_summary["n_correct_nodes"] if branch_summary is not None else 0
+        ),
+        answer_histogram=(
+            branch_summary["answer_histogram"] if branch_summary is not None else {}
+        ),
+        coverage_loss_kind=(
+            branch_summary["loss_kind"] if branch_summary is not None else None
+        ),
+        node_count=len(nodes),
+    )
+
+
+def _arm_name(
+    breadth: int,
+    depth: int,
+    beam_width: int,
+    temperature: float,
+    sibling_penalty: float,
+    prompt_framing: str,
+    prefix: str = "sweep",
+) -> str:
+    temp = f"{temperature:g}"
+    penalty = f"{sibling_penalty:g}"
+    return (
+        f"{prefix}_b{breadth}_d{depth}_beam{beam_width}_"
+        f"t{temp}_pen{penalty}_{prompt_framing}"
+    )
+
+
+def build_tot_sweep_arms() -> list[TotSweepArm]:
+    arms = [
+        TotSweepArm(
+            name="default_b3_d2_beam2_t0.7_pen0_baseline",
+            breadth=3,
+            depth=2,
+            beam_width=2,
+            temperature=0.7,
+            sibling_penalty=0.0,
+            prompt_framing="baseline",
+        )
+    ]
+    for breadth in (2, 3, 4, 5):
+        for beam_width in (1, 2):
+            for temperature in (0.7, 1.0, 1.3):
+                for sibling_penalty in (0.0, 2.0):
+                    for prompt_framing in ("baseline", "counter_reading"):
+                        arms.append(TotSweepArm(
+                            name=_arm_name(
+                                breadth,
+                                2,
+                                beam_width,
+                                temperature,
+                                sibling_penalty,
+                                prompt_framing,
+                            ),
+                            breadth=breadth,
+                            depth=2,
+                            beam_width=beam_width,
+                            temperature=temperature,
+                            sibling_penalty=sibling_penalty,
+                            prompt_framing=prompt_framing,
+                        ))
+    return arms
+
+
+def apply_prompt_framing(prompt: str, framing: str) -> str:
+    if framing == "baseline":
+        return prompt
+    if framing == "counter_reading":
+        return (
+            f"{prompt}\n\n"
+            "Before choosing, explicitly test the counter-reading that each "
+            "statement could be false. Then give only the final choice number."
+        )
+    raise ValueError(f"unknown ToT prompt framing {framing!r}")
 
 
 def _sse_events(text: str) -> tuple[list[dict], str | None]:
@@ -237,6 +375,15 @@ def _self_consistency_key(grader: str, text: str) -> str:
                 return f"json_text:{_normalized_text_key(extracted)}"
         return f"text:{_normalized_text_key(text)}"
     return f"text:{_normalized_text_key(text)}"
+
+
+def apply_single_prompt_framing(prompt: str) -> str:
+    if not SINGLE_THINKING:
+        return prompt
+    return (
+        "Use the hidden thought channel for a brief check before answering. "
+        f"{prompt}"
+    )
 
 
 def select_best_of_n_candidate(
@@ -386,11 +533,20 @@ def _cell(items: list[ItemResult], arm_name: str, grader: str) -> dict:
     tokens_per_second: list[float] = []
     first_error: str | None = None
     node_error_count = 0
+    coverage_measured = 0
+    any_correct_branch = 0
+    answer_histogram: dict[str, int] = {}
     token_sources: dict[str, int] = {}
     n_token_fallback = 0
     for item in items:
         arm: ArmResult = getattr(item, arm_name)
         node_error_count += len(arm.node_errors)
+        if arm.any_correct_branch is not None:
+            coverage_measured += 1
+            if arm.any_correct_branch:
+                any_correct_branch += 1
+        for answer, count in arm.answer_histogram.items():
+            answer_histogram[answer] = answer_histogram.get(answer, 0) + count
         bucket, passed = _score_arm(arm, grader, item.reference)
         if bucket == "error":
             n_error += 1
@@ -426,6 +582,9 @@ def _cell(items: list[ItemResult], arm_name: str, grader: str) -> dict:
         ),
         "first_error": first_error,
         "node_error_count": node_error_count,
+        "branch_coverage_measured": coverage_measured,
+        "any_correct_branch_count": any_correct_branch,
+        "answer_histogram": dict(sorted(answer_histogram.items())),
         "token_sources": token_sources,
         "n_token_fallback": n_token_fallback,
     }
@@ -473,7 +632,7 @@ def summarize_model(model: str, items: list[ItemResult], grader: str,
         acc_delta = tot["accuracy"] - single["accuracy"]
     if single["accuracy"] is not None and best_of_n["accuracy"] is not None:
         bon_acc_delta = best_of_n["accuracy"] - single["accuracy"]
-    return {
+    row = {
         "model": model,
         "dataset": dataset,
         "single": single,
@@ -497,6 +656,24 @@ def summarize_model(model: str, items: list[ItemResult], grader: str,
         ),
         "items": [_item_to_json(item, grader) for item in items],
     }
+    sweep_names = sorted({name for item in items for name in item.tot_sweep})
+    if sweep_names:
+        row["tot_sweep"] = {
+            name: _cell([
+                ItemResult(
+                    dataset=item.dataset,
+                    index=item.index,
+                    prompt_id=item.prompt_id,
+                    reference=item.reference,
+                    single=item.single,
+                    tot=item.tot_sweep[name],
+                )
+                for item in items
+                if name in item.tot_sweep
+            ], "tot", grader)
+            for name in sweep_names
+        }
+    return row
 
 
 def build_artifact(models: list[dict], settings: dict) -> dict:
@@ -575,6 +752,22 @@ def _datasets_from_env() -> list[str]:
     return list(DEFAULT_DATASETS)
 
 
+def select_records_for_run(records: list[dict], indexes: str = "") -> list[tuple[int, dict]]:
+    if not indexes.strip():
+        selected = records[:MAX_PROMPTS] if MAX_PROMPTS > 0 else records
+        return list(enumerate(selected, 1))
+    out: list[tuple[int, dict]] = []
+    for raw in indexes.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        idx = int(raw)
+        if idx < 0 or idx >= len(records):
+            raise ValueError(f"PROMPT_INDEXES entry {idx} outside 0..{len(records) - 1}")
+        out.append((idx, records[idx]))
+    return out
+
+
 async def collect_dataset_rows(model: str, datasets: list[str], run_one_dataset) -> list[dict]:
     rows: list[dict] = []
     for dataset in datasets:
@@ -604,6 +797,16 @@ def atomic_write_json(path: str | Path, payload: dict) -> None:
         raise
 
 
+def write_raw_tot_stream(text: str, model: str, prompt_framing: str) -> None:
+    if not RAW_TOT_DIR:
+        return
+    target = Path(RAW_TOT_DIR)
+    target.mkdir(parents=True, exist_ok=True)
+    safe_model = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in model)
+    name = f"tot-{int(time.time() * 1000)}-{os.getpid()}-{safe_model}-{prompt_framing}.sse"
+    (target / name).write_text(text)
+
+
 def has_any_graded_item(artifact: dict) -> bool:
     for row in artifact.get("models", []):
         for arm in ("single", "tot", "best_of_n"):
@@ -616,7 +819,7 @@ def _item_to_json(item: ItemResult, grader: str) -> dict:
     single_bucket, single_passed = _score_arm(item.single, grader, item.reference)
     tot_bucket, tot_passed = _score_arm(item.tot, grader, item.reference)
     bon_bucket, bon_passed = _score_arm(item.best_of_n, grader, item.reference)
-    return {
+    out = {
         "dataset": item.dataset,
         "index": item.index,
         "prompt_id": item.prompt_id,
@@ -634,14 +837,25 @@ def _item_to_json(item: ItemResult, grader: str) -> dict:
             item.best_of_n.latency_s - item.single.latency_s
         ) if not (item.single.error or item.best_of_n.error) else None,
     }
+    if item.tot_sweep:
+        out["tot_sweep"] = {}
+        for name, arm in sorted(item.tot_sweep.items()):
+            bucket, passed = _score_arm(arm, grader, item.reference)
+            out["tot_sweep"][name] = {
+                **asdict(arm),
+                "grade": bucket,
+                "passed": passed,
+            }
+    return out
 
 
 async def _single_once(http_c: httpx.AsyncClient, base_url: str, model: str,
                        prompt: str, count) -> ArmResult:
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
+        "messages": [{"role": "user", "content": apply_single_prompt_framing(prompt)}],
+        "temperature": SINGLE_TEMPERATURE,
+        "thinking": SINGLE_THINKING,
         "max_tokens": MAX_TOKENS,
         "stream": False,
     }
@@ -660,19 +874,31 @@ async def _single_once(http_c: httpx.AsyncClient, base_url: str, model: str,
 
 
 async def _tot_once(http_c: httpx.AsyncClient, base_url: str, model: str,
-                    prompt: str, count) -> ArmResult:
+                    prompt: str, count, grader: str | None = None,
+                    reference: dict | None = None,
+                    arm: TotSweepArm | None = None) -> ArmResult:
+    breadth = arm.breadth if arm else TOT_BREADTH
+    depth = arm.depth if arm else TOT_DEPTH
+    beam_width = arm.beam_width if arm else TOT_BEAM
+    temperature = arm.temperature if arm else TOT_TEMPERATURE
+    sibling_penalty = arm.sibling_penalty if arm else TOT_SIBLING_PENALTY
+    prompt_framing = arm.prompt_framing if arm else TOT_PROMPT_FRAMING
     body = {
         "inferlet": "tree-of-thought",
         "stream": True,
         "input": {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "breadth": TOT_BREADTH,
-            "depth": TOT_DEPTH,
-            "beam_width": TOT_BEAM,
+            "messages": [{
+                "role": "user",
+                "content": apply_prompt_framing(prompt, prompt_framing),
+            }],
+            "breadth": breadth,
+            "depth": depth,
+            "beam_width": beam_width,
             "max_tokens_per_node": MAX_TOKENS,
-            "temperature": TOT_TEMPERATURE,
+            "temperature": temperature,
             "task": TOT_TASK,
+            "sibling_penalty": sibling_penalty,
         },
     }
     started = time.monotonic()
@@ -681,7 +907,8 @@ async def _tot_once(http_c: httpx.AsyncClient, base_url: str, model: str,
         latency = time.monotonic() - started
         if r.status_code != 200:
             return ArmResult(latency_s=latency, error=f"tot dispatch {r.status_code}: {r.text[:200]}")
-        parsed = parse_tot_stream(r.text, count)
+        write_raw_tot_stream(r.text, model, prompt_framing)
+        parsed = parse_tot_stream(r.text, count, grader=grader, reference=reference)
         parsed.latency_s = latency
         return parsed
     except Exception as e:  # noqa: BLE001
@@ -743,41 +970,63 @@ async def _best_of_n_once(http_c: httpx.AsyncClient, base_url: str, model: str,
 
 
 async def _run_model_dataset(base_url: str, model: str, dataset: str, count) -> dict:
+    if PROFILE_ARMS not in {"both", "single"}:
+        raise ValueError("PROFILE_ARMS must be 'both' or 'single'")
     grader = base._grader_for(dataset)
     records, total = base._load_prompts(dataset)
-    if MAX_PROMPTS > 0:
-        records = records[:MAX_PROMPTS]
+    selected_records = select_records_for_run(records, PROMPT_INDEXES)
     arms = _arms_from_env()
+    if PROFILE_ARMS == "single":
+        arms = {"single"}
     items: list[ItemResult] = []
+    run_tot = "tot" in arms
+    sweep_arms = build_tot_sweep_arms() if run_tot and TOT_SWEEP else []
+    default_arm = sweep_arms[0] if sweep_arms else None
     async with httpx.AsyncClient(timeout=900) as http_c:
-        for i, rec in enumerate(records, 1):
-            prompt_id = str(rec.get("id") or f"{dataset}:{i}")
+        for ordinal, (record_index, rec) in enumerate(selected_records, 1):
+            prompt_id = str(rec.get("id") or f"{dataset}:{record_index}")
             single = (
                 await _single_once(http_c, base_url, model, rec["prompt"], count)
                 if "single" in arms else _skipped_arm()
             )
-            tot = (
-                await _tot_once(http_c, base_url, model, rec["prompt"], count)
-                if "tot" in arms else _skipped_arm()
-            )
+            if run_tot:
+                tot = await _tot_once(
+                    http_c, base_url, model, rec["prompt"], count, grader, rec["reference"],
+                    arm=default_arm,
+                )
+            elif PROFILE_ARMS == "single":
+                tot = ArmResult(error="skipped by PROFILE_ARMS=single")
+            else:
+                tot = _skipped_arm()
             best_of_n = (
                 await _best_of_n_once(http_c, base_url, model, rec["prompt"], count, grader)
                 if "best_of_n" in arms else _skipped_arm()
             )
-            item = ItemResult(dataset, i, prompt_id, rec["reference"], single, tot, best_of_n)
+            tot_sweep: dict[str, ArmResult] = {}
+            for arm in sweep_arms[1:]:
+                tot_sweep[arm.name] = await _tot_once(
+                    http_c, base_url, model, rec["prompt"], count,
+                    grader, rec["reference"], arm=arm,
+                )
+            item = ItemResult(
+                dataset, record_index, prompt_id, rec["reference"], single, tot,
+                best_of_n, tot_sweep
+            )
             items.append(item)
             single_bucket, _ = _score_arm(single, grader, rec["reference"])
             tot_bucket, _ = _score_arm(tot, grader, rec["reference"])
             bon_bucket, _ = _score_arm(best_of_n, grader, rec["reference"])
             print(
-                f"[profile-accuracy] {model} {dataset} {i}/{len(records)} "
+                f"[profile-accuracy] {model} {dataset} {ordinal}/{len(selected_records)} "
+                f"idx={record_index} "
                 f"single={single_bucket} tot={tot_bucket} best_of_n={bon_bucket} "
                 f"tot_node_errors={len(tot.node_errors)} "
+                f"tot_any_correct_branch={tot.any_correct_branch} "
                 f"bon_node_errors={len(best_of_n.node_errors)}",
                 flush=True,
             )
     row = summarize_model(model, items, grader, dataset=dataset)
-    row["coverage"] = {"measured": len(records), "total": total}
+    row["coverage"] = {"measured": len(selected_records), "total": total}
     return row
 
 
@@ -796,16 +1045,26 @@ async def _run() -> dict:
         "dataset": datasets[0] if len(datasets) == 1 else None,
         "datasets": datasets,
         "max_prompts": MAX_PROMPTS,
+        "prompt_indexes": PROMPT_INDEXES or None,
         "max_tokens": MAX_TOKENS,
         "models": models,
         "arms": sorted(_arms_from_env()),
         "token_unit": unit,
+        "profile_arms": PROFILE_ARMS,
+        "single": {
+            "temperature": SINGLE_TEMPERATURE,
+            "thinking": SINGLE_THINKING,
+            "prompt_framing": "hidden_thought_channel" if SINGLE_THINKING else "baseline",
+        },
         "tot": {
             "breadth": TOT_BREADTH,
             "depth": TOT_DEPTH,
             "beam_width": TOT_BEAM,
             "task": TOT_TASK,
             "temperature": TOT_TEMPERATURE,
+            "sibling_penalty": TOT_SIBLING_PENALTY,
+            "prompt_framing": TOT_PROMPT_FRAMING,
+            "sweep_enabled": TOT_SWEEP,
         },
         "best_of_n": {
             "n": BON_N,
@@ -816,6 +1075,8 @@ async def _run() -> dict:
             "selection": "modal dataset-aware extracted answer, then textual centrality, length, branch order",
         },
     }
+    if TOT_SWEEP:
+        settings["tot"]["sweep_arms"] = [asdict(arm) for arm in build_tot_sweep_arms()]
 
     def write_partial(rows: list[dict]) -> None:
         atomic_write_json(OUT, build_artifact(rows, settings))

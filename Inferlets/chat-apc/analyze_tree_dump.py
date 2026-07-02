@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import sys
 from collections import Counter
+from typing import Any
 
 import grade as g
 
@@ -39,6 +40,68 @@ def _passed(grader: str, text: str, ref: dict) -> bool | None:
 
 def _norm(s: str) -> str:
     return " ".join((s or "").split()).lower()
+
+
+def answer_key(grader: str, text: str) -> str:
+    """Small, shared answer bucketing for branch-coverage histograms."""
+    if grader in {"gsm8k_numeric", "mcq_numeric"}:
+        tail = g._answer_tail(text or "") if hasattr(g, "_answer_tail") else (text or "")
+        got = g.last_number(tail)
+        return got if got is not None else "<unparseable>"
+    return _norm(text) or "<empty>"
+
+
+def branch_variation_ratios(nodes: list[dict[str, Any]]) -> list[float]:
+    by_sibling_group: dict = {}
+    for nd in nodes:
+        key = (nd.get("depth"), nd.get("parent_id"))
+        by_sibling_group.setdefault(key, []).append(_norm(nd.get("content") or ""))
+    return [
+        len(set(sibs)) / len(sibs)
+        for sibs in by_sibling_group.values()
+        if len(sibs) > 1
+    ]
+
+
+def analyze_record(record: dict[str, Any]) -> dict[str, Any]:
+    grader, ref = record["grader"], record["reference"]
+    nodes = record.get("nodes") or []
+    graded = [(_passed(grader, nd.get("content"), ref), nd) for nd in nodes]
+    correct_nodes = [nd for ok, nd in graded if ok is True]
+
+    answer_hist: Counter = Counter()
+    node_answer_grades: dict[str, dict[str, Any]] = {}
+    for ok, nd in graded:
+        if nd.get("status", "ok") != "ok":
+            continue
+        answer = answer_key(grader, nd.get("content") or "")
+        answer_hist[answer] += 1
+        node_id = nd.get("id")
+        if node_id:
+            node_answer_grades[node_id] = {
+                "answer": answer,
+                "passed": ok,
+            }
+
+    sel_id = record.get("selected")
+    sel_node = next((nd for nd in nodes if nd.get("id") == sel_id), None)
+    sel_node_ok = _passed(grader, (sel_node or {}).get("content"), ref) if sel_node else None
+
+    verdict = (record.get("final_verdict") or "").lower()
+    loss_kind = None
+    if verdict == "fail":
+        loss_kind = "selection_synthesis" if correct_nodes else "generation"
+
+    return {
+        "correct_in_tree": bool(correct_nodes),
+        "selected_node_ok": sel_node_ok,
+        "n_correct_nodes": len(correct_nodes),
+        "n_nodes": len(nodes),
+        "answer_histogram": dict(sorted(answer_hist.items())),
+        "node_answer_grades": node_answer_grades,
+        "branch_variation_ratios": branch_variation_ratios(nodes),
+        "loss_kind": loss_kind,
+    }
 
 
 def analyze(path: str) -> None:
@@ -59,6 +122,7 @@ def analyze(path: str) -> None:
     for r in records:
         grader, ref = r["grader"], r["reference"]
         nodes = r.get("nodes") or []
+        summary = analyze_record(r)
         verdict_raw = r.get("final_verdict")
         verdict = (verdict_raw or "").lower()
         final_ok = verdict == "pass"
@@ -73,10 +137,7 @@ def analyze(path: str) -> None:
             n_ungradable += 1
         else:
             n_other += 1
-        # grade every node
-        graded = [(_passed(grader, nd.get("content"), ref), nd) for nd in nodes]
-        correct_nodes = [nd for ok, nd in graded if ok is True]
-        any_correct = bool(correct_nodes)
+        any_correct = summary["correct_in_tree"]
         if any_correct:
             correct_in_tree_count += 1
 
@@ -85,22 +146,8 @@ def analyze(path: str) -> None:
             sc = nd.get("score")
             score_hist[sc if sc is not None else "none"] += 1
 
-        # branch variation: siblings are nodes at the same depth with the same
-        # parent. Grouping by depth alone mixes cousins and can make separate
-        # branches look like duplicate siblings. Older dumps lack parent_id;
-        # they fall back to one depth-level group for backward compatibility.
-        by_sibling_group: dict = {}
-        for nd in nodes:
-            key = (nd.get("depth"), nd.get("parent_id"))
-            by_sibling_group.setdefault(key, []).append(_norm(nd.get("content") or ""))
-        for sibs in by_sibling_group.values():
-            if len(sibs) > 1:
-                dup_ratios.append(len(set(sibs)) / len(sibs))  # 1.0 = all distinct
-
-        # selected node correctness (synthesis corruption check)
-        sel_id = r.get("selected")
-        sel_node = next((nd for nd in nodes if nd.get("id") == sel_id), None)
-        sel_node_ok = _passed(grader, (sel_node or {}).get("content"), ref) if sel_node else None
+        dup_ratios.extend(summary["branch_variation_ratios"])
+        sel_node_ok = summary["selected_node_ok"]
 
         if final_fail:
             if any_correct:
@@ -116,7 +163,7 @@ def analyze(path: str) -> None:
             "index": r.get("index"), "verdict": verdict_raw, "final_ok": final_ok,
             "final_fail": final_fail, "correct_in_tree": any_correct,
             "selected_node_ok": sel_node_ok,
-            "n_correct_nodes": len(correct_nodes), "n_nodes": len(nodes),
+            "n_correct_nodes": summary["n_correct_nodes"], "n_nodes": summary["n_nodes"],
         })
 
     print(f"=== ToT tree-dump mechanism analysis ({path}) ===")
