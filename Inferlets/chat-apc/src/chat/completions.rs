@@ -57,7 +57,9 @@ use wstd::http::body::IncomingBody;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Request, Response};
 
-use super::apc::{ReasoningDecoder, ToolUseDecoder, gemma_thinking_cue_tokens};
+use super::apc::{
+    PendingReasoningMarker, ReasoningDecoder, ToolUseDecoder, gemma_thinking_cue_tokens,
+};
 use super::generate::{self, DecodeStrategy};
 use super::prefix_cache::{self, CacheDiag, ReusePlan};
 use super::spec::sidecar::{Lineage, SidecarKey, SidecarStatus, SidecarStore, encode_sidecar_blob};
@@ -1717,60 +1719,6 @@ fn visible_content<'a>(
         answer_after_close(chat_delta).unwrap_or("")
     } else {
         ""
-    }
-}
-
-#[derive(Default)]
-struct PendingReasoningMarker {
-    buffered: String,
-}
-
-impl PendingReasoningMarker {
-    fn visible_delta(
-        &mut self,
-        chat_delta: &str,
-        base_visible: &str,
-        pending_marker: Option<&str>,
-        completed_marker: Option<&str>,
-        forced_tool: bool,
-    ) -> String {
-        if forced_tool {
-            self.buffered.clear();
-            return String::new();
-        }
-
-        let mut out = String::new();
-        if !self.buffered.is_empty() {
-            if completed_marker.is_some() {
-                self.buffered.clear();
-            } else if pending_marker.is_none() {
-                out.push_str(&self.buffered);
-                self.buffered.clear();
-            }
-        }
-
-        if let Some(marker) = completed_marker {
-            if let Some((before, _)) = chat_delta.split_once(marker) {
-                out.push_str(before);
-            } else {
-                out.push_str(base_visible);
-            }
-            return out;
-        }
-
-        if let Some(marker) = pending_marker {
-            if let Some(prefix) = chat_delta.strip_suffix(marker) {
-                out.push_str(prefix);
-                self.buffered.clear();
-                self.buffered.push_str(marker);
-            } else {
-                out.push_str(base_visible);
-            }
-            return out;
-        }
-
-        out.push_str(base_visible);
-        out
     }
 }
 
