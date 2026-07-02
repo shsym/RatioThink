@@ -186,6 +186,7 @@ class ConfigToml(unittest.TestCase):
         with mock.patch.dict(os.environ, {
             "PIE_PORTABLE_TOTAL_PAGES": "256",
             "PIE_PORTABLE_KV_PAGE_SIZE": "16",
+            "PIE_PORTABLE_READY_TIMEOUT_S": "600",
             "PIE_PORTABLE_KV_CACHE_DTYPE": "f16",
         }, clear=False):
             cfg = real.config_toml("Qwen/Qwen3-8B")
@@ -193,12 +194,14 @@ class ConfigToml(unittest.TestCase):
         self.assertIn("[model.driver.options]", cfg)
         self.assertIn("total_pages = 256", cfg)
         self.assertIn("kv_page_size = 16", cfg)
+        self.assertIn("ready_timeout_s = 600", cfg)
         self.assertIn('kv_cache_dtype = "f16"', cfg)
 
     def test_portable_driver_options_are_omitted_when_unset(self):
         with mock.patch.dict(os.environ, {
             "PIE_PORTABLE_TOTAL_PAGES": "",
             "PIE_PORTABLE_KV_PAGE_SIZE": "",
+            "PIE_PORTABLE_READY_TIMEOUT_S": "",
             "PIE_PORTABLE_KV_CACHE_DTYPE": "",
         }, clear=False):
             cfg = real.config_toml("Qwen/Qwen3-8B")

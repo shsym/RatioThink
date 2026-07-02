@@ -175,17 +175,35 @@ def _positive_int_env(name: str) -> int | None:
     return value
 
 
+def _positive_float_env(name: str) -> float | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    value = float(raw)
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return value
+
+
 def _portable_driver_options_toml() -> str:
     total_pages = _positive_int_env("PIE_PORTABLE_TOTAL_PAGES")
     kv_page_size = _positive_int_env("PIE_PORTABLE_KV_PAGE_SIZE")
+    ready_timeout_s = _positive_float_env("PIE_PORTABLE_READY_TIMEOUT_S")
     kv_cache_dtype = os.environ.get("PIE_PORTABLE_KV_CACHE_DTYPE", "").strip()
-    if total_pages is None and kv_page_size is None and not kv_cache_dtype:
+    if (
+        total_pages is None
+        and kv_page_size is None
+        and ready_timeout_s is None
+        and not kv_cache_dtype
+    ):
         return ""
     lines = ["", "[model.driver.options]"]
     if total_pages is not None:
         lines.append(f"total_pages = {total_pages}")
     if kv_page_size is not None:
         lines.append(f"kv_page_size = {kv_page_size}")
+    if ready_timeout_s is not None:
+        lines.append(f"ready_timeout_s = {ready_timeout_s:g}")
     if kv_cache_dtype:
         lines.append(f'kv_cache_dtype = "{kv_cache_dtype}"')
     return "\n".join(lines) + "\n"
