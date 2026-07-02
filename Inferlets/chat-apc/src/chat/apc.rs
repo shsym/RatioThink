@@ -160,7 +160,10 @@ impl PendingReasoningMarker {
             self.buffered.push_str(fragment);
             return Some(visible.to_string());
         }
-        if !self.buffered.is_empty() && marker.starts_with(&self.buffered) {
+        if !self.buffered.is_empty()
+            && marker.starts_with(&self.buffered)
+            && fragment.starts_with(chat_delta)
+        {
             self.buffered.push_str(chat_delta);
             return Some(String::new());
         }
@@ -480,6 +483,87 @@ mod tests {
         assert_eq!(first, "answer");
         assert_eq!(second, "");
         assert_eq!(third, "<|channel> not-thought");
+    }
+
+    #[test]
+    fn pending_marker_buffers_interior_continuation_fragment_only() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let first = pending.visible_delta("answer<|", "answer<|", Some("<|"), None, false);
+        let second = pending.visible_delta("chan", "chan", Some("<|channel>"), None, false);
+        let third =
+            pending.visible_delta("nel>thought", "", None, Some("<|channel>thought"), false);
+
+        assert_eq!(first, "answer");
+        assert_eq!(second, "");
+        assert_eq!(third, "");
+    }
+
+    #[test]
+    fn pending_marker_mismatch_emits_visible_text_instead_of_swallowing() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let first = pending.visible_delta("answer<|", "answer<|", Some("<|"), None, false);
+        let second = pending.visible_delta("X", "X", Some("<|channel>"), None, false);
+        let third = pending.visible_delta(
+            "channel>thought",
+            "",
+            None,
+            Some("<|channel>thought"),
+            false,
+        );
+
+        assert_eq!(first, "answer");
+        assert_eq!(second, "X");
+        assert_eq!(third, "");
+    }
+
+    #[test]
+    fn completed_marker_uses_split_once_when_buffered_fragment_misses_suffix() {
+        let mut pending = PendingReasoningMarker {
+            buffered: "<|".to_string(),
+        };
+
+        let visible = pending.visible_delta(
+            "answer<|channel>thought trailing",
+            "answer<|channel>thought trailing",
+            None,
+            Some("<|channel>thought"),
+            false,
+        );
+
+        assert_eq!(visible, "answer");
+    }
+
+    #[test]
+    fn forced_tool_clears_pending_marker_buffer() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let first = pending.visible_delta(
+            "answer<|channel>",
+            "answer<|channel>",
+            Some("<|channel>"),
+            None,
+            false,
+        );
+        let forced = pending.visible_delta("tool", "tool", Some("<|channel>thought"), None, true);
+        let after = pending.visible_delta("", "", None, None, false);
+
+        assert_eq!(first, "answer");
+        assert_eq!(forced, "");
+        assert_eq!(after, "");
+    }
+
+    #[test]
+    fn pending_marker_without_preceding_text_stays_hidden_through_complete() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let first =
+            pending.visible_delta("<|channel>", "<|channel>", Some("<|channel>"), None, false);
+        let second = pending.visible_delta("thought", "", None, Some("<|channel>thought"), false);
+
+        assert_eq!(first, "");
+        assert_eq!(second, "");
     }
 
     #[test]
