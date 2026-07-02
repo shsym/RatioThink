@@ -639,6 +639,41 @@ final class LaunchSpecResolverTests: XCTestCase {
                    "must not pass the resolved target path; got:\n\(body)")
   }
 
+  func test_resolveLauncherSpec_gemma4_31b_bounds_physical_kv_pool() throws {
+    let slug = "unsloth/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"
+    let store = try makeStoreWithModel(slug)
+    defer { store.stop() }
+
+    let binary = tempDir.appendingPathComponent("pie-fake-gemma4-31b", isDirectory: false)
+    try touchExecutable(at: binary)
+    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+    let modelsRoot = tempDir.appendingPathComponent("models-gemma4-31b", isDirectory: true)
+    try stageModel(named: slug, in: modelsRoot)
+
+    let resolver = LaunchSpecResolver(
+      profileStore: store,
+      pieBinary: { binary },
+      modelsRoot: { modelsRoot },
+      pieControlResources: { resources },
+      pieHome: { self.tempDir },
+      subprocessEnvironment: { [:] },
+      hfHome: { self.tempDir.appendingPathComponent("hf-home-gemma4-31b") }
+    )
+
+    guard case .success(let spec) = resolver.resolveLauncherSpec(profileID: "chat") else {
+      return XCTFail("staged Gemma 4 31B GGUF must resolve")
+    }
+    XCTAssertEqual(spec.maxNumKvPages, 256,
+                   "Gemma 4 31B must not inherit pie's 1024-page default KV pool")
+
+    let body = PieControlLauncher.renderConfigBody(
+      modelConfig: spec.modelConfig,
+      defaultTokenLimit: spec.defaultTokenLimit,
+      maxNumKvPages: spec.maxNumKvPages
+    )
+    XCTAssertTrue(body.contains("total_pages = 256"), "got:\n\(body)")
+  }
+
   func test_resolveLauncherSpec_dangling_app_staged_symlink_falls_through_to_hf_cache() throws {
     // A DANGLING staged symlink (target gone) is treated as "not staged" and
     // falls through to the HF-cache GGUF (3-seg slug → first-class file hit),
@@ -1580,7 +1615,7 @@ final class LaunchSpecResolverTests: XCTestCase {
   @discardableResult
   private func writeHFCacheSnapshot(hfHome: URL,
                                     repo: String,
-                                    revision: String = "0123456789abcdef0123456789abcdef01234567",
+                                    revision: String = "0123456789abcdef0123456789abcdef01234567",  // pragma: allowlist secret
                                     files: [String: String]) throws -> URL {
     let repoDir = hfHome
       .appendingPathComponent("hub", isDirectory: true)

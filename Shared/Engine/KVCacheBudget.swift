@@ -37,6 +37,14 @@ public enum KVCacheBudget {
   /// LOWER the ceiling below this.
   public static let defaultPoolCapacityTokens: Int = kvPageSizeTokens * defaultMaxNumKvPages
 
+  public static let gemma4LargeModelMaxNumKvPages: Int = 256
+
+  public static func maxNumKvPages(modelID: String) -> Int? {
+    modelID == "unsloth/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"
+      ? gemma4LargeModelMaxNumKvPages
+      : nil
+  }
+
   /// The effective per-request output-token ceiling the engine ENFORCES for a
   /// launched session, derived from the two `LaunchSpec` knobs the helper owns.
   /// Mirrors pie `runtime::max_output_tokens` exactly

@@ -228,6 +228,7 @@ public struct LaunchSpecResolver {
               policy: memoryPolicy(), weightBytes: bytes, metadata: metadata)
           }
         }
+      let maxNumKvPages = KVCacheBudget.maxNumKvPages(modelID: model)
       // Size-aware engine timeout (#687): larger GGUFs need a longer cold
       // Metal prefill budget than the 120s floor. An explicit
       // PIE_SHMEM_TIMEOUT_S in the helper environment (read pre-sanitize)
@@ -282,7 +283,8 @@ public struct LaunchSpecResolver {
         profileID: profile.id,
         daemonBindHost: daemonBindMode(),
         modelConfig: .portableResolved(servedModelID: model, modelRef: modelRef),
-        defaultTokenLimit: defaultTokenLimit
+        defaultTokenLimit: defaultTokenLimit,
+        maxNumKvPages: maxNumKvPages
       )
       // #469: record the resolved boot model in the durable active-model
       // marker. This is the single launch-resolution choke point every path
