@@ -40,7 +40,7 @@ public enum KVCacheBudget {
   public static let gemma4LargeModelMaxNumKvPages: Int = 256
 
   public static func maxNumKvPages(modelID: String) -> Int? {
-    modelID == "unsloth/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"
+    modelID.localizedCaseInsensitiveContains("gemma-4-31B")
       ? gemma4LargeModelMaxNumKvPages
       : nil
   }

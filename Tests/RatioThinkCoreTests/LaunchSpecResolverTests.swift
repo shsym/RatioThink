@@ -640,38 +640,44 @@ final class LaunchSpecResolverTests: XCTestCase {
   }
 
   func test_resolveLauncherSpec_gemma4_31b_bounds_physical_kv_pool() throws {
-    let slug = "unsloth/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"
-    let store = try makeStoreWithModel(slug)
-    defer { store.stop() }
+    let slugs = [
+      "unsloth/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf",
+      "unsloth/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q8_0.gguf",
+    ]
 
-    let binary = tempDir.appendingPathComponent("pie-fake-gemma4-31b", isDirectory: false)
-    try touchExecutable(at: binary)
-    let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
-    let modelsRoot = tempDir.appendingPathComponent("models-gemma4-31b", isDirectory: true)
-    try stageModel(named: slug, in: modelsRoot)
+    for slug in slugs {
+      let store = try makeStoreWithModel(slug)
+      defer { store.stop() }
 
-    let resolver = LaunchSpecResolver(
-      profileStore: store,
-      pieBinary: { binary },
-      modelsRoot: { modelsRoot },
-      pieControlResources: { resources },
-      pieHome: { self.tempDir },
-      subprocessEnvironment: { [:] },
-      hfHome: { self.tempDir.appendingPathComponent("hf-home-gemma4-31b") }
-    )
+      let binary = tempDir.appendingPathComponent("pie-fake-gemma4-31b", isDirectory: false)
+      try touchExecutable(at: binary)
+      let resources = try writeInferletResources(name: "chat-apc", version: "0.1.0")
+      let modelsRoot = tempDir.appendingPathComponent("models-gemma4-31b", isDirectory: true)
+      try stageModel(named: slug, in: modelsRoot)
 
-    guard case .success(let spec) = resolver.resolveLauncherSpec(profileID: "chat") else {
-      return XCTFail("staged Gemma 4 31B GGUF must resolve")
+      let resolver = LaunchSpecResolver(
+        profileStore: store,
+        pieBinary: { binary },
+        modelsRoot: { modelsRoot },
+        pieControlResources: { resources },
+        pieHome: { self.tempDir },
+        subprocessEnvironment: { [:] },
+        hfHome: { self.tempDir.appendingPathComponent("hf-home-gemma4-31b") }
+      )
+
+      guard case .success(let spec) = resolver.resolveLauncherSpec(profileID: "chat") else {
+        return XCTFail("staged Gemma 4 31B GGUF must resolve: \(slug)")
+      }
+      XCTAssertEqual(spec.maxNumKvPages, 256,
+                     "Gemma 4 31B must not inherit pie's 1024-page default KV pool: \(slug)")
+
+      let body = PieControlLauncher.renderConfigBody(
+        modelConfig: spec.modelConfig,
+        defaultTokenLimit: spec.defaultTokenLimit,
+        maxNumKvPages: spec.maxNumKvPages
+      )
+      XCTAssertTrue(body.contains("total_pages = 256"), "slug: \(slug)\n\(body)")
     }
-    XCTAssertEqual(spec.maxNumKvPages, 256,
-                   "Gemma 4 31B must not inherit pie's 1024-page default KV pool")
-
-    let body = PieControlLauncher.renderConfigBody(
-      modelConfig: spec.modelConfig,
-      defaultTokenLimit: spec.defaultTokenLimit,
-      maxNumKvPages: spec.maxNumKvPages
-    )
-    XCTAssertTrue(body.contains("total_pages = 256"), "got:\n\(body)")
   }
 
   func test_resolveLauncherSpec_dangling_app_staged_symlink_falls_through_to_hf_cache() throws {
