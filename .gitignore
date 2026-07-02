@@ -41,6 +41,7 @@ AuthKey_*.p8
 # Logs
 *.log
 test-*.log
+logs/
 
 # Local test models (multi-GB GGUF files)
 test-models/*.gguf
