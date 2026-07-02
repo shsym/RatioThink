@@ -87,7 +87,7 @@ use inferlet::sample::Sampler;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::chat::apc::{ReasoningDecoder, gemma_thinking_cue_tokens};
+use crate::chat::apc::{PendingReasoningMarker, ReasoningDecoder, gemma_thinking_cue_tokens};
 use crate::sse::Emitter;
 
 use super::schema::{ExecStrategy, TotParams, TotTask};
@@ -573,14 +573,15 @@ fn reasoning_branch_directive(
     };
     let body = if level >= max_depth {
         format!(
-            "Using the reasoning steps already in this conversation, state the FINAL answer to the user's question now. Answer every part of the request; if a number of items is requested, include that many. For math, use only values computed from the problem and give the final number. If the answer is a money amount, include the currency symbol, such as $18 instead of 18. Do not invent unsupported names, numbers, or statistics. Write only the answer. No heading. Option {n} of {breadth}: {focus}"
+            "Briefly compute or check the needed values, then state the FINAL answer to the user's question now. Show the computation briefly and end with the final answer. Answer every part of the request; if a number of items is requested, include that many. For math, use only values computed from the problem and give the final number. If the answer is a money amount, include the currency symbol, such as $18 instead of 18. Do not invent unsupported names, numbers, or statistics. No heading. Option {n} of {breadth}: {focus}"
         )
     } else {
         format!(
             "Take ONE step toward the answer: compute or establish a single intermediate result the final answer will need. Do NOT state the final answer yet — write only this one step. For math, use only values from the problem and show the number you get. Do not invent people, labels, or statistics. No heading. Option {n} of {breadth}: {focus}"
         )
     };
-    with_thinking(&body, branch_uses_thinking(level, max_depth, thinking))
+    let thinking = branch_uses_thinking(level, max_depth, thinking);
+    with_thinking(&with_private_thought_cue(body, thinking), thinking)
 }
 
 /// Stricter `reasoning` directive for the bounded no-think retry (mirrors
@@ -1003,6 +1004,28 @@ fn content_visible(reason_idle: bool, was_in_reasoning: bool) -> bool {
     reason_idle && !was_in_reasoning
 }
 
+fn visible_answer_delta(
+    pending_reasoning_marker: &mut PendingReasoningMarker,
+    chat_delta: &str,
+    reason_idle: bool,
+    was_in_reasoning: bool,
+    pending_marker: Option<&str>,
+    completed_marker: Option<&str>,
+) -> String {
+    let base_visible = if content_visible(reason_idle, was_in_reasoning) {
+        chat_delta
+    } else {
+        ""
+    };
+    pending_reasoning_marker.visible_delta(
+        chat_delta,
+        base_visible,
+        pending_marker,
+        completed_marker,
+        false,
+    )
+}
+
 /// Qwen3-class small thinking models sometimes honor an answer-first
 /// `/no_think` prompt semantically but still route the short answer through
 /// the reasoning channel without closing a visible answer span. Accept that
@@ -1128,6 +1151,7 @@ async fn generate_demuxed(
 ) -> Demux {
     let mut reason_dec = ReasoningDecoder::new(model);
     let mut chat_dec = chat::Decoder::new(model);
+    let mut pending_reasoning_marker = PendingReasoningMarker::default();
     let mut generator = ctx
         .generate(sampler)
         .max_tokens(reasoning_budget + answer_budget)
@@ -1194,24 +1218,33 @@ async fn generate_demuxed(
             Ok(inferlet::reasoning::Event::Idle) => reason_idle = true,
             Err(e) => break DemuxKind::Aborted(format!("reasoning decode failed: {e}")),
         }
-        let suppress_pending_reasoning_marker =
-            reason_idle && reason_dec.suppress_content_for_pending_marker();
+        let pending_marker = reason_dec.pending_start_marker_text();
+        let completed_marker = reason_dec.completed_start_marker_text();
         match chat_dec.feed(&out.tokens) {
-            Ok(chat::Event::Delta(s))
-                if content_visible(reason_idle, was_in_reasoning)
-                    && !suppress_pending_reasoning_marker =>
-            {
-                answer.push_str(&s);
-                // #413 token stream: live-fill the answer channel — a tree
-                // node's `node_delta` or, for synthesis, `final_delta` (#523).
-                if let Some(em) = emitter {
-                    let _ = match sink {
-                        DeltaSink::Node(id) => em.node_delta(id, stream::DELTA_ANSWER, &s).await,
-                        DeltaSink::Final => em.final_delta(&s).await,
-                    };
+            Ok(chat::Event::Delta(s)) => {
+                let visible = visible_answer_delta(
+                    &mut pending_reasoning_marker,
+                    &s,
+                    reason_idle,
+                    was_in_reasoning,
+                    pending_marker.as_deref(),
+                    completed_marker.as_deref(),
+                );
+                if !visible.is_empty() {
+                    answer.push_str(&visible);
+                    // #413 token stream: live-fill the answer channel — a tree
+                    // node's `node_delta` or, for synthesis, `final_delta` (#523).
+                    if let Some(em) = emitter {
+                        let _ = match sink {
+                            DeltaSink::Node(id) => {
+                                em.node_delta(id, stream::DELTA_ANSWER, &visible).await
+                            }
+                            DeltaSink::Final => em.final_delta(&visible).await,
+                        };
+                    }
                 }
             }
-            Ok(chat::Event::Delta(_)) | Ok(chat::Event::Idle) => {}
+            Ok(chat::Event::Idle) => {}
             Ok(chat::Event::Done(_)) => break DemuxKind::Answered,
             Ok(chat::Event::Interrupt(_)) => {
                 break DemuxKind::Aborted("chat template interrupt".to_string());
@@ -3521,12 +3554,12 @@ mod tests {
     fn reasoning_final_cues_the_answer_grounded_on_steps() {
         let d = reasoning_branch_directive(3, 3, 1, 3, true);
         assert!(d.contains("FINAL answer"), "{d}");
-        assert!(
-            d.contains("reasoning steps already in this conversation"),
-            "{d}"
-        );
+        assert!(d.contains("Briefly compute or check"), "{d}");
+        assert!(d.contains("Show the computation briefly"), "{d}");
         assert!(d.contains("$18 instead of 18"), "{d}");
         assert!(!d.contains("Do NOT state the final answer yet"), "{d}");
+        assert!(!d.contains("already in this conversation"), "{d}");
+        assert!(!d.contains("Write only the answer"), "{d}");
     }
 
     #[test]
@@ -3536,6 +3569,13 @@ mod tests {
         assert!(reasoning_branch_directive(3, 3, 0, 3, false).contains("/no_think"));
         assert!(!reasoning_branch_directive(1, 3, 0, 3, true).contains("/no_think"));
         assert!(!reasoning_branch_directive(3, 3, 0, 3, true).contains("/no_think"));
+    }
+
+    #[test]
+    fn reasoning_directive_thinking_requests_private_thought_before_answer() {
+        let d = reasoning_branch_directive(1, 3, 0, 3, true);
+        assert!(d.contains("hidden thought channel"), "{d}");
+        assert!(!reasoning_branch_directive(1, 3, 0, 3, false).contains("hidden thought channel"));
     }
 
     #[test]
@@ -4824,6 +4864,55 @@ mod tests {
         assert!(!content_visible(false, true));
         // Inside reasoning (Idle never set there) → suppressed.
         assert!(!content_visible(false, false));
+    }
+
+    #[test]
+    fn visible_answer_delta_preserves_answer_before_pending_gemma_marker() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let visible = visible_answer_delta(
+            &mut pending,
+            "answer<|channel>",
+            true,
+            false,
+            Some("<|channel>"),
+            None,
+        );
+
+        assert_eq!(visible, "answer");
+    }
+
+    #[test]
+    fn visible_answer_delta_recovers_aborted_gemma_marker_prefix() {
+        let mut pending = PendingReasoningMarker::default();
+        let first = visible_answer_delta(
+            &mut pending,
+            "answer<|channel>",
+            true,
+            false,
+            Some("<|channel>"),
+            None,
+        );
+        let second = visible_answer_delta(&mut pending, " nope", true, false, None, None);
+
+        assert_eq!(first, "answer");
+        assert_eq!(second, "<|channel> nope");
+    }
+
+    #[test]
+    fn visible_answer_delta_suppresses_same_batch_complete_marker_suffix() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let visible = visible_answer_delta(
+            &mut pending,
+            "answer<|channel>thought",
+            false,
+            false,
+            None,
+            Some("<|channel>thought"),
+        );
+
+        assert_eq!(visible, "answer");
     }
 
     #[test]

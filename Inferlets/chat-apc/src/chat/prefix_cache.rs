@@ -599,7 +599,7 @@ impl CacheDiag {
 // real-engine e2e suite. The correctness lives in the pure helpers above.)
 // =============================================================================
 
-use super::completions::{ChatMessage, ToolSchema, build_prompt_tokens};
+use super::completions::{ChatMessage, CueMode, ToolSchema, build_prompt_tokens, generation_cue};
 use inferlet::chat;
 use inferlet::model::Model;
 use inferlet::{
@@ -653,12 +653,13 @@ pub fn plan(
     model_id: &str,
     messages: &[ChatMessage],
     tools: Option<&[ToolSchema]>,
+    cue_mode: CueMode,
     directive: CacheDirective,
 ) -> Result<ReusePlan, (&'static str, String)> {
-    let prompt_no_cue = build_prompt_tokens(model, messages, tools, false)?;
-    let cue = chat::cue(model);
+    let prompt_no_cue = build_prompt_tokens(model, messages, tools, CueMode::None)?;
+    let cue = generation_cue(model, cue_mode);
     let last = messages.len().saturating_sub(1);
-    let prefix_tokens = build_prompt_tokens(model, &messages[..last], tools, false)?;
+    let prefix_tokens = build_prompt_tokens(model, &messages[..last], tools, CueMode::None)?;
     let open_name = if !prefix_tokens.is_empty() {
         Some(snapshot_name(
             &directive.key,

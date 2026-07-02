@@ -303,12 +303,16 @@ pub async fn dispatch(
                 .await;
         }
     };
-    // cue:false — the assistant turn is opened per branch in `search`
+    // CueMode::None — the assistant turn is opened per branch in `search`
     // (each fork re-cues), so the shared prefix stays cue-free and KV
     // pages are shared across branches.
-    if let Err((code, msg)) =
-        completions::fill_context(&mut root_ctx, &model, &messages, None, false)
-    {
+    if let Err((code, msg)) = completions::fill_context(
+        &mut root_ctx,
+        &model,
+        &messages,
+        None,
+        completions::CueMode::None,
+    ) {
         // #468: an unknown role is a client error (400, same envelope as
         // the completions path); other fill_context failures (e.g.
         // tool_equip_failed) stay 500.

@@ -58,6 +58,123 @@ class ResponseParsing(unittest.TestCase):
         self.assertEqual(parsed.tokens, 2)
         self.assertEqual(parsed.token_source, "tokenizer_fallback")
 
+    def test_single_pass_request_uses_configured_temperature(self):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "choices": [{"message": {"content": "2"}}],
+                    "usage": {"completion_tokens": 1},
+                }
+
+        class FakeHttp:
+            def __init__(self):
+                self.body = None
+
+            async def post(self, url, json):
+                self.body = json
+                return FakeResponse()
+
+        fake_http = FakeHttp()
+
+        with mock.patch.object(h, "SINGLE_TEMPERATURE", 0.7), \
+             mock.patch.object(h, "MAX_TOKENS", 1):
+            result = asyncio.run(
+                h._single_once(
+                    fake_http, "http://local", "model-a", "Answer with 2",
+                    lambda text: len(text.split()),
+                )
+            )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(fake_http.body["temperature"], 0.7)
+        self.assertEqual(fake_http.body["max_tokens"], 1)
+        self.assertFalse(fake_http.body["thinking"])
+
+    def test_single_pass_request_can_enable_thinking(self):
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "choices": [{"message": {"content": "Therefore the answer is 2."}}],
+                    "usage": {"completion_tokens": 37},
+                }
+
+        class FakeHttp:
+            def __init__(self):
+                self.body = None
+
+            async def post(self, url, json):
+                self.body = json
+                return FakeResponse()
+
+        fake_http = FakeHttp()
+
+        with mock.patch.object(h, "SINGLE_TEMPERATURE", 0.7), \
+             mock.patch.object(h, "SINGLE_THINKING", True), \
+             mock.patch.object(h, "MAX_TOKENS", 512):
+            result = asyncio.run(
+                h._single_once(
+                    fake_http, "http://local", "model-a", "Answer with 2",
+                    lambda text: len(text.split()),
+                )
+            )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(fake_http.body["temperature"], 0.7)
+        self.assertTrue(fake_http.body["thinking"])
+        self.assertEqual(fake_http.body["max_tokens"], 512)
+        self.assertTrue(
+            fake_http.body["messages"][0]["content"].startswith(
+                "Use the hidden thought channel for a brief check before answering."
+            )
+        )
+
+    def test_tot_once_can_dump_raw_stream_for_diagnostics(self):
+        stream = _sse(
+            {"event": "tree_start", "breadth": 2, "depth": 2, "beam_width": 1},
+            {
+                "event": "node_complete",
+                "node": {
+                    "id": "n1",
+                    "depth": 1,
+                    "branch_index": 0,
+                    "content": "4",
+                    "status": "ok",
+                    "score": 8,
+                },
+            },
+            {"event": "tree_complete", "final_answer": "4"},
+            {"event": "generation_metrics", "output_tokens": 1},
+            "[DONE]",
+        )
+
+        class FakeResponse:
+            status_code = 200
+            text = stream
+
+        class FakeHttp:
+            async def post(self, url, json):
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(h, "RAW_TOT_DIR", tmp):
+            parsed = asyncio.run(
+                h._tot_once(
+                    FakeHttp(), "http://local", "model-a", "prompt",
+                    lambda text: len(text.split()),
+                )
+            )
+
+            dumps = list(Path(tmp).glob("tot-*.sse"))
+            dumped = dumps[0].read_text() if dumps else None
+
+        self.assertEqual(parsed.answer, "4")
+        self.assertEqual(len(dumps), 1)
+        self.assertEqual(dumped, stream)
+
     def test_tot_stream_extracts_answer_metrics_and_node_errors(self):
         parsed = h.parse_tot_stream(
             _sse(
@@ -99,6 +216,69 @@ class ResponseParsing(unittest.TestCase):
         self.assertEqual(len(parsed.node_errors), 2)
         self.assertEqual(parsed.node_errors[0]["status"], "error")
         self.assertEqual(parsed.node_errors[1]["score_error"], "score unavailable")
+
+    def test_tot_stream_reuses_tree_dump_analysis_for_branch_coverage(self):
+        parsed = h.parse_tot_stream(
+            _sse(
+                {"event": "tree_start", "breadth": 2, "depth": 2, "beam_width": 1},
+                {
+                    "event": "node_complete",
+                    "node": {
+                        "id": "wrong-a",
+                        "parent_id": "root",
+                        "depth": 2,
+                        "branch_index": 0,
+                        "status": "ok",
+                        "content": "Statement 1 is true, so answer 3.",
+                    },
+                },
+                {
+                    "event": "node_complete",
+                    "node": {
+                        "id": "right-b",
+                        "parent_id": "root",
+                        "depth": 2,
+                        "branch_index": 1,
+                        "status": "ok",
+                        "content": "Both statements are false. Answer: 2",
+                    },
+                },
+                {"event": "tree_complete", "selected_node_id": "wrong-a", "final_answer": "3"},
+                "[DONE]",
+            ),
+            fallback_count=lambda text: len(text.split()),
+            grader="mcq_numeric",
+            reference={"final_answer": "2", "choice_count": 4},
+        )
+
+        self.assertTrue(parsed.any_correct_branch)
+        self.assertEqual(parsed.answer_histogram, {"2": 1, "3": 1})
+        self.assertEqual(parsed.correct_branch_count, 1)
+        self.assertEqual(parsed.coverage_loss_kind, "selection_synthesis")
+
+    def test_tot_sweep_arms_cover_phase_a_matrix_and_start_with_shipped_default(self):
+        arms = h.build_tot_sweep_arms()
+
+        self.assertEqual(
+            arms[0],
+            h.TotSweepArm(
+                name="default_b3_d2_beam2_t0.7_pen0_baseline",
+                breadth=3,
+                depth=2,
+                beam_width=2,
+                temperature=0.7,
+                sibling_penalty=0.0,
+                prompt_framing="baseline",
+            ),
+        )
+        requested = {
+            (arm.breadth, arm.beam_width, arm.temperature,
+             arm.sibling_penalty, arm.prompt_framing)
+            for arm in arms[1:]
+        }
+        self.assertIn((2, 1, 0.7, 0.0, "baseline"), requested)
+        self.assertIn((5, 2, 1.0, 2.0, "counter_reading"), requested)
+        self.assertEqual(len(requested), 4 * 2 * 3 * 2 * 2)
 
     def test_best_of_n_stream_extracts_central_candidate_from_real_envelope(self):
         # Mirrors the shipped Best-of-N stream shape from src/bestofn/mod.rs:
@@ -256,7 +436,6 @@ class ResponseParsing(unittest.TestCase):
         self.assertEqual(summary["best_of_n"]["n_token_fallback"], 3)
 
 
-
 class DatasetSelection(unittest.TestCase):
     def test_default_datasets_exclude_jsonschema_but_include_target_generalization_set(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -293,6 +472,13 @@ class DatasetSelection(unittest.TestCase):
         self.assertEqual(calls, [("model-a", "humaneval"), ("model-a", "mbpp")])
         self.assertEqual([row["dataset"] for row in rows], ["humaneval", "mbpp"])
         self.assertTrue(all(row["model"] == "model-a" for row in rows))
+
+    def test_select_records_for_run_can_target_zero_based_idx16(self):
+        records = [{"id": f"test-{i}"} for i in range(20)]
+
+        selected = h.select_records_for_run(records, "16")
+
+        self.assertEqual(selected, [(16, {"id": "test-16"})])
 
 
 class Aggregation(unittest.TestCase):
@@ -411,7 +597,7 @@ class Aggregation(unittest.TestCase):
             "mbpp": "def f(a):\n    return a + 1\n",
         }
 
-        async def fake_once(http_c, base_url, model, prompt, count, *args):
+        async def fake_once(http_c, base_url, model, prompt, count, *args, **kwargs):
             dataset = "humaneval" if "add_one" in prompt else "mbpp"
             return h.ArmResult(answer=answers[dataset], tokens=3, latency_s=0.01)
 
@@ -435,6 +621,35 @@ class Aggregation(unittest.TestCase):
             self.assertEqual(row["tot"]["accuracy"], 1.0, row)
             self.assertEqual(row["best_of_n"]["accuracy"], 1.0, row)
             self.assertEqual(row["coverage"], {"measured": 1, "total": 1})
+
+    def test_run_model_dataset_can_measure_single_pass_only(self):
+        records = [{
+            "id": "test-15",
+            "prompt": "Answer 2",
+            "reference": {"choice_count": 4, "final_answer": "2"},
+        }]
+
+        async def fake_single(http_c, base_url, model, prompt, count):
+            return h.ArmResult(answer="2", tokens=1, latency_s=0.01)
+
+        async def fail_tot(*args, **kwargs):
+            raise AssertionError("single-pass baseline probe must not dispatch ToT")
+
+        with mock.patch.object(h.base, "_load_prompts", return_value=(records, 1)), \
+             mock.patch.object(h.base, "_grader_for", return_value="mcq_numeric"), \
+             mock.patch.object(h, "_single_once", side_effect=fake_single), \
+             mock.patch.object(h, "_tot_once", side_effect=fail_tot), \
+             mock.patch.object(h, "PROFILE_ARMS", "single"):
+            row = asyncio.run(
+                h._run_model_dataset(
+                    "http://local", "model-a", "mmlu",
+                    lambda text: len(text.split()),
+                )
+            )
+
+        self.assertEqual(row["single"]["n_correct"], 1)
+        self.assertEqual(row["tot"]["n_error"], 1)
+        self.assertEqual(row["items"][0]["tot"]["error"], "skipped by PROFILE_ARMS=single")
 
     def test_artifact_keeps_multiple_models_in_priority_order(self):
         artifact = h.build_artifact(

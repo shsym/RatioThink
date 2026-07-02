@@ -57,7 +57,9 @@ use wstd::http::body::IncomingBody;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Request, Response};
 
-use super::apc::{ReasoningDecoder, ToolUseDecoder};
+use super::apc::{
+    PendingReasoningMarker, ReasoningDecoder, ToolUseDecoder, gemma_thinking_cue_tokens,
+};
 use super::generate::{self, DecodeStrategy};
 use super::prefix_cache::{self, CacheDiag, ReusePlan};
 use super::spec::sidecar::{Lineage, SidecarKey, SidecarStatus, SidecarStore, encode_sidecar_blob};
@@ -176,6 +178,11 @@ pub struct ChatCompletionsRequest {
     pub stream: bool,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    /// chat-apc extension: request the model's native thinking channel for a
+    /// plain chat completion. Defaults to false so existing callers keep the
+    /// ordinary assistant cue exactly as before.
+    #[serde(default)]
+    pub thinking: bool,
     pub max_tokens: Option<usize>,
     /// OpenAI's newer alias for `max_tokens` (the only field current
     /// OpenAI/Codex-style clients send). Used as a fallback when
@@ -222,6 +229,23 @@ pub struct ChatCompletionsRequest {
     /// non-streaming requests (those always carry `usage`).
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+}
+
+#[derive(Copy, Clone)]
+pub(crate) enum CueMode {
+    None,
+    Generic,
+    Thinking,
+}
+
+impl ChatCompletionsRequest {
+    fn cue_mode(&self) -> CueMode {
+        if self.thinking {
+            CueMode::Thinking
+        } else {
+            CueMode::Generic
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Default)]
@@ -3517,7 +3541,14 @@ async fn handle_streaming(
     // legacy full-rebuild path below (byte-identical to pre-#522).
     let cache_plan: Option<ReusePlan> = match req.cache.clone() {
         Some(d) if d.enabled() => {
-            match prefix_cache::plan(&model, &req.model, &req.messages, req.tools.as_deref(), d) {
+            match prefix_cache::plan(
+                &model,
+                &req.model,
+                &req.messages,
+                req.tools.as_deref(),
+                req.cue_mode(),
+                d,
+            ) {
                 Ok(p) => Some(p),
                 Err((code, msg)) => {
                     return res
@@ -3553,9 +3584,13 @@ async fn handle_streaming(
                         .await;
                 }
             };
-            if let Err((code, msg)) =
-                fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true)
-            {
+            if let Err((code, msg)) = fill_context(
+                &mut ctx,
+                &model,
+                &req.messages,
+                req.tools.as_deref(),
+                req.cue_mode(),
+            ) {
                 return res
                     .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
                     .await;
@@ -3929,6 +3964,7 @@ async fn handle_streaming(
     // the canonical next-turn boundary. Only used when `cache_plan` is
     // engaged.
     let mut full_text = String::new();
+    let mut pending_reasoning_marker = PendingReasoningMarker::default();
 
     // F1/F2/F3/F5: explicit-match loop with an `Outcome` set at the
     // exit point. `Generator::next` Err, decoder Err, and chat-
@@ -4064,6 +4100,8 @@ async fn handle_streaming(
                 );
             }
         }
+        let pending_marker = reason_dec.pending_start_marker_text();
+        let completed_marker = reason_dec.completed_start_marker_text();
 
         // Tool-use side: a completed `Call(name, args)` terminates
         // generation with `finish_reason: "tool_calls"`. The delta
@@ -4104,13 +4142,20 @@ async fn handle_streaming(
             // tool call — `forced_tool` makes the whole generation the call,
             // which rides only the terminal `tool_calls` delta).
             Ok(chat::Event::Delta(s)) => {
-                let visible =
+                let base_visible =
                     visible_content(&s, reason_idle, was_in_reasoning, reason_ended, forced_tool);
+                let visible = pending_reasoning_marker.visible_delta(
+                    &s,
+                    base_visible,
+                    pending_marker.as_deref(),
+                    completed_marker.as_deref(),
+                    forced_tool,
+                );
                 if !visible.is_empty() {
                     // #522: mirror the visible text the App persists, so the
                     // save gate can compare it against the generated tokens.
-                    full_text.push_str(visible);
-                    sidecar_assistant_content.push_str(visible);
+                    full_text.push_str(&visible);
+                    sidecar_assistant_content.push_str(&visible);
                     let chunk = ChatCompletionChunk {
                         id: &id,
                         object: "chat.completion.chunk",
@@ -4119,7 +4164,7 @@ async fn handle_streaming(
                         choices: vec![ChunkChoice {
                             index: 0,
                             delta: ChunkDelta {
-                                content: Some(visible),
+                                content: Some(&visible),
                                 ..Default::default()
                             },
                             finish_reason: None,
@@ -4404,7 +4449,14 @@ async fn handle_non_streaming(
     // path below.
     let cache_plan: Option<ReusePlan> = match req.cache.clone() {
         Some(d) if d.enabled() => {
-            match prefix_cache::plan(&model, &req.model, &req.messages, req.tools.as_deref(), d) {
+            match prefix_cache::plan(
+                &model,
+                &req.model,
+                &req.messages,
+                req.tools.as_deref(),
+                req.cue_mode(),
+                d,
+            ) {
                 Ok(p) => Some(p),
                 Err((code, msg)) => {
                     return res
@@ -4440,9 +4492,13 @@ async fn handle_non_streaming(
                         .await;
                 }
             };
-            if let Err((code, msg)) =
-                fill_context(&mut ctx, &model, &req.messages, req.tools.as_deref(), true)
-            {
+            if let Err((code, msg)) = fill_context(
+                &mut ctx,
+                &model,
+                &req.messages,
+                req.tools.as_deref(),
+                req.cue_mode(),
+            ) {
                 return res
                     .respond(with_launch_diags_header(sse::json_error(500, code, &msg)))
                     .await;
@@ -4715,6 +4771,7 @@ async fn handle_non_streaming(
     let mut reasoning_text = String::new();
     let mut pending_tool: Option<PendingToolCall> = None;
     let mut in_reasoning = false;
+    let mut pending_reasoning_marker = PendingReasoningMarker::default();
 
     // F4: drive the loop ourselves so we can record the actual
     // termination reason. `collect_text` collapsed natural stop and
@@ -4813,6 +4870,8 @@ async fn handle_non_streaming(
                 );
             }
         }
+        let pending_marker = reason_dec.pending_start_marker_text();
+        let completed_marker = reason_dec.completed_start_marker_text();
 
         if tool_dec_active {
             match tool_dec.feed(&out.tokens) {
@@ -4847,9 +4906,16 @@ async fn handle_non_streaming(
             // suppressed (inside reasoning, the delimiter, or a forced tool call
             // whose content rides only the terminal tool_calls delta).
             Ok(chat::Event::Delta(s)) => {
-                let visible =
+                let base_visible =
                     visible_content(&s, reason_idle, was_in_reasoning, reason_ended, forced_tool);
-                full_text.push_str(visible);
+                let visible = pending_reasoning_marker.visible_delta(
+                    &s,
+                    base_visible,
+                    pending_marker.as_deref(),
+                    completed_marker.as_deref(),
+                    forced_tool,
+                );
+                full_text.push_str(&visible);
             }
             // F1: trust the delta-stitched `full_text` that respects the
             // reasoning channel (`content_visible`). The chat decoder runs
@@ -5216,9 +5282,9 @@ pub(crate) fn fill_context(
     model: &Model,
     messages: &[ChatMessage],
     tools: Option<&[ToolSchema]>,
-    cue: bool,
+    cue_mode: CueMode,
 ) -> Result<(), (&'static str, String)> {
-    let tokens = build_prompt_tokens(model, messages, tools, cue)?;
+    let tokens = build_prompt_tokens(model, messages, tools, cue_mode)?;
     ctx.append(&tokens);
     Ok(())
 }
@@ -5233,7 +5299,7 @@ pub(crate) fn build_prompt_tokens(
     model: &Model,
     messages: &[ChatMessage],
     tools: Option<&[ToolSchema]>,
-    cue: bool,
+    cue_mode: CueMode,
 ) -> Result<Vec<u32>, (&'static str, String)> {
     let mut out = Vec::new();
     if let Some(tools) = tools {
@@ -5321,10 +5387,16 @@ pub(crate) fn build_prompt_tokens(
     // defers it to each forked branch (so a freshly forked, fully-flushed
     // context still has tokens to process — an empty forward pass spins
     // the generator), so it is opt-out here.
-    if cue {
-        out.extend(chat::cue(model));
-    }
+    out.extend(generation_cue(model, cue_mode));
     Ok(out)
+}
+
+pub(crate) fn generation_cue(model: &Model, cue_mode: CueMode) -> Vec<u32> {
+    match cue_mode {
+        CueMode::None => Vec::new(),
+        CueMode::Generic => chat::cue(model),
+        CueMode::Thinking => gemma_thinking_cue_tokens(model).unwrap_or_else(|| chat::cue(model)),
+    }
 }
 
 fn assistant_replay_content(msg: &ChatMessage) -> String {
@@ -5502,6 +5574,30 @@ mod tests {
 
     fn parse_message(json: &str) -> Result<ChatMessage, serde_json::Error> {
         serde_json::from_str(json)
+    }
+
+    fn parse_request(json: &str) -> Result<ChatCompletionsRequest, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn request_thinking_defaults_false() {
+        let req = parse_request(r#"{"model":"m","messages":[{"role":"user","content":"answer"}]}"#)
+            .unwrap();
+
+        assert!(!req.thinking);
+        assert!(matches!(req.cue_mode(), CueMode::Generic));
+    }
+
+    #[test]
+    fn request_thinking_true_selects_thinking_cue() {
+        let req = parse_request(
+            r#"{"model":"m","messages":[{"role":"user","content":"answer"}],"thinking":true}"#,
+        )
+        .unwrap();
+
+        assert!(req.thinking);
+        assert!(matches!(req.cue_mode(), CueMode::Thinking));
     }
 
     #[test]
@@ -5905,6 +6001,76 @@ mod tests {
             visible_content("</think>Paris", false, true, true, true),
             ""
         );
+    }
+
+    #[test]
+    fn pending_gemma_marker_suppresses_only_trailing_marker_prefix() {
+        let mut pending = PendingReasoningMarker::default();
+        let base = visible_content("answer<|channel>", true, false, false, false);
+
+        let visible =
+            pending.visible_delta("answer<|channel>", base, Some("<|channel>"), None, false);
+
+        assert_eq!(visible, "answer");
+    }
+
+    #[test]
+    fn pending_gemma_marker_abort_flushes_buffered_prefix() {
+        let mut pending = PendingReasoningMarker::default();
+        let first = pending.visible_delta(
+            "answer<|channel>",
+            visible_content("answer<|channel>", true, false, false, false),
+            Some("<|channel>"),
+            None,
+            false,
+        );
+        let second = pending.visible_delta(
+            " not-thought",
+            visible_content(" not-thought", true, false, false, false),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(first, "answer");
+        assert_eq!(second, "<|channel> not-thought");
+    }
+
+    #[test]
+    fn pending_gemma_marker_complete_discards_buffered_prefix() {
+        let mut pending = PendingReasoningMarker::default();
+        let first = pending.visible_delta(
+            "answer<|channel>",
+            visible_content("answer<|channel>", true, false, false, false),
+            Some("<|channel>"),
+            None,
+            false,
+        );
+        let second = pending.visible_delta(
+            "thought",
+            visible_content("thought", false, false, false, false),
+            None,
+            Some("<|channel>thought"),
+            false,
+        );
+
+        assert_eq!(first, "answer");
+        assert_eq!(second, "");
+    }
+
+    #[test]
+    fn completed_gemma_marker_suppresses_only_marker_suffix() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let visible = pending.visible_delta(
+            "answer<|channel>thought",
+            visible_content("answer<|channel>thought", false, false, false, false),
+            None,
+            Some("<|channel>thought"),
+            false,
+        );
+
+        assert_eq!(visible, "answer");
     }
 
     #[test]

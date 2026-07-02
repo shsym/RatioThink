@@ -83,14 +83,24 @@ impl ReasoningDecoder {
             .unwrap_or(ReasoningEvent::Idle))
     }
 
-    /// True when the Gemma fallback has consumed a prefix of
-    /// `<|channel>thought` but has not yet seen the complete marker. The chat
-    /// decoder may already have text for that prefix; callers must hold it out
-    /// of the visible answer until the marker either completes or fails.
-    pub fn suppress_content_for_pending_marker(&self) -> bool {
+    /// Text for the trailing Gemma thought-channel marker prefix matched so far
+    /// on this batch, if any. The chat decoder may have surfaced it inside the
+    /// same delta as visible answer text; callers should withhold exactly this
+    /// suffix, not the whole delta.
+    pub fn pending_start_marker_text(&self) -> Option<String> {
         self.gemma
             .as_ref()
-            .is_some_and(GemmaChannelDecoder::is_start_pending)
+            .and_then(GemmaChannelDecoder::pending_start_marker_text)
+    }
+
+    /// Text for a Gemma thought-channel opener that completed on this batch, if
+    /// any. This lets callers discard a previously buffered partial opener and
+    /// recover any visible text that preceded a complete marker in the same
+    /// chat delta.
+    pub fn completed_start_marker_text(&self) -> Option<String> {
+        self.gemma
+            .as_ref()
+            .and_then(GemmaChannelDecoder::completed_start_marker_text)
     }
 
     #[allow(dead_code)]
@@ -98,6 +108,76 @@ impl ReasoningDecoder {
         self.inner.reset();
         if let Some(gemma) = &mut self.gemma {
             gemma.reset();
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PendingReasoningMarker {
+    buffered: String,
+}
+
+impl PendingReasoningMarker {
+    pub(crate) fn visible_delta(
+        &mut self,
+        chat_delta: &str,
+        base_visible: &str,
+        pending_marker: Option<&str>,
+        completed_marker: Option<&str>,
+        forced_tool: bool,
+    ) -> String {
+        if forced_tool {
+            self.buffered.clear();
+            return String::new();
+        }
+
+        let mut out = String::new();
+        if let Some(marker) = completed_marker {
+            out.push_str(&self.visible_before_marker(chat_delta, base_visible, marker));
+            self.buffered.clear();
+            return out;
+        }
+
+        if let Some(marker) = pending_marker {
+            if let Some(visible) = self.visible_before_pending_marker(chat_delta, marker) {
+                return visible;
+            }
+            out.push_str(base_visible);
+            return out;
+        }
+
+        if !self.buffered.is_empty() {
+            out.push_str(&self.buffered);
+            self.buffered.clear();
+        }
+        out.push_str(base_visible);
+        out
+    }
+
+    fn visible_before_pending_marker(&mut self, chat_delta: &str, marker: &str) -> Option<String> {
+        let fragment = marker.strip_prefix(&self.buffered)?;
+        if let Some(visible) = chat_delta.strip_suffix(fragment) {
+            self.buffered.push_str(fragment);
+            return Some(visible.to_string());
+        }
+        if !self.buffered.is_empty()
+            && marker.starts_with(&self.buffered)
+            && fragment.starts_with(chat_delta)
+        {
+            self.buffered.push_str(chat_delta);
+            return Some(String::new());
+        }
+        None
+    }
+
+    fn visible_before_marker(&self, chat_delta: &str, base_visible: &str, marker: &str) -> String {
+        let fragment = marker.strip_prefix(&self.buffered).unwrap_or(marker);
+        if let Some(visible) = chat_delta.strip_suffix(fragment) {
+            visible.to_string()
+        } else if let Some((visible, _)) = chat_delta.split_once(marker) {
+            visible.to_string()
+        } else {
+            base_visible.to_string()
         }
     }
 }
@@ -135,6 +215,7 @@ struct GemmaChannelDecoder {
     token_buf: Vec<u32>,
     text_emitted: usize,
     match_pos: usize,
+    completed_start_marker_text: Option<String>,
     detokenize: Box<dyn Fn(&[u32]) -> String + Send>,
 }
 
@@ -177,6 +258,7 @@ impl GemmaChannelDecoder {
             token_buf: Vec::new(),
             text_emitted: 0,
             match_pos: 0,
+            completed_start_marker_text: None,
             detokenize: Box::new(detokenize),
         }
     }
@@ -191,11 +273,13 @@ impl GemmaChannelDecoder {
     }
 
     fn feed(&mut self, tokens: &[u32]) -> ReasoningEvent {
+        self.completed_start_marker_text = None;
         if !self.inside {
             for &t in tokens {
                 if self.match_pos < self.start_ids.len() && t == self.start_ids[self.match_pos] {
                     self.match_pos += 1;
                     if self.match_pos == self.start_ids.len() {
+                        self.completed_start_marker_text = Some((self.detokenize)(&self.start_ids));
                         self.inside = true;
                         self.match_pos = 0;
                         self.token_buf.clear();
@@ -245,10 +329,20 @@ impl GemmaChannelDecoder {
         self.token_buf.clear();
         self.text_emitted = 0;
         self.match_pos = 0;
+        self.completed_start_marker_text = None;
     }
 
     fn is_start_pending(&self) -> bool {
         !self.inside && self.match_pos > 0
+    }
+
+    fn pending_start_marker_text(&self) -> Option<String> {
+        self.is_start_pending()
+            .then(|| (self.detokenize)(&self.start_ids[..self.match_pos]))
+    }
+
+    fn completed_start_marker_text(&self) -> Option<String> {
+        self.completed_start_marker_text.clone()
     }
 }
 
@@ -290,18 +384,201 @@ mod tests {
     }
 
     #[test]
-    fn gemma_channel_decoder_reports_pending_partial_start_marker() {
-        let mut dec = GemmaChannelDecoder::new_for_testing(vec![100, 42], vec![101], |tokens| {
-            format!("{tokens:?}")
-        });
+    fn gemma_channel_decoder_reports_pending_and_completed_start_marker_text() {
+        let mut dec =
+            GemmaChannelDecoder::new_for_testing(vec![100, 42], vec![101], |tokens| match tokens {
+                [100] => "<|channel>".to_string(),
+                [100, 42] => "<|channel>thought".to_string(),
+                other => format!("{other:?}"),
+            });
 
         assert!(matches!(dec.feed(&[100]), ReasoningEvent::Idle));
         assert!(
             dec.is_start_pending(),
             "partial Gemma marker must suppress visible content"
         );
+        assert_eq!(
+            dec.pending_start_marker_text().as_deref(),
+            Some("<|channel>")
+        );
+        assert!(dec.completed_start_marker_text().is_none());
+
         assert!(matches!(dec.feed(&[42]), ReasoningEvent::Start));
         assert!(!dec.is_start_pending());
+        assert!(dec.pending_start_marker_text().is_none());
+        assert_eq!(
+            dec.completed_start_marker_text().as_deref(),
+            Some("<|channel>thought")
+        );
+    }
+
+    #[test]
+    fn pending_marker_suppresses_only_trailing_marker_prefix() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let visible = pending.visible_delta(
+            "answer<|channel>",
+            "answer<|channel>",
+            Some("<|channel>"),
+            None,
+            false,
+        );
+
+        assert_eq!(visible, "answer");
+    }
+
+    #[test]
+    fn pending_marker_abort_flushes_buffered_prefix() {
+        let mut pending = PendingReasoningMarker::default();
+        let first = pending.visible_delta(
+            "answer<|channel>",
+            "answer<|channel>",
+            Some("<|channel>"),
+            None,
+            false,
+        );
+        let second = pending.visible_delta(" not-thought", " not-thought", None, None, false);
+
+        assert_eq!(first, "answer");
+        assert_eq!(second, "<|channel> not-thought");
+    }
+
+    #[test]
+    fn pending_marker_complete_discards_buffered_prefix() {
+        let mut pending = PendingReasoningMarker::default();
+        let first = pending.visible_delta(
+            "answer<|channel>",
+            "answer<|channel>",
+            Some("<|channel>"),
+            None,
+            false,
+        );
+        let second = pending.visible_delta("thought", "", None, Some("<|channel>thought"), false);
+
+        assert_eq!(first, "answer");
+        assert_eq!(second, "");
+    }
+
+    #[test]
+    fn pending_marker_spanning_three_batches_does_not_leak_fragments() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let first = pending.visible_delta("answer<|", "answer<|", Some("<|"), None, false);
+        let second = pending.visible_delta("channel>", "channel>", Some("<|channel>"), None, false);
+        let third = pending.visible_delta("thought", "", None, Some("<|channel>thought"), false);
+
+        assert_eq!(first, "answer");
+        assert_eq!(second, "");
+        assert_eq!(third, "");
+    }
+
+    #[test]
+    fn pending_marker_spanning_three_batches_abort_recovers_prefix() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let first = pending.visible_delta("answer<|", "answer<|", Some("<|"), None, false);
+        let second = pending.visible_delta("channel>", "channel>", Some("<|channel>"), None, false);
+        let third = pending.visible_delta(" not-thought", " not-thought", None, None, false);
+
+        assert_eq!(first, "answer");
+        assert_eq!(second, "");
+        assert_eq!(third, "<|channel> not-thought");
+    }
+
+    #[test]
+    fn pending_marker_buffers_interior_continuation_fragment_only() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let first = pending.visible_delta("answer<|", "answer<|", Some("<|"), None, false);
+        let second = pending.visible_delta("chan", "chan", Some("<|channel>"), None, false);
+        let third =
+            pending.visible_delta("nel>thought", "", None, Some("<|channel>thought"), false);
+
+        assert_eq!(first, "answer");
+        assert_eq!(second, "");
+        assert_eq!(third, "");
+    }
+
+    #[test]
+    fn pending_marker_mismatch_emits_visible_text_instead_of_swallowing() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let first = pending.visible_delta("answer<|", "answer<|", Some("<|"), None, false);
+        let second = pending.visible_delta("X", "X", Some("<|channel>"), None, false);
+        let third = pending.visible_delta(
+            "channel>thought",
+            "",
+            None,
+            Some("<|channel>thought"),
+            false,
+        );
+
+        assert_eq!(first, "answer");
+        assert_eq!(second, "X");
+        assert_eq!(third, "");
+    }
+
+    #[test]
+    fn completed_marker_uses_split_once_when_buffered_fragment_misses_suffix() {
+        let mut pending = PendingReasoningMarker {
+            buffered: "<|".to_string(),
+        };
+
+        let visible = pending.visible_delta(
+            "answer<|channel>thought trailing",
+            "answer<|channel>thought trailing",
+            None,
+            Some("<|channel>thought"),
+            false,
+        );
+
+        assert_eq!(visible, "answer");
+    }
+
+    #[test]
+    fn forced_tool_clears_pending_marker_buffer() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let first = pending.visible_delta(
+            "answer<|channel>",
+            "answer<|channel>",
+            Some("<|channel>"),
+            None,
+            false,
+        );
+        let forced = pending.visible_delta("tool", "tool", Some("<|channel>thought"), None, true);
+        let after = pending.visible_delta("", "", None, None, false);
+
+        assert_eq!(first, "answer");
+        assert_eq!(forced, "");
+        assert_eq!(after, "");
+    }
+
+    #[test]
+    fn pending_marker_without_preceding_text_stays_hidden_through_complete() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let first =
+            pending.visible_delta("<|channel>", "<|channel>", Some("<|channel>"), None, false);
+        let second = pending.visible_delta("thought", "", None, Some("<|channel>thought"), false);
+
+        assert_eq!(first, "");
+        assert_eq!(second, "");
+    }
+
+    #[test]
+    fn completed_marker_suppresses_only_marker_suffix() {
+        let mut pending = PendingReasoningMarker::default();
+
+        let visible = pending.visible_delta(
+            "answer<|channel>thought",
+            "",
+            None,
+            Some("<|channel>thought"),
+            false,
+        );
+
+        assert_eq!(visible, "answer");
     }
 
     #[test]
