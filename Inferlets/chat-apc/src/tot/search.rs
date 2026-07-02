@@ -573,14 +573,15 @@ fn reasoning_branch_directive(
     };
     let body = if level >= max_depth {
         format!(
-            "Using the reasoning steps already in this conversation, state the FINAL answer to the user's question now. Answer every part of the request; if a number of items is requested, include that many. For math, use only values computed from the problem and give the final number. If the answer is a money amount, include the currency symbol, such as $18 instead of 18. Do not invent unsupported names, numbers, or statistics. Write only the answer. No heading. Option {n} of {breadth}: {focus}"
+            "Briefly compute or check the needed values, then state the FINAL answer to the user's question now. Show the computation briefly and end with the final answer. Answer every part of the request; if a number of items is requested, include that many. For math, use only values computed from the problem and give the final number. If the answer is a money amount, include the currency symbol, such as $18 instead of 18. Do not invent unsupported names, numbers, or statistics. No heading. Option {n} of {breadth}: {focus}"
         )
     } else {
         format!(
             "Take ONE step toward the answer: compute or establish a single intermediate result the final answer will need. Do NOT state the final answer yet — write only this one step. For math, use only values from the problem and show the number you get. Do not invent people, labels, or statistics. No heading. Option {n} of {breadth}: {focus}"
         )
     };
-    with_thinking(&body, branch_uses_thinking(level, max_depth, thinking))
+    let thinking = branch_uses_thinking(level, max_depth, thinking);
+    with_thinking(&with_private_thought_cue(body, thinking), thinking)
 }
 
 /// Stricter `reasoning` directive for the bounded no-think retry (mirrors
@@ -3522,11 +3523,14 @@ mod tests {
         let d = reasoning_branch_directive(3, 3, 1, 3, true);
         assert!(d.contains("FINAL answer"), "{d}");
         assert!(
-            d.contains("reasoning steps already in this conversation"),
+            d.contains("Briefly compute or check"),
             "{d}"
         );
+        assert!(d.contains("Show the computation briefly"), "{d}");
         assert!(d.contains("$18 instead of 18"), "{d}");
         assert!(!d.contains("Do NOT state the final answer yet"), "{d}");
+        assert!(!d.contains("already in this conversation"), "{d}");
+        assert!(!d.contains("Write only the answer"), "{d}");
     }
 
     #[test]
@@ -3536,6 +3540,16 @@ mod tests {
         assert!(reasoning_branch_directive(3, 3, 0, 3, false).contains("/no_think"));
         assert!(!reasoning_branch_directive(1, 3, 0, 3, true).contains("/no_think"));
         assert!(!reasoning_branch_directive(3, 3, 0, 3, true).contains("/no_think"));
+    }
+
+    #[test]
+    fn reasoning_directive_thinking_requests_private_thought_before_answer() {
+        let d = reasoning_branch_directive(1, 3, 0, 3, true);
+        assert!(d.contains("hidden thought channel"), "{d}");
+        assert!(
+            !reasoning_branch_directive(1, 3, 0, 3, false)
+                .contains("hidden thought channel")
+        );
     }
 
     #[test]
