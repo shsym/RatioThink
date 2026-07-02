@@ -371,10 +371,15 @@ struct RatioThinkApp: App {
     #else
     let pinnedHelperHealth: HelperHealth? = nil
     #endif
+    #if DEBUG
+    let pinnedManualRestartSucceeds = Self.pinnedHelperRestartSucceedsForTesting()
+    #else
+    let pinnedManualRestartSucceeds = true
+    #endif
     let controller = HelperHealthController(
       repair: helperRepair,
       pinnedHealth: pinnedHelperHealth,
-      pinnedManualRestartSucceeds: Self.pinnedHelperRestartSucceedsForTesting()
+      pinnedManualRestartSucceeds: pinnedManualRestartSucceeds
     )
     // Set BEFORE statusStore.start() so the first ticks count.
     statusStore.onPollOutcome = { [weak controller] succeeded in
