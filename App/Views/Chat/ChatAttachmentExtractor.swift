@@ -26,13 +26,14 @@ enum ChatAttachmentExtractionError: Error, Equatable {
 }
 
 enum ChatAttachmentExtractor {
-  private static let textExtensions: Set<String> = [
+  static let textExtensions: Set<String> = [
     "txt", "text", "md", "markdown", "json", "jsonl", "csv", "tsv",
     "html", "htm", "xml", "yaml", "yml", "toml", "log",
     "swift", "rs", "py", "js", "ts", "tsx", "jsx", "java", "kt",
     "c", "h", "m", "mm", "cpp", "hpp", "cs", "go", "rb", "php",
     "sh", "bash", "zsh", "sql", "css", "scss"
   ]
+  static let supportedFileExtensions: Set<String> = textExtensions.union(["pdf"])
 
   static func extract(url: URL) throws -> PendingChatAttachment {
     let filename = url.lastPathComponent
@@ -40,7 +41,7 @@ enum ChatAttachmentExtractor {
     if ext == "pdf" {
       return try extractPDF(url: url, filename: filename)
     }
-    guard textExtensions.contains(ext) else {
+    guard supportedFileExtensions.contains(ext) else {
       throw ChatAttachmentExtractionError.unsupported(filename: filename)
     }
     guard let text = try? String(contentsOf: url, encoding: .utf8) else {
@@ -79,8 +80,18 @@ enum ChatAttachmentContextLimiter {
 
   static let truncationNotice = "Only the front portion of the attached document(s) was added."
 
+  static let promptHeadroomTokens = 2_048
+  static let maxGenerationHeadroomTokens = 2_048
+  static let attachmentContextFraction = 0.125
+
   static func budget(engineProvidedMaxTokens: Int, modelConfiguredContextLength: Int) -> Int {
-    Int(floor(Double(min(engineProvidedMaxTokens, modelConfiguredContextLength)) * 0.5))
+    let contextWindow = max(0, modelConfiguredContextLength)
+    guard contextWindow > 0 else { return 0 }
+    let promptHeadroom = min(promptHeadroomTokens, contextWindow / 4)
+    let generationHeadroom = min(max(0, engineProvidedMaxTokens), maxGenerationHeadroomTokens, contextWindow / 4)
+    let usableWindow = max(0, contextWindow - promptHeadroom - generationHeadroom)
+    let attachmentShare = Int(floor(Double(contextWindow) * attachmentContextFraction))
+    return max(0, min(usableWindow, attachmentShare))
   }
 
   static func limitedContext(

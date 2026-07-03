@@ -119,6 +119,14 @@ struct ComposerView: View {
     editorBoxHeight(forContentHeight: contentHeight(forText: draft, containerWidth: editorWidth))
   }
 
+  static var attachmentPanelAllowedFileTypes: [String] {
+    ChatAttachmentExtractor.supportedFileExtensions.sorted()
+  }
+
+  static var attachmentPanelAllowedContentTypes: [UTType] {
+    attachmentPanelAllowedFileTypes.compactMap { UTType(filenameExtension: $0) }
+  }
+
   init(
     chat: Chat?,
     viewModel: ChatTranscriptViewModel,
@@ -338,6 +346,8 @@ struct ComposerView: View {
     panel.canChooseFiles = true
     panel.canChooseDirectories = false
     panel.allowsMultipleSelection = true
+    panel.allowedContentTypes = Self.attachmentPanelAllowedContentTypes
+    panel.allowsOtherFileTypes = false
     if panel.runModal() == .OK {
       addAttachments(from: panel.urls)
     }

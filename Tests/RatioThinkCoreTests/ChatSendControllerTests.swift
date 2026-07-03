@@ -196,7 +196,7 @@ final class ChatSendControllerTests: XCTestCase {
     XCTAssertEqual(assistant.tokens, 10)
   }
 
-  func test_postFinishNonTransportStreamError_isReported() async throws {
+  func test_postFinishNonTransportStreamError_isLoggedWithoutPersistenceBanner() async throws {
     let container = try RatioThinkModelContainer.makeInMemory()
     let context = ModelContext(container)
     let chat = Chat()
@@ -229,8 +229,7 @@ final class ChatSendControllerTests: XCTestCase {
     let assistant = try XCTUnwrap(assistantMessages(in: chat).first)
     XCTAssertEqual(assistant.content, "Hi")
     XCTAssertEqual(assistant.finishReason, "stop")
-    XCTAssertEqual(status.lastError?.context, "ChatSendController.postFinishStreamError")
-    XCTAssertTrue(status.lastError?.message.contains("bad_generation_metrics") == true)
+    XCTAssertNil(status.lastError)
   }
 
   func test_cancelled_partial_assistant_does_not_keep_generation_metrics() async throws {

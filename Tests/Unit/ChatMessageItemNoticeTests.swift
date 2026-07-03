@@ -51,6 +51,16 @@ final class ChatMessageItemNoticeTests: XCTestCase {
     XCTAssertEqual(item.generationPerformanceText, "42 tok/s")
   }
 
+  func test_item_marks_user_attachmentContextForTranscriptRendering() {
+    let item = ChatMessageItem(Message(
+      role: "user",
+      content: "Summarize this.",
+      extractedAttachmentText: "attached text"
+    ))
+
+    XCTAssertTrue(item.hasAttachmentContext)
+  }
+
   func test_item_labels_tot_generation_performance_as_total_throughput() {
     let item = ChatMessageItem(
       role: .assistant,

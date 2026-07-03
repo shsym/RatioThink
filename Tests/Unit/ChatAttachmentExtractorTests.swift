@@ -74,14 +74,24 @@ final class ChatAttachmentExtractorTests: XCTestCase {
     XCTAssertEqual(ChatAttachmentExtractor.combinedContext([first, second]), "aaaaaaaa\n\nbbbbbbbb")
   }
 
-  func test_contextLimitBudgetUsesHalfOfSmallerEngineAndModelLimit() {
+  func test_contextLimitBudgetUsesRealModelContextWithHeadroom() {
     XCTAssertEqual(
-      ChatAttachmentContextLimiter.budget(engineProvidedMaxTokens: 100, modelConfiguredContextLength: 1000),
-      50
+      ChatAttachmentContextLimiter.budget(engineProvidedMaxTokens: 32_768, modelConfiguredContextLength: 32_768),
+      4_096
     )
     XCTAssertEqual(
-      ChatAttachmentContextLimiter.budget(engineProvidedMaxTokens: 1000, modelConfiguredContextLength: 120),
-      60
+      ChatAttachmentContextLimiter.budget(engineProvidedMaxTokens: 2_048, modelConfiguredContextLength: 4_096),
+      512
+    )
+  }
+
+  func test_attachmentPickerAllowedTypesMatchExtractorPolicy() {
+    XCTAssertTrue(ComposerView.attachmentPanelAllowedFileTypes.contains("pdf"))
+    XCTAssertTrue(ComposerView.attachmentPanelAllowedFileTypes.contains("md"))
+    XCTAssertFalse(ComposerView.attachmentPanelAllowedFileTypes.contains("png"))
+    XCTAssertEqual(
+      Set(ComposerView.attachmentPanelAllowedFileTypes),
+      ChatAttachmentExtractor.supportedFileExtensions
     )
   }
 
@@ -111,10 +121,10 @@ final class ChatAttachmentExtractorTests: XCTestCase {
     let result = ChatAttachmentContextLimiter.limitedContext(
       attachments: attachments,
       engineProvidedMaxTokens: 4,
-      modelConfiguredContextLength: 100
+      modelConfiguredContextLength: 64
     )
 
-    XCTAssertEqual(result.text, "aaaaaaaa")
+    XCTAssertEqual(result.text, "aaaaaaaaaaaaaaaaaaaa\n\nbbbbbbbbbb")
     XCTAssertEqual(result.notice, ChatAttachmentContextLimiter.truncationNotice)
     XCTAssertTrue(result.wasTruncated)
   }

@@ -38,6 +38,7 @@ struct ChatMessageItem: Identifiable, Equatable {
   /// Nil for historical rows and turns whose metric policy is intentionally
   /// hidden (cancelled/failed/invalid metrics).
   var generationPerformance: GenerationMetrics?
+  var hasAttachmentContext: Bool
 
   init(
     id: UUID = UUID(),
@@ -47,7 +48,8 @@ struct ChatMessageItem: Identifiable, Equatable {
     tot: ToTTree? = nil,
     bestOfN: BestOfNRound? = nil,
     finishReason: String? = nil,
-    generationPerformance: GenerationMetrics? = nil
+    generationPerformance: GenerationMetrics? = nil,
+    hasAttachmentContext: Bool = false
   ) {
     self.id = id
     self.role = role
@@ -57,6 +59,7 @@ struct ChatMessageItem: Identifiable, Equatable {
     self.bestOfN = bestOfN
     self.finishReason = finishReason
     self.generationPerformance = generationPerformance
+    self.hasAttachmentContext = hasAttachmentContext
   }
 
   /// Honest terminal state for the turn — drives the truncation notice so
@@ -108,6 +111,7 @@ extension ChatMessageItem {
       id: message.id, role: role, content: message.content,
       reasoning: message.reasoning, tot: tot, bestOfN: bestOfN,
       finishReason: message.finishReason,
-      generationPerformance: message.generationPerformance)
+      generationPerformance: message.generationPerformance,
+      hasAttachmentContext: !(message.extractedAttachmentText?.isEmpty ?? true))
   }
 }

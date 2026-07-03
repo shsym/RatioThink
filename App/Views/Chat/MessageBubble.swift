@@ -92,6 +92,18 @@ struct MessageBubble: View {
             bubble(background: Color.accentColor, foreground: .white)
           }
         }
+        if message.hasAttachmentContext {
+          HStack(spacing: 6) {
+            Spacer(minLength: 60)
+            Label("Attached document context", systemImage: "doc.text")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .padding(.horizontal, 8)
+              .padding(.vertical, 4)
+              .background(Capsule().fill(Color.secondary.opacity(0.12)))
+              .accessibilityIdentifier("message.user.attachmentContext")
+          }
+        }
         // #624: a VISIBLE Edit/Copy row under the user bubble, mirroring the
         // assistant turn's Copy/Retry chrome. Replaces the right-click
         // `.contextMenu` Edit, which the selectable-text NSTextView shadowed
