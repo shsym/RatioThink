@@ -209,7 +209,9 @@ public final class ChatSendController: ObservableObject {
           // rows.
           if didFinish {
             if !Self.isBenignPostFinishTransportClosure(error) {
-              persistenceStatus.report(error, context: "ChatSendController.postFinishStreamError")
+              Log.engine.error(
+                "ChatSendController: post-finish stream error after answer persisted: \(String(describing: error), privacy: .public)"
+              )
             }
             return
           }
