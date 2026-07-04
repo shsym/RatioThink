@@ -309,10 +309,6 @@ struct ChatScaffoldView: View {
   /// resolver-level failure publishes `.failed` (surfaced by the in-chat
   /// failure banner); a thrown transport error routes to
   /// `engineActionError` (PR#15 F3) — never the persistence banner.
-  static func engineStartFallbackProfileID(selectedProfileID: String) -> String {
-    selectedProfileID
-  }
-
   private func startEngineForSelectedProfile() {
     // Honor an explicit per-chat model pick as the boot model (#459 repro 1).
     // v1 pie loads the model at `pie serve` boot from the profile, so a
@@ -332,8 +328,7 @@ struct ChatScaffoldView: View {
         // routing below stays here.
         try await engineCoordinator.startOnActiveProfile(
           modelOverride: modelOverride,
-          fallbackProfileID: Self.engineStartFallbackProfileID(
-            selectedProfileID: viewModel.selectedProfileID)
+          fallbackProfileID: viewModel.selectedProfileID
         )
       } catch let block as HelperUnavailable {
         helperBlock = block

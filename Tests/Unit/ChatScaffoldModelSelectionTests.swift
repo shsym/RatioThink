@@ -51,13 +51,6 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
     XCTAssertEqual(xpcClient.lastStartModelOverride, "Org/Pinned-GGUF/pinned.gguf")
   }
 
-  func test_chat_start_fallback_profile_is_the_viewed_chat_profile() {
-    XCTAssertEqual(
-      ChatScaffoldView.engineStartFallbackProfileID(selectedProfileID: "viewed-chat"),
-      "viewed-chat"
-    )
-  }
-
   func test_nothing_resolvable_returns_nil_so_send_is_blocked() {
     // : no hidden fallback. With no pinned model and no profile default,
     // resolution yields nil — the caller blocks the send and shows the
