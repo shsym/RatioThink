@@ -3,6 +3,54 @@ import XCTest
 
 @MainActor
 final class ChatScaffoldModelSelectionTests: XCTestCase {
+  private final class StartCaptureXPCClient: AppXPCClient, @unchecked Sendable {
+    private(set) var startCalls = 0
+    private(set) var lastStartProfileID: String?
+    private(set) var lastStartModelOverride: String?
+
+    func helperProtocolVersion() async throws -> Int {
+      HelperProtocolCompatibility.currentVersion
+    }
+
+    func engineStatus() async throws -> EngineStatus { .stopped }
+    func stopEngine() async throws {}
+
+    func startEngine(profileID: String, modelOverride: String?) async throws {
+      startCalls += 1
+      lastStartProfileID = profileID
+      lastStartModelOverride = modelOverride
+    }
+
+    func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws {
+      startCalls += 1
+      lastStartProfileID = profileID
+    }
+
+    func restartEngine(profileID: String, modelOverride: String?) async throws {}
+  }
+
+  func test_chat_start_uses_selected_profile_as_fallback_when_active_marker_missing() async throws {
+    let xpcClient = StartCaptureXPCClient()
+    let engineStatus = EngineStatusStore(
+      client: xpcClient,
+      activeProfileIDProvider: { nil }
+    )
+    let coordinator = ChatEngineCoordinator(
+      engineStatus: engineStatus,
+      modelLoad: ModelLoadCenter(),
+      engineClient: MockEngineClient(sleep: { _ in })
+    )
+
+    try await coordinator.startOnActiveProfile(
+      modelOverride: "Org/Pinned-GGUF/pinned.gguf",
+      fallbackProfileID: "viewed-chat"
+    )
+
+    XCTAssertEqual(xpcClient.startCalls, 1)
+    XCTAssertEqual(xpcClient.lastStartProfileID, "viewed-chat")
+    XCTAssertEqual(xpcClient.lastStartModelOverride, "Org/Pinned-GGUF/pinned.gguf")
+  }
+
   func test_nothing_resolvable_returns_nil_so_send_is_blocked() {
     // : no hidden fallback. With no pinned model and no profile default,
     // resolution yields nil — the caller blocks the send and shows the
@@ -710,6 +758,58 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       decision,
       .noResolvableModel,
       "the #527 prompt stays scoped to explicit per-chat pins, but #528 still blocks profile-default sends until the resident engine matches")
+  }
+
+  func test_best_of_n_refine_stopped_engine_surfaces_no_model_prompt() {
+    let decision = ChatScaffoldView.sendGateDecision(
+      engineStatus: .stopped,
+      selectedModelID: nil,
+      profileDefaultModel: "profile-default",
+      residentModelID: nil
+    )
+    var didPresentNoModelPrompt = false
+    var mismatch: ChatScaffoldView.PinnedModelMismatch?
+
+    let modelID = ChatScaffoldView.resolvedModelIDForSend(
+      decision: decision,
+      presentNoModelPrompt: { didPresentNoModelPrompt = true },
+      presentPinnedModelMismatch: { pinned, resident in
+        mismatch = ChatScaffoldView.PinnedModelMismatch(pinnedModelID: pinned,
+                                                       residentModelID: resident)
+      })
+
+    XCTAssertNil(modelID)
+    XCTAssertTrue(didPresentNoModelPrompt,
+                  "Best-of-N Refine must surface the normal no-model prompt instead of silently returning")
+    XCTAssertNil(mismatch)
+  }
+
+  func test_best_of_n_refine_pinned_mismatch_surfaces_mismatch_prompt() throws {
+    let decision = ChatScaffoldView.sendGateDecision(
+      engineStatus: .running(EngineSessionSnapshot(
+        port: try XCTUnwrap(EnginePort(exactly: 48484)),
+        profileID: "chat",
+        servedModelID: "resident-model")),
+      selectedModelID: "pinned-model",
+      profileDefaultModel: "profile-default",
+      residentModelID: "resident-model"
+    )
+    var didPresentNoModelPrompt = false
+    var mismatch: ChatScaffoldView.PinnedModelMismatch?
+
+    let modelID = ChatScaffoldView.resolvedModelIDForSend(
+      decision: decision,
+      presentNoModelPrompt: { didPresentNoModelPrompt = true },
+      presentPinnedModelMismatch: { pinned, resident in
+        mismatch = ChatScaffoldView.PinnedModelMismatch(pinnedModelID: pinned,
+                                                       residentModelID: resident)
+      })
+
+    XCTAssertNil(modelID)
+    XCTAssertFalse(didPresentNoModelPrompt)
+    XCTAssertEqual(mismatch, ChatScaffoldView.PinnedModelMismatch(
+      pinnedModelID: "pinned-model",
+      residentModelID: "resident-model"))
   }
 
 

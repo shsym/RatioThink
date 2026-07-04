@@ -6,13 +6,17 @@ final class LocalAPIAutoStartLauncherTests: XCTestCase {
   func test_enabledAutoStartSurfacesRealStartFailure() async {
     let client = ThrowingStartClient(
       startError: EngineError(code: .modelMissing, message: "model not staged"))
-    let store = EngineStatusStore(client: client, initialStatus: .stopped)
+    let store = EngineStatusStore(
+      client: client,
+      initialStatus: .stopped,
+      activeProfileIDProvider: { "chat" }
+    )
 
     let result = await LocalAPIAutoStartLauncher.run(
       enabled: true,
       status: store.status,
       activeProfileID: "chat",
-      startEngine: { try await store.startEngine(profileID: $0) },
+      startEngine: { try await store.startOnActiveProfile() },
       errorMessage: { ChatScaffoldView.engineErrorMessage($0, verb: "start") }
     )
 

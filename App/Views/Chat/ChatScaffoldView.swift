@@ -160,6 +160,23 @@ struct ChatScaffoldView: View {
       return false
     }
   }
+
+  static func resolvedModelIDForSend(
+    decision: SendGateDecision,
+    presentNoModelPrompt: () -> Void,
+    presentPinnedModelMismatch: (_ pinnedModelID: String, _ residentModelID: String) -> Void
+  ) -> String? {
+    switch decision {
+    case .ready(let modelID):
+      return modelID
+    case .noResolvableModel:
+      presentNoModelPrompt()
+      return nil
+    case .pinnedModelMismatch(let pinned, let resident):
+      presentPinnedModelMismatch(pinned, resident)
+      return nil
+    }
+  }
   /// #513: the assistant message id awaiting the destructive-retry
   /// confirmation. Non-nil presents the alert; Cancel clears it without
   /// touching history.
@@ -303,13 +320,13 @@ struct ChatScaffoldView: View {
       hfHome: LaunchSpecResolver.defaultHFHome())
   }
 
-  /// Kick the helper to (re)start the engine on this chat's profile —
+  /// Kick the helper to (re)start the engine on the active profile, falling
+  /// back to this chat's profile when no active marker has been persisted —
   /// fire-and-forget; the engine-status poll surfaces the outcome. A
   /// resolver-level failure publishes `.failed` (surfaced by the in-chat
   /// failure banner); a thrown transport error routes to
   /// `engineActionError` (PR#15 F3) — never the persistence banner.
   private func startEngineForSelectedProfile() {
-    let profileID = viewModel.selectedProfileID
     // Honor an explicit per-chat model pick as the boot model (#459 repro 1).
     // v1 pie loads the model at `pie serve` boot from the profile, so a
     // selection that only lives in App state would never reach the engine — a
@@ -326,7 +343,10 @@ struct ChatScaffoldView: View {
         helperBlock = nil
         // #616: the engine start call lives in the coordinator; the fault
         // routing below stays here.
-        try await engineCoordinator.startEngine(profileID: profileID, modelOverride: modelOverride)
+        try await engineCoordinator.startOnActiveProfile(
+          modelOverride: modelOverride,
+          fallbackProfileID: viewModel.selectedProfileID
+        )
       } catch let block as HelperUnavailable {
         helperBlock = block
       } catch {
@@ -1053,15 +1073,20 @@ struct ChatScaffoldView: View {
       // the picked answer into `messages` would double it.) Then commit the
       // picked text so the level-1 round locks into read-only history and drops
       // out of live-candidacy while the level-2 round becomes interactive.
+      let dispatched: Bool
       if BestOfNRoundSeed.shouldInlineSecondRoundForUITest {
         BestOfNRoundSeed.appendSecondRound(after: message, in: chat, inboundComment: selectedComment)
+        dispatched = true
       } else {
-        sendBestOfNRound(for: chat, resume: resume)
+        dispatched = sendBestOfNRound(for: chat, resume: resume)
       }
-      _ = Self.commitBestOfNAnswer(pickedText, on: message, save: saveContext, report: reportSave)
-      // #736: the guidance draft has been consumed into the resume; drop it so
-      // it can't leak into a future round on this (now-committed) message id.
-      bestOfNCommentDrafts[messageID] = nil
+      _ = Self.finishBestOfNThinkMore(
+        dispatched: dispatched,
+        pickedText: pickedText,
+        on: message,
+        save: saveContext,
+        report: reportSave,
+        clearDraft: { bestOfNCommentDrafts[messageID] = nil })
     }
   }
 
@@ -1115,6 +1140,23 @@ struct ChatScaffoldView: View {
     releaseSnapshots()
   }
 
+  @discardableResult
+  static func finishBestOfNThinkMore(
+    dispatched: Bool,
+    pickedText: String,
+    on message: Message,
+    save: () throws -> Void,
+    report: (Error) -> Void,
+    clearDraft: () -> Void
+  ) -> Bool {
+    guard dispatched else { return false }
+    guard commitBestOfNAnswer(pickedText, on: message, save: save, report: report) else {
+      return false
+    }
+    clearDraft()
+    return true
+  }
+
   /// Best-effort release of a set of Best-of-N candidate KV snapshots (#690
   /// terminal cleanup). No-op when the engine is not ready or the set is empty.
   private func releaseBestOfNSnapshots(_ names: [String], in chat: Chat) {
@@ -1137,10 +1179,10 @@ struct ChatScaffoldView: View {
   /// Send Best-of-N round 2 expanding from the user's level-1 pick and
   /// refinement comment. Mirrors the round-1 route in `sendAssistantTurn` but
   /// threads the `resume` payload.
-  private func sendBestOfNRound(for chat: Chat, resume: ChatSendController.BestOfNResume) {
-    guard case .ready(let modelID) = sendGateDecision(for: chat) else { return }
+  private func sendBestOfNRound(for chat: Chat, resume: ChatSendController.BestOfNResume) -> Bool {
+    guard let modelID = resolvedModelIDForSend(for: chat) else { return false }
     guard let bonProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
-          let bonConfig = bonProfile.bestOfN else { return }
+          let bonConfig = bonProfile.bestOfN else { return false }
     let options = ChatSendRequestOptions(
       modelID: modelID,
       sampling: bonProfile.bestOfNRequestSampling,
@@ -1160,6 +1202,7 @@ struct ChatScaffoldView: View {
       persistenceStatus: persistenceStatus,
       options: options,
       resume: resume)
+    return true
   }
 
   private func sendAssistantTurn(for chat: Chat) {
@@ -1167,18 +1210,7 @@ struct ChatScaffoldView: View {
     // passed, but never ask the engine to load a model the user did not
     // choose, and never send a pinned model into a known different resident
     // engine (#527).
-    let modelID: String
-    switch sendGateDecision(for: chat) {
-    case .ready(let readyModelID):
-      modelID = readyModelID
-    case .pinnedModelMismatch(let pinned, let resident):
-      pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
-                                                residentModelID: resident)
-      return
-    case .noResolvableModel:
-      presentNoModelPrompt()
-      return
-    }
+    guard let modelID = resolvedModelIDForSend(for: chat) else { return }
     // Abandon cleanup (#690): starting a new turn orphans any uncommitted
     // Best-of-N round in this chat — free its candidate snapshots now so a long
     // session cannot accumulate unpicked KV. Runs before this turn is added, so
@@ -1315,6 +1347,16 @@ struct ChatScaffoldView: View {
       selectedModelID: chat.modelID,
       profileDefaultModel: selectedProfileDefault,
       residentModelID: modelLoadCenter.residentModelID)
+  }
+
+  private func resolvedModelIDForSend(for chat: Chat) -> String? {
+    Self.resolvedModelIDForSend(
+      decision: sendGateDecision(for: chat),
+      presentNoModelPrompt: presentNoModelPrompt,
+      presentPinnedModelMismatch: { pinned, resident in
+        pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
+                                                  residentModelID: resident)
+      })
   }
 
   private func handleBlockedSend(draft: String, for chat: Chat) {

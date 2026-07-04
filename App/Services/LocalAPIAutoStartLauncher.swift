@@ -12,19 +12,19 @@ enum LocalAPIAutoStartLauncher {
     enabled: Bool,
     status: EngineStatus,
     activeProfileID: String?,
-    startEngine: (String) async throws -> Void,
+    startEngine: () async throws -> Void,
     errorMessage: (Error) -> String
   ) async -> LocalAPIAutoStartResult {
     guard LocalAPIAutoStartPolicy.shouldStartOnLaunch(
       enabled: enabled,
       status: status,
       activeProfileID: activeProfileID
-    ), let profileID = activeProfileID else {
+    ), activeProfileID != nil else {
       return .skipped
     }
 
     do {
-      try await startEngine(profileID)
+      try await startEngine()
       return .started
     } catch {
       return .failed(message: errorMessage(error))

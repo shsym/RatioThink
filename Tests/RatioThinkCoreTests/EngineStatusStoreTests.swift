@@ -257,6 +257,83 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(store.runtimeDaemonBindMode, .external)
   }
 
+  func test_startOnActiveProfile_uses_active_profile_provider() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      activeProfileIDProvider: { "chat" }
+    )
+
+    try await store.startOnActiveProfile()
+
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(client.lastStartProfileID, "chat")
+    XCTAssertEqual(client.lastStartBindMode, .loopback)
+    XCTAssertNil(client.lastStartModelOverride)
+  }
+
+  func test_startOnActiveProfile_forwards_model_override_and_bind_mode() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      activeProfileIDProvider: { "research" }
+    )
+
+    try await store.startOnActiveProfile(
+      modelOverride: "Org/New-GGUF/new.gguf",
+      daemonBindHost: .external
+    )
+
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(client.lastStartProfileID, "research")
+    XCTAssertEqual(client.lastStartModelOverride, "Org/New-GGUF/new.gguf")
+    XCTAssertNil(client.lastStartBindMode,
+                 "model-override starts use the modelOverride wire selector; the store still records the requested runtime bind mode")
+    XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+  }
+
+  func test_startOnActiveProfile_uses_fallback_when_active_profile_missing() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      activeProfileIDProvider: { nil }
+    )
+
+    try await store.startOnActiveProfile(fallbackProfileID: "local-api")
+
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(client.lastStartProfileID, "local-api")
+  }
+
+  func test_startOnActiveProfile_prefers_active_profile_over_fallback() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      activeProfileIDProvider: { "chat" }
+    )
+
+    try await store.startOnActiveProfile(fallbackProfileID: "local-api")
+
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(client.lastStartProfileID, "chat")
+  }
+
+  func test_startOnActiveProfile_without_active_profile_refuses_before_xpc() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      activeProfileIDProvider: { "  " }
+    )
+
+    do {
+      try await store.startOnActiveProfile()
+      XCTFail("startOnActiveProfile must throw when no active profile is available")
+    } catch let error as EngineStatusStore.ActiveProfileStartError {
+      XCTAssertEqual(error, .noActiveProfile)
+    }
+    XCTAssertEqual(client.startCalls, 0)
+  }
+
   /// A running snapshot WITHOUT `daemonBindHost` (older helper) must not be
   /// read as confirmed loopback: with the current preference external, the
   /// fail-safe keeps reporting external so the 0.0.0.0 exposure warning stays.

@@ -186,12 +186,7 @@ struct RootView: View {
   /// outcome. A slow-start `replyTimeout` is swallowed by
   /// `EngineStatusStore.startEngine`.
   private func restartEngineFromBanner() {
-    let profileID = profileStore.activeProfileID
     Task { @MainActor in
-      guard let profileID, !profileID.isEmpty else {
-        statusBannerActionFeedback = .failed("No active profile is available to restart.")
-        return
-      }
       statusBannerActionFeedback = .running("Restarting engine…")
       // #668: preserve the running session's served model across the restart;
       // the durable active-model marker carries it when the engine has faulted.
@@ -199,9 +194,10 @@ struct RootView: View {
         currentSnapshot: engineStatusStore.currentSnapshot,
         lastServedModelID: profileStore.activeModelID)
       do {
-        try await engineStatusStore.startEngine(profileID: profileID,
-                                                modelOverride: modelOverride)
+        try await engineStatusStore.startOnActiveProfile(modelOverride: modelOverride)
         statusBannerActionFeedback = .succeeded("Engine restart requested.")
+      } catch EngineStatusStore.ActiveProfileStartError.noActiveProfile {
+        statusBannerActionFeedback = .failed("No active profile is available to restart.")
       } catch {
         statusBannerActionFeedback = .failed(ChatScaffoldView.engineErrorMessage(error, verb: "restart"))
       }
@@ -264,7 +260,7 @@ struct RootView: View {
       enabled: appPreferences.localAPIAutoStartEnabled,
       status: engineStatusStore.status,
       activeProfileID: profileStore.activeProfileID
-    ), let profileID = profileStore.activeProfileID else {
+    ) else {
       return
     }
 
@@ -272,8 +268,8 @@ struct RootView: View {
       let result = await LocalAPIAutoStartLauncher.run(
         enabled: appPreferences.localAPIAutoStartEnabled,
         status: engineStatusStore.status,
-        activeProfileID: profileID,
-        startEngine: { try await engineStatusStore.startEngine(profileID: $0) },
+        activeProfileID: profileStore.activeProfileID,
+        startEngine: { try await engineStatusStore.startOnActiveProfile() },
         errorMessage: { ChatScaffoldView.engineErrorMessage($0, verb: "start") }
       )
       switch result {

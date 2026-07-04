@@ -87,6 +87,14 @@ final class ChatEngineCoordinator: ObservableObject {
                                        daemonBindHost: daemonBindHost)
   }
 
+  func startOnActiveProfile(modelOverride: String? = nil,
+                            daemonBindHost: EngineHTTPBindMode? = nil,
+                            fallbackProfileID: String? = nil) async throws {
+    try await engineStatus.startOnActiveProfile(modelOverride: modelOverride,
+                                                daemonBindHost: daemonBindHost,
+                                                fallbackProfileID: fallbackProfileID)
+  }
+
   /// #397 F1: re-poll the helper after an unreachable-transport failure. The
   /// 1 Hz loop would catch up anyway; this makes Retry immediate.
   func refreshStatus() async {
