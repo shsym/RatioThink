@@ -303,11 +303,16 @@ struct ChatScaffoldView: View {
       hfHome: LaunchSpecResolver.defaultHFHome())
   }
 
-  /// Kick the helper to (re)start the engine on this chat's profile —
+  /// Kick the helper to (re)start the engine on the active profile, falling
+  /// back to this chat's profile when no active marker has been persisted —
   /// fire-and-forget; the engine-status poll surfaces the outcome. A
   /// resolver-level failure publishes `.failed` (surfaced by the in-chat
   /// failure banner); a thrown transport error routes to
   /// `engineActionError` (PR#15 F3) — never the persistence banner.
+  static func engineStartFallbackProfileID(selectedProfileID: String) -> String {
+    selectedProfileID
+  }
+
   private func startEngineForSelectedProfile() {
     // Honor an explicit per-chat model pick as the boot model (#459 repro 1).
     // v1 pie loads the model at `pie serve` boot from the profile, so a
@@ -325,7 +330,11 @@ struct ChatScaffoldView: View {
         helperBlock = nil
         // #616: the engine start call lives in the coordinator; the fault
         // routing below stays here.
-        try await engineCoordinator.startOnActiveProfile(modelOverride: modelOverride)
+        try await engineCoordinator.startOnActiveProfile(
+          modelOverride: modelOverride,
+          fallbackProfileID: Self.engineStartFallbackProfileID(
+            selectedProfileID: viewModel.selectedProfileID)
+        )
       } catch let block as HelperUnavailable {
         helperBlock = block
       } catch {

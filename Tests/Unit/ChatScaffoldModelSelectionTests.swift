@@ -3,6 +3,61 @@ import XCTest
 
 @MainActor
 final class ChatScaffoldModelSelectionTests: XCTestCase {
+  private final class StartCaptureXPCClient: AppXPCClient, @unchecked Sendable {
+    private(set) var startCalls = 0
+    private(set) var lastStartProfileID: String?
+    private(set) var lastStartModelOverride: String?
+
+    func helperProtocolVersion() async throws -> Int {
+      HelperProtocolCompatibility.currentVersion
+    }
+
+    func engineStatus() async throws -> EngineStatus { .stopped }
+    func stopEngine() async throws {}
+
+    func startEngine(profileID: String, modelOverride: String?) async throws {
+      startCalls += 1
+      lastStartProfileID = profileID
+      lastStartModelOverride = modelOverride
+    }
+
+    func startEngine(profileID: String, daemonBindHost: EngineHTTPBindMode) async throws {
+      startCalls += 1
+      lastStartProfileID = profileID
+    }
+
+    func restartEngine(profileID: String, modelOverride: String?) async throws {}
+  }
+
+  func test_chat_start_uses_selected_profile_as_fallback_when_active_marker_missing() async throws {
+    let xpcClient = StartCaptureXPCClient()
+    let engineStatus = EngineStatusStore(
+      client: xpcClient,
+      activeProfileIDProvider: { nil }
+    )
+    let coordinator = ChatEngineCoordinator(
+      engineStatus: engineStatus,
+      modelLoad: ModelLoadCenter(),
+      engineClient: MockEngineClient(sleep: { _ in })
+    )
+
+    try await coordinator.startOnActiveProfile(
+      modelOverride: "Org/Pinned-GGUF/pinned.gguf",
+      fallbackProfileID: "viewed-chat"
+    )
+
+    XCTAssertEqual(xpcClient.startCalls, 1)
+    XCTAssertEqual(xpcClient.lastStartProfileID, "viewed-chat")
+    XCTAssertEqual(xpcClient.lastStartModelOverride, "Org/Pinned-GGUF/pinned.gguf")
+  }
+
+  func test_chat_start_fallback_profile_is_the_viewed_chat_profile() {
+    XCTAssertEqual(
+      ChatScaffoldView.engineStartFallbackProfileID(selectedProfileID: "viewed-chat"),
+      "viewed-chat"
+    )
+  }
+
   func test_nothing_resolvable_returns_nil_so_send_is_blocked() {
     // : no hidden fallback. With no pinned model and no profile default,
     // resolution yields nil — the caller blocks the send and shows the
