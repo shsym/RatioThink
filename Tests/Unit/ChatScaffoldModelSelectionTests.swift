@@ -760,6 +760,20 @@ final class ChatScaffoldModelSelectionTests: XCTestCase {
       "the #527 prompt stays scoped to explicit per-chat pins, but #528 still blocks profile-default sends until the resident engine matches")
   }
 
+  func test_best_of_n_refine_stopped_engine_surfaces_no_model_prompt_action() {
+    let decision = ChatScaffoldView.sendGateDecision(
+      engineStatus: .stopped,
+      selectedModelID: nil,
+      profileDefaultModel: "profile-default",
+      residentModelID: nil
+    )
+
+    XCTAssertEqual(
+      ChatScaffoldView.sendGateAction(for: decision),
+      .presentNoModelPrompt,
+      "Best-of-N Refine must route the same stopped-engine gate as normal send instead of silently returning")
+  }
+
 
   // MARK: - #516 review F6: status edge must not fire before residency reconcile
 

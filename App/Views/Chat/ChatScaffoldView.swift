@@ -160,6 +160,23 @@ struct ChatScaffoldView: View {
       return false
     }
   }
+
+  enum SendGateAction: Equatable {
+    case send(modelID: String)
+    case presentNoModelPrompt
+    case presentPinnedModelMismatch(pinnedModelID: String, residentModelID: String)
+  }
+
+  static func sendGateAction(for decision: SendGateDecision) -> SendGateAction {
+    switch decision {
+    case .ready(let modelID):
+      return .send(modelID: modelID)
+    case .noResolvableModel:
+      return .presentNoModelPrompt
+    case .pinnedModelMismatch(let pinned, let resident):
+      return .presentPinnedModelMismatch(pinnedModelID: pinned, residentModelID: resident)
+    }
+  }
   /// #513: the assistant message id awaiting the destructive-retry
   /// confirmation. Non-nil presents the alert; Cancel clears it without
   /// touching history.
@@ -1141,7 +1158,18 @@ struct ChatScaffoldView: View {
   /// refinement comment. Mirrors the round-1 route in `sendAssistantTurn` but
   /// threads the `resume` payload.
   private func sendBestOfNRound(for chat: Chat, resume: ChatSendController.BestOfNResume) {
-    guard case .ready(let modelID) = sendGateDecision(for: chat) else { return }
+    let modelID: String
+    switch Self.sendGateAction(for: sendGateDecision(for: chat)) {
+    case .send(let readyModelID):
+      modelID = readyModelID
+    case .presentPinnedModelMismatch(let pinned, let resident):
+      pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
+                                                residentModelID: resident)
+      return
+    case .presentNoModelPrompt:
+      presentNoModelPrompt()
+      return
+    }
     guard let bonProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
           let bonConfig = bonProfile.bestOfN else { return }
     let options = ChatSendRequestOptions(
@@ -1171,14 +1199,14 @@ struct ChatScaffoldView: View {
     // choose, and never send a pinned model into a known different resident
     // engine (#527).
     let modelID: String
-    switch sendGateDecision(for: chat) {
-    case .ready(let readyModelID):
+    switch Self.sendGateAction(for: sendGateDecision(for: chat)) {
+    case .send(let readyModelID):
       modelID = readyModelID
-    case .pinnedModelMismatch(let pinned, let resident):
+    case .presentPinnedModelMismatch(let pinned, let resident):
       pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
                                                 residentModelID: resident)
       return
-    case .noResolvableModel:
+    case .presentNoModelPrompt:
       presentNoModelPrompt()
       return
     }
